@@ -423,18 +423,25 @@ impl Metric for Ndcg {
         &self,
         preds: &[f32],
         labels: &[f32],
-        _weights: Option<&[f32]>,
+        weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
         let ranges = group_ranges(preds.len(), group);
         if ranges.is_empty() {
             return 0.0;
         }
-        let sum: f64 = ranges
-            .iter()
-            .map(|&(s, e)| self.group_ndcg(&preds[s..e], &labels[s..e]))
-            .sum();
-        sum / ranges.len() as f64
+        let mut sum = 0.0;
+        let mut weight_sum = 0.0;
+        for &(start, end) in &ranges {
+            let weight = weights.map_or(1.0, |values| values[start] as f64);
+            sum += weight * self.group_ndcg(&preds[start..end], &labels[start..end]);
+            weight_sum += weight;
+        }
+        if weight_sum > 0.0 {
+            sum / weight_sum
+        } else {
+            0.0
+        }
     }
 }
 
@@ -509,18 +516,25 @@ impl Metric for MeanAveragePrecision {
         &self,
         preds: &[f32],
         labels: &[f32],
-        _weights: Option<&[f32]>,
+        weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
         let ranges = group_ranges(preds.len(), group);
         if ranges.is_empty() {
             return 0.0;
         }
-        let sum: f64 = ranges
-            .iter()
-            .map(|&(s, e)| self.group_ap(&preds[s..e], &labels[s..e]))
-            .sum();
-        sum / ranges.len() as f64
+        let mut sum = 0.0;
+        let mut weight_sum = 0.0;
+        for &(start, end) in &ranges {
+            let weight = weights.map_or(1.0, |values| values[start] as f64);
+            sum += weight * self.group_ap(&preds[start..end], &labels[start..end]);
+            weight_sum += weight;
+        }
+        if weight_sum > 0.0 {
+            sum / weight_sum
+        } else {
+            0.0
+        }
     }
 }
 

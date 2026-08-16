@@ -23,6 +23,8 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   Rayon pool.
 - Interpret explicit count, Gamma, and Tweedie base scores in reported-value
   space and pass configured Poisson `max_delta_step` into its Hessian.
+- Add query-level ranking weights and use them when averaging NDCG and MAP,
+  matching XGBoost's ranking-weight semantics.
 - Reject XGBoost JSON export for DART, `gblinear`, and categorical models that
   cannot be represented correctly by the current exporter.
 - Replace the unmaintained bincode native serializer with Postcard. Native

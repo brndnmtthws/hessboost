@@ -277,6 +277,40 @@ impl DMatrix {
         Ok(self)
     }
 
+    /// Attach one weight per ranking group.
+    ///
+    /// Group sizes must be attached first. Internally each group weight is
+    /// expanded across that group's rows so objectives and metrics receive the
+    /// XGBoost-compatible per-query weighting semantics.
+    pub fn with_group_weights(mut self, weights: &[f32]) -> Result<Self> {
+        let group = self.group.as_ref().ok_or_else(|| {
+            SequoiaError::invalid_param("group_weights", "attach group sizes first")
+        })?;
+        if weights.len() != group.num_groups() {
+            return Err(SequoiaError::DimensionMismatch {
+                what: "group_weights length",
+                expected: group.num_groups(),
+                got: weights.len(),
+            });
+        }
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || !weights.iter().any(|weight| *weight > 0.0)
+        {
+            return Err(SequoiaError::invalid_param(
+                "group_weights",
+                "weights must be finite and non-negative with at least one positive value",
+            ));
+        }
+        let mut expanded = Vec::with_capacity(self.n_rows);
+        for ((start, end), &weight) in group.iter_ranges().zip(weights) {
+            expanded.extend(std::iter::repeat_n(weight, end - start));
+        }
+        self.weights = Some(expanded);
+        Ok(self)
+    }
+
     /// Set the feature types (`len == n_cols`).
     pub fn with_feature_types(mut self, types: &[FeatureType]) -> Result<Self> {
         if types.len() != self.n_cols {
@@ -694,5 +728,15 @@ mod tests {
     fn categorical_values_must_be_non_negative_integers() {
         let d = DMatrix::from_dense(&[0.0, 1.5], 2, 1).unwrap();
         assert!(d.with_feature_types(&[FeatureType::Categorical]).is_err());
+    }
+
+    #[test]
+    fn group_weights_expand_across_query_rows() {
+        let d = sample_dense()
+            .with_group_sizes(&[2, 1])
+            .unwrap()
+            .with_group_weights(&[0.5, 2.0])
+            .unwrap();
+        assert_eq!(d.weights().unwrap(), &[0.5, 0.5, 2.0]);
     }
 }

@@ -650,7 +650,8 @@ fn validate_dataset(
             .any(|&y| y.fract() != 0.0 || y < 0.0 || y >= params.num_class as f32),
         "count:poisson" | "reg:tweedie" => labels.iter().any(|&y| y < 0.0),
         "reg:gamma" => labels.iter().any(|&y| y <= 0.0),
-        "rank:pairwise" | "rank:ndcg" | "rank:map" => labels.iter().any(|&y| y < 0.0),
+        "rank:ndcg" => labels.iter().any(|&y| !(0.0..=31.0).contains(&y)),
+        "rank:pairwise" | "rank:map" => labels.iter().any(|&y| y < 0.0),
         _ => false,
     };
     if invalid {
@@ -664,6 +665,23 @@ fn validate_dataset(
             "group_sizes",
             format!("ranking dataset `{name}` requires group information"),
         ));
+    }
+    if params.objective.starts_with("rank:") {
+        if let (Some(group), Some(weights)) = (data.group(), data.weights()) {
+            for (start, end) in group.iter_ranges() {
+                if weights[start..end]
+                    .iter()
+                    .any(|weight| *weight != weights[start])
+                {
+                    return Err(SequoiaError::invalid_param(
+                        "weights",
+                        format!(
+                            "ranking dataset `{name}` requires one constant weight per query group"
+                        ),
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }

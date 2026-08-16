@@ -180,11 +180,10 @@ it with appropriate scrutiny — it is tested and parity-checked but not warrant
 ## Citation and archiving
 
 Citation metadata is provided in [`CITATION.cff`](CITATION.cff), with matching
-deposit metadata in [`.zenodo.json`](.zenodo.json). Version 0.2.0 has not yet
-been archived, so the repository intentionally does not claim a Zenodo DOI.
-After the first GitHub release is archived through Zenodo, use Zenodo's verified
-concept DOI on the default branch and the version DOI only for that immutable
-release record.
+deposit metadata in [`.zenodo.json`](.zenodo.json). Zenodo assigns the release
+DOI when it archives the GitHub release. After the first archive is published,
+the default branch uses Zenodo's verified concept DOI, while the version DOI
+identifies only that immutable release record.
 
 ## Acknowledgments
 

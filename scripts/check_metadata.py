@@ -19,7 +19,15 @@ except ImportError as error:
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/pgarrett-scripps/sequoia-boost"
 CONCEPT_DOI = "10.5281/zenodo.21968435"
-EXPECTED_AUTHORS = ["Patrick Garrett"]
+EXPECTED_AUTHORS = ["Patrick T. Garrett", "John R. Yates III"]
+EXPECTED_CARGO_AUTHORS = [
+    "Patrick T. Garrett <pgarrett@scripps.edu>",
+    "John R. Yates III <jyates@scripps.edu>",
+]
+EXPECTED_IDENTITIES = [
+    ("pgarrett@scripps.edu", "0000-0002-8434-9693", "Scripps Research Institute"),
+    ("jyates@scripps.edu", "0000-0001-5267-1672", "Scripps Research Institute"),
+]
 REQUIRED_ZENODO = {
     "title",
     "version",
@@ -51,7 +59,8 @@ def cargo_author(name: str) -> str:
 def cff_author(author: dict[str, str]) -> str:
     if "name" in author:
         return author["name"]
-    return f"{author['given-names']} {author['family-names']}"
+    suffix = f" {author['name-suffix']}" if "name-suffix" in author else ""
+    return f"{author['given-names']} {author['family-names']}{suffix}"
 
 
 def main() -> None:
@@ -78,10 +87,13 @@ def main() -> None:
 
     cargo_authors = [cargo_author(author) for author in package["authors"]]
     cff_authors = [cff_author(author) for author in cff["authors"]]
-    zenodo_authors = [
-        name if "," not in name else " ".join(reversed([p.strip() for p in name.split(",", 1)]))
-        for name in (creator["name"] for creator in zenodo["creators"])
-    ]
+    zenodo_authors = []
+    for creator in zenodo["creators"]:
+        name = creator["name"]
+        if "," in name:
+            family, given = [part.strip() for part in name.split(",", 1)]
+            name = f"{given} {family}"
+        zenodo_authors.append(name)
     if cargo_authors != cff_authors or cargo_authors != zenodo_authors:
         fail(
             f"author names or order disagree: Cargo={cargo_authors}, "
@@ -89,6 +101,26 @@ def main() -> None:
         )
     if cargo_authors != EXPECTED_AUTHORS:
         fail(f"authors must be exactly {EXPECTED_AUTHORS}, found {cargo_authors}")
+    if package["authors"] != EXPECTED_CARGO_AUTHORS:
+        fail("Cargo author names and emails do not match the verified identities")
+    cff_identities = [
+        (
+            author.get("email"),
+            str(author.get("orcid", "")).removeprefix("https://orcid.org/"),
+            author.get("affiliation"),
+        )
+        for author in cff["authors"]
+    ]
+    zenodo_identities = [
+        (None, creator.get("orcid"), creator.get("affiliation"))
+        for creator in zenodo["creators"]
+    ]
+    if cff_identities != EXPECTED_IDENTITIES:
+        fail("CFF emails, ORCIDs, or affiliations do not match verified identities")
+    if [identity[1:] for identity in EXPECTED_IDENTITIES] != [
+        identity[1:] for identity in zenodo_identities
+    ]:
+        fail("Zenodo ORCIDs or affiliations do not match verified identities")
     if any(
         term in author.lower()
         for author in cargo_authors

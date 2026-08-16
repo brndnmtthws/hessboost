@@ -12,7 +12,7 @@ gradient boosting — no C/C++ dependency, no FFI.
 Rust — the regularized second-order boosting objective; exact, histogram, and
 approximate tree construction; the full objective/metric catalog; monotone and
 interaction constraints; categorical splits; DART and gblinear boosters;
-TreeSHAP; and XGBoost-format model interop — with multi-core (`rayon`)
+TreeSHAP; and numeric-tree XGBoost-format model interop — with multi-core (`rayon`)
 acceleration.
 
 Objective, metric, and parameter names mirror XGBoost, so configurations
@@ -100,7 +100,8 @@ Runnable, self-contained examples live in
   **interaction values** (`predict_interactions`), early stopping, feature
   importance (weight / gain / cover / totals), leaf-index and margin prediction.
 - **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
-  **XGBoost-format JSON model import/export**, k-fold cross-validation,
+  **XGBoost-format JSON model import/export** for numeric `gbtree` ensembles,
+  k-fold cross-validation,
   multi-core histogram construction.
 
 **In progress / planned**
@@ -175,6 +176,15 @@ asserts `sequoia-boost` matches within tolerance. See `scripts/README.md`.
 Written by **Claude** (Anthropic's AI coding assistant), directed and reviewed
 by **Patrick Garrett**. See [`NOTICE`](NOTICE). Because it is AI-generated, treat
 it with appropriate scrutiny — it is tested and parity-checked but not warranted.
+
+## Citation and archiving
+
+Citation metadata is provided in [`CITATION.cff`](CITATION.cff), with matching
+deposit metadata in [`.zenodo.json`](.zenodo.json). Version 0.2.0 has not yet
+been archived, so the repository intentionally does not claim a Zenodo DOI.
+After the first GitHub release is archived through Zenodo, use Zenodo's verified
+concept DOI on the default branch and the version DOI only for that immutable
+release record.
 
 ## Acknowledgments
 

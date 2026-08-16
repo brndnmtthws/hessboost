@@ -55,7 +55,7 @@ Everything in the typical workflow is re-exported from `sequoia_boost::prelude`.
 
 ## Conventions & gotchas
 
-- **Prediction layout:** single-output → length `n_rows`. Multiclass → `n_rows * num_class`, row-major `[row][class]`. SHAP contribs → `[row][n_features + 1]` (last = bias). SHAP interactions → `[row][(n_features+1)^2]`.
+- **Prediction layout:** single-output and `multi:softmax` → length `n_rows`. `multi:softprob` → `n_rows * num_class`, row-major `[row][class]`. SHAP contribs → `[row][n_features + 1]` (last = bias). SHAP interactions → `[row][(n_features+1)^2]`.
 - **Errors:** everything returns `Result<T, SequoiaError>` (`Result` alias is in the prelude). Prefer `?`; don't `unwrap` in library code.
 - **Determinism:** identical `(params, data, seed)` ⇒ identical predictions (property-tested).
 - **Parity:** matches XGBoost *model quality* (CI-tested via `tests/parity.rs`), not bit-identical predictions.

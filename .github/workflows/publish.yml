@@ -27,6 +27,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate release metadata
+        run: |
+          python -m pip install --upgrade cffconvert PyYAML
+          python scripts/check_metadata.py
+          cffconvert --validate
+
       - name: Verify tag matches crate version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |

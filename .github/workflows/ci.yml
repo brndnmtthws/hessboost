@@ -11,6 +11,20 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  metadata:
+    name: release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade cffconvert PyYAML
+      - run: python scripts/check_metadata.py
+      - run: cffconvert --validate
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -74,7 +88,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install real XGBoost
-        run: python -m pip install --upgrade "xgboost>=2.0" numpy
+        run: python -m pip install --upgrade "xgboost==3.4.1" numpy
       - name: Generate fixtures from real XGBoost
         run: python scripts/gen_fixtures.py
       - name: Assert quality parity

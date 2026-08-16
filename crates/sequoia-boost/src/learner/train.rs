@@ -21,7 +21,7 @@ use rand::{Rng, SeedableRng};
 enum Prepared {
     Exact(SortedColumns),
     Hist(GHistIndex),
-    /// `tree_method=approx`: no state is cached up front; each round recomputes
+    /// `tree_method=approx`: no state is cached up front. Each round recomputes
     /// hessian-weighted cuts and bins from that round's gradients.
     Approx,
 }
@@ -178,7 +178,7 @@ pub fn train_with_objective(
 ///
 /// Margins and gradients are laid out `[instance][output]`. Each round computes
 /// all gradients, then grows one tree per output from that output's gradient
-/// slice — the multi-output generalization of gradient boosting used by
+/// slice. This is the multi-output generalization of gradient boosting used by
 /// multiclass.
 fn train_impl(
     params: &TrainingParams,
@@ -390,7 +390,7 @@ fn train_impl_inner(
                 &mut gpair_k,
             );
             // DART rescales earlier trees' weights each round, so the cached
-            // eval margins are no longer additive — recompute them from the
+            // Eval margins are no longer additive. Recompute them from the
             // (weighted) ensemble.
             for (ei, (d, _)) in evals.iter().enumerate() {
                 eval_margins[ei] = model.predict_margin_limited_unchecked(d, 0);
@@ -486,7 +486,7 @@ fn train_impl_inner(
 /// With probability `1 - skip_drop` a dropout set `D` is selected from the trees
 /// built so far (each dropped independently with probability `rate_drop`, at
 /// least one when any exist). The round's gradients are computed from the
-/// ensemble **excluding** `D`; the new per-output trees are then fit on those
+/// ensemble **excluding** `D`. The new per-output trees are then fit on those
 /// gradients. Using XGBoost's `tree` normalization, if `k = |D|` the new trees
 /// get weight `1/(k+eta)` and each dropped tree is rescaled by `k/(k+eta)`.
 #[allow(clippy::too_many_arguments)]
@@ -595,7 +595,7 @@ fn sample_features(n: usize, colsample: f64, rng: &mut StdRng) -> Vec<u32> {
 /// Initialize the margin buffer for `data`: the scalar `base_margin` broadcast
 /// to every `(row, output)`, then overridden by the dataset's per-instance
 /// `base_margin` when present. Accepts a base margin of length `n_rows`
-/// (broadcast across outputs) or `n_rows * n_out` (per output); a mismatched
+/// (broadcast across outputs) or `n_rows * n_out` (per output). A mismatched
 /// length is rejected before this helper is called.
 fn init_margin(data: &DMatrix, base_margin: f32, n_out: usize) -> Vec<f32> {
     let n = data.n_rows();

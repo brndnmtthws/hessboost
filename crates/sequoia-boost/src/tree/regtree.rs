@@ -1,7 +1,7 @@
 //! Regression tree representation and prediction.
 //!
 //! A tree is a flat array of [`Node`]s (node `0` is the root). Internal nodes
-//! carry a numeric split `x[feature] < threshold`; instances whose feature is
+//! carry a numeric split `x[feature] < threshold`. Instances whose feature is
 //! *missing* follow the node's `default_left` direction, implementing XGBoost's
 //! sparsity-aware routing. Leaf nodes carry the raw leaf weight (the learning
 //! rate is applied by the boosting loop, not baked into the tree).
@@ -188,8 +188,8 @@ impl RegTree {
 
     /// Turn leaf `nid` into a categorical (set-membership) internal node.
     /// Instances whose value of `split_feature` is one of `cats_left` go to the
-    /// left child; all other (and missing) categories follow `default_left`
-    /// only when missing — present categories not in the set go right.
+    /// left child. All other (and missing) categories follow `default_left`
+    /// only when missing. Present categories not in the set go right.
     /// Returns `(left_id, right_id)`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn expand_categorical(

@@ -5,7 +5,7 @@
 //! (`bin = #{cuts ≤ value}`, clamped). Cuts are computed **once** from the data,
 //! matching XGBoost's `tree_method=hist`. A trailing sentinel cut just above each
 //! feature's maximum guarantees the maximum value gets its own bin (no clamp
-//! collision), so bin index `0` may be empty — harmless and cheap.
+//! collision), so bin index `0` may be empty. This is harmless and cheap.
 
 use crate::data::meta::FeatureType;
 use crate::data::DMatrix;
@@ -22,7 +22,7 @@ pub struct HistCuts {
     /// Global bin/cut offsets, length `n_features + 1`.
     feature_offset: Vec<u32>,
     /// Concatenated ascending cut values. For a numeric feature these are split
-    /// thresholds; for a categorical feature they are the distinct category
+    /// thresholds. For a categorical feature they are the distinct category
     /// values, one per bin (see `is_categorical`).
     cut_values: Vec<f32>,
     /// Per-feature flag: `true` when the feature is categorical and its bins map
@@ -34,7 +34,7 @@ impl HistCuts {
     /// Compute cuts from a dataset with at most `max_bin` bins per feature.
     ///
     /// Categorical features (per [`DMatrix::feature_types`]) are binned with one
-    /// bin per distinct category value; numeric features use quantile cut
+    /// bin per distinct category value. Numeric features use quantile cut
     /// thresholds exactly as before.
     pub fn from_dmatrix(data: &DMatrix, max_bin: usize) -> Self {
         let csc = data.to_csc();
@@ -247,7 +247,7 @@ fn build_feature_cuts(sorted_vals: &[f32], max_bin: usize, out: &mut Vec<f32>) {
 /// Append feature cut values (ascending) for one numeric feature using
 /// **hessian-weighted** quantiles: `sorted` holds ascending `(value, weight)`
 /// pairs and each value contributes its weight when locating the quantile
-/// boundaries. Mirrors [`build_feature_cuts`] — the empty-input guard, the
+/// boundaries. Mirrors [`build_feature_cuts`], including the empty-input guard, the
 /// few-distinct-values shortcut, and the trailing sentinel are identical, and
 /// with all weights equal it reproduces the unweighted cuts.
 fn build_feature_cuts_weighted(sorted: &[(f32, f32)], max_bin: usize, out: &mut Vec<f32>) {

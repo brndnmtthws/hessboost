@@ -16,11 +16,11 @@
 //! Each tree is stored as a set of parallel, node-indexed arrays rather than a
 //! nested structure: `left_children`, `right_children`, `split_indices`,
 //! `split_conditions`, `default_left`, `base_weights`, `sum_hessian` and
-//! `loss_changes`. A node `i` is a **leaf** when `left_children[i] == -1`; its
+//! `loss_changes`. A node `i` is a **leaf** when `left_children[i] == -1`. Its
 //! weight is carried in `split_conditions[i]` (and, redundantly,
 //! `base_weights[i]`). Internal nodes route `x[split_indices[i]] <
 //! split_conditions[i]`, sending missing values in the `default_left[i]`
-//! direction — the exact semantics of [`crate::RegTree`].
+//! direction, matching the exact semantics of [`crate::RegTree`].
 //!
 //! # Scope and caveats
 //!
@@ -28,7 +28,7 @@
 //! with a scalar or multiclass objective. Unsupported boosters (e.g. `gblinear`,
 //! `dart`) yield a clear [`SequoiaError::ModelFormat`]. Categorical splits,
 //! vector leaves (`size_leaf_vector > 1`) and non-numeric split types are not
-//! interpreted; only numeric splits round-trip.
+//! interpreted. Only numeric splits round-trip.
 //!
 //! ## `base_score`
 //!
@@ -37,7 +37,7 @@
 //! **probability** space for objectives with a link function (newer XGBoost
 //! writes `0.5` for `binary:logistic`, not its logit). We reconcile this using
 //! the objective's own transforms: on **import** the stored value is mapped to
-//! margin space via the inverse link ([`Objective::prob_to_margin`]); on
+//! margin space via the inverse link ([`Objective::prob_to_margin`]). On
 //! **export** the margin is mapped back with the forward transform
 //! ([`Objective::pred_transform`]). For multiclass objectives (and any objective
 //! we cannot reconstruct) the value is passed through unchanged.
@@ -131,7 +131,7 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
 
 /// Parse an XGBoost JSON model document into a [`BoostedModel`].
 ///
-/// Best-effort for `gbtree` boosters; other booster kinds produce a
+/// Best-effort for `gbtree` boosters. Other booster kinds produce a
 /// [`SequoiaError::ModelFormat`]. See the module docs (above) for details and
 /// the `base_score` space convention.
 pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {

@@ -22,7 +22,7 @@ pub struct CvResult {
 
 /// Run `nfold` cross-validation, returning one [`CvResult`] per evaluation
 /// metric. Every fold trains for the full `num_boost_round` rounds (no early
-/// stopping); the metric list comes from `params.eval_metric` or the objective's
+/// stopping). The metric list comes from `params.eval_metric` or the objective's
 /// default.
 pub fn cv(
     params: &TrainingParams,

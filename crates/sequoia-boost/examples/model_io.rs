@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     model.save_json(&json)?;
     let m_json = BoostedModel::load_json(&json)?;
 
-    // 3) XGBoost-format JSON — readable by real XGBoost's `Booster.load_model`.
+    // 3) XGBoost-format JSON, readable by real XGBoost's `Booster.load_model`.
     model.save_xgboost_json(&xgb)?;
     let m_xgb = BoostedModel::load_xgboost_json(&xgb)?;
 

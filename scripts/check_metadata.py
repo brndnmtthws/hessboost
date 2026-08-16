@@ -43,6 +43,18 @@ REQUIRED_ZENODO = {
     "communities",
     "grants",
 }
+PUBLIC_PROSE_FILES = (
+    "README.md",
+    "CHANGELOG.md",
+    "AGENTS.md",
+    "scripts/README.md",
+    "NOTICE",
+    "CITATION.cff",
+    ".zenodo.json",
+    "Cargo.toml",
+    "crates/sequoia-boost/Cargo.toml",
+)
+PROHIBITED_PROSE_MARKS = ("\N{EM DASH}", "\N{EN DASH}", ";")
 
 
 def fail(message: str) -> None:
@@ -64,7 +76,52 @@ def cff_author(author: dict[str, str]) -> str:
     return f"{author['given-names']} {author['family-names']}{suffix}"
 
 
+def without_inline_code(line: str) -> str:
+    return re.sub(r"`[^`]*`", "", line)
+
+
+def check_public_prose() -> None:
+    violations: list[str] = []
+    for relative in PUBLIC_PROSE_FILES:
+        path = ROOT / relative
+        fenced = False
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if relative.endswith(".md") and line.strip().startswith("```"):
+                fenced = not fenced
+                continue
+            if not fenced and any(mark in without_inline_code(line) for mark in PROHIBITED_PROSE_MARKS):
+                violations.append(f"{relative}:{number}")
+
+    rust_roots = (
+        ROOT / "crates/sequoia-boost/src",
+        ROOT / "crates/sequoia-boost/examples",
+        ROOT / "crates/sequoia-boost/tests",
+    )
+    for rust_root in rust_roots:
+        for path in rust_root.rglob("*.rs"):
+            fenced = False
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                stripped = line.lstrip()
+                if not (stripped.startswith("///") or stripped.startswith("//!")):
+                    continue
+                content = stripped[3:]
+                if content.strip().startswith("```"):
+                    fenced = not fenced
+                    continue
+                if not fenced and any(
+                    mark in without_inline_code(content) for mark in PROHIBITED_PROSE_MARKS
+                ):
+                    violations.append(f"{path.relative_to(ROOT)}:{number}")
+
+    if violations:
+        fail(
+            "public prose contains an em dash, en dash, or semicolon at "
+            + ", ".join(violations)
+        )
+
+
 def main() -> None:
+    check_public_prose()
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text())
     cff = yaml.safe_load((ROOT / "CITATION.cff").read_text())
     zenodo = json.loads((ROOT / ".zenodo.json").read_text())
@@ -132,9 +189,9 @@ def main() -> None:
     if abstract != normalize(zenodo["description"]):
         fail("CFF abstract and Zenodo description differ")
     words = len(abstract.split())
-    if not 140 <= words <= 180:
-        fail(f"abstract must contain 140 to 180 words, found {words}")
-    if any(mark in abstract for mark in ("—", "–", ";")):
+    if not 80 <= words <= 110:
+        fail(f"abstract must contain 80 to 110 words, found {words}")
+    if any(mark in abstract for mark in PROHIBITED_PROSE_MARKS):
         fail("abstract contains prohibited punctuation")
 
     if cff["repository-code"] != REPOSITORY or package["repository"] != REPOSITORY:

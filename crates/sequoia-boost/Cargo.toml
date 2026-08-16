@@ -32,7 +32,7 @@ approx = { workspace = true }
 
 [features]
 default = []
-# Reserved for a future GPU histogram backend; keeps the trait seam explicit.
+# Reserved for a future GPU histogram backend. This keeps the trait seam explicit.
 gpu = []
 
 [[bench]]

@@ -23,7 +23,7 @@ pub trait Metric: Send + Sync {
     ///
     /// Ranking metrics (`ndcg`, `map`) override this to compute the metric per
     /// query group and average across groups. The default ignores the grouping
-    /// and forwards to [`Metric::eval`] — correct for all pointwise metrics.
+    /// and forwards to [`Metric::eval`]. This is correct for all pointwise metrics.
     fn eval_grouped(
         &self,
         preds: &[f32],
@@ -143,7 +143,7 @@ impl Metric for ErrorRate {
     }
 }
 
-/// Binary ROC AUC (`auc`), computed with the Mann–Whitney rank-sum and average
+/// Binary ROC AUC (`auc`), computed with the Mann-Whitney rank-sum and average
 /// ranks for ties. Higher is better. Weights are ignored (unweighted AUC).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Auc;
@@ -196,7 +196,7 @@ impl Metric for Auc {
 }
 
 /// Multiclass log loss (`mlogloss`). Predictions are `n × num_class`
-/// probabilities; labels are class indices.
+/// probabilities. Labels are class indices.
 #[derive(Debug, Clone, Copy)]
 pub struct MLogLoss {
     num_class: usize,
@@ -364,7 +364,7 @@ fn group_ranges(n: usize, group: Option<&crate::data::GroupInfo>) -> Vec<(usize,
 /// A group whose ideal DCG is zero contributes `0`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ndcg {
-    /// Optional rank cutoff `k`; `None` uses the full list.
+    /// Optional rank cutoff `k`. `None` uses the full list.
     k: Option<usize>,
 }
 
@@ -464,7 +464,7 @@ fn ndcg_discount(p: usize) -> f64 {
 /// better. A group with no relevant documents contributes `0`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MeanAveragePrecision {
-    /// Optional rank cutoff `k`; `None` uses the full list.
+    /// Optional rank cutoff `k`. `None` uses the full list.
     k: Option<usize>,
 }
 
@@ -542,7 +542,7 @@ impl Metric for MeanAveragePrecision {
 ///
 /// Labels are `{0, 1}` and predictions are probabilities. The curve is traced by
 /// sorting instances by descending prediction and sweeping the decision
-/// threshold; the area is integrated over recall with the trapezoidal rule
+/// threshold. The area is integrated over recall with the trapezoidal rule
 /// (tied scores form a single operating point). Higher is better. A degenerate
 /// problem (no positives or no negatives) yields `0`.
 #[derive(Debug, Clone, Copy, Default)]

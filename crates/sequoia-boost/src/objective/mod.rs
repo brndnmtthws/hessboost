@@ -2,7 +2,7 @@
 //! score estimation.
 //!
 //! Every objective implements [`Objective`]. Boosting works in *margin* space
-//! (raw additive scores); the [`Objective::pred_transform`] maps margins to the
+//! (raw additive scores). The [`Objective::pred_transform`] maps margins to the
 //! reported prediction (e.g. the logistic sigmoid). This mirrors XGBoost's
 //! separation of `GetGradient` / `PredTransform`.
 
@@ -51,7 +51,7 @@ pub trait Objective: Send + Sync {
     fn name(&self) -> &str;
 
     /// Number of raw outputs produced per instance. `1` for regression and
-    /// binary classification; `num_class` for multiclass objectives.
+    /// binary classification. It is `num_class` for multiclass objectives.
     fn n_outputs(&self) -> usize {
         1
     }
@@ -73,7 +73,7 @@ pub trait Objective: Send + Sync {
     ///
     /// Learning-to-rank objectives (LambdaMART) override this to form document
     /// pairs *within* each group supplied by `group`. The default forwards to
-    /// [`Objective::gradient`], ignoring the grouping — correct for all
+    /// [`Objective::gradient`], ignoring the grouping. This is correct for all
     /// non-ranking objectives.
     fn gradient_grouped(
         &self,
@@ -95,7 +95,7 @@ pub trait Objective: Send + Sync {
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32;
 
     /// Convert a user-supplied `base_score` (given in prediction space) into
-    /// margin space via the objective's inverse link. Default is the identity;
+    /// margin space via the objective's inverse link. Default is the identity.
     /// objectives with a link function (e.g. logistic) override it.
     fn prob_to_margin(&self, base_score: f32) -> f32 {
         base_score

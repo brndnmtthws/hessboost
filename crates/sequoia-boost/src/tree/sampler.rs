@@ -3,7 +3,7 @@
 //! XGBoost exposes three cumulative column-sampling ratios: `colsample_bytree`
 //! (per tree), `colsample_bylevel` (per level), and `colsample_bynode` (per
 //! node). The per-tree sample is drawn by the trainer and passed in here as the
-//! *pool*; this sampler then draws the `bylevel` and `bynode` subsets from it.
+//! *pool*. This sampler then draws the `bylevel` and `bynode` subsets from it.
 //!
 //! Call granularity differs by builder: the histogram builder samples once per
 //! node ([`ColumnSampler::sample`] per node), while the exact builder samples

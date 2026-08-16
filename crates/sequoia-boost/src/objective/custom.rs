@@ -22,9 +22,9 @@ pub struct CustomObjective {
 impl CustomObjective {
     /// Build a custom objective.
     ///
-    /// * `grad_fn` — `(margins, labels, weights, out)` fills `out` with gradients.
-    /// * `base` — the initial margin (base score).
-    /// * `transform_fn` — optional prediction transform (identity if `None`).
+    /// * `grad_fn`: `(margins, labels, weights, out)` fills `out` with gradients.
+    /// * `base`: the initial margin (base score).
+    /// * `transform_fn`: optional prediction transform (identity if `None`).
     pub fn new(
         name: impl Into<String>,
         n_outputs: usize,

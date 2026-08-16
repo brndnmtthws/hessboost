@@ -5,7 +5,7 @@
 //! scans: accumulating gradients into per-bin buckets is a single indexed add.
 //!
 //! Bin indices are stored in the **narrowest** integer type that fits the total
-//! bin count — `u16` when there are ≤ 65 536 bins (the common case, e.g. 256
+//! bin count. It uses `u16` when there are at most 65,536 bins (the common case, e.g. 256
 //! features × 256 bins), else `u32`. The build loop is memory-bandwidth bound,
 //! so halving the index width is a direct throughput win.
 

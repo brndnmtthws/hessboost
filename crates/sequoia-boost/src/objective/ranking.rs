@@ -6,7 +6,7 @@
 //! pairwise-logistic (RankNet) gradient. For the `rank:ndcg` and `rank:map`
 //! variants each pair's gradient is additionally scaled by the magnitude of the
 //! change in the ranking metric (NDCG or MAP) that would result from swapping
-//! the two documents — the "lambda" weighting that turns RankNet into
+//! the two documents. This is the "lambda" weighting that turns RankNet into
 //! LambdaMART.
 //!
 //! The objective is *stateless*: query-group boundaries are supplied at
@@ -29,7 +29,7 @@ const MAX_PAIRS_PER_GROUP: usize = 4096;
 /// Which ranking loss the LambdaMART objective optimizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RankMode {
-    /// Plain pairwise logistic loss (`rank:pairwise`); every pair weighted 1.
+    /// Plain pairwise logistic loss (`rank:pairwise`). Every pair is weighted 1.
     Pairwise,
     /// Pairs weighted by |ΔNDCG| (`rank:ndcg`).
     Ndcg,

@@ -25,7 +25,7 @@ const K_RT_EPS: f64 = 1e-6;
 
 /// Value-sorted column index over a [`DMatrix`], built once and reused across
 /// boosting rounds. Within each column, `(row, value)` pairs are sorted by
-/// ascending value; missing entries are omitted (sparsity-aware).
+/// ascending value. Missing entries are omitted (sparsity-aware).
 #[derive(Debug, Clone)]
 pub struct SortedColumns {
     n_rows: usize,
@@ -162,11 +162,11 @@ impl<'a> ExactTreeBuilder<'a> {
 
     /// Grow a single tree.
     ///
-    /// * `cols` — value-sorted column index over the *full* dataset.
-    /// * `data` — the dataset (for routing rows after a split).
-    /// * `gpair` — per-row gradient/Hessian (length = dataset rows).
-    /// * `row_subset` — the sampled rows to train this tree on.
-    /// * `sampler` — per-tree column sampler; the exact builder draws one subset
+    /// * `cols`: value-sorted column index over the *full* dataset.
+    /// * `data`: the dataset (for routing rows after a split).
+    /// * `gpair`: per-row gradient/Hessian (length = dataset rows).
+    /// * `row_subset`: the sampled rows to train this tree on.
+    /// * `sampler`: per-tree column sampler. The exact builder draws one subset
     ///   per level (shared across that level's nodes).
     pub fn build(
         &self,
@@ -604,7 +604,7 @@ impl<'a> ExactTreeBuilder<'a> {
     ///
     /// Follows XGBoost's sorted-partition strategy: rank categories by their
     /// gradient/Hessian ratio, then sweep prefix partitions of that order. The
-    /// prefix categories form the "left" set; every other present category (and
+    /// prefix categories form the "left" set. Every other present category (and
     /// missing) goes right.
     #[allow(clippy::too_many_arguments)]
     fn eval_categorical(

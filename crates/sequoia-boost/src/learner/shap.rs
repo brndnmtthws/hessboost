@@ -4,7 +4,7 @@
 //! al., *"Consistent Individualized Feature Attribution for Tree Ensembles"*,
 //! matching XGBoost's `pred_contribs=True`. For a single tree the returned
 //! per-feature values sum to `f_tree(x) - E[f_tree]`, where the expectation is
-//! taken over the tree's cover (Hessian) distribution; the missing offset
+//! taken over the tree's cover (Hessian) distribution. The missing offset
 //! `E[f_tree]` is folded into the bias term. Summed over the whole ensemble the
 //! contributions therefore satisfy the exact-additivity property
 //!
@@ -43,7 +43,7 @@ struct PathElement {
 
 /// Grow the decision path by adding a new feature split.
 ///
-/// `path` holds the parent path (`unique_depth` elements before the call); the
+/// `path` holds the parent path (`unique_depth` elements before the call). The
 /// new element is appended, and every existing element's `pweight` is updated to
 /// account for one extra split in the coalition ordering.
 fn extend_path(
@@ -119,9 +119,9 @@ fn unwound_path_sum(path: &[PathElement], path_index: usize) -> f64 {
 /// contributions into `phi`.
 ///
 /// `path` is the parent decision path (owned, so it can be forked at each
-/// internal node); `get` accesses the instance's feature values (`None` =
+/// internal node). `get` accesses the instance's feature values (`None` =
 /// missing, routed by the node's default direction). This is the ordinary
-/// (unconditioned) traversal used by [`BoostedModel::predict_contribs`]; it is a
+/// (unconditioned) traversal used by [`BoostedModel::predict_contribs`]. It is a
 /// thin wrapper over [`tree_shap_cond`] with `condition == 0`.
 #[allow(clippy::too_many_arguments)]
 fn tree_shap(
@@ -150,15 +150,15 @@ fn tree_shap(
 }
 
 /// Recursive TreeSHAP traversal generalized to compute contributions
-/// *conditioned* on a feature being present or absent — the core building block
+/// *conditioned* on a feature being present or absent. This is the core building block
 /// for SHAP interaction values (Lundberg et al.).
 ///
 /// `condition` selects the conditioning mode: `0` reproduces the ordinary
-/// TreeSHAP contributions; `+1` fixes `condition_feature` to be **present** (in
-/// the coalition); `-1` fixes it **absent**. `condition_fraction` is the running
+/// TreeSHAP contributions. `+1` fixes `condition_feature` to be **present** (in
+/// the coalition). `-1` fixes it **absent**. `condition_fraction` is the running
 /// weight carried down the tree by that conditioning (it starts at `1.0`). When
 /// conditioning is active the `condition_feature` is never entered into the
-/// decision path, so it receives no attribution of its own; the half-difference
+/// decision path, so it receives no attribution of its own. The half-difference
 /// of the `+1` and `-1` runs yields the interaction of `condition_feature` with
 /// every other feature.
 #[allow(clippy::too_many_arguments)]
@@ -282,7 +282,7 @@ fn tree_shap_cond(
     );
 }
 
-/// Cover-weighted mean prediction of the subtree rooted at `node_index` — the
+/// Cover-weighted mean prediction of the subtree rooted at `node_index`. This is the
 /// tree's expected output `E[f_tree]` when evaluated at the root. This is the
 /// offset TreeSHAP folds into the bias term.
 fn node_mean_value(tree: &RegTree, node_index: usize) -> f64 {
@@ -385,10 +385,10 @@ impl BoostedModel {
     ///
     /// * the off-diagonal entry `M[i][j]` (`i, j < n_features`) is the SHAP
     ///   interaction between features `i` and `j` (symmetric: `M[i][j] ==
-    ///   M[j][i]`), split evenly between the two cells;
+    ///   M[j][i]`) and is split evenly between the two cells.
     /// * the diagonal entry `M[i][i]` is feature `i`'s *main* effect, set so that
     ///   the row sums to feature `i`'s full SHAP value (its
-    ///   [`BoostedModel::predict_contribs`] contribution);
+    ///   [`BoostedModel::predict_contribs`] contribution).
     /// * the final row/column (index `n_features`) carry the bias: `M[nf][nf]`
     ///   holds each tree's expected value `Σ E[f_tree]`, and the remaining bias
     ///   cells are zero.
@@ -549,7 +549,7 @@ mod tests {
     use crate::data::DMatrix;
     use crate::learner::train;
 
-    /// Build a small dense dataset with `nf` features; feature 0 and 1 carry
+    /// Build a small dense dataset with `nf` features. Features 0 and 1 carry
     /// signal, the rest are noise. Returns (data, n_rows).
     fn make_data(n: usize, nf: usize) -> DMatrix {
         let mut x = vec![0f32; n * nf];

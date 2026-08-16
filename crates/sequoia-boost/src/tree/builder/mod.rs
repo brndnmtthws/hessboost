@@ -1,7 +1,7 @@
 //! Tree construction algorithms.
 //!
 //! Each builder grows a single [`crate::tree::RegTree`] from per-instance
-//! gradients. The exact builder is the reference; approximate and histogram
+//! gradients. The exact builder is the reference. Approximate and histogram
 //! builders (added in a later phase) share the same regularized gain math.
 
 mod exact;

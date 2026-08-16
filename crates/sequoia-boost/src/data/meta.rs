@@ -6,16 +6,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FeatureType {
-    /// Ordered numerical feature; splits are `x < threshold`.
+    /// Ordered numerical feature. Splits are `x < threshold`.
     #[default]
     Numerical,
-    /// Unordered categorical feature; splits partition category sets.
+    /// Unordered categorical feature. Splits partition category sets.
     Categorical,
 }
 
 /// Ranking group layout, stored as a prefix-sum (`group_ptr`) over rows.
 ///
-/// `group_ptr` has `num_groups + 1` entries; group `g` spans rows
+/// `group_ptr` has `num_groups + 1` entries. Group `g` spans rows
 /// `group_ptr[g]..group_ptr[g + 1]`. This matches XGBoost's CSR-style group
 /// encoding for learning-to-rank objectives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

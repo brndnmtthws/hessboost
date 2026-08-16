@@ -4,7 +4,7 @@ use crate::data::meta::{FeatureType, GroupInfo};
 use crate::error::{Result, SequoiaError};
 
 /// Returns `true` if `v` should be treated as missing given the sentinel
-/// `missing`. NaN sentinels match any NaN; otherwise an exact bit-compatible
+/// `missing`. NaN sentinels match any NaN. Otherwise an exact bit-compatible
 /// equality is used (mirroring XGBoost's semantics).
 #[inline]
 pub(crate) fn is_missing(v: f32, missing: f32) -> bool {
@@ -112,7 +112,7 @@ impl DMatrix {
 
     /// Build a matrix from compressed-sparse-row arrays.
     ///
-    /// `indptr` must have `n_rows + 1` entries; row `i` spans
+    /// `indptr` must have `n_rows + 1` entries. Row `i` spans
     /// `indices[indptr[i]..indptr[i + 1]]`. Absent columns are treated as
     /// missing (sparsity-aware), so the sentinel is set to NaN.
     pub fn from_csr(
@@ -404,7 +404,7 @@ impl DMatrix {
         self.group.as_ref()
     }
 
-    /// Feature types (always populated; defaults to all numerical).
+    /// Feature types. This is always populated and defaults to all numerical.
     #[inline]
     pub fn feature_types(&self) -> &[FeatureType] {
         &self.feature_types
@@ -601,7 +601,7 @@ impl DMatrix {
 
 /// A compressed-sparse-column view of a [`DMatrix`], built by
 /// [`DMatrix::to_csc`]. Within each column the `(row, value)` pairs are stored
-/// in row order; callers that need value-sorted order (e.g. the exact split
+/// in row order. Callers that need value-sorted order (e.g. the exact split
 /// finder) sort per-column slices themselves.
 #[derive(Debug, Clone)]
 pub struct CscView {

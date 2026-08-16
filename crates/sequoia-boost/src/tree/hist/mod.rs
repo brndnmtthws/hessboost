@@ -51,7 +51,7 @@ pub struct CpuBackend;
 /// Go parallel only for nodes large enough that the per-chunk histogram
 /// allocation and reduction pay for themselves. Below this the reduction
 /// overhead (proportional to `threads × total_bins`) dominates the actual work,
-/// so the sequential path is faster — which is most nodes in a deep tree.
+/// so the sequential path is faster. This describes most nodes in a deep tree.
 const PARALLEL_THRESHOLD: usize = 32_768;
 
 impl HistogramBackend for CpuBackend {

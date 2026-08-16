@@ -43,7 +43,7 @@ pub struct BoostedModel {
     /// The best iteration index selected by early stopping, if any.
     best_iteration: Option<usize>,
     /// Per-tree contribution weights. For a plain `gbtree` model every weight is
-    /// `1.0`; the DART booster stores fractional weights here so dropped trees
+    /// `1.0`. The DART booster stores fractional weights here so dropped trees
     /// can be rescaled. Defaults to empty for models serialized before this
     /// field existed, in which case every tree is treated as weight `1.0`.
     #[serde(default)]
@@ -60,7 +60,7 @@ pub struct BoostedModel {
 /// plus a per-output bias, fit by coordinate descent.
 ///
 /// `weights` has length `n_features * n_outputs` laid out `[feature][output]`
-/// (the weight for feature `f`, output `k` is `weights[f * n_outputs + k]`);
+/// (the weight for feature `f`, output `k` is `weights[f * n_outputs + k]`).
 /// `bias` has length `n_outputs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearModel {
@@ -568,7 +568,7 @@ impl BoostedModel {
     }
 
     /// Parse a model saved in XGBoost's JSON model schema. Best-effort for
-    /// `gbtree` boosters and common objectives; see
+    /// `gbtree` boosters and common objectives. See
     /// [`crate::model::import_xgboost_json`] for the mapping and limitations.
     pub fn from_xgboost_json(json: &str) -> Result<Self> {
         crate::model::import_xgboost_json(json)

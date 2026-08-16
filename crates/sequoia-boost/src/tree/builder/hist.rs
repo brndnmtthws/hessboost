@@ -1,6 +1,6 @@
 //! Histogram-based tree construction (XGBoost's `tree_method=hist`).
 //!
-//! Features are pre-binned once ([`GHistIndex`]); growing a node reduces to
+//! Features are pre-binned once ([`GHistIndex`]). Growing a node reduces to
 //! scanning its per-bin gradient histogram. Sibling histograms are obtained by
 //! subtraction (`sibling = parent − smaller_child`), so only the smaller child
 //! is ever built directly. Supports both `depthwise` and `lossguide` growth.
@@ -121,10 +121,10 @@ impl<'a> HistTreeBuilder<'a> {
 
     /// Grow one tree from the binned dataset.
     ///
-    /// * `ghist` — the binned dataset (built once, reused across rounds).
-    /// * `gpair` — per-row gradient/Hessian (length = dataset rows).
-    /// * `row_subset` — sampled rows for this tree.
-    /// * `sampler` — per-tree column sampler; a fresh subset is drawn per node.
+    /// * `ghist`: the binned dataset (built once, reused across rounds).
+    /// * `gpair`: per-row gradient/Hessian (length = dataset rows).
+    /// * `row_subset`: sampled rows for this tree.
+    /// * `sampler`: per-tree column sampler. A fresh subset is drawn per node.
     pub fn build(
         &self,
         ghist: &GHistIndex,
@@ -590,7 +590,7 @@ impl<'a> HistTreeBuilder<'a> {
     /// bins by their gradient/Hessian ratio, then sweep prefix partitions of that
     /// order. This yields the optimal two-set partition under the standard result
     /// that sorting by the score ratio makes the best subset contiguous. The
-    /// prefix categories form the "left" set; every other (and missing) category
+    /// prefix categories form the "left" set. Every other (and missing) category
     /// goes right.
     #[allow(clippy::too_many_arguments)]
     fn evaluate_categorical(
@@ -720,7 +720,7 @@ fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<HashMap<u32, Vec<u32>>>
 }
 
 /// Intersect a node's allowed set with a feature's interaction set. Both operands
-/// are sorted; `None` denotes "all features". The result is sorted, and `None`
+/// are sorted. `None` denotes "all features". The result is sorted, and `None`
 /// only when both operands are `None`.
 fn next_allowed(
     parent: Option<&[u32]>,

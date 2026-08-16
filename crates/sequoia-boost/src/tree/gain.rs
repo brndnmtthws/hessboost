@@ -100,7 +100,7 @@ pub fn calc_weight(stats: GradStats, reg: &RegParams) -> f64 {
 }
 
 /// Structure score (gain) for a node. When `max_delta_step` is unset this is the
-/// closed-form `Tα(G)² / (H + λ)`; otherwise it is evaluated at the clamped
+/// closed-form `Tα(G)² / (H + λ)`. Otherwise it is evaluated at the clamped
 /// weight to stay consistent with [`calc_weight`].
 pub fn calc_gain(stats: GradStats, reg: &RegParams) -> f64 {
     if stats.hess < reg.min_child_weight || stats.hess <= 0.0 {
@@ -119,7 +119,7 @@ pub fn calc_gain(stats: GradStats, reg: &RegParams) -> f64 {
 }
 
 /// Loss change from splitting `parent` into `left` and `right`:
-/// `gain(L) + gain(R) − gain(parent)`. Larger is better; the caller compares it
+/// `gain(L) + gain(R) − gain(parent)`. Larger is better. The caller compares it
 /// against `γ` (`min_split_loss`) to decide whether to keep the split.
 pub fn split_gain(left: GradStats, right: GradStats, parent: GradStats, reg: &RegParams) -> f64 {
     calc_gain(left, reg) + calc_gain(right, reg) - calc_gain(parent, reg)

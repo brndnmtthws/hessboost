@@ -1,8 +1,8 @@
 //! # sequoia-boost
 //!
 //! A faithful, fast, pure-Rust reimplementation of
-//! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting — no C/C++
-//! dependency, no FFI.
+//! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting with no C/C++
+//! dependency and no FFI.
 //!
 //! ## Quick start
 //!
@@ -38,7 +38,8 @@
 //! ## What's here
 //!
 //! - **Boosters:** `gbtree`, `dart`, `gblinear`.
-//! - **Tree methods:** `exact`, `hist`, `approx`; `depthwise`/`lossguide` growth.
+//! - **Tree methods:** `exact`, `hist`, and `approx`, with `depthwise` or
+//!   `lossguide` growth.
 //! - **Objectives:** regression, binary/multiclass classification, count
 //!   (poisson/gamma/tweedie), learning-to-rank (LambdaMART), and a custom hook
 //!   ([`train_with_objective`]).
@@ -67,7 +68,7 @@
 //!
 //! Objective, metric, and parameter names mirror XGBoost, so configurations
 //! transfer directly. Predictions match XGBoost's *model quality* (parity is
-//! CI-tested) but are not bit-identical — the two histogram implementations pick
+//! CI-tested) but are not bit-identical. The two histogram implementations pick
 //! slightly different split points.
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -96,11 +97,11 @@ pub use metric::{CustomMetric, Metric};
 pub use objective::{CustomObjective, GradPair, Objective};
 pub use tree::{Node, RegTree};
 
-/// Commonly used imports: `use sequoia_boost::prelude::*;`.
+/// Commonly used imports include `use sequoia_boost::prelude::*;`.
 ///
 /// Pulls in the data container, configuration, training entry points, the model
-/// type, and the objective/metric hooks — everything needed for the typical
-/// train → predict workflow.
+/// type, and the objective/metric hooks. This provides everything needed for the
+/// typical train to predict workflow.
 pub mod prelude {
     pub use crate::config::{BoosterKind, GrowPolicy, Monotone, TrainingParams, TreeMethod};
     pub use crate::data::{CsvOptions, DMatrix, FeatureType};

@@ -2,7 +2,7 @@
 //!
 //! Loads fixtures produced by `scripts/gen_fixtures.py` (real XGBoost
 //! predictions) and asserts `sequoia-boost` matches within each fixture's
-//! tolerance. Ignored by default because it requires generated fixtures; run:
+//! tolerance. Ignored by default because it requires generated fixtures. Run:
 //!
 //! ```sh
 //! python scripts/gen_fixtures.py
@@ -88,7 +88,7 @@ fn run_fixture(fx: &Fixture) -> bool {
     }
     mean_abs /= preds.len() as f64;
 
-    // Fit quality against the true labels — the meaningful parity measure.
+    // Fit quality against the true labels, which is the meaningful parity measure.
     // Multiclass: accuracy (higher better). Else: RMSE vs y (lower better).
     let (metric, seq_q, xgb_q, seq_better) = if fx.num_class >= 2 {
         let k = fx.num_class;

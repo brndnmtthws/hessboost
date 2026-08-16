@@ -3,7 +3,7 @@
 
 use super::{weighted_label_mean, GradPair, Objective};
 
-/// Poisson regression (`count:poisson`). Gradient `exp(m) − y`; the Hessian is
+/// Poisson regression (`count:poisson`). Gradient is `exp(m) − y`. The Hessian is
 /// stabilized by `max_delta_step` (default 0.7 in XGBoost) via
 /// `exp(m + max_delta_step)`.
 #[derive(Debug, Clone, Copy)]

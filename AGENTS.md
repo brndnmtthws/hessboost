@@ -1,11 +1,11 @@
-# AGENTS.md — guide for AI coding agents
+# AGENTS.md guide for AI coding agents
 
 Context for automated agents working with **sequoia-boost**, a faithful,
 pure-Rust reimplementation of XGBoost gradient boosting (no C/C++, no FFI).
 Human docs: `README.md` and [docs.rs](https://docs.rs/sequoia-boost).
 
 > This codebase was generated with Claude (Anthropic) under human direction.
-> It is tested and XGBoost-parity-checked in CI but may contain bugs — verify
+> It is tested and XGBoost-parity-checked in CI but may contain bugs. Verify
 > changes with `cargo test`/`cargo clippy` and don't assume unlisted behavior.
 
 ## Using it as a dependency
@@ -44,9 +44,9 @@ Everything in the typical workflow is re-exported from `sequoia_boost::prelude`.
 
 ## Core types
 
-- **`DMatrix`** — data. `from_dense(&[f32], rows, cols)`, `from_csr(indptr, indices, values, cols)`, `from_libsvm(path)`, `from_csv`/`read_csv(reader, &CsvOptions)`. Chainable: `.with_labels(&[f32])`, `.with_weights`, `.with_base_margin` (warm-start), `.with_group_sizes(&[usize])` and `.with_group_weights(&[f32])` (ranking), `.with_feature_types(&[FeatureType])` (categorical).
-- **`TrainingParams`** — config via `TrainingParams::builder()...build()?`. Field/method names mirror XGBoost: `objective`, `num_class`, `eta`, `max_depth`, `max_leaves`, `min_child_weight`, `gamma`, `lambda`, `alpha`, `subsample`, `colsample_bytree`/`bylevel`/`bynode`, `max_bin`, `tree_method` (`TreeMethod::{Auto,Hist,Exact,Approx}`), `grow_policy` (`GrowPolicy::{DepthWise,LossGuide}`), `booster` (`BoosterKind::{GbTree,Dart,GbLinear}`), `monotone_constraints(Vec<Monotone>)`, `interaction_constraints(Vec<Vec<u32>>)`, `base_score`, `eval_metric(name)`, `seed`.
-- **`BoostedModel`** — trained model. `predict` (reported space, e.g. probabilities), `predict_margin` (raw), `predict_class` (argmax), `predict_leaf`, `predict_contribs` (TreeSHAP), `predict_interactions` (TreeSHAP interactions), `feature_importance(ImportanceType)`, `num_trees`. I/O: `save_binary`/`load_binary`, `to_json`/`from_json`/`save_json`/`load_json`, and `save_xgboost_json`/`load_xgboost_json` (interop with real XGBoost).
+- **`DMatrix`** stores data. Use `from_dense(&[f32], rows, cols)`, `from_csr(indptr, indices, values, cols)`, `from_libsvm(path)`, or `from_csv`/`read_csv(reader, &CsvOptions)`. Chainable methods include `.with_labels(&[f32])`, `.with_weights`, `.with_base_margin` (warm-start), `.with_group_sizes(&[usize])` and `.with_group_weights(&[f32])` (ranking), and `.with_feature_types(&[FeatureType])` (categorical).
+- **`TrainingParams`** provides configuration through `TrainingParams::builder()...build()?`. Field and method names mirror XGBoost: `objective`, `num_class`, `eta`, `max_depth`, `max_leaves`, `min_child_weight`, `gamma`, `lambda`, `alpha`, `subsample`, `colsample_bytree`/`bylevel`/`bynode`, `max_bin`, `tree_method` (`TreeMethod::{Auto,Hist,Exact,Approx}`), `grow_policy` (`GrowPolicy::{DepthWise,LossGuide}`), `booster` (`BoosterKind::{GbTree,Dart,GbLinear}`), `monotone_constraints(Vec<Monotone>)`, `interaction_constraints(Vec<Vec<u32>>)`, `base_score`, `eval_metric(name)`, and `seed`.
+- **`BoostedModel`** is the trained model. Methods include `predict` (reported space, e.g. probabilities), `predict_margin` (raw), `predict_class` (argmax), `predict_leaf`, `predict_contribs` (TreeSHAP), `predict_interactions` (TreeSHAP interactions), `feature_importance(ImportanceType)`, and `num_trees`. I/O methods include `save_binary`/`load_binary`, `to_json`/`from_json`/`save_json`/`load_json`, and `save_xgboost_json`/`load_xgboost_json` (interop with real XGBoost).
 
 ## Supported names (strings passed to `.objective(...)` / `.eval_metric(...)`)
 
@@ -56,11 +56,11 @@ Everything in the typical workflow is re-exported from `sequoia_boost::prelude`.
 ## Conventions & gotchas
 
 - **Prediction layout:** single-output and `multi:softmax` → length `n_rows`. `multi:softprob` → `n_rows * num_class`, row-major `[row][class]`. SHAP contribs → `[row][n_features + 1]` (last = bias). SHAP interactions → `[row][(n_features+1)^2]`.
-- **Errors:** everything returns `Result<T, SequoiaError>` (`Result` alias is in the prelude). Prefer `?`; don't `unwrap` in library code.
+- **Errors:** everything returns `Result<T, SequoiaError>` (`Result` alias is in the prelude). Prefer `?` and do not `unwrap` in library code.
 - **Determinism:** identical `(params, data, seed)` ⇒ identical predictions (property-tested).
 - **Parity:** matches XGBoost *model quality* (CI-tested via `tests/parity.rs`), not bit-identical predictions.
-- **`num_class` is required** for `multi:*`; ranking objectives require `with_group_sizes`.
-- No `unsafe` in the public API; `#![forbid(unsafe_op_in_unsafe_fn)]`.
+- **`num_class` is required** for `multi:*`. Ranking objectives require `with_group_sizes`.
+- No `unsafe` appears in the public API. The crate uses `#![forbid(unsafe_op_in_unsafe_fn)]`.
 
 ## Runnable examples (`crates/sequoia-boost/examples/`)
 

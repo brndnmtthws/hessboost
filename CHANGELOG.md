@@ -48,9 +48,9 @@ boosting.
 ### Boosters & tree construction
 - Boosters: `gbtree`, `dart` (tree dropout), `gblinear` (coordinate descent).
 - Tree methods: `exact`, `hist` (histogram + subtraction trick), `approx`
-  (hessian-weighted per-round binning); `depthwise` and `lossguide` growth.
-- Sparsity-aware missing-value handling; row and column subsampling
-  (`bytree` / `bylevel` / `bynode`); multi-core histogram construction (`rayon`).
+  (hessian-weighted per-round binning), plus `depthwise` and `lossguide` growth.
+- Sparsity-aware missing-value handling, row and column subsampling
+  (`bytree` / `bylevel` / `bynode`), and multi-core histogram construction (`rayon`).
 
 ### Objectives & metrics
 - Objectives: `reg:squarederror`, `reg:pseudohubererror`, `reg:gamma`,
@@ -75,7 +75,7 @@ boosting.
 - K-fold cross-validation.
 
 ### Quality
-- Unit, property (`proptest`), and doc tests; XGBoost model-quality parity is
+- Unit, property (`proptest`), and doc tests. XGBoost model-quality parity is
   verified in CI against real XGBoost.
 
 [Unreleased]: https://github.com/pgarrett-scripps/sequoia-boost/compare/v0.2.0...HEAD

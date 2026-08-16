@@ -3,7 +3,7 @@
 //! Each node carries a `[lower, upper]` interval on its leaf weight. A split on a
 //! monotone feature is only allowed when the child weights respect the requested
 //! direction, and the children inherit tightened bounds so the constraint holds
-//! for the whole subtree — the scheme XGBoost uses.
+//! for the whole subtree, following the scheme XGBoost uses.
 
 use crate::config::Monotone;
 use crate::tree::gain::{threshold_l1, GradStats, RegParams};

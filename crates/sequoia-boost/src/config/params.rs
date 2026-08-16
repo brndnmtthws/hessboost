@@ -196,7 +196,7 @@ impl TrainingParams {
     /// Validate mutually-consistent ranges. Called automatically before training.
     pub fn validate(&self) -> Result<()> {
         let unit = |name: &'static str, v: f64| -> Result<()> {
-            if !(0.0..=1.0).contains(&v) {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
                 Err(SequoiaError::invalid_param(
                     name,
                     format!("must be in [0, 1], got {v}"),
@@ -206,7 +206,7 @@ impl TrainingParams {
             }
         };
         let positive = |name: &'static str, v: f64| -> Result<()> {
-            if v.is_nan() || v <= 0.0 {
+            if !v.is_finite() || v <= 0.0 {
                 Err(SequoiaError::invalid_param(
                     name,
                     format!("must be > 0, got {v}"),
@@ -216,7 +216,7 @@ impl TrainingParams {
             }
         };
         let non_negative = |name: &'static str, v: f64| -> Result<()> {
-            if v.is_nan() || v < 0.0 {
+            if !v.is_finite() || v < 0.0 {
                 Err(SequoiaError::invalid_param(
                     name,
                     format!("must be >= 0, got {v}"),
@@ -243,6 +243,12 @@ impl TrainingParams {
         unit("colsample_bynode", self.colsample_bynode)?;
         unit("rate_drop", self.rate_drop)?;
         unit("skip_drop", self.skip_drop)?;
+
+        if let Some(base_score) = self.base_score {
+            if !base_score.is_finite() {
+                return Err(SequoiaError::invalid_param("base_score", "must be finite"));
+            }
+        }
 
         if self.max_bin < 2 {
             return Err(SequoiaError::invalid_param(

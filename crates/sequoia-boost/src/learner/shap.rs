@@ -319,42 +319,54 @@ impl BoostedModel {
     /// of the `n_features + 1` values equals the raw margin from
     /// [`BoostedModel::predict_margin`].
     pub fn predict_contribs(&self, data: &DMatrix) -> Result<Vec<f32>> {
+        self.validate_prediction_data(data)?;
         let n = data.n_rows();
         let k = self.n_outputs();
         let nf = self.n_features();
         let width = nf + 1;
-        let trees = self.trees();
+        let trees = &self.trees()[..self.effective_ntrees()];
 
         // Each tree's root mean value is instance-independent; compute once.
-        let tree_means: Vec<f64> = trees.iter().map(|t| node_mean_value(t, 0)).collect();
+        let tree_means: Vec<f64> = trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
+            .collect();
 
-        let base = self.base_score() as f64;
         let mut out = vec![0f32; n * k * width];
         let mut acc = vec![0f64; k * width]; // reused per row
+        let mut scratch = vec![0f64; nf];
+        let initial = self.initial_margins(data);
 
         for row in 0..n {
             for a in acc.iter_mut() {
                 *a = 0.0;
             }
-            // Seed every output's bias with the base score.
             for c in 0..k {
-                acc[c * width + nf] += base;
+                acc[c * width + nf] = initial[row * k + c] as f64;
+            }
+            if let Some(linear) = self.linear() {
+                for f in 0..nf {
+                    if let Some(x) = data.get(row, f) {
+                        for c in 0..k {
+                            acc[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
+                        }
+                    }
+                }
+                for c in 0..k {
+                    acc[c * width + nf] += linear.bias()[c] as f64;
+                }
             }
             let get = |f: u32| data.get(row, f as usize);
             for (ti, tree) in trees.iter().enumerate() {
                 let cls = ti % k;
                 let off = cls * width;
-                // Feature attributions.
-                tree_shap(
-                    tree,
-                    0,
-                    Vec::new(),
-                    1.0,
-                    1.0,
-                    -1,
-                    &get,
-                    &mut acc[off..off + nf],
-                );
+                scratch.fill(0.0);
+                tree_shap(tree, 0, Vec::new(), 1.0, 1.0, -1, &get, &mut scratch);
+                let weight = self.tree_weight(ti) as f64;
+                for f in 0..nf {
+                    acc[off + f] += weight * scratch[f];
+                }
                 // Tree expected value folds into the bias column.
                 acc[off + nf] += tree_means[ti];
             }
@@ -381,10 +393,8 @@ impl BoostedModel {
     ///   holds each tree's expected value `Σ E[f_tree]`, and the remaining bias
     ///   cells are zero.
     ///
-    /// Consequently the whole matrix sums to `margin(x) − base_score` — the raw
-    /// margin from [`BoostedModel::predict_margin`] minus the global base score,
-    /// which (unlike [`BoostedModel::predict_contribs`]) is *not* folded into the
-    /// bias cell here.
+    /// Consequently the whole matrix sums to the raw margin from
+    /// [`BoostedModel::predict_margin`], including the applicable base margin.
     ///
     /// For a multiclass model (`n_outputs > 1`) the layout is
     /// `n_rows × n_outputs × (n_features + 1)^2`, row-major: the matrix for row
@@ -393,15 +403,20 @@ impl BoostedModel {
     /// `t % n_outputs`.
     #[allow(clippy::needless_range_loop)]
     pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
+        self.validate_prediction_data(data)?;
         let n = data.n_rows();
         let k = self.n_outputs();
         let nf = self.n_features();
         let width = nf + 1;
         let mwidth = width * width;
-        let trees = self.trees();
+        let trees = &self.trees()[..self.effective_ntrees()];
 
         // Each tree's root mean value is instance-independent; compute once.
-        let tree_means: Vec<f64> = trees.iter().map(|t| node_mean_value(t, 0)).collect();
+        let tree_means: Vec<f64> = trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
+            .collect();
 
         let mut out = vec![0f32; n * k * mwidth];
 
@@ -410,6 +425,10 @@ impl BoostedModel {
         let mut on = vec![0f64; k * width]; // condition = +1 (feature present)
         let mut off = vec![0f64; k * width]; // condition = -1 (feature absent)
         let mut mat = vec![0f64; k * mwidth]; // full interaction matrices
+        let mut scratch = vec![0f64; nf];
+        let mut scratch_on = vec![0f64; nf];
+        let mut scratch_off = vec![0f64; nf];
+        let initial = self.initial_margins(data);
 
         for row in 0..n {
             let get = |f: u32| data.get(row, f as usize);
@@ -420,22 +439,30 @@ impl BoostedModel {
                 *v = 0.0;
             }
 
-            // 1. Unconditioned contributions (the diagonal / main effects). The
-            //    bias cell carries each tree's expected value only (no base
-            //    score), so the full matrix sums to `margin − base_score`.
+            for c in 0..k {
+                diag[c * width + nf] = initial[row * k + c] as f64;
+            }
+            if let Some(linear) = self.linear() {
+                for f in 0..nf {
+                    if let Some(x) = data.get(row, f) {
+                        for c in 0..k {
+                            diag[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
+                        }
+                    }
+                }
+                for c in 0..k {
+                    diag[c * width + nf] += linear.bias()[c] as f64;
+                }
+            }
             for (ti, tree) in trees.iter().enumerate() {
                 let cls = ti % k;
                 let base = cls * width;
-                tree_shap(
-                    tree,
-                    0,
-                    Vec::new(),
-                    1.0,
-                    1.0,
-                    -1,
-                    &get,
-                    &mut diag[base..base + nf],
-                );
+                scratch.fill(0.0);
+                tree_shap(tree, 0, Vec::new(), 1.0, 1.0, -1, &get, &mut scratch);
+                let weight = self.tree_weight(ti) as f64;
+                for f in 0..nf {
+                    diag[base + f] += weight * scratch[f];
+                }
                 diag[base + nf] += tree_means[ti];
             }
             for c in 0..k {
@@ -460,6 +487,8 @@ impl BoostedModel {
                 for (ti, tree) in trees.iter().enumerate() {
                     let cls = ti % k;
                     let base = cls * width;
+                    scratch_on.fill(0.0);
+                    scratch_off.fill(0.0);
                     tree_shap_cond(
                         tree,
                         0,
@@ -468,7 +497,7 @@ impl BoostedModel {
                         1.0,
                         -1,
                         &get,
-                        &mut on[base..base + nf],
+                        &mut scratch_on,
                         1,
                         j as i64,
                         1.0,
@@ -481,11 +510,16 @@ impl BoostedModel {
                         1.0,
                         -1,
                         &get,
-                        &mut off[base..base + nf],
+                        &mut scratch_off,
                         -1,
                         j as i64,
                         1.0,
                     );
+                    let weight = self.tree_weight(ti) as f64;
+                    for f in 0..nf {
+                        on[base + f] += weight * scratch_on[f];
+                        off[base + f] += weight * scratch_off[f];
+                    }
                 }
                 for c in 0..k {
                     let mbase = c * mwidth;
@@ -511,7 +545,7 @@ impl BoostedModel {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::TrainingParams;
+    use crate::config::{BoosterKind, TrainingParams};
     use crate::data::DMatrix;
     use crate::learner::train;
 
@@ -550,7 +584,7 @@ mod tests {
         let model = train(&params, &d, 30).unwrap();
 
         let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d);
+        let margin = model.predict_margin(&d).unwrap();
         let width = nf + 1;
         assert_eq!(contribs.len(), n * width);
 
@@ -597,7 +631,7 @@ mod tests {
         assert_eq!(model.n_outputs(), k);
 
         let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d);
+        let margin = model.predict_margin(&d).unwrap();
         let width = nf + 1;
         assert_eq!(contribs.len(), n * k * width);
 
@@ -682,8 +716,7 @@ mod tests {
         assert_eq!(inter.len(), n * mwidth);
 
         let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d);
-        let base = model.base_score() as f64;
+        let margin = model.predict_margin(&d).unwrap();
 
         let mut max_row_err = 0f64;
         let mut max_eff_err = 0f64;
@@ -696,9 +729,9 @@ mod tests {
                 let cval = contribs[row * width + i] as f64;
                 max_row_err = max_row_err.max((s - cval).abs());
             }
-            // Efficiency: the whole matrix sums to margin - base_score.
+            // Efficiency: the whole matrix sums to the full margin.
             let total: f64 = m.iter().map(|&v| v as f64).sum();
-            let target = margin[row] as f64 - base;
+            let target = margin[row] as f64;
             max_eff_err = max_eff_err.max((total - target).abs());
             // Symmetry.
             for i in 0..width {
@@ -746,8 +779,7 @@ mod tests {
         assert_eq!(inter.len(), n * k * mwidth);
 
         let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d);
-        let base = model.base_score() as f64;
+        let margin = model.predict_margin(&d).unwrap();
 
         let mut max_row_err = 0f64;
         let mut max_eff_err = 0f64;
@@ -762,7 +794,7 @@ mod tests {
                     max_row_err = max_row_err.max((s - cval).abs());
                 }
                 let total: f64 = m.iter().map(|&v| v as f64).sum();
-                let target = margin[row * k + c] as f64 - base;
+                let target = margin[row * k + c] as f64;
                 max_eff_err = max_eff_err.max((total - target).abs());
                 for i in 0..width {
                     for j in 0..width {
@@ -775,5 +807,45 @@ mod tests {
         assert!(max_row_err < 1e-4, "row-consistency error {max_row_err}");
         assert!(max_eff_err < 1e-4, "efficiency error {max_eff_err}");
         assert!(max_sym_err < 1e-5, "symmetry error {max_sym_err}");
+    }
+
+    #[test]
+    fn additivity_with_base_margins_dart_and_gblinear() {
+        let n = 48;
+        let x: Vec<f32> = (0..n)
+            .flat_map(|row| [row as f32 / n as f32, (row % 7) as f32])
+            .collect();
+        let y: Vec<f32> = (0..n).map(|row| row as f32 / 10.0).collect();
+        let base: Vec<f32> = (0..n).map(|row| row as f32 / 100.0).collect();
+        let d = DMatrix::from_dense(&x, n, 2)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap()
+            .with_base_margin(&base)
+            .unwrap();
+
+        for booster in [BoosterKind::Dart, BoosterKind::GbLinear] {
+            let params = TrainingParams::builder()
+                .booster(booster)
+                .rate_drop(0.5)
+                .eta(0.2)
+                .max_depth(2)
+                .build()
+                .unwrap();
+            let model = train(&params, &d, 8).unwrap();
+            let margin = model.predict_margin(&d).unwrap();
+            let contribs = model.predict_contribs(&d).unwrap();
+            let interactions = model.predict_interactions(&d).unwrap();
+            let width = d.n_cols() + 1;
+            for row in 0..n {
+                let contribution_sum: f32 = contribs[row * width..(row + 1) * width].iter().sum();
+                let interaction_sum: f32 = interactions
+                    [row * width * width..(row + 1) * width * width]
+                    .iter()
+                    .sum();
+                assert!((contribution_sum - margin[row]).abs() < 1e-4);
+                assert!((interaction_sum - margin[row]).abs() < 1e-4);
+            }
+        }
     }
 }

@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     // Their sum equals the raw margin prediction (SHAP additivity).
     let contribs = model.predict_contribs(&d)?;
     let width = f + 1;
-    let margin0 = model.predict_margin(&d)[0];
+    let margin0 = model.predict_margin(&d)?[0];
     let sum0: f32 = contribs[0..width].iter().sum();
     println!("row 0 SHAP contributions {:?}", &contribs[0..width]);
     println!("  sum {sum0:.4} ≈ margin {margin0:.4}");

@@ -6,9 +6,7 @@
 //! later phase is), but the easiest to verify against XGBoost. Growth is
 //! level-wise (depth-wise): a whole level is scanned per feature pass.
 //!
-//! Monotone and interaction constraints are honored only by the histogram
-//! builder; this exact builder ignores `monotone_constraints` and
-//! `interaction_constraints`.
+//! Monotone and interaction constraints are honored during split search.
 
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
@@ -19,7 +17,7 @@ use crate::tree::constraints::{
 use crate::tree::gain::{calc_gain, calc_weight, GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Tiny epsilon guarding against accepting numerically-zero-gain splits, mirror
 /// of XGBoost's `kRtEps`.
@@ -148,6 +146,7 @@ pub struct ExactTreeBuilder<'a> {
     params: &'a TrainingParams,
     reg: RegParams,
     cons: MonotoneConstraints,
+    interaction_sets: Option<HashMap<u32, Vec<u32>>>,
 }
 
 impl<'a> ExactTreeBuilder<'a> {
@@ -157,6 +156,7 @@ impl<'a> ExactTreeBuilder<'a> {
             params,
             reg: RegParams::from_params(params),
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
+            interaction_sets: build_interaction_sets(&params.interaction_constraints),
         }
     }
 
@@ -191,6 +191,7 @@ impl<'a> ExactTreeBuilder<'a> {
         let mut node_stats: Vec<GradStats> = vec![root];
         // Per-node monotone weight bounds (default `±∞` when unconstrained).
         let mut node_bounds: Vec<Bounds> = vec![Bounds::default()];
+        let mut node_allowed: Vec<Option<Vec<u32>>> = vec![None];
 
         // With no monotone constraints, the cheap closed-form gain path is exact
         // and behaves exactly as before; the bounded path is used otherwise.
@@ -255,6 +256,9 @@ impl<'a> ExactTreeBuilder<'a> {
                         if slot == usize::MAX {
                             continue;
                         }
+                        if !permits(node_allowed[nid as usize].as_deref(), f) {
+                            continue;
+                        }
                         let gp = gpair[r];
                         cat_stats[slot]
                             .entry(val as u32)
@@ -262,6 +266,9 @@ impl<'a> ExactTreeBuilder<'a> {
                             .add(GradStats::new(gp.grad as f64, gp.hess as f64));
                     }
                     for (slot, &nid) in active.iter().enumerate() {
+                        if !permits(node_allowed[nid].as_deref(), f) {
+                            continue;
+                        }
                         self.eval_categorical(
                             &mut best[slot],
                             node_stats[nid],
@@ -290,6 +297,9 @@ impl<'a> ExactTreeBuilder<'a> {
                     if slot == usize::MAX {
                         continue;
                     }
+                    if !permits(node_allowed[nid as usize].as_deref(), f) {
+                        continue;
+                    }
                     let gp = gpair[r];
                     present_total[slot].add(GradStats::new(gp.grad as f64, gp.hess as f64));
                 }
@@ -306,6 +316,9 @@ impl<'a> ExactTreeBuilder<'a> {
                     }
                     let slot = slot_of_node[nid as usize];
                     if slot == usize::MAX {
+                        continue;
+                    }
+                    if !permits(node_allowed[nid as usize].as_deref(), f) {
                         continue;
                     }
                     if has[slot] && val != last_val[slot] {
@@ -388,6 +401,13 @@ impl<'a> ExactTreeBuilder<'a> {
                 node_stats.push(b.right);
                 node_bounds.push(lb_bounds);
                 node_bounds.push(rb_bounds);
+                let allowed = next_allowed(
+                    node_allowed[nid].as_deref(),
+                    b.feature,
+                    self.interaction_sets.as_ref(),
+                );
+                node_allowed.push(allowed.clone());
+                node_allowed.push(allowed);
                 next_active.push(left_id);
                 next_active.push(right_id);
                 splits.push(Split {
@@ -650,6 +670,50 @@ pub fn all_rows(n_rows: usize) -> Vec<u32> {
 /// Utility: the full feature index `0..n_cols` as `u32` (no column sampling).
 pub fn all_features(n_cols: usize) -> Vec<u32> {
     (0..n_cols as u32).collect()
+}
+
+fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<HashMap<u32, Vec<u32>>> {
+    if groups.is_empty() {
+        return None;
+    }
+    let mut sets: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+    for group in groups {
+        for &feature in group {
+            sets.entry(feature)
+                .or_default()
+                .extend(group.iter().copied());
+        }
+    }
+    Some(
+        sets.into_iter()
+            .map(|(feature, allowed)| (feature, allowed.into_iter().collect()))
+            .collect(),
+    )
+}
+
+#[inline]
+fn permits(allowed: Option<&[u32]>, feature: u32) -> bool {
+    allowed.is_none_or(|features| features.binary_search(&feature).is_ok())
+}
+
+fn next_allowed(
+    parent: Option<&[u32]>,
+    feature: u32,
+    sets: Option<&HashMap<u32, Vec<u32>>>,
+) -> Option<Vec<u32>> {
+    let sets = sets?;
+    let singleton = [feature];
+    let feature_set = sets
+        .get(&feature)
+        .map_or(singleton.as_slice(), Vec::as_slice);
+    Some(match parent {
+        None => feature_set.to_vec(),
+        Some(parent) => parent
+            .iter()
+            .copied()
+            .filter(|f| feature_set.binary_search(f).is_ok())
+            .collect(),
+    })
 }
 
 #[cfg(test)]

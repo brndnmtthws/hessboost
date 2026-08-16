@@ -33,8 +33,8 @@ enum Storage {
 ///
 /// Missing values are first-class: in dense storage any entry equal to the
 /// [`DMatrix::missing`] sentinel (NaN by default) is treated as absent, and in
-/// sparse storage implicit zeros are *present* zeros unless the sentinel is
-/// `0.0`. Split finding learns a default direction for absent values, matching
+/// sparse storage absent columns are missing. Split finding learns a default
+/// direction for absent values, matching
 /// XGBoost's sparsity-aware algorithm.
 #[derive(Debug, Clone)]
 pub struct DMatrix {
@@ -78,12 +78,23 @@ impl DMatrix {
                 "from_dense: zero rows or columns",
             ));
         }
-        if data.len() != n_rows * n_cols {
+        let expected = n_rows.checked_mul(n_cols).ok_or_else(|| {
+            SequoiaError::invalid_param("matrix shape", "n_rows * n_cols overflows usize")
+        })?;
+        if data.len() != expected {
             return Err(SequoiaError::DimensionMismatch {
                 what: "dense data length",
-                expected: n_rows * n_cols,
+                expected,
                 got: data.len(),
             });
+        }
+        for &v in data {
+            if !is_missing(v, missing) && !v.is_finite() {
+                return Err(SequoiaError::invalid_param(
+                    "dense data",
+                    "non-missing feature values must be finite",
+                ));
+            }
         }
         Ok(DMatrix {
             n_rows,
@@ -124,6 +135,20 @@ impl DMatrix {
                 got: values.len(),
             });
         }
+        if indptr[0] != 0 {
+            return Err(SequoiaError::invalid_param(
+                "csr indptr",
+                "the first offset must be 0",
+            ));
+        }
+        for pair in indptr.windows(2) {
+            if pair[0] > pair[1] || pair[1] > values.len() {
+                return Err(SequoiaError::invalid_param(
+                    "csr indptr",
+                    "offsets must be monotonic and within the values array",
+                ));
+            }
+        }
         if *indptr.last().unwrap() != values.len() {
             return Err(SequoiaError::DimensionMismatch {
                 what: "csr indptr terminal",
@@ -137,6 +162,23 @@ impl DMatrix {
                     index: m as usize,
                     num_features: n_cols,
                 });
+            }
+        }
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err(SequoiaError::invalid_param(
+                "csr values",
+                "stored feature values must be finite",
+            ));
+        }
+        for row in 0..n_rows {
+            let mut seen = std::collections::HashSet::new();
+            for &col in &indices[indptr[row]..indptr[row + 1]] {
+                if !seen.insert(col) {
+                    return Err(SequoiaError::invalid_param(
+                        "csr indices",
+                        format!("duplicate column {col} in row {row}"),
+                    ));
+                }
             }
         }
         Ok(DMatrix {
@@ -160,6 +202,12 @@ impl DMatrix {
     /// Attach regression/classification labels (`len == n_rows`).
     pub fn with_labels(mut self, labels: &[f32]) -> Result<Self> {
         self.check_row_len("labels", labels.len())?;
+        if labels.iter().any(|v| !v.is_finite()) {
+            return Err(SequoiaError::invalid_param(
+                "labels",
+                "all labels must be finite",
+            ));
+        }
         self.labels = Some(labels.to_vec());
         Ok(self)
     }
@@ -167,6 +215,18 @@ impl DMatrix {
     /// Attach per-instance weights (`len == n_rows`).
     pub fn with_weights(mut self, weights: &[f32]) -> Result<Self> {
         self.check_row_len("weights", weights.len())?;
+        if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(SequoiaError::invalid_param(
+                "weights",
+                "weights must be finite and non-negative",
+            ));
+        }
+        if !weights.iter().any(|v| *v > 0.0) {
+            return Err(SequoiaError::invalid_param(
+                "weights",
+                "at least one weight must be positive",
+            ));
+        }
         self.weights = Some(weights.to_vec());
         Ok(self)
     }
@@ -174,18 +234,43 @@ impl DMatrix {
     /// Attach a per-instance base margin (raw prediction offset, `len == n_rows`
     /// for single-output objectives).
     pub fn with_base_margin(mut self, base_margin: &[f32]) -> Result<Self> {
+        if base_margin.is_empty() || base_margin.len() % self.n_rows != 0 {
+            return Err(SequoiaError::invalid_param(
+                "base_margin",
+                "length must be a non-zero multiple of n_rows",
+            ));
+        }
+        if base_margin.iter().any(|v| !v.is_finite()) {
+            return Err(SequoiaError::invalid_param(
+                "base_margin",
+                "all margins must be finite",
+            ));
+        }
         self.base_margin = Some(base_margin.to_vec());
         Ok(self)
     }
 
     /// Attach ranking group information (sizes sum to `n_rows`).
     pub fn with_group_sizes(mut self, sizes: &[usize]) -> Result<Self> {
+        if sizes.is_empty() || sizes.contains(&0) {
+            return Err(SequoiaError::invalid_param(
+                "group_sizes",
+                "groups must be non-empty and every group must contain a row",
+            ));
+        }
+        let total = sizes.iter().try_fold(0usize, |acc, &s| acc.checked_add(s));
+        let Some(total) = total else {
+            return Err(SequoiaError::invalid_param(
+                "group_sizes",
+                "group-size sum overflows usize",
+            ));
+        };
         let g = GroupInfo::from_sizes(sizes);
-        if g.num_rows() != self.n_rows {
+        if total != self.n_rows {
             return Err(SequoiaError::DimensionMismatch {
                 what: "group sizes sum",
                 expected: self.n_rows,
-                got: g.num_rows(),
+                got: total,
             });
         }
         self.group = Some(g);
@@ -202,6 +287,20 @@ impl DMatrix {
             });
         }
         self.feature_types = types.to_vec();
+        for (col, ty) in types.iter().enumerate() {
+            if *ty == FeatureType::Categorical {
+                for row in 0..self.n_rows {
+                    if let Some(v) = self.get(row, col) {
+                        if v < 0.0 || v.fract() != 0.0 || v >= u32::MAX as f32 {
+                            return Err(SequoiaError::invalid_param(
+                                "categorical feature",
+                                format!("feature {col} contains invalid category value {v}"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         Ok(self)
     }
 
@@ -285,7 +384,9 @@ impl DMatrix {
 
     /// Fetch a single value, returning `None` when the entry is missing.
     pub fn get(&self, row: usize, col: usize) -> Option<f32> {
-        debug_assert!(row < self.n_rows && col < self.n_cols);
+        if row >= self.n_rows || col >= self.n_cols {
+            return None;
+        }
         match &self.storage {
             Storage::Dense(data) => {
                 let v = data[row * self.n_cols + col];
@@ -321,6 +422,9 @@ impl DMatrix {
     /// `out`. Reuses the buffer to avoid per-row allocation in hot loops.
     pub fn row_into(&self, row: usize, out: &mut Vec<Entry>) {
         out.clear();
+        if row >= self.n_rows {
+            return;
+        }
         match &self.storage {
             Storage::Dense(data) => {
                 let base = row * self.n_cols;
@@ -390,6 +494,12 @@ impl DMatrix {
     /// over labels, weights, base margin, and feature metadata. Used for
     /// cross-validation folds. Ranking group info is not carried over.
     pub fn select_rows(&self, rows: &[usize]) -> Result<Self> {
+        if let Some(&row) = rows.iter().find(|&&row| row >= self.n_rows) {
+            return Err(SequoiaError::invalid_param(
+                "rows",
+                format!("row index {row} is out of bounds for {} rows", self.n_rows),
+            ));
+        }
         let mut indptr = Vec::with_capacity(rows.len() + 1);
         indptr.push(0usize);
         let mut indices: Vec<u32> = Vec::new();
@@ -413,7 +523,12 @@ impl DMatrix {
             out.weights = Some(rows.iter().map(|&r| w[r]).collect());
         }
         if let Some(bm) = &self.base_margin {
-            out.base_margin = Some(rows.iter().map(|&r| bm[r]).collect());
+            let nout = bm.len() / self.n_rows;
+            let mut selected = Vec::with_capacity(rows.len() * nout);
+            for &r in rows {
+                selected.extend_from_slice(&bm[r * nout..(r + 1) * nout]);
+            }
+            out.base_margin = Some(selected);
         }
         Ok(out)
     }
@@ -555,5 +670,29 @@ mod tests {
         let d = sample_dense();
         assert!(d.clone().with_labels(&[1.0, 2.0]).is_err());
         assert!(d.with_labels(&[1.0, 2.0, 3.0]).is_ok());
+    }
+
+    #[test]
+    fn malformed_csr_is_rejected() {
+        assert!(DMatrix::from_csr(vec![1, 1], vec![], vec![], 2).is_err());
+        assert!(DMatrix::from_csr(vec![0, 2, 1], vec![0], vec![1.0], 2).is_err());
+        assert!(DMatrix::from_csr(vec![0, 2], vec![0, 0], vec![1.0, 2.0], 2).is_err());
+        assert!(DMatrix::from_csr(vec![0, 1], vec![0], vec![f32::INFINITY], 2).is_err());
+    }
+
+    #[test]
+    fn metadata_values_are_validated() {
+        let d = sample_dense();
+        assert!(d.clone().with_weights(&[1.0, -1.0, 1.0]).is_err());
+        assert!(d.clone().with_weights(&[0.0, 0.0, 0.0]).is_err());
+        assert!(d.clone().with_base_margin(&[0.0, 1.0]).is_err());
+        assert!(d.clone().with_group_sizes(&[1, 0, 2]).is_err());
+        assert!(d.select_rows(&[3]).is_err());
+    }
+
+    #[test]
+    fn categorical_values_must_be_non_negative_integers() {
+        let d = DMatrix::from_dense(&[0.0, 1.5], 2, 1).unwrap();
+        assert!(d.with_feature_types(&[FeatureType::Categorical]).is_err());
     }
 }

@@ -9,6 +9,9 @@ use crate::tree::RegTree;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const NATIVE_MAGIC: &[u8; 4] = b"SQB\0";
+const NATIVE_VERSION: u8 = 1;
+
 /// The kind of feature-importance score to compute, mirroring XGBoost's
 /// `importance_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +74,14 @@ impl LinearModel {
     pub(crate) fn new(weights: Vec<f32>, bias: Vec<f32>) -> Self {
         LinearModel { weights, bias }
     }
+
+    pub(crate) fn weights(&self) -> &[f32] {
+        &self.weights
+    }
+
+    pub(crate) fn bias(&self) -> &[f32] {
+        &self.bias
+    }
 }
 
 impl BoostedModel {
@@ -130,7 +141,7 @@ impl BoostedModel {
     pub(crate) fn predict_margin_dropout(&self, data: &DMatrix, dropped: &[bool]) -> Vec<f32> {
         let n = data.n_rows();
         let k = self.n_outputs();
-        let mut out = vec![self.base_score; n * k];
+        let mut out = self.initial_margins(data);
         for (ti, tree) in self.trees.iter().enumerate() {
             if dropped.get(ti).copied().unwrap_or(false) {
                 continue;
@@ -212,7 +223,7 @@ impl BoostedModel {
 
     /// Number of trees to use at prediction time: `(best_iteration + 1) ×
     /// n_outputs` when early stopping selected one, else all trees.
-    fn effective_ntrees(&self) -> usize {
+    pub(crate) fn effective_ntrees(&self) -> usize {
         match self.best_iteration {
             Some(it) => (it + 1) * self.n_outputs(),
             None => self.trees.len(),
@@ -221,21 +232,30 @@ impl BoostedModel {
 
     /// Raw margin predictions using the effective tree count. The output is laid
     /// out `[instance][output]` (length `n_rows × n_outputs`).
-    pub fn predict_margin(&self, data: &DMatrix) -> Vec<f32> {
+    pub fn predict_margin(&self, data: &DMatrix) -> Result<Vec<f32>> {
         self.predict_margin_limited(data, self.effective_ntrees())
     }
 
     /// Raw margin predictions using only the first `ntree_limit` trees
     /// (`0` = all trees, ignoring early stopping). Tree `t` contributes to
     /// output `t % n_outputs`.
-    pub fn predict_margin_limited(&self, data: &DMatrix, ntree_limit: usize) -> Vec<f32> {
+    pub fn predict_margin_limited(&self, data: &DMatrix, ntree_limit: usize) -> Result<Vec<f32>> {
+        self.validate_prediction_data(data)?;
+        Ok(self.predict_margin_limited_unchecked(data, ntree_limit))
+    }
+
+    pub(crate) fn predict_margin_limited_unchecked(
+        &self,
+        data: &DMatrix,
+        ntree_limit: usize,
+    ) -> Vec<f32> {
         let n = data.n_rows();
         let k = self.n_outputs();
         // A gblinear model predicts from its linear parameters and ignores the
         // (empty) tree ensemble: margin(row, k) = base_score + bias[k] +
         // Σ_f weights[f][k] * x[row, f], with missing features contributing 0.
         if let Some(lm) = &self.linear {
-            let mut out = vec![self.base_score; n * k];
+            let mut out = self.initial_margins(data);
             for row in 0..n {
                 for c in 0..k {
                     out[row * k + c] += lm.bias[c];
@@ -262,18 +282,7 @@ impl BoostedModel {
         // Initialize from the dataset's per-instance base margin when present
         // (it overrides the scalar base score, matching XGBoost); otherwise use
         // the trained global bias.
-        let mut out = vec![self.base_score; n * k];
-        if let Some(bm) = data.base_margin() {
-            if bm.len() == n * k {
-                out.copy_from_slice(bm);
-            } else if bm.len() == n {
-                for row in 0..n {
-                    for c in 0..k {
-                        out[row * k + c] = bm[row];
-                    }
-                }
-            }
-        }
+        let mut out = self.initial_margins(data);
         for (ti, tree) in self.trees[..limit].iter().enumerate() {
             let w = self.tree_weight(ti);
             let cls = ti % k;
@@ -284,17 +293,29 @@ impl BoostedModel {
         out
     }
 
-    /// Predictions in the objective's reported space (probabilities for
-    /// logistic/softmax, rates for count objectives). For multiclass this is an
-    /// `n_rows × num_class` probability matrix; see [`BoostedModel::predict_class`]
-    /// for hard class labels.
+    /// Predictions in the objective's reported space. `multi:softprob` returns
+    /// an `n_rows × num_class` probability matrix while `multi:softmax` returns
+    /// one class index per row, encoded as `f32`.
     pub fn predict(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        let mut margin = self.predict_margin(data);
+        self.validate_prediction_data(data)?;
+        let mut margin = self.predict_margin(data)?;
         // A model trained with a custom objective cannot reconstruct its
         // transform from the name; fall back to the identity (raw margins),
         // mirroring how XGBoost returns margins for custom objectives.
         if let Ok(obj) = self.rebuild_objective() {
             obj.pred_transform(&mut margin);
+        }
+        if self.objective == "multi:softmax" {
+            let k = self.n_outputs();
+            return Ok(margin
+                .chunks_exact(k)
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                        .map_or(0.0, |(i, _)| i as f32)
+                })
+                .collect());
         }
         Ok(margin)
     }
@@ -310,6 +331,10 @@ impl BoostedModel {
         if k == 1 {
             for (i, o) in out.iter_mut().enumerate() {
                 *o = u32::from(probs[i] > 0.5);
+            }
+        } else if self.objective == "multi:softmax" {
+            for (dst, &class) in out.iter_mut().zip(&probs) {
+                *dst = class as u32;
             }
         } else {
             for i in 0..n {
@@ -327,7 +352,8 @@ impl BoostedModel {
     }
 
     /// Per-row leaf indices for each tree (shape `n_rows × num_trees`, row-major).
-    pub fn predict_leaf(&self, data: &DMatrix) -> Vec<u32> {
+    pub fn predict_leaf(&self, data: &DMatrix) -> Result<Vec<u32>> {
+        self.validate_prediction_data(data)?;
         let n = data.n_rows();
         let t = self.trees.len();
         let mut out = vec![0u32; n * t];
@@ -337,7 +363,7 @@ impl BoostedModel {
                 out[row * t + ti] = leaf as u32;
             }
         }
-        out
+        Ok(out)
     }
 
     /// Compute feature importance of the requested type, returned as a map from
@@ -385,15 +411,82 @@ impl BoostedModel {
         self.n_features
     }
 
-    /// Serialize the model to a compact binary blob (bincode).
+    pub(crate) fn linear(&self) -> Option<&LinearModel> {
+        self.linear.as_ref()
+    }
+
+    pub(crate) fn has_non_unit_tree_weights(&self) -> bool {
+        (0..self.trees.len()).any(|i| self.tree_weight(i) != 1.0)
+    }
+
+    pub(crate) fn initial_margins(&self, data: &DMatrix) -> Vec<f32> {
+        let n = data.n_rows();
+        let k = self.n_outputs();
+        let mut out = vec![self.base_score; n * k];
+        if let Some(bm) = data.base_margin() {
+            if bm.len() == n * k {
+                out.copy_from_slice(bm);
+            } else if bm.len() == n {
+                for row in 0..n {
+                    for c in 0..k {
+                        out[row * k + c] = bm[row];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn validate_prediction_data(&self, data: &DMatrix) -> Result<()> {
+        if data.n_cols() != self.n_features {
+            return Err(crate::error::SequoiaError::DimensionMismatch {
+                what: "prediction feature count",
+                expected: self.n_features,
+                got: data.n_cols(),
+            });
+        }
+        let n = data.n_rows();
+        let k = self.n_outputs();
+        if let Some(margin) = data.base_margin() {
+            if margin.len() != n && margin.len() != n * k {
+                return Err(crate::error::SequoiaError::DimensionMismatch {
+                    what: "prediction base_margin length",
+                    expected: n * k,
+                    got: margin.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize the model to a compact Postcard binary blob.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).map_err(|e| crate::error::SequoiaError::ModelFormat(e.to_string()))
+        let payload = postcard::to_stdvec(self)
+            .map_err(|e| crate::error::SequoiaError::ModelFormat(e.to_string()))?;
+        let mut bytes = Vec::with_capacity(NATIVE_MAGIC.len() + 1 + payload.len());
+        bytes.extend_from_slice(NATIVE_MAGIC);
+        bytes.push(NATIVE_VERSION);
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
     }
 
     /// Deserialize a model from a binary blob produced by [`BoostedModel::to_bytes`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        bincode::deserialize(bytes)
-            .map_err(|e| crate::error::SequoiaError::ModelFormat(e.to_string()))
+        if bytes.len() < NATIVE_MAGIC.len() + 1 || &bytes[..NATIVE_MAGIC.len()] != NATIVE_MAGIC {
+            return Err(crate::error::SequoiaError::ModelFormat(
+                "invalid native model header".to_string(),
+            ));
+        }
+        if bytes[NATIVE_MAGIC.len()] != NATIVE_VERSION {
+            return Err(crate::error::SequoiaError::ModelFormat(format!(
+                "unsupported native model version {}",
+                bytes[NATIVE_MAGIC.len()]
+            )));
+        }
+        let model: Self = postcard::from_bytes(&bytes[NATIVE_MAGIC.len() + 1..])
+            .map_err(|e| crate::error::SequoiaError::ModelFormat(e.to_string()))?;
+        model.validate_structure()?;
+        Ok(model)
     }
 
     /// Save the model to a file in the native binary format.
@@ -415,7 +508,45 @@ impl BoostedModel {
 
     /// Deserialize a model from a JSON string.
     pub fn from_json(s: &str) -> Result<Self> {
-        Ok(serde_json::from_str(s)?)
+        let model: Self = serde_json::from_str(s)?;
+        model.validate_structure()?;
+        Ok(model)
+    }
+
+    pub(crate) fn validate_structure(&self) -> Result<()> {
+        use crate::error::SequoiaError;
+
+        if self.n_features == 0 || !self.base_score.is_finite() {
+            return Err(SequoiaError::ModelFormat(
+                "model has invalid feature count or base score".to_string(),
+            ));
+        }
+        if !self.tree_weights.is_empty() && self.tree_weights.len() != self.trees.len() {
+            return Err(SequoiaError::ModelFormat(
+                "tree_weights length does not match trees".to_string(),
+            ));
+        }
+        if self.tree_weights.iter().any(|weight| !weight.is_finite()) {
+            return Err(SequoiaError::ModelFormat(
+                "tree weights must be finite".to_string(),
+            ));
+        }
+        for (tree_id, tree) in self.trees.iter().enumerate() {
+            if !tree.is_valid_for_features(self.n_features) {
+                return Err(SequoiaError::ModelFormat(format!(
+                    "tree {tree_id} contains invalid nodes"
+                )));
+            }
+        }
+        if let Some(linear) = &self.linear {
+            let outputs = self.n_outputs();
+            if linear.bias.len() != outputs || linear.weights.len() != self.n_features * outputs {
+                return Err(SequoiaError::ModelFormat(
+                    "linear model dimensions are invalid".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Save the model to a JSON file.

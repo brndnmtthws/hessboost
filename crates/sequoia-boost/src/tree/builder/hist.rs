@@ -101,8 +101,8 @@ pub struct HistTreeBuilder<'a> {
     cons: MonotoneConstraints,
     /// Per-feature interaction sets: feature -> sorted set of features it may be
     /// combined with on a path (its interaction set). `None` means interaction
-    /// constraints are inactive (no filtering). A feature absent from the map
-    /// appears in no constraint group, so its interaction set is "all features".
+    /// constraints are inactive (no filtering). An unlisted feature may only
+    /// interact with itself.
     interaction_sets: Option<HashMap<u32, Vec<u32>>>,
     backend: CpuBackend,
 }
@@ -117,17 +117,6 @@ impl<'a> HistTreeBuilder<'a> {
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
             backend: CpuBackend,
         }
-    }
-
-    /// Interaction set for a feature: the features it may be combined with on a
-    /// path. `None` means "all features" (constraints inactive, or the feature
-    /// appears in no group).
-    #[inline]
-    fn interaction_set(&self, feature: u32) -> Option<&[u32]> {
-        self.interaction_sets
-            .as_ref()
-            .and_then(|m| m.get(&feature))
-            .map(|v| v.as_slice())
     }
 
     /// Grow one tree from the binned dataset.
@@ -363,10 +352,10 @@ impl<'a> HistTreeBuilder<'a> {
 
         // Both children share the same allowed feature set: the parent's set
         // intersected with the split feature's interaction set. Inactive ⇒ `None`.
-        let child_allowed = if self.interaction_sets.is_none() {
-            None
+        let child_allowed = if let Some(interaction_sets) = &self.interaction_sets {
+            next_allowed(entry.allowed.as_deref(), b.feature, interaction_sets)
         } else {
-            intersect_allowed(entry.allowed.as_deref(), self.interaction_set(b.feature))
+            None
         };
 
         // Each child draws its own column subset (per-node sampling).
@@ -709,8 +698,8 @@ impl<'a> HistTreeBuilder<'a> {
 /// Precompute per-feature interaction sets from the constraint groups.
 ///
 /// The interaction set of a feature is the union of every group that contains
-/// it (which includes the feature itself). A feature that appears in no group is
-/// simply absent from the map: its interaction set is "all features". Returns
+/// it (which includes the feature itself). A feature that appears in no group
+/// may only interact with itself. Returns
 /// `None` when no constraints are configured (the inactive, no-filtering case).
 fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<HashMap<u32, Vec<u32>>> {
     if groups.is_empty() {
@@ -733,17 +722,23 @@ fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<HashMap<u32, Vec<u32>>>
 /// Intersect a node's allowed set with a feature's interaction set. Both operands
 /// are sorted; `None` denotes "all features". The result is sorted, and `None`
 /// only when both operands are `None`.
-fn intersect_allowed(parent: Option<&[u32]>, feat: Option<&[u32]>) -> Option<Vec<u32>> {
-    match (parent, feat) {
-        (None, None) => None,
-        (None, Some(v)) | (Some(v), None) => Some(v.to_vec()),
-        (Some(p), Some(v)) => Some(
-            p.iter()
-                .copied()
-                .filter(|f| v.binary_search(f).is_ok())
-                .collect(),
-        ),
-    }
+fn next_allowed(
+    parent: Option<&[u32]>,
+    feature: u32,
+    sets: &HashMap<u32, Vec<u32>>,
+) -> Option<Vec<u32>> {
+    let singleton = [feature];
+    let feature_set = sets
+        .get(&feature)
+        .map_or(singleton.as_slice(), Vec::as_slice);
+    Some(match parent {
+        None => feature_set.to_vec(),
+        Some(parent) => parent
+            .iter()
+            .copied()
+            .filter(|f| feature_set.binary_search(f).is_ok())
+            .collect(),
+    })
 }
 
 /// Per-node statistics and monotone bounds, indexed by node id.

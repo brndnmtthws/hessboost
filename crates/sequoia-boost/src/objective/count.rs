@@ -52,6 +52,10 @@ impl Objective for PoissonObjective {
         preds.iter_mut().for_each(|p| *p = p.exp());
     }
 
+    fn prob_to_margin(&self, base_score: f32) -> f32 {
+        base_score.max(1e-6).ln()
+    }
+
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
         (weighted_label_mean(labels, weights).max(1e-6)).ln() as f32
     }
@@ -87,6 +91,10 @@ impl Objective for GammaObjective {
 
     fn pred_transform(&self, preds: &mut [f32]) {
         preds.iter_mut().for_each(|p| *p = p.exp());
+    }
+
+    fn prob_to_margin(&self, base_score: f32) -> f32 {
+        base_score.max(1e-6).ln()
     }
 
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
@@ -144,6 +152,10 @@ impl Objective for TweedieObjective {
 
     fn pred_transform(&self, preds: &mut [f32]) {
         preds.iter_mut().for_each(|p| *p = p.exp());
+    }
+
+    fn prob_to_margin(&self, base_score: f32) -> f32 {
+        base_score.max(1e-6).ln()
     }
 
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {

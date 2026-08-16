@@ -160,7 +160,7 @@ impl Metric for Auc {
     fn eval(&self, preds: &[f32], labels: &[f32], _weights: Option<&[f32]>) -> f64 {
         let n = preds.len();
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| preds[a].partial_cmp(&preds[b]).unwrap());
+        order.sort_by(|&a, &b| preds[a].total_cmp(&preds[b]));
 
         // Assign average ranks (1-based), resolving ties.
         let mut ranks = vec![0.0f64; n];
@@ -381,7 +381,7 @@ impl Ndcg {
 
         // DCG in prediction order.
         let mut order: Vec<usize> = (0..m).collect();
-        order.sort_by(|&a, &b| preds[b].partial_cmp(&preds[a]).unwrap());
+        order.sort_by(|&a, &b| preds[b].total_cmp(&preds[a]));
         let dcg: f64 = order[..cut]
             .iter()
             .enumerate()
@@ -390,7 +390,7 @@ impl Ndcg {
 
         // Ideal DCG: labels sorted by descending relevance.
         let mut ideal: Vec<f64> = labels.iter().map(|&l| l as f64).collect();
-        ideal.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        ideal.sort_by(|a, b| b.total_cmp(a));
         let idcg: f64 = ideal[..cut]
             .iter()
             .enumerate()
@@ -473,7 +473,7 @@ impl MeanAveragePrecision {
         let cut = self.k.map_or(m, |k| k.min(m));
 
         let mut order: Vec<usize> = (0..m).collect();
-        order.sort_by(|&a, &b| preds[b].partial_cmp(&preds[a]).unwrap());
+        order.sort_by(|&a, &b| preds[b].total_cmp(&preds[a]));
 
         let num_rel = labels.iter().filter(|&&l| l > 0.0).count();
         if num_rel == 0 {
@@ -549,7 +549,7 @@ impl Metric for AucPr {
 
         // Sort instance indices by descending predicted score.
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| preds[b].partial_cmp(&preds[a]).unwrap());
+        order.sort_by(|&a, &b| preds[b].total_cmp(&preds[a]));
 
         let mut total_pos = 0.0f64;
         let mut total_neg = 0.0f64;

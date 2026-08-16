@@ -150,7 +150,13 @@ pub fn create_objective(params: &TrainingParams) -> Result<Box<dyn Objective>> {
             let prob = params.objective == "multi:softprob";
             Ok(Box::new(SoftmaxObjective::new(params.num_class, prob)))
         }
-        "count:poisson" => Ok(Box::new(PoissonObjective::default())),
+        "count:poisson" => Ok(Box::new(PoissonObjective::new(
+            if params.max_delta_step > 0.0 {
+                params.max_delta_step as f32
+            } else {
+                0.7
+            },
+        ))),
         "reg:gamma" => Ok(Box::new(GammaObjective)),
         "reg:tweedie" => Ok(Box::new(TweedieObjective::default())),
         "rank:pairwise" => Ok(Box::new(LambdaMartObjective::pairwise())),

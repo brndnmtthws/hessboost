@@ -59,14 +59,32 @@ const INVALID_NODE: i32 = i32::MAX;
 /// accepted by [`import_xgboost_json`] as well as upstream XGBoost. See the
 /// module docs (above) for the `base_score` space convention.
 pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
+    if model.linear().is_some() {
+        return Err(fmt_err(
+            "XGBoost JSON export does not support gblinear models",
+        ));
+    }
+    if model.has_non_unit_tree_weights() {
+        return Err(fmt_err(
+            "XGBoost JSON export does not support DART tree weights",
+        ));
+    }
+    if model
+        .trees()
+        .iter()
+        .any(|tree| tree.nodes().iter().any(|node| node.is_categorical))
+    {
+        return Err(fmt_err(
+            "XGBoost JSON export does not support categorical splits",
+        ));
+    }
     let num_feature = model.n_features();
     let num_class = model.num_class();
     let objective = model.objective().to_string();
     let n_outputs = model.n_outputs();
-    let n_trees = model.num_trees();
+    let n_trees = model.effective_ntrees();
 
-    let trees: Vec<Value> = model
-        .trees()
+    let trees: Vec<Value> = model.trees()[..n_trees]
         .iter()
         .enumerate()
         .map(|(id, t)| tree_to_json(id, t, num_feature))
@@ -158,7 +176,18 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .ok_or_else(|| fmt_err("missing `model.trees` array"))?;
     let mut trees = Vec::with_capacity(trees_json.len());
     for (i, tj) in trees_json.iter().enumerate() {
-        trees.push(tree_from_json(tj).map_err(|e| fmt_err(format!("tree {i}: {e}")))?);
+        let tree = tree_from_json(tj).map_err(|e| fmt_err(format!("tree {i}: {e}")))?;
+        if let Some(node) = tree
+            .nodes()
+            .iter()
+            .find(|node| !node.is_leaf() && node.split_feature as usize >= num_feature)
+        {
+            return Err(fmt_err(format!(
+                "tree {i}: split feature {} exceeds num_feature {num_feature}",
+                node.split_feature
+            )));
+        }
+        trees.push(tree);
     }
 
     let stored_base = lmp
@@ -168,13 +197,9 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .ok_or_else(|| fmt_err("missing/invalid `base_score`"))?;
     let base_margin = link_import(stored_base, &objective, num_class);
 
-    Ok(BoostedModel::from_parts(
-        trees,
-        base_margin,
-        objective,
-        num_class,
-        num_feature,
-    ))
+    let imported = BoostedModel::from_parts(trees, base_margin, objective, num_class, num_feature);
+    imported.validate_structure()?;
+    Ok(imported)
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +280,9 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
     let left =
         arr(tj, "left_children", scalar_f64).ok_or_else(|| fmt_err("missing `left_children`"))?;
     let n = left.len();
+    if n == 0 {
+        return Err(fmt_err("tree contains no nodes"));
+    }
     let left: Vec<i32> = left.iter().map(|&v| v as i32).collect();
 
     let right: Vec<i32> = arr(tj, "right_children", scalar_f64)
@@ -262,6 +290,17 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
         .iter()
         .map(|&v| v as i32)
         .collect();
+    if right.len() != n {
+        return Err(fmt_err("child arrays have different lengths"));
+    }
+
+    if arr(tj, "split_type", scalar_f64)
+        .unwrap_or_default()
+        .iter()
+        .any(|&kind| kind != 0.0)
+    {
+        return Err(fmt_err("categorical XGBoost trees are not supported"));
+    }
 
     let split_indices = arr(tj, "split_indices", scalar_f64).unwrap_or_default();
     let split_conditions = arr(tj, "split_conditions", scalar_f64)
@@ -297,6 +336,9 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
                 cat_end: 0,
             });
         } else {
+            if left[i] < 0 || right[i] < 0 || left[i] as usize >= n || right[i] as usize >= n {
+                return Err(fmt_err(format!("node {i} has an invalid child index")));
+            }
             nodes.push(Node {
                 split_feature: at(&split_indices, i) as u32,
                 split_cond: at(&split_conditions, i) as f32,
@@ -410,8 +452,8 @@ fn fmt_err(msg: impl Into<String>) -> SequoiaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TrainingParams;
-    use crate::data::DMatrix;
+    use crate::config::{BoosterKind, TrainingParams};
+    use crate::data::{DMatrix, FeatureType};
     use crate::learner::train;
 
     /// Train a small squared-error model on a noisy nonlinear signal.
@@ -529,13 +571,13 @@ mod tests {
 
         // x=1.0 (< 1.5) -> left leaf +10 ; x=2.0 (>= 1.5) -> right leaf -10.
         let d = DMatrix::from_dense(&[1.0, 2.0], 2, 1).unwrap();
-        let margins = model.predict_margin(&d);
+        let margins = model.predict_margin(&d).unwrap();
         assert!((margins[0] - 10.0).abs() < 1e-6, "got {}", margins[0]);
         assert!((margins[1] + 10.0).abs() < 1e-6, "got {}", margins[1]);
 
         // Missing value follows default_left = true -> left leaf.
         let dm = DMatrix::from_dense(&[f32::NAN], 1, 1).unwrap();
-        let mm = model.predict_margin(&dm);
+        let mm = model.predict_margin(&dm).unwrap();
         assert!(
             (mm[0] - 10.0).abs() < 1e-6,
             "missing routed wrong: {}",
@@ -549,5 +591,32 @@ mod tests {
                      "learner_model_param": {"num_feature": "3", "base_score": "0"}}}"#;
         let err = import_xgboost_json(js).unwrap_err();
         assert!(matches!(err, SequoiaError::ModelFormat(_)));
+    }
+
+    #[test]
+    fn unsupported_exports_are_rejected() {
+        let (_, d) = reg_model();
+        for booster in [BoosterKind::Dart, BoosterKind::GbLinear] {
+            let params = TrainingParams::builder()
+                .booster(booster)
+                .rate_drop(0.5)
+                .build()
+                .unwrap();
+            let model = train(&params, &d, 3).unwrap();
+            assert!(export_xgboost_json(&model).is_err());
+        }
+
+        let categories = [0.0, 1.0, 2.0, 0.0, 1.0, 2.0];
+        let labels = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let categorical = DMatrix::from_dense(&categories, 6, 1)
+            .unwrap()
+            .with_labels(&labels)
+            .unwrap()
+            .with_feature_types(&[FeatureType::Categorical])
+            .unwrap();
+        let params = TrainingParams::builder().max_depth(2).build().unwrap();
+        let model = train(&params, &categorical, 3).unwrap();
+        assert!(model.trees().iter().any(|tree| tree.node(0).is_categorical));
+        assert!(export_xgboost_json(&model).is_err());
     }
 }

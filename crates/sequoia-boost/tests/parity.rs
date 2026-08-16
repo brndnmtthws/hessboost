@@ -31,10 +31,13 @@ struct Fixture {
     objective: String,
     num_class: usize,
     num_round: usize,
-    n_rows: usize,
+    n_train: usize,
+    n_test: usize,
     n_cols: usize,
-    x: Vec<f32>,
-    y: Vec<f32>,
+    x_train: Vec<f32>,
+    y_train: Vec<f32>,
+    x_test: Vec<f32>,
+    y_test: Vec<f32>,
     params: FixtureParams,
     xgb_pred: Vec<f32>,
 }
@@ -45,10 +48,11 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn run_fixture(fx: &Fixture) -> bool {
-    let d = DMatrix::from_dense(&fx.x, fx.n_rows, fx.n_cols)
+    let dtrain = DMatrix::from_dense(&fx.x_train, fx.n_train, fx.n_cols)
         .unwrap()
-        .with_labels(&fx.y)
+        .with_labels(&fx.y_train)
         .unwrap();
+    let dtest = DMatrix::from_dense(&fx.x_test, fx.n_test, fx.n_cols).unwrap();
     let params = TrainingParams::builder()
         .objective(fx.objective.clone())
         .num_class(fx.num_class)
@@ -64,8 +68,8 @@ fn run_fixture(fx: &Fixture) -> bool {
         .build()
         .unwrap();
 
-    let model = train(&params, &d, fx.num_round).unwrap();
-    let preds = model.predict(&d).unwrap();
+    let model = train(&params, &dtrain, fx.num_round).unwrap();
+    let preds = model.predict(&dtest).unwrap();
     assert_eq!(
         preds.len(),
         fx.xgb_pred.len(),
@@ -90,7 +94,7 @@ fn run_fixture(fx: &Fixture) -> bool {
         let k = fx.num_class;
         let acc = |p: &[f32]| -> f64 {
             let mut correct = 0usize;
-            for (i, &yi) in fx.y.iter().enumerate() {
+            for (i, &yi) in fx.y_test.iter().enumerate() {
                 let row = &p[i * k..i * k + k];
                 let mut best = 0usize;
                 for c in 1..k {
@@ -102,7 +106,7 @@ fn run_fixture(fx: &Fixture) -> bool {
                     correct += 1;
                 }
             }
-            correct as f64 / fx.y.len() as f64
+            correct as f64 / fx.y_test.len() as f64
         };
         let (s, x) = (acc(&preds), acc(&fx.xgb_pred));
         // sequoia within 2 accuracy points of xgboost.
@@ -111,10 +115,10 @@ fn run_fixture(fx: &Fixture) -> bool {
         let rmse = |p: &[f32]| -> f64 {
             let s: f64 = p
                 .iter()
-                .zip(&fx.y)
+                .zip(&fx.y_test)
                 .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
                 .sum();
-            (s / fx.y.len() as f64).sqrt()
+            (s / fx.y_test.len() as f64).sqrt()
         };
         let (s, x) = (rmse(&preds), rmse(&fx.xgb_pred));
         // sequoia RMSE within 8% of xgboost's.

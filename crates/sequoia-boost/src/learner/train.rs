@@ -189,7 +189,63 @@ fn train_impl(
     objective: Box<dyn crate::objective::Objective>,
     metric_override: Option<Box<dyn crate::metric::Metric>>,
 ) -> Result<TrainResult> {
+    if params.nthread > 0 {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(params.nthread)
+            .build()
+            .map_err(|error| SequoiaError::invalid_param("nthread", error.to_string()))?;
+        return pool.install(|| {
+            train_impl_inner(
+                params,
+                dtrain,
+                num_boost_round,
+                evals,
+                early_stopping_rounds,
+                objective,
+                metric_override,
+            )
+        });
+    }
+    train_impl_inner(
+        params,
+        dtrain,
+        num_boost_round,
+        evals,
+        early_stopping_rounds,
+        objective,
+        metric_override,
+    )
+}
+
+fn train_impl_inner(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    num_boost_round: usize,
+    evals: &[EvalSet],
+    early_stopping_rounds: Option<usize>,
+    objective: Box<dyn crate::objective::Objective>,
+    metric_override: Option<Box<dyn crate::metric::Metric>>,
+) -> Result<TrainResult> {
     params.validate()?;
+
+    if !params.missing.is_nan() {
+        return Err(SequoiaError::invalid_param(
+            "missing",
+            "set the sentinel when constructing DMatrix with from_dense_with_missing",
+        ));
+    }
+    if early_stopping_rounds == Some(0) {
+        return Err(SequoiaError::invalid_param(
+            "early_stopping_rounds",
+            "must be greater than zero",
+        ));
+    }
+    if early_stopping_rounds.is_some() && evals.is_empty() {
+        return Err(SequoiaError::invalid_param(
+            "early_stopping_rounds",
+            "requires at least one evaluation dataset",
+        ));
+    }
 
     let labels = dtrain
         .labels()
@@ -198,6 +254,43 @@ fn train_impl(
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
+    if let Some(base_score) = params.base_score {
+        let invalid = match params.objective.as_str() {
+            "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
+            "count:poisson" | "reg:gamma" | "reg:tweedie" => base_score <= 0.0,
+            _ => false,
+        };
+        if invalid {
+            return Err(SequoiaError::invalid_param(
+                "base_score",
+                "is outside the objective's valid output domain",
+            ));
+        }
+    }
+    validate_dataset(params, dtrain, n_features, n_out, "dtrain")?;
+    for (data, name) in evals {
+        validate_dataset(params, data, n_features, n_out, name)?;
+    }
+    if params.monotone_constraints.len() > n_features {
+        return Err(SequoiaError::invalid_param(
+            "monotone_constraints",
+            "contains more entries than the training matrix has features",
+        ));
+    }
+    for group in &params.interaction_constraints {
+        if group.is_empty() {
+            return Err(SequoiaError::invalid_param(
+                "interaction_constraints",
+                "constraint groups cannot be empty",
+            ));
+        }
+        if let Some(&feature) = group.iter().find(|&&f| f as usize >= n_features) {
+            return Err(SequoiaError::FeatureOutOfBounds {
+                index: feature as usize,
+                num_features: n_features,
+            });
+        }
+    }
 
     // Base score in margin space (0 per class for multi-output objectives).
     let base_margin = if n_out == 1 {
@@ -220,11 +313,17 @@ fn train_impl(
     // instead of growing trees; it skips the tree/dart path entirely. Eval sets
     // and early stopping are not applied to it (the history stays empty).
     if params.booster == BoosterKind::GbLinear {
+        if !evals.is_empty() || early_stopping_rounds.is_some() {
+            return Err(SequoiaError::invalid_param(
+                "booster",
+                "gblinear does not yet support evaluation sets or early stopping",
+            ));
+        }
         let linear = crate::booster::gblinear::train_gblinear(
             params,
             dtrain,
             num_boost_round,
-            base_margin,
+            &model.initial_margins(dtrain),
             n_out,
             objective.as_ref(),
         )?;
@@ -294,7 +393,7 @@ fn train_impl(
             // eval margins are no longer additive — recompute them from the
             // (weighted) ensemble.
             for (ei, (d, _)) in evals.iter().enumerate() {
-                eval_margins[ei] = model.predict_margin_limited(d, 0);
+                eval_margins[ei] = model.predict_margin_limited_unchecked(d, 0);
             }
         } else {
             // 1. Gradients from the current margins (all outputs at once).
@@ -344,7 +443,7 @@ fn train_impl(
             for (ei, (d, name)) in evals.iter().enumerate() {
                 let mut preds = eval_margins[ei].clone();
                 objective.pred_transform(&mut preds);
-                let dl = d.labels().unwrap_or(&[]);
+                let dl = d.labels().expect("evaluation labels validated");
                 let dw = d.weights();
                 for m in &metrics {
                     let v = m.eval_grouped(&preds, dl, dw, d.group());
@@ -389,7 +488,7 @@ fn train_impl(
 /// least one when any exist). The round's gradients are computed from the
 /// ensemble **excluding** `D`; the new per-output trees are then fit on those
 /// gradients. Using XGBoost's `tree` normalization, if `k = |D|` the new trees
-/// get weight `1/(k+1)` and each dropped tree is rescaled by `k/(k+1)`.
+/// get weight `1/(k+eta)` and each dropped tree is rescaled by `k/(k+eta)`.
 #[allow(clippy::too_many_arguments)]
 fn dart_round(
     model: &mut BoostedModel,
@@ -436,7 +535,8 @@ fn dart_round(
 
     // 3. Fit one new tree per output on those gradients.
     let row_subset = sample_rows(n, params.subsample, &mut rng);
-    let new_weight = 1.0 / (k as f32 + 1.0);
+    let eta = params.eta as f32;
+    let new_weight = if k == 0 { 1.0 } else { 1.0 / (k as f32 + eta) };
     for kk in 0..n_out {
         let gk: &[GradPair] = if n_out == 1 {
             gpair
@@ -454,7 +554,11 @@ fn dart_round(
     }
 
     // 4. Rescale the dropped trees so the ensemble stays balanced.
-    let factor = k as f32 / (k as f32 + 1.0);
+    let factor = if k == 0 {
+        1.0
+    } else {
+        k as f32 / (k as f32 + eta)
+    };
     for &i in &drop_indices {
         model.scale_tree_weight(i, factor);
     }
@@ -492,7 +596,7 @@ fn sample_features(n: usize, colsample: f64, rng: &mut StdRng) -> Vec<u32> {
 /// to every `(row, output)`, then overridden by the dataset's per-instance
 /// `base_margin` when present. Accepts a base margin of length `n_rows`
 /// (broadcast across outputs) or `n_rows * n_out` (per output); a mismatched
-/// length is ignored (the scalar stands).
+/// length is rejected before this helper is called.
 fn init_margin(data: &DMatrix, base_margin: f32, n_out: usize) -> Vec<f32> {
     let n = data.n_rows();
     let mut m = vec![base_margin; n * n_out];
@@ -508,6 +612,60 @@ fn init_margin(data: &DMatrix, base_margin: f32, n_out: usize) -> Vec<f32> {
         }
     }
     m
+}
+
+fn validate_dataset(
+    params: &TrainingParams,
+    data: &DMatrix,
+    n_features: usize,
+    n_out: usize,
+    name: &str,
+) -> Result<()> {
+    let labels = data.labels().ok_or_else(|| {
+        SequoiaError::invalid_param("evals", format!("dataset `{name}` has no labels"))
+    })?;
+    if data.n_cols() != n_features {
+        return Err(SequoiaError::DimensionMismatch {
+            what: "dataset feature count",
+            expected: n_features,
+            got: data.n_cols(),
+        });
+    }
+    if let Some(margin) = data.base_margin() {
+        let expected = data.n_rows().checked_mul(n_out).ok_or_else(|| {
+            SequoiaError::invalid_param("base_margin", "expected length overflows usize")
+        })?;
+        if margin.len() != data.n_rows() && margin.len() != expected {
+            return Err(SequoiaError::DimensionMismatch {
+                what: "base_margin length",
+                expected,
+                got: margin.len(),
+            });
+        }
+    }
+    let invalid = match params.objective.as_str() {
+        "binary:logistic" => labels.iter().any(|&y| y != 0.0 && y != 1.0),
+        "multi:softmax" | "multi:softprob" => labels
+            .iter()
+            .any(|&y| y.fract() != 0.0 || y < 0.0 || y >= params.num_class as f32),
+        "count:poisson" | "reg:tweedie" => labels.iter().any(|&y| y < 0.0),
+        "reg:gamma" => labels.iter().any(|&y| y <= 0.0),
+        "rank:pairwise" | "rank:ndcg" | "rank:map" => labels.iter().any(|&y| y < 0.0),
+        _ => false,
+    };
+    if invalid {
+        return Err(SequoiaError::invalid_param(
+            "labels",
+            format!("dataset `{name}` has labels outside the objective's valid domain"),
+        ));
+    }
+    if params.objective.starts_with("rank:") && data.group().is_none() {
+        return Err(SequoiaError::invalid_param(
+            "group_sizes",
+            format!("ranking dataset `{name}` requires group information"),
+        ));
+    }
+    Ok(())
 }
 
 /// Build the per-tree column sampler: draw the `colsample_bytree` pool from
@@ -942,7 +1100,7 @@ mod tests {
             .unwrap();
         let model = train(&params, &d, 40).unwrap();
         // Compare weighted prediction against a manual unit-weight tree sum.
-        let preds = model.predict_margin(&d);
+        let preds = model.predict_margin(&d).unwrap();
         let n = d.n_rows();
         let mut manual = vec![model.base_score(); n];
         for tree in model.trees() {
@@ -1101,7 +1259,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d_bm, 0).unwrap();
-        let margin = model.predict_margin(&d_bm);
+        let margin = model.predict_margin(&d_bm).unwrap();
         for (m, b) in margin.iter().zip(&bm) {
             assert!((m - b).abs() < 1e-6, "{m} vs {b}");
         }
@@ -1116,11 +1274,14 @@ mod tests {
             .eta(0.3)
             .build()
             .unwrap();
-        let plain = train(&params, &d, 10).unwrap().predict_margin(&d);
+        let plain = train(&params, &d, 10).unwrap().predict_margin(&d).unwrap();
 
         let bm = vec![2.0f32; 60];
         let d_bm = d.with_base_margin(&bm).unwrap();
-        let shifted = train(&params, &d_bm, 10).unwrap().predict_margin(&d_bm);
+        let shifted = train(&params, &d_bm, 10)
+            .unwrap()
+            .predict_margin(&d_bm)
+            .unwrap();
 
         // A nonzero starting margin changes the fitted margins.
         assert!(plain
@@ -1339,5 +1500,114 @@ mod tests {
         assert!(res.model.num_trees() < 200);
         assert!(res.model.best_iteration().is_some());
         assert!(!res.history.is_empty());
+    }
+
+    #[test]
+    fn multiclass_softmax_returns_one_label_per_row() {
+        let x = [0.0, 0.1, 0.5, 0.6, 0.9, 1.0];
+        let y = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0];
+        let d = DMatrix::from_dense(&x, 6, 1)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("multi:softmax")
+            .num_class(3)
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 20).unwrap();
+        let predictions = model.predict(&d).unwrap();
+        assert_eq!(predictions.len(), d.n_rows());
+        assert!(predictions
+            .iter()
+            .all(|value| value.fract() == 0.0 && *value < 3.0));
+        assert_eq!(
+            model.predict_class(&d).unwrap(),
+            predictions
+                .iter()
+                .map(|value| *value as u32)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn count_base_score_is_in_reported_space() {
+        let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
+            .unwrap()
+            .with_labels(&[1.0, 2.0])
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("count:poisson")
+            .base_score(0.5)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 0).unwrap();
+        assert!(model
+            .predict(&d)
+            .unwrap()
+            .iter()
+            .all(|prediction| (*prediction - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn invalid_training_and_evaluation_inputs_return_errors() {
+        let d = step_dataset(20);
+        let params = TrainingParams::builder()
+            .objective("binary:logistic")
+            .build()
+            .unwrap();
+        assert!(train_with_eval(&params, &d, 2, &[], Some(1)).is_err());
+        assert!(train_with_eval(&params, &d, 2, &[(&d, "eval")], Some(0)).is_err());
+
+        let unlabeled = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
+        assert!(train_with_eval(&params, &d, 2, &[(&unlabeled, "eval")], None).is_err());
+        let wrong_features = DMatrix::from_dense(&[0.0, 0.0], 1, 2)
+            .unwrap()
+            .with_labels(&[0.0])
+            .unwrap();
+        assert!(train_with_eval(&params, &d, 2, &[(&wrong_features, "eval")], None).is_err());
+        let model = train(&params, &d, 2).unwrap();
+        assert!(model.predict(&wrong_features).is_err());
+        assert!(model.predict_margin(&wrong_features).is_err());
+        assert!(model.predict_leaf(&wrong_features).is_err());
+    }
+
+    #[test]
+    fn exact_interaction_constraints_confine_each_path() {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..128 {
+            let a = (i & 1) as f32;
+            let b = ((i >> 1) & 1) as f32;
+            x.extend_from_slice(&[a, b]);
+            y.push(f32::from(a != b));
+        }
+        let d = DMatrix::from_dense(&x, 128, 2)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .tree_method(TreeMethod::Exact)
+            .max_depth(3)
+            .interaction_constraints(vec![vec![0], vec![1]])
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 3).unwrap();
+
+        fn visit(tree: &RegTree, node: usize, path: &mut Vec<u32>) {
+            let current = tree.node(node);
+            if current.is_leaf() {
+                assert!(path.iter().all(|feature| *feature == path[0]));
+                return;
+            }
+            path.push(current.split_feature);
+            visit(tree, current.left as usize, path);
+            visit(tree, current.right as usize, path);
+            path.pop();
+        }
+        for tree in model.trees() {
+            visit(tree, 0, &mut Vec::new());
+        }
     }
 }

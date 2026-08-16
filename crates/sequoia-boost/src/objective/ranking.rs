@@ -89,7 +89,7 @@ impl LambdaMartObjective {
 
         // Rank documents by descending score; `pos[local]` is the 0-based rank.
         let mut order: Vec<usize> = (0..m).collect();
-        order.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
         let mut pos = vec![0usize; m];
         for (rank, &local) in order.iter().enumerate() {
             pos[local] = rank;
@@ -247,7 +247,7 @@ impl MetricCtx {
                 let gains: Vec<f64> = labs.iter().map(|&l| gain(l)).collect();
                 // Ideal DCG: gains sorted descending, standard log2 discount.
                 let mut ideal = gains.clone();
-                ideal.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                ideal.sort_by(|a, b| b.total_cmp(a));
                 let idcg: f64 = ideal
                     .iter()
                     .enumerate()

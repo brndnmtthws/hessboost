@@ -60,7 +60,7 @@ fn bias_delta(sum_grad: f64, sum_hess: f64) -> f64 {
 
 /// Fit a linear booster by coordinate descent.
 ///
-/// `base_margin` is the scalar starting margin (the model's `base_score`), and
+/// `initial_margin` contains the per-row starting margins, and
 /// `n_out` is the number of outputs (`num_class` for multiclass, else 1). The
 /// returned [`LinearModel`] holds `weights` laid out `[feature][output]` and a
 /// per-output `bias`.
@@ -68,7 +68,7 @@ pub(crate) fn train_gblinear(
     params: &TrainingParams,
     dtrain: &DMatrix,
     num_round: usize,
-    base_margin: f32,
+    initial_margin: &[f32],
     n_out: usize,
     objective: &dyn Objective,
 ) -> Result<LinearModel> {
@@ -107,7 +107,7 @@ pub(crate) fn train_gblinear(
 
     // Running margins [instance][output]; gradients recomputed each round, then
     // updated incrementally as each coordinate moves.
-    let mut margin = vec![base_margin; n * n_out];
+    let mut margin = initial_margin.to_vec();
     let mut gpair = vec![GradPair::default(); n * n_out];
 
     for _round in 0..num_round {

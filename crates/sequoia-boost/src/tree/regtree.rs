@@ -111,6 +111,42 @@ impl RegTree {
         self.nodes.iter().filter(|n| n.is_leaf()).count()
     }
 
+    pub(crate) fn is_valid_for_features(&self, n_features: usize) -> bool {
+        let locally_valid = !self.nodes.is_empty()
+            && self.nodes.iter().all(|node| {
+                node.sum_hess.is_finite()
+                    && node.leaf_value.is_finite()
+                    && node.split_cond.is_finite()
+                    && node.split_gain.is_finite()
+                    && (node.is_leaf()
+                        || ((node.split_feature as usize) < n_features
+                            && node.left >= 0
+                            && node.right >= 0
+                            && (node.left as usize) < self.nodes.len()
+                            && (node.right as usize) < self.nodes.len()
+                            && (!node.is_categorical
+                                || (node.cat_begin <= node.cat_end
+                                    && (node.cat_end as usize) <= self.categories.len()))))
+            });
+        if !locally_valid {
+            return false;
+        }
+        let mut seen = vec![false; self.nodes.len()];
+        let mut stack = vec![0usize];
+        while let Some(node_id) = stack.pop() {
+            if seen[node_id] {
+                return false;
+            }
+            seen[node_id] = true;
+            let node = &self.nodes[node_id];
+            if !node.is_leaf() {
+                stack.push(node.left as usize);
+                stack.push(node.right as usize);
+            }
+        }
+        seen.into_iter().all(|visited| visited)
+    }
+
     /// Read-only access to the node array.
     #[inline]
     pub fn nodes(&self) -> &[Node] {

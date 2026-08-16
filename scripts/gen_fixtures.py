@@ -44,17 +44,21 @@ def _rng():
     return np.random.default_rng(20260720)
 
 
-def _write(name, x, y, params, num_class, preds, tol):
-    x = np.ascontiguousarray(x, dtype=np.float32)
+def _write(name, x_train, y_train, x_test, y_test, params, num_class, preds):
+    x_train = np.ascontiguousarray(x_train, dtype=np.float32)
+    x_test = np.ascontiguousarray(x_test, dtype=np.float32)
     fixture = {
         "name": name,
         "objective": params["objective"],
         "num_class": num_class,
         "num_round": NUM_ROUND,
-        "n_rows": int(x.shape[0]),
-        "n_cols": int(x.shape[1]),
-        "x": x.reshape(-1).tolist(),
-        "y": np.asarray(y, dtype=np.float32).tolist(),
+        "n_train": int(x_train.shape[0]),
+        "n_test": int(x_test.shape[0]),
+        "n_cols": int(x_train.shape[1]),
+        "x_train": x_train.reshape(-1).tolist(),
+        "y_train": np.asarray(y_train, dtype=np.float32).tolist(),
+        "x_test": x_test.reshape(-1).tolist(),
+        "y_test": np.asarray(y_test, dtype=np.float32).tolist(),
         "params": {
             "max_depth": params["max_depth"],
             "eta": params["eta"],
@@ -66,47 +70,50 @@ def _write(name, x, y, params, num_class, preds, tol):
             "base_score": params["base_score"],
         },
         "xgb_pred": np.asarray(preds, dtype=np.float32).reshape(-1).tolist(),
-        "tolerance": tol,
     }
     os.makedirs(FIX_DIR, exist_ok=True)
     path = os.path.join(FIX_DIR, f"{name}.json")
     with open(path, "w") as fh:
         json.dump(fixture, fh)
-    print(f"wrote {path}  ({fixture['n_rows']}x{fixture['n_cols']})")
+    print(
+        f"wrote {path}  "
+        f"({fixture['n_train']} train, {fixture['n_test']} test, {fixture['n_cols']} features)"
+    )
 
 
-def _train(x, y, params, num_class):
-    dtrain = xgb.DMatrix(x, label=y)
+def _train(x_train, y_train, x_test, params, num_class):
+    dtrain = xgb.DMatrix(x_train, label=y_train)
+    dtest = xgb.DMatrix(x_test)
     p = dict(COMMON, **params)
     if num_class:
         p["num_class"] = num_class
     booster = xgb.train(p, dtrain, num_boost_round=NUM_ROUND)
-    return booster.predict(dtrain)
+    return booster.predict(dtest)
 
 
 def regression():
     rng = _rng()
-    x = rng.random((2000, 8), dtype=np.float32)
-    y = 2 * x[:, 0] - 3 * x[:, 1] ** 2 + 0.5 * x[:, 2] + 0.1 * rng.standard_normal(2000)
-    preds = _train(x, y, dict(objective="reg:squarederror"), 0)
-    _write("regression", x, y, dict(COMMON, objective="reg:squarederror"), 0, preds, 1e-3)
+    x = rng.random((2500, 8), dtype=np.float32)
+    y = 2 * x[:, 0] - 3 * x[:, 1] ** 2 + 0.5 * x[:, 2] + 0.1 * rng.standard_normal(2500)
+    preds = _train(x[:2000], y[:2000], x[2000:], dict(objective="reg:squarederror"), 0)
+    _write("regression", x[:2000], y[:2000], x[2000:], y[2000:], dict(COMMON, objective="reg:squarederror"), 0, preds)
 
 
 def binary():
     rng = _rng()
-    x = rng.random((2000, 8), dtype=np.float32)
+    x = rng.random((2500, 8), dtype=np.float32)
     logit = 3 * x[:, 0] - 2 * x[:, 1]
-    y = (1 / (1 + np.exp(-logit)) > rng.random(2000)).astype(np.float32)
-    preds = _train(x, y, dict(objective="binary:logistic"), 0)
-    _write("binary", x, y, dict(COMMON, objective="binary:logistic"), 0, preds, 1e-3)
+    y = (1 / (1 + np.exp(-logit)) > rng.random(2500)).astype(np.float32)
+    preds = _train(x[:2000], y[:2000], x[2000:], dict(objective="binary:logistic"), 0)
+    _write("binary", x[:2000], y[:2000], x[2000:], y[2000:], dict(COMMON, objective="binary:logistic"), 0, preds)
 
 
 def multiclass():
     rng = _rng()
-    x = rng.random((2000, 8), dtype=np.float32)
+    x = rng.random((2500, 8), dtype=np.float32)
     y = (x[:, 0] * 3).astype(int).clip(0, 2).astype(np.float32)
-    preds = _train(x, y, dict(objective="multi:softprob"), 3)
-    _write("multiclass", x, y, dict(COMMON, objective="multi:softprob"), 3, preds, 2e-3)
+    preds = _train(x[:2000], y[:2000], x[2000:], dict(objective="multi:softprob"), 3)
+    _write("multiclass", x[:2000], y[:2000], x[2000:], y[2000:], dict(COMMON, objective="multi:softprob"), 3, preds)
 
 
 if __name__ == "__main__":

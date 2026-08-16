@@ -24,6 +24,7 @@ EXPECTED_CARGO_AUTHORS = [
     "Patrick T. Garrett <pgarrett@scripps.edu>",
     "John R. Yates III <jyates@scripps.edu>",
 ]
+EXPECTED_ZENODO_AUTHORS = ["Garrett, Patrick T.", "Yates, John R. III"]
 EXPECTED_IDENTITIES = [
     ("pgarrett@scripps.edu", "0000-0002-8434-9693", "Scripps Research Institute"),
     ("jyates@scripps.edu", "0000-0001-5267-1672", "Scripps Research Institute"),
@@ -87,22 +88,21 @@ def main() -> None:
 
     cargo_authors = [cargo_author(author) for author in package["authors"]]
     cff_authors = [cff_author(author) for author in cff["authors"]]
-    zenodo_authors = []
-    for creator in zenodo["creators"]:
-        name = creator["name"]
-        if "," in name:
-            family, given = [part.strip() for part in name.split(",", 1)]
-            name = f"{given} {family}"
-        zenodo_authors.append(name)
-    if cargo_authors != cff_authors or cargo_authors != zenodo_authors:
+    zenodo_authors = [creator["name"] for creator in zenodo["creators"]]
+    if cargo_authors != cff_authors:
         fail(
-            f"author names or order disagree: Cargo={cargo_authors}, "
-            f"CFF={cff_authors}, Zenodo={zenodo_authors}"
+            f"Cargo and CFF author names or order disagree: "
+            f"Cargo={cargo_authors}, CFF={cff_authors}"
         )
     if cargo_authors != EXPECTED_AUTHORS:
         fail(f"authors must be exactly {EXPECTED_AUTHORS}, found {cargo_authors}")
     if package["authors"] != EXPECTED_CARGO_AUTHORS:
         fail("Cargo author names and emails do not match the verified identities")
+    if zenodo_authors != EXPECTED_ZENODO_AUTHORS:
+        fail(
+            f"Zenodo authors must be exactly {EXPECTED_ZENODO_AUTHORS}, "
+            f"found {zenodo_authors}"
+        )
     cff_identities = [
         (
             author.get("email"),

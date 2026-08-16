@@ -18,6 +18,7 @@ except ImportError as error:
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/pgarrett-scripps/sequoia-boost"
+CONCEPT_DOI = "10.5281/zenodo.21968435"
 REQUIRED_ZENODO = {
     "title",
     "version",
@@ -101,8 +102,13 @@ def main() -> None:
         fail("CFF url must identify the documentation site")
     if zenodo["communities"] or zenodo["grants"]:
         fail("communities and grants require project-specific verification")
-    if "doi" in cff or "doi" in zenodo:
-        fail("metadata must not claim an unverified DOI")
+    if cff.get("doi") != CONCEPT_DOI:
+        fail(f"CITATION.cff must use the verified concept DOI {CONCEPT_DOI}")
+    if "doi" in zenodo:
+        fail("Zenodo deposit metadata must not hard-code a release DOI")
+    readme = (ROOT / "README.md").read_text()
+    if f"https://doi.org/{CONCEPT_DOI}" not in readme:
+        fail("README must link to the verified concept DOI")
 
     tags = subprocess.run(
         ["git", "tag", "--list", f"v{package['version']}"],
@@ -118,7 +124,7 @@ def main() -> None:
 
     print(
         f"metadata valid: version {package['version']}, {words}-word abstract, "
-        f"{len(cargo_authors)} authors, no DOI"
+        f"{len(cargo_authors)} authors, concept DOI {CONCEPT_DOI}"
     )
 
 

@@ -3,6 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/sequoia-boost.svg)](https://crates.io/crates/sequoia-boost)
 [![docs.rs](https://img.shields.io/docsrs/sequoia-boost)](https://docs.rs/sequoia-boost)
 [![CI](https://github.com/pgarrett-scripps/sequoia-boost/actions/workflows/ci.yml/badge.svg)](https://github.com/pgarrett-scripps/sequoia-boost/actions/workflows/ci.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21968435.svg)](https://doi.org/10.5281/zenodo.21968435)
 [![license](https://img.shields.io/crates/l/sequoia-boost.svg)](LICENSE)
 
 A faithful, fast, pure-Rust reimplementation of [XGBoost](https://github.com/dmlc/xgboost)
@@ -180,10 +181,10 @@ it with appropriate scrutiny — it is tested and parity-checked but not warrant
 ## Citation and archiving
 
 Citation metadata is provided in [`CITATION.cff`](CITATION.cff), with matching
-deposit metadata in [`.zenodo.json`](.zenodo.json). Zenodo assigns the release
-DOI when it archives the GitHub release. After the first archive is published,
-the default branch uses Zenodo's verified concept DOI, while the version DOI
-identifies only that immutable release record.
+deposit metadata in [`.zenodo.json`](.zenodo.json). Cite the project using the
+stable [Zenodo concept DOI](https://doi.org/10.5281/zenodo.21968435). The
+immutable v0.2.0 archive has release DOI
+[10.5281/zenodo.21968436](https://doi.org/10.5281/zenodo.21968436).
 
 ## Acknowledgments
 

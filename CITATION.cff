@@ -7,7 +7,6 @@ authors:
   - family-names: Garrett
     given-names: Patrick
     email: pgarrett@scripps.edu
-  - name: Claude (Anthropic)
 repository-code: https://github.com/pgarrett-scripps/sequoia-boost
 url: https://docs.rs/sequoia-boost
 doi: 10.5281/zenodo.21968435

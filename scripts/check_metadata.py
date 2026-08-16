@@ -19,6 +19,7 @@ except ImportError as error:
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/pgarrett-scripps/sequoia-boost"
 CONCEPT_DOI = "10.5281/zenodo.21968435"
+EXPECTED_AUTHORS = ["Patrick Garrett"]
 REQUIRED_ZENODO = {
     "title",
     "version",
@@ -86,6 +87,14 @@ def main() -> None:
             f"author names or order disagree: Cargo={cargo_authors}, "
             f"CFF={cff_authors}, Zenodo={zenodo_authors}"
         )
+    if cargo_authors != EXPECTED_AUTHORS:
+        fail(f"authors must be exactly {EXPECTED_AUTHORS}, found {cargo_authors}")
+    if any(
+        term in author.lower()
+        for author in cargo_authors
+        for term in ("claude", "anthropic", "ai assistant", "language model")
+    ):
+        fail("AI systems must not be listed as authors or creators")
 
     abstract = normalize(cff["abstract"])
     if abstract != normalize(zenodo["description"]):
@@ -124,7 +133,7 @@ def main() -> None:
 
     print(
         f"metadata valid: version {package['version']}, {words}-word abstract, "
-        f"{len(cargo_authors)} authors, concept DOI {CONCEPT_DOI}"
+        f"{len(cargo_authors)} author(s), concept DOI {CONCEPT_DOI}"
     )
 
 

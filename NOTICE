@@ -7,10 +7,11 @@ provided in the LICENSE file.
 
 ------------------------------------------------------------------------------
 
-Authorship
+Development provenance
 
-The sequoia-boost implementation was written by Claude, Anthropic's AI coding
-assistant, directed and reviewed by Patrick Garrett. It is AI-generated code:
+The sequoia-boost implementation was generated with Claude, Anthropic's AI
+coding assistant, under Patrick Garrett's direction and review. The AI system
+is not an author. It is AI-generated code:
 tested (unit, property, and XGBoost model-quality parity in CI) but not
 warranted, and it may contain bugs or subtle correctness issues. It is provided
 "AS IS" under the Apache License, Version 2.0, without warranty of any kind.

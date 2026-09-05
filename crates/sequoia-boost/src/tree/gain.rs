@@ -15,6 +15,7 @@ use crate::config::TrainingParams;
 
 /// Accumulated first/second-order statistics for a set of instances.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
 pub struct GradStats {
     /// Sum of gradients.
     pub grad: f64,

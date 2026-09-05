@@ -11,6 +11,8 @@
 
 use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, Entry};
+use rayon::prelude::*;
+use std::ops::Range;
 
 /// Backing storage for bin indices, in the narrowest width that fits.
 #[derive(Debug, Clone)]
@@ -48,26 +50,44 @@ impl GHistIndex {
     pub fn from_dmatrix(data: &DMatrix, cuts: HistCuts) -> Self {
         let n_rows = data.n_rows();
         let n_cols = cuts.n_features();
-        let mut row_ptr = Vec::with_capacity(n_rows + 1);
-        row_ptr.push(0usize);
-        let mut bins: Vec<u32> = Vec::new();
-        let mut row: Vec<Entry> = Vec::new();
-        let mut dense = true;
-        for r in 0..n_rows {
-            data.row_into(r, &mut row);
-            // Dense iff every row lists all features in ascending index order.
-            dense &=
-                row.len() == n_cols && row.iter().enumerate().all(|(c, e)| e.index as usize == c);
-            for e in &row {
-                bins.push(cuts.bin_of(e.index as usize, e.value));
-            }
-            row_ptr.push(bins.len());
-        }
-
-        // Downcast to u16 when every global bin index fits.
-        let store = if cuts.total_bins() <= u16::MAX as usize + 1 {
-            BinStore::U16(bins.iter().map(|&b| b as u16).collect())
+        let threads = rayon::current_num_threads();
+        let chunks: Vec<_> = if threads > 1 && n_rows.saturating_mul(n_cols) >= 65_536 {
+            let grain = n_rows.div_ceil(threads).max(1024);
+            (0..n_rows.div_ceil(grain))
+                .into_par_iter()
+                .map(|chunk| {
+                    bin_rows(
+                        data,
+                        &cuts,
+                        chunk * grain..((chunk + 1) * grain).min(n_rows),
+                    )
+                })
+                .collect()
         } else {
+            vec![bin_rows(data, &cuts, 0..n_rows)]
+        };
+        let total = chunks.iter().map(|chunk| chunk.bins.len()).sum();
+        let dense = chunks.iter().all(|chunk| chunk.dense);
+        let mut row_ptr = Vec::with_capacity(n_rows + 1);
+        row_ptr.push(0);
+        let mut offset = 0;
+        for chunk in &chunks {
+            row_ptr.extend(chunk.row_ends.iter().map(|end| offset + end));
+            offset += chunk.bins.len();
+        }
+        // Convert directly into the final width without an intermediate merged
+        // u32 buffer. Chunk order preserves the input rows and feature order.
+        let store = if cuts.total_bins() <= u16::MAX as usize + 1 {
+            let mut bins = Vec::with_capacity(total);
+            for chunk in chunks {
+                bins.extend(chunk.bins.into_iter().map(|bin| bin as u16));
+            }
+            BinStore::U16(bins)
+        } else {
+            let mut bins = Vec::with_capacity(total);
+            for chunk in chunks {
+                bins.extend(chunk.bins);
+            }
             BinStore::U32(bins)
         };
 
@@ -170,9 +190,91 @@ impl GHistIndex {
     }
 }
 
+struct BinnedRows {
+    row_ends: Vec<usize>,
+    bins: Vec<u32>,
+    dense: bool,
+}
+
+fn bin_rows(data: &DMatrix, cuts: &HistCuts, rows: Range<usize>) -> BinnedRows {
+    let mut chunk = BinnedRows {
+        row_ends: Vec::with_capacity(rows.len()),
+        bins: Vec::new(),
+        dense: true,
+    };
+    let mut row: Vec<Entry> = Vec::new();
+    for r in rows {
+        data.row_into(r, &mut row);
+        chunk.dense &= row.len() == cuts.n_features()
+            && row.iter().enumerate().all(|(c, e)| e.index as usize == c);
+        chunk
+            .bins
+            .extend(row.iter().map(|e| cuts.bin_of(e.index as usize, e.value)));
+        chunk.row_ends.push(chunk.bins.len());
+    }
+    chunk
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_binning_preserves_cuts_rows_and_width() {
+        use crate::data::FeatureType;
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for (rows, cols, missing, categorical) in [
+            (1025, 80, false, false),
+            (257, 300, false, false),
+            (1025, 80, true, false),
+            (1025, 80, false, true),
+        ] {
+            let values: Vec<_> = (0..rows * cols)
+                .map(|i| {
+                    if missing && i % 11 < 2 {
+                        -1.0
+                    } else if categorical && i % cols == 0 {
+                        (i / cols % 4) as f32
+                    } else {
+                        ((i / cols * 17 + i % cols * 31) % 509) as f32
+                    }
+                })
+                .collect();
+            let mut data = DMatrix::from_dense_with_missing(&values, rows, cols, -1.0).unwrap();
+            if categorical {
+                let mut types = vec![FeatureType::Numerical; cols];
+                types[0] = FeatureType::Categorical;
+                data = data.with_feature_types(&types).unwrap();
+            }
+            let bin = || GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256));
+            let expected = serial.install(bin);
+            let actual = parallel.install(bin);
+            assert_eq!(
+                serde_json::to_value(actual.cuts()).unwrap(),
+                serde_json::to_value(expected.cuts()).unwrap()
+            );
+            assert_eq!(actual.row_ptr, expected.row_ptr);
+            assert_eq!(actual.dense, expected.dense);
+            match (&actual.store, &expected.store) {
+                (BinStore::U16(a), BinStore::U16(b)) => {
+                    assert_eq!(a, b);
+                    assert_eq!(cols, 80);
+                }
+                (BinStore::U32(a), BinStore::U32(b)) => {
+                    assert_eq!(a, b);
+                    assert_eq!(cols, 300);
+                }
+                _ => panic!("bin width changed"),
+            }
+        }
+    }
 
     #[test]
     fn bins_roundtrip_dense() {

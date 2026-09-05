@@ -48,11 +48,11 @@ pub trait HistogramBackend: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
 
-/// Go parallel only for nodes large enough that the per-chunk histogram
-/// allocation and reduction pay for themselves. Below this the reduction
-/// overhead (proportional to `threads × total_bins`) dominates the actual work,
-/// so the sequential path is faster. This describes most nodes in a deep tree.
-const PARALLEL_THRESHOLD: usize = 32_768;
+/// Each task needs enough rows to amortize its histogram allocation and merge.
+/// Capping the task count avoids creating a full histogram for every worker
+/// when a shallow node has only a few thousand rows.
+const ROWS_PER_TASK: usize = 4096;
+const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
 
 impl HistogramBackend for CpuBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
@@ -65,10 +65,9 @@ impl HistogramBackend for CpuBackend {
             return;
         }
 
-        // Parallel: each chunk builds a private histogram; reduce by summation.
-        // One chunk per thread keeps the number of (allocate + reduce) pairs
-        // minimal.
-        let grain = rows.len().div_ceil(threads);
+        // Each task builds a private histogram; reduce by summation.
+        let tasks = threads.min(rows.len() / ROWS_PER_TASK);
+        let grain = rows.len().div_ceil(tasks);
         let partial = rows
             .par_chunks(grain)
             .map(|chunk| {
@@ -178,7 +177,7 @@ mod tests {
 
     #[test]
     fn parallel_matches_sequential_large() {
-        let n = 20_000; // exceeds PARALLEL_THRESHOLD
+        let n = PARALLEL_THRESHOLD + 37;
         let x: Vec<f32> = (0..n).map(|i| (i % 251) as f32).collect();
         let data = DMatrix::from_dense(&x, n, 1).unwrap();
         let cuts = HistCuts::from_dmatrix(&data, 64);
@@ -189,7 +188,11 @@ mod tests {
         let rows: Vec<u32> = (0..n as u32).collect();
 
         let mut out = zeroed(ghist.total_bins());
-        CpuBackend.build(&ghist, &rows, &gpair, &mut out);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| CpuBackend.build(&ghist, &rows, &gpair, &mut out));
         let expect = brute_force(&ghist, &rows, &gpair, ghist.total_bins());
         for (a, b) in out.iter().zip(&expect) {
             assert!(

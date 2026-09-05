@@ -9,6 +9,7 @@
 
 use crate::data::meta::FeatureType;
 use crate::data::DMatrix;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Per-feature histogram cut points, laid out contiguously.
@@ -34,8 +35,7 @@ impl HistCuts {
     /// Compute cuts from a dataset with at most `max_bin` bins per feature.
     ///
     /// Categorical features (per [`DMatrix::feature_types`]) are binned with one
-    /// bin per distinct category value. Numeric features use quantile cut
-    /// thresholds exactly as before.
+    /// bin per distinct category value. Numeric features use quantile thresholds.
     pub fn from_dmatrix(data: &DMatrix, max_bin: usize) -> Self {
         let csc = data.to_csc();
         let n_features = csc.n_cols();
@@ -43,22 +43,42 @@ impl HistCuts {
         let mut feature_offset = Vec::with_capacity(n_features + 1);
         feature_offset.push(0u32);
         let mut cut_values: Vec<f32> = Vec::new();
-        let mut is_categorical = vec![false; n_features];
-
-        let mut scratch: Vec<f32> = Vec::new();
-        #[allow(clippy::needless_range_loop)]
-        for f in 0..n_features {
+        let is_categorical: Vec<bool> = (0..n_features)
+            .map(|f| ftypes.get(f).copied() == Some(FeatureType::Categorical))
+            .collect();
+        let build = |f, scratch: &mut Vec<f32>, output: &mut Vec<f32>| {
             let (_, vals) = csc.column(f);
             scratch.clear();
             scratch.extend_from_slice(vals);
             scratch.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            if ftypes.get(f).copied() == Some(FeatureType::Categorical) {
-                is_categorical[f] = true;
-                build_categorical_cuts(&scratch, &mut cut_values);
+            if is_categorical[f] {
+                build_categorical_cuts(scratch, output);
             } else {
-                build_feature_cuts(&scratch, max_bin, &mut cut_values);
+                build_feature_cuts(scratch, max_bin, output);
             }
-            feature_offset.push(cut_values.len() as u32);
+        };
+        if n_features > 1
+            && data.n_rows().saturating_mul(n_features) >= 65_536
+            && rayon::current_num_threads() > 1
+        {
+            let columns: Vec<_> = (0..n_features)
+                .into_par_iter()
+                .map_init(Vec::new, |scratch, f| {
+                    let mut output = Vec::new();
+                    build(f, scratch, &mut output);
+                    output
+                })
+                .collect();
+            for column in columns {
+                cut_values.extend(column);
+                feature_offset.push(cut_values.len() as u32);
+            }
+        } else {
+            let mut scratch = Vec::new();
+            for f in 0..n_features {
+                build(f, &mut scratch, &mut cut_values);
+                feature_offset.push(cut_values.len() as u32);
+            }
         }
 
         HistCuts {

@@ -28,6 +28,7 @@ use crate::error::{Result, SequoiaError};
 /// Stored as `f32` to match XGBoost's memory layout and to keep histogram
 /// accumulation cache-friendly.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
 pub struct GradPair {
     /// First-order gradient of the loss w.r.t. the margin.
     pub grad: f32,

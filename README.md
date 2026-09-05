@@ -103,7 +103,9 @@ Runnable, self-contained examples live in
 - **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
   **XGBoost-format JSON model import/export** for numeric `gbtree` ensembles,
   k-fold cross-validation,
-  multi-core histogram construction.
+  multi-core histogram construction, and runtime-detected **AArch64 NEON** for
+  objective and metric kernels, prediction transforms, multiclass operations,
+  and histogram split evaluation.
 
 **In progress / planned**
 
@@ -114,47 +116,51 @@ Runnable, self-contained examples live in
 
 ## Performance
 
-### Head-to-head vs XGBoost
+AArch64 builds use runtime-detected NEON kernels for objective gradients,
+probability transforms, metric reductions, and dense numeric split evaluation.
+Scalar fallbacks cover short inputs and values outside the approximation
+ranges. Histogram training parallelizes data preparation and independent nodes,
+scales histogram tasks to node size, and reuses training-row partitions when
+that reduces prediction work. Leaves at `max_depth` skip histograms and split
+searches.
 
-A fair comparison against real XGBoost 3.3 uses the **same** little-endian `f32`
-bytes fed to both engines, matching `hist` parameters, end-to-end fit timing
-(binning + training), best-of-3, **single-threaded**. Dataset: 100k rows × 30
-features, 100 rounds, depth 6, `max_bin=256`, `eta=0.1`, `lambda=1`.
+### Compared with XGBoost
 
-| Engine | fit time | train RMSE |
-|--------|---------:|-----------:|
-| sequoia-boost | **~1.77 s** | 0.05650 |
-| XGBoost 3.3   | ~1.30 s     | 0.05685 |
+Measured on **Apple M3 Max** against [XGBoost 3.4.1](https://pypi.org/project/xgboost/3.4.1/),
+the latest stable PyPI release checked on **2026-09-05 UTC**. Both engines use the
+same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
+256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
+preparation and training, and report the median of six fits after warmup.
 
-sequoia-boost is roughly **1.35× the wall-clock of XGBoost single-threaded**,
-with matching accuracy. This is a solid result for a pure-Rust engine with **no explicit
-SIMD** against XGBoost's heavily hand-optimized C++. Profiling drove a ~26%
-speedup in split evaluation (see `examples/profile.rs`). The remaining gap is
-largely XGBoost's SIMD and cache-tuned kernels.
+| Workload | Threads | sequoia-boost | XGBoost 3.4.1 |
+|---|---:|---:|---:|
+| Regression, 100k × 30 | 1 | 0.947 s | 1.130 s |
+| Regression, 100k × 30 | 4 | 0.392 s | 0.417 s |
+| Regression, 100k × 30 | 16 | 0.421 s | 0.451 s |
+| Regression, 50k × 128 | 1 | 2.268 s | 3.398 s |
+| Regression, 50k × 128 | 4 | 0.841 s | 1.085 s |
+| Regression, 50k × 128 | 16 | 0.796 s | 0.859 s |
+| Binary, 100k × 30 | 1 | 0.917 s | 1.109 s |
+| Binary, 100k × 30 | 4 | 0.379 s | 0.406 s |
+| Binary, 100k × 30 | 16 | 0.410 s | 0.446 s |
+| 4-class, 50k × 30 | 1 | 1.962 s | 2.661 s |
+| 4-class, 50k × 30 | 4 | 0.851 s | 1.019 s |
+| 4-class, 50k × 30 | 16 | 0.960 s | 1.246 s |
 
-Caveats worth stating plainly:
+Sequoia has lower median fit time in all 12 configurations in this run.
+Single-thread speedups are 1.19–1.50×. At four threads, wide regression is
+1.29× as fast and multiclass is 1.20× as fast; multiclass reaches 1.30× at
+sixteen threads. The remaining multithread differences are 6–9%, which should
+be treated as near parity on this interactive workstation. Held-out
+RMSE/log-loss scores differ by less than 0.6%.
 
-- **Timings are machine-load sensitive.** These are quiet-machine numbers.
-- **Multi-core is not benchmarked** here: the sandbox couldn't deliver real
-  parallel throughput (both engines regressed identically at high thread counts),
-  so honest scaling numbers need bare-metal, isolated cores.
-- One dataset shape (moderate width). XGBoost tends to pull further ahead on
-  wider data and deeper trees where its SIMD kernels dominate.
+See the [full comparison](docs/performance.md#xgboost-comparison) for held-out
+quality, sample variability, workload definitions, and reproduction commands.
 
-Reproduce:
+### Kernel benchmarks
 
-```sh
-python scripts/bench_xgb.py <bench_dir> 100000 30 100 1   # writes data + times XGBoost
-BENCH_DIR=<bench_dir> RAYON_NUM_THREADS=1 \
-  cargo run --release -p sequoia-boost --example bench_compare
-# phase-level profiler:
-BENCH_DIR=<bench_dir> RAYON_NUM_THREADS=1 \
-  cargo run --release -p sequoia-boost --example profile
-```
-
-### Internal micro-benchmarks
-
-Criterion benchmarks for the hot paths (histogram build, exact vs hist training):
+See [Performance](docs/performance.md) for kernel measurements, numerical
+behavior, and reproduction commands.
 
 ```sh
 cargo bench -p sequoia-boost

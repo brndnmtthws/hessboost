@@ -6,6 +6,23 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Runtime-dispatched AArch64 NEON kernels for objective gradients, prediction
+  transforms, metric reductions, and dense numeric histogram split evaluation.
+  Scalar fallbacks handle other CPUs, short inputs, and values outside the
+  approximation ranges.
+- Kernel and tree-building benchmarks with reproducible comparisons and
+  [documented results](docs/performance.md).
+
+### Changed
+
+- Skip child histograms and split searches for depthwise leaves at `max_depth`,
+  preserving leaf statistics, monotone bounds, and column-sampling order.
+- Parallelize quantile cuts, bin assignment, and depthwise node construction;
+  size histogram tasks to the available rows and reuse final training-row
+  partitions in smaller thread pools.
+
 ## [0.2.0] - 2026-08-16
 
 ### Fixed

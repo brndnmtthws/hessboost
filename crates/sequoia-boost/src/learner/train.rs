@@ -16,6 +16,7 @@ use crate::tree::RegTree;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
 enum Prepared {
@@ -418,18 +419,43 @@ fn train_impl_inner(
 
                 let mut sampler =
                     make_column_sampler(n_features, params, &mut rng, round as u64, k as u64);
-                let mut tree = prepared.build_tree(params, dtrain, gk, &row_subset, &mut sampler);
+                // Small pools benefit from retaining final row partitions.
+                // Larger pools update margins by parallel tree traversal and
+                // avoid allocating those final partitions.
+                let (mut tree, leaf_rows) = match &prepared {
+                    Prepared::Hist(ghist)
+                        if params.grow_policy == GrowPolicy::DepthWise
+                            && row_subset.len() == n
+                            && rayon::current_num_threads() <= 4 =>
+                    {
+                        HistTreeBuilder::new(params).build_with_leaf_rows(
+                            ghist,
+                            gk,
+                            &row_subset,
+                            &mut sampler,
+                        )
+                    }
+                    _ => (
+                        prepared.build_tree(params, dtrain, gk, &row_subset, &mut sampler),
+                        Vec::new(),
+                    ),
+                };
                 tree.scale_leaves(params.eta as f32);
 
-                // Update cached margins for output k.
-                for row in 0..n {
-                    train_margin[row * n_out + k] += tree.predict_row(dtrain, row);
+                // Row partitions already identify training leaves when every
+                // row participated in depthwise histogram construction.
+                if leaf_rows.is_empty() {
+                    update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
+                } else {
+                    for leaf in leaf_rows {
+                        let value = tree.node(leaf.node).leaf_value;
+                        for row in leaf.rows {
+                            train_margin[row as usize * n_out + k] += value;
+                        }
+                    }
                 }
                 for (ei, (d, _)) in evals.iter().enumerate() {
-                    let em = &mut eval_margins[ei];
-                    for row in 0..d.n_rows() {
-                        em[row * n_out + k] += tree.predict_row(d, row);
-                    }
+                    update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
                 }
 
                 model.push_tree(tree);
@@ -479,6 +505,29 @@ fn train_impl_inner(
     }
 
     Ok(TrainResult { model, history })
+}
+
+/// Add one tree's predictions to one output column. Rows are independent, so
+/// parallel traversal preserves each row's floating-point addition order.
+fn update_tree_margins(
+    tree: &RegTree,
+    data: &DMatrix,
+    margins: &mut [f32],
+    n_out: usize,
+    output: usize,
+) {
+    let update = |(row, margin): (usize, &mut [f32])| {
+        margin[output] += tree.predict_row(data, row);
+    };
+    if data.n_rows() >= 4096 && rayon::current_num_threads() > 1 {
+        margins
+            .par_chunks_mut(n_out)
+            .with_min_len(1024)
+            .enumerate()
+            .for_each(update);
+    } else {
+        margins.chunks_mut(n_out).enumerate().for_each(update);
+    }
 }
 
 /// Perform one DART (Dropout Additive Regression Trees) boosting round.
@@ -728,6 +777,38 @@ mod tests {
             .unwrap()
             .with_labels(&y)
             .unwrap()
+    }
+
+    #[test]
+    fn parallel_margin_updates_preserve_output_columns() {
+        let n = 4103;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 11 == 0 {
+                    f32::NAN
+                } else {
+                    (i % 7) as f32
+                }
+            })
+            .collect();
+        let data = DMatrix::from_dense(&x, n, 1).unwrap();
+        let mut tree = RegTree::with_root(n as f32);
+        tree.expand(0, 0, 3.0, true, -0.25, 1.0, 0.75, 1.0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for outputs in [1, 3] {
+            let mut actual: Vec<f32> = (0..n * outputs).map(|i| i as f32 / 100.0).collect();
+            let mut expected = actual.clone();
+            for output in 0..outputs {
+                for row in 0..n {
+                    expected[row * outputs + output] += tree.predict_row(&data, row);
+                }
+                pool.install(|| update_tree_margins(&tree, &data, &mut actual, outputs, output));
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]

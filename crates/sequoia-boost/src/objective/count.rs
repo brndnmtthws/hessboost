@@ -38,18 +38,11 @@ impl Objective for PoissonObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i]);
-            let em = preds[i].exp();
-            out[i] = GradPair::new(
-                (em - labels[i]) * w,
-                (preds[i] + self.max_delta_step).exp() * w,
-            );
-        }
+        crate::simd::poisson_gradient(preds, labels, weights, self.max_delta_step, out);
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        preds.iter_mut().for_each(|p| *p = p.exp());
+        crate::simd::exp_inplace(preds);
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {
@@ -82,15 +75,11 @@ impl Objective for GammaObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i]);
-            let neg = (-preds[i]).exp();
-            out[i] = GradPair::new((1.0 - labels[i] * neg) * w, (labels[i] * neg) * w);
-        }
+        crate::simd::gamma_gradient(preds, labels, weights, out);
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        preds.iter_mut().for_each(|p| *p = p.exp());
+        crate::simd::exp_inplace(preds);
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {
@@ -137,21 +126,11 @@ impl Objective for TweedieObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        let rho = self.rho;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i]);
-            let m = preds[i];
-            let y = labels[i];
-            let e1 = ((1.0 - rho) * m).exp();
-            let e2 = ((2.0 - rho) * m).exp();
-            let grad = -y * e1 + e2;
-            let hess = -y * (1.0 - rho) * e1 + (2.0 - rho) * e2;
-            out[i] = GradPair::new(grad * w, hess * w);
-        }
+        crate::simd::tweedie_gradient(preds, labels, weights, self.rho, out);
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        preds.iter_mut().for_each(|p| *p = p.exp());
+        crate::simd::exp_inplace(preds);
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {

@@ -9,26 +9,6 @@ use super::{GradPair, Objective};
 /// Lower bound on the multiclass Hessian, matching XGBoost's guard.
 const MIN_HESS: f32 = 1e-16;
 
-/// Softmax over one instance's class margins, written in place.
-#[inline]
-pub(crate) fn softmax_inplace(row: &mut [f32]) {
-    let mut max = f32::NEG_INFINITY;
-    for &v in row.iter() {
-        if v > max {
-            max = v;
-        }
-    }
-    let mut sum = 0.0f32;
-    for v in row.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
-    }
-    let inv = 1.0 / sum;
-    for v in row.iter_mut() {
-        *v *= inv;
-    }
-}
-
 /// Multiclass softmax objective. `output_prob` distinguishes `multi:softprob`
 /// (report per-class probabilities) from `multi:softmax` (report the argmax
 /// class), but both share identical gradients.
@@ -73,29 +53,13 @@ impl Objective for SoftmaxObjective {
         debug_assert_eq!(preds.len(), n * k);
         debug_assert_eq!(out.len(), n * k);
 
-        let mut probs = vec![0f32; k];
-        for i in 0..n {
-            let base = i * k;
-            probs.copy_from_slice(&preds[base..base + k]);
-            softmax_inplace(&mut probs);
-            let w = weights.map_or(1.0, |ws| ws[i]);
-            let label = labels[i] as usize;
-            for c in 0..k {
-                let p = probs[c];
-                let target = if c == label { 1.0 } else { 0.0 };
-                let grad = (p - target) * w;
-                let hess = (2.0 * p * (1.0 - p) * w).max(MIN_HESS);
-                out[base + c] = GradPair::new(grad, hess);
-            }
-        }
+        crate::simd::softmax_gradient(preds, labels, weights, k, MIN_HESS, out);
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
         // Convert every instance's margins to a probability distribution.
         let k = self.num_class;
-        for chunk in preds.chunks_mut(k) {
-            softmax_inplace(chunk);
-        }
+        crate::simd::softmax_rows_inplace(preds, k);
     }
 
     fn base_margin(&self, _labels: &[f32], _weights: Option<&[f32]>) -> f32 {
@@ -116,7 +80,8 @@ mod tests {
     #[test]
     fn softmax_normalizes() {
         let mut r = [1.0f32, 2.0, 3.0];
-        softmax_inplace(&mut r);
+        let num_class = r.len();
+        crate::simd::softmax_rows_inplace(&mut r, num_class);
         assert_relative_eq!(r.iter().sum::<f32>(), 1.0, epsilon = 1e-6);
         assert!(r[2] > r[1] && r[1] > r[0]);
     }

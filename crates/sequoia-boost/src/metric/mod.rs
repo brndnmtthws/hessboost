@@ -35,6 +35,16 @@ pub trait Metric: Send + Sync {
     }
 }
 
+/// Normalize a metric total, returning zero for an empty or nonpositive weight sum.
+#[inline]
+fn weighted_mean((total, weight): (f64, f64)) -> f64 {
+    if weight > 0.0 {
+        total / weight
+    } else {
+        0.0
+    }
+}
+
 /// Root-mean-square error (`rmse`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Rmse;
@@ -45,19 +55,7 @@ impl Metric for Rmse {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let mut sq = 0.0f64;
-        let mut wsum = 0.0f64;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let d = preds[i] as f64 - labels[i] as f64;
-            sq += w * d * d;
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            (sq / wsum).sqrt()
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::squared_error_sum(preds, labels, weights)).sqrt()
     }
 }
 
@@ -71,18 +69,7 @@ impl Metric for Mae {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let mut abs = 0.0f64;
-        let mut wsum = 0.0f64;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            abs += w * (preds[i] as f64 - labels[i] as f64).abs();
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            abs / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::absolute_error_sum(preds, labels, weights))
     }
 }
 
@@ -96,21 +83,7 @@ impl Metric for LogLoss {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        const EPS: f64 = 1e-15;
-        let mut loss = 0.0f64;
-        let mut wsum = 0.0f64;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let p = (preds[i] as f64).clamp(EPS, 1.0 - EPS);
-            let y = labels[i] as f64;
-            loss += w * -(y * p.ln() + (1.0 - y) * (1.0 - p).ln());
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            loss / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::log_loss_sum(preds, labels, weights))
     }
 }
 
@@ -124,22 +97,9 @@ impl Metric for ErrorRate {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let mut wrong = 0.0f64;
-        let mut wsum = 0.0f64;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let pred_pos = preds[i] > 0.5;
-            let label_pos = labels[i] > 0.5;
-            if pred_pos != label_pos {
-                wrong += w;
-            }
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            wrong / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::classification_error_sum(
+            preds, labels, weights,
+        ))
     }
 }
 
@@ -208,21 +168,12 @@ impl Metric for MLogLoss {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        const EPS: f64 = 1e-15;
-        let k = self.num_class;
-        let mut loss = 0.0;
-        let mut wsum = 0.0;
-        for (i, &lab) in labels.iter().enumerate() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let p = (preds[i * k + lab as usize] as f64).clamp(EPS, 1.0);
-            loss += -w * p.ln();
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            loss / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::multiclass_log_loss_sum(
+            preds,
+            labels,
+            weights,
+            self.num_class,
+        ))
     }
 }
 
@@ -238,28 +189,12 @@ impl Metric for MError {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let k = self.num_class;
-        let mut wrong = 0.0;
-        let mut wsum = 0.0;
-        for (i, &lab) in labels.iter().enumerate() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let row = &preds[i * k..i * k + k];
-            let mut best = 0usize;
-            for c in 1..k {
-                if row[c] > row[best] {
-                    best = c;
-                }
-            }
-            if best != lab as usize {
-                wrong += w;
-            }
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            wrong / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::multiclass_error_sum(
+            preds,
+            labels,
+            weights,
+            self.num_class,
+        ))
     }
 }
 
@@ -273,20 +208,9 @@ impl Metric for PoissonNLogLik {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let mut loss = 0.0;
-        let mut wsum = 0.0;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let p = (preds[i] as f64).max(1e-8);
-            let y = labels[i] as f64;
-            loss += w * (p - y * p.ln());
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            loss / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::positive_nloglik_sum::<false>(
+            preds, labels, weights,
+        ))
     }
 }
 
@@ -300,20 +224,9 @@ impl Metric for GammaNLogLik {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let mut loss = 0.0;
-        let mut wsum = 0.0;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let mu = (preds[i] as f64).max(1e-8);
-            let y = labels[i] as f64;
-            loss += w * (y / mu + mu.ln());
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            loss / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::positive_nloglik_sum::<true>(
+            preds, labels, weights,
+        ))
     }
 }
 
@@ -329,22 +242,9 @@ impl Metric for TweedieNLogLik {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let mut loss = 0.0;
-        let mut wsum = 0.0;
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i] as f64);
-            let mu = (preds[i] as f64).max(1e-8);
-            let y = labels[i] as f64;
-            let a = y * mu.powf(1.0 - self.rho) / (1.0 - self.rho);
-            let b = mu.powf(2.0 - self.rho) / (2.0 - self.rho);
-            loss += w * (-a + b);
-            wsum += w;
-        }
-        if wsum > 0.0 {
-            loss / wsum
-        } else {
-            0.0
-        }
+        weighted_mean(crate::simd::tweedie_nloglik_sum(
+            preds, labels, weights, self.rho,
+        ))
     }
 }
 

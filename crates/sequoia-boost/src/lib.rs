@@ -82,6 +82,7 @@ pub mod learner;
 pub mod metric;
 pub mod model;
 pub mod objective;
+mod simd;
 pub mod tree;
 
 pub use config::{

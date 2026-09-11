@@ -447,12 +447,7 @@ fn train_impl_inner(
                 if leaf_rows.is_empty() {
                     update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
                 } else {
-                    for leaf in leaf_rows {
-                        let value = tree.node(leaf.node).leaf_value;
-                        for row in leaf.rows {
-                            train_margin[row as usize * n_out + k] += value;
-                        }
-                    }
+                    apply_leaf_rows(&tree, &leaf_rows, &mut train_margin, n_out, k);
                 }
                 for (ei, (d, _)) in evals.iter().enumerate() {
                     update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
@@ -528,6 +523,44 @@ fn update_tree_margins(
     } else {
         margins.chunks_mut(n_out).enumerate().for_each(update);
     }
+}
+
+/// Add each leaf's value to the margins of the rows that reached it. Leaf row
+/// lists are ascending, so each parallel row chunk locates its slice of every
+/// leaf by binary search; the per-row addition order is unchanged.
+fn apply_leaf_rows(
+    tree: &RegTree,
+    leaf_rows: &[crate::tree::builder::LeafRows],
+    margins: &mut [f32],
+    n_out: usize,
+    output: usize,
+) {
+    const CHUNK_ROWS: usize = 8192;
+    let n = margins.len() / n_out;
+    if n < 2 * CHUNK_ROWS || rayon::current_num_threads() <= 1 {
+        for leaf in leaf_rows {
+            let value = tree.node(leaf.node).leaf_value;
+            for &row in &leaf.rows {
+                margins[row as usize * n_out + output] += value;
+            }
+        }
+        return;
+    }
+    margins
+        .par_chunks_mut(CHUNK_ROWS * n_out)
+        .enumerate()
+        .for_each(|(chunk, margins)| {
+            let first = (chunk * CHUNK_ROWS) as u32;
+            let last = first + (margins.len() / n_out) as u32;
+            for leaf in leaf_rows {
+                let value = tree.node(leaf.node).leaf_value;
+                let start = leaf.rows.partition_point(|&row| row < first);
+                let end = start + leaf.rows[start..].partition_point(|&row| row < last);
+                for &row in &leaf.rows[start..end] {
+                    margins[(row - first) as usize * n_out + output] += value;
+                }
+            }
+        });
 }
 
 /// Perform one DART (Dropout Additive Regression Trees) boosting round.

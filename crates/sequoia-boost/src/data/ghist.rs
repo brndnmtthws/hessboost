@@ -9,7 +9,7 @@
 //! features × 256 bins), else `u32`. The build loop is memory-bandwidth bound,
 //! so halving the index width is a direct throughput win.
 
-use crate::data::quantile::HistCuts;
+use crate::data::quantile::{BinSearch, HistCuts};
 use crate::data::{DMatrix, Entry};
 use rayon::prelude::*;
 use std::ops::Range;
@@ -32,12 +32,20 @@ pub enum Bins<'a> {
 
 /// Binned dataset: for each row, the global bin indices of its non-missing
 /// features, stored CSR-style.
+///
+/// Invariant: every stored bin index is below [`GHistIndex::total_bins`], so a
+/// histogram of that length can be indexed by any stored bin without bounds
+/// checks. `from_dmatrix` is the only constructor and verifies this.
 #[derive(Debug, Clone)]
 pub struct GHistIndex {
     n_rows: usize,
     n_cols: usize,
     row_ptr: Vec<usize>,
     store: BinStore,
+    /// Feature-major copy of `store` for dense indexes: feature `f` of row `r`
+    /// is at `f * n_rows + r`. Doubles bin storage in exchange for streaming
+    /// row partitions.
+    columns: Option<BinStore>,
     cuts: HistCuts,
     /// True when every row is complete and in ascending feature order (a dense
     /// matrix with no missing values). Then feature `f` of row `r` is at offset
@@ -50,7 +58,10 @@ impl GHistIndex {
     pub fn from_dmatrix(data: &DMatrix, cuts: HistCuts) -> Self {
         let n_rows = data.n_rows();
         let n_cols = cuts.n_features();
+        let total_bins = cuts.total_bins();
+        let narrow = total_bins <= u16::MAX as usize + 1;
         let threads = rayon::current_num_threads();
+        let search = BinSearch::new(&cuts);
         let chunks: Vec<_> = if threads > 1 && n_rows.saturating_mul(n_cols) >= 65_536 {
             let grain = n_rows.div_ceil(threads).max(1024);
             (0..n_rows.div_ceil(grain))
@@ -58,16 +69,25 @@ impl GHistIndex {
                 .map(|chunk| {
                     bin_rows(
                         data,
-                        &cuts,
+                        &search,
                         chunk * grain..((chunk + 1) * grain).min(n_rows),
+                        narrow,
                     )
                 })
                 .collect()
         } else {
-            vec![bin_rows(data, &cuts, 0..n_rows)]
+            vec![bin_rows(data, &search, 0..n_rows, narrow)]
         };
+        drop(search);
         let total = chunks.iter().map(|chunk| chunk.bins.len()).sum();
         let dense = chunks.iter().all(|chunk| chunk.dense);
+        // The chunk maxima establish the bin-range invariant documented on the
+        // type.
+        let max_bin = chunks.iter().map(|chunk| chunk.max_bin).max().unwrap_or(0);
+        assert!(
+            total == 0 || (max_bin as usize) < total_bins,
+            "binned index {max_bin} is outside the {total_bins} histogram bins"
+        );
         let mut row_ptr = Vec::with_capacity(n_rows + 1);
         row_ptr.push(0);
         let mut offset = 0;
@@ -75,27 +95,40 @@ impl GHistIndex {
             row_ptr.extend(chunk.row_ends.iter().map(|end| offset + end));
             offset += chunk.bins.len();
         }
-        // Convert directly into the final width without an intermediate merged
-        // u32 buffer. Chunk order preserves the input rows and feature order.
-        let store = if cuts.total_bins() <= u16::MAX as usize + 1 {
+        // Chunks were binned in the final width; concatenation preserves the
+        // input rows and feature order.
+        let store = if narrow {
             let mut bins = Vec::with_capacity(total);
             for chunk in chunks {
-                bins.extend(chunk.bins.into_iter().map(|bin| bin as u16));
+                if let BinChunk::U16(chunk) = chunk.bins {
+                    bins.extend_from_slice(&chunk);
+                }
             }
             BinStore::U16(bins)
         } else {
             let mut bins = Vec::with_capacity(total);
             for chunk in chunks {
-                bins.extend(chunk.bins);
+                if let BinChunk::U32(chunk) = chunk.bins {
+                    bins.extend_from_slice(&chunk);
+                }
             }
             BinStore::U32(bins)
         };
+
+        // A dense index also keeps a feature-major copy: routing rows on one
+        // split feature then streams a single column instead of touching one
+        // cache line per row.
+        let columns = dense.then(|| match &store {
+            BinStore::U16(bins) => BinStore::U16(transpose_dense(bins, n_rows, n_cols)),
+            BinStore::U32(bins) => BinStore::U32(transpose_dense(bins, n_rows, n_cols)),
+        });
 
         GHistIndex {
             n_rows,
             n_cols,
             row_ptr,
             store,
+            columns,
             cuts,
             dense,
         }
@@ -139,6 +172,23 @@ impl GHistIndex {
             BinStore::U16(v) => Bins::U16(v),
             BinStore::U32(v) => Bins::U32(v),
         }
+    }
+
+    /// Row stride of a dense index (every row holds every feature in order),
+    /// or `None` when rows must be located through [`GHistIndex::row_ptr`].
+    #[inline]
+    pub fn dense_stride(&self) -> Option<usize> {
+        self.dense.then_some(self.n_cols)
+    }
+
+    /// Feature-major bin indices of a dense index (`f * n_rows + r`), tagged by
+    /// width. `None` for sparse indexes.
+    #[inline]
+    pub fn column_bins(&self) -> Option<Bins<'_>> {
+        self.columns.as_ref().map(|store| match store {
+            BinStore::U16(v) => Bins::U16(v),
+            BinStore::U32(v) => Bins::U32(v),
+        })
     }
 
     /// Number of present (non-missing) entries in row `r`.
@@ -190,29 +240,141 @@ impl GHistIndex {
     }
 }
 
-struct BinnedRows {
-    row_ends: Vec<usize>,
-    bins: Vec<u32>,
-    dense: bool,
+/// Feature-major copy of a dense row-major matrix (`n_rows * n_cols` entries,
+/// row `r` at `r * n_cols`). Features are handled in groups so each pass over
+/// the rows reads a short contiguous run per row and writes a few sequential
+/// column streams.
+pub(crate) fn transpose_dense<B: Copy + Default + Send + Sync>(
+    bins: &[B],
+    n_rows: usize,
+    n_cols: usize,
+) -> Vec<B> {
+    const GROUP: usize = 8;
+    let mut columns = vec![B::default(); n_rows * n_cols];
+    if n_rows == 0 || n_cols == 0 {
+        return columns;
+    }
+    let fill = |(group, chunk): (usize, &mut [B])| {
+        let first = group * GROUP;
+        let width = chunk.len() / n_rows;
+        for r in 0..n_rows {
+            let row = &bins[r * n_cols + first..r * n_cols + first + width];
+            for (j, &bin) in row.iter().enumerate() {
+                chunk[j * n_rows + r] = bin;
+            }
+        }
+    };
+    if rayon::current_num_threads() > 1 && n_rows.saturating_mul(n_cols) >= 65_536 {
+        columns
+            .par_chunks_mut(GROUP * n_rows)
+            .enumerate()
+            .for_each(fill);
+    } else {
+        columns
+            .chunks_mut(GROUP * n_rows)
+            .enumerate()
+            .for_each(fill);
+    }
+    columns
 }
 
-fn bin_rows(data: &DMatrix, cuts: &HistCuts, rows: Range<usize>) -> BinnedRows {
-    let mut chunk = BinnedRows {
-        row_ends: Vec::with_capacity(rows.len()),
-        bins: Vec::new(),
-        dense: true,
-    };
-    let mut row: Vec<Entry> = Vec::new();
-    for r in rows {
-        data.row_into(r, &mut row);
-        chunk.dense &= row.len() == cuts.n_features()
-            && row.iter().enumerate().all(|(c, e)| e.index as usize == c);
-        chunk
-            .bins
-            .extend(row.iter().map(|e| cuts.bin_of(e.index as usize, e.value)));
-        chunk.row_ends.push(chunk.bins.len());
+/// Bin indices of a row chunk, already in the index's storage width.
+enum BinChunk {
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+}
+
+impl BinChunk {
+    fn len(&self) -> usize {
+        match self {
+            BinChunk::U16(bins) => bins.len(),
+            BinChunk::U32(bins) => bins.len(),
+        }
     }
-    chunk
+}
+
+struct BinnedRows {
+    row_ends: Vec<usize>,
+    bins: BinChunk,
+    dense: bool,
+    /// Largest bin index in the chunk (0 when empty).
+    max_bin: u32,
+}
+
+/// Storage widths a bin index can be narrowed to.
+trait FromBin: Copy {
+    fn from_bin(bin: u32) -> Self;
+}
+
+impl FromBin for u16 {
+    #[inline(always)]
+    fn from_bin(bin: u32) -> Self {
+        bin as u16
+    }
+}
+
+impl FromBin for u32 {
+    #[inline(always)]
+    fn from_bin(bin: u32) -> Self {
+        bin
+    }
+}
+
+fn bin_rows(data: &DMatrix, cuts: &BinSearch<'_>, rows: Range<usize>, narrow: bool) -> BinnedRows {
+    if narrow {
+        bin_rows_into::<u16>(data, cuts, rows, BinChunk::U16)
+    } else {
+        bin_rows_into::<u32>(data, cuts, rows, BinChunk::U32)
+    }
+}
+
+fn bin_rows_into<B: FromBin>(
+    data: &DMatrix,
+    cuts: &BinSearch<'_>,
+    rows: Range<usize>,
+    wrap: fn(Vec<B>) -> BinChunk,
+) -> BinnedRows {
+    let n_features = cuts.n_features();
+    let mut row_ends = Vec::with_capacity(rows.len());
+    let mut bins: Vec<B> = Vec::with_capacity(rows.len() * n_features);
+    let mut dense = true;
+    let mut max_bin = 0u32;
+    let mut push = |bins: &mut Vec<B>, bin: u32| {
+        max_bin = max_bin.max(bin);
+        bins.push(B::from_bin(bin));
+    };
+    if let Some(values) = data.dense_values() {
+        // Dense storage: read the row in place; features are already ascending.
+        let missing = data.missing();
+        for r in rows {
+            let row = &values[r * n_features..(r + 1) * n_features];
+            let start = bins.len();
+            for (c, &v) in row.iter().enumerate() {
+                if !crate::data::dmatrix::is_missing(v, missing) {
+                    push(&mut bins, cuts.bin_of(c, v));
+                }
+            }
+            dense &= bins.len() - start == n_features;
+            row_ends.push(bins.len());
+        }
+    } else {
+        let mut row: Vec<Entry> = Vec::new();
+        for r in rows {
+            data.row_into(r, &mut row);
+            dense &= row.len() == n_features
+                && row.iter().enumerate().all(|(c, e)| e.index as usize == c);
+            for e in &row {
+                push(&mut bins, cuts.bin_of(e.index as usize, e.value));
+            }
+            row_ends.push(bins.len());
+        }
+    }
+    BinnedRows {
+        row_ends,
+        bins: wrap(bins),
+        dense,
+        max_bin,
+    }
 }
 
 #[cfg(test)]

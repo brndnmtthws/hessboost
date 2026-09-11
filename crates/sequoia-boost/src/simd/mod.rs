@@ -47,6 +47,42 @@ fn neon_available() -> bool {
     *NEON_AVAILABLE.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon"))
 }
 
+/// Hint the cache hierarchy that `value` will be read soon. A pure performance
+/// hint: it never faults and has no observable effect on program state.
+#[inline(always)]
+pub(crate) fn prefetch_read<T>(value: &T) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: PRFM only touches the cache and cannot fault or write memory;
+    // the operand is a valid reference.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) value as *const T,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: PREFETCHT0 is available on every x86_64 CPU and cannot fault.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+            (value as *const T).cast::<i8>(),
+        );
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = value;
+}
+
+/// Number of entries of `cuts` that are `<= value` (ordered comparison).
+#[inline]
+pub(crate) fn count_le(cuts: &[f32], value: f32) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    if cuts.len() == 16 && neon_available() {
+        // SAFETY: NEON is present and the slice holds exactly four vectors.
+        return unsafe { aarch64::count_le_16(cuts, value) };
+    }
+    cuts.iter().filter(|&&cut| cut <= value).count()
+}
+
 #[inline]
 #[cfg(target_arch = "aarch64")]
 fn gradient_slices_cover(

@@ -227,6 +227,24 @@ unsafe fn expq_f64(value: float64x2_t) -> float64x2_t {
     }
 }
 
+/// Number of the 16 `cuts` that are `<= value`.
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn count_le_16(cuts: &[f32], value: f32) -> usize {
+    debug_assert_eq!(cuts.len(), 16);
+    // SAFETY: the caller guarantees NEON support and exactly 16 readable
+    // values; each load below covers one aligned quarter of them.
+    unsafe {
+        let value = vdupq_n_f32(value);
+        let ptr = cuts.as_ptr();
+        let mut count = vdupq_n_u32(0);
+        for quarter in 0..4 {
+            let mask = vcleq_f32(vld1q_f32(ptr.add(quarter * VECTOR_WIDTH)), value);
+            count = vsubq_u32(count, mask);
+        }
+        vaddvq_u32(count) as usize
+    }
+}
+
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn sum_grad_stats(values: &[GradStats]) -> GradStats {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
@@ -251,27 +269,199 @@ pub(super) unsafe fn sum_grad_stats(values: &[GradStats]) -> GradStats {
     }
 }
 
+/// Relative slack applied to the division-free prefilter threshold. Both the
+/// cross-multiplied test and the exact quotient test round to within a few
+/// ULPs, so this margin guarantees the prefilter never rejects a candidate the
+/// exact comparison would accept; false positives merely pay for a division.
+const PREFILTER_SLACK: f64 = 1e-9;
+
+/// Scaled `gain(L) + gain(R)` a candidate must exceed to beat `best_loss`.
+#[inline]
+fn prefilter_target(best_loss: f64, comparison_epsilon: f64, parent_gain: f64) -> f64 {
+    (best_loss + comparison_epsilon + parent_gain) * (1.0 - PREFILTER_SLACK)
+}
+
+/// Scan state shared by the vector prefilter and the exact candidate check.
+struct SplitScan<'a> {
+    total: GradStats,
+    reg: &'a RegParams,
+    parent_gain: f64,
+    comparison_epsilon: f64,
+    best: Option<super::SplitCandidate>,
+    best_loss: f64,
+    /// See [`prefilter_target`]; refreshed whenever `best_loss` changes.
+    target: f64,
+}
+
+impl SplitScan<'_> {
+    /// Sequential check of the two candidates at `index` and `index + 1` with
+    /// the given left statistics and exact loss changes. Matches the scalar
+    /// scan bit for bit, including tie order and the post-acceptance epsilon.
+    #[inline]
+    fn accept_pair(&mut self, index: usize, lefts: [GradStats; 2], losses: [f64; 2]) {
+        for (lane, (left, loss_change)) in lefts.into_iter().zip(losses).enumerate() {
+            let right = self.total.sub(left);
+            // Ordered comparison: a NaN loss never improves.
+            let improves = loss_change > self.best_loss + self.comparison_epsilon;
+            if !improves
+                || left.hess < self.reg.min_child_weight
+                || right.hess < self.reg.min_child_weight
+                || left.hess <= 0.0
+                || right.hess <= 0.0
+            {
+                continue;
+            }
+            self.best_loss = loss_change;
+            self.target =
+                prefilter_target(self.best_loss, self.comparison_epsilon, self.parent_gain);
+            self.best = Some(super::SplitCandidate {
+                loss_change,
+                split_offset: index + lane,
+                left,
+                right,
+            });
+        }
+    }
+}
+
+/// Closed-form gain terms of both children for two candidates.
+struct PairTerms {
+    /// `Tα(G_L)²`
+    left_numerator: float64x2_t,
+    /// `H_L + λ`
+    left_denominator: float64x2_t,
+    right_numerator: float64x2_t,
+    right_denominator: float64x2_t,
+}
+
+/// Two lanes of a vector as an array.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn unconstrained_gainq(
-    gradient: float64x2_t,
-    hessian: float64x2_t,
-    reg: &RegParams,
-) -> float64x2_t {
+unsafe fn lanes(vector: float64x2_t) -> [f64; 2] {
+    // SAFETY: the caller guarantees NEON support; lane extraction only reads
+    // registers. The function pointer expresses that precondition on every
+    // supported toolchain.
+    unsafe {
+        let lane_0: unsafe fn(float64x2_t) -> f64 = vgetq_lane_f64::<0>;
+        let lane_1: unsafe fn(float64x2_t) -> f64 = vgetq_lane_f64::<1>;
+        [lane_0(vector), lane_1(vector)]
+    }
+}
+
+/// Left statistics of the two candidates in lane-split vectors.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn pair_lanes(gradients: float64x2_t, hessians: float64x2_t) -> [GradStats; 2] {
+    // SAFETY: the caller guarantees NEON support.
+    unsafe {
+        let ([grad_0, grad_1], [hess_0, hess_1]) = (lanes(gradients), lanes(hessians));
+        [
+            GradStats::new(grad_0, hess_0),
+            GradStats::new(grad_1, hess_1),
+        ]
+    }
+}
+
+/// Exact loss change `gain(L) + gain(R) − parent` of two candidates, in the
+/// same arithmetic as the scalar [`calc_gain`] for valid children.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn pair_losses(terms: &PairTerms, parent_gain: float64x2_t) -> [f64; 2] {
     // SAFETY: the caller guarantees NEON support; all operations use registers.
     unsafe {
-        // Gain squares the L1-thresholded gradient, so its sign is unnecessary.
-        // Training validates alpha >= 0. Numeric max also maps NaN to zero,
-        // matching threshold_l1's ordered comparisons.
-        let thresholded = vmaxnmq_f64(
-            vsubq_f64(vabsq_f64(gradient), vdupq_n_f64(reg.alpha)),
-            vdupq_n_f64(0.0),
-        );
         let divide: unsafe fn(float64x2_t, float64x2_t) -> float64x2_t = vdivq_f64;
-        divide(
-            vmulq_f64(thresholded, thresholded),
-            vaddq_f64(hessian, vdupq_n_f64(reg.lambda)),
-        )
+        lanes(vsubq_f64(
+            vaddq_f64(
+                divide(terms.left_numerator, terms.left_denominator),
+                divide(terms.right_numerator, terms.right_denominator),
+            ),
+            parent_gain,
+        ))
+    }
+}
+
+/// Running prefix over the two bins at `*bin` and `*bin + 1`. `accumulated`
+/// holds `(grad, hess)` lanes and advances by both bins in sequential order;
+/// the result is lane-split into `(gradients, hessians)` of the two candidates.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn prefix_pair(
+    accumulated: &mut float64x2_t,
+    histogram: *const f64,
+    index: usize,
+) -> (float64x2_t, float64x2_t) {
+    // SAFETY: the caller guarantees NEON support and `index + 1 <
+    // histogram.len()`; GradStats is two adjacent f64 fields.
+    unsafe {
+        let first = vaddq_f64(*accumulated, vld1q_f64(histogram.add(2 * index)));
+        let second = vaddq_f64(first, vld1q_f64(histogram.add(2 * index + 2)));
+        *accumulated = second;
+        (vzip1q_f64(first, second), vzip2q_f64(first, second))
+    }
+}
+
+/// Closed-form gain terms of two candidates with the given left statistics.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn gain_terms<const L1: bool>(
+    left_gradients: float64x2_t,
+    left_hessians: float64x2_t,
+    total_gradients: float64x2_t,
+    total_hessians: float64x2_t,
+    alpha: float64x2_t,
+    lambda: float64x2_t,
+) -> PairTerms {
+    // SAFETY: the caller guarantees NEON support; all operations use registers.
+    // The function pointer expresses that precondition on every supported
+    // toolchain.
+    unsafe {
+        let multiply: unsafe fn(float64x2_t, float64x2_t) -> float64x2_t = vmulq_f64;
+        let zero = vdupq_n_f64(0.0);
+        // Gain squares the L1-thresholded gradient, so its sign is unnecessary;
+        // numeric max maps a NaN gradient to zero like threshold_l1. Without L1
+        // the threshold is the identity and the numerator is G².
+        let numerator = |gradient: float64x2_t| {
+            if L1 {
+                let thresholded = vmaxnmq_f64(vsubq_f64(vabsq_f64(gradient), alpha), zero);
+                multiply(thresholded, thresholded)
+            } else {
+                vmaxnmq_f64(multiply(gradient, gradient), zero)
+            }
+        };
+        let right_gradients = vsubq_f64(total_gradients, left_gradients);
+        let right_hessians = vsubq_f64(total_hessians, left_hessians);
+        PairTerms {
+            left_numerator: numerator(left_gradients),
+            left_denominator: vaddq_f64(left_hessians, lambda),
+            right_numerator: numerator(right_gradients),
+            right_denominator: vaddq_f64(right_hessians, lambda),
+        }
+    }
+}
+
+/// Lane mask of candidates whose exact loss change may exceed the incumbent.
+///
+/// gain = Tα(G)² / (H + λ). With `a_x = Tα(G_x)²` and `b_x = H_x + λ`
+/// (`b_x >= 0`), `a_L/b_L + a_R/b_R > target` is equivalent to
+/// `a_L·b_R + a_R·b_L > target·b_L·b_R`, which needs no division.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn improving_mask(terms: &PairTerms, target: f64) -> uint64x2_t {
+    // SAFETY: the caller guarantees NEON support; all operations use registers.
+    // The function pointer expresses that precondition on every supported
+    // toolchain.
+    unsafe {
+        let multiply: unsafe fn(float64x2_t, float64x2_t) -> float64x2_t = vmulq_f64;
+        let cross = vfmaq_f64(
+            multiply(terms.left_numerator, terms.right_denominator),
+            terms.right_numerator,
+            terms.left_denominator,
+        );
+        let bound = multiply(
+            multiply(vdupq_n_f64(target), terms.left_denominator),
+            terms.right_denominator,
+        );
+        vcgtq_f64(cross, bound)
     }
 }
 
@@ -283,84 +473,107 @@ pub(super) unsafe fn dense_unconstrained_best_split(
     parent_gain: f64,
     comparison_epsilon: f64,
 ) -> Option<super::SplitCandidate> {
+    // SAFETY: the caller guarantees NEON support.
+    unsafe {
+        if reg.alpha == 0.0 {
+            scan_dense_splits::<false>(histogram, total, reg, parent_gain, comparison_epsilon)
+        } else {
+            scan_dense_splits::<true>(histogram, total, reg, parent_gain, comparison_epsilon)
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn scan_dense_splits<const L1: bool>(
+    histogram: &[GradStats],
+    total: GradStats,
+    reg: &RegParams,
+    parent_gain: f64,
+    comparison_epsilon: f64,
+) -> Option<super::SplitCandidate> {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
     // documented at each memory access below.
     unsafe {
         let candidate_count = histogram.len().saturating_sub(1);
+        let bins = histogram.as_ptr().cast::<f64>();
+        let total_gradients = vdupq_n_f64(total.grad);
+        let total_hessians = vdupq_n_f64(total.hess);
+        let alpha = vdupq_n_f64(reg.alpha);
+        let lambda = vdupq_n_f64(reg.lambda);
         let parent_gain_vector = vdupq_n_f64(parent_gain);
-        let mut accumulated = GradStats::default();
-        let mut best: Option<super::SplitCandidate> = None;
-        let mut best_loss = 0.0;
+        let mut accumulated = vdupq_n_f64(0.0);
+        let mut scan = SplitScan {
+            total,
+            reg,
+            parent_gain,
+            comparison_epsilon,
+            best: None,
+            best_loss: 0.0,
+            target: prefilter_target(0.0, comparison_epsilon, parent_gain),
+        };
+        let terms = |gradients, hessians| {
+            gain_terms::<L1>(
+                gradients,
+                hessians,
+                total_gradients,
+                total_hessians,
+                alpha,
+                lambda,
+            )
+        };
         let mut index = 0;
 
-        while index + 1 < candidate_count {
-            accumulated.add(histogram[index]);
-            let left_0 = accumulated;
-            accumulated.add(histogram[index + 1]);
-            let left_1 = accumulated;
-            let right_0 = total.sub(left_0);
-            let right_1 = total.sub(left_1);
-
-            let left_gradients_data = [left_0.grad, left_1.grad];
-            let left_hessians_data = [left_0.hess, left_1.hess];
-            let right_gradients_data = [right_0.grad, right_1.grad];
-            let right_hessians_data = [right_0.hess, right_1.hess];
-            // SAFETY: every local input array contains exactly two f64 lanes.
-            let loss_change = {
-                let left_gain = unconstrained_gainq(
-                    vld1q_f64(left_gradients_data.as_ptr()),
-                    vld1q_f64(left_hessians_data.as_ptr()),
-                    reg,
+        // Four candidates per iteration. Most bins do not improve the
+        // incumbent, so they are rejected in vector registers without lane
+        // extraction or division; survivors take the exact sequential path.
+        while index + 3 < candidate_count {
+            // SAFETY: `index + 3 < candidate_count < histogram.len()` covers
+            // both pairs.
+            let (gradients_0, hessians_0) = prefix_pair(&mut accumulated, bins, index);
+            let (gradients_1, hessians_1) = prefix_pair(&mut accumulated, bins, index + 2);
+            let terms_0 = terms(gradients_0, hessians_0);
+            let terms_1 = terms(gradients_1, hessians_1);
+            let mask = vorrq_u64(
+                improving_mask(&terms_0, scan.target),
+                improving_mask(&terms_1, scan.target),
+            );
+            if vmaxvq_u32(vreinterpretq_u32_u64(mask)) != 0 {
+                scan.accept_pair(
+                    index,
+                    pair_lanes(gradients_0, hessians_0),
+                    pair_losses(&terms_0, parent_gain_vector),
                 );
-                let right_gain = unconstrained_gainq(
-                    vld1q_f64(right_gradients_data.as_ptr()),
-                    vld1q_f64(right_hessians_data.as_ptr()),
-                    reg,
+                scan.accept_pair(
+                    index + 2,
+                    pair_lanes(gradients_1, hessians_1),
+                    pair_losses(&terms_1, parent_gain_vector),
                 );
-                vsubq_f64(vaddq_f64(left_gain, right_gain), parent_gain_vector)
-            };
-            // Most bins do not improve the incumbent. Keep their losses in SIMD
-            // registers and skip scalar candidate extraction and validity checks.
-            // Numeric max ignores a NaN in one lane so it cannot hide a valid
-            // improvement in the other. The ordered checks below still decide
-            // ties and apply the epsilon after each accepted candidate.
-            if vmaxnmvq_f64(loss_change) <= best_loss + comparison_epsilon {
-                index += 2;
-                continue;
             }
-            let mut losses = [0.0; 2];
-            // SAFETY: `losses` contains exactly two writable f64 lanes.
-            vst1q_f64(losses.as_mut_ptr(), loss_change);
-            for (lane, (left, right)) in [(left_0, right_0), (left_1, right_1)]
-                .into_iter()
-                .enumerate()
-            {
-                if left.hess >= reg.min_child_weight
-                    && right.hess >= reg.min_child_weight
-                    && left.hess > 0.0
-                    && right.hess > 0.0
-                    && losses[lane] > best_loss + comparison_epsilon
-                {
-                    best_loss = losses[lane];
-                    best = Some(super::SplitCandidate {
-                        loss_change: losses[lane],
-                        split_offset: index + lane,
-                        left,
-                        right,
-                    });
-                }
+            index += 4;
+        }
+        if index + 1 < candidate_count {
+            // SAFETY: `index + 1 < candidate_count < histogram.len()`.
+            let (gradients, hessians) = prefix_pair(&mut accumulated, bins, index);
+            let terms = terms(gradients, hessians);
+            if vmaxvq_u32(vreinterpretq_u32_u64(improving_mask(&terms, scan.target))) != 0 {
+                scan.accept_pair(
+                    index,
+                    pair_lanes(gradients, hessians),
+                    pair_losses(&terms, parent_gain_vector),
+                );
             }
             index += 2;
         }
 
         if index < candidate_count {
-            accumulated.add(histogram[index]);
-            let left = accumulated;
+            let [grad, hess] = lanes(accumulated);
+            let mut left = GradStats::new(grad, hess);
+            left.add(histogram[index]);
             let right = total.sub(left);
             if left.hess >= reg.min_child_weight && right.hess >= reg.min_child_weight {
                 let loss_change = calc_gain(left, reg) + calc_gain(right, reg) - parent_gain;
-                if loss_change > best_loss + comparison_epsilon {
-                    best = Some(super::SplitCandidate {
+                if loss_change > scan.best_loss + comparison_epsilon {
+                    scan.best = Some(super::SplitCandidate {
                         loss_change,
                         split_offset: index,
                         left,
@@ -369,7 +582,7 @@ pub(super) unsafe fn dense_unconstrained_best_split(
                 }
             }
         }
-        best
+        scan.best
     }
 }
 

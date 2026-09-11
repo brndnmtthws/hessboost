@@ -452,6 +452,16 @@ impl DMatrix {
         }
     }
 
+    /// Raw row-major storage of a dense matrix (missing entries hold the
+    /// sentinel); `None` for sparse storage.
+    #[inline]
+    pub(crate) fn dense_values(&self) -> Option<&[f32]> {
+        match &self.storage {
+            Storage::Dense(data) => Some(data),
+            Storage::Csr { .. } => None,
+        }
+    }
+
     /// Materialize a single row's non-missing `(index, value)` entries into
     /// `out`. Reuses the buffer to avoid per-row allocation in hot loops.
     pub fn row_into(&self, row: usize, out: &mut Vec<Entry>) {

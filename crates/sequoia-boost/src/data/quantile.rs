@@ -37,8 +37,20 @@ impl HistCuts {
     /// Categorical features (per [`DMatrix::feature_types`]) are binned with one
     /// bin per distinct category value. Numeric features use quantile thresholds.
     pub fn from_dmatrix(data: &DMatrix, max_bin: usize) -> Self {
-        let csc = data.to_csc();
-        let n_features = csc.n_cols();
+        let n_rows = data.n_rows();
+        let n_features = data.n_cols();
+        // Dense storage is transposed in blocks so each feature's values are
+        // contiguous; sparse storage goes through the CSC view.
+        let (columns, csc) = match data.dense_values() {
+            Some(values) => (
+                Some(crate::data::ghist::transpose_dense(
+                    values, n_rows, n_features,
+                )),
+                None,
+            ),
+            None => (None, Some(data.to_csc())),
+        };
+        let missing = data.missing();
         let ftypes = data.feature_types();
         let mut feature_offset = Vec::with_capacity(n_features + 1);
         feature_offset.push(0u32);
@@ -46,15 +58,24 @@ impl HistCuts {
         let is_categorical: Vec<bool> = (0..n_features)
             .map(|f| ftypes.get(f).copied() == Some(FeatureType::Categorical))
             .collect();
-        let build = |f, scratch: &mut Vec<f32>, output: &mut Vec<f32>| {
-            let (_, vals) = csc.column(f);
-            scratch.clear();
-            scratch.extend_from_slice(vals);
-            scratch.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let build = |f, scratch: &mut (Vec<f32>, Vec<f32>), output: &mut Vec<f32>| {
+            let (values, spare) = scratch;
+            values.clear();
+            match (&columns, &csc) {
+                (Some(columns), _) => values.extend(
+                    columns[f * n_rows..(f + 1) * n_rows]
+                        .iter()
+                        .copied()
+                        .filter(|&v| !crate::data::dmatrix::is_missing(v, missing)),
+                ),
+                (None, Some(csc)) => values.extend_from_slice(csc.column(f).1),
+                (None, None) => unreachable!("one column source is always built"),
+            }
+            sort_values(values, spare);
             if is_categorical[f] {
-                build_categorical_cuts(scratch, output);
+                build_categorical_cuts(values, output);
             } else {
-                build_feature_cuts(scratch, max_bin, output);
+                build_feature_cuts(values, max_bin, output);
             }
         };
         if n_features > 1
@@ -63,7 +84,7 @@ impl HistCuts {
         {
             let columns: Vec<_> = (0..n_features)
                 .into_par_iter()
-                .map_init(Vec::new, |scratch, f| {
+                .map_init(Default::default, |scratch, f| {
                     let mut output = Vec::new();
                     build(f, scratch, &mut output);
                     output
@@ -74,7 +95,7 @@ impl HistCuts {
                 feature_offset.push(cut_values.len() as u32);
             }
         } else {
-            let mut scratch = Vec::new();
+            let mut scratch = Default::default();
             for f in 0..n_features {
                 build(f, &mut scratch, &mut cut_values);
                 feature_offset.push(cut_values.len() as u32);
@@ -108,6 +129,7 @@ impl HistCuts {
         let mut is_categorical = vec![false; n_features];
 
         let mut cat_scratch: Vec<f32> = Vec::new();
+        let mut cat_spare: Vec<f32> = Vec::new();
         let mut scratch: Vec<(f32, f32)> = Vec::new();
         #[allow(clippy::needless_range_loop)]
         for f in 0..n_features {
@@ -117,7 +139,7 @@ impl HistCuts {
                 is_categorical[f] = true;
                 cat_scratch.clear();
                 cat_scratch.extend_from_slice(vals);
-                cat_scratch.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                sort_values(&mut cat_scratch, &mut cat_spare);
                 build_categorical_cuts(&cat_scratch, &mut cut_values);
             } else {
                 // Pair each value with its instance's Hessian, then sort by value.
@@ -198,6 +220,164 @@ impl HistCuts {
         let local = slice.partition_point(|&c| c <= value);
         let local = local.min(slice.len().saturating_sub(1));
         start as u32 + local as u32
+    }
+}
+
+/// Cuts per block of the two-level bin search.
+const SEARCH_BLOCK: usize = 16;
+
+/// Two-level search index over a cut table for binning many values quickly.
+///
+/// Each numeric feature's cuts are padded with `+inf` to whole blocks of
+/// [`SEARCH_BLOCK`]; a first-level table holds every block's last cut. A lookup
+/// counts the first-level entries `<= value` (whole blocks below the value),
+/// then the cuts `<= value` inside the next block. Both counts are branch-free
+/// vector compares, and the result equals `partition_point(|c| c <= value)`.
+pub struct BinSearch<'a> {
+    cuts: &'a HistCuts,
+    /// Padded cuts, `padded_offset[f]..padded_offset[f + 1]` per feature.
+    padded: Vec<f32>,
+    padded_offset: Vec<usize>,
+    /// Last cut of each block, padded with `+inf` to whole blocks;
+    /// `level1_offset[f]..level1_offset[f + 1]` per feature.
+    level1: Vec<f32>,
+    level1_offset: Vec<usize>,
+}
+
+impl<'a> BinSearch<'a> {
+    /// Build the index for every numeric feature of `cuts`.
+    pub fn new(cuts: &'a HistCuts) -> Self {
+        let mut padded = Vec::new();
+        let mut padded_offset = vec![0];
+        let mut level1 = Vec::new();
+        let mut level1_offset = vec![0];
+        for f in 0..cuts.n_features() {
+            if !cuts.is_categorical(f) {
+                let (start, end) = cuts.feature_bins(f);
+                let feature = &cuts.cut_values[start..end];
+                let blocks = feature.len().div_ceil(SEARCH_BLOCK);
+                padded.extend_from_slice(feature);
+                padded.resize(padded_offset[f] + blocks * SEARCH_BLOCK, f32::INFINITY);
+                level1.extend(
+                    feature
+                        .chunks(SEARCH_BLOCK)
+                        .map(|block| *block.last().expect("blocks are non-empty")),
+                );
+                level1.resize(
+                    level1_offset[f] + blocks.div_ceil(SEARCH_BLOCK) * SEARCH_BLOCK,
+                    f32::INFINITY,
+                );
+            }
+            padded_offset.push(padded.len());
+            level1_offset.push(level1.len());
+        }
+        BinSearch {
+            cuts,
+            padded,
+            padded_offset,
+            level1,
+            level1_offset,
+        }
+    }
+
+    /// Number of features of the underlying cut table.
+    #[inline]
+    pub fn n_features(&self) -> usize {
+        self.cuts.n_features()
+    }
+
+    /// Map a feature value to its global bin index; same result as
+    /// [`HistCuts::bin_of`].
+    #[inline]
+    pub fn bin_of(&self, f: usize, value: f32) -> u32 {
+        if self.cuts.is_categorical(f) {
+            return self.cuts.bin_of(f, value);
+        }
+        let (start, end) = self.cuts.feature_bins(f);
+        let level1 = &self.level1[self.level1_offset[f]..self.level1_offset[f + 1]];
+        let mut block = 0;
+        for chunk in level1.chunks_exact(SEARCH_BLOCK) {
+            block += crate::simd::count_le(chunk, value);
+        }
+        let padded = &self.padded[self.padded_offset[f]..self.padded_offset[f + 1]];
+        let local = if block * SEARCH_BLOCK < padded.len() {
+            block * SEARCH_BLOCK
+                + crate::simd::count_le(
+                    &padded[block * SEARCH_BLOCK..(block + 1) * SEARCH_BLOCK],
+                    value,
+                )
+        } else {
+            end - start
+        };
+        let local = local.min((end - start).saturating_sub(1));
+        start as u32 + local as u32
+    }
+}
+
+/// Below this length the comparison sort beats the radix passes' fixed cost.
+const RADIX_MIN_LEN: usize = 2048;
+const RADIX_BITS: u32 = 11;
+const RADIX_BUCKETS: usize = 1 << RADIX_BITS;
+
+/// Monotone map from `f32` to `u32` under [`f32::total_cmp`] order.
+#[inline]
+fn sort_key(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+}
+
+/// Sort `values` ascending by total order. Column sorts dominate cut
+/// construction, so long inputs use a three-pass LSD radix sort on
+/// [`sort_key`] (identical order to `sort_unstable_by(f32::total_cmp)`);
+/// `spare` is scratch reused across columns.
+fn sort_values(values: &mut Vec<f32>, spare: &mut Vec<f32>) {
+    let n = values.len();
+    if n < RADIX_MIN_LEN {
+        values.sort_unstable_by(f32::total_cmp);
+        return;
+    }
+    // Bucket counts for all passes in one sweep.
+    let mut counts = vec![[0u32; RADIX_BUCKETS]; 3];
+    for &v in values.iter() {
+        let key = sort_key(v);
+        for (pass, count) in counts.iter_mut().enumerate() {
+            count[((key >> (RADIX_BITS * pass as u32)) & (RADIX_BUCKETS as u32 - 1)) as usize] += 1;
+        }
+    }
+    spare.clear();
+    spare.resize(n, 0.0);
+    // Passes ping-pong between the two buffers; track which one holds the data.
+    let mut in_spare = false;
+    for (pass, count) in counts.iter_mut().enumerate() {
+        // A pass whose digit is constant across the input is a no-op.
+        if count.iter().any(|&c| c as usize == n) {
+            continue;
+        }
+        let mut offset = 0u32;
+        for c in count.iter_mut() {
+            let start = offset;
+            offset += *c;
+            *c = start;
+        }
+        let shift = RADIX_BITS * pass as u32;
+        let (src, dst) = if in_spare {
+            (&*spare, &mut *values)
+        } else {
+            (&*values, &mut *spare)
+        };
+        for &v in src.iter() {
+            let bucket = ((sort_key(v) >> shift) & (RADIX_BUCKETS as u32 - 1)) as usize;
+            dst[count[bucket] as usize] = v;
+            count[bucket] += 1;
+        }
+        in_spare = !in_spare;
+    }
+    if in_spare {
+        std::mem::swap(values, spare);
     }
 }
 
@@ -345,6 +525,68 @@ fn push_max_sentinel(out: &mut Vec<f32>, max_val: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_level_search_matches_bin_of() {
+        // Features with 257 cuts (full), 3 cuts (short), and a constant column.
+        let n = 5000;
+        let mut x = vec![0f32; n * 3];
+        for r in 0..n {
+            x[r * 3] = ((r * 7919) % n) as f32 / n as f32;
+            x[r * 3 + 1] = (r % 3) as f32;
+            x[r * 3 + 2] = 2.5;
+        }
+        let data = DMatrix::from_dense(&x, n, 3).unwrap();
+        let cuts = HistCuts::from_dmatrix(&data, 256);
+        let search = BinSearch::new(&cuts);
+        for f in 0..3 {
+            let (start, end) = cuts.feature_bins(f);
+            let mut probes: Vec<f32> = cuts.cut_values[start..end].to_vec();
+            probes.extend(
+                cuts.cut_values[start..end]
+                    .windows(2)
+                    .map(|w| 0.5 * (w[0] + w[1])),
+            );
+            probes.extend([-1e9, 1e9, -0.0, 0.0, 0.5, 2.5, 3.0]);
+            for value in probes {
+                assert_eq!(
+                    search.bin_of(f, value),
+                    cuts.bin_of(f, value),
+                    "feature {f} value {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn radix_sort_matches_total_order() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in [RADIX_MIN_LEN, RADIX_MIN_LEN + 1, 10_007, 65_536] {
+            let mut values: Vec<f32> = (0..n)
+                .map(|i| match i % 11 {
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => f32::MAX,
+                    3 => f32::MIN,
+                    4 => f32::MIN_POSITIVE,
+                    5 => -f32::MIN_POSITIVE,
+                    _ => (next() as f32 / u64::MAX as f32 - 0.5) * 1e6,
+                })
+                .collect();
+            let mut expected = values.clone();
+            expected.sort_unstable_by(f32::total_cmp);
+            let mut spare = Vec::new();
+            sort_values(&mut values, &mut spare);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&values), bits(&expected));
+        }
+    }
 
     #[test]
     fn few_distinct_values_one_bin_each() {

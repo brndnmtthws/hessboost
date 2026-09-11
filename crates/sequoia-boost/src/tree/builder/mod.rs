@@ -9,3 +9,4 @@ mod hist;
 
 pub use exact::{all_features, all_rows, ExactTreeBuilder, SortedColumns};
 pub use hist::HistTreeBuilder;
+pub(crate) use hist::LeafRows;

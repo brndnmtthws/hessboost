@@ -36,63 +36,92 @@ fn split_prefilter_preserves_ties_and_sequential_epsilon() {
     }
 }
 
+/// Scalar reference scan with the kernel's validity rules.
+fn scalar_best_split(
+    histogram: &[GradStats],
+    total: GradStats,
+    reg: &RegParams,
+    parent_gain: f64,
+    epsilon: f64,
+) -> Option<(usize, GradStats, GradStats)> {
+    let mut accumulated = GradStats::default();
+    let mut best = None;
+    let mut best_loss = 0.0;
+    for (index, &stats) in histogram.iter().take(histogram.len() - 1).enumerate() {
+        accumulated.add(stats);
+        let right = total.sub(accumulated);
+        if accumulated.hess < reg.min_child_weight
+            || right.hess < reg.min_child_weight
+            || accumulated.hess <= 0.0
+            || right.hess <= 0.0
+        {
+            continue;
+        }
+        let loss = calc_gain(accumulated, reg) + calc_gain(right, reg) - parent_gain;
+        if loss > best_loss + epsilon {
+            best_loss = loss;
+            best = Some((index, accumulated, right));
+        }
+    }
+    best
+}
+
 #[test]
-fn vector_gain_matches_scalar_l1_thresholds() {
+fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
     if !std::arch::is_aarch64_feature_detected!("neon") {
         return;
     }
-    let gradients = [
+    let exceptional = [
         f64::NEG_INFINITY,
         -f64::MAX,
-        -4.0,
-        -2.0,
-        -1.0,
         -f64::MIN_POSITIVE,
         -f64::from_bits(1),
         -0.0,
-        0.0,
-        f64::MIN_POSITIVE,
         f64::from_bits(1),
-        1.0,
-        2.0,
-        4.0,
         f64::MAX,
         f64::INFINITY,
         f64::NAN,
-        0.5,
     ];
-    for alpha in [
-        0.0,
-        f64::from_bits(1),
-        f64::MIN_POSITIVE,
-        1.0,
-        2.0,
-        f64::MAX,
-    ] {
-        for lambda in [0.0, 1.0] {
-            let reg = RegParams {
-                alpha,
-                lambda,
-                min_child_weight: 0.0,
-                max_delta_step: 0.0,
-            };
-            for pair in gradients.chunks_exact(2) {
-                let hessians = [0.5, 123.0];
-                let mut actual = [0.0; 2];
-                // SAFETY: NEON was detected and every array has two lanes.
-                unsafe {
-                    vst1q_f64(
-                        actual.as_mut_ptr(),
-                        unconstrained_gainq(
-                            vld1q_f64(pair.as_ptr()),
-                            vld1q_f64(hessians.as_ptr()),
-                            &reg,
-                        ),
-                    );
-                }
-                for lane in 0..2 {
-                    let expected = calc_gain(GradStats::new(pair[lane], hessians[lane]), &reg);
-                    assert_eq!(actual[lane].to_bits(), expected.to_bits());
+    for length in [16, 17, 18, 19, 64, 255] {
+        for (slot, exceptional_gradient) in exceptional.iter().enumerate() {
+            let histogram: Vec<GradStats> = (0..length)
+                .map(|index| {
+                    let gradient = if index == 5 + slot {
+                        *exceptional_gradient
+                    } else {
+                        (index % 19) as f64 - 9.0 + index as f64 * 0.003
+                    };
+                    GradStats::new(gradient, 0.5 + (index % 7) as f64 * 0.25)
+                })
+                .collect();
+            let mut total = GradStats::default();
+            for &stats in &histogram {
+                total.add(stats);
+            }
+            for alpha in [0.0, f64::from_bits(1), 1.0, 2.0, f64::MAX] {
+                for lambda in [0.0, 1.0] {
+                    let reg = RegParams {
+                        alpha,
+                        lambda,
+                        min_child_weight: 0.0,
+                        max_delta_step: 0.0,
+                    };
+                    let parent_gain = calc_gain(total, &reg);
+                    let expected = scalar_best_split(&histogram, total, &reg, parent_gain, 1e-6);
+                    // SAFETY: NEON was detected; the kernel bounds its loads.
+                    let actual = unsafe {
+                        dense_unconstrained_best_split(&histogram, total, &reg, parent_gain, 1e-6)
+                    };
+                    let bits = |stats: GradStats| (stats.grad.to_bits(), stats.hess.to_bits());
+                    match (actual, expected) {
+                        (Some(actual), Some((offset, left, right))) => {
+                            assert_eq!(actual.split_offset, offset);
+                            assert_eq!(bits(actual.left), bits(left));
+                            assert_eq!(bits(actual.right), bits(right));
+                        }
+                        (None, None) => {}
+                        _ => panic!("scan disagreed on candidate presence"),
+                    }
                 }
             }
         }

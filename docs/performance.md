@@ -11,32 +11,34 @@ and tree-building optimizations within sequoia-boost.
 ## XGBoost comparison
 
 Measured on **Apple M3 Max** against [XGBoost 3.4.1](https://pypi.org/project/xgboost/3.4.1/),
-the latest stable PyPI release checked on **2026-09-05 UTC**. Both engines use the
+the latest stable PyPI release checked on **2026-09-12 UTC**. Both engines use the
 same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
 256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
 preparation and training, and report the median of six fits after warmup.
 
 | Workload | Threads | sequoia-boost | XGBoost 3.4.1 |
 |---|---:|---:|---:|
-| Regression, 100k × 30 | 1 | 0.947 s | 1.130 s |
-| Regression, 100k × 30 | 4 | 0.392 s | 0.417 s |
-| Regression, 100k × 30 | 16 | 0.421 s | 0.451 s |
-| Regression, 50k × 128 | 1 | 2.268 s | 3.398 s |
-| Regression, 50k × 128 | 4 | 0.841 s | 1.085 s |
-| Regression, 50k × 128 | 16 | 0.796 s | 0.859 s |
-| Binary, 100k × 30 | 1 | 0.917 s | 1.109 s |
-| Binary, 100k × 30 | 4 | 0.379 s | 0.406 s |
-| Binary, 100k × 30 | 16 | 0.410 s | 0.446 s |
-| 4-class, 50k × 30 | 1 | 1.962 s | 2.661 s |
-| 4-class, 50k × 30 | 4 | 0.851 s | 1.019 s |
-| 4-class, 50k × 30 | 16 | 0.960 s | 1.246 s |
+| Regression, 100k × 30 | 1 | 0.481 s | 1.066 s |
+| Regression, 100k × 30 | 4 | 0.197 s | 0.369 s |
+| Regression, 100k × 30 | 16 | 0.260 s | 0.366 s |
+| Regression, 50k × 128 | 1 | 1.137 s | 3.277 s |
+| Regression, 50k × 128 | 4 | 0.453 s | 1.011 s |
+| Regression, 50k × 128 | 16 | 0.426 s | 0.690 s |
+| Binary, 100k × 30 | 1 | 0.472 s | 1.048 s |
+| Binary, 100k × 30 | 4 | 0.195 s | 0.362 s |
+| Binary, 100k × 30 | 16 | 0.258 s | 0.358 s |
+| 4-class, 50k × 30 | 1 | 1.102 s | 2.523 s |
+| 4-class, 50k × 30 | 4 | 0.513 s | 0.974 s |
+| 4-class, 50k × 30 | 16 | 0.692 s | 1.205 s |
 
 Sequoia has lower median fit time in all 12 configurations in this run.
-Single-thread speedups range from 1.19× on 30-feature regression to 1.50× on
-wide regression. At four threads, wide regression and multiclass reach 1.29×
-and 1.20× respectively; sixteen-thread multiclass reaches 1.30×. The remaining
-multithread differences are 6–9%. Treat those smaller differences as near
-parity given the uncontrolled background activity on this workstation.
+Single-thread speedups range from 2.22× on 30-feature regression and binary
+classification to 2.88× on wide regression; multiclass reaches 2.29×. At four
+threads, speedups range from 1.85× to 2.23×, and at sixteen threads from 1.39×
+to 1.74×. Held-out scores are identical to the previous run on every workload,
+so the differences reflect training speed, not fit quality. Treat small
+differences as near parity given
+the uncontrolled background activity on this workstation.
 
 ### CPU scheduling
 
@@ -125,7 +127,7 @@ These measurements compare the optimized implementation with the scalar
 baseline, using the same benchmark source and compiler.
 
 Measured on **Apple M3 Max**, 16 physical cores,
-macOS 26.6.2, with **Rust 1.98.1 / LLVM 22.1.8**, on 2026-09-05 UTC.
+macOS 26.6.2, with **Rust 1.98.1 / LLVM 22.1.8**, on 2026-09-12 UTC.
 Both builds use `opt-level=3`, thin LTO, one codegen unit, and no `RUSTFLAGS`.
 `RAYON_NUM_THREADS` is fixed per comparison. Compilation and tests finish before
 timing begins; the benchmark executables run sequentially. Unrelated workstation
@@ -135,7 +137,7 @@ does not eliminate it.
 Each value is the mean of two Criterion run medians, collected in
 baseline/optimized/optimized/baseline order. Each run requests 0.5 seconds of
 warmup, 1 second of measurement, 20 samples, and 10,000 bootstrap resamples.
-Full-training groups use 10 samples; Criterion extends measurement time when
+Criterion extends measurement time when
 needed to collect them. **Less time** is `100 × (1 − optimized / baseline)`.
 These are results for the specified machine and workloads, not a guarantee for
 every dataset or AArch64 CPU.
@@ -148,14 +150,14 @@ tree construction, and training-prediction updates.
 
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
-| Regression, 256 bins | 1 | 414.739 | 208.003 | 49.8% |
-| Regression, 256 bins | 4 | 396.480 | 94.607 | 76.1% |
-| Regression, L1 = 1 | 1 | 414.339 | 203.823 | 50.8% |
-| Regression, L1 = 1 | 4 | 393.711 | 93.414 | 76.3% |
-| Regression, 16 bins | 1 | 244.064 | 158.713 | 35.0% |
-| Regression, 16 bins | 4 | 227.739 | 75.711 | 66.8% |
-| Binary classification | 1 | 427.917 | 214.212 | 49.9% |
-| Binary classification | 4 | 411.213 | 101.709 | 75.3% |
+| Regression, 256 bins | 1 | 393.370 | 108.551 | 72.4% |
+| Regression, 256 bins | 4 | 380.874 | 53.336 | 86.0% |
+| Regression, L1 = 1 | 1 | 390.265 | 106.366 | 72.7% |
+| Regression, L1 = 1 | 4 | 394.533 | 53.662 | 86.4% |
+| Regression, 16 bins | 1 | 230.481 | 73.666 | 68.0% |
+| Regression, 16 bins | 4 | 227.532 | 38.321 | 83.2% |
+| Binary classification | 1 | 405.765 | 113.896 | 71.9% |
+| Binary classification | 4 | 390.376 | 55.889 | 85.7% |
 
 ### Single histogram tree
 
@@ -165,20 +167,20 @@ row partitioning, and split evaluation.
 
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
-| Depth 1 | 1 | 0.875 | 0.463 | 47.0% |
-| Depth 1 | 4 | 0.645 | 0.189 | 70.7% |
-| Depth 6 | 1 | 7.127 | 4.192 | 41.2% |
-| Depth 6 | 4 | 7.013 | 1.703 | 75.7% |
-| Depth 10 | 1 | 53.372 | 18.229 | 65.8% |
-| Depth 10 | 4 | 53.444 | 5.493 | 89.7% |
-| 128 features | 1 | 26.409 | 8.441 | 68.0% |
-| 128 features | 4 | 26.555 | 3.404 | 87.2% |
-| Missing values | 1 | 9.868 | 6.477 | 34.4% |
-| Missing values | 4 | 9.572 | 2.710 | 71.7% |
-| Monotone constraint | 1 | 9.649 | 6.263 | 35.1% |
-| Monotone constraint | 4 | 9.462 | 2.252 | 76.2% |
-| Loss-guide growth | 1 | 7.302 | 5.718 | 21.7% |
-| Loss-guide growth | 4 | 6.947 | 4.992 | 28.1% |
+| Depth 1 | 1 | 0.855 | 0.443 | 48.2% |
+| Depth 1 | 4 | 0.614 | 0.204 | 66.8% |
+| Depth 6 | 1 | 6.866 | 2.126 | 69.0% |
+| Depth 6 | 4 | 6.521 | 0.911 | 86.0% |
+| Depth 10 | 1 | 49.776 | 10.756 | 78.4% |
+| Depth 10 | 4 | 51.066 | 3.582 | 93.0% |
+| 128 features | 1 | 25.079 | 5.059 | 79.8% |
+| 128 features | 4 | 25.040 | 2.165 | 91.4% |
+| Missing values | 1 | 9.551 | 5.839 | 38.9% |
+| Missing values | 4 | 9.145 | 2.546 | 72.2% |
+| Monotone constraint | 1 | 9.248 | 4.142 | 55.2% |
+| Monotone constraint | 4 | 8.843 | 1.527 | 82.7% |
+| Loss-guide growth | 1 | 6.852 | 2.841 | 58.5% |
+| Loss-guide growth | 4 | 6.573 | 2.630 | 60.0% |
 
 Depth cases use 50,000 rows × 20 features. The wide case uses 10,000 rows × 128
 features at depth six. Missing, monotone, and loss-guide cases use the depth-six
@@ -197,34 +199,34 @@ inputs, not tree training.
 
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
-| Logistic gradient | 1 | 2.080 | 0.837 | 59.8% |
-| Logistic gradient, weighted | 1 | 2.105 | 0.835 | 60.3% |
-| Poisson gradient | 1 | 2.688 | 0.977 | 63.7% |
-| Gamma gradient | 1 | 1.424 | 0.600 | 57.9% |
-| Tweedie gradient | 1 | 2.713 | 1.102 | 59.4% |
-| Softmax gradient, 2 classes | 1 | 4.301 | 0.867 | 79.8% |
-| Softmax gradient, 3 classes | 1 | 6.124 | 0.841 | 86.3% |
-| Softmax gradient, 4 classes | 1 | 3.633 | 0.966 | 73.4% |
-| Softmax gradient, 8 classes | 1 | 2.792 | 1.353 | 51.5% |
-| Softmax gradient, 32 classes | 1 | 2.324 | 1.051 | 54.8% |
-| Softmax gradient, 128 classes | 1 | 2.293 | 0.993 | 56.7% |
-| Sigmoid transform | 1 | 1.526 | 0.603 | 60.5% |
-| Exponential transform | 1 | 1.319 | 0.514 | 61.0% |
-| Softmax transform, 2 classes | 1 | 2.415 | 0.607 | 74.9% |
-| Softmax transform, 3 classes | 1 | 2.464 | 0.570 | 76.9% |
-| Softmax transform, 4 classes | 1 | 2.080 | 0.604 | 71.0% |
-| Softmax transform, 8 classes | 1 | 1.979 | 0.745 | 62.4% |
-| Softmax transform, 32 classes | 1 | 1.942 | 0.604 | 68.9% |
-| Softmax transform, 128 classes | 1 | 2.005 | 0.624 | 68.9% |
-| RMSE, weighted | 1 | 0.799 | 0.281 | 64.9% |
-| MAE, weighted | 1 | 0.795 | 0.281 | 64.7% |
-| Binary error, weighted | 1 | 1.397 | 0.216 | 84.5% |
-| Log loss, weighted | 1 | 5.082 | 2.871 | 43.5% |
-| Poisson NLL, weighted | 1 | 2.696 | 1.599 | 40.7% |
-| Gamma NLL, weighted | 1 | 2.733 | 1.619 | 40.8% |
-| Tweedie NLL, weighted | 1 | 14.220 | 4.670 | 67.2% |
-| Multiclass log loss, 32 classes, weighted | 1 | 0.104 | 0.064 | 38.0% |
-| Multiclass error, 32 classes, weighted | 1 | 1.655 | 0.254 | 84.7% |
+| Logistic gradient | 1 | 2.040 | 0.803 | 60.6% |
+| Logistic gradient, weighted | 1 | 2.044 | 0.815 | 60.1% |
+| Poisson gradient | 1 | 2.618 | 0.942 | 64.0% |
+| Gamma gradient | 1 | 1.380 | 0.583 | 57.8% |
+| Tweedie gradient | 1 | 2.653 | 1.061 | 60.0% |
+| Softmax gradient, 2 classes | 1 | 4.168 | 0.824 | 80.2% |
+| Softmax gradient, 3 classes | 1 | 5.928 | 0.815 | 86.3% |
+| Softmax gradient, 4 classes | 1 | 3.481 | 0.898 | 74.2% |
+| Softmax gradient, 8 classes | 1 | 2.684 | 1.304 | 51.4% |
+| Softmax gradient, 32 classes | 1 | 2.219 | 1.010 | 54.5% |
+| Softmax gradient, 128 classes | 1 | 2.193 | 0.946 | 56.8% |
+| Sigmoid transform | 1 | 1.449 | 0.575 | 60.3% |
+| Exponential transform | 1 | 1.258 | 0.474 | 62.3% |
+| Softmax transform, 2 classes | 1 | 2.326 | 0.565 | 75.7% |
+| Softmax transform, 3 classes | 1 | 2.370 | 0.544 | 77.1% |
+| Softmax transform, 4 classes | 1 | 2.024 | 0.584 | 71.1% |
+| Softmax transform, 8 classes | 1 | 1.887 | 0.717 | 62.0% |
+| Softmax transform, 32 classes | 1 | 1.862 | 0.583 | 68.7% |
+| Softmax transform, 128 classes | 1 | 1.925 | 0.593 | 69.2% |
+| RMSE, weighted | 1 | 0.770 | 0.274 | 64.4% |
+| MAE, weighted | 1 | 0.768 | 0.269 | 65.0% |
+| Binary error, weighted | 1 | 1.348 | 0.207 | 84.7% |
+| Log loss, weighted | 1 | 4.946 | 2.754 | 44.3% |
+| Poisson NLL, weighted | 1 | 2.604 | 1.560 | 40.1% |
+| Gamma NLL, weighted | 1 | 2.649 | 1.560 | 41.1% |
+| Tweedie NLL, weighted | 1 | 13.880 | 4.501 | 67.6% |
+| Multiclass log loss, 32 classes, weighted | 1 | 0.100 | 0.062 | 38.3% |
+| Multiclass error, 32 classes, weighted | 1 | 1.613 | 0.245 | 84.8% |
 
 The [complete results](benchmarks/performance.json) include all 73
 single-thread cases and 11 four-thread cases, including unweighted metrics,

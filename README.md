@@ -127,32 +127,30 @@ searches.
 ### Compared with XGBoost
 
 Measured on **Apple M3 Max** against [XGBoost 3.4.1](https://pypi.org/project/xgboost/3.4.1/),
-the latest stable PyPI release checked on **2026-09-05 UTC**. Both engines use the
+the latest stable PyPI release checked on **2026-09-12 UTC**. Both engines use the
 same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
 256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
 preparation and training, and report the median of six fits after warmup.
 
 | Workload | Threads | sequoia-boost | XGBoost 3.4.1 |
 |---|---:|---:|---:|
-| Regression, 100k × 30 | 1 | 0.947 s | 1.130 s |
-| Regression, 100k × 30 | 4 | 0.392 s | 0.417 s |
-| Regression, 100k × 30 | 16 | 0.421 s | 0.451 s |
-| Regression, 50k × 128 | 1 | 2.268 s | 3.398 s |
-| Regression, 50k × 128 | 4 | 0.841 s | 1.085 s |
-| Regression, 50k × 128 | 16 | 0.796 s | 0.859 s |
-| Binary, 100k × 30 | 1 | 0.917 s | 1.109 s |
-| Binary, 100k × 30 | 4 | 0.379 s | 0.406 s |
-| Binary, 100k × 30 | 16 | 0.410 s | 0.446 s |
-| 4-class, 50k × 30 | 1 | 1.962 s | 2.661 s |
-| 4-class, 50k × 30 | 4 | 0.851 s | 1.019 s |
-| 4-class, 50k × 30 | 16 | 0.960 s | 1.246 s |
+| Regression, 100k × 30 | 1 | 0.481 s | 1.066 s |
+| Regression, 100k × 30 | 4 | 0.197 s | 0.369 s |
+| Regression, 100k × 30 | 16 | 0.260 s | 0.366 s |
+| Regression, 50k × 128 | 1 | 1.137 s | 3.277 s |
+| Regression, 50k × 128 | 4 | 0.453 s | 1.011 s |
+| Regression, 50k × 128 | 16 | 0.426 s | 0.690 s |
+| Binary, 100k × 30 | 1 | 0.472 s | 1.048 s |
+| Binary, 100k × 30 | 4 | 0.195 s | 0.362 s |
+| Binary, 100k × 30 | 16 | 0.258 s | 0.358 s |
+| 4-class, 50k × 30 | 1 | 1.102 s | 2.523 s |
+| 4-class, 50k × 30 | 4 | 0.513 s | 0.974 s |
+| 4-class, 50k × 30 | 16 | 0.692 s | 1.205 s |
 
 Sequoia has lower median fit time in all 12 configurations in this run.
-Single-thread speedups are 1.19–1.50×. At four threads, wide regression is
-1.29× as fast and multiclass is 1.20× as fast; multiclass reaches 1.30× at
-sixteen threads. The remaining multithread differences are 6–9%, which should
-be treated as near parity on this interactive workstation. Held-out
-RMSE/log-loss scores differ by less than 0.6%.
+Single-thread speedups are 2.22–2.88×, four-thread speedups are 1.85–2.23×, and
+sixteen-thread speedups are 1.39–1.74×. Held-out RMSE/log-loss scores are
+identical to the previous run on every workload.
 
 See the [full comparison](docs/performance.md#xgboost-comparison) for held-out
 quality, sample variability, workload definitions, and reproduction commands.

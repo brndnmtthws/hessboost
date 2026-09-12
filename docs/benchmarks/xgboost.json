@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "started_at": "2026-09-05T02:41:15.935976+00:00",
+    "started_at": "2026-09-12T12:16:42.257191+00:00",
     "cpu": "Apple M3 Max",
     "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
     "python": "3.14.5 (main, May 10 2026, 19:20:57) [Clang 22.1.3 ]",
@@ -21,10 +21,10 @@
       "USE_NCCL": false,
       "USE_OPENMP": true,
       "USE_RMM": false,
-      "libxgboost": "/Users/brenden/Library/Caches/uv/archive-v0/pnnu-NBqp4UcJMrGqWmmw/lib/python3.14/site-packages/xgboost/lib/libxgboost.dylib"
+      "libxgboost": "/Users/brenden/Library/Caches/uv/archive-v0/MU7AF3eO6w3nVUEB/lib/python3.14/site-packages/xgboost/lib/libxgboost.dylib"
     },
     "xgboost_library_sha256": "5aef338ede7b84ae7d3405a306614de1d326ccaad033a2f14242aedd421359bc",
-    "sequoia_executable_sha256": "c47571240857dc3e635d5c7ac865b9cb6307d99c5fc2d575b71434b00de812bb",
+    "sequoia_executable_sha256": "9dac18a05b18ee9d63cc68c408801546eb3e830750fce0f9bdff27054cc0b16b",
     "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
     "source_sha256": {
       "scripts/bench_xgb.py": "8e3cf37678ea0e52fab82fc169ed3c6f8f8b72991f1819342f93817c6924092d",
@@ -36,18 +36,18 @@
       "crates/sequoia-boost/src/booster/mod.rs": "eb9cff611c9640689216121cd32ce14888140f6502fa2be58582c3f3c9fff625",
       "crates/sequoia-boost/src/config/mod.rs": "5d49cb43606f3da6de716c2909a0abe758c74ef4f9fd86abf34e2ab4878900d3",
       "crates/sequoia-boost/src/config/params.rs": "e9c1833927a1b20172ee6cd9abec5dfd299bf8235cbfff20d62b5ba7cc320593",
-      "crates/sequoia-boost/src/data/dmatrix.rs": "21bd124b74be070633c57f437da6e76e3f1680db01db87f003af9df8aeb70de0",
-      "crates/sequoia-boost/src/data/ghist.rs": "75a64de678e54dee824b5e4be3bd911ab9ed7edfcf481203e7a1813a84f53c2b",
+      "crates/sequoia-boost/src/data/dmatrix.rs": "703e5bd74916e7c32c1fb6c51f218e261041fafb0afe7a8567ee10d1b72639cc",
+      "crates/sequoia-boost/src/data/ghist.rs": "e2c915ebb2930e31b2174df21580ff2696ccf50d391d8ac0209dc471d5da52a9",
       "crates/sequoia-boost/src/data/loaders.rs": "2f29c2a85bf0fefb38f30622028ea1d2bf6a97a8be66f9b5deb8afa471bc7de8",
       "crates/sequoia-boost/src/data/meta.rs": "0fa2e984611b737ac07b9e604aaedaa7c6873c4056bd32a5a8b283a32a2e232b",
-      "crates/sequoia-boost/src/data/mod.rs": "a01e8327e567e0d18435b12fdbc56c101e0a1e51da67992d1ef70ec897e3d175",
-      "crates/sequoia-boost/src/data/quantile.rs": "4346c93dfd9d664aba82ebaa3298aad7be50face34b3c4bbba431735be6c259b",
+      "crates/sequoia-boost/src/data/mod.rs": "c32d239282cc28f56b56152424d295870305a32674a49a90b3fbd602a40831e8",
+      "crates/sequoia-boost/src/data/quantile.rs": "d9efb3b6e5bd1021536adc7ad89f6e1deb221e7b97288c25a5fe073823f355cf",
       "crates/sequoia-boost/src/error.rs": "80c5231529ac2e079b019a96fa1f46949c68c887780c5b99aa5859825b759406",
       "crates/sequoia-boost/src/learner/cv.rs": "5ae7a657ba80172930a0ef655e1a41f7449c31510562bda4c7796e17ed30c86d",
       "crates/sequoia-boost/src/learner/mod.rs": "e144976c19cbec9d717e04c9ea6c821c8273e2b952ba47f8f74f29aa3e88d97b",
-      "crates/sequoia-boost/src/learner/model.rs": "0d6327dbb22958b1296a42cb389744ea58b04848835fa04836f5a3ab0aacfbcf",
-      "crates/sequoia-boost/src/learner/shap.rs": "836c0b99dded9c8a0c0fd8633b848cb99b5c645cc5d0411f6713a8ea0934e135",
-      "crates/sequoia-boost/src/learner/train.rs": "1bdd6012bc185df1f155626dbeebbea7ab4c82465f346f1a654ff075951565e7",
+      "crates/sequoia-boost/src/learner/model.rs": "2ef995b1b09bc92e1b8230bd08cf746834619f24c64684eb4e0a3aeb6244a98c",
+      "crates/sequoia-boost/src/learner/shap.rs": "ab74581ac05531963adbe6dd01bc0693edacfbb1eb13333fa8ce9ec955f5a9b0",
+      "crates/sequoia-boost/src/learner/train.rs": "3e88a3d88455f40884b1807027f442d3a56277fd328882f3752e8c0fe3b78963",
       "crates/sequoia-boost/src/lib.rs": "7544c69747ecc92ef6f6096e0af0965887395134d90f60b0c562455c62361f4e",
       "crates/sequoia-boost/src/metric/mod.rs": "533a9e79ef70e15a545afbf6c09e535b85cdd456aded826307d6efa4c471da40",
       "crates/sequoia-boost/src/model/mod.rs": "133dfd83353e0924d12e66d8815d5ecf6cc888677b5a5b1436718cddbc05c0f0",
@@ -59,19 +59,20 @@
       "crates/sequoia-boost/src/objective/multiclass.rs": "40a0e862038c0bd01b10d0eaba8169f31692db0657d3e3fae3930b83b311424d",
       "crates/sequoia-boost/src/objective/ranking.rs": "0cfbc2b996081995bed90daf33fb096e2492d6d8ce3b311bda79a3b0efd8c38b",
       "crates/sequoia-boost/src/objective/regression.rs": "74bd2fef44d6b1d191ca92ed0078f6937e0c3ad4494123f231c024150c180d65",
-      "crates/sequoia-boost/src/simd/aarch64/tests.rs": "c06973538719c150e5b4b78caf0834bff6ea8f8120b5067b6caf0ac98fb7e98d",
-      "crates/sequoia-boost/src/simd/aarch64.rs": "3a87a4c7be09179f61ae747bafe178305cb4f67c7884c0b03904c30c0b141956",
-      "crates/sequoia-boost/src/simd/mod.rs": "876fcaa1ef7ff1a06cc6b7d4da8b83f079d97648f79748eaaa4c283318f25993",
+      "crates/sequoia-boost/src/simd/aarch64/tests.rs": "174ba6f5ef8f5b298b2d0e756ef763d7296790400a3347caaedd18c183735e49",
+      "crates/sequoia-boost/src/simd/aarch64.rs": "032a04856bf1f2ffc5ec7a50af2a261378fc0fb54d141eccd8577a911af9476f",
+      "crates/sequoia-boost/src/simd/mod.rs": "2c485147a393b45ce768116b6cdd788c903b1d77037292d4959f781fcc972ad8",
       "crates/sequoia-boost/src/simd/scalar.rs": "b56377f96277e65952ad7249abbfccaf701281260efe165a5c84cea1b2bee02d",
       "crates/sequoia-boost/src/simd/tests.rs": "23aa95569159c38e060bfb8e90fc81fa73e95701e49088e1b41fe29c2a2145f9",
       "crates/sequoia-boost/src/tree/builder/exact.rs": "8cc1a77ac076fd1dffc9030e04eb19ccd75f74cb8ad8759c8b5dc6d4d7feb219",
-      "crates/sequoia-boost/src/tree/builder/hist.rs": "2701cbe128b9ee95c827759dfada1a41041071d469e14121f26cd9209f9b0972",
-      "crates/sequoia-boost/src/tree/builder/mod.rs": "f0f745313c2d037a0edac162114bd747b45b9a29b02f3076dea5cd2a33532e5e",
+      "crates/sequoia-boost/src/tree/builder/hist.rs": "805b989c771adc17af77830319aa1f0ba929d2059e07bf0b0f206af2d2cd4072",
+      "crates/sequoia-boost/src/tree/builder/mod.rs": "646d2424ffd1a3d58982bdb733cc9d154d9567bf9d6ad223cea3b399ab6a04e0",
+      "crates/sequoia-boost/src/tree/compact.rs": "413ac63bb393c0db8dee563e7c366e4016a1175dbd389a0213747d488b20e72e",
       "crates/sequoia-boost/src/tree/constraints.rs": "66cc15e0f3f267b60457fcfde8006f562c4ed29f5497ff432900c069eb3130bb",
       "crates/sequoia-boost/src/tree/gain.rs": "6a9f114b29e8fd63b7fd3fb09e827c6f248b736c4aed612cb07b3fc3aeee6ebe",
-      "crates/sequoia-boost/src/tree/hist/mod.rs": "9f99747c1a40e104262eb45e96acd4313a311c81a3c713ca15970bc7ecaaee5d",
-      "crates/sequoia-boost/src/tree/mod.rs": "5ac3ae7b038498dff2d89bc3a0f279cf0f3589b8c4603ddb288c1d225a40fab1",
-      "crates/sequoia-boost/src/tree/regtree.rs": "e2533ae8c99acdb6935e8e8fee4b3fbf7868395a4b039d518b593d1e496a6427",
+      "crates/sequoia-boost/src/tree/hist/mod.rs": "3773f6732a21f266e70e885567e4b9bcd4b50139a729a3f9ef6fb644a3d755a5",
+      "crates/sequoia-boost/src/tree/mod.rs": "1a2da18ae493e220e421a7b4edb34b23c03b784056ed6cef3cf35e7f2d6398af",
+      "crates/sequoia-boost/src/tree/regtree.rs": "62c2d06e5e04adae542f9c55d870bee8a6e639da0e31183b9027b7765b696cc7",
       "crates/sequoia-boost/src/tree/sampler.rs": "d024d572e5064f6d10d66e55f0d3d8bc5bacf630ca3ce5b02b85a13ecb947293"
     },
     "matrix": "XGBoost QuantileDMatrix; sequoia-boost DMatrix",
@@ -89,7 +90,7 @@
       4,
       16
     ],
-    "finished_at": "2026-09-05T02:44:41.682006+00:00",
+    "finished_at": "2026-09-12T12:19:19.289393+00:00",
     "macos": "26.6.2",
     "cargo_lockfile": "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"aho-corasick\"\nversion = \"1.1.5\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba\"\ndependencies = [\n \"memchr\",\n]\n\n[[package]]\nname = \"anes\"\nversion = \"0.1.6\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299\"\n\n[[package]]\nname = \"anstyle\"\nversion = \"1.0.14\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000\"\n\n[[package]]\nname = \"approx\"\nversion = \"0.5.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6\"\ndependencies = [\n \"num-traits\",\n]\n\n[[package]]\nname = \"autocfg\"\nversion = \"1.5.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53\"\n\n[[package]]\nname = \"bit-set\"\nversion = \"0.8.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3\"\ndependencies = [\n \"bit-vec\",\n]\n\n[[package]]\nname = \"bit-vec\"\nversion = \"0.8.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7\"\n\n[[package]]\nname = \"bitflags\"\nversion = \"2.13.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da\"\n\n[[package]]\nname = \"bumpalo\"\nversion = \"3.20.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649\"\n\n[[package]]\nname = \"cast\"\nversion = \"0.3.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5\"\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n\n[[package]]\nname = \"ciborium\"\nversion = \"0.2.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e\"\ndependencies = [\n \"ciborium-io\",\n \"ciborium-ll\",\n \"serde\",\n]\n\n[[package]]\nname = \"ciborium-io\"\nversion = \"0.2.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757\"\n\n[[package]]\nname = \"ciborium-ll\"\nversion = \"0.2.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9\"\ndependencies = [\n \"ciborium-io\",\n \"half\",\n]\n\n[[package]]\nname = \"clap\"\nversion = \"4.6.6\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca\"\ndependencies = [\n \"clap_builder\",\n]\n\n[[package]]\nname = \"clap_builder\"\nversion = \"4.6.6\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889\"\ndependencies = [\n \"anstyle\",\n \"clap_lex\",\n]\n\n[[package]]\nname = \"clap_lex\"\nversion = \"1.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9\"\n\n[[package]]\nname = \"cobs\"\nversion = \"0.3.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1\"\ndependencies = [\n \"thiserror\",\n]\n\n[[package]]\nname = \"criterion\"\nversion = \"0.5.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f\"\ndependencies = [\n \"anes\",\n \"cast\",\n \"ciborium\",\n \"clap\",\n \"criterion-plot\",\n \"is-terminal\",\n \"itertools\",\n \"num-traits\",\n \"once_cell\",\n \"oorandom\",\n \"plotters\",\n \"rayon\",\n \"regex\",\n \"serde\",\n \"serde_derive\",\n \"serde_json\",\n \"tinytemplate\",\n \"walkdir\",\n]\n\n[[package]]\nname = \"criterion-plot\"\nversion = \"0.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1\"\ndependencies = [\n \"cast\",\n \"itertools\",\n]\n\n[[package]]\nname = \"crossbeam-deque\"\nversion = \"0.8.7\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb\"\ndependencies = [\n \"crossbeam-epoch\",\n \"crossbeam-utils\",\n]\n\n[[package]]\nname = \"crossbeam-epoch\"\nversion = \"0.9.20\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f\"\ndependencies = [\n \"crossbeam-utils\",\n]\n\n[[package]]\nname = \"crossbeam-utils\"\nversion = \"0.8.22\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17\"\n\n[[package]]\nname = \"crunchy\"\nversion = \"0.2.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5\"\n\n[[package]]\nname = \"either\"\nversion = \"1.18.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34\"\n\n[[package]]\nname = \"embedded-io\"\nversion = \"0.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced\"\n\n[[package]]\nname = \"embedded-io\"\nversion = \"0.6.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d\"\n\n[[package]]\nname = \"errno\"\nversion = \"0.3.14\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb\"\ndependencies = [\n \"libc\",\n \"windows-sys\",\n]\n\n[[package]]\nname = \"fastrand\"\nversion = \"2.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223\"\n\n[[package]]\nname = \"fnv\"\nversion = \"1.0.7\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1\"\n\n[[package]]\nname = \"futures-core\"\nversion = \"0.3.34\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e\"\n\n[[package]]\nname = \"futures-task\"\nversion = \"0.3.34\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd\"\n\n[[package]]\nname = \"futures-util\"\nversion = \"0.3.34\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc\"\ndependencies = [\n \"futures-core\",\n \"futures-task\",\n \"pin-project-lite\",\n \"slab\",\n]\n\n[[package]]\nname = \"getrandom\"\nversion = \"0.2.17\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0\"\ndependencies = [\n \"cfg-if\",\n \"libc\",\n \"wasi\",\n]\n\n[[package]]\nname = \"getrandom\"\nversion = \"0.3.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd\"\ndependencies = [\n \"cfg-if\",\n \"libc\",\n \"r-efi 5.3.0\",\n \"wasip2\",\n]\n\n[[package]]\nname = \"getrandom\"\nversion = \"0.4.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099\"\ndependencies = [\n \"cfg-if\",\n \"libc\",\n \"r-efi 6.0.0\",\n]\n\n[[package]]\nname = \"half\"\nversion = \"2.7.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b\"\ndependencies = [\n \"cfg-if\",\n \"crunchy\",\n \"zerocopy\",\n]\n\n[[package]]\nname = \"hermit-abi\"\nversion = \"0.5.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284\"\n\n[[package]]\nname = \"is-terminal\"\nversion = \"0.4.17\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46\"\ndependencies = [\n \"hermit-abi\",\n \"libc\",\n \"windows-sys\",\n]\n\n[[package]]\nname = \"itertools\"\nversion = \"0.10.5\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473\"\ndependencies = [\n \"either\",\n]\n\n[[package]]\nname = \"itoa\"\nversion = \"1.0.18\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682\"\n\n[[package]]\nname = \"js-sys\"\nversion = \"0.3.105\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ce57d20d1ea864ce2ac172ab472d409214f4fd359f0b2a2775abdf522e2af99e\"\ndependencies = [\n \"cfg-if\",\n \"futures-util\",\n \"wasm-bindgen\",\n]\n\n[[package]]\nname = \"libc\"\nversion = \"0.2.189\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2\"\n\n[[package]]\nname = \"linux-raw-sys\"\nversion = \"0.12.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53\"\n\n[[package]]\nname = \"memchr\"\nversion = \"2.8.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98\"\n\n[[package]]\nname = \"num-traits\"\nversion = \"0.2.19\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841\"\ndependencies = [\n \"autocfg\",\n]\n\n[[package]]\nname = \"once_cell\"\nversion = \"1.21.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50\"\n\n[[package]]\nname = \"oorandom\"\nversion = \"11.1.5\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e\"\n\n[[package]]\nname = \"pin-project-lite\"\nversion = \"0.2.17\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd\"\n\n[[package]]\nname = \"plotters\"\nversion = \"0.3.7\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747\"\ndependencies = [\n \"num-traits\",\n \"plotters-backend\",\n \"plotters-svg\",\n \"wasm-bindgen\",\n \"web-sys\",\n]\n\n[[package]]\nname = \"plotters-backend\"\nversion = \"0.3.7\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a\"\n\n[[package]]\nname = \"plotters-svg\"\nversion = \"0.3.7\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670\"\ndependencies = [\n \"plotters-backend\",\n]\n\n[[package]]\nname = \"postcard\"\nversion = \"1.1.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24\"\ndependencies = [\n \"cobs\",\n \"embedded-io 0.4.0\",\n \"embedded-io 0.6.1\",\n \"serde\",\n]\n\n[[package]]\nname = \"ppv-lite86\"\nversion = \"0.2.21\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9\"\ndependencies = [\n \"zerocopy\",\n]\n\n[[package]]\nname = \"proc-macro2\"\nversion = \"1.0.107\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9\"\ndependencies = [\n \"unicode-ident\",\n]\n\n[[package]]\nname = \"proptest\"\nversion = \"1.11.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744\"\ndependencies = [\n \"bit-set\",\n \"bit-vec\",\n \"bitflags\",\n \"num-traits\",\n \"rand 0.9.5\",\n \"rand_chacha 0.9.0\",\n \"rand_xorshift\",\n \"regex-syntax\",\n \"rusty-fork\",\n \"tempfile\",\n \"unarray\",\n]\n\n[[package]]\nname = \"quick-error\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0\"\n\n[[package]]\nname = \"quote\"\nversion = \"1.0.47\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001\"\ndependencies = [\n \"proc-macro2\",\n]\n\n[[package]]\nname = \"r-efi\"\nversion = \"5.3.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f\"\n\n[[package]]\nname = \"r-efi\"\nversion = \"6.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf\"\n\n[[package]]\nname = \"rand\"\nversion = \"0.8.8\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c\"\ndependencies = [\n \"libc\",\n \"rand_chacha 0.3.1\",\n \"rand_core 0.6.4\",\n]\n\n[[package]]\nname = \"rand\"\nversion = \"0.9.5\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41\"\ndependencies = [\n \"rand_chacha 0.9.0\",\n \"rand_core 0.9.5\",\n]\n\n[[package]]\nname = \"rand_chacha\"\nversion = \"0.3.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88\"\ndependencies = [\n \"ppv-lite86\",\n \"rand_core 0.6.4\",\n]\n\n[[package]]\nname = \"rand_chacha\"\nversion = \"0.9.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb\"\ndependencies = [\n \"ppv-lite86\",\n \"rand_core 0.9.5\",\n]\n\n[[package]]\nname = \"rand_core\"\nversion = \"0.6.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c\"\ndependencies = [\n \"getrandom 0.2.17\",\n]\n\n[[package]]\nname = \"rand_core\"\nversion = \"0.9.5\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c\"\ndependencies = [\n \"getrandom 0.3.4\",\n]\n\n[[package]]\nname = \"rand_pcg\"\nversion = \"0.3.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"59cad018caf63deb318e5a4586d99a24424a364f40f1e5778c29aca23f4fc73e\"\ndependencies = [\n \"rand_core 0.6.4\",\n]\n\n[[package]]\nname = \"rand_xorshift\"\nversion = \"0.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a\"\ndependencies = [\n \"rand_core 0.9.5\",\n]\n\n[[package]]\nname = \"rayon\"\nversion = \"1.12.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d\"\ndependencies = [\n \"either\",\n \"rayon-core\",\n]\n\n[[package]]\nname = \"rayon-core\"\nversion = \"1.13.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91\"\ndependencies = [\n \"crossbeam-deque\",\n \"crossbeam-utils\",\n]\n\n[[package]]\nname = \"regex\"\nversion = \"1.13.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d\"\ndependencies = [\n \"aho-corasick\",\n \"memchr\",\n \"regex-automata\",\n \"regex-syntax\",\n]\n\n[[package]]\nname = \"regex-automata\"\nversion = \"0.4.18\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2\"\ndependencies = [\n \"aho-corasick\",\n \"memchr\",\n \"regex-syntax\",\n]\n\n[[package]]\nname = \"regex-syntax\"\nversion = \"0.8.11\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4\"\n\n[[package]]\nname = \"rustix\"\nversion = \"1.1.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190\"\ndependencies = [\n \"bitflags\",\n \"errno\",\n \"libc\",\n \"linux-raw-sys\",\n \"windows-sys\",\n]\n\n[[package]]\nname = \"rustversion\"\nversion = \"1.0.23\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f\"\n\n[[package]]\nname = \"rusty-fork\"\nversion = \"0.3.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2\"\ndependencies = [\n \"fnv\",\n \"quick-error\",\n \"tempfile\",\n \"wait-timeout\",\n]\n\n[[package]]\nname = \"same-file\"\nversion = \"1.0.6\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502\"\ndependencies = [\n \"winapi-util\",\n]\n\n[[package]]\nname = \"sequoia-boost\"\nversion = \"0.2.0\"\ndependencies = [\n \"approx\",\n \"criterion\",\n \"num-traits\",\n \"postcard\",\n \"proptest\",\n \"rand 0.8.8\",\n \"rand_pcg\",\n \"rayon\",\n \"serde\",\n \"serde_json\",\n \"thiserror\",\n]\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.229\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba\"\ndependencies = [\n \"serde_core\",\n \"serde_derive\",\n]\n\n[[package]]\nname = \"serde_core\"\nversion = \"1.0.229\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48\"\ndependencies = [\n \"serde_derive\",\n]\n\n[[package]]\nname = \"serde_derive\"\nversion = \"1.0.229\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348\"\ndependencies = [\n \"proc-macro2\",\n \"quote\",\n \"syn 3.0.5\",\n]\n\n[[package]]\nname = \"serde_json\"\nversion = \"1.0.151\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14\"\ndependencies = [\n \"itoa\",\n \"memchr\",\n \"serde\",\n \"serde_core\",\n \"zmij\",\n]\n\n[[package]]\nname = \"slab\"\nversion = \"0.4.12\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5\"\n\n[[package]]\nname = \"syn\"\nversion = \"2.0.119\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297\"\ndependencies = [\n \"proc-macro2\",\n \"quote\",\n \"unicode-ident\",\n]\n\n[[package]]\nname = \"syn\"\nversion = \"3.0.5\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9\"\ndependencies = [\n \"proc-macro2\",\n \"quote\",\n \"unicode-ident\",\n]\n\n[[package]]\nname = \"tempfile\"\nversion = \"3.27.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd\"\ndependencies = [\n \"fastrand\",\n \"getrandom 0.4.3\",\n \"once_cell\",\n \"rustix\",\n \"windows-sys\",\n]\n\n[[package]]\nname = \"thiserror\"\nversion = \"2.0.20\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f\"\ndependencies = [\n \"thiserror-impl\",\n]\n\n[[package]]\nname = \"thiserror-impl\"\nversion = \"2.0.20\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af\"\ndependencies = [\n \"proc-macro2\",\n \"quote\",\n \"syn 3.0.5\",\n]\n\n[[package]]\nname = \"tinytemplate\"\nversion = \"1.2.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc\"\ndependencies = [\n \"serde\",\n \"serde_json\",\n]\n\n[[package]]\nname = \"unarray\"\nversion = \"0.1.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94\"\n\n[[package]]\nname = \"unicode-ident\"\nversion = \"1.0.24\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75\"\n\n[[package]]\nname = \"wait-timeout\"\nversion = \"0.2.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11\"\ndependencies = [\n \"libc\",\n]\n\n[[package]]\nname = \"walkdir\"\nversion = \"2.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b\"\ndependencies = [\n \"same-file\",\n \"winapi-util\",\n]\n\n[[package]]\nname = \"wasi\"\nversion = \"0.11.1+wasi-snapshot-preview1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b\"\n\n[[package]]\nname = \"wasip2\"\nversion = \"1.0.4+wasi-0.2.12\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487\"\ndependencies = [\n \"wit-bindgen\",\n]\n\n[[package]]\nname = \"wasm-bindgen\"\nversion = \"0.2.128\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aecb87a33d3b0c5e3b7aa46336eaf486cffafbd281b195e4c8b80d50df2351bf\"\ndependencies = [\n \"cfg-if\",\n \"once_cell\",\n \"rustversion\",\n \"wasm-bindgen-macro\",\n \"wasm-bindgen-shared\",\n]\n\n[[package]]\nname = \"wasm-bindgen-macro\"\nversion = \"0.2.128\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"a690d511e3c1a8b3a55e33511e3c2c00c78415cd23650f32b808627f5696b9ed\"\ndependencies = [\n \"quote\",\n \"wasm-bindgen-macro-support\",\n]\n\n[[package]]\nname = \"wasm-bindgen-macro-support\"\nversion = \"0.2.128\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"411e4887f0071ef2d2164a9d5fdf2d20efbef78fccd3a78b0c10a1dc5295e48a\"\ndependencies = [\n \"bumpalo\",\n \"proc-macro2\",\n \"quote\",\n \"syn 3.0.5\",\n \"wasm-bindgen-shared\",\n]\n\n[[package]]\nname = \"wasm-bindgen-shared\"\nversion = \"0.2.128\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e\"\ndependencies = [\n \"unicode-ident\",\n]\n\n[[package]]\nname = \"web-sys\"\nversion = \"0.3.105\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9fbddc4a036f00ec4f18c83445bd3115cb306a91da554919a099d9222fe4a7f8\"\ndependencies = [\n \"js-sys\",\n \"wasm-bindgen\",\n]\n\n[[package]]\nname = \"winapi-util\"\nversion = \"0.1.11\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22\"\ndependencies = [\n \"windows-sys\",\n]\n\n[[package]]\nname = \"windows-link\"\nversion = \"0.2.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5\"\n\n[[package]]\nname = \"windows-sys\"\nversion = \"0.61.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc\"\ndependencies = [\n \"windows-link\",\n]\n\n[[package]]\nname = \"wit-bindgen\"\nversion = \"0.57.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e\"\n\n[[package]]\nname = \"zerocopy\"\nversion = \"0.8.56\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb\"\ndependencies = [\n \"zerocopy-derive\",\n]\n\n[[package]]\nname = \"zerocopy-derive\"\nversion = \"0.8.56\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1\"\ndependencies = [\n \"proc-macro2\",\n \"quote\",\n \"syn 2.0.119\",\n]\n\n[[package]]\nname = \"zmij\"\nversion = \"1.0.23\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b\"\n",
     "rust_build": {
@@ -99,10 +100,10 @@
       "codegen-units": 1,
       "RUSTFLAGS": ""
     },
+    "benchmark_environment": "Interactive workstation; unrelated CPU activity observed. Engines ran sequentially without concurrent compilation or tests.",
     "xgboost_release_url": "https://pypi.org/project/xgboost/3.4.1/",
-    "latest_release_checked_at": "2026-09-05T02:20:59.730759+00:00",
-    "uv_command": "uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py --sequoia target/release/examples/bench_compare --output /tmp/sequoia-xgb --threads 1 4 16",
-    "benchmark_environment": "Interactive workstation; unrelated CPU activity observed. Engines ran sequentially without concurrent compilation or tests."
+    "latest_release_checked_at": "2026-09-12T12:27:54.349299+00:00",
+    "uv_command": "uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py --sequoia target/release/examples/bench_compare --output /tmp/sequoia-xgb --threads 1 4 16"
   },
   "datasets": {
     "regression": {
@@ -208,9 +209,9 @@
       "threads": 1,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 1.129861291468842,
-          "min_fit_seconds": 1.115815500030294,
-          "max_fit_seconds": 1.1418103749747388,
+          "median_fit_seconds": 1.065660708467476,
+          "min_fit_seconds": 1.0584515000227839,
+          "max_fit_seconds": 1.0764364999486133,
           "test_metric": "rmse",
           "test_scores": [
             0.060964787012863536,
@@ -218,9 +219,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.9468517919999999,
-          "min_fit_seconds": 0.944698167,
-          "max_fit_seconds": 0.955372625,
+          "median_fit_seconds": 0.48105508350000004,
+          "min_fit_seconds": 0.465767375,
+          "max_fit_seconds": 0.486919542,
           "test_metric": "rmse",
           "test_scores": [
             0.06063511451807803,
@@ -228,15 +229,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.1932820965383377,
+      "sequoia_speedup": 2.2152571400224605,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            1.1284833749523386,
-            1.1418103749747388,
-            1.1281947499956004
+            1.0764364999486133,
+            1.073026666068472,
+            1.0584515000227839
           ],
           "test_metric": "rmse",
           "test_score": 0.060964787012863536,
@@ -341,39 +342,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:41:16.039657+00:00"
+          "started_at": "2026-09-12T12:16:42.342310+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.955372625,
-            0.946960375,
-            0.955337875
+            0.480048459,
+            0.485177458,
+            0.480298292
           ],
           "test_metric": "rmse",
           "test_score": 0.06063511451807803,
           "threads": 1,
-          "started_at": "2026-09-05T02:41:20.594252+00:00"
+          "started_at": "2026-09-12T12:16:46.637430+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.946743209,
-            0.944698167,
-            0.946650333
+            0.465767375,
+            0.486919542,
+            0.481811875
           ],
           "test_metric": "rmse",
           "test_score": 0.06063511451807803,
           "threads": 1,
-          "started_at": "2026-09-05T02:41:24.666383+00:00"
+          "started_at": "2026-09-12T12:16:48.843925+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            1.1312392079853453,
-            1.115815500030294,
-            1.1373379579745233
+            1.0681499999482185,
+            1.0631714169867337,
+            1.0587015829514712
           ],
           "test_metric": "rmse",
           "test_score": 0.060964787012863536,
@@ -478,7 +479,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:41:28.525452+00:00"
+          "started_at": "2026-09-12T12:16:50.774589+00:00"
         }
       ]
     },
@@ -487,9 +488,9 @@
       "threads": 4,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 0.4166746664850507,
-          "min_fit_seconds": 0.4096369999460876,
-          "max_fit_seconds": 0.4267192499828525,
+          "median_fit_seconds": 0.36923285451484844,
+          "min_fit_seconds": 0.36655520903877914,
+          "max_fit_seconds": 0.3725656670285389,
           "test_metric": "rmse",
           "test_scores": [
             0.060964787012863536,
@@ -497,9 +498,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.3918984585,
-          "min_fit_seconds": 0.387528292,
-          "max_fit_seconds": 0.413999208,
+          "median_fit_seconds": 0.1969051665,
+          "min_fit_seconds": 0.194984791,
+          "max_fit_seconds": 0.197629583,
           "test_metric": "rmse",
           "test_scores": [
             0.06063511451807803,
@@ -507,15 +508,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.063220988620068,
+      "sequoia_speedup": 1.8751811396215874,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            0.417113707982935,
-            0.41193420899799094,
-            0.4096369999460876
+            0.3690803749486804,
+            0.3694868340389803,
+            0.3725656670285389
           ],
           "test_metric": "rmse",
           "test_score": 0.060964787012863536,
@@ -620,39 +621,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:41:33.062310+00:00"
+          "started_at": "2026-09-12T12:16:55.058019+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.400648333,
-            0.413999208,
-            0.387528292
+            0.197629583,
+            0.196320917,
+            0.194984791
           ],
           "test_metric": "rmse",
           "test_score": 0.06063511451807803,
           "threads": 4,
-          "started_at": "2026-09-05T02:41:34.718803+00:00"
+          "started_at": "2026-09-12T12:16:56.552933+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.394893,
-            0.388903917,
-            0.3884275
+            0.197489416,
+            0.19629175,
+            0.197593875
           ],
           "test_metric": "rmse",
           "test_score": 0.06063511451807803,
           "threads": 4,
-          "started_at": "2026-09-05T02:41:36.378587+00:00"
+          "started_at": "2026-09-12T12:16:57.351988+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            0.4162356249871664,
-            0.4212310830480419,
-            0.4267192499828525
+            0.3688087079208344,
+            0.36655520903877914,
+            0.3693853340810165
           ],
           "test_metric": "rmse",
           "test_score": 0.060964787012863536,
@@ -757,7 +758,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:41:38.013226+00:00"
+          "started_at": "2026-09-12T12:16:58.151470+00:00"
         }
       ]
     },
@@ -766,9 +767,9 @@
       "threads": 16,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 0.45081954149645753,
-          "min_fit_seconds": 0.442833042005077,
-          "max_fit_seconds": 0.45525870798155665,
+          "median_fit_seconds": 0.36586060404079035,
+          "min_fit_seconds": 0.36411904089618474,
+          "max_fit_seconds": 0.3696782919578254,
           "test_metric": "rmse",
           "test_scores": [
             0.060964787012863536,
@@ -776,9 +777,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.42095568699999997,
-          "min_fit_seconds": 0.414209958,
-          "max_fit_seconds": 0.43821275,
+          "median_fit_seconds": 0.25961764600000004,
+          "min_fit_seconds": 0.25801675,
+          "max_fit_seconds": 0.262324625,
           "test_metric": "rmse",
           "test_scores": [
             0.06063511451807803,
@@ -786,15 +787,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.0709429885822104,
+      "sequoia_speedup": 1.4092285700825986,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            0.4461665420094505,
-            0.45525870798155665,
-            0.442833042005077
+            0.36760587501339614,
+            0.36513412499334663,
+            0.36516500008292496
           ],
           "test_metric": "rmse",
           "test_score": 0.060964787012863536,
@@ -899,39 +900,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:41:39.696090+00:00"
+          "started_at": "2026-09-12T12:16:59.634530+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.427251708,
-            0.4333785,
-            0.43821275
+            0.262324625,
+            0.259571167,
+            0.25801675
           ],
           "test_metric": "rmse",
           "test_score": 0.06063511451807803,
           "threads": 16,
-          "started_at": "2026-09-05T02:41:41.504753+00:00"
+          "started_at": "2026-09-12T12:17:01.103529+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.414209958,
-            0.414659666,
-            0.414340708
+            0.259664125,
+            0.260059917,
+            0.258355209
           ],
           "test_metric": "rmse",
           "test_score": 0.06063511451807803,
           "threads": 16,
-          "started_at": "2026-09-05T02:41:43.283872+00:00"
+          "started_at": "2026-09-12T12:17:02.157928+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            0.44690124999033287,
-            0.4547378330025822,
-            0.45517683296930045
+            0.36411904089618474,
+            0.3696782919578254,
+            0.36655620799865574
           ],
           "test_metric": "rmse",
           "test_score": 0.060964787012863536,
@@ -1036,7 +1037,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:41:44.999375+00:00"
+          "started_at": "2026-09-12T12:17:03.208904+00:00"
         }
       ]
     },
@@ -1045,9 +1046,9 @@
       "threads": 1,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 3.3982193334959447,
-          "min_fit_seconds": 3.393890958977863,
-          "max_fit_seconds": 3.4132956250105053,
+          "median_fit_seconds": 3.2766096874838695,
+          "min_fit_seconds": 3.2119399999501184,
+          "max_fit_seconds": 3.5103126670001075,
           "test_metric": "rmse",
           "test_scores": [
             0.06421002143937592,
@@ -1055,9 +1056,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 2.268262,
-          "min_fit_seconds": 2.23921625,
-          "max_fit_seconds": 2.2892974170000002,
+          "median_fit_seconds": 1.1371891875,
+          "min_fit_seconds": 1.1298445,
+          "max_fit_seconds": 1.189955541,
           "test_metric": "rmse",
           "test_scores": [
             0.06395939237220531,
@@ -1065,15 +1066,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.498159971597613,
+      "sequoia_speedup": 2.881323286837767,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            3.4112047500093468,
-            3.393890958977863,
-            3.3985007500159554
+            3.2181888750055805,
+            3.2119399999501184,
+            3.5103126670001075
           ],
           "test_metric": "rmse",
           "test_score": 0.06421002143937592,
@@ -1178,39 +1179,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:41:46.852791+00:00"
+          "started_at": "2026-09-12T12:17:04.717944+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            2.2892974170000002,
-            2.274879167,
-            2.268043208
+            1.13758975,
+            1.1298445,
+            1.130824708
           ],
           "test_metric": "rmse",
           "test_score": 0.06395939237220531,
           "threads": 1,
-          "started_at": "2026-09-05T02:42:00.487308+00:00"
+          "started_at": "2026-09-12T12:17:17.890605+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            2.268480792,
-            2.24423425,
-            2.23921625
+            1.189955541,
+            1.141083042,
+            1.1367886249999999
           ],
           "test_metric": "rmse",
           "test_score": 0.06395939237220531,
           "threads": 1,
-          "started_at": "2026-09-05T02:42:09.661314+00:00"
+          "started_at": "2026-09-12T12:17:22.488335+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            3.3941755830310285,
-            3.397937916975934,
-            3.4132956250105053
+            3.2177080418914557,
+            3.3741327499737963,
+            3.3350304999621585
           ],
           "test_metric": "rmse",
           "test_score": 0.06421002143937592,
@@ -1315,7 +1316,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:42:18.723133+00:00"
+          "started_at": "2026-09-12T12:17:27.176900+00:00"
         }
       ]
     },
@@ -1324,9 +1325,9 @@
       "threads": 4,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 1.0852026665234007,
-          "min_fit_seconds": 1.0668595830211416,
-          "max_fit_seconds": 1.1671714169788174,
+          "median_fit_seconds": 1.0107138335006312,
+          "min_fit_seconds": 0.9837121659656987,
+          "max_fit_seconds": 1.044760209042579,
           "test_metric": "rmse",
           "test_scores": [
             0.06421002143937592,
@@ -1334,9 +1335,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.8414336455,
-          "min_fit_seconds": 0.83291725,
-          "max_fit_seconds": 0.848773667,
+          "median_fit_seconds": 0.452684479,
+          "min_fit_seconds": 0.44173325,
+          "max_fit_seconds": 0.462444709,
           "test_metric": "rmse",
           "test_scores": [
             0.06395939237220531,
@@ -1344,15 +1345,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.2897067669293725,
+      "sequoia_speedup": 2.2327114809267212,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            1.0668595830211416,
-            1.074958625016734,
-            1.0785688750329427
+            1.0068210000172257,
+            0.9982042498886585,
+            0.9837121659656987
           ],
           "test_metric": "rmse",
           "test_score": 0.06421002143937592,
@@ -1457,39 +1458,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:42:32.337337+00:00"
+          "started_at": "2026-09-12T12:17:40.344479+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.836391125,
-            0.83291725,
-            0.840469416
+            0.44173325,
+            0.455196166,
+            0.442095042
           ],
           "test_metric": "rmse",
           "test_score": 0.06395939237220531,
           "threads": 4,
-          "started_at": "2026-09-05T02:42:36.615378+00:00"
+          "started_at": "2026-09-12T12:17:44.344885+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.846879125,
-            0.842397875,
-            0.848773667
+            0.462444709,
+            0.458922167,
+            0.450172792
           ],
           "test_metric": "rmse",
           "test_score": 0.06395939237220531,
           "threads": 4,
-          "started_at": "2026-09-05T02:42:40.021399+00:00"
+          "started_at": "2026-09-12T12:17:46.141966+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            1.1062650840030983,
-            1.1671714169788174,
-            1.0918364580138586
+            1.0146066669840366,
+            1.044760209042579,
+            1.0289659589761868
           ],
           "test_metric": "rmse",
           "test_score": 0.06421002143937592,
@@ -1594,7 +1595,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:42:43.454136+00:00"
+          "started_at": "2026-09-12T12:17:47.985820+00:00"
         }
       ]
     },
@@ -1603,9 +1604,9 @@
       "threads": 16,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 0.8592610210180283,
-          "min_fit_seconds": 0.8505359999835491,
-          "max_fit_seconds": 0.8933408750453964,
+          "median_fit_seconds": 0.6899072294472717,
+          "min_fit_seconds": 0.6795599999604747,
+          "max_fit_seconds": 0.7069910001009703,
           "test_metric": "rmse",
           "test_scores": [
             0.06421002143937592,
@@ -1613,9 +1614,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.7956890624999999,
-          "min_fit_seconds": 0.786934625,
-          "max_fit_seconds": 0.859987333,
+          "median_fit_seconds": 0.4264459585,
+          "min_fit_seconds": 0.421452167,
+          "max_fit_seconds": 0.431260084,
           "test_metric": "rmse",
           "test_scores": [
             0.06395939237220531,
@@ -1623,15 +1624,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.0798954786663646,
+      "sequoia_speedup": 1.617806935898706,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            0.8933408750453964,
-            0.8543493329780176,
-            0.8592048750142567
+            0.6826659999787807,
+            0.6795599999604747,
+            0.7069910001009703
           ],
           "test_metric": "rmse",
           "test_score": 0.06421002143937592,
@@ -1736,39 +1737,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:42:47.917428+00:00"
+          "started_at": "2026-09-12T12:17:52.092332+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.796010208,
-            0.795367917,
-            0.859987333
+            0.430090291,
+            0.421828458,
+            0.425296292
           ],
           "test_metric": "rmse",
           "test_score": 0.06395939237220531,
           "threads": 16,
-          "started_at": "2026-09-05T02:42:51.388519+00:00"
+          "started_at": "2026-09-12T12:17:54.910756+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.802701208,
-            0.786934625,
-            0.790765708
+            0.431260084,
+            0.421452167,
+            0.427595625
           ],
           "test_metric": "rmse",
           "test_score": 0.06395939237220531,
           "threads": 16,
-          "started_at": "2026-09-05T02:42:54.687055+00:00"
+          "started_at": "2026-09-12T12:17:56.630252+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            0.8641450410359539,
-            0.8593171670217998,
-            0.8505359999835491
+            0.6937490419950336,
+            0.6860654168995097,
+            0.6950360829941928
           ],
           "test_metric": "rmse",
           "test_score": 0.06421002143937592,
@@ -1873,7 +1874,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:42:57.953406+00:00"
+          "started_at": "2026-09-12T12:17:58.348860+00:00"
         }
       ]
     },
@@ -1882,9 +1883,9 @@
       "threads": 1,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 1.1093843540002126,
-          "min_fit_seconds": 1.1027722919825464,
-          "max_fit_seconds": 1.1114481249824166,
+          "median_fit_seconds": 1.0482643124996684,
+          "min_fit_seconds": 1.0328999999910593,
+          "max_fit_seconds": 1.0638655830407515,
           "test_metric": "logloss",
           "test_scores": [
             0.5162732692532577,
@@ -1892,9 +1893,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.9166217295000001,
-          "min_fit_seconds": 0.908059833,
-          "max_fit_seconds": 0.92755425,
+          "median_fit_seconds": 0.4720494165,
+          "min_fit_seconds": 0.463985791,
+          "max_fit_seconds": 0.485999958,
           "test_metric": "logloss",
           "test_scores": [
             0.5156381389218877,
@@ -1902,15 +1903,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.210296808701405,
+      "sequoia_speedup": 2.2206664723197864,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            1.1090477500110865,
-            1.1098183749709278,
-            1.1114481249824166
+            1.0638655830407515,
+            1.0549365839688107,
+            1.0546010830439627
           ],
           "test_metric": "logloss",
           "test_score": 0.5162732692532577,
@@ -2015,39 +2016,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:01.413099+00:00"
+          "started_at": "2026-09-12T12:18:01.141850+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.922614917,
-            0.92755425,
-            0.921473042
+            0.485999958,
+            0.465093125,
+            0.484932708
           ],
           "test_metric": "logloss",
           "test_score": 0.5156381389218877,
           "threads": 1,
-          "started_at": "2026-09-05T02:43:05.870598+00:00"
+          "started_at": "2026-09-12T12:18:05.385413+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.911770417,
-            0.908059833,
-            0.908555583
+            0.468708291,
+            0.463985791,
+            0.475390542
           ],
           "test_metric": "logloss",
           "test_score": 0.5156381389218877,
           "threads": 1,
-          "started_at": "2026-09-05T02:43:09.639028+00:00"
+          "started_at": "2026-09-12T12:18:07.330691+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            1.1097209579893388,
-            1.1059474170324393,
-            1.1027722919825464
+            1.0328999999910593,
+            1.0388739169575274,
+            1.0419275419553742
           ],
           "test_metric": "logloss",
           "test_score": 0.5162732692532577,
@@ -2152,7 +2153,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:13.343499+00:00"
+          "started_at": "2026-09-12T12:18:09.216953+00:00"
         }
       ]
     },
@@ -2161,9 +2162,9 @@
       "threads": 4,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 0.4060072084830608,
-          "min_fit_seconds": 0.39863520802464336,
-          "max_fit_seconds": 0.4098494159989059,
+          "median_fit_seconds": 0.3617807294940576,
+          "min_fit_seconds": 0.36066170898266137,
+          "max_fit_seconds": 0.3629027920542285,
           "test_metric": "logloss",
           "test_scores": [
             0.5162732692532577,
@@ -2171,9 +2172,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.37895687499999997,
-          "min_fit_seconds": 0.375829708,
-          "max_fit_seconds": 0.382920708,
+          "median_fit_seconds": 0.19544866700000002,
+          "min_fit_seconds": 0.194883209,
+          "max_fit_seconds": 0.197110458,
           "test_metric": "logloss",
           "test_scores": [
             0.5156381389218877,
@@ -2181,15 +2182,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.0713810337470744,
+      "sequoia_speedup": 1.8510268452946652,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            0.40411208296427503,
-            0.40782525000395253,
-            0.39863520802464336
+            0.36066170898266137,
+            0.36193854198791087,
+            0.3629027920542285
           ],
           "test_metric": "logloss",
           "test_score": 0.5162732692532577,
@@ -2294,39 +2295,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:17.796333+00:00"
+          "started_at": "2026-09-12T12:18:13.398174+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.379475958,
-            0.380572375,
-            0.382920708
+            0.195818375,
+            0.194883209,
+            0.195235125
           ],
           "test_metric": "logloss",
           "test_score": 0.5156381389218877,
           "threads": 4,
-          "started_at": "2026-09-05T02:43:19.424132+00:00"
+          "started_at": "2026-09-12T12:18:14.852693+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.376299417,
-            0.375829708,
-            0.378437792
+            0.197110458,
+            0.195662209,
+            0.19496475
           ],
           "test_metric": "logloss",
           "test_score": 0.5156381389218877,
           "threads": 4,
-          "started_at": "2026-09-05T02:43:21.014967+00:00"
+          "started_at": "2026-09-12T12:18:15.645962+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            0.4094537920318544,
-            0.4041891669621691,
-            0.4098494159989059
+            0.3616229170002043,
+            0.36218820908106863,
+            0.3612519580638036
           ],
           "test_metric": "logloss",
           "test_score": 0.5162732692532577,
@@ -2431,7 +2432,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:22.586852+00:00"
+          "started_at": "2026-09-12T12:18:16.441379+00:00"
         }
       ]
     },
@@ -2440,9 +2441,9 @@
       "threads": 16,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 0.4462728339713067,
-          "min_fit_seconds": 0.4366007500211708,
-          "max_fit_seconds": 0.4614337910315953,
+          "median_fit_seconds": 0.3583186254836619,
+          "min_fit_seconds": 0.3551754169166088,
+          "max_fit_seconds": 0.3589966249419376,
           "test_metric": "logloss",
           "test_scores": [
             0.5162732692532577,
@@ -2450,9 +2451,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.41023154149999996,
-          "min_fit_seconds": 0.39978525,
-          "max_fit_seconds": 0.41910325,
+          "median_fit_seconds": 0.2580615205,
+          "min_fit_seconds": 0.257440792,
+          "max_fit_seconds": 0.259942584,
           "test_metric": "logloss",
           "test_scores": [
             0.5156381389218877,
@@ -2460,15 +2461,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.0878559760166728,
+      "sequoia_speedup": 1.3885007915531595,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            0.439648583997041,
-            0.43886620801640674,
-            0.4366007500211708
+            0.3582215839996934,
+            0.35597825003787875,
+            0.3551754169166088
           ],
           "test_metric": "logloss",
           "test_score": 0.5162732692532577,
@@ -2573,39 +2574,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:24.227183+00:00"
+          "started_at": "2026-09-12T12:18:17.899304+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.39978525,
-            0.41910325,
-            0.413227208
+            0.257440792,
+            0.259942584,
+            0.257915541
           ],
           "test_metric": "logloss",
           "test_score": 0.5156381389218877,
           "threads": 16,
-          "started_at": "2026-09-05T02:43:25.979864+00:00"
+          "started_at": "2026-09-12T12:18:19.330197+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.405283666,
-            0.409876333,
-            0.41058675
+            0.2582075,
+            0.259058958,
+            0.2575955
           ],
           "test_metric": "logloss",
           "test_score": 0.5156381389218877,
           "threads": 16,
-          "started_at": "2026-09-05T02:43:27.668947+00:00"
+          "started_at": "2026-09-12T12:18:20.377235+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            0.4528970839455724,
-            0.4614337910315953,
-            0.4532577089848928
+            0.3584156669676304,
+            0.3589966249419376,
+            0.35851695807650685
           ],
           "test_metric": "logloss",
           "test_score": 0.5162732692532577,
@@ -2710,7 +2711,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:29.361453+00:00"
+          "started_at": "2026-09-12T12:18:21.422030+00:00"
         }
       ]
     },
@@ -2719,9 +2720,9 @@
       "threads": 1,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 2.661323458509287,
-          "min_fit_seconds": 2.6339464579941705,
-          "max_fit_seconds": 2.6698250839835964,
+          "median_fit_seconds": 2.5231640830170363,
+          "min_fit_seconds": 2.4857910410501063,
+          "max_fit_seconds": 2.5369225000031292,
           "test_metric": "mlogloss",
           "test_scores": [
             0.15002717709824065,
@@ -2729,9 +2730,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 1.9618257495,
-          "min_fit_seconds": 1.915445208,
-          "max_fit_seconds": 1.995679541,
+          "median_fit_seconds": 1.102025416,
+          "min_fit_seconds": 1.093131209,
+          "max_fit_seconds": 1.108472542,
           "test_metric": "mlogloss",
           "test_scores": [
             0.1504986820780409,
@@ -2739,15 +2740,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.3565544540271042,
+      "sequoia_speedup": 2.2895697743299928,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            2.6698250839835964,
-            2.665316291968338,
-            2.6625129170133732
+            2.5164675830164924,
+            2.5341542919632047,
+            2.5369225000031292
           ],
           "test_metric": "mlogloss",
           "test_score": 0.15002717709824065,
@@ -2852,39 +2853,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:31.191626+00:00"
+          "started_at": "2026-09-12T12:18:22.875161+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            1.987232375,
-            1.960252541,
-            1.963398958
+            1.104676166,
+            1.108472542,
+            1.105549
           ],
           "test_metric": "mlogloss",
           "test_score": 0.1504986820780409,
           "threads": 1,
-          "started_at": "2026-09-05T02:43:41.877223+00:00"
+          "started_at": "2026-09-12T12:18:33.021269+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            1.995679541,
-            1.954684083,
-            1.915445208
+            1.0993746660000001,
+            1.093131209,
+            1.0957245
           ],
           "test_metric": "mlogloss",
           "test_score": 0.1504986820780409,
           "threads": 1,
-          "started_at": "2026-09-05T02:43:49.909259+00:00"
+          "started_at": "2026-09-12T12:18:37.469922+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 1,
           "fit_seconds": [
-            2.6339464579941705,
-            2.6601340000052005,
-            2.6433618750306778
+            2.5019075410673395,
+            2.52986058301758,
+            2.4857910410501063
           ],
           "test_metric": "mlogloss",
           "test_score": 0.15002717709824065,
@@ -2989,7 +2990,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:43:57.872747+00:00"
+          "started_at": "2026-09-12T12:18:41.892142+00:00"
         }
       ]
     },
@@ -2998,9 +2999,9 @@
       "threads": 4,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 1.018514771014452,
-          "min_fit_seconds": 1.009941708005499,
-          "max_fit_seconds": 1.021544916962739,
+          "median_fit_seconds": 0.9740438534645364,
+          "min_fit_seconds": 0.9682487909449264,
+          "max_fit_seconds": 1.0078021669760346,
           "test_metric": "mlogloss",
           "test_scores": [
             0.15002717709824065,
@@ -3008,9 +3009,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.8511774585,
-          "min_fit_seconds": 0.847468042,
-          "max_fit_seconds": 0.862632083,
+          "median_fit_seconds": 0.5126698755000001,
+          "min_fit_seconds": 0.510009084,
+          "max_fit_seconds": 0.520365375,
           "test_metric": "mlogloss",
           "test_scores": [
             0.1504986820780409,
@@ -3018,15 +3019,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.1965950940586991,
+      "sequoia_speedup": 1.8999436089638861,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            1.016248625004664,
-            1.021047207992524,
-            1.0103409579605795
+            0.9729002080857754,
+            0.9733824159484357,
+            0.9747052909806371
           ],
           "test_metric": "mlogloss",
           "test_score": 0.15002717709824065,
@@ -3131,39 +3132,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:44:08.467726+00:00"
+          "started_at": "2026-09-12T12:18:51.935418+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.8524955,
-            0.84813525,
-            0.849859417
+            0.517609291,
+            0.510009084,
+            0.511694834
           ],
           "test_metric": "mlogloss",
           "test_score": 0.1504986820780409,
           "threads": 4,
-          "started_at": "2026-09-05T02:44:12.584621+00:00"
+          "started_at": "2026-09-12T12:18:55.839560+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.856420458,
-            0.847468042,
-            0.862632083
+            0.511077125,
+            0.513644917,
+            0.520365375
           ],
           "test_metric": "mlogloss",
           "test_score": 0.1504986820780409,
           "threads": 4,
-          "started_at": "2026-09-05T02:44:16.106409+00:00"
+          "started_at": "2026-09-12T12:18:57.902209+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 4,
           "fit_seconds": [
-            1.021544916962739,
-            1.009941708005499,
-            1.02078091702424
+            0.9682487909449264,
+            1.0064345420105383,
+            1.0078021669760346
           ],
           "test_metric": "mlogloss",
           "test_score": 0.15002717709824065,
@@ -3268,7 +3269,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:44:19.636098+00:00"
+          "started_at": "2026-09-12T12:18:59.972233+00:00"
         }
       ]
     },
@@ -3277,9 +3278,9 @@
       "threads": 16,
       "engines": {
         "xgboost": {
-          "median_fit_seconds": 1.2461887295066845,
-          "min_fit_seconds": 1.2321882499963976,
-          "max_fit_seconds": 1.2633915830519982,
+          "median_fit_seconds": 1.205363020999357,
+          "min_fit_seconds": 1.1926386670675129,
+          "max_fit_seconds": 1.2475294169271365,
           "test_metric": "mlogloss",
           "test_scores": [
             0.15002717709824065,
@@ -3287,9 +3288,9 @@
           ]
         },
         "sequoia-boost": {
-          "median_fit_seconds": 0.9598678125,
-          "min_fit_seconds": 0.951650291,
-          "max_fit_seconds": 0.981304166,
+          "median_fit_seconds": 0.692250271,
+          "min_fit_seconds": 0.690983834,
+          "max_fit_seconds": 0.697883041,
           "test_metric": "mlogloss",
           "test_scores": [
             0.1504986820780409,
@@ -3297,15 +3298,15 @@
           ]
         }
       },
-      "sequoia_speedup": 1.2982920286293946,
+      "sequoia_speedup": 1.741224339657004,
       "batches": [
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            1.2581452500307932,
-            1.2321882499963976,
-            1.2633915830519982
+            1.2475294169271365,
+            1.2233347499277443,
+            1.2123855829704553
           ],
           "test_metric": "mlogloss",
           "test_score": 0.15002717709824065,
@@ -3410,39 +3411,39 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:44:23.715392+00:00"
+          "started_at": "2026-09-12T12:19:03.955976+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.981304166,
-            0.964034334,
-            0.961136958
+            0.69299475,
+            0.690983834,
+            0.691178834
           ],
           "test_metric": "mlogloss",
           "test_score": 0.1504986820780409,
           "threads": 16,
-          "started_at": "2026-09-05T02:44:28.750674+00:00"
+          "started_at": "2026-09-12T12:19:08.913041+00:00"
         },
         {
           "engine": "sequoia-boost",
           "fit_seconds": [
-            0.955149375,
-            0.951650291,
-            0.958598667
+            0.694803083,
+            0.697883041,
+            0.691505792
           ],
           "test_metric": "mlogloss",
           "test_score": 0.1504986820780409,
           "threads": 16,
-          "started_at": "2026-09-05T02:44:32.739258+00:00"
+          "started_at": "2026-09-12T12:19:11.697282+00:00"
         },
         {
           "engine": "xgboost",
           "threads": 16,
           "fit_seconds": [
-            1.2394327920046635,
-            1.2519069170230068,
-            1.240470541990362
+            1.1946674169739708,
+            1.1926386670675129,
+            1.198340459028259
           ],
           "test_metric": "mlogloss",
           "test_score": 0.15002717709824065,
@@ -3547,7 +3548,7 @@
               1
             ]
           },
-          "started_at": "2026-09-05T02:44:36.689684+00:00"
+          "started_at": "2026-09-12T12:19:14.483672+00:00"
         }
       ]
     }

@@ -153,6 +153,12 @@ impl RegTree {
         &self.nodes
     }
 
+    /// Flat pool of categories routed left by categorical nodes.
+    #[inline]
+    pub(crate) fn categories(&self) -> &[u32] {
+        &self.categories
+    }
+
     /// Access a node by id.
     #[inline]
     pub fn node(&self, id: usize) -> &Node {
@@ -268,6 +274,36 @@ impl RegTree {
                     Some(v) => v < node.split_cond,
                     None => node.default_left,
                 }
+            };
+            nid = if go_left {
+                node.left as usize
+            } else {
+                node.right as usize
+            };
+        }
+    }
+
+    /// Route a dense feature row (indexed by feature id, `missing` sentinel for
+    /// absent values) to its leaf id. Equivalent to
+    /// `leaf_id_with(|f| if is_missing(row[f]) { None } else { Some(row[f]) })`
+    /// without the closure/`Option` overhead.
+    #[inline]
+    pub fn leaf_id_dense(&self, row: &[f32], missing: f32) -> usize {
+        let nodes = &self.nodes[..];
+        let mut nid = 0usize;
+        loop {
+            let node = &nodes[nid];
+            if node.left == NO_CHILD {
+                return nid;
+            }
+            let v = row[node.split_feature as usize];
+            let go_left = if crate::data::is_missing(v, missing) {
+                node.default_left
+            } else if node.is_categorical {
+                let c = v as u32;
+                self.categories[node.cat_begin as usize..node.cat_end as usize].contains(&c)
+            } else {
+                v < node.split_cond
             };
             nid = if go_left {
                 node.left as usize

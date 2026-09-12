@@ -22,6 +22,15 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 - Parallelize quantile cuts, bin assignment, and depthwise node construction;
   size histogram tasks to the available rows and reuse final training-row
   partitions in smaller thread pools.
+- Rewrite prediction around a lazily built branch-free tree layout: breadth-first
+  node arena, single-compare split encoding with mirrored default-right
+  children, sixteen-row (or sixteen-tree) lockstep traversal, block-parallel
+  batches, and per-block densification of sparse rows. `predict`,
+  `predict_margin`, `predict_leaf`, and single-row prediction are 10–20× faster
+  with identical results.
+- Speed up TreeSHAP contributions and interactions 8× with an arena-backed
+  decision path, precomputed cover fractions, hoisted divisions, a shared
+  unwound sum for off-path elements, and row-parallel evaluation.
 
 ## [0.2.0] - 2026-08-16
 

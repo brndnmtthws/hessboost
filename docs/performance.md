@@ -290,6 +290,41 @@ parallel chunks. Ordered collection preserves the cut layout, row order,
 missing-value handling, categorical bins, and the choice of 16- or 32-bit bin
 storage. These scheduling changes also work on other CPU architectures.
 
+### Prediction
+
+`BoostedModel` lazily derives a prediction layout of the ensemble on first use
+and drops it whenever a tree is appended; it is never serialized. Every tree is
+renumbered breadth-first into one 16-byte-node arena so that the two children
+of a node are adjacent, and each numeric split is stored as a single ordered
+compare that is false for missing values: splits whose missing values go left
+store the next-lower threshold, splits whose missing values go right store
+mirrored children, a negated threshold, and a sign mask applied to the feature
+value. Leaves point at themselves. A traversal step is therefore a node load, a
+feature load, an XOR, a compare, and an add, with no data-dependent branch.
+Sixteen rows are walked in lockstep for a fixed number of levels (the tree
+depth), and batches of fewer than sixteen rows walk sixteen trees in lockstep
+instead. Rows are processed in 256-row blocks in parallel; each block stores
+its full sixteen-row groups feature-major (`[group][feature][lane]`) so a
+lane's value is an immediate offset from the group's feature base and the
+kernel needs no per-lane address registers. Within a block the trees are
+summed in order, so results match the sequential sum bit for bit. CSR rows and
+dense matrices with a non-`NaN` missing sentinel are scattered straight into
+that layout per block; matrices wider than 4,096 sparse columns use per-lookup
+access. Categorical splits and trees deeper than 16 levels use an early-exit
+walk. The kernel runs at roughly six instructions per cycle on a Neoverse V3
+and is bound by instruction issue, not memory.
+
+TreeSHAP walks each tree with a preallocated path arena instead of cloning the
+decision path at every fork, precomputes each node's cover fraction, reads the
+instance as a dense row, hoists the per-element divisions out of the
+unwinding loops, folds the recurrence coefficients off the loop-carried
+dependency so each unwinding step is one multiply-subtract, and adds one
+shared constant for all path elements that lie off the instance's own path
+(their cover fraction cancels). Rows are processed in parallel. On a Neoverse
+V3 core these changes cut prediction time by 10–20× for dense, sparse, and
+multiclass batches and by 8–9× for SHAP contributions relative to the per-node
+traversal.
+
 ## Numerical behavior and validation
 
 Objective outputs remain `f32`; metrics and histogram statistics accumulate

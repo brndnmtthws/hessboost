@@ -6,6 +6,7 @@ mod loaders;
 mod meta;
 pub mod quantile;
 
+pub(crate) use dmatrix::is_missing;
 pub use dmatrix::{CscView, DMatrix, Entry};
 pub use ghist::GHistIndex;
 pub use loaders::{load_csv, load_libsvm, read_csv, read_libsvm, CsvOptions};

@@ -5,9 +5,12 @@ use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::Result;
 use crate::objective::create_objective;
+use crate::tree::compact::{CompactForest, LANES};
 use crate::tree::RegTree;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 const NATIVE_MAGIC: &[u8; 4] = b"SQB\0";
 const NATIVE_VERSION: u8 = 1;
@@ -54,6 +57,10 @@ pub struct BoostedModel {
     /// and for models serialized before this field existed.
     #[serde(default)]
     linear: Option<LinearModel>,
+    /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
+    /// never serialized. Reset whenever `trees` changes.
+    #[serde(skip)]
+    compact: OnceLock<CompactForest>,
 }
 
 /// The parameters of a linear (`gblinear`) booster: a per-output weight vector
@@ -100,6 +107,7 @@ impl BoostedModel {
             best_iteration: None,
             tree_weights: Vec::new(),
             linear: None,
+            compact: OnceLock::new(),
         }
     }
 
@@ -112,12 +120,21 @@ impl BoostedModel {
     pub(crate) fn push_tree(&mut self, tree: RegTree) {
         self.trees.push(tree);
         self.tree_weights.push(1.0);
+        self.compact = OnceLock::new();
     }
 
     /// Append a tree with an explicit contribution weight (used by DART).
     pub(crate) fn push_tree_weighted(&mut self, tree: RegTree, weight: f32) {
         self.trees.push(tree);
         self.tree_weights.push(weight);
+        self.compact = OnceLock::new();
+    }
+
+    /// The prediction layout of the ensemble, built on first use and dropped
+    /// whenever a tree is appended.
+    fn compact_forest(&self) -> &CompactForest {
+        self.compact
+            .get_or_init(|| CompactForest::from_trees(&self.trees))
     }
 
     /// Contribution weight of tree `i` (`1.0` when weights are absent, e.g. for
@@ -178,6 +195,7 @@ impl BoostedModel {
             best_iteration: None,
             tree_weights,
             linear: None,
+            compact: OnceLock::new(),
         }
     }
 
@@ -283,13 +301,36 @@ impl BoostedModel {
         // (it overrides the scalar base score, matching XGBoost); otherwise use
         // the trained global bias.
         let mut out = self.initial_margins(data);
-        for (ti, tree) in self.trees[..limit].iter().enumerate() {
-            let w = self.tree_weight(ti);
-            let cls = ti % k;
-            for row in 0..n {
-                out[row * k + cls] += w * tree.predict_row(data, row);
+        let forest = self.compact_forest();
+        let weights = &self.tree_weights;
+        let weight = |ti: usize| weights.get(ti).copied().unwrap_or(1.0);
+        // Tiny batches (online serving) skip the thread pool and overlap the
+        // trees of each row instead of the rows of each tree.
+        if n < LANES {
+            let mut block = RowBlock::new(data);
+            block.load(0, n);
+            for (r, out_row) in out.chunks_exact_mut(k).enumerate() {
+                block.accumulate_row(forest, r, limit, weight, out_row);
             }
+            return out;
         }
+        // Rows are processed in blocks: a block's feature rows stay in cache
+        // while every tree walks them, and blocks run in parallel. Per (row,
+        // output) slot the trees are still summed in order, so the result is
+        // bit-identical to the sequential tree-outer loop.
+        out.par_chunks_mut(PREDICT_BLOCK_ROWS * k)
+            .enumerate()
+            .for_each_init(
+                || RowBlock::new(data),
+                |block, (bi, out_block)| {
+                    let start = bi * PREDICT_BLOCK_ROWS;
+                    let rows = out_block.len() / k;
+                    block.load(start, rows);
+                    for ti in 0..limit {
+                        block.accumulate(forest, ti, rows, weight(ti), &mut out_block[ti % k..], k);
+                    }
+                },
+            );
         out
     }
 
@@ -357,12 +398,31 @@ impl BoostedModel {
         let n = data.n_rows();
         let t = self.trees.len();
         let mut out = vec![0u32; n * t];
-        for row in 0..n {
-            for (ti, tree) in self.trees.iter().enumerate() {
-                let leaf = tree.leaf_id_with(|f| data.get(row, f as usize));
-                out[row * t + ti] = leaf as u32;
-            }
+        if t == 0 {
+            return Ok(out);
         }
+        let forest = self.compact_forest();
+        if n < LANES {
+            let mut block = RowBlock::new(data);
+            block.load(0, n);
+            for (r, out_row) in out.chunks_exact_mut(t).enumerate() {
+                block.original_leaf_ids_for_row(forest, r, out_row);
+            }
+            return Ok(out);
+        }
+        out.par_chunks_mut(PREDICT_BLOCK_ROWS * t)
+            .enumerate()
+            .for_each_init(
+                || RowBlock::new(data),
+                |block, (bi, out_block)| {
+                    let start = bi * PREDICT_BLOCK_ROWS;
+                    let rows = out_block.len() / t;
+                    block.load(start, rows);
+                    for ti in 0..t {
+                        block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], t);
+                    }
+                },
+            );
         Ok(out)
     }
 
@@ -591,6 +651,331 @@ impl BoostedModel {
             .num_class(self.num_class)
             .build_unchecked();
         create_objective(&params)
+    }
+}
+
+/// Rows per prediction block: the block's feature rows stay in cache while
+/// every tree walks them. Must be a multiple of [`LANES`].
+const PREDICT_BLOCK_ROWS: usize = 256;
+const _: () = assert!(PREDICT_BLOCK_ROWS % LANES == 0);
+
+/// Widest CSR matrix that is densified block-by-block for prediction. Wider
+/// matrices fall back to per-lookup row scans.
+const MAX_DENSIFY_COLS: usize = 4096;
+
+/// A block of consecutive rows exposed as dense feature vectors (`NaN` =
+/// missing) for [`CompactForest`] traversal. Dense `NaN`-sentinel matrices are
+/// viewed in place; dense matrices with another sentinel and CSR rows are
+/// materialized into a per-block scratch buffer so each node lookup is a single
+/// indexed load. Both keep a lane-major copy of the full [`LANES`]-row groups
+/// for the batch kernel.
+pub(super) enum RowBlock<'a> {
+    View {
+        data: &'a [f32],
+        n_cols: usize,
+        start: usize,
+        lanes: Vec<f32>,
+    },
+    Scratch {
+        source: &'a DMatrix,
+        n_cols: usize,
+        /// Row-major tail rows (those past the last full [`LANES`] group).
+        scratch: Vec<f32>,
+        lanes: Vec<f32>,
+        /// Block row index of the first tail row.
+        tail_start: usize,
+    },
+    /// Very wide sparse rows: route through `DMatrix::get` per lookup.
+    Wide { data: &'a DMatrix, start: usize },
+}
+
+impl<'a> RowBlock<'a> {
+    /// Blocks for batch traversal: wide CSR matrices stay sparse.
+    pub(super) fn new(data: &'a DMatrix) -> Self {
+        Self::build(data, MAX_DENSIFY_COLS)
+    }
+
+    /// Blocks that are loaded one row at a time and always expose a dense row
+    /// (for per-row algorithms such as TreeSHAP whose cost per row already
+    /// scales with the feature count).
+    pub(super) fn single_rows(data: &'a DMatrix) -> Self {
+        Self::build(data, usize::MAX)
+    }
+
+    fn build(data: &'a DMatrix, max_densify_cols: usize) -> Self {
+        let n_cols = data.n_cols();
+        match data.dense_values() {
+            Some(dense) if data.missing().is_nan() => RowBlock::View {
+                data: dense,
+                n_cols,
+                start: 0,
+                lanes: Vec::new(),
+            },
+            Some(_) => RowBlock::Scratch {
+                source: data,
+                n_cols,
+                scratch: Vec::new(),
+                lanes: Vec::new(),
+                tail_start: 0,
+            },
+            None if n_cols <= max_densify_cols => RowBlock::Scratch {
+                source: data,
+                n_cols,
+                scratch: Vec::new(),
+                lanes: Vec::new(),
+                tail_start: 0,
+            },
+            None => RowBlock::Wide { data, start: 0 },
+        }
+    }
+
+    /// Point the block at rows `start..start + rows`.
+    pub(super) fn load(&mut self, start: usize, rows: usize) {
+        match self {
+            RowBlock::Wide { start: s, .. } => *s = start,
+            RowBlock::View {
+                data,
+                n_cols,
+                start: s,
+                lanes,
+            } => {
+                *s = start;
+                let n_cols = *n_cols;
+                Self::fill_lanes(
+                    lanes,
+                    &data[start * n_cols..(start + rows) * n_cols],
+                    n_cols,
+                );
+            }
+            RowBlock::Scratch {
+                source,
+                n_cols,
+                scratch,
+                lanes,
+                tail_start,
+            } => {
+                let n_cols = *n_cols;
+                let missing = source.missing();
+                let groups = rows / LANES;
+                *tail_start = groups * LANES;
+                lanes.clear();
+                lanes.resize(groups * LANES * n_cols, f32::NAN);
+                scratch.clear();
+                scratch.resize((rows - groups * LANES) * n_cols, f32::NAN);
+                // Destination of feature `f` of block row `r`.
+                let slot = |r: usize, f: usize| -> (bool, usize) {
+                    if r < groups * LANES {
+                        (true, (r / LANES) * LANES * n_cols + f * LANES + r % LANES)
+                    } else {
+                        (false, (r - groups * LANES) * n_cols + f)
+                    }
+                };
+                if let Some(dense) = source.dense_values() {
+                    for r in 0..rows {
+                        let src = &dense[(start + r) * n_cols..(start + r + 1) * n_cols];
+                        for (f, &v) in src.iter().enumerate() {
+                            let v = if v == missing { f32::NAN } else { v };
+                            match slot(r, f) {
+                                (true, i) => lanes[i] = v,
+                                (false, i) => scratch[i] = v,
+                            }
+                        }
+                    }
+                } else {
+                    let (indptr, indices, values) =
+                        source.csr_parts().expect("scratch blocks are dense or CSR");
+                    for r in 0..rows {
+                        let row = start + r;
+                        // Reverse order so the first occurrence of a duplicated
+                        // column wins, matching `DMatrix::get`.
+                        for k in (indptr[row]..indptr[row + 1]).rev() {
+                            let v = values[k];
+                            let v = if crate::data::is_missing(v, missing) {
+                                f32::NAN
+                            } else {
+                                v
+                            };
+                            match slot(r, indices[k] as usize) {
+                                (true, i) => lanes[i] = v,
+                                (false, i) => scratch[i] = v,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transpose the full [`LANES`]-row groups of the row-major `rows` into
+    /// `lanes` as `[group][feature][lane]`, so a lane's feature value sits at a
+    /// fixed immediate offset from the group's feature base.
+    fn fill_lanes(lanes: &mut Vec<f32>, rows: &[f32], n_cols: usize) {
+        let groups = rows.len() / n_cols / LANES;
+        lanes.clear();
+        lanes.resize(groups * LANES * n_cols, 0.0);
+        for (g, dst) in lanes.chunks_exact_mut(LANES * n_cols).enumerate() {
+            let src = &rows[g * LANES * n_cols..(g + 1) * LANES * n_cols];
+            for (j, row) in src.chunks_exact(n_cols).enumerate() {
+                for (f, &v) in row.iter().enumerate() {
+                    dst[f * LANES + j] = v;
+                }
+            }
+        }
+    }
+
+    /// Loaded row `r` as a dense `NaN`-for-missing slice; `None` for wide
+    /// sparse blocks, which are never materialized. Scratch blocks only keep
+    /// the tail rows (those past the last full [`LANES`] group) row-major.
+    #[inline]
+    pub(super) fn row(&self, r: usize) -> Option<&[f32]> {
+        match self {
+            RowBlock::View {
+                data,
+                n_cols,
+                start,
+                ..
+            } => Some(&data[(start + r) * n_cols..(start + r + 1) * n_cols]),
+            RowBlock::Scratch {
+                n_cols,
+                scratch,
+                tail_start,
+                ..
+            } => {
+                let i = r
+                    .checked_sub(*tail_start)
+                    .expect("row-major access to a lane-major scratch row");
+                Some(&scratch[i * n_cols..(i + 1) * n_cols])
+            }
+            RowBlock::Wide { .. } => None,
+        }
+    }
+
+    /// Value of feature `f` in loaded row `r`, `None` when missing.
+    #[inline]
+    pub(super) fn get(&self, r: usize, f: u32) -> Option<f32> {
+        let v = match self.row(r) {
+            Some(row) => row[f as usize],
+            None => {
+                let RowBlock::Wide { data, start } = self else {
+                    unreachable!("only wide blocks lack dense rows")
+                };
+                return data.get(start + r, f as usize);
+            }
+        };
+        if v.is_nan() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Original leaf ids of loaded row `r` in trees `0..out.len()`, written to
+    /// `out[t]`.
+    fn original_leaf_ids_for_row(&self, forest: &CompactForest, r: usize, out: &mut [u32]) {
+        match self.row(r) {
+            Some(row) => forest.original_leaf_ids_for_row(row, out),
+            None => {
+                for (t, slot) in out.iter_mut().enumerate() {
+                    *slot = forest.original_id(forest.leaf_id_with(t, |f| self.get(r, f)));
+                }
+            }
+        }
+    }
+
+    /// `out[t % k] += weight(t) * leaf_value(row r, tree t)` for trees
+    /// `0..limit` of loaded row `r`.
+    fn accumulate_row(
+        &self,
+        forest: &CompactForest,
+        r: usize,
+        limit: usize,
+        weight: impl Fn(usize) -> f32,
+        out: &mut [f32],
+    ) {
+        match self.row(r) {
+            Some(row) => forest.accumulate_row(row, limit, weight, out),
+            None => {
+                let k = out.len();
+                for t in 0..limit {
+                    let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                    out[t % k] += weight(t) * forest.leaf_value(leaf);
+                }
+            }
+        }
+    }
+
+    /// The loaded rows for the batch kernel: the full [`LANES`]-row groups in
+    /// lane-major layout plus the remaining rows row-major (see
+    /// [`CompactForest::accumulate`]); `None` for wide sparse blocks.
+    #[inline]
+    fn lane_block(&self, rows: usize) -> Option<(&[f32], &[f32], usize)> {
+        let tail_start = rows / LANES * LANES;
+        match self {
+            RowBlock::View {
+                data,
+                n_cols,
+                start,
+                lanes,
+            } => Some((
+                lanes,
+                &data[(start + tail_start) * n_cols..(start + rows) * n_cols],
+                *n_cols,
+            )),
+            RowBlock::Scratch {
+                n_cols,
+                scratch,
+                lanes,
+                ..
+            } => Some((lanes, &scratch[..(rows - tail_start) * n_cols], *n_cols)),
+            RowBlock::Wide { .. } => None,
+        }
+    }
+
+    /// `out[r * stride] = original leaf id of row r` in tree `t` over the
+    /// loaded rows.
+    fn original_leaf_ids(
+        &self,
+        forest: &CompactForest,
+        t: usize,
+        rows: usize,
+        out: &mut [u32],
+        stride: usize,
+    ) {
+        match self.lane_block(rows) {
+            Some((lanes, tail, n_cols)) => {
+                forest.original_leaf_ids(t, lanes, tail, n_cols, rows, out, stride)
+            }
+            None => {
+                for r in 0..rows {
+                    let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                    out[r * stride] = forest.original_id(leaf);
+                }
+            }
+        }
+    }
+
+    /// `out[r * stride] += weight * leaf_value(row r)` in tree `t` over the
+    /// loaded rows.
+    fn accumulate(
+        &self,
+        forest: &CompactForest,
+        t: usize,
+        rows: usize,
+        weight: f32,
+        out: &mut [f32],
+        stride: usize,
+    ) {
+        match self.lane_block(rows) {
+            Some((lanes, tail, n_cols)) => {
+                forest.accumulate(t, lanes, tail, n_cols, rows, weight, out, stride)
+            }
+            None => {
+                for r in 0..rows {
+                    let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                    out[r * stride] += weight * forest.leaf_value(leaf);
+                }
+            }
+        }
     }
 }
 

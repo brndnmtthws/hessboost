@@ -23,13 +23,14 @@
 
 use crate::data::DMatrix;
 use crate::error::Result;
-use crate::learner::model::BoostedModel;
+use crate::learner::model::{BoostedModel, RowBlock};
 use crate::tree::RegTree;
+use rayon::prelude::*;
 
 /// One element of a decision path: a unique feature together with the fraction
 /// of permutations in which it is "one" (present / in the coalition) and "zero"
 /// (absent), plus the accumulated proportion of subset weights (`pweight`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PathElement {
     /// Feature index for this path element, or `-1` for the root placeholder.
     feature_index: i64,
@@ -41,48 +42,87 @@ struct PathElement {
     pweight: f64,
 }
 
-/// Grow the decision path by adding a new feature split.
-///
-/// `path` holds the parent path (`unique_depth` elements before the call). The
-/// new element is appended, and every existing element's `pweight` is updated to
-/// account for one extra split in the coalition ordering.
+/// `1 / n` for the small integers that appear as path positions. f64 division
+/// dominates TreeSHAP's inner loops, so the integer reciprocals are tabulated
+/// and the data-dependent ones hoisted out of the loops.
+const INV_LEN: usize = 128;
+const INV: [f64; INV_LEN] = {
+    let mut table = [0.0f64; INV_LEN];
+    let mut i = 1;
+    while i < INV_LEN {
+        table[i] = 1.0 / i as f64;
+        i += 1;
+    }
+    table
+};
+
+#[inline(always)]
+fn inv(n: usize) -> f64 {
+    if n < INV_LEN {
+        INV[n]
+    } else {
+        1.0 / n as f64
+    }
+}
+
+/// Grow the decision path `path[..len]` by one element (`path[len]`), updating
+/// every existing element's `pweight` to account for one extra split in the
+/// coalition ordering.
 fn extend_path(
-    path: &mut Vec<PathElement>,
+    path: &mut [PathElement],
+    len: usize,
     zero_fraction: f64,
     one_fraction: f64,
     feature_index: i64,
 ) {
-    let unique_depth = path.len(); // index the new element will occupy
-    path.push(PathElement {
+    let unique_depth = len; // index the new element will occupy
+    path[unique_depth] = PathElement {
         feature_index,
         zero_fraction,
         one_fraction,
         pweight: if unique_depth == 0 { 1.0 } else { 0.0 },
-    });
-    let denom = (unique_depth + 1) as f64;
+    };
+    let inv_denom = inv(unique_depth + 1);
+    let one_scaled = one_fraction * inv_denom;
+    let zero_scaled = zero_fraction * inv_denom;
+    if one_fraction == 0.0 {
+        // Cold edge: the new element takes no weight from its predecessors
+        // (the `one_scaled` term is exactly zero).
+        for i in (0..unique_depth).rev() {
+            path[i].pweight = zero_scaled * path[i].pweight * (unique_depth - i) as f64;
+        }
+        return;
+    }
     for i in (0..unique_depth).rev() {
         let pw_i = path[i].pweight;
-        path[i + 1].pweight += one_fraction * pw_i * (i + 1) as f64 / denom;
-        path[i].pweight = zero_fraction * pw_i * (unique_depth - i) as f64 / denom;
+        path[i + 1].pweight += one_scaled * pw_i * (i + 1) as f64;
+        path[i].pweight = zero_scaled * pw_i * (unique_depth - i) as f64;
     }
 }
 
-/// Undo a previous [`extend_path`], removing the element at `path_index` and
-/// restoring the `pweight`s of the remaining elements. Shrinks `path` by one.
-fn unwind_path(path: &mut Vec<PathElement>, path_index: usize) {
+/// Undo a previous [`extend_path`] on `path` (a full path of `path.len()`
+/// elements), removing the element at `path_index` and restoring the `pweight`s
+/// of the remaining elements. The path afterwards occupies `path[..len - 1]`.
+fn unwind_path(path: &mut [PathElement], path_index: usize) {
     let unique_depth = path.len() - 1; // top index
     let one_fraction = path[path_index].one_fraction;
     let zero_fraction = path[path_index].zero_fraction;
-    let mut next_one_portion = path[unique_depth].pweight;
     let denom = (unique_depth + 1) as f64;
-    for i in (0..unique_depth).rev() {
-        if one_fraction != 0.0 {
+    let inv_denom = inv(unique_depth + 1);
+    if one_fraction != 0.0 {
+        let mut next_one_portion = path[unique_depth].pweight;
+        let scale = denom / one_fraction;
+        let decay = scale * (zero_fraction * inv_denom);
+        for i in (0..unique_depth).rev() {
+            let inv_i = inv(i + 1);
             let tmp = path[i].pweight;
-            path[i].pweight = next_one_portion * denom / ((i + 1) as f64 * one_fraction);
-            next_one_portion =
-                tmp - path[i].pweight * zero_fraction * (unique_depth - i) as f64 / denom;
-        } else if zero_fraction != 0.0 {
-            path[i].pweight = path[i].pweight * denom / (zero_fraction * (unique_depth - i) as f64);
+            path[i].pweight = next_one_portion * (scale * inv_i);
+            next_one_portion = tmp - next_one_portion * (decay * inv_i * (unique_depth - i) as f64);
+        }
+    } else if zero_fraction != 0.0 {
+        let scale = denom / zero_fraction;
+        for i in (0..unique_depth).rev() {
+            path[i].pweight *= scale * inv(unique_depth - i);
         }
     }
     for i in path_index..unique_depth {
@@ -90,7 +130,6 @@ fn unwind_path(path: &mut Vec<PathElement>, path_index: usize) {
         path[i].zero_fraction = path[i + 1].zero_fraction;
         path[i].one_fraction = path[i + 1].one_fraction;
     }
-    path.pop();
 }
 
 /// The total permutation weight that element `path_index` would contribute if it
@@ -99,116 +138,209 @@ fn unwound_path_sum(path: &[PathElement], path_index: usize) -> f64 {
     let unique_depth = path.len() - 1; // top index
     let one_fraction = path[path_index].one_fraction;
     let zero_fraction = path[path_index].zero_fraction;
-    let mut next_one_portion = path[unique_depth].pweight;
     let denom = (unique_depth + 1) as f64;
     let mut total = 0.0;
-    for i in (0..unique_depth).rev() {
-        if one_fraction != 0.0 {
-            let tmp = next_one_portion * denom / ((i + 1) as f64 * one_fraction);
-            total += tmp;
+    if one_fraction != 0.0 {
+        // next_i = pw_i - next_{i+1} * scale/(i+1) * zero/(D+1) * (D-i): the
+        // coefficient of next_{i+1} is gathered off the dependency chain so
+        // each step of the recurrence is one multiply-subtract.
+        let mut next_one_portion = path[unique_depth].pweight;
+        let scale = denom / one_fraction;
+        let decay = scale * (zero_fraction * inv(unique_depth + 1));
+        for i in (0..unique_depth).rev() {
+            let inv_i = inv(i + 1);
+            total += next_one_portion * (scale * inv_i);
             next_one_portion =
-                path[i].pweight - tmp * zero_fraction * (unique_depth - i) as f64 / denom;
-        } else if zero_fraction != 0.0 {
-            total += (path[i].pweight / zero_fraction) / ((unique_depth - i) as f64 / denom);
+                path[i].pweight - next_one_portion * (decay * inv_i * (unique_depth - i) as f64);
+        }
+    } else if zero_fraction != 0.0 {
+        let scale = denom / zero_fraction;
+        for i in (0..unique_depth).rev() {
+            total += path[i].pweight * scale * inv(unique_depth - i);
         }
     }
     total
 }
 
-/// Recursive TreeSHAP traversal for a single tree, accumulating per-feature
-/// contributions into `phi`.
-///
-/// `path` is the parent decision path (owned, so it can be forked at each
-/// internal node). `get` accesses the instance's feature values (`None` =
-/// missing, routed by the node's default direction). This is the ordinary
-/// (unconditioned) traversal used by [`BoostedModel::predict_contribs`]. It is a
-/// thin wrapper over [`tree_shap_cond`] with `condition == 0`.
-#[allow(clippy::too_many_arguments)]
-fn tree_shap(
-    tree: &RegTree,
-    node_index: usize,
-    path: Vec<PathElement>,
-    parent_zero_fraction: f64,
-    parent_one_fraction: f64,
-    parent_feature_index: i64,
-    get: &impl Fn(u32) -> Option<f32>,
-    phi: &mut [f64],
-) {
-    tree_shap_cond(
-        tree,
-        node_index,
-        path,
-        parent_zero_fraction,
-        parent_one_fraction,
-        parent_feature_index,
-        get,
-        phi,
-        0,
-        -1,
-        1.0,
-    );
+/// Number of [`PathElement`]s a traversal of a tree of depth `depth` needs:
+/// the path at tree level `d` holds at most `d + 1` elements and every level
+/// owns its own region, so the regions sum to `(D + 1)(D + 2) / 2` for the
+/// deepest level `D`.
+fn arena_len(depth: usize) -> usize {
+    (depth + 1) * (depth + 2) / 2
 }
 
-/// Recursive TreeSHAP traversal generalized to compute contributions
-/// *conditioned* on a feature being present or absent. This is the core building block
-/// for SHAP interaction values (Lundberg et al.).
+/// [`RegTree`] node marker for "no child".
+const NO_CHILD: u32 = u32::MAX;
+
+/// A tree node with everything TreeSHAP reads per visit precomputed: the
+/// child cover ratio (`sum_hess / parent sum_hess`, which the recursion would
+/// otherwise divide out at every visit) and the leaf value widened to `f64`.
+#[derive(Clone, Copy)]
+struct ShapNode {
+    feature: u32,
+    cond: f32,
+    default_left: bool,
+    /// Left child, or [`NO_CHILD`] for a leaf.
+    left: u32,
+    right: u32,
+    /// This node's cover divided by its parent's (`0.0` when the parent has
+    /// no cover; unused for the root).
+    cover_fraction: f64,
+    /// Leaf value (`0.0` for internal nodes).
+    value: f64,
+}
+
+/// A [`RegTree`] prepared for TreeSHAP traversals.
+struct ShapTree {
+    nodes: Vec<ShapNode>,
+    depth: usize,
+}
+
+impl ShapTree {
+    fn from_tree(tree: &RegTree) -> Self {
+        let src = tree.nodes();
+        let mut nodes: Vec<ShapNode> = src
+            .iter()
+            .map(|n| ShapNode {
+                feature: n.split_feature,
+                cond: n.split_cond,
+                default_left: n.default_left,
+                left: if n.is_leaf() { NO_CHILD } else { n.left as u32 },
+                right: if n.is_leaf() {
+                    NO_CHILD
+                } else {
+                    n.right as u32
+                },
+                cover_fraction: 0.0,
+                value: if n.is_leaf() {
+                    n.leaf_value as f64
+                } else {
+                    0.0
+                },
+            })
+            .collect();
+        let mut depth = 0;
+        let mut stack = vec![(0usize, 0usize)];
+        while let Some((nid, d)) = stack.pop() {
+            depth = depth.max(d);
+            let n = &src[nid];
+            if n.is_leaf() {
+                continue;
+            }
+            let cover = n.sum_hess as f64;
+            for child in [n.left as usize, n.right as usize] {
+                nodes[child].cover_fraction = if cover > 0.0 {
+                    src[child].sum_hess as f64 / cover
+                } else {
+                    0.0
+                };
+                stack.push((child, d + 1));
+            }
+        }
+        ShapTree { nodes, depth }
+    }
+}
+
+/// Per-instance TreeSHAP traversal state shared by the plain and conditioned
+/// walks: the tree, the instance's dense feature row (`NaN` = missing), the
+/// contribution accumulator, and the conditioning mode.
+struct Walk<'a> {
+    tree: &'a ShapTree,
+    row: &'a [f32],
+    phi: &'a mut [f64],
+    /// `0`: ordinary contributions. `+1`: `condition_feature` fixed present
+    /// (in the coalition). `-1`: fixed absent.
+    condition: i32,
+    condition_feature: i64,
+}
+
+/// Recursive TreeSHAP traversal of a single tree, accumulating per-feature
+/// contributions into `walk.phi`.
 ///
-/// `condition` selects the conditioning mode: `0` reproduces the ordinary
-/// TreeSHAP contributions. `+1` fixes `condition_feature` to be **present** (in
-/// the coalition). `-1` fixes it **absent**. `condition_fraction` is the running
-/// weight carried down the tree by that conditioning (it starts at `1.0`). When
-/// conditioning is active the `condition_feature` is never entered into the
-/// decision path, so it receives no attribution of its own. The half-difference
-/// of the `+1` and `-1` runs yields the interaction of `condition_feature` with
-/// every other feature.
+/// `arena` is scratch for this node's decision path and every level below it:
+/// its first `level + 1` elements are this node's region, holding the parent's
+/// path in `arena[..parent_len]` on entry (copied by the caller, so the path
+/// can be forked at each internal node without allocating). `condition_fraction`
+/// is the running weight carried down the tree by the conditioning (it starts
+/// at `1.0`). When conditioning is active the `condition_feature` is never
+/// entered into the decision path, so it receives no attribution of its own.
+/// The half-difference of the `+1` and `-1` runs yields the interaction of
+/// `condition_feature` with every other feature.
 #[allow(clippy::too_many_arguments)]
-fn tree_shap_cond(
-    tree: &RegTree,
+fn tree_shap_rec(
+    walk: &mut Walk<'_>,
     node_index: usize,
-    mut path: Vec<PathElement>,
+    arena: &mut [PathElement],
+    level: usize,
+    parent_len: usize,
     parent_zero_fraction: f64,
     parent_one_fraction: f64,
     parent_feature_index: i64,
-    get: &impl Fn(u32) -> Option<f32>,
-    phi: &mut [f64],
-    condition: i32,
-    condition_feature: i64,
     condition_fraction: f64,
 ) {
     // No weight flows down this branch under the conditioning: nothing to do.
     if condition_fraction == 0.0 {
         return;
     }
+    let (path, rest) = arena.split_at_mut(level + 1);
+    let mut len = parent_len;
 
     // Extend the path with the parent split, unless we are conditioning on the
     // parent feature (in which case it is deliberately kept off the path).
-    if condition == 0 || condition_feature != parent_feature_index {
+    if walk.condition == 0 || walk.condition_feature != parent_feature_index {
         extend_path(
-            &mut path,
+            path,
+            len,
             parent_zero_fraction,
             parent_one_fraction,
             parent_feature_index,
         );
+        len += 1;
     }
-    let node = tree.node(node_index);
-    let unique_depth = path.len() - 1;
+    let tree = walk.tree;
+    let node = &tree.nodes[node_index];
+    let unique_depth = len - 1;
 
-    if node.is_leaf() {
-        let leaf = node.leaf_value as f64;
+    if node.left == NO_CHILD {
+        let leaf = node.value;
+        let path = &path[..len];
+        // For an element with `one_fraction == 0`, `unwound_path_sum` is
+        // `(D + 1) / zero_fraction * Σ_j pweight_j / (D - j)` and the leaf
+        // factor `(one - zero)` is `-zero_fraction`, so the fraction cancels:
+        // every such element contributes the same `-(D + 1) * Σ * leaf`. It is
+        // computed once per leaf and added for each of them (most elements: a
+        // leaf shares hot edges with the instance's own path only along their
+        // common prefix). Elements with both fractions zero contribute nothing.
+        let mut cold = None;
         for i in 1..=unique_depth {
-            let w = unwound_path_sum(&path, i);
             let el = path[i];
-            phi[el.feature_index as usize] +=
-                w * (el.one_fraction - el.zero_fraction) * leaf * condition_fraction;
+            if el.one_fraction != 0.0 {
+                let w = unwound_path_sum(path, i);
+                walk.phi[el.feature_index as usize] +=
+                    w * (el.one_fraction - el.zero_fraction) * leaf * condition_fraction;
+            } else if el.zero_fraction != 0.0 {
+                let c = *cold.get_or_insert_with(|| {
+                    let denom = (unique_depth + 1) as f64;
+                    let mut sum = 0.0;
+                    for j in (0..unique_depth).rev() {
+                        sum += path[j].pweight * inv(unique_depth - j);
+                    }
+                    -(sum * denom) * leaf * condition_fraction
+                });
+                walk.phi[el.feature_index as usize] += c;
+            }
         }
         return;
     }
 
     // Route the instance to determine the "hot" (taken) and "cold" child.
-    let split = node.split_feature;
-    let go_left = match get(split) {
-        Some(v) => v < node.split_cond,
-        None => node.default_left,
+    let split = node.feature;
+    let v = walk.row[split as usize];
+    let go_left = if v.is_nan() {
+        node.default_left
+    } else {
+        v < node.cond
     };
     let (hot, cold) = if go_left {
         (node.left as usize, node.right as usize)
@@ -217,29 +349,23 @@ fn tree_shap_cond(
     };
 
     // Cover-based child weights: hot/cold fraction = child_cover / node_cover.
-    let node_cover = node.sum_hess as f64;
-    let (hot_zero, cold_zero) = if node_cover > 0.0 {
-        (
-            tree.node(hot).sum_hess as f64 / node_cover,
-            tree.node(cold).sum_hess as f64 / node_cover,
-        )
-    } else {
-        (0.0, 0.0)
-    };
+    let hot_zero = tree.nodes[hot].cover_fraction;
+    let cold_zero = tree.nodes[cold].cover_fraction;
 
     // If this feature is already on the path, unwind it first so it is not
     // double-counted, carrying its incoming fractions forward.
     let split_i = split as i64;
     let mut incoming_zero = 1.0;
     let mut incoming_one = 1.0;
-    let found = path[1..=unique_depth]
+    let found = path[1..len]
         .iter()
         .position(|e| e.feature_index == split_i)
         .map(|p| p + 1);
     if let Some(pi) = found {
         incoming_zero = path[pi].zero_fraction;
         incoming_one = path[pi].one_fraction;
-        unwind_path(&mut path, pi);
+        unwind_path(&mut path[..len], pi);
+        len -= 1;
     }
 
     // Split the conditioning weight between the two children. When we condition
@@ -247,39 +373,59 @@ fn tree_shap_cond(
     // we condition it absent, each branch keeps only its cover fraction.
     let mut hot_condition_fraction = condition_fraction;
     let mut cold_condition_fraction = condition_fraction;
-    if condition > 0 && split_i == condition_feature {
+    if walk.condition > 0 && split_i == walk.condition_feature {
         cold_condition_fraction = 0.0;
-    } else if condition < 0 && split_i == condition_feature {
+    } else if walk.condition < 0 && split_i == walk.condition_feature {
         hot_condition_fraction *= hot_zero;
         cold_condition_fraction *= cold_zero;
     }
 
-    tree_shap_cond(
-        tree,
+    // Each child starts from its own copy of this path.
+    rest[..len].copy_from_slice(&path[..len]);
+    tree_shap_rec(
+        walk,
         hot,
-        path.clone(),
+        rest,
+        level + 1,
+        len,
         hot_zero * incoming_zero,
         incoming_one,
         split_i,
-        get,
-        phi,
-        condition,
-        condition_feature,
         hot_condition_fraction,
     );
-    tree_shap_cond(
-        tree,
+    rest[..len].copy_from_slice(&path[..len]);
+    tree_shap_rec(
+        walk,
         cold,
-        path,
+        rest,
+        level + 1,
+        len,
         cold_zero * incoming_zero,
         0.0,
         split_i,
-        get,
+        cold_condition_fraction,
+    );
+}
+
+/// TreeSHAP contributions of `tree` for one instance, accumulated into `phi`
+/// (which must be zeroed by the caller). `arena` must hold at least
+/// [`arena_len`] elements for the tree's depth.
+fn tree_shap(
+    tree: &ShapTree,
+    row: &[f32],
+    phi: &mut [f64],
+    arena: &mut [PathElement],
+    condition: i32,
+    condition_feature: i64,
+) {
+    let mut walk = Walk {
+        tree,
+        row,
         phi,
         condition,
         condition_feature,
-        cold_condition_fraction,
-    );
+    };
+    tree_shap_rec(&mut walk, 0, arena, 0, 0, 1.0, 1.0, -1, 1.0);
 }
 
 /// Cover-weighted mean prediction of the subtree rooted at `node_index`. This is the
@@ -332,49 +478,65 @@ impl BoostedModel {
             .enumerate()
             .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
             .collect();
+        let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
+        let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
 
         let mut out = vec![0f32; n * k * width];
-        let mut acc = vec![0f64; k * width]; // reused per row
-        let mut scratch = vec![0f64; nf];
         let initial = self.initial_margins(data);
 
-        for row in 0..n {
-            for a in acc.iter_mut() {
-                *a = 0.0;
-            }
-            for c in 0..k {
-                acc[c * width + nf] = initial[row * k + c] as f64;
-            }
-            if let Some(linear) = self.linear() {
-                for f in 0..nf {
-                    if let Some(x) = data.get(row, f) {
-                        for c in 0..k {
-                            acc[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
-                        }
-                    }
+        out.par_chunks_mut(k * width).enumerate().for_each_init(
+            || {
+                (
+                    RowBlock::single_rows(data),
+                    vec![0f64; k * width],
+                    vec![0f64; nf],
+                    vec![PathElement::default(); arena],
+                )
+            },
+            |(rows, acc, scratch, arena), (row, out_row)| {
+                for a in acc.iter_mut() {
+                    *a = 0.0;
                 }
                 for c in 0..k {
-                    acc[c * width + nf] += linear.bias()[c] as f64;
+                    acc[c * width + nf] = initial[row * k + c] as f64;
                 }
-            }
-            let get = |f: u32| data.get(row, f as usize);
-            for (ti, tree) in trees.iter().enumerate() {
-                let cls = ti % k;
-                let off = cls * width;
-                scratch.fill(0.0);
-                tree_shap(tree, 0, Vec::new(), 1.0, 1.0, -1, &get, &mut scratch);
-                let weight = self.tree_weight(ti) as f64;
-                for f in 0..nf {
-                    acc[off + f] += weight * scratch[f];
+                if let Some(linear) = self.linear() {
+                    for f in 0..nf {
+                        if let Some(x) = data.get(row, f) {
+                            for c in 0..k {
+                                acc[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
+                            }
+                        }
+                    }
+                    for c in 0..k {
+                        acc[c * width + nf] += linear.bias()[c] as f64;
+                    }
                 }
-                // Tree expected value folds into the bias column.
-                acc[off + nf] += tree_means[ti];
-            }
-            let row_off = row * k * width;
-            for (i, &v) in acc.iter().enumerate() {
-                out[row_off + i] = v as f32;
-            }
-        }
+                rows.load(row, 1);
+                let get = rows.row(0).expect("single-row blocks are dense");
+                for (ti, tree) in shap_trees.iter().enumerate() {
+                    let cls = ti % k;
+                    let off = cls * width;
+                    let weight = self.tree_weight(ti) as f64;
+                    if weight == 1.0 {
+                        // `1.0 * x` is exact, so unit-weight trees (gbtree)
+                        // accumulate straight into the row.
+                        tree_shap(tree, get, &mut acc[off..off + nf], arena, 0, -1);
+                    } else {
+                        scratch.fill(0.0);
+                        tree_shap(tree, get, scratch, arena, 0, -1);
+                        for f in 0..nf {
+                            acc[off + f] += weight * scratch[f];
+                        }
+                    }
+                    // Tree expected value folds into the bias column.
+                    acc[off + nf] += tree_means[ti];
+                }
+                for (o, &v) in out_row.iter_mut().zip(acc.iter()) {
+                    *o = v as f32;
+                }
+            },
+        );
         Ok(out)
     }
 
@@ -418,127 +580,120 @@ impl BoostedModel {
             .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
             .collect();
 
+        let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
+        let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
         let mut out = vec![0f32; n * k * mwidth];
-
-        // Per-(row) scratch, reused across rows.
-        let mut diag = vec![0f64; k * width]; // unconditioned contributions
-        let mut on = vec![0f64; k * width]; // condition = +1 (feature present)
-        let mut off = vec![0f64; k * width]; // condition = -1 (feature absent)
-        let mut mat = vec![0f64; k * mwidth]; // full interaction matrices
-        let mut scratch = vec![0f64; nf];
-        let mut scratch_on = vec![0f64; nf];
-        let mut scratch_off = vec![0f64; nf];
         let initial = self.initial_margins(data);
 
-        for row in 0..n {
-            let get = |f: u32| data.get(row, f as usize);
-            for v in diag.iter_mut() {
-                *v = 0.0;
-            }
-            for v in mat.iter_mut() {
-                *v = 0.0;
-            }
+        // Per-thread scratch: unconditioned contributions, condition = +1
+        // (feature present) / -1 (absent) accumulators, the interaction
+        // matrices, per-tree phi buffers, and the path arena.
+        struct Scratch<'a> {
+            rows: RowBlock<'a>,
+            diag: Vec<f64>,
+            on: Vec<f64>,
+            off: Vec<f64>,
+            mat: Vec<f64>,
+            phi: Vec<f64>,
+            phi_on: Vec<f64>,
+            phi_off: Vec<f64>,
+            arena: Vec<PathElement>,
+        }
 
-            for c in 0..k {
-                diag[c * width + nf] = initial[row * k + c] as f64;
-            }
-            if let Some(linear) = self.linear() {
-                for f in 0..nf {
-                    if let Some(x) = data.get(row, f) {
-                        for c in 0..k {
-                            diag[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
+        out.par_chunks_mut(k * mwidth).enumerate().for_each_init(
+            || Scratch {
+                rows: RowBlock::single_rows(data),
+                diag: vec![0f64; k * width],
+                on: vec![0f64; k * width],
+                off: vec![0f64; k * width],
+                mat: vec![0f64; k * mwidth],
+                phi: vec![0f64; nf],
+                phi_on: vec![0f64; nf],
+                phi_off: vec![0f64; nf],
+                arena: vec![PathElement::default(); arena],
+            },
+            |s, (row, out_row)| {
+                s.rows.load(row, 1);
+                let get = s.rows.row(0).expect("single-row blocks are dense");
+                let (diag, on, off, mat) = (&mut s.diag, &mut s.on, &mut s.off, &mut s.mat);
+                diag.fill(0.0);
+                mat.fill(0.0);
+
+                for c in 0..k {
+                    diag[c * width + nf] = initial[row * k + c] as f64;
+                }
+                if let Some(linear) = self.linear() {
+                    for f in 0..nf {
+                        if let Some(x) = data.get(row, f) {
+                            for c in 0..k {
+                                diag[c * width + f] +=
+                                    linear.weights()[f * k + c] as f64 * x as f64;
+                            }
                         }
                     }
+                    for c in 0..k {
+                        diag[c * width + nf] += linear.bias()[c] as f64;
+                    }
                 }
-                for c in 0..k {
-                    diag[c * width + nf] += linear.bias()[c] as f64;
-                }
-            }
-            for (ti, tree) in trees.iter().enumerate() {
-                let cls = ti % k;
-                let base = cls * width;
-                scratch.fill(0.0);
-                tree_shap(tree, 0, Vec::new(), 1.0, 1.0, -1, &get, &mut scratch);
-                let weight = self.tree_weight(ti) as f64;
-                for f in 0..nf {
-                    diag[base + f] += weight * scratch[f];
-                }
-                diag[base + nf] += tree_means[ti];
-            }
-            for c in 0..k {
-                let mbase = c * mwidth;
-                let dbase = c * width;
-                for j in 0..width {
-                    mat[mbase + j * width + j] = diag[dbase + j];
-                }
-            }
-
-            // 2. Interaction terms: for each feature `j`, the half-difference of
-            //    the present/absent conditioned contributions gives the
-            //    interaction with every other feature; the diagonal is reduced so
-            //    the row keeps summing to feature `j`'s SHAP value.
-            for j in 0..nf {
-                for v in on.iter_mut() {
-                    *v = 0.0;
-                }
-                for v in off.iter_mut() {
-                    *v = 0.0;
-                }
-                for (ti, tree) in trees.iter().enumerate() {
+                for (ti, tree) in shap_trees.iter().enumerate() {
                     let cls = ti % k;
                     let base = cls * width;
-                    scratch_on.fill(0.0);
-                    scratch_off.fill(0.0);
-                    tree_shap_cond(
-                        tree,
-                        0,
-                        Vec::new(),
-                        1.0,
-                        1.0,
-                        -1,
-                        &get,
-                        &mut scratch_on,
-                        1,
-                        j as i64,
-                        1.0,
-                    );
-                    tree_shap_cond(
-                        tree,
-                        0,
-                        Vec::new(),
-                        1.0,
-                        1.0,
-                        -1,
-                        &get,
-                        &mut scratch_off,
-                        -1,
-                        j as i64,
-                        1.0,
-                    );
+                    s.phi.fill(0.0);
+                    tree_shap(tree, get, &mut s.phi, &mut s.arena, 0, -1);
                     let weight = self.tree_weight(ti) as f64;
                     for f in 0..nf {
-                        on[base + f] += weight * scratch_on[f];
-                        off[base + f] += weight * scratch_off[f];
+                        diag[base + f] += weight * s.phi[f];
                     }
+                    diag[base + nf] += tree_means[ti];
                 }
                 for c in 0..k {
                     let mbase = c * mwidth;
                     let dbase = c * width;
-                    for kk in 0..width {
-                        // The conditioned feature `j` never attributes to itself
-                        // (on/off are zero there), so `kk == j` contributes 0.
-                        let val = 0.5 * (on[dbase + kk] - off[dbase + kk]);
-                        mat[mbase + j * width + kk] += val;
-                        mat[mbase + j * width + j] -= val;
+                    for j in 0..width {
+                        mat[mbase + j * width + j] = diag[dbase + j];
                     }
                 }
-            }
 
-            let row_off = row * k * mwidth;
-            for (i, &v) in mat.iter().enumerate() {
-                out[row_off + i] = v as f32;
-            }
-        }
+                // 2. Interaction terms: for each feature `j`, the
+                //    half-difference of the present/absent conditioned
+                //    contributions gives the interaction with every other
+                //    feature; the diagonal is reduced so the row keeps
+                //    summing to feature `j`'s SHAP value.
+                for j in 0..nf {
+                    on.fill(0.0);
+                    off.fill(0.0);
+                    for (ti, tree) in shap_trees.iter().enumerate() {
+                        let cls = ti % k;
+                        let base = cls * width;
+                        s.phi_on.fill(0.0);
+                        s.phi_off.fill(0.0);
+                        tree_shap(tree, get, &mut s.phi_on, &mut s.arena, 1, j as i64);
+                        tree_shap(tree, get, &mut s.phi_off, &mut s.arena, -1, j as i64);
+                        let weight = self.tree_weight(ti) as f64;
+                        for f in 0..nf {
+                            on[base + f] += weight * s.phi_on[f];
+                            off[base + f] += weight * s.phi_off[f];
+                        }
+                    }
+                    for c in 0..k {
+                        let mbase = c * mwidth;
+                        let dbase = c * width;
+                        for kk in 0..width {
+                            // The conditioned feature `j` never attributes to
+                            // itself (on/off are zero there), so `kk == j`
+                            // contributes 0.
+                            let val = 0.5 * (on[dbase + kk] - off[dbase + kk]);
+                            mat[mbase + j * width + kk] += val;
+                            mat[mbase + j * width + j] -= val;
+                        }
+                    }
+                }
+
+                for (o, &v) in out_row.iter_mut().zip(mat.iter()) {
+                    *o = v as f32;
+                }
+            },
+        );
         Ok(out)
     }
 }

@@ -88,13 +88,19 @@ impl DMatrix {
                 got: data.len(),
             });
         }
-        for &v in data {
-            if !is_missing(v, missing) && !v.is_finite() {
-                return Err(SequoiaError::invalid_param(
-                    "dense data",
-                    "non-missing feature values must be finite",
-                ));
-            }
+        // With the NaN sentinel the only rejected values are infinities, a
+        // branch-free check the compiler vectorizes; other sentinels need the
+        // general test.
+        let invalid = if missing.is_nan() {
+            data.iter().any(|v| v.is_infinite())
+        } else {
+            data.iter().any(|&v| v != missing && !v.is_finite())
+        };
+        if invalid {
+            return Err(SequoiaError::invalid_param(
+                "dense data",
+                "non-missing feature values must be finite",
+            ));
         }
         Ok(DMatrix {
             n_rows,
@@ -459,6 +465,21 @@ impl DMatrix {
         match &self.storage {
             Storage::Dense(data) => Some(data),
             Storage::Csr { .. } => None,
+        }
+    }
+
+    /// Raw `(indptr, indices, values)` of a CSR matrix; `None` for dense storage.
+    /// Entries equal to the missing sentinel may be present and must be treated
+    /// as absent by callers.
+    #[inline]
+    pub(crate) fn csr_parts(&self) -> Option<(&[usize], &[u32], &[f32])> {
+        match &self.storage {
+            Storage::Dense(_) => None,
+            Storage::Csr {
+                indptr,
+                indices,
+                values,
+            } => Some((indptr, indices, values)),
         }
     }
 

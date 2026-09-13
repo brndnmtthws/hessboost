@@ -527,7 +527,7 @@ fn update_tree_margins(
 
 /// Add each leaf's value to the margins of the rows that reached it. Leaf row
 /// lists are ascending, so each parallel row chunk locates its slice of every
-/// leaf by binary search; the per-row addition order is unchanged.
+/// leaf by binary search. The per-row addition order is unchanged.
 fn apply_leaf_rows(
     tree: &RegTree,
     leaf_rows: &[crate::tree::builder::LeafRows],

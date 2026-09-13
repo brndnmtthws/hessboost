@@ -85,7 +85,7 @@ struct NodeEntry {
     allowed: Option<Vec<u32>>,
 }
 
-/// Tree expansion and sampling happen in node order; the expensive row and
+/// Tree expansion and sampling happen in node order, so the expensive row and
 /// histogram work can then run independently for every split at a depth.
 struct PendingSplit {
     entry: NodeEntry,

@@ -1,7 +1,7 @@
 //! Fit-time and held-out quality measurements on shared binary datasets.
 //!
 //! Driven by `scripts/bench_xgb.py`. File I/O and test-data preparation are
-//! outside the timer; each fit constructs a fresh training DMatrix.
+//! outside the timer, and each fit constructs a fresh training DMatrix.
 
 use sequoia_boost::metric::create_metric;
 use sequoia_boost::prelude::*;

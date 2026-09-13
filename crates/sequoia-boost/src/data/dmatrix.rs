@@ -459,7 +459,7 @@ impl DMatrix {
     }
 
     /// Raw row-major storage of a dense matrix (missing entries hold the
-    /// sentinel); `None` for sparse storage.
+    /// sentinel), or `None` for sparse storage.
     #[inline]
     pub(crate) fn dense_values(&self) -> Option<&[f32]> {
         match &self.storage {
@@ -468,7 +468,7 @@ impl DMatrix {
         }
     }
 
-    /// Raw `(indptr, indices, values)` of a CSR matrix; `None` for dense storage.
+    /// Raw `(indptr, indices, values)` of a CSR matrix, or `None` for dense storage.
     /// Entries equal to the missing sentinel may be present and must be treated
     /// as absent by callers.
     #[inline]

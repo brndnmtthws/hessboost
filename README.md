@@ -148,9 +148,9 @@ preparation and training, and report the median of six fits after warmup.
 | 4-class, 50k × 30 | 16 | 0.692 s | 1.205 s |
 
 Sequoia has lower median fit time in all 12 configurations in this run.
-Single-thread speedups are 2.22–2.88×, four-thread speedups are 1.85–2.23×, and
-sixteen-thread speedups are 1.39–1.74×. Held-out RMSE/log-loss scores are
-identical to the previous run on every workload.
+Single-thread speedups are 2.22× to 2.88×, four-thread speedups are 1.85× to
+2.23×, and sixteen-thread speedups are 1.39× to 1.74×. Held-out RMSE/log-loss
+scores are identical to the previous run on every workload.
 
 See the [full comparison](docs/performance.md#xgboost-comparison) for held-out
 quality, sample variability, workload definitions, and reproduction commands.

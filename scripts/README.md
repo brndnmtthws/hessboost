@@ -47,13 +47,13 @@ XGBoost and the compiled `bench_compare` Rust example. Both engines read the
 same little-endian `f32` bytes. Each timed fit constructs a fresh training
 matrix and trains the model. File I/O, test-data preparation, evaluation, model
 destruction, and process startup are outside the timer. XGBoost uses
-`QuantileDMatrix` with CPU `hist`; sequoia-boost builds its `DMatrix` and performs
+`QuantileDMatrix` with CPU `hist`. sequoia-boost builds its `DMatrix` and performs
 binning during training.
 
 The default suite covers regression, wide regression, binary classification,
 and four-class classification, with 100 boosting rounds at 1, 4, and 16
 threads. Each comparison runs in XGBoost/sequoia/sequoia/XGBoost order. Every
-batch discards one warmup fit and records three fits; the report uses the
+batch discards one warmup fit and records three fits. The report uses the
 median of all six measurements for each engine. Held-out RMSE or log loss
 checks model quality alongside timing.
 
@@ -73,7 +73,7 @@ other benchmarks or compiler jobs concurrently.
 For a quick harness check, add `--rows 512 --rounds 3 --repeats 1`. Use
 `--workloads regression` to select one dataset or `--threads 1` for a
 single-thread comparison. Remove the package version constraints to benchmark
-the latest releases available through `uv`; the output records the versions
+the latest releases available through `uv`. The output records the versions
 actually used.
 
 See [Performance](../docs/performance.md#xgboost-comparison) for the recorded

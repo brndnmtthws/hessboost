@@ -39,7 +39,7 @@ pub(crate) enum DenseSplitScan {
 }
 
 /// Resolve the process-wide AArch64 backend lazily on the first numeric-kernel
-/// call. `OnceLock` makes feature detection a one-time initialization cost;
+/// call. `OnceLock` makes feature detection a one-time initialization cost, and
 /// subsequent calls are a cached load and comparison.
 #[cfg(target_arch = "aarch64")]
 #[inline]

@@ -89,7 +89,7 @@ impl HistogramBackend for CpuBackend {
 }
 
 /// Rows to run ahead of the accumulation loop when prefetching. Each row's bins
-/// and gradient are fetched into L1 before the loop needs them; subsets deep in
+/// and gradient are fetched into L1 before the loop needs them. Subsets deep in
 /// the tree are too sparse for hardware stride prediction.
 const PREFETCH_ROWS: usize = 8;
 const CACHE_LINE: usize = 64;
@@ -185,7 +185,7 @@ const BLOCK_BINS: usize = 4096;
 
 /// Dense accumulation tiled by rows and feature blocks. Every bin still
 /// receives its rows in ascending order, so the result is identical to a
-/// straight row sweep; the tiling only changes which histogram bins are hot.
+/// straight row sweep. The tiling only changes which histogram bins are hot.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn accumulate_dense<B: BinIndex>(

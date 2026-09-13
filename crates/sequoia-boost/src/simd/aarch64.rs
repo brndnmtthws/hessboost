@@ -272,7 +272,7 @@ pub(super) unsafe fn sum_grad_stats(values: &[GradStats]) -> GradStats {
 /// Relative slack applied to the division-free prefilter threshold. Both the
 /// cross-multiplied test and the exact quotient test round to within a few
 /// ULPs, so this margin guarantees the prefilter never rejects a candidate the
-/// exact comparison would accept; false positives merely pay for a division.
+/// exact comparison would accept. False positives merely pay for a division.
 const PREFILTER_SLACK: f64 = 1e-9;
 
 /// Scaled `gain(L) + gain(R)` a candidate must exceed to beat `best_loss`.
@@ -289,7 +289,7 @@ struct SplitScan<'a> {
     comparison_epsilon: f64,
     best: Option<super::SplitCandidate>,
     best_loss: f64,
-    /// See [`prefilter_target`]; refreshed whenever `best_loss` changes.
+    /// See [`prefilter_target`]. Refreshed whenever `best_loss` changes.
     target: f64,
 }
 
@@ -381,8 +381,8 @@ unsafe fn pair_losses(terms: &PairTerms, parent_gain: float64x2_t) -> [f64; 2] {
 }
 
 /// Running prefix over the two bins at `*bin` and `*bin + 1`. `accumulated`
-/// holds `(grad, hess)` lanes and advances by both bins in sequential order;
-/// the result is lane-split into `(gradients, hessians)` of the two candidates.
+/// holds `(grad, hess)` lanes and advances by both bins in sequential order.
+/// The result is lane-split into `(gradients, hessians)` of the two candidates.
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn prefix_pair(

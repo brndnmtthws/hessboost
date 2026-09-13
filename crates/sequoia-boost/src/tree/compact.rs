@@ -9,20 +9,20 @@
 //!
 //! - nodes are renumbered breadth-first so the two children of a node are
 //!   adjacent, letting the step compute `next = left + (go_right as u32)`
-//!   arithmetically; child indices are absolute within the arena, so lanes
-//!   walking different trees share one base pointer;
+//!   arithmetically. Child indices are absolute within the arena, so lanes
+//!   walking different trees share one base pointer.
 //! - every numeric split is expressed as one ordered compare `v' > cond'` that
 //!   is false for missing values (`NaN`): a split whose missing values go left
 //!   stores `cond' = next_below(cond)` (so `v > cond'` is `v >= cond`), and a
 //!   split whose missing values go right stores the children mirrored with
 //!   `cond' = -cond` and a sign mask that negates `v` (`-v > -cond` is
-//!   `v < cond`), so a step is load, XOR, compare, add, with no select;
+//!   `v < cond`), so a step is load, XOR, compare, add, with no select.
 //! - leaves store `cond' = +inf` and point at themselves, so a walk can run a
-//!   fixed number of steps (the tree depth) without testing for termination;
-//!   several rows (or, for a single row, several trees) are walked in lockstep
+//!   fixed number of steps (the tree depth) without testing for termination.
+//!   Several rows (or, for a single row, several trees) are walked in lockstep
 //!   so their dependent load chains overlap.
 //!
-//! Leaf ids are arena indices; [`CompactForest::original_id`] maps them back
+//! Leaf ids are arena indices, and [`CompactForest::original_id`] maps them back
 //! to [`RegTree`] node ids for `predict_leaf`.
 
 use crate::tree::RegTree;
@@ -40,7 +40,7 @@ const LEAF_COND: u32 = f32::INFINITY.to_bits();
 /// `aux` for a numeric node whose missing values go right: flips the sign of
 /// the feature value so `v < cond` becomes `-v > -cond`.
 const NEGATE: u32 = 1 << 31;
-/// `aux` bit: set-membership split; `cond` holds `cat_begin` and
+/// `aux` bit marking a set-membership split. `cond` holds `cat_begin` and
 /// `aux >> CAT_END_SHIFT` holds `cat_end`. Numeric `aux` values are `0` or
 /// [`NEGATE`], so this bit distinguishes them.
 const CATEGORICAL: u32 = 1;
@@ -56,7 +56,7 @@ struct CNode {
     /// Numeric threshold in the "go right when greater" form (`+inf` for a
     /// leaf). For categorical nodes the bit pattern holds `cat_begin`.
     cond: f32,
-    /// Arena index of the child selected when the compare is false; the other
+    /// Arena index of the child selected when the compare is false. The other
     /// child is `left + 1`. A leaf points at itself.
     left: u32,
     /// Numeric node: sign mask XORed into the feature value (`0` or
@@ -114,7 +114,7 @@ pub(crate) struct CompactForest {
     nodes: Vec<CNode>,
     /// Arena index → original [`RegTree`] node id within its tree.
     orig_id: Vec<u32>,
-    /// Every tree's category pool, concatenated; node ranges are absolute.
+    /// Every tree's category pool, concatenated, so node ranges are absolute.
     categories: Vec<u32>,
     trees: Vec<TreeMeta>,
 }
@@ -326,7 +326,7 @@ impl CompactForest {
     /// `sink(r, leaf)` with each row's arena leaf id, in row order. The full
     /// [`LANES`]-row groups come from `lanes`, laid out `[group][feature][lane]`
     /// so a lane's value sits at a fixed immediate offset from the group's
-    /// feature base (`n_cols * LANES` values per group); the remaining
+    /// feature base (`n_cols * LANES` values per group). The remaining
     /// `rows % LANES` rows come from `tail`, row-major with stride `n_cols`.
     #[inline(always)]
     fn walk_block(
@@ -393,7 +393,7 @@ impl CompactForest {
 
     /// `out[r * stride] = original leaf id of row r` in tree `t` for `rows`
     /// dense rows given as lane-major groups plus a row-major tail (see
-    /// [`Self::walk_block`]); `NaN` marks missing values.
+    /// [`Self::walk_block`]). `NaN` marks missing values.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn original_leaf_ids(
         &self,

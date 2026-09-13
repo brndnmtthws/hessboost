@@ -229,7 +229,7 @@ const SEARCH_BLOCK: usize = 16;
 /// Two-level search index over a cut table for binning many values quickly.
 ///
 /// Each numeric feature's cuts are padded with `+inf` to whole blocks of
-/// [`SEARCH_BLOCK`]; a first-level table holds every block's last cut. A lookup
+/// `SEARCH_BLOCK`, and a first-level table holds every block's last cut. A lookup
 /// counts the first-level entries `<= value` (whole blocks below the value),
 /// then the cuts `<= value` inside the next block. Both counts are branch-free
 /// vector compares, and the result equals `partition_point(|c| c <= value)`.
@@ -238,7 +238,7 @@ pub struct BinSearch<'a> {
     /// Padded cuts, `padded_offset[f]..padded_offset[f + 1]` per feature.
     padded: Vec<f32>,
     padded_offset: Vec<usize>,
-    /// Last cut of each block, padded with `+inf` to whole blocks;
+    /// Last cut of each block, padded with `+inf` to whole blocks,
     /// `level1_offset[f]..level1_offset[f + 1]` per feature.
     level1: Vec<f32>,
     level1_offset: Vec<usize>,
@@ -286,7 +286,7 @@ impl<'a> BinSearch<'a> {
         self.cuts.n_features()
     }
 
-    /// Map a feature value to its global bin index; same result as
+    /// Map a feature value to its global bin index, with the same result as
     /// [`HistCuts::bin_of`].
     #[inline]
     pub fn bin_of(&self, f: usize, value: f32) -> u32 {
@@ -332,7 +332,7 @@ fn sort_key(value: f32) -> u32 {
 
 /// Sort `values` ascending by total order. Column sorts dominate cut
 /// construction, so long inputs use a three-pass LSD radix sort on
-/// [`sort_key`] (identical order to `sort_unstable_by(f32::total_cmp)`);
+/// [`sort_key`] (identical order to `sort_unstable_by(f32::total_cmp)`).
 /// `spare` is scratch reused across columns.
 fn sort_values(values: &mut Vec<f32>, spare: &mut Vec<f32>) {
     let n = values.len();

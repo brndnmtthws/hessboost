@@ -185,7 +185,7 @@ struct ShapNode {
     left: u32,
     right: u32,
     /// This node's cover divided by its parent's (`0.0` when the parent has
-    /// no cover; unused for the root).
+    /// no cover, unused for the root).
     cover_fraction: f64,
     /// Leaf value (`0.0` for internal nodes).
     value: f64,

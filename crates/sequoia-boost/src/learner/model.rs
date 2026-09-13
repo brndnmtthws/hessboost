@@ -665,7 +665,7 @@ const MAX_DENSIFY_COLS: usize = 4096;
 
 /// A block of consecutive rows exposed as dense feature vectors (`NaN` =
 /// missing) for [`CompactForest`] traversal. Dense `NaN`-sentinel matrices are
-/// viewed in place; dense matrices with another sentinel and CSR rows are
+/// viewed in place. Dense matrices with another sentinel and CSR rows are
 /// materialized into a per-block scratch buffer so each node lookup is a single
 /// indexed load. Both keep a lane-major copy of the full [`LANES`]-row groups
 /// for the batch kernel.
@@ -823,7 +823,7 @@ impl<'a> RowBlock<'a> {
         }
     }
 
-    /// Loaded row `r` as a dense `NaN`-for-missing slice; `None` for wide
+    /// Loaded row `r` as a dense `NaN`-for-missing slice, or `None` for wide
     /// sparse blocks, which are never materialized. Scratch blocks only keep
     /// the tail rows (those past the last full [`LANES`] group) row-major.
     #[inline]
@@ -906,7 +906,7 @@ impl<'a> RowBlock<'a> {
 
     /// The loaded rows for the batch kernel: the full [`LANES`]-row groups in
     /// lane-major layout plus the remaining rows row-major (see
-    /// [`CompactForest::accumulate`]); `None` for wide sparse blocks.
+    /// [`CompactForest::accumulate`]), or `None` for wide sparse blocks.
     #[inline]
     fn lane_block(&self, rows: usize) -> Option<(&[f32], &[f32], usize)> {
         let tail_start = rows / LANES * LANES;

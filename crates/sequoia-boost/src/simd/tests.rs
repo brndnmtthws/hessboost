@@ -399,31 +399,21 @@ fn assert_dense_split_matches_scalar(histogram: &[GradStats], reg: &RegParams) {
     else {
         panic!("vector split scan should dispatch on this host");
     };
-    // The x86-64 kernel runs the exact scalar acceptance on every surviving
-    // lane, so its result is bit-identical; NEON evaluates the loss in vector
-    // lanes and may differ in the last bits of a finite loss.
-    let exact_loss = cfg!(target_arch = "x86_64");
+    // Both kernels run the exact scalar acceptance on every surviving lane,
+    // so the returned candidate — offset, statistics, and loss — is
+    // bit-identical to the scalar scan.
     match (actual, expected) {
         (Some(actual), Some(expected)) => {
             assert_eq!(actual.split_offset, expected.split_offset);
             assert_eq!(stats_bits(actual.left), stats_bits(expected.left));
             assert_eq!(stats_bits(actual.right), stats_bits(expected.right));
-            if exact_loss || !expected.loss_change.is_finite() {
-                assert_eq!(
-                    actual.loss_change.to_bits(),
-                    expected.loss_change.to_bits(),
-                    "loss {} differs from scalar {}",
-                    actual.loss_change,
-                    expected.loss_change
-                );
-            } else {
-                assert!(
-                    (actual.loss_change - expected.loss_change).abs() <= 1e-12,
-                    "loss {} differs from scalar {}",
-                    actual.loss_change,
-                    expected.loss_change
-                );
-            }
+            assert_eq!(
+                actual.loss_change.to_bits(),
+                expected.loss_change.to_bits(),
+                "loss {} differs from scalar {}",
+                actual.loss_change,
+                expected.loss_change
+            );
         }
         (None, None) => {}
         _ => panic!("vector and scalar scans disagreed on candidate presence"),
@@ -456,10 +446,6 @@ fn dense_split_scan_matches_scalar_candidate_order() {
     }
 }
 
-/// Adversarial histograms: extreme magnitudes (where cross-multiplied bounds
-/// overflow or underflow), empty bins, exact ties, zero regularization, and
-/// `NaN` gradients must all reproduce the scalar scan's choice.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test]
 fn dense_split_scan_matches_scalar_on_adversarial_histograms() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -469,8 +455,14 @@ fn dense_split_scan_matches_scalar_on_adversarial_histograms() {
         state ^= state << 17;
         state
     };
-    let scales = [1e-160, 1e-30, 1e-3, 1.0, 1e3, 1e30, 1e150];
-    for case in 0..400 {
+    // The deepest scales exercise overflowing and subnormal cross-multiplied
+    // bounds, subnormal `target · b` intermediates, and zero-Hessian prefixes
+    // beside zero and nonzero regularization; the case count is chosen so
+    // every guard and gate is reached by at least one draw.
+    let scales = [
+        1e-320, 1e-160, 1e-30, 1e-3, 1.0, 1e3, 1e30, 1e150, 1e240, 1e300,
+    ];
+    for case in 0..4000 {
         let length = 16 + (next() % 250) as usize;
         let grad_scale = scales[(next() % scales.len() as u64) as usize];
         let hess_scale = scales[(next() % scales.len() as u64) as usize];

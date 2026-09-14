@@ -275,6 +275,38 @@ pub(super) unsafe fn sum_grad_stats(values: &[GradStats]) -> GradStats {
 /// exact comparison would accept. False positives merely pay for a division.
 const PREFILTER_SLACK: f64 = 1e-9;
 
+/// Ceiling applied to the prefilter bound before the improving comparison. A
+/// bound that overflowed to infinity compares as `inf > inf` (false) and would
+/// silently drop a candidate the exact comparison accepts, so saturated lanes
+/// keep comparing against the ceiling: a `cross` above it goes to the exact
+/// check and anything below it loses to a bound that truly dominates it.
+const BOUND_CEILING: f64 = 1.0e292;
+
+/// Bounds below this floor take the exact comparison: their products round
+/// subnormal, where the relative error behind `PREFILTER_SLACK` is unbounded
+/// and an underflowed `cross` or `bound` can hide an acceptable candidate.
+const BOUND_FLOOR: f64 = 1.0e-250;
+
+/// Scale of the `target · b_L` intermediate that keeps subnormal rounding
+/// below `PREFILTER_SLACK / 100`: products at or above this magnitude round
+/// within 3e-17, so the bound they produce stays trustworthy.
+const DENOMINATOR_FLOOR_SCALE: f64 = 1.0e-307;
+
+/// First denominator (`b_L`) that keeps the `target · b_L` intermediate above
+/// [`DENOMINATOR_FLOOR_SCALE`]. With `lambda` large enough to cover it on its
+/// own, every acceptable candidate has `b_L = H_L + lambda >= lambda`, so
+/// `lambda` itself is the floor; otherwise the floor divides out `target`.
+#[inline]
+fn denominator_floor(target: f64, lambda: f64) -> f64 {
+    if target * lambda >= DENOMINATOR_FLOOR_SCALE {
+        lambda
+    } else if target > 0.0 {
+        DENOMINATOR_FLOOR_SCALE / target
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// Scaled `gain(L) + gain(R)` a candidate must exceed to beat `best_loss`.
 #[inline]
 fn prefilter_target(best_loss: f64, comparison_epsilon: f64, parent_gain: f64) -> f64 {
@@ -291,35 +323,40 @@ struct SplitScan<'a> {
     best_loss: f64,
     /// See [`prefilter_target`]. Refreshed whenever `best_loss` changes.
     target: f64,
+    /// See [`denominator_floor`]. Refreshed together with `target`.
+    min_denominator: f64,
 }
 
 impl SplitScan<'_> {
-    /// Sequential check of the two candidates at `index` and `index + 1` with
-    /// the given left statistics and exact loss changes. Matches the scalar
-    /// scan bit for bit, including tie order and the post-acceptance epsilon.
+    /// Exact scalar check of the candidates at `index` and `index + 1` with
+    /// the given left statistics: the same tests, in the same order, as the
+    /// histogram builder's scalar scan, so the surviving candidate is
+    /// bit-identical to it. The precomputed vector losses are not used: a
+    /// child the closed form cannot evaluate (a zero Hessian with no
+    /// regularization) contributes a zero gain in the scalar scan, and the
+    /// vector quotients would return infinity or NaN for it instead.
     #[inline]
-    fn accept_pair(&mut self, index: usize, lefts: [GradStats; 2], losses: [f64; 2]) {
-        for (lane, (left, loss_change)) in lefts.into_iter().zip(losses).enumerate() {
+    fn accept_pair(&mut self, index: usize, lefts: [GradStats; 2]) {
+        for (lane, left) in lefts.into_iter().enumerate() {
             let right = self.total.sub(left);
-            // Ordered comparison: a NaN loss never improves.
-            let improves = loss_change > self.best_loss + self.comparison_epsilon;
-            if !improves
-                || left.hess < self.reg.min_child_weight
-                || right.hess < self.reg.min_child_weight
-                || left.hess <= 0.0
-                || right.hess <= 0.0
-            {
+            if left.hess < self.reg.min_child_weight || right.hess < self.reg.min_child_weight {
                 continue;
             }
-            self.best_loss = loss_change;
-            self.target =
-                prefilter_target(self.best_loss, self.comparison_epsilon, self.parent_gain);
-            self.best = Some(super::SplitCandidate {
-                loss_change,
-                split_offset: index + lane,
-                left,
-                right,
-            });
+            let loss_change =
+                calc_gain(left, self.reg) + calc_gain(right, self.reg) - self.parent_gain;
+            // Ordered comparison: a NaN loss never improves.
+            if loss_change > self.best_loss + self.comparison_epsilon {
+                self.best_loss = loss_change;
+                self.target =
+                    prefilter_target(self.best_loss, self.comparison_epsilon, self.parent_gain);
+                self.min_denominator = denominator_floor(self.target, self.reg.lambda);
+                self.best = Some(super::SplitCandidate {
+                    loss_change,
+                    split_offset: index + lane,
+                    left,
+                    right,
+                });
+            }
         }
     }
 }
@@ -359,24 +396,6 @@ unsafe fn pair_lanes(gradients: float64x2_t, hessians: float64x2_t) -> [GradStat
             GradStats::new(grad_0, hess_0),
             GradStats::new(grad_1, hess_1),
         ]
-    }
-}
-
-/// Exact loss change `gain(L) + gain(R) − parent` of two candidates, in the
-/// same arithmetic as the scalar [`calc_gain`] for valid children.
-#[inline]
-#[target_feature(enable = "neon")]
-unsafe fn pair_losses(terms: &PairTerms, parent_gain: float64x2_t) -> [f64; 2] {
-    // SAFETY: the caller guarantees NEON support; all operations use registers.
-    unsafe {
-        let divide: unsafe fn(float64x2_t, float64x2_t) -> float64x2_t = vdivq_f64;
-        lanes(vsubq_f64(
-            vaddq_f64(
-                divide(terms.left_numerator, terms.left_denominator),
-                divide(terms.right_numerator, terms.right_denominator),
-            ),
-            parent_gain,
-        ))
     }
 }
 
@@ -444,9 +463,22 @@ unsafe fn gain_terms<const L1: bool>(
 /// gain = Tα(G)² / (H + λ). With `a_x = Tα(G_x)²` and `b_x = H_x + λ`
 /// (`b_x >= 0`), `a_L/b_L + a_R/b_R > target` is equivalent to
 /// `a_L·b_R + a_R·b_L > target·b_L·b_R`, which needs no division.
+///
+/// That equivalence and the relative rounding bound behind `PREFILTER_SLACK`
+/// hold only while the products stay in normal range, so three guards keep the
+/// prefilter exact-rejecting and otherwise hand the lane to the sequential
+/// acceptance: the bound is saturated at [`BOUND_CEILING`] (an overflowed bound
+/// compares as `inf > inf`, which is false), it must stay at or above
+/// [`BOUND_FLOOR`] (subnormal products round with unbounded relative error),
+/// and the first denominator must stay at or above `min_denominator` (a
+/// subnormal `target · b_L` intermediate corrupts an otherwise normal bound).
+/// Lanes that fail a guard are reported as improving, so they merely pay for
+/// the exact check; a `b_L <= 0` lane can only produce a bound at or below
+/// zero, which fails the floor and reaches the exact check, which scores such
+/// children with the scalar scan's zero gain.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn improving_mask(terms: &PairTerms, target: f64) -> uint64x2_t {
+unsafe fn improving_mask(terms: &PairTerms, target: f64, min_denominator: f64) -> uint64x2_t {
     // SAFETY: the caller guarantees NEON support; all operations use registers.
     // The function pointer expresses that precondition on every supported
     // toolchain.
@@ -461,7 +493,15 @@ unsafe fn improving_mask(terms: &PairTerms, target: f64) -> uint64x2_t {
             multiply(vdupq_n_f64(target), terms.left_denominator),
             terms.right_denominator,
         );
-        vcgtq_f64(cross, bound)
+        // NaNs saturate to the ceiling as well: a NaN bound belongs to a lane
+        // the exact check rejects, and only a `cross` beyond the ceiling could
+        // pass the comparison against it.
+        let bound = vminnmq_f64(bound, vdupq_n_f64(BOUND_CEILING));
+        let trusted = vandq_u64(
+            vcgeq_f64(bound, vdupq_n_f64(BOUND_FLOOR)),
+            vcgeq_f64(terms.left_denominator, vdupq_n_f64(min_denominator)),
+        );
+        vbslq_u64(trusted, vcgtq_f64(cross, bound), vdupq_n_u64(u64::MAX))
     }
 }
 
@@ -500,8 +540,8 @@ unsafe fn scan_dense_splits<const L1: bool>(
         let total_hessians = vdupq_n_f64(total.hess);
         let alpha = vdupq_n_f64(reg.alpha);
         let lambda = vdupq_n_f64(reg.lambda);
-        let parent_gain_vector = vdupq_n_f64(parent_gain);
         let mut accumulated = vdupq_n_f64(0.0);
+        let target = prefilter_target(0.0, comparison_epsilon, parent_gain);
         let mut scan = SplitScan {
             total,
             reg,
@@ -509,7 +549,8 @@ unsafe fn scan_dense_splits<const L1: bool>(
             comparison_epsilon,
             best: None,
             best_loss: 0.0,
-            target: prefilter_target(0.0, comparison_epsilon, parent_gain),
+            target,
+            min_denominator: denominator_floor(target, reg.lambda),
         };
         let terms = |gradients, hessians| {
             gain_terms::<L1>(
@@ -522,7 +563,6 @@ unsafe fn scan_dense_splits<const L1: bool>(
             )
         };
         let mut index = 0;
-
         // Four candidates per iteration. Most bins do not improve the
         // incumbent, so they are rejected in vector registers without lane
         // extraction or division; survivors take the exact sequential path.
@@ -534,20 +574,12 @@ unsafe fn scan_dense_splits<const L1: bool>(
             let terms_0 = terms(gradients_0, hessians_0);
             let terms_1 = terms(gradients_1, hessians_1);
             let mask = vorrq_u64(
-                improving_mask(&terms_0, scan.target),
-                improving_mask(&terms_1, scan.target),
+                improving_mask(&terms_0, scan.target, scan.min_denominator),
+                improving_mask(&terms_1, scan.target, scan.min_denominator),
             );
             if vmaxvq_u32(vreinterpretq_u32_u64(mask)) != 0 {
-                scan.accept_pair(
-                    index,
-                    pair_lanes(gradients_0, hessians_0),
-                    pair_losses(&terms_0, parent_gain_vector),
-                );
-                scan.accept_pair(
-                    index + 2,
-                    pair_lanes(gradients_1, hessians_1),
-                    pair_losses(&terms_1, parent_gain_vector),
-                );
+                scan.accept_pair(index, pair_lanes(gradients_0, hessians_0));
+                scan.accept_pair(index + 2, pair_lanes(gradients_1, hessians_1));
             }
             index += 4;
         }
@@ -555,12 +587,13 @@ unsafe fn scan_dense_splits<const L1: bool>(
             // SAFETY: `index + 1 < candidate_count < histogram.len()`.
             let (gradients, hessians) = prefix_pair(&mut accumulated, bins, index);
             let terms = terms(gradients, hessians);
-            if vmaxvq_u32(vreinterpretq_u32_u64(improving_mask(&terms, scan.target))) != 0 {
-                scan.accept_pair(
-                    index,
-                    pair_lanes(gradients, hessians),
-                    pair_losses(&terms, parent_gain_vector),
-                );
+            if vmaxvq_u32(vreinterpretq_u32_u64(improving_mask(
+                &terms,
+                scan.target,
+                scan.min_denominator,
+            ))) != 0
+            {
+                scan.accept_pair(index, pair_lanes(gradients, hessians));
             }
             index += 2;
         }

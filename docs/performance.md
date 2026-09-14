@@ -18,34 +18,45 @@ measures the numerical and tree-building optimizations within sequoia-boost.
 ## XGBoost comparison
 
 Measured on **Apple M3 Max** against [XGBoost 3.4.1](https://pypi.org/project/xgboost/3.4.1/),
-the latest stable PyPI release checked on **2026-09-12 UTC**. Both engines use the
+the latest stable PyPI release checked on **2026-09-14 UTC**. Both engines use the
 same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
 256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
 preparation and training, and report the median of six fits after warmup.
 
 | Workload | Threads | sequoia-boost | XGBoost 3.4.1 |
 |---|---:|---:|---:|
-| Regression, 100k × 30 | 1 | 0.481 s | 1.066 s |
-| Regression, 100k × 30 | 4 | 0.197 s | 0.369 s |
-| Regression, 100k × 30 | 16 | 0.260 s | 0.366 s |
-| Regression, 50k × 128 | 1 | 1.137 s | 3.277 s |
-| Regression, 50k × 128 | 4 | 0.453 s | 1.011 s |
-| Regression, 50k × 128 | 16 | 0.426 s | 0.690 s |
-| Binary, 100k × 30 | 1 | 0.472 s | 1.048 s |
-| Binary, 100k × 30 | 4 | 0.195 s | 0.362 s |
-| Binary, 100k × 30 | 16 | 0.258 s | 0.358 s |
-| 4-class, 50k × 30 | 1 | 1.102 s | 2.523 s |
-| 4-class, 50k × 30 | 4 | 0.513 s | 0.974 s |
-| 4-class, 50k × 30 | 16 | 0.692 s | 1.205 s |
+| Regression, 100k × 30 | 1 | 0.458 s | 1.054 s |
+| Regression, 100k × 30 | 4 | 0.201 s | 0.366 s |
+| Regression, 100k × 30 | 16 | 0.264 s | 0.362 s |
+| Regression, 50k × 128 | 1 | 1.153 s | 3.200 s |
+| Regression, 50k × 128 | 4 | 0.452 s | 0.994 s |
+| Regression, 50k × 128 | 16 | 0.428 s | 0.669 s |
+| Binary, 100k × 30 | 1 | 0.459 s | 1.044 s |
+| Binary, 100k × 30 | 4 | 0.197 s | 0.366 s |
+| Binary, 100k × 30 | 16 | 0.256 s | 0.361 s |
+| 4-class, 50k × 30 | 1 | 1.094 s | 2.506 s |
+| 4-class, 50k × 30 | 4 | 0.523 s | 0.981 s |
+| 4-class, 50k × 30 | 16 | 0.746 s | 1.219 s |
 
 Sequoia has lower median fit time in all 12 configurations in this run.
-Single-thread speedups range from 2.22× on 30-feature regression and binary
-classification to 2.88× on wide regression; multiclass reaches 2.29×. At four
-threads, speedups range from 1.85× to 2.23×, and at sixteen threads from 1.39×
-to 1.74×. Held-out scores are identical to the previous run on every workload,
-so the differences reflect training speed, not fit quality. Treat small
-differences as near parity given
-the uncontrolled background activity on this workstation.
+Single-thread speedups range from 2.28× on binary classification to 2.77× on
+wide regression; 30-feature regression reaches 2.30× and multiclass 2.29×. At
+four threads, speedups range from 1.82× to 2.20×, and at sixteen threads from
+1.37× to 1.63×. Held-out scores are identical to the previous run on every
+workload, so the differences reflect training speed, not fit quality. Treat
+small differences as near parity given the uncontrolled background activity on
+this workstation.
+
+![sequoia-boost speedup over XGBoost 3.4.1 by workload and thread count](benchmarks/xgboost-speedup.svg)
+
+![Median fit time by workload and thread count, log scale](benchmarks/xgboost-threads.svg)
+
+The charts in this guide are rendered by
+[`benchmarks/charts.gp`](benchmarks/charts.gp) from the table values recorded
+in [`benchmarks/xgboost.dat`](benchmarks/xgboost.dat) and
+[`benchmarks/optimization.dat`](benchmarks/optimization.dat). Regenerate
+them with `gnuplot -c docs/benchmarks/charts.gp` after updating a data
+file. The data files also carry the measurement provenance for each chart.
 
 ### CPU scheduling
 
@@ -134,7 +145,7 @@ These measurements compare the optimized implementation with the scalar
 baseline, using the same benchmark source and compiler.
 
 Measured on **Apple M3 Max**, 16 physical cores,
-macOS 26.6.2, with **Rust 1.98.1 / LLVM 22.1.8**, on 2026-09-12 UTC.
+macOS 26.6.2, with **Rust 1.98.1 / LLVM 22.1.8**, on 2026-09-14 UTC.
 Both builds use `opt-level=3`, thin LTO, one codegen unit, and no `RUSTFLAGS`.
 `RAYON_NUM_THREADS` is fixed per comparison. Compilation and tests finish before
 timing begins; the benchmark executables run sequentially. Unrelated workstation
@@ -157,14 +168,16 @@ tree construction, and training-prediction updates.
 
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
-| Regression, 256 bins | 1 | 393.370 | 108.551 | 72.4% |
-| Regression, 256 bins | 4 | 380.874 | 53.336 | 86.0% |
-| Regression, L1 = 1 | 1 | 390.265 | 106.366 | 72.7% |
-| Regression, L1 = 1 | 4 | 394.533 | 53.662 | 86.4% |
-| Regression, 16 bins | 1 | 230.481 | 73.666 | 68.0% |
-| Regression, 16 bins | 4 | 227.532 | 38.321 | 83.2% |
-| Binary classification | 1 | 405.765 | 113.896 | 71.9% |
-| Binary classification | 4 | 390.376 | 55.889 | 85.7% |
+| Regression, 256 bins | 1 | 398.027 | 110.772 | 72.2% |
+| Regression, 256 bins | 4 | 381.738 | 54.300 | 85.8% |
+| Regression, L1 = 1 | 1 | 392.963 | 107.278 | 72.7% |
+| Regression, L1 = 1 | 4 | 379.340 | 53.641 | 85.9% |
+| Regression, 16 bins | 1 | 231.349 | 82.752 | 64.2% |
+| Regression, 16 bins | 4 | 220.740 | 43.935 | 80.1% |
+| Binary classification | 1 | 408.616 | 114.892 | 71.9% |
+| Binary classification | 4 | 396.398 | 57.560 | 85.5% |
+
+![Full-training time cut vs scalar baseline](benchmarks/training-optimization.svg)
 
 ### Single histogram tree
 
@@ -174,20 +187,20 @@ row partitioning, and split evaluation.
 
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
-| Depth 1 | 1 | 0.855 | 0.443 | 48.2% |
-| Depth 1 | 4 | 0.614 | 0.204 | 66.8% |
-| Depth 6 | 1 | 6.866 | 2.126 | 69.0% |
-| Depth 6 | 4 | 6.521 | 0.911 | 86.0% |
-| Depth 10 | 1 | 49.776 | 10.756 | 78.4% |
-| Depth 10 | 4 | 51.066 | 3.582 | 93.0% |
-| 128 features | 1 | 25.079 | 5.059 | 79.8% |
-| 128 features | 4 | 25.040 | 2.165 | 91.4% |
-| Missing values | 1 | 9.551 | 5.839 | 38.9% |
-| Missing values | 4 | 9.145 | 2.546 | 72.2% |
-| Monotone constraint | 1 | 9.248 | 4.142 | 55.2% |
-| Monotone constraint | 4 | 8.843 | 1.527 | 82.7% |
-| Loss-guide growth | 1 | 6.852 | 2.841 | 58.5% |
-| Loss-guide growth | 4 | 6.573 | 2.630 | 60.0% |
+| Depth 1 | 1 | 0.855 | 0.361 | 57.8% |
+| Depth 1 | 4 | 0.618 | 0.220 | 64.3% |
+| Depth 6 | 1 | 6.866 | 2.155 | 68.6% |
+| Depth 6 | 4 | 6.726 | 0.908 | 86.5% |
+| Depth 10 | 1 | 49.609 | 12.373 | 75.1% |
+| Depth 10 | 4 | 49.458 | 3.926 | 92.1% |
+| 128 features | 1 | 24.854 | 5.742 | 76.9% |
+| 128 features | 4 | 24.886 | 2.310 | 90.7% |
+| Missing values | 1 | 9.409 | 5.938 | 36.9% |
+| Missing values | 4 | 9.287 | 2.438 | 73.7% |
+| Monotone constraint | 1 | 9.193 | 4.096 | 55.4% |
+| Monotone constraint | 4 | 9.008 | 1.475 | 83.6% |
+| Loss-guide growth | 1 | 6.843 | 3.077 | 55.0% |
+| Loss-guide growth | 4 | 6.680 | 2.924 | 56.2% |
 
 Depth cases use 50,000 rows × 20 features. The wide case uses 10,000 rows × 128
 features at depth six. Missing, monotone, and loss-guide cases use the depth-six
@@ -195,6 +208,8 @@ dataset; missing values occupy 2 of every 11 feature entries, the first feature
 has an increasing constraint in the monotone case. All cases use 256 bins.
 Loss-guide growth uses a 64-leaf limit; depthwise growth stops at its configured
 depth.
+
+![Histogram tree-build time cut vs scalar baseline](benchmarks/tree-optimization.svg)
 
 ### Numerical kernels
 
@@ -204,36 +219,42 @@ Transforms include copying the input into the reusable output buffer. Metrics
 include final normalization. These single-thread measurements use prepared
 inputs, not tree training.
 
+![Objective gradient time cut vs scalar baseline](benchmarks/gradient-optimization.svg)
+
+![Prediction transform time cut vs scalar baseline](benchmarks/transform-optimization.svg)
+
+![Metric time cut vs scalar baseline](benchmarks/metric-optimization.svg)
+
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
-| Logistic gradient | 1 | 2.040 | 0.803 | 60.6% |
-| Logistic gradient, weighted | 1 | 2.044 | 0.815 | 60.1% |
-| Poisson gradient | 1 | 2.618 | 0.942 | 64.0% |
-| Gamma gradient | 1 | 1.380 | 0.583 | 57.8% |
-| Tweedie gradient | 1 | 2.653 | 1.061 | 60.0% |
-| Softmax gradient, 2 classes | 1 | 4.168 | 0.824 | 80.2% |
-| Softmax gradient, 3 classes | 1 | 5.928 | 0.815 | 86.3% |
-| Softmax gradient, 4 classes | 1 | 3.481 | 0.898 | 74.2% |
-| Softmax gradient, 8 classes | 1 | 2.684 | 1.304 | 51.4% |
-| Softmax gradient, 32 classes | 1 | 2.219 | 1.010 | 54.5% |
-| Softmax gradient, 128 classes | 1 | 2.193 | 0.946 | 56.8% |
-| Sigmoid transform | 1 | 1.449 | 0.575 | 60.3% |
-| Exponential transform | 1 | 1.258 | 0.474 | 62.3% |
-| Softmax transform, 2 classes | 1 | 2.326 | 0.565 | 75.7% |
-| Softmax transform, 3 classes | 1 | 2.370 | 0.544 | 77.1% |
-| Softmax transform, 4 classes | 1 | 2.024 | 0.584 | 71.1% |
-| Softmax transform, 8 classes | 1 | 1.887 | 0.717 | 62.0% |
-| Softmax transform, 32 classes | 1 | 1.862 | 0.583 | 68.7% |
-| Softmax transform, 128 classes | 1 | 1.925 | 0.593 | 69.2% |
-| RMSE, weighted | 1 | 0.770 | 0.274 | 64.4% |
-| MAE, weighted | 1 | 0.768 | 0.269 | 65.0% |
-| Binary error, weighted | 1 | 1.348 | 0.207 | 84.7% |
-| Log loss, weighted | 1 | 4.946 | 2.754 | 44.3% |
-| Poisson NLL, weighted | 1 | 2.604 | 1.560 | 40.1% |
-| Gamma NLL, weighted | 1 | 2.649 | 1.560 | 41.1% |
-| Tweedie NLL, weighted | 1 | 13.880 | 4.501 | 67.6% |
-| Multiclass log loss, 32 classes, weighted | 1 | 0.100 | 0.062 | 38.3% |
-| Multiclass error, 32 classes, weighted | 1 | 1.613 | 0.245 | 84.8% |
+| Logistic gradient | 1 | 2.041 | 0.809 | 60.4% |
+| Logistic gradient, weighted | 1 | 2.038 | 0.811 | 60.2% |
+| Poisson gradient | 1 | 2.608 | 0.932 | 64.2% |
+| Gamma gradient | 1 | 1.380 | 0.579 | 58.0% |
+| Tweedie gradient | 1 | 2.630 | 1.056 | 59.8% |
+| Softmax gradient, 2 classes | 1 | 4.210 | 0.833 | 80.2% |
+| Softmax gradient, 3 classes | 1 | 5.890 | 0.810 | 86.2% |
+| Softmax gradient, 4 classes | 1 | 3.574 | 0.901 | 74.8% |
+| Softmax gradient, 8 classes | 1 | 2.675 | 1.309 | 51.1% |
+| Softmax gradient, 32 classes | 1 | 2.176 | 1.012 | 53.5% |
+| Softmax gradient, 128 classes | 1 | 2.188 | 0.948 | 56.6% |
+| Sigmoid transform | 1 | 1.448 | 0.573 | 60.4% |
+| Exponential transform | 1 | 1.280 | 0.473 | 63.1% |
+| Softmax transform, 2 classes | 1 | 2.339 | 0.564 | 75.9% |
+| Softmax transform, 3 classes | 1 | 2.378 | 0.543 | 77.2% |
+| Softmax transform, 4 classes | 1 | 1.997 | 0.581 | 70.9% |
+| Softmax transform, 8 classes | 1 | 1.896 | 0.712 | 62.4% |
+| Softmax transform, 32 classes | 1 | 1.877 | 0.581 | 69.1% |
+| Softmax transform, 128 classes | 1 | 1.927 | 0.589 | 69.4% |
+| RMSE, weighted | 1 | 0.776 | 0.268 | 65.4% |
+| MAE, weighted | 1 | 0.768 | 0.268 | 65.1% |
+| Binary error, weighted | 1 | 1.338 | 0.204 | 84.8% |
+| Log loss, weighted | 1 | 4.930 | 2.738 | 44.5% |
+| Poisson NLL, weighted | 1 | 2.598 | 1.545 | 40.5% |
+| Gamma NLL, weighted | 1 | 2.633 | 1.575 | 40.2% |
+| Tweedie NLL, weighted | 1 | 13.797 | 4.521 | 67.2% |
+| Multiclass log loss, 32 classes, weighted | 1 | 0.102 | 0.062 | 39.5% |
+| Multiclass error, 32 classes, weighted | 1 | 1.616 | 0.244 | 84.9% |
 
 The [complete results](benchmarks/performance.json) include all 73
 single-thread cases and 11 four-thread cases, including unweighted metrics,
@@ -275,11 +296,16 @@ spread above 80. The exponential uses Estrin evaluation for gradients and
 small-class softmax, and Horner evaluation for wide in-place softmax. Metric
 logarithms and Tweedie exponentials use `f64` throughout.
 
-The histogram builder uses NEON to evaluate pairs of gains for dense numeric features without monotone constraints or a
-nonzero `max_delta_step`. Prefix statistics and accepted-candidate comparisons
-remain sequential, preserving split order, ties, and the gain epsilon. Bins
-that cannot improve the best gain are rejected before extracting scalar lanes.
-Missing-value and constrained split searches retain their scalar evaluation.
+The histogram builder uses NEON to prefilter dense numeric features without
+monotone constraints or a nonzero `max_delta_step`. Prefix statistics and
+accepted-candidate comparisons remain sequential, preserving split order, ties,
+and the gain epsilon. Bins that cannot improve the best gain are rejected in
+vector registers without lane extraction; the division-free bound is
+saturated before that comparison, and subnormal products or intermediates take
+the exact comparison, where the scalar `calc_gain` arithmetic decides
+surviving candidates. The x86-64 scan follows the same contract with an
+AVX2 prefilter. Missing-value and constrained split searches retain their
+scalar evaluation.
 
 Depthwise growth expands nodes and draws child feature samples in traversal
 order, then partitions rows, builds histograms, and evaluates the independent
@@ -380,6 +406,13 @@ suite on the current checkout:
 
 ```sh
 RAYON_NUM_THREADS=1 cargo bench --locked -p sequoia-boost --bench training
+```
+
+To regenerate the charts in this guide from the `.dat` files after updating
+the tables, run:
+
+```sh
+gnuplot -c docs/benchmarks/charts.gp
 ```
 
 For an exact source comparison, reconstruct both trees from the recorded

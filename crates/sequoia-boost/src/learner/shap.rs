@@ -65,6 +65,13 @@ fn inv(n: usize) -> f64 {
     }
 }
 
+/// `n as f64` for path positions. Going through `i64` lets the compiler emit a
+/// single signed conversion instead of the unsigned fix-up sequence; the value
+/// is identical for every `n` that fits.
+#[inline(always)]
+fn small_f64(n: usize) -> f64 {
+    n as i64 as f64
+}
 /// Grow the decision path `path[..len]` by one element (`path[len]`), updating
 /// every existing element's `pweight` to account for one extra split in the
 /// coalition ordering.
@@ -89,14 +96,14 @@ fn extend_path(
         // Cold edge: the new element takes no weight from its predecessors
         // (the `one_scaled` term is exactly zero).
         for i in (0..unique_depth).rev() {
-            path[i].pweight = zero_scaled * path[i].pweight * (unique_depth - i) as f64;
+            path[i].pweight = zero_scaled * path[i].pweight * small_f64(unique_depth - i);
         }
         return;
     }
     for i in (0..unique_depth).rev() {
         let pw_i = path[i].pweight;
-        path[i + 1].pweight += one_scaled * pw_i * (i + 1) as f64;
-        path[i].pweight = zero_scaled * pw_i * (unique_depth - i) as f64;
+        path[i + 1].pweight += one_scaled * pw_i * small_f64(i + 1);
+        path[i].pweight = zero_scaled * pw_i * small_f64(unique_depth - i);
     }
 }
 
@@ -107,11 +114,16 @@ fn unwind_path(path: &mut [PathElement], path_index: usize) {
     let unique_depth = path.len() - 1; // top index
     let one_fraction = path[path_index].one_fraction;
     let zero_fraction = path[path_index].zero_fraction;
-    let denom = (unique_depth + 1) as f64;
+    let denom = small_f64(unique_depth + 1);
     let inv_denom = inv(unique_depth + 1);
     if one_fraction != 0.0 {
         let mut next_one_portion = path[unique_depth].pweight;
-        let scale = denom / one_fraction;
+        // `x / 1.0 == x` exactly; every hot element carries the root's `1.0`.
+        let scale = if one_fraction == 1.0 {
+            denom
+        } else {
+            denom / one_fraction
+        };
         let decay = scale * (zero_fraction * inv_denom);
         for i in (0..unique_depth).rev() {
             let inv_i = inv(i + 1);
@@ -132,34 +144,75 @@ fn unwind_path(path: &mut [PathElement], path_index: usize) {
     }
 }
 
-/// The total permutation weight that element `path_index` would contribute if it
-/// were unwound, computed without mutating `path`.
-fn unwound_path_sum(path: &[PathElement], path_index: usize) -> f64 {
+/// Maximum number of hot leaf elements whose unwound sums are computed
+/// together in lockstep.
+const HOT_LANES: usize = 4;
+
+/// Add the leaf contributions of the hot (`one_fraction != 0`) path elements
+/// `hot[..n]` to `phi`, `n <= HOT_LANES`. The lane count is monomorphized so
+/// the recurrences live in registers and no lane is wasted.
+fn add_hot_contributions(
+    path: &[PathElement],
+    hot: &[usize; HOT_LANES],
+    n: usize,
+    leaf: f64,
+    condition_fraction: f64,
+    phi: &mut [f64],
+) {
+    match n {
+        1 => hot_lanes::<1>(path, hot, leaf, condition_fraction, phi),
+        2 => hot_lanes::<2>(path, hot, leaf, condition_fraction, phi),
+        3 => hot_lanes::<3>(path, hot, leaf, condition_fraction, phi),
+        _ => hot_lanes::<HOT_LANES>(path, hot, leaf, condition_fraction, phi),
+    }
+}
+
+/// Each element's weight is the total its unwinding would contribute,
+/// `Σ_i next_i * scale / (i + 1)` where
+/// `next_i = pw_i - next_{i+1} * scale / (i + 1) * zero / (D + 1) * (D - i)`.
+/// That is a serial recurrence, so the `N` lanes are evaluated in lockstep to
+/// overlap the chains. The coefficient of `next_{i+1}` is gathered off the
+/// dependency chain so each step is one multiply-subtract. `one_fraction` is
+/// `1.0` for every hot element the traversal produces (it only ever carries the
+/// root's `1.0` forward), so the division is skipped; the result is identical.
+fn hot_lanes<const N: usize>(
+    path: &[PathElement],
+    hot: &[usize; HOT_LANES],
+    leaf: f64,
+    condition_fraction: f64,
+    phi: &mut [f64],
+) {
     let unique_depth = path.len() - 1; // top index
-    let one_fraction = path[path_index].one_fraction;
-    let zero_fraction = path[path_index].zero_fraction;
-    let denom = (unique_depth + 1) as f64;
-    let mut total = 0.0;
-    if one_fraction != 0.0 {
-        // next_i = pw_i - next_{i+1} * scale/(i+1) * zero/(D+1) * (D-i): the
-        // coefficient of next_{i+1} is gathered off the dependency chain so
-        // each step of the recurrence is one multiply-subtract.
-        let mut next_one_portion = path[unique_depth].pweight;
-        let scale = denom / one_fraction;
-        let decay = scale * (zero_fraction * inv(unique_depth + 1));
-        for i in (0..unique_depth).rev() {
-            let inv_i = inv(i + 1);
-            total += next_one_portion * (scale * inv_i);
-            next_one_portion =
-                path[i].pweight - next_one_portion * (decay * inv_i * (unique_depth - i) as f64);
-        }
-    } else if zero_fraction != 0.0 {
-        let scale = denom / zero_fraction;
-        for i in (0..unique_depth).rev() {
-            total += path[i].pweight * scale * inv(unique_depth - i);
+    let denom = small_f64(unique_depth + 1);
+    let inv_denom = inv(unique_depth + 1);
+    let top = path[unique_depth].pweight;
+    let mut scale = [0.0f64; N];
+    let mut decay = [0.0f64; N];
+    let mut next = [top; N];
+    let mut total = [0.0f64; N];
+    for k in 0..N {
+        let el = &path[hot[k]];
+        scale[k] = if el.one_fraction == 1.0 {
+            denom
+        } else {
+            denom / el.one_fraction
+        };
+        decay[k] = scale[k] * (el.zero_fraction * inv_denom);
+    }
+    for i in (0..unique_depth).rev() {
+        let inv_i = inv(i + 1);
+        let remaining = small_f64(unique_depth - i);
+        let pw = path[i].pweight;
+        for k in 0..N {
+            total[k] += next[k] * (scale[k] * inv_i);
+            next[k] = pw - next[k] * (decay[k] * inv_i * remaining);
         }
     }
-    total
+    for k in 0..N {
+        let el = path[hot[k]];
+        phi[el.feature_index as usize] +=
+            total[k] * (el.one_fraction - el.zero_fraction) * leaf * condition_fraction;
+    }
 }
 
 /// Number of [`PathElement`]s a traversal of a tree of depth `depth` needs:
@@ -312,16 +365,23 @@ fn tree_shap_rec(
         // computed once per leaf and added for each of them (most elements: a
         // leaf shares hot edges with the instance's own path only along their
         // common prefix). Elements with both fractions zero contribute nothing.
+        // The hot elements' sums are serial recurrences, so they are evaluated
+        // `HOT_LANES` at a time to overlap the chains.
         let mut cold = None;
+        let mut hot = [0usize; HOT_LANES];
+        let mut n_hot = 0;
         for i in 1..=unique_depth {
             let el = path[i];
             if el.one_fraction != 0.0 {
-                let w = unwound_path_sum(path, i);
-                walk.phi[el.feature_index as usize] +=
-                    w * (el.one_fraction - el.zero_fraction) * leaf * condition_fraction;
+                hot[n_hot] = i;
+                n_hot += 1;
+                if n_hot == HOT_LANES {
+                    add_hot_contributions(path, &hot, n_hot, leaf, condition_fraction, walk.phi);
+                    n_hot = 0;
+                }
             } else if el.zero_fraction != 0.0 {
                 let c = *cold.get_or_insert_with(|| {
-                    let denom = (unique_depth + 1) as f64;
+                    let denom = small_f64(unique_depth + 1);
                     let mut sum = 0.0;
                     for j in (0..unique_depth).rev() {
                         sum += path[j].pweight * inv(unique_depth - j);
@@ -330,6 +390,9 @@ fn tree_shap_rec(
                 });
                 walk.phi[el.feature_index as usize] += c;
             }
+        }
+        if n_hot > 0 {
+            add_hot_contributions(path, &hot, n_hot, leaf, condition_fraction, walk.phi);
         }
         return;
     }
@@ -380,7 +443,10 @@ fn tree_shap_rec(
         cold_condition_fraction *= cold_zero;
     }
 
-    // Each child starts from its own copy of this path.
+    // The hot child forks a copy of this path into the next region. The cold
+    // child is this node's last use of the path, so it continues in place:
+    // its region is this one plus the next slot, and the hot subtree only
+    // wrote at or beyond that next slot.
     rest[..len].copy_from_slice(&path[..len]);
     tree_shap_rec(
         walk,
@@ -393,11 +459,10 @@ fn tree_shap_rec(
         split_i,
         hot_condition_fraction,
     );
-    rest[..len].copy_from_slice(&path[..len]);
     tree_shap_rec(
         walk,
         cold,
-        rest,
+        arena,
         level + 1,
         len,
         cold_zero * incoming_zero,
@@ -758,6 +823,159 @@ mod tests {
         );
     }
 
+    /// Textbook path-dependent TreeSHAP (Lundberg et al., Algorithm 2) with
+    /// cloned paths, independent of the arena implementation.
+    mod textbook {
+        use crate::tree::RegTree;
+
+        #[derive(Clone, Copy)]
+        pub struct El {
+            pub d: i64,
+            pub z: f64,
+            pub o: f64,
+            pub w: f64,
+        }
+
+        fn extend(m: &mut Vec<El>, pz: f64, po: f64, pi: i64) {
+            let l = m.len();
+            m.push(El {
+                d: pi,
+                z: pz,
+                o: po,
+                w: if l == 0 { 1.0 } else { 0.0 },
+            });
+            for i in (0..l).rev() {
+                m[i + 1].w += po * m[i].w * (i + 1) as f64 / (l + 1) as f64;
+                m[i].w = pz * m[i].w * (l - i) as f64 / (l + 1) as f64;
+            }
+        }
+
+        fn unwind(m: &mut Vec<El>, i: usize) {
+            let l = m.len() - 1;
+            let (o, z) = (m[i].o, m[i].z);
+            let mut n = m[l].w;
+            for j in (0..l).rev() {
+                if o != 0.0 {
+                    let t = m[j].w;
+                    m[j].w = n * (l + 1) as f64 / ((j + 1) as f64 * o);
+                    n = t - m[j].w * z * (l - j) as f64 / (l + 1) as f64;
+                } else {
+                    m[j].w = m[j].w * (l + 1) as f64 / (z * (l - j) as f64);
+                }
+            }
+            for j in i..l {
+                m[j].d = m[j + 1].d;
+                m[j].z = m[j + 1].z;
+                m[j].o = m[j + 1].o;
+            }
+            m.pop();
+        }
+
+        fn unwound_sum(m: &[El], i: usize) -> f64 {
+            let l = m.len() - 1;
+            let (o, z) = (m[i].o, m[i].z);
+            let mut n = m[l].w;
+            let mut total = 0.0;
+            for j in (0..l).rev() {
+                if o != 0.0 {
+                    let t = n * (l + 1) as f64 / ((j + 1) as f64 * o);
+                    total += t;
+                    n = m[j].w - t * z * (l - j) as f64 / (l + 1) as f64;
+                } else {
+                    total += m[j].w * (l + 1) as f64 / (z * (l - j) as f64);
+                }
+            }
+            total
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn recurse(
+            tree: &RegTree,
+            x: &[f32],
+            phi: &mut [f64],
+            node: usize,
+            mut m: Vec<El>,
+            pz: f64,
+            po: f64,
+            pi: i64,
+        ) {
+            extend(&mut m, pz, po, pi);
+            let n = tree.node(node);
+            if n.is_leaf() {
+                for i in 1..m.len() {
+                    let w = unwound_sum(&m, i);
+                    phi[m[i].d as usize] += w * (m[i].o - m[i].z) * n.leaf_value as f64;
+                }
+                return;
+            }
+            let v = x[n.split_feature as usize];
+            let go_left = if v.is_nan() {
+                n.default_left
+            } else {
+                v < n.split_cond
+            };
+            let (hot, cold) = if go_left {
+                (n.left as usize, n.right as usize)
+            } else {
+                (n.right as usize, n.left as usize)
+            };
+            let cover = n.sum_hess as f64;
+            let (mut iz, mut io) = (1.0, 1.0);
+            if let Some(k) = m.iter().position(|e| e.d == n.split_feature as i64) {
+                iz = m[k].z;
+                io = m[k].o;
+                unwind(&mut m, k);
+            }
+            let f = n.split_feature as i64;
+            let hz = tree.node(hot).sum_hess as f64 / cover;
+            let cz = tree.node(cold).sum_hess as f64 / cover;
+            recurse(tree, x, phi, hot, m.clone(), hz * iz, io, f);
+            recurse(tree, x, phi, cold, m, cz * iz, 0.0, f);
+        }
+    }
+
+    #[test]
+    fn contributions_match_textbook_tree_shap() {
+        let n = 96;
+        let nf = 5;
+        let mut x = vec![0f32; n * nf];
+        let mut y = vec![0f32; n];
+        for i in 0..n {
+            for j in 0..nf {
+                let v = ((i * 31 + j * 17 + 7) % 97) as f32 / 97.0;
+                x[i * nf + j] = if (i + j) % 11 == 0 { f32::NAN } else { v };
+            }
+            y[i] = 2.0 * x[i * nf].max(0.0) - 1.5 * x[i * nf + 1].max(0.0)
+                + x[i * nf + 2].max(0.0) * x[i * nf + 3].max(0.0);
+        }
+        let d = DMatrix::from_dense(&x, n, nf)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("reg:squarederror")
+            .max_depth(6)
+            .eta(0.3)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 12).unwrap();
+        let contribs = model.predict_contribs(&d).unwrap();
+        let width = nf + 1;
+        let mut max_err = 0f64;
+        for row in 0..n {
+            let inst = &x[row * nf..(row + 1) * nf];
+            let mut phi = vec![0f64; width];
+            phi[nf] = model.base_score() as f64;
+            for tree in model.trees() {
+                phi[nf] += super::node_mean_value(tree, 0);
+                textbook::recurse(tree, inst, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
+            }
+            for (slot, want) in phi.iter().enumerate() {
+                max_err = max_err.max((contribs[row * width + slot] as f64 - want).abs());
+            }
+        }
+        assert!(max_err < 1e-4, "max textbook TreeSHAP error {max_err}");
+    }
     #[test]
     fn additivity_multiclass() {
         let n = 90;

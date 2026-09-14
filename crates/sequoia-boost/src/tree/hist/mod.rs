@@ -54,6 +54,8 @@ pub struct CpuBackend;
 /// when a shallow node has only a few thousand rows.
 const ROWS_PER_TASK: usize = 4096;
 const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
+/// Bins per task when the partial histograms are summed.
+const REDUCE_BINS: usize = 2048;
 
 impl HistogramBackend for CpuBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
@@ -65,9 +67,54 @@ impl HistogramBackend for CpuBackend {
             return;
         }
 
-        // Each task builds a private histogram over a contiguous run of rows;
-        // the partials are then summed into `out` in task order, so the result
-        // is deterministic for a given worker count.
+        // A contiguous row range with a column-major copy is split by feature
+        // instead of by rows: each task streams its features' columns over
+        // every row straight into the feature's slice of `out`. Every bin has
+        // one writer that adds its rows in ascending order, so there are no
+        // partial histograms to allocate or reduce and the result is identical
+        // to the sequential sweep.
+        if let (Some(columns), Some(range)) = (ghist.column_bins(), contiguous_range(rows)) {
+            let n_rows = ghist.n_rows();
+            let cuts = ghist.cuts();
+            let mut slices = Vec::with_capacity(ghist.n_cols());
+            let mut rest = out;
+            let mut next = 0;
+            for f in 0..ghist.n_cols() {
+                let (fs, fe) = cuts.feature_bins(f);
+                assert_eq!(
+                    fs, next,
+                    "feature bin ranges must be contiguous and ordered"
+                );
+                let (head, tail) = rest.split_at_mut(fe - fs);
+                slices.push((fs, head));
+                rest = tail;
+                next = fe;
+            }
+            assert!(
+                rest.is_empty(),
+                "feature bin ranges must cover the histogram"
+            );
+            slices
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(f, (fs, slice))| {
+                    slice.iter_mut().for_each(|s| *s = GradStats::default());
+                    match columns {
+                        Bins::U16(c) => {
+                            accumulate_column(&c[f * n_rows..][..n_rows], fs, &range, gpair, slice)
+                        }
+                        Bins::U32(c) => {
+                            accumulate_column(&c[f * n_rows..][..n_rows], fs, &range, gpair, slice)
+                        }
+                    }
+                });
+            return;
+        }
+
+        // Each task builds a private histogram over a contiguous run of rows.
+        // The partials are then summed into `out` in task order, so the result
+        // is deterministic for a given worker count; the reduction is split by
+        // bin range, which keeps that per-bin order while using every worker.
         let tasks = threads.min(rows.len() / ROWS_PER_TASK);
         let grain = rows.len().div_ceil(tasks);
         let partials: Vec<Histogram> = rows
@@ -78,13 +125,18 @@ impl HistogramBackend for CpuBackend {
                 local
             })
             .collect();
-        let mut partials = partials.into_iter();
-        out.copy_from_slice(&partials.next().expect("at least one row chunk"));
-        for partial in partials {
-            for (o, p) in out.iter_mut().zip(&partial) {
-                o.add(*p);
-            }
-        }
+        out.par_chunks_mut(REDUCE_BINS)
+            .enumerate()
+            .for_each(|(i, out)| {
+                let start = i * REDUCE_BINS;
+                let end = start + out.len();
+                out.copy_from_slice(&partials[0][start..end]);
+                for partial in &partials[1..] {
+                    for (o, p) in out.iter_mut().zip(&partial[start..end]) {
+                        o.add(*p);
+                    }
+                }
+            });
     }
 }
 
@@ -155,6 +207,21 @@ fn accumulate_bins<B: BinIndex>(
         }
     };
 
+    // A contiguous row range (the root, or a root chunk, without row
+    // sampling) sweeps the column-major copy one feature at a time: the bins
+    // stream sequentially and each feature's histogram slice stays in L1.
+    // Every bin still receives its rows in ascending order, so the sums are
+    // identical to the row sweep.
+    if let Some(columns) = ghist.column_bins() {
+        if let Some(range) = contiguous_range(rows) {
+            let n_rows = ghist.n_rows();
+            match columns {
+                Bins::U16(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
+                Bins::U32(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
+            }
+            return;
+        }
+    }
     if let Some(stride) = ghist.dense_stride() {
         accumulate_dense(ghist, bins, stride, rows, gpair, out, add_row, prefetch_row);
     } else {
@@ -172,6 +239,61 @@ fn accumulate_bins<B: BinIndex>(
             let ri = r as usize;
             add_row(&bins[rp[ri]..rp[ri + 1]], gpair[ri], out);
         }
+    }
+}
+
+/// `Some(first..end)` when `rows` is exactly the ascending run
+/// `first, first + 1, ..., end - 1` (checked element by element, so unsorted
+/// or repeated indices never take the column path).
+#[inline]
+fn contiguous_range(rows: &[u32]) -> Option<std::ops::Range<usize>> {
+    let first = *rows.first()? as usize;
+    let end = first.checked_add(rows.len())?;
+    let contiguous = rows
+        .iter()
+        .enumerate()
+        .all(|(i, &row)| row as usize == first + i);
+    contiguous.then_some(first..end)
+}
+
+/// Column-wise accumulation of the rows in `range` over every feature.
+/// `columns` is the column-major bin copy (`n_rows` entries per feature).
+#[inline(always)]
+fn accumulate_columns<B: BinIndex>(
+    columns: &[B],
+    n_rows: usize,
+    range: std::ops::Range<usize>,
+    gpair: &[GradPair],
+    out: &mut [GradStats],
+) {
+    let gpair = &gpair[range.clone()];
+    for column in columns.chunks_exact(n_rows) {
+        for (&bin, gp) in column[range.clone()].iter().zip(gpair) {
+            let g = GradStats::new(gp.grad as f64, gp.hess as f64);
+            // SAFETY: `bin < ghist.total_bins() == out.len()` by the index
+            // invariant and the caller's assertion.
+            unsafe { out.get_unchecked_mut(bin.index()) }.add(g);
+        }
+    }
+}
+
+/// Column-wise accumulation of the rows in `range` for one feature whose
+/// global bins start at `first_bin`, into that feature's histogram `slice`.
+/// Bins in a column are global indices, so the slice is indexed relative to
+/// `first_bin`; the subtraction is unchecked — the binned-index invariant
+/// guarantees every bin of this feature's column is at least `first_bin`, and
+/// the slice index bounds check catches any violation.
+#[inline(always)]
+fn accumulate_column<B: BinIndex>(
+    column: &[B],
+    first_bin: usize,
+    range: &std::ops::Range<usize>,
+    gpair: &[GradPair],
+    slice: &mut [GradStats],
+) {
+    for (&bin, gp) in column[range.clone()].iter().zip(&gpair[range.clone()]) {
+        let g = GradStats::new(gp.grad as f64, gp.hess as f64);
+        slice[bin.index() - first_bin].add(g);
     }
 }
 
@@ -328,6 +450,72 @@ mod tests {
                 b.grad
             );
             assert!((a.hess - b.hess).abs() < 1e-2);
+        }
+    }
+
+    /// Row-major reference independent of `accumulate`: every bin receives
+    /// its rows in ascending order, which is the order both the row sweep and
+    /// the column sweep must reproduce bit for bit.
+    fn row_order_reference(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Histogram {
+        let stride = ghist.dense_stride().expect("dense index");
+        let mut h = zeroed(ghist.total_bins());
+        for &r in rows {
+            let r = r as usize;
+            let g = GradStats::new(gpair[r].grad as f64, gpair[r].hess as f64);
+            for f in 0..stride {
+                let bin = match ghist.bins() {
+                    Bins::U16(b) => b[r * stride + f] as usize,
+                    Bins::U32(b) => b[r * stride + f] as usize,
+                };
+                h[bin].add(g);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn column_and_row_sweeps_match_reference_bit_for_bit() {
+        let (n, f) = (3 * PARALLEL_THRESHOLD + 129, 7);
+        let x: Vec<f32> = (0..n * f)
+            .map(|i| ((i * 2654435761usize) % 1009) as f32 / 7.0)
+            .collect();
+        let data = DMatrix::from_dense(&x, n, f).unwrap();
+        let cuts = HistCuts::from_dmatrix(&data, 64);
+        let ghist = GHistIndex::from_dmatrix(&data, cuts);
+        assert!(
+            ghist.column_bins().is_some(),
+            "dense index keeps a column copy"
+        );
+        let gpair: Vec<GradPair> = (0..n)
+            .map(|i| {
+                GradPair::new(
+                    ((i * 7919) % 1237) as f32 / 331.0 - 1.9,
+                    0.25 + (i % 5) as f32,
+                )
+            })
+            .collect();
+        let bits = |h: &Histogram| -> Vec<(u64, u64)> {
+            h.iter()
+                .map(|s| (s.grad.to_bits(), s.hess.to_bits()))
+                .collect()
+        };
+        let all: Vec<u32> = (0..n as u32).collect();
+        let subset: Vec<u32> = (0..n as u32).filter(|r| r % 3 != 1).collect();
+        let offset: Vec<u32> = (1000..(1000 + PARALLEL_THRESHOLD) as u32).collect();
+        assert!(contiguous_range(&all).is_some() && contiguous_range(&offset).is_some());
+        assert!(contiguous_range(&subset).is_none());
+        assert!(contiguous_range(&[2, 0, 1]).is_none() && contiguous_range(&[5, 5]).is_none());
+        for rows in [&all, &subset, &offset] {
+            let expect = bits(&row_order_reference(&ghist, rows, &gpair));
+            for threads in [1, 4] {
+                let mut out = zeroed(ghist.total_bins());
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| CpuBackend.build(&ghist, rows, &gpair, &mut out));
+                assert_eq!(bits(&out), expect, "rows={} threads={threads}", rows.len());
+            }
         }
     }
 }

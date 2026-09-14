@@ -5,7 +5,7 @@ use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::Result;
 use crate::objective::create_objective;
-use crate::tree::compact::{CompactForest, LANES};
+use crate::tree::compact::{key, CompactForest, FEATURE_LANES, LANES};
 use crate::tree::RegTree;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -674,14 +674,14 @@ pub(super) enum RowBlock<'a> {
         data: &'a [f32],
         n_cols: usize,
         start: usize,
-        lanes: Vec<f32>,
+        lanes: Vec<u32>,
     },
     Scratch {
         source: &'a DMatrix,
         n_cols: usize,
         /// Row-major tail rows (those past the last full [`LANES`] group).
         scratch: Vec<f32>,
-        lanes: Vec<f32>,
+        lanes: Vec<u32>,
         /// Block row index of the first tail row.
         tail_start: usize,
     },
@@ -759,13 +759,17 @@ impl<'a> RowBlock<'a> {
                 let groups = rows / LANES;
                 *tail_start = groups * LANES;
                 lanes.clear();
-                lanes.resize(groups * LANES * n_cols, f32::NAN);
+                lanes.resize(groups * FEATURE_LANES * n_cols, key(f32::NAN));
                 scratch.clear();
                 scratch.resize((rows - groups * LANES) * n_cols, f32::NAN);
-                // Destination of feature `f` of block row `r`.
+                // Destination of feature `f` of block row `r`: a keyed lane
+                // slot (its negated key follows `LANES` later) or a tail slot.
                 let slot = |r: usize, f: usize| -> (bool, usize) {
                     if r < groups * LANES {
-                        (true, (r / LANES) * LANES * n_cols + f * LANES + r % LANES)
+                        (
+                            true,
+                            (r / LANES) * FEATURE_LANES * n_cols + f * FEATURE_LANES + r % LANES,
+                        )
                     } else {
                         (false, (r - groups * LANES) * n_cols + f)
                     }
@@ -776,7 +780,10 @@ impl<'a> RowBlock<'a> {
                         for (f, &v) in src.iter().enumerate() {
                             let v = if v == missing { f32::NAN } else { v };
                             match slot(r, f) {
-                                (true, i) => lanes[i] = v,
+                                (true, i) => {
+                                    lanes[i] = key(v);
+                                    lanes[i + LANES] = key(-v);
+                                }
                                 (false, i) => scratch[i] = v,
                             }
                         }
@@ -796,7 +803,10 @@ impl<'a> RowBlock<'a> {
                                 v
                             };
                             match slot(r, indices[k] as usize) {
-                                (true, i) => lanes[i] = v,
+                                (true, i) => {
+                                    lanes[i] = key(v);
+                                    lanes[i + LANES] = key(-v);
+                                }
                                 (false, i) => scratch[i] = v,
                             }
                         }
@@ -807,17 +817,19 @@ impl<'a> RowBlock<'a> {
     }
 
     /// Transpose the full [`LANES`]-row groups of the row-major `rows` into
-    /// `lanes` as `[group][feature][lane]`, so a lane's feature value sits at a
-    /// fixed immediate offset from the group's feature base.
-    fn fill_lanes(lanes: &mut Vec<f32>, rows: &[f32], n_cols: usize) {
+    /// `lanes` as `[group][feature][lane]` keys of `v` and of `-v`
+    /// ([`FEATURE_LANES`] per feature), so a lane's key sits at a fixed
+    /// immediate offset from the node's slot.
+    fn fill_lanes(lanes: &mut Vec<u32>, rows: &[f32], n_cols: usize) {
         let groups = rows.len() / n_cols / LANES;
         lanes.clear();
-        lanes.resize(groups * LANES * n_cols, 0.0);
-        for (g, dst) in lanes.chunks_exact_mut(LANES * n_cols).enumerate() {
+        lanes.resize(groups * FEATURE_LANES * n_cols, 0);
+        for (g, dst) in lanes.chunks_exact_mut(FEATURE_LANES * n_cols).enumerate() {
             let src = &rows[g * LANES * n_cols..(g + 1) * LANES * n_cols];
             for (j, row) in src.chunks_exact(n_cols).enumerate() {
                 for (f, &v) in row.iter().enumerate() {
-                    dst[f * LANES + j] = v;
+                    dst[f * FEATURE_LANES + j] = key(v);
+                    dst[f * FEATURE_LANES + LANES + j] = key(-v);
                 }
             }
         }
@@ -908,7 +920,7 @@ impl<'a> RowBlock<'a> {
     /// lane-major layout plus the remaining rows row-major (see
     /// [`CompactForest::accumulate`]), or `None` for wide sparse blocks.
     #[inline]
-    fn lane_block(&self, rows: usize) -> Option<(&[f32], &[f32], usize)> {
+    fn lane_block(&self, rows: usize) -> Option<(&[u32], &[f32], usize)> {
         let tail_start = rows / LANES * LANES;
         match self {
             RowBlock::View {

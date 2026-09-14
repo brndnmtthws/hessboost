@@ -12,8 +12,21 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   transforms, metric reductions, and dense numeric histogram split evaluation.
   Scalar fallbacks handle other CPUs, short inputs, and values outside the
   approximation ranges.
+- Runtime-dispatched x86-64 kernels: an AVX2+FMA dense split-gain scan whose
+  division-free prefilter hands surviving candidates to the exact scalar test
+  (split choices are bit-identical), AVX2 exponential, sigmoid, logistic
+  gradient, and short softmax (2 and 4 classes) kernels, and an SSE2 16-cut
+  search for quantile binning. On x86-64 the histogram bin sums keep the scalar
+  summation order.
 - Kernel and tree-building benchmarks with reproducible comparisons and
   [documented results](docs/performance.md).
+
+- `autoresearch.sh`: the canonical benchmark entrypoint. It builds the
+  deterministic training and inference workload in
+  `examples/autoresearch_bench.rs` (dense, wide, binary, multiclass, and
+  sparse/missing training; batch prediction; TreeSHAP), runs the test suite
+  as a correctness guard, and reports one `METRIC` line per workload across
+  thread counts.
 
 ### Changed
 
@@ -31,6 +44,20 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 - Speed up TreeSHAP contributions and interactions 8× with an arena-backed
   decision path, precomputed cover fractions, hoisted divisions, a shared
   unwound sum for off-path elements, and row-parallel evaluation.
+- Compare prediction splits on monotone `u32` keys (NaN maps to the missing
+  direction, mirrored nodes read a precomputed negated key) loaded together
+  with the node's feature slot in one 64-bit load; batch prediction is
+  25–35% faster with identical results.
+- Build the two children's split evaluations concurrently on large nodes and
+  reduce partial histograms in parallel by bin range, keeping the per-bin
+  addition order. Root histograms over contiguous row ranges are built
+  column-wise with one writer per feature; sibling partitions are written into
+  spare capacity instead of zero-filled buffers.
+- Compute built-in row-independent gradients (squared error, logistic, softmax)
+  over fixed row chunks in parallel, bit-identical to the whole-batch result.
+- Evaluate TreeSHAP hot path elements in monomorphized lanes, skip the unit
+  `one_fraction` division, and reuse the parent's path region for the cold
+  child, for a further ~5% reduction with per-element results unchanged.
 
 ## [0.2.0] - 2026-08-16
 

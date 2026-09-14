@@ -103,9 +103,11 @@ Runnable, self-contained examples live in
 - **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
   **XGBoost-format JSON model import/export** for numeric `gbtree` ensembles,
   k-fold cross-validation,
-  multi-core histogram construction, and runtime-detected **AArch64 NEON** for
-  objective and metric kernels, prediction transforms, multiclass operations,
-  and histogram split evaluation.
+  multi-core histogram construction, and runtime-detected SIMD kernels:
+  **AArch64 NEON** for objective and metric kernels, prediction transforms,
+  multiclass operations, and histogram split evaluation; **x86-64 AVX2/FMA**
+  for objective gradients, prediction transforms, and histogram split
+  evaluation.
 
 **In progress / planned**
 
@@ -117,10 +119,13 @@ Runnable, self-contained examples live in
 ## Performance
 
 AArch64 builds use runtime-detected NEON kernels for objective gradients,
-probability transforms, metric reductions, and dense numeric split evaluation.
-Scalar fallbacks cover short inputs and values outside the approximation
-ranges. Histogram training parallelizes data preparation and independent nodes,
-scales histogram tasks to node size, and reuses training-row partitions when
+probability transforms, metric reductions, and dense numeric split evaluation;
+x86-64 builds use AVX2+FMA for dense split evaluation, exponential/sigmoid
+transforms, logistic and short-softmax gradients, and SSE2 for quantile bin
+search. Scalar fallbacks cover other CPUs, short inputs, and values outside the
+approximation ranges. Histogram training parallelizes data preparation and
+independent nodes, scales histogram tasks to node size, and reuses training-row
+partitions when
 that reduces prediction work. Leaves at `max_depth` skip histograms and split
 searches.
 

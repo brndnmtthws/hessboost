@@ -15,8 +15,14 @@
 //!   is false for missing values (`NaN`): a split whose missing values go left
 //!   stores `cond' = next_below(cond)` (so `v > cond'` is `v >= cond`), and a
 //!   split whose missing values go right stores the children mirrored with
-//!   `cond' = -cond` and a sign mask that negates `v` (`-v > -cond` is
-//!   `v < cond`), so a step is load, XOR, compare, add, with no select.
+//!   `cond' = -cond` and reads the negated feature value (`-v > -cond` is
+//!   `v < cond`).
+//! - values and thresholds are compared as monotone unsigned integer
+//!   [`key`]s, which keeps the whole step in integer registers: load, load,
+//!   compare, add. A missing value's key is `0`, below every real key, so it
+//!   never compares greater. Batch rows are stored as keys of `v` and of `-v`
+//!   side by side ([`FEATURE_LANES`] per feature), and a mirrored node simply
+//!   addresses the negated half, so no per-step sign flip is needed.
 //! - leaves store `cond' = +inf` and point at themselves, so a walk can run a
 //!   fixed number of steps (the tree depth) without testing for termination.
 //!   Several rows (or, for a single row, several trees) are walked in lockstep
@@ -29,20 +35,45 @@ use crate::tree::RegTree;
 
 /// Rows (or trees) walked in lockstep by the fixed-depth kernel.
 pub(crate) const LANES: usize = 16;
+/// Key slots per feature in a lane group: the [`LANES`] keys of `v` followed
+/// by the [`LANES`] keys of `-v`.
+pub(crate) const FEATURE_LANES: usize = 2 * LANES;
 
 /// Deeper trees than this fall back to the early-exit walk: the fixed-depth
 /// kernel would spend most steps parked on already-reached leaves.
 const MAX_FIXED_DEPTH: u32 = 16;
 
-/// `cond` bit pattern (`+inf`) marking a leaf: nothing compares greater, so a
-/// leaf always selects `left`, which points at itself.
-const LEAF_COND: u32 = f32::INFINITY.to_bits();
-/// `aux` for a numeric node whose missing values go right: flips the sign of
-/// the feature value so `v < cond` becomes `-v > -cond`.
-const NEGATE: u32 = 1 << 31;
-/// `aux` bit marking a set-membership split. `cond` holds `cat_begin` and
-/// `aux >> CAT_END_SHIFT` holds `cat_end`. Numeric `aux` values are `0` or
-/// [`NEGATE`], so this bit distinguishes them.
+const SIGN: u32 = 1 << 31;
+
+/// Monotone unsigned key of an `f32`: `key(a) > key(b)` iff `a > b` for
+/// non-`NaN` inputs (`-0.0` and `+0.0` share a key), and every `NaN` maps to
+/// `0`, strictly below `key(-inf)`, so a missing value never compares greater
+/// than a threshold.
+#[inline(always)]
+pub(crate) fn key(v: f32) -> u32 {
+    if v.is_nan() {
+        return 0;
+    }
+    // `-0.0 + 0.0` is `+0.0`; every other value is unchanged.
+    let bits = (v + 0.0).to_bits();
+    // Negative: complement all bits (reverses their order below zero).
+    // Non-negative: set the sign bit (places them above every negative).
+    bits ^ ((((bits as i32) >> 31) as u32) | SIGN)
+}
+
+/// Inverse of [`key`] up to the `NaN` payload and the sign of zero.
+#[inline(always)]
+fn unkey(key: u32) -> f32 {
+    f32::from_bits(if key & SIGN != 0 { key ^ SIGN } else { !key })
+}
+
+/// `key` of a leaf (`+inf`): no real key is greater, so a leaf always selects
+/// `left`, which points at itself.
+const LEAF_KEY: u32 = 0xFF80_0000;
+const _: () = assert!(LEAF_KEY == f32::INFINITY.to_bits() | SIGN);
+/// `aux` bit marking a set-membership split. `key` holds `cat_begin` and
+/// `aux >> CAT_END_SHIFT` holds `cat_end`. Numeric `aux` is `0`, so this bit
+/// distinguishes them.
 const CATEGORICAL: u32 = 1;
 /// `aux` bit (categorical nodes): missing values go left.
 const CAT_DEFAULT_LEFT: u32 = 2;
@@ -51,18 +82,41 @@ const CAT_END_SHIFT: u32 = 2;
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct CNode {
-    /// Split feature (kept unmasked: the row load depends on it).
-    feat: u32,
-    /// Numeric threshold in the "go right when greater" form (`+inf` for a
-    /// leaf). For categorical nodes the bit pattern holds `cat_begin`.
-    cond: f32,
+    /// Key slot of the split feature within a lane group:
+    /// `feature * FEATURE_LANES`, plus `LANES` for a mirrored numeric node
+    /// that reads the negated value. Kept unmasked: the row load depends on it.
+    slot: u32,
+    /// [`key`] of the numeric threshold in the "go right when greater" form
+    /// ([`LEAF_KEY`] for a leaf). For categorical nodes it holds `cat_begin`.
+    key: u32,
     /// Arena index of the child selected when the compare is false. The other
     /// child is `left + 1`. A leaf points at itself.
     left: u32,
-    /// Numeric node: sign mask XORed into the feature value (`0` or
-    /// [`NEGATE`]). Leaf: the leaf value's bits. Categorical: [`CATEGORICAL`],
-    /// [`CAT_DEFAULT_LEFT`], and the set end.
+    /// Numeric node: `0`. Leaf: the leaf value's bits. Categorical:
+    /// [`CATEGORICAL`], [`CAT_DEFAULT_LEFT`], and the set end.
     aux: u32,
+}
+
+// `slot_key` reads `slot` and `key` as one little-endian `u64` on x86-64.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    std::mem::size_of::<CNode>() == 16
+        && std::mem::offset_of!(CNode, slot) == 0
+        && std::mem::offset_of!(CNode, key) == 4
+);
+
+impl CNode {
+    #[inline(always)]
+    fn feature(&self) -> usize {
+        self.slot as usize / FEATURE_LANES
+    }
+
+    /// Sign mask a raw value is XORed with before keying: `SIGN` for a
+    /// mirrored numeric node, `0` otherwise.
+    #[inline(always)]
+    fn negate_mask(&self) -> u32 {
+        (self.slot & LANES as u32) << (31 - LANES.trailing_zeros())
+    }
 }
 
 /// Largest finite value strictly below `c`, so that `v > next_below(c)` is
@@ -175,8 +229,8 @@ impl CompactForest {
             depth = depth.max(depth_of[old as usize]);
             let node = if n.is_leaf() {
                 CNode {
-                    feat: 0,
-                    cond: f32::from_bits(LEAF_COND),
+                    slot: 0,
+                    key: LEAF_KEY,
                     left: id,
                     aux: n.leaf_value.to_bits(),
                 }
@@ -185,7 +239,7 @@ impl CompactForest {
                 max_feature = max_feature.max(n.split_feature);
                 let (begin, end) = (cat_base + n.cat_begin, cat_base + n.cat_end);
                 assert!(
-                    begin != LEAF_COND && end < (1 << (32 - CAT_END_SHIFT)),
+                    end < (1 << (32 - CAT_END_SHIFT)),
                     "categorical set range does not fit the compact encoding"
                 );
                 let mut aux = CATEGORICAL | (end << CAT_END_SHIFT);
@@ -193,8 +247,8 @@ impl CompactForest {
                     aux |= CAT_DEFAULT_LEFT;
                 }
                 CNode {
-                    feat: n.split_feature,
-                    cond: f32::from_bits(begin),
+                    slot: n.split_feature * FEATURE_LANES as u32,
+                    key: begin,
                     left: new_id[n.left as usize],
                     aux,
                 }
@@ -202,20 +256,20 @@ impl CompactForest {
                 // go right (to `right`) iff v >= cond  <=>  v > next_below(cond)
                 max_feature = max_feature.max(n.split_feature);
                 CNode {
-                    feat: n.split_feature,
-                    cond: next_below(n.split_cond),
+                    slot: n.split_feature * FEATURE_LANES as u32,
+                    key: key(next_below(n.split_cond)),
                     left: new_id[n.left as usize],
                     aux: 0,
                 }
             } else {
                 // children mirrored: go to `left` (second) iff v < cond
-                //   <=>  -v > -cond
+                //   <=>  -v > -cond, read from the negated key half
                 max_feature = max_feature.max(n.split_feature);
                 CNode {
-                    feat: n.split_feature,
-                    cond: -n.split_cond,
+                    slot: n.split_feature * FEATURE_LANES as u32 + LANES as u32,
+                    key: key(-n.split_cond),
                     left: new_id[n.right as usize],
-                    aux: NEGATE,
+                    aux: 0,
                 }
             };
             self.nodes.push(node);
@@ -241,21 +295,24 @@ impl CompactForest {
         self.orig_id[id as usize]
     }
 
+    /// Leaves point at themselves; children are laid out after their parent,
+    /// so no internal node does. (A leaf's key is also [`LEAF_KEY`], but an
+    /// internal `+inf` threshold shares that key, so it is not the test.)
     #[inline]
-    fn is_leaf(node: &CNode) -> bool {
-        node.cond.to_bits() == LEAF_COND
+    fn is_leaf(node: &CNode, nid: u32) -> bool {
+        node.left == nid
     }
 
     /// Whether `v` (non-missing) belongs to the categorical node's left set.
     #[inline]
     fn in_left_set(&self, node: &CNode, v: f32) -> bool {
-        let begin = node.cond.to_bits() as usize;
+        let begin = node.key as usize;
         let end = (node.aux >> CAT_END_SHIFT) as usize;
         let c = v as u32;
         self.categories[begin..end].contains(&c)
     }
 
-    /// Child of internal `node` selected by value `v` (`NaN` = missing).
+    /// Child of internal `node` selected by raw value `v` (`NaN` = missing).
     /// Handles numeric and categorical splits.
     #[inline]
     fn next(&self, node: &CNode, v: f32) -> u32 {
@@ -267,18 +324,38 @@ impl CompactForest {
             };
             node.left + u32::from(!go_left)
         } else {
-            Self::next_numeric(node, v) as u32
+            let v = f32::from_bits(v.to_bits() ^ node.negate_mask());
+            Self::next_numeric(node, key(v)) as u32
         }
     }
 
-    /// [`Self::next`] for a numeric node: one ordered compare, no select (see
-    /// the module docs for the encoding). Leaves yield themselves. The result
-    /// is `usize`: with `u32` lane state LLVM emits a ~3x slower loop on
-    /// aarch64.
+    /// [`Self::next`] for a numeric node given the key of the (already
+    /// sign-adjusted) feature value: one unsigned compare, no select (see the
+    /// module docs for the encoding). Leaves yield themselves. The result is
+    /// `usize`: with `u32` lane state LLVM emits a ~3x slower loop on aarch64.
     #[inline(always)]
-    fn next_numeric(node: &CNode, v: f32) -> usize {
-        let v = f32::from_bits(v.to_bits() ^ node.aux);
-        node.left as usize + usize::from(v > node.cond)
+    fn next_numeric(node: &CNode, key: u32) -> usize {
+        node.left as usize + usize::from(key > node.key)
+    }
+
+    /// `(slot, key)` of a node. On x86-64 the lockstep kernel is bound by
+    /// load-port throughput, so both fields are fetched with one 64-bit load
+    /// (a load per lane and level saved); other architectures, which were
+    /// tuned with plain field loads, keep them.
+    #[inline(always)]
+    fn slot_key(node: &CNode) -> (usize, u32) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: `CNode` is `repr(C)` with `slot` then `key` as its first
+            // eight bytes (asserted above), x86-64 is little-endian, and an
+            // unaligned read through a valid reference is sound.
+            let packed = unsafe { (node as *const CNode).cast::<u64>().read_unaligned() };
+            (packed as u32 as usize, (packed >> 32) as u32)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            (node.slot as usize, node.key)
+        }
     }
 
     /// Early-exit walk of a single row through tree `t`.
@@ -287,10 +364,10 @@ impl CompactForest {
         let mut nid = self.trees[t].root;
         loop {
             let node = &self.nodes[nid as usize];
-            if Self::is_leaf(node) {
+            if Self::is_leaf(node, nid) {
                 return nid;
             }
-            nid = self.next(node, row[node.feat as usize]);
+            nid = self.next(node, row[node.feature()]);
         }
     }
 
@@ -300,46 +377,52 @@ impl CompactForest {
         let mut nid = self.trees[t].root;
         loop {
             let node = &self.nodes[nid as usize];
-            if Self::is_leaf(node) {
+            if Self::is_leaf(node, nid) {
                 return nid;
             }
-            let v = get(node.feat).unwrap_or(f32::NAN);
+            let v = get(node.feature() as u32).unwrap_or(f32::NAN);
             nid = self.next(node, v);
         }
     }
 
-    /// Early-exit walk of one row stored with stride `stride` (`row[f * stride]`
-    /// is feature `f`) through tree `t`.
+    /// Early-exit walk of one lane of a key group through tree `t`:
+    /// `grp[node.slot + lane]` is the lane's key for the node's feature and
+    /// sign. Categorical nodes recover the value from the unsigned half.
     #[inline]
-    fn leaf_id_strided(&self, t: usize, row: &[f32], stride: usize) -> u32 {
+    fn leaf_id_keyed(&self, t: usize, grp: &[u32], lane: usize) -> u32 {
         let mut nid = self.trees[t].root;
         loop {
             let node = &self.nodes[nid as usize];
-            if Self::is_leaf(node) {
+            if Self::is_leaf(node, nid) {
                 return nid;
             }
-            nid = self.next(node, row[node.feat as usize * stride]);
+            nid = if node.aux & CATEGORICAL != 0 {
+                self.next(node, unkey(grp[node.slot as usize + lane]))
+            } else {
+                Self::next_numeric(node, grp[node.slot as usize + lane]) as u32
+            };
         }
     }
 
-    /// Walk `rows` dense rows (`NaN` = missing) through tree `t` and call
-    /// `sink(r, leaf)` with each row's arena leaf id, in row order. The full
-    /// [`LANES`]-row groups come from `lanes`, laid out `[group][feature][lane]`
-    /// so a lane's value sits at a fixed immediate offset from the group's
-    /// feature base (`n_cols * LANES` values per group). The remaining
-    /// `rows % LANES` rows come from `tail`, row-major with stride `n_cols`.
+    /// Walk `rows` dense rows through tree `t` and call `sink(r, leaf)` with
+    /// each row's arena leaf id, in row order. The full [`LANES`]-row groups
+    /// come from `lanes`, laid out `[group][feature][lane]` as [`key`]s of `v`
+    /// then of `-v` ([`FEATURE_LANES`] per feature, `n_cols * FEATURE_LANES`
+    /// per group), so a lane's key sits at a fixed immediate offset from the
+    /// node's slot. The remaining `rows % LANES` rows come from `tail`, raw
+    /// and row-major with stride `n_cols` (`NaN` = missing).
     #[inline(always)]
     fn walk_block(
         &self,
         t: usize,
-        lanes: &[f32],
+        lanes: &[u32],
         tail: &[f32],
         n_cols: usize,
         rows: usize,
         mut sink: impl FnMut(usize, u32),
     ) {
         let groups = rows / LANES;
-        let group_len = LANES * n_cols;
+        let group_len = FEATURE_LANES * n_cols;
         assert!(
             lanes.len() >= groups * group_len && tail.len() >= (rows - groups * LANES) * n_cols,
             "row block holds fewer rows than requested"
@@ -349,7 +432,7 @@ impl CompactForest {
             for g in 0..groups {
                 let grp = &lanes[g * group_len..(g + 1) * group_len];
                 for j in 0..LANES {
-                    sink(g * LANES + j, self.leaf_id_strided(t, &grp[j..], LANES));
+                    sink(g * LANES + j, self.leaf_id_keyed(t, grp, j));
                 }
             }
         } else {
@@ -369,10 +452,11 @@ impl CompactForest {
                             // root, then children produced by
                             // `next_numeric`), `check_width` verified every
                             // split feature < n_cols, and `grp` holds n_cols
-                            // features of LANES values.
+                            // features of FEATURE_LANES keys.
                             let node = unsafe { nodes.get_unchecked(nid[$j]) };
-                            let v = unsafe { *grp.get_unchecked(node.feat as usize * LANES + $j) };
-                            nid[$j] = Self::next_numeric(node, v);
+                            let (slot, key) = Self::slot_key(node);
+                            let k = unsafe { *grp.get_unchecked(slot + $j) };
+                            nid[$j] = node.left as usize + usize::from(k > key);
                         )*};
                     }
                     lane!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
@@ -398,7 +482,7 @@ impl CompactForest {
     pub(crate) fn original_leaf_ids(
         &self,
         t: usize,
-        lanes: &[f32],
+        lanes: &[u32],
         tail: &[f32],
         n_cols: usize,
         rows: usize,
@@ -423,7 +507,7 @@ impl CompactForest {
     pub(crate) fn accumulate(
         &self,
         t: usize,
-        lanes: &[f32],
+        lanes: &[u32],
         tail: &[f32],
         n_cols: usize,
         rows: usize,
@@ -446,12 +530,15 @@ impl CompactForest {
     /// Walk one dense `row` through trees `0..limit` and call `sink(t, leaf)`
     /// with each tree's arena leaf id, in tree order. Trees are walked
     /// [`LANES`] at a time in lockstep, so a single instance still overlaps its
-    /// dependent load chains (the batch kernel overlaps rows instead).
+    /// dependent load chains (the batch kernel overlaps rows instead). The row
+    /// is keyed once, `[feature][sign]`, so a node's slot maps to its key by a
+    /// shift.
     #[inline(always)]
     fn walk_row(&self, row: &[f32], limit: usize, mut sink: impl FnMut(usize, u32)) {
         assert!(limit <= self.trees.len());
         let nodes = &self.nodes[..];
         let full = limit / LANES * LANES;
+        let mut keys: Vec<u32> = Vec::new();
         for g in 0..limit / LANES {
             let group = &self.trees[g * LANES..(g + 1) * LANES];
             let mut depth = 0u32;
@@ -469,6 +556,14 @@ impl CompactForest {
             for meta in group {
                 meta.check_width(row.len());
             }
+            if keys.is_empty() {
+                keys.reserve(2 * row.len());
+                for &v in row {
+                    keys.push(key(v));
+                    keys.push(key(-v));
+                }
+            }
+            let keys = &keys[..];
             let mut nid = [0usize; LANES];
             for (n, meta) in nid.iter_mut().zip(group) {
                 *n = meta.root as usize;
@@ -477,10 +572,11 @@ impl CompactForest {
                 macro_rules! lane {
                     ($($j:literal)*) => {$(
                         // SAFETY: as in `walk_block`; `check_width` ran for
-                        // every tree in the group.
+                        // every tree in the group and `keys` holds two keys
+                        // per feature, indexed by `slot / LANES`.
                         let node = unsafe { nodes.get_unchecked(nid[$j]) };
-                        let v = unsafe { *row.get_unchecked(node.feat as usize) };
-                        nid[$j] = Self::next_numeric(node, v);
+                        let k = unsafe { *keys.get_unchecked(node.slot as usize / LANES) };
+                        nid[$j] = Self::next_numeric(node, k);
                     )*};
                 }
                 lane!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
@@ -531,15 +627,18 @@ mod tests {
         t
     }
 
-    /// Row-major rows -> (lane-major full groups, row-major tail), the layout
-    /// `walk_block` consumes.
-    fn split_lanes(rows: &[f32], n_cols: usize) -> (Vec<f32>, &[f32]) {
+    /// Row-major rows -> (keyed lane-major full groups, row-major tail), the
+    /// layout `walk_block` consumes.
+    fn split_lanes(rows: &[f32], n_cols: usize) -> (Vec<u32>, &[f32]) {
         let groups = rows.len() / n_cols / LANES;
-        let mut lanes = vec![0.0f32; groups * LANES * n_cols];
+        let mut lanes = vec![0u32; groups * FEATURE_LANES * n_cols];
         for g in 0..groups {
             for j in 0..LANES {
                 for f in 0..n_cols {
-                    lanes[g * LANES * n_cols + f * LANES + j] = rows[(g * LANES + j) * n_cols + f];
+                    let v = rows[(g * LANES + j) * n_cols + f];
+                    let base = g * FEATURE_LANES * n_cols + f * FEATURE_LANES + j;
+                    lanes[base] = key(v);
+                    lanes[base + LANES] = key(-v);
                 }
             }
         }
@@ -653,6 +752,114 @@ mod tests {
                 assert_eq!(f.original_id(got) as usize, want, "v={v} dl={default_left}");
                 assert_eq!(f.leaf_value(got), t.node(want).leaf_value);
             }
+        }
+    }
+
+    #[test]
+    fn keys_order_like_floats_and_isolate_missing() {
+        let values = [
+            f32::NEG_INFINITY,
+            -f32::MAX,
+            -1.5,
+            -f32::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            2.0,
+            f32::MAX,
+            f32::INFINITY,
+        ];
+        for (i, &a) in values.iter().enumerate() {
+            for &b in &values[i..] {
+                assert_eq!(key(a) > key(b), a > b, "{a} vs {b}");
+                assert_eq!(key(a) == key(b), a == b, "{a} vs {b}");
+            }
+            assert!(key(a) > key(f32::NAN), "{a} must key above missing");
+            assert!(!(key(f32::NAN) > key(a)), "missing never compares greater");
+            assert!(unkey(key(a)) == a, "{a} round trip");
+        }
+        assert_eq!(key(f32::NAN), 0);
+        assert_eq!(key(-f32::NAN), 0);
+        assert!(unkey(0).is_nan());
+        assert_eq!(key(f32::INFINITY), LEAF_KEY);
+    }
+
+    #[test]
+    fn boundary_values_match_reference_in_every_path() {
+        // Thresholds at zero, negative, and large magnitudes, with both
+        // missing directions, so mirrored nodes read negated keys and ties at
+        // the threshold are exercised from both sides.
+        let mut trees = Vec::new();
+        for (cond, default_left) in [
+            (0.0f32, true),
+            (0.0, false),
+            (-1.5, true),
+            (-1.5, false),
+            (f32::MAX, true),
+            (-f32::MAX, false),
+            (f32::MIN_POSITIVE, false),
+        ] {
+            let mut t = RegTree::with_root(1.0);
+            let (l, r) = t.expand(0, 0, cond, default_left, 0.0, 1.0, 0.0, 1.0);
+            t.expand(l, 1, cond, !default_left, -1.0, 1.0, 1.0, 1.0);
+            t.expand(r, 1, -cond, default_left, 2.0, 1.0, 3.0, 1.0);
+            trees.push(t);
+        }
+        let f = CompactForest::from_trees(&trees);
+        let probes = [
+            f32::NEG_INFINITY,
+            -f32::MAX,
+            -1.5,
+            -f32::from_bits(f32::MIN_POSITIVE.to_bits() + 1),
+            -f32::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f32::MIN_POSITIVE,
+            1.5,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        // Every (f0, f1) pair plus one odd row, so the block has full lane
+        // groups and a tail.
+        let mut rows: Vec<f32> = vec![0.5, -0.5];
+        for &a in &probes {
+            for &b in &probes {
+                rows.extend_from_slice(&[a, b]);
+            }
+        }
+        let n = rows.len() / 2;
+        assert!(n % LANES != 0, "layout must exercise a tail");
+        let (lanes, tail) = split_lanes(&rows, 2);
+        for (t, tree) in trees.iter().enumerate() {
+            let mut ids = vec![0u32; n];
+            f.original_leaf_ids(t, &lanes, tail, 2, n, &mut ids, 1);
+            for r in 0..n {
+                let row = &rows[r * 2..r * 2 + 2];
+                let want = tree.leaf_id_dense(row, f32::NAN);
+                assert_eq!(ids[r] as usize, want, "tree {t} row {row:?} (block)");
+                let leaf = f.leaf_id(t, row);
+                assert_eq!(f.original_id(leaf) as usize, want, "tree {t} row {row:?}");
+                let mut per_tree = vec![0u32; trees.len()];
+                f.original_leaf_ids_for_row(row, &mut per_tree);
+                assert_eq!(per_tree[t] as usize, want, "tree {t} row {row:?} (row)");
+            }
+        }
+    }
+
+    #[test]
+    fn infinite_mirrored_threshold_is_not_mistaken_for_a_leaf() {
+        // `v < -inf` with missing values right is stored as `-v > +inf`, whose
+        // key equals a leaf's; the early-exit walkers must still descend.
+        let mut t = RegTree::with_root(1.0);
+        t.expand(0, 0, f32::NEG_INFINITY, false, -1.0, 1.0, 1.0, 1.0);
+        let f = CompactForest::from_trees(std::slice::from_ref(&t));
+        for v in [f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN] {
+            let want = t.leaf_id_dense(&[v], f32::NAN);
+            assert_eq!(f.original_id(f.leaf_id(0, &[v])) as usize, want, "v={v}");
+            let mut out = [0u32];
+            f.original_leaf_ids_for_row(&[v], &mut out);
+            assert_eq!(out[0] as usize, want, "v={v} (row)");
         }
     }
 }

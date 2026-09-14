@@ -1,12 +1,19 @@
 # Performance
 
-sequoia-boost combines AArch64 NEON numerical kernels with parallel histogram
-training. Data preparation and independent depthwise nodes share the worker
-pool; histogram task sizes follow node size. Training reuses row partitions
+sequoia-boost combines runtime-detected SIMD numerical kernels — NEON on
+AArch64; AVX2+FMA (split evaluation, exponential and sigmoid transforms,
+logistic and short-softmax gradients) and SSE2 (quantile bin search) on
+x86-64 — with parallel histogram training. Data preparation and independent
+depthwise nodes share the worker pool; histogram task sizes follow node size,
+the two children of a large node are evaluated concurrently, and partial
+histograms are reduced in parallel by bin range. Training reuses row partitions
 where they reduce prediction work, and terminal leaves skip histogram and split
-searches. Scalar Rust handles other architectures and inputs outside the vector
-paths. This guide compares CPU training with XGBoost and measures the numerical
-and tree-building optimizations within sequoia-boost.
+searches. Prediction compares monotone integer keys in a branch-free lockstep
+walk. Scalar Rust handles other architectures and inputs outside the vector
+paths. Split choices, histogram sums, and prediction results match the scalar
+path exactly; the transcendental kernels stay within a few f32 ULPs of the
+scalar library functions. This guide compares CPU training with XGBoost and
+measures the numerical and tree-building optimizations within sequoia-boost.
 
 ## XGBoost comparison
 
@@ -242,8 +249,9 @@ result file records executable and source SHA-256 hashes.
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks
-NEON support once per process and caches the result. Other architectures use
-scalar Rust; no target-specific build flags are required. Dispatch checks the
+NEON support and x86-64 checks AVX2+FMA support once per process and caches
+the result. Other architectures use scalar Rust; no target-specific build
+flags are required. Dispatch checks the
 slice lengths before entering an unsafe kernel, and vector loads and stores
 stay within complete blocks. Scalar formulas are shared by whole-input
 fallbacks, exceptional blocks, and tails.

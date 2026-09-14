@@ -9,8 +9,11 @@ const MIN_POSITIVE_PREDICTION: f64 = 1e-8;
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::tree::gain::RegParams;
+
+#[cfg(target_arch = "x86_64")]
+use std::sync::LazyLock;
 
 #[cfg(target_arch = "aarch64")]
 use std::sync::OnceLock;
@@ -18,13 +21,21 @@ use std::sync::OnceLock;
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const MIN_SIMD_LEN: usize = 16;
 
 #[cfg(target_arch = "aarch64")]
 static NEON_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_arch = "x86_64")]
+static AVX2_FMA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
+    std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+});
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) struct SplitCandidate {
     pub(crate) loss_change: f64,
     pub(crate) split_offset: usize,
@@ -32,7 +43,7 @@ pub(crate) struct SplitCandidate {
     pub(crate) right: GradStats,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) enum DenseSplitScan {
     ScalarFallback,
     Scanned(Option<SplitCandidate>),
@@ -45,6 +56,12 @@ pub(crate) enum DenseSplitScan {
 #[inline]
 fn neon_available() -> bool {
     *NEON_AVAILABLE.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon"))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn avx2_fma_available() -> bool {
+    *AVX2_FMA_AVAILABLE
 }
 
 /// Hint the cache hierarchy that `value` will be read soon. A pure performance
@@ -80,11 +97,16 @@ pub(crate) fn count_le(cuts: &[f32], value: f32) -> usize {
         // SAFETY: NEON is present and the slice holds exactly four vectors.
         return unsafe { aarch64::count_le_16(cuts, value) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if cuts.len() == 16 {
+        // SAFETY: the slice holds exactly four vectors; SSE2 is baseline.
+        return unsafe { x86_64::count_le_16(cuts, value) };
+    }
     cuts.iter().filter(|&&cut| cut <= value).count()
 }
 
 #[inline]
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn gradient_slices_cover(
     len: usize,
     labels: &[f32],
@@ -95,7 +117,7 @@ fn gradient_slices_cover(
 }
 
 #[inline]
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn metric_slices_cover(len: usize, labels: &[f32], weights: Option<&[f32]>) -> bool {
     labels.len() >= len && weights.is_none_or(|values| values.len() >= len)
 }
@@ -126,9 +148,9 @@ pub(crate) fn sum_grad_stats(values: &[GradStats]) -> GradStats {
     sum
 }
 
-/// Try the NEON split-gain scan used by the common dense, unconstrained
+/// Try the vector split-gain scan used by the common dense, unconstrained
 /// histogram path. `ScalarFallback` asks the caller to use its scalar scan.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn dense_unconstrained_best_split(
     histogram: &[GradStats],
     total: GradStats,
@@ -136,7 +158,11 @@ pub(crate) fn dense_unconstrained_best_split(
     parent_gain: f64,
     comparison_epsilon: f64,
 ) -> DenseSplitScan {
-    if histogram.len() >= MIN_SIMD_LEN && reg.max_delta_step == 0.0 && neon_available() {
+    if histogram.len() < MIN_SIMD_LEN || reg.max_delta_step != 0.0 {
+        return DenseSplitScan::ScalarFallback;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if neon_available() {
         // SAFETY: NEON is present. The kernel only reads `histogram` and keeps
         // all vector loads within the complete candidate range.
         return DenseSplitScan::Scanned(unsafe {
@@ -149,7 +175,20 @@ pub(crate) fn dense_unconstrained_best_split(
             )
         });
     }
-
+    #[cfg(target_arch = "x86_64")]
+    if avx2_fma_available() {
+        // SAFETY: AVX2 and FMA are present. The kernel only reads `histogram`
+        // and keeps all vector loads within the complete candidate range.
+        return DenseSplitScan::Scanned(unsafe {
+            x86_64::dense_unconstrained_best_split(
+                histogram,
+                total,
+                reg,
+                parent_gain,
+                comparison_epsilon,
+            )
+        });
+    }
     DenseSplitScan::ScalarFallback
 }
 
@@ -160,6 +199,13 @@ pub(crate) fn exp_inplace(values: &mut [f32]) {
         // SAFETY: runtime feature detection proves NEON is available, and the
         // kernel bounds vector accesses by the slice length.
         unsafe { aarch64::exp_inplace(values) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
+        // SAFETY: AVX2/FMA are present; the kernel bounds vector accesses by
+        // the slice length.
+        unsafe { x86_64::exp_inplace(values) };
         return;
     }
 
@@ -173,6 +219,13 @@ pub(crate) fn sigmoid_inplace(values: &mut [f32]) {
         // SAFETY: runtime feature detection proves NEON is available, and the
         // kernel bounds vector accesses by the slice length.
         unsafe { aarch64::sigmoid_inplace(values) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
+        // SAFETY: AVX2/FMA are present; the kernel bounds vector accesses by
+        // the slice length.
+        unsafe { x86_64::sigmoid_inplace(values) };
         return;
     }
 
@@ -198,6 +251,17 @@ pub(crate) fn logistic_gradient(
         // objective validates equal slice lengths before entering this kernel.
         unsafe {
             aarch64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out)
+        };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if preds.len() >= MIN_SIMD_LEN
+        && gradient_slices_cover(preds.len(), labels, weights, out)
+        && avx2_fma_available()
+    {
+        // SAFETY: AVX2/FMA are present and the slices cover `preds.len()`.
+        unsafe {
+            x86_64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out)
         };
         return;
     }
@@ -303,6 +367,19 @@ pub(crate) fn softmax_rows_inplace(values: &mut [f32], num_class: usize) {
         }
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if (num_class == 2 || num_class == 4) && values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
+        // SAFETY: AVX2/FMA are present; each specialization processes whole
+        // rows per vector and handles the remaining rows scalarly.
+        unsafe {
+            if num_class == 2 {
+                x86_64::short_softmax_rows::<2>(values)
+            } else {
+                x86_64::short_softmax_rows::<4>(values)
+            }
+        }
+        return;
+    }
 
     for row in values.chunks_mut(num_class) {
         softmax_scalar(row);
@@ -339,6 +416,23 @@ pub(crate) fn softmax_gradient(
                 2 => aarch64::short_softmax_gradient::<2>(preds, labels, weights, min_hess, out),
                 3 => aarch64::short_softmax_gradient::<3>(preds, labels, weights, min_hess, out),
                 _ => aarch64::short_softmax_gradient::<4>(preds, labels, weights, min_hess, out),
+            }
+        }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if (num_class == 2 || num_class == 4)
+        && preds.len() >= MIN_SIMD_LEN
+        && complete
+        && avx2_fma_available()
+    {
+        // SAFETY: the complete-matrix check covers every prediction, label,
+        // weight and output row; AVX2/FMA are present and K is 2 or 4.
+        unsafe {
+            if num_class == 2 {
+                x86_64::short_softmax_gradient::<2>(preds, labels, weights, min_hess, out)
+            } else {
+                x86_64::short_softmax_gradient::<4>(preds, labels, weights, min_hess, out)
             }
         }
         return;

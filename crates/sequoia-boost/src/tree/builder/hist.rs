@@ -23,6 +23,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
 const K_RT_EPS: f64 = 1e-6;
+/// Nodes with at least this many rows evaluate their two children's splits
+/// concurrently. Smaller nodes appear in frontiers wide enough to keep the
+/// pool busy, and their evaluation is too short to be worth a fork.
+const PARALLEL_EVALUATE_ROWS: usize = 16_384;
 
 /// The best split found for a node, in bin space.
 #[derive(Debug, Clone)]
@@ -457,29 +461,41 @@ impl<'a> HistTreeBuilder<'a> {
             None
         };
 
-        let left_best = if terminal {
-            BestSplit::none()
+        // The children's split searches are independent; near the root, where
+        // the frontier holds too few nodes to occupy the pool, running them
+        // side by side halves the serial evaluation time. Each search keeps
+        // its sequential candidate order, so the result is unchanged.
+        let (left_best, right_best) = if terminal {
+            (BestSplit::none(), BestSplit::none())
         } else {
-            self.evaluate(
-                ghist,
-                &left_hist,
-                b.left,
-                &left_features,
-                lb_bounds,
-                child_allowed.as_deref(),
-            )
-        };
-        let right_best = if terminal {
-            BestSplit::none()
-        } else {
-            self.evaluate(
-                ghist,
-                &right_hist,
-                b.right,
-                &right_features,
-                rb_bounds,
-                child_allowed.as_deref(),
-            )
+            let allowed = child_allowed.as_deref();
+            let left = || {
+                self.evaluate(
+                    ghist,
+                    &left_hist,
+                    b.left,
+                    &left_features,
+                    lb_bounds,
+                    allowed,
+                )
+            };
+            let right = || {
+                self.evaluate(
+                    ghist,
+                    &right_hist,
+                    b.right,
+                    &right_features,
+                    rb_bounds,
+                    allowed,
+                )
+            };
+            if left_rows.len() + right_rows.len() >= PARALLEL_EVALUATE_ROWS
+                && rayon::current_num_threads() > 1
+            {
+                rayon::join(left, right)
+            } else {
+                (left(), right())
+            }
         };
 
         let left = NodeEntry {
@@ -589,7 +605,7 @@ impl<'a> HistTreeBuilder<'a> {
             };
             let missing = total.sub(present);
 
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             if !constrained && !has_missing {
                 if let crate::simd::DenseSplitScan::Scanned(candidate) =
                     crate::simd::dense_unconstrained_best_split(
@@ -884,22 +900,31 @@ const PARTITION_CHUNK_ROWS: usize = 16_384;
 /// (`column[r]` is row `r`'s bin). Rows ascend, so the column is read as a
 /// monotone stream the hardware prefetcher follows. Every row is written to
 /// both output slots and only the matching length advances, keeping the loop
-/// free of data-dependent branches.
+/// free of data-dependent branches. The outputs are written into spare
+/// capacity, so neither buffer is zero-filled first.
 fn route_dense<B: BinIndex>(rows: &[u32], column: &[B], split_bin: usize) -> (Vec<u32>, Vec<u32>) {
     let route = |rows: &[u32]| {
         let n = rows.len();
-        let mut left = vec![0u32; n];
-        let mut right = vec![0u32; n];
+        let mut left: Vec<u32> = Vec::with_capacity(n);
+        let mut right: Vec<u32> = Vec::with_capacity(n);
         let (mut nl, mut nr) = (0usize, 0usize);
-        for &r in rows {
-            let go_left = column[r as usize].index() <= split_bin;
-            left[nl] = r;
-            right[nr] = r;
-            nl += go_left as usize;
-            nr += !go_left as usize;
+        {
+            let (lp, rp) = (left.spare_capacity_mut(), right.spare_capacity_mut());
+            for &r in rows {
+                let go_left = column[r as usize].index() <= split_bin;
+                lp[nl].write(r);
+                rp[nr].write(r);
+                nl += go_left as usize;
+                nr += !go_left as usize;
+            }
         }
-        left.truncate(nl);
-        right.truncate(nr);
+        // SAFETY: `nl + nr == n` and each side's slot `k` was written at the
+        // iteration where its length was `k`, so `left[..nl]` and
+        // `right[..nr]` are initialized and within the reserved capacity.
+        unsafe {
+            left.set_len(nl);
+            right.set_len(nr);
+        }
         (left, right)
     };
     if rows.len() < 2 * PARTITION_CHUNK_ROWS || rayon::current_num_threads() <= 1 {

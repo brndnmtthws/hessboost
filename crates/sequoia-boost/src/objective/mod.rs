@@ -44,6 +44,77 @@ impl GradPair {
     }
 }
 
+/// Rows per parallel gradient chunk. A multiple of every vector kernel's block
+/// (4 rows, and 4 values for any class count), so chunk boundaries fall where
+/// the kernels' block boundaries already are and every element is computed
+/// by the same path as in one whole-batch call.
+const GRADIENT_CHUNK_ROWS: usize = 8192;
+
+/// Run a row-independent gradient `kernel` over `n_rows` instances with
+/// `n_outputs` values each, in parallel row chunks when the batch is large and
+/// a thread pool is available. Every row's outputs depend only on that row,
+/// and the chunking is fixed (not thread-count dependent): a short final
+/// chunk is folded into the last full chunk so every row takes the same
+/// vector/scalar path as in one whole-batch call, and the result is
+/// identical.
+pub(crate) fn rowwise_gradient<K>(
+    n_rows: usize,
+    n_outputs: usize,
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    out: &mut [GradPair],
+    kernel: K,
+) where
+    K: Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Sync,
+{
+    let complete = n_rows
+        .checked_mul(n_outputs)
+        .is_some_and(|values| preds.len() == values && out.len() == values)
+        && labels.len() == n_rows
+        && weights.is_none_or(|w| w.len() == n_rows);
+    if !complete
+        || n_rows == 0
+        || n_outputs == 0
+        || n_rows < 2 * GRADIENT_CHUNK_ROWS
+        || rayon::current_num_threads() <= 1
+    {
+        kernel(preds, labels, weights, out);
+        return;
+    }
+    use rayon::prelude::*;
+    let run_chunk = |first: usize, out: &mut [GradPair]| {
+        let rows = out.len() / n_outputs;
+        kernel(
+            &preds[first * n_outputs..(first + rows) * n_outputs],
+            &labels[first..first + rows],
+            weights.map(|w| &w[first..first + rows]),
+            out,
+        );
+    };
+    let chunk_values = GRADIENT_CHUNK_ROWS * n_outputs;
+    if out.len() % chunk_values == 0 {
+        out.par_chunks_mut(chunk_values)
+            .enumerate()
+            .for_each(|(index, out)| run_chunk(index * GRADIENT_CHUNK_ROWS, out));
+        return;
+    }
+    // A separate short tail chunk would compute its rows on the scalar path
+    // where a whole-batch call vectorizes them (or vice versa); fold it into
+    // the last full chunk so every row keeps the whole-batch vector/scalar
+    // split — chunk starts stay multiples of every kernel block.
+    let head_rows = (n_rows / GRADIENT_CHUNK_ROWS - 1) * GRADIENT_CHUNK_ROWS;
+    let (head, tail) = out.split_at_mut(head_rows * n_outputs);
+    rayon::join(
+        || {
+            head.par_chunks_mut(chunk_values)
+                .enumerate()
+                .for_each(|(index, out)| run_chunk(index * GRADIENT_CHUNK_ROWS, out));
+        },
+        || run_chunk(head_rows, tail),
+    );
+}
+
 /// A differentiable learning objective.
 ///
 /// Implementors are `Send + Sync` so gradient computation can be parallelized.
@@ -190,5 +261,79 @@ mod tests {
             .objective("nope:whatever")
             .build_unchecked();
         assert!(create_objective(&p).is_err());
+    }
+
+    /// Parallel row chunks must reproduce the whole-batch gradient bit for bit
+    /// for every objective routed through the chunked helper. Lengths are not
+    /// multiples of the chunk or of any vector block. The logistic case sweeps
+    /// every short-tail residue r in 1..=15, where a separate final chunk
+    /// would fall below the vector dispatch length and compute its rows on
+    /// the scalar path; the sweep also pins the structural invariant the fold
+    /// relies on — chunk boundaries stay multiples of every kernel block, so
+    /// a uniform `chunk + tail` chunking would fail here.
+    #[test]
+    fn chunked_gradients_match_whole_batch() {
+        let c = GRADIENT_CHUNK_ROWS;
+        let objectives: Vec<(Box<dyn Objective>, usize, Vec<usize>)> = vec![
+            (Box::new(SquaredErrorObjective), 1, vec![2 * c + 4097]),
+            (
+                Box::new(LogisticObjective::new(1.5)),
+                1,
+                (1..=15).map(|r| 2 * c + r).collect(),
+            ),
+            (Box::new(SoftmaxObjective::new(2, true)), 2, vec![2 * c + 4]),
+            (Box::new(SoftmaxObjective::new(3, true)), 3, vec![2 * c + 4]),
+            (
+                Box::new(SoftmaxObjective::new(9, false)),
+                9,
+                vec![2 * c + 1],
+            ),
+        ];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for (objective, k, ns) in objectives {
+            for n in ns {
+                let preds: Vec<f32> = (0..n * k)
+                    .map(|i| ((i * 7919) % 2003) as f32 / 97.0 - 10.0)
+                    .collect();
+                let labels: Vec<f32> = (0..n)
+                    .map(|i| {
+                        if k == 1 {
+                            (i % 2) as f32
+                        } else {
+                            (i % k) as f32
+                        }
+                    })
+                    .collect();
+                let weights: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
+                for weights in [None, Some(weights.as_slice())] {
+                    let mut whole = vec![GradPair::default(); n * k];
+                    // A single-thread pool takes the whole-batch path.
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .build()
+                        .unwrap()
+                        .install(|| objective.gradient(&preds, &labels, weights, &mut whole));
+                    let mut chunked = vec![GradPair::default(); n * k];
+                    pool.install(|| objective.gradient(&preds, &labels, weights, &mut chunked));
+                    for (i, (a, b)) in whole.iter().zip(&chunked).enumerate() {
+                        assert_eq!(
+                            a.grad.to_bits(),
+                            b.grad.to_bits(),
+                            "{} grad {i}",
+                            objective.name()
+                        );
+                        assert_eq!(
+                            a.hess.to_bits(),
+                            b.hess.to_bits(),
+                            "{} hess {i}",
+                            objective.name()
+                        );
+                    }
+                }
+            }
+        }
     }
 }

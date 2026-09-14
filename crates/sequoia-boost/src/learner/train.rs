@@ -419,14 +419,12 @@ fn train_impl_inner(
 
                 let mut sampler =
                     make_column_sampler(n_features, params, &mut rng, round as u64, k as u64);
-                // Small pools benefit from retaining final row partitions.
-                // Larger pools update margins by parallel tree traversal and
-                // avoid allocating those final partitions.
+                // Retaining the final row partitions replaces a per-row tree
+                // traversal of the raw feature matrix with one sequential
+                // pass per leaf.
                 let (mut tree, leaf_rows) = match &prepared {
                     Prepared::Hist(ghist)
-                        if params.grow_policy == GrowPolicy::DepthWise
-                            && row_subset.len() == n
-                            && rayon::current_num_threads() <= 4 =>
+                        if params.grow_policy == GrowPolicy::DepthWise && row_subset.len() == n =>
                     {
                         HistTreeBuilder::new(params).build_with_leaf_rows(
                             ghist,

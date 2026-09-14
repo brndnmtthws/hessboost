@@ -323,11 +323,116 @@ fn aarch64_backend_detection_is_cached() {
     assert_eq!(first, neon_available());
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_arch = "x86_64")]
 #[test]
-fn dense_split_scan_matches_scalar_candidate_order() {
+fn x86_64_backend_detection_is_cached() {
+    let first = avx2_fma_available();
+    assert_eq!(first, *AVX2_FMA_AVAILABLE);
+    assert_eq!(first, avx2_fma_available());
+}
+
+/// Scalar reference scan: the histogram builder's loop for one dense feature.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn scalar_dense_split(
+    histogram: &[GradStats],
+    total: GradStats,
+    reg: &RegParams,
+    parent_gain: f64,
+) -> Option<SplitCandidate> {
     use crate::tree::gain::calc_gain;
 
+    let mut accumulated = GradStats::default();
+    let mut expected: Option<SplitCandidate> = None;
+    let mut best_loss = 0.0;
+    for (index, &stats) in histogram.iter().take(histogram.len() - 1).enumerate() {
+        accumulated.add(stats);
+        let right = total.sub(accumulated);
+        if accumulated.hess >= reg.min_child_weight && right.hess >= reg.min_child_weight {
+            let loss = calc_gain(accumulated, reg) + calc_gain(right, reg) - parent_gain;
+            if loss > best_loss + 1e-6 {
+                best_loss = loss;
+                expected = Some(SplitCandidate {
+                    loss_change: loss,
+                    split_offset: index,
+                    left: accumulated,
+                    right,
+                });
+            }
+        }
+    }
+    expected
+}
+
+/// `(grad, hess)` bit patterns, so a `NaN` compares equal to itself.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn stats_bits(stats: GradStats) -> (u64, u64) {
+    (stats.grad.to_bits(), stats.hess.to_bits())
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn assert_dense_split_matches_scalar(histogram: &[GradStats], reg: &RegParams) {
+    use crate::tree::gain::calc_gain;
+
+    #[cfg(target_arch = "x86_64")]
+    if !avx2_fma_available() {
+        // Pin the dispatch contract instead of skipping silently: without
+        // AVX2+FMA the scan must return the scalar fallback.
+        let mut total = GradStats::default();
+        for &stats in histogram {
+            total.add(stats);
+        }
+        let parent_gain = calc_gain(total, reg);
+        assert!(matches!(
+            dense_unconstrained_best_split(histogram, total, reg, parent_gain, 1e-6),
+            DenseSplitScan::ScalarFallback
+        ));
+        return; // the vector path cannot be exercised on this host
+    }
+    let mut total = GradStats::default();
+    for &stats in histogram {
+        total.add(stats);
+    }
+    let parent_gain = calc_gain(total, reg);
+    let expected = scalar_dense_split(histogram, total, reg, parent_gain);
+    let DenseSplitScan::Scanned(actual) =
+        dense_unconstrained_best_split(histogram, total, reg, parent_gain, 1e-6)
+    else {
+        panic!("vector split scan should dispatch on this host");
+    };
+    // The x86-64 kernel runs the exact scalar acceptance on every surviving
+    // lane, so its result is bit-identical; NEON evaluates the loss in vector
+    // lanes and may differ in the last bits of a finite loss.
+    let exact_loss = cfg!(target_arch = "x86_64");
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(actual.split_offset, expected.split_offset);
+            assert_eq!(stats_bits(actual.left), stats_bits(expected.left));
+            assert_eq!(stats_bits(actual.right), stats_bits(expected.right));
+            if exact_loss || !expected.loss_change.is_finite() {
+                assert_eq!(
+                    actual.loss_change.to_bits(),
+                    expected.loss_change.to_bits(),
+                    "loss {} differs from scalar {}",
+                    actual.loss_change,
+                    expected.loss_change
+                );
+            } else {
+                assert!(
+                    (actual.loss_change - expected.loss_change).abs() <= 1e-12,
+                    "loss {} differs from scalar {}",
+                    actual.loss_change,
+                    expected.loss_change
+                );
+            }
+        }
+        (None, None) => {}
+        _ => panic!("vector and scalar scans disagreed on candidate presence"),
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[test]
+fn dense_split_scan_matches_scalar_candidate_order() {
     for length in [16, 17, 255, 256] {
         let histogram: Vec<GradStats> = (0..length)
             .map(|index| {
@@ -337,10 +442,6 @@ fn dense_split_scan_matches_scalar_candidate_order() {
                 )
             })
             .collect();
-        let mut total = GradStats::default();
-        for &stats in &histogram {
-            total.add(stats);
-        }
         for (alpha, lambda, min_child_weight) in
             [(0.0, 1.0, 1.0), (0.75, 0.25, 2.0), (4.0, 2.0, 0.0)]
         {
@@ -350,44 +451,70 @@ fn dense_split_scan_matches_scalar_candidate_order() {
                 min_child_weight,
                 max_delta_step: 0.0,
             };
-            let parent_gain = calc_gain(total, &reg);
-            let mut accumulated = GradStats::default();
-            let mut expected: Option<SplitCandidate> = None;
-            let mut best_loss = 0.0;
-            for (index, &stats) in histogram.iter().take(histogram.len() - 1).enumerate() {
-                accumulated.add(stats);
-                let right = total.sub(accumulated);
-                if accumulated.hess >= min_child_weight && right.hess >= min_child_weight {
-                    let loss = calc_gain(accumulated, &reg) + calc_gain(right, &reg) - parent_gain;
-                    if loss > best_loss + 1e-6 {
-                        best_loss = loss;
-                        expected = Some(SplitCandidate {
-                            loss_change: loss,
-                            split_offset: index,
-                            left: accumulated,
-                            right,
-                        });
-                    }
-                }
-            }
-
-            let DenseSplitScan::Scanned(actual) =
-                dense_unconstrained_best_split(&histogram, total, &reg, parent_gain, 1e-6)
-            else {
-                panic!("NEON split scan should dispatch on this host");
-            };
-            match (actual, expected) {
-                (Some(actual), Some(expected)) => {
-                    assert_eq!(actual.split_offset, expected.split_offset);
-                    assert_eq!(actual.left, expected.left);
-                    assert_eq!(actual.right, expected.right);
-                    assert!((actual.loss_change - expected.loss_change).abs() <= 1e-12);
-                }
-                (None, None) => {}
-                _ => panic!("NEON and scalar scans disagreed on candidate presence"),
-            }
+            assert_dense_split_matches_scalar(&histogram, &reg);
         }
     }
+}
+
+/// Adversarial histograms: extreme magnitudes (where cross-multiplied bounds
+/// overflow or underflow), empty bins, exact ties, zero regularization, and
+/// `NaN` gradients must all reproduce the scalar scan's choice.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[test]
+fn dense_split_scan_matches_scalar_on_adversarial_histograms() {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let scales = [1e-160, 1e-30, 1e-3, 1.0, 1e3, 1e30, 1e150];
+    for case in 0..400 {
+        let length = 16 + (next() % 250) as usize;
+        let grad_scale = scales[(next() % scales.len() as u64) as usize];
+        let hess_scale = scales[(next() % scales.len() as u64) as usize];
+        let histogram: Vec<GradStats> = (0..length)
+            .map(|_| {
+                let roll = next() % 16;
+                let grad = match roll {
+                    0 => 0.0,
+                    1 if case % 50 == 0 => f64::NAN,
+                    _ => ((next() >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * grad_scale,
+                };
+                let hess = match roll {
+                    0 | 2 => 0.0,
+                    _ => (next() >> 11) as f64 / (1u64 << 53) as f64 * hess_scale,
+                };
+                GradStats::new(grad, hess)
+            })
+            .collect();
+        let (alpha, lambda, min_child_weight) = match case % 5 {
+            0 => (0.0, 1.0, 1.0),
+            1 => (0.0, 0.0, 0.0),
+            2 => (0.5 * grad_scale, 1e-3 * hess_scale, 0.0),
+            3 => (0.0, 1e-300, 0.0),
+            _ => (grad_scale, hess_scale, 0.25 * hess_scale),
+        };
+        let reg = RegParams {
+            alpha,
+            lambda,
+            min_child_weight,
+            max_delta_step: 0.0,
+        };
+        assert_dense_split_matches_scalar(&histogram, &reg);
+    }
+    // Exact ties between candidates resolve to the first one.
+    let tied: Vec<GradStats> = (0..64)
+        .map(|index| GradStats::new(if index % 2 == 0 { 3.0 } else { -3.0 }, 1.0))
+        .collect();
+    let reg = RegParams {
+        alpha: 0.0,
+        lambda: 1.0,
+        min_child_weight: 1.0,
+        max_delta_step: 0.0,
+    };
+    assert_dense_split_matches_scalar(&tied, &reg);
 }
 
 #[test]
@@ -409,6 +536,53 @@ fn grad_stats_sum_is_close_to_scalar() {
         assert!((actual.grad - expected.grad).abs() <= 1e-12);
         assert!((actual.hess - expected.hess).abs() <= 1e-12);
     }
+}
+
+#[test]
+fn count_le_16_matches_scalar_on_special_values() {
+    // Exactly 16 cuts takes the vector path; NaN cuts never count, ties count,
+    // and the cuts need not be sorted.
+    let cuts: [f32; 16] = [
+        f32::NEG_INFINITY,
+        -3.0,
+        -0.0,
+        0.0,
+        0.0,
+        1.5,
+        f32::NAN,
+        2.0,
+        2.0,
+        7.25,
+        f32::INFINITY,
+        -1e-40,
+        1e-40,
+        f32::MAX,
+        f32::MIN,
+        4.0,
+    ];
+    for value in [
+        f32::NEG_INFINITY,
+        -3.0,
+        -0.0,
+        0.0,
+        1e-40,
+        2.0,
+        4.0,
+        7.25,
+        f32::MAX,
+        f32::INFINITY,
+        f32::NAN,
+    ] {
+        let expected = cuts.iter().filter(|&&cut| cut <= value).count();
+        assert_eq!(count_le(&cuts, value), expected, "value {value}");
+    }
+    // Other lengths use the scalar path unchanged.
+    let short = &cuts[..15];
+    assert_eq!(
+        count_le(short, 2.0),
+        short.iter().filter(|&&cut| cut <= 2.0).count()
+    );
+    assert_eq!(count_le(&[], 2.0), 0);
 }
 
 #[test]

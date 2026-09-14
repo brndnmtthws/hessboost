@@ -53,7 +53,9 @@ impl Objective for SoftmaxObjective {
         debug_assert_eq!(preds.len(), n * k);
         debug_assert_eq!(out.len(), n * k);
 
-        crate::simd::softmax_gradient(preds, labels, weights, k, MIN_HESS, out);
+        super::rowwise_gradient(n, k, preds, labels, weights, out, |p, l, w, o| {
+            crate::simd::softmax_gradient(p, l, w, k, MIN_HESS, o)
+        });
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {

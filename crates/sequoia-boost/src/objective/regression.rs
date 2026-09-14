@@ -24,19 +24,27 @@ impl Objective for SquaredErrorObjective {
     ) {
         debug_assert_eq!(preds.len(), labels.len());
         debug_assert_eq!(preds.len(), out.len());
-        match weights {
-            Some(w) => {
-                for i in 0..preds.len() {
-                    let g = preds[i] - labels[i];
-                    out[i] = GradPair::new(g * w[i], w[i]);
+        super::rowwise_gradient(
+            labels.len(),
+            1,
+            preds,
+            labels,
+            weights,
+            out,
+            |preds, labels, weights, out| match weights {
+                Some(w) => {
+                    for i in 0..preds.len() {
+                        let g = preds[i] - labels[i];
+                        out[i] = GradPair::new(g * w[i], w[i]);
+                    }
                 }
-            }
-            None => {
-                for i in 0..preds.len() {
-                    out[i] = GradPair::new(preds[i] - labels[i], 1.0);
+                None => {
+                    for i in 0..preds.len() {
+                        out[i] = GradPair::new(preds[i] - labels[i], 1.0);
+                    }
                 }
-            }
-        }
+            },
+        );
     }
 
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {

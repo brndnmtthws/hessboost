@@ -45,13 +45,24 @@ impl Objective for LogisticObjective {
     ) {
         debug_assert_eq!(preds.len(), labels.len());
         debug_assert_eq!(preds.len(), out.len());
-        crate::simd::logistic_gradient(
+        let (scale_pos_weight, min_hess) = (self.scale_pos_weight, MIN_HESS);
+        super::rowwise_gradient(
+            labels.len(),
+            1,
             preds,
             labels,
             weights,
-            self.scale_pos_weight,
-            MIN_HESS,
             out,
+            |preds, labels, weights, out| {
+                crate::simd::logistic_gradient(
+                    preds,
+                    labels,
+                    weights,
+                    scale_pos_weight,
+                    min_hess,
+                    out,
+                )
+            },
         );
     }
 

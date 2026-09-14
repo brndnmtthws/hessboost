@@ -16,14 +16,14 @@ set datafile commentschars "#"
 xgb_data = "docs/benchmarks/xgboost.dat"
 opt_data = "docs/benchmarks/optimization.dat"
 
-# sequoia-boost is green, XGBoost gray; darker shades are lower thread
-# counts throughout.
+# sequoia-boost is green and XGBoost blue; darker shades are lower
+# thread counts throughout.
 seq_t1 = "#1b5e20"
 seq_t4 = "#43a047"
 seq_t16 = "#a5d6a7"
-xgb_t1 = "#4d4d4d"
-xgb_t4 = "#8c8c8c"
-xgb_t16 = "#c3c3c3"
+xgb_t1 = "#1565c0"
+xgb_t4 = "#1e88e5"
+xgb_t16 = "#90caf9"
 
 # percent of scalar-baseline time removed by the optimized build
 less(base, opt) = 100.0 * (base - opt) / base
@@ -69,7 +69,7 @@ unset arrow 1
 
 set output "docs/benchmarks/xgboost-threads.svg"
 
-set title "Median fit time, sequoia-boost vs XGBoost 3.4.1\n{/*0.8 seconds, log scale, fresh matrix construction plus training}"
+set title "Median fit time, sequoia-boost vs XGBoost 3.4.1 (lower is better)\n{/*0.8 seconds, log scale, fresh matrix construction plus training}"
 set ylabel "fit time (s)"
 set logscale y 10
 set yrange [0.15:5]

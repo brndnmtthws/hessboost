@@ -21,6 +21,38 @@ enum BinStore {
     U32(Vec<u32>),
 }
 
+impl BinStore {
+    /// All bin indices as a width-tagged view.
+    fn as_bins(&self) -> Bins<'_> {
+        match self {
+            BinStore::U16(v) => Bins::U16(v),
+            BinStore::U32(v) => Bins::U32(v),
+        }
+    }
+
+    /// The global bin index at storage position `idx`.
+    #[inline]
+    fn get(&self, idx: usize) -> u32 {
+        match self {
+            BinStore::U16(v) => v[idx] as u32,
+            BinStore::U32(v) => v[idx],
+        }
+    }
+}
+
+/// The bin of the feature owning global range `[fs, fe)` within one row's
+/// slice, or `None` when that feature is missing for the row.
+#[inline]
+fn find_bin<T: Copy + Into<u32>>(row: &[T], fs: usize, fe: usize) -> Option<u32> {
+    for &b in row {
+        let b: u32 = b.into();
+        if (b as usize) >= fs && (b as usize) < fe {
+            return Some(b);
+        }
+    }
+    None
+}
+
 /// A view over one row's (or all rows') bin indices, tagged by width so hot
 /// loops can specialize with a single outer branch.
 pub enum Bins<'a> {
@@ -168,10 +200,7 @@ impl GHistIndex {
     /// slice a row's entries in a width-specialized loop.
     #[inline]
     pub fn bins(&self) -> Bins<'_> {
-        match &self.store {
-            BinStore::U16(v) => Bins::U16(v),
-            BinStore::U32(v) => Bins::U32(v),
-        }
+        self.store.as_bins()
     }
 
     /// Row stride of a dense index (every row holds every feature in order),
@@ -185,10 +214,7 @@ impl GHistIndex {
     /// width. `None` for sparse indexes.
     #[inline]
     pub fn column_bins(&self) -> Option<Bins<'_>> {
-        self.columns.as_ref().map(|store| match store {
-            BinStore::U16(v) => Bins::U16(v),
-            BinStore::U32(v) => Bins::U32(v),
-        })
+        self.columns.as_ref().map(BinStore::as_bins)
     }
 
     /// Number of present (non-missing) entries in row `r`.
@@ -203,12 +229,8 @@ impl GHistIndex {
     #[inline]
     pub fn feature_bin_at(&self, r: usize, feature: usize, fs: usize, fe: usize) -> Option<u32> {
         if self.dense {
-            let idx = self.row_ptr[r] + feature;
-            let b = match &self.store {
-                BinStore::U16(v) => v[idx] as u32,
-                BinStore::U32(v) => v[idx],
-            };
-            return Some(b); // dense entry at offset `feature` is that feature's bin
+            // Dense entry at offset `feature` is that feature's bin.
+            return Some(self.store.get(self.row_ptr[r] + feature));
         }
         self.feature_bin(r, fs, fe)
     }
@@ -219,24 +241,9 @@ impl GHistIndex {
     pub fn feature_bin(&self, r: usize, fs: usize, fe: usize) -> Option<u32> {
         let (s, e) = (self.row_ptr[r], self.row_ptr[r + 1]);
         match &self.store {
-            BinStore::U16(v) => {
-                for &b in &v[s..e] {
-                    let b = b as usize;
-                    if b >= fs && b < fe {
-                        return Some(b as u32);
-                    }
-                }
-            }
-            BinStore::U32(v) => {
-                for &b in &v[s..e] {
-                    let b = b as usize;
-                    if b >= fs && b < fe {
-                        return Some(b as u32);
-                    }
-                }
-            }
+            BinStore::U16(v) => find_bin(&v[s..e], fs, fe),
+            BinStore::U32(v) => find_bin(&v[s..e], fs, fe),
         }
-        None
     }
 }
 
@@ -306,19 +313,27 @@ trait FromBin: Copy {
     fn from_bin(bin: u32) -> Self;
 }
 
-impl FromBin for u16 {
-    #[inline(always)]
-    fn from_bin(bin: u32) -> Self {
-        bin as u16
-    }
+macro_rules! impl_from_bin {
+    (narrow $t:ty) => {
+        impl FromBin for $t {
+            #[inline(always)]
+            fn from_bin(bin: u32) -> Self {
+                bin as $t
+            }
+        }
+    };
+    (wide $t:ty) => {
+        impl FromBin for $t {
+            #[inline(always)]
+            fn from_bin(bin: u32) -> Self {
+                bin
+            }
+        }
+    };
 }
 
-impl FromBin for u32 {
-    #[inline(always)]
-    fn from_bin(bin: u32) -> Self {
-        bin
-    }
-}
+impl_from_bin!(narrow u16);
+impl_from_bin!(wide u32);
 
 fn bin_rows(data: &DMatrix, cuts: &BinSearch<'_>, rows: Range<usize>, narrow: bool) -> BinnedRows {
     if narrow {
@@ -336,7 +351,14 @@ fn bin_rows_into<B: FromBin>(
 ) -> BinnedRows {
     let n_features = cuts.n_features();
     let mut row_ends = Vec::with_capacity(rows.len());
-    let mut bins: Vec<B> = Vec::with_capacity(rows.len() * n_features);
+    // Sparse storage pushes only stored entries, so reserve by entry count.
+    // A dense-sized reservation would request rows x features capacity even
+    // when the row range holds a fraction of that in stored entries.
+    let nnz = match data.csr_parts() {
+        Some((indptr, _, _)) => indptr[rows.end] - indptr[rows.start],
+        None => rows.len() * n_features,
+    };
+    let mut bins: Vec<B> = Vec::with_capacity(nnz);
     let mut dense = true;
     let mut max_bin = 0u32;
     let mut push = |bins: &mut Vec<B>, bin: u32| {
@@ -443,14 +465,12 @@ mod tests {
         let data = DMatrix::from_dense(&[0.0, 10.0, 1.0, 20.0], 2, 2).unwrap();
         let cuts = HistCuts::from_dmatrix(&data, 256);
         let ghist = GHistIndex::from_dmatrix(&data, cuts);
-        // Two present features per row.
         assert_eq!(ghist.row_len(0), 2);
         assert_eq!(ghist.row_len(1), 2);
         // Row 1's feature-0 value (1.0) bins higher than row 0's (0.0).
         let b0 = ghist.cuts().bin_of(0, 0.0);
         let b1 = ghist.cuts().bin_of(0, 1.0);
         assert!(b1 > b0);
-        // Small bin count -> u16 storage.
         assert!(matches!(ghist.bins(), Bins::U16(_)));
     }
 
@@ -459,7 +479,6 @@ mod tests {
         let data = DMatrix::from_dense(&[0.0, f32::NAN, 1.0, 2.0], 2, 2).unwrap();
         let cuts = HistCuts::from_dmatrix(&data, 256);
         let ghist = GHistIndex::from_dmatrix(&data, cuts);
-        // Row 0 has a missing feature 1 -> only one present entry.
         assert_eq!(ghist.row_len(0), 1);
         assert_eq!(ghist.row_len(1), 2);
     }

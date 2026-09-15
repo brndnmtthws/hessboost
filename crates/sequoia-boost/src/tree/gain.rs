@@ -12,6 +12,7 @@
 //! `f64` for numerical stability, matching XGBoost's accumulation precision.
 
 use crate::config::TrainingParams;
+use crate::tree::constraints::gain_at_weight;
 
 /// Accumulated first/second-order statistics for a set of instances.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -102,7 +103,8 @@ pub fn calc_weight(stats: GradStats, reg: &RegParams) -> f64 {
 
 /// Structure score (gain) for a node. When `max_delta_step` is unset this is the
 /// closed-form `Tα(G)² / (H + λ)`. Otherwise it is evaluated at the clamped
-/// weight to stay consistent with [`calc_weight`].
+/// weight via [`gain_at_weight`] (shared with the constrained path) to stay
+/// consistent with [`calc_weight`].
 pub fn calc_gain(stats: GradStats, reg: &RegParams) -> f64 {
     if stats.hess < reg.min_child_weight || stats.hess <= 0.0 {
         return 0.0;
@@ -111,11 +113,7 @@ pub fn calc_gain(stats: GradStats, reg: &RegParams) -> f64 {
         let t = threshold_l1(stats.grad, reg.alpha);
         (t * t) / (stats.hess + reg.lambda)
     } else {
-        // Gain at the (possibly clamped) optimal weight:
-        //   −(2·Tα(G)·w + (H + λ)·w²)
-        let w = calc_weight(stats, reg);
-        let t = threshold_l1(stats.grad, reg.alpha);
-        -(2.0 * t * w + (stats.hess + reg.lambda) * w * w)
+        gain_at_weight(stats, reg, calc_weight(stats, reg))
     }
 }
 

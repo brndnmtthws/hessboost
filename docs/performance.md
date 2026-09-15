@@ -315,11 +315,11 @@ limits the task count to one per 4,096 rows, capped at the worker count,
 so a smaller node does not allocate a full histogram for every worker.
 
 Leaves at `max_depth` need no histograms or split searches. With full row
-sampling and at most four workers, training retains their final row partitions
-and adds the finalized leaf values directly to cached training margins. Larger
-pools, sampled training, and evaluation datasets update independent rows in
-parallel, skipping small inputs where task overhead would dominate. Leaf
-statistics, monotone bounds, and column-sampler draws are preserved.
+sampling, training retains their final row partitions and adds the finalized
+leaf values directly to cached training margins. Sampled training and
+evaluation datasets update independent rows in parallel, skipping small inputs
+where task overhead would dominate. Leaf statistics, monotone bounds, and
+column-sampler draws are preserved.
 
 Quantile cuts are sorted independently by feature, and rows are binned in
 parallel chunks. Ordered collection preserves the cut layout, row order,
@@ -359,7 +359,8 @@ shared constant for all path elements that lie off the instance's own path
 (their cover fraction cancels). Rows are processed in parallel. On a Neoverse
 V3 core these changes cut prediction time by 10–20× for dense, sparse, and
 multiclass batches and by 8–9× for SHAP contributions relative to the per-node
-traversal.
+traversal. Those two figures are informal spot measurements from a separate
+machine. They are not part of the recorded artifacts in this document.
 
 ## Numerical behavior and validation
 

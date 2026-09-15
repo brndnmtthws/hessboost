@@ -12,11 +12,8 @@ use crate::tree::gain::GradStats;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::tree::gain::RegParams;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use std::sync::LazyLock;
-
-#[cfg(target_arch = "aarch64")]
-use std::sync::OnceLock;
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
@@ -28,12 +25,74 @@ mod x86_64;
 const MIN_SIMD_LEN: usize = 16;
 
 #[cfg(target_arch = "aarch64")]
-static NEON_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static NEON_AVAILABLE: LazyLock<bool> =
+    LazyLock::new(|| std::arch::is_aarch64_feature_detected!("neon"));
 
 #[cfg(target_arch = "x86_64")]
 static AVX2_FMA_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
     std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
 });
+
+/// Run the per-arch kernel for a `&mut [f32]` unary inplace op when the slice
+/// is long enough, falling through to the caller's scalar tail otherwise.
+macro_rules! dispatch_unary_inplace {
+    ($values:expr, $kernel:ident) => {
+        #[cfg(target_arch = "aarch64")]
+        if $values.len() >= MIN_SIMD_LEN && neon_available() {
+            // SAFETY: runtime detection proves NEON is present and the kernel
+            // bounds vector accesses by the slice length.
+            unsafe { aarch64::$kernel($values) };
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if $values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
+            // SAFETY: AVX2/FMA are present and the kernel bounds vector
+            // accesses by the slice length.
+            unsafe { x86_64::$kernel($values) };
+            return;
+        }
+    };
+}
+
+/// Run the per-arch gradient kernel when `$gate` (length plus
+/// `gradient_slices_cover`) holds, falling through to the caller's scalar
+/// tail otherwise. The three-arm form also dispatches the x86_64 kernel; the
+/// two-arm form is NEON-only for kernels with no x86_64 counterpart.
+macro_rules! dispatch_gradient {
+    ($gate:expr, $neon_call:expr) => {
+        #[cfg(target_arch = "aarch64")]
+        if $gate && neon_available() {
+            // SAFETY: NEON is present and the gate's cover check proves every
+            // input and output slice spans the dispatched length.
+            unsafe { $neon_call };
+            return;
+        }
+    };
+    ($gate:expr, $neon_call:expr, $avx_call:expr) => {
+        dispatch_gradient!($gate, $neon_call);
+        #[cfg(target_arch = "x86_64")]
+        if $gate && avx2_fma_available() {
+            // SAFETY: AVX2/FMA are present and the gate's cover check proves
+            // every input and output slice spans the dispatched length.
+            unsafe { $avx_call };
+            return;
+        }
+    };
+}
+
+/// Run the NEON metric-sum kernel when `$gate` holds, falling through to the
+/// caller's scalar tail otherwise. Callers spell the full gate (length plus
+/// cover/validity checks) so dispatch conditions stay exactly as before.
+macro_rules! dispatch_metric_sum {
+    ($gate:expr, $neon_call:expr) => {
+        #[cfg(target_arch = "aarch64")]
+        if $gate && neon_available() {
+            // SAFETY: NEON is present and the gate's cover check proves every
+            // input slice spans the dispatched length.
+            return unsafe { $neon_call };
+        }
+    };
+}
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) struct SplitCandidate {
@@ -50,12 +109,12 @@ pub(crate) enum DenseSplitScan {
 }
 
 /// Resolve the process-wide AArch64 backend lazily on the first numeric-kernel
-/// call. `OnceLock` makes feature detection a one-time initialization cost, and
+/// call. `LazyLock` makes feature detection a one-time initialization cost, and
 /// subsequent calls are a cached load and comparison.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn neon_available() -> bool {
-    *NEON_AVAILABLE.get_or_init(|| std::arch::is_aarch64_feature_detected!("neon"))
+    *NEON_AVAILABLE
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -134,12 +193,10 @@ fn sigmoid_scalar(x: f32) -> f32 {
 
 #[inline]
 pub(crate) fn sum_grad_stats(values: &[GradStats]) -> GradStats {
-    #[cfg(target_arch = "aarch64")]
-    if values.len() >= MIN_SIMD_LEN && neon_available() {
-        // SAFETY: NEON is present; GradStats is repr(C) with two adjacent f64
-        // fields, and the kernel bounds all loads by the slice length.
-        return unsafe { aarch64::sum_grad_stats(values) };
-    }
+    dispatch_metric_sum!(
+        values.len() >= MIN_SIMD_LEN,
+        aarch64::sum_grad_stats(values)
+    );
 
     let mut sum = GradStats::default();
     for &value in values {
@@ -150,12 +207,19 @@ pub(crate) fn sum_grad_stats(values: &[GradStats]) -> GradStats {
 
 /// Try the vector split-gain scan used by the common dense, unconstrained
 /// histogram path. `ScalarFallback` asks the caller to use its scalar scan.
+///
+/// `incumbent_loss` is the best loss change already found for the node, from
+/// any earlier feature. The scan seeds its sequential epsilon comparison with
+/// that value, so its acceptance decisions replay the caller's scalar scan
+/// for this feature and the returned candidate (if any) is the one the scalar
+/// path would have accepted in the same position.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn dense_unconstrained_best_split(
     histogram: &[GradStats],
     total: GradStats,
     reg: &RegParams,
     parent_gain: f64,
+    incumbent_loss: f64,
     comparison_epsilon: f64,
 ) -> DenseSplitScan {
     if histogram.len() < MIN_SIMD_LEN || reg.max_delta_step != 0.0 {
@@ -171,6 +235,7 @@ pub(crate) fn dense_unconstrained_best_split(
                 total,
                 reg,
                 parent_gain,
+                incumbent_loss,
                 comparison_epsilon,
             )
         });
@@ -185,6 +250,7 @@ pub(crate) fn dense_unconstrained_best_split(
                 total,
                 reg,
                 parent_gain,
+                incumbent_loss,
                 comparison_epsilon,
             )
         });
@@ -194,41 +260,13 @@ pub(crate) fn dense_unconstrained_best_split(
 
 #[inline]
 pub(crate) fn exp_inplace(values: &mut [f32]) {
-    #[cfg(target_arch = "aarch64")]
-    if values.len() >= MIN_SIMD_LEN && neon_available() {
-        // SAFETY: runtime feature detection proves NEON is available, and the
-        // kernel bounds vector accesses by the slice length.
-        unsafe { aarch64::exp_inplace(values) };
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
-        // SAFETY: AVX2/FMA are present; the kernel bounds vector accesses by
-        // the slice length.
-        unsafe { x86_64::exp_inplace(values) };
-        return;
-    }
-
+    dispatch_unary_inplace!(values, exp_inplace);
     values.iter_mut().for_each(|value| *value = value.exp());
 }
 
 #[inline]
 pub(crate) fn sigmoid_inplace(values: &mut [f32]) {
-    #[cfg(target_arch = "aarch64")]
-    if values.len() >= MIN_SIMD_LEN && neon_available() {
-        // SAFETY: runtime feature detection proves NEON is available, and the
-        // kernel bounds vector accesses by the slice length.
-        unsafe { aarch64::sigmoid_inplace(values) };
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
-        // SAFETY: AVX2/FMA are present; the kernel bounds vector accesses by
-        // the slice length.
-        unsafe { x86_64::sigmoid_inplace(values) };
-        return;
-    }
-
+    dispatch_unary_inplace!(values, sigmoid_inplace);
     values
         .iter_mut()
         .for_each(|value| *value = sigmoid_scalar(*value));
@@ -242,30 +280,11 @@ pub(crate) fn logistic_gradient(
     min_hess: f32,
     out: &mut [GradPair],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && gradient_slices_cover(preds.len(), labels, weights, out)
-        && neon_available()
-    {
-        // SAFETY: runtime feature detection proves NEON is available. The
-        // objective validates equal slice lengths before entering this kernel.
-        unsafe {
-            aarch64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out)
-        };
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && gradient_slices_cover(preds.len(), labels, weights, out)
-        && avx2_fma_available()
-    {
-        // SAFETY: AVX2/FMA are present and the slices cover `preds.len()`.
-        unsafe {
-            x86_64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out)
-        };
-        return;
-    }
-
+    dispatch_gradient!(
+        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        aarch64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out),
+        x86_64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out)
+    );
     logistic_gradient_scalar(preds, labels, weights, scale_pos_weight, min_hess, out);
 }
 
@@ -294,15 +313,10 @@ pub(crate) fn poisson_gradient(
     max_delta_step: f32,
     out: &mut [GradPair],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && gradient_slices_cover(preds.len(), labels, weights, out)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and objective inputs share a common length.
-        unsafe { aarch64::poisson_gradient(preds, labels, weights, max_delta_step, out) };
-        return;
-    }
+    dispatch_gradient!(
+        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        aarch64::poisson_gradient(preds, labels, weights, max_delta_step, out)
+    );
     scalar::poisson_gradient(preds, labels, weights, max_delta_step, out, 0..preds.len());
 }
 
@@ -312,15 +326,10 @@ pub(crate) fn gamma_gradient(
     weights: Option<&[f32]>,
     out: &mut [GradPair],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && gradient_slices_cover(preds.len(), labels, weights, out)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and objective inputs share a common length.
-        unsafe { aarch64::gamma_gradient(preds, labels, weights, out) };
-        return;
-    }
+    dispatch_gradient!(
+        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        aarch64::gamma_gradient(preds, labels, weights, out)
+    );
     scalar::gamma_gradient(preds, labels, weights, out, 0..preds.len());
 }
 
@@ -331,15 +340,10 @@ pub(crate) fn tweedie_gradient(
     rho: f32,
     out: &mut [GradPair],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && gradient_slices_cover(preds.len(), labels, weights, out)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and objective inputs share a common length.
-        unsafe { aarch64::tweedie_gradient(preds, labels, weights, rho, out) };
-        return;
-    }
+    dispatch_gradient!(
+        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        aarch64::tweedie_gradient(preds, labels, weights, rho, out)
+    );
     scalar::tweedie_gradient(preds, labels, weights, rho, out, 0..preds.len());
 }
 
@@ -518,14 +522,10 @@ fn distance_sum<const SQUARED: bool>(
     labels: &[f32],
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && metric_slices_cover(preds.len(), labels, weights)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and every input slice covers `preds`.
-        return unsafe { aarch64::distance_sum::<SQUARED>(preds, labels, weights) };
-    }
+    dispatch_metric_sum!(
+        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        aarch64::distance_sum::<SQUARED>(preds, labels, weights)
+    );
 
     let mut sum = 0.0;
     let mut weight_sum = 0.0;
@@ -548,14 +548,10 @@ pub(crate) fn classification_error_sum(
     labels: &[f32],
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && metric_slices_cover(preds.len(), labels, weights)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and every input slice covers `preds`.
-        return unsafe { aarch64::classification_error_sum(preds, labels, weights) };
-    }
+    dispatch_metric_sum!(
+        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        aarch64::classification_error_sum(preds, labels, weights)
+    );
 
     let mut wrong = 0.0;
     let mut weight_sum = 0.0;
@@ -570,14 +566,10 @@ pub(crate) fn classification_error_sum(
 }
 
 pub(crate) fn log_loss_sum(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> (f64, f64) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && metric_slices_cover(preds.len(), labels, weights)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and every input slice covers `preds`.
-        return unsafe { aarch64::log_loss_sum(preds, labels, weights) };
-    }
+    dispatch_metric_sum!(
+        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        aarch64::log_loss_sum(preds, labels, weights)
+    );
 
     scalar::log_loss(preds, labels, weights, 0..preds.len())
 }
@@ -587,14 +579,10 @@ pub(crate) fn positive_nloglik_sum<const GAMMA: bool>(
     labels: &[f32],
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
-    #[cfg(target_arch = "aarch64")]
-    if preds.len() >= MIN_SIMD_LEN
-        && metric_slices_cover(preds.len(), labels, weights)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and every input slice covers `preds`.
-        return unsafe { aarch64::positive_nloglik_sum::<GAMMA>(preds, labels, weights) };
-    }
+    dispatch_metric_sum!(
+        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        aarch64::positive_nloglik_sum::<GAMMA>(preds, labels, weights)
+    );
 
     scalar::positive_nloglik::<GAMMA>(preds, labels, weights, 0..preds.len())
 }
@@ -605,17 +593,14 @@ pub(crate) fn tweedie_nloglik_sum(
     weights: Option<&[f32]>,
     rho: f64,
 ) -> (f64, f64) {
-    #[cfg(target_arch = "aarch64")]
-    if rho.is_finite()
-        && rho > 1.0
-        && rho < 2.0
-        && preds.len() >= MIN_SIMD_LEN
-        && metric_slices_cover(preds.len(), labels, weights)
-        && neon_available()
-    {
-        // SAFETY: NEON is present and every input slice covers `preds`.
-        return unsafe { aarch64::tweedie_nloglik_sum(preds, labels, weights, rho) };
-    }
+    dispatch_metric_sum!(
+        rho.is_finite()
+            && rho > 1.0
+            && rho < 2.0
+            && preds.len() >= MIN_SIMD_LEN
+            && metric_slices_cover(preds.len(), labels, weights),
+        aarch64::tweedie_nloglik_sum(preds, labels, weights, rho)
+    );
 
     tweedie_nloglik_sum_scalar(preds, labels, weights, rho)
 }
@@ -651,12 +636,10 @@ pub(crate) fn multiclass_log_loss_sum(
         .checked_mul(num_class)
         .is_some_and(|len| preds.len() >= len)
         && weights.is_none_or(|values| values.len() >= labels.len());
-    #[cfg(target_arch = "aarch64")]
-    if labels.len() >= MIN_SIMD_LEN && complete && neon_available() {
-        // SAFETY: NEON is present and the complete matrix/weight checks cover
-        // every selected class probability.
-        return unsafe { aarch64::multiclass_log_loss_sum(preds, labels, weights, num_class) };
-    }
+    dispatch_metric_sum!(
+        labels.len() >= MIN_SIMD_LEN && complete,
+        aarch64::multiclass_log_loss_sum(preds, labels, weights, num_class)
+    );
 
     debug_assert!(complete);
     multiclass_log_loss_sum_scalar(preds, labels, weights, num_class)
@@ -691,16 +674,13 @@ pub(crate) fn multiclass_error_sum(
         .checked_mul(num_class)
         .is_some_and(|len| preds.len() >= len)
         && weights.is_none_or(|values| values.len() >= labels.len());
-    #[cfg(target_arch = "aarch64")]
-    if num_class >= 8
-        && num_class <= u32::MAX as usize
-        && labels.len() >= MIN_SIMD_LEN
-        && complete
-        && neon_available()
-    {
-        // SAFETY: NEON is present and each complete probability row is covered.
-        return unsafe { aarch64::multiclass_error_sum(preds, labels, weights, num_class) };
-    }
+    dispatch_metric_sum!(
+        num_class >= 8
+            && num_class <= u32::MAX as usize
+            && labels.len() >= MIN_SIMD_LEN
+            && complete,
+        aarch64::multiclass_error_sum(preds, labels, weights, num_class)
+    );
 
     debug_assert!(complete);
     multiclass_error_sum_scalar(preds, labels, weights, num_class)
@@ -726,7 +706,7 @@ fn multiclass_error_sum_scalar(
     (wrong, weight_sum)
 }
 
-pub(super) fn argmax_scalar(values: &[f32]) -> usize {
+pub(crate) fn argmax_scalar(values: &[f32]) -> usize {
     let mut best = 0;
     for index in 1..values.len() {
         if values[index] > values[best] {

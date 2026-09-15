@@ -45,63 +45,77 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
     }
 }
 
-/// Root-mean-square error (`rmse`).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Rmse;
-
-impl Metric for Rmse {
-    fn name(&self) -> &str {
-        "rmse"
-    }
-
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::squared_error_sum(preds, labels, weights)).sqrt()
-    }
+/// Define a purely-pointwise metric from its SIMD weighted-sum kernel.
+/// Generates the metric struct plus its [`Metric`] impl from the metric name
+/// and the `crate::simd` kernel path; `eval` is
+/// `weighted_mean(kernel(preds, labels, weights))`. Metrics with metric-level
+/// state take a `field: Type` arm and pass `self.field` as the kernel's final
+/// argument; `rmse` takes `=> sqrt` for its root. All generated metrics
+/// minimize (`maximize` keeps its default `false`); metrics with non-trivial
+/// logic (`auc`, `aucpr`, ranking) stay handwritten below.
+macro_rules! simple_metric {
+    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct $ty;
+        impl Metric for $ty {
+            fn name(&self) -> &str {
+                $name
+            }
+            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                weighted_mean($simd(preds, labels, weights))
+            }
+        }
+    };
+    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path => sqrt) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct $ty;
+        impl Metric for $ty {
+            fn name(&self) -> &str {
+                $name
+            }
+            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                weighted_mean($simd(preds, labels, weights)).sqrt()
+            }
+        }
+    };
+    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy)]
+        pub struct $ty {
+            $field: $field_ty,
+        }
+        impl Metric for $ty {
+            fn name(&self) -> &str {
+                $name
+            }
+            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                weighted_mean($simd(preds, labels, weights, self.$field))
+            }
+        }
+    };
 }
 
-/// Mean absolute error (`mae`).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Mae;
+simple_metric!(
+    /// Root-mean-square error (`rmse`).
+    Rmse, "rmse", crate::simd::squared_error_sum => sqrt
+);
 
-impl Metric for Mae {
-    fn name(&self) -> &str {
-        "mae"
-    }
+simple_metric!(
+    /// Mean absolute error (`mae`).
+    Mae, "mae", crate::simd::absolute_error_sum
+);
 
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::absolute_error_sum(preds, labels, weights))
-    }
-}
+simple_metric!(
+    /// Binary logistic loss (`logloss`). Predictions are probabilities.
+    LogLoss, "logloss", crate::simd::log_loss_sum
+);
 
-/// Binary logistic loss (`logloss`). Predictions are probabilities.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LogLoss;
-
-impl Metric for LogLoss {
-    fn name(&self) -> &str {
-        "logloss"
-    }
-
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::log_loss_sum(preds, labels, weights))
-    }
-}
-
-/// Binary classification error rate at threshold 0.5 (`error`).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ErrorRate;
-
-impl Metric for ErrorRate {
-    fn name(&self) -> &str {
-        "error"
-    }
-
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::classification_error_sum(
-            preds, labels, weights,
-        ))
-    }
-}
+simple_metric!(
+    /// Binary classification error rate at threshold 0.5 (`error`).
+    ErrorRate, "error", crate::simd::classification_error_sum
+);
 
 /// Binary ROC AUC (`auc`), computed with the Mann-Whitney rank-sum and average
 /// ranks for ties. Higher is better. Weights are ignored (unweighted AUC).
@@ -155,98 +169,31 @@ impl Metric for Auc {
     }
 }
 
-/// Multiclass log loss (`mlogloss`). Predictions are `n × num_class`
-/// probabilities. Labels are class indices.
-#[derive(Debug, Clone, Copy)]
-pub struct MLogLoss {
-    num_class: usize,
-}
+simple_metric!(
+    /// Multiclass log loss (`mlogloss`). Predictions are `n × num_class`
+    /// probabilities. Labels are class indices.
+    MLogLoss, "mlogloss", num_class: usize, crate::simd::multiclass_log_loss_sum
+);
 
-impl Metric for MLogLoss {
-    fn name(&self) -> &str {
-        "mlogloss"
-    }
+simple_metric!(
+    /// Multiclass error rate (`merror`): fraction whose argmax ≠ label.
+    MError, "merror", num_class: usize, crate::simd::multiclass_error_sum
+);
 
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::multiclass_log_loss_sum(
-            preds,
-            labels,
-            weights,
-            self.num_class,
-        ))
-    }
-}
+simple_metric!(
+    /// Poisson negative log-likelihood (`poisson-nloglik`). Predictions are rates.
+    PoissonNLogLik, "poisson-nloglik", crate::simd::positive_nloglik_sum::<false>
+);
 
-/// Multiclass error rate (`merror`): fraction whose argmax ≠ label.
-#[derive(Debug, Clone, Copy)]
-pub struct MError {
-    num_class: usize,
-}
+simple_metric!(
+    /// Gamma negative log-likelihood (`gamma-nloglik`). Predictions are means.
+    GammaNLogLik, "gamma-nloglik", crate::simd::positive_nloglik_sum::<true>
+);
 
-impl Metric for MError {
-    fn name(&self) -> &str {
-        "merror"
-    }
-
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::multiclass_error_sum(
-            preds,
-            labels,
-            weights,
-            self.num_class,
-        ))
-    }
-}
-
-/// Poisson negative log-likelihood (`poisson-nloglik`). Predictions are rates.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PoissonNLogLik;
-
-impl Metric for PoissonNLogLik {
-    fn name(&self) -> &str {
-        "poisson-nloglik"
-    }
-
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::positive_nloglik_sum::<false>(
-            preds, labels, weights,
-        ))
-    }
-}
-
-/// Gamma negative log-likelihood (`gamma-nloglik`). Predictions are means.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GammaNLogLik;
-
-impl Metric for GammaNLogLik {
-    fn name(&self) -> &str {
-        "gamma-nloglik"
-    }
-
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::positive_nloglik_sum::<true>(
-            preds, labels, weights,
-        ))
-    }
-}
-
-/// Tweedie negative log-likelihood (`tweedie-nloglik`) with variance power `rho`.
-#[derive(Debug, Clone, Copy)]
-pub struct TweedieNLogLik {
-    rho: f64,
-}
-
-impl Metric for TweedieNLogLik {
-    fn name(&self) -> &str {
-        "tweedie-nloglik"
-    }
-
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        weighted_mean(crate::simd::tweedie_nloglik_sum(
-            preds, labels, weights, self.rho,
-        ))
-    }
-}
+simple_metric!(
+    /// Tweedie negative log-likelihood (`tweedie-nloglik`) with variance power `rho`.
+    TweedieNLogLik, "tweedie-nloglik", rho: f64, crate::simd::tweedie_nloglik_sum
+);
 
 /// Iterate `(start, end)` row ranges for a group, or a single whole-batch
 /// range when no group info is present. Shared by the ranking metrics.
@@ -255,6 +202,30 @@ fn group_ranges(n: usize, group: Option<&crate::data::GroupInfo>) -> Vec<(usize,
         Some(g) if g.num_rows() == n => g.iter_ranges().collect(),
         _ => vec![(0, n)],
     }
+}
+
+/// Weighted mean of a per-group `score` over query-group ranges, weighted by
+/// each group's first document weight (`1.0` when unweighted). Shared by the
+/// ranking metrics' `eval_grouped`.
+fn grouped_average(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    group: Option<&crate::data::GroupInfo>,
+    mut score: impl FnMut(&[f32], &[f32]) -> f64,
+) -> f64 {
+    let ranges = group_ranges(preds.len(), group);
+    if ranges.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    let mut weight_sum = 0.0;
+    for &(start, end) in &ranges {
+        let weight = weights.map_or(1.0, |values| values[start] as f64);
+        sum += weight * score(&preds[start..end], &labels[start..end]);
+        weight_sum += weight;
+    }
+    weighted_mean((sum, weight_sum))
 }
 
 /// Normalized Discounted Cumulative Gain (`ndcg`), averaged over query groups.
@@ -326,34 +297,21 @@ impl Metric for Ndcg {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
-        let ranges = group_ranges(preds.len(), group);
-        if ranges.is_empty() {
-            return 0.0;
-        }
-        let mut sum = 0.0;
-        let mut weight_sum = 0.0;
-        for &(start, end) in &ranges {
-            let weight = weights.map_or(1.0, |values| values[start] as f64);
-            sum += weight * self.group_ndcg(&preds[start..end], &labels[start..end]);
-            weight_sum += weight;
-        }
-        if weight_sum > 0.0 {
-            sum / weight_sum
-        } else {
-            0.0
-        }
+        grouped_average(preds, labels, weights, group, |p, l| self.group_ndcg(p, l))
     }
 }
 
-/// NDCG gain of a relevance label: `2^rel - 1`.
+/// NDCG gain of a relevance label: `2^rel - 1`. Shared with the LambdaMART
+/// objective's `|ΔNDCG|` weighting.
 #[inline]
-fn ndcg_gain(rel: f64) -> f64 {
+pub(crate) fn ndcg_gain(rel: f64) -> f64 {
     (2.0f64).powf(rel) - 1.0
 }
 
-/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`.
+/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`. Shared with
+/// the LambdaMART objective's `|ΔNDCG|` weighting.
 #[inline]
-fn ndcg_discount(p: usize) -> f64 {
+pub(crate) fn ndcg_discount(p: usize) -> f64 {
     1.0 / ((p + 2) as f64).log2()
 }
 
@@ -419,22 +377,7 @@ impl Metric for MeanAveragePrecision {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
-        let ranges = group_ranges(preds.len(), group);
-        if ranges.is_empty() {
-            return 0.0;
-        }
-        let mut sum = 0.0;
-        let mut weight_sum = 0.0;
-        for &(start, end) in &ranges {
-            let weight = weights.map_or(1.0, |values| values[start] as f64);
-            sum += weight * self.group_ap(&preds[start..end], &labels[start..end]);
-            weight_sum += weight;
-        }
-        if weight_sum > 0.0 {
-            sum / weight_sum
-        } else {
-            0.0
-        }
+        grouped_average(preds, labels, weights, group, |p, l| self.group_ap(p, l))
     }
 }
 

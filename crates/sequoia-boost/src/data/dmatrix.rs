@@ -15,6 +15,42 @@ pub(crate) fn is_missing(v: f32, missing: f32) -> bool {
     }
 }
 
+/// Length check shared by every constructor and metadata setter: `got` must
+/// equal `expected`. Preserves the [`SequoiaError::DimensionMismatch`] shape
+/// each call site already returned.
+#[inline]
+pub(crate) fn check_len(what: &'static str, got: usize, expected: usize) -> Result<()> {
+    if got != expected {
+        return Err(SequoiaError::DimensionMismatch {
+            what,
+            expected,
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// Validate CSR `indptr` against `nnz` stored entries: first offset 0,
+/// monotonic offsets within bounds, terminal offset `== nnz`.
+/// Caller must ensure `indptr` is non-empty (`from_csr` rejects that first).
+pub(crate) fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
+    if indptr[0] != 0 {
+        return Err(SequoiaError::invalid_param(
+            "csr indptr",
+            "the first offset must be 0",
+        ));
+    }
+    for pair in indptr.windows(2) {
+        if pair[0] > pair[1] || pair[1] > nnz {
+            return Err(SequoiaError::invalid_param(
+                "csr indptr",
+                "offsets must be monotonic and within the values array",
+            ));
+        }
+    }
+    check_len("csr indptr terminal", indptr[indptr.len() - 1], nnz)
+}
+
 /// Backing storage for the feature matrix.
 #[derive(Debug, Clone)]
 enum Storage {
@@ -81,13 +117,7 @@ impl DMatrix {
         let expected = n_rows.checked_mul(n_cols).ok_or_else(|| {
             SequoiaError::invalid_param("matrix shape", "n_rows * n_cols overflows usize")
         })?;
-        if data.len() != expected {
-            return Err(SequoiaError::DimensionMismatch {
-                what: "dense data length",
-                expected,
-                got: data.len(),
-            });
-        }
+        check_len("dense data length", data.len(), expected)?;
         // With the NaN sentinel the only rejected values are infinities, a
         // branch-free check the compiler vectorizes; other sentinels need the
         // general test.
@@ -134,34 +164,8 @@ impl DMatrix {
         if n_rows == 0 || n_cols == 0 {
             return Err(SequoiaError::EmptyDataset("from_csr: zero rows or columns"));
         }
-        if indices.len() != values.len() {
-            return Err(SequoiaError::DimensionMismatch {
-                what: "csr indices/values length",
-                expected: indices.len(),
-                got: values.len(),
-            });
-        }
-        if indptr[0] != 0 {
-            return Err(SequoiaError::invalid_param(
-                "csr indptr",
-                "the first offset must be 0",
-            ));
-        }
-        for pair in indptr.windows(2) {
-            if pair[0] > pair[1] || pair[1] > values.len() {
-                return Err(SequoiaError::invalid_param(
-                    "csr indptr",
-                    "offsets must be monotonic and within the values array",
-                ));
-            }
-        }
-        if *indptr.last().unwrap() != values.len() {
-            return Err(SequoiaError::DimensionMismatch {
-                what: "csr indptr terminal",
-                expected: values.len(),
-                got: *indptr.last().unwrap(),
-            });
-        }
+        check_len("csr indices/values length", values.len(), indices.len())?;
+        check_csr(&indptr, values.len())?;
         if let Some(&m) = indices.iter().max() {
             if (m as usize) >= n_cols {
                 return Err(SequoiaError::FeatureOutOfBounds {
@@ -272,13 +276,7 @@ impl DMatrix {
             ));
         };
         let g = GroupInfo::from_sizes(sizes);
-        if total != self.n_rows {
-            return Err(SequoiaError::DimensionMismatch {
-                what: "group sizes sum",
-                expected: self.n_rows,
-                got: total,
-            });
-        }
+        check_len("group sizes sum", total, self.n_rows)?;
         self.group = Some(g);
         Ok(self)
     }
@@ -292,13 +290,7 @@ impl DMatrix {
         let group = self.group.as_ref().ok_or_else(|| {
             SequoiaError::invalid_param("group_weights", "attach group sizes first")
         })?;
-        if weights.len() != group.num_groups() {
-            return Err(SequoiaError::DimensionMismatch {
-                what: "group_weights length",
-                expected: group.num_groups(),
-                got: weights.len(),
-            });
-        }
+        check_len("group_weights length", weights.len(), group.num_groups())?;
         if weights
             .iter()
             .any(|weight| !weight.is_finite() || *weight < 0.0)
@@ -319,13 +311,7 @@ impl DMatrix {
 
     /// Set the feature types (`len == n_cols`).
     pub fn with_feature_types(mut self, types: &[FeatureType]) -> Result<Self> {
-        if types.len() != self.n_cols {
-            return Err(SequoiaError::DimensionMismatch {
-                what: "feature_types length",
-                expected: self.n_cols,
-                got: types.len(),
-            });
-        }
+        check_len("feature_types length", types.len(), self.n_cols)?;
         self.feature_types = types.to_vec();
         for (col, ty) in types.iter().enumerate() {
             if *ty == FeatureType::Categorical {
@@ -346,26 +332,13 @@ impl DMatrix {
 
     /// Set human-readable feature names (`len == n_cols`).
     pub fn with_feature_names(mut self, names: &[String]) -> Result<Self> {
-        if names.len() != self.n_cols {
-            return Err(SequoiaError::DimensionMismatch {
-                what: "feature_names length",
-                expected: self.n_cols,
-                got: names.len(),
-            });
-        }
+        check_len("feature_names length", names.len(), self.n_cols)?;
         self.feature_names = Some(names.to_vec());
         Ok(self)
     }
 
     fn check_row_len(&self, what: &'static str, got: usize) -> Result<()> {
-        if got != self.n_rows {
-            return Err(SequoiaError::DimensionMismatch {
-                what,
-                expected: self.n_rows,
-                got,
-            });
-        }
-        Ok(())
+        check_len(what, got, self.n_rows)
     }
 
     /// Number of rows (instances).
@@ -526,7 +499,6 @@ impl DMatrix {
     /// finding (used by the exact tree method). Each column lists its
     /// non-missing `(row, value)` pairs.
     pub fn to_csc(&self) -> CscView {
-        // Count non-missing entries per column.
         let mut col_counts = vec![0usize; self.n_cols];
         self.for_each_entry(|_row, col, _v| col_counts[col as usize] += 1);
 

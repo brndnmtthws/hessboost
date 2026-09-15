@@ -115,6 +115,27 @@ pub(crate) fn rowwise_gradient<K>(
     );
 }
 
+/// Debug-only shape check shared by every [`Objective::gradient`]: `preds` and
+/// `out` hold `n_rows * n_outputs` values while `labels` (and `weights`, when
+/// present) hold one per row. Release builds skip it, like the
+/// `debug_assert_eq!`s it replaces; [`rowwise_gradient`] re-validates the same
+/// shapes at runtime for its chunking decision.
+pub(crate) fn check_gradient_inputs(
+    n_rows: usize,
+    n_outputs: usize,
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    out: &[GradPair],
+) {
+    debug_assert_eq!(preds.len(), n_rows * n_outputs);
+    debug_assert_eq!(out.len(), n_rows * n_outputs);
+    debug_assert_eq!(labels.len(), n_rows);
+    if let Some(w) = weights {
+        debug_assert_eq!(w.len(), n_rows);
+    }
+}
+
 /// A differentiable learning objective.
 ///
 /// Implementors are `Send + Sync` so gradient computation can be parallelized.
@@ -268,8 +289,8 @@ mod tests {
     /// multiples of the chunk or of any vector block. The logistic case sweeps
     /// every short-tail residue r in 1..=15, where a separate final chunk
     /// would fall below the vector dispatch length and compute its rows on
-    /// the scalar path; the sweep also pins the structural invariant the fold
-    /// relies on — chunk boundaries stay multiples of every kernel block, so
+    /// the scalar path. The sweep also pins the structural invariant the fold
+    /// relies on: chunk boundaries stay multiples of every kernel block, so
     /// a uniform `chunk + tail` chunking would fail here.
     #[test]
     fn chunked_gradients_match_whole_batch() {

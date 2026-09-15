@@ -3,6 +3,21 @@
 
 use super::{weighted_label_mean, GradPair, Objective};
 
+/// Prediction transform shared by the log-link count objectives: `exp(margin)`.
+fn log_link_transform(preds: &mut [f32]) {
+    crate::simd::exp_inplace(preds);
+}
+
+/// Inverse log link in margin (`f32`) space, floored away from zero.
+fn log_link_margin32(base_score: f32) -> f32 {
+    base_score.max(1e-6).ln()
+}
+
+/// Inverse log link from a label mean (`f64`), floored away from zero.
+fn log_link_margin64(mean: f64) -> f32 {
+    mean.max(1e-6).ln() as f32
+}
+
 /// Poisson regression (`count:poisson`). Gradient is `exp(m) − y`. The Hessian is
 /// stabilized by `max_delta_step` (default 0.7 in XGBoost) via
 /// `exp(m + max_delta_step)`.
@@ -38,19 +53,20 @@ impl Objective for PoissonObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         crate::simd::poisson_gradient(preds, labels, weights, self.max_delta_step, out);
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        crate::simd::exp_inplace(preds);
+        log_link_transform(preds);
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {
-        base_score.max(1e-6).ln()
+        log_link_margin32(base_score)
     }
 
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        (weighted_label_mean(labels, weights).max(1e-6)).ln() as f32
+        log_link_margin64(weighted_label_mean(labels, weights))
     }
 
     fn default_metric(&self) -> &str {
@@ -75,19 +91,20 @@ impl Objective for GammaObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         crate::simd::gamma_gradient(preds, labels, weights, out);
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        crate::simd::exp_inplace(preds);
+        log_link_transform(preds);
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {
-        base_score.max(1e-6).ln()
+        log_link_margin32(base_score)
     }
 
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        (weighted_label_mean(labels, weights).max(1e-6)).ln() as f32
+        log_link_margin64(weighted_label_mean(labels, weights))
     }
 
     fn default_metric(&self) -> &str {
@@ -126,19 +143,20 @@ impl Objective for TweedieObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         crate::simd::tweedie_gradient(preds, labels, weights, self.rho, out);
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
-        crate::simd::exp_inplace(preds);
+        log_link_transform(preds);
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {
-        base_score.max(1e-6).ln()
+        log_link_margin32(base_score)
     }
 
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        (weighted_label_mean(labels, weights).max(1e-6)).ln() as f32
+        log_link_margin64(weighted_label_mean(labels, weights))
     }
 
     fn default_metric(&self) -> &str {

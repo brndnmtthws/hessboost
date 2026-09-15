@@ -5,7 +5,7 @@ use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::data::DMatrix;
 use crate::error::{Result, SequoiaError};
-use crate::learner::model::BoostedModel;
+use crate::learner::model::{base_margins, BoostedModel};
 use crate::metric::create_metrics;
 use crate::objective::{create_objective, GradPair};
 use crate::tree::builder::{
@@ -339,10 +339,10 @@ fn train_impl_inner(
 
     // Incremental margin caches (length rows × n_out). A dataset's per-instance
     // `base_margin`, when present, overrides the scalar base score.
-    let mut train_margin = init_margin(dtrain, base_margin, n_out);
+    let mut train_margin = base_margins(dtrain, base_margin, n_out);
     let mut eval_margins: Vec<Vec<f32>> = evals
         .iter()
-        .map(|(d, _)| init_margin(d, base_margin, n_out))
+        .map(|(d, _)| base_margins(d, base_margin, n_out))
         .collect();
 
     // A caller-supplied metric replaces the configured/default metric list;
@@ -408,14 +408,7 @@ fn train_impl_inner(
             // 3. One tree per output.
             for k in 0..n_out {
                 // Gather this output's gradient slice.
-                let gk: &[GradPair] = if n_out == 1 {
-                    &gpair
-                } else {
-                    for r in 0..n {
-                        gpair_k[r] = gpair[r * n_out + k];
-                    }
-                    &gpair_k
-                };
+                let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
 
                 let mut sampler =
                     make_column_sampler(n_features, params, &mut rng, round as u64, k as u64);
@@ -618,14 +611,7 @@ fn dart_round(
     let eta = params.eta as f32;
     let new_weight = if k == 0 { 1.0 } else { 1.0 / (k as f32 + eta) };
     for kk in 0..n_out {
-        let gk: &[GradPair] = if n_out == 1 {
-            gpair
-        } else {
-            for r in 0..n {
-                gpair_k[r] = gpair[r * n_out + kk];
-            }
-            gpair_k
-        };
+        let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, kk);
         let mut sampler =
             make_column_sampler(n_features, params, &mut rng, round as u64, kk as u64);
         let mut tree = prepared.build_tree(params, dtrain, gk, &row_subset, &mut sampler);
@@ -641,6 +627,26 @@ fn dart_round(
     };
     for &i in &drop_indices {
         model.scale_tree_weight(i, factor);
+    }
+}
+
+/// Borrow the gradient slice for output `k`: the whole buffer for
+/// single-output objectives, otherwise gather output `k`'s pairs into
+/// `scratch` (length `n`) and borrow that. Shared by the boosting loop and
+/// the DART rounds.
+fn gather_output<'a>(
+    gpair: &'a [GradPair],
+    scratch: &'a mut [GradPair],
+    n_out: usize,
+    k: usize,
+) -> &'a [GradPair] {
+    if n_out == 1 {
+        gpair
+    } else {
+        for (r, dst) in scratch.iter_mut().enumerate() {
+            *dst = gpair[r * n_out + k];
+        }
+        scratch
     }
 }
 
@@ -670,28 +676,6 @@ fn sample_features(n: usize, colsample: f64, rng: &mut StdRng) -> Vec<u32> {
     idx.truncate(k);
     idx.sort_unstable();
     idx
-}
-
-/// Initialize the margin buffer for `data`: the scalar `base_margin` broadcast
-/// to every `(row, output)`, then overridden by the dataset's per-instance
-/// `base_margin` when present. Accepts a base margin of length `n_rows`
-/// (broadcast across outputs) or `n_rows * n_out` (per output). A mismatched
-/// length is rejected before this helper is called.
-fn init_margin(data: &DMatrix, base_margin: f32, n_out: usize) -> Vec<f32> {
-    let n = data.n_rows();
-    let mut m = vec![base_margin; n * n_out];
-    if let Some(bm) = data.base_margin() {
-        if bm.len() == n * n_out {
-            m.copy_from_slice(bm);
-        } else if bm.len() == n {
-            for r in 0..n {
-                for k in 0..n_out {
-                    m[r * n_out + k] = bm[r];
-                }
-            }
-        }
-    }
-    m
 }
 
 fn validate_dataset(

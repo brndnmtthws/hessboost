@@ -68,6 +68,7 @@ impl Objective for CustomObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
+        super::check_gradient_inputs(labels.len(), self.n_outputs, preds, labels, weights, out);
         (self.grad_fn)(preds, labels, weights, out);
     }
 

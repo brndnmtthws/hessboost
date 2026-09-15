@@ -31,6 +31,13 @@ pub struct HistCuts {
     is_categorical: Vec<bool>,
 }
 
+/// Global bin index for an `upper_bound` count `local` within a feature owning
+/// `n_cuts` cuts starting at `start`: clamp into the last real bin.
+#[inline]
+fn global_bin(start: usize, local: usize, n_cuts: usize) -> u32 {
+    start as u32 + local.min(n_cuts.saturating_sub(1)) as u32
+}
+
 impl HistCuts {
     /// Compute cuts from a dataset with at most `max_bin` bins per feature.
     ///
@@ -217,9 +224,7 @@ impl HistCuts {
             return start as u32 + local as u32;
         }
         // upper_bound: first cut strictly greater than value.
-        let local = slice.partition_point(|&c| c <= value);
-        let local = local.min(slice.len().saturating_sub(1));
-        start as u32 + local as u32
+        global_bin(start, slice.partition_point(|&c| c <= value), slice.len())
     }
 }
 
@@ -309,8 +314,7 @@ impl<'a> BinSearch<'a> {
         } else {
             end - start
         };
-        let local = local.min((end - start).saturating_sub(1));
-        start as u32 + local as u32
+        global_bin(start, local, end - start)
     }
 }
 

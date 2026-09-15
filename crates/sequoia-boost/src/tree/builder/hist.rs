@@ -5,14 +5,16 @@
 //! subtraction (`sibling = parent − smaller_child`), so only the smaller child
 //! is ever built directly. Supports both `depthwise` and `lossguide` growth.
 
+use super::{
+    build_interaction_sets, eval_missing_directions, loss_ord, next_allowed, parent_gain,
+    sweep_categorical, BestSplit, SplitPos, K_RT_EPS,
+};
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::tree::constraints::{
-    calc_weight_bounded, child_bounds, gain_at_weight, satisfies, Bounds, MonotoneConstraints,
-};
-use crate::tree::gain::{calc_gain, GradStats, RegParams};
+use crate::tree::constraints::{calc_weight_bounded, child_bounds, Bounds, MonotoneConstraints};
+use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::{
     subtract_in_place, zeroed, BinIndex, CpuBackend, Histogram, HistogramBackend,
 };
@@ -20,54 +22,12 @@ use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap};
 
-const K_RT_EPS: f64 = 1e-6;
 /// Nodes with at least this many rows evaluate their two children's splits
 /// concurrently. Smaller nodes appear in frontiers wide enough to keep the
 /// pool busy, and their evaluation is too short to be worth a fork.
 const PARALLEL_EVALUATE_ROWS: usize = 16_384;
-
-/// The best split found for a node, in bin space.
-#[derive(Debug, Clone)]
-struct BestSplit {
-    loss_chg: f64,
-    feature: u32,
-    /// Global bin index `i`: instances with bin ≤ `i` go left (numeric splits).
-    split_bin: usize,
-    default_left: bool,
-    left: GradStats,
-    right: GradStats,
-    /// Bounded child weights (used to derive monotone child bounds).
-    w_left: f64,
-    w_right: f64,
-    /// Whether this is a categorical (set-membership) split.
-    is_categorical: bool,
-    /// For a categorical split, the category values routed left.
-    cat_left: Vec<u32>,
-}
-
-impl BestSplit {
-    fn none() -> Self {
-        BestSplit {
-            loss_chg: 0.0,
-            feature: 0,
-            split_bin: 0,
-            default_left: true,
-            left: GradStats::default(),
-            right: GradStats::default(),
-            w_left: 0.0,
-            w_right: 0.0,
-            is_categorical: false,
-            cat_left: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn found(&self) -> bool {
-        self.loss_chg > K_RT_EPS
-    }
-}
 
 /// Training rows that reached a leaf during tree construction.
 pub(crate) struct LeafRows {
@@ -115,7 +75,7 @@ impl PartialOrd for NodeEntry {
 }
 impl Ord for NodeEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.best.loss_chg.total_cmp(&other.best.loss_chg)
+        loss_ord(self.best.loss_chg, other.best.loss_chg)
     }
 }
 
@@ -183,7 +143,6 @@ impl<'a> HistTreeBuilder<'a> {
     ) -> (RegTree, Vec<LeafRows>) {
         let total_bins = ghist.total_bins();
 
-        // Root statistics and histogram.
         let mut root_stats = GradStats::default();
         for &r in row_subset {
             let gp = gpair[r as usize];
@@ -201,7 +160,6 @@ impl<'a> HistTreeBuilder<'a> {
 
         // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
         let root_feats = sampler.sample();
-        // At the root every feature is allowed (`None`).
         let best = self.evaluate(
             ghist,
             &root_hist,
@@ -455,11 +413,11 @@ impl<'a> HistTreeBuilder<'a> {
 
         // Both children share the same allowed feature set: the parent's set
         // intersected with the split feature's interaction set. Inactive ⇒ `None`.
-        let child_allowed = if let Some(interaction_sets) = &self.interaction_sets {
-            next_allowed(parent_allowed.as_deref(), b.feature, interaction_sets)
-        } else {
-            None
-        };
+        let child_allowed = next_allowed(
+            parent_allowed.as_deref(),
+            b.feature,
+            self.interaction_sets.as_ref(),
+        );
 
         // The children's split searches are independent; near the root, where
         // the frontier holds too few nodes to occupy the pool, running them
@@ -535,7 +493,6 @@ impl<'a> HistTreeBuilder<'a> {
     ) -> BestSplit {
         let cuts = ghist.cuts();
         let mut best = BestSplit::none();
-        let mcw = self.reg.min_child_weight;
         // A dense index has no missing entries: every feature's bins sum to
         // `total` (up to rounding), so the missing direction is never distinct
         // and the per-feature sums need not be computed.
@@ -556,19 +513,8 @@ impl<'a> HistTreeBuilder<'a> {
             }
             None => feature_subset,
         };
-        // When no monotone constraints are configured, the bounds are always
-        // infinite, so the cheap closed-form gain `Tα(G)²/(H+λ)` is exact and
-        // avoids the per-candidate weight/clamp arithmetic.
         let constrained = self.cons.is_active();
-        let parent_gain = if constrained {
-            gain_at_weight(
-                total,
-                &self.reg,
-                calc_weight_bounded(total, &self.reg, bounds),
-            )
-        } else {
-            calc_gain(total, &self.reg)
-        };
+        let parent_gain = parent_gain(total, &self.reg, bounds, constrained);
 
         for &f in feature_subset {
             let (fs, fe) = cuts.feature_bins(f as usize);
@@ -578,18 +524,22 @@ impl<'a> HistTreeBuilder<'a> {
             let dir = self.cons.dir(f as usize);
 
             if cuts.is_categorical(f as usize) {
-                self.evaluate_categorical(
+                // Only non-empty category bins can move; the sweep sorts them
+                // by grad/hess ratio.
+                let mut cats: Vec<(u32, GradStats)> = (fs..fe)
+                    .filter(|&i| hist[i].hess > 0.0)
+                    .map(|i| (cuts.cut_value(i) as u32, hist[i]))
+                    .collect();
+                sweep_categorical(
                     &mut best,
-                    cuts,
-                    hist,
+                    &mut cats,
                     total,
                     parent_gain,
                     bounds,
                     dir,
                     constrained,
+                    &self.reg,
                     f,
-                    fs,
-                    fe,
                 );
                 continue;
             }
@@ -603,16 +553,18 @@ impl<'a> HistTreeBuilder<'a> {
                 let present = crate::simd::sum_grad_stats(&hist[fs..fe]);
                 (present, total.sub(present).hess > 1e-6)
             };
-            let missing = total.sub(present);
 
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             if !constrained && !has_missing {
+                // Seed the scan with the node-wide incumbent so its epsilon
+                // decisions continue the sequential scalar scan.
                 if let crate::simd::DenseSplitScan::Scanned(candidate) =
                     crate::simd::dense_unconstrained_best_split(
                         &hist[fs..fe],
                         total,
                         &self.reg,
                         parent_gain,
+                        best.loss_chg,
                         K_RT_EPS,
                     )
                 {
@@ -621,6 +573,7 @@ impl<'a> HistTreeBuilder<'a> {
                             best = BestSplit {
                                 loss_chg: candidate.loss_change,
                                 feature: f,
+                                threshold: 0.0,
                                 split_bin: fs + candidate.split_offset,
                                 default_left: false,
                                 left: candidate.left,
@@ -643,211 +596,23 @@ impl<'a> HistTreeBuilder<'a> {
                 if i + 1 >= fe {
                     break; // no right side beyond the last bin
                 }
-
-                // Direction A: missing -> right. Left = present-so-far.
-                let la = acc;
-                let ra = total.sub(acc);
-                if la.hess >= mcw && ra.hess >= mcw {
-                    self.consider(
-                        &mut best,
-                        la,
-                        ra,
-                        parent_gain,
-                        bounds,
-                        dir,
-                        constrained,
-                        f,
-                        i,
-                        false,
-                    );
-                }
-
-                // Direction B: missing -> left. Only distinct when missing exists.
-                if has_missing {
-                    let mut lb = acc;
-                    lb.add(missing);
-                    let rb = present.sub(acc);
-                    if lb.hess >= mcw && rb.hess >= mcw {
-                        self.consider(
-                            &mut best,
-                            lb,
-                            rb,
-                            parent_gain,
-                            bounds,
-                            dir,
-                            constrained,
-                            f,
-                            i,
-                            true,
-                        );
-                    }
-                }
+                eval_missing_directions(
+                    &mut best,
+                    acc,
+                    present,
+                    total,
+                    &self.reg,
+                    parent_gain,
+                    bounds,
+                    dir,
+                    constrained,
+                    f,
+                    SplitPos::Bin(i),
+                    has_missing,
+                );
             }
         }
         best
-    }
-
-    /// Evaluate one candidate split (bounded weights, monotone check) and update
-    /// `best` if it improves.
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    fn consider(
-        &self,
-        best: &mut BestSplit,
-        left: GradStats,
-        right: GradStats,
-        parent_gain: f64,
-        bounds: Bounds,
-        dir: i8,
-        constrained: bool,
-        feature: u32,
-        split_bin: usize,
-        default_left: bool,
-    ) {
-        // Unconstrained: cheap closed-form gain, no weight/clamp arithmetic.
-        let (g, wl, wr) = if constrained {
-            let wl = calc_weight_bounded(left, &self.reg, bounds);
-            let wr = calc_weight_bounded(right, &self.reg, bounds);
-            if !satisfies(dir, wl, wr) {
-                return; // monotone constraint violated
-            }
-            (
-                gain_at_weight(left, &self.reg, wl) + gain_at_weight(right, &self.reg, wr)
-                    - parent_gain,
-                wl,
-                wr,
-            )
-        } else {
-            (
-                calc_gain(left, &self.reg) + calc_gain(right, &self.reg) - parent_gain,
-                0.0,
-                0.0,
-            )
-        };
-        if g > best.loss_chg + K_RT_EPS {
-            *best = BestSplit {
-                loss_chg: g,
-                feature,
-                split_bin,
-                default_left,
-                left,
-                right,
-                w_left: wl,
-                w_right: wr,
-                is_categorical: false,
-                cat_left: Vec::new(),
-            };
-        }
-    }
-
-    /// Find the best categorical (set-membership) split for one feature.
-    ///
-    /// Follows XGBoost's sorted-partition strategy: rank the feature's category
-    /// bins by their gradient/Hessian ratio, then sweep prefix partitions of that
-    /// order. This yields the optimal two-set partition under the standard result
-    /// that sorting by the score ratio makes the best subset contiguous. The
-    /// prefix categories form the "left" set. Every other (and missing) category
-    /// goes right.
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_categorical(
-        &self,
-        best: &mut BestSplit,
-        cuts: &HistCuts,
-        hist: &[GradStats],
-        total: GradStats,
-        parent_gain: f64,
-        bounds: Bounds,
-        dir: i8,
-        constrained: bool,
-        feature: u32,
-        fs: usize,
-        fe: usize,
-    ) {
-        let mcw = self.reg.min_child_weight;
-        // Only non-empty category bins can move; sort them by grad/hess ratio.
-        let mut order: Vec<usize> = (fs..fe).filter(|&i| hist[i].hess > 0.0).collect();
-        if order.len() < 2 {
-            return;
-        }
-        let ratio = |s: GradStats| s.grad / (s.hess + self.reg.lambda);
-        order.sort_by(|&a, &b| ratio(hist[a]).total_cmp(&ratio(hist[b])));
-
-        let mut left = GradStats::default();
-        let mut cats_left: Vec<u32> = Vec::new();
-        // Sweep prefixes, always leaving at least one category on the right.
-        for &bin in &order[..order.len() - 1] {
-            left.add(hist[bin]);
-            cats_left.push(cuts.cut_value(bin) as u32);
-            // `total` includes any missing mass, which stays on the right.
-            let right = total.sub(left);
-            if left.hess < mcw || right.hess < mcw {
-                continue;
-            }
-            self.consider_cat(
-                best,
-                left,
-                right,
-                parent_gain,
-                bounds,
-                dir,
-                constrained,
-                feature,
-                &cats_left,
-            );
-        }
-    }
-
-    /// Evaluate one categorical candidate (left = `cats_left`, rest = right) and
-    /// update `best` if it improves. Mirrors [`Self::consider`] but records the
-    /// category set instead of a bin threshold.
-    #[allow(clippy::too_many_arguments)]
-    fn consider_cat(
-        &self,
-        best: &mut BestSplit,
-        left: GradStats,
-        right: GradStats,
-        parent_gain: f64,
-        bounds: Bounds,
-        dir: i8,
-        constrained: bool,
-        feature: u32,
-        cats_left: &[u32],
-    ) {
-        let (g, wl, wr) = if constrained {
-            let wl = calc_weight_bounded(left, &self.reg, bounds);
-            let wr = calc_weight_bounded(right, &self.reg, bounds);
-            if !satisfies(dir, wl, wr) {
-                return; // monotone constraint violated
-            }
-            (
-                gain_at_weight(left, &self.reg, wl) + gain_at_weight(right, &self.reg, wr)
-                    - parent_gain,
-                wl,
-                wr,
-            )
-        } else {
-            (
-                calc_gain(left, &self.reg) + calc_gain(right, &self.reg) - parent_gain,
-                0.0,
-                0.0,
-            )
-        };
-        if g > best.loss_chg + K_RT_EPS {
-            *best = BestSplit {
-                loss_chg: g,
-                feature,
-                split_bin: 0,
-                // Present categories not in the left set go right; route missing
-                // right as well (XGBoost's default for categorical features).
-                default_left: false,
-                left,
-                right,
-                w_left: wl,
-                w_right: wr,
-                is_categorical: true,
-                cat_left: cats_left.to_vec(),
-            };
-        }
     }
 }
 
@@ -939,52 +704,6 @@ fn route_dense<B: BinIndex>(rows: &[u32], column: &[B], split_bin: usize) -> (Ve
         right.extend_from_slice(&r);
     }
     (left, right)
-}
-
-/// Precompute per-feature interaction sets from the constraint groups.
-///
-/// The interaction set of a feature is the union of every group that contains
-/// it (which includes the feature itself). A feature that appears in no group
-/// may only interact with itself. Returns
-/// `None` when no constraints are configured (the inactive, no-filtering case).
-fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<HashMap<u32, Vec<u32>>> {
-    if groups.is_empty() {
-        return None;
-    }
-    let mut sets: HashMap<u32, BTreeSet<u32>> = HashMap::new();
-    for group in groups {
-        for &f in group {
-            let entry = sets.entry(f).or_default();
-            entry.extend(group.iter().copied());
-        }
-    }
-    Some(
-        sets.into_iter()
-            .map(|(f, s)| (f, s.into_iter().collect()))
-            .collect(),
-    )
-}
-
-/// Intersect a node's allowed set with a feature's interaction set. Both operands
-/// are sorted. `None` denotes "all features". The result is sorted, and `None`
-/// only when both operands are `None`.
-fn next_allowed(
-    parent: Option<&[u32]>,
-    feature: u32,
-    sets: &HashMap<u32, Vec<u32>>,
-) -> Option<Vec<u32>> {
-    let singleton = [feature];
-    let feature_set = sets
-        .get(&feature)
-        .map_or(singleton.as_slice(), Vec::as_slice);
-    Some(match parent {
-        None => feature_set.to_vec(),
-        Some(parent) => parent
-            .iter()
-            .copied()
-            .filter(|f| feature_set.binary_search(f).is_ok())
-            .collect(),
-    })
 }
 
 /// Per-node statistics and monotone bounds, indexed by node id.

@@ -5,13 +5,34 @@ use crate::error::{Result, SequoiaError};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+/// Parse error for 0-based `lineno` (reported 1-based).
+fn parse_err(lineno: usize, reason: impl Into<String>) -> SequoiaError {
+    SequoiaError::Parse {
+        line: lineno + 1,
+        reason: reason.into(),
+    }
+}
+
+/// Parse a label field, mapping failure to a line-anchored [`SequoiaError::Parse`].
+fn parse_label(field: &str, lineno: usize) -> Result<f32> {
+    field
+        .parse()
+        .map_err(|_| parse_err(lineno, format!("invalid label `{field}`")))
+}
+
+/// Parse a feature value field.
+fn parse_value(field: &str, lineno: usize) -> Result<f32> {
+    field
+        .parse()
+        .map_err(|_| parse_err(lineno, format!("invalid value `{field}`")))
+}
+
 /// Load a libsvm / SVMLight file into a sparse [`DMatrix`].
 ///
 /// Each line is `label idx:value idx:value ...` with **0-based** feature
 /// indices, matching XGBoost's reader. The label becomes the matrix labels.
 pub fn load_libsvm(path: impl AsRef<Path>) -> Result<DMatrix> {
-    let file = std::fs::File::open(path)?;
-    read_libsvm(BufReader::new(file))
+    read_libsvm(std::fs::File::open(path)?)
 }
 
 /// Parse libsvm-formatted text from any reader.
@@ -30,29 +51,20 @@ pub fn read_libsvm<R: Read>(reader: R) -> Result<DMatrix> {
             continue;
         }
         let mut it = line.split_whitespace();
-        let label_tok = it.next().ok_or_else(|| SequoiaError::Parse {
-            line: lineno + 1,
-            reason: "missing label".into(),
-        })?;
-        let label: f32 = label_tok.parse().map_err(|_| SequoiaError::Parse {
-            line: lineno + 1,
-            reason: format!("invalid label `{label_tok}`"),
-        })?;
+        let label_tok = it
+            .next()
+            .ok_or_else(|| parse_err(lineno, "missing label"))?;
+        let label: f32 = parse_label(label_tok, lineno)?;
         labels.push(label);
 
         for tok in it {
-            let (idx_s, val_s) = tok.split_once(':').ok_or_else(|| SequoiaError::Parse {
-                line: lineno + 1,
-                reason: format!("expected idx:value, got `{tok}`"),
-            })?;
-            let idx: u32 = idx_s.parse().map_err(|_| SequoiaError::Parse {
-                line: lineno + 1,
-                reason: format!("invalid index `{idx_s}`"),
-            })?;
-            let val: f32 = val_s.parse().map_err(|_| SequoiaError::Parse {
-                line: lineno + 1,
-                reason: format!("invalid value `{val_s}`"),
-            })?;
+            let (idx_s, val_s) = tok
+                .split_once(':')
+                .ok_or_else(|| parse_err(lineno, format!("expected idx:value, got `{tok}`")))?;
+            let idx: u32 = idx_s
+                .parse()
+                .map_err(|_| parse_err(lineno, format!("invalid index `{idx_s}`")))?;
+            let val: f32 = parse_value(val_s, lineno)?;
             indices.push(idx);
             values.push(val);
             max_index = max_index.max(idx);
@@ -93,8 +105,7 @@ impl Default for CsvOptions {
 
 /// Load a numeric CSV into a dense [`DMatrix`] (NaN sentinel for missing).
 pub fn load_csv(path: impl AsRef<Path>, opts: &CsvOptions) -> Result<DMatrix> {
-    let file = std::fs::File::open(path)?;
-    read_csv(BufReader::new(file), opts)
+    read_csv(std::fs::File::open(path)?, opts)
 }
 
 /// Parse CSV text from any reader.
@@ -117,31 +128,24 @@ pub fn read_csv<R: Read>(reader: R, opts: &CsvOptions) -> Result<DMatrix> {
         for (c, raw) in fields.iter().enumerate() {
             let field = raw.trim();
             if Some(c) == opts.label_column {
-                let label: f32 = field.parse().map_err(|_| SequoiaError::Parse {
-                    line: lineno + 1,
-                    reason: format!("invalid label `{field}`"),
-                })?;
-                labels.push(label);
+                labels.push(parse_label(field, lineno)?);
                 continue;
             }
             let is_na = field.is_empty() || opts.na_value.as_deref() == Some(field);
             let v = if is_na {
                 f32::NAN
             } else {
-                field.parse().map_err(|_| SequoiaError::Parse {
-                    line: lineno + 1,
-                    reason: format!("invalid value `{field}`"),
-                })?
+                parse_value(field, lineno)?
             };
             feats.push(v);
         }
         match n_cols {
             None => n_cols = Some(feats.len()),
             Some(expected) if expected != feats.len() => {
-                return Err(SequoiaError::Parse {
-                    line: lineno + 1,
-                    reason: format!("expected {expected} columns, got {}", feats.len()),
-                });
+                return Err(parse_err(
+                    lineno,
+                    format!("expected {expected} columns, got {}", feats.len()),
+                ));
             }
             _ => {}
         }

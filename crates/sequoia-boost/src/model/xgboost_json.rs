@@ -60,12 +60,12 @@ const INVALID_NODE: i32 = i32::MAX;
 /// module docs (above) for the `base_score` space convention.
 pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
     if model.linear().is_some() {
-        return Err(fmt_err(
+        return Err(SequoiaError::model_format(
             "XGBoost JSON export does not support gblinear models",
         ));
     }
     if model.has_non_unit_tree_weights() {
-        return Err(fmt_err(
+        return Err(SequoiaError::model_format(
             "XGBoost JSON export does not support DART tree weights",
         ));
     }
@@ -74,7 +74,7 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
         .iter()
         .any(|tree| tree.nodes().iter().any(|node| node.is_categorical))
     {
-        return Err(fmt_err(
+        return Err(SequoiaError::model_format(
             "XGBoost JSON export does not support categorical splits",
         ));
     }
@@ -144,7 +144,7 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .and_then(Value::as_str)
         .unwrap_or("gbtree");
     if booster_name != "gbtree" {
-        return Err(fmt_err(format!(
+        return Err(SequoiaError::model_format(format!(
             "unsupported gradient_booster `{booster_name}`: only `gbtree` is supported"
         )));
     }
@@ -156,7 +156,7 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .get("num_feature")
         .and_then(scalar_f64)
         .map(|v| v as usize)
-        .ok_or_else(|| fmt_err("missing/invalid `num_feature`"))?;
+        .ok_or_else(|| SequoiaError::model_format("missing/invalid `num_feature`"))?;
     let num_class = lmp
         .get("num_class")
         .and_then(scalar_f64)
@@ -173,16 +173,17 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
     let trees_json = model
         .get("trees")
         .and_then(Value::as_array)
-        .ok_or_else(|| fmt_err("missing `model.trees` array"))?;
+        .ok_or_else(|| SequoiaError::model_format("missing `model.trees` array"))?;
     let mut trees = Vec::with_capacity(trees_json.len());
     for (i, tj) in trees_json.iter().enumerate() {
-        let tree = tree_from_json(tj).map_err(|e| fmt_err(format!("tree {i}: {e}")))?;
+        let tree =
+            tree_from_json(tj).map_err(|e| SequoiaError::model_format(format!("tree {i}: {e}")))?;
         if let Some(node) = tree
             .nodes()
             .iter()
             .find(|node| !node.is_leaf() && node.split_feature as usize >= num_feature)
         {
-            return Err(fmt_err(format!(
+            return Err(SequoiaError::model_format(format!(
                 "tree {i}: split feature {} exceeds num_feature {num_feature}",
                 node.split_feature
             )));
@@ -194,7 +195,7 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .get("base_score")
         .and_then(scalar_f64)
         .map(|v| v as f32)
-        .ok_or_else(|| fmt_err("missing/invalid `base_score`"))?;
+        .ok_or_else(|| SequoiaError::model_format("missing/invalid `base_score`"))?;
     let base_margin = link_import(stored_base, &objective, num_class);
 
     let imported = BoostedModel::from_parts(trees, base_margin, objective, num_class, num_feature);
@@ -277,21 +278,23 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
 
 /// Decode one XGBoost tree object into a [`RegTree`].
 fn tree_from_json(tj: &Value) -> Result<RegTree> {
-    let left =
-        arr(tj, "left_children", scalar_f64).ok_or_else(|| fmt_err("missing `left_children`"))?;
+    let left = arr(tj, "left_children", scalar_f64)
+        .ok_or_else(|| SequoiaError::missing_field("left_children"))?;
     let n = left.len();
     if n == 0 {
-        return Err(fmt_err("tree contains no nodes"));
+        return Err(SequoiaError::model_format("tree contains no nodes"));
     }
     let left: Vec<i32> = left.iter().map(|&v| v as i32).collect();
 
     let right: Vec<i32> = arr(tj, "right_children", scalar_f64)
-        .ok_or_else(|| fmt_err("missing `right_children`"))?
+        .ok_or_else(|| SequoiaError::missing_field("right_children"))?
         .iter()
         .map(|&v| v as i32)
         .collect();
     if right.len() != n {
-        return Err(fmt_err("child arrays have different lengths"));
+        return Err(SequoiaError::model_format(
+            "child arrays have different lengths",
+        ));
     }
 
     if arr(tj, "split_type", scalar_f64)
@@ -299,12 +302,14 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
         .iter()
         .any(|&kind| kind != 0.0)
     {
-        return Err(fmt_err("categorical XGBoost trees are not supported"));
+        return Err(SequoiaError::model_format(
+            "categorical XGBoost trees are not supported",
+        ));
     }
 
     let split_indices = arr(tj, "split_indices", scalar_f64).unwrap_or_default();
     let split_conditions = arr(tj, "split_conditions", scalar_f64)
-        .ok_or_else(|| fmt_err("missing `split_conditions`"))?;
+        .ok_or_else(|| SequoiaError::missing_field("split_conditions"))?;
     let default_left = arr(tj, "default_left", scalar_f64).unwrap_or_default();
     let base_weights = arr(tj, "base_weights", scalar_f64).unwrap_or_default();
     let sum_hessian = arr(tj, "sum_hessian", scalar_f64).unwrap_or_default();
@@ -337,7 +342,9 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
             });
         } else {
             if left[i] < 0 || right[i] < 0 || left[i] as usize >= n || right[i] as usize >= n {
-                return Err(fmt_err(format!("node {i} has an invalid child index")));
+                return Err(SequoiaError::model_format(format!(
+                    "node {i} has an invalid child index"
+                )));
             }
             nodes.push(Node {
                 split_feature: at(&split_indices, i) as u32,
@@ -421,8 +428,7 @@ fn objective_to_json(objective: &str, num_class: usize) -> Value {
 
 /// Fetch a required object field, erroring with its name if absent.
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
-    v.get(key)
-        .ok_or_else(|| fmt_err(format!("missing `{key}`")))
+    v.get(key).ok_or_else(|| SequoiaError::missing_field(key))
 }
 
 /// Coerce a scalar JSON value (number, numeric string, or bool) to `f64`.
@@ -442,11 +448,6 @@ fn arr(v: &Value, key: &str, f: fn(&Value) -> Option<f64>) -> Option<Vec<f64>> {
     v.get(key)?
         .as_array()
         .map(|a| a.iter().map(|e| f(e).unwrap_or(0.0)).collect())
-}
-
-/// Construct a [`SequoiaError::ModelFormat`] from any displayable message.
-fn fmt_err(msg: impl Into<String>) -> SequoiaError {
-    SequoiaError::ModelFormat(msg.into())
 }
 
 #[cfg(test)]

@@ -29,20 +29,14 @@ pub fn subtract_in_place(parent: &mut [GradStats], child: &[GradStats]) {
 }
 
 /// Backend that builds and combines gradient histograms.
+///
+/// Sibling histograms reuse the parent buffer via the free [`subtract_in_place`];
+/// there is intentionally no `subtract` hook (a three-slice method would only
+/// add an allocation).
 pub trait HistogramBackend: Send + Sync {
     /// Accumulate the gradients of `rows` into `out` (length = total bins).
     /// `out` is overwritten (not added to).
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]);
-
-    /// Compute `out[i] = parent[i] − child[i]` for every bin (the sibling
-    /// histogram via subtraction).
-    fn subtract(&self, parent: &[GradStats], child: &[GradStats], out: &mut [GradStats]) {
-        debug_assert_eq!(parent.len(), child.len());
-        debug_assert_eq!(parent.len(), out.len());
-        for i in 0..out.len() {
-            out[i] = parent[i].sub(child[i]);
-        }
-    }
 }
 
 /// Multi-core CPU histogram backend.
@@ -280,7 +274,7 @@ fn accumulate_columns<B: BinIndex>(
 /// Column-wise accumulation of the rows in `range` for one feature whose
 /// global bins start at `first_bin`, into that feature's histogram `slice`.
 /// Bins in a column are global indices, so the slice is indexed relative to
-/// `first_bin`; the subtraction is unchecked — the binned-index invariant
+/// `first_bin`. The subtraction is unchecked: the binned-index invariant
 /// guarantees every bin of this feature's column is at least `first_bin`, and
 /// the slice index bounds check catches any violation.
 #[inline(always)]
@@ -415,8 +409,8 @@ mod tests {
             right[i] = GradStats::new(-(i as f64) * 0.5, 2.0);
             parent[i] = GradStats::new(left[i].grad + right[i].grad, left[i].hess + right[i].hess);
         }
-        let mut out = zeroed(total);
-        CpuBackend.subtract(&parent, &left, &mut out);
+        let mut out = parent.clone();
+        subtract_in_place(&mut out, &left);
         for i in 0..total {
             assert!((out[i].grad - right[i].grad).abs() < 1e-12);
             assert!((out[i].hess - right[i].hess).abs() < 1e-12);

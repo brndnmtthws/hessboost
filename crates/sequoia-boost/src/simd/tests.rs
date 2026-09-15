@@ -54,6 +54,41 @@ fn exp_dispatch_is_close_to_scalar_and_preserves_special_values() {
 }
 
 #[test]
+fn exp_dispatch_handles_special_values_inside_vector_blocks() {
+    // With a length divisible by every vector width there is no scalar tail,
+    // so these special values exercise the in-block fallback paths rather
+    // than landing after the vector loop.
+    let mut actual: Vec<f32> = (0..8_192)
+        .map(|i| i as f32 * (160.0 / 8_192.0) - 80.0)
+        .collect();
+    for (index, value) in [
+        (3, f32::NEG_INFINITY),
+        (67, f32::INFINITY),
+        (131, f32::NAN),
+        (259, f32::MIN),
+        (1027, f32::MAX),
+        (2051, f32::from_bits(1)),
+    ] {
+        actual[index] = value;
+    }
+    let expected: Vec<f32> = actual.iter().map(|value| value.exp()).collect();
+    exp_inplace(&mut actual);
+    for (actual, expected) in actual.iter().zip(expected) {
+        if expected.is_nan() {
+            assert!(actual.is_nan());
+        } else if expected.is_infinite() || expected == 0.0 {
+            assert_eq!(*actual, expected);
+        } else {
+            let relative = ((actual - expected) / expected).abs();
+            assert!(
+                relative <= 7.0e-7,
+                "SIMD exp {actual} differs from scalar {expected} by {relative}"
+            );
+        }
+    }
+}
+
+#[test]
 fn logistic_gradient_dispatch_is_close_to_scalar() {
     let preds: Vec<f32> = (0..4_103)
         .map(|i| i as f32 * (40.0 / 4_102.0) - 20.0)
@@ -318,8 +353,7 @@ fn short_softmax_exceptional_rows_and_label_casts_match_scalar() {
 #[test]
 fn aarch64_backend_detection_is_cached() {
     let first = neon_available();
-    let cached = *NEON_AVAILABLE.get().expect("backend must be initialized");
-    assert_eq!(first, cached);
+    assert_eq!(first, *NEON_AVAILABLE);
     assert_eq!(first, neon_available());
 }
 
@@ -332,15 +366,17 @@ fn x86_64_backend_detection_is_cached() {
 }
 
 /// Scalar reference scan: the histogram builder's loop for one dense feature.
+/// Shared with `aarch64::tests` so both suites replay the same sequential
+/// epsilon comparison as the vector prefilter acceptance.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn scalar_dense_split(
+pub(super) fn scalar_dense_split(
     histogram: &[GradStats],
     total: GradStats,
     reg: &RegParams,
     parent_gain: f64,
+    comparison_epsilon: f64,
 ) -> Option<SplitCandidate> {
     use crate::tree::gain::calc_gain;
-
     let mut accumulated = GradStats::default();
     let mut expected: Option<SplitCandidate> = None;
     let mut best_loss = 0.0;
@@ -349,7 +385,7 @@ fn scalar_dense_split(
         let right = total.sub(accumulated);
         if accumulated.hess >= reg.min_child_weight && right.hess >= reg.min_child_weight {
             let loss = calc_gain(accumulated, reg) + calc_gain(right, reg) - parent_gain;
-            if loss > best_loss + 1e-6 {
+            if loss > best_loss + comparison_epsilon {
                 best_loss = loss;
                 expected = Some(SplitCandidate {
                     loss_change: loss,
@@ -364,8 +400,9 @@ fn scalar_dense_split(
 }
 
 /// `(grad, hess)` bit patterns, so a `NaN` compares equal to itself.
+/// Shared with `aarch64::tests`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn stats_bits(stats: GradStats) -> (u64, u64) {
+pub(super) fn stats_bits(stats: GradStats) -> (u64, u64) {
     (stats.grad.to_bits(), stats.hess.to_bits())
 }
 
@@ -383,7 +420,7 @@ fn assert_dense_split_matches_scalar(histogram: &[GradStats], reg: &RegParams) {
         }
         let parent_gain = calc_gain(total, reg);
         assert!(matches!(
-            dense_unconstrained_best_split(histogram, total, reg, parent_gain, 1e-6),
+            dense_unconstrained_best_split(histogram, total, reg, parent_gain, 0.0, 1e-6),
             DenseSplitScan::ScalarFallback
         ));
         return; // the vector path cannot be exercised on this host
@@ -393,9 +430,9 @@ fn assert_dense_split_matches_scalar(histogram: &[GradStats], reg: &RegParams) {
         total.add(stats);
     }
     let parent_gain = calc_gain(total, reg);
-    let expected = scalar_dense_split(histogram, total, reg, parent_gain);
+    let expected = scalar_dense_split(histogram, total, reg, parent_gain, 1e-6);
     let DenseSplitScan::Scanned(actual) =
-        dense_unconstrained_best_split(histogram, total, reg, parent_gain, 1e-6)
+        dense_unconstrained_best_split(histogram, total, reg, parent_gain, 0.0, 1e-6)
     else {
         panic!("vector split scan should dispatch on this host");
     };
@@ -445,7 +482,7 @@ fn dense_split_scan_matches_scalar_candidate_order() {
         }
     }
 }
-
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test]
 fn dense_split_scan_matches_scalar_on_adversarial_histograms() {
     let mut state = 0x9E37_79B9_7F4A_7C15u64;

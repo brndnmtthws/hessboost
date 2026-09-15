@@ -91,6 +91,48 @@ impl LinearModel {
     }
 }
 
+/// Margin buffer for `data`: `base` broadcast to every `(row, output)`,
+/// overridden by the per-instance `base_margin` when present. Shared by
+/// [`BoostedModel::initial_margins`] and the training margin caches.
+pub(crate) fn base_margins(data: &DMatrix, base: f32, k: usize) -> Vec<f32> {
+    let n = data.n_rows();
+    let mut out = vec![base; n * k];
+    if let Some(bm) = data.base_margin() {
+        if bm.len() == n * k {
+            out.copy_from_slice(bm);
+        } else if bm.len() == n {
+            for row in 0..n {
+                for c in 0..k {
+                    out[row * k + c] = bm[row];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Invoke `f(feature, value)` for each present feature of `row` in feature
+/// order. Shared by the gblinear margin and TreeSHAP paths; arithmetic stays
+/// at each call site to preserve exact conversion points.
+pub(super) fn for_each_present_value(data: &DMatrix, row: usize, mut f: impl FnMut(usize, f32)) {
+    for feat in 0..data.n_cols() {
+        if let Some(x) = data.get(row, feat) {
+            f(feat, x);
+        }
+    }
+}
+
+/// Validated prologue for the TreeSHAP paths: dimensions, effective trees,
+/// and initial margins.
+pub(super) struct AttributionPrologue<'a> {
+    pub(super) n: usize,
+    pub(super) k: usize,
+    pub(super) nf: usize,
+    pub(super) width: usize,
+    pub(super) trees: &'a [RegTree],
+    pub(super) initial: Vec<f32>,
+}
+
 impl BoostedModel {
     pub(crate) fn new(
         base_score: f32,
@@ -98,17 +140,7 @@ impl BoostedModel {
         num_class: usize,
         n_features: usize,
     ) -> Self {
-        BoostedModel {
-            trees: Vec::new(),
-            base_score,
-            objective,
-            num_class,
-            n_features,
-            best_iteration: None,
-            tree_weights: Vec::new(),
-            linear: None,
-            compact: OnceLock::new(),
-        }
+        Self::from_parts(Vec::new(), base_score, objective, num_class, n_features)
     }
 
     /// Attach a fitted linear (`gblinear`) booster. Predictions then come from
@@ -278,17 +310,13 @@ impl BoostedModel {
                 for c in 0..k {
                     out[row * k + c] += lm.bias[c];
                 }
-            }
-            for f in 0..self.n_features {
-                for row in 0..n {
-                    if let Some(x) = data.get(row, f) {
-                        if x != 0.0 {
-                            for c in 0..k {
-                                out[row * k + c] += lm.weights[f * k + c] * x;
-                            }
+                for_each_present_value(data, row, |f, x| {
+                    if x != 0.0 {
+                        for c in 0..k {
+                            out[row * k + c] += lm.weights[f * k + c] * x;
                         }
                     }
-                }
+                });
             }
             return out;
         }
@@ -302,8 +330,7 @@ impl BoostedModel {
         // the trained global bias.
         let mut out = self.initial_margins(data);
         let forest = self.compact_forest();
-        let weights = &self.tree_weights;
-        let weight = |ti: usize| weights.get(ti).copied().unwrap_or(1.0);
+        let weight = |ti: usize| self.tree_weight(ti);
         // Tiny batches (online serving) skip the thread pool and overlap the
         // trees of each row instead of the rows of each tree.
         if n < LANES {
@@ -379,14 +406,7 @@ impl BoostedModel {
             }
         } else {
             for i in 0..n {
-                let row = &probs[i * k..i * k + k];
-                let mut best = 0usize;
-                for c in 1..k {
-                    if row[c] > row[best] {
-                        best = c;
-                    }
-                }
-                out[i] = best as u32;
+                out[i] = crate::simd::argmax_scalar(&probs[i * k..i * k + k]) as u32;
             }
         }
         Ok(out)
@@ -480,21 +500,24 @@ impl BoostedModel {
     }
 
     pub(crate) fn initial_margins(&self, data: &DMatrix) -> Vec<f32> {
+        base_margins(data, self.base_score, self.n_outputs())
+    }
+
+    /// Validated prologue for the TreeSHAP paths. `predict_leaf` is excluded:
+    /// it walks all trees (not the effective prefix) and needs no margins.
+    pub(super) fn attribution_prologue(&self, data: &DMatrix) -> Result<AttributionPrologue<'_>> {
+        self.validate_prediction_data(data)?;
         let n = data.n_rows();
         let k = self.n_outputs();
-        let mut out = vec![self.base_score; n * k];
-        if let Some(bm) = data.base_margin() {
-            if bm.len() == n * k {
-                out.copy_from_slice(bm);
-            } else if bm.len() == n {
-                for row in 0..n {
-                    for c in 0..k {
-                        out[row * k + c] = bm[row];
-                    }
-                }
-            }
-        }
-        out
+        let nf = self.n_features;
+        Ok(AttributionPrologue {
+            n,
+            k,
+            nf,
+            width: nf + 1,
+            trees: &self.trees[..self.effective_ntrees()],
+            initial: self.initial_margins(data),
+        })
     }
 
     pub(crate) fn validate_prediction_data(&self, data: &DMatrix) -> Result<()> {

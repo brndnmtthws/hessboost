@@ -15,6 +15,7 @@
 
 use super::{GradPair, Objective};
 use crate::data::GroupInfo;
+use crate::metric::{ndcg_discount, ndcg_gain};
 
 /// Maximum number of document pairs formed per query group.
 ///
@@ -152,6 +153,7 @@ impl LambdaMartObjective {
         group: Option<&GroupInfo>,
         out: &mut [GradPair],
     ) {
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         for g in out.iter_mut() {
             *g = GradPair::default();
         }
@@ -244,14 +246,14 @@ impl MetricCtx {
         match mode {
             RankMode::Pairwise => MetricCtx::Uniform,
             RankMode::Ndcg => {
-                let gains: Vec<f64> = labs.iter().map(|&l| gain(l)).collect();
+                let gains: Vec<f64> = labs.iter().map(|&l| ndcg_gain(l)).collect();
                 // Ideal DCG: gains sorted descending, standard log2 discount.
                 let mut ideal = gains.clone();
                 ideal.sort_by(|a, b| b.total_cmp(a));
                 let idcg: f64 = ideal
                     .iter()
                     .enumerate()
-                    .map(|(p, &g)| g * discount(p))
+                    .map(|(p, &g)| g * ndcg_discount(p))
                     .sum();
                 MetricCtx::Ndcg {
                     gains,
@@ -293,7 +295,7 @@ impl MetricCtx {
                 if *idcg <= 0.0 {
                     return 0.0;
                 }
-                let d = (gains[hi] - gains[lo]) * (discount(pos[hi]) - discount(pos[lo]));
+                let d = (gains[hi] - gains[lo]) * (ndcg_discount(pos[hi]) - ndcg_discount(pos[lo]));
                 (d / idcg).abs()
             }
             MetricCtx::Map {
@@ -314,18 +316,6 @@ impl MetricCtx {
             }
         }
     }
-}
-
-/// NDCG gain of a (possibly graded) relevance label: `2^rel - 1`.
-#[inline]
-fn gain(rel: f64) -> f64 {
-    (2.0f64).powf(rel) - 1.0
-}
-
-/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`.
-#[inline]
-fn discount(p: usize) -> f64 {
-    1.0 / ((p + 2) as f64).log2()
 }
 
 /// |ΔAP| from swapping the documents currently at score-ranks `p < q`.

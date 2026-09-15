@@ -91,4 +91,14 @@ impl SequoiaError {
             name: name.into(),
         }
     }
+
+    /// Convenience constructor for [`SequoiaError::ModelFormat`].
+    pub fn model_format(msg: impl Into<String>) -> Self {
+        SequoiaError::ModelFormat(msg.into())
+    }
+
+    /// A model document is missing the named field: ``missing `field` ``.
+    pub fn missing_field(field: &str) -> Self {
+        Self::model_format(format!("missing `{field}`"))
+    }
 }

@@ -1,5 +1,5 @@
 //! AVX2/FMA kernels for x86-64. The split-gain scan is a pure prefilter whose
-//! accepted result is bit-identical to the scalar path it replaces; the
+//! accepted result is bit-identical to the scalar path it replaces. The
 //! transcendental kernels mirror the NEON formulas and stay within a few f32
 //! ULPs of the scalar library functions.
 
@@ -496,7 +496,7 @@ unsafe fn normal_positive(values: __m256d) -> __m256d {
 ///
 /// The prefix sums advance bin by bin in scalar-identical order. Four
 /// candidates at a time are tested with the division-free bound
-/// `a_L·b_R + a_R·b_L > target·b_L·b_R` (`a = Tα(G)²`, `b = H + λ ≥ 0`); only
+/// `a_L·b_R + a_R·b_L > target·b_L·b_R` (`a = Tα(G)²`, `b = H + λ ≥ 0`). Only
 /// lanes that pass go through the exact scalar acceptance, so the returned
 /// candidate matches the scalar scan exactly. Callers must ensure
 /// `reg.max_delta_step == 0` (closed-form gain) and AVX2+FMA support.
@@ -506,15 +506,30 @@ pub(super) unsafe fn dense_unconstrained_best_split(
     total: GradStats,
     reg: &RegParams,
     parent_gain: f64,
+    incumbent_loss: f64,
     comparison_epsilon: f64,
 ) -> Option<SplitCandidate> {
     // SAFETY: the caller guarantees AVX2 and FMA support and `scan` has no
     // further preconditions.
     unsafe {
         if reg.alpha == 0.0 {
-            scan::<false>(histogram, total, reg, parent_gain, comparison_epsilon)
+            scan::<false>(
+                histogram,
+                total,
+                reg,
+                parent_gain,
+                incumbent_loss,
+                comparison_epsilon,
+            )
         } else {
-            scan::<true>(histogram, total, reg, parent_gain, comparison_epsilon)
+            scan::<true>(
+                histogram,
+                total,
+                reg,
+                parent_gain,
+                incumbent_loss,
+                comparison_epsilon,
+            )
         }
     }
 }
@@ -525,6 +540,7 @@ unsafe fn scan<const L1: bool>(
     total: GradStats,
     reg: &RegParams,
     parent_gain: f64,
+    incumbent_loss: f64,
     comparison_epsilon: f64,
 ) -> Option<SplitCandidate> {
     // SAFETY: the caller guarantees AVX2 and FMA support. Pointer bounds are
@@ -538,13 +554,16 @@ unsafe fn scan<const L1: bool>(
         let lambda = _mm256_set1_pd(reg.lambda);
         let ones = _mm256_castsi256_pd(_mm256_set1_epi64x(-1));
 
+        // Seed the epsilon comparison with the node-wide incumbent so the
+        // scan accepts the same candidates, in the same order, as the
+        // builder's sequential scalar scan.
         let mut scan = Scan {
             total,
             reg,
             parent_gain,
             comparison_epsilon,
             best: None,
-            best_loss: 0.0,
+            best_loss: incumbent_loss,
         };
         let mut target = scan.target();
         // `(grad, hess)` prefix over the bins consumed so far.

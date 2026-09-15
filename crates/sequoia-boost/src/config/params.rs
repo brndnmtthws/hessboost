@@ -185,6 +185,16 @@ impl Default for TrainingParams {
     }
 }
 
+/// Fail with [`SequoiaError::invalid_param`] unless `ok`. Shared by the range
+/// checks in [`TrainingParams::validate`].
+fn ensure(name: &'static str, ok: bool, reason: impl Into<String>) -> Result<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(SequoiaError::invalid_param(name, reason))
+    }
+}
+
 impl TrainingParams {
     /// Start a builder for ergonomic, chained configuration.
     pub fn builder() -> TrainingParamsBuilder {
@@ -196,34 +206,25 @@ impl TrainingParams {
     /// Validate mutually-consistent ranges. Called automatically before training.
     pub fn validate(&self) -> Result<()> {
         let unit = |name: &'static str, v: f64| -> Result<()> {
-            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
-                Err(SequoiaError::invalid_param(
-                    name,
-                    format!("must be in [0, 1], got {v}"),
-                ))
-            } else {
-                Ok(())
-            }
+            ensure(
+                name,
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                format!("must be in [0, 1], got {v}"),
+            )
         };
         let positive = |name: &'static str, v: f64| -> Result<()> {
-            if !v.is_finite() || v <= 0.0 {
-                Err(SequoiaError::invalid_param(
-                    name,
-                    format!("must be > 0, got {v}"),
-                ))
-            } else {
-                Ok(())
-            }
+            ensure(
+                name,
+                v.is_finite() && v > 0.0,
+                format!("must be > 0, got {v}"),
+            )
         };
         let non_negative = |name: &'static str, v: f64| -> Result<()> {
-            if !v.is_finite() || v < 0.0 {
-                Err(SequoiaError::invalid_param(
-                    name,
-                    format!("must be >= 0, got {v}"),
-                ))
-            } else {
-                Ok(())
-            }
+            ensure(
+                name,
+                v.is_finite() && v >= 0.0,
+                format!("must be >= 0, got {v}"),
+            )
         };
 
         positive("eta", self.eta)?;
@@ -235,9 +236,7 @@ impl TrainingParams {
         positive("scale_pos_weight", self.scale_pos_weight)?;
         unit("subsample", self.subsample)?;
         // subsample of exactly 0 is meaningless.
-        if self.subsample == 0.0 {
-            return Err(SequoiaError::invalid_param("subsample", "must be > 0"));
-        }
+        ensure("subsample", self.subsample != 0.0, "must be > 0")?;
         unit("colsample_bytree", self.colsample_bytree)?;
         unit("colsample_bylevel", self.colsample_bylevel)?;
         unit("colsample_bynode", self.colsample_bynode)?;
@@ -245,24 +244,21 @@ impl TrainingParams {
         unit("skip_drop", self.skip_drop)?;
 
         if let Some(base_score) = self.base_score {
-            if !base_score.is_finite() {
-                return Err(SequoiaError::invalid_param("base_score", "must be finite"));
-            }
+            ensure("base_score", base_score.is_finite(), "must be finite")?;
         }
 
-        if self.max_bin < 2 {
-            return Err(SequoiaError::invalid_param(
-                "max_bin",
-                format!("must be >= 2, got {}", self.max_bin),
-            ));
-        }
-        if self.grow_policy == GrowPolicy::LossGuide && self.max_leaves == 0 && self.max_depth == 0
-        {
-            return Err(SequoiaError::invalid_param(
-                "max_leaves",
-                "lossguide growth needs a bound: set max_leaves or max_depth > 0",
-            ));
-        }
+        ensure(
+            "max_bin",
+            self.max_bin >= 2,
+            format!("must be >= 2, got {}", self.max_bin),
+        )?;
+        ensure(
+            "max_leaves",
+            !(self.grow_policy == GrowPolicy::LossGuide
+                && self.max_leaves == 0
+                && self.max_depth == 0),
+            "lossguide growth needs a bound: set max_leaves or max_depth > 0",
+        )?;
         Ok(())
     }
 }

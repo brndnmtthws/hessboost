@@ -26,13 +26,6 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   metrics. The SVGs are rendered by `docs/benchmarks/charts.gp` from
   `docs/benchmarks/xgboost.dat` and `docs/benchmarks/optimization.dat`.
 
-- `autoresearch.sh`: the canonical benchmark entrypoint. It builds the
-  deterministic training and inference workload in
-  `examples/autoresearch_bench.rs` (dense, wide, binary, multiclass, and
-  sparse/missing training; batch prediction; TreeSHAP), runs the test suite
-  as a correctness guard, and reports one `METRIC` line per workload across
-  thread counts.
-
 ### Changed
 
 - Skip child histograms and split searches for depthwise leaves at `max_depth`,
@@ -51,12 +44,12 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   unwound sum for off-path elements, and row-parallel evaluation.
 - Compare prediction splits on monotone `u32` keys (NaN maps to the missing
   direction, mirrored nodes read a precomputed negated key) loaded together
-  with the node's feature slot in one 64-bit load; batch prediction is
-  25–35% faster with identical results.
+  with the node's feature slot in one 64-bit load. Batch prediction is
+  25-35% faster with identical results.
 - Build the two children's split evaluations concurrently on large nodes and
   reduce partial histograms in parallel by bin range, keeping the per-bin
   addition order. Root histograms over contiguous row ranges are built
-  column-wise with one writer per feature; sibling partitions are written into
+  column-wise with one writer per feature. Sibling partitions are written into
   spare capacity instead of zero-filled buffers.
 - Compute built-in row-independent gradients (squared error, logistic, softmax)
   over fixed row chunks in parallel, bit-identical to the whole-batch result.
@@ -67,14 +60,32 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 ### Fixed
 
 - Make the AArch64 NEON dense split scan bit-identical to the scalar scan. Its
-  vector prefilter compared a bound that could overflow to infinity — where
-  `inf > inf` reads false — or round subnormal, silently dropping candidates
-  the scalar scan accepts; the prefilter now saturates its bound and routes
+  vector prefilter compared a bound that could overflow to infinity (where
+  `inf > inf` reads false) or round subnormal, silently dropping candidates
+  the scalar scan accepts. The prefilter now saturates its bound and routes
   subnormal products and intermediates to the exact check. Surviving
   candidates are also accepted with the scalar `calc_gain` arithmetic, which
   scores zero-Hessian children with a zero gain instead of rejecting them, so
   the chosen split, statistics, and loss match the scalar scan and the x86-64
   kernel bit for bit.
+
+- Continue the vector split scan from the node-wide incumbent gain. Each
+  feature's scan previously started from zero, so within the 1e-6 gain
+  epsilon it could accept a weaker candidate and discard the stronger one
+  the sequential scalar scan picks, moving the split to another feature on
+  both NEON and AVX2. The scan now receives the incumbent, restoring
+  bit-identical split choices.
+- Reserve sparse bin chunks by their stored entry count instead of the dense
+  row width, so CSR training no longer requests dense-sized allocations that
+  can fail for matrices with few stored entries.
+- Accumulate TreeSHAP contributions one tree at a time, matching the
+  interaction path, so a later constant tree with very large leaf values can
+  no longer round away an earlier tree's contribution.
+- Gate the adversarial split-scan test to the architectures that provide the
+  vector kernels, so the test target compiles on scalar-only architectures.
+- Check the compact split encoding's feature bound when the prediction layout
+  is built, so a feature index that would wrap the slot field fails loudly
+  instead of silently addressing another feature's keys.
 
 ## [0.2.0] - 2026-08-16
 

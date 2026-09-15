@@ -41,12 +41,6 @@ impl ColumnSampler {
         ColumnSampler::new((0..n_features as u32).collect(), 1.0, 1.0, 0)
     }
 
-    /// The underlying per-tree pool.
-    #[inline]
-    pub fn pool(&self) -> &[u32] {
-        &self.pool
-    }
-
     /// Draw a feature subset: the `bylevel` sample of the pool, then the
     /// `bynode` sample of that. Returned features are sorted ascending.
     pub fn sample(&mut self) -> Vec<u32> {

@@ -43,6 +43,10 @@ pub(crate) const FEATURE_LANES: usize = 2 * LANES;
 /// kernel would spend most steps parked on already-reached leaves.
 const MAX_FIXED_DEPTH: u32 = 16;
 
+/// Largest feature index whose `slot` encoding fits a `u32`: the mirrored
+/// variant stores `feature * FEATURE_LANES + LANES`, so anything larger
+/// would wrap and address another feature's keys.
+const MAX_SLOT_FEATURE: u32 = u32::MAX / FEATURE_LANES as u32;
 const SIGN: u32 = 1 << 31;
 
 /// Monotone unsigned key of an `f32`: `key(a) > key(b)` iff `a > b` for
@@ -275,6 +279,10 @@ impl CompactForest {
             self.nodes.push(node);
             self.orig_id.push(old);
         }
+        assert!(
+            max_feature <= MAX_SLOT_FEATURE,
+            "feature index {max_feature} does not fit the compact split encoding"
+        );
         self.trees.push(TreeMeta {
             root: base,
             depth,
@@ -295,7 +303,7 @@ impl CompactForest {
         self.orig_id[id as usize]
     }
 
-    /// Leaves point at themselves; children are laid out after their parent,
+    /// Leaves point at themselves. Children are laid out after their parent,
     /// so no internal node does. (A leaf's key is also [`LEAF_KEY`], but an
     /// internal `+inf` threshold shares that key, so it is not the test.)
     #[inline]
@@ -340,7 +348,7 @@ impl CompactForest {
 
     /// `(slot, key)` of a node. On x86-64 the lockstep kernel is bound by
     /// load-port throughput, so both fields are fetched with one 64-bit load
-    /// (a load per lane and level saved); other architectures, which were
+    /// (a load per lane and level saved). Other architectures, which were
     /// tuned with plain field loads, keep them.
     #[inline(always)]
     fn slot_key(node: &CNode) -> (usize, u32) {

@@ -83,14 +83,6 @@ pub struct RegTree {
 }
 
 impl RegTree {
-    /// Create a tree consisting of a single leaf.
-    pub fn single_leaf(value: f32, sum_hess: f32) -> Self {
-        RegTree {
-            nodes: vec![Node::leaf(value, sum_hess)],
-            categories: Vec::new(),
-        }
-    }
-
     /// Create an empty tree with a placeholder root leaf, ready to be grown by a
     /// builder. Returns the root node id (`0`).
     pub(crate) fn with_root(sum_hess: f32) -> Self {
@@ -167,6 +159,11 @@ impl RegTree {
 
     /// Turn leaf `nid` into an internal node by attaching two child leaves.
     /// Returns `(left_id, right_id)`.
+    ///
+    /// Both builders overwrite these child values in their finalize pass (which
+    /// recomputes every leaf from stored stats and bounds), so the values here
+    /// are placeholders on that path — but the parameters stay: directly built
+    /// trees (tests, learners) rely on them as the real leaf weights.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn expand(
         &mut self,
@@ -197,6 +194,9 @@ impl RegTree {
     /// left child. All other (and missing) categories follow `default_left`
     /// only when missing. Present categories not in the set go right.
     /// Returns `(left_id, right_id)`.
+    ///
+    /// As in [`expand`](Self::expand), builders overwrite the child values when
+    /// finalizing; the parameters serve directly built trees.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn expand_categorical(
         &mut self,

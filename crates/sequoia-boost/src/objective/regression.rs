@@ -22,8 +22,7 @@ impl Objective for SquaredErrorObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        debug_assert_eq!(preds.len(), labels.len());
-        debug_assert_eq!(preds.len(), out.len());
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         super::rowwise_gradient(
             labels.len(),
             1,
@@ -74,6 +73,7 @@ impl Objective for PseudoHuberObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         for i in 0..preds.len() {
             let w = weights.map_or(1.0, |ws| ws[i]);
             let d = preds[i] - labels[i];

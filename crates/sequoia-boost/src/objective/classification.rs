@@ -43,8 +43,7 @@ impl Objective for LogisticObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        debug_assert_eq!(preds.len(), labels.len());
-        debug_assert_eq!(preds.len(), out.len());
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         let (scale_pos_weight, min_hess) = (self.scale_pos_weight, MIN_HESS);
         super::rowwise_gradient(
             labels.len(),

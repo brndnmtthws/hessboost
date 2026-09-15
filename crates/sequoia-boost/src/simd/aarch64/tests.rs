@@ -1,10 +1,16 @@
 use super::*;
+macro_rules! require_neon {
+    () => {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return;
+        }
+    };
+}
+use super::super::tests::{scalar_dense_split, stats_bits};
 
 #[test]
 fn split_prefilter_preserves_ties_and_sequential_epsilon() {
-    if !std::arch::is_aarch64_feature_detected!("neon") {
-        return;
-    }
+    require_neon!();
     let reg = RegParams {
         alpha: 0.0,
         lambda: 1.0,
@@ -21,7 +27,7 @@ fn split_prefilter_preserves_ties_and_sequential_epsilon() {
             for epsilon in [0.0, 1e-6, 1.0] {
                 // SAFETY: NEON was detected; the kernel bounds its loads.
                 let candidate = unsafe {
-                    dense_unconstrained_best_split(&histogram, total, &reg, 0.0, epsilon)
+                    dense_unconstrained_best_split(&histogram, total, &reg, 0.0, 0.0, epsilon)
                 };
                 let expected = if epsilon == 1.0 {
                     None
@@ -36,41 +42,9 @@ fn split_prefilter_preserves_ties_and_sequential_epsilon() {
     }
 }
 
-/// Scalar reference scan with the kernel's validity rules.
-fn scalar_best_split(
-    histogram: &[GradStats],
-    total: GradStats,
-    reg: &RegParams,
-    parent_gain: f64,
-    epsilon: f64,
-) -> Option<(usize, GradStats, GradStats)> {
-    let mut accumulated = GradStats::default();
-    let mut best = None;
-    let mut best_loss = 0.0;
-    for (index, &stats) in histogram.iter().take(histogram.len() - 1).enumerate() {
-        accumulated.add(stats);
-        let right = total.sub(accumulated);
-        if accumulated.hess < reg.min_child_weight
-            || right.hess < reg.min_child_weight
-            || accumulated.hess <= 0.0
-            || right.hess <= 0.0
-        {
-            continue;
-        }
-        let loss = calc_gain(accumulated, reg) + calc_gain(right, reg) - parent_gain;
-        if loss > best_loss + epsilon {
-            best_loss = loss;
-            best = Some((index, accumulated, right));
-        }
-    }
-    best
-}
-
 #[test]
 fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
-    if !std::arch::is_aarch64_feature_detected!("neon") {
-        return;
-    }
+    require_neon!();
     let exceptional = [
         f64::NEG_INFINITY,
         -f64::MAX,
@@ -107,17 +81,23 @@ fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
                         max_delta_step: 0.0,
                     };
                     let parent_gain = calc_gain(total, &reg);
-                    let expected = scalar_best_split(&histogram, total, &reg, parent_gain, 1e-6);
+                    let expected = scalar_dense_split(&histogram, total, &reg, parent_gain, 1e-6);
                     // SAFETY: NEON was detected; the kernel bounds its loads.
                     let actual = unsafe {
-                        dense_unconstrained_best_split(&histogram, total, &reg, parent_gain, 1e-6)
+                        dense_unconstrained_best_split(
+                            &histogram,
+                            total,
+                            &reg,
+                            parent_gain,
+                            0.0,
+                            1e-6,
+                        )
                     };
-                    let bits = |stats: GradStats| (stats.grad.to_bits(), stats.hess.to_bits());
                     match (actual, expected) {
-                        (Some(actual), Some((offset, left, right))) => {
-                            assert_eq!(actual.split_offset, offset);
-                            assert_eq!(bits(actual.left), bits(left));
-                            assert_eq!(bits(actual.right), bits(right));
+                        (Some(actual), Some(expected)) => {
+                            assert_eq!(actual.split_offset, expected.split_offset);
+                            assert_eq!(stats_bits(actual.left), stats_bits(expected.left));
+                            assert_eq!(stats_bits(actual.right), stats_bits(expected.right));
                         }
                         (None, None) => {}
                         _ => panic!("scan disagreed on candidate presence"),
@@ -130,9 +110,7 @@ fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
 
 #[test]
 fn finite_extrema_reject_exceptional_values_in_every_lane() {
-    if !std::arch::is_aarch64_feature_detected!("neon") {
-        return;
-    }
+    require_neon!();
     for length in [8, 16, 17, 32, 33, 128, 131] {
         let values: Vec<f32> = (0..length).map(|index| (index % 13) as f32 - 6.0).collect();
         let expected = (
@@ -154,9 +132,7 @@ fn finite_extrema_reject_exceptional_values_in_every_lane() {
 
 #[test]
 fn vector_log_is_accurate_across_metric_range() {
-    if !std::arch::is_aarch64_feature_detected!("neon") {
-        return;
-    }
+    require_neon!();
     let mut values = Vec::new();
     for index in 0..20_000 {
         let exponent = -34.5 + index as f64 * (123.0 / 19_999.0);
@@ -203,9 +179,7 @@ fn vector_log_is_accurate_across_metric_range() {
 
 #[test]
 fn vector_exp_f64_is_accurate_across_tweedie_range() {
-    if !std::arch::is_aarch64_feature_detected!("neon") {
-        return;
-    }
+    require_neon!();
     let values: Vec<f64> = (0..20_000)
         .map(|index| -90.0 + index as f64 * (180.0 / 19_999.0))
         .collect();

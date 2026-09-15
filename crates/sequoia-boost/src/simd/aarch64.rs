@@ -12,6 +12,66 @@ const VECTOR_WIDTH: usize = 4;
 const MAX_FAST_EXP_INPUT: f32 = 80.0;
 const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());
 const _: () = assert!(std::mem::size_of::<GradStats>() == 2 * std::mem::size_of::<f64>());
+// Shared vector-loop scaffolding for the gradient and metric-sum kernels below.
+// Lane formulas stay inline in each kernel; only the identical accumulate,
+// fallback, store, and reduction shells live here, so numerics are untouched.
+macro_rules! accumulate_metric_sum {
+    ($weights:expr, $index:ident, $value_low:expr, $value_high:expr, $sum_low:ident, $sum_high:ident, $weight_low:ident, $weight_high:ident) => {
+        match $weights {
+            Some(weights) => {
+                let weight = vld1q_f32(weights.as_ptr().add($index));
+                let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
+                let current_weight_high = vcvt_high_f64_f32(weight);
+                $sum_low = vfmaq_f64($sum_low, $value_low, current_weight_low);
+                $sum_high = vfmaq_f64($sum_high, $value_high, current_weight_high);
+                $weight_low = vaddq_f64($weight_low, current_weight_low);
+                $weight_high = vaddq_f64($weight_high, current_weight_high);
+            }
+            None => {
+                $sum_low = vaddq_f64($sum_low, $value_low);
+                $sum_high = vaddq_f64($sum_high, $value_high);
+            }
+        }
+    };
+}
+macro_rules! metric_finite_guard {
+    ($pred:expr, $index:ident, $fallback:ident, $scalar:expr) => {
+        if !finite_input($pred) {
+            let partial = $scalar;
+            $fallback.0 += partial.0;
+            $fallback.1 += partial.1;
+            $index += VECTOR_WIDTH;
+            continue;
+        }
+    };
+}
+macro_rules! finish_metric_sum {
+    ($sum_low:ident, $sum_high:ident, $weight_low:ident, $weight_high:ident, $fallback:expr, $tail:expr, $weights:expr, $len:expr) => {{
+        let loss = vaddvq_f64(vaddq_f64($sum_low, $sum_high)) + $fallback.0 + $tail.0;
+        let weight_sum = match $weights {
+            Some(_) => vaddvq_f64(vaddq_f64($weight_low, $weight_high)) + $fallback.1 + $tail.1,
+            None => $len as f64,
+        };
+        (loss, weight_sum)
+    }};
+}
+macro_rules! gradient_guard {
+    ($cond:expr, $index:ident, $fallback:expr) => {
+        if $cond {
+            $fallback;
+            $index += VECTOR_WIDTH;
+            continue;
+        }
+    };
+}
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn store_grad_pairs(out: *mut GradPair, index: usize, grad: float32x4_t, hess: float32x4_t) {
+    // SAFETY: the caller guarantees NEON support and four writable pairs at `index`.
+    unsafe {
+        vst2q_f32(out.add(index).cast::<f32>(), float32x4x2_t(grad, hess));
+    }
+}
 
 /// Exponential for finite f32 lanes in [-80, 80]. Range
 /// reduction keeps the polynomial input in [-ln(2)/2, ln(2)/2], where a
@@ -295,7 +355,7 @@ const DENOMINATOR_FLOOR_SCALE: f64 = 1.0e-307;
 /// First denominator (`b_L`) that keeps the `target · b_L` intermediate above
 /// [`DENOMINATOR_FLOOR_SCALE`]. With `lambda` large enough to cover it on its
 /// own, every acceptable candidate has `b_L = H_L + lambda >= lambda`, so
-/// `lambda` itself is the floor; otherwise the floor divides out `target`.
+/// `lambda` itself is the floor. Otherwise the floor divides out `target`.
 #[inline]
 fn denominator_floor(target: f64, lambda: f64) -> f64 {
     if target * lambda >= DENOMINATOR_FLOOR_SCALE {
@@ -473,7 +533,7 @@ unsafe fn gain_terms<const L1: bool>(
 /// and the first denominator must stay at or above `min_denominator` (a
 /// subnormal `target · b_L` intermediate corrupts an otherwise normal bound).
 /// Lanes that fail a guard are reported as improving, so they merely pay for
-/// the exact check; a `b_L <= 0` lane can only produce a bound at or below
+/// the exact check. A `b_L <= 0` lane can only produce a bound at or below
 /// zero, which fails the floor and reaches the exact check, which scores such
 /// children with the scalar scan's zero gain.
 #[inline]
@@ -511,14 +571,29 @@ pub(super) unsafe fn dense_unconstrained_best_split(
     total: GradStats,
     reg: &RegParams,
     parent_gain: f64,
+    incumbent_loss: f64,
     comparison_epsilon: f64,
 ) -> Option<super::SplitCandidate> {
     // SAFETY: the caller guarantees NEON support.
     unsafe {
         if reg.alpha == 0.0 {
-            scan_dense_splits::<false>(histogram, total, reg, parent_gain, comparison_epsilon)
+            scan_dense_splits::<false>(
+                histogram,
+                total,
+                reg,
+                parent_gain,
+                incumbent_loss,
+                comparison_epsilon,
+            )
         } else {
-            scan_dense_splits::<true>(histogram, total, reg, parent_gain, comparison_epsilon)
+            scan_dense_splits::<true>(
+                histogram,
+                total,
+                reg,
+                parent_gain,
+                incumbent_loss,
+                comparison_epsilon,
+            )
         }
     }
 }
@@ -529,6 +604,7 @@ unsafe fn scan_dense_splits<const L1: bool>(
     total: GradStats,
     reg: &RegParams,
     parent_gain: f64,
+    incumbent_loss: f64,
     comparison_epsilon: f64,
 ) -> Option<super::SplitCandidate> {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
@@ -541,14 +617,17 @@ unsafe fn scan_dense_splits<const L1: bool>(
         let alpha = vdupq_n_f64(reg.alpha);
         let lambda = vdupq_n_f64(reg.lambda);
         let mut accumulated = vdupq_n_f64(0.0);
-        let target = prefilter_target(0.0, comparison_epsilon, parent_gain);
+        // Seed the epsilon comparison with the node-wide incumbent so the
+        // scan accepts the same candidates, in the same order, as the
+        // builder's sequential scalar scan.
+        let target = prefilter_target(incumbent_loss, comparison_epsilon, parent_gain);
         let mut scan = SplitScan {
             total,
             reg,
             parent_gain,
             comparison_epsilon,
             best: None,
-            best_loss: 0.0,
+            best_loss: incumbent_loss,
             target,
             min_denominator: denominator_floor(target, reg.lambda),
         };
@@ -692,7 +771,9 @@ pub(super) unsafe fn logistic_gradient(
             // SAFETY: the loop condition and objective length checks leave four
             // readable inputs and four writable GradPair outputs.
             let pred = vld1q_f32(preds.as_ptr().add(index));
-            if !regular_input(pred) {
+            gradient_guard!(
+                !regular_input(pred),
+                index,
                 scalar::logistic_gradient(
                     preds,
                     labels,
@@ -700,10 +781,8 @@ pub(super) unsafe fn logistic_gradient(
                     (scale_pos_weight, min_hess),
                     out,
                     index..index + VECTOR_WIDTH,
-                );
-                index += VECTOR_WIDTH;
-                continue;
-            }
+                )
+            );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let probability = sigmoidq_f32(pred);
             let mut weight = match weights {
@@ -719,12 +798,8 @@ pub(super) unsafe fn logistic_gradient(
                 ),
                 weight,
             );
-            // SAFETY: GradPair is repr(C) with two adjacent f32 fields and the loop
-            // condition leaves room for four pairs.
-            vst2q_f32(
-                out.as_mut_ptr().add(index).cast::<f32>(),
-                float32x4x2_t(grad, hess),
-            );
+            // SAFETY: the loop condition leaves room for four pairs; see `store_grad_pairs`.
+            store_grad_pairs(out.as_mut_ptr(), index, grad, hess);
             index += VECTOR_WIDTH;
         }
 
@@ -756,7 +831,9 @@ pub(super) unsafe fn poisson_gradient(
             // SAFETY: the common-length contract leaves four readable inputs.
             let pred = vld1q_f32(preds.as_ptr().add(index));
             let shifted = vaddq_f32(pred, delta);
-            if !regular_input(pred) || !regular_input(shifted) {
+            gradient_guard!(
+                !regular_input(pred) || !regular_input(shifted),
+                index,
                 scalar::poisson_gradient(
                     preds,
                     labels,
@@ -764,10 +841,8 @@ pub(super) unsafe fn poisson_gradient(
                     max_delta_step,
                     out,
                     index..index + VECTOR_WIDTH,
-                );
-                index += VECTOR_WIDTH;
-                continue;
-            }
+                )
+            );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let weight = match weights {
                 Some(values) => vld1q_f32(values.as_ptr().add(index)),
@@ -775,11 +850,8 @@ pub(super) unsafe fn poisson_gradient(
             };
             let grad = vmulq_f32(vsubq_f32(expq_f32::<true>(pred), label), weight);
             let hess = vmulq_f32(expq_f32::<true>(shifted), weight);
-            // SAFETY: GradPair is two adjacent f32 fields, with four output slots.
-            vst2q_f32(
-                out.as_mut_ptr().add(index).cast::<f32>(),
-                float32x4x2_t(grad, hess),
-            );
+            // SAFETY: the loop condition leaves room for four pairs; see `store_grad_pairs`.
+            store_grad_pairs(out.as_mut_ptr(), index, grad, hess);
             index += VECTOR_WIDTH;
         }
         scalar::poisson_gradient(
@@ -809,11 +881,11 @@ pub(super) unsafe fn gamma_gradient(
             // SAFETY: the common-length contract leaves four readable inputs.
             let pred = vld1q_f32(preds.as_ptr().add(index));
             let negative = vnegq_f32(pred);
-            if !regular_input(negative) {
-                scalar::gamma_gradient(preds, labels, weights, out, index..index + VECTOR_WIDTH);
-                index += VECTOR_WIDTH;
-                continue;
-            }
+            gradient_guard!(
+                !regular_input(negative),
+                index,
+                scalar::gamma_gradient(preds, labels, weights, out, index..index + VECTOR_WIDTH)
+            );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let weight = match weights {
                 Some(values) => vld1q_f32(values.as_ptr().add(index)),
@@ -822,11 +894,8 @@ pub(super) unsafe fn gamma_gradient(
             let scaled = vmulq_f32(label, expq_f32::<true>(negative));
             let grad = vmulq_f32(vsubq_f32(one, scaled), weight);
             let hess = vmulq_f32(scaled, weight);
-            // SAFETY: GradPair is two adjacent f32 fields, with four output slots.
-            vst2q_f32(
-                out.as_mut_ptr().add(index).cast::<f32>(),
-                float32x4x2_t(grad, hess),
-            );
+            // SAFETY: the loop condition leaves room for four pairs; see `store_grad_pairs`.
+            store_grad_pairs(out.as_mut_ptr(), index, grad, hess);
             index += VECTOR_WIDTH;
         }
         scalar::gamma_gradient(preds, labels, weights, out, index..preds.len());
@@ -852,7 +921,9 @@ pub(super) unsafe fn tweedie_gradient(
             let pred = vld1q_f32(preds.as_ptr().add(index));
             let input_1 = vmulq_f32(one_minus_rho, pred);
             let input_2 = vmulq_f32(two_minus_rho, pred);
-            if !regular_input(input_1) || !regular_input(input_2) {
+            gradient_guard!(
+                !regular_input(input_1) || !regular_input(input_2),
+                index,
                 scalar::tweedie_gradient(
                     preds,
                     labels,
@@ -860,10 +931,8 @@ pub(super) unsafe fn tweedie_gradient(
                     rho,
                     out,
                     index..index + VECTOR_WIDTH,
-                );
-                index += VECTOR_WIDTH;
-                continue;
-            }
+                )
+            );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let weight = match weights {
                 Some(values) => vld1q_f32(values.as_ptr().add(index)),
@@ -880,11 +949,8 @@ pub(super) unsafe fn tweedie_gradient(
                 ),
                 weight,
             );
-            // SAFETY: GradPair is two adjacent f32 fields, with four output slots.
-            vst2q_f32(
-                out.as_mut_ptr().add(index).cast::<f32>(),
-                float32x4x2_t(grad, hess),
-            );
+            // SAFETY: the loop condition leaves room for four pairs; see `store_grad_pairs`.
+            store_grad_pairs(out.as_mut_ptr(), index, grad, hess);
             index += VECTOR_WIDTH;
         }
         scalar::tweedie_gradient(preds, labels, weights, rho, out, index..preds.len());
@@ -1290,21 +1356,16 @@ pub(super) unsafe fn distance_sum<const SQUARED: bool>(
             } else {
                 vabsq_f64(difference_high)
             };
-            match weights {
-                Some(weights) => {
-                    let weight = vld1q_f32(weights.as_ptr().add(index));
-                    let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
-                    let current_weight_high = vcvt_high_f64_f32(weight);
-                    sum_low = vfmaq_f64(sum_low, distance_low, current_weight_low);
-                    sum_high = vfmaq_f64(sum_high, distance_high, current_weight_high);
-                    weight_low = vaddq_f64(weight_low, current_weight_low);
-                    weight_high = vaddq_f64(weight_high, current_weight_high);
-                }
-                None => {
-                    sum_low = vaddq_f64(sum_low, distance_low);
-                    sum_high = vaddq_f64(sum_high, distance_high);
-                }
-            }
+            accumulate_metric_sum!(
+                weights,
+                index,
+                distance_low,
+                distance_high,
+                sum_low,
+                sum_high,
+                weight_low,
+                weight_high
+            );
             index += VECTOR_WIDTH;
         }
 
@@ -1424,13 +1485,12 @@ pub(super) unsafe fn log_loss_sum(
         while index + VECTOR_WIDTH <= preds.len() {
             // SAFETY: the common-length contract leaves four readable values.
             let pred = vld1q_f32(preds.as_ptr().add(index));
-            if !finite_input(pred) {
-                let partial = scalar::log_loss(preds, labels, weights, index..index + VECTOR_WIDTH);
-                fallback.0 += partial.0;
-                fallback.1 += partial.1;
-                index += VECTOR_WIDTH;
-                continue;
-            }
+            metric_finite_guard!(
+                pred,
+                index,
+                fallback,
+                scalar::log_loss(preds, labels, weights, index..index + VECTOR_WIDTH)
+            );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let probability_low =
                 vminq_f64(vmaxq_f64(vcvt_f64_f32(vget_low_f32(pred)), lower), upper);
@@ -1451,31 +1511,30 @@ pub(super) unsafe fn log_loss_sum(
                     logq_f64(vsubq_f64(one, probability_high)),
                 ),
             ));
-            match weights {
-                Some(weights) => {
-                    let weight = vld1q_f32(weights.as_ptr().add(index));
-                    let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
-                    let current_weight_high = vcvt_high_f64_f32(weight);
-                    loss_low = vfmaq_f64(loss_low, value_low, current_weight_low);
-                    loss_high = vfmaq_f64(loss_high, value_high, current_weight_high);
-                    weight_low = vaddq_f64(weight_low, current_weight_low);
-                    weight_high = vaddq_f64(weight_high, current_weight_high);
-                }
-                None => {
-                    loss_low = vaddq_f64(loss_low, value_low);
-                    loss_high = vaddq_f64(loss_high, value_high);
-                }
-            }
+            accumulate_metric_sum!(
+                weights,
+                index,
+                value_low,
+                value_high,
+                loss_low,
+                loss_high,
+                weight_low,
+                weight_high
+            );
             index += VECTOR_WIDTH;
         }
 
         let tail = scalar::log_loss(preds, labels, weights, index..preds.len());
-        let loss = vaddvq_f64(vaddq_f64(loss_low, loss_high)) + fallback.0 + tail.0;
-        let weight_sum = match weights {
-            Some(_) => vaddvq_f64(vaddq_f64(weight_low, weight_high)) + fallback.1 + tail.1,
-            None => preds.len() as f64,
-        };
-        (loss, weight_sum)
+        finish_metric_sum!(
+            loss_low,
+            loss_high,
+            weight_low,
+            weight_high,
+            fallback,
+            tail,
+            weights,
+            preds.len()
+        )
     }
 }
 
@@ -1499,18 +1558,17 @@ pub(super) unsafe fn positive_nloglik_sum<const GAMMA: bool>(
         while index + VECTOR_WIDTH <= preds.len() {
             // SAFETY: the common-length contract leaves four readable values.
             let pred = vld1q_f32(preds.as_ptr().add(index));
-            if !finite_input(pred) {
-                let partial = scalar::positive_nloglik::<GAMMA>(
+            metric_finite_guard!(
+                pred,
+                index,
+                fallback,
+                scalar::positive_nloglik::<GAMMA>(
                     preds,
                     labels,
                     weights,
-                    index..index + VECTOR_WIDTH,
-                );
-                fallback.0 += partial.0;
-                fallback.1 += partial.1;
-                index += VECTOR_WIDTH;
-                continue;
-            }
+                    index..index + VECTOR_WIDTH
+                )
+            );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let prediction_low = vmaxq_f64(vcvt_f64_f32(vget_low_f32(pred)), minimum);
             let prediction_high = vmaxq_f64(vcvt_high_f64_f32(pred), minimum);
@@ -1528,31 +1586,30 @@ pub(super) unsafe fn positive_nloglik_sum<const GAMMA: bool>(
             } else {
                 vsubq_f64(prediction_high, vmulq_f64(label_high, log_high))
             };
-            match weights {
-                Some(weights) => {
-                    let weight = vld1q_f32(weights.as_ptr().add(index));
-                    let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
-                    let current_weight_high = vcvt_high_f64_f32(weight);
-                    loss_low = vfmaq_f64(loss_low, value_low, current_weight_low);
-                    loss_high = vfmaq_f64(loss_high, value_high, current_weight_high);
-                    weight_low = vaddq_f64(weight_low, current_weight_low);
-                    weight_high = vaddq_f64(weight_high, current_weight_high);
-                }
-                None => {
-                    loss_low = vaddq_f64(loss_low, value_low);
-                    loss_high = vaddq_f64(loss_high, value_high);
-                }
-            }
+            accumulate_metric_sum!(
+                weights,
+                index,
+                value_low,
+                value_high,
+                loss_low,
+                loss_high,
+                weight_low,
+                weight_high
+            );
             index += VECTOR_WIDTH;
         }
 
         let tail = scalar::positive_nloglik::<GAMMA>(preds, labels, weights, index..preds.len());
-        let loss = vaddvq_f64(vaddq_f64(loss_low, loss_high)) + fallback.0 + tail.0;
-        let weight_sum = match weights {
-            Some(_) => vaddvq_f64(vaddq_f64(weight_low, weight_high)) + fallback.1 + tail.1,
-            None => preds.len() as f64,
-        };
-        (loss, weight_sum)
+        finish_metric_sum!(
+            loss_low,
+            loss_high,
+            weight_low,
+            weight_high,
+            fallback,
+            tail,
+            weights,
+            preds.len()
+        )
     }
 }
 
@@ -1619,21 +1676,16 @@ pub(super) unsafe fn tweedie_nloglik_sum(
             );
             let value_low = vsubq_f64(second_low, first_low);
             let value_high = vsubq_f64(second_high, first_high);
-            match weights {
-                Some(weights) => {
-                    let weight = vld1q_f32(weights.as_ptr().add(index));
-                    let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
-                    let current_weight_high = vcvt_high_f64_f32(weight);
-                    loss_low = vfmaq_f64(loss_low, value_low, current_weight_low);
-                    loss_high = vfmaq_f64(loss_high, value_high, current_weight_high);
-                    weight_low = vaddq_f64(weight_low, current_weight_low);
-                    weight_high = vaddq_f64(weight_high, current_weight_high);
-                }
-                None => {
-                    loss_low = vaddq_f64(loss_low, value_low);
-                    loss_high = vaddq_f64(loss_high, value_high);
-                }
-            }
+            accumulate_metric_sum!(
+                weights,
+                index,
+                value_low,
+                value_high,
+                loss_low,
+                loss_high,
+                weight_low,
+                weight_high
+            );
             index += VECTOR_WIDTH;
         }
 
@@ -1702,22 +1754,17 @@ pub(super) unsafe fn multiclass_log_loss_sum(
                 vminq_f64(vmaxq_f64(vcvt_high_f64_f32(probability), lower), upper);
             let value_low = vnegq_f64(logq_f64(probability_low));
             let value_high = vnegq_f64(logq_f64(probability_high));
-            match weights {
-                Some(weights) => {
-                    // SAFETY: the dispatcher verified one weight per label.
-                    let weight = vld1q_f32(weights.as_ptr().add(index));
-                    let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
-                    let current_weight_high = vcvt_high_f64_f32(weight);
-                    loss_low = vfmaq_f64(loss_low, value_low, current_weight_low);
-                    loss_high = vfmaq_f64(loss_high, value_high, current_weight_high);
-                    weight_low = vaddq_f64(weight_low, current_weight_low);
-                    weight_high = vaddq_f64(weight_high, current_weight_high);
-                }
-                None => {
-                    loss_low = vaddq_f64(loss_low, value_low);
-                    loss_high = vaddq_f64(loss_high, value_high);
-                }
-            }
+            // SAFETY: the dispatcher verified one weight per label.
+            accumulate_metric_sum!(
+                weights,
+                index,
+                value_low,
+                value_high,
+                loss_low,
+                loss_high,
+                weight_low,
+                weight_high
+            );
             index += VECTOR_WIDTH;
         }
 

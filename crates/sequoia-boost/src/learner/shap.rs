@@ -23,7 +23,7 @@
 
 use crate::data::DMatrix;
 use crate::error::Result;
-use crate::learner::model::{BoostedModel, RowBlock};
+use crate::learner::model::{for_each_present_value, BoostedModel, RowBlock};
 use crate::tree::RegTree;
 use rayon::prelude::*;
 
@@ -66,7 +66,7 @@ fn inv(n: usize) -> f64 {
 }
 
 /// `n as f64` for path positions. Going through `i64` lets the compiler emit a
-/// single signed conversion instead of the unsigned fix-up sequence; the value
+/// single signed conversion instead of the unsigned fix-up sequence. The value
 /// is identical for every `n` that fits.
 #[inline(always)]
 fn small_f64(n: usize) -> f64 {
@@ -174,7 +174,7 @@ fn add_hot_contributions(
 /// overlap the chains. The coefficient of `next_{i+1}` is gathered off the
 /// dependency chain so each step is one multiply-subtract. `one_fraction` is
 /// `1.0` for every hot element the traversal produces (it only ever carries the
-/// root's `1.0` forward), so the division is skipped; the result is identical.
+/// root's `1.0` forward), so the division is skipped. The result is identical.
 fn hot_lanes<const N: usize>(
     path: &[PathElement],
     hot: &[usize; HOT_LANES],
@@ -530,12 +530,9 @@ impl BoostedModel {
     /// of the `n_features + 1` values equals the raw margin from
     /// [`BoostedModel::predict_margin`].
     pub fn predict_contribs(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        self.validate_prediction_data(data)?;
-        let n = data.n_rows();
-        let k = self.n_outputs();
-        let nf = self.n_features();
-        let width = nf + 1;
-        let trees = &self.trees()[..self.effective_ntrees()];
+        let pro = self.attribution_prologue(data)?;
+        let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
+        let initial = pro.initial;
 
         // Each tree's root mean value is instance-independent; compute once.
         let tree_means: Vec<f64> = trees
@@ -547,7 +544,6 @@ impl BoostedModel {
         let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
 
         let mut out = vec![0f32; n * k * width];
-        let initial = self.initial_margins(data);
 
         out.par_chunks_mut(k * width).enumerate().for_each_init(
             || {
@@ -566,13 +562,11 @@ impl BoostedModel {
                     acc[c * width + nf] = initial[row * k + c] as f64;
                 }
                 if let Some(linear) = self.linear() {
-                    for f in 0..nf {
-                        if let Some(x) = data.get(row, f) {
-                            for c in 0..k {
-                                acc[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
-                            }
+                    for_each_present_value(data, row, |f, x| {
+                        for c in 0..k {
+                            acc[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
                         }
-                    }
+                    });
                     for c in 0..k {
                         acc[c * width + nf] += linear.bias()[c] as f64;
                     }
@@ -583,16 +577,14 @@ impl BoostedModel {
                     let cls = ti % k;
                     let off = cls * width;
                     let weight = self.tree_weight(ti) as f64;
-                    if weight == 1.0 {
-                        // `1.0 * x` is exact, so unit-weight trees (gbtree)
-                        // accumulate straight into the row.
-                        tree_shap(tree, get, &mut acc[off..off + nf], arena, 0, -1);
-                    } else {
-                        scratch.fill(0.0);
-                        tree_shap(tree, get, scratch, arena, 0, -1);
-                        for f in 0..nf {
-                            acc[off + f] += weight * scratch[f];
-                        }
+                    // Accumulate one tree at a time, exactly as the
+                    // interaction path does: folding a tree straight into
+                    // the row would let a later tree's large values round
+                    // away an earlier tree's contribution in f64.
+                    scratch.fill(0.0);
+                    tree_shap(tree, get, scratch, arena, 0, -1);
+                    for f in 0..nf {
+                        acc[off + f] += weight * scratch[f];
                     }
                     // Tree expected value folds into the bias column.
                     acc[off + nf] += tree_means[ti];
@@ -630,13 +622,10 @@ impl BoostedModel {
     /// `t % n_outputs`.
     #[allow(clippy::needless_range_loop)]
     pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        self.validate_prediction_data(data)?;
-        let n = data.n_rows();
-        let k = self.n_outputs();
-        let nf = self.n_features();
-        let width = nf + 1;
+        let pro = self.attribution_prologue(data)?;
+        let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
+        let initial = pro.initial;
         let mwidth = width * width;
-        let trees = &self.trees()[..self.effective_ntrees()];
 
         // Each tree's root mean value is instance-independent; compute once.
         let tree_means: Vec<f64> = trees
@@ -648,7 +637,6 @@ impl BoostedModel {
         let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
         let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
         let mut out = vec![0f32; n * k * mwidth];
-        let initial = self.initial_margins(data);
 
         // Per-thread scratch: unconditioned contributions, condition = +1
         // (feature present) / -1 (absent) accumulators, the interaction
@@ -688,14 +676,11 @@ impl BoostedModel {
                     diag[c * width + nf] = initial[row * k + c] as f64;
                 }
                 if let Some(linear) = self.linear() {
-                    for f in 0..nf {
-                        if let Some(x) = data.get(row, f) {
-                            for c in 0..k {
-                                diag[c * width + f] +=
-                                    linear.weights()[f * k + c] as f64 * x as f64;
-                            }
+                    for_each_present_value(data, row, |f, x| {
+                        for c in 0..k {
+                            diag[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
                         }
-                    }
+                    });
                     for c in 0..k {
                         diag[c * width + nf] += linear.bias()[c] as f64;
                     }

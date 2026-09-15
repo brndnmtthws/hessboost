@@ -8,20 +8,18 @@
 //!
 //! Monotone and interaction constraints are honored during split search.
 
+use super::{
+    build_interaction_sets, eval_missing_directions, next_allowed, sweep_categorical, BestSplit,
+    SplitPos,
+};
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
-use crate::tree::constraints::{
-    calc_weight_bounded, child_bounds, gain_at_weight, satisfies, Bounds, MonotoneConstraints,
-};
-use crate::tree::gain::{calc_gain, calc_weight, GradStats, RegParams};
+use crate::tree::constraints::{calc_weight_bounded, child_bounds, Bounds, MonotoneConstraints};
+use crate::tree::gain::{calc_weight, GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
-use std::collections::{BTreeSet, HashMap};
-
-/// Tiny epsilon guarding against accepting numerically-zero-gain splits, mirror
-/// of XGBoost's `kRtEps`.
-const K_RT_EPS: f64 = 1e-6;
+use std::collections::HashMap;
 
 /// Value-sorted column index over a [`DMatrix`], built once and reused across
 /// boosting rounds. Within each column, `(row, value)` pairs are sorted by
@@ -86,46 +84,6 @@ impl SortedColumns {
     fn column(&self, f: usize) -> (&[u32], &[f32]) {
         let (s, e) = (self.col_ptr[f], self.col_ptr[f + 1]);
         (&self.rows[s..e], &self.vals[s..e])
-    }
-}
-
-/// The best split found so far for one node.
-#[derive(Debug, Clone)]
-struct BestSplit {
-    loss_chg: f64,
-    feature: u32,
-    threshold: f32,
-    default_left: bool,
-    left: GradStats,
-    right: GradStats,
-    /// Bounded child weights (used to derive monotone child bounds).
-    w_left: f64,
-    w_right: f64,
-    /// Whether this is a categorical (set-membership) split.
-    is_categorical: bool,
-    /// For a categorical split, the category values routed left.
-    cat_left: Vec<u32>,
-}
-
-impl BestSplit {
-    fn none() -> Self {
-        BestSplit {
-            loss_chg: 0.0,
-            feature: 0,
-            threshold: 0.0,
-            default_left: true,
-            left: GradStats::default(),
-            right: GradStats::default(),
-            w_left: 0.0,
-            w_right: 0.0,
-            is_categorical: false,
-            cat_left: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn found(&self) -> bool {
-        self.loss_chg > K_RT_EPS
     }
 }
 
@@ -219,16 +177,10 @@ impl<'a> ExactTreeBuilder<'a> {
 
             let mut best = vec![BestSplit::none(); k];
 
-            // Parent structure score per active node (subtracted from the split
-            // gain). Bounded when constraints are active, closed-form otherwise.
             let mut parent_gain = vec![0.0f64; k];
             for (slot, &nid) in active.iter().enumerate() {
-                parent_gain[slot] = if constrained {
-                    let w = calc_weight_bounded(node_stats[nid], &self.reg, node_bounds[nid]);
-                    gain_at_weight(node_stats[nid], &self.reg, w)
-                } else {
-                    calc_gain(node_stats[nid], &self.reg)
-                };
+                parent_gain[slot] =
+                    super::parent_gain(node_stats[nid], &self.reg, node_bounds[nid], constrained);
             }
 
             // Scratch buffers, reused per feature.
@@ -269,15 +221,18 @@ impl<'a> ExactTreeBuilder<'a> {
                         if !permits(node_allowed[nid].as_deref(), f) {
                             continue;
                         }
-                        self.eval_categorical(
+                        let mut cats: Vec<(u32, GradStats)> =
+                            cat_stats[slot].iter().map(|(&c, &s)| (c, s)).collect();
+                        sweep_categorical(
                             &mut best[slot],
+                            &mut cats,
                             node_stats[nid],
                             parent_gain[slot],
                             node_bounds[nid],
                             dir,
                             constrained,
+                            &self.reg,
                             f,
-                            &cat_stats[slot],
                         );
                     }
                     continue;
@@ -322,18 +277,19 @@ impl<'a> ExactTreeBuilder<'a> {
                         continue;
                     }
                     if has[slot] && val != last_val[slot] {
-                        self.eval_boundary(
+                        eval_missing_directions(
                             &mut best[slot],
-                            node_stats[nid as usize],
-                            present_total[slot],
                             acc[slot],
-                            last_val[slot],
-                            val,
-                            f,
+                            present_total[slot],
+                            node_stats[nid as usize],
+                            &self.reg,
                             parent_gain[slot],
                             node_bounds[nid as usize],
                             dir,
                             constrained,
+                            f,
+                            SplitPos::Value(0.5 * (last_val[slot] + val)),
+                            true,
                         );
                     }
                     let gp = gpair[r];
@@ -343,7 +299,6 @@ impl<'a> ExactTreeBuilder<'a> {
                 }
             }
 
-            // Apply splits and prepare the next level.
             let gamma = self.params.gamma;
             let mut next_active = Vec::new();
             let mut splits: Vec<Split> = Vec::new();
@@ -474,192 +429,6 @@ impl<'a> ExactTreeBuilder<'a> {
         }
         tree
     }
-
-    /// Evaluate the split boundary between two consecutive distinct values,
-    /// considering both missing-value directions, and update `best`.
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    fn eval_boundary(
-        &self,
-        best: &mut BestSplit,
-        total: GradStats,
-        present: GradStats,
-        left_present: GradStats,
-        prev_val: f32,
-        cur_val: f32,
-        feature: u32,
-        parent_gain: f64,
-        bounds: Bounds,
-        dir: i8,
-        constrained: bool,
-    ) {
-        let threshold = 0.5 * (prev_val + cur_val);
-        let missing = total.sub(present);
-        let mcw = self.reg.min_child_weight;
-
-        // Direction A: missing values go right. Left = present-so-far.
-        let la = left_present;
-        let ra = total.sub(left_present);
-        if la.hess >= mcw && ra.hess >= mcw {
-            self.consider(
-                best,
-                la,
-                ra,
-                parent_gain,
-                bounds,
-                dir,
-                constrained,
-                feature,
-                threshold,
-                false,
-            );
-        }
-
-        // Direction B: missing values go left. Left = present-so-far + missing.
-        let mut lb = left_present;
-        lb.add(missing);
-        let rb = present.sub(left_present);
-        if lb.hess >= mcw && rb.hess >= mcw {
-            self.consider(
-                best,
-                lb,
-                rb,
-                parent_gain,
-                bounds,
-                dir,
-                constrained,
-                feature,
-                threshold,
-                true,
-            );
-        }
-    }
-
-    /// Structure-score gain for splitting `total` into `left`/`right` plus the
-    /// bounded child weights, or `None` when a monotone constraint is violated.
-    /// Unconstrained builds take the cheap closed-form path (weights unused).
-    #[inline]
-    fn eval_gain(
-        &self,
-        left: GradStats,
-        right: GradStats,
-        parent_gain: f64,
-        bounds: Bounds,
-        dir: i8,
-        constrained: bool,
-    ) -> Option<(f64, f64, f64)> {
-        if constrained {
-            let wl = calc_weight_bounded(left, &self.reg, bounds);
-            let wr = calc_weight_bounded(right, &self.reg, bounds);
-            if !satisfies(dir, wl, wr) {
-                return None; // monotone constraint violated
-            }
-            let g = gain_at_weight(left, &self.reg, wl) + gain_at_weight(right, &self.reg, wr)
-                - parent_gain;
-            Some((g, wl, wr))
-        } else {
-            let g = calc_gain(left, &self.reg) + calc_gain(right, &self.reg) - parent_gain;
-            Some((g, 0.0, 0.0))
-        }
-    }
-
-    /// Evaluate one numeric candidate split and update `best` if it improves.
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    fn consider(
-        &self,
-        best: &mut BestSplit,
-        left: GradStats,
-        right: GradStats,
-        parent_gain: f64,
-        bounds: Bounds,
-        dir: i8,
-        constrained: bool,
-        feature: u32,
-        threshold: f32,
-        default_left: bool,
-    ) {
-        let Some((g, wl, wr)) = self.eval_gain(left, right, parent_gain, bounds, dir, constrained)
-        else {
-            return;
-        };
-        if g > best.loss_chg + K_RT_EPS {
-            *best = BestSplit {
-                loss_chg: g,
-                feature,
-                threshold,
-                default_left,
-                left,
-                right,
-                w_left: wl,
-                w_right: wr,
-                is_categorical: false,
-                cat_left: Vec::new(),
-            };
-        }
-    }
-
-    /// Find the best categorical (set-membership) split for one feature at one
-    /// node, given that node's per-category statistics.
-    ///
-    /// Follows XGBoost's sorted-partition strategy: rank categories by their
-    /// gradient/Hessian ratio, then sweep prefix partitions of that order. The
-    /// prefix categories form the "left" set. Every other present category (and
-    /// missing) goes right.
-    #[allow(clippy::too_many_arguments)]
-    fn eval_categorical(
-        &self,
-        best: &mut BestSplit,
-        total: GradStats,
-        parent_gain: f64,
-        bounds: Bounds,
-        dir: i8,
-        constrained: bool,
-        feature: u32,
-        cat_stats: &HashMap<u32, GradStats>,
-    ) {
-        if cat_stats.len() < 2 {
-            return; // no interior partition
-        }
-        let mcw = self.reg.min_child_weight;
-        let ratio = |s: GradStats| s.grad / (s.hess + self.reg.lambda);
-        let mut cats: Vec<(u32, GradStats)> = cat_stats.iter().map(|(&c, &s)| (c, s)).collect();
-        cats.sort_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)));
-
-        let mut left = GradStats::default();
-        let mut cats_left: Vec<u32> = Vec::new();
-        // Sweep prefixes, always leaving at least one category on the right.
-        for &(cat, s) in &cats[..cats.len() - 1] {
-            left.add(s);
-            cats_left.push(cat);
-            // `total` includes any missing mass, which stays on the right.
-            let right = total.sub(left);
-            if left.hess < mcw || right.hess < mcw {
-                continue;
-            }
-            let Some((g, wl, wr)) =
-                self.eval_gain(left, right, parent_gain, bounds, dir, constrained)
-            else {
-                continue;
-            };
-            if g > best.loss_chg + K_RT_EPS {
-                *best = BestSplit {
-                    loss_chg: g,
-                    feature,
-                    threshold: 0.0,
-                    // Present categories not in the left set (and missing) go
-                    // right, as XGBoost defaults for categorical features.
-                    default_left: false,
-                    left,
-                    right,
-                    w_left: wl,
-                    w_right: wr,
-                    is_categorical: true,
-                    cat_left: cats_left.clone(),
-                };
-            }
-        }
-    }
 }
 
 /// Utility: the full row index `0..n_rows` as `u32` (no subsampling).
@@ -672,48 +441,9 @@ pub fn all_features(n_cols: usize) -> Vec<u32> {
     (0..n_cols as u32).collect()
 }
 
-fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<HashMap<u32, Vec<u32>>> {
-    if groups.is_empty() {
-        return None;
-    }
-    let mut sets: HashMap<u32, BTreeSet<u32>> = HashMap::new();
-    for group in groups {
-        for &feature in group {
-            sets.entry(feature)
-                .or_default()
-                .extend(group.iter().copied());
-        }
-    }
-    Some(
-        sets.into_iter()
-            .map(|(feature, allowed)| (feature, allowed.into_iter().collect()))
-            .collect(),
-    )
-}
-
 #[inline]
 fn permits(allowed: Option<&[u32]>, feature: u32) -> bool {
     allowed.is_none_or(|features| features.binary_search(&feature).is_ok())
-}
-
-fn next_allowed(
-    parent: Option<&[u32]>,
-    feature: u32,
-    sets: Option<&HashMap<u32, Vec<u32>>>,
-) -> Option<Vec<u32>> {
-    let sets = sets?;
-    let singleton = [feature];
-    let feature_set = sets
-        .get(&feature)
-        .map_or(singleton.as_slice(), Vec::as_slice);
-    Some(match parent {
-        None => feature_set.to_vec(),
-        Some(parent) => parent
-            .iter()
-            .copied()
-            .filter(|f| feature_set.binary_search(f).is_ok())
-            .collect(),
-    })
 }
 
 #[cfg(test)]

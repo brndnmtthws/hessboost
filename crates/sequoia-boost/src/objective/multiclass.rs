@@ -50,8 +50,7 @@ impl Objective for SoftmaxObjective {
     ) {
         let k = self.num_class;
         let n = labels.len();
-        debug_assert_eq!(preds.len(), n * k);
-        debug_assert_eq!(out.len(), n * k);
+        super::check_gradient_inputs(n, k, preds, labels, weights, out);
 
         super::rowwise_gradient(n, k, preds, labels, weights, out, |p, l, w, o| {
             crate::simd::softmax_gradient(p, l, w, k, MIN_HESS, o)

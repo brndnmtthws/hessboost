@@ -286,7 +286,6 @@ fallbacks, exceptional blocks, and tails.
 | RMSE, MAE, binary error, log loss, count metrics | `f64` reductions with optional weights |
 | Multiclass log loss | Gathered label probabilities with `f64` logarithms |
 | Multiclass error, 8+ classes | Vector row maxima |
-| Histogram statistics and dense numeric split gains | Two `f64` lanes |
 
 Most kernels require at least 16 input elements. Softmax with 5–7 classes uses
 the scalar path. The `f32` exponential uses range reduction and a degree-seven
@@ -295,17 +294,6 @@ Softmax subtracts the row maximum and falls back for nonfinite rows or a margin
 spread above 80. The exponential uses Estrin evaluation for gradients and
 small-class softmax, and Horner evaluation for wide in-place softmax. Metric
 logarithms and Tweedie exponentials use `f64` throughout.
-
-The histogram builder uses NEON to prefilter dense numeric features without
-monotone constraints or a nonzero `max_delta_step`. Prefix statistics and
-accepted-candidate comparisons remain sequential, preserving split order, ties,
-and the gain epsilon. Bins that cannot improve the best gain are rejected in
-vector registers without lane extraction; the division-free bound is
-saturated before that comparison, and subnormal products or intermediates take
-the exact comparison, where the scalar `calc_gain` arithmetic decides
-surviving candidates. The x86-64 scan follows the same contract with an
-AVX2 prefilter. Missing-value and constrained split searches retain their
-scalar evaluation.
 
 Depthwise growth expands nodes and draws child feature samples in traversal
 order, then partitions rows, builds histograms, and evaluates the independent

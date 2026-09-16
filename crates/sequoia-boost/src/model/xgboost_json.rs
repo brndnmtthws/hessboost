@@ -69,7 +69,7 @@
 //! ([`Objective::pred_transform`]). Multiclass objectives (and any objective we
 //! cannot reconstruct) pass the values through unchanged, as XGBoost does.
 
-use crate::config::{ObjectiveParams, TrainingParams};
+use crate::config::ObjectiveParams;
 use crate::error::{Result, SequoiaError};
 use crate::learner::model::ModelSpec;
 use crate::learner::BoostedModel;
@@ -98,11 +98,11 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
     let objective = model.objective().to_string();
     // XGBoost can only load objectives it knows; a custom objective
     // (`train_with_objective`) has no XGBoost counterpart.
-    if build_objective(&objective, num_class).is_none() {
-        return Err(SequoiaError::model_format(format!(
+    let objective_impl = model.rebuild_objective().map_err(|_| {
+        SequoiaError::model_format(format!(
             "objective `{objective}` has no XGBoost equivalent; cannot export"
-        )));
-    }
+        ))
+    })?;
     let n_outputs = model.n_outputs();
     let n_trees = model.effective_ntrees();
 
@@ -134,7 +134,7 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
         booster_model["weight_drop"] = Value::Array(weight_drop);
     }
 
-    let base_score = format_base_score(model.base_scores(), &objective, num_class);
+    let base_score = format_base_score(model.base_scores(), &*objective_impl);
 
     let value = json!({
         "version": [3, 4, 1],
@@ -247,17 +247,14 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .get("base_score")
         .and_then(Value::as_str)
         .ok_or_else(|| SequoiaError::model_format("missing/invalid `base_score`"))?;
-    let base_margins = parse_base_score(base_score, &objective, num_class, n_outputs)?;
+    let objective_impl = build_objective(&objective, num_class);
+    let base_margins = parse_base_score(base_score, objective_impl.as_deref(), n_outputs)?;
 
     // Parameter blocks come from the file: check them with the same rules as
     // a training configuration before the model rebuilds its objective.
     let objective_params = objective_params_from_json(&objective, objective_json);
     objective_params
-        .apply(
-            TrainingParams::builder()
-                .objective(objective.clone())
-                .num_class(num_class),
-        )
+        .training_params(&objective, num_class)
         .build()
         .map_err(|e| SequoiaError::model_format(format!("invalid objective parameters: {e}")))?;
 
@@ -493,25 +490,25 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
 // base_score link handling
 // ---------------------------------------------------------------------------
 
-/// Reconstruct the objective from name + `num_class`, if it is one we support.
+/// Reconstruct the objective from name + `num_class` (at XGBoost's default
+/// parameters, which do not affect the link), if it is one we support.
 fn build_objective(name: &str, num_class: usize) -> Option<Box<dyn Objective>> {
-    let params = TrainingParams::builder()
-        .objective(name)
-        .num_class(num_class)
-        .build_unchecked();
-    create_objective(&params).ok()
+    create_objective(
+        &ObjectiveParams::defaults_for(name)
+            .training_params(name, num_class)
+            .build_unchecked(),
+    )
+    .ok()
 }
 
 /// Render the per-output margin intercepts as XGBoost 3.x's `base_score`
 /// vector string, `"[v0,v1,...]"`, in the space XGBoost stores it in. Only
 /// scalar objectives have a well-defined single-value transform; multiclass
 /// (softmax) operates across classes, so its values pass through unchanged.
-fn format_base_score(margins: &[f32], objective: &str, num_class: usize) -> String {
+fn format_base_score(margins: &[f32], objective: &dyn Objective) -> String {
     let mut stored = margins.to_vec();
-    if let Some(obj) = build_objective(objective, num_class) {
-        if obj.n_outputs() == 1 {
-            obj.pred_transform(&mut stored);
-        }
+    if objective.n_outputs() == 1 {
+        objective.pred_transform(&mut stored);
     }
     let entries: Vec<String> = stored.iter().map(f32::to_string).collect();
     format!("[{}]", entries.join(","))
@@ -520,11 +517,11 @@ fn format_base_score(margins: &[f32], objective: &str, num_class: usize) -> Stri
 /// Parse XGBoost 3.x's `base_score` vector string (`"[5E-1]"`,
 /// `"[a,b,c]"`) into per-output margin intercepts. One entry applies to every
 /// output (XGBoost `HandleOldFormat`); otherwise the length must equal
-/// `n_outputs`. Each entry is mapped through the objective's inverse link.
+/// `n_outputs`. Each entry is mapped through the objective's inverse link
+/// (values pass through unchanged for an objective we cannot reconstruct).
 fn parse_base_score(
     stored: &str,
-    objective: &str,
-    num_class: usize,
+    objective: Option<&dyn Objective>,
     n_outputs: usize,
 ) -> Result<Vec<f32>> {
     let invalid = || SequoiaError::model_format(format!("invalid `base_score` `{stored}`"));
@@ -547,15 +544,24 @@ fn parse_base_score(
             )))
         }
     };
-    Ok(match build_objective(objective, num_class) {
+    Ok(match objective {
         Some(obj) => values.iter().map(|&v| obj.prob_to_margin(v)).collect(),
         None => values,
     })
 }
 
 // ---------------------------------------------------------------------------
-// Small JSON helpers
+// Objective parameter blocks
 // ---------------------------------------------------------------------------
+
+/// `(block, key)` under `learner.objective` where XGBoost 3.4.1 keeps each
+/// retained parameter (`SaveConfig` of the objective owning it).
+const SCALE_POS_WEIGHT: (&str, &str) = ("reg_loss_param", "scale_pos_weight");
+const MAX_DELTA_STEP: (&str, &str) = ("poisson_regression_param", "max_delta_step");
+const TWEEDIE_VARIANCE_POWER: (&str, &str) = ("tweedie_regression_param", "tweedie_variance_power");
+const HUBER_SLOPE: (&str, &str) = ("pseudo_huber_param", "huber_slope");
+const LAMBDARANK_NUM_PAIR: (&str, &str) = ("lambdarank_param", "lambdarank_num_pair_per_sample");
+const SOFTMAX_NUM_CLASS: (&str, &str) = ("softmax_multiclass_param", "num_class");
 
 /// Build the `objective` sub-document with the parameter block XGBoost 3.4.1
 /// writes for each objective (its `SaveConfig`), so upstream XGBoost accepts
@@ -563,43 +569,39 @@ fn parse_base_score(
 /// stringified numbers; LambdaRank parameters the model does not retain are
 /// written at XGBoost's defaults.
 fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams) -> Value {
-    let (key, block) = match objective {
-        "multi:softmax" | "multi:softprob" => (
-            "softmax_multiclass_param",
-            json!({ "num_class": num_class.to_string() }),
-        ),
-        "count:poisson" => (
-            "poisson_regression_param",
-            json!({ "max_delta_step": params.max_delta_step.to_string() }),
-        ),
+    let ((block, key), value) = match objective {
+        "multi:softmax" | "multi:softprob" => (SOFTMAX_NUM_CLASS, num_class.to_string()),
+        "count:poisson" => (MAX_DELTA_STEP, params.max_delta_step.to_string()),
         "reg:tweedie" => (
-            "tweedie_regression_param",
-            json!({ "tweedie_variance_power": params.tweedie_variance_power.to_string() }),
+            TWEEDIE_VARIANCE_POWER,
+            params.tweedie_variance_power.to_string(),
         ),
-        "reg:pseudohubererror" => (
-            "pseudo_huber_param",
-            json!({ "huber_slope": params.huber_slope.to_string() }),
-        ),
+        "reg:pseudohubererror" => (HUBER_SLOPE, params.huber_slope.to_string()),
         "rank:pairwise" | "rank:ndcg" | "rank:map" => (
-            "lambdarank_param",
-            json!({
-                "lambdarank_bias_norm": "1",
-                "lambdarank_normalization": "1",
-                "lambdarank_num_pair_per_sample": params.lambdarank_num_pair_per_sample.to_string(),
-                "lambdarank_pair_method": "topk",
-                "lambdarank_score_normalization": "1",
-                "lambdarank_unbiased": "0",
-                "ndcg_exp_gain": "1",
-            }),
+            LAMBDARANK_NUM_PAIR,
+            params.lambdarank_num_pair_per_sample.to_string(),
         ),
-        _ => (
-            "reg_loss_param",
-            json!({ "scale_pos_weight": params.scale_pos_weight.to_string() }),
-        ),
+        _ => (SCALE_POS_WEIGHT, params.scale_pos_weight.to_string()),
     };
+    let mut fields = Map::new();
+    if block == LAMBDARANK_NUM_PAIR.0 {
+        // The LambdaRank settings the model does not retain, at XGBoost's
+        // defaults (the pairing that sequoia implements is `topk`).
+        for (k, v) in [
+            ("lambdarank_bias_norm", "1"),
+            ("lambdarank_normalization", "1"),
+            ("lambdarank_pair_method", "topk"),
+            ("lambdarank_score_normalization", "1"),
+            ("lambdarank_unbiased", "0"),
+            ("ndcg_exp_gain", "1"),
+        ] {
+            fields.insert(k.to_string(), Value::String(v.to_string()));
+        }
+    }
+    fields.insert(key.to_string(), Value::String(value));
     let mut out = Map::with_capacity(2);
     out.insert("name".to_string(), Value::String(objective.to_string()));
-    out.insert(key.to_string(), block);
+    out.insert(block.to_string(), Value::Object(fields));
     Value::Object(out)
 }
 
@@ -607,31 +609,28 @@ fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams
 /// back into an [`ObjectiveParams`]. Missing blocks or fields keep XGBoost's
 /// defaults for `objective` (e.g. `max_delta_step = 0.7` for `count:poisson`).
 fn objective_params_from_json(objective: &str, obj: Option<&Value>) -> ObjectiveParams {
-    let mut params = ObjectiveParams::from_params(
-        &TrainingParams::builder()
-            .objective(objective)
-            .build_unchecked(),
-    );
+    let mut params = ObjectiveParams::defaults_for(objective);
     let Some(obj) = obj else {
         return params;
     };
-    let get = |block: &str, key: &str| obj.get(block).and_then(|b| b.get(key)).and_then(scalar_f64);
-    if let Some(v) = get("reg_loss_param", "scale_pos_weight") {
+    let get =
+        |(block, key): (&str, &str)| obj.get(block).and_then(|b| b.get(key)).and_then(scalar_f64);
+    if let Some(v) = get(SCALE_POS_WEIGHT) {
         params.scale_pos_weight = v;
     }
-    if let Some(v) = get("poisson_regression_param", "max_delta_step") {
+    if let Some(v) = get(MAX_DELTA_STEP) {
         params.max_delta_step = v;
     }
-    if let Some(v) = get("tweedie_regression_param", "tweedie_variance_power") {
+    if let Some(v) = get(TWEEDIE_VARIANCE_POWER) {
         params.tweedie_variance_power = v;
     }
-    if let Some(v) = get("pseudo_huber_param", "huber_slope") {
+    if let Some(v) = get(HUBER_SLOPE) {
         params.huber_slope = v;
     }
     // XGBoost writes `u32::MAX` (`LambdaRankParam::NotSet`) when unset; the
     // pair count then follows `lambdarank_pair_method`, whose `topk` default
     // is what `ObjectiveParams::default` already holds.
-    if let Some(v) = get("lambdarank_param", "lambdarank_num_pair_per_sample") {
+    if let Some(v) = get(LAMBDARANK_NUM_PAIR) {
         if v >= 1.0 && v != f64::from(u32::MAX) {
             params.lambdarank_num_pair_per_sample = v as usize;
         }

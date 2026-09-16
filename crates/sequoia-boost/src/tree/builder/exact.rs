@@ -14,7 +14,7 @@
 use super::{
     build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
     sweep_categorical, xgb_loss_chg, xgb_node_gain, xgb_update, BestSplit, InteractionState,
-    SplitPos, K_RT_EPS,
+    SplitPos, BELOW_ALL_VALUES, K_RT_EPS,
 };
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
@@ -316,16 +316,16 @@ impl<'a> ExactTreeBuilder<'a> {
                             let thr = if d_step > 0 { last + gap } else { last - gap };
                             // ColMaker's `last_fvalue ± delta` overflows to `±inf`
                             // for `|last|` near `f32::MAX`; the tree must stay
-                            // finite. Forward (missing right) needs every present
-                            // `v < thr`: `f32::MAX` works unless `last` is itself
-                            // `f32::MAX`, in which case no finite threshold
-                            // represents the partition and the candidate is
-                            // skipped. Backward (missing left) needs `v >= thr`,
-                            // which `f32::MIN` satisfies for every finite `v`.
+                            // finite. Backward (missing left) needs every present
+                            // `v >= thr`, which `BELOW_ALL_VALUES` satisfies.
+                            // Forward (missing right) needs `v < thr`: `f32::MAX`
+                            // works unless `last` is itself `f32::MAX`, in which
+                            // case no finite threshold represents the partition
+                            // and the candidate is skipped.
                             let thr = if thr.is_finite() {
                                 thr
                             } else if d_step < 0 {
-                                f32::MIN
+                                BELOW_ALL_VALUES
                             } else if last < f32::MAX {
                                 f32::MAX
                             } else {

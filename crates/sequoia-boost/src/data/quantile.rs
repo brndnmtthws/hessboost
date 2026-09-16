@@ -1,7 +1,7 @@
 //! Quantile cut computation for histogram-based training.
 //!
 //! For each numeric feature we compute up to `max_bin` cut points with
-//! XGBoost's weighted quantile sketch ([`crate::data::sketch`]), then map any
+//! XGBoost's weighted quantile sketch (the private `sketch` module), then map any
 //! value to a bin with an `upper_bound` search (`bin = #{cuts ≤ value}`,
 //! clamped). The cuts are exactly XGBoost's for the same data, weights, and
 //! `max_bin`: the minimum value is never a cut (bin 0 is `(-inf, cut0]`) and a

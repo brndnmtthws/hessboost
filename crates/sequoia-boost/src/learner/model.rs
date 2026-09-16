@@ -1,7 +1,7 @@
 //! The trained model: an ensemble of trees plus the metadata needed to turn
 //! their sum into calibrated predictions.
 
-use crate::config::{ObjectiveParams, TrainingParams};
+use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::Result;
 use crate::objective::create_objective;
@@ -760,11 +760,15 @@ impl BoostedModel {
         Self::from_xgboost_json(&std::fs::read_to_string(path)?)
     }
 
-    fn rebuild_objective(&self) -> Result<Box<dyn crate::objective::Objective>> {
-        let builder = TrainingParams::builder()
-            .objective(self.objective.clone())
-            .num_class(self.num_class);
-        create_objective(&self.objective_params.apply(builder).build_unchecked())
+    /// The objective the model was trained with, rebuilt from its name,
+    /// `num_class` and retained parameters. Fails for objectives the crate
+    /// cannot construct by name (custom objectives).
+    pub(crate) fn rebuild_objective(&self) -> Result<Box<dyn crate::objective::Objective>> {
+        let params = self
+            .objective_params
+            .training_params(&self.objective, self.num_class)
+            .build_unchecked();
+        create_objective(&params)
     }
 }
 

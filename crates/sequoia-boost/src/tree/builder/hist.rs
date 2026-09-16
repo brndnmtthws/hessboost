@@ -8,7 +8,7 @@
 use super::{
     build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
     sweep_categorical, xgb_loss_chg, xgb_node_gain, xgb_update, BestSplit, InteractionState,
-    SplitPos,
+    SplitPos, BELOW_ALL_VALUES,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
@@ -321,12 +321,9 @@ impl<'a> HistTreeBuilder<'a> {
                 b.right.hess as f32,
             )
         } else {
-            // XGBoost stores `-inf` for the missing-only-left endpoint; trees
-            // here require a finite `split_cond`, and `x < f32::MIN` is false
-            // for every finite `x`, so routing is identical.
             let threshold = match b.split_bin {
                 Some(bin) => cuts.cut_value(bin),
-                None => f32::MIN,
+                None => BELOW_ALL_VALUES,
             };
             tree.expand(
                 entry.nid,

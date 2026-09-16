@@ -354,10 +354,23 @@ impl ObjectiveParams {
         }
     }
 
-    /// Apply the retained values to a builder, so the rebuilt objective is the
-    /// one the model was trained with.
-    pub fn apply(&self, builder: TrainingParamsBuilder) -> TrainingParamsBuilder {
-        builder
+    /// XGBoost's defaults for `objective` (e.g. `max_delta_step = 0.7` for
+    /// `count:poisson`).
+    pub fn defaults_for(objective: &str) -> Self {
+        Self::from_params(
+            &TrainingParams::builder()
+                .objective(objective)
+                .build_unchecked(),
+        )
+    }
+
+    /// A training configuration for `objective` (with `num_class`) carrying
+    /// these parameters: the objective it rebuilds is the one the model was
+    /// trained with. Callers `build()` to validate or `build_unchecked()`.
+    pub fn training_params(&self, objective: &str, num_class: usize) -> TrainingParamsBuilder {
+        TrainingParams::builder()
+            .objective(objective)
+            .num_class(num_class)
             .scale_pos_weight(self.scale_pos_weight)
             .max_delta_step(self.max_delta_step)
             .tweedie_variance_power(self.tweedie_variance_power)

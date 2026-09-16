@@ -9,12 +9,9 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 ### Added
 
 - Runtime-dispatched AArch64 NEON kernels for objective gradients, prediction
-  transforms, metric reductions, and dense numeric histogram split evaluation.
-  Scalar fallbacks handle other CPUs, short inputs, and values outside the
-  approximation ranges.
-- Runtime-dispatched x86-64 kernels: an AVX2+FMA dense split-gain scan whose
-  division-free prefilter hands surviving candidates to the exact scalar test
-  (split choices are bit-identical), AVX2 exponential, sigmoid, logistic
+  transforms, and metric reductions. Scalar fallbacks handle other CPUs, short
+  inputs, and values outside the approximation ranges.
+- Runtime-dispatched x86-64 kernels: AVX2 exponential, sigmoid, logistic
   gradient, and short softmax (2 and 4 classes) kernels, and an SSE2 16-cut
   search for quantile binning. On x86-64 the histogram bin sums keep the scalar
   summation order.
@@ -136,35 +133,18 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 
 - `DMatrix::with_feature_names` and `DMatrix::feature_names`, which were
   unreferenced anywhere in the crate, examples, tests, or benchmarks.
-- The free function `tree::split_gain`; split evaluation keeps using the
-  inlined `calc_gain` arithmetic in the builders and SIMD kernels.
+- The free function `tree::split_gain` and the NEON/AVX2 dense split-gain
+  prefilter kernels; split evaluation is the scalar XGBoost `f32` gain
+  arithmetic in the builders.
 
 ### Fixed
 
-- Make the AArch64 NEON dense split scan bit-identical to the scalar scan. Its
-  vector prefilter compared a bound that could overflow to infinity (where
-  `inf > inf` reads false) or round subnormal, silently dropping candidates
-  the scalar scan accepts. The prefilter now saturates its bound and routes
-  subnormal products and intermediates to the exact check. Surviving
-  candidates are also accepted with the scalar `calc_gain` arithmetic, which
-  scores zero-Hessian children with a zero gain instead of rejecting them, so
-  the chosen split, statistics, and loss match the scalar scan and the x86-64
-  kernel bit for bit.
-
-- Continue the vector split scan from the node-wide incumbent gain. Each
-  feature's scan previously started from zero, so within the 1e-6 gain
-  epsilon it could accept a weaker candidate and discard the stronger one
-  the sequential scalar scan picks, moving the split to another feature on
-  both NEON and AVX2. The scan now receives the incumbent, restoring
-  bit-identical split choices.
 - Reserve sparse bin chunks by their stored entry count instead of the dense
   row width, so CSR training no longer requests dense-sized allocations that
   can fail for matrices with few stored entries.
 - Accumulate TreeSHAP contributions one tree at a time, matching the
   interaction path, so a later constant tree with very large leaf values can
   no longer round away an earlier tree's contribution.
-- Gate the adversarial split-scan test to the architectures that provide the
-  vector kernels, so the test target compiles on scalar-only architectures.
 - Check the compact split encoding's feature bound when the prediction layout
   is built, so a feature index that would wrap the slot field fails loudly
   instead of silently addressing another feature's keys.

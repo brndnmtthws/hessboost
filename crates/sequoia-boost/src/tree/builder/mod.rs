@@ -182,6 +182,14 @@ pub(super) enum SplitPos {
     BelowBins,
 }
 
+/// A finite threshold below every finite feature value: `x < BELOW_ALL_VALUES`
+/// is false for all finite `x`, so a split at it routes every present row
+/// right and only missing values (`default_left`) left. Stands in for the
+/// `-inf` XGBoost stores (`NumericBinLowerBound` at a feature's first bin, or
+/// an overflowed ColMaker endpoint) because trees here require a finite
+/// `split_cond`.
+pub(super) const BELOW_ALL_VALUES: f32 = f32::MIN;
+
 /// XGBoost's `SplitEvaluator::CalcWeight`: the regularized optimum computed in
 /// `f64`, rounded to `f32`, then clamped to the node's monotone bounds. The
 /// `f32` rounding happens before bounding, exactly as upstream.

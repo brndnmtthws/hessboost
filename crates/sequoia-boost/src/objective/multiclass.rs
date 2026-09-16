@@ -60,13 +60,41 @@ impl Objective for SoftmaxObjective {
         crate::simd::softmax_rows_inplace(preds, k);
     }
 
-    fn base_margin(&self, _labels: &[f32], _weights: Option<&[f32]>) -> f32 {
-        // Multiclass initializes every class margin to zero.
-        0.0
+    fn base_margins(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        _group: Option<&crate::data::GroupInfo>,
+    ) -> Vec<f32> {
+        // XGBoost `SoftmaxMultiClassObj::InitEstimation`, step for step in its
+        // precision: class weight totals accumulated in f32 (`SmallHistogram`),
+        // divided by the f64 weight sum (`VecScaDiv` multiplies by `1/Σw`),
+        // `ln(p + 1e-6)` (`LogE` with `kRtEps`), then centered by the f32 mean.
+        let k = self.num_class;
+        let mut margins = vec![0.0f32; k];
+        for (i, &y) in labels.iter().enumerate() {
+            if let Some(slot) = margins.get_mut(y as usize) {
+                *slot += weights.map_or(1.0, |ws| ws[i]);
+            }
+        }
+        let sum_w = match weights {
+            Some(ws) => ws.iter().map(|&w| w as f64).sum::<f64>(),
+            None => labels.len() as f32 as f64,
+        };
+        let inv_sum_w = 1.0 / sum_w;
+        for m in &mut margins {
+            *m = ((*m as f64 * inv_sum_w) as f32 + 1e-6).ln();
+        }
+        let n = k as f32;
+        let mean = margins.iter().map(|m| m / n).sum::<f32>();
+        for m in &mut margins {
+            *m -= mean;
+        }
+        margins
     }
 
-    fn default_metric(&self) -> &str {
-        "mlogloss"
+    fn default_metric(&self) -> String {
+        "mlogloss".to_string()
     }
 }
 
@@ -100,5 +128,25 @@ mod tests {
         assert_relative_eq!(out[5].grad, 1.0 / 3.0 - 1.0, epsilon = 1e-6);
         // hess = 2 * p * (1-p) = 2 * 1/3 * 2/3
         assert_relative_eq!(out[0].hess, 2.0 * (1.0 / 3.0) * (2.0 / 3.0), epsilon = 1e-6);
+    }
+
+    /// Class intercepts are centered log frequencies: `ln(p_c + 1e-6)` minus
+    /// their mean, so they sum to ~0 and differ by the log-odds between
+    /// classes. Weights shift the frequencies; an unweighted uniform split
+    /// gives all-zero margins.
+    #[test]
+    fn base_margins_are_centered_log_frequencies() {
+        let obj = SoftmaxObjective::new(3, true);
+        let labels = [0.0f32, 0.0, 1.0, 2.0];
+        let m = obj.base_margins(&labels, None, None);
+        assert_eq!(m.len(), 3);
+        assert!(m.iter().sum::<f32>().abs() < 1e-6);
+        let expected_gap = (0.5f32 + 1e-6).ln() - (0.25f32 + 1e-6).ln();
+        assert!((m[0] - m[1] - expected_gap).abs() < 1e-6, "{m:?}");
+        assert_eq!(m[1], m[2]);
+        // Weight 2 on the class-1 row makes every class equally frequent.
+        let w = [1.0f32, 1.0, 2.0, 2.0];
+        let uniform = obj.base_margins(&labels, Some(&w), None);
+        assert!(uniform.iter().all(|v| v.abs() < 1e-6), "{uniform:?}");
     }
 }

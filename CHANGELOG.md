@@ -25,6 +25,32 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   full training, tree builds, and pointwise gradients, transforms, and
   metrics. The SVGs are rendered by `docs/benchmarks/charts.gp` from
   `docs/benchmarks/xgboost.dat` and `docs/benchmarks/optimization.dat`.
+- XGBoost 3.4.1 parity harness: `scripts/gen_fixtures.py` writes 37 pointwise,
+  banded, and train-only cases (every supported objective, including
+  `reg:logistic` and the `reg:linear` alias) plus 21 histogram/approximate
+  cut oracles; `tests/parity.rs` checks train, import (predictions, margins,
+  SHAP) and cut parity, and `scripts/check_exports.py` reloads supported
+  exported models in XGBoost. CI runs all three via `uv`.
+- `TrainingParams::tweedie_variance_power` (default 1.5, in `[1, 2)`) and
+  `TrainingParams::huber_slope` (default 1.0), wired into `reg:tweedie` and
+  `reg:pseudohubererror`; the pseudo-Huber gradient now honors the slope like
+  XGBoost's `PseudoHuberRegression`.
+- `Objective::const_hess` (true only for `reg:squarederror`).
+- XGBoost JSON interop with 3.4.1's DART layout: `model.weight_drop` is read
+  as the per-tree DART weights and written back for models with non-unit tree
+  weights (which previously failed to export).
+- `reg:logistic` as its own objective: the `binary:logistic` loss, reported
+  under XGBoost's name and default metric (`rmse`), and saved as
+  `reg:logistic`. `reg:linear` models are saved as `reg:squarederror`, as
+  XGBoost does.
+- `BoostedModel::objective_params()` and `ObjectiveParams`: the objective
+  hyper-parameters (`scale_pos_weight`, effective `max_delta_step`,
+  `tweedie_variance_power`, `huber_slope`, `lambdarank_num_pair_per_sample`)
+  a model was trained with. They are stored in native models, used to rebuild
+  the objective for prediction, and written to / read from the XGBoost JSON
+  objective block instead of hard-coded defaults.
+- `TrainingParams::effective_max_delta_step()`: the `max_delta_step` in
+  effect, resolving an unset value to XGBoost's objective-dependent default.
 
 ### Changed
 
@@ -63,6 +89,48 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   parsing, and the example/benchmark data generators). Behavior is unchanged;
   verified end-to-end by an all-subsystem equivalence probe hashing every
   output against the pre-refactor revision.
+- Per-output intercepts: `BoostedModel::base_score()` remains the scalar first
+  output, while `base_scores()` returns one margin-space value per output/class.
+  `Objective::base_margin` became `base_margins(labels, weights, group) ->
+  Vec<f32>`, reproducing XGBoost 3.4.1's `InitEstimation` bit for bit: the
+  (weighted) label mean for squared error, logistic (`scale_pos_weight == 1`),
+  Poisson, Gamma and Tweedie; centered class log-frequencies for softmax; and
+  a Newton step through the link for everything else (pseudo-Huber, ranking,
+  reweighted logistic). A user `base_score` is broadcast to every output
+  through the link, as XGBoost does. Native JSON/binary models store the
+  intercept as a vector.
+- XGBoost JSON export now targets 3.4.1: `version [3,4,1]`, vector
+  `base_score` (`"[v0,v1,...]"`), `boost_from_average`, and each objective's
+  parameter block (`reg_loss_param`, `poisson_regression_param`,
+  `tweedie_regression_param`, `pseudo_huber_param`, `softmax_multiclass_param`,
+  `lambdarank_param`). Import requires the 3.x vector `base_score` (one entry
+  applies to every output) and rejects the pre-3.x scalar form.
+- `TrainingParams::max_delta_step` is `Option<f64>`. `None` (the default)
+  keeps XGBoost's behavior of injecting `0.7` for `count:poisson`; an explicit
+  `0` now disables the constraint for both the Poisson Hessian and the tree
+  regularizer instead of being treated as unset.
+- `Objective::default_metric` returns an owned `String` so it can carry
+  configuration: LambdaRank reports `ndcg@k` (`rank:pairwise`, `rank:ndcg`)
+  or `map@k` (`rank:map`) with `k = lambdarank_num_pair_per_sample`, and
+  `reg:tweedie` reports `tweedie-nloglik@<tweedie_variance_power>`, matching
+  XGBoost's `DefaultEvalMetric`; early stopping therefore tracks the same
+  score as XGBoost.
+- Native models record `n_outputs` (raw outputs per instance) separately from
+  `num_class`, so a custom objective with several outputs keeps its intercept
+  and tree layout through prediction and serialization. Native JSON requires
+  the field.
+- XGBoost JSON import honors `tree_info` (with `iteration_indptr` /
+  `num_parallel_tree`): grouped multiclass forests are reordered into the
+  round-robin layout together with their DART `weight_drop` entries, and
+  layouts that cannot be mapped losslessly are rejected. Export refuses
+  objectives XGBoost cannot load (custom objectives) instead of writing a
+  bogus `reg_loss_param` block.
+- Logistic labels are validated like XGBoost's `LogisticRegression::CheckLabel`
+  (`binary:logistic` and `reg:logistic` accept probabilities in `[0, 1]`).
+- `TrainingParams::validate` rejects `lambdarank_num_pair_per_sample == 0`
+  (XGBoost's lower bound is 1; zero would silently train zero gradients),
+  `tweedie_variance_power` values that round to `2.0` in `f32`, and
+  `huber_slope` values whose `f32` square overflows or vanishes.
 
 ### Removed
 
@@ -100,6 +168,29 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 - Check the compact split encoding's feature bound when the prediction layout
   is built, so a feature index that would wrap the slot field fails loudly
   instead of silently addressing another feature's keys.
+- Evaluate XGBoost's final backward histogram candidate: missing values alone
+  on the left, every present bin on the right (`default_left`, threshold
+  `f32::MIN` standing in for XGBoost's `-inf`). It is distinct under monotone
+  constraints, where the mirrored forward endpoint can violate the required
+  direction. The missing-value test now uses the forward pass's completed
+  accumulator exactly as XGBoost's `SplitContainsMissingValues` does.
+- Round split gains where XGBoost does: the parent gain is evaluated at the
+  `f32` weight and each child's gain is rounded to `f32` before the two are
+  added, so near-tied candidates resolve the same way as upstream.
+- Keep exact-method split thresholds finite for feature values near
+  `±f32::MAX`: the XGBoost endpoint (`last ± (|last| + eps)`) and midpoint
+  arithmetic are used unchanged, and only an overflowing result falls back to
+  the finite value that induces the same partition (or the endpoint is
+  skipped when none exists), so prediction no longer hits a non-finite
+  `split_cond`.
+- Seed the SIMD softmax gradient shift with `f32::MIN_POSITIVE` like XGBoost's
+  `SoftmaxMultiClassObj` and the scalar path, so rows whose margins are all
+  far below zero produce the same result on every architecture and batch
+  size instead of NaN scalarly and finite gradients through NEON/AVX2.
+- LambdaRank: rank documents with a stable numeric sort in which `+0.0` and
+  `-0.0` tie (XGBoost `ArgSort` with `std::greater`), and apply the
+  normalization, query weight and weight normalization as three separate
+  `f32` multiplications in XGBoost's order instead of one pre-combined scale.
 
 ## [0.2.0] - 2026-08-16
 
@@ -122,8 +213,9 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   space and pass configured Poisson `max_delta_step` into its Hessian.
 - Add query-level ranking weights and use them when averaging NDCG and MAP,
   matching XGBoost's ranking-weight semantics.
-- Reject XGBoost JSON export for DART, `gblinear`, and categorical models that
-  cannot be represented correctly by the current exporter.
+- Support XGBoost 3.4.1 categorical-tree JSON import/export by translating its
+  right-set representation to sequoia's left-set representation; gblinear
+  model JSON remains unsupported.
 - Replace the unmaintained bincode native serializer with Postcard. Native
   binary blobs from 0.1.0 are not compatible with 0.2.0. JSON remains the
   portable native interchange format across these versions.

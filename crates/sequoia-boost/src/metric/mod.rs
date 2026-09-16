@@ -223,11 +223,20 @@ pub(crate) fn group_ranges(
     }
 }
 
-/// Indices of `values` sorted by descending value (total order, stable).
+/// Indices of `values` sorted by descending value, stable under numeric
+/// equality. Mirrors XGBoost `common::ArgSort(..., std::greater<>{})`
+/// (`std::stable_sort`): `-0.0` and `+0.0` compare equal and keep input order,
+/// which decides which documents fall inside a top-k truncation. NaN (absent in
+/// valid predictions) falls back to `total_cmp` so the comparator stays a
+/// consistent total preorder.
 /// Shared by the ranking metrics and the LambdaMART objective.
 pub(crate) fn argsort_desc(values: &[f32]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..values.len()).collect();
-    order.sort_by(|&a, &b| values[b].total_cmp(&values[a]));
+    order.sort_by(|&a, &b| {
+        values[b]
+            .partial_cmp(&values[a])
+            .unwrap_or_else(|| values[b].total_cmp(&values[a]))
+    });
     order
 }
 

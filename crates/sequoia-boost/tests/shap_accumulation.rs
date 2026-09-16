@@ -30,9 +30,10 @@ fn contributions_survive_a_later_constant_tree() {
       ]
     }}
   ],
-  "base_score": 0.0,
+  "base_score": [0.0],
   "objective": "reg:squarederror",
-  "num_class": 1,
+  "num_class": 0,
+  "n_outputs": 1,
   "n_features": 1
 }}"#
     );

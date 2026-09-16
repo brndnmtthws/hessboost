@@ -1,7 +1,7 @@
 //! The trained model: an ensemble of trees plus the metadata needed to turn
 //! their sum into calibrated predictions.
 
-use crate::config::TrainingParams;
+use crate::config::{ObjectiveParams, TrainingParams};
 use crate::data::DMatrix;
 use crate::error::Result;
 use crate::objective::create_objective;
@@ -34,14 +34,27 @@ pub enum ImportanceType {
 /// A gradient-boosted tree ensemble.
 ///
 /// Leaf weights already include the learning rate (shrinkage), so a raw margin
-/// prediction is simply `base_score + Σ tree(x)`. The stored `objective` name
-/// drives the prediction transform (e.g. the logistic sigmoid).
+/// prediction for output `k` is simply `base_score[k] + Σ tree_k(x)`. The
+/// stored `objective` name drives the prediction transform (e.g. the logistic
+/// sigmoid).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoostedModel {
     trees: Vec<RegTree>,
-    base_score: f32,
+    /// Per-output intercept in margin space (length `n_outputs`).
+    base_score: Vec<f32>,
+    /// The objective's XGBoost name (`Objective::name`), which drives the
+    /// prediction transform.
     objective: String,
+    /// Objective hyper-parameters, retained for XGBoost-format export and for
+    /// rebuilding the objective (XGBoost defaults when absent).
+    #[serde(default)]
+    objective_params: ObjectiveParams,
+    /// The configured `num_class` (`0` for scalar objectives).
     num_class: usize,
+    /// Raw outputs per instance: `num_class` for multiclass objectives, the
+    /// objective's own output count otherwise (custom objectives may have
+    /// several). Trees are laid out round-robin over outputs.
+    n_outputs: usize,
     n_features: usize,
     /// The best iteration index selected by early stopping, if any.
     best_iteration: Option<usize>,
@@ -87,26 +100,6 @@ impl LinearModel {
     }
 }
 
-/// Margin buffer for `data`: `base` broadcast to every `(row, output)`,
-/// overridden by the per-instance `base_margin` when present. Shared by
-/// [`BoostedModel::initial_margins`] and the training margin caches.
-pub(crate) fn base_margins(data: &DMatrix, base: f32, k: usize) -> Vec<f32> {
-    let n = data.n_rows();
-    let mut out = vec![base; n * k];
-    if let Some(bm) = data.base_margin() {
-        if bm.len() == n * k {
-            out.copy_from_slice(bm);
-        } else if bm.len() == n {
-            for row in 0..n {
-                for c in 0..k {
-                    out[row * k + c] = bm[row];
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Invoke `f(feature, value)` for each present feature of `row` in feature
 /// order. Shared by the gblinear training and prediction paths; arithmetic
 /// stays at each call site to preserve exact conversion points.
@@ -129,14 +122,22 @@ pub(super) struct AttributionPrologue<'a> {
     pub(super) initial: Vec<f32>,
 }
 
+/// The metadata a model is assembled with: what it predicts and how its trees
+/// are laid out. Shared by training and the XGBoost-JSON importer.
+pub(crate) struct ModelSpec {
+    /// The objective's XGBoost name (`Objective::name`).
+    pub(crate) objective: String,
+    pub(crate) objective_params: ObjectiveParams,
+    /// Configured `num_class` (`0` for scalar objectives).
+    pub(crate) num_class: usize,
+    /// Raw outputs per instance (`Objective::n_outputs`).
+    pub(crate) n_outputs: usize,
+    pub(crate) n_features: usize,
+}
+
 impl BoostedModel {
-    pub(crate) fn new(
-        base_score: f32,
-        objective: String,
-        num_class: usize,
-        n_features: usize,
-    ) -> Self {
-        Self::from_parts(Vec::new(), base_score, objective, num_class, n_features)
+    pub(crate) fn new(base_score: Vec<f32>, spec: ModelSpec) -> Self {
+        Self::from_parts(Vec::new(), Vec::new(), base_score, spec)
     }
 
     /// Attach a fitted linear (`gblinear`) booster. Predictions then come from
@@ -221,21 +222,23 @@ impl BoostedModel {
     }
 
     /// Reassemble a model from its constituent parts. Used by the XGBoost-JSON
-    /// importer, which builds trees and metadata externally.
+    /// importer, which builds trees and metadata externally. `tree_weights`
+    /// is either empty (every tree weighs `1.0`) or holds one DART weight per
+    /// tree; [`BoostedModel::validate_structure`] enforces the length.
     pub(crate) fn from_parts(
         trees: Vec<RegTree>,
-        base_score: f32,
-        objective: String,
-        num_class: usize,
-        n_features: usize,
+        tree_weights: Vec<f32>,
+        base_score: Vec<f32>,
+        spec: ModelSpec,
     ) -> Self {
-        let tree_weights = vec![1.0; trees.len()];
         BoostedModel {
             trees,
             base_score,
-            objective,
-            num_class,
-            n_features,
+            objective: spec.objective,
+            objective_params: spec.objective_params,
+            num_class: spec.num_class,
+            n_outputs: spec.n_outputs,
+            n_features: spec.n_features,
             best_iteration: None,
             tree_weights,
             linear: None,
@@ -248,19 +251,22 @@ impl BoostedModel {
         self.num_class
     }
 
+    /// The objective hyper-parameters the model was trained with.
+    pub fn objective_params(&self) -> &ObjectiveParams {
+        &self.objective_params
+    }
+
     /// Number of trees (boosting rounds × outputs).
     pub fn num_trees(&self) -> usize {
         self.trees.len()
     }
 
-    /// Number of raw outputs per instance (`num_class` for multiclass, else 1).
+    /// Number of raw outputs per instance: `num_class` for multiclass, the
+    /// objective's output count otherwise (`1` for every built-in scalar
+    /// objective; custom objectives may declare more).
     #[inline]
     pub fn n_outputs(&self) -> usize {
-        if self.num_class >= 2 {
-            self.num_class
-        } else {
-            1
-        }
+        self.n_outputs
     }
 
     /// Number of boosting rounds (`num_trees / n_outputs`).
@@ -268,9 +274,17 @@ impl BoostedModel {
         self.trees.len() / self.n_outputs()
     }
 
-    /// The base score (global bias) in margin space.
+    /// The first output's intercept (global bias) in margin space.
+    ///
+    /// Scalar-output models have exactly one value. For multiclass models use
+    /// [`Self::base_scores`] to access every per-class intercept.
     pub fn base_score(&self) -> f32 {
-        self.base_score
+        self.base_score[0]
+    }
+
+    /// Per-output intercepts in margin space, one per class/output.
+    pub fn base_scores(&self) -> &[f32] {
+        &self.base_score
     }
 
     /// The objective name this model was trained with.
@@ -314,7 +328,7 @@ impl BoostedModel {
         let n = data.n_rows();
         let k = self.n_outputs();
         // A gblinear model predicts from its linear parameters and ignores the
-        // (empty) tree ensemble: margin(row, k) = base_score + bias[k] +
+        // (empty) tree ensemble: margin(row, k) = base_score[k] + bias[k] +
         // Σ_f weights[f][k] * x[row, f], with missing features contributing 0.
         if let Some(lm) = &self.linear {
             let mut out = self.initial_margins(data);
@@ -334,8 +348,8 @@ impl BoostedModel {
             ntree_limit.min(self.trees.len())
         };
         // Initialize from the dataset's per-instance base margin when present
-        // (it overrides the scalar base score, matching XGBoost); otherwise use
-        // the trained global bias.
+        // (it overrides the per-output intercepts, matching XGBoost); otherwise
+        // use the trained global bias.
         let mut out = self.initial_margins(data);
         self.accumulate_forest(data, &mut out, limit, |ti| self.tree_weight(ti));
         out
@@ -368,7 +382,7 @@ impl BoostedModel {
                     weight(ti),
                     &mut out_block[ti % k..],
                     stride,
-                )
+                );
             },
         );
     }
@@ -480,7 +494,7 @@ impl BoostedModel {
             t,
             |block, forest, r, out_row| block.original_leaf_ids_for_row(forest, r, out_row),
             |block, forest, ti, rows, out_block, stride| {
-                block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], stride)
+                block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], stride);
             },
         );
         Ok(out)
@@ -539,8 +553,26 @@ impl BoostedModel {
         (0..self.trees.len()).any(|i| self.tree_weight(i) != 1.0)
     }
 
+    /// Margin buffer for `data`: the per-output intercepts broadcast to every
+    /// row, overridden by the dataset's per-instance `base_margin` when
+    /// present (one value per row, or one per row and output). Shared by
+    /// prediction, TreeSHAP, and the training margin caches.
     pub(crate) fn initial_margins(&self, data: &DMatrix) -> Vec<f32> {
-        base_margins(data, self.base_score, self.n_outputs())
+        let n = data.n_rows();
+        let k = self.n_outputs();
+        match data.base_margin() {
+            Some(bm) if bm.len() == n * k => bm.to_vec(),
+            Some(bm) if bm.len() == n => {
+                bm.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect()
+            }
+            _ => {
+                let mut out = Vec::with_capacity(n * k);
+                for _ in 0..n {
+                    out.extend_from_slice(&self.base_score);
+                }
+                out
+            }
+        }
     }
 
     /// Validated prologue for the TreeSHAP paths. `predict_leaf` is excluded:
@@ -639,10 +671,30 @@ impl BoostedModel {
     pub(crate) fn validate_structure(&self) -> Result<()> {
         use crate::error::SequoiaError;
 
-        if self.n_features == 0 || !self.base_score.is_finite() {
+        if self.n_features == 0 {
             return Err(SequoiaError::ModelFormat(
-                "model has invalid feature count or base score".to_string(),
+                "model has an invalid feature count".to_string(),
             ));
+        }
+        if self.n_outputs == 0
+            || (self.num_class >= 2 && self.n_outputs != self.num_class)
+            || self.trees.len() % self.n_outputs != 0
+        {
+            return Err(SequoiaError::ModelFormat(format!(
+                "invalid output layout: {} outputs, num_class {}, {} trees",
+                self.n_outputs,
+                self.num_class,
+                self.trees.len()
+            )));
+        }
+        if self.base_score.len() != self.n_outputs()
+            || self.base_score.iter().any(|v| !v.is_finite())
+        {
+            return Err(SequoiaError::ModelFormat(format!(
+                "base_score must hold one finite value per output ({} outputs, got {:?})",
+                self.n_outputs(),
+                self.base_score
+            )));
         }
         if !self.tree_weights.is_empty() && self.tree_weights.len() != self.trees.len() {
             return Err(SequoiaError::ModelFormat(
@@ -709,11 +761,10 @@ impl BoostedModel {
     }
 
     fn rebuild_objective(&self) -> Result<Box<dyn crate::objective::Objective>> {
-        let params = TrainingParams::builder()
+        let builder = TrainingParams::builder()
             .objective(self.objective.clone())
-            .num_class(self.num_class)
-            .build_unchecked();
-        create_objective(&params)
+            .num_class(self.num_class);
+        create_objective(&self.objective_params.apply(builder).build_unchecked())
     }
 }
 
@@ -928,15 +979,13 @@ impl<'a> RowBlock<'a> {
     /// Value of feature `f` in loaded row `r`, `None` when missing.
     #[inline]
     pub(super) fn get(&self, r: usize, f: u32) -> Option<f32> {
-        let v = match self.row(r) {
-            Some(row) => row[f as usize],
-            None => {
-                let RowBlock::Wide { data, start } = self else {
-                    unreachable!("only wide blocks lack dense rows")
-                };
-                return data.get(start + r, f as usize);
-            }
+        let Some(row) = self.row(r) else {
+            let RowBlock::Wide { data, start } = self else {
+                unreachable!("only wide blocks lack dense rows")
+            };
+            return data.get(start + r, f as usize);
         };
+        let v = row[f as usize];
         if v.is_nan() {
             None
         } else {
@@ -967,14 +1016,13 @@ impl<'a> RowBlock<'a> {
         weight: impl Fn(usize) -> f32,
         out: &mut [f32],
     ) {
-        match self.row(r) {
-            Some(row) => forest.accumulate_row(row, limit, weight, out),
-            None => {
-                let k = out.len();
-                for t in 0..limit {
-                    let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
-                    out[t % k] += weight(t) * forest.leaf_value(leaf);
-                }
+        if let Some(row) = self.row(r) {
+            forest.accumulate_row(row, limit, weight, out);
+        } else {
+            let k = out.len();
+            for t in 0..limit {
+                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                out[t % k] += weight(t) * forest.leaf_value(leaf);
             }
         }
     }
@@ -1016,15 +1064,12 @@ impl<'a> RowBlock<'a> {
         out: &mut [u32],
         stride: usize,
     ) {
-        match self.lane_block(rows) {
-            Some((lanes, tail, n_cols)) => {
-                forest.original_leaf_ids(t, lanes, tail, n_cols, rows, out, stride)
-            }
-            None => {
-                for r in 0..rows {
-                    let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
-                    out[r * stride] = forest.original_id(leaf);
-                }
+        if let Some((lanes, tail, n_cols)) = self.lane_block(rows) {
+            forest.original_leaf_ids(t, lanes, tail, n_cols, rows, out, stride);
+        } else {
+            for r in 0..rows {
+                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                out[r * stride] = forest.original_id(leaf);
             }
         }
     }
@@ -1040,15 +1085,12 @@ impl<'a> RowBlock<'a> {
         out: &mut [f32],
         stride: usize,
     ) {
-        match self.lane_block(rows) {
-            Some((lanes, tail, n_cols)) => {
-                forest.accumulate(t, lanes, tail, n_cols, rows, weight, out, stride)
-            }
-            None => {
-                for r in 0..rows {
-                    let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
-                    out[r * stride] += weight * forest.leaf_value(leaf);
-                }
+        if let Some((lanes, tail, n_cols)) = self.lane_block(rows) {
+            forest.accumulate(t, lanes, tail, n_cols, rows, weight, out, stride);
+        } else {
+            for r in 0..rows {
+                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                out[r * stride] += weight * forest.leaf_value(leaf);
             }
         }
     }

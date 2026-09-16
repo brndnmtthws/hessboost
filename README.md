@@ -21,8 +21,8 @@ transfer directly.
 
 > **Built with AI.** The implementation was generated with **Claude** (Anthropic's
 > AI coding assistant) under Patrick Garrett's direction and review. It is **AI-generated
-> code**: it is covered by unit, property, and doc tests plus CI-checked XGBoost
-> model-quality parity, but it may still contain bugs, subtle numerical errors, or
+> code**: it is covered by unit, property, and doc tests plus CI-checked
+> XGBoost 3.4.1 parity, but it may still contain bugs, subtle numerical errors, or
 > wrong edge-case behavior. **Review and validate it for your own use case. It is
 > provided as-is, without warranty** (see [LICENSE](LICENSE)). Issue reports and
 > fixes are welcome.
@@ -87,13 +87,18 @@ Runnable, self-contained examples live in
   row/column subsampling (`bytree`/`bylevel`/`bynode`).
 - **Regularization:** `lambda`, `alpha`, `gamma`, `min_child_weight`,
   `max_delta_step`, `max_depth`, `max_leaves`, `max_bin`.
-- **Objectives:** `reg:squarederror`, `reg:pseudohubererror`, `binary:logistic`,
-  `multi:softmax`, `multi:softprob`, `count:poisson`, `reg:gamma`, `reg:tweedie`,
-  learning-to-rank (`rank:pairwise`, `rank:ndcg`, `rank:map`, LambdaMART), and a
-  user **custom-objective hook**.
+- **Objectives:** `reg:squarederror` (alias `reg:linear`), `reg:logistic`,
+  `reg:pseudohubererror` (`huber_slope`), `binary:logistic`, `multi:softmax`,
+  `multi:softprob`, `count:poisson`, `reg:gamma`, `reg:tweedie`
+  (`tweedie_variance_power`), learning-to-rank (`rank:pairwise`, `rank:ndcg`,
+  `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), and a user
+  **custom-objective hook**. Intercepts are estimated per output exactly as
+  XGBoost 3.4.1 does (label mean, class log-frequencies, or a Newton step).
 - **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
   `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
-  **custom-metric hook**.
+  **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for
+  ranking, `tweedie-nloglik@rho` for Tweedie), except `reg:pseudohubererror`,
+  which reports `mae` because XGBoost's `mphe` is not implemented.
 - **Constraints:** monotone constraints and **interaction constraints**,
   supported in **both** the `hist` and `exact` builders.
 - **Modeling:** **native categorical splits** (hist and exact), per-instance
@@ -176,10 +181,26 @@ cargo test -p sequoia-boost         # unit + integration tests
 cargo clippy --all-targets          # lints
 ```
 
-Numerical parity against upstream XGBoost is checked by a fixture harness:
-`scripts/gen_fixtures.py` trains real `xgboost` across objectives and exports
-predictions to `fixtures/`. The ignored integration test `tests/parity.rs`
-asserts `sequoia-boost` matches within tolerance. See `scripts/README.md`.
+Numerical parity with **XGBoost 3.4.1** is checked in CI by a fixture harness
+(`scripts/gen_fixtures.py`, `crates/sequoia-boost/tests/parity.rs`,
+`scripts/check_exports.py`). Each case is checked three ways: **train parity**
+(same data and parameters, compare predictions), **import parity**
+(`from_xgboost_json` on the XGBoost model: predictions, margins, SHAP
+contributions) and **export parity** (`to_xgboost_json` reloaded by XGBoost).
+`exact`-tier cases — including every objective and deterministic tree method,
+plus categorical splits — must agree pointwise (1e-4 / 1e-5). `quality` cases
+(row/column subsampling and DART) use an RMSE band because their RNG streams
+differ. The `train-only` gblinear case is pointwise; gblinear XGBoost-JSON
+import/export remains unsupported and is asserted explicitly. Histogram and
+approximate quantile cuts are compared bit-for-bit.
+
+```sh
+uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+cargo test -p sequoia-boost --test parity --release -- --ignored --nocapture
+uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+```
+
+See `scripts/README.md` for the case matrix and tolerances.
 
 ## Development provenance
 

@@ -84,12 +84,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install real XGBoost
-        run: python -m pip install --upgrade "xgboost==3.4.1" numpy
-      - name: Generate fixtures from real XGBoost
-        run: python scripts/gen_fixtures.py
-      - name: Assert quality parity
-        run: cargo test -p sequoia-boost --test parity -- --ignored --nocapture
+      - uses: astral-sh/setup-uv@v5
+      - name: Generate fixtures from XGBoost 3.4.1
+        run: uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+      - name: Train, import and cut parity
+        run: cargo test -p sequoia-boost --test parity --release -- --ignored --nocapture
+      - name: Export parity (reload in XGBoost)
+        run: uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py

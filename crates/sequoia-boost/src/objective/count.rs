@@ -8,18 +8,10 @@ fn log_link_transform(preds: &mut [f32]) {
     crate::simd::exp_inplace(preds);
 }
 
-/// Inverse log link in margin (`f32`) space, floored away from zero.
-fn log_link_margin32(base_score: f32) -> f32 {
-    base_score.max(1e-6).ln()
-}
-
-/// Inverse log link from a label mean (`f64`), floored away from zero.
-fn log_link_margin64(mean: f64) -> f32 {
-    mean.max(1e-6).ln() as f32
-}
-
-/// Emit the `pred_transform`/`prob_to_margin`/`base_margin` trio shared by the
-/// log-link objectives (all predict `exp(margin)`).
+/// Emit the `pred_transform`/`prob_to_margin`/`base_margins` trio shared by
+/// the log-link objectives (all predict `exp(margin)`). The link is XGBoost's
+/// `ProbToMargin`, `ln(v)` in `f32`; the intercept is XGBoost's
+/// `FitInterceptGlmLike`, the (weighted) label mean through that link.
 macro_rules! log_link_objective {
     () => {
         fn pred_transform(&self, preds: &mut [f32]) {
@@ -27,11 +19,16 @@ macro_rules! log_link_objective {
         }
 
         fn prob_to_margin(&self, base_score: f32) -> f32 {
-            log_link_margin32(base_score)
+            base_score.ln()
         }
 
-        fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-            log_link_margin64(weighted_label_mean(labels, weights))
+        fn base_margins(
+            &self,
+            labels: &[f32],
+            weights: Option<&[f32]>,
+            _group: Option<&crate::data::GroupInfo>,
+        ) -> Vec<f32> {
+            vec![self.prob_to_margin(weighted_label_mean(labels, weights))]
         }
     };
 }
@@ -77,8 +74,8 @@ impl Objective for PoissonObjective {
 
     log_link_objective!();
 
-    fn default_metric(&self) -> &str {
-        "poisson-nloglik"
+    fn default_metric(&self) -> String {
+        "poisson-nloglik".to_string()
     }
 }
 
@@ -105,12 +102,13 @@ impl Objective for GammaObjective {
 
     log_link_objective!();
 
-    fn default_metric(&self) -> &str {
-        "gamma-nloglik"
+    fn default_metric(&self) -> String {
+        "gamma-nloglik".to_string()
     }
 }
 
-/// Tweedie regression (`reg:tweedie`) with variance power `rho ∈ (1, 2)`.
+/// Tweedie regression (`reg:tweedie`) with variance power `rho ∈ [1, 2)`
+/// (XGBoost `tweedie_variance_power`; 1 is Poisson, 2 would be Gamma).
 #[derive(Debug, Clone, Copy)]
 pub struct TweedieObjective {
     rho: f32,
@@ -147,8 +145,10 @@ impl Objective for TweedieObjective {
 
     log_link_objective!();
 
-    fn default_metric(&self) -> &str {
-        "tweedie-nloglik"
+    fn default_metric(&self) -> String {
+        // XGBoost `TweedieRegression::Configure` names the metric with the
+        // configured power so evaluation uses the same distribution.
+        format!("tweedie-nloglik@{}", self.rho)
     }
 }
 
@@ -188,5 +188,24 @@ mod tests {
         obj.pred_transform(&mut p);
         assert_relative_eq!(p[0], 1.0, epsilon = 1e-6);
         assert_relative_eq!(p[1], 1.0f32.exp(), epsilon = 1e-6);
+    }
+
+    /// The log-link intercept is `ln(mean)` in f32 (XGBoost
+    /// `FitInterceptGlmLike` + `ProbToMargin`); with weights it is the
+    /// weighted mean, and a zero mean maps to `-inf` like XGBoost (which the
+    /// trainer rejects rather than floors).
+    #[test]
+    fn log_link_intercept_is_ln_of_mean() {
+        let obj = PoissonObjective::default();
+        assert_eq!(obj.base_margins(&[2.0, 6.0], None, None), vec![4f32.ln()]);
+        let w = [3.0f32, 1.0];
+        assert_eq!(
+            obj.base_margins(&[2.0, 6.0], Some(&w), None),
+            vec![3f32.ln()]
+        );
+        assert_eq!(
+            GammaObjective.base_margins(&[0.0, 0.0], None, None),
+            vec![f32::NEG_INFINITY]
+        );
     }
 }

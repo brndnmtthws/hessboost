@@ -11,11 +11,11 @@ pub use exact::{all_features, all_rows, ExactTreeBuilder, SortedColumns};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use crate::objective::GradPair;
 use crate::tree::constraints::{calc_weight_bounded, gain_at_weight, satisfies, Bounds};
-use crate::tree::gain::{calc_gain, GradStats, RegParams};
+use crate::tree::gain::{calc_gain, threshold_l1, GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 
 /// Tiny epsilon guarding against accepting numerically-zero-gain splits, mirror
@@ -25,15 +25,15 @@ pub(super) const K_RT_EPS: f64 = 1e-6;
 /// The best split found so far for one node.
 ///
 /// Both builders share this. `threshold` is the exact split value while
-/// `split_bin` is the histogram global-bin boundary (bins `<= split_bin` go
-/// left); each builder writes its own location field and leaves the other at
-/// its default.
+/// `split_bin` is the histogram global-bin boundary (`Some(b)`: bins `<= b` go
+/// left; `None`: no present bin goes left, only missing values); each builder
+/// writes its own location field and leaves the other at its default.
 #[derive(Debug, Clone)]
 pub(super) struct BestSplit {
     pub(super) loss_chg: f64,
     pub(super) feature: u32,
     pub(super) threshold: f32,
-    pub(super) split_bin: usize,
+    pub(super) split_bin: Option<usize>,
     pub(super) default_left: bool,
     pub(super) left: GradStats,
     pub(super) right: GradStats,
@@ -52,7 +52,7 @@ impl BestSplit {
             loss_chg: 0.0,
             feature: 0,
             threshold: 0.0,
-            split_bin: 0,
+            split_bin: None,
             default_left: true,
             left: GradStats::default(),
             right: GradStats::default(),
@@ -77,8 +77,9 @@ impl BestSplit {
         w_right: f64,
     ) -> Self {
         let (threshold, split_bin) = match pos {
-            SplitPos::Value(t) => (t, 0),
-            SplitPos::Bin(b) => (0.0, b),
+            SplitPos::Value(t) => (t, None),
+            SplitPos::Bin(b) => (0.0, Some(b)),
+            SplitPos::BelowBins => (0.0, None),
         };
         BestSplit {
             loss_chg,
@@ -111,7 +112,7 @@ impl BestSplit {
             loss_chg,
             feature,
             threshold: 0.0,
-            split_bin: 0,
+            split_bin: None,
             // Present categories not in the left set (and missing) go
             // right, as XGBoost defaults for categorical features.
             default_left: false,
@@ -129,30 +130,16 @@ impl BestSplit {
         self.loss_chg > K_RT_EPS
     }
 
-    /// Whether this split should be taken: it was found, its loss change beats
-    /// `gamma`, and both children meet `min_child_weight`.
+    /// Whether this split should be taken: it was found, its loss change
+    /// reaches `gamma` (XGBoost rejects `loss_chg < min_split_loss`), and both
+    /// children have positive cover and meet `min_child_weight`.
     pub(super) fn valid(&self, gamma: f64, min_child_weight: f64) -> bool {
         self.found()
-            && self.loss_chg > gamma
+            && self.loss_chg >= gamma
+            && self.left.hess > 0.0
+            && self.right.hess > 0.0
             && self.left.hess >= min_child_weight
             && self.right.hess >= min_child_weight
-    }
-}
-
-/// Parent structure score subtracted from a split's gain: bounded when
-/// constraints are active, closed-form otherwise.
-#[inline]
-pub(super) fn parent_gain(
-    stats: GradStats,
-    reg: &RegParams,
-    bounds: Bounds,
-    constrained: bool,
-) -> f64 {
-    if constrained {
-        let w = calc_weight_bounded(stats, reg, bounds);
-        gain_at_weight(stats, reg, w)
-    } else {
-        calc_gain(stats, reg)
     }
 }
 
@@ -182,104 +169,131 @@ pub(super) fn candidate_gain(
         Some((g, 0.0, 0.0))
     }
 }
-/// Where a numeric candidate split falls. Exact search records the midpoint
-/// threshold in value space; histogram search records the global-bin boundary
-/// (bins `<= split_bin` go left). The accept path is otherwise identical.
+
+/// Where a numeric candidate split falls. Exact search records the threshold
+/// in value space; histogram search records the global-bin boundary (bins
+/// `<= split_bin` go left) or `BelowBins`, XGBoost's backward-pass endpoint
+/// (`NumericBinLowerBound` at the feature's first bin, `-inf`): every present
+/// bin goes right and only missing values go left.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum SplitPos {
     Value(f32),
     Bin(usize),
+    BelowBins,
 }
 
-/// Evaluate one numeric candidate split and record it in `best` when its gain
-/// improves on the incumbent (beyond [`K_RT_EPS`]). Shared by both builders;
-/// only the split location differs ([`SplitPos`]).
-#[allow(clippy::too_many_arguments)]
+/// XGBoost's `SplitEvaluator::CalcWeight`: the regularized optimum computed in
+/// `f64`, rounded to `f32`, then clamped to the node's monotone bounds. The
+/// `f32` rounding happens before bounding, exactly as upstream.
 #[inline]
-pub(super) fn accept_numeric(
-    best: &mut BestSplit,
+pub(super) fn xgb_weight(stats: GradStats, reg: &RegParams, bounds: Bounds) -> f32 {
+    let w = if stats.hess <= 0.0 {
+        0.0
+    } else {
+        let mut w = -threshold_l1(stats.grad, reg.alpha) / (stats.hess + reg.lambda);
+        if reg.max_delta_step != 0.0 && w.abs() > reg.max_delta_step {
+            w = reg.max_delta_step.copysign(w);
+        }
+        w
+    } as f32;
+    let (lower, upper) = (bounds.lower as f32, bounds.upper as f32);
+    if w < lower {
+        lower
+    } else if w > upper {
+        upper
+    } else {
+        w
+    }
+}
+
+/// XGBoost's `CalcGainGivenWeight` with an `f32` weight: `−(2Gw + (H+λ)w² +
+/// 2α|w|)` where `w²` is formed in `f32` (upstream `Sqr(float)`) and every
+/// other operation runs in `f64`.
+#[inline]
+fn xgb_gain_given_weight(stats: GradStats, reg: &RegParams, w: f32) -> f64 {
+    -(2.0 * stats.grad * w as f64
+        + (stats.hess + reg.lambda) * (w * w) as f64
+        + 2.0 * reg.alpha * w.abs() as f64)
+}
+
+/// XGBoost's scalar `TreeEvaluator::CalcGain` for a node: the given-weight
+/// gain at the `f32` (bounded) weight, rounded to `f32` as upstream stores
+/// `root_gain`. The histogram and exact updaters both use this form, so the
+/// parent baseline carries the same `f32` weight rounding as every candidate.
+pub(super) fn xgb_node_gain(stats: GradStats, reg: &RegParams, bounds: Bounds) -> f32 {
+    if stats.hess <= 0.0 {
+        return 0.0;
+    }
+    xgb_gain_given_weight(stats, reg, xgb_weight(stats, reg, bounds)) as f32
+}
+
+/// XGBoost's scalar `SplitEvaluator::CalcSplitGain` minus the parent's
+/// `root_gain`, i.e. the `loss_chg` a candidate is compared and stored with.
+/// Returns `None` when the split is invalid (a child without positive Hessian
+/// or below `min_child_weight`) or violates the monotone direction `dir`, and
+/// otherwise the `f32` loss change plus both bounded child weights.
+#[inline]
+pub(super) fn xgb_loss_chg(
     left: GradStats,
     right: GradStats,
-    parent_gain: f64,
+    root_gain: f32,
+    reg: &RegParams,
     bounds: Bounds,
     dir: i8,
-    constrained: bool,
-    reg: &RegParams,
+) -> Option<(f32, f32, f32)> {
+    let mcw = reg.min_child_weight;
+    if !(left.hess > 0.0 && right.hess > 0.0 && left.hess >= mcw && right.hess >= mcw) {
+        return None;
+    }
+    let wl = xgb_weight(left, reg, bounds);
+    let wr = xgb_weight(right, reg, bounds);
+    if !satisfies(dir, wl as f64, wr as f64) {
+        return None;
+    }
+    // Upstream's scalar `CalcGainGivenWeight` returns `float`: each child's
+    // score is rounded before the two are added in `f32`.
+    let gain =
+        xgb_gain_given_weight(left, reg, wl) as f32 + xgb_gain_given_weight(right, reg, wr) as f32;
+    Some((gain - root_gain, wl, wr))
+}
+
+/// XGBoost's `SplitEntry::Update`: replace the incumbent when the candidate's
+/// loss change is strictly better, or equal on a lower feature index. Infinite
+/// loss changes are never taken. `best.loss_chg` holds an `f32` value.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn xgb_update(
+    best: &mut BestSplit,
+    loss_chg: f32,
     feature: u32,
     pos: SplitPos,
     default_left: bool,
-) {
-    let Some((g, wl, wr)) = candidate_gain(left, right, parent_gain, bounds, dir, constrained, reg)
-    else {
-        return;
-    };
-    if g > best.loss_chg + K_RT_EPS {
-        *best = BestSplit::numeric(g, feature, pos, default_left, left, right, wl, wr);
+    left: GradStats,
+    right: GradStats,
+    w_left: f32,
+    w_right: f32,
+) -> bool {
+    if loss_chg.is_infinite() {
+        return false;
     }
-}
-
-/// Evaluate one numeric boundary under both missing-value directions: missing
-/// right, then missing left. The leftward direction is skipped when the caller
-/// knows no missing mass exists (histogram search passes its `has_missing`
-/// flag; exact search always passes `true`). Shared by both builders.
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(super) fn eval_missing_directions(
-    best: &mut BestSplit,
-    left_present: GradStats,
-    present: GradStats,
-    total: GradStats,
-    reg: &RegParams,
-    parent_gain: f64,
-    bounds: Bounds,
-    dir: i8,
-    constrained: bool,
-    feature: u32,
-    pos: SplitPos,
-    eval_missing_left: bool,
-) {
-    let mcw = reg.min_child_weight;
-
-    // Direction A: missing values go right. Left = present-so-far.
-    let la = left_present;
-    let ra = total.sub(left_present);
-    if la.hess >= mcw && ra.hess >= mcw {
-        accept_numeric(
-            best,
-            la,
-            ra,
-            parent_gain,
-            bounds,
-            dir,
-            constrained,
-            reg,
+    let incumbent = best.loss_chg as f32;
+    let replace = if best.feature <= feature {
+        loss_chg > incumbent
+    } else {
+        incumbent.partial_cmp(&loss_chg) != Some(std::cmp::Ordering::Greater)
+    };
+    if replace {
+        *best = BestSplit::numeric(
+            loss_chg as f64,
             feature,
             pos,
-            false,
+            default_left,
+            left,
+            right,
+            w_left as f64,
+            w_right as f64,
         );
     }
-
-    // Direction B: missing values go left. Left = present-so-far + missing.
-    if eval_missing_left {
-        let mut lb = left_present;
-        lb.add(total.sub(present));
-        let rb = present.sub(left_present);
-        if lb.hess >= mcw && rb.hess >= mcw {
-            accept_numeric(
-                best,
-                lb,
-                rb,
-                parent_gain,
-                bounds,
-                dir,
-                constrained,
-                reg,
-                feature,
-                pos,
-                true,
-            );
-        }
-    }
+    replace
 }
 
 /// Sweep prefix partitions of categories ordered by gradient/Hessian ratio
@@ -330,58 +344,64 @@ pub(super) fn sweep_categorical(
     }
 }
 
-/// Precompute per-feature interaction sets from the constraint groups.
-///
-/// The interaction set of a feature is the union of every group that contains
-/// it (which includes the feature itself). A feature that appears in no group
-/// may only interact with itself. Returns `None` when no constraints are
-/// configured (the inactive, no-filtering case).
-pub(super) fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<HashMap<u32, Vec<u32>>> {
+/// XGBoost interaction-constraint state for one node: every split feature on
+/// the root-to-node path and the features still permitted there.
+#[derive(Clone)]
+pub(super) struct InteractionState {
+    path: Vec<u32>,
+    allowed: Vec<u32>,
+}
+
+/// Normalize configured interaction groups. `None` disables filtering.
+pub(super) fn build_interaction_sets(groups: &[Vec<u32>]) -> Option<Vec<Vec<u32>>> {
     if groups.is_empty() {
         return None;
     }
-    let mut sets: HashMap<u32, BTreeSet<u32>> = HashMap::new();
-    for group in groups {
-        for &feature in group {
-            sets.entry(feature)
-                .or_default()
-                .extend(group.iter().copied());
-        }
-    }
     Some(
-        sets.into_iter()
-            .map(|(feature, allowed)| (feature, allowed.into_iter().collect()))
+        groups
+            .iter()
+            .map(|group| {
+                let mut group = group.clone();
+                group.sort_unstable();
+                group.dedup();
+                group
+            })
             .collect(),
     )
 }
 
-/// Intersect a node's allowed set with a feature's interaction set. Both
-/// operands are sorted. `None` denotes "all features"; inactive constraints
-/// (`None` sets) stay `None`.
+/// Derive each child's state after splitting `feature`. XGBoost permits every
+/// feature already used on the path plus every member of a constraint group
+/// containing the *entire* updated path.
 pub(super) fn next_allowed(
-    parent: Option<&[u32]>,
+    parent: Option<&InteractionState>,
     feature: u32,
-    sets: Option<&HashMap<u32, Vec<u32>>>,
-) -> Option<Vec<u32>> {
-    let sets = sets?;
-    let singleton = [feature];
-    let feature_set = sets
-        .get(&feature)
-        .map_or(singleton.as_slice(), Vec::as_slice);
-    Some(match parent {
-        None => feature_set.to_vec(),
-        Some(parent) => parent
+    groups: Option<&[Vec<u32>]>,
+) -> Option<InteractionState> {
+    let groups = groups?;
+    let mut path = parent.map_or_else(Vec::new, |state| state.path.clone());
+    if let Err(pos) = path.binary_search(&feature) {
+        path.insert(pos, feature);
+    }
+    let mut allowed: BTreeSet<u32> = path.iter().copied().collect();
+    for group in groups {
+        if path
             .iter()
-            .copied()
-            .filter(|&f| permits(Some(feature_set), f))
-            .collect(),
+            .all(|feature| group.binary_search(feature).is_ok())
+        {
+            allowed.extend(group.iter().copied());
+        }
+    }
+    Some(InteractionState {
+        path,
+        allowed: allowed.into_iter().collect(),
     })
 }
 
-/// Whether `feature` passes an allowed-feature set: `None` allows every
-/// feature, otherwise sorted membership in the set is required.
-pub(super) fn permits(allowed: Option<&[u32]>, feature: u32) -> bool {
-    allowed.is_none_or(|features| features.binary_search(&feature).is_ok())
+/// Whether `feature` is permitted at a node. `None` means constraints inactive
+/// or the root (where every feature is allowed).
+pub(super) fn permits(state: Option<&InteractionState>, feature: u32) -> bool {
+    state.is_none_or(|state| state.allowed.binary_search(&feature).is_ok())
 }
 
 /// Sum the gradient pairs of `rows`, in row order. Shared by both builders'

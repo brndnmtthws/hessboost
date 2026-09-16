@@ -1,31 +1,16 @@
-//! Learning-to-rank objectives (LambdaMART).
+//! Learning-to-rank objectives (XGBoost 3.4.1 LambdaRank).
 //!
-//! These objectives operate on *query groups*: contiguous blocks of rows that
-//! belong to the same query (see [`crate::data::GroupInfo`]). Within each group
-//! we form pairs of documents with different relevance labels and apply the
-//! pairwise-logistic (RankNet) gradient. For the `rank:ndcg` and `rank:map`
-//! variants each pair's gradient is additionally scaled by the magnitude of the
-//! change in the ranking metric (NDCG or MAP) that would result from swapping
-//! the two documents. This is the "lambda" weighting that turns RankNet into
-//! LambdaMART.
-//!
-//! The objective is *stateless*: query-group boundaries are supplied at
-//! gradient time through [`Objective::gradient_grouped`]. When no group
-//! information is available the whole batch is treated as a single group.
+//! Query groups are contiguous row blocks ([`crate::data::GroupInfo`]). Within
+//! each group, documents are stably ranked by descending prediction. The
+//! default XGBoost `topk` pair method visits `(i,j)` for every model-rank
+//! `i < min(group_size, 32)` and every `j > i`; unequal-label pairs receive the
+//! pairwise logistic lambda, optionally weighted by the exact NDCG or MAP
+//! change. Pair values, accumulation, per-query normalization, and query
+//! weighting use XGBoost's float/double conversion points.
 
 use super::{GradPair, Objective};
 use crate::data::GroupInfo;
-use crate::metric::{argsort_desc, group_ranges, ideal_dcg, ndcg_discount, ndcg_gain};
-
-/// Maximum number of document pairs formed per query group.
-///
-/// A group with `m` documents can yield up to `m*(m-1)/2` pairs, which is
-/// quadratic and can explode for large result lists. When the number of
-/// candidate pairs exceeds this cap we keep each candidate pair independently
-/// with probability `CAP / total_pairs`, giving roughly `CAP` pairs while
-/// remaining an unbiased estimate of the full pairwise gradient. Sampling is
-/// deterministic (seeded per group) so training is reproducible.
-const MAX_PAIRS_PER_GROUP: usize = 4096;
+use crate::metric::{argsort_desc, group_ranges};
 
 /// Which ranking loss the LambdaMART objective optimizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,103 +30,112 @@ enum RankMode {
 #[derive(Debug, Clone, Copy)]
 pub struct LambdaMartObjective {
     mode: RankMode,
+    top_k: usize,
 }
 
 impl LambdaMartObjective {
     /// Plain pairwise logistic ranking (`rank:pairwise`).
-    pub fn pairwise() -> Self {
+    pub fn pairwise(top_k: usize) -> Self {
         LambdaMartObjective {
             mode: RankMode::Pairwise,
+            top_k,
         }
     }
 
     /// NDCG-weighted LambdaMART (`rank:ndcg`).
-    pub fn ndcg() -> Self {
+    pub fn ndcg(top_k: usize) -> Self {
         LambdaMartObjective {
             mode: RankMode::Ndcg,
+            top_k,
         }
     }
 
     /// MAP-weighted LambdaMART (`rank:map`).
-    pub fn map() -> Self {
+    pub fn map(top_k: usize) -> Self {
         LambdaMartObjective {
             mode: RankMode::Map,
+            top_k,
         }
     }
 
-    /// Accumulate gradients for one contiguous query group spanning rows
-    /// `start..end` of `preds`/`labels`, writing into the same slice of `out`.
+    /// Accumulate XGBoost's CPU top-k LambdaRank gradient for one query.
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_group(
         &self,
         preds: &[f32],
         labels: &[f32],
         start: usize,
         end: usize,
+        query_weight: f32,
+        weight_norm: f32,
         out: &mut [GradPair],
     ) {
-        let m = end - start;
-        if m < 2 {
+        let n = end - start;
+        if n < 2 {
             return;
         }
-
-        // Local score/label views for this group.
-        let scores: Vec<f64> = (start..end).map(|i| preds[i] as f64).collect();
-        let labs: Vec<f64> = (start..end).map(|i| labels[i] as f64).collect();
-
-        // Rank documents by descending score; `pos[local]` is the 0-based rank.
-        // f32 -> f64 conversion preserves order, so sorting the f32 scores
-        // yields the same permutation as sorting the widened ones.
-        let order = argsort_desc(&preds[start..end]);
-        let mut pos = vec![0usize; m];
-        for (rank, &local) in order.iter().enumerate() {
-            pos[local] = rank;
+        let p = &preds[start..end];
+        let y = &labels[start..end];
+        let order = argsort_desc(p);
+        let metric = MetricCtx::build(self.mode, y, &order, self.top_k);
+        let best_score = p[order[0]];
+        let worst_score = p[*order.last().unwrap()];
+        let mut sum_lambda = 0.0f64;
+        for i in 0..n.min(self.top_k) {
+            for j in i + 1..n {
+                let mut rank_high = i;
+                let mut rank_low = j;
+                let mut idx_high = order[rank_high];
+                let mut idx_low = order[rank_low];
+                if y[idx_high] == y[idx_low] {
+                    continue;
+                }
+                if y[idx_high] < y[idx_low] {
+                    std::mem::swap(&mut rank_high, &mut rank_low);
+                    std::mem::swap(&mut idx_high, &mut idx_low);
+                }
+                let score_diff = p[idx_high] - p[idx_low]; // float subtraction
+                let delta_score = score_diff.abs() as f64;
+                let sigmoid = (1.0f32 / ((-score_diff).min(88.7).exp() + 1.0)) as f64;
+                let mut delta = metric
+                    .delta(y[idx_high], y[idx_low], rank_high, rank_low)
+                    .abs();
+                if best_score != worst_score {
+                    delta /= delta_score + 0.01;
+                }
+                let lambda = (sigmoid - 1.0) * delta;
+                let hessian = (sigmoid * (1.0 - sigmoid)).max(1e-16) * delta * 2.0;
+                let pg = GradPair::new(lambda as f32, hessian as f32);
+                out[start + idx_high].grad += pg.grad;
+                out[start + idx_high].hess += pg.hess;
+                out[start + idx_low].grad -= pg.grad;
+                out[start + idx_low].hess += pg.hess;
+                sum_lambda += -2.0 * pg.grad as f64;
+            }
         }
 
-        // Precompute the metric context used to weight pairs.
-        let ctx = MetricCtx::build(self.mode, &labs, &order, &pos);
-
-        // Candidate-pair sampling probability (1.0 unless the group is huge).
-        let total_pairs = m * (m - 1) / 2;
-        let keep_prob = if total_pairs > MAX_PAIRS_PER_GROUP {
-            MAX_PAIRS_PER_GROUP as f64 / total_pairs as f64
+        // XGBoost `CalcLambdaForGroup`: `norm` (double) scales the pairs only
+        // when it differs from 1, then `w` (float), then `w_norm` (double);
+        // each `GradientPair::operator*(float)` rounds its factor to f32 and
+        // multiplies separately, so the three factors are never pre-combined.
+        let norm = if sum_lambda > 0.0 {
+            (sum_lambda + 1.0).log2() / sum_lambda
         } else {
             1.0
         };
-        // Deterministic per-group RNG seeded from the group size and layout.
-        let mut rng =
-            SplitMix64::new(0x9E37_79B9_7F4A_7C15 ^ (start as u64).wrapping_mul(2654435761));
-
-        for a in 0..m {
-            for b in (a + 1)..m {
-                // Only pairs with different relevance contribute.
-                if labs[a] == labs[b] {
-                    continue;
-                }
-                if keep_prob < 1.0 && rng.next_f64() >= keep_prob {
-                    continue;
-                }
-                // `hi` is the more-relevant document, which we want ranked above.
-                let (hi, lo) = if labs[a] > labs[b] { (a, b) } else { (b, a) };
-                let s_hi = scores[hi];
-                let s_lo = scores[lo];
-
-                // Weight this pair by the metric delta of swapping hi and lo.
-                let delta = ctx.delta(hi, lo);
-                if delta == 0.0 {
-                    continue;
-                }
-
-                // Pairwise-logistic gradient. rho = P(lo ranked above hi).
-                let rho = 1.0 / (1.0 + (s_hi - s_lo).exp());
-                let grad = (rho * delta) as f32;
-                let hess = (rho * (1.0 - rho) * delta).max(super::MIN_HESS as f64) as f32;
-
-                // Push the relevant doc up (negative gradient) and the other down.
-                out[start + hi].grad -= grad;
-                out[start + hi].hess += hess;
-                out[start + lo].grad += grad;
-                out[start + lo].hess += hess;
+        let group = &mut out[start..end];
+        if norm != 1.0 {
+            let norm = norm as f32;
+            for g in group.iter_mut() {
+                g.grad *= norm;
+                g.hess *= norm;
             }
+        }
+        for g in group.iter_mut() {
+            g.grad *= query_weight;
+            g.hess *= query_weight;
+            g.grad *= weight_norm;
+            g.hess *= weight_norm;
         }
     }
 
@@ -155,21 +149,22 @@ impl LambdaMartObjective {
         out: &mut [GradPair],
     ) {
         super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        for g in out.iter_mut() {
-            *g = GradPair::default();
-        }
-
-        // Without usable group info the whole batch is one query.
-        for (start, end) in group_ranges(preds.len(), group) {
-            self.accumulate_group(preds, labels, start, end, out);
-        }
-
-        // Optional per-document weighting of the aggregated gradient.
-        if let Some(w) = weights {
-            for (o, &wi) in out.iter_mut().zip(w) {
-                o.grad *= wi;
-                o.hess *= wi;
-            }
+        out.fill(GradPair::default());
+        let ranges = group_ranges(preds.len(), group);
+        // Ranking weights are per query. DMatrix expands group weights across
+        // rows, so the first row of each group recovers the query weight.
+        let group_weights: Vec<f32> = ranges
+            .iter()
+            .map(|&(start, _)| weights.map_or(1.0, |w| w[start]))
+            .collect();
+        let sum_w: f64 = group_weights.iter().map(|&w| w as f64).sum();
+        let weight_norm = if sum_w == 0.0 {
+            0.0
+        } else {
+            (ranges.len() as f64 / sum_w) as f32
+        };
+        for ((start, end), weight) in ranges.into_iter().zip(group_weights) {
+            self.accumulate_group(preds, labels, start, end, weight, weight_norm, out);
         }
     }
 }
@@ -205,156 +200,91 @@ impl Objective for LambdaMartObjective {
         self.compute(preds, labels, weights, group, out);
     }
 
-    fn base_margin(&self, _labels: &[f32], _weights: Option<&[f32]>) -> f32 {
-        0.0
-    }
-
-    fn default_metric(&self) -> &str {
-        match self.mode {
-            RankMode::Ndcg => "ndcg",
-            RankMode::Pairwise | RankMode::Map => "map",
-        }
+    fn default_metric(&self) -> String {
+        // XGBoost `RankEvalMetric`: `ndcg@k` for `rank:pairwise` and
+        // `rank:ndcg`, `map@k` for `rank:map`, with `k` the `topk` pair count.
+        let base = match self.mode {
+            RankMode::Pairwise | RankMode::Ndcg => "ndcg",
+            RankMode::Map => "map",
+        };
+        format!("{base}@{}", self.top_k)
     }
 }
 
-/// Per-group precomputed data used to compute |ΔMetric| for a candidate pair.
+/// Per-query data for XGBoost's metric deltas. Ranks are model-score ranks.
 enum MetricCtx {
-    /// Plain pairwise loss: every pair weighted 1.
     Uniform,
-    /// NDCG weighting: gains per local doc, positions, and the ideal DCG.
-    Ndcg {
-        gains: Vec<f64>,
-        pos: Vec<usize>,
-        idcg: f64,
-    },
-    /// MAP weighting: binary relevance in score order plus prefix sums.
-    Map {
-        pos: Vec<usize>,
-        rel_sorted: Vec<f64>,
-        cum: Vec<usize>,
-        prefix: Vec<f64>,
-        num_rel: usize,
-    },
+    Ndcg { discounts: Vec<f64>, inv_idcg: f64 },
+    Map { n_rel: Vec<f64>, acc: Vec<f64> },
 }
 
 impl MetricCtx {
-    fn build(mode: RankMode, labs: &[f64], order: &[usize], pos: &[usize]) -> MetricCtx {
+    fn build(mode: RankMode, labels: &[f32], order: &[usize], top_k: usize) -> Self {
         match mode {
             RankMode::Pairwise => MetricCtx::Uniform,
             RankMode::Ndcg => {
-                let gains: Vec<f64> = labs.iter().map(|&l| ndcg_gain(l)).collect();
-                let idcg = ideal_dcg(labs, labs.len());
+                let discounts: Vec<f64> = (0..labels.len())
+                    .map(|i| 1.0 / ((i + 2) as f64).log2())
+                    .collect();
+                let mut ideal: Vec<usize> = (0..labels.len()).collect();
+                ideal.sort_by(|&a, &b| labels[b].total_cmp(&labels[a])); // stable
+                let idcg: f64 = ideal
+                    .iter()
+                    .take(labels.len().min(top_k))
+                    .enumerate()
+                    .map(|(rank, &idx)| {
+                        let gain = ((1u32 << labels[idx] as u32) - 1) as f64;
+                        discounts[rank] * gain
+                    })
+                    .sum();
                 MetricCtx::Ndcg {
-                    gains,
-                    pos: pos.to_vec(),
-                    idcg,
+                    discounts,
+                    inv_idcg: if idcg == 0.0 { 0.0 } else { 1.0 / idcg },
                 }
             }
             RankMode::Map => {
-                let m = labs.len();
-                // Relevance in score order (relevant iff label > 0).
-                let rel_sorted: Vec<f64> = order
-                    .iter()
-                    .map(|&local| if labs[local] > 0.0 { 1.0 } else { 0.0 })
-                    .collect();
-                let mut cum = vec![0usize; m];
-                let mut prefix = vec![0.0f64; m + 1];
-                let mut acc = 0usize;
-                for p in 0..m {
-                    acc += rel_sorted[p] as usize;
-                    cum[p] = acc;
-                    prefix[p + 1] = prefix[p] + rel_sorted[p] / (p + 1) as f64;
+                let mut n_rel = vec![0.0; labels.len()];
+                let mut acc = vec![0.0; labels.len()];
+                for (rank, &idx) in order.iter().enumerate() {
+                    let y = labels[idx] as f64;
+                    n_rel[rank] = y + if rank == 0 { 0.0 } else { n_rel[rank - 1] };
+                    acc[rank] = y / (rank + 1) as f64 + if rank == 0 { 0.0 } else { acc[rank - 1] };
                 }
-                MetricCtx::Map {
-                    pos: pos.to_vec(),
-                    rel_sorted,
-                    cum,
-                    prefix,
-                    num_rel: acc,
-                }
+                MetricCtx::Map { n_rel, acc }
             }
         }
     }
 
-    /// Magnitude of the metric change from swapping local docs `hi` and `lo`.
-    fn delta(&self, hi: usize, lo: usize) -> f64 {
+    fn delta(&self, y_high: f32, y_low: f32, rank_high: usize, rank_low: usize) -> f64 {
         match self {
             MetricCtx::Uniform => 1.0,
-            MetricCtx::Ndcg { gains, pos, idcg } => {
-                if *idcg <= 0.0 {
-                    return 0.0;
-                }
-                let d = (gains[hi] - gains[lo]) * (ndcg_discount(pos[hi]) - ndcg_discount(pos[lo]));
-                (d / idcg).abs()
-            }
-            MetricCtx::Map {
-                pos,
-                rel_sorted,
-                cum,
-                prefix,
-                num_rel,
+            MetricCtx::Ndcg {
+                discounts,
+                inv_idcg,
             } => {
-                if *num_rel == 0 {
-                    return 0.0;
+                let gain_high = ((1u32 << y_high as u32) - 1) as f64;
+                let gain_low = ((1u32 << y_low as u32) - 1) as f64;
+                let original = gain_high * discounts[rank_high] + gain_low * discounts[rank_low];
+                let changed = gain_low * discounts[rank_high] + gain_high * discounts[rank_low];
+                (original - changed) * inv_idcg
+            }
+            MetricCtx::Map { n_rel, acc } => {
+                let (mut rh, mut rl, mut yh, mut yl) =
+                    (rank_high, rank_low, y_high as f64, y_low as f64);
+                if rh > rl {
+                    std::mem::swap(&mut rh, &mut rl);
+                    std::mem::swap(&mut yh, &mut yl);
                 }
-                let (mut p, mut q) = (pos[hi], pos[lo]);
-                if p > q {
-                    std::mem::swap(&mut p, &mut q);
+                let total = *n_rel.last().unwrap();
+                let (m, n) = (n_rel[rl], n_rel[rh]);
+                let b = acc[rl - 1] - acc[rh];
+                if yh < yl {
+                    (m / (rl + 1) as f64 - (n + 1.0) / (rh + 1) as f64 - b) / total
+                } else {
+                    (n / (rh + 1) as f64 - m / (rl + 1) as f64 + b) / total
                 }
-                delta_map(rel_sorted, cum, prefix, *num_rel, p, q)
             }
         }
-    }
-}
-
-/// |ΔAP| from swapping the documents currently at score-ranks `p < q`.
-///
-/// `rel_sorted` is binary relevance in score order, `cum[k]` the number of
-/// relevant documents in ranks `0..=k`, and `prefix[k] = Σ_{t<k} rel[t]/(t+1)`.
-fn delta_map(
-    rel_sorted: &[f64],
-    cum: &[usize],
-    prefix: &[f64],
-    num_rel: usize,
-    p: usize,
-    q: usize,
-) -> f64 {
-    let rp = rel_sorted[p];
-    let rq = rel_sorted[q];
-    if rp == rq {
-        return 0.0;
-    }
-    let cum_p = cum[p] as f64;
-    let cum_q = cum[q] as f64;
-    // Change of the average-precision numerator (AP * num_rel):
-    //   term at rank p, the middle span (p, q), and term at rank q.
-    let at_p = (rq * (cum_p - rp + rq) - rp * cum_p) / (p + 1) as f64;
-    let middle = (rq - rp) * (prefix[q] - prefix[p + 1]);
-    let at_q = (rp - rq) * cum_q / (q + 1) as f64;
-    ((at_p + middle + at_q) / num_rel as f64).abs()
-}
-
-/// A tiny deterministic SplitMix64 PRNG for reproducible pair subsampling.
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        SplitMix64 { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn next_f64(&mut self) -> f64 {
-        // 53-bit mantissa in [0, 1).
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 }
 
@@ -366,7 +296,7 @@ mod tests {
     #[test]
     fn pairwise_pushes_relevant_up() {
         // One group of 3 docs, labels 2 > 1 > 0, all scores equal at start.
-        let obj = LambdaMartObjective::ndcg();
+        let obj = LambdaMartObjective::ndcg(32);
         let preds = [0.0f32, 0.0, 0.0];
         let labels = [2.0f32, 1.0, 0.0];
         let g = GroupInfo::from_sizes(&[3]);
@@ -374,8 +304,8 @@ mod tests {
         obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut out);
         // Negative gradient => leaf value positive => score goes up.
         // Most-relevant doc should get the most-negative gradient.
-        assert!(out[0].grad < out[1].grad, "{:?}", out);
-        assert!(out[1].grad < out[2].grad, "{:?}", out);
+        assert!(out[0].grad < out[1].grad, "{out:?}");
+        assert!(out[1].grad < out[2].grad, "{out:?}");
         assert!(out[0].grad < 0.0 && out[2].grad > 0.0);
         // Hessians are non-negative.
         assert!(out.iter().all(|g| g.hess >= 0.0));
@@ -383,7 +313,7 @@ mod tests {
 
     #[test]
     fn no_pairs_when_all_labels_equal() {
-        let obj = LambdaMartObjective::pairwise();
+        let obj = LambdaMartObjective::pairwise(32);
         let preds = [0.5f32, -0.2, 1.0];
         let labels = [1.0f32, 1.0, 1.0];
         let g = GroupInfo::from_sizes(&[3]);
@@ -395,7 +325,7 @@ mod tests {
     #[test]
     fn groups_are_independent() {
         // Two groups; a cross-group pair must never be formed.
-        let obj = LambdaMartObjective::pairwise();
+        let obj = LambdaMartObjective::pairwise(32);
         let preds = [0.0f32, 0.0, 0.0, 0.0];
         let labels = [1.0f32, 0.0, 0.0, 1.0];
         let g = GroupInfo::from_sizes(&[2, 2]);
@@ -406,15 +336,87 @@ mod tests {
         assert!(out[3].grad < 0.0 && out[2].grad > 0.0);
     }
 
+    /// Hand-computed XGBoost `LambdaGrad` for one `rank:pairwise` pair whose
+    /// query has distinct best/worst scores (`delta_metric = 1 / (|Δs| + 0.01)`).
+    fn pairwise_pair(s_high: f32, s_low: f32) -> (f32, f32) {
+        let diff = s_high - s_low;
+        let sigmoid = (1.0f32 / ((-diff).min(88.7).exp() + 1.0)) as f64;
+        let delta = 1.0 / (diff.abs() as f64 + 0.01);
+        let lambda = (sigmoid - 1.0) * delta;
+        let hessian = (sigmoid * (1.0 - sigmoid)).max(1e-16) * delta * 2.0;
+        (lambda as f32, hessian as f32)
+    }
+
     #[test]
-    fn map_delta_only_relevant_vs_nonrelevant() {
-        // Labels 2 and 3 are both "relevant" -> MAP delta is 0 for that pair.
-        let ctx = MetricCtx::build(
-            RankMode::Map,
-            &[3.0, 2.0],
-            &[0, 1], // score order
-            &[0, 1], // positions
+    fn signed_zero_scores_tie_in_input_order() {
+        // `-0.0` and `0.0` compare equal under XGBoost's stable
+        // `std::greater<>` argsort, so doc 0 stays ranked first. With
+        // `top_k = 1` the pairs are exactly (0,1) and (0,2); a total-order sort
+        // would rank doc 1 first and pair (1,0),(1,2) instead.
+        let obj = LambdaMartObjective::pairwise(1);
+        let preds = [-0.0f32, 0.0, -1.0];
+        let labels = [2.0f32, 1.0, 0.0];
+        let g = GroupInfo::from_sizes(&[3]);
+        let mut out = vec![GradPair::default(); 3];
+        obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut out);
+
+        let (g01, h01) = pairwise_pair(preds[0], preds[1]);
+        let (g02, h02) = pairwise_pair(preds[0], preds[2]);
+        let sum_lambda = -2.0 * g01 as f64 + -2.0 * g02 as f64;
+        let norm = ((sum_lambda + 1.0).log2() / sum_lambda) as f32;
+
+        assert_ne!(out[0].grad, 0.0);
+        assert_eq!(out[0].grad, (g01 + g02) * norm, "{out:?}");
+        assert_eq!(out[0].hess, (h01 + h02) * norm, "{out:?}");
+        // Doc 1 only ever sees the (0,1) pair.
+        assert_eq!(out[1].grad, -g01 * norm, "{out:?}");
+        assert_eq!(out[1].hess, h01 * norm, "{out:?}");
+        assert_eq!(out[2].grad, -g02 * norm, "{out:?}");
+        assert_eq!(out[2].hess, h02 * norm, "{out:?}");
+    }
+
+    #[test]
+    fn query_weights_scale_as_sequential_f32_products() {
+        // XGBoost applies `norm`, `w`, and `w_norm` as three separate f32
+        // multiplications; folding them into one scale (`norm * w * w_norm`)
+        // rounds differently for these weights.
+        let obj = LambdaMartObjective::ndcg(32);
+        let preds = [0.3f32, -0.7, 1.1, 0.2, -0.4, 0.9, 0.05];
+        let labels = [2.0f32, 0.0, 1.0, 3.0, 1.0, 0.0, 2.0];
+        let g = GroupInfo::from_sizes(&[3, 4]);
+        let group_w = [0.3f32, 1.7];
+        let weights = [0.3f32, 0.3, 0.3, 1.7, 1.7, 1.7, 1.7];
+
+        // Unweighted: `w = 1`, `w_norm = 1`, so this is `pairs * norm` exactly.
+        let mut normed = vec![GradPair::default(); 7];
+        obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut normed);
+        let mut out = vec![GradPair::default(); 7];
+        obj.gradient_grouped(&preds, &labels, Some(&weights), Some(&g), &mut out);
+
+        let sum_w = group_w[0] as f64 + group_w[1] as f64;
+        let w_norm = (2.0 / sum_w) as f32;
+        for (i, (got, base)) in out.iter().zip(&normed).enumerate() {
+            let w = if i < 3 { group_w[0] } else { group_w[1] };
+            assert_eq!(
+                got.grad.to_bits(),
+                ((base.grad * w) * w_norm).to_bits(),
+                "{i}"
+            );
+            assert_eq!(
+                got.hess.to_bits(),
+                ((base.hess * w) * w_norm).to_bits(),
+                "{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_metric_follows_mode_and_top_k() {
+        assert_eq!(
+            LambdaMartObjective::pairwise(32).default_metric(),
+            "ndcg@32"
         );
-        assert_eq!(ctx.delta(0, 1), 0.0);
+        assert_eq!(LambdaMartObjective::ndcg(5).default_metric(), "ndcg@5");
+        assert_eq!(LambdaMartObjective::map(10).default_metric(), "map@10");
     }
 }

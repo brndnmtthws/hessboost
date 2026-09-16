@@ -39,20 +39,48 @@ impl Objective for SquaredErrorObjective {
         );
     }
 
-    fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        weighted_label_mean(labels, weights) as f32
+    fn const_hess(&self) -> bool {
+        true
     }
 
-    fn default_metric(&self) -> &str {
-        "rmse"
+    fn base_margins(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        _group: Option<&crate::data::GroupInfo>,
+    ) -> Vec<f32> {
+        // XGBoost `FitInterceptGlmLike`: the (weighted) label mean.
+        vec![weighted_label_mean(labels, weights)]
+    }
+
+    fn default_metric(&self) -> String {
+        "rmse".to_string()
     }
 }
 
 /// Pseudo-Huber regression (`reg:pseudohubererror`): a smooth approximation of
-/// the absolute error, robust to outliers. With `d = margin − y` and
-/// `s = 1 + d²`, gradient is `d/√s` and Hessian `1/(s·√s)`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PseudoHuberObjective;
+/// the absolute error, robust to outliers. With residual `z = margin − y` and
+/// slope `δ` (XGBoost `huber_slope`), the gradient is `z / √(1 + z²/δ²)` and
+/// the Hessian `δ² / ((δ² + z²) · √(1 + z²/δ²))`, evaluated in `f32` exactly
+/// like XGBoost's `PseudoHuberRegression`. The intercept is the trait's
+/// default Newton step (XGBoost `FitIntercept`).
+#[derive(Debug, Clone, Copy)]
+pub struct PseudoHuberObjective {
+    slope: f32,
+}
+
+impl PseudoHuberObjective {
+    /// Create with the given Huber slope `δ`.
+    pub fn new(slope: f32) -> Self {
+        PseudoHuberObjective { slope }
+    }
+}
+
+impl Default for PseudoHuberObjective {
+    fn default() -> Self {
+        PseudoHuberObjective { slope: 1.0 }
+    }
+}
 
 impl Objective for PseudoHuberObjective {
     fn name(&self) -> &str {
@@ -67,6 +95,7 @@ impl Objective for PseudoHuberObjective {
         out: &mut [GradPair],
     ) {
         super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
+        let slope_sq = self.slope * self.slope;
         super::rowwise_gradient(
             labels.len(),
             1,
@@ -77,21 +106,20 @@ impl Objective for PseudoHuberObjective {
             |preds, labels, weights, out| {
                 for i in 0..preds.len() {
                     let w = weights.map_or(1.0, |ws| ws[i]);
-                    let d = preds[i] - labels[i];
-                    let s = 1.0 + d * d;
-                    let sqrt_s = s.sqrt();
-                    out[i] = GradPair::new((d / sqrt_s) * w, (1.0 / (s * sqrt_s)) * w);
+                    let z = preds[i] - labels[i];
+                    let scale_sqrt = (1.0 + z * z / slope_sq).sqrt();
+                    let scale = slope_sq + z * z;
+                    out[i] =
+                        GradPair::new((z / scale_sqrt) * w, (slope_sq / (scale * scale_sqrt)) * w);
                 }
             },
         );
     }
 
-    fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        weighted_label_mean(labels, weights) as f32
-    }
-
-    fn default_metric(&self) -> &str {
-        "mae"
+    fn default_metric(&self) -> String {
+        // XGBoost's default is `mphe`, which this crate's metric catalog does
+        // not implement; `mae` is the closest robust-regression report.
+        "mae".to_string()
     }
 }
 
@@ -123,8 +151,53 @@ mod tests {
     }
 
     #[test]
-    fn base_margin_is_label_mean() {
+    fn base_margins_is_label_mean() {
         let obj = SquaredErrorObjective;
-        assert!((obj.base_margin(&[1.0, 2.0, 3.0], None) - 2.0).abs() < 1e-6);
+        assert_eq!(obj.base_margins(&[1.0, 2.0, 3.0], None, None), vec![2.0]);
+    }
+
+    /// Pseudo-Huber with slope δ: at `z = δ` the gradient is `δ/√2` and the
+    /// Hessian `1/(2√2)`, so a wrong slope scaling would be visible.
+    #[test]
+    fn pseudo_huber_slope_scales_gradient() {
+        let obj = PseudoHuberObjective::new(2.0);
+        let mut out = vec![GradPair::default(); 1];
+        obj.gradient(&[2.0], &[0.0], None, &mut out);
+        let root2 = 2f32.sqrt();
+        assert!(
+            (out[0].grad - 2.0 / root2).abs() < 1e-6,
+            "grad {}",
+            out[0].grad
+        );
+        assert!(
+            (out[0].hess - 1.0 / (2.0 * root2)).abs() < 1e-6,
+            "hess {}",
+            out[0].hess
+        );
+        // Unit slope reproduces the classic form d/√(1+d²), 1/(1+d²)^{3/2}.
+        PseudoHuberObjective::default().gradient(&[2.0], &[0.0], None, &mut out);
+        let s = 5f32;
+        assert_eq!(out[0], GradPair::new(2.0 / s.sqrt(), 1.0 / (s * s.sqrt())));
+    }
+
+    /// The pseudo-Huber intercept is the Newton step, not the label mean
+    /// (XGBoost `FitIntercept`): for labels {0, 4} the mean is 2, but the
+    /// bounded gradient `z/√(1+z²)` makes the step from zero, `-Σg/Σh` with
+    /// `h = 1/(1+z²)^{3/2}`, fall well short of it.
+    #[test]
+    fn pseudo_huber_intercept_is_newton_step() {
+        let obj = PseudoHuberObjective::default();
+        let labels = [0.0f32, 4.0];
+        let margins = obj.base_margins(&labels, None, None);
+        let s = 17f32; // 1 + 4²
+        let g1 = -4.0f32 / s.sqrt();
+        let h1 = 1.0f32 / (s * s.sqrt());
+        let expected = (-(g1 as f64) / (1.0 + h1 as f64)) as f32;
+        assert_eq!(margins, vec![expected]);
+        assert!(
+            margins[0] < 1.0,
+            "Newton step {} should undershoot the mean",
+            margins[0]
+        );
     }
 }

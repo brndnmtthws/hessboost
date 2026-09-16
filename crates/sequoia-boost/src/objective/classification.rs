@@ -1,8 +1,10 @@
 //! Classification objectives.
 
-use super::{weighted_label_mean, GradPair, Objective, MIN_HESS};
+use super::{newton_intercepts, weighted_label_mean, GradPair, Objective, MIN_HESS};
 
-/// Binary logistic regression (`binary:logistic`).
+/// Logistic regression: `binary:logistic` (classification, reported with
+/// `logloss`) or `reg:logistic` (probability regression, reported with `rmse`
+/// like XGBoost's `LogisticRegression`); the loss is identical.
 ///
 /// With `p = σ(margin)` the gradient is `p − label` and the Hessian is
 /// `max(p (1 − p), ε)`. `scale_pos_weight` rescales the loss of positive
@@ -10,26 +12,42 @@ use super::{weighted_label_mean, GradPair, Objective, MIN_HESS};
 #[derive(Debug, Clone, Copy)]
 pub struct LogisticObjective {
     scale_pos_weight: f32,
+    /// `reg:logistic` rather than `binary:logistic`.
+    regression: bool,
 }
 
 impl LogisticObjective {
-    /// Create a logistic objective with the given positive-class weight.
+    /// `binary:logistic` with the given positive-class weight.
     pub fn new(scale_pos_weight: f32) -> Self {
-        LogisticObjective { scale_pos_weight }
+        LogisticObjective {
+            scale_pos_weight,
+            regression: false,
+        }
+    }
+
+    /// `reg:logistic` with the given positive-class weight: the same loss,
+    /// named and evaluated (`rmse`) as XGBoost's probability regression.
+    pub fn regression(scale_pos_weight: f32) -> Self {
+        LogisticObjective {
+            scale_pos_weight,
+            regression: true,
+        }
     }
 }
 
 impl Default for LogisticObjective {
     fn default() -> Self {
-        LogisticObjective {
-            scale_pos_weight: 1.0,
-        }
+        Self::new(1.0)
     }
 }
 
 impl Objective for LogisticObjective {
     fn name(&self) -> &str {
-        "binary:logistic"
+        if self.regression {
+            "reg:logistic"
+        } else {
+            "binary:logistic"
+        }
     }
 
     fn gradient(
@@ -65,21 +83,30 @@ impl Objective for LogisticObjective {
         crate::simd::sigmoid_inplace(preds);
     }
 
-    fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        // Optimal constant probability is the (weighted) positive rate; the
-        // margin is its logit, clamped away from the asymptotes.
-        let mut p = weighted_label_mean(labels, weights);
-        p = p.clamp(1e-6, 1.0 - 1e-6);
-        (p / (1.0 - p)).ln() as f32
+    fn base_margins(
+        &self,
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        group: Option<&crate::data::GroupInfo>,
+    ) -> Vec<f32> {
+        // XGBoost `RegLossObj::InitEstimation`: the (weighted) positive rate
+        // through the logit, unless `scale_pos_weight` is in play, in which
+        // case the reweighted loss needs the Newton step.
+        if (self.scale_pos_weight - 1.0).abs() > 1e-6 {
+            return newton_intercepts(self, labels, weights, group);
+        }
+        vec![self.prob_to_margin(weighted_label_mean(labels, weights))]
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {
+        // XGBoost `LogisticRegression::ProbToMargin`: bound the probability
+        // away from the asymptotes, then `Logit(p) = -ln(1/p - 1)` in f32.
         let p = base_score.clamp(1e-6, 1.0 - 1e-6);
-        (p / (1.0 - p)).ln()
+        -(1.0 / p - 1.0).ln()
     }
 
-    fn default_metric(&self) -> &str {
-        "logloss"
+    fn default_metric(&self) -> String {
+        if self.regression { "rmse" } else { "logloss" }.to_string()
     }
 }
 
@@ -127,9 +154,19 @@ mod tests {
     }
 
     #[test]
-    fn base_margin_is_logit_of_rate() {
+    fn base_margins_is_logit_of_rate() {
         let obj = LogisticObjective::default();
-        // 50% positive -> logit(0.5) = 0
-        assert_relative_eq!(obj.base_margin(&[1.0, 0.0], None), 0.0, epsilon = 1e-6);
+        // 50% positive -> logit(0.5) = 0; 25% -> -ln(3) with XGBoost's f32 logit.
+        assert_eq!(obj.base_margins(&[1.0, 0.0], None, None), vec![0.0]);
+        let quarter = obj.base_margins(&[1.0, 0.0, 0.0, 0.0], None, None);
+        assert_eq!(quarter, vec![-(1.0f32 / 0.25 - 1.0).ln()]);
+    }
+
+    #[test]
+    fn prob_to_margin_clamps_to_xgboost_bounds() {
+        let obj = LogisticObjective::default();
+        assert_eq!(obj.prob_to_margin(0.0), obj.prob_to_margin(1e-6));
+        assert_eq!(obj.prob_to_margin(1.0), obj.prob_to_margin(1.0 - 1e-6));
+        assert!(obj.prob_to_margin(0.0).is_finite());
     }
 }

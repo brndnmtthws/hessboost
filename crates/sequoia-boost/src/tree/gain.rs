@@ -72,12 +72,18 @@ pub struct RegParams {
 
 impl RegParams {
     /// Extract the regularization parameters from a full training config.
+    ///
+    /// XGBoost stores these as `float`, so every value is rounded to `f32`
+    /// first: `lambda = 0.1` then means the same number on both sides.
+    /// `max_delta_step` is the effective value: XGBoost's learner injects `0.7`
+    /// for `count:poisson` only when the parameter was not supplied, so an
+    /// explicit `0` stays unconstrained.
     pub fn from_params(p: &TrainingParams) -> Self {
         RegParams {
-            lambda: p.lambda,
-            alpha: p.alpha,
-            max_delta_step: p.max_delta_step,
-            min_child_weight: p.min_child_weight,
+            lambda: p.lambda as f32 as f64,
+            alpha: p.alpha as f32 as f64,
+            max_delta_step: p.effective_max_delta_step() as f32 as f64,
+            min_child_weight: p.min_child_weight as f32 as f64,
         }
     }
 }

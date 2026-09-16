@@ -3,5 +3,6 @@
 mod params;
 
 pub use params::{
-    BoosterKind, GrowPolicy, Monotone, TrainingParams, TrainingParamsBuilder, TreeMethod,
+    BoosterKind, GrowPolicy, Monotone, ObjectiveParams, TrainingParams, TrainingParamsBuilder,
+    TreeMethod,
 };

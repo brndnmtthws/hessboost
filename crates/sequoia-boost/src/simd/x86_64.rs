@@ -1,11 +1,8 @@
-//! AVX2/FMA kernels for x86-64. The split-gain scan is a pure prefilter whose
-//! accepted result is bit-identical to the scalar path it replaces. The
-//! transcendental kernels mirror the NEON formulas and stay within a few f32
-//! ULPs of the scalar library functions.
+//! AVX2/FMA kernels for x86-64. The transcendental kernels mirror the NEON
+//! formulas and stay within a few f32 ULPs of the scalar library functions.
 
-use super::{prefilter_target, scalar, sigmoid_scalar, SplitCandidate, MAX_FAST_EXP_INPUT};
+use super::{scalar, sigmoid_scalar, MAX_FAST_EXP_INPUT};
 use crate::objective::GradPair;
-use crate::tree::gain::{calc_gain, GradStats, RegParams};
 use std::arch::x86_64::*;
 
 /// f32 lanes per vector.
@@ -216,15 +213,27 @@ unsafe fn row_reduce<const K: usize>(
 
 /// Softmax of the `WIDTH / K` rows held in one vector, or `None` when a row is
 /// non-finite or spans more than [`MAX_FAST_EXP_INPUT`].
+///
+/// `GRADIENT` selects the shift of `SoftmaxMultiClassObj::GetGradient`,
+/// `max(f32::MIN_POSITIVE, row...)`, instead of the plain row maximum of
+/// `common::Softmax`; rows whose maximum is at least `MIN_POSITIVE` are
+/// unaffected.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn short_softmax_batch<const K: usize>(preds: *const f32) -> Option<__m256> {
+unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
+    preds: *const f32,
+) -> Option<__m256> {
     // SAFETY: the caller guarantees AVX2/FMA support and `WIDTH` readable
     // values at `preds`.
     unsafe {
         let values = _mm256_loadu_ps(preds);
-        let maximum = row_reduce::<K>(values, _mm256_max_ps);
+        let mut maximum = row_reduce::<K>(values, _mm256_max_ps);
         let minimum = row_reduce::<K>(values, _mm256_min_ps);
+        if GRADIENT {
+            // `maxps` returns its second operand when either is NaN, so keep
+            // `maximum` second to preserve NaN lanes for the range guard.
+            maximum = _mm256_max_ps(_mm256_set1_ps(f32::MIN_POSITIVE), maximum);
+        }
         // NaNs propagate through min/max and infinities give a non-finite
         // range, so this ordered comparison fails for such rows.
         let regular = _mm256_cmp_ps::<_CMP_LE_OQ>(
@@ -247,7 +256,7 @@ pub(super) unsafe fn short_softmax_rows<const K: usize>(values: &mut [f32]) {
     unsafe {
         let mut batches = values.chunks_exact_mut(WIDTH);
         for batch in &mut batches {
-            match short_softmax_batch::<K>(batch.as_ptr()) {
+            match short_softmax_batch::<K, false>(batch.as_ptr()) {
                 Some(probabilities) => _mm256_storeu_ps(batch.as_mut_ptr(), probabilities),
                 None => {
                     for row in batch.chunks_mut(K) {
@@ -331,7 +340,7 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
         let mut row = 0;
         while row + rows_per_batch <= labels.len() {
             let base = row * K;
-            match short_softmax_batch::<K>(preds.as_ptr().add(base)) {
+            match short_softmax_batch::<K, true>(preds.as_ptr().add(base)) {
                 Some(probability) => {
                     let label = broadcast_rows::<K>(labels.as_ptr().add(row));
                     let weight = match weights {
@@ -375,238 +384,6 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
             row..labels.len(),
             K,
         );
-    }
-}
-
-/// Candidates examined per vector iteration (one `f64` lane each).
-const CANDIDATES: usize = 4;
-
-/// Incumbent of one feature's scan plus the fixed inputs of the exact check.
-struct Scan<'a> {
-    total: GradStats,
-    reg: &'a RegParams,
-    parent_gain: f64,
-    comparison_epsilon: f64,
-    best: Option<SplitCandidate>,
-    best_loss: f64,
-}
-
-impl Scan<'_> {
-    /// Exact scalar check of the candidate with left statistics `left`: the
-    /// same tests, in the same order, as the histogram builder's scalar scan.
-    #[inline]
-    fn accept(&mut self, left: GradStats, split_offset: usize) {
-        let right = self.total.sub(left);
-        let mcw = self.reg.min_child_weight;
-        if left.hess < mcw || right.hess < mcw {
-            return;
-        }
-        let loss_change = calc_gain(left, self.reg) + calc_gain(right, self.reg) - self.parent_gain;
-        if loss_change > self.best_loss + self.comparison_epsilon {
-            self.best_loss = loss_change;
-            self.best = Some(SplitCandidate {
-                loss_change,
-                split_offset,
-                left,
-                right,
-            });
-        }
-    }
-
-    /// See [`prefilter_target`].
-    #[inline]
-    fn target(&self) -> f64 {
-        prefilter_target(self.best_loss, self.comparison_epsilon, self.parent_gain)
-    }
-}
-
-// Arithmetic-only helpers express the AVX2 precondition through an unsafe
-// intrinsic function pointer. This keeps their unsafe blocks valid with the
-// Rust 1.86 MSRV as well as the current stdarch API, without lint overrides.
-// The compiler inlines these constant function pointers.
-
-/// `Tα(G)²` for four candidates, `0` for a NaN gradient like `threshold_l1`.
-#[inline]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn numerator<const L1: bool>(gradient: __m256d, alpha: __m256d) -> __m256d {
-    // SAFETY: the caller guarantees AVX2 support; all operations use registers.
-    unsafe {
-        let multiply: unsafe fn(__m256d, __m256d) -> __m256d = _mm256_mul_pd;
-        let zero = _mm256_setzero_pd();
-        if L1 {
-            // |g| via sign-bit clear; `max(x, 0)` yields 0 for NaN because
-            // `_mm256_max_pd` returns its second operand when either is NaN.
-            let magnitude = _mm256_andnot_pd(_mm256_set1_pd(-0.0), gradient);
-            let thresholded = _mm256_max_pd(_mm256_sub_pd(magnitude, alpha), zero);
-            multiply(thresholded, thresholded)
-        } else {
-            _mm256_max_pd(multiply(gradient, gradient), zero)
-        }
-    }
-}
-
-/// Lanes holding a normal, finite, positive value: the range in which the
-/// relative rounding-error bounds behind [`super::PREFILTER_SLACK`] hold.
-#[inline]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn normal_positive(values: __m256d) -> __m256d {
-    // SAFETY: the caller guarantees AVX2 support; all operations use registers.
-    unsafe {
-        let compare_lt: unsafe fn(__m256d, __m256d) -> __m256d = _mm256_cmp_pd::<_CMP_LT_OQ>;
-        _mm256_and_pd(
-            _mm256_cmp_pd::<_CMP_GE_OQ>(values, _mm256_set1_pd(f64::MIN_POSITIVE)),
-            compare_lt(values, _mm256_set1_pd(f64::INFINITY)),
-        )
-    }
-}
-
-/// Best dense, unconstrained split of one feature's `histogram`, or `None`.
-///
-/// The prefix sums advance bin by bin in scalar-identical order. Four
-/// candidates at a time are tested with the division-free bound
-/// `a_L·b_R + a_R·b_L > target·b_L·b_R` (`a = Tα(G)²`, `b = H + λ ≥ 0`). Only
-/// lanes that pass go through the exact scalar acceptance, so the returned
-/// candidate matches the scalar scan exactly. Callers must ensure
-/// `reg.max_delta_step == 0` (closed-form gain) and AVX2+FMA support.
-#[target_feature(enable = "avx2,fma")]
-pub(super) unsafe fn dense_unconstrained_best_split(
-    histogram: &[GradStats],
-    total: GradStats,
-    reg: &RegParams,
-    parent_gain: f64,
-    incumbent_loss: f64,
-    comparison_epsilon: f64,
-) -> Option<SplitCandidate> {
-    // SAFETY: the caller guarantees AVX2 and FMA support and `scan` has no
-    // further preconditions.
-    unsafe {
-        if reg.alpha == 0.0 {
-            scan::<false>(
-                histogram,
-                total,
-                reg,
-                parent_gain,
-                incumbent_loss,
-                comparison_epsilon,
-            )
-        } else {
-            scan::<true>(
-                histogram,
-                total,
-                reg,
-                parent_gain,
-                incumbent_loss,
-                comparison_epsilon,
-            )
-        }
-    }
-}
-
-#[target_feature(enable = "avx2,fma")]
-unsafe fn scan<const L1: bool>(
-    histogram: &[GradStats],
-    total: GradStats,
-    reg: &RegParams,
-    parent_gain: f64,
-    incumbent_loss: f64,
-    comparison_epsilon: f64,
-) -> Option<SplitCandidate> {
-    // SAFETY: the caller guarantees AVX2 and FMA support. Pointer bounds are
-    // documented at each memory access below.
-    unsafe {
-        let candidate_count = histogram.len().saturating_sub(1);
-        let bins = histogram.as_ptr().cast::<f64>();
-        let total_gradients = _mm256_set1_pd(total.grad);
-        let total_hessians = _mm256_set1_pd(total.hess);
-        let alpha = _mm256_set1_pd(reg.alpha);
-        let lambda = _mm256_set1_pd(reg.lambda);
-        let ones = _mm256_castsi256_pd(_mm256_set1_epi64x(-1));
-
-        // Seed the epsilon comparison with the node-wide incumbent so the
-        // scan accepts the same candidates, in the same order, as the
-        // builder's sequential scalar scan.
-        let mut scan = Scan {
-            total,
-            reg,
-            parent_gain,
-            comparison_epsilon,
-            best: None,
-            best_loss: incumbent_loss,
-        };
-        let mut target = scan.target();
-        // `(grad, hess)` prefix over the bins consumed so far.
-        let mut accumulated = _mm_setzero_pd();
-        let mut index = 0;
-
-        while index + CANDIDATES - 1 < candidate_count {
-            // SAFETY: `index + 3 < candidate_count < histogram.len()`, and
-            // GradStats is two adjacent f64 fields, so all four loads are in
-            // range.
-            let p0 = _mm_add_pd(accumulated, _mm_loadu_pd(bins.add(2 * index)));
-            let p1 = _mm_add_pd(p0, _mm_loadu_pd(bins.add(2 * index + 2)));
-            let p2 = _mm_add_pd(p1, _mm_loadu_pd(bins.add(2 * index + 4)));
-            let p3 = _mm_add_pd(p2, _mm_loadu_pd(bins.add(2 * index + 6)));
-            accumulated = p3;
-            let left_gradients = _mm256_set_m128d(_mm_unpacklo_pd(p2, p3), _mm_unpacklo_pd(p0, p1));
-            let left_hessians = _mm256_set_m128d(_mm_unpackhi_pd(p2, p3), _mm_unpackhi_pd(p0, p1));
-            let right_gradients = _mm256_sub_pd(total_gradients, left_gradients);
-            let right_hessians = _mm256_sub_pd(total_hessians, left_hessians);
-
-            let left_numerator = numerator::<L1>(left_gradients, alpha);
-            let right_numerator = numerator::<L1>(right_gradients, alpha);
-            let left_denominator = _mm256_add_pd(left_hessians, lambda);
-            let right_denominator = _mm256_add_pd(right_hessians, lambda);
-            let cross = _mm256_fmadd_pd(
-                right_numerator,
-                left_denominator,
-                _mm256_mul_pd(left_numerator, right_denominator),
-            );
-            let bound = _mm256_mul_pd(
-                _mm256_mul_pd(_mm256_set1_pd(target), left_denominator),
-                right_denominator,
-            );
-            // The cross-multiplied test is equivalent to the quotient test only
-            // for positive denominators, and its rounding error is relative
-            // (covered by `PREFILTER_SLACK`) only while every product stays a
-            // normal finite number — a subnormal denominator would round the
-            // intermediate `target * bL` with unbounded relative error. Every
-            // other lane goes to the exact check unconditionally. `cross >= 0`
-            // always holds, so "normal positive" also excludes a `cross` that
-            // underflowed to zero or subnormal while `bound` is comparable,
-            // where an absolute error could hide.
-            let trusted = _mm256_and_pd(
-                _mm256_and_pd(
-                    normal_positive(left_denominator),
-                    normal_positive(right_denominator),
-                ),
-                _mm256_and_pd(normal_positive(cross), normal_positive(bound)),
-            );
-            let improving = _mm256_cmp_pd::<_CMP_GT_OQ>(cross, bound);
-            let mask = _mm256_movemask_pd(_mm256_or_pd(improving, _mm256_andnot_pd(trusted, ones)));
-            if mask != 0 {
-                let mut grads = [0.0f64; CANDIDATES];
-                let mut hesses = [0.0f64; CANDIDATES];
-                _mm256_storeu_pd(grads.as_mut_ptr(), left_gradients);
-                _mm256_storeu_pd(hesses.as_mut_ptr(), left_hessians);
-                for lane in 0..CANDIDATES {
-                    if mask & (1 << lane) != 0 {
-                        scan.accept(GradStats::new(grads[lane], hesses[lane]), index + lane);
-                    }
-                }
-                target = scan.target();
-            }
-            index += CANDIDATES;
-        }
-
-        let mut lanes = [0.0f64; 2];
-        _mm_storeu_pd(lanes.as_mut_ptr(), accumulated);
-        let mut left = GradStats::new(lanes[0], lanes[1]);
-        while index < candidate_count {
-            left.add(histogram[index]);
-            scan.accept(left, index);
-            index += 1;
-        }
-        scan.best
     }
 }
 

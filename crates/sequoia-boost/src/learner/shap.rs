@@ -12,8 +12,8 @@
 //! Σ_j contribs[j] + bias == margin(x)
 //! ```
 //!
-//! where `bias == base_score + Σ_tree E[f_tree]` and `margin(x)` is the model's
-//! raw margin ([`BoostedModel::predict_margin`]).
+//! where `bias == base_score[k] + Σ_tree E[f_tree]` for output `k` and
+//! `margin(x)` is the model's raw margin ([`BoostedModel::predict_margin`]).
 //!
 //! The core recursion is the standard `O(T · L · D²)` algorithm (`T` trees, `L`
 //! leaves, `D` maximum depth): each root-to-leaf traversal maintains the set of
@@ -234,6 +234,9 @@ struct ShapNode {
     feature: u32,
     cond: f32,
     default_left: bool,
+    is_categorical: bool,
+    cat_begin: u32,
+    cat_end: u32,
     /// Left child, or [`NO_CHILD`] for a leaf.
     left: u32,
     right: u32,
@@ -247,6 +250,7 @@ struct ShapNode {
 /// A [`RegTree`] prepared for TreeSHAP traversals.
 struct ShapTree {
     nodes: Vec<ShapNode>,
+    categories: Vec<u32>,
     depth: usize,
 }
 
@@ -259,6 +263,9 @@ impl ShapTree {
                 feature: n.split_feature,
                 cond: n.split_cond,
                 default_left: n.default_left,
+                is_categorical: n.is_categorical,
+                cat_begin: n.cat_begin,
+                cat_end: n.cat_end,
                 left: if n.is_leaf() { NO_CHILD } else { n.left as u32 },
                 right: if n.is_leaf() {
                     NO_CHILD
@@ -291,7 +298,11 @@ impl ShapTree {
                 stack.push((child, d + 1));
             }
         }
-        ShapTree { nodes, depth }
+        ShapTree {
+            nodes,
+            categories: tree.categories().to_vec(),
+            depth,
+        }
     }
 }
 
@@ -402,6 +413,8 @@ fn tree_shap_rec(
     let v = walk.row[split as usize];
     let go_left = if v.is_nan() {
         node.default_left
+    } else if node.is_categorical {
+        tree.categories[node.cat_begin as usize..node.cat_end as usize].contains(&(v as u32))
     } else {
         v < node.cond
     };
@@ -565,7 +578,7 @@ impl BoostedModel {
     /// For a single-output model the result is row-major with shape
     /// `n_rows × (n_features + 1)`: within each row, columns `0..n_features` are
     /// the per-feature contributions and the final column is the bias
-    /// (`base_score` plus each tree's expected value).
+    /// (that output's intercept plus each tree's expected value).
     ///
     /// For a multiclass model (`n_outputs > 1`) the layout is
     /// `n_rows × n_outputs × (n_features + 1)`, row-major: the contributions for
@@ -917,6 +930,8 @@ mod tests {
             let v = x[n.split_feature as usize];
             let go_left = if v.is_nan() {
                 n.default_left
+            } else if n.is_categorical {
+                tree.categories()[n.cat_begin as usize..n.cat_end as usize].contains(&(v as u32))
             } else {
                 v < n.split_cond
             };

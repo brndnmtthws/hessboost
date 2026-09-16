@@ -6,8 +6,9 @@
 //! is ever built directly. Supports both `depthwise` and `lossguide` growth.
 
 use super::{
-    build_interaction_sets, eval_missing_directions, finalize_leaf_values, next_allowed,
-    parent_gain, permits, sum_rows, sweep_categorical, BestSplit, SplitPos, K_RT_EPS,
+    build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
+    sweep_categorical, xgb_loss_chg, xgb_node_gain, xgb_update, BestSplit, InteractionState,
+    SplitPos,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
@@ -22,7 +23,7 @@ use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 /// Nodes with at least this many rows evaluate their two children's splits
 /// concurrently. Smaller nodes appear in frontiers wide enough to keep the
@@ -55,7 +56,7 @@ struct NodeEntry {
     /// Features permitted for splits under this node given the interaction
     /// constraints and the split features on the path from the root. `None`
     /// means "all features allowed" (the root, and the inactive case).
-    allowed: Option<Vec<u32>>,
+    allowed: Option<InteractionState>,
 }
 
 /// Tree expansion and sampling happen in node order, so the expensive row and
@@ -97,7 +98,7 @@ pub struct HistTreeBuilder<'a> {
     /// combined with on a path (its interaction set). `None` means interaction
     /// constraints are inactive (no filtering). An unlisted feature may only
     /// interact with itself.
-    interaction_sets: Option<HashMap<u32, Vec<u32>>>,
+    interaction_sets: Option<Vec<Vec<u32>>>,
     backend: CpuBackend,
 }
 
@@ -185,10 +186,10 @@ impl<'a> HistTreeBuilder<'a> {
 
         match self.params.grow_policy {
             GrowPolicy::DepthWise => {
-                self.grow_depthwise(&mut tree, &mut store, ghist, gpair, sampler, root)
+                self.grow_depthwise(&mut tree, &mut store, ghist, gpair, sampler, root);
             }
             GrowPolicy::LossGuide => {
-                self.grow_lossguide(&mut tree, &mut store, ghist, gpair, sampler, root)
+                self.grow_lossguide(&mut tree, &mut store, ghist, gpair, sampler, root);
             }
         }
 
@@ -320,7 +321,13 @@ impl<'a> HistTreeBuilder<'a> {
                 b.right.hess as f32,
             )
         } else {
-            let threshold = cuts.cut_value(b.split_bin);
+            // XGBoost stores `-inf` for the missing-only-left endpoint; trees
+            // here require a finite `split_cond`, and `x < f32::MIN` is false
+            // for every finite `x`, so routing is identical.
+            let threshold = match b.split_bin {
+                Some(bin) => cuts.cut_value(bin),
+                None => f32::MIN,
+            };
             tree.expand(
                 entry.nid,
                 b.feature,
@@ -408,12 +415,12 @@ impl<'a> HistTreeBuilder<'a> {
             (parent_hist, rh)
         };
 
-        // Both children share the same allowed feature set: the parent's set
-        // intersected with the split feature's interaction set. Inactive ⇒ `None`.
+        // Both children share the state derived from the complete updated path:
+        // path features plus groups containing every feature on that path.
         let child_allowed = next_allowed(
-            parent_allowed.as_deref(),
+            parent_allowed.as_ref(),
             b.feature,
-            self.interaction_sets.as_ref(),
+            self.interaction_sets.as_deref(),
         );
 
         // The children's split searches are independent; near the root, where
@@ -423,7 +430,7 @@ impl<'a> HistTreeBuilder<'a> {
         let (left_best, right_best) = if terminal {
             (BestSplit::none(), BestSplit::none())
         } else {
-            let allowed = child_allowed.as_deref();
+            let allowed = child_allowed.as_ref();
             let left = || {
                 self.evaluate(
                     ghist,
@@ -472,11 +479,15 @@ impl<'a> HistTreeBuilder<'a> {
         (left, right)
     }
 
-    /// Find the best split for a node from its histogram, scanning each sampled
-    /// feature's bin range and trying both missing-value directions. Split gain
-    /// is evaluated at bounded child weights so monotone constraints are honored
-    /// (with no constraints the bounds are infinite and this is the standard
-    /// closed-form gain).
+    /// Find the best split for a node from its histogram, enumerating each
+    /// sampled feature's bins as XGBoost's histogram evaluator does: a forward
+    /// pass over every bin boundary (missing values right, including the last
+    /// boundary that isolates the missing mass) and, only when the feature has
+    /// missing values in this node, a backward pass (missing values left, down
+    /// to the endpoint that routes only the missing mass left).
+    /// Candidates are scored and compared with XGBoost's `f32` arithmetic and
+    /// tie rule, so near-equal gains resolve the same way. Monotone bounds are
+    /// honored through the bounded child weights.
     fn evaluate(
         &self,
         ghist: &GHistIndex,
@@ -484,13 +495,13 @@ impl<'a> HistTreeBuilder<'a> {
         total: GradStats,
         feature_subset: &[u32],
         bounds: Bounds,
-        allowed: Option<&[u32]>,
+        allowed: Option<&InteractionState>,
     ) -> BestSplit {
         let cuts = ghist.cuts();
         let mut best = BestSplit::none();
         // A dense index has no missing entries: every feature's bins sum to
-        // `total` (up to rounding), so the missing direction is never distinct
-        // and the per-feature sums need not be computed.
+        // `total`, so the missing direction is never distinct and the
+        // per-feature sums need not be computed.
         let dense = ghist.dense_stride().is_some();
 
         // Restrict the sampled features to those permitted by the interaction
@@ -498,18 +509,18 @@ impl<'a> HistTreeBuilder<'a> {
         // features are allowed (constraints inactive or unconstrained path).
         let filtered: Vec<u32>;
         let feature_subset: &[u32] = match allowed {
-            Some(allow) => {
+            Some(_) => {
                 filtered = feature_subset
                     .iter()
                     .copied()
-                    .filter(|&f| permits(Some(allow), f))
+                    .filter(|&f| permits(allowed, f))
                     .collect();
                 &filtered
             }
             None => feature_subset,
         };
         let constrained = self.cons.is_active();
-        let parent_gain = parent_gain(total, &self.reg, bounds, constrained);
+        let root_gain = xgb_node_gain(total, &self.reg, bounds);
 
         for &f in feature_subset {
             let (fs, fe) = cuts.feature_bins(f as usize);
@@ -529,7 +540,7 @@ impl<'a> HistTreeBuilder<'a> {
                     &mut best,
                     &mut cats,
                     total,
-                    parent_gain,
+                    root_gain as f64,
                     bounds,
                     dir,
                     constrained,
@@ -539,69 +550,55 @@ impl<'a> HistTreeBuilder<'a> {
                 continue;
             }
 
-            // Present statistics for this feature (sum over its bins). With no
-            // missing entries the two missing directions produce identical
-            // splits, so evaluate only one.
-            let (present, has_missing) = if dense {
-                (total, false)
-            } else {
-                let present = crate::simd::sum_grad_stats(&hist[fs..fe]);
-                (present, total.sub(present).hess > 1e-6)
-            };
-
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-            if !constrained && !has_missing {
-                // Seed the scan with the node-wide incumbent so its epsilon
-                // decisions continue the sequential scalar scan.
-                if let crate::simd::DenseSplitScan::Scanned(candidate) =
-                    crate::simd::dense_unconstrained_best_split(
-                        &hist[fs..fe],
-                        total,
-                        &self.reg,
-                        parent_gain,
-                        best.loss_chg,
-                        K_RT_EPS,
-                    )
+            let mut acc = GradStats::default();
+            for (offset, &bin) in hist[fs..fe].iter().enumerate() {
+                let i = fs + offset;
+                acc.add(bin);
+                let right = total.sub(acc);
+                if let Some((loss_chg, wl, wr)) =
+                    xgb_loss_chg(acc, right, root_gain, &self.reg, bounds, dir)
                 {
-                    if let Some(candidate) = candidate {
-                        if candidate.loss_change > best.loss_chg + K_RT_EPS {
-                            best = BestSplit::numeric(
-                                candidate.loss_change,
-                                f,
-                                SplitPos::Bin(fs + candidate.split_offset),
-                                false,
-                                candidate.left,
-                                candidate.right,
-                                0.0,
-                                0.0,
-                            );
-                        }
-                    }
-                    continue;
+                    xgb_update(
+                        &mut best,
+                        loss_chg,
+                        f,
+                        SplitPos::Bin(i),
+                        false,
+                        acc,
+                        right,
+                        wl,
+                        wr,
+                    );
                 }
             }
-
-            let mut acc = GradStats::default();
-            #[allow(clippy::needless_range_loop)]
-            for i in fs..fe {
-                acc.add(hist[i]);
-                if i + 1 >= fe {
-                    break; // no right side beyond the last bin
+            // Whether this feature has missing values in the node: XGBoost
+            // compares the forward pass's final sum with the node statistics
+            // exactly (`SplitContainsMissingValues`). A dense index never has
+            // missing entries.
+            if dense || acc == total {
+                continue;
+            }
+            // Backward pass: bins `>= i` right, the rest (and missing) left.
+            // The last candidate (`i == fs`, XGBoost's `NumericBinLowerBound`
+            // at the feature's first bin) puts only the missing mass left. Its
+            // children are the forward pass's last boundary swapped, so it is
+            // distinct under a monotone constraint: the direction can reject
+            // one orientation and accept the other. Without constraints the
+            // gains tie and the earlier (forward) candidate is kept.
+            let mut suffix = GradStats::default();
+            for i in (fs..fe).rev() {
+                suffix.add(hist[i]);
+                let left = total.sub(suffix);
+                if let Some((loss_chg, wl, wr)) =
+                    xgb_loss_chg(left, suffix, root_gain, &self.reg, bounds, dir)
+                {
+                    let pos = if i == fs {
+                        SplitPos::BelowBins
+                    } else {
+                        SplitPos::Bin(i - 1)
+                    };
+                    xgb_update(&mut best, loss_chg, f, pos, true, left, suffix, wl, wr);
                 }
-                eval_missing_directions(
-                    &mut best,
-                    acc,
-                    present,
-                    total,
-                    &self.reg,
-                    parent_gain,
-                    bounds,
-                    dir,
-                    constrained,
-                    f,
-                    SplitPos::Bin(i),
-                    has_missing,
-                );
             }
         }
         best
@@ -613,14 +610,14 @@ fn partition_rows(ghist: &GHistIndex, rows: &[u32], best: &BestSplit) -> (Vec<u3
     let cuts = ghist.cuts();
     let feature = best.feature as usize;
     if let (Some(columns), false) = (ghist.column_bins(), best.is_categorical) {
+        let Some(split_bin) = best.split_bin else {
+            // Missing-only-left split: a dense index has no missing rows.
+            return (Vec::new(), rows.to_vec());
+        };
         let n_rows = ghist.n_rows();
         return match columns {
-            Bins::U16(bins) => {
-                route_dense(rows, &bins[feature * n_rows..][..n_rows], best.split_bin)
-            }
-            Bins::U32(bins) => {
-                route_dense(rows, &bins[feature * n_rows..][..n_rows], best.split_bin)
-            }
+            Bins::U16(bins) => route_dense(rows, &bins[feature * n_rows..][..n_rows], split_bin),
+            Bins::U32(bins) => route_dense(rows, &bins[feature * n_rows..][..n_rows], split_bin),
         };
     }
 
@@ -634,7 +631,7 @@ fn partition_rows(ghist: &GHistIndex, rows: &[u32], best: &BestSplit) -> (Vec<u3
                     let cv = cuts.cut_value(bin as usize) as u32;
                     best.cat_left.contains(&cv)
                 } else {
-                    (bin as usize) <= best.split_bin
+                    best.split_bin.is_some_and(|s| bin as usize <= s)
                 }
             }
             None => best.default_left,
@@ -816,7 +813,9 @@ mod tests {
             for row in 0..n {
                 let mut target = 0.0;
                 for col in 0..features {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
                     let mut value = (state >> 33) as f32 / (1u32 << 31) as f32;
                     if mode == "categorical" && col < 2 {
                         value = (value * 4.0).floor();
@@ -1122,6 +1121,130 @@ mod tests {
             let pe = exact.predict_row(&data, r);
             let ph = hist.predict_row(&data, r);
             assert!((pe - ph).abs() < 1e-5, "row {r}: exact {pe} vs hist {ph}");
+        }
+    }
+
+    // Present rows share one gradient sign and missing rows the other. Under an
+    // increasing constraint the forward endpoint (present left, missing right)
+    // is rejected, and the only split with pure children is XGBoost's backward
+    // endpoint: missing mass left, every present bin right.
+    #[test]
+    fn missing_only_left_split_under_monotone_constraint() {
+        use crate::config::Monotone;
+        let x = vec![0.0f32, 1.0, 2.0, 3.0, f32::NAN, f32::NAN];
+        let n = x.len();
+        let data = DMatrix::from_dense(&x, n, 1).unwrap();
+        let ghist = binned(&data, 256);
+        assert!(ghist.dense_stride().is_none());
+        let mut gpair = vec![gp(-1.0, 1.0); 4];
+        gpair.extend([gp(1.0, 1.0), gp(1.0, 1.0)]);
+        let params = TrainingParams::builder()
+            .max_depth(1)
+            .lambda(0.0)
+            .min_child_weight(0.0)
+            .gamma(0.0)
+            .monotone_constraints(vec![Monotone::Increasing])
+            .build()
+            .unwrap();
+        let tree = HistTreeBuilder::new(&params).build(
+            &ghist,
+            &gpair,
+            &all_rows(n),
+            &mut crate::tree::sampler::ColumnSampler::all(1),
+        );
+        assert_eq!(tree.num_nodes(), 3);
+        let root = tree.node(0);
+        assert!(root.default_left);
+        assert!(root.split_cond.is_finite());
+        let left = tree.node(root.left as usize);
+        let right = tree.node(root.right as usize);
+        assert!(
+            (left.sum_hess - 2.0).abs() < 1e-6,
+            "left cover {}",
+            left.sum_hess
+        );
+        assert!(
+            (right.sum_hess - 4.0).abs() < 1e-6,
+            "right cover {}",
+            right.sum_hess
+        );
+        for r in 0..4 {
+            assert!(
+                (tree.predict_row(&data, r) - 1.0).abs() < 1e-6,
+                "present row {r}"
+            );
+        }
+        for r in 4..6 {
+            assert!(
+                (tree.predict_row(&data, r) + 1.0).abs() < 1e-6,
+                "missing row {r}"
+            );
+        }
+    }
+
+    // A sparse index whose split feature is fully present has no missing mass
+    // to route: the backward pass never runs, so the split keeps the forward
+    // orientation (missing right) even when the tie-breaking alternative
+    // would be a missing-left split.
+    #[test]
+    fn fully_present_feature_never_splits_missing_left() {
+        use crate::config::Monotone;
+        // Feature 1 carries the NaN that makes the index sparse but is constant
+        // otherwise, so only feature 0 can split.
+        let x = vec![
+            0.0f32,
+            5.0,
+            1.0,
+            5.0,
+            2.0,
+            5.0,
+            3.0,
+            f32::NAN,
+            4.0,
+            5.0,
+            5.0,
+            5.0,
+        ];
+        let n = 6;
+        let data = DMatrix::from_dense(&x, n, 2).unwrap();
+        let ghist = binned(&data, 256);
+        assert!(ghist.dense_stride().is_none());
+        let gpair = vec![
+            gp(1.0, 1.0),
+            gp(1.0, 1.0),
+            gp(1.0, 1.0),
+            gp(-1.0, 1.0),
+            gp(-1.0, 1.0),
+            gp(-1.0, 1.0),
+        ];
+        let params = TrainingParams::builder()
+            .max_depth(1)
+            .lambda(0.0)
+            .min_child_weight(0.0)
+            .gamma(0.0)
+            .monotone_constraints(vec![Monotone::Increasing, Monotone::None])
+            .build()
+            .unwrap();
+        let tree = HistTreeBuilder::new(&params).build(
+            &ghist,
+            &gpair,
+            &all_rows(n),
+            &mut crate::tree::sampler::ColumnSampler::all(2),
+        );
+        assert_eq!(tree.num_nodes(), 3);
+        let root = tree.node(0);
+        assert_eq!(root.split_feature, 0);
+        assert!(!root.default_left);
+        assert!(
+            root.split_cond > 2.0 && root.split_cond <= 3.0,
+            "{}",
+            root.split_cond
+        );
+        for r in 0..3 {
+            assert!((tree.predict_row(&data, r) + 1.0).abs() < 1e-6, "row {r}");
+        }
+        for r in 3..6 {
+            assert!((tree.predict_row(&data, r) - 1.0).abs() < 1e-6, "row {r}");
         }
     }
 }

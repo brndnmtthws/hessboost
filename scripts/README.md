@@ -2,22 +2,46 @@
 
 ## Parity fixtures
 
-`gen_fixtures.py` trains **real XGBoost** on standardized synthetic datasets and
-writes disjoint training and test datasets, parameters, and XGBoost test-set
-predictions to `../fixtures/*.json`. The Rust test
-`crates/sequoia-boost/tests/parity.rs` trains on the same training rows and
-asserts that held-out RMSE or accuracy remains close to XGBoost.
+`gen_fixtures.py` trains **real XGBoost 3.4.1** (single thread) on deterministic
+synthetic datasets, one case per supported feature (tree methods, missing values,
+constraints, every objective — including `reg:logistic` and the `reg:linear`
+alias — sample weights, ranking groups, gblinear, DART, intercept estimation;
+37 cases in total), and writes each case to `../fixtures/<name>.json`: data,
+the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
+raw margin, SHAP contributions on the first 50 rows) and the saved model JSON.
+It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
+quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
+
+`crates/sequoia-boost/tests/parity.rs` runs a three-way check per case:
+
+1. **Train parity** - train on the fixture data, compare `predict(x_test)` with
+   XGBoost's predictions.
+2. **Import parity** - `BoostedModel::from_xgboost_json` on the embedded model,
+   compare predictions, raw margins, and SHAP contributions.
+3. **Export parity** - write `to_xgboost_json` and sequoia's predictions to
+   `../fixtures/exports/`; `check_exports.py` reloads each model in XGBoost and
+   compares.
+
+`quantile_cuts_match_xgboost` compares `HistCuts::from_dmatrix` bit-for-bit with
+the cut oracles.
+
+Cases are tiered. `exact` cases are pointwise: max |delta| within `tol.train`
+(1e-4; 1e-5 for probabilities), `tol.import` (1e-5) and `tol.contribs` (1e-4).
+`quality` cases are RNG-driven (`subsample`, `colsample_bytree`, DART); training
+uses a regression RMSE <= 1.08x XGBoost band while import/export remain
+pointwise. The `train-only` gblinear case validates training pointwise; its
+unsupported XGBoost-JSON import/export path is visibly reported as
+`n/a`/`skipped` and required to return `ModelFormat` on import. Unknown XGBoost
+parameters fail the test.
 
 ```sh
-uv run --with xgboost --with numpy python scripts/gen_fixtures.py
-cargo test -p sequoia-boost --test parity -- --ignored
+uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+cargo test -p sequoia-boost --test parity --release -- --ignored --nocapture
+uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
 ```
 
-Fixtures are intentionally not checked in and are regenerated in CI. The
-datasets use `tree_method=hist` with a fixed `max_bin`. Pointwise prediction
-differences are reported for diagnosis, while held-out model quality determines
-pass or failure because independent histogram implementations need not select
-identical split points.
+Fixtures are not checked in; CI regenerates them (`.github/workflows/ci.yml`,
+job `parity`). The generator refuses any XGBoost version other than 3.4.1.
 
 ## Criterion comparisons
 

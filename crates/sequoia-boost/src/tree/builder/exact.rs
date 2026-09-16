@@ -1,22 +1,26 @@
 //! Exact greedy tree construction (XGBoost's `tree_method=exact`, ColMaker).
 //!
 //! For each node we scan every feature's value-sorted entries and evaluate every
-//! candidate threshold, trying both missing-value directions (sparsity-aware).
-//! This is the reference builder: not the fastest (the histogram builder is),
-//! but the easiest to verify against XGBoost. Growth is
-//! level-wise (depth-wise): a whole level is scanned per feature pass.
+//! candidate threshold the way XGBoost's `ColMaker` does: a backward
+//! (descending) scan sends missing values left and runs for every feature; a
+//! forward (ascending) scan sends them right and runs only for features that
+//! actually have missing values and are not constant. Each scan closes with the
+//! endpoint candidate that puts every present value on one side and the
+//! missing mass on the other. Growth is level-wise (depth-wise): a whole level
+//! is scanned per feature pass.
 //!
 //! Monotone and interaction constraints are honored during split search.
 
 use super::{
-    build_interaction_sets, eval_missing_directions, finalize_leaf_values, next_allowed, permits,
-    sum_rows, sweep_categorical, BestSplit, SplitPos,
+    build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
+    sweep_categorical, xgb_loss_chg, xgb_node_gain, xgb_update, BestSplit, InteractionState,
+    SplitPos, K_RT_EPS,
 };
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
 use crate::tree::constraints::{child_bounds, Bounds, MonotoneConstraints};
-use crate::tree::gain::{calc_weight, GradStats, RegParams};
+use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
 use std::collections::HashMap;
@@ -104,7 +108,7 @@ pub struct ExactTreeBuilder<'a> {
     params: &'a TrainingParams,
     reg: RegParams,
     cons: MonotoneConstraints,
-    interaction_sets: Option<HashMap<u32, Vec<u32>>>,
+    interaction_sets: Option<Vec<Vec<u32>>>,
 }
 
 impl<'a> ExactTreeBuilder<'a> {
@@ -147,7 +151,7 @@ impl<'a> ExactTreeBuilder<'a> {
         let mut node_stats: Vec<GradStats> = vec![root];
         // Per-node monotone weight bounds (default `±∞` when unconstrained).
         let mut node_bounds: Vec<Bounds> = vec![Bounds::default()];
-        let mut node_allowed: Vec<Option<Vec<u32>>> = vec![None];
+        let mut node_allowed: Vec<Option<InteractionState>> = vec![None];
 
         // With no monotone constraints, the cheap closed-form gain path is exact
         // and behaves exactly as before; the bounded path is used otherwise.
@@ -175,17 +179,15 @@ impl<'a> ExactTreeBuilder<'a> {
 
             let mut best = vec![BestSplit::none(); k];
 
-            let mut parent_gain = vec![0.0f64; k];
+            // XGBoost's `root_gain`: the node's own structure score as `f32`.
+            let mut root_gain = vec![0f32; k];
             for (slot, &nid) in active.iter().enumerate() {
-                parent_gain[slot] =
-                    super::parent_gain(node_stats[nid], &self.reg, node_bounds[nid], constrained);
+                root_gain[slot] = xgb_node_gain(node_stats[nid], &self.reg, node_bounds[nid]);
             }
 
-            // Scratch buffers, reused per feature.
-            let mut present_total = vec![GradStats::default(); k];
+            // Scratch buffers, reused per feature and scan direction.
             let mut acc = vec![GradStats::default(); k];
-            let mut last_val = vec![f32::NAN; k];
-            let mut has = vec![false; k];
+            let mut last_val = vec![0f32; k];
 
             for &f in &feature_subset {
                 let (crows, cvals) = cols.column(f as usize);
@@ -206,7 +208,7 @@ impl<'a> ExactTreeBuilder<'a> {
                         if slot == usize::MAX {
                             continue;
                         }
-                        if !permits(node_allowed[nid as usize].as_deref(), f) {
+                        if !permits(node_allowed[nid as usize].as_ref(), f) {
                             continue;
                         }
                         let gp = gpair[r];
@@ -216,7 +218,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             .add(GradStats::from_pair(gp));
                     }
                     for (slot, &nid) in active.iter().enumerate() {
-                        if !permits(node_allowed[nid].as_deref(), f) {
+                        if !permits(node_allowed[nid].as_ref(), f) {
                             continue;
                         }
                         let mut cats: Vec<(u32, GradStats)> =
@@ -225,7 +227,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             &mut best[slot],
                             &mut cats,
                             node_stats[nid],
-                            parent_gain[slot],
+                            root_gain[slot] as f64,
                             node_bounds[nid],
                             dir,
                             constrained,
@@ -236,65 +238,118 @@ impl<'a> ExactTreeBuilder<'a> {
                     continue;
                 }
 
-                // Pass 1: total present statistics per active node for feature f.
-                present_total
-                    .iter_mut()
-                    .for_each(|s| *s = GradStats::default());
-                for &rr in crows {
-                    let r = rr as usize;
-                    let nid = node_of_row[r];
-                    if nid < 0 {
-                        continue;
+                // `NeedForwardSearch`: only a column with missing values that is
+                // not constant scans forward (missing right); every column
+                // scans backward (missing left).
+                let indicator = !cvals.is_empty() && cvals[0] == cvals[cvals.len() - 1];
+                let scan = |d_step: i8,
+                            acc: &mut [GradStats],
+                            last_val: &mut [f32],
+                            best: &mut [BestSplit]| {
+                    acc.fill(GradStats::default());
+                    let mut visit = |r: usize, val: f32| {
+                        let nid = node_of_row[r];
+                        if nid < 0 {
+                            return;
+                        }
+                        let slot = slot_of_node[nid as usize];
+                        if slot == usize::MAX || !permits(node_allowed[nid as usize].as_ref(), f) {
+                            return;
+                        }
+                        let e = &mut acc[slot];
+                        // `UpdateEnumeration`: the first rows with positive Hessian
+                        // only seed the running statistics.
+                        if e.hess != 0.0
+                            && val != last_val[slot]
+                            && e.hess >= self.reg.min_child_weight
+                        {
+                            let c = node_stats[nid as usize].sub(*e);
+                            if c.hess >= self.reg.min_child_weight {
+                                let (left, right) = if d_step < 0 { (c, *e) } else { (*e, c) };
+                                // ColMaker's midpoint `(fvalue + last) * 0.5f`
+                                // overflows to `±inf` for two same-sign values
+                                // near `±f32::MAX`. Only then fall back to the
+                                // halved form, which is finite and still lies
+                                // between the two values, so the partition is
+                                // unchanged. Trees must stay finite.
+                                let last = last_val[slot];
+                                let mut mid = (val + last) * 0.5;
+                                if !mid.is_finite() {
+                                    mid = val * 0.5 + last * 0.5;
+                                }
+                                let thr = if mid == val { last } else { mid };
+                                self.try_split(
+                                    &mut best[slot],
+                                    left,
+                                    right,
+                                    root_gain[slot],
+                                    node_bounds[nid as usize],
+                                    dir,
+                                    f,
+                                    thr,
+                                    d_step < 0,
+                                );
+                            }
+                        }
+                        e.add(GradStats::from_pair(gpair[r]));
+                        last_val[slot] = val;
+                    };
+                    if d_step > 0 {
+                        for (&rr, &val) in crows.iter().zip(cvals) {
+                            visit(rr as usize, val);
+                        }
+                    } else {
+                        for (&rr, &val) in crows.iter().zip(cvals).rev() {
+                            visit(rr as usize, val);
+                        }
                     }
-                    let slot = slot_of_node[nid as usize];
-                    if slot == usize::MAX {
-                        continue;
+                    // Endpoint: every present value on the scanned side, the
+                    // missing mass on the other.
+                    for (slot, &nid) in active.iter().enumerate() {
+                        let e = acc[slot];
+                        let c = node_stats[nid].sub(e);
+                        if e.hess >= self.reg.min_child_weight
+                            && c.hess >= self.reg.min_child_weight
+                        {
+                            let last = last_val[slot];
+                            let gap = last.abs() + K_RT_EPS as f32;
+                            let thr = if d_step > 0 { last + gap } else { last - gap };
+                            // ColMaker's `last_fvalue ± delta` overflows to `±inf`
+                            // for `|last|` near `f32::MAX`; the tree must stay
+                            // finite. Forward (missing right) needs every present
+                            // `v < thr`: `f32::MAX` works unless `last` is itself
+                            // `f32::MAX`, in which case no finite threshold
+                            // represents the partition and the candidate is
+                            // skipped. Backward (missing left) needs `v >= thr`,
+                            // which `f32::MIN` satisfies for every finite `v`.
+                            let thr = if thr.is_finite() {
+                                thr
+                            } else if d_step < 0 {
+                                f32::MIN
+                            } else if last < f32::MAX {
+                                f32::MAX
+                            } else {
+                                continue;
+                            };
+                            let (left, right) = if d_step < 0 { (c, e) } else { (e, c) };
+                            self.try_split(
+                                &mut best[slot],
+                                left,
+                                right,
+                                root_gain[slot],
+                                node_bounds[nid],
+                                dir,
+                                f,
+                                thr,
+                                d_step < 0,
+                            );
+                        }
                     }
-                    if !permits(node_allowed[nid as usize].as_deref(), f) {
-                        continue;
-                    }
-                    let gp = gpair[r];
-                    present_total[slot].add(GradStats::from_pair(gp));
+                };
+                if cvals.len() < n_rows && !indicator {
+                    scan(1, &mut acc, &mut last_val, &mut best);
                 }
-
-                // Pass 2: enumerate thresholds, trying both missing directions.
-                acc.iter_mut().for_each(|s| *s = GradStats::default());
-                has.iter_mut().for_each(|h| *h = false);
-
-                for (&rr, &val) in crows.iter().zip(cvals) {
-                    let r = rr as usize;
-                    let nid = node_of_row[r];
-                    if nid < 0 {
-                        continue;
-                    }
-                    let slot = slot_of_node[nid as usize];
-                    if slot == usize::MAX {
-                        continue;
-                    }
-                    if !permits(node_allowed[nid as usize].as_deref(), f) {
-                        continue;
-                    }
-                    if has[slot] && val != last_val[slot] {
-                        eval_missing_directions(
-                            &mut best[slot],
-                            acc[slot],
-                            present_total[slot],
-                            node_stats[nid as usize],
-                            &self.reg,
-                            parent_gain[slot],
-                            node_bounds[nid as usize],
-                            dir,
-                            constrained,
-                            f,
-                            SplitPos::Value(0.5 * (last_val[slot] + val)),
-                            true,
-                        );
-                    }
-                    let gp = gpair[r];
-                    acc[slot].add(GradStats::from_pair(gp));
-                    last_val[slot] = val;
-                    has[slot] = true;
-                }
+                scan(-1, &mut acc, &mut last_val, &mut best);
             }
 
             let mut next_active = Vec::new();
@@ -312,18 +367,11 @@ impl<'a> ExactTreeBuilder<'a> {
                 let (lb_bounds, rb_bounds) =
                     child_bounds(node_bounds[nid], dir, b.w_left, b.w_right);
 
-                // Unconstrained children carry their closed-form weight, so the
+                // Children carry XGBoost's bounded `f32` weight, so the
                 // `leaf_value` field of nodes that later split records the value
-                // they had as a leaf at expansion time (matching the histogram
-                // builder). Leaves are overwritten by the finalize pass below.
-                let (lw, rw) = if constrained {
-                    (b.w_left as f32, b.w_right as f32)
-                } else {
-                    (
-                        calc_weight(b.left, &self.reg) as f32,
-                        calc_weight(b.right, &self.reg) as f32,
-                    )
-                };
+                // they had as a leaf at expansion time. Leaves are overwritten
+                // by the finalize pass below.
+                let (lw, rw) = (b.w_left as f32, b.w_right as f32);
                 let (left_id, right_id) = if b.is_categorical {
                     tree.expand_categorical(
                         nid,
@@ -354,9 +402,9 @@ impl<'a> ExactTreeBuilder<'a> {
                 node_bounds.push(lb_bounds);
                 node_bounds.push(rb_bounds);
                 let allowed = next_allowed(
-                    node_allowed[nid].as_deref(),
+                    node_allowed[nid].as_ref(),
                     b.feature,
-                    self.interaction_sets.as_ref(),
+                    self.interaction_sets.as_deref(),
                 );
                 node_allowed.push(allowed.clone());
                 node_allowed.push(allowed);
@@ -419,6 +467,40 @@ impl<'a> ExactTreeBuilder<'a> {
         // Finalize every leaf's weight (respecting each leaf's monotone bounds).
         finalize_leaf_values(&mut tree, &node_stats, &node_bounds, &self.reg);
         tree
+    }
+
+    /// Evaluate one candidate partition exactly as XGBoost's `ColMaker` does
+    /// (`CalcSplitGain − root_gain` in `f32`, `SplitEntry::Update` tie rule)
+    /// and record it in `best` when it wins.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn try_split(
+        &self,
+        best: &mut BestSplit,
+        left: GradStats,
+        right: GradStats,
+        root_gain: f32,
+        bounds: Bounds,
+        dir: i8,
+        feature: u32,
+        threshold: f32,
+        default_left: bool,
+    ) {
+        if let Some((loss_chg, wl, wr)) =
+            xgb_loss_chg(left, right, root_gain, &self.reg, bounds, dir)
+        {
+            xgb_update(
+                best,
+                loss_chg,
+                feature,
+                SplitPos::Value(threshold),
+                default_left,
+                left,
+                right,
+                wl,
+                wr,
+            );
+        }
     }
 }
 
@@ -641,5 +723,95 @@ mod tests {
         let val = |c: f32| tree.node(pred(c)).leaf_value;
         assert!(val(0.0) < 0.0 && val(2.0) < 0.0);
         assert!(val(1.0) > 0.0 && val(3.0) > 0.0);
+    }
+
+    /// Train a small exact regressor on one feature and check that every split
+    /// threshold is finite, prediction works (debug builds assert finiteness
+    /// in the compact forest), and the model survives a native JSON round trip.
+    /// Returns the predictions.
+    fn train_exact_finite(x: &[f32], y: &[f32]) -> Vec<f32> {
+        use crate::config::TreeMethod;
+        use crate::learner::{train, BoostedModel};
+        let n = x.len();
+        let data = DMatrix::from_dense(x, n, 1)
+            .unwrap()
+            .with_labels(y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("reg:squarederror")
+            .tree_method(TreeMethod::Exact)
+            .max_depth(2)
+            .eta(0.5)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 3).unwrap();
+        let mut n_splits = 0;
+        for tree in model.trees() {
+            for node in tree.nodes().iter().filter(|n| !n.is_leaf()) {
+                n_splits += 1;
+                assert!(
+                    node.split_cond.is_finite(),
+                    "non-finite split_cond {}",
+                    node.split_cond
+                );
+            }
+        }
+        assert!(n_splits > 0, "the model should have split");
+        let pred = model.predict(&data).unwrap();
+        let back = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
+        assert_eq!(back.predict(&data).unwrap(), pred);
+        pred
+    }
+
+    #[test]
+    fn backward_endpoint_near_neg_max_stays_finite() {
+        // Constant `-f32::MAX` column plus missing rows: only the backward
+        // endpoint separates them, and ColMaker's `last - (|last| + eps)`
+        // is `-inf` there. The fallback `f32::MIN` keeps every present value
+        // on the right (`v >= thr`) with missing on the left.
+        let x = [
+            -f32::MAX,
+            -f32::MAX,
+            -f32::MAX,
+            -f32::MAX,
+            f32::NAN,
+            f32::NAN,
+        ];
+        let y = [0.0, 0.0, 0.0, 0.0, 10.0, 10.0];
+        let pred = train_exact_finite(&x, &y);
+        assert!(
+            pred[0] < pred[4],
+            "present rows must be separated from missing"
+        );
+        assert_eq!(pred[0], pred[3]);
+        assert_eq!(pred[4], pred[5]);
+    }
+
+    #[test]
+    fn forward_endpoint_near_pos_max_stays_finite() {
+        // `3e38` rows, zeros and missing rows: the forward scan's endpoint
+        // (`last + (|last| + eps)`) overflows to `+inf`; the fallback
+        // `f32::MAX` still sends every present value left (`v < thr`).
+        let x = [3e38f32, 3e38, 0.0, 0.0, f32::NAN, f32::NAN];
+        let y = [0.0, 0.0, 0.0, 0.0, 10.0, 10.0];
+        let pred = train_exact_finite(&x, &y);
+        assert!(
+            pred[0] < pred[4],
+            "present rows must be separated from missing"
+        );
+        assert_eq!(pred[0], pred[2]);
+        assert_eq!(pred[4], pred[5]);
+    }
+
+    #[test]
+    fn midpoint_near_pos_max_stays_finite() {
+        // Two same-sign values near `f32::MAX`: `(2e38 + 3e38) * 0.5` is
+        // `+inf`; the halved form `2.5e38` lies between them.
+        let x = [2e38f32, 2e38, 3e38, 3e38];
+        let y = [0.0, 0.0, 10.0, 10.0];
+        let pred = train_exact_finite(&x, &y);
+        assert!(pred[0] < pred[2], "the two value groups must be separated");
+        assert_eq!(pred[0], pred[1]);
+        assert_eq!(pred[2], pred[3]);
     }
 }

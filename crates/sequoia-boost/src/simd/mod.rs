@@ -7,10 +7,6 @@ const LOG_LOSS_EPSILON: f64 = 1e-15;
 const MIN_POSITIVE_PREDICTION: f64 = 1e-8;
 
 use crate::objective::GradPair;
-use crate::tree::gain::GradStats;
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use crate::tree::gain::RegParams;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use std::sync::LazyLock;
@@ -24,9 +20,8 @@ mod x86_64;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const MIN_SIMD_LEN: usize = 16;
 
-// Layout contracts the deinterleaving vector loads and stores rely on.
+// Layout contract the deinterleaving vector loads and stores rely on.
 const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());
-const _: () = assert!(std::mem::size_of::<GradStats>() == 2 * std::mem::size_of::<f64>());
 
 /// Inputs with a larger magnitude take the scalar path in the fast
 /// exponential, sigmoid, and softmax kernels.
@@ -88,34 +83,6 @@ macro_rules! dispatch_gradient {
             return;
         }
     };
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(crate) struct SplitCandidate {
-    pub(crate) loss_change: f64,
-    pub(crate) split_offset: usize,
-    pub(crate) left: GradStats,
-    pub(crate) right: GradStats,
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(crate) enum DenseSplitScan {
-    ScalarFallback,
-    Scanned(Option<SplitCandidate>),
-}
-
-/// Relative slack applied to the division-free prefilter threshold. Both the
-/// cross-multiplied test and the exact quotient test round to within a few
-/// ULPs, so this margin guarantees the prefilter never rejects a candidate the
-/// exact comparison would accept. False positives merely pay for a division.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(super) const PREFILTER_SLACK: f64 = 1e-9;
-
-/// Scaled `gain(L) + gain(R)` a candidate must exceed to beat `best_loss`.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-#[inline]
-pub(super) fn prefilter_target(best_loss: f64, comparison_epsilon: f64, parent_gain: f64) -> f64 {
-    (best_loss + comparison_epsilon + parent_gain) * (1.0 - PREFILTER_SLACK)
 }
 
 /// Resolve the process-wide AArch64 backend lazily on the first numeric-kernel
@@ -191,95 +158,27 @@ fn metric_slices_cover(len: usize, labels: &[f32], weights: Option<&[f32]>) -> b
     labels.len() >= len && weights.is_none_or(|values| values.len() >= len)
 }
 
+/// XGBoost's `common::Sigmoid`: `1 / (expf(min(-x, 88.7)) + 1)` (the
+/// `1e-16f` upstream adds to the denominator vanishes in `f32`).
 #[inline]
 fn sigmoid_scalar(x: f32) -> f32 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let exp = x.exp();
-        exp / (1.0 + exp)
-    }
-}
-
-#[inline]
-pub(crate) fn sum_grad_stats(values: &[GradStats]) -> GradStats {
-    dispatch_gradient!(
-        values.len() >= MIN_SIMD_LEN,
-        aarch64::sum_grad_stats(values)
-    );
-
-    let mut sum = GradStats::default();
-    for &value in values {
-        sum.add(value);
-    }
-    sum
-}
-
-/// Try the vector split-gain scan used by the common dense, unconstrained
-/// histogram path. `ScalarFallback` asks the caller to use its scalar scan.
-///
-/// `incumbent_loss` is the best loss change already found for the node, from
-/// any earlier feature. The scan seeds its sequential epsilon comparison with
-/// that value, so its acceptance decisions replay the caller's scalar scan
-/// for this feature and the returned candidate (if any) is the one the scalar
-/// path would have accepted in the same position.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub(crate) fn dense_unconstrained_best_split(
-    histogram: &[GradStats],
-    total: GradStats,
-    reg: &RegParams,
-    parent_gain: f64,
-    incumbent_loss: f64,
-    comparison_epsilon: f64,
-) -> DenseSplitScan {
-    if histogram.len() < MIN_SIMD_LEN || reg.max_delta_step != 0.0 {
-        return DenseSplitScan::ScalarFallback;
-    }
-    #[cfg(target_arch = "aarch64")]
-    if neon_available() {
-        // SAFETY: NEON is present. The kernel only reads `histogram` and keeps
-        // all vector loads within the complete candidate range.
-        return DenseSplitScan::Scanned(unsafe {
-            aarch64::dense_unconstrained_best_split(
-                histogram,
-                total,
-                reg,
-                parent_gain,
-                incumbent_loss,
-                comparison_epsilon,
-            )
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if avx2_fma_available() {
-        // SAFETY: AVX2 and FMA are present. The kernel only reads `histogram`
-        // and keeps all vector loads within the complete candidate range.
-        return DenseSplitScan::Scanned(unsafe {
-            x86_64::dense_unconstrained_best_split(
-                histogram,
-                total,
-                reg,
-                parent_gain,
-                incumbent_loss,
-                comparison_epsilon,
-            )
-        });
-    }
-    DenseSplitScan::ScalarFallback
+    1.0 / ((-x).min(88.7).exp() + 1.0)
 }
 
 #[inline]
 pub(crate) fn exp_inplace(values: &mut [f32]) {
     dispatch_unary_inplace!(values, exp_inplace);
-    values.iter_mut().for_each(|value| *value = value.exp());
+    for value in values.iter_mut() {
+        *value = value.exp();
+    }
 }
 
 #[inline]
 pub(crate) fn sigmoid_inplace(values: &mut [f32]) {
     dispatch_unary_inplace!(values, sigmoid_inplace);
-    values
-        .iter_mut()
-        .for_each(|value| *value = sigmoid_scalar(*value));
+    for value in values.iter_mut() {
+        *value = sigmoid_scalar(*value);
+    }
 }
 
 pub(crate) fn logistic_gradient(
@@ -487,22 +386,28 @@ pub(super) fn softmax_gradient_rows_scalar(
     }
 }
 
+/// XGBoost's `common::Softmax`: shift by the row maximum, sum the
+/// exponentials in `f64`, and divide each entry by that sum rounded to `f32`.
 pub(super) fn softmax_scalar(values: &mut [f32]) {
-    let mut max = f32::NEG_INFINITY;
-    for &value in values.iter() {
-        if value > max {
-            max = value;
-        }
-    }
-    let mut sum = 0.0;
+    let Some(&first) = values.first() else {
+        return;
+    };
+    let wmax = values[1..].iter().fold(first, |m, &v| v.max(m));
+    let mut wsum = 0f64;
     for value in values.iter_mut() {
-        *value = (*value - max).exp();
-        sum += *value;
+        *value = (*value - wmax).exp();
+        wsum += *value as f64;
     }
-    let inverse = 1.0 / sum;
-    values.iter_mut().for_each(|value| *value *= inverse);
+    let wsum = wsum as f32;
+    for value in values.iter_mut() {
+        *value /= wsum;
+    }
 }
 
+/// XGBoost's `SoftmaxMultiClassObj::GetGradient` for one row: the shift is
+/// `max(f32::MIN_POSITIVE, preds...)` (upstream seeds `wmax` with
+/// `numeric_limits<float>::min()`), the exponentials are summed in `f64`, and
+/// `p = expf(x - wmax) / (float)wsum`.
 pub(super) fn softmax_gradient_row_scalar(
     preds: &[f32],
     label: usize,
@@ -510,26 +415,20 @@ pub(super) fn softmax_gradient_row_scalar(
     min_hess: f32,
     out: &mut [GradPair],
 ) {
-    let mut max = f32::NEG_INFINITY;
+    let mut wmax = f32::MIN_POSITIVE;
     for &value in preds {
-        if value > max {
-            max = value;
-        }
+        wmax = value.max(wmax);
     }
-    let mut sum = 0.0;
-    for (output, &prediction) in out.iter_mut().zip(preds) {
-        let exp = (prediction - max).exp();
-        output.grad = exp;
-        sum += exp;
+    let mut wsum = 0f64;
+    for &prediction in preds {
+        wsum += (prediction - wmax).exp() as f64;
     }
-    let inverse = 1.0 / sum;
-    for (class, output) in out.iter_mut().enumerate() {
-        let probability = output.grad * inverse;
-        let target = if class == label { 1.0 } else { 0.0 };
-        *output = GradPair::new(
-            (probability - target) * weight,
-            (2.0 * probability * (1.0 - probability) * weight).max(min_hess),
-        );
+    let wsum = wsum as f32;
+    for (class, (output, &prediction)) in out.iter_mut().zip(preds).enumerate() {
+        let p = (prediction - wmax).exp() / wsum;
+        let h = (2.0 * p * (1.0 - p) * weight).max(min_hess);
+        let g = if class == label { p - 1.0 } else { p };
+        *output = GradPair::new(g * weight, h);
     }
 }
 

@@ -1,11 +1,11 @@
 //! The gradient-boosting training loop.
 
-use crate::config::{BoosterKind, GrowPolicy, TrainingParams, TreeMethod};
+use crate::config::{BoosterKind, GrowPolicy, ObjectiveParams, TrainingParams, TreeMethod};
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::data::DMatrix;
 use crate::error::{Result, SequoiaError};
-use crate::learner::model::{base_margins, BoostedModel};
+use crate::learner::model::{BoostedModel, ModelSpec};
 use crate::metric::create_metrics;
 use crate::objective::{create_objective, GradPair};
 use crate::tree::builder::{
@@ -22,9 +22,14 @@ use rayon::prelude::*;
 enum Prepared {
     Exact(SortedColumns),
     Hist(GHistIndex),
-    /// `tree_method=approx`: no state is cached up front. Each round recomputes
-    /// hessian-weighted cuts and bins from that round's gradients.
-    Approx,
+    /// `tree_method=approx`: Hessian-weighted cuts. XGBoost regenerates them
+    /// every round from a sorted-column summary unless the objective has a
+    /// constant Hessian, in which case the round-0 streaming sketch is built
+    /// once and reused (`BatchParam::regen = !const_hess`).
+    Approx {
+        const_hess: bool,
+        cached: std::sync::OnceLock<GHistIndex>,
+    },
 }
 
 impl Prepared {
@@ -44,21 +49,41 @@ impl Prepared {
             Prepared::Hist(ghist) => {
                 HistTreeBuilder::new(params).build(ghist, gpair, rows, sampler)
             }
-            Prepared::Approx => {
-                // Recompute hessian-weighted cuts from this round's gradients,
-                // rebin, then grow with the shared histogram builder.
-                let hessians: Vec<f32> = gpair.iter().map(|g| g.hess).collect();
-                let cuts = HistCuts::from_dmatrix_weighted(dtrain, params.max_bin, &hessians);
-                let ghist = GHistIndex::from_dmatrix(dtrain, cuts);
-                HistTreeBuilder::new(params).build(&ghist, gpair, rows, sampler)
+            Prepared::Approx { const_hess, cached } => {
+                let bin = || {
+                    let hessians: Vec<f32> = gpair.iter().map(|g| g.hess).collect();
+                    let cuts = HistCuts::from_dmatrix_weighted(
+                        dtrain,
+                        params.max_bin,
+                        &hessians,
+                        !const_hess,
+                    );
+                    GHistIndex::from_dmatrix(dtrain, cuts)
+                };
+                if *const_hess {
+                    HistTreeBuilder::new(params).build(
+                        cached.get_or_init(bin),
+                        gpair,
+                        rows,
+                        sampler,
+                    )
+                } else {
+                    HistTreeBuilder::new(params).build(&bin(), gpair, rows, sampler)
+                }
             }
         }
     }
 }
 
 /// Resolve `tree_method` (handling `Auto`) and prepare the matching builder
-/// state once, up front.
-fn prepare_builder(params: &TrainingParams, dtrain: &DMatrix) -> Result<Prepared> {
+/// state once, up front. `const_hess` is the objective's
+/// [`Objective::const_hess`](crate::objective::Objective::const_hess), which
+/// decides whether `approx` regenerates its cuts every round.
+fn prepare_builder(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    const_hess: bool,
+) -> Result<Prepared> {
     let method = match params.tree_method {
         // Auto favors the histogram method, as modern XGBoost does.
         TreeMethod::Auto | TreeMethod::Hist => TreeMethod::Hist,
@@ -76,8 +101,10 @@ fn prepare_builder(params: &TrainingParams, dtrain: &DMatrix) -> Result<Prepared
             let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
             Prepared::Hist(GHistIndex::from_dmatrix(dtrain, cuts))
         }
-        // Approx caches nothing: cuts are rebuilt per round in `build_tree`.
-        TreeMethod::Approx => Prepared::Approx,
+        TreeMethod::Approx => Prepared::Approx {
+            const_hess,
+            cached: std::sync::OnceLock::new(),
+        },
         _ => Prepared::Exact(SortedColumns::from_dmatrix(dtrain)),
     })
 }
@@ -293,21 +320,42 @@ fn train_impl_inner(
         }
     }
 
-    // Base score in margin space (0 per class for multi-output objectives).
-    let base_margin = if n_out == 1 {
-        match params.base_score {
-            Some(bs) => objective.prob_to_margin(bs as f32),
-            None => objective.base_margin(labels, weights),
-        }
-    } else {
-        0.0
+    // Per-output intercepts in margin space. A user-supplied `base_score` is
+    // given in prediction space and broadcast to every output through the
+    // objective's link (XGBoost `ProbToMargin`; for multiclass this is a
+    // uniform nonzero margin, as in XGBoost); otherwise the objective estimates
+    // them from the labels (XGBoost `InitEstimation`).
+    let base_margins = match params.base_score {
+        Some(bs) => vec![objective.prob_to_margin(bs as f32); n_out],
+        None => objective.base_margins(labels, weights, dtrain.group()),
     };
+    if base_margins.len() != n_out {
+        return Err(SequoiaError::DimensionMismatch {
+            what: "objective base_margins length",
+            expected: n_out,
+            got: base_margins.len(),
+        });
+    }
+    if base_margins.iter().any(|m| !m.is_finite()) {
+        return Err(SequoiaError::invalid_param(
+            "base_score",
+            format!("estimated intercept is not finite ({base_margins:?}); check the labels"),
+        ));
+    }
 
+    // The model records the objective's own name and output count (not the
+    // configured string / `num_class`): a `reg:linear` alias is saved as
+    // `reg:squarederror` like XGBoost does, and a custom objective's outputs
+    // determine the tree layout even though `num_class` is 0.
     let mut model = BoostedModel::new(
-        base_margin,
-        params.objective.clone(),
-        params.num_class,
-        n_features,
+        base_margins,
+        ModelSpec {
+            objective: objective.name().to_string(),
+            objective_params: ObjectiveParams::from_params(params),
+            num_class: params.num_class,
+            n_outputs: n_out,
+            n_features,
+        },
     );
 
     // The linear (`gblinear`) booster fits a coordinate-descent linear model
@@ -335,14 +383,14 @@ fn train_impl_inner(
         });
     }
 
-    let prepared = prepare_builder(params, dtrain)?;
+    let prepared = prepare_builder(params, dtrain, objective.const_hess())?;
 
     // Incremental margin caches (length rows × n_out). A dataset's per-instance
-    // `base_margin`, when present, overrides the scalar base score.
-    let mut train_margin = base_margins(dtrain, base_margin, n_out);
+    // `base_margin`, when present, overrides the per-output intercepts.
+    let mut train_margin = model.initial_margins(dtrain);
     let mut eval_margins: Vec<Vec<f32>> = evals
         .iter()
-        .map(|(d, _)| base_margins(d, base_margin, n_out))
+        .map(|(d, _)| model.initial_margins(d))
         .collect();
 
     // A caller-supplied metric replaces the configured/default metric list;
@@ -351,7 +399,7 @@ fn train_impl_inner(
         Some(m) => vec![m],
         None => create_metrics(
             &params.eval_metric,
-            objective.default_metric(),
+            &objective.default_metric(),
             params.num_class,
         )?,
     };
@@ -759,7 +807,9 @@ fn validate_dataset(
         }
     }
     let invalid = match params.objective.as_str() {
-        "binary:logistic" => labels.iter().any(|&y| y != 0.0 && y != 1.0),
+        // XGBoost `LogisticRegression::CheckLabel` (shared by `binary:logistic`
+        // and `reg:logistic`): probabilities in [0, 1], not only {0, 1}.
+        "binary:logistic" | "reg:logistic" => labels.iter().any(|&y| !(0.0..=1.0).contains(&y)),
         "multi:softmax" | "multi:softprob" => labels
             .iter()
             .any(|&y| y.fract() != 0.0 || y < 0.0 || y >= params.num_class as f32),
@@ -1158,6 +1208,61 @@ mod tests {
         for (a, b) in builtin.iter().zip(&custom) {
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
+    }
+
+    #[test]
+    fn custom_multi_output_objective_trains_with_stride_and_round_trips() {
+        use crate::objective::{CustomObjective, GradPair};
+        let d = step_dataset(80);
+        let n = d.n_rows();
+        let rounds = 5usize;
+
+        // Two outputs, `[row][output]` layout: output 0 fits the label, output 1
+        // fits its negation. Same data with mirrored targets, so the learned
+        // outputs must mirror each other.
+        let obj = CustomObjective::new("custom:two", 2, 0.0, "rmse", |preds, labels, w, out| {
+            for i in 0..labels.len() {
+                let wi = w.map_or(1.0, |ws| ws[i]);
+                out[2 * i] = GradPair::new((preds[2 * i] - labels[i]) * wi, wi);
+                out[2 * i + 1] = GradPair::new((preds[2 * i + 1] + labels[i]) * wi, wi);
+            }
+        });
+        let p = TrainingParams::builder().max_depth(2).build().unwrap();
+        let model = train_with_objective(&p, &d, rounds, Box::new(obj)).unwrap();
+
+        assert_eq!(model.n_outputs(), 2);
+        assert_eq!(model.base_scores().len(), 2);
+        assert_eq!(model.num_trees(), 2 * rounds);
+
+        let margin = model.predict_margin(&d).unwrap();
+        assert_eq!(margin.len(), 2 * n);
+        // Unknown objective name: `predict` falls back to raw margins.
+        assert_eq!(model.predict(&d).unwrap(), margin);
+
+        let labels = d.labels().unwrap();
+        let (mut err0, mut err1, mut err_init) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let (o0, o1) = (margin[2 * i], margin[2 * i + 1]);
+            assert!((o0 + o1).abs() < 1e-5, "row {i}: {o0} vs {o1} not mirrored");
+            err0 += (o0 - labels[i]).abs();
+            err1 += (o1 + labels[i]).abs();
+            err_init += labels[i].abs(); // initial margin is 0.0
+        }
+        assert!(
+            err0 < 0.5 * err_init,
+            "output 0 did not learn: {err0} vs {err_init}"
+        );
+        assert!(
+            err1 < 0.5 * err_init,
+            "output 1 did not learn: {err1} vs {err_init}"
+        );
+
+        let via_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
+        assert_eq!(via_json.n_outputs(), 2);
+        assert_eq!(via_json.predict_margin(&d).unwrap(), margin);
+        let via_bytes = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        assert_eq!(via_bytes.n_outputs(), 2);
+        assert_eq!(via_bytes.predict_margin(&d).unwrap(), margin);
     }
 
     #[test]
@@ -1694,6 +1799,47 @@ mod tests {
                 .map(|value| *value as u32)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// XGBoost's `LogisticRegression::CheckLabel` accepts any probability in
+    /// `[0, 1]` for both logistic objectives, and rejects anything outside.
+    #[test]
+    fn logistic_objectives_accept_probability_labels() {
+        let x: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
+        let soft = [0.25f32, 0.75, 0.0, 1.0, 0.5, 0.9, 0.1, 0.6];
+        for objective in ["reg:logistic", "binary:logistic"] {
+            let params = TrainingParams::builder()
+                .objective(objective)
+                .max_depth(2)
+                .build()
+                .unwrap();
+            let d = DMatrix::from_dense(&x, 8, 1)
+                .unwrap()
+                .with_labels(&soft)
+                .unwrap();
+            let model = train(&params, &d, 3).unwrap();
+            assert_eq!(model.objective(), objective);
+            assert!(model
+                .predict(&d)
+                .unwrap()
+                .iter()
+                .all(|p| (0.0..=1.0).contains(p)));
+            for bad in [1.5f32, -0.1] {
+                let mut labels = soft;
+                labels[0] = bad;
+                let d = DMatrix::from_dense(&x, 8, 1)
+                    .unwrap()
+                    .with_labels(&labels)
+                    .unwrap();
+                assert!(
+                    matches!(
+                        train(&params, &d, 3),
+                        Err(SequoiaError::InvalidParameter { .. })
+                    ),
+                    "{objective} should reject label {bad}"
+                );
+            }
+        }
     }
 
     #[test]

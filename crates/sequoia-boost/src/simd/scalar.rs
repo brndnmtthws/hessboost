@@ -50,9 +50,11 @@ pub(super) fn gamma_gradient(
     out: &mut [GradPair],
     range: std::ops::Range<usize>,
 ) {
+    // XGBoost `GammaDeviance`: `p = expf(x)`, `g = 1 - y / p`, `h = y / p`.
     for index in range {
         let weight = weights.map_or(1.0, |values| values[index]);
-        let scaled = labels[index] * (-preds[index]).exp();
+        let p = preds[index].exp();
+        let scaled = labels[index] / p;
         out[index] = GradPair::new((1.0 - scaled) * weight, scaled * weight);
     }
 }

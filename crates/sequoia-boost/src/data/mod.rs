@@ -5,6 +5,7 @@ pub mod ghist;
 mod loaders;
 mod meta;
 pub mod quantile;
+mod sketch;
 
 pub(crate) use dmatrix::is_missing;
 pub use dmatrix::{CscView, DMatrix, Entry};

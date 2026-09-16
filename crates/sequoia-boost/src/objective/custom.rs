@@ -23,7 +23,7 @@ impl CustomObjective {
     /// Build a custom objective.
     ///
     /// * `grad_fn`: `(margins, labels, weights, out)` fills `out` with gradients.
-    /// * `base`: the initial margin (base score).
+    /// * `base`: the initial margin (base score), used for every output.
     /// * `transform_fn`: optional prediction transform (identity if `None`).
     pub fn new(
         name: impl Into<String>,
@@ -78,12 +78,17 @@ impl Objective for CustomObjective {
         }
     }
 
-    fn base_margin(&self, _labels: &[f32], _weights: Option<&[f32]>) -> f32 {
-        self.base
+    fn base_margins(
+        &self,
+        _labels: &[f32],
+        _weights: Option<&[f32]>,
+        _group: Option<&crate::data::GroupInfo>,
+    ) -> Vec<f32> {
+        vec![self.base; self.n_outputs]
     }
 
-    fn default_metric(&self) -> &str {
-        &self.default_metric
+    fn default_metric(&self) -> String {
+        self.default_metric.clone()
     }
 }
 

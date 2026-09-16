@@ -9,6 +9,7 @@
 //! cargo test -p sequoia-boost --test parity -- --ignored
 //! ```
 
+use sequoia_boost::metric::Rmse;
 use sequoia_boost::prelude::*;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -112,14 +113,7 @@ fn run_fixture(fx: &Fixture) -> bool {
         // sequoia within 2 accuracy points of xgboost.
         ("accuracy", s, x, s >= x - 0.02)
     } else {
-        let rmse = |p: &[f32]| -> f64 {
-            let s: f64 = p
-                .iter()
-                .zip(&fx.y_test)
-                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
-                .sum();
-            (s / fx.y_test.len() as f64).sqrt()
-        };
+        let rmse = |p: &[f32]| Rmse.eval(p, &fx.y_test, None);
         let (s, x) = (rmse(&preds), rmse(&fx.xgb_pred));
         // sequoia RMSE within 8% of xgboost's.
         ("rmse", s, x, s <= x * 1.08 + 1e-6)

@@ -2,10 +2,13 @@
 //!
 //! For each feature we compute up to `max_bin` cut points from the (non-missing)
 //! value distribution, then map any value to a bin with an `upper_bound` search
-//! (`bin = #{cuts ≤ value}`, clamped). Cuts are computed **once** from the data,
-//! matching XGBoost's `tree_method=hist`. A trailing sentinel cut just above each
-//! feature's maximum guarantees the maximum value gets its own bin (no clamp
-//! collision), so bin index `0` may be empty. This is harmless and cheap.
+//! (`bin = #{cuts ≤ value}`, clamped). With `tree_method=hist` the cuts are
+//! computed **once** from the data ([`HistCuts::from_dmatrix`]); with
+//! `tree_method=approx` they are recomputed each boosting round from the
+//! current Hessians ([`HistCuts::from_dmatrix_weighted`]). A trailing sentinel
+//! cut just above each feature's maximum guarantees the maximum value gets its
+//! own bin (no clamp collision), so bin index `0` may be empty. This is
+//! harmless and cheap.
 
 use crate::data::meta::FeatureType;
 use crate::data::DMatrix;
@@ -29,6 +32,43 @@ pub struct HistCuts {
     /// Per-feature flag: `true` when the feature is categorical and its bins map
     /// one category value each (no threshold semantics). Length `n_features`.
     is_categorical: Vec<bool>,
+}
+
+/// Whether feature `f` is categorical per the dataset's feature types.
+fn is_cat(ftypes: &[FeatureType], f: usize) -> bool {
+    ftypes.get(f).copied() == Some(FeatureType::Categorical)
+}
+
+/// Accumulates per-feature cuts and their offsets, then assembles the final
+/// [`HistCuts`].
+struct CutAssembler {
+    feature_offset: Vec<u32>,
+    cut_values: Vec<f32>,
+}
+
+impl CutAssembler {
+    fn new(n_features: usize) -> Self {
+        let mut feature_offset = Vec::with_capacity(n_features + 1);
+        feature_offset.push(0u32);
+        CutAssembler {
+            feature_offset,
+            cut_values: Vec::new(),
+        }
+    }
+
+    /// Close the current feature: its cuts end at the current length.
+    fn finish_feature(&mut self) {
+        self.feature_offset.push(self.cut_values.len() as u32);
+    }
+
+    fn assemble(self, n_features: usize, is_categorical: Vec<bool>) -> HistCuts {
+        HistCuts {
+            n_features,
+            feature_offset: self.feature_offset,
+            cut_values: self.cut_values,
+            is_categorical,
+        }
+    }
 }
 
 /// Global bin index for an `upper_bound` count `local` within a feature owning
@@ -59,12 +99,8 @@ impl HistCuts {
         };
         let missing = data.missing();
         let ftypes = data.feature_types();
-        let mut feature_offset = Vec::with_capacity(n_features + 1);
-        feature_offset.push(0u32);
-        let mut cut_values: Vec<f32> = Vec::new();
-        let is_categorical: Vec<bool> = (0..n_features)
-            .map(|f| ftypes.get(f).copied() == Some(FeatureType::Categorical))
-            .collect();
+        let mut assembler = CutAssembler::new(n_features);
+        let is_categorical: Vec<bool> = (0..n_features).map(|f| is_cat(ftypes, f)).collect();
         let build = |f, scratch: &mut (Vec<f32>, Vec<f32>), output: &mut Vec<f32>| {
             let (values, spare) = scratch;
             values.clear();
@@ -98,23 +134,18 @@ impl HistCuts {
                 })
                 .collect();
             for column in columns {
-                cut_values.extend(column);
-                feature_offset.push(cut_values.len() as u32);
+                assembler.cut_values.extend(column);
+                assembler.finish_feature();
             }
         } else {
             let mut scratch = Default::default();
             for f in 0..n_features {
-                build(f, &mut scratch, &mut cut_values);
-                feature_offset.push(cut_values.len() as u32);
+                build(f, &mut scratch, &mut assembler.cut_values);
+                assembler.finish_feature();
             }
         }
 
-        HistCuts {
-            n_features,
-            feature_offset,
-            cut_values,
-            is_categorical,
-        }
+        assembler.assemble(n_features, is_categorical)
     }
 
     /// Compute **hessian-weighted** cuts, as XGBoost's `tree_method=approx` does
@@ -130,9 +161,7 @@ impl HistCuts {
         let csc = data.to_csc();
         let n_features = csc.n_cols();
         let ftypes = data.feature_types();
-        let mut feature_offset = Vec::with_capacity(n_features + 1);
-        feature_offset.push(0u32);
-        let mut cut_values: Vec<f32> = Vec::new();
+        let mut assembler = CutAssembler::new(n_features);
         let mut is_categorical = vec![false; n_features];
 
         let mut cat_scratch: Vec<f32> = Vec::new();
@@ -141,13 +170,13 @@ impl HistCuts {
         #[allow(clippy::needless_range_loop)]
         for f in 0..n_features {
             let (rows, vals) = csc.column(f);
-            if ftypes.get(f).copied() == Some(FeatureType::Categorical) {
+            if is_cat(ftypes, f) {
                 // Categorical binning ignores weights (one bin per category).
                 is_categorical[f] = true;
                 cat_scratch.clear();
                 cat_scratch.extend_from_slice(vals);
                 sort_values(&mut cat_scratch, &mut cat_spare);
-                build_categorical_cuts(&cat_scratch, &mut cut_values);
+                build_categorical_cuts(&cat_scratch, &mut assembler.cut_values);
             } else {
                 // Pair each value with its instance's Hessian, then sort by value.
                 scratch.clear();
@@ -157,17 +186,12 @@ impl HistCuts {
                         .map(|(&r, &v)| (v, hessians[r as usize])),
                 );
                 scratch.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                build_feature_cuts_weighted(&scratch, max_bin, &mut cut_values);
+                build_feature_cuts_weighted(&scratch, max_bin, &mut assembler.cut_values);
             }
-            feature_offset.push(cut_values.len() as u32);
+            assembler.finish_feature();
         }
 
-        HistCuts {
-            n_features,
-            feature_offset,
-            cut_values,
-            is_categorical,
-        }
+        assembler.assemble(n_features, is_categorical)
     }
 
     /// Whether feature `f` is categorical (bins map one category value each).
@@ -385,6 +409,51 @@ fn sort_values(values: &mut Vec<f32>, spare: &mut Vec<f32>) {
     }
 }
 
+/// Number of distinct values in the ascending `sorted` (must be non-empty),
+/// comparing the projected value. Counts without allocating a second vector.
+fn distinct_count<T: Copy>(sorted: &[T], value_of: impl Fn(T) -> f32) -> usize {
+    let mut distinct = 1usize;
+    for w in sorted.windows(2) {
+        if value_of(w[0]) != value_of(w[1]) {
+            distinct += 1;
+        }
+    }
+    distinct
+}
+
+/// Append each distinct value of the ascending `sorted` (projected by
+/// `value_of`) to `out`. `sorted` must be non-empty.
+fn push_distinct_values<T: Copy>(sorted: &[T], out: &mut Vec<f32>, value_of: impl Fn(T) -> f32) {
+    out.push(value_of(sorted[0]));
+    for w in sorted.windows(2) {
+        if value_of(w[0]) != value_of(w[1]) {
+            out.push(value_of(w[1]));
+        }
+    }
+}
+
+/// Append cuts at the `max_bin` uniform quantile positions of the ascending
+/// `values` (projected by `value_of`), skipping positions that repeat the
+/// previously pushed cut.
+fn push_uniform_quantile_cuts<T: Copy>(
+    values: &[T],
+    max_bin: usize,
+    out: &mut Vec<f32>,
+    value_of: impl Fn(T) -> f32,
+) {
+    let n = values.len();
+    let mut last_pushed = f32::NEG_INFINITY;
+    for b in 1..=max_bin {
+        let q = b as f64 / max_bin as f64;
+        let idx = (((q * n as f64).ceil() as usize).max(1) - 1).min(n - 1);
+        let v = value_of(values[idx]);
+        if v > last_pushed {
+            out.push(v);
+            last_pushed = v;
+        }
+    }
+}
+
 /// Append one bin per distinct category value (ascending) for a categorical
 /// feature. Unlike numeric cuts, no sentinel is added: the bin *is* the
 /// category.
@@ -395,12 +464,7 @@ fn build_categorical_cuts(sorted_vals: &[f32], out: &mut Vec<f32>) {
         out.push(0.0);
         return;
     }
-    out.push(sorted_vals[0]);
-    for w in sorted_vals.windows(2) {
-        if w[0] != w[1] {
-            out.push(w[1]);
-        }
-    }
+    push_distinct_values(sorted_vals, out, |v| v);
 }
 
 /// Append feature cut values (ascending) for one feature to `out`.
@@ -413,36 +477,15 @@ fn build_feature_cuts(sorted_vals: &[f32], max_bin: usize, out: &mut Vec<f32>) {
     }
     let max_val = *sorted_vals.last().unwrap();
 
-    // Count distinct values without allocating a second vector.
-    let mut distinct = 1usize;
-    for w in sorted_vals.windows(2) {
-        if w[0] != w[1] {
-            distinct += 1;
-        }
-    }
+    let distinct = distinct_count(sorted_vals, |v| v);
 
     let start = out.len();
     if distinct <= max_bin {
         // Use each distinct value as a cut.
-        out.push(sorted_vals[0]);
-        for w in sorted_vals.windows(2) {
-            if w[0] != w[1] {
-                out.push(w[1]);
-            }
-        }
+        push_distinct_values(sorted_vals, out, |v| v);
     } else {
         // Weighted-uniform quantiles over the sorted values.
-        let n = sorted_vals.len();
-        let mut last_pushed = f32::NEG_INFINITY;
-        for b in 1..=max_bin {
-            let q = b as f64 / max_bin as f64;
-            let idx = (((q * n as f64).ceil() as usize).max(1) - 1).min(n - 1);
-            let v = sorted_vals[idx];
-            if v > last_pushed {
-                out.push(v);
-                last_pushed = v;
-            }
-        }
+        push_uniform_quantile_cuts(sorted_vals, max_bin, out, |v| v);
     }
     push_max_sentinel(out, max_val);
     debug_assert!(out.len() > start);
@@ -464,31 +507,21 @@ fn build_feature_cuts_weighted(sorted: &[(f32, f32)], max_bin: usize, out: &mut 
     let max_val = sorted.last().unwrap().0;
 
     // Count distinct values (compared on value only).
-    let mut distinct = 1usize;
-    for w in sorted.windows(2) {
-        if w[0].0 != w[1].0 {
-            distinct += 1;
-        }
-    }
+    let distinct = distinct_count(sorted, |p| p.0);
 
     let start = out.len();
     if distinct <= max_bin {
         // Use each distinct value as a cut (weights irrelevant here).
-        out.push(sorted[0].0);
-        for w in sorted.windows(2) {
-            if w[0].0 != w[1].0 {
-                out.push(w[1].0);
-            }
-        }
+        push_distinct_values(sorted, out, |p| p.0);
     } else {
         let total: f64 = sorted.iter().map(|&(_, w)| w as f64).sum();
-        let mut last_pushed = f32::NEG_INFINITY;
         if total > 0.0 {
             // Weighted quantiles: place cut `b` at the value where the running
             // weight first reaches `b/max_bin` of the total weight.
             let step = total / max_bin as f64;
             let mut cum = 0.0f64;
             let mut b = 1usize;
+            let mut last_pushed = f32::NEG_INFINITY;
             for &(v, w) in sorted {
                 cum += w as f64;
                 while b <= max_bin && cum + 1e-12 >= b as f64 * step {
@@ -501,16 +534,7 @@ fn build_feature_cuts_weighted(sorted: &[(f32, f32)], max_bin: usize, out: &mut 
             }
         } else {
             // Degenerate all-zero weights: fall back to unweighted positions.
-            let n = sorted.len();
-            for b in 1..=max_bin {
-                let q = b as f64 / max_bin as f64;
-                let idx = (((q * n as f64).ceil() as usize).max(1) - 1).min(n - 1);
-                let v = sorted[idx].0;
-                if v > last_pushed {
-                    out.push(v);
-                    last_pushed = v;
-                }
-            }
+            push_uniform_quantile_cuts(sorted, max_bin, out, |p| p.0);
         }
     }
     push_max_sentinel(out, max_val);

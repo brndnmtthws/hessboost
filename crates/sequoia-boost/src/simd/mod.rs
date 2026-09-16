@@ -24,6 +24,15 @@ mod x86_64;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const MIN_SIMD_LEN: usize = 16;
 
+// Layout contracts the deinterleaving vector loads and stores rely on.
+const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());
+const _: () = assert!(std::mem::size_of::<GradStats>() == 2 * std::mem::size_of::<f64>());
+
+/// Inputs with a larger magnitude take the scalar path in the fast
+/// exponential, sigmoid, and softmax kernels.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const MAX_FAST_EXP_INPUT: f32 = 80.0;
+
 #[cfg(target_arch = "aarch64")]
 static NEON_AVAILABLE: LazyLock<bool> =
     LazyLock::new(|| std::arch::is_aarch64_feature_detected!("neon"));
@@ -57,15 +66,16 @@ macro_rules! dispatch_unary_inplace {
 /// Run the per-arch gradient kernel when `$gate` (length plus
 /// `gradient_slices_cover`) holds, falling through to the caller's scalar
 /// tail otherwise. The three-arm form also dispatches the x86_64 kernel; the
-/// two-arm form is NEON-only for kernels with no x86_64 counterpart.
+/// two-arm form is NEON-only for kernels with no x86_64 counterpart. Both
+/// forms return the kernel's value, so `()`-valued gradient kernels and
+/// `(f64, f64)`-valued metric-sum kernels share the same expansion.
 macro_rules! dispatch_gradient {
     ($gate:expr, $neon_call:expr) => {
         #[cfg(target_arch = "aarch64")]
         if $gate && neon_available() {
             // SAFETY: NEON is present and the gate's cover check proves every
             // input and output slice spans the dispatched length.
-            unsafe { $neon_call };
-            return;
+            return unsafe { $neon_call };
         }
     };
     ($gate:expr, $neon_call:expr, $avx_call:expr) => {
@@ -76,20 +86,6 @@ macro_rules! dispatch_gradient {
             // every input and output slice spans the dispatched length.
             unsafe { $avx_call };
             return;
-        }
-    };
-}
-
-/// Run the NEON metric-sum kernel when `$gate` holds, falling through to the
-/// caller's scalar tail otherwise. Callers spell the full gate (length plus
-/// cover/validity checks) so dispatch conditions stay exactly as before.
-macro_rules! dispatch_metric_sum {
-    ($gate:expr, $neon_call:expr) => {
-        #[cfg(target_arch = "aarch64")]
-        if $gate && neon_available() {
-            // SAFETY: NEON is present and the gate's cover check proves every
-            // input slice spans the dispatched length.
-            return unsafe { $neon_call };
         }
     };
 }
@@ -106,6 +102,20 @@ pub(crate) struct SplitCandidate {
 pub(crate) enum DenseSplitScan {
     ScalarFallback,
     Scanned(Option<SplitCandidate>),
+}
+
+/// Relative slack applied to the division-free prefilter threshold. Both the
+/// cross-multiplied test and the exact quotient test round to within a few
+/// ULPs, so this margin guarantees the prefilter never rejects a candidate the
+/// exact comparison would accept. False positives merely pay for a division.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(super) const PREFILTER_SLACK: f64 = 1e-9;
+
+/// Scaled `gain(L) + gain(R)` a candidate must exceed to beat `best_loss`.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[inline]
+pub(super) fn prefilter_target(best_loss: f64, comparison_epsilon: f64, parent_gain: f64) -> f64 {
+    (best_loss + comparison_epsilon + parent_gain) * (1.0 - PREFILTER_SLACK)
 }
 
 /// Resolve the process-wide AArch64 backend lazily on the first numeric-kernel
@@ -193,7 +203,7 @@ fn sigmoid_scalar(x: f32) -> f32 {
 
 #[inline]
 pub(crate) fn sum_grad_stats(values: &[GradStats]) -> GradStats {
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         values.len() >= MIN_SIMD_LEN,
         aarch64::sum_grad_stats(values)
     );
@@ -443,14 +453,36 @@ pub(crate) fn softmax_gradient(
     }
 
     debug_assert!(complete);
-    for row in 0..labels.len() {
-        let base = row * num_class;
+    softmax_gradient_rows_scalar(
+        preds,
+        labels,
+        weights,
+        min_hess,
+        out,
+        0..labels.len(),
+        num_class,
+    );
+}
+
+/// Scalar softmax gradient over the given rows of a complete row-major
+/// prediction matrix; the remainder path of the short-row vector kernels.
+pub(super) fn softmax_gradient_rows_scalar(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    min_hess: f32,
+    out: &mut [GradPair],
+    rows: std::ops::Range<usize>,
+    k: usize,
+) {
+    for current in rows {
+        let base = current * k;
         softmax_gradient_row_scalar(
-            &preds[base..base + num_class],
-            labels[row] as usize,
-            weights.map_or(1.0, |values| values[row]),
+            &preds[base..base + k],
+            labels[current] as usize,
+            weights.map_or(1.0, |values| values[current]),
             min_hess,
-            &mut out[base..base + num_class],
+            &mut out[base..base + k],
         );
     }
 }
@@ -522,25 +554,12 @@ fn distance_sum<const SQUARED: bool>(
     labels: &[f32],
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
         aarch64::distance_sum::<SQUARED>(preds, labels, weights)
     );
 
-    let mut sum = 0.0;
-    let mut weight_sum = 0.0;
-    for i in 0..preds.len() {
-        let weight = weights.map_or(1.0, |values| values[i] as f64);
-        let difference = preds[i] as f64 - labels[i] as f64;
-        let distance = if SQUARED {
-            difference * difference
-        } else {
-            difference.abs()
-        };
-        sum += weight * distance;
-        weight_sum += weight;
-    }
-    (sum, weight_sum)
+    scalar::distance_sum::<SQUARED>(preds, labels, weights, 0..preds.len())
 }
 
 pub(crate) fn classification_error_sum(
@@ -548,25 +567,16 @@ pub(crate) fn classification_error_sum(
     labels: &[f32],
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
         aarch64::classification_error_sum(preds, labels, weights)
     );
 
-    let mut wrong = 0.0;
-    let mut weight_sum = 0.0;
-    for i in 0..preds.len() {
-        let weight = weights.map_or(1.0, |values| values[i] as f64);
-        if (preds[i] > 0.5) != (labels[i] > 0.5) {
-            wrong += weight;
-        }
-        weight_sum += weight;
-    }
-    (wrong, weight_sum)
+    scalar::classification_error_sum(preds, labels, weights, 0..preds.len())
 }
 
 pub(crate) fn log_loss_sum(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> (f64, f64) {
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
         aarch64::log_loss_sum(preds, labels, weights)
     );
@@ -579,7 +589,7 @@ pub(crate) fn positive_nloglik_sum<const GAMMA: bool>(
     labels: &[f32],
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
         aarch64::positive_nloglik_sum::<GAMMA>(preds, labels, weights)
     );
@@ -593,7 +603,7 @@ pub(crate) fn tweedie_nloglik_sum(
     weights: Option<&[f32]>,
     rho: f64,
 ) -> (f64, f64) {
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         rho.is_finite()
             && rho > 1.0
             && rho < 2.0
@@ -636,7 +646,7 @@ pub(crate) fn multiclass_log_loss_sum(
         .checked_mul(num_class)
         .is_some_and(|len| preds.len() >= len)
         && weights.is_none_or(|values| values.len() >= labels.len());
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         labels.len() >= MIN_SIMD_LEN && complete,
         aarch64::multiclass_log_loss_sum(preds, labels, weights, num_class)
     );
@@ -674,7 +684,7 @@ pub(crate) fn multiclass_error_sum(
         .checked_mul(num_class)
         .is_some_and(|len| preds.len() >= len)
         && weights.is_none_or(|values| values.len() >= labels.len());
-    dispatch_metric_sum!(
+    dispatch_gradient!(
         num_class >= 8
             && num_class <= u32::MAX as usize
             && labels.len() >= MIN_SIMD_LEN
@@ -692,12 +702,24 @@ fn multiclass_error_sum_scalar(
     weights: Option<&[f32]>,
     num_class: usize,
 ) -> (f64, f64) {
+    multiclass_error_sum_rows(preds, labels, weights, num_class, argmax_scalar)
+}
+
+/// Row loop of the multiclass error sum, parameterized on the argmax so the
+/// NEON kernel can reuse it with its vectorized `argmax`.
+pub(super) fn multiclass_error_sum_rows(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    num_class: usize,
+    argmax: impl Fn(&[f32]) -> usize,
+) -> (f64, f64) {
     let mut wrong = 0.0;
     let mut weight_sum = 0.0;
     for (row_index, &label) in labels.iter().enumerate() {
         let weight = weights.map_or(1.0, |values| values[row_index] as f64);
         let row = &preds[row_index * num_class..(row_index + 1) * num_class];
-        let best = argmax_scalar(row);
+        let best = argmax(row);
         if best != label as usize {
             wrong += weight;
         }

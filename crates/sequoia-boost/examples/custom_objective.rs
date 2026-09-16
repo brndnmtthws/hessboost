@@ -1,17 +1,19 @@
 //! Bring-your-own loss and metric: the custom-objective and custom-metric hooks.
 //! Run: `cargo run --release --example custom_objective`.
 
+use sequoia_boost::metric::Rmse;
 use sequoia_boost::prelude::*;
+
+mod common;
+use common::{fill_random, lcg};
 
 fn main() -> Result<()> {
     let (n, f) = (800usize, 3usize);
     let mut rng = lcg(5);
     let mut x = vec![0f32; n * f];
     let mut y = vec![0f32; n];
+    fill_random(&mut rng, &mut x);
     for i in 0..n {
-        for j in 0..f {
-            x[i * f + j] = rng();
-        }
         y[i] = 1.5 * x[i * f] - x[i * f + 1];
     }
     let d = DMatrix::from_dense(&x, n, f)?.with_labels(&y)?;
@@ -33,13 +35,7 @@ fn main() -> Result<()> {
     );
     let model = train_with_objective(&params, &d, 60, Box::new(obj))?;
     let preds = model.predict(&d)?;
-    let rmse = (preds
-        .iter()
-        .zip(&y)
-        .map(|(a, b)| (a - b).powi(2))
-        .sum::<f32>()
-        / n as f32)
-        .sqrt();
+    let rmse = Rmse.eval(&preds, &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
 
     // --- Custom metric: mean absolute error, used for early stopping. ---
@@ -64,14 +60,4 @@ fn main() -> Result<()> {
         out.history.last().unwrap().scores.last().unwrap().2
     );
     Ok(())
-}
-
-fn lcg(seed: u64) -> impl FnMut() -> f32 {
-    let mut s = seed;
-    move || {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((s >> 33) as f32) / (1u32 << 31) as f32
-    }
 }

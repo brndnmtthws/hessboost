@@ -3,18 +3,13 @@
 //! transcendental kernels mirror the NEON formulas and stay within a few f32
 //! ULPs of the scalar library functions.
 
-use super::{scalar, sigmoid_scalar, SplitCandidate};
+use super::{prefilter_target, scalar, sigmoid_scalar, SplitCandidate, MAX_FAST_EXP_INPUT};
 use crate::objective::GradPair;
 use crate::tree::gain::{calc_gain, GradStats, RegParams};
 use std::arch::x86_64::*;
 
-const _: () = assert!(std::mem::size_of::<GradStats>() == 2 * std::mem::size_of::<f64>());
-const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());
-
 /// f32 lanes per vector.
 const WIDTH: usize = 8;
-/// Inputs with a larger magnitude take the scalar path, as on NEON.
-const MAX_FAST_EXP_INPUT: f32 = 80.0;
 
 /// Exponential for finite f32 lanes in [-80, 80]: range reduction to
 /// [-ln(2)/2, ln(2)/2] and a seventh-order polynomial (Estrin pairs for
@@ -104,50 +99,38 @@ unsafe fn store_pairs(dest: *mut GradPair, grad: __m256, hess: __m256) {
     }
 }
 
-#[target_feature(enable = "avx2,fma")]
-pub(super) unsafe fn exp_inplace(values: &mut [f32]) {
-    // SAFETY: the caller guarantees AVX2/FMA support; every vector access is
-    // bounded by the loop condition.
-    unsafe {
-        let mut index = 0;
-        while index + WIDTH <= values.len() {
-            let input = _mm256_loadu_ps(values.as_ptr().add(index));
-            if regular_input(input) {
-                _mm256_storeu_ps(values.as_mut_ptr().add(index), exp_f32(input));
-            } else {
-                for value in &mut values[index..index + WIDTH] {
-                    *value = value.exp();
+/// Vector-loop shell of a `&mut [f32]` unary inplace kernel: vector fast path
+/// for regular lanes, scalar per-lane fallback otherwise. The kernel and
+/// scalar formulas (intrinsics included) are passed in as expressions.
+macro_rules! unary_inplace_kernel {
+    ($name:ident, $kernel:expr, $scalar:expr) => {
+        #[target_feature(enable = "avx2,fma")]
+        pub(super) unsafe fn $name(values: &mut [f32]) {
+            // SAFETY: the caller guarantees AVX2/FMA support; every vector
+            // access is bounded by the loop condition.
+            unsafe {
+                let mut index = 0;
+                while index + WIDTH <= values.len() {
+                    let input = _mm256_loadu_ps(values.as_ptr().add(index));
+                    if regular_input(input) {
+                        _mm256_storeu_ps(values.as_mut_ptr().add(index), ($kernel)(input));
+                    } else {
+                        for value in &mut values[index..index + WIDTH] {
+                            *value = ($scalar)(*value);
+                        }
+                    }
+                    index += WIDTH;
+                }
+                for value in &mut values[index..] {
+                    *value = ($scalar)(*value);
                 }
             }
-            index += WIDTH;
         }
-        for value in &mut values[index..] {
-            *value = value.exp();
-        }
-    }
+    };
 }
 
-#[target_feature(enable = "avx2,fma")]
-pub(super) unsafe fn sigmoid_inplace(values: &mut [f32]) {
-    // SAFETY: as `exp_inplace`.
-    unsafe {
-        let mut index = 0;
-        while index + WIDTH <= values.len() {
-            let input = _mm256_loadu_ps(values.as_ptr().add(index));
-            if regular_input(input) {
-                _mm256_storeu_ps(values.as_mut_ptr().add(index), sigmoid_f32(input));
-            } else {
-                for value in &mut values[index..index + WIDTH] {
-                    *value = sigmoid_scalar(*value);
-                }
-            }
-            index += WIDTH;
-        }
-        for value in &mut values[index..] {
-            *value = sigmoid_scalar(*value);
-        }
-    }
-}
+unary_inplace_kernel!(exp_inplace, exp_f32, f32::exp);
+unary_inplace_kernel!(sigmoid_inplace, sigmoid_f32, sigmoid_scalar);
 
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn logistic_gradient(
@@ -370,48 +353,33 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
                     store_pairs(out.as_mut_ptr().add(base), grad, hess);
                 }
                 None => {
-                    for current in row..row + rows_per_batch {
-                        let base = current * K;
-                        super::softmax_gradient_row_scalar(
-                            &preds[base..base + K],
-                            labels[current] as usize,
-                            weights.map_or(1.0, |values| values[current]),
-                            min_hess,
-                            &mut out[base..base + K],
-                        );
-                    }
+                    super::softmax_gradient_rows_scalar(
+                        preds,
+                        labels,
+                        weights,
+                        min_hess,
+                        out,
+                        row..row + rows_per_batch,
+                        K,
+                    );
                 }
             }
             row += rows_per_batch;
         }
-        for current in row..labels.len() {
-            let base = current * K;
-            super::softmax_gradient_row_scalar(
-                &preds[base..base + K],
-                labels[current] as usize,
-                weights.map_or(1.0, |values| values[current]),
-                min_hess,
-                &mut out[base..base + K],
-            );
-        }
+        super::softmax_gradient_rows_scalar(
+            preds,
+            labels,
+            weights,
+            min_hess,
+            out,
+            row..labels.len(),
+            K,
+        );
     }
 }
 
 /// Candidates examined per vector iteration (one `f64` lane each).
 const CANDIDATES: usize = 4;
-
-/// Relative slack applied to the division-free prefilter threshold. The
-/// cross-multiplied test and the exact quotient test each round to within a
-/// few ULPs, so this margin guarantees the prefilter never rejects a candidate
-/// the exact comparison would accept. False positives merely pay for a
-/// division.
-const PREFILTER_SLACK: f64 = 1e-9;
-
-/// Scaled `gain(L) + gain(R)` a candidate must exceed to beat `best_loss`.
-#[inline]
-fn prefilter_target(best_loss: f64, comparison_epsilon: f64, parent_gain: f64) -> f64 {
-    (best_loss + comparison_epsilon + parent_gain) * (1.0 - PREFILTER_SLACK)
-}
 
 /// Incumbent of one feature's scan plus the fixed inputs of the exact check.
 struct Scan<'a> {
@@ -478,7 +446,7 @@ unsafe fn numerator<const L1: bool>(gradient: __m256d, alpha: __m256d) -> __m256
 }
 
 /// Lanes holding a normal, finite, positive value: the range in which the
-/// relative rounding-error bounds behind [`PREFILTER_SLACK`] hold.
+/// relative rounding-error bounds behind [`super::PREFILTER_SLACK`] hold.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn normal_positive(values: __m256d) -> __m256d {

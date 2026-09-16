@@ -229,7 +229,7 @@ impl CompactForest {
         let mut max_feature = 0u32;
         for &old in &order {
             let n = &src[old as usize];
-            let id = base + self.nodes.len() as u32 - base;
+            let id = self.nodes.len() as u32;
             depth = depth.max(depth_of[old as usize]);
             let node = if n.is_leaf() {
                 CNode {

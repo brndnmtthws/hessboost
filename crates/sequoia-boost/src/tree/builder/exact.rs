@@ -2,20 +2,20 @@
 //!
 //! For each node we scan every feature's value-sorted entries and evaluate every
 //! candidate threshold, trying both missing-value directions (sparsity-aware).
-//! This is the reference builder: not the fastest (the histogram builder in a
-//! later phase is), but the easiest to verify against XGBoost. Growth is
+//! This is the reference builder: not the fastest (the histogram builder is),
+//! but the easiest to verify against XGBoost. Growth is
 //! level-wise (depth-wise): a whole level is scanned per feature pass.
 //!
 //! Monotone and interaction constraints are honored during split search.
 
 use super::{
-    build_interaction_sets, eval_missing_directions, next_allowed, sweep_categorical, BestSplit,
-    SplitPos,
+    build_interaction_sets, eval_missing_directions, finalize_leaf_values, next_allowed, permits,
+    sum_rows, sweep_categorical, BestSplit, SplitPos,
 };
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
-use crate::tree::constraints::{calc_weight_bounded, child_bounds, Bounds, MonotoneConstraints};
+use crate::tree::constraints::{child_bounds, Bounds, MonotoneConstraints};
 use crate::tree::gain::{calc_weight, GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
@@ -138,12 +138,10 @@ impl<'a> ExactTreeBuilder<'a> {
 
         // node_of_row[r] = current node id for row r, or -1 if r is not sampled.
         let mut node_of_row = vec![-1i32; n_rows];
-        let mut root = GradStats::default();
         for &r in row_subset {
             node_of_row[r as usize] = 0;
-            let gp = gpair[r as usize];
-            root.add(GradStats::new(gp.grad as f64, gp.hess as f64));
         }
+        let root = sum_rows(gpair, row_subset);
 
         let mut tree = RegTree::with_root(root.hess as f32);
         let mut node_stats: Vec<GradStats> = vec![root];
@@ -215,7 +213,7 @@ impl<'a> ExactTreeBuilder<'a> {
                         cat_stats[slot]
                             .entry(val as u32)
                             .or_default()
-                            .add(GradStats::new(gp.grad as f64, gp.hess as f64));
+                            .add(GradStats::from_pair(gp));
                     }
                     for (slot, &nid) in active.iter().enumerate() {
                         if !permits(node_allowed[nid].as_deref(), f) {
@@ -256,7 +254,7 @@ impl<'a> ExactTreeBuilder<'a> {
                         continue;
                     }
                     let gp = gpair[r];
-                    present_total[slot].add(GradStats::new(gp.grad as f64, gp.hess as f64));
+                    present_total[slot].add(GradStats::from_pair(gp));
                 }
 
                 // Pass 2: enumerate thresholds, trying both missing directions.
@@ -293,24 +291,19 @@ impl<'a> ExactTreeBuilder<'a> {
                         );
                     }
                     let gp = gpair[r];
-                    acc[slot].add(GradStats::new(gp.grad as f64, gp.hess as f64));
+                    acc[slot].add(GradStats::from_pair(gp));
                     last_val[slot] = val;
                     has[slot] = true;
                 }
             }
 
-            let gamma = self.params.gamma;
             let mut next_active = Vec::new();
             let mut splits: Vec<Split> = Vec::new();
 
             for &nid in &active {
                 let slot = slot_of_node[nid];
                 let b = &best[slot];
-                let valid = b.found()
-                    && b.loss_chg > gamma
-                    && b.left.hess >= self.reg.min_child_weight
-                    && b.right.hess >= self.reg.min_child_weight;
-                if !valid {
+                if !b.valid(self.params.gamma, self.reg.min_child_weight) {
                     continue; // stays a leaf; value finalized below
                 }
 
@@ -319,6 +312,10 @@ impl<'a> ExactTreeBuilder<'a> {
                 let (lb_bounds, rb_bounds) =
                     child_bounds(node_bounds[nid], dir, b.w_left, b.w_right);
 
+                // Unconstrained children carry their closed-form weight, so the
+                // `leaf_value` field of nodes that later split records the value
+                // they had as a leaf at expansion time (matching the histogram
+                // builder). Leaves are overwritten by the finalize pass below.
                 let (lw, rw) = if constrained {
                     (b.w_left as f32, b.w_right as f32)
                 } else {
@@ -420,13 +417,7 @@ impl<'a> ExactTreeBuilder<'a> {
         }
 
         // Finalize every leaf's weight (respecting each leaf's monotone bounds).
-        #[allow(clippy::needless_range_loop)]
-        for id in 0..tree.num_nodes() {
-            if tree.node(id).is_leaf() {
-                let w = calc_weight_bounded(node_stats[id], &self.reg, node_bounds[id]) as f32;
-                tree.set_leaf_value(id, w);
-            }
-        }
+        finalize_leaf_values(&mut tree, &node_stats, &node_bounds, &self.reg);
         tree
     }
 }
@@ -441,19 +432,11 @@ pub fn all_features(n_cols: usize) -> Vec<u32> {
     (0..n_cols as u32).collect()
 }
 
-#[inline]
-fn permits(allowed: Option<&[u32]>, feature: u32) -> bool {
-    allowed.is_none_or(|features| features.binary_search(&feature).is_ok())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{gp, monotone_v_shape_data};
     use super::*;
     use crate::config::TrainingParams;
-
-    fn gp(grad: f32, hess: f32) -> GradPair {
-        GradPair::new(grad, hess)
-    }
 
     /// A clean separable problem: feature 0 perfectly separates the sign of the
     /// gradient at threshold 0.5, so the root should split there.
@@ -550,17 +533,8 @@ mod tests {
     #[test]
     fn monotone_increasing_is_enforced() {
         use crate::config::Monotone;
-        // Data where the *unconstrained* fit would be non-monotone: a V shape.
-        let n = 60;
-        let mut x = Vec::new();
-        let mut gpair = Vec::new();
-        for i in 0..n {
-            let xi = i as f32 / n as f32;
-            x.push(xi);
-            let target = (xi - 0.5).abs(); // V shape, non-monotone
-            gpair.push(gp(-(target - 0.25), 1.0));
-        }
-        let data = DMatrix::from_dense(&x, n, 1).unwrap();
+        let (data, gpair) = monotone_v_shape_data();
+        let n = data.n_rows();
         let cols = SortedColumns::from_dmatrix(&data);
         let params = TrainingParams::builder()
             .max_depth(4)
@@ -580,11 +554,11 @@ mod tests {
 
         // Predictions must be non-decreasing in x under the increasing constraint.
         let mut prev = f32::NEG_INFINITY;
-        for (i, &xi) in x.iter().enumerate() {
+        for i in 0..n {
             let p = tree.predict_row(&data, i);
             assert!(
                 p >= prev - 1e-5,
-                "monotonicity violated at x={xi}: {p} < {prev}"
+                "monotonicity violated at row {i}: {p} < {prev}"
             );
             prev = p;
         }

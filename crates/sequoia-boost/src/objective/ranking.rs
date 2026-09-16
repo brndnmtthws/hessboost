@@ -15,7 +15,7 @@
 
 use super::{GradPair, Objective};
 use crate::data::GroupInfo;
-use crate::metric::{ndcg_discount, ndcg_gain};
+use crate::metric::{argsort_desc, group_ranges, ideal_dcg, ndcg_discount, ndcg_gain};
 
 /// Maximum number of document pairs formed per query group.
 ///
@@ -89,8 +89,9 @@ impl LambdaMartObjective {
         let labs: Vec<f64> = (start..end).map(|i| labels[i] as f64).collect();
 
         // Rank documents by descending score; `pos[local]` is the 0-based rank.
-        let mut order: Vec<usize> = (0..m).collect();
-        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+        // f32 -> f64 conversion preserves order, so sorting the f32 scores
+        // yields the same permutation as sorting the widened ones.
+        let order = argsort_desc(&preds[start..end]);
         let mut pos = vec![0usize; m];
         for (rank, &local) in order.iter().enumerate() {
             pos[local] = rank;
@@ -133,7 +134,7 @@ impl LambdaMartObjective {
                 // Pairwise-logistic gradient. rho = P(lo ranked above hi).
                 let rho = 1.0 / (1.0 + (s_hi - s_lo).exp());
                 let grad = (rho * delta) as f32;
-                let hess = (rho * (1.0 - rho) * delta).max(1e-16) as f32;
+                let hess = (rho * (1.0 - rho) * delta).max(super::MIN_HESS as f64) as f32;
 
                 // Push the relevant doc up (negative gradient) and the other down.
                 out[start + hi].grad -= grad;
@@ -158,14 +159,9 @@ impl LambdaMartObjective {
             *g = GradPair::default();
         }
 
-        match group {
-            Some(g) if g.num_rows() == preds.len() => {
-                for (start, end) in g.iter_ranges() {
-                    self.accumulate_group(preds, labels, start, end, out);
-                }
-            }
-            // No usable group info: treat the whole batch as one query.
-            _ => self.accumulate_group(preds, labels, 0, preds.len(), out),
+        // Without usable group info the whole batch is one query.
+        for (start, end) in group_ranges(preds.len(), group) {
+            self.accumulate_group(preds, labels, start, end, out);
         }
 
         // Optional per-document weighting of the aggregated gradient.
@@ -247,14 +243,7 @@ impl MetricCtx {
             RankMode::Pairwise => MetricCtx::Uniform,
             RankMode::Ndcg => {
                 let gains: Vec<f64> = labs.iter().map(|&l| ndcg_gain(l)).collect();
-                // Ideal DCG: gains sorted descending, standard log2 discount.
-                let mut ideal = gains.clone();
-                ideal.sort_by(|a, b| b.total_cmp(a));
-                let idcg: f64 = ideal
-                    .iter()
-                    .enumerate()
-                    .map(|(p, &g)| g * ndcg_discount(p))
-                    .sum();
+                let idcg = ideal_dcg(labs, labs.len());
                 MetricCtx::Ndcg {
                     gains,
                     pos: pos.to_vec(),

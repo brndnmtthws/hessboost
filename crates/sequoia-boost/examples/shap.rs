@@ -3,16 +3,17 @@
 
 use sequoia_boost::prelude::*;
 
+mod common;
+use common::{fill_random, lcg};
+
 fn main() -> Result<()> {
     // y = 2*x0 - 3*x1 + a small x0*x2 interaction.
     let (n, f) = (1000usize, 3usize);
     let mut rng = lcg(3);
     let mut x = vec![0f32; n * f];
     let mut y = vec![0f32; n];
+    fill_random(&mut rng, &mut x);
     for i in 0..n {
-        for j in 0..f {
-            x[i * f + j] = rng();
-        }
         y[i] = 2.0 * x[i * f] - 3.0 * x[i * f + 1] + x[i * f] * x[i * f + 2];
     }
     let d = DMatrix::from_dense(&x, n, f)?.with_labels(&y)?;
@@ -39,14 +40,4 @@ fn main() -> Result<()> {
     let m = |row: usize, i: usize, j: usize| inter[row * w2 + i * width + j];
     println!("row 0 interaction[0][2] = {:.4}", m(0, 0, 2));
     Ok(())
-}
-
-fn lcg(seed: u64) -> impl FnMut() -> f32 {
-    let mut s = seed;
-    move || {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((s >> 33) as f32) / (1u32 << 31) as f32
-    }
 }

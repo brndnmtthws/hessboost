@@ -3,6 +3,9 @@
 
 use sequoia_boost::prelude::*;
 
+mod common;
+use common::lcg;
+
 fn main() -> Result<()> {
     // `n_groups` queries, each with `per` documents. A document's single feature
     // is correlated with its relevance grade (0..per-1), plus noise.
@@ -41,14 +44,4 @@ fn main() -> Result<()> {
         ndcg(out.history.last().unwrap())
     );
     Ok(())
-}
-
-fn lcg(seed: u64) -> impl FnMut() -> f32 {
-    let mut s = seed;
-    move || {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((s >> 33) as f32) / (1u32 << 31) as f32
-    }
 }

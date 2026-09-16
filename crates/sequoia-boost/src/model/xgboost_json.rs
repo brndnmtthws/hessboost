@@ -178,16 +178,6 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
     for (i, tj) in trees_json.iter().enumerate() {
         let tree =
             tree_from_json(tj).map_err(|e| SequoiaError::model_format(format!("tree {i}: {e}")))?;
-        if let Some(node) = tree
-            .nodes()
-            .iter()
-            .find(|node| !node.is_leaf() && node.split_feature as usize >= num_feature)
-        {
-            return Err(SequoiaError::model_format(format!(
-                "tree {i}: split feature {} exceeds num_feature {num_feature}",
-                node.split_feature
-            )));
-        }
         trees.push(tree);
     }
 
@@ -278,27 +268,22 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
 
 /// Decode one XGBoost tree object into a [`RegTree`].
 fn tree_from_json(tj: &Value) -> Result<RegTree> {
-    let left = arr(tj, "left_children", scalar_f64)
-        .ok_or_else(|| SequoiaError::missing_field("left_children"))?;
+    let left =
+        i32_arr(tj, "left_children").ok_or_else(|| SequoiaError::missing_field("left_children"))?;
     let n = left.len();
     if n == 0 {
         return Err(SequoiaError::model_format("tree contains no nodes"));
     }
-    let left: Vec<i32> = left.iter().map(|&v| v as i32).collect();
 
-    let right: Vec<i32> = arr(tj, "right_children", scalar_f64)
-        .ok_or_else(|| SequoiaError::missing_field("right_children"))?
-        .iter()
-        .map(|&v| v as i32)
-        .collect();
+    let right = i32_arr(tj, "right_children")
+        .ok_or_else(|| SequoiaError::missing_field("right_children"))?;
     if right.len() != n {
         return Err(SequoiaError::model_format(
             "child arrays have different lengths",
         ));
     }
 
-    if arr(tj, "split_type", scalar_f64)
-        .unwrap_or_default()
+    if arr_or_empty(tj, "split_type")
         .iter()
         .any(|&kind| kind != 0.0)
     {
@@ -307,13 +292,13 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
         ));
     }
 
-    let split_indices = arr(tj, "split_indices", scalar_f64).unwrap_or_default();
+    let split_indices = arr_or_empty(tj, "split_indices");
     let split_conditions = arr(tj, "split_conditions", scalar_f64)
         .ok_or_else(|| SequoiaError::missing_field("split_conditions"))?;
-    let default_left = arr(tj, "default_left", scalar_f64).unwrap_or_default();
-    let base_weights = arr(tj, "base_weights", scalar_f64).unwrap_or_default();
-    let sum_hessian = arr(tj, "sum_hessian", scalar_f64).unwrap_or_default();
-    let loss_changes = arr(tj, "loss_changes", scalar_f64).unwrap_or_default();
+    let default_left = arr_or_empty(tj, "default_left");
+    let base_weights = arr_or_empty(tj, "base_weights");
+    let sum_hessian = arr_or_empty(tj, "sum_hessian");
+    let loss_changes = arr_or_empty(tj, "loss_changes");
 
     let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
 
@@ -327,19 +312,7 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
                 .copied()
                 .or_else(|| base_weights.get(i).copied())
                 .unwrap_or(0.0) as f32;
-            nodes.push(Node {
-                split_feature: 0,
-                split_cond: 0.0,
-                default_left: true,
-                left: -1,
-                right: -1,
-                leaf_value,
-                sum_hess,
-                split_gain: 0.0,
-                is_categorical: false,
-                cat_begin: 0,
-                cat_end: 0,
-            });
+            nodes.push(Node::leaf(leaf_value, sum_hess));
         } else {
             if left[i] < 0 || right[i] < 0 || left[i] as usize >= n || right[i] as usize >= n {
                 return Err(SequoiaError::model_format(format!(
@@ -448,6 +421,17 @@ fn arr(v: &Value, key: &str, f: fn(&Value) -> Option<f64>) -> Option<Vec<f64>> {
     v.get(key)?
         .as_array()
         .map(|a| a.iter().map(|e| f(e).unwrap_or(0.0)).collect())
+}
+
+/// Read a JSON array field as `i32`s; `None` if the field is missing or is not
+/// an array.
+fn i32_arr(v: &Value, key: &str) -> Option<Vec<i32>> {
+    arr(v, key, scalar_f64).map(|a| a.iter().map(|&x| x as i32).collect())
+}
+
+/// Read a JSON array field, defaulting to an empty vector when absent.
+fn arr_or_empty(v: &Value, key: &str) -> Vec<f64> {
+    arr(v, key, scalar_f64).unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -4,10 +4,7 @@
 //! carries `K` raw margins, laid out `[instance][class]` (row-major). Each round
 //! the trainer grows one tree per class from that class's gradient slice.
 
-use super::{GradPair, Objective};
-
-/// Lower bound on the multiclass Hessian, matching XGBoost's guard.
-const MIN_HESS: f32 = 1e-16;
+use super::{GradPair, Objective, MIN_HESS};
 
 /// Multiclass softmax objective. `output_prob` distinguishes `multi:softprob`
 /// (report per-class probabilities) from `multi:softmax` (report the argmax

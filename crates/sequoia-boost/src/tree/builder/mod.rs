@@ -1,8 +1,8 @@
 //! Tree construction algorithms.
 //!
 //! Each builder grows a single [`crate::tree::RegTree`] from per-instance
-//! gradients. The exact builder is the reference. Approximate and histogram
-//! builders (added in a later phase) share the same regularized gain math.
+//! gradients. The exact builder is the reference; the histogram builder shares
+//! the same regularized gain math.
 
 mod exact;
 mod hist;
@@ -11,11 +11,12 @@ pub use exact::{all_features, all_rows, ExactTreeBuilder, SortedColumns};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
 
-use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 
+use crate::objective::GradPair;
 use crate::tree::constraints::{calc_weight_bounded, gain_at_weight, satisfies, Bounds};
 use crate::tree::gain::{calc_gain, GradStats, RegParams};
+use crate::tree::regtree::RegTree;
 
 /// Tiny epsilon guarding against accepting numerically-zero-gain splits, mirror
 /// of XGBoost's `kRtEps`.
@@ -62,16 +63,80 @@ impl BestSplit {
         }
     }
 
+    /// A numeric split candidate; `pos` carries the split location (value-space
+    /// threshold for exact search, global-bin boundary for histogram search).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn numeric(
+        loss_chg: f64,
+        feature: u32,
+        pos: SplitPos,
+        default_left: bool,
+        left: GradStats,
+        right: GradStats,
+        w_left: f64,
+        w_right: f64,
+    ) -> Self {
+        let (threshold, split_bin) = match pos {
+            SplitPos::Value(t) => (t, 0),
+            SplitPos::Bin(b) => (0.0, b),
+        };
+        BestSplit {
+            loss_chg,
+            feature,
+            threshold,
+            split_bin,
+            default_left,
+            left,
+            right,
+            w_left,
+            w_right,
+            is_categorical: false,
+            cat_left: Vec::new(),
+        }
+    }
+
+    /// A categorical (set-membership) split candidate; `cat_left` holds the
+    /// category values routed left.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn categorical(
+        loss_chg: f64,
+        feature: u32,
+        left: GradStats,
+        right: GradStats,
+        w_left: f64,
+        w_right: f64,
+        cat_left: Vec<u32>,
+    ) -> Self {
+        BestSplit {
+            loss_chg,
+            feature,
+            threshold: 0.0,
+            split_bin: 0,
+            // Present categories not in the left set (and missing) go
+            // right, as XGBoost defaults for categorical features.
+            default_left: false,
+            left,
+            right,
+            w_left,
+            w_right,
+            is_categorical: true,
+            cat_left,
+        }
+    }
+
     #[inline]
     pub(super) fn found(&self) -> bool {
         self.loss_chg > K_RT_EPS
     }
-}
 
-/// Ordering on split loss change for the loss-guided priority queue.
-#[inline]
-pub(super) fn loss_ord(a: f64, b: f64) -> Ordering {
-    a.total_cmp(&b)
+    /// Whether this split should be taken: it was found, its loss change beats
+    /// `gamma`, and both children meet `min_child_weight`.
+    pub(super) fn valid(&self, gamma: f64, min_child_weight: f64) -> bool {
+        self.found()
+            && self.loss_chg > gamma
+            && self.left.hess >= min_child_weight
+            && self.right.hess >= min_child_weight
+    }
 }
 
 /// Parent structure score subtracted from a split's gain: bounded when
@@ -149,23 +214,7 @@ pub(super) fn accept_numeric(
         return;
     };
     if g > best.loss_chg + K_RT_EPS {
-        let (threshold, split_bin) = match pos {
-            SplitPos::Value(t) => (t, 0),
-            SplitPos::Bin(b) => (0.0, b),
-        };
-        *best = BestSplit {
-            loss_chg: g,
-            feature,
-            threshold,
-            split_bin,
-            default_left,
-            left,
-            right,
-            w_left: wl,
-            w_right: wr,
-            is_categorical: false,
-            cat_left: Vec::new(),
-        };
+        *best = BestSplit::numeric(g, feature, pos, default_left, left, right, wl, wr);
     }
 }
 
@@ -276,21 +325,7 @@ pub(super) fn sweep_categorical(
             continue;
         };
         if g > best.loss_chg + K_RT_EPS {
-            *best = BestSplit {
-                loss_chg: g,
-                feature,
-                threshold: 0.0,
-                split_bin: 0,
-                // Present categories not in the left set (and missing) go
-                // right, as XGBoost defaults for categorical features.
-                default_left: false,
-                left,
-                right,
-                w_left: wl,
-                w_right: wr,
-                is_categorical: true,
-                cat_left: cats_left.clone(),
-            };
+            *best = BestSplit::categorical(g, feature, left, right, wl, wr, cats_left.clone());
         }
     }
 }
@@ -338,7 +373,65 @@ pub(super) fn next_allowed(
         Some(parent) => parent
             .iter()
             .copied()
-            .filter(|f| feature_set.binary_search(f).is_ok())
+            .filter(|&f| permits(Some(feature_set), f))
             .collect(),
     })
+}
+
+/// Whether `feature` passes an allowed-feature set: `None` allows every
+/// feature, otherwise sorted membership in the set is required.
+pub(super) fn permits(allowed: Option<&[u32]>, feature: u32) -> bool {
+    allowed.is_none_or(|features| features.binary_search(&feature).is_ok())
+}
+
+/// Sum the gradient pairs of `rows`, in row order. Shared by both builders'
+/// root-statistics accumulation.
+pub(super) fn sum_rows(gpair: &[GradPair], rows: &[u32]) -> GradStats {
+    let mut total = GradStats::default();
+    for &r in rows {
+        total.add(GradStats::from_pair(gpair[r as usize]));
+    }
+    total
+}
+
+/// Set every leaf's weight from its stored statistics, respecting each leaf's
+/// monotone bounds. Shared by both builders' final pass.
+pub(super) fn finalize_leaf_values(
+    tree: &mut RegTree,
+    stats: &[GradStats],
+    bounds: &[Bounds],
+    reg: &RegParams,
+) {
+    #[allow(clippy::needless_range_loop)]
+    for id in 0..tree.num_nodes() {
+        if tree.node(id).is_leaf() {
+            let w = calc_weight_bounded(stats[id], reg, bounds[id]);
+            tree.set_leaf_value(id, w as f32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use crate::data::DMatrix;
+    use crate::objective::GradPair;
+
+    pub(super) fn gp(g: f32, h: f32) -> GradPair {
+        GradPair::new(g, h)
+    }
+
+    /// Data where the *unconstrained* fit would be non-monotone: a V shape.
+    /// y dips in the middle, so an unconstrained tree would go down then up.
+    pub(super) fn monotone_v_shape_data() -> (DMatrix, Vec<GradPair>) {
+        let n = 60;
+        let mut x = Vec::new();
+        let mut gpair = Vec::new();
+        for i in 0..n {
+            let xi = i as f32 / n as f32;
+            x.push(xi);
+            let target = (xi - 0.5).abs(); // V shape, non-monotone
+            gpair.push(gp(-(target - 0.25), 1.0)); // pseudo-residual around mean
+        }
+        (DMatrix::from_dense(&x, n, 1).unwrap(), gpair)
+    }
 }

@@ -1,7 +1,10 @@
 //! Criterion benchmarks for histogram construction, objective and metric
 //! kernels, prediction transforms, and end-to-end training.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::measurement::WallTime;
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+};
 use sequoia_boost::data::ghist::GHistIndex;
 use sequoia_boost::data::quantile::HistCuts;
 use sequoia_boost::metric::{
@@ -57,6 +60,41 @@ fn make_binary_data(n: usize, f: usize) -> DMatrix {
 
 fn make_weights(n: usize) -> Vec<f32> {
     (0..n).map(|i| 0.5 + (i % 17) as f32 * 0.0625).collect()
+}
+
+/// The 1M-element scale used by the per-element kernel benches.
+const N: usize = 1_000_000;
+
+/// Predictions sweeping a wide range of margins.
+fn wide_range(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i % 2_001) as f32 * 0.005 - 5.0).collect()
+}
+
+/// 0/1 labels alternating by row.
+fn alternating_labels(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i % 2) as f32).collect()
+}
+
+/// Strictly positive labels for the count objectives/metrics.
+fn positive_labels(n: usize) -> Vec<f32> {
+    (0..n).map(|i| 0.25 + (i % 101) as f32 * 0.02).collect()
+}
+
+/// Emit the unweighted/weighted bench pair for one metric.
+fn bench_metric_pair(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    name: &str,
+    metric: &dyn Metric,
+    preds: &[f32],
+    labels: &[f32],
+    weights: &[f32],
+) {
+    group.bench_function(format!("{name}_unweighted_1m"), |b| {
+        b.iter(|| black_box(metric.eval(preds, labels, None)));
+    });
+    group.bench_function(format!("{name}_weighted_1m"), |b| {
+        b.iter(|| black_box(metric.eval(preds, labels, Some(weights))));
+    });
 }
 
 fn scalar_sigmoid(value: f32) -> f32 {
@@ -147,14 +185,13 @@ fn bench_hist_tree_build(c: &mut Criterion) {
 }
 
 fn bench_objective_gradients(c: &mut Criterion) {
-    let n = 1_000_000usize;
-    let preds: Vec<f32> = (0..n).map(|i| (i % 2_001) as f32 * 0.005 - 5.0).collect();
-    let labels: Vec<f32> = (0..n).map(|i| (i % 2) as f32).collect();
-    let positive_labels: Vec<f32> = (0..n).map(|i| 0.25 + (i % 101) as f32 * 0.02).collect();
-    let weights: Vec<f32> = make_weights(n);
-    let mut out = vec![GradPair::default(); n];
+    let preds: Vec<f32> = wide_range(N);
+    let labels: Vec<f32> = alternating_labels(N);
+    let positive_labels: Vec<f32> = positive_labels(N);
+    let weights: Vec<f32> = make_weights(N);
+    let mut out = vec![GradPair::default(); N];
     let mut group = c.benchmark_group("objective_gradient");
-    group.throughput(Throughput::Elements(n as u64));
+    group.throughput(Throughput::Elements(N as u64));
 
     let mut run = |name: &str, objective: &dyn Objective, y: &[f32], weights: Option<&[f32]>| {
         group.bench_function(name, |b| {
@@ -198,7 +235,7 @@ fn bench_objective_gradients(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("objective_gradient_multiclass");
     for k in [2usize, 3, 4, 8, 16, 24, 32, 128] {
-        let rows = n / k;
+        let rows = N / k;
         let multi_preds: Vec<f32> = (0..rows * k)
             .map(|i| (i % 101) as f32 * 0.025 - 1.25)
             .collect();
@@ -220,11 +257,10 @@ fn bench_objective_gradients(c: &mut Criterion) {
 }
 
 fn bench_prediction_transforms(c: &mut Criterion) {
-    let n = 1_000_000usize;
-    let source: Vec<f32> = (0..n).map(|i| (i % 2_001) as f32 * 0.005 - 5.0).collect();
+    let source: Vec<f32> = wide_range(N);
     let mut values = source.clone();
     let mut group = c.benchmark_group("prediction_transform");
-    group.throughput(Throughput::Elements(n as u64));
+    group.throughput(Throughput::Elements(N as u64));
 
     group.bench_function("logistic_automatic", |b| {
         b.iter(|| {
@@ -260,7 +296,7 @@ fn bench_prediction_transforms(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("prediction_transform_multiclass");
     for num_class in [2, 3, 4, 8, 17, 32, 128] {
-        let len = n / num_class * num_class;
+        let len = N / num_class * num_class;
         let source = &source[..len];
         let mut values = source.to_vec();
         let objective = SoftmaxObjective::new(num_class, true);
@@ -277,36 +313,29 @@ fn bench_prediction_transforms(c: &mut Criterion) {
 }
 
 fn bench_pointwise_metrics(c: &mut Criterion) {
-    let n = 1_000_000usize;
-    let preds: Vec<f32> = (0..n).map(|i| (i % 1_001) as f32 * 0.001).collect();
-    let labels: Vec<f32> = (0..n).map(|i| (i % 2) as f32).collect();
-    let weights: Vec<f32> = make_weights(n);
+    let preds: Vec<f32> = (0..N).map(|i| (i % 1_001) as f32 * 0.001).collect();
+    let labels: Vec<f32> = alternating_labels(N);
+    let weights: Vec<f32> = make_weights(N);
     let mut group = c.benchmark_group("pointwise_metric");
-    group.throughput(Throughput::Elements(n as u64));
+    group.throughput(Throughput::Elements(N as u64));
 
     for (name, metric) in [
         ("rmse", &Rmse as &dyn Metric),
         ("mae", &Mae as &dyn Metric),
         ("error", &ErrorRate as &dyn Metric),
     ] {
-        group.bench_function(format!("{name}_unweighted_1m"), |b| {
-            b.iter(|| black_box(metric.eval(&preds, &labels, None)));
-        });
-        group.bench_function(format!("{name}_weighted_1m"), |b| {
-            b.iter(|| black_box(metric.eval(&preds, &labels, Some(&weights))));
-        });
+        bench_metric_pair(&mut group, name, metric, &preds, &labels, &weights);
     }
     group.finish();
 }
 
 fn bench_log_metrics(c: &mut Criterion) {
-    let n = 1_000_000usize;
-    let probabilities: Vec<f32> = (0..n).map(|i| 0.001 + (i % 999) as f32 * 0.001).collect();
-    let binary_labels: Vec<f32> = (0..n).map(|i| (i % 2) as f32).collect();
-    let positive_labels: Vec<f32> = (0..n).map(|i| 0.25 + (i % 101) as f32 * 0.02).collect();
-    let weights: Vec<f32> = make_weights(n);
+    let probabilities: Vec<f32> = (0..N).map(|i| 0.001 + (i % 999) as f32 * 0.001).collect();
+    let binary_labels: Vec<f32> = alternating_labels(N);
+    let positive_labels: Vec<f32> = positive_labels(N);
+    let weights: Vec<f32> = make_weights(N);
     let mut group = c.benchmark_group("log_metric");
-    group.throughput(Throughput::Elements(n as u64));
+    group.throughput(Throughput::Elements(N as u64));
 
     for (name, metric, labels) in [
         ("logloss", &LogLoss as &dyn Metric, binary_labels.as_slice()),
@@ -321,25 +350,22 @@ fn bench_log_metrics(c: &mut Criterion) {
             positive_labels.as_slice(),
         ),
     ] {
-        group.bench_function(format!("{name}_unweighted_1m"), |b| {
-            b.iter(|| black_box(metric.eval(&probabilities, labels, None)));
-        });
-        group.bench_function(format!("{name}_weighted_1m"), |b| {
-            b.iter(|| black_box(metric.eval(&probabilities, labels, Some(&weights))));
-        });
+        bench_metric_pair(&mut group, name, metric, &probabilities, labels, &weights);
     }
     let tweedie = create_metric("tweedie-nloglik@1.5", 0).unwrap();
-    group.bench_function("tweedie_nloglik_unweighted_1m", |b| {
-        b.iter(|| black_box(tweedie.eval(&probabilities, &positive_labels, None)));
-    });
-    group.bench_function("tweedie_nloglik_weighted_1m", |b| {
-        b.iter(|| black_box(tweedie.eval(&probabilities, &positive_labels, Some(&weights))));
-    });
+    bench_metric_pair(
+        &mut group,
+        "tweedie_nloglik",
+        tweedie.as_ref(),
+        &probabilities,
+        &positive_labels,
+        &weights,
+    );
     group.finish();
 }
 
 fn bench_multiclass_metrics(c: &mut Criterion) {
-    let outputs = 1_000_000usize;
+    let outputs = N;
     let mut group = c.benchmark_group("multiclass_metric");
     for num_class in [4usize, 8, 32, 128] {
         let rows = outputs / num_class;

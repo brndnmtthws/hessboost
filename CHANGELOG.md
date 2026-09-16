@@ -56,6 +56,20 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 - Evaluate TreeSHAP hot path elements in monomorphized lanes, skip the unit
   `one_fraction` division, and reuse the parent's path region for the cold
   child, for a further ~5% reduction with per-element results unchanged.
+- Consolidate shared helpers across the crate (single source for SIMD
+  dispatch, quantile cut building, tree split acceptance and leaf
+  finalization, gradient-statistic accumulation, linear-margin traversal,
+  TreeSHAP scaffolding, metric ideal-DCG and tie-run helpers, dataset
+  parsing, and the example/benchmark data generators). Behavior is unchanged;
+  verified end-to-end by an all-subsystem equivalence probe hashing every
+  output against the pre-refactor revision.
+
+### Removed
+
+- `DMatrix::with_feature_names` and `DMatrix::feature_names`, which were
+  unreferenced anywhere in the crate, examples, tests, or benchmarks.
+- The free function `tree::split_gain`; split evaluation keeps using the
+  inlined `calc_gain` arithmetic in the builders and SIMD kernels.
 
 ### Fixed
 

@@ -1,10 +1,6 @@
 //! Classification objectives.
 
-use super::{weighted_label_mean, GradPair, Objective};
-
-/// Lower bound on the logistic Hessian, matching XGBoost's `kRtEps` guard so
-/// that confidently-classified instances still contribute a positive Hessian.
-const MIN_HESS: f32 = 1e-16;
+use super::{weighted_label_mean, GradPair, Objective, MIN_HESS};
 
 /// Binary logistic regression (`binary:logistic`).
 ///

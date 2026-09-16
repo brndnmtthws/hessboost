@@ -30,17 +30,10 @@ impl Objective for SquaredErrorObjective {
             labels,
             weights,
             out,
-            |preds, labels, weights, out| match weights {
-                Some(w) => {
-                    for i in 0..preds.len() {
-                        let g = preds[i] - labels[i];
-                        out[i] = GradPair::new(g * w[i], w[i]);
-                    }
-                }
-                None => {
-                    for i in 0..preds.len() {
-                        out[i] = GradPair::new(preds[i] - labels[i], 1.0);
-                    }
+            |preds, labels, weights, out| {
+                for i in 0..preds.len() {
+                    let w = weights.map_or(1.0, |ws| ws[i]);
+                    out[i] = GradPair::new((preds[i] - labels[i]) * w, w);
                 }
             },
         );
@@ -74,13 +67,23 @@ impl Objective for PseudoHuberObjective {
         out: &mut [GradPair],
     ) {
         super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        for i in 0..preds.len() {
-            let w = weights.map_or(1.0, |ws| ws[i]);
-            let d = preds[i] - labels[i];
-            let s = 1.0 + d * d;
-            let sqrt_s = s.sqrt();
-            out[i] = GradPair::new((d / sqrt_s) * w, (1.0 / (s * sqrt_s)) * w);
-        }
+        super::rowwise_gradient(
+            labels.len(),
+            1,
+            preds,
+            labels,
+            weights,
+            out,
+            |preds, labels, weights, out| {
+                for i in 0..preds.len() {
+                    let w = weights.map_or(1.0, |ws| ws[i]);
+                    let d = preds[i] - labels[i];
+                    let s = 1.0 + d * d;
+                    let sqrt_s = s.sqrt();
+                    out[i] = GradPair::new((d / sqrt_s) * w, (1.0 / (s * sqrt_s)) * w);
+                }
+            },
+        );
     }
 
     fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {

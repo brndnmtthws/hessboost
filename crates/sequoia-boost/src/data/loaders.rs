@@ -13,18 +13,12 @@ fn parse_err(lineno: usize, reason: impl Into<String>) -> SequoiaError {
     }
 }
 
-/// Parse a label field, mapping failure to a line-anchored [`SequoiaError::Parse`].
-fn parse_label(field: &str, lineno: usize) -> Result<f32> {
+/// Parse a numeric field, mapping failure to a line-anchored
+/// [`SequoiaError::Parse`]. `what` names the field role in the message.
+fn parse_f32(field: &str, lineno: usize, what: &str) -> Result<f32> {
     field
         .parse()
-        .map_err(|_| parse_err(lineno, format!("invalid label `{field}`")))
-}
-
-/// Parse a feature value field.
-fn parse_value(field: &str, lineno: usize) -> Result<f32> {
-    field
-        .parse()
-        .map_err(|_| parse_err(lineno, format!("invalid value `{field}`")))
+        .map_err(|_| parse_err(lineno, format!("invalid {what} `{field}`")))
 }
 
 /// Load a libsvm / SVMLight file into a sparse [`DMatrix`].
@@ -54,7 +48,7 @@ pub fn read_libsvm<R: Read>(reader: R) -> Result<DMatrix> {
         let label_tok = it
             .next()
             .ok_or_else(|| parse_err(lineno, "missing label"))?;
-        let label: f32 = parse_label(label_tok, lineno)?;
+        let label: f32 = parse_f32(label_tok, lineno, "label")?;
         labels.push(label);
 
         for tok in it {
@@ -64,7 +58,7 @@ pub fn read_libsvm<R: Read>(reader: R) -> Result<DMatrix> {
             let idx: u32 = idx_s
                 .parse()
                 .map_err(|_| parse_err(lineno, format!("invalid index `{idx_s}`")))?;
-            let val: f32 = parse_value(val_s, lineno)?;
+            let val: f32 = parse_f32(val_s, lineno, "value")?;
             indices.push(idx);
             values.push(val);
             max_index = max_index.max(idx);
@@ -128,14 +122,14 @@ pub fn read_csv<R: Read>(reader: R, opts: &CsvOptions) -> Result<DMatrix> {
         for (c, raw) in fields.iter().enumerate() {
             let field = raw.trim();
             if Some(c) == opts.label_column {
-                labels.push(parse_label(field, lineno)?);
+                labels.push(parse_f32(field, lineno, "label")?);
                 continue;
             }
             let is_na = field.is_empty() || opts.na_value.as_deref() == Some(field);
             let v = if is_na {
                 f32::NAN
             } else {
-                parse_value(field, lineno)?
+                parse_f32(field, lineno, "value")?
             };
             feats.push(v);
         }

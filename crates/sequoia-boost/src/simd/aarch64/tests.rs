@@ -1,16 +1,12 @@
+use super::super::neon_available;
+use super::super::tests::assert_dense_split_matches_scalar;
 use super::*;
-macro_rules! require_neon {
-    () => {
-        if !std::arch::is_aarch64_feature_detected!("neon") {
-            return;
-        }
-    };
-}
-use super::super::tests::{scalar_dense_split, stats_bits};
 
 #[test]
 fn split_prefilter_preserves_ties_and_sequential_epsilon() {
-    require_neon!();
+    if !neon_available() {
+        return;
+    }
     let reg = RegParams {
         alpha: 0.0,
         lambda: 1.0,
@@ -44,7 +40,9 @@ fn split_prefilter_preserves_ties_and_sequential_epsilon() {
 
 #[test]
 fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
-    require_neon!();
+    if !neon_available() {
+        return;
+    }
     let exceptional = [
         f64::NEG_INFINITY,
         -f64::MAX,
@@ -68,10 +66,6 @@ fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
                     GradStats::new(gradient, 0.5 + (index % 7) as f64 * 0.25)
                 })
                 .collect();
-            let mut total = GradStats::default();
-            for &stats in &histogram {
-                total.add(stats);
-            }
             for alpha in [0.0, f64::from_bits(1), 1.0, 2.0, f64::MAX] {
                 for lambda in [0.0, 1.0] {
                     let reg = RegParams {
@@ -80,28 +74,7 @@ fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
                         min_child_weight: 0.0,
                         max_delta_step: 0.0,
                     };
-                    let parent_gain = calc_gain(total, &reg);
-                    let expected = scalar_dense_split(&histogram, total, &reg, parent_gain, 1e-6);
-                    // SAFETY: NEON was detected; the kernel bounds its loads.
-                    let actual = unsafe {
-                        dense_unconstrained_best_split(
-                            &histogram,
-                            total,
-                            &reg,
-                            parent_gain,
-                            0.0,
-                            1e-6,
-                        )
-                    };
-                    match (actual, expected) {
-                        (Some(actual), Some(expected)) => {
-                            assert_eq!(actual.split_offset, expected.split_offset);
-                            assert_eq!(stats_bits(actual.left), stats_bits(expected.left));
-                            assert_eq!(stats_bits(actual.right), stats_bits(expected.right));
-                        }
-                        (None, None) => {}
-                        _ => panic!("scan disagreed on candidate presence"),
-                    }
+                    assert_dense_split_matches_scalar(&histogram, &reg);
                 }
             }
         }
@@ -110,7 +83,9 @@ fn split_scan_matches_scalar_with_l1_and_exceptional_gradients() {
 
 #[test]
 fn finite_extrema_reject_exceptional_values_in_every_lane() {
-    require_neon!();
+    if !neon_available() {
+        return;
+    }
     for length in [8, 16, 17, 32, 33, 128, 131] {
         let values: Vec<f32> = (0..length).map(|index| (index % 13) as f32 - 6.0).collect();
         let expected = (
@@ -132,7 +107,9 @@ fn finite_extrema_reject_exceptional_values_in_every_lane() {
 
 #[test]
 fn vector_log_is_accurate_across_metric_range() {
-    require_neon!();
+    if !neon_available() {
+        return;
+    }
     let mut values = Vec::new();
     for index in 0..20_000 {
         let exponent = -34.5 + index as f64 * (123.0 / 19_999.0);
@@ -179,7 +156,9 @@ fn vector_log_is_accurate_across_metric_range() {
 
 #[test]
 fn vector_exp_f64_is_accurate_across_tweedie_range() {
-    require_neon!();
+    if !neon_available() {
+        return;
+    }
     let values: Vec<f64> = (0..20_000)
         .map(|index| -90.0 + index as f64 * (180.0 / 19_999.0))
         .collect();

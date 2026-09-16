@@ -50,6 +50,10 @@ impl GradPair {
 /// by the same path as in one whole-batch call.
 const GRADIENT_CHUNK_ROWS: usize = 8192;
 
+/// Lower bound on any per-instance Hessian, matching XGBoost's guard, so that
+/// confidently-classified instances still contribute a positive Hessian.
+pub(crate) const MIN_HESS: f32 = 1e-16;
+
 /// Run a row-independent gradient `kernel` over `n_rows` instances with
 /// `n_outputs` values each, in parallel row chunks when the batch is large and
 /// a thread pool is available. Every row's outputs depend only on that row,

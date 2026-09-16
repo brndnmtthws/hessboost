@@ -48,7 +48,7 @@ pub struct Node {
 
 impl Node {
     /// A fresh leaf node with the given weight and cover.
-    fn leaf(value: f32, sum_hess: f32) -> Self {
+    pub(crate) fn leaf(value: f32, sum_hess: f32) -> Self {
         Node {
             split_feature: 0,
             split_cond: 0.0,

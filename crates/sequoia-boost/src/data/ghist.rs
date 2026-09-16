@@ -38,6 +38,32 @@ impl BinStore {
             BinStore::U32(v) => v[idx],
         }
     }
+
+    /// Number of stored bin indices.
+    fn len(&self) -> usize {
+        match self {
+            BinStore::U16(v) => v.len(),
+            BinStore::U32(v) => v.len(),
+        }
+    }
+
+    /// Append all indices of `other`, which must have the same width.
+    fn extend(&mut self, other: BinStore) {
+        match (self, other) {
+            (BinStore::U16(dst), BinStore::U16(src)) => dst.extend_from_slice(&src),
+            (BinStore::U32(dst), BinStore::U32(src)) => dst.extend_from_slice(&src),
+            _ => unreachable!("concatenated chunks share the index width"),
+        }
+    }
+
+    /// The bin of the feature owning global range `[fs, fe)` within the stored
+    /// slice `[s, e)`, or `None` when that feature is absent there.
+    fn find(&self, s: usize, e: usize, fs: usize, fe: usize) -> Option<u32> {
+        match self {
+            BinStore::U16(v) => find_bin(&v[s..e], fs, fe),
+            BinStore::U32(v) => find_bin(&v[s..e], fs, fe),
+        }
+    }
 }
 
 /// The bin of the feature owning global range `[fs, fe)` within one row's
@@ -129,23 +155,14 @@ impl GHistIndex {
         }
         // Chunks were binned in the final width; concatenation preserves the
         // input rows and feature order.
-        let store = if narrow {
-            let mut bins = Vec::with_capacity(total);
-            for chunk in chunks {
-                if let BinChunk::U16(chunk) = chunk.bins {
-                    bins.extend_from_slice(&chunk);
-                }
-            }
-            BinStore::U16(bins)
+        let mut store = if narrow {
+            BinStore::U16(Vec::with_capacity(total))
         } else {
-            let mut bins = Vec::with_capacity(total);
-            for chunk in chunks {
-                if let BinChunk::U32(chunk) = chunk.bins {
-                    bins.extend_from_slice(&chunk);
-                }
-            }
-            BinStore::U32(bins)
+            BinStore::U32(Vec::with_capacity(total))
         };
+        for chunk in chunks {
+            store.extend(chunk.bins);
+        }
 
         // A dense index also keeps a feature-major copy: routing rows on one
         // split feature then streams a single column instead of touching one
@@ -240,10 +257,7 @@ impl GHistIndex {
     #[inline]
     pub fn feature_bin(&self, r: usize, fs: usize, fe: usize) -> Option<u32> {
         let (s, e) = (self.row_ptr[r], self.row_ptr[r + 1]);
-        match &self.store {
-            BinStore::U16(v) => find_bin(&v[s..e], fs, fe),
-            BinStore::U32(v) => find_bin(&v[s..e], fs, fe),
-        }
+        self.store.find(s, e, fs, fe)
     }
 }
 
@@ -285,24 +299,9 @@ pub(crate) fn transpose_dense<B: Copy + Default + Send + Sync>(
     columns
 }
 
-/// Bin indices of a row chunk, already in the index's storage width.
-enum BinChunk {
-    U16(Vec<u16>),
-    U32(Vec<u32>),
-}
-
-impl BinChunk {
-    fn len(&self) -> usize {
-        match self {
-            BinChunk::U16(bins) => bins.len(),
-            BinChunk::U32(bins) => bins.len(),
-        }
-    }
-}
-
 struct BinnedRows {
     row_ends: Vec<usize>,
-    bins: BinChunk,
+    bins: BinStore,
     dense: bool,
     /// Largest bin index in the chunk (0 when empty).
     max_bin: u32,
@@ -337,9 +336,9 @@ impl_from_bin!(wide u32);
 
 fn bin_rows(data: &DMatrix, cuts: &BinSearch<'_>, rows: Range<usize>, narrow: bool) -> BinnedRows {
     if narrow {
-        bin_rows_into::<u16>(data, cuts, rows, BinChunk::U16)
+        bin_rows_into::<u16>(data, cuts, rows, BinStore::U16)
     } else {
-        bin_rows_into::<u32>(data, cuts, rows, BinChunk::U32)
+        bin_rows_into::<u32>(data, cuts, rows, BinStore::U32)
     }
 }
 
@@ -347,7 +346,7 @@ fn bin_rows_into<B: FromBin>(
     data: &DMatrix,
     cuts: &BinSearch<'_>,
     rows: Range<usize>,
-    wrap: fn(Vec<B>) -> BinChunk,
+    wrap: fn(Vec<B>) -> BinStore,
 ) -> BinnedRows {
     let n_features = cuts.n_features();
     let mut row_ends = Vec::with_capacity(rows.len());

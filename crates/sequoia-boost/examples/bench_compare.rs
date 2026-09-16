@@ -5,45 +5,16 @@
 
 use sequoia_boost::metric::create_metric;
 use sequoia_boost::prelude::*;
-use serde::Deserialize;
 use std::path::Path;
 use std::time::Instant;
 
-#[derive(Deserialize)]
-struct Dataset {
-    n_rows: usize,
-    n_test: usize,
-    n_cols: usize,
-    num_round: usize,
-    objective: String,
-    num_class: usize,
-    metric: String,
-    max_depth: usize,
-    eta: f64,
-    lambda: f64,
-    max_bin: usize,
-    base_score: f64,
-    seed: u64,
-}
-
-fn read_f32(path: &Path) -> std::io::Result<Vec<f32>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() % 4 != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "dataset byte count must be divisible by four",
-        ));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
-}
+mod common;
+use common::{load_meta, read_f32};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::var("BENCH_DIR")?;
     let dir = Path::new(&dir);
-    let meta: Dataset = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    let meta = load_meta(dir)?;
     let x = read_f32(&dir.join("X.bin"))?;
     let y = read_f32(&dir.join("y.bin"))?;
     let x_test = read_f32(&dir.join("X_test.bin"))?;

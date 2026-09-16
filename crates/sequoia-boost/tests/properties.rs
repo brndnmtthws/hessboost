@@ -6,7 +6,6 @@
 
 use proptest::prelude::*;
 use sequoia_boost::prelude::*;
-use sequoia_boost::BoostedModel;
 
 const ROWS: usize = 40;
 const COLS: usize = 3;
@@ -32,13 +31,21 @@ fn base_params(seed: u64) -> TrainingParams {
         .unwrap()
 }
 
+/// Dense `ROWS × COLS` matrix with labels; the shape most cases train on.
+fn matrix(x: &[f32], y: &[f32]) -> DMatrix {
+    DMatrix::from_dense(x, ROWS, COLS)
+        .unwrap()
+        .with_labels(y)
+        .unwrap()
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     /// Same data, params, and seed must yield identical predictions.
     #[test]
     fn training_is_deterministic((x, y) in dataset(), seed in 0u64..10_000) {
-        let d = DMatrix::from_dense(&x, ROWS, COLS).unwrap().with_labels(&y).unwrap();
+        let d = matrix(&x, &y);
         let params = base_params(seed);
         let a = train(&params, &d, 15).unwrap().predict(&d).unwrap();
         let b = train(&params, &d, 15).unwrap().predict(&d).unwrap();
@@ -49,7 +56,7 @@ proptest! {
     /// predict identically (both have every feature present).
     #[test]
     fn dense_equals_sparse((x, y) in dataset(), seed in 0u64..10_000) {
-        let dense = DMatrix::from_dense(&x, ROWS, COLS).unwrap().with_labels(&y).unwrap();
+        let dense = matrix(&x, &y);
 
         // Build an equivalent CSR that explicitly lists every entry.
         let mut indptr = vec![0usize];
@@ -106,7 +113,7 @@ proptest! {
     /// Binary and native model serialization must be lossless w.r.t. predictions.
     #[test]
     fn serde_roundtrip_preserves_predictions((x, y) in dataset(), seed in 0u64..10_000) {
-        let d = DMatrix::from_dense(&x, ROWS, COLS).unwrap().with_labels(&y).unwrap();
+        let d = matrix(&x, &y);
         let model = train(&base_params(seed), &d, 12).unwrap();
         let before = model.predict(&d).unwrap();
 

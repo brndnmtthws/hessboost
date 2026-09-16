@@ -346,21 +346,17 @@ impl TrainingParamsBuilder {
         self
     }
 
-    /// Set the per-feature monotone constraints.
-    pub fn monotone_constraints(mut self, c: Vec<Monotone>) -> Self {
-        self.params.monotone_constraints = c;
-        self
-    }
-
-    /// Set the allowed feature-interaction groups.
-    ///
-    /// Each inner vector lists feature indices that are permitted to appear
-    /// together on a single root-to-leaf path. An empty list disables the
-    /// constraint. Mirrors XGBoost `interaction_constraints`.
-    pub fn interaction_constraints(mut self, c: Vec<Vec<u32>>) -> Self {
-        self.params.interaction_constraints = c;
-        self
-    }
+    setter!(/// Set the per-feature monotone constraints.
+        monotone_constraints, Vec<Monotone>);
+    setter!(
+        /// Set the allowed feature-interaction groups.
+        ///
+        /// Each inner vector lists feature indices that are permitted to appear
+        /// together on a single root-to-leaf path. An empty list disables the
+        /// constraint. Mirrors XGBoost `interaction_constraints`.
+        interaction_constraints,
+        Vec<Vec<u32>>
+    );
 
     /// Validate and produce the [`TrainingParams`].
     pub fn build(self) -> Result<TrainingParams> {

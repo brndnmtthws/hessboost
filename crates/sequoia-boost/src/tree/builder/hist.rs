@@ -6,14 +6,14 @@
 //! is ever built directly. Supports both `depthwise` and `lossguide` growth.
 
 use super::{
-    build_interaction_sets, eval_missing_directions, loss_ord, next_allowed, parent_gain,
-    sweep_categorical, BestSplit, SplitPos, K_RT_EPS,
+    build_interaction_sets, eval_missing_directions, finalize_leaf_values, next_allowed,
+    parent_gain, permits, sum_rows, sweep_categorical, BestSplit, SplitPos, K_RT_EPS,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::tree::constraints::{calc_weight_bounded, child_bounds, Bounds, MonotoneConstraints};
+use crate::tree::constraints::{child_bounds, Bounds, MonotoneConstraints};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::{
     subtract_in_place, zeroed, BinIndex, CpuBackend, Histogram, HistogramBackend,
@@ -28,6 +28,15 @@ use std::collections::{BinaryHeap, HashMap};
 /// concurrently. Smaller nodes appear in frontiers wide enough to keep the
 /// pool busy, and their evaluation is too short to be worth a fork.
 const PARALLEL_EVALUATE_ROWS: usize = 16_384;
+
+/// Combined frontier rows at which depthwise growth builds a level's child
+/// histograms concurrently. Below this, the fork costs more than the scan.
+const PARALLEL_FRONTIER_ROWS: usize = 4096;
+
+/// Whether the rayon pool has more than one thread, so parallelism can pay off.
+pub(super) fn rayon_available() -> bool {
+    rayon::current_num_threads() > 1
+}
 
 /// Training rows that reached a leaf during tree construction.
 pub(crate) struct LeafRows {
@@ -75,7 +84,7 @@ impl PartialOrd for NodeEntry {
 }
 impl Ord for NodeEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        loss_ord(self.best.loss_chg, other.best.loss_chg)
+        self.best.loss_chg.total_cmp(&other.best.loss_chg)
     }
 }
 
@@ -143,11 +152,7 @@ impl<'a> HistTreeBuilder<'a> {
     ) -> (RegTree, Vec<LeafRows>) {
         let total_bins = ghist.total_bins();
 
-        let mut root_stats = GradStats::default();
-        for &r in row_subset {
-            let gp = gpair[r as usize];
-            root_stats.add(GradStats::new(gp.grad as f64, gp.hess as f64));
-        }
+        let root_stats = sum_rows(gpair, row_subset);
         let mut root_hist = zeroed(total_bins);
         self.backend.build(ghist, row_subset, gpair, &mut root_hist);
 
@@ -188,13 +193,7 @@ impl<'a> HistTreeBuilder<'a> {
         }
 
         // Finalize leaf weights (respecting each leaf's monotone bounds).
-        #[allow(clippy::needless_range_loop)]
-        for id in 0..tree.num_nodes() {
-            if tree.node(id).is_leaf() {
-                let w = calc_weight_bounded(store.stats[id], &self.reg, store.bounds[id]);
-                tree.set_leaf_value(id, w as f32);
-            }
-        }
+        finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.reg);
         (tree, store.leaf_rows.unwrap_or_default())
     }
 
@@ -220,8 +219,9 @@ impl<'a> HistTreeBuilder<'a> {
         let mut depth = 0;
         while depth < limit && !frontier.is_empty() {
             let parallel = frontier.len() > 1
-                && frontier.iter().map(|entry| entry.rows.len()).sum::<usize>() >= 4096
-                && rayon::current_num_threads() > 1;
+                && frontier.iter().map(|entry| entry.rows.len()).sum::<usize>()
+                    >= PARALLEL_FRONTIER_ROWS
+                && rayon_available();
             let mut pending = Vec::with_capacity(frontier.len());
             for entry in frontier.drain(..) {
                 if self.valid(&entry.best) {
@@ -289,10 +289,7 @@ impl<'a> HistTreeBuilder<'a> {
 
     /// Whether a node's best split should be taken.
     fn valid(&self, best: &BestSplit) -> bool {
-        best.found()
-            && best.loss_chg > self.params.gamma
-            && best.left.hess >= self.reg.min_child_weight
-            && best.right.hess >= self.reg.min_child_weight
+        best.valid(self.params.gamma, self.reg.min_child_weight)
     }
 
     /// Expand a node and draw child features in traversal order. Children at the
@@ -447,9 +444,7 @@ impl<'a> HistTreeBuilder<'a> {
                     allowed,
                 )
             };
-            if left_rows.len() + right_rows.len() >= PARALLEL_EVALUATE_ROWS
-                && rayon::current_num_threads() > 1
-            {
+            if left_rows.len() + right_rows.len() >= PARALLEL_EVALUATE_ROWS && rayon_available() {
                 rayon::join(left, right)
             } else {
                 (left(), right())
@@ -507,7 +502,7 @@ impl<'a> HistTreeBuilder<'a> {
                 filtered = feature_subset
                     .iter()
                     .copied()
-                    .filter(|f| allow.binary_search(f).is_ok())
+                    .filter(|&f| permits(Some(allow), f))
                     .collect();
                 &filtered
             }
@@ -570,19 +565,16 @@ impl<'a> HistTreeBuilder<'a> {
                 {
                     if let Some(candidate) = candidate {
                         if candidate.loss_change > best.loss_chg + K_RT_EPS {
-                            best = BestSplit {
-                                loss_chg: candidate.loss_change,
-                                feature: f,
-                                threshold: 0.0,
-                                split_bin: fs + candidate.split_offset,
-                                default_left: false,
-                                left: candidate.left,
-                                right: candidate.right,
-                                w_left: 0.0,
-                                w_right: 0.0,
-                                is_categorical: false,
-                                cat_left: Vec::new(),
-                            };
+                            best = BestSplit::numeric(
+                                candidate.loss_change,
+                                f,
+                                SplitPos::Bin(fs + candidate.split_offset),
+                                false,
+                                candidate.left,
+                                candidate.right,
+                                0.0,
+                                0.0,
+                            );
                         }
                     }
                     continue;
@@ -692,7 +684,7 @@ fn route_dense<B: BinIndex>(rows: &[u32], column: &[B], split_bin: usize) -> (Ve
         }
         (left, right)
     };
-    if rows.len() < 2 * PARTITION_CHUNK_ROWS || rayon::current_num_threads() <= 1 {
+    if rows.len() < 2 * PARTITION_CHUNK_ROWS || !rayon_available() {
         return route(rows);
     }
     let chunks: Vec<(Vec<u32>, Vec<u32>)> =
@@ -732,14 +724,11 @@ impl NodeStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{gp, monotone_v_shape_data};
     use super::*;
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::tree::builder::all_rows;
-
-    fn gp(g: f32, h: f32) -> GradPair {
-        GradPair::new(g, h)
-    }
 
     fn binned(data: &DMatrix, max_bin: usize) -> GHistIndex {
         let cuts = HistCuts::from_dmatrix(data, max_bin);
@@ -954,19 +943,8 @@ mod tests {
     #[test]
     fn monotone_increasing_is_enforced() {
         use crate::config::Monotone;
-        // Data where the *unconstrained* fit would be non-monotone: a V shape.
-        // y dips in the middle, so an unconstrained tree would go down then up.
-        let n = 60;
-        let mut x = Vec::new();
-        let mut gpair = Vec::new();
-        for i in 0..n {
-            let xi = i as f32 / n as f32;
-            x.push(xi);
-            // gradient sign: negative residual mid-range -> would push weights down
-            let target = (xi - 0.5).abs(); // V shape, non-monotone
-            gpair.push(gp(-(target - 0.25), 1.0)); // pseudo-residual around mean
-        }
-        let data = DMatrix::from_dense(&x, n, 1).unwrap();
+        let (data, gpair) = monotone_v_shape_data();
+        let n = data.n_rows();
         let ghist = binned(&data, 256);
         let params = TrainingParams::builder()
             .max_depth(4)
@@ -985,11 +963,11 @@ mod tests {
 
         // Predictions must be non-decreasing in x under the increasing constraint.
         let mut prev = f32::NEG_INFINITY;
-        for (i, &xi) in x.iter().enumerate() {
+        for i in 0..n {
             let p = tree.predict_row(&data, i);
             assert!(
                 p >= prev - 1e-5,
-                "monotonicity violated at x={xi}: {p} < {prev}"
+                "monotonicity violated at row {i}: {p} < {prev}"
             );
             prev = p;
         }

@@ -12,6 +12,7 @@
 //! `f64` for numerical stability, matching XGBoost's accumulation precision.
 
 use crate::config::TrainingParams;
+use crate::objective::GradPair;
 use crate::tree::constraints::gain_at_weight;
 
 /// Accumulated first/second-order statistics for a set of instances.
@@ -29,6 +30,12 @@ impl GradStats {
     #[inline]
     pub fn new(grad: f64, hess: f64) -> Self {
         GradStats { grad, hess }
+    }
+
+    /// Construct from one row's gradient pair, widening to `f64`.
+    #[inline]
+    pub fn from_pair(gp: GradPair) -> Self {
+        GradStats::new(gp.grad as f64, gp.hess as f64)
     }
 
     /// Add another set of statistics.
@@ -117,13 +124,6 @@ pub fn calc_gain(stats: GradStats, reg: &RegParams) -> f64 {
     }
 }
 
-/// Loss change from splitting `parent` into `left` and `right`:
-/// `gain(L) + gain(R) − gain(parent)`. Larger is better. The caller compares it
-/// against `γ` (`min_split_loss`) to decide whether to keep the split.
-pub fn split_gain(left: GradStats, right: GradStats, parent: GradStats, reg: &RegParams) -> f64 {
-    calc_gain(left, reg) + calc_gain(right, reg) - calc_gain(parent, reg)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,15 +186,5 @@ mod tests {
         };
         assert_eq!(calc_weight(s, &r), 0.0);
         assert_eq!(calc_gain(s, &r), 0.0);
-    }
-
-    #[test]
-    fn split_gain_positive_when_children_separate() {
-        // Parent grad 0 (perfectly mixed), children strongly separated.
-        let left = GradStats::new(-4.0, 2.0);
-        let right = GradStats::new(4.0, 2.0);
-        let parent = GradStats::new(0.0, 4.0);
-        let g = split_gain(left, right, parent, &reg(1.0, 0.0));
-        assert!(g > 0.0);
     }
 }

@@ -366,8 +366,8 @@ fn x86_64_backend_detection_is_cached() {
 }
 
 /// Scalar reference scan: the histogram builder's loop for one dense feature.
-/// Shared with `aarch64::tests` so both suites replay the same sequential
-/// epsilon comparison as the vector prefilter acceptance.
+/// The assertion below replays the same sequential epsilon comparison as the
+/// vector prefilter acceptance.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(super) fn scalar_dense_split(
     histogram: &[GradStats],
@@ -400,14 +400,13 @@ pub(super) fn scalar_dense_split(
 }
 
 /// `(grad, hess)` bit patterns, so a `NaN` compares equal to itself.
-/// Shared with `aarch64::tests`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(super) fn stats_bits(stats: GradStats) -> (u64, u64) {
     (stats.grad.to_bits(), stats.hess.to_bits())
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn assert_dense_split_matches_scalar(histogram: &[GradStats], reg: &RegParams) {
+pub(super) fn assert_dense_split_matches_scalar(histogram: &[GradStats], reg: &RegParams) {
     use crate::tree::gain::calc_gain;
 
     #[cfg(target_arch = "x86_64")]

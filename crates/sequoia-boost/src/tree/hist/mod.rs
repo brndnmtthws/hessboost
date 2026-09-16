@@ -186,7 +186,7 @@ fn accumulate_bins<B: BinIndex>(
         "histogram length must equal the binned index's bin count"
     );
     let add_row = |row_bins: &[B], gp: GradPair, out: &mut [GradStats]| {
-        let g = GradStats::new(gp.grad as f64, gp.hess as f64);
+        let g = GradStats::from_pair(gp);
         for &bin in row_bins {
             // SAFETY: `bin < ghist.total_bins() == out.len()` by the index
             // invariant and the assertion above.
@@ -263,7 +263,7 @@ fn accumulate_columns<B: BinIndex>(
     let gpair = &gpair[range.clone()];
     for column in columns.chunks_exact(n_rows) {
         for (&bin, gp) in column[range.clone()].iter().zip(gpair) {
-            let g = GradStats::new(gp.grad as f64, gp.hess as f64);
+            let g = GradStats::from_pair(*gp);
             // SAFETY: `bin < ghist.total_bins() == out.len()` by the index
             // invariant and the caller's assertion.
             unsafe { out.get_unchecked_mut(bin.index()) }.add(g);
@@ -286,7 +286,7 @@ fn accumulate_column<B: BinIndex>(
     slice: &mut [GradStats],
 ) {
     for (&bin, gp) in column[range.clone()].iter().zip(&gpair[range.clone()]) {
-        let g = GradStats::new(gp.grad as f64, gp.hess as f64);
+        let g = GradStats::from_pair(*gp);
         slice[bin.index() - first_bin].add(g);
     }
 }
@@ -455,7 +455,7 @@ mod tests {
         let mut h = zeroed(ghist.total_bins());
         for &r in rows {
             let r = r as usize;
-            let g = GradStats::new(gpair[r].grad as f64, gpair[r].hess as f64);
+            let g = GradStats::from_pair(gpair[r]);
             for f in 0..stride {
                 let bin = match ghist.bins() {
                     Bins::U16(b) => b[r * stride + f] as usize,

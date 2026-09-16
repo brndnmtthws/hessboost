@@ -312,7 +312,7 @@ fn train_impl_inner(
 
     // The linear (`gblinear`) booster fits a coordinate-descent linear model
     // instead of growing trees; it skips the tree/dart path entirely. Eval sets
-    // and early stopping are not applied to it (the history stays empty).
+    // and early stopping are rejected for it (the history stays empty).
     if params.booster == BoosterKind::GbLinear {
         if !evals.is_empty() || early_stopping_rounds.is_some() {
             return Err(SequoiaError::invalid_param(
@@ -401,37 +401,48 @@ fn train_impl_inner(
             objective.gradient_grouped(&train_margin, labels, weights, dtrain.group(), &mut gpair);
 
             // 2. Row subsampling is shared across the round's per-output trees.
-            let mut rng =
-                StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9));
+            let mut rng = round_rng(params, round, 0);
             let row_subset = sample_rows(n, params.subsample, &mut rng);
 
             // 3. One tree per output.
             for k in 0..n_out {
-                // Gather this output's gradient slice.
-                let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
-
-                let mut sampler =
-                    make_column_sampler(n_features, params, &mut rng, round as u64, k as u64);
                 // Retaining the final row partitions replaces a per-row tree
                 // traversal of the raw feature matrix with one sequential
                 // pass per leaf.
-                let (mut tree, leaf_rows) = match &prepared {
+                let (tree, leaf_rows) = match &prepared {
                     Prepared::Hist(ghist)
                         if params.grow_policy == GrowPolicy::DepthWise && row_subset.len() == n =>
                     {
-                        HistTreeBuilder::new(params).build_with_leaf_rows(
-                            ghist,
-                            gk,
-                            &row_subset,
-                            &mut sampler,
-                        )
+                        let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
+                        let mut sampler = make_column_sampler(
+                            n_features,
+                            params,
+                            &mut rng,
+                            round as u64,
+                            k as u64,
+                        );
+                        let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
+                            .build_with_leaf_rows(ghist, gk, &row_subset, &mut sampler);
+                        tree.scale_leaves(params.eta as f32);
+                        (tree, leaf_rows)
                     }
                     _ => (
-                        prepared.build_tree(params, dtrain, gk, &row_subset, &mut sampler),
+                        fit_output_tree(
+                            params,
+                            &prepared,
+                            dtrain,
+                            &gpair,
+                            &mut gpair_k,
+                            &mut rng,
+                            n_out,
+                            k,
+                            round,
+                            &row_subset,
+                            n_features,
+                        ),
                         Vec::new(),
                     ),
                 };
-                tree.scale_leaves(params.eta as f32);
 
                 // Row partitions already identify training leaves when every
                 // row participated in depthwise histogram construction.
@@ -444,7 +455,7 @@ fn train_impl_inner(
                     update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
                 }
 
-                model.push_tree(tree);
+                model.push_tree_weighted(tree, 1.0);
             }
         }
 
@@ -578,8 +589,7 @@ fn dart_round(
     gpair: &mut [GradPair],
     gpair_k: &mut [GradPair],
 ) {
-    let mut rng =
-        StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ 0x0DA27);
+    let mut rng = round_rng(params, round, 0x0DA27);
 
     // 1. Select the dropout set over the trees built so far.
     let existing = model.num_trees();
@@ -611,11 +621,19 @@ fn dart_round(
     let eta = params.eta as f32;
     let new_weight = if k == 0 { 1.0 } else { 1.0 / (k as f32 + eta) };
     for kk in 0..n_out {
-        let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, kk);
-        let mut sampler =
-            make_column_sampler(n_features, params, &mut rng, round as u64, kk as u64);
-        let mut tree = prepared.build_tree(params, dtrain, gk, &row_subset, &mut sampler);
-        tree.scale_leaves(params.eta as f32);
+        let tree = fit_output_tree(
+            params,
+            prepared,
+            dtrain,
+            gpair,
+            gpair_k,
+            &mut rng,
+            n_out,
+            kk,
+            round,
+            &row_subset,
+            n_features,
+        );
         model.push_tree_weighted(tree, new_weight);
     }
 
@@ -648,6 +666,39 @@ fn gather_output<'a>(
         }
         scratch
     }
+}
+
+/// The RNG for one boosting round: `seed ^ round * 0x9E37_79B9`, plus a
+/// booster-specific `salt` (`0` for gbtree, `0x0DA27` for DART) so the two
+/// boosters draw from different streams.
+fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
+    StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ salt)
+}
+
+/// Fit one output's tree for a boosting round: gather that output's gradient
+/// slice, derive its column sampler, build the tree, and shrink its leaves by
+/// `eta`. The caller owns the round RNG (already seeded and salted), the row
+/// subset, and what happens to the tree (margin updates, contribution
+/// weight).
+#[allow(clippy::too_many_arguments)]
+fn fit_output_tree(
+    params: &TrainingParams,
+    prepared: &Prepared,
+    dtrain: &DMatrix,
+    gpair: &[GradPair],
+    gpair_k: &mut [GradPair],
+    rng: &mut StdRng,
+    n_out: usize,
+    k: usize,
+    round: usize,
+    row_subset: &[u32],
+    n_features: usize,
+) -> RegTree {
+    let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
+    let mut sampler = make_column_sampler(n_features, params, rng, round as u64, k as u64);
+    let mut tree = prepared.build_tree(params, dtrain, gk, row_subset, &mut sampler);
+    tree.scale_leaves(params.eta as f32);
+    tree
 }
 
 /// Bernoulli row subsampling (each row kept with probability `subsample`),

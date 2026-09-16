@@ -1,7 +1,11 @@
 //! Structural constraints: monotone constraints, interaction constraints, and
 //! native categorical features. Run: `cargo run --release --example constraints`.
 
+use sequoia_boost::metric::Rmse;
 use sequoia_boost::prelude::*;
+
+mod common;
+use common::{fill_random, lcg};
 
 fn main() -> Result<()> {
     // ---- Monotone constraint: force the model non-decreasing in feature 0. ----
@@ -33,10 +37,8 @@ fn main() -> Result<()> {
     let (n2, f2) = (600usize, 4usize);
     let mut x2 = vec![0f32; n2 * f2];
     let mut y2 = vec![0f32; n2];
+    fill_random(&mut rng, &mut x2);
     for i in 0..n2 {
-        for j in 0..f2 {
-            x2[i * f2 + j] = rng();
-        }
         y2[i] = x2[i * f2] * x2[i * f2 + 1] + x2[i * f2 + 2];
     }
     let d2 = DMatrix::from_dense(&x2, n2, f2)?.with_labels(&y2)?;
@@ -73,23 +75,7 @@ fn main() -> Result<()> {
         30,
     )?;
     let pc = mc.predict(&dc)?;
-    let rmse = (pc
-        .iter()
-        .zip(&yc)
-        .map(|(a, b)| (a - b).powi(2))
-        .sum::<f32>()
-        / yc.len() as f32)
-        .sqrt();
+    let rmse = Rmse.eval(&pc, &yc, None);
     println!("categorical fit RMSE on non-ordinal pattern: {rmse:.4}");
     Ok(())
-}
-
-fn lcg(seed: u64) -> impl FnMut() -> f32 {
-    let mut s = seed;
-    move || {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((s >> 33) as f32) / (1u32 << 31) as f32
-    }
 }

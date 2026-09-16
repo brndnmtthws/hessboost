@@ -117,6 +117,27 @@ simple_metric!(
     ErrorRate, "error", crate::simd::classification_error_sum
 );
 
+/// Ranges of consecutive positions in `order` whose `preds` values are equal
+/// (tie runs). Shared by the tie handling of the AUC metrics.
+fn tie_runs<'a>(
+    order: &'a [usize],
+    preds: &'a [f32],
+) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= order.len() {
+            return None;
+        }
+        let mut end = start + 1;
+        while end < order.len() && preds[order[end]] == preds[order[start]] {
+            end += 1;
+        }
+        let run = start..end;
+        start = end;
+        Some(run)
+    })
+}
+
 /// Binary ROC AUC (`auc`), computed with the Mann-Whitney rank-sum and average
 /// ranks for ties. Higher is better. Weights are ignored (unweighted AUC).
 #[derive(Debug, Clone, Copy, Default)]
@@ -138,17 +159,11 @@ impl Metric for Auc {
 
         // Assign average ranks (1-based), resolving ties.
         let mut ranks = vec![0.0f64; n];
-        let mut i = 0;
-        while i < n {
-            let mut j = i + 1;
-            while j < n && preds[order[j]] == preds[order[i]] {
-                j += 1;
-            }
-            let avg = ((i + 1 + j) as f64) / 2.0; // average of ranks i+1..=j
-            for &idx in &order[i..j] {
+        for run in tie_runs(&order, preds) {
+            let avg = ((run.start + 1 + run.end) as f64) / 2.0; // average of ranks start+1..=end
+            for &idx in &order[run] {
                 ranks[idx] = avg;
             }
-            i = j;
         }
 
         let mut sum_pos_rank = 0.0f64;
@@ -196,12 +211,24 @@ simple_metric!(
 );
 
 /// Iterate `(start, end)` row ranges for a group, or a single whole-batch
-/// range when no group info is present. Shared by the ranking metrics.
-fn group_ranges(n: usize, group: Option<&crate::data::GroupInfo>) -> Vec<(usize, usize)> {
+/// range when no group info is present. Shared by the ranking metrics and the
+/// LambdaMART objective's usable-group fallback.
+pub(crate) fn group_ranges(
+    n: usize,
+    group: Option<&crate::data::GroupInfo>,
+) -> Vec<(usize, usize)> {
     match group {
         Some(g) if g.num_rows() == n => g.iter_ranges().collect(),
         _ => vec![(0, n)],
     }
+}
+
+/// Indices of `values` sorted by descending value (total order, stable).
+/// Shared by the ranking metrics and the LambdaMART objective.
+pub(crate) fn argsort_desc(values: &[f32]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&a, &b| values[b].total_cmp(&values[a]));
+    order
 }
 
 /// Weighted mean of a per-group `score` over query-group ranges, weighted by
@@ -251,22 +278,15 @@ impl Ndcg {
         let cut = self.k.map_or(m, |k| k.min(m));
 
         // DCG in prediction order.
-        let mut order: Vec<usize> = (0..m).collect();
-        order.sort_by(|&a, &b| preds[b].total_cmp(&preds[a]));
+        let order = argsort_desc(preds);
         let dcg: f64 = order[..cut]
             .iter()
             .enumerate()
             .map(|(p, &i)| ndcg_gain(labels[i] as f64) * ndcg_discount(p))
             .sum();
 
-        // Ideal DCG: labels sorted by descending relevance.
-        let mut ideal: Vec<f64> = labels.iter().map(|&l| l as f64).collect();
-        ideal.sort_by(|a, b| b.total_cmp(a));
-        let idcg: f64 = ideal[..cut]
-            .iter()
-            .enumerate()
-            .map(|(p, &l)| ndcg_gain(l) * ndcg_discount(p))
-            .sum();
+        let labels_f64: Vec<f64> = labels.iter().map(|&l| l as f64).collect();
+        let idcg = ideal_dcg(&labels_f64, cut);
 
         if idcg <= 0.0 {
             0.0
@@ -315,6 +335,19 @@ pub(crate) fn ndcg_discount(p: usize) -> f64 {
     1.0 / ((p + 2) as f64).log2()
 }
 
+/// Ideal DCG of a group: labels sorted by descending relevance, gains
+/// accumulated with the standard discount, truncated at `cut` ranks. Shared by
+/// the `ndcg` metric and the LambdaMART objective's `|ΔNDCG|` weighting.
+pub(crate) fn ideal_dcg(labels: &[f64], cut: usize) -> f64 {
+    let mut ideal: Vec<f64> = labels.to_vec();
+    ideal.sort_by(|a, b| b.total_cmp(a));
+    ideal[..cut]
+        .iter()
+        .enumerate()
+        .map(|(p, &l)| ndcg_gain(l) * ndcg_discount(p))
+        .sum()
+}
+
 /// Mean Average Precision (`map`), averaged over query groups.
 ///
 /// Relevance is binarized as `label > 0`. Supports `@k` truncation (e.g.
@@ -337,8 +370,7 @@ impl MeanAveragePrecision {
         let m = preds.len();
         let cut = self.k.map_or(m, |k| k.min(m));
 
-        let mut order: Vec<usize> = (0..m).collect();
-        order.sort_by(|&a, &b| preds[b].total_cmp(&preds[a]));
+        let order = argsort_desc(preds);
 
         let num_rel = labels.iter().filter(|&&l| l > 0.0).count();
         if num_rel == 0 {
@@ -401,12 +433,10 @@ impl Metric for AucPr {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let n = preds.len();
         let w_of = |i: usize| weights.map_or(1.0, |ws| ws[i] as f64);
 
         // Sort instance indices by descending predicted score.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| preds[b].total_cmp(&preds[a]));
+        let order = argsort_desc(preds);
 
         let mut total_pos = 0.0f64;
         let mut total_neg = 0.0f64;
@@ -427,17 +457,13 @@ impl Metric for AucPr {
         let mut area = 0.0f64;
         let (mut tp, mut fp) = (0.0f64, 0.0f64);
         let (mut tp_prev, mut fp_prev) = (0.0f64, 0.0f64);
-        let mut i = 0;
-        while i < n {
-            let mut j = i;
-            while j < n && preds[order[j]] == preds[order[i]] {
-                let idx = order[j];
+        for run in tie_runs(&order, preds) {
+            for &idx in &order[run] {
                 if labels[idx] > 0.5 {
                     tp += w_of(idx);
                 } else {
                     fp += w_of(idx);
                 }
-                j += 1;
             }
             if tp + fp > 0.0 {
                 let recall = tp / total_pos;
@@ -454,7 +480,6 @@ impl Metric for AucPr {
             }
             tp_prev = tp;
             fp_prev = fp;
-            i = j;
         }
         area
     }

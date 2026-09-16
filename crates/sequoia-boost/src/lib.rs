@@ -104,13 +104,11 @@ pub use tree::{Node, RegTree};
 /// type, and the objective/metric hooks. This provides everything needed for the
 /// typical train to predict workflow.
 pub mod prelude {
-    pub use crate::config::{BoosterKind, GrowPolicy, Monotone, TrainingParams, TreeMethod};
-    pub use crate::data::{CsvOptions, DMatrix, FeatureType};
-    pub use crate::error::{Result, SequoiaError};
-    pub use crate::learner::{
+    pub use crate::data::CsvOptions;
+    pub use crate::{
         cv, train, train_with_custom_metric, train_with_eval, train_with_objective, BoostedModel,
-        CvResult, ImportanceType, TrainResult,
+        BoosterKind, CustomMetric, CustomObjective, CvResult, DMatrix, FeatureType, GradPair,
+        GrowPolicy, ImportanceType, Metric, Monotone, Objective, Result, SequoiaError, TrainResult,
+        TrainingParams, TreeMethod,
     };
-    pub use crate::metric::{CustomMetric, Metric};
-    pub use crate::objective::{CustomObjective, GradPair, Objective};
 }

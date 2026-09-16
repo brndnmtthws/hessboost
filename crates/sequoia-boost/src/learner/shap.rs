@@ -23,7 +23,7 @@
 
 use crate::data::DMatrix;
 use crate::error::Result;
-use crate::learner::model::{for_each_present_value, BoostedModel, RowBlock};
+use crate::learner::model::{BoostedModel, RowBlock};
 use crate::tree::RegTree;
 use rayon::prelude::*;
 
@@ -513,6 +513,53 @@ fn node_mean_value(tree: &RegTree, node_index: usize) -> f64 {
 }
 
 impl BoostedModel {
+    /// The instance-independent SHAP setup over `trees`: each tree's weighted
+    /// root mean value, the [`ShapTree`] views, and the path-arena length
+    /// covering the deepest tree.
+    fn shap_forest(&self, trees: &[RegTree]) -> (Vec<f64>, Vec<ShapTree>, usize) {
+        // Each tree's root mean value is instance-independent; compute once.
+        let tree_means: Vec<f64> = trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
+            .collect();
+        let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
+        let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
+        (tree_means, shap_trees, arena)
+    }
+
+    /// Accumulate every tree's unconditioned per-feature attributions for the
+    /// dense row `get` into `acc` (layout `[output][0..width]`), one tree at a
+    /// time: folding a tree straight into the row would let a later tree's
+    /// large values round away an earlier tree's contribution in f64. Each
+    /// tree's expected value folds into the bias column `nf`.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_unconditioned(
+        &self,
+        shap_trees: &[ShapTree],
+        tree_means: &[f64],
+        get: &[f32],
+        k: usize,
+        nf: usize,
+        width: usize,
+        acc: &mut [f64],
+        scratch: &mut [f64],
+        arena: &mut [PathElement],
+    ) {
+        for (ti, tree) in shap_trees.iter().enumerate() {
+            let cls = ti % k;
+            let off = cls * width;
+            let weight = self.tree_weight(ti) as f64;
+            scratch.fill(0.0);
+            tree_shap(tree, get, scratch, arena, 0, -1);
+            for f in 0..nf {
+                acc[off + f] += weight * scratch[f];
+            }
+            // Tree expected value folds into the bias column.
+            acc[off + nf] += tree_means[ti];
+        }
+    }
+
     /// Exact TreeSHAP feature contributions, matching XGBoost `pred_contribs=True`.
     ///
     /// For a single-output model the result is row-major with shape
@@ -533,15 +580,7 @@ impl BoostedModel {
         let pro = self.attribution_prologue(data)?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
-
-        // Each tree's root mean value is instance-independent; compute once.
-        let tree_means: Vec<f64> = trees
-            .iter()
-            .enumerate()
-            .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
-            .collect();
-        let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
-        let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
+        let (tree_means, shap_trees, arena) = self.shap_forest(trees);
 
         let mut out = vec![0f32; n * k * width];
 
@@ -562,10 +601,8 @@ impl BoostedModel {
                     acc[c * width + nf] = initial[row * k + c] as f64;
                 }
                 if let Some(linear) = self.linear() {
-                    for_each_present_value(data, row, |f, x| {
-                        for c in 0..k {
-                            acc[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
-                        }
+                    self.for_each_linear_contribution(data, row, |f, c, v| {
+                        acc[c * width + f] += v;
                     });
                     for c in 0..k {
                         acc[c * width + nf] += linear.bias()[c] as f64;
@@ -573,22 +610,17 @@ impl BoostedModel {
                 }
                 rows.load(row, 1);
                 let get = rows.row(0).expect("single-row blocks are dense");
-                for (ti, tree) in shap_trees.iter().enumerate() {
-                    let cls = ti % k;
-                    let off = cls * width;
-                    let weight = self.tree_weight(ti) as f64;
-                    // Accumulate one tree at a time, exactly as the
-                    // interaction path does: folding a tree straight into
-                    // the row would let a later tree's large values round
-                    // away an earlier tree's contribution in f64.
-                    scratch.fill(0.0);
-                    tree_shap(tree, get, scratch, arena, 0, -1);
-                    for f in 0..nf {
-                        acc[off + f] += weight * scratch[f];
-                    }
-                    // Tree expected value folds into the bias column.
-                    acc[off + nf] += tree_means[ti];
-                }
+                self.accumulate_unconditioned(
+                    &shap_trees,
+                    &tree_means,
+                    get,
+                    k,
+                    nf,
+                    width,
+                    acc.as_mut_slice(),
+                    scratch.as_mut_slice(),
+                    arena.as_mut_slice(),
+                );
                 for (o, &v) in out_row.iter_mut().zip(acc.iter()) {
                     *o = v as f32;
                 }
@@ -626,16 +658,7 @@ impl BoostedModel {
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let mwidth = width * width;
-
-        // Each tree's root mean value is instance-independent; compute once.
-        let tree_means: Vec<f64> = trees
-            .iter()
-            .enumerate()
-            .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
-            .collect();
-
-        let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
-        let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
+        let (tree_means, shap_trees, arena) = self.shap_forest(trees);
         let mut out = vec![0f32; n * k * mwidth];
 
         // Per-thread scratch: unconditioned contributions, condition = +1
@@ -676,26 +699,24 @@ impl BoostedModel {
                     diag[c * width + nf] = initial[row * k + c] as f64;
                 }
                 if let Some(linear) = self.linear() {
-                    for_each_present_value(data, row, |f, x| {
-                        for c in 0..k {
-                            diag[c * width + f] += linear.weights()[f * k + c] as f64 * x as f64;
-                        }
+                    self.for_each_linear_contribution(data, row, |f, c, v| {
+                        diag[c * width + f] += v;
                     });
                     for c in 0..k {
                         diag[c * width + nf] += linear.bias()[c] as f64;
                     }
                 }
-                for (ti, tree) in shap_trees.iter().enumerate() {
-                    let cls = ti % k;
-                    let base = cls * width;
-                    s.phi.fill(0.0);
-                    tree_shap(tree, get, &mut s.phi, &mut s.arena, 0, -1);
-                    let weight = self.tree_weight(ti) as f64;
-                    for f in 0..nf {
-                        diag[base + f] += weight * s.phi[f];
-                    }
-                    diag[base + nf] += tree_means[ti];
-                }
+                self.accumulate_unconditioned(
+                    &shap_trees,
+                    &tree_means,
+                    get,
+                    k,
+                    nf,
+                    width,
+                    diag.as_mut_slice(),
+                    &mut s.phi,
+                    &mut s.arena,
+                );
                 for c in 0..k {
                     let mbase = c * mwidth;
                     let dbase = c * width;

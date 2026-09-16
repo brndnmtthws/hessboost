@@ -2,7 +2,7 @@
 //! and feature importance.
 
 mod cv;
-mod model;
+pub(crate) mod model;
 mod shap;
 mod train;
 

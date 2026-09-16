@@ -3,16 +3,17 @@
 
 use sequoia_boost::prelude::*;
 
+mod common;
+use common::{accuracy, fill_random, lcg};
+
 fn main() -> Result<()> {
     // 3 classes determined by a region of two features.
     let (n, f, k) = (1500usize, 4usize, 3usize);
     let mut rng = lcg(7);
     let mut x = vec![0f32; n * f];
     let mut y = vec![0f32; n];
+    fill_random(&mut rng, &mut x);
     for i in 0..n {
-        for j in 0..f {
-            x[i * f + j] = rng();
-        }
         let s = x[i * f] + x[i * f + 1];
         y[i] = if s < 0.7 {
             0.0
@@ -43,22 +44,7 @@ fn main() -> Result<()> {
 
     // Hard predictions via argmax.
     let classes = model.predict_class(&dtrain)?;
-    let acc = classes
-        .iter()
-        .zip(&y)
-        .filter(|(c, l)| **c as f32 == **l)
-        .count() as f32
-        / n as f32;
+    let acc = accuracy(&classes, &y);
     println!("training accuracy: {acc:.3}");
     Ok(())
-}
-
-fn lcg(seed: u64) -> impl FnMut() -> f32 {
-    let mut s = seed;
-    move || {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((s >> 33) as f32) / (1u32 << 31) as f32
-    }
 }

@@ -82,10 +82,6 @@ impl LinearModel {
         LinearModel { weights, bias }
     }
 
-    pub(crate) fn weights(&self) -> &[f32] {
-        &self.weights
-    }
-
     pub(crate) fn bias(&self) -> &[f32] {
         &self.bias
     }
@@ -112,9 +108,9 @@ pub(crate) fn base_margins(data: &DMatrix, base: f32, k: usize) -> Vec<f32> {
 }
 
 /// Invoke `f(feature, value)` for each present feature of `row` in feature
-/// order. Shared by the gblinear margin and TreeSHAP paths; arithmetic stays
-/// at each call site to preserve exact conversion points.
-pub(super) fn for_each_present_value(data: &DMatrix, row: usize, mut f: impl FnMut(usize, f32)) {
+/// order. Shared by the gblinear training and prediction paths; arithmetic
+/// stays at each call site to preserve exact conversion points.
+pub(crate) fn for_each_present_value(data: &DMatrix, row: usize, mut f: impl FnMut(usize, f32)) {
     for feat in 0..data.n_cols() {
         if let Some(x) = data.get(row, feat) {
             f(feat, x);
@@ -149,13 +145,9 @@ impl BoostedModel {
         self.linear = Some(linear);
     }
 
-    pub(crate) fn push_tree(&mut self, tree: RegTree) {
-        self.trees.push(tree);
-        self.tree_weights.push(1.0);
-        self.compact = OnceLock::new();
-    }
-
-    /// Append a tree with an explicit contribution weight (used by DART).
+    /// Append a tree with an explicit contribution weight (`1.0` for plain
+    /// `gbtree`; DART stores fractional weights so dropped trees can be
+    /// rescaled).
     pub(crate) fn push_tree_weighted(&mut self, tree: RegTree, weight: f32) {
         self.trees.push(tree);
         self.tree_weights.push(weight);
@@ -176,6 +168,28 @@ impl BoostedModel {
         self.tree_weights.get(i).copied().unwrap_or(1.0)
     }
 
+    /// Invoke `f(feature, output, weight * x)` for each present feature of
+    /// `row` and each output of the linear (`gblinear`) model, in feature
+    /// order. The product is computed in f64, which is exact for f32 operands;
+    /// callers round to their accumulation precision. No-op for tree
+    /// ensembles.
+    pub(crate) fn for_each_linear_contribution(
+        &self,
+        data: &DMatrix,
+        row: usize,
+        mut f: impl FnMut(usize, usize, f64),
+    ) {
+        let Some(lm) = &self.linear else {
+            return;
+        };
+        let k = self.n_outputs();
+        for_each_present_value(data, row, |feat, x| {
+            for c in 0..k {
+                f(feat, c, lm.weights[feat * k + c] as f64 * x as f64);
+            }
+        });
+    }
+
     /// Multiply tree `i`'s contribution weight by `factor` (DART rescaling).
     pub(crate) fn scale_tree_weight(&mut self, i: usize, factor: f32) {
         if i < self.tree_weights.len() {
@@ -188,19 +202,17 @@ impl BoostedModel {
     /// gradients from the ensemble minus its dropout set. Output is laid out
     /// `[instance][output]`.
     pub(crate) fn predict_margin_dropout(&self, data: &DMatrix, dropped: &[bool]) -> Vec<f32> {
-        let n = data.n_rows();
-        let k = self.n_outputs();
         let mut out = self.initial_margins(data);
-        for (ti, tree) in self.trees.iter().enumerate() {
+        // Dropped trees contribute a zero weight, leaving per-cell accumulation
+        // in ascending tree order (a `0.0` addend is a no-op).
+        let weight = |ti: usize| {
             if dropped.get(ti).copied().unwrap_or(false) {
-                continue;
+                0.0
+            } else {
+                self.tree_weight(ti)
             }
-            let w = self.tree_weight(ti);
-            let cls = ti % k;
-            for row in 0..n {
-                out[row * k + cls] += w * tree.predict_row(data, row);
-            }
-        }
+        };
+        self.accumulate_forest(data, &mut out, self.trees.len(), weight);
         out
     }
 
@@ -310,12 +322,8 @@ impl BoostedModel {
                 for c in 0..k {
                     out[row * k + c] += lm.bias[c];
                 }
-                for_each_present_value(data, row, |f, x| {
-                    if x != 0.0 {
-                        for c in 0..k {
-                            out[row * k + c] += lm.weights[f * k + c] * x;
-                        }
-                    }
+                self.for_each_linear_contribution(data, row, |_f, c, v| {
+                    out[row * k + c] += v as f32;
                 });
             }
             return out;
@@ -329,43 +337,87 @@ impl BoostedModel {
         // (it overrides the scalar base score, matching XGBoost); otherwise use
         // the trained global bias.
         let mut out = self.initial_margins(data);
+        self.accumulate_forest(data, &mut out, limit, |ti| self.tree_weight(ti));
+        out
+    }
+
+    /// Sum `weight(t) * leaf(row, t)` into `out[row * k + t % k]` for trees
+    /// `0..limit`, where `k` is the output count. Rows are traversed in
+    /// cache-friendly blocks (parallel across blocks); per (row, output) slot
+    /// the trees are still summed in ascending order, so the result is
+    /// bit-identical to the sequential tree-outer loop.
+    fn accumulate_forest(
+        &self,
+        data: &DMatrix,
+        out: &mut [f32],
+        limit: usize,
+        weight: impl Fn(usize) -> f32 + Sync,
+    ) {
+        let k = self.n_outputs();
+        self.traverse_blocks(
+            data,
+            out,
+            k,
+            limit,
+            |block, forest, r, out_row| block.accumulate_row(forest, r, limit, &weight, out_row),
+            |block, forest, ti, rows, out_block, stride| {
+                block.accumulate(
+                    forest,
+                    ti,
+                    rows,
+                    weight(ti),
+                    &mut out_block[ti % k..],
+                    stride,
+                )
+            },
+        );
+    }
+
+    /// Block-parallel traversal of trees `0..limit` over `data`, writing into
+    /// `out` laid out `[row][stride]`: `row_op` handles one loaded row of the
+    /// small-batch path, `tree_op` one tree over a loaded block of rows. Tiny
+    /// batches (online serving) skip the thread pool and overlap the trees of
+    /// each row instead of the rows of each tree; larger inputs process rows
+    /// in blocks whose feature rows stay in cache while every tree walks
+    /// them, with blocks running in parallel.
+    fn traverse_blocks<T: Send>(
+        &self,
+        data: &DMatrix,
+        out: &mut [T],
+        stride: usize,
+        limit: usize,
+        row_op: impl Fn(&RowBlock, &CompactForest, usize, &mut [T]),
+        tree_op: impl Fn(&RowBlock, &CompactForest, usize, usize, &mut [T], usize) + Sync,
+    ) {
+        let n = data.n_rows();
         let forest = self.compact_forest();
-        let weight = |ti: usize| self.tree_weight(ti);
-        // Tiny batches (online serving) skip the thread pool and overlap the
-        // trees of each row instead of the rows of each tree.
         if n < LANES {
             let mut block = RowBlock::new(data);
             block.load(0, n);
-            for (r, out_row) in out.chunks_exact_mut(k).enumerate() {
-                block.accumulate_row(forest, r, limit, weight, out_row);
+            for (r, out_row) in out.chunks_exact_mut(stride).enumerate() {
+                row_op(&block, forest, r, out_row);
             }
-            return out;
+            return;
         }
-        // Rows are processed in blocks: a block's feature rows stay in cache
-        // while every tree walks them, and blocks run in parallel. Per (row,
-        // output) slot the trees are still summed in order, so the result is
-        // bit-identical to the sequential tree-outer loop.
-        out.par_chunks_mut(PREDICT_BLOCK_ROWS * k)
+        out.par_chunks_mut(PREDICT_BLOCK_ROWS * stride)
             .enumerate()
             .for_each_init(
                 || RowBlock::new(data),
                 |block, (bi, out_block)| {
                     let start = bi * PREDICT_BLOCK_ROWS;
-                    let rows = out_block.len() / k;
+                    let rows = out_block.len() / stride;
                     block.load(start, rows);
                     for ti in 0..limit {
-                        block.accumulate(forest, ti, rows, weight(ti), &mut out_block[ti % k..], k);
+                        tree_op(block, forest, ti, rows, out_block, stride);
                     }
                 },
             );
-        out
     }
 
     /// Predictions in the objective's reported space. `multi:softprob` returns
     /// an `n_rows × num_class` probability matrix while `multi:softmax` returns
     /// one class index per row, encoded as `f32`.
     pub fn predict(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        self.validate_prediction_data(data)?;
         let mut margin = self.predict_margin(data)?;
         // A model trained with a custom objective cannot reconstruct its
         // transform from the name; fall back to the identity (raw margins),
@@ -421,28 +473,16 @@ impl BoostedModel {
         if t == 0 {
             return Ok(out);
         }
-        let forest = self.compact_forest();
-        if n < LANES {
-            let mut block = RowBlock::new(data);
-            block.load(0, n);
-            for (r, out_row) in out.chunks_exact_mut(t).enumerate() {
-                block.original_leaf_ids_for_row(forest, r, out_row);
-            }
-            return Ok(out);
-        }
-        out.par_chunks_mut(PREDICT_BLOCK_ROWS * t)
-            .enumerate()
-            .for_each_init(
-                || RowBlock::new(data),
-                |block, (bi, out_block)| {
-                    let start = bi * PREDICT_BLOCK_ROWS;
-                    let rows = out_block.len() / t;
-                    block.load(start, rows);
-                    for ti in 0..t {
-                        block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], t);
-                    }
-                },
-            );
+        self.traverse_blocks(
+            data,
+            &mut out,
+            t,
+            t,
+            |block, forest, r, out_row| block.original_leaf_ids_for_row(forest, r, out_row),
+            |block, forest, ti, rows, out_block, stride| {
+                block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], stride)
+            },
+        );
         Ok(out)
     }
 

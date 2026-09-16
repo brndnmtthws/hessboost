@@ -18,6 +18,24 @@ fn log_link_margin64(mean: f64) -> f32 {
     mean.max(1e-6).ln() as f32
 }
 
+/// Emit the `pred_transform`/`prob_to_margin`/`base_margin` trio shared by the
+/// log-link objectives (all predict `exp(margin)`).
+macro_rules! log_link_objective {
+    () => {
+        fn pred_transform(&self, preds: &mut [f32]) {
+            log_link_transform(preds);
+        }
+
+        fn prob_to_margin(&self, base_score: f32) -> f32 {
+            log_link_margin32(base_score)
+        }
+
+        fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
+            log_link_margin64(weighted_label_mean(labels, weights))
+        }
+    };
+}
+
 /// Poisson regression (`count:poisson`). Gradient is `exp(m) − y`. The Hessian is
 /// stabilized by `max_delta_step` (default 0.7 in XGBoost) via
 /// `exp(m + max_delta_step)`.
@@ -57,17 +75,7 @@ impl Objective for PoissonObjective {
         crate::simd::poisson_gradient(preds, labels, weights, self.max_delta_step, out);
     }
 
-    fn pred_transform(&self, preds: &mut [f32]) {
-        log_link_transform(preds);
-    }
-
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        log_link_margin32(base_score)
-    }
-
-    fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        log_link_margin64(weighted_label_mean(labels, weights))
-    }
+    log_link_objective!();
 
     fn default_metric(&self) -> &str {
         "poisson-nloglik"
@@ -95,17 +103,7 @@ impl Objective for GammaObjective {
         crate::simd::gamma_gradient(preds, labels, weights, out);
     }
 
-    fn pred_transform(&self, preds: &mut [f32]) {
-        log_link_transform(preds);
-    }
-
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        log_link_margin32(base_score)
-    }
-
-    fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        log_link_margin64(weighted_label_mean(labels, weights))
-    }
+    log_link_objective!();
 
     fn default_metric(&self) -> &str {
         "gamma-nloglik"
@@ -147,17 +145,7 @@ impl Objective for TweedieObjective {
         crate::simd::tweedie_gradient(preds, labels, weights, self.rho, out);
     }
 
-    fn pred_transform(&self, preds: &mut [f32]) {
-        log_link_transform(preds);
-    }
-
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        log_link_margin32(base_score)
-    }
-
-    fn base_margin(&self, labels: &[f32], weights: Option<&[f32]>) -> f32 {
-        log_link_margin64(weighted_label_mean(labels, weights))
-    }
+    log_link_objective!();
 
     fn default_metric(&self) -> &str {
         "tweedie-nloglik"

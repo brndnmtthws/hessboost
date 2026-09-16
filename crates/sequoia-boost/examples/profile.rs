@@ -11,29 +11,24 @@ use sequoia_boost::objective::{create_objective, GradPair};
 use sequoia_boost::prelude::*;
 use sequoia_boost::tree::builder::HistTreeBuilder;
 use sequoia_boost::tree::sampler::ColumnSampler;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
-fn read_f32(path: &str) -> Vec<f32> {
-    std::fs::read(path)
-        .unwrap()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
+mod common;
+use common::{load_meta, read_f32};
 
 fn main() -> Result<()> {
     let dir = std::env::var("BENCH_DIR").expect("set BENCH_DIR");
-    let meta: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(format!("{dir}/meta.json")).unwrap())
-            .unwrap();
-    let n = meta["n_rows"].as_u64().unwrap() as usize;
-    let f = meta["n_cols"].as_u64().unwrap() as usize;
-    let rounds = meta["num_round"].as_u64().unwrap() as usize;
-    let max_depth = meta["max_depth"].as_u64().unwrap() as usize;
-    let max_bin = meta["max_bin"].as_u64().unwrap() as usize;
+    let dir = Path::new(&dir);
+    let meta = load_meta(dir).expect("read meta.json");
+    let n = meta.n_rows;
+    let f = meta.n_cols;
+    let rounds = meta.num_round;
+    let max_depth = meta.max_depth;
+    let max_bin = meta.max_bin;
 
-    let x = read_f32(&format!("{dir}/X.bin"));
-    let y = read_f32(&format!("{dir}/y.bin"));
+    let x = read_f32(&dir.join("X.bin")).unwrap();
+    let y = read_f32(&dir.join("y.bin")).unwrap();
     let d = DMatrix::from_dense(&x, n, f)?.with_labels(&y)?;
     let params = TrainingParams::builder()
         .objective("reg:squarederror")

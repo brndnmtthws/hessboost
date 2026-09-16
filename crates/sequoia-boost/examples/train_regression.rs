@@ -7,7 +7,9 @@
 
 use sequoia_boost::metric::Rmse;
 use sequoia_boost::prelude::*;
-use sequoia_boost::Metric;
+
+mod common;
+use common::lcg;
 
 fn main() -> Result<()> {
     // Synthetic dataset: y = 2*x0 - 3*x1^2 + 0.5*x2, with x3 an unused feature.
@@ -16,13 +18,7 @@ fn main() -> Result<()> {
     let mut x = Vec::with_capacity(n_rows * n_cols);
     let mut y = Vec::with_capacity(n_rows);
     // A tiny deterministic LCG so the example needs no rng dependency.
-    let mut state: u64 = 0x1234_5678;
-    let mut next = || {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((state >> 33) as f32) / (1u32 << 31) as f32
-    };
+    let mut next = lcg(0x1234_5678);
     for _ in 0..n_rows {
         let x0 = next();
         let x1 = next();

@@ -78,6 +78,46 @@ pub(super) fn tweedie_gradient(
     }
 }
 
+pub(super) fn distance_sum<const SQUARED: bool>(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    range: std::ops::Range<usize>,
+) -> (f64, f64) {
+    let mut sum = 0.0;
+    let mut weight_sum = 0.0;
+    for index in range {
+        let weight = weights.map_or(1.0, |values| values[index] as f64);
+        let difference = preds[index] as f64 - labels[index] as f64;
+        let distance = if SQUARED {
+            difference * difference
+        } else {
+            difference.abs()
+        };
+        sum += weight * distance;
+        weight_sum += weight;
+    }
+    (sum, weight_sum)
+}
+
+pub(super) fn classification_error_sum(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    range: std::ops::Range<usize>,
+) -> (f64, f64) {
+    let mut wrong = 0.0;
+    let mut weight_sum = 0.0;
+    for index in range {
+        let weight = weights.map_or(1.0, |values| values[index] as f64);
+        if (preds[index] > 0.5) != (labels[index] > 0.5) {
+            wrong += weight;
+        }
+        weight_sum += weight;
+    }
+    (wrong, weight_sum)
+}
+
 pub(super) fn log_loss(
     preds: &[f32],
     labels: &[f32],

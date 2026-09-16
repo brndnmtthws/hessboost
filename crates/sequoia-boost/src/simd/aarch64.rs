@@ -1,4 +1,7 @@
-use super::{scalar, sigmoid_scalar, LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION};
+use super::{
+    prefilter_target, scalar, sigmoid_scalar, LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT,
+    MIN_POSITIVE_PREDICTION,
+};
 use crate::objective::GradPair;
 use crate::tree::gain::{calc_gain, GradStats, RegParams};
 use std::arch::aarch64::*;
@@ -9,9 +12,6 @@ use std::arch::aarch64::*;
 // The compiler inlines these constant function pointers.
 
 const VECTOR_WIDTH: usize = 4;
-const MAX_FAST_EXP_INPUT: f32 = 80.0;
-const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());
-const _: () = assert!(std::mem::size_of::<GradStats>() == 2 * std::mem::size_of::<f64>());
 // Shared vector-loop scaffolding for the gradient and metric-sum kernels below.
 // Lane formulas stay inline in each kernel; only the identical accumulate,
 // fallback, store, and reduction shells live here, so numerics are untouched.
@@ -329,12 +329,6 @@ pub(super) unsafe fn sum_grad_stats(values: &[GradStats]) -> GradStats {
     }
 }
 
-/// Relative slack applied to the division-free prefilter threshold. Both the
-/// cross-multiplied test and the exact quotient test round to within a few
-/// ULPs, so this margin guarantees the prefilter never rejects a candidate the
-/// exact comparison would accept. False positives merely pay for a division.
-const PREFILTER_SLACK: f64 = 1e-9;
-
 /// Ceiling applied to the prefilter bound before the improving comparison. A
 /// bound that overflowed to infinity compares as `inf > inf` (false) and would
 /// silently drop a candidate the exact comparison accepts, so saturated lanes
@@ -365,12 +359,6 @@ fn denominator_floor(target: f64, lambda: f64) -> f64 {
     } else {
         f64::INFINITY
     }
-}
-
-/// Scaled `gain(L) + gain(R)` a candidate must exceed to beat `best_loss`.
-#[inline]
-fn prefilter_target(best_loss: f64, comparison_epsilon: f64, parent_gain: f64) -> f64 {
-    (best_loss + comparison_epsilon + parent_gain) * (1.0 - PREFILTER_SLACK)
 }
 
 /// Scan state shared by the vector prefilter and the exact candidate check.
@@ -698,57 +686,40 @@ unsafe fn scan_dense_splits<const L1: bool>(
     }
 }
 
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn exp_inplace(values: &mut [f32]) {
-    // SAFETY: the caller guarantees NEON support. Pointer bounds are
-    // documented at each memory access below.
-    unsafe {
-        let mut index = 0;
-        while index + VECTOR_WIDTH <= values.len() {
-            // SAFETY: the loop condition leaves four readable and writable values.
-            let input = vld1q_f32(values.as_ptr().add(index));
-            if regular_input(input) {
-                let output = expq_f32::<true>(input);
-                // SAFETY: the loop condition leaves four writable values.
-                vst1q_f32(values.as_mut_ptr().add(index), output);
-            } else {
-                for value in &mut values[index..index + VECTOR_WIDTH] {
-                    *value = value.exp();
+/// Vector-loop shell of a `&mut [f32]` unary inplace kernel: vector fast path
+/// for regular lanes, scalar per-lane fallback otherwise. The kernel and
+/// scalar formulas (intrinsics included) are passed in as expressions.
+macro_rules! unary_inplace_kernel {
+    ($name:ident, $kernel:expr, $scalar:expr) => {
+        #[target_feature(enable = "neon")]
+        pub(super) unsafe fn $name(values: &mut [f32]) {
+            // SAFETY: the caller guarantees NEON support. Pointer bounds are
+            // documented at each memory access below.
+            unsafe {
+                let mut index = 0;
+                while index + VECTOR_WIDTH <= values.len() {
+                    // SAFETY: the loop condition leaves four readable and writable values.
+                    let input = vld1q_f32(values.as_ptr().add(index));
+                    if regular_input(input) {
+                        // SAFETY: the loop condition leaves four writable values.
+                        vst1q_f32(values.as_mut_ptr().add(index), ($kernel)(input));
+                    } else {
+                        for value in &mut values[index..index + VECTOR_WIDTH] {
+                            *value = ($scalar)(*value);
+                        }
+                    }
+                    index += VECTOR_WIDTH;
+                }
+                for value in &mut values[index..] {
+                    *value = ($scalar)(*value);
                 }
             }
-            index += VECTOR_WIDTH;
         }
-        for value in &mut values[index..] {
-            *value = value.exp();
-        }
-    }
+    };
 }
 
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn sigmoid_inplace(values: &mut [f32]) {
-    // SAFETY: the caller guarantees NEON support. Pointer bounds are
-    // documented at each memory access below.
-    unsafe {
-        let mut index = 0;
-        while index + VECTOR_WIDTH <= values.len() {
-            // SAFETY: the loop condition leaves four readable and writable values.
-            let input = vld1q_f32(values.as_ptr().add(index));
-            if regular_input(input) {
-                let output = sigmoidq_f32(input);
-                // SAFETY: the loop condition leaves four writable values.
-                vst1q_f32(values.as_mut_ptr().add(index), output);
-            } else {
-                for value in &mut values[index..index + VECTOR_WIDTH] {
-                    *value = sigmoid_scalar(*value);
-                }
-            }
-            index += VECTOR_WIDTH;
-        }
-        for value in &mut values[index..] {
-            *value = sigmoid_scalar(*value);
-        }
-    }
-}
+unary_inplace_kernel!(exp_inplace, expq_f32::<true>, f32::exp);
+unary_inplace_kernel!(sigmoid_inplace, sigmoidq_f32, sigmoid_scalar);
 
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn logistic_gradient(
@@ -1165,29 +1136,27 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
                     }
                 }
             } else {
-                for current in row..row + 4 {
-                    let base = current * K;
-                    super::softmax_gradient_row_scalar(
-                        &preds[base..base + K],
-                        labels[current] as usize,
-                        weights.map_or(1.0, |weights| weights[current]),
-                        min_hess,
-                        &mut out[base..base + K],
-                    );
-                }
+                super::softmax_gradient_rows_scalar(
+                    preds,
+                    labels,
+                    weights,
+                    min_hess,
+                    out,
+                    row..row + 4,
+                    K,
+                );
             }
             row += 4;
         }
-        for current in row..labels.len() {
-            let base = current * K;
-            super::softmax_gradient_row_scalar(
-                &preds[base..base + K],
-                labels[current] as usize,
-                weights.map_or(1.0, |weights| weights[current]),
-                min_hess,
-                &mut out[base..base + K],
-            );
-        }
+        super::softmax_gradient_rows_scalar(
+            preds,
+            labels,
+            weights,
+            min_hess,
+            out,
+            row..labels.len(),
+            K,
+        );
     }
 }
 
@@ -1369,22 +1338,12 @@ pub(super) unsafe fn distance_sum<const SQUARED: bool>(
             index += VECTOR_WIDTH;
         }
 
-        let mut sum = vaddvq_f64(vaddq_f64(sum_low, sum_high));
-        let mut weight_sum = match weights {
-            Some(_) => vaddvq_f64(vaddq_f64(weight_low, weight_high)),
-            None => index as f64,
+        let tail = scalar::distance_sum::<SQUARED>(preds, labels, weights, index..preds.len());
+        let sum = vaddvq_f64(vaddq_f64(sum_low, sum_high)) + tail.0;
+        let weight_sum = match weights {
+            Some(_) => vaddvq_f64(vaddq_f64(weight_low, weight_high)) + tail.1,
+            None => index as f64 + tail.1,
         };
-        for index in index..preds.len() {
-            let weight = weights.map_or(1.0, |values| values[index] as f64);
-            let difference = preds[index] as f64 - labels[index] as f64;
-            let distance = if SQUARED {
-                difference * difference
-            } else {
-                difference.abs()
-            };
-            sum += weight * distance;
-            weight_sum += weight;
-        }
         (sum, weight_sum)
     }
 }
@@ -1425,15 +1384,14 @@ pub(super) unsafe fn classification_error_sum(
                     weight_high = vaddq_f64(weight_high, current_weight_high);
                     index += VECTOR_WIDTH;
                 }
-                let mut wrong = vaddvq_f64(vaddq_f64(wrong_low, wrong_high));
-                let mut weight_sum = vaddvq_f64(vaddq_f64(weight_low, weight_high));
-                for index in index..preds.len() {
-                    let weight = weights[index] as f64;
-                    if (preds[index] > 0.5) != (labels[index] > 0.5) {
-                        wrong += weight;
-                    }
-                    weight_sum += weight;
-                }
+                let tail = scalar::classification_error_sum(
+                    preds,
+                    labels,
+                    Some(weights),
+                    index..preds.len(),
+                );
+                let wrong = vaddvq_f64(vaddq_f64(wrong_low, wrong_high)) + tail.0;
+                let weight_sum = vaddvq_f64(vaddq_f64(weight_low, weight_high)) + tail.1;
                 (wrong, weight_sum)
             }
             None => {
@@ -1453,10 +1411,9 @@ pub(super) unsafe fn classification_error_sum(
                     wrong_high = vaddq_u64(wrong_high, vmovl_high_u32(mismatch));
                     index += VECTOR_WIDTH;
                 }
-                let mut wrong = vaddvq_u64(vaddq_u64(wrong_low, wrong_high)) as f64;
-                for index in index..preds.len() {
-                    wrong += f64::from((preds[index] > 0.5) != (labels[index] > 0.5));
-                }
+                let tail =
+                    scalar::classification_error_sum(preds, labels, None, index..preds.len());
+                let wrong = vaddvq_u64(vaddq_u64(wrong_low, wrong_high)) as f64 + tail.0;
                 (wrong, preds.len() as f64)
             }
         }
@@ -1638,19 +1595,17 @@ pub(super) unsafe fn tweedie_nloglik_sum(
         while index + VECTOR_WIDTH <= preds.len() {
             // SAFETY: the common-length contract leaves four readable values.
             let pred = vld1q_f32(preds.as_ptr().add(index));
-            if !finite_input(pred) {
-                let end = index + VECTOR_WIDTH;
-                let partial = super::tweedie_nloglik_sum_scalar(
-                    &preds[index..end],
-                    &labels[index..end],
-                    weights.map(|values| &values[index..end]),
+            metric_finite_guard!(
+                pred,
+                index,
+                fallback,
+                super::tweedie_nloglik_sum_scalar(
+                    &preds[index..index + VECTOR_WIDTH],
+                    &labels[index..index + VECTOR_WIDTH],
+                    weights.map(|values| &values[index..index + VECTOR_WIDTH]),
                     rho,
-                );
-                fallback.0 += partial.0;
-                fallback.1 += partial.1;
-                index = end;
-                continue;
-            }
+                )
+            );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let prediction_low = vmaxq_f64(vcvt_f64_f32(vget_low_f32(pred)), minimum);
             let prediction_high = vmaxq_f64(vcvt_high_f64_f32(pred), minimum);
@@ -1695,12 +1650,16 @@ pub(super) unsafe fn tweedie_nloglik_sum(
             weights.map(|values| &values[index..]),
             rho,
         );
-        let loss = vaddvq_f64(vaddq_f64(loss_low, loss_high)) + fallback.0 + tail.0;
-        let weight_sum = match weights {
-            Some(_) => vaddvq_f64(vaddq_f64(weight_low, weight_high)) + fallback.1 + tail.1,
-            None => preds.len() as f64,
-        };
-        (loss, weight_sum)
+        finish_metric_sum!(
+            loss_low,
+            loss_high,
+            weight_low,
+            weight_high,
+            fallback,
+            tail,
+            weights,
+            preds.len()
+        )
     }
 }
 
@@ -1732,19 +1691,17 @@ pub(super) unsafe fn multiclass_log_loss_sum(
             ];
             // SAFETY: `selected` contains exactly four f32 lanes.
             let probability = vld1q_f32(selected.as_ptr());
-            if !finite_input(probability) {
-                let end = index + VECTOR_WIDTH;
-                let partial = super::multiclass_log_loss_sum_scalar(
-                    &preds[index * num_class..end * num_class],
-                    &labels[index..end],
-                    weights.map(|values| &values[index..end]),
+            metric_finite_guard!(
+                probability,
+                index,
+                fallback,
+                super::multiclass_log_loss_sum_scalar(
+                    &preds[index * num_class..(index + VECTOR_WIDTH) * num_class],
+                    &labels[index..index + VECTOR_WIDTH],
+                    weights.map(|values| &values[index..index + VECTOR_WIDTH]),
                     num_class,
-                );
-                fallback.0 += partial.0;
-                fallback.1 += partial.1;
-                index = end;
-                continue;
-            }
+                )
+            );
 
             let probability_low = vminq_f64(
                 vmaxq_f64(vcvt_f64_f32(vget_low_f32(probability)), lower),
@@ -1774,12 +1731,16 @@ pub(super) unsafe fn multiclass_log_loss_sum(
             weights.map(|values| &values[index..]),
             num_class,
         );
-        let loss = vaddvq_f64(vaddq_f64(loss_low, loss_high)) + fallback.0 + tail.0;
-        let weight_sum = match weights {
-            Some(_) => vaddvq_f64(vaddq_f64(weight_low, weight_high)) + fallback.1 + tail.1,
-            None => labels.len() as f64,
-        };
-        (loss, weight_sum)
+        finish_metric_sum!(
+            loss_low,
+            loss_high,
+            weight_low,
+            weight_high,
+            fallback,
+            tail,
+            weights,
+            labels.len()
+        )
     }
 }
 
@@ -1790,23 +1751,11 @@ pub(super) unsafe fn multiclass_error_sum(
     weights: Option<&[f32]>,
     num_class: usize,
 ) -> (f64, f64) {
-    // SAFETY: the caller guarantees NEON support. Pointer bounds are
-    // documented at each memory access below.
-    unsafe {
-        let mut wrong = 0.0;
-        let mut weight_sum = 0.0;
-        for (row_index, &label) in labels.iter().enumerate() {
-            let row = &preds[row_index * num_class..(row_index + 1) * num_class];
-            // SAFETY: the dispatcher verified `num_class` fits u32 and NEON exists.
-            let best = argmax(row);
-            let weight = weights.map_or(1.0, |values| values[row_index] as f64);
-            if best != label as usize {
-                wrong += weight;
-            }
-            weight_sum += weight;
-        }
-        (wrong, weight_sum)
-    }
+    super::multiclass_error_sum_rows(preds, labels, weights, num_class, |row| {
+        // SAFETY: the dispatcher verified NEON support, a complete prediction
+        // matrix, and a u32-fitting class count.
+        unsafe { argmax(row) }
+    })
 }
 
 #[inline]

@@ -83,7 +83,6 @@ pub struct DMatrix {
     base_margin: Option<Vec<f32>>,
     group: Option<GroupInfo>,
     feature_types: Vec<FeatureType>,
-    feature_names: Option<Vec<String>>,
 }
 
 /// A single materialized `(feature_index, value)` entry from a row.
@@ -96,6 +95,21 @@ pub struct Entry {
 }
 
 impl DMatrix {
+    /// Shared constructor: validated storage plus default (empty) metadata.
+    fn new(n_rows: usize, n_cols: usize, storage: Storage, missing: f32) -> Self {
+        DMatrix {
+            n_rows,
+            n_cols,
+            storage,
+            missing,
+            labels: None,
+            weights: None,
+            base_margin: None,
+            group: None,
+            feature_types: vec![FeatureType::Numerical; n_cols],
+        }
+    }
+
     /// Build a dense matrix from a row-major slice of length `n_rows * n_cols`.
     /// The missing sentinel defaults to NaN.
     pub fn from_dense(data: &[f32], n_rows: usize, n_cols: usize) -> Result<Self> {
@@ -132,18 +146,12 @@ impl DMatrix {
                 "non-missing feature values must be finite",
             ));
         }
-        Ok(DMatrix {
+        Ok(Self::new(
             n_rows,
             n_cols,
-            storage: Storage::Dense(data.to_vec()),
+            Storage::Dense(data.to_vec()),
             missing,
-            labels: None,
-            weights: None,
-            base_margin: None,
-            group: None,
-            feature_types: vec![FeatureType::Numerical; n_cols],
-            feature_names: None,
-        })
+        ))
     }
 
     /// Build a matrix from compressed-sparse-row arrays.
@@ -191,27 +199,21 @@ impl DMatrix {
                 }
             }
         }
-        Ok(DMatrix {
+        Ok(Self::new(
             n_rows,
             n_cols,
-            storage: Storage::Csr {
+            Storage::Csr {
                 indptr,
                 indices,
                 values,
             },
-            missing: f32::NAN,
-            labels: None,
-            weights: None,
-            base_margin: None,
-            group: None,
-            feature_types: vec![FeatureType::Numerical; n_cols],
-            feature_names: None,
-        })
+            f32::NAN,
+        ))
     }
 
     /// Attach regression/classification labels (`len == n_rows`).
     pub fn with_labels(mut self, labels: &[f32]) -> Result<Self> {
-        self.check_row_len("labels", labels.len())?;
+        check_len("labels", labels.len(), self.n_rows)?;
         if labels.iter().any(|v| !v.is_finite()) {
             return Err(SequoiaError::invalid_param(
                 "labels",
@@ -224,7 +226,7 @@ impl DMatrix {
 
     /// Attach per-instance weights (`len == n_rows`).
     pub fn with_weights(mut self, weights: &[f32]) -> Result<Self> {
-        self.check_row_len("weights", weights.len())?;
+        check_len("weights", weights.len(), self.n_rows)?;
         if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
             return Err(SequoiaError::invalid_param(
                 "weights",
@@ -330,17 +332,6 @@ impl DMatrix {
         Ok(self)
     }
 
-    /// Set human-readable feature names (`len == n_cols`).
-    pub fn with_feature_names(mut self, names: &[String]) -> Result<Self> {
-        check_len("feature_names length", names.len(), self.n_cols)?;
-        self.feature_names = Some(names.to_vec());
-        Ok(self)
-    }
-
-    fn check_row_len(&self, what: &'static str, got: usize) -> Result<()> {
-        check_len(what, got, self.n_rows)
-    }
-
     /// Number of rows (instances).
     #[inline]
     pub fn n_rows(&self) -> usize {
@@ -387,12 +378,6 @@ impl DMatrix {
     #[inline]
     pub fn feature_types(&self) -> &[FeatureType] {
         &self.feature_types
-    }
-
-    /// Feature names, if attached.
-    #[inline]
-    pub fn feature_names(&self) -> Option<&[String]> {
-        self.feature_names.as_deref()
     }
 
     /// Fetch a single value, returning `None` when the entry is missing.
@@ -456,23 +441,16 @@ impl DMatrix {
         }
     }
 
-    /// Materialize a single row's non-missing `(index, value)` entries into
-    /// `out`. Reuses the buffer to avoid per-row allocation in hot loops.
-    pub fn row_into(&self, row: usize, out: &mut Vec<Entry>) {
-        out.clear();
-        if row >= self.n_rows {
-            return;
-        }
+    /// Visit every non-missing `(index, value)` entry of `row`, in storage
+    /// order. `row` must be in bounds.
+    fn for_row_entry(&self, row: usize, mut f: impl FnMut(u32, f32)) {
         match &self.storage {
             Storage::Dense(data) => {
                 let base = row * self.n_cols;
                 for c in 0..self.n_cols {
                     let v = data[base + c];
                     if !is_missing(v, self.missing) {
-                        out.push(Entry {
-                            index: c as u32,
-                            value: v,
-                        });
+                        f(c as u32, v);
                     }
                 }
             }
@@ -485,14 +463,21 @@ impl DMatrix {
                 for k in s..e {
                     let v = values[k];
                     if !is_missing(v, self.missing) {
-                        out.push(Entry {
-                            index: indices[k],
-                            value: v,
-                        });
+                        f(indices[k], v);
                     }
                 }
             }
         }
+    }
+
+    /// Materialize a single row's non-missing `(index, value)` entries into
+    /// `out`. Reuses the buffer to avoid per-row allocation in hot loops.
+    pub fn row_into(&self, row: usize, out: &mut Vec<Entry>) {
+        out.clear();
+        if row >= self.n_rows {
+            return;
+        }
+        self.for_row_entry(row, |index, value| out.push(Entry { index, value }));
     }
 
     /// Build a compressed-sparse-**column** view for column-oriented split
@@ -552,7 +537,6 @@ impl DMatrix {
         }
         let mut out = DMatrix::from_csr(indptr, indices, values, self.n_cols)?;
         out.feature_types = self.feature_types.clone();
-        out.feature_names = self.feature_names.clone();
         if let Some(l) = &self.labels {
             out.labels = Some(rows.iter().map(|&r| l[r]).collect());
         }

@@ -21,6 +21,7 @@
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::{Result, SequoiaError};
+use crate::learner::model::for_each_present_value;
 use crate::learner::LinearModel;
 use crate::objective::{GradPair, Objective};
 
@@ -48,14 +49,6 @@ fn coordinate_delta(sum_grad: f64, sum_hess: f64, w: f64, alpha: f64, lambda: f6
     } else {
         (-(sum_grad_l2 - alpha) / sum_hess_l2).min(-w)
     }
-}
-
-/// Coordinate step for the (unregularized) bias / intercept term.
-fn bias_delta(sum_grad: f64, sum_hess: f64) -> f64 {
-    if sum_hess < 1e-5 {
-        return 0.0;
-    }
-    -sum_grad / sum_hess
 }
 
 /// Fit a linear booster by coordinate descent.
@@ -92,14 +85,13 @@ pub(crate) fn train_gblinear(
         })
         .collect();
     for row in 0..n {
-        for (f, col) in cols.iter_mut().enumerate() {
-            if let Some(x) = dtrain.get(row, f) {
-                if x != 0.0 {
-                    col.rows.push(row as u32);
-                    col.vals.push(x);
-                }
+        for_each_present_value(dtrain, row, |f, x| {
+            if x != 0.0 {
+                let col = &mut cols[f];
+                col.rows.push(row as u32);
+                col.vals.push(x);
             }
-        }
+        });
     }
 
     let mut lin_weights = vec![0.0f32; n_features * n_out];
@@ -122,7 +114,7 @@ pub(crate) fn train_gblinear(
                 g += gp.grad as f64;
                 h += gp.hess as f64;
             }
-            let db = eta * bias_delta(g, h);
+            let db = eta * coordinate_delta(g, h, 0.0, 0.0, 0.0);
             if db != 0.0 {
                 let db32 = db as f32;
                 bias[k] += db32;

@@ -554,6 +554,13 @@ impl TrainingParams {
                 self.multi_strategy == MultiStrategy::OneOutputPerTree,
                 "quantized training grows one-output trees only",
             )?;
+            // Symmetric growth builds its level histograms outside the
+            // quantized node path, so the setting would be silently ignored.
+            ensure(
+                "use_quantized_grad",
+                self.grow_policy != GrowPolicy::Symmetric,
+                "quantized training is not supported with `grow_policy=symmetric`",
+            )?;
         }
         self.validate_tree_options()
     }
@@ -1092,5 +1099,20 @@ mod tests {
             ));
         }
         assert!(toad().linear_tree(true).build().is_ok());
+    }
+
+    /// Symmetric growth builds histograms outside the quantized path.
+    #[test]
+    fn quantized_training_refuses_symmetric_growth() {
+        let q = || {
+            TrainingParams::builder()
+                .use_quantized_grad(true)
+                .max_depth(3)
+        };
+        assert!(matches!(
+            q().grow_policy(GrowPolicy::Symmetric).build(),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "use_quantized_grad"
+        ));
+        assert!(q().grow_policy(GrowPolicy::LossGuide).build().is_ok());
     }
 }

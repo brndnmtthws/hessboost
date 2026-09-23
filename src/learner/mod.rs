@@ -4,6 +4,7 @@
 pub mod conformal;
 mod cv;
 pub(crate) mod model;
+mod sampling;
 mod shap;
 mod train;
 

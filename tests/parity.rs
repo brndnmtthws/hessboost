@@ -23,7 +23,7 @@
 use hessboost::data::HistCuts;
 use hessboost::prelude::{
     BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError, Monotone,
-    TrainingParams, TreeMethod, train,
+    SamplingMethod, TrainingParams, TreeMethod, train,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -69,6 +69,9 @@ struct Fixture {
     x_test: Vec<f32>,
     y_test: Vec<f32>,
     weights: Option<Vec<f32>>,
+    /// Per-column `DMatrix` feature weights for column sampling.
+    #[serde(default)]
+    feature_weights: Option<Vec<f32>>,
     group_sizes: Option<Vec<usize>>,
     test_group_sizes: Option<Vec<usize>>,
     feature_types: Option<Vec<String>>,
@@ -205,6 +208,11 @@ fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
             "colsample_bytree" => b.colsample_bytree(f64_of(k, v)?),
             "colsample_bylevel" => b.colsample_bylevel(f64_of(k, v)?),
             "colsample_bynode" => b.colsample_bynode(f64_of(k, v)?),
+            "sampling_method" => b.sampling_method(match str_of(k, v)? {
+                "uniform" => SamplingMethod::Uniform,
+                "gradient_based" => SamplingMethod::GradientBased,
+                other => return Err(format!("sampling_method `{other}` not mapped")),
+            }),
             "seed" => b.seed(usize_of(k, v)? as u64),
             "tweedie_variance_power" => b.tweedie_variance_power(f64_of(k, v)?),
             "huber_slope" => b.huber_slope(f64_of(k, v)?),
@@ -417,6 +425,11 @@ impl Case<'_> {
             .map_err(|e| format!("labels: {e}"))?;
         if let Some(w) = &fx.weights {
             d = d.with_weights(w).map_err(|e| format!("weights: {e}"))?;
+        }
+        if let Some(w) = &fx.feature_weights {
+            d = d
+                .with_feature_weights(w)
+                .map_err(|e| format!("feature_weights: {e}"))?;
         }
         if let Some(g) = &fx.group_sizes {
             d = d

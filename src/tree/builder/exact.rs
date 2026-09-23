@@ -169,7 +169,7 @@ impl<'a> ExactTreeBuilder<'a> {
 
         while depth < depth_limit && !active.is_empty() {
             // One column subset for the whole level (bylevel ∘ bynode).
-            let feature_subset = sampler.sample();
+            let feature_subset = sampler.sample(depth);
             let k = active.len();
             // slot_of_node maps an active node id to its dense slot index.
             let mut slot_of_node = vec![usize::MAX; tree.num_nodes()];

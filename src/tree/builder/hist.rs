@@ -165,7 +165,7 @@ impl<'a> HistTreeBuilder<'a> {
         };
 
         // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
-        let root_feats = sampler.sample();
+        let root_feats = sampler.sample(0);
         let best = self.evaluate(
             ghist,
             &root_hist,
@@ -341,26 +341,29 @@ impl<'a> HistTreeBuilder<'a> {
         store.push(b.left, lb_bounds);
         store.push(b.right, rb_bounds);
 
+        let child_depth = entry.depth + 1;
         if self.params.grow_policy == GrowPolicy::DepthWise
-            && entry.depth + 1 >= self.depth_limit()
+            && child_depth >= self.depth_limit()
             && store.leaf_rows.is_none()
         {
             // Preserve the draws for these two nodes, including when callers
             // reuse the sampler. Their rows, histograms and candidate splits
             // cannot affect this tree, and leaf weights use the stored stats.
-            sampler.sample();
-            sampler.sample();
+            sampler.sample(child_depth);
+            sampler.sample(child_depth);
             return None;
         }
 
+        let left_features = sampler.sample(child_depth);
+        let right_features = sampler.sample(child_depth);
         Some(PendingSplit {
             entry,
             left_id,
             right_id,
             left_bounds: lb_bounds,
             right_bounds: rb_bounds,
-            left_features: sampler.sample(),
-            right_features: sampler.sample(),
+            left_features,
+            right_features,
         })
     }
 
@@ -771,19 +774,25 @@ mod tests {
         for depth in [1, 2, 4] {
             let params = TrainingParams::builder().max_depth(depth).build().unwrap();
             let builder = HistTreeBuilder::new(&params);
-            let new_sampler = || ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 42);
+            let new_sampler = || ColumnSampler::new(features, None, 1.0, 0.75, 0.75, 42);
             let mut sampler = new_sampler();
             let mut expected = new_sampler();
             for _ in 0..3 {
                 let tree = builder.build(&ghist, &gradients, &rows, &mut sampler);
                 assert!(tree.num_nodes() > 1);
-                // Every created node consumes one draw, including leaves whose
-                // histogram and split search are skipped at the depth limit.
-                for _ in 0..tree.num_nodes() {
-                    expected.sample();
+                // Every created node consumes one draw at its depth, in node-id
+                // order, including leaves whose histogram and split search are
+                // skipped at the depth limit.
+                let mut node_depth = vec![0usize; tree.num_nodes()];
+                for (nid, node) in tree.nodes().iter().enumerate() {
+                    expected.sample(node_depth[nid]);
+                    if !node.is_leaf() {
+                        node_depth[node.left as usize] = node_depth[nid] + 1;
+                        node_depth[node.right as usize] = node_depth[nid] + 1;
+                    }
                 }
-                for _ in 0..4 {
-                    assert_eq!(sampler.sample(), expected.sample());
+                for depth in 0..4 {
+                    assert_eq!(sampler.sample(depth), expected.sample(depth));
                 }
             }
         }
@@ -842,7 +851,7 @@ mod tests {
                 .build()
                 .unwrap();
             let builder = HistTreeBuilder::new(&params);
-            let new_sampler = || ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 91);
+            let new_sampler = || ColumnSampler::new(features, None, 1.0, 0.75, 0.75, 91);
             // Three samplers from one seed, kept in lockstep by the draws below.
             let mut expected_sampler = new_sampler();
             let mut sampler = new_sampler();
@@ -872,9 +881,9 @@ mod tests {
                 assert!(seen.into_iter().all(|seen| seen));
                 assert!(actual.num_nodes() > 7, "must exercise multiple depths");
                 assert_eq!(actual, expected, "{mode}");
-                let next = sampler.sample();
-                assert_eq!(next, expected_sampler.sample(), "{mode}");
-                assert_eq!(next, captured_sampler.sample(), "{mode}");
+                let next = sampler.sample(1);
+                assert_eq!(next, expected_sampler.sample(1), "{mode}");
+                assert_eq!(next, captured_sampler.sample(1), "{mode}");
             }
         }
     }

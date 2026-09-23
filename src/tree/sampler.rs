@@ -1,66 +1,144 @@
 //! Column (feature) subsampling shared by the tree builders.
 //!
-//! XGBoost exposes three cumulative column-sampling ratios: `colsample_bytree`
-//! (per tree), `colsample_bylevel` (per level), and `colsample_bynode` (per
-//! node). The per-tree sample is drawn by the trainer and passed in here as the
-//! *pool*. This sampler then draws the `bylevel` and `bynode` subsets from it.
+//! XGBoost exposes three cumulative column-sampling ratios, applied like its
+//! `common::ColumnSampler`:
 //!
-//! Call granularity differs by builder: the histogram builder samples once per
-//! node ([`ColumnSampler::sample`] per node), while the exact builder samples
-//! once per level (shared across that level's nodes). With the default ratios of
-//! `1.0` every draw returns the full pool.
+//! 1. `colsample_bytree`: one pool per tree, drawn from every feature when the
+//!    sampler is built;
+//! 2. `colsample_bylevel`: one subset of the tree pool per depth, drawn the
+//!    first time that depth is requested and cached for the rest of the tree;
+//! 3. `colsample_bynode`: a fresh subset of the level set on every call.
+//!
+//! Each stage keeps `max(1, trunc(ratio * pool_len))` features (computed in
+//! `f32`, as upstream does); a ratio of `1.0` returns its input without
+//! drawing. Without feature weights a stage is a uniform draw without
+//! replacement. With [`DMatrix::with_feature_weights`] it is the
+//! Efraimidis–Spirakis weighted draw without replacement: every candidate
+//! feature gets the key `ln(u) / max(w, 1e-6)` with `u ~ U[0, 1)`, and the
+//! largest keys win. Zero weights are floored at `1e-6` exactly as in XGBoost,
+//! so a zero-weight feature always ranks below every positive-weight one and is
+//! only drawn when a stage needs more features than have positive weight.
+//!
+//! Call granularity differs by builder: the histogram builder calls
+//! [`ColumnSampler::sample`] once per node, while the exact builder calls it
+//! once per level (as XGBoost's `colmaker` does). Interaction constraints
+//! filter the returned subset afterwards and never re-add unsampled features.
+//! With the default ratios of `1.0` every draw returns all features.
+//!
+//! [`DMatrix::with_feature_weights`]: crate::data::DMatrix::with_feature_weights
 
-use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::{RngExt, SeedableRng};
 
-/// Draws feature subsets from a per-tree pool according to the `bylevel` and
-/// `bynode` ratios.
+/// XGBoost `kRtEps`: the floor applied to feature weights before the weighted
+/// draw.
+const WEIGHT_FLOOR: f32 = 1e-6;
+
+/// Draws feature subsets for one tree according to the `bytree`, `bylevel`,
+/// and `bynode` ratios, optionally weighted by per-feature weights.
 #[derive(Debug)]
 pub struct ColumnSampler {
-    pool: Vec<u32>,
-    bylevel: f64,
-    bynode: f64,
+    tree: Vec<u32>,
+    /// `bylevel` subsets by depth, drawn lazily.
+    levels: Vec<Option<Vec<u32>>>,
+    /// Per-feature sampling weights indexed by feature id; `None` samples
+    /// uniformly.
+    weights: Option<Vec<f32>>,
+    bylevel: f32,
+    bynode: f32,
     rng: StdRng,
 }
 
 impl ColumnSampler {
-    /// Build a sampler over `pool` (the per-tree / `colsample_bytree` features).
-    pub fn new(pool: Vec<u32>, bylevel: f64, bynode: f64, seed: u64) -> Self {
-        ColumnSampler {
-            pool,
-            bylevel,
-            bynode,
-            rng: StdRng::seed_from_u64(seed),
+    /// Build the sampler for one tree over `n_features` columns, drawing the
+    /// `bytree` pool immediately. `weights`, when given, has one non-negative
+    /// entry per feature and makes every stage a weighted draw.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `weights` is given with a length other than `n_features`.
+    pub fn new(
+        n_features: usize,
+        weights: Option<&[f32]>,
+        bytree: f64,
+        bylevel: f64,
+        bynode: f64,
+        seed: u64,
+    ) -> Self {
+        if let Some(w) = weights {
+            assert_eq!(w.len(), n_features, "one feature weight per feature");
         }
+        let mut sampler = ColumnSampler {
+            tree: Vec::new(),
+            levels: Vec::new(),
+            weights: weights.map(<[f32]>::to_vec),
+            bylevel: bylevel as f32,
+            bynode: bynode as f32,
+            rng: StdRng::seed_from_u64(seed),
+        };
+        let all: Vec<u32> = (0..n_features as u32).collect();
+        sampler.tree = sampler.draw(&all, bytree as f32);
+        sampler
     }
 
     /// A pass-through sampler over all `n_features` columns (ratios `1.0`),
     /// primarily for tests and callers that do no column sampling.
     pub fn all(n_features: usize) -> Self {
-        ColumnSampler::new((0..n_features as u32).collect(), 1.0, 1.0, 0)
+        ColumnSampler::new(n_features, None, 1.0, 1.0, 1.0, 0)
     }
 
-    /// Draw a feature subset: the `bylevel` sample of the pool, then the
-    /// `bynode` sample of that. Returned features are sorted ascending.
-    pub fn sample(&mut self) -> Vec<u32> {
-        let level = subsample(&self.pool, self.bylevel, &mut self.rng);
-        subsample(&level, self.bynode, &mut self.rng)
+    /// The candidate features for a node at `depth`: that depth's cached
+    /// `bylevel` subset of the tree pool, then a fresh `bynode` subset of it.
+    /// Returned features are sorted ascending.
+    pub fn sample(&mut self, depth: usize) -> Vec<u32> {
+        if self.bylevel >= 1.0 && self.bynode >= 1.0 {
+            return self.tree.clone();
+        }
+        if self.levels.len() <= depth {
+            self.levels.resize(depth + 1, None);
+        }
+        let level = match self.levels[depth].take() {
+            Some(level) => level,
+            None => self.draw(&self.tree.clone(), self.bylevel),
+        };
+        let node = self.draw(&level, self.bynode);
+        self.levels[depth] = Some(level);
+        node
     }
-}
 
-/// Sample `round(ratio * len)` features (at least one) without replacement,
-/// sorted ascending. Returns a clone of `pool` when `ratio >= 1`.
-fn subsample(pool: &[u32], ratio: f64, rng: &mut StdRng) -> Vec<u32> {
-    if ratio >= 1.0 || pool.len() <= 1 {
-        return pool.to_vec();
+    /// One sampling stage over `pool`: `max(1, trunc(ratio * len))` features
+    /// without replacement (weighted when weights are set), sorted ascending.
+    fn draw(&mut self, pool: &[u32], ratio: f32) -> Vec<u32> {
+        if ratio >= 1.0 || pool.is_empty() {
+            return pool.to_vec();
+        }
+        let n = ((ratio * pool.len() as f32) as usize).clamp(1, pool.len());
+        let mut chosen = match &self.weights {
+            None => {
+                let mut features = pool.to_vec();
+                features.shuffle(&mut self.rng);
+                features.truncate(n);
+                features
+            }
+            Some(weights) => {
+                let rng = &mut self.rng;
+                let mut keyed: Vec<(f32, u32)> = pool
+                    .iter()
+                    .map(|&f| {
+                        let w = weights[f as usize].max(WEIGHT_FLOOR);
+                        (rng.random::<f32>().ln() / w, f)
+                    })
+                    .collect();
+                // Stable descending sort by key, as XGBoost's `ArgSort`.
+                keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
+                keyed.truncate(n);
+                keyed.into_iter().map(|(_, f)| f).collect()
+            }
+        };
+        chosen.sort_unstable();
+        chosen
     }
-    let k = ((ratio * pool.len() as f64).round() as usize).clamp(1, pool.len());
-    let mut idx = pool.to_vec();
-    idx.shuffle(rng);
-    idx.truncate(k);
-    idx.sort_unstable();
-    idx
 }
 
 #[cfg(test)]
@@ -70,33 +148,121 @@ mod tests {
     #[test]
     fn pass_through_when_ratios_one() {
         let mut s = ColumnSampler::all(10);
-        let f = s.sample();
-        assert_eq!(f, (0..10u32).collect::<Vec<_>>());
+        assert_eq!(s.sample(0), (0..10u32).collect::<Vec<_>>());
+        assert_eq!(s.sample(3), (0..10u32).collect::<Vec<_>>());
     }
 
     #[test]
-    fn composes_bylevel_and_bynode() {
-        // pool of 100, bylevel 0.5, bynode 0.5 -> ~25 features, subset of pool.
-        let pool: Vec<u32> = (0..100).collect();
-        let mut s = ColumnSampler::new(pool.clone(), 0.5, 0.5, 42);
-        let f = s.sample();
-        assert_eq!(f.len(), 25); // round(0.5*100)=50, round(0.5*50)=25
-        assert!(f.windows(2).all(|w| w[0] < w[1]), "sorted & unique");
-        assert!(f.iter().all(|x| pool.contains(x)));
+    fn stage_counts_truncate_like_xgboost() {
+        // 10 * 0.75 = 7.5 -> 7 (bytree); 7 * 0.5 = 3.5 -> 3 (bylevel);
+        // 3 * 0.5 = 1.5 -> 1 (bynode).
+        let mut s = ColumnSampler::new(10, None, 0.75, 0.5, 0.5, 42);
+        assert_eq!(s.tree.len(), 7);
+        let f = s.sample(0);
+        assert_eq!(f.len(), 1);
+        assert_eq!(s.levels[0].as_ref().unwrap().len(), 3);
+        // A tiny ratio still keeps one feature.
+        let mut tiny = ColumnSampler::new(3, None, 0.01, 0.01, 0.01, 1);
+        assert_eq!(tiny.sample(0).len(), 1);
+    }
+
+    #[test]
+    fn level_subset_is_cached_per_depth_and_node_subsets_nest_in_it() {
+        let mut s = ColumnSampler::new(40, None, 0.8, 0.5, 0.5, 9);
+        let tree = s.tree.clone();
+        let first = s.sample(2);
+        let level = s.levels[2].clone().unwrap();
+        assert!(level.iter().all(|f| tree.contains(f)));
+        let mut node_sets = vec![first];
+        for _ in 0..20 {
+            node_sets.push(s.sample(2));
+        }
+        assert_eq!(s.levels[2].as_ref().unwrap(), &level, "level set is fixed");
+        for set in &node_sets {
+            assert!(set.windows(2).all(|w| w[0] < w[1]), "sorted & unique");
+            assert!(set.iter().all(|f| level.contains(f)));
+        }
+        assert!(
+            node_sets.iter().any(|set| set != &node_sets[0]),
+            "node subsets are redrawn per call"
+        );
     }
 
     #[test]
     fn deterministic_for_seed() {
-        let pool: Vec<u32> = (0..50).collect();
-        let mut a = ColumnSampler::new(pool.clone(), 0.6, 1.0, 7);
-        let mut b = ColumnSampler::new(pool, 0.6, 1.0, 7);
-        assert_eq!(a.sample(), b.sample());
+        let weights: Vec<f32> = (0..50).map(|i| (i % 7) as f32).collect();
+        for w in [None, Some(weights.as_slice())] {
+            let mut a = ColumnSampler::new(50, w, 0.6, 0.7, 0.8, 7);
+            let mut b = ColumnSampler::new(50, w, 0.6, 0.7, 0.8, 7);
+            for depth in [0, 1, 1, 0, 3] {
+                assert_eq!(a.sample(depth), b.sample(depth));
+            }
+        }
+    }
+
+    /// Selecting one feature out of a pool with the ES keys picks feature `i`
+    /// with probability `w_i / sum(w)`; check the empirical frequencies.
+    #[test]
+    fn single_draw_frequencies_are_proportional_to_weights() {
+        let weights = [1.0f32, 2.0, 3.0, 4.0, 0.0];
+        let trials = 40_000;
+        let mut counts = [0usize; 5];
+        for seed in 0..trials {
+            // 5 * 0.2 = 1 feature per tree.
+            let s = ColumnSampler::new(5, Some(&weights), 0.2, 1.0, 1.0, seed);
+            counts[s.tree[0] as usize] += 1;
+        }
+        assert_eq!(counts[4], 0, "zero weight never beats a positive weight");
+        for (i, &count) in counts[..4].iter().enumerate() {
+            let expected = f64::from(weights[i]) / 10.0;
+            let freq = count as f64 / f64::from(trials as u32);
+            // Binomial standard error is below 0.0025; allow ~5 sigma.
+            assert!(
+                (freq - expected).abs() < 0.012,
+                "feature {i}: freq {freq} vs {expected}"
+            );
+        }
+    }
+
+    /// Multi-feature draws without replacement: inclusion probabilities follow
+    /// the successive-sampling law, which for two of three features with
+    /// weights (1, 1, 8) gives feature 2 probability
+    /// 0.8 + 2 * 0.1 * (8 / 9) = 0.9778 and each light feature 0.5111.
+    #[test]
+    fn without_replacement_inclusion_matches_successive_sampling() {
+        let weights = [1.0f32, 1.0, 8.0];
+        let trials = 30_000u64;
+        let mut counts = [0usize; 3];
+        for seed in 0..trials {
+            // 3 * 0.7 = 2.1 -> 2 features at the node stage.
+            let mut s = ColumnSampler::new(3, Some(&weights), 1.0, 1.0, 0.7, seed);
+            let f = s.sample(0);
+            assert_eq!(f.len(), 2);
+            for x in f {
+                counts[x as usize] += 1;
+            }
+        }
+        let freq = |i: usize| counts[i] as f64 / trials as f64;
+        let heavy = 0.8 + 2.0 * 0.1 * (8.0 / 9.0);
+        let light = (2.0 - heavy) / 2.0;
+        assert!((freq(2) - heavy).abs() < 0.01, "heavy {}", freq(2));
+        assert!((freq(0) - light).abs() < 0.015, "light0 {}", freq(0));
+        assert!((freq(1) - light).abs() < 0.015, "light1 {}", freq(1));
     }
 
     #[test]
-    fn always_at_least_one() {
-        let pool: Vec<u32> = (0..3).collect();
-        let mut s = ColumnSampler::new(pool, 0.01, 0.01, 1);
-        assert!(!s.sample().is_empty());
+    fn zero_weight_features_fill_only_after_positive_ones() {
+        // Two positive features, a stage of three: the third comes from the
+        // zero-weight features.
+        let weights = [0.0f32, 5.0, 0.0, 1.0, 0.0];
+        for seed in 0..200 {
+            let mut s = ColumnSampler::new(5, Some(&weights), 1.0, 0.4, 1.0, seed);
+            let two = s.sample(0);
+            assert_eq!(two, vec![1, 3], "positive weights always win");
+            let mut s = ColumnSampler::new(5, Some(&weights), 0.6, 1.0, 1.0, seed);
+            let three = s.sample(0);
+            assert_eq!(three.len(), 3);
+            assert!(three.contains(&1) && three.contains(&3));
+        }
     }
 }

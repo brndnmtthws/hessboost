@@ -53,14 +53,15 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
 | `booster/` | `gblinear` |
-| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
+| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `sampling` (gradient-based/MVS row sampling per tree), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
 `tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
-(proptest), `shap_accumulation.rs`. `benches/training.rs` is the Criterion
+(proptest), `shap_accumulation.rs`, `sampling.rs` (row/column sampling
+contracts), `target_stats.rs`. `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants

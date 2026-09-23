@@ -597,6 +597,23 @@ CASES = {
         dict(num_round=20, tol_train=TOL_TRAIN_PROB, ranges=True),
     ),
     "ranges_hist_reg_d6": (y_regression, {}, dict(ranges=True)),
+    # the forest / continuation layouts on the other multi-output models: a
+    # label matrix and an alpha list (one output per target / alpha)
+    "forest_np2_multi_reg3_d4": (
+        y_multi_regression,
+        dict(num_parallel_tree=2, max_depth=4),
+        dict(num_round=20, drop=("base_score",), ranges=True),
+    ),
+    "forest_np2_quantile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], num_parallel_tree=2, max_depth=4),
+        dict(num_round=20, drop=("base_score",), ranges=True),
+    ),
+    "continue_multi_reg3_nobs_d4": (
+        y_multi_regression,
+        dict(max_depth=4),
+        dict(continue_from=20, drop=("base_score",)),
+    ),
     # random forest / boosted random forest (quality tier)
     "rf_np8_reg_d6": (
         y_regression,

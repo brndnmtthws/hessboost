@@ -4,7 +4,7 @@
 use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::objective::create_objective;
+use crate::objective::{Dist, DistFamily, create_objective};
 use crate::tree::RegTree;
 use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, key};
 use rayon::prelude::*;
@@ -754,6 +754,50 @@ impl BoostedModel {
     /// iterations, like [`Self::predict_margin`].
     pub fn predict(&self, data: &DMatrix) -> Result<Vec<f32>> {
         self.predict_range(data, self.default_iteration_range())
+    }
+
+    /// The predicted distribution of every row for a model trained with a
+    /// distributional `dist:*` objective (beyond XGBoost, see
+    /// [`crate::objective::distributional`]): one [`Dist`] per row, with its
+    /// mean, variance, CDF, quantiles, log density, CRPS, intervals and
+    /// sampling. The margins are mapped through the links in `f64`. Uses the
+    /// effective iterations, like [`Self::predict`].
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::InvalidParameter`] if the model's objective is not
+    /// a `dist:*` objective, plus the errors of [`Self::predict_margin`].
+    pub fn predict_distribution(&self, data: &DMatrix) -> Result<Vec<Dist>> {
+        self.predict_distribution_range(data, self.default_iteration_range())
+    }
+
+    /// [`Self::predict_distribution`] from the boosting iterations in
+    /// `iteration_range` only (see [`Self::predict_margin_range`]).
+    pub fn predict_distribution_range(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<Dist>> {
+        let family = DistFamily::from_objective(&self.objective).ok_or_else(|| {
+            HessboostError::invalid_param(
+                "objective",
+                format!(
+                    "`{}` does not predict distributions; train with a `dist:*` objective",
+                    self.objective
+                ),
+            )
+        })?;
+        let margin = self.predict_margin_range(data, iteration_range)?;
+        Ok(margin
+            .chunks_exact(family.n_params())
+            .map(|row| {
+                let mut eta = [0.0; 2];
+                for (e, &m) in eta.iter_mut().zip(row) {
+                    *e = f64::from(m);
+                }
+                family.dist_from_margins(&eta[..row.len()])
+            })
+            .collect())
     }
 
     /// Per-row leaf indices for each tree (shape `n_rows × num_trees`,

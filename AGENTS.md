@@ -52,7 +52,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 |---|---|
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
-| `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks |
+| `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks; `objective/distributional/` (opt-in `dist:*` families, `Dist` predictions, `special` functions) and `metric/distributional.rs` (`nll`, `crps`), beyond XGBoost |
 | `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,oblivious}` (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation (`hist/quantized`: opt-in LightGBM quantized-gradient histograms), `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees), `reuse` (opt-in Trees-on-a-Diet feature/threshold reuse penalties) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `sampling` (gradient-based/MVS row sampling per tree), `continuation` (continued-training / `process_type=update` checks), `refresh` (the refresh updater), `BoostedModel` (iteration layout, slicing, `iteration_range` prediction), cv, TreeSHAP, `conformal` (split-conformal / CQR intervals), `compact_model` (bit-packed Trees-on-a-Diet format, `CompactModel`) |
@@ -63,7 +63,9 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 (proptest), `shap_accumulation.rs`, `sampling.rs` (row/column sampling
 contracts), `target_stats.rs`, `continuation.rs` (continued training,
 refresh, forests, slicing, iteration ranges), `quantized.rs` (quantized-gradient
-training: thread-count determinism, quality band, leaf renewal). `benches/training.rs` is the Criterion
+training: thread-count determinism, quality band, leaf renewal), `distributional.rs`
+(`dist:*` objectives: interval calibration, NLL vs a homoscedastic baseline,
+serialization, CQR). `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -156,8 +158,10 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
   → `ModelSizeReport`; train with `toad_penalty_feature`/`toad_penalty_threshold` to
   shrink its dictionaries.
 - `SplitConformal::calibrate(&model, &dcal, alpha)` and
-  `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)`,
-  then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
+  `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)` /
+  `calibrate_distribution(&model, ..)`, then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
+- `BoostedModel::predict_distribution(&data)` → `Vec<Dist>` for `dist:*` models
+  (`DistFamily`, `Dist`, `DistGradient` in the prelude).
 
 Opt-in quantized training: `.use_quantized_grad(true)` with
 `num_grad_quant_bins`, `stochastic_rounding`, `quant_train_renew_leaf`

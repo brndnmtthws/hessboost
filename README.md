@@ -266,6 +266,29 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   building dominates: 1.5× (1 thread) and 1.85× (16 threads) for a 1M × 50
   depth-8 tree. On 50k-row training it is within ±7% (see
   `docs/performance.md`).
+- **Distributional boosting** (NGBoost, [Duan et al. 2020](https://arxiv.org/abs/1910.03225);
+  XGBoostLSS, [März 2019](https://arxiv.org/abs/1907.03178)): objectives
+  `dist:normal` (`μ`, `ln σ`), `dist:lognormal`, `dist:gamma` (`ln` mean,
+  `ln` shape), `dist:poisson` (`ln λ`; equals `count:poisson` without its
+  `max_delta_step` Hessian inflation) and `dist:negbinomial` (`ln` mean,
+  `ln` size) fit one tree per distribution parameter on the negative
+  log-likelihood. `dist_gradient` picks the second-order statistic:
+  `fisher` (default; the diagonal Fisher information, which is the full
+  Fisher matrix for these orthogonal parameterizations, so leaf steps are
+  natural-gradient steps), `hessian` (the exact Hessian diagonal, floored at
+  `1e-16`), or `natural` (NGBoost's natural gradient with unit Hessian). The
+  intercept is the MLE of the marginal label distribution.
+  `BoostedModel::predict_distribution` returns one `Dist` per row with
+  `mean`, `variance`, `cdf`, `quantile`, `log_prob`, `crps`, central
+  `interval`s and seeded inverse-CDF `sample`; `predict` reports the natural
+  parameters `[row][parameter]`. Metrics `nll` (default) and `crps` (closed
+  form for Normal/LogNormal/Gamma, exact step sums for the count families).
+  `ConformalizedQuantile::calibrate_distribution` conformalizes the
+  predicted central band (CQR). Native binary/JSON only: XGBoost JSON/UBJSON
+  export and import refuse `dist:*`. On the `distributional` example
+  (heteroscedastic Normal noise, early stopping) the held-out NLL is 0.768
+  against 1.014 for a squared-error model with one global deviation, with
+  90% intervals covering 0.891 (0.906 after CQR).
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.

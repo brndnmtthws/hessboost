@@ -75,7 +75,12 @@
 //!   prediction routes by bit pattern; and compact models after *Boosted Trees
 //!   on a Diet*: feature/threshold reuse penalties (`toad_penalty_feature`,
 //!   `toad_penalty_threshold`) and a bit-packed layout predicting bit-identical
-//!   margins ([`learner::compact_model`]).
+//!   margins ([`learner::compact_model`]); and distributional boosting
+//!   (NGBoost / XGBoostLSS style): `dist:normal`, `dist:lognormal`,
+//!   `dist:gamma`, `dist:poisson`, `dist:negbinomial` predict a full
+//!   conditional distribution per row
+//!   ([`BoostedModel::predict_distribution`](prelude::BoostedModel::predict_distribution),
+//!   [`objective::distributional`]), scored by `nll` / `crps`.
 //!
 //! ## Where to look
 //!
@@ -86,7 +91,8 @@
 //!   XGBoost parameter names), [`BoostedModel`] (trained model).
 //! - Runnable examples in the crate's `examples/` directory (e.g.
 //!   `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//!   `custom_objective`, `constraints`, `conformal`, `compact_model`). Run one with
+//!   `custom_objective`, `constraints`, `conformal`, `compact_model`,
+//!   `distributional`). Run one with
 //!   `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -129,8 +135,8 @@ pub mod tree;
 /// typical train to predict workflow.
 pub mod prelude {
     pub use crate::config::{
-        AftDistribution, BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType,
-        SamplingMethod, TrainingParams, TreeMethod,
+        AftDistribution, BoosterKind, DistGradient, GrowPolicy, Monotone, MultiStrategy,
+        ProcessType, SamplingMethod, TrainingParams, TreeMethod,
     };
     pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
     pub use crate::error::{HessboostError, Result};
@@ -141,5 +147,5 @@ pub mod prelude {
         train_continue_with_eval, train_with_custom_metric, train_with_eval, train_with_objective,
     };
     pub use crate::metric::{CustomMetric, Metric};
-    pub use crate::objective::{CustomObjective, GradPair, Objective};
+    pub use crate::objective::{CustomObjective, Dist, DistFamily, GradPair, Objective};
 }

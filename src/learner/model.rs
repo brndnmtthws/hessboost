@@ -780,6 +780,33 @@ impl BoostedModel {
         Self::from_xgboost_json(&std::fs::read_to_string(path)?)
     }
 
+    /// Serialize the model to XGBoost's UBJSON model format (the bytes of
+    /// `booster.save_model("m.ubj")` / `save_raw("ubj")`), carrying the same
+    /// document as [`BoostedModel::to_xgboost_json`]. See
+    /// [`crate::model::export_xgboost_ubjson`] for details.
+    pub fn to_xgboost_ubjson(&self) -> Result<Vec<u8>> {
+        crate::model::export_xgboost_ubjson(self)
+    }
+
+    /// Parse a model saved in XGBoost's UBJSON model format, with the same
+    /// mapping and limitations as [`BoostedModel::from_xgboost_json`]. See
+    /// [`crate::model::import_xgboost_ubjson`].
+    pub fn from_xgboost_ubjson(bytes: &[u8]) -> Result<Self> {
+        crate::model::import_xgboost_ubjson(bytes)
+    }
+
+    /// Save the model to a file in XGBoost's UBJSON model format (XGBoost's
+    /// `.ubj` files).
+    pub fn save_xgboost_ubjson(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        std::fs::write(path, self.to_xgboost_ubjson()?)?;
+        Ok(())
+    }
+
+    /// Load a model from a file written in XGBoost's UBJSON model format.
+    pub fn load_xgboost_ubjson(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_xgboost_ubjson(&std::fs::read(path)?)
+    }
+
     /// The objective the model was trained with, rebuilt from its name,
     /// `num_class` and retained parameters. Fails for objectives the crate
     /// cannot construct by name (custom objectives).

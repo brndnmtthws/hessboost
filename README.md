@@ -139,8 +139,11 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   model) and **conformalized quantile regression** (`ConformalizedQuantile`,
   Romano et al. 2019) over two quantile models or two outputs of one model.
 - **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
-  **XGBoost-format JSON model import/export** for `gbtree`/DART ensembles
-  with numeric and categorical splits,
+  **XGBoost-format model import/export** for `gbtree`/DART ensembles
+  with numeric and categorical splits, in both XGBoost encodings: JSON
+  (`save_xgboost_json` / `load_xgboost_json`, `to_`/`from_xgboost_json`) and
+  **UBJSON** binary `.ubj` (`save_xgboost_ubjson` / `load_xgboost_ubjson`,
+  `to_`/`from_xgboost_ubjson`), written with XGBoost's typed tree arrays,
   k-fold cross-validation,
   multi-core histogram construction, and runtime-detected SIMD kernels:
   **AArch64 NEON** for objective and metric kernels, prediction transforms,
@@ -159,8 +162,8 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   labels; dense and CSR input. Never used unless called; native categorical
   splits and training defaults are unchanged.
 
-**Not implemented:** the UBJSON (binary) XGBoost model format, a GPU backend,
-distributed or external-memory training, and Python/CLI/C-ABI wrappers.
+**Not implemented:** a GPU backend, distributed or external-memory training,
+and Python/CLI/C-ABI wrappers.
 
 ## Performance
 
@@ -216,7 +219,10 @@ Numerical parity with **XGBoost 3.4.2** is checked in CI by a fixture harness
 `scripts/check_exports.py`). Each case is checked three ways: **train parity**
 (same data and parameters, compare predictions), **import parity**
 (`from_xgboost_json` on the XGBoost model: predictions, margins, SHAP
-contributions) and **export parity** (`to_xgboost_json` reloaded by XGBoost).
+contributions; `from_xgboost_ubjson` on XGBoost's UBJSON save of the same model
+must give the identical model) and **export parity** (`to_xgboost_json` and
+`to_xgboost_ubjson` reloaded by XGBoost, with the UBJSON array encodings
+matching XGBoost's own re-save).
 `exact`-tier cases — including every objective and deterministic tree method,
 plus categorical splits — must agree pointwise (1e-4 / 1e-5). `quality` cases
 (row/column subsampling and DART) use an RMSE band because their RNG streams

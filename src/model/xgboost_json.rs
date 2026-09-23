@@ -1,5 +1,10 @@
-//! XGBoost-format (JSON) model import and export, targeting the XGBoost 3.4.2
-//! schema (identical to 3.4.1's).
+//! XGBoost-format model import and export, targeting the XGBoost 3.4.2
+//! schema (identical to 3.4.1's), in both of XGBoost's encodings: JSON text
+//! ([`export_xgboost_json`] / [`import_xgboost_json`], XGBoost's `m.json`) and
+//! Universal Binary JSON ([`export_xgboost_ubjson`] / [`import_xgboost_ubjson`],
+//! XGBoost's `m.ubj` and `save_raw("ubj")`). Both encodings carry the same
+//! document and share one model mapping; UBJSON only changes how it is
+//! serialized (see [UBJSON encoding](#ubjson-encoding)).
 //!
 //! XGBoost serializes a booster as a nested JSON document:
 //!
@@ -74,11 +79,29 @@
 //! normalizes across classes.
 //!
 //! `learner_model_param.num_target` carries [`BoostedModel::n_targets`].
+//!
+//! ## UBJSON encoding
+//!
+//! XGBoost keeps the node-indexed tree arrays as typed arrays and writes them
+//! to UBJSON in optimized form (`[$<type>#L<count>` plus big-endian
+//! payloads). [`export_xgboost_ubjson`] does the same with XGBoost's element
+//! types: float32 for `split_conditions`, `base_weights`, `loss_changes`,
+//! `sum_hessian` (and `leaf_weights`, gblinear `weights`); int32 for
+//! `left_children`, `right_children`, `parents`, `categories`,
+//! `categories_nodes` and `split_indices` (int64 when a tree's `num_feature`
+//! exceeds the int32 range, as in XGBoost); uint8 for `default_left` and
+//! `split_type`; int64 for `categories_segments` and `categories_sizes`. The
+//! category container's int32 `feature_segments` / `sorted_idx` / `offsets`
+//! and its per-column `values` follow XGBoost too. Every other array is a
+//! counted generic array, numbers are float32 and integers the narrowest
+//! width, again as XGBoost writes them. [`import_xgboost_ubjson`] accepts the
+//! optimized and the plain UBJSON container forms alike.
 
 use crate::config::ObjectiveParams;
 use crate::error::{HessboostError, Result};
 use crate::learner::BoostedModel;
 use crate::learner::model::ModelSpec;
+use crate::model::ubjson::{self, ElementType};
 use crate::objective::{Objective, create_objective};
 use crate::tree::{Node, RegTree};
 use serde_json::{Map, Value, json};
@@ -94,9 +117,88 @@ const INVALID_NODE: i32 = i32::MAX;
 /// [`import_xgboost_json`] as well as upstream XGBoost 3.4.2. See the module
 /// docs (above) for the `base_score` space convention.
 pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&model_to_value(model)?)?)
+}
+
+/// Serialize a [`BoostedModel`] into XGBoost's UBJSON model format.
+///
+/// The bytes hold the same document as [`export_xgboost_json`], encoded the
+/// way `xgboost.Booster.save_model("m.ubj")` encodes it (typed tree arrays;
+/// see [UBJSON encoding](self#ubjson-encoding)). They are accepted by
+/// [`import_xgboost_ubjson`] and upstream XGBoost 3.4.2.
+pub fn export_xgboost_ubjson(model: &BoostedModel) -> Result<Vec<u8>> {
+    ubjson::encode(&model_to_value(model)?, &xgboost_typed_array)
+}
+
+/// Parse an XGBoost JSON model document into a [`BoostedModel`].
+///
+/// Accepts `gbtree` boosters, including XGBoost 3.4.1's DART layout
+/// (`gbtree` plus `model.weight_drop`). Other booster kinds produce a
+/// [`HessboostError::ModelFormat`]. See the module docs (above) for details and
+/// the `base_score` space convention.
+pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
+    model_from_value(&serde_json::from_str(json)?)
+}
+
+/// Parse an XGBoost UBJSON model (`save_model("m.ubj")` or
+/// `save_raw("ubj")`) into a [`BoostedModel`].
+///
+/// Decoding accepts optimized (typed / counted) and plain UBJSON containers;
+/// the decoded document then goes through the same mapping, with the same
+/// support and errors, as [`import_xgboost_json`]. Malformed bytes produce a
+/// [`HessboostError::ModelFormat`].
+pub fn import_xgboost_ubjson(bytes: &[u8]) -> Result<BoostedModel> {
+    model_from_value(&ubjson::decode(bytes)?)
+}
+
+/// The element type XGBoost stores the array member `key` of `object` with,
+/// or `None` for a generic array. Mirrors the `F32Array` / `I32Array` /
+/// `U8Array` / `I64Array` members of XGBoost's `RegTree::SaveModel`,
+/// `MultiTargetTree::SaveModel`, `GBLinearModel::SaveModel` and
+/// `CatContainer::Save`.
+fn xgboost_typed_array(key: &str, object: &Map<String, Value>) -> Option<ElementType> {
+    Some(match key {
+        "split_conditions" | "base_weights" | "loss_changes" | "sum_hessian" | "leaf_weights"
+        | "weights" => ElementType::F32,
+        "left_children" | "right_children" | "parents" | "categories" | "categories_nodes"
+        | "feature_segments" | "sorted_idx" | "offsets" => ElementType::I32,
+        "split_indices" => {
+            let num_feature = object
+                .get("tree_param")
+                .and_then(|p| p.get("num_feature"))
+                .and_then(scalar_f64)
+                .unwrap_or(0.0);
+            if num_feature > f64::from(i32::MAX) {
+                ElementType::I64
+            } else {
+                ElementType::I32
+            }
+        }
+        "default_left" | "split_type" => ElementType::U8,
+        "categories_segments" | "categories_sizes" => ElementType::I64,
+        // A category column: string categories (`offsets` + int8 `values`)
+        // or numeric ones tagged with XGBoost's `CatIndexType` code; unsigned
+        // types are stored as the same-width signed bit pattern.
+        "values" if object.contains_key("offsets") => ElementType::I8,
+        "values" => match object.get("type").and_then(Value::as_i64)? {
+            7 => ElementType::F32,
+            8 => ElementType::F64,
+            9 => ElementType::I8,
+            10 => ElementType::U8,
+            11 | 12 => ElementType::I16,
+            13 | 14 => ElementType::I32,
+            15 | 16 => ElementType::I64,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Build the XGBoost model document for `model`.
+fn model_to_value(model: &BoostedModel) -> Result<Value> {
     if model.linear().is_some() {
         return Err(HessboostError::model_format(
-            "XGBoost JSON export does not support gblinear models",
+            "XGBoost model export does not support gblinear models",
         ));
     }
     let num_feature = model.n_features();
@@ -163,18 +265,13 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
         }
     });
 
-    Ok(serde_json::to_string_pretty(&value)?)
+    Ok(value)
 }
 
-/// Parse an XGBoost JSON model document into a [`BoostedModel`].
-///
-/// Accepts `gbtree` boosters, including XGBoost 3.4.1's DART layout
-/// (`gbtree` plus `model.weight_drop`). Other booster kinds produce a
-/// [`HessboostError::ModelFormat`]. See the module docs (above) for details and
-/// the `base_score` space convention.
-pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
-    let root: Value = serde_json::from_str(json)?;
-    let learner = field(&root, "learner")?;
+/// Map an XGBoost model document (decoded from either encoding) to a
+/// [`BoostedModel`].
+fn model_from_value(root: &Value) -> Result<BoostedModel> {
+    let learner = field(root, "learner")?;
     let booster = field(learner, "gradient_booster")?;
 
     let booster_name = booster
@@ -1094,6 +1191,112 @@ mod tests {
         let before = model.predict(&categorical).unwrap();
         let restored = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
         assert_eq!(restored.predict(&categorical).unwrap(), before);
+    }
+
+    /// XGBoost 3.4.2 `save_raw("ubj")` / `save_raw("json")` of one booster
+    /// with categorical splits and missing values, generated by:
+    ///
+    /// ```python
+    /// rng = np.random.default_rng(7)
+    /// x = rng.random((256, 3), dtype=np.float32)
+    /// x[:, 0] = rng.integers(0, 6, 256)
+    /// x[rng.random(x.shape) < 0.1] = np.nan
+    /// y = ((x[:, 0] % 2 == 1) ^ (x[:, 1] > 0.5)).astype(np.float32)
+    /// d = xgb.DMatrix(x, label=y, feature_types=["c", "q", "q"], enable_categorical=True)
+    /// b = xgb.train({"max_depth": 2, "objective": "binary:logistic", "nthread": 1,
+    ///                "max_cat_to_onehot": 1}, d, num_boost_round=3)
+    /// ```
+    const XGB_UBJ: &[u8] = include_bytes!("../../tests/data/xgboost-3.4.2-categorical.ubj");
+    const XGB_JSON: &str = include_str!("../../tests/data/xgboost-3.4.2-categorical.json");
+
+    #[test]
+    fn xgboost_ubjson_reencodes_byte_for_byte() {
+        // Decoding XGBoost's own bytes and encoding them again with the typed
+        // array table reproduces the file exactly: same markers, integer
+        // widths, typed element types, key order and big-endian payloads.
+        let document = ubjson::decode(XGB_UBJ).unwrap();
+        let reencoded = ubjson::encode(&document, &xgboost_typed_array).unwrap();
+        assert!(reencoded == XGB_UBJ, "re-encoded XGBoost UBJSON differs");
+    }
+
+    #[test]
+    fn xgboost_ubjson_imports_like_its_json_twin() {
+        let from_ubj = import_xgboost_ubjson(XGB_UBJ).unwrap();
+        let from_json = import_xgboost_json(XGB_JSON).unwrap();
+        assert!(
+            from_ubj
+                .trees()
+                .iter()
+                .any(|t| t.nodes().iter().any(|n| n.is_categorical && !n.is_leaf()))
+        );
+        assert_eq!(from_ubj.to_bytes().unwrap(), from_json.to_bytes().unwrap());
+
+        let truncated = &XGB_UBJ[..XGB_UBJ.len() / 2];
+        assert!(matches!(
+            import_xgboost_ubjson(truncated),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
+
+    #[test]
+    fn ubjson_export_is_the_json_document_with_typed_tree_arrays() {
+        let (_, d) = reg_model();
+        let dart = TrainingParams::builder()
+            .booster(BoosterKind::Dart)
+            .rate_drop(0.5)
+            .max_depth(3)
+            .build()
+            .unwrap();
+        let categories = [0.0, 1.0, 2.0, 0.0, 1.0, 2.0];
+        let categorical = DMatrix::from_dense(&categories, 6, 1)
+            .unwrap()
+            .with_labels(&[1.0, 0.0, 1.0, 1.0, 0.0, 1.0])
+            .unwrap()
+            .with_feature_types(&[FeatureType::Categorical])
+            .unwrap();
+        let shallow = TrainingParams::builder().max_depth(2).build().unwrap();
+        for (model, data) in [
+            (reg_model().0, &d),
+            (train(&dart, &d, 8).unwrap(), &d),
+            (train(&shallow, &categorical, 3).unwrap(), &categorical),
+        ] {
+            let ubj = export_xgboost_ubjson(&model).unwrap();
+            // The very document the JSON export prints (compared before text
+            // formatting, which `serde_json` does not round-trip bit-exactly).
+            assert_eq!(
+                ubjson::decode(&ubj).unwrap(),
+                model_to_value(&model).unwrap()
+            );
+            for header in [
+                &b"split_conditions[$d#L"[..],
+                b"base_weights[$d#L",
+                b"loss_changes[$d#L",
+                b"sum_hessian[$d#L",
+                b"left_children[$l#L",
+                b"right_children[$l#L",
+                b"parents[$l#L",
+                b"split_indices[$l#L",
+                b"categories[$l#L",
+                b"categories_nodes[$l#L",
+                b"default_left[$U#L",
+                b"split_type[$U#L",
+                b"categories_segments[$L#L",
+                b"categories_sizes[$L#L",
+            ] {
+                assert!(
+                    ubj.windows(header.len()).any(|w| w == header),
+                    "missing {}",
+                    String::from_utf8_lossy(header)
+                );
+            }
+            let restored = import_xgboost_ubjson(&ubj).unwrap();
+            assert_eq!(
+                restored.predict(data).unwrap(),
+                model.predict(data).unwrap()
+            );
+            let via_json = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
+            assert_eq!(restored.to_bytes().unwrap(), via_json.to_bytes().unwrap());
+        }
     }
 
     /// A 3-class `gbtree` document of constant stumps whose leaf values are

@@ -56,7 +56,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
-| `model/` | XGBoost JSON model import/export |
+| `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
 `tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
@@ -112,7 +112,8 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
   `.info()` (`MetaInfo`); file loaders are `hessboost::data::{load_csv, load_libsvm}`.
 - `BoostedModel::predict`/`predict_margin`/`predict_class`/`predict_leaf`/
   `predict_contribs`/`predict_interactions`, `feature_importance`, and
-  `save_*`/`load_*` for native binary, JSON, and XGBoost JSON.
+  `save_*`/`load_*` for native binary, JSON, XGBoost JSON, and XGBoost UBJSON
+  (`*_xgboost_ubjson`).
 - `SplitConformal::calibrate(&model, &dcal, alpha)` and
   `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)`,
   then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
@@ -122,5 +123,5 @@ Multiclass objectives need `.num_class(k)`; ranking objectives need
 
 ## Not implemented
 
-UBJSON XGBoost models, GPU training, distributed or external-memory training,
-and Python/CLI/C-ABI bindings.
+GPU training, distributed or external-memory training, and Python/CLI/C-ABI
+bindings.

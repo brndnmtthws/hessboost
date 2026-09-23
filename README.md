@@ -194,8 +194,10 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   Linear-leaf models round-trip through the native binary and JSON formats;
   XGBoost JSON/UBJSON export refuses them, and so do `predict_contribs` /
   `predict_interactions` (TreeSHAP is undefined for linear leaves; LightGBM
-  refuses too). All three are off by default and leave default training
-  bit-identical.
+  refuses too). `extra_trees` and `path_smooth` act in the per-node split
+  search and are refused with `grow_policy = symmetric`; linear leaves apply
+  to symmetric trees. All three are off by default and leave default
+  training bit-identical.
 - **Symmetric (oblivious) trees** (`grow_policy = symmetric`, hist/approx):
   CatBoost-style level-wise growth where every node of a level shares one
   split (feature, threshold, missing direction), chosen to maximize the gain

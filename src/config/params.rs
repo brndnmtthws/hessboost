@@ -478,7 +478,10 @@ impl TrainingParams {
     /// ([`extra_trees`](Self::extra_trees), [`path_smooth`](Self::path_smooth),
     /// [`linear_tree`](Self::linear_tree)). They act inside the histogram tree
     /// builder only, so every other booster, builder, or tree layout is
-    /// refused instead of silently ignoring them.
+    /// refused instead of silently ignoring them. The split-search options
+    /// live in the per-node histogram split search, which symmetric growth
+    /// replaces with its level-wise search, so they are refused there too;
+    /// linear leaves are fitted after growth and apply to symmetric trees.
     fn validate_tree_options(&self) -> Result<()> {
         for (name, value) in [
             ("path_smooth", self.path_smooth),
@@ -510,6 +513,13 @@ impl TrainingParams {
                 name,
                 self.multi_strategy == MultiStrategy::OneOutputPerTree,
                 "is not supported with `multi_strategy=multi_output_tree`",
+            )?;
+        }
+        for (name, _) in enabled[..2].iter().filter(|&&(_, on)| on) {
+            ensure(
+                name,
+                self.grow_policy != GrowPolicy::Symmetric,
+                "is not supported with `grow_policy=symmetric` (level-wise split search)",
             )?;
         }
         // LightGBM refuses `regression_l1` with linear trees: objectives whose

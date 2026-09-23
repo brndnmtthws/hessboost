@@ -87,9 +87,13 @@ suite; `docs/performance.md` records its results.
 - **Formats:** the native binary magic (`SQB\0`) and the JSON layouts are
   compatibility contracts; do not change them without a migration.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`
-  values; `multi:softprob` gives `n_rows * num_class`, row-major. SHAP
-  contributions are `[row][n_features + 1]` (bias last), interactions
-  `[row][(n_features + 1)^2]`, with an extra output axis for multiclass.
+  values; `multi:softprob` gives `n_rows * num_class` and the other
+  multi-output objectives (`reg:quantileerror` / `reg:expectileerror` alpha
+  lists, multi-target `reg:absoluteerror`) `n_rows * n_outputs`, row-major.
+  SHAP contributions are `[row][n_features + 1]` (bias last), interactions
+  `[row][(n_features + 1)^2]`, with an extra output axis for multi-output
+  models. XGBoost's `num_target` counts outputs (one per alpha), while
+  `BoostedModel::n_targets` counts label columns.
 - **Objective/metric hooks:** training reaches objectives and metrics only
   through the `MetaInfo` hooks (`Objective::gradient_info`,
   `base_margins_info`, `eval_transform`, `probs_to_margins`, `validate_info`,

@@ -257,6 +257,48 @@ CASES = {
         dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
         dict(drop=("base_score",)),
     ),
+    # alpha-list objectives: one output per alpha (quantile_alpha /
+    # expectile_alpha lists become one scalar tree per alpha and round) and
+    # the smoothed MAE. `nobs_*` cases exercise the per-output intercepts
+    # (label quantiles, the MAE Newton step from the mean, the monotone
+    # expectile step); the others broadcast base_score through ProbToMargin.
+    "quantile_d4": (y_heavy_tail, dict(objective="reg:quantileerror", quantile_alpha=0.5, max_depth=4), {}),
+    "nobs_quantile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "nobs_quantile_multi_exact_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], tree_method="exact", max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "nobs_quantile_weighted_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.2, 0.8], max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "nobs_mae_d4": (y_heavy_tail, dict(objective="reg:absoluteerror", max_depth=4), dict(drop=("base_score",))),
+    "nobs_mae_weighted_exact_d4": (
+        y_heavy_tail,
+        dict(objective="reg:absoluteerror", tree_method="exact", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "nobs_expectile_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=0.3, max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "nobs_expectile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=[0.1, 0.5, 0.9], max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "expectile_multi_weighted_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=[0.2, 0.8], max_depth=4),
+        dict(weighted=True),
+    ),
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
     "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),
     "colsample_bytree_0p5_d6": (y_regression, dict(colsample_bytree=0.5, seed=42), dict(tier="quality")),

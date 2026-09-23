@@ -6,19 +6,25 @@
 //! reported prediction (e.g. the logistic sigmoid). This mirrors XGBoost's
 //! separation of `GetGradient` / `PredTransform`.
 
+mod absolute;
 mod classification;
 mod count;
 mod custom;
 mod multiclass;
+mod quantile;
 mod ranking;
 mod regression;
 
+pub use absolute::AbsoluteErrorObjective;
 pub use classification::LogisticObjective;
 pub use count::{GammaObjective, PoissonObjective, TweedieObjective};
 pub use custom::CustomObjective;
 pub use multiclass::SoftmaxObjective;
+pub use quantile::{ExpectileObjective, QuantileObjective};
 pub use ranking::LambdaMartObjective;
 pub use regression::{PseudoHuberObjective, SquaredErrorObjective};
+
+pub(crate) use quantile::validate_alphas;
 
 use rayon::prelude::*;
 
@@ -292,6 +298,16 @@ pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &Met
     let zeros = vec![0.0f32; n * k];
     let mut gpair = vec![GradPair::default(); n * k];
     objective.gradient_info(&zeros, info, &mut gpair);
+    let mut out = fit_stump(&gpair, k);
+    objective.pred_transform(&mut out);
+    objective.probs_to_margins(&mut out);
+    out
+}
+
+/// XGBoost's `tree::FitStump`: the unregularized Newton step `-Σg_k /
+/// max(Σh_k, 1e-6)` per output `k` of a `[row][output]` gradient buffer with
+/// `k` outputs, summed in `f64` and rounded once to `f32`.
+pub(crate) fn fit_stump(gpair: &[GradPair], k: usize) -> Vec<f32> {
     let mut sum_grad = vec![0.0f64; k];
     let mut sum_hess = vec![0.0f64; k];
     for row in gpair.chunks_exact(k) {
@@ -300,14 +316,11 @@ pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &Met
             sum_hess[c] += f64::from(gp.hess);
         }
     }
-    let mut out: Vec<f32> = sum_grad
+    sum_grad
         .iter()
         .zip(&sum_hess)
         .map(|(g, h)| (-g / h.max(1e-6)) as f32)
-        .collect();
-    objective.pred_transform(&mut out);
-    objective.probs_to_margins(&mut out);
-    out
+        .collect()
 }
 
 /// Shared [`Objective::validate_info`] label-domain check: reject the dataset
@@ -367,8 +380,12 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
 /// Resolve an objective by name, configured from `params`, for a dataset with
 /// `n_targets` label columns per row.
 ///
-/// Every built-in objective models a single target and rejects
+/// `reg:absoluteerror` models every label column (one output per target);
+/// every other built-in objective models a single target and rejects
 /// `n_targets > 1` with an `invalid parameter "labels"` error.
+/// `reg:quantileerror` / `reg:expectileerror` produce one output per
+/// `quantile_alpha` / `expectile_alpha` entry and reject an empty, unsorted,
+/// or out-of-`[0, 1]` list.
 pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Objective>> {
     let objective: Box<dyn Objective> = match params.objective.as_str() {
         "reg:squarederror" | "reg:linear" => Box::new(SquaredErrorObjective),
@@ -392,6 +409,9 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         )),
         "reg:gamma" => Box::new(GammaObjective),
         "reg:tweedie" => Box::new(TweedieObjective::new(params.tweedie_variance_power as f32)),
+        "reg:quantileerror" => Box::new(QuantileObjective::new(&params.quantile_alpha)?),
+        "reg:expectileerror" => Box::new(ExpectileObjective::new(&params.expectile_alpha)?),
+        "reg:absoluteerror" => return Ok(Box::new(AbsoluteErrorObjective::new(n_targets))),
         "rank:pairwise" => Box::new(LambdaMartObjective::pairwise(
             params.lambdarank_num_pair_per_sample,
         )),
@@ -449,8 +469,9 @@ mod tests {
         assert!(create_objective(&p, 1).is_err());
     }
 
-    /// Every built-in objective is single-target: two label columns are a
-    /// parameter error naming `labels`, never a silently wrong model.
+    /// Every built-in objective except `reg:absoluteerror` is single-target:
+    /// two label columns are a parameter error naming `labels`, never a
+    /// silently wrong model.
     #[test]
     fn factory_rejects_multi_target_labels() {
         for name in [
@@ -462,11 +483,15 @@ mod tests {
             "count:poisson",
             "reg:gamma",
             "reg:tweedie",
+            "reg:quantileerror",
+            "reg:expectileerror",
             "rank:ndcg",
         ] {
             let p = TrainingParams::builder()
                 .objective(name)
                 .num_class(3)
+                .quantile_alpha(vec![0.5])
+                .expectile_alpha(vec![0.5])
                 .build_unchecked();
             assert!(create_objective(&p, 1).is_ok(), "{name}");
             match create_objective(&p, 2) {
@@ -476,6 +501,33 @@ mod tests {
                 Err(other) => panic!("{name}: unexpected error {other}"),
                 Ok(_) => panic!("{name}: accepted two targets"),
             }
+        }
+        let mae = TrainingParams::builder()
+            .objective("reg:absoluteerror")
+            .build_unchecked();
+        assert_eq!(create_objective(&mae, 3).unwrap().n_outputs(), 3);
+    }
+
+    /// The alpha-list objectives need their list: one output per alpha, and a
+    /// missing or invalid list is an error naming the parameter.
+    #[test]
+    fn factory_sizes_alpha_objectives_and_requires_alphas() {
+        for (name, param) in [
+            ("reg:quantileerror", "quantile_alpha"),
+            ("reg:expectileerror", "expectile_alpha"),
+        ] {
+            let p = TrainingParams::builder().objective(name).build_unchecked();
+            match create_objective(&p, 1) {
+                Err(HessboostError::InvalidParameter { name: got, .. }) => assert_eq!(got, param),
+                Err(other) => panic!("{name}: unexpected error {other}"),
+                Ok(_) => panic!("{name}: accepted an empty alpha list"),
+            }
+            let p = TrainingParams::builder()
+                .objective(name)
+                .quantile_alpha(vec![0.1, 0.5, 0.9])
+                .expectile_alpha(vec![0.1, 0.5, 0.9])
+                .build_unchecked();
+            assert_eq!(create_objective(&p, 1).unwrap().n_outputs(), 3, "{name}");
         }
     }
 
@@ -504,6 +556,19 @@ mod tests {
                 9,
                 vec![2 * c + 1],
             ),
+            // Per-output residual scales are global reductions: chunking the
+            // row kernel must not change them.
+            (
+                Box::new(QuantileObjective::new(&[0.1, 0.5, 0.9]).unwrap()),
+                3,
+                vec![2 * c + 3],
+            ),
+            (
+                Box::new(ExpectileObjective::new(&[0.2, 0.8]).unwrap()),
+                2,
+                vec![2 * c + 3],
+            ),
+            (Box::new(AbsoluteErrorObjective::new(1)), 1, vec![2 * c + 5]),
         ];
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)

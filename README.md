@@ -105,12 +105,17 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 - **Regularization:** `lambda`, `alpha`, `gamma`, `min_child_weight`,
   `max_delta_step`, `max_depth`, `max_leaves`, `max_bin`.
 - **Objectives:** `reg:squarederror` (alias `reg:linear`), `reg:logistic`,
-  `reg:pseudohubererror` (`huber_slope`), `binary:logistic`, `multi:softmax`,
+  `reg:pseudohubererror` (`huber_slope`), `reg:absoluteerror` (XGBoost 3.4's
+  smoothed MAE, also over multi-target label matrices), `reg:quantileerror`
+  (`quantile_alpha` list, one non-crossing output per quantile),
+  `reg:expectileerror` (`expectile_alpha` list, one increasing output per
+  expectile), `binary:logistic`, `multi:softmax`,
   `multi:softprob`, `count:poisson`, `reg:gamma`, `reg:tweedie`
   (`tweedie_variance_power`), learning-to-rank (`rank:pairwise`, `rank:ndcg`,
   `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), and a user
   **custom-objective hook**. Intercepts are estimated per output exactly as
-  XGBoost 3.4.1 does (label mean, class log-frequencies, or a Newton step).
+  XGBoost 3.4.1 does (label mean, class log-frequencies, label quantiles, or a
+  Newton step).
   Objectives and metrics see a dataset through `MetaInfo` (labels of every
   target, weights, query groups, and interval-censored label bounds), and
   each objective validates its own label domain.
@@ -118,12 +123,14 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `with_label_matrix`), instance and group weights, `base_margin`, query
   groups, label bounds for censored targets (`with_label_bounds`), feature
   types, and per-feature sampling weights (`with_feature_weights`). Every
-  built-in objective is single-target; training rejects multi-target labels,
+  built-in objective except `reg:absoluteerror` is single-target; training
+  rejects other multi-target labels,
   feature weights, and the not-yet-implemented `num_parallel_tree > 1`,
   `sampling_method = gradient_based`, `multi_strategy = multi_output_tree`,
   and `process_type = update` instead of ignoring them.
 - **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
-  `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
+  `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`),
+  `quantile` and `expectile` (averaged over the configured alphas), and a
   **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for
   ranking, `tweedie-nloglik@rho` for Tweedie), except `reg:pseudohubererror`,
   which reports `mae` because XGBoost's `mphe` is not implemented.

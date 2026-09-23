@@ -4,6 +4,10 @@
 //! [`crate::objective::Objective::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
+mod quantile;
+
+pub use quantile::{ExpectileError, QuantileError};
+
 use crate::config::ObjectiveParams;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -542,11 +546,13 @@ impl Metric for CustomMetric {
 
 /// Resolve a metric by name. `num_class` is used by multiclass metrics, and
 /// `objective` carries the loss parameters that objective-dependent metrics
-/// read; none of the metrics implemented so far depend on it.
+/// read: `quantile` / `expectile` take the configured `quantile_alpha` /
+/// `expectile_alpha` (whatever the objective, like XGBoost) and fail when
+/// that list is empty or invalid.
 pub fn create_metric(
     name: &str,
     num_class: usize,
-    _objective: &ObjectiveParams,
+    objective: &ObjectiveParams,
 ) -> Result<Box<dyn Metric>> {
     // Accept the XGBoost `tweedie-nloglik@1.5` suffix form.
     let (base, rho) = match name.split_once('@') {
@@ -573,6 +579,8 @@ pub fn create_metric(
         })),
         "ndcg" => Ok(Box::new(Ndcg::new(rho.map(|r| r as usize)))),
         "map" => Ok(Box::new(MeanAveragePrecision::new(rho.map(|r| r as usize)))),
+        "quantile" => Ok(Box::new(QuantileError::new(&objective.quantile_alpha)?)),
+        "expectile" => Ok(Box::new(ExpectileError::new(&objective.expectile_alpha)?)),
         other => Err(HessboostError::unknown("metric", other)),
     }
 }

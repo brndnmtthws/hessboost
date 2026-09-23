@@ -7,7 +7,7 @@
 //! ## Quick start
 //!
 //! Build a [`DMatrix`], configure [`TrainingParams`] with a builder, call
-//! [`train`], then [`predict`](BoostedModel::predict):
+//! [`train`], then [`predict`](prelude::BoostedModel::predict):
 //!
 //! ```
 //! use hessboost::prelude::*;
@@ -48,7 +48,7 @@
 //! - **Modeling:** monotone & interaction constraints, native categorical
 //!   splits, early stopping, feature importance, TreeSHAP contributions and
 //!   interaction values ([`BoostedModel::predict_contribs`] /
-//!   [`predict_interactions`](BoostedModel::predict_interactions)).
+//!   [`predict_interactions`](prelude::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON model import/export ([`crate::model`]).
 //! - **Validation:** cross-validation ([`cv`]).
@@ -70,6 +70,16 @@
 //! transfer directly. Predictions match XGBoost's *model quality* (parity is
 //! CI-tested) but are not bit-identical. The two histogram implementations pick
 //! slightly different split points.
+//!
+//! [`DMatrix`]: prelude::DMatrix
+//! [`TrainingParams`]: prelude::TrainingParams
+//! [`BoostedModel`]: prelude::BoostedModel
+//! [`BoostedModel::predict_contribs`]: prelude::BoostedModel::predict_contribs
+//! [`train`]: prelude::train
+//! [`train_with_eval`]: prelude::train_with_eval
+//! [`train_with_objective`]: prelude::train_with_objective
+//! [`train_with_custom_metric`]: prelude::train_with_custom_metric
+//! [`cv`]: prelude::cv
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
@@ -84,30 +94,19 @@ pub mod objective;
 mod simd;
 pub mod tree;
 
-pub use config::{
-    BoosterKind, GrowPolicy, Monotone, TrainingParams, TrainingParamsBuilder, TreeMethod,
-};
-pub use data::{DMatrix, FeatureType};
-pub use error::{HessboostError, Result};
-pub use learner::{
-    BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,
-    train_with_eval, train_with_objective,
-};
-pub use metric::{CustomMetric, Metric};
-pub use objective::{CustomObjective, GradPair, Objective};
-pub use tree::{Node, RegTree};
-
 /// Commonly used imports include `use hessboost::prelude::*;`.
 ///
 /// Pulls in the data container, configuration, training entry points, the model
 /// type, and the objective/metric hooks. This provides everything needed for the
 /// typical train to predict workflow.
 pub mod prelude {
-    pub use crate::data::CsvOptions;
-    pub use crate::{
-        BoostedModel, BoosterKind, CustomMetric, CustomObjective, CvResult, DMatrix, FeatureType,
-        GradPair, GrowPolicy, HessboostError, ImportanceType, Metric, Monotone, Objective, Result,
-        TrainResult, TrainingParams, TreeMethod, cv, train, train_with_custom_metric,
+    pub use crate::config::{BoosterKind, GrowPolicy, Monotone, TrainingParams, TreeMethod};
+    pub use crate::data::{CsvOptions, DMatrix, FeatureType};
+    pub use crate::error::{HessboostError, Result};
+    pub use crate::learner::{
+        BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,
         train_with_eval, train_with_objective,
     };
+    pub use crate::metric::{CustomMetric, Metric};
+    pub use crate::objective::{CustomObjective, GradPair, Objective};
 }

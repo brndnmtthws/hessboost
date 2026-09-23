@@ -21,7 +21,7 @@
 //! weight is carried in `split_conditions[i]` (and, redundantly,
 //! `base_weights[i]`). Internal nodes route `x[split_indices[i]] <
 //! split_conditions[i]`, sending missing values in the `default_left[i]`
-//! direction, matching the exact semantics of [`crate::RegTree`].
+//! direction, matching the exact semantics of [`crate::tree::RegTree`].
 //!
 //! # Scope and caveats
 //!

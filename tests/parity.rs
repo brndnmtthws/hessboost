@@ -19,7 +19,7 @@
 //! ```
 
 use hessboost::data::HistCuts;
-use hessboost::{
+use hessboost::prelude::{
     BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError, Monotone,
     TrainingParams, TreeMethod, train,
 };

@@ -876,8 +876,7 @@ fn make_column_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Metric;
-    use crate::metric::Rmse;
+    use crate::metric::{Metric, Rmse};
 
     /// A learnable 1-D step function: y = 0 for x<0.5, y = 1 for x>=0.5.
     fn step_dataset(n: usize) -> DMatrix {

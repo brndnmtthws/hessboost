@@ -3,14 +3,15 @@
 //! Fixtures come from `scripts/gen_fixtures.py` (real XGBoost, single thread) and
 //! follow the schema documented there. Two ignored tests consume them:
 //!
-//! * [`xgboost_parity`] runs the three-way check per case: **train** on the
+//! * [`xgboost_parity`] runs the per-case checks: **train** on the
 //!   fixture data and compare test predictions (pointwise for the `exact` tier,
 //!   a quality band for the RNG-driven `quality` tier), **import** the embedded
 //!   XGBoost model and compare predictions, margins and SHAP contributions
 //!   (the model's UBJSON encoding, `fixtures/<name>.ubj`, must import to the
 //!   identical model), and **export** the hessboost model as XGBoost JSON and
 //!   UBJSON to `fixtures/exports/` for `scripts/check_exports.py` to reload in
-//!   XGBoost.
+//!   XGBoost. Fixtures carrying continuation, refresh, iteration-range or
+//!   slice data add those checks (column `extra`).
 //! * [`quantile_cuts_match_xgboost`] compares `hist` quantile cuts bit-for-bit
 //!   against `DMatrix.get_quantile_cut()` oracles in `fixtures/cuts/`.
 //!
@@ -24,7 +25,8 @@ use hessboost::data::HistCuts;
 use hessboost::learner::RoundEval;
 use hessboost::prelude::{
     AftDistribution, BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError,
-    Monotone, SamplingMethod, TrainingParams, TreeMethod, train, train_with_eval,
+    Monotone, ProcessType, SamplingMethod, TrainingParams, TreeMethod, train, train_continue,
+    train_with_eval,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -107,6 +109,58 @@ struct Fixture {
     /// as UBJSON (`save_raw("ubj")`).
     xgb_model_ubj: String,
     tol: Tol,
+    /// Training ran `first_rounds` rounds, saved `xgb_model_initial`, then
+    /// continued to `num_round` with `xgb_model=`.
+    continuation: Option<Continuation>,
+    /// `process_type=update` of the final model on new labels.
+    refresh: Option<RefreshCase>,
+    /// `iteration_range=(begin, end)` test-set margins.
+    #[serde(default)]
+    ranges: Vec<RangeCase>,
+    /// Prefix-range contributions / leaf indices on the contribution rows.
+    #[serde(default)]
+    range_contribs: Vec<RangeContribs>,
+    /// `booster[begin:end:step]` test-set margins.
+    #[serde(default)]
+    slices: Vec<SliceCase>,
+}
+
+#[derive(Deserialize)]
+struct Continuation {
+    first_rounds: usize,
+    xgb_model_initial: Value,
+}
+
+#[derive(Deserialize)]
+struct RefreshCase {
+    /// The refresh data is the first `n_rows` training rows with labels `y`.
+    n_rows: usize,
+    y: Vec<f32>,
+    rounds: usize,
+    refresh_leaf: bool,
+    xgb_pred: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct RangeCase {
+    begin: usize,
+    end: usize,
+    margin: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct RangeContribs {
+    end: usize,
+    contribs: Vec<f32>,
+    leaf: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+struct SliceCase {
+    begin: usize,
+    end: usize,
+    step: usize,
+    margin: Vec<f32>,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +329,7 @@ fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
                 "gradient_based" => SamplingMethod::GradientBased,
                 other => return Err(format!("sampling_method `{other}` not mapped")),
             }),
+            "num_parallel_tree" => b.num_parallel_tree(usize_of(k, v)?),
             "seed" => b.seed(usize_of(k, v)? as u64),
             "tweedie_variance_power" => b.tweedie_variance_power(f64_of(k, v)?),
             "huber_slope" => b.huber_slope(f64_of(k, v)?),
@@ -447,6 +502,7 @@ struct Row {
     ubj: String,
     export: String,
     evals: String,
+    extra: String,
     base_score: String,
 }
 
@@ -562,7 +618,9 @@ impl Case<'_> {
 
     /// Assertion 1: train and compare `predict(x_test)` with `xgb_pred`. With
     /// metric oracles the labeled test set is evaluated every round; the
-    /// history is returned for [`Case::compare_evals`].
+    /// history is returned for [`Case::compare_evals`]. Continuation
+    /// fixtures train `first_rounds` and continue the model to `num_round`,
+    /// as XGBoost's `xgb_model=` run did.
     fn train_and_compare(
         &mut self,
         dtest: &DMatrix,
@@ -570,14 +628,26 @@ impl Case<'_> {
         let fx = self.fx;
         let params = build_params(fx)?;
         let dtrain = self.train_matrix()?;
-        let (model, history) = if fx.xgb_evals.is_some() {
-            let deval = self.eval_matrix()?;
-            let result = train_with_eval(&params, &dtrain, fx.num_round, &[(&deval, "test")], None)
-                .map_err(|e| format!("train: {e}"))?;
-            (result.model, result.history)
-        } else {
-            let model = train(&params, &dtrain, fx.num_round).map_err(|e| format!("train: {e}"))?;
-            (model, Vec::new())
+        let (model, history) = match &fx.continuation {
+            Some(c) => {
+                let first =
+                    train(&params, &dtrain, c.first_rounds).map_err(|e| format!("train: {e}"))?;
+                let model = train_continue(&params, &dtrain, fx.num_round - c.first_rounds, &first)
+                    .map_err(|e| format!("train_continue: {e}"))?;
+                (model, Vec::new())
+            }
+            None if fx.xgb_evals.is_some() => {
+                let deval = self.eval_matrix()?;
+                let result =
+                    train_with_eval(&params, &dtrain, fx.num_round, &[(&deval, "test")], None)
+                        .map_err(|e| format!("train: {e}"))?;
+                (result.model, result.history)
+            }
+            None => {
+                let model =
+                    train(&params, &dtrain, fx.num_round).map_err(|e| format!("train: {e}"))?;
+                (model, Vec::new())
+            }
         };
         let preds = model.predict(dtest).map_err(|e| format!("predict: {e}"))?;
         if preds.len() != fx.xgb_pred.len() {
@@ -638,6 +708,163 @@ impl Case<'_> {
             }
         }
         format!("{worst:.2e}")
+    }
+
+    /// Continue the imported `xgb_model_initial` to `num_round` and compare
+    /// with XGBoost's continued predictions.
+    fn continue_imported(&self, dtest: &DMatrix, c: &Continuation) -> Result<f64, String> {
+        let fx = self.fx;
+        let params = build_params(fx)?;
+        let initial = BoostedModel::from_xgboost_json(&c.xgb_model_initial.to_string())
+            .map_err(|e| format!("import initial model: {e}"))?;
+        let model = train_continue(
+            &params,
+            &self.train_matrix()?,
+            fx.num_round - c.first_rounds,
+            &initial,
+        )
+        .map_err(|e| format!("train_continue: {e}"))?;
+        let preds = model.predict(dtest).map_err(|e| e.to_string())?;
+        max_abs_diff("continue imported", &preds, &fx.xgb_pred)
+    }
+
+    /// `process_type=update` of `base` on the fixture's refresh data.
+    fn refresh(
+        &self,
+        base: &BoostedModel,
+        dtest: &DMatrix,
+        r: &RefreshCase,
+    ) -> Result<f64, String> {
+        let fx = self.fx;
+        let params = TrainingParams {
+            process_type: ProcessType::Update,
+            refresh_leaf: r.refresh_leaf,
+            ..build_params(fx)?
+        };
+        let data = self
+            .dmatrix(&fx.x_train[..r.n_rows * fx.n_cols], r.n_rows)?
+            .with_labels(&r.y)
+            .map_err(|e| format!("refresh labels: {e}"))?;
+        let model =
+            train_continue(&params, &data, r.rounds, base).map_err(|e| format!("refresh: {e}"))?;
+        let preds = model.predict(dtest).map_err(|e| e.to_string())?;
+        max_abs_diff("refresh", &preds, &r.xgb_pred)
+    }
+
+    /// `iteration_range` margins / contributions / leaves and slice margins
+    /// of `model` against the fixture, as `(check, delta, tolerance)`.
+    /// Leaf ids are compared only for `with_leaves` (node numbering of
+    /// hessboost-grown trees is its own).
+    fn range_checks(
+        &self,
+        model: &BoostedModel,
+        dtest: &DMatrix,
+        dcontrib: &DMatrix,
+        tol: f64,
+        with_leaves: bool,
+    ) -> Vec<(String, Result<f64, String>, f64)> {
+        let fx = self.fx;
+        let mut out = Vec::new();
+        for r in &fx.ranges {
+            let what = format!("margin range [{}, {})", r.begin, r.end);
+            let d = model
+                .predict_margin_range(dtest, (r.begin, r.end))
+                .map_err(|e| e.to_string())
+                .and_then(|p| max_abs_diff(&what, &p, &r.margin));
+            out.push((what, d, tol));
+        }
+        for r in &fx.range_contribs {
+            let what = format!("contribs range [0, {})", r.end);
+            let d = model
+                .predict_contribs_range(dcontrib, (0, r.end))
+                .map_err(|e| e.to_string())
+                .and_then(|p| max_abs_diff(&what, &p, &r.contribs));
+            out.push((what, d, fx.tol.contribs));
+            if with_leaves {
+                let what = format!("leaf range [0, {})", r.end);
+                let d = model
+                    .predict_leaf_range(dcontrib, (0, r.end))
+                    .map_err(|e| e.to_string())
+                    .and_then(|p| {
+                        let p: Vec<f32> = p.iter().map(|&l| l as f32).collect();
+                        max_abs_diff(&what, &p, &r.leaf)
+                    });
+                out.push((what, d, 0.0));
+            }
+        }
+        for s in &fx.slices {
+            let what = format!("slice [{}:{}:{}]", s.begin, s.end, s.step);
+            let d = model
+                .slice(s.begin, s.end, s.step)
+                .and_then(|m| m.predict_margin(dtest))
+                .map_err(|e| e.to_string())
+                .and_then(|p| max_abs_diff(&what, &p, &s.margin));
+            out.push((what, d, tol));
+        }
+        out
+    }
+
+    /// Assertion 4: the feature-specific checks a fixture carries --
+    /// continuing XGBoost's saved initial model, `process_type=update`, and
+    /// iteration ranges / slices. The imported XGBoost model is checked for
+    /// every tier, hessboost's own model for the exact tier. The cell is the
+    /// largest delta over the checks and their count, or `-` when the
+    /// fixture has none.
+    fn extras(
+        &mut self,
+        trained: Option<&BoostedModel>,
+        dtest: &DMatrix,
+        dcontrib: &DMatrix,
+    ) -> String {
+        let fx = self.fx;
+        if fx.continuation.is_none()
+            && fx.refresh.is_none()
+            && fx.ranges.is_empty()
+            && fx.range_contribs.is_empty()
+            && fx.slices.is_empty()
+        {
+            return "-".to_string();
+        }
+        let imported = match BoostedModel::from_xgboost_json(&fx.xgb_model.to_string()) {
+            Ok(m) => m,
+            Err(e) => {
+                self.fail(format!("extras import: {e}"));
+                return "ERR".to_string();
+            }
+        };
+        let trained = trained.filter(|_| fx.tier == Tier::Exact);
+        let mut checks = Vec::new();
+        if let Some(c) = &fx.continuation {
+            checks.push((
+                "continue imported".to_string(),
+                self.continue_imported(dtest, c),
+                fx.tol.train,
+            ));
+        }
+        if let Some(r) = &fx.refresh {
+            checks.push((
+                "refresh imported".to_string(),
+                self.refresh(&imported, dtest, r),
+                fx.tol.train,
+            ));
+            if let Some(t) = trained {
+                checks.push((
+                    "refresh trained".to_string(),
+                    self.refresh(t, dtest, r),
+                    fx.tol.train,
+                ));
+            }
+        }
+        checks.extend(self.range_checks(&imported, dtest, dcontrib, fx.tol.import, true));
+        if let Some(t) = trained {
+            checks.extend(self.range_checks(t, dtest, dcontrib, fx.tol.train, false));
+        }
+        let mut worst = 0.0f64;
+        for (what, delta, tol) in &checks {
+            self.check(what, delta, *tol);
+            worst = worst.max(*delta.as_ref().unwrap_or(&f64::INFINITY));
+        }
+        format!("{worst:.1e}/{}", checks.len())
     }
 
     /// Quality tier: RMSE ratio for regression, accuracy / NDCG slack otherwise.
@@ -802,6 +1029,7 @@ impl Case<'_> {
             ubj: "ERR".to_string(),
             export: "n/a".to_string(),
             evals: "-".to_string(),
+            extra: "-".to_string(),
             base_score: "-".to_string(),
         };
 
@@ -820,7 +1048,7 @@ impl Case<'_> {
             }
         };
 
-        match self.train_and_compare(&dtest) {
+        let trained = match self.train_and_compare(&dtest) {
             Ok((model, preds, history)) => {
                 row.train = match fx.tier {
                     Tier::Exact | Tier::Trainonly => {
@@ -839,12 +1067,17 @@ impl Case<'_> {
                         .collect::<Vec<_>>()
                 );
                 row.export = self.export(&model, &preds, exports);
+                Some(model)
             }
-            Err(e) => self.fail(e),
-        }
+            Err(e) => {
+                self.fail(e);
+                None
+            }
+        };
 
         [row.import, row.margin, row.contribs] = self.import_and_compare(&dtest, &dcontrib);
         row.ubj = self.import_ubjson(dir);
+        row.extra = self.extras(trained.as_ref(), &dtest, &dcontrib);
         row
     }
 }
@@ -874,8 +1107,8 @@ fn xgboost_parity() {
 
     let mut failures = Vec::new();
     println!(
-        "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} base_score hessboost | xgboost",
-        "case", "tier", "train", "import", "margin", "contribs", "ubj", "export", "evals"
+        "{:<30} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {:<11} base_score hessboost | xgboost",
+        "case", "tier", "train", "import", "margin", "contribs", "ubj", "export", "evals", "extra"
     );
     for (_, fx) in &fixtures {
         let row = Case {
@@ -884,7 +1117,7 @@ fn xgboost_parity() {
         }
         .run(&dir, &exports);
         println!(
-            "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {} | {}",
+            "{:<30} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {:<11} {} | {}",
             row.name,
             row.tier,
             row.train,
@@ -894,6 +1127,7 @@ fn xgboost_parity() {
             row.ubj,
             row.export,
             row.evals,
+            row.extra,
             row.base_score,
             xgb_base_score(fx)
         );

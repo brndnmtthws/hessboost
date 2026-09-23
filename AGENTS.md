@@ -55,13 +55,14 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks |
 | `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,oblivious}` (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation, `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees) |
 | `booster/` | `gblinear` |
-| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `sampling` (gradient-based/MVS row sampling per tree), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
+| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `sampling` (gradient-based/MVS row sampling per tree), `continuation` (continued-training / `process_type=update` checks), `refresh` (the refresh updater), `BoostedModel` (iteration layout, slicing, `iteration_range` prediction), cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
 `tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
 (proptest), `shap_accumulation.rs`, `sampling.rs` (row/column sampling
-contracts), `target_stats.rs`. `benches/training.rs` is the Criterion
+contracts), `target_stats.rs`, `continuation.rs` (continued training,
+refresh, forests, slicing, iteration ranges). `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -87,6 +88,12 @@ suite; `docs/performance.md` records its results.
   streams differ.
 - **Formats:** the native binary magic (`SQB\0`) and the JSON layouts are
   compatibility contracts; do not change them without a migration.
+- **Tree layout:** as in XGBoost, iteration `i` owns trees
+  `i * trees_per_iteration ..` (`trees_per_iteration = n_outputs ×
+  num_parallel_tree`), grouped by output; tree `t` feeds output
+  `BoostedModel::tree_output(t) = (t / num_parallel_tree) % n_outputs`.
+  Iteration counts, `best_iteration`, slicing and `iteration_range` are
+  iteration-based, never raw tree counts.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`
   values; `multi:softprob` gives `n_rows * num_class` and the other
   multi-output models (a multi-target label matrix, the `reg:quantileerror` /
@@ -124,12 +131,17 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 
 - `train(&params, &dtrain, rounds)`, `train_with_eval(.., &[(&DMatrix, "name")], early_stopping: Option<usize>)`,
   `train_with_objective(.., &dyn Objective)`, `train_with_custom_metric(.., Box<dyn Metric>)`,
+  `train_continue(.., rounds, &model)` / `train_continue_with_eval(.., evals, early_stopping, &model)`
+  (continued training; with `process_type(ProcessType::Update)` the refresh updater),
   `cv(&params, &data, rounds, nfold, seed)`.
 - `DMatrix::from_dense`/`from_csr`, `.with_labels`/`.with_label_matrix`/`.with_label_bounds`/
   `.with_weights`/`.with_base_margin`/`.with_group_sizes`/`.with_feature_types`/`.with_feature_weights`,
   `.info()` (`MetaInfo`); file loaders are `hessboost::data::{load_csv, load_libsvm}`.
 - `BoostedModel::predict`/`predict_margin`/`predict_class`/`predict_leaf`/
-  `predict_contribs`/`predict_interactions`, `feature_importance`, and
+  `predict_contribs`/`predict_interactions`, their `*_range(.., (begin, end))`
+  variants (XGBoost `iteration_range`; leaf/contribs/interactions need
+  `begin == 0`), `slice(begin, end, step)`, `num_boost_rounds`,
+  `num_parallel_tree`, `feature_importance`, and
   `save_*`/`load_*` for native binary, JSON, XGBoost JSON, and XGBoost UBJSON
   (`*_xgboost_ubjson`).
 - `SplitConformal::calibrate(&model, &dcal, alpha)` and

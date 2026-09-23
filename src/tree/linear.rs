@@ -330,20 +330,23 @@ fn solve_full_pivot(mut a: Vec<f64>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
-/// Add `weight(t) · tree_t(row)` into `out[row * k + t % k]` for every tree of
-/// `trees`, in ascending tree order per slot: the prediction path for
-/// ensembles that contain linear leaves (the compact forest stores constant
-/// leaf values only).
+/// Add `weight(t) · tree_t(row)` into `out[row * k + output(t)]` for every
+/// tree index `t` in `range` (of `trees`), in ascending tree order per slot:
+/// the prediction path for ensembles that contain linear leaves (the compact
+/// forest stores constant leaf values only). `output` maps a tree to the
+/// output it feeds (the model's tree layout).
 pub(crate) fn accumulate_forest(
     trees: &[RegTree],
+    range: std::ops::Range<usize>,
+    output: impl Fn(usize) -> usize + Sync,
     data: &DMatrix,
     out: &mut [f32],
     k: usize,
     weight: impl Fn(usize) -> f32 + Sync,
 ) {
     let row = |(r, out_row): (usize, &mut [f32])| {
-        for (t, tree) in trees.iter().enumerate() {
-            out_row[t % k] += weight(t) * tree.predict_row(data, r);
+        for t in range.clone() {
+            out_row[output(t)] += weight(t) * trees[t].predict_row(data, r);
         }
     };
     if data.n_rows() >= 1024 && rayon::current_num_threads() > 1 {

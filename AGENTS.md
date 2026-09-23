@@ -65,7 +65,7 @@ suite; `docs/performance.md` records its results.
 
 ## Invariants
 
-- **Errors:** public fallible APIs return `hessboost::Result<T>`
+- **Errors:** public fallible APIs return `hessboost::error::Result<T>`
   (`HessboostError`). No `unwrap`/`expect` on user-controlled input in library
   code.
 - **Determinism:** identical params, data, and seed give identical
@@ -92,7 +92,9 @@ suite; `docs/performance.md` records its results.
 
 ## Public API at a glance
 
-Everything below is in `hessboost::prelude`.
+Everything below is in `hessboost::prelude`. The crate root exports only
+modules; `prelude` is the one place that re-exports items. Other public items
+are reached through their module (e.g. `hessboost::tree::RegTree`).
 
 - `train(&params, &dtrain, rounds)`, `train_with_eval(.., &[(&DMatrix, "name")], early_stopping: Option<usize>)`,
   `train_with_objective(.., &dyn Objective)`, `train_with_custom_metric(.., Box<dyn Metric>)`,

@@ -323,7 +323,7 @@ impl TrainingParams {
     }
 }
 
-/// The objective hyper-parameters a trained [`BoostedModel`](crate::BoostedModel)
+/// The objective hyper-parameters a trained [`BoostedModel`](crate::learner::BoostedModel)
 /// retains. XGBoost saves them in the model's `objective` block, so they are
 /// needed to write an XGBoost-format model faithfully and to rebuild the
 /// objective when predicting. Tree-construction parameters are not retained.

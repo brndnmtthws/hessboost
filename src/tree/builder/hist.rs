@@ -3,7 +3,8 @@
 //! Features are pre-binned once ([`GHistIndex`]). Growing a node reduces to
 //! scanning its per-bin gradient histogram. Sibling histograms are obtained by
 //! subtraction (`sibling = parent − smaller_child`), so only the smaller child
-//! is ever built directly. Supports both `depthwise` and `lossguide` growth.
+//! is ever built directly. Supports `depthwise` and `lossguide` growth, and
+//! hands `symmetric` growth to the level-wise oblivious builder.
 
 use super::{
     BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, build_interaction_sets,
@@ -131,7 +132,8 @@ impl<'a> HistTreeBuilder<'a> {
     }
 
     /// Keep the final row partitions so training can update margins without
-    /// traversing the tree again. Used for depthwise trees without row sampling.
+    /// traversing the tree again. Used for depthwise and symmetric trees without
+    /// row sampling.
     pub(crate) fn build_with_leaf_rows(
         &self,
         ghist: &GHistIndex,
@@ -139,7 +141,7 @@ impl<'a> HistTreeBuilder<'a> {
         row_subset: &[u32],
         sampler: &mut ColumnSampler,
     ) -> (RegTree, Vec<LeafRows>) {
-        debug_assert_eq!(self.params.grow_policy, GrowPolicy::DepthWise);
+        debug_assert_ne!(self.params.grow_policy, GrowPolicy::LossGuide);
         self.build_inner(ghist, gpair, row_subset, sampler, true)
     }
 
@@ -151,6 +153,15 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
+        if self.params.grow_policy == GrowPolicy::Symmetric {
+            return super::oblivious::SymmetricTreeBuilder::new(self.params).build(
+                ghist,
+                gpair,
+                row_subset,
+                sampler,
+                capture_rows,
+            );
+        }
         let total_bins = ghist.total_bins();
 
         let root_stats = sum_rows(gpair, row_subset);
@@ -191,6 +202,7 @@ impl<'a> HistTreeBuilder<'a> {
             GrowPolicy::LossGuide => {
                 self.grow_lossguide(&mut tree, &mut store, ghist, gpair, sampler, root);
             }
+            GrowPolicy::Symmetric => unreachable!("symmetric trees return above"),
         }
 
         // Finalize leaf weights (respecting each leaf's monotone bounds).
@@ -603,7 +615,11 @@ impl<'a> HistTreeBuilder<'a> {
 }
 
 /// Split `rows` (kept in order) into the rows routed left and right by `best`.
-fn partition_rows(ghist: &GHistIndex, rows: &[u32], best: &BestSplit) -> (Vec<u32>, Vec<u32>) {
+pub(super) fn partition_rows(
+    ghist: &GHistIndex,
+    rows: &[u32],
+    best: &BestSplit,
+) -> (Vec<u32>, Vec<u32>) {
     let cuts = ghist.cuts();
     let feature = best.feature as usize;
     if let (Some(columns), false) = (ghist.column_bins(), best.is_categorical) {

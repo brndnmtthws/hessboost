@@ -58,7 +58,10 @@
 //!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
 //!   [`learner::conformal`]).
 //! - **Beyond XGBoost (opt-in):** CatBoost-style ordered target statistics
-//!   for categorical columns ([`data::OrderedTargetEncoder`]).
+//!   for categorical columns ([`data::OrderedTargetEncoder`]), and
+//!   CatBoost-style symmetric (oblivious) trees
+//!   ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), which batch
+//!   prediction routes by bit pattern.
 //!
 //! ## Where to look
 //!

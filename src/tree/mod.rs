@@ -5,6 +5,7 @@ pub(crate) mod compact;
 pub mod constraints;
 pub mod gain;
 pub mod hist;
+pub(crate) mod oblivious;
 mod regtree;
 pub mod sampler;
 

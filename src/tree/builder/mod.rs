@@ -6,10 +6,12 @@
 
 mod exact;
 mod hist;
+mod oblivious;
 
 pub use exact::{ExactTreeBuilder, SortedColumns, all_features, all_rows};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
+pub(crate) use oblivious::check_symmetric_input;
 
 use std::collections::BTreeSet;
 

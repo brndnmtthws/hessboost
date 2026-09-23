@@ -13,7 +13,7 @@ use crate::metric::create_metrics;
 use crate::objective::{GradPair, create_objective};
 use crate::tree::RegTree;
 use crate::tree::builder::{
-    ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows,
+    ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows, check_symmetric_input,
 };
 use crate::tree::sampler::ColumnSampler;
 use rand::rngs::StdRng;
@@ -98,6 +98,9 @@ fn prepare_builder(
             "grow_policy",
             "`lossguide` growth requires `tree_method=hist`",
         ));
+    }
+    if params.grow_policy == GrowPolicy::Symmetric {
+        check_symmetric_input(method, dtrain)?;
     }
     Ok(match method {
         TreeMethod::Hist => {
@@ -474,7 +477,7 @@ fn train_impl_inner(
                 // pass per leaf.
                 let (tree, leaf_rows) = match &prepared {
                     Prepared::Hist(ghist)
-                        if params.grow_policy == GrowPolicy::DepthWise && row_subset.len() == n =>
+                        if params.grow_policy != GrowPolicy::LossGuide && row_subset.len() == n =>
                     {
                         let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
                         let mut sampler = make_column_sampler(

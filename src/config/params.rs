@@ -52,7 +52,23 @@ pub enum GrowPolicy {
     DepthWise,
     /// Split nodes with the highest loss reduction first (leaf-wise).
     LossGuide,
+    /// Symmetric (oblivious) trees, CatBoost-style: every level applies one
+    /// shared split (feature, threshold, missing direction) chosen to maximize
+    /// the summed gain over the level's nodes. Beyond XGBoost (opt-in). Needs
+    /// `tree_method = hist` or `approx`, numerical features only, `max_depth`
+    /// in `1..=`[`MAX_SYMMETRIC_DEPTH`], and `max_leaves = 0`. A node whose
+    /// level split would violate `min_child_weight`, `gamma`, or a monotone
+    /// constraint stays a leaf. The trees are ordinary [`RegTree`]s, so they
+    /// export to XGBoost unchanged; prediction routes rows through them by
+    /// bit pattern.
+    ///
+    /// [`RegTree`]: crate::tree::RegTree
+    Symmetric,
 }
+
+/// Deepest tree `grow_policy = symmetric` grows (`2^16` leaves), CatBoost's
+/// depth limit.
+pub const MAX_SYMMETRIC_DEPTH: usize = 16;
 
 /// Per-feature monotonicity direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -404,6 +420,21 @@ impl TrainingParams {
                 && self.max_depth == 0),
             "lossguide growth needs a bound: set max_leaves or max_depth > 0",
         )?;
+        if self.grow_policy == GrowPolicy::Symmetric {
+            ensure(
+                "max_depth",
+                (1..=MAX_SYMMETRIC_DEPTH).contains(&self.max_depth),
+                format!(
+                    "symmetric growth needs 1 <= max_depth <= {MAX_SYMMETRIC_DEPTH}, got {}",
+                    self.max_depth
+                ),
+            )?;
+            ensure(
+                "max_leaves",
+                self.max_leaves == 0,
+                "symmetric growth sizes trees by max_depth; max_leaves must be 0",
+            )?;
+        }
         Ok(())
     }
 

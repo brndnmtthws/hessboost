@@ -6,8 +6,9 @@
 //! *pool*. This sampler then draws the `bylevel` and `bynode` subsets from it.
 //!
 //! Call granularity differs by builder: the histogram builder samples once per
-//! node ([`ColumnSampler::sample`] per node), while the exact builder samples
-//! once per level (shared across that level's nodes). With the default ratios of
+//! node ([`ColumnSampler::sample`] per node), while the exact builder and
+//! symmetric (`grow_policy = symmetric`) growth sample once per level (shared
+//! across that level's nodes). With the default ratios of
 //! `1.0` every draw returns the full pool.
 
 use rand::SeedableRng;

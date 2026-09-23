@@ -60,9 +60,15 @@
 //! `poisson_regression_param.max_delta_step`,
 //! `tweedie_regression_param.tweedie_variance_power`,
 //! `pseudo_huber_param.huber_slope`,
-//! `lambdarank_param.lambdarank_num_pair_per_sample`) round-trips through the
-//! model's [`ObjectiveParams`]; absent fields take XGBoost's defaults. Export
-//! rejects models whose objective XGBoost cannot load (custom objectives).
+//! `lambdarank_param.lambdarank_num_pair_per_sample`,
+//! `quantile_loss_param.quantile_alpha`,
+//! `expectile_loss_param.expectile_alpha`) round-trips through the
+//! model's [`ObjectiveParams`]; absent fields take XGBoost's defaults. The
+//! alpha lists are XGBoost's array strings (`"[0.1,0.5,0.9]"`, `(..)` also
+//! read); `reg:absoluteerror` has no block. A supported objective whose
+//! parameters do not rebuild it (e.g. an empty or unsorted alpha list) is a
+//! format error. Export rejects models whose objective XGBoost cannot load
+//! (custom objectives).
 //!
 //! ## `base_score`
 //!
@@ -81,10 +87,16 @@
 //! unchanged, as XGBoost does: softmax's inverse link is the identity, while
 //! its forward transform normalizes across classes.
 //!
-//! `learner_model_param.num_target` carries [`BoostedModel::n_targets`]. A
-//! multi-target model (`one_output_per_tree` on a label matrix, `num_class`
-//! 0) has one output per target: tree groups in `tree_info` and `base_score`
-//! entries are per target, laid out exactly like multiclass groups.
+//! `learner_model_param.num_target` is XGBoost's output count
+//! (`ObjFunction::Targets`): [`BoostedModel::n_outputs`] for non-multiclass
+//! models — one per label column for a multi-target model
+//! (`one_output_per_tree` on a label matrix, `num_class` 0), one per alpha for
+//! `reg:quantileerror` / `reg:expectileerror`, whose
+//! [`BoostedModel::n_targets`] is the single label column — and
+//! [`BoostedModel::n_targets`] (1) for multiclass. Import checks it against
+//! the rebuilt objective's output count. Tree groups in `tree_info` and
+//! `base_score` entries are per output, laid out exactly like multiclass
+//! groups.
 //!
 //! ## UBJSON encoding
 //!
@@ -265,7 +277,9 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
                 "boost_from_average": "0",
                 "num_class": num_class.to_string(),
                 "num_feature": num_feature.to_string(),
-                "num_target": model.n_targets().to_string(),
+                // XGBoost counts outputs here (`ObjFunction::Targets`): one
+                // per alpha for the alpha-list objectives; multiclass keeps 1.
+                "num_target": if num_class >= 2 { model.n_targets() } else { n_outputs }.to_string(),
             },
             "objective": objective_to_json(&objective, num_class, model.objective_params()),
         }
@@ -302,7 +316,10 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .get("num_class")
         .and_then(scalar_f64)
         .map_or(0, |v| v as usize);
-    let n_targets = lmp
+    // XGBoost's `num_target` counts model outputs (`ObjFunction::Targets`):
+    // label columns for most objectives, but one output per alpha for the
+    // alpha-list objectives, which fit a single label column.
+    let num_target = lmp
         .get("num_target")
         .and_then(scalar_f64)
         .map_or(1, |v| v as usize);
@@ -313,13 +330,29 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .and_then(Value::as_str)
         .unwrap_or("reg:squarederror")
         .to_string();
-    // XGBoost's `OutputLength`: classes for multiclass models, otherwise one
-    // output per target (one tree group per label column).
-    let n_outputs = if num_class >= 2 {
-        num_class
-    } else {
-        n_targets.max(1)
+
+    // Parameter blocks come from the file: check them with the same rules as
+    // a training configuration before the model rebuilds its objective.
+    let objective_params = objective_params_from_json(&objective, objective_json);
+    objective_params
+        .training_params(&objective, num_class)
+        .build()
+        .map_err(|e| HessboostError::model_format(format!("invalid objective parameters: {e}")))?;
+    let n_targets = match objective.as_str() {
+        "reg:quantileerror" | "reg:expectileerror" => 1,
+        _ => num_target,
     };
+    let objective_impl = build_objective(&objective, num_class, n_targets, &objective_params)?;
+    let n_outputs = match &objective_impl {
+        Some(objective) => objective.n_outputs(),
+        None if num_class >= 2 => num_class,
+        None => num_target.max(1),
+    };
+    if num_class < 2 && num_target.max(1) != n_outputs {
+        return Err(HessboostError::model_format(format!(
+            "`num_target` {num_target} does not match the {n_outputs} outputs of objective `{objective}`"
+        )));
+    }
 
     let trees_json = model
         .get("trees")
@@ -366,16 +399,7 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .get("base_score")
         .and_then(Value::as_str)
         .ok_or_else(|| HessboostError::model_format("missing/invalid `base_score`"))?;
-    let objective_impl = build_objective(&objective, num_class, n_targets)?;
     let base_margins = parse_base_score(base_score, objective_impl.as_deref(), n_outputs)?;
-
-    // Parameter blocks come from the file: check them with the same rules as
-    // a training configuration before the model rebuilds its objective.
-    let objective_params = objective_params_from_json(&objective, objective_json);
-    objective_params
-        .training_params(&objective, num_class)
-        .build()
-        .map_err(|e| HessboostError::model_format(format!("invalid objective parameters: {e}")))?;
 
     let imported = BoostedModel::from_parts(
         trees,
@@ -610,24 +634,27 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
 // base_score link handling
 // ---------------------------------------------------------------------------
 
-/// Reconstruct the objective from name, `num_class`, and `n_targets` (at
-/// XGBoost's default parameters, which do not affect the link), if it is one
-/// we support. A supported objective that cannot model `n_targets` targets
-/// is a format error rather than a silently untransformed model.
+/// Reconstruct the objective from name, `num_class`, `n_targets` (label
+/// columns), and the file's parameter blocks, if it is one we support. A
+/// supported objective that rejects that configuration (too many targets,
+/// an invalid alpha list) is a format error rather than a silently
+/// untransformed model.
 fn build_objective(
     name: &str,
     num_class: usize,
     n_targets: usize,
+    params: &ObjectiveParams,
 ) -> Result<Option<Box<dyn Objective>>> {
-    let params = ObjectiveParams::defaults_for(name)
-        .training_params(name, num_class)
-        .build_unchecked();
+    let params = params.training_params(name, num_class).build_unchecked();
     match create_objective(&params, n_targets) {
         Ok(objective) => Ok(Some(objective)),
-        Err(error @ HessboostError::InvalidParameter { .. }) if n_targets > 1 => Err(
-            HessboostError::model_format(format!("`num_target` {n_targets}: {error}")),
-        ),
-        Err(_) => Ok(None),
+        Err(HessboostError::Unknown { .. }) => Ok(None),
+        Err(error) if n_targets > 1 => Err(HessboostError::model_format(format!(
+            "`num_target` {n_targets}: {error}"
+        ))),
+        Err(error) => Err(HessboostError::model_format(format!(
+            "objective `{name}`: {error}"
+        ))),
     }
 }
 
@@ -694,18 +721,47 @@ const TWEEDIE_VARIANCE_POWER: (&str, &str) = ("tweedie_regression_param", "tweed
 const HUBER_SLOPE: (&str, &str) = ("pseudo_huber_param", "huber_slope");
 const LAMBDARANK_NUM_PAIR: (&str, &str) = ("lambdarank_param", "lambdarank_num_pair_per_sample");
 const SOFTMAX_NUM_CLASS: (&str, &str) = ("softmax_multiclass_param", "num_class");
+const QUANTILE_ALPHA: (&str, &str) = ("quantile_loss_param", "quantile_alpha");
+const EXPECTILE_ALPHA: (&str, &str) = ("expectile_loss_param", "expectile_alpha");
+
+/// Encode an alpha list as XGBoost's `ParamArray<float>` string, a JSON
+/// array of the `f32` values (`"[0.1,0.5,0.9]"`).
+fn format_param_array(values: &[f64]) -> String {
+    let entries: Vec<String> = values.iter().map(|&v| (v as f32).to_string()).collect();
+    format!("[{}]", entries.join(","))
+}
+
+/// Decode XGBoost's `ParamArray<float>` string: a JSON array or a single
+/// number, with `(..)` accepted for `[..]` like XGBoost's reader. Entries are
+/// rounded to `f32` as XGBoost stores them. `None` for anything else.
+fn parse_param_array(text: &str) -> Option<Vec<f64>> {
+    let text = text.trim();
+    let text = match text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        Some(inner) => format!("[{inner}]"),
+        None => text.to_string(),
+    };
+    let as_f32 = |v: &Value| v.as_f64().map(|v| f64::from(v as f32));
+    match serde_json::from_str::<Value>(&text).ok()? {
+        Value::Array(entries) => entries.iter().map(as_f32).collect(),
+        number @ Value::Number(_) => as_f32(&number).map(|v| vec![v]),
+        _ => None,
+    }
+}
 
 /// Build the `objective` sub-document with the parameter block XGBoost 3.4.1
 /// writes for each objective (its `SaveConfig`), so upstream XGBoost accepts
 /// the file. The retained [`ObjectiveParams`] are written as XGBoost's
 /// stringified numbers; LambdaRank parameters the model does not retain are
-/// written at XGBoost's defaults. Objectives without parameters
-/// (`reg:squaredlogerror`, `binary:hinge`) write their name only.
+/// written at XGBoost's defaults, and the alpha lists as XGBoost's array
+/// strings. Objectives without parameters (`reg:squaredlogerror`,
+/// `binary:hinge`, `reg:absoluteerror`) write their name only.
 fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams) -> Value {
     let mut out = Map::with_capacity(2);
     out.insert("name".to_string(), Value::String(objective.to_string()));
     let ((block, key), value) = match objective {
-        "reg:squaredlogerror" | "binary:hinge" => return Value::Object(out),
+        "reg:squaredlogerror" | "binary:hinge" | "reg:absoluteerror" => return Value::Object(out),
+        "reg:quantileerror" => (QUANTILE_ALPHA, format_param_array(&params.quantile_alpha)),
+        "reg:expectileerror" => (EXPECTILE_ALPHA, format_param_array(&params.expectile_alpha)),
         "multi:softmax" | "multi:softprob" => (SOFTMAX_NUM_CLASS, num_class.to_string()),
         "count:poisson" => (MAX_DELTA_STEP, params.max_delta_step.to_string()),
         "reg:tweedie" => (
@@ -769,6 +825,19 @@ fn objective_params_from_json(objective: &str, obj: Option<&Value>) -> Objective
         && v != f64::from(u32::MAX)
     {
         params.lambdarank_num_pair_per_sample = v as usize;
+    }
+    for ((block, key), alpha) in [
+        (QUANTILE_ALPHA, &mut params.quantile_alpha),
+        (EXPECTILE_ALPHA, &mut params.expectile_alpha),
+    ] {
+        // An unreadable list stays empty, which the objective then rejects.
+        if let Some(text) = obj
+            .get(block)
+            .and_then(|b| b.get(key))
+            .and_then(Value::as_str)
+        {
+            *alpha = parse_param_array(text).unwrap_or_default();
+        }
     }
     params
 }
@@ -1518,6 +1587,61 @@ mod tests {
         );
         let unset = import_xgboost_json(&exported).unwrap();
         assert_eq!(unset.objective_params().lambdarank_num_pair_per_sample, 32);
+    }
+
+    /// Alpha lists travel as XGBoost's array strings (either bracket form),
+    /// `num_target` counts the per-alpha outputs, and a list that does not
+    /// rebuild the objective is a format error, never an untransformed model.
+    #[test]
+    fn alpha_list_objectives_roundtrip_and_reject_bad_blocks() {
+        let n = 40;
+        let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let y: Vec<f32> = x.iter().map(|&v| 3.0 * v + (v * 17.0).sin()).collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("reg:quantileerror")
+            .quantile_alpha(vec![0.1, 0.9])
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 3).unwrap();
+        let exported = export_xgboost_json(&model).unwrap();
+        let json: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "reg:quantileerror", "quantile_loss_param": {"quantile_alpha": "[0.1,0.9]"}})
+        );
+        assert_eq!(json["learner"]["learner_model_param"]["num_target"], "2");
+        let back = import_xgboost_json(&exported).unwrap();
+        assert_eq!(back.n_outputs(), 2);
+        assert_eq!(back.n_targets(), 1);
+        assert_eq!(back.predict(&d).unwrap(), model.predict(&d).unwrap());
+
+        let parenthesized = exported.replace("[0.1,0.9]", "(0.1, 0.9)");
+        let back = import_xgboost_json(&parenthesized).unwrap();
+        assert_eq!(back.predict(&d).unwrap(), model.predict(&d).unwrap());
+        for bad in ["0.5", "[0.9,0.1]", "[]", "nope"] {
+            let err = import_xgboost_json(&exported.replace("[0.1,0.9]", bad)).unwrap_err();
+            assert!(
+                matches!(err, HessboostError::ModelFormat(_)),
+                "{bad}: {err}"
+            );
+        }
+
+        let mae = TrainingParams::builder()
+            .objective("reg:absoluteerror")
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let exported = export_xgboost_json(&train(&mae, &d, 2).unwrap()).unwrap();
+        let json: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "reg:absoluteerror"})
+        );
     }
 
     #[test]

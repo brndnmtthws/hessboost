@@ -163,7 +163,7 @@ fn metric_slices_cover(len: usize, labels: &[f32], weights: Option<&[f32]>) -> b
 /// XGBoost's `common::Sigmoid`: `1 / (expf(min(-x, 88.7)) + 1)` (the
 /// `1e-16f` upstream adds to the denominator vanishes in `f32`).
 #[inline]
-fn sigmoid_scalar(x: f32) -> f32 {
+pub(crate) fn sigmoid_scalar(x: f32) -> f32 {
     1.0 / ((-x).min(88.7).exp() + 1.0)
 }
 

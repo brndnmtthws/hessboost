@@ -203,6 +203,15 @@ fn str_of<'a>(key: &str, v: &'a Value) -> Result<&'a str, String> {
         .ok_or_else(|| format!("`{key}` must be a string, got {v}"))
 }
 
+/// XGBoost `ParamArray<float>` inputs (`quantile_alpha`): a number or a list
+/// of numbers.
+fn f64_list_of(key: &str, v: &Value) -> Result<Vec<f64>, String> {
+    match v {
+        Value::Array(items) => items.iter().map(|item| f64_of(key, item)).collect(),
+        other => Ok(vec![f64_of(key, other)?]),
+    }
+}
+
 /// A parameter hessboost implements only one way: the fixture must carry exactly
 /// that value, otherwise the case is not comparable.
 fn expect_fixed(key: &str, v: &Value, want: &Value) -> Result<(), String> {
@@ -269,6 +278,8 @@ fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
             "seed" => b.seed(usize_of(k, v)? as u64),
             "tweedie_variance_power" => b.tweedie_variance_power(f64_of(k, v)?),
             "huber_slope" => b.huber_slope(f64_of(k, v)?),
+            "quantile_alpha" => b.quantile_alpha(f64_list_of(k, v)?),
+            "expectile_alpha" => b.expectile_alpha(f64_list_of(k, v)?),
             "rate_drop" => b.rate_drop(f64_of(k, v)?),
             "skip_drop" => b.skip_drop(f64_of(k, v)?),
             "tree_method" => b.tree_method(match str_of(k, v)? {

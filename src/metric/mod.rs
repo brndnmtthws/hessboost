@@ -5,14 +5,15 @@
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
 mod elementwise;
+mod quantile;
 mod ranking;
-
-pub use elementwise::{Mape, PseudoHuberError, Rmsle};
-pub use ranking::Precision;
 
 use crate::config::ObjectiveParams;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
+pub use elementwise::{Mape, PseudoHuberError, Rmsle};
+pub use quantile::{ExpectileError, QuantileError};
+pub use ranking::Precision;
 
 /// An evaluation metric over predictions and labels.
 pub trait Metric: Send + Sync {
@@ -629,7 +630,10 @@ impl Metric for CustomMetric {
 
 /// Resolve a metric by name. `num_class` is used by multiclass metrics, and
 /// `objective` carries the loss parameters that objective-dependent metrics
-/// read (`mphe` takes its slope from `huber_slope`).
+/// read: `mphe` takes its slope from `huber_slope`, and `quantile` /
+/// `expectile` take the configured `quantile_alpha` / `expectile_alpha`
+/// (whatever the objective, like XGBoost) and fail when that list is empty or
+/// invalid.
 pub fn create_metric(
     name: &str,
     num_class: usize,
@@ -679,6 +683,8 @@ pub fn create_metric(
             )),
             k => Ok(Box::new(Precision::new(name, k.map(|k| k as usize)))),
         },
+        "quantile" => Ok(Box::new(QuantileError::new(&objective.quantile_alpha)?)),
+        "expectile" => Ok(Box::new(ExpectileError::new(&objective.expectile_alpha)?)),
         other => Err(HessboostError::unknown("metric", other)),
     }
 }

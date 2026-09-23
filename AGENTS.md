@@ -88,13 +88,15 @@ suite; `docs/performance.md` records its results.
 - **Formats:** the native binary magic (`SQB\0`) and the JSON layouts are
   compatibility contracts; do not change them without a migration.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`
-  values; `multi:softprob` gives `n_rows * num_class` and a multi-target
-  model (label matrix) `n_rows * n_targets`, both row-major
+  values; `multi:softprob` gives `n_rows * num_class` and the other
+  multi-output models (a multi-target label matrix, the `reg:quantileerror` /
+  `reg:expectileerror` alpha lists) `n_rows * n_outputs`, all row-major
   `[row][output]`; multi-target `predict_class` thresholds every target
-  (`[row][target]`). SHAP
-  contributions are `[row][n_features + 1]` (bias last), interactions
-  `[row][(n_features + 1)^2]`, with an extra output axis for multiclass and
-  multi-target models.
+  (`[row][target]`). SHAP contributions are `[row][n_features + 1]` (bias
+  last), interactions `[row][(n_features + 1)^2]`, with an extra output axis
+  for multi-output models. XGBoost's `num_target` counts outputs (one per
+  label column, or one per alpha), while `BoostedModel::n_targets` counts
+  label columns.
 - **Objective/metric hooks:** training reaches objectives and metrics only
   through the `MetaInfo` hooks (`Objective::gradient_info`,
   `base_margins_info`, `eval_transform`, `probs_to_margins`, `validate_info`,
@@ -102,8 +104,9 @@ suite; `docs/performance.md` records its results.
   Label-domain checks live in each objective's `validate_info`;
   `create_objective(params, n_targets)` wraps the elementwise objectives in
   `objective::MULTI_TARGET_OBJECTIVES` in `objective/multi_target.rs` for a
-  label matrix (row weights broadcast per cell, intercepts per column) and
-  rejects label matrices any other objective cannot model. The default
+  label matrix (row weights broadcast per cell, intercepts per column);
+  `reg:absoluteerror` models label matrices itself (per-target intercepts),
+  and label matrices any other objective cannot model are rejected. The default
   `Metric::eval_info` reduces a label matrix elementwise (every cell weighted
   by its row weight); non-elementwise metrics override it or return
   `supports_label_matrix() == false`, which training rejects. Parameters the

@@ -146,6 +146,16 @@ fn v1_layout_metadata_survives_the_migration() {
     assert!(params.quantile_alpha.is_empty() && params.expectile_alpha.is_empty());
     assert_eq!(params.aft_loss_distribution, AftDistribution::Normal);
     assert_eq!(params.aft_loss_distribution_scale, 1.0);
+    // Every v1 model, binary or JSON, gets the `dist:*` defaults.
+    for name in V1_MODELS {
+        let json = BoostedModel::load_json(dir.join(format!("{name}.json"))).unwrap();
+        for model in [load(name), json] {
+            let p = model.objective_params();
+            assert_eq!(p.distribution, None, "{name}");
+            assert_eq!(p.dist_gradient, DistGradient::Fisher, "{name}");
+            assert_eq!(p.dist_split_direction, DistSplitDirection::Random, "{name}");
+        }
+    }
 }
 
 #[test]
@@ -239,6 +249,11 @@ fn v2_round_trips_every_model_feature() {
         .unwrap()
         .with_labels(&classes)
         .unwrap();
+    let counts: Vec<f32> = (0..n).map(|i| ((i * 7) % 9) as f32).collect();
+    let negbinomial = DMatrix::from_dense(&x, n, COLS)
+        .unwrap()
+        .with_labels(&counts)
+        .unwrap();
     let cases: Vec<(&str, TrainingParams, DMatrix, Has)> = vec![
         (
             "vector leaves",
@@ -301,6 +316,44 @@ fn v2_round_trips_every_model_feature() {
                 .unwrap(),
             aft,
             |m| m.objective_params().aft_loss_distribution == AftDistribution::Logistic,
+        ),
+        (
+            "dist:normal",
+            base()
+                .objective("dist:normal")
+                .dist_gradient(DistGradient::Hessian)
+                .build()
+                .unwrap(),
+            matrix(1),
+            |m| {
+                let p = m.objective_params();
+                p.distribution == Some(DistFamily::Normal)
+                    && p.dist_gradient == DistGradient::Hessian
+                    && m.n_outputs() == 2
+                    && !m.has_vector_leaves()
+            },
+        ),
+        (
+            "dist:normal vector leaves",
+            base()
+                .objective("dist:normal")
+                .multi_strategy(MultiStrategy::MultiOutputTree)
+                .dist_split_direction(DistSplitDirection::Cyclic)
+                .build()
+                .unwrap(),
+            matrix(1),
+            |m| {
+                let p = m.objective_params();
+                p.distribution == Some(DistFamily::Normal)
+                    && p.dist_split_direction == DistSplitDirection::Cyclic
+                    && m.has_vector_leaves()
+            },
+        ),
+        (
+            "dist:negbinomial",
+            base().objective("dist:negbinomial").build().unwrap(),
+            negbinomial,
+            |m| m.objective_params().distribution == Some(DistFamily::NegativeBinomial),
         ),
     ];
     for (name, params, data, has_feature) in cases {

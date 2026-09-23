@@ -925,7 +925,7 @@ impl BoostedModel {
     ///
     /// This writes version 2 (the layout with label-matrix targets,
     /// `num_parallel_tree` forests, vector and linear leaves, and quantile /
-    /// expectile / AFT objective parameters). [`BoostedModel::from_bytes`]
+    /// expectile / AFT / `dist:*` objective parameters). [`BoostedModel::from_bytes`]
     /// also reads version 1 (hessboost 0.1.1 and earlier). Postcard is not
     /// self-describing, so any change to a serialized field needs a new
     /// version and a frozen decoder for the previous one.

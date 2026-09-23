@@ -7,7 +7,7 @@
 //! they were in 0.1.1 and must never change; the current types have since
 //! gained fields (`BoostedModel::n_targets` and `num_parallel_tree`,
 //! `RegTree` vector leaves and linear leaves, `ObjectiveParams` quantile /
-//! expectile / AFT parameters).
+//! expectile / AFT and `dist:*` parameters).
 //!
 //! Version 1 laid trees out round-robin over outputs (tree `t` feeds output
 //! `t % n_outputs`, `best_iteration` counts rounds of `n_outputs` trees).
@@ -15,11 +15,12 @@
 //! feeds output `(t / 1) % n_outputs`, so trees keep their order. Every other
 //! new field takes the value the native JSON format's serde defaults give a
 //! 0.1.1 JSON file: one label column, one tree per output per iteration,
-//! scalar constant leaves, and empty quantile / expectile lists with a normal
-//! AFT distribution of scale `1`.
+//! scalar constant leaves, empty quantile / expectile lists with a normal
+//! AFT distribution of scale `1`, and no `dist:*` family (Fisher scoring,
+//! random split direction).
 
 use super::model::{BoostedModel, LinearModel, ModelSpec};
-use crate::config::{AftDistribution, ObjectiveParams};
+use crate::config::{AftDistribution, DistGradient, DistSplitDirection, ObjectiveParams};
 use crate::error::{HessboostError, Result};
 use crate::tree::{Node, RegTree};
 use serde::Deserialize;
@@ -97,6 +98,9 @@ pub(super) fn decode(payload: &[u8]) -> Result<BoostedModel> {
             expectile_alpha: Vec::new(),
             aft_loss_distribution: AftDistribution::Normal,
             aft_loss_distribution_scale: 1.0,
+            dist_gradient: DistGradient::Fisher,
+            dist_split_direction: DistSplitDirection::Random,
+            distribution: None,
         },
         num_class: v1.num_class,
         n_outputs: v1.n_outputs,

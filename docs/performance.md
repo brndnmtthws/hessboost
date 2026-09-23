@@ -1,6 +1,6 @@
 # Performance
 
-sequoia-boost combines runtime-detected SIMD numerical kernels — NEON on
+hessboost combines runtime-detected SIMD numerical kernels — NEON on
 AArch64; AVX2+FMA (split evaluation, exponential and sigmoid transforms,
 logistic and short-softmax gradients) and SSE2 (quantile bin search) on
 x86-64 — with parallel histogram training. Data preparation and independent
@@ -13,7 +13,7 @@ walk. Scalar Rust handles other architectures and inputs outside the vector
 paths. Split choices, histogram sums, and prediction results match the scalar
 path exactly; the transcendental kernels stay within a few f32 ULPs of the
 scalar library functions. This guide compares CPU training with XGBoost and
-measures the numerical and tree-building optimizations within sequoia-boost.
+measures the numerical and tree-building optimizations within hessboost.
 
 ## XGBoost comparison
 
@@ -23,7 +23,7 @@ same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
 256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
 preparation and training, and report the median of six fits after warmup.
 
-| Workload | Threads | sequoia-boost | XGBoost 3.4.1 |
+| Workload | Threads | hessboost | XGBoost 3.4.1 |
 |---|---:|---:|---:|
 | Regression, 100k × 30 | 1 | 0.458 s | 1.054 s |
 | Regression, 100k × 30 | 4 | 0.201 s | 0.366 s |
@@ -38,7 +38,7 @@ preparation and training, and report the median of six fits after warmup.
 | 4-class, 50k × 30 | 4 | 0.523 s | 0.981 s |
 | 4-class, 50k × 30 | 16 | 0.746 s | 1.219 s |
 
-Sequoia has lower median fit time in all 12 configurations in this run.
+hessboost has lower median fit time in all 12 configurations in this run.
 Single-thread speedups range from 2.28× on binary classification to 2.77× on
 wide regression; 30-feature regression reaches 2.30× and multiclass 2.29×. At
 four threads, speedups range from 1.82× to 2.20×, and at sixteen threads from
@@ -47,7 +47,7 @@ workload, so the differences reflect training speed, not fit quality. Treat
 small differences as near parity given the uncontrolled background activity on
 this workstation.
 
-![sequoia-boost speedup over XGBoost 3.4.1 by workload and thread count](benchmarks/xgboost-speedup.svg)
+![hessboost speedup over XGBoost 3.4.1 by workload and thread count](benchmarks/xgboost-speedup.svg)
 
 ![Median fit time by workload and thread count, log scale](benchmarks/xgboost-threads.svg)
 
@@ -57,6 +57,9 @@ in [`benchmarks/xgboost.dat`](benchmarks/xgboost.dat) and
 [`benchmarks/optimization.dat`](benchmarks/optimization.dat). Regenerate
 them with `gnuplot -c docs/benchmarks/charts.gp` after updating a data
 file. The data files also carry the measurement provenance for each chart.
+The raw result files (`benchmarks/*.json` and the compressed samples) were
+recorded before this project was renamed from sequoia-boost, so they keep the
+crate paths and engine name in use at the time.
 
 ### CPU scheduling
 
@@ -68,7 +71,7 @@ little effect on total training time. See the upstream
 [split evaluator](https://github.com/dmlc/xgboost/blob/v3.4.1/src/tree/hist/evaluate_splits.h),
 and [hist updater](https://github.com/dmlc/xgboost/blob/v3.4.1/src/tree/updater_quantile_hist.cc).
 
-Sequoia's scheduler overlaps independent depthwise nodes and limits histogram
+hessboost's scheduler overlaps independent depthwise nodes and limits histogram
 allocations by the rows available. Data preparation and margin updates also
 share the worker pool. The measured benefit depends on tree shape, feature
 count, sampling, and worker count; more workers do not guarantee a faster fit.
@@ -80,7 +83,7 @@ training rows from the same distribution. The following scores are from the
 single-thread fits; lower is better. These synthetic tasks measure comparable
 fit quality under identical hyperparameters, not quality across all datasets.
 
-| Workload | Held-out rows | Metric | sequoia-boost | XGBoost 3.4.1 |
+| Workload | Held-out rows | Metric | hessboost | XGBoost 3.4.1 |
 |---|---:|---|---:|---:|
 | Regression, 100k × 30 | 20,000 | rmse | 0.060635 | 0.060965 |
 | Regression, 50k × 128 | 10,000 | rmse | 0.063959 | 0.064210 |
@@ -103,7 +106,7 @@ engines use depthwise growth, a fixed `base_score=0.5`, `alpha=0`, `gamma=0`,
 callbacks run inside the timer.
 
 XGBoost uses its macOS ARM64 PyPI wheel with OpenMP enabled and
-`QuantileDMatrix`, with quantile construction inside the timer. sequoia-boost
+`QuantileDMatrix`, with quantile construction inside the timer. hessboost
 constructs a fresh `DMatrix` inside the timer and bins during training. Both
 read identical binary data before timing. Test-matrix preparation, file I/O,
 process startup, prediction, scoring, and model destruction are excluded.
@@ -117,7 +120,7 @@ workstation with unrelated CPU activity, so small differences should be treated
 as near parity rather than an isolated-machine result.
 
 For each workload and thread count, batches run in
-XGBoost/sequoia/sequoia/XGBoost order. Each batch discards one warmup fit and
+XGBoost/hessboost/hessboost/XGBoost order. Each batch discards one warmup fit and
 records three fits. The table uses the median of all six recorded fits per
 engine. The [complete results](benchmarks/xgboost.json) include every sample,
 minimum/maximum times, held-out scores, native build configuration, dataset and
@@ -132,8 +135,8 @@ Reproduce from the repository root, using a new output directory:
 ```sh
 cargo build --release --example bench_compare
 uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
-  --sequoia target/release/examples/bench_compare \
-  --output /tmp/sequoia-xgb --threads 1 4 16
+  --hessboost target/release/examples/bench_compare \
+  --output /tmp/hessboost-xgb --threads 1 4 16
 ```
 
 The [script documentation](../scripts/README.md#xgboost-comparison) describes
@@ -373,8 +376,8 @@ predictions with one, four, and sixteen threads; its source and result hashes ar
 included with the benchmark samples.
 
 ```sh
-cargo test --workspace --locked
-cargo test --workspace --locked --release
+cargo test --locked
+cargo test --locked --release
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --all --check
 cargo test --locked --test parity -- --ignored
@@ -390,11 +393,11 @@ only.
 ## Reproduce the measurements
 
 The benchmark definitions live in
-[`benches/training.rs`](../crates/sequoia-boost/benches/training.rs). To run the
+[`benches/training.rs`](../benches/training.rs). To run the
 suite on the current checkout:
 
 ```sh
-RAYON_NUM_THREADS=1 cargo bench --locked -p sequoia-boost --bench training
+RAYON_NUM_THREADS=1 cargo bench --locked --bench training
 ```
 
 To regenerate the charts in this guide from the `.dat` files after updating
@@ -405,7 +408,9 @@ gnuplot -c docs/benchmarks/charts.gp
 ```
 
 For an exact source comparison, reconstruct both trees from the recorded
-baseline revision and source archive. Run from the repository root:
+baseline revision and source archive. These revisions predate the rename and
+flattening, so the snippet uses the original `crates/sequoia-boost` layout and
+package name. Run from the repository root:
 
 ```sh
 export BENCH_WORKDIR="$(mktemp -d)"

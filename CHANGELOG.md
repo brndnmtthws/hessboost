@@ -1,10 +1,13 @@
 # Changelog
 
-All notable changes to `sequoia-boost` are documented here. The format follows
+All notable changes to `hessboost` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
-[Semantic Versioning](https://semver.org/).
+[Semantic Versioning](https://semver.org/). hessboost starts at 0.1.0. The
+sequoia-boost releases it was forked from are kept at the end for reference.
 
 ## [Unreleased]
+
+Changes since sequoia-boost 0.2.0.
 
 ### Added
 
@@ -51,6 +54,17 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 
 ### Changed
 
+- Forked from [sequoia-boost](https://github.com/pgarrett-scripps/sequoia-boost)
+  and renamed to `hessboost`, restarting at version 0.1.0. The crate, library
+  path (`hessboost::prelude`), and error type (`HessboostError`) are renamed.
+  The native binary format is unchanged, so models saved by sequoia-boost 0.2.0
+  still load.
+- The crate now lives at the repository root instead of a one-member workspace
+  under `crates/`.
+- Removed the upstream citation and Zenodo metadata (`CITATION.cff`,
+  `.zenodo.json`) and the CI job that validated them.
+- Removed the unused `num-traits` and `rand_pcg` dependencies and the empty
+  `gpu` feature.
 - Skip child histograms and split searches for depthwise leaves at `max_depth`,
   preserving leaf statistics, monotone bounds, and column-sampling order.
 - Parallelize quantile cuts, bin assignment, and depthwise node construction.
@@ -172,7 +186,7 @@ All notable changes to `sequoia-boost` are documented here. The format follows
   normalization, query weight and weight normalization as three separate
   `f32` multiplications in XGBoost's order instead of one pre-combined scale.
 
-## [0.2.0] - 2026-08-16
+## [sequoia-boost 0.2.0] - 2026-08-16
 
 ### Fixed
 
@@ -207,7 +221,7 @@ All notable changes to `sequoia-boost` are documented here. The format follows
 - Prepare version 0.2.0 citation, Zenodo, and Cargo release metadata. No DOI is
   claimed until the first Zenodo archive has been published.
 
-## [0.1.0]
+## [sequoia-boost 0.1.0]
 
 Initial release: a faithful, pure-Rust reimplementation of XGBoost gradient
 boosting.
@@ -245,6 +259,6 @@ boosting.
 - Unit, property (`proptest`), and doc tests. XGBoost model-quality parity is
   verified in CI against real XGBoost.
 
-[Unreleased]: https://github.com/pgarrett-scripps/sequoia-boost/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/pgarrett-scripps/sequoia-boost/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/pgarrett-scripps/sequoia-boost/releases/tag/v0.1.0
+[Unreleased]: https://github.com/brndnmtthws/hessboost/commits/main
+[sequoia-boost 0.2.0]: https://github.com/pgarrett-scripps/sequoia-boost/compare/v0.1.0...v0.2.0
+[sequoia-boost 0.1.0]: https://github.com/pgarrett-scripps/sequoia-boost/releases/tag/v0.1.0

@@ -111,10 +111,10 @@
 	<path stroke='black'  d='M79.30,78.01 L79.30,422.50 L932.69,422.50 M932.69,78.01 M79.30,78.01  '/></g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 </g>
-	<g id="gnuplot_plot_1" ><title>sequoia, 1 thread</title>
+	<g id="gnuplot_plot_1" ><title>hessboost, 1 thread</title>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 	<g transform="translate(130.00,102.72)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="start">
-		<text><tspan font-family="sans-serif" >sequoia, 1 thread</tspan></text>
+		<text><tspan font-family="sans-serif" >hessboost, 1 thread</tspan></text>
 	</g>
 </g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
@@ -179,10 +179,10 @@
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 </g>
 	</g>
-	<g id="gnuplot_plot_3" ><title>sequoia, 4 threads</title>
+	<g id="gnuplot_plot_3" ><title>hessboost, 4 threads</title>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 	<g transform="translate(130.00,145.62)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="start">
-		<text><tspan font-family="sans-serif" >sequoia, 4 threads</tspan></text>
+		<text><tspan font-family="sans-serif" >hessboost, 4 threads</tspan></text>
 	</g>
 </g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
@@ -247,10 +247,10 @@
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 </g>
 	</g>
-	<g id="gnuplot_plot_5" ><title>sequoia, 16 threads</title>
+	<g id="gnuplot_plot_5" ><title>hessboost, 16 threads</title>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 	<g transform="translate(130.00,188.52)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="start">
-		<text><tspan font-family="sans-serif" >sequoia, 16 threads</tspan></text>
+		<text><tspan font-family="sans-serif" >hessboost, 16 threads</tspan></text>
 	</g>
 </g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
@@ -330,7 +330,7 @@
 </g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 	<g transform="translate(505.99,33.49)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="middle">
-		<text><tspan font-family="sans-serif" >Median fit time, sequoia-boost vs XGBoost 3.4.1 (lower is better)</tspan></text>
+		<text><tspan font-family="sans-serif" >Median fit time, hessboost vs XGBoost 3.4.1 (lower is better)</tspan></text>
 	</g>
 	<g transform="translate(505.99,52.99)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="middle">
 		<text><tspan font-family="sans-serif"  font-size="10.4">seconds, log scale, fresh matrix construction plus training</tspan></text>

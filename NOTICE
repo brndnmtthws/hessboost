@@ -1,3 +1,16 @@
+hessboost
+Copyright 2026 Brenden Matthews
+
+Licensed under the Apache License, Version 2.0 (the "License"). You may not use
+these files except in compliance with the License. A copy of the License is
+provided in the LICENSE file.
+
+hessboost is a fork of sequoia-boost
+(https://github.com/pgarrett-scripps/sequoia-boost), created because the two
+projects have different goals. The sequoia-boost NOTICE is retained below.
+
+==============================================================================
+
 sequoia-boost
 Copyright 2026 Patrick Garrett
 

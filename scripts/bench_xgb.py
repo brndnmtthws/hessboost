@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare CPU histogram training with XGBoost on shared synthetic datasets.
 
-Run with uv and a compiled --sequoia example. Both engines time fresh training
+Run with uv and a compiled --hessboost example. Both engines time fresh training
 matrix construction plus training; file I/O, warmup, and evaluation are excluded.
 """
 
@@ -105,7 +105,7 @@ def xgboost_batch(folder, meta, threads, repeats):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sequoia", type=Path, required=True, help="Compiled bench_compare example")
+    parser.add_argument("--hessboost", type=Path, required=True, help="Compiled bench_compare example")
     parser.add_argument("--output", type=Path, required=True, help="New directory for data and results")
     parser.add_argument("--threads", nargs="+", type=int, default=[1, 4, 16])
     parser.add_argument("--workloads", nargs="+", choices=WORKLOADS, default=list(WORKLOADS))
@@ -115,25 +115,25 @@ def main():
     args = parser.parse_args()
     if min(args.threads + [args.rounds, args.repeats, args.rows if args.rows is not None else 1]) < 1:
         parser.error("thread, round, repeat, and row counts must be positive")
-    executable = args.sequoia.resolve(strict=True)
+    executable = args.hessboost.resolve(strict=True)
     args.output.mkdir(parents=True, exist_ok=False)
     library = Path(xgb.core._LIB._name)
     cpu = (subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
            if sys.platform == "darwin" else platform.processor())
-    sources = [Path(__file__), Path("crates/sequoia-boost/examples/bench_compare.rs"),
-               Path("Cargo.toml"), Path("Cargo.lock"), Path("crates/sequoia-boost/Cargo.toml"),
-               *sorted(Path("crates/sequoia-boost/src").rglob("*.rs"))]
+    sources = [Path(__file__), Path("examples/bench_compare.rs"),
+               Path("Cargo.toml"), Path("Cargo.lock"),
+               *sorted(Path("src").rglob("*.rs"))]
     report = {
         "metadata": {
             "started_at": datetime.now(timezone.utc).isoformat(), "cpu": cpu,
             "platform": platform.platform(), "python": sys.version, "numpy": np.__version__,
             "xgboost": xgb.__version__, "xgboost_build_info": xgb.build_info(),
-            "xgboost_library_sha256": sha256(library), "sequoia_executable_sha256": sha256(executable),
+            "xgboost_library_sha256": sha256(library), "hessboost_executable_sha256": sha256(executable),
             "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
             "source_sha256": {str(p): sha256(p) for p in sources},
-            "matrix": "XGBoost QuantileDMatrix; sequoia-boost DMatrix",
+            "matrix": "XGBoost QuantileDMatrix; hessboost DMatrix",
             "timing": "Fresh training matrix construction plus train; I/O, evaluation, and destruction excluded",
-            "order": ["xgboost", "sequoia-boost", "sequoia-boost", "xgboost"],
+            "order": ["xgboost", "hessboost", "hessboost", "xgboost"],
             "warmup_fits_per_batch": 1, "measured_fits_per_batch": args.repeats,
             "threads": args.threads,
         },
@@ -167,8 +167,8 @@ def main():
                     min_fit_seconds=min(samples), max_fit_seconds=max(samples),
                     test_metric=meta["metric"], test_scores=[b["test_score"] for b in selected])
             report["results"].append(dict(workload=workload, threads=threads, engines=engines,
-                sequoia_speedup=engines["xgboost"]["median_fit_seconds"] /
-                                engines["sequoia-boost"]["median_fit_seconds"], batches=batches))
+                hessboost_speedup=engines["xgboost"]["median_fit_seconds"] /
+                                engines["hessboost"]["median_fit_seconds"], batches=batches))
             (args.output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
     report["metadata"]["finished_at"] = datetime.now(timezone.utc).isoformat()
     (args.output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")

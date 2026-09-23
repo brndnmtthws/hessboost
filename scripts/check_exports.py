@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Export parity: reload sequoia-boost's XGBoost-JSON exports in real XGBoost.
+"""Export parity: reload hessboost's XGBoost-JSON exports in real XGBoost.
 
-`crates/sequoia-boost/tests/parity.rs` writes `fixtures/exports/<name>.model.json`
-(sequoia's `to_xgboost_json`) and `<name>.pred.json` (sequoia's predictions on
+`tests/parity.rs` writes `fixtures/exports/<name>.model.json`
+(hessboost's `to_xgboost_json`) and `<name>.pred.json` (hessboost's predictions on
 the case's `x_test`). This script loads each model with `xgb.Booster.load_model`,
 predicts the same `x_test` from `fixtures/<name>.json`, and requires
 max |delta| <= the fixture's `tol.import`.
@@ -36,7 +36,7 @@ def check_case(model_path: str) -> tuple[str, str]:
     with open(os.path.join(FIX_DIR, f"{name}.json")) as fh:
         fx = json.load(fh)
     with open(os.path.join(EXPORT_DIR, f"{name}.pred.json")) as fh:
-        sequoia_pred = np.asarray(json.load(fh), dtype=np.float32)
+        hessboost_pred = np.asarray(json.load(fh), dtype=np.float32)
 
     booster = xgb.Booster()
     try:
@@ -47,10 +47,10 @@ def check_case(model_path: str) -> tuple[str, str]:
     x_test = _dense(fx["x_test"], fx["n_test"], fx["n_cols"])
     dtest = xgb.DMatrix(x_test, nthread=1, feature_types=fx.get("feature_types"))
     xgb_pred = np.asarray(booster.predict(dtest), dtype=np.float32).reshape(-1)
-    if xgb_pred.shape != sequoia_pred.shape:
-        return name, f"length mismatch: xgboost {xgb_pred.size} vs sequoia {sequoia_pred.size}"
+    if xgb_pred.shape != hessboost_pred.shape:
+        return name, f"length mismatch: xgboost {xgb_pred.size} vs hessboost {hessboost_pred.size}"
 
-    delta = np.abs(xgb_pred.astype(np.float64) - sequoia_pred.astype(np.float64))
+    delta = np.abs(xgb_pred.astype(np.float64) - hessboost_pred.astype(np.float64))
     max_delta = float(np.max(delta)) if delta.size else 0.0
     tol = fx["tol"]["import"]
     ok = np.isfinite(max_delta) and max_delta <= tol
@@ -63,7 +63,7 @@ def main() -> int:
     if not models:
         print(
             f"no exports in {os.path.abspath(EXPORT_DIR)}; run "
-            "`cargo test -p sequoia-boost --test parity --release -- --ignored` first"
+            "`cargo test -p hessboost --test parity --release -- --ignored` first"
         )
         return 2
     failures = [(name, why) for name, why in map(check_case, models) if why != "OK"]

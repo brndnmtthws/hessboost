@@ -1,35 +1,32 @@
-[workspace]
-resolver = "2"
-members = ["crates/sequoia-boost"]
-
-[workspace.package]
-version = "0.2.0"
+[package]
+name = "hessboost"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.86"
 license = "Apache-2.0"
-repository = "https://github.com/pgarrett-scripps/sequoia-boost"
-authors = [
-    "Patrick T. Garrett <pgarrett@scripps.edu>",
-    "John R. Yates III <jyates@scripps.edu>",
-]
+repository = "https://github.com/brndnmtthws/hessboost"
+authors = ["Brenden Matthews <brenden@brndn.io>"]
 description = "A faithful, fast, pure-Rust reimplementation of XGBoost gradient boosting"
 keywords = ["gradient-boosting", "xgboost", "machine-learning", "decision-trees", "boosting"]
 categories = ["science", "algorithms"]
+include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
 
-[workspace.dependencies]
+[dependencies]
 rayon = "1.10"
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
-num-traits = "0.2"
 rand = "0.8"
-rand_pcg = "0.3"
 
-# Dev
+[dev-dependencies]
 criterion = "0.5"
 proptest = "1.5"
 approx = "0.5"
+
+[[bench]]
+name = "training"
+harness = false
 
 [profile.release]
 opt-level = 3

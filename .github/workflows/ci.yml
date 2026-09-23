@@ -11,20 +11,6 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  metadata:
-    name: release metadata
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade cffconvert PyYAML
-      - run: python scripts/check_metadata.py
-      - run: cffconvert --validate
-
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -53,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      - run: cargo test --all-features
 
   docs:
     name: docs
@@ -64,7 +50,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --workspace --no-deps --all-features
+      - run: cargo doc --no-deps --all-features
 
   msrv:
     name: MSRV (1.86.0)
@@ -75,7 +61,7 @@ jobs:
         with:
           toolchain: 1.86.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-features
+      - run: cargo build --all-features
 
   parity:
     name: XGBoost parity
@@ -88,6 +74,6 @@ jobs:
       - name: Generate fixtures from XGBoost 3.4.1
         run: uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
       - name: Train, import and cut parity
-        run: cargo test -p sequoia-boost --test parity --release -- --ignored --nocapture
+        run: cargo test --test parity --release -- --ignored --nocapture
       - name: Export parity (reload in XGBoost)
         run: uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py

@@ -12,13 +12,13 @@ raw margin, SHAP contributions on the first 50 rows) and the saved model JSON.
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 
-`crates/sequoia-boost/tests/parity.rs` runs a three-way check per case:
+`tests/parity.rs` runs a three-way check per case:
 
 1. **Train parity** - train on the fixture data, compare `predict(x_test)` with
    XGBoost's predictions.
 2. **Import parity** - `BoostedModel::from_xgboost_json` on the embedded model,
    compare predictions, raw margins, and SHAP contributions.
-3. **Export parity** - write `to_xgboost_json` and sequoia's predictions to
+3. **Export parity** - write `to_xgboost_json` and hessboost's predictions to
    `../fixtures/exports/`; `check_exports.py` reloads each model in XGBoost and
    compares.
 
@@ -36,7 +36,7 @@ parameters fail the test.
 
 ```sh
 uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
-cargo test -p sequoia-boost --test parity --release -- --ignored --nocapture
+cargo test --test parity --release -- --ignored --nocapture
 uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
 ```
 
@@ -55,7 +55,7 @@ samples and console output. It requires only the Python standard library.
 python3 scripts/compare_benchmarks.py \
   --baseline /path/to/baseline-training-bench \
   --optimized /path/to/optimized-training-bench \
-  --output /tmp/sequoia-comparison \
+  --output /tmp/hessboost-comparison \
   --threads 1 --filter 'hist_tree_build|train_50k_x20_50rounds/Hist'
 ```
 
@@ -71,12 +71,12 @@ XGBoost and the compiled `bench_compare` Rust example. Both engines read the
 same little-endian `f32` bytes. Each timed fit constructs a fresh training
 matrix and trains the model. File I/O, test-data preparation, evaluation, model
 destruction, and process startup are outside the timer. XGBoost uses
-`QuantileDMatrix` with CPU `hist`. sequoia-boost builds its `DMatrix` and performs
+`QuantileDMatrix` with CPU `hist`. hessboost builds its `DMatrix` and performs
 binning during training.
 
 The default suite covers regression, wide regression, binary classification,
 and four-class classification, with 100 boosting rounds at 1, 4, and 16
-threads. Each comparison runs in XGBoost/sequoia/sequoia/XGBoost order. Every
+threads. Each comparison runs in XGBoost/hessboost/hessboost/XGBoost order. Every
 batch discards one warmup fit and records three fits. The report uses the
 median of all six measurements for each engine. Held-out RMSE or log loss
 checks model quality alongside timing.
@@ -84,8 +84,8 @@ checks model quality alongside timing.
 ```sh
 cargo build --release --example bench_compare
 uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
-  --sequoia target/release/examples/bench_compare \
-  --output /tmp/sequoia-xgb --threads 1 4 16
+  --hessboost target/release/examples/bench_compare \
+  --output /tmp/hessboost-xgb --threads 1 4 16
 ```
 
 Use a new output directory for each comparison. It contains the shared binary

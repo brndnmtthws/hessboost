@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Generate XGBoost 3.4.1 parity fixtures for sequoia-boost.
+"""Generate XGBoost 3.4.1 parity fixtures for hessboost.
 
 Trains real XGBoost (single thread) on deterministic synthetic datasets, one
 case per supported feature, and writes `fixtures/<name>.json` holding the data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
 raw margin, SHAP contributions on the first 50 rows) and the saved model JSON.
-`crates/sequoia-boost/tests/parity.rs` consumes these; the fixture schema is the
+`tests/parity.rs` consumes these; the fixture schema is the
 contract between the two.
 
 Tiers:

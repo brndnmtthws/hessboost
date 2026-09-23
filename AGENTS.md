@@ -1,8 +1,8 @@
 # AGENTS.md guide for AI coding agents
 
-Context for automated agents working with **sequoia-boost**, a faithful,
+Context for automated agents working with **hessboost**, a faithful,
 pure-Rust reimplementation of XGBoost gradient boosting (no C/C++, no FFI).
-Human docs: `README.md` and [docs.rs](https://docs.rs/sequoia-boost).
+Human docs: `README.md` and [docs.rs](https://docs.rs/hessboost).
 
 > This codebase was generated with Claude (Anthropic) under human direction.
 > It is tested and XGBoost-parity-checked in CI but may contain bugs. Verify
@@ -12,11 +12,11 @@ Human docs: `README.md` and [docs.rs](https://docs.rs/sequoia-boost).
 
 ```toml
 [dependencies]
-sequoia-boost = "0.1"
+hessboost = "0.1"
 ```
 
 ```rust
-use sequoia_boost::prelude::*;
+use hessboost::prelude::*;
 
 fn main() -> Result<()> {
     // features: row-major &[f32] of length n_rows * n_cols; labels: &[f32] of n_rows
@@ -30,7 +30,7 @@ fn main() -> Result<()> {
 }
 ```
 
-Everything in the typical workflow is re-exported from `sequoia_boost::prelude`.
+Everything in the typical workflow is re-exported from `hessboost::prelude`.
 
 ## Key entry points
 
@@ -56,30 +56,30 @@ Everything in the typical workflow is re-exported from `sequoia_boost::prelude`.
 ## Conventions & gotchas
 
 - **Prediction layout:** single-output and `multi:softmax` → length `n_rows`. `multi:softprob` → `n_rows * num_class`, row-major `[row][class]`. SHAP contribs → `[row][n_features + 1]` (last = bias). SHAP interactions → `[row][(n_features+1)^2]`.
-- **Errors:** everything returns `Result<T, SequoiaError>` (`Result` alias is in the prelude). Prefer `?` and do not `unwrap` in library code.
+- **Errors:** everything returns `Result<T, HessboostError>` (`Result` alias is in the prelude). Prefer `?` and do not `unwrap` in library code.
 - **Determinism:** identical `(params, data, seed)` ⇒ identical predictions (property-tested).
 - **Parity:** matches XGBoost *model quality* (CI-tested via `tests/parity.rs`), not bit-identical predictions.
 - **`num_class` is required** for `multi:*`. Ranking objectives require `with_group_sizes`.
 - No `unsafe` appears in the public API. The crate uses `#![forbid(unsafe_op_in_unsafe_fn)]`.
 
-## Runnable examples (`crates/sequoia-boost/examples/`)
+## Runnable examples (`examples/`)
 
 `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
 `custom_objective`, `constraints`, `train_regression`. Run one with
 `cargo run --release --example <name>`. These are the best copy-paste starting
 points for each workflow.
 
-## Repo commands (from the workspace root)
+## Repo commands (from the repository root)
 
 ```sh
-cargo test --workspace                       # unit + property + doc tests
+cargo test                                   # unit + property + doc tests
 cargo clippy --all-targets -- -D warnings    # lints (CI-enforced)
 cargo fmt --all --check                      # formatting (CI-enforced)
 cargo run --release --example <name>         # run an example
-cargo bench -p sequoia-boost                 # criterion micro-benchmarks
+cargo bench                                  # criterion micro-benchmarks
 ```
 
-## Module map (`crates/sequoia-boost/src/`)
+## Module map (`src/`)
 
 `data/` (DMatrix, quantile binning, ghist) · `config/` (TrainingParams) ·
 `objective/` · `metric/` · `tree/` (regtree, gain, constraints, sampler,

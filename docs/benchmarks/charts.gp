@@ -16,7 +16,7 @@ set datafile commentschars "#"
 xgb_data = "docs/benchmarks/xgboost.dat"
 opt_data = "docs/benchmarks/optimization.dat"
 
-# sequoia-boost is green and XGBoost blue; darker shades are lower
+# hessboost is green and XGBoost blue; darker shades are lower
 # thread counts throughout.
 seq_t1 = "#1b5e20"
 seq_t4 = "#43a047"
@@ -46,8 +46,8 @@ set terminal svg size 960,520 dynamic font "sans-serif,13" background rgb "white
 
 set output "docs/benchmarks/xgboost-speedup.svg"
 
-set title "sequoia-boost speedup over XGBoost 3.4.1 (higher is better)\n{/*0.8 median of six fits, Apple M3 Max, CPU hist, 100 rounds}"
-set ylabel "fit time ratio, XGBoost / sequoia-boost"
+set title "hessboost speedup over XGBoost 3.4.1 (higher is better)\n{/*0.8 median of six fits, Apple M3 Max, CPU hist, 100 rounds}"
+set ylabel "fit time ratio, XGBoost / hessboost"
 set yrange [0:3.2]
 set ytics 0.5
 set arrow 1 from -0.5,1 to 3.5,1 nohead lc rgb "#303030" dt 2 lw 1.5 front
@@ -69,7 +69,7 @@ unset arrow 1
 
 set output "docs/benchmarks/xgboost-threads.svg"
 
-set title "Median fit time, sequoia-boost vs XGBoost 3.4.1 (lower is better)\n{/*0.8 seconds, log scale, fresh matrix construction plus training}"
+set title "Median fit time, hessboost vs XGBoost 3.4.1 (lower is better)\n{/*0.8 seconds, log scale, fresh matrix construction plus training}"
 set ylabel "fit time (s)"
 set logscale y 10
 set yrange [0.15:5]
@@ -77,11 +77,11 @@ set ytics ("0.2" 0.2, "0.5" 0.5, "1" 1, "2" 2, "5" 5)
 set mytics 10
 set key top left reverse Left samplen 1.5 spacing 1.1
 
-plot xgb_data using 2:xtic(1) lc rgb seq_t1  title "sequoia, 1 thread", \
+plot xgb_data using 2:xtic(1) lc rgb seq_t1  title "hessboost, 1 thread", \
      xgb_data using 3:xtic(1) lc rgb xgb_t1  title "XGBoost, 1 thread", \
-     xgb_data using 4:xtic(1) lc rgb seq_t4  title "sequoia, 4 threads", \
+     xgb_data using 4:xtic(1) lc rgb seq_t4  title "hessboost, 4 threads", \
      xgb_data using 5:xtic(1) lc rgb xgb_t4  title "XGBoost, 4 threads", \
-     xgb_data using 6:xtic(1) lc rgb seq_t16 title "sequoia, 16 threads", \
+     xgb_data using 6:xtic(1) lc rgb seq_t16 title "hessboost, 16 threads", \
      xgb_data using 7:xtic(1) lc rgb xgb_t16 title "XGBoost, 16 threads"
 
 unset logscale

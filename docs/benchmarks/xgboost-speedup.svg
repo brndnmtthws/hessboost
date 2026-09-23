@@ -298,7 +298,7 @@
 </g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 	<path stroke='black'  d='M88.40,78.01 L88.40,422.50 L932.69,422.50 M932.69,78.01 M88.40,78.01  '/>	<g transform="translate(20.79,250.26) rotate(270.00)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="middle">
-		<text><tspan font-family="sans-serif" >fit time ratio, XGBoost / sequoia-boost</tspan></text>
+		<text><tspan font-family="sans-serif" >fit time ratio, XGBoost / hessboost</tspan></text>
 	</g>
 </g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
@@ -311,7 +311,7 @@
 </g>
 <g fill="none" color="black" stroke="currentColor" stroke-width="1.00" stroke-linecap="butt" stroke-linejoin="miter">
 	<g transform="translate(510.54,33.49)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="middle">
-		<text><tspan font-family="sans-serif" >sequoia-boost speedup over XGBoost 3.4.1 (higher is better)</tspan></text>
+		<text><tspan font-family="sans-serif" >hessboost speedup over XGBoost 3.4.1 (higher is better)</tspan></text>
 	</g>
 	<g transform="translate(510.54,52.99)" stroke="none" fill="black" font-family="sans-serif" font-size="13.00"  text-anchor="middle">
 		<text><tspan font-family="sans-serif"  font-size="10.4">median of six fits, Apple M3 Max, CPU hist, 100 rounds</tspan></text>

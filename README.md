@@ -1,15 +1,14 @@
-# sequoia-boost
+# hessboost
 
-[![crates.io](https://img.shields.io/crates/v/sequoia-boost.svg)](https://crates.io/crates/sequoia-boost)
-[![docs.rs](https://img.shields.io/docsrs/sequoia-boost)](https://docs.rs/sequoia-boost)
-[![CI](https://github.com/pgarrett-scripps/sequoia-boost/actions/workflows/ci.yml/badge.svg)](https://github.com/pgarrett-scripps/sequoia-boost/actions/workflows/ci.yml)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21968435.svg)](https://doi.org/10.5281/zenodo.21968435)
-[![license](https://img.shields.io/crates/l/sequoia-boost.svg)](LICENSE)
+[![crates.io](https://img.shields.io/crates/v/hessboost.svg)](https://crates.io/crates/hessboost)
+[![docs.rs](https://img.shields.io/docsrs/hessboost)](https://docs.rs/hessboost)
+[![CI](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml/badge.svg)](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 A faithful, fast, pure-Rust reimplementation of [XGBoost](https://github.com/dmlc/xgboost)
 gradient boosting with no C/C++ dependency and no FFI.
 
-`sequoia-boost` re-implements XGBoost's algorithms from scratch in idiomatic
+`hessboost` re-implements XGBoost's algorithms from scratch in idiomatic
 Rust. It includes the regularized second-order boosting objective, exact,
 histogram, and approximate tree construction, the full objective and metric
 catalog, monotone and interaction constraints, categorical splits, DART and
@@ -20,7 +19,7 @@ Objective, metric, and parameter names mirror XGBoost, so configurations
 transfer directly.
 
 > **Built with AI.** The implementation was generated with **Claude** (Anthropic's
-> AI coding assistant) under Patrick Garrett's direction and review. It is **AI-generated
+> AI coding assistant) under human direction and review. It is **AI-generated
 > code**: it is covered by unit, property, and doc tests plus CI-checked
 > XGBoost 3.4.1 parity, but it may still contain bugs, subtle numerical errors, or
 > wrong edge-case behavior. **Review and validate it for your own use case. It is
@@ -32,7 +31,7 @@ transfer directly.
 ## Quick start
 
 ```rust
-use sequoia_boost::prelude::*;
+use hessboost::prelude::*;
 
 fn main() -> Result<()> {
     // Dense features (row-major) + labels.
@@ -53,7 +52,7 @@ fn main() -> Result<()> {
     let model = train(&params, &dtrain, 200)?;
     let preds = model.predict(&dtrain)?;
 
-    model.save_binary("model.sqb")?;
+    model.save_binary("model.bin")?;
     Ok(())
 }
 ```
@@ -61,7 +60,7 @@ fn main() -> Result<()> {
 ## Examples
 
 Runnable, self-contained examples live in
-[`crates/sequoia-boost/examples/`](crates/sequoia-boost/examples). Run any with
+[`examples/`](examples). Run any with
 `cargo run --release --example <name>`:
 
 | Example | Shows |
@@ -141,7 +140,7 @@ same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
 256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
 preparation and training, and report the median of six fits after warmup.
 
-| Workload | Threads | sequoia-boost | XGBoost 3.4.1 |
+| Workload | Threads | hessboost | XGBoost 3.4.1 |
 |---|---:|---:|---:|
 | Regression, 100k × 30 | 1 | 0.458 s | 1.054 s |
 | Regression, 100k × 30 | 4 | 0.201 s | 0.366 s |
@@ -156,7 +155,7 @@ preparation and training, and report the median of six fits after warmup.
 | 4-class, 50k × 30 | 4 | 0.523 s | 0.981 s |
 | 4-class, 50k × 30 | 16 | 0.746 s | 1.219 s |
 
-Sequoia has lower median fit time in all 12 configurations in this run.
+hessboost has lower median fit time in all 12 configurations in this run.
 Single-thread speedups are 2.28× to 2.77×, four-thread speedups are 1.82× to
 2.20×, and sixteen-thread speedups are 1.37× to 1.63×. Held-out RMSE/log-loss
 scores are identical to the previous run on every workload.
@@ -170,18 +169,18 @@ See [Performance](docs/performance.md) for kernel measurements, numerical
 behavior, and reproduction commands.
 
 ```sh
-cargo bench -p sequoia-boost
+cargo bench
 ```
 
 ## Testing & parity
 
 ```sh
-cargo test -p sequoia-boost         # unit + integration tests
+cargo test                          # unit + integration tests
 cargo clippy --all-targets          # lints
 ```
 
 Numerical parity with **XGBoost 3.4.1** is checked in CI by a fixture harness
-(`scripts/gen_fixtures.py`, `crates/sequoia-boost/tests/parity.rs`,
+(`scripts/gen_fixtures.py`, `tests/parity.rs`,
 `scripts/check_exports.py`). Each case is checked three ways: **train parity**
 (same data and parameters, compare predictions), **import parity**
 (`from_xgboost_json` on the XGBoost model: predictions, margins, SHAP
@@ -195,30 +194,22 @@ approximate quantile cuts are compared bit-for-bit.
 
 ```sh
 uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
-cargo test -p sequoia-boost --test parity --release -- --ignored --nocapture
+cargo test --test parity --release -- --ignored --nocapture
 uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
 ```
 
 See `scripts/README.md` for the case matrix and tolerances.
 
-## Development provenance
+## History
 
-Generated with **Claude** (Anthropic's AI coding assistant) under **Patrick
-Garrett's** direction and review. The AI system is not an author. See
-[`NOTICE`](NOTICE). Because the code is AI-generated, treat it with appropriate
-scrutiny. It is tested and parity-checked but not warranted.
-
-## Citation and archiving
-
-Citation metadata is provided in [`CITATION.cff`](CITATION.cff), with matching
-deposit metadata in [`.zenodo.json`](.zenodo.json). Cite the project using the
-stable [Zenodo concept DOI](https://doi.org/10.5281/zenodo.21968435). The
-immutable v0.2.0 archive has release DOI
-[10.5281/zenodo.21968436](https://doi.org/10.5281/zenodo.21968436).
+hessboost is a fork of
+[sequoia-boost](https://github.com/pgarrett-scripps/sequoia-boost), created
+because the two projects have different goals. It keeps the Apache-2.0 license
+and the upstream attribution in [`NOTICE`](NOTICE).
 
 ## Acknowledgments
 
-sequoia-boost is an independent, from-scratch **reimplementation of
+hessboost is an independent, from-scratch **reimplementation of
 [XGBoost](https://github.com/dmlc/xgboost)** (Copyright the XGBoost Contributors,
 Apache-2.0) in Rust. It reimplements XGBoost's algorithms from their public
 descriptions and papers and contains no XGBoost source code. "XGBoost" is used

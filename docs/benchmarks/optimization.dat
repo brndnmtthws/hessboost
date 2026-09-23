@@ -1,4 +1,4 @@
-# Scalar baseline vs optimized sequoia-boost on an Apple M3 Max (macOS
+# Scalar baseline vs optimized hessboost on an Apple M3 Max (macOS
 # 26.6.2, Rust 1.98.1), measured with Criterion in
 # baseline/optimized/optimized/baseline order. Values are the mean of two
 # run medians in milliseconds, from the same runs as the tables in

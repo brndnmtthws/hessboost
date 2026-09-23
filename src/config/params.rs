@@ -91,8 +91,12 @@ pub enum SamplingMethod {
     /// Every row is kept with probability `subsample`. XGBoost default.
     #[default]
     Uniform,
-    /// Rows are kept with probability proportional to their gradient
-    /// magnitude (XGBoost `gradient_based`).
+    /// Minimal-variance sampling (XGBoost `gradient_based`): each tree keeps
+    /// row `i` with probability `min(1, sqrt(g_i^2 + 0.1 h_i^2) / u)`, where
+    /// `u` makes the expected kept count `trunc(n * subsample)`, and scales a
+    /// kept row's gradient and Hessian by the inverse of that probability.
+    /// Supported by `tree_method = hist | approx | auto`; `exact` rejects it
+    /// when `subsample < 1`.
     GradientBased,
 }
 

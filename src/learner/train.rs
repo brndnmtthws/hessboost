@@ -9,15 +9,13 @@ use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::learner::model::{BoostedModel, ModelSpec};
+use crate::learner::sampling::gradient_based_sample;
 use crate::metric::create_metrics;
 use crate::objective::{GradPair, create_objective};
 use crate::tree::RegTree;
-use crate::tree::builder::{
-    ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows,
-};
+use crate::tree::builder::{ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_rows};
 use crate::tree::sampler::ColumnSampler;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 
@@ -93,6 +91,16 @@ fn prepare_builder(
         TreeMethod::Exact => TreeMethod::Exact,
         TreeMethod::Approx => TreeMethod::Approx,
     };
+    if method == TreeMethod::Exact
+        && params.sampling_method == SamplingMethod::GradientBased
+        && params.subsample < 1.0
+    {
+        return Err(HessboostError::invalid_param(
+            "sampling_method",
+            "`gradient_based` sampling requires `tree_method=hist` or `approx`; \
+             `exact` supports only `uniform`",
+        ));
+    }
     if method == TreeMethod::Exact && params.grow_policy == GrowPolicy::LossGuide {
         return Err(HessboostError::invalid_param(
             "grow_policy",
@@ -258,7 +266,7 @@ fn train_impl_inner(
     metric_override: Option<Box<dyn crate::metric::Metric>>,
 ) -> Result<TrainResult> {
     params.validate()?;
-    reject_unimplemented(params, dtrain)?;
+    reject_unimplemented(params)?;
 
     if !params.missing.is_nan() {
         return Err(HessboostError::invalid_param(
@@ -476,7 +484,7 @@ fn train_impl_inner(
 
             // 2. Row subsampling is shared across the round's per-output trees.
             let mut rng = round_rng(params, round, 0);
-            let row_subset = sample_rows(n, params.subsample, &mut rng);
+            let row_subset = sample_rows(n, params, &mut rng);
 
             // 3. One tree per output.
             for k in 0..n_out {
@@ -485,15 +493,16 @@ fn train_impl_inner(
                 // pass per leaf.
                 let (tree, leaf_rows) = match &prepared {
                     Prepared::Hist(ghist)
-                        if params.grow_policy == GrowPolicy::DepthWise && row_subset.len() == n =>
+                        if params.grow_policy == GrowPolicy::DepthWise
+                            && row_subset.len() == n
+                            && !gradient_sampling(params) =>
                     {
                         let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
                         let mut sampler = make_column_sampler(
                             n_features,
+                            dtrain.feature_weights(),
                             params,
                             &mut rng,
-                            round as u64,
-                            k as u64,
                         );
                         let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
                             .build_with_leaf_rows(ghist, gk, &row_subset, &mut sampler);
@@ -510,7 +519,6 @@ fn train_impl_inner(
                             &mut rng,
                             n_out,
                             k,
-                            round,
                             &row_subset,
                             n_features,
                         ),
@@ -580,7 +588,7 @@ fn train_impl_inner(
 /// Refuse configurations the training loop does not act on yet, so a
 /// setting is never accepted and silently ignored. Each clause goes away
 /// with the feature that implements it.
-fn reject_unimplemented(params: &TrainingParams, dtrain: &DMatrix) -> Result<()> {
+fn reject_unimplemented(params: &TrainingParams) -> Result<()> {
     let unsupported = |name: &'static str, reason: &str| {
         Err(HessboostError::invalid_param(
             name,
@@ -590,17 +598,11 @@ fn reject_unimplemented(params: &TrainingParams, dtrain: &DMatrix) -> Result<()>
     if params.num_parallel_tree != 1 {
         return unsupported("num_parallel_tree", "a value other than 1");
     }
-    if params.sampling_method != SamplingMethod::Uniform {
-        return unsupported("sampling_method", "`gradient_based` sampling");
-    }
     if params.multi_strategy != MultiStrategy::OneOutputPerTree {
         return unsupported("multi_strategy", "`multi_output_tree`");
     }
     if params.process_type != ProcessType::Default {
         return unsupported("process_type", "`update`");
-    }
-    if dtrain.feature_weights().is_some() {
-        return unsupported("feature_weights", "feature-weighted column sampling");
     }
     Ok(())
 }
@@ -717,7 +719,7 @@ fn dart_round(
     objective.gradient_info(&margin_excl, info, gpair);
 
     // 3. Fit one new tree per output on those gradients.
-    let row_subset = sample_rows(n, params.subsample, &mut rng);
+    let row_subset = sample_rows(n, params, &mut rng);
     let eta = params.eta as f32;
     let new_weight = if k == 0 { 1.0 } else { 1.0 / (k as f32 + eta) };
     for kk in 0..n_out {
@@ -730,7 +732,6 @@ fn dart_round(
             &mut rng,
             n_out,
             kk,
-            round,
             &row_subset,
             n_features,
         );
@@ -776,10 +777,11 @@ fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
 }
 
 /// Fit one output's tree for a boosting round: gather that output's gradient
-/// slice, derive its column sampler, build the tree, and shrink its leaves by
-/// `eta`. The caller owns the round RNG (already seeded and salted), the row
-/// subset, and what happens to the tree (margin updates, contribution
-/// weight).
+/// slice, apply gradient-based row sampling when configured (per tree, as
+/// XGBoost does), derive its column sampler, build the tree, and shrink its
+/// leaves by `eta`. The caller owns the round RNG (already seeded and salted),
+/// the round's uniform row subset, and what happens to the tree (margin
+/// updates, contribution weight).
 #[allow(clippy::too_many_arguments)]
 fn fit_output_tree(
     params: &TrainingParams,
@@ -790,21 +792,32 @@ fn fit_output_tree(
     rng: &mut StdRng,
     n_out: usize,
     k: usize,
-    round: usize,
     row_subset: &[u32],
     n_features: usize,
 ) -> RegTree {
     let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
-    let mut sampler = make_column_sampler(n_features, params, rng, round as u64, k as u64);
-    let mut tree = prepared.build_tree(params, dtrain, gk, row_subset, &mut sampler);
+    let sampled = if gradient_sampling(params) {
+        gradient_based_sample(gk, 1, params.subsample, rng)
+    } else {
+        None
+    };
+    let (gk, rows) = match &sampled {
+        Some(s) => (s.gpair.as_slice(), s.rows.as_slice()),
+        None => (gk, row_subset),
+    };
+    let mut sampler = make_column_sampler(n_features, dtrain.feature_weights(), params, rng);
+    let mut tree = prepared.build_tree(params, dtrain, gk, rows, &mut sampler);
     tree.scale_leaves(params.eta as f32);
     tree
 }
 
 /// Bernoulli row subsampling (each row kept with probability `subsample`),
 /// matching XGBoost's default sampling method. Guarantees at least one row.
-fn sample_rows(n: usize, subsample: f64, rng: &mut StdRng) -> Vec<u32> {
-    if subsample >= 1.0 {
+/// Gradient-based sampling keeps every row here; it samples each tree's
+/// gradients in [`fit_output_tree`] instead.
+fn sample_rows(n: usize, params: &TrainingParams, rng: &mut StdRng) -> Vec<u32> {
+    let subsample = params.subsample;
+    if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
     let mut rows: Vec<u32> = (0..n as u32)
@@ -816,17 +829,9 @@ fn sample_rows(n: usize, subsample: f64, rng: &mut StdRng) -> Vec<u32> {
     rows
 }
 
-/// Column subsampling: pick `round(colsample * n)` features without replacement.
-fn sample_features(n: usize, colsample: f64, rng: &mut StdRng) -> Vec<u32> {
-    if colsample >= 1.0 {
-        return all_features(n);
-    }
-    let k = ((colsample * n as f64).round() as usize).clamp(1, n);
-    let mut idx: Vec<u32> = (0..n as u32).collect();
-    idx.shuffle(rng);
-    idx.truncate(k);
-    idx.sort_unstable();
-    idx
+/// Whether trees are grown on gradient-based (MVS) row samples.
+fn gradient_sampling(params: &TrainingParams) -> bool {
+    params.sampling_method == SamplingMethod::GradientBased && params.subsample < 1.0
 }
 
 /// Shape and metadata checks for the training matrix and every eval set,
@@ -906,26 +911,22 @@ fn name_dataset(error: HessboostError, dataset: &str) -> HessboostError {
     }
 }
 
-/// Build the per-tree column sampler: draw the `colsample_bytree` pool from
-/// `rng`, then hand it to a [`ColumnSampler`] that applies `bylevel`/`bynode`
-/// with a seed derived from the round and output index (reproducible).
+/// Build one tree's column sampler, seeded from `rng`: the `colsample_bytree`
+/// pool, then the `bylevel`/`bynode` draws, weighted by the training matrix's
+/// feature weights when it has them.
 fn make_column_sampler(
     n_features: usize,
+    feature_weights: Option<&[f32]>,
     params: &TrainingParams,
     rng: &mut StdRng,
-    round: u64,
-    output: u64,
 ) -> ColumnSampler {
-    let pool = sample_features(n_features, params.colsample_bytree, rng);
-    let seed = params
-        .seed
-        .wrapping_add(round.wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        .wrapping_add(output.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
     ColumnSampler::new(
-        pool,
+        n_features,
+        feature_weights,
+        params.colsample_bytree,
         params.colsample_bylevel,
         params.colsample_bynode,
-        seed,
+        rng.random::<u64>(),
     )
 }
 
@@ -1979,12 +1980,6 @@ mod tests {
                 base().num_parallel_tree(2).build_unchecked(),
             ),
             (
-                "sampling_method",
-                base()
-                    .sampling_method(SamplingMethod::GradientBased)
-                    .build_unchecked(),
-            ),
-            (
                 "multi_strategy",
                 base()
                     .multi_strategy(MultiStrategy::MultiOutputTree)
@@ -2004,11 +1999,6 @@ mod tests {
                 "{param}"
             );
         }
-        let weighted = d.with_feature_weights(&[1.0]).unwrap();
-        assert!(matches!(
-            train(&TrainingParams::default(), &weighted, 1),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "feature_weights"
-        ));
     }
 
     /// Label matrices reach only the objectives and metrics that model them,

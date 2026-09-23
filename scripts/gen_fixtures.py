@@ -165,7 +165,8 @@ def y_multi_heavy_tail(x, rng):
 # name -> (target fn, param overrides, options)
 # A target fn returning an (n, K) array trains on a label matrix (K targets).
 # options: tier, num_round, missing (fraction of NaN features), weighted, ranking,
-#          tol_train (override), drop (params removed from TREE_BASE)
+#          tol_train (override), drop (params removed from TREE_BASE),
+#          feature_weights (per-column DMatrix weights for column sampling)
 CASES = {
     # tree_method / grow policy / constraints on reg:squarederror
     "exact_reg_d6": (y_regression, dict(tree_method="exact"), {}),
@@ -313,6 +314,33 @@ CASES = {
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
     "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),
     "colsample_bytree_0p5_d6": (y_regression, dict(colsample_bytree=0.5, seed=42), dict(tier="quality")),
+    # sampling_method=gradient_based: XGBoost's CPU MVS row sampler (hist and approx)
+    "gradient_based_0p3_d6": (
+        y_regression,
+        dict(sampling_method="gradient_based", subsample=0.3, seed=42),
+        dict(tier="quality"),
+    ),
+    "gradient_based_binary_0p5_d6": (
+        y_binary,
+        dict(objective="binary:logistic", sampling_method="gradient_based", subsample=0.5, seed=42),
+        dict(tier="quality"),
+    ),
+    "gradient_based_approx_0p4_d6": (
+        y_regression,
+        dict(tree_method="approx", sampling_method="gradient_based", subsample=0.4, seed=42),
+        dict(tier="quality"),
+    ),
+    # feature-weighted column sampling: skewed weights favor the noise columns
+    "feature_weights_bynode_0p5_d6": (
+        y_regression,
+        dict(colsample_bynode=0.5, seed=42),
+        dict(tier="quality", num_round=100, feature_weights=[0.2, 3.0, 0.5, 1.0, 1.0, 2.0, 4.0, 0.1]),
+    ),
+    "feature_weights_bytree_bylevel_d6": (
+        y_regression,
+        dict(colsample_bytree=0.75, colsample_bylevel=0.5, seed=42),
+        dict(tier="quality", num_round=100, feature_weights=[4.0, 2.0, 1.0, 0.5, 0.0, 0.5, 0.25, 8.0]),
+    ),
     "dart_d4": (
         y_regression,
         dict(booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
@@ -403,6 +431,10 @@ def build_case(name: str) -> dict:
     )
     if group_sizes is not None:
         dtrain.set_group(group_sizes)
+    feature_weights = opts.get("feature_weights")
+    if feature_weights is not None:
+        assert len(feature_weights) == N_COLS
+        dtrain.set_info(feature_weights=np.asarray(feature_weights, dtype=np.float32))
     dtest = xgb.DMatrix(x_test, nthread=1, feature_types=feature_types)
     dcontrib = xgb.DMatrix(x_test[:N_CONTRIB_ROWS], nthread=1, feature_types=feature_types)
 
@@ -430,6 +462,7 @@ def build_case(name: str) -> dict:
         "x_test": _to_json_floats(x_test),
         "y_test": _to_json_floats(y_test),
         "weights": None if weights is None else _to_json_floats(weights),
+        "feature_weights": feature_weights,
         "group_sizes": group_sizes,
         "test_group_sizes": test_group_sizes,
         "feature_types": feature_types,

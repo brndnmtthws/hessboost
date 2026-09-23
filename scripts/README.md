@@ -6,7 +6,8 @@
 synthetic datasets, one case per supported feature (tree methods, missing values,
 constraints, every objective — including `reg:logistic` and the `reg:linear`
 alias — sample weights, ranking groups, gblinear, DART, intercept estimation,
-multi-target label matrices; 43 cases in total), and writes each case to
+row/column sampling including `sampling_method=gradient_based` and DMatrix
+`feature_weights`, multi-target label matrices), and writes each case to
 `../fixtures/<name>.json`: data, the exact `xgb.train` parameter dict,
 XGBoost's test-set predictions (transformed, raw margin, SHAP contributions on
 the first 50 rows) and the saved model JSON, plus the model's UBJSON encoding
@@ -39,9 +40,12 @@ the cut oracles.
 
 Cases are tiered. `exact` cases are pointwise: max |delta| within `tol.train`
 (1e-4; 1e-5 for probabilities), `tol.import` (1e-5) and `tol.contribs` (1e-4).
-`quality` cases are RNG-driven (`subsample`, `colsample_bytree`, DART); training
-uses a regression RMSE <= 1.08x XGBoost band while import/export remain
-pointwise. The `train-only` gblinear case validates training pointwise; its
+`quality` cases are RNG-driven (`subsample`, `sampling_method=gradient_based`,
+`colsample_*` with or without `feature_weights`, DART); training uses a
+regression RMSE <= 1.08x XGBoost band (accuracy >= XGBoost - 0.02 for
+classification) while import/export remain pointwise. A case's optional
+`feature_weights` array (one weight per column) is set on the training
+DMatrix on both sides. The `train-only` gblinear case validates training pointwise; its
 unsupported XGBoost-JSON import/export path is visibly reported as
 `n/a`/`skipped` and required to return `ModelFormat` on import. Unknown XGBoost
 parameters fail the test.

@@ -101,7 +101,11 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 - **Trees:** `tree_method = exact | hist | approx` (approx uses hessian-weighted
   per-round binning), `grow_policy = depthwise | lossguide`, histogram binning
   with the parent−child subtraction trick, sparsity-aware missing-value handling,
-  row/column subsampling (`bytree`/`bylevel`/`bynode`).
+  row subsampling (`subsample`, with `sampling_method = uniform` or XGBoost's
+  minimal-variance **`gradient_based`** sampler for `hist`/`approx`), and
+  column subsampling (`colsample_bytree`/`bylevel`/`bynode`), optionally
+  weighted per feature (`DMatrix::with_feature_weights`, XGBoost's weighted
+  draw without replacement).
 - **Regularization:** `lambda`, `alpha`, `gamma`, `min_child_weight`,
   `max_delta_step`, `max_depth`, `max_leaves`, `max_bin`.
 - **Objectives:** `reg:squarederror` (alias `reg:linear`), `reg:logistic`,
@@ -117,10 +121,10 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 - **Dataset metadata:** labels (`with_labels`, or a row-major multi-target
   `with_label_matrix`), instance and group weights, `base_margin`, query
   groups, label bounds for censored targets (`with_label_bounds`), feature
-  types, and per-feature sampling weights (`with_feature_weights`). Training
-  rejects feature weights and the not-yet-implemented `num_parallel_tree > 1`,
-  `sampling_method = gradient_based`, `multi_strategy = multi_output_tree`,
-  and `process_type = update` instead of ignoring them.
+  types, and per-feature column-sampling weights (`with_feature_weights`).
+  Training rejects the not-yet-implemented `num_parallel_tree > 1`,
+  `multi_strategy = multi_output_tree`, and `process_type = update` instead
+  of ignoring them.
 - **Multi-target labels:** `reg:squarederror`, `reg:pseudohubererror`,
   `reg:logistic`, and `binary:logistic` (multi-label) train on a label matrix
   like XGBoost's default `one_output_per_tree` strategy: one tree per target

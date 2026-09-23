@@ -289,8 +289,14 @@ impl DMatrix {
         Ok(self)
     }
 
-    /// Attach per-feature sampling weights (`len == n_cols`), used by the
-    /// column sampler.
+    /// Attach per-feature column-sampling weights (`len == n_cols`), XGBoost's
+    /// `DMatrix` `feature_weights`. When set on the training matrix, every
+    /// `colsample_bytree`/`bylevel`/`bynode` stage draws features without
+    /// replacement with probability proportional to their weight (see
+    /// [`ColumnSampler`](crate::tree::sampler::ColumnSampler)); with every
+    /// ratio at `1.0` they have no effect. A zero-weight feature ranks below
+    /// every positive-weight one and is drawn only when a stage needs more
+    /// features than have positive weight. Not stored in the model.
     pub fn with_feature_weights(mut self, weights: &[f32]) -> Result<Self> {
         check_len("feature_weights", weights.len(), self.n_cols)?;
         if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {

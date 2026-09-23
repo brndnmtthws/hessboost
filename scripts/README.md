@@ -16,13 +16,25 @@ continued training, `process_type=update`, `num_parallel_tree` forests,
 `iteration_range` and slicing), and writes each case to
 `../fixtures/<name>.json`: data, the exact `xgb.train` parameter dict,
 XGBoost's test-set predictions (transformed, raw margin, SHAP contributions on
-the first 50 rows) and the saved model JSON, plus the model's UBJSON encoding
+the first 50 rows, and for the numeric, missing-value, categorical, multiclass,
+and DART cases in `INTERACTION_CASES` SHAP interaction values on the first 5
+rows) and the saved model JSON, plus the model's UBJSON encoding
 (`save_raw("ubj")`) as `../fixtures/<name>.ubj`. `n_targets` gives the label
 columns: the `multi_*` cases (3-target `reg:squarederror` on hist and exact,
 multi-label `binary:logistic` with and without `scale_pos_weight`, weighted
 2-target `reg:pseudohubererror` and `reg:absoluteerror`) store
 `y_train`/`y_test` row-major `[row][target]`, and their predictions, margins,
-and contributions carry the target axis.
+and contributions carry the target axis. The `mot_*` cases train `multi_strategy=multi_output_tree`
+(vector-leaf trees): 3-target `reg:squarederror` depthwise, lossguide,
+with missing values, regularized (`gamma`, `min_child_weight`, `reg_alpha`,
+`max_delta_step`), monotone, interaction-constrained and categorical;
+multi-label `binary:logistic`; `multi:softprob` / `multi:softmax`; weighted
+`reg:pseudohubererror`; `reg:quantileerror` / `reg:expectileerror` alpha
+lists and a weighted `reg:absoluteerror` label matrix; a `num_parallel_tree=3`
+forest with iteration ranges and slices; continued `multi:softprob` training;
+plus quality-tier subsampling and DART. Their contributions (and, for several,
+interactions) exercise vector-leaf QuadratureTreeSHAP.
+
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 
@@ -31,9 +43,9 @@ quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 1. **Train parity** - train on the fixture data, compare `predict(x_test)` with
    XGBoost's predictions.
 2. **Import parity** - `BoostedModel::from_xgboost_json` on the embedded model,
-   compare predictions, raw margins, and SHAP contributions;
-   `from_xgboost_ubjson` on the `.ubj` sidecar must yield the identical model
-   (column `ubj`).
+   compare predictions, raw margins, SHAP contributions, and (where recorded)
+   SHAP interaction values; `from_xgboost_ubjson` on the `.ubj` sidecar must
+   yield the identical model (column `ubj`).
 3. **Export parity** - write `to_xgboost_json` (`<name>.model.json`),
    `to_xgboost_ubjson` (`<name>.model.ubj`) and hessboost's predictions to
    `../fixtures/exports/`; `check_exports.py` reloads each model in XGBoost and
@@ -61,7 +73,8 @@ quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 the cut oracles.
 
 Cases are tiered. `exact` cases are pointwise: max |delta| within `tol.train`
-(1e-4; 1e-5 for probabilities), `tol.import` (1e-5) and `tol.contribs` (1e-4).
+(1e-4; 1e-5 for probabilities), `tol.import` (1e-5), `tol.contribs` (1e-4) and
+`tol.interactions` (1e-4).
 `quality` cases are RNG-driven (`subsample`, `sampling_method=gradient_based`,
 `colsample_*` with or without `feature_weights`, DART, random forests);
 training uses a regression RMSE <= 1.08x XGBoost band (accuracy >= XGBoost -

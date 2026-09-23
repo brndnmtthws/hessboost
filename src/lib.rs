@@ -54,8 +54,8 @@
 //!   ndcg/map, nloglik, cox/aft-nloglik, interval-regression-accuracy, and a
 //!   custom hook ([`train_with_custom_metric`]).
 //! - **Modeling:** monotone & interaction constraints, native categorical
-//!   splits, early stopping, feature importance, TreeSHAP contributions and
-//!   interaction values ([`BoostedModel::predict_contribs`] /
+//!   splits, early stopping, feature importance, QuadratureTreeSHAP
+//!   contributions and interaction values ([`BoostedModel::predict_contribs`] /
 //!   [`predict_interactions`](prelude::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON and UBJSON model import/export ([`crate::model`]).
@@ -75,7 +75,9 @@
 //!   prediction routes by bit pattern; and compact models after *Boosted Trees
 //!   on a Diet*: feature/threshold reuse penalties (`toad_penalty_feature`,
 //!   `toad_penalty_threshold`) and a bit-packed layout predicting bit-identical
-//!   margins ([`learner::compact_model`]); and distributional boosting
+//!   margins ([`learner::compact_model`]); PerpetualBooster-style budget
+//!   training, one `budget` number instead of tuning `eta`/depth/rounds
+//!   ([`learner::budget`]); and distributional boosting
 //!   (NGBoost / XGBoostLSS style): `dist:normal`, `dist:lognormal`,
 //!   `dist:gamma`, `dist:poisson`, `dist:negbinomial` predict a full
 //!   conditional distribution per row
@@ -140,6 +142,7 @@ pub mod prelude {
     };
     pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
     pub use crate::error::{HessboostError, Result};
+    pub use crate::learner::budget::{BudgetConfig, BudgetResult, BudgetStop, train_with_budget};
     pub use crate::learner::compact_model::{CompactModel, ModelSizeReport};
     pub use crate::learner::conformal::{ConformalizedQuantile, SplitConformal};
     pub use crate::learner::{
@@ -147,5 +150,5 @@ pub mod prelude {
         train_continue_with_eval, train_with_custom_metric, train_with_eval, train_with_objective,
     };
     pub use crate::metric::{CustomMetric, Metric};
-    pub use crate::objective::{CustomObjective, Dist, DistFamily, GradPair, Objective};
+    pub use crate::objective::{CustomObjective, Dist, DistFamily, GradPair, Objective, SplitGradient};
 }

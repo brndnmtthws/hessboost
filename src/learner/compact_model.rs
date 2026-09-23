@@ -15,7 +15,7 @@
 //! gains (TreeSHAP, cover/gain importance) are dropped, and only the trees
 //! [`BoostedModel::predict_margin`] uses are stored (the prefix up to
 //! `best_iteration` when early stopping chose one). gblinear models and
-//! linear-leaf trees (`linear_tree`) are rejected. It is a hessboost format; XGBoost cannot read it.
+//! linear-leaf trees (`linear_tree`) and vector-leaf trees (`multi_output_tree`) are rejected. It is a hessboost format; XGBoost cannot read it.
 //!
 //! # Layout (version 1)
 //!
@@ -1143,6 +1143,11 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
     {
         return Err(format_error(
             "linear-leaf trees (`linear_tree`) have no compact encoding; use the native format",
+        ));
+    }
+    if model.has_vector_leaves() {
+        return Err(format_error(
+            "vector-leaf trees (`multi_output_tree`) have no compact encoding; use the native format",
         ));
     }
     let trees = &model.trees()[..model.effective_num_trees()];

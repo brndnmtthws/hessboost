@@ -4,14 +4,17 @@
 //! gradients. The exact builder is the reference; the histogram builder shares
 //! the same regularized gain math.
 
+pub(crate) mod budget;
 mod exact;
 mod hist;
 mod lightgbm;
+mod multi;
 mod oblivious;
 
 pub use exact::{ExactTreeBuilder, SortedColumns, all_features, all_rows};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
+pub(crate) use multi::{MultiTreeBuilder, VectorGradients};
 pub(crate) use oblivious::check_symmetric_input;
 
 use std::collections::BTreeSet;

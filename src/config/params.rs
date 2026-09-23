@@ -125,7 +125,9 @@ pub enum MultiStrategy {
     /// One tree per output each round. XGBoost default.
     #[default]
     OneOutputPerTree,
-    /// One tree per round whose leaves hold a vector of all outputs.
+    /// One tree per round whose leaves hold a vector of all outputs
+    /// (vector-leaf trees; `tree_method = hist` only). With a single output
+    /// it trains scalar trees, like XGBoost.
     MultiOutputTree,
 }
 
@@ -566,6 +568,21 @@ impl TrainingParams {
             (2..=127).contains(&self.num_grad_quant_bins),
             format!("must be in [2, 127], got {}", self.num_grad_quant_bins),
         )?;
+        if self.multi_strategy == MultiStrategy::MultiOutputTree {
+            // The vector-leaf builder has its own (XGBoost) split search:
+            // symmetric level-wise growth and the reuse penalties do not
+            // reach it.
+            ensure(
+                "grow_policy",
+                self.grow_policy != GrowPolicy::Symmetric,
+                "`symmetric` growth is not supported with `multi_strategy=multi_output_tree`",
+            )?;
+            ensure(
+                "toad_penalty_feature",
+                !reuse_on,
+                "reuse penalties are not supported with `multi_strategy=multi_output_tree`",
+            )?;
+        }
         if self.use_quantized_grad {
             ensure(
                 "use_quantized_grad",

@@ -61,6 +61,23 @@ impl GradPair {
     }
 }
 
+/// A per-row loss `ℓ(margin, label)`, unweighted by the sample weight, whose
+/// first and second derivatives with respect to the margin are the gradient
+/// pairs the objective produces (up to Hessian safeguards such as
+/// `max_delta_step`). Returned by [`Objective::pointwise_loss`].
+pub type PointwiseLoss<'a> = Box<dyn Fn(f32, f32) -> f64 + Send + Sync + 'a>;
+
+/// Reduced gradients a custom objective supplies for the *split search* of
+/// vector-leaf trees (see [`Objective::split_gradient`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitGradient {
+    /// Row-major `[row][target]` gradient pairs, `n_targets` per row.
+    pub gpair: Vec<GradPair>,
+    /// Split targets per row (at least `1`; usually far fewer than the
+    /// model's outputs).
+    pub n_targets: usize,
+}
+
 /// Rows per parallel gradient chunk. A multiple of every vector kernel's block
 /// (4 rows, and 4 values for any class count), so chunk boundaries fall where
 /// the kernels' block boundaries already are and every element is computed
@@ -298,6 +315,35 @@ pub trait Objective: Send + Sync {
     /// return `false`, and training then accepts datasets without labels.
     fn requires_labels(&self) -> bool {
         true
+    }
+
+    /// Reduced split gradients for vector-leaf trees (XGBoost 3.2+'s
+    /// `TreeObjective.split_grad`, the idea of `SketchBoost`).
+    ///
+    /// With `multi_strategy = multi_output_tree`, training calls this every
+    /// round (`iteration` counts from 0) with that round's full gradients
+    /// `gpair` (`[row][output]`, [`Objective::n_outputs`] pairs per row, row
+    /// weights applied). Returning `Some` grows the tree's structure — its
+    /// histograms, split search and internal weights — from the returned
+    /// (typically much narrower) gradients, while every leaf's weight vector
+    /// is still fit from `gpair` over the rows that reach it. `None`, the
+    /// default and what every built-in objective returns, grows the tree
+    /// from the full gradients. Training rejects a `Some` for the other
+    /// strategies and together with monotone constraints, as XGBoost does.
+    fn split_gradient(&self, _iteration: usize, _gpair: &[GradPair]) -> Option<SplitGradient> {
+        None
+    }
+    /// The objective's per-row loss, for trainers that measure the actual
+    /// loss reduction of a tree (budget-mode training,
+    /// [`train_with_budget`](crate::learner::budget::train_with_budget)).
+    /// Label-dependent reweighting the gradient applies (e.g.
+    /// `scale_pos_weight`) is part of the loss; the sample weight is not.
+    /// Losses are shifted so a perfect prediction of a hard label scores `0`
+    /// (deviance form), which makes relative loss reductions meaningful.
+    /// `None` (the default) when the objective has no single-row loss, e.g.
+    /// ranking, multi-output, or custom objectives.
+    fn pointwise_loss(&self) -> Option<PointwiseLoss<'_>> {
+        None
     }
 
     /// The default evaluation metric for this objective, as XGBoost's

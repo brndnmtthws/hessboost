@@ -10,6 +10,18 @@ fn log_link_transform(preds: &mut [f32]) {
     crate::simd::exp_inplace(preds);
 }
 
+/// Half the Poisson unit deviance at log-mean `margin`: `y ln(y/μ) − (y − μ)`,
+/// whose margin derivative is the Poisson gradient `μ − y`.
+fn poisson_deviance(margin: f32, label: f32) -> f64 {
+    let (m, y) = (f64::from(margin), f64::from(label));
+    let mu = m.exp();
+    if y > 0.0 {
+        y * (y.ln() - m) - (y - mu)
+    } else {
+        mu
+    }
+}
+
 /// Emit the `pred_transform`/`prob_to_margin`/`base_margins` trio shared by
 /// the log-link objectives (all predict `exp(margin)`). The link is XGBoost's
 /// `ProbToMargin`, `ln(v)` in `f32`; the intercept is XGBoost's
@@ -76,6 +88,10 @@ impl Objective for PoissonObjective {
 
     log_link_objective!();
 
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        Some(Box::new(poisson_deviance))
+    }
+
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         check_label_domain(info, |y| y < 0.0)
     }
@@ -107,6 +123,14 @@ impl Objective for GammaObjective {
     }
 
     log_link_objective!();
+
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // Half the Gamma unit deviance: `y/μ − ln(y/μ) − 1`.
+        Some(Box::new(|margin, label| {
+            let (m, y) = (f64::from(margin), f64::from(label));
+            y * (-m).exp() + m - y.ln() - 1.0
+        }))
+    }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         check_label_domain(info, |y| y <= 0.0)
@@ -154,6 +178,20 @@ impl Objective for TweedieObjective {
     }
 
     log_link_objective!();
+
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // Half the Tweedie unit deviance for `1 < ρ < 2` (Poisson at `ρ = 1`):
+        // `y^(2−ρ)/((1−ρ)(2−ρ)) − y μ^(1−ρ)/(1−ρ) + μ^(2−ρ)/(2−ρ)`.
+        let rho = f64::from(self.rho);
+        if (rho - 1.0).abs() < 1e-9 {
+            return Some(Box::new(poisson_deviance));
+        }
+        let (a, b) = (1.0 - rho, 2.0 - rho);
+        Some(Box::new(move |margin, label| {
+            let (m, y) = (f64::from(margin), f64::from(label));
+            y.powf(b) / (a * b) - y * (a * m).exp() / a + (b * m).exp() / b
+        }))
+    }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         check_label_domain(info, |y| y < 0.0)

@@ -4,7 +4,8 @@
 Trains real XGBoost (single thread) on deterministic synthetic datasets, one
 case per supported feature, and writes `fixtures/<name>.json` holding the data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
-raw margin, SHAP contributions on the first 50 rows) and the saved model JSON,
+raw margin, SHAP contributions on the first 50 rows, SHAP interaction values on
+the first 5 rows of the `INTERACTION_CASES`) and the saved model JSON,
 plus the same model's UBJSON encoding (`save_raw("ubj")`) as the sidecar
 `fixtures/<name>.ubj` named by the fixture's `xgb_model_ubj`.
 `tests/parity.rs` consumes these; the fixture schema is the
@@ -40,6 +41,7 @@ N_TRAIN = 2000
 N_TEST = 500
 N_COLS = 8
 N_CONTRIB_ROWS = 50
+N_INTERACTION_ROWS = 5
 GROUP_SIZE = 20
 NUM_ROUND = 50
 BASE_SEED = 20260915
@@ -51,6 +53,7 @@ TOL_IMPORT = 1e-5
 TOL_CONTRIBS = 1e-4
 # Per-round eval-metric oracles: |hessboost - xgboost| <= TOL_EVALS * max(1, |xgboost|).
 TOL_EVALS = 1e-5
+TOL_INTERACTIONS = 1e-4
 # Quality-tier bands: relative RMSE factor for regression, absolute accuracy
 # slack for classification.
 BAND_RMSE = 1.08
@@ -519,6 +522,98 @@ CASES = {
         ),
         dict(drop=("base_score",), weighted=True, test_weighted=True, evals=True),
     ),
+    # multi_strategy=multi_output_tree: one vector-leaf tree per round shares
+    # its splits across all outputs (hist only).
+    "mot_reg3_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), {}),
+    "mot_reg3_nobs_lossguide_l15": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", grow_policy="lossguide", max_leaves=15, max_depth=0),
+        dict(drop=("base_score",)),
+    ),
+    "mot_reg3_missing_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), dict(missing=0.3)),
+    "mot_reg3_regularized_d4": (
+        y_multi_regression,
+        dict(
+            multi_strategy="multi_output_tree",
+            max_depth=4,
+            gamma=0.05,
+            min_child_weight=10,
+            reg_alpha=0.5,
+            reg_lambda=2.0,
+            max_delta_step=0.3,
+        ),
+        {},
+    ),
+    "mot_reg3_monotone_d6": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", monotone_constraints="(1,-1,0,0,0,0,0,0)"),
+        {},
+    ),
+    "mot_reg3_interaction_d6": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", interaction_constraints="[[0,1],[2,3,4],[5,6,7]]"),
+        {},
+    ),
+    "mot_reg3_categorical_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), dict(categorical=True)),
+    "mot_label_binary_d4": (
+        y_multi_label,
+        dict(objective="binary:logistic", multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "mot_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "mot_softmax_d4": (
+        y_multiclass,
+        dict(objective="multi:softmax", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
+        {},
+    ),
+    "mot_huber_weighted_d4": (
+        y_multi_heavy_tail,
+        dict(objective="reg:pseudohubererror", huber_slope=1.0, multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "mot_subsample_0p8_d6": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", subsample=0.8, colsample_bynode=0.8, seed=42),
+        dict(tier="quality"),
+    ),
+    "mot_dart_d4": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
+        dict(tier="quality"),
+    ),
+    # vector leaves on the alpha-list objectives (one output per alpha) and a
+    # smoothed-MAE label matrix
+    "mot_quantile_multi_nobs_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "mot_expectile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=[0.2, 0.8], multi_strategy="multi_output_tree", max_depth=4),
+        {},
+    ),
+    "mot_mae_weighted_nobs_d4": (
+        y_multi_heavy_tail,
+        dict(objective="reg:absoluteerror", multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    # vector-leaf forests (num_parallel_tree vector trees per iteration),
+    # iteration ranges / slices, and continued training
+    "mot_forest_np3_reg3_d4": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", num_parallel_tree=3, max_depth=4),
+        dict(num_round=20, ranges=True),
+    ),
+    "mot_continue_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
+        dict(continue_from=15, tol_train=TOL_TRAIN_PROB, ranges=True),
+    ),
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
     "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),
     "colsample_bytree_0p5_d6": (y_regression, dict(colsample_bytree=0.5, seed=42), dict(tier="quality")),
@@ -631,6 +726,29 @@ CASES = {
         dict(tier="quality", num_round=20, ranges=True),
     ),
 }
+
+
+# Cases that also record `pred_interactions` on the first N_INTERACTION_ROWS
+# test rows: numeric, missing values, categorical splits, multiclass, DART,
+# and the multi-output layouts (label matrix, alpha list, parallel-tree forests,
+# vector-leaf trees).
+INTERACTION_CASES = (
+    "hist_reg_d6_r50",
+    "hist_reg_missing_d6",
+    "categorical_reg_d6",
+    "softprob_d4",
+    "dart_d4",
+    "multi_reg3_d6",
+    "nobs_quantile_multi_d4",
+    "forest_np2_softprob_d4",
+    "forest_np2_multi_reg3_d4",
+    # vector-leaf trees: numeric, categorical, multiclass, forests, DART
+    "mot_reg3_d6",
+    "mot_reg3_categorical_d6",
+    "mot_softprob_d4",
+    "mot_forest_np3_reg3_d4",
+    "mot_dart_d4",
+)
 
 
 def _params(overrides: dict, drop: tuple) -> dict:
@@ -794,6 +912,10 @@ def build_case(name: str) -> dict:
     pred = booster.predict(dtest)
     margin = booster.predict(dtest, output_margin=True)
     contribs = booster.predict(dcontrib, pred_contribs=True)
+    interactions = None
+    if name in INTERACTION_CASES:
+        dinter = xgb.DMatrix(x_test[:N_INTERACTION_ROWS], nthread=1, feature_types=feature_types)
+        interactions = booster.predict(dinter, pred_interactions=True)
 
     tol_train = _quality_band(params) if tier == "quality" else opts.get("tol_train", TOL_TRAIN)
 
@@ -827,6 +949,7 @@ def build_case(name: str) -> dict:
         "xgb_pred": _to_json_floats(pred),
         "xgb_margin": _to_json_floats(margin),
         "xgb_contribs": _to_json_floats(contribs),
+        "xgb_interactions": None if interactions is None else _to_json_floats(interactions),
         "xgb_model": _save_model_json(booster),
         "xgb_model_ubj": _save_model_ubj(booster, name),
         "tol": {
@@ -834,6 +957,7 @@ def build_case(name: str) -> dict:
             "import": TOL_IMPORT,
             "contribs": TOL_CONTRIBS,
             "evals": TOL_EVALS,
+            "interactions": TOL_INTERACTIONS,
         },
         "continuation": continuation,
         "refresh": None,
@@ -1021,7 +1145,8 @@ def main() -> None:
         print(
             f"{name:<26} {fixture['tier']:<7} {fixture['params']['objective']:<22} "
             f"rounds={fixture['num_round']:<3} pred={len(fixture['xgb_pred'])} "
-            f"contribs={len(fixture['xgb_contribs'])}"
+            f"contribs={len(fixture['xgb_contribs'])} "
+            f"interactions={len(fixture['xgb_interactions'] or [])}"
         )
     print(f"wrote {len(CASES)} fixtures to {os.path.abspath(FIX_DIR)}")
 

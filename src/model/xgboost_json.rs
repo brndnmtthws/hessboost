@@ -34,7 +34,9 @@
 //! # Scope and caveats
 //!
 //! Import targets a `gbtree` booster with a scalar, multiclass, or
-//! multi-target (`one_output_per_tree`, scalar-leaf trees) objective.
+//! multi-target objective, with scalar-leaf trees (`one_output_per_tree`) or
+//! vector-leaf trees (`multi_output_tree`, see
+//! [Vector-leaf trees](#vector-leaf-trees)).
 //! XGBoost saves `booster=dart` as `gbtree` plus a per-tree
 //! `model.weight_drop` array; those weights become the model's DART tree
 //! weights on import, and a model with non-unit tree weights writes them back
@@ -56,6 +58,19 @@
 //! predictions are sums over a group's trees, so this is lossless); a model
 //! whose groups have unequal tree counts within an iteration, or whose
 //! iterations differ in size, is rejected.
+//!
+//! ## Vector-leaf trees
+//!
+//! A `multi_output_tree` model stores XGBoost's `MultiTargetTree` layout:
+//! `tree_param.size_leaf_vector = K`, the shared split structure in the usual
+//! node-indexed arrays, and every leaf's `K` weights in `leaf_weights`
+//! (leaves in node order), each leaf's `right_children` entry holding its
+//! index into that array. Leaves and categorical nodes carry XGBoost's
+//! `DftBadValue` split condition, the root's parent is `-1`, and every tree
+//! belongs to group 0 of `tree_info` (one tree per iteration). hessboost does
+//! not retain internal node weights: export writes zeros for internal nodes'
+//! `base_weights` (leaves repeat their vectors), which XGBoost does not read
+//! for prediction.
 //!
 //! ## Objective parameters
 //!
@@ -257,7 +272,8 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
 
     // `tree_info[t]` is the output group tree `t` contributes to; hessboost
     // lays iterations out like XGBoost (`num_parallel_tree` trees per group,
-    // groups in order), so the ids and iteration boundaries carry over.
+    // groups in order, and every vector-leaf tree in group 0), so the ids and
+    // iteration boundaries carry over.
     let tree_info: Vec<Value> = (0..n_trees)
         .map(|t| json!(model.tree_output(t) as i32))
         .collect();
@@ -394,8 +410,15 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .and_then(Value::as_array)
         .ok_or_else(|| HessboostError::model_format("missing `model.trees` array"))?;
     // `order[i]` is the XGBoost index of hessboost tree `i` (the identity for
-    // XGBoost's canonical group-ordered iterations).
-    let (order, num_parallel_tree) = iteration_tree_order(model, trees_json.len(), n_outputs)?;
+    // XGBoost's canonical group-ordered iterations). Vector-leaf trees
+    // (`size_leaf_vector > 1`) form the single group 0.
+    let vector_leaf = trees_json
+        .first()
+        .and_then(|t| t.pointer("/tree_param/size_leaf_vector"))
+        .and_then(scalar_f64)
+        .is_some_and(|k| k > 1.0);
+    let groups = if vector_leaf { 1 } else { n_outputs };
+    let (order, num_parallel_tree) = iteration_tree_order(model, trees_json.len(), groups)?;
     let mut trees = Vec::with_capacity(trees_json.len());
     for &i in &order {
         let tree = tree_from_json(&trees_json[i])
@@ -460,6 +483,9 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
 
 /// Encode one [`RegTree`] as XGBoost's node-indexed array bundle.
 fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
+    if tree.is_vector_leaf() {
+        return vector_tree_to_json(id, tree, num_feature);
+    }
     let nodes = tree.nodes();
     let n = nodes.len();
 
@@ -542,6 +568,130 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
     })
 }
 
+/// Encode one vector-leaf [`RegTree`] as XGBoost's `MultiTargetTree` bundle
+/// (`MultiTargetTree::SaveModel`): the shared structure in node-indexed
+/// arrays, the leaf vectors in `leaf_weights` (`K` values per leaf, leaves in
+/// node order) with each leaf's `right_children` entry holding its leaf index,
+/// `parents[0] = -1`, and XGBoost's `DftBadValue` (the smallest subnormal) as
+/// the split condition of leaves and categorical nodes. Internal weights are
+/// not retained, so `base_weights` carries the leaf vectors and zeros for
+/// internal nodes, as the scalar export does.
+fn vector_tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
+    const DFT_BAD_VALUE: f32 = f32::from_bits(1);
+    let nodes = tree.nodes();
+    let n = nodes.len();
+    let k = tree.size_leaf_vector();
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+    let mut parents = vec![-1i32; n];
+    let mut split_indices = Vec::with_capacity(n);
+    let mut split_conditions = Vec::with_capacity(n);
+    let mut default_left = Vec::with_capacity(n);
+    let mut base_weights = Vec::with_capacity(n * k);
+    let mut leaf_weights = Vec::new();
+    let mut loss_changes = Vec::with_capacity(n);
+    let mut sum_hessian = Vec::with_capacity(n);
+    let mut split_type = Vec::with_capacity(n);
+    let mut categories = Vec::<i64>::new();
+    let mut categories_nodes = Vec::<i64>::new();
+    let mut categories_segments = Vec::<i64>::new();
+    let mut categories_sizes = Vec::<i64>::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if !node.is_leaf() {
+            parents[node.left as usize] = i as i32;
+            parents[node.right as usize] = i as i32;
+        }
+    }
+    let mut n_leaves = 0i32;
+    for (node_id, node) in nodes.iter().enumerate() {
+        sum_hessian.push(node.sum_hess);
+        split_type.push(u32::from(node.is_categorical));
+        if node.is_leaf() {
+            left.push(-1);
+            right.push(n_leaves);
+            n_leaves += 1;
+            split_indices.push(0u32);
+            split_conditions.push(DFT_BAD_VALUE);
+            default_left.push(0i32);
+            loss_changes.push(0.0f32);
+            base_weights.extend_from_slice(tree.leaf_vector(node_id));
+            leaf_weights.extend_from_slice(tree.leaf_vector(node_id));
+            continue;
+        }
+        base_weights.extend(std::iter::repeat_n(0.0f32, k));
+        split_indices.push(node.split_feature);
+        loss_changes.push(node.split_gain);
+        if node.is_categorical {
+            // XGBoost sends the category set right; hessboost keeps it left.
+            let cats = &tree.categories()[node.cat_begin as usize..node.cat_end as usize];
+            categories_nodes.push(node_id as i64);
+            categories_segments.push(categories.len() as i64);
+            categories_sizes.push(cats.len() as i64);
+            categories.extend(cats.iter().map(|&category| i64::from(category)));
+            left.push(node.right);
+            right.push(node.left);
+            split_conditions.push(DFT_BAD_VALUE);
+            default_left.push(i32::from(!node.default_left));
+        } else {
+            left.push(node.left);
+            right.push(node.right);
+            split_conditions.push(node.split_cond);
+            default_left.push(i32::from(node.default_left));
+        }
+    }
+    json!({
+        "id": id,
+        "tree_param": {
+            "num_deleted": "0",
+            "num_feature": num_feature.to_string(),
+            "num_nodes": n.to_string(),
+            "size_leaf_vector": k.to_string(),
+        },
+        "left_children": left,
+        "right_children": right,
+        "parents": parents,
+        "split_indices": split_indices,
+        "split_conditions": split_conditions,
+        "default_left": default_left,
+        "base_weights": base_weights,
+        "leaf_weights": leaf_weights,
+        "loss_changes": loss_changes,
+        "sum_hessian": sum_hessian,
+        "split_type": split_type,
+        "categories": categories,
+        "categories_nodes": categories_nodes,
+        "categories_segments": categories_segments,
+        "categories_sizes": categories_sizes,
+    })
+}
+
+/// The leaf vectors of an XGBoost `MultiTargetTree` bundle, laid out
+/// `[node][output]` (zeros for internal nodes): leaf `i`'s vector is
+/// `leaf_weights[right_children[i] * k..][..k]`.
+fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Vec<f32>> {
+    let leaf_weights = arr(tj, "leaf_weights", scalar_f64)
+        .ok_or_else(|| HessboostError::missing_field("leaf_weights"))?;
+    let mut out = vec![0.0f32; left.len() * k];
+    for (i, (&l, &r)) in left.iter().zip(right).enumerate() {
+        if l != -1 {
+            continue;
+        }
+        let slot = usize::try_from(r)
+            .ok()
+            .filter(|&slot| (slot + 1) * k <= leaf_weights.len())
+            .ok_or_else(|| {
+                HessboostError::model_format(format!("leaf {i} has an invalid leaf index {r}"))
+            })?;
+        for (dst, &w) in out[i * k..(i + 1) * k]
+            .iter_mut()
+            .zip(&leaf_weights[slot * k..(slot + 1) * k])
+        {
+            *dst = w as f32;
+        }
+    }
+    Ok(out)
+}
+
 /// Decode one XGBoost tree object into a [`RegTree`].
 fn tree_from_json(tj: &Value) -> Result<RegTree> {
     let left = i32_arr(tj, "left_children")
@@ -606,11 +756,23 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
     let loss_changes = arr_or_empty(tj, "loss_changes");
 
     let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
+    let size_leaf_vector = tj
+        .pointer("/tree_param/size_leaf_vector")
+        .and_then(scalar_f64)
+        .map_or(0, |k| k as usize);
+    let leaf_vectors = if size_leaf_vector > 1 {
+        vector_leaves(tj, &left, &right, size_leaf_vector)?
+    } else {
+        Vec::new()
+    };
 
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
         let sum_hess = at(&sum_hessian, i) as f32;
-        if left[i] == -1 {
+        if left[i] == -1 && size_leaf_vector > 1 {
+            // Vector leaf: the weights live in `leaf_vectors`.
+            nodes.push(Node::leaf(0.0, sum_hess));
+        } else if left[i] == -1 {
             // Leaf: prefer split_conditions, fall back to base_weights.
             let leaf_value = split_conditions
                 .get(i)
@@ -662,6 +824,8 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
     let tree: RegTree = serde_json::from_value(json!({
         "nodes": nodes,
         "categories": flat_categories,
+        "size_leaf_vector": if size_leaf_vector > 1 { size_leaf_vector } else { 0 },
+        "leaf_vectors": leaf_vectors,
     }))?;
     Ok(tree)
 }

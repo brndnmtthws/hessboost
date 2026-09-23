@@ -12,7 +12,7 @@ gradient boosting with no C/C++ dependency and no FFI.
 Rust. It includes the regularized second-order boosting objective, exact,
 histogram, and approximate tree construction, the full objective and metric
 catalog, monotone and interaction constraints, categorical splits, DART and
-gblinear boosters, TreeSHAP, and XGBoost-format model interop (numeric and
+gblinear boosters, QuadratureTreeSHAP, and XGBoost-format model interop (numeric and
 categorical trees) with
 multi-core (`rayon`) acceleration.
 
@@ -69,7 +69,7 @@ Runnable, self-contained examples live in
 | `binary_classification` | `binary:logistic`, watched eval set, early stopping, AUC |
 | `multiclass` | `multi:softprob`, per-class probabilities, `predict_class` |
 | `ranking` | LambdaMART `rank:ndcg` over query groups |
-| `shap` | `predict_contribs` and `predict_interactions` (TreeSHAP) |
+| `shap` | `predict_contribs` and `predict_interactions` (QuadratureTreeSHAP) |
 | `model_io` | native binary / JSON and XGBoost-format model save & load |
 | `custom_objective` | custom loss and custom eval-metric hooks |
 | `constraints` | monotone + interaction constraints and categorical features |
@@ -78,6 +78,7 @@ Runnable, self-contained examples live in
 | `pfn_boost` | boosting from a pretrained prior's logits via `base_margin` (PFN-Boost) |
 | `ordered_target_stats` | opt-in CatBoost-style ordered target statistics for a high-cardinality categorical |
 | `compact_model` | opt-in feature/threshold reuse penalties and the bit-packed compact model layout (Trees on a Diet) |
+| `budget` | budget-mode training (PerpetualBooster) across budgets vs default and validation-tuned training |
 
 ### Boosting from a pretrained prior
 
@@ -92,6 +93,30 @@ model, so predicting on a matrix without it falls back to the intercept. The
 `pfn_boost` example runs the method against boosting from scratch across
 training-set sizes with a stand-in prior, or on TabPFN logits exported from
 Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
+
+### Training with a budget instead of tuning
+
+`train_with_budget(&params, &dtrain, &BudgetConfig::new(1.0))` implements
+[PerpetualBooster](https://github.com/perpetual-ml/perpetual)'s algorithm: one
+`budget` number replaces the learning rate, tree-size limits, and round
+count. The budget sets the learning rate (`eta = 10^-budget` up to 1) and a
+per-tree target loss reduction; each split must pass a five-fold
+generalization check (its in-fold improvement has to hold up out of fold),
+and boosting stops by itself once trees stop generalizing, with a hard cap of
+1000 rounds for budgets up to 1 (at most 4000). Larger budgets train more
+trees and fit held-out data more closely at a higher cost; 0.5 (Perpetual's
+default) to 1.5 is the useful range. The result is an ordinary gbtree model
+(every prediction, SHAP, and model-I/O path applies, XGBoost export
+included). Settings budget mode derives itself (`eta`, `max_depth`,
+`lambda`, subsampling, ...) are refused rather than ignored; supported
+objectives are the single-output ones with a pointwise loss (squared error,
+pseudo-Huber, logistic, Poisson, Gamma, Tweedie). On synthetic Friedman #1
+data (`budget` example), budget 1.0 is within 1% of, and budget 1.5 better
+than, a round count tuned by early stopping on a validation set for
+regression, and within 4-10% for binary classification. Perpetual's
+dataset-regime heuristics (automatic subsampling, class reweighting,
+leaf refinement, and objective/shape-specific schedule adjustments) are not
+reproduced; see `hessboost::learner::budget` for the exact rules.
 
 ## Feature status
 
@@ -146,8 +171,6 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `with_label_matrix`), instance and group weights, `base_margin`, query
   groups, label bounds for censored targets (`with_label_bounds`), feature
   types, and per-feature column-sampling weights (`with_feature_weights`).
-  Training rejects the not-yet-implemented `multi_strategy = multi_output_tree`
-  instead of ignoring it.
 - **Multi-target labels:** `reg:squarederror`, `reg:pseudohubererror`,
   `reg:absoluteerror`, `reg:logistic`, and `binary:logistic` (multi-label)
   train on a label matrix like XGBoost's default `one_output_per_tree`
@@ -157,6 +180,28 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   Elementwise metrics average over every row and target (row weights
   repeated per target); `auc`/`aucpr` macro-average the targets. Other
   objectives and the ranking/multiclass metrics reject label matrices.
+- **Vector-leaf trees:** `multi_strategy = multi_output_tree` (`tree_method =
+  hist`) grows one tree per round (per parallel tree) whose leaves hold a
+  weight per output, for
+  every multi-output objective (label matrices, `multi:softprob`/`softmax`,
+  `reg:quantileerror`/`reg:expectileerror` alpha lists, custom objectives), with XGBoost 3.4.2's vector split gain (target-summed
+  scores, `min_child_weight` on the mean Hessian), depthwise and lossguide
+  growth, missing values, categorical partition splits, monotone (pooled
+  weights) and interaction constraints, row/column sampling (including
+  `gradient_based` and feature weights), DART, `num_parallel_tree` forests,
+  continued training, iteration ranges and slicing. Like XGBoost, the
+  refresh updater (`process_type = update`) is refused for vector leaves, as
+  are the opt-in extensions that bypass the vector split search
+  (`grow_policy = symmetric`, reuse penalties, quantized gradients,
+  `extra_trees`/`path_smooth`/`linear_tree`, budget mode) and the compact
+  model format.
+  Custom objectives may grow the tree structure from **reduced split
+  gradients** (`Objective::split_gradient` /
+  `CustomObjective::with_split_gradient`, XGBoost's `TreeObjective.split_grad`
+  / SketchBoost) while leaves are refit from the full gradients. Vector-leaf
+  models predict, explain (QuadratureTreeSHAP contributions and interactions
+  per output), report feature importance, and round-trip XGBoost's
+  `MultiTargetTree` JSON/UBJSON layout (`size_leaf_vector`, `leaf_weights`).
 - **Metrics:** `rmse`, `rmsle`, `mae`, `mape`, `mphe` (`huber_slope`),
   `logloss`, `error`, `auc`, `aucpr`, `mlogloss`, `merror`,
   `poisson/gamma/tweedie-nloglik`, `ndcg`, `map`, `pre` (with `@k`; plain
@@ -171,8 +216,11 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 - **Constraints:** monotone constraints and **interaction constraints**,
   supported in **both** the `hist` and `exact` builders.
 - **Modeling:** **native categorical splits** (hist and exact), per-instance
-  `base_margin` (warm-start), **TreeSHAP** contributions (`predict_contribs`) and
-  **interaction values** (`predict_interactions`), early stopping, feature
+  `base_margin` (warm-start), SHAP contributions (`predict_contribs`) and
+  **interaction values** (`predict_interactions`) via XGBoost 3.4's
+  **QuadratureTreeSHAP** (8-point Gauss–Legendre rule, same `f32` arithmetic
+  and accumulation order, so imported models reproduce XGBoost's values),
+  early stopping, feature
   importance (weight / gain / cover / totals), leaf-index and margin prediction.
 - **Uncertainty:** distribution-free prediction intervals with finite-sample
   marginal coverage `P(Y ∈ C(X)) ≥ 1 − alpha` (`hessboost::learner::conformal`):
@@ -266,6 +314,11 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   building dominates: 1.5× (1 thread) and 1.85× (16 threads) for a 1M × 50
   depth-8 tree. On 50k-row training it is within ±7% (see
   `docs/performance.md`).
+- **Budget-mode training** (`train_with_budget`, `BudgetConfig`):
+  PerpetualBooster's hyperparameter-free boosting, with a budget-derived
+  learning rate and per-tree loss target, five-fold generalization-gated
+  splits, and automatic stopping. Deterministic and thread-count
+  independent; the ordinary training path is untouched.
 - **Distributional boosting** (NGBoost, [Duan et al. 2020](https://arxiv.org/abs/1910.03225);
   XGBoostLSS, [März 2019](https://arxiv.org/abs/1907.03178)): objectives
   `dist:normal` (`μ`, `ln σ`), `dist:lognormal`, `dist:gamma` (`ln` mean,
@@ -347,7 +400,7 @@ Numerical parity with **XGBoost 3.4.2** is checked in CI by a fixture harness
 `scripts/check_exports.py`). Each case is checked three ways: **train parity**
 (same data and parameters, compare predictions), **import parity**
 (`from_xgboost_json` on the XGBoost model: predictions, margins, SHAP
-contributions; `from_xgboost_ubjson` on XGBoost's UBJSON save of the same model
+contributions, and SHAP interaction values; `from_xgboost_ubjson` on XGBoost's UBJSON save of the same model
 must give the identical model) and **export parity** (`to_xgboost_json` and
 `to_xgboost_ubjson` reloaded by XGBoost, with the UBJSON array encodings
 matching XGBoost's own re-save).
@@ -385,3 +438,7 @@ Apache-2.0) built from XGBoost's public descriptions and papers; it contains no
 XGBoost source code. "XGBoost" is used descriptively, for algorithmic lineage and
 result compatibility. This project is not affiliated with or endorsed by the
 XGBoost project.
+Budget-mode training re-implements the algorithm of
+[PerpetualBooster](https://github.com/perpetual-ml/perpetual) (Copyright 2024
+Perpetual ML, Apache-2.0) from its published description and Rust source; no
+Perpetual code is copied.

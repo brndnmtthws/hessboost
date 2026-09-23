@@ -295,6 +295,13 @@ impl BoostedModel {
         self.n_targets
     }
 
+    /// Whether the ensemble consists of vector-leaf trees
+    /// (`multi_strategy = multi_output_tree`): each tree predicts every
+    /// output at once instead of one output per tree.
+    pub fn has_vector_leaves(&self) -> bool {
+        self.trees.first().is_some_and(RegTree::is_vector_leaf)
+    }
+
     /// The first output's intercept (global bias) in margin space.
     ///
     /// Scalar-output models have exactly one value. For multiclass models use
@@ -364,6 +371,22 @@ impl BoostedModel {
         weight: impl Fn(usize) -> f32 + Sync,
     ) {
         let k = self.n_outputs();
+        if self.has_vector_leaves() {
+            let rows = trees.clone();
+            self.traverse_blocks(
+                data,
+                out,
+                k,
+                trees,
+                |block, forest, r, out_row| {
+                    block.accumulate_row_vector(forest, r, rows.clone(), &weight, out_row);
+                },
+                |block, forest, ti, rows, out_block, stride| {
+                    block.accumulate_vector(forest, ti, rows, weight(ti), out_block, stride);
+                },
+            );
+            return;
+        }
         if self.trees[trees.clone()]
             .iter()
             .any(|tree| tree.linear_leaves().is_some())
@@ -651,16 +674,26 @@ impl BoostedModel {
         self.num_parallel_tree
     }
 
-    /// Trees per boosting iteration: `n_outputs × num_parallel_tree`.
+    /// Trees per boosting iteration: `n_outputs × num_parallel_tree`, or
+    /// `num_parallel_tree` vector-leaf trees (each feeds every output).
     #[inline]
     pub fn trees_per_iteration(&self) -> usize {
-        self.n_outputs * self.num_parallel_tree
+        if self.has_vector_leaves() {
+            self.num_parallel_tree
+        } else {
+            self.n_outputs * self.num_parallel_tree
+        }
     }
 
-    /// The output tree `t` contributes to (XGBoost `tree_info[t]`).
+    /// The output tree `t` contributes to (XGBoost `tree_info[t]`): `0` for
+    /// every vector-leaf tree, whose leaves carry all outputs.
     #[inline]
     pub(crate) fn tree_output(&self, t: usize) -> usize {
-        (t / self.num_parallel_tree) % self.n_outputs
+        if self.has_vector_leaves() {
+            0
+        } else {
+            (t / self.num_parallel_tree) % self.n_outputs
+        }
     }
 
     /// Number of boosting iterations (`num_trees / trees_per_iteration`;
@@ -944,11 +977,16 @@ impl BoostedModel {
                 "model has an invalid feature count".to_string(),
             ));
         }
+        let vector = self.has_vector_leaves();
         if self.n_outputs == 0
             || self.n_targets == 0
             || self.num_parallel_tree == 0
             || (self.num_class >= 2 && self.n_outputs != self.num_class)
             || !self.trees.len().is_multiple_of(self.trees_per_iteration())
+            || self.trees.iter().any(|tree| {
+                tree.is_vector_leaf() != vector
+                    || (vector && tree.size_leaf_vector() != self.n_outputs)
+            })
         {
             return Err(HessboostError::ModelFormat(format!(
                 "invalid output layout: {} outputs, num_class {}, num_parallel_tree {}, {} trees",
@@ -1441,6 +1479,30 @@ impl<'a> RowBlock<'a> {
         }
     }
 
+    /// `out[j] += weight(t) * leaf_vector(row r, tree t)[j]` for the
+    /// vector-leaf trees `trees` of loaded row `r`.
+    fn accumulate_row_vector(
+        &self,
+        forest: &CompactForest,
+        r: usize,
+        trees: std::ops::Range<usize>,
+        weight: impl Fn(usize) -> f32,
+        out: &mut [f32],
+    ) {
+        if let Some(row) = self.row(r) {
+            forest.accumulate_row_vector(row, trees, weight, out);
+        } else {
+            let k = out.len();
+            for t in trees {
+                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                let w = weight(t);
+                for (o, &v) in out.iter_mut().zip(forest.leaf_vector(leaf, k)) {
+                    *o += w * v;
+                }
+            }
+        }
+    }
+
     /// The loaded rows for the batch kernel: the full [`LANES`]-row groups in
     /// lane-major layout plus the remaining rows row-major (see
     /// [`CompactForest::accumulate`]), or `None` for wide sparse blocks.
@@ -1484,6 +1546,30 @@ impl<'a> RowBlock<'a> {
             for r in 0..rows {
                 let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
                 out[r * stride] = forest.original_id(leaf);
+            }
+        }
+    }
+
+    /// `out[r * stride + j] += weight * leaf_vector(row r)[j]` (all `stride`
+    /// outputs) in vector-leaf tree `t` over the loaded rows.
+    fn accumulate_vector(
+        &self,
+        forest: &CompactForest,
+        t: usize,
+        rows: usize,
+        weight: f32,
+        out: &mut [f32],
+        stride: usize,
+    ) {
+        if let Some((lanes, tail, n_cols)) = self.lane_block(rows) {
+            forest.accumulate_vector(t, lanes, tail, n_cols, rows, stride, weight, out, stride);
+        } else {
+            for r in 0..rows {
+                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                let dst = &mut out[r * stride..(r + 1) * stride];
+                for (o, &v) in dst.iter_mut().zip(forest.leaf_vector(leaf, stride)) {
+                    *o += weight * v;
+                }
             }
         }
     }

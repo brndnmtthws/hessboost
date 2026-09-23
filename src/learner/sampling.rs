@@ -42,6 +42,25 @@ pub(crate) struct GradientSample {
     /// Row-major `[row][target]` gradients: rescaled for kept rows, zero for
     /// dropped ones.
     pub gpair: Vec<GradPair>,
+    /// Inclusion probability of each kept row (parallel to `rows`).
+    pub probability: Vec<f32>,
+}
+
+impl GradientSample {
+    /// Replay this sample on other gradients of the same rows (`n_targets`
+    /// pairs per row): kept rows rescaled by their inclusion probability,
+    /// dropped rows zeroed (XGBoost's `ApplySampling`, used for the value
+    /// gradients of reduced-gradient training).
+    pub(crate) fn apply(&self, gpair: &[GradPair], n_targets: usize) -> Vec<GradPair> {
+        let mut out = vec![GradPair::default(); gpair.len()];
+        for (&row, &p) in self.rows.iter().zip(&self.probability) {
+            let range = row as usize * n_targets..(row as usize + 1) * n_targets;
+            for (d, s) in out[range.clone()].iter_mut().zip(&gpair[range]) {
+                *d = rescale(p, *s);
+            }
+        }
+        out
+    }
 }
 
 /// Sample the rows of `gpair` (row-major, `n_targets` pairs per row) for one
@@ -65,6 +84,7 @@ pub(crate) fn gradient_based_sample(
         return Some(GradientSample {
             rows: Vec::new(),
             gpair: vec![GradPair::default(); gpair.len()],
+            probability: Vec::new(),
         });
     }
 
@@ -80,7 +100,7 @@ pub(crate) fn gradient_based_sample(
         .collect();
     let threshold = threshold(&reg_abs_grad, budget);
 
-    let blocks: Vec<(Vec<u32>, Vec<GradPair>)> = gpair
+    let blocks: Vec<(Vec<u32>, Vec<f32>, Vec<GradPair>)> = gpair
         .par_chunks(BLOCK_ROWS * n_targets)
         .zip(reg_abs_grad.par_chunks(BLOCK_ROWS))
         .enumerate()
@@ -88,6 +108,7 @@ pub(crate) fn gradient_based_sample(
             let mut stream = StdRng::seed_from_u64(block_seed(seed, block));
             let first = block * BLOCK_ROWS;
             let mut rows = Vec::new();
+            let mut kept_p = Vec::new();
             let mut out = vec![GradPair::default(); pairs.len()];
             for (i, &r) in rag.iter().enumerate() {
                 let p = probability(threshold, r);
@@ -100,19 +121,26 @@ pub(crate) fn gradient_based_sample(
                         *d = rescale(p, *s);
                     }
                     rows.push((first + i) as u32);
+                    kept_p.push(p);
                 }
             }
-            (rows, out)
+            (rows, kept_p, out)
         })
         .collect();
 
     let mut rows = Vec::new();
+    let mut probability = Vec::new();
     let mut out = Vec::with_capacity(gpair.len());
-    for (block_rows, block_pairs) in blocks {
+    for (block_rows, block_p, block_pairs) in blocks {
         rows.extend(block_rows);
+        probability.extend(block_p);
         out.extend(block_pairs);
     }
-    Some(GradientSample { rows, gpair: out })
+    Some(GradientSample {
+        rows,
+        gpair: out,
+        probability,
+    })
 }
 
 /// The seed of one row block's random stream.

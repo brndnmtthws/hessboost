@@ -5,6 +5,11 @@
 //! *missing* follow the node's `default_left` direction, implementing XGBoost's
 //! sparsity-aware routing. Leaf nodes carry the raw leaf weight (the learning
 //! rate is applied by the boosting loop, not baked into the tree).
+//!
+//! A *vector-leaf* tree (`multi_strategy = multi_output_tree`, XGBoost's
+//! `MultiTargetTree`) shares one split structure across `K > 1` outputs and
+//! stores a weight vector per leaf ([`RegTree::leaf_vector`]); its scalar
+//! [`Node::leaf_value`]s are unused (zero).
 
 use crate::data::DMatrix;
 use crate::tree::linear::LinearLeaves;
@@ -81,6 +86,14 @@ pub struct RegTree {
     /// Empty for trees with no categorical splits (including all legacy trees).
     #[serde(default)]
     categories: Vec<u32>,
+    /// Outputs per leaf of a vector-leaf tree (XGBoost's `size_leaf_vector`,
+    /// `> 1`), or `0` for a scalar tree.
+    #[serde(default)]
+    size_leaf_vector: usize,
+    /// Vector-leaf weights laid out `[node][output]` (`size_leaf_vector` per
+    /// node; internal nodes hold zeros). Empty for scalar trees.
+    #[serde(default)]
+    leaf_vectors: Vec<f32>,
     /// Per-leaf linear models of a `linear_tree` tree ([`LinearLeaves`]);
     /// `None` for constant-leaf trees (every tree unless `linear_tree` is on).
     #[serde(default)]
@@ -94,7 +107,83 @@ impl RegTree {
         RegTree {
             nodes: vec![Node::leaf(0.0, sum_hess)],
             categories: Vec::new(),
+            size_leaf_vector: 0,
+            leaf_vectors: Vec::new(),
             linear: None,
+        }
+    }
+
+    /// Create a vector-leaf tree with `n_outputs > 1` weights per leaf and a
+    /// placeholder (all-zero) root leaf.
+    pub(crate) fn with_vector_root(n_outputs: usize, sum_hess: f32) -> Self {
+        debug_assert!(n_outputs > 1);
+        RegTree {
+            nodes: vec![Node::leaf(0.0, sum_hess)],
+            categories: Vec::new(),
+            size_leaf_vector: n_outputs,
+            leaf_vectors: vec![0.0; n_outputs],
+            linear: None,
+        }
+    }
+
+    /// Outputs per leaf: `1` for a scalar tree, `K > 1` for a vector-leaf
+    /// tree.
+    #[inline]
+    pub fn size_leaf_vector(&self) -> usize {
+        self.size_leaf_vector.max(1)
+    }
+
+    /// Whether this is a vector-leaf (multi-output) tree.
+    #[inline]
+    pub fn is_vector_leaf(&self) -> bool {
+        self.size_leaf_vector > 1
+    }
+
+    /// The weights of leaf `nid`, one per output: the leaf's vector for a
+    /// vector-leaf tree, the single [`Node::leaf_value`] otherwise.
+    #[inline]
+    pub fn leaf_vector(&self, nid: usize) -> &[f32] {
+        if self.is_vector_leaf() {
+            let k = self.size_leaf_vector;
+            &self.leaf_vectors[nid * k..(nid + 1) * k]
+        } else {
+            std::slice::from_ref(&self.nodes[nid].leaf_value)
+        }
+    }
+
+    /// Set the weight vector of vector-leaf tree node `nid`.
+    pub(crate) fn set_leaf_vector(&mut self, nid: usize, values: &[f32]) {
+        let k = self.size_leaf_vector;
+        debug_assert!(k > 1 && values.len() == k);
+        self.leaf_vectors[nid * k..(nid + 1) * k].copy_from_slice(values);
+    }
+
+    /// The scalar tree predicting output `output` of this vector-leaf tree:
+    /// the same nodes (splits, covers, gains, categories) with each leaf's
+    /// value taken from its vector.
+    pub(crate) fn output_tree(&self, output: usize) -> RegTree {
+        let k = self.size_leaf_vector;
+        debug_assert!(k > 1 && output < k);
+        let mut nodes = self.nodes.clone();
+        for (id, node) in nodes.iter_mut().enumerate() {
+            if node.is_leaf() {
+                node.leaf_value = self.leaf_vectors[id * k + output];
+            }
+        }
+        RegTree {
+            nodes,
+            categories: self.categories.clone(),
+            size_leaf_vector: 0,
+            leaf_vectors: Vec::new(),
+            linear: None,
+        }
+    }
+
+    /// Give two freshly pushed child nodes their (zero) leaf vectors.
+    fn grow_leaf_vectors(&mut self) {
+        if self.is_vector_leaf() {
+            self.leaf_vectors
+                .resize(self.nodes.len() * self.size_leaf_vector, 0.0);
         }
     }
 
@@ -131,6 +220,15 @@ impl RegTree {
                 .as_ref()
                 .is_none_or(|linear| linear.is_valid(&self.nodes, n_features));
         if !locally_valid {
+            return false;
+        }
+        if self.is_vector_leaf()
+            && (self.leaf_vectors.len() != self.nodes.len() * self.size_leaf_vector
+                || self.leaf_vectors.iter().any(|w| !w.is_finite()))
+        {
+            return false;
+        }
+        if self.size_leaf_vector == 1 || (!self.is_vector_leaf() && !self.leaf_vectors.is_empty()) {
             return false;
         }
         let mut seen = vec![false; self.nodes.len()];
@@ -209,6 +307,7 @@ impl RegTree {
         n.default_left = default_left;
         n.left = left_id as i32;
         n.right = right_id as i32;
+        self.grow_leaf_vectors();
         (left_id, right_id)
     }
 
@@ -247,6 +346,7 @@ impl RegTree {
         n.default_left = default_left;
         n.left = left_id as i32;
         n.right = right_id as i32;
+        self.grow_leaf_vectors();
         (left_id, right_id)
     }
 
@@ -270,9 +370,15 @@ impl RegTree {
     /// matching XGBoost's saved-model semantics. Leaf linear models are scaled
     /// with them.
     pub fn scale_leaves(&mut self, factor: f32) {
-        for n in &mut self.nodes {
+        let k = self.size_leaf_vector;
+        for (id, n) in self.nodes.iter_mut().enumerate() {
             if n.is_leaf() {
                 n.leaf_value *= factor;
+                if k > 1 {
+                    for w in &mut self.leaf_vectors[id * k..(id + 1) * k] {
+                        *w *= factor;
+                    }
+                }
             }
         }
         if let Some(linear) = &mut self.linear {

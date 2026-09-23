@@ -138,6 +138,18 @@ impl Objective for LogisticObjective {
         -(1.0 / p - 1.0).ln()
     }
 
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // Cross-entropy `softplus(m) − y·m` (stable form), with positives
+        // reweighted by `scale_pos_weight` exactly as in the gradient.
+        let scale_pos_weight = f64::from(self.scale_pos_weight);
+        Some(Box::new(move |margin, label| {
+            let (m, y) = (f64::from(margin), f64::from(label));
+            let softplus = m.max(0.0) + (-m.abs()).exp().ln_1p();
+            let weight = if label == 1.0 { scale_pos_weight } else { 1.0 };
+            weight * (softplus - y * m)
+        }))
+    }
+
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         // XGBoost `LogisticRegression::CheckLabel` (shared by all three
         // variants): probabilities in [0, 1], not only {0, 1}.

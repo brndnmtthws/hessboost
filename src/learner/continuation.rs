@@ -12,6 +12,7 @@ use crate::config::{BoosterKind, Monotone, ObjectiveParams, ProcessType, Trainin
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::learner::model::BoostedModel;
+use crate::learner::multi_output;
 use crate::objective::Objective;
 
 /// Check that `init` can be trained further with `params` on `dtrain` and
@@ -90,6 +91,22 @@ pub(super) fn resume_model(
             ),
         ));
     }
+    // A model's trees are either all vector-leaf or all scalar-leaf.
+    if !is_linear
+        && init.num_trees() > 0
+        && init.has_vector_leaves() != multi_output::vector_leaf(params, objective.n_outputs())
+    {
+        return Err(HessboostError::invalid_param(
+            "multi_strategy",
+            if init.has_vector_leaves() {
+                "a vector-leaf model can only be trained further with \
+                 `multi_strategy=multi_output_tree`"
+            } else {
+                "a one-output-per-tree model cannot be trained further with \
+                 `multi_strategy=multi_output_tree`"
+            },
+        ));
+    }
     if params.process_type == ProcessType::Update {
         check_update(init, params, num_boost_round)?;
     }
@@ -116,6 +133,13 @@ fn check_update(
         return Err(HessboostError::invalid_param(
             "process_type",
             "`update` refreshes gbtree models only (booster=gbtree)",
+        ));
+    }
+    // XGBoost's refresh updater handles single-target trees only.
+    if init.has_vector_leaves() {
+        return Err(HessboostError::invalid_param(
+            "process_type",
+            "`update` cannot refresh vector-leaf trees (`multi_output_tree`)",
         ));
     }
     if init.has_non_unit_tree_weights() {

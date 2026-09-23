@@ -3,16 +3,20 @@
 //! row weight in `f32` before the `f64` sums, exactly as XGBoost's
 //! `elementwise_metric.cu` reduction does.
 
-use super::{Metric, weighted_mean};
+use super::{Metric, consistent, weighted_mean};
 
 /// `(Σ wᵢ·loss(yᵢ, pᵢ), Σ wᵢ)` with the per-row product in `f32`; absent
-/// weights count as `1`.
+/// weights count as `1`. Inconsistent lengths give `(NaN, 1)`, so the
+/// metric is NaN.
 fn weighted_sum(
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
     loss: impl Fn(f32, f32) -> f32,
 ) -> (f64, f64) {
+    if !consistent(preds, labels, weights, 1) {
+        return (f64::NAN, 1.0);
+    }
     let mut total = 0.0f64;
     let mut weight = 0.0f64;
     for (i, (&p, &y)) in preds.iter().zip(labels).enumerate() {

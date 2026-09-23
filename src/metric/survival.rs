@@ -2,7 +2,7 @@
 //! `interval-regression-accuracy` (XGBoost `metric/rank_metric.cc`,
 //! `metric/survival_metric.cu`).
 
-use super::Metric;
+use super::{Metric, consistent};
 use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -23,7 +23,11 @@ impl Metric for CoxNLogLik {
         "cox-nloglik"
     }
 
-    fn eval(&self, preds: &[f32], labels: &[f32], _weights: Option<&[f32]>) -> f64 {
+    /// NaN for inconsistent lengths (weights are otherwise ignored).
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        if !consistent(preds, labels, weights, 1) {
+            return f64::NAN;
+        }
         let n = labels.len();
         let order = abs_label_order(labels);
         let mut exp_p_sum: f64 = preds[..n].iter().map(|&p| f64::from(p)).sum();
@@ -51,12 +55,16 @@ impl Metric for CoxNLogLik {
 /// Weighted mean of `row(lower, upper, margin)` over the label intervals,
 /// XGBoost's survival-metric reduction (`esum / wsum`, or `esum` when the
 /// total weight is zero). Without label bounds, the labels are used as
-/// observed times (`lower == upper == label`).
+/// observed times (`lower == upper == label`). NaN unless the predictions,
+/// intervals, and weights all have one entry per row.
 fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> f64) -> f64 {
     let (lower, upper) = match (info.label_lower_bound, info.label_upper_bound) {
         (Some(lower), Some(upper)) => (lower, upper),
         _ => (info.labels, info.labels),
     };
+    if upper.len() != lower.len() || !consistent(preds, lower, info.weights, 1) {
+        return f64::NAN;
+    }
     let mut residue_sum = 0.0f64;
     let mut weights_sum = 0.0f64;
     for (i, ((&lo, &hi), &pred)) in lower.iter().zip(upper).zip(preds).enumerate() {

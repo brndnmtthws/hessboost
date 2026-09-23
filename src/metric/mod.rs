@@ -30,7 +30,9 @@ pub trait Metric: Send + Sync {
         false
     }
 
-    /// Evaluate the metric. `preds` are post-transform predictions.
+    /// Evaluate the metric. `preds` are post-transform predictions,
+    /// [`Metric::prediction_width`] per label; inconsistent lengths
+    /// (`preds`, or `weights` other than one per label) evaluate to NaN.
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64;
 
     /// Evaluate the metric with optional query-group structure.
@@ -93,6 +95,36 @@ pub trait Metric: Send + Sync {
         }
         Ok(())
     }
+
+    /// Predictions per row (`[row][output]`) that [`Metric::eval_info`]
+    /// reads on `info`: one per label column by default (elementwise,
+    /// ranking, and survival metrics), the class count for `mlogloss` /
+    /// `merror`, one per alpha and label column for `quantile` /
+    /// `expectile`, and the distribution's parameter count for `nll` /
+    /// `crps`. `None` accepts any whole number of predictions per label (the
+    /// [`CustomMetric`] hook). Training refuses an evaluation set on which a
+    /// metric's width differs from the model's output count.
+    fn prediction_width(&self, info: &MetaInfo) -> Option<usize> {
+        Some(info.n_targets)
+    }
+}
+
+/// Whether `preds` holds `width` values per label and `weights`, when
+/// given, one per label: the lengths [`Metric::eval`] reads. Metrics
+/// evaluate inconsistent inputs to NaN.
+fn consistent(preds: &[f32], labels: &[f32], weights: Option<&[f32]>, width: usize) -> bool {
+    labels.len().checked_mul(width) == Some(preds.len())
+        && weights.is_none_or(|w| w.len() == labels.len())
+}
+
+/// Short-circuit a [`Metric::eval`] to NaN when its inputs are not
+/// [`consistent`] with `width` predictions per label.
+macro_rules! nan_unless_consistent {
+    ($preds:expr, $labels:expr, $weights:expr, $width:expr) => {
+        if !consistent($preds, $labels, $weights, $width) {
+            return f64::NAN;
+        }
+    };
 }
 
 /// Normalize a metric total, returning zero for an empty or nonpositive weight sum.
@@ -104,13 +136,14 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
 /// Define a purely-pointwise metric from its SIMD weighted-sum kernel.
 /// Generates the metric struct plus its [`Metric`] impl from the metric name
 /// and the `crate::simd` kernel path; `eval` is
-/// `weighted_mean(kernel(preds, labels, weights))`. Metrics with metric-level
-/// state take a `field: Type` arm and pass `self.field` as the kernel's final
-/// argument; `rmse` takes `=> sqrt` for its root. A trailing
-/// `label_matrix: false` on the `field` arm marks a metric that is not
-/// elementwise over label matrices (the multiclass metrics read one class id
-/// per row). All generated metrics minimize (`maximize` keeps its default
-/// `false`); metrics with non-trivial logic (`auc`, `aucpr`, ranking) stay
+/// `weighted_mean(kernel(preds, labels, weights))`, NaN for inconsistent
+/// lengths. Metrics with metric-level state take a `field: Type` arm and
+/// pass `self.field` as the kernel's final argument; `rmse` takes `=> sqrt`
+/// for its root. A trailing `per_label` on the `field` arm marks a metric
+/// reading `self.field` predictions per label (the multiclass metrics: one
+/// probability per class, one class id per row, so no label matrices). All
+/// generated metrics minimize (`maximize` keeps its default `false`);
+/// metrics with non-trivial logic (`auc`, `aucpr`, ranking) stay
 /// handwritten below.
 macro_rules! simple_metric {
     ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path) => {
@@ -122,6 +155,7 @@ macro_rules! simple_metric {
                 $name
             }
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                nan_unless_consistent!(preds, labels, weights, 1);
                 weighted_mean($simd(preds, labels, weights))
             }
         }
@@ -135,12 +169,12 @@ macro_rules! simple_metric {
                 $name
             }
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                nan_unless_consistent!(preds, labels, weights, 1);
                 weighted_mean($simd(preds, labels, weights)).sqrt()
             }
         }
     };
-    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path
-        $(, label_matrix: $label_matrix:literal)?) => {
+    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy)]
         pub struct $ty {
@@ -151,13 +185,32 @@ macro_rules! simple_metric {
                 $name
             }
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                nan_unless_consistent!(preds, labels, weights, 1);
                 weighted_mean($simd(preds, labels, weights, self.$field))
             }
-            $(
-                fn supports_label_matrix(&self) -> bool {
-                    $label_matrix
-                }
-            )?
+        }
+    };
+    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path,
+        per_label) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy)]
+        pub struct $ty {
+            $field: $field_ty,
+        }
+        impl Metric for $ty {
+            fn name(&self) -> &str {
+                $name
+            }
+            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                nan_unless_consistent!(preds, labels, weights, self.$field);
+                weighted_mean($simd(preds, labels, weights, self.$field))
+            }
+            fn supports_label_matrix(&self) -> bool {
+                false
+            }
+            fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+                Some(self.$field)
+            }
         }
     };
 }
@@ -241,7 +294,8 @@ impl Metric for Auc {
         true
     }
 
-    fn eval(&self, preds: &[f32], labels: &[f32], _weights: Option<&[f32]>) -> f64 {
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         let n = preds.len();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| preds[a].total_cmp(&preds[b]));
@@ -284,13 +338,13 @@ simple_metric!(
     /// Multiclass log loss (`mlogloss`). Predictions are `n × num_class`
     /// probabilities. Labels are class indices.
     MLogLoss, "mlogloss", num_class: usize, crate::simd::multiclass_log_loss_sum,
-    label_matrix: false
+    per_label
 );
 
 simple_metric!(
     /// Multiclass error rate (`merror`): fraction whose argmax ≠ label.
     MError, "merror", num_class: usize, crate::simd::multiclass_error_sum,
-    label_matrix: false
+    per_label
 );
 
 simple_metric!(
@@ -424,6 +478,7 @@ impl Metric for Ndcg {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         grouped_average(preds, labels, weights, group, |p, l| self.group_ndcg(p, l))
     }
 }
@@ -520,6 +575,7 @@ impl Metric for MeanAveragePrecision {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         grouped_average(preds, labels, weights, group, |p, l| self.group_ap(p, l))
     }
 }
@@ -545,6 +601,7 @@ impl Metric for AucPr {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         let w_of = |i: usize| weights.map_or(1.0, |ws| f64::from(ws[i]));
 
         // Sort instance indices by descending predicted score.
@@ -609,13 +666,18 @@ type MetricFn = dyn Fn(&[f32], &[f32], Option<&[f32]>) -> f64 + Send + Sync;
 
 /// A [`Metric`] backed by a user-supplied closure (the custom-metric hook).
 ///
-/// The closure receives post-transform predictions, labels, and optional
-/// weights, and returns the scalar metric value. `maximize` declares the
-/// optimization direction used for early stopping.
+/// The closure receives post-transform predictions (`[row][output]`, the
+/// model's `n_outputs` per row), labels (`[row][target]`), and optional
+/// weights (one per label), and returns the scalar metric value.
+/// `maximize` declares the optimization direction used for early stopping.
+/// Inputs whose prediction count is not a positive multiple of the label
+/// count, or whose weights are not one per label, evaluate to NaN without
+/// calling the closure; training refuses a model whose outputs are not a
+/// whole number per label column.
 ///
-/// For a label matrix the closure sees `[row][target]` predictions and labels
-/// with each row's weight repeated for its cells (the default
-/// [`Metric::eval_info`] reduction).
+/// For a label matrix the closure sees `[row][target]` labels with each
+/// row's weight repeated for its cells (the default [`Metric::eval_info`]
+/// reduction).
 pub struct CustomMetric {
     name: String,
     maximize: bool,
@@ -647,8 +709,21 @@ impl Metric for CustomMetric {
         self.maximize
     }
 
+    /// NaN without calling the closure unless `preds` holds a positive
+    /// whole number of values per label and `weights`, when given, one per
+    /// label.
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        let width = preds.len().checked_div(labels.len()).unwrap_or(0);
+        if width == 0 || !consistent(preds, labels, weights, width) {
+            return f64::NAN;
+        }
         (self.f)(preds, labels, weights)
+    }
+
+    /// Any whole number of predictions per label: the closure interprets
+    /// them.
+    fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+        None
     }
 }
 
@@ -892,6 +967,71 @@ mod tests {
             let metric = create_metric(name, 3, &obj).unwrap();
             assert_eq!(metric.supports_label_matrix(), supported, "{name}");
         }
+    }
+
+    /// Every metric declares the predictions per row it reads, and direct
+    /// calls with inconsistent lengths evaluate to NaN instead of indexing
+    /// out of bounds.
+    #[test]
+    fn mismatched_lengths_evaluate_to_nan() {
+        let obj = ObjectiveParams {
+            quantile_alpha: vec![0.2, 0.8],
+            expectile_alpha: vec![0.5],
+            distribution: Some(crate::objective::DistFamily::Normal),
+            ..ObjectiveParams::default()
+        };
+        let widths = [
+            ("rmse", 1),
+            ("mae", 1),
+            ("logloss", 1),
+            ("error", 1),
+            ("auc", 1),
+            ("aucpr", 1),
+            ("mlogloss", 3),
+            ("merror", 3),
+            ("poisson-nloglik", 1),
+            ("gamma-nloglik", 1),
+            ("tweedie-nloglik", 1),
+            ("ndcg", 1),
+            ("map", 1),
+            ("rmsle", 1),
+            ("mape", 1),
+            ("mphe", 1),
+            ("pre@2", 1),
+            ("quantile", 2),
+            ("expectile", 1),
+            ("cox-nloglik", 1),
+            ("aft-nloglik", 1),
+            ("interval-regression-accuracy", 1),
+            ("nll", 2),
+            ("crps", 2),
+        ];
+        let labels = [1.0, 0.0, 1.0];
+        let info = MetaInfo::new(&labels, None, None);
+        for (name, width) in widths {
+            let metric = create_metric(name, 3, &obj).unwrap();
+            assert_eq!(metric.prediction_width(&info), Some(width), "{name}");
+            let preds = vec![0.5f32; labels.len() * width + 1];
+            let valid = &preds[..labels.len() * width];
+            // Consistent lengths evaluate (the value itself may be NaN for
+            // labels outside the metric's domain).
+            let _ = metric.eval(valid, &labels, Some(&[1.0; 3]));
+            for (preds, weights) in [
+                (&preds[..], None),
+                (&preds[..labels.len() * width - 1], None),
+                (valid, Some(&[1.0f32; 2][..])),
+            ] {
+                assert!(metric.eval(preds, &labels, weights).is_nan(), "{name}");
+                let info = MetaInfo::new(&labels, weights, None);
+                assert!(metric.eval_info(preds, &info).is_nan(), "{name}");
+            }
+        }
+        let custom = CustomMetric::new("first", false, |p, _, _| f64::from(p[0]));
+        assert_eq!(custom.prediction_width(&info), None);
+        assert_eq!(custom.eval(&[2.0, 3.0, 4.0], &labels, None), 2.0);
+        assert!(custom.eval(&[], &labels, None).is_nan());
+        assert!(custom.eval(&[2.0; 4], &labels, None).is_nan());
+        assert!(custom.eval(&[2.0; 3], &labels, Some(&[1.0])).is_nan());
     }
 
     #[test]

@@ -10,7 +10,8 @@ use crate::objective::validate_alphas;
 /// (row, alpha, target) cell of `preds` laid out `[row][alpha][target]`
 /// against `labels` laid out `[row][target]` (XGBoost's elementwise
 /// `Reduce`: row weights are repeated for every alpha and target). `NaN`
-/// when `preds` does not hold one value per label and alpha.
+/// when `preds` does not hold one value per label and alpha, the labels are
+/// not a whole number per row, or `weights` is not one per row.
 fn alpha_average(
     alpha: &[f32],
     preds: &[f32],
@@ -19,7 +20,11 @@ fn alpha_average(
     n_rows: usize,
     loss: impl Fn(f32, f32, f32) -> f32,
 ) -> f64 {
-    if n_rows == 0 || preds.len() != labels.len() * alpha.len() {
+    if n_rows == 0
+        || !labels.len().is_multiple_of(n_rows)
+        || labels.len().checked_mul(alpha.len()) != Some(preds.len())
+        || weights.is_some_and(|w| w.len() != n_rows)
+    {
         return f64::NAN;
     }
     let n_targets = labels.len() / n_rows;
@@ -86,6 +91,11 @@ impl Metric for QuantileError {
             },
         )
     }
+
+    /// One prediction per alpha and label column.
+    fn prediction_width(&self, info: &MetaInfo) -> Option<usize> {
+        Some(self.alpha.len() * info.n_targets)
+    }
 }
 
 /// Expectile loss (`expectile`), XGBoost's `ExpectileError`: `a·(p − y)²`
@@ -132,6 +142,11 @@ impl Metric for ExpectileError {
                 scale * diff * diff
             },
         )
+    }
+
+    /// One prediction per alpha and label column.
+    fn prediction_width(&self, info: &MetaInfo) -> Option<usize> {
+        Some(self.alpha.len() * info.n_targets)
     }
 }
 

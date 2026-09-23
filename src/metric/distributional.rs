@@ -6,13 +6,15 @@
 //! parameters per instance (`[row][parameter]`), and take the family from
 //! the objective (`ObjectiveParams::distribution`).
 
-use super::Metric;
+use super::{Metric, consistent};
+use crate::data::MetaInfo;
 use crate::objective::{Dist, DistFamily};
 use rayon::prelude::*;
 
 /// Weighted mean of `score(dist_i, y_i)` over the rows. Per-row scores are
 /// computed in parallel and summed sequentially in row order, so the value
-/// does not depend on the thread count.
+/// does not depend on the thread count. NaN unless `preds` holds one row of
+/// parameters per label and `weights` one weight per label.
 fn mean_score(
     family: DistFamily,
     preds: &[f32],
@@ -21,6 +23,9 @@ fn mean_score(
     score: impl Fn(&Dist, f64) -> f64 + Sync,
 ) -> f64 {
     let k = family.n_params();
+    if !consistent(preds, labels, weights, k) {
+        return f64::NAN;
+    }
     let scores: Vec<f64> = preds
         .par_chunks_exact(k)
         .zip(labels.par_iter())
@@ -59,6 +64,11 @@ impl Metric for DistNll {
         mean_score(self.family, preds, labels, weights, |d, y| -d.log_prob(y))
     }
 
+    /// One row of the family's natural parameters per label.
+    fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+        Some(self.family.n_params())
+    }
+
     fn supports_label_matrix(&self) -> bool {
         false
     }
@@ -86,6 +96,11 @@ impl Metric for DistCrps {
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
         mean_score(self.family, preds, labels, weights, Dist::crps)
+    }
+
+    /// One row of the family's natural parameters per label.
+    fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+        Some(self.family.n_params())
     }
 
     fn supports_label_matrix(&self) -> bool {

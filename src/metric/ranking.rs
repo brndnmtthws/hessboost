@@ -1,6 +1,6 @@
 //! Precision at `k` (`pre`, `pre@k`) for learning to rank.
 
-use super::{Metric, argsort_desc, group_ranges};
+use super::{Metric, argsort_desc, consistent, group_ranges};
 
 /// XGBoost's default ranking cutoff (`LambdaRankParam::DefaultK`), used by
 /// `pre` without an `@k` suffix.
@@ -52,6 +52,9 @@ impl Metric for Precision {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
+        if !consistent(preds, labels, weights, 1) {
+            return f64::NAN;
+        }
         // XGBoost `IsBinaryRel` with `kRtEps`.
         let binary = |y: f32| (y - 1.0).abs() < 1e-6 || y.abs() < 1e-6;
         if !labels.iter().all(|&y| binary(y)) {

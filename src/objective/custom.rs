@@ -26,7 +26,8 @@ impl CustomObjective {
     ///
     /// * `grad_fn`: `(margins, labels, weights, out)` fills `out` with gradients
     ///   (margins and `out` are `[row][output]`; labels hold one value per row,
-    ///   or `[row][target]` for a label matrix).
+    ///   or `[row][target]` for a label matrix, which then needs one column
+    ///   per output).
     /// * `base`: the initial margin (base score), used for every output.
     /// * `transform_fn`: optional prediction transform (identity if `None`).
     pub fn new(
@@ -96,6 +97,23 @@ impl Objective for CustomObjective {
         debug_assert_eq!(out.len(), preds.len());
         debug_assert!(weights.is_none_or(|w| w.len() == n_rows));
         (self.grad_fn)(preds, labels, weights, out);
+    }
+
+    /// Labels hold one value per row, or one per row and output: a label
+    /// matrix of another width is refused before the gradient closure sees
+    /// it.
+    fn validate_info(&self, info: &crate::data::MetaInfo) -> crate::error::Result<()> {
+        if info.n_targets != 1 && info.n_targets != self.n_outputs {
+            return Err(crate::error::HessboostError::invalid_param(
+                "objective",
+                format!(
+                    "custom objective `{}` has {} outputs; dataset has a {}-column label matrix \
+                     (one label per row or per output expected)",
+                    self.name, self.n_outputs, info.n_targets
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {

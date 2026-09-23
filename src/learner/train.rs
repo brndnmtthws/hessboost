@@ -527,6 +527,7 @@ fn train_impl_inner(
         for metric in &metrics {
             metric
                 .validate_info(&info)
+                .and_then(|()| check_prediction_width(metric.as_ref(), &info, n_out))
                 .map_err(|error| name_dataset(error, name))?;
         }
     }
@@ -1176,6 +1177,36 @@ fn name_dataset(error: HessboostError, dataset: &str) -> HessboostError {
         }
         other => other,
     }
+}
+
+/// Refuse a metric that reads a different number of predictions per row
+/// than the model's `n_out` outputs (XGBoost's "label and prediction size
+/// not match"): an elementwise metric on an alpha-list, multiclass, or
+/// distributional model, a multiclass metric on a single-output model, and
+/// so on. A metric of any width ([`Metric::prediction_width`] `None`, the
+/// custom-metric hook) needs a whole number of outputs per label column.
+///
+/// [`Metric::prediction_width`]: crate::metric::Metric::prediction_width
+fn check_prediction_width(
+    metric: &dyn crate::metric::Metric,
+    info: &MetaInfo,
+    n_out: usize,
+) -> Result<()> {
+    let reason = match metric.prediction_width(info) {
+        Some(width) if width != n_out => format!(
+            "metric `{}` reads {width} prediction(s) per row of dataset, but the model has \
+             {n_out} outputs",
+            metric.name()
+        ),
+        None if !n_out.is_multiple_of(info.n_targets.max(1)) => format!(
+            "metric `{}` needs a whole number of the model's {n_out} outputs per label \
+             column of dataset ({} columns)",
+            metric.name(),
+            info.n_targets
+        ),
+        _ => return Ok(()),
+    };
+    Err(HessboostError::invalid_param("eval_metric", reason))
 }
 
 /// Build one tree's column sampler, seeded from `rng`: the `colsample_bytree`
@@ -2546,6 +2577,126 @@ mod tests {
                 }
                 other => panic!("{metric}: expected a rejection, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn metrics_must_match_the_prediction_width() {
+        // Elementwise metrics read one prediction per label; on a model with
+        // more outputs than label columns they used to index past the
+        // labels and panic on the first evaluation.
+        let n = 30;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| 1.0 + (i % 3) as f32).collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let quantile = || {
+            TrainingParams::builder()
+                .objective("reg:quantileerror")
+                .quantile_alpha(vec![0.2, 0.8])
+        };
+        let expectile = || {
+            TrainingParams::builder()
+                .objective("reg:expectileerror")
+                .expectile_alpha(vec![0.3, 0.5, 0.7])
+        };
+        let normal = || TrainingParams::builder().objective("dist:normal");
+        let softprob = || {
+            TrainingParams::builder()
+                .objective("multi:softprob")
+                .num_class(4)
+        };
+        let run = |params: TrainingParams| {
+            train_with_eval(&params, &d, 2, &[(&d, "eval")], None).map(|r| r.history)
+        };
+        for (params, metric) in [
+            (quantile().eval_metric("rmse"), "rmse"),
+            (expectile().eval_metric("mae"), "mae"),
+            (normal().eval_metric("rmse"), "rmse"),
+            (softprob().eval_metric("rmse"), "rmse"),
+            (softprob().eval_metric("auc"), "auc"),
+            (quantile().eval_metric("logloss"), "logloss"),
+            (
+                TrainingParams::builder().eval_metric("mlogloss"),
+                "mlogloss",
+            ),
+        ] {
+            match run(params.build().unwrap()) {
+                Err(HessboostError::InvalidParameter { name, reason }) => {
+                    assert_eq!(name, "eval_metric");
+                    assert!(
+                        reason.contains(metric) && reason.contains("`eval`"),
+                        "{reason}"
+                    );
+                }
+                other => panic!("{metric}: expected a rejection, got {other:?}"),
+            }
+        }
+        // The defaults and matching metrics still evaluate.
+        for params in [
+            quantile(),
+            quantile().eval_metric("quantile"),
+            expectile(),
+            normal(),
+            normal().eval_metric("crps"),
+            softprob(),
+            softprob().eval_metric("merror"),
+        ] {
+            let history = run(params.build().unwrap()).unwrap();
+            assert!(
+                history[1].scores.iter().all(|s| s.2.is_finite()),
+                "{history:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_objective_outputs_must_match_the_label_layout() {
+        // A custom objective reads one label per row or one per output; a
+        // label matrix of another width used to reach its gradient closure
+        // (a debug assertion, silent misreads in release).
+        let n = 20;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..2 * n).map(|i| (i % 4) as f32).collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_label_matrix(&y, 2)
+            .unwrap();
+        let objective = |k: usize| {
+            crate::objective::CustomObjective::new("custom:k", k, 0.0, "rmse", |_p, _y, _w, out| {
+                for g in out.iter_mut() {
+                    *g = GradPair::new(0.1, 1.0);
+                }
+            })
+        };
+        let sums = || {
+            Box::new(crate::metric::CustomMetric::new(
+                "sum",
+                false,
+                |p, _y, _w| p.iter().map(|&v| f64::from(v)).sum(),
+            ))
+        };
+        let params = TrainingParams::builder().build().unwrap();
+        let run = |k: usize| {
+            train_impl(
+                &params,
+                &d,
+                1,
+                &[(&d, "eval")],
+                None,
+                &objective(k),
+                Some(sums()),
+                None,
+            )
+        };
+        assert!(run(2).is_ok());
+        for k in [1, 3] {
+            assert!(matches!(
+                run(k),
+                Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
+            ));
         }
     }
 

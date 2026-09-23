@@ -427,6 +427,11 @@ pub(super) fn permits(state: Option<&InteractionState>, feature: u32) -> bool {
 
 /// Sum the gradient pairs of `rows`, in row order. Shared by both builders'
 /// root-statistics accumulation.
+///
+/// Kept out of line: inlined into `HistTreeBuilder::build_inner`, LLVM kept
+/// the running sum in the caller's stack slot and paid a store-to-load round
+/// trip per row.
+#[inline(never)]
 pub(super) fn sum_rows(gpair: &[GradPair], rows: &[u32]) -> GradStats {
     let mut total = GradStats::default();
     for &r in rows {

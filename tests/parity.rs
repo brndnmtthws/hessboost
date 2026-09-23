@@ -1,4 +1,4 @@
-//! XGBoost 3.4.1 parity integration tests.
+//! XGBoost 3.4.2 parity integration tests.
 //!
 //! Fixtures come from `scripts/gen_fixtures.py` (real XGBoost, single thread) and
 //! follow the schema documented there. Two ignored tests consume them:
@@ -13,9 +13,9 @@
 //!   against `DMatrix.get_quantile_cut()` oracles in `fixtures/cuts/`.
 //!
 //! ```sh
-//! uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+//! uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
 //! cargo test -p hessboost --test parity --release -- --ignored --nocapture
-//! uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+//! uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 //! ```
 
 use hessboost::data::HistCuts;

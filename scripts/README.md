@@ -2,7 +2,7 @@
 
 ## Parity fixtures
 
-`gen_fixtures.py` trains **real XGBoost 3.4.1** (single thread) on deterministic
+`gen_fixtures.py` trains **real XGBoost 3.4.2** (single thread) on deterministic
 synthetic datasets, one case per supported feature (tree methods, missing values,
 constraints, every objective — including `reg:logistic` and the `reg:linear`
 alias — sample weights, ranking groups, gblinear, DART, intercept estimation;
@@ -35,13 +35,14 @@ unsupported XGBoost-JSON import/export path is visibly reported as
 parameters fail the test.
 
 ```sh
-uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
 cargo test --test parity --release -- --ignored --nocapture
-uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 
 Fixtures are not checked in; CI regenerates them (`.github/workflows/ci.yml`,
-job `parity`). The generator refuses any XGBoost version other than 3.4.1.
+job `parity`). The generator refuses any XGBoost version other than 3.4.2, pinned in
+`requirements-xgboost.txt` (a source build: 3.4.2 has no PyPI wheel).
 
 ## Criterion comparisons
 

@@ -28,9 +28,9 @@ XGBoost parity (needs uv; fixtures are generated into the gitignored
 `fixtures/`, never committed):
 
 ```sh
-uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
 cargo test --test parity --release -- --ignored --nocapture
-uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of these; tests run on x86_64 Linux,
@@ -80,9 +80,10 @@ suite; `docs/performance.md` records its results.
   the scalar path bit for bit; transcendental kernels stay within the
   tolerances in `simd/tests.rs`. Code for one architecture only compiles on
   it, so lint the other target explicitly.
-- **Parity:** the target is XGBoost 3.4.1 behavior. `exact`-tier fixtures
-  match pointwise; RNG-driven cases (subsampling, DART) only match within a
-  quality band because the RNG streams differ.
+- **Parity:** the target is XGBoost 3.4.2 behavior (numerically identical to
+  3.4.1). `exact`-tier fixtures match pointwise; RNG-driven cases
+  (subsampling, DART) only match within a quality band because the RNG
+  streams differ.
 - **Formats:** the native binary magic (`SQB\0`) and the JSON layouts are
   compatibility contracts; do not change them without a migration.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`

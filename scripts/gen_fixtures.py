@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate XGBoost 3.4.1 parity fixtures for hessboost.
+"""Generate XGBoost 3.4.2 parity fixtures for hessboost.
 
 Trains real XGBoost (single thread) on deterministic synthetic datasets, one
 case per supported feature, and writes `fixtures/<name>.json` holding the data,
@@ -16,7 +16,7 @@ Tiers:
            accuracy / NDCG@20 >= xgb - band. Import/export stay pointwise.
 
 Usage:
-    uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+    uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
 """
 
 from __future__ import annotations
@@ -28,6 +28,9 @@ import zlib
 
 import numpy as np
 import xgboost as xgb
+
+# The pinned release (scripts/requirements-xgboost.txt).
+XGBOOST_VERSION = "3.4.2"
 
 FIX_DIR = os.path.join(os.path.dirname(__file__), "..", "fixtures")
 
@@ -162,7 +165,7 @@ CASES = {
     # reg:logistic is binary:logistic's loss reported as a probability
     # regression (rmse); XGBoost saves the name as-is.
     "reg_logistic_d6": (y_binary, dict(objective="reg:logistic"), dict(tol_train=TOL_TRAIN_PROB)),
-    # Deprecated alias: XGBoost 3.4.1 trains it as reg:squarederror (with a
+    # Deprecated alias: XGBoost 3.4.2 trains it as reg:squarederror (with a
     # warning) and saves the model objective as reg:squarederror.
     "reg_linear_d6": (y_regression, dict(objective="reg:linear"), {}),
     "softprob_d4": (
@@ -474,8 +477,8 @@ def _clear_json(directory: str) -> None:
 
 
 def main() -> None:
-    if xgb.__version__ != "3.4.1":
-        raise SystemExit(f"fixtures target xgboost 3.4.1, found {xgb.__version__}")
+    if xgb.__version__ != XGBOOST_VERSION:
+        raise SystemExit(f"fixtures target xgboost {XGBOOST_VERSION}, found {xgb.__version__}")
     _clear_json(FIX_DIR)
     _clear_json(CUT_DIR)
     _clear_json(os.path.join(FIX_DIR, "exports"))

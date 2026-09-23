@@ -8,7 +8,7 @@ predicts the same `x_test` from `fixtures/<name>.json`, and requires
 max |delta| <= the fixture's `tol.import`.
 
 Usage:
-    uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+    uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 """
 
 from __future__ import annotations

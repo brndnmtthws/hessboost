@@ -12,7 +12,8 @@ gradient boosting with no C/C++ dependency and no FFI.
 Rust. It includes the regularized second-order boosting objective, exact,
 histogram, and approximate tree construction, the full objective and metric
 catalog, monotone and interaction constraints, categorical splits, DART and
-gblinear boosters, TreeSHAP, and numeric-tree XGBoost-format model interop with
+gblinear boosters, TreeSHAP, and XGBoost-format model interop (numeric and
+categorical trees) with
 multi-core (`rayon`) acceleration.
 
 Objective, metric, and parameter names mirror XGBoost, so configurations
@@ -21,7 +22,7 @@ transfer directly.
 > **Built with AI.** The implementation was generated with **Claude** (Anthropic's
 > AI coding assistant) under human direction and review. It is **AI-generated
 > code**: it is covered by unit, property, and doc tests plus CI-checked
-> XGBoost 3.4.1 parity, but it may still contain bugs, subtle numerical errors, or
+> XGBoost 3.4.2 parity, but it may still contain bugs, subtle numerical errors, or
 > wrong edge-case behavior. **Review and validate it for your own use case. It is
 > provided as-is, without warranty** (see [LICENSE](LICENSE)). Issue reports and
 > fixes are welcome.
@@ -105,7 +106,8 @@ Runnable, self-contained examples live in
   **interaction values** (`predict_interactions`), early stopping, feature
   importance (weight / gain / cover / totals), leaf-index and margin prediction.
 - **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
-  **XGBoost-format JSON model import/export** for numeric `gbtree` ensembles,
+  **XGBoost-format JSON model import/export** for `gbtree`/DART ensembles
+  with numeric and categorical splits,
   k-fold cross-validation,
   multi-core histogram construction, and runtime-detected SIMD kernels:
   **AArch64 NEON** for objective and metric kernels, prediction transforms,
@@ -165,7 +167,7 @@ cargo test                          # unit + integration tests
 cargo clippy --all-targets -- -D warnings
 ```
 
-Numerical parity with **XGBoost 3.4.1** is checked in CI by a fixture harness
+Numerical parity with **XGBoost 3.4.2** is checked in CI by a fixture harness
 (`scripts/gen_fixtures.py`, `tests/parity.rs`,
 `scripts/check_exports.py`). Each case is checked three ways: **train parity**
 (same data and parameters, compare predictions), **import parity**
@@ -179,10 +181,14 @@ import/export remains unsupported and is asserted explicitly. Histogram and
 approximate quantile cuts are compared bit-for-bit.
 
 ```sh
-uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
 cargo test --test parity --release -- --ignored --nocapture
-uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
+
+XGBoost 3.4.2 ships only as a source tarball (its release notes call it
+identical to 3.4.1 apart from Python 3.11 support), so uv builds it with CMake
+and a C++ compiler on first use.
 
 See `scripts/README.md` for the case matrix and tolerances.
 

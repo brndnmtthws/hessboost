@@ -1,10 +1,10 @@
-//! XGBoost-format (JSON) model import and export, targeting the XGBoost 3.4.1
-//! schema.
+//! XGBoost-format (JSON) model import and export, targeting the XGBoost 3.4.2
+//! schema (identical to 3.4.1's).
 //!
 //! XGBoost serializes a booster as a nested JSON document:
 //!
 //! ```text
-//! {"version": [3, 4, 1],
+//! {"version": [3, 4, 2],
 //!  "learner": {
 //!    "gradient_booster": {
 //!      "name": "gbtree",
@@ -19,20 +19,22 @@
 //! `split_conditions`, `default_left`, `base_weights`, `sum_hessian` and
 //! `loss_changes`. A node `i` is a **leaf** when `left_children[i] == -1`. Its
 //! weight is carried in `split_conditions[i]` (and, redundantly,
-//! `base_weights[i]`). Internal nodes route `x[split_indices[i]] <
+//! `base_weights[i]`). Numeric internal nodes route `x[split_indices[i]] <
 //! split_conditions[i]`, sending missing values in the `default_left[i]`
 //! direction, matching the exact semantics of [`crate::tree::RegTree`].
+//! Categorical internal nodes (`split_type[i] == 1`) carry their category set
+//! in the tree's `categories` / `categories_nodes` / `categories_segments` /
+//! `categories_sizes` arrays.
 //!
 //! # Scope and caveats
 //!
 //! Import targets a `gbtree` booster with a scalar or multiclass objective.
-//! XGBoost 3.4.1 saves `booster=dart` as `gbtree` plus a per-tree
+//! XGBoost saves `booster=dart` as `gbtree` plus a per-tree
 //! `model.weight_drop` array; those weights become the model's DART tree
 //! weights on import, and a model with non-unit tree weights writes them back
 //! as `weight_drop` on export. Other booster kinds (`gblinear`) yield a clear
-//! [`HessboostError::ModelFormat`]. Categorical splits, vector leaves
-//! (`size_leaf_vector > 1`) and non-numeric split types are not interpreted.
-//! Only numeric splits round-trip.
+//! [`HessboostError::ModelFormat`]. Numeric and categorical splits both
+//! round-trip in either direction.
 //!
 //! ## Tree layout (`tree_info`)
 //!
@@ -85,7 +87,7 @@ const INVALID_NODE: i32 = i32::MAX;
 /// The result is a pretty-printed JSON string equivalent to what
 /// `xgboost.Booster.save_model("m.json")` produces for a `gbtree` model
 /// (including DART tree weights as `weight_drop`), and is accepted by
-/// [`import_xgboost_json`] as well as upstream XGBoost 3.4.1. See the module
+/// [`import_xgboost_json`] as well as upstream XGBoost 3.4.2. See the module
 /// docs (above) for the `base_score` space convention.
 pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
     if model.linear().is_some() {
@@ -137,7 +139,7 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
     let base_score = format_base_score(model.base_scores(), &*objective_impl);
 
     let value = json!({
-        "version": [3, 4, 1],
+        "version": [3, 4, 2],
         "learner": {
             "attributes": {},
             "feature_names": [],
@@ -995,7 +997,7 @@ mod tests {
     fn export_writes_xgboost_3_learner_params() {
         let (model, _) = reg_model();
         let json: Value = serde_json::from_str(&export_xgboost_json(&model).unwrap()).unwrap();
-        assert_eq!(json["version"], json!([3, 4, 1]));
+        assert_eq!(json["version"], json!([3, 4, 2]));
         let lmp = &json["learner"]["learner_model_param"];
         assert_eq!(lmp["boost_from_average"], "0");
         assert_eq!(lmp["num_target"], "1");

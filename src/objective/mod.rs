@@ -48,6 +48,17 @@ impl GradPair {
     }
 }
 
+/// Reduced gradients a custom objective supplies for the *split search* of
+/// vector-leaf trees (see [`Objective::split_gradient`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitGradient {
+    /// Row-major `[row][target]` gradient pairs, `n_targets` per row.
+    pub gpair: Vec<GradPair>,
+    /// Split targets per row (at least `1`; usually far fewer than the
+    /// model's outputs).
+    pub n_targets: usize,
+}
+
 /// Rows per parallel gradient chunk. A multiple of every vector kernel's block
 /// (4 rows, and 4 values for any class count), so chunk boundaries fall where
 /// the kernels' block boundaries already are and every element is computed
@@ -274,6 +285,23 @@ pub trait Objective: Send + Sync {
     /// return `false`, and training then accepts datasets without labels.
     fn requires_labels(&self) -> bool {
         true
+    }
+
+    /// Reduced split gradients for vector-leaf trees (XGBoost 3.2+'s
+    /// `TreeObjective.split_grad`, the idea of `SketchBoost`).
+    ///
+    /// With `multi_strategy = multi_output_tree`, training calls this every
+    /// round (`iteration` counts from 0) with that round's full gradients
+    /// `gpair` (`[row][output]`, [`Objective::n_outputs`] pairs per row, row
+    /// weights applied). Returning `Some` grows the tree's structure — its
+    /// histograms, split search and internal weights — from the returned
+    /// (typically much narrower) gradients, while every leaf's weight vector
+    /// is still fit from `gpair` over the rows that reach it. `None`, the
+    /// default and what every built-in objective returns, grows the tree
+    /// from the full gradients. Training rejects a `Some` for the other
+    /// strategies and together with monotone constraints, as XGBoost does.
+    fn split_gradient(&self, _iteration: usize, _gpair: &[GradPair]) -> Option<SplitGradient> {
+        None
     }
 
     /// The default evaluation metric for this objective, as XGBoost's

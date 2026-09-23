@@ -4,8 +4,10 @@
 pub mod conformal;
 mod cv;
 pub(crate) mod model;
+mod multi_output;
 mod sampling;
 mod shap;
+mod shap_multi;
 mod train;
 
 pub use cv::{CvResult, cv};

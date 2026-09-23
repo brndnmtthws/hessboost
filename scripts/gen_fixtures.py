@@ -311,6 +311,69 @@ CASES = {
         dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
         dict(drop=("base_score",), weighted=True),
     ),
+    # multi_strategy=multi_output_tree: one vector-leaf tree per round shares
+    # its splits across all outputs (hist only).
+    "mot_reg3_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), {}),
+    "mot_reg3_nobs_lossguide_l15": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", grow_policy="lossguide", max_leaves=15, max_depth=0),
+        dict(drop=("base_score",)),
+    ),
+    "mot_reg3_missing_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), dict(missing=0.3)),
+    "mot_reg3_regularized_d4": (
+        y_multi_regression,
+        dict(
+            multi_strategy="multi_output_tree",
+            max_depth=4,
+            gamma=0.05,
+            min_child_weight=10,
+            reg_alpha=0.5,
+            reg_lambda=2.0,
+            max_delta_step=0.3,
+        ),
+        {},
+    ),
+    "mot_reg3_monotone_d6": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", monotone_constraints="(1,-1,0,0,0,0,0,0)"),
+        {},
+    ),
+    "mot_reg3_interaction_d6": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", interaction_constraints="[[0,1],[2,3,4],[5,6,7]]"),
+        {},
+    ),
+    "mot_reg3_categorical_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), dict(categorical=True)),
+    "mot_label_binary_d4": (
+        y_multi_label,
+        dict(objective="binary:logistic", multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "mot_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "mot_softmax_d4": (
+        y_multiclass,
+        dict(objective="multi:softmax", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
+        {},
+    ),
+    "mot_huber_weighted_d4": (
+        y_multi_heavy_tail,
+        dict(objective="reg:pseudohubererror", huber_slope=1.0, multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "mot_subsample_0p8_d6": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", subsample=0.8, colsample_bynode=0.8, seed=42),
+        dict(tier="quality"),
+    ),
+    "mot_dart_d4": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
+        dict(tier="quality"),
+    ),
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
     "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),
     "colsample_bytree_0p5_d6": (y_regression, dict(colsample_bytree=0.5, seed=42), dict(tier="quality")),

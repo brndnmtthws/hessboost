@@ -606,7 +606,11 @@ impl<'a> HistTreeBuilder<'a> {
 }
 
 /// Split `rows` (kept in order) into the rows routed left and right by `best`.
-fn partition_rows(ghist: &GHistIndex, rows: &[u32], best: &BestSplit) -> (Vec<u32>, Vec<u32>) {
+pub(super) fn partition_rows(
+    ghist: &GHistIndex,
+    rows: &[u32],
+    best: &BestSplit,
+) -> (Vec<u32>, Vec<u32>) {
     let cuts = ghist.cuts();
     let feature = best.feature as usize;
     if let (Some(columns), false) = (ghist.column_bins(), best.is_categorical) {

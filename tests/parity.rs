@@ -23,7 +23,7 @@
 use hessboost::data::HistCuts;
 use hessboost::prelude::{
     BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError, Monotone,
-    SamplingMethod, TrainingParams, TreeMethod, train,
+    MultiStrategy, SamplingMethod, TrainingParams, TreeMethod, train,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -225,6 +225,11 @@ fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
                 "approx" => TreeMethod::Approx,
                 "hist" => TreeMethod::Hist,
                 other => return Err(format!("tree_method `{other}` not mapped")),
+            }),
+            "multi_strategy" => b.multi_strategy(match str_of(k, v)? {
+                "one_output_per_tree" => MultiStrategy::OneOutputPerTree,
+                "multi_output_tree" => MultiStrategy::MultiOutputTree,
+                other => return Err(format!("multi_strategy `{other}` not mapped")),
             }),
             "grow_policy" => b.grow_policy(match str_of(k, v)? {
                 "depthwise" => GrowPolicy::DepthWise,

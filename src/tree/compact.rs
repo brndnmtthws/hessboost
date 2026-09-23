@@ -30,6 +30,10 @@
 //!
 //! Leaf ids are arena indices, and [`CompactForest::original_id`] maps them back
 //! to [`RegTree`] node ids for `predict_leaf`.
+//!
+//! A vector-leaf tree's leaves store, instead of their value's bits, the offset
+//! of their weight vector in a shared arena ([`CompactForest::accumulate_vector`]);
+//! the walk itself is unchanged.
 
 use crate::tree::RegTree;
 
@@ -96,7 +100,8 @@ struct CNode {
     /// Arena index of the child selected when the compare is false. The other
     /// child is `left + 1`. A leaf points at itself.
     left: u32,
-    /// Numeric node: `0`. Leaf: the leaf value's bits. Categorical:
+    /// Numeric node: `0`. Leaf: the leaf value's bits, or for a vector-leaf
+    /// tree the offset of its weight vector in `leaf_vectors`. Categorical:
     /// [`CATEGORICAL`], [`CAT_DEFAULT_LEFT`], and the set end.
     aux: u32,
 }
@@ -174,6 +179,8 @@ pub(crate) struct CompactForest {
     orig_id: Vec<u32>,
     /// Every tree's category pool, concatenated, so node ranges are absolute.
     categories: Vec<u32>,
+    /// Every vector-leaf tree's leaf weight vectors, concatenated.
+    leaf_vectors: Vec<f32>,
     trees: Vec<TreeMeta>,
 }
 
@@ -184,6 +191,7 @@ impl CompactForest {
             nodes: Vec::with_capacity(total),
             orig_id: Vec::with_capacity(total),
             categories: Vec::new(),
+            leaf_vectors: Vec::new(),
             trees: Vec::with_capacity(trees.len()),
         };
         for tree in trees {
@@ -232,11 +240,20 @@ impl CompactForest {
             let id = self.nodes.len() as u32;
             depth = depth.max(depth_of[old as usize]);
             let node = if n.is_leaf() {
+                let aux = if tree.is_vector_leaf() {
+                    let offset = u32::try_from(self.leaf_vectors.len())
+                        .expect("leaf vectors exceed the compact encoding");
+                    self.leaf_vectors
+                        .extend_from_slice(tree.leaf_vector(old as usize));
+                    offset
+                } else {
+                    n.leaf_value.to_bits()
+                };
                 CNode {
                     slot: 0,
                     key: LEAF_KEY,
                     left: id,
-                    aux: n.leaf_value.to_bits(),
+                    aux,
                 }
             } else if n.is_categorical {
                 has_categorical = true;
@@ -289,6 +306,13 @@ impl CompactForest {
             has_categorical,
             max_feature,
         });
+    }
+
+    /// Weight vector (`k` outputs) of vector-leaf arena node `id`.
+    #[inline]
+    pub(crate) fn leaf_vector(&self, id: u32, k: usize) -> &[f32] {
+        let offset = self.nodes[id as usize].aux as usize;
+        &self.leaf_vectors[offset..offset + k]
     }
 
     /// Leaf value of arena node `id` (must be a leaf).
@@ -537,6 +561,49 @@ impl CompactForest {
             unsafe {
                 *out.get_unchecked_mut(r * stride) +=
                     weight * f32::from_bits(nodes.get_unchecked(leaf as usize).aux);
+            }
+        });
+    }
+
+    /// `out[r * stride + j] += weight * leaf_vector(row r)[j]` for `j < k` in
+    /// vector-leaf tree `t`, over `rows` dense rows laid out as for
+    /// [`Self::accumulate`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn accumulate_vector(
+        &self,
+        t: usize,
+        lanes: &[u32],
+        tail: &[f32],
+        n_cols: usize,
+        rows: usize,
+        k: usize,
+        weight: f32,
+        out: &mut [f32],
+        stride: usize,
+    ) {
+        assert!(k <= stride && out.len() >= rows * stride);
+        self.walk_block(t, lanes, tail, n_cols, rows, |r, leaf| {
+            let dst = &mut out[r * stride..r * stride + k];
+            for (o, &w) in dst.iter_mut().zip(self.leaf_vector(leaf, k)) {
+                *o += weight * w;
+            }
+        });
+    }
+
+    /// `out[j] += weight(t) * leaf_vector(row, tree t)[j]` for the vector-leaf
+    /// trees `0..limit` of one dense `row` (`out` holds one value per output).
+    pub(crate) fn accumulate_row_vector(
+        &self,
+        row: &[f32],
+        limit: usize,
+        weight: impl Fn(usize) -> f32,
+        out: &mut [f32],
+    ) {
+        let k = out.len();
+        self.walk_row(row, limit, |t, leaf| {
+            let w = weight(t);
+            for (o, &v) in out.iter_mut().zip(self.leaf_vector(leaf, k)) {
+                *o += w * v;
             }
         });
     }

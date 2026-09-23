@@ -6,10 +6,12 @@
 
 mod exact;
 mod hist;
+mod multi;
 
 pub use exact::{ExactTreeBuilder, SortedColumns, all_features, all_rows};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
+pub(crate) use multi::{MultiTreeBuilder, VectorGradients};
 
 use std::collections::BTreeSet;
 

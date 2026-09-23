@@ -284,9 +284,27 @@ impl BoostedModel {
         self.n_targets
     }
 
-    /// Number of boosting rounds (`num_trees / n_outputs`).
+    /// Number of boosting rounds (`num_trees / n_outputs`, or `num_trees` for
+    /// a vector-leaf model).
     pub fn num_boost_rounds(&self) -> usize {
-        self.trees.len() / self.n_outputs()
+        self.trees.len() / self.trees_per_round()
+    }
+
+    /// Whether the ensemble consists of vector-leaf trees
+    /// (`multi_strategy = multi_output_tree`): each tree predicts every
+    /// output at once instead of one output per tree.
+    pub fn has_vector_leaves(&self) -> bool {
+        self.trees.first().is_some_and(RegTree::is_vector_leaf)
+    }
+
+    /// Trees grown per boosting round: one per output, or a single
+    /// vector-leaf tree.
+    pub(crate) fn trees_per_round(&self) -> usize {
+        if self.has_vector_leaves() {
+            1
+        } else {
+            self.n_outputs()
+        }
     }
 
     /// The first output's intercept (global bias) in margin space.
@@ -312,11 +330,11 @@ impl BoostedModel {
         self.best_iteration
     }
 
-    /// Number of trees to use at prediction time: `(best_iteration + 1) ×
-    /// n_outputs` when early stopping selected one, else all trees.
+    /// Number of trees to use at prediction time: `(best_iteration + 1) ×`
+    /// trees per round when early stopping selected one, else all trees.
     pub(crate) fn effective_ntrees(&self) -> usize {
         match self.best_iteration {
-            Some(it) => (it + 1) * self.n_outputs(),
+            Some(it) => (it + 1) * self.trees_per_round(),
             None => self.trees.len(),
         }
     }
@@ -329,7 +347,7 @@ impl BoostedModel {
 
     /// Raw margin predictions using only the first `ntree_limit` trees
     /// (`0` = all trees, ignoring early stopping). Tree `t` contributes to
-    /// output `t % n_outputs`.
+    /// output `t % n_outputs`, or to every output for a vector-leaf model.
     pub fn predict_margin_limited(&self, data: &DMatrix, ntree_limit: usize) -> Result<Vec<f32>> {
         self.validate_prediction_data(data)?;
         Ok(self.predict_margin_limited_unchecked(data, ntree_limit))
@@ -371,10 +389,11 @@ impl BoostedModel {
     }
 
     /// Sum `weight(t) * leaf(row, t)` into `out[row * k + t % k]` for trees
-    /// `0..limit`, where `k` is the output count. Rows are traversed in
-    /// cache-friendly blocks (parallel across blocks); per (row, output) slot
-    /// the trees are still summed in ascending order, so the result is
-    /// bit-identical to the sequential tree-outer loop.
+    /// `0..limit`, where `k` is the output count (a vector-leaf tree's leaf
+    /// adds into all `k` slots). Rows are traversed in cache-friendly blocks
+    /// (parallel across blocks); per (row, output) slot the trees are still
+    /// summed in ascending order, so the result is bit-identical to the
+    /// sequential tree-outer loop.
     fn accumulate_forest(
         &self,
         data: &DMatrix,
@@ -383,6 +402,21 @@ impl BoostedModel {
         weight: impl Fn(usize) -> f32 + Sync,
     ) {
         let k = self.n_outputs();
+        if self.has_vector_leaves() {
+            self.traverse_blocks(
+                data,
+                out,
+                k,
+                limit,
+                |block, forest, r, out_row| {
+                    block.accumulate_row_vector(forest, r, limit, &weight, out_row);
+                },
+                |block, forest, ti, rows, out_block, stride| {
+                    block.accumulate_vector(forest, ti, rows, weight(ti), out_block, stride);
+                },
+            );
+            return;
+        }
         self.traverse_blocks(
             data,
             out,
@@ -692,10 +726,15 @@ impl BoostedModel {
                 "model has an invalid feature count".to_string(),
             ));
         }
+        let vector = self.has_vector_leaves();
         if self.n_outputs == 0
             || self.n_targets == 0
             || (self.num_class >= 2 && self.n_outputs != self.num_class)
-            || !self.trees.len().is_multiple_of(self.n_outputs)
+            || !self.trees.len().is_multiple_of(self.trees_per_round())
+            || self.trees.iter().any(|tree| {
+                tree.is_vector_leaf() != vector
+                    || (vector && tree.size_leaf_vector() != self.n_outputs)
+            })
         {
             return Err(HessboostError::ModelFormat(format!(
                 "invalid output layout: {} outputs, num_class {}, {} trees",
@@ -1077,6 +1116,30 @@ impl<'a> RowBlock<'a> {
         }
     }
 
+    /// `out[j] += weight(t) * leaf_vector(row r, tree t)[j]` for the
+    /// vector-leaf trees `0..limit` of loaded row `r`.
+    fn accumulate_row_vector(
+        &self,
+        forest: &CompactForest,
+        r: usize,
+        limit: usize,
+        weight: impl Fn(usize) -> f32,
+        out: &mut [f32],
+    ) {
+        if let Some(row) = self.row(r) {
+            forest.accumulate_row_vector(row, limit, weight, out);
+        } else {
+            let k = out.len();
+            for t in 0..limit {
+                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                let w = weight(t);
+                for (o, &v) in out.iter_mut().zip(forest.leaf_vector(leaf, k)) {
+                    *o += w * v;
+                }
+            }
+        }
+    }
+
     /// The loaded rows for the batch kernel: the full [`LANES`]-row groups in
     /// lane-major layout plus the remaining rows row-major (see
     /// [`CompactForest::accumulate`]), or `None` for wide sparse blocks.
@@ -1120,6 +1183,30 @@ impl<'a> RowBlock<'a> {
             for r in 0..rows {
                 let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
                 out[r * stride] = forest.original_id(leaf);
+            }
+        }
+    }
+
+    /// `out[r * stride + j] += weight * leaf_vector(row r)[j]` (all `stride`
+    /// outputs) in vector-leaf tree `t` over the loaded rows.
+    fn accumulate_vector(
+        &self,
+        forest: &CompactForest,
+        t: usize,
+        rows: usize,
+        weight: f32,
+        out: &mut [f32],
+        stride: usize,
+    ) {
+        if let Some((lanes, tail, n_cols)) = self.lane_block(rows) {
+            forest.accumulate_vector(t, lanes, tail, n_cols, rows, stride, weight, out, stride);
+        } else {
+            for r in 0..rows {
+                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+                let dst = &mut out[r * stride..(r + 1) * stride];
+                for (o, &v) in dst.iter_mut().zip(forest.leaf_vector(leaf, stride)) {
+                    *o += weight * v;
+                }
             }
         }
     }

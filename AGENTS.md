@@ -53,15 +53,15 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
+| `tree/` | `RegTree` (scalar or vector leaves), split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,multi}` (`multi`: vector-leaf hist trees for `multi_output_tree`), `hist/` accumulation, `compact` (prediction layout) |
 | `booster/` | `gblinear` |
-| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `sampling` (gradient-based/MVS row sampling per tree), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
+| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based/MVS row sampling per tree), `BoostedModel`, cv, TreeSHAP (`shap_multi`: vector leaves as per-output scalar views), `conformal` (split-conformal / CQR intervals) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
 `tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
 (proptest), `shap_accumulation.rs`, `sampling.rs` (row/column sampling
-contracts), `target_stats.rs`. `benches/training.rs` is the Criterion
+contracts), `target_stats.rs`, `multi_output.rs` (vector-leaf trees). `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -90,7 +90,8 @@ suite; `docs/performance.md` records its results.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`
   values; `multi:softprob` gives `n_rows * num_class` and a multi-target
   model (label matrix) `n_rows * n_targets`, both row-major
-  `[row][output]`; multi-target `predict_class` thresholds every target
+  `[row][output]` (also for vector-leaf models, whose every tree feeds all
+  outputs; one tree per round, `tree_info` all 0 in XGBoost JSON); multi-target `predict_class` thresholds every target
   (`[row][target]`). SHAP
   contributions are `[row][n_features + 1]` (bias last), interactions
   `[row][(n_features + 1)^2]`, with an extra output axis for multiclass and
@@ -132,7 +133,9 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 
 Multiclass objectives need `.num_class(k)`; ranking objectives need
 `.with_group_sizes`; multi-target training takes `.with_label_matrix(y, k)`
-and gives `k` outputs (`multi_strategy = one_output_per_tree`).
+and gives `k` outputs (`multi_strategy = one_output_per_tree`, or one
+vector-leaf tree per round with `multi_output_tree`; custom objectives can
+supply reduced split gradients via `Objective::split_gradient`).
 
 ## Not implemented
 

@@ -586,6 +586,9 @@ impl BoostedModel {
     /// of the `n_features + 1` values equals the raw margin from
     /// [`BoostedModel::predict_margin`].
     pub fn predict_contribs(&self, data: &DMatrix) -> Result<Vec<f32>> {
+        if self.has_vector_leaves() {
+            return self.vector_leaf_shap_model().predict_contribs(data);
+        }
         let pro = self.attribution_prologue(data)?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
@@ -660,7 +663,7 @@ impl BoostedModel {
     /// `n_rows × n_outputs × (n_features + 1)^2`, row-major: the matrix for row
     /// `r`, output `c` occupies the `(n_features + 1)^2` values starting at
     /// `(r * n_outputs + c) * (n_features + 1)^2`. Tree `t` contributes to output
-    /// `t % n_outputs`.
+    /// `t % n_outputs` (a vector-leaf tree to every output).
     #[allow(clippy::needless_range_loop)]
     pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
         // Per-thread scratch: unconditioned contributions, condition = +1
@@ -678,6 +681,9 @@ impl BoostedModel {
             arena: Vec<PathElement>,
         }
 
+        if self.has_vector_leaves() {
+            return self.vector_leaf_shap_model().predict_interactions(data);
+        }
         let pro = self.attribution_prologue(data)?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;

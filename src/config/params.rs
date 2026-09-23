@@ -109,7 +109,9 @@ pub enum MultiStrategy {
     /// One tree per output each round. XGBoost default.
     #[default]
     OneOutputPerTree,
-    /// One tree per round whose leaves hold a vector of all outputs.
+    /// One tree per round whose leaves hold a vector of all outputs
+    /// (vector-leaf trees; `tree_method = hist` only). With a single output
+    /// it trains scalar trees, like XGBoost.
     MultiOutputTree,
 }
 

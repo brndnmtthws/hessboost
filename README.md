@@ -122,9 +122,8 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `with_label_matrix`), instance and group weights, `base_margin`, query
   groups, label bounds for censored targets (`with_label_bounds`), feature
   types, and per-feature column-sampling weights (`with_feature_weights`).
-  Training rejects the not-yet-implemented `num_parallel_tree > 1`,
-  `multi_strategy = multi_output_tree`, and `process_type = update` instead
-  of ignoring them.
+  Training rejects the not-yet-implemented `num_parallel_tree > 1` and
+  `process_type = update` instead of ignoring them.
 - **Multi-target labels:** `reg:squarederror`, `reg:pseudohubererror`,
   `reg:logistic`, and `binary:logistic` (multi-label) train on a label matrix
   like XGBoost's default `one_output_per_tree` strategy: one tree per target
@@ -133,6 +132,20 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   Elementwise metrics average over every row and target (row weights
   repeated per target); `auc`/`aucpr` macro-average the targets. Other
   objectives and the ranking/multiclass metrics reject label matrices.
+- **Vector-leaf trees:** `multi_strategy = multi_output_tree` (`tree_method =
+  hist`) grows one tree per round whose leaves hold a weight per output, for
+  every multi-output objective (label matrices, `multi:softprob`/`softmax`,
+  custom objectives), with XGBoost 3.4.2's vector split gain (target-summed
+  scores, `min_child_weight` on the mean Hessian), depthwise and lossguide
+  growth, missing values, categorical partition splits, monotone (pooled
+  weights) and interaction constraints, row/column sampling, and DART.
+  Custom objectives may grow the tree structure from **reduced split
+  gradients** (`Objective::split_gradient` /
+  `CustomObjective::with_split_gradient`, XGBoost's `TreeObjective.split_grad`
+  / SketchBoost) while leaves are refit from the full gradients. Vector-leaf
+  models predict, explain (TreeSHAP contributions and interactions per
+  output), report feature importance, and round-trip XGBoost's
+  `MultiTargetTree` JSON/UBJSON layout (`size_leaf_vector`, `leaf_weights`).
 - **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
   `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
   **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for

@@ -16,7 +16,13 @@ columns: the `multi_*` cases (3-target `reg:squarederror` on hist and exact,
 multi-label `binary:logistic` with and without `scale_pos_weight`, weighted
 2-target `reg:pseudohubererror`) store `y_train`/`y_test` row-major
 `[row][target]`, and their predictions, margins, and contributions carry the
-target axis.
+target axis. The `mot_*` cases train `multi_strategy=multi_output_tree`
+(vector-leaf trees): 3-target `reg:squarederror` depthwise, lossguide,
+with missing values, regularized (`gamma`, `min_child_weight`, `reg_alpha`,
+`max_delta_step`), monotone, interaction-constrained and categorical;
+multi-label `binary:logistic`; `multi:softprob` / `multi:softmax`; weighted
+`reg:pseudohubererror`; plus quality-tier subsampling and DART. Their
+imported contributions exercise vector-leaf TreeSHAP.
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 

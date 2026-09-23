@@ -1,14 +1,15 @@
 //! The gradient-boosting training loop.
 
 use crate::config::{
-    BoosterKind, GrowPolicy, MultiStrategy, ObjectiveParams, ProcessType, SamplingMethod,
-    TrainingParams, TreeMethod,
+    BoosterKind, GrowPolicy, ObjectiveParams, ProcessType, SamplingMethod, TrainingParams,
+    TreeMethod,
 };
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::learner::model::{BoostedModel, ModelSpec};
+use crate::learner::multi_output;
 use crate::learner::sampling::gradient_based_sample;
 use crate::metric::create_metrics;
 use crate::objective::{GradPair, create_objective};
@@ -267,6 +268,7 @@ fn train_impl_inner(
 ) -> Result<TrainResult> {
     params.validate()?;
     reject_unimplemented(params)?;
+    multi_output::validate(params)?;
 
     if !params.missing.is_nan() {
         return Err(HessboostError::invalid_param(
@@ -408,6 +410,13 @@ fn train_impl_inner(
     }
 
     let prepared = prepare_builder(params, dtrain, objective.const_hess())?;
+    // `multi_strategy = multi_output_tree` grows one vector-leaf tree per
+    // round when there is more than one output (XGBoost's `IsVectorLeaf`
+    // with a single output still builds scalar trees).
+    let vector_leaf = match &prepared {
+        Prepared::Hist(ghist) if multi_output::vector_leaf(params, n_out) => Some(ghist),
+        _ => None,
+    };
 
     // Incremental margin caches (length rows × n_out). A dataset's per-instance
     // `base_margin`, when present, overrides the per-output intercepts.
@@ -457,7 +466,23 @@ fn train_impl_inner(
     let is_dart = params.booster == BoosterKind::Dart;
 
     for round in 0..num_boost_round {
-        if is_dart {
+        if let Some(ghist) = vector_leaf {
+            multi_output::boost_round(
+                &multi_output::VectorRound {
+                    params,
+                    dtrain,
+                    ghist,
+                    objective,
+                    info: &info,
+                    evals,
+                },
+                &mut model,
+                round,
+                &mut train_margin,
+                &mut eval_margins,
+                &mut gpair,
+            )?;
+        } else if is_dart {
             dart_round(
                 &mut model,
                 params,
@@ -471,7 +496,7 @@ fn train_impl_inner(
                 round,
                 &mut gpair,
                 &mut gpair_k,
-            );
+            )?;
             // DART rescales earlier trees' weights each round, so the cached
             // Eval margins are no longer additive. Recompute them from the
             // (weighted) ensemble.
@@ -481,6 +506,7 @@ fn train_impl_inner(
         } else {
             // 1. Gradients from the current margins (all outputs at once).
             objective.gradient_info(&train_margin, &info, &mut gpair);
+            multi_output::reject_split_gradient(objective, round, &gpair)?;
 
             // 2. Row subsampling is shared across the round's per-output trees.
             let mut rng = round_rng(params, round, 0);
@@ -598,9 +624,6 @@ fn reject_unimplemented(params: &TrainingParams) -> Result<()> {
     if params.num_parallel_tree != 1 {
         return unsupported("num_parallel_tree", "a value other than 1");
     }
-    if params.multi_strategy != MultiStrategy::OneOutputPerTree {
-        return unsupported("multi_strategy", "`multi_output_tree`");
-    }
     if params.process_type != ProcessType::Default {
         return unsupported("process_type", "`update`");
     }
@@ -690,10 +713,53 @@ fn dart_round(
     round: usize,
     gpair: &mut [GradPair],
     gpair_k: &mut [GradPair],
-) {
-    let mut rng = round_rng(params, round, 0x0DA27);
+) -> Result<()> {
+    let mut rng = round_rng(params, round, DART_SALT);
 
     // 1. Select the dropout set over the trees built so far.
+    let (dropped, drop_indices) = select_dropout(model, params, &mut rng);
+
+    // 2. Gradients from the ensemble minus the dropout set.
+    let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
+    objective.gradient_info(&margin_excl, info, gpair);
+    multi_output::reject_split_gradient(objective, round, gpair)?;
+
+    // 3. Fit one new tree per output on those gradients.
+    let row_subset = sample_rows(n, params, &mut rng);
+    let new_weight = dart_new_tree_weight(&drop_indices, params);
+    for kk in 0..n_out {
+        let tree = fit_output_tree(
+            params,
+            prepared,
+            dtrain,
+            gpair,
+            gpair_k,
+            &mut rng,
+            n_out,
+            kk,
+            &row_subset,
+            n_features,
+        );
+        model.push_tree_weighted(tree, new_weight);
+    }
+
+    // 4. Rescale the dropped trees so the ensemble stays balanced.
+    rescale_dropped(model, &drop_indices, params);
+    Ok(())
+}
+
+/// The DART round RNG's booster salt.
+pub(super) const DART_SALT: u64 = 0x0DA27;
+
+/// Draw a DART round's dropout set over the trees built so far: skipped with
+/// probability `skip_drop`, otherwise each tree independently with
+/// probability `rate_drop`, and at least one tree when any exist (as
+/// XGBoost). Returns the per-tree mask and the dropped indices.
+pub(super) fn select_dropout(
+    model: &BoostedModel,
+    params: &TrainingParams,
+    rng: &mut StdRng,
+) -> (Vec<bool>, Vec<usize>) {
     let existing = model.num_trees();
     let mut dropped = vec![false; existing];
     let mut drop_indices: Vec<usize> = Vec::new();
@@ -712,39 +778,30 @@ fn dart_round(
             drop_indices.push(i);
         }
     }
+    (dropped, drop_indices)
+}
+
+/// XGBoost's `tree` normalization weight of a DART round's new trees:
+/// `1 / (k + eta)` for `k` dropped trees, `1` when none were dropped.
+pub(super) fn dart_new_tree_weight(drop_indices: &[usize], params: &TrainingParams) -> f32 {
     let k = drop_indices.len();
-
-    // 2. Gradients from the ensemble minus the dropout set.
-    let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
-    objective.gradient_info(&margin_excl, info, gpair);
-
-    // 3. Fit one new tree per output on those gradients.
-    let row_subset = sample_rows(n, params, &mut rng);
-    let eta = params.eta as f32;
-    let new_weight = if k == 0 { 1.0 } else { 1.0 / (k as f32 + eta) };
-    for kk in 0..n_out {
-        let tree = fit_output_tree(
-            params,
-            prepared,
-            dtrain,
-            gpair,
-            gpair_k,
-            &mut rng,
-            n_out,
-            kk,
-            &row_subset,
-            n_features,
-        );
-        model.push_tree_weighted(tree, new_weight);
-    }
-
-    // 4. Rescale the dropped trees so the ensemble stays balanced.
-    let factor = if k == 0 {
+    if k == 0 {
         1.0
     } else {
-        k as f32 / (k as f32 + eta)
-    };
-    for &i in &drop_indices {
+        1.0 / (k as f32 + params.eta as f32)
+    }
+}
+
+/// Rescale a DART round's dropped trees by `k / (k + eta)` so the ensemble
+/// stays balanced.
+pub(super) fn rescale_dropped(
+    model: &mut BoostedModel,
+    drop_indices: &[usize],
+    params: &TrainingParams,
+) {
+    let k = drop_indices.len() as f32;
+    let factor = k / (k + params.eta as f32);
+    for &i in drop_indices {
         model.scale_tree_weight(i, factor);
     }
 }
@@ -772,7 +829,7 @@ fn gather_output<'a>(
 /// The RNG for one boosting round: `seed ^ round * 0x9E37_79B9`, plus a
 /// booster-specific `salt` (`0` for gbtree, `0x0DA27` for DART) so the two
 /// boosters draw from different streams.
-fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
+pub(super) fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
     StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ salt)
 }
 
@@ -815,7 +872,7 @@ fn fit_output_tree(
 /// matching XGBoost's default sampling method. Guarantees at least one row.
 /// Gradient-based sampling keeps every row here; it samples each tree's
 /// gradients in [`fit_output_tree`] instead.
-fn sample_rows(n: usize, params: &TrainingParams, rng: &mut StdRng) -> Vec<u32> {
+pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut StdRng) -> Vec<u32> {
     let subsample = params.subsample;
     if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
@@ -830,7 +887,7 @@ fn sample_rows(n: usize, params: &TrainingParams, rng: &mut StdRng) -> Vec<u32> 
 }
 
 /// Whether trees are grown on gradient-based (MVS) row samples.
-fn gradient_sampling(params: &TrainingParams) -> bool {
+pub(super) fn gradient_sampling(params: &TrainingParams) -> bool {
     params.sampling_method == SamplingMethod::GradientBased && params.subsample < 1.0
 }
 
@@ -914,7 +971,7 @@ fn name_dataset(error: HessboostError, dataset: &str) -> HessboostError {
 /// Build one tree's column sampler, seeded from `rng`: the `colsample_bytree`
 /// pool, then the `bylevel`/`bynode` draws, weighted by the training matrix's
 /// feature weights when it has them.
-fn make_column_sampler(
+pub(super) fn make_column_sampler(
     n_features: usize,
     feature_weights: Option<&[f32]>,
     params: &TrainingParams,
@@ -1978,12 +2035,6 @@ mod tests {
             (
                 "num_parallel_tree",
                 base().num_parallel_tree(2).build_unchecked(),
-            ),
-            (
-                "multi_strategy",
-                base()
-                    .multi_strategy(MultiStrategy::MultiOutputTree)
-                    .build_unchecked(),
             ),
             (
                 "process_type",

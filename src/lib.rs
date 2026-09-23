@@ -119,5 +119,5 @@ pub mod prelude {
         train_with_eval, train_with_objective,
     };
     pub use crate::metric::{CustomMetric, Metric};
-    pub use crate::objective::{CustomObjective, GradPair, Objective};
+    pub use crate::objective::{CustomObjective, GradPair, Objective, SplitGradient};
 }

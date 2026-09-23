@@ -1,6 +1,6 @@
 //! Scalar formulas shared by dispatch fallbacks and NEON tails.
 
-use super::{sigmoid_scalar, LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION};
+use super::{LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION, sigmoid_scalar};
 use crate::objective::GradPair;
 
 pub(super) fn logistic_gradient(
@@ -89,8 +89,8 @@ pub(super) fn distance_sum<const SQUARED: bool>(
     let mut sum = 0.0;
     let mut weight_sum = 0.0;
     for index in range {
-        let weight = weights.map_or(1.0, |values| values[index] as f64);
-        let difference = preds[index] as f64 - labels[index] as f64;
+        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+        let difference = f64::from(preds[index]) - f64::from(labels[index]);
         let distance = if SQUARED {
             difference * difference
         } else {
@@ -111,7 +111,7 @@ pub(super) fn classification_error_sum(
     let mut wrong = 0.0;
     let mut weight_sum = 0.0;
     for index in range {
-        let weight = weights.map_or(1.0, |values| values[index] as f64);
+        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
         if (preds[index] > 0.5) != (labels[index] > 0.5) {
             wrong += weight;
         }
@@ -129,9 +129,9 @@ pub(super) fn log_loss(
     let mut loss = 0.0;
     let mut weight_sum = 0.0;
     for index in range {
-        let weight = weights.map_or(1.0, |values| values[index] as f64);
-        let probability = (preds[index] as f64).clamp(LOG_LOSS_EPSILON, 1.0 - LOG_LOSS_EPSILON);
-        let label = labels[index] as f64;
+        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+        let probability = f64::from(preds[index]).clamp(LOG_LOSS_EPSILON, 1.0 - LOG_LOSS_EPSILON);
+        let label = f64::from(labels[index]);
         loss += weight * -(label * probability.ln() + (1.0 - label) * (1.0 - probability).ln());
         weight_sum += weight;
     }
@@ -147,9 +147,9 @@ pub(super) fn positive_nloglik<const GAMMA: bool>(
     let mut loss = 0.0;
     let mut weight_sum = 0.0;
     for index in range {
-        let weight = weights.map_or(1.0, |values| values[index] as f64);
-        let prediction = (preds[index] as f64).max(MIN_POSITIVE_PREDICTION);
-        let label = labels[index] as f64;
+        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+        let prediction = f64::from(preds[index]).max(MIN_POSITIVE_PREDICTION);
+        let label = f64::from(labels[index]);
         loss += weight
             * if GAMMA {
                 label / prediction + prediction.ln()

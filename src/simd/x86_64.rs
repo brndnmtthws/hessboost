@@ -1,8 +1,12 @@
 //! AVX2/FMA kernels for x86-64. The transcendental kernels mirror the NEON
 //! formulas and stay within a few f32 ULPs of the scalar library functions.
 
-use super::{scalar, sigmoid_scalar, MAX_FAST_EXP_INPUT};
+use super::{MAX_FAST_EXP_INPUT, scalar, sigmoid_scalar};
 use crate::objective::GradPair;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "intrinsic modules are used wholesale"
+)]
 use std::arch::x86_64::*;
 
 /// f32 lanes per vector.
@@ -252,10 +256,10 @@ unsafe fn short_softmax_batch<const K: usize, const GRADIENT: bool>(
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn short_softmax_rows<const K: usize>(values: &mut [f32]) {
     // SAFETY: the caller guarantees AVX2/FMA support and K in {2, 4};
-    // `chunks_exact_mut` bounds every vector access to complete rows.
+    // `as_chunks_mut` bounds every vector access to complete rows.
     unsafe {
-        let mut batches = values.chunks_exact_mut(WIDTH);
-        for batch in &mut batches {
+        let (batches, remainder) = values.as_chunks_mut::<WIDTH>();
+        for batch in batches {
             match short_softmax_batch::<K, false>(batch.as_ptr()) {
                 Some(probabilities) => _mm256_storeu_ps(batch.as_mut_ptr(), probabilities),
                 None => {
@@ -265,7 +269,7 @@ pub(super) unsafe fn short_softmax_rows<const K: usize>(values: &mut [f32]) {
                 }
             }
         }
-        for row in batches.into_remainder().chunks_mut(K) {
+        for row in remainder.chunks_mut(K) {
             super::softmax_scalar(row);
         }
     }
@@ -275,6 +279,10 @@ pub(super) unsafe fn short_softmax_rows<const K: usize>(values: &mut [f32]) {
 /// in a batch across their `K` lanes.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "_mm_load_sd has no alignment requirement"
+)]
 unsafe fn broadcast_rows<const K: usize>(values: *const f32) -> __m256 {
     // SAFETY: the caller guarantees AVX2 support and `WIDTH / K` readable
     // values.

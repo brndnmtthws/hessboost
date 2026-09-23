@@ -98,7 +98,7 @@ pub(crate) fn rowwise_gradient<K>(
         );
     };
     let chunk_values = GRADIENT_CHUNK_ROWS * n_outputs;
-    if out.len() % chunk_values == 0 {
+    if out.len().is_multiple_of(chunk_values) {
         out.par_chunks_mut(chunk_values)
             .enumerate()
             .for_each(|(index, out)| run_chunk(index * GRADIENT_CHUNK_ROWS, out));
@@ -249,8 +249,8 @@ pub(crate) fn newton_intercepts<O: Objective + ?Sized>(
     let mut sum_hess = vec![0.0f64; k];
     for row in gpair.chunks_exact(k) {
         for (c, gp) in row.iter().enumerate() {
-            sum_grad[c] += gp.grad as f64;
-            sum_hess[c] += gp.hess as f64;
+            sum_grad[c] += f64::from(gp.grad);
+            sum_hess[c] += f64::from(gp.hess);
         }
     }
     let mut out: Vec<f32> = sum_grad
@@ -273,12 +273,12 @@ pub(crate) fn newton_intercepts<O: Objective + ?Sized>(
 pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f32 {
     let mean = match weights {
         Some(w) => {
-            let sum_w: f64 = w.iter().map(|&wi| wi as f64).sum();
+            let sum_w: f64 = w.iter().map(|&wi| f64::from(wi)).sum();
             if sum_w > 0.0 {
                 labels
                     .iter()
                     .zip(w)
-                    .map(|(&y, &wi)| y as f64 / sum_w * wi as f64)
+                    .map(|(&y, &wi)| f64::from(y) / sum_w * f64::from(wi))
                     .sum()
             } else {
                 0.0
@@ -287,7 +287,7 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
         None if labels.is_empty() => 0.0,
         None => {
             let n = labels.len() as f64;
-            labels.iter().map(|&y| y as f64 / n).sum()
+            labels.iter().map(|&y| f64::from(y) / n).sum()
         }
     };
     mean as f32

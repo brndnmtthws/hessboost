@@ -5,14 +5,14 @@ use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::Result;
 use crate::objective::create_objective;
-use crate::tree::compact::{key, CompactForest, FEATURE_LANES, LANES};
 use crate::tree::RegTree;
+use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, key};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-// Inherited from sequoia-boost ("SQB") and kept so its native blobs still load.
+// Native binary format marker; changing it breaks loading existing models.
 const NATIVE_MAGIC: &[u8; 4] = b"SQB\0";
 const NATIVE_VERSION: u8 = 1;
 
@@ -187,7 +187,7 @@ impl BoostedModel {
         let k = self.n_outputs();
         for_each_present_value(data, row, |feat, x| {
             for c in 0..k {
-                f(feat, c, lm.weights[feat * k + c] as f64 * x as f64);
+                f(feat, c, f64::from(lm.weights[feat * k + c]) * f64::from(x));
             }
         });
     }
@@ -480,6 +480,10 @@ impl BoostedModel {
     }
 
     /// Per-row leaf indices for each tree (shape `n_rows × num_trees`, row-major).
+    #[allow(
+        clippy::redundant_closure_for_method_calls,
+        reason = "the method path is not general enough over the block lifetime"
+    )]
     pub fn predict_leaf(&self, data: &DMatrix) -> Result<Vec<u32>> {
         self.validate_prediction_data(data)?;
         let n = data.n_rows();
@@ -513,8 +517,8 @@ impl BoostedModel {
                     continue;
                 }
                 *count.entry(node.split_feature).or_default() += 1.0;
-                *cover.entry(node.split_feature).or_default() += node.sum_hess as f64;
-                *gain.entry(node.split_feature).or_default() += node.split_gain as f64;
+                *cover.entry(node.split_feature).or_default() += f64::from(node.sum_hess);
+                *gain.entry(node.split_feature).or_default() += f64::from(node.split_gain);
             }
         }
         // Divide a total by the split count to get the per-split average.
@@ -603,14 +607,15 @@ impl BoostedModel {
         }
         let n = data.n_rows();
         let k = self.n_outputs();
-        if let Some(margin) = data.base_margin() {
-            if margin.len() != n && margin.len() != n * k {
-                return Err(crate::error::HessboostError::DimensionMismatch {
-                    what: "prediction base_margin length",
-                    expected: n * k,
-                    got: margin.len(),
-                });
-            }
+        if let Some(margin) = data.base_margin()
+            && margin.len() != n
+            && margin.len() != n * k
+        {
+            return Err(crate::error::HessboostError::DimensionMismatch {
+                what: "prediction base_margin length",
+                expected: n * k,
+                got: margin.len(),
+            });
         }
         Ok(())
     }
@@ -679,7 +684,7 @@ impl BoostedModel {
         }
         if self.n_outputs == 0
             || (self.num_class >= 2 && self.n_outputs != self.num_class)
-            || self.trees.len() % self.n_outputs != 0
+            || !self.trees.len().is_multiple_of(self.n_outputs)
         {
             return Err(HessboostError::ModelFormat(format!(
                 "invalid output layout: {} outputs, num_class {}, {} trees",
@@ -776,7 +781,7 @@ impl BoostedModel {
 /// Rows per prediction block: the block's feature rows stay in cache while
 /// every tree walks them. Must be a multiple of [`LANES`].
 const PREDICT_BLOCK_ROWS: usize = 256;
-const _: () = assert!(PREDICT_BLOCK_ROWS % LANES == 0);
+const _: () = assert!(PREDICT_BLOCK_ROWS.is_multiple_of(LANES));
 
 /// Widest CSR matrix that is densified block-by-block for prediction. Wider
 /// matrices fall back to per-lookup row scans.
@@ -991,11 +996,7 @@ impl<'a> RowBlock<'a> {
             return data.get(start + r, f as usize);
         };
         let v = row[f as usize];
-        if v.is_nan() {
-            None
-        } else {
-            Some(v)
-        }
+        if v.is_nan() { None } else { Some(v) }
     }
 
     /// Original leaf ids of loaded row `r` in trees `0..out.len()`, written to

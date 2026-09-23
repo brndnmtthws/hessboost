@@ -43,6 +43,7 @@ impl CustomObjective {
     }
 
     /// Attach a prediction transform.
+    #[must_use]
     pub fn with_transform(
         mut self,
         transform: impl Fn(&mut [f32]) + Send + Sync + 'static,

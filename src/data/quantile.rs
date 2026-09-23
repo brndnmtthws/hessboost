@@ -11,9 +11,9 @@
 //! they are recomputed each boosting round from the current Hessians
 //! ([`HistCuts::from_dmatrix_weighted`]).
 
+use crate::data::DMatrix;
 use crate::data::meta::FeatureType;
 use crate::data::sketch::WQSketch;
-use crate::data::DMatrix;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -339,7 +339,7 @@ impl<'a> BinSearch<'a> {
         let (start, end) = self.cuts.feature_bins(f);
         let level1 = &self.level1[self.level1_offset[f]..self.level1_offset[f + 1]];
         let mut block = 0;
-        for chunk in level1.chunks_exact(SEARCH_BLOCK) {
+        for chunk in level1.as_chunks::<SEARCH_BLOCK>().0 {
             block += crate::simd::count_le(chunk, value);
         }
         let padded = &self.padded[self.padded_offset[f]..self.padded_offset[f + 1]];
@@ -464,7 +464,7 @@ mod tests {
             probes.extend(
                 cuts.cut_values[start..end]
                     .windows(2)
-                    .map(|w| 0.5 * (w[0] + w[1])),
+                    .map(|w| f32::midpoint(w[0], w[1])),
             );
             probes.extend([-1e9, 1e9, -0.0, 0.0, 0.5, 2.5, 3.0]);
             for value in probes {

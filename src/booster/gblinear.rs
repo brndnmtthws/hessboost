@@ -21,8 +21,8 @@
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::learner::model::for_each_present_value;
 use crate::learner::LinearModel;
+use crate::learner::model::for_each_present_value;
 use crate::objective::{GradPair, Objective};
 
 /// One feature's present entries, stored column-major as parallel `(row, value)`
@@ -111,8 +111,8 @@ pub(crate) fn train_gblinear(
             let mut h = 0.0f64;
             for i in 0..n {
                 let gp = gpair[i * n_out + k];
-                g += gp.grad as f64;
-                h += gp.hess as f64;
+                g += f64::from(gp.grad);
+                h += f64::from(gp.hess);
             }
             let db = eta * coordinate_delta(g, h, 0.0, 0.0, 0.0);
             if db != 0.0 {
@@ -131,12 +131,12 @@ pub(crate) fn train_gblinear(
                 let mut g = 0.0f64;
                 let mut h = 0.0f64;
                 for (idx, &row) in col.rows.iter().enumerate() {
-                    let x = col.vals[idx] as f64;
+                    let x = f64::from(col.vals[idx]);
                     let gp = gpair[row as usize * n_out + k];
-                    g += gp.grad as f64 * x;
-                    h += gp.hess as f64 * x * x;
+                    g += f64::from(gp.grad) * x;
+                    h += f64::from(gp.hess) * x * x;
                 }
-                let w = lin_weights[f * n_out + k] as f64;
+                let w = f64::from(lin_weights[f * n_out + k]);
                 let dw = eta * coordinate_delta(g, h, w, alpha, lambda);
                 if dw == 0.0 {
                     continue;

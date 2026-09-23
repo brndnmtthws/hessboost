@@ -113,12 +113,8 @@ Runnable, self-contained examples live in
   for objective gradients, prediction transforms, and histogram split
   evaluation.
 
-**In progress / planned**
-
-- UBJSON (binary) XGBoost model format.
-- GPU histogram backend (the `HistogramBackend` trait is the seam for it).
-- Distributed / external-memory training.
-- Python (PyO3), CLI, and C-ABI wrappers.
+**Not implemented:** the UBJSON (binary) XGBoost model format, a GPU backend,
+distributed or external-memory training, and Python/CLI/C-ABI wrappers.
 
 ## Performance
 
@@ -157,26 +153,16 @@ preparation and training, and report the median of six fits after warmup.
 
 hessboost has lower median fit time in all 12 configurations in this run.
 Single-thread speedups are 2.28× to 2.77×, four-thread speedups are 1.82× to
-2.20×, and sixteen-thread speedups are 1.37× to 1.63×. Held-out RMSE/log-loss
-scores are identical to the previous run on every workload.
+2.20×, and sixteen-thread speedups are 1.37× to 1.63×.
 
-See the [full comparison](docs/performance.md#xgboost-comparison) for held-out
-quality, sample variability, workload definitions, and reproduction commands.
-
-### Kernel benchmarks
-
-See [Performance](docs/performance.md) for kernel measurements, numerical
-behavior, and reproduction commands.
-
-```sh
-cargo bench
-```
+See [Performance](docs/performance.md) for held-out quality, workload
+definitions, kernel benchmarks, and reproduction commands.
 
 ## Testing & parity
 
 ```sh
 cargo test                          # unit + integration tests
-cargo clippy --all-targets          # lints
+cargo clippy --all-targets -- -D warnings
 ```
 
 Numerical parity with **XGBoost 3.4.1** is checked in CI by a fixture harness
@@ -200,24 +186,18 @@ uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
 
 See `scripts/README.md` for the case matrix and tolerances.
 
-## History
+## License and attribution
+
+Licensed under the **Apache License, Version 2.0**; see [`LICENSE`](LICENSE).
+Copyright 2026 Brenden Matthews.
 
 hessboost is a fork of
-[sequoia-boost](https://github.com/pgarrett-scripps/sequoia-boost), created
-because the two projects have different goals. It keeps the Apache-2.0 license
-and the upstream attribution in [`NOTICE`](NOTICE).
+[sequoia-boost](https://github.com/pgarrett-scripps/sequoia-boost)
+(Copyright 2026 Patrick Garrett, Apache-2.0).
 
-## Acknowledgments
-
-hessboost is an independent, from-scratch **reimplementation of
-[XGBoost](https://github.com/dmlc/xgboost)** (Copyright the XGBoost Contributors,
-Apache-2.0) in Rust. It reimplements XGBoost's algorithms from their public
-descriptions and papers and contains no XGBoost source code. "XGBoost" is used
-descriptively to indicate algorithmic lineage and result compatibility. This
-project is not affiliated with or endorsed by the XGBoost project. See
-[`NOTICE`](NOTICE).
-
-## License
-
-Licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE) and
-[`NOTICE`](NOTICE).
+It is an independent reimplementation of
+[XGBoost](https://github.com/dmlc/xgboost) (Copyright the XGBoost Contributors,
+Apache-2.0) built from XGBoost's public descriptions and papers; it contains no
+XGBoost source code. "XGBoost" is used descriptively, for algorithmic lineage and
+result compatibility. This project is not affiliated with or endorsed by the
+XGBoost project.

@@ -60,8 +60,8 @@ macro_rules! dispatch_unary_inplace {
 
 /// Run the per-arch gradient kernel when `$gate` (length plus
 /// `gradient_slices_cover`) holds, falling through to the caller's scalar
-/// tail otherwise. The three-arm form also dispatches the x86_64 kernel; the
-/// two-arm form is NEON-only for kernels with no x86_64 counterpart. Both
+/// tail otherwise. The three-arm form also dispatches the `x86_64` kernel; the
+/// two-arm form is NEON-only for kernels with no `x86_64` counterpart. Both
 /// forms return the kernel's value, so `()`-valued gradient kernels and
 /// `(f64, f64)`-valued metric-sum kernels share the same expansion.
 macro_rules! dispatch_gradient {
@@ -110,7 +110,7 @@ pub(crate) fn prefetch_read<T>(value: &T) {
     unsafe {
         std::arch::asm!(
             "prfm pldl1keep, [{ptr}]",
-            ptr = in(reg) value as *const T,
+            ptr = in(reg) std::ptr::from_ref::<T>(value),
             options(nostack, readonly, preserves_flags)
         );
     }
@@ -118,7 +118,7 @@ pub(crate) fn prefetch_read<T>(value: &T) {
     // SAFETY: PREFETCHT0 is available on every x86_64 CPU and cannot fault.
     unsafe {
         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-            (value as *const T).cast::<i8>(),
+            std::ptr::from_ref::<T>(value).cast::<i8>(),
         );
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -286,9 +286,9 @@ pub(crate) fn softmax_rows_inplace(values: &mut [f32], num_class: usize) {
         // rows per vector and handles the remaining rows scalarly.
         unsafe {
             if num_class == 2 {
-                x86_64::short_softmax_rows::<2>(values)
+                x86_64::short_softmax_rows::<2>(values);
             } else {
-                x86_64::short_softmax_rows::<4>(values)
+                x86_64::short_softmax_rows::<4>(values);
             }
         }
         return;
@@ -343,9 +343,9 @@ pub(crate) fn softmax_gradient(
         // weight and output row; AVX2/FMA are present and K is 2 or 4.
         unsafe {
             if num_class == 2 {
-                x86_64::short_softmax_gradient::<2>(preds, labels, weights, min_hess, out)
+                x86_64::short_softmax_gradient::<2>(preds, labels, weights, min_hess, out);
             } else {
-                x86_64::short_softmax_gradient::<4>(preds, labels, weights, min_hess, out)
+                x86_64::short_softmax_gradient::<4>(preds, labels, weights, min_hess, out);
             }
         }
         return;
@@ -396,7 +396,7 @@ pub(super) fn softmax_scalar(values: &mut [f32]) {
     let mut wsum = 0f64;
     for value in values.iter_mut() {
         *value = (*value - wmax).exp();
-        wsum += *value as f64;
+        wsum += f64::from(*value);
     }
     let wsum = wsum as f32;
     for value in values.iter_mut() {
@@ -421,7 +421,7 @@ pub(super) fn softmax_gradient_row_scalar(
     }
     let mut wsum = 0f64;
     for &prediction in preds {
-        wsum += (prediction - wmax).exp() as f64;
+        wsum += f64::from((prediction - wmax).exp());
     }
     let wsum = wsum as f32;
     for (class, (output, &prediction)) in out.iter_mut().zip(preds).enumerate() {
@@ -523,9 +523,9 @@ pub(super) fn tweedie_nloglik_sum_scalar(
     let mut loss = 0.0;
     let mut weight_sum = 0.0;
     for index in 0..preds.len() {
-        let weight = weights.map_or(1.0, |values| values[index] as f64);
-        let prediction = (preds[index] as f64).max(MIN_POSITIVE_PREDICTION);
-        let label = labels[index] as f64;
+        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+        let prediction = f64::from(preds[index]).max(MIN_POSITIVE_PREDICTION);
+        let label = f64::from(labels[index]);
         let first = label * prediction.powf(1.0 - rho) / (1.0 - rho);
         let second = prediction.powf(2.0 - rho) / (2.0 - rho);
         loss += weight * (-first + second);
@@ -563,9 +563,9 @@ pub(super) fn multiclass_log_loss_sum_scalar(
     let mut loss = 0.0;
     let mut weight_sum = 0.0;
     for (row, &label) in labels.iter().enumerate() {
-        let weight = weights.map_or(1.0, |values| values[row] as f64);
+        let weight = weights.map_or(1.0, |values| f64::from(values[row]));
         let probability =
-            (preds[row * num_class + label as usize] as f64).clamp(LOG_LOSS_EPSILON, 1.0);
+            f64::from(preds[row * num_class + label as usize]).clamp(LOG_LOSS_EPSILON, 1.0);
         loss += -weight * probability.ln();
         weight_sum += weight;
     }
@@ -585,7 +585,7 @@ pub(crate) fn multiclass_error_sum(
         && weights.is_none_or(|values| values.len() >= labels.len());
     dispatch_gradient!(
         num_class >= 8
-            && num_class <= u32::MAX as usize
+            && u32::try_from(num_class).is_ok()
             && labels.len() >= MIN_SIMD_LEN
             && complete,
         aarch64::multiclass_error_sum(preds, labels, weights, num_class)
@@ -616,7 +616,7 @@ pub(super) fn multiclass_error_sum_rows(
     let mut wrong = 0.0;
     let mut weight_sum = 0.0;
     for (row_index, &label) in labels.iter().enumerate() {
-        let weight = weights.map_or(1.0, |values| values[row_index] as f64);
+        let weight = weights.map_or(1.0, |values| f64::from(values[row_index]));
         let row = &preds[row_index * num_class..(row_index + 1) * num_class];
         let best = argmax(row);
         if best != label as usize {

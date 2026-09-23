@@ -42,10 +42,7 @@ hessboost has lower median fit time in all 12 configurations in this run.
 Single-thread speedups range from 2.28× on binary classification to 2.77× on
 wide regression; 30-feature regression reaches 2.30× and multiclass 2.29×. At
 four threads, speedups range from 1.82× to 2.20×, and at sixteen threads from
-1.37× to 1.63×. Held-out scores are identical to the previous run on every
-workload, so the differences reflect training speed, not fit quality. Treat
-small differences as near parity given the uncontrolled background activity on
-this workstation.
+1.37× to 1.63×.
 
 ![hessboost speedup over XGBoost 3.4.1 by workload and thread count](benchmarks/xgboost-speedup.svg)
 
@@ -57,9 +54,6 @@ in [`benchmarks/xgboost.dat`](benchmarks/xgboost.dat) and
 [`benchmarks/optimization.dat`](benchmarks/optimization.dat). Regenerate
 them with `gnuplot -c docs/benchmarks/charts.gp` after updating a data
 file. The data files also carry the measurement provenance for each chart.
-The raw result files (`benchmarks/*.json` and the compressed samples) were
-recorded before this project was renamed from sequoia-boost, so they keep the
-crate paths and engine name in use at the time.
 
 ### CPU scheduling
 
@@ -122,13 +116,8 @@ as near parity rather than an isolated-machine result.
 For each workload and thread count, batches run in
 XGBoost/hessboost/hessboost/XGBoost order. Each batch discards one warmup fit and
 records three fits. The table uses the median of all six recorded fits per
-engine. The [complete results](benchmarks/xgboost.json) include every sample,
-minimum/maximum times, held-out scores, native build configuration, dataset and
-source hashes, and the executable hash. These numbers describe this CPU and
-these synthetic workloads; they do not establish GPU or other-platform
-performance.
-
-The result also includes the Cargo lockfile used for these measurements.
+engine. These numbers describe this CPU and these synthetic workloads; they do
+not establish GPU or other-platform performance.
 
 Reproduce from the repository root, using a new output directory:
 
@@ -259,16 +248,10 @@ inputs, not tree training.
 | Multiclass log loss, 32 classes, weighted | 1 | 0.102 | 0.062 | 39.5% |
 | Multiclass error, 32 classes, weighted | 1 | 1.616 | 0.244 | 84.9% |
 
-The [complete results](benchmarks/performance.json) include all 73
-single-thread cases and 11 four-thread cases, including unweighted metrics,
-additional class counts, and histogram-accumulation controls. Histogram
-accumulation controls exercise the scalar accumulation loop and task scheduling;
-tree construction also measures split evaluation, parallel nodes, and avoiding
-unnecessary child work. The
-[compressed samples](benchmarks/performance-samples.json.gz) contain Criterion
-estimates, confidence intervals, raw samples, logs, the shared benchmark source,
-lockfile, and a patch that reconstructs the measured optimized source. The
-result file records executable and source SHA-256 hashes.
+The benchmark suite also covers unweighted metrics, additional class counts,
+and histogram-accumulation controls. Histogram accumulation controls exercise
+the scalar accumulation loop and task scheduling; tree construction also
+measures split evaluation, parallel nodes, and avoiding unnecessary child work.
 
 ## Implementation
 
@@ -368,28 +351,6 @@ relative tolerances between `1e-12` and `3e-12` for their finite test datasets.
 Split tests check candidate order and the sequential gain epsilon. These are
 test tolerances, not universal error bounds for arbitrary inputs.
 
-Validation for the recorded build includes debug and release tests, Clippy,
-XGBoost regression/binary/multiclass quality parity, a Rust 1.86 build, and an
-x86_64 cross-check. A separate 108-case equivalence check covers dense, missing,
-categorical, sampled, constrained, and multiclass trees. It verifies serialized models and
-predictions with one, four, and sixteen threads; its source and result hashes are
-included with the benchmark samples.
-
-```sh
-cargo test --locked
-cargo test --locked --release
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo fmt --all --check
-cargo test --locked --test parity -- --ignored
-cargo +1.86.0 build --locked
-cargo check --locked --all-targets --all-features --target x86_64-pc-windows-gnu
-```
-
-Generate the parity fixtures first using the
-[fixture instructions](../scripts/README.md#parity-fixtures). The cross-check
-requires the corresponding Rust target to be installed and checks compilation
-only.
-
 ## Reproduce the measurements
 
 The benchmark definitions live in
@@ -407,70 +368,7 @@ the tables, run:
 gnuplot -c docs/benchmarks/charts.gp
 ```
 
-For an exact source comparison, reconstruct both trees from the recorded
-baseline revision and source archive. These revisions predate the rename and
-flattening, so the snippet uses the original `crates/sequoia-boost` layout and
-package name. Run from the repository root:
-
-```sh
-export BENCH_WORKDIR="$(mktemp -d)"
-uv run python - <<'PY'
-import gzip
-import io
-import json
-import os
-from pathlib import Path
-import subprocess
-import tarfile
-
-root = Path(os.environ['BENCH_WORKDIR'])
-record = json.loads(gzip.decompress(
-    Path('docs/benchmarks/performance-samples.json.gz').read_bytes()))['source']
-archive = subprocess.check_output(['git', 'archive', record['baseline_revision']])
-for name in ['baseline', 'optimized']:
-    tree = root / name
-    tree.mkdir()
-    with tarfile.open(fileobj=io.BytesIO(archive)) as source:
-        source.extractall(tree, filter='data')
-    if name == 'optimized':
-        subprocess.run(['git', 'apply', '--no-index', '-'], cwd=tree,
-                       input=record['optimized_patch'].encode(), check=True)
-    (tree / 'Cargo.lock').write_text(record['lockfile'])
-    (tree / 'crates/sequoia-boost/benches/training.rs').write_text(
-        record['benchmark_source'])
-    build = subprocess.check_output([
-        'cargo', '+1.98.1', 'bench', '--locked', '--no-run',
-        '-p', 'sequoia-boost', '--bench', 'training', '--message-format=json',
-    ], cwd=tree, env=dict(os.environ,
-                         CARGO_TARGET_DIR=str(root / f'{name}-target')))
-    artifacts = [json.loads(line) for line in build.splitlines()]
-    executable = next(Path(item['executable']) for item in artifacts
-                      if item.get('reason') == 'compiler-artifact'
-                      and item['target']['name'] == 'training'
-                      and item.get('executable'))
-    (root / f'{name}-bench').symlink_to(executable)
-PY
-
-uv run python scripts/compare_benchmarks.py \
-  --baseline "$BENCH_WORKDIR/baseline-bench" \
-  --optimized "$BENCH_WORKDIR/optimized-bench" \
-  --output "$BENCH_WORKDIR/results-t1" --threads 1 \
-  --warmup 0.5 --measurement 1 --samples 20 --resamples 10000 \
-  --filter 'objective_gradient|prediction_transform/.*automatic|prediction_transform_multiclass|pointwise_metric|log_metric|multiclass_metric|hist_tree_build|histogram_build|train_50k_x20_50rounds/Hist|train_binary_50k_x20_50rounds/automatic'
-
-uv run python scripts/compare_benchmarks.py \
-  --baseline "$BENCH_WORKDIR/baseline-bench" \
-  --optimized "$BENCH_WORKDIR/optimized-bench" \
-  --output "$BENCH_WORKDIR/results-t4" --threads 4 \
-  --warmup 0.5 --measurement 1 --samples 20 --resamples 10000 \
-  --filter 'hist_tree_build|train_50k_x20_50rounds/Hist|train_binary_50k_x20_50rounds/automatic'
-```
-
-The reconstruction snippet requires Python 3.12+ and Rust 1.98.1. Keep
-`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_TARGET`, and Cargo profile
-overrides unset to match the recorded build. The comparison runner itself uses
-only the Python standard library. It creates separate Criterion directories
-for each run and refuses to overwrite an existing output directory.
-
-For XGBoost quality fixtures and the separate XGBoost timing harness, see
-[Development scripts](../scripts/README.md).
+To compare two builds of the benchmark binary, use
+`scripts/compare_benchmarks.py`; see
+[Development scripts](../scripts/README.md) for it, the XGBoost quality
+fixtures, and the XGBoost timing harness.

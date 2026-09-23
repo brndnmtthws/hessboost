@@ -1,21 +1,21 @@
 //! The gradient-boosting training loop.
 
 use crate::config::{BoosterKind, GrowPolicy, ObjectiveParams, TrainingParams, TreeMethod};
+use crate::data::DMatrix;
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
-use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::learner::model::{BoostedModel, ModelSpec};
 use crate::metric::create_metrics;
-use crate::objective::{create_objective, GradPair};
+use crate::objective::{GradPair, create_objective};
+use crate::tree::RegTree;
 use crate::tree::builder::{
-    all_features, all_rows, ExactTreeBuilder, HistTreeBuilder, SortedColumns,
+    ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows,
 };
 use crate::tree::sampler::ColumnSampler;
-use crate::tree::RegTree;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
@@ -160,7 +160,7 @@ pub fn train_with_eval(
         num_boost_round,
         evals,
         early_stopping_rounds,
-        objective,
+        objective.as_ref(),
         None,
     )
 }
@@ -186,7 +186,7 @@ pub fn train_with_custom_metric(
         num_boost_round,
         evals,
         early_stopping_rounds,
-        objective,
+        objective.as_ref(),
         Some(metric),
     )
 }
@@ -197,7 +197,7 @@ pub fn train_with_objective(
     params: &TrainingParams,
     dtrain: &DMatrix,
     num_boost_round: usize,
-    objective: Box<dyn crate::objective::Objective>,
+    objective: &dyn crate::objective::Objective,
 ) -> Result<BoostedModel> {
     Ok(train_impl(params, dtrain, num_boost_round, &[], None, objective, None)?.model)
 }
@@ -214,7 +214,7 @@ fn train_impl(
     num_boost_round: usize,
     evals: &[EvalSet],
     early_stopping_rounds: Option<usize>,
-    objective: Box<dyn crate::objective::Objective>,
+    objective: &dyn crate::objective::Objective,
     metric_override: Option<Box<dyn crate::metric::Metric>>,
 ) -> Result<TrainResult> {
     if params.nthread > 0 {
@@ -251,7 +251,7 @@ fn train_impl_inner(
     num_boost_round: usize,
     evals: &[EvalSet],
     early_stopping_rounds: Option<usize>,
-    objective: Box<dyn crate::objective::Objective>,
+    objective: &dyn crate::objective::Objective,
     metric_override: Option<Box<dyn crate::metric::Metric>>,
 ) -> Result<TrainResult> {
     params.validate()?;
@@ -374,7 +374,7 @@ fn train_impl_inner(
             num_boost_round,
             &model.initial_margins(dtrain),
             n_out,
-            objective.as_ref(),
+            objective,
         )?;
         model.set_linear(linear);
         return Ok(TrainResult {
@@ -393,8 +393,7 @@ fn train_impl_inner(
         .map(|(d, _)| model.initial_margins(d))
         .collect();
 
-    // A caller-supplied metric replaces the configured/default metric list;
-    // otherwise build metrics exactly as before.
+    // A caller-supplied metric replaces the configured/default metric list.
     let metrics = match metric_override {
         Some(m) => vec![m],
         None => create_metrics(
@@ -410,7 +409,7 @@ fn train_impl_inner(
     let mut history: Vec<RoundEval> = Vec::new();
 
     // Early-stopping bookkeeping.
-    let maximize = metrics.last().map(|m| m.maximize()).unwrap_or(false);
+    let maximize = metrics.last().is_some_and(|m| m.maximize());
     let mut best_score = if maximize {
         f64::NEG_INFINITY
     } else {
@@ -428,7 +427,7 @@ fn train_impl_inner(
                 params,
                 dtrain,
                 &prepared,
-                objective.as_ref(),
+                objective,
                 labels,
                 weights,
                 n,
@@ -643,17 +642,17 @@ fn dart_round(
     let existing = model.num_trees();
     let mut dropped = vec![false; existing];
     let mut drop_indices: Vec<usize> = Vec::new();
-    let skip = rng.gen::<f64>() < params.skip_drop;
+    let skip = rng.random::<f64>() < params.skip_drop;
     if !skip && existing > 0 {
         for (i, d) in dropped.iter_mut().enumerate() {
-            if rng.gen::<f64>() < params.rate_drop {
+            if rng.random::<f64>() < params.rate_drop {
                 *d = true;
                 drop_indices.push(i);
             }
         }
         if drop_indices.is_empty() {
             // Guarantee at least one dropped tree, as XGBoost does.
-            let i = rng.gen_range(0..existing);
+            let i = rng.random_range(0..existing);
             dropped[i] = true;
             drop_indices.push(i);
         }
@@ -756,10 +755,10 @@ fn sample_rows(n: usize, subsample: f64, rng: &mut StdRng) -> Vec<u32> {
         return all_rows(n);
     }
     let mut rows: Vec<u32> = (0..n as u32)
-        .filter(|_| rng.gen::<f64>() < subsample)
+        .filter(|_| rng.random::<f64>() < subsample)
         .collect();
     if rows.is_empty() {
-        rows.push(rng.gen_range(0..n as u32));
+        rows.push(rng.random_range(0..n as u32));
     }
     rows
 }
@@ -831,20 +830,20 @@ fn validate_dataset(
             format!("ranking dataset `{name}` requires group information"),
         ));
     }
-    if params.objective.starts_with("rank:") {
-        if let (Some(group), Some(weights)) = (data.group(), data.weights()) {
-            for (start, end) in group.iter_ranges() {
-                if weights[start..end]
-                    .iter()
-                    .any(|weight| *weight != weights[start])
-                {
-                    return Err(HessboostError::invalid_param(
-                        "weights",
-                        format!(
-                            "ranking dataset `{name}` requires one constant weight per query group"
-                        ),
-                    ));
-                }
+    if params.objective.starts_with("rank:")
+        && let (Some(group), Some(weights)) = (data.group(), data.weights())
+    {
+        for (start, end) in group.iter_ranges() {
+            if weights[start..end]
+                .iter()
+                .any(|weight| *weight != weights[start])
+            {
+                return Err(HessboostError::invalid_param(
+                    "weights",
+                    format!(
+                        "ranking dataset `{name}` requires one constant weight per query group"
+                    ),
+                ));
             }
         }
     }
@@ -877,8 +876,8 @@ fn make_column_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metric::Rmse;
     use crate::Metric;
+    use crate::metric::Rmse;
 
     /// A learnable 1-D step function: y = 0 for x<0.5, y = 1 for x>=0.5.
     fn step_dataset(n: usize) -> DMatrix {
@@ -956,7 +955,7 @@ mod tests {
             .unwrap();
         let model = train(&params, &d, 50).unwrap();
         let preds = model.predict(&d).unwrap(); // probabilities
-                                                // Low-x rows -> ~0, high-x rows -> ~1.
+        // Low-x rows -> ~0, high-x rows -> ~1.
         assert!(preds[0] < 0.1, "expected ~0, got {}", preds[0]);
         assert!(preds[99] > 0.9, "expected ~1, got {}", preds[99]);
     }
@@ -1127,7 +1126,7 @@ mod tests {
         let mut y = Vec::new();
         let mut s: u64 = 7;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             ((s >> 33) as f32) / (1u32 << 31) as f32
         };
         for _ in 0..n {
@@ -1199,7 +1198,7 @@ mod tests {
                     out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi);
                 }
             });
-            train_with_objective(&p, &d, 30, Box::new(obj))
+            train_with_objective(&p, &d, 30, &obj)
                 .unwrap()
                 .predict(&d)
                 .unwrap()
@@ -1228,7 +1227,7 @@ mod tests {
             }
         });
         let p = TrainingParams::builder().max_depth(2).build().unwrap();
-        let model = train_with_objective(&p, &d, rounds, Box::new(obj)).unwrap();
+        let model = train_with_objective(&p, &d, rounds, &obj).unwrap();
 
         assert_eq!(model.n_outputs(), 2);
         assert_eq!(model.base_scores().len(), 2);
@@ -1279,7 +1278,7 @@ mod tests {
         let sizes = vec![per; n_groups];
         let mut s: u64 = 42;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             ((s >> 33) as f32) / (1u32 << 31) as f32
         };
         for _ in 0..n_groups {
@@ -1360,7 +1359,7 @@ mod tests {
     #[test]
     fn gbtree_unchanged_by_weight_field() {
         // A default gbtree model carries all-1.0 weights, so predictions must be
-        // bit-for-bit what the un-weighted sum produced historically.
+        // bit-for-bit the unweighted tree sum.
         let d = step_dataset(100);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
@@ -1554,10 +1553,12 @@ mod tests {
             .unwrap();
 
         // A nonzero starting margin changes the fitted margins.
-        assert!(plain
-            .iter()
-            .zip(&shifted)
-            .any(|(a, b)| (a - b).abs() > 1e-4));
+        assert!(
+            plain
+                .iter()
+                .zip(&shifted)
+                .any(|(a, b)| (a - b).abs() > 1e-4)
+        );
     }
 
     #[test]
@@ -1568,7 +1569,7 @@ mod tests {
         let mut y = vec![0f32; n];
         let mut s: u64 = 3;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             ((s >> 33) as f32) / (1u32 << 31) as f32
         };
         for i in 0..n {
@@ -1611,7 +1612,7 @@ mod tests {
         let mut y = vec![0f32; n];
         let mut s: u64 = 11;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             ((s >> 33) as f32) / (1u32 << 31) as f32
         };
         for i in 0..n {
@@ -1709,16 +1710,12 @@ mod tests {
             let mut sq = 0.0f64;
             let mut wsum = 0.0f64;
             for i in 0..preds.len() {
-                let w = weights.map_or(1.0, |ws: &[f32]| ws[i] as f64);
-                let diff = preds[i] as f64 - labels[i] as f64;
+                let w = weights.map_or(1.0, |ws: &[f32]| f64::from(ws[i]));
+                let diff = f64::from(preds[i]) - f64::from(labels[i]);
                 sq += w * diff * diff;
                 wsum += w;
             }
-            if wsum > 0.0 {
-                (sq / wsum).sqrt()
-            } else {
-                0.0
-            }
+            if wsum > 0.0 { (sq / wsum).sqrt() } else { 0.0 }
         });
         let custom = train_with_custom_metric(
             &params,
@@ -1789,9 +1786,11 @@ mod tests {
         let model = train(&params, &d, 20).unwrap();
         let predictions = model.predict(&d).unwrap();
         assert_eq!(predictions.len(), d.n_rows());
-        assert!(predictions
-            .iter()
-            .all(|value| value.fract() == 0.0 && *value < 3.0));
+        assert!(
+            predictions
+                .iter()
+                .all(|value| value.fract() == 0.0 && *value < 3.0)
+        );
         assert_eq!(
             model.predict_class(&d).unwrap(),
             predictions
@@ -1819,11 +1818,13 @@ mod tests {
                 .unwrap();
             let model = train(&params, &d, 3).unwrap();
             assert_eq!(model.objective(), objective);
-            assert!(model
-                .predict(&d)
-                .unwrap()
-                .iter()
-                .all(|p| (0.0..=1.0).contains(p)));
+            assert!(
+                model
+                    .predict(&d)
+                    .unwrap()
+                    .iter()
+                    .all(|p| (0.0..=1.0).contains(p))
+            );
             for bad in [1.5f32, -0.1] {
                 let mut labels = soft;
                 labels[0] = bad;
@@ -1854,11 +1855,13 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 0).unwrap();
-        assert!(model
-            .predict(&d)
-            .unwrap()
-            .iter()
-            .all(|prediction| (*prediction - 0.5).abs() < 1e-6));
+        assert!(
+            model
+                .predict(&d)
+                .unwrap()
+                .iter()
+                .all(|prediction| (*prediction - 0.5).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -1886,6 +1889,18 @@ mod tests {
 
     #[test]
     fn exact_interaction_constraints_confine_each_path() {
+        fn visit(tree: &RegTree, node: usize, path: &mut Vec<u32>) {
+            let current = tree.node(node);
+            if current.is_leaf() {
+                assert!(path.iter().all(|feature| *feature == path[0]));
+                return;
+            }
+            path.push(current.split_feature);
+            visit(tree, current.left as usize, path);
+            visit(tree, current.right as usize, path);
+            path.pop();
+        }
+
         let mut x = Vec::new();
         let mut y = Vec::new();
         for i in 0..128 {
@@ -1905,18 +1920,6 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 3).unwrap();
-
-        fn visit(tree: &RegTree, node: usize, path: &mut Vec<u32>) {
-            let current = tree.node(node);
-            if current.is_leaf() {
-                assert!(path.iter().all(|feature| *feature == path[0]));
-                return;
-            }
-            path.push(current.split_feature);
-            visit(tree, current.left as usize, path);
-            visit(tree, current.right as usize, path);
-            path.pop();
-        }
         for tree in model.trees() {
             visit(tree, 0, &mut Vec::new());
         }

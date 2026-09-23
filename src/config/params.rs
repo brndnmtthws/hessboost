@@ -398,6 +398,7 @@ pub struct TrainingParamsBuilder {
 macro_rules! setter {
     ($(#[$m:meta])* $name:ident, $ty:ty) => {
         $(#[$m])*
+        #[must_use]
         pub fn $name(mut self, v: $ty) -> Self {
             self.params.$name = v;
             self
@@ -426,6 +427,7 @@ impl TrainingParamsBuilder {
         min_child_weight, f64);
     /// Set the maximum delta step (`0` = no constraint). Unset, `count:poisson`
     /// defaults to `0.7` like XGBoost.
+    #[must_use]
     pub fn max_delta_step(mut self, v: f64) -> Self {
         self.params.max_delta_step = Some(v);
         self
@@ -462,18 +464,21 @@ impl TrainingParamsBuilder {
         lambdarank_num_pair_per_sample, usize);
 
     /// Set the objective by name (e.g. `"binary:logistic"`).
+    #[must_use]
     pub fn objective(mut self, name: impl Into<String>) -> Self {
         self.params.objective = name.into();
         self
     }
 
     /// Set the base score / global bias.
+    #[must_use]
     pub fn base_score(mut self, v: f64) -> Self {
         self.params.base_score = Some(v);
         self
     }
 
     /// Add an evaluation metric by name.
+    #[must_use]
     pub fn eval_metric(mut self, name: impl Into<String>) -> Self {
         self.params.eval_metric.push(name.into());
         self
@@ -546,34 +551,46 @@ mod tests {
         assert!(TrainingParams::builder().subsample(1.5).build().is_err());
         assert!(TrainingParams::builder().lambda(-1.0).build().is_err());
         assert!(TrainingParams::builder().max_bin(1).build().is_err());
-        assert!(TrainingParams::builder()
-            .tweedie_variance_power(2.0)
-            .build()
-            .is_err());
+        assert!(
+            TrainingParams::builder()
+                .tweedie_variance_power(2.0)
+                .build()
+                .is_err()
+        );
         // Passes the f64 range but rounds to 2.0 in f32, where the objective runs.
-        assert!(TrainingParams::builder()
-            .tweedie_variance_power(2.0 - f64::EPSILON)
-            .build()
-            .is_err());
-        assert!(TrainingParams::builder()
-            .tweedie_variance_power(1.0)
-            .build()
-            .is_ok());
+        assert!(
+            TrainingParams::builder()
+                .tweedie_variance_power(2.0 - f64::EPSILON)
+                .build()
+                .is_err()
+        );
+        assert!(
+            TrainingParams::builder()
+                .tweedie_variance_power(1.0)
+                .build()
+                .is_ok()
+        );
         assert!(TrainingParams::builder().huber_slope(0.0).build().is_err());
         // Finite and positive in f64, but the f32 square overflows / vanishes.
         assert!(TrainingParams::builder().huber_slope(2e19).build().is_err());
-        assert!(TrainingParams::builder()
-            .huber_slope(1e-30)
-            .build()
-            .is_err());
-        assert!(TrainingParams::builder()
-            .lambdarank_num_pair_per_sample(0)
-            .build()
-            .is_err());
-        assert!(TrainingParams::builder()
-            .max_delta_step(-1.0)
-            .build()
-            .is_err());
+        assert!(
+            TrainingParams::builder()
+                .huber_slope(1e-30)
+                .build()
+                .is_err()
+        );
+        assert!(
+            TrainingParams::builder()
+                .lambdarank_num_pair_per_sample(0)
+                .build()
+                .is_err()
+        );
+        assert!(
+            TrainingParams::builder()
+                .max_delta_step(-1.0)
+                .build()
+                .is_err()
+        );
     }
 
     /// XGBoost injects `max_delta_step = 0.7` for `count:poisson` only when

@@ -4,9 +4,9 @@ use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::learner::train::train_with_eval;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 use std::collections::BTreeMap;
 
 /// Per-metric cross-validation history, aggregated across folds.

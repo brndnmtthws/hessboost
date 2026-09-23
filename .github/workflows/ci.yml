@@ -49,7 +49,8 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: clippy
-      - run: mbx clippy --all-targets --all-features
+      # Lint levels (pedantic) live in Cargo.toml's [lints] table.
+      - run: mbx clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test (${{ matrix.name }})
@@ -91,11 +92,11 @@ jobs:
       - run: mbx doc --no-deps --all-features
 
   msrv:
-    name: MSRV (1.86.0)
+    name: MSRV (1.93.0)
     runs-on: ubuntu-latest
     env:
       # Overrides the rust version from mise.toml for every mise step.
-      MISE_RUST_VERSION: 1.86.0
+      MISE_RUST_VERSION: 1.93.0
     steps:
       - uses: actions/checkout@v7
         with:

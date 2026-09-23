@@ -69,7 +69,7 @@ fn limit_size_level(maxn: usize, eps: f64) -> usize {
     let internal_eps = eps / 2.0;
     let mut nlevel = 1u32;
     loop {
-        let limit = ((nlevel as f64 / internal_eps).ceil() as usize + 1).min(maxn);
+        let limit = ((f64::from(nlevel) / internal_eps).ceil() as usize + 1).min(maxn);
         if (1usize << nlevel) * limit >= maxn {
             return limit;
         }
@@ -268,7 +268,7 @@ fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>
         if i == 0 || sorted[i - 1].0 != v {
             unique_values += 1;
         }
-        sum_total += w as f64;
+        sum_total += f64::from(w);
     }
 
     let (mut rmin, mut wmin) = (0f64, 0f64);
@@ -278,11 +278,11 @@ fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>
         for (i, &(v, w)) in sorted.iter().enumerate() {
             if i == 0 {
                 last_value = v;
-                wmin = w as f64;
+                wmin = f64::from(w);
                 continue;
             }
             if last_value == v {
-                wmin += w as f64;
+                wmin += f64::from(w);
                 continue;
             }
             let rmax = rmin + wmin;
@@ -294,7 +294,7 @@ fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>
             ));
             rmin = rmax;
             last_value = v;
-            wmin = w as f64;
+            wmin = f64::from(w);
         }
         let rmax = rmin + wmin;
         out.push(Entry::new(
@@ -311,11 +311,11 @@ fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>
         if next_goal == -1.0 {
             next_goal = 0.0;
             last_value = v;
-            wmin = w as f64;
+            wmin = f64::from(w);
             continue;
         }
         if last_value == v {
-            wmin += w as f64;
+            wmin += f64::from(w);
         } else {
             let rmax = rmin + wmin;
             let mut size = out.len();
@@ -330,13 +330,13 @@ fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>
                     size += 1;
                 }
                 next_goal = if size == max_size {
-                    sum_total * 2.0 + 1e-5f32 as f64
+                    sum_total * 2.0 + f64::from(1e-5f32)
                 } else {
-                    (size as f64 * sum_total / max_size as f64) as f32 as f64
+                    f64::from((size as f64 * sum_total / max_size as f64) as f32)
                 };
             }
             rmin = rmax;
-            wmin = w as f64;
+            wmin = f64::from(w);
             last_value = v;
         }
     }
@@ -377,14 +377,14 @@ fn query_cut_values(data: &[Entry], max_bin: usize, out: &mut Vec<f32>) {
             next_value = advance(next_value + 1, last_cut);
         }
     } else {
-        let total = data[n - 1].rmax as f64;
+        let total = f64::from(data[n - 1].rmax);
         let mut q = 0usize;
         for i in 1..max_bin {
             let rank2 = 2.0 * (i as f64 * total / max_bin as f64);
-            while q < n - 2 && rank2 >= (data[q + 1].rmin + data[q + 1].rmax) as f64 {
+            while q < n - 2 && rank2 >= f64::from(data[q + 1].rmin + data[q + 1].rmax) {
                 q += 1;
             }
-            let queried = if rank2 < (data[q].rmin_next() + data[q + 1].rmax_prev()) as f64 {
+            let queried = if rank2 < f64::from(data[q].rmin_next() + data[q + 1].rmax_prev()) {
                 data[q]
             } else {
                 data[q + 1]
@@ -455,11 +455,11 @@ impl WQSketch {
     /// otherwise append; `false` when the queue is full.
     #[inline]
     fn queue_push(&mut self, value: f32, weight: f32) -> bool {
-        if let Some(last) = self.queue.last_mut() {
-            if last.0 == value {
-                last.1 += weight;
-                return true;
-            }
+        if let Some(last) = self.queue.last_mut()
+            && last.0 == value
+        {
+            last.1 += weight;
+            return true;
         }
         if self.queue.len() == 2 * self.limit_size {
             return false;

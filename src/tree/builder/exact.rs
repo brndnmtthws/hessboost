@@ -1,4 +1,4 @@
-//! Exact greedy tree construction (XGBoost's `tree_method=exact`, ColMaker).
+//! Exact greedy tree construction (XGBoost's `tree_method=exact`, `ColMaker`).
 //!
 //! For each node we scan every feature's value-sorted entries and evaluate every
 //! candidate threshold the way XGBoost's `ColMaker` does: a backward
@@ -12,14 +12,14 @@
 //! Monotone and interaction constraints are honored during split search.
 
 use super::{
-    build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
-    sweep_categorical, xgb_loss_chg, xgb_node_gain, xgb_update, BestSplit, InteractionState,
-    SplitPos, BELOW_ALL_VALUES, K_RT_EPS,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, K_RT_EPS, SplitPos, build_interaction_sets,
+    finalize_leaf_values, next_allowed, permits, sum_rows, sweep_categorical, xgb_loss_chg,
+    xgb_node_gain, xgb_update,
 };
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
-use crate::tree::constraints::{child_bounds, Bounds, MonotoneConstraints};
+use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
@@ -153,8 +153,8 @@ impl<'a> ExactTreeBuilder<'a> {
         let mut node_bounds: Vec<Bounds> = vec![Bounds::default()];
         let mut node_allowed: Vec<Option<InteractionState>> = vec![None];
 
-        // With no monotone constraints, the cheap closed-form gain path is exact
-        // and behaves exactly as before; the bounded path is used otherwise.
+        // With no monotone constraints the closed-form gain path is exact; the
+        // bounded path is used otherwise.
         let constrained = self.cons.is_active();
         let ftypes = data.feature_types();
 
@@ -227,7 +227,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             &mut best[slot],
                             &mut cats,
                             node_stats[nid],
-                            root_gain[slot] as f64,
+                            f64::from(root_gain[slot]),
                             node_bounds[nid],
                             dir,
                             constrained,
@@ -273,7 +273,7 @@ impl<'a> ExactTreeBuilder<'a> {
                                 // between the two values, so the partition is
                                 // unchanged. Trees must stay finite.
                                 let last = last_val[slot];
-                                let mut mid = (val + last) * 0.5;
+                                let mut mid = f32::midpoint(val, last);
                                 if !mid.is_finite() {
                                     mid = val * 0.5 + last * 0.5;
                                 }
@@ -731,7 +731,7 @@ mod tests {
     /// Returns the predictions.
     fn train_exact_finite(x: &[f32], y: &[f32]) -> Vec<f32> {
         use crate::config::TreeMethod;
-        use crate::learner::{train, BoostedModel};
+        use crate::learner::{BoostedModel, train};
         let n = x.len();
         let data = DMatrix::from_dense(x, n, 1)
             .unwrap()

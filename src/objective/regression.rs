@@ -1,6 +1,6 @@
 //! Regression objectives.
 
-use super::{weighted_label_mean, GradPair, Objective};
+use super::{GradPair, Objective, weighted_label_mean};
 
 /// Squared-error regression (`reg:squarederror`).
 ///
@@ -11,7 +11,7 @@ use super::{weighted_label_mean, GradPair, Objective};
 pub struct SquaredErrorObjective;
 
 impl Objective for SquaredErrorObjective {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "reg:squarederror"
     }
 
@@ -83,7 +83,7 @@ impl Default for PseudoHuberObjective {
 }
 
 impl Objective for PseudoHuberObjective {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "reg:pseudohubererror"
     }
 
@@ -192,7 +192,7 @@ mod tests {
         let s = 17f32; // 1 + 4²
         let g1 = -4.0f32 / s.sqrt();
         let h1 = 1.0f32 / (s * s.sqrt());
-        let expected = (-(g1 as f64) / (1.0 + h1 as f64)) as f32;
+        let expected = (-f64::from(g1) / (1.0 + f64::from(h1))) as f32;
         assert_eq!(margins, vec![expected]);
         assert!(
             margins[0] < 1.0,

@@ -115,7 +115,7 @@ impl CNode {
         self.slot as usize / FEATURE_LANES
     }
 
-    /// Sign mask a raw value is XORed with before keying: `SIGN` for a
+    /// Sign mask a raw value is `XORed` with before keying: `SIGN` for a
     /// mirrored numeric node, `0` otherwise.
     #[inline(always)]
     fn negate_mask(&self) -> u32 {
@@ -357,7 +357,11 @@ impl CompactForest {
             // SAFETY: `CNode` is `repr(C)` with `slot` then `key` as its first
             // eight bytes (asserted above), x86-64 is little-endian, and an
             // unaligned read through a valid reference is sound.
-            let packed = unsafe { (node as *const CNode).cast::<u64>().read_unaligned() };
+            let packed = unsafe {
+                std::ptr::from_ref::<CNode>(node)
+                    .cast::<u64>()
+                    .read_unaligned()
+            };
             (packed as u32 as usize, (packed >> 32) as u32)
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -436,14 +440,7 @@ impl CompactForest {
             "row block holds fewer rows than requested"
         );
         let meta = self.trees[t];
-        if !meta.lockstep_ok() {
-            for g in 0..groups {
-                let grp = &lanes[g * group_len..(g + 1) * group_len];
-                for j in 0..LANES {
-                    sink(g * LANES + j, self.leaf_id_keyed(t, grp, j));
-                }
-            }
-        } else {
+        if meta.lockstep_ok() {
             meta.check_width(n_cols);
             let nodes = &self.nodes[..];
             let root = meta.root as usize;
@@ -463,6 +460,8 @@ impl CompactForest {
                             // features of FEATURE_LANES keys.
                             let node = unsafe { nodes.get_unchecked(nid[$j]) };
                             let (slot, key) = Self::slot_key(node);
+                            // SAFETY: see above; `slot + j` indexes that
+                            // feature's FEATURE_LANES keys.
                             let k = unsafe { *grp.get_unchecked(slot + $j) };
                             nid[$j] = node.left as usize + usize::from(k > key);
                         )*};
@@ -471,6 +470,13 @@ impl CompactForest {
                 }
                 for (j, &id) in nid.iter().enumerate() {
                     sink(g * LANES + j, id as u32);
+                }
+            }
+        } else {
+            for g in 0..groups {
+                let grp = &lanes[g * group_len..(g + 1) * group_len];
+                for j in 0..LANES {
+                    sink(g * LANES + j, self.leaf_id_keyed(t, grp, j));
                 }
             }
         }
@@ -583,6 +589,7 @@ impl CompactForest {
                         // every tree in the group and `keys` holds two keys
                         // per feature, indexed by `slot / LANES`.
                         let node = unsafe { nodes.get_unchecked(nid[$j]) };
+                        // SAFETY: see above.
                         let k = unsafe { *keys.get_unchecked(node.slot as usize / LANES) };
                         nid[$j] = Self::next_numeric(node, k);
                     )*};
@@ -783,7 +790,7 @@ mod tests {
                 assert_eq!(key(a) == key(b), a == b, "{a} vs {b}");
             }
             assert!(key(a) > key(f32::NAN), "{a} must key above missing");
-            assert!(!(key(f32::NAN) > key(a)), "missing never compares greater");
+            assert!((key(f32::NAN) <= key(a)), "missing never compares greater");
             assert!(unkey(key(a)) == a, "{a} round trip");
         }
         assert_eq!(key(f32::NAN), 0);
@@ -837,7 +844,7 @@ mod tests {
             }
         }
         let n = rows.len() / 2;
-        assert!(n % LANES != 0, "layout must exercise a tail");
+        assert!(!n.is_multiple_of(LANES), "layout must exercise a tail");
         let (lanes, tail) = split_lanes(&rows, 2);
         for (t, tree) in trees.iter().enumerate() {
             let mut ids = vec![0u32; n];

@@ -176,13 +176,13 @@ impl DMatrix {
         }
         check_len("csr indices/values length", values.len(), indices.len())?;
         check_csr(&indptr, values.len())?;
-        if let Some(&m) = indices.iter().max() {
-            if (m as usize) >= n_cols {
-                return Err(HessboostError::FeatureOutOfBounds {
-                    index: m as usize,
-                    num_features: n_cols,
-                });
-            }
+        if let Some(&m) = indices.iter().max()
+            && (m as usize) >= n_cols
+        {
+            return Err(HessboostError::FeatureOutOfBounds {
+                index: m as usize,
+                num_features: n_cols,
+            });
         }
         if values.iter().any(|v| !v.is_finite()) {
             return Err(HessboostError::invalid_param(
@@ -248,7 +248,7 @@ impl DMatrix {
     /// Attach a per-instance base margin (raw prediction offset, `len == n_rows`
     /// for single-output objectives).
     pub fn with_base_margin(mut self, base_margin: &[f32]) -> Result<Self> {
-        if base_margin.is_empty() || base_margin.len() % self.n_rows != 0 {
+        if base_margin.is_empty() || !base_margin.len().is_multiple_of(self.n_rows) {
             return Err(HessboostError::invalid_param(
                 "base_margin",
                 "length must be a non-zero multiple of n_rows",
@@ -320,13 +320,13 @@ impl DMatrix {
         for (col, ty) in types.iter().enumerate() {
             if *ty == FeatureType::Categorical {
                 for row in 0..self.n_rows {
-                    if let Some(v) = self.get(row, col) {
-                        if v < 0.0 || v.fract() != 0.0 || v >= u32::MAX as f32 {
-                            return Err(HessboostError::invalid_param(
-                                "categorical feature",
-                                format!("feature {col} contains invalid category value {v}"),
-                            ));
-                        }
+                    if let Some(v) = self.get(row, col)
+                        && (v < 0.0 || v.fract() != 0.0 || v >= u32::MAX as f32)
+                    {
+                        return Err(HessboostError::invalid_param(
+                            "categorical feature",
+                            format!("feature {col} contains invalid category value {v}"),
+                        ));
                     }
                 }
             }
@@ -538,7 +538,7 @@ impl DMatrix {
             indptr.push(values.len());
         }
         let mut out = DMatrix::from_csr(indptr, indices, values, self.n_cols)?;
-        out.feature_types = self.feature_types.clone();
+        out.feature_types.clone_from(&self.feature_types);
         if let Some(l) = &self.labels {
             out.labels = Some(rows.iter().map(|&r| l[r]).collect());
         }

@@ -6,18 +6,18 @@
 //! is ever built directly. Supports both `depthwise` and `lossguide` growth.
 
 use super::{
-    build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
-    sweep_categorical, xgb_loss_chg, xgb_node_gain, xgb_update, BestSplit, InteractionState,
-    SplitPos, BELOW_ALL_VALUES,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, build_interaction_sets,
+    finalize_leaf_values, next_allowed, permits, sum_rows, sweep_categorical, xgb_loss_chg,
+    xgb_node_gain, xgb_update,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::tree::constraints::{child_bounds, Bounds, MonotoneConstraints};
+use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::{
-    subtract_in_place, zeroed, BinIndex, CpuBackend, Histogram, HistogramBackend,
+    BinIndex, CpuBackend, Histogram, HistogramBackend, subtract_in_place, zeroed,
 };
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
@@ -423,7 +423,7 @@ impl<'a> HistTreeBuilder<'a> {
         // The children's split searches are independent; near the root, where
         // the frontier holds too few nodes to occupy the pool, running them
         // side by side halves the serial evaluation time. Each search keeps
-        // its sequential candidate order, so the result is unchanged.
+        // its sequential candidate order, so the chosen split is identical.
         let (left_best, right_best) = if terminal {
             (BestSplit::none(), BestSplit::none())
         } else {
@@ -537,7 +537,7 @@ impl<'a> HistTreeBuilder<'a> {
                     &mut best,
                     &mut cats,
                     total,
-                    root_gain as f64,
+                    f64::from(root_gain),
                     bounds,
                     dir,
                     constrained,
@@ -665,8 +665,8 @@ fn route_dense<B: BinIndex>(rows: &[u32], column: &[B], split_bin: usize) -> (Ve
                 let go_left = column[r as usize].index() <= split_bin;
                 lp[nl].write(r);
                 rp[nr].write(r);
-                nl += go_left as usize;
-                nr += !go_left as usize;
+                nl += usize::from(go_left);
+                nr += usize::from(!go_left);
             }
         }
         // SAFETY: `nl + nr == n` and each side's slot `k` was written at the
@@ -771,8 +771,9 @@ mod tests {
         for depth in [1, 2, 4] {
             let params = TrainingParams::builder().max_depth(depth).build().unwrap();
             let builder = HistTreeBuilder::new(&params);
-            let mut sampler = ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 42);
-            let mut expected = sampler.clone();
+            let new_sampler = || ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 42);
+            let mut sampler = new_sampler();
+            let mut expected = new_sampler();
             for _ in 0..3 {
                 let tree = builder.build(&ghist, &gradients, &rows, &mut sampler);
                 assert!(tree.num_nodes() > 1);
@@ -841,13 +842,14 @@ mod tests {
                 .build()
                 .unwrap();
             let builder = HistTreeBuilder::new(&params);
-            let mut expected_sampler =
-                ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 91);
-            let mut sampler = expected_sampler.clone();
+            let new_sampler = || ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 91);
+            // Three samplers from one seed, kept in lockstep by the draws below.
+            let mut expected_sampler = new_sampler();
+            let mut sampler = new_sampler();
+            let mut captured_sampler = new_sampler();
             for _ in 0..3 {
                 let expected = serial
                     .install(|| builder.build(&ghist, &gradients, &rows, &mut expected_sampler));
-                let mut captured_sampler = sampler.clone();
                 let actual =
                     parallel.install(|| builder.build(&ghist, &gradients, &rows, &mut sampler));
                 let (captured, leaves) = parallel.install(|| {

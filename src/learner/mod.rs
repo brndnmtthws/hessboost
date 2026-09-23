@@ -6,10 +6,10 @@ pub(crate) mod model;
 mod shap;
 mod train;
 
-pub use cv::{cv, CvResult};
+pub use cv::{CvResult, cv};
 pub(crate) use model::LinearModel;
 pub use model::{BoostedModel, ImportanceType};
 pub use train::{
-    train, train_with_custom_metric, train_with_eval, train_with_objective, EvalSet, RoundEval,
-    TrainResult,
+    EvalSet, RoundEval, TrainResult, train, train_with_custom_metric, train_with_eval,
+    train_with_objective,
 };

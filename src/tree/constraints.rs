@@ -6,7 +6,7 @@
 //! for the whole subtree, following the scheme XGBoost uses.
 
 use crate::config::Monotone;
-use crate::tree::gain::{threshold_l1, GradStats, RegParams};
+use crate::tree::gain::{GradStats, RegParams, threshold_l1};
 
 /// Per-feature monotone directions (`+1` increasing, `-1` decreasing, `0` none).
 #[derive(Debug, Clone, Default)]
@@ -95,7 +95,7 @@ pub fn child_bounds(parent: Bounds, dir: i8, w_left: f64, w_right: f64) -> (Boun
     if dir == 0 {
         return (parent, parent);
     }
-    let mid = 0.5 * (w_left + w_right);
+    let mid = f64::midpoint(w_left, w_right);
     if dir > 0 {
         // Increasing: left ≤ mid ≤ right.
         (

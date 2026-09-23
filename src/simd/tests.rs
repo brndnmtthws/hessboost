@@ -240,11 +240,11 @@ fn short_softmax_batches_match_scalar_across_boundaries() {
             // Offset and guard both buffers to exercise unaligned stores
             // and catch writes past batch/remainder boundaries, including odd rows.
             let mut values = vec![1234.0; original.len() + 2];
-            values[1..original.len() + 1].copy_from_slice(&original);
-            softmax_rows_inplace(&mut values[1..original.len() + 1], num_class);
+            values[1..=original.len()].copy_from_slice(&original);
+            softmax_rows_inplace(&mut values[1..=original.len()], num_class);
             assert_eq!(values[0], 1234.0);
             assert_eq!(values[original.len() + 1], 1234.0);
-            for (actual, expected) in values[1..original.len() + 1].iter().zip(expected) {
+            for (actual, expected) in values[1..=original.len()].iter().zip(expected) {
                 assert!((actual - expected).abs() <= 3e-7);
             }
             for weight in [None, Some(weights.as_slice())] {
@@ -267,13 +267,13 @@ fn short_softmax_batches_match_scalar_across_boundaries() {
                     weight,
                     num_class,
                     1e-16,
-                    &mut actual[1..original.len() + 1],
+                    &mut actual[1..=original.len()],
                 );
                 for index in [0, original.len() + 1] {
                     assert_eq!(actual[index].grad, guard.grad);
                     assert_eq!(actual[index].hess, guard.hess);
                 }
-                assert_grad_pairs_close(&actual[1..original.len() + 1], &expected);
+                assert_grad_pairs_close(&actual[1..=original.len()], &expected);
             }
         }
     }
@@ -423,7 +423,7 @@ fn softmax_gradient_underflowing_rows_match_scalar() {
         assert_underflowing_softmax_gradient_matches_scalar(
             num_class,
             |preds, labels, weights, out| {
-                softmax_gradient(preds, labels, weights, num_class, 1e-16, out)
+                softmax_gradient(preds, labels, weights, num_class, 1e-16, out);
             },
         );
     }
@@ -444,13 +444,19 @@ fn neon_softmax_gradient_kernels_underflow_like_scalar() {
                 unsafe {
                     match num_class {
                         2 => {
-                            aarch64::short_softmax_gradient::<2>(preds, labels, weights, 1e-16, out)
+                            aarch64::short_softmax_gradient::<2>(
+                                preds, labels, weights, 1e-16, out,
+                            );
                         }
                         3 => {
-                            aarch64::short_softmax_gradient::<3>(preds, labels, weights, 1e-16, out)
+                            aarch64::short_softmax_gradient::<3>(
+                                preds, labels, weights, 1e-16, out,
+                            );
                         }
                         _ => {
-                            aarch64::short_softmax_gradient::<4>(preds, labels, weights, 1e-16, out)
+                            aarch64::short_softmax_gradient::<4>(
+                                preds, labels, weights, 1e-16, out,
+                            );
                         }
                     }
                 }
@@ -478,9 +484,9 @@ fn avx2_softmax_gradient_kernels_underflow_like_scalar() {
                 // matrices of `num_class` columns; K is 2 or 4.
                 unsafe {
                     if num_class == 2 {
-                        x86_64::short_softmax_gradient::<2>(preds, labels, weights, 1e-16, out)
+                        x86_64::short_softmax_gradient::<2>(preds, labels, weights, 1e-16, out);
                     } else {
-                        x86_64::short_softmax_gradient::<4>(preds, labels, weights, 1e-16, out)
+                        x86_64::short_softmax_gradient::<4>(preds, labels, weights, 1e-16, out);
                     }
                 }
             },
@@ -566,8 +572,8 @@ fn pointwise_metric_sums_are_close_to_scalar() {
             };
             let mut expected = (0.0, 0.0);
             for i in 0..preds.len() {
-                let weight = weights.map_or(1.0, |values| values[i] as f64);
-                let difference = preds[i] as f64 - labels[i] as f64;
+                let weight = weights.map_or(1.0, |values| f64::from(values[i]));
+                let difference = f64::from(preds[i]) - f64::from(labels[i]);
                 expected.0 += weight
                     * if squared {
                         difference * difference
@@ -583,7 +589,7 @@ fn pointwise_metric_sums_are_close_to_scalar() {
         let actual = classification_error_sum(&preds, &labels, weights);
         let mut expected = (0.0, 0.0);
         for i in 0..preds.len() {
-            let weight = weights.map_or(1.0, |values| values[i] as f64);
+            let weight = weights.map_or(1.0, |values| f64::from(values[i]));
             if (preds[i] > 0.5) != (labels[i] > 0.5) {
                 expected.0 += weight;
             }
@@ -609,9 +615,9 @@ fn logarithmic_metric_sums_are_close_to_scalar() {
         let actual = log_loss_sum(&preds, &binary_labels, weights);
         let mut expected = (0.0, 0.0);
         for i in 0..preds.len() {
-            let weight = weights.map_or(1.0, |values| values[i] as f64);
-            let probability = (preds[i] as f64).clamp(1e-15, 1.0 - 1e-15);
-            let label = binary_labels[i] as f64;
+            let weight = weights.map_or(1.0, |values| f64::from(values[i]));
+            let probability = f64::from(preds[i]).clamp(1e-15, 1.0 - 1e-15);
+            let label = f64::from(binary_labels[i]);
             expected.0 +=
                 weight * -(label * probability.ln() + (1.0 - label) * (1.0 - probability).ln());
             expected.1 += weight;
@@ -627,9 +633,9 @@ fn logarithmic_metric_sums_are_close_to_scalar() {
             };
             let mut expected = (0.0, 0.0);
             for i in 0..preds.len() {
-                let weight = weights.map_or(1.0, |values| values[i] as f64);
-                let prediction = (preds[i] as f64).max(1e-8);
-                let label = positive_labels[i] as f64;
+                let weight = weights.map_or(1.0, |values| f64::from(values[i]));
+                let prediction = f64::from(preds[i]).max(1e-8);
+                let label = f64::from(positive_labels[i]);
                 expected.0 += weight
                     * if gamma {
                         label / prediction + prediction.ln()

@@ -1,98 +1,112 @@
-# AGENTS.md guide for AI coding agents
+# AGENTS.md
 
-Context for automated agents working with **hessboost**, a faithful,
-pure-Rust reimplementation of XGBoost gradient boosting (no C/C++, no FFI).
-Human docs: `README.md` and [docs.rs](https://docs.rs/hessboost).
+hessboost is a pure-Rust reimplementation of XGBoost gradient boosting: one
+library crate, no C/C++, no FFI. User docs live in `README.md`, the rustdoc
+(`src/lib.rs`), and `examples/`. This file covers working on the code.
 
-> This codebase was generated with Claude (Anthropic) under human direction.
-> It is tested and XGBoost-parity-checked in CI but may contain bugs. Verify
-> changes with `cargo test`/`cargo clippy` and don't assume unlisted behavior.
+The code is largely AI-generated. Treat unlisted behavior as unverified and
+prove changes with the commands below.
 
-## Using it as a dependency
+## Toolchain
 
-```toml
-[dependencies]
-hessboost = "0.1"
-```
+`mise.toml` pins Rust, mbx, and uv; run `mise install`. Edition 2024, MSRV
+1.93 (`rust-version` in `Cargo.toml`). CI runs cargo through `mbx` (a build
+cache); locally, plain `cargo` works the same.
 
-```rust
-use hessboost::prelude::*;
-
-fn main() -> Result<()> {
-    // features: row-major &[f32] of length n_rows * n_cols; labels: &[f32] of n_rows
-    let dtrain = DMatrix::from_dense(&x, n_rows, n_cols)?.with_labels(&y)?;
-    let params = TrainingParams::builder()
-        .objective("reg:squarederror")   // XGBoost-compatible name
-        .max_depth(6).eta(0.1).build()?;
-    let model = train(&params, &dtrain, 100)?;
-    let preds = model.predict(&dtrain)?; // Vec<f32>, length n_rows (n_rows*num_class for multiclass)
-    Ok(())
-}
-```
-
-Everything in the typical workflow is re-exported from `hessboost::prelude`.
-
-## Key entry points
-
-| Function | Purpose |
-|---|---|
-| `train(&params, &dtrain, num_round) -> Result<BoostedModel>` | Basic training. |
-| `train_with_eval(&params, &dtrain, num_round, &[(&DMatrix, "name")], early_stopping_rounds: Option<usize>) -> Result<TrainResult>` | Watch eval sets + early stopping. `TrainResult { model, history }`. |
-| `train_with_objective(&params, &dtrain, num_round, Box<dyn Objective>) -> Result<BoostedModel>` | Custom loss (see `CustomObjective`). |
-| `train_with_custom_metric(&params, &dtrain, num_round, evals, early, Box<dyn Metric>) -> Result<TrainResult>` | Custom eval metric (see `CustomMetric`). |
-| `cv(&params, &data, num_round, nfold, seed) -> Result<Vec<CvResult>>` | K-fold cross-validation. |
-
-## Core types
-
-- **`DMatrix`** stores data. Use `from_dense(&[f32], rows, cols)`, `from_csr(indptr, indices, values, cols)`, `from_libsvm(path)`, or `from_csv`/`read_csv(reader, &CsvOptions)`. Chainable methods include `.with_labels(&[f32])`, `.with_weights`, `.with_base_margin` (warm-start), `.with_group_sizes(&[usize])` and `.with_group_weights(&[f32])` (ranking), and `.with_feature_types(&[FeatureType])` (categorical).
-- **`TrainingParams`** provides configuration through `TrainingParams::builder()...build()?`. Field and method names mirror XGBoost: `objective`, `num_class`, `eta`, `max_depth`, `max_leaves`, `min_child_weight`, `max_delta_step` (unset ⇒ XGBoost's default: `0.7` for `count:poisson`, else unconstrained; see `effective_max_delta_step()`), `gamma`, `lambda`, `alpha`, `subsample`, `colsample_bytree`/`bylevel`/`bynode`, `max_bin`, `tree_method` (`TreeMethod::{Auto,Hist,Exact,Approx}`), `grow_policy` (`GrowPolicy::{DepthWise,LossGuide}`), `booster` (`BoosterKind::{GbTree,Dart,GbLinear}`), `monotone_constraints(Vec<Monotone>)`, `interaction_constraints(Vec<Vec<u32>>)`, `base_score`, `eval_metric(name)`, `tweedie_variance_power`, `huber_slope`, `lambdarank_num_pair_per_sample`, and `seed`.
-- **`BoostedModel`** is the trained model. Methods include `predict` (reported space, e.g. probabilities), `predict_margin` (raw), `predict_class` (argmax), `predict_leaf`, `predict_contribs` (TreeSHAP), `predict_interactions` (TreeSHAP interactions), `feature_importance(ImportanceType)`, and `num_trees`. I/O methods include `save_binary`/`load_binary`, `to_json`/`from_json`/`save_json`/`load_json`, and `save_xgboost_json`/`load_xgboost_json` (interop with real XGBoost).
-
-## Supported names (strings passed to `.objective(...)` / `.eval_metric(...)`)
-
-- Objectives: `reg:squarederror` (alias `reg:linear`), `reg:logistic`, `reg:pseudohubererror`, `reg:gamma`, `reg:tweedie`, `count:poisson`, `binary:logistic`, `multi:softmax`, `multi:softprob` (need `.num_class(k)`), `rank:pairwise`, `rank:ndcg`, `rank:map` (need `.with_group_sizes`).
-- Metrics: `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`, `merror`, `ndcg`, `map` (accept `@k`, e.g. `ndcg@5`), `poisson-nloglik`, `gamma-nloglik`, `tweedie-nloglik` (accepts `@rho`). Default metrics follow XGBoost (`ndcg@k`/`map@k` for ranking, `tweedie-nloglik@rho` for Tweedie) except `reg:pseudohubererror`, which reports `mae` because XGBoost's `mphe` is not implemented.
-
-## Conventions & gotchas
-
-- **Prediction layout:** single-output and `multi:softmax` → length `n_rows`. `multi:softprob` → `n_rows * num_class`, row-major `[row][class]`. SHAP contribs → `[row][n_features + 1]` (last = bias). SHAP interactions → `[row][(n_features+1)^2]`.
-- **Errors:** everything returns `Result<T, HessboostError>` (`Result` alias is in the prelude). Prefer `?` and do not `unwrap` in library code.
-- **Determinism:** identical `(params, data, seed)` ⇒ identical predictions (property-tested).
-- **Parity:** matches XGBoost *model quality* (CI-tested via `tests/parity.rs`), not bit-identical predictions.
-- **`num_class` is required** for `multi:*`. Ranking objectives require `with_group_sizes`.
-- No `unsafe` appears in the public API. The crate uses `#![forbid(unsafe_op_in_unsafe_fn)]`.
-
-## Runnable examples (`examples/`)
-
-`binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-`custom_objective`, `constraints`, `train_regression`. Run one with
-`cargo run --release --example <name>`. These are the best copy-paste starting
-points for each workflow.
-
-## Repo commands (from the repository root)
+## Commands
 
 ```sh
-cargo test                                   # unit + property + doc tests
-cargo clippy --all-targets -- -D warnings    # lints (CI-enforced)
-cargo fmt --all --check                      # formatting (CI-enforced)
-cargo run --release --example <name>         # run an example
-cargo bench                                  # criterion micro-benchmarks
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings  # from an aarch64 host
+cargo test --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+MISE_RUST_VERSION=1.93.0 mise exec -- cargo check --all-targets --all-features             # MSRV
 ```
 
-Toolchain versions (rust, mbx, uv) are pinned in `mise.toml`; `mise install`
-sets them up. CI (`.github/workflows/ci.yml`) runs the same commands through
-`mbx` (e.g. `mbx test`) for build caching, on x86_64/aarch64 Linux and
-aarch64 macOS.
+XGBoost parity (needs uv; fixtures are generated into the gitignored
+`fixtures/`, never committed):
 
-## Module map (`src/`)
+```sh
+uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+cargo test --test parity --release -- --ignored --nocapture
+uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+```
 
-`data/` (DMatrix, quantile binning, ghist) · `config/` (TrainingParams) ·
-`objective/` · `metric/` · `tree/` (regtree, gain, constraints, sampler,
-`builder/{exact,hist,approx}`, `hist/` backend) · `booster/` (gblinear) ·
-`learner/` (train loop, model, cv, shap) · `model/` (XGBoost-JSON I/O).
+CI (`.github/workflows/ci.yml`) runs all of these; tests run on x86_64 Linux,
+aarch64 Linux, and aarch64 macOS. `scripts/README.md` documents the fixture
+case matrix, tolerances, and benchmark harnesses.
 
-## Scope
+## Lints
 
-Not yet implemented: UBJSON (binary) XGBoost format, GPU backend,
-distributed/external-memory training, and language wrappers (Python/CLI/C-ABI).
-Do not assume these exist.
+Clippy `pedantic` is on via `[lints.clippy]` in `Cargo.toml`, with a short
+allow-list for lints that fight numeric code (casts, float equality, short
+names, `inline(always)`, per-function `# Errors`/`# Panics` docs). CI denies
+all warnings. Fix new warnings; a local `#[allow(..., reason = "...")]` is
+acceptable only where the lint is wrong for that site. `clippy.toml` lists
+doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
+
+## Layout (`src/`)
+
+| Path | Contents |
+|---|---|
+| `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning |
+| `config/` | `TrainingParams` and its builder; names mirror XGBoost |
+| `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
+| `booster/` | `gblinear` |
+| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP |
+| `model/` | XGBoost JSON model import/export |
+| `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
+
+`tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
+(proptest), `shap_accumulation.rs`. `benches/training.rs` is the Criterion
+suite; `docs/performance.md` records its results.
+
+## Invariants
+
+- **Errors:** public fallible APIs return `hessboost::Result<T>`
+  (`HessboostError`). No `unwrap`/`expect` on user-controlled input in library
+  code.
+- **Determinism:** identical params, data, and seed give identical
+  predictions (property-tested), and the hist builder grows the same tree
+  serially and in parallel. Parallel reductions keep a fixed order.
+- **Unsafe:** confined to `simd/` and the hot loops in `tree/compact.rs`,
+  `tree/hist/`, and `tree/builder/hist.rs`. Every block needs a `// SAFETY:`
+  comment (`undocumented_unsafe_blocks`); `unsafe_op_in_unsafe_fn` is
+  forbidden.
+- **SIMD:** dispatch checks CPU features at runtime and falls back to
+  `simd/scalar.rs`. Split search, histogram sums, and prediction must match
+  the scalar path bit for bit; transcendental kernels stay within the
+  tolerances in `simd/tests.rs`. Code for one architecture only compiles on
+  it, so lint the other target explicitly.
+- **Parity:** the target is XGBoost 3.4.1 behavior. `exact`-tier fixtures
+  match pointwise; RNG-driven cases (subsampling, DART) only match within a
+  quality band because the RNG streams differ.
+- **Formats:** the native binary magic (`SQB\0`) and the JSON layouts are
+  compatibility contracts; do not change them without a migration.
+- **Prediction layout:** single-output and `multi:softmax` give `n_rows`
+  values; `multi:softprob` gives `n_rows * num_class`, row-major. SHAP
+  contributions are `[row][n_features + 1]` (bias last), interactions
+  `[row][(n_features + 1)^2]`, with an extra output axis for multiclass.
+
+## Public API at a glance
+
+Everything below is in `hessboost::prelude`.
+
+- `train(&params, &dtrain, rounds)`, `train_with_eval(.., &[(&DMatrix, "name")], early_stopping: Option<usize>)`,
+  `train_with_objective(.., &dyn Objective)`, `train_with_custom_metric(.., Box<dyn Metric>)`,
+  `cv(&params, &data, rounds, nfold, seed)`.
+- `DMatrix::from_dense`/`from_csr`, `.with_labels`/`.with_weights`/`.with_base_margin`/
+  `.with_group_sizes`/`.with_feature_types`; file loaders are `hessboost::data::{load_csv, load_libsvm}`.
+- `BoostedModel::predict`/`predict_margin`/`predict_class`/`predict_leaf`/
+  `predict_contribs`/`predict_interactions`, `feature_importance`, and
+  `save_*`/`load_*` for native binary, JSON, and XGBoost JSON.
+
+Multiclass objectives need `.num_class(k)`; ranking objectives need
+`.with_group_sizes`.
+
+## Not implemented
+
+UBJSON XGBoost models, GPU training, distributed or external-memory training,
+and Python/CLI/C-ABI bindings.

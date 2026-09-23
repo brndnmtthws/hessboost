@@ -35,7 +35,7 @@ impl GradStats {
     /// Construct from one row's gradient pair, widening to `f64`.
     #[inline]
     pub fn from_pair(gp: GradPair) -> Self {
-        GradStats::new(gp.grad as f64, gp.hess as f64)
+        GradStats::new(f64::from(gp.grad), f64::from(gp.hess))
     }
 
     /// Add another set of statistics.
@@ -45,9 +45,10 @@ impl GradStats {
         self.hess += other.hess;
     }
 
-    /// Subtract another set of statistics (used for the "other side" of a split
-    /// and for histogram subtraction later).
+    /// Subtract another set of statistics (the other side of a split, or a
+    /// histogram subtraction).
     #[inline]
+    #[must_use]
     pub fn sub(&self, other: GradStats) -> GradStats {
         GradStats {
             grad: self.grad - other.grad,
@@ -80,10 +81,10 @@ impl RegParams {
     /// explicit `0` stays unconstrained.
     pub fn from_params(p: &TrainingParams) -> Self {
         RegParams {
-            lambda: p.lambda as f32 as f64,
-            alpha: p.alpha as f32 as f64,
-            max_delta_step: p.effective_max_delta_step() as f32 as f64,
-            min_child_weight: p.min_child_weight as f32 as f64,
+            lambda: f64::from(p.lambda as f32),
+            alpha: f64::from(p.alpha as f32),
+            max_delta_step: f64::from(p.effective_max_delta_step() as f32),
+            min_child_weight: f64::from(p.min_child_weight as f32),
         }
     }
 }

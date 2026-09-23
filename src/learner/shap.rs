@@ -58,11 +58,7 @@ const INV: [f64; INV_LEN] = {
 
 #[inline(always)]
 fn inv(n: usize) -> f64 {
-    if n < INV_LEN {
-        INV[n]
-    } else {
-        1.0 / n as f64
-    }
+    if n < INV_LEN { INV[n] } else { 1.0 / n as f64 }
 }
 
 /// `n as f64` for path positions. Going through `i64` lets the compiler emit a
@@ -274,7 +270,7 @@ impl ShapTree {
                 },
                 cover_fraction: 0.0,
                 value: if n.is_leaf() {
-                    n.leaf_value as f64
+                    f64::from(n.leaf_value)
                 } else {
                     0.0
                 },
@@ -288,10 +284,10 @@ impl ShapTree {
             if n.is_leaf() {
                 continue;
             }
-            let cover = n.sum_hess as f64;
+            let cover = f64::from(n.sum_hess);
             for child in [n.left as usize, n.right as usize] {
                 nodes[child].cover_fraction = if cover > 0.0 {
-                    src[child].sum_hess as f64 / cover
+                    f64::from(src[child].sum_hess) / cover
                 } else {
                     0.0
                 };
@@ -430,7 +426,7 @@ fn tree_shap_rec(
 
     // If this feature is already on the path, unwind it first so it is not
     // double-counted, carrying its incoming fractions forward.
-    let split_i = split as i64;
+    let split_i = i64::from(split);
     let mut incoming_zero = 1.0;
     let mut incoming_one = 1.0;
     let found = path[1..len]
@@ -512,16 +508,16 @@ fn tree_shap(
 fn node_mean_value(tree: &RegTree, node_index: usize) -> f64 {
     let node = tree.node(node_index);
     if node.is_leaf() {
-        return node.leaf_value as f64;
+        return f64::from(node.leaf_value);
     }
-    let cover = node.sum_hess as f64;
+    let cover = f64::from(node.sum_hess);
     if cover <= 0.0 {
         return 0.0;
     }
     let l = node.left as usize;
     let r = node.right as usize;
-    let lc = tree.node(l).sum_hess as f64;
-    let rc = tree.node(r).sum_hess as f64;
+    let lc = f64::from(tree.node(l).sum_hess);
+    let rc = f64::from(tree.node(r).sum_hess);
     (lc * node_mean_value(tree, l) + rc * node_mean_value(tree, r)) / cover
 }
 
@@ -534,7 +530,7 @@ impl BoostedModel {
         let tree_means: Vec<f64> = trees
             .iter()
             .enumerate()
-            .map(|(i, t)| node_mean_value(t, 0) * self.tree_weight(i) as f64)
+            .map(|(i, t)| node_mean_value(t, 0) * f64::from(self.tree_weight(i)))
             .collect();
         let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
         let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
@@ -562,7 +558,7 @@ impl BoostedModel {
         for (ti, tree) in shap_trees.iter().enumerate() {
             let cls = ti % k;
             let off = cls * width;
-            let weight = self.tree_weight(ti) as f64;
+            let weight = f64::from(self.tree_weight(ti));
             scratch.fill(0.0);
             tree_shap(tree, get, scratch, arena, 0, -1);
             for f in 0..nf {
@@ -611,14 +607,14 @@ impl BoostedModel {
                     *a = 0.0;
                 }
                 for c in 0..k {
-                    acc[c * width + nf] = initial[row * k + c] as f64;
+                    acc[c * width + nf] = f64::from(initial[row * k + c]);
                 }
                 if let Some(linear) = self.linear() {
                     self.for_each_linear_contribution(data, row, |f, c, v| {
                         acc[c * width + f] += v;
                     });
                     for c in 0..k {
-                        acc[c * width + nf] += linear.bias()[c] as f64;
+                        acc[c * width + nf] += f64::from(linear.bias()[c]);
                     }
                 }
                 rows.load(row, 1);
@@ -667,13 +663,6 @@ impl BoostedModel {
     /// `t % n_outputs`.
     #[allow(clippy::needless_range_loop)]
     pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        let pro = self.attribution_prologue(data)?;
-        let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
-        let initial = pro.initial;
-        let mwidth = width * width;
-        let (tree_means, shap_trees, arena) = self.shap_forest(trees);
-        let mut out = vec![0f32; n * k * mwidth];
-
         // Per-thread scratch: unconditioned contributions, condition = +1
         // (feature present) / -1 (absent) accumulators, the interaction
         // matrices, per-tree phi buffers, and the path arena.
@@ -689,6 +678,12 @@ impl BoostedModel {
             arena: Vec<PathElement>,
         }
 
+        let pro = self.attribution_prologue(data)?;
+        let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
+        let initial = pro.initial;
+        let mwidth = width * width;
+        let (tree_means, shap_trees, arena) = self.shap_forest(trees);
+        let mut out = vec![0f32; n * k * mwidth];
         out.par_chunks_mut(k * mwidth).enumerate().for_each_init(
             || Scratch {
                 rows: RowBlock::single_rows(data),
@@ -709,14 +704,14 @@ impl BoostedModel {
                 mat.fill(0.0);
 
                 for c in 0..k {
-                    diag[c * width + nf] = initial[row * k + c] as f64;
+                    diag[c * width + nf] = f64::from(initial[row * k + c]);
                 }
                 if let Some(linear) = self.linear() {
                     self.for_each_linear_contribution(data, row, |f, c, v| {
                         diag[c * width + f] += v;
                     });
                     for c in 0..k {
-                        diag[c * width + nf] += linear.bias()[c] as f64;
+                        diag[c * width + nf] += f64::from(linear.bias()[c]);
                     }
                 }
                 self.accumulate_unconditioned(
@@ -753,7 +748,7 @@ impl BoostedModel {
                         s.phi_off.fill(0.0);
                         tree_shap(tree, get, &mut s.phi_on, &mut s.arena, 1, j as i64);
                         tree_shap(tree, get, &mut s.phi_off, &mut s.arena, -1, j as i64);
-                        let weight = self.tree_weight(ti) as f64;
+                        let weight = f64::from(self.tree_weight(ti));
                         for f in 0..nf {
                             on[base + f] += weight * s.phi_on[f];
                             off[base + f] += weight * s.phi_off[f];
@@ -789,7 +784,7 @@ mod tests {
     use crate::learner::train;
 
     /// Build a small dense dataset with `nf` features. Features 0 and 1 carry
-    /// signal, the rest are noise. Returns (data, n_rows).
+    /// signal, the rest are noise. Returns (data, `n_rows`).
     fn make_data(n: usize, nf: usize) -> DMatrix {
         let mut x = vec![0f32; n * nf];
         let mut y = vec![0f32; n];
@@ -831,9 +826,9 @@ mod tests {
         for row in 0..n {
             let s: f64 = contribs[row * width..row * width + width]
                 .iter()
-                .map(|&v| v as f64)
+                .map(|&v| f64::from(v))
                 .sum();
-            let err = (s - margin[row] as f64).abs();
+            let err = (s - f64::from(margin[row])).abs();
             max_err = max_err.max(err);
         }
         assert!(
@@ -874,12 +869,12 @@ mod tests {
             let (o, z) = (m[i].o, m[i].z);
             let mut n = m[l].w;
             for j in (0..l).rev() {
-                if o != 0.0 {
+                if o == 0.0 {
+                    m[j].w = m[j].w * (l + 1) as f64 / (z * (l - j) as f64);
+                } else {
                     let t = m[j].w;
                     m[j].w = n * (l + 1) as f64 / ((j + 1) as f64 * o);
                     n = t - m[j].w * z * (l - j) as f64 / (l + 1) as f64;
-                } else {
-                    m[j].w = m[j].w * (l + 1) as f64 / (z * (l - j) as f64);
                 }
             }
             for j in i..l {
@@ -896,12 +891,12 @@ mod tests {
             let mut n = m[l].w;
             let mut total = 0.0;
             for j in (0..l).rev() {
-                if o != 0.0 {
+                if o == 0.0 {
+                    total += m[j].w * (l + 1) as f64 / (z * (l - j) as f64);
+                } else {
                     let t = n * (l + 1) as f64 / ((j + 1) as f64 * o);
                     total += t;
                     n = m[j].w - t * z * (l - j) as f64 / (l + 1) as f64;
-                } else {
-                    total += m[j].w * (l + 1) as f64 / (z * (l - j) as f64);
                 }
             }
             total
@@ -923,7 +918,7 @@ mod tests {
             if n.is_leaf() {
                 for i in 1..m.len() {
                     let w = unwound_sum(&m, i);
-                    phi[m[i].d as usize] += w * (m[i].o - m[i].z) * n.leaf_value as f64;
+                    phi[m[i].d as usize] += w * (m[i].o - m[i].z) * f64::from(n.leaf_value);
                 }
                 return;
             }
@@ -940,16 +935,16 @@ mod tests {
             } else {
                 (n.right as usize, n.left as usize)
             };
-            let cover = n.sum_hess as f64;
+            let cover = f64::from(n.sum_hess);
             let (mut iz, mut io) = (1.0, 1.0);
-            if let Some(k) = m.iter().position(|e| e.d == n.split_feature as i64) {
+            if let Some(k) = m.iter().position(|e| e.d == i64::from(n.split_feature)) {
                 iz = m[k].z;
                 io = m[k].o;
                 unwind(&mut m, k);
             }
-            let f = n.split_feature as i64;
-            let hz = tree.node(hot).sum_hess as f64 / cover;
-            let cz = tree.node(cold).sum_hess as f64 / cover;
+            let f = i64::from(n.split_feature);
+            let hz = f64::from(tree.node(hot).sum_hess) / cover;
+            let cz = f64::from(tree.node(cold).sum_hess) / cover;
             recurse(tree, x, phi, hot, m.clone(), hz * iz, io, f);
             recurse(tree, x, phi, cold, m, cz * iz, 0.0, f);
         }
@@ -986,13 +981,13 @@ mod tests {
         for row in 0..n {
             let inst = &x[row * nf..(row + 1) * nf];
             let mut phi = vec![0f64; width];
-            phi[nf] = model.base_score() as f64;
+            phi[nf] = f64::from(model.base_score());
             for tree in model.trees() {
                 phi[nf] += super::node_mean_value(tree, 0);
                 textbook::recurse(tree, inst, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
             }
             for (slot, want) in phi.iter().enumerate() {
-                max_err = max_err.max((contribs[row * width + slot] as f64 - want).abs());
+                max_err = max_err.max((f64::from(contribs[row * width + slot]) - want).abs());
             }
         }
         assert!(max_err < 1e-4, "max textbook TreeSHAP error {max_err}");
@@ -1033,8 +1028,11 @@ mod tests {
         for row in 0..n {
             for c in 0..k {
                 let base = (row * k + c) * width;
-                let s: f64 = contribs[base..base + width].iter().map(|&v| v as f64).sum();
-                let err = (s - margin[row * k + c] as f64).abs();
+                let s: f64 = contribs[base..base + width]
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .sum();
+                let err = (s - f64::from(margin[row * k + c])).abs();
                 max_err = max_err.max(err);
             }
         }
@@ -1119,18 +1117,18 @@ mod tests {
             let m = &inter[row * mwidth..row * mwidth + mwidth];
             // Row consistency: each feature row sums to its SHAP contribution.
             for i in 0..nf {
-                let s: f64 = (0..width).map(|j| m[i * width + j] as f64).sum();
-                let cval = contribs[row * width + i] as f64;
+                let s: f64 = (0..width).map(|j| f64::from(m[i * width + j])).sum();
+                let cval = f64::from(contribs[row * width + i]);
                 max_row_err = max_row_err.max((s - cval).abs());
             }
             // Efficiency: the whole matrix sums to the full margin.
-            let total: f64 = m.iter().map(|&v| v as f64).sum();
-            let target = margin[row] as f64;
+            let total: f64 = m.iter().map(|&v| f64::from(v)).sum();
+            let target = f64::from(margin[row]);
             max_eff_err = max_eff_err.max((total - target).abs());
             // Symmetry.
             for i in 0..width {
                 for j in 0..width {
-                    let e = (m[i * width + j] as f64 - m[j * width + i] as f64).abs();
+                    let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
                     max_sym_err = max_sym_err.max(e);
                 }
             }
@@ -1183,16 +1181,16 @@ mod tests {
                 let m = &inter[(row * k + c) * mwidth..(row * k + c) * mwidth + mwidth];
                 let cbase = (row * k + c) * width;
                 for i in 0..nf {
-                    let s: f64 = (0..width).map(|j| m[i * width + j] as f64).sum();
-                    let cval = contribs[cbase + i] as f64;
+                    let s: f64 = (0..width).map(|j| f64::from(m[i * width + j])).sum();
+                    let cval = f64::from(contribs[cbase + i]);
                     max_row_err = max_row_err.max((s - cval).abs());
                 }
-                let total: f64 = m.iter().map(|&v| v as f64).sum();
-                let target = margin[row * k + c] as f64;
+                let total: f64 = m.iter().map(|&v| f64::from(v)).sum();
+                let target = f64::from(margin[row * k + c]);
                 max_eff_err = max_eff_err.max((total - target).abs());
                 for i in 0..width {
                     for j in 0..width {
-                        let e = (m[i * width + j] as f64 - m[j * width + i] as f64).abs();
+                        let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
                         max_sym_err = max_sym_err.max(e);
                     }
                 }

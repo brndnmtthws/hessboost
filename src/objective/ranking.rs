@@ -95,8 +95,8 @@ impl LambdaMartObjective {
                     std::mem::swap(&mut idx_high, &mut idx_low);
                 }
                 let score_diff = p[idx_high] - p[idx_low]; // float subtraction
-                let delta_score = score_diff.abs() as f64;
-                let sigmoid = (1.0f32 / ((-score_diff).min(88.7).exp() + 1.0)) as f64;
+                let delta_score = f64::from(score_diff.abs());
+                let sigmoid = f64::from(1.0f32 / ((-score_diff).min(88.7).exp() + 1.0));
                 let mut delta = metric
                     .delta(y[idx_high], y[idx_low], rank_high, rank_low)
                     .abs();
@@ -110,7 +110,7 @@ impl LambdaMartObjective {
                 out[start + idx_high].hess += pg.hess;
                 out[start + idx_low].grad -= pg.grad;
                 out[start + idx_low].hess += pg.hess;
-                sum_lambda += -2.0 * pg.grad as f64;
+                sum_lambda += -2.0 * f64::from(pg.grad);
             }
         }
 
@@ -157,7 +157,7 @@ impl LambdaMartObjective {
             .iter()
             .map(|&(start, _)| weights.map_or(1.0, |w| w[start]))
             .collect();
-        let sum_w: f64 = group_weights.iter().map(|&w| w as f64).sum();
+        let sum_w: f64 = group_weights.iter().map(|&w| f64::from(w)).sum();
         let weight_norm = if sum_w == 0.0 {
             0.0
         } else {
@@ -233,7 +233,7 @@ impl MetricCtx {
                     .take(labels.len().min(top_k))
                     .enumerate()
                     .map(|(rank, &idx)| {
-                        let gain = ((1u32 << labels[idx] as u32) - 1) as f64;
+                        let gain = f64::from((1u32 << labels[idx] as u32) - 1);
                         discounts[rank] * gain
                     })
                     .sum();
@@ -246,7 +246,7 @@ impl MetricCtx {
                 let mut n_rel = vec![0.0; labels.len()];
                 let mut acc = vec![0.0; labels.len()];
                 for (rank, &idx) in order.iter().enumerate() {
-                    let y = labels[idx] as f64;
+                    let y = f64::from(labels[idx]);
                     n_rel[rank] = y + if rank == 0 { 0.0 } else { n_rel[rank - 1] };
                     acc[rank] = y / (rank + 1) as f64 + if rank == 0 { 0.0 } else { acc[rank - 1] };
                 }
@@ -262,15 +262,15 @@ impl MetricCtx {
                 discounts,
                 inv_idcg,
             } => {
-                let gain_high = ((1u32 << y_high as u32) - 1) as f64;
-                let gain_low = ((1u32 << y_low as u32) - 1) as f64;
+                let gain_high = f64::from((1u32 << y_high as u32) - 1);
+                let gain_low = f64::from((1u32 << y_low as u32) - 1);
                 let original = gain_high * discounts[rank_high] + gain_low * discounts[rank_low];
                 let changed = gain_low * discounts[rank_high] + gain_high * discounts[rank_low];
                 (original - changed) * inv_idcg
             }
             MetricCtx::Map { n_rel, acc } => {
                 let (mut rh, mut rl, mut yh, mut yl) =
-                    (rank_high, rank_low, y_high as f64, y_low as f64);
+                    (rank_high, rank_low, f64::from(y_high), f64::from(y_low));
                 if rh > rl {
                     std::mem::swap(&mut rh, &mut rl);
                     std::mem::swap(&mut yh, &mut yl);
@@ -340,8 +340,8 @@ mod tests {
     /// query has distinct best/worst scores (`delta_metric = 1 / (|Δs| + 0.01)`).
     fn pairwise_pair(s_high: f32, s_low: f32) -> (f32, f32) {
         let diff = s_high - s_low;
-        let sigmoid = (1.0f32 / ((-diff).min(88.7).exp() + 1.0)) as f64;
-        let delta = 1.0 / (diff.abs() as f64 + 0.01);
+        let sigmoid = f64::from(1.0f32 / ((-diff).min(88.7).exp() + 1.0));
+        let delta = 1.0 / (f64::from(diff.abs()) + 0.01);
         let lambda = (sigmoid - 1.0) * delta;
         let hessian = (sigmoid * (1.0 - sigmoid)).max(1e-16) * delta * 2.0;
         (lambda as f32, hessian as f32)
@@ -362,7 +362,7 @@ mod tests {
 
         let (g01, h01) = pairwise_pair(preds[0], preds[1]);
         let (g02, h02) = pairwise_pair(preds[0], preds[2]);
-        let sum_lambda = -2.0 * g01 as f64 + -2.0 * g02 as f64;
+        let sum_lambda = -2.0 * f64::from(g01) + -2.0 * f64::from(g02);
         let norm = ((sum_lambda + 1.0).log2() / sum_lambda) as f32;
 
         assert_ne!(out[0].grad, 0.0);
@@ -393,7 +393,7 @@ mod tests {
         let mut out = vec![GradPair::default(); 7];
         obj.gradient_grouped(&preds, &labels, Some(&weights), Some(&g), &mut out);
 
-        let sum_w = group_w[0] as f64 + group_w[1] as f64;
+        let sum_w = f64::from(group_w[0]) + f64::from(group_w[1]);
         let w_norm = (2.0 / sum_w) as f32;
         for (i, (got, base)) in out.iter().zip(&normed).enumerate() {
             let w = if i < 3 { group_w[0] } else { group_w[1] };

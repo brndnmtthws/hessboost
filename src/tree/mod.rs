@@ -8,5 +8,5 @@ pub mod hist;
 mod regtree;
 pub mod sampler;
 
-pub use gain::{calc_gain, calc_weight, GradStats, RegParams};
+pub use gain::{GradStats, RegParams, calc_gain, calc_weight};
 pub use regtree::{Node, RegTree};

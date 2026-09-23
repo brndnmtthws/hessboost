@@ -34,7 +34,7 @@ impl BinStore {
     #[inline]
     fn get(&self, idx: usize) -> u32 {
         match self {
-            BinStore::U16(v) => v[idx] as u32,
+            BinStore::U16(v) => u32::from(v[idx]),
             BinStore::U32(v) => v[idx],
         }
     }

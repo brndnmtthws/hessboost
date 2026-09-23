@@ -71,11 +71,11 @@
 
 use crate::config::ObjectiveParams;
 use crate::error::{HessboostError, Result};
-use crate::learner::model::ModelSpec;
 use crate::learner::BoostedModel;
-use crate::objective::{create_objective, Objective};
+use crate::learner::model::ModelSpec;
+use crate::objective::{Objective, create_objective};
 use crate::tree::{Node, RegTree};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Sentinel XGBoost writes for the parent of the root node (`kInvalidNodeId`).
 const INVALID_NODE: i32 = i32::MAX;
@@ -315,7 +315,7 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
             categories_nodes.push(node_id as i64);
             categories_segments.push(categories.len() as i64);
             categories_sizes.push(cats.len() as i64);
-            categories.extend(cats.iter().map(|&category| category as i64));
+            categories.extend(cats.iter().map(|&category| i64::from(category)));
         }
         if node.is_leaf() {
             // XGBoost carries the leaf weight in both arrays for leaves.
@@ -541,7 +541,7 @@ fn parse_base_score(
         len => {
             return Err(HessboostError::model_format(format!(
                 "`base_score` has {len} entries for {n_outputs} outputs"
-            )))
+            )));
         }
     };
     Ok(match objective {
@@ -630,10 +630,11 @@ fn objective_params_from_json(objective: &str, obj: Option<&Value>) -> Objective
     // XGBoost writes `u32::MAX` (`LambdaRankParam::NotSet`) when unset; the
     // pair count then follows `lambdarank_pair_method`, whose `topk` default
     // is what `ObjectiveParams::default` already holds.
-    if let Some(v) = get(LAMBDARANK_NUM_PAIR) {
-        if v >= 1.0 && v != f64::from(u32::MAX) {
-            params.lambdarank_num_pair_per_sample = v as usize;
-        }
+    if let Some(v) = get(LAMBDARANK_NUM_PAIR)
+        && v >= 1.0
+        && v != f64::from(u32::MAX)
+    {
+        params.lambdarank_num_pair_per_sample = v as usize;
     }
     params
 }
@@ -669,38 +670,35 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
         )));
     }
 
-    let indptr = match model.get("iteration_indptr") {
-        Some(_) => {
-            let indptr = strict_nonnegative_integer_array(model, "iteration_indptr")?;
-            let bounded = indptr.first() == Some(&0)
-                && indptr.last() == Some(&(n_trees as u64))
-                && indptr.windows(2).all(|w| w[0] <= w[1]);
-            if !bounded {
-                return Err(HessboostError::model_format(
-                    "`iteration_indptr` must run monotonically from 0 to the number of trees",
-                ));
-            }
-            indptr.iter().map(|&i| i as usize).collect::<Vec<_>>()
+    let indptr = if model.get("iteration_indptr").is_some() {
+        let indptr = strict_nonnegative_integer_array(model, "iteration_indptr")?;
+        let bounded = indptr.first() == Some(&0)
+            && indptr.last() == Some(&(n_trees as u64))
+            && indptr.windows(2).all(|w| w[0] <= w[1]);
+        if !bounded {
+            return Err(HessboostError::model_format(
+                "`iteration_indptr` must run monotonically from 0 to the number of trees",
+            ));
         }
-        None => {
-            let num_parallel_tree = model
-                .get("gbtree_model_param")
-                .and_then(|p| p.get("num_parallel_tree"))
-                .map_or(Some(1.0), scalar_f64)
-                .filter(|&v| v >= 1.0 && v.fract() == 0.0)
-                .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
-                as usize;
-            let per_iteration = num_parallel_tree * n_outputs;
-            if n_trees % per_iteration != 0 {
-                return Err(HessboostError::model_format(format!(
-                    "{n_trees} trees do not form whole iterations of {per_iteration} \
-                     (num_parallel_tree × outputs)"
-                )));
-            }
-            (0..=n_trees / per_iteration)
-                .map(|k| k * per_iteration)
-                .collect()
+        indptr.iter().map(|&i| i as usize).collect::<Vec<_>>()
+    } else {
+        let num_parallel_tree = model
+            .get("gbtree_model_param")
+            .and_then(|p| p.get("num_parallel_tree"))
+            .map_or(Some(1.0), scalar_f64)
+            .filter(|&v| v >= 1.0 && v.fract() == 0.0)
+            .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
+            as usize;
+        let per_iteration = num_parallel_tree * n_outputs;
+        if !n_trees.is_multiple_of(per_iteration) {
+            return Err(HessboostError::model_format(format!(
+                "{n_trees} trees do not form whole iterations of {per_iteration} \
+                 (num_parallel_tree × outputs)"
+            )));
         }
+        (0..=n_trees / per_iteration)
+            .map(|k| k * per_iteration)
+            .collect()
     };
 
     let mut order = Vec::with_capacity(n_trees);
@@ -867,7 +865,7 @@ mod tests {
     }
 
     /// A minimal, hand-written XGBoost 3.x stump: feature 0 with threshold
-    /// 1.5, left leaf +10, right leaf -10, base_score `[0]` (raw margin).
+    /// 1.5, left leaf +10, right leaf -10, `base_score` `[0]` (raw margin).
     /// `objective`'s document is the 3.4.1 shape for `reg:squarederror`.
     fn hand_stump_json() -> &'static str {
         r#"{
@@ -927,7 +925,7 @@ mod tests {
         );
     }
 
-    /// Three constant stumps, one per class (tree_info round-robin), whose
+    /// Three constant stumps, one per class (`tree_info` round-robin), whose
     /// leaves are all zero, so `predict_margin` exposes the imported
     /// per-class intercepts. `multi:softprob` stores margins directly, so the
     /// vector must come through unchanged.
@@ -1007,9 +1005,11 @@ mod tests {
             json["learner"]["objective"],
             json!({"name": "reg:squarederror", "reg_loss_param": {"scale_pos_weight": "1"}})
         );
-        assert!(json["learner"]["gradient_booster"]["model"]
-            .get("weight_drop")
-            .is_none());
+        assert!(
+            json["learner"]["gradient_booster"]["model"]
+                .get("weight_drop")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1296,7 +1296,7 @@ mod tests {
                 out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi);
             }
         });
-        let model = train_with_objective(&params, &d, 2, Box::new(obj)).unwrap();
+        let model = train_with_objective(&params, &d, 2, &obj).unwrap();
         let err = export_xgboost_json(&model).unwrap_err();
         assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
     }

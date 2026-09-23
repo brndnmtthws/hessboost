@@ -38,11 +38,7 @@ pub trait Metric: Send + Sync {
 /// Normalize a metric total, returning zero for an empty or nonpositive weight sum.
 #[inline]
 fn weighted_mean((total, weight): (f64, f64)) -> f64 {
-    if weight > 0.0 {
-        total / weight
-    } else {
-        0.0
-    }
+    if weight > 0.0 { total / weight } else { 0.0 }
 }
 
 /// Define a purely-pointwise metric from its SIMD weighted-sum kernel.
@@ -144,7 +140,7 @@ fn tie_runs<'a>(
 pub struct Auc;
 
 impl Metric for Auc {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "auc"
     }
 
@@ -257,7 +253,7 @@ fn grouped_average(
     let mut sum = 0.0;
     let mut weight_sum = 0.0;
     for &(start, end) in &ranges {
-        let weight = weights.map_or(1.0, |values| values[start] as f64);
+        let weight = weights.map_or(1.0, |values| f64::from(values[start]));
         sum += weight * score(&preds[start..end], &labels[start..end]);
         weight_sum += weight;
     }
@@ -291,22 +287,18 @@ impl Ndcg {
         let dcg: f64 = order[..cut]
             .iter()
             .enumerate()
-            .map(|(p, &i)| ndcg_gain(labels[i] as f64) * ndcg_discount(p))
+            .map(|(p, &i)| ndcg_gain(f64::from(labels[i])) * ndcg_discount(p))
             .sum();
 
-        let labels_f64: Vec<f64> = labels.iter().map(|&l| l as f64).collect();
+        let labels_f64: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
         let idcg = ideal_dcg(&labels_f64, cut);
 
-        if idcg <= 0.0 {
-            0.0
-        } else {
-            dcg / idcg
-        }
+        if idcg <= 0.0 { 0.0 } else { dcg / idcg }
     }
 }
 
 impl Metric for Ndcg {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ndcg"
     }
 
@@ -399,7 +391,7 @@ impl MeanAveragePrecision {
 }
 
 impl Metric for MeanAveragePrecision {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "map"
     }
 
@@ -433,7 +425,7 @@ impl Metric for MeanAveragePrecision {
 pub struct AucPr;
 
 impl Metric for AucPr {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "aucpr"
     }
 
@@ -442,7 +434,7 @@ impl Metric for AucPr {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        let w_of = |i: usize| weights.map_or(1.0, |ws| ws[i] as f64);
+        let w_of = |i: usize| weights.map_or(1.0, |ws| f64::from(ws[i]));
 
         // Sort instance indices by descending predicted score.
         let order = argsort_desc(preds);
@@ -602,7 +594,7 @@ mod tests {
     fn logloss_perfect_and_wrong() {
         let m = LogLoss;
         // near-perfect predictions -> ~0 loss
-        let loss = m.eval(&[0.999999, 0.000001], &[1.0, 0.0], None);
+        let loss = m.eval(&[0.999_999, 0.000_001], &[1.0, 0.0], None);
         assert!(loss < 1e-4);
         // p=0.5 everywhere -> ln 2
         let loss = m.eval(&[0.5, 0.5], &[1.0, 0.0], None);
@@ -654,7 +646,7 @@ mod tests {
         // DCG = 3/log2(3) + 7/2 = 5.39278; IDCG = 7 + 3/log2(3) = 8.89278.
         let reversed = [0.1f32, 0.5, 0.9];
         let got = m.eval_grouped(&reversed, &labels, None, Some(&g));
-        assert_relative_eq!(got, 5.392789 / 8.892789, epsilon = 1e-5);
+        assert_relative_eq!(got, 5.392_789 / 8.892_789, epsilon = 1e-5);
         assert!(m.maximize());
     }
 
@@ -673,7 +665,7 @@ mod tests {
     fn map_hand_computed() {
         let m = MeanAveragePrecision::new(None);
         let labels = [1.0f32, 0.0, 1.0, 0.0]; // 2 relevant docs
-                                              // Order both relevant docs first -> AP = (1/1 + 2/2)/2 = 1.
+        // Order both relevant docs first -> AP = (1/1 + 2/2)/2 = 1.
         assert_relative_eq!(
             m.eval(&[0.9, 0.1, 0.8, 0.2], &labels, None),
             1.0,

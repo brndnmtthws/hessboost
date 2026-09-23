@@ -3,12 +3,12 @@
 
 use criterion::measurement::WallTime;
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+    BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use hessboost::data::ghist::GHistIndex;
 use hessboost::data::quantile::HistCuts;
 use hessboost::metric::{
-    create_metric, ErrorRate, GammaNLogLik, LogLoss, Mae, PoissonNLogLik, Rmse,
+    ErrorRate, GammaNLogLik, LogLoss, Mae, PoissonNLogLik, Rmse, create_metric,
 };
 use hessboost::objective::{
     GammaObjective, GradPair, LogisticObjective, Objective, PoissonObjective, SoftmaxObjective,
@@ -16,18 +16,19 @@ use hessboost::objective::{
 };
 use hessboost::prelude::*;
 use hessboost::tree::builder::HistTreeBuilder;
-use hessboost::tree::hist::{zeroed, CpuBackend, HistogramBackend};
+use hessboost::tree::hist::{CpuBackend, HistogramBackend, zeroed};
 use hessboost::tree::sampler::ColumnSampler;
+use std::hint::black_box;
 
 /// Deterministic synthetic regression dataset.
 fn make_data(n: usize, f: usize) -> DMatrix {
     let mut x = vec![0f32; n * f];
     let mut y = vec![0f32; n];
-    let mut s: u64 = 0x2545F4914F6CDD1D;
+    let mut s: u64 = 0x2545_F491_4F6C_DD1D;
     let mut rng = || {
         s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((s >> 33) as f32) / (1u32 << 31) as f32
     };
     for i in 0..n {
@@ -288,7 +289,9 @@ fn bench_prediction_transforms(c: &mut Criterion) {
     group.bench_function("exp_scalar_reference", |b| {
         b.iter(|| {
             values.copy_from_slice(&source);
-            values.iter_mut().for_each(|value| *value = value.exp());
+            for value in &mut values {
+                *value = value.exp();
+            }
             black_box(&values);
         });
     });
@@ -412,7 +415,8 @@ fn scalar_logistic_objective(base_margin: f32) -> hessboost::objective::CustomOb
 fn bench_binary_train(c: &mut Criterion) {
     let data = make_binary_data(50_000, 20);
     let labels = data.labels().unwrap();
-    let positive_rate = labels.iter().map(|&label| label as f64).sum::<f64>() / labels.len() as f64;
+    let positive_rate =
+        labels.iter().map(|&label| f64::from(label)).sum::<f64>() / labels.len() as f64;
     let base_margin = (positive_rate / (1.0 - positive_rate)).ln() as f32;
     let params = TrainingParams::builder()
         .objective("binary:logistic")
@@ -429,13 +433,8 @@ fn bench_binary_train(c: &mut Criterion) {
     group.bench_function("scalar_objective_reference", |b| {
         b.iter(|| {
             black_box(
-                train_with_objective(
-                    &params,
-                    &data,
-                    50,
-                    Box::new(scalar_logistic_objective(base_margin)),
-                )
-                .unwrap(),
+                train_with_objective(&params, &data, 50, &scalar_logistic_objective(base_margin))
+                    .unwrap(),
             )
         });
     });

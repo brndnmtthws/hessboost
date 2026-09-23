@@ -4,8 +4,7 @@
 #     gnuplot -c docs/benchmarks/charts.gp
 #
 # Run from the repository root. The .dat values mirror the tables in
-# docs/performance.md and trace back to docs/benchmarks/xgboost.json and
-# docs/benchmarks/performance.json. After refreshing the tables and .dat
+# docs/performance.md. After refreshing the tables and .dat
 # files, regenerate the SVGs with the command above. Requires gnuplot 5.4
 # or newer.
 #

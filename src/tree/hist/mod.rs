@@ -56,7 +56,7 @@ impl HistogramBackend for CpuBackend {
         let total = out.len();
         let threads = rayon::current_num_threads();
         if threads <= 1 || rows.len() < PARALLEL_THRESHOLD {
-            out.iter_mut().for_each(|s| *s = GradStats::default());
+            out.fill(GradStats::default());
             accumulate(ghist, rows, gpair, out);
             return;
         }
@@ -92,13 +92,13 @@ impl HistogramBackend for CpuBackend {
                 .into_par_iter()
                 .enumerate()
                 .for_each(|(f, (fs, slice))| {
-                    slice.iter_mut().for_each(|s| *s = GradStats::default());
+                    slice.fill(GradStats::default());
                     match columns {
                         Bins::U16(c) => {
-                            accumulate_column(&c[f * n_rows..][..n_rows], fs, &range, gpair, slice)
+                            accumulate_column(&c[f * n_rows..][..n_rows], fs, &range, gpair, slice);
                         }
                         Bins::U32(c) => {
-                            accumulate_column(&c[f * n_rows..][..n_rows], fs, &range, gpair, slice)
+                            accumulate_column(&c[f * n_rows..][..n_rows], fs, &range, gpair, slice);
                         }
                     }
                 });
@@ -206,15 +206,15 @@ fn accumulate_bins<B: BinIndex>(
     // stream sequentially and each feature's histogram slice stays in L1.
     // Every bin still receives its rows in ascending order, so the sums are
     // identical to the row sweep.
-    if let Some(columns) = ghist.column_bins() {
-        if let Some(range) = contiguous_range(rows) {
-            let n_rows = ghist.n_rows();
-            match columns {
-                Bins::U16(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
-                Bins::U32(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
-            }
-            return;
+    if let Some(columns) = ghist.column_bins()
+        && let Some(range) = contiguous_range(rows)
+    {
+        let n_rows = ghist.n_rows();
+        match columns {
+            Bins::U16(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
+            Bins::U32(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
         }
+        return;
     }
     if let Some(stride) = ghist.dense_stride() {
         accumulate_dense(ghist, bins, stride, rows, gpair, out, add_row, prefetch_row);
@@ -362,8 +362,8 @@ fn accumulate_dense<B: BinIndex>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::quantile::HistCuts;
     use crate::data::DMatrix;
+    use crate::data::quantile::HistCuts;
 
     fn brute_force(
         ghist: &GHistIndex,
@@ -471,7 +471,7 @@ mod tests {
     fn column_and_row_sweeps_match_reference_bit_for_bit() {
         let (n, f) = (3 * PARALLEL_THRESHOLD + 129, 7);
         let x: Vec<f32> = (0..n * f)
-            .map(|i| ((i * 2654435761usize) % 1009) as f32 / 7.0)
+            .map(|i| ((i * 2_654_435_761_usize) % 1009) as f32 / 7.0)
             .collect();
         let data = DMatrix::from_dense(&x, n, f).unwrap();
         let cuts = HistCuts::from_dmatrix(&data, 64);

@@ -7,15 +7,15 @@
 mod exact;
 mod hist;
 
-pub use exact::{all_features, all_rows, ExactTreeBuilder, SortedColumns};
+pub use exact::{ExactTreeBuilder, SortedColumns, all_features, all_rows};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
 
 use std::collections::BTreeSet;
 
 use crate::objective::GradPair;
-use crate::tree::constraints::{calc_weight_bounded, gain_at_weight, satisfies, Bounds};
-use crate::tree::gain::{calc_gain, threshold_l1, GradStats, RegParams};
+use crate::tree::constraints::{Bounds, calc_weight_bounded, gain_at_weight, satisfies};
+use crate::tree::gain::{GradStats, RegParams, calc_gain, threshold_l1};
 use crate::tree::regtree::RegTree;
 
 /// Tiny epsilon guarding against accepting numerically-zero-gain splits, mirror
@@ -186,7 +186,7 @@ pub(super) enum SplitPos {
 /// is false for all finite `x`, so a split at it routes every present row
 /// right and only missing values (`default_left`) left. Stands in for the
 /// `-inf` XGBoost stores (`NumericBinLowerBound` at a feature's first bin, or
-/// an overflowed ColMaker endpoint) because trees here require a finite
+/// an overflowed `ColMaker` endpoint) because trees here require a finite
 /// `split_cond`.
 pub(super) const BELOW_ALL_VALUES: f32 = f32::MIN;
 
@@ -219,9 +219,9 @@ pub(super) fn xgb_weight(stats: GradStats, reg: &RegParams, bounds: Bounds) -> f
 /// other operation runs in `f64`.
 #[inline]
 fn xgb_gain_given_weight(stats: GradStats, reg: &RegParams, w: f32) -> f64 {
-    -(2.0 * stats.grad * w as f64
-        + (stats.hess + reg.lambda) * (w * w) as f64
-        + 2.0 * reg.alpha * w.abs() as f64)
+    -(2.0 * stats.grad * f64::from(w)
+        + (stats.hess + reg.lambda) * f64::from(w * w)
+        + 2.0 * reg.alpha * f64::from(w.abs()))
 }
 
 /// XGBoost's scalar `TreeEvaluator::CalcGain` for a node: the given-weight
@@ -255,7 +255,7 @@ pub(super) fn xgb_loss_chg(
     }
     let wl = xgb_weight(left, reg, bounds);
     let wr = xgb_weight(right, reg, bounds);
-    if !satisfies(dir, wl as f64, wr as f64) {
+    if !satisfies(dir, f64::from(wl), f64::from(wr)) {
         return None;
     }
     // Upstream's scalar `CalcGainGivenWeight` returns `float`: each child's
@@ -291,14 +291,14 @@ pub(super) fn xgb_update(
     };
     if replace {
         *best = BestSplit::numeric(
-            loss_chg as f64,
+            f64::from(loss_chg),
             feature,
             pos,
             default_left,
             left,
             right,
-            w_left as f64,
-            w_right as f64,
+            f64::from(w_left),
+            f64::from(w_right),
         );
     }
     replace

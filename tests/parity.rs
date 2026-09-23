@@ -20,8 +20,8 @@
 
 use hessboost::data::HistCuts;
 use hessboost::{
-    train, BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError, Monotone,
-    TrainingParams, TreeMethod,
+    BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError, Monotone,
+    TrainingParams, TreeMethod, train,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -274,7 +274,7 @@ fn max_abs_diff(what: &str, a: &[f32], b: &[f32]) -> Result<f64, String> {
         ));
     }
     Ok(a.iter().zip(b).fold(0.0f64, |m, (x, y)| {
-        let d = (*x as f64 - *y as f64).abs();
+        let d = (f64::from(*x) - f64::from(*y)).abs();
         m.max(if d.is_nan() { f64::INFINITY } else { d })
     }))
 }
@@ -283,7 +283,7 @@ fn rmse(p: &[f32], y: &[f32]) -> f64 {
     let s: f64 = p
         .iter()
         .zip(y)
-        .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+        .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
         .sum();
     (s / y.len() as f64).sqrt()
 }
@@ -313,12 +313,12 @@ fn accuracy(objective: &str, p: &[f32], y: &[f32], k: usize) -> f64 {
 fn dcg(labels_in_rank_order: impl Iterator<Item = f32>) -> f64 {
     labels_in_rank_order
         .enumerate()
-        .map(|(i, l)| (2f64.powf(l as f64) - 1.0) / (i as f64 + 2.0).log2())
+        .map(|(i, l)| (2f64.powf(f64::from(l)) - 1.0) / (i as f64 + 2.0).log2())
         .sum()
 }
 
 /// Mean NDCG over query groups, each evaluated on its full list (the fixture
-/// groups are uniform, so this is NDCG@group_size). Ties broken by row order.
+/// groups are uniform, so this is `NDCG@group_size`). Ties broken by row order.
 fn mean_ndcg(scores: &[f32], labels: &[f32], groups: &[usize]) -> f64 {
     let mut start = 0;
     let mut total = 0.0;
@@ -375,13 +375,13 @@ impl Case<'_> {
     }
 
     /// Record `delta` against `tol`; returns the table cell.
-    fn check(&mut self, what: &str, delta: Result<f64, String>, tol: f64) -> String {
-        match &delta {
+    fn check(&mut self, what: &str, delta: &Result<f64, String>, tol: f64) -> String {
+        match delta {
             Ok(d) if *d <= tol => {}
             Ok(d) => self.fail(format!("{what}: max|Δ|={d:.3e} > tol {tol:.0e}")),
             Err(e) => self.fail(format!("{what}: {e}")),
         }
-        fmt_delta(&delta)
+        fmt_delta(delta)
     }
 
     fn dmatrix(&self, x: &[f32], n_rows: usize) -> Result<DMatrix, String> {
@@ -507,9 +507,9 @@ impl Case<'_> {
             .map_err(|e| e.to_string())
             .and_then(|p| max_abs_diff("import contribs", &p, &fx.xgb_contribs));
         [
-            self.check("import predict", pred, fx.tol.import),
-            self.check("import margin", margin, fx.tol.import),
-            self.check("import contribs", contribs, fx.tol.contribs),
+            self.check("import predict", &pred, fx.tol.import),
+            self.check("import margin", &margin, fx.tol.import),
+            self.check("import contribs", &contribs, fx.tol.contribs),
         ]
     }
 
@@ -582,7 +582,7 @@ impl Case<'_> {
                 row.train = match fx.tier {
                     Tier::Exact | Tier::Trainonly => {
                         let d = max_abs_diff("train predict", &preds, &fx.xgb_pred);
-                        self.check("train predict", d, fx.tol.train)
+                        self.check("train predict", &d, fx.tol.train)
                     }
                     Tier::Quality => self.quality_band(&preds),
                 };
@@ -591,7 +591,7 @@ impl Case<'_> {
                     model
                         .base_scores()
                         .iter()
-                        .map(|v| (*v as f64 * 1e4).round() / 1e4)
+                        .map(|v| (f64::from(*v) * 1e4).round() / 1e4)
                         .collect::<Vec<_>>()
                 );
                 row.export = self.export(&model, &preds, exports);

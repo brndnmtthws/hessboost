@@ -1,12 +1,16 @@
 use super::{
-    scalar, sigmoid_scalar, LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION,
+    LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION, scalar, sigmoid_scalar,
 };
 use crate::objective::GradPair;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "intrinsic modules are used wholesale"
+)]
 use std::arch::aarch64::*;
 
 // Arithmetic-only helpers express the NEON precondition through an unsafe
-// intrinsic function pointer. This keeps their unsafe blocks valid with the
-// Rust 1.86 MSRV as well as the current stdarch API, without lint overrides.
+// intrinsic function pointer. This keeps their unsafe blocks valid whether or
+// not the stdarch in use marks these intrinsics safe, without lint overrides.
 // The compiler inlines these constant function pointers.
 
 const VECTOR_WIDTH: usize = 4;
@@ -670,6 +674,10 @@ pub(super) unsafe fn short_softmax_rows<const K: usize>(values: &mut [f32]) {
     // SAFETY: NEON is available, K is 2, 3, or 4, and chunks bound each
     // interleaved load/store to four complete rows. Remaining rows are scalar.
     unsafe {
+        #[allow(
+            clippy::chunks_exact_to_as_chunks,
+            reason = "`as_chunks_mut::<{ 4 * K }>` needs generic_const_exprs"
+        )]
         let mut batches = values.chunks_exact_mut(4 * K);
         for batch in &mut batches {
             if let Some(p) = short_softmax_batch::<K, false>(batch) {
@@ -737,6 +745,10 @@ pub(super) unsafe fn short_softmax_gradient<const K: usize>(
                 // Each u64 lane contains one repr(C) GradPair. Interleaving
                 // classes restores row-major order, two complete rows per store.
                 for (offset, pairs) in [(0, low), (2 * K, high)] {
+                    #[allow(
+                        clippy::cast_ptr_alignment,
+                        reason = "NEON st2/st4 stores accept any alignment"
+                    )]
                     let dest = out.as_mut_ptr().add(base + offset).cast::<u64>();
                     match K {
                         2 => vst2q_u64(dest, uint64x2x2_t(pairs[0], pairs[1])),
@@ -992,63 +1004,54 @@ pub(super) unsafe fn classification_error_sum(
     unsafe {
         let threshold = vdupq_n_f32(0.5);
         let mut index = 0;
-        match weights {
-            Some(weights) => {
-                let mut wrong_low = vdupq_n_f64(0.0);
-                let mut wrong_high = vdupq_n_f64(0.0);
-                let mut weight_low = vdupq_n_f64(0.0);
-                let mut weight_high = vdupq_n_f64(0.0);
-                while index + VECTOR_WIDTH <= preds.len() {
-                    // SAFETY: the common-length contract leaves four values in
-                    // each input slice.
-                    let pred = vld1q_f32(preds.as_ptr().add(index));
-                    let label = vld1q_f32(labels.as_ptr().add(index));
-                    let weight = vld1q_f32(weights.as_ptr().add(index));
-                    let mismatch =
-                        veorq_u32(vcgtq_f32(pred, threshold), vcgtq_f32(label, threshold));
-                    let wrong_weight = vbslq_f32(mismatch, weight, vdupq_n_f32(0.0));
-                    let current_wrong_low = vcvt_f64_f32(vget_low_f32(wrong_weight));
-                    let current_wrong_high = vcvt_high_f64_f32(wrong_weight);
-                    let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
-                    let current_weight_high = vcvt_high_f64_f32(weight);
-                    wrong_low = vaddq_f64(wrong_low, current_wrong_low);
-                    wrong_high = vaddq_f64(wrong_high, current_wrong_high);
-                    weight_low = vaddq_f64(weight_low, current_weight_low);
-                    weight_high = vaddq_f64(weight_high, current_weight_high);
-                    index += VECTOR_WIDTH;
-                }
-                let tail = scalar::classification_error_sum(
-                    preds,
-                    labels,
-                    Some(weights),
-                    index..preds.len(),
+        if let Some(weights) = weights {
+            let mut wrong_low = vdupq_n_f64(0.0);
+            let mut wrong_high = vdupq_n_f64(0.0);
+            let mut weight_low = vdupq_n_f64(0.0);
+            let mut weight_high = vdupq_n_f64(0.0);
+            while index + VECTOR_WIDTH <= preds.len() {
+                // SAFETY: the common-length contract leaves four values in
+                // each input slice.
+                let pred = vld1q_f32(preds.as_ptr().add(index));
+                let label = vld1q_f32(labels.as_ptr().add(index));
+                let weight = vld1q_f32(weights.as_ptr().add(index));
+                let mismatch = veorq_u32(vcgtq_f32(pred, threshold), vcgtq_f32(label, threshold));
+                let wrong_weight = vbslq_f32(mismatch, weight, vdupq_n_f32(0.0));
+                let current_wrong_low = vcvt_f64_f32(vget_low_f32(wrong_weight));
+                let current_wrong_high = vcvt_high_f64_f32(wrong_weight);
+                let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
+                let current_weight_high = vcvt_high_f64_f32(weight);
+                wrong_low = vaddq_f64(wrong_low, current_wrong_low);
+                wrong_high = vaddq_f64(wrong_high, current_wrong_high);
+                weight_low = vaddq_f64(weight_low, current_weight_low);
+                weight_high = vaddq_f64(weight_high, current_weight_high);
+                index += VECTOR_WIDTH;
+            }
+            let tail =
+                scalar::classification_error_sum(preds, labels, Some(weights), index..preds.len());
+            let wrong = vaddvq_f64(vaddq_f64(wrong_low, wrong_high)) + tail.0;
+            let weight_sum = vaddvq_f64(vaddq_f64(weight_low, weight_high)) + tail.1;
+            (wrong, weight_sum)
+        } else {
+            let one = vdupq_n_u32(1);
+            let mut wrong_low = vdupq_n_u64(0);
+            let mut wrong_high = vdupq_n_u64(0);
+            while index + VECTOR_WIDTH <= preds.len() {
+                // SAFETY: the common-length contract leaves four values in
+                // each input slice.
+                let pred = vld1q_f32(preds.as_ptr().add(index));
+                let label = vld1q_f32(labels.as_ptr().add(index));
+                let mismatch = vandq_u32(
+                    veorq_u32(vcgtq_f32(pred, threshold), vcgtq_f32(label, threshold)),
+                    one,
                 );
-                let wrong = vaddvq_f64(vaddq_f64(wrong_low, wrong_high)) + tail.0;
-                let weight_sum = vaddvq_f64(vaddq_f64(weight_low, weight_high)) + tail.1;
-                (wrong, weight_sum)
+                wrong_low = vaddq_u64(wrong_low, vmovl_u32(vget_low_u32(mismatch)));
+                wrong_high = vaddq_u64(wrong_high, vmovl_high_u32(mismatch));
+                index += VECTOR_WIDTH;
             }
-            None => {
-                let one = vdupq_n_u32(1);
-                let mut wrong_low = vdupq_n_u64(0);
-                let mut wrong_high = vdupq_n_u64(0);
-                while index + VECTOR_WIDTH <= preds.len() {
-                    // SAFETY: the common-length contract leaves four values in
-                    // each input slice.
-                    let pred = vld1q_f32(preds.as_ptr().add(index));
-                    let label = vld1q_f32(labels.as_ptr().add(index));
-                    let mismatch = vandq_u32(
-                        veorq_u32(vcgtq_f32(pred, threshold), vcgtq_f32(label, threshold)),
-                        one,
-                    );
-                    wrong_low = vaddq_u64(wrong_low, vmovl_u32(vget_low_u32(mismatch)));
-                    wrong_high = vaddq_u64(wrong_high, vmovl_high_u32(mismatch));
-                    index += VECTOR_WIDTH;
-                }
-                let tail =
-                    scalar::classification_error_sum(preds, labels, None, index..preds.len());
-                let wrong = vaddvq_u64(vaddq_u64(wrong_low, wrong_high)) as f64 + tail.0;
-                (wrong, preds.len() as f64)
-            }
+            let tail = scalar::classification_error_sum(preds, labels, None, index..preds.len());
+            let wrong = vaddvq_u64(vaddq_u64(wrong_low, wrong_high)) as f64 + tail.0;
+            (wrong, preds.len() as f64)
         }
     }
 }

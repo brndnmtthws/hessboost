@@ -33,7 +33,7 @@ fn main() -> Result<()> {
             }
         },
     );
-    let model = train_with_objective(&params, &d, 60, Box::new(obj))?;
+    let model = train_with_objective(&params, &d, 60, &obj)?;
     let preds = model.predict(&d)?;
     let rmse = Rmse.eval(&preds, &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
@@ -43,7 +43,7 @@ fn main() -> Result<()> {
     let mae = CustomMetric::new("my:mae", false, |p, l, _w| {
         p.iter()
             .zip(l)
-            .map(|(a, b)| (*a as f64 - *b as f64).abs())
+            .map(|(a, b)| (f64::from(*a) - f64::from(*b)).abs())
             .sum::<f64>()
             / p.len() as f64
     });

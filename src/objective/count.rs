@@ -1,7 +1,7 @@
 //! Count and positive-continuous regression objectives with a log link:
 //! Poisson, Gamma, and Tweedie. All predict `exp(margin)`.
 
-use super::{weighted_label_mean, GradPair, Objective};
+use super::{GradPair, Objective, weighted_label_mean};
 
 /// Prediction transform shared by the log-link count objectives: `exp(margin)`.
 fn log_link_transform(preds: &mut [f32]) {
@@ -57,7 +57,7 @@ impl Default for PoissonObjective {
 }
 
 impl Objective for PoissonObjective {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "count:poisson"
     }
 
@@ -85,7 +85,7 @@ impl Objective for PoissonObjective {
 pub struct GammaObjective;
 
 impl Objective for GammaObjective {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "reg:gamma"
     }
 
@@ -128,7 +128,7 @@ impl Default for TweedieObjective {
 }
 
 impl Objective for TweedieObjective {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "reg:tweedie"
     }
 

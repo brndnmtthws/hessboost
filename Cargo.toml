@@ -1,28 +1,49 @@
 [package]
 name = "hessboost"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.86"
+edition = "2024"
+rust-version = "1.93"
 license = "Apache-2.0"
 repository = "https://github.com/brndnmtthws/hessboost"
 authors = ["Brenden Matthews <brenden@brndn.io>"]
 description = "A faithful, fast, pure-Rust reimplementation of XGBoost gradient boosting"
 keywords = ["gradient-boosting", "xgboost", "machine-learning", "decision-trees", "boosting"]
 categories = ["science", "algorithms"]
-include = ["/src", "/tests", "/examples", "/benches", "/README.md", "/CHANGELOG.md", "/LICENSE", "/NOTICE"]
 
 [dependencies]
-rayon = "1.10"
-thiserror = "2.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-postcard = { version = "1.1", default-features = false, features = ["use-std"] }
-rand = "0.8"
+rayon = "1.12"
+thiserror = "2.0.20"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+rand = "0.10.3"
 
 [dev-dependencies]
-criterion = "0.5"
-proptest = "1.5"
-approx = "0.5"
+criterion = "0.8.2"
+proptest = "1.11"
+approx = "0.5.1"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+# Numeric kernels convert between f32/f64/usize/u32 on purpose; value ranges
+# are bounded by the data model (bins, feature ids, row counts).
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# Exact comparisons are intentional: sentinels, split thresholds, test oracles.
+float_cmp = "allow"
+# Math code uses the conventional short names (g, h, w, x, y, lo, hi).
+many_single_char_names = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+# Every fallible API returns HessboostError; per-function sections are boilerplate.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Hot prediction/histogram/SIMD helpers; forced inlining is measured.
+inline_always = "allow"
 
 [[bench]]
 name = "training"

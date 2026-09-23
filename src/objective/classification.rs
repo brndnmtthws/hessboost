@@ -1,6 +1,6 @@
 //! Classification objectives.
 
-use super::{newton_intercepts, weighted_label_mean, GradPair, Objective, MIN_HESS};
+use super::{GradPair, MIN_HESS, Objective, newton_intercepts, weighted_label_mean};
 
 /// Logistic regression: `binary:logistic` (classification, reported with
 /// `logloss`) or `reg:logistic` (probability regression, reported with `rmse`
@@ -74,7 +74,7 @@ impl Objective for LogisticObjective {
                     scale_pos_weight,
                     min_hess,
                     out,
-                )
+                );
             },
         );
     }

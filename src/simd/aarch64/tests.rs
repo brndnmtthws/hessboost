@@ -7,13 +7,13 @@ fn vector_log_is_accurate_across_metric_range() {
     }
     let mut values = Vec::new();
     for index in 0..20_000 {
-        let exponent = -34.5 + index as f64 * (123.0 / 19_999.0);
+        let exponent = -34.5 + f64::from(index) * (123.0 / 19_999.0);
         values.push(exponent.exp());
     }
     // Exercise the full reduced mantissa interval and adjacent f64 values
     // at the range-reduction boundary, including extreme metric exponents.
     for index in 0..20_000 {
-        values.push(1.0 + index as f64 / 20_000.0);
+        values.push(1.0 + f64::from(index) / 20_000.0);
     }
     for exponent in [-50, -27, -1, 0, 1, 64, 127, 128] {
         for mantissa in [1.0_f64, std::f64::consts::SQRT_2, 2.0] {
@@ -31,7 +31,7 @@ fn vector_log_is_accurate_across_metric_range() {
         values.push(1.0);
     }
 
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         let mut actual = [0.0; 2];
         // SAFETY: runtime detection proves NEON support, and both arrays
         // contain two f64 lanes.
@@ -55,9 +55,9 @@ fn vector_exp_f64_is_accurate_across_tweedie_range() {
         return;
     }
     let values: Vec<f64> = (0..20_000)
-        .map(|index| -90.0 + index as f64 * (180.0 / 19_999.0))
+        .map(|index| -90.0 + f64::from(index) * (180.0 / 19_999.0))
         .collect();
-    for pair in values.chunks_exact(2) {
+    for pair in values.as_chunks::<2>().0 {
         let mut actual = [0.0; 2];
         // SAFETY: runtime detection proves NEON support, and both arrays
         // contain exactly two f64 lanes.

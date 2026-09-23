@@ -8,15 +8,15 @@
 //! Call granularity differs by builder: the histogram builder samples once per
 //! node ([`ColumnSampler::sample`] per node), while the exact builder samples
 //! once per level (shared across that level's nodes). With the default ratios of
-//! `1.0` every draw returns the full pool, so behavior is unchanged.
+//! `1.0` every draw returns the full pool.
 
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 
 /// Draws feature subsets from a per-tree pool according to the `bylevel` and
 /// `bynode` ratios.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ColumnSampler {
     pool: Vec<u32>,
     bylevel: f64,

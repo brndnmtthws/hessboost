@@ -4,7 +4,7 @@
 //! carries `K` raw margins, laid out `[instance][class]` (row-major). Each round
 //! the trainer grows one tree per class from that class's gradient slice.
 
-use super::{GradPair, Objective, MIN_HESS};
+use super::{GradPair, MIN_HESS, Objective};
 
 /// Multiclass softmax objective. `output_prob` distinguishes `multi:softprob`
 /// (report per-class probabilities) from `multi:softmax` (report the argmax
@@ -50,7 +50,7 @@ impl Objective for SoftmaxObjective {
         super::check_gradient_inputs(n, k, preds, labels, weights, out);
 
         super::rowwise_gradient(n, k, preds, labels, weights, out, |p, l, w, o| {
-            crate::simd::softmax_gradient(p, l, w, k, MIN_HESS, o)
+            crate::simd::softmax_gradient(p, l, w, k, MIN_HESS, o);
         });
     }
 
@@ -78,12 +78,12 @@ impl Objective for SoftmaxObjective {
             }
         }
         let sum_w = match weights {
-            Some(ws) => ws.iter().map(|&w| w as f64).sum::<f64>(),
-            None => labels.len() as f32 as f64,
+            Some(ws) => ws.iter().map(|&w| f64::from(w)).sum::<f64>(),
+            None => f64::from(labels.len() as f32),
         };
         let inv_sum_w = 1.0 / sum_w;
         for m in &mut margins {
-            *m = ((*m as f64 * inv_sum_w) as f32 + 1e-6).ln();
+            *m = ((f64::from(*m) * inv_sum_w) as f32 + 1e-6).ln();
         }
         let n = k as f32;
         let mean = margins.iter().map(|m| m / n).sum::<f32>();

@@ -10,6 +10,6 @@ mod sketch;
 pub(crate) use dmatrix::is_missing;
 pub use dmatrix::{CscView, DMatrix, Entry};
 pub use ghist::GHistIndex;
-pub use loaders::{load_csv, load_libsvm, read_csv, read_libsvm, CsvOptions};
+pub use loaders::{CsvOptions, load_csv, load_libsvm, read_csv, read_libsvm};
 pub use meta::{FeatureType, GroupInfo};
 pub use quantile::HistCuts;

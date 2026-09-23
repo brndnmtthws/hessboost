@@ -72,7 +72,6 @@
 //! slightly different split points.
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-#![warn(clippy::all)]
 
 pub mod booster;
 pub mod config;
@@ -91,8 +90,8 @@ pub use config::{
 pub use data::{DMatrix, FeatureType};
 pub use error::{HessboostError, Result};
 pub use learner::{
-    cv, train, train_with_custom_metric, train_with_eval, train_with_objective, BoostedModel,
-    CvResult, ImportanceType, TrainResult,
+    BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,
+    train_with_eval, train_with_objective,
 };
 pub use metric::{CustomMetric, Metric};
 pub use objective::{CustomObjective, GradPair, Objective};
@@ -106,9 +105,9 @@ pub use tree::{Node, RegTree};
 pub mod prelude {
     pub use crate::data::CsvOptions;
     pub use crate::{
-        cv, train, train_with_custom_metric, train_with_eval, train_with_objective, BoostedModel,
-        BoosterKind, CustomMetric, CustomObjective, CvResult, DMatrix, FeatureType, GradPair,
-        GrowPolicy, HessboostError, ImportanceType, Metric, Monotone, Objective, Result,
-        TrainResult, TrainingParams, TreeMethod,
+        BoostedModel, BoosterKind, CustomMetric, CustomObjective, CvResult, DMatrix, FeatureType,
+        GradPair, GrowPolicy, HessboostError, ImportanceType, Metric, Monotone, Objective, Result,
+        TrainResult, TrainingParams, TreeMethod, cv, train, train_with_custom_metric,
+        train_with_eval, train_with_objective,
     };
 }

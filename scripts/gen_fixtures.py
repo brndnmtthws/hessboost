@@ -49,6 +49,8 @@ TOL_TRAIN = 1e-4
 TOL_TRAIN_PROB = 1e-5  # binary probabilities / softprob
 TOL_IMPORT = 1e-5
 TOL_CONTRIBS = 1e-4
+# Per-round eval-metric oracles: |hessboost - xgboost| <= TOL_EVALS * max(1, |xgboost|).
+TOL_EVALS = 1e-5
 # Quality-tier bands: relative RMSE factor for regression, absolute accuracy
 # slack for classification.
 BAND_RMSE = 1.08
@@ -163,10 +165,17 @@ def y_multi_heavy_tail(x, rng):
 # ---------------------------------------------------------------------------
 
 # name -> (target fn, param overrides, options)
-# A target fn returning an (n, K) array trains on a label matrix (K targets).
+# A target fn returns the label vector, an (n, K) array to train on a label
+# matrix (K targets), or a `(labels | None, lower, upper)` tuple for survival
+# cases that carry `label_lower_bound`/`label_upper_bound` (labels `None` when
+# the objective reads the bounds only, e.g. survival:aft).
 # options: tier, num_round, missing (fraction of NaN features), weighted, ranking,
 #          tol_train (override), drop (params removed from TREE_BASE),
-#          feature_weights (per-column DMatrix weights for column sampling)
+#          feature_weights (per-column DMatrix weights for column sampling),
+#          evals (record per-round metrics on the labeled test set; the
+#          params' `eval_metric` list, or XGBoost's default metric when absent),
+#          test_weighted (per-row test-set weights; constant within each
+#          query group and passed to XGBoost per group for ranking cases)
 CASES = {
     # tree_method / grow policy / constraints on reg:squarederror
     "exact_reg_d6": (y_regression, dict(tree_method="exact"), {}),
@@ -186,6 +195,12 @@ CASES = {
         {},
     ),
     "weighted_reg_d6": (y_regression, {}, dict(weighted=True)),
+    # per-round metric oracles on a weighted test set
+    "evals_reg_d4": (
+        y_regression,
+        dict(max_depth=4, eval_metric=["rmse", "mae"]),
+        dict(evals=True, test_weighted=True),
+    ),
     "categorical_reg_d6": (
         y_regression,
         {},
@@ -217,7 +232,70 @@ CASES = {
         dict(objective="reg:tweedie", tweedie_variance_power=1.5, max_depth=4),
         {},
     ),
-    "huber_d4": (y_heavy_tail, dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4), {}),
+    # evals: the default metric is `mphe` (pseudo-Huber without factor 2)
+    "huber_d4": (
+        y_heavy_tail,
+        dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
+        dict(evals=True),
+    ),
+    # small objectives; `evals` checks each default metric (rmsle, logloss on
+    # raw margins, error on the 0/1 hinge output) round by round
+    "squaredlog_d4": (y_gamma, dict(objective="reg:squaredlogerror", max_depth=4), dict(evals=True)),
+    "squaredlog_exact_d4": (
+        y_gamma,
+        dict(objective="reg:squaredlogerror", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_squaredlog_weighted_d4": (
+        y_gamma,
+        dict(objective="reg:squaredlogerror", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+    ),
+    "logitraw_d6": (y_binary, dict(objective="binary:logitraw"), dict(evals=True)),
+    "logitraw_exact_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_logitraw_weighted_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True),
+    ),
+    "nobs_logitraw_spw3_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", scale_pos_weight=3.0, max_depth=4),
+        dict(drop=("base_score",), evals=True),
+    ),
+    "hinge_d4": (y_binary, dict(objective="binary:hinge", max_depth=4), dict(evals=True)),
+    "hinge_exact_d4": (
+        y_binary,
+        dict(objective="binary:hinge", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_hinge_weighted_d4": (
+        y_binary,
+        dict(objective="binary:hinge", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+    ),
+    # metric oracles: rmsle / mape / mphe (non-default slope) on a positive
+    # target, and pre / pre@k on weighted query groups
+    "evals_metrics_reg_d4": (
+        y_gamma,
+        dict(max_depth=4, huber_slope=0.7, eval_metric=["rmsle", "mape", "mphe"]),
+        dict(evals=True, test_weighted=True),
+    ),
+    "evals_pre_rank_d4": (
+        y_relevance_binary,
+        dict(
+            objective="rank:ndcg",
+            max_depth=4,
+            lambdarank_pair_method="topk",
+            lambdarank_num_pair_per_sample=GROUP_SIZE,
+            eval_metric=["pre", "pre@5"],
+        ),
+        dict(ranking=True, evals=True, test_weighted=True),
+    ),
     # ranking: groups of 20 and topk=20 enumerate every unordered pair. The
     # Rust objective reproduces XGBoost's top-k accumulation/normalization.
     "rank_ndcg_d4": (
@@ -375,6 +453,17 @@ def _to_json_floats(a: np.ndarray) -> list:
     return out.tolist()
 
 
+def _to_json_bounds(a: np.ndarray) -> list:
+    """f32 label bounds -> list of Python floats; +/-inf -> "inf"/"-inf" strings
+    (JSON has no infinity; bounds are never NaN)."""
+    a = np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+    assert not np.isnan(a).any(), "label bounds must not be NaN"
+    out = a.astype(np.float64).astype(object)
+    out[np.isposinf(a)] = "inf"
+    out[np.isneginf(a)] = "-inf"
+    return out.tolist()
+
+
 def _inject_missing(x: np.ndarray, frac: float, rng) -> np.ndarray:
     x = x.copy()
     x[rng.random(x.shape) < frac] = np.nan
@@ -412,11 +501,24 @@ def build_case(name: str) -> dict:
         x[:, 0] = rng.integers(0, 5, x.shape[0]).astype(np.float32)
         x[:, 1] = rng.integers(0, 9, x.shape[0]).astype(np.float32)
         feature_types = ["c", "c"] + ["q"] * (N_COLS - 2)
-    y = np.asarray(target(x, rng), dtype=np.float32)
+    target_out = target(x, rng)
+    lower = upper = None
+    if isinstance(target_out, tuple):
+        y, lower, upper = target_out
+    else:
+        y = target_out
     if "missing" in opts:
         x = _inject_missing(x, opts["missing"], rng)
     x_train, x_test = x[:N_TRAIN], x[N_TRAIN:]
-    y_train, y_test = y[:N_TRAIN], y[N_TRAIN:]
+    y_train = y_test = lo_train = lo_test = hi_train = hi_test = None
+    if y is not None:
+        y = np.asarray(y, dtype=np.float32)
+        y_train, y_test = y[:N_TRAIN], y[N_TRAIN:]
+    if lower is not None:
+        lower = np.asarray(lower, dtype=np.float32)
+        upper = np.asarray(upper, dtype=np.float32)
+        lo_train, lo_test = lower[:N_TRAIN], lower[N_TRAIN:]
+        hi_train, hi_test = upper[:N_TRAIN], upper[N_TRAIN:]
 
     weights = rng.uniform(0.5, 2.0, N_TRAIN).astype(np.float32) if opts.get("weighted") else None
     group_sizes = test_group_sizes = None
@@ -435,10 +537,45 @@ def build_case(name: str) -> dict:
     if feature_weights is not None:
         assert len(feature_weights) == N_COLS
         dtrain.set_info(feature_weights=np.asarray(feature_weights, dtype=np.float32))
+    if lo_train is not None:
+        dtrain.set_float_info("label_lower_bound", lo_train)
+        dtrain.set_float_info("label_upper_bound", hi_train)
     dtest = xgb.DMatrix(x_test, nthread=1, feature_types=feature_types)
     dcontrib = xgb.DMatrix(x_test[:N_CONTRIB_ROWS], nthread=1, feature_types=feature_types)
 
-    booster = xgb.train(dict(params, nthread=1), dtrain, num_boost_round=num_round)
+    # Test-set weights are drawn after every other draw so that cases without
+    # them keep their data.
+    test_weights = None
+    if opts.get("test_weighted"):
+        if test_group_sizes is not None:
+            per_group = rng.uniform(0.5, 2.0, len(test_group_sizes)).astype(np.float32)
+            test_weights = np.repeat(per_group, test_group_sizes)
+        else:
+            test_weights = rng.uniform(0.5, 2.0, N_TEST).astype(np.float32)
+
+    evals_result: dict = {}
+    evals = []
+    if opts.get("evals"):
+        deval = xgb.DMatrix(x_test, label=y_test, nthread=1, feature_types=feature_types)
+        if test_group_sizes is not None:
+            deval.set_group(test_group_sizes)
+            if test_weights is not None:
+                deval.set_weight(per_group)
+        elif test_weights is not None:
+            deval.set_weight(test_weights)
+        if lo_test is not None:
+            deval.set_float_info("label_lower_bound", lo_test)
+            deval.set_float_info("label_upper_bound", hi_test)
+        evals = [(deval, "test")]
+
+    booster = xgb.train(
+        dict(params, nthread=1),
+        dtrain,
+        num_boost_round=num_round,
+        evals=evals,
+        evals_result=evals_result,
+        verbose_eval=False,
+    )
     pred = booster.predict(dtest)
     margin = booster.predict(dtest, output_margin=True)
     contribs = booster.predict(dcontrib, pred_contribs=True)
@@ -456,11 +593,17 @@ def build_case(name: str) -> dict:
         "n_test": N_TEST,
         "n_cols": N_COLS,
         # Label columns: y_train / y_test are row-major [row][target].
-        "n_targets": 1 if y.ndim == 1 else int(y.shape[1]),
+        "n_targets": 1 if y is None or y.ndim == 1 else int(y.shape[1]),
         "x_train": _to_json_floats(x_train),
-        "y_train": _to_json_floats(y_train),
+        "y_train": [] if y_train is None else _to_json_floats(y_train),
         "x_test": _to_json_floats(x_test),
-        "y_test": _to_json_floats(y_test),
+        "y_test": [] if y_test is None else _to_json_floats(y_test),
+        "label_lower_bound": None if lo_train is None else _to_json_bounds(lo_train),
+        "label_upper_bound": None if hi_train is None else _to_json_bounds(hi_train),
+        "test_label_lower_bound": None if lo_test is None else _to_json_bounds(lo_test),
+        "test_label_upper_bound": None if hi_test is None else _to_json_bounds(hi_test),
+        "test_weights": None if test_weights is None else _to_json_floats(test_weights),
+        "xgb_evals": evals_result["test"] if evals else None,
         "weights": None if weights is None else _to_json_floats(weights),
         "feature_weights": feature_weights,
         "group_sizes": group_sizes,
@@ -471,7 +614,12 @@ def build_case(name: str) -> dict:
         "xgb_contribs": _to_json_floats(contribs),
         "xgb_model": _save_model_json(booster),
         "xgb_model_ubj": _save_model_ubj(booster, name),
-        "tol": {"train": tol_train, "import": TOL_IMPORT, "contribs": TOL_CONTRIBS},
+        "tol": {
+            "train": tol_train,
+            "import": TOL_IMPORT,
+            "contribs": TOL_CONTRIBS,
+            "evals": TOL_EVALS,
+        },
     }
 
 

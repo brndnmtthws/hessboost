@@ -7,16 +7,17 @@ synthetic datasets, one case per supported feature (tree methods, missing values
 constraints, every objective — including `reg:logistic` and the `reg:linear`
 alias — sample weights, ranking groups, gblinear, DART, intercept estimation,
 row/column sampling including `sampling_method=gradient_based` and DMatrix
-`feature_weights`, multi-target label matrices), and writes each case to
-`../fixtures/<name>.json`: data, the exact `xgb.train` parameter dict,
-XGBoost's test-set predictions (transformed, raw margin, SHAP contributions on
-the first 50 rows) and the saved model JSON, plus the model's UBJSON encoding
-(`save_raw("ubj")`) as `../fixtures/<name>.ubj`. `n_targets` gives the label
-columns: the `multi_*` cases (3-target `reg:squarederror` on hist and exact,
-multi-label `binary:logistic` with and without `scale_pos_weight`, weighted
-2-target `reg:pseudohubererror`) store `y_train`/`y_test` row-major
-`[row][target]`, and their predictions, margins, and contributions carry the
-target axis.
+`feature_weights`, multi-target label matrices, and per-round metric oracles
+for `rmsle`, `mape`, `mphe`, `pre`/`pre@k` and each objective's default
+metric), and writes each case to `../fixtures/<name>.json`: data, the exact
+`xgb.train` parameter dict, XGBoost's test-set predictions (transformed, raw
+margin, SHAP contributions on the first 50 rows) and the saved model JSON, plus
+the model's UBJSON encoding (`save_raw("ubj")`) as `../fixtures/<name>.ubj`.
+`n_targets` gives the label columns: the `multi_*` cases (3-target
+`reg:squarederror` on hist and exact, multi-label `binary:logistic` with and
+without `scale_pos_weight`, weighted 2-target `reg:pseudohubererror`) store
+`y_train`/`y_test` row-major `[row][target]`, and their predictions, margins,
+and contributions carry the target axis.
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 
@@ -49,6 +50,24 @@ DMatrix on both sides. The `train-only` gblinear case validates training pointwi
 unsupported XGBoost-JSON import/export path is visibly reported as
 `n/a`/`skipped` and required to return `ModelFormat` on import. Unknown XGBoost
 parameters fail the test.
+
+Optional fixture fields extend the schema for metadata beyond plain labels:
+
+- `label_lower_bound` / `label_upper_bound` (training rows) and
+  `test_label_lower_bound` / `test_label_upper_bound` (test rows): survival
+  label bounds, attached with `DMatrix::with_label_bounds`. JSON has no
+  infinity, so `+inf`/`-inf` are the strings `"inf"`/`"-inf"`; bounds are never
+  NaN. A case whose objective reads the bounds only (`survival:aft`) has empty
+  `y_train`/`y_test`, and no labels are attached.
+- `test_weights`: per-row test-set weights (constant within a query group;
+  XGBoost receives one weight per group for ranking cases).
+- `xgb_evals`: `{metric: [value per round]}`, XGBoost's `evals_result()` on the
+  labeled test set (labels, bounds, groups, `test_weights`) for cases built
+  with the `evals` option. The metrics are the params' `eval_metric` list, or
+  the objective's default metric when it is absent. The Rust side trains with
+  `train_with_eval` on the same set and requires the same metric names and,
+  every round, `|hessboost - xgboost| <= tol.evals * max(1, |xgboost|)`
+  (`tol.evals` = 1e-5; column `evals`, `-` for cases without oracles).
 
 ```sh
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py

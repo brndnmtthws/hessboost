@@ -1,6 +1,6 @@
 //! Scalar formulas shared by dispatch fallbacks and NEON tails.
 
-use super::{LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION, sigmoid_scalar};
+use super::{BINARY_LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION, sigmoid_scalar};
 use crate::objective::GradPair;
 
 pub(super) fn logistic_gradient(
@@ -120,6 +120,22 @@ pub(super) fn classification_error_sum(
     (wrong, weight_sum)
 }
 
+/// XGBoost's `logloss` term `x·ln(max(y, ε))`, exactly `0` when `x == 0`;
+/// `max` keeps a NaN `y` like `std::max(y, eps)`. Out-of-range predictions
+/// (e.g. `binary:logitraw` margins) are not clamped to `[0, 1]`.
+fn xlogy(x: f64, y: f64) -> f64 {
+    if x == 0.0 {
+        0.0
+    } else {
+        let floored = if y < BINARY_LOG_LOSS_EPSILON {
+            BINARY_LOG_LOSS_EPSILON
+        } else {
+            y
+        };
+        x * floored.ln()
+    }
+}
+
 pub(super) fn log_loss(
     preds: &[f32],
     labels: &[f32],
@@ -130,9 +146,9 @@ pub(super) fn log_loss(
     let mut weight_sum = 0.0;
     for index in range {
         let weight = weights.map_or(1.0, |values| f64::from(values[index]));
-        let probability = f64::from(preds[index]).clamp(LOG_LOSS_EPSILON, 1.0 - LOG_LOSS_EPSILON);
+        let probability = f64::from(preds[index]);
         let label = f64::from(labels[index]);
-        loss += weight * -(label * probability.ln() + (1.0 - label) * (1.0 - probability).ln());
+        loss += weight * (xlogy(-label, probability) + xlogy(-(1.0 - label), 1.0 - probability));
         weight_sum += weight;
     }
     (loss, weight_sum)

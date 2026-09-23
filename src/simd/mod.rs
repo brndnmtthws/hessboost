@@ -4,6 +4,8 @@
 mod scalar;
 
 const LOG_LOSS_EPSILON: f64 = 1e-15;
+/// XGBoost's binary `logloss` floor (`float eps = 1e-16`), widened to `f64`.
+const BINARY_LOG_LOSS_EPSILON: f64 = 1e-16f32 as f64;
 const MIN_POSITIVE_PREDICTION: f64 = 1e-8;
 
 use crate::objective::GradPair;

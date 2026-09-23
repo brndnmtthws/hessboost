@@ -21,13 +21,15 @@
 //! ```
 
 use hessboost::data::HistCuts;
+use hessboost::learner::RoundEval;
 use hessboost::prelude::{
     BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError, Monotone,
-    SamplingMethod, TrainingParams, TreeMethod, train,
+    SamplingMethod, TrainingParams, TreeMethod, train, train_with_eval,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Rows of `x_test` on which the fixture carries SHAP contributions.
@@ -50,6 +52,9 @@ struct Tol {
     train: f64,
     import: f64,
     contribs: f64,
+    /// Relative tolerance of the per-round metric oracles:
+    /// `|hessboost - xgboost| <= evals * max(1, |xgboost|)`.
+    evals: f64,
 }
 
 #[derive(Deserialize)]
@@ -70,16 +75,33 @@ struct Fixture {
     #[serde(deserialize_with = "nan_for_null")]
     x_test: Vec<f32>,
     y_test: Vec<f32>,
+    /// Survival label bounds (`label_lower_bound` / `label_upper_bound`) of the
+    /// training and test rows; `"inf"`/`"-inf"` strings encode infinities.
+    #[serde(default, deserialize_with = "bounds")]
+    label_lower_bound: Option<Vec<f32>>,
+    #[serde(default, deserialize_with = "bounds")]
+    label_upper_bound: Option<Vec<f32>>,
+    #[serde(default, deserialize_with = "bounds")]
+    test_label_lower_bound: Option<Vec<f32>>,
+    #[serde(default, deserialize_with = "bounds")]
+    test_label_upper_bound: Option<Vec<f32>>,
     weights: Option<Vec<f32>>,
     /// Per-column `DMatrix` feature weights for column sampling.
     #[serde(default)]
     feature_weights: Option<Vec<f32>>,
+    /// Per-row test-set weights (constant within a query group for ranking).
+    #[serde(default)]
+    test_weights: Option<Vec<f32>>,
     group_sizes: Option<Vec<usize>>,
     test_group_sizes: Option<Vec<usize>>,
     feature_types: Option<Vec<String>>,
     xgb_pred: Vec<f32>,
     xgb_margin: Vec<f32>,
     xgb_contribs: Vec<f32>,
+    /// XGBoost's per-round metrics on the labeled test set
+    /// (`evals_result()["test"]`), keyed by metric name.
+    #[serde(default)]
+    xgb_evals: Option<BTreeMap<String, Vec<f64>>>,
     xgb_model: Value,
     /// File name, relative to `fixtures/`, of the same model saved by XGBoost
     /// as UBJSON (`save_raw("ubj")`).
@@ -109,6 +131,28 @@ struct CutFixture {
 fn nan_for_null<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
     let v: Vec<Option<f32>> = Vec::deserialize(d)?;
     Ok(v.into_iter().map(|x| x.unwrap_or(f32::NAN)).collect())
+}
+
+/// Label bounds: numbers, with `"inf"` / `"-inf"` strings for infinities.
+fn bounds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Bound {
+        Number(f32),
+        Text(String),
+    }
+    let Some(v) = Option::<Vec<Bound>>::deserialize(d)? else {
+        return Ok(None);
+    };
+    v.into_iter()
+        .map(|b| match b {
+            Bound::Number(x) => Ok(x),
+            Bound::Text(s) if s == "inf" => Ok(f32::INFINITY),
+            Bound::Text(s) if s == "-inf" => Ok(f32::NEG_INFINITY),
+            Bound::Text(s) => Err(serde::de::Error::custom(format!("invalid bound `{s}`"))),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -194,6 +238,13 @@ fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
         let k = key.as_str();
         b = match k {
             "objective" => b.objective(str_of(k, v)?),
+            "eval_metric" => match v {
+                Value::String(name) => b.eval_metric(name.as_str()),
+                Value::Array(names) => names.iter().try_fold(b, |b, name| {
+                    Ok::<_, String>(b.eval_metric(str_of(k, name)?))
+                })?,
+                _ => return Err(format!("`{k}` is neither a string nor a list")),
+            },
             "num_class" => b.num_class(usize_of(k, v)?),
             "base_score" => b.base_score(f64_of(k, v)?),
             "eta" => b.eta(f64_of(k, v)?),
@@ -377,6 +428,7 @@ struct Row {
     contribs: String,
     ubj: String,
     export: String,
+    evals: String,
     base_score: String,
 }
 
@@ -419,21 +471,42 @@ impl Case<'_> {
         Ok(d)
     }
 
-    fn train_matrix(&self) -> Result<DMatrix, String> {
-        let fx = self.fx;
-        let mut d = self
-            .dmatrix(&fx.x_train, fx.n_train)?
-            .with_label_matrix(&fx.y_train, fx.n_targets)
-            .map_err(|e| format!("labels: {e}"))?;
-        if let Some(w) = &fx.weights {
+    /// Attach labels (a `[row][target]` matrix of `fx.n_targets` columns, when
+    /// the fixture has any), survival bounds, weights, query groups, and
+    /// column-sampling feature weights to `d`.
+    fn with_meta(
+        &self,
+        d: DMatrix,
+        labels: &[f32],
+        bounds: (Option<&Vec<f32>>, Option<&Vec<f32>>),
+        weights: Option<&Vec<f32>>,
+        groups: Option<&Vec<usize>>,
+        feature_weights: Option<&Vec<f32>>,
+    ) -> Result<DMatrix, String> {
+        let mut d = d;
+        if !labels.is_empty() {
+            d = d
+                .with_label_matrix(labels, self.fx.n_targets)
+                .map_err(|e| format!("labels: {e}"))?;
+        }
+        match bounds {
+            (Some(lo), Some(hi)) => {
+                d = d
+                    .with_label_bounds(lo, hi)
+                    .map_err(|e| format!("label bounds: {e}"))?;
+            }
+            (None, None) => {}
+            _ => return Err("only one of the label bounds is present".to_string()),
+        }
+        if let Some(w) = weights {
             d = d.with_weights(w).map_err(|e| format!("weights: {e}"))?;
         }
-        if let Some(w) = &fx.feature_weights {
+        if let Some(w) = feature_weights {
             d = d
                 .with_feature_weights(w)
                 .map_err(|e| format!("feature_weights: {e}"))?;
         }
-        if let Some(g) = &fx.group_sizes {
+        if let Some(g) = groups {
             d = d
                 .with_group_sizes(g)
                 .map_err(|e| format!("group_sizes: {e}"))?;
@@ -441,12 +514,53 @@ impl Case<'_> {
         Ok(d)
     }
 
-    /// Assertion 1: train and compare `predict(x_test)` with `xgb_pred`.
-    fn train_and_compare(&mut self, dtest: &DMatrix) -> Result<(BoostedModel, Vec<f32>), String> {
+    fn train_matrix(&self) -> Result<DMatrix, String> {
+        let fx = self.fx;
+        self.with_meta(
+            self.dmatrix(&fx.x_train, fx.n_train)?,
+            &fx.y_train,
+            (fx.label_lower_bound.as_ref(), fx.label_upper_bound.as_ref()),
+            fx.weights.as_ref(),
+            fx.group_sizes.as_ref(),
+            fx.feature_weights.as_ref(),
+        )
+    }
+
+    /// The labeled test set the metric oracles were evaluated on.
+    fn eval_matrix(&self) -> Result<DMatrix, String> {
+        let fx = self.fx;
+        self.with_meta(
+            self.dmatrix(&fx.x_test, fx.n_test)?,
+            &fx.y_test,
+            (
+                fx.test_label_lower_bound.as_ref(),
+                fx.test_label_upper_bound.as_ref(),
+            ),
+            fx.test_weights.as_ref(),
+            fx.test_group_sizes.as_ref(),
+            None,
+        )
+    }
+
+    /// Assertion 1: train and compare `predict(x_test)` with `xgb_pred`. With
+    /// metric oracles the labeled test set is evaluated every round; the
+    /// history is returned for [`Case::compare_evals`].
+    fn train_and_compare(
+        &mut self,
+        dtest: &DMatrix,
+    ) -> Result<(BoostedModel, Vec<f32>, Vec<RoundEval>), String> {
         let fx = self.fx;
         let params = build_params(fx)?;
         let dtrain = self.train_matrix()?;
-        let model = train(&params, &dtrain, fx.num_round).map_err(|e| format!("train: {e}"))?;
+        let (model, history) = if fx.xgb_evals.is_some() {
+            let deval = self.eval_matrix()?;
+            let result = train_with_eval(&params, &dtrain, fx.num_round, &[(&deval, "test")], None)
+                .map_err(|e| format!("train: {e}"))?;
+            (result.model, result.history)
+        } else {
+            let model = train(&params, &dtrain, fx.num_round).map_err(|e| format!("train: {e}"))?;
+            (model, Vec::new())
+        };
         let preds = model.predict(dtest).map_err(|e| format!("predict: {e}"))?;
         if preds.len() != fx.xgb_pred.len() {
             return Err(format!(
@@ -455,7 +569,57 @@ impl Case<'_> {
                 fx.xgb_pred.len()
             ));
         }
-        Ok((model, preds))
+        Ok((model, preds, history))
+    }
+
+    /// Assertion 1b: every round's test-set metrics match XGBoost's
+    /// `evals_result`: the same metric names (the default metric's name when
+    /// the case sets no `eval_metric`) and values within the relative
+    /// `tol.evals`. Returns the largest relative delta as the table cell.
+    fn compare_evals(&mut self, history: &[RoundEval]) -> String {
+        let fx = self.fx;
+        let Some(oracle) = &fx.xgb_evals else {
+            return "-".to_string();
+        };
+        let mut ours: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+        for round in history {
+            for (_, metric, value) in &round.scores {
+                ours.entry(metric.as_str()).or_default().push(*value);
+            }
+        }
+        let our_names: Vec<&str> = ours.keys().copied().collect();
+        let xgb_names: Vec<&str> = oracle.keys().map(String::as_str).collect();
+        if our_names != xgb_names {
+            self.fail(format!(
+                "evals: metric names {our_names:?} != xgboost {xgb_names:?}"
+            ));
+            return "ERR".to_string();
+        }
+        let mut worst = 0.0f64;
+        for (name, want) in oracle {
+            let got = &ours[name.as_str()];
+            if got.len() != want.len() {
+                self.fail(format!(
+                    "evals {name}: {} rounds, xgboost {}",
+                    got.len(),
+                    want.len()
+                ));
+                return "ERR".to_string();
+            }
+            for (round, (a, b)) in got.iter().zip(want).enumerate() {
+                let rel = (a - b).abs() / b.abs().max(1.0);
+                // NaN never passes.
+                if rel.is_nan() || rel > fx.tol.evals {
+                    self.fail(format!(
+                        "evals {name} round {round}: hessboost {a} xgboost {b} (rel {rel:.3e} > tol {:.0e})",
+                        fx.tol.evals
+                    ));
+                    return "ERR".to_string();
+                }
+                worst = worst.max(rel);
+            }
+        }
+        format!("{worst:.2e}")
     }
 
     /// Quality tier: RMSE ratio for regression, accuracy / NDCG slack otherwise.
@@ -619,6 +783,7 @@ impl Case<'_> {
             contribs: "ERR".to_string(),
             ubj: "ERR".to_string(),
             export: "n/a".to_string(),
+            evals: "-".to_string(),
             base_score: "-".to_string(),
         };
 
@@ -638,7 +803,7 @@ impl Case<'_> {
         };
 
         match self.train_and_compare(&dtest) {
-            Ok((model, preds)) => {
+            Ok((model, preds, history)) => {
                 row.train = match fx.tier {
                     Tier::Exact | Tier::Trainonly => {
                         let d = max_abs_diff("train predict", &preds, &fx.xgb_pred);
@@ -646,6 +811,7 @@ impl Case<'_> {
                     }
                     Tier::Quality => self.quality_band(&preds),
                 };
+                row.evals = self.compare_evals(&history);
                 row.base_score = format!(
                     "{:?}",
                     model
@@ -690,8 +856,8 @@ fn xgboost_parity() {
 
     let mut failures = Vec::new();
     println!(
-        "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} base_score hessboost | xgboost",
-        "case", "tier", "train", "import", "margin", "contribs", "ubj", "export"
+        "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} base_score hessboost | xgboost",
+        "case", "tier", "train", "import", "margin", "contribs", "ubj", "export", "evals"
     );
     for (_, fx) in &fixtures {
         let row = Case {
@@ -700,7 +866,7 @@ fn xgboost_parity() {
         }
         .run(&dir, &exports);
         println!(
-            "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {} | {}",
+            "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {} | {}",
             row.name,
             row.tier,
             row.train,
@@ -709,6 +875,7 @@ fn xgboost_parity() {
             row.contribs,
             row.ubj,
             row.export,
+            row.evals,
             row.base_score,
             xgb_base_score(fx)
         );

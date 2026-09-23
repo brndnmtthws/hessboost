@@ -109,8 +109,9 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 - **Regularization:** `lambda`, `alpha`, `gamma`, `min_child_weight`,
   `max_delta_step`, `max_depth`, `max_leaves`, `max_bin`.
 - **Objectives:** `reg:squarederror` (alias `reg:linear`), `reg:logistic`,
-  `reg:pseudohubererror` (`huber_slope`), `binary:logistic`, `multi:softmax`,
-  `multi:softprob`, `count:poisson`, `reg:gamma`, `reg:tweedie`
+  `reg:pseudohubererror` (`huber_slope`), `reg:squaredlogerror`,
+  `binary:logistic`, `binary:logitraw` (raw-margin output), `binary:hinge`,
+  `multi:softmax`, `multi:softprob`, `count:poisson`, `reg:gamma`, `reg:tweedie`
   (`tweedie_variance_power`), learning-to-rank (`rank:pairwise`, `rank:ndcg`,
   `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), and a user
   **custom-objective hook**. Intercepts are estimated per output exactly as
@@ -133,11 +134,13 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   Elementwise metrics average over every row and target (row weights
   repeated per target); `auc`/`aucpr` macro-average the targets. Other
   objectives and the ranking/multiclass metrics reject label matrices.
-- **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
-  `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
-  **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for
-  ranking, `tweedie-nloglik@rho` for Tweedie), except `reg:pseudohubererror`,
-  which reports `mae` because XGBoost's `mphe` is not implemented.
+- **Metrics:** `rmse`, `rmsle`, `mae`, `mape`, `mphe` (`huber_slope`),
+  `logloss`, `error`, `auc`, `aucpr`, `mlogloss`, `merror`,
+  `poisson/gamma/tweedie-nloglik`, `ndcg`, `map`, `pre` (with `@k`; plain
+  `pre` cuts at 32 like XGBoost), and a **custom-metric hook**. Default
+  metrics follow XGBoost (`ndcg@k`/`map@k` for ranking, `tweedie-nloglik@rho`
+  for Tweedie, `mphe` for pseudo-Huber, `rmsle` for squared log error,
+  `logloss` on raw margins for `binary:logitraw`, `error` for hinge).
 - **Constraints:** monotone constraints and **interaction constraints**,
   supported in **both** the `hist` and `exact` builders.
 - **Modeling:** **native categorical splits** (hist and exact), per-instance

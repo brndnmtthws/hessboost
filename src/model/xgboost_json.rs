@@ -68,16 +68,18 @@
 //!
 //! XGBoost 3.x stores the intercept as a vector string, `"[v0,v1,...]"`, with
 //! one entry per output (or a single entry that applies to every output), in
-//! whatever space its objective reports: raw margin for `reg:squarederror`, but
+//! whatever space its objective's `ProbToMargin` maps from: raw margin for
+//! `reg:squarederror`, `binary:logitraw` and `binary:hinge`, but
 //! **probability** space for objectives with a link function (`0.5` for
 //! `binary:logistic`, not its logit). `hessboost` stores per-output
 //! intercepts in **margin** space, so on **import** the vector is mapped
 //! through the objective's inverse link ([`Objective::probs_to_margins`]) and
-//! on **export** the margin row is mapped back with the forward transform
-//! ([`Objective::pred_transform`]). Multiclass objectives (and any objective we
-//! cannot reconstruct) pass the values through unchanged, as XGBoost does:
-//! softmax's inverse link is the identity, while its forward transform
-//! normalizes across classes.
+//! on **export** the margin row is mapped back with
+//! [`Objective::margins_to_probs`] (the forward transform, except for
+//! `binary:hinge`, whose threshold is not its link). Multiclass objectives
+//! (and any objective we cannot reconstruct) pass the values through
+//! unchanged, as XGBoost does: softmax's inverse link is the identity, while
+//! its forward transform normalizes across classes.
 //!
 //! `learner_model_param.num_target` carries [`BoostedModel::n_targets`]. A
 //! multi-target model (`one_output_per_tree` on a label matrix, `num_class`
@@ -631,13 +633,14 @@ fn build_objective(
 
 /// Render the per-output margin intercepts as XGBoost 3.x's `base_score`
 /// vector string, `"[v0,v1,...]"`, in the space XGBoost stores it in: the
-/// objective's forward transform over the whole row. Multiclass (softmax)
-/// values pass through unchanged, since XGBoost's softmax inverse link is the
-/// identity while its transform normalizes across classes.
+/// objective's inverse intercept link over the whole row
+/// ([`Objective::margins_to_probs`]). Multiclass (softmax) values pass
+/// through unchanged, since XGBoost's softmax inverse link is the identity
+/// while its transform normalizes across classes.
 fn format_base_score(margins: &[f32], objective: &dyn Objective, num_class: usize) -> String {
     let mut stored = margins.to_vec();
     if num_class < 2 {
-        objective.pred_transform(&mut stored);
+        objective.margins_to_probs(&mut stored);
     }
     let entries: Vec<String> = stored.iter().map(f32::to_string).collect();
     format!("[{}]", entries.join(","))
@@ -696,9 +699,13 @@ const SOFTMAX_NUM_CLASS: (&str, &str) = ("softmax_multiclass_param", "num_class"
 /// writes for each objective (its `SaveConfig`), so upstream XGBoost accepts
 /// the file. The retained [`ObjectiveParams`] are written as XGBoost's
 /// stringified numbers; LambdaRank parameters the model does not retain are
-/// written at XGBoost's defaults.
+/// written at XGBoost's defaults. Objectives without parameters
+/// (`reg:squaredlogerror`, `binary:hinge`) write their name only.
 fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams) -> Value {
+    let mut out = Map::with_capacity(2);
+    out.insert("name".to_string(), Value::String(objective.to_string()));
     let ((block, key), value) = match objective {
+        "reg:squaredlogerror" | "binary:hinge" => return Value::Object(out),
         "multi:softmax" | "multi:softprob" => (SOFTMAX_NUM_CLASS, num_class.to_string()),
         "count:poisson" => (MAX_DELTA_STEP, params.max_delta_step.to_string()),
         "reg:tweedie" => (
@@ -728,8 +735,6 @@ fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams
         }
     }
     fields.insert(key.to_string(), Value::String(value));
-    let mut out = Map::with_capacity(2);
-    out.insert("name".to_string(), Value::String(objective.to_string()));
     out.insert(block.to_string(), Value::Object(fields));
     Value::Object(out)
 }

@@ -1,5 +1,6 @@
 use super::{
-    LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION, scalar, sigmoid_scalar,
+    BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION, scalar,
+    sigmoid_scalar,
 };
 use crate::objective::GradPair;
 #[allow(
@@ -1066,8 +1067,7 @@ pub(super) unsafe fn log_loss_sum(
     // documented at each memory access below.
     unsafe {
         let one = vdupq_n_f64(1.0);
-        let lower = vdupq_n_f64(LOG_LOSS_EPSILON);
-        let upper = vdupq_n_f64(1.0 - LOG_LOSS_EPSILON);
+        let floor = vdupq_n_f64(BINARY_LOG_LOSS_EPSILON);
         let mut loss_low = vdupq_n_f64(0.0);
         let mut loss_high = vdupq_n_f64(0.0);
         let mut weight_low = vdupq_n_f64(0.0);
@@ -1085,23 +1085,26 @@ pub(super) unsafe fn log_loss_sum(
                 scalar::log_loss(preds, labels, weights, index..index + VECTOR_WIDTH)
             );
             let label = vld1q_f32(labels.as_ptr().add(index));
-            let probability_low =
-                vminq_f64(vmaxq_f64(vcvt_f64_f32(vget_low_f32(pred)), lower), upper);
-            let probability_high = vminq_f64(vmaxq_f64(vcvt_high_f64_f32(pred), lower), upper);
+            // XGBoost floors each log argument at ε separately and does not
+            // clamp the prediction into [0, 1]; the finite guard above makes
+            // both logs finite, so a zero label coefficient contributes 0
+            // exactly as upstream's `xlogy` branch does.
+            let probability_low = vcvt_f64_f32(vget_low_f32(pred));
+            let probability_high = vcvt_high_f64_f32(pred);
             let label_low = vcvt_f64_f32(vget_low_f32(label));
             let label_high = vcvt_high_f64_f32(label);
             let value_low = vnegq_f64(vaddq_f64(
-                vmulq_f64(label_low, logq_f64(probability_low)),
+                vmulq_f64(label_low, logq_f64(vmaxq_f64(probability_low, floor))),
                 vmulq_f64(
                     vsubq_f64(one, label_low),
-                    logq_f64(vsubq_f64(one, probability_low)),
+                    logq_f64(vmaxq_f64(vsubq_f64(one, probability_low), floor)),
                 ),
             ));
             let value_high = vnegq_f64(vaddq_f64(
-                vmulq_f64(label_high, logq_f64(probability_high)),
+                vmulq_f64(label_high, logq_f64(vmaxq_f64(probability_high, floor))),
                 vmulq_f64(
                     vsubq_f64(one, label_high),
-                    logq_f64(vsubq_f64(one, probability_high)),
+                    logq_f64(vmaxq_f64(vsubq_f64(one, probability_high), floor)),
                 ),
             ));
             accumulate_metric_sum!(

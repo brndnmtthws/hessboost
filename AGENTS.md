@@ -108,7 +108,10 @@ suite; `docs/performance.md` records its results.
   by its row weight); non-elementwise metrics override it or return
   `supports_label_matrix() == false`, which training rejects. Parameters the
   training loop does not act on yet are refused in
-  `train.rs::reject_unimplemented`.
+  `train.rs::reject_unimplemented`. XGBoost-JSON import maps `base_score` with
+  `probs_to_margins` and export with `margins_to_probs` (defaults to
+  `pred_transform`; `binary:hinge` overrides it because its threshold is not
+  its link).
 
 ## Public API at a glance
 

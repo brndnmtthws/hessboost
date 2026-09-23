@@ -134,6 +134,22 @@ fn check_update(
             "are not supported by the refresh updater (`process_type=update`)",
         ));
     }
+    // The refresh updater recomputes constant leaf weights from the gradient
+    // sums; linear leaf models and path-smoothed outputs would silently go
+    // stale or be dropped.
+    if params.linear_tree
+        || params.path_smooth > 0.0
+        || init
+            .trees()
+            .iter()
+            .any(|tree| tree.linear_leaves().is_some())
+    {
+        return Err(HessboostError::invalid_param(
+            "process_type",
+            "`update` cannot refresh linear-leaf trees or path-smoothed leaves \
+             (`linear_tree` / `path_smooth`)",
+        ));
+    }
     if num_boost_round > init.num_boost_rounds() {
         return Err(HessboostError::invalid_param(
             "num_boost_round",

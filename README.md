@@ -106,7 +106,8 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   which keeps the model's intercept and continues its RNG stream, so `a + b`
   rounds in two calls grow the same trees as one run; **`process_type =
   update`** refreshing an existing model's statistics and (with
-  `refresh_leaf`) leaf values on new data, like XGBoost's `refresh` updater;
+  `refresh_leaf`) leaf values on new data, like XGBoost's `refresh` updater
+  (constant leaves only: linear-leaf and `path_smooth` refreshes are refused);
   **model slicing** by boosting iteration (`BoostedModel::slice(begin, end,
   step)`, XGBoost's `booster[a:b:c]`); and **`iteration_range`** prediction
   (`predict_range`, `predict_margin_range`, `predict_leaf_range`,

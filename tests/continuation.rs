@@ -282,6 +282,30 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     ));
 }
 
+/// The refresh updater recomputes constant leaves only: a model with linear
+/// leaves, or a refresh configured with linear leaves or path smoothing, is
+/// refused instead of silently refreshing to a different model.
+#[test]
+fn refresh_refuses_linear_leaves_and_path_smoothing() {
+    let d = regression(300, 0.0);
+    let refused = |params: &TrainingParams, model: &BoostedModel| {
+        matches!(
+            train_continue(params, &d, 2, model),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "process_type"
+        )
+    };
+    let update = || base().process_type(ProcessType::Update);
+    let linear = train(&base().linear_tree(true).build().unwrap(), &d, 3).unwrap();
+    assert!(refused(&update().build().unwrap(), &linear));
+    let plain = train(&base().build().unwrap(), &d, 3).unwrap();
+    assert!(refused(
+        &update().linear_tree(true).build().unwrap(),
+        &plain
+    ));
+    assert!(refused(&update().path_smooth(1.0).build().unwrap(), &plain));
+    assert!(train_continue(&update().build().unwrap(), &d, 2, &plain).is_ok());
+}
+
 #[test]
 fn parallel_trees_form_one_iteration_and_share_the_learning_rate() {
     let d = multiclass(240);

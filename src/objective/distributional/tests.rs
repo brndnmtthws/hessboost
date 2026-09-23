@@ -316,6 +316,67 @@ fn count_crps_matches_the_integral_of_the_step_cdf() {
     }
 }
 
+/// `E|X - y| - E|X - X'|/2` of a count distribution from its pmf over
+/// `lo..=hi`, normalized there (independent of the CRPS step sum):
+/// `E|X - y|` summed directly and `E|X - X'|/2 = Σ_k F(k)(1 - F(k))`.
+fn count_crps_by_expectation(dist: &Dist, y: f64, lo: u64, hi: u64) -> f64 {
+    let pmf: Vec<f64> = (lo..=hi).map(|k| dist.log_prob(k as f64).exp()).collect();
+    let total: f64 = pmf.iter().sum();
+    let (mut abs_dev, mut spread, mut cdf) = (0.0, 0.0, 0.0);
+    for (i, p) in pmf.iter().enumerate() {
+        let p = p / total;
+        abs_dev += p * ((lo + i as u64) as f64 - y).abs();
+        cdf += p;
+        spread += cdf * (1.0 - cdf);
+    }
+    abs_dev - spread
+}
+
+/// Labels far outside the numerical support: the unit steps between the
+/// support and `y` count in full (the sum used to stop after 100 000 steps
+/// and drop them), and supports wider than the step budget are summed in
+/// strides instead of being cut short.
+#[test]
+fn count_crps_handles_residuals_far_outside_the_support() {
+    let cases = [
+        (Dist::Poisson { rate: 1.0 }, 1e6, 60),
+        (Dist::Poisson { rate: 1.0 }, 1e6 + 0.25, 60),
+        (
+            Dist::NegativeBinomial {
+                mean: 3.0,
+                size: 2.0,
+            },
+            1e7,
+            400,
+        ),
+        (Dist::Poisson { rate: 1e6 }, 0.0, 1_020_000),
+        (Dist::Poisson { rate: 1e6 }, 3e6, 1_020_000),
+        // 24 standard deviations span more than the step budget.
+        (Dist::Poisson { rate: 1e9 }, 0.0, 1_000_400_000),
+        (Dist::Poisson { rate: 1e9 }, 1e9 + 2e4, 1_000_400_000),
+        (
+            Dist::NegativeBinomial {
+                mean: 2e5,
+                size: 40.0,
+            },
+            5e3,
+            800_000,
+        ),
+    ];
+    for (dist, y, hi) in cases {
+        // Below 14 standard deviations under the mean the mass is < 1e-40.
+        let lo = (dist.mean() - 14.0 * dist.std_dev()).max(0.0) as u64;
+        let reference = count_crps_by_expectation(&dist, y, lo, hi);
+        let got = dist.crps(y);
+        assert!(
+            close(got, reference, 1e-7, 1e-6),
+            "{dist:?} y={y}: {got} vs {reference}"
+        );
+        // The CRPS is at least the distance to the mean minus E|X - X'|/2.
+        assert!(got >= (y - dist.mean()).abs() - dist.std_dev(), "{dist:?}");
+    }
+}
+
 #[test]
 fn quantiles_invert_the_cdf() {
     let continuous = [

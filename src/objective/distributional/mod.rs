@@ -749,12 +749,13 @@ impl Dist {
     /// Continuous ranked probability score `∫ (F(s) - 1{s >= y})² ds`.
     ///
     /// Closed forms for Normal, LogNormal (Baran & Lerch, 2015) and Gamma
-    /// (Scheuerer & Möller, 2015). The count families sum the integral
-    /// exactly over the unit steps of their CDF (on each `[k, k + 1)` the
-    /// integrand is constant, split at a non-integer `y`), starting 12
-    /// standard deviations below the mean and stopping once the upper tail
-    /// is below `1e-12` (or after 100 000 steps, closed with a geometric-tail
-    /// estimate).
+    /// (Scheuerer & Möller, 2015). The count families sum the integral over
+    /// the unit steps of their CDF (on each `[k, k + 1)` the integrand is
+    /// constant, split at a non-integer `y`), from 12 standard deviations
+    /// below the mean until the upper tail is below `1e-12`; supports wider
+    /// than 50 000 steps are summed in equal blocks of steps. The remaining
+    /// geometric tail, and every step between the support and a `y` far
+    /// outside it, are added in closed form.
     pub fn crps(&self, y: f64) -> f64 {
         match *self {
             Dist::Normal { mu, sigma } => {
@@ -864,38 +865,149 @@ impl Dist {
         hi
     }
 
-    /// Exact step-sum CRPS of a count distribution (see [`Self::crps`]).
+    /// Step-sum CRPS of a count distribution (see [`Self::crps`]).
+    ///
+    /// `F` is constant on each `[k, k + 1)`, so the integral is a sum over
+    /// unit steps. It covers `[max(0, mean - 12 sd), end)` in blocks of `h`
+    /// steps (`h = 1` unless 24 standard deviations exceed half of
+    /// [`MAX_COUNT_TERMS`]; wider supports take the block mass at its centre
+    /// and `F` linear across the block), normalized by the total mass. Below
+    /// the start `F = 0`; from `end` on, `1 - F` decays geometrically at the
+    /// pmf ratio, summed in closed form up to and beyond `y` however far away
+    /// `y` lies.
     fn count_crps(&self, y: f64) -> f64 {
-        let mut walk = CountWalk::new(*self);
-        let k0 = walk.k;
-        // Below 0 the CDF is 0: ∫_y^0 1 ds. Below k0 it is (numerically) 0,
-        // so every unit step above y contributes 1.
-        let mut total = (-y).max(0.0) + (k0 - y.max(0.0)).max(0.0);
-        let mut steps = 0;
+        let (mean, sd) = self.count_moments();
+        let start = (mean - COUNT_HEAD_SDS * sd).floor().max(0.0);
+        let h = (2.0 * COUNT_HEAD_SDS * sd / (MAX_COUNT_TERMS / 2) as f64)
+            .ceil()
+            .max(1.0);
+        // Pass 1: the number of blocks and the total mass (with the
+        // geometric estimate of the mass beyond the last block).
+        let mut blocks = CountBlocks::new(*self, start, h);
+        let (mut n_blocks, mut mass, mut rest) = (0usize, 0.0f64, 0.0f64);
         loop {
-            let (k, _, cdf) = walk.step();
-            let upper = 1.0 - cdf;
-            total += if y <= k {
-                upper * upper
-            } else if y >= k + 1.0 {
-                cdf * cdf
+            let (k, m, next_ratio) = blocks.step();
+            mass += m;
+            n_blocks += 1;
+            let tail = if next_ratio < 1.0 {
+                m * next_ratio / (1.0 - next_ratio)
             } else {
-                (y - k) * cdf * cdf + (k + 1.0 - y) * upper * upper
+                f64::INFINITY
             };
-            if k + 1.0 >= y && upper < COUNT_TAIL {
-                break;
-            }
-            steps += 1;
-            if steps >= MAX_COUNT_TERMS {
-                let rho = walk.ratio();
-                if k + 1.0 >= y && rho < 1.0 {
-                    total += upper * upper * rho * rho / (1.0 - rho * rho);
+            let past_mean = k + h > mean;
+            if (past_mean && tail < COUNT_TAIL * mass) || n_blocks >= MAX_COUNT_TERMS {
+                if tail.is_finite() {
+                    rest = tail;
                 }
                 break;
             }
         }
-        total
+        let total_mass = mass + rest;
+        // Below `start` F = 0: the integrand is 1 on `[y, start)`.
+        let mut total = (start - y).max(0.0);
+        // Pass 2: the blocks again, with the normalized CDF.
+        let mut blocks = CountBlocks::new(*self, start, h);
+        let mut cum = 0.0f64;
+        for _ in 0..n_blocks {
+            let (k, m, _) = blocks.step();
+            let before = cum / total_mass;
+            cum += m;
+            let after = (cum / total_mass).min(1.0);
+            total += block_crps(k, h, before, after, y);
+        }
+        let end = blocks.k;
+        let upper = (rest / total_mass).clamp(0.0, 1.0);
+        let rho = self.count_ratio(end);
+        total + geometric_tail_crps(upper, if rho < 1.0 { rho } else { 0.0 }, y - end)
     }
+}
+
+/// Blocks of `h` consecutive values of a count distribution from `start`
+/// upward, with their probability masses: exact for `h = 1` (the pmf
+/// recursion), otherwise `h` times the pmf at the block centre, stepped by
+/// the midpoint rule on the log pmf ratio (smooth on the scale of a
+/// standard deviation, which spans many blocks).
+struct CountBlocks {
+    dist: Dist,
+    h: f64,
+    /// First value of the next block.
+    k: f64,
+    /// `ln P(Y = c)` at the next block's centre `c = k + (h - 1)/2`.
+    ln_center: f64,
+}
+
+impl CountBlocks {
+    fn new(dist: Dist, start: f64, h: f64) -> Self {
+        CountBlocks {
+            dist,
+            h,
+            k: start,
+            ln_center: dist.count_ln_pmf(start + 0.5 * (h - 1.0)),
+        }
+    }
+
+    /// Visit the next block: `(first value, mass, next mass / this mass)`.
+    fn step(&mut self) -> (f64, f64, f64) {
+        let (k, h) = (self.k, self.h);
+        let mass = h * self.ln_center.exp();
+        // ln P(c + h) - ln P(c) = Σ_{t < h} ln ratio(c + t), by the midpoint.
+        let ln_step = h * self.dist.count_ratio(k + h - 1.0).ln();
+        self.ln_center += ln_step;
+        self.k += h;
+        (k, mass, ln_step.exp())
+    }
+}
+
+/// `Σ_{i0 <= i < i1} (a + d(i + 1))²`.
+fn square_sum(a: f64, d: f64, i0: f64, i1: f64) -> f64 {
+    if i1 <= i0 {
+        return 0.0;
+    }
+    let squares = |x: f64| x * (x + 1.0) * (2.0 * x + 1.0) / 6.0;
+    let (s0, s1) = (i0 + 1.0, i1);
+    let n = s1 - s0 + 1.0;
+    n * a * a + a * d * (s0 + s1) * n + d * d * (squares(s1) - squares(s0 - 1.0))
+}
+
+/// CRPS integrand over the block `[k, k + h)` of unit steps whose CDF rises
+/// linearly from `before` (below `k`) to `after` (at its last step): unit
+/// `i` has `F = before + (after - before)(i + 1)/h`, contributing `F²` below
+/// `y` and `(1 - F)²` above it (split at a fractional `y`).
+fn block_crps(k: f64, h: f64, before: f64, after: f64, y: f64) -> f64 {
+    let d = (after - before) / h;
+    let below = |i0, i1| square_sum(before, d, i0, i1);
+    let above = |i0, i1| square_sum(1.0 - before, -d, i0, i1);
+    if y <= k {
+        return above(0.0, h);
+    }
+    if y >= k + h {
+        return below(0.0, h);
+    }
+    let n = (y - k).floor();
+    let f = y - k - n;
+    let cdf = before + d * (n + 1.0);
+    let upper = 1.0 - cdf;
+    below(0.0, n) + f * cdf * cdf + (1.0 - f) * upper * upper + above(n + 1.0, h)
+}
+
+/// CRPS integrand beyond the summed support, `[end, ∞)`, with `y = end +
+/// m`: unit `t >= 1` (`[end + t - 1, end + t)`) has `1 - F = u ρ^t`, the
+/// geometric tail of the remaining mass `u` at pmf ratio `ρ < 1`. Units
+/// below `y` contribute `(1 - u ρ^t)²`, the rest `(u ρ^t)²`, in closed form
+/// however large `m` is.
+fn geometric_tail_crps(u: f64, rho: f64, m: f64) -> f64 {
+    let r2 = rho * rho;
+    // Σ_{s >= t} (u ρ^s)².
+    let beyond = |t: f64| u * u * rho.powf(2.0 * t) / (1.0 - r2);
+    if m <= 0.0 {
+        return beyond(1.0);
+    }
+    let n = m.floor();
+    let f = m - n;
+    let full = n - 2.0 * u * rho * (1.0 - rho.powf(n)) / (1.0 - rho)
+        + u * u * r2 * (1.0 - rho.powf(2.0 * n)) / (1.0 - r2);
+    let q = u * rho.powf(n + 1.0);
+    full + f * (1.0 - q) * (1.0 - q) + (1.0 - f) * q * q + beyond(n + 2.0)
 }
 
 /// Walks the probability mass function of a count distribution upward from

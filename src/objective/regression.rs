@@ -53,6 +53,13 @@ impl Objective for SquaredErrorObjective {
         vec![weighted_label_mean(labels, weights)]
     }
 
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // `½ (margin − y)²`.
+        Some(Box::new(|margin, label| {
+            0.5 * (f64::from(margin) - f64::from(label)).powi(2)
+        }))
+    }
+
     fn default_metric(&self) -> String {
         "rmse".to_string()
     }
@@ -114,6 +121,15 @@ impl Objective for PseudoHuberObjective {
                 }
             },
         );
+    }
+
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // `δ² (√(1 + z²/δ²) − 1)`, whose derivatives are the gradient above.
+        let slope_sq = f64::from(self.slope).powi(2);
+        Some(Box::new(move |margin, label| {
+            let z = f64::from(margin) - f64::from(label);
+            slope_sq * ((1.0 + z * z / slope_sq).sqrt() - 1.0)
+        }))
     }
 
     fn default_metric(&self) -> String {

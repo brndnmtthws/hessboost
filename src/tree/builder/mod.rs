@@ -4,6 +4,7 @@
 //! gradients. The exact builder is the reference; the histogram builder shares
 //! the same regularized gain math.
 
+pub(crate) mod budget;
 mod exact;
 mod hist;
 

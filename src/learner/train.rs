@@ -286,19 +286,6 @@ fn train_impl_inner(
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
-    if let Some(base_score) = params.base_score {
-        let invalid = match params.objective.as_str() {
-            "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
-            "count:poisson" | "reg:gamma" | "reg:tweedie" => base_score <= 0.0,
-            _ => false,
-        };
-        if invalid {
-            return Err(HessboostError::invalid_param(
-                "base_score",
-                "is outside the objective's valid output domain",
-            ));
-        }
-    }
     validate_dataset(
         objective,
         dtrain,
@@ -331,32 +318,7 @@ fn train_impl_inner(
         }
     }
 
-    // Per-output intercepts in margin space. A user-supplied `base_score` is
-    // given in prediction space and broadcast to every output through the
-    // objective's link (XGBoost `ProbToMargin`; for multiclass this is a
-    // uniform nonzero margin, as in XGBoost); otherwise the objective estimates
-    // them from the labels (XGBoost `InitEstimation`).
-    let base_margins = match params.base_score {
-        Some(bs) => {
-            let mut scores = vec![bs as f32; n_out];
-            objective.probs_to_margins(&mut scores);
-            scores
-        }
-        None => objective.base_margins_info(&info),
-    };
-    if base_margins.len() != n_out {
-        return Err(HessboostError::DimensionMismatch {
-            what: "objective base_margins length",
-            expected: n_out,
-            got: base_margins.len(),
-        });
-    }
-    if base_margins.iter().any(|m| !m.is_finite()) {
-        return Err(HessboostError::invalid_param(
-            "base_score",
-            format!("estimated intercept is not finite ({base_margins:?}); check the labels"),
-        ));
-    }
+    let base_margins = initial_intercepts(params, objective, &info, n_out)?;
 
     // The model records the objective's own name and output count (not the
     // configured string / `num_class`): a `reg:linear` alias is saved as
@@ -594,6 +556,54 @@ fn reject_unimplemented(params: &TrainingParams, dtrain: &DMatrix) -> Result<()>
     Ok(())
 }
 
+/// Per-output intercepts in margin space. A user-supplied `base_score` is
+/// given in prediction space and broadcast to every output through the
+/// objective's link (XGBoost `ProbToMargin`; for multiclass this is a
+/// uniform nonzero margin, as in XGBoost); otherwise the objective estimates
+/// them from the labels (XGBoost `InitEstimation`).
+pub(crate) fn initial_intercepts(
+    params: &TrainingParams,
+    objective: &dyn crate::objective::Objective,
+    info: &MetaInfo,
+    n_out: usize,
+) -> Result<Vec<f32>> {
+    if let Some(base_score) = params.base_score {
+        let invalid = match params.objective.as_str() {
+            "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
+            "count:poisson" | "reg:gamma" | "reg:tweedie" => base_score <= 0.0,
+            _ => false,
+        };
+        if invalid {
+            return Err(HessboostError::invalid_param(
+                "base_score",
+                "is outside the objective's valid output domain",
+            ));
+        }
+    }
+    let base_margins = match params.base_score {
+        Some(bs) => {
+            let mut scores = vec![bs as f32; n_out];
+            objective.probs_to_margins(&mut scores);
+            scores
+        }
+        None => objective.base_margins_info(info),
+    };
+    if base_margins.len() != n_out {
+        return Err(HessboostError::DimensionMismatch {
+            what: "objective base_margins length",
+            expected: n_out,
+            got: base_margins.len(),
+        });
+    }
+    if base_margins.iter().any(|m| !m.is_finite()) {
+        return Err(HessboostError::invalid_param(
+            "base_score",
+            format!("estimated intercept is not finite ({base_margins:?}); check the labels"),
+        ));
+    }
+    Ok(base_margins)
+}
+
 /// Add one tree's predictions to one output column. Rows are independent, so
 /// parallel traversal preserves each row's floating-point addition order.
 fn update_tree_margins(
@@ -822,7 +832,7 @@ fn sample_features(n: usize, colsample: f64, rng: &mut StdRng) -> Vec<u32> {
 /// followed by the objective's own [`validate_info`] label-domain checks.
 ///
 /// [`validate_info`]: crate::objective::Objective::validate_info
-fn validate_dataset(
+pub(crate) fn validate_dataset(
     objective: &dyn crate::objective::Objective,
     data: &DMatrix,
     n_targets: usize,

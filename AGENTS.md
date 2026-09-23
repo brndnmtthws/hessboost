@@ -53,15 +53,16 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `builder/budget` (five-fold generalization-gated grower for budget mode), `hist/` accumulation, `compact` (prediction layout) |
 | `booster/` | `gblinear` |
-| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
+| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `budget` (opt-in PerpetualBooster-style budget training, beyond XGBoost), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
 `tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
-(proptest), `shap_accumulation.rs`. `benches/training.rs` is the Criterion
-suite; `docs/performance.md` records its results.
+(proptest), `shap_accumulation.rs`, `target_stats.rs`, `budget.rs`.
+`benches/training.rs` is the Criterion suite; `docs/performance.md` records
+its results.
 
 ## Invariants
 
@@ -96,7 +97,11 @@ suite; `docs/performance.md` records its results.
   `requires_labels`; `Metric::eval_info`). Label-domain checks live in each
   objective's `validate_info`; `create_objective(params, n_targets)` rejects
   label matrices an objective cannot model. Parameters the training loop does
-  not act on yet are refused in `train.rs::reject_unimplemented`.
+  not act on yet are refused in `train.rs::reject_unimplemented`. Budget
+  mode (`learner/budget.rs`) instead refuses every `TrainingParams` field it
+  does not read by diffing the serialized params against the defaults, so a
+  new field is refused there automatically; it needs an objective's
+  `Objective::pointwise_loss` (per-row loss matching its gradients).
 
 ## Public API at a glance
 
@@ -107,6 +112,8 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 - `train(&params, &dtrain, rounds)`, `train_with_eval(.., &[(&DMatrix, "name")], early_stopping: Option<usize>)`,
   `train_with_objective(.., &dyn Objective)`, `train_with_custom_metric(.., Box<dyn Metric>)`,
   `cv(&params, &data, rounds, nfold, seed)`.
+- `train_with_budget(&params, &dtrain, &BudgetConfig::new(budget))` → `BudgetResult { model, eta, stop }`
+  (opt-in, beyond XGBoost; no round count).
 - `DMatrix::from_dense`/`from_csr`, `.with_labels`/`.with_label_matrix`/`.with_label_bounds`/
   `.with_weights`/`.with_base_margin`/`.with_group_sizes`/`.with_feature_types`/`.with_feature_weights`,
   `.info()` (`MetaInfo`); file loaders are `hessboost::data::{load_csv, load_libsvm}`.

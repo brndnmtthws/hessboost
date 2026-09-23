@@ -77,6 +77,7 @@ Runnable, self-contained examples live in
 | `conformal` | split-conformal and conformalized-quantile (CQR) prediction intervals |
 | `pfn_boost` | boosting from a pretrained prior's logits via `base_margin` (PFN-Boost) |
 | `ordered_target_stats` | opt-in CatBoost-style ordered target statistics for a high-cardinality categorical |
+| `budget` | budget-mode training (PerpetualBooster) across budgets vs default and validation-tuned training |
 
 ### Boosting from a pretrained prior
 
@@ -91,6 +92,30 @@ model, so predicting on a matrix without it falls back to the intercept. The
 `pfn_boost` example runs the method against boosting from scratch across
 training-set sizes with a stand-in prior, or on TabPFN logits exported from
 Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
+
+### Training with a budget instead of tuning
+
+`train_with_budget(&params, &dtrain, &BudgetConfig::new(1.0))` implements
+[PerpetualBooster](https://github.com/perpetual-ml/perpetual)'s algorithm: one
+`budget` number replaces the learning rate, tree-size limits, and round
+count. The budget sets the learning rate (`eta = 10^-budget` up to 1) and a
+per-tree target loss reduction; each split must pass a five-fold
+generalization check (its in-fold improvement has to hold up out of fold),
+and boosting stops by itself once trees stop generalizing, with a hard cap of
+1000 rounds for budgets up to 1 (at most 4000). Larger budgets train more
+trees and fit held-out data more closely at a higher cost; 0.5 (Perpetual's
+default) to 1.5 is the useful range. The result is an ordinary gbtree model
+(every prediction, SHAP, and model-I/O path applies, XGBoost export
+included). Settings budget mode derives itself (`eta`, `max_depth`,
+`lambda`, subsampling, ...) are refused rather than ignored; supported
+objectives are the single-output ones with a pointwise loss (squared error,
+pseudo-Huber, logistic, Poisson, Gamma, Tweedie). On synthetic Friedman #1
+data (`budget` example), budget 1.0 is within 1% of, and budget 1.5 better
+than, a round count tuned by early stopping on a validation set for
+regression, and within 4-10% for binary classification. Perpetual's
+dataset-regime heuristics (automatic subsampling, class reweighting,
+leaf refinement, and objective/shape-specific schedule adjustments) are not
+reproduced; see `hessboost::learner::budget` for the exact rules.
 
 ## Feature status
 
@@ -161,6 +186,11 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   categories to the prior, and is serde-serializable. Regression and binary
   labels; dense and CSR input. Never used unless called; native categorical
   splits and training defaults are unchanged.
+- **Budget-mode training** (`train_with_budget`, `BudgetConfig`):
+  PerpetualBooster's hyperparameter-free boosting, with a budget-derived
+  learning rate and per-tree loss target, five-fold generalization-gated
+  splits, and automatic stopping. Deterministic and thread-count
+  independent; the ordinary training path is untouched.
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.
@@ -257,3 +287,8 @@ Apache-2.0) built from XGBoost's public descriptions and papers; it contains no
 XGBoost source code. "XGBoost" is used descriptively, for algorithmic lineage and
 result compatibility. This project is not affiliated with or endorsed by the
 XGBoost project.
+
+Budget-mode training re-implements the algorithm of
+[PerpetualBooster](https://github.com/perpetual-ml/perpetual) (Copyright 2024
+Perpetual ML, Apache-2.0) from its published description and Rust source; no
+Perpetual code is copied.

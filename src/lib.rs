@@ -58,7 +58,9 @@
 //!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
 //!   [`learner::conformal`]).
 //! - **Beyond XGBoost (opt-in):** CatBoost-style ordered target statistics
-//!   for categorical columns ([`data::OrderedTargetEncoder`]).
+//!   for categorical columns ([`data::OrderedTargetEncoder`]), and
+//!   PerpetualBooster-style budget training, one `budget` number instead of
+//!   tuning `eta`/depth/rounds ([`learner::budget`]).
 //!
 //! ## Where to look
 //!
@@ -113,6 +115,7 @@ pub mod prelude {
     };
     pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
     pub use crate::error::{HessboostError, Result};
+    pub use crate::learner::budget::{BudgetConfig, BudgetResult, BudgetStop, train_with_budget};
     pub use crate::learner::conformal::{ConformalizedQuantile, SplitConformal};
     pub use crate::learner::{
         BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,

@@ -227,7 +227,8 @@ reproduced; see `hessboost::learner::budget` for the exact rules.
   **split conformal** (`SplitConformal`, absolute residuals around a point
   model) and **conformalized quantile regression** (`ConformalizedQuantile`,
   Romano et al. 2019) over two quantile models or two outputs of one model.
-- **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
+- **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O (files from
+  earlier releases keep loading with identical predictions),
   **XGBoost-format model import/export** for `gbtree`/DART ensembles
   with numeric and categorical splits, in both XGBoost encodings: JSON
   (`save_xgboost_json` / `load_xgboost_json`, `to_`/`from_xgboost_json`) and

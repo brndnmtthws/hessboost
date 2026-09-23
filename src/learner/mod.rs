@@ -9,6 +9,7 @@ mod continuation;
 mod cv;
 pub(crate) mod model;
 mod multi_output;
+mod native_v1;
 mod refresh;
 mod sampling;
 mod shap;

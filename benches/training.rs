@@ -130,17 +130,67 @@ fn bench_histogram_build(c: &mut Criterion) {
 
 fn bench_hist_tree_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("hist_tree_build");
-    for (name, n, features, depth, policy) in [
-        ("depth1", 50_000, 20, 1, GrowPolicy::DepthWise),
-        ("depth6", 50_000, 20, 6, GrowPolicy::DepthWise),
-        ("depth10", 50_000, 20, 10, GrowPolicy::DepthWise),
-        ("wide128", 10_000, 128, 6, GrowPolicy::DepthWise),
-        ("missing", 50_000, 20, 6, GrowPolicy::DepthWise),
-        ("monotone", 50_000, 20, 6, GrowPolicy::DepthWise),
-        ("lossguide", 50_000, 20, 6, GrowPolicy::LossGuide),
+    for (name, n, features, depth, policy, quantized) in [
+        ("depth1", 50_000, 20, 1, GrowPolicy::DepthWise, false),
+        ("depth6", 50_000, 20, 6, GrowPolicy::DepthWise, false),
+        ("depth10", 50_000, 20, 10, GrowPolicy::DepthWise, false),
+        ("wide128", 10_000, 128, 6, GrowPolicy::DepthWise, false),
+        ("missing", 50_000, 20, 6, GrowPolicy::DepthWise, false),
+        ("monotone", 50_000, 20, 6, GrowPolicy::DepthWise, false),
+        ("lossguide", 50_000, 20, 6, GrowPolicy::LossGuide, false),
+        (
+            "large_depth8",
+            1_000_000,
+            50,
+            8,
+            GrowPolicy::DepthWise,
+            false,
+        ),
+        // Opt-in quantized gradients (`use_quantized_grad`); the rows above
+        // with the same data are the full-precision baselines.
+        (
+            "depth6_quantized",
+            50_000,
+            20,
+            6,
+            GrowPolicy::DepthWise,
+            true,
+        ),
+        (
+            "depth10_quantized",
+            50_000,
+            20,
+            10,
+            GrowPolicy::DepthWise,
+            true,
+        ),
+        (
+            "wide128_quantized",
+            10_000,
+            128,
+            6,
+            GrowPolicy::DepthWise,
+            true,
+        ),
+        (
+            "missing_quantized",
+            50_000,
+            20,
+            6,
+            GrowPolicy::DepthWise,
+            true,
+        ),
+        (
+            "large_depth8_quantized",
+            1_000_000,
+            50,
+            8,
+            GrowPolicy::DepthWise,
+            true,
+        ),
     ] {
         let mut data = make_data(n, features);
-        if name == "missing" {
+        if name.starts_with("missing") {
             let values: Vec<f32> = (0..n * features)
                 .map(|i| {
                     if i % 11 < 2 {
@@ -173,9 +223,12 @@ fn bench_hist_tree_build(c: &mut Criterion) {
             } else {
                 Vec::new()
             })
+            .use_quantized_grad(quantized)
             .build()
             .unwrap();
         let builder = HistTreeBuilder::new(&params);
+        // A 1M-row tree takes long enough that ten samples are stable.
+        group.sample_size(if n >= 1_000_000 { 10 } else { 100 });
         group.bench_function(name, |b| {
             b.iter(|| {
                 let mut sampler = ColumnSampler::all(features);
@@ -440,6 +493,13 @@ fn bench_binary_train(c: &mut Criterion) {
             )
         });
     });
+    let quantized = TrainingParams {
+        use_quantized_grad: true,
+        ..params.clone()
+    };
+    group.bench_function("quantized", |b| {
+        b.iter(|| black_box(train(&quantized, &data, 50).unwrap()));
+    });
     group.finish();
 }
 
@@ -448,11 +508,12 @@ fn bench_train(c: &mut Criterion) {
     let mut group = c.benchmark_group("train_50k_x20_50rounds");
     group.sample_size(10);
 
-    for (name, method, alpha, max_bin) in [
-        ("Hist", TreeMethod::Hist, 0.0, 256),
-        ("Exact", TreeMethod::Exact, 0.0, 256),
-        ("Hist_l1", TreeMethod::Hist, 1.0, 256),
-        ("Hist_16bins", TreeMethod::Hist, 0.0, 16),
+    for (name, method, alpha, max_bin, quantized) in [
+        ("Hist", TreeMethod::Hist, 0.0, 256, false),
+        ("Exact", TreeMethod::Exact, 0.0, 256, false),
+        ("Hist_l1", TreeMethod::Hist, 1.0, 256, false),
+        ("Hist_16bins", TreeMethod::Hist, 0.0, 16, false),
+        ("Hist_quantized", TreeMethod::Hist, 0.0, 256, true),
     ] {
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
@@ -461,10 +522,38 @@ fn bench_train(c: &mut Criterion) {
             .eta(0.1)
             .alpha(alpha)
             .max_bin(max_bin)
+            .use_quantized_grad(quantized)
             .build()
             .unwrap();
         group.bench_function(name, |b| {
             b.iter(|| train(&params, &data, 50).unwrap());
+        });
+    }
+    group.finish();
+}
+
+/// Batch prediction on 100k x 30 rows: a symmetric model (bit-pattern
+/// tables) against a depthwise model of the same depth and size (generic
+/// lockstep walk).
+fn bench_predict(c: &mut Criterion) {
+    let data = make_data(100_000, 30);
+    let mut group = c.benchmark_group("predict_100k_x30_100trees_depth6");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(data.n_rows() as u64));
+    for (name, policy) in [
+        ("depthwise", GrowPolicy::DepthWise),
+        ("symmetric", GrowPolicy::Symmetric),
+    ] {
+        let params = TrainingParams::builder()
+            .tree_method(TreeMethod::Hist)
+            .grow_policy(policy)
+            .max_depth(6)
+            .eta(0.1)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 100).unwrap();
+        group.bench_function(name, |b| {
+            b.iter(|| model.predict_margin(black_box(&data)).unwrap());
         });
     }
     group.finish();
@@ -480,6 +569,7 @@ criterion_group!(
     bench_log_metrics,
     bench_multiclass_metrics,
     bench_binary_train,
-    bench_train
+    bench_train,
+    bench_predict
 );
 criterion_main!(benches);

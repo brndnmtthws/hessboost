@@ -6,20 +6,31 @@
 //! reported prediction (e.g. the logistic sigmoid). This mirrors XGBoost's
 //! separation of `GetGradient` / `PredTransform`.
 
+mod absolute;
 mod classification;
 mod count;
 mod custom;
 mod multi_target;
 mod multiclass;
+mod quantile;
 mod ranking;
 mod regression;
+mod survival;
 
-pub use classification::LogisticObjective;
+pub use absolute::AbsoluteErrorObjective;
+pub use classification::{HingeObjective, LogisticObjective};
 pub use count::{GammaObjective, PoissonObjective, TweedieObjective};
 pub use custom::CustomObjective;
 pub use multiclass::SoftmaxObjective;
+pub use quantile::{ExpectileObjective, QuantileObjective};
 pub use ranking::LambdaMartObjective;
-pub use regression::{PseudoHuberObjective, SquaredErrorObjective};
+pub use regression::{PseudoHuberObjective, SquaredErrorObjective, SquaredLogErrorObjective};
+
+pub(crate) use quantile::validate_alphas;
+
+pub use survival::{AftObjective, CoxObjective};
+
+pub(crate) use survival::{abs_label_order, aft_nloglik};
 
 use rayon::prelude::*;
 
@@ -47,6 +58,12 @@ impl GradPair {
         GradPair { grad, hess }
     }
 }
+
+/// A per-row loss `ℓ(margin, label)`, unweighted by the sample weight, whose
+/// first and second derivatives with respect to the margin are the gradient
+/// pairs the objective produces (up to Hessian safeguards such as
+/// `max_delta_step`). Returned by [`Objective::pointwise_loss`].
+pub type PointwiseLoss<'a> = Box<dyn Fn(f32, f32) -> f64 + Send + Sync + 'a>;
 
 /// Reduced gradients a custom objective supplies for the *split search* of
 /// vector-leaf trees (see [`Objective::split_gradient`]).
@@ -270,6 +287,17 @@ pub trait Objective: Send + Sync {
         }
     }
 
+    /// Map one row of margin-space intercepts back to the prediction space
+    /// XGBoost stores `base_score` in (the inverse of
+    /// [`Objective::probs_to_margins`]), in place; used by XGBoost-JSON
+    /// export. Defaults to [`Objective::pred_transform`], which inverts the
+    /// link of every objective whose transform is its link; objectives whose
+    /// transform is not the inverse link (`binary:hinge` thresholds, while its
+    /// `ProbToMargin` is the identity) override it.
+    fn margins_to_probs(&self, margins: &mut [f32]) {
+        self.pred_transform(margins);
+    }
+
     /// Validate a dataset's labels and metadata for this objective. Training
     /// calls it for the training matrix and every evaluation set before the
     /// first round. The default accepts everything.
@@ -303,6 +331,18 @@ pub trait Objective: Send + Sync {
     fn split_gradient(&self, _iteration: usize, _gpair: &[GradPair]) -> Option<SplitGradient> {
         None
     }
+    /// The objective's per-row loss, for trainers that measure the actual
+    /// loss reduction of a tree (budget-mode training,
+    /// [`train_with_budget`](crate::learner::budget::train_with_budget)).
+    /// Label-dependent reweighting the gradient applies (e.g.
+    /// `scale_pos_weight`) is part of the loss; the sample weight is not.
+    /// Losses are shifted so a perfect prediction of a hard label scores `0`
+    /// (deviance form), which makes relative loss reductions meaningful.
+    /// `None` (the default) when the objective has no single-row loss, e.g.
+    /// ranking, multi-output, or custom objectives.
+    fn pointwise_loss(&self) -> Option<PointwiseLoss<'_>> {
+        None
+    }
 
     /// The default evaluation metric for this objective, as XGBoost's
     /// `DefaultEvalMetric` names it — including any configuration-dependent
@@ -322,6 +362,16 @@ pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &Met
     let zeros = vec![0.0f32; n * k];
     let mut gpair = vec![GradPair::default(); n * k];
     objective.gradient_info(&zeros, info, &mut gpair);
+    let mut out = fit_stump(&gpair, k);
+    objective.pred_transform(&mut out);
+    objective.probs_to_margins(&mut out);
+    out
+}
+
+/// XGBoost's `tree::FitStump`: the unregularized Newton step `-Σg_k /
+/// max(Σh_k, 1e-6)` per output `k` of a `[row][output]` gradient buffer with
+/// `k` outputs, summed in `f64` and rounded once to `f32`.
+pub(crate) fn fit_stump(gpair: &[GradPair], k: usize) -> Vec<f32> {
     let mut sum_grad = vec![0.0f64; k];
     let mut sum_hess = vec![0.0f64; k];
     for row in gpair.chunks_exact(k) {
@@ -330,14 +380,11 @@ pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &Met
             sum_hess[c] += f64::from(gp.hess);
         }
     }
-    let mut out: Vec<f32> = sum_grad
+    sum_grad
         .iter()
         .zip(&sum_hess)
         .map(|(g, h)| (-g / h.max(1e-6)) as f32)
-        .collect();
-    objective.pred_transform(&mut out);
-    objective.probs_to_margins(&mut out);
-    out
+        .collect()
 }
 
 /// Shared [`Objective::validate_info`] label-domain check: reject the dataset
@@ -414,15 +461,21 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
 /// Resolve an objective by name, configured from `params`, for a dataset with
 /// `n_targets` label columns per row.
 ///
-/// `reg:squarederror`, `reg:pseudohubererror`, `reg:logistic`, and
-/// `binary:logistic` accept a label matrix and give one output per label
-/// column, as in XGBoost. Every other objective models a single target and
-/// rejects `n_targets > 1` with an `invalid parameter "labels"` error.
+/// `reg:squarederror`, `reg:pseudohubererror`, `reg:logistic`,
+/// `binary:logistic`, and `reg:absoluteerror` accept a label matrix and give
+/// one output per label column, as in XGBoost. `reg:quantileerror` /
+/// `reg:expectileerror` produce one output per `quantile_alpha` /
+/// `expectile_alpha` entry and reject an empty, unsorted, or out-of-`[0, 1]`
+/// list. Every other objective models a single target and rejects
+/// `n_targets > 1` with an `invalid parameter "labels"` error.
 pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Objective>> {
     let objective: Box<dyn Objective> = match params.objective.as_str() {
         "reg:squarederror" | "reg:linear" => Box::new(SquaredErrorObjective),
         "reg:pseudohubererror" => Box::new(PseudoHuberObjective::new(params.huber_slope as f32)),
         "binary:logistic" => Box::new(LogisticObjective::new(params.scale_pos_weight as f32)),
+        "binary:logitraw" => Box::new(LogisticObjective::raw(params.scale_pos_weight as f32)),
+        "binary:hinge" => Box::new(HingeObjective),
+        "reg:squaredlogerror" => Box::new(SquaredLogErrorObjective),
         "reg:logistic" => Box::new(LogisticObjective::regression(
             params.scale_pos_weight as f32,
         )),
@@ -441,6 +494,9 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         )),
         "reg:gamma" => Box::new(GammaObjective),
         "reg:tweedie" => Box::new(TweedieObjective::new(params.tweedie_variance_power as f32)),
+        "reg:quantileerror" => Box::new(QuantileObjective::new(&params.quantile_alpha)?),
+        "reg:expectileerror" => Box::new(ExpectileObjective::new(&params.expectile_alpha)?),
+        "reg:absoluteerror" => return Ok(Box::new(AbsoluteErrorObjective::new(n_targets))),
         "rank:pairwise" => Box::new(LambdaMartObjective::pairwise(
             params.lambdarank_num_pair_per_sample,
         )),
@@ -449,6 +505,11 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         )),
         "rank:map" => Box::new(LambdaMartObjective::map(
             params.lambdarank_num_pair_per_sample,
+        )),
+        "survival:cox" => Box::new(CoxObjective),
+        "survival:aft" => Box::new(AftObjective::new(
+            params.aft_loss_distribution,
+            params.aft_loss_distribution_scale as f32,
         )),
         other => return Err(HessboostError::unknown("objective", other)),
     };
@@ -498,7 +559,8 @@ mod tests {
         assert!(create_objective(&p, 1).is_err());
     }
 
-    /// Only XGBoost's elementwise multi-target objectives accept a label
+    /// Only XGBoost's elementwise multi-target objectives (and
+    /// `reg:absoluteerror`, which models label matrices itself) accept a label
     /// matrix (one output per column); every other built-in objective
     /// rejects two label columns with a parameter error naming `labels`,
     /// never a silently wrong model.
@@ -510,6 +572,7 @@ mod tests {
             "reg:pseudohubererror",
             "binary:logistic",
             "reg:logistic",
+            "reg:absoluteerror",
         ] {
             let p = TrainingParams::builder().objective(name).build_unchecked();
             assert_eq!(create_objective(&p, 3).unwrap().n_outputs(), 3, "{name}");
@@ -519,11 +582,15 @@ mod tests {
             "count:poisson",
             "reg:gamma",
             "reg:tweedie",
+            "reg:quantileerror",
+            "reg:expectileerror",
             "rank:ndcg",
         ] {
             let p = TrainingParams::builder()
                 .objective(name)
                 .num_class(3)
+                .quantile_alpha(vec![0.5])
+                .expectile_alpha(vec![0.5])
                 .build_unchecked();
             assert!(create_objective(&p, 1).is_ok(), "{name}");
             match create_objective(&p, 2) {
@@ -533,6 +600,29 @@ mod tests {
                 Err(other) => panic!("{name}: unexpected error {other}"),
                 Ok(_) => panic!("{name}: accepted two targets"),
             }
+        }
+    }
+
+    /// The alpha-list objectives need their list: one output per alpha, and a
+    /// missing or invalid list is an error naming the parameter.
+    #[test]
+    fn factory_sizes_alpha_objectives_and_requires_alphas() {
+        for (name, param) in [
+            ("reg:quantileerror", "quantile_alpha"),
+            ("reg:expectileerror", "expectile_alpha"),
+        ] {
+            let p = TrainingParams::builder().objective(name).build_unchecked();
+            match create_objective(&p, 1) {
+                Err(HessboostError::InvalidParameter { name: got, .. }) => assert_eq!(got, param),
+                Err(other) => panic!("{name}: unexpected error {other}"),
+                Ok(_) => panic!("{name}: accepted an empty alpha list"),
+            }
+            let p = TrainingParams::builder()
+                .objective(name)
+                .quantile_alpha(vec![0.1, 0.5, 0.9])
+                .expectile_alpha(vec![0.1, 0.5, 0.9])
+                .build_unchecked();
+            assert_eq!(create_objective(&p, 1).unwrap().n_outputs(), 3, "{name}");
         }
     }
 
@@ -561,6 +651,19 @@ mod tests {
                 9,
                 vec![2 * c + 1],
             ),
+            // Per-output residual scales are global reductions: chunking the
+            // row kernel must not change them.
+            (
+                Box::new(QuantileObjective::new(&[0.1, 0.5, 0.9]).unwrap()),
+                3,
+                vec![2 * c + 3],
+            ),
+            (
+                Box::new(ExpectileObjective::new(&[0.2, 0.8]).unwrap()),
+                2,
+                vec![2 * c + 3],
+            ),
+            (Box::new(AbsoluteErrorObjective::new(1)), 1, vec![2 * c + 5]),
         ];
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)

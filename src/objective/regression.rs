@@ -1,6 +1,8 @@
 //! Regression objectives.
 
-use super::{GradPair, Objective, weighted_label_mean};
+use super::{GradPair, Objective, check_label_domain, weighted_label_mean};
+use crate::data::MetaInfo;
+use crate::error::Result;
 
 /// Squared-error regression (`reg:squarederror`).
 ///
@@ -51,6 +53,13 @@ impl Objective for SquaredErrorObjective {
     ) -> Vec<f32> {
         // XGBoost `FitInterceptGlmLike`: the (weighted) label mean.
         vec![weighted_label_mean(labels, weights)]
+    }
+
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // `½ (margin − y)²`.
+        Some(Box::new(|margin, label| {
+            0.5 * (f64::from(margin) - f64::from(label)).powi(2)
+        }))
     }
 
     fn default_metric(&self) -> String {
@@ -116,10 +125,78 @@ impl Objective for PseudoHuberObjective {
         );
     }
 
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // `δ² (√(1 + z²/δ²) − 1)`, whose derivatives are the gradient above.
+        let slope_sq = f64::from(self.slope).powi(2);
+        Some(Box::new(move |margin, label| {
+            let z = f64::from(margin) - f64::from(label);
+            slope_sq * ((1.0 + z * z / slope_sq).sqrt() - 1.0)
+        }))
+    }
+
     fn default_metric(&self) -> String {
-        // XGBoost's default is `mphe`, which this crate's metric catalog does
-        // not implement; `mae` is the closest robust-regression report.
-        "mae".to_string()
+        "mphe".to_string()
+    }
+}
+
+/// Squared log error regression (`reg:squaredlogerror`): the loss
+/// `½ [ln(1 + pred) − ln(1 + y)]²` behind the `rmsle` metric. Labels must
+/// exceed `-1`. With the margin clamped to `p = max(margin, −1 + 10⁻⁶)` for
+/// the gradient only, `g = [ln1p(p) − ln1p(y)] / (p + 1)` and
+/// `h = max([−ln1p(p) + ln1p(y) + 1] / (p + 1)², 10⁻⁶)`, evaluated exactly
+/// like XGBoost's `SquaredLogError` (the Hessian's square and division in
+/// `f64`, as `std::pow(float, int)` promotes). The prediction transform is
+/// the identity (predictions are not clamped) and the intercept is the
+/// trait's default Newton step (XGBoost `FitIntercept`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SquaredLogErrorObjective;
+
+/// XGBoost's `fmaxf(predt, -1 + 1e-6)` bound: the `f64` constant rounded to
+/// `f32`.
+const SQUARED_LOG_MIN_PRED: f32 = (-1.0f64 + 1e-6) as f32;
+
+impl Objective for SquaredLogErrorObjective {
+    fn name(&self) -> &'static str {
+        "reg:squaredlogerror"
+    }
+
+    fn gradient(
+        &self,
+        preds: &[f32],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        out: &mut [GradPair],
+    ) {
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
+        super::rowwise_gradient(
+            labels.len(),
+            1,
+            preds,
+            labels,
+            weights,
+            out,
+            |preds, labels, weights, out| {
+                for i in 0..preds.len() {
+                    let w = weights.map_or(1.0, |ws| ws[i]);
+                    let p = preds[i].max(SQUARED_LOG_MIN_PRED);
+                    let (log_p, log_y) = (p.ln_1p(), labels[i].ln_1p());
+                    let grad = (log_p - log_y) / (p + 1.0);
+                    let shifted = f64::from(p + 1.0);
+                    let hess =
+                        ((f64::from(-log_p + log_y + 1.0) / (shifted * shifted)) as f32).max(1e-6);
+                    out[i] = GradPair::new(grad * w, hess * w);
+                }
+            },
+        );
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        // XGBoost `SquaredLogError::CheckLabel`: `log1p(label)` must be defined.
+        check_label_domain(info, |y| y <= -1.0)
+    }
+
+    fn default_metric(&self) -> String {
+        "rmsle".to_string()
     }
 }
 
@@ -198,6 +275,45 @@ mod tests {
             margins[0] < 1.0,
             "Newton step {} should undershoot the mean",
             margins[0]
+        );
+    }
+
+    /// The squared-log gradient vanishes where `pred == label` and the
+    /// margin clamp keeps it finite for margins at or below `-1`, where
+    /// `ln1p` itself is undefined.
+    #[test]
+    fn squared_log_gradient_zero_at_label_and_finite_below_minus_one() {
+        let obj = SquaredLogErrorObjective;
+        let mut out = vec![GradPair::default(); 3];
+        obj.gradient(&[3.0, -1.0, -7.0], &[3.0, 0.5, 0.5], None, &mut out);
+        assert_eq!(out[0].grad, 0.0);
+        // Hessian at the optimum is 1 / (p + 1)².
+        assert_eq!(out[0].hess, 1.0 / 16.0);
+        assert!(out[1].grad.is_finite() && out[1].grad < 0.0);
+        assert_eq!(out[1], out[2], "margins below the clamp share its gradient");
+    }
+
+    /// Far above the label the curvature term goes negative; XGBoost floors
+    /// it at `1e-6` (times the weight).
+    #[test]
+    fn squared_log_hessian_floor_is_weighted() {
+        let obj = SquaredLogErrorObjective;
+        let mut out = vec![GradPair::default(); 1];
+        obj.gradient(&[1e4], &[0.0], Some(&[2.0]), &mut out);
+        assert_eq!(out[0].hess, 2e-6);
+        assert!(out[0].grad > 0.0);
+    }
+
+    #[test]
+    fn squared_log_rejects_labels_at_minus_one() {
+        let obj = SquaredLogErrorObjective;
+        assert!(
+            obj.validate_info(&MetaInfo::new(&[-0.5, 2.0], None, None))
+                .is_ok()
+        );
+        assert!(
+            obj.validate_info(&MetaInfo::new(&[-1.0], None, None))
+                .is_err()
         );
     }
 }

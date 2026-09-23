@@ -52,7 +52,23 @@ pub enum GrowPolicy {
     DepthWise,
     /// Split nodes with the highest loss reduction first (leaf-wise).
     LossGuide,
+    /// Symmetric (oblivious) trees, CatBoost-style: every level applies one
+    /// shared split (feature, threshold, missing direction) chosen to maximize
+    /// the summed gain over the level's nodes. Beyond XGBoost (opt-in). Needs
+    /// `tree_method = hist` or `approx`, numerical features only, `max_depth`
+    /// in `1..=`[`MAX_SYMMETRIC_DEPTH`], and `max_leaves = 0`. A node whose
+    /// level split would violate `min_child_weight`, `gamma`, or a monotone
+    /// constraint stays a leaf. The trees are ordinary [`RegTree`]s, so they
+    /// export to XGBoost unchanged; prediction routes rows through them by
+    /// bit pattern.
+    ///
+    /// [`RegTree`]: crate::tree::RegTree
+    Symmetric,
 }
+
+/// Deepest tree `grow_policy = symmetric` grows (`2^16` leaves), CatBoost's
+/// depth limit.
+pub const MAX_SYMMETRIC_DEPTH: usize = 16;
 
 /// Per-feature monotonicity direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -134,6 +150,10 @@ pub enum ProcessType {
 /// [`TrainingParams::default`] and mutate fields directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent XGBoost/LightGBM switches, not a state machine"
+)]
 pub struct TrainingParams {
     // ---- General ----
     /// Which booster to train. XGBoost `booster`.
@@ -161,8 +181,8 @@ pub struct TrainingParams {
     /// Variance power of the Tweedie distribution for `reg:tweedie`, in
     /// `[1, 2)` (1 = Poisson, 2 = Gamma). XGBoost `tweedie_variance_power`.
     pub tweedie_variance_power: f64,
-    /// Slope `δ` of the pseudo-Huber loss for `reg:pseudohubererror`.
-    /// XGBoost `huber_slope`.
+    /// Slope `δ` of the pseudo-Huber loss for `reg:pseudohubererror` and the
+    /// `mphe` metric (which rejects `0`). XGBoost `huber_slope`.
     pub huber_slope: f64,
     /// Number of top-ranked documents paired with all lower-ranked documents
     /// by LambdaRank's `topk` pair method. XGBoost
@@ -240,11 +260,74 @@ pub struct TrainingParams {
     /// `refresh_leaf`.
     pub refresh_leaf: bool,
 
+    // ---- LightGBM tree options (opt-in, beyond XGBoost) ----
+    /// Extremely randomized split search (LightGBM `extra_trees`): every
+    /// numerical feature is scored at one random bin boundary per node, drawn
+    /// uniformly between the node's lowest and highest occupied bin, and every
+    /// categorical feature at one random prefix of its gradient-ordered
+    /// categories. Requires the histogram builder (`hist`/`approx`).
+    pub extra_trees: bool,
+    /// Seed of the [`extra_trees`](Self::extra_trees) threshold draws,
+    /// combined with the per-tree seed derived from [`seed`](Self::seed).
+    /// LightGBM `extra_seed` (default `6`).
+    pub extra_seed: u64,
+    /// Path smoothing strength `s >= 0` (LightGBM `path_smooth`, `0` = off).
+    /// Each child's output is pulled toward its parent's:
+    /// `w = w_raw·(n/s)/(n/s + 1) + w_parent/(n/s + 1)` with `n` the child's
+    /// row count, and splits are scored at the smoothed outputs. Requires the
+    /// histogram builder (`hist`/`approx`).
+    pub path_smooth: f64,
+    /// Fit a ridge-regularized linear model in every leaf (LightGBM
+    /// `linear_tree`) on the numerical features split on along the leaf's
+    /// path; rows with a missing value in any of them predict the constant
+    /// leaf value. The first boosting round keeps constant leaves. Requires
+    /// the histogram builder (`hist`/`approx`).
+    pub linear_tree: bool,
+    /// L2 penalty on the leaf linear models' slopes (not their intercepts),
+    /// `>= 0`. LightGBM `linear_lambda`.
+    pub linear_lambda: f64,
+    // ---- Quantized training (LightGBM; beyond XGBoost) ----
+    /// Train on gradients and Hessians quantized to small integers with
+    /// integer histograms (LightGBM `use_quantized_grad`; Shi et al., NeurIPS
+    /// 2022). Opt-in and not part of XGBoost: trees differ from
+    /// full-precision training. Needs `tree_method` `hist`/`approx` (or
+    /// `auto`) and a tree booster.
+    pub use_quantized_grad: bool,
+    /// Quantization levels `Q` for [`use_quantized_grad`](Self::use_quantized_grad):
+    /// gradients map to integers in `[-⌊Q/2⌋, ⌊Q/2⌋]`, non-negative Hessians
+    /// to `[0, Q]`. In `[2, 127]` (LightGBM stores each value in 8 bits).
+    /// LightGBM `num_grad_quant_bins`.
+    pub num_grad_quant_bins: usize,
+    /// Round quantized gradients stochastically (unbiased) rather than to the
+    /// nearest level. Only used with `use_quantized_grad`. LightGBM
+    /// `stochastic_rounding`.
+    pub stochastic_rounding: bool,
+    /// Recompute each leaf value from the full-precision gradients of its rows
+    /// once a quantized tree is grown. Only used with `use_quantized_grad`.
+    /// LightGBM `quant_train_renew_leaf`.
+    pub quant_train_renew_leaf: bool,
+
     // ---- DART-specific ----
     /// Fraction of trees to drop each round (DART). XGBoost `rate_drop`.
     pub rate_drop: f64,
     /// Probability of skipping dropout in a round (DART). XGBoost `skip_drop`.
     pub skip_drop: f64,
+
+    // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
+    /// Penalty `ι` subtracted from the loss change of a split on a feature the
+    /// ensemble does not use yet (Herrmann et al., *Boosted Trees on a Diet*,
+    /// ICLR 2026, eq. 3). Same units as [`gamma`](Self::gamma); `0` (the
+    /// default) disables it. Pair with
+    /// [`BoostedModel::to_compact_bytes`](crate::learner::BoostedModel::to_compact_bytes),
+    /// whose dictionaries shrink as features and thresholds are reused. The
+    /// paper's `toad_penalty_feature`.
+    pub toad_penalty_feature: f64,
+    /// Penalty `ξ` subtracted from the loss change of a split at a threshold
+    /// (or categorical left set) not yet used for its feature anywhere in the
+    /// ensemble; a new feature pays both penalties. Same units as
+    /// [`gamma`](Self::gamma); `0` (the default) disables it. The paper's
+    /// `toad_penalty_threshold`.
+    pub toad_penalty_threshold: f64,
 
     // ---- Missing value ----
     /// Value treated as "missing" in dense inputs. Defaults to NaN, like XGBoost.
@@ -291,8 +374,19 @@ impl Default for TrainingParams {
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
             refresh_leaf: true,
+            extra_trees: false,
+            extra_seed: 6,
+            path_smooth: 0.0,
+            linear_tree: false,
+            linear_lambda: 0.0,
+            use_quantized_grad: false,
+            num_grad_quant_bins: 4,
+            stochastic_rounding: true,
+            quant_train_renew_leaf: false,
             rate_drop: 0.0,
             skip_drop: 0.0,
+            toad_penalty_feature: 0.0,
+            toad_penalty_threshold: 0.0,
             missing: f64::NAN,
         }
     }
@@ -357,6 +451,27 @@ impl TrainingParams {
         unit("colsample_bynode", self.colsample_bynode)?;
         unit("rate_drop", self.rate_drop)?;
         unit("skip_drop", self.skip_drop)?;
+        non_negative("toad_penalty_feature", self.toad_penalty_feature)?;
+        non_negative("toad_penalty_threshold", self.toad_penalty_threshold)?;
+        ensure(
+            "toad_penalty_feature",
+            self.booster != BoosterKind::GbLinear
+                || (self.toad_penalty_feature == 0.0 && self.toad_penalty_threshold == 0.0),
+            "reuse penalties need a tree booster (`gbtree` or `dart`)",
+        )?;
+        // The penalties act in the XGBoost histogram/exact split searches;
+        // the LightGBM split search and symmetric level-wise growth do not
+        // apply them, so refuse the combination instead of ignoring it.
+        let reuse_on = self.toad_penalty_feature > 0.0 || self.toad_penalty_threshold > 0.0;
+        ensure(
+            "toad_penalty_feature",
+            !(reuse_on
+                && (self.extra_trees
+                    || self.path_smooth > 0.0
+                    || self.grow_policy == GrowPolicy::Symmetric)),
+            "reuse penalties are not supported with `extra_trees`, `path_smooth`, or \
+             `grow_policy=symmetric`",
+        )?;
 
         if let Some(base_score) = self.base_score {
             ensure("base_score", base_score.is_finite(), "must be finite")?;
@@ -410,7 +525,126 @@ impl TrainingParams {
                 && self.max_depth == 0),
             "lossguide growth needs a bound: set max_leaves or max_depth > 0",
         )?;
-        Ok(())
+        if self.grow_policy == GrowPolicy::Symmetric {
+            ensure(
+                "max_depth",
+                (1..=MAX_SYMMETRIC_DEPTH).contains(&self.max_depth),
+                format!(
+                    "symmetric growth needs 1 <= max_depth <= {MAX_SYMMETRIC_DEPTH}, got {}",
+                    self.max_depth
+                ),
+            )?;
+            ensure(
+                "max_leaves",
+                self.max_leaves == 0,
+                "symmetric growth sizes trees by max_depth; max_leaves must be 0",
+            )?;
+        }
+        ensure(
+            "num_grad_quant_bins",
+            (2..=127).contains(&self.num_grad_quant_bins),
+            format!("must be in [2, 127], got {}", self.num_grad_quant_bins),
+        )?;
+        if self.multi_strategy == MultiStrategy::MultiOutputTree {
+            // The vector-leaf builder has its own (XGBoost) split search:
+            // symmetric level-wise growth and the reuse penalties do not
+            // reach it.
+            ensure(
+                "grow_policy",
+                self.grow_policy != GrowPolicy::Symmetric,
+                "`symmetric` growth is not supported with `multi_strategy=multi_output_tree`",
+            )?;
+            ensure(
+                "toad_penalty_feature",
+                !reuse_on,
+                "reuse penalties are not supported with `multi_strategy=multi_output_tree`",
+            )?;
+        }
+        if self.use_quantized_grad {
+            ensure(
+                "use_quantized_grad",
+                self.tree_method != TreeMethod::Exact && self.booster != BoosterKind::GbLinear,
+                "quantized training needs a tree booster with `tree_method` hist, approx or auto",
+            )?;
+            ensure(
+                "use_quantized_grad",
+                self.multi_strategy == MultiStrategy::OneOutputPerTree,
+                "quantized training grows one-output trees only",
+            )?;
+            // Symmetric growth builds its level histograms outside the
+            // quantized node path, so the setting would be silently ignored.
+            ensure(
+                "use_quantized_grad",
+                self.grow_policy != GrowPolicy::Symmetric,
+                "quantized training is not supported with `grow_policy=symmetric`",
+            )?;
+        }
+        self.validate_tree_options()
+    }
+
+    /// Range and compatibility checks of the opt-in LightGBM tree options
+    /// ([`extra_trees`](Self::extra_trees), [`path_smooth`](Self::path_smooth),
+    /// [`linear_tree`](Self::linear_tree)). They act inside the histogram tree
+    /// builder only, so every other booster, builder, or tree layout is
+    /// refused instead of silently ignoring them. The split-search options
+    /// live in the per-node histogram split search, which symmetric growth
+    /// replaces with its level-wise search, so they are refused there too;
+    /// linear leaves are fitted after growth and apply to symmetric trees.
+    fn validate_tree_options(&self) -> Result<()> {
+        for (name, value) in [
+            ("path_smooth", self.path_smooth),
+            ("linear_lambda", self.linear_lambda),
+        ] {
+            ensure(
+                name,
+                value.is_finite() && value >= 0.0,
+                format!("must be >= 0, got {value}"),
+            )?;
+        }
+        let enabled = [
+            ("extra_trees", self.extra_trees),
+            ("path_smooth", self.path_smooth > 0.0),
+            ("linear_tree", self.linear_tree),
+        ];
+        for (name, _) in enabled.into_iter().filter(|&(_, on)| on) {
+            ensure(
+                name,
+                self.booster != BoosterKind::GbLinear,
+                "requires a tree booster (`gbtree` or `dart`)",
+            )?;
+            ensure(
+                name,
+                self.tree_method != TreeMethod::Exact,
+                "requires the histogram tree builder (`tree_method` `hist`, `approx` or `auto`)",
+            )?;
+            ensure(
+                name,
+                self.multi_strategy == MultiStrategy::OneOutputPerTree,
+                "is not supported with `multi_strategy=multi_output_tree`",
+            )?;
+        }
+        for (name, _) in enabled[..2].iter().filter(|&&(_, on)| on) {
+            ensure(
+                name,
+                self.grow_policy != GrowPolicy::Symmetric,
+                "is not supported with `grow_policy=symmetric` (level-wise split search)",
+            )?;
+        }
+        // LightGBM refuses `regression_l1` with linear trees: objectives whose
+        // leaves are re-estimated after growth (XGBoost's adaptive leaves)
+        // would overwrite the constant that linear leaves fall back to.
+        ensure(
+            "linear_tree",
+            !(self.linear_tree
+                && matches!(
+                    self.objective.as_str(),
+                    "reg:absoluteerror" | "reg:quantileerror"
+                )),
+            format!(
+                "is not supported with the adaptive-leaf objective `{}`",
+                self.objective
+            ),
+        )
     }
 
     /// The `max_delta_step` in effect: the configured value, or XGBoost's
@@ -610,6 +844,28 @@ impl TrainingParamsBuilder {
         process_type, ProcessType);
     setter!(/// Set whether `process_type = update` refreshes leaf values (`refresh_leaf`).
         refresh_leaf, bool);
+    setter!(/// Enable LightGBM's randomized split search (`extra_trees`).
+        extra_trees, bool);
+    setter!(/// Set the seed of the `extra_trees` threshold draws (`extra_seed`).
+        extra_seed, u64);
+    setter!(/// Set LightGBM's path smoothing strength (`path_smooth`, `0` = off).
+        path_smooth, f64);
+    setter!(/// Enable LightGBM's per-leaf linear models (`linear_tree`).
+        linear_tree, bool);
+    setter!(/// Set the L2 penalty on leaf linear-model slopes (`linear_lambda`).
+        linear_lambda, f64);
+    setter!(/// Set the new-feature reuse penalty `ι` (`toad_penalty_feature`).
+        toad_penalty_feature, f64);
+    setter!(/// Set the new-threshold reuse penalty `ξ` (`toad_penalty_threshold`).
+        toad_penalty_threshold, f64);
+    setter!(/// Enable quantized-gradient training (`use_quantized_grad`, LightGBM).
+        use_quantized_grad, bool);
+    setter!(/// Set the gradient quantization levels (`num_grad_quant_bins`, LightGBM).
+        num_grad_quant_bins, usize);
+    setter!(/// Set stochastic rounding of quantized gradients (`stochastic_rounding`, LightGBM).
+        stochastic_rounding, bool);
+    setter!(/// Set full-precision leaf renewal after quantized growth (`quant_train_renew_leaf`, LightGBM).
+        quant_train_renew_leaf, bool);
 
     /// Set the objective by name (e.g. `"binary:logistic"`).
     #[must_use]
@@ -842,5 +1098,38 @@ mod tests {
             .max_leaves(31)
             .build()
             .unwrap();
+    }
+
+    /// Reuse penalties apply in the XGBoost split searches only; the LightGBM
+    /// split search and symmetric growth would silently ignore them.
+    #[test]
+    fn reuse_penalties_refuse_searches_that_ignore_them() {
+        let toad = || TrainingParams::builder().toad_penalty_feature(1.0);
+        for params in [
+            toad().extra_trees(true),
+            toad().path_smooth(1.0),
+            toad().grow_policy(GrowPolicy::Symmetric).max_depth(3),
+        ] {
+            assert!(matches!(
+                params.build(),
+                Err(HessboostError::InvalidParameter { name, .. }) if name == "toad_penalty_feature"
+            ));
+        }
+        assert!(toad().linear_tree(true).build().is_ok());
+    }
+
+    /// Symmetric growth builds histograms outside the quantized path.
+    #[test]
+    fn quantized_training_refuses_symmetric_growth() {
+        let q = || {
+            TrainingParams::builder()
+                .use_quantized_grad(true)
+                .max_depth(3)
+        };
+        assert!(matches!(
+            q().grow_policy(GrowPolicy::Symmetric).build(),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "use_quantized_grad"
+        ));
+        assert!(q().grow_policy(GrowPolicy::LossGuide).build().is_ok());
     }
 }

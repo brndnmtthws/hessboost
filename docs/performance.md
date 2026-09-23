@@ -253,6 +253,53 @@ and histogram-accumulation controls. Histogram accumulation controls exercise
 the scalar accumulation loop and task scheduling; tree construction also
 measures split evaluation, parallel nodes, and avoiding unnecessary child work.
 
+### Quantized-gradient training (opt-in)
+
+`use_quantized_grad` (LightGBM's quantized training; not XGBoost behavior)
+replaces each bin's two `f64` sums with one packed integer. Its width follows
+the node's row count (32-bit up to `32767 / Q` rows, else 64-bit). Nodes too
+large for 32 bits still accumulate runs of rows in a 32-bit scratch histogram,
+which fits in L1, before adding them into the node's bins. Rows are read as
+one `i32` instead of an 8-byte gradient pair. Split evaluation is unchanged:
+it reads the dequantized sums, and each split pays one extra pass to
+dequantize both child histograms.
+
+Measured on **AWS Neoverse-V3** (192 cores, Linux 6.12) with **Rust 1.98.1**,
+`opt-level=3`, thin LTO, one codegen unit, on 2026-09-23 UTC. Each value is the
+Criterion median (2 s warm-up, 6 s measurement). The host also ran other
+agents' builds, so treat differences under about 3% as noise. Q = 4 levels,
+stochastic rounding, no leaf renewal. The full-precision column re-measures
+the cases above on this machine in the same run, plus a new 1M × 50 case
+(`large_depth8`).
+
+| Workload | Threads | Full precision (ms) | Quantized (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| Tree, depth 6, 50k × 20 | 1 | 5.935 | 5.982 | 0.99× |
+| Tree, depth 6, 50k × 20 | 16 | 1.387 | 1.314 | 1.06× |
+| Tree, depth 10, 50k × 20 | 1 | 64.10 | 65.70 | 0.98× |
+| Tree, depth 10, 50k × 20 | 16 | 5.197 | 5.195 | 1.00× |
+| Tree, 128 features, 10k rows | 1 | 26.35 | 26.77 | 0.98× |
+| Tree, 128 features, 10k rows | 16 | 5.527 | 5.298 | 1.04× |
+| Tree, missing values | 1 | 11.50 | 11.32 | 1.02× |
+| Tree, missing values | 16 | 2.875 | 2.825 | 1.02× |
+| Tree, depth 8, 1M × 50 | 1 | 274.9 | 181.7 | **1.51×** |
+| Tree, depth 8, 1M × 50 | 16 | 29.81 | 16.09 | **1.85×** |
+| Training, regression, 50 rounds | 1 | 308.8 | 318.5 | 0.97× |
+| Training, regression, 50 rounds | 16 | 77.22 | 71.92 | 1.07× |
+| Training, binary, 50 rounds | 1 | 309.4 | 323.7 | 0.96× |
+| Training, binary, 50 rounds | 16 | 80.24 | 75.01 | 1.07× |
+
+Quantization pays off only when histogram accumulation dominates the tree
+build, as in the 1M-row case, where accumulation takes about half the
+full-precision profile. On the 50k-row and 128-feature cases, the per-bin gain
+evaluation takes most of the time. It is the same code in both modes. The
+integer histograms save about a third of the smaller accumulation share, and
+the per-tree quantization pass plus the per-split dequantization give most of
+that back. Single-threaded training on 50k rows is therefore 3–4% *slower*,
+and 16 threads gain about 7%. The integer loops are scalar: widths are chosen
+per node, and serial and parallel builds agree bit for bit. There is no SIMD
+path to keep in sync.
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks
@@ -324,17 +371,62 @@ access. Categorical splits and trees deeper than 16 levels use an early-exit
 walk. The kernel runs at roughly six instructions per cycle on a Neoverse V3
 and is bound by instruction issue, not memory.
 
-TreeSHAP walks each tree with a preallocated path arena instead of cloning the
-decision path at every fork, precomputes each node's cover fraction, reads the
-instance as a dense row, hoists the per-element divisions out of the
-unwinding loops, folds the recurrence coefficients off the loop-carried
-dependency so each unwinding step is one multiply-subtract, and adds one
-shared constant for all path elements that lie off the instance's own path
-(their cover fraction cancels). Rows are processed in parallel. On a Neoverse
-V3 core these changes cut prediction time by 10–20× for dense, sparse, and
-multiclass batches and by 8–9× for SHAP contributions relative to the per-node
-traversal. Those two figures are informal spot measurements from a separate
-machine. They are not part of the recorded artifacts in this document.
+#### Symmetric trees
+
+Trees in which every internal node of a level carries the same split (grown
+with `grow_policy = symmetric`, or any imported tree of that shape) skip the
+node walk for full sixteen-row groups. The layout records each level's split
+as one `(slot, key)` compare and a `2^depth` table of leaf ids and values
+indexed by the bit pattern of the level outcomes (root most significant);
+collapsed subtrees fill every slot below them. A level is one contiguous
+16-lane key load compared against a single threshold, which vectorizes and
+carries no dependent load chain. The compares and the leaves reached are the
+generic walk's, so margins and leaf indices are bit-identical (unit-tested);
+tail rows, single-row batches, trees shallower than two levels or deeper than
+16, and tables that would exceed four slots per leaf keep the generic walk.
+
+`cargo bench --bench training -- predict_100k` predicts 100,000 × 30 rows with
+100 depth-6 trees (`eta = 0.1`, other parameters default). Criterion medians
+on a 192-core **Neoverse V3**, Rust 1.98.1, 2026-09-23, `RAYON_NUM_THREADS`
+fixed per row. The middle column is the same symmetric model with the table
+path disabled (a one-line local change), isolating the kernel:
+
+| Threads | Depthwise model (ms) | Symmetric model, generic walk (ms) | Symmetric model, bit pattern (ms) | Speedup, same model |
+|---:|---:|---:|---:|---:|
+| 1 | 132.13 | 99.64 | 13.37 | 7.5× |
+| 16 | 8.63 | 6.57 | 1.03 | 6.4× |
+| 192 | 1.66 | 1.42 | 0.70 | 2.0× |
+
+At full width the per-block row loading and scheduling, which both paths
+share, dominate.
+
+On a Neoverse V3 core these prediction changes cut prediction time by 10–20×
+for dense, sparse, and multiclass batches relative to the per-node traversal.
+That figure is an informal spot measurement from a separate machine. It is not
+part of the recorded artifacts in this document.
+
+SHAP values use XGBoost 3.4's QuadratureTreeSHAP. One recursive walk per tree
+carries an 8-lane quadrature basis in `f32` and extracts each return edge's
+contribution from its subtree's return, so contributions cost `O(L · D)` per
+tree and row (`L` leaves, `D` depth) and interactions `O(L · D²)`. Classic
+path-dependent TreeSHAP needed `O(L · D²)` for contributions and repeated a
+conditioned walk per feature for interactions. Each tree's precomputed nodes
+hold both child branch weights, only the tree's split features are cleared
+and accumulated per tree, and rows are processed in parallel. Spot
+measurements on the 192-core Neoverse V3 host (hist, 20 features, 100 trees
+trained on 20,000 rows; mean of 3–5 calls; not part of the Criterion
+artifacts):
+
+| Workload | Threads | Classic TreeSHAP | QuadratureTreeSHAP | Speedup |
+|---|---:|---:|---:|---:|
+| contributions, depth 6, 2,000 rows | 192 | 4.2 ms | 3.8 ms | 1.1× |
+| contributions, depth 10, 2,000 rows | 192 | 46.1 ms | 29.9 ms | 1.5× |
+| interactions, depth 6, 200 rows | 192 | 19.7 ms | 1.9 ms | 10.6× |
+| interactions, depth 10, 200 rows | 192 | 285 ms | 14.4 ms | 19.8× |
+| contributions, depth 6, 2,000 rows | 1 | 486 ms | 385 ms | 1.3× |
+| contributions, depth 10, 2,000 rows | 1 | 7.49 s | 4.47 s | 1.7× |
+| interactions, depth 6, 200 rows | 1 | 1.90 s | 77 ms | 24.6× |
+| interactions, depth 10, 200 rows | 1 | 29.6 s | 1.14 s | 26.1× |
 
 ## Numerical behavior and validation
 
@@ -343,6 +435,18 @@ in `f64`. SIMD reductions and polynomial evaluation can change rounding, so
 cross-architecture predictions are not promised to be bit-identical. Repeated
 training with the same inputs, parameters, seed, and execution configuration
 remains deterministic.
+
+SHAP values follow XGBoost 3.4.2's arithmetic: the quadrature rule is built in
+`f64` and stored as `f32`, the recurrence and every accumulation are `f32` in
+XGBoost's order (categorical children are walked in XGBoost's orientation),
+and each tree's expected value is summed in `f64` and rounded once. XGBoost's
+aarch64 builds contract `a * b + c` into fused multiply-adds while its x86_64
+wheels do not, and hessboost mirrors this per target, so imported models
+reproduce XGBoost's contributions and interaction values bit for bit on the
+parity fixtures (checked on aarch64 Linux). The unfused arithmetic stays
+within 2e-5 of the fused one on the same fixtures. The 8-point rule is exact
+for paths with at most seven distinct features; longer paths are the same
+quadrature approximation XGBoost computes.
 
 The test suite compares kernels against scalar formulas, including short
 inputs, vector tails, optional weights, saturation, NaNs, infinities, and
@@ -360,6 +464,9 @@ suite on the current checkout:
 ```sh
 RAYON_NUM_THREADS=1 cargo bench --bench training
 ```
+
+The quantized-gradient rows use the `*_quantized` cases of
+`hist_tree_build` and the `Hist_quantized` / `quantized` training cases.
 
 To regenerate the charts in this guide from the `.dat` files after updating
 the tables, run:

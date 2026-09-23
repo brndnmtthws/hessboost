@@ -1,1 +1,1 @@
-doc-valid-idents = ["XGBoost", "TreeSHAP", "LambdaMART", "LambdaRank", "AArch64", "SVMLight", "TabPFN", "CatBoost", ".."]
+doc-valid-idents = ["XGBoost", "TreeSHAP", "QuadratureTreeSHAP", "LambdaMART", "LambdaRank", "AArch64", "SVMLight", "TabPFN", "CatBoost", "LightGBM", "NeurIPS", "SplitMix64", ".."]

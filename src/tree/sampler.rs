@@ -20,10 +20,12 @@
 //! only drawn when a stage needs more features than have positive weight.
 //!
 //! Call granularity differs by builder: the histogram builder calls
-//! [`ColumnSampler::sample`] once per node, while the exact builder calls it
-//! once per level (as XGBoost's `colmaker` does). Interaction constraints
-//! filter the returned subset afterwards and never re-add unsampled features.
-//! With the default ratios of `1.0` every draw returns all features.
+//! [`ColumnSampler::sample`] once per node, while the exact builder (as
+//! XGBoost's `colmaker` does) and symmetric (`grow_policy = symmetric`) growth
+//! call it once per level, shared across that level's nodes. Interaction
+//! constraints filter the returned subset afterwards and never re-add
+//! unsampled features. With the default ratios of `1.0` every draw returns all
+//! features.
 //!
 //! [`DMatrix::with_feature_weights`]: crate::data::DMatrix::with_feature_weights
 
@@ -48,6 +50,9 @@ pub struct ColumnSampler {
     bylevel: f32,
     bynode: f32,
     rng: StdRng,
+    /// The seed `rng` started from: the tree's own seed, which the trainer
+    /// derives from the configured seed, round, and output.
+    seed: u64,
 }
 
 impl ColumnSampler {
@@ -76,6 +81,7 @@ impl ColumnSampler {
             bylevel: bylevel as f32,
             bynode: bynode as f32,
             rng: StdRng::seed_from_u64(seed),
+            seed,
         };
         let all: Vec<u32> = (0..n_features as u32).collect();
         sampler.tree = sampler.draw(&all, bytree as f32);
@@ -138,6 +144,13 @@ impl ColumnSampler {
         };
         chosen.sort_unstable();
         chosen
+    }
+
+    /// The per-tree seed this sampler was built with. Other per-tree random
+    /// streams (the `extra_trees` threshold draws) derive from it so they vary
+    /// across rounds and outputs without consuming this sampler's draws.
+    pub(crate) fn seed(&self) -> u64 {
+        self.seed
     }
 }
 

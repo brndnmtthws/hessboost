@@ -4,14 +4,18 @@
 //! gradients. The exact builder is the reference; the histogram builder shares
 //! the same regularized gain math.
 
+pub(crate) mod budget;
 mod exact;
 mod hist;
+mod lightgbm;
 mod multi;
+mod oblivious;
 
 pub use exact::{ExactTreeBuilder, SortedColumns, all_features, all_rows};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
 pub(crate) use multi::{MultiTreeBuilder, VectorGradients};
+pub(crate) use oblivious::check_symmetric_input;
 
 use std::collections::BTreeSet;
 
@@ -19,6 +23,7 @@ use crate::objective::GradPair;
 use crate::tree::constraints::{Bounds, calc_weight_bounded, gain_at_weight, satisfies};
 use crate::tree::gain::{GradStats, RegParams, calc_gain, threshold_l1};
 use crate::tree::regtree::RegTree;
+use crate::tree::reuse::CategoricalPenalty;
 
 /// Tiny epsilon guarding against accepting numerically-zero-gain splits, mirror
 /// of XGBoost's `kRtEps`.
@@ -312,7 +317,9 @@ pub(super) fn xgb_update(
 /// categories form the left set; every other present category — and missing
 /// — goes right. Callers supply the `(category, stats)` pairs from their own
 /// stat source (sorted-column map for exact search, histogram bins for
-/// histogram search) and keep their own empty-bin filtering.
+/// histogram search) and keep their own empty-bin filtering. `penalty`
+/// (opt-in reuse penalties) is subtracted from each candidate's gain before
+/// it competes; `None` leaves the sweep untouched.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sweep_categorical(
     best: &mut BestSplit,
@@ -324,6 +331,7 @@ pub(super) fn sweep_categorical(
     constrained: bool,
     reg: &RegParams,
     feature: u32,
+    penalty: Option<&dyn CategoricalPenalty>,
 ) {
     if cats.len() < 2 {
         return; // no interior partition
@@ -343,11 +351,14 @@ pub(super) fn sweep_categorical(
         if left.hess < mcw || right.hess < mcw {
             continue;
         }
-        let Some((g, wl, wr)) =
+        let Some((mut g, wl, wr)) =
             candidate_gain(left, right, parent_gain, bounds, dir, constrained, reg)
         else {
             continue;
         };
+        if let Some(penalty) = penalty {
+            g -= penalty.categorical_penalty(feature, &cats_left);
+        }
         if g > best.loss_chg + K_RT_EPS {
             *best = BestSplit::categorical(g, feature, left, right, wl, wr, cats_left.clone());
         }

@@ -34,8 +34,13 @@
 //! A vector-leaf tree's leaves store, instead of their value's bits, the offset
 //! of their weight vector in a shared arena ([`CompactForest::accumulate_vector`]);
 //! the walk itself is unchanged.
+//!
+//! Symmetric trees (one split per level) are additionally indexed by
+//! [`SymmetricTables`], whose bit-pattern walk replaces the per-node walk for
+//! full lane groups and reaches the same arena leaves.
 
 use crate::tree::RegTree;
+use crate::tree::oblivious::{ArenaNode, SymmetricTables};
 
 /// Rows (or trees) walked in lockstep by the fixed-depth kernel.
 pub(crate) const LANES: usize = 16;
@@ -79,6 +84,14 @@ fn unkey(key: u32) -> f32 {
 /// `left`, which points at itself.
 const LEAF_KEY: u32 = 0xFF80_0000;
 const _: () = assert!(LEAF_KEY == f32::INFINITY.to_bits() | SIGN);
+
+// `slot_key` reads `slot` and `key` as one little-endian `u64` on x86-64.
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    std::mem::size_of::<CNode>() == 16
+        && std::mem::offset_of!(CNode, slot) == 0
+        && std::mem::offset_of!(CNode, key) == 4
+);
 /// `aux` bit marking a set-membership split. `key` holds `cat_begin` and
 /// `aux >> CAT_END_SHIFT` holds `cat_end`. Numeric `aux` is `0`, so this bit
 /// distinguishes them.
@@ -105,14 +118,6 @@ struct CNode {
     /// [`CATEGORICAL`], [`CAT_DEFAULT_LEFT`], and the set end.
     aux: u32,
 }
-
-// `slot_key` reads `slot` and `key` as one little-endian `u64` on x86-64.
-#[cfg(target_arch = "x86_64")]
-const _: () = assert!(
-    std::mem::size_of::<CNode>() == 16
-        && std::mem::offset_of!(CNode, slot) == 0
-        && std::mem::offset_of!(CNode, key) == 4
-);
 
 impl CNode {
     #[inline(always)]
@@ -182,6 +187,7 @@ pub(crate) struct CompactForest {
     /// Every vector-leaf tree's leaf weight vectors, concatenated.
     leaf_vectors: Vec<f32>,
     trees: Vec<TreeMeta>,
+    symmetric: SymmetricTables,
 }
 
 impl CompactForest {
@@ -193,6 +199,7 @@ impl CompactForest {
             categories: Vec::new(),
             leaf_vectors: Vec::new(),
             trees: Vec::with_capacity(trees.len()),
+            symmetric: SymmetricTables::default(),
         };
         for tree in trees {
             forest.push_tree(tree);
@@ -306,6 +313,21 @@ impl CompactForest {
             has_categorical,
             max_feature,
         });
+        let nodes = &self.nodes;
+        self.symmetric.push(base, |id| {
+            let node = &nodes[id as usize];
+            if Self::is_leaf(node, id) {
+                ArenaNode::Leaf(f32::from_bits(node.aux))
+            } else if node.aux & CATEGORICAL != 0 {
+                ArenaNode::Other
+            } else {
+                ArenaNode::Numeric {
+                    slot: node.slot,
+                    key: node.key,
+                    first: node.left,
+                }
+            }
+        });
     }
 
     /// Weight vector (`k` outputs) of vector-leaf arena node `id`.
@@ -313,6 +335,11 @@ impl CompactForest {
     pub(crate) fn leaf_vector(&self, id: u32, k: usize) -> &[f32] {
         let offset = self.nodes[id as usize].aux as usize;
         &self.leaf_vectors[offset..offset + k]
+    }
+    /// Whether tree `t` is walked by bit pattern ([`SymmetricTables`]).
+    #[cfg(test)]
+    pub(crate) fn is_symmetric(&self, t: usize) -> bool {
+        self.symmetric.get(t).is_some()
     }
 
     /// Leaf value of arena node `id` (must be a leaf).
@@ -464,7 +491,10 @@ impl CompactForest {
             "row block holds fewer rows than requested"
         );
         let meta = self.trees[t];
-        if meta.lockstep_ok() {
+        if let Some(symmetric) = self.symmetric.get(t) {
+            meta.check_width(n_cols);
+            symmetric.walk(lanes, groups, group_len, &mut sink);
+        } else if meta.lockstep_ok() {
             meta.check_width(n_cols);
             let nodes = &self.nodes[..];
             let root = meta.root as usize;
@@ -554,6 +584,25 @@ impl CompactForest {
         stride: usize,
     ) {
         assert!(rows == 0 || out.len() > (rows - 1) * stride);
+        if let Some(symmetric) = self.symmetric.get(t) {
+            let groups = rows / LANES;
+            assert!(
+                lanes.len() >= groups * FEATURE_LANES * n_cols
+                    && tail.len() >= (rows - groups * LANES) * n_cols,
+                "row block holds fewer rows than requested"
+            );
+            self.trees[t].check_width(n_cols);
+            symmetric.accumulate(lanes, groups, FEATURE_LANES * n_cols, weight, out, stride);
+            for (i, row) in tail
+                .chunks_exact(n_cols)
+                .take(rows - groups * LANES)
+                .enumerate()
+            {
+                out[(groups * LANES + i) * stride] +=
+                    weight * self.leaf_value(self.leaf_id(t, row));
+            }
+            return;
+        }
         let nodes = &self.nodes[..];
         self.walk_block(t, lanes, tail, n_cols, rows, |r, leaf| {
             // SAFETY: `r < rows` (asserted above against `out`) and `leaf` is
@@ -591,16 +640,16 @@ impl CompactForest {
     }
 
     /// `out[j] += weight(t) * leaf_vector(row, tree t)[j]` for the vector-leaf
-    /// trees `0..limit` of one dense `row` (`out` holds one value per output).
+    /// trees `trees` of one dense `row` (`out` holds one value per output).
     pub(crate) fn accumulate_row_vector(
         &self,
         row: &[f32],
-        limit: usize,
+        trees: std::ops::Range<usize>,
         weight: impl Fn(usize) -> f32,
         out: &mut [f32],
     ) {
         let k = out.len();
-        self.walk_row(row, limit, |t, leaf| {
+        self.walk_row(row, trees, |t, leaf| {
             let w = weight(t);
             for (o, &v) in out.iter_mut().zip(self.leaf_vector(leaf, k)) {
                 *o += w * v;
@@ -608,20 +657,28 @@ impl CompactForest {
         });
     }
 
-    /// Walk one dense `row` through trees `0..limit` and call `sink(t, leaf)`
+    /// Walk one dense `row` through trees `trees` and call `sink(t, leaf)`
     /// with each tree's arena leaf id, in tree order. Trees are walked
     /// [`LANES`] at a time in lockstep, so a single instance still overlaps its
     /// dependent load chains (the batch kernel overlaps rows instead). The row
     /// is keyed once, `[feature][sign]`, so a node's slot maps to its key by a
     /// shift.
     #[inline(always)]
-    fn walk_row(&self, row: &[f32], limit: usize, mut sink: impl FnMut(usize, u32)) {
-        assert!(limit <= self.trees.len());
+    fn walk_row(
+        &self,
+        row: &[f32],
+        trees: std::ops::Range<usize>,
+        mut sink: impl FnMut(usize, u32),
+    ) {
+        assert!(trees.end <= self.trees.len());
         let nodes = &self.nodes[..];
-        let full = limit / LANES * LANES;
+        let begin = trees.start;
+        let groups = trees.len() / LANES;
+        let full = begin + groups * LANES;
         let mut keys: Vec<u32> = Vec::new();
-        for g in 0..limit / LANES {
-            let group = &self.trees[g * LANES..(g + 1) * LANES];
+        for g in 0..groups {
+            let first = begin + g * LANES;
+            let group = &self.trees[first..first + LANES];
             let mut depth = 0u32;
             let mut ok = true;
             for meta in group {
@@ -630,7 +687,7 @@ impl CompactForest {
             }
             if !ok {
                 for j in 0..LANES {
-                    sink(g * LANES + j, self.leaf_id(g * LANES + j, row));
+                    sink(first + j, self.leaf_id(first + j, row));
                 }
                 continue;
             }
@@ -664,10 +721,10 @@ impl CompactForest {
                 lane!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
             }
             for (j, &id) in nid.iter().enumerate() {
-                sink(g * LANES + j, id as u32);
+                sink(first + j, id as u32);
             }
         }
-        for t in full..limit {
+        for t in full..trees.end {
             sink(t, self.leaf_id(t, row));
         }
     }
@@ -676,22 +733,25 @@ impl CompactForest {
     /// to `out[t]`.
     pub(crate) fn original_leaf_ids_for_row(&self, row: &[f32], out: &mut [u32]) {
         let orig = &self.orig_id[..];
-        self.walk_row(row, out.len(), |t, leaf| out[t] = orig[leaf as usize]);
+        self.walk_row(row, 0..out.len(), |t, leaf| out[t] = orig[leaf as usize]);
     }
 
-    /// `out[t % k] += weight(t) * leaf_value(row, tree t)` for trees
-    /// `0..limit` of one dense `row`.
+    /// `out[(t / parallel) % k] += weight(t) * leaf_value(row, tree t)` for
+    /// the trees `trees` of one dense `row`, where `k = out.len()` and
+    /// `parallel` is the number of consecutive trees per output
+    /// (`num_parallel_tree`).
     pub(crate) fn accumulate_row(
         &self,
         row: &[f32],
-        limit: usize,
+        trees: std::ops::Range<usize>,
+        parallel: usize,
         weight: impl Fn(usize) -> f32,
         out: &mut [f32],
     ) {
         let k = out.len();
         let nodes = &self.nodes[..];
-        self.walk_row(row, limit, |t, leaf| {
-            out[t % k] += weight(t) * f32::from_bits(nodes[leaf as usize].aux);
+        self.walk_row(row, trees, |t, leaf| {
+            out[(t / parallel) % k] += weight(t) * f32::from_bits(nodes[leaf as usize].aux);
         });
     }
 }
@@ -807,13 +867,17 @@ mod tests {
         let row = [0.7f32, f32::NAN, 3.0];
         let mut out = vec![0u32; trees.len()];
         f.original_leaf_ids_for_row(&row, &mut out);
+        // An offset range shifts the lockstep groups off the lane boundary;
+        // pairs of consecutive trees share an output (`parallel = 2`).
         let mut acc = vec![0.25f32; 3];
-        f.accumulate_row(&row, trees.len(), |t| 1.0 + t as f32, &mut acc);
+        f.accumulate_row(&row, 3..trees.len(), 2, |t| 1.0 + t as f32, &mut acc);
         let mut want_acc = vec![0.25f32; 3];
         for (t, tree) in trees.iter().enumerate() {
             let want = tree.leaf_id_dense(&row, f32::NAN);
             assert_eq!(out[t] as usize, want, "tree {t}");
-            want_acc[t % 3] += (1.0 + t as f32) * tree.node(want).leaf_value;
+            if t >= 3 {
+                want_acc[(t / 2) % 3] += (1.0 + t as f32) * tree.node(want).leaf_value;
+            }
         }
         assert_eq!(acc, want_acc);
     }

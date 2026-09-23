@@ -1,4 +1,4 @@
-//! Model explainability: TreeSHAP feature contributions and interaction values.
+//! Model explainability: QuadratureTreeSHAP feature contributions and interaction values.
 //! Run: `cargo run --release --example shap`.
 
 use hessboost::prelude::*;

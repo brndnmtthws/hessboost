@@ -56,7 +56,9 @@ fn coordinate_delta(sum_grad: f64, sum_hess: f64, w: f64, alpha: f64, lambda: f6
 /// `n_out` is the number of outputs (`num_class` for multiclass, the label
 /// columns for multi-target labels, else 1). The
 /// returned [`LinearModel`] holds `weights` laid out `[feature][output]` and a
-/// per-output `bias`.
+/// per-output `bias`. Continued training passes the model's current linear
+/// booster as `start` (its margins in `initial_margin`); coordinate descent
+/// then resumes from its weights and bias instead of zeros.
 pub(crate) fn train_gblinear(
     params: &TrainingParams,
     dtrain: &DMatrix,
@@ -64,6 +66,7 @@ pub(crate) fn train_gblinear(
     initial_margin: &[f32],
     n_out: usize,
     objective: &dyn Objective,
+    start: Option<&LinearModel>,
 ) -> LinearModel {
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
@@ -92,8 +95,10 @@ pub(crate) fn train_gblinear(
         });
     }
 
-    let mut lin_weights = vec![0.0f32; n_features * n_out];
-    let mut bias = vec![0.0f32; n_out];
+    let (mut lin_weights, mut bias) = match start {
+        Some(model) => (model.weights().to_vec(), model.bias().to_vec()),
+        None => (vec![0.0f32; n_features * n_out], vec![0.0f32; n_out]),
+    };
 
     // Running margins [instance][output]; gradients recomputed each round, then
     // updated incrementally as each coordinate moves.

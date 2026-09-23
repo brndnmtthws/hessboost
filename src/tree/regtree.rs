@@ -12,6 +12,7 @@
 //! [`Node::leaf_value`]s are unused (zero).
 
 use crate::data::DMatrix;
+use crate::tree::linear::LinearLeaves;
 use serde::{Deserialize, Serialize};
 
 /// Sentinel used in child pointers to mark "no child" (i.e. a leaf).
@@ -93,6 +94,10 @@ pub struct RegTree {
     /// node; internal nodes hold zeros). Empty for scalar trees.
     #[serde(default)]
     leaf_vectors: Vec<f32>,
+    /// Per-leaf linear models of a `linear_tree` tree ([`LinearLeaves`]);
+    /// `None` for constant-leaf trees (every tree unless `linear_tree` is on).
+    #[serde(default)]
+    linear: Option<LinearLeaves>,
 }
 
 impl RegTree {
@@ -104,6 +109,7 @@ impl RegTree {
             categories: Vec::new(),
             size_leaf_vector: 0,
             leaf_vectors: Vec::new(),
+            linear: None,
         }
     }
 
@@ -116,6 +122,7 @@ impl RegTree {
             categories: Vec::new(),
             size_leaf_vector: n_outputs,
             leaf_vectors: vec![0.0; n_outputs],
+            linear: None,
         }
     }
 
@@ -168,6 +175,7 @@ impl RegTree {
             categories: self.categories.clone(),
             size_leaf_vector: 0,
             leaf_vectors: Vec::new(),
+            linear: None,
         }
     }
 
@@ -206,7 +214,11 @@ impl RegTree {
                             && (!node.is_categorical
                                 || (node.cat_begin <= node.cat_end
                                     && (node.cat_end as usize) <= self.categories.len()))))
-            });
+            })
+            && self
+                .linear
+                .as_ref()
+                .is_none_or(|linear| linear.is_valid(&self.nodes, n_features));
         if !locally_valid {
             return false;
         }
@@ -245,6 +257,19 @@ impl RegTree {
     #[inline]
     pub(crate) fn categories(&self) -> &[u32] {
         &self.categories
+    }
+
+    /// The per-leaf linear models, when this is a linear-leaf tree (trained
+    /// with `linear_tree`). Such a leaf predicts its linear model, or its
+    /// constant `leaf_value` for rows missing one of the model's features.
+    #[inline]
+    pub fn linear_leaves(&self) -> Option<&LinearLeaves> {
+        self.linear.as_ref()
+    }
+
+    /// Attach fitted leaf linear models.
+    pub(crate) fn set_linear_leaves(&mut self, linear: LinearLeaves) {
+        self.linear = Some(linear);
     }
 
     /// Access a node by id.
@@ -335,14 +360,15 @@ impl RegTree {
         self.nodes[nid].split_gain = gain;
     }
 
-    /// Set a node's cover (sum of Hessians).
+    /// Record the Hessian sum (cover) of the instances reaching node `nid`.
     pub(crate) fn set_sum_hess(&mut self, nid: usize, sum_hess: f32) {
         self.nodes[nid].sum_hess = sum_hess;
     }
 
     /// Multiply every leaf weight by `factor`. Used to apply the learning rate
     /// (shrinkage) so that stored trees already carry their scaled contribution,
-    /// matching XGBoost's saved-model semantics.
+    /// matching XGBoost's saved-model semantics. Leaf linear models are scaled
+    /// with them.
     pub fn scale_leaves(&mut self, factor: f32) {
         let k = self.size_leaf_vector;
         for (id, n) in self.nodes.iter_mut().enumerate() {
@@ -355,6 +381,9 @@ impl RegTree {
                 }
             }
         }
+        if let Some(linear) = &mut self.linear {
+            linear.scale(f64::from(factor));
+        }
     }
 
     /// Route a single feature vector (via an accessor) to its leaf id.
@@ -363,32 +392,31 @@ impl RegTree {
     /// the same code serves dense rows, sparse rows, and SHAP traversals.
     pub fn leaf_id_with(&self, get: impl Fn(u32) -> Option<f32>) -> usize {
         let mut nid = 0usize;
-        loop {
-            let node = &self.nodes[nid];
-            if node.is_leaf() {
-                return nid;
+        while !self.nodes[nid].is_leaf() {
+            nid = self.child(nid, get(self.nodes[nid].split_feature));
+        }
+        nid
+    }
+
+    /// The child of internal node `nid` that an instance whose split-feature
+    /// value is `value` (`None` = missing) descends to.
+    #[inline]
+    pub(crate) fn child(&self, nid: usize, value: Option<f32>) -> usize {
+        let node = &self.nodes[nid];
+        let go_left = match value {
+            // Categories are integer-coded; membership in the left set routes
+            // left, everything else (present, not in set) right.
+            Some(v) if node.is_categorical => {
+                let c = v as u32;
+                self.categories[node.cat_begin as usize..node.cat_end as usize].contains(&c)
             }
-            let go_left = if node.is_categorical {
-                match get(node.split_feature) {
-                    // Categories are integer-coded; membership in the left set
-                    // routes left, everything else (present, not in set) right.
-                    Some(v) => {
-                        let c = v as u32;
-                        self.categories[node.cat_begin as usize..node.cat_end as usize].contains(&c)
-                    }
-                    None => node.default_left,
-                }
-            } else {
-                match get(node.split_feature) {
-                    Some(v) => v < node.split_cond,
-                    None => node.default_left,
-                }
-            };
-            nid = if go_left {
-                node.left as usize
-            } else {
-                node.right as usize
-            };
+            Some(v) => v < node.split_cond,
+            None => node.default_left,
+        };
+        if go_left {
+            node.left as usize
+        } else {
+            node.right as usize
         }
     }
 
@@ -422,10 +450,16 @@ impl RegTree {
         }
     }
 
-    /// Predict the raw leaf weight for row `row` of `data`.
+    /// Predict the raw output of row `row` of `data`: its leaf's weight, or
+    /// the leaf's linear model for linear-leaf trees.
     pub fn predict_row(&self, data: &DMatrix, row: usize) -> f32 {
-        let leaf = self.leaf_id_with(|f| data.get(row, f as usize));
-        self.nodes[leaf].leaf_value
+        let get = |f: u32| data.get(row, f as usize);
+        let leaf = self.leaf_id_with(get);
+        let constant = self.nodes[leaf].leaf_value;
+        match &self.linear {
+            Some(linear) => linear.predict(leaf, constant, get),
+            None => constant,
+        }
     }
 }
 

@@ -4,6 +4,8 @@
 mod scalar;
 
 const LOG_LOSS_EPSILON: f64 = 1e-15;
+/// XGBoost's binary `logloss` floor (`float eps = 1e-16`), widened to `f64`.
+const BINARY_LOG_LOSS_EPSILON: f64 = 1e-16f32 as f64;
 const MIN_POSITIVE_PREDICTION: f64 = 1e-8;
 
 use crate::objective::GradPair;
@@ -161,7 +163,7 @@ fn metric_slices_cover(len: usize, labels: &[f32], weights: Option<&[f32]>) -> b
 /// XGBoost's `common::Sigmoid`: `1 / (expf(min(-x, 88.7)) + 1)` (the
 /// `1e-16f` upstream adds to the denominator vanishes in `f32`).
 #[inline]
-fn sigmoid_scalar(x: f32) -> f32 {
+pub(crate) fn sigmoid_scalar(x: f32) -> f32 {
     1.0 / ((-x).min(88.7).exp() + 1.0)
 }
 

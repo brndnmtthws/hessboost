@@ -22,7 +22,9 @@ use crate::objective::GradPair;
 use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
+use crate::tree::reuse::{CategoricalPenalty, ReuseSet};
 use crate::tree::sampler::ColumnSampler;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// Value-sorted column index over a [`DMatrix`], built once and reused across
@@ -109,6 +111,10 @@ pub struct ExactTreeBuilder<'a> {
     reg: RegParams,
     cons: MonotoneConstraints,
     interaction_sets: Option<Vec<Vec<u32>>>,
+    /// Opt-in reuse penalties (`toad_penalty_*`): the ensemble's used features
+    /// and thresholds, extended by every split this builder commits. `None`
+    /// on the default path.
+    reuse: Option<RefCell<ReuseSet>>,
 }
 
 impl<'a> ExactTreeBuilder<'a> {
@@ -119,7 +125,18 @@ impl<'a> ExactTreeBuilder<'a> {
             reg: RegParams::from_params(params),
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
+            reuse: None,
         }
+    }
+
+    /// Penalize candidates by the reuse penalties of `set` (the ensemble's
+    /// used features and thresholds; `None` keeps the default gain). Splits
+    /// the builder commits extend its own copy, so later levels (and later
+    /// trees grown by this builder) reuse them for free.
+    #[must_use]
+    pub(crate) fn with_reuse(mut self, set: Option<&ReuseSet>) -> Self {
+        self.reuse = set.cloned().map(RefCell::new);
+        self
     }
 
     /// Grow a single tree.
@@ -217,6 +234,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             .or_default()
                             .add(GradStats::from_pair(gp));
                     }
+                    let reuse = self.reuse.as_ref().map(RefCell::borrow);
                     for (slot, &nid) in active.iter().enumerate() {
                         if !permits(node_allowed[nid].as_ref(), f) {
                             continue;
@@ -233,6 +251,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             constrained,
                             &self.reg,
                             f,
+                            reuse.as_deref().map(|r| r as &dyn CategoricalPenalty),
                         );
                     }
                     continue;
@@ -396,6 +415,14 @@ impl<'a> ExactTreeBuilder<'a> {
                     )
                 };
                 tree.set_split_gain(nid, b.loss_chg as f32);
+                if let Some(reuse) = &self.reuse {
+                    let mut reuse = reuse.borrow_mut();
+                    if b.is_categorical {
+                        reuse.record_categorical(b.feature, &b.cat_left);
+                    } else {
+                        reuse.record_numeric(b.feature, b.threshold);
+                    }
+                }
                 debug_assert_eq!(left_id, node_stats.len());
                 node_stats.push(b.left);
                 node_stats.push(b.right);
@@ -486,9 +513,12 @@ impl<'a> ExactTreeBuilder<'a> {
         threshold: f32,
         default_left: bool,
     ) {
-        if let Some((loss_chg, wl, wr)) =
+        if let Some((mut loss_chg, wl, wr)) =
             xgb_loss_chg(left, right, root_gain, &self.reg, bounds, dir)
         {
+            if let Some(reuse) = &self.reuse {
+                loss_chg -= reuse.borrow().numeric_penalty(feature, threshold);
+            }
             xgb_update(
                 best,
                 loss_chg,

@@ -4,7 +4,8 @@
 Trains real XGBoost (single thread) on deterministic synthetic datasets, one
 case per supported feature, and writes `fixtures/<name>.json` holding the data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
-raw margin, SHAP contributions on the first 50 rows) and the saved model JSON,
+raw margin, SHAP contributions on the first 50 rows, SHAP interaction values on
+the first 5 rows of the `INTERACTION_CASES`) and the saved model JSON,
 plus the same model's UBJSON encoding (`save_raw("ubj")`) as the sidecar
 `fixtures/<name>.ubj` named by the fixture's `xgb_model_ubj`.
 `tests/parity.rs` consumes these; the fixture schema is the
@@ -40,6 +41,7 @@ N_TRAIN = 2000
 N_TEST = 500
 N_COLS = 8
 N_CONTRIB_ROWS = 50
+N_INTERACTION_ROWS = 5
 GROUP_SIZE = 20
 NUM_ROUND = 50
 BASE_SEED = 20260915
@@ -49,6 +51,9 @@ TOL_TRAIN = 1e-4
 TOL_TRAIN_PROB = 1e-5  # binary probabilities / softprob
 TOL_IMPORT = 1e-5
 TOL_CONTRIBS = 1e-4
+# Per-round eval-metric oracles: |hessboost - xgboost| <= TOL_EVALS * max(1, |xgboost|).
+TOL_EVALS = 1e-5
+TOL_INTERACTIONS = 1e-4
 # Quality-tier bands: relative RMSE factor for regression, absolute accuracy
 # slack for classification.
 BAND_RMSE = 1.08
@@ -158,15 +163,53 @@ def y_multi_heavy_tail(x, rng):
     )
 
 
+def y_cox(x, rng):
+    """Signed survival times for survival:cox: exponential event times with a
+    log-hazard linear in the features, independent exponential censoring
+    (about a third of rows, stored as -time), rounded to a 0.05 grid so that
+    many rows tie."""
+    n = x.shape[0]
+    hazard = np.exp(0.8 * x[:, 0] - 1.2 * x[:, 1] + 0.5 * x[:, 2])
+    event = rng.exponential(1.0 / hazard)
+    censor = rng.exponential(2.0, n)
+    observed = np.ceil(np.minimum(event, censor) * 20.0) / 20.0
+    return np.where(event <= censor, observed, -observed).astype(np.float32)
+
+
+def y_aft(x, rng):
+    """Label intervals for survival:aft from log-normal survival times: 40%
+    uncensored (lower == upper), 20% right- (upper = +inf), 20% left-
+    (lower = 0) and 20% interval-censored rows."""
+    n = x.shape[0]
+    t = np.exp(0.5 + x[:, 0] - 1.5 * x[:, 1] + 0.5 * rng.standard_normal(n)).astype(np.float32)
+    kind = rng.random(n)
+    below = (t * rng.uniform(0.5, 1.0, n)).astype(np.float32)
+    above = (t * rng.uniform(1.0, 2.0, n)).astype(np.float32)
+    lower = np.where(kind < 0.4, t, np.where(kind < 0.6, below, np.where(kind < 0.8, 0.0, below)))
+    upper = np.where(kind < 0.4, t, np.where(kind < 0.6, np.inf, above))
+    return None, lower.astype(np.float32), upper.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Case matrix
 # ---------------------------------------------------------------------------
 
 # name -> (target fn, param overrides, options)
-# A target fn returning an (n, K) array trains on a label matrix (K targets).
+# A target fn returns the label vector, an (n, K) array to train on a label
+# matrix (K targets), or a `(labels | None, lower, upper)` tuple for survival
+# cases that carry `label_lower_bound`/`label_upper_bound` (labels `None` when
+# the objective reads the bounds only, e.g. survival:aft).
 # options: tier, num_round, missing (fraction of NaN features), weighted, ranking,
 #          tol_train (override), drop (params removed from TREE_BASE),
-#          feature_weights (per-column DMatrix weights for column sampling)
+#          feature_weights (per-column DMatrix weights for column sampling),
+#          evals (record per-round metrics on the labeled test set; the
+#          params' `eval_metric` list, or XGBoost's default metric when absent),
+#          test_weighted (per-row test-set weights; constant within each
+#          query group and passed to XGBoost per group for ranking cases),
+#          continue_from (train that many rounds, then continue to num_round via
+#          `xgb_model=`), refresh (process_type=update of the final model on a
+#          prefix of the training rows with transformed labels), ranges
+#          (iteration_range predictions and model slices)
 CASES = {
     # tree_method / grow policy / constraints on reg:squarederror
     "exact_reg_d6": (y_regression, dict(tree_method="exact"), {}),
@@ -186,6 +229,12 @@ CASES = {
         {},
     ),
     "weighted_reg_d6": (y_regression, {}, dict(weighted=True)),
+    # per-round metric oracles on a weighted test set
+    "evals_reg_d4": (
+        y_regression,
+        dict(max_depth=4, eval_metric=["rmse", "mae"]),
+        dict(evals=True, test_weighted=True),
+    ),
     "categorical_reg_d6": (
         y_regression,
         {},
@@ -217,7 +266,70 @@ CASES = {
         dict(objective="reg:tweedie", tweedie_variance_power=1.5, max_depth=4),
         {},
     ),
-    "huber_d4": (y_heavy_tail, dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4), {}),
+    # evals: the default metric is `mphe` (pseudo-Huber without factor 2)
+    "huber_d4": (
+        y_heavy_tail,
+        dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
+        dict(evals=True),
+    ),
+    # small objectives; `evals` checks each default metric (rmsle, logloss on
+    # raw margins, error on the 0/1 hinge output) round by round
+    "squaredlog_d4": (y_gamma, dict(objective="reg:squaredlogerror", max_depth=4), dict(evals=True)),
+    "squaredlog_exact_d4": (
+        y_gamma,
+        dict(objective="reg:squaredlogerror", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_squaredlog_weighted_d4": (
+        y_gamma,
+        dict(objective="reg:squaredlogerror", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+    ),
+    "logitraw_d6": (y_binary, dict(objective="binary:logitraw"), dict(evals=True)),
+    "logitraw_exact_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_logitraw_weighted_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True),
+    ),
+    "nobs_logitraw_spw3_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", scale_pos_weight=3.0, max_depth=4),
+        dict(drop=("base_score",), evals=True),
+    ),
+    "hinge_d4": (y_binary, dict(objective="binary:hinge", max_depth=4), dict(evals=True)),
+    "hinge_exact_d4": (
+        y_binary,
+        dict(objective="binary:hinge", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_hinge_weighted_d4": (
+        y_binary,
+        dict(objective="binary:hinge", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+    ),
+    # metric oracles: rmsle / mape / mphe (non-default slope) on a positive
+    # target, and pre / pre@k on weighted query groups
+    "evals_metrics_reg_d4": (
+        y_gamma,
+        dict(max_depth=4, huber_slope=0.7, eval_metric=["rmsle", "mape", "mphe"]),
+        dict(evals=True, test_weighted=True),
+    ),
+    "evals_pre_rank_d4": (
+        y_relevance_binary,
+        dict(
+            objective="rank:ndcg",
+            max_depth=4,
+            lambdarank_pair_method="topk",
+            lambdarank_num_pair_per_sample=GROUP_SIZE,
+            eval_metric=["pre", "pre@5"],
+        ),
+        dict(ranking=True, evals=True, test_weighted=True),
+    ),
     # ranking: groups of 20 and topk=20 enumerate every unordered pair. The
     # Rust objective reproduces XGBoost's top-k accumulation/normalization.
     "rank_ndcg_d4": (
@@ -311,6 +423,105 @@ CASES = {
         dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
         dict(drop=("base_score",), weighted=True),
     ),
+    # alpha-list objectives: one output per alpha (quantile_alpha /
+    # expectile_alpha lists become one scalar tree per alpha and round) and
+    # the smoothed MAE. `nobs_*` cases exercise the per-output intercepts
+    # (label quantiles, the MAE Newton step from the mean, the monotone
+    # expectile step); the others broadcast base_score through ProbToMargin.
+    "quantile_d4": (y_heavy_tail, dict(objective="reg:quantileerror", quantile_alpha=0.5, max_depth=4), {}),
+    "nobs_quantile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "nobs_quantile_multi_exact_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], tree_method="exact", max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "nobs_quantile_weighted_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.2, 0.8], max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "nobs_mae_d4": (y_heavy_tail, dict(objective="reg:absoluteerror", max_depth=4), dict(drop=("base_score",))),
+    "nobs_mae_weighted_exact_d4": (
+        y_heavy_tail,
+        dict(objective="reg:absoluteerror", tree_method="exact", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "nobs_expectile_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=0.3, max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "nobs_expectile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=[0.1, 0.5, 0.9], max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "expectile_multi_weighted_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=[0.2, 0.8], max_depth=4),
+        dict(weighted=True),
+    ),
+    # multi-target smoothed MAE: a label matrix with per-target intercepts.
+    "multi_mae_weighted_d4": (
+        y_multi_heavy_tail,
+        dict(objective="reg:absoluteerror", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    # survival: Cox with censoring and tied times; AFT with every censoring
+    # type. Metric oracles cover cox-nloglik, aft-nloglik and
+    # interval-regression-accuracy.
+    "cox_hist_d4": (y_cox, dict(objective="survival:cox", max_depth=4), dict(evals=True)),
+    "cox_exact_nobs_d4": (
+        y_cox,
+        dict(objective="survival:cox", tree_method="exact", max_depth=4),
+        dict(drop=("base_score",), evals=True),
+    ),
+    "cox_weighted_nobs_d4": (
+        y_cox,
+        dict(objective="survival:cox", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "aft_normal_d4": (
+        y_aft,
+        dict(
+            objective="survival:aft",
+            aft_loss_distribution="normal",
+            aft_loss_distribution_scale=1.2,
+            max_depth=4,
+            eval_metric=["aft-nloglik", "interval-regression-accuracy"],
+        ),
+        dict(evals=True),
+    ),
+    "aft_logistic_exact_d4": (
+        y_aft,
+        dict(
+            objective="survival:aft",
+            aft_loss_distribution="logistic",
+            aft_loss_distribution_scale=0.8,
+            tree_method="exact",
+            max_depth=4,
+        ),
+        dict(evals=True),
+    ),
+    "aft_extreme_d4": (
+        y_aft,
+        dict(objective="survival:aft", aft_loss_distribution="extreme", max_depth=4),
+        dict(evals=True),
+    ),
+    "aft_weighted_nobs_d4": (
+        y_aft,
+        dict(
+            objective="survival:aft",
+            aft_loss_distribution="normal",
+            max_depth=4,
+            eval_metric=["aft-nloglik", "interval-regression-accuracy"],
+        ),
+        dict(drop=("base_score",), weighted=True, test_weighted=True, evals=True),
+    ),
     # multi_strategy=multi_output_tree: one vector-leaf tree per round shares
     # its splits across all outputs (hist only).
     "mot_reg3_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), {}),
@@ -374,6 +585,35 @@ CASES = {
         dict(multi_strategy="multi_output_tree", booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
         dict(tier="quality"),
     ),
+    # vector leaves on the alpha-list objectives (one output per alpha) and a
+    # smoothed-MAE label matrix
+    "mot_quantile_multi_nobs_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",)),
+    ),
+    "mot_expectile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:expectileerror", expectile_alpha=[0.2, 0.8], multi_strategy="multi_output_tree", max_depth=4),
+        {},
+    ),
+    "mot_mae_weighted_nobs_d4": (
+        y_multi_heavy_tail,
+        dict(objective="reg:absoluteerror", multi_strategy="multi_output_tree", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    # vector-leaf forests (num_parallel_tree vector trees per iteration),
+    # iteration ranges / slices, and continued training
+    "mot_forest_np3_reg3_d4": (
+        y_multi_regression,
+        dict(multi_strategy="multi_output_tree", num_parallel_tree=3, max_depth=4),
+        dict(num_round=20, ranges=True),
+    ),
+    "mot_continue_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
+        dict(continue_from=15, tol_train=TOL_TRAIN_PROB, ranges=True),
+    ),
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
     "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),
     "colsample_bytree_0p5_d6": (y_regression, dict(colsample_bytree=0.5, seed=42), dict(tier="quality")),
@@ -409,7 +649,106 @@ CASES = {
         dict(booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
         dict(tier="quality"),
     ),
+    # continued training (`xgb_model=`), deterministic -> pointwise
+    "continue_hist_reg_d6": (y_regression, {}, dict(continue_from=20)),
+    "continue_exact_nobs_binary_d4": (
+        y_binary,
+        dict(objective="binary:logistic", tree_method="exact", max_depth=4),
+        dict(continue_from=10, drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "continue_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, max_depth=4),
+        dict(continue_from=15, tol_train=TOL_TRAIN_PROB),
+    ),
+    # process_type=update with the refresh updater
+    "refresh_reg_d4": (
+        y_regression,
+        dict(max_depth=4),
+        dict(refresh=dict(rows=1000, rounds=NUM_ROUND, refresh_leaf=True, labels=lambda y: 1.5 * y + 0.3)),
+    ),
+    "refresh_keepleaf_binary_d4": (
+        y_binary,
+        dict(objective="binary:logistic", max_depth=4),
+        dict(
+            tol_train=TOL_TRAIN_PROB,
+            refresh=dict(rows=1200, rounds=30, refresh_leaf=False, labels=lambda y: 1.0 - y),
+        ),
+    ),
+    "refresh_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, max_depth=4, num_parallel_tree=2),
+        dict(
+            num_round=20,
+            tol_train=TOL_TRAIN_PROB,
+            refresh=dict(rows=1500, rounds=20, refresh_leaf=True, labels=lambda y: (y + 1) % 3),
+        ),
+    ),
+    # num_parallel_tree: without sampling every forest tree is identical
+    "forest_np4_reg_d4": (y_regression, dict(num_parallel_tree=4, max_depth=4), dict(ranges=True)),
+    "forest_np2_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, max_depth=4, num_parallel_tree=2),
+        dict(num_round=20, tol_train=TOL_TRAIN_PROB, ranges=True),
+    ),
+    "ranges_hist_reg_d6": (y_regression, {}, dict(ranges=True)),
+    # the forest / continuation layouts on the other multi-output models: a
+    # label matrix and an alpha list (one output per target / alpha)
+    "forest_np2_multi_reg3_d4": (
+        y_multi_regression,
+        dict(num_parallel_tree=2, max_depth=4),
+        dict(num_round=20, drop=("base_score",), ranges=True),
+    ),
+    "forest_np2_quantile_multi_d4": (
+        y_heavy_tail,
+        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], num_parallel_tree=2, max_depth=4),
+        dict(num_round=20, drop=("base_score",), ranges=True),
+    ),
+    "continue_multi_reg3_nobs_d4": (
+        y_multi_regression,
+        dict(max_depth=4),
+        dict(continue_from=20, drop=("base_score",)),
+    ),
+    # random forest / boosted random forest (quality tier)
+    "rf_np8_reg_d6": (
+        y_regression,
+        dict(num_parallel_tree=8, subsample=0.8, colsample_bynode=0.8, eta=1.0, seed=42),
+        dict(tier="quality", num_round=1),
+    ),
+    "boosted_rf_np3_reg_d4": (
+        y_regression,
+        dict(num_parallel_tree=3, subsample=0.7, colsample_bytree=0.8, max_depth=4, seed=42),
+        dict(tier="quality", num_round=20),
+    ),
+    "dart_np2_ranges_d4": (
+        y_regression,
+        dict(booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4, num_parallel_tree=2),
+        dict(tier="quality", num_round=20, ranges=True),
+    ),
 }
+
+
+# Cases that also record `pred_interactions` on the first N_INTERACTION_ROWS
+# test rows: numeric, missing values, categorical splits, multiclass, DART,
+# and the multi-output layouts (label matrix, alpha list, parallel-tree forests,
+# vector-leaf trees).
+INTERACTION_CASES = (
+    "hist_reg_d6_r50",
+    "hist_reg_missing_d6",
+    "categorical_reg_d6",
+    "softprob_d4",
+    "dart_d4",
+    "multi_reg3_d6",
+    "nobs_quantile_multi_d4",
+    "forest_np2_softprob_d4",
+    "forest_np2_multi_reg3_d4",
+    # vector-leaf trees: numeric, categorical, multiclass, forests, DART
+    "mot_reg3_d6",
+    "mot_reg3_categorical_d6",
+    "mot_softprob_d4",
+    "mot_forest_np3_reg3_d4",
+    "mot_dart_d4",
+)
 
 
 def _params(overrides: dict, drop: tuple) -> dict:
@@ -435,6 +774,17 @@ def _to_json_floats(a: np.ndarray) -> list:
     a = np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
     out = a.astype(np.float64).astype(object)
     out[np.isnan(a)] = None
+    return out.tolist()
+
+
+def _to_json_bounds(a: np.ndarray) -> list:
+    """f32 label bounds -> list of Python floats; +/-inf -> "inf"/"-inf" strings
+    (JSON has no infinity; bounds are never NaN)."""
+    a = np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+    assert not np.isnan(a).any(), "label bounds must not be NaN"
+    out = a.astype(np.float64).astype(object)
+    out[np.isposinf(a)] = "inf"
+    out[np.isneginf(a)] = "-inf"
     return out.tolist()
 
 
@@ -475,11 +825,24 @@ def build_case(name: str) -> dict:
         x[:, 0] = rng.integers(0, 5, x.shape[0]).astype(np.float32)
         x[:, 1] = rng.integers(0, 9, x.shape[0]).astype(np.float32)
         feature_types = ["c", "c"] + ["q"] * (N_COLS - 2)
-    y = np.asarray(target(x, rng), dtype=np.float32)
+    target_out = target(x, rng)
+    lower = upper = None
+    if isinstance(target_out, tuple):
+        y, lower, upper = target_out
+    else:
+        y = target_out
     if "missing" in opts:
         x = _inject_missing(x, opts["missing"], rng)
     x_train, x_test = x[:N_TRAIN], x[N_TRAIN:]
-    y_train, y_test = y[:N_TRAIN], y[N_TRAIN:]
+    y_train = y_test = lo_train = lo_test = hi_train = hi_test = None
+    if y is not None:
+        y = np.asarray(y, dtype=np.float32)
+        y_train, y_test = y[:N_TRAIN], y[N_TRAIN:]
+    if lower is not None:
+        lower = np.asarray(lower, dtype=np.float32)
+        upper = np.asarray(upper, dtype=np.float32)
+        lo_train, lo_test = lower[:N_TRAIN], lower[N_TRAIN:]
+        hi_train, hi_test = upper[:N_TRAIN], upper[N_TRAIN:]
 
     weights = rng.uniform(0.5, 2.0, N_TRAIN).astype(np.float32) if opts.get("weighted") else None
     group_sizes = test_group_sizes = None
@@ -498,17 +861,65 @@ def build_case(name: str) -> dict:
     if feature_weights is not None:
         assert len(feature_weights) == N_COLS
         dtrain.set_info(feature_weights=np.asarray(feature_weights, dtype=np.float32))
+    if lo_train is not None:
+        dtrain.set_float_info("label_lower_bound", lo_train)
+        dtrain.set_float_info("label_upper_bound", hi_train)
     dtest = xgb.DMatrix(x_test, nthread=1, feature_types=feature_types)
     dcontrib = xgb.DMatrix(x_test[:N_CONTRIB_ROWS], nthread=1, feature_types=feature_types)
 
-    booster = xgb.train(dict(params, nthread=1), dtrain, num_boost_round=num_round)
+    # Test-set weights are drawn after every other draw so that cases without
+    # them keep their data.
+    test_weights = None
+    if opts.get("test_weighted"):
+        if test_group_sizes is not None:
+            per_group = rng.uniform(0.5, 2.0, len(test_group_sizes)).astype(np.float32)
+            test_weights = np.repeat(per_group, test_group_sizes)
+        else:
+            test_weights = rng.uniform(0.5, 2.0, N_TEST).astype(np.float32)
+
+    evals_result: dict = {}
+    evals = []
+    if opts.get("evals"):
+        deval = xgb.DMatrix(x_test, label=y_test, nthread=1, feature_types=feature_types)
+        if test_group_sizes is not None:
+            deval.set_group(test_group_sizes)
+            if test_weights is not None:
+                deval.set_weight(per_group)
+        elif test_weights is not None:
+            deval.set_weight(test_weights)
+        if lo_test is not None:
+            deval.set_float_info("label_lower_bound", lo_test)
+            deval.set_float_info("label_upper_bound", hi_test)
+        evals = [(deval, "test")]
+
+    train_params = dict(params, nthread=1)
+    continuation = None
+    if "continue_from" in opts:
+        assert not evals, "metric oracles cover a single uninterrupted run"
+        first = opts["continue_from"]
+        initial = xgb.train(train_params, dtrain, num_boost_round=first)
+        continuation = {"first_rounds": first, "xgb_model_initial": _save_model_json(initial)}
+        booster = xgb.train(train_params, dtrain, num_boost_round=num_round - first, xgb_model=initial)
+    else:
+        booster = xgb.train(
+            train_params,
+            dtrain,
+            num_boost_round=num_round,
+            evals=evals,
+            evals_result=evals_result,
+            verbose_eval=False,
+        )
     pred = booster.predict(dtest)
     margin = booster.predict(dtest, output_margin=True)
     contribs = booster.predict(dcontrib, pred_contribs=True)
+    interactions = None
+    if name in INTERACTION_CASES:
+        dinter = xgb.DMatrix(x_test[:N_INTERACTION_ROWS], nthread=1, feature_types=feature_types)
+        interactions = booster.predict(dinter, pred_interactions=True)
 
     tol_train = _quality_band(params) if tier == "quality" else opts.get("tol_train", TOL_TRAIN)
 
-    return {
+    fixture = {
         "xgboost_version": xgb.__version__,
         "name": name,
         "tier": tier,
@@ -519,11 +930,17 @@ def build_case(name: str) -> dict:
         "n_test": N_TEST,
         "n_cols": N_COLS,
         # Label columns: y_train / y_test are row-major [row][target].
-        "n_targets": 1 if y.ndim == 1 else int(y.shape[1]),
+        "n_targets": 1 if y is None or y.ndim == 1 else int(y.shape[1]),
         "x_train": _to_json_floats(x_train),
-        "y_train": _to_json_floats(y_train),
+        "y_train": [] if y_train is None else _to_json_floats(y_train),
         "x_test": _to_json_floats(x_test),
-        "y_test": _to_json_floats(y_test),
+        "y_test": [] if y_test is None else _to_json_floats(y_test),
+        "label_lower_bound": None if lo_train is None else _to_json_bounds(lo_train),
+        "label_upper_bound": None if hi_train is None else _to_json_bounds(hi_train),
+        "test_label_lower_bound": None if lo_test is None else _to_json_bounds(lo_test),
+        "test_label_upper_bound": None if hi_test is None else _to_json_bounds(hi_test),
+        "test_weights": None if test_weights is None else _to_json_floats(test_weights),
+        "xgb_evals": evals_result["test"] if evals else None,
         "weights": None if weights is None else _to_json_floats(weights),
         "feature_weights": feature_weights,
         "group_sizes": group_sizes,
@@ -532,10 +949,85 @@ def build_case(name: str) -> dict:
         "xgb_pred": _to_json_floats(pred),
         "xgb_margin": _to_json_floats(margin),
         "xgb_contribs": _to_json_floats(contribs),
+        "xgb_interactions": None if interactions is None else _to_json_floats(interactions),
         "xgb_model": _save_model_json(booster),
         "xgb_model_ubj": _save_model_ubj(booster, name),
-        "tol": {"train": tol_train, "import": TOL_IMPORT, "contribs": TOL_CONTRIBS},
+        "tol": {
+            "train": tol_train,
+            "import": TOL_IMPORT,
+            "contribs": TOL_CONTRIBS,
+            "evals": TOL_EVALS,
+            "interactions": TOL_INTERACTIONS,
+        },
+        "continuation": continuation,
+        "refresh": None,
+        "ranges": [],
+        "range_contribs": [],
+        "slices": [],
     }
+    if "refresh" in opts:
+        fixture["refresh"] = _refresh(opts["refresh"], train_params, booster, x_train, y_train, dtest)
+    if opts.get("ranges"):
+        fixture.update(_ranges(booster, dtest, dcontrib))
+    return fixture
+
+
+def _refresh(spec: dict, train_params: dict, booster: xgb.Booster, x_train, y_train, dtest) -> dict:
+    """`process_type=update` + `updater=refresh` of `booster` on the first
+    `rows` training rows relabelled by `labels`; predictions on the test set."""
+    rows = spec["rows"]
+    y = np.asarray(spec["labels"](y_train[:rows]), dtype=np.float32)
+    drefresh = xgb.DMatrix(x_train[:rows], label=y, nthread=1)
+    update = dict(
+        train_params,
+        process_type="update",
+        updater="refresh",
+        refresh_leaf=int(spec["refresh_leaf"]),
+    )
+    refreshed = xgb.train(update, drefresh, num_boost_round=spec["rounds"], xgb_model=booster.copy())
+    return {
+        "n_rows": rows,
+        "y": _to_json_floats(y),
+        "rounds": spec["rounds"],
+        "refresh_leaf": spec["refresh_leaf"],
+        "xgb_pred": _to_json_floats(refreshed.predict(dtest)),
+    }
+
+
+def _ranges(booster: xgb.Booster, dtest, dcontrib) -> dict:
+    """`iteration_range` margins, prefix-range contributions / leaf indices,
+    and `booster[begin:end:step]` slice margins. Slice spans are multiples
+    of their step (XGBoost 3.4.2 rejects other spans)."""
+    rounds = booster.num_boosted_rounds()
+    half = rounds // 2
+    spans = [(0, half), (rounds // 4, 3 * rounds // 4), (half, rounds), (rounds - 1, rounds)]
+    ranges = [
+        {
+            "begin": b,
+            "end": e,
+            "margin": _to_json_floats(booster.predict(dtest, output_margin=True, iteration_range=(b, e))),
+        }
+        for b, e in spans
+    ]
+    range_contribs = [
+        {
+            "end": e,
+            "contribs": _to_json_floats(booster.predict(dcontrib, pred_contribs=True, iteration_range=(0, e))),
+            "leaf": _to_json_floats(booster.predict(dcontrib, pred_leaf=True, iteration_range=(0, e))),
+        }
+        for e in (1, half)
+    ]
+    triples = [(0, half, 1), (1, 1 + 3 * ((rounds - 1) // 3), 3), (half, rounds, 1)]
+    slices = [
+        {
+            "begin": b,
+            "end": e,
+            "step": s,
+            "margin": _to_json_floats(booster[b:e:s].predict(dtest, output_margin=True)),
+        }
+        for b, e, s in triples
+    ]
+    return {"ranges": ranges, "range_contribs": range_contribs, "slices": slices}
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +1145,8 @@ def main() -> None:
         print(
             f"{name:<26} {fixture['tier']:<7} {fixture['params']['objective']:<22} "
             f"rounds={fixture['num_round']:<3} pred={len(fixture['xgb_pred'])} "
-            f"contribs={len(fixture['xgb_contribs'])}"
+            f"contribs={len(fixture['xgb_contribs'])} "
+            f"interactions={len(fixture['xgb_interactions'] or [])}"
         )
     print(f"wrote {len(CASES)} fixtures to {os.path.abspath(FIX_DIR)}")
 

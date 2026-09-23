@@ -203,8 +203,11 @@ fn early_stopping_keeps_whole_vector_rounds() {
     assert_eq!(model.num_trees(), best + 2);
     let d = DMatrix::from_dense(&x, N, COLS).unwrap();
     let margin = model.predict_margin(&d).unwrap();
-    assert_eq!(margin, model.predict_margin_limited(&d, best + 1).unwrap());
-    assert_ne!(margin, model.predict_margin_limited(&d, 0).unwrap());
+    assert_eq!(
+        margin,
+        model.predict_margin_range(&d, (0, best + 1)).unwrap()
+    );
+    assert_ne!(margin, model.predict_margin_range(&d, (0, 0)).unwrap());
 }
 
 #[test]
@@ -356,5 +359,93 @@ fn unsupported_combinations_are_rejected() {
     assert!(matches!(
         train_with_objective(&vector_params().build().unwrap(), &dtrain, 1, &wrong),
         Err(HessboostError::DimensionMismatch { .. })
+    ));
+}
+
+#[test]
+fn vector_forests_hold_num_parallel_tree_trees_per_iteration() {
+    let params = vector_params().num_parallel_tree(3).build().unwrap();
+    let model = train(&params, &dtrain(), 4).unwrap();
+    assert_eq!(model.num_trees(), 12);
+    assert_eq!(model.trees_per_iteration(), 3);
+    assert_eq!(model.num_boost_rounds(), 4);
+    let (x, _) = data();
+    let d = DMatrix::from_dense(&x, N, COLS).unwrap();
+    // Without sampling the forest's trees are identical, each shrunk by
+    // eta / 3, and the iteration ranges select whole forests.
+    let all = model.predict_margin(&d).unwrap();
+    assert_eq!(all, reference_margins(&model, &x, N));
+    let first_two = model.predict_margin_range(&d, (0, 2)).unwrap();
+    assert_eq!(
+        first_two,
+        model.slice(0, 2, 1).unwrap().predict_margin(&d).unwrap()
+    );
+    assert_ne!(first_two, all);
+    // SHAP over a prefix range stays additive.
+    let contribs = model.predict_contribs_range(&d, (0, 2)).unwrap();
+    for (row_out, m) in contribs
+        .as_chunks::<{ COLS + 1 }>()
+        .0
+        .iter()
+        .zip(&first_two)
+    {
+        assert!((row_out.iter().sum::<f32>() - m).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn continued_vector_training_matches_one_run() {
+    let dtrain = dtrain();
+    let params = vector_params().subsample(0.8).seed(11).build().unwrap();
+    let full = train(&params, &dtrain, 8).unwrap();
+    let first = train(&params, &dtrain, 5).unwrap();
+    let continued = train_continue(&params, &dtrain, 3, &first).unwrap();
+    assert_eq!(continued.num_trees(), 8);
+    let (x, _) = data();
+    let d = DMatrix::from_dense(&x, N, COLS).unwrap();
+    assert_eq!(
+        continued.predict_margin(&d).unwrap(),
+        full.predict_margin(&d).unwrap()
+    );
+}
+
+#[test]
+fn unsupported_vector_layouts_are_rejected() {
+    let dtrain = dtrain();
+    let vector = model();
+    // XGBoost's refresh updater handles single-target trees only.
+    let refresh = vector_params()
+        .process_type(ProcessType::Update)
+        .build()
+        .unwrap();
+    assert_eq!(
+        invalid_param(train_continue(&refresh, &dtrain, 2, &vector)),
+        "process_type"
+    );
+    // A model keeps one tree kind.
+    let scalar = TrainingParams::builder().max_depth(4).build().unwrap();
+    assert_eq!(
+        invalid_param(train_continue(&scalar, &dtrain, 2, &vector)),
+        "multi_strategy"
+    );
+    // The opt-in growth modes that bypass the vector-leaf split search.
+    for (params, name) in [
+        (
+            vector_params()
+                .grow_policy(GrowPolicy::Symmetric)
+                .build_unchecked(),
+            "grow_policy",
+        ),
+        (
+            vector_params().toad_penalty_feature(0.1).build_unchecked(),
+            "toad_penalty_feature",
+        ),
+    ] {
+        assert_eq!(invalid_param(train(&params, &dtrain, 1)), name);
+    }
+    // The bit-packed compact format stores scalar leaves only.
+    assert!(matches!(
+        vector.to_compact_bytes(),
+        Err(HessboostError::ModelFormat(_))
     ));
 }

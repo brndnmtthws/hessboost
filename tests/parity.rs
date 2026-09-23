@@ -23,8 +23,8 @@
 use hessboost::data::HistCuts;
 use hessboost::learner::RoundEval;
 use hessboost::prelude::{
-    BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError, Monotone,
-    TrainingParams, TreeMethod, train, train_with_eval,
+    AftDistribution, BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError,
+    Monotone, TrainingParams, TreeMethod, train, train_with_eval,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
@@ -259,6 +259,13 @@ fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
             "seed" => b.seed(usize_of(k, v)? as u64),
             "tweedie_variance_power" => b.tweedie_variance_power(f64_of(k, v)?),
             "huber_slope" => b.huber_slope(f64_of(k, v)?),
+            "aft_loss_distribution" => b.aft_loss_distribution(match str_of(k, v)? {
+                "normal" => AftDistribution::Normal,
+                "logistic" => AftDistribution::Logistic,
+                "extreme" => AftDistribution::Extreme,
+                other => return Err(format!("aft_loss_distribution `{other}` not mapped")),
+            }),
+            "aft_loss_distribution_scale" => b.aft_loss_distribution_scale(f64_of(k, v)?),
             "rate_drop" => b.rate_drop(f64_of(k, v)?),
             "skip_drop" => b.skip_drop(f64_of(k, v)?),
             "tree_method" => b.tree_method(match str_of(k, v)? {

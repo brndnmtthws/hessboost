@@ -4,6 +4,10 @@
 //! [`crate::objective::Objective::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
+mod survival;
+
+pub use survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
+
 use crate::config::ObjectiveParams;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -542,11 +546,11 @@ impl Metric for CustomMetric {
 
 /// Resolve a metric by name. `num_class` is used by multiclass metrics, and
 /// `objective` carries the loss parameters that objective-dependent metrics
-/// read; none of the metrics implemented so far depend on it.
+/// read (`aft-nloglik` takes the AFT distribution and scale).
 pub fn create_metric(
     name: &str,
     num_class: usize,
-    _objective: &ObjectiveParams,
+    objective: &ObjectiveParams,
 ) -> Result<Box<dyn Metric>> {
     // Accept the XGBoost `tweedie-nloglik@1.5` suffix form.
     let (base, rho) = match name.split_once('@') {
@@ -573,6 +577,12 @@ pub fn create_metric(
         })),
         "ndcg" => Ok(Box::new(Ndcg::new(rho.map(|r| r as usize)))),
         "map" => Ok(Box::new(MeanAveragePrecision::new(rho.map(|r| r as usize)))),
+        "cox-nloglik" => Ok(Box::new(CoxNLogLik)),
+        "aft-nloglik" => Ok(Box::new(AftNLogLik::new(
+            objective.aft_loss_distribution,
+            objective.aft_loss_distribution_scale as f32,
+        ))),
+        "interval-regression-accuracy" => Ok(Box::new(IntervalRegressionAccuracy)),
         other => Err(HessboostError::unknown("metric", other)),
     }
 }
@@ -580,6 +590,13 @@ pub fn create_metric(
 /// Build the list of metrics to evaluate: the user's `eval_metric` list if any,
 /// otherwise the single `default_name` supplied by the objective. `num_class`
 /// and `objective` are forwarded to [`create_metric`].
+///
+/// XGBoost configures the default metric from the objective's
+/// `DefaultMetricConfig` but without the user's parameters (the learner has
+/// cleared them by the time it evaluates). For `aft-nloglik` that keeps the
+/// objective's distribution while the scale falls back to its default 1, so
+/// the default metric here is built the same way; list `aft-nloglik` in
+/// `eval_metric` to evaluate the likelihood at the configured scale.
 pub fn create_metrics(
     eval_metric: &[String],
     default_name: &str,
@@ -587,7 +604,15 @@ pub fn create_metrics(
     objective: &ObjectiveParams,
 ) -> Result<Vec<Box<dyn Metric>>> {
     if eval_metric.is_empty() {
-        Ok(vec![create_metric(default_name, num_class, objective)?])
+        let default_config = ObjectiveParams {
+            aft_loss_distribution_scale: ObjectiveParams::default().aft_loss_distribution_scale,
+            ..objective.clone()
+        };
+        Ok(vec![create_metric(
+            default_name,
+            num_class,
+            &default_config,
+        )?])
     } else {
         eval_metric
             .iter()

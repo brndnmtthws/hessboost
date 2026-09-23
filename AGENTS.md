@@ -52,7 +52,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 |---|---|
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
-| `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
+| `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks |
 | `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
@@ -119,7 +119,8 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
   then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
 
 Multiclass objectives need `.num_class(k)`; ranking objectives need
-`.with_group_sizes`.
+`.with_group_sizes`; `survival:aft` needs `.with_label_bounds` (labels are
+optional), and `survival:cox` reads negative labels as right-censored times.
 
 ## Not implemented
 

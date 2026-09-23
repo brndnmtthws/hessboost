@@ -289,7 +289,9 @@ fn train_impl_inner(
     if let Some(base_score) = params.base_score {
         let invalid = match params.objective.as_str() {
             "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
-            "count:poisson" | "reg:gamma" | "reg:tweedie" => base_score <= 0.0,
+            "count:poisson" | "reg:gamma" | "reg:tweedie" | "survival:cox" | "survival:aft" => {
+                base_score <= 0.0
+            }
             _ => false,
         };
         if invalid {

@@ -108,7 +108,10 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `reg:pseudohubererror` (`huber_slope`), `binary:logistic`, `multi:softmax`,
   `multi:softprob`, `count:poisson`, `reg:gamma`, `reg:tweedie`
   (`tweedie_variance_power`), learning-to-rank (`rank:pairwise`, `rank:ndcg`,
-  `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), and a user
+  `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), survival
+  analysis (`survival:cox` on signed right-censored times with Breslow ties;
+  `survival:aft` on interval-censored label bounds with `normal`/`logistic`/
+  `extreme` noise, `aft_loss_distribution[_scale]`), and a user
   **custom-objective hook**. Intercepts are estimated per output exactly as
   XGBoost 3.4.1 does (label mean, class log-frequencies, or a Newton step).
   Objectives and metrics see a dataset through `MetaInfo` (labels of every
@@ -123,9 +126,11 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `sampling_method = gradient_based`, `multi_strategy = multi_output_tree`,
   and `process_type = update` instead of ignoring them.
 - **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
-  `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
+  `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`),
+  `cox-nloglik`, `aft-nloglik`, `interval-regression-accuracy`, and a
   **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for
-  ranking, `tweedie-nloglik@rho` for Tweedie), except `reg:pseudohubererror`,
+  ranking, `tweedie-nloglik@rho` for Tweedie; the default `aft-nloglik` uses
+  the objective's distribution at scale 1, as XGBoost's does), except `reg:pseudohubererror`,
   which reports `mae` because XGBoost's `mphe` is not implemented.
 - **Constraints:** monotone constraints and **interaction constraints**,
   supported in **both** the `hist` and `exact` builders.

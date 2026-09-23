@@ -6,7 +6,8 @@
 //! * [`xgboost_parity`] runs the three-way check per case: **train** on the
 //!   fixture data and compare test predictions (pointwise for the `exact` tier,
 //!   a quality band for the RNG-driven `quality` tier), **import** the embedded
-//!   XGBoost model and compare predictions, margins and SHAP contributions, and
+//!   XGBoost model and compare predictions, margins, SHAP contributions and
+//!   (where the fixture records them) SHAP interaction values, and
 //!   **export** the hessboost model to `fixtures/exports/` for
 //!   `scripts/check_exports.py` to reload in XGBoost.
 //! * [`quantile_cuts_match_xgboost`] compares `hist` quantile cuts bit-for-bit
@@ -30,6 +31,8 @@ use std::path::{Path, PathBuf};
 
 /// Rows of `x_test` on which the fixture carries SHAP contributions.
 const CONTRIB_ROWS: usize = 50;
+/// Rows of `x_test` on which a fixture may carry SHAP interaction values.
+const INTERACTION_ROWS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Fixture schema
@@ -48,6 +51,7 @@ struct Tol {
     train: f64,
     import: f64,
     contribs: f64,
+    interactions: f64,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +77,7 @@ struct Fixture {
     xgb_pred: Vec<f32>,
     xgb_margin: Vec<f32>,
     xgb_contribs: Vec<f32>,
+    xgb_interactions: Option<Vec<f32>>,
     xgb_model: Value,
     tol: Tol,
 }
@@ -360,6 +365,7 @@ struct Row {
     import: String,
     margin: String,
     contribs: String,
+    interactions: String,
     export: String,
     base_score: String,
 }
@@ -468,10 +474,12 @@ impl Case<'_> {
     }
 
     /// Assertion 2: import the embedded XGBoost model and compare predictions,
-    /// margins, and SHAP contributions. XGBoost's multiclass contribution layout
-    /// `(rows, num_class, n_cols + 1)` is identical to hessboost's
-    /// `predict_contribs` layout, so both flatten to the same order.
-    fn import_and_compare(&mut self, dtest: &DMatrix, dcontrib: &DMatrix) -> [String; 3] {
+    /// margins, SHAP contributions, and recorded SHAP interaction values.
+    /// XGBoost's multiclass layouts `(rows, num_class, n_cols + 1)` and
+    /// `(rows, num_class, n_cols + 1, n_cols + 1)` are identical to hessboost's
+    /// `predict_contribs` / `predict_interactions` layouts, so both flatten to
+    /// the same order.
+    fn import_and_compare(&mut self, dtest: &DMatrix, dcontrib: &DMatrix) -> [String; 4] {
         let fx = self.fx;
         let imported = BoostedModel::from_xgboost_json(&fx.xgb_model.to_string());
         if booster_of(fx) == "gblinear" {
@@ -506,10 +514,21 @@ impl Case<'_> {
             .predict_contribs(dcontrib)
             .map_err(|e| e.to_string())
             .and_then(|p| max_abs_diff("import contribs", &p, &fx.xgb_contribs));
+        let interactions = match &fx.xgb_interactions {
+            None => "-".to_string(),
+            Some(want) => {
+                let delta = self
+                    .dmatrix(&fx.x_test[..INTERACTION_ROWS * fx.n_cols], INTERACTION_ROWS)
+                    .and_then(|d| model.predict_interactions(&d).map_err(|e| e.to_string()))
+                    .and_then(|p| max_abs_diff("import interactions", &p, want));
+                self.check("import interactions", &delta, fx.tol.interactions)
+            }
+        };
         [
             self.check("import predict", &pred, fx.tol.import),
             self.check("import margin", &margin, fx.tol.import),
             self.check("import contribs", &contribs, fx.tol.contribs),
+            interactions,
         ]
     }
 
@@ -558,6 +577,7 @@ impl Case<'_> {
             import: "ERR".to_string(),
             margin: "ERR".to_string(),
             contribs: "ERR".to_string(),
+            interactions: "ERR".to_string(),
             export: "n/a".to_string(),
             base_score: "-".to_string(),
         };
@@ -599,7 +619,8 @@ impl Case<'_> {
             Err(e) => self.fail(e),
         }
 
-        [row.import, row.margin, row.contribs] = self.import_and_compare(&dtest, &dcontrib);
+        [row.import, row.margin, row.contribs, row.interactions] =
+            self.import_and_compare(&dtest, &dcontrib);
         row
     }
 }
@@ -629,8 +650,8 @@ fn xgboost_parity() {
 
     let mut failures = Vec::new();
     println!(
-        "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<8} base_score hessboost | xgboost",
-        "case", "tier", "train", "import", "margin", "contribs", "export"
+        "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<9} {:<8} base_score hessboost | xgboost",
+        "case", "tier", "train", "import", "margin", "contribs", "inter", "export"
     );
     for (_, fx) in &fixtures {
         let row = Case {
@@ -639,13 +660,14 @@ fn xgboost_parity() {
         }
         .run(&exports);
         println!(
-            "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<8} {} | {}",
+            "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<9} {:<8} {} | {}",
             row.name,
             row.tier,
             row.train,
             row.import,
             row.margin,
             row.contribs,
+            row.interactions,
             row.export,
             row.base_score,
             xgb_base_score(fx)

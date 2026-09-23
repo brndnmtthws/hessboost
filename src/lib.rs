@@ -46,8 +46,8 @@
 //! - **Metrics:** rmse, mae, logloss, error, auc, aucpr, mlogloss, merror,
 //!   ndcg/map, nloglik, and a custom hook ([`train_with_custom_metric`]).
 //! - **Modeling:** monotone & interaction constraints, native categorical
-//!   splits, early stopping, feature importance, TreeSHAP contributions and
-//!   interaction values ([`BoostedModel::predict_contribs`] /
+//!   splits, early stopping, feature importance, QuadratureTreeSHAP
+//!   contributions and interaction values ([`BoostedModel::predict_contribs`] /
 //!   [`predict_interactions`](prelude::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON model import/export ([`crate::model`]).

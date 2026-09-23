@@ -8,7 +8,9 @@ constraints, every objective — including `reg:logistic` and the `reg:linear`
 alias — sample weights, ranking groups, gblinear, DART, intercept estimation;
 37 cases in total), and writes each case to `../fixtures/<name>.json`: data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
-raw margin, SHAP contributions on the first 50 rows) and the saved model JSON.
+raw margin, SHAP contributions on the first 50 rows, and for the numeric,
+missing-value, categorical, multiclass, and DART cases in `INTERACTION_CASES`
+SHAP interaction values on the first 5 rows) and the saved model JSON.
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 
@@ -17,7 +19,8 @@ quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 1. **Train parity** - train on the fixture data, compare `predict(x_test)` with
    XGBoost's predictions.
 2. **Import parity** - `BoostedModel::from_xgboost_json` on the embedded model,
-   compare predictions, raw margins, and SHAP contributions.
+   compare predictions, raw margins, SHAP contributions, and (where recorded)
+   SHAP interaction values.
 3. **Export parity** - write `to_xgboost_json` and hessboost's predictions to
    `../fixtures/exports/`; `check_exports.py` reloads each model in XGBoost and
    compares.
@@ -26,7 +29,8 @@ quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 the cut oracles.
 
 Cases are tiered. `exact` cases are pointwise: max |delta| within `tol.train`
-(1e-4; 1e-5 for probabilities), `tol.import` (1e-5) and `tol.contribs` (1e-4).
+(1e-4; 1e-5 for probabilities), `tol.import` (1e-5), `tol.contribs` (1e-4) and
+`tol.interactions` (1e-4).
 `quality` cases are RNG-driven (`subsample`, `colsample_bytree`, DART); training
 uses a regression RMSE <= 1.08x XGBoost band while import/export remain
 pointwise. The `train-only` gblinear case validates training pointwise; its

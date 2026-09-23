@@ -324,17 +324,33 @@ access. Categorical splits and trees deeper than 16 levels use an early-exit
 walk. The kernel runs at roughly six instructions per cycle on a Neoverse V3
 and is bound by instruction issue, not memory.
 
-TreeSHAP walks each tree with a preallocated path arena instead of cloning the
-decision path at every fork, precomputes each node's cover fraction, reads the
-instance as a dense row, hoists the per-element divisions out of the
-unwinding loops, folds the recurrence coefficients off the loop-carried
-dependency so each unwinding step is one multiply-subtract, and adds one
-shared constant for all path elements that lie off the instance's own path
-(their cover fraction cancels). Rows are processed in parallel. On a Neoverse
-V3 core these changes cut prediction time by 10–20× for dense, sparse, and
-multiclass batches and by 8–9× for SHAP contributions relative to the per-node
-traversal. Those two figures are informal spot measurements from a separate
-machine. They are not part of the recorded artifacts in this document.
+On a Neoverse V3 core these prediction changes cut prediction time by 10–20×
+for dense, sparse, and multiclass batches relative to the per-node traversal.
+That figure is an informal spot measurement from a separate machine. It is not
+part of the recorded artifacts in this document.
+
+SHAP values use XGBoost 3.4's QuadratureTreeSHAP. One recursive walk per tree
+carries an 8-lane quadrature basis in `f32` and extracts each return edge's
+contribution from its subtree's return, so contributions cost `O(L · D)` per
+tree and row (`L` leaves, `D` depth) and interactions `O(L · D²)`. Classic
+path-dependent TreeSHAP needed `O(L · D²)` for contributions and repeated a
+conditioned walk per feature for interactions. Each tree's precomputed nodes
+hold both child branch weights, only the tree's split features are cleared
+and accumulated per tree, and rows are processed in parallel. Spot
+measurements on the 192-core Neoverse V3 host (hist, 20 features, 100 trees
+trained on 20,000 rows; mean of 3–5 calls; not part of the Criterion
+artifacts):
+
+| Workload | Threads | Classic TreeSHAP | QuadratureTreeSHAP | Speedup |
+|---|---:|---:|---:|---:|
+| contributions, depth 6, 2,000 rows | 192 | 4.2 ms | 3.8 ms | 1.1× |
+| contributions, depth 10, 2,000 rows | 192 | 46.1 ms | 29.9 ms | 1.5× |
+| interactions, depth 6, 200 rows | 192 | 19.7 ms | 1.9 ms | 10.6× |
+| interactions, depth 10, 200 rows | 192 | 285 ms | 14.4 ms | 19.8× |
+| contributions, depth 6, 2,000 rows | 1 | 486 ms | 385 ms | 1.3× |
+| contributions, depth 10, 2,000 rows | 1 | 7.49 s | 4.47 s | 1.7× |
+| interactions, depth 6, 200 rows | 1 | 1.90 s | 77 ms | 24.6× |
+| interactions, depth 10, 200 rows | 1 | 29.6 s | 1.14 s | 26.1× |
 
 ## Numerical behavior and validation
 
@@ -343,6 +359,18 @@ in `f64`. SIMD reductions and polynomial evaluation can change rounding, so
 cross-architecture predictions are not promised to be bit-identical. Repeated
 training with the same inputs, parameters, seed, and execution configuration
 remains deterministic.
+
+SHAP values follow XGBoost 3.4.2's arithmetic: the quadrature rule is built in
+`f64` and stored as `f32`, the recurrence and every accumulation are `f32` in
+XGBoost's order (categorical children are walked in XGBoost's orientation),
+and each tree's expected value is summed in `f64` and rounded once. XGBoost's
+aarch64 builds contract `a * b + c` into fused multiply-adds while its x86_64
+wheels do not, and hessboost mirrors this per target, so imported models
+reproduce XGBoost's contributions and interaction values bit for bit on the
+parity fixtures (checked on aarch64 Linux). The unfused arithmetic stays
+within 2e-5 of the fused one on the same fixtures. The 8-point rule is exact
+for paths with at most seven distinct features; longer paths are the same
+quadrature approximation XGBoost computes.
 
 The test suite compares kernels against scalar formulas, including short
 inputs, vector tails, optional weights, saturation, NaNs, infinities, and

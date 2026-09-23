@@ -4,7 +4,8 @@
 Trains real XGBoost (single thread) on deterministic synthetic datasets, one
 case per supported feature, and writes `fixtures/<name>.json` holding the data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
-raw margin, SHAP contributions on the first 50 rows) and the saved model JSON.
+raw margin, SHAP contributions on the first 50 rows, SHAP interaction values on
+the first 5 rows of the `INTERACTION_CASES`) and the saved model JSON.
 `tests/parity.rs` consumes these; the fixture schema is the
 contract between the two.
 
@@ -38,6 +39,7 @@ N_TRAIN = 2000
 N_TEST = 500
 N_COLS = 8
 N_CONTRIB_ROWS = 50
+N_INTERACTION_ROWS = 5
 GROUP_SIZE = 20
 NUM_ROUND = 50
 BASE_SEED = 20260915
@@ -47,6 +49,7 @@ TOL_TRAIN = 1e-4
 TOL_TRAIN_PROB = 1e-5  # binary probabilities / softprob
 TOL_IMPORT = 1e-5
 TOL_CONTRIBS = 1e-4
+TOL_INTERACTIONS = 1e-4
 # Quality-tier bands: relative RMSE factor for regression, absolute accuracy
 # slack for classification.
 BAND_RMSE = 1.08
@@ -266,6 +269,17 @@ CASES = {
 }
 
 
+# Cases that also record `pred_interactions` on the first N_INTERACTION_ROWS
+# test rows: numeric, missing values, categorical splits, multiclass, DART.
+INTERACTION_CASES = (
+    "hist_reg_d6_r50",
+    "hist_reg_missing_d6",
+    "categorical_reg_d6",
+    "softprob_d4",
+    "dart_d4",
+)
+
+
 def _params(overrides: dict, drop: tuple) -> dict:
     p = dict(TREE_BASE)
     for key in drop:
@@ -346,6 +360,10 @@ def build_case(name: str) -> dict:
     pred = booster.predict(dtest)
     margin = booster.predict(dtest, output_margin=True)
     contribs = booster.predict(dcontrib, pred_contribs=True)
+    interactions = None
+    if name in INTERACTION_CASES:
+        dinter = xgb.DMatrix(x_test[:N_INTERACTION_ROWS], nthread=1, feature_types=feature_types)
+        interactions = booster.predict(dinter, pred_interactions=True)
 
     tol_train = _quality_band(params) if tier == "quality" else opts.get("tol_train", TOL_TRAIN)
 
@@ -370,8 +388,14 @@ def build_case(name: str) -> dict:
         "xgb_pred": _to_json_floats(pred),
         "xgb_margin": _to_json_floats(margin),
         "xgb_contribs": _to_json_floats(contribs),
+        "xgb_interactions": None if interactions is None else _to_json_floats(interactions),
         "xgb_model": _save_model_json(booster),
-        "tol": {"train": tol_train, "import": TOL_IMPORT, "contribs": TOL_CONTRIBS},
+        "tol": {
+            "train": tol_train,
+            "import": TOL_IMPORT,
+            "contribs": TOL_CONTRIBS,
+            "interactions": TOL_INTERACTIONS,
+        },
     }
 
 
@@ -490,7 +514,8 @@ def main() -> None:
         print(
             f"{name:<26} {fixture['tier']:<7} {fixture['params']['objective']:<22} "
             f"rounds={fixture['num_round']:<3} pred={len(fixture['xgb_pred'])} "
-            f"contribs={len(fixture['xgb_contribs'])}"
+            f"contribs={len(fixture['xgb_contribs'])} "
+            f"interactions={len(fixture['xgb_interactions'] or [])}"
         )
     print(f"wrote {len(CASES)} fixtures to {os.path.abspath(FIX_DIR)}")
 

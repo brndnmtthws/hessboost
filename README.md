@@ -12,7 +12,7 @@ gradient boosting with no C/C++ dependency and no FFI.
 Rust. It includes the regularized second-order boosting objective, exact,
 histogram, and approximate tree construction, the full objective and metric
 catalog, monotone and interaction constraints, categorical splits, DART and
-gblinear boosters, TreeSHAP, and XGBoost-format model interop (numeric and
+gblinear boosters, QuadratureTreeSHAP, and XGBoost-format model interop (numeric and
 categorical trees) with
 multi-core (`rayon`) acceleration.
 
@@ -69,7 +69,7 @@ Runnable, self-contained examples live in
 | `binary_classification` | `binary:logistic`, watched eval set, early stopping, AUC |
 | `multiclass` | `multi:softprob`, per-class probabilities, `predict_class` |
 | `ranking` | LambdaMART `rank:ndcg` over query groups |
-| `shap` | `predict_contribs` and `predict_interactions` (TreeSHAP) |
+| `shap` | `predict_contribs` and `predict_interactions` (QuadratureTreeSHAP) |
 | `model_io` | native binary / JSON and XGBoost-format model save & load |
 | `custom_objective` | custom loss and custom eval-metric hooks |
 | `constraints` | monotone + interaction constraints and categorical features |
@@ -102,8 +102,11 @@ Runnable, self-contained examples live in
 - **Constraints:** monotone constraints and **interaction constraints**,
   supported in **both** the `hist` and `exact` builders.
 - **Modeling:** **native categorical splits** (hist and exact), per-instance
-  `base_margin` (warm-start), **TreeSHAP** contributions (`predict_contribs`) and
-  **interaction values** (`predict_interactions`), early stopping, feature
+  `base_margin` (warm-start), SHAP contributions (`predict_contribs`) and
+  **interaction values** (`predict_interactions`) via XGBoost 3.4's
+  **QuadratureTreeSHAP** (8-point Gauss–Legendre rule, same `f32` arithmetic
+  and accumulation order, so imported models reproduce XGBoost's values),
+  early stopping, feature
   importance (weight / gain / cover / totals), leaf-index and margin prediction.
 - **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
   **XGBoost-format JSON model import/export** for `gbtree`/DART ensembles
@@ -172,7 +175,7 @@ Numerical parity with **XGBoost 3.4.2** is checked in CI by a fixture harness
 `scripts/check_exports.py`). Each case is checked three ways: **train parity**
 (same data and parameters, compare predictions), **import parity**
 (`from_xgboost_json` on the XGBoost model: predictions, margins, SHAP
-contributions) and **export parity** (`to_xgboost_json` reloaded by XGBoost).
+contributions, and SHAP interaction values) and **export parity** (`to_xgboost_json` reloaded by XGBoost).
 `exact`-tier cases — including every objective and deterministic tree method,
 plus categorical splits — must agree pointwise (1e-4 / 1e-5). `quality` cases
 (row/column subsampling and DART) use an RMSE band because their RNG streams

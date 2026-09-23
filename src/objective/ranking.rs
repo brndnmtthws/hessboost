@@ -8,8 +8,9 @@
 //! change. Pair values, accumulation, per-query normalization, and query
 //! weighting use XGBoost's float/double conversion points.
 
-use super::{GradPair, Objective};
-use crate::data::GroupInfo;
+use super::{GradPair, Objective, check_label_domain};
+use crate::data::{GroupInfo, MetaInfo};
+use crate::error::{HessboostError, Result};
 use crate::metric::{argsort_desc, group_ranges};
 
 /// Which ranking loss the LambdaMART objective optimizes.
@@ -198,6 +199,34 @@ impl Objective for LambdaMartObjective {
         out: &mut [GradPair],
     ) {
         self.compute(preds, labels, weights, group, out);
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        match self.mode {
+            // NDCG gains are `2^label - 1` in a `u32`: relevance in [0, 31].
+            RankMode::Ndcg => check_label_domain(info, |y| !(0.0..=31.0).contains(&y))?,
+            RankMode::Pairwise | RankMode::Map => check_label_domain(info, |y| y < 0.0)?,
+        }
+        let Some(group) = info.group else {
+            return Err(HessboostError::invalid_param(
+                "group_sizes",
+                "ranking dataset requires group information",
+            ));
+        };
+        if let Some(weights) = info.weights {
+            for (start, end) in group.iter_ranges() {
+                if weights[start..end]
+                    .iter()
+                    .any(|weight| *weight != weights[start])
+                {
+                    return Err(HessboostError::invalid_param(
+                        "weights",
+                        "ranking dataset requires one constant weight per query group",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn default_metric(&self) -> String {

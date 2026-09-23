@@ -56,6 +56,9 @@ pub struct BoostedModel {
     /// objective's own output count otherwise (custom objectives may have
     /// several). Trees are laid out round-robin over outputs.
     n_outputs: usize,
+    /// Label columns per training row (`1` unless trained on a label matrix).
+    #[serde(default = "one_target")]
+    n_targets: usize,
     n_features: usize,
     /// The best iteration index selected by early stopping, if any.
     best_iteration: Option<usize>,
@@ -133,6 +136,8 @@ pub(crate) struct ModelSpec {
     pub(crate) num_class: usize,
     /// Raw outputs per instance (`Objective::n_outputs`).
     pub(crate) n_outputs: usize,
+    /// Label columns per training row ([`DMatrix::n_targets`]).
+    pub(crate) n_targets: usize,
     pub(crate) n_features: usize,
 }
 
@@ -239,6 +244,7 @@ impl BoostedModel {
             objective_params: spec.objective_params,
             num_class: spec.num_class,
             n_outputs: spec.n_outputs,
+            n_targets: spec.n_targets,
             n_features: spec.n_features,
             best_iteration: None,
             tree_weights,
@@ -268,6 +274,13 @@ impl BoostedModel {
     #[inline]
     pub fn n_outputs(&self) -> usize {
         self.n_outputs
+    }
+
+    /// Number of label columns (targets) per row of the training data: `1`
+    /// unless the model was trained on [`DMatrix::with_label_matrix`] labels.
+    #[inline]
+    pub fn n_targets(&self) -> usize {
+        self.n_targets
     }
 
     /// Number of boosting rounds (`num_trees / n_outputs`).
@@ -683,6 +696,7 @@ impl BoostedModel {
             ));
         }
         if self.n_outputs == 0
+            || self.n_targets == 0
             || (self.num_class >= 2 && self.n_outputs != self.num_class)
             || !self.trees.len().is_multiple_of(self.n_outputs)
         {
@@ -774,8 +788,14 @@ impl BoostedModel {
             .objective_params
             .training_params(&self.objective, self.num_class)
             .build_unchecked();
-        create_objective(&params)
+        create_objective(&params, self.n_targets)
     }
+}
+
+/// Serde default of [`BoostedModel::n_targets`] for models written before the
+/// field existed.
+fn one_target() -> usize {
+    1
 }
 
 /// Rows per prediction block: the block's feature rows stay in cache while

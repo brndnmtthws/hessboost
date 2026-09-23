@@ -1,6 +1,10 @@
 //! Classification objectives.
 
-use super::{GradPair, MIN_HESS, Objective, newton_intercepts, weighted_label_mean};
+use super::{
+    GradPair, MIN_HESS, Objective, check_label_domain, newton_intercepts, weighted_label_mean,
+};
+use crate::data::MetaInfo;
+use crate::error::Result;
 
 /// Logistic regression: `binary:logistic` (classification, reported with
 /// `logloss`) or `reg:logistic` (probability regression, reported with `rmse`
@@ -93,7 +97,7 @@ impl Objective for LogisticObjective {
         // through the logit, unless `scale_pos_weight` is in play, in which
         // case the reweighted loss needs the Newton step.
         if (self.scale_pos_weight - 1.0).abs() > 1e-6 {
-            return newton_intercepts(self, labels, weights, group);
+            return newton_intercepts(self, &MetaInfo::new(labels, weights, group));
         }
         vec![self.prob_to_margin(weighted_label_mean(labels, weights))]
     }
@@ -103,6 +107,12 @@ impl Objective for LogisticObjective {
         // away from the asymptotes, then `Logit(p) = -ln(1/p - 1)` in f32.
         let p = base_score.clamp(1e-6, 1.0 - 1e-6);
         -(1.0 / p - 1.0).ln()
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        // XGBoost `LogisticRegression::CheckLabel` (shared by `binary:logistic`
+        // and `reg:logistic`): probabilities in [0, 1], not only {0, 1}.
+        check_label_domain(info, |y| !(0.0..=1.0).contains(&y))
     }
 
     fn default_metric(&self) -> String {

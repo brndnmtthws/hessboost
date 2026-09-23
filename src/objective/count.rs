@@ -1,7 +1,9 @@
 //! Count and positive-continuous regression objectives with a log link:
 //! Poisson, Gamma, and Tweedie. All predict `exp(margin)`.
 
-use super::{GradPair, Objective, weighted_label_mean};
+use super::{GradPair, Objective, check_label_domain, weighted_label_mean};
+use crate::data::MetaInfo;
+use crate::error::Result;
 
 /// Prediction transform shared by the log-link count objectives: `exp(margin)`.
 fn log_link_transform(preds: &mut [f32]) {
@@ -74,6 +76,10 @@ impl Objective for PoissonObjective {
 
     log_link_objective!();
 
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        check_label_domain(info, |y| y < 0.0)
+    }
+
     fn default_metric(&self) -> String {
         "poisson-nloglik".to_string()
     }
@@ -101,6 +107,10 @@ impl Objective for GammaObjective {
     }
 
     log_link_objective!();
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        check_label_domain(info, |y| y <= 0.0)
+    }
 
     fn default_metric(&self) -> String {
         "gamma-nloglik".to_string()
@@ -144,6 +154,10 @@ impl Objective for TweedieObjective {
     }
 
     log_link_objective!();
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        check_label_domain(info, |y| y < 0.0)
+    }
 
     fn default_metric(&self) -> String {
         // XGBoost `TweedieRegression::Configure` names the metric with the

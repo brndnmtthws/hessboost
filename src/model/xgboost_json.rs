@@ -65,11 +65,15 @@
 //! whatever space its objective reports: raw margin for `reg:squarederror`, but
 //! **probability** space for objectives with a link function (`0.5` for
 //! `binary:logistic`, not its logit). `hessboost` stores per-output
-//! intercepts in **margin** space, so on **import** each entry is mapped
-//! through the objective's inverse link ([`Objective::prob_to_margin`]) and on
-//! **export** each margin is mapped back with the forward transform
+//! intercepts in **margin** space, so on **import** the vector is mapped
+//! through the objective's inverse link ([`Objective::probs_to_margins`]) and
+//! on **export** the margin row is mapped back with the forward transform
 //! ([`Objective::pred_transform`]). Multiclass objectives (and any objective we
-//! cannot reconstruct) pass the values through unchanged, as XGBoost does.
+//! cannot reconstruct) pass the values through unchanged, as XGBoost does:
+//! softmax's inverse link is the identity, while its forward transform
+//! normalizes across classes.
+//!
+//! `learner_model_param.num_target` carries [`BoostedModel::n_targets`].
 
 use crate::config::ObjectiveParams;
 use crate::error::{HessboostError, Result};
@@ -136,7 +140,7 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
         booster_model["weight_drop"] = Value::Array(weight_drop);
     }
 
-    let base_score = format_base_score(model.base_scores(), &*objective_impl);
+    let base_score = format_base_score(model.base_scores(), &*objective_impl, num_class);
 
     let value = json!({
         "version": [3, 4, 2],
@@ -153,7 +157,7 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
                 "boost_from_average": "0",
                 "num_class": num_class.to_string(),
                 "num_feature": num_feature.to_string(),
-                "num_target": "1",
+                "num_target": model.n_targets().to_string(),
             },
             "objective": objective_to_json(&objective, num_class, model.objective_params()),
         }
@@ -195,6 +199,10 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .get("num_class")
         .and_then(scalar_f64)
         .map_or(0, |v| v as usize);
+    let n_targets = lmp
+        .get("num_target")
+        .and_then(scalar_f64)
+        .map_or(1, |v| v as usize);
 
     let objective_json = learner.get("objective");
     let objective = objective_json
@@ -249,7 +257,7 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .get("base_score")
         .and_then(Value::as_str)
         .ok_or_else(|| HessboostError::model_format("missing/invalid `base_score`"))?;
-    let objective_impl = build_objective(&objective, num_class);
+    let objective_impl = build_objective(&objective, num_class, n_targets)?;
     let base_margins = parse_base_score(base_score, objective_impl.as_deref(), n_outputs)?;
 
     // Parameter blocks come from the file: check them with the same rules as
@@ -269,6 +277,7 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
             objective,
             num_class,
             n_outputs,
+            n_targets,
             n_features: num_feature,
         },
     );
@@ -492,24 +501,35 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
 // base_score link handling
 // ---------------------------------------------------------------------------
 
-/// Reconstruct the objective from name + `num_class` (at XGBoost's default
-/// parameters, which do not affect the link), if it is one we support.
-fn build_objective(name: &str, num_class: usize) -> Option<Box<dyn Objective>> {
-    create_objective(
-        &ObjectiveParams::defaults_for(name)
-            .training_params(name, num_class)
-            .build_unchecked(),
-    )
-    .ok()
+/// Reconstruct the objective from name, `num_class`, and `n_targets` (at
+/// XGBoost's default parameters, which do not affect the link), if it is one
+/// we support. A supported objective that cannot model `n_targets` targets
+/// is a format error rather than a silently untransformed model.
+fn build_objective(
+    name: &str,
+    num_class: usize,
+    n_targets: usize,
+) -> Result<Option<Box<dyn Objective>>> {
+    let params = ObjectiveParams::defaults_for(name)
+        .training_params(name, num_class)
+        .build_unchecked();
+    match create_objective(&params, n_targets) {
+        Ok(objective) => Ok(Some(objective)),
+        Err(error @ HessboostError::InvalidParameter { .. }) if n_targets > 1 => Err(
+            HessboostError::model_format(format!("`num_target` {n_targets}: {error}")),
+        ),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Render the per-output margin intercepts as XGBoost 3.x's `base_score`
-/// vector string, `"[v0,v1,...]"`, in the space XGBoost stores it in. Only
-/// scalar objectives have a well-defined single-value transform; multiclass
-/// (softmax) operates across classes, so its values pass through unchanged.
-fn format_base_score(margins: &[f32], objective: &dyn Objective) -> String {
+/// vector string, `"[v0,v1,...]"`, in the space XGBoost stores it in: the
+/// objective's forward transform over the whole row. Multiclass (softmax)
+/// values pass through unchanged, since XGBoost's softmax inverse link is the
+/// identity while its transform normalizes across classes.
+fn format_base_score(margins: &[f32], objective: &dyn Objective, num_class: usize) -> String {
     let mut stored = margins.to_vec();
-    if objective.n_outputs() == 1 {
+    if num_class < 2 {
         objective.pred_transform(&mut stored);
     }
     let entries: Vec<String> = stored.iter().map(f32::to_string).collect();
@@ -519,7 +539,7 @@ fn format_base_score(margins: &[f32], objective: &dyn Objective) -> String {
 /// Parse XGBoost 3.x's `base_score` vector string (`"[5E-1]"`,
 /// `"[a,b,c]"`) into per-output margin intercepts. One entry applies to every
 /// output (XGBoost `HandleOldFormat`); otherwise the length must equal
-/// `n_outputs`. Each entry is mapped through the objective's inverse link
+/// `n_outputs`. The vector is mapped through the objective's inverse link
 /// (values pass through unchanged for an objective we cannot reconstruct).
 fn parse_base_score(
     stored: &str,
@@ -537,7 +557,7 @@ fn parse_base_score(
         .map(|v| v.trim().parse::<f32>().ok())
         .collect::<Option<Vec<f32>>>()
         .ok_or_else(invalid)?;
-    let values = match values.len() {
+    let mut values = match values.len() {
         1 => vec![values[0]; n_outputs],
         len if len == n_outputs => values,
         len => {
@@ -546,10 +566,10 @@ fn parse_base_score(
             )));
         }
     };
-    Ok(match objective {
-        Some(obj) => values.iter().map(|&v| obj.prob_to_margin(v)).collect(),
-        None => values,
-    })
+    if let Some(obj) = objective {
+        obj.probs_to_margins(&mut values);
+    }
+    Ok(values)
 }
 
 // ---------------------------------------------------------------------------

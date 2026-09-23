@@ -5,6 +5,7 @@ use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
+use hessboost::config::ObjectiveParams;
 use hessboost::data::ghist::GHistIndex;
 use hessboost::data::quantile::HistCuts;
 use hessboost::metric::{
@@ -355,7 +356,7 @@ fn bench_log_metrics(c: &mut Criterion) {
     ] {
         bench_metric_pair(&mut group, name, metric, &probabilities, labels, &weights);
     }
-    let tweedie = create_metric("tweedie-nloglik@1.5", 0).unwrap();
+    let tweedie = create_metric("tweedie-nloglik@1.5", 0, &ObjectiveParams::default()).unwrap();
     bench_metric_pair(
         &mut group,
         "tweedie_nloglik",
@@ -381,7 +382,8 @@ fn bench_multiclass_metrics(c: &mut Criterion) {
         let weights: Vec<f32> = make_weights(rows);
         group.throughput(Throughput::Elements(rows as u64));
         for metric_name in ["mlogloss", "merror"] {
-            let metric = create_metric(metric_name, num_class).unwrap();
+            let metric =
+                create_metric(metric_name, num_class, &ObjectiveParams::default()).unwrap();
             group.bench_function(format!("{metric_name}_k{num_class}_unweighted"), |b| {
                 b.iter(|| black_box(metric.eval(&probabilities, &labels, None)));
             });

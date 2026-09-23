@@ -23,6 +23,7 @@ pub use regression::{PseudoHuberObjective, SquaredErrorObjective};
 use rayon::prelude::*;
 
 use crate::config::TrainingParams;
+use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 
 /// A first- and second-order gradient for one instance/output.
@@ -184,6 +185,16 @@ pub trait Objective: Send + Sync {
         self.gradient(preds, labels, weights, out);
     }
 
+    /// Compute gradients from a dataset's full metadata view.
+    ///
+    /// This is the entry point the training loops call. The default forwards
+    /// the labels, weights, and groups to [`Objective::gradient_grouped`];
+    /// objectives that read other metadata (label bounds, several targets per
+    /// row) override it.
+    fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
+        self.gradient_grouped(preds, info.labels, info.weights, info.group, out);
+    }
+
     /// Whether the Hessian is constant across margins (XGBoost
     /// `ObjInfo::const_hess`); only `reg:squarederror` returns `true`.
     fn const_hess(&self) -> bool {
@@ -211,7 +222,21 @@ pub trait Objective: Send + Sync {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> Vec<f32> {
-        newton_intercepts(self, labels, weights, group)
+        newton_intercepts(self, &MetaInfo::new(labels, weights, group))
+    }
+
+    /// Estimate the per-output intercepts from a dataset's full metadata
+    /// view; the entry point training uses. The default forwards to
+    /// [`Objective::base_margins`].
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+        self.base_margins(info.labels, info.weights, info.group)
+    }
+
+    /// Transform raw margins into the values evaluation metrics receive
+    /// (XGBoost `EvalTransform`), in place. Defaults to
+    /// [`Objective::pred_transform`].
+    fn eval_transform(&self, preds: &mut [f32]) {
+        self.pred_transform(preds);
     }
 
     /// Convert a `base_score` given in prediction space into margin space via
@@ -220,6 +245,33 @@ pub trait Objective: Send + Sync {
     /// logistic) override it.
     fn prob_to_margin(&self, base_score: f32) -> f32 {
         base_score
+    }
+
+    /// Map one row of prediction-space intercepts (length
+    /// [`Objective::n_outputs`]) to margin space, in place (XGBoost
+    /// `ProbToMargin` on the base-score vector). Defaults to
+    /// [`Objective::prob_to_margin`] per entry.
+    fn probs_to_margins(&self, scores: &mut [f32]) {
+        for s in scores {
+            *s = self.prob_to_margin(*s);
+        }
+    }
+
+    /// Validate a dataset's labels and metadata for this objective. Training
+    /// calls it for the training matrix and every evaluation set before the
+    /// first round. The default accepts everything.
+    ///
+    /// Error messages refer to the data as "dataset"; training inserts the
+    /// dataset's name after that word.
+    fn validate_info(&self, _info: &MetaInfo) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the objective needs ordinary labels. `true` by default;
+    /// objectives that learn from other metadata only (e.g. label bounds)
+    /// return `false`, and training then accepts datasets without labels.
+    fn requires_labels(&self) -> bool {
+        true
     }
 
     /// The default evaluation metric for this objective, as XGBoost's
@@ -231,20 +283,15 @@ pub trait Objective: Send + Sync {
 /// One Newton step from all-zero margins, per output: `w_k = -Σg_k /
 /// max(Σh_k, 1e-6)` with the sums in `f64` and the step rounded to `f32`, then
 /// mapped through [`Objective::pred_transform`] and back through
-/// [`Objective::prob_to_margin`]. XGBoost (`FitIntercept::InitEstimation` +
+/// [`Objective::probs_to_margins`]. XGBoost (`FitIntercept::InitEstimation` +
 /// `tree::FitStump`) stores the intercept in prediction space and re-applies
 /// the link on use; taking the same round trip reproduces its `f32` rounding.
-pub(crate) fn newton_intercepts<O: Objective + ?Sized>(
-    objective: &O,
-    labels: &[f32],
-    weights: Option<&[f32]>,
-    group: Option<&crate::data::GroupInfo>,
-) -> Vec<f32> {
+pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &MetaInfo) -> Vec<f32> {
     let k = objective.n_outputs();
-    let n = labels.len();
+    let n = info.n_rows;
     let zeros = vec![0.0f32; n * k];
     let mut gpair = vec![GradPair::default(); n * k];
-    objective.gradient_grouped(&zeros, labels, weights, group, &mut gpair);
+    objective.gradient_info(&zeros, info, &mut gpair);
     let mut sum_grad = vec![0.0f64; k];
     let mut sum_hess = vec![0.0f64; k];
     for row in gpair.chunks_exact(k) {
@@ -259,10 +306,34 @@ pub(crate) fn newton_intercepts<O: Objective + ?Sized>(
         .map(|(g, h)| (-g / h.max(1e-6)) as f32)
         .collect();
     objective.pred_transform(&mut out);
-    for v in &mut out {
-        *v = objective.prob_to_margin(*v);
-    }
+    objective.probs_to_margins(&mut out);
     out
+}
+
+/// Shared [`Objective::validate_info`] label-domain check: reject the dataset
+/// when any label satisfies `invalid`.
+pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool) -> Result<()> {
+    if info.labels.iter().any(|&y| invalid(y)) {
+        return Err(HessboostError::invalid_param(
+            "labels",
+            "dataset has labels outside the objective's valid domain",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject `n_targets > 1` for an objective that models one target per row.
+fn single_target(objective: Box<dyn Objective>, n_targets: usize) -> Result<Box<dyn Objective>> {
+    if n_targets > 1 {
+        return Err(HessboostError::invalid_param(
+            "labels",
+            format!(
+                "objective `{}` supports one target per row, got {n_targets}",
+                objective.name()
+            ),
+        ));
+    }
+    Ok(objective)
 }
 
 /// Weighted mean of `labels`, or the plain mean when `weights` is `None`, as
@@ -293,19 +364,19 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
     mean as f32
 }
 
-/// Resolve an objective by name, configured from `params`.
-pub fn create_objective(params: &TrainingParams) -> Result<Box<dyn Objective>> {
-    match params.objective.as_str() {
-        "reg:squarederror" | "reg:linear" => Ok(Box::new(SquaredErrorObjective)),
-        "reg:pseudohubererror" => Ok(Box::new(PseudoHuberObjective::new(
-            params.huber_slope as f32,
-        ))),
-        "binary:logistic" => Ok(Box::new(LogisticObjective::new(
+/// Resolve an objective by name, configured from `params`, for a dataset with
+/// `n_targets` label columns per row.
+///
+/// Every built-in objective models a single target and rejects
+/// `n_targets > 1` with an `invalid parameter "labels"` error.
+pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Objective>> {
+    let objective: Box<dyn Objective> = match params.objective.as_str() {
+        "reg:squarederror" | "reg:linear" => Box::new(SquaredErrorObjective),
+        "reg:pseudohubererror" => Box::new(PseudoHuberObjective::new(params.huber_slope as f32)),
+        "binary:logistic" => Box::new(LogisticObjective::new(params.scale_pos_weight as f32)),
+        "reg:logistic" => Box::new(LogisticObjective::regression(
             params.scale_pos_weight as f32,
-        ))),
-        "reg:logistic" => Ok(Box::new(LogisticObjective::regression(
-            params.scale_pos_weight as f32,
-        ))),
+        )),
         "multi:softmax" | "multi:softprob" => {
             if params.num_class < 2 {
                 return Err(HessboostError::invalid_param(
@@ -314,26 +385,25 @@ pub fn create_objective(params: &TrainingParams) -> Result<Box<dyn Objective>> {
                 ));
             }
             let prob = params.objective == "multi:softprob";
-            Ok(Box::new(SoftmaxObjective::new(params.num_class, prob)))
+            Box::new(SoftmaxObjective::new(params.num_class, prob))
         }
-        "count:poisson" => Ok(Box::new(PoissonObjective::new(
-            params.effective_max_delta_step() as f32,
-        ))),
-        "reg:gamma" => Ok(Box::new(GammaObjective)),
-        "reg:tweedie" => Ok(Box::new(TweedieObjective::new(
-            params.tweedie_variance_power as f32,
-        ))),
-        "rank:pairwise" => Ok(Box::new(LambdaMartObjective::pairwise(
+        "count:poisson" => Box::new(PoissonObjective::new(
+            params.effective_max_delta_step() as f32
+        )),
+        "reg:gamma" => Box::new(GammaObjective),
+        "reg:tweedie" => Box::new(TweedieObjective::new(params.tweedie_variance_power as f32)),
+        "rank:pairwise" => Box::new(LambdaMartObjective::pairwise(
             params.lambdarank_num_pair_per_sample,
-        ))),
-        "rank:ndcg" => Ok(Box::new(LambdaMartObjective::ndcg(
+        )),
+        "rank:ndcg" => Box::new(LambdaMartObjective::ndcg(
             params.lambdarank_num_pair_per_sample,
-        ))),
-        "rank:map" => Ok(Box::new(LambdaMartObjective::map(
+        )),
+        "rank:map" => Box::new(LambdaMartObjective::map(
             params.lambdarank_num_pair_per_sample,
-        ))),
-        other => Err(HessboostError::unknown("objective", other)),
-    }
+        )),
+        other => return Err(HessboostError::unknown("objective", other)),
+    };
+    single_target(objective, n_targets)
 }
 
 #[cfg(test)]
@@ -372,11 +442,41 @@ mod tests {
         let p = TrainingParams::builder()
             .objective("reg:squarederror")
             .build_unchecked();
-        assert_eq!(create_objective(&p).unwrap().name(), "reg:squarederror");
+        assert_eq!(create_objective(&p, 1).unwrap().name(), "reg:squarederror");
         let p = TrainingParams::builder()
             .objective("nope:whatever")
             .build_unchecked();
-        assert!(create_objective(&p).is_err());
+        assert!(create_objective(&p, 1).is_err());
+    }
+
+    /// Every built-in objective is single-target: two label columns are a
+    /// parameter error naming `labels`, never a silently wrong model.
+    #[test]
+    fn factory_rejects_multi_target_labels() {
+        for name in [
+            "reg:squarederror",
+            "reg:pseudohubererror",
+            "binary:logistic",
+            "reg:logistic",
+            "multi:softprob",
+            "count:poisson",
+            "reg:gamma",
+            "reg:tweedie",
+            "rank:ndcg",
+        ] {
+            let p = TrainingParams::builder()
+                .objective(name)
+                .num_class(3)
+                .build_unchecked();
+            assert!(create_objective(&p, 1).is_ok(), "{name}");
+            match create_objective(&p, 2) {
+                Err(HessboostError::InvalidParameter { name: param, .. }) => {
+                    assert_eq!(param, "labels", "{name}");
+                }
+                Err(other) => panic!("{name}: unexpected error {other}"),
+                Ok(_) => panic!("{name}: accepted two targets"),
+            }
+        }
     }
 
     /// Parallel row chunks must reproduce the whole-batch gradient bit for bit

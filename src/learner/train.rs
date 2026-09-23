@@ -1,9 +1,12 @@
 //! The gradient-boosting training loop.
 
-use crate::config::{BoosterKind, GrowPolicy, ObjectiveParams, TrainingParams, TreeMethod};
-use crate::data::DMatrix;
+use crate::config::{
+    BoosterKind, GrowPolicy, MultiStrategy, ObjectiveParams, ProcessType, SamplingMethod,
+    TrainingParams, TreeMethod,
+};
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
+use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::learner::model::{BoostedModel, ModelSpec};
 use crate::metric::create_metrics;
@@ -153,7 +156,7 @@ pub fn train_with_eval(
     evals: &[EvalSet],
     early_stopping_rounds: Option<usize>,
 ) -> Result<TrainResult> {
-    let objective = create_objective(params)?;
+    let objective = create_objective(params, dtrain.n_targets())?;
     train_impl(
         params,
         dtrain,
@@ -179,7 +182,7 @@ pub fn train_with_custom_metric(
     early_stopping_rounds: Option<usize>,
     metric: Box<dyn crate::metric::Metric>,
 ) -> Result<TrainResult> {
-    let objective = create_objective(params)?;
+    let objective = create_objective(params, dtrain.n_targets())?;
     train_impl(
         params,
         dtrain,
@@ -255,6 +258,7 @@ fn train_impl_inner(
     metric_override: Option<Box<dyn crate::metric::Metric>>,
 ) -> Result<TrainResult> {
     params.validate()?;
+    reject_unimplemented(params, dtrain)?;
 
     if !params.missing.is_nan() {
         return Err(HessboostError::invalid_param(
@@ -275,10 +279,10 @@ fn train_impl_inner(
         ));
     }
 
-    let labels = dtrain
-        .labels()
-        .ok_or(HessboostError::EmptyDataset("train: dtrain has no labels"))?;
-    let weights = dtrain.weights();
+    if objective.requires_labels() && dtrain.labels().is_none() {
+        return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
+    }
+    let info = dtrain.info();
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
@@ -295,9 +299,16 @@ fn train_impl_inner(
             ));
         }
     }
-    validate_dataset(params, dtrain, n_features, n_out, "dtrain")?;
+    validate_dataset(
+        objective,
+        dtrain,
+        dtrain.n_targets(),
+        n_features,
+        n_out,
+        "dtrain",
+    )?;
     for (data, name) in evals {
-        validate_dataset(params, data, n_features, n_out, name)?;
+        validate_dataset(objective, data, dtrain.n_targets(), n_features, n_out, name)?;
     }
     if params.monotone_constraints.len() > n_features {
         return Err(HessboostError::invalid_param(
@@ -326,8 +337,12 @@ fn train_impl_inner(
     // uniform nonzero margin, as in XGBoost); otherwise the objective estimates
     // them from the labels (XGBoost `InitEstimation`).
     let base_margins = match params.base_score {
-        Some(bs) => vec![objective.prob_to_margin(bs as f32); n_out],
-        None => objective.base_margins(labels, weights, dtrain.group()),
+        Some(bs) => {
+            let mut scores = vec![bs as f32; n_out];
+            objective.probs_to_margins(&mut scores);
+            scores
+        }
+        None => objective.base_margins_info(&info),
     };
     if base_margins.len() != n_out {
         return Err(HessboostError::DimensionMismatch {
@@ -354,6 +369,7 @@ fn train_impl_inner(
             objective_params: ObjectiveParams::from_params(params),
             num_class: params.num_class,
             n_outputs: n_out,
+            n_targets: dtrain.n_targets(),
             n_features,
         },
     );
@@ -375,7 +391,7 @@ fn train_impl_inner(
             &model.initial_margins(dtrain),
             n_out,
             objective,
-        )?;
+        );
         model.set_linear(linear);
         return Ok(TrainResult {
             model,
@@ -400,6 +416,7 @@ fn train_impl_inner(
             &params.eval_metric,
             &objective.default_metric(),
             params.num_class,
+            &ObjectiveParams::from_params(params),
         )?,
     };
 
@@ -428,8 +445,7 @@ fn train_impl_inner(
                 dtrain,
                 &prepared,
                 objective,
-                labels,
-                weights,
+                &info,
                 n,
                 n_out,
                 n_features,
@@ -445,7 +461,7 @@ fn train_impl_inner(
             }
         } else {
             // 1. Gradients from the current margins (all outputs at once).
-            objective.gradient_grouped(&train_margin, labels, weights, dtrain.group(), &mut gpair);
+            objective.gradient_info(&train_margin, &info, &mut gpair);
 
             // 2. Row subsampling is shared across the round's per-output trees.
             let mut rng = round_rng(params, round, 0);
@@ -512,11 +528,10 @@ fn train_impl_inner(
             let mut last_metric_value = 0.0;
             for (ei, (d, name)) in evals.iter().enumerate() {
                 let mut preds = eval_margins[ei].clone();
-                objective.pred_transform(&mut preds);
-                let dl = d.labels().expect("evaluation labels validated");
-                let dw = d.weights();
+                objective.eval_transform(&mut preds);
+                let d_info = d.info();
                 for m in &metrics {
-                    let v = m.eval_grouped(&preds, dl, dw, d.group());
+                    let v = m.eval_info(&preds, &d_info);
                     scores.push((name.to_string(), m.name().to_string(), v));
                     last_metric_value = v;
                 }
@@ -549,6 +564,34 @@ fn train_impl_inner(
     }
 
     Ok(TrainResult { model, history })
+}
+
+/// Refuse configurations the training loop does not act on yet, so a
+/// setting is never accepted and silently ignored. Each clause goes away
+/// with the feature that implements it.
+fn reject_unimplemented(params: &TrainingParams, dtrain: &DMatrix) -> Result<()> {
+    let unsupported = |name: &'static str, reason: &str| {
+        Err(HessboostError::invalid_param(
+            name,
+            format!("{reason} is not implemented"),
+        ))
+    };
+    if params.num_parallel_tree != 1 {
+        return unsupported("num_parallel_tree", "a value other than 1");
+    }
+    if params.sampling_method != SamplingMethod::Uniform {
+        return unsupported("sampling_method", "`gradient_based` sampling");
+    }
+    if params.multi_strategy != MultiStrategy::OneOutputPerTree {
+        return unsupported("multi_strategy", "`multi_output_tree`");
+    }
+    if params.process_type != ProcessType::Default {
+        return unsupported("process_type", "`update`");
+    }
+    if dtrain.feature_weights().is_some() {
+        return unsupported("feature_weights", "feature-weighted column sampling");
+    }
+    Ok(())
 }
 
 /// Add one tree's predictions to one output column. Rows are independent, so
@@ -627,8 +670,7 @@ fn dart_round(
     dtrain: &DMatrix,
     prepared: &Prepared,
     objective: &dyn crate::objective::Objective,
-    labels: &[f32],
-    weights: Option<&[f32]>,
+    info: &MetaInfo,
     n: usize,
     n_out: usize,
     n_features: usize,
@@ -661,7 +703,7 @@ fn dart_round(
 
     // 2. Gradients from the ensemble minus the dropout set.
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
-    objective.gradient_grouped(&margin_excl, labels, weights, dtrain.group(), gpair);
+    objective.gradient_info(&margin_excl, info, gpair);
 
     // 3. Fit one new tree per output on those gradients.
     let row_subset = sample_rows(n, params.subsample, &mut rng);
@@ -776,16 +818,39 @@ fn sample_features(n: usize, colsample: f64, rng: &mut StdRng) -> Vec<u32> {
     idx
 }
 
+/// Shape and metadata checks for the training matrix and every eval set,
+/// followed by the objective's own [`validate_info`] label-domain checks.
+///
+/// [`validate_info`]: crate::objective::Objective::validate_info
 fn validate_dataset(
-    params: &TrainingParams,
+    objective: &dyn crate::objective::Objective,
     data: &DMatrix,
+    n_targets: usize,
     n_features: usize,
     n_out: usize,
     name: &str,
 ) -> Result<()> {
-    let labels = data.labels().ok_or_else(|| {
-        HessboostError::invalid_param("evals", format!("dataset `{name}` has no labels"))
-    })?;
+    match data.labels() {
+        None if objective.requires_labels() => {
+            return Err(HessboostError::invalid_param(
+                "evals",
+                format!("dataset `{name}` has no labels"),
+            ));
+        }
+        None => {}
+        Some(labels) => {
+            let expected = data.n_rows().checked_mul(n_targets).ok_or_else(|| {
+                HessboostError::invalid_param("labels", "expected length overflows usize")
+            })?;
+            if labels.len() != expected {
+                return Err(HessboostError::DimensionMismatch {
+                    what: "labels length (n_rows * training n_targets)",
+                    expected,
+                    got: labels.len(),
+                });
+            }
+        }
+    }
     if data.n_cols() != n_features {
         return Err(HessboostError::DimensionMismatch {
             what: "dataset feature count",
@@ -805,49 +870,29 @@ fn validate_dataset(
             });
         }
     }
-    let invalid = match params.objective.as_str() {
-        // XGBoost `LogisticRegression::CheckLabel` (shared by `binary:logistic`
-        // and `reg:logistic`): probabilities in [0, 1], not only {0, 1}.
-        "binary:logistic" | "reg:logistic" => labels.iter().any(|&y| !(0.0..=1.0).contains(&y)),
-        "multi:softmax" | "multi:softprob" => labels
-            .iter()
-            .any(|&y| y.fract() != 0.0 || y < 0.0 || y >= params.num_class as f32),
-        "count:poisson" | "reg:tweedie" => labels.iter().any(|&y| y < 0.0),
-        "reg:gamma" => labels.iter().any(|&y| y <= 0.0),
-        "rank:ndcg" => labels.iter().any(|&y| !(0.0..=31.0).contains(&y)),
-        "rank:pairwise" | "rank:map" => labels.iter().any(|&y| y < 0.0),
-        _ => false,
-    };
-    if invalid {
-        return Err(HessboostError::invalid_param(
-            "labels",
-            format!("dataset `{name}` has labels outside the objective's valid domain"),
-        ));
-    }
-    if params.objective.starts_with("rank:") && data.group().is_none() {
-        return Err(HessboostError::invalid_param(
-            "group_sizes",
-            format!("ranking dataset `{name}` requires group information"),
-        ));
-    }
-    if params.objective.starts_with("rank:")
-        && let (Some(group), Some(weights)) = (data.group(), data.weights())
-    {
-        for (start, end) in group.iter_ranges() {
-            if weights[start..end]
-                .iter()
-                .any(|weight| *weight != weights[start])
-            {
-                return Err(HessboostError::invalid_param(
-                    "weights",
-                    format!(
-                        "ranking dataset `{name}` requires one constant weight per query group"
-                    ),
-                ));
-            }
+    objective
+        .validate_info(&data.info())
+        .map_err(|error| name_dataset(error, name))
+}
+
+/// Name the offending dataset in a [`validate_info`] error: the first
+/// "dataset" in the reason becomes ``dataset `name` `` (reasons without that
+/// word get a ``dataset `name`: `` prefix).
+///
+/// [`validate_info`]: crate::objective::Objective::validate_info
+fn name_dataset(error: HessboostError, dataset: &str) -> HessboostError {
+    match error {
+        HessboostError::InvalidParameter { name, reason } => {
+            let named = format!("dataset `{dataset}`");
+            let reason = if reason.contains("dataset") {
+                reason.replacen("dataset", &named, 1)
+            } else {
+                format!("{named}: {reason}")
+            };
+            HessboostError::InvalidParameter { name, reason }
         }
+        other => other,
     }
-    Ok(())
 }
 
 /// Build the per-tree column sampler: draw the `colsample_bytree` pool from
@@ -1884,6 +1929,190 @@ mod tests {
         assert!(model.predict(&wrong_features).is_err());
         assert!(model.predict_margin(&wrong_features).is_err());
         assert!(model.predict_leaf(&wrong_features).is_err());
+    }
+
+    /// Label-domain checks run through `Objective::validate_info` for every
+    /// eval set, and the error names the offending dataset.
+    #[test]
+    fn eval_set_label_domain_errors_name_the_dataset() {
+        let d = step_dataset(20);
+        let params = TrainingParams::builder()
+            .objective("binary:logistic")
+            .build()
+            .unwrap();
+        let holdout = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
+            .unwrap()
+            .with_labels(&[0.0, 2.0])
+            .unwrap();
+        match train_with_eval(&params, &d, 2, &[(&holdout, "holdout")], None) {
+            Err(HessboostError::InvalidParameter { name, reason }) => {
+                assert_eq!(name, "labels");
+                assert_eq!(
+                    reason,
+                    "dataset `holdout` has labels outside the objective's valid domain"
+                );
+            }
+            other => panic!("expected a label-domain error, got {other:?}"),
+        }
+    }
+
+    /// Settings the training loop does not act on are refused rather than
+    /// silently ignored.
+    #[test]
+    fn unimplemented_settings_are_rejected() {
+        let d = step_dataset(8);
+        let base = || TrainingParams::builder();
+        let cases = [
+            (
+                "num_parallel_tree",
+                base().num_parallel_tree(2).build_unchecked(),
+            ),
+            (
+                "sampling_method",
+                base()
+                    .sampling_method(SamplingMethod::GradientBased)
+                    .build_unchecked(),
+            ),
+            (
+                "multi_strategy",
+                base()
+                    .multi_strategy(MultiStrategy::MultiOutputTree)
+                    .build_unchecked(),
+            ),
+            (
+                "process_type",
+                base().process_type(ProcessType::Update).build_unchecked(),
+            ),
+        ];
+        for (param, params) in cases {
+            assert!(
+                matches!(
+                    train(&params, &d, 1),
+                    Err(HessboostError::InvalidParameter { name, .. }) if name == param
+                ),
+                "{param}"
+            );
+        }
+        let weighted = d.with_feature_weights(&[1.0]).unwrap();
+        assert!(matches!(
+            train(&TrainingParams::default(), &weighted, 1),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "feature_weights"
+        ));
+    }
+
+    /// Built-in objectives are single-target, and eval sets must carry as
+    /// many label columns as the training matrix.
+    #[test]
+    fn target_count_mismatches_are_rejected() {
+        let d = step_dataset(4);
+        let params = TrainingParams::default();
+        let x: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let two_targets = DMatrix::from_dense(&x, 4, 1)
+            .unwrap()
+            .with_label_matrix(&[0.0; 8], 2)
+            .unwrap();
+        assert!(matches!(
+            train(&params, &two_targets, 1),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+        ));
+        assert!(matches!(
+            train_with_eval(&params, &d, 1, &[(&two_targets, "eval")], None),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+    }
+
+    /// An objective that learns from label bounds only: gradients and the
+    /// intercept come from `MetaInfo`, and no ordinary labels are required.
+    struct BoundsMidpoint;
+
+    impl BoundsMidpoint {
+        fn target(info: &MetaInfo, row: usize) -> f32 {
+            let lo = info.label_lower_bound.expect("validated")[row];
+            let hi = info.label_upper_bound.expect("validated")[row];
+            f32::midpoint(lo, hi)
+        }
+    }
+
+    impl crate::objective::Objective for BoundsMidpoint {
+        fn name(&self) -> &'static str {
+            "test:bounds_midpoint"
+        }
+
+        fn gradient(&self, _: &[f32], _: &[f32], _: Option<&[f32]>, _: &mut [GradPair]) {
+            unreachable!("training must call gradient_info");
+        }
+
+        fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
+            for (row, (p, g)) in preds.iter().zip(out.iter_mut()).enumerate() {
+                *g = GradPair::new(p - Self::target(info, row), 1.0);
+            }
+        }
+
+        fn base_margins(
+            &self,
+            _: &[f32],
+            _: Option<&[f32]>,
+            _: Option<&crate::data::GroupInfo>,
+        ) -> Vec<f32> {
+            unreachable!("training must call base_margins_info");
+        }
+
+        fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+            let sum: f32 = (0..info.n_rows).map(|row| Self::target(info, row)).sum();
+            vec![sum / info.n_rows as f32]
+        }
+
+        fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+            if info.label_lower_bound.is_none() || info.label_upper_bound.is_none() {
+                return Err(HessboostError::invalid_param(
+                    "label_lower_bound",
+                    "dataset has no label bounds",
+                ));
+            }
+            Ok(())
+        }
+
+        fn requires_labels(&self) -> bool {
+            false
+        }
+
+        fn default_metric(&self) -> String {
+            "rmse".to_string()
+        }
+    }
+
+    #[test]
+    fn training_routes_through_metadata_hooks() {
+        let x: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let lower: Vec<f32> = (0..32).map(|i| if i < 16 { 0.0 } else { 4.0 }).collect();
+        let upper: Vec<f32> = lower.iter().map(|lo| lo + 2.0).collect();
+        let d = DMatrix::from_dense(&x, 32, 1)
+            .unwrap()
+            .with_label_bounds(&lower, &upper)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .eta(1.0)
+            .lambda(0.0)
+            .build()
+            .unwrap();
+        let model = train_with_objective(&params, &d, 3, &BoundsMidpoint).unwrap();
+        // Base margin is the mean midpoint (1 and 5 → 3); one full-step tree
+        // then lands every row on its own midpoint.
+        assert_eq!(model.base_score(), 3.0);
+        let preds = model.predict_margin(&d).unwrap();
+        for (row, p) in preds.iter().enumerate() {
+            let expected = if row < 16 { 1.0 } else { 5.0 };
+            assert!((p - expected).abs() < 1e-3, "row {row}: {p}");
+        }
+
+        let unbounded = DMatrix::from_dense(&x, 32, 1).unwrap();
+        match train_with_objective(&params, &unbounded, 1, &BoundsMidpoint) {
+            Err(HessboostError::InvalidParameter { name, reason }) => {
+                assert_eq!(name, "label_lower_bound");
+                assert_eq!(reason, "dataset `dtrain` has no label bounds");
+            }
+            other => panic!("expected validate_info to reject, got {other:?}"),
+        }
     }
 
     #[test]

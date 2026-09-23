@@ -94,6 +94,17 @@ Runnable, self-contained examples live in
   `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), and a user
   **custom-objective hook**. Intercepts are estimated per output exactly as
   XGBoost 3.4.1 does (label mean, class log-frequencies, or a Newton step).
+  Objectives and metrics see a dataset through `MetaInfo` (labels of every
+  target, weights, query groups, and interval-censored label bounds), and
+  each objective validates its own label domain.
+- **Dataset metadata:** labels (`with_labels`, or a row-major multi-target
+  `with_label_matrix`), instance and group weights, `base_margin`, query
+  groups, label bounds for censored targets (`with_label_bounds`), feature
+  types, and per-feature sampling weights (`with_feature_weights`). Every
+  built-in objective is single-target; training rejects multi-target labels,
+  feature weights, and the not-yet-implemented `num_parallel_tree > 1`,
+  `sampling_method = gradient_based`, `multi_strategy = multi_output_tree`,
+  and `process_type = update` instead of ignoring them.
 - **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
   `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
   **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for

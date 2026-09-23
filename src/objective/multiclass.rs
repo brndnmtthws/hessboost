@@ -4,7 +4,9 @@
 //! carries `K` raw margins, laid out `[instance][class]` (row-major). Each round
 //! the trainer grows one tree per class from that class's gradient slice.
 
-use super::{GradPair, MIN_HESS, Objective};
+use super::{GradPair, MIN_HESS, Objective, check_label_domain};
+use crate::data::MetaInfo;
+use crate::error::Result;
 
 /// Multiclass softmax objective. `output_prob` distinguishes `multi:softprob`
 /// (report per-class probabilities) from `multi:softmax` (report the argmax
@@ -91,6 +93,12 @@ impl Objective for SoftmaxObjective {
             *m -= mean;
         }
         margins
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        // Class indices: non-negative integers below `num_class`.
+        let k = self.num_class as f32;
+        check_label_domain(info, |y| y.fract() != 0.0 || y < 0.0 || y >= k)
     }
 
     fn default_metric(&self) -> String {

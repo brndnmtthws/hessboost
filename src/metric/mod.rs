@@ -1,9 +1,11 @@
 //! Evaluation metrics used for reporting and early stopping.
 //!
 //! Metrics receive predictions that have already passed through the objective's
-//! [`crate::objective::Objective::pred_transform`] (so classification metrics
+//! [`crate::objective::Objective::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
+use crate::config::ObjectiveParams;
+use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 
 /// An evaluation metric over predictions and labels.
@@ -32,6 +34,14 @@ pub trait Metric: Send + Sync {
         _group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
         self.eval(preds, labels, weights)
+    }
+
+    /// Evaluate the metric from a dataset's full metadata view; the entry
+    /// point training uses. The default forwards the labels, weights, and
+    /// groups to [`Metric::eval_grouped`]; metrics that read other metadata
+    /// (label bounds, several targets per row) override it.
+    fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        self.eval_grouped(preds, info.labels, info.weights, info.group)
     }
 }
 
@@ -530,8 +540,14 @@ impl Metric for CustomMetric {
     }
 }
 
-/// Resolve a metric by name. `num_class` is used by multiclass metrics.
-pub fn create_metric(name: &str, num_class: usize) -> Result<Box<dyn Metric>> {
+/// Resolve a metric by name. `num_class` is used by multiclass metrics, and
+/// `objective` carries the loss parameters that objective-dependent metrics
+/// read; none of the metrics implemented so far depend on it.
+pub fn create_metric(
+    name: &str,
+    num_class: usize,
+    _objective: &ObjectiveParams,
+) -> Result<Box<dyn Metric>> {
     // Accept the XGBoost `tweedie-nloglik@1.5` suffix form.
     let (base, rho) = match name.split_once('@') {
         Some((b, r)) => (b, r.parse::<f64>().ok()),
@@ -562,18 +578,20 @@ pub fn create_metric(name: &str, num_class: usize) -> Result<Box<dyn Metric>> {
 }
 
 /// Build the list of metrics to evaluate: the user's `eval_metric` list if any,
-/// otherwise the single `default_name` supplied by the objective.
+/// otherwise the single `default_name` supplied by the objective. `num_class`
+/// and `objective` are forwarded to [`create_metric`].
 pub fn create_metrics(
     eval_metric: &[String],
     default_name: &str,
     num_class: usize,
+    objective: &ObjectiveParams,
 ) -> Result<Vec<Box<dyn Metric>>> {
     if eval_metric.is_empty() {
-        Ok(vec![create_metric(default_name, num_class)?])
+        Ok(vec![create_metric(default_name, num_class, objective)?])
     } else {
         eval_metric
             .iter()
-            .map(|n| create_metric(n, num_class))
+            .map(|n| create_metric(n, num_class, objective))
             .collect()
     }
 }
@@ -614,10 +632,11 @@ mod tests {
 
     #[test]
     fn factory_defaults_to_objective_metric() {
-        let ms = create_metrics(&[], "rmse", 0).unwrap();
+        let obj = ObjectiveParams::default();
+        let ms = create_metrics(&[], "rmse", 0, &obj).unwrap();
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].name(), "rmse");
-        assert!(create_metrics(&["nope".to_string()], "rmse", 0).is_err());
+        assert!(create_metrics(&["nope".to_string()], "rmse", 0, &obj).is_err());
     }
 
     #[test]
@@ -698,18 +717,43 @@ mod tests {
 
     #[test]
     fn factory_parses_ranking_metrics_with_k() {
-        assert_eq!(create_metric("ndcg", 0).unwrap().name(), "ndcg");
-        assert_eq!(create_metric("map", 0).unwrap().name(), "map");
+        assert_eq!(
+            create_metric("ndcg", 0, &ObjectiveParams::default())
+                .unwrap()
+                .name(),
+            "ndcg"
+        );
+        assert_eq!(
+            create_metric("map", 0, &ObjectiveParams::default())
+                .unwrap()
+                .name(),
+            "map"
+        );
         // `@k` suffix parses without error.
-        assert_eq!(create_metric("ndcg@5", 0).unwrap().name(), "ndcg");
-        assert_eq!(create_metric("map@10", 0).unwrap().name(), "map");
+        assert_eq!(
+            create_metric("ndcg@5", 0, &ObjectiveParams::default())
+                .unwrap()
+                .name(),
+            "ndcg"
+        );
+        assert_eq!(
+            create_metric("map@10", 0, &ObjectiveParams::default())
+                .unwrap()
+                .name(),
+            "map"
+        );
     }
 
     #[test]
     fn aucpr_perfect_and_ranks_better_than_random() {
         let m = AucPr;
         assert!(m.maximize());
-        assert_eq!(create_metric("aucpr", 0).unwrap().name(), "aucpr");
+        assert_eq!(
+            create_metric("aucpr", 0, &ObjectiveParams::default())
+                .unwrap()
+                .name(),
+            "aucpr"
+        );
 
         // Perfectly separable: all positives scored above all negatives -> ~1.
         let perfect = m.eval(&[0.1, 0.2, 0.8, 0.9], &[0.0, 0.0, 1.0, 1.0], None);

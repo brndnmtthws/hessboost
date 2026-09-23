@@ -53,6 +53,50 @@ impl GroupInfo {
     }
 }
 
+/// Borrowed per-row training metadata handed to objectives and metrics.
+///
+/// Built by [`DMatrix::info`](crate::data::DMatrix::info), or by
+/// [`MetaInfo::new`] for single-target callers that only have labels,
+/// weights, and groups.
+#[derive(Debug, Clone, Copy)]
+pub struct MetaInfo<'a> {
+    /// Number of rows (instances).
+    pub n_rows: usize,
+    /// Labels, row-major `[row][target]` (`n_rows * n_targets`); empty when
+    /// the dataset has no labels.
+    pub labels: &'a [f32],
+    /// Number of targets per row.
+    pub n_targets: usize,
+    /// Per-row weights (`n_rows`), if any.
+    pub weights: Option<&'a [f32]>,
+    /// Ranking groups, if any.
+    pub group: Option<&'a GroupInfo>,
+    /// Lower bounds of interval-censored labels (`n_rows`), if any.
+    pub label_lower_bound: Option<&'a [f32]>,
+    /// Upper bounds of interval-censored labels (`n_rows`), if any.
+    pub label_upper_bound: Option<&'a [f32]>,
+}
+
+impl<'a> MetaInfo<'a> {
+    /// Single-target metadata: `n_rows = labels.len()`, `n_targets = 1`, no
+    /// label bounds.
+    pub fn new(
+        labels: &'a [f32],
+        weights: Option<&'a [f32]>,
+        group: Option<&'a GroupInfo>,
+    ) -> Self {
+        MetaInfo {
+            n_rows: labels.len(),
+            labels,
+            n_targets: 1,
+            weights,
+            group,
+            label_lower_bound: None,
+            label_upper_bound: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

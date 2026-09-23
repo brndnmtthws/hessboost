@@ -100,8 +100,11 @@ pub mod tree;
 /// type, and the objective/metric hooks. This provides everything needed for the
 /// typical train to predict workflow.
 pub mod prelude {
-    pub use crate::config::{BoosterKind, GrowPolicy, Monotone, TrainingParams, TreeMethod};
-    pub use crate::data::{CsvOptions, DMatrix, FeatureType};
+    pub use crate::config::{
+        AftDistribution, BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType,
+        SamplingMethod, TrainingParams, TreeMethod,
+    };
+    pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
     pub use crate::error::{HessboostError, Result};
     pub use crate::learner::{
         BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,

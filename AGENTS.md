@@ -90,6 +90,13 @@ suite; `docs/performance.md` records its results.
   values; `multi:softprob` gives `n_rows * num_class`, row-major. SHAP
   contributions are `[row][n_features + 1]` (bias last), interactions
   `[row][(n_features + 1)^2]`, with an extra output axis for multiclass.
+- **Objective/metric hooks:** training reaches objectives and metrics only
+  through the `MetaInfo` hooks (`Objective::gradient_info`,
+  `base_margins_info`, `eval_transform`, `probs_to_margins`, `validate_info`,
+  `requires_labels`; `Metric::eval_info`). Label-domain checks live in each
+  objective's `validate_info`; `create_objective(params, n_targets)` rejects
+  label matrices an objective cannot model. Parameters the training loop does
+  not act on yet are refused in `train.rs::reject_unimplemented`.
 
 ## Public API at a glance
 
@@ -100,8 +107,9 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 - `train(&params, &dtrain, rounds)`, `train_with_eval(.., &[(&DMatrix, "name")], early_stopping: Option<usize>)`,
   `train_with_objective(.., &dyn Objective)`, `train_with_custom_metric(.., Box<dyn Metric>)`,
   `cv(&params, &data, rounds, nfold, seed)`.
-- `DMatrix::from_dense`/`from_csr`, `.with_labels`/`.with_weights`/`.with_base_margin`/
-  `.with_group_sizes`/`.with_feature_types`; file loaders are `hessboost::data::{load_csv, load_libsvm}`.
+- `DMatrix::from_dense`/`from_csr`, `.with_labels`/`.with_label_matrix`/`.with_label_bounds`/
+  `.with_weights`/`.with_base_margin`/`.with_group_sizes`/`.with_feature_types`/`.with_feature_weights`,
+  `.info()` (`MetaInfo`); file loaders are `hessboost::data::{load_csv, load_libsvm}`.
 - `BoostedModel::predict`/`predict_margin`/`predict_class`/`predict_leaf`/
   `predict_contribs`/`predict_interactions`, `feature_importance`, and
   `save_*`/`load_*` for native binary, JSON, and XGBoost JSON.

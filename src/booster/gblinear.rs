@@ -20,7 +20,6 @@
 
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
-use crate::error::{HessboostError, Result};
 use crate::learner::LinearModel;
 use crate::learner::model::for_each_present_value;
 use crate::objective::{GradPair, Objective};
@@ -64,14 +63,12 @@ pub(crate) fn train_gblinear(
     initial_margin: &[f32],
     n_out: usize,
     objective: &dyn Objective,
-) -> Result<LinearModel> {
+) -> LinearModel {
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
-    let labels = dtrain.labels().ok_or(HessboostError::EmptyDataset(
-        "gblinear: dtrain has no labels",
-    ))?;
-    let weights = dtrain.weights();
-    let group = dtrain.group();
+    // Label presence was validated by the training entry point (only
+    // objectives that `requires_labels` need them).
+    let info = dtrain.info();
 
     let eta = params.eta;
     let lambda = params.lambda;
@@ -103,7 +100,7 @@ pub(crate) fn train_gblinear(
     let mut gpair = vec![GradPair::default(); n * n_out];
 
     for _round in 0..num_round {
-        objective.gradient_grouped(&margin, labels, weights, group, &mut gpair);
+        objective.gradient_info(&margin, &info, &mut gpair);
 
         for k in 0..n_out {
             // 1. Bias (intercept) update: G = Σ g, H = Σ h.
@@ -153,5 +150,5 @@ pub(crate) fn train_gblinear(
         }
     }
 
-    Ok(LinearModel::new(lin_weights, bias))
+    LinearModel::new(lin_weights, bias)
 }

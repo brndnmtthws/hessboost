@@ -67,6 +67,61 @@ pub enum Monotone {
     Decreasing,
 }
 
+/// Noise distribution of the accelerated-failure-time survival loss.
+///
+/// Mirrors XGBoost's `aft_loss_distribution`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AftDistribution {
+    /// Normal (Gaussian) noise. XGBoost default.
+    #[default]
+    Normal,
+    /// Logistic noise.
+    Logistic,
+    /// Type-1 extreme-value (Gumbel minimum) noise.
+    Extreme,
+}
+
+/// How rows are subsampled each round.
+///
+/// Mirrors XGBoost's `sampling_method`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingMethod {
+    /// Every row is kept with probability `subsample`. XGBoost default.
+    #[default]
+    Uniform,
+    /// Rows are kept with probability proportional to their gradient
+    /// magnitude (XGBoost `gradient_based`).
+    GradientBased,
+}
+
+/// How multi-target and multiclass models allocate outputs to trees.
+///
+/// Mirrors XGBoost's `multi_strategy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiStrategy {
+    /// One tree per output each round. XGBoost default.
+    #[default]
+    OneOutputPerTree,
+    /// One tree per round whose leaves hold a vector of all outputs.
+    MultiOutputTree,
+}
+
+/// Whether a round grows new trees or updates existing ones.
+///
+/// Mirrors XGBoost's `process_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessType {
+    /// Grow new trees. XGBoost default.
+    #[default]
+    Default,
+    /// Revisit the trees of an existing model instead of growing new ones.
+    Update,
+}
+
 /// The complete training configuration.
 ///
 /// Construct with [`TrainingParams::builder`] or start from
@@ -107,6 +162,17 @@ pub struct TrainingParams {
     /// by LambdaRank's `topk` pair method. XGBoost
     /// `lambdarank_num_pair_per_sample` (default 32 for `topk`).
     pub lambdarank_num_pair_per_sample: usize,
+    /// Target quantiles for `reg:quantileerror`: non-empty, ascending, each in
+    /// `[0, 1]`. XGBoost `quantile_alpha`.
+    pub quantile_alpha: Vec<f64>,
+    /// Target expectiles for `reg:expectileerror`: non-empty, ascending, each
+    /// in `[0, 1]`. XGBoost `expectile_alpha`.
+    pub expectile_alpha: Vec<f64>,
+    /// Noise distribution for `survival:aft`. XGBoost `aft_loss_distribution`.
+    pub aft_loss_distribution: AftDistribution,
+    /// Scale of the `survival:aft` noise distribution (finite, `> 0`).
+    /// XGBoost `aft_loss_distribution_scale`.
+    pub aft_loss_distribution_scale: f64,
 
     // ---- Tree booster ----
     /// Learning rate / step-size shrinkage. XGBoost `eta` / `learning_rate`.
@@ -153,6 +219,20 @@ pub struct TrainingParams {
     /// feature indices permitted to appear together on a single root-to-leaf path.
     /// XGBoost `interaction_constraints`.
     pub interaction_constraints: Vec<Vec<u32>>,
+    /// Trees grown per output per round (boosted random forests; `>= 1`).
+    /// XGBoost `num_parallel_tree`.
+    pub num_parallel_tree: usize,
+    /// Row subsampling method. XGBoost `sampling_method`.
+    pub sampling_method: SamplingMethod,
+    /// Output-to-tree allocation for multi-output models. XGBoost
+    /// `multi_strategy`.
+    pub multi_strategy: MultiStrategy,
+    /// Grow new trees or update existing ones. XGBoost `process_type`.
+    pub process_type: ProcessType,
+    /// With `process_type = update`, whether the refresh updater also
+    /// rewrites leaf values (not only node statistics). XGBoost
+    /// `refresh_leaf`.
+    pub refresh_leaf: bool,
 
     // ---- DART-specific ----
     /// Fraction of trees to drop each round (DART). XGBoost `rate_drop`.
@@ -178,6 +258,10 @@ impl Default for TrainingParams {
             tweedie_variance_power: 1.5,
             huber_slope: 1.0,
             lambdarank_num_pair_per_sample: 32,
+            quantile_alpha: Vec::new(),
+            expectile_alpha: Vec::new(),
+            aft_loss_distribution: AftDistribution::Normal,
+            aft_loss_distribution_scale: 1.0,
             eta: 0.3,
             gamma: 0.0,
             max_depth: 6,
@@ -196,6 +280,11 @@ impl Default for TrainingParams {
             max_bin: 256,
             monotone_constraints: Vec::new(),
             interaction_constraints: Vec::new(),
+            num_parallel_tree: 1,
+            sampling_method: SamplingMethod::Uniform,
+            multi_strategy: MultiStrategy::OneOutputPerTree,
+            process_type: ProcessType::Default,
+            refresh_leaf: true,
             rate_drop: 0.0,
             skip_drop: 0.0,
             missing: f64::NAN,
@@ -293,6 +382,15 @@ impl TrainingParams {
             self.lambdarank_num_pair_per_sample >= 1,
             "must be >= 1",
         )?;
+        positive(
+            "aft_loss_distribution_scale",
+            self.aft_loss_distribution_scale,
+        )?;
+        ensure(
+            "num_parallel_tree",
+            self.num_parallel_tree >= 1,
+            "must be >= 1",
+        )?;
 
         ensure(
             "max_bin",
@@ -340,6 +438,18 @@ pub struct ObjectiveParams {
     pub huber_slope: f64,
     /// XGBoost `lambdarank_num_pair_per_sample` (`lambdarank_param`).
     pub lambdarank_num_pair_per_sample: usize,
+    /// XGBoost `quantile_alpha` (`reg:quantileerror`).
+    #[serde(default)]
+    pub quantile_alpha: Vec<f64>,
+    /// XGBoost `expectile_alpha` (`reg:expectileerror`).
+    #[serde(default)]
+    pub expectile_alpha: Vec<f64>,
+    /// XGBoost `aft_loss_distribution` (`survival:aft`).
+    #[serde(default)]
+    pub aft_loss_distribution: AftDistribution,
+    /// XGBoost `aft_loss_distribution_scale` (`survival:aft`).
+    #[serde(default = "default_aft_scale")]
+    pub aft_loss_distribution_scale: f64,
 }
 
 impl ObjectiveParams {
@@ -351,6 +461,10 @@ impl ObjectiveParams {
             tweedie_variance_power: p.tweedie_variance_power,
             huber_slope: p.huber_slope,
             lambdarank_num_pair_per_sample: p.lambdarank_num_pair_per_sample,
+            quantile_alpha: p.quantile_alpha.clone(),
+            expectile_alpha: p.expectile_alpha.clone(),
+            aft_loss_distribution: p.aft_loss_distribution,
+            aft_loss_distribution_scale: p.aft_loss_distribution_scale,
         }
     }
 
@@ -376,7 +490,17 @@ impl ObjectiveParams {
             .tweedie_variance_power(self.tweedie_variance_power)
             .huber_slope(self.huber_slope)
             .lambdarank_num_pair_per_sample(self.lambdarank_num_pair_per_sample)
+            .quantile_alpha(self.quantile_alpha.clone())
+            .expectile_alpha(self.expectile_alpha.clone())
+            .aft_loss_distribution(self.aft_loss_distribution)
+            .aft_loss_distribution_scale(self.aft_loss_distribution_scale)
     }
+}
+
+/// Serde default of [`ObjectiveParams::aft_loss_distribution_scale`]
+/// (XGBoost's `1.0`), for models written before the field existed.
+fn default_aft_scale() -> f64 {
+    1.0
 }
 
 impl Default for ObjectiveParams {
@@ -462,6 +586,24 @@ impl TrainingParamsBuilder {
         huber_slope, f64);
     setter!(/// Set LambdaRank's top-k pair count (`lambdarank_num_pair_per_sample`).
         lambdarank_num_pair_per_sample, usize);
+    setter!(/// Set the target quantiles of `reg:quantileerror` (`quantile_alpha`).
+        quantile_alpha, Vec<f64>);
+    setter!(/// Set the target expectiles of `reg:expectileerror` (`expectile_alpha`).
+        expectile_alpha, Vec<f64>);
+    setter!(/// Set the `survival:aft` noise distribution (`aft_loss_distribution`).
+        aft_loss_distribution, AftDistribution);
+    setter!(/// Set the `survival:aft` noise scale (`aft_loss_distribution_scale`).
+        aft_loss_distribution_scale, f64);
+    setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
+        num_parallel_tree, usize);
+    setter!(/// Set the row subsampling method (`sampling_method`).
+        sampling_method, SamplingMethod);
+    setter!(/// Set the multi-output tree strategy (`multi_strategy`).
+        multi_strategy, MultiStrategy);
+    setter!(/// Set whether rounds grow or update trees (`process_type`).
+        process_type, ProcessType);
+    setter!(/// Set whether `process_type = update` refreshes leaf values (`refresh_leaf`).
+        refresh_leaf, bool);
 
     /// Set the objective by name (e.g. `"binary:logistic"`).
     #[must_use]
@@ -591,6 +733,21 @@ mod tests {
                 .build()
                 .is_err()
         );
+        assert!(
+            TrainingParams::builder()
+                .num_parallel_tree(0)
+                .build()
+                .is_err()
+        );
+        for scale in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(
+                TrainingParams::builder()
+                    .aft_loss_distribution_scale(scale)
+                    .build()
+                    .is_err(),
+                "scale {scale}"
+            );
+        }
     }
 
     /// XGBoost injects `max_delta_step = 0.7` for `count:poisson` only when
@@ -609,6 +766,60 @@ mod tests {
             .unwrap();
         assert_eq!(zero.effective_max_delta_step(), 0.0);
         assert_eq!(TrainingParams::default().effective_max_delta_step(), 0.0);
+    }
+
+    /// The roadmap parameters take XGBoost's names on the wire, so JSON
+    /// configurations written for XGBoost deserialize unchanged, and a
+    /// configuration that omits them gets XGBoost's defaults.
+    #[test]
+    fn roadmap_params_use_xgboost_spellings_and_defaults() {
+        let p: TrainingParams = serde_json::from_str(
+            r#"{"aft_loss_distribution": "extreme", "sampling_method": "gradient_based",
+                "multi_strategy": "multi_output_tree", "process_type": "update",
+                "refresh_leaf": false, "num_parallel_tree": 4,
+                "quantile_alpha": [0.1, 0.9]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.aft_loss_distribution, AftDistribution::Extreme);
+        assert_eq!(p.sampling_method, SamplingMethod::GradientBased);
+        assert_eq!(p.multi_strategy, MultiStrategy::MultiOutputTree);
+        assert_eq!(p.process_type, ProcessType::Update);
+        assert!(!p.refresh_leaf);
+        assert_eq!(p.num_parallel_tree, 4);
+        assert_eq!(p.quantile_alpha, vec![0.1, 0.9]);
+
+        let d: TrainingParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(d.aft_loss_distribution, AftDistribution::Normal);
+        assert_eq!(d.aft_loss_distribution_scale, 1.0);
+        assert_eq!(d.num_parallel_tree, 1);
+        assert_eq!(d.sampling_method, SamplingMethod::Uniform);
+        assert_eq!(d.multi_strategy, MultiStrategy::OneOutputPerTree);
+        assert_eq!(d.process_type, ProcessType::Default);
+        assert!(d.refresh_leaf);
+        assert!(d.quantile_alpha.is_empty() && d.expectile_alpha.is_empty());
+        d.validate().unwrap();
+    }
+
+    /// A trained model rebuilds its objective from `ObjectiveParams`, so the
+    /// objective-specific parameters must survive the snapshot/restore trip.
+    #[test]
+    fn objective_params_round_trip_roadmap_fields() {
+        let p = TrainingParams::builder()
+            .objective("survival:aft")
+            .quantile_alpha(vec![0.25, 0.75])
+            .expectile_alpha(vec![0.5])
+            .aft_loss_distribution(AftDistribution::Logistic)
+            .aft_loss_distribution_scale(1.7)
+            .build_unchecked();
+        let snapshot = ObjectiveParams::from_params(&p);
+        let restored = snapshot
+            .training_params("survival:aft", 0)
+            .build_unchecked();
+        assert_eq!(restored.quantile_alpha, vec![0.25, 0.75]);
+        assert_eq!(restored.expectile_alpha, vec![0.5]);
+        assert_eq!(restored.aft_loss_distribution, AftDistribution::Logistic);
+        assert_eq!(restored.aft_loss_distribution_scale, 1.7);
+        assert_eq!(ObjectiveParams::from_params(&restored), snapshot);
     }
 
     #[test]

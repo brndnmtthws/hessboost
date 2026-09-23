@@ -287,6 +287,22 @@ pub struct TrainingParams {
     /// Probability of skipping dropout in a round (DART). XGBoost `skip_drop`.
     pub skip_drop: f64,
 
+    // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
+    /// Penalty `ι` subtracted from the loss change of a split on a feature the
+    /// ensemble does not use yet (Herrmann et al., *Boosted Trees on a Diet*,
+    /// ICLR 2026, eq. 3). Same units as [`gamma`](Self::gamma); `0` (the
+    /// default) disables it. Pair with
+    /// [`BoostedModel::to_compact_bytes`](crate::learner::BoostedModel::to_compact_bytes),
+    /// whose dictionaries shrink as features and thresholds are reused. The
+    /// paper's `toad_penalty_feature`.
+    pub toad_penalty_feature: f64,
+    /// Penalty `ξ` subtracted from the loss change of a split at a threshold
+    /// (or categorical left set) not yet used for its feature anywhere in the
+    /// ensemble; a new feature pays both penalties. Same units as
+    /// [`gamma`](Self::gamma); `0` (the default) disables it. The paper's
+    /// `toad_penalty_threshold`.
+    pub toad_penalty_threshold: f64,
+
     // ---- Missing value ----
     /// Value treated as "missing" in dense inputs. Defaults to NaN, like XGBoost.
     pub missing: f64,
@@ -339,6 +355,8 @@ impl Default for TrainingParams {
             linear_lambda: 0.0,
             rate_drop: 0.0,
             skip_drop: 0.0,
+            toad_penalty_feature: 0.0,
+            toad_penalty_threshold: 0.0,
             missing: f64::NAN,
         }
     }
@@ -403,6 +421,14 @@ impl TrainingParams {
         unit("colsample_bynode", self.colsample_bynode)?;
         unit("rate_drop", self.rate_drop)?;
         unit("skip_drop", self.skip_drop)?;
+        non_negative("toad_penalty_feature", self.toad_penalty_feature)?;
+        non_negative("toad_penalty_threshold", self.toad_penalty_threshold)?;
+        ensure(
+            "toad_penalty_feature",
+            self.booster != BoosterKind::GbLinear
+                || (self.toad_penalty_feature == 0.0 && self.toad_penalty_threshold == 0.0),
+            "reuse penalties need a tree booster (`gbtree` or `dart`)",
+        )?;
 
         if let Some(base_score) = self.base_score {
             ensure("base_score", base_score.is_finite(), "must be finite")?;
@@ -746,6 +772,10 @@ impl TrainingParamsBuilder {
         linear_tree, bool);
     setter!(/// Set the L2 penalty on leaf linear-model slopes (`linear_lambda`).
         linear_lambda, f64);
+    setter!(/// Set the new-feature reuse penalty `ι` (`toad_penalty_feature`).
+        toad_penalty_feature, f64);
+    setter!(/// Set the new-threshold reuse penalty `ξ` (`toad_penalty_threshold`).
+        toad_penalty_threshold, f64);
 
     /// Set the objective by name (e.g. `"binary:logistic"`).
     #[must_use]

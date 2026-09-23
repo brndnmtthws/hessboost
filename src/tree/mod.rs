@@ -8,6 +8,7 @@ pub mod hist;
 pub mod linear;
 pub(crate) mod oblivious;
 mod regtree;
+pub(crate) mod reuse;
 pub mod sampler;
 
 pub use gain::{GradStats, RegParams, calc_gain, calc_weight};

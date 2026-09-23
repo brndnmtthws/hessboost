@@ -53,7 +53,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist}`, `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation, `compact` (prediction layout, constant leaves only) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,oblivious}` (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation, `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `sampling` (gradient-based/MVS row sampling per tree), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
@@ -70,8 +70,8 @@ suite; `docs/performance.md` records its results.
   (`HessboostError`). No `unwrap`/`expect` on user-controlled input in library
   code.
 - **Determinism:** identical params, data, and seed give identical
-  predictions (property-tested), and the hist builder grows the same tree
-  serially and in parallel. Parallel reductions keep a fixed order.
+  predictions (property-tested), and the hist builder (every grow policy)
+  grows the same tree serially and in parallel. Parallel reductions keep a fixed order.
 - **Unsafe:** confined to `simd/` and the hot loops in `tree/compact.rs`,
   `tree/hist/`, and `tree/builder/hist.rs`. Every block needs a `// SAFETY:`
   comment (`undocumented_unsafe_blocks`); `unsafe_op_in_unsafe_fn` is
@@ -139,6 +139,8 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 Multiclass objectives need `.num_class(k)`; ranking objectives need
 `.with_group_sizes`; multi-target training takes `.with_label_matrix(y, k)`
 and gives `k` outputs (`multi_strategy = one_output_per_tree`).
+`GrowPolicy::Symmetric` (opt-in, beyond XGBoost) needs `hist`/`approx`,
+numerical features, and `1 <= max_depth <= config::MAX_SYMMETRIC_DEPTH`.
 
 Opt-in LightGBM tree options (`extra_trees`/`extra_seed`, `path_smooth`,
 `linear_tree`/`linear_lambda`) require the histogram builder and are refused

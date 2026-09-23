@@ -324,6 +324,35 @@ access. Categorical splits and trees deeper than 16 levels use an early-exit
 walk. The kernel runs at roughly six instructions per cycle on a Neoverse V3
 and is bound by instruction issue, not memory.
 
+#### Symmetric trees
+
+Trees in which every internal node of a level carries the same split (grown
+with `grow_policy = symmetric`, or any imported tree of that shape) skip the
+node walk for full sixteen-row groups. The layout records each level's split
+as one `(slot, key)` compare and a `2^depth` table of leaf ids and values
+indexed by the bit pattern of the level outcomes (root most significant);
+collapsed subtrees fill every slot below them. A level is one contiguous
+16-lane key load compared against a single threshold, which vectorizes and
+carries no dependent load chain. The compares and the leaves reached are the
+generic walk's, so margins and leaf indices are bit-identical (unit-tested);
+tail rows, single-row batches, trees shallower than two levels or deeper than
+16, and tables that would exceed four slots per leaf keep the generic walk.
+
+`cargo bench --bench training -- predict_100k` predicts 100,000 × 30 rows with
+100 depth-6 trees (`eta = 0.1`, other parameters default). Criterion medians
+on a 192-core **Neoverse V3**, Rust 1.98.1, 2026-09-23, `RAYON_NUM_THREADS`
+fixed per row. The middle column is the same symmetric model with the table
+path disabled (a one-line local change), isolating the kernel:
+
+| Threads | Depthwise model (ms) | Symmetric model, generic walk (ms) | Symmetric model, bit pattern (ms) | Speedup, same model |
+|---:|---:|---:|---:|---:|
+| 1 | 132.13 | 99.64 | 13.37 | 7.5× |
+| 16 | 8.63 | 6.57 | 1.03 | 6.4× |
+| 192 | 1.66 | 1.42 | 0.70 | 2.0× |
+
+At full width the per-block row loading and scheduling, which both paths
+share, dominate.
+
 TreeSHAP walks each tree with a preallocated path arena instead of cloning the
 decision path at every fork, precomputes each node's cover fraction, reads the
 instance as a dense row, hoists the per-element divisions out of the

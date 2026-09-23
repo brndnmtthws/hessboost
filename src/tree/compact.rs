@@ -30,8 +30,13 @@
 //!
 //! Leaf ids are arena indices, and [`CompactForest::original_id`] maps them back
 //! to [`RegTree`] node ids for `predict_leaf`.
+//!
+//! Symmetric trees (one split per level) are additionally indexed by
+//! [`SymmetricTables`], whose bit-pattern walk replaces the per-node walk for
+//! full lane groups and reaches the same arena leaves.
 
 use crate::tree::RegTree;
+use crate::tree::oblivious::{ArenaNode, SymmetricTables};
 
 /// Rows (or trees) walked in lockstep by the fixed-depth kernel.
 pub(crate) const LANES: usize = 16;
@@ -175,6 +180,7 @@ pub(crate) struct CompactForest {
     /// Every tree's category pool, concatenated, so node ranges are absolute.
     categories: Vec<u32>,
     trees: Vec<TreeMeta>,
+    symmetric: SymmetricTables,
 }
 
 impl CompactForest {
@@ -185,6 +191,7 @@ impl CompactForest {
             orig_id: Vec::with_capacity(total),
             categories: Vec::new(),
             trees: Vec::with_capacity(trees.len()),
+            symmetric: SymmetricTables::default(),
         };
         for tree in trees {
             forest.push_tree(tree);
@@ -289,6 +296,27 @@ impl CompactForest {
             has_categorical,
             max_feature,
         });
+        let nodes = &self.nodes;
+        self.symmetric.push(base, |id| {
+            let node = &nodes[id as usize];
+            if Self::is_leaf(node, id) {
+                ArenaNode::Leaf(f32::from_bits(node.aux))
+            } else if node.aux & CATEGORICAL != 0 {
+                ArenaNode::Other
+            } else {
+                ArenaNode::Numeric {
+                    slot: node.slot,
+                    key: node.key,
+                    first: node.left,
+                }
+            }
+        });
+    }
+
+    /// Whether tree `t` is walked by bit pattern ([`SymmetricTables`]).
+    #[cfg(test)]
+    pub(crate) fn is_symmetric(&self, t: usize) -> bool {
+        self.symmetric.get(t).is_some()
     }
 
     /// Leaf value of arena node `id` (must be a leaf).
@@ -440,7 +468,10 @@ impl CompactForest {
             "row block holds fewer rows than requested"
         );
         let meta = self.trees[t];
-        if meta.lockstep_ok() {
+        if let Some(symmetric) = self.symmetric.get(t) {
+            meta.check_width(n_cols);
+            symmetric.walk(lanes, groups, group_len, &mut sink);
+        } else if meta.lockstep_ok() {
             meta.check_width(n_cols);
             let nodes = &self.nodes[..];
             let root = meta.root as usize;
@@ -530,6 +561,25 @@ impl CompactForest {
         stride: usize,
     ) {
         assert!(rows == 0 || out.len() > (rows - 1) * stride);
+        if let Some(symmetric) = self.symmetric.get(t) {
+            let groups = rows / LANES;
+            assert!(
+                lanes.len() >= groups * FEATURE_LANES * n_cols
+                    && tail.len() >= (rows - groups * LANES) * n_cols,
+                "row block holds fewer rows than requested"
+            );
+            self.trees[t].check_width(n_cols);
+            symmetric.accumulate(lanes, groups, FEATURE_LANES * n_cols, weight, out, stride);
+            for (i, row) in tail
+                .chunks_exact(n_cols)
+                .take(rows - groups * LANES)
+                .enumerate()
+            {
+                out[(groups * LANES + i) * stride] +=
+                    weight * self.leaf_value(self.leaf_id(t, row));
+            }
+            return;
+        }
         let nodes = &self.nodes[..];
         self.walk_block(t, lanes, tail, n_cols, rows, |r, leaf| {
             // SAFETY: `r < rows` (asserted above against `out`) and `leaf` is

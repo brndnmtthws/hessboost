@@ -6,6 +6,7 @@ pub mod constraints;
 pub mod gain;
 pub mod hist;
 pub mod linear;
+pub(crate) mod oblivious;
 mod regtree;
 pub mod sampler;
 

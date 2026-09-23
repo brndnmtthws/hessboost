@@ -470,6 +470,33 @@ fn bench_train(c: &mut Criterion) {
     group.finish();
 }
 
+/// Batch prediction on 100k x 30 rows: a symmetric model (bit-pattern
+/// tables) against a depthwise model of the same depth and size (generic
+/// lockstep walk).
+fn bench_predict(c: &mut Criterion) {
+    let data = make_data(100_000, 30);
+    let mut group = c.benchmark_group("predict_100k_x30_100trees_depth6");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(data.n_rows() as u64));
+    for (name, policy) in [
+        ("depthwise", GrowPolicy::DepthWise),
+        ("symmetric", GrowPolicy::Symmetric),
+    ] {
+        let params = TrainingParams::builder()
+            .tree_method(TreeMethod::Hist)
+            .grow_policy(policy)
+            .max_depth(6)
+            .eta(0.1)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 100).unwrap();
+        group.bench_function(name, |b| {
+            b.iter(|| model.predict_margin(black_box(&data)).unwrap());
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_histogram_build,
@@ -480,6 +507,7 @@ criterion_group!(
     bench_log_metrics,
     bench_multiclass_metrics,
     bench_binary_train,
-    bench_train
+    bench_train,
+    bench_predict
 );
 criterion_main!(benches);

@@ -196,6 +196,18 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `predict_interactions` (TreeSHAP is undefined for linear leaves; LightGBM
   refuses too). All three are off by default and leave default training
   bit-identical.
+- **Symmetric (oblivious) trees** (`grow_policy = symmetric`, hist/approx):
+  CatBoost-style level-wise growth where every node of a level shares one
+  split (feature, threshold, missing direction), chosen to maximize the gain
+  summed over the level. `lambda`, `alpha`, `max_delta_step`, monotone and
+  interaction constraints apply per node; a node whose share of the level split
+  fails `min_child_weight`, `gamma`, or a monotone constraint stays a leaf.
+  Numerical features only; `max_depth` in `1..=16`. The trees are ordinary
+  trees, so SHAP and XGBoost JSON/UBJSON export work unchanged (XGBoost 3.4.2
+  loads them). Batch prediction recognizes symmetric trees and routes rows by
+  the bit pattern of their level comparisons: margins are bit-identical to the
+  generic walk, which is 7.5× slower on one core for 100 depth-6 trees (see
+  `docs/performance.md`).
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.

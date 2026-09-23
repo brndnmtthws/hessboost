@@ -61,7 +61,10 @@
 //!   for categorical columns ([`data::OrderedTargetEncoder`]); LightGBM tree
 //!   options `extra_trees`, `path_smooth`, and `linear_tree` leaves
 //!   ([`config::TrainingParams::extra_trees`], [`config::TrainingParams::path_smooth`],
-//!   [`config::TrainingParams::linear_tree`], [`tree::linear`]).
+//!   [`config::TrainingParams::linear_tree`], [`tree::linear`]); and
+//!   CatBoost-style symmetric (oblivious) trees
+//!   ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), which batch
+//!   prediction routes by bit pattern.
 //!
 //! ## Where to look
 //!

@@ -74,6 +74,21 @@ Runnable, self-contained examples live in
 | `custom_objective` | custom loss and custom eval-metric hooks |
 | `constraints` | monotone + interaction constraints and categorical features |
 | `train_regression` | end-to-end regression with feature importance |
+| `pfn_boost` | boosting from a pretrained prior's logits via `base_margin` (PFN-Boost) |
+
+### Boosting from a pretrained prior
+
+PFN-Boost and LLM-Boost ([Jayawardhana et al., 2025](https://arxiv.org/abs/2502.02672))
+seed a GBDT with the per-row logits of a pretrained transformer (TabPFN or an
+LLM) so the trees learn the residual of that prior: the initial margin is
+`s * score + C` instead of a constant, with the scale `s` tuned on validation
+data (`s = 0` is plain boosting). In hessboost that margin is
+`DMatrix::with_base_margin`, attached to the train, eval, **and** test
+matrices: `base_margin` replaces the model intercept and is not saved with the
+model, so predicting on a matrix without it falls back to the intercept. The
+`pfn_boost` example runs the method against boosting from scratch across
+training-set sizes with a stand-in prior, or on TabPFN logits exported from
+Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 
 ## Feature status
 

@@ -1,6 +1,7 @@
 //! Top-level orchestration: the boosting loop, the trained model, prediction,
-//! and feature importance.
+//! feature importance, and conformal prediction intervals.
 
+pub mod conformal;
 mod cv;
 pub(crate) mod model;
 mod shap;

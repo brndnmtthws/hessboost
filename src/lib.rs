@@ -52,6 +52,11 @@
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON model import/export ([`crate::model`]).
 //! - **Validation:** cross-validation ([`cv`]).
+//! - **Uncertainty:** split-conformal and conformalized-quantile prediction
+//!   intervals with finite-sample marginal coverage
+//!   ([`SplitConformal`](prelude::SplitConformal),
+//!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
+//!   [`learner::conformal`]).
 //!
 //! ## Where to look
 //!
@@ -61,7 +66,7 @@
 //!   XGBoost parameter names), [`BoostedModel`] (trained model).
 //! - Runnable examples in the crate's `examples/` directory (e.g.
 //!   `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//!   `custom_objective`, `constraints`). Run one with
+//!   `custom_objective`, `constraints`, `conformal`). Run one with
 //!   `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -106,6 +111,7 @@ pub mod prelude {
     };
     pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
     pub use crate::error::{HessboostError, Result};
+    pub use crate::learner::conformal::{ConformalizedQuantile, SplitConformal};
     pub use crate::learner::{
         BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,
         train_with_eval, train_with_objective,

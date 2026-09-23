@@ -53,9 +53,9 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout), `reuse` (opt-in Trees-on-a-Diet feature/threshold reuse penalties) |
 | `booster/` | `gblinear` |
-| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
+| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals), `compact_model` (bit-packed Trees-on-a-Diet format, `CompactModel`) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
@@ -84,8 +84,11 @@ suite; `docs/performance.md` records its results.
   3.4.1). `exact`-tier fixtures match pointwise; RNG-driven cases
   (subsampling, DART) only match within a quality band because the RNG
   streams differ.
-- **Formats:** the native binary magic (`SQB\0`) and the JSON layouts are
-  compatibility contracts; do not change them without a migration.
+- **Formats:** the native binary magic (`SQB\0`), the JSON layouts and the
+  compact layout (`HBTD`, version byte, documented in
+  `learner/compact_model.rs`) are compatibility contracts; do not change them
+  without a migration. The compact metadata embeds `ObjectiveParams` as
+  postcard, so changing that struct changes the compact format too.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`
   values; `multi:softprob` gives `n_rows * num_class`, row-major. SHAP
   contributions are `[row][n_features + 1]` (bias last), interactions
@@ -114,6 +117,10 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
   `predict_contribs`/`predict_interactions`, `feature_importance`, and
   `save_*`/`load_*` for native binary, JSON, XGBoost JSON, and XGBoost UBJSON
   (`*_xgboost_ubjson`).
+- `model.to_compact_bytes()` / `model.to_compact()` → `CompactModel` (`from_bytes`,
+  `predict_margin` bit-identical to the source model, `predict`), `model.size_report()`
+  → `ModelSizeReport`; train with `toad_penalty_feature`/`toad_penalty_threshold` to
+  shrink its dictionaries.
 - `SplitConformal::calibrate(&model, &dcal, alpha)` and
   `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)`,
   then `.predict_interval(&data)` → `Vec<(lower, upper)>`.

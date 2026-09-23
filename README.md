@@ -77,6 +77,7 @@ Runnable, self-contained examples live in
 | `conformal` | split-conformal and conformalized-quantile (CQR) prediction intervals |
 | `pfn_boost` | boosting from a pretrained prior's logits via `base_margin` (PFN-Boost) |
 | `ordered_target_stats` | opt-in CatBoost-style ordered target statistics for a high-cardinality categorical |
+| `compact_model` | opt-in feature/threshold reuse penalties and the bit-packed compact model layout (Trees on a Diet) |
 
 ### Boosting from a pretrained prior
 
@@ -161,6 +162,25 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   categories to the prior, and is serde-serializable. Regression and binary
   labels; dense and CSR input. Never used unless called; native categorical
   splits and training defaults are unchanged.
+- **Compact models** ("Trees on a Diet", [Herrmann et al., ICLR 2026](https://arxiv.org/abs/2510.26557)):
+  `toad_penalty_feature` (`ι`) and `toad_penalty_threshold` (`ξ`) subtract a
+  penalty from the loss change of every split candidate that uses a feature,
+  or a threshold of a feature, not yet used anywhere in the ensemble
+  (`Δ − s_f·ι − s_t·ξ`, in `gamma`'s units; hist, approx and exact
+  builders). `BoostedModel::to_compact_bytes` / `CompactModel` store any tree
+  ensemble in the paper's layout: a used-feature map, per-feature threshold
+  dictionaries at the narrowest exact width (1–32-bit integers, binary16 or
+  binary32), a global leaf-value table and pointer-free heap trees (a
+  preorder layout for deep unbalanced trees) with bit-packed references. `CompactModel::predict_margin` is bit-identical to
+  the source model; `BoostedModel::size_report` compares native and compact
+  bytes. Both default off; XGBoost cannot read the compact format. On the
+  `compact_model` example (binary classification, 16 sensor features, 100
+  depth-3 trees, 8000 rows) the compact layout alone is 5.4x smaller than
+  the native format (6262 vs 33844 bytes, 94.98% test accuracy);
+  `ι = ξ = 4` keeps accuracy (95.05%) with 9 of 16 features and 67 instead
+  of 379 thresholds at 5096 bytes (6.6x), and `ι = ξ = 16` reaches 7.0x
+  (4868 bytes, 93.75%). The `f32` leaf table (one value per leaf) bounds
+  the savings.
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.

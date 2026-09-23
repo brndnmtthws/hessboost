@@ -15,6 +15,7 @@ use crate::tree::RegTree;
 use crate::tree::builder::{
     ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows,
 };
+use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -36,7 +37,9 @@ enum Prepared {
 }
 
 impl Prepared {
-    /// Grow one tree for this round's gradients and samples.
+    /// Grow one tree for this round's gradients and samples. With reuse
+    /// penalties (`reuse` is `Some`) the split search is penalized by the
+    /// ensemble's dictionary, which the new tree's splits then extend.
     fn build_tree(
         &self,
         params: &TrainingParams,
@@ -44,14 +47,18 @@ impl Prepared {
         gpair: &[GradPair],
         rows: &[u32],
         sampler: &mut ColumnSampler,
+        reuse: Option<&mut ReuseSet>,
     ) -> RegTree {
-        match self {
-            Prepared::Exact(cols) => {
-                ExactTreeBuilder::new(params).build(cols, dtrain, gpair, rows, sampler)
-            }
-            Prepared::Hist(ghist) => {
-                HistTreeBuilder::new(params).build(ghist, gpair, rows, sampler)
-            }
+        let hist = |ghist: &GHistIndex, reuse: Option<&ReuseSet>, sampler: &mut ColumnSampler| {
+            HistTreeBuilder::new(params)
+                .with_reuse(reuse, ghist.cuts())
+                .build(ghist, gpair, rows, sampler)
+        };
+        let tree = match self {
+            Prepared::Exact(cols) => ExactTreeBuilder::new(params)
+                .with_reuse(reuse.as_deref())
+                .build(cols, dtrain, gpair, rows, sampler),
+            Prepared::Hist(ghist) => hist(ghist, reuse.as_deref(), sampler),
             Prepared::Approx { const_hess, cached } => {
                 let bin = || {
                     let hessians: Vec<f32> = gpair.iter().map(|g| g.hess).collect();
@@ -64,17 +71,16 @@ impl Prepared {
                     GHistIndex::from_dmatrix(dtrain, cuts)
                 };
                 if *const_hess {
-                    HistTreeBuilder::new(params).build(
-                        cached.get_or_init(bin),
-                        gpair,
-                        rows,
-                        sampler,
-                    )
+                    hist(cached.get_or_init(bin), reuse.as_deref(), sampler)
                 } else {
-                    HistTreeBuilder::new(params).build(&bin(), gpair, rows, sampler)
+                    hist(&bin(), reuse.as_deref(), sampler)
                 }
             }
+        };
+        if let Some(reuse) = reuse {
+            reuse.record_tree(&tree);
         }
+        tree
     }
 }
 
@@ -400,6 +406,9 @@ fn train_impl_inner(
     }
 
     let prepared = prepare_builder(params, dtrain, objective.const_hess())?;
+    // Opt-in reuse penalties: the features and thresholds the ensemble already
+    // uses, extended by every tree the loop grows. `None` on the default path.
+    let mut reuse = ReuseSet::from_params(params, n_features, model.trees());
 
     // Incremental margin caches (length rows × n_out). A dataset's per-instance
     // `base_margin`, when present, overrides the per-output intercepts.
@@ -452,6 +461,7 @@ fn train_impl_inner(
                 round,
                 &mut gpair,
                 &mut gpair_k,
+                reuse.as_mut(),
             );
             // DART rescales earlier trees' weights each round, so the cached
             // Eval margins are no longer additive. Recompute them from the
@@ -485,7 +495,11 @@ fn train_impl_inner(
                             k as u64,
                         );
                         let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
+                            .with_reuse(reuse.as_ref(), ghist.cuts())
                             .build_with_leaf_rows(ghist, gk, &row_subset, &mut sampler);
+                        if let Some(reuse) = reuse.as_mut() {
+                            reuse.record_tree(&tree);
+                        }
                         tree.scale_leaves(params.eta as f32);
                         (tree, leaf_rows)
                     }
@@ -502,6 +516,7 @@ fn train_impl_inner(
                             round,
                             &row_subset,
                             n_features,
+                            reuse.as_mut(),
                         ),
                         Vec::new(),
                     ),
@@ -677,6 +692,7 @@ fn dart_round(
     round: usize,
     gpair: &mut [GradPair],
     gpair_k: &mut [GradPair],
+    mut reuse: Option<&mut ReuseSet>,
 ) {
     let mut rng = round_rng(params, round, 0x0DA27);
 
@@ -722,6 +738,7 @@ fn dart_round(
             round,
             &row_subset,
             n_features,
+            reuse.as_deref_mut(),
         );
         model.push_tree_weighted(tree, new_weight);
     }
@@ -782,10 +799,11 @@ fn fit_output_tree(
     round: usize,
     row_subset: &[u32],
     n_features: usize,
+    reuse: Option<&mut ReuseSet>,
 ) -> RegTree {
     let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
     let mut sampler = make_column_sampler(n_features, params, rng, round as u64, k as u64);
-    let mut tree = prepared.build_tree(params, dtrain, gk, row_subset, &mut sampler);
+    let mut tree = prepared.build_tree(params, dtrain, gk, row_subset, &mut sampler, reuse);
     tree.scale_leaves(params.eta as f32);
     tree
 }

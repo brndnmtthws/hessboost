@@ -58,7 +58,11 @@
 //!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
 //!   [`learner::conformal`]).
 //! - **Beyond XGBoost (opt-in):** CatBoost-style ordered target statistics
-//!   for categorical columns ([`data::OrderedTargetEncoder`]).
+//!   for categorical columns ([`data::OrderedTargetEncoder`]); compact
+//!   models after *Boosted Trees on a Diet*: feature/threshold reuse
+//!   penalties (`toad_penalty_feature`, `toad_penalty_threshold`) and a
+//!   bit-packed layout predicting bit-identical margins
+//!   ([`learner::compact_model`]).
 //!
 //! ## Where to look
 //!
@@ -68,7 +72,7 @@
 //!   XGBoost parameter names), [`BoostedModel`] (trained model).
 //! - Runnable examples in the crate's `examples/` directory (e.g.
 //!   `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//!   `custom_objective`, `constraints`, `conformal`). Run one with
+//!   `custom_objective`, `constraints`, `conformal`, `compact_model`). Run one with
 //!   `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -113,6 +117,7 @@ pub mod prelude {
     };
     pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
     pub use crate::error::{HessboostError, Result};
+    pub use crate::learner::compact_model::{CompactModel, ModelSizeReport};
     pub use crate::learner::conformal::{ConformalizedQuantile, SplitConformal};
     pub use crate::learner::{
         BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,

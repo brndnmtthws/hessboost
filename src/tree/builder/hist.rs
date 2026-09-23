@@ -20,6 +20,7 @@ use crate::tree::hist::{
     BinIndex, CpuBackend, Histogram, HistogramBackend, subtract_in_place, zeroed,
 };
 use crate::tree::regtree::RegTree;
+use crate::tree::reuse::{CategoricalPenalty, HistReuse, ReuseSet};
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -100,6 +101,9 @@ pub struct HistTreeBuilder<'a> {
     /// interact with itself.
     interaction_sets: Option<Vec<Vec<u32>>>,
     backend: CpuBackend,
+    /// Opt-in reuse penalties (`toad_penalty_*`), projected onto the bins of
+    /// the index this builder grows on. `None` on the default path.
+    reuse: Option<HistReuse>,
 }
 
 impl<'a> HistTreeBuilder<'a> {
@@ -111,7 +115,19 @@ impl<'a> HistTreeBuilder<'a> {
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
             backend: CpuBackend,
+            reuse: None,
         }
+    }
+
+    /// Penalize candidates by the reuse penalties of `set` (the ensemble's
+    /// used features and thresholds; `None` keeps the default gain). `cuts`
+    /// must be the cuts of every index this builder grows on. Splits the
+    /// builder commits extend its own copy, so later nodes (and later trees
+    /// grown by this builder) reuse them for free.
+    #[must_use]
+    pub(crate) fn with_reuse(mut self, set: Option<&ReuseSet>, cuts: &HistCuts) -> Self {
+        self.reuse = set.map(|set| HistReuse::new(set, cuts, BELOW_ALL_VALUES));
+        self
     }
 
     /// Grow one tree from the binned dataset.
@@ -152,6 +168,7 @@ impl<'a> HistTreeBuilder<'a> {
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
         let total_bins = ghist.total_bins();
+        debug_assert!(self.reuse.as_ref().is_none_or(|r| r.n_bins() == total_bins));
 
         let root_stats = sum_rows(gpair, row_subset);
         let mut root_hist = zeroed(total_bins);
@@ -337,6 +354,13 @@ impl<'a> HistTreeBuilder<'a> {
             )
         };
         tree.set_split_gain(entry.nid, b.loss_chg as f32);
+        if let Some(reuse) = &self.reuse {
+            if b.is_categorical {
+                reuse.commit_categorical(b.feature, &b.cat_left);
+            } else {
+                reuse.commit_numeric(b.feature, b.split_bin);
+            }
+        }
         debug_assert_eq!(left_id, store.stats.len());
         store.push(b.left, lb_bounds);
         store.push(b.right, rb_bounds);
@@ -543,6 +567,7 @@ impl<'a> HistTreeBuilder<'a> {
                     constrained,
                     &self.reg,
                     f,
+                    self.reuse.as_ref().map(|r| r as &dyn CategoricalPenalty),
                 );
                 continue;
             }
@@ -552,9 +577,12 @@ impl<'a> HistTreeBuilder<'a> {
                 let i = fs + offset;
                 acc.add(bin);
                 let right = total.sub(acc);
-                if let Some((loss_chg, wl, wr)) =
+                if let Some((mut loss_chg, wl, wr)) =
                     xgb_loss_chg(acc, right, root_gain, &self.reg, bounds, dir)
                 {
+                    if let Some(reuse) = &self.reuse {
+                        loss_chg -= reuse.bin_penalty(f, Some(i));
+                    }
                     xgb_update(
                         &mut best,
                         loss_chg,
@@ -586,7 +614,7 @@ impl<'a> HistTreeBuilder<'a> {
             for i in (fs..fe).rev() {
                 suffix.add(hist[i]);
                 let left = total.sub(suffix);
-                if let Some((loss_chg, wl, wr)) =
+                if let Some((mut loss_chg, wl, wr)) =
                     xgb_loss_chg(left, suffix, root_gain, &self.reg, bounds, dir)
                 {
                     let pos = if i == fs {
@@ -594,6 +622,9 @@ impl<'a> HistTreeBuilder<'a> {
                     } else {
                         SplitPos::Bin(i - 1)
                     };
+                    if let Some(reuse) = &self.reuse {
+                        loss_chg -= reuse.bin_penalty(f, (i != fs).then(|| i - 1));
+                    }
                     xgb_update(&mut best, loss_chg, f, pos, true, left, suffix, wl, wr);
                 }
             }

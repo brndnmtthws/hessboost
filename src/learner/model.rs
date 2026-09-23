@@ -446,26 +446,13 @@ impl BoostedModel {
     /// an `n_rows × num_class` probability matrix while `multi:softmax` returns
     /// one class index per row, encoded as `f32`.
     pub fn predict(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        let mut margin = self.predict_margin(data)?;
-        // A model trained with a custom objective cannot reconstruct its
-        // transform from the name; fall back to the identity (raw margins),
-        // mirroring how XGBoost returns margins for custom objectives.
-        if let Ok(obj) = self.rebuild_objective() {
-            obj.pred_transform(&mut margin);
-        }
-        if self.objective == "multi:softmax" {
-            let k = self.n_outputs();
-            return Ok(margin
-                .chunks_exact(k)
-                .map(|row| {
-                    row.iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                        .map_or(0.0, |(i, _)| i as f32)
-                })
-                .collect());
-        }
-        Ok(margin)
+        let margin = self.predict_margin(data)?;
+        Ok(transform_margins(
+            &self.objective,
+            self.rebuild_objective().ok().as_deref(),
+            self.n_outputs(),
+            margin,
+        ))
     }
 
     /// For multiclass, the predicted class index per row (argmax over classes).
@@ -576,21 +563,7 @@ impl BoostedModel {
     /// present (one value per row, or one per row and output). Shared by
     /// prediction, TreeSHAP, and the training margin caches.
     pub(crate) fn initial_margins(&self, data: &DMatrix) -> Vec<f32> {
-        let n = data.n_rows();
-        let k = self.n_outputs();
-        match data.base_margin() {
-            Some(bm) if bm.len() == n * k => bm.to_vec(),
-            Some(bm) if bm.len() == n => {
-                bm.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect()
-            }
-            _ => {
-                let mut out = Vec::with_capacity(n * k);
-                for _ in 0..n {
-                    out.extend_from_slice(&self.base_score);
-                }
-                out
-            }
-        }
+        initial_margins(&self.base_score, data)
     }
 
     /// Validated prologue for the TreeSHAP paths. `predict_leaf` is excluded:
@@ -611,26 +584,7 @@ impl BoostedModel {
     }
 
     pub(crate) fn validate_prediction_data(&self, data: &DMatrix) -> Result<()> {
-        if data.n_cols() != self.n_features {
-            return Err(crate::error::HessboostError::DimensionMismatch {
-                what: "prediction feature count",
-                expected: self.n_features,
-                got: data.n_cols(),
-            });
-        }
-        let n = data.n_rows();
-        let k = self.n_outputs();
-        if let Some(margin) = data.base_margin()
-            && margin.len() != n
-            && margin.len() != n * k
-        {
-            return Err(crate::error::HessboostError::DimensionMismatch {
-                what: "prediction base_margin length",
-                expected: n * k,
-                got: margin.len(),
-            });
-        }
-        Ok(())
+        validate_prediction_data(self.n_features, self.n_outputs(), data)
     }
 
     /// Serialize the model to a compact Postcard binary blob.
@@ -811,12 +765,105 @@ impl BoostedModel {
     /// `num_class` and retained parameters. Fails for objectives the crate
     /// cannot construct by name (custom objectives).
     pub(crate) fn rebuild_objective(&self) -> Result<Box<dyn crate::objective::Objective>> {
-        let params = self
-            .objective_params
-            .training_params(&self.objective, self.num_class)
-            .build_unchecked();
-        create_objective(&params, self.n_targets)
+        rebuild_objective(
+            &self.objective,
+            &self.objective_params,
+            self.num_class,
+            self.n_targets,
+        )
     }
+}
+
+/// Margin buffer for `data` (`[row][output]`): the per-output intercepts
+/// `base_score` broadcast to every row, overridden by the dataset's
+/// per-instance `base_margin` when present (one value per row, or one per row
+/// and output). Shared by every model representation that predicts.
+pub(crate) fn initial_margins(base_score: &[f32], data: &DMatrix) -> Vec<f32> {
+    let n = data.n_rows();
+    let k = base_score.len();
+    match data.base_margin() {
+        Some(bm) if bm.len() == n * k => bm.to_vec(),
+        Some(bm) if bm.len() == n => bm.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect(),
+        _ => {
+            let mut out = Vec::with_capacity(n * k);
+            for _ in 0..n {
+                out.extend_from_slice(base_score);
+            }
+            out
+        }
+    }
+}
+
+/// Check that `data` fits a model with `n_features` inputs and `n_outputs`
+/// outputs: matching column count and a per-row or per-row-and-output
+/// `base_margin`.
+pub(crate) fn validate_prediction_data(
+    n_features: usize,
+    n_outputs: usize,
+    data: &DMatrix,
+) -> Result<()> {
+    if data.n_cols() != n_features {
+        return Err(crate::error::HessboostError::DimensionMismatch {
+            what: "prediction feature count",
+            expected: n_features,
+            got: data.n_cols(),
+        });
+    }
+    let n = data.n_rows();
+    if let Some(margin) = data.base_margin()
+        && margin.len() != n
+        && margin.len() != n * n_outputs
+    {
+        return Err(crate::error::HessboostError::DimensionMismatch {
+            what: "prediction base_margin length",
+            expected: n * n_outputs,
+            got: margin.len(),
+        });
+    }
+    Ok(())
+}
+
+/// The objective named `objective`, rebuilt from its retained parameters.
+/// Fails for objectives the crate cannot construct by name (custom
+/// objectives).
+pub(crate) fn rebuild_objective(
+    objective: &str,
+    params: &ObjectiveParams,
+    num_class: usize,
+    n_targets: usize,
+) -> Result<Box<dyn crate::objective::Objective>> {
+    let params = params
+        .training_params(objective, num_class)
+        .build_unchecked();
+    create_objective(&params, n_targets)
+}
+
+/// Turn raw margins (`[row][output]`, `n_outputs` wide) into predictions in
+/// the objective's reported space: the objective's transform (identity when
+/// it cannot be rebuilt, e.g. a custom objective, mirroring how XGBoost
+/// returns margins then), and for `multi:softmax` the per-row argmax class
+/// index encoded as `f32`.
+pub(crate) fn transform_margins(
+    objective_name: &str,
+    objective: Option<&dyn crate::objective::Objective>,
+    n_outputs: usize,
+    mut margin: Vec<f32>,
+) -> Vec<f32> {
+    if let Some(obj) = objective {
+        obj.pred_transform(&mut margin);
+    }
+    if objective_name == "multi:softmax" {
+        return margin
+            .chunks_exact(n_outputs)
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map_or(0.0, |(i, _)| i as f32)
+            })
+            .collect();
+    }
+    margin
 }
 
 /// Serde default of [`BoostedModel::n_targets`] for models written before the

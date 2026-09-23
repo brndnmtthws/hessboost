@@ -53,9 +53,9 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,oblivious}` (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation (`hist/quantized`: opt-in LightGBM quantized-gradient histograms), `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees), `reuse` (opt-in Trees-on-a-Diet feature/threshold reuse penalties) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,oblivious}` (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/budget` (five-fold generalization-gated grower for budget mode), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation (`hist/quantized`: opt-in LightGBM quantized-gradient histograms), `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees), `reuse` (opt-in Trees-on-a-Diet feature/threshold reuse penalties) |
 | `booster/` | `gblinear` |
-| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `sampling` (gradient-based/MVS row sampling per tree), `continuation` (continued-training / `process_type=update` checks), `refresh` (the refresh updater), `BoostedModel` (iteration layout, slicing, `iteration_range` prediction), cv, TreeSHAP, `conformal` (split-conformal / CQR intervals), `compact_model` (bit-packed Trees-on-a-Diet format, `CompactModel`) |
+| `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `budget` (opt-in PerpetualBooster-style budget training, beyond XGBoost), `sampling` (gradient-based/MVS row sampling per tree), `continuation` (continued-training / `process_type=update` checks), `refresh` (the refresh updater), `BoostedModel` (iteration layout, slicing, `iteration_range` prediction), cv, TreeSHAP, `conformal` (split-conformal / CQR intervals), `compact_model` (bit-packed Trees-on-a-Diet format, `CompactModel`) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
@@ -63,7 +63,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 (proptest), `shap_accumulation.rs`, `sampling.rs` (row/column sampling
 contracts), `target_stats.rs`, `continuation.rs` (continued training,
 refresh, forests, slicing, iteration ranges), `quantized.rs` (quantized-gradient
-training: thread-count determinism, quality band, leaf renewal). `benches/training.rs` is the Criterion
+training: thread-count determinism, quality band, leaf renewal), `budget.rs`. `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -128,7 +128,11 @@ suite; `docs/performance.md` records its results.
   `train.rs::reject_unimplemented`. XGBoost-JSON import maps `base_score` with
   `probs_to_margins` and export with `margins_to_probs` (defaults to
   `pred_transform`; `binary:hinge` overrides it because its threshold is not
-  its link).
+  its link). Budget
+  mode (`learner/budget.rs`) instead refuses every `TrainingParams` field it
+  does not read by diffing the serialized params against the defaults, so a
+  new field is refused there automatically; it needs an objective's
+  `Objective::pointwise_loss` (per-row loss matching its gradients).
 
 ## Public API at a glance
 
@@ -141,6 +145,8 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
   `train_continue(.., rounds, &model)` / `train_continue_with_eval(.., evals, early_stopping, &model)`
   (continued training; with `process_type(ProcessType::Update)` the refresh updater),
   `cv(&params, &data, rounds, nfold, seed)`.
+- `train_with_budget(&params, &dtrain, &BudgetConfig::new(budget))` → `BudgetResult { model, eta, stop }`
+  (opt-in, beyond XGBoost; no round count).
 - `DMatrix::from_dense`/`from_csr`, `.with_labels`/`.with_label_matrix`/`.with_label_bounds`/
   `.with_weights`/`.with_base_margin`/`.with_group_sizes`/`.with_feature_types`/`.with_feature_weights`,
   `.info()` (`MetaInfo`); file loaders are `hessboost::data::{load_csv, load_libsvm}`.

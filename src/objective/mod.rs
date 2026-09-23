@@ -59,6 +59,12 @@ impl GradPair {
     }
 }
 
+/// A per-row loss `ℓ(margin, label)`, unweighted by the sample weight, whose
+/// first and second derivatives with respect to the margin are the gradient
+/// pairs the objective produces (up to Hessian safeguards such as
+/// `max_delta_step`). Returned by [`Objective::pointwise_loss`].
+pub type PointwiseLoss<'a> = Box<dyn Fn(f32, f32) -> f64 + Send + Sync + 'a>;
+
 /// Rows per parallel gradient chunk. A multiple of every vector kernel's block
 /// (4 rows, and 4 values for any class count), so chunk boundaries fall where
 /// the kernels' block boundaries already are and every element is computed
@@ -296,6 +302,19 @@ pub trait Objective: Send + Sync {
     /// return `false`, and training then accepts datasets without labels.
     fn requires_labels(&self) -> bool {
         true
+    }
+
+    /// The objective's per-row loss, for trainers that measure the actual
+    /// loss reduction of a tree (budget-mode training,
+    /// [`train_with_budget`](crate::learner::budget::train_with_budget)).
+    /// Label-dependent reweighting the gradient applies (e.g.
+    /// `scale_pos_weight`) is part of the loss; the sample weight is not.
+    /// Losses are shifted so a perfect prediction of a hard label scores `0`
+    /// (deviance form), which makes relative loss reductions meaningful.
+    /// `None` (the default) when the objective has no single-row loss, e.g.
+    /// ranking, multi-output, or custom objectives.
+    fn pointwise_loss(&self) -> Option<PointwiseLoss<'_>> {
+        None
     }
 
     /// The default evaluation metric for this objective, as XGBoost's

@@ -1046,7 +1046,7 @@ fn gradient_sampling(params: &TrainingParams) -> bool {
 /// followed by the objective's own [`validate_info`] label-domain checks.
 ///
 /// [`validate_info`]: crate::objective::Objective::validate_info
-fn validate_dataset(
+pub(crate) fn validate_dataset(
     objective: &dyn crate::objective::Objective,
     data: &DMatrix,
     n_targets: usize,

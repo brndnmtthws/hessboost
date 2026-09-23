@@ -1,6 +1,8 @@
-//! Top-level orchestration: the boosting loop, the trained model, prediction,
-//! feature importance, and conformal prediction intervals.
+//! Top-level orchestration: the boosting loop, budget-mode training, the
+//! trained model, prediction, feature importance, and conformal prediction
+//! intervals.
 
+pub mod budget;
 pub mod compact_model;
 pub mod conformal;
 mod continuation;
@@ -11,6 +13,7 @@ mod sampling;
 mod shap;
 mod train;
 
+pub use budget::{BudgetConfig, BudgetResult, BudgetStop, train_with_budget};
 pub use cv::{CvResult, cv};
 pub(crate) use model::LinearModel;
 pub use model::{BoostedModel, ImportanceType};

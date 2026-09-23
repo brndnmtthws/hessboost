@@ -7,6 +7,7 @@
 //! rate is applied by the boosting loop, not baked into the tree).
 
 use crate::data::DMatrix;
+use crate::tree::linear::LinearLeaves;
 use serde::{Deserialize, Serialize};
 
 /// Sentinel used in child pointers to mark "no child" (i.e. a leaf).
@@ -80,6 +81,10 @@ pub struct RegTree {
     /// Empty for trees with no categorical splits (including all legacy trees).
     #[serde(default)]
     categories: Vec<u32>,
+    /// Per-leaf linear models of a `linear_tree` tree ([`LinearLeaves`]);
+    /// `None` for constant-leaf trees (every tree unless `linear_tree` is on).
+    #[serde(default)]
+    linear: Option<LinearLeaves>,
 }
 
 impl RegTree {
@@ -89,6 +94,7 @@ impl RegTree {
         RegTree {
             nodes: vec![Node::leaf(0.0, sum_hess)],
             categories: Vec::new(),
+            linear: None,
         }
     }
 
@@ -119,7 +125,11 @@ impl RegTree {
                             && (!node.is_categorical
                                 || (node.cat_begin <= node.cat_end
                                     && (node.cat_end as usize) <= self.categories.len()))))
-            });
+            })
+            && self
+                .linear
+                .as_ref()
+                .is_none_or(|linear| linear.is_valid(&self.nodes, n_features));
         if !locally_valid {
             return false;
         }
@@ -149,6 +159,19 @@ impl RegTree {
     #[inline]
     pub(crate) fn categories(&self) -> &[u32] {
         &self.categories
+    }
+
+    /// The per-leaf linear models, when this is a linear-leaf tree (trained
+    /// with `linear_tree`). Such a leaf predicts its linear model, or its
+    /// constant `leaf_value` for rows missing one of the model's features.
+    #[inline]
+    pub fn linear_leaves(&self) -> Option<&LinearLeaves> {
+        self.linear.as_ref()
+    }
+
+    /// Attach fitted leaf linear models.
+    pub(crate) fn set_linear_leaves(&mut self, linear: LinearLeaves) {
+        self.linear = Some(linear);
     }
 
     /// Access a node by id.
@@ -239,12 +262,16 @@ impl RegTree {
 
     /// Multiply every leaf weight by `factor`. Used to apply the learning rate
     /// (shrinkage) so that stored trees already carry their scaled contribution,
-    /// matching XGBoost's saved-model semantics.
+    /// matching XGBoost's saved-model semantics. Leaf linear models are scaled
+    /// with them.
     pub fn scale_leaves(&mut self, factor: f32) {
         for n in &mut self.nodes {
             if n.is_leaf() {
                 n.leaf_value *= factor;
             }
+        }
+        if let Some(linear) = &mut self.linear {
+            linear.scale(f64::from(factor));
         }
     }
 
@@ -313,10 +340,16 @@ impl RegTree {
         }
     }
 
-    /// Predict the raw leaf weight for row `row` of `data`.
+    /// Predict the raw output of row `row` of `data`: its leaf's weight, or
+    /// the leaf's linear model for linear-leaf trees.
     pub fn predict_row(&self, data: &DMatrix, row: usize) -> f32 {
-        let leaf = self.leaf_id_with(|f| data.get(row, f as usize));
-        self.nodes[leaf].leaf_value
+        let get = |f: u32| data.get(row, f as usize);
+        let leaf = self.leaf_id_with(get);
+        let constant = self.nodes[leaf].leaf_value;
+        match &self.linear {
+            Some(linear) => linear.predict(leaf, constant, get),
+            None => constant,
+        }
     }
 }
 

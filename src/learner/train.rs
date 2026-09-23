@@ -490,12 +490,13 @@ fn train_impl_inner(
             for k in 0..n_out {
                 // Retaining the final row partitions replaces a per-row tree
                 // traversal of the raw feature matrix with one sequential
-                // pass per leaf.
+                // pass per leaf (constant leaves only).
                 let (tree, leaf_rows) = match &prepared {
                     Prepared::Hist(ghist)
                         if params.grow_policy == GrowPolicy::DepthWise
                             && row_subset.len() == n
-                            && !gradient_sampling(params) =>
+                            && !gradient_sampling(params)
+                            && !params.linear_tree =>
                     {
                         let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
                         let mut sampler = make_column_sampler(
@@ -519,6 +520,7 @@ fn train_impl_inner(
                             &mut rng,
                             n_out,
                             k,
+                            round,
                             &row_subset,
                             n_features,
                         ),
@@ -732,6 +734,7 @@ fn dart_round(
             &mut rng,
             n_out,
             kk,
+            round,
             &row_subset,
             n_features,
         );
@@ -792,6 +795,7 @@ fn fit_output_tree(
     rng: &mut StdRng,
     n_out: usize,
     k: usize,
+    round: usize,
     row_subset: &[u32],
     n_features: usize,
 ) -> RegTree {
@@ -807,6 +811,10 @@ fn fit_output_tree(
     };
     let mut sampler = make_column_sampler(n_features, dtrain.feature_weights(), params, rng);
     let mut tree = prepared.build_tree(params, dtrain, gk, rows, &mut sampler);
+    // LightGBM keeps the first round's trees constant.
+    if params.linear_tree && round > 0 {
+        crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, params.linear_lambda);
+    }
     tree.scale_leaves(params.eta as f32);
     tree
 }

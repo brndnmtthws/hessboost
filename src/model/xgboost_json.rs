@@ -219,6 +219,16 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
             "XGBoost model export does not support gblinear models",
         ));
     }
+    if model
+        .trees()
+        .iter()
+        .any(|tree| tree.linear_leaves().is_some())
+    {
+        return Err(HessboostError::model_format(
+            "XGBoost model export cannot represent linear-leaf trees (`linear_tree`); \
+             save the model in the native binary or JSON format",
+        ));
+    }
     let num_feature = model.n_features();
     let num_class = model.num_class();
     let objective = model.objective().to_string();

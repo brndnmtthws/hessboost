@@ -58,7 +58,10 @@
 //!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
 //!   [`learner::conformal`]).
 //! - **Beyond XGBoost (opt-in):** CatBoost-style ordered target statistics
-//!   for categorical columns ([`data::OrderedTargetEncoder`]).
+//!   for categorical columns ([`data::OrderedTargetEncoder`]); LightGBM tree
+//!   options `extra_trees`, `path_smooth`, and `linear_tree` leaves
+//!   ([`config::TrainingParams::extra_trees`], [`config::TrainingParams::path_smooth`],
+//!   [`config::TrainingParams::linear_tree`], [`tree::linear`]).
 //!
 //! ## Where to look
 //!

@@ -182,6 +182,20 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   categories to the prior, and is serde-serializable. Regression and binary
   labels; dense and CSR input. Never used unless called; native categorical
   splits and training defaults are unchanged.
+- **LightGBM tree options** (histogram builder, `hist`/`approx`):
+  **`extra_trees`** scores each feature at one random threshold per node
+  (drawn inside the node's occupied bin range, seeded by `extra_seed` and the
+  per-tree seed); **`path_smooth`** pulls each child's output toward its
+  parent's, `w·(n/s)/(n/s+1) + w_parent/(n/s+1)`, and scores splits at the
+  smoothed outputs; **`linear_tree`** fits a ridge linear model
+  (`linear_lambda` on the slopes) in every leaf on the numerical features
+  split on along its path, falling back to the constant leaf for rows with a
+  missing model feature (first-round trees stay constant, as in LightGBM).
+  Linear-leaf models round-trip through the native binary and JSON formats;
+  XGBoost JSON/UBJSON export refuses them, and so do `predict_contribs` /
+  `predict_interactions` (TreeSHAP is undefined for linear leaves; LightGBM
+  refuses too). All three are off by default and leave default training
+  bit-identical.
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.

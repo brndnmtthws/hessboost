@@ -6,6 +6,7 @@
 
 mod exact;
 mod hist;
+mod lightgbm;
 
 pub use exact::{ExactTreeBuilder, SortedColumns, all_features, all_rows};
 pub use hist::HistTreeBuilder;

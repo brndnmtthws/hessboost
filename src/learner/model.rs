@@ -14,7 +14,10 @@ use std::sync::OnceLock;
 
 // Native binary format marker; changing it breaks loading existing models.
 const NATIVE_MAGIC: &[u8; 4] = b"SQB\0";
-const NATIVE_VERSION: u8 = 1;
+/// Native binary format version written by [`BoostedModel::to_bytes`]:
+/// `1` = hessboost 0.1.1 and earlier (decoded by the frozen `native_v1`
+/// module), `2` = the current field layout.
+const NATIVE_VERSION: u8 = 2;
 
 /// The kind of feature-importance score to compute, mirroring XGBoost's
 /// `importance_type`.
@@ -917,7 +920,15 @@ impl BoostedModel {
         validate_prediction_data(self.n_features, self.n_outputs(), data)
     }
 
-    /// Serialize the model to a compact Postcard binary blob.
+    /// Serialize the model to the native binary format: the magic `SQB\0`, a
+    /// format version byte, then the model as a Postcard payload.
+    ///
+    /// This writes version 2 (the layout with label-matrix targets,
+    /// `num_parallel_tree` forests, vector and linear leaves, and quantile /
+    /// expectile / AFT objective parameters). [`BoostedModel::from_bytes`]
+    /// also reads version 1 (hessboost 0.1.1 and earlier). Postcard is not
+    /// self-describing, so any change to a serialized field needs a new
+    /// version and a frozen decoder for the previous one.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let payload = postcard::to_stdvec(self)
             .map_err(|e| crate::error::HessboostError::ModelFormat(e.to_string()))?;
@@ -928,21 +939,32 @@ impl BoostedModel {
         Ok(bytes)
     }
 
-    /// Deserialize a model from a binary blob produced by [`BoostedModel::to_bytes`].
+    /// Deserialize a model from a binary blob produced by [`BoostedModel::to_bytes`]
+    /// of this or an earlier release (format versions 1 and 2).
+    ///
+    /// A version-1 model (hessboost 0.1.1 and earlier) predicts exactly as it did: its
+    /// trees keep their order (tree `t` feeds output `t % n_outputs`, the
+    /// current layout with `num_parallel_tree = 1`) and every field added
+    /// since takes its default (one label column, scalar constant leaves).
+    /// Unknown versions, such as those of a newer release, are refused with
+    /// [`HessboostError::ModelFormat`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < NATIVE_MAGIC.len() + 1 || &bytes[..NATIVE_MAGIC.len()] != NATIVE_MAGIC {
-            return Err(crate::error::HessboostError::ModelFormat(
+            return Err(HessboostError::ModelFormat(
                 "invalid native model header".to_string(),
             ));
         }
-        if bytes[NATIVE_MAGIC.len()] != NATIVE_VERSION {
-            return Err(crate::error::HessboostError::ModelFormat(format!(
-                "unsupported native model version {}",
-                bytes[NATIVE_MAGIC.len()]
-            )));
-        }
-        let model: Self = postcard::from_bytes(&bytes[NATIVE_MAGIC.len() + 1..])
-            .map_err(|e| crate::error::HessboostError::ModelFormat(e.to_string()))?;
+        let payload = &bytes[NATIVE_MAGIC.len() + 1..];
+        let model = match bytes[NATIVE_MAGIC.len()] {
+            1 => super::native_v1::decode(payload)?,
+            NATIVE_VERSION => postcard::from_bytes(payload)
+                .map_err(|e| HessboostError::ModelFormat(e.to_string()))?,
+            version => {
+                return Err(HessboostError::ModelFormat(format!(
+                    "unsupported native model version {version} (this build reads versions 1 to {NATIVE_VERSION})"
+                )));
+            }
+        };
         model.validate_structure()?;
         Ok(model)
     }
@@ -959,12 +981,24 @@ impl BoostedModel {
         Self::from_bytes(&bytes)
     }
 
-    /// Serialize the model to a (human-readable) JSON string.
+    /// Serialize the model to a (human-readable) JSON string: the model's
+    /// fields by name.
+    ///
+    /// The JSON layout is unversioned: fields are only ever added, each with
+    /// a serde default, so [`BoostedModel::from_json`] reads files written by
+    /// earlier releases.
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    /// Deserialize a model from a JSON string.
+    /// Deserialize a model from a JSON string produced by
+    /// [`BoostedModel::to_json`] of this or an earlier release.
+    ///
+    /// Fields a file predates take their defaults, which reproduce the
+    /// predictions of the release that wrote it (for hessboost 0.1.1 and
+    /// earlier: one label column, `num_parallel_tree = 1`, whose tree layout
+    /// is the round-robin order those releases used, and scalar constant
+    /// leaves).
     pub fn from_json(s: &str) -> Result<Self> {
         let model: Self = serde_json::from_str(s)?;
         model.validate_structure()?;

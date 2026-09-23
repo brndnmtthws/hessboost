@@ -1,0 +1,30 @@
+{
+  "trees": [],
+  "base_score": [
+    1.342573
+  ],
+  "objective": "reg:squarederror",
+  "objective_params": {
+    "scale_pos_weight": 1.0,
+    "max_delta_step": 0.0,
+    "tweedie_variance_power": 1.5,
+    "huber_slope": 1.0,
+    "lambdarank_num_pair_per_sample": 32
+  },
+  "num_class": 0,
+  "n_outputs": 1,
+  "n_features": 4,
+  "best_iteration": null,
+  "tree_weights": [],
+  "linear": {
+    "weights": [
+      0.28192848,
+      0.774052,
+      -0.8285355,
+      -0.54820883
+    ],
+    "bias": [
+      -0.11550373
+    ]
+  }
+}

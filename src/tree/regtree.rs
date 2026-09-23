@@ -113,6 +113,19 @@ impl RegTree {
         }
     }
 
+    /// Assemble a constant-leaf scalar tree from its node array and the flat
+    /// category pool its categorical nodes index. The caller validates the
+    /// result ([`RegTree::is_valid_for_features`]).
+    pub(crate) fn from_scalar_parts(nodes: Vec<Node>, categories: Vec<u32>) -> Self {
+        RegTree {
+            nodes,
+            categories,
+            size_leaf_vector: 0,
+            leaf_vectors: Vec::new(),
+            linear: None,
+        }
+    }
+
     /// Create a vector-leaf tree with `n_outputs > 1` weights per leaf and a
     /// placeholder (all-zero) root leaf.
     pub(crate) fn with_vector_root(n_outputs: usize, sum_hess: f32) -> Self {

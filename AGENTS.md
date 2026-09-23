@@ -65,7 +65,9 @@ contracts), `target_stats.rs`, `continuation.rs` (continued training,
 refresh, forests, slicing, iteration ranges), `quantized.rs` (quantized-gradient
 training: thread-count determinism, quality band, leaf renewal), `budget.rs`, `multi_output.rs` (vector-leaf trees),
 `distributional.rs` (`dist:*` objectives: interval calibration, NLL vs a
-homoscedastic baseline, serialization, CQR). `benches/training.rs` is the Criterion
+homoscedastic baseline, serialization, CQR), `native_format.rs` (native
+binary/JSON version migration and round trips; fixtures in
+`tests/data/native-v1/`). `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -92,11 +94,21 @@ suite; `docs/performance.md` records its results.
   3.4.1). `exact`-tier fixtures match pointwise; RNG-driven cases
   (subsampling, DART) only match within a quality band because the RNG
   streams differ.
-- **Formats:** the native binary magic (`SQB\0`), the JSON layouts and the
-  compact layout (`HBTD`, version byte, documented in
-  `learner/compact_model.rs`) are compatibility contracts; do not change them
-  without a migration. The compact metadata embeds `ObjectiveParams` as
-  postcard, so changing that struct changes the compact format too.
+- **Formats:** the native binary format (`SQB\0`, a version byte, a
+  postcard payload of `BoostedModel`), the JSON layouts and the compact layout
+  (`HBTD`, version byte, documented in `learner/compact_model.rs`) are
+  compatibility contracts; do not change them without a migration. Native
+  version 1 is hessboost 0.1.1 and earlier, decoded by the frozen structs in
+  `learner/native_v1.rs`; version 2 (`NATIVE_VERSION` in `learner/model.rs`)
+  is the current layout, and unknown versions are refused. Postcard is not
+  self-describing and ignores `#[serde(default)]`, so any change to a type
+  inside `BoostedModel` (`RegTree`, `Node`, `LinearLeaves`, `LinearModel`,
+  `ObjectiveParams`) needs a version bump plus a frozen decoder of the
+  previous layout; `tests/native_format.rs` checks the committed 0.1.1 files
+  in `tests/data/native-v1/` still predict bit for bit. Native JSON is
+  unversioned: only add fields, each with a serde default that reproduces the
+  old behavior. The compact metadata embeds `ObjectiveParams` as postcard, so
+  changing that struct changes the compact format too.
 - **Tree layout:** as in XGBoost, iteration `i` owns trees
   `i * trees_per_iteration ..` (`trees_per_iteration = n_outputs ×
   num_parallel_tree`), grouped by output; tree `t` feeds output

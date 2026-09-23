@@ -145,6 +145,44 @@ fn early_stopping_after_continuation_reports_absolute_iterations() {
     );
 }
 
+/// A continuation whose early-stopping metric never improves (here NaN:
+/// `cox-nloglik` of an all-censored set) keeps the first continued
+/// iteration, never an iteration of the initial model: selecting iteration
+/// 0 used to drop nearly the whole resumed model from `predict`.
+#[test]
+fn continuation_without_an_improving_metric_keeps_the_initial_model() {
+    let d = regression(200, 0.0);
+    let times: Vec<f32> = d.labels().unwrap().iter().map(|y| y.abs() + 1.0).collect();
+    let survival = |labels: &[f32]| {
+        let x: Vec<f32> = (0..d.n_rows() * 4)
+            .map(|i| d.get(i / 4, i % 4).unwrap())
+            .collect();
+        DMatrix::from_dense(&x, d.n_rows(), 4)
+            .unwrap()
+            .with_labels(labels)
+            .unwrap()
+    };
+    let train_set = survival(&times);
+    let censored = survival(&times.iter().map(|t| -t).collect::<Vec<_>>());
+    let params = base().objective("survival:cox").build().unwrap();
+    let first = train(&params, &train_set, 4).unwrap();
+    let out = train_continue_with_eval(
+        &params,
+        &train_set,
+        10,
+        &[(&censored, "censored")],
+        Some(2),
+        &first,
+    )
+    .unwrap();
+    assert!(out.history.iter().all(|r| r.scores[0].2.is_nan()));
+    assert_eq!(out.model.best_iteration(), Some(4));
+    assert_eq!(
+        out.model.predict(&train_set).unwrap(),
+        out.model.predict_range(&train_set, (0, 5)).unwrap()
+    );
+}
+
 #[test]
 fn incompatible_continuations_are_rejected() {
     let d = regression(100, 0.0);
@@ -282,11 +320,12 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     ));
 }
 
-/// The refresh updater recomputes constant leaves only: a model with linear
-/// leaves, or a refresh configured with linear leaves or path smoothing, is
-/// refused instead of silently refreshing to a different model.
+/// The refresh updater recomputes constant leaves from full-precision
+/// gradients only: a model with linear leaves, or a refresh configured with
+/// linear leaves, path smoothing, or quantized gradients, is refused instead
+/// of silently refreshing to a different model.
 #[test]
-fn refresh_refuses_linear_leaves_and_path_smoothing() {
+fn refresh_refuses_linear_leaves_path_smoothing_and_quantization() {
     let d = regression(300, 0.0);
     let refused = |params: &TrainingParams, model: &BoostedModel| {
         matches!(
@@ -303,6 +342,12 @@ fn refresh_refuses_linear_leaves_and_path_smoothing() {
         &plain
     ));
     assert!(refused(&update().path_smooth(1.0).build().unwrap(), &plain));
+    // Refresh sums full-precision gradients, so quantization would be
+    // silently skipped.
+    assert!(refused(
+        &update().use_quantized_grad(true).build().unwrap(),
+        &plain
+    ));
     assert!(train_continue(&update().build().unwrap(), &d, 2, &plain).is_ok());
 }
 

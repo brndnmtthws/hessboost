@@ -45,7 +45,7 @@ pub(super) fn validate(params: &TrainingParams) -> Result<()> {
 
 /// Reduced split gradients are defined for vector-leaf trees only: refuse an
 /// objective that supplies them to any other booster or strategy.
-pub(super) fn reject_split_gradient(
+pub(crate) fn reject_split_gradient(
     objective: &dyn Objective,
     round: usize,
     gpair: &[GradPair],

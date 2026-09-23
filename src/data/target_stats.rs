@@ -463,9 +463,10 @@ impl TryFrom<FittedRepr> for FittedTargetEncoder {
         if r.columns.is_empty() {
             return Err(bad("no encoded columns"));
         }
-        let mut seen = vec![false; r.n_cols];
+        // Sized by the supplied columns, not the untrusted `n_cols` header.
+        let mut seen = std::collections::HashSet::with_capacity(r.columns.len());
         for c in &r.columns {
-            if c.column >= r.n_cols || std::mem::replace(&mut seen[c.column], true) {
+            if c.column >= r.n_cols || !seen.insert(c.column) {
                 return Err(bad("encoded columns must be distinct and < n_cols"));
             }
             if c.values.len() != c.categories.len() {
@@ -764,6 +765,26 @@ mod tests {
             "lengths"
         );
         assert!(rejects(|c| c["column"] = 2.into()), "column out of range");
+    }
+
+    #[test]
+    fn deserialization_does_not_allocate_from_the_declared_width() {
+        // A tiny document declaring `usize::MAX` columns: validation must not
+        // allocate per declared column (this used to be a capacity-overflow
+        // panic), while duplicate columns are still refused.
+        let doc = |columns: &str| {
+            format!(
+                r#"{{"n_cols": {}, "prior": 0.5, "columns": [{columns}]}}"#,
+                usize::MAX
+            )
+        };
+        let column = r#"{"column": 7, "categories": [0, 1], "values": [0.25, 0.75]}"#;
+        let wide: FittedTargetEncoder = serde_json::from_str(&doc(column)).unwrap();
+        assert_eq!(wide.n_cols, usize::MAX);
+        assert!(
+            serde_json::from_str::<FittedTargetEncoder>(&doc(&format!("{column}, {column}")))
+                .is_err()
+        );
     }
 
     #[test]

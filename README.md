@@ -139,8 +139,8 @@ reproduced; see `hessboost::learner::budget` for the exact rules.
   rounds in two calls grow the same trees as one run; **`process_type =
   update`**, XGBoost's `refresh` updater, recomputing an existing gbtree
   model's statistics and (with `refresh_leaf`) leaf values on new data
-  (refused for DART, monotone constraints, vector leaves, linear leaves, and
-  `path_smooth`); **model slicing** by boosting iteration
+  (refused for DART, monotone constraints, vector leaves, linear leaves,
+  `path_smooth`, and `use_quantized_grad`); **model slicing** by boosting iteration
   (`BoostedModel::slice(begin, end, step)`, XGBoost's `booster[a:b:c]`); and
   **`iteration_range`** prediction (`predict_range`, `predict_margin_range`,
   `predict_leaf_range`, `predict_contribs_range`,
@@ -310,7 +310,8 @@ None of these change default training; each is off unless requested.
   default, seeded and thread-count independent). Histograms then accumulate
   packed integers whose width (32/64/128-bit) follows the node's row count.
   `quant_train_renew_leaf` refits leaf values from the full-precision
-  gradients. Supports `hist`/`approx` with the depthwise and lossguide
+  gradients (refused with `path_smooth`, whose leaves keep the outputs
+  their splits recorded). Supports `hist`/`approx` with the depthwise and lossguide
   growth policies. Trees differ from full-precision training (test loss is
   within a few percent on the synthetic suites) and are ordinary trees for
   every model format. The speedup is largest when histogram building

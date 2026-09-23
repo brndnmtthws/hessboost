@@ -75,6 +75,11 @@ impl Metric for Precision {
         }
         score.min(1.0)
     }
+
+    /// Precision ranks one label per row within each query group.
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

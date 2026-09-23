@@ -468,7 +468,7 @@ fn train_impl_inner(
             n_out,
             objective,
             model.linear(),
-        );
+        )?;
         model.set_linear(linear);
         return Ok(TrainResult {
             model,
@@ -522,6 +522,14 @@ fn train_impl_inner(
             ),
         ));
     }
+    for (data, name) in evals {
+        let info = data.info();
+        for metric in &metrics {
+            metric
+                .validate_info(&info)
+                .map_err(|error| name_dataset(error, name))?;
+        }
+    }
 
     let mut gpair = vec![GradPair::default(); n * n_out];
     // Per-output gradient buffer reused across classes (single-output aliases it).
@@ -535,7 +543,10 @@ fn train_impl_inner(
     } else {
         f64::INFINITY
     };
-    let mut best_iter = 0usize;
+    // The first iteration of this run, not of the model: when no score ever
+    // improves (a NaN metric), a continuation must not select an iteration
+    // of the initial model it was asked to extend.
+    let mut best_iter = start_iteration;
     let mut rounds_since_improve = 0usize;
 
     let is_dart = params.booster == BoosterKind::Dart;
@@ -2471,6 +2482,70 @@ mod tests {
                 assert_eq!(reason, "dataset `dtrain` has no label bounds");
             }
             other => panic!("expected validate_info to reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn label_metrics_are_refused_on_bound_only_eval_sets() {
+        // `survival:aft` trains on label bounds alone; a metric reading
+        // ordinary labels used to index the empty label slice and panic.
+        let x: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let lower: Vec<f32> = (0..32).map(|i| 1.0 + (i % 4) as f32).collect();
+        let upper: Vec<f32> = lower.iter().map(|lo| lo + 1.0).collect();
+        let d = DMatrix::from_dense(&x, 32, 1)
+            .unwrap()
+            .with_label_bounds(&lower, &upper)
+            .unwrap();
+        let params = |metric: &str| {
+            TrainingParams::builder()
+                .objective("survival:aft")
+                .eval_metric(metric)
+                .build()
+                .unwrap()
+        };
+        for metric in ["aft-nloglik", "interval-regression-accuracy"] {
+            let run = train_with_eval(&params(metric), &d, 2, &[(&d, "eval")], None).unwrap();
+            assert!(run.history[1].scores[0].2.is_finite(), "{metric}");
+        }
+        for metric in ["rmse", "mae", "cox-nloglik"] {
+            match train_with_eval(&params(metric), &d, 2, &[(&d, "eval")], None) {
+                Err(HessboostError::InvalidParameter { name, reason }) => {
+                    assert_eq!(name, "eval_metric");
+                    assert!(reason.contains("`eval`"), "{reason}");
+                }
+                other => panic!("{metric}: expected a rejection, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn per_row_metrics_refuse_label_matrices() {
+        // The survival metrics read one interval and weight per row, and
+        // `pre@k` ranks one label per row within query groups; on a label
+        // matrix they used to index the row weights per cell (panicking) or
+        // rank every target's cells together.
+        let n = 24;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..2 * n).map(|i| (i % 5) as f32).collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_label_matrix(&y, 2)
+            .unwrap()
+            .with_weights(&vec![1.0; n])
+            .unwrap()
+            .with_group_sizes(&[12, 12])
+            .unwrap();
+        for metric in ["aft-nloglik", "interval-regression-accuracy", "pre@3"] {
+            let params = TrainingParams::builder()
+                .eval_metric(metric)
+                .build()
+                .unwrap();
+            match train_with_eval(&params, &d, 1, &[(&d, "eval")], None) {
+                Err(HessboostError::InvalidParameter { name, .. }) => {
+                    assert_eq!(name, "eval_metric");
+                }
+                other => panic!("{metric}: expected a rejection, got {other:?}"),
+            }
         }
     }
 

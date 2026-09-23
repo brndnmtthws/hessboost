@@ -69,10 +69,29 @@ pub trait Metric: Send + Sync {
 
     /// Whether [`Metric::eval_info`] is defined on a label matrix
     /// (`n_targets > 1`). `true` by default (the elementwise reduction);
-    /// ranking and multiclass metrics return `false`, and training then
-    /// rejects them for multi-target data.
+    /// ranking, multiclass, and per-row survival metrics return `false`, and
+    /// training then rejects them for multi-target data.
     fn supports_label_matrix(&self) -> bool {
         true
+    }
+
+    /// Check that a dataset carries the metadata [`Metric::eval_info`]
+    /// reads, before training evaluates it. The default requires ordinary
+    /// labels; metrics that can read other metadata (the survival metrics'
+    /// label bounds) override it. Errors are
+    /// [`HessboostError::InvalidParameter`] naming `eval_metric`, with a
+    /// reason mentioning "dataset" (training names the dataset there).
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        if info.n_rows > 0 && info.labels.is_empty() {
+            return Err(HessboostError::invalid_param(
+                "eval_metric",
+                format!(
+                    "metric `{}` needs labels, but dataset has none",
+                    self.name()
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -849,8 +868,9 @@ mod tests {
         );
     }
 
-    /// Ranking and multiclass metrics read one label per row and refuse
-    /// label matrices; elementwise and curve metrics accept them.
+    /// Ranking, multiclass, and per-row survival metrics read one label (or
+    /// interval) per row and refuse label matrices; elementwise and curve
+    /// metrics accept them.
     #[test]
     fn label_matrix_support_is_declared_per_metric() {
         let obj = ObjectiveParams::default();
@@ -865,6 +885,9 @@ mod tests {
             ("merror", false),
             ("ndcg", false),
             ("map@5", false),
+            ("pre@3", false),
+            ("aft-nloglik", false),
+            ("interval-regression-accuracy", false),
         ] {
             let metric = create_metric(name, 3, &obj).unwrap();
             assert_eq!(metric.supports_label_matrix(), supported, "{name}");

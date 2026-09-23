@@ -174,6 +174,15 @@ fn check_update(
              (`linear_tree` / `path_smooth`)",
         ));
     }
+    // The refresh updater sums the full-precision gradients directly; it
+    // never builds the quantized histograms `use_quantized_grad` asks for.
+    if params.use_quantized_grad {
+        return Err(HessboostError::invalid_param(
+            "process_type",
+            "`update` refreshes from full-precision gradients and does not support \
+             `use_quantized_grad`",
+        ));
+    }
     if num_boost_round > init.num_boost_rounds() {
         return Err(HessboostError::invalid_param(
             "num_boost_round",

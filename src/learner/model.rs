@@ -1012,11 +1012,18 @@ impl BoostedModel {
             ));
         }
         let vector = self.has_vector_leaves();
+        // Both factors come from the file: check the product before any
+        // divisibility or round-count arithmetic relies on it.
+        let per_iteration = if vector {
+            Some(self.num_parallel_tree)
+        } else {
+            self.n_outputs.checked_mul(self.num_parallel_tree)
+        };
         if self.n_outputs == 0
             || self.n_targets == 0
             || self.num_parallel_tree == 0
             || (self.num_class >= 2 && self.n_outputs != self.num_class)
-            || !self.trees.len().is_multiple_of(self.trees_per_iteration())
+            || per_iteration.is_none_or(|per| !self.trees.len().is_multiple_of(per))
             || self.trees.iter().any(|tree| {
                 tree.is_vector_leaf() != vector
                     || (vector && tree.size_leaf_vector() != self.n_outputs)
@@ -1030,6 +1037,13 @@ impl BoostedModel {
                 self.trees.len()
             )));
         }
+        check_objective_width(
+            &self.objective,
+            &self.objective_params,
+            self.num_class,
+            self.n_targets,
+            self.n_outputs,
+        )?;
         if let Some(best) = self.best_iteration
             && self.linear.is_none()
             && best >= self.num_boost_rounds()
@@ -1214,6 +1228,30 @@ pub(crate) fn rebuild_objective(
         .training_params(objective, num_class)
         .build_unchecked();
     create_objective(&params, n_targets)
+}
+
+/// Check that the objective a model names, when the crate can rebuild it,
+/// produces the model's `n_outputs` outputs. Loaders call this before
+/// returning a model: the prediction transform of a multi-output objective
+/// works on `[row][output]` blocks of its own width, so a mismatched width
+/// would transform values of neighboring rows together. Objectives the crate
+/// cannot rebuild (custom objectives) predict margins and are not checked.
+pub(crate) fn check_objective_width(
+    objective: &str,
+    params: &ObjectiveParams,
+    num_class: usize,
+    n_targets: usize,
+    n_outputs: usize,
+) -> Result<()> {
+    match rebuild_objective(objective, params, num_class, n_targets) {
+        Ok(rebuilt) if rebuilt.n_outputs() != n_outputs => {
+            Err(HessboostError::ModelFormat(format!(
+                "objective `{objective}` has {} outputs but the model stores {n_outputs}",
+                rebuilt.n_outputs()
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Turn raw margins (`[row][output]`, `n_outputs` wide) into predictions in

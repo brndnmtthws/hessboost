@@ -19,6 +19,7 @@ pub use budget::{BudgetConfig, BudgetResult, BudgetStop, train_with_budget};
 pub use cv::{CvResult, cv};
 pub(crate) use model::LinearModel;
 pub use model::{BoostedModel, ImportanceType};
+pub(crate) use multi_output::reject_split_gradient;
 pub use train::{
     EvalSet, RoundEval, TrainResult, train, train_continue, train_continue_with_eval,
     train_with_custom_metric, train_with_eval, train_with_objective,

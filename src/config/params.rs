@@ -233,7 +233,8 @@ pub struct TrainingParams {
     pub expectile_alpha: Vec<f64>,
     /// Noise distribution for `survival:aft`. XGBoost `aft_loss_distribution`.
     pub aft_loss_distribution: AftDistribution,
-    /// Scale of the `survival:aft` noise distribution (finite, `> 0`).
+    /// Scale of the `survival:aft` noise distribution (`> 0` and finite, also
+    /// once rounded to the `f32` the objective computes in).
     /// XGBoost `aft_loss_distribution_scale`.
     pub aft_loss_distribution_scale: f64,
     /// Second-order statistic of the `dist:*` objectives (beyond XGBoost):
@@ -349,8 +350,9 @@ pub struct TrainingParams {
     /// `stochastic_rounding`.
     pub stochastic_rounding: bool,
     /// Recompute each leaf value from the full-precision gradients of its rows
-    /// once a quantized tree is grown. Only used with `use_quantized_grad`.
-    /// LightGBM `quant_train_renew_leaf`.
+    /// once a quantized tree is grown. Only used with `use_quantized_grad`;
+    /// refused with [`path_smooth`](Self::path_smooth), whose leaves keep the
+    /// outputs their splits recorded. LightGBM `quant_train_renew_leaf`.
     pub quant_train_renew_leaf: bool,
 
     // ---- DART-specific ----
@@ -555,6 +557,15 @@ impl TrainingParams {
             "aft_loss_distribution_scale",
             self.aft_loss_distribution_scale,
         )?;
+        let aft_scale = self.aft_loss_distribution_scale as f32;
+        ensure(
+            "aft_loss_distribution_scale",
+            aft_scale.is_finite() && aft_scale > 0.0,
+            format!(
+                "must stay positive and finite in f32, got {}",
+                self.aft_loss_distribution_scale
+            ),
+        )?;
         ensure(
             "num_parallel_tree",
             self.num_parallel_tree >= 1,
@@ -625,6 +636,13 @@ impl TrainingParams {
                 "use_quantized_grad",
                 self.grow_policy != GrowPolicy::Symmetric,
                 "quantized training is not supported with `grow_policy=symmetric`",
+            )?;
+            // Path-smoothed leaves keep the outputs their (quantized) splits
+            // recorded, so renewed leaf statistics would be discarded.
+            ensure(
+                "quant_train_renew_leaf",
+                !(self.quant_train_renew_leaf && self.path_smooth > 0.0),
+                "leaf renewal is not supported with `path_smooth`",
             )?;
         }
         self.validate_tree_options()
@@ -1069,7 +1087,9 @@ mod tests {
                 .build()
                 .is_err()
         );
-        for scale in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+        // Positive finite `f64` scales that become infinite or zero once
+        // narrowed to the `f32` the objective and metric compute in.
+        for scale in [0.0, -1.0, f64::INFINITY, f64::NAN, 1e100, 1e-50] {
             assert!(
                 TrainingParams::builder()
                     .aft_loss_distribution_scale(scale)
@@ -1186,9 +1206,10 @@ mod tests {
         assert!(toad().linear_tree(true).build().is_ok());
     }
 
-    /// Symmetric growth builds histograms outside the quantized path.
+    /// Symmetric growth builds histograms outside the quantized path, and
+    /// path-smoothed leaves would discard renewed leaf statistics.
     #[test]
-    fn quantized_training_refuses_symmetric_growth() {
+    fn quantized_training_refuses_options_it_would_ignore() {
         let q = || {
             TrainingParams::builder()
                 .use_quantized_grad(true)
@@ -1199,5 +1220,13 @@ mod tests {
             Err(HessboostError::InvalidParameter { name, .. }) if name == "use_quantized_grad"
         ));
         assert!(q().grow_policy(GrowPolicy::LossGuide).build().is_ok());
+        // Leaf renewal would be discarded: path-smoothed leaves keep the
+        // outputs their quantized splits recorded.
+        assert!(matches!(
+            q().quant_train_renew_leaf(true).path_smooth(1.0).build(),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "quant_train_renew_leaf"
+        ));
+        assert!(q().quant_train_renew_leaf(true).build().is_ok());
+        assert!(q().path_smooth(1.0).build().is_ok());
     }
 }

@@ -116,8 +116,8 @@ use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::learner::model::{
-    BoostedModel, RowBlock, initial_margins, rebuild_objective, transform_margins,
-    validate_prediction_data,
+    BoostedModel, RowBlock, check_objective_width, initial_margins, rebuild_objective,
+    transform_margins, validate_prediction_data,
 };
 use crate::tree::RegTree;
 use rayon::prelude::*;
@@ -556,6 +556,13 @@ impl CompactModel {
         if meta.num_class >= 2 && n_outputs != meta.num_class {
             return Err(format_error("output count does not match num_class"));
         }
+        check_objective_width(
+            &meta.objective,
+            &meta.objective_params(),
+            meta.num_class,
+            meta.n_targets,
+            n_outputs,
+        )?;
         r.ensure_fits(n_outputs, 32, "base score")?;
         let base_score = (0..n_outputs)
             .map(|_| r.read_f32())
@@ -564,7 +571,10 @@ impl CompactModel {
             return Err(format_error("base scores must be finite"));
         }
         let n_trees = r.read_usize(32)?;
-        if !n_trees.is_multiple_of(n_outputs * meta.num_parallel_tree) {
+        let per_iteration = n_outputs
+            .checked_mul(meta.num_parallel_tree)
+            .ok_or_else(|| format_error("trees per iteration overflow"))?;
+        if !n_trees.is_multiple_of(per_iteration) {
             return Err(format_error(
                 "tree count is not a multiple of the trees per iteration",
             ));
@@ -1776,6 +1786,54 @@ mod tests {
                 let _ = m.predict_margin(&data);
             }
         }
+    }
+
+    /// `bytes` with its metadata replaced by `edit` applied to the decoded
+    /// metadata.
+    fn with_meta(bytes: &[u8], edit: impl FnOnce(&mut Meta)) -> Vec<u8> {
+        let len = u32::from_le_bytes(bytes[MAGIC.len() + 1..PREFIX_BYTES].try_into().unwrap());
+        let end = PREFIX_BYTES + len as usize;
+        let mut meta: Meta = postcard::from_bytes(&bytes[PREFIX_BYTES..end]).unwrap();
+        edit(&mut meta);
+        let meta = postcard::to_stdvec(&meta).unwrap();
+        let mut out = bytes[..=MAGIC.len()].to_vec();
+        out.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        out.extend_from_slice(&meta);
+        out.extend_from_slice(&bytes[end..]);
+        out
+    }
+
+    #[test]
+    fn inconsistent_layout_metadata_is_rejected() {
+        let (x, y) = dataset(200, 3, false);
+        let data = DMatrix::from_dense(&x, 200, 3)
+            .unwrap()
+            .with_label_matrix(&[y.clone(), y].concat(), 2)
+            .unwrap();
+        let params = TrainingParams::builder().max_depth(2).build().unwrap();
+        let bytes = train(&params, &data, 0)
+            .unwrap()
+            .to_compact_bytes()
+            .unwrap();
+        assert!(CompactModel::from_bytes(&with_meta(&bytes, |_| ())).is_ok());
+        // Two outputs × 2^63 parallel trees overflows the trees per iteration.
+        let overflow = with_meta(&bytes, |m| m.num_parallel_tree = 1 << 63);
+        assert!(matches!(
+            CompactModel::from_bytes(&overflow),
+            Err(HessboostError::ModelFormat(_))
+        ));
+        // A three-alpha objective cannot describe a two-output layout.
+        let widened = with_meta(&bytes, |m| {
+            m.objective = "reg:quantileerror".to_string();
+            m.n_targets = 1;
+            let mut params = ObjectiveParams::defaults_for("reg:quantileerror");
+            params.quantile_alpha = vec![0.1, 0.5, 0.9];
+            m.objective_params = Some(params);
+        });
+        assert!(matches!(
+            CompactModel::from_bytes(&widened),
+            Err(HessboostError::ModelFormat(_))
+        ));
     }
 
     #[test]

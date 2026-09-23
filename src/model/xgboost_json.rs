@@ -362,17 +362,11 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .and_then(scalar_f64)
         .map(|v| v as usize)
         .ok_or_else(|| HessboostError::model_format("missing/invalid `num_feature`"))?;
-    let num_class = lmp
-        .get("num_class")
-        .and_then(scalar_f64)
-        .map_or(0, |v| v as usize);
+    let num_class = count_param(lmp, "num_class", 0)?;
     // XGBoost's `num_target` counts model outputs (`ObjFunction::Targets`):
     // label columns for most objectives, but one output per alpha for the
     // alpha-list objectives, which fit a single label column.
-    let num_target = lmp
-        .get("num_target")
-        .and_then(scalar_f64)
-        .map_or(1, |v| v as usize);
+    let num_target = count_param(lmp, "num_target", 1)?;
 
     let objective_json = learner.get("objective");
     let objective = objective_json
@@ -421,7 +415,7 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
     let (order, num_parallel_tree) = iteration_tree_order(model, trees_json.len(), groups)?;
     let mut trees = Vec::with_capacity(trees_json.len());
     for &i in &order {
-        let tree = tree_from_json(&trees_json[i])
+        let tree = tree_from_json(&trees_json[i], n_outputs)
             .map_err(|e| HessboostError::model_format(format!("tree {i}: {e}")))?;
         trees.push(tree);
     }
@@ -667,18 +661,30 @@ fn vector_tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
 
 /// The leaf vectors of an XGBoost `MultiTargetTree` bundle, laid out
 /// `[node][output]` (zeros for internal nodes): leaf `i`'s vector is
-/// `leaf_weights[right_children[i] * k..][..k]`.
+/// `leaf_weights[right_children[i] * k..][..k]`. `k` has been checked
+/// against the model's outputs; the leaf weights must hold at least one
+/// vector before the `[node][output]` storage is allocated.
 fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Vec<f32>> {
     let leaf_weights = arr(tj, "leaf_weights", scalar_f64)
         .ok_or_else(|| HessboostError::missing_field("leaf_weights"))?;
-    let mut out = vec![0.0f32; left.len() * k];
+    if leaf_weights.len() < k {
+        return Err(HessboostError::model_format(format!(
+            "`leaf_weights` holds {} values, fewer than one leaf vector of width {k}",
+            leaf_weights.len()
+        )));
+    }
+    let len = left
+        .len()
+        .checked_mul(k)
+        .ok_or_else(|| HessboostError::model_format("leaf vector storage overflows"))?;
+    let mut out = vec![0.0f32; len];
     for (i, (&l, &r)) in left.iter().zip(right).enumerate() {
         if l != -1 {
             continue;
         }
         let slot = usize::try_from(r)
             .ok()
-            .filter(|&slot| (slot + 1) * k <= leaf_weights.len())
+            .filter(|&slot| slot < leaf_weights.len() / k)
             .ok_or_else(|| {
                 HessboostError::model_format(format!("leaf {i} has an invalid leaf index {r}"))
             })?;
@@ -692,8 +698,9 @@ fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Ve
     Ok(out)
 }
 
-/// Decode one XGBoost tree object into a [`RegTree`].
-fn tree_from_json(tj: &Value) -> Result<RegTree> {
+/// Decode one XGBoost tree object into a [`RegTree`] of a model with
+/// `n_outputs` outputs.
+fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
     let left = i32_arr(tj, "left_children")
         .ok_or_else(|| HessboostError::missing_field("left_children"))?;
     let n = left.len();
@@ -756,10 +763,21 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
     let loss_changes = arr_or_empty(tj, "loss_changes");
 
     let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
-    let size_leaf_vector = tj
-        .pointer("/tree_param/size_leaf_vector")
-        .and_then(scalar_f64)
-        .map_or(0, |k| k as usize);
+    // `size_leaf_vector` is 0 or 1 for scalar trees and the model's output
+    // count for vector-leaf trees (`MultiTargetTree`); anything else,
+    // including a width too large to allocate, is malformed.
+    let size_leaf_vector = match tj.pointer("/tree_param/size_leaf_vector") {
+        None => 0,
+        Some(value) => match scalar_f64(value) {
+            Some(k) if k == 0.0 || k == 1.0 => k as usize,
+            Some(k) if k == n_outputs as f64 => n_outputs,
+            _ => {
+                return Err(HessboostError::model_format(format!(
+                    "`size_leaf_vector` {value} is neither 0, 1, nor the model's {n_outputs} outputs"
+                )));
+            }
+        },
+    };
     let leaf_vectors = if size_leaf_vector > 1 {
         vector_leaves(tj, &left, &right, size_leaf_vector)?
     } else {
@@ -895,7 +913,16 @@ fn parse_base_score(
         .collect::<Option<Vec<f32>>>()
         .ok_or_else(invalid)?;
     let mut values = match values.len() {
-        1 => vec![values[0]; n_outputs],
+        1 => {
+            // Tree-less documents leave `n_outputs` bounded only by the
+            // declared count: allocate fallibly rather than abort.
+            let mut all = Vec::new();
+            all.try_reserve_exact(n_outputs).map_err(|_| {
+                HessboostError::model_format(format!("cannot hold {n_outputs} intercepts"))
+            })?;
+            all.resize(n_outputs, values[0]);
+            all
+        }
         len if len == n_outputs => values,
         len => {
             return Err(HessboostError::model_format(format!(
@@ -1134,7 +1161,9 @@ fn iteration_tree_order(
         }
         indptr.iter().map(|&i| i as usize).collect::<Vec<_>>()
     } else {
-        let per_iteration = num_parallel_tree * n_outputs;
+        let per_iteration = num_parallel_tree
+            .checked_mul(n_outputs)
+            .ok_or_else(|| HessboostError::model_format("trees per iteration overflow"))?;
         if !n_trees.is_multiple_of(per_iteration) {
             return Err(HessboostError::model_format(format!(
                 "{n_trees} trees do not form whole iterations of {per_iteration} \
@@ -1146,6 +1175,23 @@ fn iteration_tree_order(
             .collect()
     };
 
+    if n_trees == 0 {
+        // Every iteration of a tree-less model is empty.
+        return if indptr.len() > 1 {
+            Err(HessboostError::model_format(
+                "`iteration_indptr` contains an empty iteration",
+            ))
+        } else {
+            Ok((Vec::new(), num_parallel_tree))
+        };
+    }
+    // An iteration holds at least one tree per output group, which also
+    // bounds the per-group buffers below by the document's tree count.
+    if n_outputs > n_trees {
+        return Err(HessboostError::model_format(format!(
+            "{n_trees} trees cannot hold one iteration of {n_outputs} outputs"
+        )));
+    }
     let mut order = Vec::with_capacity(n_trees);
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_outputs];
     // Trees per group, fixed by the first iteration (the model parameter
@@ -1181,6 +1227,19 @@ fn iteration_tree_order(
 /// Fetch a required object field, erroring with its name if absent.
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
     v.get(key).ok_or_else(|| HessboostError::missing_field(key))
+}
+
+/// Read an optional non-negative integer count (XGBoost writes them as
+/// numeric strings), `default` when absent. Fractional, negative, or
+/// non-representable values are malformed rather than truncated.
+fn count_param(v: &Value, key: &str, default: usize) -> Result<usize> {
+    let Some(value) = v.get(key) else {
+        return Ok(default);
+    };
+    scalar_f64(value)
+        .filter(|&n| n >= 0.0 && n.fract() == 0.0 && n < u64::MAX as f64)
+        .and_then(|n| usize::try_from(n as u64).ok())
+        .ok_or_else(|| HessboostError::model_format(format!("invalid `{key}` {value}")))
 }
 
 /// Coerce a scalar JSON value (number, numeric string, or bool) to `f64`.
@@ -1443,6 +1502,95 @@ mod tests {
                 "{bad}: {err}"
             );
         }
+    }
+
+    /// A two-target model with one single-leaf vector tree of width
+    /// `width` and the given `leaf_weights`.
+    fn vector_stump_json(width: &str, leaf_weights: &str) -> String {
+        format!(
+            r#"{{
+              "version": [3, 4, 1],
+              "learner": {{
+                "gradient_booster": {{
+                  "name": "gbtree",
+                  "model": {{
+                    "gbtree_model_param": {{"num_parallel_tree": "1", "num_trees": "1"}},
+                    "tree_info": [0],
+                    "trees": [{{"id": 0,
+                      "tree_param": {{"num_nodes": "1", "num_feature": "1", "size_leaf_vector": "{width}"}},
+                      "left_children": [-1], "right_children": [0], "parents": [-1],
+                      "split_indices": [0], "split_conditions": [0.0], "default_left": [0],
+                      "base_weights": [], "leaf_weights": {leaf_weights},
+                      "loss_changes": [0.0], "sum_hessian": [1.0], "split_type": [0]}}]
+                  }}
+                }},
+                "learner_model_param": {{
+                  "base_score": "[0E0]", "boost_from_average": "1",
+                  "num_class": "0", "num_feature": "1", "num_target": "2"
+                }},
+                "objective": {{"name": "reg:squarederror", "reg_loss_param": {{"scale_pos_weight": "1"}}}}
+              }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn vector_leaf_width_is_validated_before_allocating() {
+        let model = import_xgboost_json(&vector_stump_json("2", "[1.0, 2.0]")).unwrap();
+        let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
+        assert_eq!(model.predict_margin(&d).unwrap(), [1.0, 2.0]);
+        // A width that saturates `usize` used to panic allocating the leaf
+        // storage; a width other than the model's outputs, a fractional
+        // width, or one the leaf weights cannot fill is a format error.
+        for (width, weights) in [
+            ("1e30", "[]"),
+            ("18446744073709551615", "[]"),
+            ("3", "[1.0, 2.0, 3.0]"),
+            ("2.5", "[1.0, 2.0, 3.0]"),
+            ("2", "[1.0]"),
+        ] {
+            let err = import_xgboost_json(&vector_stump_json(width, weights)).unwrap_err();
+            assert!(
+                matches!(err, HessboostError::ModelFormat(_)),
+                "{width}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_count_is_validated_before_allocating() {
+        // `num_target` saturating `usize` used to panic sizing the per-output
+        // tree groups or broadcasting the intercept.
+        let stump = hand_stump_json();
+        let treeless = stump
+            .replace(r#""num_trees": "1""#, r#""num_trees": "0""#)
+            .replace(r#""iteration_indptr": [0, 1],"#, "")
+            .replace(r#""tree_info": [0]"#, r#""tree_info": []"#);
+        let treeless = format!(
+            "{}]{}",
+            &treeless[..treeless.find(r#""trees": ["#).unwrap() + 10],
+            &treeless[treeless.find("}]").unwrap() + 2..]
+        );
+        assert_eq!(import_xgboost_json(&treeless).unwrap().num_trees(), 0);
+        for doc in [stump.to_string(), treeless] {
+            for count in ["1e30", "18446744073709551615", "1e18", "2.5", "-1", "0"] {
+                let doc = doc.replace(
+                    r#""num_target": "1""#,
+                    &format!(r#""num_target": "{count}""#),
+                );
+                let err = import_xgboost_json(&doc).unwrap_err();
+                assert!(
+                    matches!(err, HessboostError::ModelFormat(_)),
+                    "{count}: {err}"
+                );
+            }
+        }
+        // One tree cannot cover two outputs' groups.
+        let two = stump.replace(r#""num_target": "1""#, r#""num_target": "2""#);
+        assert!(matches!(
+            import_xgboost_json(&two),
+            Err(HessboostError::ModelFormat(_))
+        ));
     }
 
     #[test]

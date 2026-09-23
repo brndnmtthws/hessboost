@@ -185,6 +185,58 @@ fn unknown_and_corrupt_native_payloads_are_refused() {
     }
 }
 
+/// The native JSON document of a tree-less single-output model; tests edit
+/// its layout fields into inconsistent states.
+fn empty_model_doc() -> Value {
+    let model = train(&base().build().unwrap(), &matrix(1), 0).unwrap();
+    serde_json::from_str(&model.to_json().unwrap()).unwrap()
+}
+
+fn load_doc(doc: &Value) -> hessboost::error::Result<BoostedModel> {
+    BoostedModel::from_json(&doc.to_string())
+}
+
+#[test]
+fn overflowing_tree_layout_is_refused() {
+    // Two outputs × 2^63 parallel trees overflows `usize`: it used to panic
+    // (debug) or wrap to zero trees per iteration (release), after which
+    // round counts divided by zero.
+    let mut doc = empty_model_doc();
+    doc["n_outputs"] = 2.into();
+    doc["n_targets"] = 2.into();
+    doc["base_score"] = serde_json::json!([0.0, 0.0]);
+    assert!(load_doc(&doc).is_ok());
+    doc["num_parallel_tree"] = (1u64 << 63).into();
+    for best_iteration in [Value::Null, 0.into()] {
+        doc["best_iteration"] = best_iteration;
+        assert!(matches!(
+            load_doc(&doc),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
+}
+
+#[test]
+fn objective_width_must_match_the_stored_outputs() {
+    // A two-alpha objective on a one-output layout used to be accepted and
+    // then transform consecutive prediction rows as if they were one row.
+    for (objective, key) in [
+        ("reg:expectileerror", "expectile_alpha"),
+        ("reg:quantileerror", "quantile_alpha"),
+    ] {
+        let mut doc = empty_model_doc();
+        doc["objective"] = objective.into();
+        doc["objective_params"][key] = serde_json::json!([0.2, 0.8]);
+        let err = load_doc(&doc).unwrap_err();
+        assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
+        // The matching layout loads.
+        doc["n_outputs"] = 2.into();
+        doc["base_score"] = serde_json::json!([0.0, 0.0]);
+        let model = load_doc(&doc).unwrap();
+        assert_eq!(model.n_outputs(), 2);
+    }
+}
+
 /// `(x, y)` with `k` label columns: 160 rows, four features, missing values
 /// in column 3.
 fn train_data(k: usize) -> (Vec<f32>, Vec<f32>) {

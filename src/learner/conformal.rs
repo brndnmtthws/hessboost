@@ -99,8 +99,8 @@ impl<'a> SplitConformal<'a> {
     /// # Errors
     ///
     /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`,
-    ///   the model has more than one output, the calibration set carries
-    ///   non-uniform weights, or a prediction is not finite.
+    ///   the model has more than one output, the calibration set carries a
+    ///   label matrix or non-uniform weights, or a prediction is not finite.
     /// - [`HessboostError::EmptyDataset`] if the calibration set has no rows or
     ///   no labels.
     /// - [`HessboostError::DimensionMismatch`] if the calibration set's feature
@@ -251,7 +251,7 @@ impl<'a> ConformalizedQuantile<'a> {
     ///
     /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`,
     ///   either model has more than one output, the calibration set carries
-    ///   non-uniform weights, or a prediction is not finite.
+    ///   a label matrix or non-uniform weights, or a prediction is not finite.
     /// - [`HessboostError::EmptyDataset`] if the calibration set has no rows or
     ///   no labels.
     /// - [`HessboostError::DimensionMismatch`] if the two models expect
@@ -412,8 +412,8 @@ fn validate_alpha(alpha: f64) -> Result<()> {
     }
 }
 
-/// The calibration labels, after checking the set is non-empty, labelled,
-/// and unweighted (or uniformly weighted).
+/// The calibration labels, after checking the set is non-empty, labelled
+/// with one label column, and unweighted (or uniformly weighted).
 fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
     if calibration.n_rows() == 0 {
         return Err(HessboostError::EmptyDataset(
@@ -423,6 +423,15 @@ fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
     let labels = calibration.labels().ok_or(HessboostError::EmptyDataset(
         "conformal calibration set has no labels",
     ))?;
+    if calibration.n_targets() != 1 {
+        return Err(HessboostError::invalid_param(
+            "labels",
+            format!(
+                "conformal calibration needs one label per row, got a {}-column label matrix",
+                calibration.n_targets()
+            ),
+        ));
+    }
     if let Some(weights) = calibration.weights()
         && weights.iter().any(|&w| w != weights[0])
     {
@@ -801,6 +810,29 @@ mod tests {
             SplitConformal::calibrate(&model, &unlabeled, ALPHA),
             Err(HessboostError::EmptyDataset(_))
         ));
+
+        // A label matrix: scores would pair each row's prediction with the
+        // flattened cells, i.e. with other rows' and targets' labels.
+        let y = cal.labels().unwrap();
+        let two_targets = y.iter().flat_map(|&v| [v, v + 1.0]).collect::<Vec<_>>();
+        let matrix = DMatrix::from_dense(
+            &vec![0.5; cal.n_rows() * N_FEATURES],
+            cal.n_rows(),
+            N_FEATURES,
+        )
+        .unwrap()
+        .with_label_matrix(&two_targets, 2)
+        .unwrap();
+        assert_invalid(SplitConformal::calibrate(&model, &matrix, ALPHA), "labels");
+        assert_invalid(
+            ConformalizedQuantile::calibrate(&model, &model, &matrix, ALPHA),
+            "labels",
+        );
+        let multi_band = quantile_model(&train_set, [0.1, 0.9]);
+        assert_invalid(
+            ConformalizedQuantile::calibrate_outputs(&multi_band, 0, 1, &matrix, ALPHA),
+            "labels",
+        );
 
         // Non-uniform weights are rejected; uniform weights are equivalent to none.
         let ones = vec![2.0; cal.n_rows()];

@@ -20,8 +20,9 @@
 
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
-use crate::learner::LinearModel;
+use crate::error::Result;
 use crate::learner::model::for_each_present_value;
+use crate::learner::{LinearModel, reject_split_gradient};
 use crate::objective::{GradPair, Objective};
 
 /// One feature's present entries, stored column-major as parallel `(row, value)`
@@ -57,8 +58,9 @@ fn coordinate_delta(sum_grad: f64, sum_hess: f64, w: f64, alpha: f64, lambda: f6
 /// columns for multi-target labels, else 1). The
 /// returned [`LinearModel`] holds `weights` laid out `[feature][output]` and a
 /// per-output `bias`. Continued training passes the model's current linear
-/// booster as `start` (its margins in `initial_margin`); coordinate descent
-/// then resumes from its weights and bias instead of zeros.
+/// then resumes from its weights and bias instead of zeros. Fails when the
+/// objective supplies reduced split gradients, which only vector-leaf trees
+/// use.
 pub(crate) fn train_gblinear(
     params: &TrainingParams,
     dtrain: &DMatrix,
@@ -67,7 +69,7 @@ pub(crate) fn train_gblinear(
     n_out: usize,
     objective: &dyn Objective,
     start: Option<&LinearModel>,
-) -> LinearModel {
+) -> Result<LinearModel> {
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     // Label presence was validated by the training entry point (only
@@ -105,8 +107,9 @@ pub(crate) fn train_gblinear(
     let mut margin = initial_margin.to_vec();
     let mut gpair = vec![GradPair::default(); n * n_out];
 
-    for _round in 0..num_round {
+    for round in 0..num_round {
         objective.gradient_info(&margin, &info, &mut gpair);
+        reject_split_gradient(objective, round, &gpair)?;
 
         for k in 0..n_out {
             // 1. Bias (intercept) update: G = Σ g, H = Σ h.
@@ -156,5 +159,5 @@ pub(crate) fn train_gblinear(
         }
     }
 
-    LinearModel::new(lin_weights, bias)
+    Ok(LinearModel::new(lin_weights, bias))
 }

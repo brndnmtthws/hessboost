@@ -341,6 +341,21 @@ fn unsupported_combinations_are_rejected() {
         invalid_param(train_with_objective(&per_output, &dtrain, 1, &sketch)),
         "objective"
     );
+    // The linear booster grows no trees; it used to ignore the hook silently.
+    for strategy in [
+        MultiStrategy::OneOutputPerTree,
+        MultiStrategy::MultiOutputTree,
+    ] {
+        let linear = TrainingParams::builder()
+            .booster(BoosterKind::GbLinear)
+            .multi_strategy(strategy)
+            .build()
+            .unwrap();
+        assert_eq!(
+            invalid_param(train_with_objective(&linear, &dtrain, 1, &sketch)),
+            "objective"
+        );
+    }
     let monotone = vector_params()
         .monotone_constraints(vec![Monotone::Increasing])
         .build()

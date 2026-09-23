@@ -134,7 +134,7 @@ Criterion suite; `docs/performance.md` records its results.
 - **Objective/metric hooks:** training reaches objectives and metrics only
   through the `MetaInfo` hooks (`Objective::gradient_info`,
   `base_margins_info`, `eval_transform`, `probs_to_margins`, `validate_info`,
-  `requires_labels`; `Metric::eval_info`, `supports_label_matrix`).
+  `requires_labels`; `Metric::eval_info`, `validate_info`, `supports_label_matrix`).
   Label-domain checks live in each objective's `validate_info`;
   `create_objective(params, n_targets)` wraps the elementwise objectives
   listed in `MULTI_TARGET_OBJECTIVES` (`objective/mod.rs`) in
@@ -144,7 +144,9 @@ Criterion suite; `docs/performance.md` records its results.
   cannot model are rejected. The default `Metric::eval_info` reduces a label
   matrix elementwise (every cell weighted by its row weight); non-elementwise
   metrics override it or return `supports_label_matrix() == false`, which
-  training rejects. Unsupported parameter combinations are refused, never
+  training rejects; `Metric::validate_info` (labels required by default, the
+  survival interval metrics accept label bounds instead) is checked on every
+  eval set before training. Unsupported parameter combinations are refused, never
   ignored: `TrainingParams::validate`, `multi_output::validate`
   (`multi_output_tree` needs `hist`), and `continuation.rs`
   (`process_type=update`). XGBoost-JSON import maps `base_score` with

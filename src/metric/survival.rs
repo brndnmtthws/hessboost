@@ -5,6 +5,7 @@
 use super::Metric;
 use crate::config::AftDistribution;
 use crate::data::MetaInfo;
+use crate::error::{HessboostError, Result};
 use crate::objective::{abs_label_order, aft_nloglik};
 
 /// Negative log partial likelihood of the Cox model (`cox-nloglik`), per
@@ -70,6 +71,19 @@ fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> 
     }
 }
 
+/// [`Metric::validate_info`] of the interval metrics: they read the label
+/// bounds, or the labels as observed times when there are none.
+fn validate_intervals(name: &str, info: &MetaInfo) -> Result<()> {
+    let bounded = info.label_lower_bound.is_some() && info.label_upper_bound.is_some();
+    if info.n_rows > 0 && !bounded && info.labels.is_empty() {
+        return Err(HessboostError::invalid_param(
+            "eval_metric",
+            format!("metric `{name}` needs label bounds or labels, but dataset has neither"),
+        ));
+    }
+    Ok(())
+}
+
 /// Negative log-likelihood of the accelerated failure time model
 /// (`aft-nloglik`), weighted mean over rows.
 ///
@@ -109,6 +123,15 @@ impl Metric for AftNLogLik {
             aft_nloglik(self.distribution, lo, hi, pred, sigma)
         })
     }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        validate_intervals(self.name(), info)
+    }
+
+    /// The label bounds and weights are per row, one interval per row.
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
 }
 
 /// Fraction of rows whose predicted time `exp(margin)` lies inside the
@@ -136,6 +159,15 @@ impl Metric for IntervalRegressionAccuracy {
             let pred = log_pred.exp();
             if pred >= lo && pred <= hi { 1.0 } else { 0.0 }
         })
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        validate_intervals(self.name(), info)
+    }
+
+    /// The label bounds and weights are per row, one interval per row.
+    fn supports_label_matrix(&self) -> bool {
+        false
     }
 }
 

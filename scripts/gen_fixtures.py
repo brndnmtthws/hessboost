@@ -272,6 +272,13 @@ CASES = {
         dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
         dict(evals=True),
     ),
+    # the default `mphe` keeps the objective's slope (pseudo_huber_param in
+    # XGBoost's DefaultMetricConfig survives the metric's empty Configure)
+    "huber_slope2p5_d4": (
+        y_heavy_tail,
+        dict(objective="reg:pseudohubererror", huber_slope=2.5, max_depth=4),
+        dict(evals=True),
+    ),
     # small objectives; `evals` checks each default metric (rmsle, logloss on
     # raw margins, error on the 0/1 hinge output) round by round
     "squaredlog_d4": (y_gamma, dict(objective="reg:squaredlogerror", max_depth=4), dict(evals=True)),

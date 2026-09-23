@@ -168,7 +168,7 @@ fn incompatible_continuations_are_rejected() {
         param_name(train_continue(&linear, &d, 1, &first)),
         "booster"
     );
-    let narrow = DMatrix::from_dense(&vec![0.5; 30], 10, 3)
+    let narrow = DMatrix::from_dense(&[0.5; 30], 10, 3)
         .unwrap()
         .with_labels(&[0.0; 10])
         .unwrap();

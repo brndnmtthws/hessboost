@@ -132,7 +132,11 @@ def y_relevance_binary(x, rng):
 
 # name -> (target fn, param overrides, options)
 # options: tier, num_round, missing (fraction of NaN features), weighted, ranking,
-#          tol_train (override), drop (params removed from TREE_BASE)
+#          tol_train (override), drop (params removed from TREE_BASE),
+#          continue_from (train that many rounds, then continue to num_round via
+#          `xgb_model=`), refresh (process_type=update of the final model on a
+#          prefix of the training rows with transformed labels), ranges
+#          (iteration_range predictions and model slices)
 CASES = {
     # tree_method / grow policy / constraints on reg:squarederror
     "exact_reg_d6": (y_regression, dict(tree_method="exact"), {}),
@@ -265,6 +269,65 @@ CASES = {
         dict(booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
         dict(tier="quality"),
     ),
+    # continued training (`xgb_model=`), deterministic -> pointwise
+    "continue_hist_reg_d6": (y_regression, {}, dict(continue_from=20)),
+    "continue_exact_nobs_binary_d4": (
+        y_binary,
+        dict(objective="binary:logistic", tree_method="exact", max_depth=4),
+        dict(continue_from=10, drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "continue_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, max_depth=4),
+        dict(continue_from=15, tol_train=TOL_TRAIN_PROB),
+    ),
+    # process_type=update with the refresh updater
+    "refresh_reg_d4": (
+        y_regression,
+        dict(max_depth=4),
+        dict(refresh=dict(rows=1000, rounds=NUM_ROUND, refresh_leaf=True, labels=lambda y: 1.5 * y + 0.3)),
+    ),
+    "refresh_keepleaf_binary_d4": (
+        y_binary,
+        dict(objective="binary:logistic", max_depth=4),
+        dict(
+            tol_train=TOL_TRAIN_PROB,
+            refresh=dict(rows=1200, rounds=30, refresh_leaf=False, labels=lambda y: 1.0 - y),
+        ),
+    ),
+    "refresh_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, max_depth=4, num_parallel_tree=2),
+        dict(
+            num_round=20,
+            tol_train=TOL_TRAIN_PROB,
+            refresh=dict(rows=1500, rounds=20, refresh_leaf=True, labels=lambda y: (y + 1) % 3),
+        ),
+    ),
+    # num_parallel_tree: without sampling every forest tree is identical
+    "forest_np4_reg_d4": (y_regression, dict(num_parallel_tree=4, max_depth=4), dict(ranges=True)),
+    "forest_np2_softprob_d4": (
+        y_multiclass,
+        dict(objective="multi:softprob", num_class=3, max_depth=4, num_parallel_tree=2),
+        dict(num_round=20, tol_train=TOL_TRAIN_PROB, ranges=True),
+    ),
+    "ranges_hist_reg_d6": (y_regression, {}, dict(ranges=True)),
+    # random forest / boosted random forest (quality tier)
+    "rf_np8_reg_d6": (
+        y_regression,
+        dict(num_parallel_tree=8, subsample=0.8, colsample_bynode=0.8, eta=1.0, seed=42),
+        dict(tier="quality", num_round=1),
+    ),
+    "boosted_rf_np3_reg_d4": (
+        y_regression,
+        dict(num_parallel_tree=3, subsample=0.7, colsample_bytree=0.8, max_depth=4, seed=42),
+        dict(tier="quality", num_round=20),
+    ),
+    "dart_np2_ranges_d4": (
+        y_regression,
+        dict(booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4, num_parallel_tree=2),
+        dict(tier="quality", num_round=20, ranges=True),
+    ),
 }
 
 
@@ -353,14 +416,22 @@ def build_case(name: str) -> dict:
     dtest = xgb.DMatrix(x_test, nthread=1, feature_types=feature_types)
     dcontrib = xgb.DMatrix(x_test[:N_CONTRIB_ROWS], nthread=1, feature_types=feature_types)
 
-    booster = xgb.train(dict(params, nthread=1), dtrain, num_boost_round=num_round)
+    train_params = dict(params, nthread=1)
+    continuation = None
+    if "continue_from" in opts:
+        first = opts["continue_from"]
+        initial = xgb.train(train_params, dtrain, num_boost_round=first)
+        continuation = {"first_rounds": first, "xgb_model_initial": _save_model_json(initial)}
+        booster = xgb.train(train_params, dtrain, num_boost_round=num_round - first, xgb_model=initial)
+    else:
+        booster = xgb.train(train_params, dtrain, num_boost_round=num_round)
     pred = booster.predict(dtest)
     margin = booster.predict(dtest, output_margin=True)
     contribs = booster.predict(dcontrib, pred_contribs=True)
 
     tol_train = _quality_band(params) if tier == "quality" else opts.get("tol_train", TOL_TRAIN)
 
-    return {
+    fixture = {
         "xgboost_version": xgb.__version__,
         "name": name,
         "tier": tier,
@@ -384,7 +455,75 @@ def build_case(name: str) -> dict:
         "xgb_model": _save_model_json(booster),
         "xgb_model_ubj": _save_model_ubj(booster, name),
         "tol": {"train": tol_train, "import": TOL_IMPORT, "contribs": TOL_CONTRIBS},
+        "continuation": continuation,
+        "refresh": None,
+        "ranges": [],
+        "range_contribs": [],
+        "slices": [],
     }
+    if "refresh" in opts:
+        fixture["refresh"] = _refresh(opts["refresh"], train_params, booster, x_train, y_train, dtest)
+    if opts.get("ranges"):
+        fixture.update(_ranges(booster, dtest, dcontrib))
+    return fixture
+
+
+def _refresh(spec: dict, train_params: dict, booster: xgb.Booster, x_train, y_train, dtest) -> dict:
+    """`process_type=update` + `updater=refresh` of `booster` on the first
+    `rows` training rows relabelled by `labels`; predictions on the test set."""
+    rows = spec["rows"]
+    y = np.asarray(spec["labels"](y_train[:rows]), dtype=np.float32)
+    drefresh = xgb.DMatrix(x_train[:rows], label=y, nthread=1)
+    update = dict(
+        train_params,
+        process_type="update",
+        updater="refresh",
+        refresh_leaf=int(spec["refresh_leaf"]),
+    )
+    refreshed = xgb.train(update, drefresh, num_boost_round=spec["rounds"], xgb_model=booster.copy())
+    return {
+        "n_rows": rows,
+        "y": _to_json_floats(y),
+        "rounds": spec["rounds"],
+        "refresh_leaf": spec["refresh_leaf"],
+        "xgb_pred": _to_json_floats(refreshed.predict(dtest)),
+    }
+
+
+def _ranges(booster: xgb.Booster, dtest, dcontrib) -> dict:
+    """`iteration_range` margins, prefix-range contributions / leaf indices,
+    and `booster[begin:end:step]` slice margins. Slice spans are multiples
+    of their step (XGBoost 3.4.2 rejects other spans)."""
+    rounds = booster.num_boosted_rounds()
+    half = rounds // 2
+    spans = [(0, half), (rounds // 4, 3 * rounds // 4), (half, rounds), (rounds - 1, rounds)]
+    ranges = [
+        {
+            "begin": b,
+            "end": e,
+            "margin": _to_json_floats(booster.predict(dtest, output_margin=True, iteration_range=(b, e))),
+        }
+        for b, e in spans
+    ]
+    range_contribs = [
+        {
+            "end": e,
+            "contribs": _to_json_floats(booster.predict(dcontrib, pred_contribs=True, iteration_range=(0, e))),
+            "leaf": _to_json_floats(booster.predict(dcontrib, pred_leaf=True, iteration_range=(0, e))),
+        }
+        for e in (1, half)
+    ]
+    triples = [(0, half, 1), (1, 1 + 3 * ((rounds - 1) // 3), 3), (half, rounds, 1)]
+    slices = [
+        {
+            "begin": b,
+            "end": e,
+            "step": s,
+            "margin": _to_json_floats(booster[b:e:s].predict(dtest, output_margin=True)),
+        }
+        for b, e, s in triples
+    ]
+    return {"ranges": ranges, "range_contribs": range_contribs, "slices": slices}
 
 
 # ---------------------------------------------------------------------------

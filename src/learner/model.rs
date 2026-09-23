@@ -266,8 +266,8 @@ impl BoostedModel {
         self.tree_weights.resize(self.trees.len(), 1.0);
     }
 
-    /// Remove and return every tree (with its contribution weight, `1.0` when
-    /// absent), leaving an empty ensemble with the same metadata. Used by
+    /// Remove and return every tree (dropping the contribution weights),
+    /// leaving an empty ensemble with the same metadata. Used by
     /// `process_type=update`, which re-appends the refreshed trees.
     pub(crate) fn take_trees(&mut self) -> Vec<RegTree> {
         self.tree_weights.clear();

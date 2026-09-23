@@ -97,7 +97,20 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 **Implemented & tested**
 
 - **Boosters:** `gbtree`, **`dart`** (tree dropout), and **`gblinear`** (linear
-  model via coordinate descent).
+  model via coordinate descent); **boosted random forests** with
+  `num_parallel_tree` (each iteration grows that many trees per output from the
+  same gradients, each with its own row/column sample and `eta /
+  num_parallel_tree` shrinkage, as XGBoost does).
+- **Training lifecycle:** **continued training** from an existing model
+  (`train_continue` / `train_continue_with_eval`, XGBoost's `xgb_model=`),
+  which keeps the model's intercept and continues its RNG stream, so `a + b`
+  rounds in two calls grow the same trees as one run; **`process_type =
+  update`** refreshing an existing model's statistics and (with
+  `refresh_leaf`) leaf values on new data, like XGBoost's `refresh` updater;
+  **model slicing** by boosting iteration (`BoostedModel::slice(begin, end,
+  step)`, XGBoost's `booster[a:b:c]`); and **`iteration_range`** prediction
+  (`predict_range`, `predict_margin_range`, `predict_leaf_range`,
+  `predict_contribs_range`, `predict_interactions_range`).
 - **Trees:** `tree_method = exact | hist | approx` (approx uses hessian-weighted
   per-round binning), `grow_policy = depthwise | lossguide`, histogram binning
   with the parent−child subtraction trick, sparsity-aware missing-value handling,
@@ -119,9 +132,9 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   groups, label bounds for censored targets (`with_label_bounds`), feature
   types, and per-feature sampling weights (`with_feature_weights`). Every
   built-in objective is single-target; training rejects multi-target labels,
-  feature weights, and the not-yet-implemented `num_parallel_tree > 1`,
-  `sampling_method = gradient_based`, `multi_strategy = multi_output_tree`,
-  and `process_type = update` instead of ignoring them.
+  feature weights, and the not-yet-implemented
+  `sampling_method = gradient_based` and `multi_strategy = multi_output_tree`
+  instead of ignoring them.
 - **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
   `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
   **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for

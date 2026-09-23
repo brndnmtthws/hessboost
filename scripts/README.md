@@ -5,15 +5,16 @@
 `gen_fixtures.py` trains **real XGBoost 3.4.2** (single thread) on deterministic
 synthetic datasets, one case per supported feature (tree methods, missing values,
 constraints, every objective — including `reg:logistic` and the `reg:linear`
-alias — sample weights, ranking groups, gblinear, DART, intercept estimation;
-37 cases in total), and writes each case to `../fixtures/<name>.json`: data,
+alias — sample weights, ranking groups, gblinear, DART, intercept estimation,
+continued training, `process_type=update`, `num_parallel_tree` forests,
+`iteration_range` and slicing; 49 cases in total), and writes each case to `../fixtures/<name>.json`: data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
 raw margin, SHAP contributions on the first 50 rows) and the saved model JSON,
 plus the model's UBJSON encoding (`save_raw("ubj")`) as `../fixtures/<name>.ubj`.
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 
-`tests/parity.rs` runs a three-way check per case:
+`tests/parity.rs` runs these checks per case:
 
 1. **Train parity** - train on the fixture data, compare `predict(x_test)` with
    XGBoost's predictions.
@@ -28,12 +29,29 @@ quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
    same container form (typed element marker or generic) as XGBoost's own
    `save_raw("ubj")` of the loaded model.
 
+4. **Feature extras** (column `extra`: largest delta / number of checks, `-`
+   when the case has none), from optional fixture fields:
+   - `continuation` (`first_rounds`, `xgb_model_initial`): XGBoost trained
+     `first_rounds`, saved the model, and continued to `num_round` with
+     `xgb_model=`. Train parity then runs `train` + `train_continue` the same
+     way, and the imported initial model is continued and compared too.
+   - `refresh` (`n_rows`, `y`, `rounds`, `refresh_leaf`, `xgb_pred`):
+     `process_type=update` + `updater=refresh` of the final model on the first
+     `n_rows` training rows relabelled `y`; hessboost refreshes the imported
+     model (and, for `exact` cases, its own) with `train_continue`.
+   - `ranges` / `range_contribs` / `slices`: `iteration_range=(begin, end)`
+     margins, prefix-range contributions and leaf indices on the
+     contribution rows, and `booster[begin:end:step]` margins. Checked on the
+     imported model (leaf ids included) and, for `exact` cases, the trained
+     model.
+
 `quantile_cuts_match_xgboost` compares `HistCuts::from_dmatrix` bit-for-bit with
 the cut oracles.
 
 Cases are tiered. `exact` cases are pointwise: max |delta| within `tol.train`
 (1e-4; 1e-5 for probabilities), `tol.import` (1e-5) and `tol.contribs` (1e-4).
-`quality` cases are RNG-driven (`subsample`, `colsample_bytree`, DART); training
+`quality` cases are RNG-driven (`subsample`, `colsample_*`, DART, random
+forests); training
 uses a regression RMSE <= 1.08x XGBoost band while import/export remain
 pointwise. The `train-only` gblinear case validates training pointwise; its
 unsupported XGBoost-JSON import/export path is visibly reported as

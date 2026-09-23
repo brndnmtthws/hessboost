@@ -17,7 +17,6 @@ use crate::tree::RegTree;
 use crate::tree::builder::{
     ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows,
 };
-use crate::tree::gain::RegParams;
 use crate::tree::sampler::ColumnSampler;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -122,7 +121,8 @@ pub type EvalSet<'a> = (&'a DMatrix, &'a str);
 /// a boosting round.
 #[derive(Debug, Clone)]
 pub struct RoundEval {
-    /// The 0-based boosting iteration.
+    /// The 0-based boosting iteration of the model (after continued training,
+    /// counted from the start of the initial model).
     pub iteration: usize,
     /// `(dataset_name, metric_name, value)` triples.
     pub scores: Vec<(String, String, f64)>,
@@ -406,24 +406,23 @@ fn train_impl_inner(
     // `reg:squarederror` like XGBoost does, and a custom objective's outputs
     // determine the tree layout even though `num_class` is 0.
     let intercepts = || initial_intercepts(params, objective, &info, n_out);
-    let mut model = match init_model {
-        Some(init) => resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?,
-        None => {
-            require_model_for_update(params)?;
-            let mut model = BoostedModel::new(
-                intercepts()?,
-                ModelSpec {
-                    objective: objective.name().to_string(),
-                    objective_params: ObjectiveParams::from_params(params),
-                    num_class: params.num_class,
-                    n_outputs: n_out,
-                    n_targets: dtrain.n_targets(),
-                    n_features,
-                },
-            );
-            model.set_num_parallel_tree(params.num_parallel_tree);
-            model
-        }
+    let mut model = if let Some(init) = init_model {
+        resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?
+    } else {
+        require_model_for_update(params)?;
+        let mut model = BoostedModel::new(
+            intercepts()?,
+            ModelSpec {
+                objective: objective.name().to_string(),
+                objective_params: ObjectiveParams::from_params(params),
+                num_class: params.num_class,
+                n_outputs: n_out,
+                n_targets: dtrain.n_targets(),
+                n_features,
+            },
+        );
+        model.set_num_parallel_tree(params.num_parallel_tree);
+        model
     };
 
     // The linear (`gblinear`) booster fits a coordinate-descent linear model
@@ -510,20 +509,12 @@ fn train_impl_inner(
                 // Gradients from the already refreshed iterations; iteration
                 // `i`'s trees are then refreshed in place, output by output.
                 objective.gradient_info(&train_margin, &info, &mut gpair);
-                let reg = RegParams::from_params(params);
                 let per_iteration = n_out * parallel;
                 for slot in 0..per_iteration {
                     let k = slot / parallel;
                     let gk = gather_output(&gpair, &mut gpair_k, n_out, k);
                     let mut tree = std::mem::take(&mut queue[iteration * per_iteration + slot]);
-                    refresh_tree(
-                        &mut tree,
-                        dtrain,
-                        gk,
-                        &reg,
-                        tree_eta(params),
-                        params.refresh_leaf,
-                    );
+                    refresh_tree(&mut tree, dtrain, gk, params, tree_eta(params));
                     update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
                     for (ei, (d, _)) in evals.iter().enumerate() {
                         update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);

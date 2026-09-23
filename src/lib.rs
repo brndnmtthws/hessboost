@@ -37,7 +37,13 @@
 //!
 //! ## What's here
 //!
-//! - **Boosters:** `gbtree`, `dart`, `gblinear`.
+//! - **Boosters:** `gbtree`, `dart`, `gblinear`, and boosted random forests
+//!   (`num_parallel_tree`).
+//! - **Training lifecycle:** continued training from an existing model and
+//!   `process_type=update` tree refresh ([`train_continue`]), model slicing
+//!   ([`BoostedModel::slice`]) and `iteration_range` prediction
+//!   ([`predict_margin_range`](prelude::BoostedModel::predict_margin_range) and
+//!   siblings).
 //! - **Tree methods:** `exact`, `hist`, and `approx`, with `depthwise` or
 //!   `lossguide` growth.
 //! - **Objectives:** regression, binary/multiclass classification, count
@@ -63,7 +69,8 @@
 //! ## Where to look
 //!
 //! - Entry points: [`train`], [`train_with_eval`], [`train_with_objective`],
-//!   [`train_with_custom_metric`], [`cv`].
+//!   [`train_with_custom_metric`], [`train_continue`] /
+//!   [`train_continue_with_eval`], [`cv`].
 //! - Core types: [`DMatrix`] (data), [`TrainingParams`] (config, mirrors
 //!   XGBoost parameter names), [`BoostedModel`] (trained model).
 //! - Runnable examples in the crate's `examples/` directory (e.g.
@@ -86,6 +93,9 @@
 //! [`train_with_eval`]: prelude::train_with_eval
 //! [`train_with_objective`]: prelude::train_with_objective
 //! [`train_with_custom_metric`]: prelude::train_with_custom_metric
+//! [`train_continue`]: prelude::train_continue
+//! [`train_continue_with_eval`]: prelude::train_continue_with_eval
+//! [`BoostedModel::slice`]: prelude::BoostedModel::slice
 //! [`cv`]: prelude::cv
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]

@@ -12,8 +12,11 @@
 //!   (the node's base weight, shrunk by the per-tree learning rate
 //!   `eta / num_parallel_tree`); without it the leaf values stay as they are.
 //!
-//! No rows are subsampled.
+//! No rows are subsampled. Unlike split finding, XGBoost's refresh applies
+//! no `min_child_weight` floor: a node with any positive Hessian gets its
+//! regularized weight (`CalcWeight` / `CalcGain` in `src/tree/param.h`).
 
+use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::objective::GradPair;
 use crate::tree::RegTree;
@@ -25,15 +28,21 @@ use rayon::prelude::*;
 const REFRESH_BLOCK_ROWS: usize = 4096;
 
 /// Refresh `tree` in place from the per-row gradients `gpair` (one pair per
-/// row of `data`). See the module docs for the recomputed quantities.
+/// row of `data`) with `params`' regularization and `refresh_leaf`, shrinking
+/// refreshed leaves by `learning_rate`. See the module docs for the
+/// recomputed quantities.
 pub(super) fn refresh_tree(
     tree: &mut RegTree,
     data: &DMatrix,
     gpair: &[GradPair],
-    reg: &RegParams,
+    params: &TrainingParams,
     learning_rate: f32,
-    refresh_leaf: bool,
 ) {
+    let reg = &RegParams {
+        min_child_weight: 0.0,
+        ..RegParams::from_params(params)
+    };
+    let refresh_leaf = params.refresh_leaf;
     let stats = node_stats(tree, data, gpair);
     for nid in 0..tree.num_nodes() {
         let node = *tree.node(nid);
@@ -105,10 +114,19 @@ mod tests {
             GradPair::new(-3.0, 2.0),
             GradPair::new(0.5, 0.5),
         ];
-        let params = TrainingParams::builder().lambda(1.0).build().unwrap();
-        let reg = RegParams::from_params(&params);
+        // min_child_weight = 3 exceeds the right leaf's Hessian (2): refresh
+        // still gives it a weight, as XGBoost's refresh does.
+        let params = TrainingParams::builder()
+            .lambda(1.0)
+            .min_child_weight(3.0)
+            .build()
+            .unwrap();
+        let reg = RegParams {
+            min_child_weight: 0.0,
+            ..RegParams::from_params(&params)
+        };
         let mut tree = stump();
-        refresh_tree(&mut tree, &data, &gpair, &reg, 0.25, true);
+        refresh_tree(&mut tree, &data, &gpair, &params, 0.25);
 
         let (left, right, root) = (
             GradStats::new(3.5, 2.5),
@@ -126,7 +144,11 @@ mod tests {
 
         // Without refresh_leaf the statistics change but the leaves do not.
         let mut kept = stump();
-        refresh_tree(&mut kept, &data, &gpair, &reg, 0.25, false);
+        let keep_leaves = TrainingParams {
+            refresh_leaf: false,
+            ..params
+        };
+        refresh_tree(&mut kept, &data, &gpair, &keep_leaves, 0.25);
         assert_eq!(kept.node(1).leaf_value, 7.0);
         assert_eq!(kept.node(2).leaf_value, -7.0);
         assert_eq!(kept.node(0).sum_hess, 4.5);
@@ -137,9 +159,8 @@ mod tests {
     fn a_leaf_no_row_reaches_gets_zero_weight() {
         let data = DMatrix::from_dense(&[0.1, 0.2], 2, 1).unwrap();
         let gpair = [GradPair::new(1.0, 1.0), GradPair::new(1.0, 1.0)];
-        let reg = RegParams::from_params(&TrainingParams::default());
         let mut tree = stump();
-        refresh_tree(&mut tree, &data, &gpair, &reg, 0.3, true);
+        refresh_tree(&mut tree, &data, &gpair, &TrainingParams::default(), 0.3);
         assert_eq!(tree.node(2).sum_hess, 0.0);
         assert_eq!(tree.node(2).leaf_value, 0.0);
     }

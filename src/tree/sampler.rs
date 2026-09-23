@@ -22,6 +22,9 @@ pub struct ColumnSampler {
     bylevel: f64,
     bynode: f64,
     rng: StdRng,
+    /// The seed `rng` started from: the tree's own seed, which the trainer
+    /// derives from the configured seed, round, and output.
+    seed: u64,
 }
 
 impl ColumnSampler {
@@ -32,6 +35,7 @@ impl ColumnSampler {
             bylevel,
             bynode,
             rng: StdRng::seed_from_u64(seed),
+            seed,
         }
     }
 
@@ -46,6 +50,13 @@ impl ColumnSampler {
     pub fn sample(&mut self) -> Vec<u32> {
         let level = subsample(&self.pool, self.bylevel, &mut self.rng);
         subsample(&level, self.bynode, &mut self.rng)
+    }
+
+    /// The per-tree seed this sampler was built with. Other per-tree random
+    /// streams (the `extra_trees` threshold draws) derive from it so they vary
+    /// across rounds and outputs without consuming this sampler's draws.
+    pub(crate) fn seed(&self) -> u64 {
+        self.seed
     }
 }
 

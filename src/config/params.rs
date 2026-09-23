@@ -234,6 +234,33 @@ pub struct TrainingParams {
     /// `refresh_leaf`.
     pub refresh_leaf: bool,
 
+    // ---- LightGBM tree options (opt-in, beyond XGBoost) ----
+    /// Extremely randomized split search (LightGBM `extra_trees`): every
+    /// numerical feature is scored at one random bin boundary per node, drawn
+    /// uniformly between the node's lowest and highest occupied bin, and every
+    /// categorical feature at one random prefix of its gradient-ordered
+    /// categories. Requires the histogram builder (`hist`/`approx`).
+    pub extra_trees: bool,
+    /// Seed of the [`extra_trees`](Self::extra_trees) threshold draws,
+    /// combined with the per-tree seed derived from [`seed`](Self::seed).
+    /// LightGBM `extra_seed` (default `6`).
+    pub extra_seed: u64,
+    /// Path smoothing strength `s >= 0` (LightGBM `path_smooth`, `0` = off).
+    /// Each child's output is pulled toward its parent's:
+    /// `w = w_raw·(n/s)/(n/s + 1) + w_parent/(n/s + 1)` with `n` the child's
+    /// row count, and splits are scored at the smoothed outputs. Requires the
+    /// histogram builder (`hist`/`approx`).
+    pub path_smooth: f64,
+    /// Fit a ridge-regularized linear model in every leaf (LightGBM
+    /// `linear_tree`) on the numerical features split on along the leaf's
+    /// path; rows with a missing value in any of them predict the constant
+    /// leaf value. The first boosting round keeps constant leaves. Requires
+    /// the histogram builder (`hist`/`approx`).
+    pub linear_tree: bool,
+    /// L2 penalty on the leaf linear models' slopes (not their intercepts),
+    /// `>= 0`. LightGBM `linear_lambda`.
+    pub linear_lambda: f64,
+
     // ---- DART-specific ----
     /// Fraction of trees to drop each round (DART). XGBoost `rate_drop`.
     pub rate_drop: f64,
@@ -285,6 +312,11 @@ impl Default for TrainingParams {
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
             refresh_leaf: true,
+            extra_trees: false,
+            extra_seed: 6,
+            path_smooth: 0.0,
+            linear_tree: false,
+            linear_lambda: 0.0,
             rate_drop: 0.0,
             skip_drop: 0.0,
             missing: f64::NAN,
@@ -404,7 +436,62 @@ impl TrainingParams {
                 && self.max_depth == 0),
             "lossguide growth needs a bound: set max_leaves or max_depth > 0",
         )?;
-        Ok(())
+        self.validate_tree_options()
+    }
+
+    /// Range and compatibility checks of the opt-in LightGBM tree options
+    /// ([`extra_trees`](Self::extra_trees), [`path_smooth`](Self::path_smooth),
+    /// [`linear_tree`](Self::linear_tree)). They act inside the histogram tree
+    /// builder only, so every other booster, builder, or tree layout is
+    /// refused instead of silently ignoring them.
+    fn validate_tree_options(&self) -> Result<()> {
+        for (name, value) in [
+            ("path_smooth", self.path_smooth),
+            ("linear_lambda", self.linear_lambda),
+        ] {
+            ensure(
+                name,
+                value.is_finite() && value >= 0.0,
+                format!("must be >= 0, got {value}"),
+            )?;
+        }
+        let enabled = [
+            ("extra_trees", self.extra_trees),
+            ("path_smooth", self.path_smooth > 0.0),
+            ("linear_tree", self.linear_tree),
+        ];
+        for (name, _) in enabled.into_iter().filter(|&(_, on)| on) {
+            ensure(
+                name,
+                self.booster != BoosterKind::GbLinear,
+                "requires a tree booster (`gbtree` or `dart`)",
+            )?;
+            ensure(
+                name,
+                self.tree_method != TreeMethod::Exact,
+                "requires the histogram tree builder (`tree_method` `hist`, `approx` or `auto`)",
+            )?;
+            ensure(
+                name,
+                self.multi_strategy == MultiStrategy::OneOutputPerTree,
+                "is not supported with `multi_strategy=multi_output_tree`",
+            )?;
+        }
+        // LightGBM refuses `regression_l1` with linear trees: objectives whose
+        // leaves are re-estimated after growth (XGBoost's adaptive leaves)
+        // would overwrite the constant that linear leaves fall back to.
+        ensure(
+            "linear_tree",
+            !(self.linear_tree
+                && matches!(
+                    self.objective.as_str(),
+                    "reg:absoluteerror" | "reg:quantileerror"
+                )),
+            format!(
+                "is not supported with the adaptive-leaf objective `{}`",
+                self.objective
+            ),
+        )
     }
 
     /// The `max_delta_step` in effect: the configured value, or XGBoost's
@@ -604,6 +691,16 @@ impl TrainingParamsBuilder {
         process_type, ProcessType);
     setter!(/// Set whether `process_type = update` refreshes leaf values (`refresh_leaf`).
         refresh_leaf, bool);
+    setter!(/// Enable LightGBM's randomized split search (`extra_trees`).
+        extra_trees, bool);
+    setter!(/// Set the seed of the `extra_trees` threshold draws (`extra_seed`).
+        extra_seed, u64);
+    setter!(/// Set LightGBM's path smoothing strength (`path_smooth`, `0` = off).
+        path_smooth, f64);
+    setter!(/// Enable LightGBM's per-leaf linear models (`linear_tree`).
+        linear_tree, bool);
+    setter!(/// Set the L2 penalty on leaf linear-model slopes (`linear_lambda`).
+        linear_lambda, f64);
 
     /// Set the objective by name (e.g. `"binary:logistic"`).
     #[must_use]

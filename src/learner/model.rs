@@ -373,7 +373,9 @@ impl BoostedModel {
     /// `0..limit`, where `k` is the output count. Rows are traversed in
     /// cache-friendly blocks (parallel across blocks); per (row, output) slot
     /// the trees are still summed in ascending order, so the result is
-    /// bit-identical to the sequential tree-outer loop.
+    /// bit-identical to the sequential tree-outer loop. Ensembles with linear
+    /// leaves take a per-row path instead, since the compact forest stores
+    /// constant leaf values only.
     fn accumulate_forest(
         &self,
         data: &DMatrix,
@@ -382,6 +384,11 @@ impl BoostedModel {
         weight: impl Fn(usize) -> f32 + Sync,
     ) {
         let k = self.n_outputs();
+        let trees = &self.trees[..limit];
+        if trees.iter().any(|tree| tree.linear_leaves().is_some()) {
+            crate::tree::linear::accumulate_forest(trees, data, out, k, weight);
+            return;
+        }
         self.traverse_blocks(
             data,
             out,
@@ -595,8 +602,20 @@ impl BoostedModel {
 
     /// Validated prologue for the TreeSHAP paths. `predict_leaf` is excluded:
     /// it walks all trees (not the effective prefix) and needs no margins.
+    ///
+    /// Linear-leaf trees are refused: TreeSHAP attributes constant leaf values
+    /// along decision paths and has no defined extension to leaves whose
+    /// output varies with the row (LightGBM refuses SHAP for linear trees as
+    /// well).
     pub(super) fn attribution_prologue(&self, data: &DMatrix) -> Result<AttributionPrologue<'_>> {
         self.validate_prediction_data(data)?;
+        let trees = &self.trees[..self.effective_ntrees()];
+        if trees.iter().any(|tree| tree.linear_leaves().is_some()) {
+            return Err(crate::error::HessboostError::invalid_param(
+                "linear_tree",
+                "SHAP contributions and interactions are not defined for models with linear leaves",
+            ));
+        }
         let n = data.n_rows();
         let k = self.n_outputs();
         let nf = self.n_features;
@@ -605,7 +624,7 @@ impl BoostedModel {
             k,
             nf,
             width: nf + 1,
-            trees: &self.trees[..self.effective_ntrees()],
+            trees,
             initial: self.initial_margins(data),
         })
     }

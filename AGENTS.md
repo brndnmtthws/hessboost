@@ -53,7 +53,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation, `compact` (prediction layout, constant leaves only) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
@@ -120,6 +120,12 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 
 Multiclass objectives need `.num_class(k)`; ranking objectives need
 `.with_group_sizes`.
+
+Opt-in LightGBM tree options (`extra_trees`/`extra_seed`, `path_smooth`,
+`linear_tree`/`linear_lambda`) require the histogram builder and are refused
+elsewhere in `TrainingParams::validate`. Linear-leaf trees
+(`RegTree::linear_leaves`) predict through `tree::linear::accumulate_forest`
+instead of the compact forest, and XGBoost export and TreeSHAP refuse them.
 
 ## Not implemented
 

@@ -5,6 +5,7 @@
 //! subtraction (`sibling = parent − smaller_child`), so only the smaller child
 //! is ever built directly. Supports both `depthwise` and `lossguide` growth.
 
+use super::lightgbm::{NodeCtx, SplitOptions, finalize_smoothed_leaves, root_output};
 use super::{
     BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, build_interaction_sets,
     finalize_leaf_values, next_allowed, permits, sum_rows, sweep_categorical, xgb_loss_chg,
@@ -57,6 +58,8 @@ struct NodeEntry {
     /// constraints and the split features on the path from the root. `None`
     /// means "all features allowed" (the root, and the inactive case).
     allowed: Option<InteractionState>,
+    /// The tree's seed, handed to every node's split search.
+    tree_seed: u64,
 }
 
 /// Tree expansion and sampling happen in node order, so the expensive row and
@@ -100,6 +103,8 @@ pub struct HistTreeBuilder<'a> {
     /// interact with itself.
     interaction_sets: Option<Vec<Vec<u32>>>,
     backend: CpuBackend,
+    /// LightGBM `extra_trees` / `path_smooth`; `None` keeps XGBoost's search.
+    options: Option<SplitOptions>,
 }
 
 impl<'a> HistTreeBuilder<'a> {
@@ -111,6 +116,7 @@ impl<'a> HistTreeBuilder<'a> {
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
             backend: CpuBackend,
+            options: SplitOptions::from_params(params),
         }
     }
 
@@ -166,6 +172,13 @@ impl<'a> HistTreeBuilder<'a> {
 
         // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
         let root_feats = sampler.sample();
+        let tree_seed = sampler.seed();
+        let root_ctx = NodeCtx {
+            id: 0,
+            rows: row_subset.len(),
+            output: root_output(root_stats, &self.reg),
+            tree_seed,
+        };
         let best = self.evaluate(
             ghist,
             &root_hist,
@@ -173,6 +186,7 @@ impl<'a> HistTreeBuilder<'a> {
             &root_feats,
             Bounds::default(),
             None,
+            root_ctx,
         );
         let root = NodeEntry {
             nid: 0,
@@ -182,6 +196,7 @@ impl<'a> HistTreeBuilder<'a> {
             best,
             bounds: Bounds::default(),
             allowed: None,
+            tree_seed,
         };
 
         match self.params.grow_policy {
@@ -194,7 +209,13 @@ impl<'a> HistTreeBuilder<'a> {
         }
 
         // Finalize leaf weights (respecting each leaf's monotone bounds).
-        finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.reg);
+        // Path-smoothed leaves already hold the outputs their splits chose.
+        match &self.options {
+            Some(options) if options.smoothing() => {
+                finalize_smoothed_leaves(&mut tree, root_stats, &self.reg);
+            }
+            _ => finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.reg),
+        }
         (tree, store.leaf_rows.unwrap_or_default())
     }
 
@@ -385,6 +406,7 @@ impl<'a> HistTreeBuilder<'a> {
             hist: mut parent_hist,
             best,
             allowed: parent_allowed,
+            tree_seed,
             ..
         } = entry;
         let b = &best;
@@ -428,6 +450,20 @@ impl<'a> HistTreeBuilder<'a> {
             (BestSplit::none(), BestSplit::none())
         } else {
             let allowed = child_allowed.as_ref();
+            // Under path smoothing each child's output is the one its split
+            // recorded; it is the parent output of the child's own children.
+            let left_ctx = NodeCtx {
+                id: left_id,
+                rows: left_rows.len(),
+                output: b.w_left,
+                tree_seed,
+            };
+            let right_ctx = NodeCtx {
+                id: right_id,
+                rows: right_rows.len(),
+                output: b.w_right,
+                tree_seed,
+            };
             let left = || {
                 self.evaluate(
                     ghist,
@@ -436,6 +472,7 @@ impl<'a> HistTreeBuilder<'a> {
                     &left_features,
                     lb_bounds,
                     allowed,
+                    left_ctx,
                 )
             };
             let right = || {
@@ -446,6 +483,7 @@ impl<'a> HistTreeBuilder<'a> {
                     &right_features,
                     rb_bounds,
                     allowed,
+                    right_ctx,
                 )
             };
             if left_rows.len() + right_rows.len() >= PARALLEL_EVALUATE_ROWS && rayon_available() {
@@ -463,6 +501,7 @@ impl<'a> HistTreeBuilder<'a> {
             best: left_best,
             bounds: lb_bounds,
             allowed: child_allowed.clone(),
+            tree_seed,
         };
         let right = NodeEntry {
             nid: right_id,
@@ -472,6 +511,7 @@ impl<'a> HistTreeBuilder<'a> {
             best: right_best,
             bounds: rb_bounds,
             allowed: child_allowed,
+            tree_seed,
         };
         (left, right)
     }
@@ -484,7 +524,9 @@ impl<'a> HistTreeBuilder<'a> {
     /// to the endpoint that routes only the missing mass left).
     /// Candidates are scored and compared with XGBoost's `f32` arithmetic and
     /// tie rule, so near-equal gains resolve the same way. Monotone bounds are
-    /// honored through the bounded child weights.
+    /// honored through the bounded child weights. With LightGBM split options
+    /// enabled the search is delegated to [`SplitOptions::evaluate`].
+    #[allow(clippy::too_many_arguments)]
     fn evaluate(
         &self,
         ghist: &GHistIndex,
@@ -493,6 +535,7 @@ impl<'a> HistTreeBuilder<'a> {
         feature_subset: &[u32],
         bounds: Bounds,
         allowed: Option<&InteractionState>,
+        node: NodeCtx,
     ) -> BestSplit {
         let cuts = ghist.cuts();
         let mut best = BestSplit::none();
@@ -516,6 +559,19 @@ impl<'a> HistTreeBuilder<'a> {
             }
             None => feature_subset,
         };
+        if let Some(options) = &self.options {
+            return options.evaluate(
+                cuts,
+                dense,
+                hist,
+                total,
+                feature_subset,
+                bounds,
+                &self.cons,
+                &self.reg,
+                node,
+            );
+        }
         let constrained = self.cons.is_active();
         let root_gain = xgb_node_gain(total, &self.reg, bounds);
 

@@ -471,10 +471,12 @@ fn train_impl_inner(
             for k in 0..n_out {
                 // Retaining the final row partitions replaces a per-row tree
                 // traversal of the raw feature matrix with one sequential
-                // pass per leaf.
+                // pass per leaf (constant leaves only).
                 let (tree, leaf_rows) = match &prepared {
                     Prepared::Hist(ghist)
-                        if params.grow_policy == GrowPolicy::DepthWise && row_subset.len() == n =>
+                        if params.grow_policy == GrowPolicy::DepthWise
+                            && row_subset.len() == n
+                            && !params.linear_tree =>
                     {
                         let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
                         let mut sampler = make_column_sampler(
@@ -786,6 +788,16 @@ fn fit_output_tree(
     let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
     let mut sampler = make_column_sampler(n_features, params, rng, round as u64, k as u64);
     let mut tree = prepared.build_tree(params, dtrain, gk, row_subset, &mut sampler);
+    // LightGBM keeps the first round's trees constant.
+    if params.linear_tree && round > 0 {
+        crate::tree::linear::fit_linear_leaves(
+            &mut tree,
+            dtrain,
+            gk,
+            row_subset,
+            params.linear_lambda,
+        );
+    }
     tree.scale_leaves(params.eta as f32);
     tree
 }

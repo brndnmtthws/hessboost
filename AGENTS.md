@@ -53,7 +53,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,oblivious}` (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation, `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees), `reuse` (opt-in Trees-on-a-Diet feature/threshold reuse penalties) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,oblivious}` (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation (`hist/quantized`: opt-in LightGBM quantized-gradient histograms), `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees), `reuse` (opt-in Trees-on-a-Diet feature/threshold reuse penalties) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `sampling` (gradient-based/MVS row sampling per tree), `continuation` (continued-training / `process_type=update` checks), `refresh` (the refresh updater), `BoostedModel` (iteration layout, slicing, `iteration_range` prediction), cv, TreeSHAP, `conformal` (split-conformal / CQR intervals), `compact_model` (bit-packed Trees-on-a-Diet format, `CompactModel`) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
@@ -62,7 +62,8 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 `tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
 (proptest), `shap_accumulation.rs`, `sampling.rs` (row/column sampling
 contracts), `target_stats.rs`, `continuation.rs` (continued training,
-refresh, forests, slicing, iteration ranges). `benches/training.rs` is the Criterion
+refresh, forests, slicing, iteration ranges), `quantized.rs` (quantized-gradient
+training: thread-count determinism, quality band, leaf renewal). `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -73,6 +74,9 @@ suite; `docs/performance.md` records its results.
 - **Determinism:** identical params, data, and seed give identical
   predictions (property-tested), and the hist builder (every grow policy)
   grows the same tree serially and in parallel. Parallel reductions keep a fixed order.
+  Quantized training (`use_quantized_grad`) draws its stochastic rounding
+  from a counter-based stream keyed by row index and sums integers exactly,
+  so it keeps the same guarantee.
 - **Unsafe:** confined to `simd/` and the hot loops in `tree/compact.rs`,
   `tree/hist/`, and `tree/builder/hist.rs`. Every block needs a `// SAFETY:`
   comment (`undocumented_unsafe_blocks`); `unsafe_op_in_unsafe_fn` is
@@ -154,6 +158,10 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 - `SplitConformal::calibrate(&model, &dcal, alpha)` and
   `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)`,
   then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
+
+Opt-in quantized training: `.use_quantized_grad(true)` with
+`num_grad_quant_bins`, `stochastic_rounding`, `quant_train_renew_leaf`
+(`hist`/`approx` only; validated in `TrainingParams::validate`).
 
 Multiclass objectives need `.num_class(k)`; ranking objectives need
 `.with_group_sizes`; multi-target training takes `.with_label_matrix(y, k)`

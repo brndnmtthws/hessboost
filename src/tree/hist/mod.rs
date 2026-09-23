@@ -6,6 +6,8 @@
 //! partial histograms and reduce them, and provides the *subtraction trick*
 //! (`sibling = parent − child`) that halves histogram construction cost.
 
+pub(crate) mod quantized;
+
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;

@@ -42,6 +42,8 @@ impl Prepared {
     /// Grow one tree for this round's gradients and samples. With reuse
     /// penalties (`reuse` is `Some`) the split search is penalized by the
     /// ensemble's dictionary, which the new tree's splits then extend.
+    /// `rounding_seed` keys the stochastic rounding of quantized training.
+    #[allow(clippy::too_many_arguments)]
     fn build_tree(
         &self,
         params: &TrainingParams,
@@ -50,9 +52,11 @@ impl Prepared {
         rows: &[u32],
         sampler: &mut ColumnSampler,
         reuse: Option<&mut ReuseSet>,
+        rounding_seed: u64,
     ) -> RegTree {
         let hist = |ghist: &GHistIndex, reuse: Option<&ReuseSet>, sampler: &mut ColumnSampler| {
             HistTreeBuilder::new(params)
+                .with_rounding_seed(rounding_seed)
                 .with_reuse(reuse, ghist.cuts())
                 .build(ghist, gpair, rows, sampler)
         };
@@ -611,7 +615,9 @@ fn train_impl_inner(
                                 params,
                                 &mut rng,
                             );
+                            let rounding_seed = quantization_seed(params, &mut rng);
                             let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
+                                .with_rounding_seed(rounding_seed)
                                 .with_reuse(reuse.as_ref(), ghist.cuts())
                                 .build_with_leaf_rows(ghist, gk, row_subset, &mut sampler);
                             if let Some(reuse) = reuse.as_mut() {
@@ -989,13 +995,28 @@ fn fit_output_tree(
         None => (gk, row_subset),
     };
     let mut sampler = make_column_sampler(n_features, dtrain.feature_weights(), params, rng);
-    let mut tree = prepared.build_tree(params, dtrain, gk, rows, &mut sampler, reuse);
+    let rounding_seed = quantization_seed(params, rng);
+    let mut tree =
+        prepared.build_tree(params, dtrain, gk, rows, &mut sampler, reuse, rounding_seed);
     // LightGBM keeps the first iteration's trees constant.
     if params.linear_tree && iteration > 0 {
         crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, params.linear_lambda);
     }
     tree.scale_leaves(tree_eta(params));
     tree
+}
+
+/// The stochastic-rounding seed of one quantized tree, drawn from the
+/// iteration's RNG after the tree's column sampler, so every tree of an
+/// iteration (outputs and parallel trees alike) rounds independently and
+/// continued training resumes the same streams. Draws nothing unless
+/// `use_quantized_grad` is on, leaving the default RNG streams untouched.
+fn quantization_seed(params: &TrainingParams, rng: &mut StdRng) -> u64 {
+    if params.use_quantized_grad {
+        rng.random::<u64>()
+    } else {
+        0
+    }
 }
 
 /// Bernoulli row subsampling (each row kept with probability `subsample`),

@@ -253,6 +253,19 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   of 379 thresholds at 5096 bytes (6.6x), and `ι = ξ = 16` reaches 7.0x
   (4868 bytes, 93.75%). The `f32` leaf table (one value per leaf) bounds
   the savings.
+- **Quantized-gradient training** (`use_quantized_grad`, LightGBM's
+  quantized training, NeurIPS 2022): each tree's gradients and Hessians are
+  rounded to `num_grad_quant_bins` integer levels (stochastic rounding by
+  default, seeded and thread-count independent). Histograms then accumulate
+  packed integers whose width (32/64/128-bit) follows the node's row count.
+  `quant_train_renew_leaf` refits leaf values from the full-precision
+  gradients. Supports `hist`/`approx` with the depthwise and lossguide growth
+  policies (`grow_policy = symmetric` is refused). Trees differ from full-precision
+  training (test loss is within a few percent on the synthetic suites) and are
+  ordinary trees for every model format. The speedup is largest when histogram
+  building dominates: 1.5× (1 thread) and 1.85× (16 threads) for a 1M × 50
+  depth-8 tree. On 50k-row training it is within ±7% (see
+  `docs/performance.md`).
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.

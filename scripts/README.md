@@ -5,21 +5,23 @@
 `gen_fixtures.py` trains **real XGBoost 3.4.2** (single thread) on deterministic
 synthetic datasets, one case per supported feature (tree methods, missing values,
 constraints, every objective — including `reg:logistic`, the `reg:linear`
-alias, and the alpha-list objectives with one and three alphas (list-valued
-`quantile_alpha` / `expectile_alpha` params) — sample weights, ranking groups,
-gblinear, DART, intercept estimation, row/column sampling including
+alias, the alpha-list objectives with one and three alphas (list-valued
+`quantile_alpha` / `expectile_alpha` params), and the survival objectives
+with censored and tied times — sample weights, ranking groups, gblinear,
+DART, intercept estimation, row/column sampling including
 `sampling_method=gradient_based` and DMatrix `feature_weights`, multi-target
 label matrices, and per-round metric oracles for `rmsle`, `mape`, `mphe`,
-`pre`/`pre@k` and each objective's default metric), and writes each case to
-`../fixtures/<name>.json`: data, the exact `xgb.train` parameter dict,
-XGBoost's test-set predictions (transformed, raw margin, SHAP contributions on
-the first 50 rows) and the saved model JSON, plus the model's UBJSON encoding
-(`save_raw("ubj")`) as `../fixtures/<name>.ubj`. `n_targets` gives the label
-columns: the `multi_*` cases (3-target `reg:squarederror` on hist and exact,
-multi-label `binary:logistic` with and without `scale_pos_weight`, weighted
-2-target `reg:pseudohubererror` and `reg:absoluteerror`) store
-`y_train`/`y_test` row-major `[row][target]`, and their predictions, margins,
-and contributions carry the target axis.
+`pre`/`pre@k`, the survival metrics and each objective's default metric),
+and writes each case to `../fixtures/<name>.json`: data, the exact
+`xgb.train` parameter dict, XGBoost's test-set predictions (transformed, raw
+margin, SHAP contributions on the first 50 rows) and the saved model JSON,
+plus the model's UBJSON encoding (`save_raw("ubj")`) as
+`../fixtures/<name>.ubj`. `n_targets` gives the label columns: the `multi_*`
+cases (3-target `reg:squarederror` on hist and exact, multi-label
+`binary:logistic` with and without `scale_pos_weight`, weighted 2-target
+`reg:pseudohubererror` and `reg:absoluteerror`) store `y_train`/`y_test`
+row-major `[row][target]`, and their predictions, margins, and contributions
+carry the target axis.
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 

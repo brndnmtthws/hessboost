@@ -15,6 +15,7 @@ mod multiclass;
 mod quantile;
 mod ranking;
 mod regression;
+mod survival;
 
 pub use absolute::AbsoluteErrorObjective;
 pub use classification::{HingeObjective, LogisticObjective};
@@ -26,6 +27,10 @@ pub use ranking::LambdaMartObjective;
 pub use regression::{PseudoHuberObjective, SquaredErrorObjective, SquaredLogErrorObjective};
 
 pub(crate) use quantile::validate_alphas;
+
+pub use survival::{AftObjective, CoxObjective};
+
+pub(crate) use survival::{abs_label_order, aft_nloglik};
 
 use rayon::prelude::*;
 
@@ -454,6 +459,11 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         )),
         "rank:map" => Box::new(LambdaMartObjective::map(
             params.lambdarank_num_pair_per_sample,
+        )),
+        "survival:cox" => Box::new(CoxObjective),
+        "survival:aft" => Box::new(AftObjective::new(
+            params.aft_loss_distribution,
+            params.aft_loss_distribution_scale as f32,
         )),
         other => return Err(HessboostError::unknown("objective", other)),
     };

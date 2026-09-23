@@ -62,13 +62,15 @@
 //! `pseudo_huber_param.huber_slope`,
 //! `lambdarank_param.lambdarank_num_pair_per_sample`,
 //! `quantile_loss_param.quantile_alpha`,
-//! `expectile_loss_param.expectile_alpha`) round-trips through the
-//! model's [`ObjectiveParams`]; absent fields take XGBoost's defaults. The
-//! alpha lists are XGBoost's array strings (`"[0.1,0.5,0.9]"`, `(..)` also
-//! read); `reg:absoluteerror` has no block. A supported objective whose
-//! parameters do not rebuild it (e.g. an empty or unsorted alpha list) is a
-//! format error. Export rejects models whose objective XGBoost cannot load
-//! (custom objectives).
+//! `expectile_loss_param.expectile_alpha`,
+//! `aft_loss_param.{aft_loss_distribution, aft_loss_distribution_scale}`)
+//! round-trips through the model's [`ObjectiveParams`]; absent fields take
+//! XGBoost's defaults. The alpha lists are XGBoost's array strings
+//! (`"[0.1,0.5,0.9]"`, `(..)` also read); `reg:absoluteerror` and
+//! `survival:cox` have no block. A supported objective whose parameters do
+//! not rebuild it (e.g. an empty or unsorted alpha list) is a format error.
+//! Export rejects models whose objective XGBoost cannot load (custom
+//! objectives).
 //!
 //! ## `base_score`
 //!
@@ -115,7 +117,7 @@
 //! width, again as XGBoost writes them. [`import_xgboost_ubjson`] accepts the
 //! optimized and the plain UBJSON container forms alike.
 
-use crate::config::ObjectiveParams;
+use crate::config::{AftDistribution, ObjectiveParams};
 use crate::error::{HessboostError, Result};
 use crate::learner::BoostedModel;
 use crate::learner::model::ModelSpec;
@@ -757,6 +759,7 @@ fn parse_param_array(text: &str) -> Option<Vec<f64>> {
         _ => None,
     }
 }
+const AFT_LOSS_PARAM: &str = "aft_loss_param";
 
 /// Build the `objective` sub-document with the parameter block XGBoost 3.4.1
 /// writes for each objective (its `SaveConfig`), so upstream XGBoost accepts
@@ -768,6 +771,29 @@ fn parse_param_array(text: &str) -> Option<Vec<f64>> {
 fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams) -> Value {
     let mut out = Map::with_capacity(2);
     out.insert("name".to_string(), Value::String(objective.to_string()));
+    match objective {
+        // `CoxRegression::SaveConfig` writes the name only.
+        "survival:cox" => return Value::Object(out),
+        "survival:aft" => {
+            let distribution = match params.aft_loss_distribution {
+                AftDistribution::Normal => "normal",
+                AftDistribution::Logistic => "logistic",
+                AftDistribution::Extreme => "extreme",
+            };
+            let mut fields = Map::with_capacity(2);
+            fields.insert(
+                "aft_loss_distribution".to_string(),
+                Value::String(distribution.to_string()),
+            );
+            fields.insert(
+                "aft_loss_distribution_scale".to_string(),
+                Value::String(params.aft_loss_distribution_scale.to_string()),
+            );
+            out.insert(AFT_LOSS_PARAM.to_string(), Value::Object(fields));
+            return Value::Object(out);
+        }
+        _ => {}
+    }
     let ((block, key), value) = match objective {
         "reg:squaredlogerror" | "binary:hinge" | "reg:absoluteerror" => return Value::Object(out),
         "reg:quantileerror" => (QUANTILE_ALPHA, format_param_array(&params.quantile_alpha)),
@@ -847,6 +873,17 @@ fn objective_params_from_json(objective: &str, obj: Option<&Value>) -> Objective
             .and_then(Value::as_str)
         {
             *alpha = parse_param_array(text).unwrap_or_default();
+        }
+    }
+    if let Some(aft) = obj.get(AFT_LOSS_PARAM) {
+        match aft.get("aft_loss_distribution").and_then(Value::as_str) {
+            Some("normal") => params.aft_loss_distribution = AftDistribution::Normal,
+            Some("logistic") => params.aft_loss_distribution = AftDistribution::Logistic,
+            Some("extreme") => params.aft_loss_distribution = AftDistribution::Extreme,
+            _ => {}
+        }
+        if let Some(v) = aft.get("aft_loss_distribution_scale").and_then(scalar_f64) {
+            params.aft_loss_distribution_scale = v;
         }
     }
     params
@@ -1652,6 +1689,76 @@ mod tests {
             json["learner"]["objective"],
             json!({"name": "reg:absoluteerror"})
         );
+    }
+
+    /// `survival:aft` keeps its distribution and scale in `aft_loss_param`
+    /// and `survival:cox` writes no parameter block; both store `base_score`
+    /// as `exp(margin)` and predict identically after the round trip.
+    #[test]
+    fn survival_objectives_roundtrip() {
+        let n = 40;
+        let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let times: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32).collect();
+        let upper: Vec<f32> = times
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| if i % 3 == 0 { f32::INFINITY } else { t })
+            .collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_label_bounds(&times, &upper)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("survival:aft")
+            .aft_loss_distribution(AftDistribution::Extreme)
+            .aft_loss_distribution_scale(1.5)
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let aft = train(&params, &d, 3).unwrap();
+        let exported = export_xgboost_json(&aft).unwrap();
+        let json: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "survival:aft", "aft_loss_param": {
+                "aft_loss_distribution": "extreme", "aft_loss_distribution_scale": "1.5"}})
+        );
+        assert_eq!(
+            json["learner"]["learner_model_param"]["base_score"],
+            "[0.5]"
+        );
+        let back = import_xgboost_json(&exported).unwrap();
+        assert_eq!(
+            back.objective_params().aft_loss_distribution,
+            AftDistribution::Extreme
+        );
+        assert_eq!(back.objective_params().aft_loss_distribution_scale, 1.5);
+        assert_eq!(back.predict(&d).unwrap(), aft.predict(&d).unwrap());
+
+        let signed: Vec<f32> = times
+            .iter()
+            .zip(&upper)
+            .map(|(&t, &u)| if u.is_infinite() { -t } else { t })
+            .collect();
+        let dc = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_labels(&signed)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("survival:cox")
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let cox = train(&params, &dc, 3).unwrap();
+        let exported = export_xgboost_json(&cox).unwrap();
+        let json: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "survival:cox"})
+        );
+        let back = import_xgboost_json(&exported).unwrap();
+        assert_eq!(back.base_scores(), cox.base_scores());
+        assert_eq!(back.predict(&dc).unwrap(), cox.predict(&dc).unwrap());
     }
 
     #[test]

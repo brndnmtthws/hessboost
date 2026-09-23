@@ -41,10 +41,12 @@
 //! - **Tree methods:** `exact`, `hist`, and `approx`, with `depthwise` or
 //!   `lossguide` growth.
 //! - **Objectives:** regression, binary/multiclass classification, count
-//!   (poisson/gamma/tweedie), learning-to-rank (LambdaMART), and a custom hook
+//!   (poisson/gamma/tweedie), learning-to-rank (LambdaMART), survival
+//!   (`survival:cox`, `survival:aft` on censored label bounds), and a custom hook
 //!   ([`train_with_objective`]).
 //! - **Metrics:** rmse, mae, logloss, error, auc, aucpr, mlogloss, merror,
-//!   ndcg/map, nloglik, and a custom hook ([`train_with_custom_metric`]).
+//!   ndcg/map, nloglik, cox/aft-nloglik, interval-regression-accuracy, and a
+//!   custom hook ([`train_with_custom_metric`]).
 //! - **Modeling:** monotone & interaction constraints, native categorical
 //!   splits, early stopping, feature importance, TreeSHAP contributions and
 //!   interaction values ([`BoostedModel::predict_contribs`] /

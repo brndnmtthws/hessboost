@@ -160,6 +160,33 @@ def y_multi_heavy_tail(x, rng):
     )
 
 
+def y_cox(x, rng):
+    """Signed survival times for survival:cox: exponential event times with a
+    log-hazard linear in the features, independent exponential censoring
+    (about a third of rows, stored as -time), rounded to a 0.05 grid so that
+    many rows tie."""
+    n = x.shape[0]
+    hazard = np.exp(0.8 * x[:, 0] - 1.2 * x[:, 1] + 0.5 * x[:, 2])
+    event = rng.exponential(1.0 / hazard)
+    censor = rng.exponential(2.0, n)
+    observed = np.ceil(np.minimum(event, censor) * 20.0) / 20.0
+    return np.where(event <= censor, observed, -observed).astype(np.float32)
+
+
+def y_aft(x, rng):
+    """Label intervals for survival:aft from log-normal survival times: 40%
+    uncensored (lower == upper), 20% right- (upper = +inf), 20% left-
+    (lower = 0) and 20% interval-censored rows."""
+    n = x.shape[0]
+    t = np.exp(0.5 + x[:, 0] - 1.5 * x[:, 1] + 0.5 * rng.standard_normal(n)).astype(np.float32)
+    kind = rng.random(n)
+    below = (t * rng.uniform(0.5, 1.0, n)).astype(np.float32)
+    above = (t * rng.uniform(1.0, 2.0, n)).astype(np.float32)
+    lower = np.where(kind < 0.4, t, np.where(kind < 0.6, below, np.where(kind < 0.8, 0.0, below)))
+    upper = np.where(kind < 0.4, t, np.where(kind < 0.6, np.inf, above))
+    return None, lower.astype(np.float32), upper.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Case matrix
 # ---------------------------------------------------------------------------
@@ -436,6 +463,57 @@ CASES = {
         y_multi_heavy_tail,
         dict(objective="reg:absoluteerror", max_depth=4),
         dict(drop=("base_score",), weighted=True),
+    ),
+    # survival: Cox with censoring and tied times; AFT with every censoring
+    # type. Metric oracles cover cox-nloglik, aft-nloglik and
+    # interval-regression-accuracy.
+    "cox_hist_d4": (y_cox, dict(objective="survival:cox", max_depth=4), dict(evals=True)),
+    "cox_exact_nobs_d4": (
+        y_cox,
+        dict(objective="survival:cox", tree_method="exact", max_depth=4),
+        dict(drop=("base_score",), evals=True),
+    ),
+    "cox_weighted_nobs_d4": (
+        y_cox,
+        dict(objective="survival:cox", max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
+    "aft_normal_d4": (
+        y_aft,
+        dict(
+            objective="survival:aft",
+            aft_loss_distribution="normal",
+            aft_loss_distribution_scale=1.2,
+            max_depth=4,
+            eval_metric=["aft-nloglik", "interval-regression-accuracy"],
+        ),
+        dict(evals=True),
+    ),
+    "aft_logistic_exact_d4": (
+        y_aft,
+        dict(
+            objective="survival:aft",
+            aft_loss_distribution="logistic",
+            aft_loss_distribution_scale=0.8,
+            tree_method="exact",
+            max_depth=4,
+        ),
+        dict(evals=True),
+    ),
+    "aft_extreme_d4": (
+        y_aft,
+        dict(objective="survival:aft", aft_loss_distribution="extreme", max_depth=4),
+        dict(evals=True),
+    ),
+    "aft_weighted_nobs_d4": (
+        y_aft,
+        dict(
+            objective="survival:aft",
+            aft_loss_distribution="normal",
+            max_depth=4,
+            eval_metric=["aft-nloglik", "interval-regression-accuracy"],
+        ),
+        dict(drop=("base_score",), weighted=True, test_weighted=True, evals=True),
     ),
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
     "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),

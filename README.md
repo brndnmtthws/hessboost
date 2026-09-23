@@ -117,7 +117,10 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `binary:logitraw` (raw-margin output), `binary:hinge`, `multi:softmax`,
   `multi:softprob`, `count:poisson`, `reg:gamma`, `reg:tweedie`
   (`tweedie_variance_power`), learning-to-rank (`rank:pairwise`, `rank:ndcg`,
-  `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), and a user
+  `rank:map`, LambdaMART with `lambdarank_num_pair_per_sample`), survival
+  analysis (`survival:cox` on signed right-censored times with Breslow ties;
+  `survival:aft` on interval-censored label bounds with `normal`/`logistic`/
+  `extreme` noise, `aft_loss_distribution[_scale]`), and a user
   **custom-objective hook**. Intercepts are estimated per output exactly as
   XGBoost 3.4.1 does (label mean, class log-frequencies, label quantiles, or a
   Newton step).
@@ -144,10 +147,13 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   `logloss`, `error`, `auc`, `aucpr`, `mlogloss`, `merror`,
   `poisson/gamma/tweedie-nloglik`, `ndcg`, `map`, `pre` (with `@k`; plain
   `pre` cuts at 32 like XGBoost), `quantile` and `expectile` (averaged over
-  the configured alphas), and a **custom-metric hook**. Default metrics follow
-  XGBoost (`ndcg@k`/`map@k` for ranking, `tweedie-nloglik@rho` for Tweedie,
-  `mphe` for pseudo-Huber, `rmsle` for squared log error, `logloss` on raw
-  margins for `binary:logitraw`, `error` for hinge).
+  the configured alphas), `cox-nloglik`, `aft-nloglik`,
+  `interval-regression-accuracy`, and a **custom-metric hook**. Default
+  metrics follow XGBoost (`ndcg@k`/`map@k` for ranking, `tweedie-nloglik@rho`
+  for Tweedie, `mphe` for pseudo-Huber, `rmsle` for squared log error,
+  `logloss` on raw margins for `binary:logitraw`, `error` for hinge; the
+  default `aft-nloglik` uses the objective's distribution at scale 1, as
+  XGBoost's does).
 - **Constraints:** monotone constraints and **interaction constraints**,
   supported in **both** the `hist` and `exact` builders.
 - **Modeling:** **native categorical splits** (hist and exact), per-instance

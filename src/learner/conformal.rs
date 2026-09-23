@@ -194,6 +194,12 @@ enum QuantileBand<'a> {
         lower: usize,
         upper: usize,
     },
+    /// Two quantiles of the distributions a `dist:*` model predicts.
+    Distribution {
+        model: &'a BoostedModel,
+        lower: f64,
+        upper: f64,
+    },
 }
 
 impl QuantileBand<'_> {
@@ -218,6 +224,20 @@ impl QuantileBand<'_> {
                     .chunks_exact(k)
                     .map(|row| (row[lower], row[upper]))
                     .collect())
+            }
+            QuantileBand::Distribution {
+                model,
+                lower,
+                upper,
+            } => {
+                let band: Vec<(f32, f32)> = model
+                    .predict_distribution(data)?
+                    .iter()
+                    .map(|d| (round_down(d.quantile(lower)), round_up(d.quantile(upper))))
+                    .collect();
+                let flat: Vec<f32> = band.iter().flat_map(|&(lo, hi)| [lo, hi]).collect();
+                check_finite(&flat)?;
+                Ok(band)
             }
         }
     }
@@ -290,6 +310,35 @@ impl<'a> ConformalizedQuantile<'a> {
             model,
             lower: lower_output,
             upper: upper_output,
+        };
+        Self::calibrate_band(band, calibration, alpha)
+    }
+
+    /// Calibrate the central band of the distributions a `dist:*` model
+    /// predicts ([`BoostedModel::predict_distribution`]): its
+    /// `alpha / 2` and `1 - alpha / 2` quantiles, rounded outward to `f32`.
+    ///
+    /// The predicted distribution's own interval covers `1 - alpha` only if
+    /// the model is well specified and fitted; CQR restores the finite-sample
+    /// marginal guarantee regardless, widening the band when it under-covers
+    /// and tightening it when it over-covers, while keeping the per-row
+    /// widths the distribution learned.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::calibrate`], plus [`HessboostError::InvalidParameter`] if
+    /// the model's objective is not a `dist:*` objective or a predicted
+    /// quantile is not finite.
+    pub fn calibrate_distribution(
+        model: &'a BoostedModel,
+        calibration: &DMatrix,
+        alpha: f64,
+    ) -> Result<Self> {
+        validate_alpha(alpha)?;
+        let band = QuantileBand::Distribution {
+            model,
+            lower: 0.5 * alpha,
+            upper: 1.0 - 0.5 * alpha,
         };
         Self::calibrate_band(band, calibration, alpha)
     }

@@ -144,6 +144,43 @@ pub enum ProcessType {
     Update,
 }
 
+/// The second-order statistic the `dist:*` distributional objectives give
+/// the trees (beyond XGBoost; see [`crate::objective::distributional`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DistGradient {
+    /// Gradient of the negative log-likelihood with the diagonal Fisher
+    /// information as Hessian (Fisher scoring; a natural-gradient Newton
+    /// step for the orthogonal parameterizations used).
+    #[default]
+    Fisher,
+    /// Gradient with the diagonal of the exact (observed) Hessian, floored
+    /// at `1e-16` (XGBoostLSS-style).
+    Hessian,
+    /// NGBoost's natural gradient `I⁻¹ ∇` with unit Hessian: trees regress
+    /// the natural gradient by least squares.
+    Natural,
+}
+
+/// How the shared tree of a `dist:*` objective chooses its structure under
+/// `multi_strategy = multi_output_tree` (beyond XGBoost; see
+/// [`crate::objective::distributional`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DistSplitDirection {
+    /// Parallel gradient boosting (Chapelle et al., 2026, Algorithm 1): each
+    /// round grows the structure from the gradients of one distribution
+    /// parameter drawn uniformly at random (seeded by `seed` and the
+    /// iteration), a canonical descent direction `e_m`.
+    #[default]
+    Random,
+    /// Parallel gradient boosting with a deterministic sweep: parameter
+    /// `iteration mod n_params` drives round `iteration`.
+    Cyclic,
+    /// Plain vector-leaf trees: the split gain sums over every parameter.
+    All,
+}
+
 /// The complete training configuration.
 ///
 /// Construct with [`TrainingParams::builder`] or start from
@@ -199,6 +236,15 @@ pub struct TrainingParams {
     /// Scale of the `survival:aft` noise distribution (finite, `> 0`).
     /// XGBoost `aft_loss_distribution_scale`.
     pub aft_loss_distribution_scale: f64,
+    /// Second-order statistic of the `dist:*` objectives (beyond XGBoost):
+    /// Fisher information (default), exact Hessian, or NGBoost natural
+    /// gradient. Ignored by every other objective.
+    pub dist_gradient: DistGradient,
+    /// Split direction of the shared (vector-leaf) trees of the `dist:*`
+    /// objectives with `multi_strategy = multi_output_tree` (beyond XGBoost):
+    /// parallel gradient boosting on a random (default) or cyclic parameter,
+    /// or the full vector-leaf gain. Ignored otherwise.
+    pub dist_split_direction: DistSplitDirection,
 
     // ---- Tree booster ----
     /// Learning rate / step-size shrinkage. XGBoost `eta` / `learning_rate`.
@@ -351,6 +397,8 @@ impl Default for TrainingParams {
             expectile_alpha: Vec::new(),
             aft_loss_distribution: AftDistribution::Normal,
             aft_loss_distribution_scale: 1.0,
+            dist_gradient: DistGradient::Fisher,
+            dist_split_direction: DistSplitDirection::Random,
             eta: 0.3,
             gamma: 0.0,
             max_depth: 6,
@@ -690,6 +738,17 @@ pub struct ObjectiveParams {
     /// XGBoost `aft_loss_distribution_scale` (`survival:aft`).
     #[serde(default = "default_aft_scale")]
     pub aft_loss_distribution_scale: f64,
+    /// Second-order statistic of the `dist:*` objectives (beyond XGBoost).
+    #[serde(default)]
+    pub dist_gradient: DistGradient,
+    /// Shared-tree split direction of the `dist:*` objectives (beyond
+    /// XGBoost).
+    #[serde(default)]
+    pub dist_split_direction: DistSplitDirection,
+    /// The distribution family of a `dist:*` objective, derived from the
+    /// objective name (not a parameter): the `nll` / `crps` metrics read it.
+    #[serde(default)]
+    pub distribution: Option<crate::objective::DistFamily>,
 }
 
 impl ObjectiveParams {
@@ -705,6 +764,9 @@ impl ObjectiveParams {
             expectile_alpha: p.expectile_alpha.clone(),
             aft_loss_distribution: p.aft_loss_distribution,
             aft_loss_distribution_scale: p.aft_loss_distribution_scale,
+            dist_gradient: p.dist_gradient,
+            dist_split_direction: p.dist_split_direction,
+            distribution: crate::objective::DistFamily::from_objective(&p.objective),
         }
     }
 
@@ -734,6 +796,8 @@ impl ObjectiveParams {
             .expectile_alpha(self.expectile_alpha.clone())
             .aft_loss_distribution(self.aft_loss_distribution)
             .aft_loss_distribution_scale(self.aft_loss_distribution_scale)
+            .dist_gradient(self.dist_gradient)
+            .dist_split_direction(self.dist_split_direction)
     }
 }
 
@@ -834,6 +898,10 @@ impl TrainingParamsBuilder {
         aft_loss_distribution, AftDistribution);
     setter!(/// Set the `survival:aft` noise scale (`aft_loss_distribution_scale`).
         aft_loss_distribution_scale, f64);
+    setter!(/// Set the second-order statistic of the `dist:*` objectives (`dist_gradient`).
+        dist_gradient, DistGradient);
+    setter!(/// Set the shared-tree split direction of the `dist:*` objectives (`dist_split_direction`).
+        dist_split_direction, DistSplitDirection);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
         num_parallel_tree, usize);
     setter!(/// Set the row subsampling method (`sampling_method`).

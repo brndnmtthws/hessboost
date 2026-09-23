@@ -227,7 +227,8 @@ reproduced; see `hessboost::learner::budget` for the exact rules.
   **split conformal** (`SplitConformal`, absolute residuals around a point
   model) and **conformalized quantile regression** (`ConformalizedQuantile`,
   Romano et al. 2019) over two quantile models or two outputs of one model.
-- **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
+- **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O (files from
+  earlier releases keep loading with identical predictions),
   **XGBoost-format model import/export** for `gbtree`/DART ensembles
   with numeric and categorical splits, in both XGBoost encodings: JSON
   (`save_xgboost_json` / `load_xgboost_json`, `to_`/`from_xgboost_json`) and
@@ -319,6 +320,36 @@ reproduced; see `hessboost::learner::budget` for the exact rules.
   learning rate and per-tree loss target, five-fold generalization-gated
   splits, and automatic stopping. Deterministic and thread-count
   independent; the ordinary training path is untouched.
+- **Distributional boosting** (NGBoost, [Duan et al. 2020](https://arxiv.org/abs/1910.03225);
+  XGBoostLSS, [März 2019](https://arxiv.org/abs/1907.03178)): objectives
+  `dist:normal` (`μ`, `ln σ`), `dist:lognormal`, `dist:gamma` (`ln` mean,
+  `ln` shape), `dist:poisson` (`ln λ`; equals `count:poisson` without its
+  `max_delta_step` Hessian inflation) and `dist:negbinomial` (`ln` mean,
+  `ln` size) fit one tree per distribution parameter on the negative
+  log-likelihood. `dist_gradient` picks the second-order statistic:
+  `fisher` (default; the diagonal Fisher information, which is the full
+  Fisher matrix for these orthogonal parameterizations, so leaf steps are
+  natural-gradient steps), `hessian` (the exact Hessian diagonal, floored at
+  `1e-16`), or `natural` (NGBoost's natural gradient with unit Hessian). The
+  intercept is the MLE of the marginal label distribution.
+  `BoostedModel::predict_distribution` returns one `Dist` per row with
+  `mean`, `variance`, `cdf`, `quantile`, `log_prob`, `crps`, central
+  `interval`s and seeded inverse-CDF `sample`; `predict` reports the natural
+  parameters `[row][parameter]`. Metrics `nll` (default) and `crps` (closed
+  form for Normal/LogNormal/Gamma, exact step sums for the count families).
+  `ConformalizedQuantile::calibrate_distribution` conformalizes the
+  predicted central band (CQR). With `multi_strategy = multi_output_tree`
+  one shared vector-leaf tree per round fits every parameter:
+  `dist_split_direction = random` (default) or `cyclic` is parallel gradient
+  boosting ([Chapelle et al. 2026](https://arxiv.org/abs/2607.13550),
+  Algorithm 1: the structure is grown from one parameter's gradients `e_m`
+  per round, the leaves take every parameter's Newton step), `all` the
+  plain vector-leaf gain. Native binary/JSON only: XGBoost JSON/UBJSON
+  export and import refuse `dist:*`. On the `distributional` example
+  (heteroscedastic Normal noise, early stopping) the held-out NLL is 0.768
+  against 1.014 for a squared-error model with one global deviation (0.774
+  with parallel gradient boosting's 112 shared trees instead of 2 × 80),
+  with 90% intervals covering 0.891 (0.906 after CQR).
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.

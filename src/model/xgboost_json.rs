@@ -88,7 +88,8 @@
 //! `survival:cox` have no block. A supported objective whose parameters do
 //! not rebuild it (e.g. an empty or unsorted alpha list) is a format error.
 //! Export rejects models whose objective XGBoost cannot load (custom
-//! objectives).
+//! objectives, and hessboost's distributional `dist:*` objectives, which
+//! import rejects as well).
 //!
 //! ## `base_score`
 //!
@@ -252,6 +253,7 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     let num_feature = model.n_features();
     let num_class = model.num_class();
     let objective = model.objective().to_string();
+    reject_extension_objective(&objective)?;
     // XGBoost can only load objectives it knows; a custom objective
     // (`train_with_objective`) has no XGBoost counterpart.
     let objective_impl = model.rebuild_objective().map_err(|_| {
@@ -323,6 +325,19 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     Ok(value)
 }
 
+/// Refuse hessboost's own objectives, which XGBoost does not define: the
+/// distributional `dist:*` objectives. Their models are saved in the native
+/// binary or JSON formats only.
+fn reject_extension_objective(objective: &str) -> Result<()> {
+    if crate::objective::DistFamily::from_objective(objective).is_some() {
+        return Err(HessboostError::model_format(format!(
+            "objective `{objective}` is a hessboost extension that XGBoost models cannot \
+             carry; save the model in the native binary or JSON format"
+        )));
+    }
+    Ok(())
+}
+
 /// Map an XGBoost model document (decoded from either encoding) to a
 /// [`BoostedModel`].
 fn model_from_value(root: &Value) -> Result<BoostedModel> {
@@ -365,6 +380,7 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .and_then(Value::as_str)
         .unwrap_or("reg:squarederror")
         .to_string();
+    reject_extension_objective(&objective)?;
 
     // Parameter blocks come from the file: check them with the same rules as
     // a training configuration before the model rebuilds its objective.

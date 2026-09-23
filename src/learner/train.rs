@@ -738,11 +738,17 @@ pub(crate) fn initial_intercepts(
     n_out: usize,
 ) -> Result<Vec<f32>> {
     if let Some(base_score) = params.base_score {
+        if n_out > 1 && crate::objective::DistFamily::from_objective(&params.objective).is_some() {
+            return Err(HessboostError::invalid_param(
+                "base_score",
+                "a scalar cannot set the several parameters of a `dist:*` objective; \
+                 supply per-row `base_margin` instead",
+            ));
+        }
         let invalid = match params.objective.as_str() {
             "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
-            "count:poisson" | "reg:gamma" | "reg:tweedie" | "survival:cox" | "survival:aft" => {
-                base_score <= 0.0
-            }
+            "count:poisson" | "reg:gamma" | "reg:tweedie" | "survival:cox" | "survival:aft"
+            | "dist:poisson" => base_score <= 0.0,
             _ => false,
         };
         if invalid {

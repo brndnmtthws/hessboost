@@ -52,7 +52,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 |---|---|
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
-| `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks |
+| `objective/`, `metric/` | Losses and eval metrics by XGBoost name (`survival.rs` in each: Cox/AFT and their metrics, with a glibc-exact `erf`), plus custom hooks; `objective/distributional/` (opt-in `dist:*` families, `Dist` predictions, `special` functions) and `metric/distributional.rs` (`nll`, `crps`), beyond XGBoost |
 | `tree/` | `RegTree` (scalar or vector leaves), split gain, monotone/interaction constraints, column sampler (`sampler`: bytree/bylevel-per-depth/bynode, optionally feature-weighted), `builder/{exact,hist,multi,oblivious}` (`multi`: vector-leaf hist trees for `multi_output_tree`) (`oblivious`: opt-in `grow_policy = symmetric` level-wise growth, beyond XGBoost), `builder/budget` (five-fold generalization-gated grower for budget mode), `builder/lightgbm` (opt-in `extra_trees` / `path_smooth` split search, beyond XGBoost), `linear` (opt-in `linear_tree` leaf models: fit, storage, slow prediction path), `hist/` accumulation (`hist/quantized`: opt-in LightGBM quantized-gradient histograms), `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables `compact` uses for symmetric trees), `reuse` (opt-in Trees-on-a-Diet feature/threshold reuse penalties) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `multi_output` (`multi_output_tree` vector-leaf rounds, reduced split gradients), `budget` (opt-in PerpetualBooster-style budget training, beyond XGBoost), `sampling` (gradient-based/MVS row sampling per tree), `continuation` (continued-training / `process_type=update` checks), `refresh` (the refresh updater), `BoostedModel` (iteration layout, slicing, `iteration_range` prediction), cv, QuadratureTreeSHAP (`shap.rs`), `conformal` (split-conformal / CQR intervals), `compact_model` (bit-packed Trees-on-a-Diet format, `CompactModel`) |
@@ -63,7 +63,11 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 (proptest), `shap_accumulation.rs`, `sampling.rs` (row/column sampling
 contracts), `target_stats.rs`, `continuation.rs` (continued training,
 refresh, forests, slicing, iteration ranges), `quantized.rs` (quantized-gradient
-training: thread-count determinism, quality band, leaf renewal), `budget.rs`, `multi_output.rs` (vector-leaf trees). `benches/training.rs` is the Criterion
+training: thread-count determinism, quality band, leaf renewal), `budget.rs`, `multi_output.rs` (vector-leaf trees),
+`distributional.rs` (`dist:*` objectives: interval calibration, NLL vs a
+homoscedastic baseline, serialization, CQR), `native_format.rs` (native
+binary/JSON version migration and round trips; fixtures in
+`tests/data/native-v1/`). `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -90,11 +94,21 @@ suite; `docs/performance.md` records its results.
   3.4.1). `exact`-tier fixtures match pointwise; RNG-driven cases
   (subsampling, DART) only match within a quality band because the RNG
   streams differ.
-- **Formats:** the native binary magic (`SQB\0`), the JSON layouts and the
-  compact layout (`HBTD`, version byte, documented in
-  `learner/compact_model.rs`) are compatibility contracts; do not change them
-  without a migration. The compact metadata embeds `ObjectiveParams` as
-  postcard, so changing that struct changes the compact format too.
+- **Formats:** the native binary format (`SQB\0`, a version byte, a
+  postcard payload of `BoostedModel`), the JSON layouts and the compact layout
+  (`HBTD`, version byte, documented in `learner/compact_model.rs`) are
+  compatibility contracts; do not change them without a migration. Native
+  version 1 is hessboost 0.1.1 and earlier, decoded by the frozen structs in
+  `learner/native_v1.rs`; version 2 (`NATIVE_VERSION` in `learner/model.rs`)
+  is the current layout, and unknown versions are refused. Postcard is not
+  self-describing and ignores `#[serde(default)]`, so any change to a type
+  inside `BoostedModel` (`RegTree`, `Node`, `LinearLeaves`, `LinearModel`,
+  `ObjectiveParams`) needs a version bump plus a frozen decoder of the
+  previous layout; `tests/native_format.rs` checks the committed 0.1.1 files
+  in `tests/data/native-v1/` still predict bit for bit. Native JSON is
+  unversioned: only add fields, each with a serde default that reproduces the
+  old behavior. The compact metadata embeds `ObjectiveParams` as postcard, so
+  changing that struct changes the compact format too.
 - **Tree layout:** as in XGBoost, iteration `i` owns trees
   `i * trees_per_iteration ..` (`trees_per_iteration = n_outputs ×
   num_parallel_tree`), grouped by output; tree `t` feeds output
@@ -164,8 +178,10 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
   → `ModelSizeReport`; train with `toad_penalty_feature`/`toad_penalty_threshold` to
   shrink its dictionaries.
 - `SplitConformal::calibrate(&model, &dcal, alpha)` and
-  `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)`,
-  then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
+  `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)` /
+  `calibrate_distribution(&model, ..)`, then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
+- `BoostedModel::predict_distribution(&data)` → `Vec<Dist>` for `dist:*` models
+  (`DistFamily`, `Dist`, `DistGradient` in the prelude).
 
 Opt-in quantized training: `.use_quantized_grad(true)` with
 `num_grad_quant_bins`, `stochastic_rounding`, `quant_train_renew_leaf`

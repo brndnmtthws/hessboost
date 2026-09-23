@@ -10,6 +10,7 @@ mod absolute;
 mod classification;
 mod count;
 mod custom;
+pub mod distributional;
 mod multi_target;
 mod multiclass;
 mod quantile;
@@ -21,6 +22,7 @@ pub use absolute::AbsoluteErrorObjective;
 pub use classification::{HingeObjective, LogisticObjective};
 pub use count::{GammaObjective, PoissonObjective, TweedieObjective};
 pub use custom::CustomObjective;
+pub use distributional::{Dist, DistFamily, DistObjective};
 pub use multiclass::SoftmaxObjective;
 pub use quantile::{ExpectileObjective, QuantileObjective};
 pub use ranking::LambdaMartObjective;
@@ -466,8 +468,10 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
 /// one output per label column, as in XGBoost. `reg:quantileerror` /
 /// `reg:expectileerror` produce one output per `quantile_alpha` /
 /// `expectile_alpha` entry and reject an empty, unsorted, or out-of-`[0, 1]`
-/// list. Every other objective models a single target and rejects
-/// `n_targets > 1` with an `invalid parameter "labels"` error.
+/// list. The distributional `dist:*` objectives (beyond XGBoost, see
+/// [`distributional`]) give one output per distribution parameter. Every
+/// other objective models a single target and rejects `n_targets > 1` with
+/// an `invalid parameter "labels"` error.
 pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Objective>> {
     let objective: Box<dyn Objective> = match params.objective.as_str() {
         "reg:squarederror" | "reg:linear" => Box::new(SquaredErrorObjective),
@@ -511,7 +515,19 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
             params.aft_loss_distribution,
             params.aft_loss_distribution_scale as f32,
         )),
-        other => return Err(HessboostError::unknown("objective", other)),
+        other => match DistFamily::from_objective(other) {
+            Some(family) => {
+                let objective = DistObjective::new(family, params.dist_gradient);
+                Box::new(
+                    if params.multi_strategy == crate::config::MultiStrategy::MultiOutputTree {
+                        objective.with_split_direction(params.dist_split_direction, params.seed)
+                    } else {
+                        objective
+                    },
+                )
+            }
+            None => return Err(HessboostError::unknown("objective", other)),
+        },
     };
     with_targets(objective, n_targets)
 }

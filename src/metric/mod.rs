@@ -4,11 +4,13 @@
 //! [`crate::objective::Objective::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
+mod distributional;
 mod elementwise;
 mod quantile;
 mod ranking;
 mod survival;
 
+pub use distributional::{DistCrps, DistNll};
 pub use elementwise::{Mape, PseudoHuberError, Rmsle};
 pub use quantile::{ExpectileError, QuantileError};
 pub use ranking::Precision;
@@ -636,7 +638,9 @@ impl Metric for CustomMetric {
 /// read: `mphe` takes its slope from `huber_slope`, `aft-nloglik` the AFT
 /// distribution and scale, and `quantile` / `expectile` the configured
 /// `quantile_alpha` / `expectile_alpha` (whatever the objective, like
-/// XGBoost), failing when that list is empty or invalid.
+/// XGBoost), failing when that list is empty or invalid. The distributional
+/// metrics `nll` and `crps` (beyond XGBoost) take the family of a `dist:*`
+/// objective from `objective.distribution` and fail without one.
 pub fn create_metric(
     name: &str,
     num_class: usize,
@@ -694,6 +698,21 @@ pub fn create_metric(
             objective.aft_loss_distribution_scale as f32,
         ))),
         "interval-regression-accuracy" => Ok(Box::new(IntervalRegressionAccuracy)),
+        "nll" | "crps" => {
+            let family = objective.distribution.ok_or_else(|| {
+                HessboostError::invalid_param(
+                    "eval_metric",
+                    format!(
+                        "`{name}` scores predicted distributions and needs a `dist:*` objective"
+                    ),
+                )
+            })?;
+            Ok(if base == "nll" {
+                Box::new(DistNll::new(family))
+            } else {
+                Box::new(DistCrps::new(family))
+            })
+        }
         other => Err(HessboostError::unknown("metric", other)),
     }
 }

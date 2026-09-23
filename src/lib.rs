@@ -45,14 +45,23 @@
 //!   ([`predict_margin_range`](prelude::BoostedModel::predict_margin_range) and
 //!   siblings).
 //! - **Tree methods:** `exact`, `hist`, and `approx`, with `depthwise` or
-//!   `lossguide` growth.
-//! - **Objectives:** regression, binary/multiclass classification, count
+//!   `lossguide` growth; uniform or `gradient_based` row sampling and
+//!   column sampling, optionally weighted per feature
+//!   ([`DMatrix::with_feature_weights`](prelude::DMatrix::with_feature_weights)).
+//! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
+//!   absolute error, quantile and expectile alpha lists), binary
+//!   (logistic, logitraw, hinge) and multiclass classification, count
 //!   (poisson/gamma/tweedie), learning-to-rank (LambdaMART), survival
-//!   (`survival:cox`, `survival:aft` on censored label bounds), and a custom hook
-//!   ([`train_with_objective`]).
-//! - **Metrics:** rmse, mae, logloss, error, auc, aucpr, mlogloss, merror,
-//!   ndcg/map, nloglik, cox/aft-nloglik, interval-regression-accuracy, and a
-//!   custom hook ([`train_with_custom_metric`]).
+//!   (`survival:cox`, `survival:aft` on censored label bounds), and a custom
+//!   hook ([`train_with_objective`]).
+//! - **Multi-output:** multi-target label matrices
+//!   ([`DMatrix::with_label_matrix`](prelude::DMatrix::with_label_matrix)),
+//!   one tree per output or vector-leaf trees
+//!   ([`MultiStrategy::MultiOutputTree`](prelude::MultiStrategy::MultiOutputTree)).
+//! - **Metrics:** rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
+//!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
+//!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, and
+//!   a custom hook ([`train_with_custom_metric`]).
 //! - **Modeling:** monotone & interaction constraints, native categorical
 //!   splits, early stopping, feature importance, QuadratureTreeSHAP
 //!   contributions and interaction values ([`BoostedModel::predict_contribs`] /
@@ -60,35 +69,37 @@
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON and UBJSON model import/export ([`crate::model`]).
 //! - **Validation:** cross-validation ([`cv`]).
-//! - **Uncertainty:** split-conformal and conformalized-quantile prediction
-//!   intervals with finite-sample marginal coverage
+//! - **Beyond XGBoost (opt-in):** split-conformal and conformalized-quantile
+//!   prediction intervals with finite-sample marginal coverage
 //!   ([`SplitConformal`](prelude::SplitConformal),
 //!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
-//!   [`learner::conformal`]).
-//! - **Beyond XGBoost (opt-in):** CatBoost-style ordered target statistics
+//!   [`learner::conformal`]); CatBoost-style ordered target statistics
 //!   for categorical columns ([`data::OrderedTargetEncoder`]); LightGBM tree
 //!   options `extra_trees`, `path_smooth`, and `linear_tree` leaves
 //!   ([`config::TrainingParams::extra_trees`], [`config::TrainingParams::path_smooth`],
 //!   [`config::TrainingParams::linear_tree`], [`tree::linear`]);
 //!   CatBoost-style symmetric (oblivious) trees
 //!   ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), which batch
-//!   prediction routes by bit pattern; and compact models after *Boosted Trees
+//!   prediction routes by bit pattern; compact models after *Boosted Trees
 //!   on a Diet*: feature/threshold reuse penalties (`toad_penalty_feature`,
 //!   `toad_penalty_threshold`) and a bit-packed layout predicting bit-identical
-//!   margins ([`learner::compact_model`]); PerpetualBooster-style budget
-//!   training, one `budget` number instead of tuning `eta`/depth/rounds
-//!   ([`learner::budget`]); and distributional boosting
-//!   (NGBoost / XGBoostLSS style): `dist:normal`, `dist:lognormal`,
+//!   margins ([`learner::compact_model`]); LightGBM-style quantized-gradient
+//!   training ([`config::TrainingParams::use_quantized_grad`]);
+//!   PerpetualBooster-style budget training, one `budget` number instead of
+//!   tuning `eta`/depth/rounds ([`learner::budget`]); and distributional
+//!   boosting (NGBoost / XGBoostLSS style): `dist:normal`, `dist:lognormal`,
 //!   `dist:gamma`, `dist:poisson`, `dist:negbinomial` predict a full
 //!   conditional distribution per row
 //!   ([`BoostedModel::predict_distribution`](prelude::BoostedModel::predict_distribution),
-//!   [`objective::distributional`]), scored by `nll` / `crps`.
+//!   [`objective::distributional`]), scored by `nll` / `crps`. None of them
+//!   changes default training.
 //!
 //! ## Where to look
 //!
 //! - Entry points: [`train`], [`train_with_eval`], [`train_with_objective`],
 //!   [`train_with_custom_metric`], [`train_continue`] /
-//!   [`train_continue_with_eval`], [`cv`].
+//!   [`train_continue_with_eval`], [`cv`],
+//!   [`train_with_budget`](prelude::train_with_budget).
 //! - Core types: [`DMatrix`] (data), [`TrainingParams`] (config, mirrors
 //!   XGBoost parameter names), [`BoostedModel`] (trained model).
 //! - Runnable examples in the crate's `examples/` directory (e.g.
@@ -100,9 +111,12 @@
 //! ## Compatibility notes
 //!
 //! Objective, metric, and parameter names mirror XGBoost, so configurations
-//! transfer directly. Predictions match XGBoost's *model quality* (parity is
-//! CI-tested) but are not bit-identical. The two histogram implementations pick
-//! slightly different split points.
+//! transfer directly. Parity with XGBoost 3.4.2 is CI-tested: on the parity
+//! fixtures, deterministic configurations reproduce XGBoost's predictions
+//! within `1e-4` (quantile cuts bit for bit), and imported XGBoost models
+//! predict and explain as XGBoost does. RNG-driven options (row/column
+//! subsampling, DART) match only in model quality, because the random
+//! streams differ.
 //!
 //! [`DMatrix`]: prelude::DMatrix
 //! [`TrainingParams`]: prelude::TrainingParams

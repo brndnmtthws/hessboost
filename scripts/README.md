@@ -16,27 +16,38 @@ continued training, `process_type=update`, `num_parallel_tree` forests,
 `iteration_range` and slicing), and writes each case to
 `../fixtures/<name>.json`: data, the exact `xgb.train` parameter dict,
 XGBoost's test-set predictions (transformed, raw margin, SHAP contributions on
-the first 50 rows, and for the numeric, missing-value, categorical, multiclass,
-and DART cases in `INTERACTION_CASES` SHAP interaction values on the first 5
-rows) and the saved model JSON, plus the model's UBJSON encoding
-(`save_raw("ubj")`) as `../fixtures/<name>.ubj`. `n_targets` gives the label
-columns: the `multi_*` cases (3-target `reg:squarederror` on hist and exact,
-multi-label `binary:logistic` with and without `scale_pos_weight`, weighted
-2-target `reg:pseudohubererror` and `reg:absoluteerror`) store
-`y_train`/`y_test` row-major `[row][target]`, and their predictions, margins,
-and contributions carry the target axis. The `mot_*` cases train `multi_strategy=multi_output_tree`
-(vector-leaf trees): 3-target `reg:squarederror` depthwise, lossguide,
-with missing values, regularized (`gamma`, `min_child_weight`, `reg_alpha`,
+the first 50 rows, and for the cases in `INTERACTION_CASES` SHAP interaction
+values on the first 5 rows: numeric, missing-value, categorical, multiclass,
+DART, and the multi-output layouts, i.e. label matrix, alpha list,
+parallel-tree forests, and vector-leaf trees) and the saved model JSON, plus
+the model's UBJSON encoding (`save_raw("ubj")`) as `../fixtures/<name>.ubj`,
+named by the `xgb_model_ubj` field. Case names say what they vary: `exact_` /
+`approx_` / `hist_` tree methods, `_d<k>` the depth, and `nobs_` cases drop
+`base_score` so the intercept is estimated. `weighted` cases carry
+`weights`, ranking cases `group_sizes` / `test_group_sizes`, and categorical
+cases (two integer-coded categorical columns) `feature_types`. `n_targets`
+gives the label columns: the `multi_*` cases (3-target `reg:squarederror`
+on hist and exact, multi-label `binary:logistic` with and without
+`scale_pos_weight`, weighted 2-target `reg:pseudohubererror` and
+`reg:absoluteerror`) store `y_train`/`y_test` row-major `[row][target]`, and
+their predictions, margins, and contributions carry the target axis. The
+`mot_*` cases train `multi_strategy=multi_output_tree` (vector-leaf trees):
+3-target `reg:squarederror` depthwise, lossguide, with missing values,
+regularized (`gamma`, `min_child_weight`, `reg_alpha`, `reg_lambda`,
 `max_delta_step`), monotone, interaction-constrained and categorical;
 multi-label `binary:logistic`; `multi:softprob` / `multi:softmax`; weighted
 `reg:pseudohubererror`; `reg:quantileerror` / `reg:expectileerror` alpha
 lists and a weighted `reg:absoluteerror` label matrix; a `num_parallel_tree=3`
-forest with iteration ranges and slices; continued `multi:softprob` training;
-plus quality-tier subsampling and DART. Their contributions (and, for several,
-interactions) exercise vector-leaf QuadratureTreeSHAP.
+forest with iteration ranges and slices; continued `multi:softprob` training
+with ranges; plus quality-tier subsampling and DART. Their contributions
+(and, for several, interactions) exercise vector-leaf QuadratureTreeSHAP.
+The `forest_*`, `rf_*`, and `boosted_rf_*` cases cover `num_parallel_tree`
+on scalar, multiclass, label-matrix, and alpha-list models.
 
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
-quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
+quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices (uniform,
+few distinct values, normal, missing values, sparse weights; `approx` cases
+with squared-error and logistic round-0 Hessians).
 
 `tests/parity.rs` runs these checks per case:
 
@@ -62,15 +73,16 @@ quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
    - `refresh` (`n_rows`, `y`, `rounds`, `refresh_leaf`, `xgb_pred`):
      `process_type=update` + `updater=refresh` of the final model on the first
      `n_rows` training rows relabelled `y`; hessboost refreshes the imported
-     model (and, for `exact` cases, its own) with `train_continue`.
+     model (and, for `exact`-tier cases, its own) with `train_continue`.
    - `ranges` / `range_contribs` / `slices`: `iteration_range=(begin, end)`
      margins, prefix-range contributions and leaf indices on the
      contribution rows, and `booster[begin:end:step]` margins. Checked on the
-     imported model (leaf ids included) and, for `exact` cases, the trained
-     model.
+     imported model (leaf ids included) and, for `exact`-tier cases, the
+     trained model.
 
-`quantile_cuts_match_xgboost` compares `HistCuts::from_dmatrix` bit-for-bit with
-the cut oracles.
+`quantile_cuts_match_xgboost` compares the cut oracles bit-for-bit with
+`HistCuts::from_dmatrix` (`hist`) and `HistCuts::from_dmatrix_weighted` with
+the round-0 Hessians (`approx`).
 
 Cases are tiered. `exact` cases are pointwise: max |delta| within `tol.train`
 (1e-4; 1e-5 for probabilities), `tol.import` (1e-5), `tol.contribs` (1e-4) and
@@ -80,9 +92,10 @@ Cases are tiered. `exact` cases are pointwise: max |delta| within `tol.train`
 training uses a regression RMSE <= 1.08x XGBoost band (accuracy >= XGBoost -
 0.02 for classification) while import/export remain pointwise. A case's
 optional `feature_weights` array (one weight per column) is set on the
-training DMatrix on both sides. The `train-only` gblinear case validates training pointwise; its
-unsupported XGBoost-JSON import/export path is visibly reported as
-`n/a`/`skipped` and required to return `ModelFormat` on import. Unknown XGBoost
+training DMatrix on both sides. The `trainonly`-tier gblinear case validates
+training pointwise; its unsupported XGBoost-JSON import/export path is
+visibly reported as `n/a`/`skipped` and required to return `ModelFormat` on
+import. Unknown XGBoost
 parameters fail the test.
 
 Optional fixture fields extend the schema for metadata beyond plain labels:
@@ -168,7 +181,9 @@ For a quick harness check, add `--rows 512 --rounds 3 --repeats 1`. Use
 `--workloads regression` to select one dataset or `--threads 1` for a
 single-thread comparison. Remove the package version constraints to benchmark
 the latest releases available through `uv`. The output records the versions
-actually used.
+actually used. To compare against the parity pin instead, replace the two
+`--with` options with `--with-requirements scripts/requirements-xgboost.txt`
+(XGBoost 3.4.2, a source build).
 
 See [Performance](../docs/performance.md#xgboost-comparison) for the recorded
 comparison and workload definitions.

@@ -1,9 +1,9 @@
 # Performance
 
 hessboost combines runtime-detected SIMD numerical kernels — NEON on
-AArch64; AVX2+FMA (split evaluation, exponential and sigmoid transforms,
-logistic and short-softmax gradients) and SSE2 (quantile bin search) on
-x86-64 — with parallel histogram training. Data preparation and independent
+AArch64; AVX2+FMA (exponential and sigmoid transforms, logistic and
+short-softmax gradients) and SSE2 (quantile bin search) on x86-64 — with
+parallel histogram training. Split search is scalar. Data preparation and independent
 depthwise nodes share the worker pool; histogram task sizes follow node size,
 the two children of a large node are evaluated concurrently, and partial
 histograms are reduced in parallel by bin range. Training reuses row partitions
@@ -79,10 +79,21 @@ fit quality under identical hyperparameters, not quality across all datasets.
 
 | Workload | Held-out rows | Metric | hessboost | XGBoost 3.4.1 |
 |---|---:|---|---:|---:|
-| Regression, 100k × 30 | 20,000 | rmse | 0.060635 | 0.060965 |
-| Regression, 50k × 128 | 10,000 | rmse | 0.063959 | 0.064210 |
-| Binary, 100k × 30 | 20,000 | logloss | 0.515638 | 0.516273 |
-| 4-class, 50k × 30 | 10,000 | mlogloss | 0.150499 | 0.150027 |
+| Regression, 100k × 30 | 20,000 | rmse | 0.060965 | 0.060965 |
+| Regression, 50k × 128 | 10,000 | rmse | 0.064210 | 0.064210 |
+| Binary, 100k × 30 | 20,000 | logloss | 0.516273 | 0.516273 |
+| 4-class, 50k × 30 | 10,000 | mlogloss | 0.150027 | 0.150027 |
+
+The XGBoost column is from the M3 Max run above. The hessboost column was
+re-measured on 2026-09-23 on the AWS Neoverse-V3 host (aarch64 Linux 6.12)
+with `bench_xgb.py --threads 1` against XGBoost 3.4.2 built from source
+(`scripts/requirements-xgboost.txt`): XGBoost 3.4.2 reproduced the M3 3.4.1
+scores to all six digits, and hessboost at release 1af4e21 and on the
+roadmap branch matched XGBoost to within 1e-9 on every workload. The
+hessboost scores previously listed here (0.060635, 0.063959, 0.515638,
+0.150499) reproduce with neither build and have no recorded provenance.
+hessboost's quality was not re-measured on the M3 Max (both hosts are
+AArch64 and dispatch the same NEON kernels).
 
 ### Workloads and method
 
@@ -126,6 +137,15 @@ cargo build --release --example bench_compare
 uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
   --hessboost target/release/examples/bench_compare \
   --output /tmp/hessboost-xgb --threads 1 4 16
+```
+
+The quality re-check used the parity pin instead of the 3.4.1 wheel (a source
+build of XGBoost 3.4.2; one measured fit per batch is enough for scores):
+
+```sh
+uv run --with-requirements scripts/requirements-xgboost.txt python scripts/bench_xgb.py \
+  --hessboost target/release/examples/bench_compare \
+  --output /tmp/hessboost-xgb-quality --threads 1 --repeats 1
 ```
 
 The [script documentation](../scripts/README.md#xgboost-comparison) describes

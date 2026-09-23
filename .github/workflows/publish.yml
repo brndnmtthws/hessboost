@@ -3,54 +3,96 @@ name: Publish to crates.io
 on:
   push:
     tags:
-      - "v*"
-  workflow_dispatch:
-    inputs:
-      dry-run:
-        description: "Run cargo publish with --dry-run (no upload)"
-        type: boolean
-        default: true
+      - v*
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
-  publish:
-    name: cargo publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { name: x86_64-linux, runner: ubuntu-26.04 }
+          - { name: aarch64-linux, runner: ubuntu-26.04-arm }
+          - { name: aarch64-darwin, runner: macos-latest }
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: publish-test
+      - run: mbx test --all-features
 
-      # Toolchain from mise.toml. No compiler cache: published artifacts must
+  publish:
+    runs-on: ubuntu-latest
+    needs: [test]
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Toolchain from mise.toml. No compiler cache: the published crate must
       # not depend on restored build outputs.
       - uses: jdx/mise-action@v4
         with:
           cache: false
 
       - name: Verify tag matches crate version
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
           crate_version="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="hessboost"))')"
+            | jq -r '.packages[] | select(.name == "hessboost") | .version')"
           echo "tag=$tag crate=$crate_version"
           if [ "$tag" != "$crate_version" ]; then
             echo "::error::Git tag v$tag does not match hessboost Cargo.toml version $crate_version"
             exit 1
           fi
 
-      - name: cargo test
-        run: cargo test --all-features
-
-      - name: cargo publish (dry run)
-        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
-        run: cargo publish --all-features --dry-run
-
-      - name: cargo publish
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry-run)
+      - name: Select crates.io authentication method
+        id: auth-mode
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          if [[ -n "$CRATES_IO_TOKEN" ]]; then
+            echo "method=api-token" >> "$GITHUB_OUTPUT"
+          else
+            echo "method=trusted-publishing" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate with crates.io using trusted publishing
+        id: auth
+        if: steps.auth-mode.outputs.method == 'trusted-publishing'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish using API token
+        if: steps.auth-mode.outputs.method == 'api-token'
         run: cargo publish --all-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Publish using trusted publishing
+        if: steps.auth-mode.outputs.method == 'trusted-publishing'
+        run: cargo publish --all-features
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true

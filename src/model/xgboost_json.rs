@@ -46,12 +46,15 @@
 //! XGBoost tags each tree with its output group in `model.tree_info` and lays
 //! trees out per boosting iteration as `[g0 × num_parallel_tree, g1 × ...]`,
 //! with `iteration_indptr` (or, when absent, `num_parallel_tree × groups`
-//! trees per iteration) marking iteration boundaries. `hessboost` stores
-//! trees round-robin (tree `t` feeds output `t % n_outputs`), so import
-//! reorders each iteration's trees -- and their `weight_drop` entries -- into
-//! that layout, preserving each group's order. Per-output predictions are sums
-//! over a group's trees, so the reordering is lossless; a model whose groups
-//! have unequal tree counts within an iteration is rejected.
+//! trees per iteration) marking iteration boundaries. `hessboost` stores the
+//! same layout ([`BoostedModel::num_parallel_tree`] trees per output and
+//! iteration), so boosted random forests keep their iteration structure in
+//! both directions and export writes `num_parallel_tree`, `tree_info` and
+//! `iteration_indptr` accordingly. Import regroups an iteration whose trees
+//! are tagged out of group order, preserving each group's order (per-output
+//! predictions are sums over a group's trees, so this is lossless); a model
+//! whose groups have unequal tree counts within an iteration, or whose
+//! iterations differ in size, is rejected.
 //!
 //! ## Objective parameters
 //!
@@ -211,8 +214,8 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
             "objective `{objective}` has no XGBoost equivalent; cannot export"
         ))
     })?;
-    let n_outputs = model.n_outputs();
-    let n_trees = model.effective_ntrees();
+    let n_trees = model.effective_num_trees();
+    let per_iteration = model.trees_per_iteration();
 
     let trees: Vec<Value> = model.trees()[..n_trees]
         .iter()
@@ -220,18 +223,22 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
         .map(|(id, t)| tree_to_json(id, t, num_feature))
         .collect();
 
-    // `tree_info[t]` is the output group tree `t` contributes to. For scalar
-    // objectives that is always 0; multiclass trees are laid out round-robin,
-    // matching `BoostedModel`'s `t % n_outputs` convention.
+    // `tree_info[t]` is the output group tree `t` contributes to; hessboost
+    // lays iterations out like XGBoost (`num_parallel_tree` trees per group,
+    // groups in order), so the ids and iteration boundaries carry over.
     let tree_info: Vec<Value> = (0..n_trees)
-        .map(|t| json!((t % n_outputs) as i32))
+        .map(|t| json!(model.tree_output(t) as i32))
+        .collect();
+    let iteration_indptr: Vec<Value> = (0..=n_trees / per_iteration)
+        .map(|i| json!(i * per_iteration))
         .collect();
 
     let mut booster_model = json!({
         "gbtree_model_param": {
-            "num_parallel_tree": "1",
+            "num_parallel_tree": model.num_parallel_tree().to_string(),
             "num_trees": n_trees.to_string(),
         },
+        "iteration_indptr": iteration_indptr,
         "tree_info": tree_info,
         "trees": trees,
     });
@@ -313,9 +320,9 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .get("trees")
         .and_then(Value::as_array)
         .ok_or_else(|| HessboostError::model_format("missing `model.trees` array"))?;
-    // XGBoost lays trees out per boosting iteration, grouped by output; hessboost
-    // stores them round-robin. `order[i]` is the XGBoost index of hessboost tree `i`.
-    let order = round_robin_tree_order(model, trees_json.len(), n_outputs)?;
+    // `order[i]` is the XGBoost index of hessboost tree `i` (the identity for
+    // XGBoost's canonical group-ordered iterations).
+    let (order, num_parallel_tree) = iteration_tree_order(model, trees_json.len(), n_outputs)?;
     let mut trees = Vec::with_capacity(trees_json.len());
     for &i in &order {
         let tree = tree_from_json(&trees_json[i])
@@ -365,7 +372,7 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .build()
         .map_err(|e| HessboostError::model_format(format!("invalid objective parameters: {e}")))?;
 
-    let imported = BoostedModel::from_parts(
+    let mut imported = BoostedModel::from_parts(
         trees,
         tree_weights,
         base_margins,
@@ -378,6 +385,7 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
             n_features: num_feature,
         },
     );
+    imported.set_num_parallel_tree(num_parallel_tree);
     imported.validate_structure()?;
     Ok(imported)
 }
@@ -762,19 +770,26 @@ fn objective_params_from_json(objective: &str, obj: Option<&Value>) -> Objective
 // Tree layout
 // ---------------------------------------------------------------------------
 
-/// Map XGBoost's tree layout onto hessboost's round-robin one (tree `t` feeds
-/// output `t % n_outputs`). Returns, for each hessboost tree position, the index
-/// of the XGBoost tree that fills it.
+/// Map XGBoost's tree layout onto hessboost's (iteration-major, then output,
+/// then parallel tree: tree `t` feeds output `(t / num_parallel_tree) %
+/// n_outputs`). Returns, for each hessboost tree position, the index of the
+/// XGBoost tree that fills it, plus the model's `num_parallel_tree`.
 ///
 /// XGBoost (`GBTreeModel::LoadModel`) stores each boosting iteration as
 /// `[g0 × num_parallel_tree, g1 × num_parallel_tree, ...]` with `tree_info[t]`
 /// naming tree `t`'s output group, and marks iteration boundaries with
 /// `iteration_indptr` (derived as `num_parallel_tree × n_groups` trees per
-/// iteration when absent, `MakeIndptr`). Within an iteration each group's
-/// trees are emitted in original order, one per hessboost round, so a group's
-/// sum -- and hence every prediction -- is unchanged. Iterations whose groups
-/// have unequal tree counts cannot be expressed and are rejected.
-fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Result<Vec<usize>> {
+/// iteration when absent, `MakeIndptr`). That canonical layout maps
+/// one-to-one; an iteration whose trees are tagged out of group order is
+/// regrouped, keeping each group's order, so every group's sum -- and hence
+/// every prediction -- is unchanged. Iterations whose groups have unequal
+/// tree counts, or whose forest size differs from another iteration's,
+/// cannot be expressed and are rejected.
+fn iteration_tree_order(
+    model: &Value,
+    n_trees: usize,
+    n_outputs: usize,
+) -> Result<(Vec<usize>, usize)> {
     field(model, "tree_info")?;
     let tree_info = strict_nonnegative_integer_array(model, "tree_info")?;
     if tree_info.len() != n_trees {
@@ -789,6 +804,13 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
         )));
     }
 
+    let num_parallel_tree = model
+        .get("gbtree_model_param")
+        .and_then(|p| p.get("num_parallel_tree"))
+        .map_or(Some(1.0), scalar_f64)
+        .filter(|&v| v >= 1.0 && v.fract() == 0.0)
+        .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
+        as usize;
     let indptr = if model.get("iteration_indptr").is_some() {
         let indptr = strict_nonnegative_integer_array(model, "iteration_indptr")?;
         let bounded = indptr.first() == Some(&0)
@@ -801,13 +823,6 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
         }
         indptr.iter().map(|&i| i as usize).collect::<Vec<_>>()
     } else {
-        let num_parallel_tree = model
-            .get("gbtree_model_param")
-            .and_then(|p| p.get("num_parallel_tree"))
-            .map_or(Some(1.0), scalar_f64)
-            .filter(|&v| v >= 1.0 && v.fract() == 0.0)
-            .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
-            as usize;
         let per_iteration = num_parallel_tree * n_outputs;
         if !n_trees.is_multiple_of(per_iteration) {
             return Err(HessboostError::model_format(format!(
@@ -822,6 +837,9 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
 
     let mut order = Vec::with_capacity(n_trees);
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_outputs];
+    // Trees per group, fixed by the first iteration (the model parameter
+    // for a tree-less model).
+    let mut per_group: Option<usize> = None;
     for (iteration, bounds) in indptr.windows(2).enumerate() {
         for group in &mut groups {
             group.clear();
@@ -829,18 +847,24 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
         for t in bounds[0]..bounds[1] {
             groups[tree_info[t] as usize].push(t);
         }
-        let per_group = groups[0].len();
-        if groups.iter().any(|g| g.len() != per_group) {
+        let size = groups[0].len();
+        if groups.iter().any(|g| g.len() != size) || *per_group.get_or_insert(size) != size {
             return Err(HessboostError::model_format(format!(
-                "iteration {iteration}: outputs have unequal tree counts; \
+                "iteration {iteration}: outputs have unequal or varying tree counts; \
                  layout is not representable"
             )));
         }
-        for round in 0..per_group {
-            order.extend(groups.iter().map(|g| g[round]));
+        for group in &groups {
+            order.extend_from_slice(group);
         }
     }
-    Ok(order)
+    match per_group {
+        Some(0) => Err(HessboostError::model_format(
+            "`iteration_indptr` contains an empty iteration",
+        )),
+        Some(size) => Ok((order, size)),
+        None => Ok((order, num_parallel_tree)),
+    }
 }
 
 /// Fetch a required object field, erroring with its name if absent.
@@ -1368,28 +1392,53 @@ mod tests {
     }
 
     #[test]
-    fn import_regroups_parallel_trees_by_tree_info() {
+    fn import_keeps_parallel_trees_as_iterations() {
         // One iteration, two parallel trees per class: XGBoost order is
         // [c0, c0, c1, c1, c2, c2]; each class must receive its own leaves.
         let leaves = [1.0, 2.0, 10.0, 20.0, 100.0, 200.0];
         let tree_info = [0, 0, 1, 1, 2, 2];
         let derived = parallel_tree_json(2, &tree_info, &leaves, None, None);
         assert_eq!(class_margins(&derived), [3.0, 30.0, 300.0]);
+        let model = import_xgboost_json(&derived).unwrap();
+        assert_eq!(
+            (model.num_parallel_tree(), model.num_boost_rounds()),
+            (2, 1)
+        );
 
-        // Two iterations marked explicitly by `iteration_indptr`.
-        let leaves2 = [leaves, [4.0, 8.0, 40.0, 80.0, 400.0, 800.0]].concat();
-        let tree_info2 = [tree_info, tree_info].concat();
+        // Two iterations marked explicitly by `iteration_indptr`; the first
+        // one's trees are tagged out of group order and get regrouped.
+        let leaves2 = [
+            [2.0, 1.0, 10.0, 200.0, 20.0, 100.0],
+            [4.0, 8.0, 40.0, 80.0, 400.0, 800.0],
+        ]
+        .concat();
+        let tree_info2 = [[0, 0, 1, 2, 1, 2], tree_info].concat();
         let explicit = parallel_tree_json(2, &tree_info2, &leaves2, Some(&[0, 6, 12]), None);
         assert_eq!(class_margins(&explicit), [15.0, 150.0, 1500.0]);
+        let model = import_xgboost_json(&explicit).unwrap();
+        assert_eq!(model.num_boost_rounds(), 2);
+        let first = model.slice(0, 1, 1).unwrap();
+        let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
+        assert_eq!(first.predict_margin(&d).unwrap(), [3.0, 30.0, 300.0]);
 
         // DART weights are indexed by XGBoost position and follow their trees.
         let weights = [1.0, 0.5, 1.0, 0.5, 1.0, 0.5];
         let dart = parallel_tree_json(2, &tree_info, &leaves, None, Some(&weights));
         assert_eq!(class_margins(&dart), [2.0, 20.0, 200.0]);
+        // Re-export writes the forest back unchanged.
         let model = import_xgboost_json(&dart).unwrap();
-        // hessboost order: [c0#0, c1#0, c2#0, c0#1, c1#1, c2#1].
-        let restored: Vec<f32> = (0..6).map(|t| model.tree_weight(t)).collect();
-        assert_eq!(restored, [1.0, 1.0, 1.0, 0.5, 0.5, 0.5]);
+        let doc: Value = serde_json::from_str(&export_xgboost_json(&model).unwrap()).unwrap();
+        let booster = &doc["learner"]["gradient_booster"]["model"];
+        assert_eq!(booster["gbtree_model_param"]["num_parallel_tree"], "2");
+        assert_eq!(booster["tree_info"], json!(tree_info));
+        assert_eq!(booster["iteration_indptr"], json!([0, 6]));
+        assert_eq!(booster["weight_drop"], json!(weights));
+
+        // Iterations of different forest sizes are unmappable.
+        let uneven_info = [0, 0, 1, 2, 1, 2, 0, 1, 2];
+        let uneven = parallel_tree_json(2, &uneven_info, &leaves2[..9], Some(&[0, 6, 9]), None);
+        let err = import_xgboost_json(&uneven).unwrap_err();
+        assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
 
         // Groups with unequal tree counts in one iteration are unmappable.
         let lopsided = parallel_tree_json(2, &[0, 0, 1, 2, 2, 0], &leaves, None, None);

@@ -548,7 +548,6 @@ impl BoostedModel {
         shap_trees: &[ShapTree],
         tree_means: &[f64],
         get: &[f32],
-        k: usize,
         nf: usize,
         width: usize,
         acc: &mut [f64],
@@ -556,7 +555,7 @@ impl BoostedModel {
         arena: &mut [PathElement],
     ) {
         for (ti, tree) in shap_trees.iter().enumerate() {
-            let cls = ti % k;
+            let cls = self.tree_output(ti);
             let off = cls * width;
             let weight = f64::from(self.tree_weight(ti));
             scratch.fill(0.0);
@@ -580,13 +579,27 @@ impl BoostedModel {
     /// `n_rows × n_outputs × (n_features + 1)`, row-major: the contributions for
     /// row `r`, output `c`, feature `j` live at
     /// `((r * n_outputs + c) * (n_features + 1)) + j`, with the bias at column
-    /// `n_features`. Tree `t` contributes to output `t % n_outputs`.
+    /// `n_features`. Tree `t` contributes to output
+    /// `(t / num_parallel_tree) % n_outputs`.
     ///
     /// The key guarantee is exact additivity: for every row (and output) the sum
     /// of the `n_features + 1` values equals the raw margin from
-    /// [`BoostedModel::predict_margin`].
+    /// [`BoostedModel::predict_margin`]. Uses the effective iterations
+    /// (`[0, best_iteration + 1)` after early stopping).
     pub fn predict_contribs(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        let pro = self.attribution_prologue(data)?;
+        self.predict_contribs_range(data, self.attribution_default_range())
+    }
+
+    /// [`Self::predict_contribs`] over the boosting iterations in
+    /// `iteration_range` (XGBoost `iteration_range`, `end == 0` = through the
+    /// last iteration). As in XGBoost the range must start at iteration `0`;
+    /// use [`BoostedModel::slice`] for a later start.
+    pub fn predict_contribs_range(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<f32>> {
+        let pro = self.attribution_prologue(data, iteration_range, "contribution prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let (tree_means, shap_trees, arena) = self.shap_forest(trees);
@@ -623,7 +636,6 @@ impl BoostedModel {
                     &shap_trees,
                     &tree_means,
                     get,
-                    k,
                     nf,
                     width,
                     acc.as_mut_slice(),
@@ -659,10 +671,22 @@ impl BoostedModel {
     /// For a multiclass model (`n_outputs > 1`) the layout is
     /// `n_rows × n_outputs × (n_features + 1)^2`, row-major: the matrix for row
     /// `r`, output `c` occupies the `(n_features + 1)^2` values starting at
-    /// `(r * n_outputs + c) * (n_features + 1)^2`. Tree `t` contributes to output
-    /// `t % n_outputs`.
-    #[allow(clippy::needless_range_loop)]
+    /// `(r * n_outputs + c) * (n_features + 1)^2`. Tree `t` contributes to
+    /// output `(t / num_parallel_tree) % n_outputs`. Uses the effective
+    /// iterations, like [`Self::predict_contribs`].
     pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
+        self.predict_interactions_range(data, self.attribution_default_range())
+    }
+
+    /// [`Self::predict_interactions`] over the boosting iterations in
+    /// `iteration_range`, which must start at iteration `0` (see
+    /// [`Self::predict_contribs_range`]).
+    #[allow(clippy::needless_range_loop)]
+    pub fn predict_interactions_range(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<f32>> {
         // Per-thread scratch: unconditioned contributions, condition = +1
         // (feature present) / -1 (absent) accumulators, the interaction
         // matrices, per-tree phi buffers, and the path arena.
@@ -678,7 +702,7 @@ impl BoostedModel {
             arena: Vec<PathElement>,
         }
 
-        let pro = self.attribution_prologue(data)?;
+        let pro = self.attribution_prologue(data, iteration_range, "interaction prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let mwidth = width * width;
@@ -718,7 +742,6 @@ impl BoostedModel {
                     &shap_trees,
                     &tree_means,
                     get,
-                    k,
                     nf,
                     width,
                     diag.as_mut_slice(),
@@ -742,7 +765,7 @@ impl BoostedModel {
                     on.fill(0.0);
                     off.fill(0.0);
                     for (ti, tree) in shap_trees.iter().enumerate() {
-                        let cls = ti % k;
+                        let cls = self.tree_output(ti);
                         let base = cls * width;
                         s.phi_on.fill(0.0);
                         s.phi_off.fill(0.0);

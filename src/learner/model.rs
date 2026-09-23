@@ -3,7 +3,7 @@
 
 use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
-use crate::error::Result;
+use crate::error::{HessboostError, Result};
 use crate::objective::create_objective;
 use crate::tree::RegTree;
 use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, key};
@@ -38,6 +38,12 @@ pub enum ImportanceType {
 /// prediction for output `k` is simply `base_score[k] + Σ tree_k(x)`. The
 /// stored `objective` name drives the prediction transform (e.g. the logistic
 /// sigmoid).
+///
+/// Trees are laid out as in XGBoost: boosting iteration `i` owns the
+/// [`trees_per_iteration`](Self::trees_per_iteration) trees starting at
+/// `i * trees_per_iteration`, grouped by output (`num_parallel_tree` trees
+/// for output 0, then output 1, ...). Tree `t` therefore feeds output
+/// `(t / num_parallel_tree) % n_outputs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoostedModel {
     trees: Vec<RegTree>,
@@ -54,7 +60,7 @@ pub struct BoostedModel {
     num_class: usize,
     /// Raw outputs per instance: `num_class` for multiclass objectives, the
     /// objective's own output count otherwise (custom objectives may have
-    /// several). Trees are laid out round-robin over outputs.
+    /// several).
     n_outputs: usize,
     /// Label columns per training row (`1` unless trained on a label matrix).
     #[serde(default = "one_target")]
@@ -68,6 +74,11 @@ pub struct BoostedModel {
     /// field existed, in which case every tree is treated as weight `1.0`.
     #[serde(default)]
     tree_weights: Vec<f32>,
+    /// Trees grown per output in each boosting iteration (XGBoost
+    /// `num_parallel_tree`; `1` for ordinary boosting, more for boosted
+    /// random forests).
+    #[serde(default = "one_parallel_tree")]
+    num_parallel_tree: usize,
     /// Linear (coordinate-descent) booster parameters. `Some` only for
     /// `gblinear` models, in which case predictions come from the linear model
     /// and the `trees` vector is empty. Defaults to `None` for tree ensembles
@@ -101,6 +112,10 @@ impl LinearModel {
 
     pub(crate) fn bias(&self) -> &[f32] {
         &self.bias
+    }
+
+    pub(crate) fn weights(&self) -> &[f32] {
+        &self.weights
     }
 }
 
@@ -219,12 +234,45 @@ impl BoostedModel {
                 self.tree_weight(ti)
             }
         };
-        self.accumulate_forest(data, &mut out, self.trees.len(), weight);
+        self.accumulate_forest(data, &mut out, 0..self.trees.len(), weight);
         out
     }
 
     pub(crate) fn set_best_iteration(&mut self, it: Option<usize>) {
         self.best_iteration = it;
+    }
+
+    /// Set the number of trees per output in each iteration. Only valid while
+    /// the layout still holds whole iterations of that size
+    /// ([`BoostedModel::validate_structure`] checks it).
+    pub(crate) fn set_num_parallel_tree(&mut self, num_parallel_tree: usize) {
+        self.num_parallel_tree = num_parallel_tree;
+    }
+
+    /// Replace the per-output intercepts (margin space).
+    pub(crate) fn set_base_scores(&mut self, base_score: Vec<f32>) {
+        self.base_score = base_score;
+    }
+
+    /// Replace the objective hyper-parameters (continued training adopts the
+    /// new configuration, as XGBoost's `set_param` does).
+    pub(crate) fn set_objective_params(&mut self, params: ObjectiveParams) {
+        self.objective_params = params;
+    }
+
+    /// Give every tree an explicit contribution weight (`1.0` where absent),
+    /// so appended trees' weights line up with their tree ids.
+    pub(crate) fn materialize_tree_weights(&mut self) {
+        self.tree_weights.resize(self.trees.len(), 1.0);
+    }
+
+    /// Remove and return every tree (with its contribution weight, `1.0` when
+    /// absent), leaving an empty ensemble with the same metadata. Used by
+    /// `process_type=update`, which re-appends the refreshed trees.
+    pub(crate) fn take_trees(&mut self) -> Vec<RegTree> {
+        self.tree_weights.clear();
+        self.compact = OnceLock::new();
+        std::mem::take(&mut self.trees)
     }
 
     /// Reassemble a model from its constituent parts. Used by the XGBoost-JSON
@@ -248,6 +296,7 @@ impl BoostedModel {
             n_features: spec.n_features,
             best_iteration: None,
             tree_weights,
+            num_parallel_tree: 1,
             linear: None,
             compact: OnceLock::new(),
         }
@@ -263,7 +312,7 @@ impl BoostedModel {
         &self.objective_params
     }
 
-    /// Number of trees (boosting rounds × outputs).
+    /// Number of trees (boosting rounds × outputs × `num_parallel_tree`).
     pub fn num_trees(&self) -> usize {
         self.trees.len()
     }
@@ -283,9 +332,29 @@ impl BoostedModel {
         self.n_targets
     }
 
-    /// Number of boosting rounds (`num_trees / n_outputs`).
+    /// Trees grown per output in each boosting iteration (XGBoost
+    /// `num_parallel_tree`).
+    #[inline]
+    pub fn num_parallel_tree(&self) -> usize {
+        self.num_parallel_tree
+    }
+
+    /// Trees per boosting iteration: `n_outputs × num_parallel_tree`.
+    #[inline]
+    pub fn trees_per_iteration(&self) -> usize {
+        self.n_outputs * self.num_parallel_tree
+    }
+
+    /// The output tree `t` contributes to (XGBoost `tree_info[t]`).
+    #[inline]
+    pub(crate) fn tree_output(&self, t: usize) -> usize {
+        (t / self.num_parallel_tree) % self.n_outputs
+    }
+
+    /// Number of boosting iterations (`num_trees / trees_per_iteration`;
+    /// XGBoost `num_boosted_rounds`).
     pub fn num_boost_rounds(&self) -> usize {
-        self.trees.len() / self.n_outputs()
+        self.trees.len() / self.trees_per_iteration()
     }
 
     /// The first output's intercept (global bias) in margin space.
@@ -311,33 +380,90 @@ impl BoostedModel {
         self.best_iteration
     }
 
-    /// Number of trees to use at prediction time: `(best_iteration + 1) ×
-    /// n_outputs` when early stopping selected one, else all trees.
-    pub(crate) fn effective_ntrees(&self) -> usize {
-        match self.best_iteration {
-            Some(it) => (it + 1) * self.n_outputs(),
-            None => self.trees.len(),
+    /// Number of trees in the effective iterations (`[0, best_iteration +
+    /// 1)` after early stopping, else all trees).
+    pub(crate) fn effective_num_trees(&self) -> usize {
+        self.best_iteration.map_or(self.trees.len(), |it| {
+            ((it + 1) * self.trees_per_iteration()).min(self.trees.len())
+        })
+    }
+
+    /// The iteration range plain prediction uses: `[0, best_iteration + 1)`
+    /// when early stopping selected an iteration, else every iteration.
+    fn default_iteration_range(&self) -> (usize, usize) {
+        (0, self.best_iteration.map_or(0, |it| it + 1))
+    }
+
+    /// Tree ids covered by `iteration_range`, XGBoost's half-open `[begin,
+    /// end)` over boosting iterations with `end == 0` meaning "through the
+    /// last iteration". Each iteration contributes its whole forest (every
+    /// output and parallel tree).
+    pub(crate) fn iteration_trees(
+        &self,
+        iteration_range: (usize, usize),
+    ) -> Result<std::ops::Range<usize>> {
+        let (begin, end) = iteration_range;
+        let rounds = self.num_boost_rounds();
+        let end = if end == 0 { rounds } else { end };
+        if self.linear.is_some() && iteration_range != (0, 0) {
+            return Err(HessboostError::invalid_param(
+                "iteration_range",
+                "gblinear models have no boosting iterations to select",
+            ));
         }
+        if end > rounds || begin > end {
+            return Err(HessboostError::invalid_param(
+                "iteration_range",
+                format!("[{begin}, {end}) is out of range for a model with {rounds} iterations"),
+            ));
+        }
+        let per = self.trees_per_iteration();
+        Ok(begin * per..end * per)
     }
 
-    /// Raw margin predictions using the effective tree count. The output is laid
-    /// out `[instance][output]` (length `n_rows × n_outputs`).
+    /// Like [`Self::iteration_trees`] for the attribution and leaf
+    /// predictions, which (as in XGBoost) only accept ranges starting at
+    /// iteration `0`; slice the model for a later start.
+    fn prefix_trees(&self, iteration_range: (usize, usize), what: &str) -> Result<usize> {
+        let trees = self.iteration_trees(iteration_range)?;
+        if trees.start != 0 {
+            return Err(HessboostError::invalid_param(
+                "iteration_range",
+                format!(
+                    "{what} supports only ranges starting at iteration 0; slice the model instead"
+                ),
+            ));
+        }
+        Ok(trees.end)
+    }
+
+    /// Raw margin predictions using the effective iterations (`[0,
+    /// best_iteration + 1)` after early stopping, else all). The output is
+    /// laid out `[instance][output]` (length `n_rows × n_outputs`).
     pub fn predict_margin(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        self.predict_margin_limited(data, self.effective_ntrees())
+        self.predict_margin_range(data, self.default_iteration_range())
     }
 
-    /// Raw margin predictions using only the first `ntree_limit` trees
-    /// (`0` = all trees, ignoring early stopping). Tree `t` contributes to
-    /// output `t % n_outputs`.
-    pub fn predict_margin_limited(&self, data: &DMatrix, ntree_limit: usize) -> Result<Vec<f32>> {
-        self.validate_prediction_data(data)?;
-        Ok(self.predict_margin_limited_unchecked(data, ntree_limit))
-    }
-
-    pub(crate) fn predict_margin_limited_unchecked(
+    /// Raw margin predictions from the boosting iterations in
+    /// `iteration_range` only (XGBoost `iteration_range`: half-open `[begin,
+    /// end)`, `end == 0` = through the last iteration, `(0, 0)` = the whole
+    /// model regardless of early stopping). The intercept / dataset
+    /// `base_margin` is always included.
+    pub fn predict_margin_range(
         &self,
         data: &DMatrix,
-        ntree_limit: usize,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<f32>> {
+        self.validate_prediction_data(data)?;
+        let trees = self.iteration_trees(iteration_range)?;
+        Ok(self.margin_from_trees(data, trees))
+    }
+
+    /// Margins from the trees `trees` (tree ids) without validating `data`.
+    pub(crate) fn margin_from_trees(
+        &self,
+        data: &DMatrix,
+        trees: std::ops::Range<usize>,
     ) -> Vec<f32> {
         let n = data.n_rows();
         let k = self.n_outputs();
@@ -356,64 +482,62 @@ impl BoostedModel {
             }
             return out;
         }
-        let limit = if ntree_limit == 0 {
-            self.trees.len()
-        } else {
-            ntree_limit.min(self.trees.len())
-        };
         // Initialize from the dataset's per-instance base margin when present
         // (it overrides the per-output intercepts, matching XGBoost); otherwise
         // use the trained global bias.
         let mut out = self.initial_margins(data);
-        self.accumulate_forest(data, &mut out, limit, |ti| self.tree_weight(ti));
+        self.accumulate_forest(data, &mut out, trees, |ti| self.tree_weight(ti));
         out
     }
 
-    /// Sum `weight(t) * leaf(row, t)` into `out[row * k + t % k]` for trees
-    /// `0..limit`, where `k` is the output count. Rows are traversed in
-    /// cache-friendly blocks (parallel across blocks); per (row, output) slot
-    /// the trees are still summed in ascending order, so the result is
+    /// Sum `weight(t) * leaf(row, t)` into `out[row * k + tree_output(t)]` for
+    /// the trees in `trees`, where `k` is the output count. Rows are traversed
+    /// in cache-friendly blocks (parallel across blocks); per (row, output)
+    /// slot the trees are still summed in ascending order, so the result is
     /// bit-identical to the sequential tree-outer loop.
     fn accumulate_forest(
         &self,
         data: &DMatrix,
         out: &mut [f32],
-        limit: usize,
+        trees: std::ops::Range<usize>,
         weight: impl Fn(usize) -> f32 + Sync,
     ) {
         let k = self.n_outputs();
+        let parallel = self.num_parallel_tree;
         self.traverse_blocks(
             data,
             out,
             k,
-            limit,
-            |block, forest, r, out_row| block.accumulate_row(forest, r, limit, &weight, out_row),
+            trees.clone(),
+            |block, forest, r, out_row| {
+                block.accumulate_row(forest, r, trees.clone(), parallel, &weight, out_row);
+            },
             |block, forest, ti, rows, out_block, stride| {
                 block.accumulate(
                     forest,
                     ti,
                     rows,
                     weight(ti),
-                    &mut out_block[ti % k..],
+                    &mut out_block[self.tree_output(ti)..],
                     stride,
                 );
             },
         );
     }
 
-    /// Block-parallel traversal of trees `0..limit` over `data`, writing into
-    /// `out` laid out `[row][stride]`: `row_op` handles one loaded row of the
-    /// small-batch path, `tree_op` one tree over a loaded block of rows. Tiny
-    /// batches (online serving) skip the thread pool and overlap the trees of
-    /// each row instead of the rows of each tree; larger inputs process rows
-    /// in blocks whose feature rows stay in cache while every tree walks
-    /// them, with blocks running in parallel.
+    /// Block-parallel traversal of the trees in `trees` over `data`, writing
+    /// into `out` laid out `[row][stride]`: `row_op` handles one loaded row of
+    /// the small-batch path, `tree_op` one tree over a loaded block of rows.
+    /// Tiny batches (online serving) skip the thread pool and overlap the
+    /// trees of each row instead of the rows of each tree; larger inputs
+    /// process rows in blocks whose feature rows stay in cache while every
+    /// tree walks them, with blocks running in parallel.
     fn traverse_blocks<T: Send>(
         &self,
         data: &DMatrix,
         out: &mut [T],
         stride: usize,
-        limit: usize,
+        trees: std::ops::Range<usize>,
         row_op: impl Fn(&RowBlock, &CompactForest, usize, &mut [T]),
         tree_op: impl Fn(&RowBlock, &CompactForest, usize, usize, &mut [T], usize) + Sync,
     ) {
@@ -435,7 +559,7 @@ impl BoostedModel {
                     let start = bi * PREDICT_BLOCK_ROWS;
                     let rows = out_block.len() / stride;
                     block.load(start, rows);
-                    for ti in 0..limit {
+                    for ti in trees.clone() {
                         tree_op(block, forest, ti, rows, out_block, stride);
                     }
                 },
@@ -444,9 +568,20 @@ impl BoostedModel {
 
     /// Predictions in the objective's reported space. `multi:softprob` returns
     /// an `n_rows × num_class` probability matrix while `multi:softmax` returns
-    /// one class index per row, encoded as `f32`.
+    /// one class index per row, encoded as `f32`. Uses the effective
+    /// iterations, like [`Self::predict_margin`].
     pub fn predict(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        let mut margin = self.predict_margin(data)?;
+        self.predict_range(data, self.default_iteration_range())
+    }
+
+    /// [`Self::predict`] from the boosting iterations in `iteration_range`
+    /// only (see [`Self::predict_margin_range`] for the range convention).
+    pub fn predict_range(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<f32>> {
+        let mut margin = self.predict_margin_range(data, iteration_range)?;
         // A model trained with a custom objective cannot reconstruct its
         // transform from the name; fall back to the identity (raw margins),
         // mirroring how XGBoost returns margins for custom objectives.
@@ -492,15 +627,28 @@ impl BoostedModel {
         Ok(out)
     }
 
-    /// Per-row leaf indices for each tree (shape `n_rows × num_trees`, row-major).
+    /// Per-row leaf indices for each tree (shape `n_rows × num_trees`,
+    /// row-major, trees in [`Self::trees`] order). Walks every tree,
+    /// regardless of early stopping.
+    pub fn predict_leaf(&self, data: &DMatrix) -> Result<Vec<u32>> {
+        self.predict_leaf_range(data, (0, 0))
+    }
+
+    /// [`Self::predict_leaf`] for the trees of the iterations in
+    /// `iteration_range` (shape `n_rows × trees`). As in XGBoost the range
+    /// must start at iteration `0`; use [`Self::slice`] for a later start.
     #[allow(
         clippy::redundant_closure_for_method_calls,
         reason = "the method path is not general enough over the block lifetime"
     )]
-    pub fn predict_leaf(&self, data: &DMatrix) -> Result<Vec<u32>> {
+    pub fn predict_leaf_range(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<u32>> {
         self.validate_prediction_data(data)?;
+        let t = self.prefix_trees(iteration_range, "leaf prediction")?;
         let n = data.n_rows();
-        let t = self.trees.len();
         let mut out = vec![0u32; n * t];
         if t == 0 {
             return Ok(out);
@@ -509,13 +657,80 @@ impl BoostedModel {
             data,
             &mut out,
             t,
-            t,
+            0..t,
             |block, forest, r, out_row| block.original_leaf_ids_for_row(forest, r, out_row),
             |block, forest, ti, rows, out_block, stride| {
                 block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], stride);
             },
         );
         Ok(out)
+    }
+
+    /// A new model holding boosting iterations `begin, begin + step, ...`
+    /// below `end` (Python's `booster[begin:end:step]`; `end == 0` means
+    /// through the last iteration). Each selected iteration keeps its whole
+    /// forest (every output and parallel tree) together with its DART tree
+    /// weights; the intercepts, objective and layout carry over unchanged and
+    /// no refit happens. As in XGBoost the slice drops `best_iteration`, so
+    /// it predicts with all of its iterations.
+    ///
+    /// `step` must be at least 1 and the range non-empty and within
+    /// [`Self::num_boost_rounds`]. XGBoost 3.4.2 additionally trips an
+    /// internal check when `end - begin` is not a multiple of `step`; here
+    /// every step selects `ceil((end - begin) / step)` iterations, matching
+    /// XGBoost wherever it succeeds.
+    pub fn slice(&self, begin: usize, end: usize, step: usize) -> Result<BoostedModel> {
+        if self.linear.is_some() {
+            return Err(HessboostError::invalid_param(
+                "slice",
+                "gblinear models have no boosting iterations to slice",
+            ));
+        }
+        if step == 0 {
+            return Err(HessboostError::invalid_param(
+                "slice",
+                "step must be at least 1",
+            ));
+        }
+        let rounds = self.num_boost_rounds();
+        let end = if end == 0 { rounds } else { end };
+        if begin >= end {
+            return Err(HessboostError::invalid_param(
+                "slice",
+                format!("empty slice [{begin}:{end}] is not allowed"),
+            ));
+        }
+        if end > rounds {
+            return Err(HessboostError::invalid_param(
+                "slice",
+                format!("end {end} is out of range for a model with {rounds} iterations"),
+            ));
+        }
+        let per = self.trees_per_iteration();
+        let mut trees = Vec::with_capacity((end - begin).div_ceil(step) * per);
+        let mut tree_weights = Vec::new();
+        for it in (begin..end).step_by(step) {
+            let layer = it * per..(it + 1) * per;
+            trees.extend_from_slice(&self.trees[layer.clone()]);
+            if !self.tree_weights.is_empty() {
+                tree_weights.extend(layer.map(|t| self.tree_weight(t)));
+            }
+        }
+        Ok(BoostedModel {
+            trees,
+            base_score: self.base_score.clone(),
+            objective: self.objective.clone(),
+            objective_params: self.objective_params.clone(),
+            num_class: self.num_class,
+            n_outputs: self.n_outputs,
+            n_targets: self.n_targets,
+            n_features: self.n_features,
+            best_iteration: None,
+            tree_weights,
+            num_parallel_tree: self.num_parallel_tree,
+            linear: None,
+            compact: OnceLock::new(),
+        })
     }
 
     /// Compute feature importance of the requested type, returned as a map from
@@ -593,10 +808,16 @@ impl BoostedModel {
         }
     }
 
-    /// Validated prologue for the TreeSHAP paths. `predict_leaf` is excluded:
-    /// it walks all trees (not the effective prefix) and needs no margins.
-    pub(super) fn attribution_prologue(&self, data: &DMatrix) -> Result<AttributionPrologue<'_>> {
+    /// Validated prologue for the TreeSHAP paths over the iterations in
+    /// `iteration_range`, which must start at iteration `0` (as in XGBoost).
+    pub(super) fn attribution_prologue(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+        what: &str,
+    ) -> Result<AttributionPrologue<'_>> {
         self.validate_prediction_data(data)?;
+        let end = self.prefix_trees(iteration_range, what)?;
         let n = data.n_rows();
         let k = self.n_outputs();
         let nf = self.n_features;
@@ -605,9 +826,15 @@ impl BoostedModel {
             k,
             nf,
             width: nf + 1,
-            trees: &self.trees[..self.effective_ntrees()],
+            trees: &self.trees[..end],
             initial: self.initial_margins(data),
         })
+    }
+
+    /// The iteration range the attribution predictions use by default (the
+    /// effective iterations, like [`Self::predict_margin`]).
+    pub(super) fn attribution_default_range(&self) -> (usize, usize) {
+        self.default_iteration_range()
     }
 
     pub(crate) fn validate_prediction_data(&self, data: &DMatrix) -> Result<()> {
@@ -688,8 +915,6 @@ impl BoostedModel {
     }
 
     pub(crate) fn validate_structure(&self) -> Result<()> {
-        use crate::error::HessboostError;
-
         if self.n_features == 0 {
             return Err(HessboostError::ModelFormat(
                 "model has an invalid feature count".to_string(),
@@ -697,14 +922,25 @@ impl BoostedModel {
         }
         if self.n_outputs == 0
             || self.n_targets == 0
+            || self.num_parallel_tree == 0
             || (self.num_class >= 2 && self.n_outputs != self.num_class)
-            || !self.trees.len().is_multiple_of(self.n_outputs)
+            || !self.trees.len().is_multiple_of(self.trees_per_iteration())
         {
             return Err(HessboostError::ModelFormat(format!(
-                "invalid output layout: {} outputs, num_class {}, {} trees",
+                "invalid output layout: {} outputs, num_class {}, num_parallel_tree {}, {} trees",
                 self.n_outputs,
                 self.num_class,
+                self.num_parallel_tree,
                 self.trees.len()
+            )));
+        }
+        if let Some(best) = self.best_iteration
+            && self.linear.is_none()
+            && best >= self.num_boost_rounds()
+        {
+            return Err(HessboostError::ModelFormat(format!(
+                "best_iteration {best} is out of range for {} iterations",
+                self.num_boost_rounds()
             )));
         }
         if self.base_score.len() != self.n_outputs()
@@ -822,6 +1058,12 @@ impl BoostedModel {
 /// Serde default of [`BoostedModel::n_targets`] for models written before the
 /// field existed.
 fn one_target() -> usize {
+    1
+}
+
+/// Serde default of [`BoostedModel::num_parallel_tree`] for models written
+/// before the field existed.
+fn one_parallel_tree() -> usize {
     1
 }
 
@@ -1059,23 +1301,25 @@ impl<'a> RowBlock<'a> {
         }
     }
 
-    /// `out[t % k] += weight(t) * leaf_value(row r, tree t)` for trees
-    /// `0..limit` of loaded row `r`.
+    /// `out[(t / parallel) % k] += weight(t) * leaf_value(row r, tree t)` for
+    /// the trees `trees` of loaded row `r`, where `parallel` is the model's
+    /// `num_parallel_tree`.
     fn accumulate_row(
         &self,
         forest: &CompactForest,
         r: usize,
-        limit: usize,
+        trees: std::ops::Range<usize>,
+        parallel: usize,
         weight: impl Fn(usize) -> f32,
         out: &mut [f32],
     ) {
         if let Some(row) = self.row(r) {
-            forest.accumulate_row(row, limit, weight, out);
+            forest.accumulate_row(row, trees, parallel, weight, out);
         } else {
             let k = out.len();
-            for t in 0..limit {
+            for t in trees {
                 let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
-                out[t % k] += weight(t) * forest.leaf_value(leaf);
+                out[(t / parallel) % k] += weight(t) * forest.leaf_value(leaf);
             }
         }
     }

@@ -237,6 +237,11 @@ impl RegTree {
         self.nodes[nid].split_gain = gain;
     }
 
+    /// Record the Hessian sum (cover) of the instances reaching node `nid`.
+    pub(crate) fn set_sum_hess(&mut self, nid: usize, sum_hess: f32) {
+        self.nodes[nid].sum_hess = sum_hess;
+    }
+
     /// Multiply every leaf weight by `factor`. Used to apply the learning rate
     /// (shrinkage) so that stored trees already carry their scaled contribution,
     /// matching XGBoost's saved-model semantics.
@@ -254,32 +259,31 @@ impl RegTree {
     /// the same code serves dense rows, sparse rows, and SHAP traversals.
     pub fn leaf_id_with(&self, get: impl Fn(u32) -> Option<f32>) -> usize {
         let mut nid = 0usize;
-        loop {
-            let node = &self.nodes[nid];
-            if node.is_leaf() {
-                return nid;
+        while !self.nodes[nid].is_leaf() {
+            nid = self.child(nid, get(self.nodes[nid].split_feature));
+        }
+        nid
+    }
+
+    /// The child of internal node `nid` that an instance whose split-feature
+    /// value is `value` (`None` = missing) descends to.
+    #[inline]
+    pub(crate) fn child(&self, nid: usize, value: Option<f32>) -> usize {
+        let node = &self.nodes[nid];
+        let go_left = match value {
+            // Categories are integer-coded; membership in the left set routes
+            // left, everything else (present, not in set) right.
+            Some(v) if node.is_categorical => {
+                let c = v as u32;
+                self.categories[node.cat_begin as usize..node.cat_end as usize].contains(&c)
             }
-            let go_left = if node.is_categorical {
-                match get(node.split_feature) {
-                    // Categories are integer-coded; membership in the left set
-                    // routes left, everything else (present, not in set) right.
-                    Some(v) => {
-                        let c = v as u32;
-                        self.categories[node.cat_begin as usize..node.cat_end as usize].contains(&c)
-                    }
-                    None => node.default_left,
-                }
-            } else {
-                match get(node.split_feature) {
-                    Some(v) => v < node.split_cond,
-                    None => node.default_left,
-                }
-            };
-            nid = if go_left {
-                node.left as usize
-            } else {
-                node.right as usize
-            };
+            Some(v) => v < node.split_cond,
+            None => node.default_left,
+        };
+        if go_left {
+            node.left as usize
+        } else {
+            node.right as usize
         }
     }
 

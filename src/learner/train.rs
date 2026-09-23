@@ -8,13 +8,16 @@ use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
+use crate::learner::continuation::{require_model_for_update, resume_model};
 use crate::learner::model::{BoostedModel, ModelSpec};
+use crate::learner::refresh::refresh_tree;
 use crate::metric::create_metrics;
 use crate::objective::{GradPair, create_objective};
 use crate::tree::RegTree;
 use crate::tree::builder::{
     ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows,
 };
+use crate::tree::gain::RegParams;
 use crate::tree::sampler::ColumnSampler;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -130,7 +133,10 @@ pub struct RoundEval {
 pub struct TrainResult {
     /// The trained model.
     pub model: BoostedModel,
-    /// Evaluation history (empty when no eval sets were supplied).
+    /// Evaluation history (empty when no eval sets were supplied). Each
+    /// entry's `iteration` is the model's absolute iteration index, which
+    /// after continued training starts at the initial model's
+    /// [`num_boost_rounds`](BoostedModel::num_boost_rounds).
     pub history: Vec<RoundEval>,
 }
 
@@ -141,6 +147,64 @@ pub fn train(
     num_boost_round: usize,
 ) -> Result<BoostedModel> {
     Ok(train_with_eval(params, dtrain, num_boost_round, &[], None)?.model)
+}
+
+/// Continue training `model` for `num_boost_round` more iterations (XGBoost's
+/// `xgb.train(..., xgb_model=model)`), without eval sets.
+///
+/// The new iterations start from `model`'s full current margins (every
+/// tree, whatever its `best_iteration`) and are appended to a copy of it. The
+/// copy keeps the model's intercepts unless `params.base_score` is set, which
+/// replaces them (as XGBoost's `set_param` does); the intercept is never
+/// re-estimated. `params` must use the model's objective, `num_class`,
+/// `num_parallel_tree`, booster family (tree or `gblinear`), feature count and
+/// label width; they otherwise drive the new iterations, including the
+/// objective's hyper-parameters, which the result records. The per-round RNG
+/// continues from the model's iteration count, so training `a` rounds and
+/// continuing for `b` grows the same trees as training `a + b` rounds with
+/// the same parameters. DART tree weights carry over and are rescaled by
+/// later dropouts. The copy's `best_iteration` is cleared.
+///
+/// With `process_type=update` the model's trees are not extended but
+/// refreshed on `dtrain` (XGBoost's `updater=refresh`): round `i` recomputes
+/// the statistics, and with `refresh_leaf` the leaf values, of iteration
+/// `i`'s trees from the gradients of the already refreshed iterations. The
+/// result holds exactly the `num_boost_round` refreshed iterations (at most
+/// the model's count), as in XGBoost. Update mode needs a gbtree model
+/// without DART weights and no monotone constraints.
+pub fn train_continue(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    num_boost_round: usize,
+    model: &BoostedModel,
+) -> Result<BoostedModel> {
+    Ok(train_continue_with_eval(params, dtrain, num_boost_round, &[], None, model)?.model)
+}
+
+/// [`train_continue`] watching `evals` and optionally stopping early, like
+/// [`train_with_eval`]. The early-stopping state starts fresh; the
+/// resulting `best_iteration` and the history's iterations are absolute
+/// iteration indices of the continued model (XGBoost's `starting_round`
+/// offset).
+pub fn train_continue_with_eval(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    num_boost_round: usize,
+    evals: &[EvalSet],
+    early_stopping_rounds: Option<usize>,
+    model: &BoostedModel,
+) -> Result<TrainResult> {
+    let objective = create_objective(params, dtrain.n_targets())?;
+    train_impl(
+        params,
+        dtrain,
+        num_boost_round,
+        evals,
+        early_stopping_rounds,
+        objective.as_ref(),
+        None,
+        Some(model),
+    )
 }
 
 /// Train a model, watching `evals` and optionally stopping early.
@@ -164,6 +228,7 @@ pub fn train_with_eval(
         evals,
         early_stopping_rounds,
         objective.as_ref(),
+        None,
         None,
     )
 }
@@ -191,6 +256,7 @@ pub fn train_with_custom_metric(
         early_stopping_rounds,
         objective.as_ref(),
         Some(metric),
+        None,
     )
 }
 
@@ -202,15 +268,27 @@ pub fn train_with_objective(
     num_boost_round: usize,
     objective: &dyn crate::objective::Objective,
 ) -> Result<BoostedModel> {
-    Ok(train_impl(params, dtrain, num_boost_round, &[], None, objective, None)?.model)
+    Ok(train_impl(
+        params,
+        dtrain,
+        num_boost_round,
+        &[],
+        None,
+        objective,
+        None,
+        None,
+    )?
+    .model)
 }
 
 /// The core boosting loop, generic over single- and multi-output objectives.
 ///
 /// Margins and gradients are laid out `[instance][output]`. Each round computes
-/// all gradients, then grows one tree per output from that output's gradient
-/// slice. This is the multi-output generalization of gradient boosting used by
-/// multiclass.
+/// all gradients, then grows `num_parallel_tree` trees per output from that
+/// output's gradient slice. This is the multi-output generalization of
+/// gradient boosting used by multiclass. `init_model` continues training
+/// from an existing model ([`train_continue`]).
+#[allow(clippy::too_many_arguments)]
 fn train_impl(
     params: &TrainingParams,
     dtrain: &DMatrix,
@@ -219,6 +297,7 @@ fn train_impl(
     early_stopping_rounds: Option<usize>,
     objective: &dyn crate::objective::Objective,
     metric_override: Option<Box<dyn crate::metric::Metric>>,
+    init_model: Option<&BoostedModel>,
 ) -> Result<TrainResult> {
     if params.nthread > 0 {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -234,6 +313,7 @@ fn train_impl(
                 early_stopping_rounds,
                 objective,
                 metric_override,
+                init_model,
             )
         });
     }
@@ -245,9 +325,11 @@ fn train_impl(
         early_stopping_rounds,
         objective,
         metric_override,
+        init_model,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn train_impl_inner(
     params: &TrainingParams,
     dtrain: &DMatrix,
@@ -256,6 +338,7 @@ fn train_impl_inner(
     early_stopping_rounds: Option<usize>,
     objective: &dyn crate::objective::Objective,
     metric_override: Option<Box<dyn crate::metric::Metric>>,
+    init_model: Option<&BoostedModel>,
 ) -> Result<TrainResult> {
     params.validate()?;
     reject_unimplemented(params, dtrain)?;
@@ -286,19 +369,6 @@ fn train_impl_inner(
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
-    if let Some(base_score) = params.base_score {
-        let invalid = match params.objective.as_str() {
-            "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
-            "count:poisson" | "reg:gamma" | "reg:tweedie" => base_score <= 0.0,
-            _ => false,
-        };
-        if invalid {
-            return Err(HessboostError::invalid_param(
-                "base_score",
-                "is outside the objective's valid output domain",
-            ));
-        }
-    }
     validate_dataset(
         objective,
         dtrain,
@@ -331,48 +401,30 @@ fn train_impl_inner(
         }
     }
 
-    // Per-output intercepts in margin space. A user-supplied `base_score` is
-    // given in prediction space and broadcast to every output through the
-    // objective's link (XGBoost `ProbToMargin`; for multiclass this is a
-    // uniform nonzero margin, as in XGBoost); otherwise the objective estimates
-    // them from the labels (XGBoost `InitEstimation`).
-    let base_margins = match params.base_score {
-        Some(bs) => {
-            let mut scores = vec![bs as f32; n_out];
-            objective.probs_to_margins(&mut scores);
-            scores
-        }
-        None => objective.base_margins_info(&info),
-    };
-    if base_margins.len() != n_out {
-        return Err(HessboostError::DimensionMismatch {
-            what: "objective base_margins length",
-            expected: n_out,
-            got: base_margins.len(),
-        });
-    }
-    if base_margins.iter().any(|m| !m.is_finite()) {
-        return Err(HessboostError::invalid_param(
-            "base_score",
-            format!("estimated intercept is not finite ({base_margins:?}); check the labels"),
-        ));
-    }
-
     // The model records the objective's own name and output count (not the
     // configured string / `num_class`): a `reg:linear` alias is saved as
     // `reg:squarederror` like XGBoost does, and a custom objective's outputs
     // determine the tree layout even though `num_class` is 0.
-    let mut model = BoostedModel::new(
-        base_margins,
-        ModelSpec {
-            objective: objective.name().to_string(),
-            objective_params: ObjectiveParams::from_params(params),
-            num_class: params.num_class,
-            n_outputs: n_out,
-            n_targets: dtrain.n_targets(),
-            n_features,
-        },
-    );
+    let intercepts = || initial_intercepts(params, objective, &info, n_out);
+    let mut model = match init_model {
+        Some(init) => resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?,
+        None => {
+            require_model_for_update(params)?;
+            let mut model = BoostedModel::new(
+                intercepts()?,
+                ModelSpec {
+                    objective: objective.name().to_string(),
+                    objective_params: ObjectiveParams::from_params(params),
+                    num_class: params.num_class,
+                    n_outputs: n_out,
+                    n_targets: dtrain.n_targets(),
+                    n_features,
+                },
+            );
+            model.set_num_parallel_tree(params.num_parallel_tree);
+            model
+        }
+    };
 
     // The linear (`gblinear`) booster fits a coordinate-descent linear model
     // instead of growing trees; it skips the tree/dart path entirely. Eval sets
@@ -384,13 +436,15 @@ fn train_impl_inner(
                 "gblinear does not yet support evaluation sets or early stopping",
             ));
         }
+        // Continued training resumes from the model's weights and margins.
         let linear = crate::booster::gblinear::train_gblinear(
             params,
             dtrain,
             num_boost_round,
-            &model.initial_margins(dtrain),
+            &model.margin_from_trees(dtrain, 0..0),
             n_out,
             objective,
+            model.linear(),
         );
         model.set_linear(linear);
         return Ok(TrainResult {
@@ -399,14 +453,26 @@ fn train_impl_inner(
         });
     }
 
-    let prepared = prepare_builder(params, dtrain, objective.const_hess())?;
+    // `process_type=update` refreshes the model's own trees (re-appended one
+    // iteration per round) instead of growing new ones, so it needs no
+    // builder state.
+    let mut plan = if params.process_type == ProcessType::Update {
+        RoundPlan::Refresh(model.take_trees())
+    } else {
+        RoundPlan::Grow(prepare_builder(params, dtrain, objective.const_hess())?)
+    };
+    // Continued training numbers its rounds after the model's iterations, so
+    // the per-round RNG streams continue where the earlier run stopped.
+    let start_iteration = model.num_boost_rounds();
+    let parallel = params.num_parallel_tree;
 
-    // Incremental margin caches (length rows × n_out). A dataset's per-instance
+    // Incremental margin caches (length rows × n_out), starting from the
+    // model's full current predictions. A dataset's per-instance
     // `base_margin`, when present, overrides the per-output intercepts.
-    let mut train_margin = model.initial_margins(dtrain);
+    let mut train_margin = model.margin_from_trees(dtrain, 0..model.num_trees());
     let mut eval_margins: Vec<Vec<f32>> = evals
         .iter()
-        .map(|(d, _)| model.initial_margins(d))
+        .map(|(d, _)| model.margin_from_trees(d, 0..model.num_trees()))
         .collect();
 
     // A caller-supplied metric replaces the configured/default metric list.
@@ -438,87 +504,124 @@ fn train_impl_inner(
     let is_dart = params.booster == BoosterKind::Dart;
 
     for round in 0..num_boost_round {
-        if is_dart {
-            dart_round(
-                &mut model,
-                params,
-                dtrain,
-                &prepared,
-                objective,
-                &info,
-                n,
-                n_out,
-                n_features,
-                round,
-                &mut gpair,
-                &mut gpair_k,
-            );
-            // DART rescales earlier trees' weights each round, so the cached
-            // Eval margins are no longer additive. Recompute them from the
-            // (weighted) ensemble.
-            for (ei, (d, _)) in evals.iter().enumerate() {
-                eval_margins[ei] = model.predict_margin_limited_unchecked(d, 0);
-            }
-        } else {
-            // 1. Gradients from the current margins (all outputs at once).
-            objective.gradient_info(&train_margin, &info, &mut gpair);
-
-            // 2. Row subsampling is shared across the round's per-output trees.
-            let mut rng = round_rng(params, round, 0);
-            let row_subset = sample_rows(n, params.subsample, &mut rng);
-
-            // 3. One tree per output.
-            for k in 0..n_out {
-                // Retaining the final row partitions replaces a per-row tree
-                // traversal of the raw feature matrix with one sequential
-                // pass per leaf.
-                let (tree, leaf_rows) = match &prepared {
-                    Prepared::Hist(ghist)
-                        if params.grow_policy == GrowPolicy::DepthWise && row_subset.len() == n =>
-                    {
-                        let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
-                        let mut sampler = make_column_sampler(
-                            n_features,
-                            params,
-                            &mut rng,
-                            round as u64,
-                            k as u64,
-                        );
-                        let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
-                            .build_with_leaf_rows(ghist, gk, &row_subset, &mut sampler);
-                        tree.scale_leaves(params.eta as f32);
-                        (tree, leaf_rows)
-                    }
-                    _ => (
-                        fit_output_tree(
-                            params,
-                            &prepared,
-                            dtrain,
-                            &gpair,
-                            &mut gpair_k,
-                            &mut rng,
-                            n_out,
-                            k,
-                            round,
-                            &row_subset,
-                            n_features,
-                        ),
-                        Vec::new(),
-                    ),
-                };
-
-                // Row partitions already identify training leaves when every
-                // row participated in depthwise histogram construction.
-                if leaf_rows.is_empty() {
+        let iteration = start_iteration + round;
+        match &mut plan {
+            RoundPlan::Refresh(queue) => {
+                // Gradients from the already refreshed iterations; iteration
+                // `i`'s trees are then refreshed in place, output by output.
+                objective.gradient_info(&train_margin, &info, &mut gpair);
+                let reg = RegParams::from_params(params);
+                let per_iteration = n_out * parallel;
+                for slot in 0..per_iteration {
+                    let k = slot / parallel;
+                    let gk = gather_output(&gpair, &mut gpair_k, n_out, k);
+                    let mut tree = std::mem::take(&mut queue[iteration * per_iteration + slot]);
+                    refresh_tree(
+                        &mut tree,
+                        dtrain,
+                        gk,
+                        &reg,
+                        tree_eta(params),
+                        params.refresh_leaf,
+                    );
                     update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
-                } else {
-                    apply_leaf_rows(&tree, &leaf_rows, &mut train_margin, n_out, k);
+                    for (ei, (d, _)) in evals.iter().enumerate() {
+                        update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
+                    }
+                    model.push_tree_weighted(tree, 1.0);
                 }
+            }
+            RoundPlan::Grow(prepared) if is_dart => {
+                dart_round(
+                    &mut model,
+                    params,
+                    dtrain,
+                    prepared,
+                    objective,
+                    &info,
+                    n,
+                    n_out,
+                    n_features,
+                    iteration,
+                    &mut gpair,
+                    &mut gpair_k,
+                );
+                // DART rescales earlier trees' weights each round, so the cached
+                // Eval margins are no longer additive. Recompute them from the
+                // (weighted) ensemble.
                 for (ei, (d, _)) in evals.iter().enumerate() {
-                    update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
+                    eval_margins[ei] = model.margin_from_trees(d, 0..model.num_trees());
                 }
+            }
+            RoundPlan::Grow(prepared) => {
+                // 1. Gradients from the current margins (all outputs at once).
+                objective.gradient_info(&train_margin, &info, &mut gpair);
 
-                model.push_tree_weighted(tree, 1.0);
+                // 2. Row subsampling is drawn once per parallel tree and shared
+                //    across that tree's per-output fits.
+                let mut rng = round_rng(params, iteration, 0);
+                let row_subsets: Vec<Vec<u32>> = (0..parallel)
+                    .map(|_| sample_rows(n, params.subsample, &mut rng))
+                    .collect();
+
+                // 3. `num_parallel_tree` trees per output from the same
+                //    gradients, output-major like XGBoost's layout.
+                for slot in 0..n_out * parallel {
+                    let (k, p) = (slot / parallel, slot % parallel);
+                    let row_subset = &row_subsets[p];
+                    // Retaining the final row partitions replaces a per-row tree
+                    // traversal of the raw feature matrix with one sequential
+                    // pass per leaf.
+                    let (tree, leaf_rows) = match &prepared {
+                        Prepared::Hist(ghist)
+                            if params.grow_policy == GrowPolicy::DepthWise
+                                && row_subset.len() == n =>
+                        {
+                            let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
+                            let mut sampler = make_column_sampler(
+                                n_features,
+                                params,
+                                &mut rng,
+                                iteration as u64,
+                                (p * n_out + k) as u64,
+                            );
+                            let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
+                                .build_with_leaf_rows(ghist, gk, row_subset, &mut sampler);
+                            tree.scale_leaves(tree_eta(params));
+                            (tree, leaf_rows)
+                        }
+                        _ => (
+                            fit_output_tree(
+                                params,
+                                prepared,
+                                dtrain,
+                                &gpair,
+                                &mut gpair_k,
+                                &mut rng,
+                                n_out,
+                                k,
+                                p,
+                                iteration,
+                                row_subset,
+                                n_features,
+                            ),
+                            Vec::new(),
+                        ),
+                    };
+
+                    // Row partitions already identify training leaves when every
+                    // row participated in depthwise histogram construction.
+                    if leaf_rows.is_empty() {
+                        update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
+                    } else {
+                        apply_leaf_rows(&tree, &leaf_rows, &mut train_margin, n_out, k);
+                    }
+                    for (ei, (d, _)) in evals.iter().enumerate() {
+                        update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
+                    }
+
+                    model.push_tree_weighted(tree, 1.0);
+                }
             }
         }
 
@@ -536,10 +639,7 @@ fn train_impl_inner(
                     last_metric_value = v;
                 }
             }
-            history.push(RoundEval {
-                iteration: round,
-                scores,
-            });
+            history.push(RoundEval { iteration, scores });
 
             // 5. Early stopping on the last metric of the last eval set.
             if let Some(patience) = early_stopping_rounds {
@@ -550,7 +650,7 @@ fn train_impl_inner(
                 };
                 if improved {
                     best_score = last_metric_value;
-                    best_iter = round;
+                    best_iter = iteration;
                     rounds_since_improve = 0;
                 } else {
                     rounds_since_improve += 1;
@@ -576,22 +676,80 @@ fn reject_unimplemented(params: &TrainingParams, dtrain: &DMatrix) -> Result<()>
             format!("{reason} is not implemented"),
         ))
     };
-    if params.num_parallel_tree != 1 {
-        return unsupported("num_parallel_tree", "a value other than 1");
-    }
     if params.sampling_method != SamplingMethod::Uniform {
         return unsupported("sampling_method", "`gradient_based` sampling");
     }
     if params.multi_strategy != MultiStrategy::OneOutputPerTree {
         return unsupported("multi_strategy", "`multi_output_tree`");
     }
-    if params.process_type != ProcessType::Default {
-        return unsupported("process_type", "`update`");
-    }
     if dtrain.feature_weights().is_some() {
         return unsupported("feature_weights", "feature-weighted column sampling");
     }
     Ok(())
+}
+
+/// Per-output intercepts in margin space. A user-supplied `base_score` is
+/// given in prediction space and broadcast to every output through the
+/// objective's link (XGBoost `ProbToMargin`; for multiclass this is a
+/// uniform nonzero margin, as in XGBoost); otherwise the objective estimates
+/// them from the labels (XGBoost `InitEstimation`).
+pub(crate) fn initial_intercepts(
+    params: &TrainingParams,
+    objective: &dyn crate::objective::Objective,
+    info: &MetaInfo,
+    n_out: usize,
+) -> Result<Vec<f32>> {
+    if let Some(base_score) = params.base_score {
+        let invalid = match params.objective.as_str() {
+            "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
+            "count:poisson" | "reg:gamma" | "reg:tweedie" => base_score <= 0.0,
+            _ => false,
+        };
+        if invalid {
+            return Err(HessboostError::invalid_param(
+                "base_score",
+                "is outside the objective's valid output domain",
+            ));
+        }
+    }
+    let base_margins = match params.base_score {
+        Some(bs) => {
+            let mut scores = vec![bs as f32; n_out];
+            objective.probs_to_margins(&mut scores);
+            scores
+        }
+        None => objective.base_margins_info(info),
+    };
+    if base_margins.len() != n_out {
+        return Err(HessboostError::DimensionMismatch {
+            what: "objective base_margins length",
+            expected: n_out,
+            got: base_margins.len(),
+        });
+    }
+    if base_margins.iter().any(|m| !m.is_finite()) {
+        return Err(HessboostError::invalid_param(
+            "base_score",
+            format!("estimated intercept is not finite ({base_margins:?}); check the labels"),
+        ));
+    }
+    Ok(base_margins)
+}
+
+/// What the boosting rounds do to the ensemble.
+enum RoundPlan {
+    /// Grow new trees with the prepared builder state.
+    Grow(Prepared),
+    /// `process_type=update`: refresh the queued trees of the initial model,
+    /// one iteration per round.
+    Refresh(Vec<RegTree>),
+}
+
+/// The learning rate applied to each new tree: `eta / num_parallel_tree`
+/// (XGBoost divides the rate across a forest so a whole iteration moves by
+/// `eta`), in `f32` as XGBoost's `learning_rate` is.
+fn tree_eta(params: &TrainingParams) -> f32 {
+    params.eta as f32 / params.num_parallel_tree as f32
 }
 
 /// Add one tree's predictions to one output column. Rows are independent, so
@@ -660,9 +818,10 @@ fn apply_leaf_rows(
 /// With probability `1 - skip_drop` a dropout set `D` is selected from the trees
 /// built so far (each dropped independently with probability `rate_drop`, at
 /// least one when any exist). The round's gradients are computed from the
-/// ensemble **excluding** `D`. The new per-output trees are then fit on those
-/// gradients. Using XGBoost's `tree` normalization, if `k = |D|` the new trees
-/// get weight `1/(k+eta)` and each dropped tree is rescaled by `k/(k+eta)`.
+/// ensemble **excluding** `D`. The new trees (`num_parallel_tree` per output,
+/// each shrunk by `eta / num_parallel_tree`) are then fit on those gradients.
+/// Using XGBoost's `tree` normalization, if `k = |D|` every new tree gets
+/// weight `1/(k+eta)` and each dropped tree is rescaled by `k/(k+eta)`.
 #[allow(clippy::too_many_arguments)]
 fn dart_round(
     model: &mut BoostedModel,
@@ -674,11 +833,11 @@ fn dart_round(
     n: usize,
     n_out: usize,
     n_features: usize,
-    round: usize,
+    iteration: usize,
     gpair: &mut [GradPair],
     gpair_k: &mut [GradPair],
 ) {
-    let mut rng = round_rng(params, round, 0x0DA27);
+    let mut rng = round_rng(params, iteration, 0x0DA27);
 
     // 1. Select the dropout set over the trees built so far.
     let existing = model.num_trees();
@@ -705,11 +864,16 @@ fn dart_round(
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
     objective.gradient_info(&margin_excl, info, gpair);
 
-    // 3. Fit one new tree per output on those gradients.
-    let row_subset = sample_rows(n, params.subsample, &mut rng);
+    // 3. Fit the new trees on those gradients: one row sample per parallel
+    //    tree, shared across outputs.
+    let parallel = params.num_parallel_tree;
+    let row_subsets: Vec<Vec<u32>> = (0..parallel)
+        .map(|_| sample_rows(n, params.subsample, &mut rng))
+        .collect();
     let eta = params.eta as f32;
     let new_weight = if k == 0 { 1.0 } else { 1.0 / (k as f32 + eta) };
-    for kk in 0..n_out {
+    for slot in 0..n_out * parallel {
+        let (kk, p) = (slot / parallel, slot % parallel);
         let tree = fit_output_tree(
             params,
             prepared,
@@ -719,8 +883,9 @@ fn dart_round(
             &mut rng,
             n_out,
             kk,
-            round,
-            &row_subset,
+            p,
+            iteration,
+            &row_subsets[p],
             n_features,
         );
         model.push_tree_weighted(tree, new_weight);
@@ -764,11 +929,11 @@ fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
     StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ salt)
 }
 
-/// Fit one output's tree for a boosting round: gather that output's gradient
-/// slice, derive its column sampler, build the tree, and shrink its leaves by
-/// `eta`. The caller owns the round RNG (already seeded and salted), the row
-/// subset, and what happens to the tree (margin updates, contribution
-/// weight).
+/// Fit one tree for output `k` (parallel tree `p`) of a boosting iteration:
+/// gather that output's gradient slice, derive its column sampler, build the
+/// tree, and shrink its leaves by `eta / num_parallel_tree`. The caller owns
+/// the round RNG (already seeded and salted), the row subset, and what
+/// happens to the tree (margin updates, contribution weight).
 #[allow(clippy::too_many_arguments)]
 fn fit_output_tree(
     params: &TrainingParams,
@@ -779,14 +944,21 @@ fn fit_output_tree(
     rng: &mut StdRng,
     n_out: usize,
     k: usize,
-    round: usize,
+    p: usize,
+    iteration: usize,
     row_subset: &[u32],
     n_features: usize,
 ) -> RegTree {
     let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
-    let mut sampler = make_column_sampler(n_features, params, rng, round as u64, k as u64);
+    let mut sampler = make_column_sampler(
+        n_features,
+        params,
+        rng,
+        iteration as u64,
+        (p * n_out + k) as u64,
+    );
     let mut tree = prepared.build_tree(params, dtrain, gk, row_subset, &mut sampler);
-    tree.scale_leaves(params.eta as f32);
+    tree.scale_leaves(tree_eta(params));
     tree
 }
 
@@ -1964,10 +2136,6 @@ mod tests {
         let base = || TrainingParams::builder();
         let cases = [
             (
-                "num_parallel_tree",
-                base().num_parallel_tree(2).build_unchecked(),
-            ),
-            (
                 "sampling_method",
                 base()
                     .sampling_method(SamplingMethod::GradientBased)
@@ -1978,10 +2146,6 @@ mod tests {
                 base()
                     .multi_strategy(MultiStrategy::MultiOutputTree)
                     .build_unchecked(),
-            ),
-            (
-                "process_type",
-                base().process_type(ProcessType::Update).build_unchecked(),
             ),
         ];
         for (param, params) in cases {

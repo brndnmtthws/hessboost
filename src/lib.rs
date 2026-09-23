@@ -115,8 +115,8 @@ pub mod prelude {
     pub use crate::error::{HessboostError, Result};
     pub use crate::learner::conformal::{ConformalizedQuantile, SplitConformal};
     pub use crate::learner::{
-        BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_with_custom_metric,
-        train_with_eval, train_with_objective,
+        BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_continue,
+        train_continue_with_eval, train_with_custom_metric, train_with_eval, train_with_objective,
     };
     pub use crate::metric::{CustomMetric, Metric};
     pub use crate::objective::{CustomObjective, GradPair, Objective};

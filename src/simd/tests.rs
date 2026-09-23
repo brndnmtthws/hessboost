@@ -611,19 +611,30 @@ fn logarithmic_metric_sums_are_close_to_scalar() {
     let weights: Vec<f32> = (0..preds.len())
         .map(|i| 0.51 + (i % 17) as f32 * 0.061)
         .collect();
+    // XGBoost's logloss floors each log argument at 1e-16 without clamping
+    // the prediction, so raw margins outside [0, 1] (`binary:logitraw`) give
+    // `-ln(p)` below zero for positives above one and the 1e-16 floor for
+    // negatives above one.
+    let margins: Vec<f32> = (0..4_103)
+        .map(|i| -0.5 + (i % 999) as f32 * 0.002)
+        .collect();
+    let floor = f64::from(1e-16f32);
     for weights in [None, Some(weights.as_slice())] {
-        let actual = log_loss_sum(&preds, &binary_labels, weights);
-        let mut expected = (0.0, 0.0);
-        for i in 0..preds.len() {
-            let weight = weights.map_or(1.0, |values| f64::from(values[i]));
-            let probability = f64::from(preds[i]).clamp(1e-15, 1.0 - 1e-15);
-            let label = f64::from(binary_labels[i]);
-            expected.0 +=
-                weight * -(label * probability.ln() + (1.0 - label) * (1.0 - probability).ln());
-            expected.1 += weight;
+        for p in [&preds, &margins] {
+            let actual = log_loss_sum(p, &binary_labels, weights);
+            let mut expected = (0.0, 0.0);
+            for i in 0..p.len() {
+                let weight = weights.map_or(1.0, |values| f64::from(values[i]));
+                let probability = f64::from(p[i]);
+                let label = f64::from(binary_labels[i]);
+                expected.0 += weight
+                    * -(label * probability.max(floor).ln()
+                        + (1.0 - label) * (1.0 - probability).max(floor).ln());
+                expected.1 += weight;
+            }
+            assert!((actual.0 - expected.0).abs() <= expected.0.abs() * 2e-12);
+            assert!((actual.1 - expected.1).abs() <= expected.1.abs() * 2e-12);
         }
-        assert!((actual.0 - expected.0).abs() <= expected.0.abs() * 2e-12);
-        assert!((actual.1 - expected.1).abs() <= expected.1.abs() * 2e-12);
 
         for gamma in [false, true] {
             let actual = if gamma {

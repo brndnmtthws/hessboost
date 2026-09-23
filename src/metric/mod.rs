@@ -4,6 +4,12 @@
 //! [`crate::objective::Objective::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
+mod elementwise;
+mod ranking;
+
+pub use elementwise::{Mape, PseudoHuberError, Rmsle};
+pub use ranking::Precision;
+
 use crate::config::ObjectiveParams;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -114,7 +120,10 @@ simple_metric!(
 );
 
 simple_metric!(
-    /// Binary logistic loss (`logloss`). Predictions are probabilities.
+    /// Binary logistic loss (`logloss`), XGBoost's
+    /// `-y·ln(max(p, ε)) − (1 − y)·ln(max(1 − p, ε))` with `ε = 1e-16` and a
+    /// zero-coefficient term dropped. Predictions are probabilities, or raw
+    /// margins for `binary:logitraw`, which are not clamped into `[0, 1]`.
     LogLoss, "logloss", crate::simd::log_loss_sum
 );
 
@@ -542,11 +551,11 @@ impl Metric for CustomMetric {
 
 /// Resolve a metric by name. `num_class` is used by multiclass metrics, and
 /// `objective` carries the loss parameters that objective-dependent metrics
-/// read; none of the metrics implemented so far depend on it.
+/// read (`mphe` takes its slope from `huber_slope`).
 pub fn create_metric(
     name: &str,
     num_class: usize,
-    _objective: &ObjectiveParams,
+    objective: &ObjectiveParams,
 ) -> Result<Box<dyn Metric>> {
     // Accept the XGBoost `tweedie-nloglik@1.5` suffix form.
     let (base, rho) = match name.split_once('@') {
@@ -573,6 +582,25 @@ pub fn create_metric(
         })),
         "ndcg" => Ok(Box::new(Ndcg::new(rho.map(|r| r as usize)))),
         "map" => Ok(Box::new(MeanAveragePrecision::new(rho.map(|r| r as usize)))),
+        "rmsle" => Ok(Box::new(Rmsle)),
+        "mape" => Ok(Box::new(Mape)),
+        "mphe" => {
+            let slope = objective.huber_slope as f32;
+            if slope == 0.0 {
+                return Err(HessboostError::invalid_param(
+                    "huber_slope",
+                    "the slope of `mphe` cannot be 0",
+                ));
+            }
+            Ok(Box::new(PseudoHuberError::new(slope)))
+        }
+        "pre" => match rho {
+            Some(k) if k < 1.0 => Err(HessboostError::invalid_param(
+                "eval_metric",
+                format!("`{name}` needs a cutoff of at least 1"),
+            )),
+            k => Ok(Box::new(Precision::new(name, k.map(|k| k as usize)))),
+        },
         other => Err(HessboostError::unknown("metric", other)),
     }
 }

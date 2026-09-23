@@ -587,7 +587,7 @@ impl Case<'_> {
             for (round, (a, b)) in got.iter().zip(want).enumerate() {
                 let rel = (a - b).abs() / b.abs().max(1.0);
                 // NaN never passes.
-                if !(rel <= fx.tol.evals) {
+                if rel.is_nan() || rel > fx.tol.evals {
                     self.fail(format!(
                         "evals {name} round {round}: hessboost {a} xgboost {b} (rel {rel:.3e} > tol {:.0e})",
                         fx.tol.evals

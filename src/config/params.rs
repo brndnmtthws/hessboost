@@ -155,8 +155,8 @@ pub struct TrainingParams {
     /// Variance power of the Tweedie distribution for `reg:tweedie`, in
     /// `[1, 2)` (1 = Poisson, 2 = Gamma). XGBoost `tweedie_variance_power`.
     pub tweedie_variance_power: f64,
-    /// Slope `δ` of the pseudo-Huber loss for `reg:pseudohubererror`.
-    /// XGBoost `huber_slope`.
+    /// Slope `δ` of the pseudo-Huber loss for `reg:pseudohubererror` and the
+    /// `mphe` metric (which rejects `0`). XGBoost `huber_slope`.
     pub huber_slope: f64,
     /// Number of top-ranked documents paired with all lower-ranked documents
     /// by LambdaRank's `topk` pair method. XGBoost

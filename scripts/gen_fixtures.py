@@ -198,7 +198,70 @@ CASES = {
         dict(objective="reg:tweedie", tweedie_variance_power=1.5, max_depth=4),
         {},
     ),
-    "huber_d4": (y_heavy_tail, dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4), {}),
+    # evals: the default metric is `mphe` (pseudo-Huber without factor 2)
+    "huber_d4": (
+        y_heavy_tail,
+        dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
+        dict(evals=True),
+    ),
+    # small objectives; `evals` checks each default metric (rmsle, logloss on
+    # raw margins, error on the 0/1 hinge output) round by round
+    "squaredlog_d4": (y_gamma, dict(objective="reg:squaredlogerror", max_depth=4), dict(evals=True)),
+    "squaredlog_exact_d4": (
+        y_gamma,
+        dict(objective="reg:squaredlogerror", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_squaredlog_weighted_d4": (
+        y_gamma,
+        dict(objective="reg:squaredlogerror", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+    ),
+    "logitraw_d6": (y_binary, dict(objective="binary:logitraw"), dict(evals=True)),
+    "logitraw_exact_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_logitraw_weighted_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True),
+    ),
+    "nobs_logitraw_spw3_d4": (
+        y_binary,
+        dict(objective="binary:logitraw", scale_pos_weight=3.0, max_depth=4),
+        dict(drop=("base_score",), evals=True),
+    ),
+    "hinge_d4": (y_binary, dict(objective="binary:hinge", max_depth=4), dict(evals=True)),
+    "hinge_exact_d4": (
+        y_binary,
+        dict(objective="binary:hinge", tree_method="exact", max_depth=4),
+        dict(evals=True),
+    ),
+    "nobs_hinge_weighted_d4": (
+        y_binary,
+        dict(objective="binary:hinge", max_depth=4),
+        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+    ),
+    # metric oracles: rmsle / mape / mphe (non-default slope) on a positive
+    # target, and pre / pre@k on weighted query groups
+    "evals_metrics_reg_d4": (
+        y_gamma,
+        dict(max_depth=4, huber_slope=0.7, eval_metric=["rmsle", "mape", "mphe"]),
+        dict(evals=True, test_weighted=True),
+    ),
+    "evals_pre_rank_d4": (
+        y_relevance_binary,
+        dict(
+            objective="rank:ndcg",
+            max_depth=4,
+            lambdarank_pair_method="topk",
+            lambdarank_num_pair_per_sample=GROUP_SIZE,
+            eval_metric=["pre", "pre@5"],
+        ),
+        dict(ranking=True, evals=True, test_weighted=True),
+    ),
     # ranking: groups of 20 and topk=20 enumerate every unordered pair. The
     # Rust objective reproduces XGBoost's top-k accumulation/normalization.
     "rank_ndcg_d4": (

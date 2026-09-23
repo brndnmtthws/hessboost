@@ -5,8 +5,10 @@
 `gen_fixtures.py` trains **real XGBoost 3.4.2** (single thread) on deterministic
 synthetic datasets, one case per supported feature (tree methods, missing values,
 constraints, every objective — including `reg:logistic` and the `reg:linear`
-alias — sample weights, ranking groups, gblinear, DART, intercept estimation;
-38 cases in total), and writes each case to `../fixtures/<name>.json`: data,
+alias — sample weights, ranking groups, gblinear, DART, intercept estimation,
+and per-round metric oracles for `rmsle`, `mape`, `mphe`, `pre`/`pre@k` and
+each objective's default metric; 50 cases in total), and writes each case to
+`../fixtures/<name>.json`: data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
 raw margin, SHAP contributions on the first 50 rows) and the saved model JSON,
 plus the model's UBJSON encoding (`save_raw("ubj")`) as `../fixtures/<name>.ubj`.

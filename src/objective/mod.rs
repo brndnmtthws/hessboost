@@ -13,12 +13,12 @@ mod multiclass;
 mod ranking;
 mod regression;
 
-pub use classification::LogisticObjective;
+pub use classification::{HingeObjective, LogisticObjective};
 pub use count::{GammaObjective, PoissonObjective, TweedieObjective};
 pub use custom::CustomObjective;
 pub use multiclass::SoftmaxObjective;
 pub use ranking::LambdaMartObjective;
-pub use regression::{PseudoHuberObjective, SquaredErrorObjective};
+pub use regression::{PseudoHuberObjective, SquaredErrorObjective, SquaredLogErrorObjective};
 
 use rayon::prelude::*;
 
@@ -257,6 +257,17 @@ pub trait Objective: Send + Sync {
         }
     }
 
+    /// Map one row of margin-space intercepts back to the prediction space
+    /// XGBoost stores `base_score` in (the inverse of
+    /// [`Objective::probs_to_margins`]), in place; used by XGBoost-JSON
+    /// export. Defaults to [`Objective::pred_transform`], which inverts the
+    /// link of every objective whose transform is its link; objectives whose
+    /// transform is not the inverse link (`binary:hinge` thresholds, while its
+    /// `ProbToMargin` is the identity) override it.
+    fn margins_to_probs(&self, margins: &mut [f32]) {
+        self.pred_transform(margins);
+    }
+
     /// Validate a dataset's labels and metadata for this objective. Training
     /// calls it for the training matrix and every evaluation set before the
     /// first round. The default accepts everything.
@@ -374,6 +385,9 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         "reg:squarederror" | "reg:linear" => Box::new(SquaredErrorObjective),
         "reg:pseudohubererror" => Box::new(PseudoHuberObjective::new(params.huber_slope as f32)),
         "binary:logistic" => Box::new(LogisticObjective::new(params.scale_pos_weight as f32)),
+        "binary:logitraw" => Box::new(LogisticObjective::raw(params.scale_pos_weight as f32)),
+        "binary:hinge" => Box::new(HingeObjective),
+        "reg:squaredlogerror" => Box::new(SquaredLogErrorObjective),
         "reg:logistic" => Box::new(LogisticObjective::regression(
             params.scale_pos_weight as f32,
         )),

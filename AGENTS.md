@@ -50,7 +50,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 
 | Path | Contents |
 |---|---|
-| `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning |
+| `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
 | `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |

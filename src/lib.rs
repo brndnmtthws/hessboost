@@ -52,6 +52,8 @@
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON model import/export ([`crate::model`]).
 //! - **Validation:** cross-validation ([`cv`]).
+//! - **Beyond XGBoost (opt-in):** CatBoost-style ordered target statistics
+//!   for categorical columns ([`data::OrderedTargetEncoder`]).
 //!
 //! ## Where to look
 //!

@@ -74,6 +74,7 @@ Runnable, self-contained examples live in
 | `custom_objective` | custom loss and custom eval-metric hooks |
 | `constraints` | monotone + interaction constraints and categorical features |
 | `train_regression` | end-to-end regression with feature importance |
+| `ordered_target_stats` | opt-in CatBoost-style ordered target statistics for a high-cardinality categorical |
 
 ## Feature status
 
@@ -114,6 +115,17 @@ Runnable, self-contained examples live in
   multiclass operations, and histogram split evaluation. **x86-64 AVX2/FMA**
   for objective gradients, prediction transforms, and histogram split
   evaluation.
+
+**Beyond XGBoost (opt-in)**
+
+- **Ordered target statistics** (`hessboost::data::OrderedTargetEncoder`):
+  CatBoost-style encoding of categorical columns as smoothed target means,
+  where each training row only sees the rows before it in a seeded random
+  permutation (so its own label never leaks into its feature). The fitted
+  encoder applies full-training-set statistics to new data, maps unseen
+  categories to the prior, and is serde-serializable. Regression and binary
+  labels; dense and CSR input. Never used unless called; native categorical
+  splits and training defaults are unchanged.
 
 **Not implemented:** the UBJSON (binary) XGBoost model format, a GPU backend,
 distributed or external-memory training, and Python/CLI/C-ABI wrappers.

@@ -9,6 +9,7 @@
 mod classification;
 mod count;
 mod custom;
+mod multi_target;
 mod multiclass;
 mod ranking;
 mod regression;
@@ -150,7 +151,8 @@ pub trait Objective: Send + Sync {
     fn name(&self) -> &str;
 
     /// Number of raw outputs produced per instance. `1` for regression and
-    /// binary classification. It is `num_class` for multiclass objectives.
+    /// binary classification. It is `num_class` for multiclass objectives and
+    /// the label-column count for a multi-target (label matrix) objective.
     fn n_outputs(&self) -> usize {
         1
     }
@@ -322,18 +324,35 @@ pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool)
     Ok(())
 }
 
-/// Reject `n_targets > 1` for an objective that models one target per row.
-fn single_target(objective: Box<dyn Objective>, n_targets: usize) -> Result<Box<dyn Objective>> {
-    if n_targets > 1 {
-        return Err(HessboostError::invalid_param(
-            "labels",
-            format!(
-                "objective `{}` supports one target per row, got {n_targets}",
-                objective.name()
-            ),
-        ));
+/// Objectives XGBoost 3.4.2 trains on a label matrix: elementwise losses whose
+/// output `j` fits label column `j` (`Targets(info) = labels.Shape(1)`).
+const MULTI_TARGET_OBJECTIVES: &[&str] = &[
+    "reg:squarederror",
+    "reg:pseudohubererror",
+    "reg:logistic",
+    "binary:logistic",
+];
+
+/// Fit `n_targets` label columns with `objective`: one per output through
+/// [`multi_target::MultiTarget`] for the objectives in
+/// [`MULTI_TARGET_OBJECTIVES`], unchanged for one column, and an
+/// `invalid parameter "labels"` error for any other objective.
+fn with_targets(objective: Box<dyn Objective>, n_targets: usize) -> Result<Box<dyn Objective>> {
+    if n_targets <= 1 {
+        return Ok(objective);
     }
-    Ok(objective)
+    if MULTI_TARGET_OBJECTIVES.contains(&objective.name()) {
+        return Ok(Box::new(multi_target::MultiTarget::new(
+            objective, n_targets,
+        )));
+    }
+    Err(HessboostError::invalid_param(
+        "labels",
+        format!(
+            "objective `{}` supports one target per row, got {n_targets}",
+            objective.name()
+        ),
+    ))
 }
 
 /// Weighted mean of `labels`, or the plain mean when `weights` is `None`, as
@@ -367,8 +386,10 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
 /// Resolve an objective by name, configured from `params`, for a dataset with
 /// `n_targets` label columns per row.
 ///
-/// Every built-in objective models a single target and rejects
-/// `n_targets > 1` with an `invalid parameter "labels"` error.
+/// `reg:squarederror`, `reg:pseudohubererror`, `reg:logistic`, and
+/// `binary:logistic` accept a label matrix and give one output per label
+/// column, as in XGBoost. Every other objective models a single target and
+/// rejects `n_targets > 1` with an `invalid parameter "labels"` error.
 pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Objective>> {
     let objective: Box<dyn Objective> = match params.objective.as_str() {
         "reg:squarederror" | "reg:linear" => Box::new(SquaredErrorObjective),
@@ -403,7 +424,7 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         )),
         other => return Err(HessboostError::unknown("objective", other)),
     };
-    single_target(objective, n_targets)
+    with_targets(objective, n_targets)
 }
 
 #[cfg(test)]
@@ -449,15 +470,23 @@ mod tests {
         assert!(create_objective(&p, 1).is_err());
     }
 
-    /// Every built-in objective is single-target: two label columns are a
-    /// parameter error naming `labels`, never a silently wrong model.
+    /// Only XGBoost's elementwise multi-target objectives accept a label
+    /// matrix (one output per column); every other built-in objective
+    /// rejects two label columns with a parameter error naming `labels`,
+    /// never a silently wrong model.
     #[test]
-    fn factory_rejects_multi_target_labels() {
+    fn factory_accepts_label_matrices_only_for_elementwise_objectives() {
         for name in [
             "reg:squarederror",
+            "reg:linear",
             "reg:pseudohubererror",
             "binary:logistic",
             "reg:logistic",
+        ] {
+            let p = TrainingParams::builder().objective(name).build_unchecked();
+            assert_eq!(create_objective(&p, 3).unwrap().n_outputs(), 3, "{name}");
+        }
+        for name in [
             "multi:softprob",
             "count:poisson",
             "reg:gamma",

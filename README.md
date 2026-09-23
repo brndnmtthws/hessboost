@@ -117,11 +117,18 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 - **Dataset metadata:** labels (`with_labels`, or a row-major multi-target
   `with_label_matrix`), instance and group weights, `base_margin`, query
   groups, label bounds for censored targets (`with_label_bounds`), feature
-  types, and per-feature sampling weights (`with_feature_weights`). Every
-  built-in objective is single-target; training rejects multi-target labels,
-  feature weights, and the not-yet-implemented `num_parallel_tree > 1`,
+  types, and per-feature sampling weights (`with_feature_weights`). Training
+  rejects feature weights and the not-yet-implemented `num_parallel_tree > 1`,
   `sampling_method = gradient_based`, `multi_strategy = multi_output_tree`,
   and `process_type = update` instead of ignoring them.
+- **Multi-target labels:** `reg:squarederror`, `reg:pseudohubererror`,
+  `reg:logistic`, and `binary:logistic` (multi-label) train on a label matrix
+  like XGBoost's default `one_output_per_tree` strategy: one tree per target
+  per round, per-target intercepts, `[row][target]` predictions and a target
+  axis in SHAP output, and `num_target` models in XGBoost JSON/UBJSON.
+  Elementwise metrics average over every row and target (row weights
+  repeated per target); `auc`/`aucpr` macro-average the targets. Other
+  objectives and the ranking/multiclass metrics reject label matrices.
 - **Metrics:** `rmse`, `mae`, `logloss`, `error`, `auc`, `aucpr`, `mlogloss`,
   `merror`, `poisson/gamma/tweedie-nloglik`, `ndcg`, `map` (with `@k`), and a
   **custom-metric hook**. Default metrics follow XGBoost (`ndcg@k`/`map@k` for

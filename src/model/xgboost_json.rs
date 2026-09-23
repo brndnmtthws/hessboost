@@ -33,7 +33,8 @@
 //!
 //! # Scope and caveats
 //!
-//! Import targets a `gbtree` booster with a scalar or multiclass objective.
+//! Import targets a `gbtree` booster with a scalar, multiclass, or
+//! multi-target (`one_output_per_tree`, scalar-leaf trees) objective.
 //! XGBoost saves `booster=dart` as `gbtree` plus a per-tree
 //! `model.weight_drop` array; those weights become the model's DART tree
 //! weights on import, and a model with non-unit tree weights writes them back
@@ -78,7 +79,10 @@
 //! softmax's inverse link is the identity, while its forward transform
 //! normalizes across classes.
 //!
-//! `learner_model_param.num_target` carries [`BoostedModel::n_targets`].
+//! `learner_model_param.num_target` carries [`BoostedModel::n_targets`]. A
+//! multi-target model (`one_output_per_tree` on a label matrix, `num_class`
+//! 0) has one output per target: tree groups in `tree_info` and `base_score`
+//! entries are per target, laid out exactly like multiclass groups.
 //!
 //! ## UBJSON encoding
 //!
@@ -307,7 +311,13 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
         .and_then(Value::as_str)
         .unwrap_or("reg:squarederror")
         .to_string();
-    let n_outputs = num_class.max(1);
+    // XGBoost's `OutputLength`: classes for multiclass models, otherwise one
+    // output per target (one tree group per label column).
+    let n_outputs = if num_class >= 2 {
+        num_class
+    } else {
+        n_targets.max(1)
+    };
 
     let trees_json = model
         .get("trees")

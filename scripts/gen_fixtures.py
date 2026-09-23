@@ -126,11 +126,44 @@ def y_relevance_binary(x, rng):
     return (y_relevance(x, rng) >= 2).astype(np.float32)
 
 
+def y_multi_regression(x, rng):
+    """Three regression targets (a label matrix) of different shapes."""
+    n = x.shape[0]
+    noise = 0.1 * rng.standard_normal((n, 3))
+    return np.stack(
+        [
+            2 * x[:, 0] - 3 * x[:, 1] ** 2,
+            np.sin(6 * x[:, 2]) + x[:, 3],
+            4 * x[:, 4] * x[:, 5] - 1,
+        ],
+        axis=1,
+    ) + noise
+
+
+def y_multi_label(x, rng):
+    """Three independent binary labels (multi-label classification)."""
+    logits = np.stack([3 * x[:, 0] - 2 * x[:, 1], 4 * x[:, 2] - 2, 2 * x[:, 3] - 3 * x[:, 4] + 1], axis=1)
+    return (1 / (1 + np.exp(-logits)) > rng.random(logits.shape)).astype(np.float32)
+
+
+def y_multi_heavy_tail(x, rng):
+    """Two regression targets with heavy-tailed noise (for pseudo-Huber)."""
+    n = x.shape[0]
+    return np.stack(
+        [
+            2 * x[:, 0] - 3 * x[:, 1] ** 2 + 0.3 * rng.standard_t(2, n),
+            x[:, 2] + 0.5 * x[:, 3] + 0.3 * rng.standard_t(2, n),
+        ],
+        axis=1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Case matrix
 # ---------------------------------------------------------------------------
 
 # name -> (target fn, param overrides, options)
+# A target fn returning an (n, K) array trains on a label matrix (K targets).
 # options: tier, num_round, missing (fraction of NaN features), weighted, ranking,
 #          tol_train (override), drop (params removed from TREE_BASE)
 CASES = {
@@ -257,6 +290,26 @@ CASES = {
         dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
         dict(drop=("base_score",)),
     ),
+    # multi-target labels (a label matrix, one output per column) on the
+    # default one_output_per_tree strategy; intercepts are estimated per target.
+    "multi_reg3_d6": (y_multi_regression, {}, {}),
+    "multi_reg3_nobs_d6": (y_multi_regression, {}, dict(drop=("base_score",))),
+    "multi_reg3_exact_nobs_d6": (y_multi_regression, dict(tree_method="exact"), dict(drop=("base_score",))),
+    "multi_label_binary_d4": (
+        y_multi_label,
+        dict(objective="binary:logistic", max_depth=4),
+        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "multi_label_spw3_d4": (
+        y_multi_label,
+        dict(objective="binary:logistic", scale_pos_weight=3.0, max_depth=4),
+        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+    ),
+    "multi_huber_weighted_d4": (
+        y_multi_heavy_tail,
+        dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
+        dict(drop=("base_score",), weighted=True),
+    ),
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
     "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),
     "colsample_bytree_0p5_d6": (y_regression, dict(colsample_bytree=0.5, seed=42), dict(tier="quality")),
@@ -370,6 +423,8 @@ def build_case(name: str) -> dict:
         "n_train": N_TRAIN,
         "n_test": N_TEST,
         "n_cols": N_COLS,
+        # Label columns: y_train / y_test are row-major [row][target].
+        "n_targets": 1 if y.ndim == 1 else int(y.shape[1]),
         "x_train": _to_json_floats(x_train),
         "y_train": _to_json_floats(y_train),
         "x_test": _to_json_floats(x_test),

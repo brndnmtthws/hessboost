@@ -53,7 +53,8 @@ fn coordinate_delta(sum_grad: f64, sum_hess: f64, w: f64, alpha: f64, lambda: f6
 /// Fit a linear booster by coordinate descent.
 ///
 /// `initial_margin` contains the per-row starting margins, and
-/// `n_out` is the number of outputs (`num_class` for multiclass, else 1). The
+/// `n_out` is the number of outputs (`num_class` for multiclass, the label
+/// columns for multi-target labels, else 1). The
 /// returned [`LinearModel`] holds `weights` laid out `[feature][output]` and a
 /// per-output `bias`.
 pub(crate) fn train_gblinear(

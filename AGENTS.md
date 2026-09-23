@@ -87,16 +87,27 @@ suite; `docs/performance.md` records its results.
 - **Formats:** the native binary magic (`SQB\0`) and the JSON layouts are
   compatibility contracts; do not change them without a migration.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`
-  values; `multi:softprob` gives `n_rows * num_class`, row-major. SHAP
+  values; `multi:softprob` gives `n_rows * num_class` and a multi-target
+  model (label matrix) `n_rows * n_targets`, both row-major
+  `[row][output]`; multi-target `predict_class` thresholds every target
+  (`[row][target]`). SHAP
   contributions are `[row][n_features + 1]` (bias last), interactions
-  `[row][(n_features + 1)^2]`, with an extra output axis for multiclass.
+  `[row][(n_features + 1)^2]`, with an extra output axis for multiclass and
+  multi-target models.
 - **Objective/metric hooks:** training reaches objectives and metrics only
   through the `MetaInfo` hooks (`Objective::gradient_info`,
   `base_margins_info`, `eval_transform`, `probs_to_margins`, `validate_info`,
-  `requires_labels`; `Metric::eval_info`). Label-domain checks live in each
-  objective's `validate_info`; `create_objective(params, n_targets)` rejects
-  label matrices an objective cannot model. Parameters the training loop does
-  not act on yet are refused in `train.rs::reject_unimplemented`.
+  `requires_labels`; `Metric::eval_info`, `supports_label_matrix`).
+  Label-domain checks live in each objective's `validate_info`;
+  `create_objective(params, n_targets)` wraps the elementwise objectives in
+  `objective::MULTI_TARGET_OBJECTIVES` in `objective/multi_target.rs` for a
+  label matrix (row weights broadcast per cell, intercepts per column) and
+  rejects label matrices any other objective cannot model. The default
+  `Metric::eval_info` reduces a label matrix elementwise (every cell weighted
+  by its row weight); non-elementwise metrics override it or return
+  `supports_label_matrix() == false`, which training rejects. Parameters the
+  training loop does not act on yet are refused in
+  `train.rs::reject_unimplemented`.
 
 ## Public API at a glance
 
@@ -119,7 +130,8 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
   then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
 
 Multiclass objectives need `.num_class(k)`; ranking objectives need
-`.with_group_sizes`.
+`.with_group_sizes`; multi-target training takes `.with_label_matrix(y, k)`
+and gives `k` outputs (`multi_strategy = one_output_per_tree`).
 
 ## Not implemented
 

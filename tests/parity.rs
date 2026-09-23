@@ -62,6 +62,8 @@ struct Fixture {
     n_train: usize,
     n_test: usize,
     n_cols: usize,
+    /// Label columns; `y_train` / `y_test` are `[row][target]`.
+    n_targets: usize,
     #[serde(deserialize_with = "nan_for_null")]
     x_train: Vec<f32>,
     y_train: Vec<f32>,
@@ -413,7 +415,7 @@ impl Case<'_> {
         let fx = self.fx;
         let mut d = self
             .dmatrix(&fx.x_train, fx.n_train)?
-            .with_labels(&fx.y_train)
+            .with_label_matrix(&fx.y_train, fx.n_targets)
             .map_err(|e| format!("labels: {e}"))?;
         if let Some(w) = &fx.weights {
             d = d.with_weights(w).map_err(|e| format!("weights: {e}"))?;

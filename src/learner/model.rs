@@ -270,7 +270,8 @@ impl BoostedModel {
 
     /// Number of raw outputs per instance: `num_class` for multiclass, the
     /// objective's output count otherwise (`1` for every built-in scalar
-    /// objective; custom objectives may declare more).
+    /// objective, [`BoostedModel::n_targets`] for a multi-target model; custom
+    /// objectives may declare more).
     #[inline]
     pub fn n_outputs(&self) -> usize {
         self.n_outputs
@@ -470,26 +471,22 @@ impl BoostedModel {
 
     /// For multiclass, the predicted class index per row (argmax over classes).
     /// For single-output models this returns the transformed prediction rounded
-    /// to the nearest class at 0.5.
+    /// to the nearest class at 0.5. A multi-target model (label matrix) is
+    /// multi-label: each target is thresholded at 0.5 independently, giving
+    /// `n_rows × n_targets` decisions laid out `[row][target]`.
     pub fn predict_class(&self, data: &DMatrix) -> Result<Vec<u32>> {
         let probs = self.predict(data)?;
         let k = self.n_outputs();
-        let n = data.n_rows();
-        let mut out = vec![0u32; n];
-        if k == 1 {
-            for (i, o) in out.iter_mut().enumerate() {
-                *o = u32::from(probs[i] > 0.5);
-            }
-        } else if self.objective == "multi:softmax" {
-            for (dst, &class) in out.iter_mut().zip(&probs) {
-                *dst = class as u32;
-            }
-        } else {
-            for i in 0..n {
-                out[i] = crate::simd::argmax_scalar(&probs[i * k..i * k + k]) as u32;
-            }
+        if k == 1 || self.n_targets > 1 {
+            return Ok(probs.iter().map(|&p| u32::from(p > 0.5)).collect());
         }
-        Ok(out)
+        if self.objective == "multi:softmax" {
+            return Ok(probs.iter().map(|&class| class as u32).collect());
+        }
+        Ok(probs
+            .chunks_exact(k)
+            .map(|row| crate::simd::argmax_scalar(row) as u32)
+            .collect())
     }
 
     /// Per-row leaf indices for each tree (shape `n_rows × num_trees`, row-major).

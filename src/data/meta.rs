@@ -95,6 +95,18 @@ impl<'a> MetaInfo<'a> {
             label_upper_bound: None,
         }
     }
+
+    /// The row weights repeated for each of the row's `n_targets` cells
+    /// (`[row][target]`, length `n_rows * n_targets`), which is how XGBoost's
+    /// elementwise objectives and metrics weight a label matrix; `None` when
+    /// the rows are unweighted.
+    pub(crate) fn cell_weights(&self) -> Option<Vec<f32>> {
+        self.weights.map(|w| {
+            w.iter()
+                .flat_map(|&wi| std::iter::repeat_n(wi, self.n_targets))
+                .collect()
+        })
+    }
 }
 
 #[cfg(test)]

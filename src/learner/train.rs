@@ -419,6 +419,17 @@ fn train_impl_inner(
             &ObjectiveParams::from_params(params),
         )?,
     };
+    if dtrain.n_targets() > 1
+        && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
+    {
+        return Err(HessboostError::invalid_param(
+            "eval_metric",
+            format!(
+                "metric `{}` does not support multi-target labels",
+                metric.name()
+            ),
+        ));
+    }
 
     let mut gpair = vec![GradPair::default(); n * n_out];
     // Per-output gradient buffer reused across classes (single-output aliases it).
@@ -2000,8 +2011,9 @@ mod tests {
         ));
     }
 
-    /// Built-in objectives are single-target, and eval sets must carry as
-    /// many label columns as the training matrix.
+    /// Label matrices reach only the objectives and metrics that model them,
+    /// and every eval set must carry as many label columns as the training
+    /// matrix.
     #[test]
     fn target_count_mismatches_are_rejected() {
         let d = step_dataset(4);
@@ -2009,16 +2021,150 @@ mod tests {
         let x: Vec<f32> = (0..4).map(|i| i as f32).collect();
         let two_targets = DMatrix::from_dense(&x, 4, 1)
             .unwrap()
-            .with_label_matrix(&[0.0; 8], 2)
+            .with_label_matrix(&[1.0; 8], 2)
+            .unwrap();
+        let poisson = TrainingParams::builder()
+            .objective("count:poisson")
+            .build()
             .unwrap();
         assert!(matches!(
-            train(&params, &two_targets, 1),
+            train(&poisson, &two_targets, 1),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
         ));
         assert!(matches!(
             train_with_eval(&params, &d, 1, &[(&two_targets, "eval")], None),
             Err(HessboostError::DimensionMismatch { .. })
         ));
+        assert!(matches!(
+            train_with_eval(&params, &two_targets, 1, &[(&d, "eval")], None),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+        let ndcg = TrainingParams::builder()
+            .eval_metric("ndcg")
+            .build()
+            .unwrap();
+        assert!(matches!(
+            train(&ndcg, &two_targets, 1),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "eval_metric"
+        ));
+        // Three margins per row fit neither one per row nor one per target.
+        let bad_margin = two_targets.clone().with_base_margin(&[0.0; 12]).unwrap();
+        assert!(matches!(
+            train(&params, &bad_margin, 1),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+    }
+
+    /// 128 rows over two integer features, weighted, with a label matrix whose
+    /// two columns are unrelated functions of the features (probabilities
+    /// for the logistic objectives).
+    fn two_target_dataset(logistic: bool) -> (DMatrix, [Vec<f32>; 2], Vec<f32>) {
+        let n = 128;
+        let x: Vec<f32> = (0..n)
+            .flat_map(|i| [(i % 32) as f32, ((i * 7) % 11) as f32])
+            .collect();
+        let (a, b): (Vec<f32>, Vec<f32>) = (0..n)
+            .map(|i| {
+                let (x0, x1) = (x[2 * i], x[2 * i + 1]);
+                if logistic {
+                    (
+                        f32::from(u8::from(x0 > 12.0)),
+                        f32::from(u8::from(x1 < 4.0)),
+                    )
+                } else {
+                    (x0 * 0.5 - 3.0, (x1 - 5.0).powi(2))
+                }
+            })
+            .unzip();
+        let matrix: Vec<f32> = a.iter().zip(&b).flat_map(|(&p, &q)| [p, q]).collect();
+        let weights: Vec<f32> = (0..n).map(|i| 0.5 + (i % 4) as f32 * 0.5).collect();
+        let d = DMatrix::from_dense(&x, n, 2)
+            .unwrap()
+            .with_label_matrix(&matrix, 2)
+            .unwrap()
+            .with_weights(&weights)
+            .unwrap();
+        (d, [a, b], weights)
+    }
+
+    /// With `one_output_per_tree`, output `j` of a multi-target model is
+    /// bit for bit the single-target model trained on label column `j`
+    /// (same trees, same per-target intercept), for every tree method and
+    /// multi-target objective.
+    #[test]
+    fn multi_target_outputs_equal_per_column_models() {
+        for (objective, logistic) in [
+            ("reg:squarederror", false),
+            ("reg:pseudohubererror", false),
+            ("binary:logistic", true),
+            ("reg:logistic", true),
+        ] {
+            for method in [TreeMethod::Hist, TreeMethod::Exact, TreeMethod::Approx] {
+                let (d, cols, weights) = two_target_dataset(logistic);
+                let params = TrainingParams::builder()
+                    .objective(objective)
+                    .tree_method(method)
+                    .max_depth(3)
+                    .build()
+                    .unwrap();
+                let model = train(&params, &d, 4).unwrap();
+                assert_eq!((model.n_outputs(), model.n_targets()), (2, 2));
+                let preds = model.predict(&d).unwrap();
+                assert_eq!(preds.len(), 2 * d.n_rows());
+                for (j, col) in cols.iter().enumerate() {
+                    let single = d
+                        .clone()
+                        .with_labels(col)
+                        .unwrap()
+                        .with_weights(&weights)
+                        .unwrap();
+                    let reference = train(&params, &single, 4).unwrap();
+                    assert_eq!(
+                        model.base_scores()[j].to_bits(),
+                        reference.base_score().to_bits(),
+                        "{objective} {method:?} intercept {j}"
+                    );
+                    let expected = reference.predict(&single).unwrap();
+                    for (row, e) in expected.iter().enumerate() {
+                        assert_eq!(
+                            preds[row * 2 + j].to_bits(),
+                            e.to_bits(),
+                            "{objective} {method:?} ({row},{j})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A multi-target model round-trips through the native and XGBoost
+    /// formats with its target count, and `predict_class` thresholds each
+    /// label independently.
+    #[test]
+    fn multi_label_model_round_trips_and_classifies_per_label() {
+        let (d, cols, _) = two_target_dataset(true);
+        let params = TrainingParams::builder()
+            .objective("binary:logistic")
+            .eta(0.5)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 10).unwrap();
+        let preds = model.predict(&d).unwrap();
+        let classes = model.predict_class(&d).unwrap();
+        assert_eq!(classes.len(), 2 * d.n_rows());
+        for (i, (&c, &p)) in classes.iter().zip(&preds).enumerate() {
+            assert_eq!(c, u32::from(p > 0.5), "cell {i}");
+            assert_eq!(c as f32, cols[i % 2][i / 2], "separable cell {i}");
+        }
+        for restored in [
+            BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
+            BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+            BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap(),
+            BoostedModel::from_xgboost_ubjson(&model.to_xgboost_ubjson().unwrap()).unwrap(),
+        ] {
+            assert_eq!(restored.n_targets(), 2);
+            assert_eq!(restored.predict(&d).unwrap(), preds);
+        }
     }
 
     /// An objective that learns from label bounds only: gradients and the

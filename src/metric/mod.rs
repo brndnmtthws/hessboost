@@ -39,9 +39,28 @@ pub trait Metric: Send + Sync {
     /// Evaluate the metric from a dataset's full metadata view; the entry
     /// point training uses. The default forwards the labels, weights, and
     /// groups to [`Metric::eval_grouped`]; metrics that read other metadata
-    /// (label bounds, several targets per row) override it.
+    /// (label bounds) override it.
+    ///
+    /// For a label matrix (`info.n_targets > 1`) the default is XGBoost's
+    /// elementwise reduction: `preds` and `labels` are both
+    /// `[row][target]`, every cell counts as one instance, and each row's
+    /// weight is repeated for its cells, so the metric averages over all
+    /// rows and targets. Metrics that are not elementwise override it (or
+    /// report [`Metric::supports_label_matrix`] `false`).
     fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        if info.n_targets > 1 {
+            let cell_weights = info.cell_weights();
+            return self.eval_grouped(preds, info.labels, cell_weights.as_deref(), None);
+        }
         self.eval_grouped(preds, info.labels, info.weights, info.group)
+    }
+
+    /// Whether [`Metric::eval_info`] is defined on a label matrix
+    /// (`n_targets > 1`). `true` by default (the elementwise reduction);
+    /// ranking and multiclass metrics return `false`, and training then
+    /// rejects them for multi-target data.
+    fn supports_label_matrix(&self) -> bool {
+        true
     }
 }
 
@@ -56,9 +75,12 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
 /// and the `crate::simd` kernel path; `eval` is
 /// `weighted_mean(kernel(preds, labels, weights))`. Metrics with metric-level
 /// state take a `field: Type` arm and pass `self.field` as the kernel's final
-/// argument; `rmse` takes `=> sqrt` for its root. All generated metrics
-/// minimize (`maximize` keeps its default `false`); metrics with non-trivial
-/// logic (`auc`, `aucpr`, ranking) stay handwritten below.
+/// argument; `rmse` takes `=> sqrt` for its root. A trailing
+/// `label_matrix: false` on the `field` arm marks a metric that is not
+/// elementwise over label matrices (the multiclass metrics read one class id
+/// per row). All generated metrics minimize (`maximize` keeps its default
+/// `false`); metrics with non-trivial logic (`auc`, `aucpr`, ranking) stay
+/// handwritten below.
 macro_rules! simple_metric {
     ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path) => {
         $(#[$m])*
@@ -86,7 +108,8 @@ macro_rules! simple_metric {
             }
         }
     };
-    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path) => {
+    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path
+        $(, label_matrix: $label_matrix:literal)?) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy)]
         pub struct $ty {
@@ -99,6 +122,11 @@ macro_rules! simple_metric {
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
                 weighted_mean($simd(preds, labels, weights, self.$field))
             }
+            $(
+                fn supports_label_matrix(&self) -> bool {
+                    $label_matrix
+                }
+            )?
         }
     };
 }
@@ -144,8 +172,29 @@ fn tie_runs<'a>(
     })
 }
 
+/// Multi-label macro average (XGBoost `MultiAUC` with
+/// `MultiAUCType::kMultiLabel`): evaluate `metric` on each target column of
+/// a `[row][target]` label matrix with the row weights, then take the plain
+/// mean over targets.
+fn macro_average_targets(metric: &dyn Metric, preds: &[f32], info: &MetaInfo) -> f64 {
+    let k = info.n_targets;
+    let mut col_preds = Vec::with_capacity(info.n_rows);
+    let mut col_labels = Vec::with_capacity(info.n_rows);
+    let mut total = 0.0;
+    for target in 0..k {
+        col_preds.clear();
+        col_preds.extend(preds.iter().skip(target).step_by(k));
+        col_labels.clear();
+        col_labels.extend(info.labels.iter().skip(target).step_by(k));
+        total += metric.eval(&col_preds, &col_labels, info.weights);
+    }
+    total / k as f64
+}
+
 /// Binary ROC AUC (`auc`), computed with the Mann-Whitney rank-sum and average
 /// ranks for ties. Higher is better. Weights are ignored (unweighted AUC).
+/// For a label matrix it is the mean of the per-target AUCs (XGBoost's
+/// multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Auc;
 
@@ -188,17 +237,26 @@ impl Metric for Auc {
         }
         (sum_pos_rank - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
     }
+
+    fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        if info.n_targets > 1 {
+            return macro_average_targets(self, preds, info);
+        }
+        self.eval_grouped(preds, info.labels, info.weights, info.group)
+    }
 }
 
 simple_metric!(
     /// Multiclass log loss (`mlogloss`). Predictions are `n × num_class`
     /// probabilities. Labels are class indices.
-    MLogLoss, "mlogloss", num_class: usize, crate::simd::multiclass_log_loss_sum
+    MLogLoss, "mlogloss", num_class: usize, crate::simd::multiclass_log_loss_sum,
+    label_matrix: false
 );
 
 simple_metric!(
     /// Multiclass error rate (`merror`): fraction whose argmax ≠ label.
-    MError, "merror", num_class: usize, crate::simd::multiclass_error_sum
+    MError, "merror", num_class: usize, crate::simd::multiclass_error_sum,
+    label_matrix: false
 );
 
 simple_metric!(
@@ -316,6 +374,10 @@ impl Metric for Ndcg {
         true
     }
 
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
         // No group info: treat everything as a single query.
         self.eval_grouped(preds, labels, weights, None)
@@ -409,6 +471,10 @@ impl Metric for MeanAveragePrecision {
         true
     }
 
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
         self.eval_grouped(preds, labels, weights, None)
     }
@@ -430,7 +496,8 @@ impl Metric for MeanAveragePrecision {
 /// sorting instances by descending prediction and sweeping the decision
 /// threshold. The area is integrated over recall with the trapezoidal rule
 /// (tied scores form a single operating point). Higher is better. A degenerate
-/// problem (no positives or no negatives) yields `0`.
+/// problem (no positives or no negatives) yields `0`. For a label matrix it
+/// is the mean of the per-target areas (XGBoost's multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AucPr;
 
@@ -494,6 +561,13 @@ impl Metric for AucPr {
         }
         area
     }
+
+    fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        if info.n_targets > 1 {
+            return macro_average_targets(self, preds, info);
+        }
+        self.eval_grouped(preds, info.labels, info.weights, info.group)
+    }
 }
 
 /// Closure type backing a [`CustomMetric`].
@@ -504,6 +578,10 @@ type MetricFn = dyn Fn(&[f32], &[f32], Option<&[f32]>) -> f64 + Send + Sync;
 /// The closure receives post-transform predictions, labels, and optional
 /// weights, and returns the scalar metric value. `maximize` declares the
 /// optimization direction used for early stopping.
+///
+/// For a label matrix the closure sees `[row][target]` predictions and labels
+/// with each row's weight repeated for its cells (the default
+/// [`Metric::eval_info`] reduction).
 pub struct CustomMetric {
     name: String,
     maximize: bool,
@@ -637,6 +715,83 @@ mod tests {
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].name(), "rmse");
         assert!(create_metrics(&["nope".to_string()], "rmse", 0, &obj).is_err());
+    }
+
+    /// XGBoost's elementwise reduction over a label matrix: every
+    /// `(row, target)` cell is one instance carrying its row's weight, so
+    /// weighted RMSE is `sqrt(Σ w_i (y_ij − p_ij)² / (K Σ w_i))`.
+    #[test]
+    fn elementwise_metrics_average_every_cell_with_row_weights() {
+        let labels = [1.0f32, 0.0, 3.0, 2.0, 0.0, 1.0];
+        let preds = [2.0f32, 0.0, 1.0, 2.0, 1.0, 1.0];
+        let weights = [1.0f32, 3.0];
+        let info = MetaInfo {
+            n_rows: 2,
+            n_targets: 3,
+            ..MetaInfo::new(&labels, Some(&weights), None)
+        };
+        // Row 0 squared errors 1, 0, 4 (weight 1); row 1: 0, 1, 0 (weight 3).
+        let expected = ((1.0 + 4.0 + 3.0) / 12.0f64).sqrt();
+        assert_relative_eq!(Rmse.eval_info(&preds, &info), expected, epsilon = 1e-12);
+        // Row 0 absolute errors 1, 0, 2; row 1: 0, 1, 0.
+        assert_relative_eq!(Mae.eval_info(&preds, &info), 6.0 / 12.0, epsilon = 1e-12);
+        let unweighted = MetaInfo {
+            weights: None,
+            ..info
+        };
+        assert_relative_eq!(
+            Rmse.eval_info(&preds, &unweighted),
+            (6.0f64 / 6.0).sqrt(),
+            epsilon = 1e-12
+        );
+    }
+
+    /// Multi-label AUC / AUCPR is the plain mean of the per-target values.
+    #[test]
+    fn ranking_curve_metrics_macro_average_label_columns() {
+        // Target 0 is ranked perfectly (AUC 1), target 1 exactly backwards
+        // (0); pooling all cells instead would give 9/16.
+        let labels = [1.0f32, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let preds = [0.9f32, 0.1, 0.8, 0.3, 0.2, 0.7, 0.1, 0.9];
+        let info = MetaInfo {
+            n_rows: 4,
+            n_targets: 2,
+            ..MetaInfo::new(&labels, None, None)
+        };
+        assert_relative_eq!(Auc.eval_info(&preds, &info), 0.5, epsilon = 1e-12);
+        let per_target: f64 = (0..2)
+            .map(|t| {
+                let col = |v: &[f32]| v.iter().skip(t).step_by(2).copied().collect::<Vec<_>>();
+                AucPr.eval(&col(&preds), &col(&labels), None)
+            })
+            .sum();
+        assert_relative_eq!(
+            AucPr.eval_info(&preds, &info),
+            per_target / 2.0,
+            epsilon = 1e-12
+        );
+    }
+
+    /// Ranking and multiclass metrics read one label per row and refuse
+    /// label matrices; elementwise and curve metrics accept them.
+    #[test]
+    fn label_matrix_support_is_declared_per_metric() {
+        let obj = ObjectiveParams::default();
+        for (name, supported) in [
+            ("rmse", true),
+            ("logloss", true),
+            ("error", true),
+            ("auc", true),
+            ("aucpr", true),
+            ("tweedie-nloglik@1.5", true),
+            ("mlogloss", false),
+            ("merror", false),
+            ("ndcg", false),
+            ("map@5", false),
+        ] {
+            let metric = create_metric(name, 3, &obj).unwrap();
+            assert_eq!(metric.supports_label_matrix(), supported, "{name}");
+        }
     }
 
     #[test]

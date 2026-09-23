@@ -8,7 +8,8 @@ constraints, every objective — including `reg:logistic` and the `reg:linear`
 alias — sample weights, ranking groups, gblinear, DART, intercept estimation;
 37 cases in total), and writes each case to `../fixtures/<name>.json`: data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
-raw margin, SHAP contributions on the first 50 rows) and the saved model JSON.
+raw margin, SHAP contributions on the first 50 rows) and the saved model JSON,
+plus the model's UBJSON encoding (`save_raw("ubj")`) as `../fixtures/<name>.ubj`.
 It also writes `../fixtures/cuts/<name>.json`, XGBoost's `hist` and `approx`
 quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 
@@ -17,10 +18,15 @@ quantile cuts (`DMatrix.get_quantile_cut`) for a set of matrices.
 1. **Train parity** - train on the fixture data, compare `predict(x_test)` with
    XGBoost's predictions.
 2. **Import parity** - `BoostedModel::from_xgboost_json` on the embedded model,
-   compare predictions, raw margins, and SHAP contributions.
-3. **Export parity** - write `to_xgboost_json` and hessboost's predictions to
+   compare predictions, raw margins, and SHAP contributions;
+   `from_xgboost_ubjson` on the `.ubj` sidecar must yield the identical model
+   (column `ubj`).
+3. **Export parity** - write `to_xgboost_json` (`<name>.model.json`),
+   `to_xgboost_ubjson` (`<name>.model.ubj`) and hessboost's predictions to
    `../fixtures/exports/`; `check_exports.py` reloads each model in XGBoost and
-   compares.
+   compares predictions, and for UBJSON also requires every array to use the
+   same container form (typed element marker or generic) as XGBoost's own
+   `save_raw("ubj")` of the loaded model.
 
 `quantile_cuts_match_xgboost` compares `HistCuts::from_dmatrix` bit-for-bit with
 the cut oracles.

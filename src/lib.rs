@@ -50,7 +50,7 @@
 //!   interaction values ([`BoostedModel::predict_contribs`] /
 //!   [`predict_interactions`](prelude::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
-//!   XGBoost-format JSON model import/export ([`crate::model`]).
+//!   XGBoost-format JSON and UBJSON model import/export ([`crate::model`]).
 //! - **Validation:** cross-validation ([`cv`]).
 //!
 //! ## Where to look

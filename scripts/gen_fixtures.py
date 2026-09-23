@@ -4,7 +4,9 @@
 Trains real XGBoost (single thread) on deterministic synthetic datasets, one
 case per supported feature, and writes `fixtures/<name>.json` holding the data,
 the exact `xgb.train` parameter dict, XGBoost's test-set predictions (transformed,
-raw margin, SHAP contributions on the first 50 rows) and the saved model JSON.
+raw margin, SHAP contributions on the first 50 rows) and the saved model JSON,
+plus the same model's UBJSON encoding (`save_raw("ubj")`) as the sidecar
+`fixtures/<name>.ubj` named by the fixture's `xgb_model_ubj`.
 `tests/parity.rs` consumes these; the fixture schema is the
 contract between the two.
 
@@ -298,6 +300,15 @@ def _inject_missing(x: np.ndarray, frac: float, rng) -> np.ndarray:
     return x
 
 
+def _save_model_ubj(booster: xgb.Booster, name: str) -> str:
+    """Write the model's UBJSON encoding (`save_raw("ubj")`, the bytes of
+    `save_model("m.ubj")`) next to the fixture; returns the file name."""
+    file_name = f"{name}.ubj"
+    with open(os.path.join(FIX_DIR, file_name), "wb") as fh:
+        fh.write(booster.save_raw("ubj"))
+    return file_name
+
+
 def _save_model_json(booster: xgb.Booster) -> dict:
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "model.json")
@@ -371,6 +382,7 @@ def build_case(name: str) -> dict:
         "xgb_margin": _to_json_floats(margin),
         "xgb_contribs": _to_json_floats(contribs),
         "xgb_model": _save_model_json(booster),
+        "xgb_model_ubj": _save_model_ubj(booster, name),
         "tol": {"train": tol_train, "import": TOL_IMPORT, "contribs": TOL_CONTRIBS},
     }
 
@@ -468,20 +480,20 @@ def build_cut_case(name: str) -> dict:
     }
 
 
-def _clear_json(directory: str) -> None:
-    """Remove stale `*.json` so a regeneration never leaves outputs of removed cases."""
+def _clear_outputs(directory: str) -> None:
+    """Remove stale `*.json` / `*.ubj` so a regeneration never leaves outputs of removed cases."""
     os.makedirs(directory, exist_ok=True)
     for entry in os.listdir(directory):
-        if entry.endswith(".json"):
+        if entry.endswith((".json", ".ubj")):
             os.remove(os.path.join(directory, entry))
 
 
 def main() -> None:
     if xgb.__version__ != XGBOOST_VERSION:
         raise SystemExit(f"fixtures target xgboost {XGBOOST_VERSION}, found {xgb.__version__}")
-    _clear_json(FIX_DIR)
-    _clear_json(CUT_DIR)
-    _clear_json(os.path.join(FIX_DIR, "exports"))
+    _clear_outputs(FIX_DIR)
+    _clear_outputs(CUT_DIR)
+    _clear_outputs(os.path.join(FIX_DIR, "exports"))
     for name in CASES:
         fixture = build_case(name)
         path = os.path.join(FIX_DIR, f"{name}.json")

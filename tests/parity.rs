@@ -6,9 +6,11 @@
 //! * [`xgboost_parity`] runs the three-way check per case: **train** on the
 //!   fixture data and compare test predictions (pointwise for the `exact` tier,
 //!   a quality band for the RNG-driven `quality` tier), **import** the embedded
-//!   XGBoost model and compare predictions, margins and SHAP contributions, and
-//!   **export** the hessboost model to `fixtures/exports/` for
-//!   `scripts/check_exports.py` to reload in XGBoost.
+//!   XGBoost model and compare predictions, margins and SHAP contributions
+//!   (the model's UBJSON encoding, `fixtures/<name>.ubj`, must import to the
+//!   identical model), and **export** the hessboost model as XGBoost JSON and
+//!   UBJSON to `fixtures/exports/` for `scripts/check_exports.py` to reload in
+//!   XGBoost.
 //! * [`quantile_cuts_match_xgboost`] compares `hist` quantile cuts bit-for-bit
 //!   against `DMatrix.get_quantile_cut()` oracles in `fixtures/cuts/`.
 //!
@@ -74,6 +76,9 @@ struct Fixture {
     xgb_margin: Vec<f32>,
     xgb_contribs: Vec<f32>,
     xgb_model: Value,
+    /// File name, relative to `fixtures/`, of the same model saved by XGBoost
+    /// as UBJSON (`save_raw("ubj")`).
+    xgb_model_ubj: String,
     tol: Tol,
 }
 
@@ -360,6 +365,7 @@ struct Row {
     import: String,
     margin: String,
     contribs: String,
+    ubj: String,
     export: String,
     base_score: String,
 }
@@ -513,8 +519,37 @@ impl Case<'_> {
         ]
     }
 
-    /// Assertion 3: export the trained model plus hessboost's predictions for
-    /// `scripts/check_exports.py`.
+    /// Assertion 2b: XGBoost's UBJSON encoding of the same model imports to
+    /// exactly the model the JSON document gives (same native bytes, hence
+    /// bit-identical predictions, margins and contributions), and fails the
+    /// same way for unsupported boosters.
+    fn import_ubjson(&mut self, dir: &Path) -> String {
+        let fx = self.fx;
+        let from_ubj = std::fs::read(dir.join(&fx.xgb_model_ubj))
+            .map_err(HessboostError::from)
+            .and_then(|bytes| BoostedModel::from_xgboost_ubjson(&bytes));
+        let from_json = BoostedModel::from_xgboost_json(&fx.xgb_model.to_string());
+        let verdict = match (&from_ubj, &from_json) {
+            (Ok(u), Ok(j)) => match (u.to_bytes(), j.to_bytes()) {
+                (Ok(u), Ok(j)) if u == j => Ok("same"),
+                (Ok(_), Ok(_)) => Err("UBJSON import differs from the JSON import".to_string()),
+                (Err(e), _) | (_, Err(e)) => Err(format!("encode imported model: {e}")),
+            },
+            (Err(HessboostError::ModelFormat(_)), Err(HessboostError::ModelFormat(_))) => Ok("n/a"),
+            (Err(e), _) => Err(format!("UBJSON import: {e}")),
+            (Ok(_), Err(e)) => Err(format!("UBJSON import succeeded, JSON import failed: {e}")),
+        };
+        match verdict {
+            Ok(cell) => cell.to_string(),
+            Err(e) => {
+                self.fail(e);
+                "ERR".to_string()
+            }
+        }
+    }
+
+    /// Assertion 3: export the trained model (XGBoost JSON and UBJSON) plus
+    /// hessboost's predictions for `scripts/check_exports.py`.
     fn export(&mut self, model: &BoostedModel, preds: &[f32], dir: &Path) -> String {
         let fx = self.fx;
         if booster_of(fx) == "gblinear" {
@@ -526,6 +561,15 @@ impl Case<'_> {
             .and_then(|json| {
                 std::fs::write(dir.join(format!("{}.model.json", fx.name)), json)
                     .map_err(|e| format!("write model: {e}"))
+            })
+            .and_then(|()| {
+                model
+                    .to_xgboost_ubjson()
+                    .map_err(|e| format!("export UBJSON: {e}"))
+            })
+            .and_then(|ubj| {
+                std::fs::write(dir.join(format!("{}.model.ubj", fx.name)), ubj)
+                    .map_err(|e| format!("write UBJSON model: {e}"))
             })
             .and_then(|()| {
                 serde_json::to_string(preds)
@@ -544,7 +588,7 @@ impl Case<'_> {
         }
     }
 
-    fn run(mut self, exports: &Path) -> Row {
+    fn run(mut self, dir: &Path, exports: &Path) -> Row {
         let fx = self.fx;
         let tier = match fx.tier {
             Tier::Exact => "exact",
@@ -558,6 +602,7 @@ impl Case<'_> {
             import: "ERR".to_string(),
             margin: "ERR".to_string(),
             contribs: "ERR".to_string(),
+            ubj: "ERR".to_string(),
             export: "n/a".to_string(),
             base_score: "-".to_string(),
         };
@@ -600,6 +645,7 @@ impl Case<'_> {
         }
 
         [row.import, row.margin, row.contribs] = self.import_and_compare(&dtest, &dcontrib);
+        row.ubj = self.import_ubjson(dir);
         row
     }
 }
@@ -629,23 +675,24 @@ fn xgboost_parity() {
 
     let mut failures = Vec::new();
     println!(
-        "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<8} base_score hessboost | xgboost",
-        "case", "tier", "train", "import", "margin", "contribs", "export"
+        "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} base_score hessboost | xgboost",
+        "case", "tier", "train", "import", "margin", "contribs", "ubj", "export"
     );
     for (_, fx) in &fixtures {
         let row = Case {
             fx,
             failures: &mut failures,
         }
-        .run(&exports);
+        .run(&dir, &exports);
         println!(
-            "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<8} {} | {}",
+            "{:<26} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {} | {}",
             row.name,
             row.tier,
             row.train,
             row.import,
             row.margin,
             row.contribs,
+            row.ubj,
             row.export,
             row.base_score,
             xgb_base_score(fx)

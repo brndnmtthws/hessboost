@@ -79,6 +79,11 @@ cargo run --release --example <name>         # run an example
 cargo bench                                  # criterion micro-benchmarks
 ```
 
+Toolchain versions (rust, mbx, uv) are pinned in `mise.toml`; `mise install`
+sets them up. CI (`.github/workflows/ci.yml`) runs the same commands through
+`mbx` (e.g. `mbx test`) for build caching, on x86_64/aarch64 Linux and
+aarch64 macOS.
+
 ## Module map (`src/`)
 
 `data/` (DMatrix, quantile binning, ghist) · `config/` (TrainingParams) ·

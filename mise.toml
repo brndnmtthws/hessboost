@@ -1,0 +1,4 @@
+[tools]
+rust = { version = "1.98.1", profile = "minimal", components = "clippy,rustfmt" }
+mr-boxington = "1.16.0"
+uv = "0.12.18"

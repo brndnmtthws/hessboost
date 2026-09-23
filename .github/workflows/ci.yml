@@ -6,40 +6,72 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 env:
+  CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+
+# Toolchain and tool versions (rust, mbx, uv) come from mise.toml. mise-action
+# runs before mr-boxington-action so the cache key sees the pinned rustc, and
+# the cache action reuses the mbx that mise put on PATH. mise's own cache is
+# off: it would restore the rust install symlink without rustup's toolchain.
 
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
         with:
-          components: rustfmt
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
       - run: cargo fmt --all --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: clippy
+      - run: mbx clippy --all-targets --all-features
 
   test:
-    name: test (stable)
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64-linux, runner: ubuntu-latest }
+          - { name: aarch64-linux, runner: ubuntu-24.04-arm }
+          - { name: aarch64-darwin, runner: macos-latest }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: test
+      - run: mbx test --all-features
 
   docs:
     name: docs
@@ -47,33 +79,64 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: docs
+      - run: mbx doc --no-deps --all-features
 
   msrv:
     name: MSRV (1.86.0)
     runs-on: ubuntu-latest
+    env:
+      # Overrides the rust version from mise.toml for every mise step.
+      MISE_RUST_VERSION: 1.86.0
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@v7
         with:
-          toolchain: 1.86.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-features
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: msrv
+      - run: mbx build --all-features
 
   parity:
     name: XGBoost parity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: parity
       - name: Generate fixtures from XGBoost 3.4.1
         run: uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
       - name: Train, import and cut parity
-        run: cargo test --test parity --release -- --ignored --nocapture
+        run: mbx test --test parity --release -- --ignored --nocapture
       - name: Export parity (reload in XGBoost)
         run: uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+
+  all-checks-passed:
+    permissions: {}
+    needs: [fmt, clippy, test, docs, msrv, parity]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    # Run on upstream failure too (so branch protection sees a failure), but
+    # not on cancellation.
+    if: ${{ !cancelled() }}
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
+      - run: echo "All checks passed"

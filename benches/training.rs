@@ -559,6 +559,33 @@ fn bench_predict(c: &mut Criterion) {
     group.finish();
 }
 
+/// QuadratureTreeSHAP on 100 depth-6 trees over 20 features (trained on 20k
+/// rows): contributions for 2,000 rows and interaction values for 200.
+fn bench_shap(c: &mut Criterion) {
+    let data = make_data(20_000, 20);
+    let params = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .max_depth(6)
+        .eta(0.1)
+        .build()
+        .unwrap();
+    let model = train(&params, &data, 100).unwrap();
+    let values: Vec<f32> = (0..2_000 * 20)
+        .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
+        .collect();
+    let rows = DMatrix::from_dense(&values, 2_000, 20).unwrap();
+    let few_rows = DMatrix::from_dense(&values[..200 * 20], 200, 20).unwrap();
+    let mut group = c.benchmark_group("shap_x20_100trees_depth6");
+    group.sample_size(10);
+    group.bench_function("contribs_2k", |b| {
+        b.iter(|| model.predict_contribs(black_box(&rows)).unwrap());
+    });
+    group.bench_function("interactions_200", |b| {
+        b.iter(|| model.predict_interactions(black_box(&few_rows)).unwrap());
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_histogram_build,
@@ -570,6 +597,7 @@ criterion_group!(
     bench_multiclass_metrics,
     bench_binary_train,
     bench_train,
-    bench_predict
+    bench_predict,
+    bench_shap
 );
 criterion_main!(benches);

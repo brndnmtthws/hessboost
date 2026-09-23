@@ -1,0 +1,864 @@
+//! Distribution-free prediction intervals by split conformal prediction.
+//!
+//! Two calibrators wrap already-fitted models:
+//!
+//! - [`SplitConformal`] turns a point regressor `f` into symmetric intervals
+//!   `[f(x) - Q, f(x) + Q]` from absolute-residual scores `|y - f(x)|`.
+//! - [`ConformalizedQuantile`] implements conformalized quantile regression
+//!   (CQR, Romano, Patterson & Candès, 2019): a lower/upper quantile band
+//!   `[q_lo(x), q_hi(x)]` is widened (or shrunk) to `[q_lo(x) - Q, q_hi(x) + Q]`
+//!   using the scores `max(q_lo(x) - y, y - q_hi(x))`. The band keeps the
+//!   input-dependent width of the quantile models, so intervals adapt to
+//!   heteroscedastic noise.
+//!
+//! Both need a **calibration set**: labelled rows that were *not* used to train
+//! the model(s). With `n` calibration scores and miscoverage level `alpha`,
+//! `Q` is the `k`-th smallest score, where `k = ceil((n + 1)(1 - alpha))`.
+//!
+//! # Coverage guarantee
+//!
+//! If the `n` calibration rows and a test row `(X, Y)` are exchangeable (for
+//! example, drawn i.i.d. from the same distribution) and independent of the
+//! data the model(s) were trained on, the returned interval `C(X)` satisfies
+//!
+//! ```text
+//! P(Y ∈ C(X)) ≥ 1 - alpha
+//! ```
+//!
+//! and, when the scores are almost surely distinct (no ties),
+//! `P(Y ∈ C(X)) ≤ 1 - alpha + 1/(n + 1)`.
+//!
+//! The probability is **marginal**: it is taken jointly over the calibration
+//! sample and the test row. It is *not* conditional coverage: a given input
+//! `x` (or a region of inputs) may be covered less often than `1 - alpha`,
+//! and for one fixed calibration set the realized coverage fluctuates around
+//! the nominal level (it follows a Beta distribution with mean `k / (n + 1)`).
+//! No assumption on the model's quality is needed; a poor model yields wide
+//! intervals, not invalid ones.
+//!
+//! When `alpha < 1 / (n + 1)`, `k > n`: the calibration set is too small to
+//! certify the requested level, `Q = +∞`, and every interval is
+//! `(-∞, +∞)`.
+//!
+//! # Weights
+//!
+//! Calibration sets with non-uniform instance weights are rejected. Weighted
+//! conformal prediction (Tibshirani et al., 2019) also requires the weight of
+//! each test point, which this API does not model; uniform weights are
+//! accepted because they do not change the quantile.
+//!
+//! # Example
+//!
+//! ```
+//! use hessboost::prelude::*;
+//!
+//! # fn main() -> Result<()> {
+//! let n = 200;
+//! let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+//! let y: Vec<f32> = x.iter().map(|v| 2.0 * v + 0.1 * (37.0 * v).sin()).collect();
+//! let (train_rows, cal_rows): (Vec<usize>, Vec<usize>) = (0..n).partition(|i| i % 2 == 0);
+//! let all = DMatrix::from_dense(&x, n, 1)?.with_labels(&y)?;
+//! let (dtrain, dcal) = (all.select_rows(&train_rows)?, all.select_rows(&cal_rows)?);
+//!
+//! let params = TrainingParams::builder().objective("reg:squarederror").build()?;
+//! let model = train(&params, &dtrain, 20)?;
+//!
+//! let conformal = SplitConformal::calibrate(&model, &dcal, 0.1)?;
+//! let intervals = conformal.predict_interval(&dcal)?;
+//! assert!(intervals.iter().all(|(lo, hi)| lo <= hi));
+//! # Ok(())
+//! # }
+//! ```
+
+use crate::data::DMatrix;
+use crate::error::{HessboostError, Result};
+use crate::learner::BoostedModel;
+
+/// Split-conformal intervals `[f(x) - Q, f(x) + Q]` around a single-output
+/// point model `f`.
+///
+/// `Q` is the finite-sample-corrected quantile of the absolute residuals
+/// `|y_i - f(x_i)|` on the calibration set; see the
+/// [module docs](crate::learner::conformal) for the exact coverage guarantee.
+#[derive(Debug, Clone)]
+pub struct SplitConformal<'a> {
+    model: &'a BoostedModel,
+    alpha: f64,
+    n_calibration: usize,
+    half_width: f64,
+}
+
+impl<'a> SplitConformal<'a> {
+    /// Calibrate `model` on a held-out, labelled `calibration` set for
+    /// miscoverage level `alpha` (target coverage `1 - alpha`).
+    ///
+    /// The model must have a single output (`model.n_outputs() == 1`); scores
+    /// are computed on [`BoostedModel::predict`] (the objective's reported
+    /// space), honouring the calibration set's `base_margin` if present.
+    ///
+    /// # Errors
+    ///
+    /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`,
+    ///   the model has more than one output, the calibration set carries
+    ///   non-uniform weights, or a prediction is not finite.
+    /// - [`HessboostError::EmptyDataset`] if the calibration set has no rows or
+    ///   no labels.
+    /// - [`HessboostError::DimensionMismatch`] if the calibration set's feature
+    ///   count differs from the model's.
+    pub fn calibrate(model: &'a BoostedModel, calibration: &DMatrix, alpha: f64) -> Result<Self> {
+        validate_alpha(alpha)?;
+        let labels = calibration_labels(calibration)?;
+        let preds = single_output_predictions(model, calibration)?;
+        let mut scores: Vec<f64> = preds
+            .iter()
+            .zip(labels)
+            .map(|(&p, &y)| (f64::from(y) - f64::from(p)).abs())
+            .collect();
+        let half_width = conformal_quantile(&mut scores, alpha);
+        Ok(SplitConformal {
+            model,
+            alpha,
+            n_calibration: labels.len(),
+            half_width,
+        })
+    }
+
+    /// Prediction intervals `(lower, upper)` for every row of `data`.
+    ///
+    /// Bounds are computed in `f64` and rounded outward to `f32`, so the
+    /// `f32` interval always contains the exact one. When the half-width is
+    /// infinite (see [`Self::half_width`]) every interval is `(-∞, +∞)`.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] on a feature-count mismatch and
+    /// [`HessboostError::InvalidParameter`] if a prediction is not finite.
+    pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
+        let preds = single_output_predictions(self.model, data)?;
+        Ok(preds
+            .iter()
+            .map(|&p| widen(p, p, self.half_width))
+            .collect())
+    }
+
+    /// The calibrated half-width `Q`: the `k`-th smallest absolute residual
+    /// with `k = ceil((n + 1)(1 - alpha))`, or `+∞` when `k > n`.
+    pub fn half_width(&self) -> f64 {
+        self.half_width
+    }
+
+    /// The miscoverage level `alpha` the calibrator was built for.
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
+    /// Number of calibration rows `n`.
+    pub fn n_calibration(&self) -> usize {
+        self.n_calibration
+    }
+}
+
+/// Conformalized quantile regression (CQR): a lower/upper quantile band
+/// `[q_lo(x), q_hi(x)]` adjusted to `[q_lo(x) - Q, q_hi(x) + Q]`.
+///
+/// `Q` is the finite-sample-corrected quantile of the calibration scores
+/// `E_i = max(q_lo(x_i) - y_i, y_i - q_hi(x_i))`; see the
+/// [module docs](crate::learner::conformal) for the exact coverage guarantee. `Q` is positive when
+/// the band under-covers and negative when it over-covers, so CQR both widens
+/// a too-narrow band and tightens a too-wide one.
+///
+/// The quantile models are typically trained with a pinball loss at levels
+/// `alpha / 2` and `1 - alpha / 2`, but the guarantee holds for any pair of
+/// models. If the adjusted bounds cross (`lower > upper`, possible when
+/// `Q < 0` or the models' quantiles cross), the interval is returned as-is and
+/// represents the empty set; the coverage guarantee already accounts for it.
+#[derive(Debug, Clone)]
+pub struct ConformalizedQuantile<'a> {
+    band: QuantileBand<'a>,
+    alpha: f64,
+    n_calibration: usize,
+    correction: f64,
+}
+
+/// Where the raw quantile band comes from.
+#[derive(Debug, Clone, Copy)]
+enum QuantileBand<'a> {
+    /// Two single-output models.
+    Pair {
+        lower: &'a BoostedModel,
+        upper: &'a BoostedModel,
+    },
+    /// Two outputs of one multi-output model.
+    Outputs {
+        model: &'a BoostedModel,
+        lower: usize,
+        upper: usize,
+    },
+}
+
+impl QuantileBand<'_> {
+    /// The raw `(q_lo, q_hi)` predictions for every row, validated finite.
+    fn predict(self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
+        match self {
+            QuantileBand::Pair { lower, upper } => {
+                let lo = single_output_predictions(lower, data)?;
+                let hi = single_output_predictions(upper, data)?;
+                Ok(lo.into_iter().zip(hi).collect())
+            }
+            QuantileBand::Outputs {
+                model,
+                lower,
+                upper,
+            } => {
+                let k = model.n_outputs();
+                let preds = model.predict(data)?;
+                check_prediction_len(preds.len(), data.n_rows() * k)?;
+                check_finite(&preds)?;
+                Ok(preds
+                    .chunks_exact(k)
+                    .map(|row| (row[lower], row[upper]))
+                    .collect())
+            }
+        }
+    }
+}
+
+impl<'a> ConformalizedQuantile<'a> {
+    /// Calibrate a band given by two single-output quantile models, `lower`
+    /// (e.g. trained at quantile `alpha / 2`) and `upper` (at `1 - alpha / 2`).
+    ///
+    /// # Errors
+    ///
+    /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`,
+    ///   either model has more than one output, the calibration set carries
+    ///   non-uniform weights, or a prediction is not finite.
+    /// - [`HessboostError::EmptyDataset`] if the calibration set has no rows or
+    ///   no labels.
+    /// - [`HessboostError::DimensionMismatch`] if the two models expect
+    ///   different feature counts or the calibration set does not match them.
+    pub fn calibrate(
+        lower: &'a BoostedModel,
+        upper: &'a BoostedModel,
+        calibration: &DMatrix,
+        alpha: f64,
+    ) -> Result<Self> {
+        if lower.n_features() != upper.n_features() {
+            return Err(HessboostError::DimensionMismatch {
+                what: "upper quantile model feature count",
+                expected: lower.n_features(),
+                got: upper.n_features(),
+            });
+        }
+        Self::calibrate_band(QuantileBand::Pair { lower, upper }, calibration, alpha)
+    }
+
+    /// Calibrate a band given by two outputs of one multi-output model, e.g.
+    /// a quantile model trained at levels `[alpha / 2, 1 - alpha / 2]`.
+    /// `lower_output` and `upper_output` index the model's outputs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::calibrate`], plus [`HessboostError::InvalidParameter`] if an
+    /// output index is out of range, the two indices are equal, or the model's
+    /// predictions are not laid out `[row][output]` (e.g. `multi:softmax`).
+    pub fn calibrate_outputs(
+        model: &'a BoostedModel,
+        lower_output: usize,
+        upper_output: usize,
+        calibration: &DMatrix,
+        alpha: f64,
+    ) -> Result<Self> {
+        let k = model.n_outputs();
+        for (name, index) in [
+            ("lower_output", lower_output),
+            ("upper_output", upper_output),
+        ] {
+            if index >= k {
+                return Err(HessboostError::invalid_param(
+                    name,
+                    format!("output index {index} is out of range for a model with {k} outputs"),
+                ));
+            }
+        }
+        if lower_output == upper_output {
+            return Err(HessboostError::invalid_param(
+                "upper_output",
+                "must differ from lower_output",
+            ));
+        }
+        let band = QuantileBand::Outputs {
+            model,
+            lower: lower_output,
+            upper: upper_output,
+        };
+        Self::calibrate_band(band, calibration, alpha)
+    }
+
+    fn calibrate_band(band: QuantileBand<'a>, calibration: &DMatrix, alpha: f64) -> Result<Self> {
+        validate_alpha(alpha)?;
+        let labels = calibration_labels(calibration)?;
+        let raw = band.predict(calibration)?;
+        let mut scores: Vec<f64> = raw
+            .iter()
+            .zip(labels)
+            .map(|(&(lo, hi), &y)| {
+                let y = f64::from(y);
+                (f64::from(lo) - y).max(y - f64::from(hi))
+            })
+            .collect();
+        let correction = conformal_quantile(&mut scores, alpha);
+        Ok(ConformalizedQuantile {
+            band,
+            alpha,
+            n_calibration: labels.len(),
+            correction,
+        })
+    }
+
+    /// Prediction intervals `(q_lo(x) - Q, q_hi(x) + Q)` for every row of
+    /// `data`.
+    ///
+    /// Bounds are computed in `f64` and rounded outward to `f32`. When `Q` is
+    /// infinite (see [`Self::correction`]) every interval is `(-∞, +∞)`.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] on a feature-count mismatch and
+    /// [`HessboostError::InvalidParameter`] if a prediction is not finite.
+    pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
+        Ok(self
+            .band
+            .predict(data)?
+            .into_iter()
+            .map(|(lo, hi)| widen(lo, hi, self.correction))
+            .collect())
+    }
+
+    /// The calibrated correction `Q`: the `k`-th smallest CQR score with
+    /// `k = ceil((n + 1)(1 - alpha))`, or `+∞` when `k > n`. Negative when
+    /// the raw band over-covers the calibration set.
+    pub fn correction(&self) -> f64 {
+        self.correction
+    }
+
+    /// The miscoverage level `alpha` the calibrator was built for.
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
+    /// Number of calibration rows `n`.
+    pub fn n_calibration(&self) -> usize {
+        self.n_calibration
+    }
+}
+
+fn validate_alpha(alpha: f64) -> Result<()> {
+    if alpha > 0.0 && alpha < 1.0 {
+        Ok(())
+    } else {
+        Err(HessboostError::invalid_param(
+            "alpha",
+            format!("miscoverage level must be in (0, 1), got {alpha}"),
+        ))
+    }
+}
+
+/// The calibration labels, after checking the set is non-empty, labelled,
+/// and unweighted (or uniformly weighted).
+fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
+    if calibration.n_rows() == 0 {
+        return Err(HessboostError::EmptyDataset(
+            "conformal calibration set has no rows",
+        ));
+    }
+    let labels = calibration.labels().ok_or(HessboostError::EmptyDataset(
+        "conformal calibration set has no labels",
+    ))?;
+    if let Some(weights) = calibration.weights()
+        && weights.iter().any(|&w| w != weights[0])
+    {
+        return Err(HessboostError::invalid_param(
+            "weights",
+            "conformal calibration does not support non-uniform instance weights",
+        ));
+    }
+    Ok(labels)
+}
+
+/// `model.predict(data)` for a single-output model, validated finite.
+fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Vec<f32>> {
+    if model.n_outputs() != 1 {
+        return Err(HessboostError::invalid_param(
+            "model",
+            format!(
+                "expected a single-output model, got {} outputs",
+                model.n_outputs()
+            ),
+        ));
+    }
+    let preds = model.predict(data)?;
+    check_prediction_len(preds.len(), data.n_rows())?;
+    check_finite(&preds)?;
+    Ok(preds)
+}
+
+fn check_prediction_len(got: usize, expected: usize) -> Result<()> {
+    if got == expected {
+        Ok(())
+    } else {
+        Err(HessboostError::invalid_param(
+            "model",
+            format!(
+                "predictions must be laid out [row][output] ({expected} values), got {got} values"
+            ),
+        ))
+    }
+}
+
+fn check_finite(preds: &[f32]) -> Result<()> {
+    match preds.iter().position(|p| !p.is_finite()) {
+        None => Ok(()),
+        Some(i) => Err(HessboostError::invalid_param(
+            "model",
+            format!("prediction {i} is not finite ({})", preds[i]),
+        )),
+    }
+}
+
+/// The `k`-th smallest score with `k = ceil((n + 1)(1 - alpha))`, or `+∞` when
+/// `k > n`. Reorders `scores`; `scores` must be non-empty and finite.
+///
+/// `k` is evaluated as `(n + 1) - floor((n + 1) * alpha)`, which equals the
+/// ceiling form exactly and avoids the rounding of `1 - alpha`.
+fn conformal_quantile(scores: &mut [f64], alpha: f64) -> f64 {
+    let n = scores.len();
+    let n1 = n + 1;
+    // `0 < alpha < 1` bounds the floor to `[0, n]`, so `1 <= k <= n + 1`.
+    let k = n1 - ((n1 as f64) * alpha).floor() as usize;
+    if k > n {
+        return f64::INFINITY;
+    }
+    let (_, kth, _) = scores.select_nth_unstable_by(k - 1, f64::total_cmp);
+    *kth
+}
+
+/// `(lo - q, hi + q)` in `f64`, rounded outward to `f32`.
+fn widen(lo: f32, hi: f32, q: f64) -> (f32, f32) {
+    (round_down(f64::from(lo) - q), round_up(f64::from(hi) + q))
+}
+
+/// The largest `f32` not above `x`.
+fn round_down(x: f64) -> f32 {
+    let r = x as f32;
+    if f64::from(r) > x { r.next_down() } else { r }
+}
+
+/// The smallest `f32` not below `x`.
+fn round_up(x: f64) -> f32 {
+    let r = x as f32;
+    if f64::from(r) < x { r.next_up() } else { r }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TrainingParams;
+    use crate::learner::{train, train_with_objective};
+    use crate::objective::{CustomObjective, GradPair};
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    const N_FEATURES: usize = 2;
+
+    /// Heteroscedastic regression: `y = sin(2π x0) + (0.1 + x1) · ε`,
+    /// `x ~ U(0, 1)²`, `ε ~ N(0, 1)`.
+    fn hetero(n: usize, rng: &mut StdRng) -> DMatrix {
+        let mut x = Vec::with_capacity(n * N_FEATURES);
+        let mut y = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (x0, x1) = (rng.random::<f32>(), rng.random::<f32>());
+            // Box–Muller.
+            let u1 = 1.0 - rng.random::<f64>();
+            let u2 = rng.random::<f64>();
+            let eps = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+            x.extend_from_slice(&[x0, x1]);
+            y.push((std::f32::consts::TAU * x0).sin() + (0.1 + x1) * eps as f32);
+        }
+        DMatrix::from_dense(&x, n, N_FEATURES)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap()
+    }
+
+    fn with_shifted_labels(d: &DMatrix, shift: f32) -> DMatrix {
+        let y: Vec<f32> = d.labels().unwrap().iter().map(|v| v + shift).collect();
+        let rows: Vec<usize> = (0..d.n_rows()).collect();
+        d.select_rows(&rows).unwrap().with_labels(&y).unwrap()
+    }
+
+    fn point_model(d: &DMatrix) -> BoostedModel {
+        let params = TrainingParams::builder()
+            .objective("reg:squarederror")
+            .max_depth(3)
+            .eta(0.3)
+            .build()
+            .unwrap();
+        train(&params, d, 20).unwrap()
+    }
+
+    /// Two-output pinball-loss model at quantile levels `taus`.
+    fn quantile_model(d: &DMatrix, taus: [f32; 2]) -> BoostedModel {
+        let obj = CustomObjective::new("test:quantile", 2, 0.0, "mae", move |p, y, _w, out| {
+            for (i, &yi) in y.iter().enumerate() {
+                for (j, tau) in taus.iter().enumerate() {
+                    let g = if p[2 * i + j] > yi { 1.0 - tau } else { -tau };
+                    out[2 * i + j] = GradPair::new(g, 1.0);
+                }
+            }
+        });
+        let params = TrainingParams::builder()
+            .max_depth(4)
+            .eta(0.3)
+            .build()
+            .unwrap();
+        train_with_objective(&params, d, 150, &obj).unwrap()
+    }
+
+    fn coverage(intervals: &[(f32, f32)], d: &DMatrix) -> f64 {
+        let covered = intervals
+            .iter()
+            .zip(d.labels().unwrap())
+            .filter(|&(&(lo, hi), &y)| lo <= y && y <= hi)
+            .count();
+        covered as f64 / intervals.len() as f64
+    }
+
+    const ALPHA: f64 = 0.1;
+    // n + 1 = 100 so that k/(n+1) = 1 - alpha exactly and the no-ties upper
+    // bound is 1 - alpha + 0.01.
+    const N_CAL: usize = 99;
+    const N_TEST: usize = 200;
+    const TRIALS: u64 = 400;
+    // Per-trial coverage sd ≈ sqrt(0.09/101 + 0.09/200) ≈ 0.037, so the mean
+    // over 400 trials has sd ≈ 0.0018; 0.0065 is ~3.5 sd.
+    const SLACK: f64 = 0.0065;
+
+    /// Mean test coverage over `TRIALS` independent calibration/test draws,
+    /// using `calibrate` to build the interval predictor.
+    fn mean_coverage(
+        seed: u64,
+        mut intervals: impl FnMut(&DMatrix, &DMatrix) -> Vec<(f32, f32)>,
+    ) -> f64 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let total: f64 = (0..TRIALS)
+            .map(|_| {
+                let cal = hetero(N_CAL, &mut rng);
+                let test = hetero(N_TEST, &mut rng);
+                coverage(&intervals(&cal, &test), &test)
+            })
+            .sum();
+        total / TRIALS as f64
+    }
+
+    fn assert_nominal(mean: f64, what: &str) {
+        let lo = 1.0 - ALPHA - SLACK;
+        let hi = 1.0 - ALPHA + 1.0 / (N_CAL + 1) as f64 + SLACK;
+        assert!(
+            (lo..=hi).contains(&mean),
+            "{what}: mean coverage {mean:.4} outside [{lo:.4}, {hi:.4}]"
+        );
+    }
+
+    #[test]
+    fn split_conformal_attains_marginal_coverage() {
+        let train_set = hetero(2000, &mut StdRng::seed_from_u64(1));
+        let model = point_model(&train_set);
+        let mean = mean_coverage(2, |cal, test| {
+            SplitConformal::calibrate(&model, cal, ALPHA)
+                .unwrap()
+                .predict_interval(test)
+                .unwrap()
+        });
+        assert_nominal(mean, "split conformal");
+    }
+
+    #[test]
+    fn cqr_widens_a_too_narrow_band_to_nominal_coverage() {
+        // Point fits on y ∓ 0.05: a band of width ≈ 0.1 against noise with
+        // standard deviation 0.1–1.1.
+        let train_set = hetero(2000, &mut StdRng::seed_from_u64(3));
+        let lower = point_model(&with_shifted_labels(&train_set, -0.05));
+        let upper = point_model(&with_shifted_labels(&train_set, 0.05));
+
+        let mut rng = StdRng::seed_from_u64(4);
+        let (cal, test) = (hetero(N_CAL, &mut rng), hetero(1000, &mut rng));
+        let raw = ConformalizedQuantile::calibrate(&lower, &upper, &cal, ALPHA)
+            .unwrap()
+            .band
+            .predict(&test)
+            .unwrap();
+        assert!(coverage(&raw, &test) < 0.5, "raw band should under-cover");
+
+        let mean = mean_coverage(5, |cal, test| {
+            let cqr = ConformalizedQuantile::calibrate(&lower, &upper, cal, ALPHA).unwrap();
+            assert!(cqr.correction() > 0.0);
+            cqr.predict_interval(test).unwrap()
+        });
+        assert_nominal(mean, "CQR on a too-narrow band");
+    }
+
+    #[test]
+    fn cqr_tightens_a_too_wide_band_without_over_covering() {
+        let train_set = hetero(2000, &mut StdRng::seed_from_u64(6));
+        let lower = point_model(&with_shifted_labels(&train_set, -5.0));
+        let upper = point_model(&with_shifted_labels(&train_set, 5.0));
+        let mean = mean_coverage(7, |cal, test| {
+            let cqr = ConformalizedQuantile::calibrate(&lower, &upper, cal, ALPHA).unwrap();
+            assert!(cqr.correction() < 0.0);
+            cqr.predict_interval(test).unwrap()
+        });
+        assert_nominal(mean, "CQR on a too-wide band");
+    }
+
+    #[test]
+    fn cqr_on_multi_output_quantile_model_is_adaptive() {
+        let train_set = hetero(2000, &mut StdRng::seed_from_u64(8));
+        let model = quantile_model(&train_set, [0.05, 0.95]);
+        let mean = mean_coverage(9, |cal, test| {
+            ConformalizedQuantile::calibrate_outputs(&model, 0, 1, cal, ALPHA)
+                .unwrap()
+                .predict_interval(test)
+                .unwrap()
+        });
+        assert_nominal(mean, "CQR on a pinball-loss model");
+
+        // The band follows the noise scale (0.1 + x1): rows with x1 = 0.9 get
+        // much wider intervals than rows with x1 = 0.1, unlike split conformal.
+        let cal = hetero(500, &mut StdRng::seed_from_u64(10));
+        let cqr = ConformalizedQuantile::calibrate_outputs(&model, 0, 1, &cal, ALPHA).unwrap();
+        let probe = DMatrix::from_dense(&[0.25, 0.1, 0.25, 0.9], 2, N_FEATURES).unwrap();
+        let widths: Vec<f32> = cqr
+            .predict_interval(&probe)
+            .unwrap()
+            .iter()
+            .map(|(lo, hi)| hi - lo)
+            .collect();
+        assert!(
+            widths[1] > 2.0 * widths[0],
+            "widths {widths:?} should grow with the noise scale"
+        );
+    }
+
+    #[test]
+    fn conformal_quantile_uses_the_finite_sample_rank() {
+        // n = 9 distinct scores 1..=9 (shuffled): k = ceil(10 (1 - alpha)).
+        let base = [5.0, 2.0, 9.0, 1.0, 7.0, 3.0, 8.0, 4.0, 6.0];
+        let q = |alpha| conformal_quantile(&mut base.clone(), alpha);
+        assert_eq!(q(0.5), 5.0); // k = 5
+        assert_eq!(q(0.2), 8.0); // k = 8
+        assert_eq!(q(0.15), 9.0); // k = ceil(8.5) = 9
+        assert_eq!(q(0.1), 9.0); // alpha = 1/(n+1): k = 9 = n, still finite
+        assert_eq!(q(0.099), f64::INFINITY); // k = 10 > n
+        assert_eq!(q(0.95), 1.0); // k = 1
+        assert_eq!(q(0.999), 1.0); // floor(9.99) = 9: k = 1
+    }
+
+    #[test]
+    fn too_small_calibration_set_gives_infinite_intervals() {
+        let train_set = hetero(300, &mut StdRng::seed_from_u64(11));
+        let model = point_model(&train_set);
+        let cal = hetero(9, &mut StdRng::seed_from_u64(12));
+        let test = hetero(5, &mut StdRng::seed_from_u64(13));
+
+        let finite = SplitConformal::calibrate(&model, &cal, 0.1).unwrap();
+        assert!(finite.half_width().is_finite());
+
+        let sc = SplitConformal::calibrate(&model, &cal, 0.05).unwrap();
+        assert_eq!(sc.half_width(), f64::INFINITY);
+        assert_eq!(sc.n_calibration(), 9);
+        let intervals = sc.predict_interval(&test).unwrap();
+        assert!(
+            intervals
+                .iter()
+                .all(|&iv| iv == (f32::NEG_INFINITY, f32::INFINITY))
+        );
+
+        let cqr = ConformalizedQuantile::calibrate(&model, &model, &cal, 0.05).unwrap();
+        assert_eq!(cqr.correction(), f64::INFINITY);
+        assert!(
+            cqr.predict_interval(&test)
+                .unwrap()
+                .iter()
+                .all(|&iv| iv == (f32::NEG_INFINITY, f32::INFINITY))
+        );
+    }
+
+    #[test]
+    fn calibration_rows_within_the_quantile_are_covered_exactly() {
+        // Outward rounding: every calibration row whose score is <= Q lies in
+        // its own f32 interval, including the row that attains Q.
+        let train_set = hetero(300, &mut StdRng::seed_from_u64(14));
+        let model = point_model(&train_set);
+        let cal = hetero(N_CAL, &mut StdRng::seed_from_u64(15));
+        let sc = SplitConformal::calibrate(&model, &cal, ALPHA).unwrap();
+        let intervals = sc.predict_interval(&cal).unwrap();
+        let k = N_CAL + 1 - ((N_CAL + 1) as f64 * ALPHA).floor() as usize;
+        assert_eq!(
+            (coverage(&intervals, &cal) * N_CAL as f64).round() as usize,
+            k
+        );
+    }
+
+    #[test]
+    fn rounding_is_outward() {
+        let x = 0.1f64; // not representable in f32
+        assert!(f64::from(round_down(x)) <= x && f64::from(round_up(x)) >= x);
+        assert!(round_down(x) < round_up(x));
+        assert_eq!(round_down(0.5), 0.5);
+        assert_eq!(round_up(0.5), 0.5);
+        assert_eq!(round_up(1e300), f32::INFINITY);
+        assert_eq!(round_down(1e300), f32::MAX);
+        assert_eq!(
+            widen(1.0, 2.0, f64::INFINITY),
+            (f32::NEG_INFINITY, f32::INFINITY)
+        );
+    }
+
+    fn assert_invalid<T: std::fmt::Debug>(r: Result<T>, param: &str) {
+        match r {
+            Err(HessboostError::InvalidParameter { name, .. }) => assert_eq!(name, param),
+            other => panic!("expected InvalidParameter `{param}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_inputs_are_rejected() {
+        let mut rng = StdRng::seed_from_u64(16);
+        let train_set = hetero(200, &mut rng);
+        let model = point_model(&train_set);
+        let cal = hetero(50, &mut rng);
+
+        for alpha in [0.0, 1.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
+            assert_invalid(SplitConformal::calibrate(&model, &cal, alpha), "alpha");
+            assert_invalid(
+                ConformalizedQuantile::calibrate(&model, &model, &cal, alpha),
+                "alpha",
+            );
+        }
+
+        // No labels.
+        let unlabeled = DMatrix::from_dense(&[0.1, 0.2], 1, N_FEATURES).unwrap();
+        assert!(matches!(
+            SplitConformal::calibrate(&model, &unlabeled, ALPHA),
+            Err(HessboostError::EmptyDataset(_))
+        ));
+
+        // Non-uniform weights are rejected; uniform weights are equivalent to none.
+        let ones = vec![2.0; cal.n_rows()];
+        let mut uneven = ones.clone();
+        uneven[3] = 1.0;
+        assert_invalid(
+            SplitConformal::calibrate(&model, &cal.clone().with_weights(&uneven).unwrap(), ALPHA),
+            "weights",
+        );
+        let uniform =
+            SplitConformal::calibrate(&model, &cal.clone().with_weights(&ones).unwrap(), ALPHA)
+                .unwrap();
+        let plain = SplitConformal::calibrate(&model, &cal, ALPHA).unwrap();
+        assert_eq!(uniform.half_width(), plain.half_width());
+
+        // Feature-count mismatch at calibration and prediction time.
+        let wide = DMatrix::from_dense(&[0.0; 3], 1, 3)
+            .unwrap()
+            .with_labels(&[0.0])
+            .unwrap();
+        assert!(matches!(
+            SplitConformal::calibrate(&model, &wide, ALPHA),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+        assert!(matches!(
+            plain.predict_interval(&wide),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+
+        // Quantile models with different feature counts.
+        let one_feature = DMatrix::from_dense(&[0.0, 1.0, 2.0], 3, 1)
+            .unwrap()
+            .with_labels(&[0.0, 1.0, 2.0])
+            .unwrap();
+        let narrow_model = point_model(&one_feature);
+        assert!(matches!(
+            ConformalizedQuantile::calibrate(&model, &narrow_model, &cal, ALPHA),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+
+        // Output selection on multi-output models.
+        let multi = quantile_model(&train_set, [0.1, 0.9]);
+        assert_invalid(SplitConformal::calibrate(&multi, &cal, ALPHA), "model");
+        assert_invalid(
+            ConformalizedQuantile::calibrate(&multi, &model, &cal, ALPHA),
+            "model",
+        );
+        assert_invalid(
+            ConformalizedQuantile::calibrate_outputs(&multi, 0, 2, &cal, ALPHA),
+            "upper_output",
+        );
+        assert_invalid(
+            ConformalizedQuantile::calibrate_outputs(&multi, 5, 1, &cal, ALPHA),
+            "lower_output",
+        );
+        assert_invalid(
+            ConformalizedQuantile::calibrate_outputs(&multi, 1, 1, &cal, ALPHA),
+            "upper_output",
+        );
+        assert_invalid(
+            ConformalizedQuantile::calibrate_outputs(&model, 0, 0, &cal, ALPHA),
+            "upper_output",
+        );
+
+        // Non-finite predictions: a base margin at f32::MAX plus large positive
+        // leaves overflows to +inf.
+        let exploding = CustomObjective::new("test:explode", 1, 0.0, "rmse", |p, _y, _w, out| {
+            for g in out.iter_mut().take(p.len()) {
+                *g = GradPair::new(-1e36, 1.0);
+            }
+        });
+        let params = TrainingParams::builder().max_depth(1).build().unwrap();
+        let exploding = train_with_objective(&params, &train_set, 1, &exploding).unwrap();
+        let at_max = |d: DMatrix| {
+            let n = d.n_rows();
+            d.with_base_margin(&vec![f32::MAX; n]).unwrap()
+        };
+        assert_invalid(
+            SplitConformal::calibrate(&exploding, &at_max(cal.clone()), ALPHA),
+            "model",
+        );
+        let finite = SplitConformal::calibrate(&exploding, &cal, ALPHA).unwrap();
+        assert_invalid(
+            finite.predict_interval(&at_max(hetero(10, &mut rng))),
+            "model",
+        );
+    }
+
+    #[test]
+    fn multiclass_softmax_outputs_are_rejected() {
+        let n = 60;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("multi:softmax")
+            .num_class(3)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 2).unwrap();
+        // One class index per row, not `[row][output]`.
+        assert_invalid(
+            ConformalizedQuantile::calibrate_outputs(&model, 0, 2, &d, ALPHA),
+            "model",
+        );
+    }
+}

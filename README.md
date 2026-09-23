@@ -74,6 +74,7 @@ Runnable, self-contained examples live in
 | `custom_objective` | custom loss and custom eval-metric hooks |
 | `constraints` | monotone + interaction constraints and categorical features |
 | `train_regression` | end-to-end regression with feature importance |
+| `conformal` | split-conformal and conformalized-quantile (CQR) prediction intervals |
 
 ## Feature status
 
@@ -105,6 +106,11 @@ Runnable, self-contained examples live in
   `base_margin` (warm-start), **TreeSHAP** contributions (`predict_contribs`) and
   **interaction values** (`predict_interactions`), early stopping, feature
   importance (weight / gain / cover / totals), leaf-index and margin prediction.
+- **Uncertainty:** distribution-free prediction intervals with finite-sample
+  marginal coverage `P(Y ∈ C(X)) ≥ 1 − alpha` (`hessboost::learner::conformal`):
+  **split conformal** (`SplitConformal`, absolute residuals around a point
+  model) and **conformalized quantile regression** (`ConformalizedQuantile`,
+  Romano et al. 2019) over two quantile models or two outputs of one model.
 - **Ecosystem:** libsvm & CSV loaders, native binary + JSON model I/O,
   **XGBoost-format JSON model import/export** for `gbtree`/DART ensembles
   with numeric and categorical splits,

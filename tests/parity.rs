@@ -6,12 +6,13 @@
 //! * [`xgboost_parity`] runs the per-case checks: **train** on the
 //!   fixture data and compare test predictions (pointwise for the `exact` tier,
 //!   a quality band for the RNG-driven `quality` tier), **import** the embedded
-//!   XGBoost model and compare predictions, margins and SHAP contributions
-//!   (the model's UBJSON encoding, `fixtures/<name>.ubj`, must import to the
-//!   identical model), and **export** the hessboost model as XGBoost JSON and
-//!   UBJSON to `fixtures/exports/` for `scripts/check_exports.py` to reload in
-//!   XGBoost. Fixtures carrying continuation, refresh, iteration-range or
-//!   slice data add those checks (column `extra`).
+//!   XGBoost model and compare predictions, margins, SHAP contributions and
+//!   (where the fixture records them) SHAP interaction values (the model's
+//!   UBJSON encoding, `fixtures/<name>.ubj`, must import to the identical
+//!   model), and **export** the hessboost model as XGBoost JSON and UBJSON to
+//!   `fixtures/exports/` for `scripts/check_exports.py` to reload in XGBoost.
+//!   Fixtures carrying continuation, refresh, iteration-range or slice data
+//!   add those checks (column `extra`).
 //! * [`quantile_cuts_match_xgboost`] compares `hist` quantile cuts bit-for-bit
 //!   against `DMatrix.get_quantile_cut()` oracles in `fixtures/cuts/`.
 //!
@@ -36,6 +37,8 @@ use std::path::{Path, PathBuf};
 
 /// Rows of `x_test` on which the fixture carries SHAP contributions.
 const CONTRIB_ROWS: usize = 50;
+/// Rows of `x_test` on which a fixture may carry SHAP interaction values.
+const INTERACTION_ROWS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Fixture schema
@@ -57,6 +60,7 @@ struct Tol {
     /// Relative tolerance of the per-round metric oracles:
     /// `|hessboost - xgboost| <= evals * max(1, |xgboost|)`.
     evals: f64,
+    interactions: f64,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +108,7 @@ struct Fixture {
     /// (`evals_result()["test"]`), keyed by metric name.
     #[serde(default)]
     xgb_evals: Option<BTreeMap<String, Vec<f64>>>,
+    xgb_interactions: Option<Vec<f32>>,
     xgb_model: Value,
     /// File name, relative to `fixtures/`, of the same model saved by XGBoost
     /// as UBJSON (`save_raw("ubj")`).
@@ -500,6 +505,7 @@ struct Row {
     margin: String,
     contribs: String,
     ubj: String,
+    interactions: String,
     export: String,
     evals: String,
     extra: String,
@@ -898,10 +904,12 @@ impl Case<'_> {
     }
 
     /// Assertion 2: import the embedded XGBoost model and compare predictions,
-    /// margins, and SHAP contributions. XGBoost's multiclass contribution layout
-    /// `(rows, num_class, n_cols + 1)` is identical to hessboost's
-    /// `predict_contribs` layout, so both flatten to the same order.
-    fn import_and_compare(&mut self, dtest: &DMatrix, dcontrib: &DMatrix) -> [String; 3] {
+    /// margins, SHAP contributions, and recorded SHAP interaction values.
+    /// XGBoost's multiclass layouts `(rows, num_class, n_cols + 1)` and
+    /// `(rows, num_class, n_cols + 1, n_cols + 1)` are identical to hessboost's
+    /// `predict_contribs` / `predict_interactions` layouts, so both flatten to
+    /// the same order.
+    fn import_and_compare(&mut self, dtest: &DMatrix, dcontrib: &DMatrix) -> [String; 4] {
         let fx = self.fx;
         let imported = BoostedModel::from_xgboost_json(&fx.xgb_model.to_string());
         if booster_of(fx) == "gblinear" {
@@ -936,10 +944,21 @@ impl Case<'_> {
             .predict_contribs(dcontrib)
             .map_err(|e| e.to_string())
             .and_then(|p| max_abs_diff("import contribs", &p, &fx.xgb_contribs));
+        let interactions = match &fx.xgb_interactions {
+            None => "-".to_string(),
+            Some(want) => {
+                let delta = self
+                    .dmatrix(&fx.x_test[..INTERACTION_ROWS * fx.n_cols], INTERACTION_ROWS)
+                    .and_then(|d| model.predict_interactions(&d).map_err(|e| e.to_string()))
+                    .and_then(|p| max_abs_diff("import interactions", &p, want));
+                self.check("import interactions", &delta, fx.tol.interactions)
+            }
+        };
         [
             self.check("import predict", &pred, fx.tol.import),
             self.check("import margin", &margin, fx.tol.import),
             self.check("import contribs", &contribs, fx.tol.contribs),
+            interactions,
         ]
     }
 
@@ -1027,6 +1046,7 @@ impl Case<'_> {
             margin: "ERR".to_string(),
             contribs: "ERR".to_string(),
             ubj: "ERR".to_string(),
+            interactions: "ERR".to_string(),
             export: "n/a".to_string(),
             evals: "-".to_string(),
             extra: "-".to_string(),
@@ -1075,7 +1095,8 @@ impl Case<'_> {
             }
         };
 
-        [row.import, row.margin, row.contribs] = self.import_and_compare(&dtest, &dcontrib);
+        [row.import, row.margin, row.contribs, row.interactions] =
+            self.import_and_compare(&dtest, &dcontrib);
         row.ubj = self.import_ubjson(dir);
         row.extra = self.extras(trained.as_ref(), &dtest, &dcontrib);
         row
@@ -1107,8 +1128,18 @@ fn xgboost_parity() {
 
     let mut failures = Vec::new();
     println!(
-        "{:<30} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {:<11} base_score hessboost | xgboost",
-        "case", "tier", "train", "import", "margin", "contribs", "ubj", "export", "evals", "extra"
+        "{:<30} {:<7} {:<22} {:<9} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {:<11} base_score hessboost | xgboost",
+        "case",
+        "tier",
+        "train",
+        "import",
+        "margin",
+        "contribs",
+        "inter",
+        "ubj",
+        "export",
+        "evals",
+        "extra"
     );
     for (_, fx) in &fixtures {
         let row = Case {
@@ -1117,13 +1148,14 @@ fn xgboost_parity() {
         }
         .run(&dir, &exports);
         println!(
-            "{:<30} {:<7} {:<22} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {:<11} {} | {}",
+            "{:<30} {:<7} {:<22} {:<9} {:<9} {:<9} {:<9} {:<5} {:<8} {:<9} {:<11} {} | {}",
             row.name,
             row.tier,
             row.train,
             row.import,
             row.margin,
             row.contribs,
+            row.interactions,
             row.ubj,
             row.export,
             row.evals,

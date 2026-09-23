@@ -54,8 +54,8 @@
 //!   ndcg/map, nloglik, cox/aft-nloglik, interval-regression-accuracy, and a
 //!   custom hook ([`train_with_custom_metric`]).
 //! - **Modeling:** monotone & interaction constraints, native categorical
-//!   splits, early stopping, feature importance, TreeSHAP contributions and
-//!   interaction values ([`BoostedModel::predict_contribs`] /
+//!   splits, early stopping, feature importance, QuadratureTreeSHAP
+//!   contributions and interaction values ([`BoostedModel::predict_contribs`] /
 //!   [`predict_interactions`](prelude::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON and UBJSON model import/export ([`crate::model`]).

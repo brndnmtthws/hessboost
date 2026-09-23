@@ -429,6 +429,19 @@ impl TrainingParams {
                 || (self.toad_penalty_feature == 0.0 && self.toad_penalty_threshold == 0.0),
             "reuse penalties need a tree booster (`gbtree` or `dart`)",
         )?;
+        // The penalties act in the XGBoost histogram/exact split searches;
+        // the LightGBM split search and symmetric level-wise growth do not
+        // apply them, so refuse the combination instead of ignoring it.
+        let reuse_on = self.toad_penalty_feature > 0.0 || self.toad_penalty_threshold > 0.0;
+        ensure(
+            "toad_penalty_feature",
+            !(reuse_on
+                && (self.extra_trees
+                    || self.path_smooth > 0.0
+                    || self.grow_policy == GrowPolicy::Symmetric)),
+            "reuse penalties are not supported with `extra_trees`, `path_smooth`, or \
+             `grow_policy=symmetric`",
+        )?;
 
         if let Some(base_score) = self.base_score {
             ensure("base_score", base_score.is_finite(), "must be finite")?;
@@ -1008,5 +1021,23 @@ mod tests {
             .max_leaves(31)
             .build()
             .unwrap();
+    }
+
+    /// Reuse penalties apply in the XGBoost split searches only; the LightGBM
+    /// split search and symmetric growth would silently ignore them.
+    #[test]
+    fn reuse_penalties_refuse_searches_that_ignore_them() {
+        let toad = || TrainingParams::builder().toad_penalty_feature(1.0);
+        for params in [
+            toad().extra_trees(true),
+            toad().path_smooth(1.0),
+            toad().grow_policy(GrowPolicy::Symmetric).max_depth(3),
+        ] {
+            assert!(matches!(
+                params.build(),
+                Err(HessboostError::InvalidParameter { name, .. }) if name == "toad_penalty_feature"
+            ));
+        }
+        assert!(toad().linear_tree(true).build().is_ok());
     }
 }

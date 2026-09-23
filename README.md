@@ -241,7 +241,11 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
   binary32), a global leaf-value table and pointer-free heap trees (a
   preorder layout for deep unbalanced trees) with bit-packed references. `CompactModel::predict_margin` is bit-identical to
   the source model; `BoostedModel::size_report` compares native and compact
-  bytes. Both default off; XGBoost cannot read the compact format. On the
+  bytes (any tree layout, including `num_parallel_tree` forests and
+  multi-output models; linear-leaf trees are refused). The penalties act in
+  the XGBoost split searches and are refused with `extra_trees`,
+  `path_smooth`, and `grow_policy = symmetric`. Both default off; XGBoost
+  cannot read the compact format. On the
   `compact_model` example (binary classification, 16 sensor features, 100
   depth-3 trees, 8000 rows) the compact layout alone is 5.4x smaller than
   the native format (6262 vs 33844 bytes, 94.98% test accuracy);

@@ -14,8 +14,8 @@
 //! The format keeps exactly what prediction needs: node covers and split
 //! gains (TreeSHAP, cover/gain importance) are dropped, and only the trees
 //! [`BoostedModel::predict_margin`] uses are stored (the prefix up to
-//! `best_iteration` when early stopping chose one). gblinear models are
-//! rejected. It is a hessboost format; XGBoost cannot read it.
+//! `best_iteration` when early stopping chose one). gblinear models and
+//! linear-leaf trees (`linear_tree`) are rejected. It is a hessboost format; XGBoost cannot read it.
 //!
 //! # Layout (version 1)
 //!
@@ -25,7 +25,7 @@
 //! bytes 5..9   u32 little-endian M, the metadata length
 //! next M bytes metadata (postcard): objective name, objective parameters
 //!              (absent when they equal XGBoost's defaults for the objective),
-//!              num_class, n_targets
+//!              num_class, n_targets, num_parallel_tree
 //! rest         one bit stream
 //! ```
 //!
@@ -58,7 +58,8 @@
 //!    left-category sets: the set length, then its categories.
 //! 4. **Global leaf values:** `L` distinct `f32` leaf values (32 bits each).
 //! 5. **Trees**, `K` in ensemble order (tree `t` feeds output
-//!    `t % n_outputs`). A layout bit selects:
+//!    `(t / num_parallel_tree) % n_outputs`, XGBoost's iteration-major
+//!    layout). A layout bit selects:
 //!    - *heap* (`0`, the paper's pointer-free layout): the depth `d` and a
 //!      completeness bit, then `2^d − 1` internal slots and `2^d` leaf slots.
 //!      The root is slot `0` and slot `i` has children `2i + 1` and
@@ -160,6 +161,9 @@ struct Meta {
     objective_params: Option<ObjectiveParams>,
     num_class: usize,
     n_targets: usize,
+    /// Trees per output in each boosting iteration: tree `t` feeds output
+    /// `(t / num_parallel_tree) % n_outputs`.
+    num_parallel_tree: usize,
 }
 
 impl Meta {
@@ -531,6 +535,9 @@ impl CompactModel {
         if meta.n_targets == 0 {
             return Err(format_error("n_targets must be positive"));
         }
+        if meta.num_parallel_tree == 0 {
+            return Err(format_error("num_parallel_tree must be positive"));
+        }
 
         let mut stream = bytes[meta_end..].to_vec();
         let len = stream.len() * 8;
@@ -557,8 +564,10 @@ impl CompactModel {
             return Err(format_error("base scores must be finite"));
         }
         let n_trees = r.read_usize(32)?;
-        if !n_trees.is_multiple_of(n_outputs) {
-            return Err(format_error("tree count is not a multiple of the outputs"));
+        if !n_trees.is_multiple_of(n_outputs * meta.num_parallel_tree) {
+            return Err(format_error(
+                "tree count is not a multiple of the trees per iteration",
+            ));
         }
         r.ensure_fits(n_trees, 1, "tree")?;
         let tree_weights = if r.read_bool()? {
@@ -893,6 +902,7 @@ impl CompactModel {
         validate_prediction_data(self.n_features, k, data)?;
         let mut out = initial_margins(&self.base_score, data);
         let weight = |t: usize| self.tree_weights.as_ref().map_or(1.0, |w| w[t]);
+        let parallel = self.meta.num_parallel_tree;
         out.par_chunks_mut(k)
             .enumerate()
             .with_min_len(256)
@@ -902,7 +912,7 @@ impl CompactModel {
                     block.load(r, 1);
                     let row = block.row(0).expect("single-row blocks are dense");
                     for t in 0..self.trees.len() {
-                        margins[t % k] += weight(t) * self.tree_leaf(t, row);
+                        margins[(t / parallel) % k] += weight(t) * self.tree_leaf(t, row);
                     }
                 },
             );
@@ -1124,6 +1134,15 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
     if model.linear().is_some() {
         return Err(format_error(
             "gblinear models have no trees to store; use the native format",
+        ));
+    }
+    if model
+        .trees()
+        .iter()
+        .any(|tree| tree.linear_leaves().is_some())
+    {
+        return Err(format_error(
+            "linear-leaf trees (`linear_tree`) have no compact encoding; use the native format",
         ));
     }
     let trees = &model.trees()[..model.effective_num_trees()];
@@ -1415,6 +1434,7 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
         .then(|| model.objective_params().clone()),
         num_class: model.num_class(),
         n_targets: model.n_targets(),
+        num_parallel_tree: model.num_parallel_tree(),
     };
     let meta = postcard::to_stdvec(&meta).map_err(|e| format_error(e.to_string()))?;
     let mut bytes = Vec::with_capacity(PREFIX_BYTES + meta.len() + w.bytes.len());
@@ -1490,6 +1510,8 @@ mod tests {
             .collect();
         let binary = data.clone().with_labels(&labels01).unwrap();
         let multi = data.clone().with_labels(&labels3).unwrap();
+        let matrix: Vec<f32> = y.iter().flat_map(|&v| [v, 1.0 - 2.0 * v]).collect();
+        let targets2 = data.clone().with_label_matrix(&matrix, 2).unwrap();
 
         let base = || TrainingParams::builder().max_depth(4).eta(0.2);
         let cases: Vec<(TrainingParams, &DMatrix)> = vec![
@@ -1531,6 +1553,26 @@ mod tests {
                 base()
                     .toad_penalty_feature(2.0)
                     .toad_penalty_threshold(0.5)
+                    .build()
+                    .unwrap(),
+                &data,
+            ),
+            // Iteration-major forests: tree `t` feeds output
+            // `(t / num_parallel_tree) % n_outputs`.
+            (
+                base()
+                    .objective("multi:softprob")
+                    .num_class(3)
+                    .num_parallel_tree(2)
+                    .build()
+                    .unwrap(),
+                &multi,
+            ),
+            (base().num_parallel_tree(2).build().unwrap(), &targets2),
+            (
+                base()
+                    .objective("reg:quantileerror")
+                    .quantile_alpha(vec![0.2, 0.8])
                     .build()
                     .unwrap(),
                 &data,
@@ -1740,6 +1782,27 @@ mod tests {
             .unwrap();
         let params = TrainingParams::builder()
             .booster(BoosterKind::GbLinear)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 3).unwrap();
+        assert!(matches!(
+            model.to_compact_bytes(),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
+
+    /// Linear leaves have no compact encoding: refused, never flattened to
+    /// their constant fallback.
+    #[test]
+    fn linear_leaf_models_are_rejected() {
+        let (x, y) = dataset(200, 3, false);
+        let data = DMatrix::from_dense(&x, 200, 3)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .max_depth(3)
+            .linear_tree(true)
             .build()
             .unwrap();
         let model = train(&params, &data, 3).unwrap();

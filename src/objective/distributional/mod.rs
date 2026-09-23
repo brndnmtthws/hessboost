@@ -8,7 +8,8 @@
 //!
 //! Objective `dist:<family>` gives the model one output per distribution
 //! parameter (`n_outputs = n_params`, one tree per parameter and round on the
-//! ordinary `one_output_per_tree` path). Each output is an *unconstrained*
+//! ordinary `one_output_per_tree` path, or one shared tree per round with
+//! `multi_output_tree`, see below). Each output is an *unconstrained*
 //! margin `η`; positive parameters use a log link. Log-link margins are
 //! clamped to `[-30, 30]` ([`LOG_LINK_BOUND`]) before the link, in the
 //! gradients as in prediction, so no parameter over- or underflows.
@@ -74,6 +75,37 @@
 //! on `ln r`) for the negative binomial. A scalar `base_score` is only
 //! accepted for the one-parameter `dist:poisson` (as its rate).
 //!
+//! # Shared trees: parallel gradient boosting
+//!
+//! With `multi_strategy = multi_output_tree` every round grows *one*
+//! vector-leaf tree for all parameters instead of one tree per parameter.
+//! [`DistSplitDirection`] (`dist_split_direction`) selects its structure:
+//!
+//! - [`DistSplitDirection::Random`] (default) and
+//!   [`DistSplitDirection::Cyclic`] implement parallel gradient boosting
+//!   (Chapelle, Vayatis, Falissard & Sedki, 2026, arXiv:2607.13550,
+//!   Algorithm 1). The common descent direction of a round is a canonical
+//!   basis vector `e_m`: parameter `m` is drawn uniformly at random from
+//!   `seed` and the iteration (the paper's choice), or swept as
+//!   `iteration mod n_params`; either visits every parameter infinitely
+//!   often, the paper's convergence condition. The tree structure is grown
+//!   from that parameter's gradient pairs alone
+//!   ([`Objective::split_gradient`], the projected pseudo-residuals
+//!   `⟨∇L_i, e_m⟩`), and every leaf then takes the per-parameter Newton step
+//!   `-G_k / (H_k + λ)` over its rows. That is the second-order form of the
+//!   paper's leaf-wise multidimensional line search `argmin_γ Σ L(g + h γ)`:
+//!   with the diagonal curvature of the `dist_gradient` mode the line search
+//!   separates across parameters, which the paper's convergence argument
+//!   also relies on. With [`DistGradient::Natural`] (unit Hessians) the
+//!   structure fit is the paper's least-squares fit of the projected
+//!   pseudo-residuals, on the natural gradient.
+//! - [`DistSplitDirection::All`]: plain vector-leaf trees, whose split gain
+//!   sums over every parameter's gradients.
+//!
+//! One-parameter families (`dist:poisson`) keep ordinary trees. The
+//! structure search's cost no longer grows with the number of parameters,
+//! and all parameters move together each round.
+//!
 //! # Predictions
 //!
 //! [`BoostedModel::predict`](crate::learner::BoostedModel::predict) returns
@@ -88,8 +120,8 @@ mod special;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use super::{GradPair, MIN_HESS, Objective, check_label_domain};
-use crate::config::DistGradient;
+use super::{GradPair, MIN_HESS, Objective, SplitGradient, check_label_domain};
+use crate::config::{DistGradient, DistSplitDirection};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use special::{
@@ -978,12 +1010,46 @@ fn gamma_unit_quantile(a: f64, p: f64) -> f64 {
 pub struct DistObjective {
     family: DistFamily,
     gradient: DistGradient,
+    /// Parallel-gradient-boosting direction and seed for shared trees, set
+    /// only for `multi_strategy = multi_output_tree`.
+    shared: Option<(DistSplitDirection, u64)>,
 }
 
 impl DistObjective {
-    /// The objective for `family` with gradient mode `gradient`.
+    /// The objective for `family` with gradient mode `gradient`, growing one
+    /// tree per parameter (no reduced split gradients).
     pub fn new(family: DistFamily, gradient: DistGradient) -> Self {
-        DistObjective { family, gradient }
+        DistObjective {
+            family,
+            gradient,
+            shared: None,
+        }
+    }
+
+    /// Grow shared vector-leaf trees (`multi_strategy = multi_output_tree`)
+    /// with the given split direction: [`Objective::split_gradient`] then
+    /// returns the gradients of the parameter the direction selects for the
+    /// round (`seed` drives [`DistSplitDirection::Random`]), or `None` for
+    /// [`DistSplitDirection::All`] and one-parameter families.
+    #[must_use]
+    pub fn with_split_direction(mut self, direction: DistSplitDirection, seed: u64) -> Self {
+        self.shared = Some((direction, seed));
+        self
+    }
+
+    /// The parameter whose gradients drive the structure of round
+    /// `iteration`'s shared tree, if any.
+    pub fn split_parameter(&self, iteration: usize) -> Option<usize> {
+        let k = self.family.n_params();
+        match self.shared? {
+            _ if k < 2 => None,
+            (DistSplitDirection::All, _) => None,
+            (DistSplitDirection::Cyclic, _) => Some(iteration % k),
+            (DistSplitDirection::Random, seed) => {
+                let draw = mix64(seed ^ mix64(iteration as u64));
+                Some((draw % k as u64) as usize)
+            }
+        }
     }
 
     /// The distribution family.
@@ -1113,6 +1179,25 @@ impl Objective for DistObjective {
     fn default_metric(&self) -> String {
         "nll".to_string()
     }
+
+    /// Parallel gradient boosting (Chapelle et al., 2026): the chosen
+    /// parameter's gradient column, `⟨∇L_i, e_m⟩` per row.
+    fn split_gradient(&self, iteration: usize, gpair: &[GradPair]) -> Option<SplitGradient> {
+        let m = self.split_parameter(iteration)?;
+        let k = self.family.n_params();
+        Some(SplitGradient {
+            gpair: gpair.iter().skip(m).step_by(k).copied().collect(),
+            n_targets: 1,
+        })
+    }
+}
+
+/// `SplitMix64` finalizer: a bijective 64-bit mix with full avalanche.
+fn mix64(z: u64) -> u64 {
+    let mut z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]

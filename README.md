@@ -337,11 +337,18 @@ reproduced; see `hessboost::learner::budget` for the exact rules.
   parameters `[row][parameter]`. Metrics `nll` (default) and `crps` (closed
   form for Normal/LogNormal/Gamma, exact step sums for the count families).
   `ConformalizedQuantile::calibrate_distribution` conformalizes the
-  predicted central band (CQR). Native binary/JSON only: XGBoost JSON/UBJSON
+  predicted central band (CQR). With `multi_strategy = multi_output_tree`
+  one shared vector-leaf tree per round fits every parameter:
+  `dist_split_direction = random` (default) or `cyclic` is parallel gradient
+  boosting ([Chapelle et al. 2026](https://arxiv.org/abs/2607.13550),
+  Algorithm 1: the structure is grown from one parameter's gradients `e_m`
+  per round, the leaves take every parameter's Newton step), `all` the
+  plain vector-leaf gain. Native binary/JSON only: XGBoost JSON/UBJSON
   export and import refuse `dist:*`. On the `distributional` example
   (heteroscedastic Normal noise, early stopping) the held-out NLL is 0.768
-  against 1.014 for a squared-error model with one global deviation, with
-  90% intervals covering 0.891 (0.906 after CQR).
+  against 1.014 for a squared-error model with one global deviation (0.774
+  with parallel gradient boosting's 112 shared trees instead of 2 × 80),
+  with 90% intervals covering 0.891 (0.906 after CQR).
 
 **Not implemented:** a GPU backend, distributed or external-memory training,
 and Python/CLI/C-ABI wrappers.

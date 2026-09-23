@@ -2,7 +2,9 @@
 //! distribution `N(μ(x), σ(x)²)` per row on heteroscedastic data, read off
 //! prediction intervals, and compare the held-out negative log-likelihood
 //! with a homoscedastic baseline (a point model plus one global residual
-//! deviation). Finally, conformalize the predicted central band with CQR.
+//! deviation), and with parallel gradient boosting (one shared tree per
+//! round for both parameters). Finally, conformalize the predicted central
+//! band with CQR.
 //!
 //! Run with: `cargo run --release --example distributional`
 
@@ -63,16 +65,18 @@ fn main() -> Result<()> {
     let dvalid = dataset(2000, 2)?;
     let dcal = dataset(2000, 3)?;
     let dtest = dataset(6000, 4)?;
-    let fit = |objective: &str| -> Result<BoostedModel> {
+    let fit_with = |objective: &str, strategy: MultiStrategy| -> Result<BoostedModel> {
         let params = TrainingParams::builder()
             .objective(objective)
             .tree_method(TreeMethod::Hist)
             .max_depth(3)
             .eta(0.1)
+            .multi_strategy(strategy)
             .build()?;
         // Early stopping on the validation NLL (the `dist:*` default metric).
         Ok(train_with_eval(&params, &dtrain, 1000, &[(&dvalid, "valid")], Some(20))?.model)
     };
+    let fit = |objective: &str| fit_with(objective, MultiStrategy::OneOutputPerTree);
 
     // One tree per distribution parameter and round: (μ, ln σ).
     let model = fit("dist:normal")?;
@@ -115,6 +119,15 @@ fn main() -> Result<()> {
     println!(
         "  homoscedastic baseline {:.4}",
         mean_nll(&baseline, &dtest)
+    );
+    // Parallel gradient boosting: one shared tree per round for (μ, ln σ),
+    // its structure grown from one randomly chosen parameter's gradients.
+    let shared = fit_with("dist:normal", MultiStrategy::MultiOutputTree)?;
+    println!(
+        "  shared trees (PGB)     {:.4}  ({} trees vs {} for one tree per parameter)",
+        mean_nll(&shared.predict_distribution(&dtest)?, &dtest),
+        shared.best_iteration().map_or(0, |b| b + 1),
+        2 * model.best_iteration().map_or(0, |b| b + 1),
     );
 
     println!("\n90% intervals on the test set (coverage, mean width):");

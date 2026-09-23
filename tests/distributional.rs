@@ -3,8 +3,9 @@
 //! conformalized intervals.
 
 use hessboost::prelude::{
-    BoostedModel, ConformalizedQuantile, DMatrix, Dist, DistFamily, DistGradient, HessboostError,
-    TrainingParams, TreeMethod, train, train_with_eval,
+    BoostedModel, ConformalizedQuantile, DMatrix, Dist, DistFamily, DistGradient,
+    DistSplitDirection, HessboostError, MultiStrategy, TrainingParams, TreeMethod, train,
+    train_with_eval,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -392,4 +393,72 @@ fn configuration_errors() {
     // Point models do not predict distributions.
     let point = train(&params("reg:squarederror").build().unwrap(), &d, 1).unwrap();
     assert!(point.predict_distribution(&d).is_err());
+}
+
+/// Parallel gradient boosting (`multi_output_tree`): one shared tree per
+/// round fits every distribution parameter, with the same quality as one
+/// tree per parameter; round trips and is deterministic.
+#[test]
+fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
+    let (dtrain, _) = heteroscedastic(6000, 1);
+    let (dvalid, _) = heteroscedastic(2000, 21);
+    let (dtest, _) = heteroscedastic(6000, 2);
+    let reference = fit(&params("dist:normal").build().unwrap(), &dtrain, &dvalid);
+    let reference_nll = mean_nll(&reference.predict_distribution(&dtest).unwrap(), &dtest);
+    for direction in [
+        DistSplitDirection::Random,
+        DistSplitDirection::Cyclic,
+        DistSplitDirection::All,
+    ] {
+        let p = params("dist:normal")
+            .multi_strategy(MultiStrategy::MultiOutputTree)
+            .dist_split_direction(direction)
+            .build()
+            .unwrap();
+        let model = fit(&p, &dtrain, &dvalid);
+        assert_eq!(model.num_trees(), model.num_boost_rounds(), "{direction:?}");
+        let dists = model.predict_distribution(&dtest).unwrap();
+        let nll = mean_nll(&dists, &dtest);
+        assert!(
+            (nll - reference_nll).abs() < 0.03,
+            "{direction:?}: {nll} vs one tree per parameter {reference_nll}"
+        );
+        let got = coverage(
+            dists.iter().map(|d| d.interval(0.8)),
+            dtest.labels().unwrap(),
+        );
+        assert!((got - 0.8).abs() < 0.03, "{direction:?} coverage {got}");
+        let again = train(&p, &dtrain, 20).unwrap();
+        assert_eq!(
+            again.predict_margin(&dtest).unwrap(),
+            train(&p, &dtrain, 20)
+                .unwrap()
+                .predict_margin(&dtest)
+                .unwrap()
+        );
+        let restored = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        assert_eq!(restored.predict_distribution(&dtest).unwrap(), dists);
+    }
+    // The random direction follows the seed.
+    let with_seed = |seed| {
+        let p = params("dist:normal")
+            .multi_strategy(MultiStrategy::MultiOutputTree)
+            .seed(seed)
+            .build()
+            .unwrap();
+        train(&p, &dtrain, 10)
+            .unwrap()
+            .predict_margin(&dtest)
+            .unwrap()
+    };
+    assert_ne!(with_seed(1), with_seed(2));
+    // One-parameter families keep scalar trees under the vector strategy.
+    let counts = sampled(500, 22, |a, _| Dist::Poisson {
+        rate: 1.0 + 5.0 * a,
+    });
+    let p = params("dist:poisson")
+        .multi_strategy(MultiStrategy::MultiOutputTree)
+        .build()
+        .unwrap();
+    assert_eq!(train(&p, &counts, 5).unwrap().num_trees(), 5);
 }

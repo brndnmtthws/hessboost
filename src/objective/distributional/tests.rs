@@ -530,3 +530,42 @@ fn dist_new_validates_parameters() {
     .interval(0.95);
     assert!(close(hi, 1.959_963_984_540_054, 1e-12, 0.0) && close(lo, -hi, 1e-12, 0.0));
 }
+
+#[test]
+fn shared_trees_split_on_one_parameter_column() {
+    let gpair: Vec<GradPair> = (0..6)
+        .map(|i| GradPair::new(i as f32, 10.0 + i as f32))
+        .collect();
+    let plain = DistObjective::new(DistFamily::Gamma, DistGradient::Fisher);
+    assert_eq!(plain.split_gradient(0, &gpair), None);
+    let all = plain.with_split_direction(DistSplitDirection::All, 0);
+    assert_eq!(all.split_gradient(0, &gpair), None);
+    let cyclic = plain.with_split_direction(DistSplitDirection::Cyclic, 0);
+    for iteration in 0..4 {
+        let m = iteration % 2;
+        let split = cyclic.split_gradient(iteration, &gpair).unwrap();
+        assert_eq!(split.n_targets, 1);
+        let column: Vec<GradPair> = gpair.iter().skip(m).step_by(2).copied().collect();
+        assert_eq!(split.gpair, column);
+    }
+    // Random: a function of (seed, iteration) that visits every parameter
+    // about equally often.
+    let random = |seed| plain.with_split_direction(DistSplitDirection::Random, seed);
+    let draws: Vec<usize> = (0..2000)
+        .map(|t| random(5).split_parameter(t).unwrap())
+        .collect();
+    let again: Vec<usize> = (0..2000)
+        .map(|t| random(5).split_parameter(t).unwrap())
+        .collect();
+    assert_eq!(draws, again);
+    let other: Vec<usize> = (0..2000)
+        .map(|t| random(6).split_parameter(t).unwrap())
+        .collect();
+    assert_ne!(draws, other);
+    let ones = draws.iter().filter(|&&m| m == 1).count();
+    assert!((900..1100).contains(&ones), "{ones} of 2000");
+    // One parameter: nothing to reduce.
+    let poisson = DistObjective::new(DistFamily::Poisson, DistGradient::Fisher)
+        .with_split_direction(DistSplitDirection::Random, 0);
+    assert_eq!(poisson.split_gradient(0, &gpair[..3]), None);
+}

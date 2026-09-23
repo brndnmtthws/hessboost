@@ -516,7 +516,16 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
             params.aft_loss_distribution_scale as f32,
         )),
         other => match DistFamily::from_objective(other) {
-            Some(family) => Box::new(DistObjective::new(family, params.dist_gradient)),
+            Some(family) => {
+                let objective = DistObjective::new(family, params.dist_gradient);
+                Box::new(
+                    if params.multi_strategy == crate::config::MultiStrategy::MultiOutputTree {
+                        objective.with_split_direction(params.dist_split_direction, params.seed)
+                    } else {
+                        objective
+                    },
+                )
+            }
             None => return Err(HessboostError::unknown("objective", other)),
         },
     };

@@ -137,8 +137,8 @@ pub mod tree;
 /// typical train to predict workflow.
 pub mod prelude {
     pub use crate::config::{
-        AftDistribution, BoosterKind, DistGradient, GrowPolicy, Monotone, MultiStrategy,
-        ProcessType, SamplingMethod, TrainingParams, TreeMethod,
+        AftDistribution, BoosterKind, DistGradient, DistSplitDirection, GrowPolicy, Monotone,
+        MultiStrategy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
     };
     pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
     pub use crate::error::{HessboostError, Result};
@@ -150,5 +150,7 @@ pub mod prelude {
         train_continue_with_eval, train_with_custom_metric, train_with_eval, train_with_objective,
     };
     pub use crate::metric::{CustomMetric, Metric};
-    pub use crate::objective::{CustomObjective, Dist, DistFamily, GradPair, Objective, SplitGradient};
+    pub use crate::objective::{
+        CustomObjective, Dist, DistFamily, GradPair, Objective, SplitGradient,
+    };
 }

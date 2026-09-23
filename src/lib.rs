@@ -57,6 +57,8 @@
 //!   ([`SplitConformal`](prelude::SplitConformal),
 //!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
 //!   [`learner::conformal`]).
+//! - **Beyond XGBoost (opt-in):** CatBoost-style ordered target statistics
+//!   for categorical columns ([`data::OrderedTargetEncoder`]).
 //!
 //! ## Where to look
 //!

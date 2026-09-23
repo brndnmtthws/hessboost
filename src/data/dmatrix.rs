@@ -566,6 +566,42 @@ impl DMatrix {
         }
     }
 
+    /// Copy of this matrix, metadata included, with every non-missing stored
+    /// value replaced by `f(row, col, value)`. Missing dense entries become NaN
+    /// and the result's sentinel is NaN, so a mapped value can never collide
+    /// with a non-NaN sentinel. Feature types are copied unchanged.
+    pub(crate) fn map_values(&self, mut f: impl FnMut(usize, usize, f32) -> f32) -> Self {
+        let mut out = self.clone();
+        match &mut out.storage {
+            Storage::Dense(data) => {
+                for (row, values) in data.chunks_exact_mut(self.n_cols).enumerate() {
+                    for (col, v) in values.iter_mut().enumerate() {
+                        *v = if is_missing(*v, self.missing) {
+                            f32::NAN
+                        } else {
+                            f(row, col, *v)
+                        };
+                    }
+                }
+            }
+            Storage::Csr {
+                indptr,
+                indices,
+                values,
+            } => {
+                for row in 0..self.n_rows {
+                    for k in indptr[row]..indptr[row + 1] {
+                        if !is_missing(values[k], self.missing) {
+                            values[k] = f(row, indices[k] as usize, values[k]);
+                        }
+                    }
+                }
+            }
+        }
+        out.missing = f32::NAN;
+        out
+    }
+
     /// Visit every non-missing `(index, value)` entry of `row`, in storage
     /// order. `row` must be in bounds.
     fn for_row_entry(&self, row: usize, mut f: impl FnMut(u32, f32)) {

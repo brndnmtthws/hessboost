@@ -358,7 +358,7 @@ The benchmark definitions live in
 suite on the current checkout:
 
 ```sh
-RAYON_NUM_THREADS=1 cargo bench --locked --bench training
+RAYON_NUM_THREADS=1 cargo bench --bench training
 ```
 
 To regenerate the charts in this guide from the `.dat` files after updating

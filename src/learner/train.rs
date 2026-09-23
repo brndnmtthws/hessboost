@@ -15,6 +15,7 @@ use crate::tree::RegTree;
 use crate::tree::builder::{
     ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_features, all_rows,
 };
+use crate::tree::hist::quantized::rounding_seed;
 use crate::tree::sampler::ColumnSampler;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -36,7 +37,8 @@ enum Prepared {
 }
 
 impl Prepared {
-    /// Grow one tree for this round's gradients and samples.
+    /// Grow one tree for this round's gradients and samples. `rounding_seed`
+    /// keys the stochastic rounding of quantized training.
     fn build_tree(
         &self,
         params: &TrainingParams,
@@ -44,14 +46,14 @@ impl Prepared {
         gpair: &[GradPair],
         rows: &[u32],
         sampler: &mut ColumnSampler,
+        rounding_seed: u64,
     ) -> RegTree {
+        let hist = || HistTreeBuilder::new(params).with_rounding_seed(rounding_seed);
         match self {
             Prepared::Exact(cols) => {
                 ExactTreeBuilder::new(params).build(cols, dtrain, gpair, rows, sampler)
             }
-            Prepared::Hist(ghist) => {
-                HistTreeBuilder::new(params).build(ghist, gpair, rows, sampler)
-            }
+            Prepared::Hist(ghist) => hist().build(ghist, gpair, rows, sampler),
             Prepared::Approx { const_hess, cached } => {
                 let bin = || {
                     let hessians: Vec<f32> = gpair.iter().map(|g| g.hess).collect();
@@ -64,14 +66,9 @@ impl Prepared {
                     GHistIndex::from_dmatrix(dtrain, cuts)
                 };
                 if *const_hess {
-                    HistTreeBuilder::new(params).build(
-                        cached.get_or_init(bin),
-                        gpair,
-                        rows,
-                        sampler,
-                    )
+                    hist().build(cached.get_or_init(bin), gpair, rows, sampler)
                 } else {
-                    HistTreeBuilder::new(params).build(&bin(), gpair, rows, sampler)
+                    hist().build(&bin(), gpair, rows, sampler)
                 }
             }
         }
@@ -485,6 +482,7 @@ fn train_impl_inner(
                             k as u64,
                         );
                         let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
+                            .with_rounding_seed(rounding_seed(params.seed, round as u64, k as u64))
                             .build_with_leaf_rows(ghist, gk, &row_subset, &mut sampler);
                         tree.scale_leaves(params.eta as f32);
                         (tree, leaf_rows)
@@ -785,7 +783,14 @@ fn fit_output_tree(
 ) -> RegTree {
     let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
     let mut sampler = make_column_sampler(n_features, params, rng, round as u64, k as u64);
-    let mut tree = prepared.build_tree(params, dtrain, gk, row_subset, &mut sampler);
+    let mut tree = prepared.build_tree(
+        params,
+        dtrain,
+        gk,
+        row_subset,
+        &mut sampler,
+        rounding_seed(params.seed, round as u64, k as u64),
+    );
     tree.scale_leaves(params.eta as f32);
     tree
 }

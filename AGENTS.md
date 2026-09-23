@@ -53,14 +53,15 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `data/` | `DMatrix` (dense/CSR, labels, weights, groups, feature types), libsvm/CSV loaders, quantile sketch and `HistCuts`, `GHistIndex` binning, opt-in ordered target statistics (`target_stats`, beyond XGBoost) |
 | `config/` | `TrainingParams` and its builder; names mirror XGBoost |
 | `objective/`, `metric/` | Losses and eval metrics by XGBoost name, plus custom hooks |
-| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation, `compact` (prediction layout) |
+| `tree/` | `RegTree`, split gain, monotone/interaction constraints, column sampler, `builder/{exact,hist}`, `hist/` accumulation (`hist/quantized`: opt-in LightGBM-style quantized-gradient histograms, `use_quantized_grad`, beyond XGBoost), `compact` (prediction layout) |
 | `booster/` | `gblinear` |
 | `learner/` | Training loop (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts), `BoostedModel`, cv, TreeSHAP, `conformal` (split-conformal / CQR intervals) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
 `tests/`: `parity.rs` (ignored by default; needs fixtures), `properties.rs`
-(proptest), `shap_accumulation.rs`. `benches/training.rs` is the Criterion
+(proptest), `shap_accumulation.rs`, `quantized.rs` (quantized-gradient
+training: thread-count determinism, quality band, leaf renewal). `benches/training.rs` is the Criterion
 suite; `docs/performance.md` records its results.
 
 ## Invariants
@@ -71,6 +72,9 @@ suite; `docs/performance.md` records its results.
 - **Determinism:** identical params, data, and seed give identical
   predictions (property-tested), and the hist builder grows the same tree
   serially and in parallel. Parallel reductions keep a fixed order.
+  Quantized training (`use_quantized_grad`) draws its stochastic rounding
+  from a counter-based stream keyed by row index and sums integers exactly,
+  so it keeps the same guarantee.
 - **Unsafe:** confined to `simd/` and the hot loops in `tree/compact.rs`,
   `tree/hist/`, and `tree/builder/hist.rs`. Every block needs a `// SAFETY:`
   comment (`undocumented_unsafe_blocks`); `unsafe_op_in_unsafe_fn` is
@@ -117,6 +121,10 @@ are reached through their module (e.g. `hessboost::tree::RegTree`).
 - `SplitConformal::calibrate(&model, &dcal, alpha)` and
   `ConformalizedQuantile::calibrate(&lo, &hi, ..)` / `calibrate_outputs(&model, lo, hi, ..)`,
   then `.predict_interval(&data)` → `Vec<(lower, upper)>`.
+
+Opt-in quantized training: `.use_quantized_grad(true)` with
+`num_grad_quant_bins`, `stochastic_rounding`, `quant_train_renew_leaf`
+(`hist`/`approx` only; validated in `TrainingParams::validate`).
 
 Multiclass objectives need `.num_class(k)`; ranking objectives need
 `.with_group_sizes`.

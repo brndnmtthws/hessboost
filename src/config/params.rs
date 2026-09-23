@@ -128,6 +128,10 @@ pub enum ProcessType {
 /// [`TrainingParams::default`] and mutate fields directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent XGBoost/LightGBM switches, not a state machine"
+)]
 pub struct TrainingParams {
     // ---- General ----
     /// Which booster to train. XGBoost `booster`.
@@ -234,6 +238,27 @@ pub struct TrainingParams {
     /// `refresh_leaf`.
     pub refresh_leaf: bool,
 
+    // ---- Quantized training (LightGBM; beyond XGBoost) ----
+    /// Train on gradients and Hessians quantized to small integers with
+    /// integer histograms (LightGBM `use_quantized_grad`; Shi et al., NeurIPS
+    /// 2022). Opt-in and not part of XGBoost: trees differ from
+    /// full-precision training. Needs `tree_method` `hist`/`approx` (or
+    /// `auto`) and a tree booster.
+    pub use_quantized_grad: bool,
+    /// Quantization levels `Q` for [`use_quantized_grad`](Self::use_quantized_grad):
+    /// gradients map to integers in `[-⌊Q/2⌋, ⌊Q/2⌋]`, non-negative Hessians
+    /// to `[0, Q]`. In `[2, 127]` (LightGBM stores each value in 8 bits).
+    /// LightGBM `num_grad_quant_bins`.
+    pub num_grad_quant_bins: usize,
+    /// Round quantized gradients stochastically (unbiased) rather than to the
+    /// nearest level. Only used with `use_quantized_grad`. LightGBM
+    /// `stochastic_rounding`.
+    pub stochastic_rounding: bool,
+    /// Recompute each leaf value from the full-precision gradients of its rows
+    /// once a quantized tree is grown. Only used with `use_quantized_grad`.
+    /// LightGBM `quant_train_renew_leaf`.
+    pub quant_train_renew_leaf: bool,
+
     // ---- DART-specific ----
     /// Fraction of trees to drop each round (DART). XGBoost `rate_drop`.
     pub rate_drop: f64,
@@ -285,6 +310,10 @@ impl Default for TrainingParams {
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
             refresh_leaf: true,
+            use_quantized_grad: false,
+            num_grad_quant_bins: 4,
+            stochastic_rounding: true,
+            quant_train_renew_leaf: false,
             rate_drop: 0.0,
             skip_drop: 0.0,
             missing: f64::NAN,
@@ -404,6 +433,23 @@ impl TrainingParams {
                 && self.max_depth == 0),
             "lossguide growth needs a bound: set max_leaves or max_depth > 0",
         )?;
+        ensure(
+            "num_grad_quant_bins",
+            (2..=127).contains(&self.num_grad_quant_bins),
+            format!("must be in [2, 127], got {}", self.num_grad_quant_bins),
+        )?;
+        if self.use_quantized_grad {
+            ensure(
+                "use_quantized_grad",
+                self.tree_method != TreeMethod::Exact && self.booster != BoosterKind::GbLinear,
+                "quantized training needs a tree booster with `tree_method` hist, approx or auto",
+            )?;
+            ensure(
+                "use_quantized_grad",
+                self.multi_strategy == MultiStrategy::OneOutputPerTree,
+                "quantized training grows one-output trees only",
+            )?;
+        }
         Ok(())
     }
 
@@ -604,6 +650,14 @@ impl TrainingParamsBuilder {
         process_type, ProcessType);
     setter!(/// Set whether `process_type = update` refreshes leaf values (`refresh_leaf`).
         refresh_leaf, bool);
+    setter!(/// Enable quantized-gradient training (`use_quantized_grad`, LightGBM).
+        use_quantized_grad, bool);
+    setter!(/// Set the gradient quantization levels (`num_grad_quant_bins`, LightGBM).
+        num_grad_quant_bins, usize);
+    setter!(/// Set stochastic rounding of quantized gradients (`stochastic_rounding`, LightGBM).
+        stochastic_rounding, bool);
+    setter!(/// Set full-precision leaf renewal after quantized growth (`quant_train_renew_leaf`, LightGBM).
+        quant_train_renew_leaf, bool);
 
     /// Set the objective by name (e.g. `"binary:logistic"`).
     #[must_use]

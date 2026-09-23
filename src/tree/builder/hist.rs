@@ -16,6 +16,7 @@ use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
 use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
 use crate::tree::gain::{GradStats, RegParams};
+use crate::tree::hist::quantized::QuantNode;
 use crate::tree::hist::{
     BinIndex, CpuBackend, Histogram, HistogramBackend, subtract_in_place, zeroed,
 };
@@ -57,6 +58,9 @@ struct NodeEntry {
     /// constraints and the split features on the path from the root. `None`
     /// means "all features allowed" (the root, and the inactive case).
     allowed: Option<InteractionState>,
+    /// Quantized histogram (`use_quantized_grad`); `hist` then holds its
+    /// dequantized copy for split evaluation.
+    quant: Option<QuantNode>,
 }
 
 /// Tree expansion and sampling happen in node order, so the expensive row and
@@ -100,6 +104,8 @@ pub struct HistTreeBuilder<'a> {
     /// interact with itself.
     interaction_sets: Option<Vec<Vec<u32>>>,
     backend: CpuBackend,
+    /// Stream of the stochastic gradient rounding (`use_quantized_grad`).
+    rounding_seed: u64,
 }
 
 impl<'a> HistTreeBuilder<'a> {
@@ -111,7 +117,17 @@ impl<'a> HistTreeBuilder<'a> {
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
             backend: CpuBackend,
+            rounding_seed: 0,
         }
+    }
+
+    /// Seed the stochastic rounding of quantized training
+    /// (`use_quantized_grad`). The trainer passes a distinct seed per round
+    /// and output so rounding noise is independent across trees.
+    #[must_use]
+    pub(crate) fn with_rounding_seed(mut self, seed: u64) -> Self {
+        self.rounding_seed = seed;
+        self
     }
 
     /// Grow one tree from the binned dataset.
@@ -152,16 +168,26 @@ impl<'a> HistTreeBuilder<'a> {
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
         let total_bins = ghist.total_bins();
+        // Leaf renewal recomputes leaf values from full-precision sums, which
+        // needs every leaf's rows.
+        let renew = self.params.use_quantized_grad && self.params.quant_train_renew_leaf;
 
-        let root_stats = sum_rows(gpair, row_subset);
-        let mut root_hist = zeroed(total_bins);
-        self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+        let (root_stats, root_hist, root_quant) = if self.params.use_quantized_grad {
+            let (quant, stats, hist) =
+                QuantNode::root(ghist, gpair, row_subset, self.params, self.rounding_seed);
+            (stats, hist, Some(quant))
+        } else {
+            let root_stats = sum_rows(gpair, row_subset);
+            let mut root_hist = zeroed(total_bins);
+            self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+            (root_stats, root_hist, None)
+        };
 
         let mut tree = RegTree::with_root(root_stats.hess as f32);
         let mut store = NodeStore {
             stats: vec![root_stats],
             bounds: vec![Bounds::default()],
-            leaf_rows: capture_rows.then(Vec::new),
+            leaf_rows: (capture_rows || renew).then(Vec::new),
         };
 
         // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
@@ -182,6 +208,7 @@ impl<'a> HistTreeBuilder<'a> {
             best,
             bounds: Bounds::default(),
             allowed: None,
+            quant: root_quant,
         };
 
         match self.params.grow_policy {
@@ -193,9 +220,19 @@ impl<'a> HistTreeBuilder<'a> {
             }
         }
 
+        if renew && let Some(leaves) = &store.leaf_rows {
+            for leaf in leaves {
+                store.stats[leaf.node] = sum_rows(gpair, &leaf.rows);
+            }
+        }
         // Finalize leaf weights (respecting each leaf's monotone bounds).
         finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.reg);
-        (tree, store.leaf_rows.unwrap_or_default())
+        let leaf_rows = if capture_rows {
+            store.leaf_rows.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (tree, leaf_rows)
     }
 
     fn depth_limit(&self) -> usize {
@@ -272,9 +309,11 @@ impl<'a> HistTreeBuilder<'a> {
         let mut n_leaves = 1usize;
         while let Some(entry) = heap.pop() {
             if n_leaves >= max_leaves {
+                store.record_leaf(entry);
                 break;
             }
             if entry.depth >= limit || !self.valid(&entry.best) {
+                store.record_leaf(entry);
                 continue; // permanent leaf
             }
             let children = self
@@ -285,6 +324,9 @@ impl<'a> HistTreeBuilder<'a> {
                 heap.push(l);
                 heap.push(r);
             }
+        }
+        for entry in heap {
+            store.record_leaf(entry);
         }
     }
 
@@ -385,6 +427,7 @@ impl<'a> HistTreeBuilder<'a> {
             hist: mut parent_hist,
             best,
             allowed: parent_allowed,
+            quant: parent_quant,
             ..
         } = entry;
         let b = &best;
@@ -395,11 +438,16 @@ impl<'a> HistTreeBuilder<'a> {
         let terminal = self.params.grow_policy == GrowPolicy::DepthWise
             && parent_depth + 1 >= self.depth_limit();
         let total_bins = parent_hist.len();
+        let (mut left_quant, mut right_quant) = (None, None);
         // Build the smaller child directly; derive the sibling by subtracting it
         // from the parent histogram in place. The parent's buffer is dead after
         // this node expands, so the sibling reuses it without a new allocation.
         let (left_hist, right_hist) = if terminal {
             (Vec::new(), Vec::new())
+        } else if let Some(quant) = parent_quant {
+            let ((lq, lh), (rq, rh)) = quant.children(ghist, &left_rows, &right_rows, parent_hist);
+            (left_quant, right_quant) = (Some(lq), Some(rq));
+            (lh, rh)
         } else if left_rows.len() <= right_rows.len() {
             let mut lh = zeroed(total_bins);
             self.backend.build(ghist, &left_rows, gpair, &mut lh);
@@ -463,6 +511,7 @@ impl<'a> HistTreeBuilder<'a> {
             best: left_best,
             bounds: lb_bounds,
             allowed: child_allowed.clone(),
+            quant: left_quant,
         };
         let right = NodeEntry {
             nid: right_id,
@@ -472,6 +521,7 @@ impl<'a> HistTreeBuilder<'a> {
             best: right_best,
             bounds: rb_bounds,
             allowed: child_allowed,
+            quant: right_quant,
         };
         (left, right)
     }

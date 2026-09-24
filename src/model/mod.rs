@@ -975,12 +975,14 @@ impl BoostedModel {
         })
     }
 
-    /// The iteration range plain prediction uses: `[0, best_iteration + 1)`
-    /// when early stopping selected an iteration, else every iteration.
-    pub(crate) fn default_iteration_range(&self) -> Range<usize> {
-        0..self
+    /// The iteration range plain prediction uses: `..best_iteration + 1`
+    /// when early stopping selected an iteration, else every iteration
+    /// (`..`, which is also the only range a `gblinear` model accepts).
+    pub(crate) fn default_iteration_range(&self) -> (Bound<usize>, Bound<usize>) {
+        let end = self
             .best_iteration
-            .map_or(self.num_boost_rounds(), |it| it + 1)
+            .map_or(Bound::Unbounded, |it| Bound::Excluded(it + 1));
+        (Bound::Unbounded, end)
     }
 
     /// Resolve `iterations`, any range of boosting iterations (`..`, `..end`,
@@ -990,6 +992,20 @@ impl BoostedModel {
         iterations: impl RangeBounds<usize>,
         param: &'static str,
     ) -> Result<Range<usize>> {
+        if self.linear.is_some() {
+            // No iterations to select: only the whole model (`..`) is a range.
+            let whole = matches!(
+                iterations.start_bound(),
+                Bound::Unbounded | Bound::Included(0)
+            ) && iterations.end_bound() == Bound::Unbounded;
+            if !whole {
+                return Err(HessboostError::invalid_param(
+                    param,
+                    "gblinear models have no boosting iterations to select; pass `..`",
+                ));
+            }
+            return Ok(0..0);
+        }
         let rounds = self.num_boost_rounds();
         let overflow = || HessboostError::invalid_param(param, "range bound overflows");
         let begin = match iterations.start_bound() {
@@ -1006,12 +1022,6 @@ impl BoostedModel {
             return Err(HessboostError::invalid_param(
                 param,
                 format!("{begin}..{end} is out of range for a model with {rounds} iterations"),
-            ));
-        }
-        if self.linear.is_some() && begin != end {
-            return Err(HessboostError::invalid_param(
-                "iterations",
-                "gblinear models have no boosting iterations to select",
             ));
         }
         Ok(begin..end)
@@ -1052,10 +1062,8 @@ impl BoostedModel {
     /// `iteration_range`), any range of iteration indices: `..` is the whole
     /// model regardless of early stopping, `..n` the first `n` iterations,
     /// `2..5` iterations 2 to 4. The intercept / dataset `base_margin` is
-    /// always included, so an empty range of a tree model predicts it alone.
-    /// A `gblinear` model has no boosting iterations to select: it accepts
-    /// only `..` (or another empty range) and always predicts its whole
-    /// linear model.
+    /// always included, so an empty range predicts it alone. A `gblinear`
+    /// model has no boosting iterations to select and accepts only `..`.
     pub fn predict_margin_range(
         &self,
         data: &DMatrix,
@@ -1188,10 +1196,6 @@ impl BoostedModel {
 
     /// The iteration range the attribution predictions use by default (the
     /// effective iterations, like [`Self::predict_margin`]).
-    fn attribution_default_range(&self) -> Range<usize> {
-        self.default_iteration_range()
-    }
-
     pub(crate) fn validate_prediction_data(&self, data: &DMatrix) -> Result<()> {
         validate_prediction_data(self.n_features, self.n_outputs(), data)
     }

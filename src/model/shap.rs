@@ -690,7 +690,7 @@ impl BoostedModel {
     /// model, [`HessboostError::ModelFormat`] when a tree has a negative cover,
     /// [`HessboostError::InvalidParameter`] for linear-leaf models.
     pub fn predict_contribs(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        self.predict_contribs_range(data, self.attribution_default_range())
+        self.predict_contribs_range(data, self.default_iteration_range())
     }
 
     /// [`Self::predict_contribs`] over the boosting iterations in
@@ -786,7 +786,7 @@ impl BoostedModel {
     ///
     /// As for [`BoostedModel::predict_contribs`].
     pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        self.predict_interactions_range(data, self.attribution_default_range())
+        self.predict_interactions_range(data, self.default_iteration_range())
     }
 
     /// [`Self::predict_interactions`] over the boosting iterations in

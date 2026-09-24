@@ -730,7 +730,10 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                 for slot in 0..per_iteration {
                     let k = slot / parallel;
                     let gk = gather_output(&gpair, &mut gpair_k, n_out, k);
-                    let mut tree = std::mem::take(&mut queue[iteration * per_iteration + slot]);
+                    let mut tree = std::mem::replace(
+                        &mut queue[iteration * per_iteration + slot],
+                        RegTree::with_root(0.0),
+                    );
                     refresh_tree(&mut tree, dtrain, gk, params, tree_eta(params));
                     update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
                     for (ei, (d, _)) in evals.iter().enumerate() {

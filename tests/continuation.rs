@@ -465,6 +465,25 @@ fn iteration_ranges_select_whole_iterations() {
 }
 
 #[test]
+fn gblinear_accepts_only_the_whole_range() {
+    let d = regression(100, 0.0);
+    let params = base().booster(BoosterKind::GbLinear).build().unwrap();
+    let model = train(&params, &d, 5).unwrap();
+    let whole = model.predict_margin(&d).unwrap();
+    assert_eq!(model.predict_margin_range(&d, ..).unwrap(), whole);
+    assert_eq!(model.predict_margin_range(&d, 0..).unwrap(), whole);
+    // An explicit empty range would predict the intercept alone on a tree
+    // model; a linear model has no iterations to leave out, so it is refused.
+    for bad in [
+        model.predict_margin_range(&d, 0..0),
+        model.predict_range(&d, ..0),
+    ] {
+        assert_eq!(invalid_param(bad), "iterations");
+    }
+    assert_eq!(invalid_param(model.slice(.., 1)), "slice");
+}
+
+#[test]
 fn slicing_selects_iterations_with_their_dart_weights() {
     let d = regression(200, 0.0);
     let params = base()

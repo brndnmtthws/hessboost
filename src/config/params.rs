@@ -536,6 +536,22 @@ fn non_negative(name: &'static str, v: f64) -> Result<()> {
     )
 }
 
+/// [`ensure`] that `v` stays finite (and `> 0` when `positive`) once
+/// narrowed to `f32`, as the split search and objectives use it (XGBoost's
+/// `float` parameters), so a setting cannot pass validation and then
+/// overflow or vanish.
+fn narrows(name: &'static str, v: f64, positive: bool) -> Result<()> {
+    let narrowed = v as f32;
+    ensure(
+        name,
+        narrowed.is_finite() && (!positive || narrowed > 0.0),
+        format!(
+            "must stay {}finite in f32, got {v}",
+            if positive { "positive and " } else { "" }
+        ),
+    )
+}
+
 impl TrainingParams {
     /// Start a builder for ergonomic, chained configuration.
     pub fn builder() -> TrainingParamsBuilder {
@@ -547,14 +563,21 @@ impl TrainingParams {
     /// Validate mutually-consistent ranges. Called automatically before training.
     pub fn validate(&self) -> Result<()> {
         positive("eta", self.eta)?;
+        narrows("eta", self.eta, true)?;
         non_negative("gamma", self.gamma)?;
+        narrows("gamma", self.gamma, false)?;
         non_negative("min_child_weight", self.min_child_weight)?;
+        narrows("min_child_weight", self.min_child_weight, false)?;
         if let Some(max_delta_step) = self.max_delta_step {
             non_negative("max_delta_step", max_delta_step)?;
+            narrows("max_delta_step", max_delta_step, false)?;
         }
         non_negative("lambda", self.lambda)?;
+        narrows("lambda", self.lambda, false)?;
         non_negative("alpha", self.alpha)?;
+        narrows("alpha", self.alpha, false)?;
         positive("scale_pos_weight", self.scale_pos_weight)?;
+        narrows("scale_pos_weight", self.scale_pos_weight, true)?;
         unit("subsample", self.subsample)?;
         // subsample of exactly 0 is meaningless.
         ensure("subsample", self.subsample != 0.0, "must be > 0")?;
@@ -618,6 +641,15 @@ impl TrainingParams {
 
         if let Some(base_score) = self.base_score {
             ensure("base_score", base_score.is_finite(), "must be finite")?;
+        }
+        // Models store both lists whatever the objective, so an entry no
+        // objective could use (e.g. NaN) must not reach a saved model. Their
+        // own objectives also require a non-empty, ascending list.
+        for alpha in &self.quantile_alpha {
+            unit("quantile_alpha", *alpha)?;
+        }
+        for alpha in &self.expectile_alpha {
+            unit("expectile_alpha", *alpha)?;
         }
         // The objectives run in `f32`: validate the narrowed values so a
         // configuration cannot pass here and leave the documented range once
@@ -1151,6 +1183,19 @@ mod tests {
             ),
             ("max_delta_step", b().max_delta_step(-1.0)),
             ("num_parallel_tree", b().num_parallel_tree(0)),
+            // Stored with every model, so checked whatever the objective.
+            ("quantile_alpha", b().quantile_alpha(vec![0.5, f64::NAN])),
+            ("expectile_alpha", b().expectile_alpha(vec![1.5])),
+            // Finite in f64, but infinite or zero in the f32 the split
+            // search and objectives use.
+            ("eta", b().eta(1e39)),
+            ("eta", b().eta(1e-50)),
+            ("gamma", b().gamma(1e39)),
+            ("min_child_weight", b().min_child_weight(1e39)),
+            ("lambda", b().lambda(1e39)),
+            ("alpha", b().alpha(1e39)),
+            ("max_delta_step", b().max_delta_step(1e39)),
+            ("scale_pos_weight", b().scale_pos_weight(1e-50)),
             // Lossguide growth needs a leaf or depth bound.
             (
                 "max_leaves",

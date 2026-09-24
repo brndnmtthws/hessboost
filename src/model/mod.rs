@@ -1311,6 +1311,24 @@ impl BoostedModel {
             self.n_targets,
             self.n_outputs,
         )?;
+        // The same rules the XGBoost importer and training apply, so a loaded
+        // model's parameters also export and rebuild.
+        self.objective_params
+            .training_params(&self.objective, self.num_class)
+            .build()
+            .map_err(|e| {
+                HessboostError::model_format(format!("invalid objective parameters: {e}"))
+            })?;
+        // Derived from the objective name, not configured: the binary format
+        // re-derives it, so a stored value must agree.
+        if self.objective_params.distribution
+            != crate::objective::distributional::DistFamily::from_objective(&self.objective)
+        {
+            return Err(HessboostError::model_format(format!(
+                "objective parameters name distribution {:?} for objective `{}`",
+                self.objective_params.distribution, self.objective
+            )));
+        }
         if let Some(best) = self.best_iteration
             && self.linear.is_none()
             && best >= self.num_boost_rounds()
@@ -1346,9 +1364,21 @@ impl BoostedModel {
         }
         if let Some(linear) = &self.linear {
             let outputs = self.n_outputs();
-            if linear.bias.len() != outputs || linear.weights.len() != self.n_features * outputs {
+            if linear.bias.len() != outputs
+                || Some(linear.weights.len()) != self.n_features.checked_mul(outputs)
+            {
                 return Err(HessboostError::model_format(
                     "linear model dimensions are invalid",
+                ));
+            }
+            if !linear
+                .weights
+                .iter()
+                .chain(&linear.bias)
+                .all(|v| v.is_finite())
+            {
+                return Err(HessboostError::model_format(
+                    "linear model parameters must be finite",
                 ));
             }
         }
@@ -1948,5 +1978,29 @@ mod tests {
         value["objective"] = "my:custom".into();
         let custom = BoostedModel::from_json(&value.to_string()).unwrap();
         assert_eq!(custom.objective(), "my:custom");
+    }
+
+    /// Non-finite gblinear parameters would save as JSON `null` (and
+    /// predict NaN): the binary reader refuses them like non-finite trees.
+    #[test]
+    fn loading_refuses_non_finite_linear_parameters() {
+        let x: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        let d = labeled_dense(&x, 10, 2, &[1.0; 10]);
+        let params = TrainingParams::builder()
+            .booster(crate::config::BoosterKind::GbLinear)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 2).unwrap();
+        assert!(BoostedModel::from_bytes(&model.to_bytes().unwrap()).is_ok());
+        for (weight, bias) in [(f32::INFINITY, 0.0), (0.0, f32::NAN)] {
+            let mut corrupt = model.clone();
+            let linear = corrupt.linear.as_mut().unwrap();
+            linear.weights[0] = weight;
+            linear.bias[0] = bias;
+            assert!(matches!(
+                BoostedModel::from_bytes(&corrupt.to_bytes().unwrap()),
+                Err(HessboostError::ModelFormat(_))
+            ));
+        }
     }
 }

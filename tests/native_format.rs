@@ -5,7 +5,7 @@
 //! corrupt payloads, and inconsistent layouts are refused.
 //!
 //! Before a release that has no directory there yet, run
-//! `cargo test --test native_format -- --ignored save_models_of_this_version`
+//! `cargo nextest run --test native_format --run-ignored only save_models_of_this_version`
 //! and commit the files it writes. Directories of earlier versions are never
 //! regenerated: they are what later versions must keep reading.
 
@@ -133,6 +133,74 @@ fn objective_width_must_match_the_stored_outputs() {
         let model = load_doc(&doc).unwrap();
         assert_eq!(model.n_outputs(), 2);
     }
+}
+
+/// A saved model's JSON document.
+fn saved_doc(name: &str) -> Value {
+    let path = saved_dir("0.2.0").join(format!("{name}.json"));
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Loading refuses what the XGBoost importer or training would refuse, so a
+/// loaded model exports and re-imports.
+#[test]
+fn documents_other_readers_refuse_are_refused() {
+    let mut doc = empty_model_doc();
+    doc["objective"] = "binary:logistic".into();
+    assert!(load_doc(&doc).is_ok());
+    doc["objective_params"]["scale_pos_weight"] = 0.into();
+    assert!(matches!(
+        load_doc(&doc),
+        Err(HessboostError::ModelFormat(_))
+    ));
+
+    // XGBoost requires at least one category per categorical split.
+    let mut doc = saved_doc("categorical_splits");
+    assert!(load_doc(&doc).is_ok());
+    let node = &mut doc["trees"][0]["nodes"][0];
+    assert_eq!(node["is_categorical"], true);
+    node["cat_end"] = node["cat_begin"].clone();
+    assert!(matches!(
+        load_doc(&doc),
+        Err(HessboostError::ModelFormat(_))
+    ));
+    // Scalar trees export the sets of categorical leaves too.
+    let mut doc = saved_doc("categorical_splits");
+    let nodes = doc["trees"][0]["nodes"].as_array_mut().unwrap();
+    let leaf = nodes.iter_mut().find(|n| n["left"] == -1).unwrap();
+    leaf["is_categorical"] = true.into();
+    assert!(matches!(
+        load_doc(&doc),
+        Err(HessboostError::ModelFormat(_))
+    ));
+
+    // The distribution family follows from the objective name.
+    let mut doc = saved_doc("dist_normal");
+    assert!(load_doc(&doc).is_ok());
+    for family in [Value::Null, "gamma".into()] {
+        doc["objective_params"]["distribution"] = family;
+        assert!(matches!(
+            load_doc(&doc),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
+}
+
+#[test]
+fn training_refuses_to_return_a_model_that_would_not_load() {
+    // `f32::MAX` row weights overflow the weighted gradient sums, leaving
+    // non-finite covers and gains that the model formats refuse.
+    let (x, _) = train_data(1);
+    let n = x.len() / COLS;
+    let y: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+    let data = DMatrix::from_dense(&x, n, COLS)
+        .unwrap()
+        .with_labels(&y)
+        .unwrap()
+        .with_weights(&vec![f32::MAX; n])
+        .unwrap();
+    let err = train(&base().build().unwrap(), &data, 2).unwrap_err();
+    assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
 }
 
 /// `(x, y)` with `k` label columns: 160 [`four_features`] rows.
@@ -366,6 +434,7 @@ fn native_formats_round_trip_every_model_feature() {
         let from_binary = BoostedModel::from_bytes(&bytes).unwrap();
         assert_eq!(from_binary.to_bytes().unwrap(), bytes, "{name}: binary");
         let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
+        assert_eq!(from_json.to_bytes().unwrap(), bytes, "{name}: JSON");
         let expected = bits(&model.predict(&data).unwrap());
         for restored in [&from_binary, &from_json] {
             assert_eq!(bits(&restored.predict(&data).unwrap()), expected, "{name}");

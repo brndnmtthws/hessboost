@@ -367,9 +367,14 @@ fn fit(case: &Case, nthread: usize) -> Option<BoostedModel> {
         nthread,
         ..case.params.clone()
     };
-    let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds).eval(&case.dtrain, "train");
-    if let Some(rounds) = case.early_stopping {
-        trainer = trainer.early_stopping_rounds(rounds);
+    let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds);
+    // gblinear refuses evaluation sets and early stopping; attaching them
+    // would reject every linear case before it trains.
+    if params.booster != BoosterKind::GbLinear {
+        trainer = trainer.eval(&case.dtrain, "train");
+        if let Some(rounds) = case.early_stopping {
+            trainer = trainer.early_stopping_rounds(rounds);
+        }
     }
     trainer.train().ok().map(|result| result.model)
 }

@@ -11,9 +11,10 @@ the code.
 ## Toolchain
 
 `mise.toml` pins Rust (1.98.1, with clippy and rustfmt), mr-boxington (`mbx`,
-a build cache), cargo-nextest, and uv; run `mise install` (an enter hook
-runs `mise i -q` in mise-activated shells). `mise.lock` pins their
-downloads; refresh it with `mise lock` after changing a version. Edition
+a build cache), cargo-binstall (so mise installs `cargo:` tools as prebuilt
+binaries), cargo-nextest, and uv; run `mise install` (an enter hook runs
+`mise i -q` in mise-activated shells). `mise.lock` pins their downloads;
+refresh it with `mise lock` after changing a version. Edition
 2024, MSRV 1.93 (`rust-version` in `Cargo.toml`). `Cargo.lock` is
 gitignored, so never pass `--locked`. Building needs a C compiler for libzstd
 (`zstd-sys`); a cross-target build needs one for that target.
@@ -63,8 +64,11 @@ the benchmark harnesses.
 Fuzzing: `fuzz/` is a separate cargo-fuzz crate. Its `mise.toml` layers a
 pinned nightly and cargo-fuzz over the repository's tools, so run it from
 there: `./run.sh [seconds] [target...]` rebuilds the seeds (the saved
-models in `tests/data/`) and runs each target for that long (30 s in CI's
-`fuzz` job). A crash leaves its input in `fuzz/artifacts/<target>/`; replay
+models in `tests/data/`, plus `fuzz/fixed-seeds/`) and runs each target for
+that long (30 s in CI's `fuzz` job). `fixed-seeds/train/*` are decoded by
+`train.rs`'s input layout: after changing it, re-check them with
+`cargo fuzz fmt train <file>`. A crash leaves its input in
+`fuzz/artifacts/<target>/`; replay
 it with `cargo fuzz run <target> <file>`. Targets: `native-model`,
 `json-model`, `xgboost-json-model`, `xgboost-ubjson-model`, `compact-model`
 (parsers: accepted models must predict and round-trip), `loaders`

@@ -146,6 +146,10 @@ jobs:
   fuzz:
     name: fuzz (smoke)
     runs-on: ubuntu-latest
+    env:
+      # mr-boxington-action caches the root `target/`; build there so the
+      # warm target tree also covers the sanitizer compiles mbx bypasses.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v7
         with:

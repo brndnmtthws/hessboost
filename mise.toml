@@ -2,6 +2,9 @@
 rust = { version = "1.98.1", profile = "minimal", components = "clippy,rustfmt", mr_boxington = true }
 mr-boxington = "1.16.0"
 uv = "0.12.18"
+# mise installs `cargo:` tools with cargo-binstall (prebuilt binaries) when
+# it is present, instead of compiling them.
+cargo-binstall = "1.23.0"
 "cargo:cargo-nextest" = "0.9.146"
 
 # Install anything missing whenever a mise-activated shell enters the repo.

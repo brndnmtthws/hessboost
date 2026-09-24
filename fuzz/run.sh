@@ -2,7 +2,9 @@
 # Runs every fuzz target for a fixed wall time: a smoke test, not a fuzzing
 # campaign. Seeds come from the models each release saved
 # (tests/data/saved/*/) and the XGBoost saves the importer tests use, so new
-# formats and releases are picked up without checked-in copies.
+# formats and releases are picked up without checked-in copies, plus the
+# inputs in fixed-seeds/ that reach paths the fuzzer is slow to find (e.g. a
+# gblinear case that trains).
 #
 # Usage (from fuzz/, where mise provides nightly Rust and cargo-fuzz):
 #   ./run.sh [seconds-per-target] [target...]
@@ -18,6 +20,8 @@ seed() {
 }
 
 rm -rf seeds
+mkdir seeds
+cp -R fixed-seeds/. seeds/
 seed native-model
 seed json-model
 seed compact-model

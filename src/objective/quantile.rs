@@ -214,6 +214,16 @@ impl Objective for QuantileObjective {
         }
     }
 
+    /// The identity: XGBoost's quantile `ProbToMargin` is the identity, so
+    /// the stored `base_score` is the margin row itself, in output order,
+    /// not the sorted prediction.
+    fn margins_to_probs(&self, _margins: &mut [f32]) {}
+
+    /// Every output is fitted to the same single label column.
+    fn validate_info(&self, info: &crate::data::MetaInfo) -> Result<()> {
+        super::check_label_width(info, 1)
+    }
+
     fn base_margins(
         &self,
         labels: &[f32],
@@ -379,6 +389,11 @@ impl Objective for ExpectileObjective {
             let gap = scores[j] - scores[j - 1];
             scores[j] = softplus_inv(gap - RT_EPS);
         }
+    }
+
+    /// Every output is fitted to the same single label column.
+    fn validate_info(&self, info: &crate::data::MetaInfo) -> Result<()> {
+        super::check_label_width(info, 1)
     }
 
     fn base_margins(
@@ -637,5 +652,105 @@ mod tests {
         for (f, alpha) in frac.iter().zip([0.1, 0.5, 0.9]) {
             assert!((f - alpha).abs() < 0.1, "coverage {frac:?}");
         }
+    }
+
+    /// XGBoost stores quantile intercepts as margins in output order: the
+    /// export-side mapping is the identity, not the sorting transform.
+    #[test]
+    fn quantile_intercepts_export_unsorted() {
+        let obj = QuantileObjective::new(&[0.1, 0.9]).unwrap();
+        let mut stored = [10.0f32, 0.0];
+        obj.margins_to_probs(&mut stored);
+        assert_eq!(stored, [10.0, 0.0]);
+    }
+
+    /// An XGBoost-JSON round trip keeps unsorted per-output intercepts where
+    /// they are, so margins and sorted predictions are unchanged.
+    #[test]
+    fn quantile_xgboost_round_trip_keeps_intercept_order() {
+        use crate::config::TrainingParams;
+        use crate::data::DMatrix;
+        use crate::learner::BoostedModel;
+        let n = 32;
+        let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_labels(&x)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("reg:quantileerror")
+            .quantile_alpha(vec![0.1, 0.9])
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let mut model = crate::learner::train(&params, &d, 3).unwrap();
+        model.set_base_scores(vec![10.0, 0.0]);
+        let restored = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
+        assert_eq!(restored.base_scores(), [10.0, 0.0]);
+        let close = |a: Vec<f32>, b: Vec<f32>| {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(&b) {
+                assert!((x - y).abs() <= 1e-5 * x.abs().max(1.0), "{a:?} vs {b:?}");
+            }
+        };
+        close(
+            model.predict_margin(&d).unwrap(),
+            restored.predict_margin(&d).unwrap(),
+        );
+        close(model.predict(&d).unwrap(), restored.predict(&d).unwrap());
+    }
+
+    /// Every alpha output fits the one label column: a label matrix handed
+    /// to training with a directly constructed objective is refused.
+    #[test]
+    fn alpha_objectives_require_one_label_column() {
+        use crate::config::TrainingParams;
+        use crate::data::DMatrix;
+        let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
+            .unwrap()
+            .with_label_matrix(&[0.0, 1.0, 1.0, 2.0], 2)
+            .unwrap();
+        let params = TrainingParams::builder().build().unwrap();
+        let objectives: [Box<dyn Objective>; 2] = [
+            Box::new(QuantileObjective::new(&[0.1, 0.9]).unwrap()),
+            Box::new(ExpectileObjective::new(&[0.1, 0.9]).unwrap()),
+        ];
+        for obj in &objectives {
+            assert!(matches!(
+                crate::learner::train_with_objective(&params, &d, 1, obj.as_ref()),
+                Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+            ));
+        }
+    }
+
+    /// A directly constructed built-in objective must match the training
+    /// parameters it is saved with, or the trained model could not be loaded:
+    /// training refuses the mismatch and accepts the matching alphas.
+    #[test]
+    fn training_refuses_alphas_the_saved_model_cannot_rebuild() {
+        use crate::config::TrainingParams;
+        use crate::data::DMatrix;
+        use crate::learner::BoostedModel;
+        let d = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1)
+            .unwrap()
+            .with_labels(&[0.0, 1.0, 2.0, 3.0])
+            .unwrap();
+        let obj = QuantileObjective::new(&[0.1, 0.9]).unwrap();
+        for alphas in [vec![], vec![0.5]] {
+            let params = TrainingParams::builder()
+                .quantile_alpha(alphas)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                crate::learner::train_with_objective(&params, &d, 1, &obj),
+                Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
+            ));
+        }
+        let params = TrainingParams::builder()
+            .quantile_alpha(vec![0.1, 0.9])
+            .build()
+            .unwrap();
+        let model = crate::learner::train_with_objective(&params, &d, 1, &obj).unwrap();
+        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
     }
 }

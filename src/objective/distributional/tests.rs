@@ -630,3 +630,227 @@ fn shared_trees_split_on_one_parameter_column() {
         .with_split_direction(DistSplitDirection::Random, 0);
     assert_eq!(poisson.split_gradient(0, &gpair[..3]), None);
 }
+
+// Regression tests at parameters where the formulas used to cancel,
+// overflow, or stop early. References are high-precision mpmath (40
+// digits) or scipy evaluations of the stated quantities.
+
+/// A Gamma label far below its mean: `t - 1` rounds to `-1`, so the log gap
+/// `t - 1 - ln t` (≈ 45.05 for `t = 1e-20`) used to be `+∞`.
+#[test]
+fn gamma_gradients_stay_finite_for_tiny_label_ratios() {
+    let eta = [0.0, 0.0];
+    let y = 1e-20;
+    let g = DistFamily::Gamma.gradient(&eta, y);
+    // a (ψ(a) - ln a + t - 1 - ln t) at m = a = 1.
+    assert!(close(g[1], 44.474_486_194_979_38, 1e-14, 0.0), "{g:?}");
+    let h = DistFamily::Gamma.hessian(&eta, y);
+    assert!(h.iter().flatten().all(|v| v.is_finite()), "{h:?}");
+    assert!(DistFamily::Gamma.nll(&eta, y).is_finite());
+}
+
+/// A zero count under a large mean at the smallest size: `(y - m)/(r + m)`
+/// rounds to `-1`, and the size score used to be `-∞`, so the intercept
+/// fell to the `ln r = -30` bound (NLL 39.21 against 12.88 at the MLE).
+#[test]
+fn negative_binomial_intercept_survives_a_zero_count_under_a_large_mean() {
+    let family = DistFamily::NegativeBinomial;
+    assert!(nb_size_score(5000.0, (-LOG_LINK_BOUND).exp(), 0.0).is_finite());
+    let eta = family.mle_margins(&[0.0, 10_000.0], None);
+    assert!(close(eta[0], 5000f64.ln(), 1e-15, 0.0), "{eta:?}");
+    assert!(close(eta[1], -2.518_424_656_738_833, 0.0, 1e-8), "{eta:?}");
+    let nll = family.nll(&eta, 0.0) + family.nll(&eta, 10_000.0);
+    assert!(close(nll, 12.884_983_486_131_556, 1e-10, 0.0), "{nll}");
+    for y in [0.0, 10_000.0] {
+        let g = family.gradient(&eta, y);
+        assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
+    }
+}
+
+/// Wide negative binomials: the unit walk of the size Fisher sum stopped
+/// 100 000 values into a support of ~340 000 (`mean = size = 1e8`), before
+/// the mode, and dropped the rest (a negative entry, floored to `1e-16`).
+/// References: the survival series `Σ_k P(Y > k)/(r + k)²` summed exactly
+/// over the whole support.
+#[test]
+fn negative_binomial_size_fisher_covers_wide_supports() {
+    for (mean, size, reference) in [
+        (1e8, 1e8, 0.124_999_999_583_333_34),
+        // Sharp head at zero (size below one), 24 sd ≈ 340 000 values.
+        (1e4, 0.5, 0.722_643_525_822_104),
+    ] {
+        let i = DistFamily::NegativeBinomial.fisher(&[f64::ln(mean), f64::ln(size)]);
+        assert!(close(i[1], reference, 1e-6, 0.0), "{mean} {size}: {i:?}");
+    }
+}
+
+/// A skewed wide negative binomial: the blocks used to start at the
+/// sd-based width with the pmf at their midpoint, losing most of the mass
+/// near zero (CRPS 2876.10 at `y = 0`). References: scipy's CDF summed
+/// over single steps up to 6e6.
+#[test]
+fn count_crps_keeps_the_head_of_skewed_wide_counts() {
+    let dist = Dist::NegativeBinomial {
+        mean: 1e4,
+        size: 0.1,
+    };
+    for (y, reference) in [
+        (0.0, 1_168.446_191_399_923_5),
+        (2.5, 1_167.639_588_097_035_4),
+        (1e4, 6_278.362_015_659_435),
+        (1e5, 84_559.396_877_837_03),
+    ] {
+        let got = dist.crps(y);
+        assert!(close(got, reference, 1e-6, 0.0), "y={y}: {got}");
+    }
+}
+
+/// Gamma at the shape bound `e^30` (what constant labels fit): the CDF,
+/// quantiles, CRPS, and log density used to lose all precision.
+#[test]
+fn gamma_handles_the_largest_shape() {
+    let a = LOG_LINK_BOUND.exp();
+    let dist = Dist::Gamma {
+        mean: 1.0,
+        shape: a,
+    };
+    assert!(close(dist.cdf(1.0), 0.500_000_040_679_123_1, 1e-9, 0.0));
+    // 2 a^a e^-a / Γ(a + 1) - Γ(a + 1/2) / (√π Γ(a) a).
+    let crps = dist.crps(1.0);
+    assert!(close(crps, 7.148_783_583_195_937e-8, 1e-6, 0.0), "{crps}");
+    // a ln a - ln Γ(a) - a.
+    let lp = dist.log_prob(1.0);
+    assert!(close(lp, 14.081_061_466_795_32, 1e-13, 0.0), "{lp}");
+    for p in [1e-6, 0.3, 0.5, 0.999] {
+        let q = dist.quantile(p);
+        assert!(close(dist.cdf(q), p, 1e-6, 1e-9), "p={p} q={q}");
+    }
+}
+
+/// A large log standard deviation: `2Φ(σ/√2) - 1` rounds to one, and the
+/// LogNormal CRPS used to come out 0 instead of `≈ 4.0e14`.
+#[test]
+fn lognormal_crps_keeps_the_upper_tail() {
+    let dist = Dist::LogNormal {
+        mu: 0.0,
+        sigma: 12.0,
+    };
+    // y (2Φ(w) - 1) + 2 e^72 (Φ(-12/√2) - Φ(w - 12)), w = ln y / 12.
+    assert!(close(dist.crps(1.0), 399_981_265_934_752.7, 1e-12, 0.0));
+    // 2 e^72 Φ(-12/√2) - y.
+    assert!(close(dist.crps(-1.0), 399_981_265_934_753.8, 1e-12, 0.0));
+    // The scale overflows f64 alone, the CRPS does not.
+    let wide = Dist::LogNormal {
+        mu: 0.0,
+        sigma: 40.0,
+    };
+    assert!(wide.crps(1.0).is_finite() && wide.crps(1.0) > 0.0);
+}
+
+/// Negative binomials near their Poisson limit (`size = 1e13`, and the f32
+/// rounding of the `e^30` bound that predictions carry): the log-gamma
+/// differences in the log pmf and the incomplete-beta prefactor used to
+/// cancel (log pmf off by 0.06, `cdf(1)` 0.325 instead of 0.287).
+#[test]
+fn negative_binomial_near_the_poisson_limit() {
+    for (size, ln_p1, cdf1, cdf2) in [
+        (
+            1e13,
+            -1.583_709_268_125_782_5,
+            0.287_297_495_183_684_25,
+            0.543_813_115_883_345_6,
+        ),
+        (
+            f64::from(LOG_LINK_BOUND.exp() as f32),
+            -1.583_709_268_125_786_5,
+            0.287_297_495_183_681_8,
+            0.543_813_115_883_344_5,
+        ),
+    ] {
+        let dist = Dist::NegativeBinomial { mean: 2.5, size };
+        assert!(close(dist.log_prob(1.0), ln_p1, 0.0, 1e-12), "{size}");
+        assert!(close(dist.cdf(1.0), cdf1, 1e-12, 0.0), "{size}");
+        assert!(close(dist.cdf(2.0), cdf2, 1e-12, 0.0), "{size}");
+        assert_eq!(dist.quantile(0.3), 2.0, "{size}");
+    }
+}
+
+/// An RNG whose every draw is one fixed word.
+struct ConstRng(u64);
+
+impl rand::TryRng for ConstRng {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+        Ok(self.0 as u32)
+    }
+
+    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+        Ok(self.0)
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+        dst.fill(self.0 as u8);
+        Ok(())
+    }
+}
+
+/// The extreme RNG words map strictly inside `(0, 1)`: `u64::MAX` used to
+/// round to `u = 1` and an infinite sample.
+#[test]
+fn sampling_stays_finite_at_the_extreme_rng_words() {
+    let dists = [
+        Dist::Normal {
+            mu: 0.0,
+            sigma: 1.0,
+        },
+        Dist::LogNormal {
+            mu: 0.0,
+            sigma: 1.0,
+        },
+        Dist::Gamma {
+            mean: 2.0,
+            shape: 3.0,
+        },
+        Dist::Poisson { rate: 4.0 },
+        Dist::NegativeBinomial {
+            mean: 4.0,
+            size: 2.0,
+        },
+    ];
+    for dist in dists {
+        for word in [0, u64::MAX] {
+            let s = dist.sample(&mut ConstRng(word));
+            assert!(s.is_finite(), "{dist:?} word={word:#x}: {s}");
+        }
+    }
+}
+
+/// The count CDFs at `+∞` (and so at `quantile(1)`) are one, not `NaN`.
+#[test]
+fn count_cdfs_are_one_at_infinity() {
+    for dist in [
+        Dist::Poisson { rate: 3.5 },
+        Dist::NegativeBinomial {
+            mean: 4.0,
+            size: 1.5,
+        },
+    ] {
+        assert_eq!(dist.cdf(f64::INFINITY), 1.0, "{dist:?}");
+        assert_eq!(dist.cdf(dist.quantile(1.0)), 1.0, "{dist:?}");
+    }
+}
+
+/// A Gamma quantile far in the lower tail: the start was floored at `1e-3`
+/// and 100 Halley steps stopped at `1.9e-51` (CDF `1.9e-102`). For shape 2,
+/// `P(2, x) = x²/2 (1 + O(x))`, so the quantile is `√2 · 1e-150`.
+#[test]
+fn gamma_quantiles_reach_the_deep_lower_tail() {
+    let dist = Dist::Gamma {
+        mean: 2.0,
+        shape: 2.0,
+    };
+    let q = dist.quantile(1e-300);
+    assert!(close(q, 1.414_213_562_373_095e-150, 1e-12, 0.0), "{q}");
+    assert!(close(dist.cdf(q), 1e-300, 1e-11, 0.0), "{}", dist.cdf(q));
+}

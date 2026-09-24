@@ -63,7 +63,11 @@
 //!   `Σ_k P(Y > k)/(r + k)²`, summed from the probability mass function
 //!   until the upper tail falls below `1e-12` (at most 100 000 terms, then
 //!   closed with a geometric-tail estimate; the terms below
-//!   `m - 12·sd` use `P(Y > k) = 1` and the trigamma difference).
+//!   `m - 12·sd` use `P(Y > k) = 1` and the trigamma difference). When 24
+//!   standard deviations span more than 50 000 values, the equivalent
+//!   `ψ'(r) - 1/r - E[ψ'(r + Y) - 1/(r + Y) + (Y - m)²/((r + m)²(r + Y))]`
+//!   is summed instead over blocks of values, the same blocks as the count
+//!   CRPS.
 //!
 //! # Intercepts
 //!
@@ -125,8 +129,8 @@ use crate::config::{DistGradient, DistSplitDirection};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use special::{
-    beta_inc, digamma_minus_log, gamma_p, gamma_q, ln_gamma, norm_cdf, norm_pdf, norm_ppf,
-    trigamma_minus_inv,
+    beta_inc, digamma_minus_log, gamma_p, gamma_prefactor, gamma_q, ln_gamma, ln_gamma_prefactor,
+    ln_gamma_ratio, log_gap, norm_cdf, norm_pdf, norm_ppf, trigamma_minus_inv,
 };
 
 /// Bound on log-link margins: `ln` of a positive parameter is clamped to
@@ -261,10 +265,7 @@ impl DistFamily {
             DistFamily::Gamma => {
                 let (m, a) = (p[0], p[1]);
                 let t = y / m;
-                [
-                    a * (1.0 - t),
-                    a * (digamma_minus_log(a) + shifted_log_gap(t)),
-                ]
+                [a * (1.0 - t), a * (digamma_minus_log(a) + log_gap(t))]
             }
             DistFamily::Poisson => [p[0] - y, 0.0],
             DistFamily::NegativeBinomial => {
@@ -302,7 +303,7 @@ impl DistFamily {
             DistFamily::Gamma => {
                 let (m, a) = (p[0], p[1]);
                 let t = y / m;
-                let g2 = a * (digamma_minus_log(a) + shifted_log_gap(t));
+                let g2 = a * (digamma_minus_log(a) + log_gap(t));
                 let h12 = a * (1.0 - t);
                 [[a * t, h12], [h12, g2 + a * a * trigamma_minus_inv(a)]]
             }
@@ -373,12 +374,6 @@ impl DistFamily {
     }
 }
 
-/// `t - 1 - ln t` without cancellation near `t = 1`.
-fn shifted_log_gap(t: f64) -> f64 {
-    let u = t - 1.0;
-    u - u.ln_1p()
-}
-
 fn normal_gradient(mu: f64, sigma: f64, y: f64) -> [f64; 2] {
     let z = (y - mu) / sigma;
     [-z / sigma, 1.0 - z * z]
@@ -392,17 +387,31 @@ fn normal_hessian(sigma: f64, z: f64) -> [[f64; 2]; 2] {
 /// `D = ψ(y + r) - ψ(r) + ln(r/(r + m)) + (m - y)/(r + m)`, the negated
 /// derivative of the negative-binomial NLL in `r`, written as
 /// `[dml(y + r) - dml(r)] + [ln(1 + u) - u]` with `u = (y - m)/(r + m)` and
-/// `dml(x) = ψ(x) - ln x` so it keeps its precision as `r` grows.
+/// `dml(x) = ψ(x) - ln x` so it keeps its precision as `r` grows. Where
+/// `u` approaches `-1` (a count far below a large mean), `ln(1 + u)` is
+/// taken as `ln((r + y)/(r + m))`: `1 + u` rounds to zero there.
 fn nb_size_score(m: f64, r: f64, y: f64) -> f64 {
     let u = (y - m) / (r + m);
-    (digamma_minus_log(y + r) - digamma_minus_log(r)) + (u.ln_1p() - u)
+    let ln_ratio = if u < -0.5 {
+        ((r + y) / (r + m)).ln()
+    } else {
+        u.ln_1p()
+    };
+    (digamma_minus_log(y + r) - digamma_minus_log(r)) + (ln_ratio - u)
 }
 
 /// Fisher information of the negative-binomial size `r` (natural scale):
 /// `E[ψ'(r) - ψ'(Y + r)] - m/(r(r + m))`, the expectation summed as
 /// `Σ_k P(Y > k)/(r + k)²` (see the module docs for the truncation).
+/// Supports wider than the unit-step budget take
+/// [`nb_size_fisher_blocked`] instead, so the sum always spans the
+/// probability-bearing region.
 fn nb_size_fisher(m: f64, r: f64) -> f64 {
     let dist = Dist::NegativeBinomial { mean: m, size: r };
+    let h_max = count_block_width(dist.std_dev());
+    if h_max > 1.0 {
+        return nb_size_fisher_blocked(dist, h_max);
+    }
     let mut walk = CountWalk::new(dist);
     // Terms below the walk's start have P(Y > k) = 1: their sum is
     // ψ'(r) - ψ'(r + k0).
@@ -431,6 +440,39 @@ fn nb_size_fisher(m: f64, r: f64) -> f64 {
         }
     }
     sum - m / (r * (r + m))
+}
+
+/// [`nb_size_fisher`] over [`CountBlocks`] of width up to `h_max`, as
+/// `[ψ'(r) - 1/r] - E[ψ'(r + Y) - 1/(r + Y) + (Y - m)²/((r + m)²(r + Y))]`:
+/// the same quantity with `1/(r + m) - 1/(r + Y)` split into its
+/// zero-mean first-order part (dropped, `E[Y] = m`) and a positive
+/// remainder, so the block approximation of the masses only perturbs
+/// second-order terms. Each block contributes its mass times the summand
+/// at its centre, with `(Y - m)²` averaged over the block's values.
+fn nb_size_fisher_blocked(dist: Dist, h_max: f64) -> f64 {
+    let Dist::NegativeBinomial { mean: m, size: r } = dist else {
+        unreachable!("nb_size_fisher_blocked on another family")
+    };
+    let start = (m - COUNT_HEAD_SDS * dist.std_dev()).floor().max(0.0);
+    let s2 = (r + m) * (r + m);
+    let mut blocks = CountBlocks::new(dist, start, h_max);
+    let (mut mass, mut expectation) = (0.0f64, 0.0f64);
+    for _ in 0..MAX_COUNT_TERMS {
+        let b = blocks.step();
+        let c = b.k + 0.5 * (b.h - 1.0);
+        let spread = (c - m) * (c - m) + (b.h * b.h - 1.0) / 12.0;
+        expectation += b.mass * (trigamma_minus_inv(r + c) + spread / (s2 * (r + c)));
+        mass += b.mass;
+        let tail = if b.next_ratio < 1.0 {
+            b.mass * b.next_ratio / (1.0 - b.next_ratio)
+        } else {
+            f64::INFINITY
+        };
+        if b.k + b.h > m && tail < COUNT_TAIL * mass {
+            break;
+        }
+    }
+    trigamma_minus_inv(r) - expectation / mass
 }
 
 /// Gamma shape MLE: the root of `ln a - ψ(a) = s` (`s = ln ȳ - mean(ln y)`
@@ -664,8 +706,9 @@ impl Dist {
                 if y <= 0.0 {
                     return f64::NEG_INFINITY;
                 }
-                let rate = shape / mean;
-                shape * rate.ln() - ln_gamma(shape) + (shape - 1.0) * y.ln() - rate * y
+                // The density is the incomplete-gamma prefactor at `rate·y`
+                // over `y`, stable for large shapes.
+                ln_gamma_prefactor(shape, shape * y / mean) - y.ln()
             }
             Dist::Poisson { rate } => {
                 if y < 0.0 {
@@ -681,7 +724,8 @@ impl Dist {
                 let ln_p = -(mean / size).ln_1p();
                 let ln_q = mean.ln() - (size + mean).ln();
                 let term = if y == 0.0 { 0.0 } else { y * ln_q };
-                ln_gamma(y + size) - ln_gamma(size) - ln_gamma(y + 1.0) + size * ln_p + term
+                // `ln Γ(y + r) - ln Γ(r)` without cancellation at large `r`.
+                ln_gamma_ratio(size, y) - ln_gamma(y + 1.0) + size * ln_p + term
             }
         }
     }
@@ -707,6 +751,8 @@ impl Dist {
             Dist::Poisson { rate } => {
                 if y < 0.0 {
                     0.0
+                } else if y == f64::INFINITY {
+                    1.0
                 } else {
                     gamma_q(y.floor() + 1.0, rate)
                 }
@@ -714,6 +760,8 @@ impl Dist {
             Dist::NegativeBinomial { mean, size } => {
                 if y < 0.0 {
                     0.0
+                } else if y == f64::INFINITY {
+                    1.0
                 } else {
                     let s = size + mean;
                     beta_inc(size, y.floor() + 1.0, size / s, mean / s)
@@ -752,10 +800,10 @@ impl Dist {
     /// (Scheuerer & Möller, 2015). The count families sum the integral over
     /// the unit steps of their CDF (on each `[k, k + 1)` the integrand is
     /// constant, split at a non-integer `y`), from 12 standard deviations
-    /// below the mean until the upper tail is below `1e-12`; supports wider
-    /// than 50 000 steps are summed in equal blocks of steps. The remaining
-    /// geometric tail, and every step between the support and a `y` far
-    /// outside it, are added in closed form.
+    /// below the mean until the upper tail is below `1e-12`, in blocks of
+    /// values once the support is wider than 50 000
+    /// steps. The remaining geometric tail, and every step between the
+    /// support and a `y` far outside it, are added in closed form.
     pub fn crps(&self, y: f64) -> f64 {
         match *self {
             Dist::Normal { mu, sigma } => {
@@ -763,25 +811,25 @@ impl Dist {
                 sigma * (z * (2.0 * norm_cdf(z) - 1.0) + 2.0 * norm_pdf(z) - FRAC_1_SQRT_PI)
             }
             Dist::LogNormal { mu, sigma } => {
-                let scale = (mu + 0.5 * sigma * sigma).exp();
-                let half = 2.0 * norm_cdf(sigma * std::f64::consts::FRAC_1_SQRT_2) - 1.0;
+                // `e^{mu + sigma²/2} Φ(t)` in log space, so a large scale
+                // meets its small tail probability without over- or
+                // underflow, and no near-one probability is subtracted.
+                let ln_scale = mu + 0.5 * sigma * sigma;
+                let scaled = |t: f64| (ln_scale + norm_cdf(t).ln()).exp();
+                // E[X] - E|X - X'|/2 = 2 e^{mu + sigma²/2} Φ(-sigma/√2), the
+                // complement of `2Φ(sigma/√2) - 1` taken directly.
+                let spread_tail = scaled(-sigma * std::f64::consts::FRAC_1_SQRT_2);
                 if y <= 0.0 {
                     // E|X - y| - E|X - X'|/2 with X > 0 > y.
-                    return scale - y - scale * half;
+                    return 2.0 * spread_tail - y;
                 }
                 let w = (y.ln() - mu) / sigma;
-                y * (2.0 * norm_cdf(w) - 1.0)
-                    - 2.0
-                        * scale
-                        * (norm_cdf(w - sigma) + norm_cdf(sigma * std::f64::consts::FRAC_1_SQRT_2)
-                            - 1.0)
+                y * (2.0 * norm_cdf(w) - 1.0) + 2.0 * (spread_tail - scaled(w - sigma))
             }
             Dist::Gamma { mean, shape } => {
                 let rate = shape / mean;
                 // 1 / B(1/2, a) = Γ(a + 1/2) / (Γ(1/2) Γ(a)).
-                let inv_beta =
-                    (ln_gamma(shape + 0.5) - ln_gamma(shape) - 0.5 * std::f64::consts::PI.ln())
-                        .exp();
+                let inv_beta = (ln_gamma_ratio(shape, 0.5) - 0.5 * std::f64::consts::PI.ln()).exp();
                 let (f_a, f_a1) = if y <= 0.0 {
                     (0.0, 0.0)
                 } else {
@@ -794,10 +842,11 @@ impl Dist {
     }
 
     /// Draw one value by inverse-CDF sampling, `quantile(u)` with `u`
-    /// uniform on `(0, 1)` from 53 random bits of `rng`, so a seeded RNG
-    /// gives a reproducible stream.
+    /// uniform on `(0, 1)` from 52 random bits of `rng` (the midpoints
+    /// `(j + 1/2)/2^52`, all exactly representable, so `u` never rounds to
+    /// `1`), so a seeded RNG gives a reproducible stream.
     pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
-        let u = ((rng.next_u64() >> 11) as f64 + 0.5) * (1.0 / (1u64 << 53) as f64);
+        let u = ((rng.next_u64() >> 12) as f64 + 0.5) * (1.0 / (1u64 << 52) as f64);
         self.quantile(u)
     }
 
@@ -868,33 +917,31 @@ impl Dist {
     /// Step-sum CRPS of a count distribution (see [`Self::crps`]).
     ///
     /// `F` is constant on each `[k, k + 1)`, so the integral is a sum over
-    /// unit steps. It covers `[max(0, mean - 12 sd), end)` in blocks of `h`
-    /// steps (`h = 1` unless 24 standard deviations exceed half of
-    /// [`MAX_COUNT_TERMS`]; wider supports take the block mass at its centre
-    /// and `F` linear across the block), normalized by the total mass. Below
-    /// the start `F = 0`; from `end` on, `1 - F` decays geometrically at the
-    /// pmf ratio, summed in closed form up to and beyond `y` however far away
-    /// `y` lies.
+    /// unit steps. It covers `[max(0, mean - 12 sd), end)` in the
+    /// [`CountBlocks`] of [`count_block_width`] (single steps unless 24
+    /// standard deviations exceed half of [`MAX_COUNT_TERMS`]; wider blocks
+    /// take `F` linear across the block), normalized by the total mass.
+    /// Below the start `F = 0`; from `end` on, `1 - F` decays geometrically
+    /// at the pmf ratio, summed in closed form up to and beyond `y` however
+    /// far away `y` lies.
     fn count_crps(&self, y: f64) -> f64 {
         let (mean, sd) = self.count_moments();
         let start = (mean - COUNT_HEAD_SDS * sd).floor().max(0.0);
-        let h = (2.0 * COUNT_HEAD_SDS * sd / (MAX_COUNT_TERMS / 2) as f64)
-            .ceil()
-            .max(1.0);
+        let h_max = count_block_width(sd);
         // Pass 1: the number of blocks and the total mass (with the
         // geometric estimate of the mass beyond the last block).
-        let mut blocks = CountBlocks::new(*self, start, h);
+        let mut blocks = CountBlocks::new(*self, start, h_max);
         let (mut n_blocks, mut mass, mut rest) = (0usize, 0.0f64, 0.0f64);
         loop {
-            let (k, m, next_ratio) = blocks.step();
-            mass += m;
+            let b = blocks.step();
+            mass += b.mass;
             n_blocks += 1;
-            let tail = if next_ratio < 1.0 {
-                m * next_ratio / (1.0 - next_ratio)
+            let tail = if b.next_ratio < 1.0 {
+                b.mass * b.next_ratio / (1.0 - b.next_ratio)
             } else {
                 f64::INFINITY
             };
-            let past_mean = k + h > mean;
+            let past_mean = b.k + b.h > mean;
             if (past_mean && tail < COUNT_TAIL * mass) || n_blocks >= MAX_COUNT_TERMS {
                 if tail.is_finite() {
                     rest = tail;
@@ -906,14 +953,14 @@ impl Dist {
         // Below `start` F = 0: the integrand is 1 on `[y, start)`.
         let mut total = (start - y).max(0.0);
         // Pass 2: the blocks again, with the normalized CDF.
-        let mut blocks = CountBlocks::new(*self, start, h);
+        let mut blocks = CountBlocks::new(*self, start, h_max);
         let mut cum = 0.0f64;
         for _ in 0..n_blocks {
-            let (k, m, _) = blocks.step();
+            let b = blocks.step();
             let before = cum / total_mass;
-            cum += m;
+            cum += b.mass;
             let after = (cum / total_mass).min(1.0);
-            total += block_crps(k, h, before, after, y);
+            total += block_crps(b.k, b.h, before, after, y);
         }
         let end = blocks.k;
         let upper = (rest / total_mass).clamp(0.0, 1.0);
@@ -922,39 +969,87 @@ impl Dist {
     }
 }
 
-/// Blocks of `h` consecutive values of a count distribution from `start`
-/// upward, with their probability masses: exact for `h = 1` (the pmf
-/// recursion), otherwise `h` times the pmf at the block centre, stepped by
-/// the midpoint rule on the log pmf ratio (smooth on the scale of a
-/// standard deviation, which spans many blocks).
+/// Widest block of the count sums for a distribution with standard
+/// deviation `sd`: `1` (single values) unless 24 standard deviations
+/// exceed half of [`MAX_COUNT_TERMS`], else the width that fits them.
+fn count_block_width(sd: f64) -> f64 {
+    (2.0 * COUNT_HEAD_SDS * sd / (MAX_COUNT_TERMS / 2) as f64)
+        .ceil()
+        .max(1.0)
+}
+
+/// Relative width of the [`CountBlocks`] below their widest: a block at
+/// `k` spans at most `(k + 1) / 1000` values.
+const BLOCK_GROWTH: f64 = 1e-3;
+
+/// One block of [`CountBlocks`].
+struct CountBlock {
+    /// First value.
+    k: f64,
+    /// Number of values.
+    h: f64,
+    /// Probability mass.
+    mass: f64,
+    /// Mass of the next block over this one.
+    next_ratio: f64,
+}
+
+/// Blocks of consecutive values of a count distribution from `start`
+/// upward, with their probability masses. A block at `k` spans
+/// `min(h_max, max(1, ⌊(k + 1)/1000⌋))` values: single values in the head,
+/// where a skewed distribution (size below one) is sharp and its mass
+/// concentrates, then widths growing in proportion to `k`, so the log pmf
+/// (whose curvature there is of order `1/k²`) stays nearly linear across
+/// every block. Single values are exact (the pmf recursion); a wider
+/// block's mass is its width times the pmf at its centre, the centres
+/// stepped by the midpoint rule on the log pmf ratio.
 struct CountBlocks {
     dist: Dist,
-    h: f64,
+    h_max: f64,
     /// First value of the next block.
     k: f64,
+    /// Width of the next block.
+    h: f64,
     /// `ln P(Y = c)` at the next block's centre `c = k + (h - 1)/2`.
     ln_center: f64,
 }
 
 impl CountBlocks {
-    fn new(dist: Dist, start: f64, h: f64) -> Self {
+    fn new(dist: Dist, start: f64, h_max: f64) -> Self {
+        let h = Self::width(h_max, start);
         CountBlocks {
             dist,
-            h,
+            h_max,
             k: start,
+            h,
             ln_center: dist.count_ln_pmf(start + 0.5 * (h - 1.0)),
         }
     }
 
-    /// Visit the next block: `(first value, mass, next mass / this mass)`.
-    fn step(&mut self) -> (f64, f64, f64) {
+    /// Width of the block starting at `k`.
+    fn width(h_max: f64, k: f64) -> f64 {
+        (BLOCK_GROWTH * (k + 1.0)).floor().clamp(1.0, h_max)
+    }
+
+    /// Visit the next block.
+    fn step(&mut self) -> CountBlock {
         let (k, h) = (self.k, self.h);
         let mass = h * self.ln_center.exp();
-        // ln P(c + h) - ln P(c) = Σ_{t < h} ln ratio(c + t), by the midpoint.
-        let ln_step = h * self.dist.count_ratio(k + h - 1.0).ln();
+        let next_h = Self::width(self.h_max, k + h);
+        // The next centre lies `d` values on:
+        // ln P(c + d) - ln P(c) = Σ_{t < d} ln ratio(c + t), by the midpoint.
+        let d = f64::midpoint(h, next_h);
+        let c = k + 0.5 * (h - 1.0);
+        let ln_step = d * self.dist.count_ratio(c + 0.5 * (d - 1.0)).ln();
         self.ln_center += ln_step;
         self.k += h;
-        (k, mass, ln_step.exp())
+        self.h = next_h;
+        CountBlock {
+            k,
+            h,
+            mass,
+            next_ratio: next_h / h * ln_step.exp(),
+        }
     }
 }
 
@@ -1052,7 +1147,10 @@ impl CountWalk {
 }
 
 /// Quantile of the unit-scale Gamma(`a`, 1): Halley iterations on
-/// `P(a, x) = p` from the *Numerical Recipes* (`invgammp`) start.
+/// `P(a, x) = p` from the *Numerical Recipes* (`invgammp`) start, which in
+/// the deep lower tail (where its Wilson–Hilferty start fails) is the
+/// small-`x` asymptote `P(a, x) ≈ x^a / Γ(a + 1)`, a lower bound of the
+/// quantile. Should Halley not converge, a log-space bisection finishes.
 fn gamma_unit_quantile(a: f64, p: f64) -> f64 {
     if p <= 0.0 {
         return 0.0;
@@ -1060,14 +1158,7 @@ fn gamma_unit_quantile(a: f64, p: f64) -> f64 {
     if p >= 1.0 {
         return f64::INFINITY;
     }
-    let gln = ln_gamma(a);
     let a1 = a - 1.0;
-    let (lna1, afac) = if a > 1.0 {
-        let lna1 = a1.ln();
-        (lna1, (a1 * (lna1 - 1.0) - gln).exp())
-    } else {
-        (0.0, 0.0)
-    };
     let mut x = if a > 1.0 {
         let pp = if p < 0.5 { p } else { 1.0 - p };
         let t = (-2.0 * pp.ln()).sqrt();
@@ -1075,7 +1166,17 @@ fn gamma_unit_quantile(a: f64, p: f64) -> f64 {
         if p < 0.5 {
             z = -z;
         }
-        (a * (1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt())).powi(3)).max(1e-3)
+        let wilson_hilferty = a * (1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt())).powi(3);
+        if p < 0.5 {
+            let asymptote = ((p.ln() + ln_gamma(a + 1.0)) / a).exp();
+            if wilson_hilferty > 1e-3 {
+                wilson_hilferty.max(asymptote)
+            } else {
+                asymptote
+            }
+        } else {
+            wilson_hilferty.max(1e-3)
+        }
     } else {
         let t = 1.0 - a * (0.253 + a * 0.12);
         if p < t {
@@ -1084,35 +1185,63 @@ fn gamma_unit_quantile(a: f64, p: f64) -> f64 {
             1.0 - (1.0 - (p - t) / (1.0 - t)).ln()
         }
     };
+    // Residual on the smaller tail for precision; increasing in `x`.
+    let residual = |x: f64| {
+        if p < 0.5 {
+            gamma_p(a, x) - p
+        } else {
+            (1.0 - p) - gamma_q(a, x)
+        }
+    };
     for _ in 0..100 {
         if x <= 0.0 {
             return 0.0;
         }
-        // Residual on the smaller tail for precision.
-        let err = if p < 0.5 {
-            gamma_p(a, x) - p
-        } else {
-            (1.0 - p) - gamma_q(a, x)
-        };
-        let density = if a > 1.0 {
-            afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
-        } else {
-            (-x + a1 * x.ln() - gln).exp()
-        };
-        if density == 0.0 {
+        let density = gamma_prefactor(a, x) / x;
+        if density == 0.0 || !density.is_finite() {
             break;
         }
-        let u = err / density;
+        let u = residual(x) / density;
         let t = u / (1.0 - 0.5 * (u * (a1 / x - 1.0)).min(1.0));
         x -= t;
         if x <= 0.0 {
             x = f64::midpoint(x, t);
         }
         if t.abs() < 1e-15 * x {
-            break;
+            return x;
         }
     }
-    x
+    bisect_quantile(x, residual)
+}
+
+/// The root of the increasing `residual`: a bracket grown by halving and
+/// doubling from `x`, then bisection of `ln x` to adjacent floats.
+fn bisect_quantile(x: f64, residual: impl Fn(f64) -> f64) -> f64 {
+    let (mut lo, mut hi) = (x.max(f64::MIN_POSITIVE), x.max(f64::MIN_POSITIVE));
+    while residual(lo) > 0.0 {
+        lo *= 0.5;
+        if lo == 0.0 {
+            return 0.0;
+        }
+    }
+    while residual(hi) < 0.0 {
+        hi *= 2.0;
+        if hi == f64::INFINITY {
+            return hi;
+        }
+    }
+    for _ in 0..200 {
+        let mid = f64::midpoint(lo.ln(), hi.ln()).exp();
+        if !(lo < mid && mid < hi) {
+            break;
+        }
+        if residual(mid) < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
 }
 
 /// A `dist:*` objective: the negative log-likelihood of a [`DistFamily`],

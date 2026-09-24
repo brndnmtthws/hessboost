@@ -9,10 +9,10 @@ use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::learner::continuation::{require_model_for_update, resume_model};
-use crate::learner::model::{BoostedModel, ModelSpec};
+use crate::learner::model::{BoostedModel, ModelSpec, check_objective_width};
 use crate::learner::multi_output;
 use crate::learner::refresh::refresh_tree;
-use crate::learner::sampling::gradient_based_sample;
+use crate::learner::sampling::{GradientSample, gradient_based_sample};
 use crate::metric::create_metrics;
 use crate::objective::{GradPair, create_objective};
 use crate::tree::RegTree;
@@ -31,8 +31,10 @@ enum Prepared {
     Hist(GHistIndex),
     /// `tree_method=approx`: Hessian-weighted cuts. XGBoost regenerates them
     /// every round from a sorted-column summary unless the objective has a
-    /// constant Hessian, in which case the round-0 streaming sketch is built
-    /// once and reused (`BatchParam::regen = !const_hess`).
+    /// constant Hessian, in which case the first tree's streaming sketch (of
+    /// its sampled Hessians) is built once and reused (`BatchParam::regen =
+    /// !const_hess`); continued training replays it
+    /// ([`Prepared::resume_approx_cache`]).
     Approx {
         const_hess: bool,
         cached: std::sync::OnceLock<GHistIndex>,
@@ -67,16 +69,7 @@ impl Prepared {
                 .build(cols, dtrain, gpair, rows, sampler),
             Prepared::Hist(ghist) => hist(ghist, reuse.as_deref(), sampler),
             Prepared::Approx { const_hess, cached } => {
-                let bin = || {
-                    let hessians: Vec<f32> = gpair.iter().map(|g| g.hess).collect();
-                    let cuts = HistCuts::from_dmatrix_weighted(
-                        dtrain,
-                        params.max_bin,
-                        &hessians,
-                        !const_hess,
-                    );
-                    GHistIndex::from_dmatrix(dtrain, cuts)
-                };
+                let bin = || approx_index(params, dtrain, gpair, *const_hess);
                 if *const_hess {
                     hist(cached.get_or_init(bin), reuse.as_deref(), sampler)
                 } else {
@@ -89,6 +82,76 @@ impl Prepared {
         }
         tree
     }
+
+    /// Whether one row sample serves every parallel tree of an output: XGBoost
+    /// 3.4.2's `GlobalApproxUpdater::Update` samples once before its tree loop
+    /// and grows the whole forest from those gradients and sketch Hessians,
+    /// whereas the hist and exact updaters sample each tree.
+    fn samples_per_forest(&self) -> bool {
+        matches!(self, Prepared::Approx { .. })
+    }
+
+    /// Continued training: seed the constant-Hessian `approx` cache with the
+    /// cuts an uninterrupted run holds. That run cached the cuts of its first
+    /// tree (iteration 0, output 0), whose Hessians gradient-based sampling
+    /// zeroes or rescales, so they depend on that tree's sample; XGBoost
+    /// keeps them in the training matrix's gradient-index cache, which a
+    /// continuation on the same matrix reuses. Replays iteration 0 from
+    /// `margin0` (the intercept margins): its gradients and its RNG draws up
+    /// to the first sample. Without gradient sampling every round's constant
+    /// Hessians agree, and the cache fills lazily as usual.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_approx_cache(
+        &self,
+        params: &TrainingParams,
+        dtrain: &DMatrix,
+        objective: &dyn crate::objective::Objective,
+        info: &MetaInfo,
+        margin0: &[f32],
+        gpair: &mut [GradPair],
+        gpair_k: &mut [GradPair],
+        n_out: usize,
+    ) {
+        let Prepared::Approx {
+            const_hess: true,
+            cached,
+        } = self
+        else {
+            return;
+        };
+        if !gradient_sampling(params) {
+            return;
+        }
+        // Iteration 0's draws before its first sample: a DART round first
+        // draws its skip variate (`select_dropout` over an empty ensemble
+        // draws nothing more), and `sample_rows` draws nothing under
+        // gradient sampling.
+        let mut rng = if params.booster == BoosterKind::Dart {
+            let mut rng = round_rng(params, 0, DART_SALT);
+            let _skip: f64 = rng.random();
+            rng
+        } else {
+            round_rng(params, 0, 0)
+        };
+        objective.gradient_info(margin0, info, gpair);
+        let g0 = gather_output(gpair, gpair_k, n_out, 0);
+        let sampled = gradient_based_sample(g0, 1, params.subsample, &mut rng);
+        let g0 = sampled.as_ref().map_or(g0, |s| s.gpair.as_slice());
+        cached.get_or_init(|| approx_index(params, dtrain, g0, true));
+    }
+}
+
+/// The `approx` gradient index of one tree: cuts weighted by `gpair`'s
+/// Hessians (a sorted-column summary unless the Hessian is constant).
+fn approx_index(
+    params: &TrainingParams,
+    dtrain: &DMatrix,
+    gpair: &[GradPair],
+    const_hess: bool,
+) -> GHistIndex {
+    let hessians: Vec<f32> = gpair.iter().map(|g| g.hess).collect();
+    let cuts = HistCuts::from_dmatrix_weighted(dtrain, params.max_bin, &hessians, !const_hess);
+    GHistIndex::from_dmatrix(dtrain, cuts)
 }
 
 /// Resolve `tree_method` (handling `Auto`) and prepare the matching builder
@@ -429,6 +492,23 @@ fn train_impl_inner(
     // configured string / `num_class`): a `reg:linear` alias is saved as
     // `reg:squarederror` like XGBoost does, and a custom objective's outputs
     // determine the tree layout even though `num_class` is 0.
+    BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)?;
+    // A built-in objective passed to `train_with_objective` is recorded by
+    // name with `params`' objective settings; refuse settings that would not
+    // rebuild it, since the saved model could not be loaded again.
+    check_objective_width(
+        objective.name(),
+        &ObjectiveParams::from_params(params),
+        params.num_class,
+        dtrain.n_targets(),
+        n_out,
+    )
+    .map_err(|e| {
+        HessboostError::invalid_param(
+            "objective",
+            format!("the training parameters do not describe the given objective: {e}"),
+        )
+    })?;
     let intercepts = || initial_intercepts(params, objective, &info, n_out);
     let mut model = if let Some(init) = init_model {
         resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?
@@ -535,6 +615,20 @@ fn train_impl_inner(
     let mut gpair = vec![GradPair::default(); n * n_out];
     // Per-output gradient buffer reused across classes (single-output aliases it).
     let mut gpair_k = vec![GradPair::default(); n];
+    if start_iteration > 0
+        && let RoundPlan::Grow(prepared) = &plan
+    {
+        prepared.resume_approx_cache(
+            params,
+            dtrain,
+            objective,
+            &info,
+            &model.margin_from_trees(dtrain, 0..0),
+            &mut gpair,
+            &mut gpair_k,
+            n_out,
+        );
+    }
     let mut history: Vec<RoundEval> = Vec::new();
 
     // Early-stopping bookkeeping.
@@ -622,18 +716,19 @@ fn train_impl_inner(
                 objective.gradient_info(&train_margin, &info, &mut gpair);
                 multi_output::reject_split_gradient(objective, iteration, &gpair)?;
 
-                // 2. Row subsampling is drawn once per parallel tree and shared
-                //    across that tree's per-output fits.
+                // 2. Uniform row subsets, drawn before the trees and shared
+                //    across the per-output fits.
                 let mut rng = round_rng(params, iteration, 0);
-                let row_subsets: Vec<Vec<u32>> = (0..parallel)
-                    .map(|_| sample_rows(n, params, &mut rng))
-                    .collect();
+                let row_subsets = iteration_row_subsets(n, params, prepared, &mut rng);
+                // An output's gradient-based sample, when its whole forest
+                // shares one.
+                let mut forest_sample = None;
 
                 // 3. `num_parallel_tree` trees per output from the same
                 //    gradients, output-major like XGBoost's layout.
                 for slot in 0..n_out * parallel {
                     let (k, p) = (slot / parallel, slot % parallel);
-                    let row_subset = &row_subsets[p];
+                    let row_subset = &row_subsets[p % row_subsets.len()];
                     // Retaining the final row partitions replaces a per-row tree
                     // traversal of the raw feature matrix with one sequential
                     // pass per leaf (constant leaves only).
@@ -672,8 +767,10 @@ fn train_impl_inner(
                                 &mut rng,
                                 n_out,
                                 k,
+                                p,
                                 iteration,
                                 row_subset,
+                                &mut forest_sample,
                                 n_features,
                                 reuse.as_mut(),
                             ),
@@ -906,12 +1003,11 @@ fn dart_round(
     objective.gradient_info(&margin_excl, info, gpair);
     multi_output::reject_split_gradient(objective, iteration, gpair)?;
 
-    // 3. Fit the new trees on those gradients: one row sample per parallel
-    //    tree, shared across outputs.
+    // 3. Fit the new trees on those gradients, from uniform row subsets
+    //    shared across outputs.
     let parallel = params.num_parallel_tree;
-    let row_subsets: Vec<Vec<u32>> = (0..parallel)
-        .map(|_| sample_rows(n, params, &mut rng))
-        .collect();
+    let row_subsets = iteration_row_subsets(n, params, prepared, &mut rng);
+    let mut forest_sample = None;
     let new_weight = dart_new_tree_weight(&drop_indices, params);
     for slot in 0..n_out * parallel {
         let (kk, p) = (slot / parallel, slot % parallel);
@@ -924,8 +1020,10 @@ fn dart_round(
             &mut rng,
             n_out,
             kk,
+            p,
             iteration,
-            &row_subsets[p],
+            &row_subsets[p % row_subsets.len()],
+            &mut forest_sample,
             n_features,
             reuse.as_deref_mut(),
         );
@@ -1022,13 +1120,15 @@ pub(super) fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> Std
     StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ salt)
 }
 
-/// Fit one tree for output `k` of a boosting iteration: gather that output's
-/// gradient slice, apply gradient-based row sampling when configured (per
-/// tree, as XGBoost does), derive its column sampler, build the tree, fit
-/// linear leaves when configured, and shrink its leaves by `eta /
-/// num_parallel_tree`. The caller owns the round RNG (already seeded and
-/// salted), the parallel tree's uniform row subset, and what happens to the
-/// tree (margin updates, contribution weight).
+/// Fit parallel tree `p` for output `k` of a boosting iteration: gather that
+/// output's gradient slice, apply gradient-based row sampling when configured
+/// (per tree, as XGBoost's hist updater does, or once per output forest
+/// under `approx`, kept in `forest_sample` by the forest's first tree for the
+/// rest), derive its column sampler, build the tree, fit linear leaves when
+/// configured, and shrink its leaves by `eta / num_parallel_tree`. The caller
+/// owns the round RNG (already seeded and salted), the tree's uniform row
+/// subset, and what happens to the tree (margin updates, contribution
+/// weight).
 #[allow(clippy::too_many_arguments)]
 fn fit_output_tree(
     params: &TrainingParams,
@@ -1039,18 +1139,27 @@ fn fit_output_tree(
     rng: &mut StdRng,
     n_out: usize,
     k: usize,
+    p: usize,
     iteration: usize,
     row_subset: &[u32],
+    forest_sample: &mut Option<GradientSample>,
     n_features: usize,
     reuse: Option<&mut ReuseSet>,
 ) -> RegTree {
     let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
-    let sampled = if gradient_sampling(params) {
-        gradient_based_sample(gk, 1, params.subsample, rng)
-    } else {
+    let own;
+    let sampled = if !gradient_sampling(params) {
         None
+    } else if prepared.samples_per_forest() {
+        if p == 0 {
+            *forest_sample = gradient_based_sample(gk, 1, params.subsample, rng);
+        }
+        forest_sample.as_ref()
+    } else {
+        own = gradient_based_sample(gk, 1, params.subsample, rng);
+        own.as_ref()
     };
-    let (gk, rows) = match &sampled {
+    let (gk, rows) = match sampled {
         Some(s) => (s.gpair.as_slice(), s.rows.as_slice()),
         None => (gk, row_subset),
     };
@@ -1081,8 +1190,8 @@ fn quantization_seed(params: &TrainingParams, rng: &mut StdRng) -> u64 {
 
 /// Bernoulli row subsampling (each row kept with probability `subsample`),
 /// matching XGBoost's default sampling method. Guarantees at least one row.
-/// Gradient-based sampling keeps every row here; it samples each tree's
-/// gradients in [`fit_output_tree`] instead.
+/// Gradient-based sampling keeps every row here; it samples the gradients in
+/// [`fit_output_tree`] instead.
 pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut StdRng) -> Vec<u32> {
     let subsample = params.subsample;
     if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
@@ -1095,6 +1204,24 @@ pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut StdRng) -
         rows.push(rng.random_range(0..n as u32));
     }
     rows
+}
+
+/// One iteration's uniform row subsets, drawn before its trees: one per
+/// parallel tree, or a single subset for the whole forest under `approx`
+/// ([`Prepared::samples_per_forest`]). Parallel tree `p` uses entry
+/// `p % len`, shared across its per-output fits.
+fn iteration_row_subsets(
+    n: usize,
+    params: &TrainingParams,
+    prepared: &Prepared,
+    rng: &mut StdRng,
+) -> Vec<Vec<u32>> {
+    let draws = if prepared.samples_per_forest() {
+        1
+    } else {
+        params.num_parallel_tree
+    };
+    (0..draws).map(|_| sample_rows(n, params, rng)).collect()
 }
 
 /// Whether trees are grown on gradient-based (MVS) row samples.

@@ -183,6 +183,18 @@ fn check_update(
              `use_quantized_grad`",
         ));
     }
+    // Refresh keeps every split and never searches for one, so options that
+    // only change the split search would silently have no effect.
+    if params.extra_trees
+        || params.toad_penalty_feature > 0.0
+        || params.toad_penalty_threshold > 0.0
+    {
+        return Err(HessboostError::invalid_param(
+            "process_type",
+            "`update` keeps the existing splits and does not support the split-search \
+             options `extra_trees`, `toad_penalty_feature`, or `toad_penalty_threshold`",
+        ));
+    }
     if num_boost_round > init.num_boost_rounds() {
         return Err(HessboostError::invalid_param(
             "num_boost_round",

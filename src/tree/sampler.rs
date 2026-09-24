@@ -15,9 +15,11 @@
 //! replacement. With [`DMatrix::with_feature_weights`] it is the
 //! Efraimidis–Spirakis weighted draw without replacement: every candidate
 //! feature gets the key `ln(u) / max(w, 1e-6)` with `u ~ U[0, 1)`, and the
-//! largest keys win. Zero weights are floored at `1e-6` exactly as in XGBoost,
-//! so a zero-weight feature always ranks below every positive-weight one and is
-//! only drawn when a stage needs more features than have positive weight.
+//! largest keys win. Weights below `1e-6`, zero included, are floored at
+//! `1e-6` exactly as in XGBoost (`kRtEps`), so a zero weight is an epsilon
+//! weight, not an exclusion: against a weight `w` a zero-weight feature still
+//! wins a single draw with probability about `1e-6 / (w + 1e-6)`, and it is
+//! exactly as likely as any other feature weighted below `1e-6`.
 //!
 //! Call granularity differs by builder: the histogram builder calls
 //! [`ColumnSampler::sample`] once per node, while the exact builder (as
@@ -225,7 +227,9 @@ mod tests {
             let s = ColumnSampler::new(5, Some(&weights), 0.2, 1.0, 1.0, seed);
             counts[s.tree[0] as usize] += 1;
         }
-        assert_eq!(counts[4], 0, "zero weight never beats a positive weight");
+        // The zero weight is an epsilon weight (win chance ~1e-7 per draw
+        // here), not an exclusion; these seeds never draw it.
+        assert_eq!(counts[4], 0, "an epsilon weight almost never wins");
         for (i, &count) in counts[..4].iter().enumerate() {
             let expected = f64::from(weights[i]) / 10.0;
             let freq = count as f64 / f64::from(trials as u32);
@@ -263,19 +267,40 @@ mod tests {
         assert!((freq(1) - light).abs() < 0.015, "light1 {}", freq(1));
     }
 
+    /// Zero weights are floored to the `1e-6` epsilon: against weights far
+    /// above it they practically never win (fixed seeds here), so a stage
+    /// larger than the positive-weight count fills from them.
     #[test]
-    fn zero_weight_features_fill_only_after_positive_ones() {
+    fn zero_weight_features_rarely_beat_large_weights() {
         // Two positive features, a stage of three: the third comes from the
         // zero-weight features.
         let weights = [0.0f32, 5.0, 0.0, 1.0, 0.0];
         for seed in 0..200 {
             let mut s = ColumnSampler::new(5, Some(&weights), 1.0, 0.4, 1.0, seed);
             let two = s.sample(0);
-            assert_eq!(two, vec![1, 3], "positive weights always win");
+            assert_eq!(two, vec![1, 3], "large weights win on these seeds");
             let mut s = ColumnSampler::new(5, Some(&weights), 0.6, 1.0, 1.0, seed);
             let three = s.sample(0);
             assert_eq!(three.len(), 3);
             assert!(three.contains(&1) && three.contains(&3));
         }
+    }
+
+    /// A zero weight is not an exclusion: it ties with a positive weight below
+    /// the `1e-6` floor, so both are drawn equally often and with the same
+    /// seeds as two zero weights.
+    #[test]
+    fn zero_and_below_epsilon_weights_are_drawn_alike() {
+        let trials = 4_000u64;
+        let mut zero_drawn = 0usize;
+        for seed in 0..trials {
+            let s = ColumnSampler::new(2, Some(&[0.0, 1e-8]), 0.5, 1.0, 1.0, seed);
+            let floored = ColumnSampler::new(2, Some(&[0.0, 0.0]), 0.5, 1.0, 1.0, seed);
+            assert_eq!(s.tree, floored.tree);
+            zero_drawn += usize::from(s.tree == [0]);
+        }
+        let freq = zero_drawn as f64 / trials as f64;
+        // Binomial standard error is ~0.008; allow ~5 sigma.
+        assert!((freq - 0.5).abs() < 0.04, "zero-weight frequency {freq}");
     }
 }

@@ -217,3 +217,29 @@ fn incompatible_configurations_are_rejected() {
         .build()
         .unwrap();
 }
+
+/// A tiny positive `path_smooth` approaches the unsmoothed tree instead of
+/// overflowing the `n / s` count ratio into a NaN gain that discards every
+/// split.
+#[test]
+fn vanishing_path_smoothing_approaches_the_unsmoothed_tree() {
+    let data = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
+        .unwrap()
+        .with_labels(&[-1.0, 1.0])
+        .unwrap();
+    let params = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .path_smooth(1e-308)
+        .lambda(0.0)
+        .eta(1.0)
+        .max_depth(1)
+        .min_child_weight(0.0)
+        .base_score(0.0)
+        .build()
+        .unwrap();
+    let preds = train(&params, &data, 1).unwrap().predict(&data).unwrap();
+    assert!(
+        (preds[0] + 1.0).abs() < 1e-6 && (preds[1] - 1.0).abs() < 1e-6,
+        "{preds:?}"
+    );
+}

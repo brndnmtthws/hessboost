@@ -112,7 +112,10 @@ impl<'a> SplitConformal<'a> {
         let mut scores: Vec<f64> = preds
             .iter()
             .zip(labels)
-            .map(|(&p, &y)| (f64::from(y) - f64::from(p)).abs())
+            .map(|(&p, &y)| {
+                let (y, p) = (f64::from(y), f64::from(p));
+                sub_round_up(y, p).max(sub_round_up(p, y))
+            })
             .collect();
         let half_width = conformal_quantile(&mut scores, alpha);
         Ok(SplitConformal {
@@ -142,7 +145,8 @@ impl<'a> SplitConformal<'a> {
     }
 
     /// The calibrated half-width `Q`: the `k`-th smallest absolute residual
-    /// with `k = ceil((n + 1)(1 - alpha))`, or `+∞` when `k > n`.
+    /// with `k = ceil((n + 1)(1 - alpha))`, or `+∞` when `k > n`. Residuals
+    /// are computed in `f64` and rounded up, never below the exact value.
     pub fn half_width(&self) -> f64 {
         self.half_width
     }
@@ -203,6 +207,20 @@ enum QuantileBand<'a> {
 }
 
 impl QuantileBand<'_> {
+    /// Check that the band can be evaluated on `data` (model kind, feature
+    /// count, prediction layout) without requiring finite bounds from a
+    /// `dist:*` model. Used when `Q = +∞`, where the band does not affect the
+    /// intervals and a tiny `alpha` puts the distribution quantiles at levels
+    /// that round to 0 or 1 (infinite bounds).
+    fn check(self, data: &DMatrix) -> Result<()> {
+        match self {
+            QuantileBand::Distribution { model, .. } => model.predict_distribution(data).map(drop),
+            QuantileBand::Pair { .. } | QuantileBand::Outputs { .. } => {
+                self.predict(data).map(drop)
+            }
+        }
+    }
+
     /// The raw `(q_lo, q_hi)` predictions for every row, validated finite.
     fn predict(self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
         match self {
@@ -328,7 +346,9 @@ impl<'a> ConformalizedQuantile<'a> {
     ///
     /// As [`Self::calibrate`], plus [`HessboostError::InvalidParameter`] if
     /// the model's objective is not a `dist:*` objective or a predicted
-    /// quantile is not finite.
+    /// quantile is not finite. Quantiles are not evaluated when `k > n`
+    /// (`Q = +∞`), so a tiny `alpha` yields `(-∞, +∞)` intervals rather than
+    /// an error.
     pub fn calibrate_distribution(
         model: &'a BoostedModel,
         calibration: &DMatrix,
@@ -346,16 +366,21 @@ impl<'a> ConformalizedQuantile<'a> {
     fn calibrate_band(band: QuantileBand<'a>, calibration: &DMatrix, alpha: f64) -> Result<Self> {
         validate_alpha(alpha)?;
         let labels = calibration_labels(calibration)?;
-        let raw = band.predict(calibration)?;
-        let mut scores: Vec<f64> = raw
-            .iter()
-            .zip(labels)
-            .map(|(&(lo, hi), &y)| {
-                let y = f64::from(y);
-                (f64::from(lo) - y).max(y - f64::from(hi))
-            })
-            .collect();
-        let correction = conformal_quantile(&mut scores, alpha);
+        let correction = if conformal_rank(labels.len(), alpha).is_none() {
+            band.check(calibration)?;
+            f64::INFINITY
+        } else {
+            let raw = band.predict(calibration)?;
+            let mut scores: Vec<f64> = raw
+                .iter()
+                .zip(labels)
+                .map(|(&(lo, hi), &y)| {
+                    let y = f64::from(y);
+                    sub_round_up(f64::from(lo), y).max(sub_round_up(y, f64::from(hi)))
+                })
+                .collect();
+            conformal_quantile(&mut scores, alpha)
+        };
         Ok(ConformalizedQuantile {
             band,
             alpha,
@@ -375,6 +400,10 @@ impl<'a> ConformalizedQuantile<'a> {
     /// [`HessboostError::DimensionMismatch`] on a feature-count mismatch and
     /// [`HessboostError::InvalidParameter`] if a prediction is not finite.
     pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
+        if self.correction == f64::INFINITY {
+            self.band.check(data)?;
+            return Ok(vec![(f32::NEG_INFINITY, f32::INFINITY); data.n_rows()]);
+        }
         Ok(self
             .band
             .predict(data)?
@@ -385,7 +414,8 @@ impl<'a> ConformalizedQuantile<'a> {
 
     /// The calibrated correction `Q`: the `k`-th smallest CQR score with
     /// `k = ceil((n + 1)(1 - alpha))`, or `+∞` when `k > n`. Negative when
-    /// the raw band over-covers the calibration set.
+    /// the raw band over-covers the calibration set. Score differences are
+    /// computed in `f64` and rounded up, never below the exact value.
     pub fn correction(&self) -> f64 {
         self.correction
     }
@@ -483,21 +513,43 @@ fn check_finite(preds: &[f32]) -> Result<()> {
     }
 }
 
-/// The `k`-th smallest score with `k = ceil((n + 1)(1 - alpha))`, or `+∞` when
-/// `k > n`. Reorders `scores`; `scores` must be non-empty and finite.
+/// The rank `k = ceil((n + 1)(1 - alpha))` of the conformal quantile among
+/// `n` scores, or `None` when `k > n` (the quantile is `+∞`).
 ///
 /// `k` is evaluated as `(n + 1) - floor((n + 1) * alpha)`, which equals the
 /// ceiling form exactly and avoids the rounding of `1 - alpha`.
-fn conformal_quantile(scores: &mut [f64], alpha: f64) -> f64 {
-    let n = scores.len();
+fn conformal_rank(n: usize, alpha: f64) -> Option<usize> {
     let n1 = n + 1;
     // `0 < alpha < 1` bounds the floor to `[0, n]`, so `1 <= k <= n + 1`.
     let k = n1 - ((n1 as f64) * alpha).floor() as usize;
-    if k > n {
+    (k <= n).then_some(k)
+}
+
+/// The `k`-th smallest score with `k` from [`conformal_rank`], or `+∞` when
+/// `k > n`. Reorders `scores`; `scores` must be non-empty and finite.
+fn conformal_quantile(scores: &mut [f64], alpha: f64) -> f64 {
+    let Some(k) = conformal_rank(scores.len(), alpha) else {
         return f64::INFINITY;
-    }
+    };
     let (_, kth, _) = scores.select_nth_unstable_by(k - 1, f64::total_cmp);
     *kth
+}
+
+/// An upper bound on the exact difference `a - b`: the rounded difference,
+/// raised by one ulp when rounding went down. Scores built from it are never
+/// below the exact ones, so an interval widened by their quantile contains
+/// every label whose rounded score is within it (`f64` subtraction of two
+/// `f32` values is not always exact, e.g. `1 - (-2^-80)`).
+///
+/// `a` and `b` must be finite and small enough for `a - b` not to overflow
+/// (true for values converted from `f32`), which makes the 2Sum error term
+/// exact.
+fn sub_round_up(a: f64, b: f64) -> f64 {
+    let s = a - b;
+    let bb = s - a;
+    // Exact `a - b - s` (Knuth's 2Sum on `a + (-b)`).
+    let err = (a - (s - bb)) + (-b - bb);
+    if err > 0.0 { s.next_up() } else { s }
 }
 
 /// `(lo - q, hi + q)` in `f64`, rounded outward to `f32`.
@@ -780,6 +832,69 @@ mod tests {
             widen(1.0, 2.0, f64::INFINITY),
             (f32::NEG_INFINITY, f32::INFINITY)
         );
+    }
+
+    #[test]
+    fn scores_are_rounded_up_so_the_quantile_row_stays_covered() {
+        // `1 - (-2^-80)` rounds to 1 in f64: with Q = 1 the interval [0, 2]
+        // excluded the only calibration label, whose score attains Q.
+        let y = -(2f32.powi(-80));
+        let cal = DMatrix::from_dense(&[0.0], 1, 1)
+            .unwrap()
+            .with_labels(&[y])
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("reg:squarederror")
+            .base_score(1.0)
+            .build()
+            .unwrap();
+        let model = train(&params, &cal, 0).unwrap();
+        assert_eq!(model.predict(&cal).unwrap(), [1.0]);
+        let covers = |(lo, hi): (f32, f32)| lo <= y && y <= hi;
+
+        let sc = SplitConformal::calibrate(&model, &cal, 0.5).unwrap();
+        assert!(sc.half_width() > 1.0);
+        assert!(covers(sc.predict_interval(&cal).unwrap()[0]));
+        let cqr = ConformalizedQuantile::calibrate(&model, &model, &cal, 0.5).unwrap();
+        assert!(cqr.correction() > 1.0);
+        assert!(covers(cqr.predict_interval(&cal).unwrap()[0]));
+
+        // Only a difference that rounded down is raised; exact ones are kept.
+        let tiny = f64::from(y);
+        assert_eq!(sub_round_up(1.0, tiny), 1.0f64.next_up());
+        assert_eq!(sub_round_up(tiny, 1.0), -1.0);
+        assert_eq!(sub_round_up(3.0, 0.5), 2.5);
+    }
+
+    #[test]
+    fn tiny_alpha_on_a_distribution_band_gives_infinite_intervals() {
+        // `1 - alpha / 2` rounds to 1 for alpha = 1e-20, where the normal
+        // quantile is +∞; with 9 rows k = 10 > n, so the documented result is
+        // an unbounded interval, not a non-finite-prediction error.
+        let train_set = hetero(300, &mut StdRng::seed_from_u64(17));
+        let params = TrainingParams::builder()
+            .objective("dist:normal")
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = train(&params, &train_set, 3).unwrap();
+        let cal = hetero(9, &mut StdRng::seed_from_u64(18));
+        let test = hetero(4, &mut StdRng::seed_from_u64(19));
+
+        let cqr = ConformalizedQuantile::calibrate_distribution(&model, &cal, 1e-20).unwrap();
+        assert_eq!(cqr.correction(), f64::INFINITY);
+        assert_eq!(
+            cqr.predict_interval(&test).unwrap(),
+            vec![(f32::NEG_INFINITY, f32::INFINITY); 4]
+        );
+        // The model and data are still validated without evaluating the band.
+        let point = point_model(&train_set);
+        assert!(ConformalizedQuantile::calibrate_distribution(&point, &cal, 1e-20).is_err());
+        let wide = DMatrix::from_dense(&[0.0; 3], 1, 3).unwrap();
+        assert!(matches!(
+            cqr.predict_interval(&wide),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
     }
 
     fn assert_invalid<T: std::fmt::Debug>(r: Result<T>, param: &str) {

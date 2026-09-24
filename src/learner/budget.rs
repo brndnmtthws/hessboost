@@ -29,14 +29,17 @@
 //!   both sides in every fold; the root splits whenever a positive-gain
 //!   split exists. Accepted splits are ranked by gain damped by fold-weight
 //!   stability. Nodes grow best-first by their own score `G²/(H + 10⁻⁸)`;
-//!   leaves use unregularized Newton weights `−G/(H + 10⁻⁸)` shrunk by `η`.
+//!   leaves use unregularized Newton weights `−G/(H + 10⁻⁸)`, clamped to
+//!   `±max_delta_step` for `count:poisson` (XGBoost's default `0.7`, as its
+//!   leaves are in regular training) and shrunk by `η`.
 //!   Missing values try both directions (each counted in every fold); a tree
 //!   holds at most 10 000 nodes.
 //! * **Stopping.** A tree with at most one split whose generalization score
 //!   is below `0.99` (and that did not stop on the loss target) counts as a
 //!   weak round; boosting stops after `stopping_rounds` weak rounds, right
 //!   after a tree whose root could not be split, after `stopping_rounds`
-//!   rounds without a lower training loss, or at the iteration cap.
+//!   rounds without a lower training loss, at the iteration cap, or before
+//!   a tree that would make the training loss non-finite (it is not added).
 //!   `stopping_rounds` defaults to `⌈3 · clamp(10^(0.5 (b − 1)⁺), 1, 6)⌉` (3
 //!   for `b ≤ 1`); the hard **iteration cap** is
 //!   `round(1000 · clamp(10^(0.35 (b − 1)⁺), 1, 4))` rounds (1000 for `b ≤ 1`,
@@ -54,14 +57,16 @@
 //! # Parameters
 //!
 //! Budget mode derives the learning rate, tree size, and round count itself.
-//! It reads `objective`, `num_class`, `base_score`, `max_bin`, `nthread`, the
-//! objective parameters (`scale_pos_weight`, `huber_slope`,
-//! `tweedie_variance_power`, and `max_delta_step` for `count:poisson`), and
-//! `missing`; every other [`TrainingParams`] field must keep its default, or
-//! training fails naming the fields. Supported objectives are the
-//! single-output ones with a pointwise loss: `reg:squarederror`,
-//! `reg:pseudohubererror`, `binary:logistic`, `reg:logistic`,
-//! `count:poisson`, `reg:gamma`, and `reg:tweedie`. Training is
+//! It reads `objective`, `num_class`, `base_score`, `max_bin`, `nthread`,
+//! `missing`, and the one objective parameter the trained objective consumes
+//! (`scale_pos_weight` for the logistic objectives, `huber_slope` for
+//! `reg:pseudohubererror`, `tweedie_variance_power` for `reg:tweedie`,
+//! `max_delta_step` for `count:poisson`); every other [`TrainingParams`]
+//! field must keep its default, or training fails naming the fields.
+//! Supported objectives are the single-output ones with a pointwise loss:
+//! `reg:squarederror`, `reg:pseudohubererror`, `binary:logistic`,
+//! `binary:logitraw`, `reg:logistic`, `count:poisson`, `reg:gamma`, and
+//! `reg:tweedie`. Training is
 //! deterministic (no random numbers are drawn) and independent of the thread
 //! count.
 
@@ -216,6 +221,9 @@ pub enum BudgetStop {
     NoImprovement,
     /// The iteration cap was reached.
     IterationLimit,
+    /// The next tree would have made the training loss non-finite (an
+    /// overflowing step); it was not added.
+    NonFiniteLoss,
 }
 
 /// The result of [`train_with_budget`].
@@ -262,20 +270,23 @@ pub fn train_with_budget(
 /// Refuse every [`TrainingParams`] field budget mode does not read (they are
 /// derived from the budget or have no budget-mode meaning), comparing the
 /// serialized configuration against the defaults so newly added fields are
-/// covered too.
+/// covered too. Of the objective parameters only the one the supported
+/// objective consumes may differ from its default.
 fn reject_tuned_params(params: &TrainingParams) -> Result<()> {
-    let objective = ObjectiveParams::from_params(params);
-    let mut reference = objective
-        .training_params(&params.objective, params.num_class)
+    let mut reference = TrainingParams::builder()
+        .objective(&params.objective)
+        .num_class(params.num_class)
         .build_unchecked();
-    // `training_params` fixes the effective `max_delta_step`; only
-    // `count:poisson` reads it (as its Hessian safeguard), elsewhere it is a
-    // tree parameter.
-    reference.max_delta_step = if params.objective == "count:poisson" {
-        params.max_delta_step
-    } else {
-        None
-    };
+    match params.objective.as_str() {
+        "binary:logistic" | "binary:logitraw" | "reg:logistic" => {
+            reference.scale_pos_weight = params.scale_pos_weight;
+        }
+        "reg:pseudohubererror" => reference.huber_slope = params.huber_slope,
+        "reg:tweedie" => reference.tweedie_variance_power = params.tweedie_variance_power,
+        // The Hessian safeguard and leaf-step bound of `count:poisson`.
+        "count:poisson" => reference.max_delta_step = params.max_delta_step,
+        _ => {}
+    }
     reference.base_score = params.base_score;
     reference.max_bin = params.max_bin;
     reference.nthread = params.nthread;
@@ -324,7 +335,6 @@ fn train_budget_inner(
             "set the sentinel when constructing DMatrix with from_dense_with_missing",
         ));
     }
-    reject_tuned_params(params)?;
     if dtrain.feature_weights().is_some() {
         return Err(HessboostError::invalid_param(
             "feature_weights",
@@ -346,6 +356,7 @@ fn train_budget_inner(
             ));
         }
     };
+    reject_tuned_params(params)?;
     let Some(labels) = dtrain.labels() else {
         return Err(HessboostError::EmptyDataset(
             "train_with_budget: dtrain has no labels",
@@ -399,7 +410,7 @@ fn train_budget_inner(
     let mut stop = BudgetStop::IterationLimit;
 
     for _ in 0..config.effective_iteration_limit() {
-        let target = (untargeted_rounds <= stopping_rounds + 1)
+        let target = (untargeted_rounds <= stopping_rounds.saturating_add(1))
             .then(|| config.target(initial_loss, previous_loss));
         objective.gradient_info(&margins, &info, &mut gpair);
         let row_decrement = |r: u32, delta: f32| {
@@ -413,6 +424,7 @@ fn train_budget_inner(
                 eta: eta as f32,
                 target_loss_decrement: target,
                 row_decrement: &row_decrement,
+                max_delta_step: params.effective_max_delta_step(),
             },
         );
         grown.apply(&mut margins);
@@ -437,6 +449,12 @@ fn train_budget_inner(
             *l = row_loss(r, margins[r]);
         }
         let current_loss = average(&loss);
+        if !current_loss.is_finite() {
+            // The step overflowed the loss (and would poison the next
+            // round's gradients): keep the model built so far.
+            stop = BudgetStop::NonFiniteLoss;
+            break;
+        }
         previous_loss = current_loss;
         if current_loss < best_loss {
             best_loss = current_loss;

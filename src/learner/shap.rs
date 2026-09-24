@@ -21,7 +21,12 @@
 //! Arithmetic follows upstream: the rule is generated in `f64` and stored as
 //! `f32`, the recurrence and all accumulation are `f32` in XGBoost's operation
 //! order, and each tree's cover-weighted expected value is summed in `f64` and
-//! rounded once. Summed over the ensemble the contributions satisfy
+//! rounded once (bottom-up for scalar trees, top-down over the leaf vectors
+//! for vector-leaf trees, as upstream). One deliberate deviation: when a
+//! repeated feature's basis update overflows `f32` before its old factor is
+//! divided out, that lane is redone in `f64`, so a representable basis stays
+//! finite where XGBoost's temporary overflows into `NaN` attributions.
+//! Summed over the ensemble the contributions satisfy
 //!
 //! ```text
 //! Σ_j contribs[j] + bias == margin(x)
@@ -254,6 +259,32 @@ fn root_mean_value(tree: &RegTree, nid: usize) -> f64 {
     }
     let right_part = right_mean * f64::from(tree.node(r).sum_hess);
     madd64(left_mean, f64::from(tree.node(l).sum_hess), right_part) / f64::from(node.sum_hess)
+}
+
+/// Adds `path_weight ×` the cover-weighted expected leaf vector of vector-leaf
+/// subtree `nid` to `out`, one value per output (XGBoost's
+/// `FillRootMeanValues`): top-down, each leaf's vector enters scaled by its
+/// path's product of cover fractions, in depth-first leaf order. A coverless
+/// split halves the path weight of both children.
+fn root_mean_values(tree: &RegTree, nid: usize, path_weight: f64, out: &mut [f64]) {
+    let node = tree.node(nid);
+    if node.is_leaf() {
+        for (o, &v) in out.iter_mut().zip(tree.leaf_vector(nid)) {
+            *o = madd64(path_weight, f64::from(v), *o);
+        }
+        return;
+    }
+    let (l, r) = xgboost_children(node);
+    if node.sum_hess == 0.0 {
+        root_mean_values(tree, l, path_weight * 0.5, out);
+        root_mean_values(tree, r, path_weight * 0.5, out);
+    } else {
+        let parent = f64::from(node.sum_hess);
+        let left = path_weight * f64::from(tree.node(l).sum_hess) / parent;
+        root_mean_values(tree, l, left, out);
+        let right = path_weight * f64::from(tree.node(r).sum_hess) / parent;
+        root_mean_values(tree, r, right, out);
+    }
 }
 
 impl ShapTree {
@@ -517,8 +548,17 @@ impl<F: Formulation> Walk<'_, F> {
         if seen {
             let alpha_old = p_old - 1.0;
             if alpha_old != 0.0 {
-                for (ci, &u) in c_child.iter_mut().zip(&rule.nodes) {
-                    *ci /= madd(alpha_old, u, 1.0);
+                for ((ci, &u), &c0) in c_child.iter_mut().zip(&rule.nodes).zip(c) {
+                    let old = madd(alpha_old, u, 1.0);
+                    *ci = if ci.is_finite() {
+                        *ci / old
+                    } else {
+                        // The f32 product overflowed before dividing out the
+                        // overwritten factor; the quotient may still be
+                        // finite, so redo this lane in f64.
+                        let enter = madd(alpha, u, 1.0);
+                        (f64::from(c0) * f64::from(enter) / f64::from(old)) as f32
+                    };
                 }
             }
         }
@@ -550,10 +590,11 @@ impl BoostedModel {
         let mut by_output = vec![Vec::new(); k];
         let mut weights = Vec::with_capacity(trees.len());
         let mut shap_trees = Vec::with_capacity(trees.len());
-        let mut push = |tree: &RegTree, c: usize, weight: f32| -> Result<()> {
+        let mut root_means = vec![0f64; k];
+        let mut push = |tree: &RegTree, c: usize, root_mean: f64, weight: f32| -> Result<()> {
             by_output[c].push(shap_trees.len());
             shap_trees.push(ShapTree::from_tree(tree)?);
-            sums[c] = madd64(root_mean_value(tree, 0), f64::from(weight), sums[c]);
+            sums[c] = madd64(root_mean, f64::from(weight), sums[c]);
             weights.push(weight);
             Ok(())
         };
@@ -562,12 +603,16 @@ impl BoostedModel {
             if tree.is_vector_leaf() {
                 // XGBoost walks a vector-leaf tree once per output with that
                 // output's leaf values over the shared covers (the Hessians
-                // summed across targets), with a root mean per output.
-                for c in 0..k {
-                    push(&tree.output_tree(c), c, weight)?;
+                // summed across targets). Its root means come from one
+                // top-down pass over the leaf vectors, whose rounding differs
+                // from the per-output bottom-up reduction.
+                root_means.fill(0.0);
+                root_mean_values(tree, 0, 1.0, &mut root_means);
+                for (c, &root_mean) in root_means.iter().enumerate() {
+                    push(&tree.output_tree(c), c, root_mean, weight)?;
                 }
             } else {
-                push(tree, self.tree_output(ti), weight)?;
+                push(tree, self.tree_output(ti), root_mean_value(tree, 0), weight)?;
             }
         }
         Ok(ShapForest {

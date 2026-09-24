@@ -313,9 +313,12 @@ pub(super) fn xgb_update(
 
 /// Sweep prefix partitions of categories ordered by gradient/Hessian ratio
 /// (XGBoost's sorted-partition strategy: the best subset is contiguous in
-/// that order) and record the best set-membership split in `best`. Prefix
-/// categories form the left set; every other present category — and missing
-/// — goes right. Callers supply the `(category, stats)` pairs from their own
+/// that order) and record the best set-membership split in `best`. Tied
+/// ratios keep ascending category order, as XGBoost's `std::stable_sort`
+/// over bin indices does, so the result never depends on the caller's
+/// ordering of `cats`. Prefix categories form the left set; every other
+/// present category — and missing — goes right. Callers supply the
+/// `(category, stats)` pairs from their own
 /// stat source (sorted-column map for exact search, histogram bins for
 /// histogram search) and keep their own empty-bin filtering. `penalty`
 /// (opt-in reuse penalties) is subtracted from each candidate's gain before
@@ -337,7 +340,8 @@ pub(super) fn sweep_categorical(
         return; // no interior partition
     }
     let ratio = |s: GradStats| s.grad / (s.hess + reg.lambda);
-    cats.sort_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)));
+    // Categories are distinct, so this is a total order.
+    cats.sort_unstable_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)).then(a.0.cmp(&b.0)));
 
     let mcw = reg.min_child_weight;
     let mut left = GradStats::default();
@@ -479,5 +483,62 @@ mod test_support {
             gpair.push(gp(-(target - 0.25), 1.0)); // pseudo-residual around mean
         }
         (DMatrix::from_dense(&x, n, 1).unwrap(), gpair)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Penalizes every left set except `{0, 2}`.
+    struct OnlyZeroTwo;
+
+    impl CategoricalPenalty for OnlyZeroTwo {
+        fn categorical_penalty(&self, _feature: u32, cats_left: &[u32]) -> f64 {
+            let mut set = cats_left.to_vec();
+            set.sort_unstable();
+            if set == [0, 2] { 0.0 } else { 10.0 }
+        }
+    }
+
+    /// Categories 0 and 1 tie on gradient/Hessian ratio; the penalized sweep
+    /// must break the tie by category id whatever order the caller supplies
+    /// (the exact builder's order comes from a `HashMap`).
+    #[test]
+    fn categorical_ties_sweep_in_category_order() {
+        let reg = RegParams {
+            lambda: 0.0,
+            alpha: 0.0,
+            max_delta_step: 0.0,
+            min_child_weight: 0.0,
+        };
+        let stats = |c: u32| {
+            let g = [1.0, 1.0, -2.0][c as usize];
+            (c, GradStats::new(g, 1.0))
+        };
+        let total = GradStats::new(0.0, 3.0);
+        let sweep = |order: [u32; 3]| {
+            let mut cats = order.map(stats);
+            let mut best = BestSplit::none();
+            sweep_categorical(
+                &mut best,
+                &mut cats,
+                total,
+                0.0,
+                Bounds::default(),
+                0,
+                false,
+                &reg,
+                0,
+                Some(&OnlyZeroTwo),
+            );
+            best
+        };
+        for order in [[0, 1, 2], [1, 0, 2], [2, 1, 0]] {
+            let best = sweep(order);
+            assert!(best.is_categorical, "order {order:?}");
+            assert_eq!(best.cat_left, [2, 0], "order {order:?}");
+            assert!((best.loss_chg - 1.5).abs() < 1e-9, "order {order:?}");
+        }
     }
 }

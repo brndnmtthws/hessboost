@@ -320,12 +320,13 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     ));
 }
 
-/// The refresh updater recomputes constant leaves from full-precision
-/// gradients only: a model with linear leaves, or a refresh configured with
-/// linear leaves, path smoothing, or quantized gradients, is refused instead
-/// of silently refreshing to a different model.
+/// The refresh updater keeps the splits and recomputes constant leaves from
+/// full-precision gradients only: a model with linear leaves, or a refresh
+/// configured with linear leaves, path smoothing, quantized gradients, or
+/// split-search options (`extra_trees`, reuse penalties), is refused instead
+/// of silently refreshing to a different model or ignoring the option.
 #[test]
-fn refresh_refuses_linear_leaves_path_smoothing_and_quantization() {
+fn refresh_refuses_options_it_cannot_apply() {
     let d = regression(300, 0.0);
     let refused = |params: &TrainingParams, model: &BoostedModel| {
         matches!(
@@ -348,6 +349,15 @@ fn refresh_refuses_linear_leaves_path_smoothing_and_quantization() {
         &update().use_quantized_grad(true).build().unwrap(),
         &plain
     ));
+    // Refresh keeps the existing splits, so split-search-only options would
+    // silently do nothing.
+    for params in [
+        update().extra_trees(true),
+        update().toad_penalty_feature(1.0),
+        update().toad_penalty_threshold(0.5),
+    ] {
+        assert!(refused(&params.build().unwrap(), &plain));
+    }
     assert!(train_continue(&update().build().unwrap(), &d, 2, &plain).is_ok());
 }
 

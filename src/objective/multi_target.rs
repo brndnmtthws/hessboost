@@ -117,7 +117,10 @@ impl Objective for MultiTarget {
         self.inner.probs_to_margins(scores);
     }
 
+    /// The dataset must carry this objective's label width: every cell of
+    /// the flattened metadata is paired with one output margin.
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        super::check_label_width(info, self.n_targets)?;
         let cell_weights = info.cell_weights();
         self.inner
             .validate_info(&Self::cells(info, cell_weights.as_deref()))
@@ -136,6 +139,7 @@ impl Objective for MultiTarget {
 mod tests {
     use super::*;
     use crate::config::TrainingParams;
+    use crate::error::HessboostError;
     use crate::objective::create_objective;
 
     fn objective(name: &str, n_targets: usize) -> Box<dyn Objective> {
@@ -216,5 +220,18 @@ mod tests {
             ..info
         };
         assert!(multi.validate_info(&info).is_ok());
+    }
+
+    /// A dataset whose label width differs from the wrapped target count is
+    /// refused before any gradient pairs predictions with labels.
+    #[test]
+    fn rejects_a_different_label_width() {
+        let multi = objective("reg:squarederror", 2);
+        let labels = [0.0, 1.0];
+        let single = MetaInfo::new(&labels, None, None);
+        assert!(matches!(
+            multi.validate_info(&single),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+        ));
     }
 }

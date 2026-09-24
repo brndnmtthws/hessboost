@@ -688,6 +688,30 @@ impl BoostedModel {
         }
     }
 
+    /// Check that training `num_parallel_tree` trees per output for
+    /// `n_outputs` outputs keeps the per-iteration tree count
+    /// (`n_outputs × num_parallel_tree`) within `usize`, so every
+    /// iteration-indexing product stays defined. The trainer calls it before
+    /// assembling the model, as the loader's structural checks do for saved
+    /// models.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::InvalidParameter`] (`num_parallel_tree`) when the
+    /// product overflows.
+    pub(crate) fn check_iteration_size(n_outputs: usize, num_parallel_tree: usize) -> Result<()> {
+        if n_outputs.checked_mul(num_parallel_tree).is_none() {
+            return Err(HessboostError::invalid_param(
+                "num_parallel_tree",
+                format!(
+                    "{num_parallel_tree} parallel trees for {n_outputs} outputs overflow the \
+                     trees per iteration"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// The output tree `t` contributes to (XGBoost `tree_info[t]`): `0` for
     /// every vector-leaf tree, whose leaves carry all outputs.
     #[inline]
@@ -1234,8 +1258,11 @@ pub(crate) fn rebuild_objective(
 /// produces the model's `n_outputs` outputs. Loaders call this before
 /// returning a model: the prediction transform of a multi-output objective
 /// works on `[row][output]` blocks of its own width, so a mismatched width
-/// would transform values of neighboring rows together. Objectives the crate
-/// cannot rebuild (custom objectives) predict margins and are not checked.
+/// would transform values of neighboring rows together. Only objectives the
+/// crate does not know by name (custom objectives) are skipped: they predict
+/// margins. A built-in objective that cannot be rebuilt from the stored
+/// configuration (e.g. a distribution with a label matrix) is a format error,
+/// since predicting without its transform would misreport every output.
 pub(crate) fn check_objective_width(
     objective: &str,
     params: &ObjectiveParams,
@@ -1250,7 +1277,13 @@ pub(crate) fn check_objective_width(
                 rebuilt.n_outputs()
             )))
         }
-        _ => Ok(()),
+        Ok(_)
+        | Err(HessboostError::Unknown {
+            kind: "objective", ..
+        }) => Ok(()),
+        Err(e) => Err(HessboostError::ModelFormat(format!(
+            "objective `{objective}` cannot be rebuilt from the stored configuration: {e}"
+        ))),
     }
 }
 
@@ -1673,6 +1706,7 @@ mod tests {
     use super::BoostedModel;
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
+    use crate::error::HessboostError;
     use crate::learner::train;
 
     fn small_model() -> (BoostedModel, DMatrix) {
@@ -1717,5 +1751,48 @@ mod tests {
         for (a, b) in before.iter().zip(&after) {
             assert!((a - b).abs() < 1e-6);
         }
+    }
+
+    /// A two-output forest of `2^63` parallel trees overflows the trees per
+    /// iteration: training refuses it as a parameter error instead of
+    /// overflowing (or dividing by zero) in its iteration arithmetic, even
+    /// for zero rounds.
+    #[test]
+    fn training_rejects_overflowing_iteration_size() {
+        let x = [0.0f32, 1.0, 2.0, 3.0];
+        let y = [0.0f32, 1.0, 1.0, 0.0, 2.0, 3.0, 3.0, 2.0];
+        let d = DMatrix::from_dense(&x, 4, 1)
+            .unwrap()
+            .with_label_matrix(&y, 2)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .num_parallel_tree(1usize << (usize::BITS - 1))
+            .build()
+            .unwrap();
+        for rounds in [0, 1] {
+            assert!(matches!(
+                train(&params, &d, rounds),
+                Err(HessboostError::InvalidParameter { name, .. }) if name == "num_parallel_tree"
+            ));
+        }
+    }
+
+    /// Only unknown (custom) objective names skip the objective check: a
+    /// built-in objective that cannot be rebuilt from the stored
+    /// configuration (here a single-target objective with two label columns)
+    /// is a format error, not a silently untransformed model.
+    #[test]
+    fn loading_propagates_invalid_builtin_objective() {
+        let (model, _) = small_model();
+        let mut value: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        value["n_targets"] = 2.into();
+        value["objective"] = "count:poisson".into();
+        assert!(matches!(
+            BoostedModel::from_json(&value.to_string()),
+            Err(HessboostError::ModelFormat(_))
+        ));
+        value["objective"] = "my:custom".into();
+        let custom = BoostedModel::from_json(&value.to_string()).unwrap();
+        assert_eq!(custom.objective(), "my:custom");
     }
 }

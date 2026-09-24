@@ -83,3 +83,82 @@ fn zero_cover_splits_average_their_children() {
         assert!((got - want).abs() < 1e-6, "{interactions:?}");
     }
 }
+
+/// A feature repeated down a path overwrites its probability: the basis is
+/// multiplied by the new factor and divided by the old one. With hot-child
+/// covers `1 → 2^-32 → 2^-64 → 2^-96` the third split's product exceeds
+/// `f32` before the division although the resulting basis is representable;
+/// computing it in that order turned every attribution into `NaN`.
+#[test]
+fn repeated_feature_basis_update_stays_finite() {
+    let node = |left: i32, right: i32, value: f32, hess: f64| {
+        format!(
+            r#"{{"split_feature": 0, "split_cond": 0.5, "default_left": true, "left": {left}, "right": {right}, "leaf_value": {value}, "sum_hess": {hess:e}, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}"#
+        )
+    };
+    let cover = |e: i32| 2f64.powi(-e);
+    // x0 < 0.5 three times reaches the only non-zero leaf.
+    let model_json = format!(
+        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}, {}, {}]}}], "base_score": [0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 1, "n_features": 1}}"#,
+        node(1, 2, 0.0, cover(0)),
+        node(3, 4, 0.0, cover(32)),
+        node(-1, -1, 0.0, cover(0)),
+        node(5, 6, 0.0, cover(64)),
+        node(-1, -1, 0.0, cover(32)),
+        node(-1, -1, 1.0, cover(96)),
+        node(-1, -1, 0.0, cover(64)),
+    );
+    let model = BoostedModel::from_json(&model_json).unwrap();
+    let row = DMatrix::from_dense(&[0.2f32], 1, 1).unwrap();
+    assert_eq!(model.predict_margin(&row).unwrap(), [1.0]);
+
+    // E[f] = 2^-96, so feature 0 carries the whole margin.
+    let bias = cover(96) as f32;
+    let contribs = model.predict_contribs(&row).unwrap();
+    assert_eq!(contribs[1], bias, "{contribs:?}");
+    assert!((contribs[0] - 1.0).abs() < 1e-6, "{contribs:?}");
+    let interactions = model.predict_interactions(&row).unwrap();
+    assert_eq!(interactions[3], bias, "{interactions:?}");
+    assert!((interactions[0] - 1.0).abs() < 1e-6, "{interactions:?}");
+    assert_eq!(interactions[1..3], [0.0, 0.0], "{interactions:?}");
+}
+
+/// XGBoost 3.4.2 takes a vector-leaf tree's expected values top-down
+/// (`FillRootMeanValues`): each leaf vector enters scaled by its path's cover
+/// fraction, in leaf order. For output 0, `x0 < 0.5 ? 2^60 : (x1 < 0.5 ?
+/// -2^60 : 1)` with covers 3 / 1, 2 / 1, 1 that sums `2^60/3 - 2^60/3 + 1/3`,
+/// so the bias is `1/3`; a per-output bottom-up reduction loses the `1` to
+/// `-2^60` in the right subtree and reports `0`.
+#[test]
+fn vector_leaf_bias_accumulates_leaves_top_down() {
+    let node = |feature: u32, left: i32, right: i32, hess: f32| {
+        format!(
+            r#"{{"split_feature": {feature}, "split_cond": 0.5, "default_left": true, "left": {left}, "right": {right}, "leaf_value": 0.0, "sum_hess": {hess}, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}"#
+        )
+    };
+    let huge = 2f64.powi(60);
+    let model_json = format!(
+        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}], "size_leaf_vector": 2, "leaf_vectors": [0.0, 0.0, {huge:e}, 0.0, 0.0, 0.0, {neg:e}, 0.0, 1.0, 0.0]}}], "base_score": [0.0, 0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 2, "n_targets": 2, "n_features": 2}}"#,
+        node(0, 1, 2, 3.0),
+        node(0, -1, -1, 1.0),
+        node(1, 3, 4, 2.0),
+        node(0, -1, -1, 1.0),
+        node(0, -1, -1, 1.0),
+        neg = -huge,
+    );
+    let model = BoostedModel::from_json(&model_json).unwrap();
+    let row = DMatrix::from_dense(&[0.7f32, 0.7], 1, 2).unwrap();
+    assert_eq!(model.predict_margin(&row).unwrap(), [1.0, 0.0]);
+
+    let third = (1.0f64 / 3.0) as f32;
+    // Per output: [x0, x1, bias].
+    let contribs = model.predict_contribs(&row).unwrap();
+    assert_eq!([contribs[2], contribs[5]], [third, 0.0], "{contribs:?}");
+    // Per output: a 3 × 3 matrix with the bias in its last cell.
+    let interactions = model.predict_interactions(&row).unwrap();
+    assert_eq!(
+        [interactions[8], interactions[17]],
+        [third, 0.0],
+        "{interactions:?}"
+    );
+}

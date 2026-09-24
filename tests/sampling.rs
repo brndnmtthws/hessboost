@@ -2,6 +2,7 @@
 //! `sampling_method=gradient_based` (XGBoost's CPU MVS sampler) and
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
+use hessboost::config::TrainingParamsBuilder;
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -154,10 +155,12 @@ fn gradient_based_sampling_tree_method_support() {
     assert!(train(&dart, &data, 3).is_ok());
 }
 
-/// A stage that keeps as many features as have positive weight never picks a
-/// zero-weight feature, for every tree method and sampling stage.
+/// Zero weights are epsilon weights (floored at 1e-6, as in XGBoost): against
+/// weights far above the floor they practically never win, so on these fixed
+/// seeds a stage that keeps as many features as have positive weight never
+/// splits on a zero-weight feature, for every tree method and sampling stage.
 #[test]
-fn zero_weight_features_are_never_split_on() {
+fn zero_weight_features_are_practically_never_split_on() {
     let data = dataset(800, 4)
         .with_feature_weights(&[0.0, 3.0, 0.0, 1.0])
         .unwrap();
@@ -282,4 +285,93 @@ fn weighted_column_sampling_is_seeded() {
     let a = predictions(&params(1), &data, 6);
     assert_eq!(a, predictions(&params(1), &data, 6));
     assert_ne!(a, predictions(&params(2), &data, 6));
+}
+
+/// Eight single-feature rows (`x` per `feature`) with labels
+/// `[0, 0, 0, 0, 1, 1, 1, 1]`.
+fn step_rows(feature: impl Fn(usize) -> f32) -> DMatrix {
+    let x: Vec<f32> = (0..8).map(feature).collect();
+    let y: Vec<f32> = (0..8).map(|i| if i < 4 { 0.0 } else { 1.0 }).collect();
+    DMatrix::from_dense(&x, 8, 1)
+        .unwrap()
+        .with_labels(&y)
+        .unwrap()
+}
+
+/// Unregularized unit-rate squared-error parameters from a zero margin.
+fn plain(method: TreeMethod, booster: BoosterKind) -> TrainingParamsBuilder {
+    TrainingParams::builder()
+        .tree_method(method)
+        .booster(booster)
+        .base_score(0.0)
+        .eta(1.0)
+        .lambda(0.0)
+        .min_child_weight(0.0)
+}
+
+/// XGBoost's approx updater samples once per output forest
+/// (`GlobalApproxUpdater::Update`), so on a constant feature every parallel
+/// tree of an iteration holds the same leaf; the hist updater samples each
+/// tree, so its forests' leaves differ.
+#[test]
+fn approx_parallel_trees_share_one_row_sample() {
+    let data = step_rows(|_| 0.0);
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+        for (sampling, subsample) in [
+            (SamplingMethod::GradientBased, 0.25),
+            (SamplingMethod::Uniform, 0.5),
+        ] {
+            let leaves = |method: TreeMethod| {
+                let params = plain(method, booster)
+                    .sampling_method(sampling)
+                    .subsample(subsample)
+                    .num_parallel_tree(4)
+                    .seed(13)
+                    .build()
+                    .unwrap();
+                let model = train(&params, &data, 3).unwrap();
+                let leaves: Vec<f32> = model.trees().iter().map(|t| t.node(0).leaf_value).collect();
+                assert_eq!(leaves.len(), 12);
+                leaves
+            };
+            let differs = |leaves: &[f32]| {
+                leaves
+                    .chunks(4)
+                    .any(|forest| forest.iter().any(|&v| v != forest[0]))
+            };
+            let approx = leaves(TreeMethod::Approx);
+            assert!(!differs(&approx), "{booster:?} {sampling:?}: {approx:?}");
+            let hist = leaves(TreeMethod::Hist);
+            assert!(differs(&hist), "{booster:?} {sampling:?}: {hist:?}");
+        }
+    }
+}
+
+/// Continuing `approx` training under gradient-based sampling reproduces the
+/// uninterrupted run: the constant-Hessian cuts an uninterrupted run caches
+/// from its first tree's sample are rebuilt on resume, not taken from the
+/// resumed round's sample.
+#[test]
+fn approx_gradient_sampling_continuation_matches_uninterrupted_training() {
+    let step = step_rows(|i| i as f32);
+    let wide = dataset(400, 3);
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+        for (data, depth, split) in [(&step, 1, [1, 1]), (&wide, 3, [2, 3])] {
+            let params = plain(TreeMethod::Approx, booster)
+                .sampling_method(SamplingMethod::GradientBased)
+                .subsample(0.25)
+                .max_depth(depth)
+                .seed(13)
+                .build()
+                .unwrap();
+            let full = train(&params, data, split[0] + split[1]).unwrap();
+            let head = train(&params, data, split[0]).unwrap();
+            let resumed = train_continue(&params, data, split[1], &head).unwrap();
+            assert_eq!(
+                full.predict(data).unwrap(),
+                resumed.predict(data).unwrap(),
+                "{booster:?} depth {depth}"
+            );
+        }
+    }
 }

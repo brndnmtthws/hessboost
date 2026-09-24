@@ -14,7 +14,8 @@ use crate::objective::{abs_label_order, aft_nloglik};
 /// Receives hazard ratios `exp(margin)` (the `survival:cox` evaluation
 /// transform) and the signed survival-time labels (negative = censored).
 /// Censored rows enter the risk sets only. Weights are ignored, as in
-/// XGBoost; a dataset without events yields a non-finite value.
+/// XGBoost; a dataset without events yields a non-finite value. The risk
+/// sets span one label per row, so label matrices are refused.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CoxNLogLik;
 
@@ -49,6 +50,12 @@ impl Metric for CoxNLogLik {
             }
         }
         out / num_events as f64
+    }
+
+    /// One signed survival time per row: flattening a label matrix would
+    /// pool independent targets into one risk set.
+    fn supports_label_matrix(&self) -> bool {
+        false
     }
 }
 
@@ -202,6 +209,27 @@ mod tests {
             want,
             max_relative = 1e-7
         );
+    }
+
+    /// Training refuses `cox-nloglik` on a label matrix instead of pooling
+    /// every target column into one risk set.
+    #[test]
+    fn cox_nloglik_refuses_label_matrix() {
+        use crate::prelude::{DMatrix, TrainingParams, train};
+
+        let x: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let two_targets = DMatrix::from_dense(&x, 4, 1)
+            .unwrap()
+            .with_label_matrix(&[1.0, 2.0, -3.0, 4.0, 2.0, 1.0, 3.0, -4.0], 2)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .eval_metric("cox-nloglik")
+            .build()
+            .unwrap();
+        assert!(matches!(
+            train(&params, &two_targets, 1),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "eval_metric"
+        ));
     }
 
     #[test]

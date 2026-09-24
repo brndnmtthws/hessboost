@@ -16,17 +16,20 @@
 //!   in `f32` with XGBoost's tie rule (lower feature index wins);
 //! - numeric splits enumerate a forward pass (missing right) and, when the
 //!   feature has missing values in the node, a backward pass (missing left);
-//! - categorical features use the partition search, with categories ordered
-//!   by the projection of their weight vector on the parent's
-//!   (`w_parent · w_category`) and at most `max_cat_threshold` (64, XGBoost's
-//!   default) categories on the enumerated side;
+//! - categorical features with fewer than `max_cat_to_onehot` (4, XGBoost's
+//!   default) categories enumerate one-hot splits (each category against the
+//!   rest, missing values on either side); larger ones use the partition
+//!   search, with categories ordered by the projection of their weight vector
+//!   on the parent's (`w_parent · w_category`) and at most `max_cat_threshold`
+//!   (64, XGBoost's default) categories on the enumerated side;
 //! - monotone constraints bound every target's weight; a child pair that
 //!   violates the direction takes the pooled weight of both children instead
 //!   of being rejected;
 //! - growth follows XGBoost's `Driver` (depth-wise levels in node order,
-//!   loss-guided by loss change with ties to the older node), and the child
-//!   with the smaller summed Hessian gets its histogram built, the sibling by
-//!   subtraction;
+//!   loss-guided by loss change with ties to the older node, both by
+//!   XGBoost's node ids, which categorical splits swap relative to the tree's
+//!   storage), and the child with the smaller summed Hessian gets its
+//!   histogram built, the sibling by subtraction;
 //! - with reduced (split) gradients, leaf weights are refit from the full
 //!   value gradients of each leaf's rows once the structure is fixed.
 //!
@@ -53,6 +56,10 @@ const RT_EPS: f32 = 1e-6;
 /// XGBoost's default `max_cat_threshold`: the most categories one side of a
 /// partition split enumerates.
 const MAX_CAT_THRESHOLD: usize = 64;
+
+/// XGBoost's default `max_cat_to_onehot`: categorical features with fewer
+/// categories enumerate one-hot splits instead of partitions.
+const MAX_CAT_TO_ONEHOT: usize = 4;
 
 /// XGBoost's `Driver` batch size: at most this many nodes of one depth-wise
 /// level are expanded together.
@@ -174,6 +181,10 @@ impl Candidate {
 /// A node awaiting expansion.
 struct Entry {
     nid: usize,
+    /// XGBoost's id of this node: `nid`, except that the children of a
+    /// categorical split trade ids (the tree stores XGBoost's right child
+    /// first). XGBoost's driver orders nodes by this id.
+    order: usize,
     depth: usize,
     rows: Vec<u32>,
     /// `[bin][target]` histogram (empty once no longer needed).
@@ -278,6 +289,7 @@ impl<'a> MultiTreeBuilder<'a> {
         let best = grow.evaluate(0, &root_hist, &features, None, rows.len());
         let mut queue = vec![Entry {
             nid: 0,
+            order: 0,
             depth: 0,
             rows: rows.to_vec(),
             hist: root_hist,
@@ -516,7 +528,11 @@ impl Grow<'_, '_> {
             return;
         }
         if cuts.is_categorical(f as usize) {
-            self.enumerate_partition(nid, hist, f, fs, fe, best);
+            if fe - fs < MAX_CAT_TO_ONEHOT {
+                self.enumerate_one_hot(nid, hist, f, fs, fe, best);
+            } else {
+                self.enumerate_partition(nid, hist, f, fs, fe, best);
+            }
         } else if self.enumerate_numeric(nid, hist, f, fs, fe, true, best) {
             self.enumerate_numeric(nid, hist, f, fs, fe, false, best);
         }
@@ -569,6 +585,54 @@ impl Grow<'_, '_> {
         }
         // XGBoost compares the forward sums with the node totals exactly.
         forward && acc.as_slice() != parent
+    }
+
+    /// XGBoost's vector `EnumerateOneHot`: every category alone on the right
+    /// child, first with missing values left (among the other categories),
+    /// then with missing values right (with the category).
+    fn enumerate_one_hot(
+        &self,
+        nid: usize,
+        hist: &[GradStats],
+        f: u32,
+        fs: usize,
+        fe: usize,
+        best: &mut Candidate,
+    ) {
+        let s = self.n_split();
+        let parent = self.node_stats(nid);
+        let parent_gain = self.gain[nid];
+        let dir = self.b.cons.dir(f as usize);
+        let cuts = self.ghist.cuts();
+        // Per-target missing statistics: the node total minus every bin.
+        let mut missing = parent.to_vec();
+        for (t, m) in missing.iter_mut().enumerate() {
+            let mut present = GradStats::default();
+            for i in fs..fe {
+                present.add(hist[i * s + t]);
+            }
+            *m = m.sub(present);
+        }
+        let mut left = vec![GradStats::default(); s];
+        let mut right = vec![GradStats::default(); s];
+        let mut local = Candidate::none();
+        for i in fs..fe {
+            let cat = || Loc::Cats(vec![cuts.cut_value(i) as u32]);
+            for missing_left in [true, false] {
+                for t in 0..s {
+                    right[t] = hist[i * s + t];
+                    if !missing_left {
+                        right[t].add(missing[t]);
+                    }
+                    left[t] = parent[t].sub(right[t]);
+                }
+                let loss = (self.split_gain(nid, dir, &left, &right) - parent_gain) as f32;
+                local.update(loss, f, missing_left, cat, &left, &right);
+            }
+        }
+        if local.is_categorical() {
+            best.merge(local);
+        }
     }
 
     /// XGBoost's vector partition search for a categorical feature.
@@ -785,8 +849,9 @@ impl Grow<'_, '_> {
 
     /// Children histograms (smaller summed Hessian built, sibling by
     /// subtraction) and split searches of one expanded node, as XGBoost's
-    /// `AssignNodes` + `BuildHistLeftRight` + `EvaluateSplits`. Returns the
-    /// children in tree-id order.
+    /// `AssignNodes` + `BuildHistLeftRight` + `EvaluateSplits`. `features`
+    /// are sampled in XGBoost's child order (left, then right); the children
+    /// are returned in the same order.
     fn children(&self, e: Expanded, features: [Vec<u32>; 2]) -> [Entry; 2] {
         let Expanded {
             entry,
@@ -812,13 +877,7 @@ impl Grow<'_, '_> {
             b.feature,
             self.b.interaction_sets.as_deref(),
         );
-        // `features` follow tree-id order; map them onto XGBoost's sides.
-        let [f_first, f_second] = features;
-        let (f_l, f_r) = if xl < xr {
-            (f_first, f_second)
-        } else {
-            (f_second, f_first)
-        };
+        let [f_l, f_r] = features;
         let n_rows = rows_l.len() + rows_r.len();
         let eval_l = || self.evaluate(xl, &hist_l, &f_l, allowed.as_ref(), rows_l.len());
         let eval_r = || self.evaluate(xr, &hist_r, &f_r, allowed.as_ref(), rows_r.len());
@@ -828,8 +887,12 @@ impl Grow<'_, '_> {
             (eval_l(), eval_r())
         };
         let depth = entry.depth + 1;
+        // Expansions run in XGBoost's order, so both trees give each
+        // expansion's children the same pair of consecutive ids, XGBoost's
+        // left child the smaller one.
         let left = Entry {
             nid: xl,
+            order: xl.min(xr),
             depth,
             rows: rows_l,
             hist: hist_l,
@@ -838,17 +901,14 @@ impl Grow<'_, '_> {
         };
         let right = Entry {
             nid: xr,
+            order: xl.max(xr),
             depth,
             rows: rows_r,
             hist: hist_r,
             best: best_r,
             allowed,
         };
-        if xl < xr {
-            [left, right]
-        } else {
-            [right, left]
-        }
+        [left, right]
     }
 
     /// XGBoost's `IsValidExpandEntry`.
@@ -877,7 +937,7 @@ impl Grow<'_, '_> {
             for (i, e) in queue.iter().enumerate().skip(1) {
                 let t = &queue[top];
                 if e.best.loss_chg > t.best.loss_chg
-                    || (e.best.loss_chg == t.best.loss_chg && e.nid < t.nid)
+                    || (e.best.loss_chg == t.best.loss_chg && e.order < t.order)
                 {
                     top = i;
                 }
@@ -890,9 +950,9 @@ impl Grow<'_, '_> {
             self.record_leaf(e.nid, e.rows);
             return Vec::new();
         }
-        // Depth-wise: the lowest node ids first, one level (and at most
-        // `MAX_NODE_BATCH` expandable nodes) at a time.
-        queue.sort_by_key(|e| std::cmp::Reverse(e.nid));
+        // Depth-wise: the lowest XGBoost node ids first, one level (and at
+        // most `MAX_NODE_BATCH` expandable nodes) at a time.
+        queue.sort_by_key(|e| std::cmp::Reverse(e.order));
         let level = queue[queue.len() - 1].depth;
         let mut result = Vec::new();
         while let Some(e) = queue.pop_if(|e| e.depth == level) {

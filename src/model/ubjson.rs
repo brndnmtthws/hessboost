@@ -427,6 +427,8 @@ impl<'a> Decoder<'a> {
         if is_object {
             let mut map = Map::new();
             let mut entry = |this: &mut Self| -> Result<()> {
+                // `N` no-ops may precede every key, counted or not.
+                this.skip_noops();
                 let key = this.string()?;
                 let member = match element_marker {
                     Some(ty) => this.value_of(ty, depth)?,
@@ -679,6 +681,16 @@ mod tests {
         // Typed object: every member shares the element type.
         assert_eq!(
             decode(b"{$d#U\x01U\x01k\x3f\x00\x00\x00").unwrap(),
+            json!({"k": 0.5})
+        );
+        // No-op padding before the keys of a counted object.
+        assert_eq!(decode(b"{#U\x01NU\x01kZ").unwrap(), json!({"k": null}));
+        assert_eq!(
+            decode(b"{#U\x02NU\x01aZNNU\x01bT").unwrap(),
+            json!({"a": null, "b": true})
+        );
+        assert_eq!(
+            decode(b"{$d#U\x01NU\x01k\x3f\x00\x00\x00").unwrap(),
             json!({"k": 0.5})
         );
         // `C` is an integer code, as in XGBoost's reader.

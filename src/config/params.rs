@@ -55,7 +55,8 @@ pub enum GrowPolicy {
     /// Symmetric (oblivious) trees, CatBoost-style: every level applies one
     /// shared split (feature, threshold, missing direction) chosen to maximize
     /// the summed gain over the level's nodes. Beyond XGBoost (opt-in). Needs
-    /// `tree_method = hist` or `approx`, numerical features only, `max_depth`
+    /// a tree booster (`gbtree` or `dart`), `tree_method = hist` or `approx`,
+    /// numerical features only, `max_depth`
     /// in `1..=`[`MAX_SYMMETRIC_DEPTH`], and `max_leaves = 0`. A node whose
     /// level split would violate `min_child_weight`, `gamma`, or a monotone
     /// constraint stays a leaf. The trees are ordinary [`RegTree`]s, so they
@@ -585,6 +586,11 @@ impl TrainingParams {
             "lossguide growth needs a bound: set max_leaves or max_depth > 0",
         )?;
         if self.grow_policy == GrowPolicy::Symmetric {
+            ensure(
+                "grow_policy",
+                self.booster != BoosterKind::GbLinear,
+                "`symmetric` growth needs a tree booster (`gbtree` or `dart`)",
+            )?;
             ensure(
                 "max_depth",
                 (1..=MAX_SYMMETRIC_DEPTH).contains(&self.max_depth),
@@ -1228,5 +1234,21 @@ mod tests {
         ));
         assert!(q().quant_train_renew_leaf(true).build().is_ok());
         assert!(q().path_smooth(1.0).build().is_ok());
+    }
+
+    /// The linear booster never grows trees, so symmetric growth would be
+    /// silently discarded.
+    #[test]
+    fn symmetric_growth_refuses_the_linear_booster() {
+        let sym = || {
+            TrainingParams::builder()
+                .grow_policy(GrowPolicy::Symmetric)
+                .max_depth(3)
+        };
+        assert!(matches!(
+            sym().booster(BoosterKind::GbLinear).build(),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "grow_policy"
+        ));
+        assert!(sym().booster(BoosterKind::Dart).build().is_ok());
     }
 }

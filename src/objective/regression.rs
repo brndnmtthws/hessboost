@@ -126,11 +126,14 @@ impl Objective for PseudoHuberObjective {
     }
 
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
-        // `δ² (√(1 + z²/δ²) − 1)`, whose derivatives are the gradient above.
+        // `δ² (√(1 + z²/δ²) − 1)`, whose derivatives are the gradient above,
+        // rationalized to `z² / (√(1 + z²/δ²) + 1)`: the subtraction would
+        // cancel to `0` once `z²/δ²` drops below the `f64` epsilon (e.g. a
+        // unit residual under a large slope), losing the quadratic regime.
         let slope_sq = f64::from(self.slope).powi(2);
         Some(Box::new(move |margin, label| {
             let z = f64::from(margin) - f64::from(label);
-            slope_sq * ((1.0 + z * z / slope_sq).sqrt() - 1.0)
+            z * z / ((1.0 + z * z / slope_sq).sqrt() + 1.0)
         }))
     }
 
@@ -276,6 +279,21 @@ mod tests {
             "Newton step {} should undershoot the mean",
             margins[0]
         );
+    }
+
+    /// The loss keeps its quadratic regime `z²/2` under a slope so large that
+    /// `1 + z²/δ²` rounds to `1`, and still matches `δ² (√(1 + z²/δ²) − 1)`
+    /// where that form is accurate.
+    #[test]
+    fn pseudo_huber_loss_survives_large_slopes() {
+        let obj = PseudoHuberObjective::new(1e9);
+        let loss = obj.pointwise_loss().unwrap();
+        assert!((loss(0.0, 1.0) - 0.5).abs() < 1e-12, "{}", loss(0.0, 1.0));
+
+        let obj = PseudoHuberObjective::new(2.0);
+        let loss = obj.pointwise_loss().unwrap();
+        let naive = 4.0 * ((1.0f64 + 9.0 / 4.0).sqrt() - 1.0);
+        assert!((loss(3.0, 0.0) - naive).abs() < 1e-12);
     }
 
     /// The squared-log gradient vanishes where `pred == label` and the

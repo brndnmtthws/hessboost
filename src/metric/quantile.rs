@@ -10,8 +10,9 @@ use crate::objective::validate_alphas;
 /// (row, alpha, target) cell of `preds` laid out `[row][alpha][target]`
 /// against `labels` laid out `[row][target]` (XGBoost's elementwise
 /// `Reduce`: row weights are repeated for every alpha and target). `NaN`
-/// when `preds` does not hold one value per label and alpha, the labels are
-/// not a whole number per row, or `weights` is not one per row.
+/// when there are no labels, `preds` does not hold one value per label and
+/// alpha, the labels are not a whole number per row, or `weights` is not
+/// one per row.
 fn alpha_average(
     alpha: &[f32],
     preds: &[f32],
@@ -21,6 +22,7 @@ fn alpha_average(
     loss: impl Fn(f32, f32, f32) -> f32,
 ) -> f64 {
     if n_rows == 0
+        || labels.is_empty()
         || !labels.len().is_multiple_of(n_rows)
         || labels.len().checked_mul(alpha.len()) != Some(preds.len())
         || weights.is_some_and(|w| w.len() != n_rows)
@@ -176,5 +178,24 @@ mod tests {
         // Over-prediction by 2 → 0.8·4; under-prediction by 1 → 0.2·1.
         let v = m.eval(&[2.0, -1.0], &[0.0, 0.0], None);
         assert!((v - 1.7).abs() < 1e-6, "{v}");
+    }
+
+    /// An unlabeled dataset with rows (zero inferred targets) evaluates to
+    /// NaN instead of panicking on a zero chunk size.
+    #[test]
+    fn empty_labels_evaluate_to_nan() {
+        let info = MetaInfo {
+            n_rows: 3,
+            labels: &[],
+            n_targets: 1,
+            weights: None,
+            group: None,
+            label_lower_bound: None,
+            label_upper_bound: None,
+        };
+        let q = QuantileError::new(&[0.5]).unwrap();
+        let e = ExpectileError::new(&[0.2, 0.8]).unwrap();
+        assert!(q.eval_info(&[], &info).is_nan());
+        assert!(e.eval_info(&[], &info).is_nan());
     }
 }

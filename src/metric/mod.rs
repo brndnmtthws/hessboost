@@ -745,6 +745,15 @@ pub fn create_metric(
         Some((b, r)) => (b, r.parse::<f64>().ok()),
         None => (name, None),
     };
+    // Rank cutoff `@k` of at least `min`. NaN would cast to a zero cutoff,
+    // infinity to `usize::MAX`, and a negative value saturate to zero.
+    let cutoff = |min: f64| match rho {
+        Some(k) if !k.is_finite() || k < min => Err(HessboostError::invalid_param(
+            "eval_metric",
+            format!("`{name}` needs a finite cutoff of at least {min}"),
+        )),
+        k => Ok(k.map(|k| k as usize)),
+    };
     match base {
         "rmse" => Ok(Box::new(Rmse)),
         "mae" => Ok(Box::new(Mae)),
@@ -763,8 +772,8 @@ pub fn create_metric(
         "tweedie-nloglik" => Ok(Box::new(TweedieNLogLik {
             rho: rho.unwrap_or(1.5),
         })),
-        "ndcg" => Ok(Box::new(Ndcg::new(rho.map(|r| r as usize)))),
-        "map" => Ok(Box::new(MeanAveragePrecision::new(rho.map(|r| r as usize)))),
+        "ndcg" => Ok(Box::new(Ndcg::new(cutoff(0.0)?))),
+        "map" => Ok(Box::new(MeanAveragePrecision::new(cutoff(0.0)?))),
         "rmsle" => Ok(Box::new(Rmsle)),
         "mape" => Ok(Box::new(Mape)),
         "mphe" => {
@@ -777,13 +786,7 @@ pub fn create_metric(
             }
             Ok(Box::new(PseudoHuberError::new(slope)))
         }
-        "pre" => match rho {
-            Some(k) if k < 1.0 => Err(HessboostError::invalid_param(
-                "eval_metric",
-                format!("`{name}` needs a cutoff of at least 1"),
-            )),
-            k => Ok(Box::new(Precision::new(name, k.map(|k| k as usize)))),
-        },
+        "pre" => Ok(Box::new(Precision::new(name, cutoff(1.0)?))),
         "quantile" => Ok(Box::new(QuantileError::new(&objective.quantile_alpha)?)),
         "expectile" => Ok(Box::new(ExpectileError::new(&objective.expectile_alpha)?)),
         "cox-nloglik" => Ok(Box::new(CoxNLogLik)),
@@ -961,12 +964,40 @@ mod tests {
             ("ndcg", false),
             ("map@5", false),
             ("pre@3", false),
+            ("cox-nloglik", false),
             ("aft-nloglik", false),
             ("interval-regression-accuracy", false),
         ] {
             let metric = create_metric(name, 3, &obj).unwrap();
             assert_eq!(metric.supports_label_matrix(), supported, "{name}");
         }
+    }
+
+    /// Rank cutoffs `@k` that are NaN, infinite, or below the metric's
+    /// minimum (1 for `pre`, 0 for `ndcg` / `map`) are refused instead of
+    /// casting to a zero (or saturated) `usize`.
+    #[test]
+    fn rank_metrics_reject_invalid_cutoffs() {
+        let obj = ObjectiveParams::default();
+        let mut names = vec!["pre@0".to_string(), "pre@0.5".to_string()];
+        for base in ["pre", "ndcg", "map"] {
+            for k in ["NaN", "nan", "inf", "-inf", "-1"] {
+                names.push(format!("{base}@{k}"));
+            }
+        }
+        for name in &names {
+            let err = create_metric(name, 0, &obj).err();
+            assert!(
+                matches!(err, Some(HessboostError::InvalidParameter { name: param, .. }) if param == "eval_metric"),
+                "{name}: {err:?}"
+            );
+        }
+        for name in ["pre@1", "ndcg@0", "ndcg@3", "map@0", "map@5"] {
+            assert!(create_metric(name, 0, &obj).is_ok(), "{name}");
+        }
+        let m = create_metric("pre@2", 0, &obj).unwrap();
+        // All labels zero: no hits at any cutoff.
+        assert_eq!(m.eval(&[0.9, 0.5, 0.1], &[0.0, 0.0, 0.0], None), 0.0);
     }
 
     /// Every metric declares the predictions per row it reads, and direct

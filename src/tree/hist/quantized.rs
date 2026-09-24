@@ -137,15 +137,22 @@ impl QuantizedGradients {
 
         let half = (bins / 2) as i32;
         let levels = bins as i32;
-        let grad_scale = if max_grad > 0.0 {
-            max_grad / half as f32
-        } else {
-            0.0
+        // The correctly rounded `f32` quotient, floored at the least positive
+        // `f32`: a nonzero maximum of at most `divisor · 2⁻¹⁵⁰` would otherwise
+        // underflow to a zero scale and erase every value. The floor only
+        // raises the scale, so the quantized values stay within their bound.
+        let scale_of = |max: f32, divisor: i32| {
+            if max > 0.0 {
+                (max / divisor as f32).max(f32::from_bits(1))
+            } else {
+                0.0
+            }
         };
+        let grad_scale = scale_of(max_grad, half);
         let hess_scale = if constant {
             first_hess
         } else {
-            max_hess / levels as f32
+            scale_of(max_hess, levels)
         };
         let inverse = |scale: f32| {
             if scale > 0.0 && scale.is_finite() {

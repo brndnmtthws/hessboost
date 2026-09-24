@@ -103,7 +103,8 @@
 //! through the objective's inverse link ([`Objective::probs_to_margins`]) and
 //! on **export** the margin row is mapped back with
 //! [`Objective::margins_to_probs`] (the forward transform, except for
-//! `binary:hinge`, whose threshold is not its link). Multiclass objectives
+//! `binary:hinge` and `reg:quantileerror`, whose transforms (threshold, sort)
+//! are not their links). Multiclass objectives
 //! (and any objective we cannot reconstruct) pass the values through
 //! unchanged, as XGBoost does: softmax's inverse link is the identity, while
 //! its forward transform normalizes across classes.
@@ -662,14 +663,26 @@ fn vector_tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
 /// The leaf vectors of an XGBoost `MultiTargetTree` bundle, laid out
 /// `[node][output]` (zeros for internal nodes): leaf `i`'s vector is
 /// `leaf_weights[right_children[i] * k..][..k]`. `k` has been checked
-/// against the model's outputs; the leaf weights must hold at least one
-/// vector before the `[node][output]` storage is allocated.
+/// against the model's outputs. The `[node][output]` storage is sized from
+/// the node count, so before allocating it the tree must have the node count
+/// of a binary tree over its leaves (`2 * leaves - 1`) and the leaf weights
+/// must hold a vector for every leaf: the storage is then smaller than twice
+/// the serialized leaf weights.
 fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Vec<f32>> {
     let leaf_weights = arr(tj, "leaf_weights", scalar_f64)
         .ok_or_else(|| HessboostError::missing_field("leaf_weights"))?;
-    if leaf_weights.len() < k {
+    let n_leaves = left.iter().filter(|&&l| l == -1).count();
+    if n_leaves.checked_mul(2) != left.len().checked_add(1) {
         return Err(HessboostError::model_format(format!(
-            "`leaf_weights` holds {} values, fewer than one leaf vector of width {k}",
+            "tree has {} nodes, but a binary tree with {n_leaves} leaves has {}",
+            left.len(),
+            (2 * n_leaves).saturating_sub(1)
+        )));
+    }
+    let n_vectors = leaf_weights.len() / k;
+    if n_vectors < n_leaves {
+        return Err(HessboostError::model_format(format!(
+            "`leaf_weights` holds {} values, fewer than {n_leaves} leaf vectors of width {k}",
             leaf_weights.len()
         )));
     }
@@ -677,14 +690,18 @@ fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Ve
         .len()
         .checked_mul(k)
         .ok_or_else(|| HessboostError::model_format("leaf vector storage overflows"))?;
-    let mut out = vec![0.0f32; len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        HessboostError::model_format(format!("cannot allocate {len} leaf vector values"))
+    })?;
+    out.resize(len, 0.0f32);
     for (i, (&l, &r)) in left.iter().zip(right).enumerate() {
         if l != -1 {
             continue;
         }
         let slot = usize::try_from(r)
             .ok()
-            .filter(|&slot| slot < leaf_weights.len() / k)
+            .filter(|&slot| slot < n_vectors)
             .ok_or_else(|| {
                 HessboostError::model_format(format!("leaf {i} has an invalid leaf index {r}"))
             })?;
@@ -778,11 +795,6 @@ fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
             }
         },
     };
-    let leaf_vectors = if size_leaf_vector > 1 {
-        vector_leaves(tj, &left, &right, size_leaf_vector)?
-    } else {
-        Vec::new()
-    };
 
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
@@ -829,6 +841,12 @@ fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
             });
         }
     }
+
+    let leaf_vectors = if size_leaf_vector > 1 {
+        vector_leaves(tj, &left, &right, size_leaf_vector)?
+    } else {
+        Vec::new()
+    };
 
     // Build RegTree through serde, flattening category lists in node order.
     let mut flat_categories: Vec<u32> = Vec::new();
@@ -1555,6 +1573,76 @@ mod tests {
                 "{width}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn vector_leaf_storage_is_bounded_by_the_leaf_weights() {
+        // 65,536 outputs over 65,535 nodes would expand to ~16 GiB of leaf
+        // storage, which used to be allocated (and filled) before the node
+        // graph and leaf mapping were checked.
+        const K: usize = 1 << 16;
+        const N: usize = K - 1;
+        let one_vector = vec![0.5f32; K];
+        let tree = |left: Vec<i64>, right: Vec<i64>, leaf_weights: &[f32]| {
+            json!({
+                "tree_param": {"num_nodes": N.to_string(), "num_feature": "1",
+                               "size_leaf_vector": K.to_string()},
+                "left_children": left,
+                "right_children": right,
+                "split_conditions": vec![0.0f32; N],
+                "leaf_weights": leaf_weights,
+            })
+        };
+        // Heap-shaped binary tree: internal node `i` has children
+        // `2i + 1, 2i + 2`; leaves are numbered in node order.
+        let internal = N / 2;
+        let heap_left: Vec<i64> = (0..N)
+            .map(|i| if i < internal { 2 * i as i64 + 1 } else { -1 })
+            .collect();
+        let heap_right: Vec<i64> = (0..N)
+            .map(|i| {
+                if i < internal {
+                    2 * i as i64 + 2
+                } else {
+                    (i - internal) as i64
+                }
+            })
+            .collect();
+        let cases = [
+            // Every node a leaf sharing the one serialized vector.
+            tree(vec![-1; N], vec![0; N], &one_vector),
+            // Binary-tree shape, but internal children out of range.
+            tree(
+                heap_left
+                    .iter()
+                    .map(|&l| if l < 0 { l } else { i64::from(i32::MAX) })
+                    .collect(),
+                heap_right.clone(),
+                &one_vector,
+            ),
+            // Valid graph, but one serialized vector for 32,768 leaves.
+            tree(heap_left.clone(), heap_right.clone(), &one_vector),
+        ];
+        for (case, tj) in cases.iter().enumerate() {
+            let err = tree_from_json(tj, K).unwrap_err();
+            assert!(
+                matches!(err, HessboostError::ModelFormat(_)),
+                "{case}: {err}"
+            );
+        }
+        // The same valid graph with a vector per leaf decodes, each leaf
+        // reading its own vector.
+        let k = 2;
+        let leaves = N - internal;
+        let weights: Vec<f32> = (0..leaves * k).map(|v| v as f32).collect();
+        let mut tj = tree(heap_left, heap_right, &weights);
+        tj["tree_param"]["size_leaf_vector"] = json!(k.to_string());
+        let decoded = tree_from_json(&tj, k).unwrap();
+        assert_eq!(decoded.leaf_vector(internal), [0.0, 1.0]);
+        assert_eq!(
+            decoded.leaf_vector(N - 1),
+            [(2 * leaves - 2) as f32, (2 * leaves - 1) as f32]
+        );
     }
 
     #[test]

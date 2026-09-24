@@ -310,6 +310,89 @@ fn iteration_limit_caps_the_rounds() {
     assert_eq!(result.stop, BudgetStop::IterationLimit);
 }
 
+/// An unbounded `stopping_rounds` override is valid: the target-round check
+/// must not overflow (it panicked, or wrapped and dropped the loss target).
+#[test]
+fn unbounded_stopping_rounds_override_trains() {
+    let data = regression(300, 16);
+    let config = BudgetConfig::new(0.5).iteration_limit(30);
+    let train = |rounds| {
+        let result = train_with_budget(
+            &params("reg:squarederror"),
+            &data,
+            &config.stopping_rounds(rounds),
+        )
+        .unwrap();
+        result.model.predict(&data).unwrap()
+    };
+    assert_eq!(train(usize::MAX), train(1 << 40));
+}
+
+/// A lone positive count among 999 zeros: unbounded Newton leaves stepped
+/// its margin by about `+157`, overflowing the next round's gradients and
+/// turning every prediction into NaN. The `max_delta_step` bound keeps the
+/// steps, and so the predictions, finite and moving toward the labels.
+#[test]
+fn poisson_leaf_steps_are_bounded() {
+    let n = 1000;
+    let mut x = vec![0.0f32; n];
+    x[n - 1] = 1.0;
+    let data = DMatrix::from_dense(&x, n, 1)
+        .unwrap()
+        .with_labels(&x)
+        .unwrap();
+    let result =
+        train_with_budget(&params("count:poisson"), &data, &BudgetConfig::new(0.5)).unwrap();
+    let preds = result.model.predict(&data).unwrap();
+    assert!(preds.iter().all(|p| p.is_finite()), "{:?}", result.stop);
+    assert!(preds[0] < 1e-3, "zero-count prediction {}", preds[0]);
+    assert!(
+        preds[n - 1] > 0.5,
+        "positive-count prediction {}",
+        preds[n - 1]
+    );
+}
+
+/// A tree whose step overflows the training loss is not appended: a lone
+/// `1e-30` Gamma label among ones gets a leaf of about `−3·10²⁹`, whose loss
+/// `y/μ` is infinite (and would turn the next gradients, and every
+/// prediction, into NaN).
+#[test]
+fn non_finite_steps_are_not_appended() {
+    let n = 1000;
+    let mut x = vec![0.0f32; n];
+    x[n - 1] = 1.0;
+    let mut y = vec![1.0f32; n];
+    y[n - 1] = 1e-30;
+    let data = DMatrix::from_dense(&x, n, 1)
+        .unwrap()
+        .with_labels(&y)
+        .unwrap();
+    let result = train_with_budget(&params("reg:gamma"), &data, &BudgetConfig::new(0.5)).unwrap();
+    assert_eq!(result.stop, BudgetStop::NonFiniteLoss);
+    let preds = result.model.predict(&data).unwrap();
+    assert!(preds.iter().all(|p| p.is_finite()));
+}
+
+/// Four rows leave no fold with rows on both sides, and the root gradient
+/// sums to zero, so every split's generalization ratio is `0/0`. That must
+/// not rank the first threshold above the rest: the perfect split is taken.
+#[test]
+fn undefined_root_generalization_keeps_the_best_split() {
+    let data = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1)
+        .unwrap()
+        .with_labels(&[0.0, 0.0, 1.0, 1.0])
+        .unwrap();
+    let result = train_with_budget(
+        &params("reg:squarederror"),
+        &data,
+        &BudgetConfig::default().iteration_limit(1),
+    )
+    .unwrap();
+    let p = result.model.predict(&data).unwrap();
+    assert!(p[0] == p[1] && p[2] == p[3] && p[1] < p[2], "{p:?}");
+}
+
 #[test]
 fn derived_or_unused_parameters_are_rejected_by_name() {
     let data = regression(200, 13);
@@ -336,6 +419,34 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
         .build()
         .unwrap();
     train_with_budget(&accepted, &binary(300, 14), &BudgetConfig::default()).unwrap();
+    let huber = TrainingParams::builder()
+        .objective("reg:pseudohubererror")
+        .huber_slope(2.0)
+        .build()
+        .unwrap();
+    train_with_budget(&huber, &data, &BudgetConfig::default()).unwrap();
+
+    // Parameters of other objectives are unused, so they are refused too.
+    let foreign = TrainingParams::builder()
+        .quantile_alpha(vec![0.3])
+        .expectile_alpha(vec![0.7])
+        .lambdarank_num_pair_per_sample(4)
+        .huber_slope(2.0)
+        .scale_pos_weight(3.0)
+        .build()
+        .unwrap();
+    let error = train_with_budget(&foreign, &data, &BudgetConfig::default())
+        .unwrap_err()
+        .to_string();
+    for name in [
+        "quantile_alpha",
+        "expectile_alpha",
+        "lambdarank_num_pair_per_sample",
+        "huber_slope",
+        "scale_pos_weight",
+    ] {
+        assert!(error.contains(&format!("`{name}`")), "{name}: {error}");
+    }
 }
 
 #[test]

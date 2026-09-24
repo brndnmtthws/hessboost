@@ -622,7 +622,10 @@ impl CompactModel {
             if code > 5 {
                 return Err(format_error("threshold width code exceeds 5"));
             }
-            let count = r.read_usize(widths.threshold_ref)? + 1;
+            let count = r
+                .read_usize(widths.threshold_ref)?
+                .checked_add(1)
+                .ok_or_else(|| format_error("dictionary size overflow"))?;
             if count > max_thresholds as usize {
                 return Err(format_error("dictionary larger than its declared maximum"));
             }
@@ -776,7 +779,37 @@ impl CompactModel {
                     check(self.slot(tree, i, false), i, nodes)?;
                 }
             }
+            Layout::Heap {
+                depth,
+                complete: true,
+            } => {
+                // Every internal slot is a split and every bottom slot a leaf,
+                // so all are reachable. A zero-width row decodes identically
+                // in every slot and costs no input bits, so one check covers
+                // it; this keeps validation work bounded by the input size.
+                let internal = (1u64 << depth) - 1;
+                let splits = if self.widths.split() == 0 {
+                    internal.min(1)
+                } else {
+                    internal
+                };
+                for i in 0..splits {
+                    check(self.slot(tree, i as u32, false), i as u32, 0)?;
+                }
+                let leaves = if self.widths.leaf_ref == 0 {
+                    1
+                } else {
+                    1u64 << depth
+                };
+                for j in 0..leaves {
+                    let i = (internal + j) as u32;
+                    check(self.slot(tree, i, true), i, 0)?;
+                }
+            }
             Layout::Heap { depth, .. } => {
+                // Flagged slots take at least one bit each, and every visited
+                // bottom slot is a child of a visited split, so this walk is
+                // bounded by the tree's encoded size.
                 let first_leaf = (1u64 << depth) - 1;
                 let mut stack = vec![0u64];
                 while let Some(i) = stack.pop() {
@@ -1832,6 +1865,65 @@ mod tests {
         });
         assert!(matches!(
             CompactModel::from_bytes(&widened),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
+
+    /// `n_trees` complete depth-24 heaps whose split and leaf references are
+    /// zero bits wide: each tree costs only its seven header bits, so the
+    /// whole model is a few KB although it names 2^25 slots per tree.
+    fn zero_width_heaps(n_trees: usize, n_leaves: u64) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        w.write(1, 32); // n_features
+        w.write(1, 32); // n_outputs
+        w.write_f32(0.5); // base score
+        w.write(n_trees as u64, 32);
+        w.write_bool(false); // no tree weights
+        w.write(u64::from(DEFAULT_ALL_LEFT), 2);
+        w.write(1, 32); // used features
+        w.write(1, 32); // max thresholds
+        w.write(n_leaves, 32);
+        w.write(5, 6); // heap depth bits
+        w.write(0, 6); // preorder node-count bits
+        w.write(u64::from(KIND_UINT), 2);
+        w.write(0, 3); // one-bit thresholds
+        w.write(1, 1); // threshold 1
+        for _ in 0..n_leaves {
+            w.write_f32(1.0);
+        }
+        for _ in 0..n_trees {
+            w.write_bool(false); // heap
+            w.write(24, 5);
+            w.write_bool(true); // complete
+        }
+        let meta = Meta {
+            objective: "reg:squarederror".to_string(),
+            objective_params: None,
+            num_class: 0,
+            n_targets: 1,
+            num_parallel_tree: 1,
+        };
+        let meta = postcard::to_stdvec(&meta).unwrap();
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(VERSION);
+        bytes.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&meta);
+        bytes.extend_from_slice(&w.bytes);
+        bytes
+    }
+
+    /// Validation work is bounded by the input: 4096 zero-width depth-24
+    /// heaps (under 4 KB) once cost 2^25 slot checks each.
+    #[test]
+    fn zero_width_heaps_validate_in_bounded_time() {
+        let bytes = zero_width_heaps(4096, 1);
+        assert!(bytes.len() < 4096);
+        let model = CompactModel::from_bytes(&bytes).unwrap();
+        let data = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
+        assert_eq!(model.predict_margin(&data).unwrap(), [4096.5]);
+        // The shared zero-width leaf reference is still range-checked.
+        assert!(matches!(
+            CompactModel::from_bytes(&zero_width_heaps(4096, 0)),
             Err(HessboostError::ModelFormat(_))
         ));
     }

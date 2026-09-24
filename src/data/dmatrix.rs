@@ -294,9 +294,12 @@ impl DMatrix {
     /// `colsample_bytree`/`bylevel`/`bynode` stage draws features without
     /// replacement with probability proportional to their weight (see
     /// [`ColumnSampler`](crate::tree::sampler::ColumnSampler)); with every
-    /// ratio at `1.0` they have no effect. A zero-weight feature ranks below
-    /// every positive-weight one and is drawn only when a stage needs more
-    /// features than have positive weight. Not stored in the model.
+    /// ratio at `1.0` they have no effect. Weights below `1e-6`, zero
+    /// included, are floored at `1e-6` as in XGBoost, so a zero weight is an
+    /// epsilon weight, not an exclusion: such a feature is rarely drawn
+    /// against much larger weights but can still be selected, and it is as
+    /// likely as any other feature weighted below `1e-6`. Not stored in the
+    /// model.
     pub fn with_feature_weights(mut self, weights: &[f32]) -> Result<Self> {
         check_len("feature_weights", weights.len(), self.n_cols)?;
         if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {

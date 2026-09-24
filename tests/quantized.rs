@@ -205,6 +205,28 @@ fn renewed_leaves_use_full_precision_gradients() {
     }
 }
 
+/// Subnormal gradients keep a nonzero quantized representation: rows whose
+/// weights sit at the least positive `f32` still learn the unit squared-error
+/// leaf `−G/H` from a zero margin, with constant and with varying Hessians.
+#[test]
+fn subnormal_gradients_survive_quantization() {
+    let tiny = f32::from_bits(1);
+    for weights in [[tiny, tiny], [tiny, 2.0 * tiny]] {
+        let d = dmatrix(&[0.0, 0.0], &[1.0, 1.0])
+            .with_weights(&weights)
+            .unwrap();
+        let params = quantized(TrainingParams::builder())
+            .base_score(0.0)
+            .eta(1.0)
+            .lambda(0.0)
+            .min_child_weight(0.0)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 1).unwrap();
+        assert_eq!(model.predict(&d).unwrap(), vec![1.0, 1.0], "{weights:?}");
+    }
+}
+
 #[test]
 fn quantized_parameters_are_validated() {
     let err = |builder: TrainingParamsBuilder| builder.build().unwrap_err().to_string();

@@ -27,6 +27,11 @@ use rayon::prelude::*;
 /// do not depend on the thread count.
 const REFRESH_BLOCK_ROWS: usize = 4096;
 
+/// Blocks accumulated concurrently per worker thread before they are reduced
+/// into the running total: bounds the buffered per-block node statistics to
+/// `threads × REFRESH_BATCH_PER_THREAD × n_nodes` regardless of the row count.
+const REFRESH_BATCH_PER_THREAD: usize = 4;
+
 /// Refresh `tree` in place from the per-row gradients `gpair` (one pair per
 /// row of `data`) with `params`' regularization and `refresh_leaf`, shrinking
 /// refreshed leaves by `learning_rate`. See the module docs for the
@@ -63,6 +68,19 @@ pub(super) fn refresh_tree(
 
 /// Per-node gradient statistics of `tree` over every row of `data`.
 fn node_stats(tree: &RegTree, data: &DMatrix, gpair: &[GradPair]) -> Vec<GradStats> {
+    let batch_blocks = rayon::current_num_threads().max(1) * REFRESH_BATCH_PER_THREAD;
+    node_stats_batched(tree, data, gpair, batch_blocks)
+}
+
+/// [`node_stats`] holding at most `batch_blocks` block accumulators at once.
+/// Blocks are still reduced one by one in index order, so the result is the
+/// same for every batch size (and thread count).
+fn node_stats_batched(
+    tree: &RegTree,
+    data: &DMatrix,
+    gpair: &[GradPair],
+    batch_blocks: usize,
+) -> Vec<GradStats> {
     let n_nodes = tree.num_nodes();
     let block_stats = |rows: std::ops::Range<usize>| {
         let mut stats = vec![GradStats::default(); n_nodes];
@@ -79,14 +97,18 @@ fn node_stats(tree: &RegTree, data: &DMatrix, gpair: &[GradPair]) -> Vec<GradSta
         stats
     };
     let n = data.n_rows();
-    let blocks: Vec<Vec<GradStats>> = (0..n.div_ceil(REFRESH_BLOCK_ROWS))
-        .into_par_iter()
-        .map(|b| block_stats(b * REFRESH_BLOCK_ROWS..((b + 1) * REFRESH_BLOCK_ROWS).min(n)))
-        .collect();
+    let n_blocks = n.div_ceil(REFRESH_BLOCK_ROWS);
+    let batch = batch_blocks.max(1);
     let mut total = vec![GradStats::default(); n_nodes];
-    for block in blocks {
-        for (acc, s) in total.iter_mut().zip(block) {
-            acc.add(s);
+    for first in (0..n_blocks).step_by(batch) {
+        let blocks: Vec<Vec<GradStats>> = (first..(first + batch).min(n_blocks))
+            .into_par_iter()
+            .map(|b| block_stats(b * REFRESH_BLOCK_ROWS..((b + 1) * REFRESH_BLOCK_ROWS).min(n)))
+            .collect();
+        for block in blocks {
+            for (acc, s) in total.iter_mut().zip(block) {
+                acc.add(s);
+            }
         }
     }
     total
@@ -163,5 +185,33 @@ mod tests {
         refresh_tree(&mut tree, &data, &gpair, &TrainingParams::default(), 0.3);
         assert_eq!(tree.node(2).sum_hess, 0.0);
         assert_eq!(tree.node(2).leaf_value, 0.0);
+    }
+
+    /// Bounding the buffered blocks does not change the ordered reduction:
+    /// any batch size gives bit-identical statistics.
+    #[test]
+    fn batched_block_reduction_matches_for_every_batch_size() {
+        let n = 5 * REFRESH_BLOCK_ROWS + 123;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 37) % 101) as f32 / 101.0).collect();
+        let data = DMatrix::from_dense(&x, n, 1).unwrap();
+        let gpair: Vec<GradPair> = (0..n)
+            .map(|i| {
+                let g = ((i * 7919) % 1000) as f32 * 1e-3 - 0.37;
+                GradPair::new(g, 0.1 + (i % 13) as f32)
+            })
+            .collect();
+        let tree = stump();
+        let unbatched = node_stats_batched(&tree, &data, &gpair, usize::MAX);
+        assert!(unbatched.iter().all(|s| s.hess > 0.0));
+        for batch in [0, 1, 2, 4, 6] {
+            let stats = node_stats_batched(&tree, &data, &gpair, batch);
+            for (a, b) in stats.iter().zip(&unbatched) {
+                assert_eq!(
+                    (a.grad.to_bits(), a.hess.to_bits()),
+                    (b.grad.to_bits(), b.hess.to_bits()),
+                    "batch {batch}"
+                );
+            }
+        }
     }
 }

@@ -130,6 +130,17 @@ fn weight(grad: f64, hess: f64) -> f64 {
     -grad / (hess + HESSIAN_EPS)
 }
 
+/// A leaf value: the Newton weight clamped to `±max_delta_step` (when
+/// positive, as XGBoost's `CalcWeight` does) and shrunk by `eta`.
+#[inline]
+fn leaf_value(grad: f64, hess: f64, cfg: &GrowConfig) -> f32 {
+    let mut w = weight(grad, hess);
+    if cfg.max_delta_step > 0.0 {
+        w = w.clamp(-cfg.max_delta_step, cfg.max_delta_step);
+    }
+    cfg.eta * w as f32
+}
+
 /// Score `G²/(H + ε)`, written as `−(2 G w + (H + ε) w²)` at the Newton weight
 /// like Perpetual.
 #[inline]
@@ -286,10 +297,17 @@ impl NodeCtx {
         }
         let parent = -0.5 * self.gain / self.count as f64;
         let generalization = (parent - mean(&train)) / (parent - mean(&valid));
+        // Undefined (`0/0`: a root without usable folds whose gradients sum
+        // to zero) ranks nowhere, as in Perpetual, where a NaN rank never
+        // beats the best; a root of at most eight rows then falls back to
+        // `evaluate_tiny_root`.
+        if generalization.is_nan() {
+            return None;
+        }
         if !self.is_root {
             let stability = split_weight_stability(&left_weights, &right_weights);
             let floor = generalization_floor(stability, categorical, self.depth, self.count);
-            if generalization.is_nan() || generalization < floor {
+            if generalization < floor {
                 return None;
             }
         }
@@ -389,6 +407,9 @@ pub(crate) struct GrowConfig<'a> {
     /// Loss reduction of row `r` when its margin moves by `delta`
     /// (`loss_r(m_r) − loss_r(m_r + delta)`, sample-weighted).
     pub row_decrement: &'a (dyn Fn(u32, f32) -> f64 + Sync),
+    /// Bound on every unshrunk leaf weight (`0`: unbounded), XGBoost
+    /// `max_delta_step`.
+    pub max_delta_step: f64,
 }
 
 /// A frontier node, ordered by its own score (ties: lower node id first).
@@ -430,10 +451,7 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
     }
     let root_totals = root_stats.totals();
     let mut tree = RegTree::with_root(root_totals.hess as f32);
-    tree.set_leaf_value(
-        0,
-        cfg.eta * weight(root_totals.grad, root_totals.hess) as f32,
-    );
+    tree.set_leaf_value(0, leaf_value(root_totals.grad, root_totals.hess, cfg));
 
     let mut heap = BinaryHeap::new();
     heap.push(Frontier {
@@ -481,8 +499,8 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
         let n_left = partition(ghist, &mut index[node.start..node.end], &best, &mut scratch);
         let mid = node.start + n_left;
         let (lt, rt) = (best.left.totals(), best.right.totals());
-        let left_value = cfg.eta * weight(lt.grad, lt.hess) as f32;
-        let right_value = cfg.eta * weight(rt.grad, rt.hess) as f32;
+        let left_value = leaf_value(lt.grad, lt.hess, cfg);
+        let right_value = leaf_value(rt.grad, rt.hess, cfg);
         let (left_id, right_id) = if best.cat_bins.is_empty() {
             tree.expand(
                 node.nid,

@@ -464,3 +464,89 @@ fn unsupported_vector_layouts_are_rejected() {
         Err(HessboostError::ModelFormat(_))
     ));
 }
+
+/// Rows of `cols` features (column 0 categorical) with `y` duplicated across
+/// two targets.
+fn categorical_two_targets(x: &[f32], cols: usize, y: &[f32]) -> DMatrix {
+    let mut types = vec![FeatureType::Numerical; cols];
+    types[0] = FeatureType::Categorical;
+    let labels: Vec<f32> = y.iter().flat_map(|&v| [v, v]).collect();
+    DMatrix::from_dense(x, y.len(), cols)
+        .unwrap()
+        .with_label_matrix(&labels, 2)
+        .unwrap()
+        .with_feature_types(&types)
+        .unwrap()
+}
+
+/// One unregularized, unshrunk round fits every row whose leaf holds a single
+/// label value exactly.
+fn one_round_margins(params: hessboost::config::TrainingParamsBuilder, d: &DMatrix) -> Vec<f32> {
+    let params = params
+        .multi_strategy(MultiStrategy::MultiOutputTree)
+        .lambda(0.0)
+        .eta(1.0)
+        .base_score(0.0)
+        .build()
+        .unwrap();
+    train(&params, d, 1).unwrap().predict_margin(d).unwrap()
+}
+
+fn assert_margins(got: &[f32], want: &[f32]) {
+    let want: Vec<f32> = want.iter().flat_map(|&v| [v, v]).collect();
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!((g - w).abs() < 1e-4, "margin {i}: {got:?} vs {want:?}");
+    }
+}
+
+#[test]
+fn low_cardinality_categories_split_one_hot() {
+    // Fewer than four categories: XGBoost enumerates each category against
+    // the rest with missing values on either side. One depth-1 round fits
+    // each case exactly only through a one-hot candidate.
+    let nan = f32::NAN;
+    for (x, y) in [
+        // A single category against missing values.
+        (vec![0.0, 0.0, nan, nan], vec![0.0, 0.0, 2.0, 2.0]),
+        // The middle category alone.
+        (
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+            vec![-5.0, -5.0, 10.0, 10.0, -5.0, -5.0],
+        ),
+        // The middle category together with the missing values.
+        (
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, nan, nan],
+            vec![-10.0, -10.0, 10.0, 10.0, -10.0, -10.0, 10.0, 10.0],
+        ),
+    ] {
+        let d = categorical_two_targets(&x, 1, &y);
+        let margins = one_round_margins(TrainingParams::builder().max_depth(1), &d);
+        assert_margins(&margins, &y);
+    }
+}
+
+#[test]
+fn categorical_children_keep_xgboost_priority() {
+    // The root splits categories {0, 1} (XGBoost's right child, stored
+    // first) from {2, 3}. Both children then gain equally from splitting on
+    // `b`, and the one remaining leaf goes to XGBoost's left child, the
+    // positive one, under either growth policy.
+    let (mut x, mut y, mut want) = (Vec::new(), Vec::new(), Vec::new());
+    for c in 0..4 {
+        for b in 0..2 {
+            let v = if c < 2 { -10.0 } else { 10.0 } + 2.0 * b as f32 - 1.0;
+            x.extend([c as f32, b as f32]);
+            y.push(v);
+            want.push(if c < 2 { -10.0 } else { v });
+        }
+    }
+    let d = categorical_two_targets(&x, 2, &y);
+    for policy in [GrowPolicy::DepthWise, GrowPolicy::LossGuide] {
+        let params = TrainingParams::builder()
+            .grow_policy(policy)
+            .max_depth(2)
+            .max_leaves(3);
+        assert_margins(&one_round_margins(params, &d), &want);
+    }
+}

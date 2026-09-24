@@ -294,8 +294,9 @@ pub trait Objective: Send + Sync {
     /// [`Objective::probs_to_margins`]), in place; used by XGBoost-JSON
     /// export. Defaults to [`Objective::pred_transform`], which inverts the
     /// link of every objective whose transform is its link; objectives whose
-    /// transform is not the inverse link (`binary:hinge` thresholds, while its
-    /// `ProbToMargin` is the identity) override it.
+    /// transform is not the inverse link (`binary:hinge` thresholds and
+    /// `reg:quantileerror` sorts, while their `ProbToMargin` is the identity)
+    /// override it.
     fn margins_to_probs(&self, margins: &mut [f32]) {
         self.pred_transform(margins);
     }
@@ -396,6 +397,23 @@ pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool)
         return Err(HessboostError::invalid_param(
             "labels",
             "dataset has labels outside the objective's valid domain",
+        ));
+    }
+    Ok(())
+}
+
+/// Shared [`Objective::validate_info`] label-width check: reject the dataset
+/// unless it carries the `n_targets` label columns the objective's outputs
+/// are paired with (objectives passed to training directly are not sized
+/// from the dataset, unlike [`create_objective`]'s).
+pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()> {
+    if info.n_targets != n_targets {
+        return Err(HessboostError::invalid_param(
+            "labels",
+            format!(
+                "dataset has {} label columns but the objective models {n_targets}",
+                info.n_targets
+            ),
         ));
     }
     Ok(())

@@ -167,10 +167,12 @@ fn raw_output(stats: GradStats, reg: &RegParams) -> f64 {
 }
 
 /// LightGBM's path smoothing of output `w` of a node with `n` rows toward its
-/// parent's output, with strength `s`.
+/// parent's output, with strength `s`: `w·(n/s)/(n/s + 1) + parent/(n/s + 1)`,
+/// evaluated as `w·n/(n + s) + parent·s/(n + s)` so a tiny `s` cannot overflow
+/// `n/s` (and turn the blend into `inf/inf`); as `s → 0` it approaches `w`.
 fn smooth(w: f64, n: f64, s: f64, parent: f64) -> f64 {
-    let ratio = n / s;
-    w * ratio / (ratio + 1.0) + parent / (ratio + 1.0)
+    let total = n + s;
+    w * (n / total) + parent * (s / total)
 }
 
 /// Seed of one node's `extra_trees` draws (`SplitMix64` finalizer chain).

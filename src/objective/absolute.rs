@@ -139,6 +139,11 @@ impl Objective for AbsoluteErrorObjective {
         out
     }
 
+    /// The dataset must carry this objective's `n_targets` label columns.
+    fn validate_info(&self, info: &crate::data::MetaInfo) -> crate::error::Result<()> {
+        super::check_label_width(info, self.n_targets)
+    }
+
     fn default_metric(&self) -> String {
         "mae".to_string()
     }
@@ -248,5 +253,27 @@ mod tests {
             let column: Vec<f32> = joint_pred.iter().skip(j).step_by(2).copied().collect();
             assert_eq!(column, pred, "target {j}");
         }
+    }
+
+    /// An objective handed to training directly is not sized from the
+    /// dataset: a label width other than its `n_targets` is a parameter
+    /// error, not a gradient over mismatched predictions and labels.
+    #[test]
+    fn training_rejects_a_different_label_width() {
+        use crate::config::TrainingParams;
+        use crate::data::DMatrix;
+        use crate::error::HessboostError;
+        let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
+            .unwrap()
+            .with_labels(&[0.0, 1.0])
+            .unwrap();
+        let params = TrainingParams::builder().build().unwrap();
+        let two = AbsoluteErrorObjective::new(2);
+        assert!(matches!(
+            crate::learner::train_with_objective(&params, &d, 1, &two),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+        ));
+        let one = AbsoluteErrorObjective::new(1);
+        assert!(crate::learner::train_with_objective(&params, &d, 1, &one).is_ok());
     }
 }

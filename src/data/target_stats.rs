@@ -14,9 +14,10 @@
 //! inference:    (Σ_{j: x_j = c} y_j + a·P) / (#{j: x_j = c} + a)
 //! ```
 //!
-//! A row's own target never enters its training encoding, so a tree cannot
-//! learn "this encoded value means this row's label" the way it can with a
-//! plain in-sample target mean. Inference ([`FittedTargetEncoder::transform`])
+//! The preceding rows never include the row itself, so apart from the default
+//! prior (see below) a row's own target never enters its training encoding: a
+//! tree cannot learn "this encoded value means this row's label" the way it
+//! can with a plain in-sample target mean. Inference ([`FittedTargetEncoder::transform`])
 //! uses statistics over every training row. Categories never seen in training
 //! map to `P`; a missing category stays missing.
 //!
@@ -143,7 +144,8 @@ impl OrderedTargetEncoderBuilder {
         self
     }
 
-    /// Fixed prior `P` (default: the mean training label). Must be finite.
+    /// Fixed prior `P` (default: the mean training label). Must be finite as
+    /// an `f32`, since unseen categories encode to it.
     #[must_use]
     pub fn prior(mut self, prior: f64) -> Self {
         self.encoder.prior = Some(prior);
@@ -181,8 +183,11 @@ impl OrderedTargetEncoderBuilder {
                 "must be finite and > 0",
             ));
         }
-        if e.prior.is_some_and(|p| !p.is_finite()) {
-            return Err(HessboostError::invalid_param("prior", "must be finite"));
+        if e.prior.is_some_and(|p| !(p as f32).is_finite()) {
+            return Err(HessboostError::invalid_param(
+                "prior",
+                "must be finite and within the f32 range",
+            ));
         }
         if e.permutations == 0 {
             return Err(HessboostError::invalid_param(
@@ -253,7 +258,7 @@ impl OrderedTargetEncoder {
             encodings
                 .par_iter_mut()
                 .zip(codes.par_iter())
-                .for_each(|(enc, col)| ordered_pass(&order, col, labels, a, a * prior, enc));
+                .for_each(|(enc, col)| ordered_pass(&order, col, labels, prior, a, enc));
         }
 
         let scale = 1.0 / self.permutations as f64;
@@ -368,8 +373,8 @@ fn ordered_pass(
     order: &[usize],
     col: &ColumnCodes,
     labels: &[f32],
+    prior: f64,
     a: f64,
-    a_prior: f64,
     enc: &mut [f64],
 ) {
     let mut sums = vec![0f64; col.categories.len()];
@@ -380,10 +385,19 @@ fn ordered_pass(
             continue;
         }
         let id = id as usize;
-        enc[row] += (sums[id] + a_prior) / (counts[id] + a);
+        enc[row] += smoothed_mean(sums[id], counts[id], prior, a);
         sums[id] += f64::from(labels[row]);
         counts[id] += 1.0;
     }
+}
+
+/// `(sum + a·P) / (count + a)`, evaluated as `sum / (count + a) + P · (a / (count + a))`
+/// so that no `a·P` product can overflow or underflow for extreme `a`: an
+/// empty count gives exactly `P`. The result is a convex combination of the
+/// label mean and `P`, so it stays within the `f32` range of both.
+fn smoothed_mean(sum: f64, count: f64, prior: f64, a: f64) -> f64 {
+    let denom = count + a;
+    sum / denom + prior * (a / denom)
 }
 
 /// Inference encodings of one encoded column. Only `f32` values are stored:
@@ -414,7 +428,7 @@ impl ColumnEncoding {
         let values = sums
             .iter()
             .zip(&counts)
-            .map(|(&sum, &count)| ((sum + a * prior) / (count + a)) as f32)
+            .map(|(&sum, &count)| smoothed_mean(sum, count, prior, a) as f32)
             .collect();
         ColumnEncoding {
             column,
@@ -783,6 +797,38 @@ mod tests {
         assert_eq!(wide.n_cols, usize::MAX);
         assert!(
             serde_json::from_str::<FittedTargetEncoder>(&doc(&format!("{column}, {column}")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn extreme_prior_weights_keep_the_smoothed_mean_finite() {
+        // With `a = 1e308` the product `a·P` used to overflow to +inf; with the
+        // smallest positive `a` it used to underflow to 0. The encoding must
+        // stay the prior for an empty prefix, and the encoder must round-trip.
+        let data = matrix(&[0.0], &[2.0]);
+        for (a, prior, first, fitted_value) in [
+            (1e308, None, 2.0, 2.0),
+            (f64::from_bits(1), Some(0.25), 0.25, 2.0),
+        ] {
+            let mut builder = OrderedTargetEncoder::builder().prior_weight(a);
+            if let Some(p) = prior {
+                builder = builder.prior(p);
+            }
+            let (out, fitted) = builder.build().unwrap().fit_transform(&data, &[0]).unwrap();
+            assert_eq!(out.get(0, 0), Some(first), "a = {a:e}");
+            assert_eq!(fitted.encode(0, 0), Some(fitted_value), "a = {a:e}");
+            let json = serde_json::to_string(&fitted).unwrap();
+            assert_eq!(
+                serde_json::from_str::<FittedTargetEncoder>(&json).unwrap(),
+                fitted
+            );
+        }
+        // A prior outside the f32 range could not be stored in the encoder.
+        assert!(
+            OrderedTargetEncoder::builder()
+                .prior(1e300)
+                .build()
                 .is_err()
         );
     }

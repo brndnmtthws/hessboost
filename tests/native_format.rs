@@ -80,6 +80,27 @@ fn expected(predictions: &Value, name: &str, kind: &str) -> Vec<u32> {
         .collect()
 }
 
+/// `model`'s prediction transform applied to `margins` through the current
+/// code path: the same model without trees or linear weights, predicting on
+/// `data` with `margins` as its per-row-and-output base margin.
+fn transform_of(model: &BoostedModel, data: DMatrix, margins: &[f32]) -> Vec<u32> {
+    let mut doc: Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    doc["trees"] = Value::Array(Vec::new());
+    doc["tree_weights"] = Value::Array(Vec::new());
+    doc["best_iteration"] = Value::Null;
+    doc["linear"] = Value::Null;
+    let bare = BoostedModel::from_json(&doc.to_string()).unwrap();
+    let data = data.with_base_margin(margins).unwrap();
+    bits(&bare.predict(&data).unwrap())
+}
+
+/// Margins are sums of stored leaf values, identical on every backend, so
+/// they must reproduce 0.1.1 bit for bit. Transformed predictions go through
+/// SIMD-dispatched transcendental kernels (e.g. NEON softmax for three
+/// classes on aarch64, scalar on x86-64) that differ in the last bits, so
+/// `predict` must equal the current transform of those margins exactly and
+/// the recorded 0.1.1 predictions within the kernels' tolerance
+/// (`simd/tests.rs`), which still refuses a wrong decoded transform.
 #[test]
 fn v1_files_load_with_their_original_predictions() {
     let dir = v1_dir();
@@ -92,21 +113,33 @@ fn v1_files_load_with_their_original_predictions() {
         let from_binary = BoostedModel::from_bytes(&bytes).unwrap();
         let from_json = BoostedModel::load_json(dir.join(format!("{name}.json"))).unwrap();
         let data = v1_data(name);
+        let margin = expected(&predictions, name, "margin");
+        let recorded = expected(&predictions, name, "predict");
         for model in [&from_binary, &from_json] {
             assert_eq!(model.n_targets(), 1, "{name}");
             assert_eq!(model.num_parallel_tree(), 1, "{name}");
             assert!(!model.has_vector_leaves(), "{name}");
             assert!(model.trees().iter().all(|t| t.linear_leaves().is_none()));
             assert_eq!(
-                bits(&model.predict(&data).unwrap()),
-                expected(&predictions, name, "predict"),
-                "{name}: predict"
-            );
-            assert_eq!(
                 bits(&model.predict_margin(&data).unwrap()),
-                expected(&predictions, name, "margin"),
+                margin,
                 "{name}: predict_margin"
             );
+            let predict = bits(&model.predict(&data).unwrap());
+            let margin_values: Vec<f32> = margin.iter().map(|&b| f32::from_bits(b)).collect();
+            assert_eq!(
+                predict,
+                transform_of(model, v1_data(name), &margin_values),
+                "{name}: predict is not the transform of the margins"
+            );
+            assert_eq!(predict.len(), recorded.len(), "{name}");
+            for (i, (&got, &want)) in predict.iter().zip(&recorded).enumerate() {
+                let (got, want) = (f32::from_bits(got), f32::from_bits(want));
+                assert!(
+                    (got - want).abs() <= 1e-6 * want.abs().max(1.0),
+                    "{name}: predict[{i}] {got} differs from the recorded {want}"
+                );
+            }
         }
         // The binary migration and the JSON serde defaults build the same
         // model, and re-saving it writes the current version.
@@ -120,7 +153,7 @@ fn v1_files_load_with_their_original_predictions() {
                     .predict(&data)
                     .unwrap()
             ),
-            expected(&predictions, name, "predict"),
+            bits(&from_binary.predict(&data).unwrap()),
             "{name}: v2 re-save"
         );
     }

@@ -140,7 +140,8 @@ reproduced; see `hessboost::learner::budget` for the exact rules.
   update`**, XGBoost's `refresh` updater, recomputing an existing gbtree
   model's statistics and (with `refresh_leaf`) leaf values on new data
   (refused for DART, monotone constraints, vector leaves, linear leaves,
-  `path_smooth`, and `use_quantized_grad`); **model slicing** by boosting iteration
+  `path_smooth`, `use_quantized_grad`, `extra_trees`, and reuse penalties);
+  **model slicing** by boosting iteration
   (`BoostedModel::slice(begin, end, step)`, XGBoost's `booster[a:b:c]`); and
   **`iteration_range`** prediction (`predict_range`, `predict_margin_range`,
   `predict_leaf_range`, `predict_contribs_range`,
@@ -250,7 +251,10 @@ None of these change default training; each is off unless requested.
 - **Ordered target statistics** (`hessboost::data::OrderedTargetEncoder`):
   CatBoost-style encoding of categorical columns as smoothed target means,
   where each training row only sees the rows before it in a seeded random
-  permutation (so its own label never leaks into its feature). The fitted
+  permutation, so the preceding rows' statistics never include its own label.
+  The default prior is the mean of all training labels, through which each
+  row's label still enters its own encoding (with a small weight); set a fixed,
+  label-independent `.prior(...)` for strict independence. The fitted
   encoder applies full-training-set statistics to new data, maps unseen
   categories to the prior, and is serde-serializable. Regression and binary
   labels; dense and CSR input.

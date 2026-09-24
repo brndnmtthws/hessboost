@@ -241,7 +241,13 @@ impl RegTree {
         {
             return false;
         }
-        if self.size_leaf_vector == 1 || (!self.is_vector_leaf() && !self.leaf_vectors.is_empty()) {
+        // A leaf is a scalar constant, a vector, or a scalar linear model:
+        // vector-leaf consumers ignore linear payloads, so both at once
+        // would make them disagree with `predict_row`.
+        if self.size_leaf_vector == 1
+            || (!self.is_vector_leaf() && !self.leaf_vectors.is_empty())
+            || (self.is_vector_leaf() && self.linear.is_some())
+        {
             return false;
         }
         let mut seen = vec![false; self.nodes.len()];
@@ -532,5 +538,22 @@ mod tests {
         assert_eq!(t.predict_row(&d, 1), 2.0);
         assert_eq!(t.num_leaves(), 2);
         assert_eq!(t.num_nodes(), 3);
+    }
+
+    /// A vector-leaf tree carrying a linear-leaf payload is invalid: vector
+    /// consumers would drop the linear models `predict_row` uses.
+    #[test]
+    fn vector_leaves_refuse_linear_payload() {
+        let linear: LinearLeaves = serde_json::from_str(
+            r#"{"offsets":[0,1],"intercepts":[0.5],"features":[0],"coeffs":[2.0]}"#,
+        )
+        .unwrap();
+        let mut scalar = RegTree::with_root(1.0);
+        scalar.set_linear_leaves(linear.clone());
+        assert!(scalar.is_valid_for_features(1));
+        let mut vector = RegTree::with_vector_root(2, 1.0);
+        assert!(vector.is_valid_for_features(1));
+        vector.set_linear_leaves(linear);
+        assert!(!vector.is_valid_for_features(1));
     }
 }

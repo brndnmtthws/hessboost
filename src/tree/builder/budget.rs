@@ -1,5 +1,5 @@
 //! Generalization-gated tree growth for budget-mode training
-//! ([`train_with_budget`](crate::learner::budget::train_with_budget)), after
+//! ([`train_with_budget`](crate::training::budget::train_with_budget)), after
 //! Perpetual's splitter and tree grower (`splitter.rs`,
 //! `tree/core.rs`; Apache-2.0, re-implemented here).
 //!
@@ -35,7 +35,7 @@ use super::hist::rayon_available;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
 use crate::tree::hist::feature_slices;
-use crate::tree::regtree::RegTree;
+use crate::tree::{ChildLeaf, RegTree, SplitRule};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -509,35 +509,26 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
         let (lt, rt) = (best.left.totals(), best.right.totals());
         let left_value = leaf_value(lt.grad, lt.hess, cfg);
         let right_value = leaf_value(rt.grad, rt.hess, cfg);
-        let (left_id, right_id) = if best.cat_bins.is_empty() {
-            tree.expand(
-                node.nid,
-                best.feature,
-                ghist.cuts().cut_value(best.split_bin),
-                best.default_left,
-                left_value,
-                lt.hess as f32,
-                right_value,
-                rt.hess as f32,
-            )
+        let cats: Vec<u32>;
+        let split = if best.cat_bins.is_empty() {
+            let threshold = ghist.cuts().cut_value(best.split_bin);
+            SplitRule::numeric(best.feature, threshold, best.default_left)
         } else {
-            let mut cats: Vec<u32> = best
+            let mut cats_left: Vec<u32> = best
                 .cat_bins
                 .iter()
                 .map(|&b| ghist.cuts().cut_value(b) as u32)
                 .collect();
-            cats.sort_unstable();
-            tree.expand_categorical(
-                node.nid,
-                best.feature,
-                &cats,
-                best.default_left,
-                left_value,
-                lt.hess as f32,
-                right_value,
-                rt.hess as f32,
-            )
+            cats_left.sort_unstable();
+            cats = cats_left;
+            SplitRule::categorical(best.feature, &cats, best.default_left)
         };
+        let (left_id, right_id) = tree.expand(
+            node.nid,
+            split,
+            ChildLeaf::new(left_value, lt.hess as f32),
+            ChildLeaf::new(right_value, rt.hess as f32),
+        );
         tree.set_split_gain(node.nid, best.scored.split_gain as f32);
 
         for (nid, start, end, value, stats, fold_weights) in [

@@ -8,7 +8,7 @@
 
 use super::{Metric, weighted_mean};
 use crate::data::MetaInfo;
-use crate::objective::{Dist, DistFamily};
+use crate::objective::distributional::{Dist, DistFamily};
 use rayon::prelude::*;
 
 /// Weighted mean of `score(dist_i, y_i)` over the rows. Per-row scores are
@@ -110,7 +110,7 @@ impl Metric for DistCrps {
 mod tests {
     use super::*;
     use crate::config::ObjectiveParams;
-    use crate::metric::create_metric;
+    use crate::metric::build;
 
     #[test]
     fn metrics_average_the_per_row_scores_with_weights() {
@@ -138,11 +138,11 @@ mod tests {
         let dist = ObjectiveParams::defaults_for("dist:gamma");
         assert_eq!(dist.distribution, Some(DistFamily::Gamma));
         for name in ["nll", "crps"] {
-            let metric = create_metric(name, 0, &dist).unwrap();
+            let metric = build(name, 0, &dist).unwrap();
             assert_eq!(metric.name(), name);
             assert!(!metric.maximize());
             // Not a distributional objective: nothing to score.
-            assert!(create_metric(name, 0, &ObjectiveParams::default()).is_err());
+            assert!(build(name, 0, &ObjectiveParams::default()).is_err());
         }
     }
 }

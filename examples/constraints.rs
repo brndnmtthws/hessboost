@@ -1,7 +1,9 @@
 //! Structural constraints: monotone constraints, interaction constraints, and
 //! native categorical features. Run: `cargo run --release --example constraints`.
 
-use hessboost::metric::Rmse;
+use hessboost::config::Monotone;
+use hessboost::data::FeatureType;
+use hessboost::metric::{Metric, Rmse};
 use hessboost::prelude::*;
 
 mod common;

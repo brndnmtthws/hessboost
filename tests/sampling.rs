@@ -2,7 +2,7 @@
 //! `sampling_method=gradient_based` (XGBoost's CPU MVS sampler) and
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
-use hessboost::config::TrainingParamsBuilder;
+use hessboost::config::{BoosterKind, SamplingMethod, TrainingParamsBuilder, TreeMethod};
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -354,7 +354,11 @@ fn approx_gradient_sampling_continuation_matches_uninterrupted_training() {
                 .unwrap();
             let full = train(&params, data, split[0] + split[1]).unwrap();
             let head = train(&params, data, split[0]).unwrap();
-            let resumed = train_continue(&params, data, split[1], &head).unwrap();
+            let resumed = Trainer::new(&params, data, split[1])
+                .init_model(&head)
+                .train()
+                .unwrap()
+                .model;
             assert_eq!(
                 full.predict(data).unwrap(),
                 resumed.predict(data).unwrap(),

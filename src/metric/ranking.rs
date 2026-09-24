@@ -132,10 +132,10 @@ mod tests {
     #[test]
     fn factory_names_and_rejections() {
         use crate::config::{ObjectiveParams, TrainingParams};
-        use crate::metric::create_metric;
+        use crate::metric::build;
         let defaults = ObjectiveParams::from_params(&TrainingParams::default());
         for name in ["pre", "pre@5"] {
-            let m = create_metric(name, 0, &defaults).unwrap();
+            let m = build(name, 0, &defaults).unwrap();
             assert_eq!(m.name(), name);
             assert!(m.maximize());
         }
@@ -143,6 +143,6 @@ mod tests {
             huber_slope: 0.0,
             ..defaults
         };
-        assert!(create_metric("mphe", 0, &flat).is_err());
+        assert!(build("mphe", 0, &flat).is_err());
     }
 }

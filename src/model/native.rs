@@ -31,11 +31,11 @@
 
 use std::io::Read;
 
-use super::model::LinearModel;
+use super::LinearModel;
 use super::sections::{Sections, Writer, format_error};
 use crate::config::{AftDistribution, DistGradient, DistSplitDirection, ObjectiveParams};
 use crate::error::Result;
-use crate::objective::DistFamily;
+use crate::objective::distributional::DistFamily;
 use crate::tree::linear::LinearLeaves;
 use crate::tree::{Node, RegTree};
 
@@ -721,8 +721,8 @@ mod tests {
     use super::super::sections::REQUIRED;
     use super::*;
     use crate::config::TrainingParams;
-    use crate::learner::{BoostedModel, train};
     use crate::test_support::labeled_dense;
+    use crate::{model::BoostedModel, training::train};
 
     /// One section of a container, as `rewrite` edits them.
     struct Entry {

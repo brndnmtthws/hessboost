@@ -37,9 +37,10 @@
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::learner::model::{BoostedModel, RowBlock};
+use crate::model::{BoostedModel, RowBlock};
 use crate::tree::{RegTree, in_category_set};
 use rayon::prelude::*;
+use std::ops::RangeBounds;
 use std::sync::LazyLock;
 
 /// Quadrature points (XGBoost's `kQuadratureTreeShapPoints`).
@@ -465,6 +466,19 @@ impl Formulation for Interaction<'_> {
     }
 }
 
+/// One outgoing edge of a split, as [`Walk::child`] descends it.
+#[derive(Clone, Copy)]
+struct Branch {
+    /// The parent's split feature.
+    feature: u32,
+    /// The child node id.
+    child: u32,
+    /// The child's cover fraction of its parent.
+    weight: f32,
+    /// The row takes this edge.
+    satisfies: bool,
+}
+
 /// One QuadratureTreeSHAP walk of a tree for a dense row (`NaN` = missing).
 /// `path_prob` holds [`UNSEEN`] for every feature on entry and on exit.
 struct Walk<'a, F> {
@@ -508,22 +522,21 @@ impl<F: Formulation> Walk<'_, F> {
             v < node.cond
         };
         let goes_first = goes_left != node.is_categorical;
+        let branch = |child, weight, satisfies| Branch {
+            feature: node.feature,
+            child,
+            weight,
+            satisfies,
+        };
         let mut second = [0.0; POINTS];
-        let (a, b) = (node.first as usize, node.second as usize);
         self.child(
-            node.feature,
-            a,
-            node.first_weight,
-            goes_first,
+            branch(node.first, node.first_weight, goes_first),
             c,
             w_prod,
             out,
         );
         self.child(
-            node.feature,
-            b,
-            node.second_weight,
-            !goes_first,
+            branch(node.second, node.second_weight, !goes_first),
             c,
             w_prod,
             &mut second,
@@ -533,17 +546,15 @@ impl<F: Formulation> Walk<'_, F> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn child(
-        &mut self,
-        feature: u32,
-        child: usize,
-        weight: f32,
-        satisfies: bool,
-        c: &Lanes,
-        w_prod: f32,
-        out: &mut Lanes,
-    ) {
+    /// Descend `branch` from a node with basis `c` and path cover product
+    /// `w_prod`, writing the child's weighted return into `out`.
+    fn child(&mut self, branch: Branch, c: &Lanes, w_prod: f32, out: &mut Lanes) {
+        let Branch {
+            feature,
+            child,
+            weight,
+            satisfies,
+        } = branch;
         let rule = self.rule;
         let p_old = self.path_prob[feature as usize];
         let seen = p_old != UNSEEN;
@@ -576,7 +587,7 @@ impl<F: Formulation> Walk<'_, F> {
         }
         self.path_prob[feature as usize] = p_enter;
         self.form.push(feature, p_enter);
-        self.node(child, &c_child, w_prod * weight, out);
+        self.node(child as usize, &c_child, w_prod * weight, out);
         let p_exit = if seen { p_old } else { 1.0 };
         self.form.on_return(rule, feature, out, p_enter, p_exit);
         self.form.pop();
@@ -683,20 +694,20 @@ impl BoostedModel {
     }
 
     /// [`Self::predict_contribs`] over the boosting iterations in
-    /// `iteration_range` (XGBoost `iteration_range`, `end == 0` = through the
-    /// last iteration). As in XGBoost the range must start at iteration `0`;
-    /// use [`BoostedModel::slice`] for a later start.
+    /// `iterations` (see [`BoostedModel::predict_margin_range`]). As in
+    /// XGBoost the range must start at iteration `0`; use
+    /// [`BoostedModel::slice`] for a later start.
     ///
     /// # Errors
     ///
     /// As for [`Self::predict_contribs`], plus an out-of-range
-    /// `iteration_range`.
+    /// `iterations`.
     pub fn predict_contribs_range(
         &self,
         data: &DMatrix,
-        iteration_range: (usize, usize),
+        iterations: impl RangeBounds<usize>,
     ) -> Result<Vec<f32>> {
-        let pro = self.attribution_prologue(data, iteration_range, "contribution prediction")?;
+        let pro = self.attribution_prologue(data, iterations, "contribution prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let forest = self.shap_forest(trees, k)?;
@@ -779,7 +790,7 @@ impl BoostedModel {
     }
 
     /// [`Self::predict_interactions`] over the boosting iterations in
-    /// `iteration_range`, which must start at iteration `0` (see
+    /// `iterations`, which must start at iteration `0` (see
     /// [`Self::predict_contribs_range`]).
     ///
     /// # Errors
@@ -788,7 +799,7 @@ impl BoostedModel {
     pub fn predict_interactions_range(
         &self,
         data: &DMatrix,
-        iteration_range: (usize, usize),
+        iterations: impl RangeBounds<usize>,
     ) -> Result<Vec<f32>> {
         struct Scratch<'a> {
             rows: RowBlock<'a>,
@@ -799,7 +810,7 @@ impl BoostedModel {
             last: Vec<u32>,
         }
 
-        let pro = self.attribution_prologue(data, iteration_range, "interaction prediction")?;
+        let pro = self.attribution_prologue(data, iterations, "interaction prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let mwidth = width * width;
@@ -887,8 +898,8 @@ impl BoostedModel {
 mod tests {
     use crate::config::{BoosterKind, TrainingParams, TreeMethod};
     use crate::data::{DMatrix, FeatureType};
-    use crate::learner::{BoostedModel, train};
     use crate::test_support::labeled_dense;
+    use crate::{model::BoostedModel, training::train};
 
     /// A `reg:squarederror` model with `eta = 0.3`.
     fn squared_error_model(d: &DMatrix, max_depth: usize, rounds: usize) -> BoostedModel {
@@ -1006,7 +1017,7 @@ mod tests {
     /// Textbook path-dependent TreeSHAP (Lundberg et al., Algorithm 2) with
     /// cloned paths, independent of the arena implementation.
     mod textbook {
-        use crate::learner::BoostedModel;
+        use crate::model::BoostedModel;
         use crate::tree::{RegTree, in_category_set};
 
         #[derive(Clone, Copy)]
@@ -1069,54 +1080,57 @@ mod tests {
             total
         }
 
-        #[allow(clippy::too_many_arguments)]
-        fn recurse(
-            tree: &RegTree,
-            x: &[f32],
-            phi: &mut [f64],
-            node: usize,
-            mut m: Vec<El>,
-            pz: f64,
-            po: f64,
-            pi: i64,
-        ) {
-            extend(&mut m, pz, po, pi);
-            let n = tree.node(node);
-            if n.is_leaf() {
-                for i in 1..m.len() {
-                    let w = unwound_sum(&m, i);
-                    phi[m[i].d as usize] += w * (m[i].o - m[i].z) * f64::from(n.leaf_value);
+        /// One tree's explanation of row `x`, accumulating into `phi`.
+        struct Explain<'a> {
+            tree: &'a RegTree,
+            x: &'a [f32],
+            phi: &'a mut [f64],
+        }
+
+        impl Explain<'_> {
+            /// Extend path `m` with the split on feature `pi` (zero fraction
+            /// `pz`, one fraction `po`), then descend into `node`.
+            fn recurse(&mut self, node: usize, mut m: Vec<El>, pz: f64, po: f64, pi: i64) {
+                let tree = self.tree;
+                extend(&mut m, pz, po, pi);
+                let n = tree.node(node);
+                if n.is_leaf() {
+                    for i in 1..m.len() {
+                        let w = unwound_sum(&m, i);
+                        self.phi[m[i].d as usize] +=
+                            w * (m[i].o - m[i].z) * f64::from(n.leaf_value);
+                    }
+                    return;
                 }
-                return;
+                let v = self.x[n.split_feature as usize];
+                let go_left = if v.is_nan() {
+                    n.default_left
+                } else if n.is_categorical {
+                    in_category_set(
+                        &tree.categories()[n.cat_begin as usize..n.cat_end as usize],
+                        v,
+                    )
+                } else {
+                    v < n.split_cond
+                };
+                let (hot, cold) = if go_left {
+                    (n.left as usize, n.right as usize)
+                } else {
+                    (n.right as usize, n.left as usize)
+                };
+                let cover = f64::from(n.sum_hess);
+                let (mut iz, mut io) = (1.0, 1.0);
+                if let Some(k) = m.iter().position(|e| e.d == i64::from(n.split_feature)) {
+                    iz = m[k].z;
+                    io = m[k].o;
+                    unwind(&mut m, k);
+                }
+                let f = i64::from(n.split_feature);
+                let hz = f64::from(tree.node(hot).sum_hess) / cover;
+                let cz = f64::from(tree.node(cold).sum_hess) / cover;
+                self.recurse(hot, m.clone(), hz * iz, io, f);
+                self.recurse(cold, m, cz * iz, 0.0, f);
             }
-            let v = x[n.split_feature as usize];
-            let go_left = if v.is_nan() {
-                n.default_left
-            } else if n.is_categorical {
-                in_category_set(
-                    &tree.categories()[n.cat_begin as usize..n.cat_end as usize],
-                    v,
-                )
-            } else {
-                v < n.split_cond
-            };
-            let (hot, cold) = if go_left {
-                (n.left as usize, n.right as usize)
-            } else {
-                (n.right as usize, n.left as usize)
-            };
-            let cover = f64::from(n.sum_hess);
-            let (mut iz, mut io) = (1.0, 1.0);
-            if let Some(k) = m.iter().position(|e| e.d == i64::from(n.split_feature)) {
-                iz = m[k].z;
-                io = m[k].o;
-                unwind(&mut m, k);
-            }
-            let f = i64::from(n.split_feature);
-            let hz = f64::from(tree.node(hot).sum_hess) / cover;
-            let cz = f64::from(tree.node(cold).sum_hess) / cover;
-            recurse(tree, x, phi, hot, m.clone(), hz * iz, io, f);
-            recurse(tree, x, phi, cold, m, cz * iz, 0.0, f);
         }
 
         /// Contributions for row `x` (bias last), in `f64`.
@@ -1126,7 +1140,12 @@ mod tests {
             phi[nf] = f64::from(model.base_score());
             for tree in model.trees() {
                 phi[nf] += super::super::root_mean_value(tree, 0);
-                recurse(tree, x, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
+                Explain {
+                    tree,
+                    x,
+                    phi: &mut phi,
+                }
+                .recurse(0, Vec::new(), 1.0, 1.0, -1);
             }
             phi
         }
@@ -1361,7 +1380,7 @@ mod tests {
             node(0, -1, -1, 2.0, 2.0),
             serde_json::to_string(&crate::config::ObjectiveParams::default()).unwrap(),
         );
-        let model = crate::learner::BoostedModel::from_json(&json).unwrap();
+        let model = crate::model::BoostedModel::from_json(&json).unwrap();
         let d = DMatrix::from_dense(&[0.2], 1, 1).unwrap();
         for result in [model.predict_contribs(&d), model.predict_interactions(&d)] {
             assert!(matches!(

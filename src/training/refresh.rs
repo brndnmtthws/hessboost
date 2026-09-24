@@ -116,11 +116,17 @@ fn node_stats_batched(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{ChildLeaf, SplitRule};
 
     /// Stump on feature 0 at 0.5 (missing left) with placeholder statistics.
     fn stump() -> RegTree {
         let mut t = RegTree::with_root(99.0);
-        t.expand(0, 0, 0.5, true, 7.0, 99.0, -7.0, 99.0);
+        t.expand(
+            0,
+            SplitRule::numeric(0, 0.5, true),
+            ChildLeaf::new(7.0, 99.0),
+            ChildLeaf::new(-7.0, 99.0),
+        );
         t
     }
 

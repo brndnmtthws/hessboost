@@ -25,7 +25,7 @@
 //! bytes 0..4   magic b"HBTD"
 //! byte  4      format version (1)
 //! bytes 5..9   u32 little-endian M, the metadata length
-//! next M bytes metadata: a section table (`learner::sections`, the
+//! next M bytes metadata: a section table (`model::sections`, the
 //!              native format's building block) holding the objective name,
 //!              num_class, n_targets, num_parallel_tree, and the objective
 //!              parameters when they differ from the objective's defaults;
@@ -94,6 +94,7 @@
 //! # Example
 //!
 //! ```
+//! use hessboost::model::compact::CompactModel;
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {
@@ -122,7 +123,7 @@ use super::sections::{Sections, Writer};
 use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::learner::model::{
+use crate::model::{
     BoostedModel, RowBlock, check_objective_width, initial_margins, transform_model_margins,
     validate_prediction_data,
 };
@@ -1114,7 +1115,7 @@ impl ModelSizeReport {
 
 impl BoostedModel {
     /// This model in the bit-packed *Trees on a Diet* layout (see
-    /// [`crate::learner::compact_model`]), predicting bit-identical margins
+    /// [`crate::model::compact`]), predicting bit-identical margins
     /// from the trees [`BoostedModel::predict_margin`] uses. Fails for
     /// gblinear, linear-leaf and vector-leaf models and for trees the format
     /// cannot express (a feature split both numerically and categorically).
@@ -1506,8 +1507,8 @@ mod tests {
     use super::*;
     use crate::config::{BoosterKind, GrowPolicy, TrainingParams, TreeMethod};
     use crate::data::FeatureType;
-    use crate::learner::{train, train_with_eval};
     use crate::test_support::labeled_dense;
+    use crate::training::{Trainer, train};
 
     /// Deterministic pseudo-random value in `[0, 1)`.
     fn noise(i: usize) -> f32 {
@@ -1726,7 +1727,10 @@ mod tests {
         let yv: Vec<f32> = yv.iter().map(|v| -v).collect();
         let valid = labeled_dense(&xv, 200, 3, &yv);
         let params = TrainingParams::builder().build().unwrap();
-        let model = train_with_eval(&params, &data, 50, &[(&valid, "valid")], Some(3))
+        let model = Trainer::new(&params, &data, 50)
+            .eval(&valid, "valid")
+            .early_stopping_rounds(3)
+            .train()
             .unwrap()
             .model;
         let best = model.best_iteration().expect("early stopping triggers");

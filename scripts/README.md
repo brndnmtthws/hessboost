@@ -72,17 +72,19 @@ with squared-error and logistic round-0 Hessians).
    when the case has none), from optional fixture fields:
    - `continuation` (`first_rounds`, `xgb_model_initial`): XGBoost trained
      `first_rounds`, saved the model, and continued to `num_round` with
-     `xgb_model=`. Train parity then runs `train` + `train_continue` the same
-     way, and the imported initial model is continued and compared too.
+     `xgb_model=`. Train parity then runs `train` + `Trainer::init_model`
+     the same way, and the imported initial model is continued and compared
+     too.
    - `refresh` (`n_rows`, `y`, `rounds`, `refresh_leaf`, `xgb_pred`):
      `process_type=update` + `updater=refresh` of the final model on the first
      `n_rows` training rows relabelled `y`; hessboost refreshes the imported
-     model (and, for `exact`-tier cases, its own) with `train_continue`.
+     model (and, for `exact`-tier cases, its own) with `Trainer::init_model`.
    - `ranges` / `range_contribs` / `slices`: `iteration_range=(begin, end)`
-     margins, prefix-range contributions and leaf indices on the
-     contribution rows, and `booster[begin:end:step]` margins. Checked on the
-     imported model (leaf ids included) and, for `exact`-tier cases, the
-     trained model.
+     margins (hessboost's `predict_margin_range(begin..end)`), prefix-range
+     contributions and leaf indices on the contribution rows, and
+     `booster[begin:end:step]` margins (`slice(begin..end, step)`). Checked
+     on the imported model (leaf ids included) and, for `exact`-tier cases,
+     the trained model.
 
 `quantile_cuts_match_xgboost` compares the cut oracles bit-for-bit with
 `HistCuts::from_dmatrix` (`hist`) and `HistCuts::from_dmatrix_weighted` with
@@ -116,7 +118,7 @@ Optional fixture fields extend the schema for metadata beyond plain labels:
   labeled test set (labels, bounds, groups, `test_weights`) for cases built
   with the `evals` option. The metrics are the params' `eval_metric` list, or
   the objective's default metric when it is absent. The Rust side trains with
-  `train_with_eval` on the same set and requires the same metric names and,
+  a `Trainer` watching the same set and requires the same metric names and,
   every round, `|hessboost - xgboost| <= tol.evals * max(1, |xgboost|)`
   (`tol.evals` = 1e-5; column `evals`, `-` for cases without oracles).
 

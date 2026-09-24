@@ -4,6 +4,7 @@
 //! determinism, dense/sparse prediction equivalence, monotone-constraint
 //! guarantees, and lossless model round-trips.
 
+use hessboost::config::Monotone;
 use hessboost::prelude::*;
 use proptest::prelude::*;
 

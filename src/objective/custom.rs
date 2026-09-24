@@ -1,7 +1,7 @@
 //! User-defined objective hook.
 //!
 //! Wraps caller-supplied closures so any custom loss can drive training via
-//! [`crate::learner::train_with_objective`]. The gradient closure receives raw
+//! [`crate::training::Trainer`]. The gradient closure receives raw
 //! margins and writes gradient/Hessian pairs, matching the built-in objectives.
 
 use super::{GradPair, Objective, SplitGradient};

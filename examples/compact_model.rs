@@ -9,6 +9,7 @@
 //!
 //! Run with: `cargo run --release --example compact_model`
 
+use hessboost::model::compact::CompactModel;
 use hessboost::prelude::*;
 
 mod common;

@@ -3,7 +3,9 @@
 //! full-precision training, full-precision leaf renewal, and parameter
 //! validation.
 
-use hessboost::config::TrainingParamsBuilder;
+use hessboost::config::{
+    BoosterKind, GrowPolicy, MultiStrategy, TrainingParamsBuilder, TreeMethod,
+};
 use hessboost::prelude::*;
 
 mod common;

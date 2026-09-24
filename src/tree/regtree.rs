@@ -75,6 +75,62 @@ impl Node {
     }
 }
 
+/// How an internal node routes rows: the feature it tests, the test, and the
+/// direction rows missing that feature take. Passed to [`RegTree::expand`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SplitRule<'a> {
+    feature: u32,
+    test: SplitTest<'a>,
+    default_left: bool,
+}
+
+/// The test of a [`SplitRule`].
+#[derive(Debug, Clone, Copy)]
+enum SplitTest<'a> {
+    /// Rows with `value < threshold` go left, other present values right.
+    Threshold(f32),
+    /// Rows whose category is in the set go left, other present categories
+    /// right.
+    Categories(&'a [u32]),
+}
+
+impl<'a> SplitRule<'a> {
+    /// A numeric split: `x[feature] < threshold` goes left, missing values
+    /// follow `default_left`.
+    pub(crate) fn numeric(feature: u32, threshold: f32, default_left: bool) -> Self {
+        SplitRule {
+            feature,
+            test: SplitTest::Threshold(threshold),
+            default_left,
+        }
+    }
+
+    /// A categorical (set-membership) split: instances whose value of
+    /// `feature` is one of `cats_left` go left, other present categories go
+    /// right, and missing values follow `default_left`.
+    pub(crate) fn categorical(feature: u32, cats_left: &'a [u32], default_left: bool) -> Self {
+        SplitRule {
+            feature,
+            test: SplitTest::Categories(cats_left),
+            default_left,
+        }
+    }
+}
+
+/// Initial weight and cover (Hessian sum) of a leaf created by
+/// [`RegTree::expand`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChildLeaf {
+    value: f32,
+    sum_hess: f32,
+}
+
+impl ChildLeaf {
+    pub(crate) fn new(value: f32, sum_hess: f32) -> Self {
+        ChildLeaf { value, sum_hess }
+    }
+}
+
 /// A regression tree: a flat node array with node `0` as the root.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RegTree {
@@ -311,80 +367,40 @@ impl RegTree {
         &self.nodes[id]
     }
 
-    /// Turn leaf `nid` into an internal node by attaching two child leaves.
-    /// Returns `(left_id, right_id)`.
+    /// Turn leaf `nid` into an internal node routing rows by `split`, with
+    /// two new child leaves `left` and `right`. Returns `(left_id, right_id)`.
     ///
-    /// Both builders overwrite these child values in their finalize pass (which
+    /// Both builders overwrite the child values in their finalize pass (which
     /// recomputes every leaf from stored stats and bounds), so the values here
     /// are placeholders on that path — but the parameters stay: directly built
     /// trees (tests, learners) rely on them as the real leaf weights.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn expand(
         &mut self,
         nid: usize,
-        split_feature: u32,
-        split_cond: f32,
-        default_left: bool,
-        left_value: f32,
-        left_hess: f32,
-        right_value: f32,
-        right_hess: f32,
+        split: SplitRule<'_>,
+        left: ChildLeaf,
+        right: ChildLeaf,
     ) -> (usize, usize) {
-        let n = &mut self.nodes[nid];
-        n.split_feature = split_feature;
-        n.split_cond = split_cond;
-        n.default_left = default_left;
-        self.attach_children(nid, left_value, left_hess, right_value, right_hess)
-    }
-
-    /// Turn leaf `nid` into a categorical (set-membership) internal node.
-    /// Instances whose value of `split_feature` is one of `cats_left` go to the
-    /// left child, other present categories go right, and missing values
-    /// follow `default_left`. Returns `(left_id, right_id)`.
-    ///
-    /// As in [`expand`](Self::expand), builders overwrite the child values when
-    /// finalizing; the parameters serve directly built trees.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn expand_categorical(
-        &mut self,
-        nid: usize,
-        split_feature: u32,
-        cats_left: &[u32],
-        default_left: bool,
-        left_value: f32,
-        left_hess: f32,
-        right_value: f32,
-        right_hess: f32,
-    ) -> (usize, usize) {
-        let begin = self.categories.len() as u32;
-        self.categories.extend_from_slice(cats_left);
-        let end = self.categories.len() as u32;
-        let n = &mut self.nodes[nid];
-        n.split_feature = split_feature;
-        n.is_categorical = true;
-        n.cat_begin = begin;
-        n.cat_end = end;
-        n.default_left = default_left;
-        self.attach_children(nid, left_value, left_hess, right_value, right_hess)
-    }
-
-    /// Push two child leaves of `nid` (with their zero leaf vectors) and
-    /// point `nid` at them. Returns `(left_id, right_id)`.
-    fn attach_children(
-        &mut self,
-        nid: usize,
-        left_value: f32,
-        left_hess: f32,
-        right_value: f32,
-        right_hess: f32,
-    ) -> (usize, usize) {
+        match split.test {
+            SplitTest::Threshold(cond) => self.nodes[nid].split_cond = cond,
+            SplitTest::Categories(cats_left) => {
+                let begin = self.categories.len() as u32;
+                self.categories.extend_from_slice(cats_left);
+                let n = &mut self.nodes[nid];
+                n.is_categorical = true;
+                n.cat_begin = begin;
+                n.cat_end = self.categories.len() as u32;
+            }
+        }
         let left_id = self.nodes.len();
         let right_id = left_id + 1;
-        self.nodes.push(Node::leaf(left_value, left_hess));
-        self.nodes.push(Node::leaf(right_value, right_hess));
         let n = &mut self.nodes[nid];
+        n.split_feature = split.feature;
+        n.default_left = split.default_left;
         n.left = left_id as i32;
         n.right = right_id as i32;
+        self.nodes.push(Node::leaf(left.value, left.sum_hess));
+        self.nodes.push(Node::leaf(right.value, right.sum_hess));
         self.grow_leaf_vectors();
         (left_id, right_id)
     }
@@ -408,7 +424,7 @@ impl RegTree {
     /// (shrinkage) so that stored trees already carry their scaled contribution,
     /// matching XGBoost's saved-model semantics. Leaf linear models are scaled
     /// with them.
-    pub fn scale_leaves(&mut self, factor: f32) {
+    pub(crate) fn scale_leaves(&mut self, factor: f32) {
         let k = self.size_leaf_vector;
         for (id, n) in self.nodes.iter_mut().enumerate() {
             if n.is_leaf() {
@@ -504,7 +520,12 @@ mod tests {
     ///   left leaf = -1.0, right leaf = +2.0
     fn stump() -> RegTree {
         let mut t = RegTree::with_root(10.0);
-        t.expand(0, 0, 0.5, true, -1.0, 5.0, 2.0, 5.0);
+        t.expand(
+            0,
+            SplitRule::numeric(0, 0.5, true),
+            ChildLeaf::new(-1.0, 5.0),
+            ChildLeaf::new(2.0, 5.0),
+        );
         t
     }
 
@@ -529,7 +550,12 @@ mod tests {
     fn routing_categorical_set_membership() {
         // Categorical split: categories {0, 2} go left, everything else right.
         let mut t = RegTree::with_root(10.0);
-        t.expand_categorical(0, 0, &[0, 2], false, -1.0, 5.0, 2.0, 5.0);
+        t.expand(
+            0,
+            SplitRule::categorical(0, &[0, 2], false),
+            ChildLeaf::new(-1.0, 5.0),
+            ChildLeaf::new(2.0, 5.0),
+        );
         assert!(t.node(0).is_categorical);
         // In-set categories route left (leaf 1, value -1.0).
         assert_eq!(t.leaf_id_with(|_| Some(0.0)), 1);

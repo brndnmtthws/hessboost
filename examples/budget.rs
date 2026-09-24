@@ -7,8 +7,9 @@
 //!
 //! Run with: `cargo run --release --example budget`
 
-use hessboost::metric::{LogLoss, Rmse};
+use hessboost::metric::{LogLoss, Metric, Rmse};
 use hessboost::prelude::*;
+use hessboost::training::budget::{BudgetConfig, train_with_budget};
 use std::time::Instant;
 
 mod common;
@@ -103,7 +104,11 @@ fn report(
         .eta(0.05)
         .build()?;
     let start = Instant::now();
-    let tuned = train_with_eval(&tuned_params, dtrain, 2000, &[(dvalid, "valid")], Some(50))?.model;
+    let tuned = Trainer::new(&tuned_params, dtrain, 2000)
+        .eval(dvalid, "valid")
+        .early_stopping_rounds(50)
+        .train()?
+        .model;
     let seconds = start.elapsed().as_secs_f64();
     let rounds = tuned.best_iteration().map_or(tuned.num_trees(), |b| b + 1);
     let value = score(&tuned.predict(dtest)?);

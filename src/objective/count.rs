@@ -46,26 +46,26 @@ macro_rules! log_link_objective {
 /// stabilized by `max_delta_step` (default 0.7 in XGBoost) via
 /// `exp(m + max_delta_step)`.
 #[derive(Debug, Clone, Copy)]
-pub struct PoissonObjective {
+pub struct Poisson {
     max_delta_step: f32,
 }
 
-impl PoissonObjective {
+impl Poisson {
     /// Create with the given Hessian-stabilizing max delta step.
     pub fn new(max_delta_step: f32) -> Self {
-        PoissonObjective { max_delta_step }
+        Poisson { max_delta_step }
     }
 }
 
-impl Default for PoissonObjective {
+impl Default for Poisson {
     fn default() -> Self {
-        PoissonObjective {
+        Poisson {
             max_delta_step: 0.7,
         }
     }
 }
 
-impl Objective for PoissonObjective {
+impl Objective for Poisson {
     fn name(&self) -> &'static str {
         "count:poisson"
     }
@@ -99,9 +99,9 @@ impl Objective for PoissonObjective {
 /// Gamma regression (`reg:gamma`), a log-link objective for positive targets.
 /// Gradient `1 − y·exp(−m)`, Hessian `y·exp(−m)`.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct GammaObjective;
+pub struct Gamma;
 
-impl Objective for GammaObjective {
+impl Objective for Gamma {
     fn name(&self) -> &'static str {
         "reg:gamma"
     }
@@ -139,24 +139,24 @@ impl Objective for GammaObjective {
 /// Tweedie regression (`reg:tweedie`) with variance power `rho ∈ [1, 2)`
 /// (XGBoost `tweedie_variance_power`; 1 is Poisson, 2 would be Gamma).
 #[derive(Debug, Clone, Copy)]
-pub struct TweedieObjective {
+pub struct Tweedie {
     rho: f32,
 }
 
-impl TweedieObjective {
+impl Tweedie {
     /// Create with the given Tweedie variance power.
     pub fn new(rho: f32) -> Self {
-        TweedieObjective { rho }
+        Tweedie { rho }
     }
 }
 
-impl Default for TweedieObjective {
+impl Default for Tweedie {
     fn default() -> Self {
-        TweedieObjective { rho: 1.5 }
+        Tweedie { rho: 1.5 }
     }
 }
 
-impl Objective for TweedieObjective {
+impl Objective for Tweedie {
     fn name(&self) -> &'static str {
         "reg:tweedie"
     }
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn poisson_gradient_at_log_mean_is_zero_sum() {
         // At margin = log(y) the gradient exp(m)-y = 0.
-        let obj = PoissonObjective::default();
+        let obj = Poisson::default();
         let labels = [2.0f32, 5.0];
         let preds = [2.0f32.ln(), 5.0f32.ln()];
         let out = gradient_pairs(&obj, &preds, &labels, None);
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn gamma_gradient_zero_at_log_y() {
-        let obj = GammaObjective;
+        let obj = Gamma;
         let labels = [3.0f32];
         let preds = [3.0f32.ln()];
         let out = gradient_pairs(&obj, &preds, &labels, None);
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn tweedie_transform_is_exp() {
-        let obj = TweedieObjective::default();
+        let obj = Tweedie::default();
         let mut p = [0.0f32, 1.0];
         obj.pred_transform(&mut p);
         assert_relative_eq!(p[0], 1.0, epsilon = 1e-6);
@@ -242,7 +242,7 @@ mod tests {
     /// trainer rejects rather than floors).
     #[test]
     fn log_link_intercept_is_ln_of_mean() {
-        let obj = PoissonObjective::default();
+        let obj = Poisson::default();
         assert_eq!(obj.base_margins(&[2.0, 6.0], None, None), vec![4f32.ln()]);
         let w = [3.0f32, 1.0];
         assert_eq!(
@@ -250,7 +250,7 @@ mod tests {
             vec![3f32.ln()]
         );
         assert_eq!(
-            GammaObjective.base_margins(&[0.0, 0.0], None, None),
+            Gamma.base_margins(&[0.0, 0.0], None, None),
             vec![f32::NEG_INFINITY]
         );
     }

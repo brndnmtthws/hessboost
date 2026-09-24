@@ -21,9 +21,9 @@
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::Result;
-use crate::learner::model::for_each_present_value;
-use crate::learner::{LinearModel, reject_split_gradient};
+use crate::model::for_each_present_value;
 use crate::objective::{GradPair, Objective};
+use crate::{model::LinearModel, training::reject_split_gradient};
 
 /// One feature's present entries, stored column-major as parallel `(row, value)`
 /// vectors so a coordinate update touches only the rows where the feature is

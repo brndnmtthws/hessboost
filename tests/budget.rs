@@ -3,8 +3,10 @@
 //! determinism, model compatibility, the objectives' pointwise losses, and
 //! the configuration contract.
 
-use hessboost::objective::create_objective;
+use hessboost::data::FeatureType;
+use hessboost::objective::{GradPair, create_objective};
 use hessboost::prelude::*;
+use hessboost::training::budget::{BudgetConfig, BudgetStop, train_with_budget};
 
 mod common;
 use common::{labeled_dense, lcg};
@@ -142,15 +144,12 @@ fn held_out_quality_is_comparable_to_validation_tuned_training() {
             .eta(0.05)
             .build()
             .unwrap();
-        let tuned = train_with_eval(
-            &tuned_params,
-            &train_set,
-            2000,
-            &[(&valid, "valid")],
-            Some(50),
-        )
-        .unwrap()
-        .model;
+        let tuned = Trainer::new(&tuned_params, &train_set, 2000)
+            .eval(&valid, "valid")
+            .early_stopping_rounds(50)
+            .train()
+            .unwrap()
+            .model;
         let untuned = train(&params(objective), &train_set, 100).unwrap();
         let (budget_loss, tuned_loss) = (loss(&budget.model, &test), loss(&tuned, &test));
         assert!(

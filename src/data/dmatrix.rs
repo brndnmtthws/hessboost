@@ -105,7 +105,7 @@ pub struct DMatrix {
 
 /// A single materialized `(feature_index, value)` entry from a row.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Entry {
+pub(crate) struct Entry {
     /// Column index of the feature.
     pub index: u32,
     /// Feature value (guaranteed non-missing when yielded by row iterators).
@@ -604,7 +604,7 @@ impl DMatrix {
 
     /// Materialize a single row's non-missing `(index, value)` entries into
     /// `out`. Reuses the buffer to avoid per-row allocation in hot loops.
-    pub fn row_into(&self, row: usize, out: &mut Vec<Entry>) {
+    pub(crate) fn row_into(&self, row: usize, out: &mut Vec<Entry>) {
         out.clear();
         if row >= self.n_rows {
             return;
@@ -615,7 +615,7 @@ impl DMatrix {
     /// Build a compressed-sparse-**column** view for column-oriented split
     /// finding (used by the exact tree method). Each column lists its
     /// non-missing `(row, value)` pairs.
-    pub fn to_csc(&self) -> CscView {
+    pub(crate) fn to_csc(&self) -> CscView {
         let mut col_counts = vec![0usize; self.n_cols];
         self.for_each_entry(|_row, col, _v| col_counts[col as usize] += 1);
 
@@ -701,7 +701,7 @@ impl DMatrix {
 /// in row order. Callers that need value-sorted order (e.g. the exact split
 /// finder) sort per-column slices themselves.
 #[derive(Debug, Clone)]
-pub struct CscView {
+pub(crate) struct CscView {
     n_rows: usize,
     n_cols: usize,
     col_ptr: Vec<usize>,

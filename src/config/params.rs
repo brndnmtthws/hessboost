@@ -292,8 +292,7 @@ pub struct TrainingParams {
     /// Maximum delta step allowed for each leaf weight; `Some(0.0)` means no
     /// constraint. `None` leaves XGBoost's objective-dependent default: `0.7`
     /// for `count:poisson` (where the same value also stabilizes the Poisson
-    /// Hessian), otherwise unconstrained. See
-    /// [`TrainingParams::effective_max_delta_step`]. XGBoost `max_delta_step`.
+    /// Hessian), otherwise unconstrained. XGBoost `max_delta_step`.
     pub max_delta_step: Option<f64>,
     /// Row subsample ratio per boosting round. XGBoost `subsample`.
     pub subsample: f64,
@@ -396,7 +395,7 @@ pub struct TrainingParams {
     /// ensemble does not use yet (Herrmann et al., *Boosted Trees on a Diet*,
     /// ICLR 2026, eq. 3). Same units as [`gamma`](Self::gamma); `0` (the
     /// default) disables it. Pair with
-    /// [`BoostedModel::to_compact_bytes`](crate::learner::BoostedModel::to_compact_bytes),
+    /// [`BoostedModel::to_compact_bytes`](crate::model::BoostedModel::to_compact_bytes),
     /// whose dictionaries shrink as features and thresholds are reused. The
     /// paper's `toad_penalty_feature`.
     pub toad_penalty_feature: f64,
@@ -751,7 +750,7 @@ impl TrainingParams {
     /// default when unset (`0.7` for `count:poisson`, which XGBoost's learner
     /// injects before configuring the objective and tree updater; `0`,
     /// unconstrained, otherwise).
-    pub fn effective_max_delta_step(&self) -> f64 {
+    pub(crate) fn effective_max_delta_step(&self) -> f64 {
         self.max_delta_step
             .unwrap_or(if self.objective == "count:poisson" {
                 0.7
@@ -761,7 +760,7 @@ impl TrainingParams {
     }
 }
 
-/// The objective hyper-parameters a trained [`BoostedModel`](crate::learner::BoostedModel)
+/// The objective hyper-parameters a trained [`BoostedModel`](crate::model::BoostedModel)
 /// retains. XGBoost saves them in the model's `objective` block, so they are
 /// needed to write an XGBoost-format model faithfully and to rebuild the
 /// objective when predicting. Tree-construction parameters are not retained.
@@ -769,8 +768,9 @@ impl TrainingParams {
 pub struct ObjectiveParams {
     /// XGBoost `scale_pos_weight` (`reg_loss_param`).
     pub scale_pos_weight: f64,
-    /// The effective `max_delta_step` (`poisson_regression_param`), see
-    /// [`TrainingParams::effective_max_delta_step`].
+    /// The effective `max_delta_step` (`poisson_regression_param`): the
+    /// configured [`TrainingParams::max_delta_step`], or `0.7` for
+    /// `count:poisson` and `0` otherwise when unset.
     pub max_delta_step: f64,
     /// XGBoost `tweedie_variance_power` (`tweedie_regression_param`).
     pub tweedie_variance_power: f64,
@@ -793,7 +793,7 @@ pub struct ObjectiveParams {
     pub dist_split_direction: DistSplitDirection,
     /// The distribution family of a `dist:*` objective, derived from the
     /// objective name (not a parameter): the `nll` / `crps` metrics read it.
-    pub distribution: Option<crate::objective::DistFamily>,
+    pub distribution: Option<crate::objective::distributional::DistFamily>,
 }
 
 impl ObjectiveParams {
@@ -811,7 +811,9 @@ impl ObjectiveParams {
             aft_loss_distribution_scale: p.aft_loss_distribution_scale,
             dist_gradient: p.dist_gradient,
             dist_split_direction: p.dist_split_direction,
-            distribution: crate::objective::DistFamily::from_objective(&p.objective),
+            distribution: crate::objective::distributional::DistFamily::from_objective(
+                &p.objective,
+            ),
         }
     }
 

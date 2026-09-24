@@ -27,7 +27,7 @@ pub use quantile::{ExpectileError, QuantileError};
 pub use ranking::Precision;
 pub use survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
 
-use crate::config::ObjectiveParams;
+use crate::config::{ObjectiveParams, TrainingParams};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 
@@ -708,15 +708,25 @@ impl Metric for CustomMetric {
     }
 }
 
-/// Resolve a metric by name. `num_class` is used by multiclass metrics, and
-/// `objective` carries the loss parameters that objective-dependent metrics
-/// read: `mphe` takes its slope from `huber_slope`, `aft-nloglik` the AFT
+/// The metric XGBoost calls `name` (e.g. `"auc"`, `"ndcg@5"`,
+/// `"tweedie-nloglik@1.5"`), configured from `params`: multiclass metrics
+/// read `num_class`, and objective-dependent metrics the loss parameters:
+/// `mphe` takes its slope from `huber_slope`, `aft-nloglik` the AFT
 /// distribution and scale, and `quantile` / `expectile` the configured
 /// `quantile_alpha` / `expectile_alpha` (whatever the objective, like
 /// XGBoost), failing when that list is empty or invalid. The distributional
 /// metrics `nll` and `crps` (beyond XGBoost) take the family of a `dist:*`
-/// objective from `objective.distribution` and fail without one.
-pub fn create_metric(
+/// objective and fail without one.
+pub fn create_metric(name: &str, params: &TrainingParams) -> Result<Box<dyn Metric>> {
+    build(
+        name,
+        params.num_class,
+        &ObjectiveParams::from_params(params),
+    )
+}
+
+/// [`create_metric`] from a model's retained objective parameters.
+pub(crate) fn build(
     name: &str,
     num_class: usize,
     objective: &ObjectiveParams,
@@ -797,7 +807,7 @@ pub fn create_metric(
 
 /// Build the list of metrics to evaluate: the user's `eval_metric` list if any,
 /// otherwise the single `default_name` supplied by the objective. `num_class`
-/// and `objective` are forwarded to [`create_metric`].
+/// and `objective` are forwarded to [`build`].
 ///
 /// XGBoost configures the default metric from the objective's
 /// `DefaultMetricConfig` but without the user's parameters (the learner has
@@ -805,7 +815,7 @@ pub fn create_metric(
 /// objective's distribution while the scale falls back to its default 1, so
 /// the default metric here is built the same way; list `aft-nloglik` in
 /// `eval_metric` to evaluate the likelihood at the configured scale.
-pub fn create_metrics(
+pub(crate) fn create_metrics(
     eval_metric: &[String],
     default_name: &str,
     num_class: usize,
@@ -816,15 +826,11 @@ pub fn create_metrics(
             aft_loss_distribution_scale: ObjectiveParams::default().aft_loss_distribution_scale,
             ..objective.clone()
         };
-        Ok(vec![create_metric(
-            default_name,
-            num_class,
-            &default_config,
-        )?])
+        Ok(vec![build(default_name, num_class, &default_config)?])
     } else {
         eval_metric
             .iter()
-            .map(|n| create_metric(n, num_class, objective))
+            .map(|n| build(n, num_class, objective))
             .collect()
     }
 }
@@ -949,7 +955,7 @@ mod tests {
             ("aft-nloglik", false),
             ("interval-regression-accuracy", false),
         ] {
-            let metric = create_metric(name, 3, &obj).unwrap();
+            let metric = build(name, 3, &obj).unwrap();
             assert_eq!(metric.supports_label_matrix(), supported, "{name}");
         }
     }
@@ -967,16 +973,16 @@ mod tests {
             }
         }
         for name in &names {
-            let err = create_metric(name, 0, &obj).err();
+            let err = build(name, 0, &obj).err();
             assert!(
                 matches!(err, Some(HessboostError::InvalidParameter { name: param, .. }) if param == "eval_metric"),
                 "{name}: {err:?}"
             );
         }
         for name in ["pre@1", "ndcg@0", "ndcg@3", "map@0", "map@5"] {
-            assert!(create_metric(name, 0, &obj).is_ok(), "{name}");
+            assert!(build(name, 0, &obj).is_ok(), "{name}");
         }
-        let m = create_metric("pre@2", 0, &obj).unwrap();
+        let m = build("pre@2", 0, &obj).unwrap();
         // All labels zero: no hits at any cutoff.
         assert_eq!(m.eval(&[0.9, 0.5, 0.1], &[0.0, 0.0, 0.0], None), 0.0);
     }
@@ -989,7 +995,7 @@ mod tests {
         let obj = ObjectiveParams {
             quantile_alpha: vec![0.2, 0.8],
             expectile_alpha: vec![0.5],
-            distribution: Some(crate::objective::DistFamily::Normal),
+            distribution: Some(crate::objective::distributional::DistFamily::Normal),
             ..ObjectiveParams::default()
         };
         let widths = [
@@ -1021,7 +1027,7 @@ mod tests {
         let labels = [1.0, 0.0, 1.0];
         let info = MetaInfo::new(&labels, None, None);
         for (name, width) in widths {
-            let metric = create_metric(name, 3, &obj).unwrap();
+            let metric = build(name, 3, &obj).unwrap();
             assert_eq!(metric.prediction_width(&info), Some(width), "{name}");
             let preds = vec![0.5f32; labels.len() * width + 1];
             let valid = &preds[..labels.len() * width];
@@ -1131,7 +1137,7 @@ mod tests {
             ("ndcg@5", "ndcg"),
             ("map@10", "map"),
         ] {
-            let metric = create_metric(name, 0, &ObjectiveParams::default()).unwrap();
+            let metric = build(name, 0, &ObjectiveParams::default()).unwrap();
             assert_eq!(metric.name(), base, "{name}");
         }
     }
@@ -1141,7 +1147,7 @@ mod tests {
         let m = AucPr;
         assert!(m.maximize());
         assert_eq!(
-            create_metric("aucpr", 0, &ObjectiveParams::default())
+            build("aucpr", 0, &ObjectiveParams::default())
                 .unwrap()
                 .name(),
             "aucpr"

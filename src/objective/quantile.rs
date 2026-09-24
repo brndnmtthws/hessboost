@@ -58,18 +58,18 @@ pub(crate) fn validate_alphas(param: &'static str, alphas: &[f64]) -> Result<Vec
 /// `WeightedQuantile`). Predictions sort each row's outputs ascending, so
 /// reported quantiles never cross; there is no link function.
 #[derive(Debug, Clone)]
-pub struct QuantileObjective {
+pub struct Quantile {
     alpha: Vec<f32>,
 }
 
-impl QuantileObjective {
+impl Quantile {
     /// Create for the quantile levels `alpha` (XGBoost `quantile_alpha`).
     ///
     /// # Errors
     ///
     /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
     pub fn new(alpha: &[f64]) -> Result<Self> {
-        Ok(QuantileObjective {
+        Ok(Quantile {
             alpha: validate_alphas("quantile_alpha", alpha)?,
         })
     }
@@ -148,7 +148,7 @@ fn weighted_quantile(alpha: f32, labels: &[f32], weights: &[f32], order: &[usize
     labels[order[idx]]
 }
 
-impl Objective for QuantileObjective {
+impl Objective for Quantile {
     fn name(&self) -> &'static str {
         "reg:quantileerror"
     }
@@ -259,18 +259,18 @@ impl Objective for QuantileObjective {
 /// (weighted) label mean, plus the mean, made non-decreasing by a running
 /// maximum, then mapped to margins with the inverse softplus gaps.
 #[derive(Debug, Clone)]
-pub struct ExpectileObjective {
+pub struct Expectile {
     alpha: Vec<f32>,
 }
 
-impl ExpectileObjective {
+impl Expectile {
     /// Create for the expectile levels `alpha` (XGBoost `expectile_alpha`).
     ///
     /// # Errors
     ///
     /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
     pub fn new(alpha: &[f64]) -> Result<Self> {
-        Ok(ExpectileObjective {
+        Ok(Expectile {
             alpha: validate_alphas("expectile_alpha", alpha)?,
         })
     }
@@ -300,7 +300,7 @@ fn expectile_scale(diff: f32, alpha: f32) -> f32 {
     if diff >= 0.0 { 1.0 - alpha } else { alpha }
 }
 
-impl Objective for ExpectileObjective {
+impl Objective for Expectile {
     fn name(&self) -> &'static str {
         "reg:expectileerror"
     }
@@ -373,7 +373,7 @@ impl Objective for ExpectileObjective {
         }
     }
 
-    /// Inverse of [`ExpectileObjective::pred_transform`] on one row: each
+    /// Inverse of [`Expectile::pred_transform`] on one row: each
     /// later entry becomes the inverse softplus of its gap to the previous
     /// prediction, less `1e-6` (XGBoost `ProbToMargin`).
     fn probs_to_margins(&self, scores: &mut [f32]) {
@@ -425,16 +425,17 @@ impl Objective for ExpectileObjective {
 mod tests {
     use super::*;
     use crate::objective::gradient_pairs;
+    use crate::training::Trainer;
 
     #[test]
     fn alpha_lists_are_validated() {
         for bad in [&[][..], &[0.5, 0.2], &[-0.1], &[1.5], &[f64::NAN]] {
-            assert!(QuantileObjective::new(bad).is_err(), "{bad:?}");
-            assert!(ExpectileObjective::new(bad).is_err(), "{bad:?}");
+            assert!(Quantile::new(bad).is_err(), "{bad:?}");
+            assert!(Expectile::new(bad).is_err(), "{bad:?}");
         }
         // Equal neighbours and both endpoints are allowed.
-        assert!(QuantileObjective::new(&[0.0, 0.5, 0.5, 1.0]).is_ok());
-        assert!(ExpectileObjective::new(&[0.0, 1.0]).is_ok());
+        assert!(Quantile::new(&[0.0, 0.5, 0.5, 1.0]).is_ok());
+        assert!(Expectile::new(&[0.0, 1.0]).is_ok());
     }
 
     /// With 19 zero residuals and one of −4, the scale is `S = (2/20)² =
@@ -443,7 +444,7 @@ mod tests {
     /// `3e-4`.
     #[test]
     fn quantile_gradient_at_zero_and_saturated_residuals() {
-        let obj = QuantileObjective::new(&[0.25]).unwrap();
+        let obj = Quantile::new(&[0.25]).unwrap();
         let mut labels = vec![0.0f32; 20];
         labels[19] = 4.0;
         let out = gradient_pairs(&obj, &[0.0; 20], &labels, None);
@@ -460,7 +461,7 @@ mod tests {
     /// weight zeroes its pair while the others keep the weighted scale.
     #[test]
     fn quantile_gradient_zero_scale_and_zero_weight() {
-        let obj = QuantileObjective::new(&[0.5]).unwrap();
+        let obj = Quantile::new(&[0.5]).unwrap();
         let out = gradient_pairs(&obj, &[1.0, 2.0], &[1.0, 2.0], None);
         assert!(out.iter().all(|p| *p == GradPair::new(0.0, 0.0)));
 
@@ -482,7 +483,7 @@ mod tests {
     /// Every output uses its own alpha and its own scale.
     #[test]
     fn quantile_outputs_use_their_own_alpha() {
-        let obj = QuantileObjective::new(&[0.1, 0.9]).unwrap();
+        let obj = Quantile::new(&[0.1, 0.9]).unwrap();
         let out = gradient_pairs(&obj, &[0.0, 0.0], &[0.0], None);
         // r = 0 on both outputs but S = 0 there too: zero pairs.
         assert_eq!(out, vec![GradPair::default(); 2]);
@@ -499,7 +500,7 @@ mod tests {
 
     #[test]
     fn quantile_transform_sorts_each_row() {
-        let obj = QuantileObjective::new(&[0.1, 0.5, 0.9]).unwrap();
+        let obj = Quantile::new(&[0.1, 0.5, 0.9]).unwrap();
         let mut p = [3.0, 1.0, 2.0, 0.0, 5.0, -1.0];
         obj.pred_transform(&mut p);
         assert_eq!(p, [1.0, 2.0, 3.0, -1.0, 0.0, 5.0]);
@@ -509,7 +510,7 @@ mod tests {
     /// ends; weighted ones step through the cumulative weights.
     #[test]
     fn quantile_intercepts() {
-        let obj = QuantileObjective::new(&[0.1, 0.25, 0.5, 0.9]).unwrap();
+        let obj = Quantile::new(&[0.1, 0.25, 0.5, 0.9]).unwrap();
         let labels = [4.0f32, 1.0, 3.0, 2.0];
         // n = 4: α ≤ 0.2 → min; 0.25·5 = 1.25 → v0 + 0.25(v1−v0) = 1.25;
         // 0.5·5 = 2.5 → 2.5; α ≥ 0.8 → max.
@@ -529,7 +530,7 @@ mod tests {
 
     #[test]
     fn expectile_transform_is_monotone_and_inverts() {
-        let obj = ExpectileObjective::new(&[0.1, 0.5, 0.9]).unwrap();
+        let obj = Expectile::new(&[0.1, 0.5, 0.9]).unwrap();
         let mut p = [2.0, -30.0, 3.0];
         obj.pred_transform(&mut p);
         assert_eq!(p[0], 2.0);
@@ -551,12 +552,12 @@ mod tests {
     /// is scaled by `sigmoid(u)`.
     #[test]
     fn expectile_gradient_formulas() {
-        let single = ExpectileObjective::new(&[0.2]).unwrap();
+        let single = Expectile::new(&[0.2]).unwrap();
         let out = gradient_pairs(&single, &[1.0, -1.0], &[0.0, 0.0], Some(&[2.0, 0.0]));
         assert_eq!(out[0], GradPair::new(0.8 * 1.0 * 2.0, 0.8 * 2.0));
         assert_eq!(out[1], GradPair::new(0.0, 0.0));
 
-        let obj = ExpectileObjective::new(&[0.2, 0.8]).unwrap();
+        let obj = Expectile::new(&[0.2, 0.8]).unwrap();
         let out = gradient_pairs(&obj, &[0.0, 0.0], &[1.0], None);
         let q1 = K_RT_EPS_F32 + softplus(0.0);
         let (d0, d1) = (-1.0f32, q1 - 1.0);
@@ -568,10 +569,10 @@ mod tests {
 
     #[test]
     fn expectile_intercept_is_newton_step_from_mean_then_running_max() {
-        let obj = ExpectileObjective::new(&[0.5]).unwrap();
+        let obj = Expectile::new(&[0.5]).unwrap();
         // α = 0.5 is the mean.
         assert_eq!(obj.base_margins(&[1.0, 2.0, 6.0], None, None), vec![3.0]);
-        let obj = ExpectileObjective::new(&[0.1, 0.9]).unwrap();
+        let obj = Expectile::new(&[0.1, 0.9]).unwrap();
         let labels = [0.0f32, 0.0, 0.0, 10.0];
         let mut q = obj.base_margins(&labels, None, None);
         obj.pred_transform(&mut q);
@@ -584,7 +585,7 @@ mod tests {
             "{q:?}"
         );
         // A running max keeps equal alphas' intercepts ordered.
-        let tied = ExpectileObjective::new(&[0.5, 0.5]).unwrap();
+        let tied = Expectile::new(&[0.5, 0.5]).unwrap();
         let mut q = tied.base_margins(&labels, None, None);
         tied.pred_transform(&mut q);
         assert!(q[1] >= q[0]);
@@ -612,8 +613,10 @@ mod tests {
             .eta(0.3)
             .build()
             .unwrap();
-        let result =
-            crate::learner::train_with_eval(&params, &d, 30, &[(&d, "train")], None).unwrap();
+        let result = Trainer::new(&params, &d, 30)
+            .eval(&d, "train")
+            .train()
+            .unwrap();
         let history = &result.history;
         assert_eq!(history[0].scores[0].1, "quantile");
         assert!(history.last().unwrap().scores[0].2 < history[0].scores[0].2);
@@ -636,7 +639,7 @@ mod tests {
     /// export-side mapping is the identity, not the sorting transform.
     #[test]
     fn quantile_intercepts_export_unsorted() {
-        let obj = QuantileObjective::new(&[0.1, 0.9]).unwrap();
+        let obj = Quantile::new(&[0.1, 0.9]).unwrap();
         let mut stored = [10.0f32, 0.0];
         obj.margins_to_probs(&mut stored);
         assert_eq!(stored, [10.0, 0.0]);
@@ -647,7 +650,7 @@ mod tests {
     #[test]
     fn quantile_xgboost_round_trip_keeps_intercept_order() {
         use crate::config::TrainingParams;
-        use crate::learner::BoostedModel;
+        use crate::model::BoostedModel;
         let n = 32;
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let d = crate::test_support::labeled_dense(&x, n, 1, &x);
@@ -657,7 +660,7 @@ mod tests {
             .max_depth(2)
             .build()
             .unwrap();
-        let mut model = crate::learner::train(&params, &d, 3).unwrap();
+        let mut model = crate::training::train(&params, &d, 3).unwrap();
         model.set_base_scores(vec![10.0, 0.0]);
         let restored = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
         assert_eq!(restored.base_scores(), [10.0, 0.0]);
@@ -686,12 +689,12 @@ mod tests {
             .unwrap();
         let params = TrainingParams::builder().build().unwrap();
         let objectives: [Box<dyn Objective>; 2] = [
-            Box::new(QuantileObjective::new(&[0.1, 0.9]).unwrap()),
-            Box::new(ExpectileObjective::new(&[0.1, 0.9]).unwrap()),
+            Box::new(Quantile::new(&[0.1, 0.9]).unwrap()),
+            Box::new(Expectile::new(&[0.1, 0.9]).unwrap()),
         ];
         for obj in &objectives {
             assert!(matches!(
-                crate::learner::train_with_objective(&params, &d, 1, obj.as_ref()),
+                Trainer::new(&params, &d, 1).objective(obj.as_ref()).train(),
                 Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
             ));
         }
@@ -703,17 +706,17 @@ mod tests {
     #[test]
     fn training_refuses_alphas_the_saved_model_cannot_rebuild() {
         use crate::config::TrainingParams;
-        use crate::learner::BoostedModel;
+        use crate::model::BoostedModel;
         let d =
             crate::test_support::labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 1.0, 2.0, 3.0]);
-        let obj = QuantileObjective::new(&[0.1, 0.9]).unwrap();
+        let obj = Quantile::new(&[0.1, 0.9]).unwrap();
         for alphas in [vec![], vec![0.5]] {
             let params = TrainingParams::builder()
                 .quantile_alpha(alphas)
                 .build()
                 .unwrap();
             assert!(matches!(
-                crate::learner::train_with_objective(&params, &d, 1, &obj),
+                Trainer::new(&params, &d, 1).objective(&obj).train(),
                 Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
             ));
         }
@@ -721,7 +724,11 @@ mod tests {
             .quantile_alpha(vec![0.1, 0.9])
             .build()
             .unwrap();
-        let model = crate::learner::train_with_objective(&params, &d, 1, &obj).unwrap();
+        let model = Trainer::new(&params, &d, 1)
+            .objective(&obj)
+            .train()
+            .unwrap()
+            .model;
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
     }
 }

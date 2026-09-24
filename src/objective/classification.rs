@@ -16,12 +16,12 @@ use crate::error::Result;
 /// `max(p (1 − p), ε)`. `scale_pos_weight` rescales the loss of positive
 /// instances to combat class imbalance, exactly as in XGBoost.
 #[derive(Debug, Clone, Copy)]
-pub struct LogisticObjective {
+pub struct Logistic {
     scale_pos_weight: f32,
     variant: LogisticVariant,
 }
 
-/// Which XGBoost objective a [`LogisticObjective`] is.
+/// Which XGBoost objective a [`Logistic`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogisticVariant {
     /// `binary:logistic`.
@@ -32,10 +32,10 @@ enum LogisticVariant {
     Raw,
 }
 
-impl LogisticObjective {
+impl Logistic {
     /// `binary:logistic` with the given positive-class weight.
     pub fn new(scale_pos_weight: f32) -> Self {
-        LogisticObjective {
+        Logistic {
             scale_pos_weight,
             variant: LogisticVariant::Binary,
         }
@@ -44,7 +44,7 @@ impl LogisticObjective {
     /// `reg:logistic` with the given positive-class weight: the same loss,
     /// named and evaluated (`rmse`) as XGBoost's probability regression.
     pub fn regression(scale_pos_weight: f32) -> Self {
-        LogisticObjective {
+        Logistic {
             scale_pos_weight,
             variant: LogisticVariant::Regression,
         }
@@ -55,20 +55,20 @@ impl LogisticObjective {
     /// XGBoost's `LogisticRaw`. Its unweighted-positive intercept is the
     /// plain label mean, taken as a margin.
     pub fn raw(scale_pos_weight: f32) -> Self {
-        LogisticObjective {
+        Logistic {
             scale_pos_weight,
             variant: LogisticVariant::Raw,
         }
     }
 }
 
-impl Default for LogisticObjective {
+impl Default for Logistic {
     fn default() -> Self {
         Self::new(1.0)
     }
 }
 
-impl Objective for LogisticObjective {
+impl Objective for Logistic {
     fn name(&self) -> &str {
         match self.variant {
             LogisticVariant::Binary => "binary:logistic",
@@ -174,9 +174,9 @@ impl Objective for LogisticObjective {
 /// threshold (XGBoost `FitIntercept`), so it is `0` or `1`. Labels are not
 /// validated (upstream expects `{0, 1}` but does not check).
 #[derive(Debug, Clone, Copy, Default)]
-pub struct HingeObjective;
+pub struct Hinge;
 
-impl Objective for HingeObjective {
+impl Objective for Hinge {
     fn name(&self) -> &'static str {
         "binary:hinge"
     }
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn sigmoid_symmetry() {
         let mut values = [0.0, 2.0, -2.0, 80.0, -80.0];
-        LogisticObjective::default().pred_transform(&mut values);
+        Logistic::default().pred_transform(&mut values);
         assert_relative_eq!(values[0], 0.5, epsilon = 1e-6);
         assert_relative_eq!(values[1] + values[2], 1.0, epsilon = 1e-6);
         // Extreme values do not overflow.
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn gradient_matches_closed_form() {
-        let obj = LogisticObjective::default();
+        let obj = Logistic::default();
         // margin 0 -> p = 0.5
         let preds = [0.0f32];
         let labels = [1.0f32];
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn scale_pos_weight_scales_positive() {
-        let obj = LogisticObjective::new(3.0);
+        let obj = Logistic::new(3.0);
         let preds = [0.0f32, 0.0];
         let labels = [1.0f32, 0.0];
         let out = gradient_pairs(&obj, &preds, &labels, None);
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn base_margins_is_logit_of_rate() {
-        let obj = LogisticObjective::default();
+        let obj = Logistic::default();
         // 50% positive -> logit(0.5) = 0; 25% -> -ln(3) with XGBoost's f32 logit.
         assert_eq!(obj.base_margins(&[1.0, 0.0], None, None), vec![0.0]);
         let quarter = obj.base_margins(&[1.0, 0.0, 0.0, 0.0], None, None);
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn prob_to_margin_clamps_to_xgboost_bounds() {
-        let obj = LogisticObjective::default();
+        let obj = Logistic::default();
         assert_eq!(obj.prob_to_margin(0.0), obj.prob_to_margin(1e-6));
         assert_eq!(obj.prob_to_margin(1.0), obj.prob_to_margin(1.0 - 1e-6));
         assert!(obj.prob_to_margin(0.0).is_finite());
@@ -278,7 +278,7 @@ mod tests {
     /// (XGBoost stores the mean as the margin, not its logit).
     #[test]
     fn logitraw_keeps_margins_and_uses_mean_intercept() {
-        let raw = LogisticObjective::raw(1.0);
+        let raw = Logistic::raw(1.0);
         let mut values = [-3.0f32, 0.5];
         raw.pred_transform(&mut values);
         assert_eq!(values, [-3.0, 0.5]);
@@ -289,7 +289,7 @@ mod tests {
         let (preds, labels) = ([0.3, -1.2], [1.0, 0.0]);
         assert_eq!(
             gradient_pairs(&raw, &preds, &labels, None),
-            gradient_pairs(&LogisticObjective::new(1.0), &preds, &labels, None)
+            gradient_pairs(&Logistic::new(1.0), &preds, &labels, None)
         );
     }
 
@@ -297,7 +297,7 @@ mod tests {
     /// rest a zero gradient with the minimal positive Hessian.
     #[test]
     fn hinge_gradient_and_threshold() {
-        let obj = HingeObjective;
+        let obj = Hinge;
         let out = gradient_pairs(
             &obj,
             &[0.5, 1.0, -0.5, -2.0],
@@ -318,7 +318,7 @@ mod tests {
     /// keeps the margin because hinge's `ProbToMargin` is the identity.
     #[test]
     fn hinge_intercept_is_thresholded_newton_step() {
-        let obj = HingeObjective;
+        let obj = Hinge;
         // Step = -Σg/Σh = (3 - 1)/4 = 0.5 > 0 -> 1.
         assert_eq!(
             obj.base_margins(&[1.0, 1.0, 1.0, 0.0], None, None),

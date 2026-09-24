@@ -12,22 +12,22 @@ use crate::error::Result;
 /// (report per-class probabilities) from `multi:softmax` (report the argmax
 /// class), but both share identical gradients.
 #[derive(Debug, Clone, Copy)]
-pub struct SoftmaxObjective {
+pub struct Softmax {
     num_class: usize,
     output_prob: bool,
 }
 
-impl SoftmaxObjective {
+impl Softmax {
     /// Create a softmax objective over `num_class` classes.
     pub fn new(num_class: usize, output_prob: bool) -> Self {
-        SoftmaxObjective {
+        Softmax {
             num_class,
             output_prob,
         }
     }
 }
 
-impl Objective for SoftmaxObjective {
+impl Objective for Softmax {
     fn name(&self) -> &str {
         if self.output_prob {
             "multi:softprob"
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn gradient_layout_and_values() {
         // 2 instances, 3 classes, all margins 0 -> uniform p = 1/3.
-        let obj = SoftmaxObjective::new(3, true);
+        let obj = Softmax::new(3, true);
         let preds = [0.0f32; 6];
         let labels = [0.0f32, 2.0];
         let mut out = vec![GradPair::default(); 6];
@@ -141,7 +141,7 @@ mod tests {
     /// gives all-zero margins.
     #[test]
     fn base_margins_are_centered_log_frequencies() {
-        let obj = SoftmaxObjective::new(3, true);
+        let obj = Softmax::new(3, true);
         let labels = [0.0f32, 0.0, 1.0, 2.0];
         let m = obj.base_margins(&labels, None, None);
         assert_eq!(m.len(), 3);

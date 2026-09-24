@@ -3,8 +3,8 @@
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::learner::train::train_with_eval;
 use crate::rng::Rng;
+use crate::training::Trainer;
 use std::collections::BTreeMap;
 
 /// Per-metric cross-validation history, aggregated across folds.
@@ -61,7 +61,9 @@ pub fn cv(
             .collect();
         let dtrain = data.select_rows(&train_rows)?;
         let dtest = data.select_rows(test_rows)?;
-        let res = train_with_eval(params, &dtrain, num_boost_round, &[(&dtest, "test")], None)?;
+        let res = Trainer::new(params, &dtrain, num_boost_round)
+            .eval(&dtest, "test")
+            .train()?;
         for round in &res.history {
             for (_ds, metric, value) in &round.scores {
                 let entry = collected.entry(metric.clone()).or_default();

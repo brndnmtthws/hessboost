@@ -61,7 +61,7 @@ pub(crate) fn feature_slices<'a, T>(
 
 /// Backend that builds and combines gradient histograms.
 ///
-/// Sibling histograms reuse the parent buffer via the free [`subtract_in_place`];
+/// Sibling histograms reuse the parent buffer via the free `subtract_in_place`;
 /// there is intentionally no `subtract` hook (a three-slice method would only
 /// add an allocation).
 pub trait HistogramBackend: Send + Sync {

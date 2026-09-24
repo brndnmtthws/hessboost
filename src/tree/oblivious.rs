@@ -194,29 +194,64 @@ impl SymmetricTables {
 #[cfg(test)]
 mod tests {
     use crate::config::{GrowPolicy, TrainingParams, TreeMethod};
-    use crate::learner::train;
     use crate::test_support::labeled_dense;
-    use crate::tree::RegTree;
-    use crate::tree::compact::{CompactForest, LANES, split_lanes};
+    use crate::training::train;
+    use crate::tree::compact::{CompactForest, LANES, LaneBlock, split_lanes};
+    use crate::tree::{ChildLeaf, RegTree, SplitRule};
 
     /// Level 0: `f0 < 0.5`, missing left. Level 1: `f1 < 2`, missing right,
     /// on the left child only; the right child is a collapsed leaf. Level 2:
     /// `f2 < -1`, missing left, under both level-1 nodes.
     fn collapsed_tree() -> RegTree {
         let mut t = RegTree::with_root(1.0);
-        let (l, _) = t.expand(0, 0, 0.5, true, 0.0, 1.0, 7.0, 1.0);
-        let (ll, lr) = t.expand(l, 1, 2.0, false, 0.0, 1.0, 0.0, 1.0);
-        t.expand(ll, 2, -1.0, true, -3.0, 1.0, -2.0, 1.0);
-        t.expand(lr, 2, -1.0, true, 1.5, 1.0, 2.5, 1.0);
+        let (l, _) = t.expand(
+            0,
+            SplitRule::numeric(0, 0.5, true),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(7.0, 1.0),
+        );
+        let (ll, lr) = t.expand(
+            l,
+            SplitRule::numeric(1, 2.0, false),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(0.0, 1.0),
+        );
+        t.expand(
+            ll,
+            SplitRule::numeric(2, -1.0, true),
+            ChildLeaf::new(-3.0, 1.0),
+            ChildLeaf::new(-2.0, 1.0),
+        );
+        t.expand(
+            lr,
+            SplitRule::numeric(2, -1.0, true),
+            ChildLeaf::new(1.5, 1.0),
+            ChildLeaf::new(2.5, 1.0),
+        );
         t
     }
 
     /// A tree whose second level splits two nodes differently.
     fn asymmetric_tree() -> RegTree {
         let mut t = RegTree::with_root(1.0);
-        let (l, r) = t.expand(0, 0, 0.5, true, 0.0, 1.0, 0.0, 1.0);
-        t.expand(l, 1, 2.0, false, 1.0, 1.0, 2.0, 1.0);
-        t.expand(r, 1, 3.0, false, 3.0, 1.0, 4.0, 1.0);
+        let (l, r) = t.expand(
+            0,
+            SplitRule::numeric(0, 0.5, true),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(0.0, 1.0),
+        );
+        t.expand(
+            l,
+            SplitRule::numeric(1, 2.0, false),
+            ChildLeaf::new(1.0, 1.0),
+            ChildLeaf::new(2.0, 1.0),
+        );
+        t.expand(
+            r,
+            SplitRule::numeric(1, 3.0, false),
+            ChildLeaf::new(3.0, 1.0),
+            ChildLeaf::new(4.0, 1.0),
+        );
         t
     }
 
@@ -226,7 +261,12 @@ mod tests {
         let mut t = RegTree::with_root(1.0);
         let mut node = 0;
         for d in 0..depth {
-            let (l, _) = t.expand(node, 0, d as f32, true, 0.0, 1.0, d as f32, 1.0);
+            let (l, _) = t.expand(
+                node,
+                SplitRule::numeric(0, d as f32, true),
+                ChildLeaf::new(0.0, 1.0),
+                ChildLeaf::new(d as f32, 1.0),
+            );
             node = l;
         }
         t
@@ -281,11 +321,17 @@ mod tests {
         let n = 5 * LANES + 7;
         let data = rows(n, n_cols);
         let (lanes, tail) = split_lanes(&data, n_cols);
+        let block = LaneBlock {
+            lanes: &lanes,
+            tail,
+            n_cols,
+            rows: n,
+        };
         for (t, tree) in trees.iter().enumerate() {
             let mut margins = vec![0.25f32; n];
-            forest.accumulate(t, &lanes, tail, n_cols, n, 1.0, &mut margins, 1);
+            forest.accumulate(t, block, 1.0, &mut margins, 1);
             let mut leaves = vec![0u32; n];
-            forest.original_leaf_ids(t, &lanes, tail, n_cols, n, &mut leaves, 1);
+            forest.original_leaf_ids(t, block, &mut leaves, 1);
             for (r, row) in data.chunks_exact(n_cols).enumerate() {
                 let leaf = tree.leaf_id_dense(row, f32::NAN);
                 assert_eq!(leaves[r] as usize, leaf, "tree {t} row {r} {row:?}");

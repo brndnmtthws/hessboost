@@ -497,7 +497,7 @@ fn poisson_matches_count_poisson_without_max_delta_step() {
     let labels = [2.0f32, 0.0, 14.0, 1.0];
     let weights = [1.0f32, 0.5, 2.0, 1.5];
     let dist = DistObjective::new(DistFamily::Poisson, DistGradient::Fisher);
-    let count = crate::objective::PoissonObjective::new(0.0);
+    let count = crate::objective::Poisson::new(0.0);
     for w in [None, Some(weights.as_slice())] {
         let a = gradient_pairs(&dist, &preds, &labels, w);
         let b = gradient_pairs(&count, &preds, &labels, w);

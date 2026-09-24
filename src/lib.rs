@@ -7,10 +7,13 @@
 //!
 //! ## Quick start
 //!
-//! Build a [`DMatrix`], configure [`TrainingParams`] with a builder, call
-//! [`train`], then [`predict`](prelude::BoostedModel::predict):
+//! Build a [`DMatrix`], configure [`TrainingParams`] with a builder, train
+//! with [`train`] (or [`Trainer`] for eval sets, early stopping, custom
+//! hooks, and continued training), then
+//! [`predict`](model::BoostedModel::predict):
 //!
 //! ```
+//! use hessboost::config::TreeMethod;
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {
@@ -36,78 +39,103 @@
 //! # }
 //! ```
 //!
+//! [`prelude`] holds only this workflow's items; everything else is
+//! imported from its module.
+//!
+//! ## Modules
+//!
+//! - [`config`]: [`TrainingParams`], its builder, and the parameter enums
+//!   ([`TreeMethod`](config::TreeMethod), [`GrowPolicy`](config::GrowPolicy),
+//!   [`Monotone`](config::Monotone), ...).
+//! - [`data`]: [`DMatrix`], [`MetaInfo`](data::MetaInfo), feature types, the
+//!   CSV/libsvm loaders; [`data::target_stats`] (ordered target statistics).
+//! - [`training`]: [`train`], [`Trainer`], [`cv`](training::cv);
+//!   [`training::budget`] (budget-mode training).
+//! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
+//!   native and XGBoost JSON/UBJSON formats); [`model::compact`]
+//!   (bit-packed inference format).
+//! - [`objective`]: the [`Objective`](objective::Objective) trait, the
+//!   built-in objectives, [`CustomObjective`](objective::CustomObjective);
+//!   [`objective::distributional`] (`dist:*` objectives).
+//! - [`metric`]: the [`Metric`](metric::Metric) trait, the built-in metrics,
+//!   [`CustomMetric`](metric::CustomMetric).
+//! - [`conformal`]: split-conformal and conformalized-quantile prediction
+//!   intervals.
+//! - [`tree`]: [`RegTree`](tree::RegTree) and its nodes, for inspecting a
+//!   trained model.
+//! - [`error`]: [`HessboostError`](error::HessboostError) and
+//!   [`Result`](error::Result).
+//!
 //! ## What's here
 //!
 //! - **Boosters:** `gbtree`, `dart`, `gblinear`, and boosted random forests
 //!   (`num_parallel_tree`).
 //! - **Training lifecycle:** continued training from an existing model and
-//!   `process_type=update` tree refresh ([`train_continue`]), model slicing
-//!   ([`BoostedModel::slice`]) and `iteration_range` prediction
-//!   ([`predict_margin_range`](prelude::BoostedModel::predict_margin_range) and
+//!   `process_type=update` tree refresh
+//!   ([`Trainer::init_model`](training::Trainer::init_model)), model slicing
+//!   ([`BoostedModel::slice`](model::BoostedModel::slice)) and
+//!   `iteration_range` prediction as Rust ranges
+//!   ([`predict_margin_range`](model::BoostedModel::predict_margin_range) and
 //!   siblings).
 //! - **Tree methods:** `exact`, `hist`, and `approx`, with `depthwise` or
 //!   `lossguide` growth; uniform or `gradient_based` row sampling and
 //!   column sampling, optionally weighted per feature
-//!   ([`DMatrix::with_feature_weights`](prelude::DMatrix::with_feature_weights)).
+//!   ([`DMatrix::with_feature_weights`](data::DMatrix::with_feature_weights)).
 //! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute error, quantile and expectile alpha lists), binary
 //!   (logistic, logitraw, hinge) and multiclass classification, count
 //!   (poisson/gamma/tweedie), learning-to-rank (LambdaMART), survival
 //!   (`survival:cox`, `survival:aft` on censored label bounds), and a custom
-//!   hook ([`train_with_objective`]).
+//!   hook ([`Trainer::objective`](training::Trainer::objective)).
 //! - **Multi-output:** multi-target label matrices
-//!   ([`DMatrix::with_label_matrix`](prelude::DMatrix::with_label_matrix)),
+//!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)),
 //!   one tree per output or vector-leaf trees
-//!   ([`MultiStrategy::MultiOutputTree`](prelude::MultiStrategy::MultiOutputTree)).
+//!   ([`MultiStrategy::MultiOutputTree`](config::MultiStrategy::MultiOutputTree)).
 //! - **Metrics:** rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
 //!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, and
-//!   a custom hook ([`train_with_custom_metric`]).
+//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric)).
 //! - **Modeling:** monotone & interaction constraints, native categorical
 //!   splits, early stopping, feature importance, QuadratureTreeSHAP
-//!   contributions and interaction values ([`BoostedModel::predict_contribs`] /
-//!   [`predict_interactions`](prelude::BoostedModel::predict_interactions)).
+//!   contributions and interaction values
+//!   ([`predict_contribs`](model::BoostedModel::predict_contribs) /
+//!   [`predict_interactions`](model::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
-//!   XGBoost-format JSON and UBJSON model import/export ([`crate::model`]).
-//! - **Validation:** cross-validation ([`cv`]).
-//! - **Beyond XGBoost (opt-in):** split-conformal and conformalized-quantile
-//!   prediction intervals with finite-sample marginal coverage
-//!   ([`SplitConformal`](prelude::SplitConformal),
-//!   [`ConformalizedQuantile`](prelude::ConformalizedQuantile); see
-//!   [`learner::conformal`]); CatBoost-style ordered target statistics
-//!   for categorical columns ([`data::OrderedTargetEncoder`]); LightGBM tree
-//!   options `extra_trees`, `path_smooth`, and `linear_tree` leaves
-//!   ([`config::TrainingParams::extra_trees`], [`config::TrainingParams::path_smooth`],
-//!   [`config::TrainingParams::linear_tree`], [`tree::linear`]);
-//!   CatBoost-style symmetric (oblivious) trees
-//!   ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), which batch
-//!   prediction routes by bit pattern; compact models after *Boosted Trees
-//!   on a Diet*: feature/threshold reuse penalties (`toad_penalty_feature`,
-//!   `toad_penalty_threshold`) and a bit-packed layout predicting bit-identical
-//!   margins ([`learner::compact_model`]); LightGBM-style quantized-gradient
-//!   training ([`config::TrainingParams::use_quantized_grad`]);
-//!   PerpetualBooster-style budget training, one `budget` number instead of
-//!   tuning `eta`/depth/rounds ([`learner::budget`]); and distributional
-//!   boosting (NGBoost / XGBoostLSS style): `dist:normal`, `dist:lognormal`,
-//!   `dist:gamma`, `dist:poisson`, `dist:negbinomial` predict a full
-//!   conditional distribution per row
-//!   ([`BoostedModel::predict_distribution`](prelude::BoostedModel::predict_distribution),
-//!   [`objective::distributional`]), scored by `nll` / `crps`. None of them
-//!   changes default training.
+//!   XGBoost-format JSON and UBJSON model import/export
+//!   ([XGBoost interchange](model#xgboost-interchange)).
+//! - **Validation:** cross-validation ([`cv`](training::cv)).
+//! - **Beyond XGBoost (opt-in, none changes default training):**
+//!   - split-conformal and conformalized-quantile prediction intervals with
+//!     finite-sample marginal coverage ([`conformal`]);
+//!   - CatBoost-style ordered target statistics for categorical columns
+//!     ([`data::target_stats`]);
+//!   - LightGBM tree options `extra_trees`, `path_smooth`, and `linear_tree`
+//!     leaves ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
+//!     [`path_smooth`](config::TrainingParams::path_smooth),
+//!     [`linear_tree`](config::TrainingParams::linear_tree),
+//!     [`LinearLeaves`](tree::LinearLeaves));
+//!   - CatBoost-style symmetric (oblivious) trees
+//!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), which batch
+//!     prediction routes by bit pattern;
+//!   - compact models after *Boosted Trees on a Diet*: feature/threshold
+//!     reuse penalties (`toad_penalty_feature`, `toad_penalty_threshold`) and
+//!     a bit-packed layout predicting bit-identical margins
+//!     ([`model::compact`]);
+//!   - LightGBM-style quantized-gradient training
+//!     ([`use_quantized_grad`](config::TrainingParams::use_quantized_grad));
+//!   - PerpetualBooster-style budget training, one `budget` number instead of
+//!     tuning `eta`/depth/rounds ([`training::budget`]);
+//!   - distributional boosting (NGBoost / XGBoostLSS style): `dist:normal`,
+//!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`
+//!     predict a full conditional distribution per row
+//!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
+//!     [`objective::distributional`]), scored by `nll` / `crps`.
 //!
-//! ## Where to look
-//!
-//! - Entry points: [`train`], [`train_with_eval`], [`train_with_objective`],
-//!   [`train_with_custom_metric`], [`train_continue`] /
-//!   [`train_continue_with_eval`], [`cv`],
-//!   [`train_with_budget`](prelude::train_with_budget).
-//! - Core types: [`DMatrix`] (data), [`TrainingParams`] (config, mirrors
-//!   XGBoost parameter names), [`BoostedModel`] (trained model).
-//! - Runnable examples in the crate's `examples/` directory (e.g.
-//!   `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//!   `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//!   `distributional`). Run one with
-//!   `cargo run --release --example binary_classification`.
+//! Runnable examples live in the crate's `examples/` directory (e.g.
+//! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
+//! `custom_objective`, `constraints`, `conformal`, `compact_model`,
+//! `distributional`). Run one with
+//! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
 //!
@@ -119,26 +147,18 @@
 //! subsampling, DART) match only in model quality, because the random
 //! streams differ.
 //!
-//! [`DMatrix`]: prelude::DMatrix
-//! [`TrainingParams`]: prelude::TrainingParams
-//! [`BoostedModel`]: prelude::BoostedModel
-//! [`BoostedModel::predict_contribs`]: prelude::BoostedModel::predict_contribs
-//! [`train`]: prelude::train
-//! [`train_with_eval`]: prelude::train_with_eval
-//! [`train_with_objective`]: prelude::train_with_objective
-//! [`train_with_custom_metric`]: prelude::train_with_custom_metric
-//! [`train_continue`]: prelude::train_continue
-//! [`train_continue_with_eval`]: prelude::train_continue_with_eval
-//! [`BoostedModel::slice`]: prelude::BoostedModel::slice
-//! [`cv`]: prelude::cv
+//! [`DMatrix`]: data::DMatrix
+//! [`TrainingParams`]: config::TrainingParams
+//! [`BoostedModel`]: model::BoostedModel
+//! [`train`]: training::train
+//! [`Trainer`]: training::Trainer
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-pub mod booster;
 pub mod config;
+pub mod conformal;
 pub mod data;
 pub mod error;
-pub mod learner;
 pub mod metric;
 pub mod model;
 pub mod objective;
@@ -146,6 +166,7 @@ mod rng;
 mod simd;
 #[cfg(test)]
 mod test_support;
+pub mod training;
 pub mod tree;
 
 /// `1e-6` in `f64` arithmetic, where the crate compares against XGBoost's
@@ -156,27 +177,27 @@ pub(crate) const K_RT_EPS: f64 = 1e-6;
 /// beat, and the floor of sampling weights and near-zero sums.
 pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 
-/// Commonly used imports include `use hessboost::prelude::*;`.
+/// The train-and-predict workflow in one import: `use hessboost::prelude::*;`.
 ///
-/// Pulls in the data container, configuration, training entry points, the model
-/// type, and the objective/metric hooks. This provides everything needed for the
-/// typical train to predict workflow.
+/// Holds the data container, the parameters, the training entry points, the
+/// model, and the error types. Everything else (parameter enums, objectives,
+/// metrics, conformal intervals, ...) is imported from its module.
 pub mod prelude {
-    pub use crate::config::{
-        AftDistribution, BoosterKind, DistGradient, DistSplitDirection, GrowPolicy, Monotone,
-        MultiStrategy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
-    };
-    pub use crate::data::{CsvOptions, DMatrix, FeatureType, MetaInfo};
+    pub use crate::config::TrainingParams;
+    pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
-    pub use crate::learner::budget::{BudgetConfig, BudgetResult, BudgetStop, train_with_budget};
-    pub use crate::learner::compact_model::{CompactModel, ModelSizeReport};
-    pub use crate::learner::conformal::{ConformalizedQuantile, SplitConformal};
-    pub use crate::learner::{
-        BoostedModel, CvResult, ImportanceType, TrainResult, cv, train, train_continue,
-        train_continue_with_eval, train_with_custom_metric, train_with_eval, train_with_objective,
-    };
-    pub use crate::metric::{CustomMetric, Metric};
-    pub use crate::objective::{
-        CustomObjective, Dist, DistFamily, GradPair, Objective, SplitGradient,
-    };
+    pub use crate::model::BoostedModel;
+    pub use crate::training::{Trainer, train};
+}
+
+/// Implementation details the crate's own benchmarks and parity tests
+/// drive directly (histogram construction, tree growth, quantile cuts). Not
+/// part of the public API: hidden from the docs and changed without notice.
+#[doc(hidden)]
+pub mod internals {
+    pub use crate::data::ghist::GHistIndex;
+    pub use crate::data::quantile::HistCuts;
+    pub use crate::tree::builder::HistTreeBuilder;
+    pub use crate::tree::hist::{CpuBackend, HistogramBackend, zeroed};
+    pub use crate::tree::sampler::ColumnSampler;
 }

@@ -1,7 +1,8 @@
 //! Bring-your-own loss and metric: the custom-objective and custom-metric hooks.
 //! Run: `cargo run --release --example custom_objective`.
 
-use hessboost::metric::Rmse;
+use hessboost::metric::{CustomMetric, Metric, Rmse};
+use hessboost::objective::{CustomObjective, GradPair};
 use hessboost::prelude::*;
 
 mod common;
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
             }
         },
     );
-    let model = train_with_objective(&params, &d, 60, &obj)?;
+    let model = Trainer::new(&params, &d, 60).objective(&obj).train()?.model;
     let preds = model.predict(&d)?;
     let rmse = Rmse.eval(&preds, &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
@@ -52,8 +53,11 @@ fn main() -> Result<()> {
         .max_depth(3)
         .eta(0.2)
         .build()?;
-    let out =
-        train_with_custom_metric(&builtin, &d, 100, &[(&d, "train")], Some(10), Box::new(mae))?;
+    let out = Trainer::new(&builtin, &d, 100)
+        .eval(&d, "train")
+        .early_stopping_rounds(10)
+        .custom_metric(Box::new(mae))
+        .train()?;
     println!(
         "custom-metric run: {} trees, last MAE = {:.4}",
         out.model.num_trees(),

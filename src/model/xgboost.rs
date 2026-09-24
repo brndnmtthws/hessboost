@@ -1,146 +1,9 @@
-//! XGBoost-format model import and export, targeting the XGBoost 3.4.2
-//! schema (identical to 3.4.1's), in both of XGBoost's encodings: JSON text
-//! ([`export_xgboost_json`] / [`import_xgboost_json`], XGBoost's `m.json`) and
-//! Universal Binary JSON ([`export_xgboost_ubjson`] / [`import_xgboost_ubjson`],
-//! XGBoost's `m.ubj` and `save_raw("ubj")`). Both encodings carry the same
-//! document and share one model mapping; UBJSON only changes how it is
-//! serialized (see [UBJSON encoding](#ubjson-encoding)).
-//!
-//! XGBoost serializes a booster as a nested JSON document:
-//!
-//! ```text
-//! {"version": [3, 4, 2],
-//!  "learner": {
-//!    "gradient_booster": {
-//!      "name": "gbtree",
-//!      "model": {"trees": [ {..per-tree arrays..} ], "tree_info": [..],
-//!                "gbtree_model_param": {..}, "weight_drop": [..]?}},
-//!    "learner_model_param": {"base_score", "num_class", "num_feature", ..},
-//!    "objective": {"name": .., ..parameter block..}}}
-//! ```
-//!
-//! Each tree is stored as a set of parallel, node-indexed arrays rather than a
-//! nested structure: `left_children`, `right_children`, `split_indices`,
-//! `split_conditions`, `default_left`, `base_weights`, `sum_hessian` and
-//! `loss_changes`. A node `i` is a **leaf** when `left_children[i] == -1`. Its
-//! weight is carried in `split_conditions[i]` (and, redundantly,
-//! `base_weights[i]`). Numeric internal nodes route `x[split_indices[i]] <
-//! split_conditions[i]`, sending missing values in the `default_left[i]`
-//! direction, matching the exact semantics of [`crate::tree::RegTree`].
-//! Categorical internal nodes (`split_type[i] == 1`) carry their category set
-//! in the tree's `categories` / `categories_nodes` / `categories_segments` /
-//! `categories_sizes` arrays.
-//!
-//! # Scope and caveats
-//!
-//! Import targets a `gbtree` booster with a scalar, multiclass, or
-//! multi-target objective, with scalar-leaf trees (`one_output_per_tree`) or
-//! vector-leaf trees (`multi_output_tree`, see
-//! [Vector-leaf trees](#vector-leaf-trees)).
-//! XGBoost saves `booster=dart` as `gbtree` plus a per-tree
-//! `model.weight_drop` array; those weights become the model's DART tree
-//! weights on import, and a model with non-unit tree weights writes them back
-//! as `weight_drop` on export. Other booster kinds (`gblinear`) yield a clear
-//! [`HessboostError::ModelFormat`]. Numeric and categorical splits both
-//! round-trip in either direction.
-//!
-//! ## Tree layout (`tree_info`)
-//!
-//! XGBoost tags each tree with its output group in `model.tree_info` and lays
-//! trees out per boosting iteration as `[g0 × num_parallel_tree, g1 × ...]`,
-//! with `iteration_indptr` (or, when absent, `num_parallel_tree × groups`
-//! trees per iteration) marking iteration boundaries. `hessboost` stores the
-//! same layout ([`BoostedModel::num_parallel_tree`] trees per output and
-//! iteration), so boosted random forests keep their iteration structure in
-//! both directions and export writes `num_parallel_tree`, `tree_info` and
-//! `iteration_indptr` accordingly. Import regroups an iteration whose trees
-//! are tagged out of group order, preserving each group's order (per-output
-//! predictions are sums over a group's trees, so this is lossless); a model
-//! whose groups have unequal tree counts within an iteration, or whose
-//! iterations differ in size, is rejected.
-//!
-//! ## Vector-leaf trees
-//!
-//! A `multi_output_tree` model stores XGBoost's `MultiTargetTree` layout:
-//! `tree_param.size_leaf_vector = K`, the shared split structure in the usual
-//! node-indexed arrays, and every leaf's `K` weights in `leaf_weights`
-//! (leaves in node order), each leaf's `right_children` entry holding its
-//! index into that array. Leaves and categorical nodes carry XGBoost's
-//! `DftBadValue` split condition, the root's parent is `-1`, and every tree
-//! belongs to group 0 of `tree_info` (one tree per iteration). hessboost does
-//! not retain internal node weights: export writes zeros for internal nodes'
-//! `base_weights` (leaves repeat their vectors), which XGBoost does not read
-//! for prediction.
-//!
-//! ## Objective parameters
-//!
-//! The objective's parameter block (`reg_loss_param.scale_pos_weight`,
-//! `poisson_regression_param.max_delta_step`,
-//! `tweedie_regression_param.tweedie_variance_power`,
-//! `pseudo_huber_param.huber_slope`,
-//! `lambdarank_param.lambdarank_num_pair_per_sample`,
-//! `quantile_loss_param.quantile_alpha`,
-//! `expectile_loss_param.expectile_alpha`,
-//! `aft_loss_param.{aft_loss_distribution, aft_loss_distribution_scale}`)
-//! round-trips through the model's [`ObjectiveParams`]; absent fields take
-//! XGBoost's defaults. The alpha lists are XGBoost's array strings
-//! (`"[0.1,0.5,0.9]"`, `(..)` also read); `reg:absoluteerror` and
-//! `survival:cox` have no block. A supported objective whose parameters do
-//! not rebuild it (e.g. an empty or unsorted alpha list) is a format error.
-//! Export rejects models whose objective XGBoost cannot load (custom
-//! objectives, and hessboost's distributional `dist:*` objectives, which
-//! import rejects as well).
-//!
-//! ## `base_score`
-//!
-//! XGBoost 3.x stores the intercept as a vector string, `"[v0,v1,...]"`, with
-//! one entry per output (or a single entry that applies to every output), in
-//! whatever space its objective's `ProbToMargin` maps from: raw margin for
-//! `reg:squarederror`, `binary:logitraw` and `binary:hinge`, but
-//! **probability** space for objectives with a link function (`0.5` for
-//! `binary:logistic`, not its logit). `hessboost` stores per-output
-//! intercepts in **margin** space, so on **import** the vector is mapped
-//! through the objective's inverse link ([`Objective::probs_to_margins`]) and
-//! on **export** the margin row is mapped back with
-//! [`Objective::margins_to_probs`] (the forward transform, except for
-//! `binary:hinge` and `reg:quantileerror`, whose transforms (threshold, sort)
-//! are not their links). Multiclass objectives
-//! (and any objective we cannot reconstruct) pass the values through
-//! unchanged, as XGBoost does: softmax's inverse link is the identity, while
-//! its forward transform normalizes across classes.
-//!
-//! `learner_model_param.num_target` is XGBoost's output count
-//! (`ObjFunction::Targets`): [`BoostedModel::n_outputs`] for non-multiclass
-//! models — one per label column for a multi-target model
-//! (`one_output_per_tree` on a label matrix, `num_class` 0), one per alpha for
-//! `reg:quantileerror` / `reg:expectileerror`, whose
-//! [`BoostedModel::n_targets`] is the single label column — and
-//! [`BoostedModel::n_targets`] (1) for multiclass. Import checks it against
-//! the rebuilt objective's output count. Tree groups in `tree_info` and
-//! `base_score` entries are per output, laid out exactly like multiclass
-//! groups.
-//!
-//! ## UBJSON encoding
-//!
-//! XGBoost keeps the node-indexed tree arrays as typed arrays and writes them
-//! to UBJSON in optimized form (`[$<type>#L<count>` plus big-endian
-//! payloads). [`export_xgboost_ubjson`] does the same with XGBoost's element
-//! types: float32 for `split_conditions`, `base_weights`, `loss_changes`,
-//! `sum_hessian` (and `leaf_weights`, gblinear `weights`); int32 for
-//! `left_children`, `right_children`, `parents`, `categories`,
-//! `categories_nodes` and `split_indices` (int64 when a tree's `num_feature`
-//! exceeds the int32 range, as in XGBoost); uint8 for `default_left` and
-//! `split_type`; int64 for `categories_segments` and `categories_sizes`. The
-//! category container's int32 `feature_segments` / `sorted_idx` / `offsets`
-//! and its per-column `values` follow XGBoost too. Every other array is a
-//! counted generic array, numbers are float32 and integers the narrowest
-//! width, again as XGBoost writes them. [`import_xgboost_ubjson`] accepts the
-//! optimized and the plain UBJSON container forms alike.
+//! XGBoost JSON/UBJSON schema mapping; user docs: `model` module, "XGBoost interchange".
 
 use crate::config::{AftDistribution, ObjectiveParams};
 use crate::error::{HessboostError, Result};
-use crate::learner::BoostedModel;
-use crate::learner::model::ModelSpec;
+use crate::model::BoostedModel;
+use crate::model::ModelSpec;
 use crate::model::ubjson::{self, ElementType};
 use crate::objective::{Objective, create_objective};
 use crate::tree::{Node, RegTree};
@@ -257,7 +120,7 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     let objective = model.objective();
     reject_extension_objective(objective)?;
     // XGBoost can only load objectives it knows; a custom objective
-    // (`train_with_objective`) has no XGBoost counterpart.
+    // (`Trainer::objective`) has no XGBoost counterpart.
     let objective_impl = model.rebuild_objective().map_err(|_| {
         HessboostError::model_format(format!(
             "objective `{objective}` has no XGBoost equivalent; cannot export"
@@ -329,7 +192,7 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
 /// distributional `dist:*` objectives. Their models are saved in the native
 /// binary or JSON formats only.
 fn reject_extension_objective(objective: &str) -> Result<()> {
-    if crate::objective::DistFamily::from_objective(objective).is_some() {
+    if crate::objective::distributional::DistFamily::from_objective(objective).is_some() {
         return Err(HessboostError::model_format(format!(
             "objective `{objective}` is a hessboost extension that XGBoost models cannot \
              carry; save the model in the native binary or JSON format"
@@ -1246,8 +1109,8 @@ mod tests {
     use super::*;
     use crate::config::{BoosterKind, TrainingParams};
     use crate::data::{DMatrix, FeatureType};
-    use crate::learner::train;
     use crate::test_support::labeled_dense;
+    use crate::training::train;
 
     /// Train a small squared-error model on a noisy nonlinear signal.
     fn reg_model() -> (BoostedModel, DMatrix) {
@@ -1851,7 +1714,7 @@ mod tests {
         assert_eq!(class_margins(&explicit), [15.0, 150.0, 1500.0]);
         let model = import_xgboost_json(&explicit).unwrap();
         assert_eq!(model.num_boost_rounds(), 2);
-        let first = model.slice(0, 1, 1).unwrap();
+        let first = model.slice(0..1, 1).unwrap();
         let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
         assert_eq!(first.predict_margin(&d).unwrap(), [3.0, 30.0, 300.0]);
 
@@ -2080,8 +1943,8 @@ mod tests {
 
     #[test]
     fn custom_objective_export_is_rejected() {
-        use crate::learner::train_with_objective;
         use crate::objective::{CustomObjective, GradPair};
+        use crate::training::Trainer;
         let (_, d) = reg_model();
         let params = TrainingParams::builder()
             .objective("custom:test")
@@ -2094,7 +1957,11 @@ mod tests {
                 out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi);
             }
         });
-        let model = train_with_objective(&params, &d, 2, &obj).unwrap();
+        let model = Trainer::new(&params, &d, 2)
+            .objective(&obj)
+            .train()
+            .unwrap()
+            .model;
         assert_format_error(export_xgboost_json(&model), "custom objective");
     }
 }

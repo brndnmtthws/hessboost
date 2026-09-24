@@ -75,11 +75,11 @@ use crate::data::DMatrix;
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::error::{HessboostError, Result};
-use crate::learner::model::BoostedModel;
-use crate::learner::train::{
+use crate::model::BoostedModel;
+use crate::objective::{GradPair, create_objective};
+use crate::training::train::{
     initial_intercepts, new_model, reject_missing_param, validate_dataset, with_thread_pool,
 };
-use crate::objective::{GradPair, create_objective};
 use crate::tree::builder::budget::{
     ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
     fold_weight_spread, grow,
@@ -181,13 +181,13 @@ impl BudgetConfig {
 
     /// The effective number of weak or non-improving rounds that stop
     /// training.
-    pub fn effective_stopping_rounds(&self) -> usize {
+    pub(crate) fn effective_stopping_rounds(&self) -> usize {
         self.stopping_rounds
             .unwrap_or_else(|| (STOPPING_ROUNDS as f64 * self.scale(0.5, 6.0)).ceil() as usize)
     }
 
     /// The effective hard cap on boosting rounds.
-    pub fn effective_iteration_limit(&self) -> usize {
+    pub(crate) fn effective_iteration_limit(&self) -> usize {
         let derived = (ITER_LIMIT as f64 * self.scale(0.35, 4.0)).round() as usize;
         self.iteration_limit
             .map_or(derived, |limit| limit.min(derived))
@@ -247,6 +247,7 @@ pub struct BudgetResult {
 ///
 /// ```
 /// use hessboost::prelude::*;
+/// use hessboost::training::budget::{BudgetConfig, train_with_budget};
 ///
 /// let x: Vec<f32> = (0..400).map(|i| (i % 20) as f32).collect();
 /// let y: Vec<f32> = x.iter().map(|v| (v * 0.3).sin()).collect();

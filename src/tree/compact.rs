@@ -205,6 +205,23 @@ impl TreeMeta {
     }
 }
 
+/// A block of dense rows as the batch kernels consume it: the full
+/// [`LANES`]-row groups keyed lane-major (see [`fill_lanes`]) and the
+/// remaining `rows % LANES` rows raw.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LaneBlock<'a> {
+    /// The full groups, `[group][feature][lane]` as [`key`]s of `v` then of
+    /// `-v` ([`FEATURE_LANES`] per feature, `n_cols * FEATURE_LANES` per
+    /// group).
+    pub(crate) lanes: &'a [u32],
+    /// The remaining rows, row-major with stride `n_cols` (`NaN` = missing).
+    pub(crate) tail: &'a [f32],
+    /// Features per row.
+    pub(crate) n_cols: usize,
+    /// Rows in the block: the groups' plus the tail's.
+    pub(crate) rows: usize,
+}
+
 /// An ensemble of [`RegTree`]s re-laid out for prediction. See the module docs.
 #[derive(Debug, Clone)]
 pub(crate) struct CompactForest {
@@ -490,23 +507,19 @@ impl CompactForest {
         }
     }
 
-    /// Walk `rows` dense rows through tree `t` and call `sink(r, leaf)` with
-    /// each row's arena leaf id, in row order. The full [`LANES`]-row groups
-    /// come from `lanes`, laid out `[group][feature][lane]` as [`key`]s of `v`
-    /// then of `-v` ([`FEATURE_LANES`] per feature, `n_cols * FEATURE_LANES`
-    /// per group), so a lane's key sits at a fixed immediate offset from the
-    /// node's slot. The remaining `rows % LANES` rows come from `tail`, raw
-    /// and row-major with stride `n_cols` (`NaN` = missing).
+    /// Walk the rows of `block` through tree `t` and call `sink(r, leaf)`
+    /// with each row's arena leaf id, in row order. The full [`LANES`]-row
+    /// groups come from the keyed lanes, so a lane's key sits at a fixed
+    /// immediate offset from the node's slot; the remaining rows come from
+    /// the raw tail.
     #[inline(always)]
-    fn walk_block(
-        &self,
-        t: usize,
-        lanes: &[u32],
-        tail: &[f32],
-        n_cols: usize,
-        rows: usize,
-        mut sink: impl FnMut(usize, u32),
-    ) {
+    fn walk_block(&self, t: usize, block: LaneBlock<'_>, mut sink: impl FnMut(usize, u32)) {
+        let LaneBlock {
+            lanes,
+            tail,
+            n_cols,
+            rows,
+        } = block;
         let groups = rows / LANES;
         let group_len = FEATURE_LANES * n_cols;
         assert!(
@@ -566,23 +579,19 @@ impl CompactForest {
         }
     }
 
-    /// `out[r * stride] = original leaf id of row r` in tree `t` for `rows`
-    /// dense rows given as lane-major groups plus a row-major tail (see
-    /// [`Self::walk_block`]). `NaN` marks missing values.
-    #[allow(clippy::too_many_arguments)]
+    /// `out[r * stride] = original leaf id of row r` in tree `t` for the rows
+    /// of `block`.
     pub(crate) fn original_leaf_ids(
         &self,
         t: usize,
-        lanes: &[u32],
-        tail: &[f32],
-        n_cols: usize,
-        rows: usize,
+        block: LaneBlock<'_>,
         out: &mut [u32],
         stride: usize,
     ) {
+        let rows = block.rows;
         assert!(rows == 0 || out.len() > (rows - 1) * stride);
         let orig = &self.orig_id[..];
-        self.walk_block(t, lanes, tail, n_cols, rows, |r, leaf| {
+        self.walk_block(t, block, |r, leaf| {
             // SAFETY: `r < rows` (asserted above against `out`) and `leaf` is
             // an arena node id produced by the walk.
             unsafe {
@@ -591,21 +600,22 @@ impl CompactForest {
         });
     }
 
-    /// `out[r * stride] += weight * leaf_value(row r)` in tree `t` for `rows`
-    /// dense rows given as lane-major groups plus a row-major tail (see
-    /// [`Self::walk_block`]).
-    #[allow(clippy::too_many_arguments)]
+    /// `out[r * stride] += weight * leaf_value(row r)` in tree `t` for the
+    /// rows of `block`.
     pub(crate) fn accumulate(
         &self,
         t: usize,
-        lanes: &[u32],
-        tail: &[f32],
-        n_cols: usize,
-        rows: usize,
+        block: LaneBlock<'_>,
         weight: f32,
         out: &mut [f32],
         stride: usize,
     ) {
+        let LaneBlock {
+            lanes,
+            tail,
+            n_cols,
+            rows,
+        } = block;
         assert!(rows == 0 || out.len() > (rows - 1) * stride);
         if let Some(symmetric) = self.symmetric.get(t) {
             let groups = rows / LANES;
@@ -627,7 +637,7 @@ impl CompactForest {
             return;
         }
         let nodes = &self.nodes[..];
-        self.walk_block(t, lanes, tail, n_cols, rows, |r, leaf| {
+        self.walk_block(t, block, |r, leaf| {
             // SAFETY: `r < rows` (asserted above against `out`) and `leaf` is
             // an arena node id produced by the walk.
             unsafe {
@@ -638,23 +648,18 @@ impl CompactForest {
     }
 
     /// `out[r * stride + j] += weight * leaf_vector(row r)[j]` for `j < k` in
-    /// vector-leaf tree `t`, over `rows` dense rows laid out as for
-    /// [`Self::accumulate`].
-    #[allow(clippy::too_many_arguments)]
+    /// vector-leaf tree `t`, over the rows of `block`.
     pub(crate) fn accumulate_vector(
         &self,
         t: usize,
-        lanes: &[u32],
-        tail: &[f32],
-        n_cols: usize,
-        rows: usize,
+        block: LaneBlock<'_>,
         k: usize,
         weight: f32,
         out: &mut [f32],
         stride: usize,
     ) {
-        assert!(k <= stride && out.len() >= rows * stride);
-        self.walk_block(t, lanes, tail, n_cols, rows, |r, leaf| {
+        assert!(k <= stride && out.len() >= block.rows * stride);
+        self.walk_block(t, block, |r, leaf| {
             let dst = &mut out[r * stride..r * stride + k];
             for (o, &w) in dst.iter_mut().zip(self.leaf_vector(leaf, k)) {
                 *o += weight * w;
@@ -780,13 +785,24 @@ impl CompactForest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{ChildLeaf, SplitRule};
 
     fn tree() -> RegTree {
         // Root splits on f0 < 0.5 (missing left); left child splits on f1 < 2
         // (missing right) into leaves -1 / 1; right child is leaf 5.
         let mut t = RegTree::with_root(1.0);
-        let (l, _r) = t.expand(0, 0, 0.5, true, 0.0, 1.0, 5.0, 1.0);
-        t.expand(l, 1, 2.0, false, -1.0, 1.0, 1.0, 1.0);
+        let (l, _r) = t.expand(
+            0,
+            SplitRule::numeric(0, 0.5, true),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(5.0, 1.0),
+        );
+        t.expand(
+            l,
+            SplitRule::numeric(1, 2.0, false),
+            ChildLeaf::new(-1.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
         t
     }
 
@@ -805,7 +821,13 @@ mod tests {
         ];
         let flat: Vec<f32> = rows.iter().flatten().copied().collect();
         let mut out = vec![0u32; rows.len()];
-        f.original_leaf_ids(0, &[], &flat, 2, rows.len(), &mut out, 1);
+        let block = LaneBlock {
+            lanes: &[],
+            tail: &flat,
+            n_cols: 2,
+            rows: rows.len(),
+        };
+        f.original_leaf_ids(0, block, &mut out, 1);
         for (r, row) in rows.iter().enumerate() {
             let want = t.leaf_id_dense(row, f32::NAN);
             assert_eq!(out[r] as usize, want, "row {r}");
@@ -831,9 +853,15 @@ mod tests {
             .collect();
         let (lanes, tail) = split_lanes(&block, 2);
         let mut ids = vec![0u32; n * 3];
-        f.original_leaf_ids(0, &lanes, tail, 2, n, &mut ids[1..], 3);
+        let rows = LaneBlock {
+            lanes: &lanes,
+            tail,
+            n_cols: 2,
+            rows: n,
+        };
+        f.original_leaf_ids(0, rows, &mut ids[1..], 3);
         let mut acc = vec![0.5f32; n * 2];
-        f.accumulate(0, &lanes, tail, 2, n, 2.0, &mut acc, 2);
+        f.accumulate(0, rows, 2.0, &mut acc, 2);
         for r in 0..n {
             let leaf = f.leaf_id(0, &block[r * 2..r * 2 + 2]);
             assert_eq!(ids[r * 3 + 1], f.original_id(leaf));
@@ -851,20 +879,26 @@ mod tests {
                 let mut t = RegTree::with_root(1.0);
                 let (l, _r) = t.expand(
                     0,
-                    i as u32 % 3,
-                    0.1 * i as f32,
-                    i % 2 == 0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    1.0,
+                    SplitRule::numeric(i as u32 % 3, 0.1 * i as f32, i % 2 == 0),
+                    ChildLeaf::new(0.0, 1.0),
+                    ChildLeaf::new(1.0, 1.0),
                 );
-                t.expand(l, 1, 0.5, i % 4 == 0, -1.0, 1.0, 2.0, 1.0);
+                t.expand(
+                    l,
+                    SplitRule::numeric(1, 0.5, i % 4 == 0),
+                    ChildLeaf::new(-1.0, 1.0),
+                    ChildLeaf::new(2.0, 1.0),
+                );
                 t
             })
             .collect();
         let mut cat = RegTree::with_root(1.0);
-        cat.expand_categorical(0, 2, &[1, 3], false, -1.0, 1.0, 1.0, 1.0);
+        cat.expand(
+            0,
+            SplitRule::categorical(2, &[1, 3], false),
+            ChildLeaf::new(-1.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
         trees[LANES + 1] = cat;
         let f = CompactForest::from_trees(&trees);
         let row = [0.7f32, f32::NAN, 3.0];
@@ -889,10 +923,20 @@ mod tests {
     fn categorical_membership() {
         for default_left in [true, false] {
             let mut t = RegTree::with_root(1.0);
-            t.expand_categorical(0, 0, &[2, 5], default_left, -1.0, 1.0, 1.0, 1.0);
+            t.expand(
+                0,
+                SplitRule::categorical(0, &[2, 5], default_left),
+                ChildLeaf::new(-1.0, 1.0),
+                ChildLeaf::new(1.0, 1.0),
+            );
             // A preceding tree with its own categories shifts the pool.
             let mut first = RegTree::with_root(1.0);
-            first.expand_categorical(0, 0, &[9], true, 0.0, 1.0, 0.0, 1.0);
+            first.expand(
+                0,
+                SplitRule::categorical(0, &[9], true),
+                ChildLeaf::new(0.0, 1.0),
+                ChildLeaf::new(0.0, 1.0),
+            );
             let f = CompactForest::from_trees(&[first, t.clone()]);
             assert!(f.trees[1].has_categorical);
             for v in [0.0f32, 2.0, 5.0, 7.0, f32::NAN] {
@@ -949,9 +993,24 @@ mod tests {
             (f32::MIN_POSITIVE, false),
         ] {
             let mut t = RegTree::with_root(1.0);
-            let (l, r) = t.expand(0, 0, cond, default_left, 0.0, 1.0, 0.0, 1.0);
-            t.expand(l, 1, cond, !default_left, -1.0, 1.0, 1.0, 1.0);
-            t.expand(r, 1, -cond, default_left, 2.0, 1.0, 3.0, 1.0);
+            let (l, r) = t.expand(
+                0,
+                SplitRule::numeric(0, cond, default_left),
+                ChildLeaf::new(0.0, 1.0),
+                ChildLeaf::new(0.0, 1.0),
+            );
+            t.expand(
+                l,
+                SplitRule::numeric(1, cond, !default_left),
+                ChildLeaf::new(-1.0, 1.0),
+                ChildLeaf::new(1.0, 1.0),
+            );
+            t.expand(
+                r,
+                SplitRule::numeric(1, -cond, default_left),
+                ChildLeaf::new(2.0, 1.0),
+                ChildLeaf::new(3.0, 1.0),
+            );
             trees.push(t);
         }
         let f = CompactForest::from_trees(&trees);
@@ -980,9 +1039,15 @@ mod tests {
         let n = rows.len() / 2;
         assert!(!n.is_multiple_of(LANES), "layout must exercise a tail");
         let (lanes, tail) = split_lanes(&rows, 2);
+        let block = LaneBlock {
+            lanes: &lanes,
+            tail,
+            n_cols: 2,
+            rows: n,
+        };
         for (t, tree) in trees.iter().enumerate() {
             let mut ids = vec![0u32; n];
-            f.original_leaf_ids(t, &lanes, tail, 2, n, &mut ids, 1);
+            f.original_leaf_ids(t, block, &mut ids, 1);
             for r in 0..n {
                 let row = &rows[r * 2..r * 2 + 2];
                 let want = tree.leaf_id_dense(row, f32::NAN);
@@ -1001,7 +1066,12 @@ mod tests {
         // `v < -inf` with missing values right is stored as `-v > +inf`, whose
         // key equals a leaf's; the early-exit walkers must still descend.
         let mut t = RegTree::with_root(1.0);
-        t.expand(0, 0, f32::NEG_INFINITY, false, -1.0, 1.0, 1.0, 1.0);
+        t.expand(
+            0,
+            SplitRule::numeric(0, f32::NEG_INFINITY, false),
+            ChildLeaf::new(-1.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
         let f = CompactForest::from_trees(std::slice::from_ref(&t));
         for v in [f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN] {
             let want = t.leaf_id_dense(&[v], f32::NAN);

@@ -34,8 +34,10 @@ fn main() -> Result<()> {
         .build()?;
 
     // Watch NDCG on the training set to see it improve.
-    let out = train_with_eval(&params, &dtrain, 40, &[(&dtrain, "train")], None)?;
-    let ndcg = |r: &hessboost::learner::RoundEval| {
+    let out = Trainer::new(&params, &dtrain, 40)
+        .eval(&dtrain, "train")
+        .train()?;
+    let ndcg = |r: &hessboost::training::RoundEval| {
         r.scores.iter().find(|(_, m, _)| m == "ndcg").unwrap().2
     };
     println!(

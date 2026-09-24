@@ -96,7 +96,16 @@ the examples. `benches/training.rs` is the Criterion suite;
 - **Parity:** the target is XGBoost 3.4.2 behavior (numerically identical to
   3.4.1). `exact`-tier fixtures match pointwise; RNG-driven cases
   (subsampling, DART) only match within a quality band because the RNG
-  streams differ.
+  streams differ. Two sampling structures also differ from XGBoost and are
+  covered only by that band: under `hist`, a multi-output model's outputs
+  share each parallel tree's uniform row sample (XGBoost draws one per
+  output group), and under `approx` with uniform sampling, the per-round
+  cuts weight unsampled rows by their Hessian (XGBoost gives them zero
+  weight). Categorical splits follow XGBoost's `HistEvaluator`
+  (`EnumerateOneHot` below `max_cat_to_onehot = 4` categories, otherwise
+  `EnumeratePart` scanned in both directions up to `max_cat_threshold = 64`)
+  in `tree/builder/mod.rs::sweep_categorical`, shared by the histogram and
+  exact builders.
 - **Formats:** the native binary format (`SQB\0`, a version byte, then a
   postcard payload of `BoostedModel`), the native JSON layout
   (`BoostedModel`'s fields by name) and the compact layout (`HBTD`, version

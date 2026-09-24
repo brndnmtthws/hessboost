@@ -21,7 +21,9 @@ use std::collections::BTreeSet;
 
 use crate::K_RT_EPS;
 use crate::objective::GradPair;
-use crate::tree::constraints::{Bounds, calc_weight_bounded, gain_at_weight, satisfies};
+use crate::tree::constraints::{
+    Bounds, calc_weight_bounded, child_bounds, gain_at_weight, satisfies,
+};
 use crate::tree::gain::{GradStats, RegParams, calc_gain, threshold_l1};
 use crate::tree::regtree::RegTree;
 use crate::tree::reuse::CategoricalPenalty;
@@ -107,10 +109,13 @@ impl BestSplit {
     }
 
     /// A categorical (set-membership) split candidate; `cat_left` holds the
-    /// category values routed left.
+    /// category values routed left, and `default_left` says where missing
+    /// values go.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn categorical(
         loss_chg: f64,
         feature: u32,
+        default_left: bool,
         left: GradStats,
         right: GradStats,
         w_left: f64,
@@ -122,9 +127,7 @@ impl BestSplit {
             feature,
             threshold: 0.0,
             split_bin: None,
-            // Present categories not in the left set (and missing) go
-            // right, as XGBoost defaults for categorical features.
-            default_left: false,
+            default_left,
             left,
             right,
             w_left,
@@ -179,6 +182,18 @@ impl BestSplit {
         self.found()
             && self.loss_chg >= gamma
             && children_valid(self.left, self.right, min_child_weight)
+    }
+
+    /// Monotone bounds of this split's children (left, right). A categorical
+    /// split's children are XGBoost's children swapped (its set is XGBoost's
+    /// right child), so their bounds are derived in XGBoost's orientation.
+    pub(super) fn child_bounds(&self, parent: Bounds, dir: i8) -> (Bounds, Bounds) {
+        if self.is_categorical {
+            let (xgb_left, xgb_right) = child_bounds(parent, dir, self.w_right, self.w_left);
+            (xgb_right, xgb_left)
+        } else {
+            child_bounds(parent, dir, self.w_left, self.w_right)
+        }
     }
 }
 
@@ -411,71 +426,169 @@ pub(super) fn xgb_update(
     replace
 }
 
-/// Sweep prefix partitions of categories ordered by gradient/Hessian ratio
-/// (XGBoost's sorted-partition strategy: the best subset is contiguous in
-/// that order) and record the best set-membership split in `best`. Tied
-/// ratios keep ascending category order, as XGBoost's `std::stable_sort`
-/// over bin indices does, so the result never depends on the caller's
-/// ordering of `cats`. Prefix categories form the left set; every other
-/// present category — and missing — goes right. Callers supply the
-/// `(category, stats)` pairs from their own
-/// stat source (sorted-column map for exact search, histogram bins for
-/// histogram search) and keep their own empty-bin filtering. `penalty`
-/// (opt-in reuse penalties) is subtracted from each candidate's gain before
-/// it competes; `None` leaves the sweep untouched.
+/// XGBoost's default `max_cat_to_onehot`: categorical features with fewer
+/// categories enumerate one-hot splits instead of partitions.
+pub(super) const MAX_CAT_TO_ONEHOT: usize = 4;
+
+/// XGBoost's default `max_cat_threshold`: the most categories one side of a
+/// partition split enumerates.
+pub(super) const MAX_CAT_THRESHOLD: usize = 64;
+
+/// The best categorical split of one feature, in XGBoost's orientation: its
+/// set of categories goes to the right child, `default_left` routes missing
+/// values.
+struct CatCandidate {
+    loss_chg: f32,
+    default_left: bool,
+    left: GradStats,
+    right: GradStats,
+    w_left: f32,
+    w_right: f32,
+}
+
+/// XGBoost's scalar categorical split search (`HistEvaluator`), shared by the
+/// histogram and exact builders. `cats` holds every category of `feature` in
+/// ascending order with its node statistics (zero when the node has none);
+/// `total` is the node's statistics, including missing values.
+///
+/// - Fewer than [`MAX_CAT_TO_ONEHOT`] categories (`EnumerateOneHot`): each
+///   category alone on one side, with missing values on either side.
+/// - Otherwise (`EnumeratePart`): categories stably sorted by their weight
+///   (`CalcWeightCat`), then scanned forward (a growing prefix of the order
+///   on one side, missing values on the other) and backward (a growing
+///   suffix on the other side, missing values with it), at most
+///   [`MAX_CAT_THRESHOLD`] categories deep.
+///
+/// Candidates are scored with [`xgb_loss_chg`] and compared with XGBoost's
+/// tie rule ([`need_replace`]). XGBoost routes the chosen set to its right
+/// child; the recorded split stores that set as the tree's left child, with
+/// the children (and the missing direction) swapped to match. `penalty`
+/// (opt-in reuse penalties) is subtracted from each candidate's loss change
+/// before it competes; `None` leaves the search untouched.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sweep_categorical(
     best: &mut BestSplit,
-    cats: &mut [(u32, GradStats)],
+    cats: &[(u32, GradStats)],
     total: GradStats,
-    parent_gain: f64,
+    root_gain: f32,
     bounds: Bounds,
     dir: i8,
-    constrained: bool,
     reg: &RegParams,
     feature: u32,
     penalty: Option<&dyn CategoricalPenalty>,
 ) {
-    if cats.len() < 2 {
-        return; // no interior partition
-    }
-    let ratio = |s: GradStats| s.grad / (s.hess + reg.lambda);
-    // Categories are distinct, so this is a total order.
-    cats.sort_unstable_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)).then(a.0.cmp(&b.0)));
-    sweep_prefixes(best, cats, total, feature, |left, right, cats_left| {
-        let (mut g, wl, wr) =
-            candidate_gain(left, right, parent_gain, bounds, dir, constrained, reg)?;
+    let n = cats.len();
+    let score = |left: GradStats, right: GradStats, set: &dyn Fn() -> Vec<u32>| {
+        let (mut loss_chg, w_left, w_right) =
+            xgb_loss_chg(left, right, root_gain, reg, bounds, dir)?;
         if let Some(penalty) = penalty {
-            g -= penalty.categorical_penalty(feature, cats_left);
+            loss_chg -= penalty.categorical_penalty(feature, &set()) as f32;
         }
-        Some((g, wl, wr))
-    });
-}
+        Some((loss_chg, w_left, w_right))
+    };
+    // `SplitEntry::Update` on a per-feature entry that starts at zero.
+    let offer = |local: &mut Option<CatCandidate>,
+                 default_left: bool,
+                 left: GradStats,
+                 right: GradStats,
+                 set: &dyn Fn() -> Vec<u32>| {
+        let Some((loss_chg, w_left, w_right)) = score(left, right, set) else {
+            return false;
+        };
+        let incumbent = local.as_ref().map_or(0.0, |c| c.loss_chg);
+        if !need_replace(incumbent, feature, loss_chg, feature) {
+            return false;
+        }
+        *local = Some(CatCandidate {
+            loss_chg,
+            default_left,
+            left,
+            right,
+            w_left,
+            w_right,
+        });
+        true
+    };
+    // `p_best->Update(best)`: the feature's split against the node's best.
+    let merge = |best: &mut BestSplit, local: Option<CatCandidate>, mut set: Vec<u32>| {
+        let Some(c) = local else { return };
+        if need_replace(best.loss_chg as f32, best.feature, c.loss_chg, feature) {
+            set.sort_unstable();
+            *best = BestSplit::categorical(
+                f64::from(c.loss_chg),
+                feature,
+                !c.default_left,
+                c.right,
+                c.left,
+                f64::from(c.w_right),
+                f64::from(c.w_left),
+                set,
+            );
+        }
+    };
 
-/// Offer every prefix of the ordered `cats` (at least one category always
-/// stays right) as a set-membership split with the prefix on the left.
-/// `total` includes any missing mass, which stays on the right.
-/// `score(left, right, cats_left)` returns the candidate's gain and child
-/// weights (`None`: invalid), and `best` takes it when it beats the incumbent
-/// by more than `K_RT_EPS`.
-pub(super) fn sweep_prefixes(
-    best: &mut BestSplit,
-    cats: &[(u32, GradStats)],
-    total: GradStats,
-    feature: u32,
-    mut score: impl FnMut(GradStats, GradStats, &[u32]) -> Option<(f64, f64, f64)>,
-) {
-    let mut left = GradStats::default();
-    let mut cats_left: Vec<u32> = Vec::new();
-    for &(cat, stats) in &cats[..cats.len() - 1] {
-        left.add(stats);
-        cats_left.push(cat);
-        let right = total.sub(left);
-        if let Some((g, wl, wr)) = score(left, right, &cats_left)
-            && g > best.loss_chg + K_RT_EPS
-        {
-            *best = BestSplit::categorical(g, feature, left, right, wl, wr, cats_left.clone());
+    if n < MAX_CAT_TO_ONEHOT {
+        let mut present = GradStats::default();
+        for &(_, stats) in cats {
+            present.add(stats);
         }
+        let missing = total.sub(present);
+        let mut local = None;
+        let mut chosen = 0;
+        for &(cat, stats) in cats {
+            let single = || vec![cat];
+            // Missing values with the other categories, then with this one.
+            let mut right = stats;
+            if offer(&mut local, true, total.sub(right), right, &single) {
+                chosen = cat;
+            }
+            right.add(missing);
+            if offer(&mut local, false, total.sub(right), right, &single) {
+                chosen = cat;
+            }
+        }
+        merge(best, local, vec![chosen]);
+        return;
+    }
+
+    let weight = |s: GradStats| -> f32 {
+        if s.hess < reg.min_child_weight {
+            0.0
+        } else {
+            xgb_calc_weight(s, reg) as f32
+        }
+    };
+    let keys: Vec<f32> = cats.iter().map(|&(_, s)| weight(s)).collect();
+    let mut sorted: Vec<usize> = (0..n).collect();
+    sorted.sort_by(|&l, &r| {
+        keys[l]
+            .partial_cmp(&keys[r])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let set_of =
+        |partition: usize| -> Vec<u32> { sorted[..partition].iter().map(|&c| cats[c].0).collect() };
+    let depth = MAX_CAT_THRESHOLD.min(n);
+    for forward in [true, false] {
+        let mut acc = GradStats::default();
+        let mut local = None;
+        let mut best_partition = 0;
+        for step in 0..depth - 1 {
+            let j = if forward { step } else { n - 1 - step };
+            acc.add(cats[sorted[j]].1);
+            // The set (XGBoost's right child) is the first `partition`
+            // sorted categories: the scanned prefix going forward, the
+            // unscanned rest going backward.
+            let partition = if forward { step + 1 } else { j };
+            let (left, right) = if forward {
+                (total.sub(acc), acc)
+            } else {
+                (acc, total.sub(acc))
+            };
+            if offer(&mut local, forward, left, right, &|| set_of(partition)) {
+                best_partition = partition;
+            }
+        }
+        merge(best, local, set_of(best_partition));
     }
 }
 
@@ -648,55 +761,71 @@ mod test_support {
 mod tests {
     use super::*;
 
-    /// Penalizes every left set except `{0, 2}`.
-    struct OnlyZeroTwo;
-
-    impl CategoricalPenalty for OnlyZeroTwo {
-        fn categorical_penalty(&self, _feature: u32, cats_left: &[u32]) -> f64 {
-            let mut set = cats_left.to_vec();
-            set.sort_unstable();
-            if set == [0, 2] { 0.0 } else { 10.0 }
-        }
-    }
-
-    /// Categories 0 and 1 tie on gradient/Hessian ratio; the penalized sweep
-    /// must break the tie by category id whatever order the caller supplies
-    /// (the exact builder's order comes from a `HashMap`).
-    #[test]
-    fn categorical_ties_sweep_in_category_order() {
-        let reg = RegParams {
+    fn unregularized() -> RegParams {
+        RegParams {
             lambda: 0.0,
             alpha: 0.0,
             max_delta_step: 0.0,
             min_child_weight: 0.0,
-        };
-        let stats = |c: u32| {
-            let g = [1.0, 1.0, -2.0][c as usize];
-            (c, GradStats::new(g, 1.0))
-        };
-        let total = GradStats::new(0.0, 3.0);
-        let sweep = |order: [u32; 3]| {
-            let mut cats = order.map(stats);
-            let mut best = BestSplit::none();
-            sweep_categorical(
-                &mut best,
-                &mut cats,
-                total,
-                0.0,
-                Bounds::default(),
-                0,
-                false,
-                &reg,
-                0,
-                Some(&OnlyZeroTwo),
+        }
+    }
+
+    fn sweep(cats: &[(u32, GradStats)], total: GradStats) -> BestSplit {
+        let reg = unregularized();
+        let mut best = BestSplit::none();
+        let root_gain = xgb_node_gain(total, &reg, Bounds::default());
+        sweep_categorical(
+            &mut best,
+            cats,
+            total,
+            root_gain,
+            Bounds::default(),
+            0,
+            &reg,
+            0,
+            None,
+        );
+        best
+    }
+
+    /// A feature with a single category still separates it from the missing
+    /// values (one-hot search, fewer than four categories).
+    #[test]
+    fn a_lone_category_splits_from_missing_values() {
+        let best = sweep(&[(0, GradStats::new(2.0, 2.0))], GradStats::new(0.0, 4.0));
+        assert!(best.is_categorical);
+        assert_eq!(best.cat_left, [0]);
+        assert!(!best.default_left, "missing values go to the other child");
+        assert!((best.loss_chg - 4.0).abs() < 1e-6, "{}", best.loss_chg);
+    }
+
+    /// Four categories ordered by weight (`-2, -1, 1, 2`) plus missing values
+    /// whose weight (`±3`) puts them with one end of that order: the search
+    /// scans both directions, so the missing values join the side that fits
+    /// them, and the recorded set is `{0, 1}` either way.
+    #[test]
+    fn missing_values_join_the_side_that_fits_them() {
+        let cats = [
+            (0, GradStats::new(2.0, 1.0)),
+            (1, GradStats::new(1.0, 1.0)),
+            (2, GradStats::new(-1.0, 1.0)),
+            (3, GradStats::new(-2.0, 1.0)),
+        ];
+        // G = 3 and -6 over H = 2 and 3 against the parent's 9/5.
+        let expected = 4.5 + 12.0 - 1.8;
+        for (missing_grad, with_set) in [(-3.0, false), (3.0, true)] {
+            let best = sweep(&cats, GradStats::new(missing_grad, 5.0));
+            assert!(best.is_categorical);
+            assert_eq!(best.cat_left, [0, 1], "missing gradient {missing_grad}");
+            assert_eq!(
+                best.default_left, with_set,
+                "missing gradient {missing_grad}"
             );
-            best
-        };
-        for order in [[0, 1, 2], [1, 0, 2], [2, 1, 0]] {
-            let best = sweep(order);
-            assert!(best.is_categorical, "order {order:?}");
-            assert_eq!(best.cat_left, [2, 0], "order {order:?}");
-            assert!((best.loss_chg - 1.5).abs() < 1e-9, "order {order:?}");
+            assert!(
+                (best.loss_chg - expected).abs() < 1e-5,
+                "missing gradient {missing_grad}: {}",
+                best.loss_chg
+            );
         }
     }
 }

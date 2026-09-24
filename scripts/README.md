@@ -25,7 +25,11 @@ named by the `xgb_model_ubj` field. Case names say what they vary: `exact_` /
 `approx_` / `hist_` tree methods, `_d<k>` the depth, and `nobs_` cases drop
 `base_score` so the intercept is estimated. `weighted` cases carry
 `weights`, ranking cases `group_sizes` / `test_group_sizes`, and categorical
-cases (two integer-coded categorical columns) `feature_types`. `n_targets`
+cases (two integer-coded categorical columns) `feature_types`;
+`categorical_missing_reg_d6` (6 and 80 categories with missing values, so the
+forward and backward partition scans differ and `max_cat_threshold` binds)
+and `categorical_onehot_reg_d6` (3 and 2 categories, one-hot splits) cover
+the categorical split search. `n_targets`
 gives the label columns: the `multi_*` cases (3-target `reg:squarederror`
 on hist and exact, multi-label `binary:logistic` with and without
 `scale_pos_weight`, weighted 2-target `reg:pseudohubererror` and

@@ -353,7 +353,8 @@ wrappers. Some XGBoost options exist only at one setting: gblinear is
 `updater=coord_descent` with `feature_selector=cyclic`, LambdaMART is
 `lambdarank_pair_method=topk` (no `lambdarank_unbiased` or `ndcg_exp_gain`),
 DART has no `sample_type`/`normalize_type`/`one_drop`, and categorical
-splits have no `max_cat_to_onehot`/`max_cat_threshold`. The metrics
+splits use XGBoost's defaults `max_cat_to_onehot = 4` and
+`max_cat_threshold = 64` (not configurable). The metrics
 `gamma-deviance` and `ndcg-`/`map-` are missing, and `@` cutoffs are read by
 `tweedie-nloglik`, `ndcg`, `map`, and `pre` only (`error@t` evaluates plain
 `error`).

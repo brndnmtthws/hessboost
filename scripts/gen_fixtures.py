@@ -87,6 +87,20 @@ def y_regression(x, rng):
     return 2 * x[:, 0] - 3 * x[:, 1] ** 2 + 0.5 * x[:, 2] + 0.1 * rng.standard_normal(n)
 
 
+def y_category_effects(x, rng):
+    """A random effect per category of columns 0 and 1 plus a numeric trend,
+    so category order carries no signal and every partition is plausible."""
+    n = x.shape[0]
+    effect0 = rng.standard_normal(128)
+    effect1 = rng.standard_normal(128)
+    return (
+        effect0[x[:, 0].astype(int)]
+        + 0.7 * effect1[x[:, 1].astype(int)]
+        + 0.5 * x[:, 2]
+        + 0.1 * rng.standard_normal(n)
+    )
+
+
 def y_heavy_tail(x, rng):
     """Regression signal with heavy-tailed noise (for pseudo-Huber)."""
     n = x.shape[0]
@@ -239,6 +253,20 @@ CASES = {
         y_regression,
         {},
         dict(categorical=True),
+    ),
+    # categorical splits with missing values in the categorical columns, so
+    # the forward and backward partition scans differ; 80 categories exceed
+    # XGBoost's max_cat_threshold (64)
+    "categorical_missing_reg_d6": (
+        y_category_effects,
+        {},
+        dict(categorical=(6, 80), missing=0.2),
+    ),
+    # fewer than max_cat_to_onehot (4) categories: one-hot splits
+    "categorical_onehot_reg_d6": (
+        y_category_effects,
+        {},
+        dict(categorical=(3, 2), missing=0.2),
     ),
     # objectives
     "binary_d6": (y_binary, dict(objective="binary:logistic"), dict(tol_train=TOL_TRAIN_PROB)),
@@ -827,10 +855,13 @@ def build_case(name: str) -> dict:
 
     x = rng.random((N_TRAIN + N_TEST, N_COLS), dtype=np.float32)
     feature_types = None
-    if opts.get("categorical"):
-        # Two integer-coded categorical columns plus six numeric columns.
-        x[:, 0] = rng.integers(0, 5, x.shape[0]).astype(np.float32)
-        x[:, 1] = rng.integers(0, 9, x.shape[0]).astype(np.float32)
+    categorical = opts.get("categorical")
+    if categorical:
+        # Two integer-coded categorical columns plus six numeric columns;
+        # `categorical` is True (5 and 9 categories) or the two counts.
+        counts = (5, 9) if categorical is True else categorical
+        x[:, 0] = rng.integers(0, counts[0], x.shape[0]).astype(np.float32)
+        x[:, 1] = rng.integers(0, counts[1], x.shape[0]).astype(np.float32)
         feature_types = ["c", "c"] + ["q"] * (N_COLS - 2)
     target_out = target(x, rng)
     lower = upper = None

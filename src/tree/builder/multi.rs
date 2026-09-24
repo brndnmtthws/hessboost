@@ -37,9 +37,9 @@
 
 use super::hist::{partition_rows, rayon_available};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, LeafRows, build_interaction_sets,
-    limit_or_unbounded, need_replace, next_allowed, permits, xgb_calc_weight,
-    xgb_gain_given_weight,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, LeafRows, MAX_CAT_THRESHOLD, MAX_CAT_TO_ONEHOT,
+    build_interaction_sets, limit_or_unbounded, need_replace, next_allowed, permits,
+    xgb_calc_weight, xgb_gain_given_weight,
 };
 use crate::K_RT_EPS_F32;
 use crate::config::{GrowPolicy, TrainingParams};
@@ -52,14 +52,6 @@ use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-
-/// XGBoost's default `max_cat_threshold`: the most categories one side of a
-/// partition split enumerates.
-const MAX_CAT_THRESHOLD: usize = 64;
-
-/// XGBoost's default `max_cat_to_onehot`: categorical features with fewer
-/// categories enumerate one-hot splits instead of partitions.
-const MAX_CAT_TO_ONEHOT: usize = 4;
 
 /// XGBoost's `Driver` batch size: at most this many nodes of one depth-wise
 /// level are expanded together.

@@ -20,13 +20,12 @@ use crate::K_RT_EPS_F32;
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
-use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
+use crate::tree::constraints::{Bounds, MonotoneConstraints};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 use crate::tree::reuse::{CategoricalPenalty, ReuseSet};
 use crate::tree::sampler::ColumnSampler;
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 /// Value-sorted column index over a [`DMatrix`], built once and reused across
 /// boosting rounds. Within each column, `(row, value)` pairs are sorted by
@@ -159,9 +158,6 @@ impl<'a> ExactTreeBuilder<'a> {
         let mut node_bounds: Vec<Bounds> = vec![Bounds::default()];
         let mut node_allowed: Vec<Option<InteractionState>> = vec![None];
 
-        // With no monotone constraints the closed-form gain path is exact; the
-        // bounded path is used otherwise.
-        let constrained = self.cons.is_active();
         let ftypes = data.feature_types();
 
         let depth_limit = limit_or_unbounded(self.params.max_depth);
@@ -203,35 +199,42 @@ impl<'a> ExactTreeBuilder<'a> {
                 };
 
                 // Categorical features use a set-membership split instead of a
-                // numeric threshold.
+                // numeric threshold, over every category of the column in
+                // ascending order (the histogram builder's category bins).
                 if ftypes[f as usize] == FeatureType::Categorical {
-                    // Gather per-node, per-category statistics for this feature.
-                    let mut cat_stats: Vec<HashMap<u32, GradStats>> = vec![HashMap::new(); k];
+                    // The column is sorted, so equal categories are adjacent.
+                    let mut categories: Vec<u32> = Vec::new();
+                    let mut cat_stats: Vec<Vec<GradStats>> = vec![Vec::new(); k];
                     for (&rr, &val) in crows.iter().zip(cvals) {
-                        let r = rr as usize;
-                        let Some((_, slot)) = active_slot(r) else {
+                        let cat = val as u32;
+                        if categories.last() != Some(&cat) {
+                            categories.push(cat);
+                        }
+                        let Some((_, slot)) = active_slot(rr as usize) else {
                             continue;
                         };
-                        cat_stats[slot]
-                            .entry(val as u32)
-                            .or_default()
-                            .add(GradStats::from_pair(gpair[r]));
+                        let stats = &mut cat_stats[slot];
+                        stats.resize(categories.len(), GradStats::default());
+                        stats[categories.len() - 1].add(GradStats::from_pair(gpair[rr as usize]));
                     }
                     let reuse = self.reuse.as_ref().map(RefCell::borrow);
                     for (slot, &nid) in active.iter().enumerate() {
                         if !permits(node_allowed[nid].as_ref(), f) {
                             continue;
                         }
-                        let mut cats: Vec<(u32, GradStats)> =
-                            cat_stats[slot].iter().map(|(&c, &s)| (c, s)).collect();
+                        let stats = &cat_stats[slot];
+                        let cats: Vec<(u32, GradStats)> = categories
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &c)| (c, stats.get(i).copied().unwrap_or_default()))
+                            .collect();
                         sweep_categorical(
                             &mut best[slot],
-                            &mut cats,
+                            &cats,
                             node_stats[nid],
-                            f64::from(root_gain[slot]),
+                            root_gain[slot],
                             node_bounds[nid],
                             dir,
-                            constrained,
                             &self.reg,
                             f,
                             reuse.as_deref().map(|r| r as &dyn CategoricalPenalty),
@@ -360,8 +363,7 @@ impl<'a> ExactTreeBuilder<'a> {
 
                 // Monotone child bounds derived from the (bounded) child weights.
                 let dir = self.cons.dir(b.feature as usize);
-                let (lb_bounds, rb_bounds) =
-                    child_bounds(node_bounds[nid], dir, b.w_left, b.w_right);
+                let (lb_bounds, rb_bounds) = b.child_bounds(node_bounds[nid], dir);
 
                 // Children carry XGBoost's bounded `f32` weight, so the
                 // `leaf_value` field of nodes that later split records the value

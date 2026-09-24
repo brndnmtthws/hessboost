@@ -32,9 +32,10 @@
 //! Hessians); leaves keep the outputs their split recorded.
 
 use super::{
-    BestSplit, SplitPos, candidate_gain, children_valid, for_each_numeric_split, sweep_prefixes,
-    xgb_calc_weight, xgb_loss_chg, xgb_node_gain, xgb_update,
+    BestSplit, SplitPos, candidate_gain, children_valid, for_each_numeric_split, xgb_calc_weight,
+    xgb_loss_chg, xgb_node_gain, xgb_update,
 };
+use crate::K_RT_EPS;
 use crate::config::TrainingParams;
 use crate::data::quantile::HistCuts;
 use crate::rng::splitmix64;
@@ -360,6 +361,34 @@ impl Candidate<'_> {
                 }
             },
         );
+    }
+}
+
+/// Offer every prefix of the ordered `cats` (at least one category always
+/// stays right) as a set-membership split with the prefix on the left.
+/// `total` includes any missing mass, which stays on the right.
+/// `score(left, right, cats_left)` returns the candidate's gain and child
+/// weights (`None`: invalid), and `best` takes it when it beats the incumbent
+/// by more than `K_RT_EPS`.
+fn sweep_prefixes(
+    best: &mut BestSplit,
+    cats: &[(u32, GradStats)],
+    total: GradStats,
+    feature: u32,
+    mut score: impl FnMut(GradStats, GradStats, &[u32]) -> Option<(f64, f64, f64)>,
+) {
+    let mut left = GradStats::default();
+    let mut cats_left: Vec<u32> = Vec::new();
+    for &(cat, stats) in &cats[..cats.len() - 1] {
+        left.add(stats);
+        cats_left.push(cat);
+        let right = total.sub(left);
+        if let Some((g, wl, wr)) = score(left, right, &cats_left)
+            && g > best.loss_chg + K_RT_EPS
+        {
+            *best =
+                BestSplit::categorical(g, feature, false, left, right, wl, wr, cats_left.clone());
+        }
     }
 }
 

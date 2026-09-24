@@ -16,7 +16,7 @@ use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
+use crate::tree::constraints::{Bounds, MonotoneConstraints};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::quantized::QuantNode;
 use crate::tree::hist::{
@@ -388,7 +388,7 @@ impl<'a> HistTreeBuilder<'a> {
 
         // Monotone child bounds derived from the (bounded) child weights.
         let dir = self.cons.dir(b.feature as usize);
-        let (lb_bounds, rb_bounds) = child_bounds(entry.bounds, dir, b.w_left, b.w_right);
+        let (lb_bounds, rb_bounds) = b.child_bounds(entry.bounds, dir);
 
         let threshold = match b.split_bin {
             Some(bin) => cuts.cut_value(bin),
@@ -619,36 +619,34 @@ impl<'a> HistTreeBuilder<'a> {
                 node,
             );
         }
-        let constrained = self.cons.is_active();
         let root_gain = xgb_node_gain(total, &self.reg, bounds);
 
         for &f in feature_subset {
             let (fs, fe) = cuts.feature_bins(f as usize);
-            if fe <= fs + 1 {
-                continue; // degenerate feature, no interior boundary
-            }
             let dir = self.cons.dir(f as usize);
 
             if cuts.is_categorical(f as usize) {
-                // Only non-empty category bins can move; the sweep sorts them
-                // by grad/hess ratio.
-                let mut cats: Vec<(u32, GradStats)> = (fs..fe)
-                    .filter(|&i| hist[i].hess > 0.0)
+                // Every category bin, empty ones included, as XGBoost
+                // enumerates them (a lone category can still split present
+                // from missing values).
+                let cats: Vec<(u32, GradStats)> = (fs..fe)
                     .map(|i| (cuts.cut_value(i) as u32, hist[i]))
                     .collect();
                 sweep_categorical(
                     &mut best,
-                    &mut cats,
+                    &cats,
                     total,
-                    f64::from(root_gain),
+                    root_gain,
                     bounds,
                     dir,
-                    constrained,
                     &self.reg,
                     f,
                     self.reuse.as_ref().map(|r| r as &dyn CategoricalPenalty),
                 );
                 continue;
+            }
+            if fe <= fs + 1 {
+                continue; // degenerate feature, no interior boundary
             }
 
             for_each_numeric_split(

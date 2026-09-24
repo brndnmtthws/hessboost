@@ -108,6 +108,7 @@ Self-contained programs in [`examples/`](examples); run one with
 | `ordered_target_stats` | ordered target statistics for a high-cardinality categorical |
 | `compact_model` | reuse penalties and the bit-packed compact model format |
 | `budget` | budget-mode training against default and tuned training |
+| `metal` | CPU vs GPU batch prediction (macOS, `--features metal`) |
 
 `bench_compare` is the Rust half of the XGBoost timing harness
 (`scripts/bench_xgb.py`), not a standalone example.
@@ -119,8 +120,10 @@ Everything in this section follows XGBoost 3.4.2 and is covered by the
 
 ### Boosters and training
 
-- **Boosters:** `gbtree`, `dart`, and `gblinear` (coordinate descent).
-  Boosted random forests with `num_parallel_tree`: each iteration grows
+- **Boosters:** `gbtree`, `dart`, and `gblinear` (coordinate descent,
+  which updates from every row and feature, so it refuses row and column
+  sampling, forests, tree constraints, and feature weights). Boosted random
+  forests with `num_parallel_tree` (up to 65,536): each iteration grows
   that many trees per output from the same gradients, each with its own
   row/column sample and `eta / num_parallel_tree` shrinkage.
 - **Entry points:** `train` and the `Trainer` builder (watched eval sets
@@ -132,10 +135,13 @@ Everything in this section follows XGBoost 3.4.2 and is covered by the
   followed by `b` rounds grow the same trees as one run of `a + b`.
 - **Refresh:** `process_type = update` (XGBoost's `refresh` updater, via
   `Trainer::init_model`) recomputes an existing gbtree model's node
-  statistics and, with `refresh_leaf`, its leaf values on new data. It is
-  refused for DART-weighted and vector-leaf models, monotone constraints,
-  linear leaves, `path_smooth`, `use_quantized_grad`, `extra_trees`, reuse
-  penalties, and more rounds than the model has.
+  statistics and, with `refresh_leaf`, its leaf values on new data. It keeps
+  every split and sums every row, so it accepts XGBoost's tree-shape and
+  regularization settings but refuses any other non-default setting it
+  does not read (row and column sampling, symmetric growth, DART dropout,
+  `use_quantized_grad`, and the opt-in tree options) and feature weights.
+  It also refuses DART-weighted, vector-leaf, and linear-leaf models,
+  monotone constraints, and more rounds than the model has.
 - **Slicing and iteration ranges:** `BoostedModel::slice(0..4, 1)`
   (XGBoost's `booster[a:b:c]`) and the `iteration_range` predictions
   `predict_range`, `predict_margin_range`, `predict_leaf_range`,
@@ -170,11 +176,14 @@ Everything in this section follows XGBoost 3.4.2 and is covered by the
 | Counts | `count:poisson` |
 | Ranking | `rank:pairwise`, `rank:ndcg`, `rank:map` (LambdaMART, `lambdarank_num_pair_per_sample`) |
 | Survival | `survival:cox` (negative labels are right-censored), `survival:aft` (interval-censored label bounds, `aft_loss_distribution` `normal`/`logistic`/`extreme`) |
-| Custom | `CustomObjective` via `Trainer::objective` |
+| Custom | `CustomObjective`, or any `Objective` implementation, via `Trainer::objective` |
 
 Intercepts are estimated per output as XGBoost 3.4.2 does.
 `reg:absoluteerror` and `reg:quantileerror` use XGBoost 3.4's smoothed
-losses.
+losses. A custom `Objective` sets its intercepts through one hook,
+`base_margins_info` (default: XGBoost's Newton step), and its link through
+one, `probs_to_margins` (applied to a user `base_score`; default:
+identity).
 
 ### Metrics
 
@@ -182,9 +191,10 @@ losses.
 `mlogloss`, `merror`, `poisson-nloglik`, `gamma-nloglik`, `tweedie-nloglik`,
 `ndcg`, `map`, `pre`, `quantile`, `expectile`, `cox-nloglik`, `aft-nloglik`,
 `interval-regression-accuracy`, and custom metrics (`CustomMetric`) via
-`Trainer::custom_metric`. Ranking metrics take `@k` cutoffs (plain `pre`
-cuts at 32) and `tweedie-nloglik@rho` a variance power. Each objective's
-default metric is XGBoost's.
+`Trainer::custom_metric`. Ranking metrics take `@k` cutoffs (a positive
+integer; plain `pre` cuts at 32) and `tweedie-nloglik@rho` a variance power
+in `[1, 2)`; any other `@` suffix is refused. Each objective's default
+metric is XGBoost's.
 
 ### Multi-output models
 
@@ -237,8 +247,9 @@ Predictions for multi-output models are row-major, `[row][output]`.
 - **Native formats:** a checksummed, zstd-compressed binary format
   (`save_binary` / `load_binary`) and JSON (`save_json` / `load_json`),
   both covering every model hessboost trains. Files written by 0.2.0
-  and later load in every later release; native binaries from 0.1.x are
-  refused.
+  and later load in every later release. Native binary and JSON files from
+  0.1.x are refused; the [changelog](CHANGELOG.md#upgrading-from-01) shows
+  how to carry a model over.
 - **XGBoost interchange:** import and export `gbtree` and DART models
   (numeric and categorical splits, forests, multi-output and vector-leaf
   trees) as XGBoost JSON (`save_xgboost_json` / `load_xgboost_json`) or
@@ -356,12 +367,13 @@ After *Boosted Trees on a Diet* ([Herrmann et al., ICLR 2026](https://arxiv.org/
   (in `gamma`'s units) penalize split candidates that use a feature or
   threshold not yet used anywhere in the ensemble. Available in every tree
   method; refused with `extra_trees`, `path_smooth`, and symmetric trees.
-- **Compact format:** `BoostedModel::to_compact_bytes` / `to_compact` give a
-  `CompactModel` (`hessboost::model::compact`) with deduplicated,
-  bit-packed feature, threshold, and leaf tables. Its `predict_margin` is
-  bit-identical to the source model's; `BoostedModel::size_report` compares
-  native and compact sizes. Forests and scalar multi-output models are
-  supported; gblinear, linear-leaf, and vector-leaf models are refused.
+- **Compact format:** `BoostedModel::to_compact` gives a `CompactModel`
+  (`hessboost::model::compact`; `to_compact_bytes` gives its serialized
+  bytes) with deduplicated, bit-packed feature, threshold, and leaf tables.
+  Its `predict_margin` is bit-identical to the source model's;
+  `BoostedModel::size_report` compares native and compact sizes. Forests
+  and scalar multi-output models are supported; gblinear, linear-leaf, and
+  vector-leaf models are refused.
   XGBoost cannot read the format.
 
 On the `compact_model` example (100 depth-3 trees, 16 features), the compact
@@ -393,21 +405,31 @@ from scratch, using a synthetic prior or TabPFN logits exported from Python
 
 ### GPU acceleration (macOS, Metal)
 
-Build with `--features metal` on macOS. Two paths, both opt-in and both
-bit-identical to the CPU:
+Build with `--features metal` on macOS 10.15 or later with a Metal device
+whose kernels support 64-bit integers (every Apple Silicon Mac); without one,
+the GPU paths return an error. Two paths, both opt-in and both bit-identical
+to the CPU:
 
 - **Prediction** (`model.to_gpu()`): the model's compact forest is uploaded
   once and every row walks it on the GPU, one thread per row. On an M4 Max,
   500k rows through 200 depth-8 trees predict ~2.5x faster than the CPU,
   and the gap widens with model and batch size. See
-  `hessboost::backend::metal` and
   `cargo run --release --features metal --example metal`.
-- **Training** (`device = metal`): histogram construction moves to the GPU,
-  reproducing single-threaded CPU training bit for bit. Currently a
-  correctness path rather than a speedup — on multicore Apple Silicon the
-  exact (no-atomics, no-`double`) GPU accumulation is slower than the CPU
-  histogram path; the measured numbers and the cause are documented in
-  `hessboost::backend::metal`.
+- **Training** (`device = metal`, `tree_method = hist`): the GPU builds a
+  node's histogram from exact 64-bit integer sums whenever the CPU's `f64`
+  sums for that node are exact too (at most `2^53` times the gradients'
+  finest power-of-two grain). Other nodes, nodes under 8,192 rows, and
+  failed GPU commands run on the CPU, so training reproduces
+  single-threaded CPU training bit for bit. A correctness path rather than
+  a speedup so far: the earlier floating-point kernels were slower than the
+  multicore CPU histogram path, and the integer kernels have not been
+  measured yet.
+
+The [docs.rs](https://docs.rs/hessboost) build runs on Linux, where
+`hessboost::backend::metal` is a stub. On a Mac,
+`cargo doc --features metal --open` renders the Metal API (`GpuModel`,
+`available`, `device_name`) and the backend's design, exactness bound, and
+limitations.
 
 ## Not implemented
 
@@ -420,8 +442,9 @@ bit-identical to the CPU:
   `ndcg_exp_gain`); DART has no `sample_type`, `normalize_type`, or
   `one_drop`; categorical splits use XGBoost's defaults
   `max_cat_to_onehot = 4` and `max_cat_threshold = 64`.
-- The metrics `gamma-deviance` and `ndcg-`/`map-`. Only ranking metrics and
-  `tweedie-nloglik` read an `@` suffix; `error@t` evaluates plain `error`.
+- The metrics `gamma-deviance`, `error@t` (XGBoost's classification
+  threshold suffix), and the `-` variants of the ranking metrics (`ndcg-`,
+  `ndcg@k-`, `map-`, `map@k-`); these names are refused.
 - gblinear models cannot be imported from or exported to XGBoost formats.
 
 ## Performance
@@ -493,3 +516,9 @@ Budget-mode training reimplements the algorithm of
 [PerpetualBooster](https://github.com/perpetual-ml/perpetual) (Copyright 2024
 Perpetual ML, Apache-2.0) from its published description and Rust source; no
 Perpetual code is copied.
+
+The error function behind the AFT normal distribution is ported from
+glibc 2.41's `s_erf.c`, which derives from Sun Microsystems' fdlibm
+(Copyright (C) 1993 Sun Microsystems, Inc.; use, copying, modification, and
+distribution are permitted provided the notice is preserved).
+`src/objective/survival.rs` carries that notice verbatim.

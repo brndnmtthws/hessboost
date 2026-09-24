@@ -311,7 +311,9 @@ impl DMatrix {
     /// epsilon weight, not an exclusion: such a feature is rarely drawn
     /// against much larger weights but can still be selected, and it is as
     /// likely as any other feature weighted below `1e-6`. Not stored in the
-    /// model.
+    /// model. Training refuses them with `booster = gblinear`, with
+    /// `process_type = update`, and in budget mode, none of which samples
+    /// columns.
     pub fn with_feature_weights(mut self, weights: &[f32]) -> Result<Self> {
         check_len("feature_weights", weights.len(), self.n_cols)?;
         check_weights(

@@ -83,15 +83,17 @@ pub enum Device {
     /// run on.
     #[default]
     Cpu,
-    /// Apple's Metal GPU, on macOS with the `metal` feature: histogram
-    /// construction runs on the GPU, reproducing single-threaded CPU
-    /// training bit for bit. Requires `tree_method = hist`/`auto` and a
-    /// tree booster. Beyond XGBoost (opt-in).
+    /// Apple's Metal GPU, on macOS 10.15 or later with the `metal` feature:
+    /// histogram construction runs on the GPU for every node whose sums it
+    /// can compute exactly and on the CPU for the rest, reproducing
+    /// single-threaded CPU training bit for bit. Requires `tree_method =
+    /// hist`/`auto` and a tree booster. Beyond XGBoost (opt-in).
     ///
-    /// Currently a correctness path, not a speedup: on multicore Apple
-    /// Silicon the GPU histograms are slower than the CPU's (see
-    /// [`backend`](crate::backend) for the measured numbers and the
-    /// cause); the fast Metal path is prediction, through
+    /// A correctness path so far, not a speedup: with the earlier
+    /// floating-point kernels the GPU histograms were slower than the
+    /// multicore CPU's, and the current integer kernels are unmeasured
+    /// (see [`backend::metal`](crate::backend::metal)); the fast Metal path is
+    /// prediction, through
     /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu).
     Metal,
 }

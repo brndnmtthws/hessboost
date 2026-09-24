@@ -96,7 +96,9 @@
 //! - **Metrics:** rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
 //!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, and
-//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric)).
+//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric));
+//!   `@k` cutoffs on the ranking metrics and `@rho` on tweedie-nloglik, any
+//!   other suffix refused ([`create_metric`](metric::create_metric)).
 //! - **Modeling:** monotone & interaction constraints, native categorical
 //!   splits, early stopping, feature importance, QuadratureTreeSHAP
 //!   contributions and interaction values
@@ -132,11 +134,15 @@
 //!     predict a full conditional distribution per row
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
 //!     [`objective::distributional`]), scored by `nll` / `crps`.
-//!   - GPU acceleration on macOS through native Metal (`metal` feature):
-//!     bit-identical GPU prediction ([`to_gpu`](model::BoostedModel::to_gpu),
-//!     roughly 2.5x faster at scale) and bit-identical GPU histogram
-//!     training ([`device`](config::TrainingParams::device) = `metal`; see
-//!     [`backend`] for what each path does today).
+//!   - GPU acceleration on macOS 10.15+ through native Metal (`metal`
+//!     feature): bit-identical GPU prediction
+//!     ([`to_gpu`](model::BoostedModel::to_gpu), roughly 2.5x faster at
+//!     scale) and bit-identical GPU histogram training
+//!     ([`device`](config::TrainingParams::device) = `metal`; exact integer
+//!     sums, with a CPU fallback outside their exact domain). The Metal API
+//!     is documented only in macOS builds with the feature
+//!     (`cargo doc --features metal`); elsewhere [`backend::metal`] is a
+//!     stub.
 //!
 //! Runnable examples live in the crate's `examples/` directory (e.g.
 //! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,

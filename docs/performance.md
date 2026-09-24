@@ -551,23 +551,29 @@ metal` and `cargo run --release --features metal --example metal`:
 |---|---|---|---|
 | predict, 500k rows × 30 features, 200 depth-8 trees | 31.0 ms | 12.6 ms | **2.5×** |
 | predict, 500k rows × 30 features, 100 depth-6 trees | 12.4 ms | 6–11 ms (thermal-sensitive) | ~1.1–1.8× |
-| hist build, 1M rows × 30 features (root node) | 2.0 ms | 11.2 ms | 0.18× |
-| train, 200k × 30, depth 8, 50 rounds | 278 ms | 501 ms | 0.56× |
+| hist build, 1M rows × 30 features (root node)\* | 2.0 ms | 11.2 ms | 0.18× |
+| train, 200k × 30, depth 8, 50 rounds\* | 278 ms | 501 ms | 0.56× |
+
+\* Measured with the earlier double-float histogram kernels. The current
+integer kernels have not been measured yet.
 
 GPU **prediction** is the speed path: the per-row walk is independent, the
 compact forest stays L2-resident, and the fixed per-call row upload
 amortizes as batches and ensembles grow (the 200-tree example measures
 2.5×; larger models widen the gap).
 
-GPU **histogram construction** (`device = metal`) is currently slower than
-the 14-core CPU path. The cause is structural, not incidental: the
-determinism contract (bit-identical to single-threaded CPU training, no
-floating-point atomics) plus Apple GPUs' lack of `double` forces an exact
-double-float (two-sum) accumulation at roughly six times the arithmetic of
-the CPU's native `f64` adds, and the single-writer-per-bin layout routes
-row/column/gradient loads through the GPU's scalar path. Wider feature
-blocks and cooperative (threadgroup-memory) loading are the known tuning
-directions; measured attempts so far (wider blocks up to 1024 threads,
+GPU **histogram construction** (`device = metal`) was slower than the
+14-core CPU path with the double-float kernels. The determinism contract
+(bit-identical to single-threaded CPU training, no floating-point atomics)
+plus Apple GPUs' lack of `double` forced an exact double-float (two-sum)
+accumulation at roughly six times the arithmetic of the CPU's native `f64`
+adds, and the single-writer-per-bin layout routes row/column/gradient loads
+through the GPU's scalar path. The current kernels sum 64-bit integers
+instead (one add per component, but 16-byte gradient pairs instead of 8),
+for every node whose sums the CPU's `f64` chain computes exactly; other
+nodes run on the CPU. Wider feature blocks and cooperative
+(threadgroup-memory) loading are the known tuning directions; measured
+attempts with the double-float kernels (wider blocks up to 1024 threads,
 interleaved `uint4` records) regressed.
 
 Run the Metal benches on a Mac with a Metal device:

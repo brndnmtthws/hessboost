@@ -164,7 +164,7 @@ impl Objective for AbsoluteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::gradient_pairs;
+    use crate::objective::{base_margins, gradient_pairs};
     use crate::training::Trainer;
 
     /// `δ = (Σ√|r| / n)²`; `g = r·δ/√(δ² + r²)`, `h = δ/√(δ² + r²)`, which
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!([out[1], out[3]], [single[0], single[1]]);
         assert!(out[0].grad < 0.0 && out[1].grad > 0.0);
 
-        let margins = two.base_margins(&labels, None, None);
+        let margins = base_margins(&two, &labels, None);
         // Constant columns: the Newton step from the mean is zero.
         assert_eq!(margins, vec![1.0, -9.0]);
     }
@@ -240,11 +240,11 @@ mod tests {
         let preds = [mean; 3];
         let gpair = gradient_pairs(&obj, &preds, &labels, None);
         let expected = fit_stump(&gpair, 1)[0] + mean;
-        let got = obj.base_margins(&labels, None, None);
+        let got = base_margins(&obj, &labels, None);
         assert_eq!(got, vec![expected]);
         assert!(got[0] > 0.0 && got[0] < mean, "{got:?}");
         assert_eq!(
-            obj.base_margins(&labels, Some(&[0.0, 0.0, 0.0]), None),
+            base_margins(&obj, &labels, Some(&[0.0, 0.0, 0.0])),
             vec![0.0]
         );
     }

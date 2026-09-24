@@ -234,7 +234,12 @@ fn bench_objective_gradients(c: &mut Criterion) {
         &positive_labels,
         None,
     );
-    run("gamma_unweighted_1m", &Gamma, &positive_labels, None);
+    run(
+        "gamma_unweighted_1m",
+        &Gamma::default(),
+        &positive_labels,
+        None,
+    );
     run(
         "tweedie_unweighted_1m",
         &Tweedie::default(),
@@ -291,7 +296,7 @@ fn bench_prediction_transforms(c: &mut Criterion) {
     group.bench_function("exp_automatic", |b| {
         b.iter(|| {
             values.copy_from_slice(&source);
-            Gamma.pred_transform(&mut values);
+            Gamma::default().pred_transform(&mut values);
             black_box(&values);
         });
     });
@@ -332,9 +337,9 @@ fn bench_pointwise_metrics(c: &mut Criterion) {
     group.throughput(Throughput::Elements(N as u64));
 
     for (name, metric) in [
-        ("rmse", &Rmse as &dyn Metric),
-        ("mae", &Mae as &dyn Metric),
-        ("error", &ErrorRate as &dyn Metric),
+        ("rmse", &Rmse::default() as &dyn Metric),
+        ("mae", &Mae::default() as &dyn Metric),
+        ("error", &ErrorRate::default() as &dyn Metric),
     ] {
         bench_metric_pair(&mut group, name, metric, &preds, &labels, &weights);
     }
@@ -351,15 +356,19 @@ fn bench_log_metrics(c: &mut Criterion) {
 
     let tweedie = create_metric("tweedie-nloglik@1.5", &TrainingParams::default()).unwrap();
     for (name, metric, labels) in [
-        ("logloss", &LogLoss as &dyn Metric, binary_labels.as_slice()),
+        (
+            "logloss",
+            &LogLoss::default() as &dyn Metric,
+            binary_labels.as_slice(),
+        ),
         (
             "poisson_nloglik",
-            &PoissonNLogLik as &dyn Metric,
+            &PoissonNLogLik::default() as &dyn Metric,
             positive_labels.as_slice(),
         ),
         (
             "gamma_nloglik",
-            &GammaNLogLik as &dyn Metric,
+            &GammaNLogLik::default() as &dyn Metric,
             positive_labels.as_slice(),
         ),
         (
@@ -452,10 +461,8 @@ fn bench_binary_train(c: &mut Criterion) {
             )
         });
     });
-    let quantized = TrainingParams {
-        use_quantized_grad: true,
-        ..params.clone()
-    };
+    let mut quantized = params.clone();
+    quantized.use_quantized_grad = true;
     group.bench_function("quantized", |b| {
         b.iter(|| black_box(train(&quantized, &data, 50).unwrap()));
     });

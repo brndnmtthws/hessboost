@@ -1,7 +1,7 @@
 //! Count and positive-continuous regression objectives with a log link:
 //! Poisson, Gamma, and Tweedie. All predict `exp(margin)`.
 
-use super::{GradPair, Objective, check_label_domain, weighted_label_mean};
+use super::{GradPair, Objective, check_label_domain, log_link, weighted_label_mean};
 use crate::data::MetaInfo;
 use crate::error::Result;
 
@@ -17,9 +17,9 @@ fn poisson_deviance(margin: f32, label: f32) -> f64 {
     }
 }
 
-/// Emit the `pred_transform`/`prob_to_margin`/`base_margins` trio shared by
-/// the log-link objectives (all predict `exp(margin)`). The link is XGBoost's
-/// `ProbToMargin`, `ln(v)` in `f32`; the intercept is XGBoost's
+/// Emit the `pred_transform`/`probs_to_margins`/`base_margins_info` trio
+/// shared by the log-link objectives (all predict `exp(margin)`). The link is
+/// XGBoost's `ProbToMargin`, `ln(v)` in `f32`; the intercept is XGBoost's
 /// `FitInterceptGlmLike`, the (weighted) label mean through that link.
 macro_rules! log_link_objective {
     () => {
@@ -27,12 +27,14 @@ macro_rules! log_link_objective {
             crate::simd::exp_inplace(preds);
         }
 
-        fn prob_to_margin(&self, base_score: f32) -> f32 {
-            base_score.ln()
+        fn probs_to_margins(&self, scores: &mut [f32]) {
+            log_link(scores);
         }
 
         fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
-            vec![self.prob_to_margin(weighted_label_mean(info.labels, info.weights))]
+            let mut margin = [weighted_label_mean(info.labels, info.weights)];
+            log_link(&mut margin);
+            margin.to_vec()
         }
     };
 }
@@ -94,6 +96,7 @@ impl Objective for Poisson {
 /// Gamma regression (`reg:gamma`), a log-link objective for positive targets.
 /// Gradient `1 − y·exp(−m)`, Hessian `y·exp(−m)`.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Gamma;
 
 impl Objective for Gamma {
@@ -197,7 +200,7 @@ impl Objective for Tweedie {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::gradient_pairs;
+    use crate::objective::{base_margins, gradient_pairs};
     use approx::assert_relative_eq;
 
     #[test]
@@ -238,14 +241,11 @@ mod tests {
     #[test]
     fn log_link_intercept_is_ln_of_mean() {
         let obj = Poisson::default();
-        assert_eq!(obj.base_margins(&[2.0, 6.0], None, None), vec![4f32.ln()]);
+        assert_eq!(base_margins(&obj, &[2.0, 6.0], None), vec![4f32.ln()]);
         let w = [3.0f32, 1.0];
+        assert_eq!(base_margins(&obj, &[2.0, 6.0], Some(&w)), vec![3f32.ln()]);
         assert_eq!(
-            obj.base_margins(&[2.0, 6.0], Some(&w), None),
-            vec![3f32.ln()]
-        );
-        assert_eq!(
-            Gamma.base_margins(&[0.0, 0.0], None, None),
+            base_margins(&Gamma, &[0.0, 0.0], None),
             vec![f32::NEG_INFINITY]
         );
     }

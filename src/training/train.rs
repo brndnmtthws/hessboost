@@ -299,6 +299,7 @@ pub(crate) type EvalSet<'a> = (&'a DMatrix, &'a str);
 /// One row of the evaluation history: the metric values computed at the end of
 /// a boosting round.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RoundEval {
     /// The 0-based boosting iteration of the model (after continued training,
     /// counted from the start of the initial model).
@@ -310,6 +311,7 @@ pub struct RoundEval {
 /// The result of [`Trainer::train`]: the model plus the per-round evaluation
 /// history.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct TrainResult {
     /// The trained model.
     pub model: BoostedModel,
@@ -2720,15 +2722,6 @@ mod tests {
             for (row, (p, g)) in preds.iter().zip(out.iter_mut()).enumerate() {
                 *g = GradPair::new(p - Self::target(info, row), 1.0);
             }
-        }
-
-        fn base_margins(
-            &self,
-            _: &[f32],
-            _: Option<&[f32]>,
-            _: Option<&crate::data::GroupInfo>,
-        ) -> Vec<f32> {
-            unreachable!("training must call base_margins_info");
         }
 
         fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {

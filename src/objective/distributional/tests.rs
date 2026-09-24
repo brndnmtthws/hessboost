@@ -40,7 +40,7 @@ fn gradients_match_finite_differences() {
     // Large enough that the rounding of `ln Γ` differences (the NLL of the
     // count families at large sizes) stays below the tolerance.
     let h = 1e-4;
-    for family in DistFamily::ALL {
+    for &family in DistFamily::ALL {
         for (eta, y) in cases(family) {
             let g = family.gradient(&eta, y);
             for j in 0..family.n_params() {
@@ -61,7 +61,7 @@ fn gradients_match_finite_differences() {
 #[test]
 fn exact_hessians_match_finite_differences_of_the_gradient() {
     let h = 1e-6;
-    for family in DistFamily::ALL {
+    for &family in DistFamily::ALL {
         for (eta, y) in cases(family) {
             let hess = family.hessian(&eta, y);
             let k = family.n_params();
@@ -108,7 +108,7 @@ fn fisher_information_matches_monte_carlo() {
         }
     }
     let n = 200_000;
-    for family in DistFamily::ALL {
+    for &family in DistFamily::ALL {
         for (eta, _) in cases(family) {
             let dist = family.dist_from_margins(&eta);
             let fisher = family.fisher(&eta);
@@ -154,7 +154,7 @@ fn fisher_information_matches_monte_carlo() {
 #[test]
 fn intercepts_are_the_marginal_mle() {
     let mut rng = Rng::new(3);
-    for family in DistFamily::ALL {
+    for &family in DistFamily::ALL {
         let truth = family.dist_from_margins(&cases(family)[0].0);
         let labels: Vec<f32> = (0..4000)
             .map(|_| truth.sample(|| rng.next_u64()) as f32)
@@ -567,7 +567,7 @@ fn transforms_and_links_round_trip() {
     let mut bad = [0.0f32, -1.0];
     objective.probs_to_margins(&mut bad);
     assert!(bad[1].is_nan());
-    for family in DistFamily::ALL {
+    for &family in DistFamily::ALL {
         assert_eq!(
             DistFamily::from_objective(family.objective_name()),
             Some(family)

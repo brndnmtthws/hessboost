@@ -22,6 +22,7 @@ const NO_CHILD: i32 = -1;
 
 /// A single tree node.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Node {
     /// Split feature index (meaningful only for internal nodes).
     pub split_feature: u32,

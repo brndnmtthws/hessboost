@@ -7,6 +7,7 @@ use crate::error::{HessboostError, Result};
 /// How a feature column should be treated during split finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum FeatureType {
     /// Ordered numerical feature. Splits are `x < threshold`.
     #[default]
@@ -19,8 +20,10 @@ pub enum FeatureType {
 ///
 /// `group_ptr` has `num_groups + 1` entries. Group `g` spans rows
 /// `group_ptr[g]..group_ptr[g + 1]`. This matches XGBoost's CSR-style group
-/// encoding for learning-to-rank objectives.
+/// encoding for learning-to-rank objectives. Build with
+/// [`GroupInfo::from_sizes`] (or set `group_ptr` on [`GroupInfo::default`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
 pub struct GroupInfo {
     /// Prefix-sum group boundaries over the row index.
     pub group_ptr: Vec<usize>,
@@ -71,8 +74,10 @@ impl GroupInfo {
 ///
 /// Built by [`DMatrix::info`](crate::data::DMatrix::info), or by
 /// [`MetaInfo::new`] for single-target callers that only have labels,
-/// weights, and groups.
+/// weights, and groups; set the other fields (a label matrix's `n_rows` and
+/// `n_targets`, label bounds) on the result.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct MetaInfo<'a> {
     /// Number of rows (instances).
     pub n_rows: usize,

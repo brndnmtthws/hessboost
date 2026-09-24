@@ -95,6 +95,7 @@ const NO_CATEGORY: u32 = u32::MAX;
 /// Which labels an [`OrderedTargetEncoder`] accepts. Both kinds encode the
 /// smoothed target mean; the kind only decides label validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TargetKind {
     /// Any finite labels; the default prior is the label mean.
     #[default]

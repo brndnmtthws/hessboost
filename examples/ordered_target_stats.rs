@@ -41,7 +41,7 @@ fn fit_rmse(
 ) -> Result<(f64, f64)> {
     let model = train(params, train_set, 200)?;
     let rmse = |data: &DMatrix| -> Result<f64> {
-        Ok(Rmse.eval(
+        Ok(Rmse::default().eval(
             &model.predict(data)?,
             data.labels().unwrap_or_default(),
             None,

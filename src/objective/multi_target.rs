@@ -100,10 +100,6 @@ impl Objective for MultiTarget {
         self.inner.eval_transform(preds);
     }
 
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        self.inner.prob_to_margin(base_score)
-    }
-
     fn probs_to_margins(&self, scores: &mut [f32]) {
         self.inner.probs_to_margins(scores);
     }
@@ -131,7 +127,7 @@ mod tests {
     use super::*;
     use crate::config::TrainingParams;
     use crate::error::HessboostError;
-    use crate::objective::create_objective;
+    use crate::objective::{base_margins, create_objective};
 
     fn objective(name: &str, n_targets: usize) -> Box<dyn Objective> {
         let params = TrainingParams::builder()
@@ -187,7 +183,7 @@ mod tests {
                         assert_eq!(got.grad.to_bits(), e.grad.to_bits(), "{name} ({row},{j})");
                         assert_eq!(got.hess.to_bits(), e.hess.to_bits(), "{name} ({row},{j})");
                     }
-                    let intercept = single.base_margins(col, w, None);
+                    let intercept = base_margins(single.as_ref(), col, w);
                     assert_eq!(margins[j].to_bits(), intercept[0].to_bits(), "{name} {j}");
                 }
             }

@@ -236,6 +236,7 @@ use std::sync::OnceLock;
 /// The kind of feature-importance score to compute, mirroring XGBoost's
 /// `importance_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImportanceType {
     /// Number of times a feature is used to split.
     Weight,

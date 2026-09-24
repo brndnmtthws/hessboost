@@ -31,6 +31,7 @@ fn weighted_sum(
 /// `√(Σ w [ln1p(y) − ln1p(p)]² / Σ w)`. Predictions or labels at or below
 /// `-1` give NaN, as upstream (no clamp).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Rmsle;
 
 impl Metric for Rmsle {
@@ -50,6 +51,7 @@ impl Metric for Rmsle {
 /// Mean absolute percentage error (`mape`): `Σ w |(y − p) / y| / Σ w`. A
 /// zero label divides by zero (infinite or NaN), as upstream.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Mape;
 
 impl Metric for Mape {

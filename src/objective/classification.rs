@@ -60,6 +60,18 @@ impl Logistic {
             variant: LogisticVariant::Raw,
         }
     }
+
+    /// The link of one prediction-space value (XGBoost `ProbToMargin`):
+    /// the identity for `binary:logitraw`, otherwise
+    /// `LogisticRegression::ProbToMargin`, which bounds the probability away
+    /// from the asymptotes, then takes `Logit(p) = -ln(1/p - 1)` in `f32`.
+    fn link(self, p: f32) -> f32 {
+        if self.variant == LogisticVariant::Raw {
+            return p;
+        }
+        let p = p.clamp(K_RT_EPS_F32, 1.0 - K_RT_EPS_F32);
+        -(1.0 / p - 1.0).ln()
+    }
 }
 
 impl Default for Logistic {
@@ -119,18 +131,13 @@ impl Objective for Logistic {
         if (self.scale_pos_weight - 1.0).abs() > K_RT_EPS_F32 {
             return newton_intercepts(self, info);
         }
-        vec![self.prob_to_margin(weighted_label_mean(info.labels, info.weights))]
+        vec![self.link(weighted_label_mean(info.labels, info.weights))]
     }
 
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        if self.variant == LogisticVariant::Raw {
-            // `LogisticRaw::ProbToMargin` is the identity.
-            return base_score;
+    fn probs_to_margins(&self, scores: &mut [f32]) {
+        for s in scores {
+            *s = self.link(*s);
         }
-        // XGBoost `LogisticRegression::ProbToMargin`: bound the probability
-        // away from the asymptotes, then `Logit(p) = -ln(1/p - 1)` in f32.
-        let p = base_score.clamp(K_RT_EPS_F32, 1.0 - K_RT_EPS_F32);
-        -(1.0 / p - 1.0).ln()
     }
 
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
@@ -169,6 +176,7 @@ impl Objective for Logistic {
 /// threshold (XGBoost `FitIntercept`), so it is `0` or `1`. Labels are not
 /// validated (upstream expects `{0, 1}` but does not check).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Hinge;
 
 impl Objective for Hinge {
@@ -212,7 +220,7 @@ impl Objective for Hinge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::gradient_pairs;
+    use crate::objective::{base_margins, gradient_pairs};
     use approx::assert_relative_eq;
 
     #[test]
@@ -255,17 +263,19 @@ mod tests {
     fn base_margins_is_logit_of_rate() {
         let obj = Logistic::default();
         // 50% positive -> logit(0.5) = 0; 25% -> -ln(3) with XGBoost's f32 logit.
-        assert_eq!(obj.base_margins(&[1.0, 0.0], None, None), vec![0.0]);
-        let quarter = obj.base_margins(&[1.0, 0.0, 0.0, 0.0], None, None);
+        assert_eq!(base_margins(&obj, &[1.0, 0.0], None), vec![0.0]);
+        let quarter = base_margins(&obj, &[1.0, 0.0, 0.0, 0.0], None);
         assert_eq!(quarter, vec![-(1.0f32 / 0.25 - 1.0).ln()]);
     }
 
     #[test]
-    fn prob_to_margin_clamps_to_xgboost_bounds() {
+    fn probs_to_margins_clamps_to_xgboost_bounds() {
         let obj = Logistic::default();
-        assert_eq!(obj.prob_to_margin(0.0), obj.prob_to_margin(1e-6));
-        assert_eq!(obj.prob_to_margin(1.0), obj.prob_to_margin(1.0 - 1e-6));
-        assert!(obj.prob_to_margin(0.0).is_finite());
+        let mut scores = [0.0, 1e-6, 1.0, 1.0 - 1e-6];
+        obj.probs_to_margins(&mut scores);
+        assert_eq!(scores[0], scores[1]);
+        assert_eq!(scores[2], scores[3]);
+        assert!(scores[0].is_finite());
     }
 
     /// `binary:logitraw` shares the logistic gradient but keeps margins raw:
@@ -277,10 +287,7 @@ mod tests {
         let mut values = [-3.0f32, 0.5];
         raw.pred_transform(&mut values);
         assert_eq!(values, [-3.0, 0.5]);
-        assert_eq!(
-            raw.base_margins(&[1.0, 0.0, 0.0, 0.0], None, None),
-            vec![0.25]
-        );
+        assert_eq!(base_margins(&raw, &[1.0, 0.0, 0.0, 0.0], None), vec![0.25]);
         let (preds, labels) = ([0.3, -1.2], [1.0, 0.0]);
         assert_eq!(
             gradient_pairs(&raw, &preds, &labels, None),
@@ -315,11 +322,8 @@ mod tests {
     fn hinge_intercept_is_thresholded_newton_step() {
         let obj = Hinge;
         // Step = -Σg/Σh = (3 - 1)/4 = 0.5 > 0 -> 1.
-        assert_eq!(
-            obj.base_margins(&[1.0, 1.0, 1.0, 0.0], None, None),
-            vec![1.0]
-        );
-        assert_eq!(obj.base_margins(&[0.0, 0.0, 1.0], None, None), vec![0.0]);
+        assert_eq!(base_margins(&obj, &[1.0, 1.0, 1.0, 0.0], None), vec![1.0]);
+        assert_eq!(base_margins(&obj, &[0.0, 0.0, 1.0], None), vec![0.0]);
         let mut stored = [0.5f32];
         obj.margins_to_probs(&mut stored);
         assert_eq!(stored, [0.5]);

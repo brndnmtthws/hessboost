@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         30,
     )?;
     let pc = mc.predict(&dc)?;
-    let rmse = Rmse.eval(&pc, &yc, None);
+    let rmse = Rmse::default().eval(&pc, &yc, None);
     println!("categorical fit RMSE on non-ordinal pattern: {rmse:.4}");
     Ok(())
 }

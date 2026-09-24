@@ -10,6 +10,7 @@ use crate::error::Result;
 /// `1`. The prediction transform is the identity and the optimal base margin is
 /// the (weighted) label mean.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct SquaredError;
 
 impl Objective for SquaredError {
@@ -122,6 +123,7 @@ impl Objective for PseudoHuber {
 /// the identity (predictions are not clamped) and the intercept is the
 /// trait's default Newton step (XGBoost `FitIntercept`).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct SquaredLogError;
 
 /// XGBoost's `fmaxf(predt, -1 + 1e-6)` bound: the `f64` constant rounded to
@@ -163,7 +165,7 @@ impl Objective for SquaredLogError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::gradient_pairs;
+    use crate::objective::{base_margins, gradient_pairs};
 
     #[test]
     fn gradient_matches_closed_form() {
@@ -189,7 +191,7 @@ mod tests {
     #[test]
     fn base_margins_is_label_mean() {
         let obj = SquaredError;
-        assert_eq!(obj.base_margins(&[1.0, 2.0, 3.0], None, None), vec![2.0]);
+        assert_eq!(base_margins(&obj, &[1.0, 2.0, 3.0], None), vec![2.0]);
     }
 
     /// Pseudo-Huber with slope δ: at `z = δ` the gradient is `δ/√2` and the
@@ -223,7 +225,7 @@ mod tests {
     fn pseudo_huber_intercept_is_newton_step() {
         let obj = PseudoHuber::default();
         let labels = [0.0f32, 4.0];
-        let margins = obj.base_margins(&labels, None, None);
+        let margins = base_margins(&obj, &labels, None);
         let s = 17f32; // 1 + 4²
         let g1 = -4.0f32 / s.sqrt();
         let h1 = 1.0f32 / (s * s.sqrt());

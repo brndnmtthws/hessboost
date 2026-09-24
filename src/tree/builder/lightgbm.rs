@@ -354,7 +354,8 @@ impl Candidate<'_> {
 /// `total` includes any missing mass, which stays on the right.
 /// `score(left, right, cats_left)` returns the candidate's gain and child
 /// weights (`None`: invalid), and `best` takes it when it beats the incumbent
-/// by more than `K_RT_EPS`.
+/// by more than `K_RT_EPS` and its gain is a finite `f32` (the tree stores it
+/// as one; numeric candidates are skipped the same way).
 fn sweep_prefixes(
     best: &mut BestSplit,
     cats: &[(u32, GradStats)],
@@ -370,6 +371,7 @@ fn sweep_prefixes(
         let right = total.sub(left);
         if let Some(s) = score(left, right, &cats_left)
             && s.loss_chg > best.loss_chg + K_RT_EPS
+            && (s.loss_chg as f32).is_finite()
         {
             let children = Children::new(false, left, right);
             *best = BestSplit::categorical(feature, children, s, cats_left.clone());

@@ -9,8 +9,8 @@
 //! Run with: `cargo run --release --example distributional`
 
 use hessboost::prelude::*;
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 mod common;
 use common::lcg;
@@ -28,7 +28,7 @@ fn dataset(n: usize, seed: u64) -> Result<DMatrix> {
     let mut y = Vec::with_capacity(n);
     for _ in 0..n {
         let (x0, x1) = (next(), next());
-        let eps = noise.sample(&mut rng) as f32;
+        let eps = noise.sample(|| rng.next_u64()) as f32;
         x.extend_from_slice(&[x0, x1]);
         y.push(2.0 * (std::f32::consts::TAU * x0).sin() + (0.1 + x1) * eps);
     }

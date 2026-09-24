@@ -14,10 +14,10 @@ use crate::data::ghist::GHistIndex;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::objective::{GradPair, Objective, SplitGradient};
+use crate::rng::Rng;
 use crate::tree::RegTree;
 use crate::tree::builder::{LeafRows, MultiTreeBuilder, VectorGradients};
 use crate::tree::constraints::MonotoneConstraints;
-use rand::rngs::StdRng;
 
 /// Whether training grows vector-leaf trees: `multi_output_tree` with more
 /// than one output. A single output always gets scalar trees, as in XGBoost.
@@ -159,7 +159,7 @@ fn fit_tree(
     ctx: &VectorRound,
     gpair: &[GradPair],
     split: Option<&SplitGradient>,
-    rng: &mut StdRng,
+    rng: &mut Rng,
     rows: &[u32],
     n_out: usize,
 ) -> (RegTree, Vec<LeafRows>) {

@@ -78,9 +78,7 @@
 //! # }
 //! ```
 
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
+use crate::rng::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -252,10 +250,10 @@ impl OrderedTargetEncoder {
         let codes = collect_codes(data, &slots, columns.len());
 
         let mut encodings = vec![vec![0f64; n_rows]; codes.len()];
-        let mut rng = StdRng::seed_from_u64(self.seed);
+        let mut rng = Rng::new(self.seed);
         let mut order: Vec<usize> = (0..n_rows).collect();
         for _ in 0..self.permutations {
-            order.shuffle(&mut rng);
+            rng.shuffle(&mut order);
             encodings
                 .par_iter_mut()
                 .zip(codes.par_iter())

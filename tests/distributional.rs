@@ -8,7 +8,7 @@ use hessboost::prelude::{
     train_with_eval,
 };
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 
 mod common;
 use common::labeled_dense;
@@ -29,7 +29,7 @@ fn heteroscedastic(n: usize, seed: u64) -> (DMatrix, Vec<f64>) {
         let f: [f32; 3] = [rng.random(), rng.random(), rng.random()];
         let s = 0.1 + f64::from(f[1]);
         let mean = 2.0 * (std::f64::consts::TAU * f64::from(f[0])).sin();
-        y.push((mean + s * normal.sample(&mut rng)) as f32);
+        y.push((mean + s * normal.sample(|| rng.next_u64())) as f32);
         sigma.push(s);
         x.extend(f);
     }
@@ -43,7 +43,7 @@ fn sampled(n: usize, seed: u64, dist_of: impl Fn(f64, f64) -> Dist) -> DMatrix {
     let mut y = Vec::with_capacity(n);
     for _ in 0..n {
         let f: [f32; 2] = [rng.random(), rng.random()];
-        y.push(dist_of(f64::from(f[0]), f64::from(f[1])).sample(&mut rng) as f32);
+        y.push(dist_of(f64::from(f[0]), f64::from(f[1])).sample(|| rng.next_u64()) as f32);
         x.extend(f);
     }
     labeled_dense(&x, 2, &y)
@@ -323,7 +323,7 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
                 mu: 0.0,
                 sigma: scale,
             }
-            .sample(&mut rng);
+            .sample(|| rng.next_u64());
             y.push((3.0 * f64::from(f) + e) as f32);
             x.push(f);
         }

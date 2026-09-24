@@ -83,9 +83,11 @@ the examples. `benches/training.rs` is the Criterion suite;
 - **Determinism:** identical params, data, and seed give identical
   predictions (property-tested), and the hist builder (every grow policy)
   grows the same tree serially and in parallel. Parallel reductions keep a fixed order.
-  Quantized training (`use_quantized_grad`) draws its stochastic rounding
-  from a counter-based stream keyed by row index and sums integers exactly,
-  so it keeps the same guarantee.
+  Sequential sampling (rows, columns, DART, folds, target-stat permutations)
+  draws from `rng::Rng` (xoshiro256++, the same stream on every platform);
+  `rand` is a dev-dependency only. Quantized training (`use_quantized_grad`)
+  draws its stochastic rounding from a counter-based stream keyed by row
+  index and sums integers exactly, so it keeps the same guarantee.
 - **Unsafe:** confined to `simd/` and the hot loops in `tree/compact.rs`,
   `tree/hist/`, and `tree/builder/hist.rs`. Every block needs a `// SAFETY:`
   comment (`undocumented_unsafe_blocks`); `unsafe_op_in_unsafe_fn` is

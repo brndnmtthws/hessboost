@@ -1,7 +1,6 @@
 use super::*;
 use crate::objective::gradient_pairs;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
+use crate::rng::Rng;
 
 /// Margins and labels exercising every family away from the link bounds.
 fn cases(family: DistFamily) -> Vec<(Vec<f64>, f64)> {
@@ -114,11 +113,11 @@ fn fisher_information_matches_monte_carlo() {
             let dist = family.dist_from_margins(&eta);
             let fisher = family.fisher(&eta);
             let k = family.n_params();
-            let mut rng = StdRng::seed_from_u64(7);
+            let mut rng = Rng::new(7);
             let mut outer = [[Moments::default(); 2]; 2];
             let mut hess = [Moments::default(); 2];
             for _ in 0..n {
-                let y = dist.sample(&mut rng);
+                let y = dist.sample(|| rng.next_u64());
                 let g = family.gradient(&eta, y);
                 let h = family.hessian(&eta, y);
                 for i in 0..k {
@@ -154,10 +153,12 @@ fn fisher_information_matches_monte_carlo() {
 /// negative log-likelihood.
 #[test]
 fn intercepts_are_the_marginal_mle() {
-    let mut rng = StdRng::seed_from_u64(3);
+    let mut rng = Rng::new(3);
     for family in DistFamily::ALL {
         let truth = family.dist_from_margins(&cases(family)[0].0);
-        let labels: Vec<f32> = (0..4000).map(|_| truth.sample(&mut rng) as f32).collect();
+        let labels: Vec<f32> = (0..4000)
+            .map(|_| truth.sample(|| rng.next_u64()) as f32)
+            .collect();
         let weights: Vec<f32> = (0..labels.len()).map(|i| 0.5 + (i % 3) as f32).collect();
         for w in [None, Some(weights.as_slice())] {
             let eta = family.mle_margins(&labels, w);
@@ -470,9 +471,9 @@ fn one_per_family() -> [Dist; 5] {
 fn sampling_is_seeded_and_matches_the_moments() {
     for dist in one_per_family() {
         let draw = |seed| {
-            let mut rng = StdRng::seed_from_u64(seed);
+            let mut rng = Rng::new(seed);
             (0..50_000)
-                .map(|_| dist.sample(&mut rng))
+                .map(|_| dist.sample(|| rng.next_u64()))
                 .collect::<Vec<f64>>()
         };
         let a = draw(11);
@@ -797,33 +798,13 @@ fn negative_binomial_near_the_poisson_limit() {
     }
 }
 
-/// An RNG whose every draw is one fixed word.
-struct ConstRng(u64);
-
-impl rand::TryRng for ConstRng {
-    type Error = std::convert::Infallible;
-
-    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
-        Ok(self.0 as u32)
-    }
-
-    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
-        Ok(self.0)
-    }
-
-    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
-        dst.fill(self.0 as u8);
-        Ok(())
-    }
-}
-
-/// The extreme RNG words map strictly inside `(0, 1)`: `u64::MAX` must not
-/// round to `u = 1` and give an infinite sample.
+/// The extreme random words map strictly inside `(0, 1)`: `u64::MAX` must
+/// not round to `u = 1` and give an infinite sample.
 #[test]
 fn sampling_stays_finite_at_the_extreme_rng_words() {
     for dist in one_per_family() {
         for word in [0, u64::MAX] {
-            let s = dist.sample(&mut ConstRng(word));
+            let s = dist.sample(|| word);
             assert!(s.is_finite(), "{dist:?} word={word:#x}: {s}");
         }
     }

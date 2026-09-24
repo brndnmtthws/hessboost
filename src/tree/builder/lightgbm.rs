@@ -38,12 +38,10 @@ use super::{
 use crate::K_RT_EPS;
 use crate::config::TrainingParams;
 use crate::data::quantile::HistCuts;
-use crate::rng::splitmix64;
+use crate::rng::{Rng, splitmix64};
 use crate::tree::constraints::{Bounds, MonotoneConstraints, gain_at_weight, satisfies};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 
 /// The node a split search runs for.
 #[derive(Debug, Clone, Copy)]
@@ -108,7 +106,7 @@ impl SplitOptions {
         };
         let mut rng = self
             .extra_seed
-            .map(|seed| StdRng::seed_from_u64(node_seed(seed, node.tree_seed, node.id)));
+            .map(|seed| Rng::new(node_seed(seed, node.tree_seed, node.id)));
         let constrained = cons.is_active();
         let mut best = BestSplit::none();
         for &f in features {
@@ -289,7 +287,7 @@ impl Candidate<'_> {
         bins: &[GradStats],
         first: usize,
         dense: bool,
-        rng: &mut StdRng,
+        rng: &mut Rng,
     ) {
         let occupied = |i: &usize| bins[*i].hess > 0.0;
         let (Some(lo), Some(hi)) = (
@@ -302,7 +300,7 @@ impl Candidate<'_> {
             return; // a single occupied bin cannot be split
         }
         // Bins `<= cut` go left, so both sides hold an occupied bin.
-        let cut = rng.random_range(lo..hi);
+        let cut = rng.range(lo..hi);
         let mut left = GradStats::default();
         for &bin in &bins[..=cut] {
             left.add(bin);
@@ -327,7 +325,7 @@ impl Candidate<'_> {
         best: &mut BestSplit,
         cats: &mut [(u32, GradStats)],
         constrained: bool,
-        rng: Option<&mut StdRng>,
+        rng: Option<&mut Rng>,
     ) {
         if cats.len() < 2 {
             return; // no interior partition
@@ -335,7 +333,7 @@ impl Candidate<'_> {
         let reg = self.reg;
         let ratio = |s: GradStats| s.grad / (s.hess + reg.lambda);
         cats.sort_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)));
-        let chosen = rng.map(|rng| rng.random_range(1..cats.len()));
+        let chosen = rng.map(|rng| rng.range(1..cats.len()));
         sweep_prefixes(
             best,
             cats,

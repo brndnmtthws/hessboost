@@ -4,9 +4,7 @@ use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::learner::train::train_with_eval;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
+use crate::rng::Rng;
 use std::collections::BTreeMap;
 
 /// Per-metric cross-validation history, aggregated across folds.
@@ -44,7 +42,7 @@ pub fn cv(
 
     // Shuffle then round-robin assign rows to folds.
     let mut order: Vec<usize> = (0..n).collect();
-    order.shuffle(&mut StdRng::seed_from_u64(seed));
+    Rng::new(seed).shuffle(&mut order);
     let mut folds: Vec<Vec<usize>> = vec![Vec::new(); nfold];
     for (i, &row) in order.iter().enumerate() {
         folds[i % nfold].push(row);

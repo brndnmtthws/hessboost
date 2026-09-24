@@ -121,7 +121,6 @@
 
 mod special;
 
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::{GradPair, MIN_HESS, Objective, SplitGradient, check_label_domain};
@@ -799,11 +798,13 @@ impl Dist {
     }
 
     /// Draw one value by inverse-CDF sampling, `quantile(u)` with `u`
-    /// uniform on `(0, 1)` from 52 random bits of `rng` (the midpoints
-    /// `(j + 1/2)/2^52`, all exactly representable, so `u` never rounds to
-    /// `1`), so a seeded RNG gives a reproducible stream.
-    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
-        let u = ((rng.next_u64() >> 12) as f64 + 0.5) * (1.0 / (1u64 << 52) as f64);
+    /// uniform on `(0, 1)` from 52 of the random bits `next_u64` returns
+    /// (the midpoints `(j + 1/2)/2^52`, all exactly representable, so `u`
+    /// never rounds to `1`), so a seeded generator gives a reproducible
+    /// stream. Any source of uniform `u64` words works, e.g.
+    /// `dist.sample(|| rng.next_u64())` with a `rand` generator.
+    pub fn sample(&self, mut next_u64: impl FnMut() -> u64) -> f64 {
+        let u = ((next_u64() >> 12) as f64 + 0.5) * (1.0 / (1u64 << 52) as f64);
         self.quantile(u)
     }
 

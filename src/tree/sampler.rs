@@ -32,9 +32,7 @@
 //! [`DMatrix::with_feature_weights`]: crate::data::DMatrix::with_feature_weights
 
 use crate::K_RT_EPS_F32;
-use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::{RngExt, SeedableRng};
+use crate::rng::Rng;
 
 /// Draws feature subsets for one tree according to the `bytree`, `bylevel`,
 /// and `bynode` ratios, optionally weighted by per-feature weights.
@@ -48,7 +46,7 @@ pub struct ColumnSampler {
     weights: Option<Vec<f32>>,
     bylevel: f32,
     bynode: f32,
-    rng: StdRng,
+    rng: Rng,
     /// The seed `rng` started from: the tree's own seed, which the trainer
     /// derives from the configured seed, round, and output.
     seed: u64,
@@ -74,7 +72,7 @@ impl ColumnSampler {
             assert_eq!(w.len(), n_features, "one feature weight per feature");
         }
         let weights = weights.map(<[f32]>::to_vec);
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = Rng::new(seed);
         let all: Vec<u32> = (0..n_features as u32).collect();
         let tree = draw(&mut rng, weights.as_deref(), &all, bytree as f32);
         ColumnSampler {
@@ -120,7 +118,7 @@ impl ColumnSampler {
 
 /// One sampling stage over `pool`: `max(1, trunc(ratio * len))` features
 /// without replacement (weighted when `weights` is set), sorted ascending.
-fn draw(rng: &mut StdRng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> Vec<u32> {
+fn draw(rng: &mut Rng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> Vec<u32> {
     if ratio >= 1.0 || pool.is_empty() {
         return pool.to_vec();
     }
@@ -128,7 +126,7 @@ fn draw(rng: &mut StdRng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> 
     let mut chosen = match weights {
         None => {
             let mut features = pool.to_vec();
-            features.shuffle(rng);
+            rng.shuffle(&mut features);
             features.truncate(n);
             features
         }
@@ -138,7 +136,7 @@ fn draw(rng: &mut StdRng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> 
                 .iter()
                 .map(|&f| {
                     let w = weights[f as usize].max(K_RT_EPS_F32);
-                    (rng.random::<f32>().ln() / w, f)
+                    (rng.f32().ln() / w, f)
                 })
                 .collect();
             // Stable descending sort by key, as XGBoost's `ArgSort`.

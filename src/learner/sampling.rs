@@ -21,9 +21,7 @@
 
 use crate::K_RT_EPS_F32;
 use crate::objective::GradPair;
-use crate::rng::GOLDEN;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use crate::rng::{GOLDEN, Rng};
 use rayon::prelude::*;
 
 /// XGBoost `kDefaultMvsLambda`: the Hessian weight inside `r_i`. A fixed
@@ -69,7 +67,7 @@ pub(crate) fn gradient_based_sample(
     gpair: &[GradPair],
     n_targets: usize,
     subsample: f64,
-    rng: &mut StdRng,
+    rng: &mut Rng,
 ) -> Option<GradientSample> {
     debug_assert!(n_targets >= 1 && gpair.len().is_multiple_of(n_targets));
     let n = gpair.len() / n_targets;
@@ -77,7 +75,7 @@ pub(crate) fn gradient_based_sample(
     if n == 0 || budget >= n {
         return None;
     }
-    let seed = rng.random::<u64>();
+    let seed = rng.next_u64();
     if budget == 0 {
         // An empty budget keeps nothing (upstream zeroes every pair).
         return Some(GradientSample {
@@ -99,7 +97,7 @@ pub(crate) fn gradient_based_sample(
         .zip(reg_abs_grad.par_chunks(BLOCK_ROWS))
         .enumerate()
         .map(|(block, (pairs, rag))| {
-            let mut stream = StdRng::seed_from_u64(block_seed(seed, block));
+            let mut stream = Rng::new(block_seed(seed, block));
             let first = block * BLOCK_ROWS;
             let mut rows = Vec::new();
             let mut kept_p = Vec::new();
@@ -107,7 +105,7 @@ pub(crate) fn gradient_based_sample(
             for (i, &r) in rag.iter().enumerate() {
                 let p = probability(threshold, r);
                 // Exactly one draw per row, kept or not.
-                let draw = stream.random::<f32>();
+                let draw = stream.f32();
                 if p >= 1.0 || (p > 0.0 && draw <= p) {
                     let src = &pairs[i * n_targets..(i + 1) * n_targets];
                     let dst = &mut out[i * n_targets..(i + 1) * n_targets];
@@ -216,13 +214,13 @@ mod tests {
     use super::*;
 
     fn gradients(n: usize, n_targets: usize, seed: u64) -> Vec<GradPair> {
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = Rng::new(seed);
         (0..n * n_targets)
             .map(|i| {
                 // Heavy-tailed magnitudes so inclusion probabilities vary widely.
-                let u: f32 = rng.random::<f32>();
+                let u: f32 = rng.f32();
                 let g = (u * u * u * 8.0 - 1.0) * if i % 3 == 0 { -1.0 } else { 1.0 };
-                GradPair::new(g, 0.5 + rng.random::<f32>())
+                GradPair::new(g, 0.5 + rng.f32())
             })
             .collect()
     }
@@ -251,7 +249,7 @@ mod tests {
     #[test]
     fn full_budget_does_not_sample() {
         let g = gradients(100, 1, 1);
-        let mut rng = StdRng::seed_from_u64(0);
+        let mut rng = Rng::new(0);
         assert!(gradient_based_sample(&g, 1, 1.0, &mut rng).is_none());
         // 3 rows * 0.999 = 2.997 -> 2 rows: sampling happens.
         assert!(gradient_based_sample(&g[..3], 1, 0.999, &mut rng).is_some());
@@ -260,7 +258,7 @@ mod tests {
     #[test]
     fn empty_budget_keeps_nothing() {
         let g = gradients(3, 1, 1);
-        let mut rng = StdRng::seed_from_u64(0);
+        let mut rng = Rng::new(0);
         let s = gradient_based_sample(&g, 1, 0.3, &mut rng).unwrap();
         assert!(s.rows.is_empty());
         assert!(s.gpair.iter().all(|p| *p == GradPair::default()));
@@ -281,7 +279,7 @@ mod tests {
         let trials = 4000usize;
         let mut hits = vec![0usize; n];
         let (mut kept, mut grad_sum, mut hess_sum) = (0usize, 0.0f64, 0.0f64);
-        let mut rng = StdRng::seed_from_u64(5);
+        let mut rng = Rng::new(5);
         for _ in 0..trials {
             let s = gradient_based_sample(&g, 1, 0.3, &mut rng).unwrap();
             kept += s.rows.len();
@@ -329,7 +327,7 @@ mod tests {
         let mut g = gradients(2000, 1, 2);
         g[7] = GradPair::new(1e4, 1.0);
         g[1500] = GradPair::new(-3e4, 2.0);
-        let mut rng = StdRng::seed_from_u64(9);
+        let mut rng = Rng::new(9);
         for _ in 0..20 {
             let s = gradient_based_sample(&g, 1, 0.2, &mut rng).unwrap();
             for row in [7usize, 1500] {
@@ -344,7 +342,7 @@ mod tests {
     #[test]
     fn multi_target_rows_share_one_decision() {
         let g = gradients(3000, 3, 4);
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut rng = Rng::new(1);
         let s = gradient_based_sample(&g, 3, 0.4, &mut rng).unwrap();
         let r = rag(&g, 3);
         let u = threshold(&r, (3000f32 * 0.4f32) as usize);
@@ -376,14 +374,14 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                let mut rng = StdRng::seed_from_u64(42);
+                let mut rng = Rng::new(42);
                 let s = gradient_based_sample(&g, 1, 0.35, &mut rng).unwrap();
                 (s.rows, s.gpair)
             })
         };
         let serial = run(1);
         assert_eq!(serial, run(4));
-        let mut other = StdRng::seed_from_u64(43);
+        let mut other = Rng::new(43);
         let different = gradient_based_sample(&g, 1, 0.35, &mut other).unwrap();
         assert_ne!(serial.0, different.rows, "the seed drives the sample");
     }

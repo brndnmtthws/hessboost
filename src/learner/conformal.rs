@@ -573,22 +573,21 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::learner::{train, train_with_objective};
     use crate::objective::{CustomObjective, GradPair};
+    use crate::rng::Rng;
     use crate::test_support::labeled_dense;
-    use rand::rngs::StdRng;
-    use rand::{RngExt, SeedableRng};
 
     const N_FEATURES: usize = 2;
 
     /// Heteroscedastic regression: `y = sin(2π x0) + (0.1 + x1) · ε`,
     /// `x ~ U(0, 1)²`, `ε ~ N(0, 1)`.
-    fn hetero(n: usize, rng: &mut StdRng) -> DMatrix {
+    fn hetero(n: usize, rng: &mut Rng) -> DMatrix {
         let mut x = Vec::with_capacity(n * N_FEATURES);
         let mut y = Vec::with_capacity(n);
         for _ in 0..n {
-            let (x0, x1) = (rng.random::<f32>(), rng.random::<f32>());
+            let (x0, x1) = (rng.f32(), rng.f32());
             // Box–Muller.
-            let u1 = 1.0 - rng.random::<f64>();
-            let u2 = rng.random::<f64>();
+            let u1 = 1.0 - rng.f64();
+            let u2 = rng.f64();
             let eps = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
             x.extend_from_slice(&[x0, x1]);
             y.push((std::f32::consts::TAU * x0).sin() + (0.1 + x1) * eps as f32);
@@ -654,7 +653,7 @@ mod tests {
         seed: u64,
         mut intervals: impl FnMut(&DMatrix, &DMatrix) -> Vec<(f32, f32)>,
     ) -> f64 {
-        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rng = Rng::new(seed);
         let total: f64 = (0..TRIALS)
             .map(|_| {
                 let cal = hetero(N_CAL, &mut rng);
@@ -676,7 +675,7 @@ mod tests {
 
     #[test]
     fn split_conformal_attains_marginal_coverage() {
-        let train_set = hetero(2000, &mut StdRng::seed_from_u64(1));
+        let train_set = hetero(2000, &mut Rng::new(1));
         let model = point_model(&train_set);
         let mean = mean_coverage(2, |cal, test| {
             SplitConformal::calibrate(&model, cal, ALPHA)
@@ -691,11 +690,11 @@ mod tests {
     fn cqr_widens_a_too_narrow_band_to_nominal_coverage() {
         // Point fits on y ∓ 0.05: a band of width ≈ 0.1 against noise with
         // standard deviation 0.1–1.1.
-        let train_set = hetero(2000, &mut StdRng::seed_from_u64(3));
+        let train_set = hetero(2000, &mut Rng::new(3));
         let lower = point_model(&with_shifted_labels(&train_set, -0.05));
         let upper = point_model(&with_shifted_labels(&train_set, 0.05));
 
-        let mut rng = StdRng::seed_from_u64(4);
+        let mut rng = Rng::new(4);
         let (cal, test) = (hetero(N_CAL, &mut rng), hetero(1000, &mut rng));
         let raw = ConformalizedQuantile::calibrate(&lower, &upper, &cal, ALPHA)
             .unwrap()
@@ -714,7 +713,7 @@ mod tests {
 
     #[test]
     fn cqr_tightens_a_too_wide_band_without_over_covering() {
-        let train_set = hetero(2000, &mut StdRng::seed_from_u64(6));
+        let train_set = hetero(2000, &mut Rng::new(6));
         let lower = point_model(&with_shifted_labels(&train_set, -5.0));
         let upper = point_model(&with_shifted_labels(&train_set, 5.0));
         let mean = mean_coverage(7, |cal, test| {
@@ -727,7 +726,7 @@ mod tests {
 
     #[test]
     fn cqr_on_multi_output_quantile_model_is_adaptive() {
-        let train_set = hetero(2000, &mut StdRng::seed_from_u64(8));
+        let train_set = hetero(2000, &mut Rng::new(8));
         let model = quantile_model(&train_set, [0.05, 0.95]);
         let mean = mean_coverage(9, |cal, test| {
             ConformalizedQuantile::calibrate_outputs(&model, 0, 1, cal, ALPHA)
@@ -739,7 +738,7 @@ mod tests {
 
         // The band follows the noise scale (0.1 + x1): rows with x1 = 0.9 get
         // much wider intervals than rows with x1 = 0.1, unlike split conformal.
-        let cal = hetero(500, &mut StdRng::seed_from_u64(10));
+        let cal = hetero(500, &mut Rng::new(10));
         let cqr = ConformalizedQuantile::calibrate_outputs(&model, 0, 1, &cal, ALPHA).unwrap();
         let probe = DMatrix::from_dense(&[0.25, 0.1, 0.25, 0.9], 2, N_FEATURES).unwrap();
         let widths: Vec<f32> = cqr
@@ -770,10 +769,10 @@ mod tests {
 
     #[test]
     fn too_small_calibration_set_gives_infinite_intervals() {
-        let train_set = hetero(300, &mut StdRng::seed_from_u64(11));
+        let train_set = hetero(300, &mut Rng::new(11));
         let model = point_model(&train_set);
-        let cal = hetero(9, &mut StdRng::seed_from_u64(12));
-        let test = hetero(5, &mut StdRng::seed_from_u64(13));
+        let cal = hetero(9, &mut Rng::new(12));
+        let test = hetero(5, &mut Rng::new(13));
 
         let finite = SplitConformal::calibrate(&model, &cal, 0.1).unwrap();
         assert!(finite.half_width().is_finite());
@@ -802,9 +801,9 @@ mod tests {
     fn calibration_rows_within_the_quantile_are_covered_exactly() {
         // Outward rounding: every calibration row whose score is <= Q lies in
         // its own f32 interval, including the row that attains Q.
-        let train_set = hetero(300, &mut StdRng::seed_from_u64(14));
+        let train_set = hetero(300, &mut Rng::new(14));
         let model = point_model(&train_set);
-        let cal = hetero(N_CAL, &mut StdRng::seed_from_u64(15));
+        let cal = hetero(N_CAL, &mut Rng::new(15));
         let sc = SplitConformal::calibrate(&model, &cal, ALPHA).unwrap();
         let intervals = sc.predict_interval(&cal).unwrap();
         let k = N_CAL + 1 - ((N_CAL + 1) as f64 * ALPHA).floor() as usize;
@@ -863,15 +862,15 @@ mod tests {
         // `1 - alpha / 2` rounds to 1 for alpha = 1e-20, where the normal
         // quantile is +∞; with 9 rows k = 10 > n, so the documented result is
         // an unbounded interval, not a non-finite-prediction error.
-        let train_set = hetero(300, &mut StdRng::seed_from_u64(17));
+        let train_set = hetero(300, &mut Rng::new(17));
         let params = TrainingParams::builder()
             .objective("dist:normal")
             .max_depth(2)
             .build()
             .unwrap();
         let model = train(&params, &train_set, 3).unwrap();
-        let cal = hetero(9, &mut StdRng::seed_from_u64(18));
-        let test = hetero(4, &mut StdRng::seed_from_u64(19));
+        let cal = hetero(9, &mut Rng::new(18));
+        let test = hetero(4, &mut Rng::new(19));
 
         let cqr = ConformalizedQuantile::calibrate_distribution(&model, &cal, 1e-20).unwrap();
         assert_eq!(cqr.correction(), f64::INFINITY);
@@ -898,7 +897,7 @@ mod tests {
 
     #[test]
     fn invalid_inputs_are_rejected() {
-        let mut rng = StdRng::seed_from_u64(16);
+        let mut rng = Rng::new(16);
         let train_set = hetero(200, &mut rng);
         let model = point_model(&train_set);
         let cal = hetero(50, &mut rng);

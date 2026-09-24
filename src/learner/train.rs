@@ -15,14 +15,13 @@ use crate::learner::refresh::refresh_tree;
 use crate::learner::sampling::{GradientSample, gradient_based_sample};
 use crate::metric::create_metrics;
 use crate::objective::{GradPair, create_objective};
+use crate::rng::Rng;
 use crate::tree::RegTree;
 use crate::tree::builder::{
     ExactTreeBuilder, HistTreeBuilder, LeafRows, SortedColumns, all_rows, check_symmetric_input,
 };
 use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
@@ -138,7 +137,7 @@ impl Prepared {
         // gradient sampling.
         let mut rng = if params.booster == BoosterKind::Dart {
             let mut rng = round_rng(params, 0, DART_SALT);
-            let _skip: f64 = rng.random();
+            let _skip = rng.f64();
             rng
         } else {
             round_rng(params, 0, 0)
@@ -990,7 +989,7 @@ pub(super) fn round_gradients(
     iteration: usize,
     margin: &[f32],
     gpair: &mut [GradPair],
-) -> (StdRng, Option<Vec<usize>>) {
+) -> (Rng, Option<Vec<usize>>) {
     if params.booster != BoosterKind::Dart {
         objective.gradient_info(margin, info, gpair);
         return (round_rng(params, iteration, 0), None);
@@ -1012,22 +1011,22 @@ const DART_SALT: u64 = 0x0DA27;
 fn select_dropout(
     model: &BoostedModel,
     params: &TrainingParams,
-    rng: &mut StdRng,
+    rng: &mut Rng,
 ) -> (Vec<bool>, Vec<usize>) {
     let existing = model.num_trees();
     let mut dropped = vec![false; existing];
     let mut drop_indices: Vec<usize> = Vec::new();
-    let skip = rng.random::<f64>() < params.skip_drop;
+    let skip = rng.f64() < params.skip_drop;
     if !skip && existing > 0 {
         for (i, d) in dropped.iter_mut().enumerate() {
-            if rng.random::<f64>() < params.rate_drop {
+            if rng.f64() < params.rate_drop {
                 *d = true;
                 drop_indices.push(i);
             }
         }
         if drop_indices.is_empty() {
             // Guarantee at least one dropped tree, as XGBoost does.
-            let i = rng.random_range(0..existing);
+            let i = rng.range(0..existing);
             dropped[i] = true;
             drop_indices.push(i);
         }
@@ -1088,8 +1087,8 @@ fn gather_output<'a>(
 /// The RNG for one boosting round: `seed ^ round * 0x9E37_79B9`, plus a
 /// booster-specific `salt` (`0` for gbtree, `0x0DA27` for DART) so the two
 /// boosters draw from different streams.
-fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
-    StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ salt)
+fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> Rng {
+    Rng::new(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ salt)
 }
 
 /// Fit parallel tree `p` for output `k` of a boosting iteration: gather that
@@ -1109,7 +1108,7 @@ fn fit_output_tree(
     dtrain: &DMatrix,
     gpair: &[GradPair],
     gpair_k: &mut [GradPair],
-    rng: &mut StdRng,
+    rng: &mut Rng,
     n_out: usize,
     k: usize,
     p: usize,
@@ -1161,9 +1160,9 @@ fn fit_output_tree(
 /// iteration (outputs and parallel trees alike) rounds independently and
 /// continued training resumes the same streams. Draws nothing unless
 /// `use_quantized_grad` is on, leaving the default RNG streams untouched.
-fn quantization_seed(params: &TrainingParams, rng: &mut StdRng) -> u64 {
+fn quantization_seed(params: &TrainingParams, rng: &mut Rng) -> u64 {
     if params.use_quantized_grad {
-        rng.random::<u64>()
+        rng.next_u64()
     } else {
         0
     }
@@ -1173,16 +1172,14 @@ fn quantization_seed(params: &TrainingParams, rng: &mut StdRng) -> u64 {
 /// matching XGBoost's default sampling method. Guarantees at least one row.
 /// Gradient-based sampling keeps every row here; it samples the gradients in
 /// [`fit_output_tree`] instead.
-pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut StdRng) -> Vec<u32> {
+pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut Rng) -> Vec<u32> {
     let subsample = params.subsample;
     if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
-    let mut rows: Vec<u32> = (0..n as u32)
-        .filter(|_| rng.random::<f64>() < subsample)
-        .collect();
+    let mut rows: Vec<u32> = (0..n as u32).filter(|_| rng.f64() < subsample).collect();
     if rows.is_empty() {
-        rows.push(rng.random_range(0..n as u32));
+        rows.push(rng.range(0..n) as u32);
     }
     rows
 }
@@ -1195,7 +1192,7 @@ fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
     prepared: &Prepared,
-    rng: &mut StdRng,
+    rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
     let draws = if prepared.samples_per_forest() {
         1
@@ -1323,7 +1320,7 @@ fn check_prediction_width(
 pub(super) fn make_column_sampler(
     dtrain: &DMatrix,
     params: &TrainingParams,
-    rng: &mut StdRng,
+    rng: &mut Rng,
 ) -> ColumnSampler {
     ColumnSampler::new(
         dtrain.n_cols(),
@@ -1331,7 +1328,7 @@ pub(super) fn make_column_sampler(
         params.colsample_bytree,
         params.colsample_bylevel,
         params.colsample_bynode,
-        rng.random::<u64>(),
+        rng.next_u64(),
     )
 }
 

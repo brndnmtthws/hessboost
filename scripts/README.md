@@ -124,7 +124,7 @@ Optional fixture fields extend the schema for metadata beyond plain labels:
 
 ```sh
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
-cargo test --test parity --release -- --ignored --nocapture
+cargo nextest run --test parity --release --run-ignored only --no-capture
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 

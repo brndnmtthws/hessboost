@@ -1,0 +1,70 @@
+[package]
+name = "hessboost-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The native-model target seals fuzzed section bytes in a container with a
+# valid checksum, so mutations reach the section parser.
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[dependencies.hessboost]
+path = ".."
+
+# Keep this crate out of hessboost's build: it needs nightly and libFuzzer.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "native-model"
+path = "fuzz_targets/native-model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json-model"
+path = "fuzz_targets/json-model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xgboost-json-model"
+path = "fuzz_targets/xgboost-json-model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xgboost-ubjson-model"
+path = "fuzz_targets/xgboost-ubjson-model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compact-model"
+path = "fuzz_targets/compact-model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "loaders"
+path = "fuzz_targets/loaders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "train"
+path = "fuzz_targets/train.rs"
+test = false
+doc = false
+bench = false

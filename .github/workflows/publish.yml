@@ -31,7 +31,9 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: publish-test
-      - run: mbx test --all-features
+      - run: mbx nextest run --all-features
+      # nextest does not run doctests.
+      - run: mbx test --doc --all-features
 
   publish:
     runs-on: ubuntu-latest

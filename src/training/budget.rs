@@ -33,7 +33,9 @@
 //!   `±max_delta_step` for `count:poisson` (XGBoost's default `0.7`, as its
 //!   leaves are in regular training) and shrunk by `η`.
 //!   Missing values try both directions (each counted in every fold); a tree
-//!   holds at most 10 000 nodes.
+//!   holds at most 10 000 nodes. Splits whose gain, child Hessian sums, or
+//!   leaf values overflow `f32` are skipped; when the root's own do (from
+//!   extreme labels or sample weights), training fails.
 //! * **Stopping.** A tree with at most one split whose generalization score
 //!   is below `0.99` (and that did not stop on the loss target) counts as a
 //!   weak round; boosting stops after `stopping_rounds` weak rounds, right
@@ -261,7 +263,23 @@ pub fn train_with_budget(
     dtrain: &DMatrix,
     config: &BudgetConfig,
 ) -> Result<BudgetResult> {
-    with_thread_pool(params, || train_budget_inner(params, dtrain, config))
+    let result = with_thread_pool(params, || train_budget_inner(params, dtrain, config))?;
+    validate_trained_model(&result.model)?;
+    Ok(result)
+}
+
+/// What training returns must load again: the structural check the model
+/// formats apply, reported as a training error.
+// Mirrors the check at the end of `Trainer::train` (`training/train.rs`);
+// replace with a shared helper there once one exists.
+fn validate_trained_model(model: &BoostedModel) -> Result<()> {
+    model.validate_structure().map_err(|e| {
+        let reason = match e {
+            HessboostError::ModelFormat(reason) => reason,
+            other => other.to_string(),
+        };
+        HessboostError::model_format(format!("training produced an invalid model: {reason}"))
+    })
 }
 
 /// Refuse every [`TrainingParams`] field budget mode does not read (they are
@@ -348,6 +366,18 @@ fn train_budget_inner(
             ));
         }
     };
+    // Saved models require `num_class >= 2` to equal the output count (1).
+    // Mirrors the check in `training/train.rs::train_impl`.
+    if params.num_class >= 2 {
+        return Err(HessboostError::invalid_param(
+            "num_class",
+            format!(
+                "objective `{}` has {n_out} outputs, so num_class {} does not apply to it",
+                objective.name(),
+                params.num_class
+            ),
+        ));
+    }
     reject_tuned_params(params)?;
     let Some(labels) = dtrain.labels() else {
         return Err(HessboostError::EmptyDataset(
@@ -408,7 +438,7 @@ fn train_budget_inner(
                 row_decrement: &row_decrement,
                 max_delta_step: params.effective_max_delta_step(),
             },
-        );
+        )?;
         grown.apply(&mut margins);
 
         let n_nodes = grown.tree.num_nodes();

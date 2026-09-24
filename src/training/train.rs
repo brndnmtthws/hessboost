@@ -263,6 +263,7 @@ fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn H
                 // Unreachable in practice: `TrainingParams::validate` refuses
                 // `device = metal` without the feature, and training always
                 // validates first.
+                let _ = index;
                 Err(HessboostError::invalid_param(
                     "device",
                     "`metal` requires building with the `metal` feature on macOS",

@@ -238,7 +238,9 @@ pub(crate) struct CompactForest {
 
 /// The forest's raw buffers for GPU upload: the node arena as bytes (each
 /// [`CNode`](super::compact) is `repr(C)` of four `u32`s), the category pool,
-/// the vector-leaf weight pool, and each tree's root index.
+/// the vector-leaf weight pool, and each tree's root index. Only the Metal
+/// backend reads them.
+#[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) struct GpuForestParts<'a> {
     /// Node arena, 16 bytes per node.
     pub(crate) nodes: &'a [u8],
@@ -416,6 +418,7 @@ impl CompactForest {
     }
 
     /// The forest's GPU-upload parts (see [`GpuForestParts`]).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn gpu_parts(&self) -> GpuForestParts<'_> {
         // SAFETY: `CNode` is `repr(C)` with four `u32` fields and no padding
         // (asserted by the layout tests), so the arena is exactly

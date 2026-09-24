@@ -2,7 +2,7 @@
 //!
 //! Two paths have GPU implementations; everything else stays on the CPU:
 //!
-//! - **Prediction** ([`GpuModel`], from [`BoostedModel::to_gpu`]): every row
+//! - **Prediction** ([`GpuModel`](crate::backend::metal::GpuModel), from [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu)): every row
 //!   walks the branch-free compact forest arena on the GPU, one thread per
 //!   row, adding each tree's leaf value in tree order. This is the speed
 //!   win: on an M4 Max, 500k rows through 200 depth-8 trees predict about
@@ -21,7 +21,7 @@
 //!   CPU's native `f64` adds, and the determinism contract forbids the
 //!   floating-point atomics other GPU histogram implementations use. Set
 //!   `device = metal` to exercise the GPU path; for speed, keep training
-//!   on the CPU and use [`BoostedModel::to_gpu`] for prediction.
+//!   on the CPU and use [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) for prediction.
 //!
 //! # Determinism
 //!
@@ -56,7 +56,7 @@
 //! - Sparse (CSR, missing-value) training data is supported through an
 //!   interleaved column copy (up to 8 bytes per row per feature block);
 //!   datasets whose copy would exceed 4 GiB are refused.
-//! - [`GpuModel`] refuses `gblinear` and `linear_tree` models (they do not
+//! - [`GpuModel`](crate::backend::metal::GpuModel) refuses `gblinear` and `linear_tree` models (they do not
 //!   predict through the compact forest), and prediction needs a dense row
 //!   copy, so `rows × features × 4` bytes must stay under 4 GiB.
 //! - The gradient slice is re-uploaded once per tree (8 bytes per row) and

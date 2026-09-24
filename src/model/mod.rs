@@ -408,16 +408,19 @@ impl BoostedModel {
 
     /// Whether this is a `gblinear` model, whose predictions come from the
     /// linear weights instead of the tree ensemble.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn is_gblinear(&self) -> bool {
         self.linear.is_some()
     }
 
     /// Whether any tree carries per-leaf linear models (`linear_tree`).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn has_linear_leaves(&self) -> bool {
         self.trees.iter().any(|tree| tree.linear_leaves().is_some())
     }
 
     /// Whether tree `t` stores a weight vector per leaf (vector-leaf trees).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn tree_is_vector_leaf(&self, t: usize) -> bool {
         self.trees[t].is_vector_leaf()
     }
@@ -805,7 +808,7 @@ impl BoostedModel {
     /// always returns an error; see
     /// [`backend`](crate::backend) for the accelerated path.
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
-    pub fn to_gpu(&self) -> Result<crate::backend::GpuModel> {
+    pub fn to_gpu(&self) -> Result<crate::backend::metal::GpuModel> {
         Err(HessboostError::gpu(
             "GPU prediction requires the `metal` feature on macOS",
         ))

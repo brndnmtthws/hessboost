@@ -99,8 +99,11 @@ const STOPPING_ROUNDS: usize = 3;
 /// Base iteration cap (Perpetual `ITER_LIMIT`), before the budget scaling.
 const ITER_LIMIT: usize = 1000;
 
-/// Configuration of [`train_with_budget`].
+/// Configuration of [`train_with_budget`]. Construct with
+/// [`BudgetConfig::new`] (or [`Default`]) and the setters, or set fields
+/// directly.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct BudgetConfig {
     /// The fitting budget `b`, in `(0, 5)`. Larger budgets use a smaller
     /// learning rate and a smaller per-tree loss target, so they train more
@@ -217,6 +220,7 @@ impl BudgetConfig {
 
 /// Why budget-mode training stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BudgetStop {
     /// The last tree's root had no split that passed the generalization
     /// check.
@@ -234,6 +238,7 @@ pub enum BudgetStop {
 
 /// The result of [`train_with_budget`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct BudgetResult {
     /// The trained model (one tree per round, leaves already shrunk by
     /// [`BudgetResult::eta`]).

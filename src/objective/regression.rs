@@ -10,6 +10,7 @@ use crate::error::Result;
 /// `1`. The prediction transform is the identity and the optimal base margin is
 /// the (weighted) label mean.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct SquaredError;
 
 impl Objective for SquaredError {
@@ -122,6 +123,7 @@ impl Objective for PseudoHuber {
 /// the identity (predictions are not clamped) and the intercept is the
 /// trait's default Newton step (XGBoost `FitIntercept`).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct SquaredLogError;
 
 /// XGBoost's `fmaxf(predt, -1 + 1e-6)` bound: the `f64` constant rounded to

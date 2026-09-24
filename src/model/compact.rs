@@ -1080,6 +1080,7 @@ impl CompactModel {
 /// statistics the *Trees on a Diet* paper reports. From
 /// [`BoostedModel::size_report`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ModelSizeReport {
     /// [`BoostedModel::to_bytes`] length (all trees, with covers and gains).
     pub native_bytes: usize,

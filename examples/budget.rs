@@ -145,7 +145,7 @@ fn main() -> Result<()> {
         &regression(5000, 1)?,
         &regression(2000, 2)?,
         &regression(10_000, 3)?,
-        &Rmse,
+        &Rmse::default(),
     )?;
     report(
         "Friedman #1 binary classification, 5000 rows",
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
         &binary(5000, 4)?,
         &binary(2000, 5)?,
         &binary(10_000, 6)?,
-        &LogLoss,
+        &LogLoss::default(),
     )?;
     Ok(())
 }

@@ -8,6 +8,7 @@ pub type Result<T, E = HessboostError> = std::result::Result<T, E>;
 /// Errors that can occur while building datasets, configuring, training, or
 /// serializing models.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HessboostError {
     /// A dataset was constructed with inconsistent shapes (e.g. the label
     /// vector length does not match the number of rows).
@@ -48,7 +49,9 @@ pub enum HessboostError {
         name: String,
     },
 
-    /// A parsing error while loading data (libsvm/CSV).
+    /// A parsing error while loading data (libsvm/CSV). Non-exhaustive:
+    /// the position may gain a column; match with `Parse { line, .. }`.
+    #[non_exhaustive]
     Parse {
         /// 1-based line number where parsing failed.
         line: usize,

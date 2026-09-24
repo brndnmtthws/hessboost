@@ -71,8 +71,10 @@ pub fn read_libsvm<R: Read>(reader: R) -> Result<DMatrix> {
     DMatrix::from_csr(indptr, indices, values, n_cols)?.with_labels(&labels)
 }
 
-/// Options controlling CSV parsing.
+/// Options controlling CSV parsing. Start from [`CsvOptions::default`] and
+/// set the fields that differ.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CsvOptions {
     /// Whether the first line is a header row to skip.
     pub has_header: bool,

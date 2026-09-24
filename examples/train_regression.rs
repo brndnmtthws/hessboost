@@ -43,7 +43,7 @@ fn main() -> Result<()> {
     let model = train(&params, &dtrain, 200)?;
 
     let preds = model.predict(&dtrain)?;
-    let rmse = Rmse.eval(&preds, dtrain.labels().unwrap(), None);
+    let rmse = Rmse::default().eval(&preds, dtrain.labels().unwrap(), None);
     println!("trained {} trees", model.num_trees());
     println!("training RMSE: {rmse:.5}");
 

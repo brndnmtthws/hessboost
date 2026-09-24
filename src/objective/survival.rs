@@ -41,6 +41,7 @@ pub(crate) fn abs_label_order(labels: &[f32]) -> Vec<usize> {
 /// tied times share one risk-set denominator. The intercept is XGBoost's
 /// one-Newton-step fit from zero margins.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Cox;
 
 impl Objective for Cox {

@@ -40,7 +40,8 @@ use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use distributional::{DistFamily, DistObjective};
 
-/// A first- and second-order gradient for one instance/output.
+/// A first- and second-order gradient for one instance/output: a fixed
+/// pair, built with [`GradPair::new`] or a struct literal.
 ///
 /// Stored as `f32` to match XGBoost's memory layout and to keep histogram
 /// accumulation cache-friendly.
@@ -68,14 +69,23 @@ impl GradPair {
 pub type PointwiseLoss<'a> = Box<dyn Fn(f32, f32) -> f64 + Send + Sync + 'a>;
 
 /// Reduced gradients a custom objective supplies for the *split search* of
-/// vector-leaf trees (see [`Objective::split_gradient`]).
+/// vector-leaf trees (see [`Objective::split_gradient`]). Build with
+/// [`SplitGradient::new`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SplitGradient {
     /// Row-major `[row][target]` gradient pairs, `n_targets` per row.
     pub gpair: Vec<GradPair>,
     /// Split targets per row (at least `1`; usually far fewer than the
     /// model's outputs).
     pub n_targets: usize,
+}
+
+impl SplitGradient {
+    /// Row-major `[row][target]` gradient pairs with `n_targets` per row.
+    pub fn new(gpair: Vec<GradPair>, n_targets: usize) -> Self {
+        SplitGradient { gpair, n_targets }
+    }
 }
 
 /// Rows per parallel gradient chunk. A multiple of every vector kernel's block

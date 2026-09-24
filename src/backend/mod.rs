@@ -31,5 +31,6 @@ pub mod metal {
     /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) then
     /// always returns an error, so this is never constructed.
     #[derive(Debug)]
+    #[non_exhaustive]
     pub struct GpuModel;
 }

@@ -176,6 +176,7 @@ impl Objective for Logistic {
 /// threshold (XGBoost `FitIntercept`), so it is `0` or `1`. Labels are not
 /// validated (upstream expects `{0, 1}` but does not check).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Hinge;
 
 impl Objective for Hinge {

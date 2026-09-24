@@ -268,10 +268,7 @@ fn mean_sketch(g: &[GradPair]) -> SplitGradient {
             GradPair::new(g / K as f32, h / K as f32)
         })
         .collect();
-    SplitGradient {
-        gpair,
-        n_targets: 1,
-    }
+    SplitGradient::new(gpair, 1)
 }
 
 #[test]
@@ -364,12 +361,8 @@ fn unsupported_combinations_are_rejected() {
         "monotone_constraints"
     );
 
-    let wrong = squared_error(K).with_split_gradient(|_, g| {
-        Some(SplitGradient {
-            gpair: g[1..].to_vec(),
-            n_targets: 1,
-        })
-    });
+    let wrong =
+        squared_error(K).with_split_gradient(|_, g| Some(SplitGradient::new(g[1..].to_vec(), 1)));
     assert!(matches!(
         Trainer::new(&vector_params().build().unwrap(), &dtrain, 1)
             .objective(&wrong)

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Mirrors XGBoost's `booster` parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum BoosterKind {
     /// Gradient boosted trees (XGBoost `gbtree`).
     #[default]
@@ -32,6 +33,7 @@ pub enum BoosterKind {
 /// all but the smallest datasets, matching modern XGBoost behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum TreeMethod {
     /// Pick automatically based on dataset size.
     #[default]
@@ -49,6 +51,7 @@ pub enum TreeMethod {
 /// Mirrors XGBoost's `grow_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum GrowPolicy {
     /// Split nodes closest to the root first (level-wise). XGBoost default.
     #[default]
@@ -74,6 +77,7 @@ pub enum GrowPolicy {
 /// GPU choices `cuda`/`gpu`; the macOS GPU backend here is `metal`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Device {
     /// The CPU (default): always available, and what the parity fixtures
     /// run on.
@@ -101,7 +105,8 @@ pub const MAX_SYMMETRIC_DEPTH: usize = 16;
 /// count is bounded well below what its bookkeeping could address.
 pub(crate) const MAX_NUM_PARALLEL_TREE: usize = 1 << 16;
 
-/// Per-feature monotonicity direction.
+/// Per-feature monotonicity direction: XGBoost's `-1`/`0`/`1`, a complete
+/// set, so it can be matched exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Monotone {
@@ -119,6 +124,7 @@ pub enum Monotone {
 /// Mirrors XGBoost's `aft_loss_distribution`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum AftDistribution {
     /// Normal (Gaussian) noise. XGBoost default.
     #[default]
@@ -134,6 +140,7 @@ pub enum AftDistribution {
 /// Mirrors XGBoost's `sampling_method`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SamplingMethod {
     /// Every row is kept with probability `subsample`. XGBoost default.
     #[default]
@@ -152,6 +159,7 @@ pub enum SamplingMethod {
 /// Mirrors XGBoost's `multi_strategy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MultiStrategy {
     /// One tree per output each round. XGBoost default.
     #[default]
@@ -167,6 +175,7 @@ pub enum MultiStrategy {
 /// Mirrors XGBoost's `process_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ProcessType {
     /// Grow new trees. XGBoost default.
     #[default]
@@ -185,6 +194,7 @@ pub enum ProcessType {
 /// the trees (beyond XGBoost; see [`crate::objective::distributional`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum DistGradient {
     /// Gradient of the negative log-likelihood with the diagonal Fisher
     /// information as Hessian (Fisher scoring; a natural-gradient Newton
@@ -204,6 +214,7 @@ pub enum DistGradient {
 /// [`crate::objective::distributional`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum DistSplitDirection {
     /// Parallel gradient boosting (Chapelle et al., 2026, Algorithm 1): each
     /// round grows the structure from the gradients of one distribution
@@ -257,6 +268,7 @@ stored_names! {
     clippy::struct_excessive_bools,
     reason = "independent XGBoost/LightGBM switches, not a state machine"
 )]
+#[non_exhaustive]
 pub struct TrainingParams {
     // ---- General ----
     /// Which booster to train. XGBoost `booster`.
@@ -927,7 +939,11 @@ impl TrainingParams {
 /// retains. XGBoost saves them in the model's `objective` block, so they are
 /// needed to write an XGBoost-format model faithfully and to rebuild the
 /// objective when predicting. Tree-construction parameters are not retained.
+///
+/// Construct with [`ObjectiveParams::default`], [`ObjectiveParams::defaults_for`],
+/// or [`ObjectiveParams::from_params`], then set fields directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ObjectiveParams {
     /// XGBoost `scale_pos_weight` (`reg_loss_param`).
     pub scale_pos_weight: f64,

@@ -156,6 +156,7 @@ macro_rules! simple_metric {
     ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path $(=> $root:ident)?) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, Default)]
+        #[non_exhaustive]
         pub struct $ty;
         impl Metric for $ty {
             fn name(&self) -> &str {
@@ -280,6 +281,7 @@ fn macro_average_targets(metric: &dyn Metric, preds: &[f32], info: &MetaInfo) ->
 /// For a label matrix it is the mean of the per-target AUCs (XGBoost's
 /// multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Auc;
 
 impl Metric for Auc {
@@ -583,6 +585,7 @@ impl Metric for MeanAveragePrecision {
 /// problem (no positives or no negatives) yields `0`. For a label matrix it
 /// is the mean of the per-target areas (XGBoost's multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct AucPr;
 
 impl Metric for AucPr {

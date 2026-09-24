@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     );
     let model = Trainer::new(&params, &d, 60).objective(&obj).train()?.model;
     let preds = model.predict(&d)?;
-    let rmse = Rmse.eval(&preds, &y, None);
+    let rmse = Rmse::default().eval(&preds, &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
 
     // --- Custom metric: mean absolute error, used for early stopping. ---

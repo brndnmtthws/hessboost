@@ -96,6 +96,7 @@ impl Objective for Poisson {
 /// Gamma regression (`reg:gamma`), a log-link objective for positive targets.
 /// Gradient `1 − y·exp(−m)`, Hessian `y·exp(−m)`.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Gamma;
 
 impl Objective for Gamma {

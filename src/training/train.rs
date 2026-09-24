@@ -2722,15 +2722,6 @@ mod tests {
             }
         }
 
-        fn base_margins(
-            &self,
-            _: &[f32],
-            _: Option<&[f32]>,
-            _: Option<&crate::data::GroupInfo>,
-        ) -> Vec<f32> {
-            unreachable!("training must call base_margins_info");
-        }
-
         fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
             let sum: f32 = (0..info.n_rows).map(|row| Self::target(info, row)).sum();
             vec![sum / info.n_rows as f32]

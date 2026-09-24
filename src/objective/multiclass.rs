@@ -102,6 +102,7 @@ impl Objective for Softmax {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::base_margins;
     use approx::assert_relative_eq;
 
     #[test]
@@ -139,7 +140,7 @@ mod tests {
     fn base_margins_are_centered_log_frequencies() {
         let obj = Softmax::new(3, true);
         let labels = [0.0f32, 0.0, 1.0, 2.0];
-        let m = obj.base_margins(&labels, None, None);
+        let m = base_margins(&obj, &labels, None);
         assert_eq!(m.len(), 3);
         assert!(m.iter().sum::<f32>().abs() < 1e-6);
         let expected_gap = (0.5f32 + 1e-6).ln() - (0.25f32 + 1e-6).ln();
@@ -147,7 +148,7 @@ mod tests {
         assert_eq!(m[1], m[2]);
         // Weight 2 on the class-1 row makes every class equally frequent.
         let w = [1.0f32, 1.0, 2.0, 2.0];
-        let uniform = obj.base_margins(&labels, Some(&w), None);
+        let uniform = base_margins(&obj, &labels, Some(&w));
         assert!(uniform.iter().all(|v| v.abs() < 1e-6), "{uniform:?}");
     }
 }

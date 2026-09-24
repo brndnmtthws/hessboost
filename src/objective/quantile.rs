@@ -416,7 +416,7 @@ impl Objective for Expectile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::gradient_pairs;
+    use crate::objective::{base_margins, gradient_pairs};
     use crate::training::Trainer;
 
     #[test]
@@ -506,18 +506,15 @@ mod tests {
         let labels = [4.0f32, 1.0, 3.0, 2.0];
         // n = 4: α ≤ 0.2 → min; 0.25·5 = 1.25 → v0 + 0.25(v1−v0) = 1.25;
         // 0.5·5 = 2.5 → 2.5; α ≥ 0.8 → max.
-        assert_eq!(
-            obj.base_margins(&labels, None, None),
-            vec![1.0, 1.25, 2.5, 4.0]
-        );
+        assert_eq!(base_margins(&obj, &labels, None), vec![1.0, 1.25, 2.5, 4.0]);
         // Sorted weights 1,1,1,5 (labels 1,2,3,4): cdf 1,2,3,8.
         let w = [5.0f32, 1.0, 1.0, 1.0];
         // thresholds 0.8, 2, 4, 7.2 → first cdf ≥ threshold: 1, 2, 4, 4.
         assert_eq!(
-            obj.base_margins(&labels, Some(&w), None),
+            base_margins(&obj, &labels, Some(&w)),
             vec![1.0, 2.0, 4.0, 4.0]
         );
-        assert!(obj.base_margins(&[], None, None)[0].is_nan());
+        assert!(base_margins(&obj, &[], None)[0].is_nan());
     }
 
     #[test]
@@ -563,10 +560,10 @@ mod tests {
     fn expectile_intercept_is_newton_step_from_mean_then_running_max() {
         let obj = Expectile::new(&[0.5]).unwrap();
         // α = 0.5 is the mean.
-        assert_eq!(obj.base_margins(&[1.0, 2.0, 6.0], None, None), vec![3.0]);
+        assert_eq!(base_margins(&obj, &[1.0, 2.0, 6.0], None), vec![3.0]);
         let obj = Expectile::new(&[0.1, 0.9]).unwrap();
         let labels = [0.0f32, 0.0, 0.0, 10.0];
-        let mut q = obj.base_margins(&labels, None, None);
+        let mut q = base_margins(&obj, &labels, None);
         obj.pred_transform(&mut q);
         // mean 2.5: α=0.1 → residuals {2.5×3 at weight 0.9, −7.5 at 0.1}:
         // step −(6.75 − 0.75)/(2.7 + 0.1) → 2.5 − 2.142857.
@@ -578,7 +575,7 @@ mod tests {
         );
         // A running max keeps equal alphas' intercepts ordered.
         let tied = Expectile::new(&[0.5, 0.5]).unwrap();
-        let mut q = tied.base_margins(&labels, None, None);
+        let mut q = base_margins(&tied, &labels, None);
         tied.pred_transform(&mut q);
         assert!(q[1] >= q[0]);
     }

@@ -9,7 +9,7 @@
 
 use rayon::prelude::*;
 
-use super::{GradPair, MIN_HESS_F64, Objective};
+use super::{GradPair, MIN_HESS_F64, Objective, log_link};
 use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -96,8 +96,8 @@ impl Objective for Cox {
         exp_transform(preds);
     }
 
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        base_score.ln()
+    fn probs_to_margins(&self, scores: &mut [f32]) {
+        log_link(scores);
     }
 
     fn default_metric(&self) -> String {
@@ -234,14 +234,14 @@ impl Objective for Aft {
     /// Identity: the AFT metrics consume the raw log-time margins.
     fn eval_transform(&self, _preds: &mut [f32]) {}
 
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        base_score.ln()
+    fn probs_to_margins(&self, scores: &mut [f32]) {
+        log_link(scores);
     }
 
     /// XGBoost does not estimate an AFT intercept: its default `base_score`
     /// 0.5 maps to the margin `ln 0.5`.
     fn base_margins_info(&self, _info: &MetaInfo) -> Vec<f32> {
-        vec![self.prob_to_margin(0.5)]
+        vec![0.5f32.ln()]
     }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {

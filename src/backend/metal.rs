@@ -11,15 +11,18 @@
 //!   call's fixed row-upload cost amortizes).
 //! - **Training** (`device = metal`, see
 //!   [`TrainingParams::device`](crate::config::TrainingParams::device)):
-//!   the histogram construction of `tree_method = hist` moves to the GPU,
-//!   bit-identical to the CPU's (below). It is correct and deterministic
-//!   everywhere, but on multicore Apple Silicon it is currently *slower*
-//!   than the CPU histogram path (measured 1M rows × 30 features: ~11 ms
-//!   GPU vs ~2 ms for a 14-core CPU; end-to-end 200k × 30 depth-8 training
-//!   ~1.8× slower). The cause is structural: Apple GPUs have no `double`,
-//!   so the exact accumulation needs ~six times the arithmetic of the
-//!   CPU's native `f64` adds, and the determinism contract forbids the
-//!   floating-point atomics other GPU histogram implementations use. Set
+//!   the histogram construction of `tree_method = hist` moves to the GPU
+//!   for every node it can sum exactly (below), bit-identical to the
+//!   CPU's. It is correct and deterministic everywhere, but on multicore
+//!   Apple Silicon it is currently *slower* than the CPU histogram path
+//!   (measured with an earlier kernel that skipped renormalization, so the
+//!   GPU times are lower bounds: 1M rows × 30 features took ~11 ms on the
+//!   GPU vs ~2 ms on a 14-core CPU; end-to-end 200k × 30 depth-8 training
+//!   was ~1.8× slower).
+//!   The cause is structural: Apple GPUs have no `double`, so the exact
+//!   accumulation needs about ten times the arithmetic of the CPU's native
+//!   `f64` adds, and the determinism contract forbids the floating-point
+//!   atomics other GPU histogram implementations use. Set
 //!   `device = metal` to exercise the GPU path; for speed, keep training
 //!   on the CPU and use [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) for prediction.
 //!
@@ -27,31 +30,41 @@
 //!
 //! Metal on Apple GPUs has no `double` type, while the CPU accumulates each
 //! histogram bin as a chain of `f64` additions in row order. The GPU kernel
-//! instead accumulates each (feature, bin) cell in an *exact* double-float
-//! pair (Knuth's two-sum) over fixed 65,536-row chunks, merges the chunk
-//! partials in chunk order, and rounds once to `f64`. For any bin holding
-//! fewer than 2^24 rows the whole pipeline is exact — zero intermediate
-//! rounding — so the GPU histogram equals the single-threaded CPU histogram
-//! bit for bit, and a `device = metal` training run reproduces the
-//! single-threaded CPU model exactly. Beyond that, or when one bin's
-//! gradients span more than ~2^29 in magnitude (where the CPU's own `f64`
-//! chain starts rounding), the GPU value is the correctly rounded sum and
-//! may differ from the CPU by an `f64` ulp. In all cases the GPU result is
-//! identical across runs, thread counts, and machines: there are no atomics,
-//! and every constant (chunk size, thread layout, merge order) is fixed.
+//! instead accumulates each (feature, bin) cell of fixed row slices in a
+//! normalized double-float pair (Knuth's two-sum, then Dekker's fast
+//! two-sum), merges the slice pairs in slice order, and rounds once to
+//! `f64`. The two agree bit for bit exactly when neither rounds, and the
+//! backend checks that before every GPU build: from the staged gradients'
+//! largest magnitude `max` and the coarsest power of two `u` every value
+//! is a multiple of, a node of `n` rows goes to the GPU only when
+//! `n * max <= 2^45 u` for both the gradients and the Hessians (proved in
+//! the private `backend::exact_sum` module; the double-float carries about
+//! 48 exact bits). Every other build runs the CPU's sequential path inside
+//! the backend, so a `device = metal` training run reproduces the
+//! single-threaded CPU model exactly. The result is also identical across
+//! runs, thread counts, and machines: there are no atomics, and every
+//! constant (chunk size, thread layout, merge order) is fixed.
 //!
-//! Guard rails keep the two paths identical in the edge cases where they
-//! could not be: nodes below 8,192 rows and gradients large enough to
-//! overflow an `f32` accumulator run on the CPU's sequential path inside the
-//! GPU backend, and the kernels are compiled with safe math mode (and FP
-//! contraction off) so the compiler cannot distort the two-sums or the
-//! prediction's rounding order.
+//! The domain depends on the data: `u` is set by the finest-grained value,
+//! so real-valued labels near zero (squared-error residuals) or confident
+//! predictions (logistic Hessians `p (1 - p)` near 0) cap GPU nodes at
+//! roughly 10^4 to 10^5 rows, and larger nodes run on the CPU. Coarse
+//! gradients (whole numbers, the constant Hessians of squared error) stay
+//! on the GPU up to `2^45 u / max` rows.
+//!
+//! Guard rails keep the two paths identical in the remaining edge cases:
+//! nodes below 8,192 rows, non-finite gradients, inputs that do not match
+//! the index the backend was built from, and GPU command failures run on
+//! the CPU's sequential path, and the kernels are compiled with safe math
+//! (`mathMode = safe` from macOS 15 on, `fastMathEnabled = false` before)
+//! and FP contraction off, so the compiler cannot distort the two-sums or
+//! the prediction's rounding order.
 //!
 //! # Limitations
 //!
-//! - macOS with a Metal device (Apple Silicon or an Intel Mac with a
-//!   supported GPU). Training on a machine without one fails with an error,
-//!   as do the combinations listed under
+//! - macOS 10.13 or later with a Metal device (Apple Silicon or an Intel
+//!   Mac with a supported GPU). Training on a machine without one fails
+//!   with an error, as do the combinations listed under
 //!   [`TrainingParams::validate`](crate::config::TrainingParams::validate).
 //! - Sparse (CSR, missing-value) training data is supported through an
 //!   interleaved column copy (up to 8 bytes per row per feature block);
@@ -68,6 +81,7 @@
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 
+use crate::backend::exact_sum::SumDomain;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, initial_margins, transform_model_margins};
@@ -79,16 +93,16 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
 };
 use rayon::prelude::*;
 use std::ops::RangeBounds;
 use std::ptr::NonNull;
 use std::ptr::copy_nonoverlapping;
 use std::slice;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard};
 
 /// Rows per GPU histogram chunk. A chunk's shared data (row ids plus
 /// gradient pairs, 12 bytes per row) stays resident in the GPU's level-2
@@ -214,34 +228,52 @@ struct HistRun {
     uint features_per_group; // features one threadgroup covers
 };
 
-// Exact double-float add of `x` to `(hi, lo)` (Knuth's two-sum, then the
-// error folded into `lo`). Exact while the running pair needs at most 48
-// bits of significand, which a chunk's per-bin sum always does.
-#define DF_ADD(hi, lo, x) { \
-    float s = hi + (x); \
-    float bb = s - hi; \
-    float e = (hi - (s - bb)) + ((x) - bb); \
-    float s2 = lo + e; \
-    lo = s2; \
-    hi = s; \
+// Knuth's two-sum: `s + e == a + b` exactly (round to nearest, no
+// overflow), whatever the magnitudes.
+#define TWO_SUM(s, e, a, b) { \
+    s = (a) + (b); \
+    float bb_ = s - (a); \
+    e = ((a) - (s - bb_)) + ((b) - bb_); \
 }
 
-// Exact double-float add of `(bhi, blo)` to `(ahi, alo)` (two-sum on the
-// high parts, remainder folded once).
+// Dekker's fast two-sum: `s + e == a + b` exactly when `|a| >= |b|` or
+// `a == 0`.
+#define FAST_TWO_SUM(s, e, a, b) { \
+    s = (a) + (b); \
+    e = (b) - (s - (a)); \
+}
+
+// Double-float add of `x` to the normalized pair `(hi, lo)`: two-sum of
+// the high word, the error added to `lo`, then a fast two-sum renormalizes
+// so `|lo| <= ulp(hi) / 2` again. Exact inside the domain the host checks
+// (`backend/exact_sum.rs`, which proves it), where the one inexact
+// candidate, `lo + e`, is a small multiple of the inputs' grain and
+// `|lo + e| <= |s|` makes the fast two-sum exact.
+#define DF_ADD(hi, lo, x) { \
+    float s_, e_; \
+    TWO_SUM(s_, e_, hi, (x)) \
+    float t_ = (lo) + e_; \
+    FAST_TWO_SUM(hi, lo, s_, t_) \
+}
+
+// Double-float add of the normalized pair `(bhi, blo)` to `(ahi, alo)`:
+// two-sum of the high words, the low words and the error added, then a
+// full two-sum renormalizes (the high words may cancel, so the fast
+// variant's magnitude condition is not guaranteed). Exact inside the same
+// domain.
 #define DF_ADD_DF(ahi, alo, bhi, blo) { \
-    float s = ahi + bhi; \
-    float bb = s - ahi; \
-    float e = (ahi - (s - bb)) + (bhi - bb); \
-    float t = (alo + blo) + e; \
-    alo = t; \
-    ahi = s; \
+    float s_, e_; \
+    TWO_SUM(s_, e_, ahi, bhi) \
+    float t_ = ((alo) + (blo)) + e_; \
+    TWO_SUM(ahi, alo, s_, t_) \
 }
 
 // One threadgroup scans one (feature block, 32-bin window) of one row
 // chunk: thread `tid` covers feature `tid / 8` and its bin quarter
 // `(tid % 8) * 4`, four bins held in registers. Every bin has a single
-// writer that adds its rows in ascending order, so the result is exact and
-// deterministic. The interleaved column store packs 8 features' bins into
+// writer that adds its rows in ascending order, so the result is
+// deterministic (and exact inside the host-checked domain). The
+// interleaved column store packs 8 features' bins into
 // one 16-byte word per (row, block), so a row step costs one uniform load
 // for the row id, one for the word, and one for the gradient pair —
 // amortized across the block's 8 features.
@@ -553,11 +585,12 @@ unsafe impl Sync for Pipeline {}
 struct GpuBuffer(Retained<ProtocolObject<dyn MTLBuffer>>);
 // SAFETY: the `MTLBuffer` *object* is thread-safe; the memory it owns is
 // governed by this backend's ownership rules — writes go through `unsafe`
-// methods whose contracts require exclusive access, and the safe methods are
-// read-only.
+// methods whose contracts require exclusive access (the gradient buffer's
+// write lock, a checked-out per-call buffer set, or a buffer not yet shared),
+// and the safe methods do not touch the contents.
 unsafe impl Send for GpuBuffer {}
-// SAFETY: see the `Send` impl: concurrent access happens only through the
-// read-only safe methods.
+// SAFETY: see the `Send` impl: shared references only reach the contents
+// through the `unsafe` methods and their exclusivity contracts.
 unsafe impl Sync for GpuBuffer {}
 
 impl GpuBuffer {
@@ -577,37 +610,61 @@ impl GpuBuffer {
         self.0.length()
     }
 
-    /// The buffer's contents as a mutable slice of `n` elements of `T`.
+    /// Check that `len` bytes at `offset` lie within the buffer.
+    fn check_range(&self, offset: usize, len: usize) -> Result<()> {
+        match offset.checked_add(len) {
+            Some(end) if end <= self.len() => Ok(()),
+            _ => Err(HessboostError::gpu(format!(
+                "a {len}-byte access at offset {offset} overruns a {}-byte Metal buffer",
+                self.len()
+            ))),
+        }
+    }
+
+    /// The buffer's contents as a mutable slice of `n` elements of `T`, or
+    /// an error when `n` of them do not fit (or the contents are misaligned
+    /// for `T`).
     ///
     /// # Safety
     ///
     /// The caller must exclusively own the buffer: no in-flight GPU work may
     /// read it, and no other CPU access may alias the returned slice. `T`
-    /// must be a plain data type matching the kernel's layout.
+    /// must be a plain data type (every bit pattern valid) matching the
+    /// kernel's layout.
     #[allow(
         clippy::mut_from_ref,
         reason = "the caller proves exclusive access; the buffer is plain shared memory"
     )]
-    unsafe fn as_slice_mut<T>(&self, n: usize) -> &mut [T] {
-        debug_assert!(n * std::mem::size_of::<T>() <= self.len());
-        // SAFETY: the caller guarantees exclusive access (see above); Metal
-        // shared buffers are plain CPU-accessible memory of `self.len()`
-        // bytes, and `n * size_of::<T>()` is within it.
-        unsafe { slice::from_raw_parts_mut(self.0.contents().as_ptr().cast(), n) }
+    unsafe fn as_slice_mut<T>(&self, n: usize) -> Result<&mut [T]> {
+        let bytes = n
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| HessboostError::gpu("a Metal buffer view overflows `usize`"))?;
+        self.check_range(0, bytes)?;
+        let data = self.0.contents().as_ptr().cast::<T>();
+        if !data.is_aligned() {
+            return Err(HessboostError::gpu("a Metal buffer is misaligned"));
+        }
+        // SAFETY: the caller guarantees exclusive access and a plain-data
+        // `T` (see above); Metal shared buffers are plain CPU-accessible
+        // memory of `self.len()` bytes, `n * size_of::<T>()` of which were
+        // just checked to lie within it, at an address aligned for `T`.
+        Ok(unsafe { slice::from_raw_parts_mut(data, n) })
     }
 
-    /// Copy `bytes` into the buffer at `offset`. No-op for empty input.
+    /// Copy `bytes` into the buffer at `offset`, or return an error (and
+    /// write nothing) when they do not fit. No-op for empty input.
     ///
     /// # Safety
     ///
     /// The caller must exclusively own the buffer (see [`Self::as_slice_mut`]).
-    unsafe fn write(&self, offset: usize, bytes: &[u8]) {
+    unsafe fn write(&self, offset: usize, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
-        debug_assert!(offset + bytes.len() <= self.len());
-        // SAFETY: exclusive access per the caller; the destination lies
-        // within the buffer and cannot overlap the source.
+        self.check_range(offset, bytes.len())?;
+        // SAFETY: exclusive access per the caller; the destination range was
+        // just checked to lie within the buffer, and a caller's slice cannot
+        // overlap memory this backend owns exclusively.
         unsafe {
             copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -615,6 +672,7 @@ impl GpuBuffer {
                 bytes.len(),
             );
         }
+        Ok(())
     }
 }
 
@@ -652,16 +710,33 @@ impl MetalContext {
     }
 
     fn new() -> Result<Self, String> {
+        // `dispatchThreads:threadsPerThreadgroup:` (non-uniform threadgroup
+        // dispatch) arrived in macOS 10.13; an older system would raise an
+        // unknown-selector exception at the first dispatch.
+        if !objc2::available!(macos = 10.13) {
+            return Err("the Metal backend needs macOS 10.13 or later".to_string());
+        }
         let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| "no system default Metal device".to_string())?;
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| "creating the Metal command queue failed".to_string())?;
         // Safe math mode: the two-sums require exact IEEE 754 adds with no
-        // FMA contraction, and the compile-time default (`fastMathEnabled`)
-        // permits both.
+        // FMA contraction or reassociation, and the compile-time default
+        // (fast math) permits both. `mathMode` exists from macOS 15 on (an
+        // older system has no such selector, so sending it would raise an
+        // exception); before that, `fastMathEnabled = false` is the same
+        // setting.
         let options = MTLCompileOptions::new();
-        options.setMathMode(MTLMathMode::Safe);
+        if objc2::available!(macos = 15.0) {
+            options.setMathMode(MTLMathMode::Safe);
+        } else {
+            #[allow(
+                deprecated,
+                reason = "the only safe-math setting before macOS 15, where `mathMode` replaced it"
+            )]
+            options.setFastMathEnabled(false);
+        }
         let source = NSString::from_str(MSL);
         let library = device
             .newLibraryWithSource_options_error(&source, Some(&options))
@@ -693,6 +768,25 @@ impl MetalContext {
             .commandBuffer()
             .ok_or_else(|| HessboostError::gpu("creating a Metal command buffer failed"))
     }
+}
+
+/// Commit `cb`, wait until the GPU is done with it, and check that it
+/// completed: a command buffer that ends in the error state (a GPU fault, a
+/// timeout, a lost device) has not produced its outputs. Either way the GPU
+/// no longer touches the buffers it referenced when this returns.
+fn submit(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
+    cb.commit();
+    cb.waitUntilCompleted();
+    let status = cb.status();
+    if status == MTLCommandBufferStatus::Completed {
+        return Ok(());
+    }
+    let detail = cb
+        .error()
+        .map_or_else(|| format!("status {}", status.0), |e| e.to_string());
+    Err(HessboostError::gpu(format!(
+        "a Metal command buffer failed: {detail}"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -739,25 +833,35 @@ struct HistRun {
     features_per_group: u32,
 }
 
-/// The identity (address) of a gradient slice, for change detection. A
-/// newtype because raw pointers are neither `Send` nor `Sync`; it is only
-/// ever compared, never dereferenced.
-struct SliceId(*const GradPair);
-// SAFETY: the pointer is never dereferenced or otherwise used, only
-// compared for identity.
-unsafe impl Send for SliceId {}
-
-/// The gradient slice staged by [`HistogramBackend::prepare`], uploaded to
-/// the GPU together with the magnitude bound the overflow guard needs.
-struct PreparedGradients {
+/// The gradient slice staged by [`HistogramBackend::prepare`]: uploaded to
+/// the GPU, with the statistics that decide whether a node's sums are
+/// exact on both paths.
+///
+/// Lives behind the backend's `RwLock`: staging (the only write to
+/// `buffer`) takes the write lock, and every GPU build holds a read guard
+/// from checking that the staged slice is its own until its command buffer
+/// has completed, so the buffer never changes while the GPU reads it.
+struct StagedGradients {
     buffer: GpuBuffer,
-    /// (pointer, length) identity of the uploaded slice.
-    ptr: SliceId,
+    /// (address, length) identity of the staged slice; length 0 when
+    /// nothing is staged (a staged slice always has `n_rows > 0` entries).
+    addr: usize,
     len: usize,
-    /// `max(|grad|)` and `max(|hess|)` over the slice (NaN inputs are
-    /// ignored, matching `f32::max`; an infinity always trips the guard).
-    max_g: f32,
-    max_h: f32,
+    grad: SumDomain,
+    hess: SumDomain,
+}
+
+impl StagedGradients {
+    /// Whether `gpair` is the staged slice.
+    fn holds(&self, gpair: &[GradPair]) -> bool {
+        self.len != 0 && self.len == gpair.len() && self.addr == gpair.as_ptr().addr()
+    }
+
+    /// Whether every sum of at most `n` staged gradient pairs is exact on
+    /// both paths (see `backend::exact_sum`).
+    fn sums_exact(&self, n: usize) -> bool {
+        self.grad.sums_exact(n) && self.hess.sums_exact(n)
+    }
 }
 
 /// Per-call GPU buffers of the histogram backend, pooled across the parallel
@@ -775,7 +879,15 @@ struct CallBuffers {
 ///
 /// Training selects it automatically through
 /// [`device = metal`](crate::config::TrainingParams::device); constructing it
-/// directly serves custom training loops against a [`GHistIndex`].
+/// directly serves custom training loops against a [`GHistIndex`]. Its
+/// histograms equal the single-threaded CPU backend's bit for bit: nodes
+/// the GPU cannot sum exactly (see the [module docs](crate::backend::metal))
+/// run the CPU's sequential path instead. `build` must receive the index
+/// the backend was built from, and the gradient slice must not change
+/// between `prepare` and the tree's last `build`; inputs that do not fit
+/// the backend's buffers (a different index shape, a gradient slice of
+/// another length, row indices past the index) never reach the GPU and
+/// take the CPU path, which checks them.
 pub struct MetalHistBackend {
     ctx: &'static MetalContext,
     /// `true` when `columns` packs each record as eight `u16` bins (dense
@@ -791,8 +903,9 @@ pub struct MetalHistBackend {
     threads_per_group: usize,
     total_bins: usize,
     n_rows: usize,
+    n_cols: usize,
     run: HistRun,
-    gradients: Mutex<PreparedGradients>,
+    gradients: RwLock<StagedGradients>,
     pool: Mutex<Vec<CallBuffers>>,
 }
 
@@ -882,10 +995,10 @@ impl MetalHistBackend {
         // SAFETY: freshly allocated buffer, written once before any
         // dispatch; `BlockInfo` is `repr(C)` of two arrays of sixteen
         // `u32`s.
-        unsafe { blocks_bytes.write(0, as_bytes(&blocks)) };
+        unsafe { blocks_bytes.write(0, as_bytes(&blocks))? };
         let groups_bytes = GpuBuffer::new(&ctx.device, groups.len() * 8)?;
         // SAFETY: see above; `ScanGroup` is `repr(C)` of two `u32`s.
-        unsafe { groups_bytes.write(0, as_bytes(&groups)) };
+        unsafe { groups_bytes.write(0, as_bytes(&groups))? };
         let run = HistRun {
             total_bins: total_bins as u32,
             n_records: n_records as u32,
@@ -908,41 +1021,70 @@ impl MetalHistBackend {
             threads_per_group,
             total_bins,
             n_rows,
+            n_cols,
             run,
-            gradients: Mutex::new(PreparedGradients {
+            gradients: RwLock::new(StagedGradients {
                 buffer: gpair,
-                ptr: SliceId(std::ptr::null()),
+                addr: 0,
                 len: 0,
-                max_g: 0.0,
-                max_h: 0.0,
+                grad: SumDomain::EMPTY,
+                hess: SumDomain::EMPTY,
             }),
             pool: Mutex::new(vec![call]),
         })
     }
 
-    /// Stage `gpair` on the GPU, returning the magnitude bound of the staged
-    /// data.
+    /// Stage `gpair` on the GPU with its exactness statistics, unless it is
+    /// the staged slice already and `force` is off. A slice of any length
+    /// other than `n_rows` is not staged: it does not fit the buffer, and
+    /// the builds it serves run on the CPU.
     ///
     /// `force` stages unconditionally: the trainer refills its gradient
     /// buffer in place every round, so a new tree's `prepare` cannot rely on
     /// the slice's identity. Within one tree (a `build` whose `prepare` just
     /// ran) the identity check skips the re-upload: the slice is constant
     /// while a tree grows.
-    fn ensure_gradients(&self, gpair: &[GradPair], force: bool) -> f32 {
-        let mut prepared = self.gradients.lock().expect("gradient lock poisoned");
-        let (ptr, len) = (gpair.as_ptr(), gpair.len());
-        if force || prepared.ptr.0 != ptr || prepared.len != len {
-            // SAFETY: the gradient buffer is only written here, under the
-            // gradient lock, while no GPU work reads it: every `build` waits
-            // for its own command buffer before returning, and trees are
-            // built one at a time.
-            unsafe { prepared.buffer.write(0, as_bytes(gpair)) };
-            prepared.max_g = gpair.iter().map(|p| p.grad.abs()).fold(0.0f32, f32::max);
-            prepared.max_h = gpair.iter().map(|p| p.hess.abs()).fold(0.0f32, f32::max);
-            prepared.ptr = SliceId(ptr);
-            prepared.len = len;
+    fn stage(&self, gpair: &[GradPair], force: bool) {
+        let mut staged = self.gradients.write().expect("gradient lock poisoned");
+        if !force && staged.holds(gpair) {
+            return;
         }
-        prepared.max_g.max(prepared.max_h)
+        // Unstage first, so a slice that is not uploaded below is never
+        // mistaken for the previous one.
+        staged.len = 0;
+        if gpair.len() != self.n_rows {
+            return;
+        }
+        // SAFETY: the write lock excludes every GPU build (each holds a
+        // read guard until its command buffer has completed), so no GPU work
+        // reads the buffer; `GradPair` is `repr(C)` of two `f32`s, without
+        // padding.
+        if unsafe { staged.buffer.write(0, as_bytes(gpair)) }.is_err() {
+            return;
+        }
+        staged.grad = SumDomain::of(gpair.iter().map(|p| p.grad));
+        staged.hess = SumDomain::of(gpair.iter().map(|p| p.hess));
+        staged.addr = gpair.as_ptr().addr();
+        staged.len = gpair.len();
+    }
+
+    /// A read guard on the staged gradients when they hold `gpair`, staging
+    /// it first if needed; `None` when `gpair` cannot be staged or another
+    /// thread staged a different slice in between. While the guard lives,
+    /// the gradient buffer does not change.
+    fn staged_for(&self, gpair: &[GradPair]) -> Option<RwLockReadGuard<'_, StagedGradients>> {
+        if gpair.len() != self.n_rows {
+            return None;
+        }
+        {
+            let staged = self.gradients.read().expect("gradient lock poisoned");
+            if staged.holds(gpair) {
+                return Some(staged);
+            }
+        }
+        self.stage(gpair, false);
+        let staged = self.gradients.read().expect("gradient lock poisoned");
+        staged.holds(gpair).then_some(staged)
     }
 
     /// Check out a per-call buffer set from the pool.
@@ -965,28 +1107,68 @@ impl MetalHistBackend {
             .push(call);
     }
 
-    /// The sequential CPU path, used below the row threshold and for guard
-    /// trips. It matches the GPU's semantics: row-order `f64` accumulation
-    /// of the same exact sums.
+    /// The sequential CPU path, used below the row threshold and whenever
+    /// the GPU cannot take a node. Inside the exactness domain the GPU
+    /// reproduces it bit for bit; its own bounds checks reject inputs that
+    /// do not match `ghist`, as the CPU backend's do.
     fn serial(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
         out.fill(GradStats::default());
         cpu_accumulate(ghist, rows, gpair, out);
     }
 
-    /// Run the GPU accumulation of `rows` into `out`. The guards have
-    /// passed and the gradients are staged.
-    fn gpu_build(&self, rows: &[u32], out: &mut [GradStats]) -> Result<()> {
-        let call = self.checkout()?;
-        let result = self.dispatch(&call, rows, out);
+    /// Build the histogram of `rows` into `out` on the GPU when the inputs
+    /// allow it, returning whether it did (otherwise `out` is unspecified).
+    fn try_gpu(
+        &self,
+        ghist: &GHistIndex,
+        rows: &[u32],
+        gpair: &[GradPair],
+        out: &mut [GradStats],
+    ) -> bool {
+        // The kernels do not bounds-check: inputs the GPU buffers were not
+        // sized for (another index shape, more rows than the index holds, a
+        // row past its end) must never reach a dispatch.
+        let fits = out.len() == self.total_bins
+            && ghist.n_rows() == self.n_rows
+            && ghist.n_cols() == self.n_cols
+            && ghist.total_bins() == self.total_bins
+            && rows.len() <= self.n_rows
+            && rows.iter().all(|&r| (r as usize) < self.n_rows);
+        if !fits {
+            return false;
+        }
+        // The guard lives until this function returns, after the dispatch's
+        // command buffer has completed: no `stage` can rewrite the gradient
+        // buffer while the GPU reads it.
+        let Some(staged) = self.staged_for(gpair) else {
+            return false;
+        };
+        if !staged.sums_exact(rows.len()) {
+            return false;
+        }
+        let Ok(call) = self.checkout() else {
+            return false;
+        };
+        let result = self.dispatch(&call, &staged.buffer, rows, out);
         self.checkin(call);
-        result
+        result.is_ok()
     }
 
-    fn dispatch(&self, call: &CallBuffers, rows: &[u32], out: &mut [GradStats]) -> Result<()> {
+    /// Encode, run, and read back the scan and merge of `rows` over the
+    /// staged `gradients`. The caller has checked that `rows` fit the
+    /// backend (at most `n_rows` entries, each below `n_rows`) and holds the
+    /// gradients' read guard throughout.
+    fn dispatch(
+        &self,
+        call: &CallBuffers,
+        gradients: &GpuBuffer,
+        rows: &[u32],
+        out: &mut [GradStats],
+    ) -> Result<()> {
         let cb = self.ctx.command_buffer()?;
-        // SAFETY: this call exclusively owns `call`; nothing has been
-        // dispatched on it yet, and `rows` are `u32`s within its capacity.
-        unsafe { call.rows.write(0, as_bytes(rows)) };
+        // SAFETY: this call exclusively owns `call` (checked out of the
+        // pool), and nothing has been dispatched on it yet.
+        unsafe { call.rows.write(0, as_bytes(rows))? };
         let chunks = rows.len().div_ceil(CHUNK_ROWS);
         for c in 0..chunks {
             let begin = c * CHUNK_ROWS;
@@ -996,8 +1178,13 @@ impl MetalHistBackend {
                 chunk_index: c as u32,
                 slices: ROW_SLICES as u32,
             };
-            // SAFETY: the argument block is a live `repr(C)` plain-data
-            // local outliving the encoder, and its pointer/length are valid.
+            // SAFETY: the argument blocks are live `repr(C)` plain-data
+            // locals outliving the encoder. Every access the kernel makes is
+            // in bounds: the row offset `begin * 4` lies within the rows
+            // buffer (`begin < rows.len() <= n_rows`), each row id is below
+            // `n_rows`, the size the column store and gradient buffer were
+            // allocated for, and the partials of `chunks <= ceil(n_rows /
+            // CHUNK_ROWS)` chunks fit the pool's partials buffer.
             unsafe {
                 let enc = cb
                     .computeCommandEncoder()
@@ -1010,9 +1197,7 @@ impl MetalHistBackend {
                 enc.setComputePipelineState(&pipe.0);
                 enc.setBuffer_offset_atIndex(Some(&call.rows.0), begin * 4, 0);
                 enc.setBuffer_offset_atIndex(Some(&self.columns.0), 0, 1);
-                let gradients = self.gradients.lock().expect("gradient lock poisoned");
-                enc.setBuffer_offset_atIndex(Some(&gradients.buffer.0), 0, 2);
-                drop(gradients);
+                enc.setBuffer_offset_atIndex(Some(&gradients.0), 0, 2);
                 enc.setBuffer_offset_atIndex(Some(&self.blocks_bytes.0), 0, 3);
                 enc.setBuffer_offset_atIndex(Some(&self.groups_bytes.0), 0, 4);
                 enc.setBuffer_offset_atIndex(Some(&call.partials.0), 0, 5);
@@ -1041,8 +1226,10 @@ impl MetalHistBackend {
             }
         }
         // SAFETY: encoders of one command buffer run in the order they were
-        // created, so the merge reads complete chunk partials; the argument
-        // blocks are live plain-data locals.
+        // created, so the merge reads complete chunk partials (the same
+        // `chunks * ROW_SLICES` the scans wrote); the argument blocks are
+        // live plain-data locals, and the merge's `total_bins` threads
+        // index the partials and histogram buffers within their sizes.
         unsafe {
             let enc = cb
                 .computeCommandEncoder()
@@ -1076,14 +1263,14 @@ impl MetalHistBackend {
             enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
             enc.endEncoding();
         }
-        cb.commit();
-        cb.waitUntilCompleted();
+        submit(&cb)?;
         // SAFETY: the command buffer has completed, so the GPU is done with
         // the buffer; this call owns it.
-        let hist = unsafe { call.hist.as_slice_mut::<[f32; 4]>(self.total_bins) };
+        let hist = unsafe { call.hist.as_slice_mut::<[f32; 4]>(self.total_bins)? };
         for (o, h) in out.iter_mut().zip(hist) {
-            // (hi, lo) as f64 sums exactly: the pair holds at most 48
-            // significand bits and f64 carries 53.
+            // Inside the exactness domain `hi + lo` is the exact bin sum, a
+            // multiple of the grain below 2^53 grains, so the `f64` add is
+            // exact.
             o.grad = f64::from(h[0]) + f64::from(h[1]);
             o.hess = f64::from(h[2]) + f64::from(h[3]);
         }
@@ -1093,30 +1280,18 @@ impl MetalHistBackend {
 
 impl HistogramBackend for MetalHistBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        debug_assert_eq!(out.len(), self.total_bins);
-        // Small nodes and guard trips stay on the sequential CPU path, which
-        // the GPU reproduces exactly: both are row-order accumulation of the
-        // same exact sums.
-        if rows.len() < CPU_ROWS {
+        // Small nodes, and every node the GPU cannot take (inputs that do
+        // not fit, sums outside the exactness domain, a failed dispatch),
+        // run on the sequential CPU path. The histogram is a pure function
+        // of the inputs, so a GPU failure costs time, never the training
+        // run.
+        if rows.len() < CPU_ROWS || !self.try_gpu(ghist, rows, gpair, out) {
             Self::serial(ghist, rows, gpair, out);
-            return;
-        }
-        let max = self.ensure_gradients(gpair, false);
-        if f64::from(max) * rows.len() as f64 > f64::from(f32::MAX) {
-            Self::serial(ghist, rows, gpair, out);
-            return;
-        }
-        match self.gpu_build(rows, out) {
-            Ok(()) => {}
-            // A dispatch failure is not recoverable on the GPU, but the
-            // histogram is a pure function of the inputs: fall back to the
-            // CPU rather than failing the training run.
-            Err(_) => Self::serial(ghist, rows, gpair, out),
         }
     }
 
     fn prepare(&self, _ghist: &GHistIndex, gpair: &[GradPair]) {
-        self.ensure_gradients(gpair, true);
+        self.stage(gpair, true);
     }
 }
 
@@ -1152,7 +1327,7 @@ fn interleaved_columns(
     let buffer = GpuBuffer::new(device, words * 4)?;
     // SAFETY: the buffer was just allocated and is not yet shared; its
     // length covers `words` u32s.
-    let store = unsafe { buffer.as_slice_mut::<u32>(words) };
+    let store = unsafe { buffer.as_slice_mut::<u32>(words)? };
     let sentinel = if u16_pack {
         [u32::from(u16::MAX); RECORD_FEATURES]
     } else {
@@ -1343,9 +1518,9 @@ impl GpuModel {
             let cb = self.ctx.command_buffer()?;
             // SAFETY: this call owns `call`; nothing is dispatched on it yet.
             unsafe {
-                let rows_slice = call.rows.as_slice_mut::<f32>(n * data.n_cols());
+                let rows_slice = call.rows.as_slice_mut::<f32>(n * data.n_cols())?;
                 materialize_rows(data, rows_slice);
-                call.out.write(0, as_bytes(&margins));
+                call.out.write(0, as_bytes(&margins))?;
             }
             // SAFETY: the encoder runs after the writes above (encoders of
             // one command buffer are ordered), the argument block is a live
@@ -1386,10 +1561,9 @@ impl GpuModel {
                 enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
                 enc.endEncoding();
             }
-            cb.commit();
-            cb.waitUntilCompleted();
+            submit(&cb)?;
             // SAFETY: the command buffer completed; this call owns the buffer.
-            let out = unsafe { call.out.as_slice_mut::<f32>(margins.len()) };
+            let out = unsafe { call.out.as_slice_mut::<f32>(margins.len())? };
             margins.copy_from_slice(out);
             Ok(())
         })();
@@ -1494,14 +1668,14 @@ impl BoostedModel {
         let parts = forest.gpu_parts();
         let nodes = GpuBuffer::new(&ctx.device, parts.nodes.len())?;
         // SAFETY: fresh buffers, written once before any dispatch.
-        unsafe { nodes.write(0, parts.nodes) };
+        unsafe { nodes.write(0, parts.nodes)? };
         let categories = GpuBuffer::new(&ctx.device, parts.categories.len() * 4)?;
         // SAFETY: fresh buffer, written once before any dispatch.
-        unsafe { categories.write(0, as_bytes(parts.categories)) };
+        unsafe { categories.write(0, as_bytes(parts.categories))? };
         let leaf_vectors = GpuBuffer::new(&ctx.device, parts.leaf_vectors.len() * 4)?;
         // SAFETY: fresh buffer, written once before any dispatch (a
         // scalar-leaf model's is never read).
-        unsafe { leaf_vectors.write(0, as_bytes(parts.leaf_vectors)) };
+        unsafe { leaf_vectors.write(0, as_bytes(parts.leaf_vectors))? };
         let trees: Vec<PTree> = parts
             .roots
             .iter()
@@ -1515,7 +1689,7 @@ impl BoostedModel {
             .collect();
         let trees_bytes = GpuBuffer::new(&ctx.device, trees.len() * 16)?;
         // SAFETY: see above; `PTree` is `repr(C)` of `u32, f32, u32, u32`.
-        unsafe { trees_bytes.write(0, as_bytes(&trees)) };
+        unsafe { trees_bytes.write(0, as_bytes(&trees))? };
         Ok(GpuModel {
             model: Arc::new(self.clone()),
             ctx,
@@ -1572,11 +1746,40 @@ mod tests {
         MetalContext::shared().is_some()
     }
 
-    fn one_thread_pool() -> rayon::ThreadPool {
+    /// The single-threaded CPU histogram of `rows`.
+    fn cpu_hist(index: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Vec<GradStats> {
+        let mut out = vec![GradStats::default(); index.total_bins()];
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .unwrap()
+            .install(|| CpuBackend.build(index, rows, gpair, &mut out));
+        out
+    }
+
+    /// The histogram of `rows` built on the GPU, asserting that the GPU
+    /// path ran rather than the CPU fallback.
+    fn gpu_hist(
+        backend: &MetalHistBackend,
+        index: &GHistIndex,
+        rows: &[u32],
+        gpair: &[GradPair],
+    ) -> Vec<GradStats> {
+        backend.prepare(index, gpair);
+        let mut out = vec![GradStats::default(); index.total_bins()];
+        assert!(
+            backend.try_gpu(index, rows, gpair, &mut out),
+            "the GPU path must take this node"
+        );
+        out
+    }
+
+    /// A one-feature dataset whose rows cycle through `values` distinct
+    /// feature values (one bin each).
+    fn one_feature(n: usize, values: usize) -> GHistIndex {
+        let x: Vec<f32> = (0..n).map(|i| (i % values) as f32).collect();
+        let data = crate::data::DMatrix::from_dense(&x, n, 1).unwrap();
+        GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256))
     }
 
     /// The double-float two-sum must be exact: a bin's rows of
@@ -1587,7 +1790,7 @@ mod tests {
         if !context() {
             return;
         }
-        let n = 300;
+        let n = CPU_ROWS + 808;
         let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32 * 0.25 - 0.75).collect();
         let gpair: Vec<GradPair> = x
             .iter()
@@ -1601,14 +1804,109 @@ mod tests {
         let index = GHistIndex::from_dmatrix(&data, cuts);
         let rows: Vec<u32> = (0..n as u32).collect();
         let backend = MetalHistBackend::new(&index).unwrap();
-        let mut gpu = vec![GradStats::default(); index.total_bins()];
-        HistogramBackend::build(&backend, &index, &rows, &gpair, &mut gpu);
-        let mut cpu = vec![GradStats::default(); index.total_bins()];
-        one_thread_pool().install(|| CpuBackend.build(&index, &rows, &gpair, &mut cpu));
-        for (g, c) in gpu.iter().zip(&cpu) {
-            assert_eq!(g.grad, c.grad, "grad mismatch (GPU {g:?} vs CPU {c:?})");
-            assert_eq!(g.hess, c.hess, "hess mismatch");
+        assert_eq!(
+            gpu_hist(&backend, &index, &rows, &gpair),
+            cpu_hist(&index, &rows, &gpair)
+        );
+    }
+
+    /// Renormalization: at the edge of the exactness domain (bin sums near
+    /// `2^45` grains), a large gradient just below `2^29` with an odd small
+    /// one every eleventh row must keep every low bit through 1,024-row
+    /// slices and the 64-way merge. The unrenormalized double-float lost
+    /// them (modeled on the CPU, both bins came out 5 low).
+    #[test]
+    fn hist_is_exact_at_the_domain_edge() {
+        if !context() {
+            return;
         }
+        let n = CHUNK_ROWS;
+        let gpair: Vec<GradPair> = (0..n)
+            .map(|i| GradPair::new(if i % 11 == 0 { 1975.0 } else { 535_449_824.0 }, 1.0))
+            .collect();
+        let index = one_feature(n, 2);
+        let backend = MetalHistBackend::new(&index).unwrap();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        assert_eq!(
+            gpu_hist(&backend, &index, &rows, &gpair),
+            cpu_hist(&index, &rows, &gpair)
+        );
+    }
+
+    /// Outside the exactness domain the backend runs the CPU path: the
+    /// review's six gradients per 128-row slice sum to +64 and -64 on the
+    /// CPU, which the old double-float returned as 0 and 0.
+    #[test]
+    fn out_of_domain_nodes_run_on_the_cpu() {
+        if !context() {
+            return;
+        }
+        let six = [
+            2f32.powi(50),
+            2f32.powi(26),
+            2f32.powi(23) + 1.0,
+            -(2f32.powi(50)),
+            -(2f32.powi(26)),
+            -(2f32.powi(23)),
+        ];
+        let n = CPU_ROWS;
+        let grad = |i: usize| match (i % 128, i % 128 >= 64) {
+            (p, false) if p < 6 => six[p],
+            (p, true) if p - 64 < 6 => -six[p - 64],
+            _ => 0.0,
+        };
+        let gpair: Vec<GradPair> = (0..n).map(|i| GradPair::new(grad(i), 1.0)).collect();
+        let x: Vec<f32> = (0..n).map(|i| f32::from(i % 128 >= 64)).collect();
+        let data = crate::data::DMatrix::from_dense(&x, n, 1).unwrap();
+        let index = GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256));
+        let backend = MetalHistBackend::new(&index).unwrap();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        backend.prepare(&index, &gpair);
+        let mut out = vec![GradStats::default(); index.total_bins()];
+        assert!(!backend.try_gpu(&index, &rows, &gpair, &mut out));
+        HistogramBackend::build(&backend, &index, &rows, &gpair, &mut out);
+        let cpu = cpu_hist(&index, &rows, &gpair);
+        assert_eq!(out, cpu);
+        assert_eq!([cpu[0].grad, cpu[1].grad], [64.0, -64.0]);
+    }
+
+    /// Inputs that do not fit the backend's GPU buffers (a longer gradient
+    /// slice, more row ids than rows, a row past the index, another
+    /// histogram length) never reach a dispatch, and those the CPU path
+    /// accepts give the CPU's histogram.
+    #[test]
+    fn mismatched_inputs_never_reach_the_gpu() {
+        if !context() {
+            return;
+        }
+        let n = CPU_ROWS + 100;
+        let index = one_feature(n, 5);
+        let backend = MetalHistBackend::new(&index).unwrap();
+        let bins = index.total_bins();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        let long: Vec<GradPair> = (0..n + 1000)
+            .map(|i| GradPair::new((i % 7) as f32 - 3.0, 1.0))
+            .collect();
+        let gpair = &long[..n];
+        let twice: Vec<u32> = rows.iter().chain(&rows).copied().collect();
+        let past_end: Vec<u32> = (1..=n as u32).collect();
+        let mut out = vec![GradStats::default(); bins];
+        backend.prepare(&index, &long);
+        assert!(!backend.try_gpu(&index, &rows, &long, &mut out));
+        HistogramBackend::build(&backend, &index, &rows, &long, &mut out);
+        assert_eq!(out, cpu_hist(&index, &rows, &long));
+        backend.prepare(&index, gpair);
+        assert!(!backend.try_gpu(&index, &twice, gpair, &mut out));
+        HistogramBackend::build(&backend, &index, &twice, gpair, &mut out);
+        assert_eq!(out, cpu_hist(&index, &twice, gpair));
+        assert!(!backend.try_gpu(&index, &past_end, gpair, &mut out));
+        let mut short = vec![GradStats::default(); bins - 1];
+        assert!(!backend.try_gpu(&index, &rows, gpair, &mut short));
+        // The matching inputs still run on the GPU.
+        assert_eq!(
+            gpu_hist(&backend, &index, &rows, gpair),
+            cpu_hist(&index, &rows, gpair)
+        );
     }
 
     /// GPU histograms equal the single-threaded CPU histograms bit for bit
@@ -1629,25 +1927,23 @@ mod tests {
         let data = crate::data::DMatrix::from_dense(&x, n, cols).unwrap();
         let cuts = HistCuts::from_dmatrix(&data, 64);
         let index = GHistIndex::from_dmatrix(&data, cuts);
+        // Gradients on a 2^-20 grid: sums need more than an `f32`'s 24 bits
+        // but stay inside the exactness domain.
         let gpair: Vec<GradPair> = (0..n)
             .map(|i| GradPair {
-                grad: ((i as i32 % 11) as f32 - 5.0).powi(3) * 0.01,
+                grad: (((i as i32 % 11) as f32 - 5.0).powi(3) * 0.01 * 2f32.powi(20)).round()
+                    * 2f32.powi(-20),
                 hess: ((i % 3) as f32 + 1.0).powi(2),
             })
             .collect();
         let all: Vec<u32> = (0..n as u32).collect();
         let sampled: Vec<u32> = all.iter().copied().step_by(3).collect();
-        let pool = one_thread_pool();
         let backend = MetalHistBackend::new(&index).unwrap();
         for rows in [&all, &sampled] {
-            let mut gpu = vec![GradStats::default(); index.total_bins()];
-            HistogramBackend::build(&backend, &index, rows, &gpair, &mut gpu);
-            let mut cpu = vec![GradStats::default(); index.total_bins()];
-            pool.install(|| CpuBackend.build(&index, rows, &gpair, &mut cpu));
-            for (g, c) in gpu.iter().zip(&cpu) {
-                assert_eq!(g.grad, c.grad);
-                assert_eq!(g.hess, c.hess);
-            }
+            assert_eq!(
+                gpu_hist(&backend, &index, rows, &gpair),
+                cpu_hist(&index, rows, &gpair)
+            );
         }
     }
 
@@ -1680,14 +1976,10 @@ mod tests {
             .collect();
         let rows: Vec<u32> = (0..n as u32).collect();
         let backend = MetalHistBackend::new(&index).unwrap();
-        let mut gpu = vec![GradStats::default(); index.total_bins()];
-        HistogramBackend::build(&backend, &index, &rows, &gpair, &mut gpu);
-        let mut cpu = vec![GradStats::default(); index.total_bins()];
-        one_thread_pool().install(|| CpuBackend.build(&index, &rows, &gpair, &mut cpu));
-        for (g, c) in gpu.iter().zip(&cpu) {
-            assert_eq!(g.grad, c.grad);
-            assert_eq!(g.hess, c.hess);
-        }
+        assert_eq!(
+            gpu_hist(&backend, &index, &rows, &gpair),
+            cpu_hist(&index, &rows, &gpair)
+        );
     }
 
     /// Tail chunks — a node of `CHUNK_ROWS * k + tiny` rows leaves the last
@@ -1700,7 +1992,6 @@ mod tests {
         if !context() {
             return;
         }
-        let pool = one_thread_pool();
         for &n in &[CHUNK_ROWS + 4, 2 * CHUNK_ROWS + 123] {
             let cols = 5;
             let x: Vec<f32> = (0..n * cols)
@@ -1714,14 +2005,11 @@ mod tests {
                 .collect();
             let rows: Vec<u32> = (0..n as u32).collect();
             let backend = MetalHistBackend::new(&index).unwrap();
-            let mut gpu = vec![GradStats::default(); index.total_bins()];
-            HistogramBackend::build(&backend, &index, &rows, &gpair, &mut gpu);
-            let mut cpu = vec![GradStats::default(); index.total_bins()];
-            pool.install(|| CpuBackend.build(&index, &rows, &gpair, &mut cpu));
-            for (g, c) in gpu.iter().zip(&cpu) {
-                assert_eq!(g.grad, c.grad, "grad mismatch at {n} rows");
-                assert_eq!(g.hess, c.hess, "hess mismatch at {n} rows");
-            }
+            assert_eq!(
+                gpu_hist(&backend, &index, &rows, &gpair),
+                cpu_hist(&index, &rows, &gpair),
+                "at {n} rows"
+            );
         }
     }
 

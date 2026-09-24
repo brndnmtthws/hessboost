@@ -1,5 +1,6 @@
 use super::{
-    LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION, scalar, sigmoid_scalar,
+    BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION, scalar,
+    sigmoid_scalar,
 };
 use crate::objective::GradPair;
 #[allow(
@@ -307,6 +308,8 @@ pub(super) unsafe fn count_le_16(cuts: &[f32], value: f32) -> usize {
     }
 }
 
+/// Vector-loop shell of a `&mut [f32]` unary inplace kernel: vector fast path
+/// for regular lanes, scalar per-lane fallback otherwise. The kernel and
 /// scalar formulas (intrinsics included) are passed in as expressions.
 macro_rules! unary_inplace_kernel {
     ($name:ident, $kernel:expr, $scalar:expr) => {
@@ -355,6 +358,17 @@ pub(super) unsafe fn logistic_gradient(
         let one = vdupq_n_f32(1.0);
         let scale = vdupq_n_f32(scale_pos_weight);
         let min_hess_vector = vdupq_n_f32(min_hess);
+        let scalar_range = |out: &mut [GradPair], range| {
+            scalar::logistic_gradient(
+                preds,
+                labels,
+                weights,
+                scale_pos_weight,
+                min_hess,
+                out,
+                range,
+            );
+        };
         let mut index = 0;
 
         while index + VECTOR_WIDTH <= preds.len() {
@@ -364,14 +378,7 @@ pub(super) unsafe fn logistic_gradient(
             gradient_guard!(
                 !regular_input(pred),
                 index,
-                scalar::logistic_gradient(
-                    preds,
-                    labels,
-                    weights,
-                    (scale_pos_weight, min_hess),
-                    out,
-                    index..index + VECTOR_WIDTH,
-                )
+                scalar_range(out, index..index + VECTOR_WIDTH)
             );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let probability = sigmoidq_f32(pred);
@@ -393,14 +400,7 @@ pub(super) unsafe fn logistic_gradient(
             index += VECTOR_WIDTH;
         }
 
-        scalar::logistic_gradient(
-            preds,
-            labels,
-            weights,
-            (scale_pos_weight, min_hess),
-            out,
-            index..preds.len(),
-        );
+        scalar_range(out, index..preds.len());
     }
 }
 
@@ -1066,8 +1066,7 @@ pub(super) unsafe fn log_loss_sum(
     // documented at each memory access below.
     unsafe {
         let one = vdupq_n_f64(1.0);
-        let lower = vdupq_n_f64(LOG_LOSS_EPSILON);
-        let upper = vdupq_n_f64(1.0 - LOG_LOSS_EPSILON);
+        let floor = vdupq_n_f64(BINARY_LOG_LOSS_EPSILON);
         let mut loss_low = vdupq_n_f64(0.0);
         let mut loss_high = vdupq_n_f64(0.0);
         let mut weight_low = vdupq_n_f64(0.0);
@@ -1085,23 +1084,26 @@ pub(super) unsafe fn log_loss_sum(
                 scalar::log_loss(preds, labels, weights, index..index + VECTOR_WIDTH)
             );
             let label = vld1q_f32(labels.as_ptr().add(index));
-            let probability_low =
-                vminq_f64(vmaxq_f64(vcvt_f64_f32(vget_low_f32(pred)), lower), upper);
-            let probability_high = vminq_f64(vmaxq_f64(vcvt_high_f64_f32(pred), lower), upper);
+            // XGBoost floors each log argument at ε separately and does not
+            // clamp the prediction into [0, 1]; the finite guard above makes
+            // both logs finite, so a zero label coefficient contributes 0
+            // exactly as upstream's `xlogy` branch does.
+            let probability_low = vcvt_f64_f32(vget_low_f32(pred));
+            let probability_high = vcvt_high_f64_f32(pred);
             let label_low = vcvt_f64_f32(vget_low_f32(label));
             let label_high = vcvt_high_f64_f32(label);
             let value_low = vnegq_f64(vaddq_f64(
-                vmulq_f64(label_low, logq_f64(probability_low)),
+                vmulq_f64(label_low, logq_f64(vmaxq_f64(probability_low, floor))),
                 vmulq_f64(
                     vsubq_f64(one, label_low),
-                    logq_f64(vsubq_f64(one, probability_low)),
+                    logq_f64(vmaxq_f64(vsubq_f64(one, probability_low), floor)),
                 ),
             ));
             let value_high = vnegq_f64(vaddq_f64(
-                vmulq_f64(label_high, logq_f64(probability_high)),
+                vmulq_f64(label_high, logq_f64(vmaxq_f64(probability_high, floor))),
                 vmulq_f64(
                     vsubq_f64(one, label_high),
-                    logq_f64(vsubq_f64(one, probability_high)),
+                    logq_f64(vmaxq_f64(vsubq_f64(one, probability_high), floor)),
                 ),
             ));
             accumulate_metric_sum!(
@@ -1219,8 +1221,6 @@ pub(super) unsafe fn tweedie_nloglik_sum(
         let minimum = vdupq_n_f64(MIN_POSITIVE_PREDICTION);
         let first_power = vdupq_n_f64(1.0 - rho);
         let second_power = vdupq_n_f64(2.0 - rho);
-        let first_denominator = vdupq_n_f64(1.0 - rho);
-        let second_denominator = vdupq_n_f64(2.0 - rho);
         let mut loss_low = vdupq_n_f64(0.0);
         let mut loss_high = vdupq_n_f64(0.0);
         let mut weight_low = vdupq_n_f64(0.0);
@@ -1235,12 +1235,7 @@ pub(super) unsafe fn tweedie_nloglik_sum(
                 pred,
                 index,
                 fallback,
-                super::tweedie_nloglik_sum_scalar(
-                    &preds[index..index + VECTOR_WIDTH],
-                    &labels[index..index + VECTOR_WIDTH],
-                    weights.map(|values| &values[index..index + VECTOR_WIDTH]),
-                    rho,
-                )
+                scalar::tweedie_nloglik(preds, labels, weights, rho, index..index + VECTOR_WIDTH)
             );
             let label = vld1q_f32(labels.as_ptr().add(index));
             let prediction_low = vmaxq_f64(vcvt_f64_f32(vget_low_f32(pred)), minimum);
@@ -1249,22 +1244,17 @@ pub(super) unsafe fn tweedie_nloglik_sum(
             let label_high = vcvt_high_f64_f32(label);
             let log_low = logq_f64(prediction_low);
             let log_high = logq_f64(prediction_high);
+            // `first_power` and `second_power` are also the denominators.
             let first_low = vdivq_f64(
                 vmulq_f64(label_low, expq_f64(vmulq_f64(first_power, log_low))),
-                first_denominator,
+                first_power,
             );
             let first_high = vdivq_f64(
                 vmulq_f64(label_high, expq_f64(vmulq_f64(first_power, log_high))),
-                first_denominator,
+                first_power,
             );
-            let second_low = vdivq_f64(
-                expq_f64(vmulq_f64(second_power, log_low)),
-                second_denominator,
-            );
-            let second_high = vdivq_f64(
-                expq_f64(vmulq_f64(second_power, log_high)),
-                second_denominator,
-            );
+            let second_low = vdivq_f64(expq_f64(vmulq_f64(second_power, log_low)), second_power);
+            let second_high = vdivq_f64(expq_f64(vmulq_f64(second_power, log_high)), second_power);
             let value_low = vsubq_f64(second_low, first_low);
             let value_high = vsubq_f64(second_high, first_high);
             accumulate_metric_sum!(
@@ -1280,12 +1270,7 @@ pub(super) unsafe fn tweedie_nloglik_sum(
             index += VECTOR_WIDTH;
         }
 
-        let tail = super::tweedie_nloglik_sum_scalar(
-            &preds[index..],
-            &labels[index..],
-            weights.map(|values| &values[index..]),
-            rho,
-        );
+        let tail = scalar::tweedie_nloglik(preds, labels, weights, rho, index..preds.len());
         finish_metric_sum!(
             loss_low,
             loss_high,
@@ -1331,11 +1316,12 @@ pub(super) unsafe fn multiclass_log_loss_sum(
                 probability,
                 index,
                 fallback,
-                super::multiclass_log_loss_sum_scalar(
-                    &preds[index * num_class..(index + VECTOR_WIDTH) * num_class],
-                    &labels[index..index + VECTOR_WIDTH],
-                    weights.map(|values| &values[index..index + VECTOR_WIDTH]),
+                scalar::multiclass_log_loss(
+                    preds,
+                    labels,
+                    weights,
                     num_class,
+                    index..index + VECTOR_WIDTH
                 )
             );
 
@@ -1361,12 +1347,8 @@ pub(super) unsafe fn multiclass_log_loss_sum(
             index += VECTOR_WIDTH;
         }
 
-        let tail = super::multiclass_log_loss_sum_scalar(
-            &preds[index * num_class..labels.len() * num_class],
-            &labels[index..],
-            weights.map(|values| &values[index..]),
-            num_class,
-        );
+        let tail =
+            scalar::multiclass_log_loss(preds, labels, weights, num_class, index..labels.len());
         finish_metric_sum!(
             loss_low,
             loss_high,

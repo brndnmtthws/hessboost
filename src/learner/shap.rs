@@ -1,230 +1,226 @@
-//! Exact per-prediction feature attributions via TreeSHAP.
+//! Per-prediction feature attributions via QuadratureTreeSHAP.
 //!
-//! This implements the path-dependent, exact TreeSHAP algorithm of Lundberg et
-//! al., *"Consistent Individualized Feature Attribution for Tree Ensembles"*,
-//! matching XGBoost's `pred_contribs=True`. For a single tree the returned
-//! per-feature values sum to `f_tree(x) - E[f_tree]`, where the expectation is
-//! taken over the tree's cover (Hessian) distribution. The missing offset
-//! `E[f_tree]` is folded into the bias term. Summed over the whole ensemble the
-//! contributions therefore satisfy the exact-additivity property
+//! This is a port of XGBoost 3.4's CPU `pred_contribs` / `pred_interactions`
+//! engine (`src/predictor/interpretability/{quadrature.h,shap.cc}`). It
+//! computes the path-dependent TreeSHAP values of Lundberg et al., where a
+//! feature's absence is modeled by the tree's cover (Hessian) distribution,
+//! but evaluates them as QuadratureTreeSHAP does: a Shapley value is the
+//! integral over the participation probability `p ∈ [0, 1]` of a
+//! weighted-Banzhaf polynomial, and that integral is taken with a fixed
+//! 8-point Gauss–Legendre rule after the endpoint substitution `p = s²`.
+//!
+//! One recursive walk visits both children of every split. Each node carries
+//! an 8-lane basis `c` (the path polynomial evaluated at the 8 quadrature
+//! nodes); a leaf returns `h = c · Π w · leaf · weight` lane-wise, and every
+//! return edge extracts its feature's contribution from the subtree's `h`.
+//! A feature that repeats on a path overwrites (and afterwards restores) its
+//! probability rather than entering as a second player. The rule is exact
+//! for paths with at most 7 distinct features; longer paths are a quadrature
+//! approximation, identical to XGBoost's.
+//!
+//! Arithmetic follows upstream: the rule is generated in `f64` and stored as
+//! `f32`, the recurrence and all accumulation are `f32` in XGBoost's operation
+//! order, and each tree's cover-weighted expected value is summed in `f64` and
+//! rounded once (bottom-up for scalar trees, top-down over the leaf vectors
+//! for vector-leaf trees, as upstream). One deliberate deviation: when a
+//! repeated feature's basis update overflows `f32` before its old factor is
+//! divided out, that lane is redone in `f64`, so a representable basis stays
+//! finite where XGBoost's temporary overflows into `NaN` attributions.
+//! Summed over the ensemble the contributions satisfy
 //!
 //! ```text
 //! Σ_j contribs[j] + bias == margin(x)
 //! ```
 //!
-//! where `bias == base_score[k] + Σ_tree E[f_tree]` for output `k` and
-//! `margin(x)` is the model's raw margin ([`BoostedModel::predict_margin`]).
-//!
-//! The core recursion is the standard `O(T · L · D²)` algorithm (`T` trees, `L`
-//! leaves, `D` maximum depth): each root-to-leaf traversal maintains the set of
-//! unique features seen so far together with their `zero`/`one` fractions and a
-//! permutation weight, using the EXTEND / UNWIND operations to add and remove
-//! features as the path forks.
+//! up to `f32` rounding, where `bias == base_score[k] + Σ_tree E[f_tree]` for
+//! output `k` and `margin(x)` is [`BoostedModel::predict_margin`].
 
 use crate::data::DMatrix;
-use crate::error::Result;
+use crate::error::{HessboostError, Result};
 use crate::learner::model::{BoostedModel, RowBlock};
-use crate::tree::RegTree;
+use crate::tree::{RegTree, in_category_set};
 use rayon::prelude::*;
+use std::sync::LazyLock;
 
-/// One element of a decision path: a unique feature together with the fraction
-/// of permutations in which it is "one" (present / in the coalition) and "zero"
-/// (absent), plus the accumulated proportion of subset weights (`pweight`).
-#[derive(Clone, Copy, Default)]
-struct PathElement {
-    /// Feature index for this path element, or `-1` for the root placeholder.
-    feature_index: i64,
-    /// Fraction of paths that flow through the "zero" (absent) branch.
-    zero_fraction: f64,
-    /// Fraction of paths that flow through the "one" (present) branch.
-    one_fraction: f64,
-    /// Accumulated proportion of the subset weights for this element.
-    pweight: f64,
+/// Quadrature points (XGBoost's `kQuadratureTreeShapPoints`).
+const POINTS: usize = 8;
+/// Path probability of a feature that is not yet on the current path.
+const UNSEEN: f32 = -999.0;
+/// Floor for a child's cover fraction, so zero-cover branches stay reachable.
+const MIN_BRANCH_WEIGHT: f32 = 1e-12;
+
+/// One value per quadrature node.
+type Lanes = [f32; POINTS];
+
+/// The endpoint Gauss–Legendre rule: `∫₀¹ g(u) du ≈ Σ weights[i] · g(nodes[i])`.
+struct QuadratureRule {
+    nodes: Lanes,
+    weights: Lanes,
 }
 
-/// `1 / n` for the small integers that appear as path positions. f64 division
-/// dominates TreeSHAP's inner loops, so the integer reciprocals are tabulated
-/// and the data-dependent ones hoisted out of the loops.
-const INV_LEN: usize = 128;
-const INV: [f64; INV_LEN] = {
-    let mut table = [0.0f64; INV_LEN];
-    let mut i = 1;
-    while i < INV_LEN {
-        table[i] = 1.0 / i as f64;
-        i += 1;
+/// Legendre polynomial `P_n(x)` by the three-term recurrence.
+fn legendre(n: usize, x: f64) -> f64 {
+    let mut p0 = 1.0;
+    if n == 0 {
+        return p0;
     }
-    table
-};
-
-#[inline(always)]
-fn inv(n: usize) -> f64 {
-    if n < INV_LEN { INV[n] } else { 1.0 / n as f64 }
+    let mut p1 = x;
+    for k in 2..=n {
+        let k = k as f64;
+        let pk = ((2.0 * k - 1.0) * x * p1 - (k - 1.0) * p0) / k;
+        p0 = p1;
+        p1 = pk;
+    }
+    p1
 }
 
-/// `n as f64` for path positions. Going through `i64` lets the compiler emit a
-/// single signed conversion instead of the unsigned fix-up sequence. The value
-/// is identical for every `n` that fits.
-#[inline(always)]
-fn small_f64(n: usize) -> f64 {
-    n as i64 as f64
+/// `P_n'(x)` given `pn = P_n(x)`.
+fn legendre_derivative(n: usize, x: f64, pn: f64) -> f64 {
+    n as f64 * (x * pn - legendre(n - 1, x)) / (x * x - 1.0)
 }
-/// Grow the decision path `path[..len]` by one element (`path[len]`), updating
-/// every existing element's `pweight` to account for one extra split in the
-/// coalition ordering.
-fn extend_path(
-    path: &mut [PathElement],
-    len: usize,
-    zero_fraction: f64,
-    one_fraction: f64,
-    feature_index: i64,
-) {
-    let unique_depth = len; // index the new element will occupy
-    path[unique_depth] = PathElement {
-        feature_index,
-        zero_fraction,
-        one_fraction,
-        pweight: if unique_depth == 0 { 1.0 } else { 0.0 },
+
+/// XGBoost's `MakeEndpointQuadrature`: Newton-refined Gauss–Legendre roots
+/// `x` on `[-1, 1]`, mapped to `s = (x + 1) / 2` on `[0, 1]` and substituted
+/// `u = s²` (so `du = 2s ds`), stored in increasing node order.
+fn endpoint_quadrature() -> QuadratureRule {
+    let mut rule = QuadratureRule {
+        nodes: [0.0; POINTS],
+        weights: [0.0; POINTS],
     };
-    let inv_denom = inv(unique_depth + 1);
-    let one_scaled = one_fraction * inv_denom;
-    let zero_scaled = zero_fraction * inv_denom;
-    if one_fraction == 0.0 {
-        // Cold edge: the new element takes no weight from its predecessors
-        // (the `one_scaled` term is exactly zero).
-        for i in (0..unique_depth).rev() {
-            path[i].pweight = zero_scaled * path[i].pweight * small_f64(unique_depth - i);
+    let n = POINTS as f64;
+    for i in 0..POINTS {
+        let theta = std::f64::consts::PI * (i as f64 + 0.75) / (n + 0.5);
+        let mut x = theta.cos();
+        for _ in 0..64 {
+            let pn = legendre(POINTS, x);
+            let dx = pn / legendre_derivative(POINTS, x, pn);
+            x -= dx;
+            if dx.abs() < 1e-15 {
+                break;
+            }
         }
-        return;
+        let pn = legendre(POINTS, x);
+        let dpn = legendre_derivative(POINTS, x, pn);
+        let w = 2.0 / ((1.0 - x * x) * dpn * dpn);
+        #[allow(
+            clippy::manual_midpoint,
+            reason = "XGBoost rounds the sum, then halves"
+        )]
+        let s = 0.5 * (x + 1.0);
+        let ws = 0.5 * w;
+        rule.nodes[POINTS - 1 - i] = (s * s) as f32;
+        rule.weights[POINTS - 1 - i] = (2.0 * s * ws) as f32;
     }
-    for i in (0..unique_depth).rev() {
-        let pw_i = path[i].pweight;
-        path[i + 1].pweight += one_scaled * pw_i * small_f64(i + 1);
-        path[i].pweight = zero_scaled * pw_i * small_f64(unique_depth - i);
+    rule
+}
+
+static RULE: LazyLock<QuadratureRule> = LazyLock::new(endpoint_quadrature);
+
+/// `a * b + c` rounded the way XGBoost 3.4.2's release builds round it. Its
+/// C++ compilers contract such expressions into one fused multiply-add where
+/// the target baseline has FMA: aarch64 builds (GCC on Linux, Clang on macOS)
+/// fuse, while `x86_64` wheels target a baseline without FMA and do not.
+#[inline(always)]
+fn madd(a: f32, b: f32, c: f32) -> f32 {
+    if cfg!(target_arch = "aarch64") {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
     }
 }
 
-/// Undo a previous [`extend_path`] on `path` (a full path of `path.len()`
-/// elements), removing the element at `path_index` and restoring the `pweight`s
-/// of the remaining elements. The path afterwards occupies `path[..len - 1]`.
-fn unwind_path(path: &mut [PathElement], path_index: usize) {
-    let unique_depth = path.len() - 1; // top index
-    let one_fraction = path[path_index].one_fraction;
-    let zero_fraction = path[path_index].zero_fraction;
-    let denom = small_f64(unique_depth + 1);
-    let inv_denom = inv(unique_depth + 1);
-    if one_fraction != 0.0 {
-        let mut next_one_portion = path[unique_depth].pweight;
-        // `x / 1.0 == x` exactly; every hot element carries the root's `1.0`.
-        let scale = if one_fraction == 1.0 {
-            denom
-        } else {
-            denom / one_fraction
-        };
-        let decay = scale * (zero_fraction * inv_denom);
-        for i in (0..unique_depth).rev() {
-            let inv_i = inv(i + 1);
-            let tmp = path[i].pweight;
-            path[i].pweight = next_one_portion * (scale * inv_i);
-            next_one_portion = tmp - next_one_portion * (decay * inv_i * (unique_depth - i) as f64);
-        }
-    } else if zero_fraction != 0.0 {
-        let scale = denom / zero_fraction;
-        for i in (0..unique_depth).rev() {
-            path[i].pweight *= scale * inv(unique_depth - i);
-        }
-    }
-    for i in path_index..unique_depth {
-        path[i].feature_index = path[i + 1].feature_index;
-        path[i].zero_fraction = path[i + 1].zero_fraction;
-        path[i].one_fraction = path[i + 1].one_fraction;
+/// [`madd`] in `f64`.
+#[inline(always)]
+fn madd64(a: f64, b: f64, c: f64) -> f64 {
+    if cfg!(target_arch = "aarch64") {
+        a.mul_add(b, c)
+    } else {
+        a * b + c
     }
 }
 
-/// Maximum number of hot leaf elements whose unwound sums are computed
-/// together in lockstep.
-const HOT_LANES: usize = 4;
-
-/// Add the leaf contributions of the hot (`one_fraction != 0`) path elements
-/// `hot[..n]` to `phi`, `n <= HOT_LANES`. The lane count is monomorphized so
-/// the recurrences live in registers and no lane is wasted.
-fn add_hot_contributions(
-    path: &[PathElement],
-    hot: &[usize; HOT_LANES],
-    n: usize,
-    leaf: f64,
-    condition_fraction: f64,
-    phi: &mut [f64],
-) {
-    match n {
-        1 => hot_lanes::<1>(path, hot, leaf, condition_fraction, phi),
-        2 => hot_lanes::<2>(path, hot, leaf, condition_fraction, phi),
-        3 => hot_lanes::<3>(path, hot, leaf, condition_fraction, phi),
-        _ => hot_lanes::<HOT_LANES>(path, hot, leaf, condition_fraction, phi),
+/// Probability of following a child: its cover fraction, `0.5` under a
+/// coverless parent, floored at [`MIN_BRANCH_WEIGHT`].
+fn branch_weight(cover: f32, parent_cover: f32) -> f32 {
+    if parent_cover <= 0.0 {
+        return 0.5;
+    }
+    let weight = cover / parent_cover;
+    if weight < MIN_BRANCH_WEIGHT {
+        MIN_BRANCH_WEIGHT
+    } else {
+        weight
     }
 }
 
-/// Each element's weight is the total its unwinding would contribute,
-/// `Σ_i next_i * scale / (i + 1)` where
-/// `next_i = pw_i - next_{i+1} * scale / (i + 1) * zero / (D + 1) * (D - i)`.
-/// That is a serial recurrence, so the `N` lanes are evaluated in lockstep to
-/// overlap the chains. The coefficient of `next_{i+1}` is gathered off the
-/// dependency chain so each step is one multiply-subtract. `one_fraction` is
-/// `1.0` for every hot element the traversal produces (it only ever carries the
-/// root's `1.0` forward), so the division is skipped. The result is identical.
-fn hot_lanes<const N: usize>(
-    path: &[PathElement],
-    hot: &[usize; HOT_LANES],
-    leaf: f64,
-    condition_fraction: f64,
-    phi: &mut [f64],
-) {
-    let unique_depth = path.len() - 1; // top index
-    let denom = small_f64(unique_depth + 1);
-    let inv_denom = inv(unique_depth + 1);
-    let top = path[unique_depth].pweight;
-    let mut scale = [0.0f64; N];
-    let mut decay = [0.0f64; N];
-    let mut next = [top; N];
-    let mut total = [0.0f64; N];
-    for k in 0..N {
-        let el = &path[hot[k]];
-        scale[k] = if el.one_fraction == 1.0 {
-            denom
-        } else {
-            denom / el.one_fraction
-        };
-        decay[k] = scale[k] * (el.zero_fraction * inv_denom);
-    }
-    for i in (0..unique_depth).rev() {
-        let inv_i = inv(i + 1);
-        let remaining = small_f64(unique_depth - i);
-        let pw = path[i].pweight;
-        for k in 0..N {
-            total[k] += next[k] * (scale[k] * inv_i);
-            next[k] = pw - next[k] * (decay[k] * inv_i * remaining);
+/// Contribution of one return edge whose feature entered the subtree with
+/// probability `p_enter` and had `p_exit` above it (`1.0` = not on the path).
+fn edge_delta(rule: &QuadratureRule, h: &Lanes, p_enter: f32, p_exit: f32) -> f32 {
+    let mut acc = 0.0f32;
+    if p_enter != 1.0 {
+        let alpha = p_enter - 1.0;
+        for (&hi, &u) in h.iter().zip(&rule.nodes) {
+            acc += alpha * hi / madd(alpha, u, 1.0);
         }
     }
-    for k in 0..N {
-        let el = path[hot[k]];
-        phi[el.feature_index as usize] +=
-            total[k] * (el.one_fraction - el.zero_fraction) * leaf * condition_fraction;
+    if p_exit != 1.0 {
+        let alpha = p_exit - 1.0;
+        for (&hi, &u) in h.iter().zip(&rule.nodes) {
+            acc -= alpha * hi / madd(alpha, u, 1.0);
+        }
     }
+    acc
 }
 
-/// Number of [`PathElement`]s a traversal of a tree of depth `depth` needs:
-/// the path at tree level `d` holds at most `d + 1` elements and every level
-/// owns its own region, so the regions sum to `(D + 1)(D + 2) / 2` for the
-/// deepest level `D`.
-fn arena_len(depth: usize) -> usize {
-    (depth + 1) * (depth + 2) / 2
+/// The per-lane factor `α_enter / (1 + α_enter·u) - α_exit / (1 + α_exit·u)`
+/// of a return edge, shared by every [`interaction_delta`] of that edge.
+fn edge_factors(rule: &QuadratureRule, p_enter: f32, p_exit: f32) -> Lanes {
+    let alpha_enter = p_enter - 1.0;
+    let mut edge = [0.0; POINTS];
+    if p_exit == 1.0 {
+        for (e, &u) in edge.iter_mut().zip(&rule.nodes) {
+            *e = alpha_enter / madd(alpha_enter, u, 1.0);
+        }
+    } else {
+        let alpha_exit = p_exit - 1.0;
+        for (e, &u) in edge.iter_mut().zip(&rule.nodes) {
+            *e = alpha_enter / madd(alpha_enter, u, 1.0) - alpha_exit / madd(alpha_exit, u, 1.0);
+        }
+    }
+    edge
 }
 
-/// [`RegTree`] node marker for "no child".
+/// The part of [`edge_delta`] attributable to a path partner currently
+/// entered with probability `q`, given the edge's [`edge_factors`].
+fn interaction_delta(rule: &QuadratureRule, h: &Lanes, edge: &Lanes, q: f32) -> f32 {
+    if q == 1.0 {
+        return 0.0;
+    }
+    let alpha_q = q - 1.0;
+    let mut acc = 0.0f32;
+    for ((&hi, &e), &u) in h.iter().zip(edge).zip(&rule.nodes) {
+        acc += alpha_q * hi * e / madd(alpha_q, u, 1.0);
+    }
+    acc
+}
+
+/// [`ShapNode::first`] marker for a leaf.
 const NO_CHILD: u32 = u32::MAX;
 
-/// A tree node with everything TreeSHAP reads per visit precomputed: the
-/// child cover ratio (`sum_hess / parent sum_hess`, which the recursion would
-/// otherwise divide out at every visit) and the leaf value widened to `f64`.
+/// A split's children in XGBoost's order. XGBoost routes a categorical split's
+/// category set right, hessboost routes it left, so the importer swaps those
+/// children. Walking them in XGBoost's order keeps every accumulation in
+/// XGBoost's sequence.
+fn xgboost_children(node: &crate::tree::Node) -> (usize, usize) {
+    let (left, right) = (node.left as usize, node.right as usize);
+    if node.is_categorical {
+        (right, left)
+    } else {
+        (left, right)
+    }
+}
+
+/// A tree node with its routing data and both child branch weights.
 #[derive(Clone, Copy)]
 struct ShapNode {
     feature: u32,
@@ -233,343 +229,431 @@ struct ShapNode {
     is_categorical: bool,
     cat_begin: u32,
     cat_end: u32,
-    /// Left child, or [`NO_CHILD`] for a leaf.
-    left: u32,
-    right: u32,
-    /// This node's cover divided by its parent's (`0.0` when the parent has
-    /// no cover, unused for the root).
-    cover_fraction: f64,
+    /// XGBoost's left child (see [`xgboost_children`]), or [`NO_CHILD`] for a
+    /// leaf.
+    first: u32,
+    second: u32,
+    first_weight: f32,
+    second_weight: f32,
     /// Leaf value (`0.0` for internal nodes).
-    value: f64,
+    value: f32,
 }
 
-/// A [`RegTree`] prepared for TreeSHAP traversals.
+/// A [`RegTree`] prepared for QuadratureTreeSHAP walks.
 struct ShapTree {
     nodes: Vec<ShapNode>,
     categories: Vec<u32>,
-    depth: usize,
+    /// Distinct split features, the only columns a walk can write.
+    features: Vec<u32>,
+}
+
+/// Cover-weighted expected output of the subtree at `nid`, in `f64`
+/// (XGBoost's `FillRootMeanValue`). A coverless split averages its children.
+fn root_mean_value(tree: &RegTree, nid: usize) -> f64 {
+    let node = tree.node(nid);
+    if node.is_leaf() {
+        return f64::from(node.leaf_value);
+    }
+    let (l, r) = xgboost_children(node);
+    let left_mean = root_mean_value(tree, l);
+    let right_mean = root_mean_value(tree, r);
+    if node.sum_hess == 0.0 {
+        #[allow(
+            clippy::manual_midpoint,
+            reason = "XGBoost rounds the sum, then halves"
+        )]
+        return 0.5 * (left_mean + right_mean);
+    }
+    let right_part = right_mean * f64::from(tree.node(r).sum_hess);
+    madd64(left_mean, f64::from(tree.node(l).sum_hess), right_part) / f64::from(node.sum_hess)
+}
+
+/// Adds `path_weight ×` the cover-weighted expected leaf vector of vector-leaf
+/// subtree `nid` to `out`, one value per output (XGBoost's
+/// `FillRootMeanValues`): top-down, each leaf's vector enters scaled by its
+/// path's product of cover fractions, in depth-first leaf order. A coverless
+/// split halves the path weight of both children.
+fn root_mean_values(tree: &RegTree, nid: usize, path_weight: f64, out: &mut [f64]) {
+    let node = tree.node(nid);
+    if node.is_leaf() {
+        for (o, &v) in out.iter_mut().zip(tree.leaf_vector(nid)) {
+            *o = madd64(path_weight, f64::from(v), *o);
+        }
+        return;
+    }
+    let (l, r) = xgboost_children(node);
+    if node.sum_hess == 0.0 {
+        root_mean_values(tree, l, path_weight * 0.5, out);
+        root_mean_values(tree, r, path_weight * 0.5, out);
+    } else {
+        let parent = f64::from(node.sum_hess);
+        let left = path_weight * f64::from(tree.node(l).sum_hess) / parent;
+        root_mean_values(tree, l, left, out);
+        let right = path_weight * f64::from(tree.node(r).sum_hess) / parent;
+        root_mean_values(tree, r, right, out);
+    }
 }
 
 impl ShapTree {
-    fn from_tree(tree: &RegTree) -> Self {
+    fn from_tree(tree: &RegTree) -> Result<Self> {
         let src = tree.nodes();
-        let mut nodes: Vec<ShapNode> = src
-            .iter()
-            .map(|n| ShapNode {
+        let mut features = Vec::new();
+        let mut nodes = Vec::with_capacity(src.len());
+        for n in src {
+            let mut node = ShapNode {
                 feature: n.split_feature,
                 cond: n.split_cond,
                 default_left: n.default_left,
                 is_categorical: n.is_categorical,
                 cat_begin: n.cat_begin,
                 cat_end: n.cat_end,
-                left: if n.is_leaf() { NO_CHILD } else { n.left as u32 },
-                right: if n.is_leaf() {
-                    NO_CHILD
-                } else {
-                    n.right as u32
-                },
-                cover_fraction: 0.0,
-                value: if n.is_leaf() {
-                    f64::from(n.leaf_value)
-                } else {
-                    0.0
-                },
-            })
-            .collect();
-        let mut depth = 0;
-        let mut stack = vec![(0usize, 0usize)];
-        while let Some((nid, d)) = stack.pop() {
-            depth = depth.max(d);
-            let n = &src[nid];
-            if n.is_leaf() {
-                continue;
+                first: NO_CHILD,
+                second: NO_CHILD,
+                first_weight: 0.0,
+                second_weight: 0.0,
+                value: n.leaf_value,
+            };
+            if !n.is_leaf() {
+                let (l, r) = xgboost_children(n);
+                let (left, right) = (&src[l], &src[r]);
+                // `!(x >= 0)` also rejects NaN, as XGBoost's `CHECK_GE` does.
+                if !(n.sum_hess >= 0.0 && left.sum_hess >= 0.0 && right.sum_hess >= 0.0) {
+                    return Err(HessboostError::model_format(
+                        "QuadratureTreeSHAP is undefined for trees with negative node cover",
+                    ));
+                }
+                node.first = l as u32;
+                node.second = r as u32;
+                node.first_weight = branch_weight(left.sum_hess, n.sum_hess);
+                node.second_weight = branch_weight(right.sum_hess, n.sum_hess);
+                node.value = 0.0;
+                features.push(n.split_feature);
             }
-            let cover = f64::from(n.sum_hess);
-            for child in [n.left as usize, n.right as usize] {
-                nodes[child].cover_fraction = if cover > 0.0 {
-                    f64::from(src[child].sum_hess) / cover
-                } else {
-                    0.0
-                };
-                stack.push((child, d + 1));
-            }
+            nodes.push(node);
         }
-        ShapTree {
+        features.sort_unstable();
+        features.dedup();
+        Ok(ShapTree {
             nodes,
             categories: tree.categories().to_vec(),
-            depth,
+            features,
+        })
+    }
+}
+
+/// How return edges are written: additive contributions or interactions.
+trait Formulation {
+    /// Enter the child of a split on `feature` with path probability `p`.
+    fn push(&mut self, feature: u32, p: f32);
+    /// Leave the child entered by the matching [`Formulation::push`].
+    fn pop(&mut self);
+    /// Record the return edge of `feature` given the subtree return `h`.
+    fn on_return(
+        &mut self,
+        rule: &QuadratureRule,
+        feature: u32,
+        h: &Lanes,
+        p_enter: f32,
+        p_exit: f32,
+    );
+}
+
+/// Additive SHAP: one feature contribution per return edge.
+struct Additive<'a> {
+    phi: &'a mut [f32],
+}
+
+impl Formulation for Additive<'_> {
+    #[inline(always)]
+    fn push(&mut self, _feature: u32, _p: f32) {}
+
+    #[inline(always)]
+    fn pop(&mut self) {}
+
+    #[inline(always)]
+    fn on_return(
+        &mut self,
+        rule: &QuadratureRule,
+        feature: u32,
+        h: &Lanes,
+        p_enter: f32,
+        p_exit: f32,
+    ) {
+        self.phi[feature as usize] += edge_delta(rule, h, p_enter, p_exit);
+    }
+}
+
+/// [`PathEntry::prev`] marker: no earlier occurrence of the feature.
+const NO_ENTRY: u32 = u32::MAX;
+
+/// One split on the live root-to-node path.
+#[derive(Clone, Copy)]
+struct PathEntry {
+    feature: u32,
+    p: f32,
+    /// Index of this feature's previous occurrence on the path.
+    prev: u32,
+    /// A later occurrence of the same feature hides this one from partners.
+    shadowed: bool,
+}
+
+/// SHAP interactions: every return edge also pairs its feature with each
+/// other distinct feature on the live path (newest occurrence wins). The
+/// directed pair effects land in `matrix[feature][partner]`; additive effects
+/// accumulate into `diag`. Both are scaled by the tree weight.
+struct Interaction<'a> {
+    path: &'a mut Vec<PathEntry>,
+    /// Per-feature index of its newest path entry, [`NO_ENTRY`] if absent.
+    last: &'a mut [u32],
+    diag: &'a mut [f32],
+    matrix: &'a mut [f32],
+    width: usize,
+    scale: f32,
+}
+
+impl Formulation for Interaction<'_> {
+    fn push(&mut self, feature: u32, p: f32) {
+        let prev = self.last[feature as usize];
+        if prev != NO_ENTRY {
+            self.path[prev as usize].shadowed = true;
+        }
+        self.last[feature as usize] = self.path.len() as u32;
+        self.path.push(PathEntry {
+            feature,
+            p,
+            prev,
+            shadowed: false,
+        });
+    }
+
+    fn pop(&mut self) {
+        let entry = self.path.pop().expect("pop follows a push");
+        self.last[entry.feature as usize] = entry.prev;
+        if entry.prev != NO_ENTRY {
+            self.path[entry.prev as usize].shadowed = false;
+        }
+    }
+
+    fn on_return(
+        &mut self,
+        rule: &QuadratureRule,
+        feature: u32,
+        h: &Lanes,
+        p_enter: f32,
+        p_exit: f32,
+    ) {
+        let f = feature as usize;
+        self.diag[f] = madd(
+            self.scale,
+            edge_delta(rule, h, p_enter, p_exit),
+            self.diag[f],
+        );
+        // The current split is the path's last entry and shadows the older
+        // occurrences of its own feature, so every unshadowed entry before it
+        // is a distinct partner.
+        let (_, partners) = self.path.split_last().expect("return follows a push");
+        if partners.is_empty() {
+            return;
+        }
+        let edge = edge_factors(rule, p_enter, p_exit);
+        let row = &mut self.matrix[f * self.width..(f + 1) * self.width];
+        for partner in partners.iter().rev().filter(|e| !e.shadowed) {
+            let pair = interaction_delta(rule, h, &edge, partner.p);
+            let cell = &mut row[partner.feature as usize];
+            *cell = madd(self.scale, pair, *cell);
         }
     }
 }
 
-/// Per-instance TreeSHAP traversal state shared by the plain and conditioned
-/// walks: the tree, the instance's dense feature row (`NaN` = missing), the
-/// contribution accumulator, and the conditioning mode.
-struct Walk<'a> {
+/// One QuadratureTreeSHAP walk of a tree for a dense row (`NaN` = missing).
+/// `path_prob` holds [`UNSEEN`] for every feature on entry and on exit.
+struct Walk<'a, F> {
     tree: &'a ShapTree,
     row: &'a [f32],
-    phi: &'a mut [f64],
-    /// `0`: ordinary contributions. `+1`: `condition_feature` fixed present
-    /// (in the coalition). `-1`: fixed absent.
-    condition: i32,
-    condition_feature: i64,
+    rule: &'a QuadratureRule,
+    path_prob: &'a mut [f32],
+    form: F,
 }
 
-/// Recursive TreeSHAP traversal of a single tree, accumulating per-feature
-/// contributions into `walk.phi`.
-///
-/// `arena` is scratch for this node's decision path and every level below it:
-/// its first `level + 1` elements are this node's region, holding the parent's
-/// path in `arena[..parent_len]` on entry (copied by the caller, so the path
-/// can be forked at each internal node without allocating). `condition_fraction`
-/// is the running weight carried down the tree by the conditioning (it starts
-/// at `1.0`). When conditioning is active the `condition_feature` is never
-/// entered into the decision path, so it receives no attribution of its own.
-/// The half-difference of the `+1` and `-1` runs yields the interaction of
-/// `condition_feature` with every other feature.
-#[allow(clippy::too_many_arguments)]
-fn tree_shap_rec(
-    walk: &mut Walk<'_>,
-    node_index: usize,
-    arena: &mut [PathElement],
-    level: usize,
-    parent_len: usize,
-    parent_zero_fraction: f64,
-    parent_one_fraction: f64,
-    parent_feature_index: i64,
-    condition_fraction: f64,
-) {
-    // No weight flows down this branch under the conditioning: nothing to do.
-    if condition_fraction == 0.0 {
-        return;
+impl<F: Formulation> Walk<'_, F> {
+    fn run(mut self) {
+        if self.tree.nodes[0].first == NO_CHILD {
+            return;
+        }
+        let mut h = [0.0; POINTS];
+        self.node(0, &[1.0; POINTS], 1.0, &mut h);
     }
-    let (path, rest) = arena.split_at_mut(level + 1);
-    let mut len = parent_len;
 
-    // Extend the path with the parent split, unless we are conditioning on the
-    // parent feature (in which case it is deliberately kept off the path).
-    if walk.condition == 0 || walk.condition_feature != parent_feature_index {
-        extend_path(
-            path,
-            len,
-            parent_zero_fraction,
-            parent_one_fraction,
-            parent_feature_index,
+    /// Walk the subtree at `nid` with basis `c` and path cover product
+    /// `w_prod`, writing its weighted return into `out`.
+    fn node(&mut self, nid: usize, c: &Lanes, w_prod: f32, out: &mut Lanes) {
+        let node = self.tree.nodes[nid];
+        if node.first == NO_CHILD {
+            let scale = w_prod * node.value;
+            for i in 0..POINTS {
+                out[i] = c[i] * scale * self.rule.weights[i];
+            }
+            return;
+        }
+        // Route with hessboost's orientation, then map onto XGBoost's order.
+        let v = self.row[node.feature as usize];
+        let goes_left = if v.is_nan() {
+            node.default_left
+        } else if node.is_categorical {
+            in_category_set(
+                &self.tree.categories[node.cat_begin as usize..node.cat_end as usize],
+                v,
+            )
+        } else {
+            v < node.cond
+        };
+        let goes_first = goes_left != node.is_categorical;
+        let mut second = [0.0; POINTS];
+        let (a, b) = (node.first as usize, node.second as usize);
+        self.child(
+            node.feature,
+            a,
+            node.first_weight,
+            goes_first,
+            c,
+            w_prod,
+            out,
         );
-        len += 1;
+        self.child(
+            node.feature,
+            b,
+            node.second_weight,
+            !goes_first,
+            c,
+            w_prod,
+            &mut second,
+        );
+        for i in 0..POINTS {
+            out[i] += second[i];
+        }
     }
-    let tree = walk.tree;
-    let node = &tree.nodes[node_index];
-    let unique_depth = len - 1;
 
-    if node.left == NO_CHILD {
-        let leaf = node.value;
-        let path = &path[..len];
-        // For an element with `one_fraction == 0`, `unwound_path_sum` is
-        // `(D + 1) / zero_fraction * Σ_j pweight_j / (D - j)` and the leaf
-        // factor `(one - zero)` is `-zero_fraction`, so the fraction cancels:
-        // every such element contributes the same `-(D + 1) * Σ * leaf`. It is
-        // computed once per leaf and added for each of them (most elements: a
-        // leaf shares hot edges with the instance's own path only along their
-        // common prefix). Elements with both fractions zero contribute nothing.
-        // The hot elements' sums are serial recurrences, so they are evaluated
-        // `HOT_LANES` at a time to overlap the chains.
-        let mut cold = None;
-        let mut hot = [0usize; HOT_LANES];
-        let mut n_hot = 0;
-        for i in 1..=unique_depth {
-            let el = path[i];
-            if el.one_fraction != 0.0 {
-                hot[n_hot] = i;
-                n_hot += 1;
-                if n_hot == HOT_LANES {
-                    add_hot_contributions(path, &hot, n_hot, leaf, condition_fraction, walk.phi);
-                    n_hot = 0;
+    #[allow(clippy::too_many_arguments)]
+    fn child(
+        &mut self,
+        feature: u32,
+        child: usize,
+        weight: f32,
+        satisfies: bool,
+        c: &Lanes,
+        w_prod: f32,
+        out: &mut Lanes,
+    ) {
+        let rule = self.rule;
+        let p_old = self.path_prob[feature as usize];
+        let seen = p_old != UNSEEN;
+        let p_enter = match (satisfies, seen) {
+            (false, _) => 0.0,
+            (true, false) => 1.0 / weight,
+            (true, true) => p_old / weight,
+        };
+        let mut c_child = *c;
+        let alpha = p_enter - 1.0;
+        for (ci, &u) in c_child.iter_mut().zip(&rule.nodes) {
+            *ci *= madd(alpha, u, 1.0);
+        }
+        if seen {
+            let alpha_old = p_old - 1.0;
+            if alpha_old != 0.0 {
+                for ((ci, &u), &c0) in c_child.iter_mut().zip(&rule.nodes).zip(c) {
+                    let old = madd(alpha_old, u, 1.0);
+                    *ci = if ci.is_finite() {
+                        *ci / old
+                    } else {
+                        // The f32 product overflowed before dividing out the
+                        // overwritten factor; the quotient may still be
+                        // finite, so redo this lane in f64.
+                        let enter = madd(alpha, u, 1.0);
+                        (f64::from(c0) * f64::from(enter) / f64::from(old)) as f32
+                    };
                 }
-            } else if el.zero_fraction != 0.0 {
-                let c = *cold.get_or_insert_with(|| {
-                    let denom = small_f64(unique_depth + 1);
-                    let mut sum = 0.0;
-                    for j in (0..unique_depth).rev() {
-                        sum += path[j].pweight * inv(unique_depth - j);
-                    }
-                    -(sum * denom) * leaf * condition_fraction
-                });
-                walk.phi[el.feature_index as usize] += c;
             }
         }
-        if n_hot > 0 {
-            add_hot_contributions(path, &hot, n_hot, leaf, condition_fraction, walk.phi);
-        }
-        return;
+        self.path_prob[feature as usize] = p_enter;
+        self.form.push(feature, p_enter);
+        self.node(child, &c_child, w_prod * weight, out);
+        let p_exit = if seen { p_old } else { 1.0 };
+        self.form.on_return(rule, feature, out, p_enter, p_exit);
+        self.form.pop();
+        self.path_prob[feature as usize] = p_old;
     }
-
-    // Route the instance to determine the "hot" (taken) and "cold" child.
-    let split = node.feature;
-    let v = walk.row[split as usize];
-    let go_left = if v.is_nan() {
-        node.default_left
-    } else if node.is_categorical {
-        tree.categories[node.cat_begin as usize..node.cat_end as usize].contains(&(v as u32))
-    } else {
-        v < node.cond
-    };
-    let (hot, cold) = if go_left {
-        (node.left as usize, node.right as usize)
-    } else {
-        (node.right as usize, node.left as usize)
-    };
-
-    // Cover-based child weights: hot/cold fraction = child_cover / node_cover.
-    let hot_zero = tree.nodes[hot].cover_fraction;
-    let cold_zero = tree.nodes[cold].cover_fraction;
-
-    // If this feature is already on the path, unwind it first so it is not
-    // double-counted, carrying its incoming fractions forward.
-    let split_i = i64::from(split);
-    let mut incoming_zero = 1.0;
-    let mut incoming_one = 1.0;
-    let found = path[1..len]
-        .iter()
-        .position(|e| e.feature_index == split_i)
-        .map(|p| p + 1);
-    if let Some(pi) = found {
-        incoming_zero = path[pi].zero_fraction;
-        incoming_one = path[pi].one_fraction;
-        unwind_path(&mut path[..len], pi);
-        len -= 1;
-    }
-
-    // Split the conditioning weight between the two children. When we condition
-    // the split feature present, all weight follows the hot (taken) branch; when
-    // we condition it absent, each branch keeps only its cover fraction.
-    let mut hot_condition_fraction = condition_fraction;
-    let mut cold_condition_fraction = condition_fraction;
-    if walk.condition > 0 && split_i == walk.condition_feature {
-        cold_condition_fraction = 0.0;
-    } else if walk.condition < 0 && split_i == walk.condition_feature {
-        hot_condition_fraction *= hot_zero;
-        cold_condition_fraction *= cold_zero;
-    }
-
-    // The hot child forks a copy of this path into the next region. The cold
-    // child is this node's last use of the path, so it continues in place:
-    // its region is this one plus the next slot, and the hot subtree only
-    // wrote at or beyond that next slot.
-    rest[..len].copy_from_slice(&path[..len]);
-    tree_shap_rec(
-        walk,
-        hot,
-        rest,
-        level + 1,
-        len,
-        hot_zero * incoming_zero,
-        incoming_one,
-        split_i,
-        hot_condition_fraction,
-    );
-    tree_shap_rec(
-        walk,
-        cold,
-        arena,
-        level + 1,
-        len,
-        cold_zero * incoming_zero,
-        0.0,
-        split_i,
-        cold_condition_fraction,
-    );
 }
 
-/// TreeSHAP contributions of `tree` for one instance, accumulated into `phi`
-/// (which must be zeroed by the caller). `arena` must hold at least
-/// [`arena_len`] elements for the tree's depth.
-fn tree_shap(
-    tree: &ShapTree,
-    row: &[f32],
-    phi: &mut [f64],
-    arena: &mut [PathElement],
-    condition: i32,
-    condition_feature: i64,
-) {
-    let mut walk = Walk {
-        tree,
-        row,
-        phi,
-        condition,
-        condition_feature,
-    };
-    tree_shap_rec(&mut walk, 0, arena, 0, 0, 1.0, 1.0, -1, 1.0);
-}
-
-/// Cover-weighted mean prediction of the subtree rooted at `node_index`. This is the
-/// tree's expected output `E[f_tree]` when evaluated at the root. This is the
-/// offset TreeSHAP folds into the bias term.
-fn node_mean_value(tree: &RegTree, node_index: usize) -> f64 {
-    let node = tree.node(node_index);
-    if node.is_leaf() {
-        return f64::from(node.leaf_value);
-    }
-    let cover = f64::from(node.sum_hess);
-    if cover <= 0.0 {
-        return 0.0;
-    }
-    let l = node.left as usize;
-    let r = node.right as usize;
-    let lc = f64::from(tree.node(l).sum_hess);
-    let rc = f64::from(tree.node(r).sum_hess);
-    (lc * node_mean_value(tree, l) + rc * node_mean_value(tree, r)) / cover
+/// The instance-independent SHAP setup of an ensemble.
+struct ShapForest {
+    trees: Vec<ShapTree>,
+    weights: Vec<f32>,
+    /// Per output: `Σ weight · E[f_tree]`, summed in `f64`, rounded once.
+    root_mean_sums: Vec<f32>,
+    /// Per output: the ids (into `trees`) of the trees feeding it, ascending
+    /// (`BoostedModel::tree_output`; a vector-leaf tree contributes one
+    /// per-output view to every list).
+    by_output: Vec<Vec<usize>>,
 }
 
 impl BoostedModel {
-    /// The instance-independent SHAP setup over `trees`: each tree's weighted
-    /// root mean value, the [`ShapTree`] views, and the path-arena length
-    /// covering the deepest tree.
-    fn shap_forest(&self, trees: &[RegTree]) -> (Vec<f64>, Vec<ShapTree>, usize) {
-        // Each tree's root mean value is instance-independent; compute once.
-        let tree_means: Vec<f64> = trees
-            .iter()
-            .enumerate()
-            .map(|(i, t)| node_mean_value(t, 0) * f64::from(self.tree_weight(i)))
-            .collect();
-        let shap_trees: Vec<ShapTree> = trees.iter().map(ShapTree::from_tree).collect();
-        let arena = arena_len(shap_trees.iter().map(|t| t.depth).max().unwrap_or(0));
-        (tree_means, shap_trees, arena)
+    fn shap_forest(&self, trees: &[RegTree], k: usize) -> Result<ShapForest> {
+        let mut sums = vec![0f64; k];
+        let mut by_output = vec![Vec::new(); k];
+        let mut weights = Vec::with_capacity(trees.len());
+        let mut shap_trees = Vec::with_capacity(trees.len());
+        let mut root_means = vec![0f64; k];
+        let mut push = |tree: &RegTree, c: usize, root_mean: f64, weight: f32| -> Result<()> {
+            by_output[c].push(shap_trees.len());
+            shap_trees.push(ShapTree::from_tree(tree)?);
+            sums[c] = madd64(root_mean, f64::from(weight), sums[c]);
+            weights.push(weight);
+            Ok(())
+        };
+        for (ti, tree) in trees.iter().enumerate() {
+            let weight = self.tree_weight(ti);
+            if tree.is_vector_leaf() {
+                // XGBoost walks a vector-leaf tree once per output with that
+                // output's leaf values over the shared covers (the Hessians
+                // summed across targets). Its root means come from one
+                // top-down pass over the leaf vectors, whose rounding differs
+                // from the per-output bottom-up reduction.
+                root_means.fill(0.0);
+                root_mean_values(tree, 0, 1.0, &mut root_means);
+                for (c, &root_mean) in root_means.iter().enumerate() {
+                    push(&tree.output_tree(c), c, root_mean, weight)?;
+                }
+            } else {
+                push(tree, self.tree_output(ti), root_mean_value(tree, 0), weight)?;
+            }
+        }
+        Ok(ShapForest {
+            trees: shap_trees,
+            weights,
+            root_mean_sums: sums.into_iter().map(|s| s as f32).collect(),
+            by_output,
+        })
     }
 
-    /// Accumulate every tree's unconditioned per-feature attributions for the
-    /// dense row `get` into `acc` (layout `[output][0..width]`), one tree at a
-    /// time: folding a tree straight into the row would let a later tree's
-    /// large values round away an earlier tree's contribution in f64. Each
-    /// tree's expected value folds into the bias column `nf`.
-    #[allow(clippy::too_many_arguments)]
-    fn accumulate_unconditioned(
-        &self,
-        shap_trees: &[ShapTree],
-        tree_means: &[f64],
-        get: &[f32],
-        k: usize,
-        nf: usize,
-        width: usize,
-        acc: &mut [f64],
-        scratch: &mut [f64],
-        arena: &mut [PathElement],
-    ) {
-        for (ti, tree) in shap_trees.iter().enumerate() {
-            let cls = ti % k;
-            let off = cls * width;
-            let weight = f64::from(self.tree_weight(ti));
-            scratch.fill(0.0);
-            tree_shap(tree, get, scratch, arena, 0, -1);
-            for f in 0..nf {
-                acc[off + f] += weight * scratch[f];
-            }
-            // Tree expected value folds into the bias column.
-            acc[off + nf] += tree_means[ti];
+    /// Exact per-feature contributions for gblinear: `weight · x` per present
+    /// feature and the intercept plus linear bias in the bias column.
+    fn linear_contribs(&self, data: &DMatrix, row: usize, initial: &[f32], out: &mut [f32]) {
+        let Some(linear) = self.linear() else {
+            return;
+        };
+        let k = self.n_outputs();
+        let width = out.len() / k;
+        self.for_each_linear_contribution(data, row, |f, c, v| {
+            out[c * width + f] = v as f32;
+        });
+        for c in 0..k {
+            out[c * width + width - 1] =
+                (f64::from(initial[row * k + c]) + f64::from(linear.bias()[c])) as f32;
         }
     }
 
-    /// Exact TreeSHAP feature contributions, matching XGBoost `pred_contribs=True`.
+    /// SHAP feature contributions, matching XGBoost `pred_contribs=True`
+    /// (QuadratureTreeSHAP; see the module docs).
     ///
     /// For a single-output model the result is row-major with shape
     /// `n_rows × (n_features + 1)`: within each row, columns `0..n_features` are
@@ -580,65 +664,89 @@ impl BoostedModel {
     /// `n_rows × n_outputs × (n_features + 1)`, row-major: the contributions for
     /// row `r`, output `c`, feature `j` live at
     /// `((r * n_outputs + c) * (n_features + 1)) + j`, with the bias at column
-    /// `n_features`. Tree `t` contributes to output `t % n_outputs`.
+    /// `n_features`. Tree `t` contributes to output
+    /// `(t / num_parallel_tree) % n_outputs`; a vector-leaf tree contributes
+    /// to every output with that output's leaf values and the tree's covers.
     ///
-    /// The key guarantee is exact additivity: for every row (and output) the sum
-    /// of the `n_features + 1` values equals the raw margin from
-    /// [`BoostedModel::predict_margin`].
+    /// For every row (and output) the `n_features + 1` values sum to the raw
+    /// margin from [`BoostedModel::predict_margin`] up to `f32` rounding. Uses
+    /// the effective iterations (`[0, best_iteration + 1)` after early
+    /// stopping).
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
+    /// model, [`HessboostError::ModelFormat`] when a tree has a negative cover,
+    /// [`HessboostError::InvalidParameter`] for linear-leaf models.
     pub fn predict_contribs(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        let pro = self.attribution_prologue(data)?;
+        self.predict_contribs_range(data, self.attribution_default_range())
+    }
+
+    /// [`Self::predict_contribs`] over the boosting iterations in
+    /// `iteration_range` (XGBoost `iteration_range`, `end == 0` = through the
+    /// last iteration). As in XGBoost the range must start at iteration `0`;
+    /// use [`BoostedModel::slice`] for a later start.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::predict_contribs`], plus an out-of-range
+    /// `iteration_range`.
+    pub fn predict_contribs_range(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<f32>> {
+        let pro = self.attribution_prologue(data, iteration_range, "contribution prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
-        let (tree_means, shap_trees, arena) = self.shap_forest(trees);
+        let forest = self.shap_forest(trees, k)?;
+        let rule = &*RULE;
 
         let mut out = vec![0f32; n * k * width];
-
         out.par_chunks_mut(k * width).enumerate().for_each_init(
             || {
                 (
                     RowBlock::single_rows(data),
-                    vec![0f64; k * width],
-                    vec![0f64; nf],
-                    vec![PathElement::default(); arena],
+                    vec![0f32; nf],
+                    vec![UNSEEN; nf],
                 )
             },
-            |(rows, acc, scratch, arena), (row, out_row)| {
-                for a in acc.iter_mut() {
-                    *a = 0.0;
-                }
-                for c in 0..k {
-                    acc[c * width + nf] = f64::from(initial[row * k + c]);
-                }
-                if let Some(linear) = self.linear() {
-                    self.for_each_linear_contribution(data, row, |f, c, v| {
-                        acc[c * width + f] += v;
-                    });
-                    for c in 0..k {
-                        acc[c * width + nf] += f64::from(linear.bias()[c]);
-                    }
+            |(rows, phi, path_prob), (row, out_row)| {
+                if self.linear().is_some() {
+                    self.linear_contribs(data, row, &initial, out_row);
+                    return;
                 }
                 rows.load(row, 1);
-                let get = rows.row(0).expect("single-row blocks are dense");
-                self.accumulate_unconditioned(
-                    &shap_trees,
-                    &tree_means,
-                    get,
-                    k,
-                    nf,
-                    width,
-                    acc.as_mut_slice(),
-                    scratch.as_mut_slice(),
-                    arena.as_mut_slice(),
-                );
-                for (o, &v) in out_row.iter_mut().zip(acc.iter()) {
-                    *o = v as f32;
+                let x = rows.row(0).expect("single-row blocks are dense");
+                for (c, acc) in out_row.chunks_exact_mut(width).enumerate() {
+                    for &ti in &forest.by_output[c] {
+                        let tree = &forest.trees[ti];
+                        for &f in &tree.features {
+                            phi[f as usize] = 0.0;
+                        }
+                        Walk {
+                            tree,
+                            row: x,
+                            rule,
+                            path_prob,
+                            form: Additive { phi },
+                        }
+                        .run();
+                        let weight = forest.weights[ti];
+                        for &f in &tree.features {
+                            acc[f as usize] = madd(phi[f as usize], weight, acc[f as usize]);
+                        }
+                    }
+                    acc[nf] += forest.root_mean_sums[c];
+                    acc[nf] += initial[row * k + c];
                 }
             },
         );
         Ok(out)
     }
 
-    /// Exact TreeSHAP interaction values, matching XGBoost `pred_interactions=True`.
+    /// SHAP interaction values, matching XGBoost `pred_interactions=True`
+    /// (QuadratureTreeSHAP; see the module docs).
     ///
     /// For a single-output model the result is row-major with per-row shape
     /// `(n_features + 1) × (n_features + 1)`. Within a row's matrix `M`:
@@ -647,129 +755,127 @@ impl BoostedModel {
     ///   interaction between features `i` and `j` (symmetric: `M[i][j] ==
     ///   M[j][i]`) and is split evenly between the two cells.
     /// * the diagonal entry `M[i][i]` is feature `i`'s *main* effect, set so that
-    ///   the row sums to feature `i`'s full SHAP value (its
-    ///   [`BoostedModel::predict_contribs`] contribution).
+    ///   the row sums to feature `i`'s SHAP value.
     /// * the final row/column (index `n_features`) carry the bias: `M[nf][nf]`
-    ///   holds each tree's expected value `Σ E[f_tree]`, and the remaining bias
-    ///   cells are zero.
+    ///   holds the intercept plus each tree's expected value `Σ E[f_tree]`, and
+    ///   the remaining bias cells are zero.
     ///
     /// Consequently the whole matrix sums to the raw margin from
-    /// [`BoostedModel::predict_margin`], including the applicable base margin.
+    /// [`BoostedModel::predict_margin`] (including the applicable base
+    /// margin) up to `f32` rounding.
     ///
     /// For a multiclass model (`n_outputs > 1`) the layout is
     /// `n_rows × n_outputs × (n_features + 1)^2`, row-major: the matrix for row
     /// `r`, output `c` occupies the `(n_features + 1)^2` values starting at
     /// `(r * n_outputs + c) * (n_features + 1)^2`. Tree `t` contributes to output
-    /// `t % n_outputs`.
-    #[allow(clippy::needless_range_loop)]
+    /// `(t / num_parallel_tree) % n_outputs`. Uses the effective iterations,
+    /// like [`Self::predict_contribs`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`BoostedModel::predict_contribs`].
     pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
-        // Per-thread scratch: unconditioned contributions, condition = +1
-        // (feature present) / -1 (absent) accumulators, the interaction
-        // matrices, per-tree phi buffers, and the path arena.
+        self.predict_interactions_range(data, self.attribution_default_range())
+    }
+
+    /// [`Self::predict_interactions`] over the boosting iterations in
+    /// `iteration_range`, which must start at iteration `0` (see
+    /// [`Self::predict_contribs_range`]).
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::predict_contribs_range`].
+    pub fn predict_interactions_range(
+        &self,
+        data: &DMatrix,
+        iteration_range: (usize, usize),
+    ) -> Result<Vec<f32>> {
         struct Scratch<'a> {
             rows: RowBlock<'a>,
-            diag: Vec<f64>,
-            on: Vec<f64>,
-            off: Vec<f64>,
-            mat: Vec<f64>,
-            phi: Vec<f64>,
-            phi_on: Vec<f64>,
-            phi_off: Vec<f64>,
-            arena: Vec<PathElement>,
+            contribs: Vec<f32>,
+            diag: Vec<f32>,
+            path_prob: Vec<f32>,
+            path: Vec<PathEntry>,
+            last: Vec<u32>,
         }
 
-        let pro = self.attribution_prologue(data)?;
+        let pro = self.attribution_prologue(data, iteration_range, "interaction prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let mwidth = width * width;
-        let (tree_means, shap_trees, arena) = self.shap_forest(trees);
+        let forest = self.shap_forest(trees, k)?;
+        let rule = &*RULE;
+
         let mut out = vec![0f32; n * k * mwidth];
         out.par_chunks_mut(k * mwidth).enumerate().for_each_init(
             || Scratch {
                 rows: RowBlock::single_rows(data),
-                diag: vec![0f64; k * width],
-                on: vec![0f64; k * width],
-                off: vec![0f64; k * width],
-                mat: vec![0f64; k * mwidth],
-                phi: vec![0f64; nf],
-                phi_on: vec![0f64; nf],
-                phi_off: vec![0f64; nf],
-                arena: vec![PathElement::default(); arena],
+                contribs: vec![0f32; k * width],
+                diag: vec![0f32; width],
+                path_prob: vec![UNSEEN; nf],
+                path: Vec::new(),
+                last: vec![NO_ENTRY; nf],
             },
             |s, (row, out_row)| {
+                if self.linear().is_some() {
+                    // A linear model has no interactions: its contributions
+                    // sit on the diagonal.
+                    s.contribs.fill(0.0);
+                    self.linear_contribs(data, row, &initial, &mut s.contribs);
+                    for (c, m) in out_row.chunks_exact_mut(mwidth).enumerate() {
+                        for j in 0..width {
+                            m[j * width + j] = s.contribs[c * width + j];
+                        }
+                    }
+                    return;
+                }
                 s.rows.load(row, 1);
-                let get = s.rows.row(0).expect("single-row blocks are dense");
-                let (diag, on, off, mat) = (&mut s.diag, &mut s.on, &mut s.off, &mut s.mat);
-                diag.fill(0.0);
-                mat.fill(0.0);
-
-                for c in 0..k {
-                    diag[c * width + nf] = f64::from(initial[row * k + c]);
-                }
-                if let Some(linear) = self.linear() {
-                    self.for_each_linear_contribution(data, row, |f, c, v| {
-                        diag[c * width + f] += v;
-                    });
-                    for c in 0..k {
-                        diag[c * width + nf] += f64::from(linear.bias()[c]);
+                let x = s.rows.row(0).expect("single-row blocks are dense");
+                for (c, m) in out_row.chunks_exact_mut(mwidth).enumerate() {
+                    let diag = &mut s.diag;
+                    diag.fill(0.0);
+                    for &ti in &forest.by_output[c] {
+                        Walk {
+                            tree: &forest.trees[ti],
+                            row: x,
+                            rule,
+                            path_prob: &mut s.path_prob,
+                            form: Interaction {
+                                path: &mut s.path,
+                                last: &mut s.last,
+                                diag,
+                                matrix: m,
+                                width,
+                                scale: forest.weights[ti],
+                            },
+                        }
+                        .run();
                     }
-                }
-                self.accumulate_unconditioned(
-                    &shap_trees,
-                    &tree_means,
-                    get,
-                    k,
-                    nf,
-                    width,
-                    diag.as_mut_slice(),
-                    &mut s.phi,
-                    &mut s.arena,
-                );
-                for c in 0..k {
-                    let mbase = c * mwidth;
-                    let dbase = c * width;
-                    for j in 0..width {
-                        mat[mbase + j * width + j] = diag[dbase + j];
-                    }
-                }
+                    diag[nf] += forest.root_mean_sums[c];
+                    diag[nf] += initial[row * k + c];
 
-                // 2. Interaction terms: for each feature `j`, the
-                //    half-difference of the present/absent conditioned
-                //    contributions gives the interaction with every other
-                //    feature; the diagonal is reduced so the row keeps
-                //    summing to feature `j`'s SHAP value.
-                for j in 0..nf {
-                    on.fill(0.0);
-                    off.fill(0.0);
-                    for (ti, tree) in shap_trees.iter().enumerate() {
-                        let cls = ti % k;
-                        let base = cls * width;
-                        s.phi_on.fill(0.0);
-                        s.phi_off.fill(0.0);
-                        tree_shap(tree, get, &mut s.phi_on, &mut s.arena, 1, j as i64);
-                        tree_shap(tree, get, &mut s.phi_off, &mut s.arena, -1, j as i64);
-                        let weight = f64::from(self.tree_weight(ti));
-                        for f in 0..nf {
-                            on[base + f] += weight * s.phi_on[f];
-                            off[base + f] += weight * s.phi_off[f];
+                    // Average the two directed estimates of each pair, then
+                    // set each diagonal so its row sums to the additive value.
+                    for r in 0..width {
+                        for cc in r + 1..width {
+                            #[allow(
+                                clippy::manual_midpoint,
+                                reason = "XGBoost rounds the sum, then halves"
+                            )]
+                            let sym = 0.5 * (m[r * width + cc] + m[cc * width + r]);
+                            m[r * width + cc] = sym;
+                            m[cc * width + r] = sym;
                         }
                     }
-                    for c in 0..k {
-                        let mbase = c * mwidth;
-                        let dbase = c * width;
-                        for kk in 0..width {
-                            // The conditioned feature `j` never attributes to
-                            // itself (on/off are zero there), so `kk == j`
-                            // contributes 0.
-                            let val = 0.5 * (on[dbase + kk] - off[dbase + kk]);
-                            mat[mbase + j * width + kk] += val;
-                            mat[mbase + j * width + j] -= val;
+                    for r in 0..width {
+                        let mut value = diag[r];
+                        for cc in 0..width {
+                            if cc != r {
+                                value -= m[r * width + cc];
+                            }
                         }
+                        m[r * width + r] = value;
                     }
-                }
-
-                for (o, &v) in out_row.iter_mut().zip(mat.iter()) {
-                    *o = v as f32;
                 }
             },
         );
@@ -779,75 +885,136 @@ impl BoostedModel {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{BoosterKind, TrainingParams};
-    use crate::data::DMatrix;
-    use crate::learner::train;
+    use crate::config::{BoosterKind, TrainingParams, TreeMethod};
+    use crate::data::{DMatrix, FeatureType};
+    use crate::learner::{BoostedModel, train};
+    use crate::test_support::labeled_dense;
 
-    /// Build a small dense dataset with `nf` features. Features 0 and 1 carry
-    /// signal, the rest are noise. Returns (data, `n_rows`).
-    fn make_data(n: usize, nf: usize) -> DMatrix {
+    /// A `reg:squarederror` model with `eta = 0.3`.
+    fn squared_error_model(d: &DMatrix, max_depth: usize, rounds: usize) -> BoostedModel {
+        let params = TrainingParams::builder()
+            .objective("reg:squarederror")
+            .max_depth(max_depth)
+            .eta(0.3)
+            .build()
+            .unwrap();
+        train(&params, d, rounds).unwrap()
+    }
+
+    /// A 30-round regression model on 80 rows of 5 features; features 0 and
+    /// 1 carry signal, the rest are noise.
+    fn regression_fixture() -> (DMatrix, BoostedModel) {
+        let (n, nf) = (80, 5);
         let mut x = vec![0f32; n * nf];
         let mut y = vec![0f32; n];
         for i in 0..n {
             for j in 0..nf {
                 // Deterministic pseudo-random values.
-                let v = ((i * 31 + j * 17 + 7) % 97) as f32 / 97.0;
-                x[i * nf + j] = v;
+                x[i * nf + j] = ((i * 31 + j * 17 + 7) % 97) as f32 / 97.0;
             }
-            let f0 = x[i * nf];
-            let f1 = x[i * nf + 1];
-            y[i] = 2.0 * f0 - 1.5 * f1 + 0.3;
+            y[i] = 2.0 * x[i * nf] - 1.5 * x[i * nf + 1] + 0.3;
         }
-        DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        let d = labeled_dense(&x, n, nf, &y);
+        let model = squared_error_model(&d, 4, 30);
+        (d, model)
+    }
+
+    /// A 15-round `multi:softprob` model on 90 rows of 4 features, 3 classes.
+    fn multiclass_fixture() -> (DMatrix, BoostedModel) {
+        let (n, nf, k) = (90, 4, 3);
+        let mut x = vec![0f32; n * nf];
+        let mut y = vec![0f32; n];
+        for i in 0..n {
+            for j in 0..nf {
+                x[i * nf + j] = ((i * 13 + j * 29 + 3) % 101) as f32 / 101.0;
+            }
+            y[i] = (i % k) as f32;
+        }
+        let d = labeled_dense(&x, n, nf, &y);
+        let params = TrainingParams::builder()
+            .objective("multi:softprob")
+            .num_class(k)
+            .max_depth(3)
+            .eta(0.3)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 15).unwrap();
+        assert_eq!(model.n_outputs(), k);
+        (d, model)
+    }
+
+    fn sum64(values: &[f32]) -> f64 {
+        values.iter().map(|&v| f64::from(v)).sum()
+    }
+
+    /// Largest `|Σ contributions - margin|` over every row and output.
+    fn max_additivity_error(contribs: &[f32], margin: &[f32], width: usize) -> f64 {
+        contribs
+            .chunks_exact(width)
+            .zip(margin)
+            .map(|(c, &m)| (sum64(c) - f64::from(m)).abs())
+            .fold(0.0, f64::max)
+    }
+
+    /// `model`'s contributions on `d` have the documented layout and sum to
+    /// the margin of every row and output.
+    fn assert_additive(model: &BoostedModel, d: &DMatrix) {
+        let width = d.n_cols() + 1;
+        let contribs = model.predict_contribs(d).unwrap();
+        assert_eq!(contribs.len(), d.n_rows() * model.n_outputs() * width);
+        let margin = model.predict_margin(d).unwrap();
+        let err = max_additivity_error(&contribs, &margin, width);
+        assert!(err < 1e-4, "max additivity error {err} exceeded 1e-4");
+    }
+
+    /// `model`'s interaction matrices on `d` have the documented layout, each
+    /// row sums to that feature's contribution (the bias row to the bias),
+    /// each matrix to the margin, and every matrix is symmetric.
+    fn assert_interactions_consistent(model: &BoostedModel, d: &DMatrix) {
+        let width = d.n_cols() + 1;
+        let mwidth = width * width;
+        let inter = model.predict_interactions(d).unwrap();
+        assert_eq!(inter.len(), d.n_rows() * model.n_outputs() * mwidth);
+        let contribs = model.predict_contribs(d).unwrap();
+        let margin = model.predict_margin(d).unwrap();
+
+        let (mut row_err, mut eff_err, mut sym_err) = (0f64, 0f64, 0f64);
+        let matrices = inter.chunks_exact(mwidth).zip(contribs.chunks_exact(width));
+        for ((m, c), &target) in matrices.zip(&margin) {
+            for (row, &cval) in m.chunks_exact(width).zip(c) {
+                row_err = row_err.max((sum64(row) - f64::from(cval)).abs());
+            }
+            eff_err = eff_err.max((sum64(m) - f64::from(target)).abs());
+            for i in 0..width {
+                for j in 0..width {
+                    let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
+                    sym_err = sym_err.max(e);
+                }
+            }
+        }
+        assert!(row_err < 1e-4, "row-consistency error {row_err}");
+        assert!(eff_err < 1e-4, "efficiency error {eff_err}");
+        assert!(sym_err < 1e-5, "symmetry error {sym_err}");
     }
 
     #[test]
     fn additivity_single_output() {
-        let n = 80;
-        let nf = 5;
-        let d = make_data(n, nf);
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(4)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 30).unwrap();
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-        let width = nf + 1;
-        assert_eq!(contribs.len(), n * width);
-
-        let mut max_err = 0f64;
-        for row in 0..n {
-            let s: f64 = contribs[row * width..row * width + width]
-                .iter()
-                .map(|&v| f64::from(v))
-                .sum();
-            let err = (s - f64::from(margin[row])).abs();
-            max_err = max_err.max(err);
-        }
-        assert!(
-            max_err < 1e-4,
-            "max additivity error {max_err} exceeded 1e-4"
-        );
+        let (d, model) = regression_fixture();
+        assert_additive(&model, &d);
     }
 
     /// Textbook path-dependent TreeSHAP (Lundberg et al., Algorithm 2) with
     /// cloned paths, independent of the arena implementation.
     mod textbook {
-        use crate::tree::RegTree;
+        use crate::learner::BoostedModel;
+        use crate::tree::{RegTree, in_category_set};
 
         #[derive(Clone, Copy)]
-        pub struct El {
-            pub d: i64,
-            pub z: f64,
-            pub o: f64,
-            pub w: f64,
+        struct El {
+            d: i64,
+            z: f64,
+            o: f64,
+            w: f64,
         }
 
         fn extend(m: &mut Vec<El>, pz: f64, po: f64, pi: i64) {
@@ -903,7 +1070,7 @@ mod tests {
         }
 
         #[allow(clippy::too_many_arguments)]
-        pub fn recurse(
+        fn recurse(
             tree: &RegTree,
             x: &[f32],
             phi: &mut [f64],
@@ -926,7 +1093,10 @@ mod tests {
             let go_left = if v.is_nan() {
                 n.default_left
             } else if n.is_categorical {
-                tree.categories()[n.cat_begin as usize..n.cat_end as usize].contains(&(v as u32))
+                in_category_set(
+                    &tree.categories()[n.cat_begin as usize..n.cat_end as usize],
+                    v,
+                )
             } else {
                 v < n.split_cond
             };
@@ -948,8 +1118,36 @@ mod tests {
             recurse(tree, x, phi, hot, m.clone(), hz * iz, io, f);
             recurse(tree, x, phi, cold, m, cz * iz, 0.0, f);
         }
+
+        /// Contributions for row `x` (bias last), in `f64`.
+        pub fn contributions(model: &BoostedModel, x: &[f32]) -> Vec<f64> {
+            let nf = x.len();
+            let mut phi = vec![0f64; nf + 1];
+            phi[nf] = f64::from(model.base_score());
+            for tree in model.trees() {
+                phi[nf] += super::super::root_mean_value(tree, 0);
+                recurse(tree, x, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
+            }
+            phi
+        }
     }
 
+    /// `model`'s contributions on `d` match the textbook reference on every
+    /// row of `x`, the row-major features of `d`.
+    fn assert_matches_textbook(model: &BoostedModel, d: &DMatrix, x: &[f32]) {
+        let nf = d.n_cols();
+        let contribs = model.predict_contribs(d).unwrap();
+        let mut max_err = 0f64;
+        for (c, row) in contribs.chunks_exact(nf + 1).zip(x.chunks_exact(nf)) {
+            for (&got, want) in c.iter().zip(textbook::contributions(model, row)) {
+                max_err = max_err.max((f64::from(got) - want).abs());
+            }
+        }
+        assert!(max_err < 1e-4, "max textbook TreeSHAP error {max_err}");
+    }
+
+    /// Numeric, missing, and categorical routing against the f64 reference
+    /// (exact here: depth 6 keeps every path within the rule's exact range).
     #[test]
     fn contributions_match_textbook_tree_shap() {
         let n = 96;
@@ -958,88 +1156,47 @@ mod tests {
         let mut y = vec![0f32; n];
         for i in 0..n {
             for j in 0..nf {
-                let v = ((i * 31 + j * 17 + 7) % 97) as f32 / 97.0;
+                let v = if j == 4 {
+                    ((i * 7) % 6) as f32
+                } else {
+                    ((i * 31 + j * 17 + 7) % 97) as f32 / 97.0
+                };
                 x[i * nf + j] = if (i + j) % 11 == 0 { f32::NAN } else { v };
             }
+            let cat_effect = [0.8, -0.5, 0.0, 1.2, -1.0, 0.3];
+            let cat = x[i * nf + 4];
             y[i] = 2.0 * x[i * nf].max(0.0) - 1.5 * x[i * nf + 1].max(0.0)
-                + x[i * nf + 2].max(0.0) * x[i * nf + 3].max(0.0);
+                + x[i * nf + 2].max(0.0) * x[i * nf + 3].max(0.0)
+                + if cat.is_nan() {
+                    0.0
+                } else {
+                    cat_effect[cat as usize]
+                };
         }
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
+        let types = [
+            FeatureType::Numerical,
+            FeatureType::Numerical,
+            FeatureType::Numerical,
+            FeatureType::Numerical,
+            FeatureType::Categorical,
+        ];
+        let d = labeled_dense(&x, n, nf, &y)
+            .with_feature_types(&types)
             .unwrap();
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(6)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 12).unwrap();
-        let contribs = model.predict_contribs(&d).unwrap();
-        let width = nf + 1;
-        let mut max_err = 0f64;
-        for row in 0..n {
-            let inst = &x[row * nf..(row + 1) * nf];
-            let mut phi = vec![0f64; width];
-            phi[nf] = f64::from(model.base_score());
-            for tree in model.trees() {
-                phi[nf] += super::node_mean_value(tree, 0);
-                textbook::recurse(tree, inst, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
-            }
-            for (slot, want) in phi.iter().enumerate() {
-                max_err = max_err.max((f64::from(contribs[row * width + slot]) - want).abs());
-            }
-        }
-        assert!(max_err < 1e-4, "max textbook TreeSHAP error {max_err}");
+        let model = squared_error_model(&d, 6, 12);
+        let categorical = model
+            .trees()
+            .iter()
+            .flat_map(crate::tree::RegTree::nodes)
+            .any(|node| node.is_categorical);
+        assert!(categorical, "no categorical split was learned");
+        assert_matches_textbook(&model, &d, &x);
     }
+
     #[test]
     fn additivity_multiclass() {
-        let n = 90;
-        let nf = 4;
-        let k = 3;
-        let mut x = vec![0f32; n * nf];
-        let mut y = vec![0f32; n];
-        for i in 0..n {
-            for j in 0..nf {
-                x[i * nf + j] = ((i * 13 + j * 29 + 3) % 101) as f32 / 101.0;
-            }
-            y[i] = (i % k) as f32;
-        }
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(k)
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 15).unwrap();
-        assert_eq!(model.n_outputs(), k);
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-        let width = nf + 1;
-        assert_eq!(contribs.len(), n * k * width);
-
-        let mut max_err = 0f64;
-        for row in 0..n {
-            for c in 0..k {
-                let base = (row * k + c) * width;
-                let s: f64 = contribs[base..base + width]
-                    .iter()
-                    .map(|&v| f64::from(v))
-                    .sum();
-                let err = (s - f64::from(margin[row * k + c])).abs();
-                max_err = max_err.max(err);
-            }
-        }
-        assert!(
-            max_err < 1e-4,
-            "max multiclass additivity error {max_err} exceeded 1e-4"
-        );
+        let (d, model) = multiclass_fixture();
+        assert_additive(&model, &d);
     }
 
     #[test]
@@ -1057,17 +1214,8 @@ mod tests {
             x[i * nf + 3] = 0.5; // constant -> never a useful split
             y[i] = 3.0 * x[i * nf] - 2.0 * x[i * nf + 1];
         }
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(4)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 25).unwrap();
+        let d = labeled_dense(&x, n, nf, &y);
+        let model = squared_error_model(&d, 4, 25);
 
         // Sanity: feature 3 is never used in any split.
         let used = model
@@ -1091,114 +1239,14 @@ mod tests {
 
     #[test]
     fn interactions_single_output() {
-        let n = 80;
-        let nf = 5;
-        let d = make_data(n, nf);
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(4)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 30).unwrap();
-
-        let width = nf + 1;
-        let mwidth = width * width;
-        let inter = model.predict_interactions(&d).unwrap();
-        assert_eq!(inter.len(), n * mwidth);
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-
-        let mut max_row_err = 0f64;
-        let mut max_eff_err = 0f64;
-        let mut max_sym_err = 0f64;
-        for row in 0..n {
-            let m = &inter[row * mwidth..row * mwidth + mwidth];
-            // Row consistency: each feature row sums to its SHAP contribution.
-            for i in 0..nf {
-                let s: f64 = (0..width).map(|j| f64::from(m[i * width + j])).sum();
-                let cval = f64::from(contribs[row * width + i]);
-                max_row_err = max_row_err.max((s - cval).abs());
-            }
-            // Efficiency: the whole matrix sums to the full margin.
-            let total: f64 = m.iter().map(|&v| f64::from(v)).sum();
-            let target = f64::from(margin[row]);
-            max_eff_err = max_eff_err.max((total - target).abs());
-            // Symmetry.
-            for i in 0..width {
-                for j in 0..width {
-                    let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
-                    max_sym_err = max_sym_err.max(e);
-                }
-            }
-        }
-        assert!(max_row_err < 1e-4, "row-consistency error {max_row_err}");
-        assert!(max_eff_err < 1e-4, "efficiency error {max_eff_err}");
-        assert!(max_sym_err < 1e-5, "symmetry error {max_sym_err}");
+        let (d, model) = regression_fixture();
+        assert_interactions_consistent(&model, &d);
     }
 
     #[test]
     fn interactions_multiclass() {
-        let n = 90;
-        let nf = 4;
-        let k = 3;
-        let mut x = vec![0f32; n * nf];
-        let mut y = vec![0f32; n];
-        for i in 0..n {
-            for j in 0..nf {
-                x[i * nf + j] = ((i * 13 + j * 29 + 3) % 101) as f32 / 101.0;
-            }
-            y[i] = (i % k) as f32;
-        }
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(k)
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 15).unwrap();
-        assert_eq!(model.n_outputs(), k);
-
-        let width = nf + 1;
-        let mwidth = width * width;
-        let inter = model.predict_interactions(&d).unwrap();
-        assert_eq!(inter.len(), n * k * mwidth);
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-
-        let mut max_row_err = 0f64;
-        let mut max_eff_err = 0f64;
-        let mut max_sym_err = 0f64;
-        for row in 0..n {
-            for c in 0..k {
-                let m = &inter[(row * k + c) * mwidth..(row * k + c) * mwidth + mwidth];
-                let cbase = (row * k + c) * width;
-                for i in 0..nf {
-                    let s: f64 = (0..width).map(|j| f64::from(m[i * width + j])).sum();
-                    let cval = f64::from(contribs[cbase + i]);
-                    max_row_err = max_row_err.max((s - cval).abs());
-                }
-                let total: f64 = m.iter().map(|&v| f64::from(v)).sum();
-                let target = f64::from(margin[row * k + c]);
-                max_eff_err = max_eff_err.max((total - target).abs());
-                for i in 0..width {
-                    for j in 0..width {
-                        let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
-                        max_sym_err = max_sym_err.max(e);
-                    }
-                }
-            }
-        }
-        assert!(max_row_err < 1e-4, "row-consistency error {max_row_err}");
-        assert!(max_eff_err < 1e-4, "efficiency error {max_eff_err}");
-        assert!(max_sym_err < 1e-5, "symmetry error {max_sym_err}");
+        let (d, model) = multiclass_fixture();
+        assert_interactions_consistent(&model, &d);
     }
 
     #[test]
@@ -1209,12 +1257,7 @@ mod tests {
             .collect();
         let y: Vec<f32> = (0..n).map(|row| row as f32 / 10.0).collect();
         let base: Vec<f32> = (0..n).map(|row| row as f32 / 100.0).collect();
-        let d = DMatrix::from_dense(&x, n, 2)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
-            .with_base_margin(&base)
-            .unwrap();
+        let d = labeled_dense(&x, n, 2, &y).with_base_margin(&base).unwrap();
 
         for booster in [BoosterKind::Dart, BoosterKind::GbLinear] {
             let params = TrainingParams::builder()
@@ -1225,19 +1268,106 @@ mod tests {
                 .build()
                 .unwrap();
             let model = train(&params, &d, 8).unwrap();
-            let margin = model.predict_margin(&d).unwrap();
-            let contribs = model.predict_contribs(&d).unwrap();
-            let interactions = model.predict_interactions(&d).unwrap();
-            let width = d.n_cols() + 1;
-            for row in 0..n {
-                let contribution_sum: f32 = contribs[row * width..(row + 1) * width].iter().sum();
-                let interaction_sum: f32 = interactions
-                    [row * width * width..(row + 1) * width * width]
-                    .iter()
-                    .sum();
-                assert!((contribution_sum - margin[row]).abs() < 1e-4);
-                assert!((interaction_sum - margin[row]).abs() < 1e-4);
+            assert_additive(&model, &d);
+            assert_interactions_consistent(&model, &d);
+        }
+    }
+
+    /// The endpoint rule integrates `u^d` over `[0, 1]` exactly for `d ≤ 7`:
+    /// that is what makes QuadratureTreeSHAP exact on paths with at most
+    /// seven distinct features.
+    #[test]
+    fn quadrature_rule_integrates_low_degree_polynomials() {
+        let rule = super::endpoint_quadrature();
+        for d in 0..=7 {
+            let got: f64 = (0..super::POINTS)
+                .map(|i| f64::from(rule.weights[i]) * f64::from(rule.nodes[i]).powi(d))
+                .sum();
+            let want = 1.0 / f64::from(d + 1);
+            assert!((got - want).abs() < 1e-6, "degree {d}: {got} vs {want}");
+        }
+        assert!(rule.nodes.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// Depth-40 `exact` trees on six features: paths are long and repeat
+    /// features many times. The quadrature stays exact (≤ 7 distinct
+    /// features per path), so the contributions match the textbook f64
+    /// recursion, sum to the margin, and the interaction rows sum to them.
+    #[test]
+    fn deep_exact_trees_stay_additive_and_exact() {
+        let (n, nf) = (3000, 6);
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let mut x = vec![0f32; n * nf];
+        for v in &mut x {
+            *v = next();
+        }
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let r = &x[i * nf..(i + 1) * nf];
+                (r[0] * 40.0).sin() * 5.0 + r[1] * r[2] * 8.0 + (r[3] * 25.0).cos() + next()
+            })
+            .collect();
+        let d = labeled_dense(&x, n, nf, &y);
+        let params = TrainingParams::builder()
+            .tree_method(TreeMethod::Exact)
+            .max_depth(40)
+            .min_child_weight(0.0)
+            .lambda(0.0)
+            .eta(0.5)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 6).unwrap();
+        let depth = |t: &crate::tree::RegTree| {
+            let mut best = 0;
+            let mut stack = vec![(0usize, 0usize)];
+            while let Some((nid, dep)) = stack.pop() {
+                best = best.max(dep);
+                let node = t.node(nid);
+                if !node.is_leaf() {
+                    stack.push((node.left as usize, dep + 1));
+                    stack.push((node.right as usize, dep + 1));
+                }
             }
+            best
+        };
+        let deepest = model.trees().iter().map(depth).max().unwrap();
+        assert!(deepest >= 25, "trees only reach depth {deepest}");
+
+        let rows = 200;
+        let dsub = DMatrix::from_dense(&x[..rows * nf], rows, nf).unwrap();
+        assert_additive(&model, &dsub);
+        assert_interactions_consistent(&model, &dsub);
+        assert_matches_textbook(&model, &dsub, &x[..rows * nf]);
+    }
+
+    /// Covers are validated like XGBoost's `CHECK_GE(sum_hess, 0)`.
+    #[test]
+    fn negative_cover_is_a_model_error() {
+        let node = |feature: i32, left: i32, right: i32, value: f32, hess: f32| {
+            format!(
+                r#"{{"split_feature": {feature}, "split_cond": 0.5, "default_left": true, "left": {left}, "right": {right}, "leaf_value": {value}, "sum_hess": {hess}, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"trees": [{{"nodes": [{}, {}, {}], "categories": [], "size_leaf_vector": 0, "leaf_vectors": []}}], "base_score": [0.0], "objective": "reg:squarederror", "objective_params": {}, "num_class": 0, "n_outputs": 1, "n_targets": 1, "n_features": 1, "tree_weights": [], "num_parallel_tree": 1}}"#,
+            node(0, 1, 2, 0.0, 1.0),
+            node(0, -1, -1, 1.0, -1.0),
+            node(0, -1, -1, 2.0, 2.0),
+            serde_json::to_string(&crate::config::ObjectiveParams::default()).unwrap(),
+        );
+        let model = crate::learner::BoostedModel::from_json(&json).unwrap();
+        let d = DMatrix::from_dense(&[0.2], 1, 1).unwrap();
+        for result in [model.predict_contribs(&d), model.predict_interactions(&d)] {
+            assert!(matches!(
+                result,
+                Err(crate::error::HessboostError::ModelFormat(_))
+            ));
         }
     }
 }

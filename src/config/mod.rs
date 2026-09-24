@@ -3,6 +3,7 @@
 mod params;
 
 pub use params::{
-    BoosterKind, GrowPolicy, Monotone, ObjectiveParams, TrainingParams, TrainingParamsBuilder,
-    TreeMethod,
+    AftDistribution, BoosterKind, DistGradient, DistSplitDirection, GrowPolicy,
+    MAX_SYMMETRIC_DEPTH, Monotone, MultiStrategy, ObjectiveParams, ProcessType, SamplingMethod,
+    TrainingParams, TrainingParamsBuilder, TreeMethod,
 };

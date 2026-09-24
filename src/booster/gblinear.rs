@@ -20,9 +20,9 @@
 
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
-use crate::error::{HessboostError, Result};
-use crate::learner::LinearModel;
+use crate::error::Result;
 use crate::learner::model::for_each_present_value;
+use crate::learner::{LinearModel, reject_split_gradient};
 use crate::objective::{GradPair, Objective};
 
 /// One feature's present entries, stored column-major as parallel `(row, value)`
@@ -53,10 +53,13 @@ fn coordinate_delta(sum_grad: f64, sum_hess: f64, w: f64, alpha: f64, lambda: f6
 
 /// Fit a linear booster by coordinate descent.
 ///
-/// `initial_margin` contains the per-row starting margins, and
-/// `n_out` is the number of outputs (`num_class` for multiclass, else 1). The
-/// returned [`LinearModel`] holds `weights` laid out `[feature][output]` and a
-/// per-output `bias`.
+/// `initial_margin` contains the per-row starting margins, and `n_out` is the
+/// number of outputs (`num_class` for multiclass, the label columns for
+/// multi-target labels, else 1). The returned [`LinearModel`] holds `weights`
+/// laid out `[feature][output]` and a per-output `bias`. Continued training
+/// passes the model's current linear booster as `start`, which fitting
+/// resumes from instead of zeros. Fails when the objective supplies reduced
+/// split gradients, which only vector-leaf trees use.
 pub(crate) fn train_gblinear(
     params: &TrainingParams,
     dtrain: &DMatrix,
@@ -64,14 +67,13 @@ pub(crate) fn train_gblinear(
     initial_margin: &[f32],
     n_out: usize,
     objective: &dyn Objective,
+    start: Option<&LinearModel>,
 ) -> Result<LinearModel> {
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
-    let labels = dtrain.labels().ok_or(HessboostError::EmptyDataset(
-        "gblinear: dtrain has no labels",
-    ))?;
-    let weights = dtrain.weights();
-    let group = dtrain.group();
+    // Label presence was validated by the training entry point (only
+    // objectives that `requires_labels` need them).
+    let info = dtrain.info();
 
     let eta = params.eta;
     let lambda = params.lambda;
@@ -94,16 +96,19 @@ pub(crate) fn train_gblinear(
         });
     }
 
-    let mut lin_weights = vec![0.0f32; n_features * n_out];
-    let mut bias = vec![0.0f32; n_out];
+    let (mut lin_weights, mut bias) = match start {
+        Some(model) => (model.weights().to_vec(), model.bias().to_vec()),
+        None => (vec![0.0f32; n_features * n_out], vec![0.0f32; n_out]),
+    };
 
     // Running margins [instance][output]; gradients recomputed each round, then
     // updated incrementally as each coordinate moves.
     let mut margin = initial_margin.to_vec();
     let mut gpair = vec![GradPair::default(); n * n_out];
 
-    for _round in 0..num_round {
-        objective.gradient_grouped(&margin, labels, weights, group, &mut gpair);
+    for round in 0..num_round {
+        objective.gradient_info(&margin, &info, &mut gpair);
+        reject_split_gradient(objective, round, &gpair)?;
 
         for k in 0..n_out {
             // 1. Bias (intercept) update: G = Σ g, H = Σ h.
@@ -130,8 +135,8 @@ pub(crate) fn train_gblinear(
                 let col = &cols[f];
                 let mut g = 0.0f64;
                 let mut h = 0.0f64;
-                for (idx, &row) in col.rows.iter().enumerate() {
-                    let x = f64::from(col.vals[idx]);
+                for (&row, &x) in col.rows.iter().zip(&col.vals) {
+                    let x = f64::from(x);
                     let gp = gpair[row as usize * n_out + k];
                     g += f64::from(gp.grad) * x;
                     h += f64::from(gp.hess) * x * x;
@@ -143,8 +148,7 @@ pub(crate) fn train_gblinear(
                 }
                 let dw32 = dw as f32;
                 lin_weights[f * n_out + k] += dw32;
-                for (idx, &row) in col.rows.iter().enumerate() {
-                    let x = col.vals[idx];
+                for (&row, &x) in col.rows.iter().zip(&col.vals) {
                     let gp = &mut gpair[row as usize * n_out + k];
                     gp.grad += gp.hess * x * dw32;
                     margin[row as usize * n_out + k] += x * dw32;

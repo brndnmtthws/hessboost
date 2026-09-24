@@ -36,43 +36,6 @@ pub struct HistCuts {
     is_categorical: Vec<bool>,
 }
 
-/// Whether feature `f` is categorical per the dataset's feature types.
-fn is_cat(ftypes: &[FeatureType], f: usize) -> bool {
-    ftypes.get(f).copied() == Some(FeatureType::Categorical)
-}
-
-/// Accumulates per-feature cuts and their offsets, then assembles the final
-/// [`HistCuts`].
-struct CutAssembler {
-    feature_offset: Vec<u32>,
-    cut_values: Vec<f32>,
-}
-
-impl CutAssembler {
-    fn new(n_features: usize) -> Self {
-        let mut feature_offset = Vec::with_capacity(n_features + 1);
-        feature_offset.push(0u32);
-        CutAssembler {
-            feature_offset,
-            cut_values: Vec::new(),
-        }
-    }
-
-    /// Close the current feature: its cuts end at the current length.
-    fn finish_feature(&mut self) {
-        self.feature_offset.push(self.cut_values.len() as u32);
-    }
-
-    fn assemble(self, n_features: usize, is_categorical: Vec<bool>) -> HistCuts {
-        HistCuts {
-            n_features,
-            feature_offset: self.feature_offset,
-            cut_values: self.cut_values,
-            is_categorical,
-        }
-    }
-}
-
 /// Global bin index for an `upper_bound` count `local` within a feature owning
 /// `n_cuts` cuts starting at `start`: clamp into the last real bin.
 #[inline]
@@ -139,8 +102,13 @@ impl HistCuts {
         };
         let missing = data.missing();
         let ftypes = data.feature_types();
-        let mut assembler = CutAssembler::new(n_features);
-        let is_categorical: Vec<bool> = (0..n_features).map(|f| is_cat(ftypes, f)).collect();
+        let is_categorical: Vec<bool> = ftypes
+            .iter()
+            .map(|&t| t == FeatureType::Categorical)
+            .collect();
+        let mut feature_offset = Vec::with_capacity(n_features + 1);
+        feature_offset.push(0u32);
+        let mut cut_values = Vec::new();
         // Per-feature `(row, value)` pairs in row order, for either storage.
         let for_each_value = |f: usize, visit: &mut dyn FnMut(usize, f32)| match (&columns, &csc) {
             (Some(columns), _) => {
@@ -182,7 +150,7 @@ impl HistCuts {
                 sketch.cut_values(output);
             };
         if n_features > 1
-            && data.n_rows().saturating_mul(n_features) >= 65_536
+            && n_rows.saturating_mul(n_features) >= 65_536
             && rayon::current_num_threads() > 1
         {
             let columns: Vec<_> = (0..n_features)
@@ -194,18 +162,23 @@ impl HistCuts {
                 })
                 .collect();
             for column in columns {
-                assembler.cut_values.extend(column);
-                assembler.finish_feature();
+                cut_values.extend(column);
+                feature_offset.push(cut_values.len() as u32);
             }
         } else {
             let mut scratch = Default::default();
             for f in 0..n_features {
-                build(f, &mut scratch, &mut assembler.cut_values);
-                assembler.finish_feature();
+                build(f, &mut scratch, &mut cut_values);
+                feature_offset.push(cut_values.len() as u32);
             }
         }
 
-        assembler.assemble(n_features, is_categorical)
+        HistCuts {
+            n_features,
+            feature_offset,
+            cut_values,
+            is_categorical,
+        }
     }
 
     /// Whether feature `f` is categorical (bins map one category value each).
@@ -548,11 +521,13 @@ mod tests {
     }
 
     #[test]
-    fn constant_feature_never_collides() {
+    fn constant_feature_has_one_bin() {
+        // The minimum is never a cut: only the sentinel remains, so every
+        // value of a constant feature lands in its single bin.
         let data = DMatrix::from_dense(&[5.0, 5.0, 5.0], 3, 1).unwrap();
         let cuts = HistCuts::from_dmatrix(&data, 256);
-        // All identical values map to the same bin.
-        assert_eq!(cuts.bin_of(0, 5.0), cuts.bin_of(0, 5.0));
+        assert_eq!(cuts.num_bins(0), 1);
+        assert_eq!(cuts.bin_of(0, 5.0), 0);
     }
 
     #[test]

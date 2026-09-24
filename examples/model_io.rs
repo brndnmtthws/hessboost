@@ -1,9 +1,8 @@
 //! Saving and loading models: native binary, native JSON, and XGBoost-format
-//! JSON (interoperable with real XGBoost). Run:
+//! JSON and UBJSON (interoperable with real XGBoost). Run:
 //! `cargo run --release --example model_io`.
 
 use hessboost::prelude::*;
-use std::path::Path;
 
 mod common;
 use common::{fill_random, lcg};
@@ -30,6 +29,7 @@ fn main() -> Result<()> {
     let bin = dir.join("hessboost_model.bin");
     let json = dir.join("hessboost_model.json");
     let xgb = dir.join("hessboost_xgb.json");
+    let ubj = dir.join("hessboost_xgb.ubj");
 
     // 1) Native binary (compact) round-trip.
     model.save_binary(&bin)?;
@@ -43,10 +43,16 @@ fn main() -> Result<()> {
     model.save_xgboost_json(&xgb)?;
     let m_xgb = BoostedModel::load_xgboost_json(&xgb)?;
 
+    // 4) XGBoost-format UBJSON (binary JSON, XGBoost's `.ubj`), the same
+    //    document in XGBoost's compact encoding.
+    model.save_xgboost_ubjson(&ubj)?;
+    let m_ubj = BoostedModel::load_xgboost_ubjson(&ubj)?;
+
     for (label, m) in [
         ("binary", &m_bin),
         ("json", &m_json),
         ("xgboost-json", &m_xgb),
+        ("xgboost-ubj", &m_ubj),
     ] {
         let after = m.predict(&d)?;
         let max_diff = before
@@ -57,8 +63,8 @@ fn main() -> Result<()> {
         println!("{label:<13} round-trip max |Δ| = {max_diff:.2e}");
     }
 
-    for p in [&bin, &json, &xgb] {
-        let _ = std::fs::remove_file(Path::new(p));
+    for p in [&bin, &json, &xgb, &ubj] {
+        let _ = std::fs::remove_file(p);
     }
     Ok(())
 }

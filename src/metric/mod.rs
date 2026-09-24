@@ -1,9 +1,34 @@
 //! Evaluation metrics used for reporting and early stopping.
 //!
 //! Metrics receive predictions that have already passed through the objective's
-//! [`crate::objective::Objective::pred_transform`] (so classification metrics
+//! [`crate::objective::Objective::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
+/// Short-circuit a [`Metric::eval`] to NaN when its inputs are not
+/// [`consistent`] with `width` predictions per label. Defined before the
+/// submodules so their metrics can use it too.
+macro_rules! nan_unless_consistent {
+    ($preds:expr, $labels:expr, $weights:expr, $width:expr) => {
+        if !$crate::metric::consistent($preds, $labels, $weights, $width) {
+            return f64::NAN;
+        }
+    };
+}
+
+mod distributional;
+mod elementwise;
+mod quantile;
+mod ranking;
+mod survival;
+
+pub use distributional::{DistCrps, DistNll};
+pub use elementwise::{Mape, PseudoHuberError, Rmsle};
+pub use quantile::{ExpectileError, QuantileError};
+pub use ranking::Precision;
+pub use survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
+
+use crate::config::ObjectiveParams;
+use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 
 /// An evaluation metric over predictions and labels.
@@ -16,7 +41,9 @@ pub trait Metric: Send + Sync {
         false
     }
 
-    /// Evaluate the metric. `preds` are post-transform predictions.
+    /// Evaluate the metric. `preds` are post-transform predictions,
+    /// [`Metric::prediction_width`] per label; inconsistent lengths
+    /// (`preds`, or `weights` other than one per label) evaluate to NaN.
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64;
 
     /// Evaluate the metric with optional query-group structure.
@@ -33,6 +60,72 @@ pub trait Metric: Send + Sync {
     ) -> f64 {
         self.eval(preds, labels, weights)
     }
+
+    /// Evaluate the metric from a dataset's full metadata view; the entry
+    /// point training uses. The default forwards the labels, weights, and
+    /// groups to [`Metric::eval_grouped`]; metrics that read other metadata
+    /// (label bounds) override it.
+    ///
+    /// For a label matrix (`info.n_targets > 1`) the default is XGBoost's
+    /// elementwise reduction: `preds` and `labels` are both
+    /// `[row][target]`, every cell counts as one instance, and each row's
+    /// weight is repeated for its cells, so the metric averages over all
+    /// rows and targets. Metrics that are not elementwise override it (or
+    /// report [`Metric::supports_label_matrix`] `false`).
+    fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        if info.n_targets > 1 {
+            let cell_weights = info.cell_weights();
+            return self.eval_grouped(preds, info.labels, cell_weights.as_deref(), None);
+        }
+        self.eval_grouped(preds, info.labels, info.weights, info.group)
+    }
+
+    /// Whether [`Metric::eval_info`] is defined on a label matrix
+    /// (`n_targets > 1`). `true` by default (the elementwise reduction);
+    /// ranking, multiclass, and per-row survival metrics return `false`, and
+    /// training then rejects them for multi-target data.
+    fn supports_label_matrix(&self) -> bool {
+        true
+    }
+
+    /// Check that a dataset carries the metadata [`Metric::eval_info`]
+    /// reads, before training evaluates it. The default requires ordinary
+    /// labels; metrics that can read other metadata (the survival metrics'
+    /// label bounds) override it. Errors are
+    /// [`HessboostError::InvalidParameter`] naming `eval_metric`, with a
+    /// reason mentioning "dataset" (training names the dataset there).
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        if info.n_rows > 0 && info.labels.is_empty() {
+            return Err(HessboostError::invalid_param(
+                "eval_metric",
+                format!(
+                    "metric `{}` needs labels, but dataset has none",
+                    self.name()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Predictions per row (`[row][output]`) that [`Metric::eval_info`]
+    /// reads on `info`: one per label column by default (elementwise,
+    /// ranking, and survival metrics), the class count for `mlogloss` /
+    /// `merror`, one per alpha and label column for `quantile` /
+    /// `expectile`, and the distribution's parameter count for `nll` /
+    /// `crps`. `None` accepts any whole number of predictions per label (the
+    /// [`CustomMetric`] hook). Training refuses an evaluation set on which a
+    /// metric's width differs from the model's output count.
+    fn prediction_width(&self, info: &MetaInfo) -> Option<usize> {
+        Some(info.n_targets)
+    }
+}
+
+/// Whether `preds` holds `width` values per label and `weights`, when
+/// given, one per label: the lengths [`Metric::eval`] reads. Metrics
+/// evaluate inconsistent inputs to NaN.
+fn consistent(preds: &[f32], labels: &[f32], weights: Option<&[f32]>, width: usize) -> bool {
+    labels.len().checked_mul(width) == Some(preds.len())
+        && weights.is_none_or(|w| w.len() == labels.len())
 }
 
 /// Normalize a metric total, returning zero for an empty or nonpositive weight sum.
@@ -44,13 +137,17 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
 /// Define a purely-pointwise metric from its SIMD weighted-sum kernel.
 /// Generates the metric struct plus its [`Metric`] impl from the metric name
 /// and the `crate::simd` kernel path; `eval` is
-/// `weighted_mean(kernel(preds, labels, weights))`. Metrics with metric-level
-/// state take a `field: Type` arm and pass `self.field` as the kernel's final
-/// argument; `rmse` takes `=> sqrt` for its root. All generated metrics
-/// minimize (`maximize` keeps its default `false`); metrics with non-trivial
-/// logic (`auc`, `aucpr`, ranking) stay handwritten below.
+/// `weighted_mean(kernel(preds, labels, weights))`, NaN for inconsistent
+/// lengths. Metrics with metric-level state take a `field: Type` arm and
+/// pass `self.field` as the kernel's final argument; `rmse` takes `=> sqrt`
+/// for its root. A trailing `per_label` on the `field` arm marks a metric
+/// reading `self.field` predictions per label (the multiclass metrics: one
+/// probability per class, one class id per row, so no label matrices). All
+/// generated metrics minimize (`maximize` keeps its default `false`);
+/// metrics with non-trivial logic (`auc`, `aucpr`, ranking) stay
+/// handwritten below.
 macro_rules! simple_metric {
-    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path) => {
+    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path $(=> $root:ident)?) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, Default)]
         pub struct $ty;
@@ -59,20 +156,8 @@ macro_rules! simple_metric {
                 $name
             }
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-                weighted_mean($simd(preds, labels, weights))
-            }
-        }
-    };
-    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path => sqrt) => {
-        $(#[$m])*
-        #[derive(Debug, Clone, Copy, Default)]
-        pub struct $ty;
-        impl Metric for $ty {
-            fn name(&self) -> &str {
-                $name
-            }
-            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-                weighted_mean($simd(preds, labels, weights)).sqrt()
+                nan_unless_consistent!(preds, labels, weights, 1);
+                weighted_mean($simd(preds, labels, weights))$(.$root())?
             }
         }
     };
@@ -87,7 +172,31 @@ macro_rules! simple_metric {
                 $name
             }
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                nan_unless_consistent!(preds, labels, weights, 1);
                 weighted_mean($simd(preds, labels, weights, self.$field))
+            }
+        }
+    };
+    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path,
+        per_label) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy)]
+        pub struct $ty {
+            $field: $field_ty,
+        }
+        impl Metric for $ty {
+            fn name(&self) -> &str {
+                $name
+            }
+            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+                nan_unless_consistent!(preds, labels, weights, self.$field);
+                weighted_mean($simd(preds, labels, weights, self.$field))
+            }
+            fn supports_label_matrix(&self) -> bool {
+                false
+            }
+            fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+                Some(self.$field)
             }
         }
     };
@@ -104,7 +213,10 @@ simple_metric!(
 );
 
 simple_metric!(
-    /// Binary logistic loss (`logloss`). Predictions are probabilities.
+    /// Binary logistic loss (`logloss`), XGBoost's
+    /// `-y·ln(max(p, ε)) − (1 − y)·ln(max(1 − p, ε))` with `ε = 1e-16` and a
+    /// zero-coefficient term dropped. Predictions are probabilities, or raw
+    /// margins for `binary:logitraw`, which are not clamped into `[0, 1]`.
     LogLoss, "logloss", crate::simd::log_loss_sum
 );
 
@@ -134,8 +246,33 @@ fn tie_runs<'a>(
     })
 }
 
+/// [`Metric::eval_info`] of the curve metrics: for a label matrix, XGBoost's
+/// multi-label macro average (`MultiAUC` with `MultiAUCType::kMultiLabel`):
+/// evaluate `metric` on each target column of the `[row][target]` labels
+/// with the row weights, then take the plain mean over targets. A single
+/// label column evaluates through [`Metric::eval_grouped`].
+fn macro_average_targets(metric: &dyn Metric, preds: &[f32], info: &MetaInfo) -> f64 {
+    let k = info.n_targets;
+    if k <= 1 {
+        return metric.eval_grouped(preds, info.labels, info.weights, info.group);
+    }
+    let mut col_preds = Vec::with_capacity(info.n_rows);
+    let mut col_labels = Vec::with_capacity(info.n_rows);
+    let mut total = 0.0;
+    for target in 0..k {
+        col_preds.clear();
+        col_preds.extend(preds.iter().skip(target).step_by(k));
+        col_labels.clear();
+        col_labels.extend(info.labels.iter().skip(target).step_by(k));
+        total += metric.eval(&col_preds, &col_labels, info.weights);
+    }
+    total / k as f64
+}
+
 /// Binary ROC AUC (`auc`), computed with the Mann-Whitney rank-sum and average
 /// ranks for ties. Higher is better. Weights are ignored (unweighted AUC).
+/// For a label matrix it is the mean of the per-target AUCs (XGBoost's
+/// multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Auc;
 
@@ -148,7 +285,8 @@ impl Metric for Auc {
         true
     }
 
-    fn eval(&self, preds: &[f32], labels: &[f32], _weights: Option<&[f32]>) -> f64 {
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         let n = preds.len();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| preds[a].total_cmp(&preds[b]));
@@ -178,17 +316,23 @@ impl Metric for Auc {
         }
         (sum_pos_rank - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
     }
+
+    fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        macro_average_targets(self, preds, info)
+    }
 }
 
 simple_metric!(
     /// Multiclass log loss (`mlogloss`). Predictions are `n × num_class`
     /// probabilities. Labels are class indices.
-    MLogLoss, "mlogloss", num_class: usize, crate::simd::multiclass_log_loss_sum
+    MLogLoss, "mlogloss", num_class: usize, crate::simd::multiclass_log_loss_sum,
+    per_label
 );
 
 simple_metric!(
     /// Multiclass error rate (`merror`): fraction whose argmax ≠ label.
-    MError, "merror", num_class: usize, crate::simd::multiclass_error_sum
+    MError, "merror", num_class: usize, crate::simd::multiclass_error_sum,
+    per_label
 );
 
 simple_metric!(
@@ -290,8 +434,7 @@ impl Ndcg {
             .map(|(p, &i)| ndcg_gain(f64::from(labels[i])) * ndcg_discount(p))
             .sum();
 
-        let labels_f64: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
-        let idcg = ideal_dcg(&labels_f64, cut);
+        let idcg = ideal_dcg(labels, cut);
 
         if idcg <= 0.0 { 0.0 } else { dcg / idcg }
     }
@@ -306,6 +449,10 @@ impl Metric for Ndcg {
         true
     }
 
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
         // No group info: treat everything as a single query.
         self.eval_grouped(preds, labels, weights, None)
@@ -318,29 +465,27 @@ impl Metric for Ndcg {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         grouped_average(preds, labels, weights, group, |p, l| self.group_ndcg(p, l))
     }
 }
 
-/// NDCG gain of a relevance label: `2^rel - 1`. Shared with the LambdaMART
-/// objective's `|ΔNDCG|` weighting.
+/// NDCG gain of a relevance label: `2^rel - 1`.
 #[inline]
-pub(crate) fn ndcg_gain(rel: f64) -> f64 {
+fn ndcg_gain(rel: f64) -> f64 {
     (2.0f64).powf(rel) - 1.0
 }
 
-/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`. Shared with
-/// the LambdaMART objective's `|ΔNDCG|` weighting.
+/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`.
 #[inline]
-pub(crate) fn ndcg_discount(p: usize) -> f64 {
+fn ndcg_discount(p: usize) -> f64 {
     1.0 / ((p + 2) as f64).log2()
 }
 
 /// Ideal DCG of a group: labels sorted by descending relevance, gains
-/// accumulated with the standard discount, truncated at `cut` ranks. Shared by
-/// the `ndcg` metric and the LambdaMART objective's `|ΔNDCG|` weighting.
-pub(crate) fn ideal_dcg(labels: &[f64], cut: usize) -> f64 {
-    let mut ideal: Vec<f64> = labels.to_vec();
+/// accumulated with the standard discount, truncated at `cut` ranks.
+fn ideal_dcg(labels: &[f32], cut: usize) -> f64 {
+    let mut ideal: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
     ideal.sort_by(|a, b| b.total_cmp(a));
     ideal[..cut]
         .iter()
@@ -399,6 +544,10 @@ impl Metric for MeanAveragePrecision {
         true
     }
 
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
         self.eval_grouped(preds, labels, weights, None)
     }
@@ -410,6 +559,7 @@ impl Metric for MeanAveragePrecision {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         grouped_average(preds, labels, weights, group, |p, l| self.group_ap(p, l))
     }
 }
@@ -420,7 +570,8 @@ impl Metric for MeanAveragePrecision {
 /// sorting instances by descending prediction and sweeping the decision
 /// threshold. The area is integrated over recall with the trapezoidal rule
 /// (tied scores form a single operating point). Higher is better. A degenerate
-/// problem (no positives or no negatives) yields `0`.
+/// problem (no positives or no negatives) yields `0`. For a label matrix it
+/// is the mean of the per-target areas (XGBoost's multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AucPr;
 
@@ -434,6 +585,7 @@ impl Metric for AucPr {
     }
 
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
         let w_of = |i: usize| weights.map_or(1.0, |ws| f64::from(ws[i]));
 
         // Sort instance indices by descending predicted score.
@@ -484,6 +636,10 @@ impl Metric for AucPr {
         }
         area
     }
+
+    fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        macro_average_targets(self, preds, info)
+    }
 }
 
 /// Closure type backing a [`CustomMetric`].
@@ -491,9 +647,18 @@ type MetricFn = dyn Fn(&[f32], &[f32], Option<&[f32]>) -> f64 + Send + Sync;
 
 /// A [`Metric`] backed by a user-supplied closure (the custom-metric hook).
 ///
-/// The closure receives post-transform predictions, labels, and optional
-/// weights, and returns the scalar metric value. `maximize` declares the
-/// optimization direction used for early stopping.
+/// The closure receives post-transform predictions (`[row][output]`, the
+/// model's `n_outputs` per row), labels (`[row][target]`), and optional
+/// weights (one per label), and returns the scalar metric value.
+/// `maximize` declares the optimization direction used for early stopping.
+/// Inputs whose prediction count is not a positive multiple of the label
+/// count, or whose weights are not one per label, evaluate to NaN without
+/// calling the closure; training refuses a model whose outputs are not a
+/// whole number per label column.
+///
+/// For a label matrix the closure sees `[row][target]` labels with each
+/// row's weight repeated for its cells (the default [`Metric::eval_info`]
+/// reduction).
 pub struct CustomMetric {
     name: String,
     maximize: bool,
@@ -525,17 +690,50 @@ impl Metric for CustomMetric {
         self.maximize
     }
 
+    /// NaN without calling the closure unless `preds` holds a positive
+    /// whole number of values per label and `weights`, when given, one per
+    /// label.
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        let width = preds.len().checked_div(labels.len()).unwrap_or(0);
+        if width == 0 || !consistent(preds, labels, weights, width) {
+            return f64::NAN;
+        }
         (self.f)(preds, labels, weights)
+    }
+
+    /// Any whole number of predictions per label: the closure interprets
+    /// them.
+    fn prediction_width(&self, _info: &MetaInfo) -> Option<usize> {
+        None
     }
 }
 
-/// Resolve a metric by name. `num_class` is used by multiclass metrics.
-pub fn create_metric(name: &str, num_class: usize) -> Result<Box<dyn Metric>> {
+/// Resolve a metric by name. `num_class` is used by multiclass metrics, and
+/// `objective` carries the loss parameters that objective-dependent metrics
+/// read: `mphe` takes its slope from `huber_slope`, `aft-nloglik` the AFT
+/// distribution and scale, and `quantile` / `expectile` the configured
+/// `quantile_alpha` / `expectile_alpha` (whatever the objective, like
+/// XGBoost), failing when that list is empty or invalid. The distributional
+/// metrics `nll` and `crps` (beyond XGBoost) take the family of a `dist:*`
+/// objective from `objective.distribution` and fail without one.
+pub fn create_metric(
+    name: &str,
+    num_class: usize,
+    objective: &ObjectiveParams,
+) -> Result<Box<dyn Metric>> {
     // Accept the XGBoost `tweedie-nloglik@1.5` suffix form.
     let (base, rho) = match name.split_once('@') {
         Some((b, r)) => (b, r.parse::<f64>().ok()),
         None => (name, None),
+    };
+    // Rank cutoff `@k` of at least `min`. NaN would cast to a zero cutoff,
+    // infinity to `usize::MAX`, and a negative value saturate to zero.
+    let cutoff = |min: f64| match rho {
+        Some(k) if !k.is_finite() || k < min => Err(HessboostError::invalid_param(
+            "eval_metric",
+            format!("`{name}` needs a finite cutoff of at least {min}"),
+        )),
+        k => Ok(k.map(|k| k as usize)),
     };
     match base {
         "rmse" => Ok(Box::new(Rmse)),
@@ -555,25 +753,78 @@ pub fn create_metric(name: &str, num_class: usize) -> Result<Box<dyn Metric>> {
         "tweedie-nloglik" => Ok(Box::new(TweedieNLogLik {
             rho: rho.unwrap_or(1.5),
         })),
-        "ndcg" => Ok(Box::new(Ndcg::new(rho.map(|r| r as usize)))),
-        "map" => Ok(Box::new(MeanAveragePrecision::new(rho.map(|r| r as usize)))),
+        "ndcg" => Ok(Box::new(Ndcg::new(cutoff(0.0)?))),
+        "map" => Ok(Box::new(MeanAveragePrecision::new(cutoff(0.0)?))),
+        "rmsle" => Ok(Box::new(Rmsle)),
+        "mape" => Ok(Box::new(Mape)),
+        "mphe" => {
+            let slope = objective.huber_slope as f32;
+            if slope == 0.0 {
+                return Err(HessboostError::invalid_param(
+                    "huber_slope",
+                    "the slope of `mphe` cannot be 0",
+                ));
+            }
+            Ok(Box::new(PseudoHuberError::new(slope)))
+        }
+        "pre" => Ok(Box::new(Precision::new(name, cutoff(1.0)?))),
+        "quantile" => Ok(Box::new(QuantileError::new(&objective.quantile_alpha)?)),
+        "expectile" => Ok(Box::new(ExpectileError::new(&objective.expectile_alpha)?)),
+        "cox-nloglik" => Ok(Box::new(CoxNLogLik)),
+        "aft-nloglik" => Ok(Box::new(AftNLogLik::new(
+            objective.aft_loss_distribution,
+            objective.aft_loss_distribution_scale as f32,
+        ))),
+        "interval-regression-accuracy" => Ok(Box::new(IntervalRegressionAccuracy)),
+        "nll" | "crps" => {
+            let family = objective.distribution.ok_or_else(|| {
+                HessboostError::invalid_param(
+                    "eval_metric",
+                    format!(
+                        "`{name}` scores predicted distributions and needs a `dist:*` objective"
+                    ),
+                )
+            })?;
+            Ok(if base == "nll" {
+                Box::new(DistNll::new(family))
+            } else {
+                Box::new(DistCrps::new(family))
+            })
+        }
         other => Err(HessboostError::unknown("metric", other)),
     }
 }
 
 /// Build the list of metrics to evaluate: the user's `eval_metric` list if any,
-/// otherwise the single `default_name` supplied by the objective.
+/// otherwise the single `default_name` supplied by the objective. `num_class`
+/// and `objective` are forwarded to [`create_metric`].
+///
+/// XGBoost configures the default metric from the objective's
+/// `DefaultMetricConfig` but without the user's parameters (the learner has
+/// cleared them by the time it evaluates). For `aft-nloglik` that keeps the
+/// objective's distribution while the scale falls back to its default 1, so
+/// the default metric here is built the same way; list `aft-nloglik` in
+/// `eval_metric` to evaluate the likelihood at the configured scale.
 pub fn create_metrics(
     eval_metric: &[String],
     default_name: &str,
     num_class: usize,
+    objective: &ObjectiveParams,
 ) -> Result<Vec<Box<dyn Metric>>> {
     if eval_metric.is_empty() {
-        Ok(vec![create_metric(default_name, num_class)?])
+        let default_config = ObjectiveParams {
+            aft_loss_distribution_scale: ObjectiveParams::default().aft_loss_distribution_scale,
+            ..objective.clone()
+        };
+        Ok(vec![create_metric(
+            default_name,
+            num_class,
+            &default_config,
+        )?])
     } else {
         eval_metric
             .iter()
-            .map(|n| create_metric(n, num_class))
+            .map(|n| create_metric(n, num_class, objective))
             .collect()
     }
 }
@@ -614,10 +865,185 @@ mod tests {
 
     #[test]
     fn factory_defaults_to_objective_metric() {
-        let ms = create_metrics(&[], "rmse", 0).unwrap();
+        let obj = ObjectiveParams::default();
+        let ms = create_metrics(&[], "rmse", 0, &obj).unwrap();
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].name(), "rmse");
-        assert!(create_metrics(&["nope".to_string()], "rmse", 0).is_err());
+        assert!(create_metrics(&["nope".to_string()], "rmse", 0, &obj).is_err());
+    }
+
+    /// XGBoost's elementwise reduction over a label matrix: every
+    /// `(row, target)` cell is one instance carrying its row's weight, so
+    /// weighted RMSE is `sqrt(Σ w_i (y_ij − p_ij)² / (K Σ w_i))`.
+    #[test]
+    fn elementwise_metrics_average_every_cell_with_row_weights() {
+        let labels = [1.0f32, 0.0, 3.0, 2.0, 0.0, 1.0];
+        let preds = [2.0f32, 0.0, 1.0, 2.0, 1.0, 1.0];
+        let weights = [1.0f32, 3.0];
+        let info = MetaInfo {
+            n_rows: 2,
+            n_targets: 3,
+            ..MetaInfo::new(&labels, Some(&weights), None)
+        };
+        // Row 0 squared errors 1, 0, 4 (weight 1); row 1: 0, 1, 0 (weight 3).
+        let expected = ((1.0 + 4.0 + 3.0) / 12.0f64).sqrt();
+        assert_relative_eq!(Rmse.eval_info(&preds, &info), expected, epsilon = 1e-12);
+        // Row 0 absolute errors 1, 0, 2; row 1: 0, 1, 0.
+        assert_relative_eq!(Mae.eval_info(&preds, &info), 6.0 / 12.0, epsilon = 1e-12);
+        let unweighted = MetaInfo {
+            weights: None,
+            ..info
+        };
+        assert_relative_eq!(
+            Rmse.eval_info(&preds, &unweighted),
+            (6.0f64 / 6.0).sqrt(),
+            epsilon = 1e-12
+        );
+    }
+
+    /// Multi-label AUC / AUCPR is the plain mean of the per-target values.
+    #[test]
+    fn ranking_curve_metrics_macro_average_label_columns() {
+        // Target 0 is ranked perfectly (AUC 1), target 1 exactly backwards
+        // (0); pooling all cells instead would give 9/16.
+        let labels = [1.0f32, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let preds = [0.9f32, 0.1, 0.8, 0.3, 0.2, 0.7, 0.1, 0.9];
+        let info = MetaInfo {
+            n_rows: 4,
+            n_targets: 2,
+            ..MetaInfo::new(&labels, None, None)
+        };
+        assert_relative_eq!(Auc.eval_info(&preds, &info), 0.5, epsilon = 1e-12);
+        let per_target: f64 = (0..2)
+            .map(|t| {
+                let col = |v: &[f32]| v.iter().skip(t).step_by(2).copied().collect::<Vec<_>>();
+                AucPr.eval(&col(&preds), &col(&labels), None)
+            })
+            .sum();
+        assert_relative_eq!(
+            AucPr.eval_info(&preds, &info),
+            per_target / 2.0,
+            epsilon = 1e-12
+        );
+    }
+
+    /// Ranking, multiclass, and per-row survival metrics read one label (or
+    /// interval) per row and refuse label matrices; elementwise and curve
+    /// metrics accept them.
+    #[test]
+    fn label_matrix_support_is_declared_per_metric() {
+        let obj = ObjectiveParams::default();
+        for (name, supported) in [
+            ("rmse", true),
+            ("logloss", true),
+            ("error", true),
+            ("auc", true),
+            ("aucpr", true),
+            ("tweedie-nloglik@1.5", true),
+            ("mlogloss", false),
+            ("merror", false),
+            ("ndcg", false),
+            ("map@5", false),
+            ("pre@3", false),
+            ("cox-nloglik", false),
+            ("aft-nloglik", false),
+            ("interval-regression-accuracy", false),
+        ] {
+            let metric = create_metric(name, 3, &obj).unwrap();
+            assert_eq!(metric.supports_label_matrix(), supported, "{name}");
+        }
+    }
+
+    /// Rank cutoffs `@k` that are NaN, infinite, or below the metric's
+    /// minimum (1 for `pre`, 0 for `ndcg` / `map`) are refused instead of
+    /// casting to a zero (or saturated) `usize`.
+    #[test]
+    fn rank_metrics_reject_invalid_cutoffs() {
+        let obj = ObjectiveParams::default();
+        let mut names = vec!["pre@0".to_string(), "pre@0.5".to_string()];
+        for base in ["pre", "ndcg", "map"] {
+            for k in ["NaN", "nan", "inf", "-inf", "-1"] {
+                names.push(format!("{base}@{k}"));
+            }
+        }
+        for name in &names {
+            let err = create_metric(name, 0, &obj).err();
+            assert!(
+                matches!(err, Some(HessboostError::InvalidParameter { name: param, .. }) if param == "eval_metric"),
+                "{name}: {err:?}"
+            );
+        }
+        for name in ["pre@1", "ndcg@0", "ndcg@3", "map@0", "map@5"] {
+            assert!(create_metric(name, 0, &obj).is_ok(), "{name}");
+        }
+        let m = create_metric("pre@2", 0, &obj).unwrap();
+        // All labels zero: no hits at any cutoff.
+        assert_eq!(m.eval(&[0.9, 0.5, 0.1], &[0.0, 0.0, 0.0], None), 0.0);
+    }
+
+    /// Every metric declares the predictions per row it reads, and direct
+    /// calls with inconsistent lengths evaluate to NaN instead of indexing
+    /// out of bounds.
+    #[test]
+    fn mismatched_lengths_evaluate_to_nan() {
+        let obj = ObjectiveParams {
+            quantile_alpha: vec![0.2, 0.8],
+            expectile_alpha: vec![0.5],
+            distribution: Some(crate::objective::DistFamily::Normal),
+            ..ObjectiveParams::default()
+        };
+        let widths = [
+            ("rmse", 1),
+            ("mae", 1),
+            ("logloss", 1),
+            ("error", 1),
+            ("auc", 1),
+            ("aucpr", 1),
+            ("mlogloss", 3),
+            ("merror", 3),
+            ("poisson-nloglik", 1),
+            ("gamma-nloglik", 1),
+            ("tweedie-nloglik", 1),
+            ("ndcg", 1),
+            ("map", 1),
+            ("rmsle", 1),
+            ("mape", 1),
+            ("mphe", 1),
+            ("pre@2", 1),
+            ("quantile", 2),
+            ("expectile", 1),
+            ("cox-nloglik", 1),
+            ("aft-nloglik", 1),
+            ("interval-regression-accuracy", 1),
+            ("nll", 2),
+            ("crps", 2),
+        ];
+        let labels = [1.0, 0.0, 1.0];
+        let info = MetaInfo::new(&labels, None, None);
+        for (name, width) in widths {
+            let metric = create_metric(name, 3, &obj).unwrap();
+            assert_eq!(metric.prediction_width(&info), Some(width), "{name}");
+            let preds = vec![0.5f32; labels.len() * width + 1];
+            let valid = &preds[..labels.len() * width];
+            // Consistent lengths evaluate (the value itself may be NaN for
+            // labels outside the metric's domain).
+            let _ = metric.eval(valid, &labels, Some(&[1.0; 3]));
+            for (preds, weights) in [
+                (&preds[..], None),
+                (&preds[..labels.len() * width - 1], None),
+                (valid, Some(&[1.0f32; 2][..])),
+            ] {
+                assert!(metric.eval(preds, &labels, weights).is_nan(), "{name}");
+                let info = MetaInfo::new(&labels, weights, None);
+                assert!(metric.eval_info(preds, &info).is_nan(), "{name}");
+            }
+        }
+        let custom = CustomMetric::new("first", false, |p, _, _| f64::from(p[0]));
+        assert_eq!(custom.prediction_width(&info), None);
+        assert_eq!(custom.eval(&[2.0, 3.0, 4.0], &labels, None), 2.0);
+        assert!(custom.eval(&[], &labels, None).is_nan());
+        assert!(custom.eval(&[2.0; 4], &labels, None).is_nan());
+        assert!(custom.eval(&[2.0; 3], &labels, Some(&[1.0])).is_nan());
     }
 
     #[test]
@@ -698,18 +1124,28 @@ mod tests {
 
     #[test]
     fn factory_parses_ranking_metrics_with_k() {
-        assert_eq!(create_metric("ndcg", 0).unwrap().name(), "ndcg");
-        assert_eq!(create_metric("map", 0).unwrap().name(), "map");
-        // `@k` suffix parses without error.
-        assert_eq!(create_metric("ndcg@5", 0).unwrap().name(), "ndcg");
-        assert_eq!(create_metric("map@10", 0).unwrap().name(), "map");
+        // An `@k` suffix parses and is dropped from the name.
+        for (name, base) in [
+            ("ndcg", "ndcg"),
+            ("map", "map"),
+            ("ndcg@5", "ndcg"),
+            ("map@10", "map"),
+        ] {
+            let metric = create_metric(name, 0, &ObjectiveParams::default()).unwrap();
+            assert_eq!(metric.name(), base, "{name}");
+        }
     }
 
     #[test]
     fn aucpr_perfect_and_ranks_better_than_random() {
         let m = AucPr;
         assert!(m.maximize());
-        assert_eq!(create_metric("aucpr", 0).unwrap().name(), "aucpr");
+        assert_eq!(
+            create_metric("aucpr", 0, &ObjectiveParams::default())
+                .unwrap()
+                .name(),
+            "aucpr"
+        );
 
         // Perfectly separable: all positives scored above all negatives -> ~1.
         let perfect = m.eval(&[0.1, 0.2, 0.8, 0.9], &[0.0, 0.0, 1.0, 1.0], None);

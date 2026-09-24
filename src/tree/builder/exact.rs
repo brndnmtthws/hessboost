@@ -12,18 +12,20 @@
 //! Monotone and interaction constraints are honored during split search.
 
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, K_RT_EPS, SplitPos, build_interaction_sets,
-    finalize_leaf_values, next_allowed, permits, sum_rows, sweep_categorical, xgb_loss_chg,
-    xgb_node_gain, xgb_update,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, build_interaction_sets,
+    finalize_leaf_values, limit_or_unbounded, next_allowed, permits, sum_rows, sweep_categorical,
+    xgb_loss_chg, xgb_node_gain, xgb_update,
 };
+use crate::K_RT_EPS_F32;
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
-use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
+use crate::tree::constraints::{Bounds, MonotoneConstraints};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
+use crate::tree::reuse::{CategoricalPenalty, ReuseSet};
 use crate::tree::sampler::ColumnSampler;
-use std::collections::HashMap;
+use std::cell::RefCell;
 
 /// Value-sorted column index over a [`DMatrix`], built once and reused across
 /// boosting rounds. Within each column, `(row, value)` pairs are sorted by
@@ -91,24 +93,16 @@ impl SortedColumns {
     }
 }
 
-/// A split that was applied at a level, used to route rows into their children.
-struct Split {
-    nid: usize,
-    feature: u32,
-    threshold: f32,
-    default_left: bool,
-    is_categorical: bool,
-    cat_left: Vec<u32>,
-    left_id: usize,
-    right_id: usize,
-}
-
 /// Exact greedy tree builder.
 pub struct ExactTreeBuilder<'a> {
     params: &'a TrainingParams,
     reg: RegParams,
     cons: MonotoneConstraints,
     interaction_sets: Option<Vec<Vec<u32>>>,
+    /// Opt-in reuse penalties (`toad_penalty_*`): the ensemble's used features
+    /// and thresholds, extended by every split this builder commits. `None`
+    /// on the default path.
+    reuse: Option<RefCell<ReuseSet>>,
 }
 
 impl<'a> ExactTreeBuilder<'a> {
@@ -119,7 +113,18 @@ impl<'a> ExactTreeBuilder<'a> {
             reg: RegParams::from_params(params),
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
+            reuse: None,
         }
+    }
+
+    /// Penalize candidates by the reuse penalties of `set` (the ensemble's
+    /// used features and thresholds; `None` keeps the default gain). Splits
+    /// the builder commits extend its own copy, so later levels (and later
+    /// trees grown by this builder) reuse them for free.
+    #[must_use]
+    pub(crate) fn with_reuse(mut self, set: Option<&ReuseSet>) -> Self {
+        self.reuse = set.cloned().map(RefCell::new);
+        self
     }
 
     /// Grow a single tree.
@@ -153,23 +158,15 @@ impl<'a> ExactTreeBuilder<'a> {
         let mut node_bounds: Vec<Bounds> = vec![Bounds::default()];
         let mut node_allowed: Vec<Option<InteractionState>> = vec![None];
 
-        // With no monotone constraints the closed-form gain path is exact; the
-        // bounded path is used otherwise.
-        let constrained = self.cons.is_active();
         let ftypes = data.feature_types();
 
-        let depth_limit = if self.params.max_depth == 0 {
-            usize::MAX
-        } else {
-            self.params.max_depth
-        };
-
+        let depth_limit = limit_or_unbounded(self.params.max_depth);
         let mut active: Vec<usize> = vec![0];
         let mut depth = 0;
 
         while depth < depth_limit && !active.is_empty() {
             // One column subset for the whole level (bylevel ∘ bynode).
-            let feature_subset = sampler.sample();
+            let feature_subset = sampler.sample(depth);
             let k = active.len();
             // slot_of_node maps an active node id to its dense slot index.
             let mut slot_of_node = vec![usize::MAX; tree.num_nodes()];
@@ -192,47 +189,55 @@ impl<'a> ExactTreeBuilder<'a> {
             for &f in &feature_subset {
                 let (crows, cvals) = cols.column(f as usize);
                 let dir = self.cons.dir(f as usize);
+                // Row `r`'s node and its dense slot, when that node is active
+                // at this level and may split on `f`.
+                let active_slot = |r: usize| {
+                    let nid = usize::try_from(node_of_row[r]).ok()?;
+                    let slot = slot_of_node[nid];
+                    (slot != usize::MAX && permits(node_allowed[nid].as_ref(), f))
+                        .then_some((nid, slot))
+                };
 
                 // Categorical features use a set-membership split instead of a
-                // numeric threshold.
+                // numeric threshold, over every category of the column in
+                // ascending order (the histogram builder's category bins).
                 if ftypes[f as usize] == FeatureType::Categorical {
-                    // Gather per-node, per-category statistics for this feature.
-                    let mut cat_stats: Vec<HashMap<u32, GradStats>> = vec![HashMap::new(); k];
+                    // The column is sorted, so equal categories are adjacent.
+                    let mut categories: Vec<u32> = Vec::new();
+                    let mut cat_stats: Vec<Vec<GradStats>> = vec![Vec::new(); k];
                     for (&rr, &val) in crows.iter().zip(cvals) {
-                        let r = rr as usize;
-                        let nid = node_of_row[r];
-                        if nid < 0 {
-                            continue;
+                        let cat = val as u32;
+                        if categories.last() != Some(&cat) {
+                            categories.push(cat);
                         }
-                        let slot = slot_of_node[nid as usize];
-                        if slot == usize::MAX {
+                        let Some((_, slot)) = active_slot(rr as usize) else {
                             continue;
-                        }
-                        if !permits(node_allowed[nid as usize].as_ref(), f) {
-                            continue;
-                        }
-                        let gp = gpair[r];
-                        cat_stats[slot]
-                            .entry(val as u32)
-                            .or_default()
-                            .add(GradStats::from_pair(gp));
+                        };
+                        let stats = &mut cat_stats[slot];
+                        stats.resize(categories.len(), GradStats::default());
+                        stats[categories.len() - 1].add(GradStats::from_pair(gpair[rr as usize]));
                     }
+                    let reuse = self.reuse.as_ref().map(RefCell::borrow);
                     for (slot, &nid) in active.iter().enumerate() {
                         if !permits(node_allowed[nid].as_ref(), f) {
                             continue;
                         }
-                        let mut cats: Vec<(u32, GradStats)> =
-                            cat_stats[slot].iter().map(|(&c, &s)| (c, s)).collect();
+                        let stats = &cat_stats[slot];
+                        let cats: Vec<(u32, GradStats)> = categories
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &c)| (c, stats.get(i).copied().unwrap_or_default()))
+                            .collect();
                         sweep_categorical(
                             &mut best[slot],
-                            &mut cats,
+                            &cats,
                             node_stats[nid],
-                            f64::from(root_gain[slot]),
+                            root_gain[slot],
                             node_bounds[nid],
                             dir,
-                            constrained,
                             &self.reg,
                             f,
+                            reuse.as_deref().map(|r| r as &dyn CategoricalPenalty),
                         );
                     }
                     continue;
@@ -248,14 +253,9 @@ impl<'a> ExactTreeBuilder<'a> {
                             best: &mut [BestSplit]| {
                     acc.fill(GradStats::default());
                     let mut visit = |r: usize, val: f32| {
-                        let nid = node_of_row[r];
-                        if nid < 0 {
+                        let Some((nid, slot)) = active_slot(r) else {
                             return;
-                        }
-                        let slot = slot_of_node[nid as usize];
-                        if slot == usize::MAX || !permits(node_allowed[nid as usize].as_ref(), f) {
-                            return;
-                        }
+                        };
                         let e = &mut acc[slot];
                         // `UpdateEnumeration`: the first rows with positive Hessian
                         // only seed the running statistics.
@@ -263,7 +263,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             && val != last_val[slot]
                             && e.hess >= self.reg.min_child_weight
                         {
-                            let c = node_stats[nid as usize].sub(*e);
+                            let c = node_stats[nid].sub(*e);
                             if c.hess >= self.reg.min_child_weight {
                                 let (left, right) = if d_step < 0 { (c, *e) } else { (*e, c) };
                                 // ColMaker's midpoint `(fvalue + last) * 0.5f`
@@ -283,7 +283,7 @@ impl<'a> ExactTreeBuilder<'a> {
                                     left,
                                     right,
                                     root_gain[slot],
-                                    node_bounds[nid as usize],
+                                    node_bounds[nid],
                                     dir,
                                     f,
                                     thr,
@@ -312,7 +312,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             && c.hess >= self.reg.min_child_weight
                         {
                             let last = last_val[slot];
-                            let gap = last.abs() + K_RT_EPS as f32;
+                            let gap = last.abs() + K_RT_EPS_F32;
                             let thr = if d_step > 0 { last + gap } else { last - gap };
                             // ColMaker's `last_fvalue ± delta` overflows to `±inf`
                             // for `|last|` near `f32::MAX`; the tree must stay
@@ -353,7 +353,6 @@ impl<'a> ExactTreeBuilder<'a> {
             }
 
             let mut next_active = Vec::new();
-            let mut splits: Vec<Split> = Vec::new();
 
             for &nid in &active {
                 let slot = slot_of_node[nid];
@@ -364,38 +363,21 @@ impl<'a> ExactTreeBuilder<'a> {
 
                 // Monotone child bounds derived from the (bounded) child weights.
                 let dir = self.cons.dir(b.feature as usize);
-                let (lb_bounds, rb_bounds) =
-                    child_bounds(node_bounds[nid], dir, b.w_left, b.w_right);
+                let (lb_bounds, rb_bounds) = b.child_bounds(node_bounds[nid], dir);
 
                 // Children carry XGBoost's bounded `f32` weight, so the
                 // `leaf_value` field of nodes that later split records the value
                 // they had as a leaf at expansion time. Leaves are overwritten
                 // by the finalize pass below.
-                let (lw, rw) = (b.w_left as f32, b.w_right as f32);
-                let (left_id, right_id) = if b.is_categorical {
-                    tree.expand_categorical(
-                        nid,
-                        b.feature,
-                        &b.cat_left,
-                        b.default_left,
-                        lw,
-                        b.left.hess as f32,
-                        rw,
-                        b.right.hess as f32,
-                    )
-                } else {
-                    tree.expand(
-                        nid,
-                        b.feature,
-                        b.threshold,
-                        b.default_left,
-                        lw,
-                        b.left.hess as f32,
-                        rw,
-                        b.right.hess as f32,
-                    )
-                };
-                tree.set_split_gain(nid, b.loss_chg as f32);
+                let (left_id, right_id) = b.expand(&mut tree, nid, b.threshold);
+                if let Some(reuse) = &self.reuse {
+                    let mut reuse = reuse.borrow_mut();
+                    if b.is_categorical {
+                        reuse.record_categorical(b.feature, &b.cat_left);
+                    } else {
+                        reuse.record_numeric(b.feature, b.threshold);
+                    }
+                }
                 debug_assert_eq!(left_id, node_stats.len());
                 node_stats.push(b.left);
                 node_stats.push(b.right);
@@ -410,53 +392,23 @@ impl<'a> ExactTreeBuilder<'a> {
                 node_allowed.push(allowed);
                 next_active.push(left_id);
                 next_active.push(right_id);
-                splits.push(Split {
-                    nid,
-                    feature: b.feature,
-                    threshold: b.threshold,
-                    default_left: b.default_left,
-                    is_categorical: b.is_categorical,
-                    cat_left: b.cat_left.clone(),
-                    left_id,
-                    right_id,
-                });
             }
 
-            // Route each sampled row into its child for the nodes that split.
-            if !splits.is_empty() {
-                // Map nid -> split info for O(1) routing.
-                let mut split_of_node = vec![usize::MAX; tree.num_nodes()];
-                for (idx, s) in splits.iter().enumerate() {
-                    split_of_node[s.nid] = idx;
-                }
+            // Route each sampled row of a node split at this level into its
+            // child (rows of every other node sit at a leaf).
+            if !next_active.is_empty() {
                 #[allow(clippy::needless_range_loop)]
                 for r in 0..n_rows {
                     let nid = node_of_row[r];
                     if nid < 0 {
                         continue;
                     }
-                    let si = split_of_node[nid as usize];
-                    if si == usize::MAX {
+                    let node = tree.node(nid as usize);
+                    if node.is_leaf() {
                         continue;
                     }
-                    let s = &splits[si];
-                    let go_left = match data.get(r, s.feature as usize) {
-                        Some(v) => {
-                            if s.is_categorical {
-                                // Present categories in the left set go left;
-                                // every other present category goes right.
-                                s.cat_left.contains(&(v as u32))
-                            } else {
-                                v < s.threshold
-                            }
-                        }
-                        None => s.default_left,
-                    };
-                    node_of_row[r] = if go_left {
-                        s.left_id as i32
-                    } else {
-                        s.right_id as i32
-                    };
+                    let value = data.get(r, node.split_feature as usize);
+                    node_of_row[r] = tree.child(nid as usize, value) as i32;
                 }
             }
 
@@ -486,9 +438,12 @@ impl<'a> ExactTreeBuilder<'a> {
         threshold: f32,
         default_left: bool,
     ) {
-        if let Some((loss_chg, wl, wr)) =
+        if let Some((mut loss_chg, wl, wr)) =
             xgb_loss_chg(left, right, root_gain, &self.reg, bounds, dir)
         {
+            if let Some(reuse) = &self.reuse {
+                loss_chg -= reuse.borrow().numeric_penalty(feature, threshold);
+            }
             xgb_update(
                 best,
                 loss_chg,
@@ -516,7 +471,7 @@ pub fn all_features(n_cols: usize) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{gp, monotone_v_shape_data};
+    use super::super::test_support::{gp, grow_exact, monotone_v_shape_data, non_decreasing};
     use super::*;
     use crate::config::TrainingParams;
 
@@ -527,7 +482,6 @@ mod tests {
         // 4 rows, 1 feature. values 0,0,1,1. gradients push low->+, high->-.
         let x = vec![0.0f32, 0.0, 1.0, 1.0];
         let data = DMatrix::from_dense(&x, 4, 1).unwrap();
-        let cols = SortedColumns::from_dmatrix(&data);
         // squared-error-like gradients: left group wants negative weight, right positive
         let gpair = vec![gp(1.0, 1.0), gp(1.0, 1.0), gp(-1.0, 1.0), gp(-1.0, 1.0)];
 
@@ -538,14 +492,7 @@ mod tests {
             .gamma(0.0)
             .build()
             .unwrap();
-        let b = ExactTreeBuilder::new(&params);
-        let tree = b.build(
-            &cols,
-            &data,
-            &gpair,
-            &all_rows(4),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_exact(&params, &data, &gpair);
 
         assert_eq!(
             tree.num_nodes(),
@@ -564,21 +511,13 @@ mod tests {
     fn no_split_when_gain_below_gamma() {
         let x = vec![0.0f32, 1.0];
         let data = DMatrix::from_dense(&x, 2, 1).unwrap();
-        let cols = SortedColumns::from_dmatrix(&data);
         let gpair = vec![gp(1.0, 1.0), gp(-1.0, 1.0)];
         let params = TrainingParams::builder()
             .max_depth(3)
             .gamma(1e9) // impossibly high min split loss
             .build()
             .unwrap();
-        let b = ExactTreeBuilder::new(&params);
-        let tree = b.build(
-            &cols,
-            &data,
-            &gpair,
-            &all_rows(2),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_exact(&params, &data, &gpair);
         assert_eq!(tree.num_nodes(), 1, "no split should be taken");
     }
 
@@ -587,7 +526,6 @@ mod tests {
         // 3 rows, feature 0 missing for row 2. Non-missing rows separate cleanly.
         let x = vec![0.0f32, 1.0, f32::NAN];
         let data = DMatrix::from_dense(&x, 3, 1).unwrap();
-        let cols = SortedColumns::from_dmatrix(&data);
         // row2 (missing) shares the sign of the high group.
         let gpair = vec![gp(1.0, 1.0), gp(-1.0, 1.0), gp(-1.0, 1.0)];
         let params = TrainingParams::builder()
@@ -597,14 +535,7 @@ mod tests {
             .gamma(0.0)
             .build()
             .unwrap();
-        let b = ExactTreeBuilder::new(&params);
-        let tree = b.build(
-            &cols,
-            &data,
-            &gpair,
-            &all_rows(3),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_exact(&params, &data, &gpair);
         assert_eq!(tree.num_nodes(), 3);
         // The missing row should be routed with the negative-gradient group
         // (right, positive weight). default_left should therefore be false.
@@ -616,8 +547,6 @@ mod tests {
     fn monotone_increasing_is_enforced() {
         use crate::config::Monotone;
         let (data, gpair) = monotone_v_shape_data();
-        let n = data.n_rows();
-        let cols = SortedColumns::from_dmatrix(&data);
         let params = TrainingParams::builder()
             .max_depth(4)
             .min_child_weight(0.0)
@@ -626,24 +555,9 @@ mod tests {
             .monotone_constraints(vec![Monotone::Increasing])
             .build()
             .unwrap();
-        let tree = ExactTreeBuilder::new(&params).build(
-            &cols,
-            &data,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
-
+        let tree = grow_exact(&params, &data, &gpair);
         // Predictions must be non-decreasing in x under the increasing constraint.
-        let mut prev = f32::NEG_INFINITY;
-        for i in 0..n {
-            let p = tree.predict_row(&data, i);
-            assert!(
-                p >= prev - 1e-5,
-                "monotonicity violated at row {i}: {p} < {prev}"
-            );
-            prev = p;
-        }
+        assert!(non_decreasing(&tree, &data), "monotonicity violated");
 
         // Sanity: the unconstrained fit on the same data is *not* monotone, so
         // the constraint is doing real work.
@@ -654,23 +568,11 @@ mod tests {
             .lambda(1.0)
             .build()
             .unwrap();
-        let free = ExactTreeBuilder::new(&unconstrained).build(
-            &cols,
-            &data,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
+        let free = grow_exact(&unconstrained, &data, &gpair);
+        assert!(
+            !non_decreasing(&free, &data),
+            "unconstrained fit should be non-monotone"
         );
-        let mut any_decrease = false;
-        let mut prev = f32::NEG_INFINITY;
-        for i in 0..n {
-            let p = free.predict_row(&data, i);
-            if p < prev - 1e-5 {
-                any_decrease = true;
-            }
-            prev = p;
-        }
-        assert!(any_decrease, "unconstrained fit should be non-monotone");
     }
 
     #[test]
@@ -693,7 +595,6 @@ mod tests {
             .unwrap()
             .with_feature_types(&[FeatureType::Categorical])
             .unwrap();
-        let cols = SortedColumns::from_dmatrix(&data);
         let params = TrainingParams::builder()
             .max_depth(1)
             .min_child_weight(0.0)
@@ -701,13 +602,7 @@ mod tests {
             .lambda(1.0)
             .build()
             .unwrap();
-        let tree = ExactTreeBuilder::new(&params).build(
-            &cols,
-            &data,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_exact(&params, &data, &gpair);
 
         assert_eq!(tree.num_nodes(), 3, "root should split");
         assert!(tree.node(0).is_categorical, "split should be categorical");
@@ -733,10 +628,7 @@ mod tests {
         use crate::config::TreeMethod;
         use crate::learner::{BoostedModel, train};
         let n = x.len();
-        let data = DMatrix::from_dense(x, n, 1)
-            .unwrap()
-            .with_labels(y)
-            .unwrap();
+        let data = crate::test_support::labeled_dense(x, n, 1, y);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
             .tree_method(TreeMethod::Exact)

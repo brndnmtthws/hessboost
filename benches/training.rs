@@ -5,6 +5,7 @@ use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
+use hessboost::config::ObjectiveParams;
 use hessboost::data::ghist::GHistIndex;
 use hessboost::data::quantile::HistCuts;
 use hessboost::metric::{
@@ -129,14 +130,17 @@ fn bench_histogram_build(c: &mut Criterion) {
 
 fn bench_hist_tree_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("hist_tree_build");
-    for (name, n, features, depth, policy) in [
-        ("depth1", 50_000, 20, 1, GrowPolicy::DepthWise),
-        ("depth6", 50_000, 20, 6, GrowPolicy::DepthWise),
-        ("depth10", 50_000, 20, 10, GrowPolicy::DepthWise),
-        ("wide128", 10_000, 128, 6, GrowPolicy::DepthWise),
-        ("missing", 50_000, 20, 6, GrowPolicy::DepthWise),
-        ("monotone", 50_000, 20, 6, GrowPolicy::DepthWise),
-        ("lossguide", 50_000, 20, 6, GrowPolicy::LossGuide),
+    // `quantized` adds a `{name}_quantized` run with opt-in quantized
+    // gradients (`use_quantized_grad`) on the same data.
+    for (name, n, features, depth, quantized) in [
+        ("depth1", 50_000, 20, 1, false),
+        ("depth6", 50_000, 20, 6, true),
+        ("depth10", 50_000, 20, 10, true),
+        ("wide128", 10_000, 128, 6, true),
+        ("missing", 50_000, 20, 6, true),
+        ("monotone", 50_000, 20, 6, false),
+        ("lossguide", 50_000, 20, 6, false),
+        ("large_depth8", 1_000_000, 50, 8, true),
     ] {
         let mut data = make_data(n, features);
         if name == "missing" {
@@ -163,24 +167,39 @@ fn bench_hist_tree_build(c: &mut Criterion) {
             .map(|&label| GradPair::new(7.5 - label, 1.0))
             .collect();
         let rows: Vec<u32> = (0..n as u32).collect();
-        let params = TrainingParams::builder()
-            .max_depth(depth)
-            .grow_policy(policy)
-            .max_leaves(64)
-            .monotone_constraints(if name == "monotone" {
-                vec![Monotone::Increasing]
+        // A 1M-row tree takes long enough that ten samples are stable.
+        group.sample_size(if n >= 1_000_000 { 10 } else { 100 });
+        let variants: &[bool] = if quantized { &[false, true] } else { &[false] };
+        for &use_quantized_grad in variants {
+            let params = TrainingParams::builder()
+                .max_depth(depth)
+                .grow_policy(if name == "lossguide" {
+                    GrowPolicy::LossGuide
+                } else {
+                    GrowPolicy::DepthWise
+                })
+                .max_leaves(64)
+                .monotone_constraints(if name == "monotone" {
+                    vec![Monotone::Increasing]
+                } else {
+                    Vec::new()
+                })
+                .use_quantized_grad(use_quantized_grad)
+                .build()
+                .unwrap();
+            let builder = HistTreeBuilder::new(&params);
+            let id = if use_quantized_grad {
+                format!("{name}_quantized")
             } else {
-                Vec::new()
-            })
-            .build()
-            .unwrap();
-        let builder = HistTreeBuilder::new(&params);
-        group.bench_function(name, |b| {
-            b.iter(|| {
-                let mut sampler = ColumnSampler::all(features);
-                black_box(builder.build(&ghist, &gpair, &rows, &mut sampler))
+                name.to_owned()
+            };
+            group.bench_function(id, |b| {
+                b.iter(|| {
+                    let mut sampler = ColumnSampler::all(features);
+                    black_box(builder.build(&ghist, &gpair, &rows, &mut sampler))
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -340,6 +359,7 @@ fn bench_log_metrics(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_metric");
     group.throughput(Throughput::Elements(N as u64));
 
+    let tweedie = create_metric("tweedie-nloglik@1.5", 0, &ObjectiveParams::default()).unwrap();
     for (name, metric, labels) in [
         ("logloss", &LogLoss as &dyn Metric, binary_labels.as_slice()),
         (
@@ -352,18 +372,14 @@ fn bench_log_metrics(c: &mut Criterion) {
             &GammaNLogLik as &dyn Metric,
             positive_labels.as_slice(),
         ),
+        (
+            "tweedie_nloglik",
+            tweedie.as_ref(),
+            positive_labels.as_slice(),
+        ),
     ] {
         bench_metric_pair(&mut group, name, metric, &probabilities, labels, &weights);
     }
-    let tweedie = create_metric("tweedie-nloglik@1.5", 0).unwrap();
-    bench_metric_pair(
-        &mut group,
-        "tweedie_nloglik",
-        tweedie.as_ref(),
-        &probabilities,
-        &positive_labels,
-        &weights,
-    );
     group.finish();
 }
 
@@ -381,7 +397,8 @@ fn bench_multiclass_metrics(c: &mut Criterion) {
         let weights: Vec<f32> = make_weights(rows);
         group.throughput(Throughput::Elements(rows as u64));
         for metric_name in ["mlogloss", "merror"] {
-            let metric = create_metric(metric_name, num_class).unwrap();
+            let metric =
+                create_metric(metric_name, num_class, &ObjectiveParams::default()).unwrap();
             group.bench_function(format!("{metric_name}_k{num_class}_unweighted"), |b| {
                 b.iter(|| black_box(metric.eval(&probabilities, &labels, None)));
             });
@@ -438,6 +455,13 @@ fn bench_binary_train(c: &mut Criterion) {
             )
         });
     });
+    let quantized = TrainingParams {
+        use_quantized_grad: true,
+        ..params.clone()
+    };
+    group.bench_function("quantized", |b| {
+        b.iter(|| black_box(train(&quantized, &data, 50).unwrap()));
+    });
     group.finish();
 }
 
@@ -446,11 +470,12 @@ fn bench_train(c: &mut Criterion) {
     let mut group = c.benchmark_group("train_50k_x20_50rounds");
     group.sample_size(10);
 
-    for (name, method, alpha, max_bin) in [
-        ("Hist", TreeMethod::Hist, 0.0, 256),
-        ("Exact", TreeMethod::Exact, 0.0, 256),
-        ("Hist_l1", TreeMethod::Hist, 1.0, 256),
-        ("Hist_16bins", TreeMethod::Hist, 0.0, 16),
+    for (name, method, alpha, max_bin, quantized) in [
+        ("Hist", TreeMethod::Hist, 0.0, 256, false),
+        ("Exact", TreeMethod::Exact, 0.0, 256, false),
+        ("Hist_l1", TreeMethod::Hist, 1.0, 256, false),
+        ("Hist_16bins", TreeMethod::Hist, 0.0, 16, false),
+        ("Hist_quantized", TreeMethod::Hist, 0.0, 256, true),
     ] {
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
@@ -459,12 +484,67 @@ fn bench_train(c: &mut Criterion) {
             .eta(0.1)
             .alpha(alpha)
             .max_bin(max_bin)
+            .use_quantized_grad(quantized)
             .build()
             .unwrap();
         group.bench_function(name, |b| {
             b.iter(|| train(&params, &data, 50).unwrap());
         });
     }
+    group.finish();
+}
+
+/// Batch prediction on 100k x 30 rows: a symmetric model (bit-pattern
+/// tables) against a depthwise model of the same depth and size (generic
+/// lockstep walk).
+fn bench_predict(c: &mut Criterion) {
+    let data = make_data(100_000, 30);
+    let mut group = c.benchmark_group("predict_100k_x30_100trees_depth6");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(data.n_rows() as u64));
+    for (name, policy) in [
+        ("depthwise", GrowPolicy::DepthWise),
+        ("symmetric", GrowPolicy::Symmetric),
+    ] {
+        let params = TrainingParams::builder()
+            .tree_method(TreeMethod::Hist)
+            .grow_policy(policy)
+            .max_depth(6)
+            .eta(0.1)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 100).unwrap();
+        group.bench_function(name, |b| {
+            b.iter(|| model.predict_margin(black_box(&data)).unwrap());
+        });
+    }
+    group.finish();
+}
+
+/// QuadratureTreeSHAP on 100 depth-6 trees over 20 features (trained on 20k
+/// rows): contributions for 2,000 rows and interaction values for 200.
+fn bench_shap(c: &mut Criterion) {
+    let data = make_data(20_000, 20);
+    let params = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .max_depth(6)
+        .eta(0.1)
+        .build()
+        .unwrap();
+    let model = train(&params, &data, 100).unwrap();
+    let values: Vec<f32> = (0..2_000 * 20)
+        .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
+        .collect();
+    let rows = DMatrix::from_dense(&values, 2_000, 20).unwrap();
+    let few_rows = DMatrix::from_dense(&values[..200 * 20], 200, 20).unwrap();
+    let mut group = c.benchmark_group("shap_x20_100trees_depth6");
+    group.sample_size(10);
+    group.bench_function("contribs_2k", |b| {
+        b.iter(|| model.predict_contribs(black_box(&rows)).unwrap());
+    });
+    group.bench_function("interactions_200", |b| {
+        b.iter(|| model.predict_interactions(black_box(&few_rows)).unwrap());
+    });
     group.finish();
 }
 
@@ -478,6 +558,8 @@ criterion_group!(
     bench_log_metrics,
     bench_multiclass_metrics,
     bench_binary_train,
-    bench_train
+    bench_train,
+    bench_predict,
+    bench_shap
 );
 criterion_main!(benches);

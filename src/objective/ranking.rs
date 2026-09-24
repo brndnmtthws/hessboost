@@ -8,8 +8,9 @@
 //! change. Pair values, accumulation, per-query normalization, and query
 //! weighting use XGBoost's float/double conversion points.
 
-use super::{GradPair, Objective};
-use crate::data::GroupInfo;
+use super::{GradPair, MIN_HESS_F64, Objective, check_label_domain};
+use crate::data::{GroupInfo, MetaInfo};
+use crate::error::{HessboostError, Result};
 use crate::metric::{argsort_desc, group_ranges};
 
 /// Which ranking loss the LambdaMART objective optimizes.
@@ -96,7 +97,7 @@ impl LambdaMartObjective {
                 }
                 let score_diff = p[idx_high] - p[idx_low]; // float subtraction
                 let delta_score = f64::from(score_diff.abs());
-                let sigmoid = f64::from(1.0f32 / ((-score_diff).min(88.7).exp() + 1.0));
+                let sigmoid = f64::from(crate::simd::sigmoid_scalar(score_diff));
                 let mut delta = metric
                     .delta(y[idx_high], y[idx_low], rank_high, rank_low)
                     .abs();
@@ -104,7 +105,7 @@ impl LambdaMartObjective {
                     delta /= delta_score + 0.01;
                 }
                 let lambda = (sigmoid - 1.0) * delta;
-                let hessian = (sigmoid * (1.0 - sigmoid)).max(1e-16) * delta * 2.0;
+                let hessian = (sigmoid * (1.0 - sigmoid)).max(MIN_HESS_F64) * delta * 2.0;
                 let pg = GradPair::new(lambda as f32, hessian as f32);
                 out[start + idx_high].grad += pg.grad;
                 out[start + idx_high].hess += pg.hess;
@@ -138,9 +139,29 @@ impl LambdaMartObjective {
             g.hess *= weight_norm;
         }
     }
+}
 
-    /// Shared gradient computation over an optional group layout.
-    fn compute(
+impl Objective for LambdaMartObjective {
+    fn name(&self) -> &str {
+        match self.mode {
+            RankMode::Pairwise => "rank:pairwise",
+            RankMode::Ndcg => "rank:ndcg",
+            RankMode::Map => "rank:map",
+        }
+    }
+
+    fn gradient(
+        &self,
+        preds: &[f32],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        out: &mut [GradPair],
+    ) {
+        // Without group info the whole batch is one query group.
+        self.gradient_grouped(preds, labels, weights, None, out);
+    }
+
+    fn gradient_grouped(
         &self,
         preds: &[f32],
         labels: &[f32],
@@ -167,37 +188,33 @@ impl LambdaMartObjective {
             self.accumulate_group(preds, labels, start, end, weight, weight_norm, out);
         }
     }
-}
 
-impl Objective for LambdaMartObjective {
-    fn name(&self) -> &str {
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         match self.mode {
-            RankMode::Pairwise => "rank:pairwise",
-            RankMode::Ndcg => "rank:ndcg",
-            RankMode::Map => "rank:map",
+            // NDCG gains are `2^label - 1` in a `u32`: relevance in [0, 31].
+            RankMode::Ndcg => check_label_domain(info, |y| !(0.0..=31.0).contains(&y))?,
+            RankMode::Pairwise | RankMode::Map => check_label_domain(info, |y| y < 0.0)?,
         }
-    }
-
-    fn gradient(
-        &self,
-        preds: &[f32],
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        out: &mut [GradPair],
-    ) {
-        // Without group info the whole batch is one query group.
-        self.compute(preds, labels, weights, None, out);
-    }
-
-    fn gradient_grouped(
-        &self,
-        preds: &[f32],
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        group: Option<&GroupInfo>,
-        out: &mut [GradPair],
-    ) {
-        self.compute(preds, labels, weights, group, out);
+        let Some(group) = info.group else {
+            return Err(HessboostError::invalid_param(
+                "group_sizes",
+                "ranking dataset requires group information",
+            ));
+        };
+        if let Some(weights) = info.weights {
+            for (start, end) in group.iter_ranges() {
+                if weights[start..end]
+                    .iter()
+                    .any(|weight| *weight != weights[start])
+                {
+                    return Err(HessboostError::invalid_param(
+                        "weights",
+                        "ranking dataset requires one constant weight per query group",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn default_metric(&self) -> String {
@@ -209,6 +226,11 @@ impl Objective for LambdaMartObjective {
         };
         format!("{base}@{}", self.top_k)
     }
+}
+
+/// XGBoost's NDCG gain `2^label - 1` (`rank:ndcg` labels lie in `[0, 31]`).
+fn ndcg_gain(label: f32) -> f64 {
+    f64::from((1u32 << label as u32) - 1)
 }
 
 /// Per-query data for XGBoost's metric deltas. Ranks are model-score ranks.
@@ -232,10 +254,7 @@ impl MetricCtx {
                     .iter()
                     .take(labels.len().min(top_k))
                     .enumerate()
-                    .map(|(rank, &idx)| {
-                        let gain = f64::from((1u32 << labels[idx] as u32) - 1);
-                        discounts[rank] * gain
-                    })
+                    .map(|(rank, &idx)| discounts[rank] * ndcg_gain(labels[idx]))
                     .sum();
                 MetricCtx::Ndcg {
                     discounts,
@@ -262,8 +281,7 @@ impl MetricCtx {
                 discounts,
                 inv_idcg,
             } => {
-                let gain_high = f64::from((1u32 << y_high as u32) - 1);
-                let gain_low = f64::from((1u32 << y_low as u32) - 1);
+                let (gain_high, gain_low) = (ndcg_gain(y_high), ndcg_gain(y_low));
                 let original = gain_high * discounts[rank_high] + gain_low * discounts[rank_low];
                 let changed = gain_low * discounts[rank_high] + gain_high * discounts[rank_low];
                 (original - changed) * inv_idcg
@@ -291,17 +309,26 @@ impl MetricCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::GroupInfo;
+
+    /// Gradients of `obj` over query groups of `sizes`.
+    fn grouped(
+        obj: LambdaMartObjective,
+        preds: &[f32],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        sizes: &[usize],
+    ) -> Vec<GradPair> {
+        let mut out = vec![GradPair::default(); preds.len()];
+        let group = GroupInfo::from_sizes(sizes);
+        obj.gradient_grouped(preds, labels, weights, Some(&group), &mut out);
+        out
+    }
 
     #[test]
     fn pairwise_pushes_relevant_up() {
         // One group of 3 docs, labels 2 > 1 > 0, all scores equal at start.
         let obj = LambdaMartObjective::ndcg(32);
-        let preds = [0.0f32, 0.0, 0.0];
-        let labels = [2.0f32, 1.0, 0.0];
-        let g = GroupInfo::from_sizes(&[3]);
-        let mut out = vec![GradPair::default(); 3];
-        obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut out);
+        let out = grouped(obj, &[0.0, 0.0, 0.0], &[2.0, 1.0, 0.0], None, &[3]);
         // Negative gradient => leaf value positive => score goes up.
         // Most-relevant doc should get the most-negative gradient.
         assert!(out[0].grad < out[1].grad, "{out:?}");
@@ -314,11 +341,7 @@ mod tests {
     #[test]
     fn no_pairs_when_all_labels_equal() {
         let obj = LambdaMartObjective::pairwise(32);
-        let preds = [0.5f32, -0.2, 1.0];
-        let labels = [1.0f32, 1.0, 1.0];
-        let g = GroupInfo::from_sizes(&[3]);
-        let mut out = vec![GradPair::default(); 3];
-        obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut out);
+        let out = grouped(obj, &[0.5, -0.2, 1.0], &[1.0, 1.0, 1.0], None, &[3]);
         assert!(out.iter().all(|g| g.grad == 0.0 && g.hess == 0.0));
     }
 
@@ -326,11 +349,7 @@ mod tests {
     fn groups_are_independent() {
         // Two groups; a cross-group pair must never be formed.
         let obj = LambdaMartObjective::pairwise(32);
-        let preds = [0.0f32, 0.0, 0.0, 0.0];
-        let labels = [1.0f32, 0.0, 0.0, 1.0];
-        let g = GroupInfo::from_sizes(&[2, 2]);
-        let mut out = vec![GradPair::default(); 4];
-        obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut out);
+        let out = grouped(obj, &[0.0; 4], &[1.0, 0.0, 0.0, 1.0], None, &[2, 2]);
         // Within each group the relevant doc is pushed up, the other down.
         assert!(out[0].grad < 0.0 && out[1].grad > 0.0);
         assert!(out[3].grad < 0.0 && out[2].grad > 0.0);
@@ -343,7 +362,7 @@ mod tests {
         let sigmoid = f64::from(1.0f32 / ((-diff).min(88.7).exp() + 1.0));
         let delta = 1.0 / (f64::from(diff.abs()) + 0.01);
         let lambda = (sigmoid - 1.0) * delta;
-        let hessian = (sigmoid * (1.0 - sigmoid)).max(1e-16) * delta * 2.0;
+        let hessian = (sigmoid * (1.0 - sigmoid)).max(MIN_HESS_F64) * delta * 2.0;
         (lambda as f32, hessian as f32)
     }
 
@@ -356,9 +375,7 @@ mod tests {
         let obj = LambdaMartObjective::pairwise(1);
         let preds = [-0.0f32, 0.0, -1.0];
         let labels = [2.0f32, 1.0, 0.0];
-        let g = GroupInfo::from_sizes(&[3]);
-        let mut out = vec![GradPair::default(); 3];
-        obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut out);
+        let out = grouped(obj, &preds, &labels, None, &[3]);
 
         let (g01, h01) = pairwise_pair(preds[0], preds[1]);
         let (g02, h02) = pairwise_pair(preds[0], preds[2]);
@@ -383,15 +400,13 @@ mod tests {
         let obj = LambdaMartObjective::ndcg(32);
         let preds = [0.3f32, -0.7, 1.1, 0.2, -0.4, 0.9, 0.05];
         let labels = [2.0f32, 0.0, 1.0, 3.0, 1.0, 0.0, 2.0];
-        let g = GroupInfo::from_sizes(&[3, 4]);
+        let sizes = [3, 4];
         let group_w = [0.3f32, 1.7];
         let weights = [0.3f32, 0.3, 0.3, 1.7, 1.7, 1.7, 1.7];
 
         // Unweighted: `w = 1`, `w_norm = 1`, so this is `pairs * norm` exactly.
-        let mut normed = vec![GradPair::default(); 7];
-        obj.gradient_grouped(&preds, &labels, None, Some(&g), &mut normed);
-        let mut out = vec![GradPair::default(); 7];
-        obj.gradient_grouped(&preds, &labels, Some(&weights), Some(&g), &mut out);
+        let normed = grouped(obj, &preds, &labels, None, &sizes);
+        let out = grouped(obj, &preds, &labels, Some(&weights), &sizes);
 
         let sum_w = f64::from(group_w[0]) + f64::from(group_w[1]);
         let w_norm = (2.0 / sum_w) as f32;

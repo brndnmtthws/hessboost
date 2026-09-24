@@ -259,9 +259,9 @@ fn set_combine(this: &mut Vec<Entry>, other: &[Entry], workspace: &mut Vec<Entry
 /// pairs sorted by value directly into at most `max_size` entries.
 fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>) {
     out.clear();
-    if sorted.is_empty() {
+    let Some((&(first_value, first_weight), rest)) = sorted.split_first() else {
         return;
-    }
+    };
     let mut sum_total = 0f64;
     let mut unique_values = 0usize;
     for (i, &(v, w)) in sorted.iter().enumerate() {
@@ -271,41 +271,29 @@ fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>
         sum_total += f64::from(w);
     }
 
-    let (mut rmin, mut wmin) = (0f64, 0f64);
-    let mut last_value = 0f32;
+    // The entry of `value` with rank interval `[rmin, rmin + wmin]`.
+    let entry = |rmin: f64, wmin: f64, value: f32| {
+        Entry::new(rmin as f32, (rmin + wmin) as f32, wmin as f32, value)
+    };
+    let (mut rmin, mut wmin, mut last_value) = (0f64, f64::from(first_weight), first_value);
     if unique_values <= max_size {
         // Enough budget to keep every distinct value: exact weighted summary.
-        for (i, &(v, w)) in sorted.iter().enumerate() {
-            if i == 0 {
-                last_value = v;
-                wmin = f64::from(w);
-                continue;
-            }
+        for &(v, w) in rest {
             if last_value == v {
                 wmin += f64::from(w);
                 continue;
             }
-            let rmax = rmin + wmin;
-            out.push(Entry::new(
-                rmin as f32,
-                rmax as f32,
-                wmin as f32,
-                last_value,
-            ));
-            rmin = rmax;
+            out.push(entry(rmin, wmin, last_value));
+            rmin += wmin;
             last_value = v;
             wmin = f64::from(w);
         }
-        let rmax = rmin + wmin;
-        out.push(Entry::new(
-            rmin as f32,
-            rmax as f32,
-            wmin as f32,
-            last_value,
-        ));
+        out.push(entry(rmin, wmin, last_value));
         return;
     }
 
+    // Upstream's `-1` sentinel (re)starts the scan; kept verbatim, since a
+    // negative weight sum can bring `next_goal` back to `-1`.
     let mut next_goal = -1f64;
     for &(v, w) in sorted {
         if next_goal == -1.0 {
@@ -316,39 +304,27 @@ fn set_prune_sorted(sorted: &[(f32, f32)], max_size: usize, out: &mut Vec<Entry>
         }
         if last_value == v {
             wmin += f64::from(w);
-        } else {
-            let rmax = rmin + wmin;
-            let mut size = out.len();
-            if rmax >= next_goal && size != max_size {
-                if size == 0 || last_value > out[size - 1].value {
-                    out.push(Entry::new(
-                        rmin as f32,
-                        rmax as f32,
-                        wmin as f32,
-                        last_value,
-                    ));
-                    size += 1;
-                }
-                next_goal = if size == max_size {
-                    sum_total * 2.0 + f64::from(1e-5f32)
-                } else {
-                    f64::from((size as f64 * sum_total / max_size as f64) as f32)
-                };
-            }
-            rmin = rmax;
-            wmin = f64::from(w);
-            last_value = v;
+            continue;
         }
-    }
-    let size = out.len();
-    if size == 0 || last_value > out[size - 1].value {
         let rmax = rmin + wmin;
-        out.push(Entry::new(
-            rmin as f32,
-            rmax as f32,
-            wmin as f32,
-            last_value,
-        ));
+        let mut size = out.len();
+        if rmax >= next_goal && size != max_size {
+            if size == 0 || last_value > out[size - 1].value {
+                out.push(entry(rmin, wmin, last_value));
+                size += 1;
+            }
+            next_goal = if size == max_size {
+                sum_total * 2.0 + f64::from(1e-5f32)
+            } else {
+                f64::from((size as f64 * sum_total / max_size as f64) as f32)
+            };
+        }
+        rmin = rmax;
+        wmin = f64::from(w);
+        last_value = v;
+    }
+    if out.last().is_none_or(|e| last_value > e.value) {
+        out.push(entry(rmin, wmin, last_value));
     }
 }
 
@@ -426,7 +402,7 @@ impl WQSketch {
     /// A sketch for a feature with `n_values` non-missing values and at most
     /// `max_bin` bins (upstream `HostSketchContainer` constructor).
     pub(crate) fn new(n_values: usize, max_bin: usize) -> Self {
-        let limit_size = limit_size_level(n_values, sketch_epsilon(max_bin, n_values));
+        let limit_size = summary_budget(max_bin, n_values);
         WQSketch {
             max_bin,
             limit_size,

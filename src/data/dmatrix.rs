@@ -1,6 +1,6 @@
 //! The core dataset container: a feature matrix plus training metadata.
 
-use crate::data::meta::{FeatureType, GroupInfo};
+use crate::data::meta::{FeatureType, GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 
 /// Returns `true` if `v` should be treated as missing given the sentinel
@@ -16,16 +16,11 @@ pub(crate) fn is_missing(v: f32, missing: f32) -> bool {
 }
 
 /// Length check shared by every constructor and metadata setter: `got` must
-/// equal `expected`. Preserves the [`HessboostError::DimensionMismatch`] shape
-/// each call site already returned.
+/// equal `expected`, else [`HessboostError::DimensionMismatch`].
 #[inline]
 pub(crate) fn check_len(what: &'static str, got: usize, expected: usize) -> Result<()> {
     if got != expected {
-        return Err(HessboostError::DimensionMismatch {
-            what,
-            expected,
-            got,
-        });
+        return Err(HessboostError::dimension_mismatch(what, expected, got));
     }
     Ok(())
 }
@@ -33,7 +28,7 @@ pub(crate) fn check_len(what: &'static str, got: usize, expected: usize) -> Resu
 /// Validate CSR `indptr` against `nnz` stored entries: first offset 0,
 /// monotonic offsets within bounds, terminal offset `== nnz`.
 /// Caller must ensure `indptr` is non-empty (`from_csr` rejects that first).
-pub(crate) fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
+fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
     if indptr[0] != 0 {
         return Err(HessboostError::invalid_param(
             "csr indptr",
@@ -51,6 +46,23 @@ pub(crate) fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
     check_len("csr indptr terminal", indptr[indptr.len() - 1], nnz)
 }
 
+/// Reject weights that are negative or non-finite (`invalid`), or none of
+/// which is positive (`none_positive`), under parameter `name`.
+fn check_weights(
+    name: &'static str,
+    weights: &[f32],
+    invalid: &'static str,
+    none_positive: &'static str,
+) -> Result<()> {
+    if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return Err(HessboostError::invalid_param(name, invalid));
+    }
+    if !weights.iter().any(|v| *v > 0.0) {
+        return Err(HessboostError::invalid_param(name, none_positive));
+    }
+    Ok(())
+}
+
 /// Backing storage for the feature matrix.
 #[derive(Debug, Clone)]
 enum Storage {
@@ -64,8 +76,9 @@ enum Storage {
     },
 }
 
-/// A dataset: features in dense or sparse form, plus labels, weights, base
-/// margins, ranking groups, and per-feature metadata.
+/// A dataset: features in dense or sparse form, plus labels (one or more
+/// targets per row), label bounds, weights, base margins, ranking groups, and
+/// per-feature metadata.
 ///
 /// Missing values are first-class: in dense storage any entry equal to the
 /// [`DMatrix::missing`] sentinel (NaN by default) is treated as absent, and in
@@ -78,11 +91,16 @@ pub struct DMatrix {
     n_cols: usize,
     storage: Storage,
     missing: f32,
+    /// Row-major `[row][target]`, length `n_rows * n_targets`.
     labels: Option<Vec<f32>>,
+    n_targets: usize,
+    label_lower_bound: Option<Vec<f32>>,
+    label_upper_bound: Option<Vec<f32>>,
     weights: Option<Vec<f32>>,
     base_margin: Option<Vec<f32>>,
     group: Option<GroupInfo>,
     feature_types: Vec<FeatureType>,
+    feature_weights: Option<Vec<f32>>,
 }
 
 /// A single materialized `(feature_index, value)` entry from a row.
@@ -103,10 +121,14 @@ impl DMatrix {
             storage,
             missing,
             labels: None,
+            n_targets: 1,
+            label_lower_bound: None,
+            label_upper_bound: None,
             weights: None,
             base_margin: None,
             group: None,
             feature_types: vec![FeatureType::Numerical; n_cols],
+            feature_weights: None,
         }
     }
 
@@ -190,8 +212,9 @@ impl DMatrix {
                 "stored feature values must be finite",
             ));
         }
+        let mut seen = std::collections::HashSet::new();
         for row in 0..n_rows {
-            let mut seen = std::collections::HashSet::new();
+            seen.clear();
             for &col in &indices[indptr[row]..indptr[row + 1]] {
                 if !seen.insert(col) {
                     return Err(HessboostError::invalid_param(
@@ -213,9 +236,25 @@ impl DMatrix {
         ))
     }
 
-    /// Attach regression/classification labels (`len == n_rows`).
-    pub fn with_labels(mut self, labels: &[f32]) -> Result<Self> {
-        check_len("labels", labels.len(), self.n_rows)?;
+    /// Attach regression/classification labels (`len == n_rows`), one target
+    /// per row.
+    pub fn with_labels(self, labels: &[f32]) -> Result<Self> {
+        self.with_label_matrix(labels, 1)
+    }
+
+    /// Attach a label matrix with `n_targets` targets per row, laid out
+    /// row-major `[row][target]` (`len == n_rows * n_targets`).
+    pub fn with_label_matrix(mut self, labels: &[f32], n_targets: usize) -> Result<Self> {
+        if n_targets == 0 {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                "n_targets must be at least 1",
+            ));
+        }
+        let expected = self.n_rows.checked_mul(n_targets).ok_or_else(|| {
+            HessboostError::invalid_param("labels", "n_rows * n_targets overflows usize")
+        })?;
+        check_len("labels", labels.len(), expected)?;
         if labels.iter().any(|v| !v.is_finite()) {
             return Err(HessboostError::invalid_param(
                 "labels",
@@ -223,24 +262,64 @@ impl DMatrix {
             ));
         }
         self.labels = Some(labels.to_vec());
+        self.n_targets = n_targets;
+        Ok(self)
+    }
+
+    /// Attach interval-censored label bounds (`len == n_rows` each), as used
+    /// by `survival:aft`.
+    ///
+    /// NaN is rejected in both. `upper` may be `+inf` (right censoring) and
+    /// `lower` may be `<= 0` (left censoring); as in XGBoost the bounds are
+    /// not checked against each other.
+    pub fn with_label_bounds(mut self, lower: &[f32], upper: &[f32]) -> Result<Self> {
+        check_len("label_lower_bound", lower.len(), self.n_rows)?;
+        check_len("label_upper_bound", upper.len(), self.n_rows)?;
+        for (name, bound) in [("label_lower_bound", lower), ("label_upper_bound", upper)] {
+            if bound.iter().any(|v| v.is_nan()) {
+                return Err(HessboostError::invalid_param(
+                    name,
+                    "label bounds must not be NaN",
+                ));
+            }
+        }
+        self.label_lower_bound = Some(lower.to_vec());
+        self.label_upper_bound = Some(upper.to_vec());
+        Ok(self)
+    }
+
+    /// Attach per-feature column-sampling weights (`len == n_cols`), XGBoost's
+    /// `DMatrix` `feature_weights`. When set on the training matrix, every
+    /// `colsample_bytree`/`bylevel`/`bynode` stage draws features without
+    /// replacement with probability proportional to their weight (see
+    /// [`ColumnSampler`](crate::tree::sampler::ColumnSampler)); with every
+    /// ratio at `1.0` they have no effect. Weights below `1e-6`, zero
+    /// included, are floored at `1e-6` as in XGBoost, so a zero weight is an
+    /// epsilon weight, not an exclusion: such a feature is rarely drawn
+    /// against much larger weights but can still be selected, and it is as
+    /// likely as any other feature weighted below `1e-6`. Not stored in the
+    /// model.
+    pub fn with_feature_weights(mut self, weights: &[f32]) -> Result<Self> {
+        check_len("feature_weights", weights.len(), self.n_cols)?;
+        check_weights(
+            "feature_weights",
+            weights,
+            "feature weights must be finite and non-negative",
+            "at least one feature weight must be positive",
+        )?;
+        self.feature_weights = Some(weights.to_vec());
         Ok(self)
     }
 
     /// Attach per-instance weights (`len == n_rows`).
     pub fn with_weights(mut self, weights: &[f32]) -> Result<Self> {
         check_len("weights", weights.len(), self.n_rows)?;
-        if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
-            return Err(HessboostError::invalid_param(
-                "weights",
-                "weights must be finite and non-negative",
-            ));
-        }
-        if !weights.iter().any(|v| *v > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "weights",
-                "at least one weight must be positive",
-            ));
-        }
+        check_weights(
+            "weights",
+            weights,
+            "weights must be finite and non-negative",
+            "at least one weight must be positive",
+        )?;
         self.weights = Some(weights.to_vec());
         Ok(self)
     }
@@ -279,9 +358,8 @@ impl DMatrix {
                 "group-size sum overflows usize",
             ));
         };
-        let g = GroupInfo::from_sizes(sizes);
         check_len("group sizes sum", total, self.n_rows)?;
-        self.group = Some(g);
+        self.group = Some(GroupInfo::from_sizes(sizes));
         Ok(self)
     }
 
@@ -295,16 +373,8 @@ impl DMatrix {
             HessboostError::invalid_param("group_weights", "attach group sizes first")
         })?;
         check_len("group_weights length", weights.len(), group.num_groups())?;
-        if weights
-            .iter()
-            .any(|weight| !weight.is_finite() || *weight < 0.0)
-            || !weights.iter().any(|weight| *weight > 0.0)
-        {
-            return Err(HessboostError::invalid_param(
-                "group_weights",
-                "weights must be finite and non-negative with at least one positive value",
-            ));
-        }
+        let invalid = "weights must be finite and non-negative with at least one positive value";
+        check_weights("group_weights", weights, invalid, invalid)?;
         let mut expanded = Vec::with_capacity(self.n_rows);
         for ((start, end), &weight) in group.iter_ranges().zip(weights) {
             expanded.extend(std::iter::repeat_n(weight, end - start));
@@ -352,10 +422,30 @@ impl DMatrix {
         self.missing
     }
 
-    /// Labels, if attached.
+    /// Labels, if attached: row-major `[row][target]`, length
+    /// `n_rows * n_targets`.
     #[inline]
     pub fn labels(&self) -> Option<&[f32]> {
         self.labels.as_deref()
+    }
+
+    /// Number of label columns (targets) per row; 1 unless set by
+    /// [`DMatrix::with_label_matrix`].
+    #[inline]
+    pub fn n_targets(&self) -> usize {
+        self.n_targets
+    }
+
+    /// Lower label bounds for interval-censored labels, if attached.
+    #[inline]
+    pub fn label_lower_bound(&self) -> Option<&[f32]> {
+        self.label_lower_bound.as_deref()
+    }
+
+    /// Upper label bounds for interval-censored labels, if attached.
+    #[inline]
+    pub fn label_upper_bound(&self) -> Option<&[f32]> {
+        self.label_upper_bound.as_deref()
     }
 
     /// Weights, if attached.
@@ -382,40 +472,44 @@ impl DMatrix {
         &self.feature_types
     }
 
+    /// Per-feature sampling weights, if attached.
+    #[inline]
+    pub fn feature_weights(&self) -> Option<&[f32]> {
+        self.feature_weights.as_deref()
+    }
+
+    /// Borrowed view of the per-row training metadata that objectives and
+    /// metrics consume.
+    pub fn info(&self) -> MetaInfo<'_> {
+        MetaInfo {
+            n_rows: self.n_rows,
+            labels: self.labels.as_deref().unwrap_or(&[]),
+            n_targets: self.n_targets,
+            weights: self.weights.as_deref(),
+            group: self.group.as_ref(),
+            label_lower_bound: self.label_lower_bound.as_deref(),
+            label_upper_bound: self.label_upper_bound.as_deref(),
+        }
+    }
+
     /// Fetch a single value, returning `None` when the entry is missing.
     pub fn get(&self, row: usize, col: usize) -> Option<f32> {
         if row >= self.n_rows || col >= self.n_cols {
             return None;
         }
-        match &self.storage {
-            Storage::Dense(data) => {
-                let v = data[row * self.n_cols + col];
-                if is_missing(v, self.missing) {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
+        let v = match &self.storage {
+            Storage::Dense(data) => data[row * self.n_cols + col],
             Storage::Csr {
                 indptr,
                 indices,
                 values,
             } => {
-                let (s, e) = (indptr[row], indptr[row + 1]);
                 // Rows are not assumed sorted by column; linear scan of the row.
-                for k in s..e {
-                    if indices[k] as usize == col {
-                        let v = values[k];
-                        return if is_missing(v, self.missing) {
-                            None
-                        } else {
-                            Some(v)
-                        };
-                    }
-                }
-                None
+                let k = (indptr[row]..indptr[row + 1]).find(|&k| indices[k] as usize == col)?;
+                values[k]
             }
-        }
+        };
+        (!is_missing(v, self.missing)).then_some(v)
     }
 
     /// Raw row-major storage of a dense matrix (missing entries hold the
@@ -441,6 +535,42 @@ impl DMatrix {
                 values,
             } => Some((indptr, indices, values)),
         }
+    }
+
+    /// Copy of this matrix, metadata included, with every non-missing stored
+    /// value replaced by `f(row, col, value)`. Missing dense entries become NaN
+    /// and the result's sentinel is NaN, so a mapped value can never collide
+    /// with a non-NaN sentinel. Feature types are copied unchanged.
+    pub(crate) fn map_values(&self, mut f: impl FnMut(usize, usize, f32) -> f32) -> Self {
+        let mut out = self.clone();
+        match &mut out.storage {
+            Storage::Dense(data) => {
+                for (row, values) in data.chunks_exact_mut(self.n_cols).enumerate() {
+                    for (col, v) in values.iter_mut().enumerate() {
+                        *v = if is_missing(*v, self.missing) {
+                            f32::NAN
+                        } else {
+                            f(row, col, *v)
+                        };
+                    }
+                }
+            }
+            Storage::Csr {
+                indptr,
+                indices,
+                values,
+            } => {
+                for row in 0..self.n_rows {
+                    for k in indptr[row]..indptr[row + 1] {
+                        if !is_missing(values[k], self.missing) {
+                            values[k] = f(row, indices[k] as usize, values[k]);
+                        }
+                    }
+                }
+            }
+        }
+        out.missing = f32::NAN;
+        out
     }
 
     /// Visit every non-missing `(index, value)` entry of `row`, in storage
@@ -490,9 +620,8 @@ impl DMatrix {
         self.for_each_entry(|_row, col, _v| col_counts[col as usize] += 1);
 
         let mut col_ptr = vec![0usize; self.n_cols + 1];
-        #[allow(clippy::needless_range_loop)]
-        for c in 0..self.n_cols {
-            col_ptr[c + 1] = col_ptr[c] + col_counts[c];
+        for (c, &count) in col_counts.iter().enumerate() {
+            col_ptr[c + 1] = col_ptr[c] + count;
         }
         let nnz = col_ptr[self.n_cols];
         let mut rows = vec![0u32; nnz];
@@ -515,8 +644,9 @@ impl DMatrix {
     }
 
     /// Build a new matrix containing only `rows` (in the given order), carrying
-    /// over labels, weights, base margin, and feature metadata. Used for
-    /// cross-validation folds. Ranking group info is not carried over.
+    /// over labels (every target of each row), label bounds, weights, base
+    /// margin, and feature metadata. Used for cross-validation folds. Ranking
+    /// group info is not carried over.
     pub fn select_rows(&self, rows: &[usize]) -> Result<Self> {
         if let Some(&row) = rows.iter().find(|&&row| row >= self.n_rows) {
             return Err(HessboostError::invalid_param(
@@ -528,62 +658,40 @@ impl DMatrix {
         indptr.push(0usize);
         let mut indices: Vec<u32> = Vec::new();
         let mut values: Vec<f32> = Vec::new();
-        let mut buf: Vec<Entry> = Vec::new();
         for &r in rows {
-            self.row_into(r, &mut buf);
-            for e in &buf {
-                indices.push(e.index);
-                values.push(e.value);
-            }
+            self.for_row_entry(r, |index, value| {
+                indices.push(index);
+                values.push(value);
+            });
             indptr.push(values.len());
         }
         let mut out = DMatrix::from_csr(indptr, indices, values, self.n_cols)?;
         out.feature_types.clone_from(&self.feature_types);
-        if let Some(l) = &self.labels {
-            out.labels = Some(rows.iter().map(|&r| l[r]).collect());
-        }
-        if let Some(w) = &self.weights {
-            out.weights = Some(rows.iter().map(|&r| w[r]).collect());
-        }
-        if let Some(bm) = &self.base_margin {
-            let nout = bm.len() / self.n_rows;
-            let mut selected = Vec::with_capacity(rows.len() * nout);
+        out.feature_weights.clone_from(&self.feature_weights);
+        out.n_targets = self.n_targets;
+        // Each row's `stride` consecutive values of `v`, in `rows` order.
+        let gather = |v: &[f32], stride: usize| {
+            let mut selected = Vec::with_capacity(rows.len() * stride);
             for &r in rows {
-                selected.extend_from_slice(&bm[r * nout..(r + 1) * nout]);
+                selected.extend_from_slice(&v[r * stride..(r + 1) * stride]);
             }
-            out.base_margin = Some(selected);
-        }
+            selected
+        };
+        out.labels = self.labels.as_deref().map(|l| gather(l, self.n_targets));
+        out.label_lower_bound = self.label_lower_bound.as_deref().map(|lo| gather(lo, 1));
+        out.label_upper_bound = self.label_upper_bound.as_deref().map(|hi| gather(hi, 1));
+        out.weights = self.weights.as_deref().map(|w| gather(w, 1));
+        out.base_margin = self
+            .base_margin
+            .as_deref()
+            .map(|bm| gather(bm, bm.len() / self.n_rows));
         Ok(out)
     }
 
-    /// Visit every non-missing entry as `(row, col, value)`.
-    fn for_each_entry(&self, mut f: impl FnMut(usize, u32, f32)) {
-        match &self.storage {
-            Storage::Dense(data) => {
-                for r in 0..self.n_rows {
-                    let base = r * self.n_cols;
-                    for c in 0..self.n_cols {
-                        let v = data[base + c];
-                        if !is_missing(v, self.missing) {
-                            f(r, c as u32, v);
-                        }
-                    }
-                }
-            }
-            Storage::Csr {
-                indptr,
-                indices,
-                values,
-            } => {
-                for r in 0..self.n_rows {
-                    for k in indptr[r]..indptr[r + 1] {
-                        let v = values[k];
-                        if !is_missing(v, self.missing) {
-                            f(r, indices[k], v);
-                        }
-                    }
-                }
-            }
+    /// Visit every non-missing entry as `(row, col, value)`, in row order.
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(usize, u32, f32)) {
+        for r in 0..self.n_rows {
+            self.for_row_entry(r, |c, v| f(r, c, v));
         }
     }
 }
@@ -717,6 +825,86 @@ mod tests {
     fn categorical_values_must_be_non_negative_integers() {
         let d = DMatrix::from_dense(&[0.0, 1.5], 2, 1).unwrap();
         assert!(d.with_feature_types(&[FeatureType::Categorical]).is_err());
+    }
+
+    #[test]
+    fn label_matrix_is_row_major_and_validated() {
+        let d = sample_dense();
+        assert!(d.clone().with_label_matrix(&[1.0; 5], 2).is_err());
+        assert!(d.clone().with_label_matrix(&[], 0).is_err());
+        assert!(
+            d.clone()
+                .with_label_matrix(&[1.0, 2.0, 3.0, 4.0, 5.0, f32::NAN], 2)
+                .is_err()
+        );
+        let m = d
+            .with_label_matrix(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2)
+            .unwrap();
+        assert_eq!(m.n_targets(), 2);
+        let info = m.info();
+        assert_eq!((info.n_rows, info.n_targets), (3, 2));
+        assert_eq!(info.labels, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // Re-attaching single-target labels resets the target count.
+        assert_eq!(m.with_labels(&[0.0, 1.0, 2.0]).unwrap().n_targets(), 1);
+    }
+
+    #[test]
+    fn label_bounds_allow_censoring_but_not_nan() {
+        let d = sample_dense();
+        let inf = f32::INFINITY;
+        let censored = d
+            .clone()
+            .with_label_bounds(&[0.0, -1.0, 2.0], &[1.0, inf, 1.5])
+            .unwrap();
+        assert_eq!(censored.label_lower_bound().unwrap(), &[0.0, -1.0, 2.0]);
+        assert_eq!(censored.label_upper_bound().unwrap(), &[1.0, inf, 1.5]);
+        assert!(censored.labels().is_none());
+        assert!(censored.info().labels.is_empty());
+        assert!(
+            d.clone()
+                .with_label_bounds(&[f32::NAN, 0.0, 0.0], &[1.0; 3])
+                .is_err()
+        );
+        assert!(
+            d.clone()
+                .with_label_bounds(&[0.0; 3], &[1.0, f32::NAN, 1.0])
+                .is_err()
+        );
+        assert!(d.with_label_bounds(&[0.0; 2], &[1.0; 3]).is_err());
+    }
+
+    #[test]
+    fn feature_weights_are_validated() {
+        let d = sample_dense();
+        assert!(d.clone().with_feature_weights(&[1.0]).is_err());
+        assert!(d.clone().with_feature_weights(&[1.0, -0.5]).is_err());
+        assert!(d.clone().with_feature_weights(&[0.0, 0.0]).is_err());
+        assert!(
+            d.clone()
+                .with_feature_weights(&[1.0, f32::INFINITY])
+                .is_err()
+        );
+        let w = d.with_feature_weights(&[0.0, 2.0]).unwrap();
+        assert_eq!(w.feature_weights().unwrap(), &[0.0, 2.0]);
+    }
+
+    /// Cross-validation folds must keep every target of a selected row
+    /// together, and carry bounds and feature weights along.
+    #[test]
+    fn select_rows_carries_multi_target_labels_and_metadata() {
+        let d = sample_dense()
+            .with_label_matrix(&[10.0, 11.0, 20.0, 21.0, 30.0, 31.0], 2)
+            .unwrap()
+            .with_label_bounds(&[1.0, 2.0, 3.0], &[1.5, f32::INFINITY, 3.5])
+            .unwrap()
+            .with_feature_weights(&[0.25, 0.75])
+            .unwrap();
+        let s = d.select_rows(&[2, 0]).unwrap();
+        assert_eq!(s.n_targets(), 2);
+        assert_eq!(s.labels().unwrap(), &[30.0, 31.0, 10.0, 11.0]);
+        assert_eq!(s.label_lower_bound().unwrap(), &[3.0, 1.0]);
+        assert_eq!(s.label_upper_bound().unwrap(), &[3.5, 1.5]);
+        assert_eq!(s.feature_weights().unwrap(), &[0.25, 0.75]);
     }
 
     #[test]

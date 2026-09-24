@@ -1,10 +1,15 @@
-//! XGBoost-format (JSON) model import and export, targeting the XGBoost 3.4.1
-//! schema.
+//! XGBoost-format model import and export, targeting the XGBoost 3.4.2
+//! schema (identical to 3.4.1's), in both of XGBoost's encodings: JSON text
+//! ([`export_xgboost_json`] / [`import_xgboost_json`], XGBoost's `m.json`) and
+//! Universal Binary JSON ([`export_xgboost_ubjson`] / [`import_xgboost_ubjson`],
+//! XGBoost's `m.ubj` and `save_raw("ubj")`). Both encodings carry the same
+//! document and share one model mapping; UBJSON only changes how it is
+//! serialized (see [UBJSON encoding](#ubjson-encoding)).
 //!
 //! XGBoost serializes a booster as a nested JSON document:
 //!
 //! ```text
-//! {"version": [3, 4, 1],
+//! {"version": [3, 4, 2],
 //!  "learner": {
 //!    "gradient_booster": {
 //!      "name": "gbtree",
@@ -19,32 +24,53 @@
 //! `split_conditions`, `default_left`, `base_weights`, `sum_hessian` and
 //! `loss_changes`. A node `i` is a **leaf** when `left_children[i] == -1`. Its
 //! weight is carried in `split_conditions[i]` (and, redundantly,
-//! `base_weights[i]`). Internal nodes route `x[split_indices[i]] <
+//! `base_weights[i]`). Numeric internal nodes route `x[split_indices[i]] <
 //! split_conditions[i]`, sending missing values in the `default_left[i]`
 //! direction, matching the exact semantics of [`crate::tree::RegTree`].
+//! Categorical internal nodes (`split_type[i] == 1`) carry their category set
+//! in the tree's `categories` / `categories_nodes` / `categories_segments` /
+//! `categories_sizes` arrays.
 //!
 //! # Scope and caveats
 //!
-//! Import targets a `gbtree` booster with a scalar or multiclass objective.
-//! XGBoost 3.4.1 saves `booster=dart` as `gbtree` plus a per-tree
+//! Import targets a `gbtree` booster with a scalar, multiclass, or
+//! multi-target objective, with scalar-leaf trees (`one_output_per_tree`) or
+//! vector-leaf trees (`multi_output_tree`, see
+//! [Vector-leaf trees](#vector-leaf-trees)).
+//! XGBoost saves `booster=dart` as `gbtree` plus a per-tree
 //! `model.weight_drop` array; those weights become the model's DART tree
 //! weights on import, and a model with non-unit tree weights writes them back
 //! as `weight_drop` on export. Other booster kinds (`gblinear`) yield a clear
-//! [`HessboostError::ModelFormat`]. Categorical splits, vector leaves
-//! (`size_leaf_vector > 1`) and non-numeric split types are not interpreted.
-//! Only numeric splits round-trip.
+//! [`HessboostError::ModelFormat`]. Numeric and categorical splits both
+//! round-trip in either direction.
 //!
 //! ## Tree layout (`tree_info`)
 //!
 //! XGBoost tags each tree with its output group in `model.tree_info` and lays
 //! trees out per boosting iteration as `[g0 × num_parallel_tree, g1 × ...]`,
 //! with `iteration_indptr` (or, when absent, `num_parallel_tree × groups`
-//! trees per iteration) marking iteration boundaries. `hessboost` stores
-//! trees round-robin (tree `t` feeds output `t % n_outputs`), so import
-//! reorders each iteration's trees -- and their `weight_drop` entries -- into
-//! that layout, preserving each group's order. Per-output predictions are sums
-//! over a group's trees, so the reordering is lossless; a model whose groups
-//! have unequal tree counts within an iteration is rejected.
+//! trees per iteration) marking iteration boundaries. `hessboost` stores the
+//! same layout ([`BoostedModel::num_parallel_tree`] trees per output and
+//! iteration), so boosted random forests keep their iteration structure in
+//! both directions and export writes `num_parallel_tree`, `tree_info` and
+//! `iteration_indptr` accordingly. Import regroups an iteration whose trees
+//! are tagged out of group order, preserving each group's order (per-output
+//! predictions are sums over a group's trees, so this is lossless); a model
+//! whose groups have unequal tree counts within an iteration, or whose
+//! iterations differ in size, is rejected.
+//!
+//! ## Vector-leaf trees
+//!
+//! A `multi_output_tree` model stores XGBoost's `MultiTargetTree` layout:
+//! `tree_param.size_leaf_vector = K`, the shared split structure in the usual
+//! node-indexed arrays, and every leaf's `K` weights in `leaf_weights`
+//! (leaves in node order), each leaf's `right_children` entry holding its
+//! index into that array. Leaves and categorical nodes carry XGBoost's
+//! `DftBadValue` split condition, the root's parent is `-1`, and every tree
+//! belongs to group 0 of `tree_info` (one tree per iteration). hessboost does
+//! not retain internal node weights: export writes zeros for internal nodes'
+//! `base_weights` (leaves repeat their vectors), which XGBoost does not read
+//! for prediction.
 //!
 //! ## Objective parameters
 //!
@@ -52,29 +78,73 @@
 //! `poisson_regression_param.max_delta_step`,
 //! `tweedie_regression_param.tweedie_variance_power`,
 //! `pseudo_huber_param.huber_slope`,
-//! `lambdarank_param.lambdarank_num_pair_per_sample`) round-trips through the
-//! model's [`ObjectiveParams`]; absent fields take XGBoost's defaults. Export
-//! rejects models whose objective XGBoost cannot load (custom objectives).
+//! `lambdarank_param.lambdarank_num_pair_per_sample`,
+//! `quantile_loss_param.quantile_alpha`,
+//! `expectile_loss_param.expectile_alpha`,
+//! `aft_loss_param.{aft_loss_distribution, aft_loss_distribution_scale}`)
+//! round-trips through the model's [`ObjectiveParams`]; absent fields take
+//! XGBoost's defaults. The alpha lists are XGBoost's array strings
+//! (`"[0.1,0.5,0.9]"`, `(..)` also read); `reg:absoluteerror` and
+//! `survival:cox` have no block. A supported objective whose parameters do
+//! not rebuild it (e.g. an empty or unsorted alpha list) is a format error.
+//! Export rejects models whose objective XGBoost cannot load (custom
+//! objectives, and hessboost's distributional `dist:*` objectives, which
+//! import rejects as well).
 //!
 //! ## `base_score`
 //!
 //! XGBoost 3.x stores the intercept as a vector string, `"[v0,v1,...]"`, with
 //! one entry per output (or a single entry that applies to every output), in
-//! whatever space its objective reports: raw margin for `reg:squarederror`, but
+//! whatever space its objective's `ProbToMargin` maps from: raw margin for
+//! `reg:squarederror`, `binary:logitraw` and `binary:hinge`, but
 //! **probability** space for objectives with a link function (`0.5` for
 //! `binary:logistic`, not its logit). `hessboost` stores per-output
-//! intercepts in **margin** space, so on **import** each entry is mapped
-//! through the objective's inverse link ([`Objective::prob_to_margin`]) and on
-//! **export** each margin is mapped back with the forward transform
-//! ([`Objective::pred_transform`]). Multiclass objectives (and any objective we
-//! cannot reconstruct) pass the values through unchanged, as XGBoost does.
+//! intercepts in **margin** space, so on **import** the vector is mapped
+//! through the objective's inverse link ([`Objective::probs_to_margins`]) and
+//! on **export** the margin row is mapped back with
+//! [`Objective::margins_to_probs`] (the forward transform, except for
+//! `binary:hinge` and `reg:quantileerror`, whose transforms (threshold, sort)
+//! are not their links). Multiclass objectives
+//! (and any objective we cannot reconstruct) pass the values through
+//! unchanged, as XGBoost does: softmax's inverse link is the identity, while
+//! its forward transform normalizes across classes.
+//!
+//! `learner_model_param.num_target` is XGBoost's output count
+//! (`ObjFunction::Targets`): [`BoostedModel::n_outputs`] for non-multiclass
+//! models — one per label column for a multi-target model
+//! (`one_output_per_tree` on a label matrix, `num_class` 0), one per alpha for
+//! `reg:quantileerror` / `reg:expectileerror`, whose
+//! [`BoostedModel::n_targets`] is the single label column — and
+//! [`BoostedModel::n_targets`] (1) for multiclass. Import checks it against
+//! the rebuilt objective's output count. Tree groups in `tree_info` and
+//! `base_score` entries are per output, laid out exactly like multiclass
+//! groups.
+//!
+//! ## UBJSON encoding
+//!
+//! XGBoost keeps the node-indexed tree arrays as typed arrays and writes them
+//! to UBJSON in optimized form (`[$<type>#L<count>` plus big-endian
+//! payloads). [`export_xgboost_ubjson`] does the same with XGBoost's element
+//! types: float32 for `split_conditions`, `base_weights`, `loss_changes`,
+//! `sum_hessian` (and `leaf_weights`, gblinear `weights`); int32 for
+//! `left_children`, `right_children`, `parents`, `categories`,
+//! `categories_nodes` and `split_indices` (int64 when a tree's `num_feature`
+//! exceeds the int32 range, as in XGBoost); uint8 for `default_left` and
+//! `split_type`; int64 for `categories_segments` and `categories_sizes`. The
+//! category container's int32 `feature_segments` / `sorted_idx` / `offsets`
+//! and its per-column `values` follow XGBoost too. Every other array is a
+//! counted generic array, numbers are float32 and integers the narrowest
+//! width, again as XGBoost writes them. [`import_xgboost_ubjson`] accepts the
+//! optimized and the plain UBJSON container forms alike.
 
-use crate::config::ObjectiveParams;
+use crate::config::{AftDistribution, ObjectiveParams};
 use crate::error::{HessboostError, Result};
 use crate::learner::BoostedModel;
 use crate::learner::model::ModelSpec;
+use crate::model::ubjson::{self, ElementType};
 use crate::objective::{Objective, create_objective};
 use crate::tree::{Node, RegTree};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 /// Sentinel XGBoost writes for the parent of the root node (`kInvalidNodeId`).
@@ -85,17 +155,107 @@ const INVALID_NODE: i32 = i32::MAX;
 /// The result is a pretty-printed JSON string equivalent to what
 /// `xgboost.Booster.save_model("m.json")` produces for a `gbtree` model
 /// (including DART tree weights as `weight_drop`), and is accepted by
-/// [`import_xgboost_json`] as well as upstream XGBoost 3.4.1. See the module
+/// [`import_xgboost_json`] as well as upstream XGBoost 3.4.2. See the module
 /// docs (above) for the `base_score` space convention.
 pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&model_to_value(model)?)?)
+}
+
+/// Serialize a [`BoostedModel`] into XGBoost's UBJSON model format.
+///
+/// The bytes hold the same document as [`export_xgboost_json`], encoded the
+/// way `xgboost.Booster.save_model("m.ubj")` encodes it (typed tree arrays;
+/// see [UBJSON encoding](self#ubjson-encoding)). They are accepted by
+/// [`import_xgboost_ubjson`] and upstream XGBoost 3.4.2.
+pub fn export_xgboost_ubjson(model: &BoostedModel) -> Result<Vec<u8>> {
+    ubjson::encode(&model_to_value(model)?, &xgboost_typed_array)
+}
+
+/// Parse an XGBoost JSON model document into a [`BoostedModel`].
+///
+/// Accepts `gbtree` boosters, including XGBoost 3.4.1's DART layout
+/// (`gbtree` plus `model.weight_drop`). Other booster kinds produce a
+/// [`HessboostError::ModelFormat`]. See the module docs (above) for details and
+/// the `base_score` space convention.
+pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
+    model_from_value(&serde_json::from_str(json)?)
+}
+
+/// Parse an XGBoost UBJSON model (`save_model("m.ubj")` or
+/// `save_raw("ubj")`) into a [`BoostedModel`].
+///
+/// Decoding accepts optimized (typed / counted) and plain UBJSON containers;
+/// the decoded document then goes through the same mapping, with the same
+/// support and errors, as [`import_xgboost_json`]. Malformed bytes produce a
+/// [`HessboostError::ModelFormat`].
+pub fn import_xgboost_ubjson(bytes: &[u8]) -> Result<BoostedModel> {
+    model_from_value(&ubjson::decode(bytes)?)
+}
+
+/// The element type XGBoost stores the array member `key` of `object` with,
+/// or `None` for a generic array. Mirrors the `F32Array` / `I32Array` /
+/// `U8Array` / `I64Array` members of XGBoost's `RegTree::SaveModel`,
+/// `MultiTargetTree::SaveModel`, `GBLinearModel::SaveModel` and
+/// `CatContainer::Save`.
+fn xgboost_typed_array(key: &str, object: &Map<String, Value>) -> Option<ElementType> {
+    Some(match key {
+        "split_conditions" | "base_weights" | "loss_changes" | "sum_hessian" | "leaf_weights"
+        | "weights" => ElementType::F32,
+        "left_children" | "right_children" | "parents" | "categories" | "categories_nodes"
+        | "feature_segments" | "sorted_idx" | "offsets" => ElementType::I32,
+        "split_indices" => {
+            let num_feature = object
+                .get("tree_param")
+                .and_then(|p| p.get("num_feature"))
+                .and_then(scalar_f64)
+                .unwrap_or(0.0);
+            if num_feature > f64::from(i32::MAX) {
+                ElementType::I64
+            } else {
+                ElementType::I32
+            }
+        }
+        "default_left" | "split_type" => ElementType::U8,
+        "categories_segments" | "categories_sizes" => ElementType::I64,
+        // A category column: string categories (`offsets` + int8 `values`)
+        // or numeric ones tagged with XGBoost's `CatIndexType` code; unsigned
+        // types are stored as the same-width signed bit pattern.
+        "values" if object.contains_key("offsets") => ElementType::I8,
+        "values" => match object.get("type").and_then(Value::as_i64)? {
+            7 => ElementType::F32,
+            8 => ElementType::F64,
+            9 => ElementType::I8,
+            10 => ElementType::U8,
+            11 | 12 => ElementType::I16,
+            13 | 14 => ElementType::I32,
+            15 | 16 => ElementType::I64,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Build the XGBoost model document for `model`.
+fn model_to_value(model: &BoostedModel) -> Result<Value> {
     if model.linear().is_some() {
         return Err(HessboostError::model_format(
-            "XGBoost JSON export does not support gblinear models",
+            "XGBoost model export does not support gblinear models",
+        ));
+    }
+    if model
+        .trees()
+        .iter()
+        .any(|tree| tree.linear_leaves().is_some())
+    {
+        return Err(HessboostError::model_format(
+            "XGBoost model export cannot represent linear-leaf trees (`linear_tree`); \
+             save the model in the native binary or JSON format",
         ));
     }
     let num_feature = model.n_features();
     let num_class = model.num_class();
-    let objective = model.objective().to_string();
+    let objective = model.objective();
+    reject_extension_objective(objective)?;
     // XGBoost can only load objectives it knows; a custom objective
     // (`train_with_objective`) has no XGBoost counterpart.
     let objective_impl = model.rebuild_objective().map_err(|_| {
@@ -103,8 +263,8 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
             "objective `{objective}` has no XGBoost equivalent; cannot export"
         ))
     })?;
-    let n_outputs = model.n_outputs();
-    let n_trees = model.effective_ntrees();
+    let n_trees = model.effective_num_trees();
+    let per_iteration = model.trees_per_iteration();
 
     let trees: Vec<Value> = model.trees()[..n_trees]
         .iter()
@@ -112,18 +272,23 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
         .map(|(id, t)| tree_to_json(id, t, num_feature))
         .collect();
 
-    // `tree_info[t]` is the output group tree `t` contributes to. For scalar
-    // objectives that is always 0; multiclass trees are laid out round-robin,
-    // matching `BoostedModel`'s `t % n_outputs` convention.
+    // `tree_info[t]` is the output group tree `t` contributes to; hessboost
+    // lays iterations out like XGBoost (`num_parallel_tree` trees per group,
+    // groups in order, and every vector-leaf tree in group 0), so the ids and
+    // iteration boundaries carry over.
     let tree_info: Vec<Value> = (0..n_trees)
-        .map(|t| json!((t % n_outputs) as i32))
+        .map(|t| json!(model.tree_output(t) as i32))
+        .collect();
+    let iteration_indptr: Vec<Value> = (0..=n_trees / per_iteration)
+        .map(|i| json!(i * per_iteration))
         .collect();
 
     let mut booster_model = json!({
         "gbtree_model_param": {
-            "num_parallel_tree": "1",
+            "num_parallel_tree": model.num_parallel_tree().to_string(),
             "num_trees": n_trees.to_string(),
         },
+        "iteration_indptr": iteration_indptr,
         "tree_info": tree_info,
         "trees": trees,
     });
@@ -134,10 +299,10 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
         booster_model["weight_drop"] = Value::Array(weight_drop);
     }
 
-    let base_score = format_base_score(model.base_scores(), &*objective_impl);
+    let base_score = format_base_score(model.base_scores(), &*objective_impl, num_class);
 
-    let value = json!({
-        "version": [3, 4, 1],
+    Ok(json!({
+        "version": [3, 4, 2],
         "learner": {
             "attributes": {},
             "feature_names": [],
@@ -151,24 +316,32 @@ pub fn export_xgboost_json(model: &BoostedModel) -> Result<String> {
                 "boost_from_average": "0",
                 "num_class": num_class.to_string(),
                 "num_feature": num_feature.to_string(),
-                "num_target": "1",
+                // XGBoost counts outputs here (`ObjFunction::Targets`): one
+                // per alpha for the alpha-list objectives; multiclass keeps 1.
+                "num_target": if num_class >= 2 { model.n_targets() } else { model.n_outputs() }.to_string(),
             },
-            "objective": objective_to_json(&objective, num_class, model.objective_params()),
+            "objective": objective_to_json(objective, num_class, model.objective_params()),
         }
-    });
-
-    Ok(serde_json::to_string_pretty(&value)?)
+    }))
 }
 
-/// Parse an XGBoost JSON model document into a [`BoostedModel`].
-///
-/// Accepts `gbtree` boosters, including XGBoost 3.4.1's DART layout
-/// (`gbtree` plus `model.weight_drop`). Other booster kinds produce a
-/// [`HessboostError::ModelFormat`]. See the module docs (above) for details and
-/// the `base_score` space convention.
-pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
-    let root: Value = serde_json::from_str(json)?;
-    let learner = field(&root, "learner")?;
+/// Refuse hessboost's own objectives, which XGBoost does not define: the
+/// distributional `dist:*` objectives. Their models are saved in the native
+/// binary or JSON formats only.
+fn reject_extension_objective(objective: &str) -> Result<()> {
+    if crate::objective::DistFamily::from_objective(objective).is_some() {
+        return Err(HessboostError::model_format(format!(
+            "objective `{objective}` is a hessboost extension that XGBoost models cannot \
+             carry; save the model in the native binary or JSON format"
+        )));
+    }
+    Ok(())
+}
+
+/// Map an XGBoost model document (decoded from either encoding) to a
+/// [`BoostedModel`].
+fn model_from_value(root: &Value) -> Result<BoostedModel> {
+    let learner = field(root, "learner")?;
     let booster = field(learner, "gradient_booster")?;
 
     let booster_name = booster
@@ -189,10 +362,11 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .and_then(scalar_f64)
         .map(|v| v as usize)
         .ok_or_else(|| HessboostError::model_format("missing/invalid `num_feature`"))?;
-    let num_class = lmp
-        .get("num_class")
-        .and_then(scalar_f64)
-        .map_or(0, |v| v as usize);
+    let num_class = count_param(lmp, "num_class", 0)?;
+    // XGBoost's `num_target` counts model outputs (`ObjFunction::Targets`):
+    // label columns for most objectives, but one output per alpha for the
+    // alpha-list objectives, which fit a single label column.
+    let num_target = count_param(lmp, "num_target", 1)?;
 
     let objective_json = learner.get("objective");
     let objective = objective_json
@@ -200,18 +374,48 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .and_then(Value::as_str)
         .unwrap_or("reg:squarederror")
         .to_string();
-    let n_outputs = num_class.max(1);
+    reject_extension_objective(&objective)?;
+
+    // Parameter blocks come from the file: check them with the same rules as
+    // a training configuration before the model rebuilds its objective.
+    let objective_params = objective_params_from_json(&objective, objective_json);
+    objective_params
+        .training_params(&objective, num_class)
+        .build()
+        .map_err(|e| HessboostError::model_format(format!("invalid objective parameters: {e}")))?;
+    let n_targets = match objective.as_str() {
+        "reg:quantileerror" | "reg:expectileerror" => 1,
+        _ => num_target,
+    };
+    let objective_impl = build_objective(&objective, num_class, n_targets, &objective_params)?;
+    let n_outputs = match &objective_impl {
+        Some(objective) => objective.n_outputs(),
+        None if num_class >= 2 => num_class,
+        None => num_target.max(1),
+    };
+    if num_class < 2 && num_target.max(1) != n_outputs {
+        return Err(HessboostError::model_format(format!(
+            "`num_target` {num_target} does not match the {n_outputs} outputs of objective `{objective}`"
+        )));
+    }
 
     let trees_json = model
         .get("trees")
         .and_then(Value::as_array)
         .ok_or_else(|| HessboostError::model_format("missing `model.trees` array"))?;
-    // XGBoost lays trees out per boosting iteration, grouped by output; hessboost
-    // stores them round-robin. `order[i]` is the XGBoost index of hessboost tree `i`.
-    let order = round_robin_tree_order(model, trees_json.len(), n_outputs)?;
+    // `order[i]` is the XGBoost index of hessboost tree `i` (the identity for
+    // XGBoost's canonical group-ordered iterations). Vector-leaf trees
+    // (`size_leaf_vector > 1`) form the single group 0.
+    let vector_leaf = trees_json
+        .first()
+        .and_then(|t| t.pointer("/tree_param/size_leaf_vector"))
+        .and_then(scalar_f64)
+        .is_some_and(|k| k > 1.0);
+    let groups = if vector_leaf { 1 } else { n_outputs };
+    let (order, num_parallel_tree) = iteration_tree_order(model, trees_json.len(), groups)?;
     let mut trees = Vec::with_capacity(trees_json.len());
     for &i in &order {
-        let tree = tree_from_json(&trees_json[i])
+        let tree = tree_from_json(&trees_json[i], n_outputs)
             .map_err(|e| HessboostError::model_format(format!("tree {i}: {e}")))?;
         trees.push(tree);
     }
@@ -247,18 +451,9 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
         .get("base_score")
         .and_then(Value::as_str)
         .ok_or_else(|| HessboostError::model_format("missing/invalid `base_score`"))?;
-    let objective_impl = build_objective(&objective, num_class);
     let base_margins = parse_base_score(base_score, objective_impl.as_deref(), n_outputs)?;
 
-    // Parameter blocks come from the file: check them with the same rules as
-    // a training configuration before the model rebuilds its objective.
-    let objective_params = objective_params_from_json(&objective, objective_json);
-    objective_params
-        .training_params(&objective, num_class)
-        .build()
-        .map_err(|e| HessboostError::model_format(format!("invalid objective parameters: {e}")))?;
-
-    let imported = BoostedModel::from_parts(
+    let mut imported = BoostedModel::from_parts(
         trees,
         tree_weights,
         base_margins,
@@ -267,9 +462,11 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
             objective,
             num_class,
             n_outputs,
+            n_targets,
             n_features: num_feature,
         },
     );
+    imported.set_num_parallel_tree(num_parallel_tree);
     imported.validate_structure()?;
     Ok(imported)
 }
@@ -279,16 +476,28 @@ pub fn import_xgboost_json(json: &str) -> Result<BoostedModel> {
 // ---------------------------------------------------------------------------
 
 /// Encode one [`RegTree`] as XGBoost's node-indexed array bundle.
+///
+/// A vector-leaf tree is written as XGBoost's `MultiTargetTree` bundle
+/// (`MultiTargetTree::SaveModel`): the leaf vectors in `leaf_weights` (`K`
+/// values per leaf, leaves in node order) with each leaf's `right_children`
+/// entry holding its leaf index, `parents[0] = -1`, and XGBoost's
+/// `DftBadValue` (the smallest subnormal) as the split condition of leaves and
+/// categorical nodes. Internal weights are not retained, so `base_weights`
+/// carries the leaf values (vectors) and zeros for internal nodes.
 fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
+    const DFT_BAD_VALUE: f32 = f32::from_bits(1);
+    let vector = tree.is_vector_leaf();
     let nodes = tree.nodes();
     let n = nodes.len();
+    let k = tree.size_leaf_vector();
 
     let mut left = Vec::with_capacity(n);
     let mut right = Vec::with_capacity(n);
     let mut split_indices = Vec::with_capacity(n);
     let mut split_conditions = Vec::with_capacity(n);
     let mut default_left = Vec::with_capacity(n);
-    let mut base_weights = Vec::with_capacity(n);
+    let mut base_weights = Vec::with_capacity(n * k);
+    let mut leaf_weights = Vec::new();
     let mut loss_changes = Vec::with_capacity(n);
     let mut sum_hessian = Vec::with_capacity(n);
     let mut split_type = Vec::with_capacity(n);
@@ -296,7 +505,7 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
     let mut categories_nodes = Vec::<i64>::new();
     let mut categories_segments = Vec::<i64>::new();
     let mut categories_sizes = Vec::<i64>::new();
-    let mut parents = vec![INVALID_NODE; n];
+    let mut parents = vec![if vector { -1 } else { INVALID_NODE }; n];
     for (i, node) in nodes.iter().enumerate() {
         if !node.is_leaf() {
             parents[node.left as usize] = i as i32;
@@ -304,46 +513,68 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
         }
     }
 
+    let mut n_leaves = 0i32;
     for (node_id, node) in nodes.iter().enumerate() {
-        let categorical = node.is_categorical && !node.is_leaf();
-        left.push(if categorical { node.right } else { node.left });
-        right.push(if categorical { node.left } else { node.right });
         sum_hessian.push(node.sum_hess);
         split_type.push(u32::from(node.is_categorical));
-        if node.is_categorical {
-            let cats = &tree.categories()[node.cat_begin as usize..node.cat_end as usize];
+        // A scalar tree writes the category set of a categorical-flagged leaf
+        // too; a vector-leaf tree only those of its split nodes.
+        if node.is_categorical && !(vector && node.is_leaf()) {
+            let cats = tree.node_categories(node);
             categories_nodes.push(node_id as i64);
             categories_segments.push(categories.len() as i64);
             categories_sizes.push(cats.len() as i64);
             categories.extend(cats.iter().map(|&category| i64::from(category)));
         }
         if node.is_leaf() {
-            // XGBoost carries the leaf weight in both arrays for leaves.
             split_indices.push(0u32);
-            split_conditions.push(node.leaf_value);
-            base_weights.push(node.leaf_value);
-            default_left.push(1i32);
             loss_changes.push(0.0f32);
-        } else {
-            split_indices.push(node.split_feature);
-            split_conditions.push(node.split_cond);
-            base_weights.push(0.0f32);
-            default_left.push(i32::from(if node.is_categorical {
-                !node.default_left
+            if vector {
+                left.push(-1);
+                right.push(n_leaves);
+                n_leaves += 1;
+                split_conditions.push(DFT_BAD_VALUE);
+                default_left.push(0i32);
+                base_weights.extend_from_slice(tree.leaf_vector(node_id));
+                leaf_weights.extend_from_slice(tree.leaf_vector(node_id));
             } else {
-                node.default_left
-            }));
-            loss_changes.push(node.split_gain);
+                // XGBoost carries the leaf weight in both arrays for leaves.
+                left.push(node.left);
+                right.push(node.right);
+                split_conditions.push(node.leaf_value);
+                base_weights.push(node.leaf_value);
+                default_left.push(1i32);
+            }
+            continue;
+        }
+        split_indices.push(node.split_feature);
+        loss_changes.push(node.split_gain);
+        base_weights.extend(std::iter::repeat_n(0.0f32, k));
+        if node.is_categorical {
+            // XGBoost sends the category set right; hessboost keeps it left.
+            left.push(node.right);
+            right.push(node.left);
+            split_conditions.push(if vector {
+                DFT_BAD_VALUE
+            } else {
+                node.split_cond
+            });
+            default_left.push(i32::from(!node.default_left));
+        } else {
+            left.push(node.left);
+            right.push(node.right);
+            split_conditions.push(node.split_cond);
+            default_left.push(i32::from(node.default_left));
         }
     }
 
-    json!({
+    let mut bundle = json!({
         "id": id,
         "tree_param": {
             "num_deleted": "0",
             "num_feature": num_feature.to_string(),
             "num_nodes": n.to_string(),
-            "size_leaf_vector": "0",
+            "size_leaf_vector": if vector { k.to_string() } else { "0".to_owned() },
         },
         "left_children": left,
         "right_children": right,
@@ -359,20 +590,77 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
         "categories_nodes": categories_nodes,
         "categories_segments": categories_segments,
         "categories_sizes": categories_sizes,
-    })
+    });
+    if vector {
+        bundle["leaf_weights"] = json!(leaf_weights);
+    }
+    bundle
 }
 
-/// Decode one XGBoost tree object into a [`RegTree`].
-fn tree_from_json(tj: &Value) -> Result<RegTree> {
-    let left = i32_arr(tj, "left_children")
-        .ok_or_else(|| HessboostError::missing_field("left_children"))?;
+/// The leaf vectors of an XGBoost `MultiTargetTree` bundle, laid out
+/// `[node][output]` (zeros for internal nodes): leaf `i`'s vector is
+/// `leaf_weights[right_children[i] * k..][..k]`. `k` has been checked
+/// against the model's outputs. The `[node][output]` storage is sized from
+/// the node count, so before allocating it the tree must have the node count
+/// of a binary tree over its leaves (`2 * leaves - 1`) and the leaf weights
+/// must hold a vector for every leaf: the storage is then smaller than twice
+/// the serialized leaf weights.
+fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Vec<f32>> {
+    let leaf_weights = required_arr(tj, "leaf_weights")?;
+    let n_leaves = left.iter().filter(|&&l| l == -1).count();
+    if n_leaves.checked_mul(2) != left.len().checked_add(1) {
+        return Err(HessboostError::model_format(format!(
+            "tree has {} nodes, but a binary tree with {n_leaves} leaves has {}",
+            left.len(),
+            (2 * n_leaves).saturating_sub(1)
+        )));
+    }
+    let n_vectors = leaf_weights.len() / k;
+    if n_vectors < n_leaves {
+        return Err(HessboostError::model_format(format!(
+            "`leaf_weights` holds {} values, fewer than {n_leaves} leaf vectors of width {k}",
+            leaf_weights.len()
+        )));
+    }
+    let len = left
+        .len()
+        .checked_mul(k)
+        .ok_or_else(|| HessboostError::model_format("leaf vector storage overflows"))?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| {
+        HessboostError::model_format(format!("cannot allocate {len} leaf vector values"))
+    })?;
+    out.resize(len, 0.0f32);
+    for (i, (&l, &r)) in left.iter().zip(right).enumerate() {
+        if l != -1 {
+            continue;
+        }
+        let slot = usize::try_from(r)
+            .ok()
+            .filter(|&slot| slot < n_vectors)
+            .ok_or_else(|| {
+                HessboostError::model_format(format!("leaf {i} has an invalid leaf index {r}"))
+            })?;
+        for (dst, &w) in out[i * k..(i + 1) * k]
+            .iter_mut()
+            .zip(&leaf_weights[slot * k..(slot + 1) * k])
+        {
+            *dst = w as f32;
+        }
+    }
+    Ok(out)
+}
+
+/// Decode one XGBoost tree object into a [`RegTree`] of a model with
+/// `n_outputs` outputs.
+fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
+    let left = required_i32_arr(tj, "left_children")?;
     let n = left.len();
     if n == 0 {
         return Err(HessboostError::model_format("tree contains no nodes"));
     }
 
-    let right = i32_arr(tj, "right_children")
-        .ok_or_else(|| HessboostError::missing_field("right_children"))?;
+    let right = required_i32_arr(tj, "right_children")?;
     if right.len() != n {
         return Err(HessboostError::model_format(
             "child arrays have different lengths",
@@ -418,19 +706,36 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
     }
 
     let split_indices = arr_or_empty(tj, "split_indices");
-    let split_conditions = arr(tj, "split_conditions", scalar_f64)
-        .ok_or_else(|| HessboostError::missing_field("split_conditions"))?;
+    let split_conditions = required_arr(tj, "split_conditions")?;
     let default_left = arr_or_empty(tj, "default_left");
     let base_weights = arr_or_empty(tj, "base_weights");
     let sum_hessian = arr_or_empty(tj, "sum_hessian");
     let loss_changes = arr_or_empty(tj, "loss_changes");
 
     let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
+    // `size_leaf_vector` is 0 or 1 for scalar trees and the model's output
+    // count for vector-leaf trees (`MultiTargetTree`); anything else,
+    // including a width too large to allocate, is malformed.
+    let size_leaf_vector = match tj.pointer("/tree_param/size_leaf_vector") {
+        None => 0,
+        Some(value) => match scalar_f64(value) {
+            Some(k) if k == 0.0 || k == 1.0 => k as usize,
+            Some(k) if k == n_outputs as f64 => n_outputs,
+            _ => {
+                return Err(HessboostError::model_format(format!(
+                    "`size_leaf_vector` {value} is neither 0, 1, nor the model's {n_outputs} outputs"
+                )));
+            }
+        },
+    };
 
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
         let sum_hess = at(&sum_hessian, i) as f32;
-        if left[i] == -1 {
+        if left[i] == -1 && size_leaf_vector > 1 {
+            // Vector leaf: the weights live in `leaf_vectors`.
+            nodes.push(Node::leaf(0.0, sum_hess));
+        } else if left[i] == -1 {
             // Leaf: prefer split_conditions, fall back to base_weights.
             let leaf_value = split_conditions
                 .get(i)
@@ -470,6 +775,12 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
         }
     }
 
+    let leaf_vectors = if size_leaf_vector > 1 {
+        vector_leaves(tj, &left, &right, size_leaf_vector)?
+    } else {
+        Vec::new()
+    };
+
     // Build RegTree through serde, flattening category lists in node order.
     let mut flat_categories: Vec<u32> = Vec::new();
     for (i, cats) in node_categories.iter().enumerate() {
@@ -482,6 +793,8 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
     let tree: RegTree = serde_json::from_value(json!({
         "nodes": nodes,
         "categories": flat_categories,
+        "size_leaf_vector": if size_leaf_vector > 1 { size_leaf_vector } else { 0 },
+        "leaf_vectors": leaf_vectors,
     }))?;
     Ok(tree)
 }
@@ -490,34 +803,48 @@ fn tree_from_json(tj: &Value) -> Result<RegTree> {
 // base_score link handling
 // ---------------------------------------------------------------------------
 
-/// Reconstruct the objective from name + `num_class` (at XGBoost's default
-/// parameters, which do not affect the link), if it is one we support.
-fn build_objective(name: &str, num_class: usize) -> Option<Box<dyn Objective>> {
-    create_objective(
-        &ObjectiveParams::defaults_for(name)
-            .training_params(name, num_class)
-            .build_unchecked(),
-    )
-    .ok()
+/// Reconstruct the objective from name, `num_class`, `n_targets` (label
+/// columns), and the file's parameter blocks, if it is one we support. A
+/// supported objective that rejects that configuration (too many targets,
+/// an invalid alpha list) is a format error rather than a silently
+/// untransformed model.
+fn build_objective(
+    name: &str,
+    num_class: usize,
+    n_targets: usize,
+    params: &ObjectiveParams,
+) -> Result<Option<Box<dyn Objective>>> {
+    let params = params.training_params(name, num_class).build_unchecked();
+    match create_objective(&params, n_targets) {
+        Ok(objective) => Ok(Some(objective)),
+        Err(HessboostError::Unknown { .. }) => Ok(None),
+        Err(error) if n_targets > 1 => Err(HessboostError::model_format(format!(
+            "`num_target` {n_targets}: {error}"
+        ))),
+        Err(error) => Err(HessboostError::model_format(format!(
+            "objective `{name}`: {error}"
+        ))),
+    }
 }
 
 /// Render the per-output margin intercepts as XGBoost 3.x's `base_score`
-/// vector string, `"[v0,v1,...]"`, in the space XGBoost stores it in. Only
-/// scalar objectives have a well-defined single-value transform; multiclass
-/// (softmax) operates across classes, so its values pass through unchanged.
-fn format_base_score(margins: &[f32], objective: &dyn Objective) -> String {
+/// vector string, `"[v0,v1,...]"`, in the space XGBoost stores it in: the
+/// whole row mapped through [`Objective::margins_to_probs`], the inverse of
+/// the objective's `ProbToMargin`. Multiclass (softmax) values pass through
+/// unchanged, since XGBoost's softmax `ProbToMargin` is the identity while
+/// its transform normalizes across classes.
+fn format_base_score(margins: &[f32], objective: &dyn Objective, num_class: usize) -> String {
     let mut stored = margins.to_vec();
-    if objective.n_outputs() == 1 {
-        objective.pred_transform(&mut stored);
+    if num_class < 2 {
+        objective.margins_to_probs(&mut stored);
     }
-    let entries: Vec<String> = stored.iter().map(f32::to_string).collect();
-    format!("[{}]", entries.join(","))
+    format_float_vector(stored)
 }
 
 /// Parse XGBoost 3.x's `base_score` vector string (`"[5E-1]"`,
 /// `"[a,b,c]"`) into per-output margin intercepts. One entry applies to every
 /// output (XGBoost `HandleOldFormat`); otherwise the length must equal
-/// `n_outputs`. Each entry is mapped through the objective's inverse link
+/// `n_outputs`. The vector is mapped through the objective's inverse link
 /// (values pass through unchanged for an objective we cannot reconstruct).
 fn parse_base_score(
     stored: &str,
@@ -535,8 +862,17 @@ fn parse_base_score(
         .map(|v| v.trim().parse::<f32>().ok())
         .collect::<Option<Vec<f32>>>()
         .ok_or_else(invalid)?;
-    let values = match values.len() {
-        1 => vec![values[0]; n_outputs],
+    let mut values = match values.len() {
+        1 => {
+            // Tree-less documents leave `n_outputs` bounded only by the
+            // declared count: allocate fallibly rather than abort.
+            let mut all = Vec::new();
+            all.try_reserve_exact(n_outputs).map_err(|_| {
+                HessboostError::model_format(format!("cannot hold {n_outputs} intercepts"))
+            })?;
+            all.resize(n_outputs, values[0]);
+            all
+        }
         len if len == n_outputs => values,
         len => {
             return Err(HessboostError::model_format(format!(
@@ -544,10 +880,10 @@ fn parse_base_score(
             )));
         }
     };
-    Ok(match objective {
-        Some(obj) => values.iter().map(|&v| obj.prob_to_margin(v)).collect(),
-        None => values,
-    })
+    if let Some(obj) = objective {
+        obj.probs_to_margins(&mut values);
+    }
+    Ok(values)
 }
 
 // ---------------------------------------------------------------------------
@@ -562,14 +898,68 @@ const TWEEDIE_VARIANCE_POWER: (&str, &str) = ("tweedie_regression_param", "tweed
 const HUBER_SLOPE: (&str, &str) = ("pseudo_huber_param", "huber_slope");
 const LAMBDARANK_NUM_PAIR: (&str, &str) = ("lambdarank_param", "lambdarank_num_pair_per_sample");
 const SOFTMAX_NUM_CLASS: (&str, &str) = ("softmax_multiclass_param", "num_class");
+const QUANTILE_ALPHA: (&str, &str) = ("quantile_loss_param", "quantile_alpha");
+const EXPECTILE_ALPHA: (&str, &str) = ("expectile_loss_param", "expectile_alpha");
+/// The `survival:aft` block, holding `aft_loss_distribution` and
+/// `aft_loss_distribution_scale`.
+const AFT_LOSS_PARAM: &str = "aft_loss_param";
+
+/// Encode `values` as XGBoost's float vector string (`"[0.1,0.5,0.9]"`): the
+/// form of `base_score` and of `ParamArray<float>` alpha lists.
+fn format_float_vector(values: impl IntoIterator<Item = f32>) -> String {
+    let entries: Vec<String> = values.into_iter().map(|v| v.to_string()).collect();
+    format!("[{}]", entries.join(","))
+}
+
+/// Decode XGBoost's `ParamArray<float>` string: a JSON array or a single
+/// number, with `(..)` accepted for `[..]` like XGBoost's reader. Entries are
+/// rounded to `f32` as XGBoost stores them. `None` for anything else.
+fn parse_param_array(text: &str) -> Option<Vec<f64>> {
+    let text = text.trim();
+    let text = match text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        Some(inner) => format!("[{inner}]"),
+        None => text.to_string(),
+    };
+    let as_f32 = |v: &Value| v.as_f64().map(|v| f64::from(v as f32));
+    match serde_json::from_str::<Value>(&text).ok()? {
+        Value::Array(entries) => entries.iter().map(as_f32).collect(),
+        number @ Value::Number(_) => as_f32(&number).map(|v| vec![v]),
+        _ => None,
+    }
+}
 
 /// Build the `objective` sub-document with the parameter block XGBoost 3.4.1
 /// writes for each objective (its `SaveConfig`), so upstream XGBoost accepts
 /// the file. The retained [`ObjectiveParams`] are written as XGBoost's
 /// stringified numbers; LambdaRank parameters the model does not retain are
-/// written at XGBoost's defaults.
+/// written at XGBoost's defaults, and the alpha lists as XGBoost's array
+/// strings. Objectives without parameters (`reg:squaredlogerror`,
+/// `binary:hinge`, `reg:absoluteerror`, `survival:cox`) write their name
+/// only.
 fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams) -> Value {
+    let mut out = Map::with_capacity(2);
+    out.insert("name".to_string(), Value::String(objective.to_string()));
+    if objective == "survival:aft" {
+        // `AftDistribution` serializes as XGBoost's lowercase names.
+        let fields = json!({
+            "aft_loss_distribution": params.aft_loss_distribution,
+            "aft_loss_distribution_scale": params.aft_loss_distribution_scale.to_string(),
+        });
+        out.insert(AFT_LOSS_PARAM.to_string(), fields);
+        return Value::Object(out);
+    }
     let ((block, key), value) = match objective {
+        "survival:cox" | "reg:squaredlogerror" | "binary:hinge" | "reg:absoluteerror" => {
+            return Value::Object(out);
+        }
+        "reg:quantileerror" => (
+            QUANTILE_ALPHA,
+            format_float_vector(params.quantile_alpha.iter().map(|&v| v as f32)),
+        ),
+        "reg:expectileerror" => (
+            EXPECTILE_ALPHA,
+            format_float_vector(params.expectile_alpha.iter().map(|&v| v as f32)),
+        ),
         "multi:softmax" | "multi:softprob" => (SOFTMAX_NUM_CLASS, num_class.to_string()),
         "count:poisson" => (MAX_DELTA_STEP, params.max_delta_step.to_string()),
         "reg:tweedie" => (
@@ -599,8 +989,6 @@ fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams
         }
     }
     fields.insert(key.to_string(), Value::String(value));
-    let mut out = Map::with_capacity(2);
-    out.insert("name".to_string(), Value::String(objective.to_string()));
     out.insert(block.to_string(), Value::Object(fields));
     Value::Object(out)
 }
@@ -613,28 +1001,43 @@ fn objective_params_from_json(objective: &str, obj: Option<&Value>) -> Objective
     let Some(obj) = obj else {
         return params;
     };
-    let get =
-        |(block, key): (&str, &str)| obj.get(block).and_then(|b| b.get(key)).and_then(scalar_f64);
-    if let Some(v) = get(SCALE_POS_WEIGHT) {
-        params.scale_pos_weight = v;
-    }
-    if let Some(v) = get(MAX_DELTA_STEP) {
-        params.max_delta_step = v;
-    }
-    if let Some(v) = get(TWEEDIE_VARIANCE_POWER) {
-        params.tweedie_variance_power = v;
-    }
-    if let Some(v) = get(HUBER_SLOPE) {
-        params.huber_slope = v;
+    let lookup = |(block, key): (&str, &str)| obj.get(block).and_then(|b| b.get(key));
+    for (param, value) in [
+        (SCALE_POS_WEIGHT, &mut params.scale_pos_weight),
+        (MAX_DELTA_STEP, &mut params.max_delta_step),
+        (TWEEDIE_VARIANCE_POWER, &mut params.tweedie_variance_power),
+        (HUBER_SLOPE, &mut params.huber_slope),
+        (
+            (AFT_LOSS_PARAM, "aft_loss_distribution_scale"),
+            &mut params.aft_loss_distribution_scale,
+        ),
+    ] {
+        if let Some(v) = lookup(param).and_then(scalar_f64) {
+            *value = v;
+        }
     }
     // XGBoost writes `u32::MAX` (`LambdaRankParam::NotSet`) when unset; the
     // pair count then follows `lambdarank_pair_method`, whose `topk` default
     // is what `ObjectiveParams::default` already holds.
-    if let Some(v) = get(LAMBDARANK_NUM_PAIR)
+    if let Some(v) = lookup(LAMBDARANK_NUM_PAIR).and_then(scalar_f64)
         && v >= 1.0
         && v != f64::from(u32::MAX)
     {
         params.lambdarank_num_pair_per_sample = v as usize;
+    }
+    for (param, alpha) in [
+        (QUANTILE_ALPHA, &mut params.quantile_alpha),
+        (EXPECTILE_ALPHA, &mut params.expectile_alpha),
+    ] {
+        // An unreadable list stays empty, which the objective then rejects.
+        if let Some(text) = lookup(param).and_then(Value::as_str) {
+            *alpha = parse_param_array(text).unwrap_or_default();
+        }
+    }
+    if let Some(distribution) = lookup((AFT_LOSS_PARAM, "aft_loss_distribution"))
+        .and_then(|v| AftDistribution::deserialize(v).ok())
+    {
+        params.aft_loss_distribution = distribution;
     }
     params
 }
@@ -643,19 +1046,26 @@ fn objective_params_from_json(objective: &str, obj: Option<&Value>) -> Objective
 // Tree layout
 // ---------------------------------------------------------------------------
 
-/// Map XGBoost's tree layout onto hessboost's round-robin one (tree `t` feeds
-/// output `t % n_outputs`). Returns, for each hessboost tree position, the index
-/// of the XGBoost tree that fills it.
+/// Map XGBoost's tree layout onto hessboost's (iteration-major, then output,
+/// then parallel tree: tree `t` feeds output `(t / num_parallel_tree) %
+/// n_outputs`). Returns, for each hessboost tree position, the index of the
+/// XGBoost tree that fills it, plus the model's `num_parallel_tree`.
 ///
 /// XGBoost (`GBTreeModel::LoadModel`) stores each boosting iteration as
 /// `[g0 × num_parallel_tree, g1 × num_parallel_tree, ...]` with `tree_info[t]`
 /// naming tree `t`'s output group, and marks iteration boundaries with
 /// `iteration_indptr` (derived as `num_parallel_tree × n_groups` trees per
-/// iteration when absent, `MakeIndptr`). Within an iteration each group's
-/// trees are emitted in original order, one per hessboost round, so a group's
-/// sum -- and hence every prediction -- is unchanged. Iterations whose groups
-/// have unequal tree counts cannot be expressed and are rejected.
-fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Result<Vec<usize>> {
+/// iteration when absent, `MakeIndptr`). That canonical layout maps
+/// one-to-one; an iteration whose trees are tagged out of group order is
+/// regrouped, keeping each group's order, so every group's sum -- and hence
+/// every prediction -- is unchanged. Iterations whose groups have unequal
+/// tree counts, or whose forest size differs from another iteration's,
+/// cannot be expressed and are rejected.
+fn iteration_tree_order(
+    model: &Value,
+    n_trees: usize,
+    n_outputs: usize,
+) -> Result<(Vec<usize>, usize)> {
     field(model, "tree_info")?;
     let tree_info = strict_nonnegative_integer_array(model, "tree_info")?;
     if tree_info.len() != n_trees {
@@ -670,6 +1080,13 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
         )));
     }
 
+    let num_parallel_tree = model
+        .get("gbtree_model_param")
+        .and_then(|p| p.get("num_parallel_tree"))
+        .map_or(Some(1.0), scalar_f64)
+        .filter(|&v| v >= 1.0 && v.fract() == 0.0)
+        .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
+        as usize;
     let indptr = if model.get("iteration_indptr").is_some() {
         let indptr = strict_nonnegative_integer_array(model, "iteration_indptr")?;
         let bounded = indptr.first() == Some(&0)
@@ -682,14 +1099,9 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
         }
         indptr.iter().map(|&i| i as usize).collect::<Vec<_>>()
     } else {
-        let num_parallel_tree = model
-            .get("gbtree_model_param")
-            .and_then(|p| p.get("num_parallel_tree"))
-            .map_or(Some(1.0), scalar_f64)
-            .filter(|&v| v >= 1.0 && v.fract() == 0.0)
-            .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
-            as usize;
-        let per_iteration = num_parallel_tree * n_outputs;
+        let per_iteration = num_parallel_tree
+            .checked_mul(n_outputs)
+            .ok_or_else(|| HessboostError::model_format("trees per iteration overflow"))?;
         if !n_trees.is_multiple_of(per_iteration) {
             return Err(HessboostError::model_format(format!(
                 "{n_trees} trees do not form whole iterations of {per_iteration} \
@@ -701,8 +1113,28 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
             .collect()
     };
 
+    if n_trees == 0 {
+        // Every iteration of a tree-less model is empty.
+        return if indptr.len() > 1 {
+            Err(HessboostError::model_format(
+                "`iteration_indptr` contains an empty iteration",
+            ))
+        } else {
+            Ok((Vec::new(), num_parallel_tree))
+        };
+    }
+    // An iteration holds at least one tree per output group, which also
+    // bounds the per-group buffers below by the document's tree count.
+    if n_outputs > n_trees {
+        return Err(HessboostError::model_format(format!(
+            "{n_trees} trees cannot hold one iteration of {n_outputs} outputs"
+        )));
+    }
     let mut order = Vec::with_capacity(n_trees);
     let mut groups: Vec<Vec<usize>> = vec![Vec::new(); n_outputs];
+    // Trees per group, fixed by the first iteration (the model parameter
+    // for a tree-less model).
+    let mut per_group: Option<usize> = None;
     for (iteration, bounds) in indptr.windows(2).enumerate() {
         for group in &mut groups {
             group.clear();
@@ -710,23 +1142,42 @@ fn round_robin_tree_order(model: &Value, n_trees: usize, n_outputs: usize) -> Re
         for t in bounds[0]..bounds[1] {
             groups[tree_info[t] as usize].push(t);
         }
-        let per_group = groups[0].len();
-        if groups.iter().any(|g| g.len() != per_group) {
+        let size = groups[0].len();
+        if groups.iter().any(|g| g.len() != size) || *per_group.get_or_insert(size) != size {
             return Err(HessboostError::model_format(format!(
-                "iteration {iteration}: outputs have unequal tree counts; \
+                "iteration {iteration}: outputs have unequal or varying tree counts; \
                  layout is not representable"
             )));
         }
-        for round in 0..per_group {
-            order.extend(groups.iter().map(|g| g[round]));
+        for group in &groups {
+            order.extend_from_slice(group);
         }
     }
-    Ok(order)
+    match per_group {
+        Some(0) => Err(HessboostError::model_format(
+            "`iteration_indptr` contains an empty iteration",
+        )),
+        Some(size) => Ok((order, size)),
+        None => Ok((order, num_parallel_tree)),
+    }
 }
 
 /// Fetch a required object field, erroring with its name if absent.
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value> {
     v.get(key).ok_or_else(|| HessboostError::missing_field(key))
+}
+
+/// Read an optional non-negative integer count (XGBoost writes them as
+/// numeric strings), `default` when absent. Fractional, negative, or
+/// non-representable values are malformed rather than truncated.
+fn count_param(v: &Value, key: &str, default: usize) -> Result<usize> {
+    let Some(value) = v.get(key) else {
+        return Ok(default);
+    };
+    scalar_f64(value)
+        .filter(|&n| n >= 0.0 && n.fract() == 0.0 && n < u64::MAX as f64)
+        .and_then(|n| usize::try_from(n as u64).ok())
+        .ok_or_else(|| HessboostError::model_format(format!("invalid `{key}` {value}")))
 }
 
 /// Coerce a scalar JSON value (number, numeric string, or bool) to `f64`.
@@ -740,23 +1191,29 @@ fn scalar_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// Read a JSON array field, mapping each element through `f`. Returns `None` if
-/// the field is missing or is not an array.
-fn arr(v: &Value, key: &str, f: fn(&Value) -> Option<f64>) -> Option<Vec<f64>> {
+/// Read a JSON array field, coercing each element with [`scalar_f64`] (`0`
+/// for non-scalar entries). Returns `None` if the field is missing or is not
+/// an array.
+fn arr(v: &Value, key: &str) -> Option<Vec<f64>> {
     v.get(key)?
         .as_array()
-        .map(|a| a.iter().map(|e| f(e).unwrap_or(0.0)).collect())
+        .map(|a| a.iter().map(|e| scalar_f64(e).unwrap_or(0.0)).collect())
 }
 
-/// Read a JSON array field as `i32`s; `None` if the field is missing or is not
-/// an array.
-fn i32_arr(v: &Value, key: &str) -> Option<Vec<i32>> {
-    arr(v, key, scalar_f64).map(|a| a.iter().map(|&x| x as i32).collect())
+/// Read a required JSON array field; a missing or non-array field is a
+/// missing-field error naming `key`.
+fn required_arr(v: &Value, key: &str) -> Result<Vec<f64>> {
+    arr(v, key).ok_or_else(|| HessboostError::missing_field(key))
+}
+
+/// Read a required JSON array field as `i32`s.
+fn required_i32_arr(v: &Value, key: &str) -> Result<Vec<i32>> {
+    Ok(required_arr(v, key)?.iter().map(|&x| x as i32).collect())
 }
 
 /// Read a JSON array field, defaulting to an empty vector when absent.
 fn arr_or_empty(v: &Value, key: &str) -> Vec<f64> {
-    arr(v, key, scalar_f64).unwrap_or_default()
+    arr(v, key).unwrap_or_default()
 }
 
 /// Read a JSON array whose entries are finite, non-negative integers.
@@ -790,6 +1247,7 @@ mod tests {
     use crate::config::{BoosterKind, TrainingParams};
     use crate::data::{DMatrix, FeatureType};
     use crate::learner::train;
+    use crate::test_support::labeled_dense;
 
     /// Train a small squared-error model on a noisy nonlinear signal.
     fn reg_model() -> (BoostedModel, DMatrix) {
@@ -803,10 +1261,7 @@ mod tests {
             x.push(b);
             y.push(2.0 * a - 3.0 * b + if a > 0.5 { 1.0 } else { -1.0 });
         }
-        let d = DMatrix::from_dense(&x, n, 2)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, 2, &y);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
             .max_depth(3)
@@ -814,6 +1269,48 @@ mod tests {
             .build()
             .unwrap();
         (train(&params, &d, 15).unwrap(), d)
+    }
+
+    /// A DART model on `d` with non-unit tree weights.
+    fn dart_model(d: &DMatrix) -> BoostedModel {
+        let params = TrainingParams::builder()
+            .booster(BoosterKind::Dart)
+            .rate_drop(0.5)
+            .max_depth(3)
+            .build()
+            .unwrap();
+        train(&params, d, 8).unwrap()
+    }
+
+    /// A shallow model on one categorical feature, and its data.
+    fn categorical_model() -> (BoostedModel, DMatrix) {
+        let categorical = labeled_dense(
+            &[0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+            6,
+            1,
+            &[1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
+        )
+        .with_feature_types(&[FeatureType::Categorical])
+        .unwrap();
+        let params = TrainingParams::builder().max_depth(2).build().unwrap();
+        (train(&params, &categorical, 3).unwrap(), categorical)
+    }
+
+    /// The XGBoost JSON export of `model`, as text and parsed.
+    fn export_json_document(model: &BoostedModel) -> (String, Value) {
+        let text = export_xgboost_json(model).unwrap();
+        let json = serde_json::from_str(&text).unwrap();
+        (text, json)
+    }
+
+    /// Assert `result` is a [`HessboostError::ModelFormat`]; `context` labels
+    /// a failure.
+    fn assert_format_error<T: std::fmt::Debug>(result: Result<T>, context: impl std::fmt::Display) {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, HessboostError::ModelFormat(_)),
+            "{context}: {err}"
+        );
     }
 
     #[test]
@@ -840,10 +1337,7 @@ mod tests {
         let n = 80;
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let y: Vec<f32> = x.iter().map(|&v| f32::from(v > 0.4)).collect();
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
             .objective("binary:logistic")
             .max_depth(3)
@@ -930,36 +1424,9 @@ mod tests {
     /// per-class intercepts. `multi:softprob` stores margins directly, so the
     /// vector must come through unchanged.
     fn three_class_json(base_score: &str) -> String {
-        let stump = |id: usize| {
-            format!(
-                r#"{{"id": {id}, "tree_param": {{"num_nodes": "1", "num_feature": "2", "size_leaf_vector": "1"}},
-                    "left_children": [-1], "right_children": [-1], "parents": [2147483647],
-                    "split_indices": [0], "split_conditions": [0.0], "default_left": [0],
-                    "base_weights": [0.0], "loss_changes": [0.0], "sum_hessian": [1.0], "split_type": [0]}}"#
-            )
-        };
-        format!(
-            r#"{{
-              "version": [3, 4, 1],
-              "learner": {{
-                "gradient_booster": {{
-                  "name": "gbtree",
-                  "model": {{
-                    "gbtree_model_param": {{"num_parallel_tree": "1", "num_trees": "3"}},
-                    "tree_info": [0, 1, 2],
-                    "trees": [{}, {}, {}]
-                  }}
-                }},
-                "learner_model_param": {{
-                  "base_score": "{base_score}", "boost_from_average": "1",
-                  "num_class": "3", "num_feature": "2", "num_target": "1"
-                }},
-                "objective": {{"name": "multi:softprob", "softmax_multiclass_param": {{"num_class": "3"}}}}
-              }}
-            }}"#,
-            stump(0),
-            stump(1),
-            stump(2)
+        parallel_tree_json(1, &[0, 1, 2], &[0.0; 3], None, None).replace(
+            r#""base_score": "[0E0]""#,
+            &format!(r#""base_score": "{base_score}""#),
         )
     }
 
@@ -971,7 +1438,7 @@ mod tests {
         .unwrap();
         let expected = [5.329_358_6E-2f32, -1.347_581_1E-1, 8.146_441E-2];
         assert_eq!(model.base_scores(), &expected);
-        let d = DMatrix::from_dense(&[0.0, 0.0, 1.0, 1.0], 2, 2).unwrap();
+        let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
         let margins = model.predict_margin(&d).unwrap();
         assert_eq!(margins, [expected, expected].concat());
 
@@ -983,19 +1450,162 @@ mod tests {
     #[test]
     fn malformed_base_score_is_rejected() {
         for bad in ["0.5", "[0.1,0.2]", "[a]", "[]", "[0.1,0.2,0.3,0.4]"] {
-            let err = import_xgboost_json(&three_class_json(bad)).unwrap_err();
-            assert!(
-                matches!(err, HessboostError::ModelFormat(_)),
-                "{bad}: {err}"
+            assert_format_error(import_xgboost_json(&three_class_json(bad)), bad);
+        }
+    }
+
+    /// A two-target model with one single-leaf vector tree of width
+    /// `width` and the given `leaf_weights`.
+    fn vector_stump_json(width: &str, leaf_weights: &str) -> String {
+        format!(
+            r#"{{
+              "version": [3, 4, 1],
+              "learner": {{
+                "gradient_booster": {{
+                  "name": "gbtree",
+                  "model": {{
+                    "gbtree_model_param": {{"num_parallel_tree": "1", "num_trees": "1"}},
+                    "tree_info": [0],
+                    "trees": [{{"id": 0,
+                      "tree_param": {{"num_nodes": "1", "num_feature": "1", "size_leaf_vector": "{width}"}},
+                      "left_children": [-1], "right_children": [0], "parents": [-1],
+                      "split_indices": [0], "split_conditions": [0.0], "default_left": [0],
+                      "base_weights": [], "leaf_weights": {leaf_weights},
+                      "loss_changes": [0.0], "sum_hessian": [1.0], "split_type": [0]}}]
+                  }}
+                }},
+                "learner_model_param": {{
+                  "base_score": "[0E0]", "boost_from_average": "1",
+                  "num_class": "0", "num_feature": "1", "num_target": "2"
+                }},
+                "objective": {{"name": "reg:squarederror", "reg_loss_param": {{"scale_pos_weight": "1"}}}}
+              }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn vector_leaf_width_is_validated_before_allocating() {
+        let model = import_xgboost_json(&vector_stump_json("2", "[1.0, 2.0]")).unwrap();
+        let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
+        assert_eq!(model.predict_margin(&d).unwrap(), [1.0, 2.0]);
+        // A width that saturates `usize` must not panic allocating the leaf
+        // storage: it, a width other than the model's outputs, a fractional
+        // width, or one the leaf weights cannot fill is a format error.
+        for (width, weights) in [
+            ("1e30", "[]"),
+            ("18446744073709551615", "[]"),
+            ("3", "[1.0, 2.0, 3.0]"),
+            ("2.5", "[1.0, 2.0, 3.0]"),
+            ("2", "[1.0]"),
+        ] {
+            assert_format_error(
+                import_xgboost_json(&vector_stump_json(width, weights)),
+                width,
             );
         }
     }
 
     #[test]
+    fn vector_leaf_storage_is_bounded_by_the_leaf_weights() {
+        // 65,536 outputs over 65,535 nodes would expand to ~16 GiB of leaf
+        // storage, so the node graph and leaf mapping must be checked before
+        // any of it is allocated.
+        const K: usize = 1 << 16;
+        const N: usize = K - 1;
+        let one_vector = vec![0.5f32; K];
+        let tree = |left: Vec<i64>, right: Vec<i64>, leaf_weights: &[f32]| {
+            json!({
+                "tree_param": {"num_nodes": N.to_string(), "num_feature": "1",
+                               "size_leaf_vector": K.to_string()},
+                "left_children": left,
+                "right_children": right,
+                "split_conditions": vec![0.0f32; N],
+                "leaf_weights": leaf_weights,
+            })
+        };
+        // Heap-shaped binary tree: internal node `i` has children
+        // `2i + 1, 2i + 2`; leaves are numbered in node order.
+        let internal = N / 2;
+        let heap_left: Vec<i64> = (0..N)
+            .map(|i| if i < internal { 2 * i as i64 + 1 } else { -1 })
+            .collect();
+        let heap_right: Vec<i64> = (0..N)
+            .map(|i| {
+                if i < internal {
+                    2 * i as i64 + 2
+                } else {
+                    (i - internal) as i64
+                }
+            })
+            .collect();
+        let cases = [
+            // Every node a leaf sharing the one serialized vector.
+            tree(vec![-1; N], vec![0; N], &one_vector),
+            // Binary-tree shape, but internal children out of range.
+            tree(
+                heap_left
+                    .iter()
+                    .map(|&l| if l < 0 { l } else { i64::from(i32::MAX) })
+                    .collect(),
+                heap_right.clone(),
+                &one_vector,
+            ),
+            // Valid graph, but one serialized vector for 32,768 leaves.
+            tree(heap_left.clone(), heap_right.clone(), &one_vector),
+        ];
+        for (case, tj) in cases.iter().enumerate() {
+            assert_format_error(tree_from_json(tj, K), case);
+        }
+        // The same valid graph with a vector per leaf decodes, each leaf
+        // reading its own vector.
+        let k = 2;
+        let leaves = N - internal;
+        let weights: Vec<f32> = (0..leaves * k).map(|v| v as f32).collect();
+        let mut tj = tree(heap_left, heap_right, &weights);
+        tj["tree_param"]["size_leaf_vector"] = json!(k.to_string());
+        let decoded = tree_from_json(&tj, k).unwrap();
+        assert_eq!(decoded.leaf_vector(internal), [0.0, 1.0]);
+        assert_eq!(
+            decoded.leaf_vector(N - 1),
+            [(2 * leaves - 2) as f32, (2 * leaves - 1) as f32]
+        );
+    }
+
+    #[test]
+    fn output_count_is_validated_before_allocating() {
+        // `num_target` saturating `usize` must not panic sizing the per-output
+        // tree groups or broadcasting the intercept.
+        let stump = hand_stump_json();
+        let treeless = stump
+            .replace(r#""num_trees": "1""#, r#""num_trees": "0""#)
+            .replace(r#""iteration_indptr": [0, 1],"#, "")
+            .replace(r#""tree_info": [0]"#, r#""tree_info": []"#);
+        let treeless = format!(
+            "{}]{}",
+            &treeless[..treeless.find(r#""trees": ["#).unwrap() + 10],
+            &treeless[treeless.find("}]").unwrap() + 2..]
+        );
+        assert_eq!(import_xgboost_json(&treeless).unwrap().num_trees(), 0);
+        for doc in [stump.to_string(), treeless] {
+            for count in ["1e30", "18446744073709551615", "1e18", "2.5", "-1", "0"] {
+                let doc = doc.replace(
+                    r#""num_target": "1""#,
+                    &format!(r#""num_target": "{count}""#),
+                );
+                assert_format_error(import_xgboost_json(&doc), count);
+            }
+        }
+        // One tree cannot cover two outputs' groups.
+        let two = stump.replace(r#""num_target": "1""#, r#""num_target": "2""#);
+        assert_format_error(import_xgboost_json(&two), "two outputs");
+    }
+
+    #[test]
     fn export_writes_xgboost_3_learner_params() {
         let (model, _) = reg_model();
-        let json: Value = serde_json::from_str(&export_xgboost_json(&model).unwrap()).unwrap();
-        assert_eq!(json["version"], json!([3, 4, 1]));
+        let (_, json) = export_json_document(&model);
+        assert_eq!(json["version"], json!([3, 4, 2]));
         let lmp = &json["learner"]["learner_model_param"];
         assert_eq!(lmp["boost_from_average"], "0");
         assert_eq!(lmp["num_target"], "1");
@@ -1016,25 +1626,17 @@ mod tests {
     fn unsupported_booster_is_rejected() {
         let js = r#"{"learner": {"gradient_booster": {"name": "gblinear"},
                      "learner_model_param": {"num_feature": "3", "base_score": "[0]"}}}"#;
-        let err = import_xgboost_json(js).unwrap_err();
-        assert!(matches!(err, HessboostError::ModelFormat(_)));
+        assert_format_error(import_xgboost_json(js), "gblinear");
     }
 
     #[test]
     fn dart_roundtrips_through_weight_drop() {
         let (_, d) = reg_model();
-        let params = TrainingParams::builder()
-            .booster(BoosterKind::Dart)
-            .rate_drop(0.5)
-            .max_depth(3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 8).unwrap();
+        let model = dart_model(&d);
         assert!(model.has_non_unit_tree_weights());
         let before = model.predict(&d).unwrap();
 
-        let exported = export_xgboost_json(&model).unwrap();
-        let json: Value = serde_json::from_str(&exported).unwrap();
+        let (exported, json) = export_json_document(&model);
         assert_eq!(json["learner"]["gradient_booster"]["name"], "gbtree");
         let weight_drop = json["learner"]["gradient_booster"]["model"]["weight_drop"]
             .as_array()
@@ -1058,20 +1660,101 @@ mod tests {
         let model = train(&params, &d, 3).unwrap();
         assert!(export_xgboost_json(&model).is_err());
 
-        let categories = [0.0, 1.0, 2.0, 0.0, 1.0, 2.0];
-        let labels = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-        let categorical = DMatrix::from_dense(&categories, 6, 1)
-            .unwrap()
-            .with_labels(&labels)
-            .unwrap()
-            .with_feature_types(&[FeatureType::Categorical])
-            .unwrap();
-        let params = TrainingParams::builder().max_depth(2).build().unwrap();
-        let model = train(&params, &categorical, 3).unwrap();
+        let (model, categorical) = categorical_model();
         assert!(model.trees().iter().any(|tree| tree.node(0).is_categorical));
         let before = model.predict(&categorical).unwrap();
         let restored = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
         assert_eq!(restored.predict(&categorical).unwrap(), before);
+    }
+
+    /// XGBoost 3.4.2 `save_raw("ubj")` / `save_raw("json")` of one booster
+    /// with categorical splits and missing values, generated by:
+    ///
+    /// ```python
+    /// rng = np.random.default_rng(7)
+    /// x = rng.random((256, 3), dtype=np.float32)
+    /// x[:, 0] = rng.integers(0, 6, 256)
+    /// x[rng.random(x.shape) < 0.1] = np.nan
+    /// y = ((x[:, 0] % 2 == 1) ^ (x[:, 1] > 0.5)).astype(np.float32)
+    /// d = xgb.DMatrix(x, label=y, feature_types=["c", "q", "q"], enable_categorical=True)
+    /// b = xgb.train({"max_depth": 2, "objective": "binary:logistic", "nthread": 1,
+    ///                "max_cat_to_onehot": 1}, d, num_boost_round=3)
+    /// ```
+    const XGB_UBJ: &[u8] = include_bytes!("../../tests/data/xgboost-3.4.2-categorical.ubj");
+    const XGB_JSON: &str = include_str!("../../tests/data/xgboost-3.4.2-categorical.json");
+
+    #[test]
+    fn xgboost_ubjson_reencodes_byte_for_byte() {
+        // Decoding XGBoost's own bytes and encoding them again with the typed
+        // array table reproduces the file exactly: same markers, integer
+        // widths, typed element types, key order and big-endian payloads.
+        let document = ubjson::decode(XGB_UBJ).unwrap();
+        let reencoded = ubjson::encode(&document, &xgboost_typed_array).unwrap();
+        assert!(reencoded == XGB_UBJ, "re-encoded XGBoost UBJSON differs");
+    }
+
+    #[test]
+    fn xgboost_ubjson_imports_like_its_json_twin() {
+        let from_ubj = import_xgboost_ubjson(XGB_UBJ).unwrap();
+        let from_json = import_xgboost_json(XGB_JSON).unwrap();
+        assert!(
+            from_ubj
+                .trees()
+                .iter()
+                .any(|t| t.nodes().iter().any(|n| n.is_categorical && !n.is_leaf()))
+        );
+        assert_eq!(from_ubj.to_bytes().unwrap(), from_json.to_bytes().unwrap());
+
+        let truncated = &XGB_UBJ[..XGB_UBJ.len() / 2];
+        assert_format_error(import_xgboost_ubjson(truncated), "truncated");
+    }
+
+    #[test]
+    fn ubjson_export_is_the_json_document_with_typed_tree_arrays() {
+        let (_, d) = reg_model();
+        let (categorical_model, categorical) = categorical_model();
+        for (model, data) in [
+            (reg_model().0, &d),
+            (dart_model(&d), &d),
+            (categorical_model, &categorical),
+        ] {
+            let ubj = export_xgboost_ubjson(&model).unwrap();
+            // The very document the JSON export prints (compared before text
+            // formatting, which `serde_json` does not round-trip bit-exactly).
+            assert_eq!(
+                ubjson::decode(&ubj).unwrap(),
+                model_to_value(&model).unwrap()
+            );
+            for header in [
+                &b"split_conditions[$d#L"[..],
+                b"base_weights[$d#L",
+                b"loss_changes[$d#L",
+                b"sum_hessian[$d#L",
+                b"left_children[$l#L",
+                b"right_children[$l#L",
+                b"parents[$l#L",
+                b"split_indices[$l#L",
+                b"categories[$l#L",
+                b"categories_nodes[$l#L",
+                b"default_left[$U#L",
+                b"split_type[$U#L",
+                b"categories_segments[$L#L",
+                b"categories_sizes[$L#L",
+            ] {
+                assert!(
+                    ubj.windows(header.len()).any(|w| w == header),
+                    "missing {}",
+                    String::from_utf8_lossy(header)
+                );
+            }
+            let restored = import_xgboost_ubjson(&ubj).unwrap();
+            assert_eq!(
+                restored.predict(data).unwrap(),
+                model.predict(data).unwrap()
+            );
+            let via_json = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
+            assert_eq!(restored.to_bytes().unwrap(), via_json.to_bytes().unwrap());
+        }
     }
 
     /// A 3-class `gbtree` document of constant stumps whose leaf values are
@@ -1143,141 +1826,256 @@ mod tests {
     }
 
     #[test]
-    fn import_regroups_parallel_trees_by_tree_info() {
+    fn import_keeps_parallel_trees_as_iterations() {
         // One iteration, two parallel trees per class: XGBoost order is
         // [c0, c0, c1, c1, c2, c2]; each class must receive its own leaves.
         let leaves = [1.0, 2.0, 10.0, 20.0, 100.0, 200.0];
         let tree_info = [0, 0, 1, 1, 2, 2];
         let derived = parallel_tree_json(2, &tree_info, &leaves, None, None);
         assert_eq!(class_margins(&derived), [3.0, 30.0, 300.0]);
+        let model = import_xgboost_json(&derived).unwrap();
+        assert_eq!(
+            (model.num_parallel_tree(), model.num_boost_rounds()),
+            (2, 1)
+        );
 
-        // Two iterations marked explicitly by `iteration_indptr`.
-        let leaves2 = [leaves, [4.0, 8.0, 40.0, 80.0, 400.0, 800.0]].concat();
-        let tree_info2 = [tree_info, tree_info].concat();
+        // Two iterations marked explicitly by `iteration_indptr`; the first
+        // one's trees are tagged out of group order and get regrouped.
+        let leaves2 = [
+            [2.0, 1.0, 10.0, 200.0, 20.0, 100.0],
+            [4.0, 8.0, 40.0, 80.0, 400.0, 800.0],
+        ]
+        .concat();
+        let tree_info2 = [[0, 0, 1, 2, 1, 2], tree_info].concat();
         let explicit = parallel_tree_json(2, &tree_info2, &leaves2, Some(&[0, 6, 12]), None);
         assert_eq!(class_margins(&explicit), [15.0, 150.0, 1500.0]);
+        let model = import_xgboost_json(&explicit).unwrap();
+        assert_eq!(model.num_boost_rounds(), 2);
+        let first = model.slice(0, 1, 1).unwrap();
+        let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
+        assert_eq!(first.predict_margin(&d).unwrap(), [3.0, 30.0, 300.0]);
 
         // DART weights are indexed by XGBoost position and follow their trees.
         let weights = [1.0, 0.5, 1.0, 0.5, 1.0, 0.5];
         let dart = parallel_tree_json(2, &tree_info, &leaves, None, Some(&weights));
         assert_eq!(class_margins(&dart), [2.0, 20.0, 200.0]);
+        // Re-export writes the forest back unchanged.
         let model = import_xgboost_json(&dart).unwrap();
-        // hessboost order: [c0#0, c1#0, c2#0, c0#1, c1#1, c2#1].
-        let restored: Vec<f32> = (0..6).map(|t| model.tree_weight(t)).collect();
-        assert_eq!(restored, [1.0, 1.0, 1.0, 0.5, 0.5, 0.5]);
+        let (_, doc) = export_json_document(&model);
+        let booster = &doc["learner"]["gradient_booster"]["model"];
+        assert_eq!(booster["gbtree_model_param"]["num_parallel_tree"], "2");
+        assert_eq!(booster["tree_info"], json!(tree_info));
+        assert_eq!(booster["iteration_indptr"], json!([0, 6]));
+        assert_eq!(booster["weight_drop"], json!(weights));
+
+        // Iterations of different forest sizes are unmappable.
+        let uneven_info = [0, 0, 1, 2, 1, 2, 0, 1, 2];
+        let uneven = parallel_tree_json(2, &uneven_info, &leaves2[..9], Some(&[0, 6, 9]), None);
+        assert_format_error(import_xgboost_json(&uneven), "uneven");
 
         // Groups with unequal tree counts in one iteration are unmappable.
         let lopsided = parallel_tree_json(2, &[0, 0, 1, 2, 2, 0], &leaves, None, None);
-        let err = import_xgboost_json(&lopsided).unwrap_err();
-        assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
+        assert_format_error(import_xgboost_json(&lopsided), "lopsided");
         let missing = parallel_tree_json(1, &tree_info, &leaves, None, None)
             .replace(r#""tree_info": [0, 0, 1, 1, 2, 2],"#, "");
-        let err = import_xgboost_json(&missing).unwrap_err();
-        assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
-    }
-
-    /// Export `model`, assert the objective block's `key` equals `expected`,
-    /// and hand back the re-imported model.
-    fn roundtrip_objective_param(
-        model: &BoostedModel,
-        block: &str,
-        key: &str,
-        expected: &str,
-    ) -> BoostedModel {
-        let exported = export_xgboost_json(model).unwrap();
-        let json: Value = serde_json::from_str(&exported).unwrap();
-        assert_eq!(
-            json["learner"]["objective"][block][key], expected,
-            "{block}.{key}"
-        );
-        import_xgboost_json(&exported).unwrap()
+        assert_format_error(import_xgboost_json(&missing), "no tree_info");
     }
 
     #[test]
     fn objective_params_roundtrip_through_parameter_blocks() {
+        /// Reads the retained value of one case's parameter.
+        type Retained = fn(&ObjectiveParams) -> f64;
         let n = 40;
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let counts: Vec<f32> = (0..n).map(|i| (i % 4) as f32).collect();
-        let data = |labels: &[f32]| {
-            DMatrix::from_dense(&x, n, 1)
-                .unwrap()
-                .with_labels(labels)
-                .unwrap()
-        };
+        let binary: Vec<f32> = x.iter().map(|&v| f32::from(v > 0.6)).collect();
+        let d = labeled_dense(&x, n, 1, &counts);
+        let binary = labeled_dense(&x, n, 1, &binary);
+        let ranked = labeled_dense(&x, n, 1, &counts)
+            .with_group_sizes(&[20, 20])
+            .unwrap();
         let fit = |builder: crate::config::TrainingParamsBuilder, d: &DMatrix| {
             train(&builder.max_depth(2).build().unwrap(), d, 2).unwrap()
         };
-
-        let d = data(&counts);
-        let tweedie = fit(
-            TrainingParams::builder()
-                .objective("reg:tweedie")
-                .tweedie_variance_power(1.2),
-            &d,
-        );
-        let back = roundtrip_objective_param(
-            &tweedie,
-            "tweedie_regression_param",
-            "tweedie_variance_power",
-            "1.2",
-        );
-        assert_eq!(back.objective_params().tweedie_variance_power, 1.2);
-
-        let poisson = fit(
-            TrainingParams::builder()
-                .objective("count:poisson")
-                .max_delta_step(0.3),
-            &d,
-        );
-        let back = roundtrip_objective_param(
-            &poisson,
-            "poisson_regression_param",
-            "max_delta_step",
-            "0.3",
-        );
-        assert_eq!(back.objective_params().max_delta_step, 0.3);
-
-        let huber = fit(
-            TrainingParams::builder()
-                .objective("reg:pseudohubererror")
-                .huber_slope(2.5),
-            &d,
-        );
-        let back = roundtrip_objective_param(&huber, "pseudo_huber_param", "huber_slope", "2.5");
-        assert_eq!(back.objective_params().huber_slope, 2.5);
-
-        let binary: Vec<f32> = x.iter().map(|&v| f32::from(v > 0.6)).collect();
-        let logistic = fit(
-            TrainingParams::builder()
-                .objective("binary:logistic")
-                .scale_pos_weight(3.0),
-            &data(&binary),
-        );
-        let back = roundtrip_objective_param(&logistic, "reg_loss_param", "scale_pos_weight", "3");
-        assert_eq!(back.objective_params().scale_pos_weight, 3.0);
-
-        let ranked = data(&counts).with_group_sizes(&[20, 20]).unwrap();
-        let ranker = fit(
-            TrainingParams::builder()
-                .objective("rank:ndcg")
-                .lambdarank_num_pair_per_sample(5),
-            &ranked,
-        );
-        let back = roundtrip_objective_param(
-            &ranker,
-            "lambdarank_param",
-            "lambdarank_num_pair_per_sample",
-            "5",
-        );
-        assert_eq!(back.objective_params().lambdarank_num_pair_per_sample, 5);
+        let b = TrainingParams::builder;
+        let ranker = || b().objective("rank:ndcg").lambdarank_num_pair_per_sample(5);
+        // (configuration, data, block, key, exported text, retained value)
+        let cases: [(_, _, _, _, _, Retained); 5] = [
+            (
+                b().objective("reg:tweedie").tweedie_variance_power(1.2),
+                &d,
+                "tweedie_regression_param",
+                "tweedie_variance_power",
+                "1.2",
+                |p| p.tweedie_variance_power,
+            ),
+            (
+                b().objective("count:poisson").max_delta_step(0.3),
+                &d,
+                "poisson_regression_param",
+                "max_delta_step",
+                "0.3",
+                |p| p.max_delta_step,
+            ),
+            (
+                b().objective("reg:pseudohubererror").huber_slope(2.5),
+                &d,
+                "pseudo_huber_param",
+                "huber_slope",
+                "2.5",
+                |p| p.huber_slope,
+            ),
+            (
+                b().objective("binary:logistic").scale_pos_weight(3.0),
+                &binary,
+                "reg_loss_param",
+                "scale_pos_weight",
+                "3",
+                |p| p.scale_pos_weight,
+            ),
+            (
+                ranker(),
+                &ranked,
+                "lambdarank_param",
+                "lambdarank_num_pair_per_sample",
+                "5",
+                |p| p.lambdarank_num_pair_per_sample as f64,
+            ),
+        ];
+        for (builder, data, block, key, text, retained) in cases {
+            let (exported, json) = export_json_document(&fit(builder, data));
+            assert_eq!(
+                json["learner"]["objective"][block][key], text,
+                "{block}.{key}"
+            );
+            let back = import_xgboost_json(&exported).unwrap();
+            let expected: f64 = text.parse().unwrap();
+            assert_eq!(retained(back.objective_params()), expected, "{block}.{key}");
+        }
 
         // XGBoost's own "not set" sentinel maps to the `topk` default.
-        let exported = export_xgboost_json(&ranker).unwrap().replace(
-            r#""lambdarank_num_pair_per_sample": "5""#,
-            r#""lambdarank_num_pair_per_sample": "4294967295""#,
-        );
+        let exported = export_xgboost_json(&fit(ranker(), &ranked))
+            .unwrap()
+            .replace(
+                r#""lambdarank_num_pair_per_sample": "5""#,
+                r#""lambdarank_num_pair_per_sample": "4294967295""#,
+            );
         let unset = import_xgboost_json(&exported).unwrap();
         assert_eq!(unset.objective_params().lambdarank_num_pair_per_sample, 32);
+    }
+
+    /// Alpha lists travel as XGBoost's array strings (either bracket form),
+    /// `num_target` counts the per-alpha outputs, and a list that does not
+    /// rebuild the objective is a format error, never an untransformed model.
+    #[test]
+    fn alpha_list_objectives_roundtrip_and_reject_bad_blocks() {
+        let n = 40;
+        let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let y: Vec<f32> = x.iter().map(|&v| 3.0 * v + (v * 17.0).sin()).collect();
+        let d = labeled_dense(&x, n, 1, &y);
+        let params = TrainingParams::builder()
+            .objective("reg:quantileerror")
+            .quantile_alpha(vec![0.1, 0.9])
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 3).unwrap();
+        let (exported, json) = export_json_document(&model);
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "reg:quantileerror", "quantile_loss_param": {"quantile_alpha": "[0.1,0.9]"}})
+        );
+        assert_eq!(json["learner"]["learner_model_param"]["num_target"], "2");
+        let back = import_xgboost_json(&exported).unwrap();
+        assert_eq!(back.n_outputs(), 2);
+        assert_eq!(back.n_targets(), 1);
+        assert_eq!(back.predict(&d).unwrap(), model.predict(&d).unwrap());
+
+        let parenthesized = exported.replace("[0.1,0.9]", "(0.1, 0.9)");
+        let back = import_xgboost_json(&parenthesized).unwrap();
+        assert_eq!(back.predict(&d).unwrap(), model.predict(&d).unwrap());
+        for bad in ["0.5", "[0.9,0.1]", "[]", "nope"] {
+            assert_format_error(
+                import_xgboost_json(&exported.replace("[0.1,0.9]", bad)),
+                bad,
+            );
+        }
+
+        let mae = TrainingParams::builder()
+            .objective("reg:absoluteerror")
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let (_, json) = export_json_document(&train(&mae, &d, 2).unwrap());
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "reg:absoluteerror"})
+        );
+    }
+
+    /// `survival:aft` keeps its distribution and scale in `aft_loss_param`
+    /// and `survival:cox` writes no parameter block; both store `base_score`
+    /// as `exp(margin)` and predict identically after the round trip.
+    #[test]
+    fn survival_objectives_roundtrip() {
+        let n = 40;
+        let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let times: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32).collect();
+        let upper: Vec<f32> = times
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| if i % 3 == 0 { f32::INFINITY } else { t })
+            .collect();
+        let d = DMatrix::from_dense(&x, n, 1)
+            .unwrap()
+            .with_label_bounds(&times, &upper)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective("survival:aft")
+            .aft_loss_distribution(AftDistribution::Extreme)
+            .aft_loss_distribution_scale(1.5)
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let aft = train(&params, &d, 3).unwrap();
+        let (exported, json) = export_json_document(&aft);
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "survival:aft", "aft_loss_param": {
+                "aft_loss_distribution": "extreme", "aft_loss_distribution_scale": "1.5"}})
+        );
+        assert_eq!(
+            json["learner"]["learner_model_param"]["base_score"],
+            "[0.5]"
+        );
+        let back = import_xgboost_json(&exported).unwrap();
+        assert_eq!(
+            back.objective_params().aft_loss_distribution,
+            AftDistribution::Extreme
+        );
+        assert_eq!(back.objective_params().aft_loss_distribution_scale, 1.5);
+        assert_eq!(back.predict(&d).unwrap(), aft.predict(&d).unwrap());
+
+        let signed: Vec<f32> = times
+            .iter()
+            .zip(&upper)
+            .map(|(&t, &u)| if u.is_infinite() { -t } else { t })
+            .collect();
+        let dc = labeled_dense(&x, n, 1, &signed);
+        let params = TrainingParams::builder()
+            .objective("survival:cox")
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let cox = train(&params, &dc, 3).unwrap();
+        let (exported, json) = export_json_document(&cox);
+        assert_eq!(
+            json["learner"]["objective"],
+            json!({"name": "survival:cox"})
+        );
+        let back = import_xgboost_json(&exported).unwrap();
+        assert_eq!(back.base_scores(), cox.base_scores());
+        assert_eq!(back.predict(&dc).unwrap(), cox.predict(&dc).unwrap());
     }
 
     #[test]
@@ -1297,7 +2095,6 @@ mod tests {
             }
         });
         let model = train_with_objective(&params, &d, 2, &obj).unwrap();
-        let err = export_xgboost_json(&model).unwrap_err();
-        assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
+        assert_format_error(export_xgboost_json(&model), "custom objective");
     }
 }

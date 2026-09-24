@@ -1,11 +1,20 @@
 //! Count and positive-continuous regression objectives with a log link:
 //! Poisson, Gamma, and Tweedie. All predict `exp(margin)`.
 
-use super::{GradPair, Objective, weighted_label_mean};
+use super::{GradPair, Objective, check_label_domain, weighted_label_mean};
+use crate::data::MetaInfo;
+use crate::error::Result;
 
-/// Prediction transform shared by the log-link count objectives: `exp(margin)`.
-fn log_link_transform(preds: &mut [f32]) {
-    crate::simd::exp_inplace(preds);
+/// Half the Poisson unit deviance at log-mean `margin`: `y ln(y/μ) − (y − μ)`,
+/// whose margin derivative is the Poisson gradient `μ − y`.
+fn poisson_deviance(margin: f32, label: f32) -> f64 {
+    let (m, y) = (f64::from(margin), f64::from(label));
+    let mu = m.exp();
+    if y > 0.0 {
+        y * (y.ln() - m) - (y - mu)
+    } else {
+        mu
+    }
 }
 
 /// Emit the `pred_transform`/`prob_to_margin`/`base_margins` trio shared by
@@ -15,7 +24,7 @@ fn log_link_transform(preds: &mut [f32]) {
 macro_rules! log_link_objective {
     () => {
         fn pred_transform(&self, preds: &mut [f32]) {
-            log_link_transform(preds);
+            crate::simd::exp_inplace(preds);
         }
 
         fn prob_to_margin(&self, base_score: f32) -> f32 {
@@ -74,6 +83,14 @@ impl Objective for PoissonObjective {
 
     log_link_objective!();
 
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        Some(Box::new(poisson_deviance))
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        check_label_domain(info, |y| y < 0.0)
+    }
+
     fn default_metric(&self) -> String {
         "poisson-nloglik".to_string()
     }
@@ -101,6 +118,18 @@ impl Objective for GammaObjective {
     }
 
     log_link_objective!();
+
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // Half the Gamma unit deviance: `y/μ − ln(y/μ) − 1`.
+        Some(Box::new(|margin, label| {
+            let (m, y) = (f64::from(margin), f64::from(label));
+            y * (-m).exp() + m - y.ln() - 1.0
+        }))
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        check_label_domain(info, |y| y <= 0.0)
+    }
 
     fn default_metric(&self) -> String {
         "gamma-nloglik".to_string()
@@ -145,6 +174,24 @@ impl Objective for TweedieObjective {
 
     log_link_objective!();
 
+    fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
+        // Half the Tweedie unit deviance for `1 < ρ < 2` (Poisson at `ρ = 1`):
+        // `y^(2−ρ)/((1−ρ)(2−ρ)) − y μ^(1−ρ)/(1−ρ) + μ^(2−ρ)/(2−ρ)`.
+        let rho = f64::from(self.rho);
+        if (rho - 1.0).abs() < 1e-9 {
+            return Some(Box::new(poisson_deviance));
+        }
+        let (a, b) = (1.0 - rho, 2.0 - rho);
+        Some(Box::new(move |margin, label| {
+            let (m, y) = (f64::from(margin), f64::from(label));
+            y.powf(b) / (a * b) - y * (a * m).exp() / a + (b * m).exp() / b
+        }))
+    }
+
+    fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        check_label_domain(info, |y| y < 0.0)
+    }
+
     fn default_metric(&self) -> String {
         // XGBoost `TweedieRegression::Configure` names the metric with the
         // configured power so evaluation uses the same distribution.
@@ -155,6 +202,7 @@ impl Objective for TweedieObjective {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::gradient_pairs;
     use approx::assert_relative_eq;
 
     #[test]
@@ -163,8 +211,7 @@ mod tests {
         let obj = PoissonObjective::default();
         let labels = [2.0f32, 5.0];
         let preds = [2.0f32.ln(), 5.0f32.ln()];
-        let mut out = vec![GradPair::default(); 2];
-        obj.gradient(&preds, &labels, None, &mut out);
+        let out = gradient_pairs(&obj, &preds, &labels, None);
         assert_relative_eq!(out[0].grad, 0.0, epsilon = 1e-5);
         assert_relative_eq!(out[1].grad, 0.0, epsilon = 1e-5);
         assert!(out[0].hess > 0.0);
@@ -175,8 +222,7 @@ mod tests {
         let obj = GammaObjective;
         let labels = [3.0f32];
         let preds = [3.0f32.ln()];
-        let mut out = vec![GradPair::default(); 1];
-        obj.gradient(&preds, &labels, None, &mut out);
+        let out = gradient_pairs(&obj, &preds, &labels, None);
         // 1 - y*exp(-log y) = 1 - 1 = 0
         assert_relative_eq!(out[0].grad, 0.0, epsilon = 1e-5);
     }

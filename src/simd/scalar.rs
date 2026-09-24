@@ -1,17 +1,17 @@
 //! Scalar formulas shared by dispatch fallbacks and NEON tails.
 
-use super::{LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION, sigmoid_scalar};
+use super::{BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION, sigmoid_scalar};
 use crate::objective::GradPair;
 
 pub(super) fn logistic_gradient(
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
-    parameters: (f32, f32),
+    scale_pos_weight: f32,
+    min_hess: f32,
     out: &mut [GradPair],
     range: std::ops::Range<usize>,
 ) {
-    let (scale_pos_weight, min_hess) = parameters;
     for index in range {
         let label = labels[index];
         let probability = sigmoid_scalar(preds[index]);
@@ -80,26 +80,38 @@ pub(super) fn tweedie_gradient(
     }
 }
 
+/// `(Σ wᵢ·term(i), Σ wᵢ)` over `range`, with unit weights when `weights` is
+/// `None`: the accumulation shared by the weighted metric sums.
+#[inline]
+fn weighted_sum(
+    weights: Option<&[f32]>,
+    range: std::ops::Range<usize>,
+    term: impl Fn(usize) -> f64,
+) -> (f64, f64) {
+    let mut sum = 0.0;
+    let mut weight_sum = 0.0;
+    for index in range {
+        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+        sum += weight * term(index);
+        weight_sum += weight;
+    }
+    (sum, weight_sum)
+}
+
 pub(super) fn distance_sum<const SQUARED: bool>(
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
-    let mut sum = 0.0;
-    let mut weight_sum = 0.0;
-    for index in range {
-        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+    weighted_sum(weights, range, |index| {
         let difference = f64::from(preds[index]) - f64::from(labels[index]);
-        let distance = if SQUARED {
+        if SQUARED {
             difference * difference
         } else {
             difference.abs()
-        };
-        sum += weight * distance;
-        weight_sum += weight;
-    }
-    (sum, weight_sum)
+        }
+    })
 }
 
 pub(super) fn classification_error_sum(
@@ -120,22 +132,33 @@ pub(super) fn classification_error_sum(
     (wrong, weight_sum)
 }
 
+/// XGBoost's `logloss` term `x·ln(max(y, ε))`, exactly `0` when `x == 0`;
+/// `max` keeps a NaN `y` like `std::max(y, eps)`. Out-of-range predictions
+/// (e.g. `binary:logitraw` margins) are not clamped to `[0, 1]`.
+fn xlogy(x: f64, y: f64) -> f64 {
+    if x == 0.0 {
+        0.0
+    } else {
+        let floored = if y < BINARY_LOG_LOSS_EPSILON {
+            BINARY_LOG_LOSS_EPSILON
+        } else {
+            y
+        };
+        x * floored.ln()
+    }
+}
+
 pub(super) fn log_loss(
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
-    let mut loss = 0.0;
-    let mut weight_sum = 0.0;
-    for index in range {
-        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
-        let probability = f64::from(preds[index]).clamp(LOG_LOSS_EPSILON, 1.0 - LOG_LOSS_EPSILON);
+    weighted_sum(weights, range, |index| {
+        let probability = f64::from(preds[index]);
         let label = f64::from(labels[index]);
-        loss += weight * -(label * probability.ln() + (1.0 - label) * (1.0 - probability).ln());
-        weight_sum += weight;
-    }
-    (loss, weight_sum)
+        xlogy(-label, probability) + xlogy(-(1.0 - label), 1.0 - probability)
+    })
 }
 
 pub(super) fn positive_nloglik<const GAMMA: bool>(
@@ -144,19 +167,45 @@ pub(super) fn positive_nloglik<const GAMMA: bool>(
     weights: Option<&[f32]>,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
-    let mut loss = 0.0;
-    let mut weight_sum = 0.0;
-    for index in range {
-        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+    weighted_sum(weights, range, |index| {
         let prediction = f64::from(preds[index]).max(MIN_POSITIVE_PREDICTION);
         let label = f64::from(labels[index]);
-        loss += weight
-            * if GAMMA {
-                label / prediction + prediction.ln()
-            } else {
-                prediction - label * prediction.ln()
-            };
-        weight_sum += weight;
-    }
-    (loss, weight_sum)
+        if GAMMA {
+            label / prediction + prediction.ln()
+        } else {
+            prediction - label * prediction.ln()
+        }
+    })
+}
+
+pub(super) fn tweedie_nloglik(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    rho: f64,
+    range: std::ops::Range<usize>,
+) -> (f64, f64) {
+    weighted_sum(weights, range, |index| {
+        let prediction = f64::from(preds[index]).max(MIN_POSITIVE_PREDICTION);
+        let label = f64::from(labels[index]);
+        let first = label * prediction.powf(1.0 - rho) / (1.0 - rho);
+        let second = prediction.powf(2.0 - rho) / (2.0 - rho);
+        -first + second
+    })
+}
+
+/// Multiclass log loss over the label `rows` of a row-major `num_class`
+/// prediction matrix.
+pub(super) fn multiclass_log_loss(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    num_class: usize,
+    rows: std::ops::Range<usize>,
+) -> (f64, f64) {
+    weighted_sum(weights, rows, |row| {
+        -f64::from(preds[row * num_class + labels[row] as usize])
+            .clamp(LOG_LOSS_EPSILON, 1.0)
+            .ln()
+    })
 }

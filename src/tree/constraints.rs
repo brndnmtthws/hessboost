@@ -6,7 +6,7 @@
 //! for the whole subtree, following the scheme XGBoost uses.
 
 use crate::config::Monotone;
-use crate::tree::gain::{GradStats, RegParams, threshold_l1};
+use crate::tree::gain::{GradStats, RegParams, calc_weight, threshold_l1};
 
 /// Per-feature monotone directions (`+1` increasing, `-1` decreasing, `0` none).
 #[derive(Debug, Clone, Default)]
@@ -68,14 +68,7 @@ impl Bounds {
 
 /// Optimal leaf weight subject to `max_delta_step` and the bound interval.
 pub fn calc_weight_bounded(stats: GradStats, reg: &RegParams, bounds: Bounds) -> f64 {
-    if stats.hess < reg.min_child_weight || stats.hess <= 0.0 {
-        return bounds.clamp(0.0);
-    }
-    let mut w = -threshold_l1(stats.grad, reg.alpha) / (stats.hess + reg.lambda);
-    if reg.max_delta_step > 0.0 {
-        w = w.clamp(-reg.max_delta_step, reg.max_delta_step);
-    }
-    bounds.clamp(w)
+    bounds.clamp(calc_weight(stats, reg))
 }
 
 /// Structure score evaluated at a specific weight `w`:

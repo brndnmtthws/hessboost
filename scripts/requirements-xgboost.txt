@@ -1,0 +1,4 @@
+# The XGBoost release hessboost's parity fixtures target. 3.4.2 is published
+# only as a source tarball (no PyPI wheel), so uv builds it with CMake.
+xgboost @ https://github.com/dmlc/xgboost/releases/download/v3.4.2/xgboost-src-3.4.2.tar.gz#subdirectory=python-package
+numpy

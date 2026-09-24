@@ -122,12 +122,12 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: parity
-      - name: Generate fixtures from XGBoost 3.4.1
-        run: uv run --with xgboost==3.4.1 --with numpy python scripts/gen_fixtures.py
+      - name: Generate fixtures from XGBoost 3.4.2
+        run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
       - name: Train, import and cut parity
         run: mbx test --test parity --release -- --ignored --nocapture
       - name: Export parity (reload in XGBoost)
-        run: uv run --with xgboost==3.4.1 --with numpy python scripts/check_exports.py
+        run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 
   all-checks-passed:
     permissions: {}

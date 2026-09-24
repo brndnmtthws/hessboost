@@ -3,23 +3,28 @@
 //! Features are pre-binned once ([`GHistIndex`]). Growing a node reduces to
 //! scanning its per-bin gradient histogram. Sibling histograms are obtained by
 //! subtraction (`sibling = parent − smaller_child`), so only the smaller child
-//! is ever built directly. Supports both `depthwise` and `lossguide` growth.
+//! is ever built directly. Supports `depthwise` and `lossguide` growth, and
+//! hands `symmetric` growth to the level-wise oblivious builder.
 
+use super::lightgbm::{NodeCtx, SplitOptions, finalize_smoothed_leaves};
 use super::{
     BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, build_interaction_sets,
-    finalize_leaf_values, next_allowed, permits, sum_rows, sweep_categorical, xgb_loss_chg,
-    xgb_node_gain, xgb_update,
+    finalize_leaf_values, for_each_numeric_split, limit_or_unbounded, next_allowed, permits,
+    sum_rows, sweep_categorical, xgb_calc_weight, xgb_loss_chg, xgb_node_gain, xgb_update,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
+use crate::tree::constraints::{Bounds, MonotoneConstraints};
 use crate::tree::gain::{GradStats, RegParams};
+use crate::tree::hist::quantized::QuantNode;
 use crate::tree::hist::{
     BinIndex, CpuBackend, Histogram, HistogramBackend, subtract_in_place, zeroed,
 };
+use crate::tree::in_category_set;
 use crate::tree::regtree::RegTree;
+use crate::tree::reuse::{CategoricalPenalty, HistReuse, ReuseSet};
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -30,9 +35,10 @@ use std::collections::BinaryHeap;
 /// pool busy, and their evaluation is too short to be worth a fork.
 const PARALLEL_EVALUATE_ROWS: usize = 16_384;
 
-/// Combined frontier rows at which depthwise growth builds a level's child
-/// histograms concurrently. Below this, the fork costs more than the scan.
-const PARALLEL_FRONTIER_ROWS: usize = 4096;
+/// Combined level rows at which depthwise and symmetric growth build a
+/// level's child histograms concurrently. Below this, the fork costs more
+/// than the scan.
+pub(super) const PARALLEL_FRONTIER_ROWS: usize = 4096;
 
 /// Whether the rayon pool has more than one thread, so parallelism can pay off.
 pub(super) fn rayon_available() -> bool {
@@ -57,6 +63,11 @@ struct NodeEntry {
     /// constraints and the split features on the path from the root. `None`
     /// means "all features allowed" (the root, and the inactive case).
     allowed: Option<InteractionState>,
+    /// The tree's seed, handed to every node's split search.
+    tree_seed: u64,
+    /// Quantized histogram (`use_quantized_grad`); `hist` then holds its
+    /// dequantized copy for split evaluation.
+    quant: Option<QuantNode>,
 }
 
 /// Tree expansion and sampling happen in node order, so the expensive row and
@@ -100,6 +111,13 @@ pub struct HistTreeBuilder<'a> {
     /// interact with itself.
     interaction_sets: Option<Vec<Vec<u32>>>,
     backend: CpuBackend,
+    /// LightGBM `extra_trees` / `path_smooth`; `None` keeps XGBoost's search.
+    options: Option<SplitOptions>,
+    /// Opt-in reuse penalties (`toad_penalty_*`), projected onto the bins of
+    /// the index this builder grows on. `None` on the default path.
+    reuse: Option<HistReuse>,
+    /// Stream of the stochastic gradient rounding (`use_quantized_grad`).
+    rounding_seed: u64,
 }
 
 impl<'a> HistTreeBuilder<'a> {
@@ -111,7 +129,29 @@ impl<'a> HistTreeBuilder<'a> {
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
             backend: CpuBackend,
+            options: SplitOptions::from_params(params),
+            reuse: None,
+            rounding_seed: 0,
         }
+    }
+
+    /// Penalize candidates by the reuse penalties of `set` (the ensemble's
+    /// used features and thresholds; `None` keeps the default gain). `cuts`
+    /// must be the cuts of every index this builder grows on. Splits the
+    /// builder commits extend its own copy, so later nodes (and later trees
+    /// grown by this builder) reuse them for free.
+    #[must_use]
+    pub(crate) fn with_reuse(mut self, set: Option<&ReuseSet>, cuts: &HistCuts) -> Self {
+        self.reuse = set.map(|set| HistReuse::new(set, cuts, BELOW_ALL_VALUES));
+        self
+    }
+    /// Seed the stochastic rounding of quantized training
+    /// (`use_quantized_grad`). The trainer passes a distinct seed per round
+    /// and output so rounding noise is independent across trees.
+    #[must_use]
+    pub(crate) fn with_rounding_seed(mut self, seed: u64) -> Self {
+        self.rounding_seed = seed;
+        self
     }
 
     /// Grow one tree from the binned dataset.
@@ -131,7 +171,8 @@ impl<'a> HistTreeBuilder<'a> {
     }
 
     /// Keep the final row partitions so training can update margins without
-    /// traversing the tree again. Used for depthwise trees without row sampling.
+    /// traversing the tree again. Used for depthwise and symmetric trees without
+    /// row sampling.
     pub(crate) fn build_with_leaf_rows(
         &self,
         ghist: &GHistIndex,
@@ -139,7 +180,7 @@ impl<'a> HistTreeBuilder<'a> {
         row_subset: &[u32],
         sampler: &mut ColumnSampler,
     ) -> (RegTree, Vec<LeafRows>) {
-        debug_assert_eq!(self.params.grow_policy, GrowPolicy::DepthWise);
+        debug_assert_ne!(self.params.grow_policy, GrowPolicy::LossGuide);
         self.build_inner(ghist, gpair, row_subset, sampler, true)
     }
 
@@ -151,21 +192,48 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
+        if self.params.grow_policy == GrowPolicy::Symmetric {
+            return super::oblivious::SymmetricTreeBuilder::new(self.params).build(
+                ghist,
+                gpair,
+                row_subset,
+                sampler,
+                capture_rows,
+            );
+        }
         let total_bins = ghist.total_bins();
+        debug_assert!(self.reuse.as_ref().is_none_or(|r| r.n_bins() == total_bins));
+        // Leaf renewal recomputes leaf values from full-precision sums, which
+        // needs every leaf's rows.
+        let renew = self.params.use_quantized_grad && self.params.quant_train_renew_leaf;
 
-        let root_stats = sum_rows(gpair, row_subset);
-        let mut root_hist = zeroed(total_bins);
-        self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+        let (root_stats, root_hist, root_quant) = if self.params.use_quantized_grad {
+            let (quant, stats, hist) =
+                QuantNode::root(ghist, gpair, row_subset, self.params, self.rounding_seed);
+            (stats, hist, Some(quant))
+        } else {
+            let root_stats = sum_rows(gpair, row_subset);
+            let mut root_hist = zeroed(total_bins);
+            self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+            (root_stats, root_hist, None)
+        };
 
         let mut tree = RegTree::with_root(root_stats.hess as f32);
         let mut store = NodeStore {
             stats: vec![root_stats],
             bounds: vec![Bounds::default()],
-            leaf_rows: capture_rows.then(Vec::new),
+            leaf_rows: (capture_rows || renew).then(Vec::new),
         };
 
         // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
-        let root_feats = sampler.sample();
+        let root_feats = sampler.sample(0);
+        let tree_seed = sampler.seed();
+        let root_ctx = NodeCtx {
+            id: 0,
+            rows: row_subset.len(),
+            output: xgb_calc_weight(root_stats, &self.reg),
+            tree_seed,
+        };
         let best = self.evaluate(
             ghist,
             &root_hist,
@@ -173,6 +241,7 @@ impl<'a> HistTreeBuilder<'a> {
             &root_feats,
             Bounds::default(),
             None,
+            root_ctx,
         );
         let root = NodeEntry {
             nid: 0,
@@ -182,6 +251,8 @@ impl<'a> HistTreeBuilder<'a> {
             best,
             bounds: Bounds::default(),
             allowed: None,
+            tree_seed,
+            quant: root_quant,
         };
 
         match self.params.grow_policy {
@@ -191,19 +262,28 @@ impl<'a> HistTreeBuilder<'a> {
             GrowPolicy::LossGuide => {
                 self.grow_lossguide(&mut tree, &mut store, ghist, gpair, sampler, root);
             }
+            GrowPolicy::Symmetric => unreachable!("symmetric trees return above"),
         }
 
+        if renew && let Some(leaves) = &store.leaf_rows {
+            for leaf in leaves {
+                store.stats[leaf.node] = sum_rows(gpair, &leaf.rows);
+            }
+        }
         // Finalize leaf weights (respecting each leaf's monotone bounds).
-        finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.reg);
-        (tree, store.leaf_rows.unwrap_or_default())
-    }
-
-    fn depth_limit(&self) -> usize {
-        if self.params.max_depth == 0 {
-            usize::MAX
-        } else {
-            self.params.max_depth
+        // Path-smoothed leaves already hold the outputs their splits chose.
+        match &self.options {
+            Some(options) if options.smoothing() => {
+                finalize_smoothed_leaves(&mut tree, root_stats, &self.reg);
+            }
+            _ => finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.reg),
         }
+        let leaf_rows = if capture_rows {
+            store.leaf_rows.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (tree, leaf_rows)
     }
 
     fn grow_depthwise(
@@ -215,7 +295,7 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         root: NodeEntry,
     ) {
-        let limit = self.depth_limit();
+        let limit = limit_or_unbounded(self.params.max_depth);
         let mut frontier = vec![root];
         let mut depth = 0;
         while depth < limit && !frontier.is_empty() {
@@ -261,20 +341,18 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         root: NodeEntry,
     ) {
-        let limit = self.depth_limit();
-        let max_leaves = if self.params.max_leaves == 0 {
-            usize::MAX
-        } else {
-            self.params.max_leaves
-        };
+        let limit = limit_or_unbounded(self.params.max_depth);
+        let max_leaves = limit_or_unbounded(self.params.max_leaves);
         let mut heap = BinaryHeap::new();
         heap.push(root);
         let mut n_leaves = 1usize;
         while let Some(entry) = heap.pop() {
             if n_leaves >= max_leaves {
+                store.record_leaf(entry);
                 break;
             }
             if entry.depth >= limit || !self.valid(&entry.best) {
+                store.record_leaf(entry);
                 continue; // permanent leaf
             }
             let children = self
@@ -285,6 +363,9 @@ impl<'a> HistTreeBuilder<'a> {
                 heap.push(l);
                 heap.push(r);
             }
+        }
+        for entry in heap {
+            store.record_leaf(entry);
         }
     }
 
@@ -307,60 +388,47 @@ impl<'a> HistTreeBuilder<'a> {
 
         // Monotone child bounds derived from the (bounded) child weights.
         let dir = self.cons.dir(b.feature as usize);
-        let (lb_bounds, rb_bounds) = child_bounds(entry.bounds, dir, b.w_left, b.w_right);
+        let (lb_bounds, rb_bounds) = b.child_bounds(entry.bounds, dir);
 
-        let (left_id, right_id) = if b.is_categorical {
-            tree.expand_categorical(
-                entry.nid,
-                b.feature,
-                &b.cat_left,
-                b.default_left,
-                b.w_left as f32,
-                b.left.hess as f32,
-                b.w_right as f32,
-                b.right.hess as f32,
-            )
-        } else {
-            let threshold = match b.split_bin {
-                Some(bin) => cuts.cut_value(bin),
-                None => BELOW_ALL_VALUES,
-            };
-            tree.expand(
-                entry.nid,
-                b.feature,
-                threshold,
-                b.default_left,
-                b.w_left as f32,
-                b.left.hess as f32,
-                b.w_right as f32,
-                b.right.hess as f32,
-            )
+        let threshold = match b.split_bin {
+            Some(bin) => cuts.cut_value(bin),
+            None => BELOW_ALL_VALUES,
         };
-        tree.set_split_gain(entry.nid, b.loss_chg as f32);
+        let (left_id, right_id) = b.expand(tree, entry.nid, threshold);
+        if let Some(reuse) = &self.reuse {
+            if b.is_categorical {
+                reuse.commit_categorical(b.feature, &b.cat_left);
+            } else {
+                reuse.commit_numeric(b.feature, b.split_bin);
+            }
+        }
         debug_assert_eq!(left_id, store.stats.len());
         store.push(b.left, lb_bounds);
         store.push(b.right, rb_bounds);
 
+        let child_depth = entry.depth + 1;
         if self.params.grow_policy == GrowPolicy::DepthWise
-            && entry.depth + 1 >= self.depth_limit()
+            && child_depth >= limit_or_unbounded(self.params.max_depth)
             && store.leaf_rows.is_none()
         {
             // Preserve the draws for these two nodes, including when callers
             // reuse the sampler. Their rows, histograms and candidate splits
             // cannot affect this tree, and leaf weights use the stored stats.
-            sampler.sample();
-            sampler.sample();
+            sampler.sample(child_depth);
+            sampler.sample(child_depth);
             return None;
         }
 
+        let left_features = sampler.sample(child_depth);
+        let right_features = sampler.sample(child_depth);
         Some(PendingSplit {
             entry,
             left_id,
             right_id,
             left_bounds: lb_bounds,
             right_bounds: rb_bounds,
-            left_features: sampler.sample(),
-            right_features: sampler.sample(),
+            left_features,
+            right_features,
         })
     }
 
@@ -382,9 +450,11 @@ impl<'a> HistTreeBuilder<'a> {
         let NodeEntry {
             depth: parent_depth,
             rows: parent_rows,
-            hist: mut parent_hist,
+            hist: parent_hist,
             best,
             allowed: parent_allowed,
+            tree_seed,
+            quant: parent_quant,
             ..
         } = entry;
         let b = &best;
@@ -393,23 +463,23 @@ impl<'a> HistTreeBuilder<'a> {
         drop(parent_rows);
 
         let terminal = self.params.grow_policy == GrowPolicy::DepthWise
-            && parent_depth + 1 >= self.depth_limit();
-        let total_bins = parent_hist.len();
-        // Build the smaller child directly; derive the sibling by subtracting it
-        // from the parent histogram in place. The parent's buffer is dead after
-        // this node expands, so the sibling reuses it without a new allocation.
+            && parent_depth + 1 >= limit_or_unbounded(self.params.max_depth);
+        let (mut left_quant, mut right_quant) = (None, None);
         let (left_hist, right_hist) = if terminal {
             (Vec::new(), Vec::new())
-        } else if left_rows.len() <= right_rows.len() {
-            let mut lh = zeroed(total_bins);
-            self.backend.build(ghist, &left_rows, gpair, &mut lh);
-            subtract_in_place(&mut parent_hist, &lh);
-            (lh, parent_hist)
+        } else if let Some(quant) = parent_quant {
+            let ((lq, lh), (rq, rh)) = quant.children(ghist, &left_rows, &right_rows, parent_hist);
+            (left_quant, right_quant) = (Some(lq), Some(rq));
+            (lh, rh)
         } else {
-            let mut rh = zeroed(total_bins);
-            self.backend.build(ghist, &right_rows, gpair, &mut rh);
-            subtract_in_place(&mut parent_hist, &rh);
-            (parent_hist, rh)
+            child_histograms(
+                self.backend,
+                ghist,
+                gpair,
+                &left_rows,
+                &right_rows,
+                parent_hist,
+            )
         };
 
         // Both children share the state derived from the complete updated path:
@@ -428,6 +498,20 @@ impl<'a> HistTreeBuilder<'a> {
             (BestSplit::none(), BestSplit::none())
         } else {
             let allowed = child_allowed.as_ref();
+            // Under path smoothing each child's output is the one its split
+            // recorded; it is the parent output of the child's own children.
+            let left_ctx = NodeCtx {
+                id: left_id,
+                rows: left_rows.len(),
+                output: b.w_left,
+                tree_seed,
+            };
+            let right_ctx = NodeCtx {
+                id: right_id,
+                rows: right_rows.len(),
+                output: b.w_right,
+                tree_seed,
+            };
             let left = || {
                 self.evaluate(
                     ghist,
@@ -436,6 +520,7 @@ impl<'a> HistTreeBuilder<'a> {
                     &left_features,
                     lb_bounds,
                     allowed,
+                    left_ctx,
                 )
             };
             let right = || {
@@ -446,6 +531,7 @@ impl<'a> HistTreeBuilder<'a> {
                     &right_features,
                     rb_bounds,
                     allowed,
+                    right_ctx,
                 )
             };
             if left_rows.len() + right_rows.len() >= PARALLEL_EVALUATE_ROWS && rayon_available() {
@@ -463,6 +549,8 @@ impl<'a> HistTreeBuilder<'a> {
             best: left_best,
             bounds: lb_bounds,
             allowed: child_allowed.clone(),
+            tree_seed,
+            quant: left_quant,
         };
         let right = NodeEntry {
             nid: right_id,
@@ -472,19 +560,20 @@ impl<'a> HistTreeBuilder<'a> {
             best: right_best,
             bounds: rb_bounds,
             allowed: child_allowed,
+            tree_seed,
+            quant: right_quant,
         };
         (left, right)
     }
 
     /// Find the best split for a node from its histogram, enumerating each
-    /// sampled feature's bins as XGBoost's histogram evaluator does: a forward
-    /// pass over every bin boundary (missing values right, including the last
-    /// boundary that isolates the missing mass) and, only when the feature has
-    /// missing values in this node, a backward pass (missing values left, down
-    /// to the endpoint that routes only the missing mass left).
-    /// Candidates are scored and compared with XGBoost's `f32` arithmetic and
-    /// tie rule, so near-equal gains resolve the same way. Monotone bounds are
-    /// honored through the bounded child weights.
+    /// sampled feature's bins as XGBoost's histogram evaluator does
+    /// ([`for_each_numeric_split`]). Candidates are scored and compared with
+    /// XGBoost's `f32` arithmetic and tie rule, so near-equal gains resolve
+    /// the same way. Monotone bounds are honored through the bounded child
+    /// weights. With LightGBM split options enabled the search is delegated
+    /// to [`SplitOptions::evaluate`].
+    #[allow(clippy::too_many_arguments)]
     fn evaluate(
         &self,
         ghist: &GHistIndex,
@@ -493,6 +582,7 @@ impl<'a> HistTreeBuilder<'a> {
         feature_subset: &[u32],
         bounds: Bounds,
         allowed: Option<&InteractionState>,
+        node: NodeCtx,
     ) -> BestSplit {
         let cuts = ghist.cuts();
         let mut best = BestSplit::none();
@@ -516,94 +606,81 @@ impl<'a> HistTreeBuilder<'a> {
             }
             None => feature_subset,
         };
-        let constrained = self.cons.is_active();
+        if let Some(options) = &self.options {
+            return options.evaluate(
+                cuts,
+                dense,
+                hist,
+                total,
+                feature_subset,
+                bounds,
+                &self.cons,
+                &self.reg,
+                node,
+            );
+        }
         let root_gain = xgb_node_gain(total, &self.reg, bounds);
 
         for &f in feature_subset {
             let (fs, fe) = cuts.feature_bins(f as usize);
-            if fe <= fs + 1 {
-                continue; // degenerate feature, no interior boundary
-            }
             let dir = self.cons.dir(f as usize);
 
             if cuts.is_categorical(f as usize) {
-                // Only non-empty category bins can move; the sweep sorts them
-                // by grad/hess ratio.
-                let mut cats: Vec<(u32, GradStats)> = (fs..fe)
-                    .filter(|&i| hist[i].hess > 0.0)
+                // Every category bin, empty ones included, as XGBoost
+                // enumerates them (a lone category can still split present
+                // from missing values).
+                let cats: Vec<(u32, GradStats)> = (fs..fe)
                     .map(|i| (cuts.cut_value(i) as u32, hist[i]))
                     .collect();
                 sweep_categorical(
                     &mut best,
-                    &mut cats,
+                    &cats,
                     total,
-                    f64::from(root_gain),
+                    root_gain,
                     bounds,
                     dir,
-                    constrained,
                     &self.reg,
                     f,
+                    self.reuse.as_ref().map(|r| r as &dyn CategoricalPenalty),
                 );
                 continue;
             }
+            if fe <= fs + 1 {
+                continue; // degenerate feature, no interior boundary
+            }
 
-            let mut acc = GradStats::default();
-            for (offset, &bin) in hist[fs..fe].iter().enumerate() {
-                let i = fs + offset;
-                acc.add(bin);
-                let right = total.sub(acc);
-                if let Some((loss_chg, wl, wr)) =
-                    xgb_loss_chg(acc, right, root_gain, &self.reg, bounds, dir)
-                {
-                    xgb_update(
-                        &mut best,
-                        loss_chg,
-                        f,
-                        SplitPos::Bin(i),
-                        false,
-                        acc,
-                        right,
-                        wl,
-                        wr,
-                    );
-                }
-            }
-            // Whether this feature has missing values in the node: XGBoost
-            // compares the forward pass's final sum with the node statistics
-            // exactly (`SplitContainsMissingValues`). A dense index never has
-            // missing entries.
-            if dense || acc == total {
-                continue;
-            }
-            // Backward pass: bins `>= i` right, the rest (and missing) left.
-            // The last candidate (`i == fs`, XGBoost's `NumericBinLowerBound`
-            // at the feature's first bin) puts only the missing mass left. Its
-            // children are the forward pass's last boundary swapped, so it is
-            // distinct under a monotone constraint: the direction can reject
-            // one orientation and accept the other. Without constraints the
-            // gains tie and the earlier (forward) candidate is kept.
-            let mut suffix = GradStats::default();
-            for i in (fs..fe).rev() {
-                suffix.add(hist[i]);
-                let left = total.sub(suffix);
-                if let Some((loss_chg, wl, wr)) =
-                    xgb_loss_chg(left, suffix, root_gain, &self.reg, bounds, dir)
-                {
-                    let pos = if i == fs {
-                        SplitPos::BelowBins
-                    } else {
-                        SplitPos::Bin(i - 1)
+            for_each_numeric_split(
+                &hist[fs..fe],
+                fs,
+                total,
+                dense,
+                |pos, default_left, l, r| {
+                    let Some((mut loss_chg, wl, wr)) =
+                        xgb_loss_chg(l, r, root_gain, &self.reg, bounds, dir)
+                    else {
+                        return;
                     };
-                    xgb_update(&mut best, loss_chg, f, pos, true, left, suffix, wl, wr);
-                }
-            }
+                    if let Some(reuse) = &self.reuse {
+                        let bin = match pos {
+                            SplitPos::Bin(bin) => Some(bin),
+                            _ => None,
+                        };
+                        loss_chg -= reuse.bin_penalty(f, bin);
+                    }
+                    xgb_update(&mut best, loss_chg, f, pos, default_left, l, r, wl, wr);
+                },
+            );
         }
         best
     }
 }
 
 /// Split `rows` (kept in order) into the rows routed left and right by `best`.
-fn partition_rows(ghist: &GHistIndex, rows: &[u32], best: &BestSplit) -> (Vec<u32>, Vec<u32>) {
+pub(super) fn partition_rows(
+    ghist: &GHistIndex,
+    rows: &[u32],
+    best: &BestSplit,
+) -> (Vec<u32>, Vec<u32>) {
     let cuts = ghist.cuts();
     let feature = best.feature as usize;
     if let (Some(columns), false) = (ghist.column_bins(), best.is_categorical) {
@@ -625,8 +702,7 @@ fn partition_rows(ghist: &GHistIndex, rows: &[u32], best: &BestSplit) -> (Vec<u3
         let go_left = match ghist.feature_bin_at(r as usize, feature, fs, fe) {
             Some(bin) => {
                 if best.is_categorical {
-                    let cv = cuts.cut_value(bin as usize) as u32;
-                    best.cat_left.contains(&cv)
+                    in_category_set(&best.cat_left, cuts.cut_value(bin as usize))
                 } else {
                     best.split_bin.is_some_and(|s| bin as usize <= s)
                 }
@@ -640,6 +716,34 @@ fn partition_rows(ghist: &GHistIndex, rows: &[u32], best: &BestSplit) -> (Vec<u3
         }
     }
     (left_rows, right_rows)
+}
+
+/// Histograms of both children of a split node: the smaller child is built
+/// directly and the sibling derived by subtracting it from `parent` in place.
+/// The parent's buffer is dead once the node expands, so the sibling reuses
+/// it without a new allocation.
+pub(super) fn child_histograms(
+    backend: CpuBackend,
+    ghist: &GHistIndex,
+    gpair: &[GradPair],
+    left_rows: &[u32],
+    right_rows: &[u32],
+    mut parent: Histogram,
+) -> (Histogram, Histogram) {
+    let left_smaller = left_rows.len() <= right_rows.len();
+    let mut small = zeroed(parent.len());
+    backend.build(
+        ghist,
+        if left_smaller { left_rows } else { right_rows },
+        gpair,
+        &mut small,
+    );
+    subtract_in_place(&mut parent, &small);
+    if left_smaller {
+        (small, parent)
+    } else {
+        (parent, small)
+    }
 }
 
 /// Rows per parallel partition chunk. Large nodes near the root are routed in
@@ -718,16 +822,13 @@ impl NodeStore {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{gp, monotone_v_shape_data};
+    use super::super::test_support::{
+        binned, gp, grow_exact, grow_hist, monotone_v_shape_data, non_decreasing,
+    };
     use super::*;
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::tree::builder::all_rows;
-
-    fn binned(data: &DMatrix, max_bin: usize) -> GHistIndex {
-        let cuts = HistCuts::from_dmatrix(data, max_bin);
-        GHistIndex::from_dmatrix(data, cuts)
-    }
 
     #[test]
     fn splits_on_separating_feature() {
@@ -742,12 +843,7 @@ mod tests {
             .gamma(0.0)
             .build()
             .unwrap();
-        let tree = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &gpair,
-            &all_rows(4),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_hist(&params, &ghist, &gpair);
         assert_eq!(tree.num_nodes(), 3);
         assert!((tree.predict_row(&data, 0) - (-1.0)).abs() < 1e-6);
         assert!((tree.predict_row(&data, 2) - 1.0).abs() < 1e-6);
@@ -771,19 +867,25 @@ mod tests {
         for depth in [1, 2, 4] {
             let params = TrainingParams::builder().max_depth(depth).build().unwrap();
             let builder = HistTreeBuilder::new(&params);
-            let new_sampler = || ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 42);
+            let new_sampler = || ColumnSampler::new(features, None, 1.0, 0.75, 0.75, 42);
             let mut sampler = new_sampler();
             let mut expected = new_sampler();
             for _ in 0..3 {
                 let tree = builder.build(&ghist, &gradients, &rows, &mut sampler);
                 assert!(tree.num_nodes() > 1);
-                // Every created node consumes one draw, including leaves whose
-                // histogram and split search are skipped at the depth limit.
-                for _ in 0..tree.num_nodes() {
-                    expected.sample();
+                // Every created node consumes one draw at its depth, in node-id
+                // order, including leaves whose histogram and split search are
+                // skipped at the depth limit.
+                let mut node_depth = vec![0usize; tree.num_nodes()];
+                for (nid, node) in tree.nodes().iter().enumerate() {
+                    expected.sample(node_depth[nid]);
+                    if !node.is_leaf() {
+                        node_depth[node.left as usize] = node_depth[nid] + 1;
+                        node_depth[node.right as usize] = node_depth[nid] + 1;
+                    }
                 }
-                for _ in 0..4 {
-                    assert_eq!(sampler.sample(), expected.sample());
+                for depth in 0..4 {
+                    assert_eq!(sampler.sample(depth), expected.sample(depth));
                 }
             }
         }
@@ -842,7 +944,7 @@ mod tests {
                 .build()
                 .unwrap();
             let builder = HistTreeBuilder::new(&params);
-            let new_sampler = || ColumnSampler::new((0..features as u32).collect(), 0.75, 0.75, 91);
+            let new_sampler = || ColumnSampler::new(features, None, 1.0, 0.75, 0.75, 91);
             // Three samplers from one seed, kept in lockstep by the draws below.
             let mut expected_sampler = new_sampler();
             let mut sampler = new_sampler();
@@ -872,9 +974,9 @@ mod tests {
                 assert!(seen.into_iter().all(|seen| seen));
                 assert!(actual.num_nodes() > 7, "must exercise multiple depths");
                 assert_eq!(actual, expected, "{mode}");
-                let next = sampler.sample();
-                assert_eq!(next, expected_sampler.sample(), "{mode}");
-                assert_eq!(next, captured_sampler.sample(), "{mode}");
+                let next = sampler.sample(1);
+                assert_eq!(next, expected_sampler.sample(1), "{mode}");
+                assert_eq!(next, captured_sampler.sample(1), "{mode}");
             }
         }
     }
@@ -890,12 +992,7 @@ mod tests {
             .gamma(1e9)
             .build()
             .unwrap();
-        let tree = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &gpair,
-            &all_rows(2),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_hist(&params, &ghist, &gpair);
         assert_eq!(tree.num_nodes(), 1);
         let (captured, leaves) = HistTreeBuilder::new(&params).build_with_leaf_rows(
             &ghist,
@@ -929,12 +1026,7 @@ mod tests {
             .lambda(0.0)
             .build()
             .unwrap();
-        let tree = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &y,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_hist(&params, &ghist, &y);
         assert!(tree.num_leaves() <= 4, "got {} leaves", tree.num_leaves());
     }
 
@@ -942,7 +1034,6 @@ mod tests {
     fn monotone_increasing_is_enforced() {
         use crate::config::Monotone;
         let (data, gpair) = monotone_v_shape_data();
-        let n = data.n_rows();
         let ghist = binned(&data, 256);
         let params = TrainingParams::builder()
             .max_depth(4)
@@ -952,23 +1043,9 @@ mod tests {
             .monotone_constraints(vec![Monotone::Increasing])
             .build()
             .unwrap();
-        let tree = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
-
+        let tree = grow_hist(&params, &ghist, &gpair);
         // Predictions must be non-decreasing in x under the increasing constraint.
-        let mut prev = f32::NEG_INFINITY;
-        for i in 0..n {
-            let p = tree.predict_row(&data, i);
-            assert!(
-                p >= prev - 1e-5,
-                "monotonicity violated at row {i}: {p} < {prev}"
-            );
-            prev = p;
-        }
+        assert!(non_decreasing(&tree, &data), "monotonicity violated");
     }
 
     // Collect the split features along every root-to-leaf path.
@@ -1019,12 +1096,7 @@ mod tests {
             .interaction_constraints(vec![vec![0, 1], vec![2, 3]])
             .build()
             .unwrap();
-        let tree = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &gpair,
-            &all_rows(data.n_rows()),
-            &mut crate::tree::sampler::ColumnSampler::all(4),
-        );
+        let tree = grow_hist(&params, &ghist, &gpair);
 
         // Every path's split features must fit inside a single allowed group:
         // never both a {0,1} feature and a {2,3} feature on the same path.
@@ -1039,47 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_interaction_constraints_leave_behavior_unchanged() {
-        let (data, gpair) = four_feature_data();
-        let ghist = binned(&data, 256);
-        let base = TrainingParams::builder()
-            .max_depth(4)
-            .min_child_weight(0.0)
-            .gamma(0.0)
-            .lambda(0.0)
-            .build()
-            .unwrap();
-        let with_empty = TrainingParams::builder()
-            .max_depth(4)
-            .min_child_weight(0.0)
-            .gamma(0.0)
-            .lambda(0.0)
-            .interaction_constraints(Vec::new())
-            .build()
-            .unwrap();
-
-        let t1 = HistTreeBuilder::new(&base).build(
-            &ghist,
-            &gpair,
-            &all_rows(data.n_rows()),
-            &mut crate::tree::sampler::ColumnSampler::all(4),
-        );
-        let t2 = HistTreeBuilder::new(&with_empty).build(
-            &ghist,
-            &gpair,
-            &all_rows(data.n_rows()),
-            &mut crate::tree::sampler::ColumnSampler::all(4),
-        );
-
-        assert_eq!(t1.num_nodes(), t2.num_nodes());
-        for r in 0..data.n_rows() {
-            assert!((t1.predict_row(&data, r) - t2.predict_row(&data, r)).abs() < 1e-9);
-        }
-    }
-
-    #[test]
     fn hist_matches_exact_on_small_problem() {
-        use crate::tree::builder::{ExactTreeBuilder, SortedColumns};
         // Random-ish separable-ish data; hist with enough bins should match exact.
         let n = 60;
         let mut x = Vec::new();
@@ -1098,23 +1130,11 @@ mod tests {
             .build()
             .unwrap();
 
-        let cols = SortedColumns::from_dmatrix(&data);
-        let exact = ExactTreeBuilder::new(&params).build(
-            &cols,
-            &data,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let exact = grow_exact(&params, &data, &gpair);
 
         // 256 bins over 60 distinct values -> each value its own bin -> exact match.
         let ghist = binned(&data, 256);
-        let hist = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let hist = grow_hist(&params, &ghist, &gpair);
 
         for r in 0..n {
             let pe = exact.predict_row(&data, r);
@@ -1145,12 +1165,7 @@ mod tests {
             .monotone_constraints(vec![Monotone::Increasing])
             .build()
             .unwrap();
-        let tree = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(1),
-        );
+        let tree = grow_hist(&params, &ghist, &gpair);
         assert_eq!(tree.num_nodes(), 3);
         let root = tree.node(0);
         assert!(root.default_left);
@@ -1224,12 +1239,7 @@ mod tests {
             .monotone_constraints(vec![Monotone::Increasing, Monotone::None])
             .build()
             .unwrap();
-        let tree = HistTreeBuilder::new(&params).build(
-            &ghist,
-            &gpair,
-            &all_rows(n),
-            &mut crate::tree::sampler::ColumnSampler::all(2),
-        );
+        let tree = grow_hist(&params, &ghist, &gpair);
         assert_eq!(tree.num_nodes(), 3);
         let root = tree.node(0);
         assert_eq!(root.split_feature, 0);

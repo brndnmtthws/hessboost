@@ -12,8 +12,9 @@
 //! [`Node::leaf_value`]s are unused (zero).
 
 use crate::data::DMatrix;
+use crate::error::HessboostError;
 use crate::tree::in_category_set;
-use crate::tree::linear::LinearLeaves;
+use crate::tree::linear::{LinearLeaves, UncheckedLinearLeaves};
 use serde::{Deserialize, Serialize};
 
 /// Sentinel used in child pointers to mark "no child" (i.e. a leaf).
@@ -132,7 +133,15 @@ impl ChildLeaf {
 }
 
 /// A regression tree: a flat node array with node `0` as the root.
+///
+/// Serde deserialization validates the tree's own structure (child links in
+/// range, every node reached exactly once from the root, finite values,
+/// category ranges inside the category pool, leaf vectors and linear leaves
+/// consistent with the nodes) and refuses a malformed tree, so every
+/// deserialized tree can be traversed. Feature indices are checked against a
+/// feature count only by the owning [`BoostedModel`](crate::model::BoostedModel).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedRegTree")]
 pub struct RegTree {
     nodes: Vec<Node>,
     /// Flat pool of category values routed left by categorical nodes. Node
@@ -148,6 +157,48 @@ pub struct RegTree {
     /// Per-leaf linear models of a `linear_tree` tree ([`LinearLeaves`]);
     /// `None` for constant-leaf trees (every tree unless `linear_tree` is on).
     linear: Option<LinearLeaves>,
+}
+
+/// The serialized fields of a [`RegTree`] (same names and layout), before
+/// validation. `RegTree`'s `Deserialize` goes through it; the native JSON
+/// reader keeps it unchecked so the model validates each tree against its
+/// feature count ([`UncheckedRegTree::into_unchecked`]).
+#[derive(Deserialize)]
+pub(crate) struct UncheckedRegTree {
+    nodes: Vec<Node>,
+    categories: Vec<u32>,
+    size_leaf_vector: usize,
+    leaf_vectors: Vec<f32>,
+    linear: Option<UncheckedLinearLeaves>,
+}
+
+impl UncheckedRegTree {
+    /// The tree as stored, unvalidated: the caller validates it
+    /// ([`RegTree::is_valid_for_features`]).
+    pub(crate) fn into_unchecked(self) -> RegTree {
+        RegTree::from_parts(
+            self.nodes,
+            self.categories,
+            self.size_leaf_vector,
+            self.leaf_vectors,
+            self.linear.map(UncheckedLinearLeaves::into_unchecked),
+        )
+    }
+}
+
+impl TryFrom<UncheckedRegTree> for RegTree {
+    type Error = HessboostError;
+
+    fn try_from(unchecked: UncheckedRegTree) -> Result<Self, Self::Error> {
+        let tree = unchecked.into_unchecked();
+        // No feature count bounds a standalone tree: traversal reads features
+        // through the caller's accessor, which answers any index.
+        if tree.is_valid_for_features(usize::MAX) {
+            Ok(tree)
+        } else {
+            Err(HessboostError::model_format("tree contains invalid nodes"))
+        }
+    }
 }
 
 impl RegTree {
@@ -224,6 +275,13 @@ impl RegTree {
 
     /// The weights of leaf `nid`, one per output: the leaf's vector for a
     /// vector-leaf tree, the single [`Node::leaf_value`] otherwise.
+    ///
+    /// With a leaf id from [`leaf_id_with`](Self::leaf_id_with) or
+    /// [`leaf_id_dense`](Self::leaf_id_dense) this is the tree's output for
+    /// a row (as XGBoost's `GetLeafIndex` and `LeafValue`), except in a
+    /// linear-leaf tree, where the leaf predicts its
+    /// [`linear_leaves`](Self::linear_leaves) model and the weight is only its
+    /// fallback for rows missing one of the model's features.
     #[inline]
     pub fn leaf_vector(&self, nid: usize) -> &[f32] {
         if self.is_vector_leaf() {
@@ -502,9 +560,12 @@ impl RegTree {
         })
     }
 
-    /// Predict the raw output of row `row` of `data`: its leaf's weight, or
-    /// the leaf's linear model for linear-leaf trees.
-    pub fn predict_row(&self, data: &DMatrix, row: usize) -> f32 {
+    /// The raw output of row `row` of `data` in this *scalar* tree: its
+    /// leaf's weight, or the leaf's linear model for linear-leaf trees.
+    /// Crate-internal: vector-leaf trees hold one weight per output, which
+    /// callers read with [`RegTree::leaf_vector`].
+    pub(crate) fn predict_row(&self, data: &DMatrix, row: usize) -> f32 {
+        debug_assert!(!self.is_vector_leaf(), "predict_row on a vector-leaf tree");
         let get = |f: u32| data.get(row, f as usize);
         let leaf = self.leaf_id_with(get);
         let constant = self.nodes[leaf].leaf_value;
@@ -531,6 +592,30 @@ mod tests {
             ChildLeaf::new(2.0, 5.0),
         );
         t
+    }
+
+    /// A deserialized tree is traversable: serde refuses child links out of
+    /// range, cycles, and unreachable nodes (which traversal would follow
+    /// out of bounds or forever) and a leaf vector of the wrong length.
+    #[test]
+    fn deserialization_refuses_malformed_trees() {
+        let doc = serde_json::to_value(stump()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RegTree>(doc.clone()).unwrap(),
+            stump()
+        );
+        for (node, field, value) in [(0, "left", 3), (0, "right", 0), (0, "left", 2)] {
+            let mut bad = doc.clone();
+            bad["nodes"][node][field] = value.into();
+            assert!(
+                serde_json::from_value::<RegTree>(bad).is_err(),
+                "{field} = {value}"
+            );
+        }
+        let mut vector = serde_json::to_value(RegTree::with_vector_root(2, 1.0)).unwrap();
+        assert!(serde_json::from_value::<RegTree>(vector.clone()).is_ok());
+        vector["leaf_vectors"] = serde_json::json!([0.0]);
+        assert!(serde_json::from_value::<RegTree>(vector).is_err());
     }
 
     #[test]

@@ -30,6 +30,7 @@
 //! scales, since the slope penalty is not scale invariant.
 
 use crate::data::{DMatrix, FeatureType};
+use crate::error::HessboostError;
 use crate::objective::GradPair;
 use crate::tree::regtree::{Node, RegTree};
 use rayon::prelude::*;
@@ -46,7 +47,13 @@ const ZERO_THRESHOLD: f64 = 1e-35_f32 as f64;
 /// Leaf `n` predicts `intercept(n) + Σ coeff·x[feature]` over its
 /// [`terms`](Self::terms), or the node's constant `leaf_value` when any of
 /// those features is missing. Internal nodes hold no terms.
+///
+/// Serde deserialization checks that the arrays are consistent (one
+/// intercept and one term range per node, ranges inside the term arrays,
+/// finite values) and refuses them otherwise; the owning [`RegTree`] checks
+/// them against its nodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(try_from = "UncheckedLinearLeaves")]
 pub struct LinearLeaves {
     /// Node `n`'s terms are `features[offsets[n]..offsets[n + 1]]` (and the
     /// matching `coeffs`); length `num_nodes + 1`.
@@ -55,6 +62,40 @@ pub struct LinearLeaves {
     intercepts: Vec<f64>,
     features: Vec<u32>,
     coeffs: Vec<f64>,
+}
+
+/// The serialized fields of [`LinearLeaves`] (same names and layout), before
+/// validation. A serialized [`RegTree`] reads its leaf models through it, so
+/// the tree checks them against its nodes in one place.
+#[derive(Deserialize)]
+pub(crate) struct UncheckedLinearLeaves {
+    offsets: Vec<u32>,
+    intercepts: Vec<f64>,
+    features: Vec<u32>,
+    coeffs: Vec<f64>,
+}
+
+impl UncheckedLinearLeaves {
+    /// The leaf models as stored, unvalidated: the caller validates them
+    /// ([`LinearLeaves::is_valid`]).
+    pub(crate) fn into_unchecked(self) -> LinearLeaves {
+        LinearLeaves::from_parts(self.offsets, self.intercepts, self.features, self.coeffs)
+    }
+}
+
+impl TryFrom<UncheckedLinearLeaves> for LinearLeaves {
+    type Error = HessboostError;
+
+    fn try_from(unchecked: UncheckedLinearLeaves) -> Result<Self, Self::Error> {
+        let linear = unchecked.into_unchecked();
+        if linear.is_consistent() {
+            Ok(linear)
+        } else {
+            Err(HessboostError::model_format(
+                "linear leaf models are inconsistent",
+            ))
+        }
+    }
 }
 
 impl LinearLeaves {
@@ -125,28 +166,35 @@ impl LinearLeaves {
         }
     }
 
-    /// Structural validity against the owning tree's nodes.
-    pub(crate) fn is_valid(&self, nodes: &[Node], n_features: usize) -> bool {
-        let n = nodes.len();
-        self.offsets.len() == n + 1
-            && self.intercepts.len() == n
+    /// Consistency of the arrays on their own: one intercept and one
+    /// non-decreasing term range per node, the ranges covering `features`
+    /// and `coeffs` exactly, and finite values.
+    fn is_consistent(&self) -> bool {
+        self.offsets.len() == self.intercepts.len() + 1
             && self.offsets.first() == Some(&0)
             && self
                 .offsets
                 .last()
                 .is_some_and(|&end| end as usize == self.features.len())
             && self.features.len() == self.coeffs.len()
-            && self
-                .offsets
-                .windows(2)
-                .zip(nodes)
-                .all(|(w, node)| w[0] <= w[1] && (node.is_leaf() || w[0] == w[1]))
-            && self.features.iter().all(|&f| (f as usize) < n_features)
+            && self.offsets.windows(2).all(|w| w[0] <= w[1])
             && self
                 .intercepts
                 .iter()
                 .chain(&self.coeffs)
                 .all(|v| v.is_finite())
+    }
+
+    /// Structural validity against the owning tree's nodes.
+    pub(crate) fn is_valid(&self, nodes: &[Node], n_features: usize) -> bool {
+        self.is_consistent()
+            && self.intercepts.len() == nodes.len()
+            && self
+                .offsets
+                .windows(2)
+                .zip(nodes)
+                .all(|(w, node)| node.is_leaf() || w[0] == w[1])
+            && self.features.iter().all(|&f| (f as usize) < n_features)
     }
 }
 
@@ -502,6 +550,23 @@ mod tests {
         for (id, node) in tree.nodes().iter().enumerate() {
             let want: &[u32] = if node.is_leaf() { &[1] } else { &[] };
             assert_eq!(paths[id], want, "node {id}");
+        }
+    }
+
+    /// Deserialized leaf models are consistent: a term range past the term
+    /// arrays (which `terms` would slice out of bounds) is refused.
+    #[test]
+    fn deserialization_refuses_inconsistent_arrays() {
+        let doc = |offsets: &str| {
+            format!(r#"{{"offsets":{offsets},"intercepts":[0.5],"features":[0],"coeffs":[2.0]}}"#)
+        };
+        let linear: LinearLeaves = serde_json::from_str(&doc("[0,1]")).unwrap();
+        assert_eq!(linear.terms(0), (&[0u32][..], &[2.0][..]));
+        for offsets in ["[0,2]", "[1,1]", "[0]", "[0,1,1]"] {
+            assert!(
+                serde_json::from_str::<LinearLeaves>(&doc(offsets)).is_err(),
+                "{offsets}"
+            );
         }
     }
 }

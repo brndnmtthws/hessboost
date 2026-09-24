@@ -68,8 +68,10 @@ models in `tests/data/`, plus `fuzz/fixed-seeds/`) and runs each target for
 that long (30 s in CI's `fuzz` job). `fixed-seeds/train/*` are decoded by
 `train.rs`'s input layout: after changing it, re-check them with
 `cargo fuzz fmt train <file>`. A crash leaves its input in
-`fuzz/artifacts/<target>/`; replay
-it with `cargo fuzz run <target> <file>`. Targets: `native-model`,
+`fuzz/artifacts/<target>/`; replay it with `cargo fuzz run <target> <file>`.
+Pass `--target` with the host triple (`rustc -vV`) to both, as `run.sh`
+does: the prebuilt x86_64 Linux cargo-fuzz defaults to musl, which the
+sanitizers reject. Targets: `native-model`,
 `json-model`, `xgboost-json-model`, `xgboost-ubjson-model`, `compact-model`
 (parsers: accepted models must predict and round-trip), `loaders`
 (libsvm/CSV), and `train` (validated parameters on small datasets must

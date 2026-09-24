@@ -1,0 +1,10 @@
+# Layered over the repository's mise.toml when mise runs in this directory:
+# fuzzing needs a nightly compiler (sanitizer flags) and cargo-fuzz.
+[tools]
+rust = { version = "nightly-2026-09-22", profile = "minimal", components = "rustfmt", mr_boxington = true }
+"cargo:cargo-fuzz" = "0.13.2"
+
+# The repository's enter hook does not fire when moving into this directory
+# from the repository root.
+[hooks]
+enter = "mise i -q"

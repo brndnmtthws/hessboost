@@ -13,7 +13,10 @@ categories = ["artificial-intelligence", "algorithms", "science"]
 [dependencies]
 rayon = "1.12"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# `float_roundtrip`: native JSON models store `f64` fields (linear-leaf
+# coefficients, objective parameters), which the default parser can misread
+# by an ulp.
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 zstd = { version = "0.14", default-features = false }
 
 [features]

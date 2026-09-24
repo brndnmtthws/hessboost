@@ -453,7 +453,18 @@ impl<'a> Trainer<'a> {
             built.as_ref()
         };
         let params = self.params;
-        with_thread_pool(params, || train_impl(self, objective))
+        let result = with_thread_pool(params, || train_impl(self, objective))?;
+        // What training returns must load again. Arithmetic that overflows
+        // `f32` (from extreme labels, weights, or margins) leaves non-finite
+        // values the model formats refuse; report it here, not at load time.
+        result.model.validate_structure().map_err(|e| {
+            let reason = match e {
+                HessboostError::ModelFormat(reason) => reason,
+                other => other.to_string(),
+            };
+            HessboostError::model_format(format!("training produced an invalid model: {reason}"))
+        })?;
+        Ok(result)
     }
 }
 
@@ -528,6 +539,18 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
+    // Saved models require `num_class >= 2` to equal the output count, so a
+    // `num_class` the objective does not use would train an unloadable model.
+    if params.num_class >= 2 && params.num_class != n_out {
+        return Err(HessboostError::invalid_param(
+            "num_class",
+            format!(
+                "objective `{}` has {n_out} outputs, so num_class {} does not apply to it",
+                objective.name(),
+                params.num_class
+            ),
+        ));
+    }
     validate_dataset(
         objective,
         dtrain,
@@ -1561,6 +1584,32 @@ mod tests {
             train(&params, &d, 5),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "grow_policy"
         ));
+    }
+
+    #[test]
+    fn num_class_must_match_the_objective_outputs() {
+        let x: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..12).map(|i| (i % 3) as f32).collect();
+        let d = labeled_dense(&x, 12, 1, &y);
+        let params = |objective: &str, num_class| {
+            TrainingParams::builder()
+                .objective(objective)
+                .num_class(num_class)
+                .build()
+                .unwrap()
+        };
+        // A stray num_class used to train a single-output model that
+        // `from_bytes`/`from_json` then refused.
+        assert!(matches!(
+            train(&params("reg:squarederror", 3), &d, 2),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "num_class"
+        ));
+        for num_class in [0, 1] {
+            let model = train(&params("reg:squarederror", num_class), &d, 2).unwrap();
+            BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        }
+        let model = train(&params("multi:softprob", 3), &d, 2).unwrap();
+        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
     }
 
     #[test]

@@ -11,17 +11,20 @@ the code.
 ## Toolchain
 
 `mise.toml` pins Rust (1.98.1, with clippy and rustfmt), mr-boxington (`mbx`,
-a build cache), and uv; run `mise install`. Edition 2024, MSRV 1.93
-(`rust-version` in `Cargo.toml`). `Cargo.lock` is gitignored, so never pass
-`--locked`. Building needs a C compiler for libzstd (`zstd-sys`); a
-cross-target build needs one for that target.
+a build cache), cargo-nextest, and uv; run `mise install` (an enter hook
+runs `mise i -q` in mise-activated shells). `mise.lock` pins their
+downloads; refresh it with `mise lock` after changing a version. Edition
+2024, MSRV 1.93 (`rust-version` in `Cargo.toml`). `Cargo.lock` is
+gitignored, so never pass `--locked`. Building needs a C compiler for libzstd
+(`zstd-sys`); a cross-target build needs one for that target.
 
 ## Commands
 
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo nextest run --all-features
+cargo test --doc --all-features   # nextest does not run doctests
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 MISE_RUST_VERSION=1.93.0 mise exec -- cargo build --all-features   # MSRV
 ```
@@ -32,7 +35,7 @@ gitignored `fixtures/` and never committed:
 
 ```sh
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
-cargo test --test parity --release -- --ignored --nocapture
+cargo nextest run --test parity --release --run-ignored only --no-capture
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 
@@ -56,6 +59,17 @@ cargo clippy --all-targets --all-features --target aarch64-unknown-linux-gnu -- 
 
 `scripts/README.md` documents the fixture case matrix, tiers, tolerances, and
 the benchmark harnesses.
+
+Fuzzing: `fuzz/` is a separate cargo-fuzz crate. Its `mise.toml` layers a
+pinned nightly and cargo-fuzz over the repository's tools, so run it from
+there: `./run.sh [seconds] [target...]` rebuilds the seeds (the saved
+models in `tests/data/`) and runs each target for that long (30 s in CI's
+`fuzz` job). A crash leaves its input in `fuzz/artifacts/<target>/`; replay
+it with `cargo fuzz run <target> <file>`. Targets: `native-model`,
+`json-model`, `xgboost-json-model`, `xgboost-ubjson-model`, `compact-model`
+(parsers: accepted models must predict and round-trip), `loaders`
+(libsvm/CSV), and `train` (validated parameters on small datasets must
+train or error, deterministically across thread counts).
 
 ## Lints
 
@@ -179,8 +193,8 @@ nouns there.
   - Compact (`HBTD`, documented in `model/compact.rs`): metadata is a
     section table like the native one; a change to the bit stream bumps its
     version byte (currently 1).
-  - Before each release, `cargo test --test native_format -- --ignored
-    save_models_of_this_version` writes `tests/data/saved/<Cargo
+  - Before each release, `cargo nextest run --test native_format
+    --run-ignored only save_models_of_this_version` writes `tests/data/saved/<Cargo
     version>/` (it refuses to overwrite). Commit it; never regenerate an
     earlier version's directory.
 - **Tree layout:** as in XGBoost, iteration `i` owns trees

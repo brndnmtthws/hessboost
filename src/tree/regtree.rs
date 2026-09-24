@@ -287,10 +287,14 @@ impl RegTree {
                             && node.left >= 0
                             && node.right >= 0
                             && (node.left as usize) < self.nodes.len()
-                            && (node.right as usize) < self.nodes.len()
-                            && (!node.is_categorical
-                                || (node.cat_begin <= node.cat_end
-                                    && (node.cat_end as usize) <= self.categories.len()))))
+                            && (node.right as usize) < self.nodes.len()))
+                    // Scalar trees carry the category set of categorical
+                    // leaves too (XGBoost keeps a pruned split's set), and
+                    // XGBoost refuses an empty one.
+                    && (!node.is_categorical
+                        || (node.is_leaf() && self.is_vector_leaf())
+                        || (node.cat_begin < node.cat_end
+                            && (node.cat_end as usize) <= self.categories.len()))
             })
             && self
                 .linear

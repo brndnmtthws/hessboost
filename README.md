@@ -446,7 +446,8 @@ commands.
 ## Testing and parity
 
 ```sh
-cargo test --all-features
+cargo nextest run --all-features
+cargo test --doc --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
@@ -457,7 +458,7 @@ C++ compiler.
 
 ```sh
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
-cargo test --test parity --release -- --ignored --nocapture
+cargo nextest run --test parity --release --run-ignored only --no-capture
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 

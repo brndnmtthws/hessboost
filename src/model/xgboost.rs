@@ -222,8 +222,7 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
 
     let num_feature = lmp
         .get("num_feature")
-        .and_then(scalar_f64)
-        .map(|v| v as usize)
+        .and_then(scalar_count)
         .ok_or_else(|| HessboostError::model_format("missing/invalid `num_feature`"))?;
     let num_class = count_param(lmp, "num_class", 0)?;
     // XGBoost's `num_target` counts model outputs (`ObjFunction::Targets`):
@@ -1037,10 +1036,28 @@ fn count_param(v: &Value, key: &str, default: usize) -> Result<usize> {
     let Some(value) = v.get(key) else {
         return Ok(default);
     };
-    scalar_f64(value)
-        .filter(|&n| n >= 0.0 && n.fract() == 0.0 && n < u64::MAX as f64)
-        .and_then(|n| usize::try_from(n as u64).ok())
+    scalar_count(value)
         .ok_or_else(|| HessboostError::model_format(format!("invalid `{key}` {value}")))
+}
+
+/// A scalar JSON value as an exact non-negative integer: an integer number
+/// or numeric string, or an integral value `f64` holds exactly (such as
+/// `"4.0"`). Parsing every count through `f64` would round large ones.
+fn scalar_count(value: &Value) -> Option<usize> {
+    /// `2^53`: every integer up to it is exact in `f64`.
+    const EXACT: f64 = 9_007_199_254_740_992.0;
+    let integer = match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    };
+    integer
+        .or_else(|| {
+            scalar_f64(value)
+                .filter(|&n| (0.0..=EXACT).contains(&n) && n.fract() == 0.0)
+                .map(|n| n as u64)
+        })
+        .and_then(|n| usize::try_from(n).ok())
 }
 
 /// Coerce a scalar JSON value (number, numeric string, or bool) to `f64`.
@@ -1192,6 +1209,27 @@ mod tests {
         for (a, b) in before.iter().zip(&after) {
             assert!((a - b).abs() < 1e-5, "pred drift: {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn feature_counts_round_trip_exactly() {
+        // `num_feature` is written as an integer string; reading it through
+        // `f64` rounded counts above 2^53 to a neighbor.
+        let (model, _) = reg_model();
+        for n_features in [(1usize << 53) + 1, usize::MAX] {
+            let mut wide = model.clone();
+            wide.n_features = n_features;
+            for restored in [
+                import_xgboost_json(&export_xgboost_json(&wide).unwrap()).unwrap(),
+                import_xgboost_ubjson(&export_xgboost_ubjson(&wide).unwrap()).unwrap(),
+            ] {
+                assert_eq!(restored.n_features(), n_features);
+            }
+        }
+        let lmp = |v: &str| serde_json::json!({ "num_feature": v });
+        assert_eq!(count_param(&lmp("4.0"), "num_feature", 0).unwrap(), 4);
+        assert!(count_param(&lmp("4.5"), "num_feature", 0).is_err());
+        assert!(count_param(&lmp("-1"), "num_feature", 0).is_err());
     }
 
     #[test]

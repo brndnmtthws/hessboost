@@ -56,6 +56,10 @@ pub(super) struct BestSplit {
     pub(super) is_categorical: bool,
     /// For a categorical split, the category values routed left.
     pub(super) cat_left: Vec<u32>,
+    /// Whether the children are XGBoost's children swapped: the XGBoost
+    /// categorical search scores its set as the right child and records it
+    /// as the tree's left one, so monotone bounds follow its orientation.
+    pub(super) children_swapped: bool,
 }
 
 impl BestSplit {
@@ -72,6 +76,7 @@ impl BestSplit {
             w_right: 0.0,
             is_categorical: false,
             cat_left: Vec::new(),
+            children_swapped: false,
         }
     }
 
@@ -105,6 +110,7 @@ impl BestSplit {
             w_right,
             is_categorical: false,
             cat_left: Vec::new(),
+            children_swapped: false,
         }
     }
 
@@ -134,6 +140,7 @@ impl BestSplit {
             w_right,
             is_categorical: true,
             cat_left,
+            children_swapped: false,
         }
     }
 
@@ -184,11 +191,10 @@ impl BestSplit {
             && children_valid(self.left, self.right, min_child_weight)
     }
 
-    /// Monotone bounds of this split's children (left, right). A categorical
-    /// split's children are XGBoost's children swapped (its set is XGBoost's
-    /// right child), so their bounds are derived in XGBoost's orientation.
+    /// Monotone bounds of this split's children (left, right), derived in
+    /// the orientation the split was scored in.
     pub(super) fn child_bounds(&self, parent: Bounds, dir: i8) -> (Bounds, Bounds) {
-        if self.is_categorical {
+        if self.children_swapped {
             let (xgb_left, xgb_right) = child_bounds(parent, dir, self.w_right, self.w_left);
             (xgb_right, xgb_left)
         } else {
@@ -524,6 +530,7 @@ pub(super) fn sweep_categorical(
                 f64::from(c.w_left),
                 set,
             );
+            best.children_swapped = true;
         }
     };
 

@@ -211,3 +211,28 @@ fn vanishing_path_smoothing_approaches_the_unsmoothed_tree() {
         "{preds:?}"
     );
 }
+
+/// A monotone constraint on a categorical feature bounds a split's children
+/// in the orientation the split was scored in (XGBoost's search records its
+/// children swapped; the `extra_trees` search does not), so a fit that
+/// satisfies the direction keeps its leaf values.
+#[test]
+fn categorical_splits_keep_their_monotone_leaves() {
+    let data = labeled_dense(&[0.0, 0.0, 1.0, 1.0], 1, &[0.0, 0.0, 2.0, 2.0])
+        .with_feature_types(&[FeatureType::Categorical])
+        .unwrap();
+    for extra_trees in [false, true] {
+        let params = TrainingParams::builder()
+            .tree_method(TreeMethod::Hist)
+            .extra_trees(extra_trees)
+            .monotone_constraints(vec![Monotone::Decreasing])
+            .lambda(0.0)
+            .eta(1.0)
+            .max_depth(1)
+            .base_score(0.0)
+            .build()
+            .unwrap();
+        let preds = train(&params, &data, 1).unwrap().predict(&data).unwrap();
+        assert_eq!(preds, [0.0, 0.0, 2.0, 2.0], "extra_trees {extra_trees}");
+    }
+}

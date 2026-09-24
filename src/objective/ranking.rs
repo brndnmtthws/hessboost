@@ -190,7 +190,12 @@ impl Objective for LambdaMart {
         }
     }
 
+    /// One label per row in the objective's domain, and non-empty query
+    /// groups that cover the rows in order, each with one constant weight
+    /// (lengths are checked before any group is sliced).
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+        info.check_layout()?;
+        super::check_label_width(info, 1)?;
         match self.mode {
             // NDCG gains are `2^label - 1` in a `u32`: relevance in [0, 31].
             RankMode::Ndcg => check_label_domain(info, |y| !(0.0..=31.0).contains(&y))?,
@@ -202,6 +207,16 @@ impl Objective for LambdaMart {
                 "ranking dataset requires group information",
             ));
         };
+        if !group.partitions(info.n_rows) || group.iter_ranges().any(|(start, end)| start == end) {
+            return Err(HessboostError::invalid_param(
+                "group_sizes",
+                format!(
+                    "dataset has {} rows, but its query groups are not non-empty consecutive \
+                     row ranges covering them",
+                    info.n_rows
+                ),
+            ));
+        }
         if let Some(weights) = info.weights {
             for (start, end) in group.iter_ranges() {
                 if weights[start..end]
@@ -431,5 +446,30 @@ mod tests {
         assert_eq!(LambdaMart::pairwise(32).default_metric(), "ndcg@32");
         assert_eq!(LambdaMart::ndcg(5).default_metric(), "ndcg@5");
         assert_eq!(LambdaMart::map(10).default_metric(), "map@10");
+    }
+
+    /// Groups or weights that do not match the rows are refused before any
+    /// group is sliced (a group of 2 over 1 row used to index out of bounds).
+    #[test]
+    fn validate_info_refuses_inconsistent_groups_and_weights() {
+        let obj = LambdaMart::pairwise(32);
+        let refused = |labels: &[f32], weights: Option<&[f32]>, group: GroupInfo| {
+            let err = obj.validate_info(&MetaInfo::new(labels, weights, Some(&group)));
+            assert!(
+                matches!(err, Err(HessboostError::InvalidParameter { .. })),
+                "{group:?}: {err:?}"
+            );
+        };
+        refused(&[1.0], Some(&[1.0]), GroupInfo::from_sizes(&[2]));
+        refused(&[1.0, 0.0], None, GroupInfo::from_sizes(&[1]));
+        refused(&[1.0, 0.0], None, GroupInfo::from_sizes(&[2, 0]));
+        refused(&[1.0, 0.0], Some(&[1.0]), GroupInfo::from_sizes(&[2]));
+        let unordered = GroupInfo {
+            group_ptr: vec![0, 3, 1, 3],
+        };
+        refused(&[1.0, 0.0, 1.0], None, unordered);
+        let fine = GroupInfo::from_sizes(&[1, 2]);
+        let info = MetaInfo::new(&[1.0, 0.0, 1.0], Some(&[2.0, 1.0, 1.0]), Some(&fine));
+        obj.validate_info(&info).unwrap();
     }
 }

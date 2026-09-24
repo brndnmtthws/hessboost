@@ -33,14 +33,9 @@ impl Objective for SquaredError {
         true
     }
 
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
         // XGBoost `FitInterceptGlmLike`: the (weighted) label mean.
-        vec![weighted_label_mean(labels, weights)]
+        vec![weighted_label_mean(info.labels, info.weights)]
     }
 
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {

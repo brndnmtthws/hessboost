@@ -122,12 +122,7 @@ impl Objective for CustomObjective {
         }
     }
 
-    fn base_margins(
-        &self,
-        _labels: &[f32],
-        _weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, _info: &crate::data::MetaInfo) -> Vec<f32> {
         vec![self.base; self.n_outputs]
     }
 

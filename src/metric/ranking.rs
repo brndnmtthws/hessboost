@@ -1,6 +1,6 @@
 //! Precision at `k` (`pre`, `pre@k`) for learning to rank.
 
-use super::{Metric, argsort_desc, group_ranges};
+use super::{Metric, argsort_desc, group_ranges, weighted_mean};
 use crate::K_RT_EPS_F32;
 
 /// XGBoost's default ranking cutoff (`LambdaRankParam::DefaultK`), used by
@@ -12,7 +12,9 @@ const DEFAULT_TOP_K: usize = 32;
 /// (stable for ties) and scores `Σ_{rank < n} label / n` with
 /// `n = min(k, group size)`; groups are averaged with their weight (the
 /// first document's weight; `1` when unweighted) and the result is capped
-/// at `1`. Without group information the whole dataset is one query.
+/// at `1`. Without group information the whole dataset is one query. Empty
+/// and zero-weight groups are skipped; without any rows or weight the
+/// result is `0`, like the other ranking metrics.
 /// Plain `pre` uses `k = 32`, XGBoost's default cutoff. Labels must be
 /// binary (within `1e-6` of `0` or `1`); XGBoost aborts otherwise, and this
 /// metric returns NaN. Higher is better.
@@ -63,6 +65,9 @@ impl Metric for Precision {
         let mut weight_sum = 0.0f64;
         for (start, end) in group_ranges(preds.len(), group) {
             let weight = weights.map_or(1.0f32, |w| w[start]);
+            if weight == 0.0 {
+                continue;
+            }
             let order = argsort_desc(&preds[start..end]);
             let n = self.k.min(end - start);
             let hits: f64 = order[..n]
@@ -72,10 +77,7 @@ impl Metric for Precision {
             score += hits / n as f64;
             weight_sum += f64::from(weight);
         }
-        if weight_sum > 0.0 {
-            score /= weight_sum;
-        }
-        score.min(1.0)
+        weighted_mean((score, weight_sum)).min(1.0)
     }
 
     /// Precision ranks one label per row within each query group.
@@ -125,6 +127,26 @@ mod tests {
     fn precision_rejects_graded_labels() {
         let v = Precision::new("pre", None).eval(&[0.5, 0.2], &[2.0, 0.0], None);
         assert!(v.is_nan());
+    }
+
+    /// Empty input (weighted or not) and empty groups score like the other
+    /// ranking metrics instead of indexing a missing first weight or
+    /// dividing `0 / 0`.
+    #[test]
+    fn precision_of_empty_input_and_groups() {
+        use crate::config::{ObjectiveParams, TrainingParams};
+        use crate::metric::build;
+        let defaults = ObjectiveParams::from_params(&TrainingParams::default());
+        for name in ["pre@5", "ndcg", "map"] {
+            let m = build(name, 0, &defaults).unwrap();
+            assert_eq!(m.eval(&[], &[], Some(&[])), 0.0, "{name}");
+            assert_eq!(m.eval(&[], &[], None), 0.0, "{name}");
+        }
+        // A trailing empty group starts past the last row.
+        let pre = Precision::new("pre@1", Some(1));
+        let group = GroupInfo::from_sizes(&[2, 0]);
+        let v = pre.eval_grouped(&[0.9, 0.1], &[1.0, 0.0], Some(&[1.0, 1.0]), Some(&group));
+        assert_eq!(v, 1.0);
     }
 
     /// `pre` reports XGBoost's names and maximizes; a zero `mphe` slope is a

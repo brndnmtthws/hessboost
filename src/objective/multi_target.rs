@@ -14,7 +14,7 @@
 //! column.
 
 use super::{GradPair, Objective};
-use crate::data::{GroupInfo, MetaInfo};
+use crate::data::MetaInfo;
 use crate::error::Result;
 
 /// An elementwise single-target objective applied to each of `n_targets`
@@ -63,8 +63,13 @@ impl Objective for MultiTarget {
         self.gradient_info(preds, &info, out);
     }
 
+    /// Inconsistent metadata (which [`Objective::validate_info`] refuses)
+    /// gives zero pairs rather than broadcasting weights it cannot pair up.
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
-        let cell_weights = info.cell_weights();
+        let Ok(cell_weights) = info.cell_weights() else {
+            out.fill(GradPair::default());
+            return;
+        };
         self.inner
             .gradient_info(preds, &Self::cells(info, cell_weights.as_deref()), out);
     }
@@ -75,20 +80,6 @@ impl Objective for MultiTarget {
 
     fn pred_transform(&self, preds: &mut [f32]) {
         self.inner.pred_transform(preds);
-    }
-
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        group: Option<&GroupInfo>,
-    ) -> Vec<f32> {
-        let info = MetaInfo {
-            n_rows: labels.len() / self.n_targets,
-            n_targets: self.n_targets,
-            ..MetaInfo::new(labels, weights, group)
-        };
-        self.base_margins_info(&info)
     }
 
     /// Per-column intercepts: the wrapped objective's estimator on label
@@ -121,7 +112,7 @@ impl Objective for MultiTarget {
     /// the flattened metadata is paired with one output margin.
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         super::check_label_width(info, self.n_targets)?;
-        let cell_weights = info.cell_weights();
+        let cell_weights = info.cell_weights()?;
         self.inner
             .validate_info(&Self::cells(info, cell_weights.as_deref()))
     }
@@ -233,5 +224,31 @@ mod tests {
             multi.validate_info(&single),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
         ));
+    }
+
+    /// Weights that do not pair up with the rows are refused, and the
+    /// gradient hook zeroes its output instead of broadcasting them (a
+    /// public `n_targets` of `usize::MAX` once overflowed the broadcast).
+    #[test]
+    fn inconsistent_metadata_is_refused_without_allocating() {
+        let multi = objective("reg:squarederror", 2);
+        let labels = [0.0, 1.0, 1.0, 0.0];
+        let info = MetaInfo {
+            n_rows: 2,
+            n_targets: 2,
+            ..MetaInfo::new(&labels, Some(&[1.0]), None)
+        };
+        assert!(matches!(
+            multi.validate_info(&info),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "weights"
+        ));
+        let huge = MetaInfo {
+            n_targets: usize::MAX,
+            weights: Some(&[1.0, 1.0]),
+            ..info
+        };
+        let mut out = vec![GradPair::new(1.0, 1.0); 4];
+        multi.gradient_info(&[0.5; 4], &huge, &mut out);
+        assert_eq!(out, vec![GradPair::default(); 4]);
     }
 }

@@ -240,12 +240,7 @@ impl Objective for Aft {
 
     /// XGBoost does not estimate an AFT intercept: its default `base_score`
     /// 0.5 maps to the margin `ln 0.5`.
-    fn base_margins(
-        &self,
-        _labels: &[f32],
-        _weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, _info: &MetaInfo) -> Vec<f32> {
         vec![self.prob_to_margin(0.5)]
     }
 
@@ -619,6 +614,23 @@ pub(crate) fn aft_nloglik(
 // erf
 // ---------------------------------------------------------------------------
 
+// `erf` below is ported from glibc 2.41's sysdeps/ieee754/dbl-64/s_erf.c,
+// whose notice follows verbatim:
+//
+// /* @(#)s_erf.c 5.1 93/09/24 */
+// /*
+//  * ====================================================
+//  * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//  *
+//  * Developed at SunPro, a Sun Microsystems, Inc. business.
+//  * Permission to use, copy, modify, and distribute this
+//  * software is freely granted, provided that this notice
+//  * is preserved.
+//  * ====================================================
+//  */
+// /* Modified by Naohiko Shimizu/Tokai University, Japan 1997/08/25,
+//    for performance improvement on pipelined processors.
+// */
 /// The error function, ported from glibc's `s_erf.c` (Sun fdlibm with
 /// glibc's polynomial evaluation order), the `erf` XGBoost's normal CDF
 /// calls on Linux. Each `a + b * c` is a fused multiply-add, as GCC

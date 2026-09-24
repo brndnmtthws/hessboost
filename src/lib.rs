@@ -1,8 +1,9 @@
 //! # hessboost
 //!
-//! A faithful, fast, pure-Rust reimplementation of
-//! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting with no C/C++
-//! dependency and no FFI.
+//! A faithful, fast Rust reimplementation of
+//! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting. Its only C
+//! dependency is the official zstd library, which compresses native model
+//! files.
 //!
 //! ## Quick start
 //!

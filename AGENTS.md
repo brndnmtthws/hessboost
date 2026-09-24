@@ -1,7 +1,8 @@
 # AGENTS.md
 
-hessboost is a pure-Rust reimplementation of XGBoost gradient boosting: one
-library crate, no C/C++, no FFI. User docs live in `README.md`, the rustdoc
+hessboost is a Rust reimplementation of XGBoost gradient boosting: one
+library crate, and no C/C++ or FFI apart from the `zstd` crate (the official
+libzstd, compressing native model files). User docs live in `README.md`, the rustdoc
 (`src/lib.rs`), and `examples/`. This file covers working on the code.
 
 ## Toolchain

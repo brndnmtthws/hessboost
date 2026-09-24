@@ -11,7 +11,6 @@
 
 use hessboost::prelude::*;
 use serde_json::Value;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 mod common;
@@ -29,11 +28,7 @@ fn unknown_and_corrupt_native_payloads_are_refused() {
     let bytes = model.to_bytes().unwrap();
     // The uncompressed container loads too; its version byte follows the
     // magic.
-    let mut container = Vec::new();
-    ruzstd::decoding::StreamingDecoder::new(bytes.as_slice())
-        .unwrap()
-        .read_to_end(&mut container)
-        .unwrap();
+    let container = zstd::stream::decode_all(bytes.as_slice()).unwrap();
     assert_eq!(&container[..4], b"SQB\0");
     assert_eq!(
         bits(

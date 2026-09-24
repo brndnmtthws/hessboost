@@ -5,8 +5,9 @@
 [![CI](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml/badge.svg)](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A faithful, fast, pure-Rust reimplementation of [XGBoost](https://github.com/dmlc/xgboost)
-gradient boosting with no C/C++ dependency and no FFI.
+A faithful, fast Rust reimplementation of [XGBoost](https://github.com/dmlc/xgboost)
+gradient boosting. Its only C dependency is the official zstd library, which
+compresses native model files.
 
 `hessboost` re-implements XGBoost's algorithms from scratch in idiomatic
 Rust. It includes the regularized second-order boosting objective, exact,
@@ -296,10 +297,10 @@ None of these change default training; each is off unless requested.
   linear-leaf, and vector-leaf models are refused, and XGBoost cannot read
   the format. On the `compact_model` example (binary classification, 16
   sensor features, 100 depth-3 trees, 8000 rows) the compact layout alone is
-  3.9x smaller than the zstd-compressed native format (6370 vs 24671 bytes,
+  2.8x smaller than the zstd-compressed native format (6370 vs 17730 bytes,
   94.98% test accuracy); `ι = ξ = 4` keeps accuracy (95.05%) with 9 of 16
-  features and 67 instead of 379 thresholds at 5204 bytes (4.7x), and
-  `ι = ξ = 16` reaches 4.9x (4976 bytes, 93.75%). The `f32` leaf table (one
+  features and 67 instead of 379 thresholds at 5204 bytes (3.3x), and
+  `ι = ξ = 16` reaches 4976 bytes (3.3x, 93.75%). The `f32` leaf table (one
   value per leaf) bounds the savings.
 - **Quantized-gradient training** (`use_quantized_grad`, LightGBM's
   quantized training, NeurIPS 2022): each tree's gradients and Hessians are

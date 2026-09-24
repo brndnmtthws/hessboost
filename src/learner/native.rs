@@ -294,10 +294,7 @@ pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
     w.finish(&mut out);
     let checksum = xxh64(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(ruzstd::encoding::compress_to_vec(
-        out.as_slice(),
-        ruzstd::encoding::CompressionLevel::Fastest,
-    ))
+    Ok(zstd::bulk::compress(&out, zstd::DEFAULT_COMPRESSION_LEVEL)?)
 }
 
 /// Decode a container (zstd-compressed or not). The caller validates the
@@ -635,7 +632,7 @@ fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
     let limit = (bytes.len() as u64)
         .saturating_mul(MAX_EXPANSION)
         .max(ALWAYS_ALLOWED);
-    let decoder = ruzstd::decoding::StreamingDecoder::new(bytes)
+    let decoder = zstd::stream::read::Decoder::with_buffer(bytes)
         .map_err(|e| format_error(format!("zstd: {e}")))?;
     let mut out = Vec::new();
     decoder

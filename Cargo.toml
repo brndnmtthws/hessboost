@@ -6,7 +6,7 @@ rust-version = "1.93"
 license = "Apache-2.0"
 repository = "https://github.com/brndnmtthws/hessboost"
 authors = ["Brenden Matthews <brenden@brndn.io>"]
-description = "A faithful, fast, pure-Rust reimplementation of XGBoost gradient boosting"
+description = "A faithful, fast Rust reimplementation of XGBoost gradient boosting"
 keywords = ["gradient-boosting", "xgboost", "machine-learning", "decision-trees", "boosting"]
 categories = ["science", "algorithms"]
 
@@ -14,7 +14,7 @@ categories = ["science", "algorithms"]
 rayon = "1.12"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 criterion = "0.8.2"

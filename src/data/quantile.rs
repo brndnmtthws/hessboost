@@ -43,6 +43,16 @@ fn global_bin(start: usize, local: usize, n_cuts: usize) -> u32 {
     start as u32 + local.min(n_cuts.saturating_sub(1)) as u32
 }
 
+/// How [`HistCuts::build`] feeds a numeric feature's sketch.
+#[derive(Clone, Copy)]
+struct Ingest {
+    /// Sort the whole column first (upstream `PushColPage`) instead of
+    /// streaming it in row order (`PushRowPage`).
+    sorted: bool,
+    /// Every weight is `1` (see [`WQSketch::with_unit_weights`]).
+    unit_weights: bool,
+}
+
 impl HistCuts {
     /// Compute cuts from a dataset with at most `max_bin` bins per feature.
     ///
@@ -52,7 +62,16 @@ impl HistCuts {
     /// sample weights when present (upstream `PushRowPage`).
     pub fn from_dmatrix(data: &DMatrix, max_bin: usize) -> Self {
         let weights = data.weights();
-        Self::build(data, max_bin, |row| weights.map_or(1.0, |w| w[row]), false)
+        let unit_weights = weights.is_none();
+        Self::build(
+            data,
+            max_bin,
+            |row| weights.map_or(1.0, |w| w[row]),
+            Ingest {
+                sorted: false,
+                unit_weights,
+            },
+        )
     }
 
     /// Compute **Hessian-weighted** cuts, as XGBoost's `tree_method=approx`
@@ -77,7 +96,10 @@ impl HistCuts {
             data,
             max_bin,
             |row| weights.map_or(hessians[row], |w| hessians[row] * w[row]),
-            sorted,
+            Ingest {
+                sorted,
+                unit_weights: false,
+            },
         )
     }
 
@@ -85,8 +107,12 @@ impl HistCuts {
         data: &DMatrix,
         max_bin: usize,
         weight_of: impl Fn(usize) -> f32 + Sync,
-        sorted: bool,
+        ingest: Ingest,
     ) -> Self {
+        let Ingest {
+            sorted,
+            unit_weights,
+        } = ingest;
         let n_rows = data.n_rows();
         let n_features = data.n_cols();
         // Dense storage is transposed in blocks so each feature's values are
@@ -139,6 +165,9 @@ impl HistCuts {
                 let mut n_values = 0usize;
                 for_each_value(f, &mut |_, _| n_values += 1);
                 let mut sketch = WQSketch::new(n_values, max_bin);
+                if unit_weights {
+                    sketch = sketch.with_unit_weights();
+                }
                 if sorted {
                     pairs.clear();
                     for_each_value(f, &mut |row, v| pairs.push((v, weight_of(row))));

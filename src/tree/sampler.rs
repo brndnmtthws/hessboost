@@ -108,6 +108,12 @@ impl ColumnSampler {
         draw(&mut self.rng, weights, level, self.bynode)
     }
 
+    /// What [`Self::sample`] returns at every depth when it draws nothing
+    /// (no `bylevel` or `bynode` sampling), else `None`.
+    pub(crate) fn fixed_features(&self) -> Option<&[u32]> {
+        (self.bylevel >= 1.0 && self.bynode >= 1.0).then_some(self.tree.as_slice())
+    }
+
     /// The per-tree seed this sampler was built with. Other per-tree random
     /// streams (the `extra_trees` threshold draws) derive from it so they vary
     /// across rounds and outputs without consuming this sampler's draws.

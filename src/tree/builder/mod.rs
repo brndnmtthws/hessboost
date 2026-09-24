@@ -284,6 +284,188 @@ impl SplitScorer<'_> {
         })
     }
 
+    /// [`Self::loss_chg`] of a run of candidates, written branch-free so it
+    /// vectorizes: `acc_grad`/`acc_hess` are the accumulated statistics of
+    /// each candidate's left child (`ACC_LEFT`) or right child, the other
+    /// child is `total` minus them. Each `loss[i]` is the candidate's loss
+    /// change, or `-inf` where [`Self::loss_chg`] returns `None`. The
+    /// arithmetic is the scalar path's, operation for operation.
+    #[inline]
+    pub(super) fn score_run<const ACC_LEFT: bool>(
+        &self,
+        total: GradStats,
+        acc_grad: &[f64],
+        acc_hess: &[f64],
+        loss: &mut [f32],
+    ) {
+        match self.dir {
+            d if d > 0 => self.score_run_dir::<ACC_LEFT, 1>(total, acc_grad, acc_hess, loss),
+            d if d < 0 => self.score_run_dir::<ACC_LEFT, { -1 }>(total, acc_grad, acc_hess, loss),
+            _ => self.score_run_dir::<ACC_LEFT, 0>(total, acc_grad, acc_hess, loss),
+        }
+    }
+
+    #[inline(always)]
+    fn score_run_dir<const ACC_LEFT: bool, const DIR: i8>(
+        &self,
+        total: GradStats,
+        acc_grad: &[f64],
+        acc_hess: &[f64],
+        loss: &mut [f32],
+    ) {
+        let RegParams {
+            lambda,
+            alpha,
+            max_delta_step,
+            min_child_weight,
+        } = *self.reg;
+        let (lower, upper) = (self.bounds.lower as f32, self.bounds.upper as f32);
+        let root_gain = self.root_gain;
+        // `xgb_weight` without its `hess <= 0` case: a candidate whose
+        // child lacks positive Hessian is invalid, and its value discarded.
+        let weight = |g: f64, h: f64| -> f32 {
+            let t = if g > alpha {
+                g - alpha
+            } else if g < -alpha {
+                g + alpha
+            } else {
+                0.0
+            };
+            let mut w = -t / (h + lambda);
+            if max_delta_step != 0.0 && w.abs() > max_delta_step {
+                w = max_delta_step.copysign(w);
+            }
+            let w = w as f32;
+            if w < lower {
+                lower
+            } else if w > upper {
+                upper
+            } else {
+                w
+            }
+        };
+        let gain = |g: f64, h: f64, w: f32| -> f64 {
+            -(2.0 * g * f64::from(w)
+                + (h + lambda) * f64::from(w * w)
+                + 2.0 * alpha * f64::from(w.abs()))
+        };
+        let n = loss.len();
+        let (acc_grad, acc_hess) = (&acc_grad[..n], &acc_hess[..n]);
+        for i in 0..n {
+            let (ag, ah) = (acc_grad[i], acc_hess[i]);
+            let (og, oh) = (total.grad - ag, total.hess - ah);
+            let (lg, lh, rg, rh) = if ACC_LEFT {
+                (ag, ah, og, oh)
+            } else {
+                (og, oh, ag, ah)
+            };
+            let valid = lh > 0.0 && rh > 0.0 && lh >= min_child_weight && rh >= min_child_weight;
+            let wl = weight(lg, lh);
+            let wr = weight(rg, rh);
+            let monotone = match DIR {
+                1 => f64::from(wl) <= f64::from(wr),
+                -1 => f64::from(wl) >= f64::from(wr),
+                _ => true,
+            };
+            let chg = (gain(lg, lh, wl) as f32 + gain(rg, rh, wr) as f32) - root_gain;
+            loss[i] = if valid && monotone {
+                chg
+            } else {
+                f32::NEG_INFINITY
+            };
+        }
+    }
+
+    /// Whether [`Self::approx_run`]'s error bound ([`APPROX_MARGIN`]) holds:
+    /// no monotone direction or bounds, no `alpha` (whose soft threshold can
+    /// cancel in the exact gain) or `max_delta_step`, and child Hessians plus
+    /// `lambda` bounded away from zero, so the optimal weight overflows `f32`
+    /// only where the approximation does.
+    #[inline]
+    pub(super) fn approx_exact(&self) -> bool {
+        let reg = self.reg;
+        self.dir == 0
+            && self.bounds.lower == f64::NEG_INFINITY
+            && self.bounds.upper == f64::INFINITY
+            && reg.alpha == 0.0
+            && reg.max_delta_step == 0.0
+            && reg.lambda + reg.min_child_weight >= 1e-3
+            && self.root_gain.is_finite()
+    }
+
+    /// Whether the candidate `(left, right)` certainly cannot score a loss
+    /// change above `incumbent` under [`Self::loss_chg`], decided without a
+    /// division: `G² / (H + λ)` per child bounds its exact gain within the
+    /// [`APPROX_MARGIN`] analysis, and the comparison is cross-multiplied.
+    /// `false` whenever [`Self::approx_exact`] does not hold or any value is
+    /// not finite, so a `true` never hides a winner.
+    #[inline]
+    pub(super) fn cannot_beat(&self, left: GradStats, right: GradStats, incumbent: f64) -> bool {
+        // The exact score is within `4ε(U + |root|)` of `U - root`
+        // ([`APPROX_MARGIN`]); `κ = 2^-19` is eight times that.
+        const KAPPA: f64 = 1.0 / 524_288.0;
+        if !self.approx_exact() {
+            return false;
+        }
+        let lambda = self.reg.lambda;
+        let (hl, hr) = (left.hess + lambda, right.hess + lambda);
+        if !(hl > 0.0 && hr > 0.0) {
+            return false;
+        }
+        let root = f64::from(self.root_gain);
+        // The exact loss change is at most `U(1 + κ) - root + κ|root|`, `U`
+        // the real `Σ G² / (H + λ)`; it stays at most the incumbent while
+        // `U(1 + κ) < incumbent + root - κ(|root| + |incumbent|)`.
+        let bound = incumbent + root - KAPPA * (root.abs() + incumbent.abs()) - 1e-30;
+        let n = left.grad * left.grad * hr + right.grad * right.grad * hl;
+        n * (1.0 + KAPPA) < bound * (hl * hr)
+    }
+
+    /// An `f32` approximation of [`Self::score_run`] (same arguments and
+    /// `-inf` for invalid candidates, validity decided exactly): each child
+    /// contributes `G · (G / (H + λ))`, the closed form of its gain at the
+    /// optimal weight. Valid only under [`Self::approx_exact`].
+    #[inline]
+    #[allow(
+        clippy::needless_bitwise_bool,
+        reason = "non-short-circuit validity keeps the loop branch-free so it vectorizes"
+    )]
+    pub(super) fn approx_run<const ACC_LEFT: bool>(
+        &self,
+        total: GradStats,
+        acc_grad: &[f64],
+        acc_hess: &[f64],
+        approx: &mut [f32],
+    ) {
+        let RegParams {
+            lambda,
+            min_child_weight,
+            ..
+        } = *self.reg;
+        let root_gain = self.root_gain;
+        let gain = |g: f64, h: f64| -> f32 {
+            let g = g as f32;
+            g * (g / (h + lambda) as f32)
+        };
+        let n = approx.len();
+        let (acc_grad, acc_hess) = (&acc_grad[..n], &acc_hess[..n]);
+        for i in 0..n {
+            let (ag, ah) = (acc_grad[i], acc_hess[i]);
+            let (og, oh) = (total.grad - ag, total.hess - ah);
+            let (lg, lh, rg, rh) = if ACC_LEFT {
+                (ag, ah, og, oh)
+            } else {
+                (og, oh, ag, ah)
+            };
+            // Non-short-circuit `&` keeps the loop free of branches, so it
+            // vectorizes.
+            let valid =
+                (lh > 0.0) & (rh > 0.0) & (lh >= min_child_weight) & (rh >= min_child_weight);
+            let chg = (gain(lg, lh) + gain(rg, rh)) - root_gain;
+            approx[i] = if valid { chg } else { f32::NEG_INFINITY };
+        }
+    }
+
     /// Gain of one candidate split in `f64` against the `root_gain` baseline,
     /// plus its bounded child weights, or `None` when a child is below
     /// `min_child_weight` or the monotone direction is violated. Unconstrained
@@ -364,6 +546,302 @@ pub(super) fn for_each_numeric_split(
             SplitPos::Bin(first + offset - 1)
         };
         offer(pos, Children::new(true, total.sub(suffix), suffix));
+    }
+}
+
+/// Candidates scored per batch by [`scan_numeric_splits`].
+const SCAN_RUN: usize = 64;
+
+/// The outcome of [`scan_numeric_splits`] for one feature.
+pub(super) enum NumericScan {
+    /// No candidate has a finite loss change.
+    Empty,
+    /// The first candidate (in [`for_each_numeric_split`] order) with the
+    /// largest finite loss change.
+    Best {
+        loss_chg: f32,
+        pos: SplitPos,
+        children: Children,
+    },
+    /// Some candidate scored NaN, whose replacement depends on the
+    /// incumbent's feature ([`need_replace`]): replay the feature with
+    /// [`for_each_numeric_split`].
+    Nan,
+}
+
+/// [`SplitScorer::loss_chg`] of every candidate of one feature, batched: the
+/// prefix sums of a run are formed first (in the same order), then every
+/// candidate of the run is scored branch-free (invalid or monotone-violating
+/// candidates as `-inf`) so the arithmetic vectorizes, and the run is
+/// scanned for its first maximum.
+///
+/// Sequential [`xgb_update`] over one feature's candidates keeps the first
+/// candidate with the largest finite loss change, if that one replaces the
+/// incumbent, and never takes infinite ones: offering only the returned
+/// [`NumericScan::Best`] to [`xgb_update`] picks the same split. NaN loss
+/// changes are the exception ([`NumericScan::Nan`]).
+pub(super) fn scan_numeric_splits(
+    bins: &[GradStats],
+    first: usize,
+    total: GradStats,
+    dense: bool,
+    scorer: &SplitScorer,
+    scratch: &mut ScanScratch,
+) -> NumericScan {
+    if bins.len() <= FILTER_BINS
+        && scorer.approx_exact()
+        && let Some(scan) = scan_filtered(bins, first, total, dense, scorer, scratch)
+    {
+        return scan;
+    }
+    let mut run = RunMax {
+        best: f32::NEG_INFINITY,
+        at: None,
+    };
+    let mut grad = [0f64; SCAN_RUN];
+    let mut hess = [0f64; SCAN_RUN];
+    let mut loss = [0f32; SCAN_RUN];
+    let mut found = None;
+
+    // Forward pass: bins `..= offset` left, missing values right.
+    let mut acc = GradStats::default();
+    for (index, chunk) in bins.chunks(SCAN_RUN).enumerate() {
+        let n = chunk.len();
+        for (k, &bin) in chunk.iter().enumerate() {
+            acc.add(bin);
+            grad[k] = acc.grad;
+            hess[k] = acc.hess;
+        }
+        scorer.score_run::<true>(total, &grad[..n], &hess[..n], &mut loss[..n]);
+        if !run.scan(&loss[..n], &grad, &hess, index * SCAN_RUN) {
+            return NumericScan::Nan;
+        }
+    }
+    if let Some((offset, left)) = run.at.take() {
+        found = Some((
+            SplitPos::Bin(first + offset),
+            Children::new(false, left, total.sub(left)),
+        ));
+    }
+    if !(dense || acc == total) {
+        // Backward pass: bins `>= offset` right, missing values left.
+        let mut suffix = GradStats::default();
+        let mut end = bins.len();
+        let mut base = 0;
+        while end > 0 {
+            let n = end.min(SCAN_RUN);
+            for k in 0..n {
+                suffix.add(bins[end - 1 - k]);
+                grad[k] = suffix.grad;
+                hess[k] = suffix.hess;
+            }
+            scorer.score_run::<false>(total, &grad[..n], &hess[..n], &mut loss[..n]);
+            if !run.scan(&loss[..n], &grad, &hess, base) {
+                return NumericScan::Nan;
+            }
+            base += n;
+            end -= n;
+        }
+        if let Some((step, right)) = run.at {
+            let offset = bins.len() - 1 - step;
+            let pos = if offset == 0 {
+                SplitPos::BelowBins
+            } else {
+                SplitPos::Bin(first + offset - 1)
+            };
+            found = Some((pos, Children::new(true, total.sub(right), right)));
+        }
+    }
+    match found {
+        Some((pos, children)) => NumericScan::Best {
+            loss_chg: run.best,
+            pos,
+            children,
+        },
+        None => NumericScan::Empty,
+    }
+}
+
+/// The most bins per feature [`scan_filtered`] handles (its candidate
+/// buffers live on the stack); wider features take the exact batched scan.
+const FILTER_BINS: usize = 256;
+
+/// Candidates per run of [`scan_filtered`]'s vectorized threshold test.
+const FILTER_RUN: usize = 16;
+
+/// Relative error allowance of [`SplitScorer::approx_run`] against
+/// [`SplitScorer::loss_chg`], per unit of `gain(left) + gain(right) +
+/// |root_gain|`. The exact score is within `4ε` of the real-valued loss
+/// change (its `f32` weight, two child gains, their sum and the parent
+/// subtraction each round once, `ε = 2^-24`) and the approximation within
+/// `7ε` (two conversions, a division and a product per child, the sum and
+/// the subtraction), so the two differ by under `11ε ≈ 2^-20.5`; `2^-17`
+/// leaves an order of magnitude to spare.
+const APPROX_MARGIN: f64 = 1.0 / 131_072.0;
+
+/// [`scan_numeric_splits`] with an approximate prefilter: every candidate is
+/// first scored by [`SplitScorer::approx_run`] (a single `f32` division per
+/// child), and only candidates whose approximation lies within the error
+/// allowance of the best approximation are scored exactly, in order. A
+/// candidate with the largest exact loss change always passes the filter: its
+/// approximation is within the allowance of its exact value, which is at
+/// least the approximate maximum's exact value. The result is therefore the
+/// exact scan's. `None` (non-finite approximations, which the error bound
+/// does not cover) defers to the exact scan.
+#[allow(
+    clippy::needless_bitwise_bool,
+    reason = "branch-free overflow and threshold tests vectorize"
+)]
+fn scan_filtered(
+    bins: &[GradStats],
+    first: usize,
+    total: GradStats,
+    dense: bool,
+    scorer: &SplitScorer,
+    scratch: &mut ScanScratch,
+) -> Option<NumericScan> {
+    let n = bins.len();
+    let ScanScratch { grad, hess, approx } = scratch;
+    let (grad, hess, approx) = (&mut grad[..2 * n], &mut hess[..2 * n], &mut approx[..2 * n]);
+    let mut acc = GradStats::default();
+    for ((&bin, g), h) in bins.iter().zip(&mut grad[..n]).zip(&mut hess[..n]) {
+        acc.add(bin);
+        *g = acc.grad;
+        *h = acc.hess;
+    }
+    scorer.approx_run::<true>(total, &grad[..n], &hess[..n], &mut approx[..n]);
+    // Candidates `n..2n` are the backward pass, whose accumulated statistics
+    // are the right child's.
+    let mut m = n;
+    if !(dense || acc == total) {
+        let mut suffix = GradStats::default();
+        for ((&bin, g), h) in bins.iter().rev().zip(&mut grad[n..]).zip(&mut hess[n..]) {
+            suffix.add(bin);
+            *g = suffix.grad;
+            *h = suffix.hess;
+        }
+        let (grad, hess) = (&grad[n..], &hess[n..]);
+        scorer.approx_run::<false>(total, grad, hess, &mut approx[n..]);
+        m = 2 * n;
+    }
+    let mut max = f32::NEG_INFINITY;
+    let mut overflow = false;
+    for &a in &approx[..m] {
+        // Invalid candidates are `-inf`; valid ones are finite unless the
+        // statistics overflow `f32`.
+        overflow |= a.is_nan() | (a == f32::INFINITY);
+        max = max.max(a);
+    }
+    if overflow {
+        return None;
+    }
+    if max == f32::NEG_INFINITY {
+        return Some(NumericScan::Empty);
+    }
+    let root = f64::from(scorer.root_gain);
+    // `gain(left) + gain(right) + |root_gain|` of the largest candidate,
+    // which bounds every candidate's error.
+    let scale = (f64::from(max) + root + root.abs()).max(0.0);
+    if scale >= 1e30 {
+        return None;
+    }
+    let threshold = f64::from(max) - 2.0 * APPROX_MARGIN * scale - 1e-30;
+    // The largest `f32` at most `threshold`: comparing in `f32` against it
+    // keeps every candidate the `f64` comparison keeps.
+    let mut cutoff = threshold as f32;
+    if f64::from(cutoff) > threshold {
+        cutoff = cutoff.next_down();
+    }
+
+    let mut best = f32::NEG_INFINITY;
+    let mut found = None;
+    for (chunk, run) in approx[..m].chunks(FILTER_RUN).enumerate() {
+        // Most runs hold no candidate near the maximum; this test vectorizes.
+        if !run.iter().fold(false, |any, &a| any | (a >= cutoff)) {
+            continue;
+        }
+        for (k, &a) in run.iter().enumerate() {
+            if a < cutoff || f64::from(a) < threshold {
+                continue;
+            }
+            let i = chunk * FILTER_RUN + k;
+            let acc = GradStats::new(grad[i], hess[i]);
+            let (pos, children) = if i < n {
+                (
+                    SplitPos::Bin(first + i),
+                    Children::new(false, acc, total.sub(acc)),
+                )
+            } else {
+                let offset = n - 1 - (i - n);
+                let pos = if offset == 0 {
+                    SplitPos::BelowBins
+                } else {
+                    SplitPos::Bin(first + offset - 1)
+                };
+                (pos, Children::new(true, total.sub(acc), acc))
+            };
+            let Some(score) = scorer.loss_chg(children.left, children.right) else {
+                continue;
+            };
+            let l = score.loss_chg;
+            if l.is_nan() {
+                return Some(NumericScan::Nan);
+            }
+            if l > best && l.is_finite() {
+                best = l;
+                found = Some((pos, children));
+            }
+        }
+    }
+    Some(match found {
+        Some((pos, children)) => NumericScan::Best {
+            loss_chg: best,
+            pos,
+            children,
+        },
+        None => NumericScan::Empty,
+    })
+}
+
+/// Candidate buffers of [`scan_numeric_splits`], reused across features.
+pub(super) struct ScanScratch {
+    grad: Vec<f64>,
+    hess: Vec<f64>,
+    approx: Vec<f32>,
+}
+
+impl ScanScratch {
+    pub(super) fn new() -> Self {
+        ScanScratch {
+            grad: vec![0.0; 2 * FILTER_BINS],
+            hess: vec![0.0; 2 * FILTER_BINS],
+            approx: vec![0.0; 2 * FILTER_BINS],
+        }
+    }
+}
+
+/// The running first maximum of [`scan_numeric_splits`]: the best finite
+/// loss change so far and, when the current pass reached it, the candidate's
+/// index in the pass and its accumulated statistics.
+struct RunMax {
+    best: f32,
+    at: Option<(usize, GradStats)>,
+}
+
+impl RunMax {
+    /// Scan one scored run (candidates `base..`); `false` on a NaN.
+    #[inline]
+    fn scan(&mut self, loss: &[f32], grad: &[f64], hess: &[f64], base: usize) -> bool {
+        for (k, &l) in loss.iter().enumerate() {
+            if l.is_nan() {
+                return false;
+            }
+            if l > self.best && l.is_finite() {
+                self.best = l;
+                self.at = Some((base + k, GradStats::new(grad[k], hess[k])));
+            }
+        }
+        true
     }
 }
 
@@ -808,6 +1286,133 @@ mod tests {
         };
         sweep_categorical(&mut best, cats, total, &scorer, 0, None);
         best
+    }
+
+    /// The batched and prefiltered numeric scans pick the split the
+    /// sequential [`for_each_numeric_split`] search picks, bit for bit, over
+    /// random histograms (empty bins and repeated bins give tied
+    /// candidates), missing mass, regularization, monotone directions, and
+    /// features wider than the prefilter's buffers.
+    #[test]
+    fn numeric_scan_matches_sequential_search() {
+        let mut rng = crate::rng::Rng::new(7);
+        for trial in 0..4000 {
+            let n = 2 + rng.range(0..300);
+            let mut bins = vec![GradStats::default(); n];
+            for bin in &mut bins {
+                if rng.below(4) == 0 {
+                    continue;
+                }
+                for _ in 0..rng.range(1..20) {
+                    let g = rng.f32() * 4.0 - 2.0;
+                    let h = 0.05 + rng.f32();
+                    bin.add(GradStats::from_pair(GradPair::new(g, h)));
+                }
+            }
+            if trial % 5 == 0 {
+                // Repeat a block of bins: equal partial sums on both sides.
+                let half = n / 2;
+                for i in 0..half {
+                    bins[n - 1 - i] = bins[i];
+                }
+            }
+            let mut total = GradStats::default();
+            for &bin in &bins {
+                total.add(bin);
+            }
+            let dense = trial % 3 == 0;
+            if !dense && rng.below(2) == 0 {
+                total.add(GradStats::new(f64::from(rng.f32()) * 8.0 - 4.0, 3.0));
+            }
+            let reg = RegParams {
+                lambda: [0.0, 1.0, 0.1][rng.range(0..3)],
+                alpha: if rng.below(6) == 0 { 0.5 } else { 0.0 },
+                max_delta_step: if rng.below(6) == 0 { 0.7 } else { 0.0 },
+                min_child_weight: [0.0, 1.0, 5.0][rng.range(0..3)],
+            };
+            let dir = [0, 0, 0, 1, -1][rng.range(0..5)];
+            let scorer = SplitScorer {
+                reg: &reg,
+                root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+                bounds: Bounds::default(),
+                dir,
+            };
+            let offer = |best: &mut BestSplit, pos, children: Children| {
+                if let Some(score) = scorer.loss_chg(children.left, children.right) {
+                    xgb_update(best, 0, pos, children, score);
+                }
+            };
+            let mut expected = BestSplit::none();
+            for_each_numeric_split(&bins, 0, total, dense, |pos, children| {
+                offer(&mut expected, pos, children);
+            });
+            let mut actual = BestSplit::none();
+            match scan_numeric_splits(&bins, 0, total, dense, &scorer, &mut ScanScratch::new()) {
+                NumericScan::Empty => {}
+                NumericScan::Best { pos, children, .. } => offer(&mut actual, pos, children),
+                NumericScan::Nan => panic!("finite statistics scored NaN"),
+            }
+            let key = |b: &BestSplit| {
+                (
+                    b.loss_chg.to_bits(),
+                    b.split_bin,
+                    b.default_left,
+                    b.left.grad.to_bits(),
+                    b.left.hess.to_bits(),
+                    b.right.grad.to_bits(),
+                    b.right.hess.to_bits(),
+                )
+            };
+            assert_eq!(key(&actual), key(&expected), "trial {trial}");
+        }
+    }
+
+    /// [`SplitScorer::cannot_beat`] never rules out a candidate whose exact
+    /// loss change exceeds the incumbent, including incumbents a few `f32`
+    /// steps around the exact value, and does rule out clearly worse ones.
+    #[test]
+    fn cannot_beat_is_conservative() {
+        let mut rng = crate::rng::Rng::new(11);
+        let mut ruled_out = 0;
+        for _ in 0..20_000 {
+            let scale = [1e-3f64, 1.0, 1e3][rng.range(0..3)];
+            let stats = |rng: &mut crate::rng::Rng| {
+                GradStats::new((rng.f64() * 2.0 - 1.0) * scale, 0.01 + rng.f64() * scale)
+            };
+            let (left, right) = (stats(&mut rng), stats(&mut rng));
+            let total = GradStats::new(left.grad + right.grad, left.hess + right.hess);
+            let reg = RegParams {
+                lambda: [1.0, 0.1][rng.range(0..2)],
+                alpha: 0.0,
+                max_delta_step: 0.0,
+                min_child_weight: 0.0,
+            };
+            let scorer = SplitScorer {
+                reg: &reg,
+                root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+                bounds: Bounds::default(),
+                dir: 0,
+            };
+            let Some(score) = scorer.loss_chg(left, right) else {
+                continue;
+            };
+            let exact = score.loss_chg;
+            let mut incumbent = exact;
+            for _ in 0..4 {
+                incumbent = incumbent.next_down();
+            }
+            for _ in 0..8 {
+                let beats = exact > incumbent;
+                if scorer.cannot_beat(left, right, f64::from(incumbent)) {
+                    assert!(!beats, "{left:?} {right:?} {incumbent} {exact}");
+                }
+                incumbent = incumbent.next_up();
+            }
+            if scorer.cannot_beat(left, right, f64::from(exact) + f64::from(exact.abs()) + 1.0) {
+                ruled_out += 1;
+            }
+        }
+        assert!(ruled_out > 10_000, "{ruled_out}");
     }
 
     /// A feature with a single category still separates it from the missing

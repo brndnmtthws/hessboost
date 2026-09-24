@@ -790,39 +790,92 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
 
                 // 3. `num_parallel_tree` trees per output from the same
                 //    gradients, output-major like XGBoost's layout.
-                for slot in 0..n_out * parallel {
-                    let (k, p) = (slot / parallel, slot % parallel);
-                    let row_subset = &row_subsets[p % row_subsets.len()];
-                    // Retaining the final row partitions replaces a per-row tree
-                    // traversal of the raw feature matrix with one sequential
-                    // pass per leaf (constant leaves only).
-                    let capture_rows = matches!(prepared, Prepared::Hist { .. })
-                        && dropped.is_none()
-                        && params.grow_policy != GrowPolicy::LossGuide
-                        && row_subset.len() == n
-                        && !gradient_sampling(params)
-                        && !params.linear_tree;
-                    let tree_slot = TreeSlot {
-                        output: k,
-                        parallel: p,
-                        rows: row_subset,
-                        capture_rows,
-                    };
-                    let (tree, leaf_rows) = fit_output_tree(
-                        &grow,
-                        &tree_slot,
-                        &mut gpair_k,
-                        &mut rng,
-                        &mut forest_sample,
-                        reuse.as_mut(),
-                    );
+                let slots: Vec<TreeSlot> = (0..n_out * parallel)
+                    .map(|slot| {
+                        let row_subset = &row_subsets[(slot % parallel) % row_subsets.len()];
+                        // Retaining the final row partitions replaces a per-row
+                        // tree traversal of the raw feature matrix with one
+                        // sequential pass per leaf (constant leaves only).
+                        let capture_rows = matches!(prepared, Prepared::Hist { .. })
+                            && dropped.is_none()
+                            && row_subset.len() == n
+                            && !gradient_sampling(params)
+                            && !params.linear_tree;
+                        TreeSlot {
+                            output: slot / parallel,
+                            parallel: slot % parallel,
+                            rows: row_subset,
+                            capture_rows,
+                        }
+                    })
+                    .collect();
+                // The trees of an iteration share the round's gradients and
+                // do not read each other. Without gradient-based sampling or
+                // a reuse dictionary, each tree's RNG draws are its column
+                // sampler and rounding seed, drawn here in slot order as the
+                // sequential path draws them; the trees are then grown in
+                // parallel. A GPU backend stages one tree's gradients at a
+                // time, so it keeps the sequential path.
+                let trees: Vec<(RegTree, Vec<LeafRows>)> = if slots.len() > 1
+                    && reuse.is_none()
+                    && !gradient_sampling(params)
+                    && params.device == Device::Cpu
+                    && rayon::current_num_threads() > 1
+                {
+                    let draws: Vec<(ColumnSampler, u64)> = slots
+                        .iter()
+                        .map(|_| {
+                            let sampler = make_column_sampler(dtrain, params, &mut rng);
+                            (sampler, quantization_seed(params, &mut rng))
+                        })
+                        .collect();
+                    slots
+                        .par_iter()
+                        .zip(draws)
+                        .map(|(slot, (mut sampler, rounding_seed))| {
+                            let mut scratch = if n_out > 1 {
+                                vec![GradPair::default(); n]
+                            } else {
+                                Vec::new()
+                            };
+                            let gk = gather_output(&gpair, &mut scratch, n_out, slot.output);
+                            let sample = TreeSample {
+                                gpair: gk,
+                                rows: slot.rows,
+                            };
+                            grow_sampled_tree(
+                                &grow,
+                                slot,
+                                sample,
+                                &mut sampler,
+                                rounding_seed,
+                                None,
+                            )
+                        })
+                        .collect()
+                } else {
+                    slots
+                        .iter()
+                        .map(|slot| {
+                            fit_output_tree(
+                                &grow,
+                                slot,
+                                &mut gpair_k,
+                                &mut rng,
+                                &mut forest_sample,
+                                reuse.as_mut(),
+                            )
+                        })
+                        .collect()
+                };
 
+                for (slot, (tree, leaf_rows)) in slots.iter().zip(trees) {
+                    let k = slot.output;
                     // DART's gradients come from the ensemble, not the margin
                     // caches (`finish_dart` recomputes the eval ones).
                     if dropped.is_none() {
                         // Row partitions already identify training leaves when
-                        // every row participated in depthwise histogram
-                        // construction.
+                        // every row participated in histogram construction.
                         if leaf_rows.is_empty() {
                             update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
                         } else {
@@ -1213,15 +1266,9 @@ fn fit_output_tree(
     forest_sample: &mut Option<GradientSample>,
     reuse: Option<&mut ReuseSet>,
 ) -> (RegTree, Vec<LeafRows>) {
-    let GrowRound {
-        run,
-        prepared,
-        gpair,
-        n_out,
-        iteration,
-    } = *grow;
-    let TrainContext { params, dtrain, .. } = *run;
-    let gk: &[GradPair] = gather_output(gpair, scratch, n_out, slot.output);
+    let TrainContext { params, dtrain, .. } = *grow.run;
+    let (prepared, n_out) = (grow.prepared, grow.n_out);
+    let gk: &[GradPair] = gather_output(grow.gpair, scratch, n_out, slot.output);
     let own;
     let sampled = if !gradient_sampling(params) {
         None
@@ -1240,16 +1287,32 @@ fn fit_output_tree(
     };
     let mut sampler = make_column_sampler(dtrain, params, rng);
     let rounding_seed = quantization_seed(params, rng);
-    let (mut tree, leaf_rows) = prepared.build_tree(
-        run,
-        TreeSample { gpair: gk, rows },
-        &mut sampler,
+    let sample = TreeSample { gpair: gk, rows };
+    grow_sampled_tree(grow, slot, sample, &mut sampler, rounding_seed, reuse)
+}
+
+/// The part of [`fit_output_tree`] after its RNG draws: build the tree on
+/// `sample`, fit linear leaves when configured, and shrink its leaves.
+fn grow_sampled_tree(
+    grow: &GrowRound,
+    slot: &TreeSlot,
+    sample: TreeSample,
+    sampler: &mut ColumnSampler,
+    rounding_seed: u64,
+    reuse: Option<&mut ReuseSet>,
+) -> (RegTree, Vec<LeafRows>) {
+    let TrainContext { params, dtrain, .. } = *grow.run;
+    let TreeSample { gpair: gk, rows } = sample;
+    let (mut tree, leaf_rows) = grow.prepared.build_tree(
+        grow.run,
+        sample,
+        sampler,
         reuse,
         rounding_seed,
         slot.capture_rows,
     );
     // LightGBM keeps the first iteration's trees constant.
-    if params.linear_tree && iteration > 0 {
+    if params.linear_tree && grow.iteration > 0 {
         crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, params.linear_lambda);
     }
     tree.scale_leaves(tree_eta(params));

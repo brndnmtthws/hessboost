@@ -318,6 +318,43 @@ and 16 threads gain about 7%. The integer loops are scalar: widths are chosen
 per node, and serial and parallel builds agree bit for bit. There is no SIMD
 path to keep in sync.
 
+### Split search, histogram, and scheduling changes
+
+Sixteen fixed workloads, timed as the median of five fits after a warmup
+(a fresh `DMatrix` inside the timer; prediction and SHAP time only the
+call), all run at once, each pinned to its own NUMA-local CPU set. Every
+case's output bits (held-out margins, predictions, contributions) were
+hashed before and after: none changed, at any thread count, and the XGBoost
+parity suite passes.
+
+Measured on the 192-core **AWS Neoverse-V3** host (Rust 1.98.1, release
+profile) on 2026-09-24 UTC, before and after the split-scoring, histogram,
+scheduling, and data-preparation changes described under
+[Implementation](#implementation). The host ran other jobs at the same time
+(load averages up to about 90), so single values vary by up to about 10%.
+
+| Case | Threads | Before (ms) | After (ms) |
+|---|---:|---:|---:|
+| Regression 100k × 30, 100 rounds | 1 | 1247 | 668 |
+| Regression 100k × 30, 100 rounds | 4 | 425 | 283 |
+| Regression 100k × 30, 100 rounds | 16 | 261 | 185 |
+| Regression 50k × 128, 100 rounds | 1 | 3931 | 1582 |
+| Regression 50k × 128, 100 rounds | 16 | 758 | 436 |
+| Binary 100k × 30, 100 rounds | 1 | 1186 | 650 |
+| Binary 100k × 30, 100 rounds | 16 | 260 | 172 |
+| 4-class 50k × 30, 100 rounds | 1 | 3312 | 1490 |
+| 4-class 50k × 30, 100 rounds | 16 | 805 | 219 |
+| Loss-guide (64 leaves) 100k × 30 | 16 | 1597 | 312 |
+| Binary 100k × 30, 20% missing | 16 | 729 | 158 |
+| Exact 50k × 20, 20 rounds | 4 | 2906 | 361 |
+| Regression 1M × 50, depth 8, 20 rounds | 48 | 441 | 361 |
+| Predict 100k × 30, 100 trees | 1 | 132 | 132 |
+| Predict 100k × 30, 100 trees | 16 | 8.64 | 9.72 |
+| SHAP contributions, 2k rows | 16 | 27.9 | 27.6 |
+| **Geometric mean** | | **501.8** | **247.5** |
+
+Prediction and SHAP are unchanged code; their differences are host noise.
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks
@@ -348,22 +385,51 @@ logarithms and Tweedie exponentials use `f64` throughout.
 
 Depthwise growth expands nodes and draws child feature samples in traversal
 order, then partitions rows, builds histograms, and evaluates the independent
-nodes in parallel. Candidate scans within a node keep their sequential order.
-Loss-guide growth retains its priority-queue ordering. Histogram accumulation
-limits the task count to one per 4,096 rows, capped at the worker count,
-so a smaller node does not allocate a full histogram for every worker.
+nodes in parallel. A wide node also splits its numeric split scans into
+feature chunks that run in parallel; each feature's best candidate is merged
+in feature order with XGBoost's tie rule, which is the sequential result.
+Loss-guide growth retains its priority-queue ordering: node ids, statistics,
+and sampler draws follow the queue, but without per-level or per-node column
+sampling the children of the queue's next best nodes are built ahead of their
+turn, in parallel. The trees of one iteration (one per class, or a
+`num_parallel_tree` forest) are grown concurrently once their RNG draws are
+taken in slot order. The exact method scans a level's features in parallel
+the same way.
+
+Split scoring is batched per feature. Prefix sums are formed in bin order,
+then every candidate is scored by an `f32` closed form `G · (G / (H + λ))`
+per child that vectorizes; only candidates within `2^-16` (relative) of the
+best approximation, twice the derived rounding bound times an order of
+magnitude, are scored exactly, in order. Configurations the bound does not
+cover (monotone constraints, `alpha`, `max_delta_step`, reuse penalties,
+non-finite statistics) score every candidate exactly, still batched. The
+exact method skips candidates a division-free bound shows cannot beat the
+incumbent. `tree::builder::tests` checks both against the sequential search.
+
+Histogram accumulation over a contiguous row range (the root) sweeps the
+column-major bin copy two features at a time, one writer per bin. Other row
+subsets of datasets up to 2^18 rows are gathered per feature pair from the
+same copy, so no partial histograms are allocated or reduced; larger ones use
+one partial histogram per task of at least 4,096 rows. Row sweeps load four
+of a row's bins (distinct features) before storing them. Every bin receives
+its rows in ascending order on every path.
 
 Leaves at `max_depth` need no histograms or split searches. With full row
-sampling, training retains their final row partitions and adds the finalized
-leaf values directly to cached training margins. Sampled training and
-evaluation datasets update independent rows in parallel, skipping small inputs
-where task overhead would dominate. Leaf statistics, monotone bounds, and
-column-sampler draws are preserved.
+sampling, training retains their final row partitions (depthwise and
+loss-guided) and adds the finalized leaf values directly to cached training
+margins. Sampled training and evaluation datasets update independent rows in
+parallel, skipping small inputs where task overhead would dominate. Leaf
+statistics, monotone bounds, and column-sampler draws are preserved.
 
 Quantile cuts are sorted independently by feature, and rows are binned in
-parallel chunks. Ordered collection preserves the cut layout, row order,
-missing-value handling, categorical bins, and the choice of 16- or 32-bit bin
-storage. This scheduling is independent of the CPU architecture.
+parallel chunks. Without sample weights the sketch's queue is radix-sorted
+(its weights are whole numbers, so equal values sum identically in any
+order). Large dense inputs are validated and copied in parallel. Ordered
+collection preserves the cut layout, row order, missing-value handling,
+categorical bins, and the choice of 16- or 32-bit bin storage. A sparse index
+at least half full also keeps a column-major copy with a missing sentinel,
+so partitions stream one column. This scheduling is independent of the CPU
+architecture.
 
 ### Prediction
 

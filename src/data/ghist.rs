@@ -100,15 +100,26 @@ pub struct GHistIndex {
     n_cols: usize,
     row_ptr: Vec<usize>,
     store: BinStore,
-    /// Feature-major copy of `store` for dense indexes: feature `f` of row `r`
-    /// is at `f * n_rows + r`. Doubles bin storage in exchange for streaming
-    /// row partitions.
-    columns: Option<BinStore>,
+    /// Feature-major copy of `store` (feature `f` of row `r` at `f * n_rows +
+    /// r`), trading up to double the bin storage for streaming partitions
+    /// and column-wise histograms.
+    columns: Columns,
     cuts: HistCuts,
     /// True when every row is complete and in ascending feature order (a dense
     /// matrix with no missing values). Then feature `f` of row `r` is at offset
     /// `row_ptr[r] + f`, so routing needs no per-row scan.
     dense: bool,
+}
+
+/// The feature-major copy a [`GHistIndex`] keeps, if any.
+#[derive(Debug, Clone)]
+enum Columns {
+    None,
+    /// Every row holds every feature ([`GHistIndex::column_bins`]).
+    Dense(BinStore),
+    /// Missing entries hold the width's maximum
+    /// ([`GHistIndex::missing_columns`]).
+    WithMissing(BinStore),
 }
 
 impl GHistIndex {
@@ -164,13 +175,39 @@ impl GHistIndex {
             store.extend(chunk.bins);
         }
 
-        // A dense index also keeps a feature-major copy: routing rows on one
-        // split feature then streams a single column instead of touching one
-        // cache line per row.
-        let columns = dense.then(|| match &store {
-            BinStore::U16(bins) => BinStore::U16(transpose_dense(bins, n_rows, n_cols)),
-            BinStore::U32(bins) => BinStore::U32(transpose_dense(bins, n_rows, n_cols)),
-        });
+        // A dense index keeps a feature-major copy: routing rows on one split
+        // feature then streams a single column instead of touching one cache
+        // line per row. A sparse index at least half full keeps one too, with
+        // a sentinel for missing entries.
+        let columns = if dense {
+            Columns::Dense(match &store {
+                BinStore::U16(bins) => BinStore::U16(transpose_dense(bins, n_rows, n_cols)),
+                BinStore::U32(bins) => BinStore::U32(transpose_dense(bins, n_rows, n_cols)),
+            })
+        } else if n_rows.saturating_mul(n_cols) <= total.saturating_mul(2) {
+            let bin_feature = bin_features(&cuts);
+            match &store {
+                BinStore::U16(bins) if total_bins < u16::MAX as usize => {
+                    Columns::WithMissing(BinStore::U16(transpose_sparse(
+                        bins,
+                        &row_ptr,
+                        n_cols,
+                        &bin_feature,
+                        u16::MAX,
+                    )))
+                }
+                BinStore::U16(_) => Columns::None,
+                BinStore::U32(bins) => Columns::WithMissing(BinStore::U32(transpose_sparse(
+                    bins,
+                    &row_ptr,
+                    n_cols,
+                    &bin_feature,
+                    u32::MAX,
+                ))),
+            }
+        } else {
+            Columns::None
+        };
 
         GHistIndex {
             n_rows,
@@ -231,7 +268,22 @@ impl GHistIndex {
     /// width. `None` for sparse indexes.
     #[inline]
     pub fn column_bins(&self) -> Option<Bins<'_>> {
-        self.columns.as_ref().map(BinStore::as_bins)
+        match &self.columns {
+            Columns::Dense(store) => Some(store.as_bins()),
+            _ => None,
+        }
+    }
+
+    /// Feature-major bin indices (`f * n_rows + r`) of a sparse index that
+    /// is at least half full, with the width's maximum (`u16::MAX` or
+    /// `u32::MAX`, never a bin) where row `r` lacks feature `f`. `None` for
+    /// dense indexes (see [`GHistIndex::column_bins`]) and sparser ones.
+    #[inline]
+    pub fn missing_columns(&self) -> Option<Bins<'_>> {
+        match &self.columns {
+            Columns::WithMissing(store) => Some(store.as_bins()),
+            _ => None,
+        }
     }
 
     /// Number of present (non-missing) entries in row `r`.
@@ -282,6 +334,63 @@ pub(crate) fn transpose_dense<B: Copy + Default + Send + Sync>(
             let row = &bins[r * n_cols + first..r * n_cols + first + width];
             for (j, &bin) in row.iter().enumerate() {
                 chunk[j * n_rows + r] = bin;
+            }
+        }
+    };
+    if rayon::current_num_threads() > 1 && n_rows.saturating_mul(n_cols) >= 65_536 {
+        columns
+            .par_chunks_mut(GROUP * n_rows)
+            .enumerate()
+            .for_each(fill);
+    } else {
+        columns
+            .chunks_mut(GROUP * n_rows)
+            .enumerate()
+            .for_each(fill);
+    }
+    columns
+}
+
+/// The feature owning each global bin.
+fn bin_features(cuts: &HistCuts) -> Vec<u32> {
+    let mut owner = vec![0u32; cuts.total_bins()];
+    for f in 0..cuts.n_features() {
+        let (fs, fe) = cuts.feature_bins(f);
+        owner[fs..fe].fill(f as u32);
+    }
+    owner
+}
+
+/// Feature-major copy of a sparse index (`bins` sliced by `row_ptr`): feature
+/// `f` of row `r` at `f * n_rows + r`, `missing` where the row has no entry
+/// for `f`. A row holding several entries of one feature keeps the first, as
+/// [`GHistIndex::feature_bin`] finds it. Features are filled in groups, each
+/// group scanning every row.
+fn transpose_sparse<B: Copy + Into<u32> + PartialEq + Send + Sync>(
+    bins: &[B],
+    row_ptr: &[usize],
+    n_cols: usize,
+    bin_feature: &[u32],
+    missing: B,
+) -> Vec<B> {
+    const GROUP: usize = 8;
+    let n_rows = row_ptr.len() - 1;
+    let mut columns = vec![missing; n_rows * n_cols];
+    if n_rows == 0 || n_cols == 0 {
+        return columns;
+    }
+    let fill = |(group, chunk): (usize, &mut [B])| {
+        let first = group * GROUP;
+        let width = chunk.len() / n_rows;
+        for r in 0..n_rows {
+            for &bin in &bins[row_ptr[r]..row_ptr[r + 1]] {
+                let j = (bin_feature[bin.into() as usize] as usize).wrapping_sub(first);
+                if j < width {
+                    let slot = &mut chunk[j * n_rows + r];
+                    if *slot == missing {
+                        *slot = bin;
+                    }
+                }
             }
         }
     };

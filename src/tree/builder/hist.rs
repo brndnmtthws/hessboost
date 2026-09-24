@@ -8,9 +8,10 @@
 
 use super::lightgbm::{SplitOptions, finalize_smoothed_leaves};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, SplitScorer, build_interaction_sets,
-    finalize_leaf_values, for_each_numeric_split, limit_or_unbounded, next_allowed, permits,
-    sum_rows, sweep_categorical, xgb_calc_weight, xgb_node_gain, xgb_update,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, NumericScan, ScanScratch, SplitPos, SplitScorer,
+    build_interaction_sets, finalize_leaf_values, for_each_numeric_split, limit_or_unbounded,
+    need_replace, next_allowed, permits, scan_numeric_splits, sum_rows, sweep_categorical,
+    xgb_calc_weight, xgb_node_gain, xgb_update,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
@@ -28,7 +29,11 @@ use crate::tree::reuse::{CategoricalPenalty, HistReuse, ReuseSet};
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
+
+/// Queued loss-guided nodes whose children are built together, in parallel
+/// (see [`HistTreeBuilder::speculative_features`]).
+const SPECULATE_NODES: usize = 8;
 
 /// Nodes with at least this many rows evaluate their two children's splits
 /// concurrently. Smaller nodes appear in frontiers wide enough to keep the
@@ -39,6 +44,11 @@ const PARALLEL_EVALUATE_ROWS: usize = 16_384;
 /// level's child histograms concurrently. Below this, the fork costs more
 /// than the scan.
 pub(super) const PARALLEL_FRONTIER_ROWS: usize = 4096;
+
+/// Split candidates (feature bins) at which a node's numeric scans run in
+/// parallel chunks of about [`SCAN_TASK_BINS`] candidates each.
+const PARALLEL_SCAN_BINS: usize = 4096;
+const SCAN_TASK_BINS: usize = 1024;
 
 /// Whether the rayon pool has more than one thread, so parallelism can pay off.
 pub(super) fn rayon_available() -> bool {
@@ -201,8 +211,7 @@ impl<'a> HistTreeBuilder<'a> {
     }
 
     /// Keep the final row partitions so training can update margins without
-    /// traversing the tree again. Used for depthwise and symmetric trees without
-    /// row sampling.
+    /// traversing the tree again. Used without row sampling.
     pub(crate) fn build_with_leaf_rows(
         &self,
         ghist: &GHistIndex,
@@ -210,7 +219,6 @@ impl<'a> HistTreeBuilder<'a> {
         row_subset: &[u32],
         sampler: &mut ColumnSampler,
     ) -> (RegTree, Vec<LeafRows>) {
-        debug_assert_ne!(self.params.grow_policy, GrowPolicy::LossGuide);
         self.build_inner(ghist, gpair, row_subset, sampler, true)
     }
 
@@ -246,9 +254,18 @@ impl<'a> HistTreeBuilder<'a> {
                 QuantNode::root(ghist, gpair, row_subset, self.params, self.rounding_seed);
             (stats, hist, Some(quant))
         } else {
-            let root_stats = sum_rows(gpair, row_subset);
-            let mut root_hist = zeroed(total_bins);
-            self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+            // The root sum is a sequential pass; it runs beside the
+            // (parallel) root histogram instead of before it.
+            let build_hist = || {
+                let mut root_hist = zeroed(total_bins);
+                self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+                root_hist
+            };
+            let (root_stats, root_hist) = if rayon_available() {
+                rayon::join(|| sum_rows(gpair, row_subset), build_hist)
+            } else {
+                (sum_rows(gpair, row_subset), build_hist())
+            };
             (root_stats, root_hist, None)
         };
 
@@ -371,6 +388,10 @@ impl<'a> HistTreeBuilder<'a> {
     ) {
         let limit = limit_or_unbounded(self.params.max_depth);
         let max_leaves = limit_or_unbounded(self.params.max_leaves);
+        let expandable = |entry: &NodeEntry| entry.depth < limit && self.valid(&entry.best);
+        let speculative = self.speculative_features(sampler);
+        // Children built ahead of their parent's turn, by parent node id.
+        let mut ready: HashMap<usize, (NodeEntry, NodeEntry)> = HashMap::new();
         let mut heap = BinaryHeap::new();
         heap.push(root);
         let mut n_leaves = 1usize;
@@ -379,13 +400,46 @@ impl<'a> HistTreeBuilder<'a> {
                 store.record_leaf(entry);
                 break;
             }
-            if entry.depth >= limit || !self.valid(&entry.best) {
+            if !expandable(&entry) {
                 store.record_leaf(entry);
                 continue; // permanent leaf
             }
-            let children = self
-                .prepare_split(tree, store, ghist.cuts(), sampler, entry)
-                .map(|split| self.build_children(ghist, gpair, split));
+            let children = if let Some(features) = &speculative {
+                if !ready.contains_key(&entry.nid) {
+                    // Build this node's children together with those of the
+                    // queue's next best candidates, at most as many as can
+                    // still be expanded.
+                    let budget = (max_leaves - n_leaves).min(SPECULATE_NODES);
+                    let mut queued: Vec<&NodeEntry> = heap
+                        .iter()
+                        .filter(|e| expandable(e) && !ready.contains_key(&e.nid))
+                        .collect();
+                    queued.sort_by(|a, b| b.cmp(a));
+                    let batch: Vec<&NodeEntry> = std::iter::once(&entry)
+                        .chain(queued.into_iter().take(budget - 1))
+                        .collect();
+                    let built: Vec<_> = batch
+                        .par_iter()
+                        .map(|e| (e.nid, self.speculate_children(ghist, gpair, e, features)))
+                        .collect();
+                    ready.extend(built);
+                }
+                let built = ready.remove(&entry.nid);
+                // The expansion itself (node ids, stored statistics, sampler
+                // draws) stays in queue order.
+                self.prepare_split(tree, store, ghist.cuts(), sampler, entry)
+                    .map(|split| match built {
+                        Some((mut left, mut right)) => {
+                            left.nid = split.left_id;
+                            right.nid = split.right_id;
+                            (left, right)
+                        }
+                        None => self.build_children(ghist, gpair, split),
+                    })
+            } else {
+                self.prepare_split(tree, store, ghist.cuts(), sampler, entry)
+                    .map(|split| self.build_children(ghist, gpair, split))
+            };
             n_leaves += 1; // one leaf became two
             if let Some((l, r)) = children {
                 heap.push(l);
@@ -395,6 +449,59 @@ impl<'a> HistTreeBuilder<'a> {
         for entry in heap {
             store.record_leaf(entry);
         }
+    }
+
+    /// The features every node samples, when loss-guided growth may build
+    /// children ahead of their parent's turn: a node's children then depend
+    /// only on the node, not on the expansion order. That needs a sampler
+    /// without per-level or per-node draws, no reuse penalties (which each
+    /// expansion extends), no LightGBM options (which key draws by node id),
+    /// no quantized histograms, and more than one worker.
+    fn speculative_features(&self, sampler: &ColumnSampler) -> Option<Vec<u32>> {
+        if self.reuse.is_some()
+            || self.options.is_some()
+            || self.params.use_quantized_grad
+            || !rayon_available()
+        {
+            return None;
+        }
+        sampler.fixed_features().map(<[u32]>::to_vec)
+    }
+
+    /// [`Self::build_children`] of `entry` (whose split is valid) ahead of
+    /// its turn, from copies of its rows and histogram. Node ids are
+    /// placeholders the caller replaces once the expansion is due; the split
+    /// search does not read them without LightGBM options.
+    fn speculate_children(
+        &self,
+        ghist: &GHistIndex,
+        gpair: &[GradPair],
+        entry: &NodeEntry,
+        features: &[u32],
+    ) -> (NodeEntry, NodeEntry) {
+        let b = &entry.best;
+        let (left_bounds, right_bounds) =
+            b.child_bounds(entry.bounds, self.cons.dir(b.feature as usize));
+        let split = PendingSplit {
+            entry: NodeEntry {
+                nid: entry.nid,
+                depth: entry.depth,
+                rows: entry.rows.clone(),
+                hist: entry.hist.clone(),
+                best: entry.best.clone(),
+                bounds: entry.bounds,
+                allowed: entry.allowed.clone(),
+                tree_seed: entry.tree_seed,
+                quant: None,
+            },
+            left_id: 0,
+            right_id: 0,
+            left_bounds,
+            right_bounds,
+            left_features: features.to_vec(),
+            right_features: features.to_vec(),
+        };
+        self.build_children(ghist, gpair, split)
     }
 
     /// Whether a node's best split should be taken.
@@ -624,8 +731,21 @@ impl<'a> HistTreeBuilder<'a> {
             bounds: node.bounds,
             dir: 0,
         };
+        let scan = |f: u32, scratch: &mut ScanScratch| {
+            let (fs, fe) = cuts.feature_bins(f as usize);
+            let scorer = SplitScorer {
+                dir: self.cons.dir(f as usize),
+                ..node_scorer
+            };
+            scan_numeric_splits(&hist[fs..fe], fs, total, dense, &scorer, scratch)
+        };
+        // The scans of plain numeric features do not depend on the
+        // incumbent, so a wide search computes them in parallel up front;
+        // they are then merged in feature order exactly as below.
+        let mut scans = self.parallel_scans(cuts, feature_subset, scan);
+        let mut scratch = None;
 
-        for &f in feature_subset {
+        for (i, &f) in feature_subset.iter().enumerate() {
             let (fs, fe) = cuts.feature_bins(f as usize);
             let scorer = SplitScorer {
                 dir: self.cons.dir(f as usize),
@@ -653,25 +773,91 @@ impl<'a> HistTreeBuilder<'a> {
                 continue; // degenerate feature, no interior boundary
             }
 
-            for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
-                let Some(mut score) = scorer.loss_chg(children.left, children.right) else {
-                    return;
-                };
-                if let Some(reuse) = &self.reuse {
+            if let Some(reuse) = &self.reuse {
+                for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
+                    let Some(mut score) = scorer.loss_chg(children.left, children.right) else {
+                        return;
+                    };
                     let bin = match pos {
                         SplitPos::Bin(bin) => Some(bin),
                         _ => None,
                     };
                     score.loss_chg -= reuse.bin_penalty(f, bin);
+                    xgb_update(&mut best, f, pos, children, score);
+                });
+                continue;
+            }
+            let scanned = scans.as_mut().and_then(|scans| scans[i].take());
+            match scanned.unwrap_or_else(|| scan(f, scratch.get_or_insert_with(ScanScratch::new))) {
+                NumericScan::Empty => {}
+                NumericScan::Best {
+                    loss_chg,
+                    pos,
+                    children,
+                } => {
+                    if need_replace(best.loss_chg as f32, best.feature, loss_chg, f)
+                        && let Some(score) = scorer.loss_chg(children.left, children.right)
+                    {
+                        xgb_update(&mut best, f, pos, children, score);
+                    }
                 }
-                xgb_update(&mut best, f, pos, children, score);
-            });
+                NumericScan::Nan => {
+                    for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
+                        if let Some(score) = scorer.loss_chg(children.left, children.right) {
+                            xgb_update(&mut best, f, pos, children, score);
+                        }
+                    });
+                }
+            }
         }
         best
+    }
+
+    /// [`scan_numeric_splits`] of every plain numeric feature of
+    /// `feature_subset` (by position; `None` for the others), computed in
+    /// parallel chunks, when the subset holds enough candidates to pay for
+    /// the tasks. `None` otherwise.
+    fn parallel_scans(
+        &self,
+        cuts: &HistCuts,
+        feature_subset: &[u32],
+        scan: impl Fn(u32, &mut ScanScratch) -> NumericScan + Sync,
+    ) -> Option<Vec<Option<NumericScan>>> {
+        if self.reuse.is_some() || !rayon_available() {
+            return None;
+        }
+        let bins = |f: u32| {
+            let (fs, fe) = cuts.feature_bins(f as usize);
+            fe - fs
+        };
+        let candidates: usize = feature_subset.iter().map(|&f| bins(f)).sum();
+        if candidates < PARALLEL_SCAN_BINS {
+            return None;
+        }
+        let per_task = (SCAN_TASK_BINS * feature_subset.len()).div_ceil(candidates);
+        Some(
+            feature_subset
+                .par_chunks(per_task.max(1))
+                .flat_map_iter(|chunk| {
+                    let mut scratch = ScanScratch::new();
+                    chunk
+                        .iter()
+                        .map(|&f| {
+                            (!cuts.is_categorical(f as usize) && bins(f) > 1)
+                                .then(|| scan(f, &mut scratch))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+        )
     }
 }
 
 /// Split `rows` (kept in order) into the rows routed left and right by `best`.
+#[allow(
+    clippy::needless_bitwise_bool,
+    reason = "branch-free routing predicates keep the partition loop free of data-dependent branches"
+)]
 pub(super) fn partition_rows(
     ghist: &GHistIndex,
     rows: &[u32],
@@ -686,8 +872,33 @@ pub(super) fn partition_rows(
         };
         let n_rows = ghist.n_rows();
         return match columns {
-            Bins::U16(bins) => route_dense(rows, &bins[feature * n_rows..][..n_rows], split_bin),
-            Bins::U32(bins) => route_dense(rows, &bins[feature * n_rows..][..n_rows], split_bin),
+            Bins::U16(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+                b <= split_bin
+            }),
+            Bins::U32(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+                b <= split_bin
+            }),
+        };
+    }
+    if let (Some(columns), false) = (ghist.missing_columns(), best.is_categorical) {
+        // Present bins below `limit` go left; the sentinel (above every bin,
+        // so never below `limit`) follows `default_left`.
+        let limit = best.split_bin.map_or(0, |s| s + 1);
+        let default_left = best.default_left;
+        let n_rows = ghist.n_rows();
+        return match columns {
+            Bins::U16(bins) => {
+                let missing = usize::from(u16::MAX);
+                route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+                    (b < limit) | ((b == missing) & default_left)
+                })
+            }
+            Bins::U32(bins) => {
+                let missing = u32::MAX as usize;
+                route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+                    (b < limit) | ((b == missing) & default_left)
+                })
+            }
         };
     }
 
@@ -747,13 +958,19 @@ pub(super) fn child_histograms(
 /// the sequential loop exactly.
 const PARTITION_CHUNK_ROWS: usize = 16_384;
 
-/// Partition a dense index on a numeric split using the split feature's column
-/// (`column[r]` is row `r`'s bin). Rows ascend, so the column is read as a
-/// monotone stream the hardware prefetcher follows. Every row is written to
-/// both output slots and only the matching length advances, keeping the loop
-/// free of data-dependent branches. The outputs are written into spare
-/// capacity, so neither buffer is zero-filled first.
-fn route_dense<B: BinIndex>(rows: &[u32], column: &[B], split_bin: usize) -> (Vec<u32>, Vec<u32>) {
+/// Partition rows on a numeric split using the split feature's column
+/// (`column[r]` is row `r`'s bin, or a missing sentinel); `go_left` decides a
+/// bin. Rows ascend, so the column is read as a monotone stream the hardware
+/// prefetcher follows. Every row is written to both output slots and only the
+/// matching length advances, keeping the loop free of data-dependent
+/// branches. The outputs are written into spare capacity, so neither buffer
+/// is zero-filled first.
+#[inline(always)]
+fn route_column<B: BinIndex>(
+    rows: &[u32],
+    column: &[B],
+    go_left: impl Fn(usize) -> bool + Sync,
+) -> (Vec<u32>, Vec<u32>) {
     let route = |rows: &[u32]| {
         let n = rows.len();
         let mut left: Vec<u32> = Vec::with_capacity(n);
@@ -762,7 +979,7 @@ fn route_dense<B: BinIndex>(rows: &[u32], column: &[B], split_bin: usize) -> (Ve
         {
             let (lp, rp) = (left.spare_capacity_mut(), right.spare_capacity_mut());
             for &r in rows {
-                let go_left = column[r as usize].index() <= split_bin;
+                let go_left = go_left(column[r as usize].index());
                 lp[nl].write(r);
                 rp[nr].write(r);
                 nl += usize::from(go_left);
@@ -974,6 +1191,86 @@ mod tests {
                 assert_eq!(next, expected_sampler.sample(1), "{mode}");
                 assert_eq!(next, captured_sampler.sample(1), "{mode}");
             }
+        }
+    }
+
+    /// Loss-guided growth builds queued nodes' children ahead of their turn
+    /// in parallel; the tree and the captured leaf rows must be the serial
+    /// ones, including when two queued nodes tie on loss change (the second
+    /// half of the rows mirrors the first with negated gradients, so the
+    /// root's children score every candidate identically).
+    #[test]
+    fn parallel_lossguide_grows_the_serial_tree() {
+        let half = 6000;
+        let features = 6;
+        let mut state = 7u64;
+        let mut values = Vec::with_capacity(2 * half * features);
+        let mut gradients = Vec::with_capacity(2 * half);
+        for side in 0..2 {
+            for row in 0..half {
+                let mut target = 0.0;
+                values.push(side as f32);
+                for col in 1..features {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    let mut value = (state >> 33) as f32 / (1u32 << 31) as f32;
+                    target += value * col as f32;
+                    if (row * 13 + col * 7) % 11 < 2 {
+                        value = f32::NAN;
+                    }
+                    values.push(value);
+                }
+                let g = 7.0 - target + 20.0;
+                gradients.push(gp(if side == 0 { g } else { -g }, 1.0));
+            }
+        }
+        let n = 2 * half;
+        let data = DMatrix::from_dense(&values, n, features).unwrap();
+        let ghist = binned(&data, 64);
+        let rows = all_rows(n);
+        let params = TrainingParams::builder()
+            .grow_policy(GrowPolicy::LossGuide)
+            .max_depth(0)
+            .max_leaves(24)
+            .build()
+            .unwrap();
+        let builder = HistTreeBuilder::new(&params);
+        let grow = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    builder.build_with_leaf_rows(
+                        &ghist,
+                        &gradients,
+                        &rows,
+                        &mut ColumnSampler::all(features),
+                    )
+                })
+        };
+        let (expected, _) = grow(1);
+        assert_eq!(
+            expected.node(0).split_feature,
+            0,
+            "the root separates the halves"
+        );
+        assert!(expected.num_nodes() > 20);
+        for threads in [2, 4, 8] {
+            let (tree, leaves) = grow(threads);
+            assert_eq!(tree, expected, "{threads} threads");
+            let mut seen = vec![false; n];
+            for leaf in leaves {
+                for row in leaf.rows {
+                    assert!(!std::mem::replace(&mut seen[row as usize], true));
+                    assert_eq!(
+                        leaf.node,
+                        tree.leaf_id_with(|f| data.get(row as usize, f as usize))
+                    );
+                }
+            }
+            assert!(seen.into_iter().all(|seen| seen));
         }
     }
 

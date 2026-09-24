@@ -2,6 +2,11 @@
 
 use crate::data::meta::{FeatureType, GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
+use rayon::prelude::*;
+
+/// Dense inputs with at least this many values are validated and copied in
+/// parallel.
+const PARALLEL_COPY_VALUES: usize = 1 << 20;
 
 /// Returns `true` if `v` should be treated as missing given the sentinel
 /// `missing`. NaN sentinels match any NaN. Otherwise an exact bit-compatible
@@ -156,11 +161,19 @@ impl DMatrix {
         check_len("dense data length", data.len(), expected)?;
         // With the NaN sentinel the only rejected values are infinities, a
         // branch-free check the compiler vectorizes; other sentinels need the
-        // general test.
-        let invalid = if missing.is_nan() {
-            data.iter().any(|v| v.is_infinite())
+        // general test. Large inputs are checked and copied in parallel.
+        let parallel = data.len() >= PARALLEL_COPY_VALUES && rayon::current_num_threads() > 1;
+        let rejects = |chunk: &[f32]| {
+            if missing.is_nan() {
+                chunk.iter().any(|v| v.is_infinite())
+            } else {
+                chunk.iter().any(|&v| v != missing && !v.is_finite())
+            }
+        };
+        let invalid = if parallel {
+            data.par_chunks(PARALLEL_COPY_VALUES / 16).any(rejects)
         } else {
-            data.iter().any(|&v| v != missing && !v.is_finite())
+            rejects(data)
         };
         if invalid {
             return Err(HessboostError::invalid_param(
@@ -168,12 +181,12 @@ impl DMatrix {
                 "non-missing feature values must be finite",
             ));
         }
-        Ok(Self::new(
-            n_rows,
-            n_cols,
-            Storage::Dense(data.to_vec()),
-            missing,
-        ))
+        let values = if parallel {
+            data.par_iter().copied().collect()
+        } else {
+            data.to_vec()
+        };
+        Ok(Self::new(n_rows, n_cols, Storage::Dense(values), missing))
     }
 
     /// Build a matrix from compressed-sparse-row arrays.

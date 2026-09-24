@@ -102,6 +102,47 @@ fn set_from_sorted(queue: &[(f32, f32)], out: &mut Vec<Entry>) {
     }
 }
 
+/// Sort `queue` by value in `f32::total_cmp` order with an LSD radix sort
+/// over the order-preserving key of each value's bits (11, 11, and 10 bit
+/// digits; a digit every key shares is skipped). Stable, `scratch` is reused.
+fn radix_sort_by_value(queue: &mut Vec<(f32, f32)>, scratch: &mut Vec<(f32, f32)>) {
+    // Negative values reverse all bits, others set the sign bit: unsigned
+    // order of the keys is `total_cmp` order of the values.
+    let key = |v: f32| {
+        let bits = v.to_bits();
+        if bits >> 31 == 1 {
+            !bits
+        } else {
+            bits | 0x8000_0000
+        }
+    };
+    let n = queue.len();
+    scratch.clear();
+    scratch.resize(n, (0.0, 0.0));
+    let mut counts = [0usize; 2048];
+    for shift in [0u32, 11, 22] {
+        counts.fill(0);
+        for &(v, _) in queue.iter() {
+            counts[((key(v) >> shift) & 0x7ff) as usize] += 1;
+        }
+        if counts.contains(&n) {
+            continue;
+        }
+        let mut offset = 0;
+        for count in &mut counts {
+            let c = *count;
+            *count = offset;
+            offset += c;
+        }
+        for &entry in queue.iter() {
+            let digit = ((key(entry.0) >> shift) & 0x7ff) as usize;
+            scratch[counts[digit]] = entry;
+            counts[digit] += 1;
+        }
+        std::mem::swap(queue, scratch);
+    }
+}
+
 /// `WQSummary::SetPrune`: shrink `data` in place to at most `maxsize`
 /// entries by answering evenly spaced rank queries.
 fn set_prune(data: &mut Vec<Entry>, maxsize: usize) {
@@ -396,6 +437,10 @@ pub(crate) struct WQSketch {
     workspace: Vec<Entry>,
     /// Number of pushed values with non-zero weight.
     num_elements: usize,
+    /// Every pushed weight is `1` ([`Self::with_unit_weights`]).
+    unit_weights: bool,
+    /// Scratch buffer of the radix sort.
+    sort_scratch: Vec<(f32, f32)>,
 }
 
 impl WQSketch {
@@ -411,6 +456,8 @@ impl WQSketch {
             temp: Vec::new(),
             workspace: Vec::new(),
             num_elements: 0,
+            unit_weights: false,
+            sort_scratch: Vec::new(),
         }
     }
 
@@ -444,9 +491,26 @@ impl WQSketch {
         true
     }
 
+    /// Mark every pushed weight as a small whole number (unweighted data,
+    /// each weight `1`), so equal values sum to the same weight in any
+    /// order and [`Self::flush_queue`] may sort with a radix sort.
+    pub(crate) fn with_unit_weights(mut self) -> Self {
+        self.unit_weights = true;
+        self
+    }
+
     /// `Queue::PopSummary` followed by `PushSummary`.
     fn flush_queue(&mut self) {
-        self.queue.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        // With unit weights every queued weight is a whole number below
+        // `2^24` (a count of at most `num_elements` values), exact in `f32`,
+        // so `set_from_sorted` sums equal values to the same weight however
+        // the sort orders them: any value-ordered permutation gives the
+        // summary the comparison sort gives.
+        if self.unit_weights && self.num_elements < 1 << 24 {
+            radix_sort_by_value(&mut self.queue, &mut self.sort_scratch);
+        } else {
+            self.queue.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        }
         set_from_sorted(&self.queue, &mut self.temp);
         self.queue.clear();
         self.push_summary();
@@ -519,6 +583,35 @@ mod tests {
         let mut out = Vec::new();
         sketch.cut_values(&mut out);
         out
+    }
+
+    /// The unit-weight sketch (radix-sorted queue) cuts exactly where the
+    /// comparison-sorted one does, on streams with heavy repeats, signed
+    /// zeros, negatives, and infinities, long enough to flush the queue.
+    #[test]
+    fn unit_weight_sketch_matches_comparison_sort() {
+        let mut rng = crate::rng::Rng::new(3);
+        for case in 0..6 {
+            let n = 20_000 + case * 7_000;
+            let values: Vec<f32> = (0..n)
+                .map(|i| match rng.range(0..10) {
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => f32::NEG_INFINITY,
+                    3 => ((i % 17) as f32) - 8.0,
+                    _ => (rng.f32() - 0.5) * 10f32.powi(case as i32 - 2),
+                })
+                .collect();
+            let mut radix = WQSketch::new(n, 64).with_unit_weights();
+            for &v in &values {
+                radix.push(v, 1.0);
+            }
+            let mut out = Vec::new();
+            radix.cut_values(&mut out);
+            let expected = cuts_of(&values, 64);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&out), bits(&expected), "case {case}");
+        }
     }
 
     #[test]

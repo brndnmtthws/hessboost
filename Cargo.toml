@@ -6,9 +6,9 @@ rust-version = "1.93"
 license = "Apache-2.0"
 repository = "https://github.com/brndnmtthws/hessboost"
 authors = ["Brenden Matthews <brenden@brndn.io>"]
-description = "A faithful, fast Rust reimplementation of XGBoost gradient boosting"
-keywords = ["gradient-boosting", "xgboost", "machine-learning", "decision-trees", "boosting"]
-categories = ["science", "algorithms"]
+description = "Rust XGBoost: gradient boosted decision trees (GBDT) for machine learning in Rust, reimplementing XGBoost's training, parameters, and model formats"
+keywords = ["xgboost", "gradient-boosting", "gbdt", "machine-learning", "decision-trees"]
+categories = ["artificial-intelligence", "algorithms", "science"]
 
 [dependencies]
 rayon = "1.12"

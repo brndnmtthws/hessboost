@@ -2,9 +2,11 @@
 
 hessboost is a Rust reimplementation of XGBoost gradient boosting: one
 library crate, with no C/C++ or FFI apart from the `zstd` crate (the
-official libzstd, compressing native model files). User docs are
-`README.md`, the rustdoc (`src/lib.rs` and module docs), `examples/`, and
-`docs/performance.md`. This file covers working on the code.
+official libzstd, compressing native model files) and, on macOS with the
+opt-in `metal` feature, the `objc2-metal` bindings to Apple's Metal
+framework. User docs are `README.md`, the rustdoc (`src/lib.rs` and module
+docs), `examples/`, and `docs/performance.md`. This file covers working on
+the code.
 
 ## Toolchain
 
@@ -37,11 +39,15 @@ uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check
 CI (`.github/workflows/ci.yml`) runs each of these with `mbx` in place of
 `cargo` (same arguments; rustfmt runs as plain `cargo`) and
 `RUSTFLAGS=-D warnings`. Tests run on x86_64 Linux, aarch64 Linux, and
-aarch64 macOS; everything else on x86_64 Linux. `all-checks-passed` gates
-merges to `main`.
+aarch64 macOS (with `--all-features`, so the `metal` backend's tests run
+there; the device-dependent ones skip on runners without a Metal device,
+and an always-on guard test fails if the kernels fail to compile). Clippy
+runs on x86_64 Linux and aarch64 macOS, so the aarch64 SIMD kernels and
+the darwin-only `backend/metal.rs` are linted. Everything else runs on
+x86_64 Linux. `all-checks-passed` gates merges to `main`.
 
-Clippy in CI therefore never sees the aarch64-only code. Lint the other
-architecture yourself when touching `simd/` or `cfg(target_arch)` code:
+When touching `simd/` or `cfg(target_arch)` code, still cross-check the
+architecture CI does not build:
 
 ```sh
 cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings   # from aarch64
@@ -81,6 +87,7 @@ nouns there.
 | `training/` | `train` (`train`, `Trainer`, `TrainResult`; gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `gblinear` (coordinate descent), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv`, `budget` (public; opt-in PerpetualBooster-style training) |
 | `model/` | `mod.rs` (`BoostedModel`: iteration layout, slicing, `iteration_range` prediction, save/load entry points; user docs for XGBoost interchange), `native` (native binary container), `sections` (section table shared by the native and compact formats), `shap` (QuadratureTreeSHAP), `compact` (public; `CompactModel`, `HBTD` format), `xgboost` (XGBoost JSON/UBJSON schema mapping), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `conformal.rs` | split-conformal / CQR intervals (`SplitConformal`, `ConformalizedQuantile`) |
+| `backend/` | opt-in compute backends: `metal/` (macOS, `metal` feature; `MetalHistBackend` for GPU histograms, `GpuModel` for GPU prediction, runtime-compiled MSL kernels, exact double-float accumulation) |
 | `simd/` | private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests` |
 | `test_support.rs` | unit-test helpers (`cfg(test)`) |
 
@@ -94,7 +101,9 @@ nouns there.
   `path_smooth`, `linear_tree`), `budget.rs`, `multi_output.rs` (vector-leaf
   trees), `distributional.rs` (`dist:*`: calibration, NLL, serialization,
   CQR), `native_format.rs` (native round trips, refused versions and corrupt
-  payloads, saved models of every release).
+  payloads, saved models of every release), and `metal.rs` (macOS, `metal`
+  feature; GPU==CPU bit-exactness, determinism, refusals, `to_gpu`
+  predictions; device-dependent tests skip without a Metal device).
 - `tests/common/` and `examples/common/` hold shared helpers.
 - `tests/data/saved/<version>/` holds the models each release saved (`.bin`,
   `.json`, compact `.hbtd` where supported, and `.margins`);
@@ -118,10 +127,14 @@ nouns there.
   per-block row-sampling seeds) use counter-based SplitMix64 streams keyed
   by seed and index (`rng.rs`), so they do not depend on scheduling.
   Quantized histograms sum integers exactly. `rand` is a dev-dependency
-  only.
-- **Unsafe:** confined to `simd/` and the hot loops in `tree/compact.rs`,
-  `tree/hist/`, and `tree/builder/hist.rs`. Every block needs a `// SAFETY:`
-  comment; `unsafe_op_in_unsafe_fn` is forbidden (`lib.rs`).
+  only. A `device = metal` training run reproduces the single-threaded CPU
+  model bit for bit: the GPU kernels accumulate exact double-float
+  (two-sum) partials in a fixed chunk/slice/merge order, with no atomics,
+  and every constant is machine-independent (`src/backend/metal.rs`).
+- **Unsafe:** confined to `simd/`, the hot loops in `tree/compact.rs`,
+  `tree/hist/`, and `tree/builder/hist.rs`, and the Metal FFI in
+  `backend/metal.rs`. Every block needs a `// SAFETY:` comment;
+  `unsafe_op_in_unsafe_fn` is forbidden (`lib.rs`).
 - **SIMD:** kernels cover objective gradients, exp/sigmoid/softmax
   transforms, metric sums, and cut search (`count_le`). Dispatch checks CPU
   features at runtime and falls back to `simd/scalar.rs` (also below
@@ -211,12 +224,16 @@ nouns there.
     `None`, as for custom metrics, needs a whole number of outputs per label
     column). `Metric::eval` returns NaN for inconsistent lengths.
 - **Refusals:** unsupported parameters and combinations fail with an error,
-  never silently ignored. Checks live in `TrainingParams::validate`,
-  `training/multi_output.rs::validate` (`multi_output_tree` needs `hist` or
-  `auto`), `training/continuation.rs` (`process_type=update`), and
-  `training/budget.rs`. Budget mode compares the serialized params against
-  the defaults plus its allow-list, so a non-default value of any field it
-  does not read, including one added later, is refused automatically.
+  never silently ignored. Checks live in `TrainingParams::validate`
+  (`device = metal` needs the `metal` feature on macOS, `tree_method =
+  hist`/`auto`, and a tree booster, and refuses `use_quantized_grad` and
+  `process_type = update`), `training/multi_output.rs::validate`
+  (`multi_output_tree` needs `hist` or `auto`, and refuses vector-leaf
+  trees on a GPU device), `training/continuation.rs` (`process_type=update`),
+  and `training/budget.rs`. Budget mode compares the serialized params
+  against the defaults plus its allow-list, so a non-default value of any
+  field it does not read, including one added later, is refused
+  automatically.
 - **Parity-fixed options:** options that XGBoost has but hessboost supports
   at one setting (README, "Not implemented") are not `TrainingParams`
   fields. `tests/parity.rs` (`expect_fixed`) fails a fixture that sets

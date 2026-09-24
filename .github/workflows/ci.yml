@@ -37,8 +37,16 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
-    name: clippy
-    runs-on: ubuntu-latest
+    name: clippy (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64-linux, runner: ubuntu-latest }
+          # The darwin-only Metal backend (`--features metal`) and the
+          # aarch64 SIMD kernels are only compiled on this runner.
+          - { name: aarch64-darwin, runner: macos-latest }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,7 +56,7 @@ jobs:
           cache: false
       - uses: jdx/mr-boxington-action@v1
         with:
-          cache-generation: clippy
+          cache-generation: clippy-${{ matrix.name }}
       # Lint levels (pedantic) live in Cargo.toml's [lints] table.
       - run: mbx clippy --all-targets --all-features -- -D warnings
 

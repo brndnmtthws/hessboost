@@ -67,6 +67,28 @@ pub enum GrowPolicy {
     Symmetric,
 }
 
+/// Which processor training runs on. XGBoost `device` (XGBoost spells its
+/// GPU choices `cuda`/`gpu`; the macOS GPU backend here is `metal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Device {
+    /// The CPU (default): always available, and what the parity fixtures
+    /// run on.
+    #[default]
+    Cpu,
+    /// Apple's Metal GPU, on macOS with the `metal` feature: histogram
+    /// construction runs on the GPU, reproducing single-threaded CPU
+    /// training bit for bit. Requires `tree_method = hist`/`auto` and a
+    /// tree booster. Beyond XGBoost (opt-in).
+    ///
+    /// Currently a correctness path, not a speedup: on multicore Apple
+    /// Silicon the GPU histograms are slower than the CPU's (see
+    /// [`backend`](crate::backend) for the measured numbers and the
+    /// cause); the fast Metal path is prediction, through
+    /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu).
+    Metal,
+}
+
 /// Deepest tree `grow_policy = symmetric` grows (`2^16` leaves), CatBoost's
 /// depth limit.
 pub const MAX_SYMMETRIC_DEPTH: usize = 16;
@@ -229,6 +251,11 @@ pub struct TrainingParams {
     pub nthread: usize,
     /// RNG seed for subsampling and column sampling. XGBoost `seed`.
     pub seed: u64,
+
+    /// Which processor training runs on. XGBoost `device`. `metal` moves
+    /// histogram construction to the GPU (macOS, `metal` feature); the
+    /// default `cpu` leaves everything as it was.
+    pub device: Device,
 
     // ---- Learning task ----
     /// Objective function name, e.g. `"reg:squarederror"`, `"binary:logistic"`.
@@ -417,6 +444,7 @@ impl Default for TrainingParams {
             booster: BoosterKind::GbTree,
             nthread: 0,
             seed: 0,
+            device: Device::Cpu,
             objective: "reg:squarederror".to_string(),
             num_class: 0,
             base_score: None,
@@ -556,6 +584,37 @@ impl TrainingParams {
             "reuse penalties are not supported with `extra_trees`, `path_smooth`, or \
              `grow_policy=symmetric`",
         )?;
+
+        // The GPU backend accelerates the histogram tree method only; the
+        // other tree methods, the quantized path, and `gblinear` have their
+        // own accumulation loops that would silently ignore the device.
+        if self.device != Device::Cpu {
+            ensure(
+                "device",
+                cfg!(all(target_os = "macos", feature = "metal")),
+                "`metal` requires building with the `metal` feature on macOS",
+            )?;
+            ensure(
+                "device",
+                !matches!(self.tree_method, TreeMethod::Exact | TreeMethod::Approx),
+                "`metal` requires `tree_method = hist` (or `auto`)",
+            )?;
+            ensure(
+                "device",
+                !self.use_quantized_grad,
+                "`metal` does not support `use_quantized_grad`",
+            )?;
+            ensure(
+                "device",
+                self.booster != BoosterKind::GbLinear,
+                "`metal` needs a tree booster (`gbtree` or `dart`)",
+            )?;
+            ensure(
+                "device",
+                self.process_type != ProcessType::Update,
+                "`metal` does not support `process_type = update` (refresh grows no trees)",
+            )?;
+        }
 
         if let Some(base_score) = self.base_score {
             ensure("base_score", base_score.is_finite(), "must be finite")?;
@@ -884,6 +943,8 @@ impl TrainingParamsBuilder {
         seed, u64);
     setter!(/// Set the number of classes (multiclass objectives).
         num_class, usize);
+    setter!(/// Set the processor training runs on (XGBoost `device`).
+        device, Device);
     setter!(/// Set the learning rate (`eta`).
         eta, f64);
     setter!(/// Set the minimum split loss (`gamma`).

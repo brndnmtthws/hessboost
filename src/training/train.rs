@@ -1,7 +1,7 @@
 //! The gradient-boosting training loop.
 
 use crate::config::{
-    BoosterKind, GrowPolicy, ObjectiveParams, ProcessType, SamplingMethod, TrainingParams,
+    BoosterKind, Device, GrowPolicy, ObjectiveParams, ProcessType, SamplingMethod, TrainingParams,
     TreeMethod,
 };
 use crate::data::ghist::GHistIndex;
@@ -41,11 +41,17 @@ struct TreeSample<'a> {
     gpair: &'a [GradPair],
     rows: &'a [u32],
 }
+use crate::tree::hist::{CpuBackend, HistogramBackend};
 
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
 enum Prepared {
     Exact(SortedColumns),
-    Hist(GHistIndex),
+    /// Histogram method: the binned dataset plus the backend its histograms
+    /// are built on (the CPU's, or the Metal GPU's when `device = metal`).
+    Hist {
+        index: GHistIndex,
+        backend: Box<dyn HistogramBackend>,
+    },
     /// `tree_method=approx`: Hessian-weighted cuts. XGBoost regenerates them
     /// every round from a sorted-column summary unless the objective has a
     /// constant Hessian, in which case the first tree's streaming sketch (of
@@ -75,10 +81,14 @@ impl Prepared {
     ) -> (RegTree, Vec<LeafRows>) {
         let TrainContext { params, dtrain, .. } = *run;
         let TreeSample { gpair, rows } = sample;
-        let hist = |ghist: &GHistIndex, reuse: Option<&ReuseSet>, sampler: &mut ColumnSampler| {
+        let hist = |ghist: &GHistIndex,
+                    backend: &dyn HistogramBackend,
+                    reuse: Option<&ReuseSet>,
+                    sampler: &mut ColumnSampler| {
             let builder = HistTreeBuilder::new(params)
                 .with_rounding_seed(rounding_seed)
-                .with_reuse(reuse, ghist.cuts());
+                .with_reuse(reuse, ghist.cuts())
+                .with_backend(backend);
             if capture_rows {
                 builder.build_with_leaf_rows(ghist, gpair, rows, sampler)
             } else {
@@ -92,13 +102,18 @@ impl Prepared {
                     .build(cols, dtrain, gpair, rows, sampler),
                 Vec::new(),
             ),
-            Prepared::Hist(ghist) => hist(ghist, reuse.as_deref(), sampler),
+            Prepared::Hist { index, backend } => {
+                hist(index, backend.as_ref(), reuse.as_deref(), sampler)
+            }
             Prepared::Approx { const_hess, cached } => {
                 let bin = || approx_index(params, dtrain, gpair, *const_hess);
+                // `approx` never runs with a GPU device: `validate` refuses
+                // the combination, so its histograms always use the CPU.
+                let cpu = CpuBackend;
                 if *const_hess {
-                    hist(cached.get_or_init(bin), reuse.as_deref(), sampler)
+                    hist(cached.get_or_init(bin), &cpu, reuse.as_deref(), sampler)
                 } else {
-                    hist(&bin(), reuse.as_deref(), sampler)
+                    hist(&bin(), &cpu, reuse.as_deref(), sampler)
                 }
             }
         };
@@ -215,7 +230,9 @@ fn prepare_builder(
     Ok(match method {
         TreeMethod::Hist => {
             let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
-            Prepared::Hist(GHistIndex::from_dmatrix(dtrain, cuts))
+            let index = GHistIndex::from_dmatrix(dtrain, cuts);
+            let backend = hist_backend(params, &index)?;
+            Prepared::Hist { index, backend }
         }
         TreeMethod::Approx => Prepared::Approx {
             const_hess,
@@ -223,6 +240,36 @@ fn prepare_builder(
         },
         _ => Prepared::Exact(SortedColumns::from_dmatrix(dtrain)),
     })
+}
+
+/// The histogram backend a training run builds on: the Metal GPU's when
+/// `device = metal` (the parameter validation has already checked the
+/// platform and feature), else the CPU's.
+fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn HistogramBackend>> {
+    match params.device {
+        Device::Cpu => {
+            let backend: Box<dyn HistogramBackend> = Box::new(CpuBackend);
+            Ok(backend)
+        }
+        Device::Metal => {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                let backend: Box<dyn HistogramBackend> =
+                    Box::new(crate::backend::metal::MetalHistBackend::new(index)?);
+                Ok(backend)
+            }
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            {
+                // Unreachable in practice: `TrainingParams::validate` refuses
+                // `device = metal` without the feature, and training always
+                // validates first.
+                Err(HessboostError::invalid_param(
+                    "device",
+                    "`metal` requires building with the `metal` feature on macOS",
+                ))
+            }
+        }
+    }
 }
 
 /// A named evaluation dataset watched during training.
@@ -458,7 +505,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     } = trainer;
     let evals: &[EvalSet] = &evals;
     params.validate()?;
-    multi_output::validate(params)?;
+    multi_output::validate(params, objective.n_outputs())?;
     reject_missing_param(params)?;
     if early_stopping_rounds == Some(0) {
         return Err(HessboostError::invalid_param(
@@ -664,7 +711,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     for round in 0..num_boost_round {
         let iteration = start_iteration + round;
         match &mut plan {
-            RoundPlan::Grow(Prepared::Hist(ghist)) if vector_leaf => {
+            RoundPlan::Grow(Prepared::Hist { index: ghist, .. }) if vector_leaf => {
                 multi_output::boost_round(
                     &multi_output::VectorRound { run, ghist, evals },
                     &mut model,
@@ -722,7 +769,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                     // Retaining the final row partitions replaces a per-row tree
                     // traversal of the raw feature matrix with one sequential
                     // pass per leaf (constant leaves only).
-                    let capture_rows = matches!(prepared, Prepared::Hist(_))
+                    let capture_rows = matches!(prepared, Prepared::Hist { .. })
                         && dropped.is_none()
                         && params.grow_policy != GrowPolicy::LossGuide
                         && row_subset.len() == n

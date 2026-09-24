@@ -68,6 +68,12 @@ pub trait HistogramBackend: Send + Sync {
     /// Accumulate the gradients of `rows` into `out` (length = total bins).
     /// `out` is overwritten (not added to).
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]);
+
+    /// Announce the gradient slice the following [`build`](Self::build) calls
+    /// of this tree will read. Called once per tree, before any `build`.
+    /// Backends that stage the gradients (a GPU) upload them here; the
+    /// default does nothing.
+    fn prepare(&self, _ghist: &GHistIndex, _gpair: &[GradPair]) {}
 }
 
 /// Multi-core CPU histogram backend.
@@ -174,7 +180,12 @@ impl BinIndex for u32 {
 /// Sequential accumulation of `rows` into `out` (added, not reset). Specialized
 /// on the bin-index width so the inner loop reads the narrowest integers.
 #[inline]
-fn accumulate(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
+pub(crate) fn accumulate(
+    ghist: &GHistIndex,
+    rows: &[u32],
+    gpair: &[GradPair],
+    out: &mut [GradStats],
+) {
     match ghist.bins() {
         Bins::U16(bins) => accumulate_bins(ghist, bins, rows, gpair, out),
         Bins::U32(bins) => accumulate_bins(ghist, bins, rows, gpair, out),

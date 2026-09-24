@@ -391,10 +391,29 @@ the model intercept. The `pfn_boost` example compares this with boosting
 from scratch, using a synthetic prior or TabPFN logits exported from Python
 (`cargo run --release --example pfn_boost -- <dir>`).
 
+### GPU acceleration (macOS, Metal)
+
+Build with `--features metal` on macOS. Two paths, both opt-in and both
+bit-identical to the CPU:
+
+- **Prediction** (`model.to_gpu()`): the model's compact forest is uploaded
+  once and every row walks it on the GPU, one thread per row. On an M4 Max,
+  500k rows through 200 depth-8 trees predict ~2.5x faster than the CPU,
+  and the gap widens with model and batch size. See
+  `hessboost::backend::metal` and
+  `cargo run --release --features metal --example metal`.
+- **Training** (`device = metal`): histogram construction moves to the GPU,
+  reproducing single-threaded CPU training bit for bit. Currently a
+  correctness path rather than a speedup — on multicore Apple Silicon the
+  exact (no-atomics, no-`double`) GPU accumulation is slower than the CPU
+  histogram path; the measured numbers and the cause are documented in
+  `hessboost::backend::metal`.
+
 ## Not implemented
 
-- GPU training, distributed or external-memory training, and Python, CLI,
-  or C-ABI bindings.
+- Distributed or external-memory training, and Python, CLI, or C-ABI
+  bindings. GPU training outside macOS (a `wgpu` backend for Linux and
+  Windows) is planned.
 - XGBoost options available at one setting only: gblinear uses
   `updater = coord_descent` with `feature_selector = cyclic`; LambdaMART
   uses `lambdarank_pair_method = topk` (no `lambdarank_unbiased` or

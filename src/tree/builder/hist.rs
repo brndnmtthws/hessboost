@@ -99,6 +99,8 @@ struct PendingSplit {
     right_features: Vec<u32>,
 }
 
+/// The CPU backend every builder defaults to.
+pub(super) static CPU_BACKEND: CpuBackend = CpuBackend;
 // Ordering for the loss-guided priority queue (max-heap on loss change).
 impl PartialEq for NodeEntry {
     fn eq(&self, other: &Self) -> bool {
@@ -127,7 +129,9 @@ pub struct HistTreeBuilder<'a> {
     /// constraints are inactive (no filtering). An unlisted feature may only
     /// interact with itself.
     interaction_sets: Option<Vec<Vec<u32>>>,
-    backend: CpuBackend,
+    /// Histogram construction backend (the CPU's, or a GPU's when
+    /// `device = metal`).
+    backend: &'a dyn HistogramBackend,
     /// LightGBM `extra_trees` / `path_smooth`; `None` keeps XGBoost's search.
     options: Option<SplitOptions>,
     /// Opt-in reuse penalties (`toad_penalty_*`), projected onto the bins of
@@ -145,7 +149,7 @@ impl<'a> HistTreeBuilder<'a> {
             reg: RegParams::from_params(params),
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
-            backend: CpuBackend,
+            backend: &CPU_BACKEND,
             options: SplitOptions::from_params(params),
             reuse: None,
             rounding_seed: 0,
@@ -168,6 +172,15 @@ impl<'a> HistTreeBuilder<'a> {
     #[must_use]
     pub(crate) fn with_rounding_seed(mut self, seed: u64) -> Self {
         self.rounding_seed = seed;
+        self
+    }
+
+    /// Use a specific histogram backend (the Metal GPU's, when
+    /// `device = metal`). Held by reference: the trainer owns it for the
+    /// whole run.
+    #[must_use]
+    pub(crate) fn with_backend(mut self, backend: &'a dyn HistogramBackend) -> Self {
+        self.backend = backend;
         self
     }
 
@@ -209,8 +222,12 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
+        // Stage the gradients once per tree (a GPU backend uploads them
+        // here); every node build below reads the same slice.
+        self.backend.prepare(ghist, gpair);
+
         if self.params.grow_policy == GrowPolicy::Symmetric {
-            return super::oblivious::SymmetricTreeBuilder::new(self.params).build(
+            return super::oblivious::SymmetricTreeBuilder::new(self.params, self.backend).build(
                 ghist,
                 gpair,
                 row_subset,
@@ -702,7 +719,7 @@ pub(super) fn partition_rows(
 /// The parent's buffer is dead once the node expands, so the sibling reuses
 /// it without a new allocation.
 pub(super) fn child_histograms(
-    backend: CpuBackend,
+    backend: &dyn HistogramBackend,
     ghist: &GHistIndex,
     gpair: &[GradPair],
     left_rows: &[u32],

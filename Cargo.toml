@@ -16,6 +16,33 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 zstd = { version = "0.14", default-features = false }
 
+[features]
+# Native Metal acceleration for histogram training and prediction on
+# macOS (Apple Silicon and Intel Macs with a Metal GPU). Opt-in and
+# off by default; see `src/backend/`.
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLDevice",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLComputeCommandEncoder",
+    "MTLCommandEncoder",
+    "MTLLibrary",
+    "MTLComputePipeline",
+    "MTLAllocation",
+    "MTLResource",
+    "MTLBuffer",
+    "MTLTypes",
+], optional = true }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+], optional = true }
+
 [dev-dependencies]
 criterion = "0.8.2"
 proptest = "1.11"

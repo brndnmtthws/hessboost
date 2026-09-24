@@ -236,6 +236,20 @@ pub(crate) struct CompactForest {
     symmetric: SymmetricTables,
 }
 
+/// The forest's raw buffers for GPU upload: the node arena as bytes (each
+/// [`CNode`](super::compact) is `repr(C)` of four `u32`s), the category pool,
+/// the vector-leaf weight pool, and each tree's root index.
+pub(crate) struct GpuForestParts<'a> {
+    /// Node arena, 16 bytes per node.
+    pub(crate) nodes: &'a [u8],
+    /// Every tree's category pool, concatenated.
+    pub(crate) categories: &'a [u32],
+    /// Every vector-leaf tree's weight vectors, concatenated.
+    pub(crate) leaf_vectors: &'a [f32],
+    /// Arena root index of each tree.
+    pub(crate) roots: Vec<u32>,
+}
+
 impl CompactForest {
     pub(crate) fn from_trees(trees: &[RegTree]) -> Self {
         let total: usize = trees.iter().map(RegTree::num_nodes).sum();
@@ -399,6 +413,25 @@ impl CompactForest {
     #[inline]
     pub(crate) fn original_id(&self, id: u32) -> u32 {
         self.orig_id[id as usize]
+    }
+
+    /// The forest's GPU-upload parts (see [`GpuForestParts`]).
+    pub(crate) fn gpu_parts(&self) -> GpuForestParts<'_> {
+        // SAFETY: `CNode` is `repr(C)` with four `u32` fields and no padding
+        // (asserted by the layout tests), so the arena is exactly
+        // `nodes.len() * 16` bytes of plain data.
+        let nodes = unsafe {
+            std::slice::from_raw_parts(
+                self.nodes.as_ptr().cast::<u8>(),
+                self.nodes.len() * std::mem::size_of::<CNode>(),
+            )
+        };
+        GpuForestParts {
+            nodes,
+            categories: &self.categories,
+            leaf_vectors: &self.leaf_vectors,
+            roots: self.trees.iter().map(|t| t.root).collect(),
+        }
     }
 
     /// Leaves point at themselves. Children are laid out after their parent,

@@ -262,6 +262,11 @@ pub enum ImportanceType {
 /// for output 0, then output 1, ...). Tree `t` therefore feeds output
 /// `(t / num_parallel_tree) % n_outputs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(
+    clippy::unsafe_derive_deserialize,
+    reason = "the type's only unsafe code is the optional Metal backend's \
+              buffer handling; every serialized field is plain data"
+)]
 pub struct BoostedModel {
     trees: Vec<RegTree>,
     /// Per-output intercept in margin space (length `n_outputs`).
@@ -389,7 +394,7 @@ impl BoostedModel {
 
     /// The prediction layout of the ensemble, built on first use and dropped
     /// whenever a tree is appended.
-    fn compact_forest(&self) -> &CompactForest {
+    pub(crate) fn compact_forest(&self) -> &CompactForest {
         self.compact
             .get_or_init(|| CompactForest::from_trees(&self.trees))
     }
@@ -399,6 +404,22 @@ impl BoostedModel {
     #[inline]
     pub(crate) fn tree_weight(&self, i: usize) -> f32 {
         self.tree_weights.get(i).copied().unwrap_or(1.0)
+    }
+
+    /// Whether this is a `gblinear` model, whose predictions come from the
+    /// linear weights instead of the tree ensemble.
+    pub(crate) fn is_gblinear(&self) -> bool {
+        self.linear.is_some()
+    }
+
+    /// Whether any tree carries per-leaf linear models (`linear_tree`).
+    pub(crate) fn has_linear_leaves(&self) -> bool {
+        self.trees.iter().any(|tree| tree.linear_leaves().is_some())
+    }
+
+    /// Whether tree `t` stores a weight vector per leaf (vector-leaf trees).
+    pub(crate) fn tree_is_vector_leaf(&self, t: usize) -> bool {
+        self.trees[t].is_vector_leaf()
     }
 
     /// Invoke `f(feature, output, weight * x)` for each present feature of
@@ -779,6 +800,17 @@ impl BoostedModel {
         }
     }
 
+    /// Lay this model out for GPU batch prediction on Metal. Without the
+    /// `metal` feature on macOS (the only supported platform today), this
+    /// always returns an error; see
+    /// [`backend`](crate::backend) for the accelerated path.
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    pub fn to_gpu(&self) -> Result<crate::backend::GpuModel> {
+        Err(HessboostError::gpu(
+            "GPU prediction requires the `metal` feature on macOS",
+        ))
+    }
+
     /// Read-only access to the trees (e.g. for serialization or SHAP).
     pub fn trees(&self) -> &[RegTree] {
         &self.trees
@@ -945,7 +977,7 @@ impl BoostedModel {
 
     /// The iteration range plain prediction uses: `[0, best_iteration + 1)`
     /// when early stopping selected an iteration, else every iteration.
-    fn default_iteration_range(&self) -> Range<usize> {
+    pub(crate) fn default_iteration_range(&self) -> Range<usize> {
         0..self
             .best_iteration
             .map_or(self.num_boost_rounds(), |it| it + 1)

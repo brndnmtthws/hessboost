@@ -26,8 +26,10 @@
 //!   [`CONTAINER_VERSION`], with an upgrade path for the previous one.
 //!
 //! Files are written as a single zstd frame, so `zstd -d` recovers the
-//! container; uncompressed containers are read as well. The trailing
-//! checksum catches corruption either way.
+//! container; uncompressed containers are read as well. A container that
+//! compresses beyond what the reader accepts from a frame (see
+//! [`MAX_EXPANSION`]) is written uncompressed instead, so every written file
+//! loads. The trailing checksum catches corruption either way.
 
 use std::io::Read;
 
@@ -141,7 +143,8 @@ pub(super) struct StoredRef<'a> {
     pub(super) linear: Option<&'a LinearModel>,
 }
 
-/// Encode a model as a zstd-compressed container.
+/// Encode a model as a container: zstd-compressed unless the frame would
+/// expand further than [`read`] accepts (see [`pack`]).
 pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
     let trees = m.trees;
     // Per-tree counts and array offsets are stored as `u32`.
@@ -294,7 +297,34 @@ pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
     w.finish(&mut out);
     let checksum = xxh64(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    Ok(zstd::bulk::compress(&out, zstd::DEFAULT_COMPRESSION_LEVEL)?)
+    pack(out)
+}
+
+/// The file form of a finished container: its zstd frame, or the container
+/// itself when [`read`] would refuse the frame as expanding too far (a large,
+/// highly repetitive model, such as a gblinear model of mostly zero weights).
+/// Every container of at most [`ALWAYS_ALLOWED`] bytes is compressed.
+fn pack(container: Vec<u8>) -> Result<Vec<u8>> {
+    let frame = zstd::bulk::compress(&container, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    Ok(
+        if expansion_accepted(frame.len() as u64, container.len() as u64) {
+            frame
+        } else {
+            container
+        },
+    )
+}
+
+/// Largest container [`read`] decompresses from a zstd frame of `compressed`
+/// bytes.
+fn expansion_limit(compressed: u64) -> u64 {
+    compressed.saturating_mul(MAX_EXPANSION).max(ALWAYS_ALLOWED)
+}
+
+/// Whether [`read`] accepts a zstd frame of `compressed` bytes holding a
+/// container of `decompressed` bytes.
+fn expansion_accepted(compressed: u64, decompressed: u64) -> bool {
+    decompressed <= expansion_limit(compressed)
 }
 
 /// Decode a container (zstd-compressed or not). The caller validates the
@@ -367,8 +397,9 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
     let node_count = s.array("tree.node_count", u32::from_le_bytes)?;
     let n_trees = node_count.len();
     let n_nodes = checked_sum(&node_count)?;
+    // `n_nodes` sums untrusted per-tree counts, so its product may overflow.
     let column = |name: &str, width: usize| -> Result<()> {
-        if s.bytes(name)?.len() == n_nodes * width {
+        if Some(s.bytes(name)?.len()) == n_nodes.checked_mul(width) {
             Ok(())
         } else {
             Err(wrong_length(name))
@@ -629,9 +660,7 @@ impl<T: Clone> Cursor<T> {
 }
 
 fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
-    let limit = (bytes.len() as u64)
-        .saturating_mul(MAX_EXPANSION)
-        .max(ALWAYS_ALLOWED);
+    let limit = expansion_limit(bytes.len() as u64);
     let decoder = zstd::stream::read::Decoder::with_buffer(bytes)
         .map_err(|e| format_error(format!("zstd: {e}")))?;
     let mut out = Vec::new();
@@ -881,5 +910,66 @@ mod tests {
         corrupt[at] ^= 1;
         let err = BoostedModel::from_bytes(&corrupt).unwrap_err().to_string();
         assert!(err.contains("checksum"), "{err}");
+    }
+
+    /// The container bytes of a gblinear model with `n_features` zero
+    /// weights: the most compressible model there is.
+    fn zero_linear_model(n_features: usize) -> Vec<u8> {
+        let linear = LinearModel::new(vec![0.0; n_features], vec![0.0]);
+        write(&StoredRef {
+            trees: &[],
+            base_score: &[0.5],
+            objective: "reg:squarederror",
+            objective_params: &ObjectiveParams::defaults_for("reg:squarederror"),
+            num_class: 0,
+            n_outputs: 1,
+            n_targets: 1,
+            n_features,
+            best_iteration: None,
+            tree_weights: &[],
+            num_parallel_tree: 1,
+            linear: Some(&linear),
+        })
+        .unwrap()
+    }
+
+    /// The reader's frame policy: containers up to [`ALWAYS_ALLOWED`] bytes
+    /// always decompress, larger ones only within [`MAX_EXPANSION`] of the
+    /// frame; the writer keeps a container uncompressed exactly when this
+    /// refuses its frame.
+    #[test]
+    fn frame_expansion_policy_boundaries() {
+        assert!(expansion_accepted(1, ALWAYS_ALLOWED));
+        assert!(!expansion_accepted(1, ALWAYS_ALLOWED + 1));
+        let frame = ALWAYS_ALLOWED / MAX_EXPANSION + 1;
+        assert!(expansion_accepted(frame, frame * MAX_EXPANSION));
+        assert!(!expansion_accepted(frame, frame * MAX_EXPANSION + 1));
+        assert!(expansion_accepted(u64::MAX, u64::MAX));
+    }
+
+    /// A frame expanding far beyond [`MAX_EXPANSION`] below the size cap
+    /// stays compressed and loads (a 16 MiB container of zero weights
+    /// compresses to a few KiB).
+    #[test]
+    fn highly_compressible_models_load_after_saving() {
+        let n = 1 << 22;
+        let bytes = zero_linear_model(n);
+        assert!(bytes.starts_with(&ZSTD_MAGIC));
+        assert!((bytes.len() as u64).saturating_mul(MAX_EXPANSION) < 4 * n as u64);
+        let stored = read(&bytes).unwrap();
+        let linear = stored.linear.unwrap();
+        assert_eq!(linear.weights().len(), n);
+        assert!(linear.weights().iter().all(|&w| w == 0.0));
+    }
+
+    /// Past the size cap, a container whose frame the reader would refuse is
+    /// written uncompressed and loads.
+    #[test]
+    #[ignore = "allocates about 1 GiB"]
+    fn models_past_the_frame_policy_are_written_uncompressed() {
+        let n = 67_108_864;
+        let bytes = zero_linear_model(n);
+        assert!(bytes.starts_with(MAGIC));
+        assert_eq!(read(&bytes).unwrap().linear.unwrap().weights().len(), n);
     }
 }

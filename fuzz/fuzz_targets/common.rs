@@ -74,18 +74,18 @@ pub fn exercise(model: &BoostedModel) {
         "JSON round trip changed the model"
     );
 
-    // XGBoost interchange is partial; whatever exports must import.
+    // XGBoost interchange is partial; whatever exports must import and
+    // predict like the model (see `check_xgboost_round_trip`).
     if let Ok(xgb) = model.to_xgboost_json() {
         let imported =
             BoostedModel::from_xgboost_json(&xgb).expect("exported XGBoost JSON imports");
-        assert_eq!(imported.n_features(), n_features);
-        assert_eq!(imported.n_outputs(), k);
-    }
-    if let Ok(ubj) = model.to_xgboost_ubjson() {
-        let imported =
-            BoostedModel::from_xgboost_ubjson(&ubj).expect("exported XGBoost UBJSON imports");
-        assert_eq!(imported.n_features(), n_features);
-        assert_eq!(imported.n_outputs(), k);
+        check_xgboost_round_trip(model, &imported, &xgb, "JSON");
+        // Both encodings hold the same document.
+        if let Ok(ubj) = model.to_xgboost_ubjson() {
+            let imported =
+                BoostedModel::from_xgboost_ubjson(&ubj).expect("exported XGBoost UBJSON imports");
+            check_xgboost_round_trip(model, &imported, &xgb, "UBJSON");
+        }
     }
 
     // The compact layout predicts bit-identically to its source.
@@ -178,4 +178,68 @@ fn predict_all(model: &BoostedModel) -> Vec<f32> {
         assert_eq!(first.num_boost_rounds(), 1);
     }
     margin
+}
+
+/// Checks `imported`, read back from the XGBoost export of `model` whose
+/// JSON text is `exported`.
+///
+/// Trees, tree weights and the iteration layout travel losslessly: with the
+/// intercepts replaced by a per-row `base_margin`, the margins are bitwise
+/// equal. The intercepts travel in the space XGBoost stores `base_score` in
+/// (through the objective's inverse link, and its link and clamps on the
+/// way back), so they are compared there: exporting `imported` again must
+/// store the same `base_score` up to `f32` rounding of the link and its
+/// inverse (relative `1e-5`) and XGBoost's clamp of probabilities to
+/// `[1e-6, 1 - 1e-6]` (absolute `2e-6`). A stored value the link maps past
+/// `f32` (non-finite on the second export) is the format's limit and is not
+/// compared.
+fn check_xgboost_round_trip(
+    model: &BoostedModel,
+    imported: &BoostedModel,
+    exported: &str,
+    format: &str,
+) {
+    let n_features = model.n_features();
+    let k = model.n_outputs();
+    assert_eq!(imported.n_features(), n_features);
+    assert_eq!(imported.n_outputs(), k);
+    if small_enough(n_features, k) {
+        let probe = probe_matrix(n_features);
+        let intercepts = vec![0.0; probe.n_rows() * k];
+        let data = probe
+            .with_base_margin(&intercepts)
+            .expect("zero base margins are valid");
+        let before = model.predict_margin(&data).expect("model predicts");
+        let after = imported
+            .predict_margin(&data)
+            .expect("imported model predicts");
+        assert!(
+            same_bits(&before, &after),
+            "XGBoost {format} round trip changed the trees: {before:?} -> {after:?}"
+        );
+    }
+    let again = imported
+        .to_xgboost_json()
+        .expect("an imported XGBoost model exports again");
+    let (stored, restored) = (stored_base_score(exported), stored_base_score(&again));
+    assert_eq!(stored.len(), restored.len());
+    for (&s0, &s1) in stored.iter().zip(&restored) {
+        assert!(
+            !s1.is_finite() || (s1 - s0).abs() <= 1e-5 * s0.abs() + 2e-6,
+            "XGBoost {format} round trip changed the intercepts: stored {stored:?}, \
+             re-exported {restored:?}"
+        );
+    }
+}
+
+/// The `base_score` entries an XGBoost JSON export stores
+/// (`"base_score": "[v0,v1,...]"`, written once, in `learner_model_param`).
+fn stored_base_score(json: &str) -> Vec<f32> {
+    let key = r#""base_score": "["#;
+    let start = json.find(key).expect("the export stores base_score") + key.len();
+    let len = json[start..].find(']').expect("base_score is a vector");
+    json[start..start + len]
+        .split(',')
+        .map(|v| v.parse().expect("base_score entries are numbers"))
+        .collect()
 }

@@ -1,58 +1,45 @@
 //! The exactness domain of the Metal backend's histogram sums.
 //!
 //! The CPU accumulates each histogram bin as a chain of `f64` additions in
-//! row order; the GPU splits the rows into slices, accumulates each slice in
-//! a double-float `(hi, lo)` pair of `f32`s, and merges the slice pairs in
-//! order. The two agree bit for bit exactly when neither rounds, which
-//! [`SumDomain::sums_exact`] decides from two statistics of the gradient
-//! slice: the largest magnitude and the coarsest power of two every value
-//! is a multiple of.
+//! row order. The GPU instead sums integers: at staging time every value
+//! `x` becomes the integer `k = x / u`, where `u = 2^grain` is the largest
+//! power of two dividing every value of the slice, the kernels add the
+//! `k`s in 64-bit integers (any grouping, any order), and the host scales
+//! the bin total back by `u`. [`SumDomain::sums_exact`] decides when the two
+//! agree bit for bit, from two statistics of the slice: its largest
+//! magnitude and its grain.
 //!
 //! # Proof
 //!
-//! Let every value be a multiple of `u = 2^grain` with `|value| <= max`,
-//! and let a node sum at most `n` values, `B = n * max`. Every partial sum
-//! either path forms (a prefix of one bin's rows on the CPU; a prefix of a
-//! slice's rows, or of the slice totals, on the GPU) sums a subset of the
-//! values, so it is a multiple of `u` of magnitude at most `B`. Multiples of
-//! `u` up to `2^24 u` are `f32`s and up to `2^53 u` are `f64`s. By induction
-//! over the operations, while every earlier one was exact:
+//! Let every value be `k u` with an integer `k`, `|k| <= M = max / u`, and
+//! let a node sum `n` values with `n M <= 2^53`. Every partial sum either
+//! path forms sums a subset of the values, so it is `K u` with an integer
+//! `|K| <= n M <= 2^53`.
 //!
-//! - CPU: each `f64` add is exact for `B <= 2^53 u`, so a bin holds the
-//!   exact sum `S`.
-//! - GPU scan (`DF_ADD`: two-sum `s + e = hi + x`, `t = lo + e`, fast
-//!   two-sum of `(s, t)`): the pair is normalized, `|lo| <= ulp(hi)/2 <=
-//!   2^-24 |hi|`, and the two-sums are exact, so the one candidate for
-//!   rounding is `t`, a multiple of `u` with `|t| <= 2^-24 (|hi| + |s|) <=
-//!   2^-23 B (1 + 2^-22)`: exact for `B <= 2^47 u / (1 + 2^-22)`. The fast
-//!   two-sum is exact because `|t| <= |s|` or `s = 0`: if `|s| >= ulp(hi)`,
-//!   `|t| <= |s|/2 + 2^-24 |s|`; otherwise `hi + x` cancels, so (Sterbenz)
-//!   `e = 0`, `t = lo`, and `s`, a nonzero multiple of `ulp(hi)/2`, is at
-//!   least `|lo|`.
-//! - GPU merge (`DF_ADD_DF`: two-sum of the highs, `t = (alo + blo) + e`,
-//!   two-sum of `(s, t)`): both adds are bounded by `2^-24 (|ahi| + |bhi| +
-//!   |s|) <= 3 * 2^-24 B (1 + 2^-22)`, exact for `B <= 2^48 u / (3 (1 +
-//!   2^-22))`, about `2^46.4 u`.
-//! - The final `f64(hi) + f64(lo) = S` is exact for `B <= 2^53 u`.
-//! - Overflow: every `f32` intermediate (including inside the two-sums)
-//!   stays below `2 B (1 + 2^-22)`, finite for `B <= 2^126`.
-//! - Subnormals, which a GPU may flush to zero: for `u >= 2^-126` every
-//!   nonzero multiple of `u` is a normal `f32`.
+//! - Staging: `x * 2^-grain` in `f64` scales by a power of two inside the
+//!   `f64` range (`grain` is in `[-149, 127]`), so it is exact, and it is an
+//!   integer of magnitude at most `2^53`, so the conversion to `i64` is
+//!   exact too.
+//! - GPU: the integer partials never exceed `2^53 < 2^63`, so every add is
+//!   exact, whatever the grouping; the bin total is `K`, which converts to
+//!   `f64` exactly (`|K| <= 2^53`), and multiplying by `u` is exact (a
+//!   nonzero result is at least `2^-149`, a normal `f64`).
+//! - CPU: every partial sum `K u` with `|K| <= 2^53` is an `f64`, so each
+//!   add of the chain is exact and the bin holds the same `K u`.
 //!
-//! So `B <= 2^46 u` suffices; [`DOMAIN_BITS`] keeps one bit of margin below
-//! it, which also absorbs the `f64` rounding of `max * n`.
+//! The kernels therefore never touch a float, so neither rounding modes nor
+//! subnormal flushing matter. The check computes `n M` exactly in integers,
+//! so it needs no margin. It is also the widest bound these statistics
+//! allow: past `2^53` grains the CPU chain itself can round (a test below
+//! shows one), and no parallel grouping reproduces that rounding.
 
-/// `log2(B / u)` up to which both paths are exact (see the module docs).
-const DOMAIN_BITS: i32 = 45;
-/// `log2` of the largest `B` whose `f32` intermediates cannot overflow.
-const OVERFLOW_BITS: i32 = 126;
-/// The finest grain whose multiples are all normal `f32`s (`f32`'s
-/// smallest normal exponent).
-const MIN_GRAIN: i32 = -126;
+/// The largest exact bin sum, in grains: `f64`'s 53-bit significand.
+const MAX_UNITS: u64 = 1 << 53;
 
 /// The magnitude statistics of one gradient component (all gradients, or
 /// all Hessians, of a slice) that decide whether its histogram sums are
-/// exact on both the CPU and the GPU.
+/// exact on both the CPU and the GPU, and the fixed-point scale the GPU
+/// sums them in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SumDomain {
     /// Largest magnitude (0 when every value is zero).
@@ -93,11 +80,10 @@ impl SumDomain {
     }
 
     /// Whether every sum of at most `n` of the values, in any order and
-    /// grouping the GPU uses, is computed exactly by both the CPU's `f64`
-    /// chain and the GPU's double-float accumulation, so that the two agree
-    /// bit for bit. Non-finite values are never exact (NaN payloads and
-    /// infinities do not carry through the double-float pair), nor are
-    /// grains below `2^-126` (subnormal intermediates).
+    /// grouping, is computed exactly by both the CPU's `f64` chain and the
+    /// GPU's integer accumulation of [`units`](Self::units), so that the
+    /// two agree bit for bit: `n * max <= 2^53` grains, computed exactly.
+    /// Non-finite values are never exact.
     pub(crate) fn sums_exact(&self, n: usize) -> bool {
         if !self.finite {
             return false;
@@ -105,12 +91,30 @@ impl SumDomain {
         if self.grain == i32::MAX {
             return true;
         }
-        if self.grain < MIN_GRAIN {
-            return false;
+        // `max / 2^grain` is an exact integer in `f64` (see the proof).
+        let max_units = f64::from(self.max) * pow2(-self.grain);
+        max_units <= MAX_UNITS as f64
+            && (n as u128) * u128::from(max_units as u64) <= u128::from(MAX_UNITS)
+    }
+
+    /// `x` in grains: the integer the GPU sums. Exact for a value of the
+    /// slice whenever any sum of it is exact ([`sums_exact`](Self::sums_exact)
+    /// holds for one value); otherwise (non-finite values, magnitudes past
+    /// `2^63` grains) the saturating conversion keeps it defined, and such
+    /// slices never reach the GPU.
+    pub(crate) fn units(&self, x: f32) -> i64 {
+        if self.grain == i32::MAX {
+            return 0;
         }
-        // `max * n` rounds at most 2^-53 relatively, inside the margin.
-        let bound = f64::from(self.max) * n as f64;
-        bound <= pow2(OVERFLOW_BITS) && bound <= pow2(DOMAIN_BITS + self.grain)
+        (f64::from(x) * pow2(-self.grain)) as i64
+    }
+
+    /// A GPU sum of grains back in value space, exactly (see the proof).
+    pub(crate) fn value(&self, units: i64) -> f64 {
+        if self.grain == i32::MAX {
+            return 0.0;
+        }
+        units as f64 * pow2(self.grain)
     }
 }
 
@@ -138,31 +142,16 @@ fn pow2(k: i32) -> f64 {
 mod tests {
     use super::*;
 
-    /// A model of the GPU kernels' arithmetic (`DF_ADD`, `DF_ADD_DF`, and
-    /// the final `f64` sum in `backend/metal.rs`), in the same `f32`
-    /// operation order: each slice of `slice_len` values accumulates from
-    /// `(0, 0)`, then the slice pairs merge in order.
+    /// A model of the GPU path (`backend/metal.rs`): the values staged as
+    /// grains, each slice of `slice_len` summed in `i64`, the slice totals
+    /// merged in `i64`, and the total scaled back.
     fn gpu_sum(values: &[f32], slice_len: usize) -> f64 {
-        fn two_sum(a: f32, b: f32) -> (f32, f32) {
-            let s = a + b;
-            let bb = s - a;
-            (s, (a - (s - bb)) + (b - bb))
-        }
-        fn fast_two_sum(a: f32, b: f32) -> (f32, f32) {
-            let s = a + b;
-            (s, b - (s - a))
-        }
-        let (mut hi, mut lo) = (0.0f32, 0.0f32);
-        for slice in values.chunks(slice_len) {
-            let (mut shi, mut slo) = (0.0f32, 0.0f32);
-            for &x in slice {
-                let (s, e) = two_sum(shi, x);
-                (shi, slo) = fast_two_sum(s, slo + e);
-            }
-            let (s, e) = two_sum(hi, shi);
-            (hi, lo) = two_sum(s, (lo + slo) + e);
-        }
-        f64::from(hi) + f64::from(lo)
+        let domain = SumDomain::of(values.iter().copied());
+        let total: i64 = values
+            .chunks(slice_len)
+            .map(|slice| slice.iter().map(|&x| domain.units(x)).sum::<i64>())
+            .sum();
+        domain.value(total)
     }
 
     /// The CPU's sequential `f64` chain.
@@ -182,12 +171,35 @@ mod tests {
         assert_eq!(grain(1.0 + f32::EPSILON), -23);
     }
 
-    /// The review's triggering input: in 128-row slices, the six values
-    /// sum to 1 exactly in `f64` (and 64 slices to 64), but need 51
-    /// significand bits, beyond the double-float's reach; the domain check
-    /// sends it to the CPU.
+    /// Staging and scaling back are exact at the extremes of the `f32`
+    /// range: subnormals, the largest finite value, and mixed exponents.
     #[test]
-    fn wide_dynamic_range_is_outside_the_domain() {
+    fn grains_round_trip_exactly() {
+        for values in [
+            vec![
+                f32::from_bits(1),
+                f32::from_bits(0x7F_FFFF),
+                -f32::MIN_POSITIVE,
+            ],
+            vec![f32::MAX, -(2f32.powi(104))],
+            vec![0.75, -3.0, 1.0 + f32::EPSILON],
+        ] {
+            let domain = SumDomain::of(values.iter().copied());
+            assert!(domain.sums_exact(1));
+            for &x in &values {
+                assert_eq!(domain.value(domain.units(x)), f64::from(x), "{x:e}");
+            }
+        }
+        let zeros = SumDomain::of([0.0f32, -0.0]);
+        assert_eq!(zeros.units(0.0), 0);
+        assert_eq!(zeros.value(0), 0.0);
+    }
+
+    /// The review's triggering input: the six values span 51 bits, so a
+    /// node sums them exactly only up to `2^53 / 2^50 = 8` rows; the
+    /// 8,192-row case goes to the CPU.
+    #[test]
+    fn wide_dynamic_range_bounds_the_row_count() {
         let six = [
             2f32.powi(50),
             2f32.powi(26),
@@ -196,49 +208,40 @@ mod tests {
             -(2f32.powi(26)),
             -(2f32.powi(23)),
         ];
-        let mut values = Vec::new();
-        for _ in 0..64 {
-            values.extend(six);
-            values.extend([0.0; 122]);
-        }
-        assert_eq!(cpu_sum(&values), 64.0);
-        let domain = SumDomain::of(values.iter().copied());
-        assert!(!domain.sums_exact(values.len()));
-        assert!(!domain.sums_exact(6));
+        let domain = SumDomain::of(six);
+        assert!(domain.sums_exact(8));
+        assert!(!domain.sums_exact(9));
+        assert!(!domain.sums_exact(8192));
+        assert_eq!(gpu_sum(&six, 4), cpu_sum(&six));
     }
 
-    /// The boundary: `n * max` up to `2^45` grains is in, one more row is
-    /// out; zeros, whole-number grains, and non-finite values.
+    /// The boundary: `n * max` up to `2^53` grains is in, one more row is
+    /// out; zeros, subnormals, and non-finite values.
     #[test]
     fn domain_boundary() {
         // Hessians of squared error: all 1.0, grain 2^0.
         let ones = SumDomain::of([1.0f32; 3]);
-        assert!(ones.sums_exact(1 << 45));
-        assert!(!ones.sums_exact((1 << 45) + 1));
-        // An odd multiple of 2^-10 decides the grain; the max is 4.
+        assert!(ones.sums_exact(1 << 53));
+        assert!(!ones.sums_exact((1 << 53) + 1));
+        // An odd multiple of 2^-10 decides the grain; the max is 4 = 2^12
+        // grains.
         let mixed = SumDomain::of([4.0, -0.5, 3.0 * 2f32.powi(-10), 0.0]);
-        assert!(mixed.sums_exact(1 << 33));
-        assert!(!mixed.sums_exact((1 << 33) + 1));
+        assert!(mixed.sums_exact(1 << 41));
+        assert!(!mixed.sums_exact((1 << 41) + 1));
+        // Subnormals are fine: the GPU never sees a float.
+        assert!(SumDomain::of([f32::from_bits(1)]).sums_exact(1 << 53));
+        // A single value past 2^53 grains is never exact.
+        assert!(!SumDomain::of([2f32.powi(60), 1.0]).sums_exact(1));
         assert!(SumDomain::of([0.0f32, -0.0]).sums_exact(usize::MAX));
-        assert!(SumDomain::EMPTY.sums_exact(1 << 40));
+        assert!(SumDomain::EMPTY.sums_exact(usize::MAX));
         assert!(!SumDomain::of([1.0, f32::NAN]).sums_exact(1));
         assert!(!SumDomain::of([f32::INFINITY]).sums_exact(1));
-        // Grains below 2^-126 could produce subnormal intermediates.
-        assert!(SumDomain::of([2f32.powi(-126)]).sums_exact(2));
-        assert!(!SumDomain::of([f32::from_bits(1)]).sums_exact(1));
-        assert!(!SumDomain::of([f32::MIN_POSITIVE + f32::from_bits(1)]).sums_exact(1));
-        // Overflow: coarse grains, but `n * max` past 2^126.
-        let huge = SumDomain::of([2f32.powi(120)]);
-        assert!(huge.sums_exact(64));
-        assert!(!huge.sums_exact(65));
     }
 
-    /// Inside the domain the modeled GPU arithmetic equals the CPU chain
-    /// bit for bit, at the domain's edge: mostly-positive large values
-    /// (partial sums near `n * max`, so the pair's low word collects large
-    /// rounding errors) mixed with odd small ones. The unrenormalized
-    /// double-float the kernels used before loses low bits in about one
-    /// check in twenty here.
+    /// Inside the domain the modeled GPU path equals the CPU chain bit for
+    /// bit at the domain's edge: mostly-positive large values (partial
+    /// sums near `2^53` grains, where the chain has no bit to spare) mixed
+    /// with odd small ones, over several slice groupings.
     #[test]
     fn in_domain_sums_match_the_cpu_chain() {
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -250,8 +253,8 @@ mod tests {
         };
         for case in 0..200 {
             let n = 4096 + (next() % 4096) as usize;
-            // Largest magnitude 2^top with grain 2^0: `n * 2^top <= 2^45`.
-            let top = 45 - (n as f64).log2().ceil() as i32;
+            // Largest magnitude 2^top with grain 2^0: `n * 2^top <= 2^53`.
+            let top = 53 - (n as f64).log2().ceil() as i32;
             let values: Vec<f32> = (0..n)
                 .map(|_| {
                     let r = next();
@@ -276,5 +279,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Just past the bound the CPU chain itself rounds: `1 + k * 2^30`
+    /// reaches `2^53 + 1` at `k = 2^23`, which `f64` rounds to `2^53`, while
+    /// the exact (integer) sum keeps the 1. The domain refuses the node.
+    #[test]
+    fn the_cpu_chain_rounds_just_past_the_bound() {
+        let k = (1 << 23) + 1;
+        let values: Vec<f32> = std::iter::once(1.0)
+            .chain(std::iter::repeat_n(2f32.powi(30), k))
+            .collect();
+        // The exact sum, `2^53 + 2^30 + 1`, is not an `f64`: compare in
+        // integers.
+        let exact = 1 + (k as i64) * (1 << 30);
+        assert_eq!(cpu_sum(&values) as i64, exact - 1);
+        assert!(!SumDomain::of(values.iter().copied()).sums_exact(values.len()));
     }
 }

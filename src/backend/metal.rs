@@ -14,57 +14,62 @@
 //!   the histogram construction of `tree_method = hist` moves to the GPU
 //!   for every node it can sum exactly (below), bit-identical to the
 //!   CPU's. It is correct and deterministic everywhere, but on multicore
-//!   Apple Silicon it is currently *slower* than the CPU histogram path
-//!   (measured with an earlier kernel that skipped renormalization, so the
-//!   GPU times are lower bounds: 1M rows × 30 features took ~11 ms on the
-//!   GPU vs ~2 ms on a 14-core CPU; end-to-end 200k × 30 depth-8 training
-//!   was ~1.8× slower).
-//!   The cause is structural: Apple GPUs have no `double`, so the exact
-//!   accumulation needs about ten times the arithmetic of the CPU's native
-//!   `f64` adds, and the determinism contract forbids the floating-point
-//!   atomics other GPU histogram implementations use. Set
-//!   `device = metal` to exercise the GPU path; for speed, keep training
-//!   on the CPU and use [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) for prediction.
+//!   Apple Silicon it has been *slower* than the CPU histogram path: with
+//!   the earlier `float` double-float kernels, 1M rows × 30 features took
+//!   ~11 ms on the GPU vs ~2 ms on a 14-core CPU, and end-to-end 200k × 30
+//!   depth-8 training was ~1.8× slower. The current integer kernels do less
+//!   arithmetic per row (one 64-bit add per component, instead of a
+//!   double-float's ~7 `float` operations) but read 16-byte gradient pairs
+//!   instead of 8-byte ones; they have not been re-measured. The
+//!   determinism contract forbids the floating-point atomics other GPU
+//!   histogram implementations use. Set `device = metal` to exercise the
+//!   GPU path; for speed, keep training on the CPU and use
+//!   [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) for prediction.
 //!
 //! # Determinism
 //!
-//! Metal on Apple GPUs has no `double` type, while the CPU accumulates each
-//! histogram bin as a chain of `f64` additions in row order. The GPU kernel
-//! instead accumulates each (feature, bin) cell of fixed row slices in a
-//! normalized double-float pair (Knuth's two-sum, then Dekker's fast
-//! two-sum), merges the slice pairs in slice order, and rounds once to
-//! `f64`. The two agree bit for bit exactly when neither rounds, and the
-//! backend checks that before every GPU build: from the staged gradients'
-//! largest magnitude `max` and the coarsest power of two `u` every value
-//! is a multiple of, a node of `n` rows goes to the GPU only when
-//! `n * max <= 2^45 u` for both the gradients and the Hessians (proved in
-//! the private `backend::exact_sum` module; the double-float carries about
-//! 48 exact bits). Every other build runs the CPU's sequential path inside
-//! the backend, so a `device = metal` training run reproduces the
-//! single-threaded CPU model exactly. The result is also identical across
-//! runs, thread counts, and machines: there are no atomics, and every
-//! constant (chunk size, thread layout, merge order) is fixed.
+//! The CPU accumulates each histogram bin as a chain of `f64` additions in
+//! row order. Metal on Apple GPUs has no `double`, so the GPU sums integers
+//! instead. When the backend stages a tree's gradients it finds, per
+//! component (gradients, Hessians), the grain `u`: the largest power of
+//! two that divides every value. It uploads each value as the integer
+//! `x / u`. The kernels add those integers in 64-bit arithmetic, per row
+//! slice and then across slices, and the host scales each bin total back
+//! by `u`. A node of `n` rows goes to the GPU only when `n * max <= 2^53 u`
+//! for both components, checked exactly. Inside that bound every integer
+//! partial is exact. So is every partial sum of the CPU's `f64` chain, a
+//! multiple of `u` below `2^53 u`, which makes the two histograms equal bit
+//! for bit (proof in the private `backend::exact_sum` module). No wider
+//! bound on these statistics works: past it the CPU chain itself can
+//! round, and no parallel grouping reproduces that rounding. Every other
+//! build runs the CPU's sequential path inside the backend, so a
+//! `device = metal` training run reproduces the single-threaded CPU model
+//! exactly. The result is also identical across runs, thread counts, and
+//! machines: there are no atomics, and integer sums do not depend on the
+//! order.
 //!
-//! The domain depends on the data: `u` is set by the finest-grained value,
-//! so real-valued labels near zero (squared-error residuals) or confident
-//! predictions (logistic Hessians `p (1 - p)` near 0) cap GPU nodes at
-//! roughly 10^4 to 10^5 rows, and larger nodes run on the CPU. Coarse
-//! gradients (whole numbers, the constant Hessians of squared error) stay
-//! on the GPU up to `2^45 u / max` rows.
+//! The bound depends on the data: `u` is set by the finest-grained value,
+//! so the GPU limit per node is `2^53 u / max` rows. On synthetic data
+//! (100k rows, depth-6 trees), squared error with real-valued labels near
+//! zero allowed 1.3M to 6M rows per node over 100 rounds, and its constant
+//! Hessians allowed 9e15. `binary:logistic` allowed 1.8e7 to 2e9 rows in
+//! the first 20 rounds, falling to about 2.6e5 by round 100 as confident
+//! rows push `p (1 - p)` toward 0. Larger nodes run on the CPU.
 //!
 //! Guard rails keep the two paths identical in the remaining edge cases:
 //! nodes below 8,192 rows, non-finite gradients, inputs that do not match
 //! the index the backend was built from, and GPU command failures run on
-//! the CPU's sequential path, and the kernels are compiled with safe math
+//! the CPU's sequential path. The kernels are compiled with safe math
 //! (`mathMode = safe` from macOS 15 on, `fastMathEnabled = false` before)
-//! and FP contraction off, so the compiler cannot distort the two-sums or
-//! the prediction's rounding order.
+//! and FP contraction off, so the compiler cannot change the prediction's
+//! rounding order.
 //!
 //! # Limitations
 //!
-//! - macOS 10.13 or later with a Metal device (Apple Silicon or an Intel
-//!   Mac with a supported GPU). Training on a machine without one fails
-//!   with an error, as do the combinations listed under
+//! - macOS 10.15 or later (Metal 2.2, for 64-bit integers in kernels) with
+//!   a Metal device (Apple Silicon or an Intel Mac with a supported GPU).
+//!   Training on a machine without one fails with an error, as do the
+//!   combinations listed under
 //!   [`TrainingParams::validate`](crate::config::TrainingParams::validate).
 //! - Sparse (CSR, missing-value) training data is supported through an
 //!   interleaved column copy (up to 8 bytes per row per feature block);
@@ -72,9 +77,9 @@
 //! - [`GpuModel`](crate::backend::metal::GpuModel) refuses `gblinear` and `linear_tree` models (they do not
 //!   predict through the compact forest), and prediction needs a dense row
 //!   copy, so `rows × features × 4` bytes must stay under 4 GiB.
-//! - The gradient slice is re-uploaded once per tree (8 bytes per row) and
-//!   each prediction call uploads its rows; on unified memory (Apple
-//!   Silicon) these are plain memory copies.
+//! - The gradient slice is converted and re-uploaded once per tree (16
+//!   bytes per row) and each prediction call uploads its rows; on unified
+//!   memory (Apple Silicon) these are plain memory copies.
 
 // `MTLCreateSystemDefaultDevice` links against CoreGraphics; the binding
 // crate documents this as the required linkage.
@@ -105,17 +110,16 @@ use std::slice;
 use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard};
 
 /// Rows per GPU histogram chunk. A chunk's shared data (row ids plus
-/// gradient pairs, 12 bytes per row) stays resident in the GPU's level-2
-/// cache while every (feature, window) threadgroup sweeps it, so the
-/// re-reads by the ~hundreds of threadgroups do not reach DRAM. A fixed
-/// constant: it is part of the summation order, so it must not vary by
-/// machine.
+/// gradient pairs in grains, 20 bytes per row) is meant to stay resident in
+/// the GPU's level-2 cache while every (feature, window) threadgroup sweeps
+/// it, so the re-reads by the ~hundreds of threadgroups do not reach DRAM.
+/// The sums are exact integers, so the chunking does not affect results.
 const CHUNK_ROWS: usize = 65_536;
 
 /// Row slices per chunk: each chunk dispatch runs one threadgroup per
 /// (feature window, slice), the `.y` grid dimension, so the scan has enough
-/// threadgroups in flight to hide memory latency. A fixed constant: it is
-/// part of the summation order and must not vary by machine.
+/// threadgroups in flight to hide memory latency. Like the chunking, it
+/// does not affect results.
 const ROW_SLICES: usize = 64;
 /// Nodes below this many rows run on the CPU's sequential path: the kernel
 /// dispatch and readback cost more than the scan. Below this size the CPU
@@ -169,9 +173,11 @@ pub fn device_name() -> Option<String> {
 
 /// The compute kernels, compiled from source once per process.
 ///
-/// All arithmetic is `float` (Apple GPUs have no `double`); the histogram
-/// accumulations use exact double-float two-sums, so the source must be
-/// compiled with safe math mode (see [`MetalContext::new`]).
+/// The histogram kernels only add 64-bit integers (MSL `long`, Metal 2.2
+/// and later): the host stages each gradient pair as integer multiples of
+/// its slice's grain (`backend/exact_sum.rs`). Prediction is `float`
+/// arithmetic that must round like the CPU, so the source is compiled with
+/// safe math mode (see [`MetalContext::new`]).
 const MSL: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -179,24 +185,24 @@ using namespace metal;
 // then add) like the CPU: fused multiply-add would change results by an ulp.
 #pragma clang fp contract(off)
 
-// Accumulate one row's gradient pair into this thread's bin registers:
-// `wl` is the row's bin offset within this thread's 32-bin window, `gh` its
-// gradient pair. The owner check and the four-way register select stay
-// branch-predicated; `j`, `n_win`, and `win_base` are thread-uniform.
+// Accumulate one row's gradient pair (in grains) into this thread's bin
+// registers: `wl` is the row's bin offset within this thread's window,
+// `gh` its gradient pair. The owner check and the four-way register select
+// stay branch-predicated; `j`, `n_win`, and `win_base` are thread-uniform.
 #define ACC_BIN(wl_, gh) { \
     if ((wl_) >= 0 && (uint)(wl_) < n_win && (uint)((wl_) >> 2) == j) { \
         if (((wl_) & 3) == 0) { \
-            DF_ADD(ghi0, glo0, (gh).x) \
-            DF_ADD(hhi0, hlo0, (gh).y) \
+            g0 += (gh).x; \
+            h0 += (gh).y; \
         } else if (((wl_) & 3) == 1) { \
-            DF_ADD(ghi1, glo1, (gh).x) \
-            DF_ADD(hhi1, hlo1, (gh).y) \
+            g1 += (gh).x; \
+            h1 += (gh).y; \
         } else if (((wl_) & 3) == 2) { \
-            DF_ADD(ghi2, glo2, (gh).x) \
-            DF_ADD(hhi2, hlo2, (gh).y) \
+            g2 += (gh).x; \
+            h2 += (gh).y; \
         } else { \
-            DF_ADD(ghi3, glo3, (gh).x) \
-            DF_ADD(hhi3, hlo3, (gh).y) \
+            g3 += (gh).x; \
+            h3 += (gh).y; \
         } \
     } \
 }
@@ -228,51 +234,10 @@ struct HistRun {
     uint features_per_group; // features one threadgroup covers
 };
 
-// Knuth's two-sum: `s + e == a + b` exactly (round to nearest, no
-// overflow), whatever the magnitudes.
-#define TWO_SUM(s, e, a, b) { \
-    s = (a) + (b); \
-    float bb_ = s - (a); \
-    e = ((a) - (s - bb_)) + ((b) - bb_); \
-}
-
-// Dekker's fast two-sum: `s + e == a + b` exactly when `|a| >= |b|` or
-// `a == 0`.
-#define FAST_TWO_SUM(s, e, a, b) { \
-    s = (a) + (b); \
-    e = (b) - (s - (a)); \
-}
-
-// Double-float add of `x` to the normalized pair `(hi, lo)`: two-sum of
-// the high word, the error added to `lo`, then a fast two-sum renormalizes
-// so `|lo| <= ulp(hi) / 2` again. Exact inside the domain the host checks
-// (`backend/exact_sum.rs`, which proves it), where the one inexact
-// candidate, `lo + e`, is a small multiple of the inputs' grain and
-// `|lo + e| <= |s|` makes the fast two-sum exact.
-#define DF_ADD(hi, lo, x) { \
-    float s_, e_; \
-    TWO_SUM(s_, e_, hi, (x)) \
-    float t_ = (lo) + e_; \
-    FAST_TWO_SUM(hi, lo, s_, t_) \
-}
-
-// Double-float add of the normalized pair `(bhi, blo)` to `(ahi, alo)`:
-// two-sum of the high words, the low words and the error added, then a
-// full two-sum renormalizes (the high words may cancel, so the fast
-// variant's magnitude condition is not guaranteed). Exact inside the same
-// domain.
-#define DF_ADD_DF(ahi, alo, bhi, blo) { \
-    float s_, e_; \
-    TWO_SUM(s_, e_, ahi, bhi) \
-    float t_ = ((alo) + (blo)) + e_; \
-    TWO_SUM(ahi, alo, s_, t_) \
-}
-
-// One threadgroup scans one (feature block, 32-bin window) of one row
-// chunk: thread `tid` covers feature `tid / 8` and its bin quarter
-// `(tid % 8) * 4`, four bins held in registers. Every bin has a single
-// writer that adds its rows in ascending order, so the result is
-// deterministic (and exact inside the host-checked domain). The
+// One threadgroup scans one (feature block, 256-bin window) of one row
+// slice. Every bin has a single writer per slice and integer adds are
+// exact, so the result is exact and deterministic (the host keeps every
+// partial below 2^53 grains). The
 // interleaved column store packs 8 features' bins into
 // one 16-byte word per (row, block), so a row step costs one uniform load
 // for the row id, one for the word, and one for the gradient pair —
@@ -280,10 +245,10 @@ struct HistRun {
 kernel void hist_scan_u16(
     const device uint* rows [[buffer(0)]],
     const device uint4* columns [[buffer(1)]],
-    const device float2* gpair [[buffer(2)]],
+    const device long2* gpair [[buffer(2)]],
     const device BlockInfo* blocks [[buffer(3)]],
     const device ScanGroup* groups [[buffer(4)]],
-    device float4* partials [[buffer(5)]],
+    device long2* partials [[buffer(5)]],
     constant ChunkArgs& chunk [[buffer(6)]],
     constant HistRun& run [[buffer(7)]],
     uint2 gpos [[threadgroup_position_in_grid]],
@@ -317,10 +282,8 @@ kernel void hist_scan_u16(
     uint slice_rows = (slice_begin < chunk.chunk_rows)
         ? min(slice_len, chunk.chunk_rows - slice_begin)
         : 0u;
-    float ghi0 = 0.0f, ghi1 = 0.0f, ghi2 = 0.0f, ghi3 = 0.0f;
-    float glo0 = 0.0f, glo1 = 0.0f, glo2 = 0.0f, glo3 = 0.0f;
-    float hhi0 = 0.0f, hhi1 = 0.0f, hhi2 = 0.0f, hhi3 = 0.0f;
-    float hlo0 = 0.0f, hlo1 = 0.0f, hlo2 = 0.0f, hlo3 = 0.0f;
+    long g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+    long h0 = 0, h1 = 0, h2 = 0, h3 = 0;
     // Batches of 8: the row ids load together, then the column words and
     // gradient pairs, so the dependent uniform loads pipeline across the
     // batch. The accumulation order per bin is unchanged (ascending rows
@@ -343,14 +306,14 @@ kernel void hist_scan_u16(
         uint4 c5 = columns[(size_t)r5 * run.n_records + record];
         uint4 c6 = columns[(size_t)r6 * run.n_records + record];
         uint4 c7 = columns[(size_t)r7 * run.n_records + record];
-        float2 q0 = gpair[r0];
-        float2 q1 = gpair[r1];
-        float2 q2 = gpair[r2];
-        float2 q3 = gpair[r3];
-        float2 q4 = gpair[r4];
-        float2 q5 = gpair[r5];
-        float2 q6 = gpair[r6];
-        float2 q7 = gpair[r7];
+        long2 q0 = gpair[r0];
+        long2 q1 = gpair[r1];
+        long2 q2 = gpair[r2];
+        long2 q3 = gpair[r3];
+        long2 q4 = gpair[r4];
+        long2 q5 = gpair[r5];
+        long2 q6 = gpair[r6];
+        long2 q7 = gpair[r7];
         ACC_BIN((int)((c0[word] >> shift) & 0xFFFFu) - (int)win_base, q0)
         ACC_BIN((int)((c1[word] >> shift) & 0xFFFFu) - (int)win_base, q1)
         ACC_BIN((int)((c2[word] >> shift) & 0xFFFFu) - (int)win_base, q2)
@@ -363,15 +326,15 @@ kernel void hist_scan_u16(
     for (; i < slice_rows; i++) {
         uint r = rows[slice_begin + i];
         uint4 c = columns[(size_t)r * run.n_records + record];
-        float2 gh = gpair[r];
+        long2 gh = gpair[r];
         ACC_BIN((int)((c[word] >> shift) & 0xFFFFu) - (int)win_base, gh)
     }
-    device float4* out = partials + (size_t)(chunk.chunk_index * chunk.slices + gpos.y) * run.total_bins;
+    device long2* out = partials + (size_t)(chunk.chunk_index * chunk.slices + gpos.y) * run.total_bins;
     uint base = win_base + j * 4;
-    if (j * 4 + 0 < n_win) { out[base + 0] = float4(ghi0, glo0, hhi0, hlo0); }
-    if (j * 4 + 1 < n_win) { out[base + 1] = float4(ghi1, glo1, hhi1, hlo1); }
-    if (j * 4 + 2 < n_win) { out[base + 2] = float4(ghi2, glo2, hhi2, hlo2); }
-    if (j * 4 + 3 < n_win) { out[base + 3] = float4(ghi3, glo3, hhi3, hlo3); }
+    if (j * 4 + 0 < n_win) { out[base + 0] = long2(g0, h0); }
+    if (j * 4 + 1 < n_win) { out[base + 1] = long2(g1, h1); }
+    if (j * 4 + 2 < n_win) { out[base + 2] = long2(g2, h2); }
+    if (j * 4 + 3 < n_win) { out[base + 3] = long2(g3, h3); }
 }
 
 // The wide-bin variant (more than 65,536 total bins, or a sparse dataset
@@ -380,10 +343,10 @@ kernel void hist_scan_u16(
 kernel void hist_scan_u32(
     const device uint* rows [[buffer(0)]],
     const device uint* columns [[buffer(1)]],
-    const device float2* gpair [[buffer(2)]],
+    const device long2* gpair [[buffer(2)]],
     const device BlockInfo* blocks [[buffer(3)]],
     const device ScanGroup* groups [[buffer(4)]],
-    device float4* partials [[buffer(5)]],
+    device long2* partials [[buffer(5)]],
     constant ChunkArgs& chunk [[buffer(6)]],
     constant HistRun& run [[buffer(7)]],
     uint2 gpos [[threadgroup_position_in_grid]],
@@ -408,10 +371,8 @@ kernel void hist_scan_u32(
     uint slice_rows = (slice_begin < chunk.chunk_rows)
         ? min(slice_len, chunk.chunk_rows - slice_begin)
         : 0u;
-    float ghi0 = 0.0f, ghi1 = 0.0f, ghi2 = 0.0f, ghi3 = 0.0f;
-    float glo0 = 0.0f, glo1 = 0.0f, glo2 = 0.0f, glo3 = 0.0f;
-    float hhi0 = 0.0f, hhi1 = 0.0f, hhi2 = 0.0f, hhi3 = 0.0f;
-    float hlo0 = 0.0f, hlo1 = 0.0f, hlo2 = 0.0f, hlo3 = 0.0f;
+    long g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+    long h0 = 0, h1 = 0, h2 = 0, h3 = 0;
     uint stride = run.n_records * 8u;
     uint i = 0;
     for (; i + 8 <= slice_rows; i += 8) {
@@ -431,14 +392,14 @@ kernel void hist_scan_u32(
         uint b5 = columns[(size_t)r5 * stride + record * 8u + slot];
         uint b6 = columns[(size_t)r6 * stride + record * 8u + slot];
         uint b7 = columns[(size_t)r7 * stride + record * 8u + slot];
-        float2 q0 = gpair[r0];
-        float2 q1 = gpair[r1];
-        float2 q2 = gpair[r2];
-        float2 q3 = gpair[r3];
-        float2 q4 = gpair[r4];
-        float2 q5 = gpair[r5];
-        float2 q6 = gpair[r6];
-        float2 q7 = gpair[r7];
+        long2 q0 = gpair[r0];
+        long2 q1 = gpair[r1];
+        long2 q2 = gpair[r2];
+        long2 q3 = gpair[r3];
+        long2 q4 = gpair[r4];
+        long2 q5 = gpair[r5];
+        long2 q6 = gpair[r6];
+        long2 q7 = gpair[r7];
         ACC_BIN((int)b0 - (int)win_base, q0)
         ACC_BIN((int)b1 - (int)win_base, q1)
         ACC_BIN((int)b2 - (int)win_base, q2)
@@ -451,33 +412,32 @@ kernel void hist_scan_u32(
     for (; i < slice_rows; i++) {
         uint r = rows[slice_begin + i];
         uint b = columns[(size_t)r * stride + record * 8u + slot];
-        float2 gh = gpair[r];
+        long2 gh = gpair[r];
         ACC_BIN((int)b - (int)win_base, gh)
     }
-    device float4* out = partials + (size_t)(chunk.chunk_index * chunk.slices + gpos.y) * run.total_bins;
+    device long2* out = partials + (size_t)(chunk.chunk_index * chunk.slices + gpos.y) * run.total_bins;
     uint base = win_base + j * 4;
-    if (j * 4 + 0 < n_win) { out[base + 0] = float4(ghi0, glo0, hhi0, hlo0); }
-    if (j * 4 + 1 < n_win) { out[base + 1] = float4(ghi1, glo1, hhi1, hlo1); }
-    if (j * 4 + 2 < n_win) { out[base + 2] = float4(ghi2, glo2, hhi2, hlo2); }
-    if (j * 4 + 3 < n_win) { out[base + 3] = float4(ghi3, glo3, hhi3, hlo3); }
+    if (j * 4 + 0 < n_win) { out[base + 0] = long2(g0, h0); }
+    if (j * 4 + 1 < n_win) { out[base + 1] = long2(g1, h1); }
+    if (j * 4 + 2 < n_win) { out[base + 2] = long2(g2, h2); }
+    if (j * 4 + 3 < n_win) { out[base + 3] = long2(g3, h3); }
 }
 
-// Merge the chunk partials of every bin in chunk order, rounding once.
+// Merge the slice partials of every bin. Integer adds: exact, so the
+// order does not matter (it is still fixed).
 kernel void hist_merge(
-    const device float4* partials [[buffer(0)]],
-    device float4* hist [[buffer(1)]],
+    const device long2* partials [[buffer(0)]],
+    device long2* hist [[buffer(1)]],
     constant MergeArgs& merge [[buffer(2)]],
     constant HistRun& run [[buffer(3)]],
     uint b [[thread_position_in_grid]])
 {
     if (b >= run.total_bins) { return; }
-    float ghi = 0.0f, glo = 0.0f, hhi = 0.0f, hlo = 0.0f;
+    long2 sum = long2(0L, 0L);
     for (uint c = 0; c < merge.n_partials; c++) {
-        float4 p = partials[(size_t)c * run.total_bins + b];
-        DF_ADD_DF(ghi, glo, p.x, p.y)
-        DF_ADD_DF(hhi, hlo, p.z, p.w)
+        sum += partials[(size_t)c * run.total_bins + b];
     }
-    hist[b] = float4(ghi, glo, hhi, hlo);
+    hist[b] = sum;
 }
 
 // One compact-forest node: the layout of `CNode` in `tree/compact.rs`.
@@ -710,19 +670,20 @@ impl MetalContext {
     }
 
     fn new() -> Result<Self, String> {
-        // `dispatchThreads:threadsPerThreadgroup:` (non-uniform threadgroup
-        // dispatch) arrived in macOS 10.13; an older system would raise an
-        // unknown-selector exception at the first dispatch.
-        if !objc2::available!(macos = 10.13) {
-            return Err("the Metal backend needs macOS 10.13 or later".to_string());
+        // The histogram kernels use 64-bit integers (MSL `long`), which
+        // need Metal 2.2, macOS 10.15. Older systems would fail the kernel
+        // compile; `dispatchThreads:threadsPerThreadgroup:` (macOS 10.13)
+        // would otherwise raise an unknown-selector exception.
+        if !objc2::available!(macos = 10.15) {
+            return Err("the Metal backend needs macOS 10.15 or later".to_string());
         }
         let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| "no system default Metal device".to_string())?;
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| "creating the Metal command queue failed".to_string())?;
-        // Safe math mode: the two-sums require exact IEEE 754 adds with no
-        // FMA contraction or reassociation, and the compile-time default
+        // Safe math mode: the prediction kernel must round like the CPU,
+        // with no FMA contraction or reassociation, and the compile-time default
         // (fast math) permits both. `mathMode` exists from macOS 15 on (an
         // older system has no such selector, so sending it would raise an
         // exception); before that, `fastMathEnabled = false` is the same
@@ -949,13 +910,14 @@ impl MetalHistBackend {
             None => u16::try_from(total_bins).is_ok(),
         };
         let columns = interleaved_columns(&ctx.device, index, columns_u16, n_records)?;
-        // Feature blocks per threadgroup. Measured on Apple Silicon: one
-        // feature per 64-thread group (a whole 256-bin window) beats every
-        // wider block — the interleaved record load costs more than the
-        // row/gradient amortization saves, and 512+-thread groups lose
-        // occupancy to register pressure. A fixed constant: it is part of
-        // the summation order. Wider blocks are a tuning direction if the
-        // scan kernels are reworked around the scalar-load path.
+        // Feature blocks per threadgroup. Measured on Apple Silicon (with
+        // the earlier `float` kernels): one feature per 64-thread group (a
+        // whole 256-bin window) beats every wider block — the interleaved
+        // record load costs more than the row/gradient amortization saves,
+        // and 512+-thread groups lose occupancy to register pressure. The
+        // integer sums make the choice a pure tuning knob. Wider blocks are
+        // a tuning direction if the scan kernels are reworked around the
+        // scalar-load path.
         let features_per_group = 1;
         let threads_per_group = features_per_group * THREADS_PER_FEATURE;
         // Per-block bin ranges, and one group per (block, 256-bin window);
@@ -1010,7 +972,8 @@ impl MetalHistBackend {
             partials: GpuBuffer::new(&ctx.device, chunks * ROW_SLICES * total_bins * 16)?,
             hist: GpuBuffer::new(&ctx.device, total_bins * 16)?,
         };
-        let gpair = GpuBuffer::new(&ctx.device, n_rows * 8)?;
+        // One `[i64; 2]` gradient pair in grains per row.
+        let gpair = GpuBuffer::new(&ctx.device, n_rows * 16)?;
         Ok(MetalHistBackend {
             ctx,
             columns_u16,
@@ -1055,15 +1018,23 @@ impl MetalHistBackend {
         if gpair.len() != self.n_rows {
             return;
         }
+        let grad = SumDomain::of(gpair.iter().map(|p| p.grad));
+        let hess = SumDomain::of(gpair.iter().map(|p| p.hess));
         // SAFETY: the write lock excludes every GPU build (each holds a
         // read guard until its command buffer has completed), so no GPU work
-        // reads the buffer; `GradPair` is `repr(C)` of two `f32`s, without
-        // padding.
-        if unsafe { staged.buffer.write(0, as_bytes(gpair)) }.is_err() {
+        // reads the buffer and nothing else aliases it; `[i64; 2]` is plain
+        // data laid out as the kernels' `long2`.
+        let Ok(units) = (unsafe { staged.buffer.as_slice_mut::<[i64; 2]>(gpair.len()) }) else {
             return;
-        }
-        staged.grad = SumDomain::of(gpair.iter().map(|p| p.grad));
-        staged.hess = SumDomain::of(gpair.iter().map(|p| p.hess));
+        };
+        // Integer multiples of each component's grain, the values the
+        // kernels sum: exact whenever a node's sums can be (`exact_sum`).
+        units
+            .par_iter_mut()
+            .zip(gpair)
+            .for_each(|(u, p)| *u = [grad.units(p.grad), hess.units(p.hess)]);
+        staged.grad = grad;
+        staged.hess = hess;
         staged.addr = gpair.as_ptr().addr();
         staged.len = gpair.len();
     }
@@ -1149,19 +1120,20 @@ impl MetalHistBackend {
         let Ok(call) = self.checkout() else {
             return false;
         };
-        let result = self.dispatch(&call, &staged.buffer, rows, out);
+        let result = self.dispatch(&call, &staged, rows, out);
         self.checkin(call);
         result.is_ok()
     }
 
     /// Encode, run, and read back the scan and merge of `rows` over the
     /// staged `gradients`. The caller has checked that `rows` fit the
-    /// backend (at most `n_rows` entries, each below `n_rows`) and holds the
-    /// gradients' read guard throughout.
+    /// backend (at most `n_rows` entries, each below `n_rows`) and that
+    /// their sums are exact, and holds the gradients' read guard
+    /// throughout.
     fn dispatch(
         &self,
         call: &CallBuffers,
-        gradients: &GpuBuffer,
+        gradients: &StagedGradients,
         rows: &[u32],
         out: &mut [GradStats],
     ) -> Result<()> {
@@ -1197,7 +1169,7 @@ impl MetalHistBackend {
                 enc.setComputePipelineState(&pipe.0);
                 enc.setBuffer_offset_atIndex(Some(&call.rows.0), begin * 4, 0);
                 enc.setBuffer_offset_atIndex(Some(&self.columns.0), 0, 1);
-                enc.setBuffer_offset_atIndex(Some(&gradients.0), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&gradients.buffer.0), 0, 2);
                 enc.setBuffer_offset_atIndex(Some(&self.blocks_bytes.0), 0, 3);
                 enc.setBuffer_offset_atIndex(Some(&self.groups_bytes.0), 0, 4);
                 enc.setBuffer_offset_atIndex(Some(&call.partials.0), 0, 5);
@@ -1266,13 +1238,11 @@ impl MetalHistBackend {
         submit(&cb)?;
         // SAFETY: the command buffer has completed, so the GPU is done with
         // the buffer; this call owns it.
-        let hist = unsafe { call.hist.as_slice_mut::<[f32; 4]>(self.total_bins)? };
-        for (o, h) in out.iter_mut().zip(hist) {
-            // Inside the exactness domain `hi + lo` is the exact bin sum, a
-            // multiple of the grain below 2^53 grains, so the `f64` add is
-            // exact.
-            o.grad = f64::from(h[0]) + f64::from(h[1]);
-            o.hess = f64::from(h[2]) + f64::from(h[3]);
+        let hist = unsafe { call.hist.as_slice_mut::<[i64; 2]>(self.total_bins)? };
+        for (o, &[g, h]) in out.iter_mut().zip(hist.iter()) {
+            // Exact bin sums in grains (below 2^53), scaled back exactly.
+            o.grad = gradients.grad.value(g);
+            o.hess = gradients.hess.value(h);
         }
         Ok(())
     }
@@ -1782,11 +1752,11 @@ mod tests {
         GHistIndex::from_dmatrix(&data, HistCuts::from_dmatrix(&data, 256))
     }
 
-    /// The double-float two-sum must be exact: a bin's rows of
-    /// near-identical gradients must keep a nonzero low word, which FMA
-    /// contraction (safe math mode off) or a plain `f32` sum would erase.
+    /// Gradients one `f32` ulp away from coarse values keep that last bit:
+    /// a bin of such rows needs more than 24 significant bits, which a
+    /// `float` accumulator would drop.
     #[test]
-    fn two_sum_is_exact() {
+    fn near_identical_gradients_keep_their_low_bits() {
         if !context() {
             return;
         }
@@ -1810,20 +1780,22 @@ mod tests {
         );
     }
 
-    /// Renormalization: at the edge of the exactness domain (bin sums near
-    /// `2^45` grains), a large gradient just below `2^29` with an odd small
-    /// one every eleventh row must keep every low bit through 1,024-row
-    /// slices and the 64-way merge. The unrenormalized double-float lost
-    /// them (modeled on the CPU, both bins came out 5 low).
+    /// At the exactness bound (`n * max = 2^53` grains) the GPU still takes
+    /// the node and keeps every low bit: each bin sums to about `2^52`, with
+    /// odd small gradients mixed in, so it needs all 53 bits of an `f64`.
+    /// One more row and the node goes to the CPU.
     #[test]
     fn hist_is_exact_at_the_domain_edge() {
         if !context() {
             return;
         }
-        let n = CHUNK_ROWS;
-        let gpair: Vec<GradPair> = (0..n)
-            .map(|i| GradPair::new(if i % 11 == 0 { 1975.0 } else { 535_449_824.0 }, 1.0))
-            .collect();
+        let grad = |i: usize| match i {
+            1 => 2f32.powi(37),
+            i if i % 11 == 0 => 1975.0,
+            _ => 2f32.powi(37) - 2f32.powi(13),
+        };
+        let n = CHUNK_ROWS; // 2^16 rows of at most 2^37
+        let gpair: Vec<GradPair> = (0..n).map(|i| GradPair::new(grad(i), 1.0)).collect();
         let index = one_feature(n, 2);
         let backend = MetalHistBackend::new(&index).unwrap();
         let rows: Vec<u32> = (0..n as u32).collect();
@@ -1831,11 +1803,21 @@ mod tests {
             gpu_hist(&backend, &index, &rows, &gpair),
             cpu_hist(&index, &rows, &gpair)
         );
+        let gpair: Vec<GradPair> = (0..=n).map(|i| GradPair::new(grad(i), 1.0)).collect();
+        let index = one_feature(n + 1, 2);
+        let backend = MetalHistBackend::new(&index).unwrap();
+        let rows: Vec<u32> = (0..=n as u32).collect();
+        backend.prepare(&index, &gpair);
+        let mut out = vec![GradStats::default(); index.total_bins()];
+        assert!(!backend.try_gpu(&index, &rows, &gpair, &mut out));
+        HistogramBackend::build(&backend, &index, &rows, &gpair, &mut out);
+        assert_eq!(out, cpu_hist(&index, &rows, &gpair));
     }
 
-    /// Outside the exactness domain the backend runs the CPU path: the
-    /// review's six gradients per 128-row slice sum to +64 and -64 on the
-    /// CPU, which the old double-float returned as 0 and 0.
+    /// Outside the exactness bound the backend runs the CPU path: the
+    /// review's six gradients (up to `2^50`, grain 1) allow at most 8 rows
+    /// per node. The CPU sums the bins to +64 and -64; the old double-float
+    /// kernels returned 0 and 0.
     #[test]
     fn out_of_domain_nodes_run_on_the_cpu() {
         if !context() {
@@ -1927,12 +1909,9 @@ mod tests {
         let data = crate::data::DMatrix::from_dense(&x, n, cols).unwrap();
         let cuts = HistCuts::from_dmatrix(&data, 64);
         let index = GHistIndex::from_dmatrix(&data, cuts);
-        // Gradients on a 2^-20 grid: sums need more than an `f32`'s 24 bits
-        // but stay inside the exactness domain.
         let gpair: Vec<GradPair> = (0..n)
             .map(|i| GradPair {
-                grad: (((i as i32 % 11) as f32 - 5.0).powi(3) * 0.01 * 2f32.powi(20)).round()
-                    * 2f32.powi(-20),
+                grad: ((i as i32 % 11) as f32 - 5.0).powi(3) * 0.01,
                 hess: ((i % 3) as f32 + 1.0).powi(2),
             })
             .collect();

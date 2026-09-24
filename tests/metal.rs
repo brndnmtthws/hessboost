@@ -144,40 +144,27 @@ fn device_metal_refuses_unsupported_combinations() {
         .device(Device::Metal)
         .build()
         .unwrap();
+    let with = |change: fn(&mut TrainingParams)| {
+        let mut params = base.clone();
+        change(&mut params);
+        params
+    };
     let variants: Vec<(TrainingParams, &str)> = vec![
         (
-            TrainingParams {
-                tree_method: TreeMethod::Approx,
-                ..base.clone()
-            },
+            with(|p| p.tree_method = TreeMethod::Approx),
             "tree_method=approx",
         ),
         (
-            TrainingParams {
-                tree_method: TreeMethod::Exact,
-                ..base.clone()
-            },
+            with(|p| p.tree_method = TreeMethod::Exact),
             "tree_method=exact",
         ),
+        (with(|p| p.use_quantized_grad = true), "use_quantized_grad"),
         (
-            TrainingParams {
-                use_quantized_grad: true,
-                ..base.clone()
-            },
-            "use_quantized_grad",
-        ),
-        (
-            TrainingParams {
-                booster: BoosterKind::GbLinear,
-                ..base.clone()
-            },
+            with(|p| p.booster = BoosterKind::GbLinear),
             "booster=gblinear",
         ),
         (
-            TrainingParams {
-                process_type: ProcessType::Update,
-                ..base.clone()
-            },
+            with(|p| p.process_type = ProcessType::Update),
             "process_type=update",
         ),
     ];
@@ -289,8 +276,9 @@ fn to_gpu_refuses_unsupported_models() {
 /// The review's dynamic-range case: in every 128-row slice the first 64
 /// rows (bin 0) carry `2^50, 2^26, 2^23 + 1, -2^50, -2^26, -2^23` then zeros
 /// and the next 64 (bin 1) the negated sequence. The CPU's `f64` chain sums
-/// the bins to +64 and -64; a double-float of `f32`s cannot hold the 51
-/// bits, so the backend must take its CPU path.
+/// the bins to +64 and -64 (the first double-float kernels returned 0 and
+/// 0). Values up to `2^50` with a grain of 1 are exact on the GPU for at
+/// most 8 rows per node, so the backend must take its CPU path.
 fn dynamic_range_case() -> (Vec<f32>, Vec<f32>) {
     let six = [
         2f32.powi(50),
@@ -339,8 +327,8 @@ fn index_of(x: &[f32]) -> hessboost::internals::GHistIndex {
     hessboost::internals::GHistIndex::from_dmatrix(&data, cuts)
 }
 
-/// Gradients outside the double-float's exactness domain give the CPU's
-/// histogram bit for bit (the GPU kernels alone returned 0 and 0).
+/// Gradients outside the GPU's exactness bound give the CPU's histogram
+/// bit for bit.
 #[test]
 fn wide_dynamic_range_histogram_matches_cpu() {
     if !device() {

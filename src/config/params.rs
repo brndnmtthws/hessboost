@@ -908,6 +908,18 @@ impl ObjectiveParams {
         }
     }
 
+    /// [`Self::from_params`] for a model that records `objective`, which
+    /// may differ from `p.objective` (an objective passed to
+    /// [`Trainer::objective`](crate::training::Trainer::objective), or a
+    /// continued model's): the distribution family follows the recorded
+    /// objective, as loading requires.
+    pub(crate) fn for_objective(p: &TrainingParams, objective: &str) -> Self {
+        ObjectiveParams {
+            distribution: crate::objective::distributional::DistFamily::from_objective(objective),
+            ..Self::from_params(p)
+        }
+    }
+
     /// XGBoost's defaults for `objective` (e.g. `max_delta_step = 0.7` for
     /// `count:poisson`).
     pub fn defaults_for(objective: &str) -> Self {

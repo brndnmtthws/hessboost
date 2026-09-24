@@ -587,7 +587,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     // A built-in objective passed to `Trainer::objective` is recorded by
     // name with `params`' objective settings; refuse settings that would not
     // rebuild it, since the saved model could not be loaded again.
-    let objective_params = ObjectiveParams::from_params(params);
+    let objective_params = ObjectiveParams::for_objective(params, objective.name());
     check_objective_width(
         objective.name(),
         &objective_params,
@@ -897,7 +897,7 @@ pub(crate) fn new_model(
         base_margins,
         ModelSpec {
             objective: objective.name().to_string(),
-            objective_params: ObjectiveParams::from_params(params),
+            objective_params: ObjectiveParams::for_objective(params, objective.name()),
             num_class: params.num_class,
             n_outputs: objective.n_outputs(),
             n_targets: dtrain.n_targets(),
@@ -1584,6 +1584,38 @@ mod tests {
             train(&params, &d, 5),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "grow_policy"
         ));
+    }
+
+    #[test]
+    fn objective_override_records_its_own_distribution() {
+        // `params` name a `dist:*` objective, but `Trainer::objective`
+        // boosts squared error: the model's objective metadata must follow
+        // the objective it records, or loading refuses it.
+        let x: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..24).map(|i| (i % 5) as f32).collect();
+        let d = labeled_dense(&x, 24, 1, &y);
+        let params = TrainingParams::builder()
+            .objective("dist:normal")
+            .build()
+            .unwrap();
+        let squared = crate::objective::SquaredError;
+        let model = Trainer::new(&params, &d, 3)
+            .objective(&squared)
+            .train()
+            .unwrap()
+            .model;
+        assert_eq!(model.objective(), "reg:squarederror");
+        assert_eq!(model.objective_params().distribution, None);
+        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        // Continued training records the initial model's objective too.
+        let more = Trainer::new(&params, &d, 2)
+            .objective(&squared)
+            .init_model(&model)
+            .train()
+            .unwrap()
+            .model;
+        assert_eq!(more.objective_params().distribution, None);
+        assert_eq!(more.num_boost_rounds(), 5);
     }
 
     #[test]

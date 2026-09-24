@@ -473,6 +473,47 @@ relative tolerances between `1e-12` and `3e-12` for their finite test datasets.
 Split tests check candidate order and the sequential gain epsilon. These are
 test tolerances, not universal error bounds for arbitrary inputs.
 
+## Metal GPU (macOS)
+
+The `metal` feature adds a native Metal backend (see `src/backend/metal.rs`
+for its design, determinism contract, and limitations). Measured on **Apple
+M4 Max** (40-core GPU, 14 performance+efficiency CPU cores, macOS 26.6.2,
+Rust 1.98.1, 2026-09-24), `cargo bench --features metal --bench training --
+metal` and `cargo run --release --features metal --example metal`:
+
+| Workload | CPU | Metal | Speedup |
+|---|---|---|---|
+| predict, 500k rows × 30 features, 200 depth-8 trees | 31.0 ms | 12.6 ms | **2.5×** |
+| predict, 500k rows × 30 features, 100 depth-6 trees | 12.4 ms | 6–11 ms (thermal-sensitive) | ~1.1–1.8× |
+| hist build, 1M rows × 30 features (root node) | 2.0 ms | 11.2 ms | 0.18× |
+| train, 200k × 30, depth 8, 50 rounds | 278 ms | 501 ms | 0.56× |
+
+GPU **prediction** is the speed path: the per-row walk is independent, the
+compact forest stays L2-resident, and the fixed per-call row upload
+amortizes as batches and ensembles grow (the 200-tree example measures
+2.5×; larger models widen the gap).
+
+GPU **histogram construction** (`device = metal`) is currently slower than
+the 14-core CPU path. The cause is structural, not incidental: the
+determinism contract (bit-identical to single-threaded CPU training, no
+floating-point atomics) plus Apple GPUs' lack of `double` forces an exact
+double-float (two-sum) accumulation at roughly six times the arithmetic of
+the CPU's native `f64` adds, and the single-writer-per-bin layout routes
+row/column/gradient loads through the GPU's scalar path. Wider feature
+blocks and cooperative (threadgroup-memory) loading are the known tuning
+directions; measured attempts so far (wider blocks up to 1024 threads,
+interleaved `uint4` records) regressed.
+
+Run the Metal benches on a Mac with a Metal device:
+
+```sh
+cargo bench --features metal --bench training -- metal
+cargo run --release --features metal --example metal
+```
+
+Hosted macOS CI runners have no Metal device; the device-dependent tests
+skip there and run on real hardware.
+
 ## Reproduce the measurements
 
 The benchmark definitions live in

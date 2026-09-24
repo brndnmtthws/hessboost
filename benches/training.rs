@@ -545,6 +545,100 @@ fn bench_shap(c: &mut Criterion) {
     group.finish();
 }
 
+/// Metal GPU benches (`cargo bench --features metal` on a Mac with a Metal
+/// device): histogram construction, end-to-end training, and batch
+/// prediction, each against its CPU counterpart on identical data. The GPU
+/// results are bit-identical to the single-threaded CPU's, so the benches
+/// compare speed only.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn bench_metal(c: &mut Criterion) {
+    use hessboost::backend::metal;
+    use hessboost::backend::metal::MetalHistBackend;
+    use hessboost::config::Device;
+
+    if let Some(reason) = metal::unavailable_reason() {
+        eprintln!("skipping metal benches: {reason}");
+        return;
+    }
+    // Histogram construction at the sizes where the GPU pays off.
+    {
+        let mut group = c.benchmark_group("metal_histogram_build");
+        group.sample_size(10);
+        for &n in &[100_000usize, 1_000_000] {
+            let data = make_data(n, 30);
+            let cuts = HistCuts::from_dmatrix(&data, 256);
+            let ghist = GHistIndex::from_dmatrix(&data, cuts);
+            let gpair: Vec<GradPair> = (0..n)
+                .map(|i| GradPair::new((i % 7) as f32 - 3.0, 1.0))
+                .collect();
+            let rows: Vec<u32> = (0..n as u32).collect();
+            let gpu = MetalHistBackend::new(&ghist).unwrap();
+            let mut cpu_out = zeroed(ghist.total_bins());
+            let mut gpu_out = zeroed(ghist.total_bins());
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(BenchmarkId::new("cpu", n), &n, |b, _| {
+                b.iter(|| CpuBackend.build(&ghist, &rows, &gpair, &mut cpu_out));
+            });
+            group.bench_with_input(BenchmarkId::new("metal", n), &n, |b, _| {
+                b.iter(|| gpu.build(&ghist, &rows, &gpair, &mut gpu_out));
+            });
+        }
+        group.finish();
+    }
+    // End-to-end training: identical parameters, CPU against GPU histograms.
+    {
+        let data = make_data(200_000, 30);
+        let mut group = c.benchmark_group("metal_train_200k_x30_50rounds_depth8");
+        group.sample_size(10);
+        for (name, device) in [("cpu", Device::Cpu), ("metal", Device::Metal)] {
+            let params = TrainingParams::builder()
+                .objective("reg:squarederror")
+                .tree_method(TreeMethod::Hist)
+                .max_depth(8)
+                .eta(0.1)
+                .device(device)
+                .build()
+                .unwrap();
+            group.bench_function(name, |b| {
+                b.iter(|| black_box(train(&params, &data, 50).unwrap()));
+            });
+        }
+        group.finish();
+    }
+    // Batch prediction: the compact-forest walk against the GPU walk.
+    {
+        let model_data = make_data(100_000, 30);
+        let params = TrainingParams::builder()
+            .objective("reg:squarederror")
+            .tree_method(TreeMethod::Hist)
+            .max_depth(6)
+            .eta(0.1)
+            .build()
+            .unwrap();
+        let model = train(&params, &model_data, 100).unwrap();
+        let gpu = model.to_gpu().unwrap();
+        let data = make_data(500_000, 30);
+        let mut group = c.benchmark_group("metal_predict_500k_x30_100trees_depth6");
+        group.sample_size(10);
+        group.throughput(Throughput::Elements(data.n_rows() as u64));
+        group.bench_function("cpu", |b| {
+            b.iter(|| model.predict_margin(black_box(&data)).unwrap());
+        });
+        group.bench_function("metal", |b| {
+            b.iter(|| gpu.predict_margin(black_box(&data)).unwrap());
+        });
+        group.finish();
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn bench_metal_registered(c: &mut Criterion) {
+    bench_metal(c);
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+fn bench_metal_registered(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_histogram_build,
@@ -557,6 +651,7 @@ criterion_group!(
     bench_binary_train,
     bench_train,
     bench_predict,
-    bench_shap
+    bench_shap,
+    bench_metal_registered
 );
 criterion_main!(benches);

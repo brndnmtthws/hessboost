@@ -59,6 +59,10 @@ pub enum HessboostError {
     /// A model-format (native or XGBoost JSON/UBJSON) (de)serialization error.
     ModelFormat(String),
 
+    /// A GPU backend (Metal) failure: no device, a kernel compile or dispatch
+    /// error, or a resource limit.
+    Gpu(String),
+
     /// An underlying I/O error.
     Io(std::io::Error),
 
@@ -92,6 +96,7 @@ impl fmt::Display for HessboostError {
             Self::Unknown { kind, name } => write!(f, "unknown {kind} `{name}`"),
             Self::Parse { line, reason } => write!(f, "parse error at line {line}: {reason}"),
             Self::ModelFormat(msg) => write!(f, "model format error: {msg}"),
+            Self::Gpu(msg) => write!(f, "GPU backend error: {msg}"),
             Self::Io(e) => e.fmt(f),
             Self::Json(e) => e.fmt(f),
         }
@@ -141,6 +146,11 @@ impl HessboostError {
     /// Convenience constructor for [`HessboostError::ModelFormat`].
     pub fn model_format(msg: impl Into<String>) -> Self {
         HessboostError::ModelFormat(msg.into())
+    }
+
+    /// Convenience constructor for [`HessboostError::Gpu`].
+    pub fn gpu(msg: impl Into<String>) -> Self {
+        HessboostError::Gpu(msg.into())
     }
 
     /// A model document is missing the named field: ``missing `field` ``.

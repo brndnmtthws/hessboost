@@ -3,18 +3,18 @@
 //! for `gbtree` and DART, optionally growing its structure from reduced split
 //! gradients supplied by the objective ([`Objective::split_gradient`]).
 
-use super::sampling::gradient_based_sample;
 use super::train::{
     EvalSet, TrainContext, dart_new_tree_weight, finish_dart, for_each_row_margins,
     gradient_sampling, make_column_sampler, round_gradients, sample_rows, tree_eta,
 };
-use crate::config::{BoosterKind, MultiStrategy, TrainingParams, TreeMethod};
+use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, Objective, SplitGradient};
 use crate::rng::Rng;
+use crate::training::sampling::gradient_based_sample;
 use crate::tree::RegTree;
 use crate::tree::builder::{LeafRows, MultiTreeBuilder, VectorGradients};
 use crate::tree::constraints::MonotoneConstraints;
@@ -28,8 +28,9 @@ pub(super) fn vector_leaf(params: &TrainingParams, n_outputs: usize) -> bool {
 }
 
 /// Configuration checks for `multi_output_tree`: like XGBoost, vector-leaf
-/// trees are built by the histogram method only.
-pub(super) fn validate(params: &TrainingParams) -> Result<()> {
+/// trees are built by the histogram method only, and their builder keeps
+/// its own histogram loop, which no GPU backend accelerates.
+pub(super) fn validate(params: &TrainingParams, n_outputs: usize) -> Result<()> {
     if params.multi_strategy == MultiStrategy::MultiOutputTree
         && params.booster != BoosterKind::GbLinear
         && !matches!(params.tree_method, TreeMethod::Hist | TreeMethod::Auto)
@@ -37,6 +38,13 @@ pub(super) fn validate(params: &TrainingParams) -> Result<()> {
         return Err(HessboostError::invalid_param(
             "multi_strategy",
             "`multi_output_tree` requires `tree_method=hist` (or `auto`)",
+        ));
+    }
+    if vector_leaf(params, n_outputs) && params.device != Device::Cpu {
+        return Err(HessboostError::invalid_param(
+            "device",
+            "`metal` does not support `multi_strategy = multi_output_tree` \
+             (the vector-leaf builder has its own histogram loop)",
         ));
     }
     Ok(())

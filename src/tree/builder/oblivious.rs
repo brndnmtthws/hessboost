@@ -59,7 +59,7 @@ use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
 use crate::tree::gain::{GradStats, RegParams};
-use crate::tree::hist::{CpuBackend, Histogram, HistogramBackend, zeroed};
+use crate::tree::hist::{Histogram, HistogramBackend, zeroed};
 use crate::tree::sampler::ColumnSampler;
 use crate::tree::{ChildLeaf, RegTree, SplitRule};
 use rayon::prelude::*;
@@ -149,17 +149,17 @@ pub(super) struct SymmetricTreeBuilder<'a> {
     reg: RegParams,
     cons: MonotoneConstraints,
     interaction_sets: Option<Vec<Vec<u32>>>,
-    backend: CpuBackend,
+    backend: &'a dyn HistogramBackend,
 }
 
 impl<'a> SymmetricTreeBuilder<'a> {
-    pub(super) fn new(params: &'a TrainingParams) -> Self {
+    pub(super) fn new(params: &'a TrainingParams, backend: &'a dyn HistogramBackend) -> Self {
         SymmetricTreeBuilder {
             params,
             reg: RegParams::from_params(params),
             cons: MonotoneConstraints::from_params(&params.monotone_constraints),
             interaction_sets: build_interaction_sets(&params.interaction_constraints),
-            backend: CpuBackend,
+            backend,
         }
     }
 
@@ -173,6 +173,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
+        self.backend.prepare(ghist, gpair);
         let root_stats = sum_rows(gpair, row_subset);
         let mut root_hist = zeroed(ghist.total_bins());
         self.backend.build(ghist, row_subset, gpair, &mut root_hist);

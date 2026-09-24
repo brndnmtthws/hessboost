@@ -3,7 +3,9 @@
 //! A faithful, fast Rust reimplementation of
 //! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting. Its only C
 //! dependency is the official zstd library, which compresses native model
-//! files.
+//! files; the opt-in `metal` feature additionally binds Apple's Metal
+//! framework for GPU prediction and (bit-identical) GPU histograms on
+//! macOS.
 //!
 //! ## Quick start
 //!
@@ -130,11 +132,16 @@
 //!     predict a full conditional distribution per row
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
 //!     [`objective::distributional`]), scored by `nll` / `crps`.
+//!   - GPU acceleration on macOS through native Metal (`metal` feature):
+//!     bit-identical GPU prediction ([`to_gpu`](model::BoostedModel::to_gpu),
+//!     roughly 2.5x faster at scale) and bit-identical GPU histogram
+//!     training ([`device`](config::TrainingParams::device) = `metal`; see
+//!     [`backend`] for what each path does today).
 //!
 //! Runnable examples live in the crate's `examples/` directory (e.g.
 //! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`). Run one with
+//! `distributional`, `metal` (`--features metal`, macOS)). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -155,6 +162,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod backend;
 pub mod config;
 pub mod conformal;
 pub mod data;
@@ -168,7 +176,6 @@ mod simd;
 mod test_support;
 pub mod training;
 pub mod tree;
-
 /// `1e-6` in `f64` arithmetic, where the crate compares against XGBoost's
 /// `kRtEps` in double precision (the `f64` literal, not [`K_RT_EPS_F32`]
 /// widened).
@@ -176,7 +183,6 @@ pub(crate) const K_RT_EPS: f64 = 1e-6;
 /// XGBoost's `kRtEps` (`1e-6f`): the minimum gain improvement a split must
 /// beat, and the floor of sampling weights and near-zero sums.
 pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
-
 /// The train-and-predict workflow in one import: `use hessboost::prelude::*;`.
 ///
 /// Holds the data container, the parameters, the training entry points, the
@@ -189,7 +195,6 @@ pub mod prelude {
     pub use crate::model::BoostedModel;
     pub use crate::training::{Trainer, train};
 }
-
 /// Implementation details the crate's own benchmarks and parity tests
 /// drive directly (histogram construction, tree growth, quantile cuts). Not
 /// part of the public API: hidden from the docs and changed without notice.

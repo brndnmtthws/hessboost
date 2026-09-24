@@ -40,7 +40,8 @@ use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use distributional::{DistFamily, DistObjective};
 
-/// A first- and second-order gradient for one instance/output.
+/// A first- and second-order gradient for one instance/output: a fixed
+/// pair, built with [`GradPair::new`] or a struct literal.
 ///
 /// Stored as `f32` to match XGBoost's memory layout and to keep histogram
 /// accumulation cache-friendly.
@@ -68,14 +69,23 @@ impl GradPair {
 pub type PointwiseLoss<'a> = Box<dyn Fn(f32, f32) -> f64 + Send + Sync + 'a>;
 
 /// Reduced gradients a custom objective supplies for the *split search* of
-/// vector-leaf trees (see [`Objective::split_gradient`]).
+/// vector-leaf trees (see [`Objective::split_gradient`]). Build with
+/// [`SplitGradient::new`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SplitGradient {
     /// Row-major `[row][target]` gradient pairs, `n_targets` per row.
     pub gpair: Vec<GradPair>,
     /// Split targets per row (at least `1`; usually far fewer than the
     /// model's outputs).
     pub n_targets: usize,
+}
+
+impl SplitGradient {
+    /// Row-major `[row][target]` gradient pairs with `n_targets` per row.
+    pub fn new(gpair: Vec<GradPair>, n_targets: usize) -> Self {
+        SplitGradient { gpair, n_targets }
+    }
 }
 
 /// Rows per parallel gradient chunk. A multiple of every vector kernel's block
@@ -196,6 +206,13 @@ fn gradient_pairs(
     out
 }
 
+/// The intercepts `objective.base_margins_info` estimates from single-target
+/// labels and weights.
+#[cfg(test)]
+fn base_margins(objective: &dyn Objective, labels: &[f32], weights: Option<&[f32]>) -> Vec<f32> {
+    objective.base_margins_info(&MetaInfo::new(labels, weights, None))
+}
+
 /// Debug-only shape check shared by every [`Objective::gradient`]: `preds` and
 /// `out` hold `n_rows * n_outputs` values while `labels` (and `weights`, when
 /// present) hold one per row. Release builds skip it; [`rowwise_gradient`]
@@ -278,34 +295,29 @@ pub trait Objective: Send + Sync {
     }
 
     /// Transform raw margins into reported predictions, in place. Default is the
-    /// identity (used by squared-error regression).
+    /// identity (used by squared-error regression). An objective whose
+    /// transform is an inverse link also overrides
+    /// [`Objective::probs_to_margins`] with the link, which the intercept
+    /// estimate and a user-supplied `base_score` go through.
     fn pred_transform(&self, _preds: &mut [f32]) {}
 
-    /// Estimate the per-output intercepts in *margin* space from the training
-    /// labels; used to initialize the model's `base_score` when the user does
-    /// not supply one. Returns exactly [`Objective::n_outputs`] values.
+    /// Estimate the per-output intercepts in *margin* space from a dataset's
+    /// full metadata view; the single hook training uses to initialize the
+    /// model's `base_score` when the user does not supply one. Returns
+    /// exactly [`Objective::n_outputs`] values. To estimate from bare
+    /// labels, weights, and groups, pass [`MetaInfo::new`].
     ///
     /// The default is XGBoost's `FitIntercept::InitEstimation`: one Newton
-    /// step from all-zero margins, `w_k = -Σg_k / max(Σh_k, 1e-6)` (sums in
-    /// `f64`, step rounded to `f32`), mapped through
-    /// [`Objective::pred_transform`] and back through
-    /// [`Objective::probs_to_margins`] to reproduce XGBoost's `f32` rounding.
-    /// Objectives whose optimal constant has a closed form (label mean, class
-    /// frequencies) override it.
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
-        newton_intercepts(self, &MetaInfo::new(labels, weights, group))
-    }
-
-    /// Estimate the per-output intercepts from a dataset's full metadata
-    /// view; the entry point training uses. The default forwards to
-    /// [`Objective::base_margins`].
+    /// step from all-zero margins over [`Objective::gradient_info`] on `info`
+    /// itself (so label bounds and label matrices reach the gradient),
+    /// `w_k = -Σg_k / max(Σh_k, 1e-6)` (sums in `f64`, step rounded to
+    /// `f32`), mapped through [`Objective::pred_transform`] and back through
+    /// [`Objective::probs_to_margins`] to reproduce XGBoost's `f32` rounding;
+    /// `NaN` intercepts (which training refuses) when `info`'s lengths are
+    /// inconsistent. Objectives whose optimal constant has a closed form
+    /// (label mean, class frequencies) override it.
     fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
-        self.base_margins(info.labels, info.weights, info.group)
+        newton_intercepts(self, info)
     }
 
     /// Transform raw margins into the values evaluation metrics receive
@@ -315,23 +327,14 @@ pub trait Objective: Send + Sync {
         self.pred_transform(preds);
     }
 
-    /// Convert a `base_score` given in prediction space into margin space via
-    /// the objective's inverse link, in `f32` like XGBoost's `ProbToMargin`.
-    /// Default is the identity; objectives with a link function (e.g.
-    /// logistic) override it.
-    fn prob_to_margin(&self, base_score: f32) -> f32 {
-        base_score
-    }
-
     /// Map one row of prediction-space intercepts (length
-    /// [`Objective::n_outputs`]) to margin space, in place (XGBoost
-    /// `ProbToMargin` on the base-score vector). Defaults to
-    /// [`Objective::prob_to_margin`] per entry.
-    fn probs_to_margins(&self, scores: &mut [f32]) {
-        for s in scores {
-            *s = self.prob_to_margin(*s);
-        }
-    }
+    /// [`Objective::n_outputs`]) to margin space, in place: XGBoost
+    /// `ProbToMargin` on the base-score vector, in `f32`. Training applies
+    /// it to a user-supplied `base_score`, XGBoost-model import to the
+    /// stored one, and the default [`Objective::base_margins_info`] to its
+    /// Newton step. Default is the identity; objectives with a link
+    /// function (e.g. the logit of `binary:logistic`) override it.
+    fn probs_to_margins(&self, _scores: &mut [f32]) {}
 
     /// Map one row of margin-space intercepts back to the prediction space
     /// XGBoost stores `base_score` in (the inverse of
@@ -403,11 +406,19 @@ pub trait Objective: Send + Sync {
 /// [`Objective::probs_to_margins`]. XGBoost (`FitIntercept::InitEstimation` +
 /// `tree::FitStump`) stores the intercept in prediction space and re-applies
 /// the link on use; taking the same round trip reproduces its `f32` rounding.
+/// `NaN` for every output when `info` fails [`MetaInfo::check_layout`] or
+/// the margin buffer would overflow, before anything is allocated.
 pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &MetaInfo) -> Vec<f32> {
     let k = objective.n_outputs();
-    let n = info.n_rows;
-    let zeros = vec![0.0f32; n * k];
-    let mut gpair = vec![GradPair::default(); n * k];
+    let Some(len) = info
+        .n_rows
+        .checked_mul(k)
+        .filter(|_| info.check_layout().is_ok())
+    else {
+        return vec![f32::NAN; k];
+    };
+    let zeros = vec![0.0f32; len];
+    let mut gpair = vec![GradPair::default(); len];
     objective.gradient_info(&zeros, info, &mut gpair);
     let mut out = fit_stump(&gpair, k);
     objective.pred_transform(&mut out);
@@ -432,6 +443,14 @@ pub(crate) fn fit_stump(gpair: &[GradPair], k: usize) -> Vec<f32> {
         .zip(&sum_hess)
         .map(|(g, h)| (-g / h.max(crate::K_RT_EPS)) as f32)
         .collect()
+}
+
+/// The log link's [`Objective::probs_to_margins`] (XGBoost `ProbToMargin`
+/// of the log-link objectives): `ln(v)` of every entry, in `f32`.
+pub(crate) fn log_link(scores: &mut [f32]) {
+    for s in scores {
+        *s = s.ln();
+    }
 }
 
 /// Shared [`Objective::validate_info`] label-domain check: reject the dataset
@@ -605,14 +624,56 @@ mod tests {
     fn default_base_margins_is_newton_step_through_link() {
         let obj = Logistic::new(2.0);
         let labels = [1.0f32, 0.0, 0.0, 0.0];
-        let margins = obj.base_margins(&labels, None, None);
+        let margins = base_margins(&obj, &labels, None);
         assert_eq!(margins.len(), 1);
         // g = -0.5*2 + 3*0.5 = 0.5, h = 0.25*(2 + 3) = 1.25 -> w = -0.4.
         let mut through_link = [-0.4f32];
         obj.pred_transform(&mut through_link);
-        let expected = obj.prob_to_margin(through_link[0]);
-        assert_eq!(margins[0], expected);
+        obj.probs_to_margins(&mut through_link);
+        assert_eq!(margins[0], through_link[0]);
         assert!((margins[0] + 0.4).abs() < 1e-6, "got {}", margins[0]);
+    }
+
+    /// An objective that learns from label bounds through `gradient_info`
+    /// only: the default `base_margins_info` must take its Newton step on
+    /// the dataset's own metadata (it once rebuilt label-only metadata, so
+    /// the gradient saw no bounds), and give NaN, not a panic, for a
+    /// `n_targets` the lengths do not match.
+    #[test]
+    fn default_intercept_reads_the_original_metadata() {
+        struct Midpoint;
+        impl Objective for Midpoint {
+            fn name(&self) -> &'static str {
+                "test:midpoint"
+            }
+            fn gradient(&self, _: &[f32], _: &[f32], _: Option<&[f32]>, out: &mut [GradPair]) {
+                out.fill(GradPair::new(f32::NAN, 1.0));
+            }
+            fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
+                let (Some(lo), Some(hi)) = (info.label_lower_bound, info.label_upper_bound) else {
+                    return self.gradient(preds, info.labels, info.weights, out);
+                };
+                for (i, g) in out.iter_mut().enumerate() {
+                    *g = GradPair::new(preds[i] - f32::midpoint(lo[i], hi[i]), 1.0);
+                }
+            }
+            fn default_metric(&self) -> String {
+                "rmse".to_string()
+            }
+        }
+        let (lower, upper) = ([0.0f32, 4.0], [2.0f32, 6.0]);
+        let info = MetaInfo {
+            n_rows: 2,
+            label_lower_bound: Some(&lower),
+            label_upper_bound: Some(&upper),
+            ..MetaInfo::new(&[], None, None)
+        };
+        assert_eq!(Midpoint.base_margins_info(&info), vec![3.0]);
+        let inconsistent = MetaInfo {
+            n_targets: usize::MAX,
+            ..info
+        };
+        assert!(Midpoint.base_margins_info(&inconsistent)[0].is_nan());
     }
 
     #[test]

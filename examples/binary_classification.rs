@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     let probs = model.predict(&dvalid)?; // probabilities in [0, 1]
     let classes = model.predict_class(&dvalid)?; // hard 0/1 labels
     let acc = accuracy(&classes, dvalid.labels().unwrap());
-    let auc = Auc.eval(&probs, dvalid.labels().unwrap(), None);
+    let auc = Auc::default().eval(&probs, dvalid.labels().unwrap(), None);
     println!("valid accuracy {acc:.3}, AUC {auc:.3}");
     Ok(())
 }

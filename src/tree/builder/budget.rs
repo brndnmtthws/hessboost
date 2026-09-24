@@ -33,6 +33,7 @@
 
 use super::hist::rayon_available;
 use crate::data::ghist::{Bins, GHistIndex};
+use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::hist::feature_slices;
 use crate::tree::{ChildLeaf, RegTree, SplitRule};
@@ -53,6 +54,9 @@ pub(crate) const GENERALIZATION_THRESHOLD_RELAXED: f64 = 0.99;
 pub(crate) const MAX_NODES: usize = 10_000;
 /// Rows below which a node's histogram and loss update run serially.
 const PARALLEL_ROWS: usize = 4096;
+/// Rows up to which a root without an acceptable split falls back to
+/// [`NodeCtx::evaluate_tiny_root`] (Perpetual's small-data fallback).
+const TINY_ROOT_ROWS: usize = 8;
 /// Upper bounds (rounded up) of the largest factor [`ranking_gain`] applies
 /// to a split's gain: `1.05^0.1` for numeric and `1.12^0.3` for categorical
 /// splits (every other factor is at most `1`).
@@ -142,6 +146,12 @@ fn leaf_value(grad: f64, hess: f64, cfg: &GrowConfig) -> f32 {
         w = w.clamp(-cfg.max_delta_step, cfg.max_delta_step);
     }
     cfg.eta * w as f32
+}
+
+/// Whether a node with totals `t` stores a finite `f32` Hessian sum and leaf
+/// value.
+fn representable_node(t: &Totals, cfg: &GrowConfig) -> bool {
+    (t.hess as f32).is_finite() && leaf_value(t.grad, t.hess, cfg).is_finite()
 }
 
 /// Score `G²/(H + ε)`, written as `−(2 G w + (H + ε) w²)` at the Newton weight
@@ -239,17 +249,32 @@ struct Candidate {
 }
 
 /// What the split search needs to know about the node being split.
-struct NodeCtx {
+struct NodeCtx<'a> {
     is_root: bool,
     depth: usize,
     count: usize,
     gain: f64,
     stats: FoldStats,
+    /// The tree's leaf settings, for the leaf values a split would store.
+    cfg: &'a GrowConfig<'a>,
 }
 
-impl NodeCtx {
+impl NodeCtx<'_> {
+    /// Whether every statistic a split with gain `split_gain` and children
+    /// `children` stores in the tree (the gain, each child's Hessian sum and
+    /// leaf value) is a finite `f32`. Saved models refuse non-finite ones, so
+    /// such a split is skipped, as the other builders skip numeric candidates
+    /// whose `f32` gain overflows.
+    fn representable(&self, split_gain: f64, children: [&Totals; 2]) -> bool {
+        (split_gain as f32).is_finite()
+            && children
+                .into_iter()
+                .all(|t| representable_node(t, self.cfg))
+    }
+
     /// Score the partition `left`/`right` of this node; `None` when it fails
-    /// the fold-coverage or generalization checks or has no positive gain.
+    /// the fold-coverage or generalization checks, has no positive gain, or
+    /// is not [representable](Self::representable).
     /// Partitions whose best possible rank (their gain times the largest
     /// ranking factor) cannot beat `rank_to_beat` are skipped before the
     /// fold evaluation; this only saves work, the chosen split is unchanged.
@@ -273,7 +298,9 @@ impl NodeCtx {
         } else {
             MAX_NUMERIC_RANK_FACTOR
         };
-        if split_gain * max_factor <= rank_to_beat {
+        // After the rank bound, which is cheaper: the incumbent `best` is
+        // representable, so the order of the two checks does not matter.
+        if split_gain * max_factor <= rank_to_beat || !self.representable(split_gain, [&lt, &rt]) {
             return None;
         }
         let mut train = [0.0; N_FOLDS];
@@ -333,15 +360,16 @@ impl NodeCtx {
         })
     }
 
-    /// Perpetual's fallback for a root of at most eight rows, where the fold
-    /// check cannot pass: plain positive-gain splits, generalization `1`.
+    /// Perpetual's fallback for a root of at most [`TINY_ROOT_ROWS`] rows,
+    /// where the fold check cannot pass: plain positive-gain splits over the
+    /// same partitions (generalization `1`).
     fn evaluate_tiny_root(&self, left: &FoldStats, right: &FoldStats) -> Option<Scored> {
         let (lt, rt) = (left.totals(), right.totals());
         if lt.count == 0 || rt.count == 0 || lt.hess <= 0.0 || rt.hess <= 0.0 {
             return None;
         }
         let split_gain = score(lt.grad, lt.hess) + score(rt.grad, rt.hess) - self.gain;
-        (split_gain > 0.0).then(|| Scored {
+        (split_gain > 0.0 && self.representable(split_gain, [&lt, &rt])).then(|| Scored {
             rank: split_gain,
             split_gain,
             generalization: 1.0,
@@ -450,7 +478,10 @@ impl Ord for Frontier {
 }
 
 /// Grow one tree from this round's gradients over all rows of `ghist`.
-pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> GrownTree {
+///
+/// Fails when the root's Hessian sum or leaf value overflows `f32` (extreme
+/// labels or sample weights): no tree over these rows can be stored.
+pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> Result<GrownTree> {
     let n = ghist.n_rows();
     let mut index: Vec<u32> = (0..n as u32).collect();
     let mut root_stats = FoldStats::default();
@@ -458,6 +489,12 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
         root_stats.add_row(r, gpair[r as usize]);
     }
     let root_totals = root_stats.totals();
+    if !representable_node(&root_totals, cfg) {
+        return Err(HessboostError::model_format(
+            "training produced an invalid model: the root's Hessian sum or leaf value \
+             is not a finite f32 (extreme labels or sample weights)",
+        ));
+    }
     let mut tree = RegTree::with_root(root_totals.hess as f32);
     tree.set_leaf_value(0, leaf_value(root_totals.grad, root_totals.hess, cfg));
 
@@ -496,6 +533,7 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
             count: node.end - node.start,
             gain: node.gain,
             stats: node.stats,
+            cfg,
         };
         let rows = &index[node.start..node.end];
         let hist = build_histogram(ghist, rows, gpair);
@@ -572,13 +610,13 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
     }
     leaves.extend(heap.into_iter().map(|f| (f.nid, f.start, f.end)));
 
-    GrownTree {
+    Ok(GrownTree {
         tree,
         stopper,
         children,
         index,
         leaves,
-    }
+    })
 }
 
 /// Recompute the loss decrement of `rows` now that their leaf value is
@@ -689,106 +727,129 @@ fn find_split(ghist: &GHistIndex, hist: &[FoldStats], ctx: &NodeCtx) -> Option<C
     best
 }
 
-/// Best acceptable split on feature `f`.
+/// Best acceptable split on feature `f`: the fold-checked
+/// [`NodeCtx::evaluate`], or for a small root where it accepts nothing,
+/// [`NodeCtx::evaluate_tiny_root`], over the same partitions.
 fn feature_split(
     ghist: &GHistIndex,
     hist: &[FoldStats],
     ctx: &NodeCtx,
     f: usize,
 ) -> Option<Candidate> {
-    let cuts = ghist.cuts();
-    let (fs, fe) = cuts.feature_bins(f);
-    let categorical = cuts.is_categorical(f);
-    let bins = &hist[fs..fe];
-    let mut present = FoldStats::default();
-    for b in bins {
-        present.add(b);
-    }
-    let missing = ctx.stats.sub(&present);
-    let has_missing = missing.totals().count > 0;
-
-    // Scan order: numeric bins ascending; categorical bins (non-empty only)
-    // ascending by `G/(H + ε)` over all folds, as Perpetual sorts categories.
-    let mut order: Vec<usize> = (0..bins.len())
-        .filter(|&b| !categorical || bins[b].totals().count > 0)
-        .collect();
-    if categorical {
-        let ratio = |b: usize| {
-            let t = bins[b].totals();
-            t.grad / (t.hess + HESSIAN_EPS)
-        };
-        order.sort_by(|&a, &b| ratio(a).total_cmp(&ratio(b)).then(a.cmp(&b)));
-    }
-
-    let feature = f as u32;
-    let mut best: Option<Candidate> = None;
-    let mut left = FoldStats::default();
-    for (pos, &b) in order.iter().enumerate() {
-        left.add(&bins[b]);
-        let last = pos + 1 == order.len();
-        // Empty numeric bins repeat the previous partition.
-        if (!categorical && bins[b].count.iter().all(|&c| c == 0)) || (last && !has_missing) {
-            continue;
-        }
-        let right = present.sub(&left);
-        let cat_bins = || {
-            if categorical {
-                order[..=pos].iter().map(|&k| fs + k).collect()
-            } else {
-                Vec::new()
-            }
-        };
-        let make = |l: FoldStats, r: FoldStats, default_left: bool| {
-            move |scored| Candidate {
-                scored,
-                left: l,
-                right: r,
-                feature,
-                split_bin: fs + b,
-                cat_bins: cat_bins(),
-                default_left,
-            }
-        };
-        // Missing rows right (the only option without missing values).
-        let rank_to_beat =
-            |best: &Option<Candidate>| best.as_ref().map_or(f64::NEG_INFINITY, |c| c.scored.rank);
-        let mut missing_right = right;
-        missing_right.add(&missing);
-        if let Some(s) = ctx.evaluate(&left, &missing_right, categorical, rank_to_beat(&best)) {
-            offer(&mut best, s, make(left, missing_right, false));
-        }
-        if has_missing && !last {
-            let mut missing_left = left;
-            missing_left.add(&missing);
-            if let Some(s) = ctx.evaluate(&missing_left, &right, categorical, rank_to_beat(&best)) {
-                offer(&mut best, s, make(missing_left, right, true));
-            }
-        }
-    }
-
-    if best.is_none() && ctx.is_root && !categorical && ctx.count <= 8 {
-        let mut left = FoldStats::default();
-        for (b, stats) in bins.iter().enumerate() {
-            left.add(stats);
-            if stats.totals().count == 0 || b + 1 == bins.len() {
-                continue;
-            }
-            let mut right = present.sub(&left);
-            right.add(&missing);
-            if let Some(s) = ctx.evaluate_tiny_root(&left, &right) {
-                offer(&mut best, s, |scored| Candidate {
-                    scored,
-                    left,
-                    right,
-                    feature,
-                    split_bin: fs + b,
-                    cat_bins: Vec::new(),
-                    default_left: false,
-                });
-            }
-        }
+    let scan = FeatureScan::new(ghist, hist, ctx, f);
+    let categorical = scan.categorical;
+    let best =
+        scan.best(|left, right, rank_to_beat| ctx.evaluate(left, right, categorical, rank_to_beat));
+    if best.is_none() && ctx.is_root && ctx.count <= TINY_ROOT_ROWS {
+        return scan.best(|left, right, _| ctx.evaluate_tiny_root(left, right));
     }
     best
+}
+
+/// The candidate partitions of one feature in a node.
+struct FeatureScan<'a> {
+    bins: &'a [FoldStats],
+    /// Scan order of `bins`: numeric bins ascending; categorical bins
+    /// (non-empty only) ascending by `G/(H + ε)` over all folds, as Perpetual
+    /// sorts categories.
+    order: Vec<usize>,
+    present: FoldStats,
+    missing: FoldStats,
+    /// Global index of `bins[0]`.
+    first_bin: usize,
+    feature: u32,
+    categorical: bool,
+}
+
+impl<'a> FeatureScan<'a> {
+    fn new(ghist: &GHistIndex, hist: &'a [FoldStats], ctx: &NodeCtx, f: usize) -> Self {
+        let cuts = ghist.cuts();
+        let (fs, fe) = cuts.feature_bins(f);
+        let categorical = cuts.is_categorical(f);
+        let bins = &hist[fs..fe];
+        let mut present = FoldStats::default();
+        for b in bins {
+            present.add(b);
+        }
+        let mut order: Vec<usize> = (0..bins.len())
+            .filter(|&b| !categorical || bins[b].totals().count > 0)
+            .collect();
+        if categorical {
+            let ratio = |b: usize| {
+                let t = bins[b].totals();
+                t.grad / (t.hess + HESSIAN_EPS)
+            };
+            order.sort_by(|&a, &b| ratio(a).total_cmp(&ratio(b)).then(a.cmp(&b)));
+        }
+        FeatureScan {
+            bins,
+            order,
+            present,
+            missing: ctx.stats.sub(&present),
+            first_bin: fs,
+            feature: f as u32,
+            categorical,
+        }
+    }
+
+    /// The highest-ranked partition `evaluate(left, right, rank_to_beat)`
+    /// scores (ties keep the earlier one). Every prefix of `order` goes left
+    /// with the missing rows right, and, when the node has missing rows, with
+    /// them left; the full prefix (present against missing values) only with
+    /// them right.
+    fn best(
+        &self,
+        evaluate: impl Fn(&FoldStats, &FoldStats, f64) -> Option<Scored>,
+    ) -> Option<Candidate> {
+        let (bins, order, categorical) = (self.bins, &self.order, self.categorical);
+        let has_missing = self.missing.totals().count > 0;
+        let mut best: Option<Candidate> = None;
+        let mut left = FoldStats::default();
+        for (pos, &b) in order.iter().enumerate() {
+            left.add(&bins[b]);
+            let last = pos + 1 == order.len();
+            // Empty numeric bins repeat the previous partition.
+            if (!categorical && bins[b].count.iter().all(|&c| c == 0)) || (last && !has_missing) {
+                continue;
+            }
+            let right = self.present.sub(&left);
+            let cat_bins = || {
+                if categorical {
+                    order[..=pos].iter().map(|&k| self.first_bin + k).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+            let make = |l: FoldStats, r: FoldStats, default_left: bool| {
+                move |scored| Candidate {
+                    scored,
+                    left: l,
+                    right: r,
+                    feature: self.feature,
+                    split_bin: self.first_bin + b,
+                    cat_bins: cat_bins(),
+                    default_left,
+                }
+            };
+            let rank_to_beat = |best: &Option<Candidate>| {
+                best.as_ref().map_or(f64::NEG_INFINITY, |c| c.scored.rank)
+            };
+            // Missing rows right (the only option without missing values).
+            let mut missing_right = right;
+            missing_right.add(&self.missing);
+            if let Some(s) = evaluate(&left, &missing_right, rank_to_beat(&best)) {
+                offer(&mut best, s, make(left, missing_right, false));
+            }
+            if has_missing && !last {
+                let mut missing_left = left;
+                missing_left.add(&self.missing);
+                if let Some(s) = evaluate(&missing_left, &right, rank_to_beat(&best)) {
+                    offer(&mut best, s, make(missing_left, right, true));
+                }
+            }
+        }
+        best
+    }
 }
 
 /// Stable in-place partition of a node's rows by the chosen split. Returns

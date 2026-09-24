@@ -151,9 +151,11 @@ const COUNT_HEAD_SDS: f64 = 12.0;
 /// Floor of the second-order statistic: the objectives' [`MIN_HESS`], widened.
 const MIN_CURVATURE: f64 = MIN_HESS as f64;
 
-/// A parametric distribution family for the `dist:*` objectives.
+/// A parametric distribution family for the `dist:*` objectives. More
+/// families may be added; [`DistFamily::ALL`] lists the current ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DistFamily {
     /// Normal `N(μ, σ²)`, margins `(μ, ln σ)` (`dist:normal`).
     Normal,
@@ -170,8 +172,8 @@ pub enum DistFamily {
 }
 
 impl DistFamily {
-    /// Every family.
-    pub const ALL: [DistFamily; 5] = [
+    /// Every family (a slice, so adding a family keeps its type).
+    pub const ALL: &'static [DistFamily] = &[
         DistFamily::Normal,
         DistFamily::LogNormal,
         DistFamily::Gamma,
@@ -181,7 +183,10 @@ impl DistFamily {
 
     /// The family of objective `name` (`"dist:normal"`, ...), if any.
     pub fn from_objective(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|f| f.objective_name() == name)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|f| f.objective_name() == name)
     }
 
     /// The objective name, e.g. `"dist:normal"`.
@@ -515,7 +520,12 @@ fn nb_size_mle(score: impl Fn(f64) -> f64) -> f64 {
 }
 
 /// A distribution predicted for one row, in its natural parameters.
+///
+/// One variant per [`DistFamily`], so it gains a variant with every new
+/// family: match the families you train (with a `_` arm), or read any
+/// distribution through [`Dist::family`] and [`Dist::params`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Dist {
     /// Normal `N(mu, sigma²)`.
     Normal {
@@ -818,7 +828,8 @@ impl Dist {
     }
 
     /// Smallest integer `k >= 0` with `cdf(k) >= p`: bracket from the normal
-    /// approximation by doubling steps, then bisect.
+    /// approximation by doubling steps, then bisect (to adjacent integers,
+    /// or adjacent floats where those are more than 1 apart).
     fn count_quantile(&self, p: f64) -> f64 {
         if p >= 1.0 {
             return f64::INFINITY;
@@ -850,9 +861,14 @@ impl Dist {
                 }
             }
         }
-        // Invariant: cdf(lo) < p <= cdf(hi) (cdf(-1) = 0).
+        // Invariant: cdf(lo) < p <= cdf(hi) (cdf(-1) = 0). Past 2^53 adjacent
+        // floats are more than 1 apart, so stop once no integer lies strictly
+        // between them.
         while hi - lo > 1.0 {
             let mid = f64::midpoint(lo, hi).floor();
+            if !(lo < mid && mid < hi) {
+                break;
+            }
             if self.cdf(mid) >= p {
                 hi = mid;
             } else {
@@ -1308,14 +1324,9 @@ impl Objective for DistObjective {
     }
 
     /// Maximum-likelihood fit of the marginal label distribution.
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
         self.family
-            .mle_margins(labels, weights)
+            .mle_margins(info.labels, info.weights)
             .into_iter()
             .map(|m| m as f32)
             .collect()

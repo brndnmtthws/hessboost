@@ -767,11 +767,9 @@ impl Case<'_> {
         r: &RefreshCase,
     ) -> Result<f64, String> {
         let fx = self.fx;
-        let params = TrainingParams {
-            process_type: ProcessType::Update,
-            refresh_leaf: r.refresh_leaf,
-            ..build_params(fx)?
-        };
+        let mut params = build_params(fx)?;
+        params.process_type = ProcessType::Update;
+        params.refresh_leaf = r.refresh_leaf;
         let data = self
             .dmatrix(&fx.x_train[..r.n_rows * fx.n_cols], r.n_rows)?
             .with_labels(&r.y)

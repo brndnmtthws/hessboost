@@ -59,12 +59,8 @@ impl Objective for Softmax {
         crate::simd::softmax_rows_inplace(preds, self.num_class);
     }
 
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+        let (labels, weights) = (info.labels, info.weights);
         // XGBoost `SoftmaxMultiClassObj::InitEstimation`, step for step in its
         // precision: class weight totals accumulated in f32 (`SmallHistogram`),
         // divided by the f64 weight sum (`VecScaDiv` multiplies by `1/Σw`),
@@ -106,6 +102,7 @@ impl Objective for Softmax {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::base_margins;
     use approx::assert_relative_eq;
 
     #[test]
@@ -143,7 +140,7 @@ mod tests {
     fn base_margins_are_centered_log_frequencies() {
         let obj = Softmax::new(3, true);
         let labels = [0.0f32, 0.0, 1.0, 2.0];
-        let m = obj.base_margins(&labels, None, None);
+        let m = base_margins(&obj, &labels, None);
         assert_eq!(m.len(), 3);
         assert!(m.iter().sum::<f32>().abs() < 1e-6);
         let expected_gap = (0.5f32 + 1e-6).ln() - (0.25f32 + 1e-6).ln();
@@ -151,7 +148,7 @@ mod tests {
         assert_eq!(m[1], m[2]);
         // Weight 2 on the class-1 row makes every class equally frequent.
         let w = [1.0f32, 1.0, 2.0, 2.0];
-        let uniform = obj.base_margins(&labels, Some(&w), None);
+        let uniform = base_margins(&obj, &labels, Some(&w));
         assert!(uniform.iter().all(|v| v.abs() < 1e-6), "{uniform:?}");
     }
 }

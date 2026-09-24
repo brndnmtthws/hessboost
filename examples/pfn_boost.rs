@@ -120,8 +120,8 @@ struct Score {
 
 fn score(p: &[f32], y: &[f32]) -> Score {
     Score {
-        logloss: LogLoss.eval(p, y, None),
-        auc: Auc.eval(p, y, None),
+        logloss: LogLoss::default().eval(p, y, None),
+        auc: Auc::default().eval(p, y, None),
     }
 }
 
@@ -186,7 +186,7 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
             .early_stopping_rounds(EARLY_STOPPING)
             .train()?
             .model;
-        let valid_loss = LogLoss.eval(&model.predict(&dvalid)?, valid.labels(), None);
+        let valid_loss = LogLoss::default().eval(&model.predict(&dvalid)?, valid.labels(), None);
         if best.as_ref().is_none_or(|(loss, ..)| valid_loss < *loss) {
             best = Some((valid_loss, s, c, model));
         }

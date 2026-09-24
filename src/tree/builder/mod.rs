@@ -376,11 +376,11 @@ impl SplitScorer<'_> {
         }
     }
 
-    /// Whether [`Self::approx_run`]'s error bound ([`APPROX_MARGIN`]) holds:
-    /// no monotone direction or bounds, no `alpha` (whose soft threshold can
-    /// cancel in the exact gain) or `max_delta_step`, and child Hessians plus
-    /// `lambda` bounded away from zero, so the optimal weight overflows `f32`
-    /// only where the approximation does.
+    /// Whether [`Self::approx_run`]'s error bound ([`APPROX_MARGIN`],
+    /// [`UNDERFLOW_MARGIN`]) holds: no monotone direction or bounds, no
+    /// `alpha` (whose soft threshold can cancel in the exact gain) or
+    /// `max_delta_step`, and `H + λ >= 1e-3` for every valid child (`H >=
+    /// min_child_weight`), so both scorers overflow only for large gains.
     #[inline]
     pub(super) fn approx_exact(&self) -> bool {
         let reg = self.reg;
@@ -395,14 +395,19 @@ impl SplitScorer<'_> {
 
     /// Whether the candidate `(left, right)` certainly cannot score a loss
     /// change above `incumbent` under [`Self::loss_chg`], decided without a
-    /// division: `G² / (H + λ)` per child bounds its exact gain within the
-    /// [`APPROX_MARGIN`] analysis, and the comparison is cross-multiplied.
-    /// `false` whenever [`Self::approx_exact`] does not hold or any value is
-    /// not finite, so a `true` never hides a winner.
+    /// division: `U = Σ G² / (H + λ)` bounds the exact loss change by
+    /// `U - root_gain` within the exact scorer's share of the
+    /// [`APPROX_MARGIN`] and [`UNDERFLOW_MARGIN`] analysis, and the
+    /// comparison is cross-multiplied. `false` whenever [`Self::approx_exact`]
+    /// does not hold or `U` overflows, so a `true` never hides a winner. (A
+    /// loss change that overflows or is NaN never replaces an incumbent from
+    /// the same or an earlier feature, so a `true` for it is harmless.)
     #[inline]
     pub(super) fn cannot_beat(&self, left: GradStats, right: GradStats, incumbent: f64) -> bool {
-        // The exact score is within `4ε(U + |root|)` of `U - root`
-        // ([`APPROX_MARGIN`]); `κ = 2^-19` is eight times that.
+        // The exact score is within `4ε(U + |root|) + (D_l + D_r + 2)τ` of
+        // `U - root` ([`APPROX_MARGIN`]); `κ = 2^-19` is eight times the
+        // relative part, and `UNDERFLOW_MARGIN · (D_l + D_r + 1)` over
+        // thirty times the absolute one.
         const KAPPA: f64 = 1.0 / 524_288.0;
         if !self.approx_exact() {
             return false;
@@ -413,10 +418,11 @@ impl SplitScorer<'_> {
             return false;
         }
         let root = f64::from(self.root_gain);
-        // The exact loss change is at most `U(1 + κ) - root + κ|root|`, `U`
-        // the real `Σ G² / (H + λ)`; it stays at most the incumbent while
-        // `U(1 + κ) < incumbent + root - κ(|root| + |incumbent|)`.
-        let bound = incumbent + root - KAPPA * (root.abs() + incumbent.abs()) - 1e-30;
+        // The exact loss change is at most `U(1 + κ) - root + κ|root| + a`,
+        // `a` the absolute allowance; it stays at most the incumbent while
+        // `U(1 + κ) < incumbent + root - κ(|root| + |incumbent|) - a`.
+        let absolute = UNDERFLOW_MARGIN * (hl + hr + 1.0);
+        let bound = incumbent + root - KAPPA * (root.abs() + incumbent.abs()) - absolute;
         let n = left.grad * left.grad * hr + right.grad * right.grad * hl;
         n * (1.0 + KAPPA) < bound * (hl * hr)
     }
@@ -670,14 +676,40 @@ const FILTER_BINS: usize = 256;
 const FILTER_RUN: usize = 16;
 
 /// Relative error allowance of [`SplitScorer::approx_run`] against
-/// [`SplitScorer::loss_chg`], per unit of `gain(left) + gain(right) +
-/// |root_gain|`. The exact score is within `4ε` of the real-valued loss
-/// change (its `f32` weight, two child gains, their sum and the parent
-/// subtraction each round once, `ε = 2^-24`) and the approximation within
-/// `7ε` (two conversions, a division and a product per child, the sum and
-/// the subtraction), so the two differ by under `11ε ≈ 2^-20.5`; `2^-17`
-/// leaves an order of magnitude to spare.
+/// [`SplitScorer::loss_chg`]: for a valid candidate the two differ by at most
+/// `APPROX_MARGIN · (U + |root_gain|) + UNDERFLOW_MARGIN · (D_l + D_r + 1)`,
+/// where `D = H + λ` per child (the `f64` sum both scorers start from) and
+/// `U = Σ G² / D` is the real closed-form gain of the children.
+///
+/// Each `f32` operation or conversion gives `x(1 + δ) + η` with `|δ| <= ε =
+/// 2^-24` and `|η| <= τ = 2^-150`, `η` only below the normal range (where
+/// `f32` sums and differences are exact); `f64` rounding is far below both.
+/// Under [`SplitScorer::approx_exact`] every `D >= 1e-3`, and
+/// [`scan_filtered`] defers to the exact scan unless every `D` and every
+/// candidate's gain is below `1e30`, so nothing overflows.
+///
+/// - Exact: at the `f32` weight `w = w*(1 + δ) + η` (`w* = -G/D`), the child
+///   gain `-(2Gw + D·w²)` equals `G²/D - D(w - w*)²`, so the weight's
+///   rounding enters only squared. What is left per child is the rounding of
+///   `w²`, which `D` scales to `εU + Dτ` (large when `w²` is subnormal), and
+///   of the gain (`εU + τ`); with the sum and the `root_gain` subtraction,
+///   the exact score is within `4ε(U + |root|) + (D_l + D_r + 2)τ` of `U -
+///   root_gain`.
+/// - Approximation: per child two conversions, the quotient and the product
+///   (`5εU`, plus `τ` from the product; a quotient's `τ` is scaled by `|G| <
+///   D · 2^-126`, and a subnormal `G` leaves `U` and the product below
+///   `2^-240`), then the sum and the subtraction: within `7ε(U + |root|) +
+///   2τ`.
+///
+/// The relative parts total under `11ε ≈ 2^-20.5` and the absolute ones
+/// `(D_l + D_r + 4)τ`; `2^-17` and [`UNDERFLOW_MARGIN`] `= 64τ` leave an
+/// order of magnitude to spare.
 const APPROX_MARGIN: f64 = 1.0 / 131_072.0;
+
+/// Absolute error allowance of [`SplitScorer::approx_run`] against
+/// [`SplitScorer::loss_chg`], per unit of `D_l + D_r + 1`: `2^-144` (derived
+/// at [`APPROX_MARGIN`]).
+const UNDERFLOW_MARGIN: f64 = f64::from_bits((1023 - 144) << 52);
 
 /// [`scan_numeric_splits`] with an approximate prefilter: every candidate is
 /// first scored by [`SplitScorer::approx_run`] (a single `f32` division per
@@ -686,8 +718,8 @@ const APPROX_MARGIN: f64 = 1.0 / 131_072.0;
 /// candidate with the largest exact loss change always passes the filter: its
 /// approximation is within the allowance of its exact value, which is at
 /// least the approximate maximum's exact value. The result is therefore the
-/// exact scan's. `None` (non-finite approximations, which the error bound
-/// does not cover) defers to the exact scan.
+/// exact scan's. `None` (non-finite approximations, or gains or `H + λ` too
+/// large for the error bound) defers to the exact scan.
 #[allow(
     clippy::needless_bitwise_bool,
     reason = "branch-free overflow and threshold tests vectorize"
@@ -704,10 +736,14 @@ fn scan_filtered(
     let ScanScratch { grad, hess, approx } = scratch;
     let (grad, hess, approx) = (&mut grad[..2 * n], &mut hess[..2 * n], &mut approx[..2 * n]);
     let mut acc = GradStats::default();
+    // The extreme accumulated Hessians, which bound every child's `H`.
+    let (mut hess_lo, mut hess_hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for ((&bin, g), h) in bins.iter().zip(&mut grad[..n]).zip(&mut hess[..n]) {
         acc.add(bin);
         *g = acc.grad;
         *h = acc.hess;
+        hess_lo = hess_lo.min(acc.hess);
+        hess_hi = hess_hi.max(acc.hess);
     }
     scorer.approx_run::<true>(total, &grad[..n], &hess[..n], &mut approx[..n]);
     // Candidates `n..2n` are the backward pass, whose accumulated statistics
@@ -719,6 +755,8 @@ fn scan_filtered(
             suffix.add(bin);
             *g = suffix.grad;
             *h = suffix.hess;
+            hess_lo = hess_lo.min(suffix.hess);
+            hess_hi = hess_hi.max(suffix.hess);
         }
         let (grad, hess) = (&grad[n..], &hess[n..]);
         scorer.approx_run::<false>(total, grad, hess, &mut approx[n..]);
@@ -740,12 +778,18 @@ fn scan_filtered(
     }
     let root = f64::from(scorer.root_gain);
     // `gain(left) + gain(right) + |root_gain|` of the largest candidate,
-    // which bounds every candidate's error.
+    // which bounds every candidate's relative error.
     let scale = (f64::from(max) + root + root.abs()).max(0.0);
-    if scale >= 1e30 {
+    // The largest `H + λ` of any child, the other child's `H` being the
+    // total's minus the accumulated one.
+    let max_d = hess_hi.max(total.hess - hess_lo) + scorer.reg.lambda;
+    if scale >= 1e30 || max_d.is_nan() || max_d >= 1e30 {
         return None;
     }
-    let threshold = f64::from(max) - 2.0 * APPROX_MARGIN * scale - 1e-30;
+    // Each of the two candidates compared (the approximate and the exact
+    // maximum) is off by at most its relative and absolute allowance.
+    let absolute = UNDERFLOW_MARGIN * (2.0 * max_d + 1.0);
+    let threshold = f64::from(max) - 2.0 * (APPROX_MARGIN * scale + absolute);
     // The largest `f32` at most `threshold`: comparing in `f32` against it
     // keeps every candidate the `f64` comparison keeps.
     let mut cutoff = threshold as f32;
@@ -1288,6 +1332,82 @@ mod tests {
         best
     }
 
+    /// The split [`xgb_update`] picks from the sequential
+    /// [`for_each_numeric_split`] search and from [`scan_numeric_splits`]'s
+    /// result, as `(expected, actual)`. A [`NumericScan::Nan`] (which needs
+    /// a candidate that scores NaN) is replayed sequentially, as the
+    /// builders do.
+    fn sequential_and_scanned(
+        bins: &[GradStats],
+        total: GradStats,
+        dense: bool,
+        scorer: &SplitScorer,
+    ) -> (BestSplit, BestSplit) {
+        let offer = |best: &mut BestSplit, pos, children: Children| {
+            if let Some(score) = scorer.loss_chg(children.left, children.right) {
+                xgb_update(best, 0, pos, children, score);
+            }
+        };
+        let mut expected = BestSplit::none();
+        let mut nan = false;
+        for_each_numeric_split(bins, 0, total, dense, |pos, children| {
+            nan |= scorer
+                .loss_chg(children.left, children.right)
+                .is_some_and(|score| score.loss_chg.is_nan());
+            offer(&mut expected, pos, children);
+        });
+        let mut actual = BestSplit::none();
+        match scan_numeric_splits(bins, 0, total, dense, scorer, &mut ScanScratch::new()) {
+            NumericScan::Empty => {}
+            NumericScan::Best { pos, children, .. } => offer(&mut actual, pos, children),
+            NumericScan::Nan => {
+                assert!(nan, "no candidate scores NaN");
+                actual = expected.clone();
+            }
+        }
+        (expected, actual)
+    }
+
+    /// Everything that identifies a recorded numeric split, bit for bit.
+    fn split_key(b: &BestSplit) -> (u64, Option<usize>, bool, [u64; 4]) {
+        (
+            b.loss_chg.to_bits(),
+            b.split_bin,
+            b.default_left,
+            [b.left.grad, b.left.hess, b.right.grad, b.right.hess].map(f64::to_bits),
+        )
+    }
+
+    /// Random histogram bins of `n` bins, each the sum of up to 20 `f32`
+    /// gradient pairs with gradients in `±2 · grad_scale` and Hessians in
+    /// `[0.05, 1.05) · hess_scale` (a quarter of the bins empty), and on
+    /// every fifth trial a repeated block (equal partial sums on both sides).
+    fn random_bins(
+        rng: &mut crate::rng::Rng,
+        n: usize,
+        (grad_scale, hess_scale): (f32, f32),
+        repeat: bool,
+    ) -> Vec<GradStats> {
+        let mut bins = vec![GradStats::default(); n];
+        for bin in &mut bins {
+            if rng.below(4) == 0 {
+                continue;
+            }
+            for _ in 0..rng.range(1..20) {
+                let g = (rng.f32() * 4.0 - 2.0) * grad_scale;
+                let h = (0.05 + rng.f32()) * hess_scale;
+                bin.add(GradStats::from_pair(GradPair::new(g, h)));
+            }
+        }
+        if repeat {
+            let half = n / 2;
+            for i in 0..half {
+                bins[n - 1 - i] = bins[i];
+            }
+        }
+        bins
+    }
+
     /// The batched and prefiltered numeric scans pick the split the
     /// sequential [`for_each_numeric_split`] search picks, bit for bit, over
     /// random histograms (empty bins and repeated bins give tied
@@ -1298,24 +1418,7 @@ mod tests {
         let mut rng = crate::rng::Rng::new(7);
         for trial in 0..4000 {
             let n = 2 + rng.range(0..300);
-            let mut bins = vec![GradStats::default(); n];
-            for bin in &mut bins {
-                if rng.below(4) == 0 {
-                    continue;
-                }
-                for _ in 0..rng.range(1..20) {
-                    let g = rng.f32() * 4.0 - 2.0;
-                    let h = 0.05 + rng.f32();
-                    bin.add(GradStats::from_pair(GradPair::new(g, h)));
-                }
-            }
-            if trial % 5 == 0 {
-                // Repeat a block of bins: equal partial sums on both sides.
-                let half = n / 2;
-                for i in 0..half {
-                    bins[n - 1 - i] = bins[i];
-                }
-            }
+            let bins = random_bins(&mut rng, n, (1.0, 1.0), trial % 5 == 0);
             let mut total = GradStats::default();
             for &bin in &bins {
                 total.add(bin);
@@ -1337,33 +1440,112 @@ mod tests {
                 bounds: Bounds::default(),
                 dir,
             };
-            let offer = |best: &mut BestSplit, pos, children: Children| {
-                if let Some(score) = scorer.loss_chg(children.left, children.right) {
-                    xgb_update(best, 0, pos, children, score);
-                }
-            };
-            let mut expected = BestSplit::none();
-            for_each_numeric_split(&bins, 0, total, dense, |pos, children| {
-                offer(&mut expected, pos, children);
-            });
-            let mut actual = BestSplit::none();
-            match scan_numeric_splits(&bins, 0, total, dense, &scorer, &mut ScanScratch::new()) {
-                NumericScan::Empty => {}
-                NumericScan::Best { pos, children, .. } => offer(&mut actual, pos, children),
-                NumericScan::Nan => panic!("finite statistics scored NaN"),
+            let (expected, actual) = sequential_and_scanned(&bins, total, dense, &scorer);
+            assert_eq!(split_key(&actual), split_key(&expected), "trial {trial}");
+        }
+    }
+
+    /// [`numeric_scan_matches_sequential_search`] with gradients from `1e-30`
+    /// to `1e30` and Hessians up to `1e38` (sums past `f32::MAX` included),
+    /// where `f32` weights, their squares, and the prefilter's quotients
+    /// underflow into subnormals or overflow.
+    #[test]
+    fn numeric_scan_matches_sequential_search_at_extreme_scales() {
+        let mut rng = crate::rng::Rng::new(13);
+        let scales = [1e-30f32, 1e-20, 1e-10, 1e-3, 1.0, 1e10, 1e20, 1e30];
+        for trial in 0..4000 {
+            let n = 2 + rng.range(0..40);
+            let grad_scale = scales[rng.range(0..scales.len())];
+            let hess_scale = [1.0f32, 1e10, 1e20, 1e30, 1e36, 1e38][rng.range(0..6)];
+            let bins = random_bins(&mut rng, n, (grad_scale, hess_scale), trial % 5 == 0);
+            let mut total = GradStats::default();
+            for &bin in &bins {
+                total.add(bin);
             }
-            let key = |b: &BestSplit| {
-                (
-                    b.loss_chg.to_bits(),
-                    b.split_bin,
-                    b.default_left,
-                    b.left.grad.to_bits(),
-                    b.left.hess.to_bits(),
-                    b.right.grad.to_bits(),
-                    b.right.hess.to_bits(),
-                )
+            let dense = trial % 3 == 0;
+            if !dense && rng.below(2) == 0 {
+                let g = f64::from(rng.f32() * 8.0 - 4.0) * f64::from(grad_scale);
+                total.add(GradStats::new(g, 3.0 * f64::from(hess_scale)));
+            }
+            let reg = RegParams {
+                lambda: [1.0, 0.1][rng.range(0..2)],
+                alpha: 0.0,
+                max_delta_step: 0.0,
+                min_child_weight: [0.0, 1.0][rng.range(0..2)],
             };
-            assert_eq!(key(&actual), key(&expected), "trial {trial}");
+            let scorer = SplitScorer {
+                reg: &reg,
+                root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+                bounds: Bounds::default(),
+                dir: 0,
+            };
+            let (expected, actual) = sequential_and_scanned(&bins, total, dense, &scorer);
+            assert_eq!(split_key(&actual), split_key(&expected), "trial {trial}");
+        }
+    }
+
+    /// Squared error with `x = [0, 1, 2]`, labels `[-1.02e-22, -1e-24,
+    /// 1.03e-22]`, weights `1e38` and base score 0 under the default
+    /// regularization, one bin per value.
+    fn subnormal_weight_square_bins() -> (Vec<GradStats>, GradStats, RegParams) {
+        let bins: Vec<GradStats> = [-1.02e-22f32, -1e-24, 1.03e-22]
+            .iter()
+            .map(|&label| GradStats::from_pair(GradPair::new((0.0 - label) * 1e38, 1e38)))
+            .collect();
+        let mut total = GradStats::default();
+        for &bin in &bins {
+            total.add(bin);
+        }
+        let reg = RegParams {
+            lambda: 1.0,
+            alpha: 0.0,
+            max_delta_step: 0.0,
+            min_child_weight: 1.0,
+        };
+        (bins, total, reg)
+    }
+
+    /// Each child's `f32` weight (about `1e-22`) squares to a subnormal, so
+    /// the exact score `(H + λ) · w²` is off from `G² / (H + λ)` by far more
+    /// than the relative error allowance: the true winner (bins `..= 0`
+    /// left, loss change ~`1.5798e-6`) approximates below the runner-up
+    /// (~`1.5011e-6` exact, ~`1.5913e-6` approximated). The prefilter must
+    /// still keep it.
+    #[test]
+    fn numeric_scan_keeps_the_winner_when_weights_square_to_subnormals() {
+        let (bins, total, reg) = subnormal_weight_square_bins();
+        let scorer = SplitScorer {
+            reg: &reg,
+            root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+            bounds: Bounds::default(),
+            dir: 0,
+        };
+        assert!(scorer.approx_exact());
+        let (expected, actual) = sequential_and_scanned(&bins, total, true, &scorer);
+        assert_eq!(expected.split_bin, Some(0));
+        assert_eq!(split_key(&actual), split_key(&expected));
+    }
+
+    /// [`SplitScorer::cannot_beat`] on the true winner of
+    /// [`numeric_scan_keeps_the_winner_when_weights_square_to_subnormals`],
+    /// whose exact loss change exceeds its `G² / (H + λ)` estimate by 1.2%:
+    /// no incumbent below the exact loss change rules it out.
+    #[test]
+    fn cannot_beat_allows_for_subnormal_weight_squares() {
+        let (bins, total, reg) = subnormal_weight_square_bins();
+        let scorer = SplitScorer {
+            reg: &reg,
+            root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+            bounds: Bounds::default(),
+            dir: 0,
+        };
+        let (left, right) = (bins[0], total.sub(bins[0]));
+        let exact = scorer.loss_chg(left, right).unwrap().loss_chg;
+        for incumbent in [exact * 0.98, exact * 0.99, exact.next_down()] {
+            assert!(
+                !scorer.cannot_beat(left, right, f64::from(incumbent)),
+                "{incumbent} < {exact}"
+            );
         }
     }
 
@@ -1413,6 +1595,55 @@ mod tests {
             }
         }
         assert!(ruled_out > 10_000, "{ruled_out}");
+    }
+
+    /// [`cannot_beat_is_conservative`] at gradient magnitudes from `1e-30`
+    /// to `1e30` and Hessians up to `1e38`, where the `f32` weights and
+    /// their squares underflow.
+    #[test]
+    fn cannot_beat_is_conservative_at_extreme_scales() {
+        let mut rng = crate::rng::Rng::new(17);
+        let grad_scales = [1e-30f64, 1e-20, 1e-10, 1.0, 1e10, 1e20, 1e30];
+        let hess_scales = [1.0f64, 1e10, 1e20, 1e30, 1e38];
+        for _ in 0..20_000 {
+            let grad_scale = grad_scales[rng.range(0..grad_scales.len())];
+            let hess_scale = hess_scales[rng.range(0..hess_scales.len())];
+            let mut stats = || {
+                GradStats::new(
+                    (rng.f64() * 2.0 - 1.0) * grad_scale,
+                    (0.01 + rng.f64()) * hess_scale,
+                )
+            };
+            let (left, right) = (stats(), stats());
+            let total = GradStats::new(left.grad + right.grad, left.hess + right.hess);
+            let reg = RegParams {
+                lambda: [1.0, 0.1][rng.range(0..2)],
+                alpha: 0.0,
+                max_delta_step: 0.0,
+                min_child_weight: 0.0,
+            };
+            let scorer = SplitScorer {
+                reg: &reg,
+                root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+                bounds: Bounds::default(),
+                dir: 0,
+            };
+            let Some(score) = scorer.loss_chg(left, right) else {
+                continue;
+            };
+            let exact = score.loss_chg;
+            if !exact.is_finite() {
+                continue;
+            }
+            let mut incumbent = exact;
+            for _ in 0..8 {
+                incumbent = incumbent.next_down();
+                assert!(
+                    !scorer.cannot_beat(left, right, f64::from(incumbent)),
+                    "{left:?} {right:?} {incumbent} {exact}"
+                );
+            }
+        }
     }
 
     /// A feature with a single category still separates it from the missing

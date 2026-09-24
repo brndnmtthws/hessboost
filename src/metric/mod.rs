@@ -71,10 +71,16 @@ pub trait Metric: Send + Sync {
     /// `[row][target]`, every cell counts as one instance, and each row's
     /// weight is repeated for its cells, so the metric averages over all
     /// rows and targets. Metrics that are not elementwise override it (or
-    /// report [`Metric::supports_label_matrix`] `false`).
+    /// report [`Metric::supports_label_matrix`] `false`). Metadata whose
+    /// lengths disagree with `n_rows` and `n_targets` evaluates to NaN.
     fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
+        if info.check_layout().is_err() {
+            return f64::NAN;
+        }
         if info.n_targets > 1 {
-            let cell_weights = info.cell_weights();
+            let Ok(cell_weights) = info.cell_weights() else {
+                return f64::NAN;
+            };
             return self.eval_grouped(preds, info.labels, cell_weights.as_deref(), None);
         }
         self.eval_grouped(preds, info.labels, info.weights, info.group)
@@ -150,6 +156,7 @@ macro_rules! simple_metric {
     ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path $(=> $root:ident)?) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, Default)]
+        #[non_exhaustive]
         pub struct $ty;
         impl Metric for $ty {
             fn name(&self) -> &str {
@@ -274,6 +281,7 @@ fn macro_average_targets(metric: &dyn Metric, preds: &[f32], info: &MetaInfo) ->
 /// For a label matrix it is the mean of the per-target AUCs (XGBoost's
 /// multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct Auc;
 
 impl Metric for Auc {
@@ -350,15 +358,18 @@ simple_metric!(
     TweedieNLogLik, "tweedie-nloglik", rho: f64, crate::simd::tweedie_nloglik_sum
 );
 
-/// Iterate `(start, end)` row ranges for a group, or a single whole-batch
-/// range when no group info is present. Shared by the ranking metrics and the
-/// LambdaMART objective's usable-group fallback.
+/// The non-empty `(start, end)` row ranges of `group` when it partitions the
+/// `n` rows (`GroupInfo::partitions`), otherwise the whole batch as one
+/// range (none when `n == 0`). Every range indexes an `n`-row buffer and
+/// holds at least one row. Shared by the ranking metrics and the LambdaMART
+/// objective's usable-group fallback.
 pub(crate) fn group_ranges(
     n: usize,
     group: Option<&crate::data::GroupInfo>,
 ) -> Vec<(usize, usize)> {
     match group {
-        Some(g) if g.num_rows() == n => g.iter_ranges().collect(),
+        Some(g) if g.partitions(n) => g.iter_ranges().filter(|(s, e)| s < e).collect(),
+        _ if n == 0 => Vec::new(),
         _ => vec![(0, n)],
     }
 }
@@ -380,8 +391,10 @@ pub(crate) fn argsort_desc(values: &[f32]) -> Vec<usize> {
     order
 }
 
-/// Weighted mean of a per-group `score` over query-group ranges, weighted by
-/// each group's first document weight (`1.0` when unweighted). Shared by the
+/// Weighted mean of a per-group `score` over the non-empty query-group
+/// ranges, weighted by each group's first document weight (`1.0` when
+/// unweighted); zero-weight groups are skipped, and without any rows or
+/// weight the result is `0`, like the elementwise metrics. Shared by the
 /// ranking metrics' `eval_grouped`.
 fn grouped_average(
     preds: &[f32],
@@ -390,14 +403,13 @@ fn grouped_average(
     group: Option<&crate::data::GroupInfo>,
     mut score: impl FnMut(&[f32], &[f32]) -> f64,
 ) -> f64 {
-    let ranges = group_ranges(preds.len(), group);
-    if ranges.is_empty() {
-        return 0.0;
-    }
     let mut sum = 0.0;
     let mut weight_sum = 0.0;
-    for &(start, end) in &ranges {
+    for (start, end) in group_ranges(preds.len(), group) {
         let weight = weights.map_or(1.0, |values| f64::from(values[start]));
+        if weight == 0.0 {
+            continue;
+        }
         sum += weight * score(&preds[start..end], &labels[start..end]);
         weight_sum += weight;
     }
@@ -573,6 +585,7 @@ impl Metric for MeanAveragePrecision {
 /// problem (no positives or no negatives) yields `0`. For a label matrix it
 /// is the mean of the per-target areas (XGBoost's multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct AucPr;
 
 impl Metric for AucPr {
@@ -717,6 +730,12 @@ impl Metric for CustomMetric {
 /// XGBoost), failing when that list is empty or invalid. The distributional
 /// metrics `nll` and `crps` (beyond XGBoost) take the family of a `dist:*`
 /// objective and fail without one.
+///
+/// Only `ndcg`, `map`, and `pre` (a positive integer rank cutoff `@k`, as
+/// the lower bound 1 XGBoost puts on the top-k it sets from the suffix) and
+/// `tweedie-nloglik` (a variance power `@rho` in `[1, 2)`) take an `@`
+/// suffix; any other suffix, including XGBoost's `error@t` threshold and the
+/// `-` variants (`ndcg@3-`), is a parameter error.
 pub fn create_metric(name: &str, params: &TrainingParams) -> Result<Box<dyn Metric>> {
     build(
         name,
@@ -731,21 +750,26 @@ pub(crate) fn build(
     num_class: usize,
     objective: &ObjectiveParams,
 ) -> Result<Box<dyn Metric>> {
-    // Accept the XGBoost `tweedie-nloglik@1.5` suffix form.
-    let (base, rho) = match name.split_once('@') {
-        Some((b, r)) => (b, r.parse::<f64>().ok()),
+    let (base, suffix) = match name.split_once('@') {
+        Some((b, s)) => (b, Some(s)),
         None => (name, None),
     };
-    // Rank cutoff `@k` of at least `min`. NaN would cast to a zero cutoff,
-    // infinity to `usize::MAX`, and a negative value saturate to zero.
-    let cutoff = |min: f64| match rho {
-        Some(k) if !k.is_finite() || k < min => Err(HessboostError::invalid_param(
-            "eval_metric",
-            format!("`{name}` needs a finite cutoff of at least {min}"),
+    let invalid =
+        |reason: &str| HessboostError::invalid_param("eval_metric", format!("`{name}`: {reason}"));
+    // Rank cutoff `@k`: decimal digits only (`usize::from_str` also takes a
+    // leading `+`), so `2.9`, `abc`, `1@2`, or an empty suffix are refused
+    // rather than truncated or dropped.
+    let cutoff = || match suffix {
+        None => Ok(None),
+        Some(s) if s.ends_with('-') => Err(invalid(
+            "the `-` variants of the ranking metrics are not implemented",
         )),
-        k => Ok(k.map(|k| k as usize)),
+        Some(s) => match s.parse::<usize>() {
+            Ok(k) if k >= 1 && s.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(k)),
+            _ => Err(invalid("the `@k` cutoff must be a positive integer")),
+        },
     };
-    match base {
+    let metric: Result<Box<dyn Metric>> = match base {
         "rmse" => Ok(Box::new(Rmse)),
         "mae" => Ok(Box::new(Mae)),
         "logloss" => Ok(Box::new(LogLoss)),
@@ -760,11 +784,21 @@ pub(crate) fn build(
         })),
         "poisson-nloglik" => Ok(Box::new(PoissonNLogLik)),
         "gamma-nloglik" => Ok(Box::new(GammaNLogLik)),
-        "tweedie-nloglik" => Ok(Box::new(TweedieNLogLik {
-            rho: rho.unwrap_or(1.5),
-        })),
-        "ndcg" => Ok(Box::new(Ndcg::new(cutoff(0.0)?))),
-        "map" => Ok(Box::new(MeanAveragePrecision::new(cutoff(0.0)?))),
+        "tweedie-nloglik" => {
+            // The range `TrainingParams::validate` gives the objective's
+            // `tweedie_variance_power`, whose default metric this is.
+            let rho = match suffix {
+                None => 1.5,
+                Some(s) => s
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|r| r.is_finite() && (1.0f32..2.0).contains(&(*r as f32)))
+                    .ok_or_else(|| invalid("the variance power `@rho` must be in [1, 2)"))?,
+            };
+            Ok(Box::new(TweedieNLogLik { rho }))
+        }
+        "ndcg" => Ok(Box::new(Ndcg::new(cutoff()?))),
+        "map" => Ok(Box::new(MeanAveragePrecision::new(cutoff()?))),
         "rmsle" => Ok(Box::new(Rmsle)),
         "mape" => Ok(Box::new(Mape)),
         "mphe" => {
@@ -777,7 +811,7 @@ pub(crate) fn build(
             }
             Ok(Box::new(PseudoHuberError::new(slope)))
         }
-        "pre" => Ok(Box::new(Precision::new(name, cutoff(1.0)?))),
+        "pre" => Ok(Box::new(Precision::new(name, cutoff()?))),
         "quantile" => Ok(Box::new(QuantileError::new(&objective.quantile_alpha)?)),
         "expectile" => Ok(Box::new(ExpectileError::new(&objective.expectile_alpha)?)),
         "cox-nloglik" => Ok(Box::new(CoxNLogLik)),
@@ -802,7 +836,12 @@ pub(crate) fn build(
             })
         }
         other => Err(HessboostError::unknown("metric", other)),
+    };
+    let metric = metric?;
+    if suffix.is_some() && !matches!(base, "tweedie-nloglik" | "ndcg" | "map" | "pre") {
+        return Err(invalid(&format!("`{base}` takes no `@` suffix")));
     }
+    Ok(metric)
 }
 
 /// Build the list of metrics to evaluate: the user's `eval_metric` list if any,
@@ -960,15 +999,33 @@ mod tests {
         }
     }
 
-    /// Rank cutoffs `@k` that are NaN, infinite, or below the metric's
-    /// minimum (1 for `pre`, 0 for `ndcg` / `map`) are refused instead of
-    /// casting to a zero (or saturated) `usize`.
+    /// A rank cutoff `@k` must be a positive integer (XGBoost bounds the
+    /// top-k it sets from the suffix below by 1): anything else is refused
+    /// instead of being truncated (`pre@2.9`), dropped (`pre@abc`), or cast
+    /// to a zero or saturated `usize`. Other metrics refuse any suffix but
+    /// `tweedie-nloglik`'s variance power in `[1, 2)`.
     #[test]
-    fn rank_metrics_reject_invalid_cutoffs() {
+    fn metrics_reject_invalid_suffixes() {
         let obj = ObjectiveParams::default();
-        let mut names = vec!["pre@0".to_string(), "pre@0.5".to_string()];
+        let mut names: Vec<String> = [
+            "pre@0.5",
+            "pre@2.9",
+            "pre@1@2",
+            "tweedie-nloglik@",
+            "tweedie-nloglik@abc",
+            "tweedie-nloglik@2",
+            "tweedie-nloglik@0.5",
+            "tweedie-nloglik@nan",
+            "error@0.7",
+            "rmse@3",
+            "auc@",
+        ]
+        .map(String::from)
+        .into();
         for base in ["pre", "ndcg", "map"] {
-            for k in ["NaN", "nan", "inf", "-inf", "-1"] {
+            for k in [
+                "", "0", "abc", "+3", " 3", "3-", "-", "NaN", "inf", "-1", "1e3",
+            ] {
                 names.push(format!("{base}@{k}"));
             }
         }
@@ -979,7 +1036,15 @@ mod tests {
                 "{name}: {err:?}"
             );
         }
-        for name in ["pre@1", "ndcg@0", "ndcg@3", "map@0", "map@5"] {
+        for name in [
+            "pre@1",
+            "pre@32",
+            "ndcg@3",
+            "map@5",
+            "tweedie-nloglik",
+            "tweedie-nloglik@1",
+            "tweedie-nloglik@1.25",
+        ] {
             assert!(build(name, 0, &obj).is_ok(), "{name}");
         }
         let m = build("pre@2", 0, &obj).unwrap();
@@ -1050,6 +1115,25 @@ mod tests {
         assert!(custom.eval(&[], &labels, None).is_nan());
         assert!(custom.eval(&[2.0; 4], &labels, None).is_nan());
         assert!(custom.eval(&[2.0; 3], &labels, Some(&[1.0])).is_nan());
+    }
+
+    /// Metadata whose `n_targets` disagrees with its lengths evaluates to
+    /// NaN through the default `eval_info` (a `usize::MAX` once overflowed
+    /// the per-cell weight allocation).
+    #[test]
+    fn inconsistent_label_matrix_metadata_evaluates_to_nan() {
+        let labels = [1.0f32, 2.0, 3.0, 4.0];
+        let weights = [1.0f32, 1.0];
+        let info = MetaInfo {
+            n_rows: 2,
+            n_targets: 2,
+            ..MetaInfo::new(&labels, Some(&weights), None)
+        };
+        assert_eq!(Rmse.eval_info(&labels, &info), 0.0);
+        for n_targets in [usize::MAX, 0, 3] {
+            let bad = MetaInfo { n_targets, ..info };
+            assert!(Rmse.eval_info(&labels, &bad).is_nan(), "{n_targets}");
+        }
     }
 
     #[test]

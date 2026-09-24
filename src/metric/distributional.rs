@@ -13,8 +13,11 @@ use rayon::prelude::*;
 
 /// Weighted mean of `score(dist_i, y_i)` over the rows. Per-row scores are
 /// computed in parallel and summed sequentially in row order, so the value
-/// does not depend on the thread count. NaN unless `preds` holds one row of
-/// parameters per label and `weights` one weight per label.
+/// does not depend on the thread count. Zero-weight rows are skipped, so a
+/// row whose score is infinite or NaN (e.g. a label outside the predicted
+/// support) cannot turn the mean into `0 · ∞ = NaN`. NaN unless `preds`
+/// holds one row of parameters per label and `weights` one weight per
+/// label.
 fn mean_score(
     family: DistFamily,
     preds: &[f32],
@@ -24,18 +27,28 @@ fn mean_score(
 ) -> f64 {
     let k = family.n_params();
     nan_unless_consistent!(preds, labels, weights, k);
+    let weight = |i: usize| weights.map_or(1.0, |ws| f64::from(ws[i]));
     let scores: Vec<f64> = preds
         .par_chunks_exact(k)
         .zip(labels.par_iter())
-        .map(|(row, &y)| score(&Dist::from_row(family, row), f64::from(y)))
+        .enumerate()
+        .map(|(i, (row, &y))| {
+            if weight(i) == 0.0 {
+                0.0
+            } else {
+                score(&Dist::from_row(family, row), f64::from(y))
+            }
+        })
         .collect();
-    let (mut total, mut weight) = (0.0f64, 0.0f64);
+    let (mut total, mut weight_sum) = (0.0f64, 0.0f64);
     for (i, s) in scores.into_iter().enumerate() {
-        let w = weights.map_or(1.0, |ws| f64::from(ws[i]));
-        total += w * s;
-        weight += w;
+        let w = weight(i);
+        if w != 0.0 {
+            total += w * s;
+            weight_sum += w;
+        }
     }
-    weighted_mean((total, weight))
+    weighted_mean((total, weight_sum))
 }
 
 /// Mean negative log-likelihood `-ln p(y)` of the predicted distributions
@@ -131,6 +144,24 @@ mod tests {
         assert!((nll.eval(&preds, &labels, Some(&[1.0, 3.0])) - expect).abs() < 1e-12);
         let expect = f64::midpoint(d0.crps(0.0), d1.crps(3.0));
         assert!((crps.eval(&preds, &labels, None) - expect).abs() < 1e-12);
+    }
+
+    /// A zero-weight row whose score overflows (LogNormal with `sigma =
+    /// 100`: `e^{sigma²/2} = ∞` in its CRPS) leaves the mean of the others.
+    #[test]
+    fn zero_weight_rows_do_not_poison_the_mean() {
+        let preds = [0.0f32, 100.0, 0.0, 1.0];
+        let labels = [1.0f32, 1.0];
+        let weights = [0.0f32, 1.0];
+        let d1 = Dist::LogNormal {
+            mu: 0.0,
+            sigma: 1.0,
+        };
+        let crps = DistCrps::new(DistFamily::LogNormal);
+        assert!(!crps.eval(&preds[..2], &labels[..1], None).is_finite());
+        assert_eq!(crps.eval(&preds, &labels, Some(&weights)), d1.crps(1.0));
+        let nll = DistNll::new(DistFamily::LogNormal);
+        assert_eq!(nll.eval(&preds, &labels, Some(&weights)), -d1.log_prob(1.0));
     }
 
     #[test]

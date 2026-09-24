@@ -54,15 +54,14 @@ fuzz_target!(|data: &[u8]| {
         assert!(matrix.labels().is_some());
     }
 
-    let opts = CsvOptions {
-        has_header: selector & 1 != 0,
-        delimiter: [',', ';', '\t', ' '][usize::from((selector >> 1) & 3)],
-        label_column: match (selector >> 3) & 3 {
-            0 => None,
-            c => Some(usize::from(c - 1)),
-        },
-        na_value: (selector & 0x20 != 0).then(|| "NA".to_string()),
+    let mut opts = CsvOptions::default();
+    opts.has_header = selector & 1 != 0;
+    opts.delimiter = [',', ';', '\t', ' '][usize::from((selector >> 1) & 3)];
+    opts.label_column = match (selector >> 3) & 3 {
+        0 => None,
+        c => Some(usize::from(c - 1)),
     };
+    opts.na_value = (selector & 0x20 != 0).then(|| "NA".to_string());
     if let Ok(matrix) = read_csv(contents, &opts) {
         check(&matrix);
     }

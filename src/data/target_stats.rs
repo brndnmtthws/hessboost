@@ -95,6 +95,7 @@ const NO_CATEGORY: u32 = u32::MAX;
 /// Which labels an [`OrderedTargetEncoder`] accepts. Both kinds encode the
 /// smoothed target mean; the kind only decides label validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TargetKind {
     /// Any finite labels; the default prior is the label mean.
     #[default]
@@ -144,8 +145,8 @@ impl OrderedTargetEncoderBuilder {
         self
     }
 
-    /// Fixed prior `P` (default: the mean training label). Must be finite as
-    /// an `f32`, since unseen categories encode to it.
+    /// Fixed prior `P` (default: the mean training label). Must be finite and
+    /// at most `f32::MAX` in magnitude, since unseen categories encode to it.
     #[must_use]
     pub fn prior(mut self, prior: f64) -> Self {
         self.encoder.prior = Some(prior);
@@ -183,7 +184,9 @@ impl OrderedTargetEncoderBuilder {
                 "must be finite and > 0",
             ));
         }
-        if e.prior.is_some_and(|p| !(p as f32).is_finite()) {
+        if e.prior
+            .is_some_and(|p| !p.is_finite() || p.abs() > f64::from(f32::MAX))
+        {
             return Err(HessboostError::invalid_param(
                 "prior",
                 "must be finite and within the f32 range",
@@ -221,7 +224,8 @@ impl OrderedTargetEncoder {
     /// ordered encodings (now [`FeatureType::Numerical`]; everything else,
     /// storage kind and metadata included, is kept) and the fitted encoder for
     /// evaluation and test data. The result uses a NaN missing sentinel;
-    /// entries missing in `data` stay missing.
+    /// entries missing in `data` stay missing. Fails should an encoding round
+    /// outside the `f32` range.
     pub fn fit_transform(
         &self,
         data: &DMatrix,
@@ -262,6 +266,18 @@ impl OrderedTargetEncoder {
         }
 
         let scale = 1.0 / self.permutations as f64;
+        // Each encoding is a convex combination of labels and the prior,
+        // all within the `f32` range; this guards the final rounding.
+        let overflow = || {
+            HessboostError::invalid_param("prior", "target statistics round outside the f32 range")
+        };
+        if encodings
+            .iter()
+            .flatten()
+            .any(|&v| !((v * scale) as f32).is_finite())
+        {
+            return Err(overflow());
+        }
         let encoded = data
             .map_values(|row, col, v| match slots[col] {
                 Some(s) => (encodings[s][row] * scale) as f32,
@@ -269,11 +285,17 @@ impl OrderedTargetEncoder {
             })
             .with_feature_types(&numeric_types(data, columns.iter().copied()))?;
 
-        let columns = codes
+        let columns: Vec<ColumnEncoding> = codes
             .into_iter()
             .zip(columns)
             .map(|(col, &column)| ColumnEncoding::fit(column, col, labels, prior, a))
             .collect();
+        if columns
+            .iter()
+            .any(|c| c.values.iter().any(|v| !v.is_finite()))
+        {
+            return Err(overflow());
+        }
         let fitted = FittedTargetEncoder {
             n_cols: data.n_cols(),
             prior: prior as f32,
@@ -859,5 +881,33 @@ mod tests {
         assert!(fitted.transform(&wide).is_err());
         let numeric = DMatrix::from_dense(&[0.0, 1.0], 1, 2).unwrap();
         assert!(fitted.transform(&numeric).is_err());
+    }
+
+    /// A prior just above `f32::MAX` narrows to `f32::MAX` but, averaged over
+    /// 105 permutations, used to round to an infinite encoding: it is refused
+    /// by the builder, while `±f32::MAX` itself encodes finitely.
+    #[test]
+    fn priors_stay_within_the_f32_range() {
+        let above = f64::from_bits(0x47ef_ffff_efff_ffff);
+        assert!(above > f64::from(f32::MAX) && (above as f32) == f32::MAX);
+        let with_prior = |prior: f64| {
+            OrderedTargetEncoder::builder()
+                .prior(prior)
+                .permutations(105)
+                .build()
+        };
+        assert!(matches!(
+            with_prior(above),
+            Err(HessboostError::InvalidParameter { .. })
+        ));
+        let data = matrix(&[0.0, 1.0, 1.0, 2.0], &[1.0, 0.0, 1.0, 0.0]);
+        for prior in [f64::from(f32::MAX), -f64::from(f32::MAX)] {
+            let (encoded, fitted) = with_prior(prior)
+                .unwrap()
+                .fit_transform(&data, &[0])
+                .unwrap();
+            assert!(column(&encoded, 0).iter().all(|v| v.unwrap().is_finite()));
+            assert!(fitted.encode(0, 7).unwrap().is_finite());
+        }
     }
 }

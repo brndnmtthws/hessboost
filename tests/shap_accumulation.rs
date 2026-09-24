@@ -103,13 +103,15 @@ fn zero_cover_splits_average_their_children() {
 
 /// A feature repeated down a path overwrites its probability: the basis is
 /// multiplied by the new factor and divided by the old one. With hot-child
-/// covers `1 → 2^-32 → 2^-64 → 2^-96` the third split's product exceeds
-/// `f32` if formed before the division, although the resulting basis is
-/// representable; every attribution must stay finite.
+/// covers `1 → 2^-32 → 2^-64 → 2^-96 → 2^-128` the third split's basis
+/// product exceeds `f32` if formed before the division, and the fourth
+/// split's path probability `2^128` exceeds it outright, although the
+/// resulting basis and attributions are representable; every attribution
+/// must stay finite.
 #[test]
 fn repeated_feature_basis_update_stays_finite() {
     let cover = |e: i32| 2f64.powi(-e);
-    // x0 < 0.5 three times reaches the only non-zero leaf.
+    // x0 < 0.5 four times reaches the only non-zero leaf.
     let model = scalar_model(
         &[&[
             node(0, 1, 2, 0.0, cover(0)),
@@ -117,16 +119,19 @@ fn repeated_feature_basis_update_stays_finite() {
             node(0, -1, -1, 0.0, cover(0)),
             node(0, 5, 6, 0.0, cover(64)),
             node(0, -1, -1, 0.0, cover(32)),
-            node(0, -1, -1, 1.0, cover(96)),
+            node(0, 7, 8, 0.0, cover(96)),
             node(0, -1, -1, 0.0, cover(64)),
+            node(0, -1, -1, 1.0, cover(128)),
+            node(0, -1, -1, 0.0, cover(96)),
         ]],
         1,
     );
     let row = DMatrix::from_dense(&[0.2f32], 1, 1).unwrap();
     assert_eq!(model.predict_margin(&row).unwrap(), [1.0]);
 
-    // E[f] = 2^-96, so feature 0 carries the whole margin.
-    let bias = cover(96) as f32;
+    // E[f] = 2^-128, so feature 0 carries the whole margin.
+    let bias = cover(128) as f32;
+    assert!(bias > 0.0);
     let contribs = model.predict_contribs(&row).unwrap();
     assert_eq!(contribs[1], bias, "{contribs:?}");
     assert!((contribs[0] - 1.0).abs() < 1e-6, "{contribs:?}");

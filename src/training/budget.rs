@@ -33,7 +33,9 @@
 //!   `±max_delta_step` for `count:poisson` (XGBoost's default `0.7`, as its
 //!   leaves are in regular training) and shrunk by `η`.
 //!   Missing values try both directions (each counted in every fold); a tree
-//!   holds at most 10 000 nodes.
+//!   holds at most 10 000 nodes. Splits whose gain, child Hessian sums, or
+//!   leaf values overflow `f32` are skipped; when the root's own do (from
+//!   extreme labels or sample weights), training fails.
 //! * **Stopping.** A tree with at most one split whose generalization score
 //!   is below `0.99` (and that did not stop on the loss target) counts as a
 //!   weak round; boosting stops after `stopping_rounds` weak rounds, right
@@ -78,7 +80,8 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, create_objective};
 use crate::training::train::{
-    initial_intercepts, new_model, reject_missing_param, validate_dataset, with_thread_pool,
+    check_num_class, initial_intercepts, new_model, reject_missing_param, validate_dataset,
+    validate_trained_model, with_thread_pool,
 };
 use crate::tree::builder::budget::{
     ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
@@ -96,8 +99,11 @@ const STOPPING_ROUNDS: usize = 3;
 /// Base iteration cap (Perpetual `ITER_LIMIT`), before the budget scaling.
 const ITER_LIMIT: usize = 1000;
 
-/// Configuration of [`train_with_budget`].
+/// Configuration of [`train_with_budget`]. Construct with
+/// [`BudgetConfig::new`] (or [`Default`]) and the setters, or set fields
+/// directly.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct BudgetConfig {
     /// The fitting budget `b`, in `(0, 5)`. Larger budgets use a smaller
     /// learning rate and a smaller per-tree loss target, so they train more
@@ -214,6 +220,7 @@ impl BudgetConfig {
 
 /// Why budget-mode training stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BudgetStop {
     /// The last tree's root had no split that passed the generalization
     /// check.
@@ -231,6 +238,7 @@ pub enum BudgetStop {
 
 /// The result of [`train_with_budget`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct BudgetResult {
     /// The trained model (one tree per round, leaves already shrunk by
     /// [`BudgetResult::eta`]).
@@ -261,7 +269,9 @@ pub fn train_with_budget(
     dtrain: &DMatrix,
     config: &BudgetConfig,
 ) -> Result<BudgetResult> {
-    with_thread_pool(params, || train_budget_inner(params, dtrain, config))
+    let result = with_thread_pool(params, || train_budget_inner(params, dtrain, config))?;
+    validate_trained_model(&result.model)?;
+    Ok(result)
 }
 
 /// Refuse every [`TrainingParams`] field budget mode does not read (they are
@@ -348,6 +358,7 @@ fn train_budget_inner(
             ));
         }
     };
+    check_num_class(params, objective.as_ref())?;
     reject_tuned_params(params)?;
     let Some(labels) = dtrain.labels() else {
         return Err(HessboostError::EmptyDataset(
@@ -408,7 +419,7 @@ fn train_budget_inner(
                 row_decrement: &row_decrement,
                 max_delta_step: params.effective_max_delta_step(),
             },
-        );
+        )?;
         grown.apply(&mut margins);
 
         let n_nodes = grown.tree.num_nodes();

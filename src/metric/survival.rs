@@ -17,6 +17,7 @@ use crate::objective::{abs_label_order, aft_nloglik};
 /// XGBoost; a dataset without events yields a non-finite value. The risk
 /// sets span one label per row, so label matrices are refused.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct CoxNLogLik;
 
 impl Metric for CoxNLogLik {
@@ -151,6 +152,7 @@ impl Metric for AftNLogLik {
 /// label interval, endpoints included (`interval-regression-accuracy`),
 /// weighted. Receives raw log-time margins. Higher is better.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct IntervalRegressionAccuracy;
 
 impl Metric for IntervalRegressionAccuracy {

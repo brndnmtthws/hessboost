@@ -22,10 +22,12 @@
 //! `f32`, the recurrence and all accumulation are `f32` in XGBoost's operation
 //! order, and each tree's cover-weighted expected value is summed in `f64` and
 //! rounded once (bottom-up for scalar trees, top-down over the leaf vectors
-//! for vector-leaf trees, as upstream). One deliberate deviation: when a
-//! repeated feature's basis update overflows `f32` before its old factor is
-//! divided out, that lane is redone in `f64`, so a representable basis stays
-//! finite where XGBoost's temporary overflows into `NaN` attributions.
+//! for vector-leaf trees, as upstream). One deliberate deviation: a feature
+//! repeated down a path can push its path probability (the product of its
+//! inverse cover fractions) or the basis past `f32`'s range, where XGBoost's
+//! temporaries overflow into `NaN` attributions. The probability then
+//! continues in `f64`, and each basis lane or edge sum whose `f32` result
+//! overflows is redone in `f64`, so representable attributions stay finite.
 //! Summed over the ensemble the contributions satisfy
 //!
 //! ```text
@@ -46,7 +48,7 @@ use std::sync::LazyLock;
 /// Quadrature points (XGBoost's `kQuadratureTreeShapPoints`).
 const POINTS: usize = 8;
 /// Path probability of a feature that is not yet on the current path.
-const UNSEEN: f32 = -999.0;
+const UNSEEN: f64 = -999.0;
 /// Floor for a child's cover fraction, so zero-cover branches stay reachable.
 const MIN_BRANCH_WEIGHT: f32 = 1e-12;
 
@@ -156,53 +158,91 @@ fn branch_weight(cover: f32, parent_cover: f32) -> f32 {
 
 /// Contribution of one return edge whose feature entered the subtree with
 /// probability `p_enter` and had `p_exit` above it (`1.0` = not on the path).
-fn edge_delta(rule: &QuadratureRule, h: &Lanes, p_enter: f32, p_exit: f32) -> f32 {
+///
+/// Path probabilities are kept in `f64` (see [`Walk::child`]); ordinary ones
+/// are `f32` values and take XGBoost's `f32` arithmetic. When that overflows
+/// (a probability beyond `f32`, or `α·h` exceeding it) the edge is redone in
+/// `f64`, whose quotients `α·h / (1 + α·u)` stay representable.
+fn edge_delta(rule: &QuadratureRule, h: &Lanes, p_enter: f64, p_exit: f64) -> f32 {
     let mut acc = 0.0f32;
     if p_enter != 1.0 {
-        let alpha = p_enter - 1.0;
+        let alpha = p_enter as f32 - 1.0;
         for (&hi, &u) in h.iter().zip(&rule.nodes) {
             acc += alpha * hi / madd(alpha, u, 1.0);
         }
     }
     if p_exit != 1.0 {
-        let alpha = p_exit - 1.0;
+        let alpha = p_exit as f32 - 1.0;
         for (&hi, &u) in h.iter().zip(&rule.nodes) {
             acc -= alpha * hi / madd(alpha, u, 1.0);
         }
     }
-    acc
+    if acc.is_finite() {
+        return acc;
+    }
+    let term = |p: f64| {
+        let alpha = p - 1.0;
+        h.iter()
+            .zip(&rule.nodes)
+            .map(|(&hi, &u)| alpha * f64::from(hi) / madd64(alpha, f64::from(u), 1.0))
+            .sum::<f64>()
+    };
+    (term(p_enter) - term(p_exit)) as f32
+}
+
+/// `α / (1 + α·u)` for `α = p - 1`, in `f32` unless that overflows (a
+/// probability beyond `f32`), then in `f64`.
+#[inline(always)]
+fn edge_factor(p: f64, u: f32) -> f32 {
+    let alpha = p as f32 - 1.0;
+    let factor = alpha / madd(alpha, u, 1.0);
+    if factor.is_finite() {
+        factor
+    } else {
+        let alpha = p - 1.0;
+        (alpha / madd64(alpha, f64::from(u), 1.0)) as f32
+    }
 }
 
 /// The per-lane factor `α_enter / (1 + α_enter·u) - α_exit / (1 + α_exit·u)`
 /// of a return edge, shared by every [`interaction_delta`] of that edge.
-fn edge_factors(rule: &QuadratureRule, p_enter: f32, p_exit: f32) -> Lanes {
-    let alpha_enter = p_enter - 1.0;
+fn edge_factors(rule: &QuadratureRule, p_enter: f64, p_exit: f64) -> Lanes {
     let mut edge = [0.0; POINTS];
     if p_exit == 1.0 {
         for (e, &u) in edge.iter_mut().zip(&rule.nodes) {
-            *e = alpha_enter / madd(alpha_enter, u, 1.0);
+            *e = edge_factor(p_enter, u);
         }
     } else {
-        let alpha_exit = p_exit - 1.0;
         for (e, &u) in edge.iter_mut().zip(&rule.nodes) {
-            *e = alpha_enter / madd(alpha_enter, u, 1.0) - alpha_exit / madd(alpha_exit, u, 1.0);
+            *e = edge_factor(p_enter, u) - edge_factor(p_exit, u);
         }
     }
     edge
 }
 
 /// The part of [`edge_delta`] attributable to a path partner currently
-/// entered with probability `q`, given the edge's [`edge_factors`].
-fn interaction_delta(rule: &QuadratureRule, h: &Lanes, edge: &Lanes, q: f32) -> f32 {
+/// entered with probability `q`, given the edge's [`edge_factors`]; redone in
+/// `f64` when the `f32` sum overflows, like [`edge_delta`].
+fn interaction_delta(rule: &QuadratureRule, h: &Lanes, edge: &Lanes, q: f64) -> f32 {
     if q == 1.0 {
         return 0.0;
     }
-    let alpha_q = q - 1.0;
+    let alpha_q = q as f32 - 1.0;
     let mut acc = 0.0f32;
     for ((&hi, &e), &u) in h.iter().zip(edge).zip(&rule.nodes) {
         acc += alpha_q * hi * e / madd(alpha_q, u, 1.0);
     }
-    acc
+    if acc.is_finite() {
+        return acc;
+    }
+    let alpha_q = q - 1.0;
+    h.iter()
+        .zip(edge)
+        .zip(&rule.nodes)
+        .map(|((&hi, &e), &u)| {
+            alpha_q * f64::from(hi) * f64::from(e) / madd64(alpha_q, f64::from(u), 1.0)
+        })
+        .sum::<f64>() as f32
 }
 
 /// [`ShapNode::first`] marker for a leaf.
@@ -345,7 +385,7 @@ impl ShapTree {
 /// How return edges are written: additive contributions or interactions.
 trait Formulation {
     /// Enter the child of a split on `feature` with path probability `p`.
-    fn push(&mut self, feature: u32, p: f32);
+    fn push(&mut self, feature: u32, p: f64);
     /// Leave the child entered by the matching [`Formulation::push`].
     fn pop(&mut self);
     /// Record the return edge of `feature` given the subtree return `h`.
@@ -354,8 +394,8 @@ trait Formulation {
         rule: &QuadratureRule,
         feature: u32,
         h: &Lanes,
-        p_enter: f32,
-        p_exit: f32,
+        p_enter: f64,
+        p_exit: f64,
     );
 }
 
@@ -366,7 +406,7 @@ struct Additive<'a> {
 
 impl Formulation for Additive<'_> {
     #[inline(always)]
-    fn push(&mut self, _feature: u32, _p: f32) {}
+    fn push(&mut self, _feature: u32, _p: f64) {}
 
     #[inline(always)]
     fn pop(&mut self) {}
@@ -377,8 +417,8 @@ impl Formulation for Additive<'_> {
         rule: &QuadratureRule,
         feature: u32,
         h: &Lanes,
-        p_enter: f32,
-        p_exit: f32,
+        p_enter: f64,
+        p_exit: f64,
     ) {
         self.phi[feature as usize] += edge_delta(rule, h, p_enter, p_exit);
     }
@@ -391,7 +431,7 @@ const NO_ENTRY: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 struct PathEntry {
     feature: u32,
-    p: f32,
+    p: f64,
     /// Index of this feature's previous occurrence on the path.
     prev: u32,
     /// A later occurrence of the same feature hides this one from partners.
@@ -413,7 +453,7 @@ struct Interaction<'a> {
 }
 
 impl Formulation for Interaction<'_> {
-    fn push(&mut self, feature: u32, p: f32) {
+    fn push(&mut self, feature: u32, p: f64) {
         let prev = self.last[feature as usize];
         if prev != NO_ENTRY {
             self.path[prev as usize].shadowed = true;
@@ -440,8 +480,8 @@ impl Formulation for Interaction<'_> {
         rule: &QuadratureRule,
         feature: u32,
         h: &Lanes,
-        p_enter: f32,
-        p_exit: f32,
+        p_enter: f64,
+        p_exit: f64,
     ) {
         let f = feature as usize;
         self.diag[f] = madd(
@@ -485,7 +525,7 @@ struct Walk<'a, F> {
     tree: &'a ShapTree,
     row: &'a [f32],
     rule: &'a QuadratureRule,
-    path_prob: &'a mut [f32],
+    path_prob: &'a mut [f64],
     form: F,
 }
 
@@ -548,6 +588,13 @@ impl<F: Formulation> Walk<'_, F> {
 
     /// Descend `branch` from a node with basis `c` and path cover product
     /// `w_prod`, writing the child's weighted return into `out`.
+    ///
+    /// Path probabilities are stored in `f64` but computed in `f32` like
+    /// XGBoost's, so they are `f32` values unless a feature repeated down
+    /// the path divides its probability past `f32`'s range (e.g. child cover
+    /// fractions of `2^-32` four times, `2^128`); that one continues in
+    /// `f64`, and the recurrences reading it fall back to `f64` where their
+    /// `f32` results overflow.
     fn child(&mut self, branch: Branch, c: &Lanes, w_prod: f32, out: &mut Lanes) {
         let Branch {
             feature,
@@ -560,27 +607,36 @@ impl<F: Formulation> Walk<'_, F> {
         let seen = p_old != UNSEEN;
         let p_enter = match (satisfies, seen) {
             (false, _) => 0.0,
-            (true, false) => 1.0 / weight,
-            (true, true) => p_old / weight,
+            (true, false) => f64::from(1.0 / weight),
+            (true, true) => {
+                let p = p_old as f32 / weight;
+                if p.is_finite() {
+                    f64::from(p)
+                } else {
+                    p_old / f64::from(weight)
+                }
+            }
         };
         let mut c_child = *c;
-        let alpha = p_enter - 1.0;
+        let alpha = p_enter as f32 - 1.0;
         for (ci, &u) in c_child.iter_mut().zip(&rule.nodes) {
             *ci *= madd(alpha, u, 1.0);
         }
         if seen {
-            let alpha_old = p_old - 1.0;
+            let alpha_old = p_old as f32 - 1.0;
             if alpha_old != 0.0 {
                 for ((ci, &u), &c0) in c_child.iter_mut().zip(&rule.nodes).zip(c) {
                     let old = madd(alpha_old, u, 1.0);
-                    *ci = if ci.is_finite() {
+                    *ci = if ci.is_finite() && old.is_finite() {
                         *ci / old
                     } else {
-                        // The f32 product overflowed before dividing out the
-                        // overwritten factor; the quotient may still be
-                        // finite, so redo this lane in f64.
-                        let enter = madd(alpha, u, 1.0);
-                        (f64::from(c0) * f64::from(enter) / f64::from(old)) as f32
+                        // A factor overflowed f32 before the overwritten one
+                        // was divided out; the quotient may still be finite,
+                        // so redo this lane in f64.
+                        let u = f64::from(u);
+                        let enter = madd64(p_enter - 1.0, u, 1.0);
+                        let old = madd64(p_old - 1.0, u, 1.0);
+                        (f64::from(c0) * enter / old) as f32
                     };
                 }
             }
@@ -805,7 +861,7 @@ impl BoostedModel {
             rows: RowBlock<'a>,
             contribs: Vec<f32>,
             diag: Vec<f32>,
-            path_prob: Vec<f32>,
+            path_prob: Vec<f64>,
             path: Vec<PathEntry>,
             last: Vec<u32>,
         }

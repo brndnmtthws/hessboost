@@ -226,7 +226,7 @@ use crate::error::{HessboostError, Result};
 use crate::objective::create_objective;
 use crate::objective::distributional::{Dist, DistFamily};
 use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, key};
-use crate::tree::{RegTree, scalar_tree_output};
+use crate::tree::{RegTree, UncheckedRegTree, scalar_tree_output};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -236,6 +236,7 @@ use std::sync::OnceLock;
 /// The kind of feature-importance score to compute, mirroring XGBoost's
 /// `importance_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImportanceType {
     /// Number of times a feature is used to split.
     Weight,
@@ -261,7 +262,14 @@ pub enum ImportanceType {
 /// `i * trees_per_iteration`, grouped by output (`num_parallel_tree` trees
 /// for output 0, then output 1, ...). Tree `t` therefore feeds output
 /// `(t / num_parallel_tree) % n_outputs`.
+///
+/// The serde implementations are the native JSON format
+/// ([`to_json`](Self::to_json) / [`from_json`](Self::from_json)).
+/// Deserializing validates the model like every loader does and refuses an
+/// inconsistent one, so a model deserialized through serde directly is as
+/// safe to predict with and train on as a loaded one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedBoostedModel")]
 #[allow(
     clippy::unsafe_derive_deserialize,
     reason = "the type's only unsafe code is the optional Metal backend's \
@@ -307,14 +315,63 @@ pub struct BoostedModel {
     compact: OnceLock<CompactForest>,
 }
 
+/// The serialized fields of a [`BoostedModel`] (the native JSON format:
+/// same names and layout), before validation. `BoostedModel`'s
+/// `Deserialize` converts it with [`BoostedModel::try_from`], which runs
+/// [`BoostedModel::validate_structure`].
+#[derive(Deserialize)]
+struct UncheckedBoostedModel {
+    trees: Vec<UncheckedRegTree>,
+    base_score: Vec<f32>,
+    objective: String,
+    objective_params: ObjectiveParams,
+    num_class: usize,
+    n_outputs: usize,
+    n_targets: usize,
+    n_features: usize,
+    best_iteration: Option<usize>,
+    tree_weights: Vec<f32>,
+    num_parallel_tree: usize,
+    linear: Option<LinearModel>,
+}
+
+impl TryFrom<UncheckedBoostedModel> for BoostedModel {
+    type Error = HessboostError;
+
+    fn try_from(m: UncheckedBoostedModel) -> Result<Self> {
+        let model = BoostedModel {
+            trees: m
+                .trees
+                .into_iter()
+                .map(UncheckedRegTree::into_unchecked)
+                .collect(),
+            base_score: m.base_score,
+            objective: m.objective,
+            objective_params: m.objective_params,
+            num_class: m.num_class,
+            n_outputs: m.n_outputs,
+            n_targets: m.n_targets,
+            n_features: m.n_features,
+            best_iteration: m.best_iteration,
+            tree_weights: m.tree_weights,
+            num_parallel_tree: m.num_parallel_tree,
+            linear: m.linear,
+            compact: OnceLock::new(),
+        };
+        model.validate_structure()?;
+        Ok(model)
+    }
+}
+
 /// The parameters of a linear (`gblinear`) booster: a per-output weight vector
 /// plus a per-output bias, fit by coordinate descent.
 ///
 /// `weights` has length `n_features * n_outputs` laid out `[feature][output]`
 /// (the weight for feature `f`, output `k` is `weights[f * n_outputs + k]`).
-/// `bias` has length `n_outputs`.
+/// `bias` has length `n_outputs`. Checked by the owning model
+/// ([`BoostedModel::validate_structure`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LinearModel {
+pub(crate) struct LinearModel {
     weights: Vec<f32>,
     bias: Vec<f32>,
 }
@@ -1265,11 +1322,11 @@ impl BoostedModel {
     }
 
     /// Deserialize a model from a JSON string produced by
-    /// [`BoostedModel::to_json`].
+    /// [`BoostedModel::to_json`]. Malformed JSON is refused with
+    /// [`HessboostError::Json`], an inconsistent model with
+    /// [`HessboostError::ModelFormat`].
     pub fn from_json(s: &str) -> Result<Self> {
-        let model: Self = serde_json::from_str(s)?;
-        model.validate_structure()?;
-        Ok(model)
+        Self::try_from(serde_json::from_str::<UncheckedBoostedModel>(s)?)
     }
 
     pub(crate) fn validate_structure(&self) -> Result<()> {
@@ -1329,14 +1386,21 @@ impl BoostedModel {
                 self.objective_params.distribution, self.objective
             )));
         }
-        if let Some(best) = self.best_iteration
-            && self.linear.is_none()
-            && best >= self.num_boost_rounds()
-        {
-            return Err(HessboostError::ModelFormat(format!(
-                "best_iteration {best} is out of range for {} iterations",
-                self.num_boost_rounds()
-            )));
+        // Early stopping selects iterations of a tree ensemble; gblinear has
+        // none (training refuses early stopping for it), and a stored value
+        // would make plain prediction ask it for an iteration range.
+        if let Some(best) = self.best_iteration {
+            if self.linear.is_some() {
+                return Err(HessboostError::ModelFormat(format!(
+                    "gblinear models have no boosting iterations, but best_iteration is {best}"
+                )));
+            }
+            if best >= self.num_boost_rounds() {
+                return Err(HessboostError::ModelFormat(format!(
+                    "best_iteration {best} is out of range for {} iterations",
+                    self.num_boost_rounds()
+                )));
+            }
         }
         if self.base_score.len() != self.n_outputs()
             || self.base_score.iter().any(|v| !v.is_finite())
@@ -1533,6 +1597,9 @@ fn rebuild_objective(
 /// margins. A built-in objective that cannot be rebuilt from the stored
 /// configuration (e.g. a distribution with a label matrix) is a format error,
 /// since predicting without its transform would misreport every output.
+/// So is a `num_class >= 2` on a built-in objective other than
+/// `multi:softmax`/`multi:softprob`: XGBoost reads `num_class` as the
+/// multiclass class count and refuses it together with several targets.
 pub(crate) fn check_objective_width(
     objective: &str,
     params: &ObjectiveParams,
@@ -1545,6 +1612,11 @@ pub(crate) fn check_objective_width(
             Err(HessboostError::ModelFormat(format!(
                 "objective `{objective}` has {} outputs but the model stores {n_outputs}",
                 rebuilt.n_outputs()
+            )))
+        }
+        Ok(_) if num_class >= 2 && !matches!(objective, "multi:softmax" | "multi:softprob") => {
+            Err(HessboostError::ModelFormat(format!(
+                "num_class {num_class} applies only to multiclass objectives, not `{objective}`"
             )))
         }
         Ok(_)
@@ -1948,10 +2020,11 @@ mod tests {
             .unwrap()
             .with_label_matrix(&y, 2)
             .unwrap();
+        // Built unchecked: `train` itself must refuse the layout, whatever the
+        // builder's own bounds.
         let params = TrainingParams::builder()
             .num_parallel_tree(1usize << (usize::BITS - 1))
-            .build()
-            .unwrap();
+            .build_unchecked();
         for rounds in [0, 1] {
             assert!(matches!(
                 train(&params, &d, rounds),
@@ -2002,5 +2075,97 @@ mod tests {
                 Err(HessboostError::ModelFormat(_))
             ));
         }
+    }
+
+    /// A gblinear model and its native JSON document.
+    fn gblinear_doc() -> (BoostedModel, serde_json::Value) {
+        let x: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        let d = labeled_dense(&x, 10, 2, &[1.0; 10]);
+        let params = TrainingParams::builder()
+            .booster(crate::config::BoosterKind::GbLinear)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 2).unwrap();
+        let doc = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        (model, doc)
+    }
+
+    /// Deserializing through serde directly validates like `from_json`: an
+    /// empty gblinear bias used to load and panic in prediction, and a cyclic
+    /// tree used to load and loop forever in traversal.
+    #[test]
+    fn serde_deserialization_validates_the_model() {
+        let (model, mut doc) = gblinear_doc();
+        let valid: BoostedModel = serde_json::from_value(doc.clone()).unwrap();
+        let d = DMatrix::from_dense(&[1.0, 2.0], 1, 2).unwrap();
+        assert_eq!(valid.predict(&d).unwrap(), model.predict(&d).unwrap());
+        doc["linear"]["bias"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<BoostedModel>(doc.clone()).is_err());
+        assert!(matches!(
+            BoostedModel::from_json(&doc.to_string()),
+            Err(HessboostError::ModelFormat(_))
+        ));
+
+        let d = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 0.0, 1.0, 1.0]);
+        let model = train(&TrainingParams::default(), &d, 1).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        assert!(doc["trees"][0]["nodes"].as_array().unwrap().len() > 1);
+        doc["trees"][0]["nodes"][0]["left"] = 0.into();
+        assert!(serde_json::from_value::<BoostedModel>(doc.clone()).is_err());
+        assert!(matches!(
+            BoostedModel::from_json(&doc.to_string()),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
+
+    /// gblinear has no boosting iterations, so a stored `best_iteration`
+    /// (which training never writes for it) is refused at load instead of
+    /// making every plain prediction fail on its iteration range.
+    #[test]
+    fn gblinear_refuses_best_iteration() {
+        let (model, mut doc) = gblinear_doc();
+        doc["best_iteration"] = 0.into();
+        assert!(matches!(
+            BoostedModel::from_json(&doc.to_string()),
+            Err(HessboostError::ModelFormat(_))
+        ));
+        let mut stopped = model.clone();
+        stopped.set_best_iteration(Some(0));
+        assert!(matches!(
+            BoostedModel::from_bytes(&stopped.to_bytes().unwrap()),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
+
+    /// `num_class` counts multiclass classes (XGBoost refuses it with
+    /// several targets), so a two-target `binary:logistic` model with
+    /// `num_class = 2` is neither trained nor loaded.
+    #[test]
+    fn num_class_applies_only_to_multiclass_objectives() {
+        let x = [0.0f32, 1.0, 2.0, 3.0];
+        let y = [0.0f32, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+        let d = DMatrix::from_dense(&x, 4, 1)
+            .unwrap()
+            .with_label_matrix(&y, 2)
+            .unwrap();
+        let params = |num_class| {
+            TrainingParams::builder()
+                .objective("binary:logistic")
+                .num_class(num_class)
+                .build()
+                .unwrap()
+        };
+        assert!(matches!(
+            train(&params(2), &d, 1),
+            Err(HessboostError::InvalidParameter { .. })
+        ));
+        let model = train(&params(0), &d, 1).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        assert!(BoostedModel::from_json(&doc.to_string()).is_ok());
+        doc["num_class"] = 2.into();
+        assert!(matches!(
+            BoostedModel::from_json(&doc.to_string()),
+            Err(HessboostError::ModelFormat(_))
+        ));
     }
 }

@@ -4,9 +4,9 @@ hessboost is a Rust reimplementation of XGBoost gradient boosting: one
 library crate, with no C/C++ or FFI apart from the `zstd` crate (the
 official libzstd, compressing native model files) and, on macOS with the
 opt-in `metal` feature, the `objc2-metal` bindings to Apple's Metal
-framework. User docs are `README.md`, the rustdoc (`src/lib.rs` and module
-docs), `examples/`, and `docs/performance.md`. This file covers working on
-the code.
+framework. User docs are `README.md`, `CHANGELOG.md`, the rustdoc
+(`src/lib.rs` and module docs), `examples/`, and `docs/performance.md`.
+This file covers working on the code.
 
 ## Toolchain
 
@@ -17,7 +17,12 @@ binaries), cargo-nextest, and uv; run `mise install` (an enter hook runs
 refresh it with `mise lock` after changing a version. Edition
 2024, MSRV 1.93 (`rust-version` in `Cargo.toml`). `Cargo.lock` is
 gitignored, so never pass `--locked`. Building needs a C compiler for libzstd
-(`zstd-sys`); a cross-target build needs one for that target.
+(`zstd-sys`); a cross-target build needs one for that target. docs.rs
+builds only its Linux default target (there is no
+`[package.metadata.docs.rs]`: it has no Apple SDK to build `zstd-sys` for a
+macOS target), so the Metal API renders only in a local
+`cargo doc --features metal` on macOS. `include` in `Cargo.toml` lists what
+the published crate ships.
 
 ## Commands
 
@@ -107,7 +112,7 @@ nouns there.
 | `training/` | `train` (`train`, `Trainer`, `TrainResult`; gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `gblinear` (coordinate descent), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv`, `budget` (public; opt-in PerpetualBooster-style training) |
 | `model/` | `mod.rs` (`BoostedModel`: iteration layout, slicing, `iteration_range` prediction, save/load entry points; user docs for XGBoost interchange), `native` (native binary container), `sections` (section table shared by the native and compact formats), `shap` (QuadratureTreeSHAP), `compact` (public; `CompactModel`, `HBTD` format), `xgboost` (XGBoost JSON/UBJSON schema mapping), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `conformal.rs` | split-conformal / CQR intervals (`SplitConformal`, `ConformalizedQuantile`) |
-| `backend/` | opt-in compute backends: `metal/` (macOS, `metal` feature; `MetalHistBackend` for GPU histograms, `GpuModel` for GPU prediction, runtime-compiled MSL kernels, exact double-float accumulation) |
+| `backend/` | opt-in compute backends: `metal.rs` (macOS, `metal` feature; `MetalHistBackend` for GPU histograms, `GpuModel` for GPU prediction, runtime-compiled MSL kernels, exact 64-bit integer histogram sums), `exact_sum.rs` (`SumDomain`: when those sums equal the CPU's `f64` chain, with the proof; compiled and tested on every platform) |
 | `simd/` | private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests` |
 | `test_support.rs` | unit-test helpers (`cfg(test)`) |
 
@@ -148,9 +153,12 @@ nouns there.
   by seed and index (`rng.rs`), so they do not depend on scheduling.
   Quantized histograms sum integers exactly. `rand` is a dev-dependency
   only. A `device = metal` training run reproduces the single-threaded CPU
-  model bit for bit: the GPU kernels accumulate exact double-float
-  (two-sum) partials in a fixed chunk/slice/merge order, with no atomics,
-  and every constant is machine-independent (`src/backend/metal.rs`).
+  model bit for bit: gradients are staged as integer multiples of each
+  component's grain, the GPU adds them in 64-bit integers (exact in any
+  order, no atomics), and a node goes to the GPU only inside the domain
+  where the CPU's `f64` chain is exact too (`n * max <= 2^53` grains,
+  `backend/exact_sum.rs`). Other nodes, small nodes, non-finite gradients,
+  and failed command buffers run on the CPU's sequential path.
 - **Unsafe:** confined to `simd/`, the hot loops in `tree/compact.rs`,
   `tree/hist/`, and `tree/builder/hist.rs`, and the Metal FFI in
   `backend/metal.rs`. Every block needs a `// SAFETY:` comment;
@@ -165,9 +173,10 @@ nouns there.
   optimized paths must stay bit-identical to the plain ones.
 - **Parity:** the target is XGBoost 3.4.2 (whose release notes call it
   numerically identical to 3.4.1). Fixture tiers: `exact` (pointwise
-  train/import/export), `quality` (RNG-driven cases, i.e. subsampling,
-  column sampling, and DART, plus `rank:*` objectives; training within a
-  quality band, import/export still pointwise), and `trainonly` (gblinear).
+  train/import/export, including the `rank:*` objectives), `quality`
+  (RNG-driven cases, i.e. subsampling, column sampling, forests, and DART;
+  training within a quality band, import/export still pointwise), and
+  `trainonly` (gblinear).
   Two sampling structures deliberately differ from XGBoost and are covered
   only by the band: under `hist`, a multi-output model's outputs share each
   parallel tree's uniform row sample (XGBoost draws one per output group),
@@ -180,7 +189,7 @@ nouns there.
   exact builders. Beyond-XGBoost features are opt-in, leave default training
   unchanged, and stay out of the parity fixtures.
 - **Formats:** from 0.2.0 on, files written by a release keep loading in
-  every later one (0.1.x native binaries are refused).
+  every later one (0.1.x native binary and JSON files are refused).
   - Native binary (`model/native.rs`): a zstd frame holding `SQB\0`, a
     container version byte (`CONTAINER_VERSION`, currently 3), a section
     table (`model/sections.rs`), and an XXH64 checksum of the preceding
@@ -193,9 +202,16 @@ nouns there.
     objective's defaults). Changing an existing section's meaning or the
     container layout bumps `CONTAINER_VERSION`; the reader accepts only the
     current version, so such a change must add a reader for the previous
-    one.
-  - Native JSON (`BoostedModel`'s serde fields by name): a new field needs
-    `#[serde(default)]` reproducing older files.
+    one. The reader bounds decompression (`ALWAYS_ALLOWED`,
+    `MAX_EXPANSION`); a container whose zstd frame would exceed that is
+    written uncompressed, which the reader also accepts, so every save
+    loads.
+  - Native JSON (the serde fields by name): `BoostedModel`, `RegTree`, and
+    `LinearLeaves` deserialize through `#[serde(try_from = "Unchecked…")]`
+    mirrors (`UncheckedBoostedModel`, `UncheckedRegTree`,
+    `UncheckedLinearLeaves`) and validate the result. A new serialized field
+    goes in both the type and its mirror, with `#[serde(default)]` on the
+    mirror reproducing older files.
   - Compact (`HBTD`, documented in `model/compact.rs`): metadata is a
     section table like the native one; a change to the bit stream bumps its
     version byte (currently 1).
@@ -221,14 +237,17 @@ nouns there.
   `num_target` counts outputs (label columns or alphas), and is 1 for
   multiclass, which uses `num_class`.
 - **Objective/metric hooks:** training and evaluation read data only through
-  `MetaInfo` hooks: `Objective::gradient_info`, `base_margins_info`,
-  `eval_transform`, `validate_info`, `requires_labels`;
-  `Metric::eval_info`, `validate_info`, `prediction_width`,
-  `supports_label_matrix`. Specialized paths add `Objective::split_gradient`
-  (vector-leaf structure search), `pointwise_loss` (budget mode), and
-  `probs_to_margins`/`margins_to_probs` (XGBoost `base_score` import/export;
-  `margins_to_probs` defaults to `pred_transform`, and `binary:hinge`
-  overrides it because its threshold is not its link).
+  `MetaInfo` hooks: `Objective::gradient_info`, `base_margins_info` (the
+  only intercept hook), `eval_transform`, `validate_info`,
+  `requires_labels`; `Metric::eval_info`, `validate_info`,
+  `prediction_width`, `supports_label_matrix`. Specialized paths add
+  `Objective::split_gradient` (vector-leaf structure search),
+  `pointwise_loss` (budget mode), `probs_to_margins` (the only link hook,
+  identity by default: a user `base_score`, an imported XGBoost
+  `base_score`, and the default Newton intercept go through it), and
+  `margins_to_probs` (XGBoost `base_score` export; defaults to
+  `pred_transform`, and `binary:hinge` and `reg:quantileerror` override it
+  because their transform is not their inverse link).
   - Label-domain checks live in each objective's `validate_info`.
   - `create_objective(params, n_targets)` wraps the objectives in
     `MULTI_TARGET_OBJECTIVES` (`objective/mod.rs`) in
@@ -247,13 +266,20 @@ nouns there.
   never silently ignored. Checks live in `TrainingParams::validate`
   (`device = metal` needs the `metal` feature on macOS, `tree_method =
   hist`/`auto`, and a tree booster, and refuses `use_quantized_grad` and
-  `process_type = update`), `training/multi_output.rs::validate`
+  `process_type = update`; `gblinear` refuses row and column sampling,
+  `gradient_based`, `num_parallel_tree > 1`, and tree constraints;
+  `num_parallel_tree` is at most `MAX_NUM_PARALLEL_TREE`), `train_impl` in
+  `training/train.rs` (data-dependent checks, e.g. feature weights with
+  `gblinear` or `process_type = update`), `training/multi_output.rs::validate`
   (`multi_output_tree` needs `hist` or `auto`, and refuses vector-leaf
-  trees on a GPU device), `training/continuation.rs` (`process_type=update`),
-  and `training/budget.rs`. Budget mode compares the serialized params
-  against the defaults plus its allow-list, so a non-default value of any
-  field it does not read, including one added later, is refused
-  automatically.
+  trees on a GPU device), `training/continuation.rs` (init-model structure
+  and compatibility, `process_type=update`), `metric/mod.rs::build` (only
+  `ndcg`/`map`/`pre` take an `@k` suffix and `tweedie-nloglik` an `@rho`;
+  any other suffix is refused), and `training/budget.rs`. Budget mode and
+  the refresh updater (`reject_unused_by_refresh`) compare the serialized
+  params against the defaults plus an allow-list of what they read, so a
+  non-default value of any other field, including one added later, is
+  refused automatically.
 - **Parity-fixed options:** options that XGBoost has but hessboost supports
   at one setting (README, "Not implemented") are not `TrainingParams`
   fields. `tests/parity.rs` (`expect_fixed`) fails a fixture that sets
@@ -279,6 +305,11 @@ The crate root exports only modules. Rules:
   `HistTreeBuilder`, `CpuBackend`, `HistogramBackend`, `zeroed`,
   `ColumnSampler`) through the `#[doc(hidden)] pub mod internals` in
   `lib.rs`, which is not public API.
+- `#[non_exhaustive]` goes on every public enum, every struct with public
+  fields, and every unit-struct built-in that could grow (a new variant,
+  field, or parameter); users build them from `Default`, a builder, or a
+  constructor (`SplitGradient::new`) and assign fields. Only closed sets
+  stay exhaustive (`Monotone`, `GradPair`, `Dist`'s variants).
 
 Paths: `config` (`TrainingParams`, `TrainingParamsBuilder`, the parameter
 enums, `ObjectiveParams`, `MAX_SYMMETRIC_DEPTH`); `data` (`DMatrix`,
@@ -324,9 +355,10 @@ enums, `ObjectiveParams`, `MAX_SYMMETRIC_DEPTH`); `data` (`DMatrix`,
     `save_binary`/`load_binary`; native JSON `to_json`/`from_json`,
     `save_json`/`load_json`; XGBoost `{to,from,save,load}_xgboost_json` and
     `{to,from,save,load}_xgboost_ubjson`.
-  - Compact: `to_compact()` / `to_compact_bytes()` → `model::compact::CompactModel`
+  - Compact: `to_compact()` → `model::compact::CompactModel`
     (`from_bytes`/`load`, `to_bytes`/`save`, `predict_margin` bit-identical
-    to the source, `predict`); `size_report()` → `ModelSizeReport`.
+    to the source, `predict`), `to_compact_bytes()` → its serialized bytes;
+    `size_report()` → `ModelSizeReport`.
 - `conformal`: `SplitConformal::calibrate(&model, &dcal, alpha)`;
   `ConformalizedQuantile::calibrate(&lower, &upper, &dcal, alpha)` /
   `calibrate_outputs(&model, lower_output, upper_output, &dcal, alpha)` /
@@ -349,14 +381,18 @@ forest; XGBoost export, SHAP, and the compact format refuse them.
 
 Update, in the same change: the rustdoc of the touched items, the
 README feature lists (and "Not implemented"), the `lib.rs` "What's here"
-list, this file's layout and invariants, and the examples that exercise it.
+list, this file's layout and invariants, the examples that exercise it,
+and `CHANGELOG.md` (the upcoming version's section) for user-visible
+changes.
 New options need a `TrainingParams` field, builder setter, and validation;
 beyond-XGBoost options must default to off.
 
 ## Releases
 
 Bump `version` in `Cargo.toml`, write `tests/data/saved/<version>/` (see
-Formats), merge, then push a `v<version>` tag: `publish.yml` checks the tag
-against the crate version, runs the tests on all three platforms, publishes
-to crates.io, and creates the GitHub release (notes grouped by
-`.github/release.yml`) with a discussion.
+Formats), date the version's `CHANGELOG.md` section (`## [x.y.z] -
+YYYY-MM-DD`), merge, then push a `v<version>` tag: `publish.yml` checks the
+tag against the crate version and the dated CHANGELOG section, runs the
+tests on all three platforms, publishes to crates.io, and creates the
+GitHub release (the CHANGELOG section followed by the pull requests,
+grouped by `.github/release.yml`) with a discussion.

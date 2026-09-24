@@ -12,11 +12,14 @@ plus the same model's UBJSON encoding (`save_raw("ubj")`) as the sidecar
 contract between the two.
 
 Tiers:
-  exact    every assertion is pointwise (train, import, export).
-  quality  the model is RNG-driven (subsample, colsample, DART) or the objective
-           is not yet measured for pointwise agreement (rank:*), so training is
-           held to a quality band instead: RMSE <= band * xgb RMSE, or
-           accuracy / NDCG@20 >= xgb - band. Import/export stay pointwise.
+  exact      every assertion is pointwise (train, import, export); this
+             includes the rank:* objectives.
+  quality    the model is RNG-driven (subsample, colsample, DART, forests), so
+             training is held to a quality band instead: RMSE <= band * xgb
+             RMSE, or accuracy / NDCG@20 >= xgb - band. Import/export stay
+             pointwise.
+  trainonly  gblinear: training is pointwise; XGBoost-format import/export is
+             unsupported.
 
 Usage:
     uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py

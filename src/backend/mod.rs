@@ -9,11 +9,22 @@
 //!   `BoostedModel::to_gpu`).
 //!
 //! The backends keep the crate's determinism contract: a GPU run reproduces
-//! the single-threaded CPU result bit for bit on every realistic dataset (see
-//! [`metal`] for the exact guarantee and its edge cases), and repeats itself
-//! exactly across runs and machines.
+//! the single-threaded CPU result bit for bit (work the GPU cannot compute
+//! exactly runs on the CPU; see [`metal`]), and repeats itself exactly
+//! across runs and machines.
 //!
 //! A future `wgpu` backend will extend the same seam to Linux and Windows.
+
+/// When the Metal backend's integer histogram sums reproduce the CPU's
+/// `f64` chain (platform-independent, so its proof is tested everywhere).
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "metal")),
+    allow(
+        dead_code,
+        reason = "only the Metal backend calls it; its unit tests run on every platform"
+    )
+)]
+mod exact_sum;
 
 /// The native Metal backend (macOS, `metal` feature).
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -25,11 +36,16 @@ pub mod metal;
 /// [`GpuModel`](self::metal::GpuModel) handle, which
 /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) then never
 /// constructs — it always returns an error naming the missing feature.
+///
+/// These docs are the stand-in (docs.rs builds on Linux). The Metal API and
+/// the backend's design, exactness bound, and limitations are documented
+/// in the real module: run `cargo doc --features metal --open` on macOS.
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
 pub mod metal {
     /// The GPU predictor handle when the Metal backend is not compiled in.
     /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) then
     /// always returns an error, so this is never constructed.
     #[derive(Debug)]
+    #[non_exhaustive]
     pub struct GpuModel;
 }

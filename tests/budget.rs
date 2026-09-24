@@ -367,6 +367,69 @@ fn undefined_root_generalization_keeps_the_best_split() {
     assert!(p[0] == p[1] && p[2] == p[3] && p[1] < p[2], "{p:?}");
 }
 
+/// One tree of `data`, which must train and load back from the native
+/// format; returns its training predictions and the reason training stopped.
+fn one_saved_tree(data: &DMatrix) -> (Vec<f32>, BudgetStop) {
+    let result = train_with_budget(
+        &params("reg:squarederror"),
+        data,
+        &BudgetConfig::default().iteration_limit(1),
+    )
+    .unwrap();
+    let loaded = BoostedModel::from_bytes(&result.model.to_bytes().unwrap()).unwrap();
+    (loaded.predict(data).unwrap(), result.stop)
+}
+
+/// Separating the `±1e20` labels gains about `1e40`, which `f32` cannot
+/// hold: that split is skipped for the representable one isolating the last
+/// row, instead of storing an infinite gain the formats refuse to load.
+#[test]
+fn unrepresentable_split_gains_are_skipped() {
+    let data = labeled_dense(&[0.0, 1.0, 2.0], 1, &[1e20, -1e20, 5.0]);
+    let (p, _) = one_saved_tree(&data);
+    assert!(p[0] == p[1] && p[1] < p[2], "{p:?}");
+
+    // With no representable split the root stays a leaf.
+    let data = labeled_dense(&[0.0, 1.0], 1, &[-1e20, 1e20]);
+    let (p, stop) = one_saved_tree(&data);
+    assert_eq!((p[0], stop), (p[1], BudgetStop::RootUnsplittable));
+}
+
+/// A root whose Hessian sum overflows `f32` cannot be stored: training fails
+/// like the ordinary trainer does rather than returning an unloadable model.
+#[test]
+fn roots_with_overflowing_hessian_sums_are_errors() {
+    let data = labeled_dense(&[0.0, 0.0], 1, &[0.0, 0.0])
+        .with_weights(&[3e38, 3e38])
+        .unwrap();
+    let params = params("reg:squarederror");
+    assert!(matches!(
+        train(&params, &data, 1),
+        Err(HessboostError::ModelFormat(_))
+    ));
+    assert!(matches!(
+        train_with_budget(&params, &data, &BudgetConfig::default()),
+        Err(HessboostError::ModelFormat(_))
+    ));
+}
+
+/// A root of at most eight rows without usable folds falls back to plain
+/// positive-gain splits over the same partitions the fold-checked search
+/// scores: here the gainful ones send the missing row left or split present
+/// from missing values, and on a categorical feature separate the categories.
+#[test]
+fn tiny_roots_try_missing_directions_and_categorical_splits() {
+    let data = labeled_dense(&[0.0, 1.0, f32::NAN], 1, &[0.0, 1.0, -1.0]);
+    let (p, _) = one_saved_tree(&data);
+    assert!(p[0] == p[2] && p[0] < p[1], "{p:?}");
+
+    let data = labeled_dense(&[0.0, 1.0], 1, &[0.0, 1.0])
+        .with_feature_types(&[FeatureType::Categorical])
+        .unwrap();
+    let (p, _) = one_saved_tree(&data);
+    assert!(p[0] < p[1], "{p:?}");
+}
+
 /// The `(name, reason)` of the invalid-parameter error `train_with_budget`
 /// refuses `params` / `config` with.
 fn rejection(
@@ -451,4 +514,14 @@ fn unsupported_objectives_and_budgets_are_rejected() {
         );
         assert_eq!(name, "budget", "budget {budget}");
     }
+}
+
+/// A `num_class` the single-output objective does not use would record an
+/// output layout saved models refuse; it is refused before training.
+#[test]
+fn num_class_the_objective_does_not_use_is_rejected() {
+    let data = regression(8, 17);
+    let params = TrainingParams::builder().num_class(3).build().unwrap();
+    let (name, _) = rejection(&params, &data, &BudgetConfig::new(0.5));
+    assert_eq!(name, "num_class");
 }

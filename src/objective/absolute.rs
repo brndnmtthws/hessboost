@@ -1,6 +1,7 @@
 //! Mean absolute error regression (`reg:absoluteerror`).
 
 use super::{GradPair, Objective, fit_stump, weighted_label_mean};
+use crate::data::MetaInfo;
 
 /// Total row weight in `f64` (`n_rows` without weights), or `None` when it is
 /// within `1e-6` of zero (XGBoost `common::CloseTo`).
@@ -14,7 +15,9 @@ fn total_weight(weights: Option<&[f32]>, n_rows: usize) -> Option<f64> {
 /// the `k` outputs of `preds` (`[row][output]`), where `label(i, j)` is the
 /// label output `j` of row `i` is fitted to. Each term `wᵢ √|r|` is formed in
 /// `f32` and summed in `f64` (XGBoost `common::Reduce`); a total weight
-/// within `1e-6` of zero (`common::CloseTo`) gives `S_j = 0`.
+/// within `1e-6` of zero (`common::CloseTo`) gives `S_j = 0`. Zero-weight
+/// rows are skipped (their term is `0`), so an overflowing residual there
+/// cannot turn the shared scale into `0 · ∞ = NaN`.
 pub(super) fn residual_scales(
     preds: &[f32],
     weights: Option<&[f32]>,
@@ -30,6 +33,9 @@ pub(super) fn residual_scales(
             let root_sum: f64 = (0..n)
                 .map(|i| {
                     let w = weights.map_or(1.0, |ws| ws[i]);
+                    if w == 0.0 {
+                        return 0.0;
+                    }
                     f64::from(w * (preds[i * k + j] - label(i, j)).abs().sqrt())
                 })
                 .sum();
@@ -48,7 +54,8 @@ pub(super) fn residual_scales(
 /// per output, the residual scale `δ_j = (Σ wᵢ √|rᵢⱼ| / Σ wᵢ)²` of `r =
 /// margin − label` and emits `g = w·r·c`, `h = w·c` with `c = δ /
 /// hypot(δ, r)` (`c = 1` when both are zero): the pseudo-Huber score with
-/// its majorizing curvature `1/√(1 + (r/δ)²)`, all in `f32`.
+/// its majorizing curvature `1/√(1 + (r/δ)²)`, all in `f32`. Zero-weight
+/// rows get zero pairs, even where `r` overflows.
 ///
 /// The intercept of each target is one Newton step of this surrogate from
 /// the target's (weighted) label mean, added to that mean — not a median.
@@ -107,7 +114,11 @@ impl Objective for AbsoluteError {
                     let norm = delta.hypot(residual);
                     let curvature = if norm > 0.0 { delta / norm } else { 1.0 };
                     let w = weights.map_or(1.0, |ws| ws[i]);
-                    *o = GradPair::new(w * residual * curvature, w * curvature);
+                    *o = if w == 0.0 {
+                        GradPair::default()
+                    } else {
+                        GradPair::new(w * residual * curvature, w * curvature)
+                    };
                 }
             };
         if k == 1 {
@@ -117,12 +128,8 @@ impl Objective for AbsoluteError {
         }
     }
 
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+        let (labels, weights) = (info.labels, info.weights);
         let k = self.n_targets;
         let n = labels.len() / k;
         if total_weight(weights, n).is_none() {
@@ -145,7 +152,7 @@ impl Objective for AbsoluteError {
     }
 
     /// The dataset must carry this objective's `n_targets` label columns.
-    fn validate_info(&self, info: &crate::data::MetaInfo) -> crate::error::Result<()> {
+    fn validate_info(&self, info: &MetaInfo) -> crate::error::Result<()> {
         super::check_label_width(info, self.n_targets)
     }
 
@@ -157,7 +164,7 @@ impl Objective for AbsoluteError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::gradient_pairs;
+    use crate::objective::{base_margins, gradient_pairs};
     use crate::training::Trainer;
 
     /// `δ = (Σ√|r| / n)²`; `g = r·δ/√(δ² + r²)`, `h = δ/√(δ² + r²)`, which
@@ -187,6 +194,23 @@ mod tests {
         );
     }
 
+    /// A zero-weight row whose residual overflows (`-f32::MAX - f32::MAX`)
+    /// is left out of the shared scale (it used to make it `0 · ∞ = NaN`,
+    /// zeroing every gradient) and gets a zero pair itself.
+    #[test]
+    fn zero_weight_rows_do_not_poison_the_scale() {
+        let obj = AbsoluteError::default();
+        let preds = [-f32::MAX, 0.0, 0.0];
+        let labels = [f32::MAX, 1.0, 2.0];
+        let out = gradient_pairs(&obj, &preds, &labels, Some(&[0.0, 1.0, 1.0]));
+        let rest = gradient_pairs(&obj, &preds[1..], &labels[1..], None);
+        assert_eq!(out, [GradPair::default(), rest[0], rest[1]]);
+        assert!(
+            rest.iter().all(|p| p.grad < 0.0 && p.hess > 0.0),
+            "{rest:?}"
+        );
+    }
+
     /// Output `j` fits label column `j` with its own scale.
     #[test]
     fn multi_target_uses_each_label_column() {
@@ -200,7 +224,7 @@ mod tests {
         assert_eq!([out[1], out[3]], [single[0], single[1]]);
         assert!(out[0].grad < 0.0 && out[1].grad > 0.0);
 
-        let margins = two.base_margins(&labels, None, None);
+        let margins = base_margins(&two, &labels, None);
         // Constant columns: the Newton step from the mean is zero.
         assert_eq!(margins, vec![1.0, -9.0]);
     }
@@ -216,11 +240,11 @@ mod tests {
         let preds = [mean; 3];
         let gpair = gradient_pairs(&obj, &preds, &labels, None);
         let expected = fit_stump(&gpair, 1)[0] + mean;
-        let got = obj.base_margins(&labels, None, None);
+        let got = base_margins(&obj, &labels, None);
         assert_eq!(got, vec![expected]);
         assert!(got[0] > 0.0 && got[0] < mean, "{got:?}");
         assert_eq!(
-            obj.base_margins(&labels, Some(&[0.0, 0.0, 0.0]), None),
+            base_margins(&obj, &labels, Some(&[0.0, 0.0, 0.0])),
             vec![0.0]
         );
     }

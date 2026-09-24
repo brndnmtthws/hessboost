@@ -237,3 +237,21 @@ fn categorical_splits_keep_their_monotone_leaves() {
         assert_eq!(preds, [0.0, 0.0, 2.0, 2.0], "extra_trees {extra_trees}");
     }
 }
+
+/// Separating the `±1e20` labels gains about `1e40`, beyond `f32`: the
+/// LightGBM searches skip that candidate on a categorical feature as they do
+/// on a numerical one, so training succeeds with the same (unsplit) model.
+#[test]
+fn categorical_splits_with_unrepresentable_gains_are_skipped() {
+    let x = [0.0, 1.0];
+    let y = [-1e20, 1e20];
+    let categorical = labeled_dense(&x, 1, &y)
+        .with_feature_types(&[FeatureType::Categorical])
+        .unwrap();
+    let numerical = labeled_dense(&x, 1, &y);
+    for builder in [base().extra_trees(true), base().path_smooth(1.0)] {
+        let params = builder.base_score(0.0).build().unwrap();
+        let preds = |data: &DMatrix| train(&params, data, 1).unwrap().predict(data).unwrap();
+        assert_eq!(preds(&categorical), preds(&numerical));
+    }
+}

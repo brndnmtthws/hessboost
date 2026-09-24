@@ -8,7 +8,9 @@
 //! stored intercept, while an absent one keeps it: the intercept is never
 //! re-estimated from the new labels.
 
-use crate::config::{BoosterKind, Monotone, ObjectiveParams, ProcessType, TrainingParams};
+use crate::config::{
+    BoosterKind, GrowPolicy, Monotone, ObjectiveParams, ProcessType, TrainingParams,
+};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
@@ -20,6 +22,8 @@ use crate::training::multi_output;
 /// early-stopping selection, carrying the new objective parameters, an
 /// explicit `base_score` from `params` when set (via `intercepts`), and one
 /// explicit weight per tree so appended trees line up with DART weights.
+/// `init` must be structurally valid (as every loaded model is), whichever
+/// way it was built, before its trees and intercepts are read.
 ///
 /// `best_iteration` is cleared because hessboost predicts with it by
 /// default: a stale selection from the earlier run would hide the new
@@ -33,6 +37,13 @@ pub(super) fn resume_model(
     num_boost_round: usize,
     intercepts: impl FnOnce() -> Result<Vec<f32>>,
 ) -> Result<BoostedModel> {
+    init.validate_structure().map_err(|e| {
+        let reason = match e {
+            HessboostError::ModelFormat(reason) => reason,
+            other => other.to_string(),
+        };
+        HessboostError::model_format(format!("invalid init model: {reason}"))
+    })?;
     let is_linear = init.linear().is_some();
     if is_linear != (params.booster == BoosterKind::GbLinear) {
         return Err(HessboostError::invalid_param(
@@ -122,7 +133,9 @@ pub(super) fn resume_model(
 }
 
 /// `process_type=update` refreshes existing gbtree trees one iteration per
-/// round (XGBoost `GBTree::InitNewTrees` in update mode).
+/// round (XGBoost `GBTree::InitNewTrees` in update mode). Beyond the
+/// specific refusals, every setting refresh does not read must keep its
+/// default ([`reject_unused_by_refresh`]).
 fn check_update(
     init: &BoostedModel,
     params: &TrainingParams,
@@ -158,42 +171,18 @@ fn check_update(
         ));
     }
     // The refresh updater recomputes constant leaf weights from the gradient
-    // sums; linear leaf models and path-smoothed outputs would silently go
-    // stale or be dropped.
-    if params.linear_tree
-        || params.path_smooth > 0.0
-        || init
-            .trees()
-            .iter()
-            .any(|tree| tree.linear_leaves().is_some())
+    // sums: a linear-leaf model would silently go stale.
+    if init
+        .trees()
+        .iter()
+        .any(|tree| tree.linear_leaves().is_some())
     {
         return Err(HessboostError::invalid_param(
             "process_type",
-            "`update` cannot refresh linear-leaf trees or path-smoothed leaves \
-             (`linear_tree` / `path_smooth`)",
+            "`update` cannot refresh linear-leaf trees (`linear_tree`)",
         ));
     }
-    // The refresh updater sums the full-precision gradients directly; it
-    // never builds the quantized histograms `use_quantized_grad` asks for.
-    if params.use_quantized_grad {
-        return Err(HessboostError::invalid_param(
-            "process_type",
-            "`update` refreshes from full-precision gradients and does not support \
-             `use_quantized_grad`",
-        ));
-    }
-    // Refresh keeps every split and never searches for one, so options that
-    // only change the split search would silently have no effect.
-    if params.extra_trees
-        || params.toad_penalty_feature > 0.0
-        || params.toad_penalty_threshold > 0.0
-    {
-        return Err(HessboostError::invalid_param(
-            "process_type",
-            "`update` keeps the existing splits and does not support the split-search \
-             options `extra_trees`, `toad_penalty_feature`, or `toad_penalty_threshold`",
-        ));
-    }
+    reject_unused_by_refresh(params)?;
     if num_boost_round > init.num_boost_rounds() {
         return Err(HessboostError::invalid_param(
             "num_boost_round",
@@ -206,6 +195,102 @@ fn check_update(
     Ok(())
 }
 
+/// Refuse every [`TrainingParams`] field `process_type=update` does not read,
+/// comparing the serialized configuration against the defaults plus an
+/// allow-list (as budget mode does), so newly added fields are covered too.
+///
+/// Refresh keeps every split, sums the gradients of every row over the
+/// existing trees, and draws nothing at random. Allowed to differ from the
+/// default are:
+///
+/// * what refresh or the objective's gradients read: the booster and
+///   device (checked elsewhere), `nthread`, `seed`, the objective and its
+///   parameters, `eval_metric`, `eta`, `lambda`, `alpha`, `max_delta_step`,
+///   `num_parallel_tree`, `multi_strategy`, `monotone_constraints` (refused
+///   with their own message), `process_type`, `refresh_leaf`, `missing`;
+/// * XGBoost's tree-shape settings, which describe how the refreshed trees
+///   were grown and which XGBoost 3.4.2's refresh updater accepts with a
+///   training run's parameters: `tree_method`, `max_depth`, `max_leaves`,
+///   `min_child_weight`, `gamma`, `max_bin`, `interaction_constraints`, and
+///   a `depthwise` or `lossguide` `grow_policy`.
+///
+/// Refused are row and column sampling (`subsample`, `sampling_method`,
+/// `colsample_*`), DART's `rate_drop`/`skip_drop`, symmetric growth, and the
+/// beyond-XGBoost split-search and leaf options (`extra_trees`,
+/// `path_smooth`, `linear_tree`, quantized gradients, reuse penalties): they
+/// would silently have no effect.
+fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
+    let p = params.clone();
+    let reference = TrainingParams {
+        booster: p.booster,
+        nthread: p.nthread,
+        seed: p.seed,
+        device: p.device,
+        objective: p.objective,
+        num_class: p.num_class,
+        base_score: p.base_score,
+        eval_metric: p.eval_metric,
+        tweedie_variance_power: p.tweedie_variance_power,
+        huber_slope: p.huber_slope,
+        lambdarank_num_pair_per_sample: p.lambdarank_num_pair_per_sample,
+        quantile_alpha: p.quantile_alpha,
+        expectile_alpha: p.expectile_alpha,
+        aft_loss_distribution: p.aft_loss_distribution,
+        aft_loss_distribution_scale: p.aft_loss_distribution_scale,
+        dist_gradient: p.dist_gradient,
+        dist_split_direction: p.dist_split_direction,
+        scale_pos_weight: p.scale_pos_weight,
+        eta: p.eta,
+        lambda: p.lambda,
+        alpha: p.alpha,
+        max_delta_step: p.max_delta_step,
+        num_parallel_tree: p.num_parallel_tree,
+        multi_strategy: p.multi_strategy,
+        monotone_constraints: p.monotone_constraints,
+        process_type: p.process_type,
+        refresh_leaf: p.refresh_leaf,
+        missing: p.missing,
+        tree_method: p.tree_method,
+        max_depth: p.max_depth,
+        max_leaves: p.max_leaves,
+        min_child_weight: p.min_child_weight,
+        gamma: p.gamma,
+        max_bin: p.max_bin,
+        interaction_constraints: p.interaction_constraints,
+        grow_policy: match p.grow_policy {
+            GrowPolicy::Symmetric => GrowPolicy::default(),
+            policy => policy,
+        },
+        ..TrainingParams::default()
+    };
+    let (Ok(serde_json::Value::Object(set)), Ok(serde_json::Value::Object(allowed))) = (
+        serde_json::to_value(params),
+        serde_json::to_value(&reference),
+    ) else {
+        return Err(HessboostError::invalid_param(
+            "process_type",
+            "training parameters could not be compared",
+        ));
+    };
+    let changed: Vec<String> = set
+        .iter()
+        .filter(|(key, value)| allowed.get(*key) != Some(*value))
+        .map(|(key, _)| format!("`{key}`"))
+        .collect();
+    if changed.is_empty() {
+        Ok(())
+    } else {
+        Err(HessboostError::invalid_param(
+            "process_type",
+            format!(
+                "`update` keeps the existing splits and refreshes them from every row, so it \
+                 applies no sampling, growth, or split-search options; leave {} at the default",
+                changed.join(", ")
+            ),
+        ))
+    }
+}
+
 /// Reject `process_type=update` without a model to update.
 pub(super) fn require_model_for_update(params: &TrainingParams) -> Result<()> {
     if params.process_type == ProcessType::Update {
@@ -215,4 +300,28 @@ pub(super) fn require_model_for_update(params: &TrainingParams) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::TrainingParams;
+    use crate::error::HessboostError;
+    use crate::test_support::labeled_dense;
+    use crate::training::{Trainer, train};
+
+    /// A model built in memory is checked like a loaded one before training
+    /// reads its intercepts and trees: one without an intercept per output
+    /// is refused instead of indexing past its intercepts.
+    #[test]
+    fn invalid_init_models_are_refused() {
+        let x: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        let d = labeled_dense(&x, 20, 1, &x);
+        let params = TrainingParams::default();
+        let mut model = train(&params, &d, 2).unwrap();
+        model.set_base_scores(Vec::new());
+        assert!(matches!(
+            Trainer::new(&params, &d, 1).init_model(&model).train(),
+            Err(HessboostError::ModelFormat(_))
+        ));
+    }
 }

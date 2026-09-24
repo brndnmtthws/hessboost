@@ -9,6 +9,19 @@ authors = ["Brenden Matthews <brenden@brndn.io>"]
 description = "Rust XGBoost: gradient boosted decision trees (GBDT) for machine learning in Rust, reimplementing XGBoost's training, parameters, and model formats"
 keywords = ["xgboost", "gradient-boosting", "gbdt", "machine-learning", "decision-trees"]
 categories = ["artificial-intelligence", "algorithms", "science"]
+# What the published crate ships: the library, its tests (with their saved
+# models), examples, benches, and the user docs. Development tooling (CI,
+# mise, fuzzing, scripts, benchmark charts, AGENTS.md) stays in the
+# repository.
+include = [
+    "/src/**",
+    "/tests/**",
+    "/examples/**",
+    "/benches/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
 
 [dependencies]
 rayon = "1.12"

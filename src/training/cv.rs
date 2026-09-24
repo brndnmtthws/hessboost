@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 /// Per-metric cross-validation history, aggregated across folds.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CvResult {
     /// Metric name.
     pub metric: String,

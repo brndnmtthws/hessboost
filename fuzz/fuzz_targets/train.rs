@@ -242,84 +242,83 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     };
     let n_cols = dtrain.n_cols();
 
-    let mut params = TrainingParams {
-        booster: *u.choose(&[
-            BoosterKind::GbTree,
-            BoosterKind::Dart,
-            BoosterKind::GbLinear,
-        ])?,
-        seed: u.arbitrary()?,
-        objective: objective.to_string(),
-        num_class,
-        base_score: if u.arbitrary()? {
-            Some(param(u, &[0.0, 0.5, 1.0, -1.0, 2.0])?)
-        } else {
-            None
-        },
-        tweedie_variance_power: param(u, &[1.5, 1.0, 2.0])?,
-        huber_slope: param(u, &[1.0, 0.1, 10.0])?,
-        lambdarank_num_pair_per_sample: u.int_in_range(0..=4)?,
-        quantile_alpha: alphas(u)?,
-        expectile_alpha: alphas(u)?,
-        aft_loss_distribution: *u.choose(&[
-            AftDistribution::Normal,
-            AftDistribution::Logistic,
-            AftDistribution::Extreme,
-        ])?,
-        aft_loss_distribution_scale: param(u, &[1.0, 0.5, 2.0])?,
-        dist_gradient: *u.choose(&[DistGradient::Fisher, DistGradient::Hessian])?,
-        dist_split_direction: *u
-            .choose(&[DistSplitDirection::Random, DistSplitDirection::Cyclic])?,
-        eta: param(u, &[0.3, 0.1, 1.0, 1e-3, 10.0])?,
-        gamma: param(u, &[0.0, 0.5, 10.0])?,
-        max_depth: u.int_in_range(0..=6)?,
-        max_leaves: u.int_in_range(0..=8)?,
-        min_child_weight: param(u, &[1.0, 0.0, 0.1, 5.0])?,
-        max_delta_step: if u.ratio(1, 4)? {
-            Some(param(u, &[0.0, 0.7, 1.0])?)
-        } else {
-            None
-        },
-        subsample: param(u, &[1.0, 0.5, 0.1])?,
-        colsample_bytree: param(u, &[1.0, 0.5, 0.0])?,
-        colsample_bylevel: param(u, &[1.0, 0.5, 0.0])?,
-        colsample_bynode: param(u, &[1.0, 0.5, 0.0])?,
-        lambda: param(u, &[1.0, 0.0, 10.0])?,
-        alpha: param(u, &[0.0, 1.0])?,
-        scale_pos_weight: param(u, &[1.0, 0.5, 4.0])?,
-        tree_method: *u.choose(&[
-            TreeMethod::Auto,
-            TreeMethod::Exact,
-            TreeMethod::Approx,
-            TreeMethod::Hist,
-        ])?,
-        grow_policy: *u.choose(&[
-            GrowPolicy::DepthWise,
-            GrowPolicy::LossGuide,
-            GrowPolicy::Symmetric,
-        ])?,
-        max_bin: u.int_in_range(0..=32)?,
-        num_parallel_tree: u.int_in_range(0..=3)?,
-        sampling_method: *u.choose(&[SamplingMethod::Uniform, SamplingMethod::GradientBased])?,
-        multi_strategy: *u.choose(&[
-            MultiStrategy::OneOutputPerTree,
-            MultiStrategy::MultiOutputTree,
-        ])?,
-        extra_trees: u.ratio(1, 6)?,
-        extra_seed: u.arbitrary()?,
-        path_smooth: param(u, &[0.0, 0.0, 1.0])?,
-        linear_tree: u.ratio(1, 6)?,
-        linear_lambda: param(u, &[0.0, 1.0])?,
-        use_quantized_grad: u.ratio(1, 6)?,
-        num_grad_quant_bins: u.int_in_range(0..=8)?,
-        stochastic_rounding: u.arbitrary()?,
-        quant_train_renew_leaf: u.arbitrary()?,
-        rate_drop: param(u, &[0.0, 0.5, 1.0])?,
-        skip_drop: param(u, &[0.0, 0.5, 1.0])?,
-        toad_penalty_feature: param(u, &[0.0, 0.0, 1.0])?,
-        toad_penalty_threshold: param(u, &[0.0, 0.0, 1.0])?,
-        ..TrainingParams::default()
+    let mut params = TrainingParams::default();
+    params.booster = *u.choose(&[
+        BoosterKind::GbTree,
+        BoosterKind::Dart,
+        BoosterKind::GbLinear,
+    ])?;
+    params.seed = u.arbitrary()?;
+    params.objective = objective.to_string();
+    params.num_class = num_class;
+    params.base_score = if u.arbitrary()? {
+        Some(param(u, &[0.0, 0.5, 1.0, -1.0, 2.0])?)
+    } else {
+        None
     };
+    params.tweedie_variance_power = param(u, &[1.5, 1.0, 2.0])?;
+    params.huber_slope = param(u, &[1.0, 0.1, 10.0])?;
+    params.lambdarank_num_pair_per_sample = u.int_in_range(0..=4)?;
+    params.quantile_alpha = alphas(u)?;
+    params.expectile_alpha = alphas(u)?;
+    params.aft_loss_distribution = *u.choose(&[
+        AftDistribution::Normal,
+        AftDistribution::Logistic,
+        AftDistribution::Extreme,
+    ])?;
+    params.aft_loss_distribution_scale = param(u, &[1.0, 0.5, 2.0])?;
+    params.dist_gradient = *u.choose(&[DistGradient::Fisher, DistGradient::Hessian])?;
+    params.dist_split_direction =
+        *u.choose(&[DistSplitDirection::Random, DistSplitDirection::Cyclic])?;
+    params.eta = param(u, &[0.3, 0.1, 1.0, 1e-3, 10.0])?;
+    params.gamma = param(u, &[0.0, 0.5, 10.0])?;
+    params.max_depth = u.int_in_range(0..=6)?;
+    params.max_leaves = u.int_in_range(0..=8)?;
+    params.min_child_weight = param(u, &[1.0, 0.0, 0.1, 5.0])?;
+    params.max_delta_step = if u.ratio(1, 4)? {
+        Some(param(u, &[0.0, 0.7, 1.0])?)
+    } else {
+        None
+    };
+    params.subsample = param(u, &[1.0, 0.5, 0.1])?;
+    params.colsample_bytree = param(u, &[1.0, 0.5, 0.0])?;
+    params.colsample_bylevel = param(u, &[1.0, 0.5, 0.0])?;
+    params.colsample_bynode = param(u, &[1.0, 0.5, 0.0])?;
+    params.lambda = param(u, &[1.0, 0.0, 10.0])?;
+    params.alpha = param(u, &[0.0, 1.0])?;
+    params.scale_pos_weight = param(u, &[1.0, 0.5, 4.0])?;
+    params.tree_method = *u.choose(&[
+        TreeMethod::Auto,
+        TreeMethod::Exact,
+        TreeMethod::Approx,
+        TreeMethod::Hist,
+    ])?;
+    params.grow_policy = *u.choose(&[
+        GrowPolicy::DepthWise,
+        GrowPolicy::LossGuide,
+        GrowPolicy::Symmetric,
+    ])?;
+    params.max_bin = u.int_in_range(0..=32)?;
+    params.num_parallel_tree = u.int_in_range(0..=3)?;
+    params.sampling_method =
+        *u.choose(&[SamplingMethod::Uniform, SamplingMethod::GradientBased])?;
+    params.multi_strategy = *u.choose(&[
+        MultiStrategy::OneOutputPerTree,
+        MultiStrategy::MultiOutputTree,
+    ])?;
+    params.extra_trees = u.ratio(1, 6)?;
+    params.extra_seed = u.arbitrary()?;
+    params.path_smooth = param(u, &[0.0, 0.0, 1.0])?;
+    params.linear_tree = u.ratio(1, 6)?;
+    params.linear_lambda = param(u, &[0.0, 1.0])?;
+    params.use_quantized_grad = u.ratio(1, 6)?;
+    params.num_grad_quant_bins = u.int_in_range(0..=8)?;
+    params.stochastic_rounding = u.arbitrary()?;
+    params.quant_train_renew_leaf = u.arbitrary()?;
+    params.rate_drop = param(u, &[0.0, 0.5, 1.0])?;
+    params.skip_drop = param(u, &[0.0, 0.5, 1.0])?;
+    params.toad_penalty_feature = param(u, &[0.0, 0.0, 1.0])?;
+    params.toad_penalty_threshold = param(u, &[0.0, 0.0, 1.0])?;
     if u.ratio(1, 4)? {
         for _ in 0..n_cols {
             params.monotone_constraints.push(*u.choose(&[
@@ -363,10 +362,8 @@ impl<'a> Arbitrary<'a> for Case {
 }
 
 fn fit(case: &Case, nthread: usize) -> Option<BoostedModel> {
-    let params = TrainingParams {
-        nthread,
-        ..case.params.clone()
-    };
+    let mut params = case.params.clone();
+    params.nthread = nthread;
     let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds);
     // gblinear refuses evaluation sets and early stopping; attaching them
     // would reject every linear case before it trains.

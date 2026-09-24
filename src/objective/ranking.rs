@@ -29,15 +29,15 @@ enum RankMode {
 /// Supports three XGBoost-compatible modes: `rank:pairwise`, `rank:ndcg`, and
 /// `rank:map`. See the module-level documentation for the algorithm.
 #[derive(Debug, Clone, Copy)]
-pub struct LambdaMartObjective {
+pub struct LambdaMart {
     mode: RankMode,
     top_k: usize,
 }
 
-impl LambdaMartObjective {
+impl LambdaMart {
     /// Plain pairwise logistic ranking (`rank:pairwise`).
     pub fn pairwise(top_k: usize) -> Self {
-        LambdaMartObjective {
+        LambdaMart {
             mode: RankMode::Pairwise,
             top_k,
         }
@@ -45,7 +45,7 @@ impl LambdaMartObjective {
 
     /// NDCG-weighted LambdaMART (`rank:ndcg`).
     pub fn ndcg(top_k: usize) -> Self {
-        LambdaMartObjective {
+        LambdaMart {
             mode: RankMode::Ndcg,
             top_k,
         }
@@ -53,30 +53,26 @@ impl LambdaMartObjective {
 
     /// MAP-weighted LambdaMART (`rank:map`).
     pub fn map(top_k: usize) -> Self {
-        LambdaMartObjective {
+        LambdaMart {
             mode: RankMode::Map,
             top_k,
         }
     }
 
-    /// Accumulate XGBoost's CPU top-k LambdaRank gradient for one query.
-    #[allow(clippy::too_many_arguments)]
+    /// Accumulate XGBoost's CPU top-k LambdaRank gradient for one query:
+    /// `p`, `y` and `out` are that query's rows.
     fn accumulate_group(
         &self,
-        preds: &[f32],
-        labels: &[f32],
-        start: usize,
-        end: usize,
+        p: &[f32],
+        y: &[f32],
         query_weight: f32,
         weight_norm: f32,
         out: &mut [GradPair],
     ) {
-        let n = end - start;
+        let n = p.len();
         if n < 2 {
             return;
         }
-        let p = &preds[start..end];
-        let y = &labels[start..end];
         let order = argsort_desc(p);
         let metric = MetricCtx::build(self.mode, y, &order, self.top_k);
         let best_score = p[order[0]];
@@ -107,10 +103,10 @@ impl LambdaMartObjective {
                 let lambda = (sigmoid - 1.0) * delta;
                 let hessian = (sigmoid * (1.0 - sigmoid)).max(MIN_HESS_F64) * delta * 2.0;
                 let pg = GradPair::new(lambda as f32, hessian as f32);
-                out[start + idx_high].grad += pg.grad;
-                out[start + idx_high].hess += pg.hess;
-                out[start + idx_low].grad -= pg.grad;
-                out[start + idx_low].hess += pg.hess;
+                out[idx_high].grad += pg.grad;
+                out[idx_high].hess += pg.hess;
+                out[idx_low].grad -= pg.grad;
+                out[idx_low].hess += pg.hess;
                 sum_lambda += -2.0 * f64::from(pg.grad);
             }
         }
@@ -124,15 +120,14 @@ impl LambdaMartObjective {
         } else {
             1.0
         };
-        let group = &mut out[start..end];
         if norm != 1.0 {
             let norm = norm as f32;
-            for g in group.iter_mut() {
+            for g in out.iter_mut() {
                 g.grad *= norm;
                 g.hess *= norm;
             }
         }
-        for g in group.iter_mut() {
+        for g in out.iter_mut() {
             g.grad *= query_weight;
             g.hess *= query_weight;
             g.grad *= weight_norm;
@@ -141,7 +136,7 @@ impl LambdaMartObjective {
     }
 }
 
-impl Objective for LambdaMartObjective {
+impl Objective for LambdaMart {
     fn name(&self) -> &str {
         match self.mode {
             RankMode::Pairwise => "rank:pairwise",
@@ -185,7 +180,13 @@ impl Objective for LambdaMartObjective {
             (ranges.len() as f64 / sum_w) as f32
         };
         for ((start, end), weight) in ranges.into_iter().zip(group_weights) {
-            self.accumulate_group(preds, labels, start, end, weight, weight_norm, out);
+            self.accumulate_group(
+                &preds[start..end],
+                &labels[start..end],
+                weight,
+                weight_norm,
+                &mut out[start..end],
+            );
         }
     }
 
@@ -312,7 +313,7 @@ mod tests {
 
     /// Gradients of `obj` over query groups of `sizes`.
     fn grouped(
-        obj: LambdaMartObjective,
+        obj: LambdaMart,
         preds: &[f32],
         labels: &[f32],
         weights: Option<&[f32]>,
@@ -327,7 +328,7 @@ mod tests {
     #[test]
     fn pairwise_pushes_relevant_up() {
         // One group of 3 docs, labels 2 > 1 > 0, all scores equal at start.
-        let obj = LambdaMartObjective::ndcg(32);
+        let obj = LambdaMart::ndcg(32);
         let out = grouped(obj, &[0.0, 0.0, 0.0], &[2.0, 1.0, 0.0], None, &[3]);
         // Negative gradient => leaf value positive => score goes up.
         // Most-relevant doc should get the most-negative gradient.
@@ -340,7 +341,7 @@ mod tests {
 
     #[test]
     fn no_pairs_when_all_labels_equal() {
-        let obj = LambdaMartObjective::pairwise(32);
+        let obj = LambdaMart::pairwise(32);
         let out = grouped(obj, &[0.5, -0.2, 1.0], &[1.0, 1.0, 1.0], None, &[3]);
         assert!(out.iter().all(|g| g.grad == 0.0 && g.hess == 0.0));
     }
@@ -348,7 +349,7 @@ mod tests {
     #[test]
     fn groups_are_independent() {
         // Two groups; a cross-group pair must never be formed.
-        let obj = LambdaMartObjective::pairwise(32);
+        let obj = LambdaMart::pairwise(32);
         let out = grouped(obj, &[0.0; 4], &[1.0, 0.0, 0.0, 1.0], None, &[2, 2]);
         // Within each group the relevant doc is pushed up, the other down.
         assert!(out[0].grad < 0.0 && out[1].grad > 0.0);
@@ -372,7 +373,7 @@ mod tests {
         // `std::greater<>` argsort, so doc 0 stays ranked first. With
         // `top_k = 1` the pairs are exactly (0,1) and (0,2); a total-order sort
         // would rank doc 1 first and pair (1,0),(1,2) instead.
-        let obj = LambdaMartObjective::pairwise(1);
+        let obj = LambdaMart::pairwise(1);
         let preds = [-0.0f32, 0.0, -1.0];
         let labels = [2.0f32, 1.0, 0.0];
         let out = grouped(obj, &preds, &labels, None, &[3]);
@@ -397,7 +398,7 @@ mod tests {
         // XGBoost applies `norm`, `w`, and `w_norm` as three separate f32
         // multiplications; folding them into one scale (`norm * w * w_norm`)
         // rounds differently for these weights.
-        let obj = LambdaMartObjective::ndcg(32);
+        let obj = LambdaMart::ndcg(32);
         let preds = [0.3f32, -0.7, 1.1, 0.2, -0.4, 0.9, 0.05];
         let labels = [2.0f32, 0.0, 1.0, 3.0, 1.0, 0.0, 2.0];
         let sizes = [3, 4];
@@ -427,11 +428,8 @@ mod tests {
 
     #[test]
     fn default_metric_follows_mode_and_top_k() {
-        assert_eq!(
-            LambdaMartObjective::pairwise(32).default_metric(),
-            "ndcg@32"
-        );
-        assert_eq!(LambdaMartObjective::ndcg(5).default_metric(), "ndcg@5");
-        assert_eq!(LambdaMartObjective::map(10).default_metric(), "map@10");
+        assert_eq!(LambdaMart::pairwise(32).default_metric(), "ndcg@32");
+        assert_eq!(LambdaMart::ndcg(5).default_metric(), "ndcg@5");
+        assert_eq!(LambdaMart::map(10).default_metric(), "map@10");
     }
 }

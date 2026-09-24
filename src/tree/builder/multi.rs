@@ -48,8 +48,8 @@ use crate::objective::GradPair;
 use crate::tree::constraints::MonotoneConstraints;
 use crate::tree::gain::{GradStats, RegParams, threshold_l1};
 use crate::tree::hist::{feature_slices, subtract_in_place};
-use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
+use crate::tree::{ChildLeaf, RegTree, SplitRule};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 
@@ -155,6 +155,18 @@ impl Candidate {
     fn is_categorical(&self) -> bool {
         matches!(self.loc, Loc::Cats(_))
     }
+}
+
+/// One feature's bins `fs..fe` in the `[bin][target]` split-gradient
+/// histogram of node `nid`: the input every split enumeration of the feature
+/// scans.
+#[derive(Clone, Copy)]
+struct FeatureBins<'h> {
+    nid: usize,
+    hist: &'h [GradStats],
+    feature: u32,
+    fs: usize,
+    fe: usize,
 }
 
 /// A node awaiting expansion.
@@ -488,31 +500,35 @@ impl Grow<'_, '_> {
         if fe <= fs {
             return;
         }
+        let bins = FeatureBins {
+            nid,
+            hist,
+            feature: f,
+            fs,
+            fe,
+        };
         if cuts.is_categorical(f as usize) {
             if fe - fs < MAX_CAT_TO_ONEHOT {
-                self.enumerate_one_hot(nid, hist, f, fs, fe, best);
+                self.enumerate_one_hot(&bins, best);
             } else {
-                self.enumerate_partition(nid, hist, f, fs, fe, best);
+                self.enumerate_partition(&bins, best);
             }
-        } else if self.enumerate_numeric(nid, hist, f, fs, fe, true, best) {
-            self.enumerate_numeric(nid, hist, f, fs, fe, false, best);
+        } else if self.enumerate_numeric(&bins, true, best) {
+            self.enumerate_numeric(&bins, false, best);
         }
     }
 
     /// XGBoost's vector `EnumerateSplit`: the forward pass (`forward`,
     /// missing right) returns whether the feature has missing values in this
     /// node; the backward pass (missing left) runs only then.
-    #[allow(clippy::too_many_arguments)]
-    fn enumerate_numeric(
-        &self,
-        nid: usize,
-        hist: &[GradStats],
-        f: u32,
-        fs: usize,
-        fe: usize,
-        forward: bool,
-        best: &mut Candidate,
-    ) -> bool {
+    fn enumerate_numeric(&self, bins: &FeatureBins, forward: bool, best: &mut Candidate) -> bool {
+        let FeatureBins {
+            nid,
+            hist,
+            feature: f,
+            fs,
+            fe,
+        } = *bins;
         let s = self.n_split();
         let parent = self.node_stats(nid);
         let parent_gain = self.gain[nid];
@@ -551,15 +567,14 @@ impl Grow<'_, '_> {
     /// XGBoost's vector `EnumerateOneHot`: every category alone on the right
     /// child, first with missing values left (among the other categories),
     /// then with missing values right (with the category).
-    fn enumerate_one_hot(
-        &self,
-        nid: usize,
-        hist: &[GradStats],
-        f: u32,
-        fs: usize,
-        fe: usize,
-        best: &mut Candidate,
-    ) {
+    fn enumerate_one_hot(&self, bins: &FeatureBins, best: &mut Candidate) {
+        let FeatureBins {
+            nid,
+            hist,
+            feature: f,
+            fs,
+            fe,
+        } = *bins;
         let s = self.n_split();
         let parent = self.node_stats(nid);
         let parent_gain = self.gain[nid];
@@ -597,15 +612,10 @@ impl Grow<'_, '_> {
     }
 
     /// XGBoost's vector partition search for a categorical feature.
-    fn enumerate_partition(
-        &self,
-        nid: usize,
-        hist: &[GradStats],
-        f: u32,
-        fs: usize,
-        fe: usize,
-        best: &mut Candidate,
-    ) {
+    fn enumerate_partition(&self, bins: &FeatureBins, best: &mut Candidate) {
+        let FeatureBins {
+            nid, hist, fs, fe, ..
+        } = *bins;
         let s = self.n_split();
         let reg = &self.b.reg;
         let parent = self.node_stats(nid);
@@ -627,25 +637,27 @@ impl Grow<'_, '_> {
         let mut sorted: Vec<usize> = (0..n_bins).collect();
         sorted.sort_by(|&l, &r| scores[l].partial_cmp(&scores[r]).unwrap_or(Ordering::Equal));
         for forward in [true, false] {
-            self.enumerate_part(nid, hist, f, fs, fe, &sorted, forward, best);
+            self.enumerate_part(bins, &sorted, forward, best);
         }
     }
 
     /// XGBoost's `EnumeratePart`: the forward direction moves the sorted
     /// prefix to the right child (missing left), the backward direction
     /// accumulates the sorted suffix on the left (missing right).
-    #[allow(clippy::too_many_arguments)]
     fn enumerate_part(
         &self,
-        nid: usize,
-        hist: &[GradStats],
-        f: u32,
-        fs: usize,
-        fe: usize,
+        bins: &FeatureBins,
         sorted: &[usize],
         forward: bool,
         best: &mut Candidate,
     ) {
+        let FeatureBins {
+            nid,
+            hist,
+            feature: f,
+            fs,
+            fe,
+        } = *bins;
         let s = self.n_split();
         let parent = self.node_stats(nid);
         let parent_gain = self.gain[nid];
@@ -718,15 +730,11 @@ impl Grow<'_, '_> {
                 route.is_categorical = true;
                 route.cat_left.clone_from(cats);
                 route.default_left = !best.default_left;
-                self.tree.expand_categorical(
+                self.tree.expand(
                     nid,
-                    best.feature,
-                    cats,
-                    !best.default_left,
-                    0.0,
-                    right_hess as f32,
-                    0.0,
-                    left_hess as f32,
+                    SplitRule::categorical(best.feature, cats, !best.default_left),
+                    ChildLeaf::new(0.0, right_hess as f32),
+                    ChildLeaf::new(0.0, left_hess as f32),
                 )
             }
             loc => {
@@ -740,13 +748,9 @@ impl Grow<'_, '_> {
                 route.default_left = best.default_left;
                 self.tree.expand(
                     nid,
-                    best.feature,
-                    threshold,
-                    best.default_left,
-                    0.0,
-                    left_hess as f32,
-                    0.0,
-                    right_hess as f32,
+                    SplitRule::numeric(best.feature, threshold, best.default_left),
+                    ChildLeaf::new(0.0, left_hess as f32),
+                    ChildLeaf::new(0.0, right_hess as f32),
                 )
             }
         };

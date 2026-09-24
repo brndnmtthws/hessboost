@@ -2,11 +2,10 @@
 //! calibration of the predicted distributions, metrics, serialization, and
 //! conformalized intervals.
 
-use hessboost::prelude::{
-    BoostedModel, ConformalizedQuantile, DMatrix, Dist, DistFamily, DistGradient,
-    DistSplitDirection, HessboostError, MultiStrategy, TrainingParams, TreeMethod, train,
-    train_with_eval,
-};
+use hessboost::config::{DistGradient, DistSplitDirection, MultiStrategy, TreeMethod};
+use hessboost::conformal::ConformalizedQuantile;
+use hessboost::objective::distributional::{Dist, DistFamily};
+use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
@@ -62,7 +61,11 @@ fn params(objective: &str) -> hessboost::config::TrainingParamsBuilder {
 /// their scale parameters like any boosted model; the validation NLL picks
 /// the iteration). Predictions then use the best iteration.
 fn fit(p: &TrainingParams, dtrain: &DMatrix, dvalid: &DMatrix) -> BoostedModel {
-    let result = train_with_eval(p, dtrain, 1000, &[(dvalid, "valid")], Some(20)).unwrap();
+    let result = Trainer::new(p, dtrain, 1000)
+        .eval(dvalid, "valid")
+        .early_stopping_rounds(20)
+        .train()
+        .unwrap();
     assert!(
         result.model.best_iteration().is_some(),
         "early stopping triggered"
@@ -208,8 +211,11 @@ fn every_family_and_gradient_mode_learns() {
                 .eval_metric("nll")
                 .build()
                 .unwrap();
-            let result =
-                train_with_eval(&p, &dtrain, 1000, &[(&dvalid, "valid")], Some(20)).unwrap();
+            let result = Trainer::new(&p, &dtrain, 1000)
+                .eval(&dvalid, "valid")
+                .early_stopping_rounds(20)
+                .train()
+                .unwrap();
             let model = result.model;
             assert_eq!(model.n_outputs(), family.n_params());
             let best = model.best_iteration().expect("early stopping triggered");
@@ -382,7 +388,7 @@ fn configuration_errors() {
         .eval_metric("crps")
         .build()
         .unwrap();
-    assert!(train_with_eval(&p, &d, 1, &[(&d, "d")], None).is_err());
+    assert!(Trainer::new(&p, &d, 1).eval(&d, "d").train().is_err());
     // Point models do not predict distributions.
     let point = train(&params("reg:squarederror").build().unwrap(), &d, 1).unwrap();
     assert!(point.predict_distribution(&d).is_err());

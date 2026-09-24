@@ -11,9 +11,9 @@
 use crate::config::{BoosterKind, Monotone, ObjectiveParams, ProcessType, TrainingParams};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::learner::model::BoostedModel;
-use crate::learner::multi_output;
+use crate::model::BoostedModel;
 use crate::objective::Objective;
+use crate::training::multi_output;
 
 /// Check that `init` can be trained further with `params` on `dtrain` and
 /// return the model training continues from: a copy of `init` without its
@@ -211,7 +211,7 @@ pub(super) fn require_model_for_update(params: &TrainingParams) -> Result<()> {
     if params.process_type == ProcessType::Update {
         return Err(HessboostError::invalid_param(
             "process_type",
-            "`update` refreshes an existing model; use train_continue",
+            "`update` refreshes an existing model; use Trainer::init_model",
         ));
     }
     Ok(())

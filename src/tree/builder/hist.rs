@@ -6,11 +6,11 @@
 //! is ever built directly. Supports `depthwise` and `lossguide` growth, and
 //! hands `symmetric` growth to the level-wise oblivious builder.
 
-use super::lightgbm::{NodeCtx, SplitOptions, finalize_smoothed_leaves};
+use super::lightgbm::{SplitOptions, finalize_smoothed_leaves};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, build_interaction_sets,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, SplitScorer, build_interaction_sets,
     finalize_leaf_values, for_each_numeric_split, limit_or_unbounded, next_allowed, permits,
-    sum_rows, sweep_categorical, xgb_calc_weight, xgb_loss_chg, xgb_node_gain, xgb_update,
+    sum_rows, sweep_categorical, xgb_calc_weight, xgb_node_gain, xgb_update,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
@@ -49,6 +49,23 @@ pub(super) fn rayon_available() -> bool {
 pub(crate) struct LeafRows {
     pub node: usize,
     pub rows: Vec<u32>,
+}
+
+/// The node a split search runs for.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NodeCtx {
+    /// Node id in the tree being grown; seeds the node's `extra_trees` draws.
+    pub(super) id: usize,
+    /// The node's gradient statistics, including missing values.
+    pub(super) stats: GradStats,
+    /// The node's monotone weight bounds.
+    pub(super) bounds: Bounds,
+    /// Training rows in the node (`n` of path smoothing).
+    pub(super) rows: usize,
+    /// The node's own output, which path smoothing pulls its children toward.
+    pub(super) output: f64,
+    /// Seed of the tree being grown ([`crate::tree::sampler::ColumnSampler::seed`]).
+    pub(super) tree_seed: u64,
 }
 
 /// A node awaiting or undergoing expansion.
@@ -230,19 +247,13 @@ impl<'a> HistTreeBuilder<'a> {
         let tree_seed = sampler.seed();
         let root_ctx = NodeCtx {
             id: 0,
+            stats: root_stats,
+            bounds: Bounds::default(),
             rows: row_subset.len(),
             output: xgb_calc_weight(root_stats, &self.reg),
             tree_seed,
         };
-        let best = self.evaluate(
-            ghist,
-            &root_hist,
-            root_stats,
-            &root_feats,
-            Bounds::default(),
-            None,
-            root_ctx,
-        );
+        let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
         let root = NodeEntry {
             nid: 0,
             depth: 0,
@@ -502,38 +513,22 @@ impl<'a> HistTreeBuilder<'a> {
             // recorded; it is the parent output of the child's own children.
             let left_ctx = NodeCtx {
                 id: left_id,
+                stats: b.left,
+                bounds: lb_bounds,
                 rows: left_rows.len(),
                 output: b.w_left,
                 tree_seed,
             };
             let right_ctx = NodeCtx {
                 id: right_id,
+                stats: b.right,
+                bounds: rb_bounds,
                 rows: right_rows.len(),
                 output: b.w_right,
                 tree_seed,
             };
-            let left = || {
-                self.evaluate(
-                    ghist,
-                    &left_hist,
-                    b.left,
-                    &left_features,
-                    lb_bounds,
-                    allowed,
-                    left_ctx,
-                )
-            };
-            let right = || {
-                self.evaluate(
-                    ghist,
-                    &right_hist,
-                    b.right,
-                    &right_features,
-                    rb_bounds,
-                    allowed,
-                    right_ctx,
-                )
-            };
+            let left = || self.evaluate(ghist, &left_hist, &left_features, allowed, left_ctx);
+            let right = || self.evaluate(ghist, &right_hist, &right_features, allowed, right_ctx);
             if left_rows.len() + right_rows.len() >= PARALLEL_EVALUATE_ROWS && rayon_available() {
                 rayon::join(left, right)
             } else {
@@ -566,31 +561,21 @@ impl<'a> HistTreeBuilder<'a> {
         (left, right)
     }
 
-    /// Find the best split for a node from its histogram, enumerating each
+    /// Find the best split for `node` from its histogram, enumerating each
     /// sampled feature's bins as XGBoost's histogram evaluator does
     /// ([`for_each_numeric_split`]). Candidates are scored and compared with
     /// XGBoost's `f32` arithmetic and tie rule, so near-equal gains resolve
     /// the same way. Monotone bounds are honored through the bounded child
     /// weights. With LightGBM split options enabled the search is delegated
     /// to [`SplitOptions::evaluate`].
-    #[allow(clippy::too_many_arguments)]
     fn evaluate(
         &self,
         ghist: &GHistIndex,
         hist: &[GradStats],
-        total: GradStats,
         feature_subset: &[u32],
-        bounds: Bounds,
         allowed: Option<&InteractionState>,
         node: NodeCtx,
     ) -> BestSplit {
-        let cuts = ghist.cuts();
-        let mut best = BestSplit::none();
-        // A dense index has no missing entries: every feature's bins sum to
-        // `total`, so the missing direction is never distinct and the
-        // per-feature sums need not be computed.
-        let dense = ghist.dense_stride().is_some();
-
         // Restrict the sampled features to those permitted by the interaction
         // constraints for this node. `allowed` is a sorted set; `None` means all
         // features are allowed (constraints inactive or unconstrained path).
@@ -607,23 +592,28 @@ impl<'a> HistTreeBuilder<'a> {
             None => feature_subset,
         };
         if let Some(options) = &self.options {
-            return options.evaluate(
-                cuts,
-                dense,
-                hist,
-                total,
-                feature_subset,
-                bounds,
-                &self.cons,
-                &self.reg,
-                node,
-            );
+            return options.evaluate(ghist, hist, feature_subset, &self.cons, &self.reg, node);
         }
-        let root_gain = xgb_node_gain(total, &self.reg, bounds);
+        let cuts = ghist.cuts();
+        let mut best = BestSplit::none();
+        // A dense index has no missing entries: every feature's bins sum to
+        // `total`, so the missing direction is never distinct and the
+        // per-feature sums need not be computed.
+        let dense = ghist.dense_stride().is_some();
+        let total = node.stats;
+        let node_scorer = SplitScorer {
+            reg: &self.reg,
+            root_gain: xgb_node_gain(total, &self.reg, node.bounds),
+            bounds: node.bounds,
+            dir: 0,
+        };
 
         for &f in feature_subset {
             let (fs, fe) = cuts.feature_bins(f as usize);
-            let dir = self.cons.dir(f as usize);
+            let scorer = SplitScorer {
+                dir: self.cons.dir(f as usize),
+                ..node_scorer
+            };
 
             if cuts.is_categorical(f as usize) {
                 // Every category bin, empty ones included, as XGBoost
@@ -636,10 +626,7 @@ impl<'a> HistTreeBuilder<'a> {
                     &mut best,
                     &cats,
                     total,
-                    root_gain,
-                    bounds,
-                    dir,
-                    &self.reg,
+                    &scorer,
                     f,
                     self.reuse.as_ref().map(|r| r as &dyn CategoricalPenalty),
                 );
@@ -649,27 +636,19 @@ impl<'a> HistTreeBuilder<'a> {
                 continue; // degenerate feature, no interior boundary
             }
 
-            for_each_numeric_split(
-                &hist[fs..fe],
-                fs,
-                total,
-                dense,
-                |pos, default_left, l, r| {
-                    let Some((mut loss_chg, wl, wr)) =
-                        xgb_loss_chg(l, r, root_gain, &self.reg, bounds, dir)
-                    else {
-                        return;
+            for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
+                let Some(mut score) = scorer.loss_chg(children.left, children.right) else {
+                    return;
+                };
+                if let Some(reuse) = &self.reuse {
+                    let bin = match pos {
+                        SplitPos::Bin(bin) => Some(bin),
+                        _ => None,
                     };
-                    if let Some(reuse) = &self.reuse {
-                        let bin = match pos {
-                            SplitPos::Bin(bin) => Some(bin),
-                            _ => None,
-                        };
-                        loss_chg -= reuse.bin_penalty(f, bin);
-                    }
-                    xgb_update(&mut best, loss_chg, f, pos, default_left, l, r, wl, wr);
-                },
-            );
+                    score.loss_chg -= reuse.bin_penalty(f, bin);
+                }
+                xgb_update(&mut best, f, pos, children, score);
+            });
         }
         best
     }

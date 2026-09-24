@@ -50,6 +50,7 @@
 //! # Example
 //!
 //! ```
+//! use hessboost::conformal::SplitConformal;
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {
@@ -72,14 +73,14 @@
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::learner::BoostedModel;
+use crate::model::BoostedModel;
 
 /// Split-conformal intervals `[f(x) - Q, f(x) + Q]` around a single-output
 /// point model `f`.
 ///
 /// `Q` is the finite-sample-corrected quantile of the absolute residuals
 /// `|y_i - f(x_i)|` on the calibration set; see the
-/// [module docs](crate::learner::conformal) for the exact coverage guarantee.
+/// [module docs](crate::conformal) for the exact coverage guarantee.
 #[derive(Debug, Clone)]
 pub struct SplitConformal<'a> {
     model: &'a BoostedModel,
@@ -167,7 +168,7 @@ impl<'a> SplitConformal<'a> {
 ///
 /// `Q` is the finite-sample-corrected quantile of the calibration scores
 /// `E_i = max(q_lo(x_i) - y_i, y_i - q_hi(x_i))`; see the
-/// [module docs](crate::learner::conformal) for the exact coverage guarantee. `Q` is positive when
+/// [module docs](crate::conformal) for the exact coverage guarantee. `Q` is positive when
 /// the band under-covers and negative when it over-covers, so CQR both widens
 /// a too-narrow band and tightens a too-wide one.
 ///
@@ -571,10 +572,10 @@ fn round_up(x: f64) -> f32 {
 mod tests {
     use super::*;
     use crate::config::TrainingParams;
-    use crate::learner::{train, train_with_objective};
     use crate::objective::{CustomObjective, GradPair};
     use crate::rng::Rng;
     use crate::test_support::labeled_dense;
+    use crate::training::{Trainer, train};
 
     const N_FEATURES: usize = 2;
 
@@ -625,7 +626,11 @@ mod tests {
             .eta(0.3)
             .build()
             .unwrap();
-        train_with_objective(&params, d, 150, &obj).unwrap()
+        Trainer::new(&params, d, 150)
+            .objective(&obj)
+            .train()
+            .unwrap()
+            .model
     }
 
     fn coverage(intervals: &[(f32, f32)], d: &DMatrix) -> f64 {
@@ -1004,7 +1009,11 @@ mod tests {
             }
         });
         let params = TrainingParams::builder().max_depth(1).build().unwrap();
-        let exploding = train_with_objective(&params, &train_set, 1, &exploding).unwrap();
+        let exploding = Trainer::new(&params, &train_set, 1)
+            .objective(&exploding)
+            .train()
+            .unwrap()
+            .model;
         let at_max = |d: DMatrix| {
             let n = d.n_rows();
             d.with_base_margin(&vec![f32::MAX; n]).unwrap()

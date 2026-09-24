@@ -1,7 +1,7 @@
 //! Binary classification with `binary:logistic`, a watched eval set, and early
 //! stopping. Run: `cargo run --release --example binary_classification`.
 
-use hessboost::metric::Auc;
+use hessboost::metric::{Auc, Metric};
 use hessboost::prelude::*;
 
 mod common;
@@ -34,7 +34,10 @@ fn main() -> Result<()> {
         .build()?;
 
     // Watch `dvalid`; stop after 20 rounds without improvement on the last metric.
-    let out = train_with_eval(&params, &dtrain, 500, &[(&dvalid, "valid")], Some(20))?;
+    let out = Trainer::new(&params, &dtrain, 500)
+        .eval(&dvalid, "valid")
+        .early_stopping_rounds(20)
+        .train()?;
     let model = out.model;
     println!(
         "stopped at {} trees (best iteration {:?})",

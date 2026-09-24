@@ -18,19 +18,18 @@ mod ranking;
 mod regression;
 mod survival;
 
-pub use absolute::AbsoluteErrorObjective;
-pub use classification::{HingeObjective, LogisticObjective};
-pub use count::{GammaObjective, PoissonObjective, TweedieObjective};
+pub use absolute::AbsoluteError;
+pub use classification::{Hinge, Logistic};
+pub use count::{Gamma, Poisson, Tweedie};
 pub use custom::CustomObjective;
-pub use distributional::{Dist, DistFamily, DistObjective};
-pub use multiclass::SoftmaxObjective;
-pub use quantile::{ExpectileObjective, QuantileObjective};
-pub use ranking::LambdaMartObjective;
-pub use regression::{PseudoHuberObjective, SquaredErrorObjective, SquaredLogErrorObjective};
+pub use multiclass::Softmax;
+pub use quantile::{Expectile, Quantile};
+pub use ranking::LambdaMart;
+pub use regression::{PseudoHuber, SquaredError, SquaredLogError};
 
 pub(crate) use quantile::validate_alphas;
 
-pub use survival::{AftObjective, CoxObjective};
+pub use survival::{Aft, Cox};
 
 pub(crate) use survival::{abs_label_order, aft_nloglik};
 
@@ -39,6 +38,7 @@ use rayon::prelude::*;
 use crate::config::TrainingParams;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
+use distributional::{DistFamily, DistObjective};
 
 /// A first- and second-order gradient for one instance/output.
 ///
@@ -380,7 +380,7 @@ pub trait Objective: Send + Sync {
     }
     /// The objective's per-row loss, for trainers that measure the actual
     /// loss reduction of a tree (budget-mode training,
-    /// [`train_with_budget`](crate::learner::budget::train_with_budget)).
+    /// [`train_with_budget`](crate::training::budget::train_with_budget)).
     /// Label-dependent reweighting the gradient applies (e.g.
     /// `scale_pos_weight`) is part of the loss; the sample weight is not.
     /// Losses are shifted so a perfect prediction of a hard label scores `0`
@@ -536,15 +536,13 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
 /// an `invalid parameter "labels"` error.
 pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Objective>> {
     let objective: Box<dyn Objective> = match params.objective.as_str() {
-        "reg:squarederror" | "reg:linear" => Box::new(SquaredErrorObjective),
-        "reg:pseudohubererror" => Box::new(PseudoHuberObjective::new(params.huber_slope as f32)),
-        "binary:logistic" => Box::new(LogisticObjective::new(params.scale_pos_weight as f32)),
-        "binary:logitraw" => Box::new(LogisticObjective::raw(params.scale_pos_weight as f32)),
-        "binary:hinge" => Box::new(HingeObjective),
-        "reg:squaredlogerror" => Box::new(SquaredLogErrorObjective),
-        "reg:logistic" => Box::new(LogisticObjective::regression(
-            params.scale_pos_weight as f32,
-        )),
+        "reg:squarederror" | "reg:linear" => Box::new(SquaredError),
+        "reg:pseudohubererror" => Box::new(PseudoHuber::new(params.huber_slope as f32)),
+        "binary:logistic" => Box::new(Logistic::new(params.scale_pos_weight as f32)),
+        "binary:logitraw" => Box::new(Logistic::raw(params.scale_pos_weight as f32)),
+        "binary:hinge" => Box::new(Hinge),
+        "reg:squaredlogerror" => Box::new(SquaredLogError),
+        "reg:logistic" => Box::new(Logistic::regression(params.scale_pos_weight as f32)),
         "multi:softmax" | "multi:softprob" => {
             if params.num_class < 2 {
                 return Err(HessboostError::invalid_param(
@@ -553,27 +551,19 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
                 ));
             }
             let prob = params.objective == "multi:softprob";
-            Box::new(SoftmaxObjective::new(params.num_class, prob))
+            Box::new(Softmax::new(params.num_class, prob))
         }
-        "count:poisson" => Box::new(PoissonObjective::new(
-            params.effective_max_delta_step() as f32
-        )),
-        "reg:gamma" => Box::new(GammaObjective),
-        "reg:tweedie" => Box::new(TweedieObjective::new(params.tweedie_variance_power as f32)),
-        "reg:quantileerror" => Box::new(QuantileObjective::new(&params.quantile_alpha)?),
-        "reg:expectileerror" => Box::new(ExpectileObjective::new(&params.expectile_alpha)?),
-        "reg:absoluteerror" => return Ok(Box::new(AbsoluteErrorObjective::new(n_targets))),
-        "rank:pairwise" => Box::new(LambdaMartObjective::pairwise(
-            params.lambdarank_num_pair_per_sample,
-        )),
-        "rank:ndcg" => Box::new(LambdaMartObjective::ndcg(
-            params.lambdarank_num_pair_per_sample,
-        )),
-        "rank:map" => Box::new(LambdaMartObjective::map(
-            params.lambdarank_num_pair_per_sample,
-        )),
-        "survival:cox" => Box::new(CoxObjective),
-        "survival:aft" => Box::new(AftObjective::new(
+        "count:poisson" => Box::new(Poisson::new(params.effective_max_delta_step() as f32)),
+        "reg:gamma" => Box::new(Gamma),
+        "reg:tweedie" => Box::new(Tweedie::new(params.tweedie_variance_power as f32)),
+        "reg:quantileerror" => Box::new(Quantile::new(&params.quantile_alpha)?),
+        "reg:expectileerror" => Box::new(Expectile::new(&params.expectile_alpha)?),
+        "reg:absoluteerror" => return Ok(Box::new(AbsoluteError::new(n_targets))),
+        "rank:pairwise" => Box::new(LambdaMart::pairwise(params.lambdarank_num_pair_per_sample)),
+        "rank:ndcg" => Box::new(LambdaMart::ndcg(params.lambdarank_num_pair_per_sample)),
+        "rank:map" => Box::new(LambdaMart::map(params.lambdarank_num_pair_per_sample)),
+        "survival:cox" => Box::new(Cox),
+        "survival:aft" => Box::new(Aft::new(
             params.aft_loss_distribution,
             params.aft_loss_distribution_scale as f32,
         )),
@@ -613,7 +603,7 @@ mod tests {
     /// `h = ¼·w`, then sigmoid then logit (XGBoost's Newton fallback).
     #[test]
     fn default_base_margins_is_newton_step_through_link() {
-        let obj = LogisticObjective::new(2.0);
+        let obj = Logistic::new(2.0);
         let labels = [1.0f32, 0.0, 0.0, 0.0];
         let margins = obj.base_margins(&labels, None, None);
         assert_eq!(margins.len(), 1);
@@ -716,32 +706,28 @@ mod tests {
     fn chunked_gradients_match_whole_batch() {
         let c = GRADIENT_CHUNK_ROWS;
         let objectives: Vec<(Box<dyn Objective>, usize, Vec<usize>)> = vec![
-            (Box::new(SquaredErrorObjective), 1, vec![2 * c + 4097]),
+            (Box::new(SquaredError), 1, vec![2 * c + 4097]),
             (
-                Box::new(LogisticObjective::new(1.5)),
+                Box::new(Logistic::new(1.5)),
                 1,
                 (1..=15).map(|r| 2 * c + r).collect(),
             ),
-            (Box::new(SoftmaxObjective::new(2, true)), 2, vec![2 * c + 4]),
-            (Box::new(SoftmaxObjective::new(3, true)), 3, vec![2 * c + 4]),
-            (
-                Box::new(SoftmaxObjective::new(9, false)),
-                9,
-                vec![2 * c + 1],
-            ),
+            (Box::new(Softmax::new(2, true)), 2, vec![2 * c + 4]),
+            (Box::new(Softmax::new(3, true)), 3, vec![2 * c + 4]),
+            (Box::new(Softmax::new(9, false)), 9, vec![2 * c + 1]),
             // Per-output residual scales are global reductions: chunking the
             // row kernel must not change them.
             (
-                Box::new(QuantileObjective::new(&[0.1, 0.5, 0.9]).unwrap()),
+                Box::new(Quantile::new(&[0.1, 0.5, 0.9]).unwrap()),
                 3,
                 vec![2 * c + 3],
             ),
             (
-                Box::new(ExpectileObjective::new(&[0.2, 0.8]).unwrap()),
+                Box::new(Expectile::new(&[0.2, 0.8]).unwrap()),
                 2,
                 vec![2 * c + 3],
             ),
-            (Box::new(AbsoluteErrorObjective::new(1)), 1, vec![2 * c + 5]),
+            (Box::new(AbsoluteError::new(1)), 1, vec![2 * c + 5]),
         ];
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)

@@ -37,6 +37,7 @@ Requires Rust 1.93 or newer (edition 2024) and a C compiler, which the
 ## Quick start
 
 ```rust
+use hessboost::config::TreeMethod;
 use hessboost::prelude::*;
 
 fn main() -> Result<()> {
@@ -66,10 +67,25 @@ fn main() -> Result<()> {
 }
 ```
 
-Everything used in typical training and prediction is in
-`hessboost::prelude`; other items are reached through their module (for
-example `hessboost::data::load_csv`). The
+`hessboost::prelude` holds only the train-and-predict workflow
+(`TrainingParams`, `DMatrix`, `train`, `Trainer`, `BoostedModel`, and the
+error types); everything else is imported from its module, for example
+`hessboost::config::TreeMethod` or `hessboost::data::load_csv`. The
 [API documentation](https://docs.rs/hessboost) covers every type and option.
+
+`train(&params, &dtrain, rounds)` is the plain run; `Trainer` adds the
+optional arguments of XGBoost's `xgb.train` as builder methods:
+
+```rust
+let result = Trainer::new(&params, &dtrain, 1000)
+    .eval(&dvalid, "valid")         // watched eval set (repeatable)
+    .early_stopping_rounds(20)      // on the last metric of the last eval set
+    .train()?;                      // TrainResult { model, history }
+let continued = Trainer::new(&params, &dtrain, 50)
+    .init_model(&result.model)      // continued training (xgb_model=)
+    .train()?
+    .model;
+```
 
 ## Examples
 
@@ -107,23 +123,25 @@ Everything in this section follows XGBoost 3.4.2 and is covered by the
   Boosted random forests with `num_parallel_tree`: each iteration grows
   that many trees per output from the same gradients, each with its own
   row/column sample and `eta / num_parallel_tree` shrinkage.
-- **Entry points:** `train`, `train_with_eval` (watched eval sets, early
-  stopping), `train_with_objective`, `train_with_custom_metric`, and `cv`
-  (k-fold cross-validation).
-- **Continued training:** `train_continue` / `train_continue_with_eval`
-  (XGBoost's `xgb_model=`) keep the model's intercept and continue its RNG
-  stream, so `a` rounds followed by `b` rounds grow the same trees as one
-  run of `a + b`.
+- **Entry points:** `train` and the `Trainer` builder (watched eval sets
+  via `.eval`, `.early_stopping_rounds`, custom `.objective` and
+  `.custom_metric` hooks, `.init_model`), and `cv` (k-fold
+  cross-validation), all in `hessboost::training`.
+- **Continued training:** `Trainer::init_model` (XGBoost's `xgb_model=`)
+  keeps the model's intercept and continues its RNG stream, so `a` rounds
+  followed by `b` rounds grow the same trees as one run of `a + b`.
 - **Refresh:** `process_type = update` (XGBoost's `refresh` updater, via
-  `train_continue`) recomputes an existing gbtree model's node statistics
-  and, with `refresh_leaf`, its leaf values on new data. It is refused for
-  DART-weighted and vector-leaf models, monotone constraints, linear leaves,
-  `path_smooth`, `use_quantized_grad`, `extra_trees`, reuse penalties, and
-  more rounds than the model has.
-- **Slicing and iteration ranges:** `BoostedModel::slice(begin, end, step)`
+  `Trainer::init_model`) recomputes an existing gbtree model's node
+  statistics and, with `refresh_leaf`, its leaf values on new data. It is
+  refused for DART-weighted and vector-leaf models, monotone constraints,
+  linear leaves, `path_smooth`, `use_quantized_grad`, `extra_trees`, reuse
+  penalties, and more rounds than the model has.
+- **Slicing and iteration ranges:** `BoostedModel::slice(0..4, 1)`
   (XGBoost's `booster[a:b:c]`) and the `iteration_range` predictions
   `predict_range`, `predict_margin_range`, `predict_leaf_range`,
-  `predict_contribs_range`, and `predict_interactions_range`.
+  `predict_contribs_range`, `predict_interactions_range`, and
+  `predict_distribution_range`, which take a Rust range of iterations
+  (`..` for all, `..n`, `2..5`) where XGBoost takes `(begin, end)`.
 
 ### Trees
 
@@ -152,7 +170,7 @@ Everything in this section follows XGBoost 3.4.2 and is covered by the
 | Counts | `count:poisson` |
 | Ranking | `rank:pairwise`, `rank:ndcg`, `rank:map` (LambdaMART, `lambdarank_num_pair_per_sample`) |
 | Survival | `survival:cox` (negative labels are right-censored), `survival:aft` (interval-censored label bounds, `aft_loss_distribution` `normal`/`logistic`/`extreme`) |
-| Custom | `CustomObjective` via `train_with_objective` |
+| Custom | `CustomObjective` via `Trainer::objective` |
 
 Intercepts are estimated per output as XGBoost 3.4.2 does.
 `reg:absoluteerror` and `reg:quantileerror` use XGBoost 3.4's smoothed
@@ -163,8 +181,8 @@ losses.
 `rmse`, `rmsle`, `mae`, `mape`, `mphe`, `logloss`, `error`, `auc`, `aucpr`,
 `mlogloss`, `merror`, `poisson-nloglik`, `gamma-nloglik`, `tweedie-nloglik`,
 `ndcg`, `map`, `pre`, `quantile`, `expectile`, `cox-nloglik`, `aft-nloglik`,
-`interval-regression-accuracy`, and custom metrics via
-`train_with_custom_metric`. Ranking metrics take `@k` cutoffs (plain `pre`
+`interval-regression-accuracy`, and custom metrics (`CustomMetric`) via
+`Trainer::custom_metric`. Ranking metrics take `@k` cutoffs (plain `pre`
 cuts at 32) and `tweedie-nloglik@rho` a variance power. Each objective's
 default metric is XGBoost's.
 
@@ -237,12 +255,12 @@ suite. Unsupported combinations are refused with an error.
 ### Prediction intervals
 
 `SplitConformal` (absolute residuals around a point model) and
-`ConformalizedQuantile` (CQR, Romano et al. 2019) calibrate a fitted model
-on held-out data and return `(lower, upper)` intervals from
-`predict_interval`. CQR calibrates two single-output models, two outputs of
-one model, or a `dist:*` model's central band. When calibration and test
-rows are exchangeable and unseen in training, coverage is at least
-`1 − alpha` in finite samples.
+`ConformalizedQuantile` (CQR, Romano et al. 2019), in
+`hessboost::conformal`, calibrate a fitted model on held-out data and
+return `(lower, upper)` intervals from `predict_interval`. CQR calibrates
+two single-output models, two outputs of one model, or a `dist:*` model's
+central band. When calibration and test rows are exchangeable and unseen
+in training, coverage is at least `1 − alpha` in finite samples.
 
 ### Distributional boosting
 
@@ -255,9 +273,10 @@ negative log-likelihood.
 - `dist_gradient = fisher` (default; natural-gradient Newton steps),
   `hessian`, or `natural` (NGBoost's unit-Hessian natural gradient).
 - `predict_distribution` / `predict_distribution_range` return a `Dist`
-  per row with `mean`, `variance`, `std_dev`, `cdf`, `quantile`,
-  `log_prob`, `crps`, central `interval`, and inverse-CDF `sample`;
-  `predict` returns the parameters `[row][parameter]`.
+  (`hessboost::objective::distributional`) per row with `mean`,
+  `variance`, `std_dev`, `cdf`, `quantile`, `log_prob`, `crps`, central
+  `interval`, and inverse-CDF `sample`; `predict` returns the parameters
+  `[row][parameter]`.
 - Metrics: `nll` (default) and `crps`.
 - With `multi_strategy = multi_output_tree`, one shared tree per round fits
   every parameter: `dist_split_direction = random` (default) or `cyclic`
@@ -272,7 +291,8 @@ and 90% intervals cover 0.891 of test rows (0.906 after CQR).
 
 ### Budget training
 
-`train_with_budget(&params, &dtrain, &BudgetConfig::new(1.0))` reimplements
+`train_with_budget(&params, &dtrain, &BudgetConfig::new(1.0))`
+(`hessboost::training::budget`) reimplements
 [PerpetualBooster](https://github.com/perpetual-ml/perpetual)'s algorithm:
 one `budget` number replaces the learning rate, tree-size limits, and round
 count. Below the root, every split must pass a five-fold generalization
@@ -286,7 +306,7 @@ Supported objectives: `reg:squarederror`, `reg:pseudohubererror`,
 `reg:gamma`, and `reg:tweedie`. Parameters that budget mode derives itself
 (`eta`, `max_depth`, `lambda`, sampling, ...) are refused. Perpetual's
 dataset-specific heuristics are not reproduced; the
-[`learner::budget`](https://docs.rs/hessboost/latest/hessboost/learner/budget/)
+[`training::budget`](https://docs.rs/hessboost/latest/hessboost/training/budget/)
 docs give the exact rules.
 
 On Friedman #1 data (`budget` example), budget 1.0 comes within 1% of the
@@ -337,11 +357,12 @@ After *Boosted Trees on a Diet* ([Herrmann et al., ICLR 2026](https://arxiv.org/
   threshold not yet used anywhere in the ensemble. Available in every tree
   method; refused with `extra_trees`, `path_smooth`, and symmetric trees.
 - **Compact format:** `BoostedModel::to_compact_bytes` / `to_compact` give a
-  `CompactModel` with deduplicated, bit-packed feature, threshold, and leaf
-  tables. Its `predict_margin` is bit-identical to the source model's;
-  `BoostedModel::size_report` compares native and compact sizes. Forests and
-  scalar multi-output models are supported; gblinear, linear-leaf, and
-  vector-leaf models are refused. XGBoost cannot read the format.
+  `CompactModel` (`hessboost::model::compact`) with deduplicated,
+  bit-packed feature, threshold, and leaf tables. Its `predict_margin` is
+  bit-identical to the source model's; `BoostedModel::size_report` compares
+  native and compact sizes. Forests and scalar multi-output models are
+  supported; gblinear, linear-leaf, and vector-leaf models are refused.
+  XGBoost cannot read the format.
 
 On the `compact_model` example (100 depth-3 trees, 16 features), the compact
 format is 2.8× smaller than the zstd-compressed native binary (6370 vs
@@ -350,13 +371,14 @@ smaller (9 features, 67 thresholds) at 95.05% accuracy.
 
 ### Ordered target statistics
 
-`hessboost::data::OrderedTargetEncoder` encodes categorical columns as
-smoothed target means, CatBoost-style: each training row sees only the
-rows before it in a seeded random permutation. The default prior is the
-training-label mean; set a fixed `.prior(...)` to keep every row's label out
-of its own encoding. The `FittedTargetEncoder` applies full-training
-statistics to new data, maps unseen categories to the prior, and is
-serde-serializable. Regression and binary labels; dense and CSR input.
+`OrderedTargetEncoder` (`hessboost::data::target_stats`) encodes
+categorical columns as smoothed target means, CatBoost-style: each training
+row sees only the rows before it in a seeded random permutation. The
+default prior is the training-label mean; set a fixed `.prior(...)` to keep
+every row's label out of its own encoding. The `FittedTargetEncoder`
+applies full-training statistics to new data, maps unseen categories to the
+prior, and is serde-serializable. Regression and binary labels; dense and
+CSR input.
 
 ### Boosting from a pretrained prior
 

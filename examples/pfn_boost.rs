@@ -79,8 +79,9 @@
 //! `multi:softprob`, `with_base_margin` also takes `n_rows * num_class`
 //! per-class scores laid out row-major.
 
-use hessboost::data::load_csv;
-use hessboost::metric::{Auc, LogLoss};
+use hessboost::config::BoosterKind;
+use hessboost::data::{CsvOptions, load_csv};
+use hessboost::metric::{Auc, LogLoss, Metric};
 use hessboost::prelude::*;
 use std::path::Path;
 
@@ -164,14 +165,11 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
     );
 
     // Baseline: boosting from the constant intercept, early-stopped on `valid`.
-    let scratch = train_with_eval(
-        &params,
-        &train.data,
-        MAX_ROUNDS,
-        &[(&valid.data, "valid")],
-        Some(EARLY_STOPPING),
-    )?
-    .model;
+    let scratch = Trainer::new(&params, &train.data, MAX_ROUNDS)
+        .eval(&valid.data, "valid")
+        .early_stopping_rounds(EARLY_STOPPING)
+        .train()?
+        .model;
 
     // PFN-Boost: seed train, valid, and test with the same `s * score + C`,
     // then pick `s` by validation logloss (the model predicts at its best
@@ -183,14 +181,11 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
         let c = scratch.base_score() - s * prior_mean as f32;
         let dtrain = train.with_prior(s, c)?;
         let dvalid = valid.with_prior(s, c)?;
-        let model = train_with_eval(
-            &params,
-            &dtrain,
-            MAX_ROUNDS,
-            &[(&dvalid, "valid")],
-            Some(EARLY_STOPPING),
-        )?
-        .model;
+        let model = Trainer::new(&params, &dtrain, MAX_ROUNDS)
+            .eval(&dvalid, "valid")
+            .early_stopping_rounds(EARLY_STOPPING)
+            .train()?
+            .model;
         let valid_loss = LogLoss.eval(&model.predict(&dvalid)?, valid.labels(), None);
         if best.as_ref().is_none_or(|(loss, ..)| valid_loss < *loss) {
             best = Some((valid_loss, s, c, model));

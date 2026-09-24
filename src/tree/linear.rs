@@ -39,7 +39,9 @@ use serde::{Deserialize, Serialize};
 /// `kZeroThreshold`, `1e-35f`).
 const ZERO_THRESHOLD: f64 = 1e-35_f32 as f64;
 
-/// The per-leaf linear models of one tree, indexed by node id.
+/// The per-leaf linear models of one tree, indexed by node id: what
+/// [`TrainingParams::linear_tree`](crate::config::TrainingParams::linear_tree)
+/// fits in every leaf, read through [`RegTree::linear_leaves`].
 ///
 /// Leaf `n` predicts `intercept(n) + Σ coeff·x[feature]` over its
 /// [`terms`](Self::terms), or the node's constant `leaf_value` when any of
@@ -388,6 +390,7 @@ pub(crate) fn accumulate_forest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{ChildLeaf, SplitRule};
 
     #[test]
     fn full_pivot_solver_matches_a_known_solution() {
@@ -408,7 +411,12 @@ mod tests {
     /// `default_left`, with constant leaves `-0.5` / `0.25`.
     fn stump(default_left: bool) -> RegTree {
         let mut tree = RegTree::with_root(1.0);
-        tree.expand(0, 0, 0.0, default_left, -0.5, 1.0, 0.25, 1.0);
+        tree.expand(
+            0,
+            SplitRule::numeric(0, 0.0, default_left),
+            ChildLeaf::new(-0.5, 1.0),
+            ChildLeaf::new(0.25, 1.0),
+        );
         tree
     }
 
@@ -475,9 +483,20 @@ mod tests {
     fn categorical_path_features_route_but_stay_out_of_the_model() {
         // Root splits categorical feature 0; each child splits numeric 1.
         let mut tree = RegTree::with_root(8.0);
-        let (l, r) = tree.expand_categorical(0, 0, &[1], false, 0.0, 4.0, 0.0, 4.0);
-        tree.expand(l, 1, 0.5, true, 0.0, 2.0, 0.0, 2.0);
-        tree.expand(r, 1, 0.5, true, 0.0, 2.0, 0.0, 2.0);
+        let (l, r) = tree.expand(
+            0,
+            SplitRule::categorical(0, &[1], false),
+            ChildLeaf::new(0.0, 4.0),
+            ChildLeaf::new(0.0, 4.0),
+        );
+        for child in [l, r] {
+            tree.expand(
+                child,
+                SplitRule::numeric(1, 0.5, true),
+                ChildLeaf::new(0.0, 2.0),
+                ChildLeaf::new(0.0, 2.0),
+            );
+        }
         let types = [FeatureType::Categorical, FeatureType::Numerical];
         let paths = path_features(tree.nodes(), &types);
         for (id, node) in tree.nodes().iter().enumerate() {

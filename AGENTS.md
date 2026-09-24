@@ -58,25 +58,29 @@ the benchmark harnesses.
 names, `too_many_lines`, `missing_errors_doc`/`missing_panics_doc`,
 `must_use_candidate`, and `inline_always`. Fix new warnings. A new local
 `#[allow(...)]` needs `reason = "..."` and is acceptable only where the lint
-is wrong for that site. `clippy.toml` lists the doc identifiers (`XGBoost`,
-`TreeSHAP`, ...) exempt from `doc_markdown`; add new proper nouns there.
+is wrong for that site. Never `#[allow(clippy::too_many_arguments)]`: group
+the parameters into a well-named struct of arguments that belong together
+(e.g. per-call context vs. per-node state; references and `Copy` values
+passed by reference in hot loops). `clippy.toml` lists the doc identifiers
+(`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`; add new proper
+nouns there.
 
 ## Layout (`src/`)
 
 | Path | Contents |
 |---|---|
-| `lib.rs` | crate docs, module list, `prelude` |
+| `lib.rs` | crate docs (module map, "What's here"), module list, `prelude`, hidden `internals` |
 | `error.rs` | `HessboostError`, `Result` |
 | `rng.rs` | `Rng` (xoshiro256++) and the SplitMix64 mixing for counter-based streams |
-| `data/` | `DMatrix` (dense/CSR, labels or a label matrix, label bounds, weights, groups, base margins, feature types and weights), `meta` (`MetaInfo`, the view objectives and metrics read), `loaders` (libsvm/CSV), `sketch`/`quantile` (quantile sketch, `HistCuts`), `ghist` (`GHistIndex` binning), `target_stats` (opt-in ordered target statistics) |
-| `config/` | `TrainingParams`, its builder and `validate`; names mirror XGBoost |
-| `objective/` | Losses by XGBoost name: `regression`, `classification`, `multiclass`, `count`, `ranking`, `quantile` (quantile/expectile alpha lists), `absolute` (smoothed MAE), `survival` (Cox/AFT; `erf` ported from glibc), `multi_target` (label-matrix wrapper), `custom`; `distributional/` (opt-in `dist:*` families, `Dist`, `special` functions) |
+| `data/` | `DMatrix` (dense/CSR, labels or a label matrix, label bounds, weights, groups, base margins, feature types and weights), `meta` (`MetaInfo`, the view objectives and metrics read), `loaders` (libsvm/CSV), `sketch`/`quantile` (quantile sketch, `HistCuts`), `ghist` (`GHistIndex` binning), `target_stats` (public; opt-in ordered target statistics) |
+| `config/` | `params.rs`: `TrainingParams`, its builder and `validate`, the parameter enums, `ObjectiveParams`; names mirror XGBoost |
+| `objective/` | Losses by XGBoost name: `regression`, `classification`, `multiclass`, `count`, `ranking`, `quantile` (quantile/expectile alpha lists), `absolute` (smoothed MAE), `survival` (Cox/AFT; `erf` ported from glibc), `multi_target` (label-matrix wrapper), `custom`; `distributional/` (public; opt-in `dist:*` families, `Dist`, `special` functions) |
 | `metric/` | Eval metrics by XGBoost name: `mod.rs` (factory, defaults, rmse, mae, logloss, error, auc/aucpr, multiclass, count, ndcg/map, custom), `elementwise` (rmsle, mape, mphe), `ranking` (`pre@k`), `quantile`, `survival` (cox/aft-nloglik, interval accuracy), `distributional` (`nll`, `crps`) |
-| `tree/` | `regtree` (`RegTree`, scalar or vector leaves), `gain`, `constraints` (monotone/interaction), `sampler` (colsample bytree/bylevel/bynode, optionally feature-weighted), `builder/` (see below), `hist/` (histogram accumulation; `hist/quantized` for quantized gradients), `compact` (prediction-optimized layout, scalar and vector leaves), `oblivious` (bit-pattern prediction for symmetric trees), `linear` (opt-in `linear_tree` leaves), `reuse` (opt-in Trees-on-a-Diet reuse penalties) |
+| `tree/` | `regtree` (`RegTree`, scalar or vector leaves), `gain`, `constraints` (monotone/interaction), `sampler` (colsample bytree/bylevel/bynode, optionally feature-weighted), `builder/` (see below), `hist/` (histogram accumulation; `hist/quantized` for quantized gradients), `compact` (prediction-optimized layout, scalar and vector leaves), `oblivious` (bit-pattern prediction for symmetric trees), `linear` (opt-in `linear_tree` leaves, `LinearLeaves`), `reuse` (opt-in Trees-on-a-Diet reuse penalties); only `RegTree`, `Node`, `LinearLeaves` are public |
 | `tree/builder/` | `mod.rs` (split enumeration shared by all builders, incl. `sweep_categorical`), `exact`, `hist` (also `approx`), `multi` (vector-leaf trees), and the opt-in `oblivious` (symmetric growth), `lightgbm` (`extra_trees`/`path_smooth` search), `budget` (generalization-gated grower) |
-| `booster/` | `gblinear` |
-| `learner/` | `train` (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `model` (`BoostedModel`: iteration layout, slicing, `iteration_range` prediction, save/load entry points), `native` (native binary container), `sections` (section table shared by the native and compact formats), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv`, `shap` (QuadratureTreeSHAP), `conformal` (split-conformal / CQR intervals), `compact_model` (`CompactModel`, `HBTD` format), `budget` (opt-in PerpetualBooster-style training) |
-| `model/` | XGBoost import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
+| `training/` | `train` (`train`, `Trainer`, `TrainResult`; gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `gblinear` (coordinate descent), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv`, `budget` (public; opt-in PerpetualBooster-style training) |
+| `model/` | `mod.rs` (`BoostedModel`: iteration layout, slicing, `iteration_range` prediction, save/load entry points; user docs for XGBoost interchange), `native` (native binary container), `sections` (section table shared by the native and compact formats), `shap` (QuadratureTreeSHAP), `compact` (public; `CompactModel`, `HBTD` format), `xgboost` (XGBoost JSON/UBJSON schema mapping), `ubjson` (UBJSON codec over `serde_json::Value`) |
+| `conformal.rs` | split-conformal / CQR intervals (`SplitConformal`, `ConformalizedQuantile`) |
 | `simd/` | private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests` |
 | `test_support.rs` | unit-test helpers (`cfg(test)`) |
 
@@ -95,7 +99,7 @@ is wrong for that site. `clippy.toml` lists the doc identifiers (`XGBoost`,
 - `tests/data/saved/<version>/` holds the models each release saved (`.bin`,
   `.json`, compact `.hbtd` where supported, and `.margins`);
   `tests/data/xgboost-3.4.2-categorical.{json,ubj}` are XGBoost saves imported
-  by the `model/xgboost_json.rs` unit tests.
+  by the `model/xgboost.rs` unit tests.
 - `benches/training.rs` is the Criterion suite; `docs/performance.md` records
   its results and the XGBoost comparison.
 
@@ -144,9 +148,9 @@ is wrong for that site. `clippy.toml` lists the doc identifiers (`XGBoost`,
   unchanged, and stay out of the parity fixtures.
 - **Formats:** from 0.2.0 on, files written by a release keep loading in
   every later one (0.1.x native binaries are refused).
-  - Native binary (`learner/native.rs`): a zstd frame holding `SQB\0`, a
+  - Native binary (`model/native.rs`): a zstd frame holding `SQB\0`, a
     container version byte (`CONTAINER_VERSION`, currently 3), a section
-    table (`learner/sections.rs`), and an XXH64 checksum of the preceding
+    table (`model/sections.rs`), and an XXH64 checksum of the preceding
     bytes. Sections hold model scalars (`model.*`), objective parameters
     (`objective.*`), trees column-wise (`tree.*`, `node.*`,
     `leaf_linear.*`), and gblinear weights (`gblinear.*`). A new stored
@@ -159,7 +163,7 @@ is wrong for that site. `clippy.toml` lists the doc identifiers (`XGBoost`,
     one.
   - Native JSON (`BoostedModel`'s serde fields by name): a new field needs
     `#[serde(default)]` reproducing older files.
-  - Compact (`HBTD`, documented in `learner/compact_model.rs`): metadata is a
+  - Compact (`HBTD`, documented in `model/compact.rs`): metadata is a
     section table like the native one; a change to the bit stream bumps its
     version byte (currently 1).
   - Before each release, `cargo test --test native_format -- --ignored
@@ -208,11 +212,11 @@ is wrong for that site. `clippy.toml` lists the doc identifiers (`XGBoost`,
     column). `Metric::eval` returns NaN for inconsistent lengths.
 - **Refusals:** unsupported parameters and combinations fail with an error,
   never silently ignored. Checks live in `TrainingParams::validate`,
-  `multi_output::validate` (`multi_output_tree` needs `hist` or `auto`),
-  `continuation.rs` (`process_type=update`), and `learner/budget.rs`. Budget
-  mode compares the serialized params against the defaults plus its
-  allow-list, so a non-default value of any field it does not read,
-  including one added later, is refused automatically.
+  `training/multi_output.rs::validate` (`multi_output_tree` needs `hist` or
+  `auto`), `training/continuation.rs` (`process_type=update`), and
+  `training/budget.rs`. Budget mode compares the serialized params against
+  the defaults plus its allow-list, so a non-default value of any field it
+  does not read, including one added later, is refused automatically.
 - **Parity-fixed options:** options that XGBoost has but hessboost supports
   at one setting (README, "Not implemented") are not `TrainingParams`
   fields. `tests/parity.rs` (`expect_fixed`) fails a fixture that sets
@@ -221,26 +225,48 @@ is wrong for that site. `clippy.toml` lists the doc identifiers (`XGBoost`,
 
 ## Public API
 
-The crate root exports only modules; `hessboost::prelude` is the one place
-that re-exports items (see `lib.rs` for the list). Everything else is reached
-through its module, e.g. `hessboost::tree::RegTree`,
-`hessboost::data::{load_csv, read_csv, load_libsvm, read_libsvm}`,
-`hessboost::learner::EvalSet`, `hessboost::config::MAX_SYMMETRIC_DEPTH`.
+The crate root exports only modules. Rules:
 
-- Training (`rounds: usize`, `evals: &[(&DMatrix, &str)]`,
-  `early_stopping_rounds: Option<usize>`):
-  - `train(&params, &dtrain, rounds)` and
-    `train_with_objective(.., rounds, &dyn Objective)` → `BoostedModel`.
-  - `train_with_eval(.., rounds, evals, early_stopping_rounds)` and
-    `train_with_custom_metric(.., evals, early_stopping_rounds, Box<dyn Metric>)`
-    → `TrainResult`.
-  - `train_continue(.., rounds, &model)` → `BoostedModel`,
-    `train_continue_with_eval(.., evals, early_stopping_rounds, &model)` →
-    `TrainResult`; with `process_type(ProcessType::Update)` they run the
-    refresh updater.
+- `hessboost::prelude` holds only the train-and-predict workflow:
+  `TrainingParams`, `DMatrix`, `train`, `Trainer`, `BoostedModel`,
+  `HessboostError`, `Result`. Parameter enums, objectives, metrics, and
+  opt-in features are imported from their modules.
+- Each item has exactly one public path (the prelude re-exports are the only
+  second path): no flat re-exports of a public submodule's items, no
+  aliases.
+- Opt-in subsystems with substantial docs get their own public submodule:
+  `data::target_stats`, `training::budget`, `model::compact`,
+  `objective::distributional`, and the top-level `conformal`.
+- Implementation modules are crate-private (`pub(crate)` or private); the
+  benches and parity tests reach internals (`HistCuts`, `GHistIndex`,
+  `HistTreeBuilder`, `CpuBackend`, `HistogramBackend`, `zeroed`,
+  `ColumnSampler`) through the `#[doc(hidden)] pub mod internals` in
+  `lib.rs`, which is not public API.
+
+Paths: `config` (`TrainingParams`, `TrainingParamsBuilder`, the parameter
+enums, `ObjectiveParams`, `MAX_SYMMETRIC_DEPTH`); `data` (`DMatrix`,
+`FeatureType`, `MetaInfo`, `GroupInfo`, `CsvOptions`,
+`{load,read}_{csv,libsvm}`); `training` (`train`, `Trainer`, `TrainResult`,
+`RoundEval`, `cv`, `CvResult`); `model` (`BoostedModel`, `ImportanceType`);
+`objective` (`Objective`, `GradPair`, `SplitGradient`, `PointwiseLoss`,
+`CustomObjective`, `create_objective`, built-ins named without an
+`Objective` suffix: `SquaredError`, `Logistic`, `Softmax`, `LambdaMart`,
+`Aft`, ...); `metric` (`Metric`, `CustomMetric`, the built-in metrics,
+`create_metric(name, &params)`); `tree` (`RegTree`, `Node`,
+`LinearLeaves`); `error`.
+
+- Training (`rounds: usize`):
+  - `train(&params, &dtrain, rounds)` → `BoostedModel`.
+  - `Trainer::new(&params, &dtrain, rounds)` with optional
+    `.eval(&data, "name")` (repeatable), `.early_stopping_rounds(k)`,
+    `.objective(&dyn Objective)`, `.custom_metric(Box<dyn Metric>)`,
+    `.init_model(&model)` (continued training; with
+    `process_type(ProcessType::Update)` the refresh updater), then
+    `.train()` → `TrainResult { model, history }`.
   - `cv(&params, &data, rounds, nfold, seed: u64)` → `Vec<CvResult>`.
-  - `train_with_budget(&params, &dtrain, &BudgetConfig::new(budget))` →
-    `BudgetResult { model, eta, stop }` (no round count).
+  - `training::budget::train_with_budget(&params, &dtrain,
+    &BudgetConfig::new(budget))` → `BudgetResult { model, eta, stop }` (no
+    round count).
 - `DMatrix::from_dense` / `from_dense_with_missing` / `from_csr`, then
   `.with_labels` / `.with_label_matrix(y, k)` / `.with_label_bounds` /
   `.with_weights` / `.with_base_margin` / `.with_group_sizes` /
@@ -252,18 +278,19 @@ through its module, e.g. `hessboost::tree::RegTree`,
     (`dist:*`, → `Vec<Dist>`), and the `iteration_range` variants
     `predict_range`, `predict_margin_range`, `predict_leaf_range`,
     `predict_contribs_range`, `predict_interactions_range`,
-    `predict_distribution_range` taking `(begin, end)`; leaf, contribution,
-    and interaction ranges must start at 0.
-  - `slice(begin, end, step)`, `num_boost_rounds`, `num_parallel_tree`,
-    `feature_importance(ImportanceType)`.
+    `predict_distribution_range` taking `impl RangeBounds<usize>` of
+    iterations (`..`, `..n`, `2..5`); leaf, contribution, and interaction
+    ranges must start at 0.
+  - `slice(iterations: impl RangeBounds<usize>, step)`, `num_boost_rounds`,
+    `num_parallel_tree`, `feature_importance(ImportanceType)`.
   - Formats: native binary `to_bytes`/`from_bytes`,
     `save_binary`/`load_binary`; native JSON `to_json`/`from_json`,
     `save_json`/`load_json`; XGBoost `{to,from,save,load}_xgboost_json` and
     `{to,from,save,load}_xgboost_ubjson`.
-  - Compact: `to_compact()` / `to_compact_bytes()` → `CompactModel`
+  - Compact: `to_compact()` / `to_compact_bytes()` → `model::compact::CompactModel`
     (`from_bytes`/`load`, `to_bytes`/`save`, `predict_margin` bit-identical
     to the source, `predict`); `size_report()` → `ModelSizeReport`.
-- Conformal: `SplitConformal::calibrate(&model, &dcal, alpha)`;
+- `conformal`: `SplitConformal::calibrate(&model, &dcal, alpha)`;
   `ConformalizedQuantile::calibrate(&lower, &upper, &dcal, alpha)` /
   `calibrate_outputs(&model, lower_output, upper_output, &dcal, alpha)` /
   `calibrate_distribution(&model, &dcal, alpha)`; then

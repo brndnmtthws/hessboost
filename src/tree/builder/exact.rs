@@ -12,9 +12,9 @@
 //! Monotone and interaction constraints are honored during split search.
 
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, SplitPos, build_interaction_sets,
-    finalize_leaf_values, limit_or_unbounded, next_allowed, permits, sum_rows, sweep_categorical,
-    xgb_loss_chg, xgb_node_gain, xgb_update,
+    BELOW_ALL_VALUES, BestSplit, Children, InteractionState, SplitPos, SplitScorer,
+    build_interaction_sets, finalize_leaf_values, limit_or_unbounded, next_allowed, permits,
+    sum_rows, sweep_categorical, xgb_node_gain, xgb_update,
 };
 use crate::K_RT_EPS_F32;
 use crate::config::TrainingParams;
@@ -33,7 +33,6 @@ use std::cell::RefCell;
 #[derive(Debug, Clone)]
 pub struct SortedColumns {
     n_rows: usize,
-    n_cols: usize,
     col_ptr: Vec<usize>,
     rows: Vec<u32>,
     vals: Vec<f32>,
@@ -67,7 +66,6 @@ impl SortedColumns {
         }
         SortedColumns {
             n_rows: csc.n_rows(),
-            n_cols,
             col_ptr,
             rows,
             vals,
@@ -78,12 +76,6 @@ impl SortedColumns {
     #[inline]
     pub fn n_rows(&self) -> usize {
         self.n_rows
-    }
-
-    /// Number of columns.
-    #[inline]
-    pub fn n_cols(&self) -> usize {
-        self.n_cols
     }
 
     #[inline]
@@ -189,6 +181,13 @@ impl<'a> ExactTreeBuilder<'a> {
             for &f in &feature_subset {
                 let (crows, cvals) = cols.column(f as usize);
                 let dir = self.cons.dir(f as usize);
+                // Scoring context of active node `nid` (dense slot `slot`) for `f`.
+                let scorer = |slot: usize, nid: usize| SplitScorer {
+                    reg: &self.reg,
+                    root_gain: root_gain[slot],
+                    bounds: node_bounds[nid],
+                    dir,
+                };
                 // Row `r`'s node and its dense slot, when that node is active
                 // at this level and may split on `f`.
                 let active_slot = |r: usize| {
@@ -232,10 +231,7 @@ impl<'a> ExactTreeBuilder<'a> {
                             &mut best[slot],
                             &cats,
                             node_stats[nid],
-                            root_gain[slot],
-                            node_bounds[nid],
-                            dir,
-                            &self.reg,
+                            &scorer(slot, nid),
                             f,
                             reuse.as_deref().map(|r| r as &dyn CategoricalPenalty),
                         );
@@ -265,7 +261,11 @@ impl<'a> ExactTreeBuilder<'a> {
                         {
                             let c = node_stats[nid].sub(*e);
                             if c.hess >= self.reg.min_child_weight {
-                                let (left, right) = if d_step < 0 { (c, *e) } else { (*e, c) };
+                                let children = if d_step < 0 {
+                                    Children::new(true, c, *e)
+                                } else {
+                                    Children::new(false, *e, c)
+                                };
                                 // ColMaker's midpoint `(fvalue + last) * 0.5f`
                                 // overflows to `±inf` for two same-sign values
                                 // near `±f32::MAX`. Only then fall back to the
@@ -280,14 +280,10 @@ impl<'a> ExactTreeBuilder<'a> {
                                 let thr = if mid == val { last } else { mid };
                                 self.try_split(
                                     &mut best[slot],
-                                    left,
-                                    right,
-                                    root_gain[slot],
-                                    node_bounds[nid],
-                                    dir,
+                                    &scorer(slot, nid),
                                     f,
                                     thr,
-                                    d_step < 0,
+                                    children,
                                 );
                             }
                         }
@@ -331,18 +327,12 @@ impl<'a> ExactTreeBuilder<'a> {
                             } else {
                                 continue;
                             };
-                            let (left, right) = if d_step < 0 { (c, e) } else { (e, c) };
-                            self.try_split(
-                                &mut best[slot],
-                                left,
-                                right,
-                                root_gain[slot],
-                                node_bounds[nid],
-                                dir,
-                                f,
-                                thr,
-                                d_step < 0,
-                            );
+                            let children = if d_step < 0 {
+                                Children::new(true, c, e)
+                            } else {
+                                Children::new(false, e, c)
+                            };
+                            self.try_split(&mut best[slot], &scorer(slot, nid), f, thr, children);
                         }
                     }
                 };
@@ -424,37 +414,20 @@ impl<'a> ExactTreeBuilder<'a> {
     /// Evaluate one candidate partition exactly as XGBoost's `ColMaker` does
     /// (`CalcSplitGain − root_gain` in `f32`, `SplitEntry::Update` tie rule)
     /// and record it in `best` when it wins.
-    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn try_split(
         &self,
         best: &mut BestSplit,
-        left: GradStats,
-        right: GradStats,
-        root_gain: f32,
-        bounds: Bounds,
-        dir: i8,
+        scorer: &SplitScorer,
         feature: u32,
         threshold: f32,
-        default_left: bool,
+        children: Children,
     ) {
-        if let Some((mut loss_chg, wl, wr)) =
-            xgb_loss_chg(left, right, root_gain, &self.reg, bounds, dir)
-        {
+        if let Some(mut score) = scorer.loss_chg(children.left, children.right) {
             if let Some(reuse) = &self.reuse {
-                loss_chg -= reuse.borrow().numeric_penalty(feature, threshold);
+                score.loss_chg -= reuse.borrow().numeric_penalty(feature, threshold);
             }
-            xgb_update(
-                best,
-                loss_chg,
-                feature,
-                SplitPos::Value(threshold),
-                default_left,
-                left,
-                right,
-                wl,
-                wr,
-            );
+            xgb_update(best, feature, SplitPos::Value(threshold), children, score);
         }
     }
 }
@@ -462,11 +435,6 @@ impl<'a> ExactTreeBuilder<'a> {
 /// Utility: the full row index `0..n_rows` as `u32` (no subsampling).
 pub fn all_rows(n_rows: usize) -> Vec<u32> {
     (0..n_rows as u32).collect()
-}
-
-/// Utility: the full feature index `0..n_cols` as `u32` (no column sampling).
-pub fn all_features(n_cols: usize) -> Vec<u32> {
-    (0..n_cols as u32).collect()
 }
 
 #[cfg(test)]
@@ -626,7 +594,7 @@ mod tests {
     /// Returns the predictions.
     fn train_exact_finite(x: &[f32], y: &[f32]) -> Vec<f32> {
         use crate::config::TreeMethod;
-        use crate::learner::{BoostedModel, train};
+        use crate::{model::BoostedModel, training::train};
         let n = x.len();
         let data = crate::test_support::labeled_dense(x, n, 1, y);
         let params = TrainingParams::builder()

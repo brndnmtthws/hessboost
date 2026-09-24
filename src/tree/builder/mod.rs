@@ -11,7 +11,7 @@ mod lightgbm;
 mod multi;
 mod oblivious;
 
-pub use exact::{ExactTreeBuilder, SortedColumns, all_features, all_rows};
+pub(crate) use exact::{ExactTreeBuilder, SortedColumns, all_rows};
 pub use hist::HistTreeBuilder;
 pub(crate) use hist::LeafRows;
 pub(crate) use multi::{MultiTreeBuilder, VectorGradients};
@@ -25,8 +25,8 @@ use crate::tree::constraints::{
     Bounds, calc_weight_bounded, child_bounds, gain_at_weight, satisfies,
 };
 use crate::tree::gain::{GradStats, RegParams, calc_gain, threshold_l1};
-use crate::tree::regtree::RegTree;
 use crate::tree::reuse::CategoricalPenalty;
+use crate::tree::{ChildLeaf, RegTree, SplitRule};
 
 /// The bound set by a `max_depth` / `max_leaves` style parameter, where `0`
 /// means unlimited.
@@ -82,32 +82,22 @@ impl BestSplit {
 
     /// A numeric split candidate; `pos` carries the split location (value-space
     /// threshold for exact search, global-bin boundary for histogram search).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn numeric(
-        loss_chg: f64,
-        feature: u32,
-        pos: SplitPos,
-        default_left: bool,
-        left: GradStats,
-        right: GradStats,
-        w_left: f64,
-        w_right: f64,
-    ) -> Self {
+    pub(super) fn numeric(feature: u32, pos: SplitPos, children: Children, score: Score) -> Self {
         let (threshold, split_bin) = match pos {
             SplitPos::Value(t) => (t, None),
             SplitPos::Bin(b) => (0.0, Some(b)),
             SplitPos::BelowBins => (0.0, None),
         };
         BestSplit {
-            loss_chg,
+            loss_chg: score.loss_chg,
             feature,
             threshold,
             split_bin,
-            default_left,
-            left,
-            right,
-            w_left,
-            w_right,
+            default_left: children.default_left,
+            left: children.left,
+            right: children.right,
+            w_left: score.w_left,
+            w_right: score.w_right,
             is_categorical: false,
             cat_left: Vec::new(),
             children_swapped: false,
@@ -115,29 +105,24 @@ impl BestSplit {
     }
 
     /// A categorical (set-membership) split candidate; `cat_left` holds the
-    /// category values routed left, and `default_left` says where missing
-    /// values go.
-    #[allow(clippy::too_many_arguments)]
+    /// category values routed left, and `children.default_left` says where
+    /// missing values go.
     pub(super) fn categorical(
-        loss_chg: f64,
         feature: u32,
-        default_left: bool,
-        left: GradStats,
-        right: GradStats,
-        w_left: f64,
-        w_right: f64,
+        children: Children,
+        score: Score,
         cat_left: Vec<u32>,
     ) -> Self {
         BestSplit {
-            loss_chg,
+            loss_chg: score.loss_chg,
             feature,
             threshold: 0.0,
             split_bin: None,
-            default_left,
-            left,
-            right,
-            w_left,
-            w_right,
+            default_left: children.default_left,
+            left: children.left,
+            right: children.right,
+            w_left: score.w_left,
+            w_right: score.w_right,
             is_categorical: true,
             cat_left,
             children_swapped: false,
@@ -153,31 +138,17 @@ impl BestSplit {
     /// `threshold`), the children holding the bounded child weights as `f32`,
     /// and record the split's loss change. Returns the child ids.
     pub(super) fn expand(&self, tree: &mut RegTree, nid: usize, threshold: f32) -> (usize, usize) {
-        let (w_left, w_right) = (self.w_left as f32, self.w_right as f32);
-        let (h_left, h_right) = (self.left.hess as f32, self.right.hess as f32);
-        let ids = if self.is_categorical {
-            tree.expand_categorical(
-                nid,
-                self.feature,
-                &self.cat_left,
-                self.default_left,
-                w_left,
-                h_left,
-                w_right,
-                h_right,
-            )
+        let split = if self.is_categorical {
+            SplitRule::categorical(self.feature, &self.cat_left, self.default_left)
         } else {
-            tree.expand(
-                nid,
-                self.feature,
-                threshold,
-                self.default_left,
-                w_left,
-                h_left,
-                w_right,
-                h_right,
-            )
+            SplitRule::numeric(self.feature, threshold, self.default_left)
         };
+        let ids = tree.expand(
+            nid,
+            split,
+            ChildLeaf::new(self.w_left as f32, self.left.hess as f32),
+            ChildLeaf::new(self.w_right as f32, self.right.hess as f32),
+        );
         tree.set_split_gain(nid, self.loss_chg as f32);
         ids
     }
@@ -213,33 +184,142 @@ pub(super) fn children_valid(left: GradStats, right: GradStats, min_child_weight
         && right.hess >= min_child_weight
 }
 
-/// Gain of one candidate split plus its bounded child weights, or `None` when
-/// a child is below `min_child_weight` or a monotone constraint is violated.
-/// Unconstrained builds take the cheap closed-form path (weights unused).
-#[inline]
-pub(super) fn candidate_gain(
-    left: GradStats,
-    right: GradStats,
-    parent: f64,
-    bounds: Bounds,
-    dir: i8,
-    constrained: bool,
-    reg: &RegParams,
-) -> Option<(f64, f64, f64)> {
-    if left.hess < reg.min_child_weight || right.hess < reg.min_child_weight {
-        return None;
+/// A candidate partition of a node's rows: where missing values go and the
+/// gradient statistics of both children.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Children {
+    pub(super) default_left: bool,
+    pub(super) left: GradStats,
+    pub(super) right: GradStats,
+}
+
+impl Children {
+    #[inline]
+    pub(super) fn new(default_left: bool, left: GradStats, right: GradStats) -> Self {
+        Children {
+            default_left,
+            left,
+            right,
+        }
     }
-    if constrained {
-        let wl = calc_weight_bounded(left, reg, bounds);
-        let wr = calc_weight_bounded(right, reg, bounds);
-        if !satisfies(dir, wl, wr) {
+
+    /// The same partition seen from the other side: children exchanged and
+    /// missing values routed the other way.
+    #[inline]
+    fn swapped(self) -> Self {
+        Children::new(!self.default_left, self.right, self.left)
+    }
+}
+
+/// The score of a candidate partition: its loss change and both children's
+/// bounded weights. `Score<f32>` is XGBoost's `f32` split arithmetic;
+/// `Score` (`f64`) is what a [`BestSplit`] records.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Score<T = f64> {
+    pub(super) loss_chg: T,
+    pub(super) w_left: T,
+    pub(super) w_right: T,
+}
+
+impl<T> Score<T> {
+    /// The score of [`Children::swapped`].
+    #[inline]
+    fn swapped(self) -> Self {
+        Score {
+            loss_chg: self.loss_chg,
+            w_left: self.w_right,
+            w_right: self.w_left,
+        }
+    }
+}
+
+impl From<Score<f32>> for Score {
+    #[inline]
+    fn from(score: Score<f32>) -> Self {
+        Score {
+            loss_chg: f64::from(score.loss_chg),
+            w_left: f64::from(score.w_left),
+            w_right: f64::from(score.w_right),
+        }
+    }
+}
+
+/// Everything a candidate's score depends on besides its children: the
+/// regularization, the node's `root_gain` baseline ([`xgb_node_gain`]) and
+/// monotone bounds, and the candidate feature's monotone direction.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SplitScorer<'a> {
+    pub(super) reg: &'a RegParams,
+    pub(super) root_gain: f32,
+    pub(super) bounds: Bounds,
+    pub(super) dir: i8,
+}
+
+impl SplitScorer<'_> {
+    /// XGBoost's scalar `SplitEvaluator::CalcSplitGain` minus the parent's
+    /// `root_gain`, i.e. the `loss_chg` a candidate is compared and stored
+    /// with. Returns `None` when the split is invalid (a child without
+    /// positive Hessian or below `min_child_weight`) or violates the monotone
+    /// direction, and otherwise the `f32` loss change plus both bounded child
+    /// weights.
+    #[inline]
+    pub(super) fn loss_chg(&self, left: GradStats, right: GradStats) -> Option<Score<f32>> {
+        let reg = self.reg;
+        if !children_valid(left, right, reg.min_child_weight) {
             return None;
         }
-        let g = gain_at_weight(left, reg, wl) + gain_at_weight(right, reg, wr) - parent;
-        Some((g, wl, wr))
-    } else {
-        let g = calc_gain(left, reg) + calc_gain(right, reg) - parent;
-        Some((g, 0.0, 0.0))
+        let wl = xgb_weight(left, reg, self.bounds);
+        let wr = xgb_weight(right, reg, self.bounds);
+        if !satisfies(self.dir, f64::from(wl), f64::from(wr)) {
+            return None;
+        }
+        // Upstream's scalar `CalcGainGivenWeight` returns `float`: each child's
+        // score is rounded before the two are added in `f32`.
+        let gain = xgb_gain_given_weight(left, reg, wl) as f32
+            + xgb_gain_given_weight(right, reg, wr) as f32;
+        Some(Score {
+            loss_chg: gain - self.root_gain,
+            w_left: wl,
+            w_right: wr,
+        })
+    }
+
+    /// Gain of one candidate split in `f64` against the `root_gain` baseline,
+    /// plus its bounded child weights, or `None` when a child is below
+    /// `min_child_weight` or the monotone direction is violated. Unconstrained
+    /// builds take the cheap closed-form path (weights unused).
+    #[inline]
+    pub(super) fn candidate_gain(
+        &self,
+        left: GradStats,
+        right: GradStats,
+        constrained: bool,
+    ) -> Option<Score> {
+        let reg = self.reg;
+        if left.hess < reg.min_child_weight || right.hess < reg.min_child_weight {
+            return None;
+        }
+        let parent = f64::from(self.root_gain);
+        if constrained {
+            let wl = calc_weight_bounded(left, reg, self.bounds);
+            let wr = calc_weight_bounded(right, reg, self.bounds);
+            if !satisfies(self.dir, wl, wr) {
+                return None;
+            }
+            let g = gain_at_weight(left, reg, wl) + gain_at_weight(right, reg, wr) - parent;
+            Some(Score {
+                loss_chg: g,
+                w_left: wl,
+                w_right: wr,
+            })
+        } else {
+            let g = calc_gain(left, reg) + calc_gain(right, reg) - parent;
+            Some(Score {
+                loss_chg: g,
+                w_left: 0.0,
+                w_right: 0.0,
+            })
+        }
     }
 }
 
@@ -252,20 +332,23 @@ pub(super) fn candidate_gain(
 /// at the feature's first bin), which puts only the missing mass left. Its
 /// children are the forward pass's last boundary swapped, so it is distinct
 /// under a monotone constraint: the direction can reject one orientation and
-/// accept the other. `offer(pos, default_left, left, right)` sees every
-/// candidate; a `dense` index has no missing values.
+/// accept the other. `offer(pos, children)` sees every candidate; a `dense`
+/// index has no missing values.
 #[inline]
 pub(super) fn for_each_numeric_split(
     bins: &[GradStats],
     first: usize,
     total: GradStats,
     dense: bool,
-    mut offer: impl FnMut(SplitPos, bool, GradStats, GradStats),
+    mut offer: impl FnMut(SplitPos, Children),
 ) {
     let mut acc = GradStats::default();
     for (offset, &bin) in bins.iter().enumerate() {
         acc.add(bin);
-        offer(SplitPos::Bin(first + offset), false, acc, total.sub(acc));
+        offer(
+            SplitPos::Bin(first + offset),
+            Children::new(false, acc, total.sub(acc)),
+        );
     }
     // XGBoost compares the forward pass's final sum with the node statistics
     // exactly (`SplitContainsMissingValues`).
@@ -280,7 +363,7 @@ pub(super) fn for_each_numeric_split(
         } else {
             SplitPos::Bin(first + offset - 1)
         };
-        offer(pos, true, total.sub(suffix), suffix);
+        offer(pos, Children::new(true, total.sub(suffix), suffix));
     }
 }
 
@@ -355,35 +438,6 @@ pub(super) fn xgb_node_gain(stats: GradStats, reg: &RegParams, bounds: Bounds) -
     xgb_gain_given_weight(stats, reg, xgb_weight(stats, reg, bounds)) as f32
 }
 
-/// XGBoost's scalar `SplitEvaluator::CalcSplitGain` minus the parent's
-/// `root_gain`, i.e. the `loss_chg` a candidate is compared and stored with.
-/// Returns `None` when the split is invalid (a child without positive Hessian
-/// or below `min_child_weight`) or violates the monotone direction `dir`, and
-/// otherwise the `f32` loss change plus both bounded child weights.
-#[inline]
-pub(super) fn xgb_loss_chg(
-    left: GradStats,
-    right: GradStats,
-    root_gain: f32,
-    reg: &RegParams,
-    bounds: Bounds,
-    dir: i8,
-) -> Option<(f32, f32, f32)> {
-    if !children_valid(left, right, reg.min_child_weight) {
-        return None;
-    }
-    let wl = xgb_weight(left, reg, bounds);
-    let wr = xgb_weight(right, reg, bounds);
-    if !satisfies(dir, f64::from(wl), f64::from(wr)) {
-        return None;
-    }
-    // Upstream's scalar `CalcGainGivenWeight` returns `float`: each child's
-    // score is rounded before the two are added in `f32`.
-    let gain =
-        xgb_gain_given_weight(left, reg, wl) as f32 + xgb_gain_given_weight(right, reg, wr) as f32;
-    Some((gain - root_gain, wl, wr))
-}
-
 /// XGBoost's `SplitEntry::NeedReplace`: a candidate replaces the incumbent
 /// when its loss change is strictly better, or equal on a lower feature index.
 /// Infinite loss changes are never taken.
@@ -404,30 +458,16 @@ pub(super) fn need_replace(
 
 /// XGBoost's `SplitEntry::Update`: replace the incumbent when
 /// [`need_replace`] says so. `best.loss_chg` holds an `f32` value.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn xgb_update(
     best: &mut BestSplit,
-    loss_chg: f32,
     feature: u32,
     pos: SplitPos,
-    default_left: bool,
-    left: GradStats,
-    right: GradStats,
-    w_left: f32,
-    w_right: f32,
+    children: Children,
+    score: Score<f32>,
 ) -> bool {
-    let replace = need_replace(best.loss_chg as f32, best.feature, loss_chg, feature);
+    let replace = need_replace(best.loss_chg as f32, best.feature, score.loss_chg, feature);
     if replace {
-        *best = BestSplit::numeric(
-            f64::from(loss_chg),
-            feature,
-            pos,
-            default_left,
-            left,
-            right,
-            f64::from(w_left),
-            f64::from(w_right),
-        );
+        *best = BestSplit::numeric(feature, pos, children, score.into());
     }
     replace
 }
@@ -441,15 +481,11 @@ pub(super) const MAX_CAT_TO_ONEHOT: usize = 4;
 pub(super) const MAX_CAT_THRESHOLD: usize = 64;
 
 /// The best categorical split of one feature, in XGBoost's orientation: its
-/// set of categories goes to the right child, `default_left` routes missing
-/// values.
+/// set of categories goes to the right child, `children.default_left` routes
+/// missing values.
 struct CatCandidate {
-    loss_chg: f32,
-    default_left: bool,
-    left: GradStats,
-    right: GradStats,
-    w_left: f32,
-    w_right: f32,
+    children: Children,
+    score: Score<f32>,
 }
 
 /// XGBoost's scalar categorical split search (`HistEvaluator`), shared by the
@@ -465,71 +501,51 @@ struct CatCandidate {
 ///   suffix on the other side, missing values with it), at most
 ///   [`MAX_CAT_THRESHOLD`] categories deep.
 ///
-/// Candidates are scored with [`xgb_loss_chg`] and compared with XGBoost's
+/// Candidates are scored with [`SplitScorer::loss_chg`] and compared with XGBoost's
 /// tie rule ([`need_replace`]). XGBoost routes the chosen set to its right
 /// child; the recorded split stores that set as the tree's left child, with
 /// the children (and the missing direction) swapped to match. `penalty`
 /// (opt-in reuse penalties) is subtracted from each candidate's loss change
 /// before it competes; `None` leaves the search untouched.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn sweep_categorical(
     best: &mut BestSplit,
     cats: &[(u32, GradStats)],
     total: GradStats,
-    root_gain: f32,
-    bounds: Bounds,
-    dir: i8,
-    reg: &RegParams,
+    scorer: &SplitScorer,
     feature: u32,
     penalty: Option<&dyn CategoricalPenalty>,
 ) {
     let n = cats.len();
-    let score = |left: GradStats, right: GradStats, set: &dyn Fn() -> Vec<u32>| {
-        let (mut loss_chg, w_left, w_right) =
-            xgb_loss_chg(left, right, root_gain, reg, bounds, dir)?;
+    let reg = scorer.reg;
+    let score = |children: Children, set: &dyn Fn() -> Vec<u32>| {
+        let mut score = scorer.loss_chg(children.left, children.right)?;
         if let Some(penalty) = penalty {
-            loss_chg -= penalty.categorical_penalty(feature, &set()) as f32;
+            score.loss_chg -= penalty.categorical_penalty(feature, &set()) as f32;
         }
-        Some((loss_chg, w_left, w_right))
+        Some(score)
     };
     // `SplitEntry::Update` on a per-feature entry that starts at zero.
-    let offer = |local: &mut Option<CatCandidate>,
-                 default_left: bool,
-                 left: GradStats,
-                 right: GradStats,
-                 set: &dyn Fn() -> Vec<u32>| {
-        let Some((loss_chg, w_left, w_right)) = score(left, right, set) else {
-            return false;
+    let offer =
+        |local: &mut Option<CatCandidate>, children: Children, set: &dyn Fn() -> Vec<u32>| {
+            let Some(score) = score(children, set) else {
+                return false;
+            };
+            let incumbent = local.as_ref().map_or(0.0, |c| c.score.loss_chg);
+            if !need_replace(incumbent, feature, score.loss_chg, feature) {
+                return false;
+            }
+            *local = Some(CatCandidate { children, score });
+            true
         };
-        let incumbent = local.as_ref().map_or(0.0, |c| c.loss_chg);
-        if !need_replace(incumbent, feature, loss_chg, feature) {
-            return false;
-        }
-        *local = Some(CatCandidate {
-            loss_chg,
-            default_left,
-            left,
-            right,
-            w_left,
-            w_right,
-        });
-        true
-    };
     // `p_best->Update(best)`: the feature's split against the node's best.
     let merge = |best: &mut BestSplit, local: Option<CatCandidate>, mut set: Vec<u32>| {
-        let Some(c) = local else { return };
-        if need_replace(best.loss_chg as f32, best.feature, c.loss_chg, feature) {
+        let Some(CatCandidate { children, score }) = local else {
+            return;
+        };
+        if need_replace(best.loss_chg as f32, best.feature, score.loss_chg, feature) {
             set.sort_unstable();
-            *best = BestSplit::categorical(
-                f64::from(c.loss_chg),
-                feature,
-                !c.default_left,
-                c.right,
-                c.left,
-                f64::from(c.w_right),
-                f64::from(c.w_left),
-                set,
-            );
+            *best =
+                BestSplit::categorical(feature, children.swapped(), score.swapped().into(), set);
             best.children_swapped = true;
         }
     };
@@ -546,11 +562,13 @@ pub(super) fn sweep_categorical(
             let single = || vec![cat];
             // Missing values with the other categories, then with this one.
             let mut right = stats;
-            if offer(&mut local, true, total.sub(right), right, &single) {
+            let missing_left = Children::new(true, total.sub(right), right);
+            if offer(&mut local, missing_left, &single) {
                 chosen = cat;
             }
             right.add(missing);
-            if offer(&mut local, false, total.sub(right), right, &single) {
+            let missing_right = Children::new(false, total.sub(right), right);
+            if offer(&mut local, missing_right, &single) {
                 chosen = cat;
             }
         }
@@ -591,7 +609,9 @@ pub(super) fn sweep_categorical(
             } else {
                 (acc, total.sub(acc))
             };
-            if offer(&mut local, forward, left, right, &|| set_of(partition)) {
+            if offer(&mut local, Children::new(forward, left, right), &|| {
+                set_of(partition)
+            }) {
                 best_partition = partition;
             }
         }
@@ -780,18 +800,13 @@ mod tests {
     fn sweep(cats: &[(u32, GradStats)], total: GradStats) -> BestSplit {
         let reg = unregularized();
         let mut best = BestSplit::none();
-        let root_gain = xgb_node_gain(total, &reg, Bounds::default());
-        sweep_categorical(
-            &mut best,
-            cats,
-            total,
-            root_gain,
-            Bounds::default(),
-            0,
-            &reg,
-            0,
-            None,
-        );
+        let scorer = SplitScorer {
+            reg: &reg,
+            root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+            bounds: Bounds::default(),
+            dir: 0,
+        };
+        sweep_categorical(&mut best, cats, total, &scorer, 0, None);
         best
     }
 

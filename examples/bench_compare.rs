@@ -3,7 +3,7 @@
 //! Driven by `scripts/bench_xgb.py`. File I/O and test-data preparation are
 //! outside the timer, and each fit constructs a fresh training `DMatrix`.
 
-use hessboost::config::ObjectiveParams;
+use hessboost::config::{GrowPolicy, TreeMethod};
 use hessboost::metric::create_metric;
 use hessboost::prelude::*;
 use std::path::Path;
@@ -33,11 +33,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .base_score(meta.base_score)
         .seed(meta.seed)
         .build()?;
-    let metric = create_metric(
-        &meta.metric,
-        meta.num_class,
-        &ObjectiveParams::from_params(&params),
-    )?;
+    let metric = create_metric(&meta.metric, &params)?;
     let repeats: usize = std::env::var("BENCH_REPEATS")
         .unwrap_or_else(|_| "3".to_owned())
         .parse()?;

@@ -265,8 +265,8 @@ mod tests {
     use super::*;
     use crate::data::DMatrix;
     use crate::data::ghist::GHistIndex;
-    use crate::learner::train;
     use crate::objective::GradPair;
+    use crate::training::train;
     use crate::tree::builder::{ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_rows};
     use crate::tree::sampler::ColumnSampler;
 
@@ -424,7 +424,7 @@ mod tests {
         crate::test_support::labeled_dense(&x, n, f, &y)
     }
 
-    fn dictionary(model: &crate::learner::BoostedModel) -> (usize, usize) {
+    fn dictionary(model: &crate::model::BoostedModel) -> (usize, usize) {
         let set =
             ReuseSet::from_params(&params(1.0, 1.0), model.n_features(), model.trees()).unwrap();
         let features = set.features.iter().filter(|&&u| u).count();

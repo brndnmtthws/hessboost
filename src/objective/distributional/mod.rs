@@ -112,9 +112,9 @@
 //!
 //! # Predictions
 //!
-//! [`BoostedModel::predict`](crate::learner::BoostedModel::predict) returns
+//! [`BoostedModel::predict`](crate::model::BoostedModel::predict) returns
 //! the natural parameters `[row][parameter]` (the table's last column);
-//! [`BoostedModel::predict_distribution`](crate::learner::BoostedModel::predict_distribution)
+//! [`BoostedModel::predict_distribution`](crate::model::BoostedModel::predict_distribution)
 //! returns one [`Dist`] per row with its mean, variance, CDF, quantiles,
 //! log density, CRPS, intervals, and inverse-CDF sampling. Metrics `nll`
 //! (the default) and `crps` score them.
@@ -612,7 +612,7 @@ impl Dist {
     }
 
     /// The distribution from one row of natural parameters as
-    /// [`BoostedModel::predict`](crate::learner::BoostedModel::predict)
+    /// [`BoostedModel::predict`](crate::model::BoostedModel::predict)
     /// reports them (no validation).
     pub(crate) fn from_row(family: DistFamily, row: &[f32]) -> Self {
         Self::from_natural(

@@ -31,30 +31,18 @@
 //! of the node's Hessian (`round(n·H_child/H_node)`, exact for constant
 //! Hessians); leaves keep the outputs their split recorded.
 
+use super::hist::NodeCtx;
 use super::{
-    BestSplit, SplitPos, candidate_gain, children_valid, for_each_numeric_split, xgb_calc_weight,
-    xgb_loss_chg, xgb_node_gain, xgb_update,
+    BestSplit, Children, Score, SplitPos, SplitScorer, children_valid, for_each_numeric_split,
+    xgb_calc_weight, xgb_node_gain, xgb_update,
 };
 use crate::K_RT_EPS;
 use crate::config::TrainingParams;
-use crate::data::quantile::HistCuts;
+use crate::data::ghist::GHistIndex;
 use crate::rng::{Rng, splitmix64};
 use crate::tree::constraints::{Bounds, MonotoneConstraints, gain_at_weight, satisfies};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
-
-/// The node a split search runs for.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct NodeCtx {
-    /// Node id in the tree being grown; seeds the node's `extra_trees` draws.
-    pub(super) id: usize,
-    /// Training rows in the node (`n` of path smoothing).
-    pub(super) rows: usize,
-    /// The node's own output, which path smoothing pulls its children toward.
-    pub(super) output: f64,
-    /// Seed of the tree being grown ([`crate::tree::sampler::ColumnSampler::seed`]).
-    pub(super) tree_seed: u64,
-}
 
 /// The enabled LightGBM split options. Built only when at least one is on.
 #[derive(Debug, Clone, Copy)]
@@ -80,25 +68,25 @@ impl SplitOptions {
         self.path_smooth > 0.0
     }
 
-    /// Find the best split of one node from its histogram, under the enabled
+    /// Find the best split of `node` from its histogram, under the enabled
     /// options. `features` is already filtered by column sampling and
     /// interaction constraints; the candidate order and tie rule follow the
     /// builder's XGBoost search.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn evaluate(
         &self,
-        cuts: &HistCuts,
-        dense: bool,
+        ghist: &GHistIndex,
         hist: &[GradStats],
-        total: GradStats,
         features: &[u32],
-        bounds: Bounds,
         cons: &MonotoneConstraints,
         reg: &RegParams,
         node: NodeCtx,
     ) -> BestSplit {
+        let cuts = ghist.cuts();
+        let dense = ghist.dense_stride().is_some();
+        let total = node.stats;
+        let bounds = node.bounds;
         let scorer = if self.smoothing() {
-            Scorer::Smooth(Smoothed::new(self.path_smooth, total, node, reg))
+            Scorer::Smooth(Smoothed::new(self.path_smooth, node, reg))
         } else {
             Scorer::Xgb {
                 root_gain: xgb_node_gain(total, reg, bounds),
@@ -133,15 +121,9 @@ impl SplitOptions {
                 ctx.random_numeric(&mut best, &hist[fs..fe], fs, dense, rng);
             } else {
                 // Every boundary, exactly as the builder's XGBoost search.
-                for_each_numeric_split(
-                    &hist[fs..fe],
-                    fs,
-                    total,
-                    dense,
-                    |pos, missing_left, l, r| {
-                        ctx.offer_numeric(&mut best, pos, missing_left, l, r);
-                    },
-                );
+                for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
+                    ctx.offer_numeric(&mut best, pos, children);
+                });
             }
         }
         best
@@ -183,15 +165,20 @@ struct Smoothed {
 }
 
 impl Smoothed {
-    fn new(strength: f64, total: GradStats, node: NodeCtx, reg: &RegParams) -> Self {
+    fn new(strength: f64, node: NodeCtx, reg: &RegParams) -> Self {
         let rows = node.rows as f64;
-        let own = smooth(xgb_calc_weight(total, reg), rows, strength, node.output);
+        let own = smooth(
+            xgb_calc_weight(node.stats, reg),
+            rows,
+            strength,
+            node.output,
+        );
         Smoothed {
             strength,
             rows,
             parent: node.output,
-            rows_per_hess: rows / total.hess,
-            shift: gain_at_weight(total, reg, own),
+            rows_per_hess: rows / node.stats.hess,
+            shift: gain_at_weight(node.stats, reg, own),
         }
     }
 
@@ -204,7 +191,7 @@ impl Smoothed {
         reg: &RegParams,
         bounds: Bounds,
         dir: i8,
-    ) -> Option<(f64, f64, f64)> {
+    ) -> Option<Score> {
         if !children_valid(left, right, reg.min_child_weight) {
             return None;
         }
@@ -225,7 +212,11 @@ impl Smoothed {
             return None;
         }
         let gain = gain_at_weight(left, reg, wl) + gain_at_weight(right, reg, wr) - self.shift;
-        Some((gain, wl, wr))
+        Some(Score {
+            loss_chg: gain,
+            w_left: wl,
+            w_right: wr,
+        })
     }
 }
 
@@ -246,36 +237,33 @@ struct Candidate<'a> {
 }
 
 impl Candidate<'_> {
+    /// The XGBoost scorer of this feature's candidates in a node whose
+    /// `root_gain` baseline is `root_gain`.
+    fn xgb_scorer(&self, root_gain: f32) -> SplitScorer<'_> {
+        SplitScorer {
+            reg: self.reg,
+            root_gain,
+            bounds: self.bounds,
+            dir: self.dir,
+        }
+    }
+
     /// Score a numeric candidate and keep it if it beats `best` (XGBoost's
     /// `f32` comparison and tie rule).
-    fn offer_numeric(
-        &self,
-        best: &mut BestSplit,
-        pos: SplitPos,
-        default_left: bool,
-        left: GradStats,
-        right: GradStats,
-    ) {
+    fn offer_numeric(&self, best: &mut BestSplit, pos: SplitPos, children: Children) {
+        let Children { left, right, .. } = children;
         let scored = match self.scorer {
-            Scorer::Xgb { root_gain } => {
-                xgb_loss_chg(left, right, *root_gain, self.reg, self.bounds, self.dir)
-            }
+            Scorer::Xgb { root_gain } => self.xgb_scorer(*root_gain).loss_chg(left, right),
             Scorer::Smooth(smoothed) => smoothed
                 .score(left, right, self.reg, self.bounds, self.dir)
-                .map(|(g, wl, wr)| (g as f32, wl as f32, wr as f32)),
+                .map(|s| Score {
+                    loss_chg: s.loss_chg as f32,
+                    w_left: s.w_left as f32,
+                    w_right: s.w_right as f32,
+                }),
         };
-        if let Some((loss_chg, wl, wr)) = scored {
-            xgb_update(
-                best,
-                loss_chg,
-                self.feature,
-                pos,
-                default_left,
-                left,
-                right,
-                wl,
-                wr,
-            );
+        if let Some(score) = scored {
+            xgb_update(best, self.feature, pos, children, score);
         }
     }
 
@@ -310,11 +298,15 @@ impl Candidate<'_> {
             suffix.add(bin);
         }
         let pos = SplitPos::Bin(first + cut);
-        self.offer_numeric(best, pos, false, left, self.total.sub(left));
+        self.offer_numeric(best, pos, Children::new(false, left, self.total.sub(left)));
         let mut present = left;
         present.add(suffix);
         if !dense && present != self.total {
-            self.offer_numeric(best, pos, true, self.total.sub(suffix), suffix);
+            self.offer_numeric(
+                best,
+                pos,
+                Children::new(true, self.total.sub(suffix), suffix),
+            );
         }
     }
 
@@ -344,15 +336,10 @@ impl Candidate<'_> {
                     return None;
                 }
                 match self.scorer {
-                    Scorer::Xgb { root_gain } => candidate_gain(
-                        left,
-                        right,
-                        f64::from(*root_gain),
-                        self.bounds,
-                        self.dir,
-                        constrained,
-                        reg,
-                    ),
+                    Scorer::Xgb { root_gain } => {
+                        self.xgb_scorer(*root_gain)
+                            .candidate_gain(left, right, constrained)
+                    }
                     Scorer::Smooth(smoothed) => {
                         smoothed.score(left, right, reg, self.bounds, self.dir)
                     }
@@ -373,7 +360,7 @@ fn sweep_prefixes(
     cats: &[(u32, GradStats)],
     total: GradStats,
     feature: u32,
-    mut score: impl FnMut(GradStats, GradStats, &[u32]) -> Option<(f64, f64, f64)>,
+    mut score: impl FnMut(GradStats, GradStats, &[u32]) -> Option<Score>,
 ) {
     let mut left = GradStats::default();
     let mut cats_left: Vec<u32> = Vec::new();
@@ -381,11 +368,11 @@ fn sweep_prefixes(
         left.add(stats);
         cats_left.push(cat);
         let right = total.sub(left);
-        if let Some((g, wl, wr)) = score(left, right, &cats_left)
-            && g > best.loss_chg + K_RT_EPS
+        if let Some(s) = score(left, right, &cats_left)
+            && s.loss_chg > best.loss_chg + K_RT_EPS
         {
-            *best =
-                BestSplit::categorical(g, feature, false, left, right, wl, wr, cats_left.clone());
+            let children = Children::new(false, left, right);
+            *best = BestSplit::categorical(feature, children, s, cats_left.clone());
         }
     }
 }

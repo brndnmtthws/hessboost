@@ -1,17 +1,20 @@
-//! Decision-tree representation, split-scoring math, and construction.
+//! The trees of a trained model ([`BoostedModel::trees`](crate::model::BoostedModel::trees)),
+//! for inspection: [`RegTree`], its [`Node`]s, and the [`LinearLeaves`] of
+//! `linear_tree` models.
 
-pub mod builder;
+pub(crate) mod builder;
 pub(crate) mod compact;
-pub mod constraints;
-pub mod gain;
-pub mod hist;
-pub mod linear;
+pub(crate) mod constraints;
+pub(crate) mod gain;
+pub(crate) mod hist;
+pub(crate) mod linear;
 pub(crate) mod oblivious;
 mod regtree;
 pub(crate) mod reuse;
-pub mod sampler;
+pub(crate) mod sampler;
 
-pub use gain::{GradStats, RegParams, calc_gain, calc_weight};
+pub use linear::LinearLeaves;
+pub(crate) use regtree::{ChildLeaf, SplitRule};
 pub use regtree::{Node, RegTree};
 
 /// Output of scalar tree `t` in an ensemble of `n_outputs` outputs with

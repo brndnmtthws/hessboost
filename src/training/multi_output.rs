@@ -3,16 +3,16 @@
 //! for `gbtree` and DART, optionally growing its structure from reduced split
 //! gradients supplied by the objective ([`Objective::split_gradient`]).
 
-use super::model::BoostedModel;
 use super::sampling::gradient_based_sample;
 use super::train::{
-    EvalSet, dart_new_tree_weight, finish_dart, for_each_row_margins, gradient_sampling,
-    make_column_sampler, round_gradients, sample_rows, tree_eta,
+    EvalSet, TrainContext, dart_new_tree_weight, finish_dart, for_each_row_margins,
+    gradient_sampling, make_column_sampler, round_gradients, sample_rows, tree_eta,
 };
 use crate::config::{BoosterKind, MultiStrategy, TrainingParams, TreeMethod};
+use crate::data::DMatrix;
 use crate::data::ghist::GHistIndex;
-use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
+use crate::model::BoostedModel;
 use crate::objective::{GradPair, Objective, SplitGradient};
 use crate::rng::Rng;
 use crate::tree::RegTree;
@@ -86,13 +86,11 @@ fn split_gradient(
     Ok(Some(split))
 }
 
-/// What every vector-leaf round reads.
+/// What every vector-leaf round reads: the run's shared inputs, the training
+/// matrix's gradient index, and the eval sets whose margins it keeps current.
 pub(super) struct VectorRound<'a> {
-    pub(super) params: &'a TrainingParams,
-    pub(super) dtrain: &'a DMatrix,
+    pub(super) run: TrainContext<'a>,
     pub(super) ghist: &'a GHistIndex,
-    pub(super) objective: &'a dyn Objective,
-    pub(super) info: &'a MetaInfo<'a>,
     pub(super) evals: &'a [EvalSet<'a>],
 }
 
@@ -109,20 +107,11 @@ pub(super) fn boost_round(
     eval_margins: &mut [Vec<f32>],
     gpair: &mut [GradPair],
 ) -> Result<()> {
-    let params = ctx.params;
-    let n = ctx.dtrain.n_rows();
+    let params = ctx.run.params;
+    let n = ctx.run.dtrain.n_rows();
     let n_out = model.n_outputs();
-    let (mut rng, dropped) = round_gradients(
-        model,
-        params,
-        ctx.dtrain,
-        ctx.objective,
-        ctx.info,
-        iteration,
-        train_margin,
-        gpair,
-    );
-    let split = split_gradient(ctx.objective, params, iteration, gpair, n)?;
+    let (mut rng, dropped) = round_gradients(&ctx.run, model, iteration, train_margin, gpair);
+    let split = split_gradient(ctx.run.objective, params, iteration, gpair, n)?;
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
     // One row sample per parallel tree, all drawn before the trees.
     let row_subsets: Vec<Vec<u32>> = (0..params.num_parallel_tree)
@@ -138,7 +127,7 @@ pub(super) fn boost_round(
             if rows.len() == n && !gradient_sampling(params) {
                 add_leaf_rows(&tree, &leaf_rows, train_margin, n_out);
             } else {
-                add_tree(&tree, ctx.dtrain, train_margin, n_out);
+                add_tree(&tree, ctx.run.dtrain, train_margin, n_out);
             }
             for (margins, (d, _)) in eval_margins.iter_mut().zip(ctx.evals) {
                 add_tree(&tree, d, margins, n_out);
@@ -163,7 +152,7 @@ fn fit_tree(
     rows: &[u32],
     n_out: usize,
 ) -> (RegTree, Vec<LeafRows>) {
-    let params = ctx.params;
+    let params = ctx.run.params;
     let (split_gpair, n_split) = split.map_or((gpair, n_out), |s| (&s.gpair[..], s.n_targets));
     let sampled = if gradient_sampling(params) {
         gradient_based_sample(split_gpair, n_split, params.subsample, rng)
@@ -179,7 +168,7 @@ fn fit_tree(
         None => (split_gpair, rows),
     };
     let value = split.map(|_| sampled_value.as_deref().unwrap_or(gpair));
-    let mut sampler = make_column_sampler(ctx.dtrain, params, rng);
+    let mut sampler = make_column_sampler(ctx.run.dtrain, params, rng);
     let grad = VectorGradients {
         split: split_gpair,
         n_split,

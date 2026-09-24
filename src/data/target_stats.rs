@@ -52,7 +52,8 @@
 //! CatBoost's counters).
 //!
 //! ```
-//! use hessboost::data::{OrderedTargetEncoder, TargetKind};
+//! use hessboost::data::FeatureType;
+//! use hessboost::data::target_stats::{OrderedTargetEncoder, TargetKind};
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {

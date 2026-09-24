@@ -9,6 +9,12 @@
 //! and commit the files it writes. Directories of earlier versions are never
 //! regenerated: they are what later versions must keep reading.
 
+use hessboost::config::{
+    AftDistribution, BoosterKind, DistGradient, DistSplitDirection, MultiStrategy, TreeMethod,
+};
+use hessboost::data::FeatureType;
+use hessboost::model::compact::CompactModel;
+use hessboost::objective::distributional::DistFamily;
 use hessboost::prelude::*;
 use serde_json::Value;
 use std::path::{Path, PathBuf};

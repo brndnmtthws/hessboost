@@ -8,6 +8,8 @@
 //!
 //! Run with: `cargo run --release --example conformal`
 
+use hessboost::conformal::{ConformalizedQuantile, SplitConformal};
+use hessboost::objective::{CustomObjective, GradPair};
 use hessboost::prelude::*;
 
 mod common;
@@ -74,7 +76,10 @@ fn main() -> Result<()> {
             }
         }
     });
-    let quantiles = train_with_objective(&params, &dtrain, 200, &pinball)?;
+    let quantiles = Trainer::new(&params, &dtrain, 200)
+        .objective(&pinball)
+        .train()?
+        .model;
     // The uncalibrated band, for comparison: predictions are `[row][output]`.
     let preds = quantiles.predict(&dtest)?;
     let band: Vec<(f32, f32)> = preds

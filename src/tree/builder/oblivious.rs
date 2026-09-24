@@ -7,7 +7,7 @@
 //! level at once, and the candidate with the largest summed gain wins
 //! (CatBoost's level-wise search). Candidate enumeration, per-node gain, and
 //! leaf weights reuse the histogram builder's XGBoost arithmetic
-//! ([`xgb_loss_chg`], `f32` gains, [`finalize_leaf_values`]), so `lambda`,
+//! ([`SplitScorer::loss_chg`], `f32` gains, [`finalize_leaf_values`]), so `lambda`,
 //! `alpha`, `max_delta_step`, and monotone bounds act per node exactly as they
 //! do for `depthwise` trees.
 //!
@@ -47,8 +47,9 @@
 
 use super::hist::{PARALLEL_FRONTIER_ROWS, child_histograms, partition_rows, rayon_available};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, LeafRows, SplitPos, build_interaction_sets,
-    finalize_leaf_values, next_allowed, permits, sum_rows, xgb_loss_chg, xgb_node_gain,
+    BELOW_ALL_VALUES, BestSplit, Children, InteractionState, LeafRows, Score, SplitPos,
+    SplitScorer, build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
+    xgb_node_gain,
 };
 use crate::K_RT_EPS;
 use crate::config::{TrainingParams, TreeMethod};
@@ -59,8 +60,8 @@ use crate::objective::GradPair;
 use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::hist::{CpuBackend, Histogram, HistogramBackend, zeroed};
-use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
+use crate::tree::{ChildLeaf, RegTree, SplitRule};
 use rayon::prelude::*;
 
 /// Histogram bins scanned per level (nodes × total bins) at which candidate
@@ -129,6 +130,17 @@ struct NodeSplit {
     loss_chg: f32,
     w_left: f32,
     w_right: f32,
+}
+
+/// A level node expanded in the tree by its [`NodeSplit`], whose children are
+/// still to be built.
+struct ExpandedNode {
+    node: LevelNode,
+    split: NodeSplit,
+    /// Tree ids of the left and right child.
+    ids: [usize; 2],
+    /// Monotone bounds of the left and right child.
+    bounds: [Bounds; 2],
 }
 
 /// Symmetric tree builder over the histogram index.
@@ -217,19 +229,20 @@ impl<'a> SymmetricTreeBuilder<'a> {
                     child_bounds(node.bounds, dir, f64::from(s.w_left), f64::from(s.w_right));
                 let (left_id, right_id) = tree.expand(
                     node.nid,
-                    split.feature,
-                    threshold,
-                    split.missing_left,
-                    s.w_left,
-                    s.left.hess as f32,
-                    s.w_right,
-                    s.right.hess as f32,
+                    SplitRule::numeric(split.feature, threshold, split.missing_left),
+                    ChildLeaf::new(s.w_left, s.left.hess as f32),
+                    ChildLeaf::new(s.w_right, s.right.hess as f32),
                 );
                 tree.set_split_gain(node.nid, s.loss_chg);
                 debug_assert_eq!(left_id, stats.len());
                 stats.extend([s.left, s.right]);
                 bounds.extend([lb, rb]);
-                pending.push((node, s, [left_id, right_id], [lb, rb]));
+                pending.push(ExpandedNode {
+                    node,
+                    split: s,
+                    ids: [left_id, right_id],
+                    bounds: [lb, rb],
+                });
             }
             allowed = next_allowed(
                 allowed.as_ref(),
@@ -243,22 +256,21 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 break;
             }
             let routing = BestSplit::numeric(
-                0.0,
                 split.feature,
                 pos,
-                split.missing_left,
-                GradStats::default(),
-                GradStats::default(),
-                0.0,
-                0.0,
+                Children::new(
+                    split.missing_left,
+                    GradStats::default(),
+                    GradStats::default(),
+                ),
+                Score::default(),
             );
             let parallel = pending.len() > 1
-                && pending.iter().map(|(n, ..)| n.rows.len()).sum::<usize>()
+                && pending.iter().map(|p| p.node.rows.len()).sum::<usize>()
                     >= PARALLEL_FRONTIER_ROWS
                 && rayon_available();
-            let build = |(node, s, ids, cb): (LevelNode, NodeSplit, [usize; 2], [Bounds; 2])| {
-                self.children(ghist, gpair, &routing, node, &s, ids, cb, terminal)
-            };
+            let build =
+                |expanded: ExpandedNode| self.children(ghist, gpair, &routing, expanded, terminal);
             let children: Vec<[LevelNode; 2]> = if parallel {
                 pending.into_par_iter().map(build).collect()
             } else {
@@ -294,18 +306,20 @@ impl<'a> SymmetricTreeBuilder<'a> {
 
     /// Partition a split node's rows and, below the last level, build the
     /// smaller child's histogram and derive the sibling by subtraction.
-    #[allow(clippy::too_many_arguments)]
     fn children(
         &self,
         ghist: &GHistIndex,
         gpair: &[GradPair],
         routing: &BestSplit,
-        node: LevelNode,
-        split: &NodeSplit,
-        [left_id, right_id]: [usize; 2],
-        [lb, rb]: [Bounds; 2],
+        expanded: ExpandedNode,
         terminal: bool,
     ) -> [LevelNode; 2] {
+        let ExpandedNode {
+            node,
+            split,
+            ids: [left_id, right_id],
+            bounds: [lb, rb],
+        } = expanded;
         let (left_rows, right_rows) = partition_rows(ghist, &node.rows, routing);
         let (left_hist, right_hist) = if terminal {
             (Vec::new(), Vec::new())
@@ -325,8 +339,8 @@ impl<'a> SymmetricTreeBuilder<'a> {
         ]
     }
 
-    /// Per-node `(loss_chg, w_left, w_right)` of a candidate, or `None` when
-    /// the node would not take it (see the module docs).
+    /// Per-node score of a candidate, or `None` when the node would not take
+    /// it (see the module docs).
     #[inline]
     fn node_gain(
         &self,
@@ -334,12 +348,17 @@ impl<'a> SymmetricTreeBuilder<'a> {
         left: GradStats,
         right: GradStats,
         dir: i8,
-    ) -> Option<(f32, f32, f32)> {
-        let (loss_chg, wl, wr) =
-            xgb_loss_chg(left, right, node.root_gain, &self.reg, node.bounds, dir)?;
-        let gain = f64::from(loss_chg);
-        (loss_chg.is_finite() && gain > K_RT_EPS && gain >= self.params.gamma)
-            .then_some((loss_chg, wl, wr))
+    ) -> Option<Score<f32>> {
+        let scorer = SplitScorer {
+            reg: &self.reg,
+            root_gain: node.root_gain,
+            bounds: node.bounds,
+            dir,
+        };
+        let score = scorer.loss_chg(left, right)?;
+        let gain = f64::from(score.loss_chg);
+        (score.loss_chg.is_finite() && gain > K_RT_EPS && gain >= self.params.gamma)
+            .then_some(score)
     }
 
     /// The best level-wide candidate over `features`, or `None` when no
@@ -407,7 +426,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 acc.add(bin);
                 let term = self
                     .node_gain(node, acc, total.sub(acc), dir)
-                    .map(|(loss_chg, ..)| f64::from(loss_chg) - gamma);
+                    .map(|score| f64::from(score.loss_chg) - gamma);
                 if let Some(term) = term {
                     add(&mut forward[b], term);
                 }
@@ -431,7 +450,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 let mut suffix = GradStats::default();
                 for b in (0..n_bins).rev() {
                     suffix.add(hist[b]);
-                    if let Some((loss_chg, ..)) =
+                    if let Some(Score { loss_chg, .. }) =
                         self.node_gain(node, total.sub(suffix), suffix, dir)
                     {
                         add(&mut backward[b], f64::from(loss_chg) - gamma);
@@ -500,8 +519,11 @@ impl<'a> SymmetricTreeBuilder<'a> {
             let left = prefix(split.offset);
             (left, total.sub(left))
         };
-        let (loss_chg, w_left, w_right) =
-            self.node_gain(node, left, right, self.cons.dir(feature))?;
+        let Score {
+            loss_chg,
+            w_left,
+            w_right,
+        } = self.node_gain(node, left, right, self.cons.dir(feature))?;
         Some(NodeSplit {
             left,
             right,
@@ -517,7 +539,7 @@ mod tests {
     use super::super::test_support::{binned, gp, grow_hist};
     use super::*;
     use crate::config::{GrowPolicy, Monotone};
-    use crate::learner::train;
+    use crate::training::train;
     use crate::tree::builder::{HistTreeBuilder, all_rows};
 
     /// Deterministic pseudo-random value in `[0, 1)`.

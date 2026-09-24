@@ -5,20 +5,15 @@ use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
-use hessboost::config::ObjectiveParams;
-use hessboost::data::ghist::GHistIndex;
-use hessboost::data::quantile::HistCuts;
+use hessboost::config::{GrowPolicy, Monotone, TreeMethod};
+use hessboost::internals::{
+    ColumnSampler, CpuBackend, GHistIndex, HistCuts, HistTreeBuilder, HistogramBackend, zeroed,
+};
 use hessboost::metric::{
-    ErrorRate, GammaNLogLik, LogLoss, Mae, PoissonNLogLik, Rmse, create_metric,
+    ErrorRate, GammaNLogLik, LogLoss, Mae, Metric, PoissonNLogLik, Rmse, create_metric,
 };
-use hessboost::objective::{
-    GammaObjective, GradPair, LogisticObjective, Objective, PoissonObjective, SoftmaxObjective,
-    TweedieObjective,
-};
+use hessboost::objective::{Gamma, GradPair, Logistic, Objective, Poisson, Softmax, Tweedie};
 use hessboost::prelude::*;
-use hessboost::tree::builder::HistTreeBuilder;
-use hessboost::tree::hist::{CpuBackend, HistogramBackend, zeroed};
-use hessboost::tree::sampler::ColumnSampler;
 use std::hint::black_box;
 
 /// Deterministic synthetic regression dataset.
@@ -223,31 +218,26 @@ fn bench_objective_gradients(c: &mut Criterion) {
     };
     run(
         "logistic_unweighted_1m",
-        &LogisticObjective::default(),
+        &Logistic::default(),
         &labels,
         None,
     );
     run(
         "logistic_weighted_1m",
-        &LogisticObjective::new(1.5),
+        &Logistic::new(1.5),
         &labels,
         Some(&weights),
     );
     run(
         "poisson_unweighted_1m",
-        &PoissonObjective::default(),
+        &Poisson::default(),
         &positive_labels,
         None,
     );
-    run(
-        "gamma_unweighted_1m",
-        &GammaObjective,
-        &positive_labels,
-        None,
-    );
+    run("gamma_unweighted_1m", &Gamma, &positive_labels, None);
     run(
         "tweedie_unweighted_1m",
-        &TweedieObjective::default(),
+        &Tweedie::default(),
         &positive_labels,
         None,
     );
@@ -262,7 +252,7 @@ fn bench_objective_gradients(c: &mut Criterion) {
         let multi_labels: Vec<f32> = (0..rows).map(|i| (i % k) as f32).collect();
         let multi_weights: Vec<f32> = make_weights(rows);
         let mut multi_out = vec![GradPair::default(); rows * k];
-        let softmax = SoftmaxObjective::new(k, true);
+        let softmax = Softmax::new(k, true);
         group.throughput(Throughput::Elements((rows * k) as u64));
         for (suffix, weights) in [("", None), ("_weighted", Some(multi_weights.as_slice()))] {
             group.bench_function(format!("softmax_k{k}{suffix}_1m_outputs"), |b| {
@@ -285,7 +275,7 @@ fn bench_prediction_transforms(c: &mut Criterion) {
     group.bench_function("logistic_automatic", |b| {
         b.iter(|| {
             values.copy_from_slice(&source);
-            LogisticObjective::default().pred_transform(&mut values);
+            Logistic::default().pred_transform(&mut values);
             black_box(&values);
         });
     });
@@ -301,7 +291,7 @@ fn bench_prediction_transforms(c: &mut Criterion) {
     group.bench_function("exp_automatic", |b| {
         b.iter(|| {
             values.copy_from_slice(&source);
-            GammaObjective.pred_transform(&mut values);
+            Gamma.pred_transform(&mut values);
             black_box(&values);
         });
     });
@@ -321,7 +311,7 @@ fn bench_prediction_transforms(c: &mut Criterion) {
         let len = N / num_class * num_class;
         let source = &source[..len];
         let mut values = source.to_vec();
-        let objective = SoftmaxObjective::new(num_class, true);
+        let objective = Softmax::new(num_class, true);
         group.throughput(Throughput::Elements(len as u64));
         group.bench_function(format!("softmax_k{num_class}_1m_outputs"), |b| {
             b.iter(|| {
@@ -359,7 +349,7 @@ fn bench_log_metrics(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_metric");
     group.throughput(Throughput::Elements(N as u64));
 
-    let tweedie = create_metric("tweedie-nloglik@1.5", 0, &ObjectiveParams::default()).unwrap();
+    let tweedie = create_metric("tweedie-nloglik@1.5", &TrainingParams::default()).unwrap();
     for (name, metric, labels) in [
         ("logloss", &LogLoss as &dyn Metric, binary_labels.as_slice()),
         (
@@ -397,8 +387,12 @@ fn bench_multiclass_metrics(c: &mut Criterion) {
         let weights: Vec<f32> = make_weights(rows);
         group.throughput(Throughput::Elements(rows as u64));
         for metric_name in ["mlogloss", "merror"] {
-            let metric =
-                create_metric(metric_name, num_class, &ObjectiveParams::default()).unwrap();
+            let params = TrainingParams::builder()
+                .objective("multi:softprob")
+                .num_class(num_class)
+                .build()
+                .unwrap();
+            let metric = create_metric(metric_name, &params).unwrap();
             group.bench_function(format!("{metric_name}_k{num_class}_unweighted"), |b| {
                 b.iter(|| black_box(metric.eval(&probabilities, &labels, None)));
             });
@@ -450,8 +444,11 @@ fn bench_binary_train(c: &mut Criterion) {
     group.bench_function("scalar_objective_reference", |b| {
         b.iter(|| {
             black_box(
-                train_with_objective(&params, &data, 50, &scalar_logistic_objective(base_margin))
-                    .unwrap(),
+                Trainer::new(&params, &data, 50)
+                    .objective(&scalar_logistic_objective(base_margin))
+                    .train()
+                    .unwrap()
+                    .model,
             )
         });
     });

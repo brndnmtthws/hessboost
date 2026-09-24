@@ -5,7 +5,8 @@
 //!
 //! Run with: `cargo run --release --example train_regression`
 
-use hessboost::metric::Rmse;
+use hessboost::metric::{Metric, Rmse};
+use hessboost::model::ImportanceType;
 use hessboost::prelude::*;
 
 mod common;

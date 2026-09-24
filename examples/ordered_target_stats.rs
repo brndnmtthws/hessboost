@@ -3,8 +3,9 @@
 //! with native categorical splits and a leaky in-sample target mean.
 //! Run: `cargo run --release --example ordered_target_stats`.
 
-use hessboost::data::{FittedTargetEncoder, OrderedTargetEncoder};
-use hessboost::metric::Rmse;
+use hessboost::data::FeatureType;
+use hessboost::data::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
+use hessboost::metric::{Metric, Rmse};
 use hessboost::prelude::*;
 
 mod common;

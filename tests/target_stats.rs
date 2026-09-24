@@ -1,7 +1,9 @@
 //! Held-out quality of ordered target statistics against native categorical
 //! splits on a high-cardinality feature with few rows per category.
 
-use hessboost::data::OrderedTargetEncoder;
+use hessboost::config::TreeMethod;
+use hessboost::data::FeatureType;
+use hessboost::data::target_stats::OrderedTargetEncoder;
 use hessboost::prelude::*;
 
 mod common;

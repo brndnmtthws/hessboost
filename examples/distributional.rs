@@ -8,6 +8,9 @@
 //!
 //! Run with: `cargo run --release --example distributional`
 
+use hessboost::config::{MultiStrategy, TreeMethod};
+use hessboost::conformal::ConformalizedQuantile;
+use hessboost::objective::distributional::Dist;
 use hessboost::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -74,7 +77,11 @@ fn main() -> Result<()> {
             .multi_strategy(strategy)
             .build()?;
         // Early stopping on the validation NLL (the `dist:*` default metric).
-        Ok(train_with_eval(&params, &dtrain, 1000, &[(&dvalid, "valid")], Some(20))?.model)
+        Ok(Trainer::new(&params, &dtrain, 1000)
+            .eval(&dvalid, "valid")
+            .early_stopping_rounds(20)
+            .train()?
+            .model)
     };
     let fit = |objective: &str| fit_with(objective, MultiStrategy::OneOutputPerTree);
 

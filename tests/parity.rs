@@ -23,13 +23,14 @@
 //! uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 //! ```
 
-use hessboost::data::HistCuts;
-use hessboost::learner::RoundEval;
-use hessboost::prelude::{
-    AftDistribution, BoostedModel, BoosterKind, DMatrix, FeatureType, GrowPolicy, HessboostError,
-    Monotone, MultiStrategy, ProcessType, SamplingMethod, TrainingParams, TreeMethod, train,
-    train_continue, train_with_eval,
+use hessboost::config::{
+    AftDistribution, BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType, SamplingMethod,
+    TreeMethod,
 };
+use hessboost::data::FeatureType;
+use hessboost::internals::HistCuts;
+use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
+use hessboost::training::RoundEval;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
@@ -416,6 +417,16 @@ fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
 // Comparison helpers
 // ---------------------------------------------------------------------------
 
+/// XGBoost's `iteration_range` / slice bounds as a Rust range: `end == 0`
+/// means through the last iteration.
+fn xgb_range(model: &BoostedModel, begin: usize, end: usize) -> std::ops::Range<usize> {
+    begin..if end == 0 {
+        model.num_boost_rounds()
+    } else {
+        end
+    }
+}
+
 /// Max |a - b|; a NaN on either side counts as infinite so it can never hide.
 fn max_abs_diff(what: &str, a: &[f32], b: &[f32]) -> Result<f64, String> {
     if a.len() != b.len() {
@@ -646,15 +657,19 @@ impl Case<'_> {
             Some(c) => {
                 let first =
                     train(&params, &dtrain, c.first_rounds).map_err(|e| format!("train: {e}"))?;
-                let model = train_continue(&params, &dtrain, fx.num_round - c.first_rounds, &first)
-                    .map_err(|e| format!("train_continue: {e}"))?;
+                let model = Trainer::new(&params, &dtrain, fx.num_round - c.first_rounds)
+                    .init_model(&first)
+                    .train()
+                    .map(|r| r.model)
+                    .map_err(|e| format!("continue training: {e}"))?;
                 (model, Vec::new())
             }
             None if fx.xgb_evals.is_some() => {
                 let deval = self.eval_matrix()?;
-                let result =
-                    train_with_eval(&params, &dtrain, fx.num_round, &[(&deval, "test")], None)
-                        .map_err(|e| format!("train: {e}"))?;
+                let result = Trainer::new(&params, &dtrain, fx.num_round)
+                    .eval(&deval, "test")
+                    .train()
+                    .map_err(|e| format!("train: {e}"))?;
                 (result.model, result.history)
             }
             None => {
@@ -731,13 +746,15 @@ impl Case<'_> {
         let params = build_params(fx)?;
         let initial = BoostedModel::from_xgboost_json(&c.xgb_model_initial.to_string())
             .map_err(|e| format!("import initial model: {e}"))?;
-        let model = train_continue(
+        let model = Trainer::new(
             &params,
             &self.train_matrix()?,
             fx.num_round - c.first_rounds,
-            &initial,
         )
-        .map_err(|e| format!("train_continue: {e}"))?;
+        .init_model(&initial)
+        .train()
+        .map(|r| r.model)
+        .map_err(|e| format!("continue training: {e}"))?;
         let preds = model.predict(dtest).map_err(|e| e.to_string())?;
         max_abs_diff("continue imported", &preds, &fx.xgb_pred)
     }
@@ -759,8 +776,11 @@ impl Case<'_> {
             .dmatrix(&fx.x_train[..r.n_rows * fx.n_cols], r.n_rows)?
             .with_labels(&r.y)
             .map_err(|e| format!("refresh labels: {e}"))?;
-        let model =
-            train_continue(&params, &data, r.rounds, base).map_err(|e| format!("refresh: {e}"))?;
+        let model = Trainer::new(&params, &data, r.rounds)
+            .init_model(base)
+            .train()
+            .map(|r| r.model)
+            .map_err(|e| format!("refresh: {e}"))?;
         let preds = model.predict(dtest).map_err(|e| e.to_string())?;
         max_abs_diff("refresh", &preds, &r.xgb_pred)
     }
@@ -782,7 +802,7 @@ impl Case<'_> {
         for r in &fx.ranges {
             let what = format!("margin range [{}, {})", r.begin, r.end);
             let d = model
-                .predict_margin_range(dtest, (r.begin, r.end))
+                .predict_margin_range(dtest, xgb_range(model, r.begin, r.end))
                 .map_err(|e| e.to_string())
                 .and_then(|p| max_abs_diff(&what, &p, &r.margin));
             out.push((what, d, tol));
@@ -790,14 +810,14 @@ impl Case<'_> {
         for r in &fx.range_contribs {
             let what = format!("contribs range [0, {})", r.end);
             let d = model
-                .predict_contribs_range(dcontrib, (0, r.end))
+                .predict_contribs_range(dcontrib, xgb_range(model, 0, r.end))
                 .map_err(|e| e.to_string())
                 .and_then(|p| max_abs_diff(&what, &p, &r.contribs));
             out.push((what, d, fx.tol.contribs));
             if with_leaves {
                 let what = format!("leaf range [0, {})", r.end);
                 let d = model
-                    .predict_leaf_range(dcontrib, (0, r.end))
+                    .predict_leaf_range(dcontrib, xgb_range(model, 0, r.end))
                     .map_err(|e| e.to_string())
                     .and_then(|p| {
                         let p: Vec<f32> = p.iter().map(|&l| l as f32).collect();
@@ -809,7 +829,7 @@ impl Case<'_> {
         for s in &fx.slices {
             let what = format!("slice [{}:{}:{}]", s.begin, s.end, s.step);
             let d = model
-                .slice(s.begin, s.end, s.step)
+                .slice(xgb_range(model, s.begin, s.end), s.step)
                 .and_then(|m| m.predict_margin(dtest))
                 .map_err(|e| e.to_string())
                 .and_then(|p| max_abs_diff(&what, &p, &s.margin));

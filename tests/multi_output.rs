@@ -2,6 +2,11 @@
 //! layout across the kernel paths, SHAP additivity, format round trips,
 //! reduced split gradients, and configuration errors.
 
+use hessboost::config::{
+    BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType, TreeMethod,
+};
+use hessboost::data::FeatureType;
+use hessboost::objective::{CustomObjective, GradPair, SplitGradient};
 use hessboost::prelude::*;
 
 mod common;
@@ -109,13 +114,13 @@ fn training_margins_match_the_final_model() {
     // The loss after each round comes from the incrementally updated margin
     // caches; the final eval RMSE must equal the model's own prediction.
     let dtrain = dtrain();
-    let result = train_with_eval(
+    let result = Trainer::new(
         &vector_params().subsample(0.7).seed(3).build().unwrap(),
         &dtrain,
         6,
-        &[(&dtrain, "train")],
-        None,
     )
+    .eval(&dtrain, "train")
+    .train()
     .unwrap();
     let rmse = rmse(&result.model, &dtrain);
     let last = result.history.last().unwrap().scores[0].2;
@@ -180,13 +185,14 @@ fn early_stopping_keeps_whole_vector_rounds() {
         .unwrap()
         .with_label_matrix(&shuffled, K)
         .unwrap();
-    let result = train_with_eval(
+    let result = Trainer::new(
         &vector_params().eta(1.0).max_depth(6).build().unwrap(),
         &dtrain,
         40,
-        &[(&holdout, "holdout")],
-        Some(1),
     )
+    .eval(&holdout, "holdout")
+    .early_stopping_rounds(1)
+    .train()
     .unwrap();
     let model = result.model;
     let best = model.best_iteration().expect("early stopping triggers");
@@ -195,9 +201,9 @@ fn early_stopping_keeps_whole_vector_rounds() {
     let margin = model.predict_margin(&dtrain).unwrap();
     assert_eq!(
         margin,
-        model.predict_margin_range(&dtrain, (0, best + 1)).unwrap()
+        model.predict_margin_range(&dtrain, ..=best).unwrap()
     );
-    assert_ne!(margin, model.predict_margin_range(&dtrain, (0, 0)).unwrap());
+    assert_ne!(margin, model.predict_margin_range(&dtrain, ..).unwrap());
 }
 
 #[test]
@@ -273,7 +279,11 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
     let dtrain = dtrain();
     let params = vector_params().lambda(0.0).build().unwrap();
     let obj = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
-    let model = train_with_objective(&params, &dtrain, 1, &obj).unwrap();
+    let model = Trainer::new(&params, &dtrain, 1)
+        .objective(&obj)
+        .train()
+        .unwrap()
+        .model;
     let tree = &model.trees()[0];
     // Leaf vectors are refit per target from the full gradients: with unit
     // Hessians and no regularization each is eta × the leaf's mean residual.
@@ -298,7 +308,11 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
         }
     }
     // The sketch changes the structure relative to the full gradients.
-    let full = train_with_objective(&params, &dtrain, 1, &squared_error(K)).unwrap();
+    let full = Trainer::new(&params, &dtrain, 1)
+        .objective(&squared_error(K))
+        .train()
+        .unwrap()
+        .model;
     assert_ne!(full.trees()[0].nodes(), tree.nodes());
 }
 
@@ -314,7 +328,11 @@ fn unsupported_combinations_are_rejected() {
     let sketch = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
     let per_output = TrainingParams::builder().build().unwrap();
     assert_eq!(
-        invalid_param(train_with_objective(&per_output, &dtrain, 1, &sketch)),
+        invalid_param(
+            Trainer::new(&per_output, &dtrain, 1)
+                .objective(&sketch)
+                .train()
+        ),
         "objective"
     );
     // The linear booster grows no trees, so it refuses the hook rather than
@@ -329,7 +347,7 @@ fn unsupported_combinations_are_rejected() {
             .build()
             .unwrap();
         assert_eq!(
-            invalid_param(train_with_objective(&linear, &dtrain, 1, &sketch)),
+            invalid_param(Trainer::new(&linear, &dtrain, 1).objective(&sketch).train()),
             "objective"
         );
     }
@@ -338,7 +356,11 @@ fn unsupported_combinations_are_rejected() {
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(train_with_objective(&monotone, &dtrain, 1, &sketch)),
+        invalid_param(
+            Trainer::new(&monotone, &dtrain, 1)
+                .objective(&sketch)
+                .train()
+        ),
         "monotone_constraints"
     );
 
@@ -349,7 +371,9 @@ fn unsupported_combinations_are_rejected() {
         })
     });
     assert!(matches!(
-        train_with_objective(&vector_params().build().unwrap(), &dtrain, 1, &wrong),
+        Trainer::new(&vector_params().build().unwrap(), &dtrain, 1)
+            .objective(&wrong)
+            .train(),
         Err(HessboostError::DimensionMismatch { .. })
     ));
 }
@@ -367,17 +391,14 @@ fn vector_forests_hold_num_parallel_tree_trees_per_iteration() {
     // eta / 3, and the iteration ranges select whole forests.
     let all = model.predict_margin(&d).unwrap();
     assert_eq!(all, reference_margins(&model, &x, N));
-    let first_two = model.predict_margin_range(&d, (0, 2)).unwrap();
+    let first_two = model.predict_margin_range(&d, ..2).unwrap();
     assert_eq!(
         first_two,
-        model.slice(0, 2, 1).unwrap().predict_margin(&d).unwrap()
+        model.slice(..2, 1).unwrap().predict_margin(&d).unwrap()
     );
     assert_ne!(first_two, all);
     // SHAP over a prefix range stays additive.
-    assert_contribs_sum_to(
-        &model.predict_contribs_range(&d, (0, 2)).unwrap(),
-        &first_two,
-    );
+    assert_contribs_sum_to(&model.predict_contribs_range(&d, ..2).unwrap(), &first_two);
 }
 
 #[test]
@@ -386,7 +407,11 @@ fn continued_vector_training_matches_one_run() {
     let params = vector_params().subsample(0.8).seed(11).build().unwrap();
     let full = train(&params, &dtrain, 8).unwrap();
     let first = train(&params, &dtrain, 5).unwrap();
-    let continued = train_continue(&params, &dtrain, 3, &first).unwrap();
+    let continued = Trainer::new(&params, &dtrain, 3)
+        .init_model(&first)
+        .train()
+        .unwrap()
+        .model;
     assert_eq!(continued.num_trees(), 8);
     assert_eq!(
         continued.predict_margin(&dtrain).unwrap(),
@@ -404,13 +429,21 @@ fn unsupported_vector_layouts_are_rejected() {
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(train_continue(&refresh, &dtrain, 2, &vector)),
+        invalid_param(
+            Trainer::new(&refresh, &dtrain, 2)
+                .init_model(&vector)
+                .train()
+        ),
         "process_type"
     );
     // A model keeps one tree kind.
     let scalar = TrainingParams::builder().max_depth(4).build().unwrap();
     assert_eq!(
-        invalid_param(train_continue(&scalar, &dtrain, 2, &vector)),
+        invalid_param(
+            Trainer::new(&scalar, &dtrain, 2)
+                .init_model(&vector)
+                .train()
+        ),
         "multi_strategy"
     );
     // The opt-in growth modes that bypass the vector-leaf split search.

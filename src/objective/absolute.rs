@@ -55,26 +55,26 @@ pub(super) fn residual_scales(
 /// A total weight within `1e-6` of zero gives zero intercepts. Predictions
 /// are margins (no link); the default metric is `mae`.
 #[derive(Debug, Clone, Copy)]
-pub struct AbsoluteErrorObjective {
+pub struct AbsoluteError {
     n_targets: usize,
 }
 
-impl AbsoluteErrorObjective {
+impl AbsoluteError {
     /// Create for `n_targets` label columns (at least one).
     pub fn new(n_targets: usize) -> Self {
-        AbsoluteErrorObjective {
+        AbsoluteError {
             n_targets: n_targets.max(1),
         }
     }
 }
 
-impl Default for AbsoluteErrorObjective {
+impl Default for AbsoluteError {
     fn default() -> Self {
         Self::new(1)
     }
 }
 
-impl Objective for AbsoluteErrorObjective {
+impl Objective for AbsoluteError {
     fn name(&self) -> &'static str {
         "reg:absoluteerror"
     }
@@ -158,12 +158,13 @@ impl Objective for AbsoluteErrorObjective {
 mod tests {
     use super::*;
     use crate::objective::gradient_pairs;
+    use crate::training::Trainer;
 
     /// `δ = (Σ√|r| / n)²`; `g = r·δ/√(δ² + r²)`, `h = δ/√(δ² + r²)`, which
     /// tends to `sign(r)` and `δ/|r|` for large residuals.
     #[test]
     fn gradient_is_scaled_pseudo_huber_score() {
-        let obj = AbsoluteErrorObjective::default();
+        let obj = AbsoluteError::default();
         let out = gradient_pairs(&obj, &[4.0, 0.0], &[0.0, 1.0], None);
         let delta = 1.5f64.powi(2) as f32; // ((√4 + √1) / 2)²
         let norm0 = delta.hypot(4.0);
@@ -176,7 +177,7 @@ mod tests {
     /// defaults to 1 with a zero gradient; zero total weight zeroes all.
     #[test]
     fn gradient_edge_cases() {
-        let obj = AbsoluteErrorObjective::default();
+        let obj = AbsoluteError::default();
         let out = gradient_pairs(&obj, &[1.0, 2.0], &[1.0, 2.0], None);
         assert_eq!(out, vec![GradPair::new(0.0, 1.0); 2]);
         let out = gradient_pairs(&obj, &[3.0, 2.0], &[1.0, 2.0], Some(&[0.0, 0.0]));
@@ -189,12 +190,12 @@ mod tests {
     /// Output `j` fits label column `j` with its own scale.
     #[test]
     fn multi_target_uses_each_label_column() {
-        let two = AbsoluteErrorObjective::new(2);
+        let two = AbsoluteError::new(2);
         assert_eq!(two.n_outputs(), 2);
         let preds = [0.0f32, 0.0, 0.0, 0.0];
         let labels = [1.0f32, -9.0, 1.0, -9.0];
         let out = gradient_pairs(&two, &preds, &labels, None);
-        let one = AbsoluteErrorObjective::default();
+        let one = AbsoluteError::default();
         let single = gradient_pairs(&one, &[0.0, 0.0], &[-9.0, -9.0], None);
         assert_eq!([out[1], out[3]], [single[0], single[1]]);
         assert!(out[0].grad < 0.0 && out[1].grad > 0.0);
@@ -209,7 +210,7 @@ mod tests {
     /// mean towards (not onto) the median.
     #[test]
     fn intercept_is_newton_step_from_mean() {
-        let obj = AbsoluteErrorObjective::default();
+        let obj = AbsoluteError::default();
         let labels = [0.0f32, 0.0, 10.0];
         let mean = weighted_label_mean(&labels, None);
         let preds = [mean; 3];
@@ -245,12 +246,12 @@ mod tests {
             .unwrap();
         let base = DMatrix::from_dense(&x, n, 2).unwrap();
         let both = base.clone().with_label_matrix(&matrix, 2).unwrap();
-        let joint = crate::learner::train(&params, &both, 5).unwrap();
+        let joint = crate::training::train(&params, &both, 5).unwrap();
         assert_eq!(joint.n_outputs(), 2);
         let joint_pred = joint.predict(&base).unwrap();
         for (j, y) in [&y0, &y1].into_iter().enumerate() {
             let single = base.clone().with_labels(y).unwrap();
-            let alone = crate::learner::train(&params, &single, 5).unwrap();
+            let alone = crate::training::train(&params, &single, 5).unwrap();
             let pred = alone.predict(&base).unwrap();
             let column: Vec<f32> = joint_pred.iter().skip(j).step_by(2).copied().collect();
             assert_eq!(column, pred, "target {j}");
@@ -266,12 +267,12 @@ mod tests {
         use crate::error::HessboostError;
         let d = crate::test_support::labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
         let params = TrainingParams::builder().build().unwrap();
-        let two = AbsoluteErrorObjective::new(2);
+        let two = AbsoluteError::new(2);
         assert!(matches!(
-            crate::learner::train_with_objective(&params, &d, 1, &two),
+            Trainer::new(&params, &d, 1).objective(&two).train(),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
         ));
-        let one = AbsoluteErrorObjective::new(1);
-        assert!(crate::learner::train_with_objective(&params, &d, 1, &one).is_ok());
+        let one = AbsoluteError::new(1);
+        assert!(Trainer::new(&params, &d, 1).objective(&one).train().is_ok());
     }
 }

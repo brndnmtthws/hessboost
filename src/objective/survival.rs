@@ -41,9 +41,9 @@ pub(crate) fn abs_label_order(labels: &[f32]) -> Vec<usize> {
 /// tied times share one risk-set denominator. The intercept is XGBoost's
 /// one-Newton-step fit from zero margins.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CoxObjective;
+pub struct Cox;
 
-impl Objective for CoxObjective {
+impl Objective for Cox {
     fn name(&self) -> &'static str {
         "survival:cox"
     }
@@ -121,22 +121,22 @@ impl Objective for CoxObjective {
 /// evaluation metrics receive the raw margins. The intercept is XGBoost's
 /// default `base_score` of 0.5 (margin `ln 0.5`), not estimated from data.
 /// The default metric is `aft-nloglik` with this distribution at scale 1, as
-/// in XGBoost (see [`create_metrics`](crate::metric::create_metrics)).
+/// in XGBoost.
 ///
 /// Training reads only the label bounds. Called without bounds
 /// ([`Objective::gradient`]), the ordinary labels are treated as observed
 /// times.
 #[derive(Debug, Clone, Copy)]
-pub struct AftObjective {
+pub struct Aft {
     distribution: AftDistribution,
     sigma: f32,
 }
 
-impl AftObjective {
+impl Aft {
     /// Create with the noise `distribution` and its scale `sigma`
     /// (XGBoost `aft_loss_distribution`, `aft_loss_distribution_scale`).
     pub fn new(distribution: AftDistribution, sigma: f32) -> Self {
-        AftObjective {
+        Aft {
             distribution,
             sigma,
         }
@@ -197,14 +197,14 @@ impl AftObjective {
     }
 }
 
-impl Default for AftObjective {
+impl Default for Aft {
     /// XGBoost's defaults: normal noise with scale 1.
     fn default() -> Self {
-        AftObjective::new(AftDistribution::Normal, 1.0)
+        Aft::new(AftDistribution::Normal, 1.0)
     }
 }
 
-impl Objective for AftObjective {
+impl Objective for Aft {
     fn name(&self) -> &'static str {
         "survival:aft"
     }
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn cox_breslow_gradient_with_tie_and_censoring() {
         let labels = [2.0, 1.0, 3.0, -2.0];
-        let out = gradient_pairs(&CoxObjective, &[0.0; 4], &labels, None);
+        let out = gradient_pairs(&Cox, &[0.0; 4], &labels, None);
         // Risk-set sizes seen by events: time 1 -> 4, time 2 -> 3, time 3 -> 1.
         let r = [
             1.0 / 4.0,
@@ -835,8 +835,8 @@ mod tests {
     fn cox_weights_scale_gradients() {
         let labels = [1.0, -2.0, 3.0];
         let preds = [0.3, -0.2, 0.1];
-        let plain = gradient_pairs(&CoxObjective, &preds, &labels, None);
-        let weighted = gradient_pairs(&CoxObjective, &preds, &labels, Some(&[2.0, 0.5, 1.0]));
+        let plain = gradient_pairs(&Cox, &preds, &labels, None);
+        let weighted = gradient_pairs(&Cox, &preds, &labels, Some(&[2.0, 0.5, 1.0]));
         for ((p, w), s) in plain.iter().zip(&weighted).zip([2.0f32, 0.5, 1.0]) {
             assert_relative_eq!(w.grad, p.grad * s, max_relative = 1e-6);
             assert_relative_eq!(w.hess, p.hess * s, max_relative = 1e-6);
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn aft_reads_bounds_and_weights() {
-        let obj = AftObjective::new(AftDistribution::Normal, 1.0);
+        let obj = Aft::new(AftDistribution::Normal, 1.0);
         let lower = [1.0, 2.0, 0.0];
         let upper = [1.0, f32::INFINITY, 3.0];
         let weights = [1.0, 2.0, 0.5];
@@ -949,7 +949,7 @@ mod tests {
     fn aft_trains_from_bounds_without_labels() {
         use crate::config::TrainingParams;
         use crate::data::DMatrix;
-        use crate::learner::{train, train_with_eval};
+        use crate::training::{Trainer, train};
 
         let n = 60;
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
@@ -980,7 +980,10 @@ mod tests {
         assert!(pred[n - 1] > 3.0 * pred[1]);
 
         let unbounded = crate::test_support::labeled_dense(&x, n, 1, &t);
-        let err = train_with_eval(&params, &d, 1, &[(&unbounded, "valid")], None).unwrap_err();
+        let err = Trainer::new(&params, &d, 1)
+            .eval(&unbounded, "valid")
+            .train()
+            .unwrap_err();
         assert!(err.to_string().contains("`valid`"), "{err}");
     }
 }

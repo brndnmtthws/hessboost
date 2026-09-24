@@ -132,7 +132,7 @@ impl ChildLeaf {
 }
 
 /// A regression tree: a flat node array with node `0` as the root.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegTree {
     nodes: Vec<Node>,
     /// Flat pool of category values routed left by categorical nodes. Node

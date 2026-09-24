@@ -80,7 +80,8 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, create_objective};
 use crate::training::train::{
-    initial_intercepts, new_model, reject_missing_param, validate_dataset, with_thread_pool,
+    check_num_class, initial_intercepts, new_model, reject_missing_param, validate_dataset,
+    validate_trained_model, with_thread_pool,
 };
 use crate::tree::builder::budget::{
     ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
@@ -268,20 +269,6 @@ pub fn train_with_budget(
     Ok(result)
 }
 
-/// What training returns must load again: the structural check the model
-/// formats apply, reported as a training error.
-// Mirrors the check at the end of `Trainer::train` (`training/train.rs`);
-// replace with a shared helper there once one exists.
-fn validate_trained_model(model: &BoostedModel) -> Result<()> {
-    model.validate_structure().map_err(|e| {
-        let reason = match e {
-            HessboostError::ModelFormat(reason) => reason,
-            other => other.to_string(),
-        };
-        HessboostError::model_format(format!("training produced an invalid model: {reason}"))
-    })
-}
-
 /// Refuse every [`TrainingParams`] field budget mode does not read (they are
 /// derived from the budget or have no budget-mode meaning), comparing the
 /// serialized configuration against the defaults so newly added fields are
@@ -366,18 +353,7 @@ fn train_budget_inner(
             ));
         }
     };
-    // Saved models require `num_class >= 2` to equal the output count (1).
-    // Mirrors the check in `training/train.rs::train_impl`.
-    if params.num_class >= 2 {
-        return Err(HessboostError::invalid_param(
-            "num_class",
-            format!(
-                "objective `{}` has {n_out} outputs, so num_class {} does not apply to it",
-                objective.name(),
-                params.num_class
-            ),
-        ));
-    }
+    check_num_class(params, objective.as_ref())?;
     reject_tuned_params(params)?;
     let Some(labels) = dtrain.labels() else {
         return Err(HessboostError::EmptyDataset(

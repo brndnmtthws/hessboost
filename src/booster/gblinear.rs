@@ -53,14 +53,13 @@ fn coordinate_delta(sum_grad: f64, sum_hess: f64, w: f64, alpha: f64, lambda: f6
 
 /// Fit a linear booster by coordinate descent.
 ///
-/// `initial_margin` contains the per-row starting margins, and
-/// `n_out` is the number of outputs (`num_class` for multiclass, the label
-/// columns for multi-target labels, else 1). The
-/// returned [`LinearModel`] holds `weights` laid out `[feature][output]` and a
-/// per-output `bias`. Continued training passes the model's current linear
-/// then resumes from its weights and bias instead of zeros. Fails when the
-/// objective supplies reduced split gradients, which only vector-leaf trees
-/// use.
+/// `initial_margin` contains the per-row starting margins, and `n_out` is the
+/// number of outputs (`num_class` for multiclass, the label columns for
+/// multi-target labels, else 1). The returned [`LinearModel`] holds `weights`
+/// laid out `[feature][output]` and a per-output `bias`. Continued training
+/// passes the model's current linear booster as `start`, which fitting
+/// resumes from instead of zeros. Fails when the objective supplies reduced
+/// split gradients, which only vector-leaf trees use.
 pub(crate) fn train_gblinear(
     params: &TrainingParams,
     dtrain: &DMatrix,
@@ -136,8 +135,8 @@ pub(crate) fn train_gblinear(
                 let col = &cols[f];
                 let mut g = 0.0f64;
                 let mut h = 0.0f64;
-                for (idx, &row) in col.rows.iter().enumerate() {
-                    let x = f64::from(col.vals[idx]);
+                for (&row, &x) in col.rows.iter().zip(&col.vals) {
+                    let x = f64::from(x);
                     let gp = gpair[row as usize * n_out + k];
                     g += f64::from(gp.grad) * x;
                     h += f64::from(gp.hess) * x * x;
@@ -149,8 +148,7 @@ pub(crate) fn train_gblinear(
                 }
                 let dw32 = dw as f32;
                 lin_weights[f * n_out + k] += dw32;
-                for (idx, &row) in col.rows.iter().enumerate() {
-                    let x = col.vals[idx];
+                for (&row, &x) in col.rows.iter().zip(&col.vals) {
                     let gp = &mut gpair[row as usize * n_out + k];
                     gp.grad += gp.hess * x * dw32;
                     margin[row as usize * n_out + k] += x * dw32;

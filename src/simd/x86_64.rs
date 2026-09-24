@@ -149,18 +149,22 @@ pub(super) unsafe fn logistic_gradient(
         let one = _mm256_set1_ps(1.0);
         let scale = _mm256_set1_ps(scale_pos_weight);
         let min_hess_vector = _mm256_set1_ps(min_hess);
+        let scalar_range = |out: &mut [GradPair], range| {
+            scalar::logistic_gradient(
+                preds,
+                labels,
+                weights,
+                scale_pos_weight,
+                min_hess,
+                out,
+                range,
+            );
+        };
         let mut index = 0;
         while index + WIDTH <= preds.len() {
             let pred = _mm256_loadu_ps(preds.as_ptr().add(index));
             if !regular_input(pred) {
-                scalar::logistic_gradient(
-                    preds,
-                    labels,
-                    weights,
-                    (scale_pos_weight, min_hess),
-                    out,
-                    index..index + WIDTH,
-                );
+                scalar_range(out, index..index + WIDTH);
                 index += WIDTH;
                 continue;
             }
@@ -183,14 +187,7 @@ pub(super) unsafe fn logistic_gradient(
             store_pairs(out.as_mut_ptr().add(index), grad, hess);
             index += WIDTH;
         }
-        scalar::logistic_gradient(
-            preds,
-            labels,
-            weights,
-            (scale_pos_weight, min_hess),
-            out,
-            index..preds.len(),
-        );
+        scalar_range(out, index..preds.len());
     }
 }
 

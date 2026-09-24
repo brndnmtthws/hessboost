@@ -3,7 +3,6 @@
 //! `cargo run --release --example model_io`.
 
 use hessboost::prelude::*;
-use std::path::Path;
 
 mod common;
 use common::{fill_random, lcg};
@@ -65,7 +64,7 @@ fn main() -> Result<()> {
     }
 
     for p in [&bin, &json, &xgb, &ubj] {
-        let _ = std::fs::remove_file(Path::new(p));
+        let _ = std::fs::remove_file(p);
     }
     Ok(())
 }

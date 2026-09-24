@@ -87,6 +87,9 @@ const GRADIENT_CHUNK_ROWS: usize = 8192;
 /// Lower bound on any per-instance Hessian, matching XGBoost's guard, so that
 /// confidently-classified instances still contribute a positive Hessian.
 pub(crate) const MIN_HESS: f32 = 1e-16;
+/// XGBoost's `f64` Hessian floor (AFT `kMinHessian`, LambdaRank `Eps64`):
+/// the `f64` literal, not [`MIN_HESS`] widened.
+pub(crate) const MIN_HESS_F64: f64 = 1e-16;
 
 /// Run a row-independent gradient `kernel` over `n_rows` instances with
 /// `n_outputs` values each, in parallel row chunks when the batch is large and
@@ -94,7 +97,8 @@ pub(crate) const MIN_HESS: f32 = 1e-16;
 /// and the chunking is fixed (not thread-count dependent): a short final
 /// chunk is folded into the last full chunk so every row takes the same
 /// vector/scalar path as in one whole-batch call, and the result is
-/// identical.
+/// identical. Debug builds first assert the shapes with
+/// [`check_gradient_inputs`].
 pub(crate) fn rowwise_gradient<K>(
     n_rows: usize,
     n_outputs: usize,
@@ -106,6 +110,7 @@ pub(crate) fn rowwise_gradient<K>(
 ) where
     K: Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Sync,
 {
+    check_gradient_inputs(n_rows, n_outputs, preds, labels, weights, out);
     let complete = n_rows
         .checked_mul(n_outputs)
         .is_some_and(|values| preds.len() == values && out.len() == values)
@@ -152,11 +157,50 @@ pub(crate) fn rowwise_gradient<K>(
     );
 }
 
+/// [`rowwise_gradient`] for a single-output objective whose pair depends only
+/// on the row's margin, label, and weight (`1` without weights):
+/// `out[i] = pair(preds[i], labels[i], w_i)`.
+pub(crate) fn elementwise_gradient(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    out: &mut [GradPair],
+    pair: impl Fn(f32, f32, f32) -> GradPair + Sync,
+) {
+    rowwise_gradient(
+        labels.len(),
+        1,
+        preds,
+        labels,
+        weights,
+        out,
+        |preds, labels, weights, out| {
+            for i in 0..preds.len() {
+                let w = weights.map_or(1.0, |ws| ws[i]);
+                out[i] = pair(preds[i], labels[i], w);
+            }
+        },
+    );
+}
+
+/// The pairs `objective.gradient` writes for `preds` (one per margin).
+#[cfg(test)]
+fn gradient_pairs(
+    objective: &dyn Objective,
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+) -> Vec<GradPair> {
+    let mut out = vec![GradPair::default(); preds.len()];
+    objective.gradient(preds, labels, weights, &mut out);
+    out
+}
+
 /// Debug-only shape check shared by every [`Objective::gradient`]: `preds` and
 /// `out` hold `n_rows * n_outputs` values while `labels` (and `weights`, when
-/// present) hold one per row. Release builds skip it, like the
-/// `debug_assert_eq!`s it replaces; [`rowwise_gradient`] re-validates the same
-/// shapes at runtime for its chunking decision.
+/// present) hold one per row. Release builds skip it; [`rowwise_gradient`]
+/// runs it and re-validates the same shapes at runtime for its chunking
+/// decision.
 pub(crate) fn check_gradient_inputs(
     n_rows: usize,
     n_outputs: usize,
@@ -245,7 +289,7 @@ pub trait Objective: Send + Sync {
     /// step from all-zero margins, `w_k = -Σg_k / max(Σh_k, 1e-6)` (sums in
     /// `f64`, step rounded to `f32`), mapped through
     /// [`Objective::pred_transform`] and back through
-    /// [`Objective::prob_to_margin`] to reproduce XGBoost's `f32` rounding.
+    /// [`Objective::probs_to_margins`] to reproduce XGBoost's `f32` rounding.
     /// Objectives whose optimal constant has a closed form (label mean, class
     /// frequencies) override it.
     fn base_margins(
@@ -386,7 +430,7 @@ pub(crate) fn fit_stump(gpair: &[GradPair], k: usize) -> Vec<f32> {
     sum_grad
         .iter()
         .zip(&sum_hess)
-        .map(|(g, h)| (-g / h.max(1e-6)) as f32)
+        .map(|(g, h)| (-g / h.max(crate::K_RT_EPS)) as f32)
         .collect()
 }
 
@@ -708,15 +752,7 @@ mod tests {
                 let preds: Vec<f32> = (0..n * k)
                     .map(|i| ((i * 7919) % 2003) as f32 / 97.0 - 10.0)
                     .collect();
-                let labels: Vec<f32> = (0..n)
-                    .map(|i| {
-                        if k == 1 {
-                            (i % 2) as f32
-                        } else {
-                            (i % k) as f32
-                        }
-                    })
-                    .collect();
+                let labels: Vec<f32> = (0..n).map(|i| (i % k.max(2)) as f32).collect();
                 let weights: Vec<f32> = (0..n).map(|i| 0.5 + (i % 5) as f32 * 0.25).collect();
                 for weights in [None, Some(weights.as_slice())] {
                     let mut whole = vec![GradPair::default(); n * k];

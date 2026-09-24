@@ -31,21 +31,24 @@
 //! with the missing rows counted in every fold's statistics. (Perpetual's
 //! imputing splitter adds the whole missing mass to the in-fold side only.)
 
+use super::hist::rayon_available;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
+use crate::tree::hist::feature_slices;
 use crate::tree::regtree::RegTree;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 /// Number of generalization folds.
-const N_FOLDS: usize = 5;
+pub(crate) const N_FOLDS: usize = 5;
 /// Hessian guard in every weight and score (Perpetual `HESSIAN_EPS`).
 const HESSIAN_EPS: f64 = 1e-8;
 /// Generalization floor for numeric splits (Perpetual `GENERALIZATION_THRESHOLD`).
 const GENERALIZATION_THRESHOLD: f64 = 1.0;
-/// Base floor for categorical splits (Perpetual `GENERALIZATION_THRESHOLD_RELAXED`).
-const GENERALIZATION_THRESHOLD_RELAXED: f64 = 0.99;
+/// Base floor for categorical splits, and the generalization score below
+/// which a tree counts as weak (Perpetual `GENERALIZATION_THRESHOLD_RELAXED`).
+pub(crate) const GENERALIZATION_THRESHOLD_RELAXED: f64 = 0.99;
 /// Node cap per tree (Perpetual `N_NODES_ALLOC_MAX`).
 pub(crate) const MAX_NODES: usize = 10_000;
 /// Rows below which a node's histogram and loss update run serially.
@@ -153,16 +156,24 @@ fn mean(values: &[f64; N_FOLDS]) -> f64 {
     values.iter().sum::<f64>() / N_FOLDS as f64
 }
 
-/// Agreement of one child's five fold weights (splitter form):
-/// `1 / (1 + σ/(|w̄| + 1e-6))` clamped to `[0.5, 1]`.
-fn fold_weight_stability(weights: &[f64; N_FOLDS]) -> f64 {
+/// Mean absolute value and standard deviation of a node's fold weights;
+/// `None` when they are all (near) zero.
+pub(crate) fn fold_weight_spread(weights: &[f64; N_FOLDS]) -> Option<(f64, f64)> {
     let m = mean(weights);
     let mean_abs = weights.iter().map(|w| w.abs()).sum::<f64>() / N_FOLDS as f64;
     if mean_abs <= f64::from(f32::EPSILON) {
-        return 1.0;
+        return None;
     }
     let variance = weights.iter().map(|w| (w - m).powi(2)).sum::<f64>() / N_FOLDS as f64;
-    (1.0 / (1.0 + variance.sqrt() / (mean_abs + 1e-6))).clamp(0.5, 1.0)
+    Some((mean_abs, variance.sqrt()))
+}
+
+/// Agreement of one child's five fold weights (splitter form):
+/// `1 / (1 + σ/(|w̄| + 1e-6))` clamped to `[0.5, 1]`.
+fn fold_weight_stability(weights: &[f64; N_FOLDS]) -> f64 {
+    fold_weight_spread(weights).map_or(1.0, |(mean_abs, std_dev)| {
+        (1.0 / (1.0 + std_dev / (mean_abs + 1e-6))).clamp(0.5, 1.0)
+    })
 }
 
 /// Root-mean-square of a child's fold weights.
@@ -192,15 +203,15 @@ fn generalization_floor(stability: f64, categorical: bool, depth: usize, count: 
 }
 
 /// The ranking score of an accepted split: its gain damped by fold-weight
-/// stability and (weakly) by its generalization ratio.
+/// `stability` and (weakly) by its generalization ratio.
 fn ranking_gain(
     split_gain: f64,
     generalization: f64,
+    stability: f64,
     left: &[f64; N_FOLDS],
     right: &[f64; N_FOLDS],
     categorical: bool,
 ) -> f64 {
-    let stability = split_weight_stability(left, right);
     if categorical {
         let factor =
             generalization.clamp(generalization_floor(stability, true, 0, usize::MAX), 1.12);
@@ -216,13 +227,9 @@ fn ranking_gain(
 /// A split candidate that passed the generalization check.
 #[derive(Debug, Clone)]
 struct Candidate {
-    rank: f64,
-    split_gain: f64,
-    generalization: f64,
+    scored: Scored,
     left: FoldStats,
     right: FoldStats,
-    left_weights: [f64; N_FOLDS],
-    right_weights: [f64; N_FOLDS],
     feature: u32,
     /// Numeric: bins `<= split_bin` go left. Categorical: unused.
     split_bin: usize,
@@ -304,17 +311,17 @@ impl NodeCtx {
         if generalization.is_nan() {
             return None;
         }
-        if !self.is_root {
-            let stability = split_weight_stability(&left_weights, &right_weights);
-            let floor = generalization_floor(stability, categorical, self.depth, self.count);
-            if generalization < floor {
-                return None;
-            }
+        let stability = split_weight_stability(&left_weights, &right_weights);
+        if !self.is_root
+            && generalization < generalization_floor(stability, categorical, self.depth, self.count)
+        {
+            return None;
         }
         Some(Scored {
             rank: ranking_gain(
                 split_gain,
                 generalization,
+                stability,
                 &left_weights,
                 &right_weights,
                 categorical,
@@ -345,6 +352,7 @@ impl NodeCtx {
 }
 
 /// The scores of one evaluated partition.
+#[derive(Debug, Clone)]
 struct Scored {
     rank: f64,
     split_gain: f64,
@@ -356,7 +364,7 @@ struct Scored {
 /// Keep the higher-ranked of `best` and a new partition (ties keep `best`,
 /// which was found earlier in the fixed scan order).
 fn offer(best: &mut Option<Candidate>, scored: Scored, make: impl FnOnce(Scored) -> Candidate) {
-    if best.as_ref().is_none_or(|b| scored.rank > b.rank) {
+    if best.as_ref().is_none_or(|b| scored.rank > b.scored.rank) {
         *best = Some(make(scored));
     }
 }
@@ -530,7 +538,7 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
                 rt.hess as f32,
             )
         };
-        tree.set_split_gain(node.nid, best.split_gain as f32);
+        tree.set_split_gain(node.nid, best.scored.split_gain as f32);
 
         for (nid, start, end, value, stats, fold_weights) in [
             (
@@ -539,7 +547,7 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
                 mid,
                 left_value,
                 best.left,
-                best.left_weights,
+                best.scored.left_weights,
             ),
             (
                 right_id,
@@ -547,7 +555,7 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
                 node.end,
                 right_value,
                 best.right,
-                best.right_weights,
+                best.scored.right_weights,
             ),
         ] {
             if cfg.target_loss_decrement.is_some() {
@@ -557,7 +565,7 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
             }
             let totals = stats.totals();
             children.push(ChildRecord {
-                generalization: best.generalization,
+                generalization: best.scored.generalization,
                 fold_weights,
                 count: end - start,
             });
@@ -598,12 +606,11 @@ fn update_decrement(
             .map(|&r| (r, row_decrement(r, value)))
             .collect()
     };
-    let updates: Vec<Vec<(u32, f64)>> =
-        if rows.len() >= PARALLEL_ROWS && rayon::current_num_threads() > 1 {
-            rows.par_chunks(DECREMENT_CHUNK).map(serial).collect()
-        } else {
-            rows.chunks(DECREMENT_CHUNK).map(serial).collect()
-        };
+    let updates: Vec<Vec<(u32, f64)>> = if rows.len() >= PARALLEL_ROWS && rayon_available() {
+        rows.par_chunks(DECREMENT_CHUNK).map(serial).collect()
+    } else {
+        rows.chunks(DECREMENT_CHUNK).map(serial).collect()
+    };
     let mut delta = 0.0;
     for (r, new) in updates.into_iter().flatten() {
         let old = &mut loss_decr[r as usize];
@@ -616,23 +623,15 @@ fn update_decrement(
 /// Per-fold histogram of `rows` over every global bin.
 fn build_histogram(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair]) -> Vec<FoldStats> {
     let mut hist = vec![FoldStats::default(); ghist.total_bins()];
-    let parallel = rows.len() >= PARALLEL_ROWS && rayon::current_num_threads() > 1;
+    let parallel = rows.len() >= PARALLEL_ROWS && rayon_available();
     if let (true, Some(columns)) = (parallel, ghist.column_bins()) {
         // Feature-parallel: each task owns one feature's bin range and adds
         // that feature's rows in the node's row order.
         let n_rows = ghist.n_rows();
-        let cuts = ghist.cuts();
-        let mut slices = Vec::with_capacity(ghist.n_cols());
-        let mut rest = hist.as_mut_slice();
-        for f in 0..ghist.n_cols() {
-            let (fs, fe) = cuts.feature_bins(f);
-            let (head, tail) = rest.split_at_mut(fe - fs);
-            slices.push((f, fs, head));
-            rest = tail;
-        }
-        slices
+        feature_slices(ghist, &mut hist, 1)
             .into_par_iter()
-            .for_each(|(f, fs, slice)| match columns {
+            .enumerate()
+            .for_each(|(f, (fs, slice))| match columns {
                 Bins::U16(c) => {
                     accumulate_column(&c[f * n_rows..(f + 1) * n_rows], fs, rows, gpair, slice);
                 }
@@ -682,15 +681,17 @@ fn accumulate_rows<B: Copy + Into<u32>>(
 fn find_split(ghist: &GHistIndex, hist: &[FoldStats], ctx: &NodeCtx) -> Option<Candidate> {
     let n_features = ghist.n_cols();
     let per_feature = |f: usize| feature_split(ghist, hist, ctx, f);
-    let found: Vec<Option<Candidate>> =
-        if ctx.count >= PARALLEL_ROWS && rayon::current_num_threads() > 1 {
-            (0..n_features).into_par_iter().map(per_feature).collect()
-        } else {
-            (0..n_features).map(per_feature).collect()
-        };
+    let found: Vec<Option<Candidate>> = if ctx.count >= PARALLEL_ROWS && rayon_available() {
+        (0..n_features).into_par_iter().map(per_feature).collect()
+    } else {
+        (0..n_features).map(per_feature).collect()
+    };
     let mut best: Option<Candidate> = None;
     for candidate in found.into_iter().flatten() {
-        if best.as_ref().is_none_or(|b| candidate.rank > b.rank) {
+        if best
+            .as_ref()
+            .is_none_or(|b| candidate.scored.rank > b.scored.rank)
+        {
             best = Some(candidate);
         }
     }
@@ -747,14 +748,10 @@ fn feature_split(
             }
         };
         let make = |l: FoldStats, r: FoldStats, default_left: bool| {
-            move |s: Scored| Candidate {
-                rank: s.rank,
-                split_gain: s.split_gain,
-                generalization: s.generalization,
+            move |scored| Candidate {
+                scored,
                 left: l,
                 right: r,
-                left_weights: s.left_weights,
-                right_weights: s.right_weights,
                 feature,
                 split_bin: fs + b,
                 cat_bins: cat_bins(),
@@ -763,7 +760,7 @@ fn feature_split(
         };
         // Missing rows right (the only option without missing values).
         let rank_to_beat =
-            |best: &Option<Candidate>| best.as_ref().map_or(f64::NEG_INFINITY, |c| c.rank);
+            |best: &Option<Candidate>| best.as_ref().map_or(f64::NEG_INFINITY, |c| c.scored.rank);
         let mut missing_right = right;
         missing_right.add(&missing);
         if let Some(s) = ctx.evaluate(&left, &missing_right, categorical, rank_to_beat(&best)) {
@@ -788,14 +785,10 @@ fn feature_split(
             let mut right = present.sub(&left);
             right.add(&missing);
             if let Some(s) = ctx.evaluate_tiny_root(&left, &right) {
-                offer(&mut best, s, |s| Candidate {
-                    rank: s.rank,
-                    split_gain: s.split_gain,
-                    generalization: s.generalization,
+                offer(&mut best, s, |scored| Candidate {
+                    scored,
                     left,
                     right,
-                    left_weights: s.left_weights,
-                    right_weights: s.right_weights,
                     feature,
                     split_bin: fs + b,
                     cat_bins: Vec::new(),

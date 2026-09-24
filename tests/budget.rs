@@ -6,16 +6,8 @@
 use hessboost::objective::create_objective;
 use hessboost::prelude::*;
 
-/// 64-bit LCG returning uniforms in `[0, 1)`.
-fn lcg(seed: u64) -> impl FnMut() -> f32 {
-    let mut s = seed;
-    move || {
-        s = s
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        ((s >> 40) as f32) / (1u32 << 24) as f32
-    }
-}
+mod common;
+use common::{labeled_dense, lcg};
 
 const N_FEATURES: usize = 6;
 
@@ -45,10 +37,7 @@ fn regression(n: usize, seed: u64) -> DMatrix {
         .iter()
         .map(|v| v + (0..12).map(|_| next()).sum::<f32>() - 6.0)
         .collect();
-    DMatrix::from_dense(&x, n, N_FEATURES)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    labeled_dense(&x, N_FEATURES, &y)
 }
 
 /// Binary labels drawn with probability `σ((f − 14) / 2)`.
@@ -59,10 +48,7 @@ fn binary(n: usize, seed: u64) -> DMatrix {
         .iter()
         .map(|v| f32::from(next() < 1.0 / (1.0 + (-(v - 14.0) / 2.0).exp())))
         .collect();
-    DMatrix::from_dense(&x, n, N_FEATURES)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    labeled_dense(&x, N_FEATURES, &y)
 }
 
 fn params(objective: &str) -> TrainingParams {
@@ -277,10 +263,7 @@ fn learns_missing_value_directions_and_categorical_splits() {
         let lucky = [1.0, 4.0, 6.0].contains(&category);
         y.push(f32::from(missing) * 2.0 + f32::from(lucky) + 0.1 * (next() - 0.5));
     }
-    let data = DMatrix::from_dense(&x, n, 2)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    let data = labeled_dense(&x, 2, &y)
         .with_feature_types(&[FeatureType::Numerical, FeatureType::Categorical])
         .unwrap();
     let result =
@@ -311,7 +294,8 @@ fn iteration_limit_caps_the_rounds() {
 }
 
 /// An unbounded `stopping_rounds` override is valid: the target-round check
-/// must not overflow (it panicked, or wrapped and dropped the loss target).
+/// must not overflow, so `usize::MAX` trains the same model as any other
+/// round count far beyond the iteration limit.
 #[test]
 fn unbounded_stopping_rounds_override_trains() {
     let data = regression(300, 16);
@@ -328,7 +312,7 @@ fn unbounded_stopping_rounds_override_trains() {
     assert_eq!(train(usize::MAX), train(1 << 40));
 }
 
-/// A lone positive count among 999 zeros: unbounded Newton leaves stepped
+/// A lone positive count among 999 zeros: an unbounded Newton leaf would step
 /// its margin by about `+157`, overflowing the next round's gradients and
 /// turning every prediction into NaN. The `max_delta_step` bound keeps the
 /// steps, and so the predictions, finite and moving toward the labels.
@@ -337,10 +321,7 @@ fn poisson_leaf_steps_are_bounded() {
     let n = 1000;
     let mut x = vec![0.0f32; n];
     x[n - 1] = 1.0;
-    let data = DMatrix::from_dense(&x, n, 1)
-        .unwrap()
-        .with_labels(&x)
-        .unwrap();
+    let data = labeled_dense(&x, 1, &x);
     let result =
         train_with_budget(&params("count:poisson"), &data, &BudgetConfig::new(0.5)).unwrap();
     let preds = result.model.predict(&data).unwrap();
@@ -364,10 +345,7 @@ fn non_finite_steps_are_not_appended() {
     x[n - 1] = 1.0;
     let mut y = vec![1.0f32; n];
     y[n - 1] = 1e-30;
-    let data = DMatrix::from_dense(&x, n, 1)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap();
+    let data = labeled_dense(&x, 1, &y);
     let result = train_with_budget(&params("reg:gamma"), &data, &BudgetConfig::new(0.5)).unwrap();
     assert_eq!(result.stop, BudgetStop::NonFiniteLoss);
     let preds = result.model.predict(&data).unwrap();
@@ -379,10 +357,7 @@ fn non_finite_steps_are_not_appended() {
 /// not rank the first threshold above the rest: the perfect split is taken.
 #[test]
 fn undefined_root_generalization_keeps_the_best_split() {
-    let data = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1)
-        .unwrap()
-        .with_labels(&[0.0, 0.0, 1.0, 1.0])
-        .unwrap();
+    let data = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 1, &[0.0, 0.0, 1.0, 1.0]);
     let result = train_with_budget(
         &params("reg:squarederror"),
         &data,
@@ -393,6 +368,19 @@ fn undefined_root_generalization_keeps_the_best_split() {
     assert!(p[0] == p[1] && p[2] == p[3] && p[1] < p[2], "{p:?}");
 }
 
+/// The `(name, reason)` of the invalid-parameter error `train_with_budget`
+/// refuses `params` / `config` with.
+fn rejection(
+    params: &TrainingParams,
+    data: &DMatrix,
+    config: &BudgetConfig,
+) -> (&'static str, String) {
+    match train_with_budget(params, data, config) {
+        Err(HessboostError::InvalidParameter { name, reason }) => (name, reason),
+        other => panic!("expected an invalid-parameter error, got {other:?}"),
+    }
+}
+
 #[test]
 fn derived_or_unused_parameters_are_rejected_by_name() {
     let data = regression(200, 13);
@@ -401,13 +389,11 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
         .max_depth(3)
         .build()
         .unwrap();
-    let error = train_with_budget(&tuned, &data, &BudgetConfig::default())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("`eta`") && error.contains("`max_depth`"),
-        "{error}"
-    );
+    let (name, reason) = rejection(&tuned, &data, &BudgetConfig::default());
+    assert_eq!(name, "budget");
+    for name in ["eta", "max_depth"] {
+        assert!(reason.contains(&format!("`{name}`")), "{name}: {reason}");
+    }
 
     // Objective parameters and the parameters budget mode reads are accepted.
     let accepted = TrainingParams::builder()
@@ -435,9 +421,8 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
         .scale_pos_weight(3.0)
         .build()
         .unwrap();
-    let error = train_with_budget(&foreign, &data, &BudgetConfig::default())
-        .unwrap_err()
-        .to_string();
+    let (name, reason) = rejection(&foreign, &data, &BudgetConfig::default());
+    assert_eq!(name, "budget");
     for name in [
         "quantile_alpha",
         "expectile_alpha",
@@ -445,7 +430,7 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
         "huber_slope",
         "scale_pos_weight",
     ] {
-        assert!(error.contains(&format!("`{name}`")), "{name}: {error}");
+        assert!(reason.contains(&format!("`{name}`")), "{name}: {reason}");
     }
 }
 
@@ -457,18 +442,14 @@ fn unsupported_objectives_and_budgets_are_rejected() {
         .num_class(2)
         .build()
         .unwrap();
-    let error = train_with_budget(&multiclass, &data, &BudgetConfig::default()).unwrap_err();
-    assert!(error.to_string().contains("multi:softprob"), "{error}");
-
+    let (name, _) = rejection(&multiclass, &data, &BudgetConfig::default());
+    assert_eq!(name, "objective");
     for budget in [0.0, -1.0, 5.0, f64::NAN] {
-        assert!(
-            train_with_budget(
-                &params("binary:logistic"),
-                &data,
-                &BudgetConfig::new(budget)
-            )
-            .is_err(),
-            "budget {budget} was accepted"
+        let (name, _) = rejection(
+            &params("binary:logistic"),
+            &data,
+            &BudgetConfig::new(budget),
         );
+        assert_eq!(name, "budget", "budget {budget}");
     }
 }

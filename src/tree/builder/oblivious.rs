@@ -45,12 +45,12 @@
 //! and XGBoost export treat them like any other tree; prediction recognizes
 //! the shape and routes rows by bit pattern (`crate::tree::oblivious`).
 
-use super::hist::{partition_rows, rayon_available};
+use super::hist::{PARALLEL_FRONTIER_ROWS, child_histograms, partition_rows, rayon_available};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, K_RT_EPS, LeafRows, SplitPos,
-    build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows, xgb_loss_chg,
-    xgb_node_gain,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, LeafRows, SplitPos, build_interaction_sets,
+    finalize_leaf_values, next_allowed, permits, sum_rows, xgb_loss_chg, xgb_node_gain,
 };
+use crate::K_RT_EPS;
 use crate::config::{TrainingParams, TreeMethod};
 use crate::data::ghist::GHistIndex;
 use crate::data::{DMatrix, FeatureType};
@@ -58,14 +58,10 @@ use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
 use crate::tree::gain::{GradStats, RegParams};
-use crate::tree::hist::{CpuBackend, Histogram, HistogramBackend, subtract_in_place, zeroed};
+use crate::tree::hist::{CpuBackend, Histogram, HistogramBackend, zeroed};
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
-
-/// Combined level rows at which the level's child histograms are built
-/// concurrently. Below this, the fork costs more than the scan.
-const PARALLEL_LEVEL_ROWS: usize = 4096;
 
 /// Histogram bins scanned per level (nodes × total bins) at which candidate
 /// features are scored concurrently.
@@ -257,7 +253,8 @@ impl<'a> SymmetricTreeBuilder<'a> {
                 0.0,
             );
             let parallel = pending.len() > 1
-                && pending.iter().map(|(n, ..)| n.rows.len()).sum::<usize>() >= PARALLEL_LEVEL_ROWS
+                && pending.iter().map(|(n, ..)| n.rows.len()).sum::<usize>()
+                    >= PARALLEL_FRONTIER_ROWS
                 && rayon_available();
             let build = |(node, s, ids, cb): (LevelNode, NodeSplit, [usize; 2], [Bounds; 2])| {
                 self.children(ghist, gpair, &routing, node, &s, ids, cb, terminal)
@@ -310,19 +307,17 @@ impl<'a> SymmetricTreeBuilder<'a> {
         terminal: bool,
     ) -> [LevelNode; 2] {
         let (left_rows, right_rows) = partition_rows(ghist, &node.rows, routing);
-        let mut parent_hist = node.hist;
         let (left_hist, right_hist) = if terminal {
             (Vec::new(), Vec::new())
-        } else if left_rows.len() <= right_rows.len() {
-            let mut lh = zeroed(parent_hist.len());
-            self.backend.build(ghist, &left_rows, gpair, &mut lh);
-            subtract_in_place(&mut parent_hist, &lh);
-            (lh, parent_hist)
         } else {
-            let mut rh = zeroed(parent_hist.len());
-            self.backend.build(ghist, &right_rows, gpair, &mut rh);
-            subtract_in_place(&mut parent_hist, &rh);
-            (parent_hist, rh)
+            child_histograms(
+                self.backend,
+                ghist,
+                gpair,
+                &left_rows,
+                &right_rows,
+                node.hist,
+            )
         };
         [
             self.level_node(left_id, left_rows, left_hist, split.left, lb),
@@ -519,10 +514,9 @@ impl<'a> SymmetricTreeBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::gp;
+    use super::super::test_support::{binned, gp, grow_hist};
     use super::*;
     use crate::config::{GrowPolicy, Monotone};
-    use crate::data::quantile::HistCuts;
     use crate::learner::train;
     use crate::tree::builder::{HistTreeBuilder, all_rows};
 
@@ -554,10 +548,6 @@ mod tests {
         (d, y)
     }
 
-    fn binned(data: &DMatrix, max_bin: usize) -> GHistIndex {
-        GHistIndex::from_dmatrix(data, HistCuts::from_dmatrix(data, max_bin))
-    }
-
     /// Squared-error gradients at a zero margin.
     fn residual_gradients(y: &[f32]) -> Vec<GradPair> {
         y.iter().map(|&v| gp(-v, 1.0)).collect()
@@ -570,13 +560,7 @@ mod tests {
     }
 
     fn grow(params: &TrainingParams, data: &DMatrix, gpair: &[GradPair]) -> RegTree {
-        let ghist = binned(data, 64);
-        HistTreeBuilder::new(params).build(
-            &ghist,
-            gpair,
-            &all_rows(data.n_rows()),
-            &mut ColumnSampler::all(data.n_cols()),
-        )
+        grow_hist(params, &binned(data, 64), gpair)
     }
 
     /// Assert the tree is symmetric: node ids are breadth-first by depth and

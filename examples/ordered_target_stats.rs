@@ -117,10 +117,8 @@ fn main() -> Result<()> {
 
     // The fitted encoder is serde-serializable: store it next to the model and
     // reload it to encode new data exactly as during training.
-    let json =
-        serde_json::to_string(&fitted).map_err(|e| HessboostError::ModelFormat(e.to_string()))?;
-    let reloaded: FittedTargetEncoder =
-        serde_json::from_str(&json).map_err(|e| HessboostError::ModelFormat(e.to_string()))?;
+    let json = serde_json::to_string(&fitted)?;
+    let reloaded: FittedTargetEncoder = serde_json::from_str(&json)?;
     assert_eq!(reloaded, fitted);
     println!(
         "fitted encoder: {} bytes of JSON, prior {:.4}, unseen category -> {:?}",

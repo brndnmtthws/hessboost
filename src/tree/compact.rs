@@ -39,8 +39,8 @@
 //! [`SymmetricTables`], whose bit-pattern walk replaces the per-node walk for
 //! full lane groups and reaches the same arena leaves.
 
-use crate::tree::RegTree;
 use crate::tree::oblivious::{ArenaNode, SymmetricTables};
+use crate::tree::{RegTree, in_category_set, scalar_tree_output};
 
 /// Rows (or trees) walked in lockstep by the fixed-depth kernel.
 pub(crate) const LANES: usize = 16;
@@ -78,6 +78,35 @@ pub(crate) fn key(v: f32) -> u32 {
 #[inline(always)]
 fn unkey(key: u32) -> f32 {
     f32::from_bits(if key & SIGN != 0 { key ^ SIGN } else { !key })
+}
+
+/// Transpose the full [`LANES`]-row groups of the row-major `rows` into
+/// `lanes` as `[group][feature][lane]` keys of `v` and of `-v`
+/// ([`FEATURE_LANES`] per feature), so a lane's key sits at a fixed
+/// immediate offset from the node's slot.
+pub(crate) fn fill_lanes(lanes: &mut Vec<u32>, rows: &[f32], n_cols: usize) {
+    let groups = rows.len() / n_cols / LANES;
+    lanes.clear();
+    lanes.resize(groups * FEATURE_LANES * n_cols, 0);
+    for (g, dst) in lanes.chunks_exact_mut(FEATURE_LANES * n_cols).enumerate() {
+        let src = &rows[g * LANES * n_cols..(g + 1) * LANES * n_cols];
+        for (j, row) in src.chunks_exact(n_cols).enumerate() {
+            for (f, &v) in row.iter().enumerate() {
+                dst[f * FEATURE_LANES + j] = key(v);
+                dst[f * FEATURE_LANES + LANES + j] = key(-v);
+            }
+        }
+    }
+}
+
+/// Row-major rows -> (keyed lane-major full groups, row-major tail), the
+/// layout the batch kernels consume.
+#[cfg(test)]
+pub(crate) fn split_lanes(rows: &[f32], n_cols: usize) -> (Vec<u32>, &[f32]) {
+    let mut lanes = Vec::new();
+    fill_lanes(&mut lanes, rows, n_cols);
+    let groups = rows.len() / n_cols / LANES;
+    (lanes, &rows[groups * LANES * n_cols..])
 }
 
 /// `key` of a leaf (`+inf`): no real key is greater, so a leaf always selects
@@ -336,6 +365,7 @@ impl CompactForest {
         let offset = self.nodes[id as usize].aux as usize;
         &self.leaf_vectors[offset..offset + k]
     }
+
     /// Whether tree `t` is walked by bit pattern ([`SymmetricTables`]).
     #[cfg(test)]
     pub(crate) fn is_symmetric(&self, t: usize) -> bool {
@@ -367,8 +397,7 @@ impl CompactForest {
     fn in_left_set(&self, node: &CNode, v: f32) -> bool {
         let begin = node.key as usize;
         let end = (node.aux >> CAT_END_SHIFT) as usize;
-        let c = v as u32;
-        self.categories[begin..end].contains(&c)
+        in_category_set(&self.categories[begin..end], v)
     }
 
     /// Child of internal `node` selected by raw value `v` (`NaN` = missing).
@@ -424,18 +453,12 @@ impl CompactForest {
     /// Early-exit walk of a single row through tree `t`.
     #[inline]
     pub(crate) fn leaf_id(&self, t: usize, row: &[f32]) -> u32 {
-        let mut nid = self.trees[t].root;
-        loop {
-            let node = &self.nodes[nid as usize];
-            if Self::is_leaf(node, nid) {
-                return nid;
-            }
-            nid = self.next(node, row[node.feature()]);
-        }
+        self.leaf_id_with(t, |f| Some(row[f as usize]))
     }
 
     /// Early-exit walk through an accessor (`None` = missing), for rows that
     /// are not materialized densely.
+    #[inline]
     pub(crate) fn leaf_id_with(&self, t: usize, get: impl Fn(u32) -> Option<f32>) -> u32 {
         let mut nid = self.trees[t].root;
         loop {
@@ -732,14 +755,13 @@ impl CompactForest {
     /// Original leaf ids of one dense `row` in trees `0..out.len()`, written
     /// to `out[t]`.
     pub(crate) fn original_leaf_ids_for_row(&self, row: &[f32], out: &mut [u32]) {
-        let orig = &self.orig_id[..];
-        self.walk_row(row, 0..out.len(), |t, leaf| out[t] = orig[leaf as usize]);
+        self.walk_row(row, 0..out.len(), |t, leaf| out[t] = self.original_id(leaf));
     }
 
-    /// `out[(t / parallel) % k] += weight(t) * leaf_value(row, tree t)` for
-    /// the trees `trees` of one dense `row`, where `k = out.len()` and
-    /// `parallel` is the number of consecutive trees per output
-    /// (`num_parallel_tree`).
+    /// `out[scalar_tree_output(t, parallel, k)] += weight(t) * leaf_value(row,
+    /// tree t)` for the trees `trees` of one dense `row`, where
+    /// `k = out.len()` and `parallel` is the number of consecutive trees per
+    /// output (`num_parallel_tree`).
     pub(crate) fn accumulate_row(
         &self,
         row: &[f32],
@@ -749,9 +771,8 @@ impl CompactForest {
         out: &mut [f32],
     ) {
         let k = out.len();
-        let nodes = &self.nodes[..];
         self.walk_row(row, trees, |t, leaf| {
-            out[(t / parallel) % k] += weight(t) * f32::from_bits(nodes[leaf as usize].aux);
+            out[scalar_tree_output(t, parallel, k)] += weight(t) * self.leaf_value(leaf);
         });
     }
 }
@@ -767,24 +788,6 @@ mod tests {
         let (l, _r) = t.expand(0, 0, 0.5, true, 0.0, 1.0, 5.0, 1.0);
         t.expand(l, 1, 2.0, false, -1.0, 1.0, 1.0, 1.0);
         t
-    }
-
-    /// Row-major rows -> (keyed lane-major full groups, row-major tail), the
-    /// layout `walk_block` consumes.
-    fn split_lanes(rows: &[f32], n_cols: usize) -> (Vec<u32>, &[f32]) {
-        let groups = rows.len() / n_cols / LANES;
-        let mut lanes = vec![0u32; groups * FEATURE_LANES * n_cols];
-        for g in 0..groups {
-            for j in 0..LANES {
-                for f in 0..n_cols {
-                    let v = rows[(g * LANES + j) * n_cols + f];
-                    let base = g * FEATURE_LANES * n_cols + f * FEATURE_LANES + j;
-                    lanes[base] = key(v);
-                    lanes[base + LANES] = key(-v);
-                }
-            }
-        }
-        (lanes, &rows[groups * LANES * n_cols..])
     }
 
     #[test]

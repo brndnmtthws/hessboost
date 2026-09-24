@@ -70,7 +70,8 @@ pub enum HessboostError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// A JSON (de)serialization error, used by the XGBoost-compat model reader.
+    /// A JSON (de)serialization error, from the native JSON model format or
+    /// the XGBoost JSON model reader and writer.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
@@ -100,5 +101,14 @@ impl HessboostError {
     /// A model document is missing the named field: ``missing `field` ``.
     pub fn missing_field(field: &str) -> Self {
         Self::model_format(format!("missing `{field}`"))
+    }
+
+    /// Convenience constructor for [`HessboostError::DimensionMismatch`].
+    pub(crate) fn dimension_mismatch(what: &'static str, expected: usize, got: usize) -> Self {
+        HessboostError::DimensionMismatch {
+            what,
+            expected,
+            got,
+        }
     }
 }

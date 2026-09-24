@@ -4,6 +4,7 @@ use crate::data::dmatrix::DMatrix;
 use crate::error::{HessboostError, Result};
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
+use std::str::FromStr;
 
 /// Parse error for 0-based `lineno` (reported 1-based).
 fn parse_err(lineno: usize, reason: impl Into<String>) -> HessboostError {
@@ -15,7 +16,7 @@ fn parse_err(lineno: usize, reason: impl Into<String>) -> HessboostError {
 
 /// Parse a numeric field, mapping failure to a line-anchored
 /// [`HessboostError::Parse`]. `what` names the field role in the message.
-fn parse_f32(field: &str, lineno: usize, what: &str) -> Result<f32> {
+fn parse_num<T: FromStr>(field: &str, lineno: usize, what: &str) -> Result<T> {
     field
         .parse()
         .map_err(|_| parse_err(lineno, format!("invalid {what} `{field}`")))
@@ -48,17 +49,14 @@ pub fn read_libsvm<R: Read>(reader: R) -> Result<DMatrix> {
         let label_tok = it
             .next()
             .ok_or_else(|| parse_err(lineno, "missing label"))?;
-        let label: f32 = parse_f32(label_tok, lineno, "label")?;
-        labels.push(label);
+        labels.push(parse_num(label_tok, lineno, "label")?);
 
         for tok in it {
             let (idx_s, val_s) = tok
                 .split_once(':')
                 .ok_or_else(|| parse_err(lineno, format!("expected idx:value, got `{tok}`")))?;
-            let idx: u32 = idx_s
-                .parse()
-                .map_err(|_| parse_err(lineno, format!("invalid index `{idx_s}`")))?;
-            let val: f32 = parse_f32(val_s, lineno, "value")?;
+            let idx: u32 = parse_num(idx_s, lineno, "index")?;
+            let val: f32 = parse_num(val_s, lineno, "value")?;
             indices.push(idx);
             values.push(val);
             max_index = max_index.max(idx);
@@ -105,7 +103,8 @@ pub fn load_csv(path: impl AsRef<Path>, opts: &CsvOptions) -> Result<DMatrix> {
 /// Parse CSV text from any reader.
 pub fn read_csv<R: Read>(reader: R, opts: &CsvOptions) -> Result<DMatrix> {
     let reader = BufReader::new(reader);
-    let mut rows: Vec<Vec<f32>> = Vec::new();
+    let mut flat: Vec<f32> = Vec::new();
+    let mut n_rows = 0;
     let mut labels: Vec<f32> = Vec::new();
     let mut n_cols: Option<usize> = None;
 
@@ -117,46 +116,40 @@ pub fn read_csv<R: Read>(reader: R, opts: &CsvOptions) -> Result<DMatrix> {
         if line.trim().is_empty() {
             continue;
         }
-        let fields: Vec<&str> = line.split(opts.delimiter).collect();
-        let mut feats = Vec::with_capacity(fields.len());
-        for (c, raw) in fields.iter().enumerate() {
+        let start = flat.len();
+        for (c, raw) in line.split(opts.delimiter).enumerate() {
             let field = raw.trim();
             if Some(c) == opts.label_column {
-                labels.push(parse_f32(field, lineno, "label")?);
+                labels.push(parse_num(field, lineno, "label")?);
                 continue;
             }
             let is_na = field.is_empty() || opts.na_value.as_deref() == Some(field);
-            let v = if is_na {
+            flat.push(if is_na {
                 f32::NAN
             } else {
-                parse_f32(field, lineno, "value")?
-            };
-            feats.push(v);
+                parse_num(field, lineno, "value")?
+            });
         }
+        let width = flat.len() - start;
         match n_cols {
-            None => n_cols = Some(feats.len()),
-            Some(expected) if expected != feats.len() => {
+            None => n_cols = Some(width),
+            Some(expected) if expected != width => {
                 return Err(parse_err(
                     lineno,
-                    format!("expected {expected} columns, got {}", feats.len()),
+                    format!("expected {expected} columns, got {width}"),
                 ));
             }
             _ => {}
         }
-        rows.push(feats);
+        n_rows += 1;
     }
 
     let n_cols = n_cols.ok_or(HessboostError::EmptyDataset("csv: no data rows"))?;
-    let n_rows = rows.len();
-    let mut flat = Vec::with_capacity(n_rows * n_cols);
-    for r in &rows {
-        flat.extend_from_slice(r);
-    }
     let d = DMatrix::from_dense(&flat, n_rows, n_cols)?;
-    if opts.label_column.is_some() && !labels.is_empty() {
-        d.with_labels(&labels)
-    } else {
+    if labels.is_empty() {
         Ok(d)
+    } else {
+        d.with_labels(&labels)
     }
 }
 

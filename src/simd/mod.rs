@@ -60,8 +60,8 @@ macro_rules! dispatch_unary_inplace {
     };
 }
 
-/// Run the per-arch gradient kernel when `$gate` (length plus
-/// `gradient_slices_cover`) holds, falling through to the caller's scalar
+/// Run the per-arch gradient kernel when `$gate` (typically `gradient_gate`
+/// or `metric_gate`) holds, falling through to the caller's scalar
 /// tail otherwise. The three-arm form also dispatches the `x86_64` kernel; the
 /// two-arm form is NEON-only for kernels with no `x86_64` counterpart. Both
 /// forms return the kernel's value, so `()`-valued gradient kernels and
@@ -143,21 +143,37 @@ pub(crate) fn count_le(cuts: &[f32], value: f32) -> usize {
     cuts.iter().filter(|&&cut| cut <= value).count()
 }
 
+/// Whether a gradient kernel may take the vector path: at least
+/// `MIN_SIMD_LEN` predictions, with labels, weights, and `out` covering them.
 #[inline]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn gradient_slices_cover(
-    len: usize,
-    labels: &[f32],
-    weights: Option<&[f32]>,
-    out: &[GradPair],
-) -> bool {
-    metric_slices_cover(len, labels, weights) && out.len() >= len
+fn gradient_gate(preds: &[f32], labels: &[f32], weights: Option<&[f32]>, out: &[GradPair]) -> bool {
+    metric_gate(preds, labels, weights) && out.len() >= preds.len()
 }
 
+/// Whether a metric-sum kernel may take the vector path: at least
+/// `MIN_SIMD_LEN` predictions, with labels and weights covering them.
 #[inline]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn metric_slices_cover(len: usize, labels: &[f32], weights: Option<&[f32]>) -> bool {
-    labels.len() >= len && weights.is_none_or(|values| values.len() >= len)
+fn metric_gate(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> bool {
+    let len = preds.len();
+    len >= MIN_SIMD_LEN && labels.len() >= len && weights.is_none_or(|values| values.len() >= len)
+}
+
+/// Whether `labels` (and `weights`, if any) index complete `num_class` rows
+/// of `preds`.
+#[inline]
+fn class_rows_cover(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    num_class: usize,
+) -> bool {
+    labels
+        .len()
+        .checked_mul(num_class)
+        .is_some_and(|len| preds.len() >= len)
+        && weights.is_none_or(|values| values.len() >= labels.len())
 }
 
 /// XGBoost's `common::Sigmoid`: `1 / (expf(min(-x, 88.7)) + 1)` (the
@@ -192,26 +208,16 @@ pub(crate) fn logistic_gradient(
     out: &mut [GradPair],
 ) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        gradient_gate(preds, labels, weights, out),
         aarch64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out),
         x86_64::logistic_gradient(preds, labels, weights, scale_pos_weight, min_hess, out)
     );
-    logistic_gradient_scalar(preds, labels, weights, scale_pos_weight, min_hess, out);
-}
-
-fn logistic_gradient_scalar(
-    preds: &[f32],
-    labels: &[f32],
-    weights: Option<&[f32]>,
-    scale_pos_weight: f32,
-    min_hess: f32,
-    out: &mut [GradPair],
-) {
     scalar::logistic_gradient(
         preds,
         labels,
         weights,
-        (scale_pos_weight, min_hess),
+        scale_pos_weight,
+        min_hess,
         out,
         0..preds.len(),
     );
@@ -225,7 +231,7 @@ pub(crate) fn poisson_gradient(
     out: &mut [GradPair],
 ) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        gradient_gate(preds, labels, weights, out),
         aarch64::poisson_gradient(preds, labels, weights, max_delta_step, out)
     );
     scalar::poisson_gradient(preds, labels, weights, max_delta_step, out, 0..preds.len());
@@ -238,7 +244,7 @@ pub(crate) fn gamma_gradient(
     out: &mut [GradPair],
 ) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        gradient_gate(preds, labels, weights, out),
         aarch64::gamma_gradient(preds, labels, weights, out)
     );
     scalar::gamma_gradient(preds, labels, weights, out, 0..preds.len());
@@ -252,7 +258,7 @@ pub(crate) fn tweedie_gradient(
     out: &mut [GradPair],
 ) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && gradient_slices_cover(preds.len(), labels, weights, out),
+        gradient_gate(preds, labels, weights, out),
         aarch64::tweedie_gradient(preds, labels, weights, rho, out)
     );
     scalar::tweedie_gradient(preds, labels, weights, rho, out, 0..preds.len());
@@ -456,7 +462,7 @@ fn distance_sum<const SQUARED: bool>(
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        metric_gate(preds, labels, weights),
         aarch64::distance_sum::<SQUARED>(preds, labels, weights)
     );
 
@@ -469,7 +475,7 @@ pub(crate) fn classification_error_sum(
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        metric_gate(preds, labels, weights),
         aarch64::classification_error_sum(preds, labels, weights)
     );
 
@@ -478,7 +484,7 @@ pub(crate) fn classification_error_sum(
 
 pub(crate) fn log_loss_sum(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> (f64, f64) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        metric_gate(preds, labels, weights),
         aarch64::log_loss_sum(preds, labels, weights)
     );
 
@@ -491,7 +497,7 @@ pub(crate) fn positive_nloglik_sum<const GAMMA: bool>(
     weights: Option<&[f32]>,
 ) -> (f64, f64) {
     dispatch_gradient!(
-        preds.len() >= MIN_SIMD_LEN && metric_slices_cover(preds.len(), labels, weights),
+        metric_gate(preds, labels, weights),
         aarch64::positive_nloglik_sum::<GAMMA>(preds, labels, weights)
     );
 
@@ -505,35 +511,11 @@ pub(crate) fn tweedie_nloglik_sum(
     rho: f64,
 ) -> (f64, f64) {
     dispatch_gradient!(
-        rho.is_finite()
-            && rho > 1.0
-            && rho < 2.0
-            && preds.len() >= MIN_SIMD_LEN
-            && metric_slices_cover(preds.len(), labels, weights),
+        rho.is_finite() && rho > 1.0 && rho < 2.0 && metric_gate(preds, labels, weights),
         aarch64::tweedie_nloglik_sum(preds, labels, weights, rho)
     );
 
-    tweedie_nloglik_sum_scalar(preds, labels, weights, rho)
-}
-
-pub(super) fn tweedie_nloglik_sum_scalar(
-    preds: &[f32],
-    labels: &[f32],
-    weights: Option<&[f32]>,
-    rho: f64,
-) -> (f64, f64) {
-    let mut loss = 0.0;
-    let mut weight_sum = 0.0;
-    for index in 0..preds.len() {
-        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
-        let prediction = f64::from(preds[index]).max(MIN_POSITIVE_PREDICTION);
-        let label = f64::from(labels[index]);
-        let first = label * prediction.powf(1.0 - rho) / (1.0 - rho);
-        let second = prediction.powf(2.0 - rho) / (2.0 - rho);
-        loss += weight * (-first + second);
-        weight_sum += weight;
-    }
-    (loss, weight_sum)
+    scalar::tweedie_nloglik(preds, labels, weights, rho, 0..preds.len())
 }
 
 pub(crate) fn multiclass_log_loss_sum(
@@ -542,36 +524,14 @@ pub(crate) fn multiclass_log_loss_sum(
     weights: Option<&[f32]>,
     num_class: usize,
 ) -> (f64, f64) {
-    let complete = labels
-        .len()
-        .checked_mul(num_class)
-        .is_some_and(|len| preds.len() >= len)
-        && weights.is_none_or(|values| values.len() >= labels.len());
+    let complete = class_rows_cover(preds, labels, weights, num_class);
     dispatch_gradient!(
         labels.len() >= MIN_SIMD_LEN && complete,
         aarch64::multiclass_log_loss_sum(preds, labels, weights, num_class)
     );
 
     debug_assert!(complete);
-    multiclass_log_loss_sum_scalar(preds, labels, weights, num_class)
-}
-
-pub(super) fn multiclass_log_loss_sum_scalar(
-    preds: &[f32],
-    labels: &[f32],
-    weights: Option<&[f32]>,
-    num_class: usize,
-) -> (f64, f64) {
-    let mut loss = 0.0;
-    let mut weight_sum = 0.0;
-    for (row, &label) in labels.iter().enumerate() {
-        let weight = weights.map_or(1.0, |values| f64::from(values[row]));
-        let probability =
-            f64::from(preds[row * num_class + label as usize]).clamp(LOG_LOSS_EPSILON, 1.0);
-        loss += -weight * probability.ln();
-        weight_sum += weight;
-    }
-    (loss, weight_sum)
+    scalar::multiclass_log_loss(preds, labels, weights, num_class, 0..labels.len())
 }
 
 pub(crate) fn multiclass_error_sum(
@@ -580,11 +540,7 @@ pub(crate) fn multiclass_error_sum(
     weights: Option<&[f32]>,
     num_class: usize,
 ) -> (f64, f64) {
-    let complete = labels
-        .len()
-        .checked_mul(num_class)
-        .is_some_and(|len| preds.len() >= len)
-        && weights.is_none_or(|values| values.len() >= labels.len());
+    let complete = class_rows_cover(preds, labels, weights, num_class);
     dispatch_gradient!(
         num_class >= 8
             && u32::try_from(num_class).is_ok()
@@ -594,15 +550,6 @@ pub(crate) fn multiclass_error_sum(
     );
 
     debug_assert!(complete);
-    multiclass_error_sum_scalar(preds, labels, weights, num_class)
-}
-
-fn multiclass_error_sum_scalar(
-    preds: &[f32],
-    labels: &[f32],
-    weights: Option<&[f32]>,
-    num_class: usize,
-) -> (f64, f64) {
     multiclass_error_sum_rows(preds, labels, weights, num_class, argmax_scalar)
 }
 

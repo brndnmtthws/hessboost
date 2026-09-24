@@ -1,6 +1,41 @@
-//! Regression tests for SHAP contribution accumulation across trees.
+//! SHAP contribution accumulation across trees.
 
+use hessboost::config::ObjectiveParams;
 use hessboost::prelude::*;
+
+/// One node of a hand-built native-JSON tree: an `x[feature] < 0.5` split
+/// (missing values go left), or a leaf when `left == right == -1`.
+fn node(feature: u32, left: i32, right: i32, value: f64, hess: f64) -> String {
+    format!(
+        r#"{{"split_feature": {feature}, "split_cond": 0.5, "default_left": true, "left": {left}, "right": {right}, "leaf_value": {value:e}, "sum_hess": {hess:e}, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}"#
+    )
+}
+
+/// The native-JSON `objective_params` object of a model without
+/// objective-specific parameters.
+fn default_objective_params() -> String {
+    serde_json::to_string(&ObjectiveParams::default()).unwrap()
+}
+
+/// A single-output squared-error model over `n_features` whose trees are
+/// the given [`node`] lists.
+fn scalar_model(trees: &[&[String]], n_features: usize) -> BoostedModel {
+    let trees: Vec<String> = trees
+        .iter()
+        .map(|nodes| {
+            format!(
+                r#"{{"nodes": [{}], "categories": [], "size_leaf_vector": 0, "leaf_vectors": []}}"#,
+                nodes.join(", ")
+            )
+        })
+        .collect();
+    BoostedModel::from_json(&format!(
+        r#"{{"trees": [{}], "tree_weights": [], "base_score": [0.0], "objective": "reg:squarederror", "objective_params": {}, "num_class": 0, "n_outputs": 1, "n_targets": 1, "num_parallel_tree": 1, "n_features": {n_features}}}"#,
+        trees.join(", "),
+        default_objective_params()
+    ))
+    .unwrap()
+}
 
 /// A later constant tree must not round away an earlier tree's contribution.
 ///
@@ -13,37 +48,23 @@ use hessboost::prelude::*;
 /// diagonal loses the +2 in both implementations).
 #[test]
 fn contributions_survive_a_later_constant_tree() {
-    let huge = (1u64 << 60) as f32;
-    let model_json = format!(
-        r#"{{
-  "trees": [
-    {{
-      "nodes": [
-        {{"split_feature": 0, "split_cond": 0.5, "default_left": false, "left": 1, "right": 2, "leaf_value": 0.0, "sum_hess": 2.0, "split_gain": 1.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}},
-        {{"split_feature": 0, "split_cond": 0.0, "default_left": true, "left": -1, "right": -1, "leaf_value": -2.0, "sum_hess": 1.0, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}},
-        {{"split_feature": 0, "split_cond": 0.0, "default_left": true, "left": -1, "right": -1, "leaf_value": 2.0, "sum_hess": 1.0, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}
-      ]
-    }},
-    {{
-      "nodes": [
-        {{"split_feature": 0, "split_cond": 0.5, "default_left": false, "left": 1, "right": 2, "leaf_value": 0.0, "sum_hess": 2.0, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}},
-        {{"split_feature": 0, "split_cond": 0.0, "default_left": true, "left": -1, "right": -1, "leaf_value": {huge}, "sum_hess": 1.0, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}},
-        {{"split_feature": 0, "split_cond": 0.0, "default_left": true, "left": -1, "right": -1, "leaf_value": {huge}, "sum_hess": 1.0, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}
-      ]
-    }}
-  ],
-  "base_score": [0.0],
-  "objective": "reg:squarederror",
-  "num_class": 0,
-  "n_outputs": 1,
-  "n_features": 1
-}}"#
+    let huge = 2f64.powi(60);
+    let model = scalar_model(
+        &[
+            &[
+                node(0, 1, 2, 0.0, 2.0),
+                node(0, -1, -1, -2.0, 1.0),
+                node(0, -1, -1, 2.0, 1.0),
+            ],
+            &[
+                node(0, 1, 2, 0.0, 2.0),
+                node(0, -1, -1, huge, 1.0),
+                node(0, -1, -1, huge, 1.0),
+            ],
+        ],
+        1,
     );
-    let model = BoostedModel::from_json(&model_json).unwrap();
-    let row = DMatrix::from_dense(&[0.7f32], 1, 1)
-        .unwrap()
-        .with_labels(&[0f32])
-        .unwrap();
+    let row = DMatrix::from_dense(&[0.7f32], 1, 1).unwrap();
 
     // One row of [feature 0, bias].
     let contribs = model.predict_contribs(&row).unwrap();
@@ -57,21 +78,17 @@ fn contributions_survive_a_later_constant_tree() {
 /// `pred_contribs` / `pred_interactions` on the same model.
 #[test]
 fn zero_cover_splits_average_their_children() {
-    let node = |feature: u32, left: i32, right: i32, value: f32| {
-        format!(
-            r#"{{"split_feature": {feature}, "split_cond": 0.5, "default_left": true, "left": {left}, "right": {right}, "leaf_value": {value}, "sum_hess": 0.0, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}"#
-        )
-    };
     // x0 < 0.5 ? -1 : (x1 < 0.5 ? 2 : 4), every node with zero cover.
-    let model_json = format!(
-        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}]}}], "base_score": [0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 1, "n_features": 2}}"#,
-        node(0, 1, 2, 0.0),
-        node(0, -1, -1, -1.0),
-        node(1, 3, 4, 0.0),
-        node(0, -1, -1, 2.0),
-        node(0, -1, -1, 4.0),
+    let model = scalar_model(
+        &[&[
+            node(0, 1, 2, 0.0, 0.0),
+            node(0, -1, -1, -1.0, 0.0),
+            node(1, 3, 4, 0.0, 0.0),
+            node(0, -1, -1, 2.0, 0.0),
+            node(0, -1, -1, 4.0, 0.0),
+        ]],
+        2,
     );
-    let model = BoostedModel::from_json(&model_json).unwrap();
     let row = DMatrix::from_dense(&[0.7f32, 0.2], 1, 2).unwrap();
 
     // E[f] = 0.5 * -1 + 0.25 * 2 + 0.25 * 4 = 1; margin 2.
@@ -87,28 +104,24 @@ fn zero_cover_splits_average_their_children() {
 /// A feature repeated down a path overwrites its probability: the basis is
 /// multiplied by the new factor and divided by the old one. With hot-child
 /// covers `1 → 2^-32 → 2^-64 → 2^-96` the third split's product exceeds
-/// `f32` before the division although the resulting basis is representable;
-/// computing it in that order turned every attribution into `NaN`.
+/// `f32` if formed before the division, although the resulting basis is
+/// representable; every attribution must stay finite.
 #[test]
 fn repeated_feature_basis_update_stays_finite() {
-    let node = |left: i32, right: i32, value: f32, hess: f64| {
-        format!(
-            r#"{{"split_feature": 0, "split_cond": 0.5, "default_left": true, "left": {left}, "right": {right}, "leaf_value": {value}, "sum_hess": {hess:e}, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}"#
-        )
-    };
     let cover = |e: i32| 2f64.powi(-e);
     // x0 < 0.5 three times reaches the only non-zero leaf.
-    let model_json = format!(
-        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}, {}, {}]}}], "base_score": [0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 1, "n_features": 1}}"#,
-        node(1, 2, 0.0, cover(0)),
-        node(3, 4, 0.0, cover(32)),
-        node(-1, -1, 0.0, cover(0)),
-        node(5, 6, 0.0, cover(64)),
-        node(-1, -1, 0.0, cover(32)),
-        node(-1, -1, 1.0, cover(96)),
-        node(-1, -1, 0.0, cover(64)),
+    let model = scalar_model(
+        &[&[
+            node(0, 1, 2, 0.0, cover(0)),
+            node(0, 3, 4, 0.0, cover(32)),
+            node(0, -1, -1, 0.0, cover(0)),
+            node(0, 5, 6, 0.0, cover(64)),
+            node(0, -1, -1, 0.0, cover(32)),
+            node(0, -1, -1, 1.0, cover(96)),
+            node(0, -1, -1, 0.0, cover(64)),
+        ]],
+        1,
     );
-    let model = BoostedModel::from_json(&model_json).unwrap();
     let row = DMatrix::from_dense(&[0.2f32], 1, 1).unwrap();
     assert_eq!(model.predict_margin(&row).unwrap(), [1.0]);
 
@@ -131,20 +144,16 @@ fn repeated_feature_basis_update_stays_finite() {
 /// `-2^60` in the right subtree and reports `0`.
 #[test]
 fn vector_leaf_bias_accumulates_leaves_top_down() {
-    let node = |feature: u32, left: i32, right: i32, hess: f32| {
-        format!(
-            r#"{{"split_feature": {feature}, "split_cond": 0.5, "default_left": true, "left": {left}, "right": {right}, "leaf_value": 0.0, "sum_hess": {hess}, "split_gain": 0.0, "is_categorical": false, "cat_begin": 0, "cat_end": 0}}"#
-        )
-    };
     let huge = 2f64.powi(60);
     let model_json = format!(
-        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}], "size_leaf_vector": 2, "leaf_vectors": [0.0, 0.0, {huge:e}, 0.0, 0.0, 0.0, {neg:e}, 0.0, 1.0, 0.0]}}], "base_score": [0.0, 0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 2, "n_targets": 2, "n_features": 2}}"#,
-        node(0, 1, 2, 3.0),
-        node(0, -1, -1, 1.0),
-        node(1, 3, 4, 2.0),
-        node(0, -1, -1, 1.0),
-        node(0, -1, -1, 1.0),
+        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}], "categories": [], "size_leaf_vector": 2, "leaf_vectors": [0.0, 0.0, {huge:e}, 0.0, 0.0, 0.0, {neg:e}, 0.0, 1.0, 0.0]}}], "tree_weights": [], "base_score": [0.0, 0.0], "objective": "reg:squarederror", "objective_params": {objective_params}, "num_class": 0, "n_outputs": 2, "n_targets": 2, "num_parallel_tree": 1, "n_features": 2}}"#,
+        node(0, 1, 2, 0.0, 3.0),
+        node(0, -1, -1, 0.0, 1.0),
+        node(1, 3, 4, 0.0, 2.0),
+        node(0, -1, -1, 0.0, 1.0),
+        node(0, -1, -1, 0.0, 1.0),
         neg = -huge,
+        objective_params = default_objective_params(),
     );
     let model = BoostedModel::from_json(&model_json).unwrap();
     let row = DMatrix::from_dense(&[0.7f32, 0.7], 1, 2).unwrap();

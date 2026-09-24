@@ -194,10 +194,10 @@ impl SymmetricTables {
 #[cfg(test)]
 mod tests {
     use crate::config::{GrowPolicy, TrainingParams, TreeMethod};
-    use crate::data::DMatrix;
     use crate::learner::train;
+    use crate::test_support::labeled_dense;
     use crate::tree::RegTree;
-    use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, key};
+    use crate::tree::compact::{CompactForest, LANES, split_lanes};
 
     /// Level 0: `f0 < 0.5`, missing left. Level 1: `f1 < 2`, missing right,
     /// on the left child only; the right child is a collapsed leaf. Level 2:
@@ -249,7 +249,7 @@ mod tests {
         ];
         (0..n * n_cols)
             .map(|i| {
-                let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+                let h = (i as u64).wrapping_mul(crate::rng::GOLDEN) >> 40;
                 if h.is_multiple_of(3) {
                     specials[(h / 3) as usize % specials.len()]
                 } else {
@@ -257,31 +257,6 @@ mod tests {
                 }
             })
             .collect()
-    }
-
-    /// Keyed lane-major groups plus the row-major tail, as the batch kernel
-    /// consumes them.
-    fn split_lanes(rows: &[f32], n_cols: usize) -> (Vec<u32>, &[f32]) {
-        let groups = rows.len() / n_cols / LANES;
-        let mut lanes = vec![0u32; groups * FEATURE_LANES * n_cols];
-        for g in 0..groups {
-            for j in 0..LANES {
-                for f in 0..n_cols {
-                    let v = rows[(g * LANES + j) * n_cols + f];
-                    let base = g * FEATURE_LANES * n_cols + f * FEATURE_LANES + j;
-                    lanes[base] = key(v);
-                    lanes[base + LANES] = key(-v);
-                }
-            }
-        }
-        (lanes, &rows[groups * LANES * n_cols..])
-    }
-
-    fn reference_leaf(tree: &RegTree, row: &[f32]) -> usize {
-        tree.leaf_id_with(|f| {
-            let v = row[f as usize];
-            (!v.is_nan()).then_some(v)
-        })
     }
 
     #[test]
@@ -312,7 +287,7 @@ mod tests {
             let mut leaves = vec![0u32; n];
             forest.original_leaf_ids(t, &lanes, tail, n_cols, n, &mut leaves, 1);
             for (r, row) in data.chunks_exact(n_cols).enumerate() {
-                let leaf = reference_leaf(tree, row);
+                let leaf = tree.leaf_id_dense(row, f32::NAN);
                 assert_eq!(leaves[r] as usize, leaf, "tree {t} row {r} {row:?}");
                 let want = 0.25f32 + tree.node(leaf).leaf_value;
                 assert_eq!(margins[r].to_bits(), want.to_bits());
@@ -332,10 +307,7 @@ mod tests {
             .chunks_exact(n_cols)
             .map(|r| r.iter().filter(|v| !v.is_nan()).map(|v| v.sin()).sum())
             .collect();
-        let data = DMatrix::from_dense(&x, n, n_cols)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let data = labeled_dense(&x, n, n_cols, &y);
         let params = TrainingParams::builder()
             .tree_method(TreeMethod::Hist)
             .grow_policy(GrowPolicy::Symmetric)
@@ -351,7 +323,7 @@ mod tests {
         for (r, row) in x.chunks_exact(n_cols).enumerate() {
             let mut want = model.base_score();
             for (t, tree) in model.trees().iter().enumerate() {
-                let leaf = reference_leaf(tree, row);
+                let leaf = tree.leaf_id_dense(row, f32::NAN);
                 assert_eq!(leaves[r * model.num_trees() + t] as usize, leaf);
                 want += 1.0 * tree.node(leaf).leaf_value;
             }

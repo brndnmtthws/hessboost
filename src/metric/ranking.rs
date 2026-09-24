@@ -1,6 +1,7 @@
 //! Precision at `k` (`pre`, `pre@k`) for learning to rank.
 
-use super::{Metric, argsort_desc, consistent, group_ranges};
+use super::{Metric, argsort_desc, group_ranges};
+use crate::K_RT_EPS_F32;
 
 /// XGBoost's default ranking cutoff (`LambdaRankParam::DefaultK`), used by
 /// `pre` without an `@k` suffix.
@@ -52,11 +53,9 @@ impl Metric for Precision {
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> f64 {
-        if !consistent(preds, labels, weights, 1) {
-            return f64::NAN;
-        }
-        // XGBoost `IsBinaryRel` with `kRtEps`.
-        let binary = |y: f32| (y - 1.0).abs() < 1e-6 || y.abs() < 1e-6;
+        nan_unless_consistent!(preds, labels, weights, 1);
+        // XGBoost `IsBinaryRel`.
+        let binary = |y: f32| (y - 1.0).abs() < K_RT_EPS_F32 || y.abs() < K_RT_EPS_F32;
         if !labels.iter().all(|&y| binary(y)) {
             return f64::NAN;
         }
@@ -128,8 +127,8 @@ mod tests {
         assert!(v.is_nan());
     }
 
-    /// `pre` reports XGBoost's names and maximizes; a zero cutoff and a zero
-    /// `mphe` slope are parameter errors rather than NaN scores.
+    /// `pre` reports XGBoost's names and maximizes; a zero `mphe` slope is a
+    /// parameter error rather than a NaN score.
     #[test]
     fn factory_names_and_rejections() {
         use crate::config::{ObjectiveParams, TrainingParams};
@@ -140,7 +139,6 @@ mod tests {
             assert_eq!(m.name(), name);
             assert!(m.maximize());
         }
-        assert!(create_metric("pre@0", 0, &defaults).is_err());
         let flat = ObjectiveParams {
             huber_slope: 0.0,
             ..defaults

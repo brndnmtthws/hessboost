@@ -7,6 +7,7 @@
 //!
 //! Run with: `cargo run --release --example budget`
 
+use hessboost::metric::{LogLoss, Rmse};
 use hessboost::prelude::*;
 use std::time::Instant;
 
@@ -52,27 +53,6 @@ fn binary(n: usize, seed: u64) -> Result<DMatrix> {
     DMatrix::from_dense(&x, n, N_FEATURES)?.with_labels(&y)
 }
 
-fn rmse(preds: &[f32], labels: &[f32]) -> f64 {
-    let sse: f64 = preds
-        .iter()
-        .zip(labels)
-        .map(|(p, y)| f64::from(p - y).powi(2))
-        .sum();
-    (sse / preds.len() as f64).sqrt()
-}
-
-fn logloss(probs: &[f32], labels: &[f32]) -> f64 {
-    let total: f64 = probs
-        .iter()
-        .zip(labels)
-        .map(|(&p, &y)| {
-            let p = f64::from(p).clamp(1e-15, 1.0 - 1e-15);
-            -(f64::from(y) * p.ln() + (1.0 - f64::from(y)) * (1.0 - p).ln())
-        })
-        .sum();
-    total / probs.len() as f64
-}
-
 /// Mean leaves per tree over the first `trees` trees.
 fn mean_leaves(model: &BoostedModel, trees: usize) -> f64 {
     let leaves: usize = model.trees()[..trees]
@@ -93,16 +73,12 @@ fn report(
     dtrain: &DMatrix,
     dvalid: &DMatrix,
     dtest: &DMatrix,
-    score: fn(&[f32], &[f32]) -> f64,
+    metric: &dyn Metric,
 ) -> Result<()> {
     let labels = dtest.labels().unwrap_or_default();
+    let score = |preds: &[f32]| metric.eval(preds, labels, None);
     let params = TrainingParams::builder().objective(objective).build()?;
-    let metric = if objective == "binary:logistic" {
-        "logloss"
-    } else {
-        "rmse"
-    };
-    println!("{task} (test {metric}):");
+    println!("{task} (test {}):", metric.name());
     println!(
         "  {:<34} {:>6} {:>7} {:>9} {:>8}",
         "method", "trees", "leaves", "score", "seconds"
@@ -111,7 +87,7 @@ fn report(
     let start = Instant::now();
     let model = train(&params, dtrain, 100)?;
     let seconds = start.elapsed().as_secs_f64();
-    let value = score(&model.predict(dtest)?, labels);
+    let value = score(&model.predict(dtest)?);
     row(
         "default (eta 0.3, depth 6, 100)",
         &model,
@@ -130,7 +106,7 @@ fn report(
     let tuned = train_with_eval(&tuned_params, dtrain, 2000, &[(dvalid, "valid")], Some(50))?.model;
     let seconds = start.elapsed().as_secs_f64();
     let rounds = tuned.best_iteration().map_or(tuned.num_trees(), |b| b + 1);
-    let value = score(&tuned.predict(dtest)?, labels);
+    let value = score(&tuned.predict(dtest)?);
     row(
         "tuned (eta 0.05, early stopping)",
         &tuned,
@@ -143,7 +119,7 @@ fn report(
         let start = Instant::now();
         let result = train_with_budget(&params, dtrain, &BudgetConfig::new(budget))?;
         let seconds = start.elapsed().as_secs_f64();
-        let value = score(&result.model.predict(dtest)?, labels);
+        let value = score(&result.model.predict(dtest)?);
         let label = format!("budget {budget} (eta {:.3}, {:?})", result.eta, result.stop);
         row(
             &label,
@@ -164,7 +140,7 @@ fn main() -> Result<()> {
         &regression(5000, 1)?,
         &regression(2000, 2)?,
         &regression(10_000, 3)?,
-        rmse,
+        &Rmse,
     )?;
     report(
         "Friedman #1 binary classification, 5000 rows",
@@ -172,7 +148,7 @@ fn main() -> Result<()> {
         &binary(5000, 4)?,
         &binary(2000, 5)?,
         &binary(10_000, 6)?,
-        logloss,
+        &LogLoss,
     )?;
     Ok(())
 }

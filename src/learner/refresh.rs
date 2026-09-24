@@ -47,13 +47,12 @@ pub(super) fn refresh_tree(
         min_child_weight: 0.0,
         ..RegParams::from_params(params)
     };
-    let refresh_leaf = params.refresh_leaf;
     let stats = node_stats(tree, data, gpair);
     for nid in 0..tree.num_nodes() {
         let node = *tree.node(nid);
         tree.set_sum_hess(nid, stats[nid].hess as f32);
         if node.is_leaf() {
-            if refresh_leaf {
+            if params.refresh_leaf {
                 let base_weight = calc_weight(stats[nid], reg) as f32;
                 tree.set_leaf_value(nid, base_weight * learning_rate);
             }
@@ -117,7 +116,6 @@ fn node_stats_batched(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TrainingParams;
 
     /// Stump on feature 0 at 0.5 (missing left) with placeholder statistics.
     fn stump() -> RegTree {

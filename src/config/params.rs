@@ -453,6 +453,33 @@ fn ensure(name: &'static str, ok: bool, reason: impl Into<String>) -> Result<()>
     }
 }
 
+/// [`ensure`] that `v` is finite and in `[0, 1]`.
+fn unit(name: &'static str, v: f64) -> Result<()> {
+    ensure(
+        name,
+        v.is_finite() && (0.0..=1.0).contains(&v),
+        format!("must be in [0, 1], got {v}"),
+    )
+}
+
+/// [`ensure`] that `v` is finite and `> 0`.
+fn positive(name: &'static str, v: f64) -> Result<()> {
+    ensure(
+        name,
+        v.is_finite() && v > 0.0,
+        format!("must be > 0, got {v}"),
+    )
+}
+
+/// [`ensure`] that `v` is finite and `>= 0`.
+fn non_negative(name: &'static str, v: f64) -> Result<()> {
+    ensure(
+        name,
+        v.is_finite() && v >= 0.0,
+        format!("must be >= 0, got {v}"),
+    )
+}
+
 impl TrainingParams {
     /// Start a builder for ergonomic, chained configuration.
     pub fn builder() -> TrainingParamsBuilder {
@@ -463,28 +490,6 @@ impl TrainingParams {
 
     /// Validate mutually-consistent ranges. Called automatically before training.
     pub fn validate(&self) -> Result<()> {
-        let unit = |name: &'static str, v: f64| -> Result<()> {
-            ensure(
-                name,
-                v.is_finite() && (0.0..=1.0).contains(&v),
-                format!("must be in [0, 1], got {v}"),
-            )
-        };
-        let positive = |name: &'static str, v: f64| -> Result<()> {
-            ensure(
-                name,
-                v.is_finite() && v > 0.0,
-                format!("must be > 0, got {v}"),
-            )
-        };
-        let non_negative = |name: &'static str, v: f64| -> Result<()> {
-            ensure(
-                name,
-                v.is_finite() && v >= 0.0,
-                format!("must be >= 0, got {v}"),
-            )
-        };
-
         positive("eta", self.eta)?;
         non_negative("gamma", self.gamma)?;
         non_negative("min_child_weight", self.min_child_weight)?;
@@ -663,22 +668,16 @@ impl TrainingParams {
     /// replaces with its level-wise search, so they are refused there too;
     /// linear leaves are fitted after growth and apply to symmetric trees.
     fn validate_tree_options(&self) -> Result<()> {
-        for (name, value) in [
-            ("path_smooth", self.path_smooth),
-            ("linear_lambda", self.linear_lambda),
-        ] {
-            ensure(
-                name,
-                value.is_finite() && value >= 0.0,
-                format!("must be >= 0, got {value}"),
-            )?;
-        }
+        non_negative("path_smooth", self.path_smooth)?;
+        non_negative("linear_lambda", self.linear_lambda)?;
+        // The compatibility checks do not depend on the option, so the first
+        // enabled one names the error.
         let enabled = [
             ("extra_trees", self.extra_trees),
             ("path_smooth", self.path_smooth > 0.0),
             ("linear_tree", self.linear_tree),
         ];
-        for (name, _) in enabled.into_iter().filter(|&(_, on)| on) {
+        if let Some(&(name, _)) = enabled.iter().find(|&&(_, on)| on) {
             ensure(
                 name,
                 self.booster != BoosterKind::GbLinear,
@@ -695,7 +694,7 @@ impl TrainingParams {
                 "is not supported with `multi_strategy=multi_output_tree`",
             )?;
         }
-        for (name, _) in enabled[..2].iter().filter(|&&(_, on)| on) {
+        if let Some(&(name, _)) = enabled[..2].iter().find(|&&(_, on)| on) {
             ensure(
                 name,
                 self.grow_policy != GrowPolicy::Symmetric,
@@ -751,27 +750,20 @@ pub struct ObjectiveParams {
     /// XGBoost `lambdarank_num_pair_per_sample` (`lambdarank_param`).
     pub lambdarank_num_pair_per_sample: usize,
     /// XGBoost `quantile_alpha` (`reg:quantileerror`).
-    #[serde(default)]
     pub quantile_alpha: Vec<f64>,
     /// XGBoost `expectile_alpha` (`reg:expectileerror`).
-    #[serde(default)]
     pub expectile_alpha: Vec<f64>,
     /// XGBoost `aft_loss_distribution` (`survival:aft`).
-    #[serde(default)]
     pub aft_loss_distribution: AftDistribution,
     /// XGBoost `aft_loss_distribution_scale` (`survival:aft`).
-    #[serde(default = "default_aft_scale")]
     pub aft_loss_distribution_scale: f64,
     /// Second-order statistic of the `dist:*` objectives (beyond XGBoost).
-    #[serde(default)]
     pub dist_gradient: DistGradient,
     /// Shared-tree split direction of the `dist:*` objectives (beyond
     /// XGBoost).
-    #[serde(default)]
     pub dist_split_direction: DistSplitDirection,
     /// The distribution family of a `dist:*` objective, derived from the
     /// objective name (not a parameter): the `nll` / `crps` metrics read it.
-    #[serde(default)]
     pub distribution: Option<crate::objective::DistFamily>,
 }
 
@@ -823,12 +815,6 @@ impl ObjectiveParams {
             .dist_gradient(self.dist_gradient)
             .dist_split_direction(self.dist_split_direction)
     }
-}
-
-/// Serde default of [`ObjectiveParams::aft_loss_distribution_scale`]
-/// (XGBoost's `1.0`), for models written before the field existed.
-fn default_aft_scale() -> f64 {
-    1.0
 }
 
 impl Default for ObjectiveParams {
@@ -1008,6 +994,14 @@ impl TrainingParamsBuilder {
 mod tests {
     use super::*;
 
+    /// The parameter `builder.build()` rejects, if any.
+    fn rejected(builder: TrainingParamsBuilder) -> Option<&'static str> {
+        match builder.build() {
+            Err(HessboostError::InvalidParameter { name, .. }) => Some(name),
+            _ => None,
+        }
+    }
+
     #[test]
     fn defaults_match_xgboost() {
         let p = TrainingParams::default();
@@ -1043,64 +1037,51 @@ mod tests {
 
     #[test]
     fn rejects_bad_params() {
-        assert!(TrainingParams::builder().eta(0.0).build().is_err());
-        assert!(TrainingParams::builder().subsample(1.5).build().is_err());
-        assert!(TrainingParams::builder().lambda(-1.0).build().is_err());
-        assert!(TrainingParams::builder().max_bin(1).build().is_err());
+        let b = TrainingParams::builder;
+        for (name, builder) in [
+            ("eta", b().eta(0.0)),
+            ("subsample", b().subsample(1.5)),
+            ("lambda", b().lambda(-1.0)),
+            ("max_bin", b().max_bin(1)),
+            ("tweedie_variance_power", b().tweedie_variance_power(2.0)),
+            // Passes the f64 range but rounds to 2.0 in f32, where the objective runs.
+            (
+                "tweedie_variance_power",
+                b().tweedie_variance_power(2.0 - f64::EPSILON),
+            ),
+            ("huber_slope", b().huber_slope(0.0)),
+            // Finite and positive in f64, but the f32 square overflows / vanishes.
+            ("huber_slope", b().huber_slope(2e19)),
+            ("huber_slope", b().huber_slope(1e-30)),
+            (
+                "lambdarank_num_pair_per_sample",
+                b().lambdarank_num_pair_per_sample(0),
+            ),
+            ("max_delta_step", b().max_delta_step(-1.0)),
+            ("num_parallel_tree", b().num_parallel_tree(0)),
+            // Lossguide growth needs a leaf or depth bound.
+            (
+                "max_leaves",
+                b().grow_policy(GrowPolicy::LossGuide)
+                    .max_depth(0)
+                    .max_leaves(0),
+            ),
+        ] {
+            assert_eq!(rejected(builder), Some(name));
+        }
+        assert!(b().tweedie_variance_power(1.0).build().is_ok());
         assert!(
-            TrainingParams::builder()
-                .tweedie_variance_power(2.0)
-                .build()
-                .is_err()
-        );
-        // Passes the f64 range but rounds to 2.0 in f32, where the objective runs.
-        assert!(
-            TrainingParams::builder()
-                .tweedie_variance_power(2.0 - f64::EPSILON)
-                .build()
-                .is_err()
-        );
-        assert!(
-            TrainingParams::builder()
-                .tweedie_variance_power(1.0)
+            b().grow_policy(GrowPolicy::LossGuide)
+                .max_leaves(31)
                 .build()
                 .is_ok()
-        );
-        assert!(TrainingParams::builder().huber_slope(0.0).build().is_err());
-        // Finite and positive in f64, but the f32 square overflows / vanishes.
-        assert!(TrainingParams::builder().huber_slope(2e19).build().is_err());
-        assert!(
-            TrainingParams::builder()
-                .huber_slope(1e-30)
-                .build()
-                .is_err()
-        );
-        assert!(
-            TrainingParams::builder()
-                .lambdarank_num_pair_per_sample(0)
-                .build()
-                .is_err()
-        );
-        assert!(
-            TrainingParams::builder()
-                .max_delta_step(-1.0)
-                .build()
-                .is_err()
-        );
-        assert!(
-            TrainingParams::builder()
-                .num_parallel_tree(0)
-                .build()
-                .is_err()
         );
         // Positive finite `f64` scales that become infinite or zero once
         // narrowed to the `f32` the objective and metric compute in.
         for scale in [0.0, -1.0, f64::INFINITY, f64::NAN, 1e100, 1e-50] {
-            assert!(
-                TrainingParams::builder()
-                    .aft_loss_distribution_scale(scale)
-                    .build()
-                    .is_err(),
+            assert_eq!(
+                rejected(b().aft_loss_distribution_scale(scale)),
+                Some("aft_loss_distribution_scale"),
                 "scale {scale}"
             );
         }
@@ -1124,11 +1105,11 @@ mod tests {
         assert_eq!(TrainingParams::default().effective_max_delta_step(), 0.0);
     }
 
-    /// The roadmap parameters take XGBoost's names on the wire, so JSON
+    /// Parameters take XGBoost's names on the wire, so JSON
     /// configurations written for XGBoost deserialize unchanged, and a
     /// configuration that omits them gets XGBoost's defaults.
     #[test]
-    fn roadmap_params_use_xgboost_spellings_and_defaults() {
+    fn params_use_xgboost_spellings_and_defaults() {
         let p: TrainingParams = serde_json::from_str(
             r#"{"aft_loss_distribution": "extreme", "sampling_method": "gradient_based",
                 "multi_strategy": "multi_output_tree", "process_type": "update",
@@ -1159,7 +1140,7 @@ mod tests {
     /// A trained model rebuilds its objective from `ObjectiveParams`, so the
     /// objective-specific parameters must survive the snapshot/restore trip.
     #[test]
-    fn objective_params_round_trip_roadmap_fields() {
+    fn objective_params_round_trip_objective_fields() {
         let p = TrainingParams::builder()
             .objective("survival:aft")
             .quantile_alpha(vec![0.25, 0.75])
@@ -1178,22 +1159,6 @@ mod tests {
         assert_eq!(ObjectiveParams::from_params(&restored), snapshot);
     }
 
-    #[test]
-    fn lossguide_requires_bound() {
-        let r = TrainingParams::builder()
-            .grow_policy(GrowPolicy::LossGuide)
-            .max_depth(0)
-            .max_leaves(0)
-            .build();
-        assert!(r.is_err());
-        // With a leaf bound it is fine.
-        TrainingParams::builder()
-            .grow_policy(GrowPolicy::LossGuide)
-            .max_leaves(31)
-            .build()
-            .unwrap();
-    }
-
     /// Reuse penalties apply in the XGBoost split searches only; the LightGBM
     /// split search and symmetric growth would silently ignore them.
     #[test]
@@ -1204,10 +1169,7 @@ mod tests {
             toad().path_smooth(1.0),
             toad().grow_policy(GrowPolicy::Symmetric).max_depth(3),
         ] {
-            assert!(matches!(
-                params.build(),
-                Err(HessboostError::InvalidParameter { name, .. }) if name == "toad_penalty_feature"
-            ));
+            assert_eq!(rejected(params), Some("toad_penalty_feature"));
         }
         assert!(toad().linear_tree(true).build().is_ok());
     }
@@ -1221,17 +1183,17 @@ mod tests {
                 .use_quantized_grad(true)
                 .max_depth(3)
         };
-        assert!(matches!(
-            q().grow_policy(GrowPolicy::Symmetric).build(),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "use_quantized_grad"
-        ));
+        assert_eq!(
+            rejected(q().grow_policy(GrowPolicy::Symmetric)),
+            Some("use_quantized_grad")
+        );
         assert!(q().grow_policy(GrowPolicy::LossGuide).build().is_ok());
         // Leaf renewal would be discarded: path-smoothed leaves keep the
         // outputs their quantized splits recorded.
-        assert!(matches!(
-            q().quant_train_renew_leaf(true).path_smooth(1.0).build(),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "quant_train_renew_leaf"
-        ));
+        assert_eq!(
+            rejected(q().quant_train_renew_leaf(true).path_smooth(1.0)),
+            Some("quant_train_renew_leaf")
+        );
         assert!(q().quant_train_renew_leaf(true).build().is_ok());
         assert!(q().path_smooth(1.0).build().is_ok());
     }
@@ -1245,10 +1207,10 @@ mod tests {
                 .grow_policy(GrowPolicy::Symmetric)
                 .max_depth(3)
         };
-        assert!(matches!(
-            sym().booster(BoosterKind::GbLinear).build(),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "grow_policy"
-        ));
+        assert_eq!(
+            rejected(sym().booster(BoosterKind::GbLinear)),
+            Some("grow_policy")
+        );
         assert!(sym().booster(BoosterKind::Dart).build().is_ok());
     }
 }

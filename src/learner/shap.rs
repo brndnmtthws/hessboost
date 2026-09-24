@@ -38,7 +38,7 @@
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::learner::model::{BoostedModel, RowBlock};
-use crate::tree::RegTree;
+use crate::tree::{RegTree, in_category_set};
 use rayon::prelude::*;
 use std::sync::LazyLock;
 
@@ -172,27 +172,34 @@ fn edge_delta(rule: &QuadratureRule, h: &Lanes, p_enter: f32, p_exit: f32) -> f3
     acc
 }
 
+/// The per-lane factor `α_enter / (1 + α_enter·u) - α_exit / (1 + α_exit·u)`
+/// of a return edge, shared by every [`interaction_delta`] of that edge.
+fn edge_factors(rule: &QuadratureRule, p_enter: f32, p_exit: f32) -> Lanes {
+    let alpha_enter = p_enter - 1.0;
+    let mut edge = [0.0; POINTS];
+    if p_exit == 1.0 {
+        for (e, &u) in edge.iter_mut().zip(&rule.nodes) {
+            *e = alpha_enter / madd(alpha_enter, u, 1.0);
+        }
+    } else {
+        let alpha_exit = p_exit - 1.0;
+        for (e, &u) in edge.iter_mut().zip(&rule.nodes) {
+            *e = alpha_enter / madd(alpha_enter, u, 1.0) - alpha_exit / madd(alpha_exit, u, 1.0);
+        }
+    }
+    edge
+}
+
 /// The part of [`edge_delta`] attributable to a path partner currently
-/// entered with probability `q`.
-fn interaction_delta(rule: &QuadratureRule, h: &Lanes, p_enter: f32, p_exit: f32, q: f32) -> f32 {
+/// entered with probability `q`, given the edge's [`edge_factors`].
+fn interaction_delta(rule: &QuadratureRule, h: &Lanes, edge: &Lanes, q: f32) -> f32 {
     if q == 1.0 {
         return 0.0;
     }
     let alpha_q = q - 1.0;
-    let alpha_enter = p_enter - 1.0;
     let mut acc = 0.0f32;
-    if p_exit == 1.0 {
-        for (&hi, &u) in h.iter().zip(&rule.nodes) {
-            let edge = alpha_enter / madd(alpha_enter, u, 1.0);
-            acc += alpha_q * hi * edge / madd(alpha_q, u, 1.0);
-        }
-    } else {
-        let alpha_exit = p_exit - 1.0;
-        for (&hi, &u) in h.iter().zip(&rule.nodes) {
-            let edge =
-                alpha_enter / madd(alpha_enter, u, 1.0) - alpha_exit / madd(alpha_exit, u, 1.0);
-            acc += alpha_q * hi * edge / madd(alpha_q, u, 1.0);
-        }
+    for ((&hi, &e), &u) in h.iter().zip(edge).zip(&rule.nodes) {
+        acc += alpha_q * hi * e / madd(alpha_q, u, 1.0);
     }
     acc
 }
@@ -311,9 +318,8 @@ impl ShapTree {
                 let (left, right) = (&src[l], &src[r]);
                 // `!(x >= 0)` also rejects NaN, as XGBoost's `CHECK_GE` does.
                 if !(n.sum_hess >= 0.0 && left.sum_hess >= 0.0 && right.sum_hess >= 0.0) {
-                    return Err(HessboostError::ModelFormat(
-                        "QuadratureTreeSHAP is undefined for trees with negative node cover"
-                            .to_string(),
+                    return Err(HessboostError::model_format(
+                        "QuadratureTreeSHAP is undefined for trees with negative node cover",
                     ));
                 }
                 node.first = l as u32;
@@ -446,9 +452,13 @@ impl Formulation for Interaction<'_> {
         // occurrences of its own feature, so every unshadowed entry before it
         // is a distinct partner.
         let (_, partners) = self.path.split_last().expect("return follows a push");
+        if partners.is_empty() {
+            return;
+        }
+        let edge = edge_factors(rule, p_enter, p_exit);
         let row = &mut self.matrix[f * self.width..(f + 1) * self.width];
         for partner in partners.iter().rev().filter(|e| !e.shadowed) {
-            let pair = interaction_delta(rule, h, p_enter, p_exit, partner.p);
+            let pair = interaction_delta(rule, h, &edge, partner.p);
             let cell = &mut row[partner.feature as usize];
             *cell = madd(self.scale, pair, *cell);
         }
@@ -490,8 +500,10 @@ impl<F: Formulation> Walk<'_, F> {
         let goes_left = if v.is_nan() {
             node.default_left
         } else if node.is_categorical {
-            self.tree.categories[node.cat_begin as usize..node.cat_end as usize]
-                .contains(&(v as u32))
+            in_category_set(
+                &self.tree.categories[node.cat_begin as usize..node.cat_end as usize],
+                v,
+            )
         } else {
             v < node.cond
         };
@@ -875,73 +887,134 @@ impl BoostedModel {
 mod tests {
     use crate::config::{BoosterKind, TrainingParams, TreeMethod};
     use crate::data::{DMatrix, FeatureType};
-    use crate::learner::train;
+    use crate::learner::{BoostedModel, train};
+    use crate::test_support::labeled_dense;
 
-    /// Build a small dense dataset with `nf` features. Features 0 and 1 carry
-    /// signal, the rest are noise. Returns (data, `n_rows`).
-    fn make_data(n: usize, nf: usize) -> DMatrix {
+    /// A `reg:squarederror` model with `eta = 0.3`.
+    fn squared_error_model(d: &DMatrix, max_depth: usize, rounds: usize) -> BoostedModel {
+        let params = TrainingParams::builder()
+            .objective("reg:squarederror")
+            .max_depth(max_depth)
+            .eta(0.3)
+            .build()
+            .unwrap();
+        train(&params, d, rounds).unwrap()
+    }
+
+    /// A 30-round regression model on 80 rows of 5 features; features 0 and
+    /// 1 carry signal, the rest are noise.
+    fn regression_fixture() -> (DMatrix, BoostedModel) {
+        let (n, nf) = (80, 5);
         let mut x = vec![0f32; n * nf];
         let mut y = vec![0f32; n];
         for i in 0..n {
             for j in 0..nf {
                 // Deterministic pseudo-random values.
-                let v = ((i * 31 + j * 17 + 7) % 97) as f32 / 97.0;
-                x[i * nf + j] = v;
+                x[i * nf + j] = ((i * 31 + j * 17 + 7) % 97) as f32 / 97.0;
             }
-            let f0 = x[i * nf];
-            let f1 = x[i * nf + 1];
-            y[i] = 2.0 * f0 - 1.5 * f1 + 0.3;
+            y[i] = 2.0 * x[i * nf] - 1.5 * x[i * nf + 1] + 0.3;
         }
-        DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        let d = labeled_dense(&x, n, nf, &y);
+        let model = squared_error_model(&d, 4, 30);
+        (d, model)
+    }
+
+    /// A 15-round `multi:softprob` model on 90 rows of 4 features, 3 classes.
+    fn multiclass_fixture() -> (DMatrix, BoostedModel) {
+        let (n, nf, k) = (90, 4, 3);
+        let mut x = vec![0f32; n * nf];
+        let mut y = vec![0f32; n];
+        for i in 0..n {
+            for j in 0..nf {
+                x[i * nf + j] = ((i * 13 + j * 29 + 3) % 101) as f32 / 101.0;
+            }
+            y[i] = (i % k) as f32;
+        }
+        let d = labeled_dense(&x, n, nf, &y);
+        let params = TrainingParams::builder()
+            .objective("multi:softprob")
+            .num_class(k)
+            .max_depth(3)
+            .eta(0.3)
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 15).unwrap();
+        assert_eq!(model.n_outputs(), k);
+        (d, model)
+    }
+
+    fn sum64(values: &[f32]) -> f64 {
+        values.iter().map(|&v| f64::from(v)).sum()
+    }
+
+    /// Largest `|Σ contributions - margin|` over every row and output.
+    fn max_additivity_error(contribs: &[f32], margin: &[f32], width: usize) -> f64 {
+        contribs
+            .chunks_exact(width)
+            .zip(margin)
+            .map(|(c, &m)| (sum64(c) - f64::from(m)).abs())
+            .fold(0.0, f64::max)
+    }
+
+    /// `model`'s contributions on `d` have the documented layout and sum to
+    /// the margin of every row and output.
+    fn assert_additive(model: &BoostedModel, d: &DMatrix) {
+        let width = d.n_cols() + 1;
+        let contribs = model.predict_contribs(d).unwrap();
+        assert_eq!(contribs.len(), d.n_rows() * model.n_outputs() * width);
+        let margin = model.predict_margin(d).unwrap();
+        let err = max_additivity_error(&contribs, &margin, width);
+        assert!(err < 1e-4, "max additivity error {err} exceeded 1e-4");
+    }
+
+    /// `model`'s interaction matrices on `d` have the documented layout, each
+    /// row sums to that feature's contribution (the bias row to the bias),
+    /// each matrix to the margin, and every matrix is symmetric.
+    fn assert_interactions_consistent(model: &BoostedModel, d: &DMatrix) {
+        let width = d.n_cols() + 1;
+        let mwidth = width * width;
+        let inter = model.predict_interactions(d).unwrap();
+        assert_eq!(inter.len(), d.n_rows() * model.n_outputs() * mwidth);
+        let contribs = model.predict_contribs(d).unwrap();
+        let margin = model.predict_margin(d).unwrap();
+
+        let (mut row_err, mut eff_err, mut sym_err) = (0f64, 0f64, 0f64);
+        let matrices = inter.chunks_exact(mwidth).zip(contribs.chunks_exact(width));
+        for ((m, c), &target) in matrices.zip(&margin) {
+            for (row, &cval) in m.chunks_exact(width).zip(c) {
+                row_err = row_err.max((sum64(row) - f64::from(cval)).abs());
+            }
+            eff_err = eff_err.max((sum64(m) - f64::from(target)).abs());
+            for i in 0..width {
+                for j in 0..width {
+                    let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
+                    sym_err = sym_err.max(e);
+                }
+            }
+        }
+        assert!(row_err < 1e-4, "row-consistency error {row_err}");
+        assert!(eff_err < 1e-4, "efficiency error {eff_err}");
+        assert!(sym_err < 1e-5, "symmetry error {sym_err}");
     }
 
     #[test]
     fn additivity_single_output() {
-        let n = 80;
-        let nf = 5;
-        let d = make_data(n, nf);
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(4)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 30).unwrap();
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-        let width = nf + 1;
-        assert_eq!(contribs.len(), n * width);
-
-        let mut max_err = 0f64;
-        for row in 0..n {
-            let s: f64 = contribs[row * width..row * width + width]
-                .iter()
-                .map(|&v| f64::from(v))
-                .sum();
-            let err = (s - f64::from(margin[row])).abs();
-            max_err = max_err.max(err);
-        }
-        assert!(
-            max_err < 1e-4,
-            "max additivity error {max_err} exceeded 1e-4"
-        );
+        let (d, model) = regression_fixture();
+        assert_additive(&model, &d);
     }
 
     /// Textbook path-dependent TreeSHAP (Lundberg et al., Algorithm 2) with
     /// cloned paths, independent of the arena implementation.
     mod textbook {
-        use crate::tree::RegTree;
+        use crate::learner::BoostedModel;
+        use crate::tree::{RegTree, in_category_set};
 
         #[derive(Clone, Copy)]
-        pub struct El {
-            pub d: i64,
-            pub z: f64,
-            pub o: f64,
-            pub w: f64,
+        struct El {
+            d: i64,
+            z: f64,
+            o: f64,
+            w: f64,
         }
 
         fn extend(m: &mut Vec<El>, pz: f64, po: f64, pi: i64) {
@@ -997,7 +1070,7 @@ mod tests {
         }
 
         #[allow(clippy::too_many_arguments)]
-        pub fn recurse(
+        fn recurse(
             tree: &RegTree,
             x: &[f32],
             phi: &mut [f64],
@@ -1020,7 +1093,10 @@ mod tests {
             let go_left = if v.is_nan() {
                 n.default_left
             } else if n.is_categorical {
-                tree.categories()[n.cat_begin as usize..n.cat_end as usize].contains(&(v as u32))
+                in_category_set(
+                    &tree.categories()[n.cat_begin as usize..n.cat_end as usize],
+                    v,
+                )
             } else {
                 v < n.split_cond
             };
@@ -1042,6 +1118,32 @@ mod tests {
             recurse(tree, x, phi, hot, m.clone(), hz * iz, io, f);
             recurse(tree, x, phi, cold, m, cz * iz, 0.0, f);
         }
+
+        /// Contributions for row `x` (bias last), in `f64`.
+        pub fn contributions(model: &BoostedModel, x: &[f32]) -> Vec<f64> {
+            let nf = x.len();
+            let mut phi = vec![0f64; nf + 1];
+            phi[nf] = f64::from(model.base_score());
+            for tree in model.trees() {
+                phi[nf] += super::super::root_mean_value(tree, 0);
+                recurse(tree, x, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
+            }
+            phi
+        }
+    }
+
+    /// `model`'s contributions on `d` match the textbook reference on every
+    /// row of `x`, the row-major features of `d`.
+    fn assert_matches_textbook(model: &BoostedModel, d: &DMatrix, x: &[f32]) {
+        let nf = d.n_cols();
+        let contribs = model.predict_contribs(d).unwrap();
+        let mut max_err = 0f64;
+        for (c, row) in contribs.chunks_exact(nf + 1).zip(x.chunks_exact(nf)) {
+            for (&got, want) in c.iter().zip(textbook::contributions(model, row)) {
+                max_err = max_err.max((f64::from(got) - want).abs());
+            }
+        }
+        assert!(max_err < 1e-4, "max textbook TreeSHAP error {max_err}");
     }
 
     /// Numeric, missing, and categorical routing against the f64 reference
@@ -1078,90 +1180,23 @@ mod tests {
             FeatureType::Numerical,
             FeatureType::Categorical,
         ];
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        let d = labeled_dense(&x, n, nf, &y)
             .with_feature_types(&types)
             .unwrap();
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(6)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 12).unwrap();
+        let model = squared_error_model(&d, 6, 12);
         let categorical = model
             .trees()
             .iter()
             .flat_map(crate::tree::RegTree::nodes)
             .any(|node| node.is_categorical);
         assert!(categorical, "no categorical split was learned");
-        let contribs = model.predict_contribs(&d).unwrap();
-        let width = nf + 1;
-        let mut max_err = 0f64;
-        for row in 0..n {
-            let inst = &x[row * nf..(row + 1) * nf];
-            let mut phi = vec![0f64; width];
-            phi[nf] = f64::from(model.base_score());
-            for tree in model.trees() {
-                phi[nf] += super::root_mean_value(tree, 0);
-                textbook::recurse(tree, inst, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
-            }
-            for (slot, want) in phi.iter().enumerate() {
-                max_err = max_err.max((f64::from(contribs[row * width + slot]) - want).abs());
-            }
-        }
-        assert!(max_err < 1e-4, "max textbook TreeSHAP error {max_err}");
+        assert_matches_textbook(&model, &d, &x);
     }
+
     #[test]
     fn additivity_multiclass() {
-        let n = 90;
-        let nf = 4;
-        let k = 3;
-        let mut x = vec![0f32; n * nf];
-        let mut y = vec![0f32; n];
-        for i in 0..n {
-            for j in 0..nf {
-                x[i * nf + j] = ((i * 13 + j * 29 + 3) % 101) as f32 / 101.0;
-            }
-            y[i] = (i % k) as f32;
-        }
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(k)
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 15).unwrap();
-        assert_eq!(model.n_outputs(), k);
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-        let width = nf + 1;
-        assert_eq!(contribs.len(), n * k * width);
-
-        let mut max_err = 0f64;
-        for row in 0..n {
-            for c in 0..k {
-                let base = (row * k + c) * width;
-                let s: f64 = contribs[base..base + width]
-                    .iter()
-                    .map(|&v| f64::from(v))
-                    .sum();
-                let err = (s - f64::from(margin[row * k + c])).abs();
-                max_err = max_err.max(err);
-            }
-        }
-        assert!(
-            max_err < 1e-4,
-            "max multiclass additivity error {max_err} exceeded 1e-4"
-        );
+        let (d, model) = multiclass_fixture();
+        assert_additive(&model, &d);
     }
 
     #[test]
@@ -1179,17 +1214,8 @@ mod tests {
             x[i * nf + 3] = 0.5; // constant -> never a useful split
             y[i] = 3.0 * x[i * nf] - 2.0 * x[i * nf + 1];
         }
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(4)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 25).unwrap();
+        let d = labeled_dense(&x, n, nf, &y);
+        let model = squared_error_model(&d, 4, 25);
 
         // Sanity: feature 3 is never used in any split.
         let used = model
@@ -1213,114 +1239,14 @@ mod tests {
 
     #[test]
     fn interactions_single_output() {
-        let n = 80;
-        let nf = 5;
-        let d = make_data(n, nf);
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(4)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 30).unwrap();
-
-        let width = nf + 1;
-        let mwidth = width * width;
-        let inter = model.predict_interactions(&d).unwrap();
-        assert_eq!(inter.len(), n * mwidth);
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-
-        let mut max_row_err = 0f64;
-        let mut max_eff_err = 0f64;
-        let mut max_sym_err = 0f64;
-        for row in 0..n {
-            let m = &inter[row * mwidth..row * mwidth + mwidth];
-            // Row consistency: each feature row sums to its SHAP contribution.
-            for i in 0..nf {
-                let s: f64 = (0..width).map(|j| f64::from(m[i * width + j])).sum();
-                let cval = f64::from(contribs[row * width + i]);
-                max_row_err = max_row_err.max((s - cval).abs());
-            }
-            // Efficiency: the whole matrix sums to the full margin.
-            let total: f64 = m.iter().map(|&v| f64::from(v)).sum();
-            let target = f64::from(margin[row]);
-            max_eff_err = max_eff_err.max((total - target).abs());
-            // Symmetry.
-            for i in 0..width {
-                for j in 0..width {
-                    let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
-                    max_sym_err = max_sym_err.max(e);
-                }
-            }
-        }
-        assert!(max_row_err < 1e-4, "row-consistency error {max_row_err}");
-        assert!(max_eff_err < 1e-4, "efficiency error {max_eff_err}");
-        assert!(max_sym_err < 1e-5, "symmetry error {max_sym_err}");
+        let (d, model) = regression_fixture();
+        assert_interactions_consistent(&model, &d);
     }
 
     #[test]
     fn interactions_multiclass() {
-        let n = 90;
-        let nf = 4;
-        let k = 3;
-        let mut x = vec![0f32; n * nf];
-        let mut y = vec![0f32; n];
-        for i in 0..n {
-            for j in 0..nf {
-                x[i * nf + j] = ((i * 13 + j * 29 + 3) % 101) as f32 / 101.0;
-            }
-            y[i] = (i % k) as f32;
-        }
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(k)
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 15).unwrap();
-        assert_eq!(model.n_outputs(), k);
-
-        let width = nf + 1;
-        let mwidth = width * width;
-        let inter = model.predict_interactions(&d).unwrap();
-        assert_eq!(inter.len(), n * k * mwidth);
-
-        let contribs = model.predict_contribs(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
-
-        let mut max_row_err = 0f64;
-        let mut max_eff_err = 0f64;
-        let mut max_sym_err = 0f64;
-        for row in 0..n {
-            for c in 0..k {
-                let m = &inter[(row * k + c) * mwidth..(row * k + c) * mwidth + mwidth];
-                let cbase = (row * k + c) * width;
-                for i in 0..nf {
-                    let s: f64 = (0..width).map(|j| f64::from(m[i * width + j])).sum();
-                    let cval = f64::from(contribs[cbase + i]);
-                    max_row_err = max_row_err.max((s - cval).abs());
-                }
-                let total: f64 = m.iter().map(|&v| f64::from(v)).sum();
-                let target = f64::from(margin[row * k + c]);
-                max_eff_err = max_eff_err.max((total - target).abs());
-                for i in 0..width {
-                    for j in 0..width {
-                        let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
-                        max_sym_err = max_sym_err.max(e);
-                    }
-                }
-            }
-        }
-        assert!(max_row_err < 1e-4, "row-consistency error {max_row_err}");
-        assert!(max_eff_err < 1e-4, "efficiency error {max_eff_err}");
-        assert!(max_sym_err < 1e-5, "symmetry error {max_sym_err}");
+        let (d, model) = multiclass_fixture();
+        assert_interactions_consistent(&model, &d);
     }
 
     #[test]
@@ -1331,12 +1257,7 @@ mod tests {
             .collect();
         let y: Vec<f32> = (0..n).map(|row| row as f32 / 10.0).collect();
         let base: Vec<f32> = (0..n).map(|row| row as f32 / 100.0).collect();
-        let d = DMatrix::from_dense(&x, n, 2)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
-            .with_base_margin(&base)
-            .unwrap();
+        let d = labeled_dense(&x, n, 2, &y).with_base_margin(&base).unwrap();
 
         for booster in [BoosterKind::Dart, BoosterKind::GbLinear] {
             let params = TrainingParams::builder()
@@ -1347,19 +1268,8 @@ mod tests {
                 .build()
                 .unwrap();
             let model = train(&params, &d, 8).unwrap();
-            let margin = model.predict_margin(&d).unwrap();
-            let contribs = model.predict_contribs(&d).unwrap();
-            let interactions = model.predict_interactions(&d).unwrap();
-            let width = d.n_cols() + 1;
-            for row in 0..n {
-                let contribution_sum: f32 = contribs[row * width..(row + 1) * width].iter().sum();
-                let interaction_sum: f32 = interactions
-                    [row * width * width..(row + 1) * width * width]
-                    .iter()
-                    .sum();
-                assert!((contribution_sum - margin[row]).abs() < 1e-4);
-                assert!((interaction_sum - margin[row]).abs() < 1e-4);
-            }
+            assert_additive(&model, &d);
+            assert_interactions_consistent(&model, &d);
         }
     }
 
@@ -1403,10 +1313,7 @@ mod tests {
                 (r[0] * 40.0).sin() * 5.0 + r[1] * r[2] * 8.0 + (r[3] * 25.0).cos() + next()
             })
             .collect();
-        let d = DMatrix::from_dense(&x, n, nf)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, nf, &y);
         let params = TrainingParams::builder()
             .tree_method(TreeMethod::Exact)
             .max_depth(40)
@@ -1434,39 +1341,9 @@ mod tests {
 
         let rows = 200;
         let dsub = DMatrix::from_dense(&x[..rows * nf], rows, nf).unwrap();
-        let contribs = model.predict_contribs(&dsub).unwrap();
-        let inter = model.predict_interactions(&dsub).unwrap();
-        let margin = model.predict_margin(&dsub).unwrap();
-        let width = nf + 1;
-        let (mut add_err, mut ref_err, mut row_err) = (0f64, 0f64, 0f64);
-        for row in 0..rows {
-            let c = &contribs[row * width..(row + 1) * width];
-            let sum: f64 = c.iter().map(|&v| f64::from(v)).sum();
-            add_err = add_err.max((sum - f64::from(margin[row])).abs());
-
-            let mut phi = vec![0f64; width];
-            phi[nf] = f64::from(model.base_score());
-            for tree in model.trees() {
-                phi[nf] += super::root_mean_value(tree, 0);
-                let inst = &x[row * nf..(row + 1) * nf];
-                textbook::recurse(tree, inst, &mut phi, 0, Vec::new(), 1.0, 1.0, -1);
-            }
-            for (got, want) in c.iter().zip(&phi) {
-                ref_err = ref_err.max((f64::from(*got) - want).abs());
-            }
-
-            let m = &inter[row * width * width..(row + 1) * width * width];
-            for i in 0..width {
-                let s: f64 = m[i * width..(i + 1) * width]
-                    .iter()
-                    .map(|&v| f64::from(v))
-                    .sum();
-                row_err = row_err.max((s - f64::from(c[i])).abs());
-            }
-        }
-        assert!(add_err < 1e-4, "additivity error {add_err}");
-        assert!(ref_err < 1e-4, "textbook TreeSHAP error {ref_err}");
-        assert!(row_err < 1e-4, "interaction row-sum error {row_err}");
+        assert_additive(&model, &dsub);
+        assert_interactions_consistent(&model, &dsub);
+        assert_matches_textbook(&model, &dsub, &x[..rows * nf]);
     }
 
     /// Covers are validated like XGBoost's `CHECK_GE(sum_hess, 0)`.
@@ -1478,10 +1355,11 @@ mod tests {
             )
         };
         let json = format!(
-            r#"{{"trees": [{{"nodes": [{}, {}, {}]}}], "base_score": [0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 1, "n_features": 1}}"#,
+            r#"{{"trees": [{{"nodes": [{}, {}, {}], "categories": [], "size_leaf_vector": 0, "leaf_vectors": []}}], "base_score": [0.0], "objective": "reg:squarederror", "objective_params": {}, "num_class": 0, "n_outputs": 1, "n_targets": 1, "n_features": 1, "tree_weights": [], "num_parallel_tree": 1}}"#,
             node(0, 1, 2, 0.0, 1.0),
             node(0, -1, -1, 1.0, -1.0),
             node(0, -1, -1, 2.0, 2.0),
+            serde_json::to_string(&crate::config::ObjectiveParams::default()).unwrap(),
         );
         let model = crate::learner::BoostedModel::from_json(&json).unwrap();
         let d = DMatrix::from_dense(&[0.2], 1, 1).unwrap();

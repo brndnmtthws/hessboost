@@ -27,34 +27,24 @@
 //! "forward sum equals node total" missing-value test then holds exactly as it
 //! does for the integers.
 
-use super::{BinIndex, CACHE_LINE, PREFETCH_ROWS, REDUCE_BINS, ROWS_PER_TASK, contiguous_range};
+use super::{
+    BinIndex, PARALLEL_THRESHOLD, PREFETCH_ROWS, REDUCE_BINS, ROWS_PER_TASK, TILE_ROWS,
+    contiguous_range, feature_blocks, feature_slices, prefetch_bins,
+};
 use crate::config::TrainingParams;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
+use crate::rng::{GOLDEN, mix64};
 use crate::tree::gain::GradStats;
 use rayon::prelude::*;
 use std::sync::Arc;
 
 /// Rows per parallel quantization task.
 const QUANTIZE_CHUNK: usize = 8192;
-/// Nodes below this many rows build their histogram on one thread.
-const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
 /// Bytes of histogram a dense feature block may span, so the block stays in
 /// L1 while a row tile is accumulated into it (the float path's 64 KiB).
 const BLOCK_BYTES: usize = 64 * 1024;
-/// Rows per tile of the dense accumulation.
-const TILE_ROWS: usize = 4096;
 
-/// SplitMix64 finalizer: a bijective 64-bit mix with full avalanche.
-#[inline]
-fn mix64(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-/// SplitMix64's state increment (the 64-bit golden ratio).
-const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Stream salts separating the gradient and Hessian rounding variates.
 const GRAD_STREAM: u64 = 0x6772_6164_5F71_6E74;
 const HESS_STREAM: u64 = 0x6865_7373_5F71_6E74;
@@ -101,18 +91,8 @@ pub(crate) struct QuantizedGradients {
 }
 
 impl QuantizedGradients {
-    /// Quantize `gpair` with `params.num_grad_quant_bins` levels, stochastic
-    /// or round-to-nearest per `params.stochastic_rounding`, drawing rounding
-    /// variates from the stream `seed`.
-    pub(crate) fn new(gpair: &[GradPair], params: &TrainingParams, seed: u64) -> Self {
-        Self::quantize(
-            gpair,
-            params.num_grad_quant_bins,
-            params.stochastic_rounding,
-            seed,
-        )
-    }
-
+    /// Quantize `gpair` with `bins` levels, stochastically or to nearest,
+    /// drawing rounding variates from the stream `seed`.
     fn quantize(gpair: &[GradPair], bins: usize, stochastic: bool, seed: u64) -> Self {
         debug_assert!((2..=127).contains(&bins), "validated by TrainingParams");
         // Max |g|, max |h|, and whether every Hessian equals the first. `max`
@@ -277,23 +257,16 @@ impl QuantizedGradients {
 
         if let (Some(columns), Some(range)) = (ghist.column_bins(), contiguous_range(rows)) {
             let mut out = vec![A::default(); total];
-            let values: Vec<A> = self.packed[range].iter().map(|&p| A::from_row(p)).collect();
+            let values: Vec<A> = self.packed[range.clone()]
+                .iter()
+                .map(|&p| A::from_row(p))
+                .collect();
             let n_rows = ghist.n_rows();
-            let cuts = ghist.cuts();
-            let first = rows[0] as usize;
-            let mut slices = Vec::with_capacity(ghist.n_cols());
-            let mut rest = out.as_mut_slice();
-            for f in 0..ghist.n_cols() {
-                let (fs, fe) = cuts.feature_bins(f);
-                let (head, tail) = rest.split_at_mut(fe - fs);
-                slices.push((fs, head));
-                rest = tail;
-            }
-            slices
+            feature_slices(ghist, &mut out, 1)
                 .into_par_iter()
                 .enumerate()
                 .for_each(|(f, (fs, slice))| {
-                    let span = first..first + values.len();
+                    let span = range.clone();
                     match columns {
                         Bins::U16(c) => {
                             accumulate_column(&c[f * n_rows..][span], fs, &values, slice);
@@ -445,8 +418,10 @@ pub(crate) struct QuantNode {
 }
 
 impl QuantNode {
-    /// Quantize the tree's gradients and build the root over `rows`. Returns
-    /// the node, its dequantized statistics, and its dequantized histogram.
+    /// Quantize the tree's gradients (`params.num_grad_quant_bins` levels,
+    /// rounded per `params.stochastic_rounding` from the stream `seed`) and
+    /// build the root over `rows`. Returns the node, its dequantized
+    /// statistics, and its dequantized histogram.
     pub(crate) fn root(
         ghist: &GHistIndex,
         gpair: &[GradPair],
@@ -454,7 +429,12 @@ impl QuantNode {
         params: &TrainingParams,
         seed: u64,
     ) -> (Self, GradStats, Vec<GradStats>) {
-        let grads = Arc::new(QuantizedGradients::new(gpair, params, seed));
+        let grads = Arc::new(QuantizedGradients::quantize(
+            gpair,
+            params.num_grad_quant_bins,
+            params.stochastic_rounding,
+            seed,
+        ));
         let hist = grads.build(ghist, rows);
         let stats = grads.node_stats(rows);
         let float = grads.dequantize(&hist);
@@ -588,13 +568,6 @@ fn accumulate_bins<A: Packed, B: BinIndex>(
             *slot = slot.add(v);
         }
     };
-    let prefetch_row = |start: usize, len: usize| {
-        for offset in (0..len).step_by(CACHE_LINE / std::mem::size_of::<B>()) {
-            if let Some(bin) = bins.get(start + offset) {
-                crate::simd::prefetch_read(bin);
-            }
-        }
-    };
 
     if let Some(columns) = ghist.column_bins()
         && let Some(range) = contiguous_range(rows)
@@ -620,23 +593,14 @@ fn accumulate_bins<A: Packed, B: BinIndex>(
     }
 
     if let Some(stride) = ghist.dense_stride() {
-        accumulate_dense(
-            ghist,
-            bins,
-            stride,
-            rows,
-            packed,
-            out,
-            add_row,
-            prefetch_row,
-        );
+        accumulate_dense(ghist, bins, stride, rows, packed, out, add_row);
     } else {
         let rp = ghist.row_ptr();
         for (i, &r) in rows.iter().enumerate() {
             if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
                 let ahead = ahead as usize;
                 if let (Some(&start), Some(&end)) = (rp.get(ahead), rp.get(ahead + 1)) {
-                    prefetch_row(start, end - start);
+                    prefetch_bins(bins, start, end - start);
                 }
             }
             let ri = r as usize;
@@ -663,7 +627,6 @@ fn accumulate_column<A: Packed, B: BinIndex>(
 /// Dense accumulation tiled by rows and feature blocks, as the float path
 /// does, with blocks sized for the accumulator width.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn accumulate_dense<A: Packed, B: BinIndex>(
     ghist: &GHistIndex,
     bins: &[B],
@@ -672,24 +635,12 @@ fn accumulate_dense<A: Packed, B: BinIndex>(
     packed: &[i32],
     out: &mut [A],
     add_row: impl Fn(&[B], A, &mut [A]),
-    prefetch_row: impl Fn(usize, usize),
 ) {
-    let block_bins = BLOCK_BYTES / std::mem::size_of::<A>();
-    let cuts = ghist.cuts();
-    let mut blocks: Vec<(usize, usize)> = Vec::new();
-    let mut block_start = 0;
-    for f in 1..=stride {
-        let span = cuts.feature_bins(f - 1).1 - cuts.feature_bins(block_start).0;
-        if span > block_bins && f - 1 > block_start {
-            blocks.push((block_start, f - 1));
-            block_start = f - 1;
-        }
-    }
-    blocks.push((block_start, stride));
+    let blocks = feature_blocks(ghist, stride, BLOCK_BYTES / std::mem::size_of::<A>());
 
     let prefetch = |rows: &[u32], i: usize| {
         if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
-            prefetch_row(ahead as usize * stride, stride);
+            prefetch_bins(bins, ahead as usize * stride, stride);
         }
     };
     if blocks.len() == 1 {

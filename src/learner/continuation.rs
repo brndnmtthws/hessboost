@@ -67,45 +67,44 @@ pub(super) fn resume_model(
         ));
     }
     if dtrain.n_cols() != init.n_features() {
-        return Err(HessboostError::DimensionMismatch {
-            what: "continued-training feature count",
-            expected: init.n_features(),
-            got: dtrain.n_cols(),
-        });
+        return Err(HessboostError::dimension_mismatch(
+            "continued-training feature count",
+            init.n_features(),
+            dtrain.n_cols(),
+        ));
     }
     if dtrain.n_targets() != init.n_targets() {
-        return Err(HessboostError::DimensionMismatch {
-            what: "continued-training label targets",
-            expected: init.n_targets(),
-            got: dtrain.n_targets(),
-        });
-    }
-    // Iterations must stay uniform: every layer holds the same forest size.
-    if !is_linear && init.num_trees() > 0 && params.num_parallel_tree != init.num_parallel_tree() {
-        return Err(HessboostError::invalid_param(
-            "num_parallel_tree",
-            format!(
-                "{} does not match the model's num_parallel_tree {}",
-                params.num_parallel_tree,
-                init.num_parallel_tree()
-            ),
+        return Err(HessboostError::dimension_mismatch(
+            "continued-training label targets",
+            init.n_targets(),
+            dtrain.n_targets(),
         ));
     }
-    // A model's trees are either all vector-leaf or all scalar-leaf.
-    if !is_linear
-        && init.num_trees() > 0
-        && init.has_vector_leaves() != multi_output::vector_leaf(params, objective.n_outputs())
-    {
-        return Err(HessboostError::invalid_param(
-            "multi_strategy",
-            if init.has_vector_leaves() {
-                "a vector-leaf model can only be trained further with \
-                 `multi_strategy=multi_output_tree`"
-            } else {
-                "a one-output-per-tree model cannot be trained further with \
-                 `multi_strategy=multi_output_tree`"
-            },
-        ));
+    if !is_linear && init.num_trees() > 0 {
+        // Iterations must stay uniform: every layer holds the same forest size.
+        if params.num_parallel_tree != init.num_parallel_tree() {
+            return Err(HessboostError::invalid_param(
+                "num_parallel_tree",
+                format!(
+                    "{} does not match the model's num_parallel_tree {}",
+                    params.num_parallel_tree,
+                    init.num_parallel_tree()
+                ),
+            ));
+        }
+        // A model's trees are either all vector-leaf or all scalar-leaf.
+        if init.has_vector_leaves() != multi_output::vector_leaf(params, objective.n_outputs()) {
+            return Err(HessboostError::invalid_param(
+                "multi_strategy",
+                if init.has_vector_leaves() {
+                    "a vector-leaf model can only be trained further with \
+                     `multi_strategy=multi_output_tree`"
+                } else {
+                    "a one-output-per-tree model cannot be trained further with \
+                     `multi_strategy=multi_output_tree`"
+                },
+            ));
+        }
     }
     if params.process_type == ProcessType::Update {
         check_update(init, params, num_boost_round)?;

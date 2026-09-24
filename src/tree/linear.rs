@@ -148,12 +148,11 @@ pub(crate) fn fit_linear_leaves(
     let models: Vec<(f64, Vec<(u32, f64)>)> = (0..nodes.len())
         .into_par_iter()
         .map(|id| {
-            let constant = f64::from(nodes[id].leaf_value);
             if !nodes[id].is_leaf() {
                 return (0.0, Vec::new());
             }
             fit_leaf(&features[id], &members[id], data, gpair, lambda)
-                .unwrap_or((constant, Vec::new()))
+                .unwrap_or((f64::from(nodes[id].leaf_value), Vec::new()))
         })
         .collect();
 
@@ -447,7 +446,6 @@ mod tests {
 
     #[test]
     fn categorical_path_features_route_but_stay_out_of_the_model() {
-        use crate::data::FeatureType;
         // Root splits categorical feature 0; each child splits numeric 1.
         let mut tree = RegTree::with_root(8.0);
         let (l, r) = tree.expand_categorical(0, 0, &[1], false, 0.0, 4.0, 0.0, 4.0);

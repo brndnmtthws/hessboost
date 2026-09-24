@@ -85,15 +85,12 @@ fit quality under identical hyperparameters, not quality across all datasets.
 | 4-class, 50k × 30 | 10,000 | mlogloss | 0.150027 | 0.150027 |
 
 The XGBoost column is from the M3 Max run above. The hessboost column was
-re-measured on 2026-09-23 on the AWS Neoverse-V3 host (aarch64 Linux 6.12)
+measured on 2026-09-23 on the AWS Neoverse-V3 host (aarch64 Linux 6.12)
 with `bench_xgb.py --threads 1` against XGBoost 3.4.2 built from source
-(`scripts/requirements-xgboost.txt`): XGBoost 3.4.2 reproduced the M3 3.4.1
-scores to all six digits, and hessboost at release 1af4e21 and on the
-roadmap branch matched XGBoost to within 1e-9 on every workload. The
-hessboost scores previously listed here (0.060635, 0.063959, 0.515638,
-0.150499) reproduce with neither build and have no recorded provenance.
-hessboost's quality was not re-measured on the M3 Max (both hosts are
-AArch64 and dispatch the same NEON kernels).
+(`scripts/requirements-xgboost.txt`): XGBoost 3.4.2 reproduces the M3 3.4.1
+scores to all six digits, and hessboost matches XGBoost to within 1e-9 on
+every workload. hessboost's quality was not measured on the M3 Max (both
+hosts are AArch64 and dispatch the same NEON kernels).
 
 ### Workloads and method
 
@@ -139,8 +136,9 @@ uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
   --output /tmp/hessboost-xgb --threads 1 4 16
 ```
 
-The quality re-check used the parity pin instead of the 3.4.1 wheel (a source
-build of XGBoost 3.4.2; one measured fit per batch is enough for scores):
+The quality measurement uses the parity pin instead of the 3.4.1 wheel (a
+source build of XGBoost 3.4.2; one measured fit per batch is enough for
+scores):
 
 ```sh
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/bench_xgb.py \
@@ -288,8 +286,8 @@ Measured on **AWS Neoverse-V3** (192 cores, Linux 6.12) with **Rust 1.98.1**,
 `opt-level=3`, thin LTO, one codegen unit, on 2026-09-23 UTC. Each value is the
 Criterion median (2 s warm-up, 6 s measurement). The host also ran other
 agents' builds, so treat differences under about 3% as noise. Q = 4 levels,
-stochastic rounding, no leaf renewal. The full-precision column re-measures
-the cases above on this machine in the same run, plus a new 1M × 50 case
+stochastic rounding, no leaf renewal. The full-precision column measures the
+same cases on this machine in the same run, plus a 1M × 50 case
 (`large_depth8`).
 
 | Workload | Threads | Full precision (ms) | Quantized (ms) | Speedup |
@@ -319,107 +317,6 @@ that back. Single-threaded training on 50k rows is therefore 3–4% *slower*,
 and 16 threads gain about 7%. The integer loops are scalar: widths are chosen
 per node, and serial and parallel builds agree bit for bit. There is no SIMD
 path to keep in sync.
-
-### Roadmap regression check
-
-The roadmap branch adds many opt-in features on top of release 1af4e21, the
-build the XGBoost comparison above measured. This check confirms that the
-default training, prediction, and SHAP paths did not get slower along the way.
-
-Measured on **AWS Neoverse-V3** (aarch64 Linux 6.12, 192 cores in two NUMA
-nodes) with **Rust 1.98.1**, `opt-level=3`, thin LTO, one codegen unit, on
-2026-09-23 UTC. Every run is pinned to the same 16 cores of one NUMA node
-(`taskset -c 100-115`), with `RAYON_NUM_THREADS` fixed per row. Other agents'
-builds shared the host, on other cores. Criterion rows come from
-`scripts/compare_benchmarks.py` (release/roadmap/roadmap/release order,
-0.5 s warm-up, 2 s measurement, 20 samples; the training groups keep their
-own 10). Each value is the mean of the two run medians. Both executables
-compile the same bench source. The release checkout got the depthwise
-`predict_100k_x30_100trees_depth6` and the `shap_x20_100trees_depth6` cases,
-neither of which it has, copied verbatim for this run. **Change** is
-`roadmap / release − 1`. For this machine and these workloads only.
-
-The first run found one real regression. `sum_rows`, the root gradient sum,
-had been inlined into the roadmap's larger `HistTreeBuilder::build_inner`.
-There LLVM kept the running sum in the caller's stack slot, so every row paid
-a store-to-load round trip. Each tree took about 90 µs longer, a fixed serial
-cost: depth-1 trees were 16% slower on one thread and 45% slower on 16.
-Training got 4–5% slower on one thread and 7–10% slower on 16. Keeping
-`sum_rows` out of line (`#[inline(never)]`) fixes it. The arithmetic and the
-models are unchanged, and the parity suite stays bit-identical. The
-"before fix" column is the roadmap at `ca37b7c`. The last column is the
-roadmap after the fix, merged with `5779ed8`.
-
-| Workload | Threads | 1af4e21 (ms) | Roadmap, before fix (ms) | Roadmap (ms) | Change |
-|---|---:|---:|---:|---:|---:|
-| Tree, depth 1 | 1 | 0.575 | 0.666 | 0.576 | +0.1% |
-| Tree, depth 1 | 16 | 0.206 | 0.300 | 0.212 | +2.6% |
-| Tree, depth 6 | 1 | 5.856 | 6.017 | 5.939 | +1.4% |
-| Tree, depth 6 | 16 | 1.231 | 1.321 | 1.234 | +0.3% |
-| Tree, depth 10 | 1 | 64.335 | 65.539 | 65.508 | +1.8% |
-| Tree, depth 10 | 16 | 4.939 | 5.130 | 4.978 | +0.8% |
-| Tree, 128 features | 1 | 26.304 | 27.047 | 26.954 | +2.5% |
-| Tree, 128 features | 16 | 5.327 | 5.430 | 5.429 | +1.9% |
-| Tree, missing values | 1 | 11.352 | 11.538 | 11.368 | +0.1% |
-| Tree, missing values | 16 | 2.757 | 2.819 | 2.726 | -1.1% |
-| Tree, monotone | 1 | 5.879 | 6.121 | 5.980 | +1.7% |
-| Tree, monotone | 16 | 1.230 | 1.322 | 1.237 | +0.6% |
-| Tree, loss-guide | 1 | 9.749 | 10.097 | 9.922 | +1.8% |
-| Tree, loss-guide | 16 | 8.994 | 9.276 | 9.153 | +1.8% |
-| Training, regression | 1 | 302.9 | 316.0 | 308.6 | +1.9% |
-| Training, regression | 16 | 70.895 | 75.324 | 70.877 | -0.0% |
-| Training, L1 = 1 | 1 | 303.3 | 314.0 | 308.3 | +1.6% |
-| Training, L1 = 1 | 16 | 70.898 | 75.185 | 70.729 | -0.2% |
-| Training, 16 bins | 1 | 130.3 | 137.0 | 131.6 | +1.0% |
-| Training, 16 bins | 16 | 43.596 | 47.324 | 43.093 | -1.2% |
-| Training, exact | 1 | 6486.3 | 6387.4 | 6380.0 | -1.6% |
-| Training, exact | 16 | 6473.7 | 6301.4 | 6352.6 | -1.9% |
-| Training, binary | 1 | 304.4 | 318.4 | 309.9 | +1.8% |
-| Training, binary | 16 | 72.441 | 76.965 | 72.320 | -0.2% |
-| Training, binary, scalar objective | 1 | 315.4 | 329.4 | 320.8 | +1.7% |
-| Training, binary, scalar objective | 16 | 85.330 | 90.102 | 85.567 | +0.3% |
-| Prediction, 100k rows | 1 | 136.2 | 136.3 | 132.8 | -2.5% |
-| Prediction, 100k rows | 16 | 8.892 | 8.877 | 8.658 | -2.6% |
-| SHAP contributions, 2,000 rows | 1 | 510.0 | 354.9 | 359.1 | -29.6% |
-| SHAP contributions, 2,000 rows | 16 | 32.342 | 22.602 | 22.785 | -29.5% |
-| SHAP interactions, 200 rows | 1 | 2008.8 | 77.360 | 77.394 | -96.1% |
-| SHAP interactions, 200 rows | 16 | 130.8 | 5.268 | 5.272 | -96.0% |
-
-End-to-end fits use `examples/bench_compare.rs` on the `bench_xgb.py`
-datasets: 100 rounds, depth 6, 256 bins, fresh `DMatrix` per fit. Runs go in
-release/roadmap/roadmap/release order, each with one warm-up fit and five
-recorded fits. The table shows the median of the ten recorded fits per build.
-Both builds reach identical held-out scores.
-
-| Workload | Threads | 1af4e21 (s) | Roadmap (s) | Change |
-|---|---:|---:|---:|---:|
-| Regression, 100k × 30 | 1 | 1.091 | 1.107 | +1.5% |
-| Regression, 100k × 30 | 16 | 0.213 | 0.214 | +0.6% |
-| Binary, 100k × 30 | 1 | 1.033 | 1.049 | +1.5% |
-| Binary, 100k × 30 | 16 | 0.206 | 0.208 | +1.1% |
-| 4-class, 50k × 30 | 1 | 2.803 | 2.845 | +1.5% |
-| 4-class, 50k × 30 | 16 | 0.722 | 0.727 | +0.7% |
-
-What remains is under 3% everywhere. It sits in split evaluation: on one
-thread, depth-6 trees are 1–2% slower, and so is training that consists of
-them. The profile shares are the same in both builds (split evaluation about
-1.55× histogram accumulation). The `histogram_build` cases also match the
-release to within 0.5%. `HistTreeBuilder::evaluate` gained two never-taken
-branches for the opt-in reuse penalties. Removing them made the depth-6 case
-4% *slower*, not faster, so the remaining difference follows code layout, not
-extra work. At 16 threads, training matches the release. Prediction is 2.5%
-faster. QuadratureTreeSHAP cuts contribution time by 30% and interaction time
-26-fold compared with the classic TreeSHAP the release shipped.
-
-Reproduce with the commands in [Development scripts](../scripts/README.md),
-building the release in a separate worktree:
-
-```sh
-git worktree add /tmp/hb-base 1af4e21   # add the predict/SHAP cases to its bench
-python3 scripts/compare_benchmarks.py --baseline <release bench> --optimized <roadmap bench> \
-  --output /tmp/hb-cmp-t1 --threads 1 \
-  --filter '^(hist_tree_build/(depth1|depth6|depth10|wide128|missing|monotone|lossguide)|train_50k_x20_50rounds/(Hist|Hist_l1|Hist_16bins|Exact)|train_binary_50k_x20_50rounds/.*_(dispatch|reference)|predict_100k_x30_100trees_depth6/depthwise|shap_x20_100trees_depth6/.*)$'
-```
 
 ## Implementation
 
@@ -451,7 +348,7 @@ logarithms and Tweedie exponentials use `f64` throughout.
 
 Depthwise growth expands nodes and draws child feature samples in traversal
 order, then partitions rows, builds histograms, and evaluates the independent
-nodes in parallel. Candidate scans within a node retain their original order.
+nodes in parallel. Candidate scans within a node keep their sequential order.
 Loss-guide growth retains its priority-queue ordering. Histogram accumulation
 limits the task count to one per 4,096 rows, capped at the worker count,
 so a smaller node does not allocate a full histogram for every worker.
@@ -466,7 +363,7 @@ column-sampler draws are preserved.
 Quantile cuts are sorted independently by feature, and rows are binned in
 parallel chunks. Ordered collection preserves the cut layout, row order,
 missing-value handling, categorical bins, and the choice of 16- or 32-bit bin
-storage. These scheduling changes also work on other CPU architectures.
+storage. This scheduling is independent of the CPU architecture.
 
 ### Prediction
 
@@ -521,16 +418,16 @@ path disabled (a one-line local change), isolating the kernel:
 At full width the per-block row loading and scheduling, which both paths
 share, dominate.
 
-On a Neoverse V3 core these prediction changes cut prediction time by 10–20×
-for dense, sparse, and multiclass batches relative to the per-node traversal.
-That figure is an informal spot measurement from a separate machine. It is not
-part of the recorded artifacts in this document.
+On a Neoverse V3 core this layout predicts dense, sparse, and multiclass
+batches 10–20× faster than a per-node traversal. That figure is an informal
+spot measurement from a separate machine. It is not part of the recorded
+artifacts in this document.
 
 SHAP values use XGBoost 3.4's QuadratureTreeSHAP. One recursive walk per tree
 carries an 8-lane quadrature basis in `f32` and extracts each return edge's
 contribution from its subtree's return, so contributions cost `O(L · D)` per
 tree and row (`L` leaves, `D` depth) and interactions `O(L · D²)`. Classic
-path-dependent TreeSHAP needed `O(L · D²)` for contributions and repeated a
+path-dependent TreeSHAP needs `O(L · D²)` for contributions and repeats a
 conditioned walk per feature for interactions. Each tree's precomputed nodes
 hold both child branch weights, only the tree's split features are cleared
 and accumulated per tree, and rows are processed in parallel. Spot

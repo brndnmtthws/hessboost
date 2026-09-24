@@ -130,67 +130,20 @@ fn bench_histogram_build(c: &mut Criterion) {
 
 fn bench_hist_tree_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("hist_tree_build");
-    for (name, n, features, depth, policy, quantized) in [
-        ("depth1", 50_000, 20, 1, GrowPolicy::DepthWise, false),
-        ("depth6", 50_000, 20, 6, GrowPolicy::DepthWise, false),
-        ("depth10", 50_000, 20, 10, GrowPolicy::DepthWise, false),
-        ("wide128", 10_000, 128, 6, GrowPolicy::DepthWise, false),
-        ("missing", 50_000, 20, 6, GrowPolicy::DepthWise, false),
-        ("monotone", 50_000, 20, 6, GrowPolicy::DepthWise, false),
-        ("lossguide", 50_000, 20, 6, GrowPolicy::LossGuide, false),
-        (
-            "large_depth8",
-            1_000_000,
-            50,
-            8,
-            GrowPolicy::DepthWise,
-            false,
-        ),
-        // Opt-in quantized gradients (`use_quantized_grad`); the rows above
-        // with the same data are the full-precision baselines.
-        (
-            "depth6_quantized",
-            50_000,
-            20,
-            6,
-            GrowPolicy::DepthWise,
-            true,
-        ),
-        (
-            "depth10_quantized",
-            50_000,
-            20,
-            10,
-            GrowPolicy::DepthWise,
-            true,
-        ),
-        (
-            "wide128_quantized",
-            10_000,
-            128,
-            6,
-            GrowPolicy::DepthWise,
-            true,
-        ),
-        (
-            "missing_quantized",
-            50_000,
-            20,
-            6,
-            GrowPolicy::DepthWise,
-            true,
-        ),
-        (
-            "large_depth8_quantized",
-            1_000_000,
-            50,
-            8,
-            GrowPolicy::DepthWise,
-            true,
-        ),
+    // `quantized` adds a `{name}_quantized` run with opt-in quantized
+    // gradients (`use_quantized_grad`) on the same data.
+    for (name, n, features, depth, quantized) in [
+        ("depth1", 50_000, 20, 1, false),
+        ("depth6", 50_000, 20, 6, true),
+        ("depth10", 50_000, 20, 10, true),
+        ("wide128", 10_000, 128, 6, true),
+        ("missing", 50_000, 20, 6, true),
+        ("monotone", 50_000, 20, 6, false),
+        ("lossguide", 50_000, 20, 6, false),
+        ("large_depth8", 1_000_000, 50, 8, true),
     ] {
         let mut data = make_data(n, features);
-        if name.starts_with("missing") {
+        if name == "missing" {
             let values: Vec<f32> = (0..n * features)
                 .map(|i| {
                     if i % 11 < 2 {
@@ -214,27 +167,39 @@ fn bench_hist_tree_build(c: &mut Criterion) {
             .map(|&label| GradPair::new(7.5 - label, 1.0))
             .collect();
         let rows: Vec<u32> = (0..n as u32).collect();
-        let params = TrainingParams::builder()
-            .max_depth(depth)
-            .grow_policy(policy)
-            .max_leaves(64)
-            .monotone_constraints(if name == "monotone" {
-                vec![Monotone::Increasing]
-            } else {
-                Vec::new()
-            })
-            .use_quantized_grad(quantized)
-            .build()
-            .unwrap();
-        let builder = HistTreeBuilder::new(&params);
         // A 1M-row tree takes long enough that ten samples are stable.
         group.sample_size(if n >= 1_000_000 { 10 } else { 100 });
-        group.bench_function(name, |b| {
-            b.iter(|| {
-                let mut sampler = ColumnSampler::all(features);
-                black_box(builder.build(&ghist, &gpair, &rows, &mut sampler))
+        let variants: &[bool] = if quantized { &[false, true] } else { &[false] };
+        for &use_quantized_grad in variants {
+            let params = TrainingParams::builder()
+                .max_depth(depth)
+                .grow_policy(if name == "lossguide" {
+                    GrowPolicy::LossGuide
+                } else {
+                    GrowPolicy::DepthWise
+                })
+                .max_leaves(64)
+                .monotone_constraints(if name == "monotone" {
+                    vec![Monotone::Increasing]
+                } else {
+                    Vec::new()
+                })
+                .use_quantized_grad(use_quantized_grad)
+                .build()
+                .unwrap();
+            let builder = HistTreeBuilder::new(&params);
+            let id = if use_quantized_grad {
+                format!("{name}_quantized")
+            } else {
+                name.to_owned()
+            };
+            group.bench_function(id, |b| {
+                b.iter(|| {
+                    let mut sampler = ColumnSampler::all(features);
+                    black_box(builder.build(&ghist, &gpair, &rows, &mut sampler))
+                });
             });
-        });
+        }
     }
     group.finish();
 }
@@ -394,6 +359,7 @@ fn bench_log_metrics(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_metric");
     group.throughput(Throughput::Elements(N as u64));
 
+    let tweedie = create_metric("tweedie-nloglik@1.5", 0, &ObjectiveParams::default()).unwrap();
     for (name, metric, labels) in [
         ("logloss", &LogLoss as &dyn Metric, binary_labels.as_slice()),
         (
@@ -406,18 +372,14 @@ fn bench_log_metrics(c: &mut Criterion) {
             &GammaNLogLik as &dyn Metric,
             positive_labels.as_slice(),
         ),
+        (
+            "tweedie_nloglik",
+            tweedie.as_ref(),
+            positive_labels.as_slice(),
+        ),
     ] {
         bench_metric_pair(&mut group, name, metric, &probabilities, labels, &weights);
     }
-    let tweedie = create_metric("tweedie-nloglik@1.5", 0, &ObjectiveParams::default()).unwrap();
-    bench_metric_pair(
-        &mut group,
-        "tweedie_nloglik",
-        tweedie.as_ref(),
-        &probabilities,
-        &positive_labels,
-        &weights,
-    );
     group.finish();
 }
 

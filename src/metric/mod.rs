@@ -4,6 +4,17 @@
 //! [`crate::objective::Objective::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
+/// Short-circuit a [`Metric::eval`] to NaN when its inputs are not
+/// [`consistent`] with `width` predictions per label. Defined before the
+/// submodules so their metrics can use it too.
+macro_rules! nan_unless_consistent {
+    ($preds:expr, $labels:expr, $weights:expr, $width:expr) => {
+        if !$crate::metric::consistent($preds, $labels, $weights, $width) {
+            return f64::NAN;
+        }
+    };
+}
+
 mod distributional;
 mod elementwise;
 mod quantile;
@@ -117,16 +128,6 @@ fn consistent(preds: &[f32], labels: &[f32], weights: Option<&[f32]>, width: usi
         && weights.is_none_or(|w| w.len() == labels.len())
 }
 
-/// Short-circuit a [`Metric::eval`] to NaN when its inputs are not
-/// [`consistent`] with `width` predictions per label.
-macro_rules! nan_unless_consistent {
-    ($preds:expr, $labels:expr, $weights:expr, $width:expr) => {
-        if !consistent($preds, $labels, $weights, $width) {
-            return f64::NAN;
-        }
-    };
-}
-
 /// Normalize a metric total, returning zero for an empty or nonpositive weight sum.
 #[inline]
 fn weighted_mean((total, weight): (f64, f64)) -> f64 {
@@ -146,7 +147,7 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
 /// metrics with non-trivial logic (`auc`, `aucpr`, ranking) stay
 /// handwritten below.
 macro_rules! simple_metric {
-    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path) => {
+    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path $(=> $root:ident)?) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, Default)]
         pub struct $ty;
@@ -156,21 +157,7 @@ macro_rules! simple_metric {
             }
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
                 nan_unless_consistent!(preds, labels, weights, 1);
-                weighted_mean($simd(preds, labels, weights))
-            }
-        }
-    };
-    ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path => sqrt) => {
-        $(#[$m])*
-        #[derive(Debug, Clone, Copy, Default)]
-        pub struct $ty;
-        impl Metric for $ty {
-            fn name(&self) -> &str {
-                $name
-            }
-            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-                nan_unless_consistent!(preds, labels, weights, 1);
-                weighted_mean($simd(preds, labels, weights)).sqrt()
+                weighted_mean($simd(preds, labels, weights))$(.$root())?
             }
         }
     };
@@ -259,12 +246,16 @@ fn tie_runs<'a>(
     })
 }
 
-/// Multi-label macro average (XGBoost `MultiAUC` with
-/// `MultiAUCType::kMultiLabel`): evaluate `metric` on each target column of
-/// a `[row][target]` label matrix with the row weights, then take the plain
-/// mean over targets.
+/// [`Metric::eval_info`] of the curve metrics: for a label matrix, XGBoost's
+/// multi-label macro average (`MultiAUC` with `MultiAUCType::kMultiLabel`):
+/// evaluate `metric` on each target column of the `[row][target]` labels
+/// with the row weights, then take the plain mean over targets. A single
+/// label column evaluates through [`Metric::eval_grouped`].
 fn macro_average_targets(metric: &dyn Metric, preds: &[f32], info: &MetaInfo) -> f64 {
     let k = info.n_targets;
+    if k <= 1 {
+        return metric.eval_grouped(preds, info.labels, info.weights, info.group);
+    }
     let mut col_preds = Vec::with_capacity(info.n_rows);
     let mut col_labels = Vec::with_capacity(info.n_rows);
     let mut total = 0.0;
@@ -327,10 +318,7 @@ impl Metric for Auc {
     }
 
     fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
-        if info.n_targets > 1 {
-            return macro_average_targets(self, preds, info);
-        }
-        self.eval_grouped(preds, info.labels, info.weights, info.group)
+        macro_average_targets(self, preds, info)
     }
 }
 
@@ -446,8 +434,7 @@ impl Ndcg {
             .map(|(p, &i)| ndcg_gain(f64::from(labels[i])) * ndcg_discount(p))
             .sum();
 
-        let labels_f64: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
-        let idcg = ideal_dcg(&labels_f64, cut);
+        let idcg = ideal_dcg(labels, cut);
 
         if idcg <= 0.0 { 0.0 } else { dcg / idcg }
     }
@@ -483,25 +470,22 @@ impl Metric for Ndcg {
     }
 }
 
-/// NDCG gain of a relevance label: `2^rel - 1`. Shared with the LambdaMART
-/// objective's `|ΔNDCG|` weighting.
+/// NDCG gain of a relevance label: `2^rel - 1`.
 #[inline]
-pub(crate) fn ndcg_gain(rel: f64) -> f64 {
+fn ndcg_gain(rel: f64) -> f64 {
     (2.0f64).powf(rel) - 1.0
 }
 
-/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`. Shared with
-/// the LambdaMART objective's `|ΔNDCG|` weighting.
+/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`.
 #[inline]
-pub(crate) fn ndcg_discount(p: usize) -> f64 {
+fn ndcg_discount(p: usize) -> f64 {
     1.0 / ((p + 2) as f64).log2()
 }
 
 /// Ideal DCG of a group: labels sorted by descending relevance, gains
-/// accumulated with the standard discount, truncated at `cut` ranks. Shared by
-/// the `ndcg` metric and the LambdaMART objective's `|ΔNDCG|` weighting.
-pub(crate) fn ideal_dcg(labels: &[f64], cut: usize) -> f64 {
-    let mut ideal: Vec<f64> = labels.to_vec();
+/// accumulated with the standard discount, truncated at `cut` ranks.
+fn ideal_dcg(labels: &[f32], cut: usize) -> f64 {
+    let mut ideal: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
     ideal.sort_by(|a, b| b.total_cmp(a));
     ideal[..cut]
         .iter()
@@ -654,10 +638,7 @@ impl Metric for AucPr {
     }
 
     fn eval_info(&self, preds: &[f32], info: &MetaInfo) -> f64 {
-        if info.n_targets > 1 {
-            return macro_average_targets(self, preds, info);
-        }
-        self.eval_grouped(preds, info.labels, info.weights, info.group)
+        macro_average_targets(self, preds, info)
     }
 }
 
@@ -1143,31 +1124,16 @@ mod tests {
 
     #[test]
     fn factory_parses_ranking_metrics_with_k() {
-        assert_eq!(
-            create_metric("ndcg", 0, &ObjectiveParams::default())
-                .unwrap()
-                .name(),
-            "ndcg"
-        );
-        assert_eq!(
-            create_metric("map", 0, &ObjectiveParams::default())
-                .unwrap()
-                .name(),
-            "map"
-        );
-        // `@k` suffix parses without error.
-        assert_eq!(
-            create_metric("ndcg@5", 0, &ObjectiveParams::default())
-                .unwrap()
-                .name(),
-            "ndcg"
-        );
-        assert_eq!(
-            create_metric("map@10", 0, &ObjectiveParams::default())
-                .unwrap()
-                .name(),
-            "map"
-        );
+        // An `@k` suffix parses and is dropped from the name.
+        for (name, base) in [
+            ("ndcg", "ndcg"),
+            ("map", "map"),
+            ("ndcg@5", "ndcg"),
+            ("map@10", "map"),
+        ] {
+            let metric = create_metric(name, 0, &ObjectiveParams::default()).unwrap();
+            assert_eq!(metric.name(), base, "{name}");
+        }
     }
 
     #[test]

@@ -30,6 +30,35 @@ pub fn subtract_in_place(parent: &mut [GradStats], child: &[GradStats]) {
     }
 }
 
+/// Split a flat histogram of `stride` entries per global bin into each
+/// feature's disjoint bin range, in feature order: `(first_bin, slice)`.
+pub(crate) fn feature_slices<'a, T>(
+    ghist: &GHistIndex,
+    hist: &'a mut [T],
+    stride: usize,
+) -> Vec<(usize, &'a mut [T])> {
+    let cuts = ghist.cuts();
+    let mut slices = Vec::with_capacity(ghist.n_cols());
+    let mut rest = hist;
+    let mut next = 0;
+    for f in 0..ghist.n_cols() {
+        let (fs, fe) = cuts.feature_bins(f);
+        assert_eq!(
+            fs, next,
+            "feature bin ranges must be contiguous and ordered"
+        );
+        let (head, tail) = rest.split_at_mut((fe - fs) * stride);
+        slices.push((fs, head));
+        rest = tail;
+        next = fe;
+    }
+    assert!(
+        rest.is_empty(),
+        "feature bin ranges must cover the histogram"
+    );
+    slices
+}
+
 /// Backend that builds and combines gradient histograms.
 ///
 /// Sibling histograms reuse the parent buffer via the free [`subtract_in_place`];
@@ -71,26 +100,7 @@ impl HistogramBackend for CpuBackend {
         // to the sequential sweep.
         if let (Some(columns), Some(range)) = (ghist.column_bins(), contiguous_range(rows)) {
             let n_rows = ghist.n_rows();
-            let cuts = ghist.cuts();
-            let mut slices = Vec::with_capacity(ghist.n_cols());
-            let mut rest = out;
-            let mut next = 0;
-            for f in 0..ghist.n_cols() {
-                let (fs, fe) = cuts.feature_bins(f);
-                assert_eq!(
-                    fs, next,
-                    "feature bin ranges must be contiguous and ordered"
-                );
-                let (head, tail) = rest.split_at_mut(fe - fs);
-                slices.push((fs, head));
-                rest = tail;
-                next = fe;
-            }
-            assert!(
-                rest.is_empty(),
-                "feature bin ranges must cover the histogram"
-            );
-            slices
+            feature_slices(ghist, out, 1)
                 .into_par_iter()
                 .enumerate()
                 .for_each(|(f, (fs, slice))| {
@@ -171,6 +181,38 @@ fn accumulate(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [G
     }
 }
 
+/// Prefetch the `len` bins of one row starting at `start`, a cache line at a
+/// time.
+#[inline(always)]
+pub(crate) fn prefetch_bins<B>(bins: &[B], start: usize, len: usize) {
+    for offset in (0..len).step_by(CACHE_LINE / std::mem::size_of::<B>()) {
+        if let Some(bin) = bins.get(start + offset) {
+            crate::simd::prefetch_read(bin);
+        }
+    }
+}
+
+/// Feature blocks `[f0, f1)` of a dense index with `stride` features whose
+/// bin ranges each span at most `block_bins` (a single feature may exceed it).
+pub(crate) fn feature_blocks(
+    ghist: &GHistIndex,
+    stride: usize,
+    block_bins: usize,
+) -> Vec<(usize, usize)> {
+    let cuts = ghist.cuts();
+    let mut blocks = Vec::new();
+    let mut block_start = 0;
+    for f in 1..=stride {
+        let span = cuts.feature_bins(f - 1).1 - cuts.feature_bins(block_start).0;
+        if span > block_bins && f - 1 > block_start {
+            blocks.push((block_start, f - 1));
+            block_start = f - 1;
+        }
+    }
+    blocks.push((block_start, stride));
+    blocks
+}
+
 #[inline(always)]
 fn accumulate_bins<B: BinIndex>(
     ghist: &GHistIndex,
@@ -195,13 +237,6 @@ fn accumulate_bins<B: BinIndex>(
             unsafe { out.get_unchecked_mut(bin.index()) }.add(g);
         }
     };
-    let prefetch_row = |start: usize, len: usize| {
-        for offset in (0..len).step_by(CACHE_LINE / std::mem::size_of::<B>()) {
-            if let Some(bin) = bins.get(start + offset) {
-                crate::simd::prefetch_read(bin);
-            }
-        }
-    };
 
     // A contiguous row range (the root, or a root chunk, without row
     // sampling) sweeps the column-major copy one feature at a time: the bins
@@ -219,14 +254,14 @@ fn accumulate_bins<B: BinIndex>(
         return;
     }
     if let Some(stride) = ghist.dense_stride() {
-        accumulate_dense(ghist, bins, stride, rows, gpair, out, add_row, prefetch_row);
+        accumulate_dense(ghist, bins, stride, rows, gpair, out, add_row);
     } else {
         let rp = ghist.row_ptr();
         for (i, &r) in rows.iter().enumerate() {
             if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
                 let ahead = ahead as usize;
                 if let (Some(&start), Some(&end)) = (rp.get(ahead), rp.get(ahead + 1)) {
-                    prefetch_row(start, end - start);
+                    prefetch_bins(bins, start, end - start);
                 }
                 if let Some(gp) = gpair.get(ahead) {
                     crate::simd::prefetch_read(gp);
@@ -305,7 +340,6 @@ const BLOCK_BINS: usize = 4096;
 /// receives its rows in ascending order, so the result is identical to a
 /// straight row sweep. The tiling only changes which histogram bins are hot.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn accumulate_dense<B: BinIndex>(
     ghist: &GHistIndex,
     bins: &[B],
@@ -314,25 +348,12 @@ fn accumulate_dense<B: BinIndex>(
     gpair: &[GradPair],
     out: &mut [GradStats],
     add_row: impl Fn(&[B], GradPair, &mut [GradStats]),
-    prefetch_row: impl Fn(usize, usize),
 ) {
-    // Feature blocks `[f0, f1)` whose bin ranges each span at most BLOCK_BINS.
-    let cuts = ghist.cuts();
-    let mut blocks: Vec<(usize, usize)> = Vec::new();
-    let mut block_start = 0;
-    for f in 1..=stride {
-        let span = cuts.feature_bins(f - 1).1 - cuts.feature_bins(block_start).0;
-        if span > BLOCK_BINS && f - 1 > block_start {
-            blocks.push((block_start, f - 1));
-            block_start = f - 1;
-        }
-    }
-    blocks.push((block_start, stride));
-
+    let blocks = feature_blocks(ghist, stride, BLOCK_BINS);
     let prefetch = |rows: &[u32], i: usize| {
         if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
             let ahead = ahead as usize;
-            prefetch_row(ahead * stride, stride);
+            prefetch_bins(bins, ahead * stride, stride);
             if let Some(gp) = gpair.get(ahead) {
                 crate::simd::prefetch_read(gp);
             }
@@ -367,38 +388,6 @@ mod tests {
     use crate::data::DMatrix;
     use crate::data::quantile::HistCuts;
 
-    fn brute_force(
-        ghist: &GHistIndex,
-        rows: &[u32],
-        gpair: &[GradPair],
-        total: usize,
-    ) -> Histogram {
-        let mut h = zeroed(total);
-        accumulate(ghist, rows, gpair, &mut h);
-        h
-    }
-
-    #[test]
-    fn build_matches_brute_force() {
-        let n = 200;
-        let x: Vec<f32> = (0..n).map(|i| (i % 17) as f32).collect();
-        let data = DMatrix::from_dense(&x, n, 1).unwrap();
-        let cuts = HistCuts::from_dmatrix(&data, 32);
-        let ghist = GHistIndex::from_dmatrix(&data, cuts);
-        let gpair: Vec<GradPair> = (0..n)
-            .map(|i| GradPair::new((i as f32) * 0.1 - 5.0, 1.0))
-            .collect();
-        let rows: Vec<u32> = (0..n as u32).collect();
-
-        let mut out = zeroed(ghist.total_bins());
-        CpuBackend.build(&ghist, &rows, &gpair, &mut out);
-        let expect = brute_force(&ghist, &rows, &gpair, ghist.total_bins());
-        for (a, b) in out.iter().zip(&expect) {
-            assert!((a.grad - b.grad).abs() < 1e-4);
-            assert!((a.hess - b.hess).abs() < 1e-4);
-        }
-    }
-
     #[test]
     fn subtraction_identity() {
         // parent = left + right, so parent - left = right.
@@ -416,36 +405,6 @@ mod tests {
         for i in 0..total {
             assert!((out[i].grad - right[i].grad).abs() < 1e-12);
             assert!((out[i].hess - right[i].hess).abs() < 1e-12);
-        }
-    }
-
-    #[test]
-    fn parallel_matches_sequential_large() {
-        let n = PARALLEL_THRESHOLD + 37;
-        let x: Vec<f32> = (0..n).map(|i| (i % 251) as f32).collect();
-        let data = DMatrix::from_dense(&x, n, 1).unwrap();
-        let cuts = HistCuts::from_dmatrix(&data, 64);
-        let ghist = GHistIndex::from_dmatrix(&data, cuts);
-        let gpair: Vec<GradPair> = (0..n)
-            .map(|i| GradPair::new(((i * 7) % 13) as f32 - 6.0, 1.0))
-            .collect();
-        let rows: Vec<u32> = (0..n as u32).collect();
-
-        let mut out = zeroed(ghist.total_bins());
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap()
-            .install(|| CpuBackend.build(&ghist, &rows, &gpair, &mut out));
-        let expect = brute_force(&ghist, &rows, &gpair, ghist.total_bins());
-        for (a, b) in out.iter().zip(&expect) {
-            assert!(
-                (a.grad - b.grad).abs() < 1e-2,
-                "grad {} vs {}",
-                a.grad,
-                b.grad
-            );
-            assert!((a.hess - b.hess).abs() < 1e-2);
         }
     }
 

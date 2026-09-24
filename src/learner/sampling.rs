@@ -19,7 +19,9 @@
 //! caller's RNG, then one uniform draw per row from a stream fixed per block of
 //! [`BLOCK_ROWS`] rows, so the sample does not depend on the thread count.
 
+use crate::K_RT_EPS_F32;
 use crate::objective::GradPair;
+use crate::rng::GOLDEN;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
@@ -27,9 +29,6 @@ use rayon::prelude::*;
 /// XGBoost `kDefaultMvsLambda`: the Hessian weight inside `r_i`. A fixed
 /// sampling regularizer, unrelated to the tree `lambda`.
 const MVS_LAMBDA: f32 = 0.1;
-
-/// XGBoost `kRtEps`: the smallest threshold magnitude used as a divisor.
-const RT_EPS: f32 = 1e-6;
 
 /// Rows per independently seeded random stream (and per parallel task).
 const BLOCK_ROWS: usize = 4096;
@@ -91,12 +90,7 @@ pub(crate) fn gradient_based_sample(
     let reg_abs_grad: Vec<f32> = gpair
         .par_chunks(n_targets)
         .with_min_len(BLOCK_ROWS)
-        .map(|row| {
-            let sum_sq = row.iter().fold(0.0f32, |acc, g| {
-                acc + (g.grad * g.grad + MVS_LAMBDA * (g.hess * g.hess))
-            });
-            sum_sq.sqrt()
-        })
+        .map(regularized_abs_grad)
         .collect();
     let threshold = threshold(&reg_abs_grad, budget);
 
@@ -145,7 +139,15 @@ pub(crate) fn gradient_based_sample(
 
 /// The seed of one row block's random stream.
 fn block_seed(seed: u64, block: usize) -> u64 {
-    seed ^ (block as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    seed ^ (block as u64 + 1).wrapping_mul(GOLDEN)
+}
+
+/// A row's regularized absolute gradient `sqrt(sum_t(g_t^2 + 0.1 * h_t^2))`.
+fn regularized_abs_grad(row: &[GradPair]) -> f32 {
+    let sum_sq = row.iter().fold(0.0f32, |acc, g| {
+        acc + (g.grad * g.grad + MVS_LAMBDA * (g.hess * g.hess))
+    });
+    sum_sq.sqrt()
 }
 
 /// XGBoost `CalculateThreshold`: the `u` with `sum_i min(1, r_i / u) = budget`,
@@ -192,8 +194,8 @@ fn probability(threshold: f32, reg_abs_grad: f32) -> f32 {
     if threshold.is_infinite() {
         return 0.0;
     }
-    let u = if threshold.abs() < RT_EPS {
-        RT_EPS.copysign(threshold)
+    let u = if threshold.abs() < K_RT_EPS_F32 {
+        K_RT_EPS_F32.copysign(threshold)
     } else {
         threshold
     };
@@ -226,14 +228,7 @@ mod tests {
     }
 
     fn rag(g: &[GradPair], n_targets: usize) -> Vec<f32> {
-        g.chunks(n_targets)
-            .map(|row| {
-                row.iter()
-                    .map(|g| g.grad * g.grad + MVS_LAMBDA * (g.hess * g.hess))
-                    .sum::<f32>()
-                    .sqrt()
-            })
-            .collect()
+        g.chunks(n_targets).map(regularized_abs_grad).collect()
     }
 
     #[test]

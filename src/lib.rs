@@ -141,8 +141,19 @@ pub mod learner;
 pub mod metric;
 pub mod model;
 pub mod objective;
+mod rng;
 mod simd;
+#[cfg(test)]
+mod test_support;
 pub mod tree;
+
+/// `1e-6` in `f64` arithmetic, where the crate compares against XGBoost's
+/// `kRtEps` in double precision (the `f64` literal, not [`K_RT_EPS_F32`]
+/// widened).
+pub(crate) const K_RT_EPS: f64 = 1e-6;
+/// XGBoost's `kRtEps` (`1e-6f`): the minimum gain improvement a split must
+/// beat, and the floor of sampling weights and near-zero sums.
+pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 
 /// Commonly used imports include `use hessboost::prelude::*;`.
 ///

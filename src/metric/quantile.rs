@@ -186,12 +186,7 @@ mod tests {
     fn empty_labels_evaluate_to_nan() {
         let info = MetaInfo {
             n_rows: 3,
-            labels: &[],
-            n_targets: 1,
-            weights: None,
-            group: None,
-            label_lower_bound: None,
-            label_upper_bound: None,
+            ..MetaInfo::new(&[], None, None)
         };
         let q = QuantileError::new(&[0.5]).unwrap();
         let e = ExpectileError::new(&[0.2, 0.8]).unwrap();

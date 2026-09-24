@@ -13,8 +13,9 @@
 //!   `fixtures/exports/` for `scripts/check_exports.py` to reload in XGBoost.
 //!   Fixtures carrying continuation, refresh, iteration-range or slice data
 //!   add those checks (column `extra`).
-//! * [`quantile_cuts_match_xgboost`] compares `hist` quantile cuts bit-for-bit
-//!   against `DMatrix.get_quantile_cut()` oracles in `fixtures/cuts/`.
+//! * [`quantile_cuts_match_xgboost`] compares `hist` and `approx` quantile
+//!   cuts bit-for-bit against `DMatrix.get_quantile_cut()` oracles in
+//!   `fixtures/cuts/`.
 //!
 //! ```sh
 //! uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
@@ -218,28 +219,30 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
-fn load_all<T: for<'de> Deserialize<'de>>(dir: &Path, what: &str) -> Vec<(String, T)> {
+/// Every `*.json` fixture in `dir`, in path order.
+fn load_all<T: for<'de> Deserialize<'de>>(dir: &Path, what: &str) -> Vec<T> {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
         panic!(
             "{what} fixtures missing at {}: {e}; run scripts/gen_fixtures.py",
             dir.display()
         )
     });
-    let mut out: Vec<(String, T)> = entries
+    let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
-        .map(|path| {
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            let value = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()));
-            (path.display().to_string(), value)
-        })
         .collect();
-    assert!(!out.is_empty(), "no {what} fixtures in {}", dir.display());
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    assert!(!paths.is_empty(), "no {what} fixtures in {}", dir.display());
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +826,7 @@ impl Case<'_> {
     /// fixture has none.
     fn extras(
         &mut self,
+        imported: &hessboost::error::Result<BoostedModel>,
         trained: Option<&BoostedModel>,
         dtest: &DMatrix,
         dcontrib: &DMatrix,
@@ -836,7 +840,7 @@ impl Case<'_> {
         {
             return "-".to_string();
         }
-        let imported = match BoostedModel::from_xgboost_json(&fx.xgb_model.to_string()) {
+        let imported = match imported {
             Ok(m) => m,
             Err(e) => {
                 self.fail(format!("extras import: {e}"));
@@ -855,7 +859,7 @@ impl Case<'_> {
         if let Some(r) = &fx.refresh {
             checks.push((
                 "refresh imported".to_string(),
-                self.refresh(&imported, dtest, r),
+                self.refresh(imported, dtest, r),
                 fx.tol.train,
             ));
             if let Some(t) = trained {
@@ -866,7 +870,7 @@ impl Case<'_> {
                 ));
             }
         }
-        checks.extend(self.range_checks(&imported, dtest, dcontrib, fx.tol.import, true));
+        checks.extend(self.range_checks(imported, dtest, dcontrib, fx.tol.import, true));
         if let Some(t) = trained {
             checks.extend(self.range_checks(t, dtest, dcontrib, fx.tol.train, false));
         }
@@ -914,9 +918,13 @@ impl Case<'_> {
     /// `(rows, num_class, n_cols + 1, n_cols + 1)` are identical to hessboost's
     /// `predict_contribs` / `predict_interactions` layouts, so both flatten to
     /// the same order.
-    fn import_and_compare(&mut self, dtest: &DMatrix, dcontrib: &DMatrix) -> [String; 4] {
+    fn import_and_compare(
+        &mut self,
+        imported: &hessboost::error::Result<BoostedModel>,
+        dtest: &DMatrix,
+        dcontrib: &DMatrix,
+    ) -> [String; 4] {
         let fx = self.fx;
-        let imported = BoostedModel::from_xgboost_json(&fx.xgb_model.to_string());
         if booster_of(fx) == "gblinear" {
             return match imported {
                 Err(HessboostError::ModelFormat(_)) => std::array::from_fn(|_| "n/a".to_string()),
@@ -971,13 +979,16 @@ impl Case<'_> {
     /// exactly the model the JSON document gives (same native bytes, hence
     /// bit-identical predictions, margins and contributions), and fails the
     /// same way for unsupported boosters.
-    fn import_ubjson(&mut self, dir: &Path) -> String {
+    fn import_ubjson(
+        &mut self,
+        from_json: &hessboost::error::Result<BoostedModel>,
+        dir: &Path,
+    ) -> String {
         let fx = self.fx;
         let from_ubj = std::fs::read(dir.join(&fx.xgb_model_ubj))
             .map_err(HessboostError::from)
             .and_then(|bytes| BoostedModel::from_xgboost_ubjson(&bytes));
-        let from_json = BoostedModel::from_xgboost_json(&fx.xgb_model.to_string());
-        let verdict = match (&from_ubj, &from_json) {
+        let verdict = match (&from_ubj, from_json) {
             (Ok(u), Ok(j)) => match (u.to_bytes(), j.to_bytes()) {
                 (Ok(u), Ok(j)) if u == j => Ok("same"),
                 (Ok(_), Ok(_)) => Err("UBJSON import differs from the JSON import".to_string()),
@@ -1100,10 +1111,11 @@ impl Case<'_> {
             }
         };
 
+        let imported = BoostedModel::from_xgboost_json(&fx.xgb_model.to_string());
         [row.import, row.margin, row.contribs, row.interactions] =
-            self.import_and_compare(&dtest, &dcontrib);
-        row.ubj = self.import_ubjson(dir);
-        row.extra = self.extras(trained.as_ref(), &dtest, &dcontrib);
+            self.import_and_compare(&imported, &dtest, &dcontrib);
+        row.ubj = self.import_ubjson(&imported, dir);
+        row.extra = self.extras(&imported, trained.as_ref(), &dtest, &dcontrib);
         row
     }
 }
@@ -1129,7 +1141,7 @@ fn xgboost_parity() {
     let dir = fixtures_dir();
     let exports = dir.join("exports");
     std::fs::create_dir_all(&exports).expect("create fixtures/exports");
-    let fixtures: Vec<(String, Fixture)> = load_all(&dir, "parity");
+    let fixtures: Vec<Fixture> = load_all(&dir, "parity");
 
     let mut failures = Vec::new();
     println!(
@@ -1146,7 +1158,7 @@ fn xgboost_parity() {
         "evals",
         "extra"
     );
-    for (_, fx) in &fixtures {
+    for fx in &fixtures {
         let row = Case {
             fx,
             failures: &mut failures,
@@ -1180,9 +1192,9 @@ fn xgboost_parity() {
 #[test]
 #[ignore = "requires fixtures from scripts/gen_fixtures.py"]
 fn quantile_cuts_match_xgboost() {
-    let fixtures: Vec<(String, CutFixture)> = load_all(&fixtures_dir().join("cuts"), "cut");
+    let fixtures: Vec<CutFixture> = load_all(&fixtures_dir().join("cuts"), "cut");
     let mut failures: Vec<String> = Vec::new();
-    for (_, fx) in &fixtures {
+    for fx in &fixtures {
         let mut d = DMatrix::from_dense(&fx.x, fx.n_rows, fx.n_cols).expect("dense matrix");
         if let Some(w) = &fx.w {
             d = d.with_weights(w).expect("weights");

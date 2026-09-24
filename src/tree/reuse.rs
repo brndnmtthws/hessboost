@@ -63,9 +63,9 @@ pub(crate) trait CategoricalPenalty {
     fn categorical_penalty(&self, feature: u32, cats_left: &[u32]) -> f64;
 }
 
-/// A sorted copy of a category set, the identity under which sets are
-/// compared.
-fn sorted_set(cats: &[u32]) -> Vec<u32> {
+/// A sorted, deduplicated copy of a category set: the identity under which
+/// sets are compared here and stored in the compact model dictionary.
+pub(crate) fn canonical_categories(cats: &[u32]) -> Vec<u32> {
     let mut set = cats.to_vec();
     set.sort_unstable();
     set.dedup();
@@ -115,8 +115,7 @@ impl ReuseSet {
     pub(crate) fn record_tree(&mut self, tree: &RegTree) {
         for node in tree.nodes().iter().filter(|n| !n.is_leaf()) {
             if node.is_categorical {
-                let cats = &tree.categories()[node.cat_begin as usize..node.cat_end as usize];
-                self.record_categorical(node.split_feature, cats);
+                self.record_categorical(node.split_feature, tree.node_categories(node));
             } else {
                 self.record_numeric(node.split_feature, node.split_cond);
             }
@@ -134,7 +133,7 @@ impl ReuseSet {
     pub(crate) fn record_categorical(&mut self, feature: u32, cats_left: &[u32]) {
         let f = feature as usize;
         self.features[f] = true;
-        self.category_sets[f].insert(sorted_set(cats_left));
+        self.category_sets[f].insert(canonical_categories(cats_left));
     }
 
     /// Penalty of a numeric split on `feature` at `threshold`.
@@ -153,7 +152,8 @@ impl ReuseSet {
 impl CategoricalPenalty for ReuseSet {
     fn categorical_penalty(&self, feature: u32, cats_left: &[u32]) -> f64 {
         let f = feature as usize;
-        let used = self.features[f] && self.category_sets[f].contains(&sorted_set(cats_left));
+        let used =
+            self.features[f] && self.category_sets[f].contains(&canonical_categories(cats_left));
         f64::from(penalty(self.features[f], used, self.iota, self.xi))
     }
 }
@@ -242,7 +242,7 @@ impl HistReuse {
         self.category_sets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[feature as usize]
-            .insert(sorted_set(cats_left));
+            .insert(canonical_categories(cats_left));
     }
 }
 
@@ -255,7 +255,7 @@ impl CategoricalPenalty for HistReuse {
                 .category_sets
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)[f]
-                .contains(&sorted_set(cats_left));
+                .contains(&canonical_categories(cats_left));
         f64::from(penalty(feature_used, used, self.iota, self.xi))
     }
 }
@@ -421,10 +421,7 @@ mod tests {
             .chunks(f)
             .map(|r| r.iter().enumerate().map(|(j, v)| v * (j + 1) as f32).sum())
             .collect();
-        DMatrix::from_dense(&x, n, f)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        crate::test_support::labeled_dense(&x, n, f, &y)
     }
 
     fn dictionary(model: &crate::learner::BoostedModel) -> (usize, usize) {

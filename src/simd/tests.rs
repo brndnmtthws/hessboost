@@ -15,11 +15,70 @@ fn assert_grad_pairs_close(actual: &[GradPair], expected: &[GradPair]) {
     }
 }
 
+/// The vector exponential matches `f32::exp` within 7e-7 relative error and
+/// reproduces NaN, infinities, and underflow to zero exactly.
+fn assert_exp_close(actual: &[f32], expected: &[f32]) {
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        if expected.is_nan() {
+            assert!(actual.is_nan());
+        } else if expected.is_infinite() || expected == 0.0 {
+            assert_eq!(actual, expected);
+        } else {
+            let relative = ((actual - expected) / expected).abs();
+            assert!(
+                relative <= 7.0e-7,
+                "SIMD exp {actual} differs from scalar {expected} by {relative}"
+            );
+        }
+    }
+}
+
+/// `(loss, weight)` sums agree within a relative `tolerance`.
+fn assert_sums_close(actual: (f64, f64), expected: (f64, f64), tolerance: f64) {
+    assert!((actual.0 - expected.0).abs() <= expected.0.abs() * tolerance);
+    assert!((actual.1 - expected.1).abs() <= expected.1.abs() * tolerance);
+}
+
+/// `start + (i % period) · step` for `i` in `0..len`: the periodic test
+/// inputs (`period == len` gives a linear ramp).
+fn sawtooth(len: usize, period: usize, start: f32, step: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| start + (i % period) as f32 * step)
+        .collect()
+}
+
+/// Scalar `softmax_scalar` over every `num_class` row of `values`.
+fn scalar_softmax_rows(values: &[f32], num_class: usize) -> Vec<f32> {
+    let mut out = values.to_vec();
+    for row in out.chunks_mut(num_class) {
+        softmax_scalar(row);
+    }
+    out
+}
+
+/// [`softmax_gradient_rows_scalar`] over every row of a complete matrix.
+fn scalar_softmax_gradient(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    num_class: usize,
+) -> Vec<GradPair> {
+    let mut out = vec![GradPair::default(); preds.len()];
+    softmax_gradient_rows_scalar(
+        preds,
+        labels,
+        weights,
+        1e-16,
+        &mut out,
+        0..labels.len(),
+        num_class,
+    );
+    out
+}
+
 #[test]
 fn sigmoid_dispatch_is_close_to_scalar() {
-    let mut actual: Vec<f32> = (0..4_103)
-        .map(|i| i as f32 * (40.0 / 4_102.0) - 20.0)
-        .collect();
+    let mut actual = sawtooth(4_103, 4_103, -20.0, 40.0 / 4_102.0);
     let expected: Vec<f32> = actual.iter().map(|&value| sigmoid_scalar(value)).collect();
     sigmoid_inplace(&mut actual);
     for (actual, expected) in actual.iter().zip(expected) {
@@ -32,25 +91,11 @@ fn sigmoid_dispatch_is_close_to_scalar() {
 
 #[test]
 fn exp_dispatch_is_close_to_scalar_and_preserves_special_values() {
-    let mut actual: Vec<f32> = (0..8_195)
-        .map(|i| i as f32 * (160.0 / 8_192.0) - 80.0)
-        .collect();
+    let mut actual = sawtooth(8_195, 8_195, -80.0, 160.0 / 8_192.0);
     actual.extend([f32::NEG_INFINITY, f32::INFINITY, f32::NAN]);
     let expected: Vec<f32> = actual.iter().map(|value| value.exp()).collect();
     exp_inplace(&mut actual);
-    for (actual, expected) in actual.iter().zip(expected) {
-        if expected.is_nan() {
-            assert!(actual.is_nan());
-        } else if expected.is_infinite() || expected == 0.0 {
-            assert_eq!(*actual, expected);
-        } else {
-            let relative = ((actual - expected) / expected).abs();
-            assert!(
-                relative <= 7.0e-7,
-                "SIMD exp {actual} differs from scalar {expected} by {relative}"
-            );
-        }
-    }
+    assert_exp_close(&actual, &expected);
 }
 
 #[test]
@@ -58,9 +103,7 @@ fn exp_dispatch_handles_special_values_inside_vector_blocks() {
     // With a length divisible by every vector width there is no scalar tail,
     // so these special values exercise the in-block fallback paths rather
     // than landing after the vector loop.
-    let mut actual: Vec<f32> = (0..8_192)
-        .map(|i| i as f32 * (160.0 / 8_192.0) - 80.0)
-        .collect();
+    let mut actual = sawtooth(8_192, 8_192, -80.0, 160.0 / 8_192.0);
     for (index, value) in [
         (3, f32::NEG_INFINITY),
         (67, f32::INFINITY),
@@ -73,34 +116,26 @@ fn exp_dispatch_handles_special_values_inside_vector_blocks() {
     }
     let expected: Vec<f32> = actual.iter().map(|value| value.exp()).collect();
     exp_inplace(&mut actual);
-    for (actual, expected) in actual.iter().zip(expected) {
-        if expected.is_nan() {
-            assert!(actual.is_nan());
-        } else if expected.is_infinite() || expected == 0.0 {
-            assert_eq!(*actual, expected);
-        } else {
-            let relative = ((actual - expected) / expected).abs();
-            assert!(
-                relative <= 7.0e-7,
-                "SIMD exp {actual} differs from scalar {expected} by {relative}"
-            );
-        }
-    }
+    assert_exp_close(&actual, &expected);
 }
 
 #[test]
 fn logistic_gradient_dispatch_is_close_to_scalar() {
-    let preds: Vec<f32> = (0..4_103)
-        .map(|i| i as f32 * (40.0 / 4_102.0) - 20.0)
-        .collect();
+    let preds = sawtooth(4_103, 4_103, -20.0, 40.0 / 4_102.0);
     let labels: Vec<f32> = (0..preds.len()).map(|i| (i % 2) as f32).collect();
-    let weights: Vec<f32> = (0..preds.len())
-        .map(|i| 0.5 + (i % 13) as f32 * 0.125)
-        .collect();
+    let weights = sawtooth(preds.len(), 13, 0.5, 0.125);
     for weights in [None, Some(weights.as_slice())] {
         let mut expected = vec![GradPair::default(); preds.len()];
         let mut actual = vec![GradPair::default(); preds.len()];
-        logistic_gradient_scalar(&preds, &labels, weights, 1.5, 1e-16, &mut expected);
+        scalar::logistic_gradient(
+            &preds,
+            &labels,
+            weights,
+            1.5,
+            1e-16,
+            &mut expected,
+            0..preds.len(),
+        );
         logistic_gradient(&preds, &labels, weights, 1.5, 1e-16, &mut actual);
         for (actual, expected) in actual.iter().zip(expected) {
             assert!((actual.grad - expected.grad).abs() <= 5.0e-7);
@@ -111,49 +146,25 @@ fn logistic_gradient_dispatch_is_close_to_scalar() {
 
 #[test]
 fn count_gradients_are_close_to_scalar() {
-    let preds: Vec<f32> = (0..4_103)
-        .map(|i| i as f32 * (10.0 / 4_102.0) - 5.0)
-        .collect();
-    let labels: Vec<f32> = (0..preds.len())
-        .map(|i| 0.25 + (i % 101) as f32 * 0.02)
-        .collect();
-    let weights: Vec<f32> = (0..preds.len())
-        .map(|i| 0.5 + (i % 13) as f32 * 0.125)
-        .collect();
+    let preds = sawtooth(4_103, 4_103, -5.0, 10.0 / 4_102.0);
+    let labels = sawtooth(preds.len(), 101, 0.25, 0.02);
+    let weights = sawtooth(preds.len(), 13, 0.5, 0.125);
 
     for weights in [None, Some(weights.as_slice())] {
         let mut actual = vec![GradPair::default(); preds.len()];
         let mut expected = vec![GradPair::default(); preds.len()];
+        let range = 0..preds.len();
 
         poisson_gradient(&preds, &labels, weights, 0.7, &mut actual);
-        for i in 0..preds.len() {
-            let weight = weights.map_or(1.0, |values| values[i]);
-            expected[i] = GradPair::new(
-                (preds[i].exp() - labels[i]) * weight,
-                (preds[i] + 0.7).exp() * weight,
-            );
-        }
+        scalar::poisson_gradient(&preds, &labels, weights, 0.7, &mut expected, range.clone());
         assert_grad_pairs_close(&actual, &expected);
 
         gamma_gradient(&preds, &labels, weights, &mut actual);
-        for i in 0..preds.len() {
-            let weight = weights.map_or(1.0, |values| values[i]);
-            let scaled = labels[i] * (-preds[i]).exp();
-            expected[i] = GradPair::new((1.0 - scaled) * weight, scaled * weight);
-        }
+        scalar::gamma_gradient(&preds, &labels, weights, &mut expected, range.clone());
         assert_grad_pairs_close(&actual, &expected);
 
-        let rho = 1.5;
-        tweedie_gradient(&preds, &labels, weights, rho, &mut actual);
-        for i in 0..preds.len() {
-            let weight = weights.map_or(1.0, |values| values[i]);
-            let exp_1 = ((1.0 - rho) * preds[i]).exp();
-            let exp_2 = ((2.0 - rho) * preds[i]).exp();
-            expected[i] = GradPair::new(
-                (-labels[i] * exp_1 + exp_2) * weight,
-                (-labels[i] * (1.0 - rho) * exp_1 + (2.0 - rho) * exp_2) * weight,
-            );
-        }
+        tweedie_gradient(&preds, &labels, weights, 1.5, &mut actual);
+        scalar::tweedie_gradient(&preds, &labels, weights, 1.5, &mut expected, range);
         assert_grad_pairs_close(&actual, &expected);
     }
 }
@@ -161,11 +172,8 @@ fn count_gradients_are_close_to_scalar() {
 #[test]
 fn wide_softmax_dispatch_is_close_to_scalar() {
     for num_class in [8, 32, 33, 128, 131] {
-        let original: Vec<f32> = (0..num_class)
-            .map(|i| (i % 103) as f32 * 0.05 - 2.5)
-            .collect();
-        let mut expected = original.clone();
-        softmax_scalar(&mut expected);
+        let original = sawtooth(num_class, 103, -2.5, 0.05);
+        let expected = scalar_softmax_rows(&original, num_class);
         let mut actual = original;
         softmax_rows_inplace(&mut actual, num_class);
         for (actual, expected) in actual.iter().zip(expected) {
@@ -177,8 +185,7 @@ fn wide_softmax_dispatch_is_close_to_scalar() {
     // underflow behavior remains identical.
     let mut actual = vec![-100.0; 32];
     actual[0] = 100.0;
-    let mut expected = actual.clone();
-    softmax_scalar(&mut expected);
+    let expected = scalar_softmax_rows(&actual, 32);
     softmax_rows_inplace(&mut actual, 32);
     assert_eq!(actual, expected);
 }
@@ -187,19 +194,12 @@ fn wide_softmax_dispatch_is_close_to_scalar() {
 fn softmax_matrix_and_gradient_are_close_to_scalar() {
     for num_class in [4, 8, 17, 32, 33, 128, 131] {
         let rows = 257;
-        let original: Vec<f32> = (0..rows * num_class)
-            .map(|i| (i % 211) as f32 * 0.025 - 2.5)
-            .collect();
+        let original = sawtooth(rows * num_class, 211, -2.5, 0.025);
         let labels: Vec<f32> = (0..rows).map(|row| (row % num_class) as f32).collect();
-        let weight_values: Vec<f32> = (0..rows)
-            .map(|row| 0.5 + (row % 11) as f32 * 0.125)
-            .collect();
+        let weight_values = sawtooth(rows, 11, 0.5, 0.125);
 
         let mut transformed = original.clone();
-        let mut expected_transform = original.clone();
-        for row in expected_transform.chunks_mut(num_class) {
-            softmax_scalar(row);
-        }
+        let expected_transform = scalar_softmax_rows(&original, num_class);
         softmax_rows_inplace(&mut transformed, num_class);
         for (actual, expected) in transformed.iter().zip(&expected_transform) {
             assert!((actual - expected).abs() <= 3.0e-7);
@@ -207,17 +207,7 @@ fn softmax_matrix_and_gradient_are_close_to_scalar() {
 
         for weights in [None, Some(weight_values.as_slice())] {
             let mut actual = vec![GradPair::default(); original.len()];
-            let mut expected = vec![GradPair::default(); original.len()];
-            for row in 0..rows {
-                let base = row * num_class;
-                softmax_gradient_row_scalar(
-                    &original[base..base + num_class],
-                    labels[row] as usize,
-                    weights.map_or(1.0, |values| values[row]),
-                    1e-16,
-                    &mut expected[base..base + num_class],
-                );
-            }
+            let expected = scalar_softmax_gradient(&original, &labels, weights, num_class);
             softmax_gradient(&original, &labels, weights, num_class, 1e-16, &mut actual);
             assert_grad_pairs_close(&actual, &expected);
         }
@@ -233,10 +223,7 @@ fn short_softmax_batches_match_scalar_across_boundaries() {
                 .collect();
             let labels: Vec<f32> = (0..rows).map(|i| (i % num_class) as f32).collect();
             let weights: Vec<f32> = (0..rows).map(|i| (i % 7) as f32 * 0.25).collect();
-            let mut expected = original.clone();
-            for row in expected.chunks_mut(num_class) {
-                softmax_scalar(row);
-            }
+            let expected = scalar_softmax_rows(&original, num_class);
             // Offset and guard both buffers to exercise unaligned stores
             // and catch writes past batch/remainder boundaries, including odd rows.
             let mut values = vec![1234.0; original.len() + 2];
@@ -250,17 +237,7 @@ fn short_softmax_batches_match_scalar_across_boundaries() {
             for weight in [None, Some(weights.as_slice())] {
                 let guard = GradPair::new(1234.0, 5678.0);
                 let mut actual = vec![guard; original.len() + 2];
-                let mut expected = vec![GradPair::default(); original.len()];
-                for row in 0..rows {
-                    let base = row * num_class;
-                    softmax_gradient_row_scalar(
-                        &original[base..base + num_class],
-                        labels[row] as usize,
-                        weight.map_or(1.0, |w| w[row]),
-                        1e-16,
-                        &mut expected[base..base + num_class],
-                    );
-                }
+                let expected = scalar_softmax_gradient(&original, &labels, weight, num_class);
                 softmax_gradient(
                     &original,
                     &labels,
@@ -316,10 +293,7 @@ fn short_softmax_exceptional_rows_and_label_casts_match_scalar() {
             ] {
                 let mut original = vec![0.0; labels.len() * num_class];
                 original[position] = exceptional;
-                let mut expected = original.clone();
-                for row in expected.chunks_mut(num_class) {
-                    softmax_scalar(row);
-                }
+                let expected = scalar_softmax_rows(&original, num_class);
                 let mut actual = original.clone();
                 softmax_rows_inplace(&mut actual, num_class);
                 for (&actual, &expected) in actual.iter().zip(&expected) {
@@ -327,17 +301,7 @@ fn short_softmax_exceptional_rows_and_label_casts_match_scalar() {
                 }
                 for weight in [None, Some(weights.as_slice())] {
                     let mut actual = vec![GradPair::default(); original.len()];
-                    let mut expected = actual.clone();
-                    for row in 0..labels.len() {
-                        let base = row * num_class;
-                        softmax_gradient_row_scalar(
-                            &original[base..base + num_class],
-                            labels[row] as usize,
-                            weight.map_or(1.0, |w| w[row]),
-                            1e-16,
-                            &mut expected[base..base + num_class],
-                        );
-                    }
+                    let expected = scalar_softmax_gradient(&original, &labels, weight, num_class);
                     softmax_gradient(&original, &labels, weight, num_class, 1e-16, &mut actual);
                     for (actual, expected) in actual.iter().zip(expected) {
                         close(actual.grad, expected.grad);
@@ -381,16 +345,7 @@ fn assert_underflowing_softmax_gradient_matches_scalar(
 ) {
     let (preds, labels, weights) = underflowing_softmax_rows(num_class);
     for weights in [None, Some(weights.as_slice())] {
-        let mut expected = vec![GradPair::default(); preds.len()];
-        softmax_gradient_rows_scalar(
-            &preds,
-            &labels,
-            weights,
-            1e-16,
-            &mut expected,
-            0..labels.len(),
-            num_class,
-        );
+        let expected = scalar_softmax_gradient(&preds, &labels, weights, num_class);
         let mut actual = vec![GradPair::default(); preds.len()];
         kernel(&preds, &labels, weights, &mut actual);
         for (row, (actual, expected)) in actual
@@ -494,21 +449,6 @@ fn avx2_softmax_gradient_kernels_underflow_like_scalar() {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn aarch64_backend_detection_is_cached() {
-    let first = neon_available();
-    assert_eq!(first, *NEON_AVAILABLE);
-    assert_eq!(first, neon_available());
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn x86_64_backend_detection_is_cached() {
-    let first = avx2_fma_available();
-    assert_eq!(first, *AVX2_FMA_AVAILABLE);
-    assert_eq!(first, avx2_fma_available());
-}
 #[test]
 fn count_le_16_matches_scalar_on_special_values() {
     // Exactly 16 cuts takes the vector path; NaN cuts never count, ties count,
@@ -560,124 +500,67 @@ fn count_le_16_matches_scalar_on_special_values() {
 fn pointwise_metric_sums_are_close_to_scalar() {
     let preds: Vec<f32> = (0..4_103).map(|i| (i % 1_001) as f32 * 0.001).collect();
     let labels: Vec<f32> = (0..preds.len()).map(|i| (i % 2) as f32).collect();
-    let weights: Vec<f32> = (0..preds.len())
-        .map(|i| 0.5 + (i % 17) as f32 * 0.0625)
-        .collect();
+    let weights = sawtooth(preds.len(), 17, 0.5, 0.0625);
     for weights in [None, Some(weights.as_slice())] {
-        for squared in [false, true] {
-            let actual = if squared {
-                squared_error_sum(&preds, &labels, weights)
-            } else {
-                absolute_error_sum(&preds, &labels, weights)
-            };
-            let mut expected = (0.0, 0.0);
-            for i in 0..preds.len() {
-                let weight = weights.map_or(1.0, |values| f64::from(values[i]));
-                let difference = f64::from(preds[i]) - f64::from(labels[i]);
-                expected.0 += weight
-                    * if squared {
-                        difference * difference
-                    } else {
-                        difference.abs()
-                    };
-                expected.1 += weight;
-            }
-            assert!((actual.0 - expected.0).abs() <= expected.0.abs() * 1e-12);
-            assert!((actual.1 - expected.1).abs() <= expected.1.abs() * 1e-12);
-        }
-
-        let actual = classification_error_sum(&preds, &labels, weights);
-        let mut expected = (0.0, 0.0);
-        for i in 0..preds.len() {
-            let weight = weights.map_or(1.0, |values| f64::from(values[i]));
-            if (preds[i] > 0.5) != (labels[i] > 0.5) {
-                expected.0 += weight;
-            }
-            expected.1 += weight;
-        }
-        assert_eq!(actual, expected);
+        let range = 0..preds.len();
+        assert_sums_close(
+            squared_error_sum(&preds, &labels, weights),
+            scalar::distance_sum::<true>(&preds, &labels, weights, range.clone()),
+            1e-12,
+        );
+        assert_sums_close(
+            absolute_error_sum(&preds, &labels, weights),
+            scalar::distance_sum::<false>(&preds, &labels, weights, range.clone()),
+            1e-12,
+        );
+        assert_eq!(
+            classification_error_sum(&preds, &labels, weights),
+            scalar::classification_error_sum(&preds, &labels, weights, range)
+        );
     }
 }
 
 #[test]
 fn logarithmic_metric_sums_are_close_to_scalar() {
-    let preds: Vec<f32> = (0..4_103)
-        .map(|i| 0.001 + (i % 999) as f32 * 0.001)
-        .collect();
+    let preds = sawtooth(4_103, 999, 0.001, 0.001);
     let binary_labels: Vec<f32> = (0..preds.len()).map(|i| (i % 2) as f32).collect();
-    let positive_labels: Vec<f32> = (0..preds.len())
-        .map(|i| 0.25 + (i % 101) as f32 * 0.02)
-        .collect();
-    let weights: Vec<f32> = (0..preds.len())
-        .map(|i| 0.51 + (i % 17) as f32 * 0.061)
-        .collect();
-    // XGBoost's logloss floors each log argument at 1e-16 without clamping
-    // the prediction, so raw margins outside [0, 1] (`binary:logitraw`) give
-    // `-ln(p)` below zero for positives above one and the 1e-16 floor for
-    // negatives above one.
-    let margins: Vec<f32> = (0..4_103)
-        .map(|i| -0.5 + (i % 999) as f32 * 0.002)
-        .collect();
-    let floor = f64::from(1e-16f32);
+    let positive_labels = sawtooth(preds.len(), 101, 0.25, 0.02);
+    let weights = sawtooth(preds.len(), 17, 0.51, 0.061);
+    // Raw margins outside [0, 1] (`binary:logitraw`) reach XGBoost's
+    // unclamped 1e-16 floor of each log argument.
+    let margins = sawtooth(4_103, 999, -0.5, 0.002);
+    let range = 0..preds.len();
     for weights in [None, Some(weights.as_slice())] {
         for p in [&preds, &margins] {
-            let actual = log_loss_sum(p, &binary_labels, weights);
-            let mut expected = (0.0, 0.0);
-            for i in 0..p.len() {
-                let weight = weights.map_or(1.0, |values| f64::from(values[i]));
-                let probability = f64::from(p[i]);
-                let label = f64::from(binary_labels[i]);
-                expected.0 += weight
-                    * -(label * probability.max(floor).ln()
-                        + (1.0 - label) * (1.0 - probability).max(floor).ln());
-                expected.1 += weight;
-            }
-            assert!((actual.0 - expected.0).abs() <= expected.0.abs() * 2e-12);
-            assert!((actual.1 - expected.1).abs() <= expected.1.abs() * 2e-12);
+            assert_sums_close(
+                log_loss_sum(p, &binary_labels, weights),
+                scalar::log_loss(p, &binary_labels, weights, range.clone()),
+                2e-12,
+            );
         }
-
-        for gamma in [false, true] {
-            let actual = if gamma {
-                positive_nloglik_sum::<true>(&preds, &positive_labels, weights)
-            } else {
-                positive_nloglik_sum::<false>(&preds, &positive_labels, weights)
-            };
-            let mut expected = (0.0, 0.0);
-            for i in 0..preds.len() {
-                let weight = weights.map_or(1.0, |values| f64::from(values[i]));
-                let prediction = f64::from(preds[i]).max(1e-8);
-                let label = f64::from(positive_labels[i]);
-                expected.0 += weight
-                    * if gamma {
-                        label / prediction + prediction.ln()
-                    } else {
-                        prediction - label * prediction.ln()
-                    };
-                expected.1 += weight;
-            }
-            assert!((actual.0 - expected.0).abs() <= expected.0.abs() * 2e-12);
-            assert!((actual.1 - expected.1).abs() <= expected.1.abs() * 2e-12);
-        }
+        assert_sums_close(
+            positive_nloglik_sum::<true>(&preds, &positive_labels, weights),
+            scalar::positive_nloglik::<true>(&preds, &positive_labels, weights, range.clone()),
+            2e-12,
+        );
+        assert_sums_close(
+            positive_nloglik_sum::<false>(&preds, &positive_labels, weights),
+            scalar::positive_nloglik::<false>(&preds, &positive_labels, weights, range.clone()),
+            2e-12,
+        );
     }
 }
 
 #[test]
 fn tweedie_metric_sum_is_close_to_scalar() {
-    let preds: Vec<f32> = (0..4_103)
-        .map(|index| 1e-6 + (index % 2_003) as f32 * 0.05)
-        .collect();
-    let labels: Vec<f32> = (0..preds.len())
-        .map(|index| 0.25 + (index % 101) as f32 * 0.02)
-        .collect();
-    let weight_values: Vec<f32> = (0..preds.len())
-        .map(|index| 0.51 + (index % 17) as f32 * 0.061)
-        .collect();
+    let preds = sawtooth(4_103, 2_003, 1e-6, 0.05);
+    let labels = sawtooth(preds.len(), 101, 0.25, 0.02);
+    let weight_values = sawtooth(preds.len(), 17, 0.51, 0.061);
     for rho in [1.1, 1.5, 1.9] {
         for weights in [None, Some(weight_values.as_slice())] {
             let actual = tweedie_nloglik_sum(&preds, &labels, weights, rho);
-            let expected = tweedie_nloglik_sum_scalar(&preds, &labels, weights, rho);
-            assert!((actual.0 - expected.0).abs() <= expected.0.abs() * 3e-12);
-            assert!((actual.1 - expected.1).abs() <= expected.1.abs() * 2e-12);
+            let expected = scalar::tweedie_nloglik(&preds, &labels, weights, rho, 0..preds.len());
+            assert_sums_close(actual, expected, 3e-12);
         }
     }
 }
@@ -686,24 +569,20 @@ fn tweedie_metric_sum_is_close_to_scalar() {
 fn multiclass_metric_sums_are_close_to_scalar() {
     let rows = 4_103;
     for num_class in [3, 8, 17, 32, 131] {
-        let preds: Vec<f32> = (0..rows * num_class)
-            .map(|index| 0.001 + (index % 999) as f32 * 0.001)
-            .collect();
+        let preds = sawtooth(rows * num_class, 999, 0.001, 0.001);
         let labels: Vec<f32> = (0..rows)
             .map(|row| ((row * 7) % num_class) as f32)
             .collect();
-        let weight_values: Vec<f32> = (0..rows)
-            .map(|row| 0.51 + (row % 17) as f32 * 0.061)
-            .collect();
+        let weight_values = sawtooth(rows, 17, 0.51, 0.061);
         for weights in [None, Some(weight_values.as_slice())] {
             let actual = multiclass_log_loss_sum(&preds, &labels, weights, num_class);
-            let expected = multiclass_log_loss_sum_scalar(&preds, &labels, weights, num_class);
-            assert!((actual.0 - expected.0).abs() <= expected.0.abs() * 2e-12);
-            assert!((actual.1 - expected.1).abs() <= expected.1.abs() * 2e-12);
+            let expected =
+                scalar::multiclass_log_loss(&preds, &labels, weights, num_class, 0..rows);
+            assert_sums_close(actual, expected, 2e-12);
 
             assert_eq!(
                 multiclass_error_sum(&preds, &labels, weights, num_class),
-                multiclass_error_sum_scalar(&preds, &labels, weights, num_class)
+                multiclass_error_sum_rows(&preds, &labels, weights, num_class, argmax_scalar)
             );
         }
     }
@@ -718,11 +597,11 @@ fn multiclass_metric_fallback_preserves_ties_and_nonfinite_values() {
     preds[2 * num_class] = f32::INFINITY;
     assert_eq!(
         multiclass_error_sum(&preds, &labels, None, num_class),
-        multiclass_error_sum_scalar(&preds, &labels, None, num_class)
+        multiclass_error_sum_rows(&preds, &labels, None, num_class, argmax_scalar)
     );
 
     let actual = multiclass_log_loss_sum(&preds, &labels, None, num_class);
-    let expected = multiclass_log_loss_sum_scalar(&preds, &labels, None, num_class);
+    let expected = scalar::multiclass_log_loss(&preds, &labels, None, num_class, 0..labels.len());
     assert_eq!(actual.1, expected.1);
     assert_eq!(actual.0.is_nan(), expected.0.is_nan());
 }

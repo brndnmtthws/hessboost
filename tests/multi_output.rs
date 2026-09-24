@@ -4,24 +4,19 @@
 
 use hessboost::prelude::*;
 
+mod common;
+use common::{four_features, invalid_param, labeled_dense, rmse};
+
 const N: usize = 300;
 const COLS: usize = 4;
 const K: usize = 3;
 
-/// Features in `[0, 1)` with every 7th value of column 3 missing, and three
-/// targets that depend on different columns.
+/// [`four_features`] rows and three targets that depend on different columns.
 fn data() -> (Vec<f32>, Vec<f32>) {
     let mut x = Vec::with_capacity(N * COLS);
     let mut y = Vec::with_capacity(N * K);
     for i in 0..N {
-        let a = ((i * 37) % 101) as f32 / 101.0;
-        let b = ((i * 53) % 97) as f32 / 97.0;
-        let c = ((i * 11) % 89) as f32 / 89.0;
-        let d = if i % 7 == 0 {
-            f32::NAN
-        } else {
-            ((i * 29) % 83) as f32 / 83.0
-        };
+        let [a, b, c, d] = four_features(i);
         x.extend([a, b, c, d]);
         y.extend([
             2.0 * a - b,
@@ -66,6 +61,15 @@ fn reference_margins(model: &BoostedModel, x: &[f32], n: usize) -> Vec<f32> {
         out.extend(m);
     }
     out
+}
+
+/// Every row-and-output's contributions (bias included) sum to its margin.
+fn assert_contribs_sum_to(contribs: &[f32], margins: &[f32]) {
+    assert_eq!(contribs.len(), margins.len() * (COLS + 1));
+    for (row_out, m) in contribs.as_chunks::<{ COLS + 1 }>().0.iter().zip(margins) {
+        let sum: f32 = row_out.iter().sum();
+        assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");
+    }
 }
 
 #[test]
@@ -113,15 +117,7 @@ fn training_margins_match_the_final_model() {
         None,
     )
     .unwrap();
-    let preds = result.model.predict(&dtrain).unwrap();
-    let (_, y) = data();
-    let rmse = (preds
-        .iter()
-        .zip(&y)
-        .map(|(p, y)| f64::from(p - y).powi(2))
-        .sum::<f64>()
-        / y.len() as f64)
-        .sqrt();
+    let rmse = rmse(&result.model, &dtrain);
     let last = result.history.last().unwrap().scores[0].2;
     assert!((last - rmse).abs() < 1e-6, "history {last} vs model {rmse}");
 }
@@ -135,11 +131,7 @@ fn shap_is_additive_per_output() {
     let margin = model.predict_margin(&d).unwrap();
     let width = COLS + 1;
     let contribs = model.predict_contribs(&d).unwrap();
-    assert_eq!(contribs.len(), n * K * width);
-    for (row_out, m) in contribs.chunks_exact(width).zip(&margin) {
-        let sum: f32 = row_out.iter().sum();
-        assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");
-    }
+    assert_contribs_sum_to(&contribs, &margin);
     let inter = model.predict_interactions(&d).unwrap();
     assert_eq!(inter.len(), n * K * width * width);
     for (mat, phi) in inter
@@ -156,8 +148,7 @@ fn shap_is_additive_per_output() {
 #[test]
 fn formats_round_trip_vector_leaves() {
     let model = model();
-    let (x, _) = data();
-    let d = DMatrix::from_dense(&x, N, COLS).unwrap();
+    let d = dtrain();
     let want = model.predict(&d).unwrap();
     let reloaded = [
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
@@ -201,23 +192,19 @@ fn early_stopping_keeps_whole_vector_rounds() {
     let best = model.best_iteration().expect("early stopping triggers");
     // Patience 1: one round past the best, one vector tree per round.
     assert_eq!(model.num_trees(), best + 2);
-    let d = DMatrix::from_dense(&x, N, COLS).unwrap();
-    let margin = model.predict_margin(&d).unwrap();
+    let margin = model.predict_margin(&dtrain).unwrap();
     assert_eq!(
         margin,
-        model.predict_margin_range(&d, (0, best + 1)).unwrap()
+        model.predict_margin_range(&dtrain, (0, best + 1)).unwrap()
     );
-    assert_ne!(margin, model.predict_margin_range(&d, (0, 0)).unwrap());
+    assert_ne!(margin, model.predict_margin_range(&dtrain, (0, 0)).unwrap());
 }
 
 #[test]
 fn single_output_builds_scalar_trees() {
     let (x, y) = data();
     let y0: Vec<f32> = y.iter().step_by(K).copied().collect();
-    let d = DMatrix::from_dense(&x, N, COLS)
-        .unwrap()
-        .with_labels(&y0)
-        .unwrap();
+    let d = labeled_dense(&x, COLS, &y0);
     let vector = train(&vector_params().build().unwrap(), &d, 5).unwrap();
     let scalar = train(
         &TrainingParams::builder()
@@ -242,19 +229,16 @@ fn dart_rounds_train_vector_trees() {
         .seed(7)
         .build()
         .unwrap();
-    let model = train(&params, &dtrain(), 6).unwrap();
+    let d = dtrain();
+    let model = train(&params, &d, 6).unwrap();
     assert!(model.has_vector_leaves());
     assert_eq!(model.num_trees(), 6);
     let (x, _) = data();
-    let d = DMatrix::from_dense(&x, N, COLS).unwrap();
     // Dropout rescales earlier trees, so the margins are the weighted sum.
     let margins = model.predict_margin(&d).unwrap();
     let unweighted = reference_margins(&model, &x, N);
     assert_ne!(margins, unweighted);
-    let contribs = model.predict_contribs(&d).unwrap();
-    for (row_out, m) in contribs.as_chunks::<{ COLS + 1 }>().0.iter().zip(&margins) {
-        assert!((row_out.iter().sum::<f32>() - m).abs() < 1e-4);
-    }
+    assert_contribs_sum_to(&model.predict_contribs(&d).unwrap(), &margins);
 }
 
 fn squared_error(k: usize) -> CustomObjective {
@@ -318,14 +302,6 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
     assert_ne!(full.trees()[0].nodes(), tree.nodes());
 }
 
-fn invalid_param(result: Result<BoostedModel>) -> String {
-    match result {
-        Err(HessboostError::InvalidParameter { name, .. }) => name.to_string(),
-        Err(e) => panic!("expected an invalid-parameter error, got {e}"),
-        Ok(_) => panic!("expected an invalid-parameter error"),
-    }
-}
-
 #[test]
 fn unsupported_combinations_are_rejected() {
     let dtrain = dtrain();
@@ -341,7 +317,8 @@ fn unsupported_combinations_are_rejected() {
         invalid_param(train_with_objective(&per_output, &dtrain, 1, &sketch)),
         "objective"
     );
-    // The linear booster grows no trees; it used to ignore the hook silently.
+    // The linear booster grows no trees, so it refuses the hook rather than
+    // ignoring it.
     for strategy in [
         MultiStrategy::OneOutputPerTree,
         MultiStrategy::MultiOutputTree,
@@ -380,12 +357,12 @@ fn unsupported_combinations_are_rejected() {
 #[test]
 fn vector_forests_hold_num_parallel_tree_trees_per_iteration() {
     let params = vector_params().num_parallel_tree(3).build().unwrap();
-    let model = train(&params, &dtrain(), 4).unwrap();
+    let d = dtrain();
+    let model = train(&params, &d, 4).unwrap();
     assert_eq!(model.num_trees(), 12);
     assert_eq!(model.trees_per_iteration(), 3);
     assert_eq!(model.num_boost_rounds(), 4);
     let (x, _) = data();
-    let d = DMatrix::from_dense(&x, N, COLS).unwrap();
     // Without sampling the forest's trees are identical, each shrunk by
     // eta / 3, and the iteration ranges select whole forests.
     let all = model.predict_margin(&d).unwrap();
@@ -397,15 +374,10 @@ fn vector_forests_hold_num_parallel_tree_trees_per_iteration() {
     );
     assert_ne!(first_two, all);
     // SHAP over a prefix range stays additive.
-    let contribs = model.predict_contribs_range(&d, (0, 2)).unwrap();
-    for (row_out, m) in contribs
-        .as_chunks::<{ COLS + 1 }>()
-        .0
-        .iter()
-        .zip(&first_two)
-    {
-        assert!((row_out.iter().sum::<f32>() - m).abs() < 1e-4);
-    }
+    assert_contribs_sum_to(
+        &model.predict_contribs_range(&d, (0, 2)).unwrap(),
+        &first_two,
+    );
 }
 
 #[test]
@@ -416,11 +388,9 @@ fn continued_vector_training_matches_one_run() {
     let first = train(&params, &dtrain, 5).unwrap();
     let continued = train_continue(&params, &dtrain, 3, &first).unwrap();
     assert_eq!(continued.num_trees(), 8);
-    let (x, _) = data();
-    let d = DMatrix::from_dense(&x, N, COLS).unwrap();
     assert_eq!(
-        continued.predict_margin(&d).unwrap(),
-        full.predict_margin(&d).unwrap()
+        continued.predict_margin(&dtrain).unwrap(),
+        full.predict_margin(&dtrain).unwrap()
     );
 }
 

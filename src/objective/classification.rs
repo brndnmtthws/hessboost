@@ -3,6 +3,7 @@
 use super::{
     GradPair, MIN_HESS, Objective, check_label_domain, newton_intercepts, weighted_label_mean,
 };
+use crate::K_RT_EPS_F32;
 use crate::data::MetaInfo;
 use crate::error::Result;
 
@@ -83,8 +84,7 @@ impl Objective for LogisticObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        let (scale_pos_weight, min_hess) = (self.scale_pos_weight, MIN_HESS);
+        let scale_pos_weight = self.scale_pos_weight;
         super::rowwise_gradient(
             labels.len(),
             1,
@@ -98,7 +98,7 @@ impl Objective for LogisticObjective {
                     labels,
                     weights,
                     scale_pos_weight,
-                    min_hess,
+                    MIN_HESS,
                     out,
                 );
             },
@@ -121,7 +121,7 @@ impl Objective for LogisticObjective {
         // through the link (the logit; the identity for `binary:logitraw`),
         // unless `scale_pos_weight` is in play, in which case the reweighted
         // loss needs the Newton step.
-        if (self.scale_pos_weight - 1.0).abs() > 1e-6 {
+        if (self.scale_pos_weight - 1.0).abs() > K_RT_EPS_F32 {
             return newton_intercepts(self, &MetaInfo::new(labels, weights, group));
         }
         vec![self.prob_to_margin(weighted_label_mean(labels, weights))]
@@ -134,7 +134,7 @@ impl Objective for LogisticObjective {
         }
         // XGBoost `LogisticRegression::ProbToMargin`: bound the probability
         // away from the asymptotes, then `Logit(p) = -ln(1/p - 1)` in f32.
-        let p = base_score.clamp(1e-6, 1.0 - 1e-6);
+        let p = base_score.clamp(K_RT_EPS_F32, 1.0 - K_RT_EPS_F32);
         -(1.0 / p - 1.0).ln()
     }
 
@@ -188,26 +188,14 @@ impl Objective for HingeObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        super::rowwise_gradient(
-            labels.len(),
-            1,
-            preds,
-            labels,
-            weights,
-            out,
-            |preds, labels, weights, out| {
-                for i in 0..preds.len() {
-                    let w = weights.map_or(1.0, |ws| ws[i]);
-                    let z = f64::from(labels[i]) * 2.0 - 1.0;
-                    out[i] = if f64::from(preds[i]) * z < 1.0 {
-                        GradPair::new((-z * f64::from(w)) as f32, w)
-                    } else {
-                        GradPair::new(0.0, f32::MIN_POSITIVE)
-                    };
-                }
-            },
-        );
+        super::elementwise_gradient(preds, labels, weights, out, |p, y, w| {
+            let z = f64::from(y) * 2.0 - 1.0;
+            if f64::from(p) * z < 1.0 {
+                GradPair::new((-z * f64::from(w)) as f32, w)
+            } else {
+                GradPair::new(0.0, f32::MIN_POSITIVE)
+            }
+        });
     }
 
     fn pred_transform(&self, preds: &mut [f32]) {
@@ -229,6 +217,7 @@ impl Objective for HingeObjective {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::gradient_pairs;
     use approx::assert_relative_eq;
 
     #[test]
@@ -248,8 +237,7 @@ mod tests {
         // margin 0 -> p = 0.5
         let preds = [0.0f32];
         let labels = [1.0f32];
-        let mut out = vec![GradPair::default(); 1];
-        obj.gradient(&preds, &labels, None, &mut out);
+        let out = gradient_pairs(&obj, &preds, &labels, None);
         assert_relative_eq!(out[0].grad, -0.5, epsilon = 1e-6); // 0.5 - 1
         assert_relative_eq!(out[0].hess, 0.25, epsilon = 1e-6); // 0.5 * 0.5
     }
@@ -259,8 +247,7 @@ mod tests {
         let obj = LogisticObjective::new(3.0);
         let preds = [0.0f32, 0.0];
         let labels = [1.0f32, 0.0];
-        let mut out = vec![GradPair::default(); 2];
-        obj.gradient(&preds, &labels, None, &mut out);
+        let out = gradient_pairs(&obj, &preds, &labels, None);
         // positive instance gradient/hess scaled by 3
         assert_relative_eq!(out[0].grad, -1.5, epsilon = 1e-6);
         assert_relative_eq!(out[0].hess, 0.75, epsilon = 1e-6);
@@ -299,10 +286,11 @@ mod tests {
             raw.base_margins(&[1.0, 0.0, 0.0, 0.0], None, None),
             vec![0.25]
         );
-        let (mut a, mut b) = (vec![GradPair::default(); 2], vec![GradPair::default(); 2]);
-        raw.gradient(&[0.3, -1.2], &[1.0, 0.0], None, &mut a);
-        LogisticObjective::new(1.0).gradient(&[0.3, -1.2], &[1.0, 0.0], None, &mut b);
-        assert_eq!(a, b);
+        let (preds, labels) = ([0.3, -1.2], [1.0, 0.0]);
+        assert_eq!(
+            gradient_pairs(&raw, &preds, &labels, None),
+            gradient_pairs(&LogisticObjective::new(1.0), &preds, &labels, None)
+        );
     }
 
     /// Hinge: margins on the wrong side of the unit margin get `∓w`, the
@@ -310,12 +298,11 @@ mod tests {
     #[test]
     fn hinge_gradient_and_threshold() {
         let obj = HingeObjective;
-        let mut out = vec![GradPair::default(); 4];
-        obj.gradient(
+        let out = gradient_pairs(
+            &obj,
             &[0.5, 1.0, -0.5, -2.0],
             &[1.0, 1.0, 0.0, 0.0],
             Some(&[2.0, 2.0, 3.0, 3.0]),
-            &mut out,
         );
         assert_eq!(out[0], GradPair::new(-2.0, 2.0));
         assert_eq!(out[1], GradPair::new(0.0, f32::MIN_POSITIVE));

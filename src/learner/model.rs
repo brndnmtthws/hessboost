@@ -5,18 +5,18 @@ use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::objective::{Dist, DistFamily, create_objective};
-use crate::tree::RegTree;
-use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, key};
+use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, fill_lanes, key};
+use crate::tree::{RegTree, scalar_tree_output};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-// Native binary format marker; changing it breaks loading existing models.
+// Native binary format marker.
 const NATIVE_MAGIC: &[u8; 4] = b"SQB\0";
-/// Native binary format version written by [`BoostedModel::to_bytes`]:
-/// `1` = hessboost 0.1.1 and earlier (decoded by the frozen `native_v1`
-/// module), `2` = the current field layout.
+/// Native binary format version written by [`BoostedModel::to_bytes`] and the
+/// only one [`BoostedModel::from_bytes`] reads. Bump it on any change to a
+/// serialized type.
 const NATIVE_VERSION: u8 = 2;
 
 /// The kind of feature-importance score to compute, mirroring XGBoost's
@@ -56,8 +56,7 @@ pub struct BoostedModel {
     /// prediction transform.
     objective: String,
     /// Objective hyper-parameters, retained for XGBoost-format export and for
-    /// rebuilding the objective (XGBoost defaults when absent).
-    #[serde(default)]
+    /// rebuilding the objective.
     objective_params: ObjectiveParams,
     /// The configured `num_class` (`0` for scalar objectives).
     num_class: usize,
@@ -66,27 +65,22 @@ pub struct BoostedModel {
     /// several).
     n_outputs: usize,
     /// Label columns per training row (`1` unless trained on a label matrix).
-    #[serde(default = "one_target")]
     n_targets: usize,
     n_features: usize,
     /// The best iteration index selected by early stopping, if any.
     best_iteration: Option<usize>,
-    /// Per-tree contribution weights. For a plain `gbtree` model every weight is
-    /// `1.0`. The DART booster stores fractional weights here so dropped trees
-    /// can be rescaled. Defaults to empty for models serialized before this
-    /// field existed, in which case every tree is treated as weight `1.0`.
-    #[serde(default)]
+    /// Per-tree contribution weights: empty when every tree weighs `1.0`
+    /// (e.g. imported or sliced `gbtree` models), otherwise one weight per
+    /// tree. The DART booster stores fractional weights here so dropped trees
+    /// can be rescaled.
     tree_weights: Vec<f32>,
     /// Trees grown per output in each boosting iteration (XGBoost
     /// `num_parallel_tree`; `1` for ordinary boosting, more for boosted
     /// random forests).
-    #[serde(default = "one_parallel_tree")]
     num_parallel_tree: usize,
     /// Linear (coordinate-descent) booster parameters. `Some` only for
     /// `gblinear` models, in which case predictions come from the linear model
-    /// and the `trees` vector is empty. Defaults to `None` for tree ensembles
-    /// and for models serialized before this field existed.
-    #[serde(default)]
+    /// and the `trees` vector is empty.
     linear: Option<LinearModel>,
     /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
     /// never serialized. Reset whenever `trees` changes.
@@ -187,7 +181,7 @@ impl BoostedModel {
     }
 
     /// Contribution weight of tree `i` (`1.0` when weights are absent, e.g. for
-    /// legacy models or plain `gbtree`).
+    /// imported models or plain `gbtree`).
     #[inline]
     pub(crate) fn tree_weight(&self, i: usize) -> f32 {
         self.tree_weights.get(i).copied().unwrap_or(1.0)
@@ -336,11 +330,14 @@ impl BoostedModel {
     ) -> Vec<f32> {
         let n = data.n_rows();
         let k = self.n_outputs();
+        // Initialize from the dataset's per-instance base margin when present
+        // (it overrides the per-output intercepts, matching XGBoost); otherwise
+        // use the trained global bias.
+        let mut out = self.initial_margins(data);
         // A gblinear model predicts from its linear parameters and ignores the
         // (empty) tree ensemble: margin(row, k) = base_score[k] + bias[k] +
         // Σ_f weights[f][k] * x[row, f], with missing features contributing 0.
         if let Some(lm) = &self.linear {
-            let mut out = self.initial_margins(data);
             for row in 0..n {
                 for c in 0..k {
                     out[row * k + c] += lm.bias[c];
@@ -351,10 +348,6 @@ impl BoostedModel {
             }
             return out;
         }
-        // Initialize from the dataset's per-instance base margin when present
-        // (it overrides the per-output intercepts, matching XGBoost); otherwise
-        // use the trained global bias.
-        let mut out = self.initial_margins(data);
         self.accumulate_forest(data, &mut out, trees, |ti| self.tree_weight(ti));
         out
     }
@@ -375,14 +368,13 @@ impl BoostedModel {
     ) {
         let k = self.n_outputs();
         if self.has_vector_leaves() {
-            let rows = trees.clone();
             self.traverse_blocks(
                 data,
                 out,
                 k,
-                trees,
+                trees.clone(),
                 |block, forest, r, out_row| {
-                    block.accumulate_row_vector(forest, r, rows.clone(), &weight, out_row);
+                    block.accumulate_row_vector(forest, r, trees.clone(), &weight, out_row);
                 },
                 |block, forest, ti, rows, out_block, stride| {
                     block.accumulate_vector(forest, ti, rows, weight(ti), out_block, stride);
@@ -476,9 +468,11 @@ impl BoostedModel {
         iteration_range: (usize, usize),
     ) -> Result<Vec<f32>> {
         let margin = self.predict_margin_range(data, iteration_range)?;
-        Ok(transform_margins(
+        Ok(transform_model_margins(
             &self.objective,
-            self.rebuild_objective().ok().as_deref(),
+            &self.objective_params,
+            self.num_class,
+            self.n_targets,
             self.n_outputs(),
             margin,
         ))
@@ -614,17 +608,15 @@ impl BoostedModel {
         let end = self.prefix_trees(iteration_range, what)?;
         let trees = &self.trees[..end];
         if trees.iter().any(|tree| tree.linear_leaves().is_some()) {
-            return Err(crate::error::HessboostError::invalid_param(
+            return Err(HessboostError::invalid_param(
                 "linear_tree",
                 "SHAP contributions and interactions are not defined for models with linear leaves",
             ));
         }
-        let n = data.n_rows();
-        let k = self.n_outputs();
         let nf = self.n_features;
         Ok(AttributionPrologue {
-            n,
-            k,
+            n: data.n_rows(),
+            k: self.n_outputs(),
             nf,
             width: nf + 1,
             trees,
@@ -719,7 +711,7 @@ impl BoostedModel {
         if self.has_vector_leaves() {
             0
         } else {
-            (t / self.num_parallel_tree) % self.n_outputs
+            scalar_tree_output(t, self.num_parallel_tree, self.n_outputs)
         }
     }
 
@@ -947,15 +939,12 @@ impl BoostedModel {
     /// Serialize the model to the native binary format: the magic `SQB\0`, a
     /// format version byte, then the model as a Postcard payload.
     ///
-    /// This writes version 2 (the layout with label-matrix targets,
-    /// `num_parallel_tree` forests, vector and linear leaves, and quantile /
-    /// expectile / AFT / `dist:*` objective parameters). [`BoostedModel::from_bytes`]
-    /// also reads version 1 (hessboost 0.1.1 and earlier). Postcard is not
-    /// self-describing, so any change to a serialized field needs a new
-    /// version and a frozen decoder for the previous one.
+    /// Postcard is not self-describing: a payload decodes only against the
+    /// exact field layout it was written with, so any change to a serialized
+    /// type needs a new format version.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let payload = postcard::to_stdvec(self)
-            .map_err(|e| crate::error::HessboostError::ModelFormat(e.to_string()))?;
+        let payload =
+            postcard::to_stdvec(self).map_err(|e| HessboostError::ModelFormat(e.to_string()))?;
         let mut bytes = Vec::with_capacity(NATIVE_MAGIC.len() + 1 + payload.len());
         bytes.extend_from_slice(NATIVE_MAGIC);
         bytes.push(NATIVE_VERSION);
@@ -963,66 +952,44 @@ impl BoostedModel {
         Ok(bytes)
     }
 
-    /// Deserialize a model from a binary blob produced by [`BoostedModel::to_bytes`]
-    /// of this or an earlier release (format versions 1 and 2).
+    /// Deserialize a model from a binary blob produced by [`BoostedModel::to_bytes`].
     ///
-    /// A version-1 model (hessboost 0.1.1 and earlier) predicts exactly as it did: its
-    /// trees keep their order (tree `t` feeds output `t % n_outputs`, the
-    /// current layout with `num_parallel_tree = 1`) and every field added
-    /// since takes its default (one label column, scalar constant leaves).
-    /// Unknown versions, such as those of a newer release, are refused with
+    /// Blobs with another format version are refused with
     /// [`HessboostError::ModelFormat`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < NATIVE_MAGIC.len() + 1 || &bytes[..NATIVE_MAGIC.len()] != NATIVE_MAGIC {
-            return Err(HessboostError::ModelFormat(
-                "invalid native model header".to_string(),
-            ));
+            return Err(HessboostError::model_format("invalid native model header"));
         }
-        let payload = &bytes[NATIVE_MAGIC.len() + 1..];
-        let model = match bytes[NATIVE_MAGIC.len()] {
-            1 => super::native_v1::decode(payload)?,
-            NATIVE_VERSION => postcard::from_bytes(payload)
-                .map_err(|e| HessboostError::ModelFormat(e.to_string()))?,
-            version => {
-                return Err(HessboostError::ModelFormat(format!(
-                    "unsupported native model version {version} (this build reads versions 1 to {NATIVE_VERSION})"
-                )));
-            }
-        };
+        let version = bytes[NATIVE_MAGIC.len()];
+        if version != NATIVE_VERSION {
+            return Err(HessboostError::ModelFormat(format!(
+                "unsupported native model version {version}"
+            )));
+        }
+        let model: Self = postcard::from_bytes(&bytes[NATIVE_MAGIC.len() + 1..])
+            .map_err(|e| HessboostError::ModelFormat(e.to_string()))?;
         model.validate_structure()?;
         Ok(model)
     }
 
     /// Save the model to a file in the native binary format.
     pub fn save_binary(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        std::fs::write(path, self.to_bytes()?)?;
-        Ok(())
+        Ok(std::fs::write(path, self.to_bytes()?)?)
     }
 
     /// Load a model from a native binary file.
     pub fn load_binary(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
-        Self::from_bytes(&bytes)
+        Self::from_bytes(&std::fs::read(path)?)
     }
 
     /// Serialize the model to a (human-readable) JSON string: the model's
     /// fields by name.
-    ///
-    /// The JSON layout is unversioned: fields are only ever added, each with
-    /// a serde default, so [`BoostedModel::from_json`] reads files written by
-    /// earlier releases.
     pub fn to_json(&self) -> Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
     /// Deserialize a model from a JSON string produced by
-    /// [`BoostedModel::to_json`] of this or an earlier release.
-    ///
-    /// Fields a file predates take their defaults, which reproduce the
-    /// predictions of the release that wrote it (for hessboost 0.1.1 and
-    /// earlier: one label column, `num_parallel_tree = 1`, whose tree layout
-    /// is the round-robin order those releases used, and scalar constant
-    /// leaves).
+    /// [`BoostedModel::to_json`].
     pub fn from_json(s: &str) -> Result<Self> {
         let model: Self = serde_json::from_str(s)?;
         model.validate_structure()?;
@@ -1031,8 +998,8 @@ impl BoostedModel {
 
     pub(crate) fn validate_structure(&self) -> Result<()> {
         if self.n_features == 0 {
-            return Err(HessboostError::ModelFormat(
-                "model has an invalid feature count".to_string(),
+            return Err(HessboostError::model_format(
+                "model has an invalid feature count",
             ));
         }
         let vector = self.has_vector_leaves();
@@ -1087,14 +1054,12 @@ impl BoostedModel {
             )));
         }
         if !self.tree_weights.is_empty() && self.tree_weights.len() != self.trees.len() {
-            return Err(HessboostError::ModelFormat(
-                "tree_weights length does not match trees".to_string(),
+            return Err(HessboostError::model_format(
+                "tree_weights length does not match trees",
             ));
         }
         if self.tree_weights.iter().any(|weight| !weight.is_finite()) {
-            return Err(HessboostError::ModelFormat(
-                "tree weights must be finite".to_string(),
-            ));
+            return Err(HessboostError::model_format("tree weights must be finite"));
         }
         for (tree_id, tree) in self.trees.iter().enumerate() {
             if !tree.is_valid_for_features(self.n_features) {
@@ -1106,8 +1071,8 @@ impl BoostedModel {
         if let Some(linear) = &self.linear {
             let outputs = self.n_outputs();
             if linear.bias.len() != outputs || linear.weights.len() != self.n_features * outputs {
-                return Err(HessboostError::ModelFormat(
-                    "linear model dimensions are invalid".to_string(),
+                return Err(HessboostError::model_format(
+                    "linear model dimensions are invalid",
                 ));
             }
         }
@@ -1116,8 +1081,7 @@ impl BoostedModel {
 
     /// Save the model to a JSON file.
     pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        std::fs::write(path, self.to_json()?)?;
-        Ok(())
+        Ok(std::fs::write(path, self.to_json()?)?)
     }
 
     /// Load a model from a JSON file.
@@ -1141,8 +1105,7 @@ impl BoostedModel {
 
     /// Save the model to a file in XGBoost's JSON model format.
     pub fn save_xgboost_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        std::fs::write(path, self.to_xgboost_json()?)?;
-        Ok(())
+        Ok(std::fs::write(path, self.to_xgboost_json()?)?)
     }
 
     /// Load a model from a file written in XGBoost's JSON model format.
@@ -1168,8 +1131,7 @@ impl BoostedModel {
     /// Save the model to a file in XGBoost's UBJSON model format (XGBoost's
     /// `.ubj` files).
     pub fn save_xgboost_ubjson(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        std::fs::write(path, self.to_xgboost_ubjson()?)?;
-        Ok(())
+        Ok(std::fs::write(path, self.to_xgboost_ubjson()?)?)
     }
 
     /// Load a model from a file written in XGBoost's UBJSON model format.
@@ -1219,22 +1181,22 @@ pub(crate) fn validate_prediction_data(
     data: &DMatrix,
 ) -> Result<()> {
     if data.n_cols() != n_features {
-        return Err(crate::error::HessboostError::DimensionMismatch {
-            what: "prediction feature count",
-            expected: n_features,
-            got: data.n_cols(),
-        });
+        return Err(HessboostError::dimension_mismatch(
+            "prediction feature count",
+            n_features,
+            data.n_cols(),
+        ));
     }
     let n = data.n_rows();
     if let Some(margin) = data.base_margin()
         && margin.len() != n
         && margin.len() != n * n_outputs
     {
-        return Err(crate::error::HessboostError::DimensionMismatch {
-            what: "prediction base_margin length",
-            expected: n * n_outputs,
-            got: margin.len(),
-        });
+        return Err(HessboostError::dimension_mismatch(
+            "prediction base_margin length",
+            n * n_outputs,
+            margin.len(),
+        ));
     }
     Ok(())
 }
@@ -1242,7 +1204,7 @@ pub(crate) fn validate_prediction_data(
 /// The objective named `objective`, rebuilt from its retained parameters.
 /// Fails for objectives the crate cannot construct by name (custom
 /// objectives).
-pub(crate) fn rebuild_objective(
+fn rebuild_objective(
     objective: &str,
     params: &ObjectiveParams,
     num_class: usize,
@@ -1287,21 +1249,23 @@ pub(crate) fn check_objective_width(
     }
 }
 
-/// Turn raw margins (`[row][output]`, `n_outputs` wide) into predictions in
-/// the objective's reported space: the objective's transform (identity when
-/// it cannot be rebuilt, e.g. a custom objective, mirroring how XGBoost
-/// returns margins then), and for `multi:softmax` the per-row argmax class
-/// index encoded as `f32`.
-pub(crate) fn transform_margins(
-    objective_name: &str,
-    objective: Option<&dyn crate::objective::Objective>,
+/// Turn raw margins (`[row][output]`, `n_outputs` wide) of a model with the
+/// given objective metadata into predictions in the objective's reported
+/// space: the objective's transform (identity when it cannot be rebuilt,
+/// e.g. a custom objective, mirroring how XGBoost returns margins then), and
+/// for `multi:softmax` the per-row argmax class index encoded as `f32`.
+pub(crate) fn transform_model_margins(
+    objective: &str,
+    params: &ObjectiveParams,
+    num_class: usize,
+    n_targets: usize,
     n_outputs: usize,
     mut margin: Vec<f32>,
 ) -> Vec<f32> {
-    if let Some(obj) = objective {
+    if let Ok(obj) = rebuild_objective(objective, params, num_class, n_targets) {
         obj.pred_transform(&mut margin);
     }
-    if objective_name == "multi:softmax" {
+    if objective == "multi:softmax" {
         return margin
             .chunks_exact(n_outputs)
             .map(|row| {
@@ -1313,18 +1277,6 @@ pub(crate) fn transform_margins(
             .collect();
     }
     margin
-}
-
-/// Serde default of [`BoostedModel::n_targets`] for models written before the
-/// field existed.
-fn one_target() -> usize {
-    1
-}
-
-/// Serde default of [`BoostedModel::num_parallel_tree`] for models written
-/// before the field existed.
-fn one_parallel_tree() -> usize {
-    1
 }
 
 /// Rows per prediction block: the block's feature rows stay in cache while
@@ -1384,21 +1336,14 @@ impl<'a> RowBlock<'a> {
                 start: 0,
                 lanes: Vec::new(),
             },
-            Some(_) => RowBlock::Scratch {
+            None if n_cols > max_densify_cols => RowBlock::Wide { data, start: 0 },
+            _ => RowBlock::Scratch {
                 source: data,
                 n_cols,
                 scratch: Vec::new(),
                 lanes: Vec::new(),
                 tail_start: 0,
             },
-            None if n_cols <= max_densify_cols => RowBlock::Scratch {
-                source: data,
-                n_cols,
-                scratch: Vec::new(),
-                lanes: Vec::new(),
-                tail_start: 0,
-            },
-            None => RowBlock::Wide { data, start: 0 },
         }
     }
 
@@ -1414,7 +1359,7 @@ impl<'a> RowBlock<'a> {
             } => {
                 *s = start;
                 let n_cols = *n_cols;
-                Self::fill_lanes(
+                fill_lanes(
                     lanes,
                     &data[start * n_cols..(start + rows) * n_cols],
                     n_cols,
@@ -1435,30 +1380,23 @@ impl<'a> RowBlock<'a> {
                 lanes.resize(groups * FEATURE_LANES * n_cols, key(f32::NAN));
                 scratch.clear();
                 scratch.resize((rows - groups * LANES) * n_cols, f32::NAN);
-                // Destination of feature `f` of block row `r`: a keyed lane
-                // slot (its negated key follows `LANES` later) or a tail slot.
-                let slot = |r: usize, f: usize| -> (bool, usize) {
+                // Store feature `f` of block row `r` in its keyed lane slot
+                // (the negated key follows `LANES` later) or its tail slot.
+                let mut put = |r: usize, f: usize, v: f32| {
                     if r < groups * LANES {
-                        (
-                            true,
-                            (r / LANES) * FEATURE_LANES * n_cols + f * FEATURE_LANES + r % LANES,
-                        )
+                        let i =
+                            (r / LANES) * FEATURE_LANES * n_cols + f * FEATURE_LANES + r % LANES;
+                        lanes[i] = key(v);
+                        lanes[i + LANES] = key(-v);
                     } else {
-                        (false, (r - groups * LANES) * n_cols + f)
+                        scratch[(r - groups * LANES) * n_cols + f] = v;
                     }
                 };
                 if let Some(dense) = source.dense_values() {
                     for r in 0..rows {
                         let src = &dense[(start + r) * n_cols..(start + r + 1) * n_cols];
                         for (f, &v) in src.iter().enumerate() {
-                            let v = if v == missing { f32::NAN } else { v };
-                            match slot(r, f) {
-                                (true, i) => {
-                                    lanes[i] = key(v);
-                                    lanes[i + LANES] = key(-v);
-                                }
-                                (false, i) => scratch[i] = v,
-                            }
+                            put(r, f, if v == missing { f32::NAN } else { v });
                         }
                     }
                 } else {
@@ -1475,34 +1413,9 @@ impl<'a> RowBlock<'a> {
                             } else {
                                 v
                             };
-                            match slot(r, indices[k] as usize) {
-                                (true, i) => {
-                                    lanes[i] = key(v);
-                                    lanes[i + LANES] = key(-v);
-                                }
-                                (false, i) => scratch[i] = v,
-                            }
+                            put(r, indices[k] as usize, v);
                         }
                     }
-                }
-            }
-        }
-    }
-
-    /// Transpose the full [`LANES`]-row groups of the row-major `rows` into
-    /// `lanes` as `[group][feature][lane]` keys of `v` and of `-v`
-    /// ([`FEATURE_LANES`] per feature), so a lane's key sits at a fixed
-    /// immediate offset from the node's slot.
-    fn fill_lanes(lanes: &mut Vec<u32>, rows: &[f32], n_cols: usize) {
-        let groups = rows.len() / n_cols / LANES;
-        lanes.clear();
-        lanes.resize(groups * FEATURE_LANES * n_cols, 0);
-        for (g, dst) in lanes.chunks_exact_mut(FEATURE_LANES * n_cols).enumerate() {
-            let src = &rows[g * LANES * n_cols..(g + 1) * LANES * n_cols];
-            for (j, row) in src.chunks_exact(n_cols).enumerate() {
-                for (f, &v) in row.iter().enumerate() {
-                    dst[f * FEATURE_LANES + j] = key(v);
-                    dst[f * FEATURE_LANES + LANES + j] = key(-v);
                 }
             }
         }
@@ -1561,9 +1474,9 @@ impl<'a> RowBlock<'a> {
         }
     }
 
-    /// `out[(t / parallel) % k] += weight(t) * leaf_value(row r, tree t)` for
-    /// the trees `trees` of loaded row `r`, where `parallel` is the model's
-    /// `num_parallel_tree`.
+    /// `out[scalar_tree_output(t, parallel, k)] += weight(t) * leaf_value(row
+    /// r, tree t)` for the trees `trees` of loaded row `r`, where `parallel`
+    /// is the model's `num_parallel_tree`.
     fn accumulate_row(
         &self,
         forest: &CompactForest,
@@ -1579,7 +1492,7 @@ impl<'a> RowBlock<'a> {
             let k = out.len();
             for t in trees {
                 let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
-                out[(t / parallel) % k] += weight(t) * forest.leaf_value(leaf);
+                out[scalar_tree_output(t, parallel, k)] += weight(t) * forest.leaf_value(leaf);
             }
         }
     }
@@ -1708,50 +1621,7 @@ mod tests {
     use crate::data::DMatrix;
     use crate::error::HessboostError;
     use crate::learner::train;
-
-    fn small_model() -> (BoostedModel, DMatrix) {
-        let n = 60;
-        let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        let y: Vec<f32> = x.iter().map(|&v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let params = TrainingParams::builder()
-            .objective("binary:logistic")
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        (train(&params, &d, 20).unwrap(), d)
-    }
-
-    #[test]
-    fn binary_roundtrip_preserves_predictions() {
-        let (model, d) = small_model();
-        let before = model.predict(&d).unwrap();
-        let bytes = model.to_bytes().unwrap();
-        let restored = BoostedModel::from_bytes(&bytes).unwrap();
-        let after = restored.predict(&d).unwrap();
-        assert_eq!(before.len(), after.len());
-        for (a, b) in before.iter().zip(&after) {
-            assert!((a - b).abs() < 1e-6);
-        }
-        assert_eq!(restored.num_trees(), model.num_trees());
-        assert_eq!(restored.objective(), model.objective());
-    }
-
-    #[test]
-    fn json_roundtrip_preserves_predictions() {
-        let (model, d) = small_model();
-        let before = model.predict(&d).unwrap();
-        let json = model.to_json().unwrap();
-        let restored = BoostedModel::from_json(&json).unwrap();
-        let after = restored.predict(&d).unwrap();
-        for (a, b) in before.iter().zip(&after) {
-            assert!((a - b).abs() < 1e-6);
-        }
-    }
+    use crate::test_support::labeled_dense;
 
     /// A two-output forest of `2^63` parallel trees overflows the trees per
     /// iteration: training refuses it as a parameter error instead of
@@ -1783,7 +1653,8 @@ mod tests {
     /// is a format error, not a silently untransformed model.
     #[test]
     fn loading_propagates_invalid_builtin_objective() {
-        let (model, _) = small_model();
+        let d = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
+        let model = train(&TrainingParams::default(), &d, 1).unwrap();
         let mut value: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
         value["n_targets"] = 2.into();
         value["objective"] = "count:poisson".into();

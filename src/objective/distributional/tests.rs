@@ -1,4 +1,5 @@
 use super::*;
+use crate::objective::gradient_pairs;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -333,9 +334,9 @@ fn count_crps_by_expectation(dist: &Dist, y: f64, lo: u64, hi: u64) -> f64 {
 }
 
 /// Labels far outside the numerical support: the unit steps between the
-/// support and `y` count in full (the sum used to stop after 100 000 steps
-/// and drop them), and supports wider than the step budget are summed in
-/// strides instead of being cut short.
+/// support and `y` count in full (none are dropped after a step budget), and
+/// supports wider than the step budget are summed in blocks instead of
+/// being cut short.
 #[test]
 fn count_crps_handles_residuals_far_outside_the_support() {
     let cases = [
@@ -442,9 +443,9 @@ fn counts_are_normalized_and_consistent_with_the_cdf() {
     }
 }
 
-#[test]
-fn sampling_is_seeded_and_matches_the_moments() {
-    let dists = [
+/// One distribution per family, away from the parameter bounds.
+fn one_per_family() -> [Dist; 5] {
+    [
         Dist::Normal {
             mu: 2.0,
             sigma: 3.0,
@@ -462,8 +463,12 @@ fn sampling_is_seeded_and_matches_the_moments() {
             mean: 4.0,
             size: 3.0,
         },
-    ];
-    for dist in dists {
+    ]
+}
+
+#[test]
+fn sampling_is_seeded_and_matches_the_moments() {
+    for dist in one_per_family() {
         let draw = |seed| {
             let mut rng = StdRng::seed_from_u64(seed);
             (0..50_000)
@@ -493,9 +498,8 @@ fn poisson_matches_count_poisson_without_max_delta_step() {
     let dist = DistObjective::new(DistFamily::Poisson, DistGradient::Fisher);
     let count = crate::objective::PoissonObjective::new(0.0);
     for w in [None, Some(weights.as_slice())] {
-        let (mut a, mut b) = (vec![GradPair::default(); 4], vec![GradPair::default(); 4]);
-        dist.gradient(&preds, &labels, w, &mut a);
-        count.gradient(&preds, &labels, w, &mut b);
+        let a = gradient_pairs(&dist, &preds, &labels, w);
+        let b = gradient_pairs(&count, &preds, &labels, w);
         for (x, y) in a.iter().zip(&b) {
             assert!(close(f64::from(x.grad), f64::from(y.grad), 1e-6, 1e-7));
             assert!(close(f64::from(x.hess), f64::from(y.hess), 1e-6, 1e-7));
@@ -515,8 +519,7 @@ fn gradient_modes_pair_the_gradient_with_the_selected_curvature() {
         DistGradient::Natural,
     ] {
         let objective = DistObjective::new(family, mode);
-        let mut out = vec![GradPair::default(); 4];
-        objective.gradient(&preds, &labels, Some(&weights), &mut out);
+        let out = gradient_pairs(&objective, &preds, &labels, Some(&weights));
         for i in 0..2 {
             let eta = [f64::from(preds[2 * i]), f64::from(preds[2 * i + 1])];
             let y = f64::from(labels[i]);
@@ -542,8 +545,8 @@ fn gradient_modes_pair_the_gradient_with_the_selected_curvature() {
     let family = DistFamily::NegativeBinomial;
     let eta = [0.0, 3.0];
     assert!(family.hessian(&eta, 5.0)[1][1] < 0.0);
-    let mut out = vec![GradPair::default(); 2];
-    DistObjective::new(family, DistGradient::Hessian).gradient(&[0.0, 3.0], &[5.0], None, &mut out);
+    let objective = DistObjective::new(family, DistGradient::Hessian);
+    let out = gradient_pairs(&objective, &[0.0, 3.0], &[5.0], None);
     assert_eq!(out[1].hess, crate::objective::MIN_HESS);
 }
 
@@ -568,7 +571,6 @@ fn transforms_and_links_round_trip() {
             DistFamily::from_objective(family.objective_name()),
             Some(family)
         );
-        assert_eq!(family.param_names().len(), family.n_params());
     }
     assert!(DistFamily::from_objective("reg:squarederror").is_none());
 }
@@ -611,19 +613,16 @@ fn shared_trees_split_on_one_parameter_column() {
     }
     // Random: a function of (seed, iteration) that visits every parameter
     // about equally often.
-    let random = |seed| plain.with_split_direction(DistSplitDirection::Random, seed);
-    let draws: Vec<usize> = (0..2000)
-        .map(|t| random(5).split_parameter(t).unwrap())
-        .collect();
-    let again: Vec<usize> = (0..2000)
-        .map(|t| random(5).split_parameter(t).unwrap())
-        .collect();
-    assert_eq!(draws, again);
-    let other: Vec<usize> = (0..2000)
-        .map(|t| random(6).split_parameter(t).unwrap())
-        .collect();
-    assert_ne!(draws, other);
-    let ones = draws.iter().filter(|&&m| m == 1).count();
+    let draws = |seed| -> Vec<usize> {
+        let random = plain.with_split_direction(DistSplitDirection::Random, seed);
+        (0..2000)
+            .map(|t| random.split_parameter(t).unwrap())
+            .collect()
+    };
+    let first = draws(5);
+    assert_eq!(first, draws(5));
+    assert_ne!(first, draws(6));
+    let ones = first.iter().filter(|&&m| m == 1).count();
     assert!((900..1100).contains(&ones), "{ones} of 2000");
     // One parameter: nothing to reduce.
     let poisson = DistObjective::new(DistFamily::Poisson, DistGradient::Fisher)
@@ -631,12 +630,13 @@ fn shared_trees_split_on_one_parameter_column() {
     assert_eq!(poisson.split_gradient(0, &gpair[..3]), None);
 }
 
-// Regression tests at parameters where the formulas used to cancel,
-// overflow, or stop early. References are high-precision mpmath (40
-// digits) or scipy evaluations of the stated quantities.
+// Parameters where the formulas are prone to cancellation, overflow, or
+// early termination. References are high-precision mpmath (40 digits) or
+// scipy evaluations of the stated quantities.
 
 /// A Gamma label far below its mean: `t - 1` rounds to `-1`, so the log gap
-/// `t - 1 - ln t` (≈ 45.05 for `t = 1e-20`) used to be `+∞`.
+/// `t - 1 - ln t` (≈ 45.05 for `t = 1e-20`) must not be formed from it and
+/// come out `+∞`.
 #[test]
 fn gamma_gradients_stay_finite_for_tiny_label_ratios() {
     let eta = [0.0, 0.0];
@@ -650,8 +650,9 @@ fn gamma_gradients_stay_finite_for_tiny_label_ratios() {
 }
 
 /// A zero count under a large mean at the smallest size: `(y - m)/(r + m)`
-/// rounds to `-1`, and the size score used to be `-∞`, so the intercept
-/// fell to the `ln r = -30` bound (NLL 39.21 against 12.88 at the MLE).
+/// rounds to `-1`, yet the size score must stay finite so the intercept
+/// reaches the MLE (NLL 12.88) rather than the `ln r = -30` bound (NLL
+/// 39.21).
 #[test]
 fn negative_binomial_intercept_survives_a_zero_count_under_a_large_mean() {
     let family = DistFamily::NegativeBinomial;
@@ -667,11 +668,11 @@ fn negative_binomial_intercept_survives_a_zero_count_under_a_large_mean() {
     }
 }
 
-/// Wide negative binomials: the unit walk of the size Fisher sum stopped
-/// 100 000 values into a support of ~340 000 (`mean = size = 1e8`), before
-/// the mode, and dropped the rest (a negative entry, floored to `1e-16`).
-/// References: the survival series `Σ_k P(Y > k)/(r + k)²` summed exactly
-/// over the whole support.
+/// Wide negative binomials: the size Fisher sum covers the whole support of
+/// ~340 000 values (`mean = size = 1e8`), mode and tail included, and stays
+/// positive (not a negative entry floored to `1e-16`). References: the
+/// survival series `Σ_k P(Y > k)/(r + k)²` summed exactly over the whole
+/// support.
 #[test]
 fn negative_binomial_size_fisher_covers_wide_supports() {
     for (mean, size, reference) in [
@@ -684,10 +685,10 @@ fn negative_binomial_size_fisher_covers_wide_supports() {
     }
 }
 
-/// A skewed wide negative binomial: the blocks used to start at the
-/// sd-based width with the pmf at their midpoint, losing most of the mass
-/// near zero (CRPS 2876.10 at `y = 0`). References: scipy's CDF summed
-/// over single steps up to 6e6.
+/// A skewed wide negative binomial: the blocks must keep the mass near zero
+/// that sd-width blocks evaluated at their midpoint would lose (CRPS
+/// 2876.10 at `y = 0`). References: scipy's CDF summed over single steps up
+/// to 6e6.
 #[test]
 fn count_crps_keeps_the_head_of_skewed_wide_counts() {
     let dist = Dist::NegativeBinomial {
@@ -706,7 +707,7 @@ fn count_crps_keeps_the_head_of_skewed_wide_counts() {
 }
 
 /// Gamma at the shape bound `e^30` (what constant labels fit): the CDF,
-/// quantiles, CRPS, and log density used to lose all precision.
+/// quantiles, CRPS, and log density keep full precision.
 #[test]
 fn gamma_handles_the_largest_shape() {
     let a = LOG_LINK_BOUND.exp();
@@ -727,8 +728,8 @@ fn gamma_handles_the_largest_shape() {
     }
 }
 
-/// A large log standard deviation: `2Φ(σ/√2) - 1` rounds to one, and the
-/// LogNormal CRPS used to come out 0 instead of `≈ 4.0e14`.
+/// A large log standard deviation: `2Φ(σ/√2) - 1` rounds to one, yet the
+/// LogNormal CRPS must come out `≈ 4.0e14`, not 0.
 #[test]
 fn lognormal_crps_keeps_the_upper_tail() {
     let dist = Dist::LogNormal {
@@ -747,10 +748,31 @@ fn lognormal_crps_keeps_the_upper_tail() {
     assert!(wide.crps(1.0).is_finite() && wide.crps(1.0) > 0.0);
 }
 
+/// A tail probability below the smallest double under a huge scale:
+/// `e^{756.25} Φ(-55/√2)` with `Φ(-38.9) ≈ 1e-331` must be evaluated in log
+/// space, not as the logarithm of a CDF that underflowed to zero (CRPS 0 at
+/// `y = 0`). References: the closed form in mpmath (60 digits).
+#[test]
+fn lognormal_crps_survives_an_underflowing_tail_probability() {
+    let dist = Dist::LogNormal {
+        mu: -756.25,
+        sigma: 55.0,
+    };
+    for (y, reference) in [
+        (0.0, 0.020_502_447_384_614_8),
+        (1e-300, 0.020_502_447_384_614_8),
+        (1.0, 1.020_502_447_384_614_7),
+    ] {
+        let got = dist.crps(y);
+        assert!(close(got, reference, 1e-12, 0.0), "y={y}: {got}");
+    }
+}
+
 /// Negative binomials near their Poisson limit (`size = 1e13`, and the f32
 /// rounding of the `e^30` bound that predictions carry): the log-gamma
-/// differences in the log pmf and the incomplete-beta prefactor used to
-/// cancel (log pmf off by 0.06, `cdf(1)` 0.325 instead of 0.287).
+/// differences in the log pmf and the incomplete-beta prefactor must not
+/// cancel (a cancelling evaluation is off by 0.06 in the log pmf and gives
+/// `cdf(1)` 0.325 instead of 0.287).
 #[test]
 fn negative_binomial_near_the_poisson_limit() {
     for (size, ln_p1, cdf1, cdf2) in [
@@ -795,30 +817,11 @@ impl rand::TryRng for ConstRng {
     }
 }
 
-/// The extreme RNG words map strictly inside `(0, 1)`: `u64::MAX` used to
-/// round to `u = 1` and an infinite sample.
+/// The extreme RNG words map strictly inside `(0, 1)`: `u64::MAX` must not
+/// round to `u = 1` and give an infinite sample.
 #[test]
 fn sampling_stays_finite_at_the_extreme_rng_words() {
-    let dists = [
-        Dist::Normal {
-            mu: 0.0,
-            sigma: 1.0,
-        },
-        Dist::LogNormal {
-            mu: 0.0,
-            sigma: 1.0,
-        },
-        Dist::Gamma {
-            mean: 2.0,
-            shape: 3.0,
-        },
-        Dist::Poisson { rate: 4.0 },
-        Dist::NegativeBinomial {
-            mean: 4.0,
-            size: 2.0,
-        },
-    ];
-    for dist in dists {
+    for dist in one_per_family() {
         for word in [0, u64::MAX] {
             let s = dist.sample(&mut ConstRng(word));
             assert!(s.is_finite(), "{dist:?} word={word:#x}: {s}");
@@ -841,9 +844,10 @@ fn count_cdfs_are_one_at_infinity() {
     }
 }
 
-/// A Gamma quantile far in the lower tail: the start was floored at `1e-3`
-/// and 100 Halley steps stopped at `1.9e-51` (CDF `1.9e-102`). For shape 2,
-/// `P(2, x) = x²/2 (1 + O(x))`, so the quantile is `√2 · 1e-150`.
+/// A Gamma quantile far in the lower tail: the Halley iteration must not
+/// start from a floor such as `1e-3` (100 steps from there stop at
+/// `1.9e-51`, CDF `1.9e-102`). For shape 2, `P(2, x) = x²/2 (1 + O(x))`, so
+/// the quantile is `√2 · 1e-150`.
 #[test]
 fn gamma_quantiles_reach_the_deep_lower_tail() {
     let dist = Dist::Gamma {

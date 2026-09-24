@@ -84,7 +84,8 @@ use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::data::{DMatrix, Entry, FeatureType};
+use crate::data::dmatrix::check_len;
+use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
 
 /// Dense category id of a row whose category is missing. Category codes are
@@ -334,22 +335,13 @@ fn numeric_types(data: &DMatrix, columns: impl IntoIterator<Item = usize>) -> Ve
 /// Read every encoded column's category codes in one pass over the rows and
 /// compact them to dense ids.
 fn collect_codes(data: &DMatrix, slots: &[Option<usize>], n_encoded: usize) -> Vec<ColumnCodes> {
-    let n_rows = data.n_rows();
-    let mut raw = vec![vec![NO_CATEGORY; n_rows]; n_encoded];
-    let mut entries: Vec<Entry> = Vec::new();
-    #[allow(
-        clippy::needless_range_loop,
-        reason = "`row` indexes the DMatrix and the inner vectors of `raw`"
-    )]
-    for row in 0..n_rows {
-        data.row_into(row, &mut entries);
-        for e in &entries {
-            if let Some(s) = slots[e.index as usize] {
-                // Categorical values are validated non-negative integers < 2^32.
-                raw[s][row] = e.value as u32;
-            }
+    let mut raw = vec![vec![NO_CATEGORY; data.n_rows()]; n_encoded];
+    data.for_each_entry(|row, col, v| {
+        if let Some(s) = slots[col as usize] {
+            // Categorical values are validated non-negative integers < 2^32.
+            raw[s][row] = v as u32;
         }
-    }
+    });
     raw.into_par_iter()
         .map(|mut ids| {
             let mut categories: Vec<u32> =
@@ -507,13 +499,7 @@ impl FittedTargetEncoder {
     /// Unseen categories map to the prior; missing entries stay missing.
     /// Output conventions match [`OrderedTargetEncoder::fit_transform`].
     pub fn transform(&self, data: &DMatrix) -> Result<DMatrix> {
-        if data.n_cols() != self.n_cols {
-            return Err(HessboostError::DimensionMismatch {
-                what: "target encoder feature count",
-                expected: self.n_cols,
-                got: data.n_cols(),
-            });
-        }
+        check_len("target encoder feature count", data.n_cols(), self.n_cols)?;
         let mut slots = vec![None; self.n_cols];
         for (s, c) in self.columns.iter().enumerate() {
             require_categorical(data, c.column)?;
@@ -565,10 +551,7 @@ mod tests {
             .enumerate()
             .flat_map(|(i, &c)| [c, i as f32])
             .collect();
-        DMatrix::from_dense(&x, cats.len(), 2)
-            .unwrap()
-            .with_labels(labels)
-            .unwrap()
+        crate::test_support::labeled_dense(&x, cats.len(), 2, labels)
             .with_feature_types(&CAT_NUM)
             .unwrap()
     }
@@ -784,8 +767,8 @@ mod tests {
     #[test]
     fn deserialization_does_not_allocate_from_the_declared_width() {
         // A tiny document declaring `usize::MAX` columns: validation must not
-        // allocate per declared column (this used to be a capacity-overflow
-        // panic), while duplicate columns are still refused.
+        // allocate per declared column (no capacity-overflow panic), while
+        // duplicate columns are still refused.
         let doc = |columns: &str| {
             format!(
                 r#"{{"n_cols": {}, "prior": 0.5, "columns": [{columns}]}}"#,
@@ -803,8 +786,8 @@ mod tests {
 
     #[test]
     fn extreme_prior_weights_keep_the_smoothed_mean_finite() {
-        // With `a = 1e308` the product `a·P` used to overflow to +inf; with the
-        // smallest positive `a` it used to underflow to 0. The encoding must
+        // With `a = 1e308` the product `a·P` overflows to +inf, and with the
+        // smallest positive `a` it underflows to 0. The encoding must still
         // stay the prior for an empty prefix, and the encoder must round-trip.
         let data = matrix(&[0.0], &[2.0]);
         for (a, prior, first, fitted_value) in [

@@ -4,6 +4,7 @@
 
 use super::absolute::residual_scales;
 use super::{GradPair, Objective, fit_stump, weighted_label_mean};
+use crate::K_RT_EPS_F32;
 use crate::error::{HessboostError, Result};
 
 /// Bandwidth factor `c` of XGBoost's smoothed quantile score
@@ -12,8 +13,6 @@ const SMOOTHING_SCALE: f32 = 0.04;
 /// Relative floor of the quantile surrogate curvature `tanh(x)/x`
 /// (`kMinSurrogateRatio`).
 const MIN_SURROGATE_RATIO: f32 = 3.0e-4;
-/// XGBoost `kRtEps`: the minimum gap between consecutive expectile outputs.
-const RT_EPS: f32 = 1e-6;
 
 /// Check an alpha list the way XGBoost's `QuantileLossParam::Validate` /
 /// `ExpectileLossParam::Validate` do (after rounding to `f32`, as XGBoost
@@ -97,14 +96,9 @@ fn quantile_pair(r: f32, s: f32, alpha: f32, w: f32) -> GradPair {
 fn stable_order(labels: &[f32]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..labels.len()).collect();
     order.sort_by(|&l, &r| {
-        let (a, b) = (labels[l], labels[r]);
-        if a < b {
-            std::cmp::Ordering::Less
-        } else if b < a {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
+        labels[l]
+            .partial_cmp(&labels[r])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     order
 }
@@ -172,7 +166,6 @@ impl Objective for QuantileObjective {
     ) {
         let k = self.alpha.len();
         let n = labels.len();
-        super::check_gradient_inputs(n, k, preds, labels, weights, out);
         let scales = residual_scales(preds, weights, k, |i, _| labels[i]);
         let alpha = &self.alpha;
         super::rowwise_gradient(
@@ -297,7 +290,7 @@ fn softplus(x: f32) -> f32 {
 /// `1e-6`.
 #[inline]
 fn softplus_inv(x: f32) -> f32 {
-    let x = x.max(RT_EPS);
+    let x = x.max(K_RT_EPS_F32);
     x + (-(-x).exp_m1()).ln()
 }
 
@@ -325,7 +318,6 @@ impl Objective for ExpectileObjective {
     ) {
         let k = self.alpha.len();
         let n = labels.len();
-        super::check_gradient_inputs(n, k, preds, labels, weights, out);
         let alpha = &self.alpha;
         super::rowwise_gradient(
             n,
@@ -348,7 +340,7 @@ impl Objective for ExpectileObjective {
                         let mut hess_sum = 0.0f32;
                         for (kk, &a) in alpha.iter().enumerate() {
                             if kk > 0 {
-                                pred += RT_EPS + softplus(row[kk]);
+                                pred += K_RT_EPS_F32 + softplus(row[kk]);
                             }
                             if kk >= j {
                                 let diff = pred - label;
@@ -375,7 +367,7 @@ impl Objective for ExpectileObjective {
         for row in preds.chunks_exact_mut(self.alpha.len()) {
             let mut pred = row[0];
             for value in &mut row[1..] {
-                pred += RT_EPS + softplus(*value);
+                pred += K_RT_EPS_F32 + softplus(*value);
                 *value = pred;
             }
         }
@@ -387,7 +379,7 @@ impl Objective for ExpectileObjective {
     fn probs_to_margins(&self, scores: &mut [f32]) {
         for j in (1..scores.len()).rev() {
             let gap = scores[j] - scores[j - 1];
-            scores[j] = softplus_inv(gap - RT_EPS);
+            scores[j] = softplus_inv(gap - K_RT_EPS_F32);
         }
     }
 
@@ -432,17 +424,7 @@ impl Objective for ExpectileObjective {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pairs(
-        obj: &dyn Objective,
-        preds: &[f32],
-        labels: &[f32],
-        w: Option<&[f32]>,
-    ) -> Vec<GradPair> {
-        let mut out = vec![GradPair::default(); preds.len()];
-        obj.gradient(preds, labels, w, &mut out);
-        out
-    }
+    use crate::objective::gradient_pairs;
 
     #[test]
     fn alpha_lists_are_validated() {
@@ -464,7 +446,7 @@ mod tests {
         let obj = QuantileObjective::new(&[0.25]).unwrap();
         let mut labels = vec![0.0f32; 20];
         labels[19] = 4.0;
-        let out = pairs(&obj, &[0.0; 20], &labels, None);
+        let out = gradient_pairs(&obj, &[0.0; 20], &labels, None);
         let s = 0.01f32;
         assert_eq!(out[0], GradPair::new(0.5 * s * (1.0 - 0.5), 12.5));
         let tanh = (-4.0f32 / (SMOOTHING_SCALE * s)).tanh();
@@ -479,15 +461,15 @@ mod tests {
     #[test]
     fn quantile_gradient_zero_scale_and_zero_weight() {
         let obj = QuantileObjective::new(&[0.5]).unwrap();
-        let out = pairs(&obj, &[1.0, 2.0], &[1.0, 2.0], None);
+        let out = gradient_pairs(&obj, &[1.0, 2.0], &[1.0, 2.0], None);
         assert!(out.iter().all(|p| *p == GradPair::new(0.0, 0.0)));
 
-        let out = pairs(&obj, &[1.0, 0.0], &[0.0, 0.0], Some(&[0.0, 2.0]));
+        let out = gradient_pairs(&obj, &[1.0, 0.0], &[0.0, 0.0], Some(&[0.0, 2.0]));
         assert_eq!(out[0], GradPair::new(0.0, 0.0));
         // Only the zero-weight row has a residual, so S = 0 for everyone.
         assert_eq!(out[1], GradPair::new(0.0, 0.0));
 
-        let out = pairs(&obj, &[1.0, 1.0], &[0.0, 0.0], Some(&[0.0, 2.0]));
+        let out = gradient_pairs(&obj, &[1.0, 1.0], &[0.0, 0.0], Some(&[0.0, 2.0]));
         assert_eq!(out[0], GradPair::new(0.0, 0.0));
         // S = (2·1 / 2)² = 1, x = 25: grad = 2·½·tanh(25), hess = 2·12.5·tanh(25)/25.
         let t = 25.0f32.tanh();
@@ -501,10 +483,10 @@ mod tests {
     #[test]
     fn quantile_outputs_use_their_own_alpha() {
         let obj = QuantileObjective::new(&[0.1, 0.9]).unwrap();
-        let out = pairs(&obj, &[0.0, 0.0], &[0.0], None);
+        let out = gradient_pairs(&obj, &[0.0, 0.0], &[0.0], None);
         // r = 0 on both outputs but S = 0 there too: zero pairs.
         assert_eq!(out, vec![GradPair::default(); 2]);
-        let out = pairs(&obj, &[-10.0, 10.0, 10.0, 10.0], &[0.0, 0.0], None);
+        let out = gradient_pairs(&obj, &[-10.0, 10.0, 10.0, 10.0], &[0.0, 0.0], None);
         // Output 0 residuals {-10, 10}: gradients of opposite sign around the
         // alpha tilt; output 1 residuals {10, 10}: both at the +x saturation.
         let tilt0 = 1.0 - 2.0 * 0.1f32;
@@ -561,7 +543,7 @@ mod tests {
         // Equal prediction-space scores clamp to the minimal gap.
         let mut tied = [1.0f32, 1.0];
         obj.probs_to_margins(&mut tied);
-        assert_eq!(tied[1], softplus_inv(RT_EPS));
+        assert_eq!(tied[1], softplus_inv(K_RT_EPS_F32));
     }
 
     /// For one output the pair is the asymmetric squared loss; the first
@@ -570,13 +552,13 @@ mod tests {
     #[test]
     fn expectile_gradient_formulas() {
         let single = ExpectileObjective::new(&[0.2]).unwrap();
-        let out = pairs(&single, &[1.0, -1.0], &[0.0, 0.0], Some(&[2.0, 0.0]));
+        let out = gradient_pairs(&single, &[1.0, -1.0], &[0.0, 0.0], Some(&[2.0, 0.0]));
         assert_eq!(out[0], GradPair::new(0.8 * 1.0 * 2.0, 0.8 * 2.0));
         assert_eq!(out[1], GradPair::new(0.0, 0.0));
 
         let obj = ExpectileObjective::new(&[0.2, 0.8]).unwrap();
-        let out = pairs(&obj, &[0.0, 0.0], &[1.0], None);
-        let q1 = RT_EPS + softplus(0.0);
+        let out = gradient_pairs(&obj, &[0.0, 0.0], &[1.0], None);
+        let q1 = K_RT_EPS_F32 + softplus(0.0);
         let (d0, d1) = (-1.0f32, q1 - 1.0);
         let (a0, a1) = (0.2f32, if d1 >= 0.0 { 0.2 } else { 0.8 });
         assert_eq!(out[0], GradPair::new(a0 * d0 + a1 * d1, a0 + a1));
@@ -614,7 +596,6 @@ mod tests {
     #[test]
     fn multi_quantile_training_is_calibrated_and_ordered() {
         use crate::config::TrainingParams;
-        use crate::data::DMatrix;
         let n = 400;
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         // Deterministic noise with a spread that grows with x.
@@ -623,10 +604,7 @@ mod tests {
             .enumerate()
             .map(|(i, &v)| v + (1.0 + v) * (((i * 7919) % 1000) as f32 / 1000.0 - 0.5))
             .collect();
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = crate::test_support::labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
             .objective("reg:quantileerror")
             .quantile_alpha(vec![0.1, 0.5, 0.9])
@@ -669,14 +647,10 @@ mod tests {
     #[test]
     fn quantile_xgboost_round_trip_keeps_intercept_order() {
         use crate::config::TrainingParams;
-        use crate::data::DMatrix;
         use crate::learner::BoostedModel;
         let n = 32;
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&x)
-            .unwrap();
+        let d = crate::test_support::labeled_dense(&x, n, 1, &x);
         let params = TrainingParams::builder()
             .objective("reg:quantileerror")
             .quantile_alpha(vec![0.1, 0.9])
@@ -729,12 +703,9 @@ mod tests {
     #[test]
     fn training_refuses_alphas_the_saved_model_cannot_rebuild() {
         use crate::config::TrainingParams;
-        use crate::data::DMatrix;
         use crate::learner::BoostedModel;
-        let d = DMatrix::from_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1)
-            .unwrap()
-            .with_labels(&[0.0, 1.0, 2.0, 3.0])
-            .unwrap();
+        let d =
+            crate::test_support::labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 1.0, 2.0, 3.0]);
         let obj = QuantileObjective::new(&[0.1, 0.9]).unwrap();
         for alphas in [vec![], vec![0.5]] {
             let params = TrainingParams::builder()

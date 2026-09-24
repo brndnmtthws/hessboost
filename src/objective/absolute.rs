@@ -2,6 +2,13 @@
 
 use super::{GradPair, Objective, fit_stump, weighted_label_mean};
 
+/// Total row weight in `f64` (`n_rows` without weights), or `None` when it is
+/// within `1e-6` of zero (XGBoost `common::CloseTo`).
+fn total_weight(weights: Option<&[f32]>, n_rows: usize) -> Option<f64> {
+    let sum = weights.map_or(n_rows as f64, |w| w.iter().map(|&wi| f64::from(wi)).sum());
+    if sum.abs() < 1e-6 { None } else { Some(sum) }
+}
+
 /// XGBoost's per-output automatic residual scale, shared by the quantile and
 /// absolute-error objectives: `S_j = (Σᵢ wᵢ √|pᵢⱼ − yᵢⱼ| / Σᵢ wᵢ)²` for each of
 /// the `k` outputs of `preds` (`[row][output]`), where `label(i, j)` is the
@@ -15,12 +22,11 @@ pub(super) fn residual_scales(
     label: impl Fn(usize, usize) -> f32,
 ) -> Vec<f32> {
     let n = preds.len() / k;
-    let sum_weight = weights.map_or(n as f64, |w| w.iter().map(|&wi| f64::from(wi)).sum());
+    let Some(sum_weight) = total_weight(weights, n) else {
+        return vec![0.0; k];
+    };
     (0..k)
         .map(|j| {
-            if sum_weight.abs() < 1e-6 {
-                return 0.0;
-            }
             let root_sum: f64 = (0..n)
                 .map(|i| {
                     let w = weights.map_or(1.0, |ws| ws[i]);
@@ -119,8 +125,7 @@ impl Objective for AbsoluteErrorObjective {
     ) -> Vec<f32> {
         let k = self.n_targets;
         let n = labels.len() / k;
-        let sum_weight = weights.map_or(n as f64, |w| w.iter().map(|&wi| f64::from(wi)).sum());
-        if sum_weight.abs() < 1e-6 {
+        if total_weight(weights, n).is_none() {
             return vec![0.0; k];
         }
         let mean: Vec<f32> = (0..k)
@@ -152,14 +157,14 @@ impl Objective for AbsoluteErrorObjective {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::gradient_pairs;
 
     /// `δ = (Σ√|r| / n)²`; `g = r·δ/√(δ² + r²)`, `h = δ/√(δ² + r²)`, which
     /// tends to `sign(r)` and `δ/|r|` for large residuals.
     #[test]
     fn gradient_is_scaled_pseudo_huber_score() {
         let obj = AbsoluteErrorObjective::default();
-        let mut out = vec![GradPair::default(); 2];
-        obj.gradient(&[4.0, 0.0], &[0.0, 1.0], None, &mut out);
+        let out = gradient_pairs(&obj, &[4.0, 0.0], &[0.0, 1.0], None);
         let delta = 1.5f64.powi(2) as f32; // ((√4 + √1) / 2)²
         let norm0 = delta.hypot(4.0);
         assert_eq!(out[0], GradPair::new(4.0 * (delta / norm0), delta / norm0));
@@ -172,10 +177,9 @@ mod tests {
     #[test]
     fn gradient_edge_cases() {
         let obj = AbsoluteErrorObjective::default();
-        let mut out = vec![GradPair::default(); 2];
-        obj.gradient(&[1.0, 2.0], &[1.0, 2.0], None, &mut out);
+        let out = gradient_pairs(&obj, &[1.0, 2.0], &[1.0, 2.0], None);
         assert_eq!(out, vec![GradPair::new(0.0, 1.0); 2]);
-        obj.gradient(&[3.0, 2.0], &[1.0, 2.0], Some(&[0.0, 0.0]), &mut out);
+        let out = gradient_pairs(&obj, &[3.0, 2.0], &[1.0, 2.0], Some(&[0.0, 0.0]));
         assert!(
             out.iter().all(|p| p.grad == 0.0 && p.hess == 0.0),
             "{out:?}"
@@ -189,10 +193,9 @@ mod tests {
         assert_eq!(two.n_outputs(), 2);
         let preds = [0.0f32, 0.0, 0.0, 0.0];
         let labels = [1.0f32, -9.0, 1.0, -9.0];
-        let mut out = vec![GradPair::default(); 4];
-        two.gradient(&preds, &labels, None, &mut out);
-        let mut single = vec![GradPair::default(); 2];
-        AbsoluteErrorObjective::default().gradient(&[0.0, 0.0], &[-9.0, -9.0], None, &mut single);
+        let out = gradient_pairs(&two, &preds, &labels, None);
+        let one = AbsoluteErrorObjective::default();
+        let single = gradient_pairs(&one, &[0.0, 0.0], &[-9.0, -9.0], None);
         assert_eq!([out[1], out[3]], [single[0], single[1]]);
         assert!(out[0].grad < 0.0 && out[1].grad > 0.0);
 
@@ -210,8 +213,7 @@ mod tests {
         let labels = [0.0f32, 0.0, 10.0];
         let mean = weighted_label_mean(&labels, None);
         let preds = [mean; 3];
-        let mut gpair = vec![GradPair::default(); 3];
-        obj.gradient(&preds, &labels, None, &mut gpair);
+        let gpair = gradient_pairs(&obj, &preds, &labels, None);
         let expected = fit_stump(&gpair, 1)[0] + mean;
         let got = obj.base_margins(&labels, None, None);
         assert_eq!(got, vec![expected]);
@@ -261,12 +263,8 @@ mod tests {
     #[test]
     fn training_rejects_a_different_label_width() {
         use crate::config::TrainingParams;
-        use crate::data::DMatrix;
         use crate::error::HessboostError;
-        let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
-            .unwrap()
-            .with_labels(&[0.0, 1.0])
-            .unwrap();
+        let d = crate::test_support::labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
         let params = TrainingParams::builder().build().unwrap();
         let two = AbsoluteErrorObjective::new(2);
         assert!(matches!(

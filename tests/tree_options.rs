@@ -4,17 +4,13 @@
 use hessboost::config::TrainingParamsBuilder;
 use hessboost::prelude::*;
 
-/// Deterministic pseudo-random values in `[0, 1)`.
+mod common;
+use common::{invalid_param, labeled_dense, lcg, rmse};
+
+/// `n` deterministic pseudo-random values in `[0, 1)`.
 fn uniform(n: usize, seed: u64) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 40) as f32 / (1u64 << 24) as f32
-        })
-        .collect()
+    let mut next = lcg(seed);
+    (0..n).map(|_| next()).collect()
 }
 
 /// Two features; the target is piecewise linear: a jump at `x0 = 0.5` plus
@@ -32,21 +28,7 @@ fn piecewise_linear(n: usize, seed: u64) -> DMatrix {
             jump + 2.0 * row[0] - 1.5 * row[1] + 0.05 * (e - 0.5)
         })
         .collect();
-    DMatrix::from_dense(&x, n, 2)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
-}
-
-fn rmse(model: &BoostedModel, data: &DMatrix) -> f64 {
-    let preds = model.predict(data).unwrap();
-    let labels = data.labels().unwrap();
-    let sse: f64 = preds
-        .iter()
-        .zip(labels)
-        .map(|(p, y)| f64::from(p - y).powi(2))
-        .sum();
-    (sse / preds.len() as f64).sqrt()
+    labeled_dense(&x, 2, &y)
 }
 
 fn base() -> TrainingParamsBuilder {
@@ -147,10 +129,7 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
         .iter()
         .map(|r| 3.0 * r[0] - r[1])
         .collect();
-    let data = DMatrix::from_dense(&values, 300, 2)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap();
+    let data = labeled_dense(&values, 2, &y);
     let params = base().linear_tree(true).build().unwrap();
     let model = train(&params, &data, 6).unwrap();
     let before = model.predict(&data).unwrap();
@@ -172,22 +151,14 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
         model.predict_contribs(&data),
         model.predict_interactions(&data),
     ] {
-        assert!(matches!(
-            result,
-            Err(HessboostError::InvalidParameter {
-                name: "linear_tree",
-                ..
-            })
-        ));
+        assert_eq!(invalid_param(result), "linear_tree");
     }
 }
 
 #[test]
 fn incompatible_configurations_are_rejected() {
-    let invalid = |builder: TrainingParamsBuilder, name: &str| match builder.build() {
-        Err(HessboostError::InvalidParameter { name: got, .. }) => assert_eq!(got, name),
-        other => panic!("expected `{name}` to be rejected, got {other:?}"),
-    };
+    let invalid =
+        |builder: TrainingParamsBuilder, name| assert_eq!(invalid_param(builder.build()), name);
     invalid(base().path_smooth(-1.0), "path_smooth");
     invalid(base().linear_lambda(f64::NAN), "linear_lambda");
     invalid(
@@ -223,10 +194,7 @@ fn incompatible_configurations_are_rejected() {
 /// split.
 #[test]
 fn vanishing_path_smoothing_approaches_the_unsmoothed_tree() {
-    let data = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
-        .unwrap()
-        .with_labels(&[-1.0, 1.0])
-        .unwrap();
+    let data = labeled_dense(&[0.0, 1.0], 1, &[-1.0, 1.0]);
     let params = TrainingParams::builder()
         .tree_method(TreeMethod::Hist)
         .path_smooth(1e-308)

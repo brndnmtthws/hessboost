@@ -19,15 +19,18 @@ pub(crate) use oblivious::check_symmetric_input;
 
 use std::collections::BTreeSet;
 
+use crate::K_RT_EPS;
 use crate::objective::GradPair;
 use crate::tree::constraints::{Bounds, calc_weight_bounded, gain_at_weight, satisfies};
 use crate::tree::gain::{GradStats, RegParams, calc_gain, threshold_l1};
 use crate::tree::regtree::RegTree;
 use crate::tree::reuse::CategoricalPenalty;
 
-/// Tiny epsilon guarding against accepting numerically-zero-gain splits, mirror
-/// of XGBoost's `kRtEps`.
-pub(super) const K_RT_EPS: f64 = 1e-6;
+/// The bound set by a `max_depth` / `max_leaves` style parameter, where `0`
+/// means unlimited.
+pub(super) fn limit_or_unbounded(limit: usize) -> usize {
+    if limit == 0 { usize::MAX } else { limit }
+}
 
 /// The best split found so far for one node.
 ///
@@ -105,7 +108,6 @@ impl BestSplit {
 
     /// A categorical (set-membership) split candidate; `cat_left` holds the
     /// category values routed left.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn categorical(
         loss_chg: f64,
         feature: u32,
@@ -137,22 +139,62 @@ impl BestSplit {
         self.loss_chg > K_RT_EPS
     }
 
+    /// Expand node `nid` of `tree` by this split (a numeric split at
+    /// `threshold`), the children holding the bounded child weights as `f32`,
+    /// and record the split's loss change. Returns the child ids.
+    pub(super) fn expand(&self, tree: &mut RegTree, nid: usize, threshold: f32) -> (usize, usize) {
+        let (w_left, w_right) = (self.w_left as f32, self.w_right as f32);
+        let (h_left, h_right) = (self.left.hess as f32, self.right.hess as f32);
+        let ids = if self.is_categorical {
+            tree.expand_categorical(
+                nid,
+                self.feature,
+                &self.cat_left,
+                self.default_left,
+                w_left,
+                h_left,
+                w_right,
+                h_right,
+            )
+        } else {
+            tree.expand(
+                nid,
+                self.feature,
+                threshold,
+                self.default_left,
+                w_left,
+                h_left,
+                w_right,
+                h_right,
+            )
+        };
+        tree.set_split_gain(nid, self.loss_chg as f32);
+        ids
+    }
+
     /// Whether this split should be taken: it was found, its loss change
     /// reaches `gamma` (XGBoost rejects `loss_chg < min_split_loss`), and both
     /// children have positive cover and meet `min_child_weight`.
     pub(super) fn valid(&self, gamma: f64, min_child_weight: f64) -> bool {
         self.found()
             && self.loss_chg >= gamma
-            && self.left.hess > 0.0
-            && self.right.hess > 0.0
-            && self.left.hess >= min_child_weight
-            && self.right.hess >= min_child_weight
+            && children_valid(self.left, self.right, min_child_weight)
     }
 }
 
+/// XGBoost's child validity: both children have positive Hessian and meet
+/// `min_child_weight`.
+#[inline]
+pub(super) fn children_valid(left: GradStats, right: GradStats, min_child_weight: f64) -> bool {
+    left.hess > 0.0
+        && right.hess > 0.0
+        && left.hess >= min_child_weight
+        && right.hess >= min_child_weight
+}
+
 /// Gain of one candidate split plus its bounded child weights, or `None` when
-/// a monotone constraint is violated. Unconstrained builds take the cheap
-/// closed-form path (weights unused).
+/// a child is below `min_child_weight` or a monotone constraint is violated.
+/// Unconstrained builds take the cheap closed-form path (weights unused).
 #[inline]
 pub(super) fn candidate_gain(
     left: GradStats,
@@ -163,6 +205,9 @@ pub(super) fn candidate_gain(
     constrained: bool,
     reg: &RegParams,
 ) -> Option<(f64, f64, f64)> {
+    if left.hess < reg.min_child_weight || right.hess < reg.min_child_weight {
+        return None;
+    }
     if constrained {
         let wl = calc_weight_bounded(left, reg, bounds);
         let wr = calc_weight_bounded(right, reg, bounds);
@@ -174,6 +219,47 @@ pub(super) fn candidate_gain(
     } else {
         let g = calc_gain(left, reg) + calc_gain(right, reg) - parent;
         Some((g, 0.0, 0.0))
+    }
+}
+
+/// Every numeric boundary of one feature's histogram `bins` (global bins
+/// from `first`) in XGBoost's order: a forward pass over every boundary
+/// (bins `<= b` left, missing values right, including the last boundary that
+/// isolates the missing mass) and, only when the feature has missing values
+/// in the node, a backward pass (bins `>= b` right, missing values left).
+/// The backward pass ends at `BelowBins` (XGBoost's `NumericBinLowerBound`
+/// at the feature's first bin), which puts only the missing mass left. Its
+/// children are the forward pass's last boundary swapped, so it is distinct
+/// under a monotone constraint: the direction can reject one orientation and
+/// accept the other. `offer(pos, default_left, left, right)` sees every
+/// candidate; a `dense` index has no missing values.
+#[inline]
+pub(super) fn for_each_numeric_split(
+    bins: &[GradStats],
+    first: usize,
+    total: GradStats,
+    dense: bool,
+    mut offer: impl FnMut(SplitPos, bool, GradStats, GradStats),
+) {
+    let mut acc = GradStats::default();
+    for (offset, &bin) in bins.iter().enumerate() {
+        acc.add(bin);
+        offer(SplitPos::Bin(first + offset), false, acc, total.sub(acc));
+    }
+    // XGBoost compares the forward pass's final sum with the node statistics
+    // exactly (`SplitContainsMissingValues`).
+    if dense || acc == total {
+        return;
+    }
+    let mut suffix = GradStats::default();
+    for offset in (0..bins.len()).rev() {
+        suffix.add(bins[offset]);
+        let pos = if offset == 0 {
+            SplitPos::BelowBins
+        } else {
+            SplitPos::Bin(first + offset - 1)
+        };
+        offer(pos, true, total.sub(suffix), suffix);
     }
 }
 
@@ -197,20 +283,26 @@ pub(super) enum SplitPos {
 /// `split_cond`.
 pub(super) const BELOW_ALL_VALUES: f32 = f32::MIN;
 
-/// XGBoost's `SplitEvaluator::CalcWeight`: the regularized optimum computed in
-/// `f64`, rounded to `f32`, then clamped to the node's monotone bounds. The
-/// `f32` rounding happens before bounding, exactly as upstream.
+/// XGBoost's `CalcWeight` in `f64`: `−Tα(G)/(H+λ)`, `0` without positive
+/// Hessian, clamped to `max_delta_step` when set.
+#[inline]
+pub(super) fn xgb_calc_weight(stats: GradStats, reg: &RegParams) -> f64 {
+    if stats.hess <= 0.0 {
+        return 0.0;
+    }
+    let mut w = -threshold_l1(stats.grad, reg.alpha) / (stats.hess + reg.lambda);
+    if reg.max_delta_step != 0.0 && w.abs() > reg.max_delta_step {
+        w = reg.max_delta_step.copysign(w);
+    }
+    w
+}
+
+/// XGBoost's `SplitEvaluator::CalcWeight`: [`xgb_calc_weight`] rounded to
+/// `f32`, then clamped to the node's monotone bounds. The `f32` rounding
+/// happens before bounding, exactly as upstream.
 #[inline]
 pub(super) fn xgb_weight(stats: GradStats, reg: &RegParams, bounds: Bounds) -> f32 {
-    let w = if stats.hess <= 0.0 {
-        0.0
-    } else {
-        let mut w = -threshold_l1(stats.grad, reg.alpha) / (stats.hess + reg.lambda);
-        if reg.max_delta_step != 0.0 && w.abs() > reg.max_delta_step {
-            w = reg.max_delta_step.copysign(w);
-        }
-        w
-    } as f32;
+    let w = xgb_calc_weight(stats, reg) as f32;
     let (lower, upper) = (bounds.lower as f32, bounds.upper as f32);
     if w < lower {
         lower
@@ -225,7 +317,7 @@ pub(super) fn xgb_weight(stats: GradStats, reg: &RegParams, bounds: Bounds) -> f
 /// 2α|w|)` where `w²` is formed in `f32` (upstream `Sqr(float)`) and every
 /// other operation runs in `f64`.
 #[inline]
-fn xgb_gain_given_weight(stats: GradStats, reg: &RegParams, w: f32) -> f64 {
+pub(super) fn xgb_gain_given_weight(stats: GradStats, reg: &RegParams, w: f32) -> f64 {
     -(2.0 * stats.grad * f64::from(w)
         + (stats.hess + reg.lambda) * f64::from(w * w)
         + 2.0 * reg.alpha * f64::from(w.abs()))
@@ -256,8 +348,7 @@ pub(super) fn xgb_loss_chg(
     bounds: Bounds,
     dir: i8,
 ) -> Option<(f32, f32, f32)> {
-    let mcw = reg.min_child_weight;
-    if !(left.hess > 0.0 && right.hess > 0.0 && left.hess >= mcw && right.hess >= mcw) {
+    if !children_valid(left, right, reg.min_child_weight) {
         return None;
     }
     let wl = xgb_weight(left, reg, bounds);
@@ -272,9 +363,26 @@ pub(super) fn xgb_loss_chg(
     Some((gain - root_gain, wl, wr))
 }
 
-/// XGBoost's `SplitEntry::Update`: replace the incumbent when the candidate's
-/// loss change is strictly better, or equal on a lower feature index. Infinite
-/// loss changes are never taken. `best.loss_chg` holds an `f32` value.
+/// XGBoost's `SplitEntry::NeedReplace`: a candidate replaces the incumbent
+/// when its loss change is strictly better, or equal on a lower feature index.
+/// Infinite loss changes are never taken.
+pub(super) fn need_replace(
+    incumbent: f32,
+    incumbent_feature: u32,
+    loss_chg: f32,
+    feature: u32,
+) -> bool {
+    if loss_chg.is_infinite() {
+        false
+    } else if incumbent_feature <= feature {
+        loss_chg > incumbent
+    } else {
+        incumbent.partial_cmp(&loss_chg) != Some(std::cmp::Ordering::Greater)
+    }
+}
+
+/// XGBoost's `SplitEntry::Update`: replace the incumbent when
+/// [`need_replace`] says so. `best.loss_chg` holds an `f32` value.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn xgb_update(
     best: &mut BestSplit,
@@ -287,15 +395,7 @@ pub(super) fn xgb_update(
     w_left: f32,
     w_right: f32,
 ) -> bool {
-    if loss_chg.is_infinite() {
-        return false;
-    }
-    let incumbent = best.loss_chg as f32;
-    let replace = if best.feature <= feature {
-        loss_chg > incumbent
-    } else {
-        incumbent.partial_cmp(&loss_chg) != Some(std::cmp::Ordering::Greater)
-    };
+    let replace = need_replace(best.loss_chg as f32, best.feature, loss_chg, feature);
     if replace {
         *best = BestSplit::numeric(
             f64::from(loss_chg),
@@ -342,28 +442,38 @@ pub(super) fn sweep_categorical(
     let ratio = |s: GradStats| s.grad / (s.hess + reg.lambda);
     // Categories are distinct, so this is a total order.
     cats.sort_unstable_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)).then(a.0.cmp(&b.0)));
+    sweep_prefixes(best, cats, total, feature, |left, right, cats_left| {
+        let (mut g, wl, wr) =
+            candidate_gain(left, right, parent_gain, bounds, dir, constrained, reg)?;
+        if let Some(penalty) = penalty {
+            g -= penalty.categorical_penalty(feature, cats_left);
+        }
+        Some((g, wl, wr))
+    });
+}
 
-    let mcw = reg.min_child_weight;
+/// Offer every prefix of the ordered `cats` (at least one category always
+/// stays right) as a set-membership split with the prefix on the left.
+/// `total` includes any missing mass, which stays on the right.
+/// `score(left, right, cats_left)` returns the candidate's gain and child
+/// weights (`None`: invalid), and `best` takes it when it beats the incumbent
+/// by more than `K_RT_EPS`.
+pub(super) fn sweep_prefixes(
+    best: &mut BestSplit,
+    cats: &[(u32, GradStats)],
+    total: GradStats,
+    feature: u32,
+    mut score: impl FnMut(GradStats, GradStats, &[u32]) -> Option<(f64, f64, f64)>,
+) {
     let mut left = GradStats::default();
     let mut cats_left: Vec<u32> = Vec::new();
-    // Sweep prefixes, always leaving at least one category on the right.
-    for &(cat, s) in &cats[..cats.len() - 1] {
-        left.add(s);
+    for &(cat, stats) in &cats[..cats.len() - 1] {
+        left.add(stats);
         cats_left.push(cat);
-        // `total` includes any missing mass, which stays on the right.
         let right = total.sub(left);
-        if left.hess < mcw || right.hess < mcw {
-            continue;
-        }
-        let Some((mut g, wl, wr)) =
-            candidate_gain(left, right, parent_gain, bounds, dir, constrained, reg)
-        else {
-            continue;
-        };
-        if let Some(penalty) = penalty {
-            g -= penalty.categorical_penalty(feature, &cats_left);
-        }
-        if g > best.loss_chg + K_RT_EPS {
+        if let Some((g, wl, wr)) = score(left, right, &cats_left)
+            && g > best.loss_chg + K_RT_EPS
+        {
             *best = BestSplit::categorical(g, feature, left, right, wl, wr, cats_left.clone());
         }
     }
@@ -463,11 +573,59 @@ pub(super) fn finalize_leaf_values(
 
 #[cfg(test)]
 mod test_support {
+    use super::{ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_rows};
+    use crate::config::TrainingParams;
     use crate::data::DMatrix;
+    use crate::data::ghist::GHistIndex;
+    use crate::data::quantile::HistCuts;
     use crate::objective::GradPair;
+    use crate::tree::regtree::RegTree;
+    use crate::tree::sampler::ColumnSampler;
 
     pub(super) fn gp(g: f32, h: f32) -> GradPair {
         GradPair::new(g, h)
+    }
+
+    pub(super) fn binned(data: &DMatrix, max_bin: usize) -> GHistIndex {
+        GHistIndex::from_dmatrix(data, HistCuts::from_dmatrix(data, max_bin))
+    }
+
+    /// One exact tree over every row and feature of `data`.
+    pub(super) fn grow_exact(
+        params: &TrainingParams,
+        data: &DMatrix,
+        gpair: &[GradPair],
+    ) -> RegTree {
+        ExactTreeBuilder::new(params).build(
+            &SortedColumns::from_dmatrix(data),
+            data,
+            gpair,
+            &all_rows(data.n_rows()),
+            &mut ColumnSampler::all(data.n_cols()),
+        )
+    }
+
+    /// One histogram tree over every row and feature of `ghist`.
+    pub(super) fn grow_hist(
+        params: &TrainingParams,
+        ghist: &GHistIndex,
+        gpair: &[GradPair],
+    ) -> RegTree {
+        HistTreeBuilder::new(params).build(
+            ghist,
+            gpair,
+            &all_rows(ghist.n_rows()),
+            &mut ColumnSampler::all(ghist.n_cols()),
+        )
+    }
+
+    /// Whether `tree`'s predictions never decrease (beyond `1e-5`) from one
+    /// row of `data` to the next.
+    pub(super) fn non_decreasing(tree: &RegTree, data: &DMatrix) -> bool {
+        let preds: Vec<f32> = (0..data.n_rows())
+            .map(|r| tree.predict_row(data, r))
+            .collect();
+        preds.windows(2).all(|w| w[1] >= w[0] - 1e-5)
     }
 
     /// Data where the *unconstrained* fit would be non-monotone: a V shape.

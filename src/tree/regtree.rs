@@ -12,6 +12,7 @@
 //! [`Node::leaf_value`]s are unused (zero).
 
 use crate::data::DMatrix;
+use crate::tree::in_category_set;
 use crate::tree::linear::LinearLeaves;
 use serde::{Deserialize, Serialize};
 
@@ -40,15 +41,12 @@ pub struct Node {
     /// Whether this internal node splits on a categorical feature by set
     /// membership rather than a numeric threshold. `false` for numeric splits
     /// and leaves.
-    #[serde(default)]
     pub is_categorical: bool,
     /// For a categorical node, the start index into the owning tree's category
     /// list of the categories routed left. Unused (`0`) otherwise.
-    #[serde(default)]
     pub cat_begin: u32,
     /// For a categorical node, the end index (exclusive) into the owning tree's
     /// category list of the categories routed left. Unused (`0`) otherwise.
-    #[serde(default)]
     pub cat_end: u32,
 }
 
@@ -83,34 +81,24 @@ pub struct RegTree {
     nodes: Vec<Node>,
     /// Flat pool of category values routed left by categorical nodes. Node
     /// `n` (when `n.is_categorical`) owns `categories[n.cat_begin..n.cat_end]`.
-    /// Empty for trees with no categorical splits (including all legacy trees).
-    #[serde(default)]
+    /// Empty for trees with no categorical splits.
     categories: Vec<u32>,
     /// Outputs per leaf of a vector-leaf tree (XGBoost's `size_leaf_vector`,
     /// `> 1`), or `0` for a scalar tree.
-    #[serde(default)]
     size_leaf_vector: usize,
     /// Vector-leaf weights laid out `[node][output]` (`size_leaf_vector` per
     /// node; internal nodes hold zeros). Empty for scalar trees.
-    #[serde(default)]
     leaf_vectors: Vec<f32>,
     /// Per-leaf linear models of a `linear_tree` tree ([`LinearLeaves`]);
     /// `None` for constant-leaf trees (every tree unless `linear_tree` is on).
-    #[serde(default)]
     linear: Option<LinearLeaves>,
 }
 
 impl RegTree {
-    /// Create an empty tree with a placeholder root leaf, ready to be grown by a
-    /// builder. Returns the root node id (`0`).
+    /// Create an empty tree with a placeholder root leaf (node `0`), ready to
+    /// be grown by a builder.
     pub(crate) fn with_root(sum_hess: f32) -> Self {
-        RegTree {
-            nodes: vec![Node::leaf(0.0, sum_hess)],
-            categories: Vec::new(),
-            size_leaf_vector: 0,
-            leaf_vectors: Vec::new(),
-            linear: None,
-        }
+        Self::from_scalar_parts(vec![Node::leaf(0.0, sum_hess)], Vec::new())
     }
 
     /// Assemble a constant-leaf scalar tree from its node array and the flat
@@ -183,13 +171,7 @@ impl RegTree {
                 node.leaf_value = self.leaf_vectors[id * k + output];
             }
         }
-        RegTree {
-            nodes,
-            categories: self.categories.clone(),
-            size_leaf_vector: 0,
-            leaf_vectors: Vec::new(),
-            linear: None,
-        }
+        RegTree::from_scalar_parts(nodes, self.categories.clone())
     }
 
     /// Give two freshly pushed child nodes their (zero) leaf vectors.
@@ -278,6 +260,12 @@ impl RegTree {
         &self.categories
     }
 
+    /// The categories categorical node `node` of this tree routes left.
+    #[inline]
+    pub(crate) fn node_categories(&self, node: &Node) -> &[u32] {
+        &self.categories[node.cat_begin as usize..node.cat_end as usize]
+    }
+
     /// The per-leaf linear models, when this is a linear-leaf tree (trained
     /// with `linear_tree`). Such a leaf predicts its linear model, or its
     /// constant `leaf_value` for rows missing one of the model's features.
@@ -316,25 +304,17 @@ impl RegTree {
         right_value: f32,
         right_hess: f32,
     ) -> (usize, usize) {
-        let left_id = self.nodes.len();
-        let right_id = left_id + 1;
-        self.nodes.push(Node::leaf(left_value, left_hess));
-        self.nodes.push(Node::leaf(right_value, right_hess));
         let n = &mut self.nodes[nid];
         n.split_feature = split_feature;
         n.split_cond = split_cond;
         n.default_left = default_left;
-        n.left = left_id as i32;
-        n.right = right_id as i32;
-        self.grow_leaf_vectors();
-        (left_id, right_id)
+        self.attach_children(nid, left_value, left_hess, right_value, right_hess)
     }
 
     /// Turn leaf `nid` into a categorical (set-membership) internal node.
     /// Instances whose value of `split_feature` is one of `cats_left` go to the
-    /// left child. All other (and missing) categories follow `default_left`
-    /// only when missing. Present categories not in the set go right.
-    /// Returns `(left_id, right_id)`.
+    /// left child, other present categories go right, and missing values
+    /// follow `default_left`. Returns `(left_id, right_id)`.
     ///
     /// As in [`expand`](Self::expand), builders overwrite the child values when
     /// finalizing; the parameters serve directly built trees.
@@ -350,10 +330,6 @@ impl RegTree {
         right_value: f32,
         right_hess: f32,
     ) -> (usize, usize) {
-        let left_id = self.nodes.len();
-        let right_id = left_id + 1;
-        self.nodes.push(Node::leaf(left_value, left_hess));
-        self.nodes.push(Node::leaf(right_value, right_hess));
         let begin = self.categories.len() as u32;
         self.categories.extend_from_slice(cats_left);
         let end = self.categories.len() as u32;
@@ -363,6 +339,24 @@ impl RegTree {
         n.cat_begin = begin;
         n.cat_end = end;
         n.default_left = default_left;
+        self.attach_children(nid, left_value, left_hess, right_value, right_hess)
+    }
+
+    /// Push two child leaves of `nid` (with their zero leaf vectors) and
+    /// point `nid` at them. Returns `(left_id, right_id)`.
+    fn attach_children(
+        &mut self,
+        nid: usize,
+        left_value: f32,
+        left_hess: f32,
+        right_value: f32,
+        right_hess: f32,
+    ) -> (usize, usize) {
+        let left_id = self.nodes.len();
+        let right_id = left_id + 1;
+        self.nodes.push(Node::leaf(left_value, left_hess));
+        self.nodes.push(Node::leaf(right_value, right_hess));
+        let n = &mut self.nodes[nid];
         n.left = left_id as i32;
         n.right = right_id as i32;
         self.grow_leaf_vectors();
@@ -408,13 +402,23 @@ impl RegTree {
     /// Route a single feature vector (via an accessor) to its leaf id.
     ///
     /// `get` returns `None` for a missing feature. Generic over the accessor so
-    /// the same code serves dense rows, sparse rows, and SHAP traversals.
+    /// the same code serves dense rows, sparse rows, and SHAP traversals. Each
+    /// level loads its node once (re-indexing through `child` measured
+    /// ~7% slower).
     pub fn leaf_id_with(&self, get: impl Fn(u32) -> Option<f32>) -> usize {
+        let nodes = &self.nodes[..];
         let mut nid = 0usize;
-        while !self.nodes[nid].is_leaf() {
-            nid = self.child(nid, get(self.nodes[nid].split_feature));
+        loop {
+            let node = &nodes[nid];
+            if node.is_leaf() {
+                return nid;
+            }
+            nid = if self.goes_left(node, get(node.split_feature)) {
+                node.left as usize
+            } else {
+                node.right as usize
+            };
         }
-        nid
     }
 
     /// The child of internal node `nid` that an instance whose split-feature
@@ -422,51 +426,34 @@ impl RegTree {
     #[inline]
     pub(crate) fn child(&self, nid: usize, value: Option<f32>) -> usize {
         let node = &self.nodes[nid];
-        let go_left = match value {
-            // Categories are integer-coded; membership in the left set routes
-            // left, everything else (present, not in set) right.
-            Some(v) if node.is_categorical => {
-                let c = v as u32;
-                self.categories[node.cat_begin as usize..node.cat_end as usize].contains(&c)
-            }
-            Some(v) => v < node.split_cond,
-            None => node.default_left,
-        };
-        if go_left {
+        if self.goes_left(node, value) {
             node.left as usize
         } else {
             node.right as usize
         }
     }
 
+    /// Whether an instance whose split-feature value is `value` (`None` =
+    /// missing) goes left at internal node `node` of this tree.
+    #[inline]
+    pub(crate) fn goes_left(&self, node: &Node, value: Option<f32>) -> bool {
+        match value {
+            // Categories are integer-coded; membership in the left set routes
+            // left, everything else (present, not in set) right.
+            Some(v) if node.is_categorical => in_category_set(self.node_categories(node), v),
+            Some(v) => v < node.split_cond,
+            None => node.default_left,
+        }
+    }
+
     /// Route a dense feature row (indexed by feature id, `missing` sentinel for
-    /// absent values) to its leaf id. Equivalent to
-    /// `leaf_id_with(|f| if is_missing(row[f]) { None } else { Some(row[f]) })`
-    /// without the closure/`Option` overhead.
+    /// absent values) to its leaf id.
     #[inline]
     pub fn leaf_id_dense(&self, row: &[f32], missing: f32) -> usize {
-        let nodes = &self.nodes[..];
-        let mut nid = 0usize;
-        loop {
-            let node = &nodes[nid];
-            if node.left == NO_CHILD {
-                return nid;
-            }
-            let v = row[node.split_feature as usize];
-            let go_left = if crate::data::is_missing(v, missing) {
-                node.default_left
-            } else if node.is_categorical {
-                let c = v as u32;
-                self.categories[node.cat_begin as usize..node.cat_end as usize].contains(&c)
-            } else {
-                v < node.split_cond
-            };
-            nid = if go_left {
-                node.left as usize
-            } else {
-                node.right as usize
-            };
-        }
+        self.leaf_id_with(|f| {
+            let v = row[f as usize];
+            (!crate::data::is_missing(v, missing)).then_some(v)
+        })
     }
 
     /// Predict the raw output of row `row` of `data`: its leaf's weight, or

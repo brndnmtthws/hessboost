@@ -16,7 +16,7 @@
 use std::f64::consts::PI;
 
 /// `ln(2π) / 2`.
-const HALF_LN_2PI: f64 = 0.918_938_533_204_672_8;
+pub(super) const HALF_LN_2PI: f64 = 0.918_938_533_204_672_8;
 /// Convergence tolerance of the series and continued fractions.
 const EPS: f64 = 1e-15;
 /// Lentz's guard against a zero denominator.
@@ -240,7 +240,7 @@ fn digamma_minus_log_asymptotic(x: f64) -> f64 {
 }
 
 /// The digamma function `ψ(x) = d/dx ln Γ(x)` for `x > 0`.
-pub(crate) fn digamma(x: f64) -> f64 {
+fn digamma(x: f64) -> f64 {
     if x.is_nan() || x <= 0.0 {
         return f64::NAN;
     }
@@ -282,7 +282,7 @@ fn trigamma_minus_inv_asymptotic(x: f64) -> f64 {
 }
 
 /// The trigamma function `ψ'(x)` for `x > 0`.
-pub(crate) fn trigamma(x: f64) -> f64 {
+fn trigamma(x: f64) -> f64 {
     if x.is_nan() || x <= 0.0 {
         return f64::NAN;
     }
@@ -374,7 +374,13 @@ fn gamma_p_series(a: f64, x: f64) -> f64 {
     sum * gamma_prefactor(a, x)
 }
 
-/// Continued fraction for `Q(a, x)`, valid (fast) for `x >= a + 1`.
+/// Lentz's guard: `v`, or [`FPMIN`] where `v` is (nearly) zero.
+fn nonzero(v: f64) -> f64 {
+    if v.abs() < FPMIN { FPMIN } else { v }
+}
+
+/// Continued fraction for `Q(a, x)` over its prefactor `x^a e^-x / Γ(a)`,
+/// valid (fast) for `x >= a + 1`.
 fn gamma_q_fraction(a: f64, x: f64) -> f64 {
     let mut b = x + 1.0 - a;
     let mut c = 1.0 / FPMIN;
@@ -384,22 +390,15 @@ fn gamma_q_fraction(a: f64, x: f64) -> f64 {
         let i = i as f64;
         let an = -i * (i - a);
         b += 2.0;
-        d = an * d + b;
-        if d.abs() < FPMIN {
-            d = FPMIN;
-        }
-        c = b + an / c;
-        if c.abs() < FPMIN {
-            c = FPMIN;
-        }
-        d = 1.0 / d;
+        d = 1.0 / nonzero(an * d + b);
+        c = nonzero(b + an / c);
         let del = d * c;
         h *= del;
         if (del - 1.0).abs() < EPS {
             break;
         }
     }
-    gamma_prefactor(a, x) * h
+    h
 }
 
 /// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)`, `a > 0`.
@@ -416,7 +415,7 @@ pub(crate) fn gamma_p(a: f64, x: f64) -> f64 {
     } else if x < a + 1.0 {
         gamma_p_series(a, x)
     } else {
-        1.0 - gamma_q_fraction(a, x)
+        1.0 - gamma_prefactor(a, x) * gamma_q_fraction(a, x)
     }
 }
 
@@ -435,7 +434,7 @@ pub(crate) fn gamma_q(a: f64, x: f64) -> f64 {
     } else if x < a + 1.0 {
         1.0 - gamma_p_series(a, x)
     } else {
-        gamma_q_fraction(a, x)
+        gamma_prefactor(a, x) * gamma_q_fraction(a, x)
     }
 }
 
@@ -445,37 +444,19 @@ fn beta_fraction(a: f64, b: f64, x: f64) -> f64 {
     let qap = a + 1.0;
     let qam = a - 1.0;
     let mut c = 1.0;
-    let mut d = 1.0 - qab * x / qap;
-    if d.abs() < FPMIN {
-        d = FPMIN;
-    }
-    d = 1.0 / d;
+    let mut d = 1.0 / nonzero(1.0 - qab * x / qap);
     let mut h = d;
+    // One Lentz step with coefficient `aa`, returning its factor of `h`.
+    let mut step = |aa: f64| {
+        d = 1.0 / nonzero(1.0 + aa * d);
+        c = nonzero(1.0 + aa / c);
+        d * c
+    };
     for m in 1..MAX_ITER {
         let m = m as f64;
         let m2 = 2.0 * m;
-        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FPMIN {
-            d = FPMIN;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FPMIN {
-            c = FPMIN;
-        }
-        d = 1.0 / d;
-        h *= d * c;
-        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FPMIN {
-            d = FPMIN;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FPMIN {
-            c = FPMIN;
-        }
-        d = 1.0 / d;
-        let del = d * c;
+        h *= step(m * (b - m) * x / ((qam + m2) * (a + m2)));
+        let del = step(-(a + m) * (qab + m) * x / ((a + m2) * (qap + m2)));
         h *= del;
         if (del - 1.0).abs() < EPS {
             break;
@@ -529,6 +510,25 @@ pub(crate) fn norm_pdf(z: f64) -> f64 {
 /// Standard normal CDF `Φ(z)`, accurate in relative terms in the lower tail.
 pub(crate) fn norm_cdf(z: f64) -> f64 {
     0.5 * erfc(-z * std::f64::consts::FRAC_1_SQRT_2)
+}
+
+/// `ln Φ(z)`, keeping its relative precision where `Φ(z)` underflows: in
+/// the lower tail, where `Φ(z) = Q(1/2, z²/2)/2` takes the continued
+/// fraction (`z²/2 >= 3/2`), as the log prefactor plus the log of the
+/// fraction; above zero as `ln(1 - Φ(-z))`.
+pub(crate) fn ln_norm_cdf(z: f64) -> f64 {
+    let s = -z * std::f64::consts::FRAC_1_SQRT_2;
+    let x = s * s;
+    if s > 0.0 && x >= 1.5 {
+        if x == f64::INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        ln_gamma_prefactor(0.5, x) + gamma_q_fraction(0.5, x).ln() - std::f64::consts::LN_2
+    } else if z > 0.0 {
+        (-norm_cdf(-z)).ln_1p()
+    } else {
+        norm_cdf(z).ln()
+    }
 }
 
 /// Standard normal quantile `Φ⁻¹(p)`: Acklam's rational approximation
@@ -684,10 +684,11 @@ mod tests {
         assert_eq!(gamma_q(2.0, f64::INFINITY), 0.0);
     }
 
-    /// Shapes up to the log-link bound `e^30`: the series used to stop at
-    /// its iteration cap (`P(a, a) ≈ 0.118`), and the prefactor lost its
-    /// precision to `a ln x - ln Γ(a)`. References by mpmath (quadrature
-    /// of the density at 40 digits for `a = e^30`, `gammainc` otherwise).
+    /// Shapes up to the log-link bound `e^30`: the series must converge
+    /// within its iteration cap (not stop short at `P(a, a) ≈ 0.118`), and
+    /// the prefactor must keep its precision despite the cancellation in
+    /// `a ln x - ln Γ(a)`. References by mpmath (quadrature of the density
+    /// at 40 digits for `a = e^30`, `gammainc` otherwise).
     #[test]
     fn incomplete_gamma_converges_for_huge_shapes() {
         let a = 30f64.exp();
@@ -777,5 +778,29 @@ mod tests {
         assert_eq!(norm_ppf(0.0), f64::NEG_INFINITY);
         assert_eq!(norm_ppf(1.0), f64::INFINITY);
         assert!(norm_ppf(1.5).is_nan());
+    }
+
+    /// `ln Φ(z)` from far below the smallest double (`Φ(-1000) ≈ e^-500008`)
+    /// to near one (mpmath `log(ncdf(z))`, 60 digits).
+    #[test]
+    fn log_normal_cdf_keeps_its_precision_in_both_tails() {
+        for (z, reference) in [
+            (-1000.0, -500_007.826_694_812_16),
+            (-300.0, -45_006.622_732_118_66),
+            (-38.890_872_965_260_115, -760.830_358_195_908_2),
+            (-10.0, -53.231_285_150_512_47),
+            (-5.0, -15.064_998_393_988_725),
+            (-1.7, -3.110_796_097_552_481_3),
+            (-1.0, -1.841_021_645_009_263_6),
+            (0.0, -std::f64::consts::LN_2),
+            (0.5, -0.368_946_415_288_656_4),
+            (3.0, -0.001_350_809_964_748_193_8),
+            (10.0, -7.619_853_024_160_525e-24),
+        ] {
+            let got = ln_norm_cdf(z);
+            assert!(close(got, reference, 1e-12), "{z}: {got} vs {reference}");
+        }
+        assert_eq!(ln_norm_cdf(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        assert_eq!(ln_norm_cdf(f64::INFINITY), 0.0);
     }
 }

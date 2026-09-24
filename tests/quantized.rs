@@ -6,6 +6,11 @@
 use hessboost::config::TrainingParamsBuilder;
 use hessboost::prelude::*;
 
+mod common;
+use common::{invalid_param, labeled_dense, rmse};
+
+const FEATURES: usize = 8;
+
 /// SplitMix64-driven uniform variates in `[0, 1)`.
 struct Rng(u64);
 
@@ -21,12 +26,11 @@ impl Rng {
 
 /// A nonlinear regression task with noise; `missing` blanks some entries.
 fn regression(n: usize, seed: u64, missing: bool) -> (Vec<f32>, Vec<f32>) {
-    let features = 8;
     let mut rng = Rng(seed);
-    let mut x = Vec::with_capacity(n * features);
+    let mut x = Vec::with_capacity(n * FEATURES);
     let mut y = Vec::with_capacity(n);
     for _ in 0..n {
-        let row: Vec<f32> = (0..features).map(|_| rng.next()).collect();
+        let row: Vec<f32> = (0..FEATURES).map(|_| rng.next()).collect();
         let target = 3.0 * (row[0] * 6.0).sin() + 4.0 * row[1] * row[2] - 2.0 * row[3]
             + if row[4] > 0.5 { 1.5 } else { 0.0 }
             + 0.3 * (rng.next() - 0.5);
@@ -40,22 +44,6 @@ fn regression(n: usize, seed: u64, missing: bool) -> (Vec<f32>, Vec<f32>) {
         y.push(target);
     }
     (x, y)
-}
-
-fn dmatrix(x: &[f32], y: &[f32]) -> DMatrix {
-    DMatrix::from_dense(x, y.len(), x.len() / y.len())
-        .unwrap()
-        .with_labels(y)
-        .unwrap()
-}
-
-fn rmse(pred: &[f32], y: &[f32]) -> f64 {
-    let sse: f64 = pred
-        .iter()
-        .zip(y)
-        .map(|(&p, &t)| f64::from(p - t).powi(2))
-        .sum();
-    (sse / y.len() as f64).sqrt()
 }
 
 fn logloss(pred: &[f32], y: &[f32]) -> f64 {
@@ -77,7 +65,7 @@ fn quantized(builder: TrainingParamsBuilder) -> TrainingParamsBuilder {
 #[test]
 fn quantized_training_is_identical_across_thread_counts() {
     let (x, y) = regression(30_000, 1, true);
-    let d = dmatrix(&x, &y);
+    let d = labeled_dense(&x, FEATURES, &y);
     let fit = |nthread: usize, seed: u64, policy: GrowPolicy| {
         let params = quantized(TrainingParams::builder())
             .nthread(nthread)
@@ -103,15 +91,17 @@ fn quantized_training_is_identical_across_thread_counts() {
 fn quantized_regression_stays_close_to_full_precision() {
     let (x, y) = regression(20_000, 2, false);
     let (xt, yt) = regression(5_000, 3, false);
-    let (d, dt) = (dmatrix(&x, &y), dmatrix(&xt, &yt));
+    let (d, dt) = (
+        labeled_dense(&x, FEATURES, &y),
+        labeled_dense(&xt, FEATURES, &yt),
+    );
     for method in [TreeMethod::Hist, TreeMethod::Approx] {
         let base = TrainingParams::builder()
             .tree_method(method)
             .max_depth(6)
             .eta(0.1);
         let score = |builder: TrainingParamsBuilder| {
-            let model = train(&builder.build().unwrap(), &d, 150).unwrap();
-            rmse(&model.predict(&dt).unwrap(), &yt)
+            rmse(&train(&builder.build().unwrap(), &d, 150).unwrap(), &dt)
         };
         let full = score(base.clone());
         let stochastic = score(quantized(base.clone()));
@@ -140,7 +130,10 @@ fn quantized_binary_classification_stays_close_to_full_precision() {
     let (xt, yt) = regression(5_000, 5, true);
     let labels = |y: &[f32]| -> Vec<f32> { y.iter().map(|&t| f32::from(t > 1.0)).collect() };
     let (y, yt) = (labels(&y), labels(&yt));
-    let (d, dt) = (dmatrix(&x, &y), dmatrix(&xt, &yt));
+    let (d, dt) = (
+        labeled_dense(&x, FEATURES, &y),
+        labeled_dense(&xt, FEATURES, &yt),
+    );
     let base = TrainingParams::builder()
         .objective("binary:logistic")
         .max_depth(6)
@@ -169,7 +162,7 @@ fn quantized_binary_classification_stays_close_to_full_precision() {
 #[test]
 fn renewed_leaves_use_full_precision_gradients() {
     let (x, y) = regression(12_000, 6, true);
-    let d = dmatrix(&x, &y);
+    let d = labeled_dense(&x, FEATURES, &y);
     for policy in [GrowPolicy::DepthWise, GrowPolicy::LossGuide] {
         let fit = |renew: bool| {
             let params = quantized(TrainingParams::builder())
@@ -212,7 +205,7 @@ fn renewed_leaves_use_full_precision_gradients() {
 fn subnormal_gradients_survive_quantization() {
     let tiny = f32::from_bits(1);
     for weights in [[tiny, tiny], [tiny, 2.0 * tiny]] {
-        let d = dmatrix(&[0.0, 0.0], &[1.0, 1.0])
+        let d = labeled_dense(&[0.0, 0.0], 1, &[1.0, 1.0])
             .with_weights(&weights)
             .unwrap();
         let params = quantized(TrainingParams::builder())
@@ -229,24 +222,16 @@ fn subnormal_gradients_survive_quantization() {
 
 #[test]
 fn quantized_parameters_are_validated() {
-    let err = |builder: TrainingParamsBuilder| builder.build().unwrap_err().to_string();
-    assert!(
-        err(quantized(TrainingParams::builder()).tree_method(TreeMethod::Exact))
-            .contains("use_quantized_grad")
-    );
-    assert!(
-        err(quantized(TrainingParams::builder()).booster(BoosterKind::GbLinear))
-            .contains("use_quantized_grad")
-    );
-    assert!(
-        err(quantized(TrainingParams::builder()).multi_strategy(MultiStrategy::MultiOutputTree))
-            .contains("use_quantized_grad")
-    );
+    for builder in [
+        quantized(TrainingParams::builder()).tree_method(TreeMethod::Exact),
+        quantized(TrainingParams::builder()).booster(BoosterKind::GbLinear),
+        quantized(TrainingParams::builder()).multi_strategy(MultiStrategy::MultiOutputTree),
+    ] {
+        assert_eq!(invalid_param(builder.build()), "use_quantized_grad");
+    }
     for bins in [0, 1, 128] {
-        assert!(
-            err(TrainingParams::builder().num_grad_quant_bins(bins))
-                .contains("num_grad_quant_bins")
-        );
+        let builder = TrainingParams::builder().num_grad_quant_bins(bins);
+        assert_eq!(invalid_param(builder.build()), "num_grad_quant_bins");
     }
     for bins in [2, 3, 127] {
         quantized(TrainingParams::builder())

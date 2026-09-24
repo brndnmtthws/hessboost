@@ -312,27 +312,19 @@ trait FromBin: Copy {
     fn from_bin(bin: u32) -> Self;
 }
 
-macro_rules! impl_from_bin {
-    (narrow $t:ty) => {
-        impl FromBin for $t {
-            #[inline(always)]
-            fn from_bin(bin: u32) -> Self {
-                bin as $t
-            }
-        }
-    };
-    (wide $t:ty) => {
-        impl FromBin for $t {
-            #[inline(always)]
-            fn from_bin(bin: u32) -> Self {
-                bin
-            }
-        }
-    };
+impl FromBin for u16 {
+    #[inline(always)]
+    fn from_bin(bin: u32) -> Self {
+        bin as u16
+    }
 }
 
-impl_from_bin!(narrow u16);
-impl_from_bin!(wide u32);
+impl FromBin for u32 {
+    #[inline(always)]
+    fn from_bin(bin: u32) -> Self {
+        bin
+    }
+}
 
 fn bin_rows(data: &DMatrix, cuts: &BinSearch<'_>, rows: Range<usize>, narrow: bool) -> BinnedRows {
     if narrow {

@@ -26,9 +26,7 @@ impl Metric for CoxNLogLik {
 
     /// NaN for inconsistent lengths (weights are otherwise ignored).
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        if !consistent(preds, labels, weights, 1) {
-            return f64::NAN;
-        }
+        nan_unless_consistent!(preds, labels, weights, 1);
         let n = labels.len();
         let order = abs_label_order(labels);
         let mut exp_p_sum: f64 = preds[..n].iter().map(|&p| f64::from(p)).sum();
@@ -191,6 +189,16 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
+    /// Metadata of `lower.len()` unlabeled rows with label bounds.
+    fn bounded<'a>(lower: &'a [f32], upper: &'a [f32], weights: Option<&'a [f32]>) -> MetaInfo<'a> {
+        MetaInfo {
+            n_rows: lower.len(),
+            label_lower_bound: Some(lower),
+            label_upper_bound: Some(upper),
+            ..MetaInfo::new(&[], weights, None)
+        }
+    }
+
     /// Breslow partial likelihood by hand (the metric takes each log in
     /// `f32`, hence the tolerance): times 1 (event), 2 (event),
     /// 2 (censored), 3 (event) with hazards h. The tied time-2 event's risk
@@ -240,15 +248,7 @@ mod tests {
         // the right-censored interval), 1 (below).
         let margins = [0.0f32, 2.0f32.ln(), 2.0f32.ln(), 0.0];
         let weights = [1.0f32, 1.0, 1.0, 3.0];
-        let info = MetaInfo {
-            n_rows: 4,
-            labels: &[],
-            n_targets: 1,
-            weights: Some(&weights),
-            group: None,
-            label_lower_bound: Some(&lower),
-            label_upper_bound: Some(&upper),
-        };
+        let info = bounded(&lower, &upper, Some(&weights));
         let m = IntervalRegressionAccuracy;
         assert!(m.maximize());
         assert_relative_eq!(m.eval_info(&margins, &info), 3.0 / 6.0);
@@ -261,15 +261,7 @@ mod tests {
         let lower = [1.5f32, 0.7];
         let margins = [0.2f32, -0.1];
         let sigma = 0.5f64;
-        let info = MetaInfo {
-            n_rows: 2,
-            labels: &[],
-            n_targets: 1,
-            weights: None,
-            group: None,
-            label_lower_bound: Some(&lower),
-            label_upper_bound: Some(&lower),
-        };
+        let info = bounded(&lower, &lower, None);
         let want: f64 = lower
             .iter()
             .zip(&margins)
@@ -297,15 +289,7 @@ mod tests {
         let lower = [1.5f32, 0.0, 2.0];
         let upper = [1.5f32, 3.0, f32::INFINITY];
         let margins = [0.2f32, 0.5, 0.1];
-        let info = MetaInfo {
-            n_rows: 3,
-            labels: &[],
-            n_targets: 1,
-            weights: None,
-            group: None,
-            label_lower_bound: Some(&lower),
-            label_upper_bound: Some(&upper),
-        };
+        let info = bounded(&lower, &upper, None);
         let params = ObjectiveParams {
             aft_loss_distribution: AftDistribution::Logistic,
             aft_loss_distribution_scale: 0.8,

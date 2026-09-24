@@ -37,21 +37,21 @@
 
 use super::hist::{partition_rows, rayon_available};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, LeafRows, build_interaction_sets, next_allowed,
-    permits,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, LeafRows, build_interaction_sets,
+    limit_or_unbounded, need_replace, next_allowed, permits, xgb_calc_weight,
+    xgb_gain_given_weight,
 };
+use crate::K_RT_EPS_F32;
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
 use crate::tree::constraints::MonotoneConstraints;
 use crate::tree::gain::{GradStats, RegParams, threshold_l1};
+use crate::tree::hist::{feature_slices, subtract_in_place};
 use crate::tree::regtree::RegTree;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-
-/// XGBoost's `kRtEps` (an `f32`): loss changes at or below it never split.
-const RT_EPS: f32 = 1e-6;
 
 /// XGBoost's default `max_cat_threshold`: the most categories one side of a
 /// partition split enumerates.
@@ -131,19 +131,6 @@ impl Candidate {
         }
     }
 
-    /// XGBoost's `NeedReplace`: strictly better, or equal on a lower feature
-    /// index. Infinite loss changes (invalid splits) are never taken.
-    fn need_replace(&self, loss_chg: f32, feature: u32) -> bool {
-        if loss_chg.is_infinite() {
-            false
-        } else if self.feature <= feature {
-            loss_chg > self.loss_chg
-        } else {
-            self.loss_chg.partial_cmp(&loss_chg) != Some(Ordering::Greater)
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn update(
         &mut self,
         loss_chg: f32,
@@ -153,7 +140,7 @@ impl Candidate {
         left: &[GradStats],
         right: &[GradStats],
     ) -> bool {
-        if !self.need_replace(loss_chg, feature) {
+        if !need_replace(self.loss_chg, self.feature, loss_chg, feature) {
             return false;
         }
         self.loss_chg = loss_chg;
@@ -168,7 +155,7 @@ impl Candidate {
     }
 
     fn merge(&mut self, other: Candidate) {
-        if self.need_replace(other.loss_chg, other.feature) {
+        if need_replace(self.loss_chg, self.feature, other.loss_chg, other.feature) {
             *self = other;
         }
     }
@@ -258,7 +245,7 @@ impl<'a> MultiTreeBuilder<'a> {
         }
         // XGBoost sums the target Hessians of the root cover in `f32`.
         let root_hess = root.iter().fold(0.0f32, |acc, t| acc + t.hess as f32);
-        let constrained = self.cons.is_active();
+        let n_bounds = if self.cons.is_active() { s } else { 0 };
         let mut grow = Grow {
             b: self,
             ghist,
@@ -267,16 +254,8 @@ impl<'a> MultiTreeBuilder<'a> {
             stats: root.clone(),
             gain: Vec::new(),
             weights: Vec::new(),
-            lower: if constrained {
-                vec![-f32::MAX; s]
-            } else {
-                Vec::new()
-            },
-            upper: if constrained {
-                vec![f32::MAX; s]
-            } else {
-                Vec::new()
-            },
+            lower: vec![-f32::MAX; n_bounds],
+            upper: vec![f32::MAX; n_bounds],
             leaf_rows: Vec::new(),
             num_leaves: 1,
         };
@@ -303,15 +282,11 @@ impl<'a> MultiTreeBuilder<'a> {
         grow.finish()
     }
 
-    fn depth_limit(&self) -> Option<usize> {
-        (self.params.max_depth > 0).then_some(self.params.max_depth)
-    }
-
     /// Per-target weights' gain summed in `f64` (XGBoost's vector
     /// `CalcGainGivenWeight`).
     fn gain_given_weights(&self, stats: &[GradStats], weights: &[f32]) -> f64 {
         stats.iter().zip(weights).fold(0.0, |gain, (st, &w)| {
-            gain + gain_given_weight(&self.reg, *st, w)
+            gain + xgb_gain_given_weight(*st, &self.reg, w)
         })
     }
 }
@@ -327,7 +302,7 @@ impl Grow<'_, '_> {
 
     /// XGBoost's bounded `CalcWeight` for target `t` of node `nid`.
     fn weight(&self, nid: usize, t: usize, stats: GradStats) -> f32 {
-        self.bound(nid, t, calc_weight(&self.b.reg, stats) as f32)
+        self.bound(nid, t, xgb_calc_weight(stats, &self.b.reg) as f32)
     }
 
     /// XGBoost's `ApplyBounds`.
@@ -373,7 +348,7 @@ impl Grow<'_, '_> {
         };
         let mut both = left;
         both.add(right);
-        let pooled = self.bound(nid, t, calc_weight(&pooled_reg, both) as f32);
+        let pooled = self.bound(nid, t, xgb_calc_weight(both, &pooled_reg) as f32);
         (pooled, pooled)
     }
 
@@ -402,8 +377,8 @@ impl Grow<'_, '_> {
         }
         for (t, (l, r)) in left.iter().zip(right).enumerate() {
             let (wl, wr) = self.split_weights(nid, t, dir, *l, *r);
-            gain += gain_given_weight(reg, *l, wl);
-            gain += gain_given_weight(reg, *r, wr);
+            gain += xgb_gain_given_weight(*l, reg, wl);
+            gain += xgb_gain_given_weight(*r, reg, wr);
         }
         gain
     }
@@ -418,7 +393,6 @@ impl Grow<'_, '_> {
     fn build_hist(&self, rows: &[u32]) -> Vec<GradStats> {
         let s = self.n_split();
         let ghist = self.ghist;
-        let cuts = ghist.cuts();
         let gp = self.grad.split;
         let mut hist = vec![GradStats::default(); ghist.total_bins() * s];
         let add = |slot: &mut [GradStats], g: &[GradPair]| {
@@ -432,26 +406,21 @@ impl Grow<'_, '_> {
             && rayon_available()
         {
             let n_rows = ghist.n_rows();
-            let mut slices = Vec::with_capacity(ghist.n_cols());
-            let mut rest = hist.as_mut_slice();
-            for f in 0..ghist.n_cols() {
-                let (fs, fe) = cuts.feature_bins(f);
-                let (head, tail) = rest.split_at_mut((fe - fs) * s);
-                slices.push((f, fs, head));
-                rest = tail;
-            }
-            slices.into_par_iter().for_each(|(f, fs, slice)| {
-                let column = |r: u32| -> usize {
-                    match &columns {
-                        Bins::U16(c) => usize::from(c[f * n_rows + r as usize]),
-                        Bins::U32(c) => c[f * n_rows + r as usize] as usize,
+            feature_slices(ghist, &mut hist, s)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(f, (fs, slice))| {
+                    let column = |r: u32| -> usize {
+                        match &columns {
+                            Bins::U16(c) => usize::from(c[f * n_rows + r as usize]),
+                            Bins::U32(c) => c[f * n_rows + r as usize] as usize,
+                        }
+                    };
+                    for &r in rows {
+                        let b = column(r) - fs;
+                        add(&mut slice[b * s..(b + 1) * s], &gp[r as usize * s..][..s]);
                     }
-                };
-                for &r in rows {
-                    let b = column(r) - fs;
-                    add(&mut slice[b * s..(b + 1) * s], &gp[r as usize * s..][..s]);
-                }
-            });
+                });
             return hist;
         }
         let row_ptr = ghist.row_ptr();
@@ -651,11 +620,14 @@ impl Grow<'_, '_> {
         let n_bins = fe - fs;
         // Order categories by `w_parent · w_category` (unbounded weights, as
         // XGBoost's `CalcWeightCat`), stably.
-        let parent_w: Vec<f32> = parent.iter().map(|&p| calc_weight(reg, p) as f32).collect();
+        let parent_w: Vec<f32> = parent
+            .iter()
+            .map(|&p| xgb_calc_weight(p, reg) as f32)
+            .collect();
         let scores: Vec<f64> = (0..n_bins)
             .map(|b| {
                 (0..s).fold(0.0f64, |sc, t| {
-                    let w = calc_weight(reg, hist[(fs + b) * s + t]) as f32;
+                    let w = xgb_calc_weight(hist[(fs + b) * s + t], reg) as f32;
                     sc + f64::from(parent_w[t] * w)
                 })
             })
@@ -914,15 +886,15 @@ impl Grow<'_, '_> {
     /// XGBoost's `IsValidExpandEntry`.
     fn expandable(&self, e: &Entry) -> bool {
         let loss = e.best.loss_chg;
-        !(loss <= RT_EPS
+        !(loss <= K_RT_EPS_F32
             || loss < self.b.params.gamma as f32
-            || self.b.depth_limit().is_some_and(|d| e.depth == d)
+            || e.depth == limit_or_unbounded(self.b.params.max_depth)
             || (self.b.params.max_leaves > 0 && self.num_leaves == self.b.params.max_leaves))
     }
 
     /// XGBoost's `Driver::IsChildValid`.
     fn child_valid(&self, e: &Entry) -> bool {
-        !(self.b.depth_limit().is_some_and(|d| e.depth + 1 >= d)
+        !(e.depth + 1 >= limit_or_unbounded(self.b.params.max_depth)
             || (self.b.params.max_leaves > 0 && self.num_leaves >= self.b.params.max_leaves))
     }
 
@@ -1001,7 +973,7 @@ impl Grow<'_, '_> {
                 work.into_iter().map(|(e, f)| this.children(e, f)).collect()
             };
             for child in children.into_iter().flatten() {
-                if child.best.loss_chg > RT_EPS {
+                if child.best.loss_chg > K_RT_EPS_F32 {
                     queue.push(child);
                 } else {
                     self.record_leaf(child.nid, child.rows);
@@ -1039,7 +1011,7 @@ impl Grow<'_, '_> {
                         }
                     }
                     for (w, st) in w.iter_mut().zip(&sums) {
-                        *w = calc_weight(&self.b.reg, *st) as f32;
+                        *w = xgb_calc_weight(*st, &self.b.reg) as f32;
                     }
                     self.tree.set_leaf_vector(leaf.node, &w);
                 }
@@ -1047,26 +1019,6 @@ impl Grow<'_, '_> {
         }
         (self.tree, self.leaf_rows)
     }
-}
-
-/// `parent -= child`, elementwise.
-fn subtract_in_place(parent: &mut [GradStats], child: &[GradStats]) {
-    for (p, c) in parent.iter_mut().zip(child) {
-        *p = p.sub(*c);
-    }
-}
-
-/// XGBoost's `CalcWeight` in `f64`: `-Tα(G)/(H+λ)`, `0` without positive
-/// Hessian, clamped to `max_delta_step` when set.
-fn calc_weight(reg: &RegParams, st: GradStats) -> f64 {
-    if st.hess <= 0.0 {
-        return 0.0;
-    }
-    let mut w = -threshold_l1(st.grad, reg.alpha) / (st.hess + reg.lambda);
-    if reg.max_delta_step != 0.0 && w.abs() > reg.max_delta_step {
-        w = reg.max_delta_step.copysign(w);
-    }
-    w
 }
 
 /// XGBoost's `CalcGain` in `f64`: the closed form `Tα(G)²/(H+λ)`, or the
@@ -1079,29 +1031,19 @@ fn calc_gain(reg: &RegParams, st: GradStats) -> f64 {
         let t = threshold_l1(st.grad, reg.alpha);
         t * t / (st.hess + reg.lambda)
     } else {
-        let w = calc_weight(reg, st);
+        let w = xgb_calc_weight(st, reg);
         -(2.0 * st.grad * w + (st.hess + reg.lambda) * (w * w) + 2.0 * reg.alpha * w.abs())
     }
-}
-
-/// XGBoost's `CalcGainGivenWeight` at an `f32` weight: `w²` in `f32`,
-/// everything else in `f64`.
-fn gain_given_weight(reg: &RegParams, st: GradStats, w: f32) -> f64 {
-    -(2.0 * st.grad * f64::from(w)
-        + (st.hess + reg.lambda) * f64::from(w * w)
-        + 2.0 * reg.alpha * f64::from(w.abs()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::DMatrix;
-    use crate::data::quantile::HistCuts;
-    use crate::tree::builder::HistTreeBuilder;
+    use crate::tree::builder::{HistTreeBuilder, all_rows, test_support};
 
     fn binned(x: &[f32], n: usize, cols: usize) -> GHistIndex {
-        let d = DMatrix::from_dense(x, n, cols).unwrap();
-        GHistIndex::from_dmatrix(&d, HistCuts::from_dmatrix(&d, 256))
+        test_support::binned(&DMatrix::from_dense(x, n, cols).unwrap(), 256)
     }
 
     fn build(
@@ -1118,11 +1060,10 @@ mod tests {
             value,
             n_outputs,
         };
-        let rows: Vec<u32> = (0..ghist.n_rows() as u32).collect();
         MultiTreeBuilder::new(params).build(
             ghist,
             &grad,
-            &rows,
+            &all_rows(ghist.n_rows()),
             &mut ColumnSampler::all(ghist.n_cols()),
         )
     }
@@ -1151,9 +1092,12 @@ mod tests {
         let dup: Vec<GradPair> = g1.iter().flat_map(|&g| [g, g]).collect();
         let params = TrainingParams::builder().max_depth(3).build().unwrap();
         let (vector, _) = build(&params, &ghist, &dup, 2, None, 2);
-        let rows: Vec<u32> = (0..400).collect();
-        let scalar =
-            HistTreeBuilder::new(&params).build(&ghist, &g1, &rows, &mut ColumnSampler::all(2));
+        let scalar = HistTreeBuilder::new(&params).build(
+            &ghist,
+            &g1,
+            &all_rows(400),
+            &mut ColumnSampler::all(2),
+        );
         assert_eq!(vector.num_nodes(), scalar.num_nodes());
         for r in 0..400usize {
             let row = [(r % 17) as f32 / 17.0, (r % 11) as f32 / 11.0];

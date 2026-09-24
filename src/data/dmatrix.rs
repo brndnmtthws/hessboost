@@ -16,16 +16,11 @@ pub(crate) fn is_missing(v: f32, missing: f32) -> bool {
 }
 
 /// Length check shared by every constructor and metadata setter: `got` must
-/// equal `expected`. Preserves the [`HessboostError::DimensionMismatch`] shape
-/// each call site already returned.
+/// equal `expected`, else [`HessboostError::DimensionMismatch`].
 #[inline]
 pub(crate) fn check_len(what: &'static str, got: usize, expected: usize) -> Result<()> {
     if got != expected {
-        return Err(HessboostError::DimensionMismatch {
-            what,
-            expected,
-            got,
-        });
+        return Err(HessboostError::dimension_mismatch(what, expected, got));
     }
     Ok(())
 }
@@ -33,7 +28,7 @@ pub(crate) fn check_len(what: &'static str, got: usize, expected: usize) -> Resu
 /// Validate CSR `indptr` against `nnz` stored entries: first offset 0,
 /// monotonic offsets within bounds, terminal offset `== nnz`.
 /// Caller must ensure `indptr` is non-empty (`from_csr` rejects that first).
-pub(crate) fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
+fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
     if indptr[0] != 0 {
         return Err(HessboostError::invalid_param(
             "csr indptr",
@@ -51,13 +46,19 @@ pub(crate) fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
     check_len("csr indptr terminal", indptr[indptr.len() - 1], nnz)
 }
 
-/// Reject non-finite labels (shared by the single- and multi-target setters).
-fn check_finite_labels(labels: &[f32]) -> Result<()> {
-    if labels.iter().any(|v| !v.is_finite()) {
-        return Err(HessboostError::invalid_param(
-            "labels",
-            "all labels must be finite",
-        ));
+/// Reject weights that are negative or non-finite (`invalid`), or none of
+/// which is positive (`none_positive`), under parameter `name`.
+fn check_weights(
+    name: &'static str,
+    weights: &[f32],
+    invalid: &'static str,
+    none_positive: &'static str,
+) -> Result<()> {
+    if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return Err(HessboostError::invalid_param(name, invalid));
+    }
+    if !weights.iter().any(|v| *v > 0.0) {
+        return Err(HessboostError::invalid_param(name, none_positive));
     }
     Ok(())
 }
@@ -211,8 +212,9 @@ impl DMatrix {
                 "stored feature values must be finite",
             ));
         }
+        let mut seen = std::collections::HashSet::new();
         for row in 0..n_rows {
-            let mut seen = std::collections::HashSet::new();
+            seen.clear();
             for &col in &indices[indptr[row]..indptr[row + 1]] {
                 if !seen.insert(col) {
                     return Err(HessboostError::invalid_param(
@@ -236,12 +238,8 @@ impl DMatrix {
 
     /// Attach regression/classification labels (`len == n_rows`), one target
     /// per row.
-    pub fn with_labels(mut self, labels: &[f32]) -> Result<Self> {
-        check_len("labels", labels.len(), self.n_rows)?;
-        check_finite_labels(labels)?;
-        self.labels = Some(labels.to_vec());
-        self.n_targets = 1;
-        Ok(self)
+    pub fn with_labels(self, labels: &[f32]) -> Result<Self> {
+        self.with_label_matrix(labels, 1)
     }
 
     /// Attach a label matrix with `n_targets` targets per row, laid out
@@ -257,7 +255,12 @@ impl DMatrix {
             HessboostError::invalid_param("labels", "n_rows * n_targets overflows usize")
         })?;
         check_len("labels", labels.len(), expected)?;
-        check_finite_labels(labels)?;
+        if labels.iter().any(|v| !v.is_finite()) {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                "all labels must be finite",
+            ));
+        }
         self.labels = Some(labels.to_vec());
         self.n_targets = n_targets;
         Ok(self)
@@ -272,17 +275,13 @@ impl DMatrix {
     pub fn with_label_bounds(mut self, lower: &[f32], upper: &[f32]) -> Result<Self> {
         check_len("label_lower_bound", lower.len(), self.n_rows)?;
         check_len("label_upper_bound", upper.len(), self.n_rows)?;
-        if lower.iter().any(|v| v.is_nan()) {
-            return Err(HessboostError::invalid_param(
-                "label_lower_bound",
-                "label bounds must not be NaN",
-            ));
-        }
-        if upper.iter().any(|v| v.is_nan()) {
-            return Err(HessboostError::invalid_param(
-                "label_upper_bound",
-                "label bounds must not be NaN",
-            ));
+        for (name, bound) in [("label_lower_bound", lower), ("label_upper_bound", upper)] {
+            if bound.iter().any(|v| v.is_nan()) {
+                return Err(HessboostError::invalid_param(
+                    name,
+                    "label bounds must not be NaN",
+                ));
+            }
         }
         self.label_lower_bound = Some(lower.to_vec());
         self.label_upper_bound = Some(upper.to_vec());
@@ -302,18 +301,12 @@ impl DMatrix {
     /// model.
     pub fn with_feature_weights(mut self, weights: &[f32]) -> Result<Self> {
         check_len("feature_weights", weights.len(), self.n_cols)?;
-        if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
-            return Err(HessboostError::invalid_param(
-                "feature_weights",
-                "feature weights must be finite and non-negative",
-            ));
-        }
-        if !weights.iter().any(|v| *v > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "feature_weights",
-                "at least one feature weight must be positive",
-            ));
-        }
+        check_weights(
+            "feature_weights",
+            weights,
+            "feature weights must be finite and non-negative",
+            "at least one feature weight must be positive",
+        )?;
         self.feature_weights = Some(weights.to_vec());
         Ok(self)
     }
@@ -321,18 +314,12 @@ impl DMatrix {
     /// Attach per-instance weights (`len == n_rows`).
     pub fn with_weights(mut self, weights: &[f32]) -> Result<Self> {
         check_len("weights", weights.len(), self.n_rows)?;
-        if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
-            return Err(HessboostError::invalid_param(
-                "weights",
-                "weights must be finite and non-negative",
-            ));
-        }
-        if !weights.iter().any(|v| *v > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "weights",
-                "at least one weight must be positive",
-            ));
-        }
+        check_weights(
+            "weights",
+            weights,
+            "weights must be finite and non-negative",
+            "at least one weight must be positive",
+        )?;
         self.weights = Some(weights.to_vec());
         Ok(self)
     }
@@ -371,9 +358,8 @@ impl DMatrix {
                 "group-size sum overflows usize",
             ));
         };
-        let g = GroupInfo::from_sizes(sizes);
         check_len("group sizes sum", total, self.n_rows)?;
-        self.group = Some(g);
+        self.group = Some(GroupInfo::from_sizes(sizes));
         Ok(self)
     }
 
@@ -387,16 +373,8 @@ impl DMatrix {
             HessboostError::invalid_param("group_weights", "attach group sizes first")
         })?;
         check_len("group_weights length", weights.len(), group.num_groups())?;
-        if weights
-            .iter()
-            .any(|weight| !weight.is_finite() || *weight < 0.0)
-            || !weights.iter().any(|weight| *weight > 0.0)
-        {
-            return Err(HessboostError::invalid_param(
-                "group_weights",
-                "weights must be finite and non-negative with at least one positive value",
-            ));
-        }
+        let invalid = "weights must be finite and non-negative with at least one positive value";
+        check_weights("group_weights", weights, invalid, invalid)?;
         let mut expanded = Vec::with_capacity(self.n_rows);
         for ((start, end), &weight) in group.iter_ranges().zip(weights) {
             expanded.extend(std::iter::repeat_n(weight, end - start));
@@ -519,35 +497,19 @@ impl DMatrix {
         if row >= self.n_rows || col >= self.n_cols {
             return None;
         }
-        match &self.storage {
-            Storage::Dense(data) => {
-                let v = data[row * self.n_cols + col];
-                if is_missing(v, self.missing) {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
+        let v = match &self.storage {
+            Storage::Dense(data) => data[row * self.n_cols + col],
             Storage::Csr {
                 indptr,
                 indices,
                 values,
             } => {
-                let (s, e) = (indptr[row], indptr[row + 1]);
                 // Rows are not assumed sorted by column; linear scan of the row.
-                for k in s..e {
-                    if indices[k] as usize == col {
-                        let v = values[k];
-                        return if is_missing(v, self.missing) {
-                            None
-                        } else {
-                            Some(v)
-                        };
-                    }
-                }
-                None
+                let k = (indptr[row]..indptr[row + 1]).find(|&k| indices[k] as usize == col)?;
+                values[k]
             }
-        }
+        };
+        (!is_missing(v, self.missing)).then_some(v)
     }
 
     /// Raw row-major storage of a dense matrix (missing entries hold the
@@ -658,9 +620,8 @@ impl DMatrix {
         self.for_each_entry(|_row, col, _v| col_counts[col as usize] += 1);
 
         let mut col_ptr = vec![0usize; self.n_cols + 1];
-        #[allow(clippy::needless_range_loop)]
-        for c in 0..self.n_cols {
-            col_ptr[c + 1] = col_ptr[c] + col_counts[c];
+        for (c, &count) in col_counts.iter().enumerate() {
+            col_ptr[c + 1] = col_ptr[c] + count;
         }
         let nnz = col_ptr[self.n_cols];
         let mut rows = vec![0u32; nnz];
@@ -697,75 +658,40 @@ impl DMatrix {
         indptr.push(0usize);
         let mut indices: Vec<u32> = Vec::new();
         let mut values: Vec<f32> = Vec::new();
-        let mut buf: Vec<Entry> = Vec::new();
         for &r in rows {
-            self.row_into(r, &mut buf);
-            for e in &buf {
-                indices.push(e.index);
-                values.push(e.value);
-            }
+            self.for_row_entry(r, |index, value| {
+                indices.push(index);
+                values.push(value);
+            });
             indptr.push(values.len());
         }
         let mut out = DMatrix::from_csr(indptr, indices, values, self.n_cols)?;
         out.feature_types.clone_from(&self.feature_types);
         out.feature_weights.clone_from(&self.feature_weights);
         out.n_targets = self.n_targets;
-        if let Some(l) = &self.labels {
-            let k = self.n_targets;
-            let mut selected = Vec::with_capacity(rows.len() * k);
+        // Each row's `stride` consecutive values of `v`, in `rows` order.
+        let gather = |v: &[f32], stride: usize| {
+            let mut selected = Vec::with_capacity(rows.len() * stride);
             for &r in rows {
-                selected.extend_from_slice(&l[r * k..(r + 1) * k]);
+                selected.extend_from_slice(&v[r * stride..(r + 1) * stride]);
             }
-            out.labels = Some(selected);
-        }
-        if let Some(lo) = &self.label_lower_bound {
-            out.label_lower_bound = Some(rows.iter().map(|&r| lo[r]).collect());
-        }
-        if let Some(hi) = &self.label_upper_bound {
-            out.label_upper_bound = Some(rows.iter().map(|&r| hi[r]).collect());
-        }
-        if let Some(w) = &self.weights {
-            out.weights = Some(rows.iter().map(|&r| w[r]).collect());
-        }
-        if let Some(bm) = &self.base_margin {
-            let nout = bm.len() / self.n_rows;
-            let mut selected = Vec::with_capacity(rows.len() * nout);
-            for &r in rows {
-                selected.extend_from_slice(&bm[r * nout..(r + 1) * nout]);
-            }
-            out.base_margin = Some(selected);
-        }
+            selected
+        };
+        out.labels = self.labels.as_deref().map(|l| gather(l, self.n_targets));
+        out.label_lower_bound = self.label_lower_bound.as_deref().map(|lo| gather(lo, 1));
+        out.label_upper_bound = self.label_upper_bound.as_deref().map(|hi| gather(hi, 1));
+        out.weights = self.weights.as_deref().map(|w| gather(w, 1));
+        out.base_margin = self
+            .base_margin
+            .as_deref()
+            .map(|bm| gather(bm, bm.len() / self.n_rows));
         Ok(out)
     }
 
-    /// Visit every non-missing entry as `(row, col, value)`.
-    fn for_each_entry(&self, mut f: impl FnMut(usize, u32, f32)) {
-        match &self.storage {
-            Storage::Dense(data) => {
-                for r in 0..self.n_rows {
-                    let base = r * self.n_cols;
-                    for c in 0..self.n_cols {
-                        let v = data[base + c];
-                        if !is_missing(v, self.missing) {
-                            f(r, c as u32, v);
-                        }
-                    }
-                }
-            }
-            Storage::Csr {
-                indptr,
-                indices,
-                values,
-            } => {
-                for r in 0..self.n_rows {
-                    for k in indptr[r]..indptr[r + 1] {
-                        let v = values[k];
-                        if !is_missing(v, self.missing) {
-                            f(r, indices[k], v);
-                        }
-                    }
-                }
-            }
+    /// Visit every non-missing entry as `(row, col, value)`, in row order.
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(usize, u32, f32)) {
+        for r in 0..self.n_rows {
+            self.for_row_entry(r, |c, v| f(r, c, v));
         }
     }
 }

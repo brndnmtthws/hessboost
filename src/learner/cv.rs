@@ -81,9 +81,9 @@ pub fn cv(
         let mut mean = Vec::with_capacity(per_round.len());
         let mut std = Vec::with_capacity(per_round.len());
         for vals in &per_round {
-            let m = vals.iter().sum::<f64>() / vals.len().max(1) as f64;
-            let var =
-                vals.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / vals.len().max(1) as f64;
+            let len = vals.len().max(1) as f64;
+            let m = vals.iter().sum::<f64>() / len;
+            let var = vals.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / len;
             mean.push(m);
             std.push(var.sqrt());
         }
@@ -99,6 +99,7 @@ pub fn cv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::labeled_dense;
 
     #[test]
     fn cv_reports_decreasing_rmse() {
@@ -111,10 +112,7 @@ mod tests {
             x.push(xi);
             y.push(if xi > 0.5 { 1.0 } else { 0.0 });
         }
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
             .max_depth(3)

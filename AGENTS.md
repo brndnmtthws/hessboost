@@ -4,9 +4,6 @@ hessboost is a pure-Rust reimplementation of XGBoost gradient boosting: one
 library crate, no C/C++, no FFI. User docs live in `README.md`, the rustdoc
 (`src/lib.rs`), and `examples/`. This file covers working on the code.
 
-The code is largely AI-generated. Treat unlisted behavior as unverified and
-prove changes with the commands below.
-
 ## Toolchain
 
 `mise.toml` pins Rust, mbx, and uv; run `mise install`. Edition 2024, MSRV
@@ -56,7 +53,7 @@ doc identifiers (`XGBoost`, `TreeSHAP`, ...) exempt from `doc_markdown`.
 | `metric/` | Eval metrics by XGBoost name: `mod.rs` (rmse, mae, logloss, error, auc/aucpr, multiclass, count, ndcg/map, custom hook), `elementwise` (rmsle, mape, mphe), `ranking` (`pre@k`), `quantile` (quantile/expectile), `survival` (cox/aft-nloglik, interval accuracy), `distributional` (`nll`, `crps`; beyond XGBoost) |
 | `tree/` | `RegTree` (scalar or vector leaves), `gain`, `constraints` (monotone/interaction), `sampler` (colsample bytree/bylevel/bynode, optionally feature-weighted), `builder/` (`exact`, `hist`, `multi` vector-leaf hist trees for `multi_output_tree`, and the opt-in `oblivious` symmetric growth, `lightgbm` `extra_trees`/`path_smooth` search, `budget` generalization-gated grower), `hist/` accumulation (`hist/quantized`: opt-in quantized-gradient histograms), `compact` (prediction layout, constant leaves only), `oblivious` (bit-pattern tables for symmetric trees), `linear` (opt-in `linear_tree` leaves: fit, storage, prediction), `reuse` (opt-in Trees-on-a-Diet reuse penalties) |
 | `booster/` | `gblinear` |
-| `learner/` | `train` (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `model` (`BoostedModel`: iteration layout, slicing, `iteration_range` prediction, native formats), `native_v1` (frozen v1 decoder), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv`, `shap` (QuadratureTreeSHAP), `conformal` (split-conformal / CQR intervals), `compact_model` (`CompactModel`, bit-packed Trees-on-a-Diet format), `budget` (opt-in PerpetualBooster-style training) |
+| `learner/` | `train` (gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `model` (`BoostedModel`: iteration layout, slicing, `iteration_range` prediction, native formats), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv`, `shap` (QuadratureTreeSHAP), `conformal` (split-conformal / CQR intervals), `compact_model` (`CompactModel`, bit-packed Trees-on-a-Diet format), `budget` (opt-in PerpetualBooster-style training) |
 | `model/` | XGBoost model import/export: `xgboost_json` (schema mapping, JSON and UBJSON entry points), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `simd/` | Private runtime-dispatched kernels: `scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2) |
 
@@ -68,11 +65,13 @@ refresh, forests, slicing, iteration ranges), `quantized.rs`
 renewal), `tree_options.rs` (`extra_trees`, `path_smooth`, `linear_tree`),
 `budget.rs`, `multi_output.rs` (vector-leaf trees), `distributional.rs`
 (`dist:*` objectives: interval calibration, NLL vs a homoscedastic baseline,
-serialization, CQR), `native_format.rs` (native binary/JSON version
-migration and round trips; fixtures in `tests/data/native-v1/`).
+serialization, CQR), `native_format.rs` (native binary/JSON round trips,
+refused versions and corrupt payloads).
 `tests/data/xgboost-3.4.2-categorical.{json,ubj}` are committed XGBoost saves
-that `model/xgboost_json.rs` unit tests import. `benches/training.rs` is the
-Criterion suite; `docs/performance.md` records its results.
+that `model/xgboost_json.rs` unit tests import. `tests/common/` and
+`examples/common/` hold the helpers shared by the integration tests and by
+the examples. `benches/training.rs` is the Criterion suite;
+`docs/performance.md` records its results.
 
 ## Invariants
 
@@ -98,21 +97,17 @@ Criterion suite; `docs/performance.md` records its results.
   3.4.1). `exact`-tier fixtures match pointwise; RNG-driven cases
   (subsampling, DART) only match within a quality band because the RNG
   streams differ.
-- **Formats:** the native binary format (`SQB\0`, a version byte, a
-  postcard payload of `BoostedModel`), the JSON layouts and the compact layout
-  (`HBTD`, version byte, documented in `learner/compact_model.rs`) are
-  compatibility contracts; do not change them without a migration. Native
-  version 1 is hessboost 0.1.1 and earlier, decoded by the frozen structs in
-  `learner/native_v1.rs`; version 2 (`NATIVE_VERSION` in `learner/model.rs`)
-  is the current layout, and unknown versions are refused. Postcard is not
-  self-describing and ignores `#[serde(default)]`, so any change to a type
-  inside `BoostedModel` (`RegTree`, `Node`, `LinearLeaves`, `LinearModel`,
-  `ObjectiveParams`) needs a version bump plus a frozen decoder of the
-  previous layout; `tests/native_format.rs` checks the committed 0.1.1 files
-  in `tests/data/native-v1/` still predict bit for bit. Native JSON is
-  unversioned: only add fields, each with a serde default that reproduces the
-  old behavior. The compact metadata embeds `ObjectiveParams` as postcard, so
-  changing that struct changes the compact format too.
+- **Formats:** the native binary format (`SQB\0`, a version byte, then a
+  postcard payload of `BoostedModel`), the native JSON layout
+  (`BoostedModel`'s fields by name) and the compact layout (`HBTD`, version
+  byte, documented in `learner/compact_model.rs`) are contracts.
+  `BoostedModel::from_bytes` reads only `NATIVE_VERSION`
+  (`learner/model.rs`) and refuses every other version. Postcard is not
+  self-describing, so any change to a type inside `BoostedModel` (`RegTree`,
+  `Node`, `LinearLeaves`, `LinearModel`, `ObjectiveParams`) needs a
+  `NATIVE_VERSION` bump; it changes the native JSON layout as well. The
+  compact metadata embeds `ObjectiveParams` as postcard, so changing that
+  struct changes the compact format too.
 - **Tree layout:** as in XGBoost, iteration `i` owns trees
   `i * trees_per_iteration ..` (`trees_per_iteration = n_outputs ×
   num_parallel_tree`), grouped by output; tree `t` feeds output
@@ -218,13 +213,6 @@ instead of the compact forest, and XGBoost export and TreeSHAP refuse them.
 
 ## Not implemented
 
-GPU training, distributed or external-memory training, and Python/CLI/C-ABI
-bindings. Some XGBoost options exist only at one setting and are not
-parameters: gblinear is `updater=coord_descent` with
-`feature_selector=cyclic`; LambdaMART is `lambdarank_pair_method=topk`
-(no `lambdarank_unbiased`, `ndcg_exp_gain`); DART has no `sample_type`,
-`normalize_type`, or `one_drop`; categorical splits have no
-`max_cat_to_onehot`/`max_cat_threshold`. Metrics missing from XGBoost's
-catalog: `gamma-deviance` and the `ndcg-`/`map-` variants. The `@` suffix
-is read by `tweedie-nloglik`, `ndcg`, `map`, and `pre` only; other metrics
-drop it, so `error@t` evaluates plain `error` at threshold 0.5.
+See [`README.md`](README.md#not-implemented). Options that exist at only
+one setting there are not parameters; `tests/parity.rs` fails a fixture
+that sets them any other way.

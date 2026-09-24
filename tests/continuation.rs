@@ -6,6 +6,9 @@ use hessboost::prelude::{
     train, train_continue, train_continue_with_eval, train_with_eval,
 };
 
+mod common;
+use common::{invalid_param, labeled_dense, rmse};
+
 /// Deterministic regression data: `n` rows, 4 features, a smooth target.
 fn regression(n: usize, shift: f32) -> DMatrix {
     let mut x = Vec::with_capacity(n * 4);
@@ -17,10 +20,7 @@ fn regression(n: usize, shift: f32) -> DMatrix {
         y.push(2.0 * f[0] - 3.0 * f[1] * f[1] + 0.5 * f[2] + shift);
         x.extend(f);
     }
-    DMatrix::from_dense(&x, n, 4)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    labeled_dense(&x, 4, &y)
 }
 
 /// [`regression`] with pseudo-random label noise, so boosting eventually
@@ -68,7 +68,7 @@ fn continuing_grows_the_same_trees_as_training_in_one_run() {
     let cases = [
         (
             base().subsample(0.7).colsample_bynode(0.5).build().unwrap(),
-            regression(300, 0.0),
+            d.clone(),
         ),
         (
             base()
@@ -76,11 +76,11 @@ fn continuing_grows_the_same_trees_as_training_in_one_run() {
                 .rate_drop(0.3)
                 .build()
                 .unwrap(),
-            regression(300, 0.0),
+            d.clone(),
         ),
         (
             base().tree_method(TreeMethod::Exact).build().unwrap(),
-            regression(300, 0.0),
+            d.clone(),
         ),
         (softprob, multiclass(300)),
     ];
@@ -147,23 +147,16 @@ fn early_stopping_after_continuation_reports_absolute_iterations() {
 
 /// A continuation whose early-stopping metric never improves (here NaN:
 /// `cox-nloglik` of an all-censored set) keeps the first continued
-/// iteration, never an iteration of the initial model: selecting iteration
-/// 0 used to drop nearly the whole resumed model from `predict`.
+/// iteration, never an iteration of the initial model, so `predict` still
+/// uses every tree of the resumed model.
 #[test]
 fn continuation_without_an_improving_metric_keeps_the_initial_model() {
     let d = regression(200, 0.0);
     let times: Vec<f32> = d.labels().unwrap().iter().map(|y| y.abs() + 1.0).collect();
-    let survival = |labels: &[f32]| {
-        let x: Vec<f32> = (0..d.n_rows() * 4)
-            .map(|i| d.get(i / 4, i % 4).unwrap())
-            .collect();
-        DMatrix::from_dense(&x, d.n_rows(), 4)
-            .unwrap()
-            .with_labels(labels)
-            .unwrap()
-    };
-    let train_set = survival(&times);
-    let censored = survival(&times.iter().map(|t| -t).collect::<Vec<_>>());
+    let train_set = d.clone().with_labels(&times).unwrap();
+    let censored = d
+        .with_labels(&times.iter().map(|t| -t).collect::<Vec<_>>())
+        .unwrap();
     let params = base().objective("survival:cox").build().unwrap();
     let first = train(&params, &train_set, 4).unwrap();
     let out = train_continue_with_eval(
@@ -187,29 +180,22 @@ fn continuation_without_an_improving_metric_keeps_the_initial_model() {
 fn incompatible_continuations_are_rejected() {
     let d = regression(100, 0.0);
     let first = train(&base().build().unwrap(), &d, 2).unwrap();
-    let param_name = |r: Result<BoostedModel, HessboostError>| match r {
-        Err(HessboostError::InvalidParameter { name, .. }) => name,
-        other => panic!("expected InvalidParameter, got {other:?}"),
-    };
     let objective = base().objective("reg:pseudohubererror").build().unwrap();
     assert_eq!(
-        param_name(train_continue(&objective, &d, 1, &first)),
+        invalid_param(train_continue(&objective, &d, 1, &first)),
         "objective"
     );
     let forest = base().num_parallel_tree(2).build().unwrap();
     assert_eq!(
-        param_name(train_continue(&forest, &d, 1, &first)),
+        invalid_param(train_continue(&forest, &d, 1, &first)),
         "num_parallel_tree"
     );
     let linear = base().booster(BoosterKind::GbLinear).build().unwrap();
     assert_eq!(
-        param_name(train_continue(&linear, &d, 1, &first)),
+        invalid_param(train_continue(&linear, &d, 1, &first)),
         "booster"
     );
-    let narrow = DMatrix::from_dense(&[0.5; 30], 10, 3)
-        .unwrap()
-        .with_labels(&[0.0; 10])
-        .unwrap();
+    let narrow = labeled_dense(&[0.5; 30], 3, &[0.0; 10]);
     assert!(matches!(
         train_continue(&base().build().unwrap(), &narrow, 1, &first),
         Err(HessboostError::DimensionMismatch { .. })
@@ -224,11 +210,6 @@ fn gblinear_continues_from_its_weights() {
         .eta(0.5)
         .build()
         .unwrap();
-    let rmse = |m: &BoostedModel| {
-        let p = m.predict(&d).unwrap();
-        let y = d.labels().unwrap();
-        (p.iter().zip(y).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / p.len() as f32).sqrt()
-    };
     let first = train(&params, &d, 3).unwrap();
     let resumed = train_continue(&params, &d, 5, &first).unwrap();
     let whole = train(&params, &d, 8).unwrap();
@@ -236,7 +217,7 @@ fn gblinear_continues_from_its_weights() {
     // the f32 margin rounding of recomputing predictions.
     let (a, b) = (resumed.predict(&d).unwrap(), whole.predict(&d).unwrap());
     assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-4));
-    assert!(rmse(&resumed) < rmse(&first));
+    assert!(rmse(&resumed, &d) < rmse(&first, &d));
 }
 
 #[test]
@@ -271,21 +252,8 @@ fn refreshing_on_the_training_data_reproduces_the_model() {
 #[test]
 fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     let d = regression(300, 0.0);
-    let half = DMatrix::from_dense(
-        &(0..150 * 4)
-            .map(|i| d.get(i / 4, i % 4).unwrap())
-            .collect::<Vec<_>>(),
-        150,
-        4,
-    )
-    .unwrap()
-    .with_labels(
-        &d.labels().unwrap()[..150]
-            .iter()
-            .map(|y| y + 3.0)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
+    // The first 150 rows of `d`, with labels shifted by 3.
+    let half = regression(150, 3.0);
     let model = train(&base().build().unwrap(), &d, 6).unwrap();
     let keep_leaves = base()
         .process_type(ProcessType::Update)
@@ -294,7 +262,7 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
         .unwrap();
     let stats_only = train_continue(&keep_leaves, &half, 6, &model).unwrap();
     assert_eq!(stats_only.predict(&d).unwrap(), model.predict(&d).unwrap());
-    // Covers now count the 150 refresh rows (squared error: hess 1 each).
+    // Covers count the 150 refresh rows (squared error: hess 1 each).
     assert!(
         stats_only
             .trees()
@@ -310,14 +278,11 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     let original = model.slice(0, 4, 1).unwrap().predict(&half).unwrap();
     assert!(shifted.iter().zip(&original).all(|(s, o)| s > o));
 
-    let too_many = train_continue(&update, &half, 7, &model);
-    assert!(
-        matches!(too_many, Err(HessboostError::InvalidParameter { name, .. }) if name == "num_boost_round")
+    assert_eq!(
+        invalid_param(train_continue(&update, &half, 7, &model)),
+        "num_boost_round"
     );
-    assert!(matches!(
-        train(&update, &d, 1),
-        Err(HessboostError::InvalidParameter { name, .. }) if name == "process_type"
-    ));
+    assert_eq!(invalid_param(train(&update, &d, 1)), "process_type");
 }
 
 /// The refresh updater keeps the splits and recomputes constant leaves from
@@ -329,29 +294,20 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
 fn refresh_refuses_options_it_cannot_apply() {
     let d = regression(300, 0.0);
     let refused = |params: &TrainingParams, model: &BoostedModel| {
-        matches!(
-            train_continue(params, &d, 2, model),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "process_type"
-        )
+        invalid_param(train_continue(params, &d, 2, model)) == "process_type"
     };
     let update = || base().process_type(ProcessType::Update);
     let linear = train(&base().linear_tree(true).build().unwrap(), &d, 3).unwrap();
     assert!(refused(&update().build().unwrap(), &linear));
     let plain = train(&base().build().unwrap(), &d, 3).unwrap();
-    assert!(refused(
-        &update().linear_tree(true).build().unwrap(),
-        &plain
-    ));
-    assert!(refused(&update().path_smooth(1.0).build().unwrap(), &plain));
-    // Refresh sums full-precision gradients, so quantization would be
-    // silently skipped.
-    assert!(refused(
-        &update().use_quantized_grad(true).build().unwrap(),
-        &plain
-    ));
-    // Refresh keeps the existing splits, so split-search-only options would
-    // silently do nothing.
     for params in [
+        update().linear_tree(true),
+        update().path_smooth(1.0),
+        // Refresh sums full-precision gradients, so quantization would be
+        // silently skipped.
+        update().use_quantized_grad(true),
+        // Refresh keeps the existing splits, so split-search-only options
+        // would silently do nothing.
         update().extra_trees(true),
         update().toad_penalty_feature(1.0),
         update().toad_penalty_threshold(0.5),
@@ -443,15 +399,15 @@ fn iteration_ranges_select_whole_iterations() {
         .fold(0.0, f32::max);
     assert!(diff < 1e-5, "{diff}");
 
-    let bad = |r: hessboost::error::Result<Vec<f32>>| matches!(r, Err(HessboostError::InvalidParameter { name, .. }) if name == "iteration_range");
+    let bad = |r| invalid_param::<Vec<f32>>(r) == "iteration_range";
     assert!(bad(model.predict_margin_range(&d, (0, 7))));
     assert!(bad(model.predict_margin_range(&d, (4, 3))));
     // Attributions and leaves, as in XGBoost, only take prefixes.
     assert!(bad(model.predict_contribs_range(&d, (1, 3))));
-    assert!(matches!(
-        model.predict_leaf_range(&d, (1, 0)),
-        Err(HessboostError::InvalidParameter { .. })
-    ));
+    assert_eq!(
+        invalid_param(model.predict_leaf_range(&d, (1, 0))),
+        "iteration_range"
+    );
 }
 
 #[test]
@@ -472,8 +428,9 @@ fn slicing_selects_iterations_with_their_dart_weights() {
         let full = m.predict_margin_range(&d, (it, it + 1)).unwrap();
         full.iter().map(|v| v - m.base_score()).collect::<Vec<_>>()
     };
+    let picked = [1, 4, 7].map(|it| pick(&model, it));
     let expected: Vec<f32> = (0..d.n_rows())
-        .map(|r| model.base_score() + [1, 4, 7].iter().map(|&it| pick(&model, it)[r]).sum::<f32>())
+        .map(|r| model.base_score() + picked.iter().map(|p| p[r]).sum::<f32>())
         .collect();
     let got = sliced.predict_margin(&d).unwrap();
     assert!(got.iter().zip(&expected).all(|(a, b)| (a - b).abs() < 1e-5));
@@ -495,9 +452,6 @@ fn slicing_selects_iterations_with_their_dart_weights() {
     );
 
     for (b, e, s) in [(0, 0, 0), (3, 3, 1), (0, 10, 1), (5, 2, 1)] {
-        assert!(matches!(
-            model.slice(b, e, s),
-            Err(HessboostError::InvalidParameter { .. })
-        ));
+        assert_eq!(invalid_param(model.slice(b, e, s)), "slice");
     }
 }

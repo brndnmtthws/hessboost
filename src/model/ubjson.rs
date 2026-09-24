@@ -186,37 +186,31 @@ impl Encoder<'_> {
     }
 
     fn number(&mut self, n: &Number) -> Result<()> {
-        if let Some(i) = n.as_i64() {
+        let ty = if let Some(i) = n.as_i64() {
             // XGBoost's `UBJWriter::Visit(JsonInteger)` uses strict bounds, so
             // e.g. 127 and -128 are written as int16.
             if i64::from(i8::MIN) < i && i < i64::from(i8::MAX) {
-                self.out.push(b'i');
-                self.out.extend_from_slice(&(i as i8).to_be_bytes());
+                ElementType::I8
             } else if i64::from(i16::MIN) < i && i < i64::from(i16::MAX) {
-                self.out.push(b'I');
-                self.out.extend_from_slice(&(i as i16).to_be_bytes());
+                ElementType::I16
             } else if i64::from(i32::MIN) < i && i < i64::from(i32::MAX) {
-                self.out.push(b'l');
-                self.out.extend_from_slice(&(i as i32).to_be_bytes());
+                ElementType::I32
             } else {
-                self.out.push(b'L');
-                self.out.extend_from_slice(&i.to_be_bytes());
+                ElementType::I64
             }
         } else if n.is_u64() {
             return Err(HessboostError::model_format(format!(
                 "UBJSON: integer {n} exceeds the int64 range"
             )));
-        } else if let Some(f) = exact_f32(n) {
-            self.out.push(b'd');
-            self.out.extend_from_slice(&f.to_be_bytes());
+        } else if exact_f32(n).is_some() {
+            ElementType::F32
         } else {
-            let f = n.as_f64().ok_or_else(|| {
-                HessboostError::model_format(format!("UBJSON: unrepresentable number {n}"))
-            })?;
-            self.out.push(b'D');
-            self.out.extend_from_slice(&f.to_be_bytes());
-        }
-        Ok(())
+            ElementType::F64
+        };
+        self.out.push(ty.marker());
+        ty.push(n, &mut self.out).ok_or_else(|| {
+            HessboostError::model_format(format!("UBJSON: unrepresentable number {n}"))
+        })
     }
 
     fn typed(&mut self, key: &str, ty: ElementType, items: &[Value]) -> Result<()> {
@@ -322,11 +316,7 @@ impl<'a> Decoder<'a> {
             b'Z' => Value::Null,
             b'T' => Value::Bool(true),
             b'F' => Value::Bool(false),
-            b'i' => Value::from(i8::from_be_bytes(self.array()?)),
-            b'U' | b'C' => Value::from(self.byte()?),
-            b'I' => Value::from(i16::from_be_bytes(self.array()?)),
-            b'l' => Value::from(i32::from_be_bytes(self.array()?)),
-            b'L' => Value::from(i64::from_be_bytes(self.array()?)),
+            b'C' => Value::from(self.byte()?),
             b'd' => {
                 let v = f32::from_be_bytes(self.array()?);
                 self.float(f64::from(v))?
@@ -345,7 +335,10 @@ impl<'a> Decoder<'a> {
             b'S' => Value::String(self.string()?),
             b'[' => self.container(depth, false)?,
             b'{' => self.container(depth, true)?,
-            other => return Err(self.error(format!("unknown marker 0x{other:02x}"))),
+            other => match self.integer(other)? {
+                Some(i) => Value::from(i),
+                None => return Err(self.error(format!("unknown marker 0x{other:02x}"))),
+            },
         })
     }
 
@@ -355,20 +348,26 @@ impl<'a> Decoder<'a> {
             .ok_or_else(|| self.error(format!("non-finite number {v} has no JSON representation")))
     }
 
-    /// A length or count: an integer-typed value that must be non-negative.
-    fn length(&mut self) -> Result<usize> {
-        let marker = self.byte()?;
-        let n = match marker {
+    /// Payload of an integer-typed `marker` (`i U I l L`), or `None` for any
+    /// other marker.
+    fn integer(&mut self, marker: u8) -> Result<Option<i64>> {
+        Ok(Some(match marker {
             b'i' => i64::from(i8::from_be_bytes(self.array()?)),
             b'U' => i64::from(self.byte()?),
             b'I' => i64::from(i16::from_be_bytes(self.array()?)),
             b'l' => i64::from(i32::from_be_bytes(self.array()?)),
             b'L' => i64::from_be_bytes(self.array()?),
-            other => {
-                return Err(self.error(format!(
-                    "length must be an integer, found marker 0x{other:02x}"
-                )));
-            }
+            _ => return Ok(None),
+        }))
+    }
+
+    /// A length or count: an integer-typed value that must be non-negative.
+    fn length(&mut self) -> Result<usize> {
+        let marker = self.byte()?;
+        let Some(n) = self.integer(marker)? else {
+            return Err(self.error(format!(
+                "length must be an integer, found marker 0x{marker:02x}"
+            )));
         };
         usize::try_from(n).map_err(|_| self.error(format!("negative length {n}")))
     }
@@ -430,10 +429,7 @@ impl<'a> Decoder<'a> {
                 // `N` no-ops may precede every key, counted or not.
                 this.skip_noops();
                 let key = this.string()?;
-                let member = match element_marker {
-                    Some(ty) => this.value_of(ty, depth)?,
-                    None => this.value(depth)?,
-                };
+                let member = this.element(element_marker, depth)?;
                 // XGBoost's reader keeps the first occurrence of a key.
                 map.entry(key).or_insert(member);
                 Ok(())
@@ -459,10 +455,7 @@ impl<'a> Decoder<'a> {
             match count {
                 Some(n) => {
                     for _ in 0..n {
-                        items.push(match element_marker {
-                            Some(ty) => self.value_of(ty, depth)?,
-                            None => self.value(depth)?,
-                        });
+                        items.push(self.element(element_marker, depth)?);
                     }
                 }
                 None => loop {
@@ -475,6 +468,15 @@ impl<'a> Decoder<'a> {
                 },
             }
             Ok(Value::Array(items))
+        }
+    }
+
+    /// A container entry: the payload of a typed container's shared
+    /// `element_marker`, or a marked value otherwise.
+    fn element(&mut self, element_marker: Option<u8>, depth: usize) -> Result<Value> {
+        match element_marker {
+            Some(ty) => self.value_of(ty, depth),
+            None => self.value(depth),
         }
     }
 }

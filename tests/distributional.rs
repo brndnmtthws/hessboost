@@ -10,6 +10,9 @@ use hessboost::prelude::{
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+mod common;
+use common::labeled_dense;
+
 /// Heteroscedastic regression: `y = 2 sin(2π x₀) + (0.1 + x₁) ε`,
 /// `ε ~ N(0, 1)`, with a third, irrelevant feature. Returns the matrix and
 /// the true noise scale of every row.
@@ -30,11 +33,7 @@ fn heteroscedastic(n: usize, seed: u64) -> (DMatrix, Vec<f64>) {
         sigma.push(s);
         x.extend(f);
     }
-    let d = DMatrix::from_dense(&x, n, 3)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap();
-    (d, sigma)
+    (labeled_dense(&x, 3, &y), sigma)
 }
 
 /// Rows drawn from `dist_of(x)` for two uniform features.
@@ -47,10 +46,7 @@ fn sampled(n: usize, seed: u64, dist_of: impl Fn(f64, f64) -> Dist) -> DMatrix {
         y.push(dist_of(f64::from(f[0]), f64::from(f[1])).sample(&mut rng) as f32);
         x.extend(f);
     }
-    DMatrix::from_dense(&x, n, 2)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    labeled_dense(&x, 2, &y)
 }
 
 fn params(objective: &str) -> hessboost::config::TrainingParamsBuilder {
@@ -331,10 +327,7 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
             y.push((3.0 * f64::from(f) + e) as f32);
             x.push(f);
         }
-        DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        labeled_dense(&x, 1, &y)
     };
     let (dtrain, dcal, dtest) = (make(3000, 11), make(3000, 12), make(6000, 13));
     let model = fit(

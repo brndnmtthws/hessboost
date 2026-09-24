@@ -31,13 +31,10 @@
 //!
 //! [`DMatrix::with_feature_weights`]: crate::data::DMatrix::with_feature_weights
 
+use crate::K_RT_EPS_F32;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{RngExt, SeedableRng};
-
-/// XGBoost `kRtEps`: the floor applied to feature weights before the weighted
-/// draw.
-const WEIGHT_FLOOR: f32 = 1e-6;
 
 /// Draws feature subsets for one tree according to the `bytree`, `bylevel`,
 /// and `bynode` ratios, optionally weighted by per-feature weights.
@@ -76,18 +73,19 @@ impl ColumnSampler {
         if let Some(w) = weights {
             assert_eq!(w.len(), n_features, "one feature weight per feature");
         }
-        let mut sampler = ColumnSampler {
-            tree: Vec::new(),
+        let weights = weights.map(<[f32]>::to_vec);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let all: Vec<u32> = (0..n_features as u32).collect();
+        let tree = draw(&mut rng, weights.as_deref(), &all, bytree as f32);
+        ColumnSampler {
+            tree,
             levels: Vec::new(),
-            weights: weights.map(<[f32]>::to_vec),
+            weights,
             bylevel: bylevel as f32,
             bynode: bynode as f32,
-            rng: StdRng::seed_from_u64(seed),
+            rng,
             seed,
-        };
-        let all: Vec<u32> = (0..n_features as u32).collect();
-        sampler.tree = sampler.draw(&all, bytree as f32);
-        sampler
+        }
     }
 
     /// A pass-through sampler over all `n_features` columns (ratios `1.0`),
@@ -106,46 +104,10 @@ impl ColumnSampler {
         if self.levels.len() <= depth {
             self.levels.resize(depth + 1, None);
         }
-        let level = match self.levels[depth].take() {
-            Some(level) => level,
-            None => self.draw(&self.tree.clone(), self.bylevel),
-        };
-        let node = self.draw(&level, self.bynode);
-        self.levels[depth] = Some(level);
-        node
-    }
-
-    /// One sampling stage over `pool`: `max(1, trunc(ratio * len))` features
-    /// without replacement (weighted when weights are set), sorted ascending.
-    fn draw(&mut self, pool: &[u32], ratio: f32) -> Vec<u32> {
-        if ratio >= 1.0 || pool.is_empty() {
-            return pool.to_vec();
-        }
-        let n = ((ratio * pool.len() as f32) as usize).clamp(1, pool.len());
-        let mut chosen = match &self.weights {
-            None => {
-                let mut features = pool.to_vec();
-                features.shuffle(&mut self.rng);
-                features.truncate(n);
-                features
-            }
-            Some(weights) => {
-                let rng = &mut self.rng;
-                let mut keyed: Vec<(f32, u32)> = pool
-                    .iter()
-                    .map(|&f| {
-                        let w = weights[f as usize].max(WEIGHT_FLOOR);
-                        (rng.random::<f32>().ln() / w, f)
-                    })
-                    .collect();
-                // Stable descending sort by key, as XGBoost's `ArgSort`.
-                keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
-                keyed.truncate(n);
-                keyed.into_iter().map(|(_, f)| f).collect()
-            }
-        };
-        chosen.sort_unstable();
-        chosen
+        let weights = self.weights.as_deref();
+        let level = self.levels[depth]
+            .get_or_insert_with(|| draw(&mut self.rng, weights, &self.tree, self.bylevel));
+        draw(&mut self.rng, weights, level, self.bynode)
     }
 
     /// The per-tree seed this sampler was built with. Other per-tree random
@@ -154,6 +116,39 @@ impl ColumnSampler {
     pub(crate) fn seed(&self) -> u64 {
         self.seed
     }
+}
+
+/// One sampling stage over `pool`: `max(1, trunc(ratio * len))` features
+/// without replacement (weighted when `weights` is set), sorted ascending.
+fn draw(rng: &mut StdRng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> Vec<u32> {
+    if ratio >= 1.0 || pool.is_empty() {
+        return pool.to_vec();
+    }
+    let n = ((ratio * pool.len() as f32) as usize).clamp(1, pool.len());
+    let mut chosen = match weights {
+        None => {
+            let mut features = pool.to_vec();
+            features.shuffle(rng);
+            features.truncate(n);
+            features
+        }
+        Some(weights) => {
+            // XGBoost floors every weight at `kRtEps` before the draw.
+            let mut keyed: Vec<(f32, u32)> = pool
+                .iter()
+                .map(|&f| {
+                    let w = weights[f as usize].max(K_RT_EPS_F32);
+                    (rng.random::<f32>().ln() / w, f)
+                })
+                .collect();
+            // Stable descending sort by key, as XGBoost's `ArgSort`.
+            keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
+            keyed.truncate(n);
+            keyed.into_iter().map(|(_, f)| f).collect()
+        }
+    };
+    chosen.sort_unstable();
+    chosen
 }
 
 #[cfg(test)]

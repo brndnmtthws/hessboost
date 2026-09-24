@@ -235,9 +235,7 @@ impl QuantileBand<'_> {
                 upper,
             } => {
                 let k = model.n_outputs();
-                let preds = model.predict(data)?;
-                check_prediction_len(preds.len(), data.n_rows() * k)?;
-                check_finite(&preds)?;
+                let preds = checked_predictions(model, data, k)?;
                 Ok(preds
                     .chunks_exact(k)
                     .map(|row| (row[lower], row[upper]))
@@ -253,8 +251,7 @@ impl QuantileBand<'_> {
                     .iter()
                     .map(|d| (round_down(d.quantile(lower)), round_up(d.quantile(upper))))
                     .collect();
-                let flat: Vec<f32> = band.iter().flat_map(|&(lo, hi)| [lo, hi]).collect();
-                check_finite(&flat)?;
+                check_finite(band.iter().flat_map(|&(lo, hi)| [lo, hi]))?;
                 Ok(band)
             }
         }
@@ -281,11 +278,11 @@ impl<'a> ConformalizedQuantile<'a> {
         alpha: f64,
     ) -> Result<Self> {
         if lower.n_features() != upper.n_features() {
-            return Err(HessboostError::DimensionMismatch {
-                what: "upper quantile model feature count",
-                expected: lower.n_features(),
-                got: upper.n_features(),
-            });
+            return Err(HessboostError::dimension_mismatch(
+                "upper quantile model feature count",
+                lower.n_features(),
+                upper.n_features(),
+            ));
         }
         Self::calibrate_band(QuantileBand::Pair { lower, upper }, calibration, alpha)
     }
@@ -354,7 +351,6 @@ impl<'a> ConformalizedQuantile<'a> {
         calibration: &DMatrix,
         alpha: f64,
     ) -> Result<Self> {
-        validate_alpha(alpha)?;
         let band = QuantileBand::Distribution {
             model,
             lower: 0.5 * alpha,
@@ -484,31 +480,33 @@ fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Vec
             ),
         ));
     }
+    checked_predictions(model, data, 1)
+}
+
+/// `model.predict(data)`, validated as `width` finite values per row.
+fn checked_predictions(model: &BoostedModel, data: &DMatrix, width: usize) -> Result<Vec<f32>> {
     let preds = model.predict(data)?;
-    check_prediction_len(preds.len(), data.n_rows())?;
-    check_finite(&preds)?;
+    let expected = data.n_rows() * width;
+    if preds.len() != expected {
+        return Err(HessboostError::invalid_param(
+            "model",
+            format!(
+                "predictions must be laid out [row][output] ({expected} values), got {} values",
+                preds.len()
+            ),
+        ));
+    }
+    check_finite(preds.iter().copied())?;
     Ok(preds)
 }
 
-fn check_prediction_len(got: usize, expected: usize) -> Result<()> {
-    if got == expected {
-        Ok(())
-    } else {
-        Err(HessboostError::invalid_param(
-            "model",
-            format!(
-                "predictions must be laid out [row][output] ({expected} values), got {got} values"
-            ),
-        ))
-    }
-}
-
-fn check_finite(preds: &[f32]) -> Result<()> {
-    match preds.iter().position(|p| !p.is_finite()) {
+/// Rejects the first non-finite value, by its index in `preds`.
+fn check_finite(preds: impl IntoIterator<Item = f32>) -> Result<()> {
+    match preds.into_iter().enumerate().find(|(_, p)| !p.is_finite()) {
         None => Ok(()),
-        Some(i) => Err(HessboostError::invalid_param(
+        Some((i, p)) => Err(HessboostError::invalid_param(
             "model",
-            format!("prediction {i} is not finite ({})", preds[i]),
+            format!("prediction {i} is not finite ({p})"),
         )),
     }
 }
@@ -575,6 +573,7 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::learner::{train, train_with_objective};
     use crate::objective::{CustomObjective, GradPair};
+    use crate::test_support::labeled_dense;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
@@ -594,16 +593,12 @@ mod tests {
             x.extend_from_slice(&[x0, x1]);
             y.push((std::f32::consts::TAU * x0).sin() + (0.1 + x1) * eps as f32);
         }
-        DMatrix::from_dense(&x, n, N_FEATURES)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        labeled_dense(&x, n, N_FEATURES, &y)
     }
 
     fn with_shifted_labels(d: &DMatrix, shift: f32) -> DMatrix {
         let y: Vec<f32> = d.labels().unwrap().iter().map(|v| v + shift).collect();
-        let rows: Vec<usize> = (0..d.n_rows()).collect();
-        d.select_rows(&rows).unwrap().with_labels(&y).unwrap()
+        d.clone().with_labels(&y).unwrap()
     }
 
     fn point_model(d: &DMatrix) -> BoostedModel {
@@ -839,10 +834,7 @@ mod tests {
         // `1 - (-2^-80)` rounds to 1 in f64: with Q = 1 the interval [0, 2]
         // excluded the only calibration label, whose score attains Q.
         let y = -(2f32.powi(-80));
-        let cal = DMatrix::from_dense(&[0.0], 1, 1)
-            .unwrap()
-            .with_labels(&[y])
-            .unwrap();
+        let cal = labeled_dense(&[0.0], 1, 1, &[y]);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
             .base_score(1.0)
@@ -943,9 +935,9 @@ mod tests {
             ConformalizedQuantile::calibrate(&model, &model, &matrix, ALPHA),
             "labels",
         );
-        let multi_band = quantile_model(&train_set, [0.1, 0.9]);
+        let multi = quantile_model(&train_set, [0.1, 0.9]);
         assert_invalid(
-            ConformalizedQuantile::calibrate_outputs(&multi_band, 0, 1, &matrix, ALPHA),
+            ConformalizedQuantile::calibrate_outputs(&multi, 0, 1, &matrix, ALPHA),
             "labels",
         );
 
@@ -964,10 +956,7 @@ mod tests {
         assert_eq!(uniform.half_width(), plain.half_width());
 
         // Feature-count mismatch at calibration and prediction time.
-        let wide = DMatrix::from_dense(&[0.0; 3], 1, 3)
-            .unwrap()
-            .with_labels(&[0.0])
-            .unwrap();
+        let wide = labeled_dense(&[0.0; 3], 1, 3, &[0.0]);
         assert!(matches!(
             SplitConformal::calibrate(&model, &wide, ALPHA),
             Err(HessboostError::DimensionMismatch { .. })
@@ -978,10 +967,7 @@ mod tests {
         ));
 
         // Quantile models with different feature counts.
-        let one_feature = DMatrix::from_dense(&[0.0, 1.0, 2.0], 3, 1)
-            .unwrap()
-            .with_labels(&[0.0, 1.0, 2.0])
-            .unwrap();
+        let one_feature = labeled_dense(&[0.0, 1.0, 2.0], 3, 1, &[0.0, 1.0, 2.0]);
         let narrow_model = point_model(&one_feature);
         assert!(matches!(
             ConformalizedQuantile::calibrate(&model, &narrow_model, &cal, ALPHA),
@@ -989,7 +975,6 @@ mod tests {
         ));
 
         // Output selection on multi-output models.
-        let multi = quantile_model(&train_set, [0.1, 0.9]);
         assert_invalid(SplitConformal::calibrate(&multi, &cal, ALPHA), "model");
         assert_invalid(
             ConformalizedQuantile::calibrate(&multi, &model, &cal, ALPHA),
@@ -1041,10 +1026,7 @@ mod tests {
         let n = 60;
         let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let y: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
             .objective("multi:softmax")
             .num_class(3)

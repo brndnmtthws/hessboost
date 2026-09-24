@@ -9,7 +9,7 @@
 
 use rayon::prelude::*;
 
-use super::{GradPair, Objective};
+use super::{GradPair, MIN_HESS_F64, Objective};
 use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -276,8 +276,7 @@ impl Objective for AftObjective {
 /// Gradient clip range.
 const MIN_GRADIENT: f64 = -15.0;
 const MAX_GRADIENT: f64 = 15.0;
-/// Hessian clip range; the lower end keeps every row's Hessian positive.
-const MIN_HESSIAN: f64 = 1e-16;
+/// Hessian clip upper end (the lower end is [`MIN_HESS_F64`]).
 const MAX_HESSIAN: f64 = 15.0;
 /// Floor of the likelihood and threshold of a degenerate denominator.
 const EPS: f64 = 1e-12;
@@ -299,8 +298,21 @@ trait Distribution {
     fn cdf(z: f64) -> f64;
     fn grad_pdf(z: f64) -> f64;
     fn hess_pdf(z: f64) -> f64;
-    fn limit_grad(censoring: Censoring, sign: bool, sigma: f64) -> f64;
+    /// The `(low, high)` gradient limits [`limit_grad`] substitutes.
+    fn grad_limits(sigma: f64) -> (f64, f64);
     fn limit_hess(censoring: Censoring, sign: bool, sigma: f64) -> f64;
+}
+
+/// The gradient substituted for a degenerate ratio: `D`'s low limit for a
+/// positive z-score sign, its high limit otherwise, and `0` on the side a
+/// right (left) censored interval leaves flat.
+fn limit_grad<D: Distribution>(censoring: Censoring, sign: bool, sigma: f64) -> f64 {
+    let (low, high) = D::grad_limits(sigma);
+    match (censoring, sign) {
+        (Censoring::Uncensored | Censoring::Interval | Censoring::Right, true) => low,
+        (Censoring::Uncensored | Censoring::Interval | Censoring::Left, false) => high,
+        (Censoring::Right, false) | (Censoring::Left, true) => 0.0,
+    }
 }
 
 struct Normal;
@@ -325,30 +337,8 @@ impl Distribution for Normal {
         (z * z - 1.0) * Self::pdf(z)
     }
 
-    fn limit_grad(censoring: Censoring, sign: bool, _sigma: f64) -> f64 {
-        match censoring {
-            Censoring::Uncensored | Censoring::Interval => {
-                if sign {
-                    MIN_GRADIENT
-                } else {
-                    MAX_GRADIENT
-                }
-            }
-            Censoring::Right => {
-                if sign {
-                    MIN_GRADIENT
-                } else {
-                    0.0
-                }
-            }
-            Censoring::Left => {
-                if sign {
-                    0.0
-                } else {
-                    MAX_GRADIENT
-                }
-            }
-        }
+    fn grad_limits(_sigma: f64) -> (f64, f64) {
+        (MIN_GRADIENT, MAX_GRADIENT)
     }
 
     fn limit_hess(censoring: Censoring, sign: bool, sigma: f64) -> f64 {
@@ -359,12 +349,12 @@ impl Distribution for Normal {
                 if sign {
                     flat
                 } else {
-                    MIN_HESSIAN
+                    MIN_HESS_F64
                 }
             }
             Censoring::Left => {
                 if sign {
-                    MIN_HESSIAN
+                    MIN_HESS_F64
                 } else {
                     flat
                 }
@@ -407,35 +397,12 @@ impl Distribution for Logistic {
         }
     }
 
-    fn limit_grad(censoring: Censoring, sign: bool, sigma: f64) -> f64 {
-        let (low, high) = (-1.0 / sigma, 1.0 / sigma);
-        match censoring {
-            Censoring::Uncensored | Censoring::Interval => {
-                if sign {
-                    low
-                } else {
-                    high
-                }
-            }
-            Censoring::Right => {
-                if sign {
-                    low
-                } else {
-                    0.0
-                }
-            }
-            Censoring::Left => {
-                if sign {
-                    0.0
-                } else {
-                    high
-                }
-            }
-        }
+    fn grad_limits(sigma: f64) -> (f64, f64) {
+        (-1.0 / sigma, 1.0 / sigma)
     }
 
     fn limit_hess(_censoring: Censoring, _sign: bool, _sigma: f64) -> f64 {
-        MIN_HESSIAN
+        MIN_HESS_F64
     }
 }
 
@@ -468,30 +435,8 @@ impl Distribution for Extreme {
         }
     }
 
-    fn limit_grad(censoring: Censoring, sign: bool, sigma: f64) -> f64 {
-        match censoring {
-            Censoring::Uncensored | Censoring::Interval => {
-                if sign {
-                    MIN_GRADIENT
-                } else {
-                    1.0 / sigma
-                }
-            }
-            Censoring::Right => {
-                if sign {
-                    MIN_GRADIENT
-                } else {
-                    0.0
-                }
-            }
-            Censoring::Left => {
-                if sign {
-                    0.0
-                } else {
-                    1.0 / sigma
-                }
-            }
-        }
+    fn grad_limits(sigma: f64) -> (f64, f64) {
+        (MIN_GRADIENT, 1.0 / sigma)
     }
 
     fn limit_hess(censoring: Censoring, sign: bool, _sigma: f64) -> f64 {
@@ -500,10 +445,10 @@ impl Distribution for Extreme {
                 if sign {
                     MAX_HESSIAN
                 } else {
-                    MIN_HESSIAN
+                    MIN_HESS_F64
                 }
             }
-            Censoring::Left => MIN_HESSIAN,
+            Censoring::Left => MIN_HESS_F64,
         }
     }
 }
@@ -604,7 +549,7 @@ fn aft_gradient<D: Distribution>(y_lower: f64, y_upper: f64, pred: f64, sigma: f
     };
     let mut gradient = numerator / denominator;
     if denominator < EPS && !gradient.is_finite() {
-        gradient = D::limit_grad(censoring, z_sign, sigma);
+        gradient = limit_grad::<D>(censoring, z_sign, sigma);
     }
     clip(gradient, MIN_GRADIENT, MAX_GRADIENT)
 }
@@ -639,7 +584,7 @@ fn aft_hessian<D: Distribution>(y_lower: f64, y_upper: f64, pred: f64, sigma: f6
     if denominator < EPS && !hessian.is_finite() {
         hessian = D::limit_hess(censoring, z_sign, sigma);
     }
-    clip(hessian, MIN_HESSIAN, MAX_HESSIAN)
+    clip(hessian, MIN_HESS_F64, MAX_HESSIAN)
 }
 
 /// XGBoost `aft::Clip` (NaN passes through unchanged).
@@ -834,6 +779,7 @@ fn erf(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::gradient_pairs;
     use approx::assert_relative_eq;
 
     #[test]
@@ -862,9 +808,7 @@ mod tests {
     #[test]
     fn cox_breslow_gradient_with_tie_and_censoring() {
         let labels = [2.0, 1.0, 3.0, -2.0];
-        let preds = [0.0; 4];
-        let mut out = [GradPair::default(); 4];
-        CoxObjective.gradient(&preds, &labels, None, &mut out);
+        let out = gradient_pairs(&CoxObjective, &[0.0; 4], &labels, None);
         // Risk-set sizes seen by events: time 1 -> 4, time 2 -> 3, time 3 -> 1.
         let r = [
             1.0 / 4.0,
@@ -891,10 +835,8 @@ mod tests {
     fn cox_weights_scale_gradients() {
         let labels = [1.0, -2.0, 3.0];
         let preds = [0.3, -0.2, 0.1];
-        let mut plain = [GradPair::default(); 3];
-        let mut weighted = [GradPair::default(); 3];
-        CoxObjective.gradient(&preds, &labels, None, &mut plain);
-        CoxObjective.gradient(&preds, &labels, Some(&[2.0, 0.5, 1.0]), &mut weighted);
+        let plain = gradient_pairs(&CoxObjective, &preds, &labels, None);
+        let weighted = gradient_pairs(&CoxObjective, &preds, &labels, Some(&[2.0, 0.5, 1.0]));
         for ((p, w), s) in plain.iter().zip(&weighted).zip([2.0f32, 0.5, 1.0]) {
             assert_relative_eq!(w.grad, p.grad * s, max_relative = 1e-6);
             assert_relative_eq!(w.hess, p.hess * s, max_relative = 1e-6);
@@ -939,8 +881,8 @@ mod tests {
                     let fd_hess = (loss(pred + h) - 2.0 * loss(pred) + loss(pred - h)) / (h * h);
                     assert_relative_eq!(grad, fd_grad, epsilon = 1e-6, max_relative = 1e-5);
                     assert_relative_eq!(
-                        hess.max(MIN_HESSIAN),
-                        fd_hess.max(MIN_HESSIAN),
+                        hess.max(MIN_HESS_F64),
+                        fd_hess.max(MIN_HESS_F64),
                         epsilon = 1e-4,
                         max_relative = 1e-3
                     );
@@ -962,7 +904,7 @@ mod tests {
         assert_eq!(g, 0.0);
         assert_eq!(
             aft_hessian::<Logistic>(1.0, f64::INFINITY, 1e3, 1.0),
-            MIN_HESSIAN
+            MIN_HESS_F64
         );
         // Interval far below the prediction.
         let g = aft_gradient::<Extreme>(1.0, 2.0, 50.0, 1.0);
@@ -978,12 +920,9 @@ mod tests {
         let preds = [0.1, 0.2, 0.3];
         let info = MetaInfo {
             n_rows: 3,
-            labels: &[],
-            n_targets: 1,
-            weights: Some(&weights),
-            group: None,
             label_lower_bound: Some(&lower),
             label_upper_bound: Some(&upper),
+            ..MetaInfo::new(&[], Some(&weights), None)
         };
         obj.validate_info(&info).unwrap();
         let mut out = [GradPair::default(); 3];
@@ -1040,10 +979,7 @@ mod tests {
         // The fit follows the (uncensored) times upward.
         assert!(pred[n - 1] > 3.0 * pred[1]);
 
-        let unbounded = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&t)
-            .unwrap();
+        let unbounded = crate::test_support::labeled_dense(&x, n, 1, &t);
         let err = train_with_eval(&params, &d, 1, &[(&unbounded, "valid")], None).unwrap_err();
         assert!(err.to_string().contains("`valid`"), "{err}");
     }

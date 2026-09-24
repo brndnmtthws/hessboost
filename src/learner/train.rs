@@ -17,7 +17,7 @@ use crate::metric::create_metrics;
 use crate::objective::{GradPair, create_objective};
 use crate::tree::RegTree;
 use crate::tree::builder::{
-    ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_rows, check_symmetric_input,
+    ExactTreeBuilder, HistTreeBuilder, LeafRows, SortedColumns, all_rows, check_symmetric_input,
 };
 use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
@@ -42,10 +42,12 @@ enum Prepared {
 }
 
 impl Prepared {
-    /// Grow one tree for this round's gradients and samples. With reuse
-    /// penalties (`reuse` is `Some`) the split search is penalized by the
-    /// ensemble's dictionary, which the new tree's splits then extend.
-    /// `rounding_seed` keys the stochastic rounding of quantized training.
+    /// Grow one tree for this round's gradients and samples, with the rows
+    /// that reached each leaf when `capture_rows` (histogram method only;
+    /// empty otherwise). With reuse penalties (`reuse` is `Some`) the split
+    /// search is penalized by the ensemble's dictionary, which the new tree's
+    /// splits then extend. `rounding_seed` keys the stochastic rounding of
+    /// quantized training.
     #[allow(clippy::too_many_arguments)]
     fn build_tree(
         &self,
@@ -56,17 +58,25 @@ impl Prepared {
         sampler: &mut ColumnSampler,
         reuse: Option<&mut ReuseSet>,
         rounding_seed: u64,
-    ) -> RegTree {
+        capture_rows: bool,
+    ) -> (RegTree, Vec<LeafRows>) {
         let hist = |ghist: &GHistIndex, reuse: Option<&ReuseSet>, sampler: &mut ColumnSampler| {
-            HistTreeBuilder::new(params)
+            let builder = HistTreeBuilder::new(params)
                 .with_rounding_seed(rounding_seed)
-                .with_reuse(reuse, ghist.cuts())
-                .build(ghist, gpair, rows, sampler)
+                .with_reuse(reuse, ghist.cuts());
+            if capture_rows {
+                builder.build_with_leaf_rows(ghist, gpair, rows, sampler)
+            } else {
+                (builder.build(ghist, gpair, rows, sampler), Vec::new())
+            }
         };
-        let tree = match self {
-            Prepared::Exact(cols) => ExactTreeBuilder::new(params)
-                .with_reuse(reuse.as_deref())
-                .build(cols, dtrain, gpair, rows, sampler),
+        let (tree, leaf_rows) = match self {
+            Prepared::Exact(cols) => (
+                ExactTreeBuilder::new(params)
+                    .with_reuse(reuse.as_deref())
+                    .build(cols, dtrain, gpair, rows, sampler),
+                Vec::new(),
+            ),
             Prepared::Hist(ghist) => hist(ghist, reuse.as_deref(), sampler),
             Prepared::Approx { const_hess, cached } => {
                 let bin = || approx_index(params, dtrain, gpair, *const_hess);
@@ -80,7 +90,7 @@ impl Prepared {
         if let Some(reuse) = reuse {
             reuse.record_tree(&tree);
         }
-        tree
+        (tree, leaf_rows)
     }
 
     /// Whether one row sample serves every parallel tree of an output: XGBoost
@@ -169,10 +179,7 @@ fn prepare_builder(
         TreeMethod::Exact => TreeMethod::Exact,
         TreeMethod::Approx => TreeMethod::Approx,
     };
-    if method == TreeMethod::Exact
-        && params.sampling_method == SamplingMethod::GradientBased
-        && params.subsample < 1.0
-    {
+    if method == TreeMethod::Exact && gradient_sampling(params) {
         return Err(HessboostError::invalid_param(
             "sampling_method",
             "`gradient_based` sampling requires `tree_method=hist` or `approx`; \
@@ -386,34 +393,46 @@ fn train_impl(
     metric_override: Option<Box<dyn crate::metric::Metric>>,
     init_model: Option<&BoostedModel>,
 ) -> Result<TrainResult> {
-    if params.nthread > 0 {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(params.nthread)
-            .build()
-            .map_err(|error| HessboostError::invalid_param("nthread", error.to_string()))?;
-        return pool.install(|| {
-            train_impl_inner(
-                params,
-                dtrain,
-                num_boost_round,
-                evals,
-                early_stopping_rounds,
-                objective,
-                metric_override,
-                init_model,
-            )
-        });
+    with_thread_pool(params, || {
+        train_impl_inner(
+            params,
+            dtrain,
+            num_boost_round,
+            evals,
+            early_stopping_rounds,
+            objective,
+            metric_override,
+            init_model,
+        )
+    })
+}
+
+/// Run `train` on a dedicated pool of `params.nthread` threads, or on the
+/// global rayon pool when `nthread` is `0`.
+pub(crate) fn with_thread_pool<T: Send>(
+    params: &TrainingParams,
+    train: impl FnOnce() -> Result<T> + Send,
+) -> Result<T> {
+    if params.nthread == 0 {
+        return train();
     }
-    train_impl_inner(
-        params,
-        dtrain,
-        num_boost_round,
-        evals,
-        early_stopping_rounds,
-        objective,
-        metric_override,
-        init_model,
-    )
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(params.nthread)
+        .build()
+        .map_err(|error| HessboostError::invalid_param("nthread", error.to_string()))?;
+    pool.install(train)
+}
+
+/// Refuse a `missing` parameter other than the default: the sentinel belongs
+/// to the training matrix.
+pub(crate) fn reject_missing_param(params: &TrainingParams) -> Result<()> {
+    if !params.missing.is_nan() {
+        return Err(HessboostError::invalid_param(
+            "missing",
+            "set the sentinel when constructing DMatrix with from_dense_with_missing",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -429,13 +448,7 @@ fn train_impl_inner(
 ) -> Result<TrainResult> {
     params.validate()?;
     multi_output::validate(params)?;
-
-    if !params.missing.is_nan() {
-        return Err(HessboostError::invalid_param(
-            "missing",
-            "set the sentinel when constructing DMatrix with from_dense_with_missing",
-        ));
-    }
+    reject_missing_param(params)?;
     if early_stopping_rounds == Some(0) {
         return Err(HessboostError::invalid_param(
             "early_stopping_rounds",
@@ -488,17 +501,14 @@ fn train_impl_inner(
         }
     }
 
-    // The model records the objective's own name and output count (not the
-    // configured string / `num_class`): a `reg:linear` alias is saved as
-    // `reg:squarederror` like XGBoost does, and a custom objective's outputs
-    // determine the tree layout even though `num_class` is 0.
     BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)?;
     // A built-in objective passed to `train_with_objective` is recorded by
     // name with `params`' objective settings; refuse settings that would not
     // rebuild it, since the saved model could not be loaded again.
+    let objective_params = ObjectiveParams::from_params(params);
     check_objective_width(
         objective.name(),
-        &ObjectiveParams::from_params(params),
+        &objective_params,
         params.num_class,
         dtrain.n_targets(),
         n_out,
@@ -514,19 +524,7 @@ fn train_impl_inner(
         resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?
     } else {
         require_model_for_update(params)?;
-        let mut model = BoostedModel::new(
-            intercepts()?,
-            ModelSpec {
-                objective: objective.name().to_string(),
-                objective_params: ObjectiveParams::from_params(params),
-                num_class: params.num_class,
-                n_outputs: n_out,
-                n_targets: dtrain.n_targets(),
-                n_features,
-            },
-        );
-        model.set_num_parallel_tree(params.num_parallel_tree);
-        model
+        new_model(params, objective, dtrain, intercepts()?)
     };
 
     // The linear (`gblinear`) booster fits a coordinate-descent linear model
@@ -588,7 +586,7 @@ fn train_impl_inner(
             &params.eval_metric,
             &objective.default_metric(),
             params.num_class,
-            &ObjectiveParams::from_params(params),
+            &objective_params,
         )?,
     };
     if dtrain.n_targets() > 1
@@ -644,7 +642,6 @@ fn train_impl_inner(
     let mut best_iter = start_iteration;
     let mut rounds_since_improve = 0usize;
 
-    let is_dart = params.booster == BoosterKind::Dart;
     // `multi_strategy = multi_output_tree` grows vector-leaf trees when there
     // is more than one output (a single output keeps scalar trees, as
     // XGBoost's `LeafLength` does).
@@ -688,37 +685,24 @@ fn train_impl_inner(
                     model.push_tree_weighted(tree, 1.0);
                 }
             }
-            RoundPlan::Grow(prepared) if is_dart => {
-                dart_round(
-                    &mut model,
+            RoundPlan::Grow(prepared) => {
+                // 1. Gradients from the current margins (all outputs at once),
+                //    DART's from the ensemble minus this round's dropout set.
+                let (mut rng, dropped) = round_gradients(
+                    &model,
                     params,
                     dtrain,
-                    prepared,
                     objective,
                     &info,
-                    n,
-                    n_out,
-                    n_features,
                     iteration,
+                    &train_margin,
                     &mut gpair,
-                    &mut gpair_k,
-                    reuse.as_mut(),
-                )?;
-                // DART rescales earlier trees' weights each round, so the cached
-                // Eval margins are no longer additive. Recompute them from the
-                // (weighted) ensemble.
-                for (ei, (d, _)) in evals.iter().enumerate() {
-                    eval_margins[ei] = model.margin_from_trees(d, 0..model.num_trees());
-                }
-            }
-            RoundPlan::Grow(prepared) => {
-                // 1. Gradients from the current margins (all outputs at once).
-                objective.gradient_info(&train_margin, &info, &mut gpair);
+                );
                 multi_output::reject_split_gradient(objective, iteration, &gpair)?;
+                let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
 
                 // 2. Uniform row subsets, drawn before the trees and shared
                 //    across the per-output fits.
-                let mut rng = round_rng(params, iteration, 0);
                 let row_subsets = iteration_row_subsets(n, params, prepared, &mut rng);
                 // An output's gradient-based sample, when its whole forest
                 // shares one.
@@ -732,64 +716,48 @@ fn train_impl_inner(
                     // Retaining the final row partitions replaces a per-row tree
                     // traversal of the raw feature matrix with one sequential
                     // pass per leaf (constant leaves only).
-                    let (tree, leaf_rows) = match &prepared {
-                        Prepared::Hist(ghist)
-                            if params.grow_policy != GrowPolicy::LossGuide
-                                && row_subset.len() == n
-                                && !gradient_sampling(params)
-                                && !params.linear_tree =>
-                        {
-                            let gk: &[GradPair] = gather_output(&gpair, &mut gpair_k, n_out, k);
-                            let mut sampler = make_column_sampler(
-                                n_features,
-                                dtrain.feature_weights(),
-                                params,
-                                &mut rng,
-                            );
-                            let rounding_seed = quantization_seed(params, &mut rng);
-                            let (mut tree, leaf_rows) = HistTreeBuilder::new(params)
-                                .with_rounding_seed(rounding_seed)
-                                .with_reuse(reuse.as_ref(), ghist.cuts())
-                                .build_with_leaf_rows(ghist, gk, row_subset, &mut sampler);
-                            if let Some(reuse) = reuse.as_mut() {
-                                reuse.record_tree(&tree);
-                            }
-                            tree.scale_leaves(tree_eta(params));
-                            (tree, leaf_rows)
+                    let capture_rows = matches!(prepared, Prepared::Hist(_))
+                        && dropped.is_none()
+                        && params.grow_policy != GrowPolicy::LossGuide
+                        && row_subset.len() == n
+                        && !gradient_sampling(params)
+                        && !params.linear_tree;
+                    let (tree, leaf_rows) = fit_output_tree(
+                        params,
+                        prepared,
+                        dtrain,
+                        &gpair,
+                        &mut gpair_k,
+                        &mut rng,
+                        n_out,
+                        k,
+                        p,
+                        iteration,
+                        row_subset,
+                        &mut forest_sample,
+                        capture_rows,
+                        reuse.as_mut(),
+                    );
+
+                    // DART's gradients come from the ensemble, not the margin
+                    // caches (`finish_dart` recomputes the eval ones).
+                    if dropped.is_none() {
+                        // Row partitions already identify training leaves when
+                        // every row participated in depthwise histogram
+                        // construction.
+                        if leaf_rows.is_empty() {
+                            update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
+                        } else {
+                            apply_leaf_rows(&tree, &leaf_rows, &mut train_margin, n_out, k);
                         }
-                        _ => (
-                            fit_output_tree(
-                                params,
-                                prepared,
-                                dtrain,
-                                &gpair,
-                                &mut gpair_k,
-                                &mut rng,
-                                n_out,
-                                k,
-                                p,
-                                iteration,
-                                row_subset,
-                                &mut forest_sample,
-                                n_features,
-                                reuse.as_mut(),
-                            ),
-                            Vec::new(),
-                        ),
-                    };
-
-                    // Row partitions already identify training leaves when every
-                    // row participated in depthwise histogram construction.
-                    if leaf_rows.is_empty() {
-                        update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
-                    } else {
-                        apply_leaf_rows(&tree, &leaf_rows, &mut train_margin, n_out, k);
+                        for (ei, (d, _)) in evals.iter().enumerate() {
+                            update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
+                        }
                     }
-                    for (ei, (d, _)) in evals.iter().enumerate() {
-                        update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
-                    }
-
-                    model.push_tree_weighted(tree, 1.0);
+                    model.push_tree_weighted(tree, weight);
+                }
+                if let Some(dropped) = &dropped {
+                    finish_dart(&mut model, params, dropped, evals, &mut eval_margins);
                 }
             }
         }
@@ -835,6 +803,33 @@ fn train_impl_inner(
     Ok(TrainResult { model, history })
 }
 
+/// An empty model that `objective` trains on `dtrain` with `params`, starting
+/// from the margin-space intercepts `base_margins`. The model records the
+/// objective's own name and output count (not the configured string /
+/// `num_class`): a `reg:linear` alias is saved as `reg:squarederror` like
+/// XGBoost does, and a custom objective's outputs determine the tree layout
+/// even though `num_class` is 0.
+pub(crate) fn new_model(
+    params: &TrainingParams,
+    objective: &dyn crate::objective::Objective,
+    dtrain: &DMatrix,
+    base_margins: Vec<f32>,
+) -> BoostedModel {
+    let mut model = BoostedModel::new(
+        base_margins,
+        ModelSpec {
+            objective: objective.name().to_string(),
+            objective_params: ObjectiveParams::from_params(params),
+            num_class: params.num_class,
+            n_outputs: objective.n_outputs(),
+            n_targets: dtrain.n_targets(),
+            n_features: dtrain.n_cols(),
+        },
+    );
+    model.set_num_parallel_tree(params.num_parallel_tree);
+    model
+}
+
 /// Per-output intercepts in margin space. A user-supplied `base_score` is
 /// given in prediction space and broadcast to every output through the
 /// objective's link (XGBoost `ProbToMargin`; for multiclass this is a
@@ -876,11 +871,11 @@ pub(crate) fn initial_intercepts(
         None => objective.base_margins_info(info),
     };
     if base_margins.len() != n_out {
-        return Err(HessboostError::DimensionMismatch {
-            what: "objective base_margins length",
-            expected: n_out,
-            got: base_margins.len(),
-        });
+        return Err(HessboostError::dimension_mismatch(
+            "objective base_margins length",
+            n_out,
+            base_margins.len(),
+        ));
     }
     if base_margins.iter().any(|m| !m.is_finite()) {
         return Err(HessboostError::invalid_param(
@@ -907,19 +902,15 @@ pub(super) fn tree_eta(params: &TrainingParams) -> f32 {
     params.eta as f32 / params.num_parallel_tree as f32
 }
 
-/// Add one tree's predictions to one output column. Rows are independent, so
+/// Apply `update` to every `(row, row margins)` pair of `margins`
+/// (`[row][n_out]`), in parallel for large inputs. Rows are independent, so
 /// parallel traversal preserves each row's floating-point addition order.
-fn update_tree_margins(
-    tree: &RegTree,
-    data: &DMatrix,
+pub(super) fn for_each_row_margins(
     margins: &mut [f32],
     n_out: usize,
-    output: usize,
+    update: impl Fn((usize, &mut [f32])) + Sync + Send,
 ) {
-    let update = |(row, margin): (usize, &mut [f32])| {
-        margin[output] += tree.predict_row(data, row);
-    };
-    if data.n_rows() >= 4096 && rayon::current_num_threads() > 1 {
+    if margins.len() / n_out >= 4096 && rayon::current_num_threads() > 1 {
         margins
             .par_chunks_mut(n_out)
             .with_min_len(1024)
@@ -930,12 +921,25 @@ fn update_tree_margins(
     }
 }
 
+/// Add one tree's predictions to one output column.
+fn update_tree_margins(
+    tree: &RegTree,
+    data: &DMatrix,
+    margins: &mut [f32],
+    n_out: usize,
+    output: usize,
+) {
+    for_each_row_margins(margins, n_out, |(row, margin)| {
+        margin[output] += tree.predict_row(data, row);
+    });
+}
+
 /// Add each leaf's value to the margins of the rows that reached it. Leaf row
 /// lists are ascending, so each parallel row chunk locates its slice of every
 /// leaf by binary search. The per-row addition order is unchanged.
 fn apply_leaf_rows(
     tree: &RegTree,
-    leaf_rows: &[crate::tree::builder::LeafRows],
+    leaf_rows: &[LeafRows],
     margins: &mut [f32],
     n_out: usize,
     output: usize,
@@ -968,81 +972,44 @@ fn apply_leaf_rows(
         });
 }
 
-/// Perform one DART (Dropout Additive Regression Trees) boosting round.
-///
-/// With probability `1 - skip_drop` a dropout set `D` is selected from the trees
-/// built so far (each dropped independently with probability `rate_drop`, at
-/// least one when any exist). The round's gradients are computed from the
-/// ensemble **excluding** `D`. The new trees (`num_parallel_tree` per output,
-/// each shrunk by `eta / num_parallel_tree`) are then fit on those gradients.
-/// Using XGBoost's `tree` normalization, if `k = |D|` every new tree gets
-/// weight `1/(k+eta)` and each dropped tree is rescaled by `k/(k+eta)`.
+/// The RNG and gradients of one tree-growing round, filled into `gpair`.
+/// gbtree takes the gradients at the cached `margin`. DART (Dropout Additive
+/// Regression Trees) first draws a dropout set `D` over the trees built so
+/// far ([`select_dropout`]) and takes the gradients of the ensemble
+/// **excluding** `D`, whose tree ids it returns. Using XGBoost's `tree`
+/// normalization, if `k = |D|` the round's new trees then get weight
+/// `1/(k+eta)` ([`dart_new_tree_weight`]) and [`finish_dart`] rescales each
+/// dropped tree by `k/(k+eta)`.
 #[allow(clippy::too_many_arguments)]
-fn dart_round(
-    model: &mut BoostedModel,
+pub(super) fn round_gradients(
+    model: &BoostedModel,
     params: &TrainingParams,
     dtrain: &DMatrix,
-    prepared: &Prepared,
     objective: &dyn crate::objective::Objective,
     info: &MetaInfo,
-    n: usize,
-    n_out: usize,
-    n_features: usize,
     iteration: usize,
+    margin: &[f32],
     gpair: &mut [GradPair],
-    gpair_k: &mut [GradPair],
-    mut reuse: Option<&mut ReuseSet>,
-) -> Result<()> {
+) -> (StdRng, Option<Vec<usize>>) {
+    if params.booster != BoosterKind::Dart {
+        objective.gradient_info(margin, info, gpair);
+        return (round_rng(params, iteration, 0), None);
+    }
     let mut rng = round_rng(params, iteration, DART_SALT);
-
-    // 1. Select the dropout set over the trees built so far.
     let (dropped, drop_indices) = select_dropout(model, params, &mut rng);
-
-    // 2. Gradients from the ensemble minus the dropout set.
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
     objective.gradient_info(&margin_excl, info, gpair);
-    multi_output::reject_split_gradient(objective, iteration, gpair)?;
-
-    // 3. Fit the new trees on those gradients, from uniform row subsets
-    //    shared across outputs.
-    let parallel = params.num_parallel_tree;
-    let row_subsets = iteration_row_subsets(n, params, prepared, &mut rng);
-    let mut forest_sample = None;
-    let new_weight = dart_new_tree_weight(&drop_indices, params);
-    for slot in 0..n_out * parallel {
-        let (kk, p) = (slot / parallel, slot % parallel);
-        let tree = fit_output_tree(
-            params,
-            prepared,
-            dtrain,
-            gpair,
-            gpair_k,
-            &mut rng,
-            n_out,
-            kk,
-            p,
-            iteration,
-            &row_subsets[p % row_subsets.len()],
-            &mut forest_sample,
-            n_features,
-            reuse.as_deref_mut(),
-        );
-        model.push_tree_weighted(tree, new_weight);
-    }
-
-    // 4. Rescale the dropped trees so the ensemble stays balanced.
-    rescale_dropped(model, &drop_indices, params);
-    Ok(())
+    (rng, Some(drop_indices))
 }
 
 /// The DART round RNG's booster salt.
-pub(super) const DART_SALT: u64 = 0x0DA27;
+const DART_SALT: u64 = 0x0DA27;
 
 /// Draw a DART round's dropout set over the trees built so far: skipped with
 /// probability `skip_drop`, otherwise each tree independently with
 /// probability `rate_drop`, and at least one tree when any exist (as
 /// XGBoost). Returns the per-tree mask and the dropped indices.
-pub(super) fn select_dropout(
+fn select_dropout(
     model: &BoostedModel,
     params: &TrainingParams,
     rng: &mut StdRng,
@@ -1079,24 +1046,29 @@ pub(super) fn dart_new_tree_weight(drop_indices: &[usize], params: &TrainingPara
     }
 }
 
-/// Rescale a DART round's dropped trees by `k / (k + eta)` so the ensemble
-/// stays balanced.
-pub(super) fn rescale_dropped(
+/// Finish a DART round: rescale its dropped trees by `k / (k + eta)` so the
+/// ensemble stays balanced, then recompute the eval margin caches, which the
+/// rescaling makes non-additive.
+pub(super) fn finish_dart(
     model: &mut BoostedModel,
-    drop_indices: &[usize],
     params: &TrainingParams,
+    drop_indices: &[usize],
+    evals: &[EvalSet],
+    eval_margins: &mut [Vec<f32>],
 ) {
     let k = drop_indices.len() as f32;
     let factor = k / (k + params.eta as f32);
     for &i in drop_indices {
         model.scale_tree_weight(i, factor);
     }
+    for (margins, (d, _)) in eval_margins.iter_mut().zip(evals) {
+        *margins = model.margin_from_trees(d, 0..model.num_trees());
+    }
 }
 
 /// Borrow the gradient slice for output `k`: the whole buffer for
 /// single-output objectives, otherwise gather output `k`'s pairs into
-/// `scratch` (length `n`) and borrow that. Shared by the boosting loop and
-/// the DART rounds.
+/// `scratch` (length `n`) and borrow that.
 fn gather_output<'a>(
     gpair: &'a [GradPair],
     scratch: &'a mut [GradPair],
@@ -1116,7 +1088,7 @@ fn gather_output<'a>(
 /// The RNG for one boosting round: `seed ^ round * 0x9E37_79B9`, plus a
 /// booster-specific `salt` (`0` for gbtree, `0x0DA27` for DART) so the two
 /// boosters draw from different streams.
-pub(super) fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
+fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> StdRng {
     StdRng::seed_from_u64(params.seed ^ (round as u64).wrapping_mul(0x9E37_79B9) ^ salt)
 }
 
@@ -1124,10 +1096,11 @@ pub(super) fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> Std
 /// output's gradient slice, apply gradient-based row sampling when configured
 /// (per tree, as XGBoost's hist updater does, or once per output forest
 /// under `approx`, kept in `forest_sample` by the forest's first tree for the
-/// rest), derive its column sampler, build the tree, fit linear leaves when
-/// configured, and shrink its leaves by `eta / num_parallel_tree`. The caller
-/// owns the round RNG (already seeded and salted), the tree's uniform row
-/// subset, and what happens to the tree (margin updates, contribution
+/// rest), derive its column sampler, build the tree (with its leaves' rows
+/// when `capture_rows`, see [`Prepared::build_tree`]), fit linear leaves
+/// when configured, and shrink its leaves by `eta / num_parallel_tree`. The
+/// caller owns the round RNG (already seeded and salted), the tree's uniform
+/// row subset, and what happens to the tree (margin updates, contribution
 /// weight).
 #[allow(clippy::too_many_arguments)]
 fn fit_output_tree(
@@ -1143,9 +1116,9 @@ fn fit_output_tree(
     iteration: usize,
     row_subset: &[u32],
     forest_sample: &mut Option<GradientSample>,
-    n_features: usize,
+    capture_rows: bool,
     reuse: Option<&mut ReuseSet>,
-) -> RegTree {
+) -> (RegTree, Vec<LeafRows>) {
     let gk: &[GradPair] = gather_output(gpair, gpair_k, n_out, k);
     let own;
     let sampled = if !gradient_sampling(params) {
@@ -1163,16 +1136,24 @@ fn fit_output_tree(
         Some(s) => (s.gpair.as_slice(), s.rows.as_slice()),
         None => (gk, row_subset),
     };
-    let mut sampler = make_column_sampler(n_features, dtrain.feature_weights(), params, rng);
+    let mut sampler = make_column_sampler(dtrain, params, rng);
     let rounding_seed = quantization_seed(params, rng);
-    let mut tree =
-        prepared.build_tree(params, dtrain, gk, rows, &mut sampler, reuse, rounding_seed);
+    let (mut tree, leaf_rows) = prepared.build_tree(
+        params,
+        dtrain,
+        gk,
+        rows,
+        &mut sampler,
+        reuse,
+        rounding_seed,
+        capture_rows,
+    );
     // LightGBM keeps the first iteration's trees constant.
     if params.linear_tree && iteration > 0 {
         crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, params.linear_lambda);
     }
     tree.scale_leaves(tree_eta(params));
-    tree
+    (tree, leaf_rows)
 }
 
 /// The stochastic-rounding seed of one quantized tree, drawn from the
@@ -1254,31 +1235,31 @@ pub(crate) fn validate_dataset(
                 HessboostError::invalid_param("labels", "expected length overflows usize")
             })?;
             if labels.len() != expected {
-                return Err(HessboostError::DimensionMismatch {
-                    what: "labels length (n_rows * training n_targets)",
+                return Err(HessboostError::dimension_mismatch(
+                    "labels length (n_rows * training n_targets)",
                     expected,
-                    got: labels.len(),
-                });
+                    labels.len(),
+                ));
             }
         }
     }
     if data.n_cols() != n_features {
-        return Err(HessboostError::DimensionMismatch {
-            what: "dataset feature count",
-            expected: n_features,
-            got: data.n_cols(),
-        });
+        return Err(HessboostError::dimension_mismatch(
+            "dataset feature count",
+            n_features,
+            data.n_cols(),
+        ));
     }
     if let Some(margin) = data.base_margin() {
         let expected = data.n_rows().checked_mul(n_out).ok_or_else(|| {
             HessboostError::invalid_param("base_margin", "expected length overflows usize")
         })?;
         if margin.len() != data.n_rows() && margin.len() != expected {
-            return Err(HessboostError::DimensionMismatch {
-                what: "base_margin length",
+            return Err(HessboostError::dimension_mismatch(
+                "base_margin length",
                 expected,
-                got: margin.len(),
-            });
+                margin.len(),
+            ));
         }
     }
     objective
@@ -1336,18 +1317,17 @@ fn check_prediction_width(
     Err(HessboostError::invalid_param("eval_metric", reason))
 }
 
-/// Build one tree's column sampler, seeded from `rng`: the `colsample_bytree`
-/// pool, then the `bylevel`/`bynode` draws, weighted by the training matrix's
-/// feature weights when it has them.
+/// Build one tree's column sampler over `dtrain`'s features, seeded from
+/// `rng`: the `colsample_bytree` pool, then the `bylevel`/`bynode` draws,
+/// weighted by the training matrix's feature weights when it has them.
 pub(super) fn make_column_sampler(
-    n_features: usize,
-    feature_weights: Option<&[f32]>,
+    dtrain: &DMatrix,
     params: &TrainingParams,
     rng: &mut StdRng,
 ) -> ColumnSampler {
     ColumnSampler::new(
-        n_features,
-        feature_weights,
+        dtrain.n_cols(),
+        dtrain.feature_weights(),
         params.colsample_bytree,
         params.colsample_bylevel,
         params.colsample_bynode,
@@ -1359,6 +1339,15 @@ pub(super) fn make_column_sampler(
 mod tests {
     use super::*;
     use crate::metric::{Metric, Rmse};
+    use crate::test_support::labeled_dense;
+
+    /// A deterministic uniform `[0, 1)` stream (a 64-bit LCG's top 31 bits).
+    fn lcg(mut s: u64) -> impl FnMut() -> f32 {
+        move || {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            ((s >> 33) as f32) / (1u32 << 31) as f32
+        }
+    }
 
     /// A learnable 1-D step function: y = 0 for x<0.5, y = 1 for x>=0.5.
     fn step_dataset(n: usize) -> DMatrix {
@@ -1369,10 +1358,7 @@ mod tests {
             x.push(xi);
             y.push(if xi >= 0.5 { 1.0 } else { 0.0 });
         }
-        DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        labeled_dense(&x, n, 1, &y)
     }
 
     #[test]
@@ -1408,24 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn regression_reduces_training_error() {
-        let d = step_dataset(100);
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 50).unwrap();
-        assert_eq!(model.num_trees(), 50);
-
-        let preds = model.predict(&d).unwrap();
-        let rmse = Rmse.eval(&preds, d.labels().unwrap(), None);
-        // The step is exactly representable; boosting should nearly fit it.
-        assert!(rmse < 0.05, "rmse too high: {rmse}");
-    }
-
-    #[test]
     fn binary_logistic_separates_classes() {
         let d = step_dataset(100);
         let params = TrainingParams::builder()
@@ -1458,9 +1426,9 @@ mod tests {
     }
 
     #[test]
-    fn hist_and_exact_reach_similar_accuracy() {
+    fn tree_methods_reach_similar_accuracy() {
         let d = step_dataset(120);
-        let mk = |method: crate::config::TreeMethod| {
+        let rmse = |method: TreeMethod| {
             let params = TrainingParams::builder()
                 .objective("reg:squarederror")
                 .tree_method(method)
@@ -1472,52 +1440,14 @@ mod tests {
             let preds = model.predict(&d).unwrap();
             Rmse.eval(&preds, d.labels().unwrap(), None)
         };
-        let rmse_hist = mk(crate::config::TreeMethod::Hist);
-        let rmse_exact = mk(crate::config::TreeMethod::Exact);
+        let rmse_hist = rmse(TreeMethod::Hist);
         assert!(rmse_hist < 0.05, "hist rmse {rmse_hist}");
-        assert!(rmse_exact < 0.05, "exact rmse {rmse_exact}");
-        // The two methods should land very close on this cleanly-binnable problem.
-        assert!((rmse_hist - rmse_exact).abs() < 0.02);
-    }
-
-    #[test]
-    fn approx_reduces_training_error() {
-        let d = step_dataset(120);
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .tree_method(crate::config::TreeMethod::Approx)
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        let model = train(&params, &d, 50).unwrap();
-        assert_eq!(model.num_trees(), 50);
-        let preds = model.predict(&d).unwrap();
-        let rmse = Rmse.eval(&preds, d.labels().unwrap(), None);
-        assert!(rmse < 0.05, "approx rmse too high: {rmse}");
-    }
-
-    #[test]
-    fn approx_and_hist_reach_similar_accuracy() {
-        let d = step_dataset(120);
-        let mk = |method: crate::config::TreeMethod| {
-            let params = TrainingParams::builder()
-                .objective("reg:squarederror")
-                .tree_method(method)
-                .max_depth(3)
-                .eta(0.3)
-                .build()
-                .unwrap();
-            let model = train(&params, &d, 60).unwrap();
-            let preds = model.predict(&d).unwrap();
-            Rmse.eval(&preds, d.labels().unwrap(), None)
-        };
-        let rmse_approx = mk(crate::config::TreeMethod::Approx);
-        let rmse_hist = mk(crate::config::TreeMethod::Hist);
-        assert!(rmse_approx < 0.05, "approx rmse {rmse_approx}");
-        assert!(rmse_hist < 0.05, "hist rmse {rmse_hist}");
-        // Both land close on this cleanly-binnable problem.
-        assert!((rmse_approx - rmse_hist).abs() < 0.02);
+        for method in [TreeMethod::Exact, TreeMethod::Approx] {
+            let other = rmse(method);
+            assert!(other < 0.05, "{method:?} rmse {other}");
+            // The methods land very close on this cleanly-binnable problem.
+            assert!((other - rmse_hist).abs() < 0.02, "{method:?} rmse {other}");
+        }
     }
 
     #[test]
@@ -1525,7 +1455,7 @@ mod tests {
         let d = step_dataset(120);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
-            .tree_method(crate::config::TreeMethod::Hist)
+            .tree_method(TreeMethod::Hist)
             .grow_policy(GrowPolicy::LossGuide)
             .max_leaves(16)
             .eta(0.3)
@@ -1541,12 +1471,15 @@ mod tests {
     fn exact_rejects_lossguide() {
         let d = step_dataset(20);
         let params = TrainingParams::builder()
-            .tree_method(crate::config::TreeMethod::Exact)
+            .tree_method(TreeMethod::Exact)
             .grow_policy(GrowPolicy::LossGuide)
             .max_leaves(8)
             .build()
             .unwrap();
-        assert!(train(&params, &d, 5).is_err());
+        assert!(matches!(
+            train(&params, &d, 5),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "grow_policy"
+        ));
     }
 
     #[test]
@@ -1566,10 +1499,7 @@ mod tests {
                 2.0
             });
         }
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
             .objective("multi:softprob")
             .num_class(3)
@@ -1603,24 +1533,11 @@ mod tests {
     #[test]
     fn poisson_trains_and_predicts_positive_rates() {
         let n = 200;
-        let mut x = Vec::new();
-        let mut y = Vec::new();
-        let mut s: u64 = 7;
-        let mut rng = || {
-            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            ((s >> 33) as f32) / (1u32 << 31) as f32
-        };
-        for _ in 0..n {
-            let xi = rng();
-            x.push(xi);
-            // rate increases with x; sample a rough count.
-            let rate = 1.0 + 5.0 * xi;
-            y.push(rate.round());
-        }
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let mut rng = lcg(7);
+        let x: Vec<f32> = (0..n).map(|_| rng()).collect();
+        // The rate increases with x; the label is a rough count.
+        let y: Vec<f32> = x.iter().map(|xi| (1.0 + 5.0 * xi).round()).collect();
+        let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
             .objective("count:poisson")
             .max_depth(3)
@@ -1632,18 +1549,14 @@ mod tests {
         assert!(preds.iter().all(|&p| p > 0.0), "rates must be positive");
         // Higher x should predict a higher rate: compare mean predicted rate for
         // low-x vs high-x rows (the feature is randomized, so bucket by value).
-        let (mut lo_sum, mut lo_n, mut hi_sum, mut hi_n) = (0.0f32, 0, 0.0f32, 0);
-        for i in 0..n {
-            if x[i] < 0.5 {
-                lo_sum += preds[i];
-                lo_n += 1;
-            } else {
-                hi_sum += preds[i];
-                hi_n += 1;
-            }
-        }
-        let lo_mean = lo_sum / lo_n as f32;
-        let hi_mean = hi_sum / hi_n as f32;
+        let mean = |high: bool| {
+            let bucket: Vec<f32> = (0..n)
+                .filter(|&i| (x[i] >= 0.5) == high)
+                .map(|i| preds[i])
+                .collect();
+            bucket.iter().sum::<f32>() / bucket.len() as f32
+        };
+        let (lo_mean, hi_mean) = (mean(false), mean(true));
         assert!(
             lo_mean < hi_mean,
             "rate should rise with x: {lo_mean} vs {hi_mean}"
@@ -1652,7 +1565,7 @@ mod tests {
 
     #[test]
     fn custom_objective_matches_builtin_squared_error() {
-        use crate::objective::{CustomObjective, GradPair};
+        use crate::objective::CustomObjective;
         let d = step_dataset(80);
 
         let builtin = {
@@ -1692,7 +1605,7 @@ mod tests {
 
     #[test]
     fn custom_multi_output_objective_trains_with_stride_and_round_trips() {
-        use crate::objective::{CustomObjective, GradPair};
+        use crate::objective::CustomObjective;
         let d = step_dataset(80);
         let n = d.n_rows();
         let rounds = 5usize;
@@ -1757,11 +1670,7 @@ mod tests {
         let mut x = Vec::with_capacity(n);
         let mut y = Vec::with_capacity(n);
         let sizes = vec![per; n_groups];
-        let mut s: u64 = 42;
-        let mut rng = || {
-            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            ((s >> 33) as f32) / (1u32 << 31) as f32
-        };
+        let mut rng = lcg(42);
         for _ in 0..n_groups {
             for d in 0..per {
                 let rel = d as f32; // relevance grade 0..per-1
@@ -1770,10 +1679,7 @@ mod tests {
                 y.push(rel);
             }
         }
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        let d = labeled_dense(&x, n, 1, &y)
             .with_group_sizes(&sizes)
             .unwrap();
 
@@ -1802,7 +1708,6 @@ mod tests {
 
     #[test]
     fn dart_trains_reduces_error_and_roundtrips() {
-        use crate::config::BoosterKind;
         let d = step_dataset(120);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
@@ -1820,20 +1725,12 @@ mod tests {
         let rmse = Rmse.eval(&preds, d.labels().unwrap(), None);
         assert!(rmse < 0.1, "dart rmse too high: {rmse}");
 
-        // Native serde round-trip preserves predictions (weights included).
-        let bytes = model.to_bytes().unwrap();
-        let restored = BoostedModel::from_bytes(&bytes).unwrap();
-        let after = restored.predict(&d).unwrap();
-        for (a, b) in preds.iter().zip(&after) {
-            assert!((a - b).abs() < 1e-6, "roundtrip mismatch {a} vs {b}");
-        }
-
-        // JSON round-trip too.
-        let json = model.to_json().unwrap();
-        let rj = BoostedModel::from_json(&json).unwrap();
-        let aj = rj.predict(&d).unwrap();
-        for (a, b) in preds.iter().zip(&aj) {
-            assert!((a - b).abs() < 1e-6);
+        // Native and JSON round-trips preserve predictions (weights included).
+        for restored in [
+            BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
+            BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        ] {
+            assert_eq!(restored.predict(&d).unwrap(), preds);
         }
     }
 
@@ -1878,11 +1775,7 @@ mod tests {
                 y.push(if (c as u32) % 2 == 1 { 1.0 } else { 0.0 });
             }
         }
-        let n = x.len();
-        let numeric = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let numeric = labeled_dense(&x, x.len(), 1, &y);
         let categorical = numeric
             .clone()
             .with_feature_types(&[FeatureType::Categorical])
@@ -1890,73 +1783,31 @@ mod tests {
 
         // Depth-1 stumps: the numeric model can only threshold, the categorical
         // model can partition the category set in a single node.
-        let mk = |d: &DMatrix| {
-            let p = TrainingParams::builder()
-                .objective("reg:squarederror")
-                .max_depth(1)
-                .eta(0.3)
-                .build()
-                .unwrap();
-            let m = train(&p, d, 40).unwrap();
-            Rmse.eval(&m.predict(d).unwrap(), d.labels().unwrap(), None)
-        };
-        let rmse_num = mk(&numeric);
-        let rmse_cat = mk(&categorical);
+        for method in [TreeMethod::Auto, TreeMethod::Exact] {
+            let mk = |d: &DMatrix| {
+                let p = TrainingParams::builder()
+                    .objective("reg:squarederror")
+                    .tree_method(method)
+                    .max_depth(1)
+                    .eta(0.3)
+                    .build()
+                    .unwrap();
+                let m = train(&p, d, 40).unwrap();
+                Rmse.eval(&m.predict(d).unwrap(), d.labels().unwrap(), None)
+            };
+            let rmse_num = mk(&numeric);
+            let rmse_cat = mk(&categorical);
 
-        // Categorical nearly fits the pattern; numeric is left far behind.
-        assert!(rmse_cat < 0.02, "categorical rmse too high: {rmse_cat}");
-        assert!(rmse_num > 0.05, "numeric unexpectedly fit it: {rmse_num}");
-        assert!(
-            rmse_cat < rmse_num,
-            "categorical ({rmse_cat}) should beat numeric ({rmse_num})"
-        );
-    }
-
-    #[test]
-    fn exact_categorical_beats_numeric_on_non_ordinal_pattern() {
-        use crate::data::FeatureType;
-        // Same non-ordinal pattern as the hist test, but forcing tree_method=exact.
-        let cats = [0.0f32, 1.0, 2.0, 3.0];
-        let mut x = Vec::new();
-        let mut y = Vec::new();
-        for _ in 0..40 {
-            for &c in &cats {
-                x.push(c);
-                y.push(if (c as u32) % 2 == 1 { 1.0 } else { 0.0 });
-            }
+            // Categorical nearly fits the pattern; numeric is left far behind.
+            assert!(
+                rmse_cat < 0.02,
+                "{method:?} categorical rmse too high: {rmse_cat}"
+            );
+            assert!(
+                rmse_num > 0.05,
+                "{method:?} numeric unexpectedly fit it: {rmse_num}"
+            );
         }
-        let n = x.len();
-        let numeric = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
-        let categorical = numeric
-            .clone()
-            .with_feature_types(&[FeatureType::Categorical])
-            .unwrap();
-
-        let mk = |d: &DMatrix| {
-            let p = TrainingParams::builder()
-                .objective("reg:squarederror")
-                .tree_method(crate::config::TreeMethod::Exact)
-                .max_depth(1)
-                .eta(0.3)
-                .build()
-                .unwrap();
-            let m = train(&p, d, 40).unwrap();
-            Rmse.eval(&m.predict(d).unwrap(), d.labels().unwrap(), None)
-        };
-        let rmse_num = mk(&numeric);
-        let rmse_cat = mk(&categorical);
-        assert!(
-            rmse_cat < 0.02,
-            "exact categorical rmse too high: {rmse_cat}"
-        );
-        assert!(rmse_num > 0.05, "numeric unexpectedly fit it: {rmse_num}");
-        assert!(
-            rmse_cat < rmse_num,
-            "exact categorical ({rmse_cat}) should beat numeric ({rmse_num})"
-        );
     }
 
     #[test]
@@ -1973,13 +1824,10 @@ mod tests {
             x.push(xi);
             y.push((xi - 0.5).abs());
         }
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
-            .tree_method(crate::config::TreeMethod::Exact)
+            .tree_method(TreeMethod::Exact)
             .max_depth(4)
             .eta(0.3)
             .monotone_constraints(vec![Monotone::Increasing])
@@ -1997,48 +1845,29 @@ mod tests {
         }
     }
 
+    /// Training starts from a per-instance base margin: with 0 rounds the
+    /// margin is exactly the base margin, and trees then fit the labels'
+    /// residuals from it (not from the intercept).
     #[test]
-    fn base_margin_is_the_initial_margin() {
-        // With 0 rounds and a per-instance base margin, the raw margin
-        // prediction must equal that base margin exactly.
-        let d = step_dataset(50);
-        let bm: Vec<f32> = (0..50).map(|i| i as f32 * 0.01 - 0.25).collect();
-        let d_bm = d.with_base_margin(&bm).unwrap();
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .build()
-            .unwrap();
-        let model = train(&params, &d_bm, 0).unwrap();
-        let margin = model.predict_margin(&d_bm).unwrap();
-        for (m, b) in margin.iter().zip(&bm) {
-            assert!((m - b).abs() < 1e-6, "{m} vs {b}");
-        }
-    }
-
-    #[test]
-    fn base_margin_affects_training() {
+    fn training_starts_from_the_base_margin() {
         let d = step_dataset(60);
+        let bm: Vec<f32> = (0..60).map(|i| i as f32 * 0.01 + 1.5).collect();
+        let d_bm = d.with_base_margin(&bm).unwrap();
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
             .max_depth(3)
             .eta(0.3)
             .build()
             .unwrap();
-        let plain = train(&params, &d, 10).unwrap().predict_margin(&d).unwrap();
+        let initial = train(&params, &d_bm, 0).unwrap();
+        assert_eq!(initial.predict_margin(&d_bm).unwrap(), bm);
 
-        let bm = vec![2.0f32; 60];
-        let d_bm = d.with_base_margin(&bm).unwrap();
-        let shifted = train(&params, &d_bm, 10)
-            .unwrap()
-            .predict_margin(&d_bm)
-            .unwrap();
-
-        // A nonzero starting margin changes the fitted margins.
+        let fitted = train(&params, &d_bm, 10).unwrap();
+        let margin = fitted.predict_margin(&d_bm).unwrap();
+        let rmse = Rmse.eval(&margin, d_bm.labels().unwrap(), None);
         assert!(
-            plain
-                .iter()
-                .zip(&shifted)
-                .any(|(a, b)| (a - b).abs() > 1e-4)
+            rmse < 0.2,
+            "the trees did not fit the base-margin residuals: {rmse}"
         );
     }
 
@@ -2048,11 +1877,7 @@ mod tests {
         let (n, f) = (400usize, 8usize);
         let mut x = vec![0f32; n * f];
         let mut y = vec![0f32; n];
-        let mut s: u64 = 3;
-        let mut rng = || {
-            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            ((s >> 33) as f32) / (1u32 << 31) as f32
-        };
+        let mut rng = lcg(3);
         for i in 0..n {
             let mut acc = 0.0;
             for j in 0..f {
@@ -2062,10 +1887,7 @@ mod tests {
             }
             y[i] = acc;
         }
-        let d = DMatrix::from_dense(&x, n, f)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, f, &y);
 
         let train_with = |bynode: f64| {
             let p = TrainingParams::builder()
@@ -2091,11 +1913,7 @@ mod tests {
         let f = 3usize;
         let mut x = vec![0f32; n * f];
         let mut y = vec![0f32; n];
-        let mut s: u64 = 11;
-        let mut rng = || {
-            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            ((s >> 33) as f32) / (1u32 << 31) as f32
-        };
+        let mut rng = lcg(11);
         for i in 0..n {
             let x0 = rng();
             let x1 = rng();
@@ -2106,15 +1924,11 @@ mod tests {
             let noise = (rng() - 0.5) * 0.02;
             y[i] = 2.0 * x0 - 3.0 * x1 + 0.5 * x2 + noise;
         }
-        DMatrix::from_dense(&x, n, f)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap()
+        labeled_dense(&x, n, f, &y)
     }
 
     #[test]
     fn gblinear_fits_linear_target() {
-        use crate::config::BoosterKind;
         let d = linear_dataset(400);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
@@ -2144,7 +1958,6 @@ mod tests {
 
     #[test]
     fn gblinear_roundtrips() {
-        use crate::config::BoosterKind;
         let d = linear_dataset(200);
         let params = TrainingParams::builder()
             .objective("reg:squarederror")
@@ -2155,20 +1968,11 @@ mod tests {
         let model = train(&params, &d, 100).unwrap();
         let before = model.predict(&d).unwrap();
 
-        // Binary serde round-trip.
-        let bytes = model.to_bytes().unwrap();
-        let restored = BoostedModel::from_bytes(&bytes).unwrap();
-        let after = restored.predict(&d).unwrap();
-        for (a, b) in before.iter().zip(&after) {
-            assert!((a - b).abs() < 1e-6, "binary roundtrip mismatch {a} vs {b}");
-        }
-
-        // JSON round-trip.
-        let json = model.to_json().unwrap();
-        let rj = BoostedModel::from_json(&json).unwrap();
-        let aj = rj.predict(&d).unwrap();
-        for (a, b) in before.iter().zip(&aj) {
-            assert!((a - b).abs() < 1e-6, "json roundtrip mismatch {a} vs {b}");
+        for restored in [
+            BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
+            BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        ] {
+            assert_eq!(restored.predict(&d).unwrap(), before);
         }
     }
 
@@ -2208,21 +2012,16 @@ mod tests {
         )
         .unwrap();
 
-        // Early stopping fired identically, so the two models match tree-for-tree.
+        // Early stopping fired `patience` rounds after the best iteration,
+        // identically for both metrics, so the models match tree for tree.
+        let best = builtin.model.best_iteration().expect("stops early");
+        assert_eq!(builtin.history.len(), best + 6);
+        assert_eq!(builtin.model.num_trees(), best + 6);
+        assert_eq!(custom.model.best_iteration(), Some(best));
         assert_eq!(
-            builtin.model.num_trees(),
-            custom.model.num_trees(),
-            "custom-metric early stopping diverged from builtin rmse"
+            custom.model.predict(&d).unwrap(),
+            builtin.model.predict(&d).unwrap()
         );
-        assert_eq!(
-            builtin.model.best_iteration(),
-            custom.model.best_iteration()
-        );
-        let pb = builtin.model.predict(&d).unwrap();
-        let pc = custom.model.predict(&d).unwrap();
-        for (a, b) in pb.iter().zip(&pc) {
-            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
-        }
 
         // The custom metric was actually recorded in the history.
         let names: Vec<&str> = custom.history[0]
@@ -2234,30 +2033,10 @@ mod tests {
     }
 
     #[test]
-    fn early_stopping_sets_best_iteration() {
-        let d = step_dataset(80);
-        let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .max_depth(3)
-            .eta(0.3)
-            .build()
-            .unwrap();
-        // Use the training set as its own eval just to exercise the mechanism.
-        let res = train_with_eval(&params, &d, 200, &[(&d, "train")], Some(5)).unwrap();
-        // Should stop well before 200 rounds once RMSE plateaus.
-        assert!(res.model.num_trees() < 200);
-        assert!(res.model.best_iteration().is_some());
-        assert!(!res.history.is_empty());
-    }
-
-    #[test]
     fn multiclass_softmax_returns_one_label_per_row() {
         let x = [0.0, 0.1, 0.5, 0.6, 0.9, 1.0];
         let y = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0];
-        let d = DMatrix::from_dense(&x, 6, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, 6, 1, &y);
         let params = TrainingParams::builder()
             .objective("multi:softmax")
             .num_class(3)
@@ -2293,10 +2072,7 @@ mod tests {
                 .max_depth(2)
                 .build()
                 .unwrap();
-            let d = DMatrix::from_dense(&x, 8, 1)
-                .unwrap()
-                .with_labels(&soft)
-                .unwrap();
+            let d = labeled_dense(&x, 8, 1, &soft);
             let model = train(&params, &d, 3).unwrap();
             assert_eq!(model.objective(), objective);
             assert!(
@@ -2309,10 +2085,7 @@ mod tests {
             for bad in [1.5f32, -0.1] {
                 let mut labels = soft;
                 labels[0] = bad;
-                let d = DMatrix::from_dense(&x, 8, 1)
-                    .unwrap()
-                    .with_labels(&labels)
-                    .unwrap();
+                let d = labeled_dense(&x, 8, 1, &labels);
                 assert!(
                     matches!(
                         train(&params, &d, 3),
@@ -2326,10 +2099,7 @@ mod tests {
 
     #[test]
     fn count_base_score_is_in_reported_space() {
-        let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
-            .unwrap()
-            .with_labels(&[1.0, 2.0])
-            .unwrap();
+        let d = labeled_dense(&[0.0, 1.0], 2, 1, &[1.0, 2.0]);
         let params = TrainingParams::builder()
             .objective("count:poisson")
             .base_score(0.5)
@@ -2357,10 +2127,7 @@ mod tests {
 
         let unlabeled = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
         assert!(train_with_eval(&params, &d, 2, &[(&unlabeled, "eval")], None).is_err());
-        let wrong_features = DMatrix::from_dense(&[0.0, 0.0], 1, 2)
-            .unwrap()
-            .with_labels(&[0.0])
-            .unwrap();
+        let wrong_features = labeled_dense(&[0.0, 0.0], 1, 2, &[0.0]);
         assert!(train_with_eval(&params, &d, 2, &[(&wrong_features, "eval")], None).is_err());
         let model = train(&params, &d, 2).unwrap();
         assert!(model.predict(&wrong_features).is_err());
@@ -2377,10 +2144,7 @@ mod tests {
             .objective("binary:logistic")
             .build()
             .unwrap();
-        let holdout = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
-            .unwrap()
-            .with_labels(&[0.0, 2.0])
-            .unwrap();
+        let holdout = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 2.0]);
         match train_with_eval(&params, &d, 2, &[(&holdout, "holdout")], None) {
             Err(HessboostError::InvalidParameter { name, reason }) => {
                 assert_eq!(name, "labels");
@@ -2425,10 +2189,7 @@ mod tests {
             .eval_metric("ndcg")
             .build()
             .unwrap();
-        assert!(matches!(
-            train(&ndcg, &two_targets, 1),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "eval_metric"
-        ));
+        eval_metric_rejection(train(&ndcg, &two_targets, 1), "ndcg");
         // Three margins per row fit neither one per row nor one per target.
         let bad_margin = two_targets.clone().with_base_margin(&[0.0; 12]).unwrap();
         assert!(matches!(
@@ -2634,19 +2395,28 @@ mod tests {
         }
 
         let unbounded = DMatrix::from_dense(&x, 32, 1).unwrap();
-        match train_with_objective(&params, &unbounded, 1, &BoundsMidpoint) {
-            Err(HessboostError::InvalidParameter { name, reason }) => {
-                assert_eq!(name, "label_lower_bound");
-                assert_eq!(reason, "dataset `dtrain` has no label bounds");
-            }
-            other => panic!("expected validate_info to reject, got {other:?}"),
+        assert!(matches!(
+            train_with_objective(&params, &unbounded, 1, &BoundsMidpoint),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "label_lower_bound"
+        ));
+    }
+
+    /// The reason of an `eval_metric` rejection of the `context` run,
+    /// panicking on any other outcome.
+    fn eval_metric_rejection<T: std::fmt::Debug>(result: Result<T>, context: &str) -> String {
+        match result {
+            Err(HessboostError::InvalidParameter {
+                name: "eval_metric",
+                reason,
+            }) => reason,
+            other => panic!("{context}: expected an `eval_metric` rejection, got {other:?}"),
         }
     }
 
     #[test]
     fn label_metrics_are_refused_on_bound_only_eval_sets() {
-        // `survival:aft` trains on label bounds alone; a metric reading
-        // ordinary labels used to index the empty label slice and panic.
+        // `survival:aft` trains on label bounds alone, so the label slice is
+        // empty: metrics reading ordinary labels must be refused, not index it.
         let x: Vec<f32> = (0..32).map(|i| i as f32).collect();
         let lower: Vec<f32> = (0..32).map(|i| 1.0 + (i % 4) as f32).collect();
         let upper: Vec<f32> = lower.iter().map(|lo| lo + 1.0).collect();
@@ -2666,13 +2436,9 @@ mod tests {
             assert!(run.history[1].scores[0].2.is_finite(), "{metric}");
         }
         for metric in ["rmse", "mae", "cox-nloglik"] {
-            match train_with_eval(&params(metric), &d, 2, &[(&d, "eval")], None) {
-                Err(HessboostError::InvalidParameter { name, reason }) => {
-                    assert_eq!(name, "eval_metric");
-                    assert!(reason.contains("`eval`"), "{reason}");
-                }
-                other => panic!("{metric}: expected a rejection, got {other:?}"),
-            }
+            let run = train_with_eval(&params(metric), &d, 2, &[(&d, "eval")], None);
+            let reason = eval_metric_rejection(run, metric);
+            assert!(reason.contains("`eval`"), "{reason}");
         }
     }
 
@@ -2680,8 +2446,8 @@ mod tests {
     fn per_row_metrics_refuse_label_matrices() {
         // The survival metrics read one interval and weight per row, and
         // `pre@k` ranks one label per row within query groups; on a label
-        // matrix they used to index the row weights per cell (panicking) or
-        // rank every target's cells together.
+        // matrix they must be refused rather than index the row weights per
+        // cell or rank every target's cells together.
         let n = 24;
         let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let y: Vec<f32> = (0..2 * n).map(|i| (i % 5) as f32).collect();
@@ -2698,27 +2464,22 @@ mod tests {
                 .eval_metric(metric)
                 .build()
                 .unwrap();
-            match train_with_eval(&params, &d, 1, &[(&d, "eval")], None) {
-                Err(HessboostError::InvalidParameter { name, .. }) => {
-                    assert_eq!(name, "eval_metric");
-                }
-                other => panic!("{metric}: expected a rejection, got {other:?}"),
-            }
+            eval_metric_rejection(
+                train_with_eval(&params, &d, 1, &[(&d, "eval")], None),
+                metric,
+            );
         }
     }
 
     #[test]
     fn metrics_must_match_the_prediction_width() {
-        // Elementwise metrics read one prediction per label; on a model with
-        // more outputs than label columns they used to index past the
-        // labels and panic on the first evaluation.
+        // Elementwise metrics read one prediction per label; a model with
+        // more outputs than label columns must be refused before the first
+        // evaluation instead of indexing past the labels.
         let n = 30;
         let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let y: Vec<f32> = (0..n).map(|i| 1.0 + (i % 3) as f32).collect();
-        let d = DMatrix::from_dense(&x, n, 1)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, n, 1, &y);
         let quantile = || {
             TrainingParams::builder()
                 .objective("reg:quantileerror")
@@ -2750,16 +2511,11 @@ mod tests {
                 "mlogloss",
             ),
         ] {
-            match run(params.build().unwrap()) {
-                Err(HessboostError::InvalidParameter { name, reason }) => {
-                    assert_eq!(name, "eval_metric");
-                    assert!(
-                        reason.contains(metric) && reason.contains("`eval`"),
-                        "{reason}"
-                    );
-                }
-                other => panic!("{metric}: expected a rejection, got {other:?}"),
-            }
+            let reason = eval_metric_rejection(run(params.build().unwrap()), metric);
+            assert!(
+                reason.contains(metric) && reason.contains("`eval`"),
+                "{reason}"
+            );
         }
         // The defaults and matching metrics still evaluate.
         for params in [
@@ -2782,8 +2538,8 @@ mod tests {
     #[test]
     fn custom_objective_outputs_must_match_the_label_layout() {
         // A custom objective reads one label per row or one per output; a
-        // label matrix of another width used to reach its gradient closure
-        // (a debug assertion, silent misreads in release).
+        // label matrix of another width must be refused before it reaches the
+        // gradient closure.
         let n = 20;
         let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let y: Vec<f32> = (0..2 * n).map(|i| (i % 4) as f32).collect();
@@ -2849,10 +2605,7 @@ mod tests {
             x.extend_from_slice(&[a, b]);
             y.push(f32::from(a != b));
         }
-        let d = DMatrix::from_dense(&x, 128, 2)
-            .unwrap()
-            .with_labels(&y)
-            .unwrap();
+        let d = labeled_dense(&x, 128, 2, &y);
         let params = TrainingParams::builder()
             .tree_method(TreeMethod::Exact)
             .max_depth(3)

@@ -21,14 +21,6 @@ boosting, compact models, and more) never change default training.
 Objective, metric, and parameter names mirror XGBoost, so configurations
 transfer directly.
 
-> **Built with AI.** The implementation was generated with **Claude** (Anthropic's
-> AI coding assistant) under human direction and review. It is **AI-generated
-> code**: it is covered by unit, property, and doc tests plus CI-checked
-> XGBoost 3.4.2 parity, but it may still contain bugs, subtle numerical errors, or
-> wrong edge-case behavior. **Review and validate it for your own use case. It is
-> provided as-is, without warranty** (see [LICENSE](LICENSE)). Issue reports and
-> fixes are welcome.
-
 > Using AI coding agents? See [`AGENTS.md`](AGENTS.md) for a task-oriented guide.
 
 ## Quick start
@@ -105,24 +97,24 @@ Python (`cargo run --release --example pfn_boost -- <dir>`; see its docs).
 `train_with_budget(&params, &dtrain, &BudgetConfig::new(1.0))` implements
 [PerpetualBooster](https://github.com/perpetual-ml/perpetual)'s algorithm: one
 `budget` number replaces the learning rate, tree-size limits, and round
-count. The budget sets the learning rate (`eta = 10^-budget` up to 1) and a
-per-tree target loss reduction; each split must pass a five-fold
-generalization check (its in-fold improvement has to hold up out of fold),
-and boosting stops by itself once trees stop generalizing, with a hard cap of
-1000 rounds for budgets up to 1 (at most 4000). Larger budgets train more
-trees and fit held-out data more closely at a higher cost; 0.5 (Perpetual's
-default) to 1.5 is the useful range. The result is an ordinary gbtree model
-(every prediction, SHAP, and model-I/O path applies, XGBoost export
-included). Settings budget mode derives itself (`eta`, `max_depth`,
-`lambda`, subsampling, ...) are refused rather than ignored; supported
-objectives are the single-output ones with a pointwise loss (squared error,
-pseudo-Huber, logistic, Poisson, Gamma, Tweedie). On synthetic Friedman #1
-data (`budget` example), budget 1.0 is within 1% of, and budget 1.5 better
-than, a round count tuned by early stopping on a validation set for
-regression, and within 4-10% for binary classification. Perpetual's
-dataset-regime heuristics (automatic subsampling, class reweighting,
-leaf refinement, and objective/shape-specific schedule adjustments) are not
-reproduced; see `hessboost::learner::budget` for the exact rules.
+count. The budget sets the learning rate (smaller for larger budgets), a
+per-tree target loss reduction, and the iteration cap; each split must pass a
+five-fold generalization check (its in-fold improvement has to hold up out
+of fold), and boosting stops by itself once trees stop generalizing. Larger
+budgets train more trees and fit held-out data more closely at a higher
+cost; 0.5 (Perpetual's default) to 1.5 is the useful range. The result is an
+ordinary gbtree model (every prediction, SHAP, and model-I/O path applies,
+XGBoost export included). Settings budget mode derives itself (`eta`,
+`max_depth`, `lambda`, subsampling, ...) are refused rather than ignored;
+supported objectives are the single-output ones with a pointwise loss
+(squared error, pseudo-Huber, logistic, Poisson, Gamma, Tweedie). On
+synthetic Friedman #1 data (`budget` example), budget 1.0 is within 1% of,
+and budget 1.5 better than, a round count tuned by early stopping on a
+validation set for regression, and within 4-10% for binary classification.
+Perpetual's dataset-regime heuristics (automatic subsampling, class
+reweighting, leaf refinement, and objective/shape-specific schedule
+adjustments) are not reproduced; the `hessboost::learner::budget` rustdoc
+gives the exact learning-rate, loss-target, split, and stopping rules.
 
 ## Feature status
 
@@ -228,8 +220,7 @@ reproduced; see `hessboost::learner::budget` for the exact rules.
   XGBoost's values), early stopping, feature importance (weight / gain /
   cover / totals), leaf-index and margin prediction, and k-fold
   cross-validation (`cv`).
-- **Model I/O:** libsvm & CSV loaders; native binary + JSON model I/O (files
-  from earlier releases keep loading with identical predictions); and
+- **Model I/O:** libsvm & CSV loaders; native binary + JSON model I/O; and
   **XGBoost-format import/export** of `gbtree`/DART models (numeric and
   categorical splits, forests, multi-output and vector-leaf trees) in both
   XGBoost encodings: JSON (`save_xgboost_json` / `load_xgboost_json`,
@@ -370,46 +361,19 @@ splits have no `max_cat_to_onehot`/`max_cat_threshold`. The metrics
 ## Performance
 
 AArch64 builds use runtime-detected NEON kernels for objective gradients,
-probability transforms, and metric reductions. x86-64 builds use AVX2+FMA for
-exponential/sigmoid transforms, logistic and short-softmax gradients, and SSE2
-for quantile bin search. Scalar fallbacks cover other CPUs, short inputs, and
-values outside the approximation ranges. Split search is scalar and follows
-XGBoost's `f32` gain arithmetic exactly. Histogram training parallelizes data
-preparation and independent nodes, scales histogram tasks to node size, and
-reuses training-row partitions when that reduces prediction work. Leaves at
-`max_depth` skip histograms and split searches.
+probability transforms, metric reductions, and quantile bin search. x86-64
+builds use AVX2+FMA for exponential/sigmoid transforms and logistic and
+short-softmax gradients, and SSE2 for quantile bin search. Scalar fallbacks
+cover other CPUs, short inputs, and values outside the approximation ranges.
+Split search is scalar and follows XGBoost's `f32` gain arithmetic exactly.
 
-### Compared with XGBoost
-
-Measured on **Apple M3 Max** against [XGBoost 3.4.1](https://pypi.org/project/xgboost/3.4.1/),
-the latest stable PyPI release checked on **2026-09-14 UTC**. Both engines use the
-same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
-256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
-preparation and training, and report the median of six fits after warmup.
-
-| Workload | Threads | hessboost | XGBoost 3.4.1 |
-|---|---:|---:|---:|
-| Regression, 100k × 30 | 1 | 0.458 s | 1.054 s |
-| Regression, 100k × 30 | 4 | 0.201 s | 0.366 s |
-| Regression, 100k × 30 | 16 | 0.264 s | 0.362 s |
-| Regression, 50k × 128 | 1 | 1.153 s | 3.200 s |
-| Regression, 50k × 128 | 4 | 0.452 s | 0.994 s |
-| Regression, 50k × 128 | 16 | 0.428 s | 0.669 s |
-| Binary, 100k × 30 | 1 | 0.459 s | 1.044 s |
-| Binary, 100k × 30 | 4 | 0.197 s | 0.366 s |
-| Binary, 100k × 30 | 16 | 0.256 s | 0.361 s |
-| 4-class, 50k × 30 | 1 | 1.094 s | 2.506 s |
-| 4-class, 50k × 30 | 4 | 0.523 s | 0.981 s |
-| 4-class, 50k × 30 | 16 | 0.746 s | 1.219 s |
-
-hessboost has lower median fit time in all 12 configurations in this run.
-Single-thread speedups are 2.28× to 2.77×, four-thread speedups are 1.82× to
-2.20×, and sixteen-thread speedups are 1.37× to 1.63×.
-
-Held-out quality matches: re-run on aarch64 Linux against XGBoost 3.4.2,
-hessboost's single-thread held-out scores on these workloads equal XGBoost's
-to within 1e-9. See [Performance](docs/performance.md) for held-out quality,
-workload definitions, kernel benchmarks, and reproduction commands.
+In the CPU `hist` timing harness (`scripts/bench_xgb.py` with
+`bench_compare`: regression, binary, and 4-class workloads at 1, 4, and 16
+threads), hessboost's median fit time is lower than XGBoost's in every
+configuration, with matching held-out scores. See
+[Performance](docs/performance.md) for the measurements and their
+provenance, workload definitions, kernel and tree-building benchmarks, and
+reproduction commands.
 
 ## Testing & parity
 

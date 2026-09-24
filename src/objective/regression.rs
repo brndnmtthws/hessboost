@@ -24,21 +24,9 @@ impl Objective for SquaredErrorObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        super::rowwise_gradient(
-            labels.len(),
-            1,
-            preds,
-            labels,
-            weights,
-            out,
-            |preds, labels, weights, out| {
-                for i in 0..preds.len() {
-                    let w = weights.map_or(1.0, |ws| ws[i]);
-                    out[i] = GradPair::new((preds[i] - labels[i]) * w, w);
-                }
-            },
-        );
+        super::elementwise_gradient(preds, labels, weights, out, |p, y, w| {
+            GradPair::new((p - y) * w, w)
+        });
     }
 
     fn const_hess(&self) -> bool {
@@ -103,26 +91,13 @@ impl Objective for PseudoHuberObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         let slope_sq = self.slope * self.slope;
-        super::rowwise_gradient(
-            labels.len(),
-            1,
-            preds,
-            labels,
-            weights,
-            out,
-            |preds, labels, weights, out| {
-                for i in 0..preds.len() {
-                    let w = weights.map_or(1.0, |ws| ws[i]);
-                    let z = preds[i] - labels[i];
-                    let scale_sqrt = (1.0 + z * z / slope_sq).sqrt();
-                    let scale = slope_sq + z * z;
-                    out[i] =
-                        GradPair::new((z / scale_sqrt) * w, (slope_sq / (scale * scale_sqrt)) * w);
-                }
-            },
-        );
+        super::elementwise_gradient(preds, labels, weights, out, |p, y, w| {
+            let z = p - y;
+            let scale_sqrt = (1.0 + z * z / slope_sq).sqrt();
+            let scale = slope_sq + z * z;
+            GradPair::new((z / scale_sqrt) * w, (slope_sq / (scale * scale_sqrt)) * w)
+        });
     }
 
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
@@ -170,27 +145,14 @@ impl Objective for SquaredLogErrorObjective {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        super::rowwise_gradient(
-            labels.len(),
-            1,
-            preds,
-            labels,
-            weights,
-            out,
-            |preds, labels, weights, out| {
-                for i in 0..preds.len() {
-                    let w = weights.map_or(1.0, |ws| ws[i]);
-                    let p = preds[i].max(SQUARED_LOG_MIN_PRED);
-                    let (log_p, log_y) = (p.ln_1p(), labels[i].ln_1p());
-                    let grad = (log_p - log_y) / (p + 1.0);
-                    let shifted = f64::from(p + 1.0);
-                    let hess =
-                        ((f64::from(-log_p + log_y + 1.0) / (shifted * shifted)) as f32).max(1e-6);
-                    out[i] = GradPair::new(grad * w, hess * w);
-                }
-            },
-        );
+        super::elementwise_gradient(preds, labels, weights, out, |p, y, w| {
+            let p = p.max(SQUARED_LOG_MIN_PRED);
+            let (log_p, log_y) = (p.ln_1p(), y.ln_1p());
+            let grad = (log_p - log_y) / (p + 1.0);
+            let shifted = f64::from(p + 1.0);
+            let hess = ((f64::from(-log_p + log_y + 1.0) / (shifted * shifted)) as f32).max(1e-6);
+            GradPair::new(grad * w, hess * w)
+        });
     }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
@@ -206,14 +168,14 @@ impl Objective for SquaredLogErrorObjective {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::gradient_pairs;
 
     #[test]
     fn gradient_matches_closed_form() {
         let obj = SquaredErrorObjective;
         let preds = [2.0f32, 0.0, -1.0];
         let labels = [1.0f32, 0.5, -3.0];
-        let mut out = vec![GradPair::default(); 3];
-        obj.gradient(&preds, &labels, None, &mut out);
+        let out = gradient_pairs(&obj, &preds, &labels, None);
         assert_eq!(out[0], GradPair::new(1.0, 1.0)); // 2 - 1
         assert_eq!(out[1], GradPair::new(-0.5, 1.0)); // 0 - 0.5
         assert_eq!(out[2], GradPair::new(2.0, 1.0)); // -1 - (-3)
@@ -225,8 +187,7 @@ mod tests {
         let preds = [2.0f32];
         let labels = [1.0f32];
         let w = [4.0f32];
-        let mut out = vec![GradPair::default(); 1];
-        obj.gradient(&preds, &labels, Some(&w), &mut out);
+        let out = gradient_pairs(&obj, &preds, &labels, Some(&w));
         assert_eq!(out[0], GradPair::new(4.0, 4.0));
     }
 
@@ -241,8 +202,7 @@ mod tests {
     #[test]
     fn pseudo_huber_slope_scales_gradient() {
         let obj = PseudoHuberObjective::new(2.0);
-        let mut out = vec![GradPair::default(); 1];
-        obj.gradient(&[2.0], &[0.0], None, &mut out);
+        let out = gradient_pairs(&obj, &[2.0], &[0.0], None);
         let root2 = 2f32.sqrt();
         assert!(
             (out[0].grad - 2.0 / root2).abs() < 1e-6,
@@ -255,7 +215,7 @@ mod tests {
             out[0].hess
         );
         // Unit slope reproduces the classic form d/√(1+d²), 1/(1+d²)^{3/2}.
-        PseudoHuberObjective::default().gradient(&[2.0], &[0.0], None, &mut out);
+        let out = gradient_pairs(&PseudoHuberObjective::default(), &[2.0], &[0.0], None);
         let s = 5f32;
         assert_eq!(out[0], GradPair::new(2.0 / s.sqrt(), 1.0 / (s * s.sqrt())));
     }
@@ -302,8 +262,7 @@ mod tests {
     #[test]
     fn squared_log_gradient_zero_at_label_and_finite_below_minus_one() {
         let obj = SquaredLogErrorObjective;
-        let mut out = vec![GradPair::default(); 3];
-        obj.gradient(&[3.0, -1.0, -7.0], &[3.0, 0.5, 0.5], None, &mut out);
+        let out = gradient_pairs(&obj, &[3.0, -1.0, -7.0], &[3.0, 0.5, 0.5], None);
         assert_eq!(out[0].grad, 0.0);
         // Hessian at the optimum is 1 / (p + 1)².
         assert_eq!(out[0].hess, 1.0 / 16.0);
@@ -316,8 +275,7 @@ mod tests {
     #[test]
     fn squared_log_hessian_floor_is_weighted() {
         let obj = SquaredLogErrorObjective;
-        let mut out = vec![GradPair::default(); 1];
-        obj.gradient(&[1e4], &[0.0], Some(&[2.0]), &mut out);
+        let out = gradient_pairs(&obj, &[1e4], &[0.0], Some(&[2.0]));
         assert_eq!(out[0].hess, 2e-6);
         assert!(out[0].grad > 0.0);
     }

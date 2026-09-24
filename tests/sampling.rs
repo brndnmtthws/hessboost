@@ -6,16 +6,13 @@ use hessboost::config::TrainingParamsBuilder;
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
+mod common;
+use common::{invalid_param, labeled_dense, lcg};
+
 /// Deterministic `n × f` regression data whose label depends on every
 /// feature, with a few large-residual rows so gradient magnitudes vary.
 fn dataset(n: usize, f: usize) -> DMatrix {
-    let mut state = 0x1234_5678_u64;
-    let mut next = || {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (state >> 40) as f32 / (1u64 << 24) as f32
-    };
+    let mut next = lcg(0x1234_5678);
     let mut x = Vec::with_capacity(n * f);
     let mut y = Vec::with_capacity(n);
     for row in 0..n {
@@ -30,10 +27,7 @@ fn dataset(n: usize, f: usize) -> DMatrix {
         }
         y.push(target);
     }
-    DMatrix::from_dense(&x, n, f)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    labeled_dense(&x, f, &y)
 }
 
 fn mvs_params(seed: u64) -> TrainingParams {
@@ -133,13 +127,10 @@ fn gradient_based_sampling_tree_method_support() {
             .build()
             .unwrap()
     };
-    match train(&with(TreeMethod::Exact, 0.5), &data, 2) {
-        Err(HessboostError::InvalidParameter { name, reason }) => {
-            assert_eq!(name, "sampling_method");
-            assert!(reason.contains("hist"), "{reason}");
-        }
-        other => panic!("expected a sampling_method error, got {other:?}"),
-    }
+    assert_eq!(
+        invalid_param(train(&with(TreeMethod::Exact, 0.5), &data, 2)),
+        "sampling_method"
+    );
     assert!(train(&with(TreeMethod::Exact, 1.0), &data, 2).is_ok());
     for method in [TreeMethod::Hist, TreeMethod::Approx, TreeMethod::Auto] {
         let model = train(&with(method, 0.4), &data, 3).unwrap();
@@ -292,10 +283,7 @@ fn weighted_column_sampling_is_seeded() {
 fn step_rows(feature: impl Fn(usize) -> f32) -> DMatrix {
     let x: Vec<f32> = (0..8).map(feature).collect();
     let y: Vec<f32> = (0..8).map(|i| if i < 4 { 0.0 } else { 1.0 }).collect();
-    DMatrix::from_dense(&x, 8, 1)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    labeled_dense(&x, 1, &y)
 }
 
 /// Unregularized unit-rate squared-error parameters from a zero margin.

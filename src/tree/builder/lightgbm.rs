@@ -32,12 +32,14 @@
 //! Hessians); leaves keep the outputs their split recorded.
 
 use super::{
-    BestSplit, K_RT_EPS, SplitPos, candidate_gain, xgb_loss_chg, xgb_node_gain, xgb_update,
+    BestSplit, SplitPos, candidate_gain, children_valid, for_each_numeric_split, sweep_prefixes,
+    xgb_calc_weight, xgb_loss_chg, xgb_node_gain, xgb_update,
 };
 use crate::config::TrainingParams;
 use crate::data::quantile::HistCuts;
+use crate::rng::splitmix64;
 use crate::tree::constraints::{Bounds, MonotoneConstraints, gain_at_weight, satisfies};
-use crate::tree::gain::{GradStats, RegParams, threshold_l1};
+use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -131,7 +133,16 @@ impl SplitOptions {
             } else if let Some(rng) = rng.as_mut() {
                 ctx.random_numeric(&mut best, &hist[fs..fe], fs, dense, rng);
             } else {
-                ctx.all_numeric(&mut best, &hist[fs..fe], fs, dense);
+                // Every boundary, exactly as the builder's XGBoost search.
+                for_each_numeric_split(
+                    &hist[fs..fe],
+                    fs,
+                    total,
+                    dense,
+                    |pos, missing_left, l, r| {
+                        ctx.offer_numeric(&mut best, pos, missing_left, l, r);
+                    },
+                );
             }
         }
         best
@@ -143,26 +154,7 @@ impl SplitOptions {
 /// (unsmoothed) output.
 pub(super) fn finalize_smoothed_leaves(tree: &mut RegTree, root: GradStats, reg: &RegParams) {
     if tree.node(0).is_leaf() {
-        tree.set_leaf_value(0, raw_output(root, reg) as f32);
-    }
-}
-
-/// The unsmoothed output of the root, which path smoothing pulls the root's
-/// children toward (LightGBM does not smooth the root).
-pub(super) fn root_output(root: GradStats, reg: &RegParams) -> f64 {
-    raw_output(root, reg)
-}
-
-/// Regularized optimum `−Tα(G)/(H+λ)`, clipped to `max_delta_step`, in `f64`.
-fn raw_output(stats: GradStats, reg: &RegParams) -> f64 {
-    if stats.hess <= 0.0 {
-        return 0.0;
-    }
-    let w = -threshold_l1(stats.grad, reg.alpha) / (stats.hess + reg.lambda);
-    if reg.max_delta_step > 0.0 && w.abs() > reg.max_delta_step {
-        reg.max_delta_step.copysign(w)
-    } else {
-        w
+        tree.set_leaf_value(0, xgb_calc_weight(root, reg) as f32);
     }
 }
 
@@ -175,15 +167,9 @@ fn smooth(w: f64, n: f64, s: f64, parent: f64) -> f64 {
     w * (n / total) + parent * (s / total)
 }
 
-/// Seed of one node's `extra_trees` draws (`SplitMix64` finalizer chain).
+/// Seed of one node's `extra_trees` draws (chained SplitMix64 steps).
 fn node_seed(extra_seed: u64, tree_seed: u64, node: usize) -> u64 {
-    fn mix(mut z: u64) -> u64 {
-        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    mix(mix(mix(extra_seed) ^ tree_seed) ^ node as u64)
+    splitmix64(splitmix64(splitmix64(extra_seed) ^ tree_seed) ^ node as u64)
 }
 
 /// Path-smoothing state of one node's split search.
@@ -200,7 +186,7 @@ struct Smoothed {
 impl Smoothed {
     fn new(strength: f64, total: GradStats, node: NodeCtx, reg: &RegParams) -> Self {
         let rows = node.rows as f64;
-        let own = smooth(raw_output(total, reg), rows, strength, node.output);
+        let own = smooth(xgb_calc_weight(total, reg), rows, strength, node.output);
         Smoothed {
             strength,
             rows,
@@ -220,8 +206,7 @@ impl Smoothed {
         bounds: Bounds,
         dir: i8,
     ) -> Option<(f64, f64, f64)> {
-        let mcw = reg.min_child_weight;
-        if !(left.hess > 0.0 && right.hess > 0.0 && left.hess >= mcw && right.hess >= mcw) {
+        if !children_valid(left, right, reg.min_child_weight) {
             return None;
         }
         let left_rows = (left.hess * self.rows_per_hess)
@@ -229,7 +214,7 @@ impl Smoothed {
             .clamp(0.0, self.rows);
         let output = |stats: GradStats, rows: f64| {
             bounds.clamp(smooth(
-                raw_output(stats, reg),
+                xgb_calc_weight(stats, reg),
                 rows,
                 self.strength,
                 self.parent,
@@ -295,32 +280,6 @@ impl Candidate<'_> {
         }
     }
 
-    /// Every boundary of the feature: the forward pass (missing right) and,
-    /// when the node has missing values for it, the backward pass (missing
-    /// left), exactly as the builder's XGBoost search enumerates them.
-    fn all_numeric(&self, best: &mut BestSplit, bins: &[GradStats], first: usize, dense: bool) {
-        let mut acc = GradStats::default();
-        for (offset, &bin) in bins.iter().enumerate() {
-            acc.add(bin);
-            let right = self.total.sub(acc);
-            self.offer_numeric(best, SplitPos::Bin(first + offset), false, acc, right);
-        }
-        if dense || acc == self.total {
-            return;
-        }
-        let mut suffix = GradStats::default();
-        for offset in (0..bins.len()).rev() {
-            suffix.add(bins[offset]);
-            let left = self.total.sub(suffix);
-            let pos = if offset == 0 {
-                SplitPos::BelowBins
-            } else {
-                SplitPos::Bin(first + offset - 1)
-            };
-            self.offer_numeric(best, pos, true, left, suffix);
-        }
-    }
-
     /// One random boundary between the node's lowest and highest occupied
     /// bin, scored with missing values right and (when present) left.
     fn random_numeric(
@@ -376,68 +335,42 @@ impl Candidate<'_> {
         let ratio = |s: GradStats| s.grad / (s.hess + reg.lambda);
         cats.sort_by(|a, b| ratio(a.1).total_cmp(&ratio(b.1)));
         let chosen = rng.map(|rng| rng.random_range(1..cats.len()));
-        let parent_gain = match self.scorer {
-            Scorer::Xgb { root_gain } => f64::from(*root_gain),
-            Scorer::Smooth(_) => 0.0,
-        };
-        let mut left = GradStats::default();
-        let mut cats_left: Vec<u32> = Vec::new();
-        for (i, &(cat, stats)) in cats[..cats.len() - 1].iter().enumerate() {
-            left.add(stats);
-            cats_left.push(cat);
-            if chosen.is_some_and(|len| len != i + 1) {
-                continue;
-            }
-            // `total` includes any missing mass, which stays on the right.
-            let right = self.total.sub(left);
-            let scored = match self.scorer {
-                Scorer::Xgb { .. } => {
-                    if left.hess < reg.min_child_weight || right.hess < reg.min_child_weight {
-                        continue;
-                    }
-                    candidate_gain(
+        sweep_prefixes(
+            best,
+            cats,
+            self.total,
+            self.feature,
+            |left, right, cats_left| {
+                if chosen.is_some_and(|len| len != cats_left.len()) {
+                    return None;
+                }
+                match self.scorer {
+                    Scorer::Xgb { root_gain } => candidate_gain(
                         left,
                         right,
-                        parent_gain,
+                        f64::from(*root_gain),
                         self.bounds,
                         self.dir,
                         constrained,
                         reg,
-                    )
+                    ),
+                    Scorer::Smooth(smoothed) => {
+                        smoothed.score(left, right, reg, self.bounds, self.dir)
+                    }
                 }
-                Scorer::Smooth(smoothed) => smoothed.score(left, right, reg, self.bounds, self.dir),
-            };
-            let Some((gain, wl, wr)) = scored else {
-                continue;
-            };
-            if gain > best.loss_chg + K_RT_EPS {
-                *best = BestSplit::categorical(
-                    gain,
-                    self.feature,
-                    left,
-                    right,
-                    wl,
-                    wr,
-                    cats_left.clone(),
-                );
-            }
-        }
+            },
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::gp;
+    use super::super::test_support::{binned, gp};
     use super::*;
     use crate::data::DMatrix;
-    use crate::data::ghist::GHistIndex;
     use crate::objective::GradPair;
     use crate::tree::builder::{HistTreeBuilder, all_rows};
     use crate::tree::sampler::ColumnSampler;
-
-    fn binned(data: &DMatrix) -> GHistIndex {
-        GHistIndex::from_dmatrix(data, HistCuts::from_dmatrix(data, 64))
-    }
 
     /// Pseudo-random rows with an additive target, some values missing.
     fn noisy(n: usize, features: usize, missing: bool) -> (DMatrix, Vec<GradPair>) {
@@ -461,7 +394,7 @@ mod tests {
     }
 
     fn grow(params: &TrainingParams, data: &DMatrix, gpair: &[GradPair], seed: u64) -> RegTree {
-        let ghist = binned(data);
+        let ghist = binned(data, 64);
         HistTreeBuilder::new(params).build(
             &ghist,
             gpair,

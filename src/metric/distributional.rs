@@ -6,7 +6,7 @@
 //! parameters per instance (`[row][parameter]`), and take the family from
 //! the objective (`ObjectiveParams::distribution`).
 
-use super::{Metric, consistent};
+use super::{Metric, weighted_mean};
 use crate::data::MetaInfo;
 use crate::objective::{Dist, DistFamily};
 use rayon::prelude::*;
@@ -23,9 +23,7 @@ fn mean_score(
     score: impl Fn(&Dist, f64) -> f64 + Sync,
 ) -> f64 {
     let k = family.n_params();
-    if !consistent(preds, labels, weights, k) {
-        return f64::NAN;
-    }
+    nan_unless_consistent!(preds, labels, weights, k);
     let scores: Vec<f64> = preds
         .par_chunks_exact(k)
         .zip(labels.par_iter())
@@ -37,7 +35,7 @@ fn mean_score(
         total += w * s;
         weight += w;
     }
-    super::weighted_mean((total, weight))
+    weighted_mean((total, weight))
 }
 
 /// Mean negative log-likelihood `-ln p(y)` of the predicted distributions

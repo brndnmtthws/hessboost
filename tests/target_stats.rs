@@ -4,6 +4,9 @@
 use hessboost::data::OrderedTargetEncoder;
 use hessboost::prelude::*;
 
+mod common;
+use common::{labeled_dense, rmse};
+
 const CATEGORIES: usize = 600;
 const TRAIN_ROWS: usize = 2400; // ~4 rows per category
 const TEST_ROWS: usize = 4000;
@@ -31,23 +34,9 @@ fn sample(rows: usize, effects: &[f64], rng: &mut impl FnMut() -> f64) -> DMatri
         x.extend([cat as f32, num as f32]);
         y.push((effects[cat] + 2.0 * num + noise) as f32);
     }
-    DMatrix::from_dense(&x, rows, 2)
-        .unwrap()
-        .with_labels(&y)
-        .unwrap()
+    labeled_dense(&x, 2, &y)
         .with_feature_types(&[FeatureType::Categorical, FeatureType::Numerical])
         .unwrap()
-}
-
-fn rmse(model: &BoostedModel, data: &DMatrix) -> f64 {
-    let preds = model.predict(data).unwrap();
-    let labels = data.labels().unwrap();
-    let sse: f64 = preds
-        .iter()
-        .zip(labels)
-        .map(|(&p, &y)| (f64::from(p) - f64::from(y)).powi(2))
-        .sum();
-    (sse / labels.len() as f64).sqrt()
 }
 
 #[test]

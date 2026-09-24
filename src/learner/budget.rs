@@ -70,28 +70,31 @@
 //! deterministic (no random numbers are drawn) and independent of the thread
 //! count.
 
-use crate::config::{ObjectiveParams, TrainingParams};
+use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::error::{HessboostError, Result};
-use crate::learner::model::{BoostedModel, ModelSpec};
-use crate::learner::train::{initial_intercepts, validate_dataset};
+use crate::learner::model::BoostedModel;
+use crate::learner::train::{
+    initial_intercepts, new_model, reject_missing_param, validate_dataset, with_thread_pool,
+};
 use crate::objective::{GradPair, create_objective};
-use crate::tree::builder::budget::{ChildRecord, GrowConfig, TreeStopper, grow};
+use crate::tree::builder::budget::{
+    ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
+    fold_weight_spread, grow,
+};
 
 /// Perpetual's default budget.
 pub const DEFAULT_BUDGET: f64 = 0.5;
-/// Largest admissible budget (exclusive): at `b ≥ 5` the target loss
-/// decrement formula is no longer positive.
+/// Largest admissible budget (exclusive): for `b ≥ 5` the target loss
+/// decrement formula is not positive.
 pub const MAX_BUDGET: f64 = 5.0;
 /// Weak/non-improving rounds tolerated before stopping (Perpetual
 /// `STOPPING_ROUNDS`), before the budget scaling.
 const STOPPING_ROUNDS: usize = 3;
 /// Base iteration cap (Perpetual `ITER_LIMIT`), before the budget scaling.
 const ITER_LIMIT: usize = 1000;
-/// A weak tree's generalization score is below this.
-const GENERALIZATION_THRESHOLD_RELAXED: f64 = 0.99;
 
 /// Configuration of [`train_with_budget`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -257,14 +260,7 @@ pub fn train_with_budget(
     dtrain: &DMatrix,
     config: &BudgetConfig,
 ) -> Result<BudgetResult> {
-    if params.nthread > 0 {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(params.nthread)
-            .build()
-            .map_err(|error| HessboostError::invalid_param("nthread", error.to_string()))?;
-        return pool.install(|| train_budget_inner(params, dtrain, config));
-    }
-    train_budget_inner(params, dtrain, config)
+    with_thread_pool(params, || train_budget_inner(params, dtrain, config))
 }
 
 /// Refuse every [`TrainingParams`] field budget mode does not read (they are
@@ -329,12 +325,7 @@ fn train_budget_inner(
 ) -> Result<BudgetResult> {
     config.validate()?;
     params.validate()?;
-    if !params.missing.is_nan() {
-        return Err(HessboostError::invalid_param(
-            "missing",
-            "set the sentinel when constructing DMatrix with from_dense_with_missing",
-        ));
-    }
+    reject_missing_param(params)?;
     if dtrain.feature_weights().is_some() {
         return Err(HessboostError::invalid_param(
             "feature_weights",
@@ -374,17 +365,7 @@ fn train_budget_inner(
     )?;
     let info = dtrain.info();
     let base_margins = initial_intercepts(params, objective.as_ref(), &info, n_out)?;
-    let mut model = BoostedModel::new(
-        base_margins,
-        ModelSpec {
-            objective: objective.name().to_string(),
-            objective_params: ObjectiveParams::from_params(params),
-            num_class: params.num_class,
-            n_outputs: n_out,
-            n_targets: dtrain.n_targets(),
-            n_features,
-        },
-    );
+    let mut model = new_model(params, objective.as_ref(), dtrain, base_margins);
 
     let ghist = GHistIndex::from_dmatrix(dtrain, HistCuts::from_dmatrix(dtrain, params.max_bin));
     let weights = dtrain.weights();
@@ -483,16 +464,11 @@ fn train_budget_inner(
 
 /// Sign agreement and spread of a node's fold weights (booster form):
 /// `max(share≥0, share<0) / (1 + σ/|w̄|)` clamped to `[0.5, 1]`.
-fn fold_weight_reliability(weights: &[f64]) -> f64 {
-    let n = weights.len() as f64;
-    let mean = weights.iter().sum::<f64>() / n;
-    let mean_abs = weights.iter().map(|w| w.abs()).sum::<f64>() / n;
-    if mean_abs <= f64::from(f32::EPSILON) {
-        return 1.0;
-    }
-    let std_dev = (weights.iter().map(|w| (w - mean).powi(2)).sum::<f64>() / n).sqrt();
-    let positive = weights.iter().filter(|&&w| w >= 0.0).count() as f64 / n;
-    (positive.max(1.0 - positive) / (1.0 + std_dev / mean_abs)).clamp(0.5, 1.0)
+fn fold_weight_reliability(weights: &[f64; N_FOLDS]) -> f64 {
+    fold_weight_spread(weights).map_or(1.0, |(mean_abs, std_dev)| {
+        let positive = weights.iter().filter(|&&w| w >= 0.0).count() as f64 / N_FOLDS as f64;
+        (positive.max(1.0 - positive) / (1.0 + std_dev / mean_abs)).clamp(0.5, 1.0)
+    })
 }
 
 /// A tree's generalization score: the best node score for classification

@@ -144,40 +144,27 @@ fn device_metal_refuses_unsupported_combinations() {
         .device(Device::Metal)
         .build()
         .unwrap();
+    let with = |change: fn(&mut TrainingParams)| {
+        let mut params = base.clone();
+        change(&mut params);
+        params
+    };
     let variants: Vec<(TrainingParams, &str)> = vec![
         (
-            TrainingParams {
-                tree_method: TreeMethod::Approx,
-                ..base.clone()
-            },
+            with(|p| p.tree_method = TreeMethod::Approx),
             "tree_method=approx",
         ),
         (
-            TrainingParams {
-                tree_method: TreeMethod::Exact,
-                ..base.clone()
-            },
+            with(|p| p.tree_method = TreeMethod::Exact),
             "tree_method=exact",
         ),
+        (with(|p| p.use_quantized_grad = true), "use_quantized_grad"),
         (
-            TrainingParams {
-                use_quantized_grad: true,
-                ..base.clone()
-            },
-            "use_quantized_grad",
-        ),
-        (
-            TrainingParams {
-                booster: BoosterKind::GbLinear,
-                ..base.clone()
-            },
+            with(|p| p.booster = BoosterKind::GbLinear),
             "booster=gblinear",
         ),
         (
-            TrainingParams {
-                process_type: ProcessType::Update,
-                ..base.clone()
-            },
+            with(|p| p.process_type = ProcessType::Update),
             "process_type=update",
         ),
     ];
@@ -284,4 +271,155 @@ fn to_gpu_refuses_unsupported_models() {
     .unwrap();
     let err = linear.to_gpu().unwrap_err().to_string();
     assert!(err.contains("linear_tree"), "{err}");
+}
+
+/// The review's dynamic-range case: in every 128-row slice the first 64
+/// rows (bin 0) carry `2^50, 2^26, 2^23 + 1, -2^50, -2^26, -2^23` then zeros
+/// and the next 64 (bin 1) the negated sequence. The CPU's `f64` chain sums
+/// the bins to +64 and -64 (the first double-float kernels returned 0 and
+/// 0). Values up to `2^50` with a grain of 1 are exact on the GPU for at
+/// most 8 rows per node, so the backend must take its CPU path.
+fn dynamic_range_case() -> (Vec<f32>, Vec<f32>) {
+    let six = [
+        2f32.powi(50),
+        2f32.powi(26),
+        2f32.powi(23) + 1.0,
+        -(2f32.powi(50)),
+        -(2f32.powi(26)),
+        -(2f32.powi(23)),
+    ];
+    let n = 8192;
+    let x: Vec<f32> = (0..n).map(|i| f32::from(i % 128 >= 64)).collect();
+    let grad: Vec<f32> = (0..n)
+        .map(|i| match i % 128 {
+            p @ 0..6 => six[p],
+            p @ 64..70 => -six[p - 64],
+            _ => 0.0,
+        })
+        .collect();
+    (x, grad)
+}
+
+/// The histogram of `rows` on `backend` after `prepare(gpair)`, run on one
+/// thread so the CPU backend takes its sequential path.
+fn histogram(
+    backend: &dyn hessboost::internals::HistogramBackend,
+    index: &hessboost::internals::GHistIndex,
+    rows: &[u32],
+    gpair: &[hessboost::objective::GradPair],
+) -> Vec<(f64, f64)> {
+    let mut out = hessboost::internals::zeroed(index.total_bins());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap()
+        .install(|| {
+            backend.prepare(index, gpair);
+            backend.build(index, rows, gpair, &mut out);
+        });
+    out.iter().map(|s| (s.grad, s.hess)).collect()
+}
+
+/// A binned one-feature index of `x`.
+fn index_of(x: &[f32]) -> hessboost::internals::GHistIndex {
+    let data = DMatrix::from_dense(x, x.len(), 1).unwrap();
+    let cuts = hessboost::internals::HistCuts::from_dmatrix(&data, 256);
+    hessboost::internals::GHistIndex::from_dmatrix(&data, cuts)
+}
+
+/// Gradients outside the GPU's exactness bound give the CPU's histogram
+/// bit for bit.
+#[test]
+fn wide_dynamic_range_histogram_matches_cpu() {
+    if !device() {
+        return;
+    }
+    let (x, grad) = dynamic_range_case();
+    let index = index_of(&x);
+    let gpair: Vec<_> = grad
+        .iter()
+        .map(|&g| hessboost::objective::GradPair::new(g, 1.0))
+        .collect();
+    let rows: Vec<u32> = (0..x.len() as u32).collect();
+    let cpu = histogram(&hessboost::internals::CpuBackend, &index, &rows, &gpair);
+    assert_eq!(cpu, [(64.0, 4096.0), (-64.0, 4096.0)]);
+    let backend = metal::MetalHistBackend::new(&index).unwrap();
+    assert_eq!(histogram(&backend, &index, &rows, &gpair), cpu);
+}
+
+/// The same case through training: with `base_score = 0`, squared error's
+/// gradients are the negated labels, and the `device = metal` model is the
+/// single-threaded CPU model bit for bit.
+#[test]
+fn wide_dynamic_range_training_matches_single_threaded_cpu() {
+    if !device() {
+        return;
+    }
+    let (x, grad) = dynamic_range_case();
+    let labels: Vec<f32> = grad.iter().map(|&g| -g).collect();
+    let data = DMatrix::from_dense(&x, x.len(), 1)
+        .unwrap()
+        .with_labels(&labels)
+        .unwrap();
+    let build = |device| {
+        TrainingParams::builder()
+            .objective("reg:squarederror")
+            .tree_method(TreeMethod::Hist)
+            .base_score(0.0)
+            .max_depth(2)
+            .device(device)
+            .build()
+            .unwrap()
+    };
+    let train_one = |params| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| train(&params, &data, 2).unwrap())
+    };
+    assert_eq!(
+        train_one(build(Device::Cpu)).to_bytes().unwrap(),
+        train_one(build(Device::Metal)).to_bytes().unwrap()
+    );
+}
+
+/// Inputs that do not fit the backend's GPU buffers never reach the GPU: a
+/// gradient slice longer than the index and a row list longer than the
+/// index (repeated rows) give the CPU's histogram, and a row past the index
+/// is refused by the CPU path's bounds check exactly as the CPU backend
+/// refuses it, instead of being read past the GPU buffers.
+#[test]
+fn mismatched_inputs_match_the_cpu_backend() {
+    if !device() {
+        return;
+    }
+    let n = 10_000;
+    let x: Vec<f32> = (0..n).map(|i| (i % 5) as f32).collect();
+    let index = index_of(&x);
+    let cpu = hessboost::internals::CpuBackend;
+    let backend = metal::MetalHistBackend::new(&index).unwrap();
+    let long: Vec<_> = (0..n + 1000)
+        .map(|i| hessboost::objective::GradPair::new((i % 7) as f32 - 3.0, 1.0))
+        .collect();
+    let rows: Vec<u32> = (0..n as u32).collect();
+    assert_eq!(
+        histogram(&backend, &index, &rows, &long),
+        histogram(&cpu, &index, &rows, &long)
+    );
+    let gpair = &long[..n];
+    let twice: Vec<u32> = rows.iter().chain(&rows).copied().collect();
+    assert_eq!(
+        histogram(&backend, &index, &twice, gpair),
+        histogram(&cpu, &index, &twice, gpair)
+    );
+    let past_end: Vec<u32> = (1..=n as u32).collect();
+    let refused = |backend: &dyn hessboost::internals::HistogramBackend| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            histogram(backend, &index, &past_end, gpair)
+        }))
+        .is_err()
+    };
+    assert!(refused(&cpu));
+    assert!(refused(&backend));
 }

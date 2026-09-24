@@ -2,7 +2,9 @@
 # Runs every fuzz target for a fixed wall time: a smoke test, not a fuzzing
 # campaign. Seeds come from the models each release saved
 # (tests/data/saved/*/) and the XGBoost saves the importer tests use, so new
-# formats and releases are picked up without checked-in copies.
+# formats and releases are picked up without checked-in copies, plus the
+# inputs in fixed-seeds/ that reach paths the fuzzer is slow to find (e.g. a
+# gblinear case that trains).
 #
 # Usage (from fuzz/, where mise provides nightly Rust and cargo-fuzz):
 #   ./run.sh [seconds-per-target] [target...]
@@ -18,6 +20,8 @@ seed() {
 }
 
 rm -rf seeds
+mkdir seeds
+cp -R fixed-seeds/. seeds/
 seed native-model
 seed json-model
 seed compact-model
@@ -48,6 +52,9 @@ printf '\x00# comment\n1 0:1.5 3:-2\n0 1:0.25\n\n2 2:1e3 0:7\n' > seeds/loaders/
 printf '\x09y,a,b\n1,2.5,\n0,,-3\n1,4,5\n' > seeds/loaders/csv-header-label0
 printf '\x23a;b;c\n1;NA;3\n4;5;NA\n' > seeds/loaders/csv-semicolon-na
 
+# cargo-fuzz defaults to the target it was built for; the prebuilt Linux
+# binary is a musl build, whose static libc the sanitizers cannot use.
+host="$(rustc -vV | sed -n 's/^host: //p')"
 targets=("$@")
 if [ ${#targets[@]} -eq 0 ]; then
   mapfile -t targets < <(cargo fuzz list)
@@ -61,5 +68,6 @@ for target in "${targets[@]}"; do
   # `-max_total_time` does not interrupt a stuck input, so `-timeout` bounds
   # each input too; libFuzzer's default 2 GB RSS limit catches runaway
   # allocations.
-  cargo fuzz run "$target" "${corpora[@]}" -- -max_total_time="$seconds" -timeout=10
+  cargo fuzz run --target "$host" "$target" "${corpora[@]}" \
+    -- -max_total_time="$seconds" -timeout=10
 done

@@ -112,7 +112,7 @@ pub(super) fn resume_model(
 
     let mut model = init.clone();
     model.set_best_iteration(None);
-    model.set_objective_params(ObjectiveParams::from_params(params));
+    model.set_objective_params(ObjectiveParams::for_objective(params, init.objective()));
     model.set_num_parallel_tree(params.num_parallel_tree);
     model.materialize_tree_weights();
     if params.base_score.is_some() {

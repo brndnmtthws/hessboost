@@ -66,7 +66,9 @@ renewal), `tree_options.rs` (`extra_trees`, `path_smooth`, `linear_tree`),
 `budget.rs`, `multi_output.rs` (vector-leaf trees), `distributional.rs`
 (`dist:*` objectives: interval calibration, NLL vs a homoscedastic baseline,
 serialization, CQR), `native_format.rs` (native binary/JSON round trips,
-refused versions and corrupt payloads).
+refused versions and corrupt payloads, and the models saved by each release
+in `tests/data/saved/<version>/`, which must keep loading with their
+recorded margins).
 `tests/data/xgboost-3.4.2-categorical.{json,ubj}` are committed XGBoost saves
 that `model/xgboost_json.rs` unit tests import. `tests/common/` and
 `examples/common/` hold the helpers shared by the integration tests and by
@@ -106,17 +108,26 @@ the examples. `benches/training.rs` is the Criterion suite;
   `EnumeratePart` scanned in both directions up to `max_cat_threshold = 64`)
   in `tree/builder/mod.rs::sweep_categorical`, shared by the histogram and
   exact builders.
-- **Formats:** the native binary format (`SQB\0`, a version byte, then a
-  postcard payload of `BoostedModel`), the native JSON layout
-  (`BoostedModel`'s fields by name) and the compact layout (`HBTD`, version
-  byte, documented in `learner/compact_model.rs`) are contracts.
-  `BoostedModel::from_bytes` reads only `NATIVE_VERSION`
-  (`learner/model.rs`) and refuses every other version. Postcard is not
-  self-describing, so any change to a type inside `BoostedModel` (`RegTree`,
-  `Node`, `LinearLeaves`, `LinearModel`, `ObjectiveParams`) needs a
-  `NATIVE_VERSION` bump; it changes the native JSON layout as well. The
-  compact metadata embeds `ObjectiveParams` as postcard, so changing that
-  struct changes the compact format too.
+- **Formats:** files written by a release keep loading in every later one.
+  - Native binary (`learner/native.rs`): a zstd frame holding `SQB\0`, a
+    container version byte, a table of named, typed sections
+    (`learner/sections.rs`), and an XXH64 checksum of the preceding bytes.
+    The sections hold model scalars (`model.*`), objective parameters
+    (`objective.*`), and the trees column-wise (`node.*`, `tree.*`,
+    `leaf_linear.*`). A new stored field is a new section, written with
+    `REQUIRED` when older readers must refuse rather than skip it, and read
+    with a default that reproduces files written before it existed (for
+    objective parameters, the objective's defaults). Changing or removing an
+    existing section's meaning, or the container layout, bumps
+    `CONTAINER_VERSION` and keeps reading the previous version.
+  - Native JSON (`BoostedModel`'s fields by name): a new field needs
+    `#[serde(default)]` reproducing older files.
+  - Compact (`HBTD`, documented in `learner/compact_model.rs`): its metadata
+    is a section table like the native one; a change to the bit stream bumps
+    its version byte.
+  - Before each release, `cargo test --test native_format -- --ignored
+    save_models_of_this_version` writes `tests/data/saved/<version>/`;
+    commit it and never rewrite an earlier version's directory.
 - **Tree layout:** as in XGBoost, iteration `i` owns trees
   `i * trees_per_iteration ..` (`trees_per_iteration = n_outputs ×
   num_parallel_tree`), grouped by output; tree `t` feeds output

@@ -182,6 +182,35 @@ pub enum DistSplitDirection {
     All,
 }
 
+/// Stable names of the enums a model file stores, matching their serde
+/// (and XGBoost) spellings.
+macro_rules! stored_names {
+    ($($ty:ident { $($variant:ident => $name:literal),+ $(,)? })+) => {$(
+        impl $ty {
+            /// The variant's stored name.
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $($ty::$variant => $name,)+
+                }
+            }
+
+            /// The variant stored as `name`, if any.
+            pub(crate) fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some($ty::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    )+};
+}
+
+stored_names! {
+    AftDistribution { Normal => "normal", Logistic => "logistic", Extreme => "extreme" }
+    DistGradient { Fisher => "fisher", Hessian => "hessian", Natural => "natural" }
+    DistSplitDirection { Random => "random", Cyclic => "cyclic", All => "all" }
+}
+
 /// The complete training configuration.
 ///
 /// Construct with [`TrainingParams::builder`] or start from
@@ -1212,5 +1241,49 @@ mod tests {
             Some("grow_policy")
         );
         assert!(sym().booster(BoosterKind::Dart).build().is_ok());
+    }
+
+    /// The names model files store are the serde (and XGBoost) spellings,
+    /// and read back to the same variant.
+    #[test]
+    fn stored_enum_names_match_serde_and_read_back() {
+        fn check<T: Serialize + Copy + PartialEq + std::fmt::Debug>(
+            variants: &[T],
+            name: fn(T) -> &'static str,
+            from_name: fn(&str) -> Option<T>,
+        ) {
+            for &v in variants {
+                assert_eq!(serde_json::to_value(v).unwrap(), name(v), "{v:?}");
+                assert_eq!(from_name(name(v)), Some(v));
+            }
+            assert_eq!(from_name("no such variant"), None);
+        }
+        check(
+            &[
+                AftDistribution::Normal,
+                AftDistribution::Logistic,
+                AftDistribution::Extreme,
+            ],
+            AftDistribution::name,
+            AftDistribution::from_name,
+        );
+        check(
+            &[
+                DistGradient::Fisher,
+                DistGradient::Hessian,
+                DistGradient::Natural,
+            ],
+            DistGradient::name,
+            DistGradient::from_name,
+        );
+        check(
+            &[
+                DistSplitDirection::Random,
+                DistSplitDirection::Cyclic,
+                DistSplitDirection::All,
+            ],
+            DistSplitDirection::name,
+            DistSplitDirection::from_name,
+        );
     }
 }

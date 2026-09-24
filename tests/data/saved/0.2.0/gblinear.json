@@ -1,0 +1,39 @@
+{
+  "trees": [],
+  "base_score": [
+    0.59688044
+  ],
+  "objective": "reg:squarederror",
+  "objective_params": {
+    "scale_pos_weight": 1.0,
+    "max_delta_step": 0.0,
+    "tweedie_variance_power": 1.5,
+    "huber_slope": 1.0,
+    "lambdarank_num_pair_per_sample": 32,
+    "quantile_alpha": [],
+    "expectile_alpha": [],
+    "aft_loss_distribution": "normal",
+    "aft_loss_distribution_scale": 1.0,
+    "dist_gradient": "fisher",
+    "dist_split_direction": "random",
+    "distribution": null
+  },
+  "num_class": 0,
+  "n_outputs": 1,
+  "n_targets": 1,
+  "n_features": 4,
+  "best_iteration": null,
+  "tree_weights": [],
+  "num_parallel_tree": 1,
+  "linear": {
+    "weights": [
+      0.49159032,
+      -0.33421656,
+      -0.06759773,
+      -0.006093465
+    ],
+    "bias": [
+      -0.018827023
+    ]
+  }
+}

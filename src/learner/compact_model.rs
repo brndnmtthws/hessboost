@@ -25,9 +25,12 @@
 //! bytes 0..4   magic b"HBTD"
 //! byte  4      format version (1)
 //! bytes 5..9   u32 little-endian M, the metadata length
-//! next M bytes metadata (postcard): objective name, objective parameters
-//!              (absent when they equal XGBoost's defaults for the objective),
-//!              num_class, n_targets, num_parallel_tree
+//! next M bytes metadata: a section table (`learner::sections`, the
+//!              native format's building block) holding the objective name,
+//!              num_class, n_targets, num_parallel_tree, and the objective
+//!              parameters when they differ from the objective's defaults;
+//!              readers give sections a file lacks their default, so later
+//!              additions keep older files loading
 //! rest         one bit stream
 //! ```
 //!
@@ -114,6 +117,8 @@
 //! # }
 //! ```
 
+use super::native::{OBJECTIVE_SECTIONS, read_objective_params, write_objective_params};
+use super::sections::{Sections, Writer};
 use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -124,7 +129,6 @@ use crate::learner::model::{
 use crate::tree::reuse::canonical_categories;
 use crate::tree::{Node, RegTree, scalar_tree_output};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const MAGIC: &[u8; 4] = b"HBTD";
@@ -156,8 +160,8 @@ fn format_error(msg: impl Into<String>) -> HessboostError {
     HessboostError::model_format(format!("compact model: {}", msg.into()))
 }
 
-/// Metadata the transform and dimension checks need, stored as postcard.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Metadata the transform and dimension checks need.
+#[derive(Debug, Clone)]
 struct Meta {
     objective: String,
     /// `None` when equal to [`ObjectiveParams::defaults_for`] the objective.
@@ -169,16 +173,55 @@ struct Meta {
     num_parallel_tree: usize,
 }
 
+/// Every metadata section besides [`OBJECTIVE_SECTIONS`].
+const META_SECTIONS: &[&str] = &["objective", "num_class", "n_targets", "num_parallel_tree"];
+
 impl Meta {
     fn objective_params(&self) -> ObjectiveParams {
         self.objective_params
             .clone()
             .unwrap_or_else(|| ObjectiveParams::defaults_for(&self.objective))
     }
+
+    /// The metadata as a section table, the objective parameters only when
+    /// they differ from the objective's defaults.
+    fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.str("objective", &self.objective);
+        w.u64("num_class", self.num_class as u64);
+        w.u64("n_targets", self.n_targets as u64);
+        w.u64("num_parallel_tree", self.num_parallel_tree as u64);
+        if let Some(params) = &self.objective_params {
+            write_objective_params(&mut w, params);
+        }
+        let mut out = Vec::new();
+        w.finish(&mut out);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let (s, rest) = Sections::parse(bytes, |name| {
+            META_SECTIONS.contains(&name) || OBJECTIVE_SECTIONS.contains(&name)
+        })
+        .map_err(|e| format_error(format!("metadata: {e}")))?;
+        if !rest.is_empty() {
+            return Err(format_error("metadata has trailing bytes"));
+        }
+        let objective = s.str("objective")?.to_string();
+        let defaults = ObjectiveParams::defaults_for(&objective);
+        let params = read_objective_params(&s, defaults.clone())?;
+        Ok(Meta {
+            objective_params: (params != defaults).then_some(params),
+            objective,
+            num_class: s.usize("num_class")?,
+            n_targets: s.usize("n_targets")?,
+            num_parallel_tree: s.usize("num_parallel_tree")?,
+        })
+    }
 }
 
 /// The serialized model: magic, version and length prefix, then the
-/// postcard `meta` and the bit `stream`.
+/// metadata section table and the bit `stream`.
 fn frame(meta: &[u8], stream: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(PREFIX_BYTES + meta.len() + stream.len());
     bytes.extend_from_slice(MAGIC);
@@ -564,8 +607,7 @@ impl CompactModel {
     /// prediction on a parsed model cannot index out of bounds.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (meta, stream) = split_frame(bytes)?;
-        let meta: Meta =
-            postcard::from_bytes(meta).map_err(|e| format_error(format!("metadata: {e}")))?;
+        let meta = Meta::decode(meta)?;
         if meta.n_targets == 0 {
             return Err(format_error("n_targets must be positive"));
         }
@@ -1456,8 +1498,7 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
         n_targets: model.n_targets(),
         num_parallel_tree: model.num_parallel_tree(),
     };
-    let meta = postcard::to_stdvec(&meta).map_err(|e| format_error(e.to_string()))?;
-    Ok(frame(&meta, &w.bytes))
+    Ok(frame(&meta.encode(), &w.bytes))
 }
 
 #[cfg(test)]
@@ -1738,8 +1779,10 @@ mod tests {
             report.compact_bytes,
             model.to_compact_bytes().unwrap().len()
         );
+        // The native format is zstd-compressed; the bit-packed layout still
+        // beats it by a wide margin (about 3.3x here).
         assert!(
-            report.compression_ratio() > 4.0,
+            report.compression_ratio() > 2.5,
             "compact {} vs native {}",
             report.compact_bytes,
             report.native_bytes
@@ -1776,9 +1819,9 @@ mod tests {
     /// metadata.
     fn with_meta(bytes: &[u8], edit: impl FnOnce(&mut Meta)) -> Vec<u8> {
         let (meta, stream) = split_frame(bytes).unwrap();
-        let mut meta: Meta = postcard::from_bytes(meta).unwrap();
+        let mut meta = Meta::decode(meta).unwrap();
         edit(&mut meta);
-        frame(&postcard::to_stdvec(&meta).unwrap(), stream)
+        frame(&meta.encode(), stream)
     }
 
     #[test]
@@ -1848,7 +1891,7 @@ mod tests {
             n_targets: 1,
             num_parallel_tree: 1,
         };
-        frame(&postcard::to_stdvec(&meta).unwrap(), &w.bytes)
+        frame(&meta.encode(), &w.bytes)
     }
 
     /// Validation work is bounded by the input: 4096 zero-width depth-24

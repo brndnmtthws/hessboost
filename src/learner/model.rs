@@ -12,13 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-// Native binary format marker.
-const NATIVE_MAGIC: &[u8; 4] = b"SQB\0";
-/// Native binary format version written by [`BoostedModel::to_bytes`] and the
-/// only one [`BoostedModel::from_bytes`] reads. Bump it on any change to a
-/// serialized type.
-const NATIVE_VERSION: u8 = 2;
-
 /// The kind of feature-importance score to compute, mirroring XGBoost's
 /// `importance_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -936,38 +929,47 @@ impl BoostedModel {
         validate_prediction_data(self.n_features, self.n_outputs(), data)
     }
 
-    /// Serialize the model to the native binary format: the magic `SQB\0`, a
-    /// format version byte, then the model as a Postcard payload.
-    ///
-    /// Postcard is not self-describing: a payload decodes only against the
-    /// exact field layout it was written with, so any change to a serialized
-    /// type needs a new format version.
+    /// Serialize the model to the native binary format: a zstd-compressed
+    /// container of named, typed sections holding the trees column-wise.
+    /// Files written by this version keep loading in later ones.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let payload =
-            postcard::to_stdvec(self).map_err(|e| HessboostError::ModelFormat(e.to_string()))?;
-        let mut bytes = Vec::with_capacity(NATIVE_MAGIC.len() + 1 + payload.len());
-        bytes.extend_from_slice(NATIVE_MAGIC);
-        bytes.push(NATIVE_VERSION);
-        bytes.extend_from_slice(&payload);
-        Ok(bytes)
+        super::native::write(&super::native::StoredRef {
+            trees: &self.trees,
+            base_score: &self.base_score,
+            objective: &self.objective,
+            objective_params: &self.objective_params,
+            num_class: self.num_class,
+            n_outputs: self.n_outputs,
+            n_targets: self.n_targets,
+            n_features: self.n_features,
+            best_iteration: self.best_iteration,
+            tree_weights: &self.tree_weights,
+            num_parallel_tree: self.num_parallel_tree,
+            linear: self.linear.as_ref(),
+        })
     }
 
-    /// Deserialize a model from a binary blob produced by [`BoostedModel::to_bytes`].
-    ///
-    /// Blobs with another format version are refused with
+    /// Deserialize a model from bytes produced by [`BoostedModel::to_bytes`]
+    /// of this or an earlier version. Malformed input, and files that need
+    /// a feature this version lacks, are refused with
     /// [`HessboostError::ModelFormat`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < NATIVE_MAGIC.len() + 1 || &bytes[..NATIVE_MAGIC.len()] != NATIVE_MAGIC {
-            return Err(HessboostError::model_format("invalid native model header"));
-        }
-        let version = bytes[NATIVE_MAGIC.len()];
-        if version != NATIVE_VERSION {
-            return Err(HessboostError::ModelFormat(format!(
-                "unsupported native model version {version}"
-            )));
-        }
-        let model: Self = postcard::from_bytes(&bytes[NATIVE_MAGIC.len() + 1..])
-            .map_err(|e| HessboostError::ModelFormat(e.to_string()))?;
+        let m = super::native::read(bytes)?;
+        let model = BoostedModel {
+            trees: m.trees,
+            base_score: m.base_score,
+            objective: m.objective,
+            objective_params: m.objective_params,
+            num_class: m.num_class,
+            n_outputs: m.n_outputs,
+            n_targets: m.n_targets,
+            n_features: m.n_features,
+            best_iteration: m.best_iteration,
+            tree_weights: m.tree_weights,
+            num_parallel_tree: m.num_parallel_tree,
+            linear: m.linear,
+            compact: OnceLock::new(),
+        };
         model.validate_structure()?;
         Ok(model)
     }

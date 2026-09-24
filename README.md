@@ -220,7 +220,9 @@ gives the exact learning-rate, loss-target, split, and stopping rules.
   XGBoost's values), early stopping, feature importance (weight / gain /
   cover / totals), leaf-index and margin prediction, and k-fold
   cross-validation (`cv`).
-- **Model I/O:** libsvm & CSV loaders; native binary + JSON model I/O; and
+- **Model I/O:** libsvm & CSV loaders; native binary (a zstd-compressed,
+  column-wise section container) and JSON model I/O, with models from any
+  earlier release loading in later ones; and
   **XGBoost-format import/export** of `gbtree`/DART models (numeric and
   categorical splits, forests, multi-output and vector-leaf trees) in both
   XGBoost encodings: JSON (`save_xgboost_json` / `load_xgboost_json`,
@@ -294,11 +296,11 @@ None of these change default training; each is off unless requested.
   linear-leaf, and vector-leaf models are refused, and XGBoost cannot read
   the format. On the `compact_model` example (binary classification, 16
   sensor features, 100 depth-3 trees, 8000 rows) the compact layout alone is
-  5.4x smaller than the native format (6262 vs 33844 bytes, 94.98% test
-  accuracy); `ι = ξ = 4` keeps accuracy (95.05%) with 9 of 16 features and
-  67 instead of 379 thresholds at 5096 bytes (6.6x), and `ι = ξ = 16`
-  reaches 7.0x (4868 bytes, 93.75%). The `f32` leaf table (one value per
-  leaf) bounds the savings.
+  3.9x smaller than the zstd-compressed native format (6370 vs 24671 bytes,
+  94.98% test accuracy); `ι = ξ = 4` keeps accuracy (95.05%) with 9 of 16
+  features and 67 instead of 379 thresholds at 5204 bytes (4.7x), and
+  `ι = ξ = 16` reaches 4.9x (4976 bytes, 93.75%). The `f32` leaf table (one
+  value per leaf) bounds the savings.
 - **Quantized-gradient training** (`use_quantized_grad`, LightGBM's
   quantized training, NeurIPS 2022): each tree's gradients and Hessians are
   rounded to `num_grad_quant_bins` integer levels (stochastic rounding by

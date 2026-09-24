@@ -114,6 +114,32 @@ impl RegTree {
         }
     }
 
+    /// Assemble a tree from every stored part, as the native binary format
+    /// keeps them: `size_leaf_vector` is `0` for a scalar tree, and
+    /// `leaf_vectors` holds `size_leaf_vector` weights per node. The caller
+    /// validates the result ([`RegTree::is_valid_for_features`]).
+    pub(crate) fn from_parts(
+        nodes: Vec<Node>,
+        categories: Vec<u32>,
+        size_leaf_vector: usize,
+        leaf_vectors: Vec<f32>,
+        linear: Option<LinearLeaves>,
+    ) -> Self {
+        RegTree {
+            nodes,
+            categories,
+            size_leaf_vector,
+            leaf_vectors,
+            linear,
+        }
+    }
+
+    /// The stored leaf-vector width (`0` for a scalar tree) and weights, as
+    /// [`RegTree::from_parts`] takes them.
+    pub(crate) fn leaf_vector_parts(&self) -> (usize, &[f32]) {
+        (self.size_leaf_vector, &self.leaf_vectors)
+    }
+
     /// Create a vector-leaf tree with `n_outputs > 1` weights per leaf and a
     /// placeholder (all-zero) root leaf.
     pub(crate) fn with_vector_root(n_outputs: usize, sum_hess: f32) -> Self {

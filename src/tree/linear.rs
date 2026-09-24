@@ -96,6 +96,33 @@ impl LinearLeaves {
         }
     }
 
+    /// The stored arrays `(offsets, intercepts, features, coeffs)`, as
+    /// [`LinearLeaves::from_parts`] takes them.
+    pub(crate) fn parts(&self) -> (&[u32], &[f64], &[u32], &[f64]) {
+        (
+            &self.offsets,
+            &self.intercepts,
+            &self.features,
+            &self.coeffs,
+        )
+    }
+
+    /// Assemble leaf models from their stored arrays; the owning tree checks
+    /// them with [`LinearLeaves::is_valid`].
+    pub(crate) fn from_parts(
+        offsets: Vec<u32>,
+        intercepts: Vec<f64>,
+        features: Vec<u32>,
+        coeffs: Vec<f64>,
+    ) -> Self {
+        LinearLeaves {
+            offsets,
+            intercepts,
+            features,
+            coeffs,
+        }
+    }
+
     /// Structural validity against the owning tree's nodes.
     pub(crate) fn is_valid(&self, nodes: &[Node], n_features: usize) -> bool {
         let n = nodes.len();

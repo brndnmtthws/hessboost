@@ -1,10 +1,18 @@
-//! Native model formats: the binary format (`SQB\0`, a version byte, then a
-//! postcard payload) and native JSON round-trip every model feature bit for
-//! bit, while other format versions, corrupt payloads, and inconsistent
-//! layouts are refused.
+//! Native model formats: the binary format (a zstd-compressed container of
+//! named sections) and native JSON round-trip every model feature bit for
+//! bit; models saved by earlier versions in `tests/data/saved/<version>/`
+//! keep loading with their recorded margins; and other container versions,
+//! corrupt payloads, and inconsistent layouts are refused.
+//!
+//! Before a release that has no directory there yet, run
+//! `cargo test --test native_format -- --ignored save_models_of_this_version`
+//! and commit the files it writes. Directories of earlier versions are never
+//! regenerated: they are what later versions must keep reading.
 
 use hessboost::prelude::*;
 use serde_json::Value;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 mod common;
 use common::{four_features, labeled_dense};
@@ -19,20 +27,39 @@ fn bits(values: &[f32]) -> Vec<u32> {
 fn unknown_and_corrupt_native_payloads_are_refused() {
     let model = train(&base().build().unwrap(), &matrix(1), 3).unwrap();
     let bytes = model.to_bytes().unwrap();
+    // The uncompressed container loads too; its version byte follows the
+    // magic.
+    let mut container = Vec::new();
+    ruzstd::decoding::StreamingDecoder::new(bytes.as_slice())
+        .unwrap()
+        .read_to_end(&mut container)
+        .unwrap();
+    assert_eq!(&container[..4], b"SQB\0");
+    assert_eq!(
+        bits(
+            &BoostedModel::from_bytes(&container)
+                .unwrap()
+                .predict(&matrix(1))
+                .unwrap()
+        ),
+        bits(&model.predict(&matrix(1)).unwrap())
+    );
     let with_version = |version: u8| {
-        let mut bytes = bytes.clone();
+        let mut bytes = container.clone();
         bytes[4] = version;
         bytes
     };
-    // Every version but the current one is refused, and so are truncated
-    // payloads and headers.
+    // Every container version but the current one is refused, and so are
+    // truncated payloads and headers, compressed or not.
     for corrupt in [
         with_version(0),
         with_version(1),
-        with_version(3),
+        with_version(2),
+        with_version(4),
         with_version(255),
         bytes[..bytes.len() - 3].to_vec(),
-        bytes[..4].to_vec(),
+        container[..container.len() - 3].to_vec(),
+        container[..4].to_vec(),
     ] {
         let err = BoostedModel::from_bytes(&corrupt).unwrap_err();
         assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
@@ -155,8 +182,10 @@ fn has_dart_weights(model: &BoostedModel) -> bool {
         .any(|w| w.as_f64() != Some(1.0))
 }
 
-#[test]
-fn native_formats_round_trip_every_model_feature() {
+/// One trained model per stored model feature, with the data it is
+/// evaluated on. The data (built from [`four_features`]) must never change:
+/// the margins saved under `tests/data/saved/` were recorded on it.
+fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
     let (x, _) = train_data(1);
     let n = x.len() / COLS;
     let classes: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
@@ -325,10 +354,14 @@ fn native_formats_round_trip_every_model_feature() {
     models.push(("early stopping", stopped, matrix(1), |m| {
         m.best_iteration() == Some(1)
     }));
-    for (name, model, data, has_feature) in models {
+    models
+}
+
+#[test]
+fn native_formats_round_trip_every_model_feature() {
+    for (name, model, data, has_feature) in feature_models() {
         assert!(has_feature(&model), "{name}: feature not exercised");
         let bytes = model.to_bytes().unwrap();
-        assert_eq!(&bytes[..5], b"SQB\0\x02", "{name}");
         let from_binary = BoostedModel::from_bytes(&bytes).unwrap();
         assert_eq!(from_binary.to_bytes().unwrap(), bytes, "{name}: binary");
         let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
@@ -354,5 +387,82 @@ fn native_formats_round_trip_every_model_feature() {
                 "{name}"
             );
         }
+    }
+}
+
+/// Where the models saved by hessboost release `version` live.
+fn saved_dir(version: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/saved")
+        .join(version)
+}
+
+/// A file-name form of a [`feature_models`] case name.
+fn slug(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+fn margin_bytes(margins: &[f32]) -> Vec<u8> {
+    margins.iter().flat_map(|m| m.to_le_bytes()).collect()
+}
+
+/// Every model saved by an earlier (or this) version loads from each format
+/// it was saved in and reproduces the margins recorded when it was saved.
+#[test]
+fn saved_models_keep_loading_with_their_margins() {
+    let root = saved_dir("");
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    versions.sort();
+    assert!(
+        !versions.is_empty(),
+        "no saved models under {}",
+        root.display()
+    );
+    let cases = feature_models();
+    for dir in versions {
+        for (name, _, data, _) in &cases {
+            let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
+            let expected = std::fs::read(file("margins")).unwrap();
+            let binary = BoostedModel::load_binary(file("bin")).unwrap();
+            let json = BoostedModel::load_json(file("json")).unwrap();
+            for (format, model) in [("bin", binary), ("json", json)] {
+                let margins = margin_bytes(&model.predict_margin(data).unwrap());
+                assert!(margins == expected, "{}: {name} ({format})", dir.display());
+            }
+            if file("hbtd").exists() {
+                let compact = CompactModel::load(file("hbtd")).unwrap();
+                let margins = margin_bytes(&compact.predict_margin(data).unwrap());
+                assert!(margins == expected, "{}: {name} (compact)", dir.display());
+            }
+        }
+    }
+}
+
+/// Write this version's saved models (see the module docs). Refuses to
+/// overwrite a version's existing directory.
+#[test]
+#[ignore = "run once per release, then commit tests/data/saved/<version>"]
+fn save_models_of_this_version() {
+    let dir = saved_dir(env!("CARGO_PKG_VERSION"));
+    assert!(
+        !dir.exists(),
+        "{} exists; saved models of a version are never rewritten",
+        dir.display()
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, model, data, _) in feature_models() {
+        let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
+        model.save_binary(file("bin")).unwrap();
+        model.save_json(file("json")).unwrap();
+        if let Ok(compact) = model.to_compact() {
+            compact.save(file("hbtd")).unwrap();
+        }
+        let margins = model.predict_margin(&data).unwrap();
+        std::fs::write(file("margins"), margin_bytes(&margins)).unwrap();
     }
 }

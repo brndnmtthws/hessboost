@@ -818,7 +818,8 @@ impl Dist {
     }
 
     /// Smallest integer `k >= 0` with `cdf(k) >= p`: bracket from the normal
-    /// approximation by doubling steps, then bisect.
+    /// approximation by doubling steps, then bisect (to adjacent integers,
+    /// or adjacent floats where those are more than 1 apart).
     fn count_quantile(&self, p: f64) -> f64 {
         if p >= 1.0 {
             return f64::INFINITY;
@@ -850,9 +851,14 @@ impl Dist {
                 }
             }
         }
-        // Invariant: cdf(lo) < p <= cdf(hi) (cdf(-1) = 0).
+        // Invariant: cdf(lo) < p <= cdf(hi) (cdf(-1) = 0). Past 2^53 adjacent
+        // floats are more than 1 apart, so stop once no integer lies strictly
+        // between them.
         while hi - lo > 1.0 {
             let mid = f64::midpoint(lo, hi).floor();
+            if !(lo < mid && mid < hi) {
+                break;
+            }
             if self.cdf(mid) >= p {
                 hi = mid;
             } else {
@@ -1308,14 +1314,9 @@ impl Objective for DistObjective {
     }
 
     /// Maximum-likelihood fit of the marginal label distribution.
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
         self.family
-            .mle_margins(labels, weights)
+            .mle_margins(info.labels, info.weights)
             .into_iter()
             .map(|m| m as f32)
             .collect()

@@ -59,12 +59,8 @@ impl Objective for Softmax {
         crate::simd::softmax_rows_inplace(preds, self.num_class);
     }
 
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+        let (labels, weights) = (info.labels, info.weights);
         // XGBoost `SoftmaxMultiClassObj::InitEstimation`, step for step in its
         // precision: class weight totals accumulated in f32 (`SmallHistogram`),
         // divided by the f64 weight sum (`VecScaDiv` multiplies by `1/Σw`),

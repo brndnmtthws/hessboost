@@ -111,20 +111,15 @@ impl Objective for Logistic {
         }
     }
 
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
         // XGBoost `RegLossObj::InitEstimation`: the (weighted) positive rate
         // through the link (the logit; the identity for `binary:logitraw`),
         // unless `scale_pos_weight` is in play, in which case the reweighted
         // loss needs the Newton step.
         if (self.scale_pos_weight - 1.0).abs() > K_RT_EPS_F32 {
-            return newton_intercepts(self, &MetaInfo::new(labels, weights, group));
+            return newton_intercepts(self, info);
         }
-        vec![self.prob_to_margin(weighted_label_mean(labels, weights))]
+        vec![self.prob_to_margin(weighted_label_mean(info.labels, info.weights))]
     }
 
     fn prob_to_margin(&self, base_score: f32) -> f32 {

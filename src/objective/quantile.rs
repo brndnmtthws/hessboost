@@ -217,12 +217,8 @@ impl Objective for Quantile {
         super::check_label_width(info, 1)
     }
 
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &crate::data::MetaInfo) -> Vec<f32> {
+        let (labels, weights) = (info.labels, info.weights);
         let order = stable_order(labels);
         match weights {
             None => {
@@ -388,12 +384,8 @@ impl Objective for Expectile {
         super::check_label_width(info, 1)
     }
 
-    fn base_margins(
-        &self,
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        _group: Option<&crate::data::GroupInfo>,
-    ) -> Vec<f32> {
+    fn base_margins_info(&self, info: &crate::data::MetaInfo) -> Vec<f32> {
+        let (labels, weights) = (info.labels, info.weights);
         let k = self.alpha.len();
         let mean = weighted_label_mean(labels, weights);
         let mut gpair = Vec::with_capacity(labels.len() * k);

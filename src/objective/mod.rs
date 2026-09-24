@@ -281,31 +281,37 @@ pub trait Objective: Send + Sync {
     /// identity (used by squared-error regression).
     fn pred_transform(&self, _preds: &mut [f32]) {}
 
-    /// Estimate the per-output intercepts in *margin* space from the training
-    /// labels; used to initialize the model's `base_score` when the user does
-    /// not supply one. Returns exactly [`Objective::n_outputs`] values.
-    ///
-    /// The default is XGBoost's `FitIntercept::InitEstimation`: one Newton
-    /// step from all-zero margins, `w_k = -Σg_k / max(Σh_k, 1e-6)` (sums in
-    /// `f64`, step rounded to `f32`), mapped through
-    /// [`Objective::pred_transform`] and back through
-    /// [`Objective::probs_to_margins`] to reproduce XGBoost's `f32` rounding.
-    /// Objectives whose optimal constant has a closed form (label mean, class
-    /// frequencies) override it.
+    /// Estimate the per-output intercepts in *margin* space from bare
+    /// training labels, weights, and groups: a convenience that forwards
+    /// single-target metadata ([`MetaInfo::new`]) to
+    /// [`Objective::base_margins_info`]. Returns exactly
+    /// [`Objective::n_outputs`] values. Training never calls it, so override
+    /// [`Objective::base_margins_info`] rather than this method.
     fn base_margins(
         &self,
         labels: &[f32],
         weights: Option<&[f32]>,
         group: Option<&crate::data::GroupInfo>,
     ) -> Vec<f32> {
-        newton_intercepts(self, &MetaInfo::new(labels, weights, group))
+        self.base_margins_info(&MetaInfo::new(labels, weights, group))
     }
 
-    /// Estimate the per-output intercepts from a dataset's full metadata
-    /// view; the entry point training uses. The default forwards to
-    /// [`Objective::base_margins`].
+    /// Estimate the per-output intercepts in *margin* space from a dataset's
+    /// full metadata view; the entry point training uses to initialize the
+    /// model's `base_score` when the user does not supply one. Returns
+    /// exactly [`Objective::n_outputs`] values.
+    ///
+    /// The default is XGBoost's `FitIntercept::InitEstimation`: one Newton
+    /// step from all-zero margins over [`Objective::gradient_info`] on `info`
+    /// itself (so label bounds and label matrices reach the gradient),
+    /// `w_k = -Σg_k / max(Σh_k, 1e-6)` (sums in `f64`, step rounded to
+    /// `f32`), mapped through [`Objective::pred_transform`] and back through
+    /// [`Objective::probs_to_margins`] to reproduce XGBoost's `f32` rounding;
+    /// `NaN` intercepts (which training refuses) when `info`'s lengths are
+    /// inconsistent. Objectives whose optimal constant has a closed form
+    /// (label mean, class frequencies) override it.
     fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
-        self.base_margins(info.labels, info.weights, info.group)
+        newton_intercepts(self, info)
     }
 
     /// Transform raw margins into the values evaluation metrics receive
@@ -403,11 +409,19 @@ pub trait Objective: Send + Sync {
 /// [`Objective::probs_to_margins`]. XGBoost (`FitIntercept::InitEstimation` +
 /// `tree::FitStump`) stores the intercept in prediction space and re-applies
 /// the link on use; taking the same round trip reproduces its `f32` rounding.
+/// `NaN` for every output when `info` fails [`MetaInfo::check_layout`] or
+/// the margin buffer would overflow, before anything is allocated.
 pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &MetaInfo) -> Vec<f32> {
     let k = objective.n_outputs();
-    let n = info.n_rows;
-    let zeros = vec![0.0f32; n * k];
-    let mut gpair = vec![GradPair::default(); n * k];
+    let Some(len) = info
+        .n_rows
+        .checked_mul(k)
+        .filter(|_| info.check_layout().is_ok())
+    else {
+        return vec![f32::NAN; k];
+    };
+    let zeros = vec![0.0f32; len];
+    let mut gpair = vec![GradPair::default(); len];
     objective.gradient_info(&zeros, info, &mut gpair);
     let mut out = fit_stump(&gpair, k);
     objective.pred_transform(&mut out);
@@ -613,6 +627,48 @@ mod tests {
         let expected = obj.prob_to_margin(through_link[0]);
         assert_eq!(margins[0], expected);
         assert!((margins[0] + 0.4).abs() < 1e-6, "got {}", margins[0]);
+    }
+
+    /// An objective that learns from label bounds through `gradient_info`
+    /// only: the default `base_margins_info` must take its Newton step on
+    /// the dataset's own metadata (it once rebuilt label-only metadata, so
+    /// the gradient saw no bounds), and give NaN, not a panic, for a
+    /// `n_targets` the lengths do not match.
+    #[test]
+    fn default_intercept_reads_the_original_metadata() {
+        struct Midpoint;
+        impl Objective for Midpoint {
+            fn name(&self) -> &'static str {
+                "test:midpoint"
+            }
+            fn gradient(&self, _: &[f32], _: &[f32], _: Option<&[f32]>, out: &mut [GradPair]) {
+                out.fill(GradPair::new(f32::NAN, 1.0));
+            }
+            fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
+                let (Some(lo), Some(hi)) = (info.label_lower_bound, info.label_upper_bound) else {
+                    return self.gradient(preds, info.labels, info.weights, out);
+                };
+                for (i, g) in out.iter_mut().enumerate() {
+                    *g = GradPair::new(preds[i] - f32::midpoint(lo[i], hi[i]), 1.0);
+                }
+            }
+            fn default_metric(&self) -> String {
+                "rmse".to_string()
+            }
+        }
+        let (lower, upper) = ([0.0f32, 4.0], [2.0f32, 6.0]);
+        let info = MetaInfo {
+            n_rows: 2,
+            label_lower_bound: Some(&lower),
+            label_upper_bound: Some(&upper),
+            ..MetaInfo::new(&[], None, None)
+        };
+        assert_eq!(Midpoint.base_margins_info(&info), vec![3.0]);
+        let inconsistent = MetaInfo {
+            n_targets: usize::MAX,
+            ..info
+        };
+        assert!(Midpoint.base_margins_info(&inconsistent)[0].is_nan());
     }
 
     #[test]

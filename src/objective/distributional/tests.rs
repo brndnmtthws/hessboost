@@ -825,6 +825,25 @@ fn count_cdfs_are_one_at_infinity() {
     }
 }
 
+/// Count quantiles beyond `2^53`, where adjacent floats are more than 1
+/// apart, still terminate (the bisection once looped forever when the
+/// floored midpoint fell back onto `lo`) and bracket `p`.
+#[test]
+fn count_quantiles_terminate_past_integer_precision() {
+    let poisson = Dist::new(DistFamily::Poisson, &[1e20]).unwrap();
+    let median = poisson.quantile(0.5);
+    assert!((median - 1e20).abs() < 1e11, "{median}");
+    for dist in [
+        poisson,
+        Dist::new(DistFamily::NegativeBinomial, &[1e20, 1e3]).unwrap(),
+    ] {
+        for p in [1e-6, 0.3, 0.5, 0.9] {
+            let q = dist.quantile(p);
+            assert!(q.is_finite() && dist.cdf(q) >= p, "{dist:?} p={p}: {q}");
+        }
+    }
+}
+
 /// A Gamma quantile far in the lower tail: the Halley iteration must not
 /// start from a floor such as `1e-3` (100 steps from there stop at
 /// `1.9e-51`, CDF `1.9e-102`). For shape 2, `P(2, x) = x²/2 (1 + O(x))`, so

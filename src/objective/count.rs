@@ -31,13 +31,8 @@ macro_rules! log_link_objective {
             base_score.ln()
         }
 
-        fn base_margins(
-            &self,
-            labels: &[f32],
-            weights: Option<&[f32]>,
-            _group: Option<&crate::data::GroupInfo>,
-        ) -> Vec<f32> {
-            vec![self.prob_to_margin(weighted_label_mean(labels, weights))]
+        fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+            vec![self.prob_to_margin(weighted_label_mean(info.labels, info.weights))]
         }
     };
 }

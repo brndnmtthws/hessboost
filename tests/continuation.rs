@@ -1,7 +1,7 @@
 //! Continued training, `process_type=update`, `num_parallel_tree` forests,
 //! model slicing and iteration-range prediction.
 
-use hessboost::config::{BoosterKind, ProcessType, TreeMethod};
+use hessboost::config::{BoosterKind, GrowPolicy, ProcessType, SamplingMethod, TreeMethod};
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
 use std::ops::Bound;
 
@@ -331,11 +331,14 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     assert_eq!(invalid_param(train(&update, &d, 1)), "process_type");
 }
 
-/// The refresh updater keeps the splits and recomputes constant leaves from
-/// full-precision gradients only: a model with linear leaves, or a refresh
-/// configured with linear leaves, path smoothing, quantized gradients, or
-/// split-search options (`extra_trees`, reuse penalties), is refused instead
-/// of silently refreshing to a different model or ignoring the option.
+/// The refresh updater keeps the splits, sums every row, and recomputes
+/// constant leaves from full-precision gradients only: a model with linear
+/// leaves, or a refresh configured with anything refresh does not read
+/// (linear leaves, path smoothing, quantized gradients, split-search
+/// options, row or column sampling, symmetric growth, DART dropout), is
+/// refused instead of silently refreshing to a different model or ignoring
+/// the option. XGBoost's tree-shape settings, which describe the refreshed
+/// trees, are accepted as XGBoost's refresh updater accepts them.
 #[test]
 fn refresh_refuses_options_it_cannot_apply() {
     let d = regression(300, 0.0);
@@ -357,15 +360,44 @@ fn refresh_refuses_options_it_cannot_apply() {
         update().extra_trees(true),
         update().toad_penalty_feature(1.0),
         update().toad_penalty_threshold(0.5),
+        // Refresh sums every row over every existing split: it samples
+        // neither rows nor columns and grows nothing.
+        update().subsample(0.5),
+        update()
+            .sampling_method(SamplingMethod::GradientBased)
+            .subsample(0.25),
+        update().colsample_bytree(0.5),
+        update().colsample_bynode(0.5),
+        update().grow_policy(GrowPolicy::Symmetric),
+        update().rate_drop(0.5),
     ] {
         assert!(refused(&params.build().unwrap(), &plain));
     }
-    assert!(
-        Trainer::new(&update().build().unwrap(), &d, 2)
-            .init_model(&plain)
-            .train()
-            .is_ok()
-    );
+    for params in [
+        update(),
+        update()
+            .tree_method(TreeMethod::Approx)
+            .max_depth(5)
+            .max_leaves(8)
+            .grow_policy(GrowPolicy::LossGuide)
+            .min_child_weight(2.0)
+            .gamma(0.5)
+            .max_bin(64)
+            .interaction_constraints(vec![vec![0, 1]])
+            .lambda(2.0)
+            .alpha(0.5)
+            .eta(0.1)
+            .nthread(2)
+            .seed(99),
+    ] {
+        let params = params.build().unwrap();
+        assert!(
+            Trainer::new(&params, &d, 2)
+                .init_model(&plain)
+                .train()
+                .is_ok()
+        );
+    }
 }
 
 #[test]

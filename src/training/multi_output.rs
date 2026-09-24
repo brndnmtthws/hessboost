@@ -126,7 +126,7 @@ pub(super) fn boost_round(
         .map(|_| sample_rows(n, params, &mut rng))
         .collect();
     for rows in &row_subsets {
-        let (tree, leaf_rows) = fit_tree(ctx, gpair, split.as_ref(), &mut rng, rows, n_out);
+        let (tree, leaf_rows) = fit_tree(ctx, gpair, split.as_ref(), &mut rng, rows, n_out)?;
         // DART's gradients come from the ensemble, not the margin caches
         // (`finish_dart` recomputes the eval ones).
         if dropped.is_none() {
@@ -159,11 +159,11 @@ fn fit_tree(
     rng: &mut Rng,
     rows: &[u32],
     n_out: usize,
-) -> (RegTree, Vec<LeafRows>) {
+) -> Result<(RegTree, Vec<LeafRows>)> {
     let params = ctx.run.params;
     let (split_gpair, n_split) = split.map_or((gpair, n_out), |s| (&s.gpair[..], s.n_targets));
     let sampled = if gradient_sampling(params) {
-        gradient_based_sample(split_gpair, n_split, params.subsample, rng)
+        gradient_based_sample(split_gpair, n_split, params.subsample, rng)?
     } else {
         None
     };
@@ -186,7 +186,7 @@ fn fit_tree(
     let (mut tree, leaf_rows) =
         MultiTreeBuilder::new(params).build(ctx.ghist, &grad, rows, &mut sampler);
     tree.scale_leaves(tree_eta(params));
-    (tree, leaf_rows)
+    Ok((tree, leaf_rows))
 }
 
 /// Add a vector-leaf tree's leaf vector to every row's margins (`[row][k]`).

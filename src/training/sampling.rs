@@ -15,11 +15,16 @@
 //!    Dropped rows contribute nothing.
 //!
 //! Arithmetic mirrors upstream in `f32` (including the sequential running
-//! sum). The random stream is hessboost's own: one `u64` seed per call from the
-//! caller's RNG, then one uniform draw per row from a stream fixed per block of
-//! [`BLOCK_ROWS`] rows, so the sample does not depend on the thread count.
+//! sum). Where that overflows (finite gradients whose squares or sums exceed
+//! `f32`, e.g. from labels near `1e20`), `r` and `u` are recomputed from
+//! gradients scaled by a power of two, which leaves every ratio `r_i / u`
+//! exact; non-finite gradients, or rescaled ones that overflow, are an error.
+//! The random stream is hessboost's own: one `u64` seed per call from the
+//! caller's RNG, then one uniform draw per row from a stream fixed per block
+//! of [`BLOCK_ROWS`] rows, so the sample does not depend on the thread count.
 
 use crate::K_RT_EPS_F32;
+use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::rng::{GOLDEN, Rng};
 use rayon::prelude::*;
@@ -62,35 +67,39 @@ impl GradientSample {
 
 /// Sample the rows of `gpair` (row-major, `n_targets` pairs per row) for one
 /// tree. Returns `None` when `trunc(n * subsample) >= n`, i.e. XGBoost would
-/// not sample at all; the caller then uses every row unchanged.
+/// not sample at all; the caller then uses every row unchanged. Fails when a
+/// gradient or Hessian is not finite, or when rescaling a kept row by its
+/// inclusion probability overflows `f32`.
 pub(crate) fn gradient_based_sample(
     gpair: &[GradPair],
     n_targets: usize,
     subsample: f64,
     rng: &mut Rng,
-) -> Option<GradientSample> {
+) -> Result<Option<GradientSample>> {
     debug_assert!(n_targets >= 1 && gpair.len().is_multiple_of(n_targets));
     let n = gpair.len() / n_targets;
     let budget = (n as f32 * subsample as f32) as usize;
     if n == 0 || budget >= n {
-        return None;
+        return Ok(None);
     }
     let seed = rng.next_u64();
     if budget == 0 {
         // An empty budget keeps nothing (upstream zeroes every pair).
-        return Some(GradientSample {
+        return Ok(Some(GradientSample {
             rows: Vec::new(),
             gpair: vec![GradPair::default(); gpair.len()],
             probability: Vec::new(),
-        });
+        }));
     }
 
-    let reg_abs_grad: Vec<f32> = gpair
-        .par_chunks(n_targets)
-        .with_min_len(BLOCK_ROWS)
-        .map(regularized_abs_grad)
-        .collect();
-    let threshold = threshold(&reg_abs_grad, budget);
+    // XGBoost's `f32` arithmetic, unless it overflows.
+    let (reg_abs_grad, threshold) =
+        if let Some(stats) = sampling_statistics(gpair, n_targets, budget, 1.0) {
+            stats
+        } else {
+            let scale = overflow_scale(gpair)?;
+            sampling_statistics(gpair, n_targets, budget, scale).ok_or_else(non_finite)?
+        };
 
     let blocks: Vec<(Vec<u32>, Vec<f32>, Vec<GradPair>)> = gpair
         .par_chunks(BLOCK_ROWS * n_targets)
@@ -128,11 +137,63 @@ pub(crate) fn gradient_based_sample(
         probability.extend(block_p);
         out.extend(block_pairs);
     }
-    Some(GradientSample {
+    if !out.iter().all(|g| g.grad.is_finite() && g.hess.is_finite()) {
+        return Err(non_finite());
+    }
+    Ok(Some(GradientSample {
         rows,
         gpair: out,
         probability,
-    })
+    }))
+}
+
+/// The regularized absolute gradients of `gpair` scaled by `scale`, and
+/// their threshold for `budget`, or `None` when either is not finite.
+fn sampling_statistics(
+    gpair: &[GradPair],
+    n_targets: usize,
+    budget: usize,
+    scale: f32,
+) -> Option<(Vec<f32>, f32)> {
+    let reg_abs_grad: Vec<f32> = gpair
+        .par_chunks(n_targets)
+        .with_min_len(BLOCK_ROWS)
+        .map(|row| regularized_abs_grad(row, scale))
+        .collect();
+    if !reg_abs_grad.iter().all(|r| r.is_finite()) {
+        return None;
+    }
+    let threshold = threshold(&reg_abs_grad, budget);
+    threshold.is_finite().then_some((reg_abs_grad, threshold))
+}
+
+/// The power of two that brings the largest gradient or Hessian magnitude
+/// of `gpair` to at most `1`, so neither the squares nor the sums over rows
+/// of the scaled regularized gradients overflow. Scaling by a power of two
+/// is exact, so every ratio `r_i / u` is the one unbounded `f32` would give
+/// (up to underflow of values `2^-126` below the largest). Fails for a
+/// non-finite value.
+fn overflow_scale(gpair: &[GradPair]) -> Result<f32> {
+    let mut largest = 0.0f32;
+    for g in gpair {
+        if !(g.grad.is_finite() && g.hess.is_finite()) {
+            return Err(non_finite());
+        }
+        largest = largest.max(g.grad.abs()).max(g.hess.abs());
+    }
+    // `largest < 2^128`, so the exponent is at most 128 and `2^-exponent`
+    // (subnormal only at 128) is exact.
+    let exponent = largest.log2().ceil().max(0.0) as i32;
+    Ok(2.0f32.powi(-exponent))
+}
+
+/// The error for gradients the sample cannot be computed from.
+fn non_finite() -> HessboostError {
+    HessboostError::invalid_param(
+        "sampling_method",
+        "`gradient_based` sampling needs finite gradients and Hessians whose rescaled \
+         values stay finite in f32; the objective produced values that do not",
+    )
 }
 
 /// The seed of one row block's random stream.
@@ -140,10 +201,12 @@ fn block_seed(seed: u64, block: usize) -> u64 {
     seed ^ (block as u64 + 1).wrapping_mul(GOLDEN)
 }
 
-/// A row's regularized absolute gradient `sqrt(sum_t(g_t^2 + 0.1 * h_t^2))`.
-fn regularized_abs_grad(row: &[GradPair]) -> f32 {
+/// A row's regularized absolute gradient `sqrt(sum_t(g_t^2 + 0.1 * h_t^2))`,
+/// of the pairs scaled by `scale` (`1` reproduces XGBoost exactly).
+fn regularized_abs_grad(row: &[GradPair], scale: f32) -> f32 {
     let sum_sq = row.iter().fold(0.0f32, |acc, g| {
-        acc + (g.grad * g.grad + MVS_LAMBDA * (g.hess * g.hess))
+        let (grad, hess) = (g.grad * scale, g.hess * scale);
+        acc + (grad * grad + MVS_LAMBDA * (hess * hess))
     });
     sum_sq.sqrt()
 }
@@ -188,10 +251,9 @@ fn threshold(reg_abs_grad: &[f32], budget: usize) -> f32 {
 }
 
 /// XGBoost `SamplingProbability`: `r / u`, with `|u|` floored at `kRtEps`.
+/// Upstream's `0` for an infinite `u` is unreachable here:
+/// [`sampling_statistics`] only yields finite thresholds.
 fn probability(threshold: f32, reg_abs_grad: f32) -> f32 {
-    if threshold.is_infinite() {
-        return 0.0;
-    }
     let u = if threshold.abs() < K_RT_EPS_F32 {
         K_RT_EPS_F32.copysign(threshold)
     } else {
@@ -226,7 +288,9 @@ mod tests {
     }
 
     fn rag(g: &[GradPair], n_targets: usize) -> Vec<f32> {
-        g.chunks(n_targets).map(regularized_abs_grad).collect()
+        g.chunks(n_targets)
+            .map(|row| regularized_abs_grad(row, 1.0))
+            .collect()
     }
 
     #[test]
@@ -250,16 +314,26 @@ mod tests {
     fn full_budget_does_not_sample() {
         let g = gradients(100, 1, 1);
         let mut rng = Rng::new(0);
-        assert!(gradient_based_sample(&g, 1, 1.0, &mut rng).is_none());
+        assert!(
+            gradient_based_sample(&g, 1, 1.0, &mut rng)
+                .unwrap()
+                .is_none()
+        );
         // 3 rows * 0.999 = 2.997 -> 2 rows: sampling happens.
-        assert!(gradient_based_sample(&g[..3], 1, 0.999, &mut rng).is_some());
+        assert!(
+            gradient_based_sample(&g[..3], 1, 0.999, &mut rng)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn empty_budget_keeps_nothing() {
         let g = gradients(3, 1, 1);
         let mut rng = Rng::new(0);
-        let s = gradient_based_sample(&g, 1, 0.3, &mut rng).unwrap();
+        let s = gradient_based_sample(&g, 1, 0.3, &mut rng)
+            .unwrap()
+            .unwrap();
         assert!(s.rows.is_empty());
         assert!(s.gpair.iter().all(|p| *p == GradPair::default()));
     }
@@ -281,7 +355,9 @@ mod tests {
         let (mut kept, mut grad_sum, mut hess_sum) = (0usize, 0.0f64, 0.0f64);
         let mut rng = Rng::new(5);
         for _ in 0..trials {
-            let s = gradient_based_sample(&g, 1, 0.3, &mut rng).unwrap();
+            let s = gradient_based_sample(&g, 1, 0.3, &mut rng)
+                .unwrap()
+                .unwrap();
             kept += s.rows.len();
             for &row in &s.rows {
                 hits[row as usize] += 1;
@@ -329,7 +405,9 @@ mod tests {
         g[1500] = GradPair::new(-3e4, 2.0);
         let mut rng = Rng::new(9);
         for _ in 0..20 {
-            let s = gradient_based_sample(&g, 1, 0.2, &mut rng).unwrap();
+            let s = gradient_based_sample(&g, 1, 0.2, &mut rng)
+                .unwrap()
+                .unwrap();
             for row in [7usize, 1500] {
                 assert!(s.rows.contains(&(row as u32)));
                 assert_eq!(s.gpair[row], g[row]);
@@ -343,7 +421,9 @@ mod tests {
     fn multi_target_rows_share_one_decision() {
         let g = gradients(3000, 3, 4);
         let mut rng = Rng::new(1);
-        let s = gradient_based_sample(&g, 3, 0.4, &mut rng).unwrap();
+        let s = gradient_based_sample(&g, 3, 0.4, &mut rng)
+            .unwrap()
+            .unwrap();
         let r = rag(&g, 3);
         let u = threshold(&r, (3000f32 * 0.4f32) as usize);
         let mut kept = vec![false; 3000];
@@ -375,14 +455,53 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let mut rng = Rng::new(42);
-                let s = gradient_based_sample(&g, 1, 0.35, &mut rng).unwrap();
+                let s = gradient_based_sample(&g, 1, 0.35, &mut rng)
+                    .unwrap()
+                    .unwrap();
                 (s.rows, s.gpair)
             })
         };
         let serial = run(1);
         assert_eq!(serial, run(4));
         let mut other = Rng::new(43);
-        let different = gradient_based_sample(&g, 1, 0.35, &mut other).unwrap();
+        let different = gradient_based_sample(&g, 1, 0.35, &mut other)
+            .unwrap()
+            .unwrap();
         assert_ne!(serial.0, different.rows, "the seed drives the sample");
+    }
+
+    /// Finite gradients whose squares overflow `f32` sample exactly like the
+    /// same gradients at an ordinary scale: the same rows with the same
+    /// probabilities, and the rescaled pairs scaled back up.
+    #[test]
+    fn overflowing_gradients_sample_like_scaled_down_ones() {
+        let g = gradients(3000, 2, 6);
+        let big: Vec<GradPair> = g
+            .iter()
+            .map(|p| GradPair::new(p.grad * 2f32.powi(70), p.hess * 2f32.powi(70)))
+            .collect();
+        assert!(rag(&big, 2).iter().any(|r| r.is_infinite()));
+        let s = gradient_based_sample(&g, 2, 0.3, &mut Rng::new(3))
+            .unwrap()
+            .unwrap();
+        let b = gradient_based_sample(&big, 2, 0.3, &mut Rng::new(3))
+            .unwrap()
+            .unwrap();
+        assert!(!s.rows.is_empty());
+        assert_eq!(b.rows, s.rows);
+        assert_eq!(b.probability, s.probability);
+        for (bp, sp) in b.gpair.iter().zip(&s.gpair) {
+            assert_eq!(bp.grad, sp.grad * 2f32.powi(70));
+            assert_eq!(bp.hess, sp.hess * 2f32.powi(70));
+        }
+    }
+
+    #[test]
+    fn non_finite_gradients_are_an_error() {
+        let mut g = gradients(100, 1, 1);
+        for bad in [f32::INFINITY, f32::NAN] {
+            g[17] = GradPair::new(bad, 1.0);
+            assert!(gradient_based_sample(&g, 1, 0.5, &mut Rng::new(0)).is_err());
+        }
     }
 }

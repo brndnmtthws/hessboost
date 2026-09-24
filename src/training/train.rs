@@ -147,22 +147,22 @@ impl Prepared {
         gpair: &mut [GradPair],
         gpair_k: &mut [GradPair],
         n_out: usize,
-    ) {
+    ) -> Result<()> {
         let TrainContext {
             params,
-            dtrain,
             info,
             objective,
+            ..
         } = *run;
-        let Prepared::Approx {
-            const_hess: true,
-            cached,
-        } = self
-        else {
-            return;
-        };
-        if !gradient_sampling(params) {
-            return;
+        let const_hess_approx = matches!(
+            self,
+            Prepared::Approx {
+                const_hess: true,
+                ..
+            }
+        );
+        if !const_hess_approx || !gradient_sampling(params) {
+            return Ok(());
         }
         // Iteration 0's draws before its first sample: a DART round first
         // draws its skip variate (`select_dropout` over an empty ensemble
@@ -177,9 +177,29 @@ impl Prepared {
         };
         objective.gradient_info(margin0, info, gpair);
         let g0 = gather_output(gpair, gpair_k, n_out, 0);
-        let sampled = gradient_based_sample(g0, 1, params.subsample, &mut rng);
+        let sampled = gradient_based_sample(g0, 1, params.subsample, &mut rng)?;
         let g0 = sampled.as_ref().map_or(g0, |s| s.gpair.as_slice());
-        cached.get_or_init(|| approx_index(params, dtrain, g0, true));
+        self.fill_approx_cache(run, g0);
+        Ok(())
+    }
+
+    /// Build the constant-Hessian `approx` cache from `gpair`, the gradients
+    /// its first tree reads, unless it is already built (a no-op for every
+    /// other builder). The first tree of a run is output 0's, so the parallel
+    /// slot loop calls this with output 0's gradients before growing trees
+    /// for several outputs at once: whichever tree ran first would otherwise
+    /// pick the cuts, and a custom objective's constant Hessians may differ
+    /// by output. XGBoost 3.4.2 likewise keeps the first gradient index its
+    /// training matrix builds (`BatchParam::regen` is false), whichever
+    /// output group later reads it.
+    fn fill_approx_cache(&self, run: &TrainContext, gpair: &[GradPair]) {
+        if let Prepared::Approx {
+            const_hess: true,
+            cached,
+        } = self
+        {
+            cached.get_or_init(|| approx_index(run.params, run.dtrain, gpair, true));
+        }
     }
 }
 
@@ -436,7 +456,14 @@ impl<'a> Trainer<'a> {
     /// iteration `i`'s trees from the gradients of the already refreshed
     /// iterations. The result holds exactly the `num_boost_round` refreshed
     /// iterations (at most the model's count), as in XGBoost. Update mode
-    /// needs a gbtree model without DART weights and no monotone constraints.
+    /// needs a gbtree model without DART weights or linear leaves, no
+    /// monotone constraints, and no feature weights on `dtrain`; settings
+    /// refresh does not read (row and column sampling, symmetric growth,
+    /// DART dropout, the beyond-XGBoost tree options) must keep their
+    /// defaults, while XGBoost's tree-shape settings (`tree_method`,
+    /// `max_depth`, `min_child_weight`, ...) are accepted.
+    ///
+    /// The model must be structurally valid, as every loaded model is.
     #[must_use]
     pub fn init_model(mut self, model: &'a BoostedModel) -> Self {
         self.init_model = Some(model);
@@ -454,18 +481,41 @@ impl<'a> Trainer<'a> {
         };
         let params = self.params;
         let result = with_thread_pool(params, || train_impl(self, objective))?;
-        // What training returns must load again. Arithmetic that overflows
-        // `f32` (from extreme labels, weights, or margins) leaves non-finite
-        // values the model formats refuse; report it here, not at load time.
-        result.model.validate_structure().map_err(|e| {
-            let reason = match e {
-                HessboostError::ModelFormat(reason) => reason,
-                other => other.to_string(),
-            };
-            HessboostError::model_format(format!("training produced an invalid model: {reason}"))
-        })?;
+        validate_trained_model(&result.model)?;
         Ok(result)
     }
+}
+
+/// Check that a freshly trained model would load again. Arithmetic that
+/// overflows `f32` (from extreme labels, weights, or margins) leaves
+/// non-finite values the model formats refuse; report it when training
+/// returns, not at load time.
+pub(crate) fn validate_trained_model(model: &BoostedModel) -> Result<()> {
+    model.validate_structure().map_err(|e| {
+        let reason = match e {
+            HessboostError::ModelFormat(reason) => reason,
+            other => other.to_string(),
+        };
+        HessboostError::model_format(format!("training produced an invalid model: {reason}"))
+    })
+}
+
+/// Refuse a `num_class >= 2` that differs from `objective`'s output count:
+/// saved models require the two to agree, so a `num_class` the objective
+/// does not use would train an unloadable model.
+pub(crate) fn check_num_class(params: &TrainingParams, objective: &dyn Objective) -> Result<()> {
+    let n_out = objective.n_outputs();
+    if params.num_class >= 2 && params.num_class != n_out {
+        return Err(HessboostError::invalid_param(
+            "num_class",
+            format!(
+                "objective `{}` has {n_out} outputs, so num_class {} does not apply to it",
+                objective.name(),
+                params.num_class
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Run `train` on a dedicated pool of `params.nthread` threads, or on the
@@ -539,18 +589,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
-    // Saved models require `num_class >= 2` to equal the output count, so a
-    // `num_class` the objective does not use would train an unloadable model.
-    if params.num_class >= 2 && params.num_class != n_out {
-        return Err(HessboostError::invalid_param(
-            "num_class",
-            format!(
-                "objective `{}` has {n_out} outputs, so num_class {} does not apply to it",
-                objective.name(),
-                params.num_class
-            ),
-        ));
-    }
+    check_num_class(params, objective)?;
     validate_dataset(
         objective,
         dtrain,
@@ -580,6 +619,22 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                 index: feature as usize,
                 num_features: n_features,
             });
+        }
+    }
+    // Feature weights only steer the tree builders' column sampling, which
+    // neither the linear booster nor the refresh updater performs.
+    if dtrain.feature_weights().is_some() {
+        if params.booster == BoosterKind::GbLinear {
+            return Err(HessboostError::invalid_param(
+                "feature_weights",
+                "gblinear does not sample columns",
+            ));
+        }
+        if params.process_type == ProcessType::Update {
+            return Err(HessboostError::invalid_param(
+                "feature_weights",
+                "`process_type=update` does not sample columns",
+            ));
         }
     }
 
@@ -710,7 +765,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
             &mut gpair,
             &mut gpair_k,
             n_out,
-        );
+        )?;
     }
     let mut history: Vec<RoundEval> = Vec::new();
 
@@ -822,6 +877,8 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                     && params.device == Device::Cpu
                     && rayon::current_num_threads() > 1
                 {
+                    // The first tree's cuts, before any tree reads them.
+                    prepared.fill_approx_cache(&run, gather_output(&gpair, &mut gpair_k, n_out, 0));
                     let draws: Vec<(ColumnSampler, u64)> = slots
                         .iter()
                         .map(|_| {
@@ -866,7 +923,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                                 reuse.as_mut(),
                             )
                         })
-                        .collect()
+                        .collect::<Result<_>>()?
                 };
 
                 for (slot, (tree, leaf_rows)) in slots.iter().zip(trees) {
@@ -1265,7 +1322,7 @@ fn fit_output_tree(
     rng: &mut Rng,
     forest_sample: &mut Option<GradientSample>,
     reuse: Option<&mut ReuseSet>,
-) -> (RegTree, Vec<LeafRows>) {
+) -> Result<(RegTree, Vec<LeafRows>)> {
     let TrainContext { params, dtrain, .. } = *grow.run;
     let (prepared, n_out) = (grow.prepared, grow.n_out);
     let gk: &[GradPair] = gather_output(grow.gpair, scratch, n_out, slot.output);
@@ -1274,11 +1331,11 @@ fn fit_output_tree(
         None
     } else if prepared.samples_per_forest() {
         if slot.parallel == 0 {
-            *forest_sample = gradient_based_sample(gk, 1, params.subsample, rng);
+            *forest_sample = gradient_based_sample(gk, 1, params.subsample, rng)?;
         }
         forest_sample.as_ref()
     } else {
-        own = gradient_based_sample(gk, 1, params.subsample, rng);
+        own = gradient_based_sample(gk, 1, params.subsample, rng)?;
         own.as_ref()
     };
     let (gk, rows) = match sampled {
@@ -1288,7 +1345,14 @@ fn fit_output_tree(
     let mut sampler = make_column_sampler(dtrain, params, rng);
     let rounding_seed = quantization_seed(params, rng);
     let sample = TreeSample { gpair: gk, rows };
-    grow_sampled_tree(grow, slot, sample, &mut sampler, rounding_seed, reuse)
+    Ok(grow_sampled_tree(
+        grow,
+        slot,
+        sample,
+        &mut sampler,
+        rounding_seed,
+        reuse,
+    ))
 }
 
 /// The part of [`fit_output_tree`] after its RNG draws: build the tree on
@@ -1350,15 +1414,17 @@ pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut Rng) -> V
 
 /// One iteration's uniform row subsets, drawn before its trees: one per
 /// parallel tree, or a single subset for the whole forest under `approx`
-/// ([`Prepared::samples_per_forest`]). Parallel tree `p` uses entry
-/// `p % len`, shared across its per-output fits.
+/// ([`Prepared::samples_per_forest`]) or when there is no uniform sampling
+/// (every tree then reads all rows, and [`sample_rows`] draws nothing).
+/// Parallel tree `p` uses entry `p % len`, shared across its per-output fits.
 fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
     prepared: &Prepared,
     rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
-    let draws = if prepared.samples_per_forest() {
+    let uniform = params.subsample < 1.0 && params.sampling_method == SamplingMethod::Uniform;
+    let draws = if prepared.samples_per_forest() || !uniform {
         1
     } else {
         params.num_parallel_tree
@@ -1557,6 +1623,61 @@ mod tests {
                 pool.install(|| update_tree_margins(&tree, &data, &mut actual, outputs, output));
                 assert_eq!(actual, expected);
             }
+        }
+    }
+
+    /// Squared error around `y` with fixed, per-output Hessians: output 0
+    /// weights row 0 heavily, output 1 row 3, so their Hessian-weighted
+    /// `approx` cuts differ.
+    struct PerOutputHessians;
+
+    impl Objective for PerOutputHessians {
+        fn name(&self) -> &'static str {
+            "custom:per_output_hessians"
+        }
+        fn n_outputs(&self) -> usize {
+            2
+        }
+        fn gradient(&self, preds: &[f32], labels: &[f32], _: Option<&[f32]>, out: &mut [GradPair]) {
+            const HESS: [[f32; 4]; 2] = [[100.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 100.0]];
+            for (i, (g, p)) in out.iter_mut().zip(preds).enumerate() {
+                let (row, output) = (i / 2, i % 2);
+                let h = HESS[output][row];
+                *g = GradPair::new(h * (p - labels[row]), h);
+            }
+        }
+        fn const_hess(&self) -> bool {
+            true
+        }
+        fn default_metric(&self) -> String {
+            "rmse".into()
+        }
+    }
+
+    #[test]
+    fn approx_constant_hessian_cuts_do_not_depend_on_thread_count() {
+        // The parallel slot loop grows both outputs' trees at once; the
+        // cached cuts must still come from output 0, as the serial loop's.
+        let d = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 1.0, 2.0, 3.0]);
+        let fit = |nthread: usize| {
+            let params = TrainingParams::builder()
+                .tree_method(TreeMethod::Approx)
+                .max_bin(2)
+                .max_depth(1)
+                .min_child_weight(0.0)
+                .nthread(nthread)
+                .build()
+                .unwrap();
+            let model = Trainer::new(&params, &d, 3)
+                .objective(&PerOutputHessians)
+                .train()
+                .unwrap()
+                .model;
+            model.predict_margin(&d).unwrap()
+        };
+        let serial = fit(1);
+        for _ in 0..32 {
+            assert_eq!(fit(4), serial);
         }
     }
 

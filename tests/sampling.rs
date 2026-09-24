@@ -367,3 +367,48 @@ fn approx_gradient_sampling_continuation_matches_uninterrupted_training() {
         }
     }
 }
+
+/// Labels near `1e20` from a zero margin give finite gradients whose `f32`
+/// squares overflow: the sample still keeps rows by their (equal)
+/// probabilities, so the model moves toward the labels instead of staying
+/// at the intercept.
+#[test]
+fn gradient_based_sampling_survives_overflowing_squares() {
+    let data = labeled_dense(&[0.0; 8], 1, &[1e20; 8]);
+    let params = plain(TreeMethod::Hist, BoosterKind::GbTree)
+        .sampling_method(SamplingMethod::GradientBased)
+        .subsample(0.5)
+        .seed(3)
+        .build()
+        .unwrap();
+    let preds = predictions(&params, &data, 1);
+    assert!(
+        preds.iter().all(|&p| p > 1e19 && p.is_finite()),
+        "{preds:?}"
+    );
+}
+
+/// Feature weights only steer column sampling: training that samples no
+/// columns (the linear booster, the refresh updater) refuses them instead
+/// of ignoring them.
+#[test]
+fn feature_weights_are_refused_where_columns_are_not_sampled() {
+    let data = dataset(200, 3);
+    let weighted = data.clone().with_feature_weights(&[1.0, 2.0, 3.0]).unwrap();
+    let linear = TrainingParams::builder()
+        .booster(BoosterKind::GbLinear)
+        .build()
+        .unwrap();
+    assert_eq!(
+        invalid_param(train(&linear, &weighted, 2)),
+        "feature_weights"
+    );
+    let model = train(&TrainingParams::default(), &data, 2).unwrap();
+    let update = TrainingParams::builder()
+        .process_type(hessboost::config::ProcessType::Update)
+        .build()
+        .unwrap();
+    let refresh = |data: &DMatrix| Trainer::new(&update, data, 2).init_model(&model).train();
+    assert_eq!(invalid_param(refresh(&weighted)), "feature_weights");
+    assert!(refresh(&data).is_ok());
+}

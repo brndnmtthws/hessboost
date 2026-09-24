@@ -19,7 +19,10 @@ pub enum BoosterKind {
     GbTree,
     /// Dropout Additive Regression Trees (XGBoost `dart`).
     Dart,
-    /// Linear booster with coordinate descent (XGBoost `gblinear`).
+    /// Linear booster with coordinate descent (XGBoost `gblinear`). It
+    /// updates from every row and feature and grows no trees, so row and
+    /// column sampling, `num_parallel_tree > 1`, tree constraints, and
+    /// training-matrix feature weights are refused with it.
     GbLinear,
 }
 
@@ -93,6 +96,11 @@ pub enum Device {
 /// depth limit.
 pub const MAX_SYMMETRIC_DEPTH: usize = 16;
 
+/// Largest [`TrainingParams::num_parallel_tree`]: an iteration's forest is
+/// grown and held in memory at once (with one row sample per tree), so the
+/// count is bounded well below what its bookkeeping could address.
+pub(crate) const MAX_NUM_PARALLEL_TREE: usize = 1 << 16;
+
 /// Per-feature monotonicity direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -163,7 +171,13 @@ pub enum ProcessType {
     /// Grow new trees. XGBoost default.
     #[default]
     Default,
-    /// Revisit the trees of an existing model instead of growing new ones.
+    /// Revisit the trees of an existing model instead of growing new ones
+    /// (the refresh updater; see
+    /// [`Trainer::init_model`](crate::training::Trainer::init_model)). It
+    /// keeps every split and sums every row, so settings it does not read
+    /// (row and column sampling, symmetric growth, DART dropout, the
+    /// beyond-XGBoost tree options) and training-matrix feature weights
+    /// must keep their defaults.
     Update,
 }
 
@@ -348,8 +362,8 @@ pub struct TrainingParams {
     /// feature indices permitted to appear together on a single root-to-leaf path.
     /// XGBoost `interaction_constraints`.
     pub interaction_constraints: Vec<Vec<u32>>,
-    /// Trees grown per output per round (boosted random forests; `>= 1`).
-    /// XGBoost `num_parallel_tree`.
+    /// Trees grown per output per round (boosted random forests; in
+    /// `1..=65536`). XGBoost `num_parallel_tree`. `gblinear` needs `1`.
     pub num_parallel_tree: usize,
     /// Row subsampling method. XGBoost `sampling_method`.
     pub sampling_method: SamplingMethod,
@@ -693,9 +707,15 @@ impl TrainingParams {
         )?;
         ensure(
             "num_parallel_tree",
-            self.num_parallel_tree >= 1,
-            "must be >= 1",
+            (1..=MAX_NUM_PARALLEL_TREE).contains(&self.num_parallel_tree),
+            format!(
+                "must be in [1, {MAX_NUM_PARALLEL_TREE}], got {}",
+                self.num_parallel_tree
+            ),
         )?;
+        if self.booster == BoosterKind::GbLinear {
+            self.validate_gblinear()?;
+        }
 
         ensure(
             "max_bin",
@@ -776,6 +796,58 @@ impl TrainingParams {
             )?;
         }
         self.validate_tree_options()
+    }
+
+    /// Refuse the tree-booster settings `gblinear` cannot apply. Coordinate
+    /// descent updates every weight from every row each round, grows no
+    /// trees, and draws nothing at random, so row and column sampling,
+    /// forests, and tree constraints would be silently ignored. Like
+    /// XGBoost, which accepts (with an "unused parameter" warning) whatever
+    /// tree settings it is given, the tree-shape settings whose defaults are
+    /// not neutral (`max_depth`, `min_child_weight`, `max_bin`,
+    /// `tree_method`, `grow_policy`, ...) stay accepted: every configuration
+    /// carries them. The ones refused here default to "off" and are only
+    /// changed to ask for their effect. (The beyond-XGBoost tree options are
+    /// refused by their own checks.)
+    fn validate_gblinear(&self) -> Result<()> {
+        ensure(
+            "num_parallel_tree",
+            self.num_parallel_tree == 1,
+            "gblinear grows no trees, so it cannot grow forests; must be 1",
+        )?;
+        ensure(
+            "subsample",
+            self.subsample == 1.0,
+            "gblinear updates from every row and does not subsample; must be 1",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "gblinear does not sample rows; `gradient_based` needs a tree booster",
+        )?;
+        for (name, ratio) in [
+            ("colsample_bytree", self.colsample_bytree),
+            ("colsample_bylevel", self.colsample_bylevel),
+            ("colsample_bynode", self.colsample_bynode),
+        ] {
+            ensure(
+                name,
+                ratio == 1.0,
+                "gblinear updates every feature and does not sample columns; must be 1",
+            )?;
+        }
+        ensure(
+            "monotone_constraints",
+            self.monotone_constraints
+                .iter()
+                .all(|&m| m == Monotone::None),
+            "gblinear does not apply monotone constraints",
+        )?;
+        ensure(
+            "interaction_constraints",
+            self.interaction_constraints.is_empty(),
+            "gblinear does not apply interaction constraints",
+        )
     }
 
     /// Range and compatibility checks of the opt-in LightGBM tree options
@@ -1195,6 +1267,12 @@ mod tests {
             ),
             ("max_delta_step", b().max_delta_step(-1.0)),
             ("num_parallel_tree", b().num_parallel_tree(0)),
+            // Would overflow the iteration's allocations.
+            ("num_parallel_tree", b().num_parallel_tree(1 << 63)),
+            (
+                "num_parallel_tree",
+                b().num_parallel_tree(MAX_NUM_PARALLEL_TREE + 1),
+            ),
             // Stored with every model, so checked whatever the objective.
             ("quantile_alpha", b().quantile_alpha(vec![0.5, f64::NAN])),
             ("expectile_alpha", b().expectile_alpha(vec![1.5])),
@@ -1361,6 +1439,53 @@ mod tests {
             Some("grow_policy")
         );
         assert!(sym().booster(BoosterKind::Dart).build().is_ok());
+    }
+
+    /// Coordinate descent reads every row and feature and grows no trees:
+    /// sampling, forests, and tree constraints would be silently ignored,
+    /// while the tree-shape settings every configuration carries pass.
+    #[test]
+    fn gblinear_refuses_tree_sampling_forests_and_constraints() {
+        let linear = || TrainingParams::builder().booster(BoosterKind::GbLinear);
+        for (name, builder) in [
+            ("num_parallel_tree", linear().num_parallel_tree(2)),
+            ("subsample", linear().subsample(0.5)),
+            (
+                "sampling_method",
+                linear().sampling_method(SamplingMethod::GradientBased),
+            ),
+            ("colsample_bytree", linear().colsample_bytree(0.5)),
+            ("colsample_bylevel", linear().colsample_bylevel(0.5)),
+            ("colsample_bynode", linear().colsample_bynode(0.5)),
+            (
+                "monotone_constraints",
+                linear().monotone_constraints(vec![Monotone::None, Monotone::Increasing]),
+            ),
+            (
+                "interaction_constraints",
+                linear().interaction_constraints(vec![vec![0, 1]]),
+            ),
+        ] {
+            assert_eq!(rejected(builder), Some(name));
+        }
+        linear()
+            .max_depth(4)
+            .min_child_weight(3.0)
+            .max_bin(64)
+            .tree_method(TreeMethod::Hist)
+            .grow_policy(GrowPolicy::LossGuide)
+            .monotone_constraints(vec![Monotone::None])
+            .build()
+            .unwrap();
+        for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+            TrainingParams::builder()
+                .booster(booster)
+                .num_parallel_tree(2)
+                .subsample(0.5)
+                .colsample_bynode(0.5)
+                .build()
+                .unwrap();
+        }
     }
 
     /// The names model files store are the serde (and XGBoost) spellings,

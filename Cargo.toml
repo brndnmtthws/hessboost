@@ -25,11 +25,11 @@ include = [
 
 [dependencies]
 rayon = "1.12"
-serde = { version = "1.0.229", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
 # `float_roundtrip`: native JSON models store `f64` fields (linear-leaf
 # coefficients, objective parameters), which the default parser can misread
 # by an ulp.
-serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 zstd = { version = "0.14", default-features = false }
 
 [features]
@@ -40,7 +40,7 @@ metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }
-objc2-metal = { version = "0.3.2", default-features = false, features = [
+objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
     "MTLDevice",
     "MTLCommandQueue",

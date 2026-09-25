@@ -605,3 +605,138 @@ fn multiclass_metric_fallback_preserves_ties_and_nonfinite_values() {
     assert_eq!(actual.1, expected.1);
     assert_eq!(actual.0.is_nan(), expected.0.is_nan());
 }
+
+/// The softmax entry points run the architecture's specialized kernel for
+/// every class count it covers, bit for bit, and the scalar rows otherwise.
+#[test]
+fn softmax_dispatch_selects_the_kernel_for_each_class_count() {
+    for num_class in 2..=9usize {
+        let rows = 37;
+        let preds: Vec<f32> = (0..rows * num_class)
+            .map(|i| ((i * 7919) % 211) as f32 / 23.0 - 4.0)
+            .collect();
+        let labels: Vec<f32> = (0..rows).map(|r| (r % num_class) as f32).collect();
+        let weights: Vec<f32> = (0..rows).map(|r| 0.5 + (r % 3) as f32 * 0.25).collect();
+        let mut dispatched = vec![GradPair::default(); preds.len()];
+        softmax_gradient(
+            &preds,
+            &labels,
+            Some(&weights),
+            num_class,
+            1e-16,
+            &mut dispatched,
+        );
+        let mut transformed = preds.clone();
+        softmax_rows_inplace(&mut transformed, num_class);
+
+        let mut expected = vec![GradPair::default(); preds.len()];
+        let mut expected_rows = preds.clone();
+        let mut vector = false;
+        #[cfg(target_arch = "aarch64")]
+        if neon_available() {
+            vector = true;
+            // SAFETY: NEON was detected and the inputs form complete matrices
+            // of `num_class` columns; each kernel matches its class count.
+            unsafe {
+                match num_class {
+                    2 => aarch64::short_softmax_gradient::<2>(
+                        &preds,
+                        &labels,
+                        Some(&weights),
+                        1e-16,
+                        &mut expected,
+                    ),
+                    3 => aarch64::short_softmax_gradient::<3>(
+                        &preds,
+                        &labels,
+                        Some(&weights),
+                        1e-16,
+                        &mut expected,
+                    ),
+                    4 => aarch64::short_softmax_gradient::<4>(
+                        &preds,
+                        &labels,
+                        Some(&weights),
+                        1e-16,
+                        &mut expected,
+                    ),
+                    8.. => aarch64::softmax_gradient(
+                        &preds,
+                        &labels,
+                        Some(&weights),
+                        num_class,
+                        1e-16,
+                        &mut expected,
+                    ),
+                    _ => vector = false,
+                }
+                match num_class {
+                    2 => aarch64::short_softmax_rows::<2>(&mut expected_rows),
+                    3 => aarch64::short_softmax_rows::<3>(&mut expected_rows),
+                    4 => aarch64::short_softmax_rows::<4>(&mut expected_rows),
+                    8.. => aarch64::softmax_rows_inplace(&mut expected_rows, num_class),
+                    _ => {}
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if avx2_fma_available() && (num_class == 2 || num_class == 4) {
+            vector = true;
+            // SAFETY: AVX2/FMA were detected and the inputs form complete
+            // matrices of `num_class` columns; each kernel matches its class
+            // count.
+            unsafe {
+                if num_class == 2 {
+                    x86_64::short_softmax_gradient::<2>(
+                        &preds,
+                        &labels,
+                        Some(&weights),
+                        1e-16,
+                        &mut expected,
+                    );
+                    x86_64::short_softmax_rows::<2>(&mut expected_rows);
+                } else {
+                    x86_64::short_softmax_gradient::<4>(
+                        &preds,
+                        &labels,
+                        Some(&weights),
+                        1e-16,
+                        &mut expected,
+                    );
+                    x86_64::short_softmax_rows::<4>(&mut expected_rows);
+                }
+            }
+        }
+        if !vector {
+            softmax_gradient_rows_scalar(
+                &preds,
+                &labels,
+                Some(&weights),
+                1e-16,
+                &mut expected,
+                0..rows,
+                num_class,
+            );
+            for row in expected_rows.chunks_mut(num_class) {
+                softmax_scalar(row);
+            }
+        }
+        let bits = |pairs: &[GradPair]| -> Vec<(u32, u32)> {
+            pairs
+                .iter()
+                .map(|p| (p.grad.to_bits(), p.hess.to_bits()))
+                .collect()
+        };
+        assert_eq!(
+            bits(&dispatched),
+            bits(&expected),
+            "gradient, {num_class} classes"
+        );
+        let bits = |values: &[f32]| -> Vec<u32> { values.iter().map(|v| v.to_bits()).collect() };
+        assert_eq!(
+            bits(&transformed),
+            bits(&expected_rows),
+            "transform, {num_class} classes"
+        );
+    }
+}

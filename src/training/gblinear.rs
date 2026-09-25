@@ -64,7 +64,7 @@ pub(crate) fn train_gblinear(
     params: &TrainingParams,
     dtrain: &DMatrix,
     num_round: usize,
-    initial_margin: &[f32],
+    initial_margin: Vec<f32>,
     n_out: usize,
     objective: &dyn Objective,
     start: Option<&LinearModel>,
@@ -103,7 +103,7 @@ pub(crate) fn train_gblinear(
 
     // Running margins [instance][output]; gradients recomputed each round, then
     // updated incrementally as each coordinate moves.
-    let mut margin = initial_margin.to_vec();
+    let mut margin = initial_margin;
     let mut gpair = vec![GradPair::default(); n * n_out];
 
     for round in 0..num_round {

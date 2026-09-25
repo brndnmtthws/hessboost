@@ -91,11 +91,22 @@ impl HistCuts {
         hessians: &[f32],
         sorted: bool,
     ) -> Self {
+        Self::from_dmatrix_hessians(data, max_bin, |row| hessians[row], sorted)
+    }
+
+    /// [`Self::from_dmatrix_weighted`] with row `row`'s Hessian read through
+    /// `hessian`, so callers need not collect them.
+    pub(crate) fn from_dmatrix_hessians(
+        data: &DMatrix,
+        max_bin: usize,
+        hessian: impl Fn(usize) -> f32 + Sync,
+        sorted: bool,
+    ) -> Self {
         let weights = data.weights();
         Self::build(
             data,
             max_bin,
-            |row| weights.map_or(hessians[row], |w| hessians[row] * w[row]),
+            |row| weights.map_or(hessian(row), |w| hessian(row) * w[row]),
             Ingest {
                 sorted,
                 unit_weights: false,

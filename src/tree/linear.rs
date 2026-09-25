@@ -32,6 +32,7 @@
 use crate::data::{DMatrix, FeatureType};
 use crate::error::HessboostError;
 use crate::objective::GradPair;
+use crate::tree::builder::LeafRows;
 use crate::tree::regtree::{Node, RegTree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -212,7 +213,6 @@ pub(crate) fn fit_linear_leaves(
     if nodes.len() == 1 {
         return;
     }
-    let features = path_features(nodes, data.feature_types());
     let mut members: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
     let leaves: Vec<u32> = rows
         .par_iter()
@@ -222,13 +222,47 @@ pub(crate) fn fit_linear_leaves(
     for (&r, &leaf) in rows.iter().zip(&leaves) {
         members[leaf as usize].push(r);
     }
+    fit_leaf_members(tree, data, gpair, &members, lambda);
+}
+
+/// [`fit_linear_leaves`] from the rows the tree builder partitioned into
+/// each leaf (ascending, as routing `rows` in order gives them), instead of
+/// routing every row again.
+pub(crate) fn fit_captured_linear_leaves(
+    tree: &mut RegTree,
+    data: &DMatrix,
+    gpair: &[GradPair],
+    leaf_rows: &[LeafRows],
+    lambda: f64,
+) {
+    let n_nodes = tree.num_nodes();
+    if n_nodes == 1 {
+        return;
+    }
+    let mut members: Vec<&[u32]> = vec![&[]; n_nodes];
+    for leaf in leaf_rows {
+        members[leaf.node] = &leaf.rows;
+    }
+    fit_leaf_members(tree, data, gpair, &members, lambda);
+}
+
+/// Fit every leaf's model from its training rows, `members[leaf]`.
+fn fit_leaf_members(
+    tree: &mut RegTree,
+    data: &DMatrix,
+    gpair: &[GradPair],
+    members: &[impl AsRef<[u32]> + Sync],
+    lambda: f64,
+) {
+    let nodes = tree.nodes();
+    let features = path_features(nodes, data.feature_types());
     let models: Vec<(f64, Vec<(u32, f64)>)> = (0..nodes.len())
         .into_par_iter()
         .map(|id| {
             if !nodes[id].is_leaf() {
                 return (0.0, Vec::new());
             }
-            fit_leaf(&features[id], &members[id], data, gpair, lambda)
+            fit_leaf(&features[id], members[id].as_ref(), data, gpair, lambda)
                 .unwrap_or((f64::from(nodes[id].leaf_value), Vec::new()))
         })
         .collect();

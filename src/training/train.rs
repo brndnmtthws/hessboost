@@ -23,6 +23,7 @@ use crate::tree::builder::{
 use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 /// What every boosting round of one training run reads: the parameters, the
 /// training matrix with its metadata, and the objective.
@@ -40,6 +41,11 @@ pub(super) struct TrainContext<'a> {
 struct TreeSample<'a> {
     gpair: &'a [GradPair],
     rows: &'a [u32],
+    /// Under `approx` with per-round cuts, the gradient index that every
+    /// tree of this output's forest builds from these same gradients
+    /// (`None` elsewhere): built before the parallel trees start, or by the
+    /// first tree that needs it on the serial path.
+    forest_index: Option<&'a OnceLock<GHistIndex>>,
 }
 use crate::tree::hist::{CpuBackend, HistogramBackend};
 
@@ -51,6 +57,15 @@ enum Prepared {
     Hist {
         index: GHistIndex,
         backend: Box<dyn HistogramBackend>,
+        /// Every training value was sketched (no row has a zero sample
+        /// weight), so the builder's row partitions equal routing each
+        /// training row through the finished tree by raw value: numeric
+        /// values lie below their feature's last cut, and categorical cuts
+        /// hold every category. A zero-weight row's value can lie beyond the
+        /// last cut, where binning clamps it into the last bin while the tree
+        /// routes it by its threshold, so linear leaves then route instead of
+        /// reading the builder's rows.
+        rows_route_like_trees: bool,
     },
     /// `tree_method=approx`: Hessian-weighted cuts. XGBoost regenerates them
     /// every round from a sorted-column summary unless the objective has a
@@ -60,7 +75,7 @@ enum Prepared {
     /// ([`Prepared::resume_approx_cache`]).
     Approx {
         const_hess: bool,
-        cached: std::sync::OnceLock<GHistIndex>,
+        cached: OnceLock<GHistIndex>,
     },
 }
 
@@ -80,7 +95,11 @@ impl Prepared {
         capture_rows: bool,
     ) -> (RegTree, Vec<LeafRows>) {
         let TrainContext { params, dtrain, .. } = *run;
-        let TreeSample { gpair, rows } = sample;
+        let TreeSample {
+            gpair,
+            rows,
+            forest_index,
+        } = sample;
         let hist = |ghist: &GHistIndex,
                     backend: &dyn HistogramBackend,
                     reuse: Option<&ReuseSet>,
@@ -102,7 +121,7 @@ impl Prepared {
                     .build(cols, dtrain, gpair, rows, sampler),
                 Vec::new(),
             ),
-            Prepared::Hist { index, backend } => {
+            Prepared::Hist { index, backend, .. } => {
                 hist(index, backend.as_ref(), reuse.as_deref(), sampler)
             }
             Prepared::Approx { const_hess, cached } => {
@@ -112,6 +131,8 @@ impl Prepared {
                 let cpu = CpuBackend;
                 if *const_hess {
                     hist(cached.get_or_init(bin), &cpu, reuse.as_deref(), sampler)
+                } else if let Some(shared) = forest_index {
+                    hist(shared.get_or_init(bin), &cpu, reuse.as_deref(), sampler)
                 } else {
                     hist(&bin(), &cpu, reuse.as_deref(), sampler)
                 }
@@ -121,6 +142,22 @@ impl Prepared {
             reuse.record_tree(&tree);
         }
         (tree, leaf_rows)
+    }
+
+    /// The per-round gradient indices of `approx` with a non-constant
+    /// Hessian when a forest has several trees: one per output, built before
+    /// the parallel trees start (or by the first tree that needs it on the
+    /// serial path), since every tree of an output's forest
+    /// weights its cuts by the same gradients (one row sample and, under
+    /// gradient-based sampling, one gradient sample serve the whole forest,
+    /// [`Self::samples_per_forest`]). Empty otherwise.
+    fn forest_indices(&self, n_out: usize, num_parallel_tree: usize) -> Vec<OnceLock<GHistIndex>> {
+        match self {
+            Prepared::Approx {
+                const_hess: false, ..
+            } if num_parallel_tree > 1 => (0..n_out).map(|_| OnceLock::new()).collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// Whether one row sample serves every parallel tree of an output: XGBoost
@@ -211,8 +248,8 @@ fn approx_index(
     gpair: &[GradPair],
     const_hess: bool,
 ) -> GHistIndex {
-    let hessians: Vec<f32> = gpair.iter().map(|g| g.hess).collect();
-    let cuts = HistCuts::from_dmatrix_weighted(dtrain, params.max_bin, &hessians, !const_hess);
+    let cuts =
+        HistCuts::from_dmatrix_hessians(dtrain, params.max_bin, |row| gpair[row].hess, !const_hess);
     GHistIndex::from_dmatrix(dtrain, cuts)
 }
 
@@ -252,11 +289,16 @@ fn prepare_builder(
             let cuts = HistCuts::from_dmatrix(dtrain, params.max_bin);
             let index = GHistIndex::from_dmatrix(dtrain, cuts);
             let backend = hist_backend(params, &index)?;
-            Prepared::Hist { index, backend }
+            let rows_route_like_trees = dtrain.weights().is_none_or(|w| !w.contains(&0.0));
+            Prepared::Hist {
+                index,
+                backend,
+                rows_route_like_trees,
+            }
         }
         TreeMethod::Approx => Prepared::Approx {
             const_hess,
-            cached: std::sync::OnceLock::new(),
+            cached: OnceLock::new(),
         },
         _ => Prepared::Exact(SortedColumns::from_dmatrix(dtrain)),
     })
@@ -755,7 +797,7 @@ fn train_linear(
         params,
         dtrain,
         num_boost_round,
-        &model.margin_from_trees(dtrain, 0..0),
+        model.margin_from_trees(dtrain, 0..0),
         objective.n_outputs(),
         objective,
         model.linear(),
@@ -946,12 +988,14 @@ fn grow_round(
     let row_subsets = iteration_row_subsets(n, params, prepared.samples_per_forest(), &mut rng);
     // An output's gradient-based sample, when its whole forest shares one.
     let mut forest_sample = None;
+    let forest_indices = prepared.forest_indices(n_out, parallel);
     let grow = GrowRound {
         run,
         prepared,
         gpair: &state.gpair,
         n_out,
         iteration,
+        forest_indices: &forest_indices,
     };
 
     // 3. `num_parallel_tree` trees per output from the same gradients,
@@ -959,19 +1003,29 @@ fn grow_round(
     let slots: Vec<TreeSlot> = (0..n_out * parallel)
         .map(|slot| {
             let row_subset = &row_subsets[(slot % parallel) % row_subsets.len()];
-            // Retaining the final row partitions replaces a per-row tree
-            // traversal of the raw feature matrix with one sequential pass
-            // per leaf (constant leaves only).
-            let capture_rows = matches!(prepared, Prepared::Hist { .. })
+            // Retaining the final row partitions replaces per-row tree
+            // traversals of the raw feature matrix with one sequential pass
+            // per leaf: the training margin update's, when every row took
+            // part, and the linear-leaf fit's. Linear leaves use them only
+            // when they equal raw routing (see `rows_route_like_trees`).
+            let (hist, linear_rows) = match prepared {
+                Prepared::Hist {
+                    rows_route_like_trees,
+                    ..
+                } => (true, params.linear_tree && *rows_route_like_trees),
+                _ => (false, false),
+            };
+            let margin_rows = hist
                 && dropped.is_none()
                 && row_subset.len() == n
                 && !gradient_sampling(params)
-                && !params.linear_tree;
+                && (!params.linear_tree || linear_rows);
             TreeSlot {
                 output: slot / parallel,
                 parallel: slot % parallel,
                 rows: row_subset,
-                capture_rows,
+                capture_rows: margin_rows || linear_rows,
+                margin_rows,
             }
         })
         .collect();
@@ -999,19 +1053,33 @@ fn grow_round(
                 (sampler, quantization_seed(params, &mut rng))
             })
             .collect();
+        // Every output's gradients gathered once, output-major, for all of
+        // its parallel trees (single-output objectives read `gpair`).
+        let gathered = gather_outputs(&state.gpair, n_out);
+        let output_gpair = |k: usize| {
+            if n_out == 1 {
+                &state.gpair[..]
+            } else {
+                &gathered[k * n..(k + 1) * n]
+            }
+        };
+        // Build the forests' shared `approx` indices here, before the
+        // parallel trees read them: an index built inside a tree task would
+        // run its own parallel loops while other tasks wait on it, and a
+        // worker waiting there can steal a task that waits on the same
+        // index again.
+        for (k, index) in forest_indices.iter().enumerate() {
+            index.get_or_init(|| approx_index(params, dtrain, output_gpair(k), false));
+        }
         slots
             .par_iter()
             .zip(draws)
             .map(|(slot, (mut sampler, rounding_seed))| {
-                let mut scratch = if n_out > 1 {
-                    vec![GradPair::default(); n]
-                } else {
-                    Vec::new()
-                };
-                let gk = gather_output(&state.gpair, &mut scratch, n_out, slot.output);
+                let gk = output_gpair(slot.output);
                 let sample = TreeSample {
                     gpair: gk,
                     rows: slot.rows,
+                    forest_index: grow.forest_index(slot.output),
                 };
                 grow_sampled_tree(&grow, slot, sample, &mut sampler, rounding_seed, None)
             })
@@ -1038,7 +1106,7 @@ fn grow_round(
         if dropped.is_none() {
             // Row partitions already identify training leaves when every row
             // participated in histogram construction.
-            let captured = (!leaf_rows.is_empty()).then_some(leaf_rows.as_slice());
+            let captured = slot.margin_rows.then_some(leaf_rows.as_slice());
             state
                 .margins
                 .add_tree(&tree, TreeOutput::Scalar(slot.output), captured);
@@ -1390,7 +1458,8 @@ impl<'a> MarginCaches<'a> {
     ) {
         match leaf_rows {
             Some(leaf_rows) => {
-                apply_leaf_rows(tree, leaf_rows, &mut self.train, self.n_out, output);
+                let train = &mut self.train;
+                apply_leaf_rows(tree, self.dtrain, leaf_rows, train, self.n_out, output);
             }
             None => add_tree_margins(tree, self.dtrain, &mut self.train, self.n_out, output),
         }
@@ -1429,29 +1498,41 @@ fn add_tree_margins(
     }
 }
 
-/// Add each leaf's value (or vector) to the margins of the training rows
-/// that reached it.
+/// Add each leaf's value (or vector), or its linear model's output, to the
+/// margins of the training rows of `data` that reached it.
 fn apply_leaf_rows(
     tree: &RegTree,
+    data: &DMatrix,
     leaf_rows: &[LeafRows],
     margins: &mut [f32],
     n_out: usize,
     output: TreeOutput,
 ) {
-    match output {
-        TreeOutput::Scalar(k) => apply_leaf_values(
+    match (output, tree.linear_leaves()) {
+        (TreeOutput::Scalar(k), None) => apply_leaf_values(
             leaf_rows,
             margins,
             n_out,
             |node| tree.node(node).leaf_value,
-            |margins, base, value| margins[base + k] += value,
+            |margins, base, _, value| margins[base + k] += value,
         ),
-        TreeOutput::Vector => apply_leaf_values(
+        // `RegTree::predict_row`'s linear-leaf arithmetic, without routing.
+        (TreeOutput::Scalar(k), Some(linear)) => apply_leaf_values(
+            leaf_rows,
+            margins,
+            n_out,
+            |node| node,
+            |margins, base, row, node| {
+                let get = |f: u32| data.get(row as usize, f as usize);
+                margins[base + k] += linear.predict(node, tree.node(node).leaf_value, get);
+            },
+        ),
+        (TreeOutput::Vector, _) => apply_leaf_values(
             leaf_rows,
             margins,
             n_out,
             |node| tree.leaf_vector(node),
-            |margins, base, value: &[f32]| {
+            |margins, base, _, value: &[f32]| {
                 for (m, &v) in margins[base..base + n_out].iter_mut().zip(value) {
                     *m += v;
                 }
@@ -1460,7 +1541,7 @@ fn apply_leaf_rows(
     }
 }
 
-/// `add(margins, row * n_out, value(leaf))` for every row of every leaf of
+/// `add(margins, row * n_out, row, value(leaf))` for every row of every leaf of
 /// `leaf_rows`, in parallel row chunks for large inputs. Leaf row lists are
 /// ascending, so each chunk locates its slice of every leaf by binary
 /// search; each row still receives one addition per tree.
@@ -1469,7 +1550,7 @@ fn apply_leaf_values<V: Copy + Send + Sync>(
     margins: &mut [f32],
     n_out: usize,
     value: impl Fn(usize) -> V + Sync,
-    add: impl Fn(&mut [f32], usize, V) + Sync,
+    add: impl Fn(&mut [f32], usize, u32, V) + Sync,
 ) {
     const CHUNK_ROWS: usize = 8192;
     let n = margins.len() / n_out;
@@ -1477,7 +1558,7 @@ fn apply_leaf_values<V: Copy + Send + Sync>(
         for leaf in leaf_rows {
             let v = value(leaf.node);
             for &row in &leaf.rows {
-                add(margins, row as usize * n_out, v);
+                add(margins, row as usize * n_out, row, v);
             }
         }
         return;
@@ -1493,7 +1574,7 @@ fn apply_leaf_values<V: Copy + Send + Sync>(
                 let start = leaf.rows.partition_point(|&row| row < first);
                 let end = start + leaf.rows[start..].partition_point(|&row| row < last);
                 for &row in &leaf.rows[start..end] {
-                    add(margins, (row - first) as usize * n_out, v);
+                    add(margins, (row - first) as usize * n_out, row, v);
                 }
             }
         });
@@ -1611,6 +1692,25 @@ fn gather_output<'a>(
     }
 }
 
+/// Every output's gradients of `gpair` (`[row][n_out]`) gathered
+/// output-major (`[output][row]`, as [`gather_output`] gathers one); empty
+/// for a single output.
+fn gather_outputs(gpair: &[GradPair], n_out: usize) -> Vec<GradPair> {
+    if n_out == 1 {
+        return Vec::new();
+    }
+    let n = gpair.len() / n_out;
+    let mut out = vec![GradPair::default(); gpair.len()];
+    out.par_chunks_exact_mut(n)
+        .enumerate()
+        .for_each(|(k, column)| {
+            for (r, dst) in column.iter_mut().enumerate() {
+                *dst = gpair[r * n_out + k];
+            }
+        });
+    out
+}
+
 /// The RNG for one boosting round: `seed ^ round * 0x9E37_79B9`, plus a
 /// booster-specific `salt` (`0` for gbtree, `0x0DA27` for DART) so the two
 /// boosters draw from different streams.
@@ -1627,16 +1727,28 @@ struct GrowRound<'a> {
     n_out: usize,
     /// The model's absolute iteration index.
     iteration: usize,
+    /// One gradient index per output, shared by that output's forest
+    /// ([`Prepared::forest_indices`]); empty when trees build their own.
+    forest_indices: &'a [OnceLock<GHistIndex>],
+}
+
+impl GrowRound<'_> {
+    /// The gradient index output `output`'s forest shares, if any.
+    fn forest_index(&self, output: usize) -> Option<&OnceLock<GHistIndex>> {
+        self.forest_indices.get(output)
+    }
 }
 
 /// Which tree of an iteration to grow: parallel tree `parallel` of output
 /// `output`, on the uniform row subset `rows`, keeping its leaves' rows when
-/// `capture_rows` (see [`Prepared::build_tree`]).
+/// `capture_rows` (see [`Prepared::build_tree`]) and adding it to the
+/// training margins from them when `margin_rows`.
 struct TreeSlot<'a> {
     output: usize,
     parallel: usize,
     rows: &'a [u32],
     capture_rows: bool,
+    margin_rows: bool,
 }
 
 /// Fit the tree `slot` of the iteration `grow`: gather that output's
@@ -1677,7 +1789,11 @@ fn fit_output_tree(
     };
     let mut sampler = make_column_sampler(dtrain, params, rng);
     let rounding_seed = quantization_seed(params, rng);
-    let sample = TreeSample { gpair: gk, rows };
+    let sample = TreeSample {
+        gpair: gk,
+        rows,
+        forest_index: grow.forest_index(slot.output),
+    };
     Ok(grow_sampled_tree(
         grow,
         slot,
@@ -1699,7 +1815,9 @@ fn grow_sampled_tree(
     reuse: Option<&mut ReuseSet>,
 ) -> (RegTree, Vec<LeafRows>) {
     let TrainContext { params, dtrain, .. } = *grow.run;
-    let TreeSample { gpair: gk, rows } = sample;
+    let TreeSample {
+        gpair: gk, rows, ..
+    } = sample;
     let (mut tree, leaf_rows) = grow.prepared.build_tree(
         grow.run,
         sample,
@@ -1710,7 +1828,14 @@ fn grow_sampled_tree(
     );
     // LightGBM keeps the first iteration's trees constant.
     if params.linear_tree && grow.iteration > 0 {
-        crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, params.linear_lambda);
+        let lambda = params.linear_lambda;
+        if leaf_rows.is_empty() {
+            crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, lambda);
+        } else {
+            crate::tree::linear::fit_captured_linear_leaves(
+                &mut tree, dtrain, gk, &leaf_rows, lambda,
+            );
+        }
     }
     tree.scale_leaves(tree_eta(params));
     (tree, leaf_rows)
@@ -1738,7 +1863,10 @@ pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut Rng) -> V
     if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
-    let mut rows: Vec<u32> = (0..n as u32).filter(|_| rng.f64() < subsample).collect();
+    // Sized for the expected sample plus a few standard deviations.
+    let expected = n as f64 * subsample;
+    let mut rows: Vec<u32> = Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize);
+    rows.extend((0..n as u32).filter(|_| rng.f64() < subsample));
     if rows.is_empty() {
         rows.push(rng.range(0..n) as u32);
     }
@@ -2013,11 +2141,22 @@ mod tests {
             ChildLeaf::new(0.75, 1.0),
         );
         let leaves = leaf_rows_of(&scalar);
-        let mut expected = start(3);
-        add_tree_margins(&scalar, &data, &mut expected, 3, TreeOutput::Scalar(1));
-        let mut actual = start(3);
-        pool.install(|| apply_leaf_rows(&scalar, &leaves, &mut actual, 3, TreeOutput::Scalar(1)));
-        assert_eq!(actual, expected);
+        let mut linear = scalar.clone();
+        let gpair: Vec<GradPair> = x
+            .iter()
+            .map(|&v| GradPair::new(-(2.0 * v.max(0.0) + 1.0), 1.0))
+            .collect();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        crate::tree::linear::fit_linear_leaves(&mut linear, &data, &gpair, &rows, 0.5);
+        assert!(linear.linear_leaves().is_some());
+        for tree in [&scalar, &linear] {
+            let output = TreeOutput::Scalar(1);
+            let mut expected = start(3);
+            add_tree_margins(tree, &data, &mut expected, 3, output);
+            let mut actual = start(3);
+            pool.install(|| apply_leaf_rows(tree, &data, &leaves, &mut actual, 3, output));
+            assert_eq!(actual, expected);
+        }
 
         let mut vector = RegTree::with_vector_root(3, n as f32);
         let (left, right) = vector.expand(
@@ -2039,7 +2178,9 @@ mod tests {
         let mut expected = start(3);
         add_tree_margins(&vector, &data, &mut expected, 3, TreeOutput::Vector);
         let mut actual = start(3);
-        pool.install(|| apply_leaf_rows(&vector, &leaves, &mut actual, 3, TreeOutput::Vector));
+        pool.install(|| {
+            apply_leaf_rows(&vector, &data, &leaves, &mut actual, 3, TreeOutput::Vector);
+        });
         assert_eq!(actual, expected);
     }
 
@@ -2095,6 +2236,75 @@ mod tests {
         let serial = fit(1);
         for _ in 0..32 {
             assert_eq!(fit(4), serial);
+        }
+    }
+
+    /// Zero-weight rows are not sketched, so one whose value lies beyond the
+    /// last cut is binned into the last bin but routed right of a split on
+    /// it by the finished tree. Linear leaves must then be fitted from raw
+    /// routing, as without captured rows: fitting the second tree from the
+    /// builder's rows gave leaf 3 intercept 1.0 instead of 0.5, and row 0 a
+    /// prediction of 2.0 instead of 1.5.
+    #[test]
+    fn linear_leaves_route_zero_weight_rows_like_the_tree() {
+        let nan = f32::NAN;
+        let x = [0.0, 1.0, 0.0, nan, 1.0, 0.0, 0.0, 100.0, 0.0, 101.0];
+        let data = DMatrix::from_dense(&x, 5, 2)
+            .unwrap()
+            .with_labels(&[2.0, 0.0, 10.0, 0.0, 0.0])
+            .unwrap()
+            .with_weights(&[1.0, 1.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        let params = TrainingParams::builder()
+            .tree_method(TreeMethod::Hist)
+            .linear_tree(true)
+            .base_score(0.0)
+            .eta(1.0)
+            .lambda(1.0)
+            .linear_lambda(1.0)
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = Trainer::new(&params, &data, 2).train().unwrap().model;
+        assert_eq!(model.predict(&data).unwrap(), [1.5, 0.0, 7.5, 0.0, 0.0]);
+        let linear = model.trees()[1].linear_leaves().unwrap();
+        let intercepts: Vec<u64> = (0..5).map(|id| linear.intercept(id).to_bits()).collect();
+        let routed: Vec<u64> = [0.0f64, 0.0, 2.5, 0.5, -0.0].map(f64::to_bits).to_vec();
+        assert_eq!(intercepts, routed);
+    }
+
+    #[test]
+    fn approx_forests_share_one_index_per_output_across_threads() {
+        // Per-round `approx` cuts (non-constant Hessians) are shared by an
+        // output's parallel trees; the parallel slot loop builds them before
+        // growing the trees, and every thread count grows the same forest.
+        // 20,000 rows × 4 features reach the parallel cut construction
+        // (65,536 cells), whose nested rayon loops deadlocked when tree
+        // tasks built the shared index themselves.
+        let n = 20_000;
+        let x: Vec<f32> = (0..n * 4)
+            .map(|i| ((i * 7919) % 1009) as f32 / 1009.0)
+            .collect();
+        let y: Vec<f32> = x
+            .chunks(4)
+            .map(|r| f32::from(r[0] + 0.5 * r[1] > 0.7))
+            .collect();
+        let d = labeled_dense(&x, n, 4, &y);
+        let fit = |nthread: usize| {
+            let params = TrainingParams::builder()
+                .objective("multi:softprob")
+                .num_class(2)
+                .tree_method(TreeMethod::Approx)
+                .num_parallel_tree(4)
+                .max_depth(3)
+                .nthread(nthread)
+                .build()
+                .unwrap();
+            train(&params, &d, 3).unwrap().predict_margin(&d).unwrap()
+        };
+        let serial = fit(1);
+        for _ in 0..4 {
+            assert_eq!(fit(8), serial);
         }
     }
 

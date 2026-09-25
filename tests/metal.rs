@@ -6,7 +6,7 @@
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
 use hessboost::backend::metal;
-use hessboost::config::{BoosterKind, Device, ProcessType, TreeMethod};
+use hessboost::config::{BoosterKind, Device, ProcessType};
 use hessboost::prelude::*;
 
 /// Whether a Metal device is present, with the skip reason printed so a

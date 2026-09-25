@@ -1,7 +1,7 @@
 //! End-to-end behavior of the opt-in LightGBM tree options: `extra_trees`,
 //! `path_smooth`, and `linear_tree` / `linear_lambda`.
 
-use hessboost::config::{BoosterKind, Monotone, MultiStrategy, TrainingParamsBuilder, TreeMethod};
+use hessboost::config::{BoosterKind, Monotone, MultiStrategy, TrainingParamsBuilder};
 use hessboost::data::FeatureType;
 use hessboost::prelude::*;
 

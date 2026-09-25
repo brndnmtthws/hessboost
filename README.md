@@ -37,7 +37,6 @@ Requires Rust 1.93 or newer (edition 2024) and a C compiler, which the
 ## Quick start
 
 ```rust
-use hessboost::config::TreeMethod;
 use hessboost::prelude::*;
 
 fn main() -> Result<()> {
@@ -67,11 +66,14 @@ fn main() -> Result<()> {
 }
 ```
 
-`hessboost::prelude` holds only the train-and-predict workflow
-(`TrainingParams`, `DMatrix`, `train`, `Trainer`, `BoostedModel`, and the
-error types); everything else is imported from its module, for example
-`hessboost::config::TreeMethod` or `hessboost::data::load_csv`. The
-[API documentation](https://docs.rs/hessboost) covers every type and option.
+`hessboost::prelude` holds the train-and-predict workflow
+(`TrainingParams`, `DMatrix`, `train`, `Trainer`, `BoostedModel`, the error
+types, and `TreeMethod`, `ImportanceType`, and `ObjectiveParams`, which
+their methods take); everything else is imported from its module, for
+example `hessboost::config::GrowPolicy` or `hessboost::data::load_csv`.
+The [API documentation](https://docs.rs/hessboost) covers every type and
+option. To derive a variant of a built configuration through the
+validated setters, convert it back with `TrainingParamsBuilder::from(params)`.
 
 `train(&params, &dtrain, rounds)` is the plain run; `Trainer` adds the
 optional arguments of XGBoost's `xgb.train` as builder methods:
@@ -80,7 +82,7 @@ optional arguments of XGBoost's `xgb.train` as builder methods:
 let result = Trainer::new(&params, &dtrain, 1000)
     .eval(&dvalid, "valid")         // watched eval set (repeatable)
     .early_stopping_rounds(20)      // on the last metric of the last eval set
-    .train()?;                      // TrainResult { model, history }
+    .train()?;                      // TrainResult { model, history, best_score }
 let continued = Trainer::new(&params, &dtrain, 50)
     .init_model(&result.model)      // continued training (xgb_model=)
     .train()?
@@ -128,8 +130,17 @@ Everything in this section follows XGBoost 3.4.2 and is covered by the
   row/column sample and `eta / num_parallel_tree` shrinkage.
 - **Entry points:** `train` and the `Trainer` builder (watched eval sets
   via `.eval`, `.early_stopping_rounds`, custom `.objective` and
-  `.custom_metric` hooks, `.init_model`), and `cv` (k-fold
-  cross-validation), all in `hessboost::training`.
+  `.custom_metric` hooks, `.init_model`), all in `hessboost::training`.
+  With early stopping, the model's `best_iteration` (which plain
+  prediction uses) and `TrainResult::best_score` are set whether or not
+  patience ran out, as in XGBoost.
+- **Cross-validation:** `cv` (shuffled k-fold, `xgboost.cv`) and
+  `CrossValidation` over caller-supplied `Fold`s (XGBoost's `folds=`), with
+  optional early stopping on the fold-averaged metric. For time-ordered
+  rows, `Fold::forward_chaining(n_rows, n_splits, gap)` trains each fold
+  only on rows before its test block, leaving out the `gap` rows just
+  before it (e.g. the label horizon), where shuffled k-fold would train
+  on the future.
 - **Continued training:** `Trainer::init_model` (XGBoost's `xgb_model=`)
   keeps the model's intercept and continues its RNG stream, so `a` rounds
   followed by `b` rounds grow the same trees as one run of `a + b`.
@@ -248,8 +259,12 @@ Predictions for multi-output models are row-major, `[row][output]`.
   (`save_binary` / `load_binary`) and JSON (`save_json` / `load_json`),
   both covering every model hessboost trains. Files written by 0.2.0
   and later load in every later release. Native binary and JSON files from
-  0.1.x are refused; the [changelog](CHANGELOG.md#upgrading-from-01) shows
-  how to carry a model over.
+  0.1.x are refused: export such a model with 0.1.1's `save_xgboost_json`
+  and load it with `BoostedModel::load_xgboost_json` (gbtree and DART
+  models reload with identical predictions; retrain gblinear and
+  custom-objective models). A hand-written JSON document may leave out
+  objective parameters (the recorded objective's defaults apply) and a
+  scalar tree's leaf fields; anything predictions depend on is required.
 - **XGBoost interchange:** import and export `gbtree` and DART models
   (numeric and categorical splits, forests, multi-output and vector-leaf
   trees) as XGBoost JSON (`save_xgboost_json` / `load_xgboost_json`) or
@@ -323,6 +338,15 @@ docs give the exact rules.
 On Friedman #1 data (`budget` example), budget 1.0 comes within 1% of the
 test RMSE of an early-stopping-tuned model and budget 1.5 beats it; for
 binary classification, budgets 1.0–1.5 are 3–9% behind the tuned logloss.
+
+Budget mode is much slower than one fixed-round fit: its trees grow far
+past depth 6, the five-fold check makes each leaf about 2x as expensive as
+a `lossguide` `hist` leaf, and more threads barely help. At budget 1.0 on
+Friedman #1 it took 10x (5,000 rows) to 54x (200,000 rows) the wall time
+of a depth-6 `hist` fit with the same number of trees, and 2–8x an
+early-stopping-tuned fit at 5,000 rows; the
+[`training::budget`](https://docs.rs/hessboost/latest/hessboost/training/budget/#cost)
+docs give the measurements.
 
 ### Tree options from LightGBM and CatBoost
 

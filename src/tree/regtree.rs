@@ -163,24 +163,33 @@ pub struct RegTree {
 /// The serialized fields of a [`RegTree`] (same names and layout), before
 /// validation. `RegTree`'s `Deserialize` goes through it; the native JSON
 /// reader keeps it unchecked so the model validates each tree against its
-/// feature count ([`UncheckedRegTree::into_unchecked`]).
+/// feature count ([`UncheckedRegTree::into_unchecked`]). A scalar tree may
+/// omit `size_leaf_vector` (`0`), `leaf_vectors` (empty), and `linear`
+/// (constant leaves); a multi-output model requires `size_leaf_vector`
+/// ([`UncheckedRegTree::states_leaf_width`]).
 #[derive(Deserialize)]
 pub(crate) struct UncheckedRegTree {
     nodes: Vec<Node>,
     categories: Vec<u32>,
-    size_leaf_vector: usize,
+    size_leaf_vector: Option<usize>,
+    #[serde(default)]
     leaf_vectors: Vec<f32>,
     linear: Option<UncheckedLinearLeaves>,
 }
 
 impl UncheckedRegTree {
+    /// Whether the tree stored `size_leaf_vector` rather than defaulting it.
+    pub(crate) fn states_leaf_width(&self) -> bool {
+        self.size_leaf_vector.is_some()
+    }
+
     /// The tree as stored, unvalidated: the caller validates it
     /// ([`RegTree::is_valid_for_features`]).
     pub(crate) fn into_unchecked(self) -> RegTree {
         RegTree::from_parts(
             self.nodes,
             self.categories,
-            self.size_leaf_vector,
+            self.size_leaf_vector.unwrap_or(0),
             self.leaf_vectors,
             self.linear.map(UncheckedLinearLeaves::into_unchecked),
         )

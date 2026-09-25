@@ -65,33 +65,6 @@ jobs:
             exit 1
           fi
 
-      # The release body is this version's CHANGELOG.md section (without its
-      # heading); GitHub's generated pull-request list follows it. Checked
-      # before publishing, so a missing or undated section stops the release.
-      - name: Extract release notes from CHANGELOG.md
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          notes="$RUNNER_TEMP/release-notes.md"
-          awk -v heading="## [$version] - " '
-            index($0, heading) == 1 { found = 1; date = substr($0, length(heading) + 1); next }
-            found && /^## \[/ { exit }
-            found { print }
-            END {
-              if (!found) { print "no \"" heading "YYYY-MM-DD\" section" > "/dev/stderr"; exit 1 }
-              if (date !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) {
-                print "section date is \"" date "\", not YYYY-MM-DD" > "/dev/stderr"; exit 1
-              }
-            }
-          ' CHANGELOG.md > "$notes" || {
-            echo "::error::CHANGELOG.md needs a dated '## [$version] - YYYY-MM-DD' section"
-            exit 1
-          }
-          if ! grep -q '[^[:space:]]' "$notes"; then
-            echo "::error::CHANGELOG.md section for $version is empty"
-            exit 1
-          fi
-
       - name: Select crates.io authentication method
         id: auth-mode
         env:
@@ -126,6 +99,6 @@ jobs:
           draft: false
           prerelease: false
           discussion_category_name: General
-          # The body (the CHANGELOG section) is prepended to the generated notes.
-          body_path: ${{ runner.temp }}/release-notes.md
+          # Notes are the pull requests merged since the previous tag,
+          # grouped by .github/release.yml.
           generate_release_notes: true

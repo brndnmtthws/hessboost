@@ -56,6 +56,31 @@
 //! (deviance form for the log-link objectives, where Perpetual uses the
 //! unshifted negative log-likelihood).
 //!
+//! # Cost
+//!
+//! Budget mode is much slower than a fixed-round `hist` fit with the same
+//! number of trees, for two reasons:
+//!
+//! * **Tree size.** Trees grow best-first until the loss target or the
+//!   generalization check stops them, not to a depth limit, so they are much
+//!   larger than the default depth-6 trees. On Friedman #1 at budget 1.0
+//!   they averaged about 120 leaves per tree at 5 000 rows, 960 at 50 000,
+//!   and 2 400 at 200 000 (depth 6 allows 64).
+//! * **The five-fold check.** Evaluating every candidate split per fold
+//!   makes each leaf cost about 2x a `lossguide` `hist` leaf with all
+//!   threads (4–5x single-threaded), and extra threads barely shorten it:
+//!   its wall time was within 5% of the single-threaded time on a 192-core
+//!   machine.
+//!
+//! Measured together (budget 1.0 against `hist` with `eta = 0.1`, depth 6,
+//! and the round count budget mode chose, 192 threads): 10x the wall time
+//! at 5 000 rows, 36x at 50 000, and 54x at 200 000 (e.g. 12.1 s against
+//! 0.34 s at 50 000 rows × 10 features, 123 trees). Against an
+//! early-stopping-tuned fit (`eta = 0.05`), the `budget` example measures
+//! 2x (regression) to 8x (classification) at 5 000 rows. Budget mode
+//! replaces a tuning search, so compare its cost with that search's, not
+//! with one fixed-round fit.
+//!
 //! # Parameters
 //!
 //! Budget mode derives the learning rate, tree size, and round count itself.

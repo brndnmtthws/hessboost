@@ -1,6 +1,5 @@
 //! SHAP contribution accumulation across trees.
 
-use hessboost::config::ObjectiveParams;
 use hessboost::prelude::*;
 
 /// One node of a hand-built native-JSON tree: an `x[feature] < 0.5` split

@@ -50,7 +50,7 @@ use crate::tree::{Node, RegTree};
 
 const MAGIC: &[u8; 4] = b"HBM\0";
 /// The magic of the pre-0.2.0 native format (hessboost 0.1.x), which this
-/// version refuses with a pointer to the upgrade notes.
+/// version refuses, naming the upgrade path.
 const LEGACY_MAGIC: &[u8; 4] = b"SQB\0";
 /// The `model.writer` section: the release that wrote the file.
 const WRITER: &str = concat!("hessboost ", env!("CARGO_PKG_VERSION"));
@@ -357,7 +357,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Stored> {
         if container.starts_with(LEGACY_MAGIC) {
             return Err(format_error(
                 "a native model from hessboost 0.1.x, which 0.2.0 and later cannot read \
-                 (see the CHANGELOG's upgrade notes)",
+                 (export it with 0.1.1's `save_xgboost_json` and load that)",
             ));
         }
         return Err(format_error("invalid native model header"));
@@ -946,7 +946,7 @@ mod tests {
     }
 
     /// Files of the pre-0.2.0 format are recognized by their magic and
-    /// refused with a pointer to the upgrade notes.
+    /// refused, naming the upgrade path.
     #[test]
     fn pre_0_2_files_are_named_in_the_refusal() {
         let (model, _) = model();

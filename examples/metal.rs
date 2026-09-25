@@ -49,7 +49,7 @@ fn dataset(n: usize, seed: u64) -> hessboost::error::Result<hessboost::data::DMa
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn metal_main() -> hessboost::error::Result<()> {
     use hessboost::backend::metal;
-    use hessboost::config::{Device, TreeMethod};
+    use hessboost::config::Device;
     use hessboost::prelude::*;
 
     let Some(()) = metal::available().then_some(()) else {

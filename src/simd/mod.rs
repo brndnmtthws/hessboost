@@ -87,6 +87,71 @@ macro_rules! dispatch_gradient {
     };
 }
 
+/// Dispatch a softmax entry point to the vector kernels: on AArch64 the
+/// wide-row kernel (`$wide`) for 8+ classes and the short-row kernels for
+/// 2–4 classes, on `x86_64` the short-row kernels for 2 and 4 classes, each
+/// when `$eligible` holds. `$short` calls the short-row kernel as
+/// `arch::kernel::<$k>(..)`, with `arch` the architecture's module and `$k`
+/// the class count. Returns after a vector kernel ran; otherwise falls
+/// through to the caller's scalar path.
+macro_rules! dispatch_softmax {
+    ($num_class:expr, $eligible:expr, wide: $wide:expr, short: |$k:ident| $short:expr) => {
+        #[cfg(target_arch = "aarch64")]
+        if $eligible && neon_available() {
+            if $num_class >= 8 {
+                // SAFETY: NEON is present; the caller's eligibility check
+                // covers the complete row-major matrix, and the kernel bounds
+                // each row by `num_class`.
+                unsafe { $wide };
+                return;
+            }
+            if (2..=4).contains(&$num_class) {
+                // SAFETY: NEON is present, the eligibility check covers the
+                // matrix, and each specialization processes bounded batches of
+                // four rows and handles the remaining values scalarly.
+                unsafe {
+                    match $num_class {
+                        2 => {
+                            use aarch64 as arch;
+                            const $k: usize = 2;
+                            $short
+                        }
+                        3 => {
+                            use aarch64 as arch;
+                            const $k: usize = 3;
+                            $short
+                        }
+                        _ => {
+                            use aarch64 as arch;
+                            const $k: usize = 4;
+                            $short
+                        }
+                    }
+                }
+                return;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        if ($num_class == 2 || $num_class == 4) && $eligible && avx2_fma_available() {
+            // SAFETY: AVX2/FMA are present, the eligibility check covers the
+            // matrix, and each specialization processes whole rows per vector
+            // and handles the remaining rows scalarly.
+            unsafe {
+                if $num_class == 2 {
+                    use x86_64 as arch;
+                    const $k: usize = 2;
+                    $short
+                } else {
+                    use x86_64 as arch;
+                    const $k: usize = 4;
+                    $short
+                }
+            }
+            return;
+        }
+    };
+}
+
 /// Resolve the process-wide AArch64 backend lazily on the first numeric-kernel
 /// call. `LazyLock` makes feature detection a one-time initialization cost, and
 /// subsequent calls are a cached load and comparison.
@@ -267,40 +332,12 @@ pub(crate) fn tweedie_gradient(
 /// Apply softmax to every contiguous `num_class` row while resolving the SIMD
 /// backend only once for the whole matrix.
 pub(crate) fn softmax_rows_inplace(values: &mut [f32], num_class: usize) {
-    #[cfg(target_arch = "aarch64")]
-    if num_class >= 8 && values.len() >= MIN_SIMD_LEN && neon_available() {
-        // SAFETY: NEON is present; the objective guarantees complete rows and
-        // the kernel bounds each row by `num_class`.
-        unsafe { aarch64::softmax_rows_inplace(values, num_class) };
-        return;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    if (2..=4).contains(&num_class) && values.len() >= MIN_SIMD_LEN && neon_available() {
-        // SAFETY: NEON is present; each specialization processes bounded
-        // batches of four rows and handles the remaining values scalarly.
-        unsafe {
-            match num_class {
-                2 => aarch64::short_softmax_rows::<2>(values),
-                3 => aarch64::short_softmax_rows::<3>(values),
-                _ => aarch64::short_softmax_rows::<4>(values),
-            }
-        }
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if (num_class == 2 || num_class == 4) && values.len() >= MIN_SIMD_LEN && avx2_fma_available() {
-        // SAFETY: AVX2/FMA are present; each specialization processes whole
-        // rows per vector and handles the remaining rows scalarly.
-        unsafe {
-            if num_class == 2 {
-                x86_64::short_softmax_rows::<2>(values);
-            } else {
-                x86_64::short_softmax_rows::<4>(values);
-            }
-        }
-        return;
-    }
+    dispatch_softmax!(
+        num_class,
+        values.len() >= MIN_SIMD_LEN,
+        wide: aarch64::softmax_rows_inplace(values, num_class),
+        short: |K| arch::short_softmax_rows::<K>(values)
+    );
 
     for row in values.chunks_mut(num_class) {
         softmax_scalar(row);
@@ -320,44 +357,12 @@ pub(crate) fn softmax_gradient(
         .checked_mul(num_class)
         .is_some_and(|len| len == preds.len() && out.len() >= len)
         && weights.is_none_or(|values| values.len() >= labels.len());
-    #[cfg(target_arch = "aarch64")]
-    if num_class >= 8 && preds.len() >= MIN_SIMD_LEN && complete && neon_available() {
-        // SAFETY: NEON is present and all input/output slices cover the complete
-        // row-major prediction matrix.
-        unsafe { aarch64::softmax_gradient(preds, labels, weights, num_class, min_hess, out) };
-        return;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    if (2..=4).contains(&num_class) && preds.len() >= MIN_SIMD_LEN && complete && neon_available() {
-        // SAFETY: the complete-matrix check covers every prediction, label,
-        // weight and output row. NEON is available and K is 2, 3, or 4.
-        unsafe {
-            match num_class {
-                2 => aarch64::short_softmax_gradient::<2>(preds, labels, weights, min_hess, out),
-                3 => aarch64::short_softmax_gradient::<3>(preds, labels, weights, min_hess, out),
-                _ => aarch64::short_softmax_gradient::<4>(preds, labels, weights, min_hess, out),
-            }
-        }
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if (num_class == 2 || num_class == 4)
-        && preds.len() >= MIN_SIMD_LEN
-        && complete
-        && avx2_fma_available()
-    {
-        // SAFETY: the complete-matrix check covers every prediction, label,
-        // weight and output row; AVX2/FMA are present and K is 2 or 4.
-        unsafe {
-            if num_class == 2 {
-                x86_64::short_softmax_gradient::<2>(preds, labels, weights, min_hess, out);
-            } else {
-                x86_64::short_softmax_gradient::<4>(preds, labels, weights, min_hess, out);
-            }
-        }
-        return;
-    }
+    dispatch_softmax!(
+        num_class,
+        preds.len() >= MIN_SIMD_LEN && complete,
+        wide: aarch64::softmax_gradient(preds, labels, weights, num_class, min_hess, out),
+        short: |K| arch::short_softmax_gradient::<K>(preds, labels, weights, min_hess, out)
+    );
 
     debug_assert!(complete);
     softmax_gradient_rows_scalar(

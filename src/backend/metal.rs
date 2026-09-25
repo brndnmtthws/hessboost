@@ -832,6 +832,24 @@ struct CallBuffers {
     hist: GpuBuffer,
 }
 
+impl CallBuffers {
+    /// One set of buffers for an index of `n_rows` rows and `total_bins`
+    /// bins: the node's row list, the per-chunk partial histograms, and the
+    /// merged histogram.
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        n_rows: usize,
+        total_bins: usize,
+    ) -> Result<Self> {
+        let chunks = n_rows.div_ceil(CHUNK_ROWS).max(1);
+        Ok(CallBuffers {
+            rows: GpuBuffer::new(device, n_rows * 4)?,
+            partials: GpuBuffer::new(device, chunks * ROW_SLICES * total_bins * 16)?,
+            hist: GpuBuffer::new(device, total_bins * 16)?,
+        })
+    }
+}
+
 /// The Metal histogram backend: implements [`HistogramBackend`] by scanning
 /// the binned column store on the GPU. Constructed once per training run (the
 /// column upload and group descriptors are per-dataset); the gradient slice
@@ -965,12 +983,7 @@ impl MetalHistBackend {
             n_records: n_records as u32,
             features_per_group: features_per_group as u32,
         };
-        let chunks = n_rows.div_ceil(CHUNK_ROWS).max(1);
-        let call = CallBuffers {
-            rows: GpuBuffer::new(&ctx.device, n_rows * 4)?,
-            partials: GpuBuffer::new(&ctx.device, chunks * ROW_SLICES * total_bins * 16)?,
-            hist: GpuBuffer::new(&ctx.device, total_bins * 16)?,
-        };
+        let call = CallBuffers::new(&ctx.device, n_rows, total_bins)?;
         // One `[i64; 2]` gradient pair in grains per row.
         let gpair = GpuBuffer::new(&ctx.device, n_rows * 16)?;
         Ok(MetalHistBackend {
@@ -1062,12 +1075,7 @@ impl MetalHistBackend {
         if let Some(call) = self.pool.lock().expect("buffer pool lock poisoned").pop() {
             return Ok(call);
         }
-        let chunks = self.n_rows.div_ceil(CHUNK_ROWS).max(1);
-        Ok(CallBuffers {
-            rows: GpuBuffer::new(&self.ctx.device, self.n_rows * 4)?,
-            partials: GpuBuffer::new(&self.ctx.device, chunks * ROW_SLICES * self.total_bins * 16)?,
-            hist: GpuBuffer::new(&self.ctx.device, self.total_bins * 16)?,
-        })
+        CallBuffers::new(&self.ctx.device, self.n_rows, self.total_bins)
     }
 
     fn checkin(&self, call: CallBuffers) {
@@ -1300,72 +1308,56 @@ fn interleaved_columns(
     } else {
         [u32::MAX; RECORD_FEATURES]
     };
-    match index.column_bins() {
-        Some(Bins::U16(cols)) => {
-            let row_words = record * n_records;
-            store
-                .par_chunks_mut(row_words)
-                .enumerate()
-                .for_each(|(r, row)| {
-                    for (b, out) in row.chunks_exact_mut(record).enumerate() {
-                        let mut bins = sentinel;
-                        for (f, bin) in bins.iter_mut().enumerate() {
-                            let feature = b * RECORD_FEATURES + f;
-                            if feature < f_count {
-                                *bin = u32::from(cols[feature * n + r]);
-                            }
+    if let Some(cols) = index.column_bins() {
+        // The bin at feature-major position `i` (`feature * n + row`).
+        let bin_at = |i: usize| match &cols {
+            Bins::U16(c) => u32::from(c[i]),
+            Bins::U32(c) => c[i],
+        };
+        let row_words = record * n_records;
+        store
+            .par_chunks_mut(row_words)
+            .enumerate()
+            .for_each(|(r, row)| {
+                for (b, out) in row.chunks_exact_mut(record).enumerate() {
+                    let mut bins = sentinel;
+                    for (f, bin) in bins.iter_mut().enumerate() {
+                        let feature = b * RECORD_FEATURES + f;
+                        if feature < f_count {
+                            *bin = bin_at(feature * n + r);
                         }
-                        write_record(out, &bins, u16_pack);
                     }
-                });
-        }
-        Some(Bins::U32(cols)) => {
-            let row_words = record * n_records;
-            store
-                .par_chunks_mut(row_words)
-                .enumerate()
-                .for_each(|(r, row)| {
-                    for (b, out) in row.chunks_exact_mut(record).enumerate() {
-                        let mut bins = sentinel;
-                        for (f, bin) in bins.iter_mut().enumerate() {
-                            let feature = b * RECORD_FEATURES + f;
-                            if feature < f_count {
-                                *bin = cols[feature * n + r];
-                            }
-                        }
-                        write_record(out, &bins, u16_pack);
-                    }
-                });
-        }
-        None => {
-            // Sparse: walk each row's CSR entries once, mapping bins to
-            // their owning feature, and leave the rest at the sentinel.
-            let cuts = index.cuts();
-            let starts: Vec<u32> = (0..f_count)
-                .map(|f| cuts.feature_bins(f).0 as u32)
-                .collect();
-            let row_ptr = index.row_ptr();
-            let bins = index.bins();
-            let row_words = record * n_records;
-            store.par_chunks_mut(row_words).enumerate().for_each_init(
-                || vec![sentinel; n_records],
-                |scratch, (r, row)| {
-                    scratch.fill(sentinel);
-                    let (s, e) = (row_ptr[r], row_ptr[r + 1]);
-                    let row_bins: Vec<u32> = match bins {
-                        Bins::U16(b) => b[s..e].iter().copied().map(u32::from).collect(),
-                        Bins::U32(b) => b[s..e].to_vec(),
-                    };
-                    for bin in row_bins {
-                        let feature = starts.partition_point(|&start| start <= bin) - 1;
-                        scratch[feature / RECORD_FEATURES][feature % RECORD_FEATURES] = bin;
-                    }
-                    for (b, out) in row.chunks_exact_mut(record).enumerate() {
-                        write_record(out, &scratch[b], u16_pack);
-                    }
-                },
-            );
-        }
+                    write_record(out, &bins, u16_pack);
+                }
+            });
+    } else {
+        // Sparse: walk each row's CSR entries once, mapping bins to
+        // their owning feature, and leave the rest at the sentinel.
+        let cuts = index.cuts();
+        let starts: Vec<u32> = (0..f_count)
+            .map(|f| cuts.feature_bins(f).0 as u32)
+            .collect();
+        let row_ptr = index.row_ptr();
+        let bins = index.bins();
+        let row_words = record * n_records;
+        store.par_chunks_mut(row_words).enumerate().for_each_init(
+            || vec![sentinel; n_records],
+            |scratch, (r, row)| {
+                scratch.fill(sentinel);
+                let (s, e) = (row_ptr[r], row_ptr[r + 1]);
+                let mut place = |bin: u32| {
+                    let feature = starts.partition_point(|&start| start <= bin) - 1;
+                    scratch[feature / RECORD_FEATURES][feature % RECORD_FEATURES] = bin;
+                };
+                match &bins {
+                    Bins::U16(b) => b[s..e].iter().for_each(|&bin| place(u32::from(bin))),
+                    Bins::U32(b) => b[s..e].iter().for_each(|&bin| place(bin)),
+                }
+                for (b, out) in row.chunks_exact_mut(record).enumerate() {
+                    write_record(out, &scratch[b], u16_pack);
+                }
+            },
+        );
     }
     Ok(buffer)
 }

@@ -504,6 +504,41 @@ block tail walk between the generic and symmetric kernels was dropped: it
 made quantile prediction 4.6% and symmetric prediction 2.2% slower in the
 same build comparison.
 
+### Categorical and sparse partitions
+
+Categorical splits used to route every row through a per-row bin lookup and a
+scan of the category set, and indexes without a column copy (sparse, less than
+half full) through an out-of-line per-row lookup, serially. Both now use the
+branch-free partition loop (see [Implementation](#implementation)); every row
+goes where its bin decides, so trees are unchanged (a unit test compares every
+layout with per-row routing).
+
+Measured on the 192-core **AWS Neoverse-V3** host (Rust 1.98.1, bench profile)
+on 2026-09-25 UTC with `scripts/compare_benchmarks.py` (Criterion medians,
+baseline/optimized/optimized/baseline; 10 samples per run, except
+`hist_tree_build/missing`, whose benchmark group sets 100), before and after
+this change, applied to the benchmark-coverage commit (without the changes
+described above). The host ran other jobs at the same time.
+
+| Case | Threads | Before (ms) | After (ms) |
+|---|---:|---:|---:|
+| `train_variants_50k_x20_20rounds/categorical` | 1 | 104.67 | 90.70 |
+| `train_variants_50k_x20_20rounds/categorical` | 16 | 23.02 | 20.00 |
+| `train_variants_50k_x20_20rounds/csr` | 1 | 112.90 | 95.40 |
+| `train_variants_50k_x20_20rounds/csr` | 16 | 45.08 | 28.64 |
+| `train_50k_x20_50rounds/Hist` (dense, numeric) | 1 | 169.57 | 168.58 |
+| `train_50k_x20_50rounds/Hist` (dense, numeric) | 16 | 43.33 | 43.76 |
+| `hist_tree_build/missing` | 1 | 3.83 | 3.86 |
+| `hist_tree_build/missing` | 16 | 0.82 | 0.81 |
+| 4,000-category feature, 50k rows, depth 10, 20 rounds | 1 | 985.2 | 155.7 |
+| 4,000-category feature, 50k rows, depth 10, 20 rounds | 16 | 903.3 | 67.4 |
+
+Dense numeric and half-full cases take unchanged code; their differences are
+host noise. The 4,000-category case comes from a throwaway harness (one
+categorical and three numeric features, `max_bin = 4096`, single timed runs):
+a split's per-bin left-set table marks each left category's bin (a binary
+search per category) instead of testing every bin against the whole set.
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks
@@ -582,8 +617,10 @@ order). Large dense inputs are validated and copied in parallel. Ordered
 collection preserves the cut layout, row order, missing-value handling,
 categorical bins, and the choice of 16- or 32-bit bin storage. A sparse index
 at least half full also keeps a column-major copy with a missing sentinel,
-so partitions stream one column. This scheduling is independent of the CPU
-architecture.
+so partitions stream one column; categorical splits stream the same columns
+through a per-bin table of the left category set. Sparser indexes route each
+row by scanning its stored bins inline, in fixed row-order chunks in parallel
+for large nodes. This scheduling is independent of the CPU architecture.
 
 ### Prediction
 

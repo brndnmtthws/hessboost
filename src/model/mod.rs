@@ -1286,20 +1286,7 @@ impl BoostedModel {
     /// container of named, typed sections holding the trees column-wise.
     /// Files written by this version keep loading in later ones.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        native::write(&native::StoredRef {
-            trees: &self.trees,
-            base_score: &self.base_score,
-            objective: &self.objective,
-            objective_params: &self.objective_params,
-            num_class: self.num_class,
-            n_outputs: self.n_outputs,
-            n_targets: self.n_targets,
-            n_features: self.n_features,
-            best_iteration: self.best_iteration,
-            tree_weights: &self.tree_weights,
-            num_parallel_tree: self.num_parallel_tree,
-            linear: self.linear.as_ref(),
-        })
+        native::write(self)
     }
 
     /// Deserialize a model from bytes produced by [`BoostedModel::to_bytes`]
@@ -1307,22 +1294,7 @@ impl BoostedModel {
     /// a feature this version lacks, are refused with
     /// [`HessboostError::ModelFormat`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let m = native::read(bytes)?;
-        let model = BoostedModel {
-            trees: m.trees,
-            base_score: m.base_score,
-            objective: m.objective,
-            objective_params: m.objective_params,
-            num_class: m.num_class,
-            n_outputs: m.n_outputs,
-            n_targets: m.n_targets,
-            n_features: m.n_features,
-            best_iteration: m.best_iteration,
-            tree_weights: m.tree_weights,
-            num_parallel_tree: m.num_parallel_tree,
-            linear: m.linear,
-            compact: OnceLock::new(),
-        };
+        let model = native::read(bytes)?;
         model.validate_structure()?;
         Ok(model)
     }

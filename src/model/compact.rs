@@ -127,7 +127,6 @@ use crate::model::{
     BoostedModel, RowBlock, check_objective_width, initial_margins, transform_model_margins,
     validate_prediction_data,
 };
-use crate::tree::reuse::canonical_categories;
 use crate::tree::{Node, RegTree, scalar_tree_output};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -186,7 +185,7 @@ impl Meta {
 
     /// The metadata as a section table, the objective parameters only when
     /// they differ from the objective's defaults.
-    fn encode(&self) -> Vec<u8> {
+    fn section_table(&self) -> Writer {
         let mut w = Writer::default();
         w.str("objective", &self.objective);
         w.u64("num_class", self.num_class as u64);
@@ -195,9 +194,7 @@ impl Meta {
         if let Some(params) = &self.objective_params {
             write_objective_params(&mut w, params);
         }
-        let mut out = Vec::new();
-        w.finish(&mut out);
-        out
+        w
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
@@ -223,12 +220,15 @@ impl Meta {
 
 /// The serialized model: magic, version and length prefix, then the
 /// metadata section table and the bit `stream`.
-fn frame(meta: &[u8], stream: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(PREFIX_BYTES + meta.len() + stream.len());
+fn frame(meta: &Meta, stream: &[u8]) -> Vec<u8> {
+    let table = meta.section_table();
+    let mut bytes = Vec::with_capacity(PREFIX_BYTES + table.encoded_len() + stream.len());
     bytes.extend_from_slice(MAGIC);
     bytes.push(VERSION);
-    bytes.extend_from_slice(&(meta.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(meta);
+    bytes.extend_from_slice(&[0; 4]);
+    table.finish(&mut bytes);
+    let meta_len = (bytes.len() - PREFIX_BYTES) as u32;
+    bytes[MAGIC.len() + 1..PREFIX_BYTES].copy_from_slice(&meta_len.to_le_bytes());
     bytes.extend_from_slice(stream);
     bytes
 }
@@ -269,20 +269,33 @@ struct BitWriter {
 }
 
 impl BitWriter {
+    /// Append the low `width` bits of `value` (the rest must be zero; a
+    /// zero `value` may be any width, as padding).
     fn write(&mut self, value: u64, width: u32) {
         debug_assert!(
-            width == 64 || value >> width == 0,
+            width >= 64 || value >> width == 0,
             "value exceeds its field"
         );
-        for j in 0..width {
-            if self.len.is_multiple_of(8) {
-                self.bytes.push(0);
-            }
-            if (value >> j) & 1 == 1 {
-                self.bytes[self.len / 8] |= 1 << (self.len % 8);
-            }
-            self.len += 1;
+        let mut value = value;
+        let mut remaining = width;
+        // Fill the partial last byte, then append whole bytes.
+        let used = (self.len % 8) as u32;
+        if used != 0
+            && remaining > 0
+            && let Some(last) = self.bytes.last_mut()
+        {
+            let take = (8 - used).min(remaining);
+            *last |= ((value & ((1 << take) - 1)) as u8) << used;
+            value >>= take;
+            remaining -= take;
         }
+        while remaining > 0 {
+            let take = remaining.min(8);
+            self.bytes.push((value & ((1 << take) - 1)) as u8);
+            value >>= take;
+            remaining -= take;
+        }
+        self.len += width as usize;
     }
 
     fn write_bool(&mut self, value: bool) {
@@ -561,7 +574,7 @@ impl Layout {
 #[derive(Debug, Clone, Copy)]
 struct PackedTree {
     layout: Layout,
-    /// Stream bit offset of the tree's first slot.
+    /// Bit offset of the tree's first slot in the padded serialized bytes.
     offset: usize,
 }
 
@@ -587,10 +600,10 @@ enum Slot {
 /// serialized bytes plus the decoded threshold and leaf dictionaries.
 #[derive(Debug, Clone)]
 pub struct CompactModel {
-    /// The serialized form, as [`CompactModel::to_bytes`] returns it.
+    /// The serialized form, as [`CompactModel::to_bytes`] returns it,
+    /// followed by [`STREAM_PAD`] zero bytes so a field read may always load
+    /// eight bytes; tree offsets index its bits.
     bytes: Vec<u8>,
-    /// The bit stream followed by [`STREAM_PAD`] zero bytes.
-    stream: Vec<u8>,
     meta: Meta,
     n_features: usize,
     base_score: Vec<f32>,
@@ -600,6 +613,208 @@ pub struct CompactModel {
     leaf_values: Vec<f32>,
     widths: Widths,
     trees: Vec<PackedTree>,
+}
+
+/// The bit stream's leading metadata fields (layout item 1).
+struct Header {
+    n_features: usize,
+    base_score: Vec<f32>,
+    n_trees: usize,
+    tree_weights: Option<Vec<f32>>,
+    default_mode: u32,
+    n_used: usize,
+    max_thresholds: u32,
+    n_leaves: usize,
+    heap_depth_bits: u32,
+    preorder_nodes_bits: u32,
+}
+
+/// One feature map entry (layout item 2) before its dictionary is read.
+struct MapSpec {
+    input: usize,
+    kind: u32,
+    /// Value width in bits.
+    width: u32,
+    /// Dictionary size.
+    count: usize,
+    /// Width of a categorical set's length (`0` for numeric features).
+    len_bits: u32,
+}
+
+/// Read the [`Header`] and check it against the metadata `meta`.
+fn read_header(r: &mut BitReader, meta: &Meta) -> Result<Header> {
+    let n_features = r.read_usize(32)?;
+    let n_outputs = r.read_usize(32)?;
+    if n_features == 0 || n_outputs == 0 {
+        return Err(format_error("feature and output counts must be positive"));
+    }
+    if meta.num_class >= 2 && n_outputs != meta.num_class {
+        return Err(format_error("output count does not match num_class"));
+    }
+    check_objective_width(
+        &meta.objective,
+        &meta.objective_params(),
+        meta.num_class,
+        meta.n_targets,
+        n_outputs,
+    )?;
+    let base_score = r.read_finite_f32s(n_outputs, "base score")?;
+    let n_trees = r.read_usize(32)?;
+    let per_iteration = n_outputs
+        .checked_mul(meta.num_parallel_tree)
+        .ok_or_else(|| format_error("trees per iteration overflow"))?;
+    if !n_trees.is_multiple_of(per_iteration) {
+        return Err(format_error(
+            "tree count is not a multiple of the trees per iteration",
+        ));
+    }
+    r.ensure_fits(n_trees, 1, "tree")?;
+    let tree_weights = if r.read_bool()? {
+        Some(r.read_finite_f32s(n_trees, "tree weight")?)
+    } else {
+        None
+    };
+    let default_mode = r.read(2)?;
+    if default_mode > DEFAULT_PER_NODE {
+        return Err(format_error("invalid default-direction mode"));
+    }
+    let header = Header {
+        n_features,
+        base_score,
+        n_trees,
+        tree_weights,
+        default_mode,
+        n_used: r.read_usize(32)?,
+        max_thresholds: r.read(32)?,
+        n_leaves: r.read_usize(32)?,
+        heap_depth_bits: r.read(6)?,
+        preorder_nodes_bits: r.read(6)?,
+    };
+    if header.n_used > n_features || (header.n_used == 0) != (header.max_thresholds == 0) {
+        return Err(format_error("inconsistent feature map counts"));
+    }
+    Ok(header)
+}
+
+/// Read the feature & threshold map (layout item 2).
+fn read_feature_map(r: &mut BitReader, header: &Header, widths: Widths) -> Result<Vec<MapSpec>> {
+    let input_bits = bits(header.n_features as u64 - 1);
+    r.ensure_fits(header.n_used, 5, "used feature")?;
+    let mut map: Vec<MapSpec> = Vec::with_capacity(header.n_used);
+    for _ in 0..header.n_used {
+        let input = r.read_usize(input_bits)?;
+        let kind = r.read(2)?;
+        let code = r.read(3)?;
+        if code > 5 {
+            return Err(format_error("threshold width code exceeds 5"));
+        }
+        let count = r
+            .read_usize(widths.threshold_ref)?
+            .checked_add(1)
+            .ok_or_else(|| format_error("dictionary size overflow"))?;
+        if count > header.max_thresholds as usize {
+            return Err(format_error("dictionary larger than its declared maximum"));
+        }
+        let len_bits = if kind == KIND_CATEGORICAL {
+            r.read(6)?
+        } else {
+            0
+        };
+        if kind == KIND_CATEGORICAL && !(1..=32).contains(&len_bits) {
+            return Err(format_error("category set lengths need 1 to 32 bits"));
+        }
+        if input >= header.n_features || map.last().is_some_and(|prev| prev.input >= input) {
+            return Err(format_error("feature map entries must ascend"));
+        }
+        map.push(MapSpec {
+            input,
+            kind,
+            width: 1u32 << code,
+            count,
+            len_bits,
+        });
+    }
+    Ok(map)
+}
+
+/// Read each map entry's dictionary (layout item 3, the global thresholds).
+fn read_dictionaries(r: &mut BitReader, map: &[MapSpec]) -> Result<Vec<FeatureEntry>> {
+    let mut features = Vec::with_capacity(map.len());
+    for spec in map {
+        let &MapSpec {
+            input,
+            kind,
+            width,
+            count,
+            len_bits,
+        } = spec;
+        let dict = if kind == KIND_CATEGORICAL {
+            r.ensure_fits(count, len_bits as usize, "category set")?;
+            let mut sets = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = r.read_usize(len_bits)?;
+                r.ensure_fits(len, width as usize, "category")?;
+                let set = (0..len)
+                    .map(|_| r.read(width))
+                    .collect::<Result<Vec<_>>>()?;
+                if !set.is_sorted() {
+                    return Err(format_error("category sets must be sorted"));
+                }
+                sets.push(set);
+            }
+            Dictionary::Categorical(sets)
+        } else {
+            r.ensure_fits(count, width as usize, "threshold")?;
+            let values = (0..count)
+                .map(|_| decode_threshold(r.read(width)?, kind, width))
+                .collect::<Result<Vec<_>>>()?;
+            Dictionary::Numeric(values)
+        };
+        features.push(FeatureEntry { input, dict });
+    }
+    Ok(features)
+}
+
+/// Read each tree's layout (layout item 5) and record its slot offset,
+/// skipping its slots; nothing but zero padding may follow the last tree.
+fn read_tree_layouts(
+    r: &mut BitReader,
+    header: &Header,
+    widths: Widths,
+) -> Result<Vec<PackedTree>> {
+    let mut trees = Vec::with_capacity(header.n_trees);
+    for _ in 0..header.n_trees {
+        let layout = if r.read_bool()? {
+            let nodes = r.read(header.preorder_nodes_bits)?.checked_add(1);
+            Layout::Preorder {
+                nodes: nodes.ok_or_else(|| format_error("preorder node count overflow"))?,
+            }
+        } else {
+            let depth = r.read(header.heap_depth_bits)?;
+            if depth > MAX_HEAP_DEPTH {
+                return Err(format_error(format!(
+                    "heap tree deeper than {MAX_HEAP_DEPTH}"
+                )));
+            }
+            Layout::Heap {
+                depth,
+                complete: r.read_bool()?,
+            }
+        };
+        let total = layout.total_bits(widths);
+        if total > r.remaining() as u128 {
+            return Err(format_error("truncated tree"));
+        }
+        trees.push(PackedTree {
+            layout,
+            offset: r.pos,
+        });
+        r.pos += total as usize;
+    }
+    if r.remaining() >= 8 || read_bits(r.stream, r.pos, r.remaining() as u32) != 0 {
+        return Err(format_error("trailing data after the last tree"));
+    }
+    Ok(trees)
 }
 
 impl CompactModel {
@@ -616,175 +831,49 @@ impl CompactModel {
             return Err(format_error("num_parallel_tree must be positive"));
         }
 
-        let mut stream = stream.to_vec();
-        let len = stream.len() * 8;
-        stream.resize(stream.len() + STREAM_PAD, 0);
+        let mut padded = Vec::with_capacity(bytes.len() + STREAM_PAD);
+        padded.extend_from_slice(bytes);
+        padded.resize(bytes.len() + STREAM_PAD, 0);
+        let too_large = || format_error("model is too large");
         let mut r = BitReader {
-            stream: &stream,
-            len,
-            pos: 0,
+            stream: &padded,
+            len: bytes.len().checked_mul(8).ok_or_else(too_large)?,
+            pos: (bytes.len() - stream.len())
+                .checked_mul(8)
+                .ok_or_else(too_large)?,
         };
-
-        let n_features = r.read_usize(32)?;
-        let n_outputs = r.read_usize(32)?;
-        if n_features == 0 || n_outputs == 0 {
-            return Err(format_error("feature and output counts must be positive"));
-        }
-        if meta.num_class >= 2 && n_outputs != meta.num_class {
-            return Err(format_error("output count does not match num_class"));
-        }
-        check_objective_width(
-            &meta.objective,
-            &meta.objective_params(),
-            meta.num_class,
-            meta.n_targets,
-            n_outputs,
-        )?;
-        let base_score = r.read_finite_f32s(n_outputs, "base score")?;
-        let n_trees = r.read_usize(32)?;
-        let per_iteration = n_outputs
-            .checked_mul(meta.num_parallel_tree)
-            .ok_or_else(|| format_error("trees per iteration overflow"))?;
-        if !n_trees.is_multiple_of(per_iteration) {
-            return Err(format_error(
-                "tree count is not a multiple of the trees per iteration",
-            ));
-        }
-        r.ensure_fits(n_trees, 1, "tree")?;
-        let tree_weights = if r.read_bool()? {
-            Some(r.read_finite_f32s(n_trees, "tree weight")?)
-        } else {
-            None
-        };
-        let default_mode = r.read(2)?;
-        if default_mode > DEFAULT_PER_NODE {
-            return Err(format_error("invalid default-direction mode"));
-        }
-        let n_used = r.read_usize(32)?;
-        let max_thresholds = r.read(32)?;
-        let n_leaves = r.read_usize(32)?;
-        let heap_depth_bits = r.read(6)?;
-        let preorder_nodes_bits = r.read(6)?;
-        if n_used > n_features || (n_used == 0) != (max_thresholds == 0) {
-            return Err(format_error("inconsistent feature map counts"));
-        }
-        let widths = Widths::new(n_used, max_thresholds as usize, n_leaves, default_mode);
-
-        // Feature & threshold map.
-        let input_bits = bits(n_features as u64 - 1);
-        r.ensure_fits(n_used, 5, "used feature")?;
-        let mut map: Vec<(usize, u32, u32, usize, u32)> = Vec::with_capacity(n_used);
-        for _ in 0..n_used {
-            let input = r.read_usize(input_bits)?;
-            let kind = r.read(2)?;
-            let code = r.read(3)?;
-            if code > 5 {
-                return Err(format_error("threshold width code exceeds 5"));
-            }
-            let count = r
-                .read_usize(widths.threshold_ref)?
-                .checked_add(1)
-                .ok_or_else(|| format_error("dictionary size overflow"))?;
-            if count > max_thresholds as usize {
-                return Err(format_error("dictionary larger than its declared maximum"));
-            }
-            let len_bits = if kind == KIND_CATEGORICAL {
-                r.read(6)?
-            } else {
-                0
-            };
-            if kind == KIND_CATEGORICAL && !(1..=32).contains(&len_bits) {
-                return Err(format_error("category set lengths need 1 to 32 bits"));
-            }
-            if input >= n_features || map.last().is_some_and(|&(prev, ..)| prev >= input) {
-                return Err(format_error("feature map entries must ascend"));
-            }
-            map.push((input, kind, 1u32 << code, count, len_bits));
-        }
-
-        // Global thresholds.
-        let mut features = Vec::with_capacity(n_used);
-        for &(input, kind, width, count, len_bits) in &map {
-            let dict = if kind == KIND_CATEGORICAL {
-                r.ensure_fits(count, len_bits as usize, "category set")?;
-                let mut sets = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let len = r.read_usize(len_bits)?;
-                    r.ensure_fits(len, width as usize, "category")?;
-                    let set = (0..len)
-                        .map(|_| r.read(width))
-                        .collect::<Result<Vec<_>>>()?;
-                    if !set.is_sorted() {
-                        return Err(format_error("category sets must be sorted"));
-                    }
-                    sets.push(set);
-                }
-                Dictionary::Categorical(sets)
-            } else {
-                r.ensure_fits(count, width as usize, "threshold")?;
-                let values = (0..count)
-                    .map(|_| decode_threshold(r.read(width)?, kind, width))
-                    .collect::<Result<Vec<_>>>()?;
-                Dictionary::Numeric(values)
-            };
-            features.push(FeatureEntry { input, dict });
-        }
-
-        // Global leaf values.
-        let leaf_values = r.read_finite_f32s(n_leaves, "leaf value")?;
-
-        let mut model = CompactModel {
-            bytes: Vec::new(),
-            stream: Vec::new(),
+        let header = read_header(&mut r, &meta)?;
+        let widths = Widths::new(
+            header.n_used,
+            header.max_thresholds as usize,
+            header.n_leaves,
+            header.default_mode,
+        );
+        let map = read_feature_map(&mut r, &header, widths)?;
+        let features = read_dictionaries(&mut r, &map)?;
+        let leaf_values = r.read_finite_f32s(header.n_leaves, "leaf value")?;
+        let trees = read_tree_layouts(&mut r, &header, widths)?;
+        let model = CompactModel {
+            bytes: padded,
             meta,
-            n_features,
-            base_score,
-            tree_weights,
-            default_mode,
+            n_features: header.n_features,
+            base_score: header.base_score,
+            tree_weights: header.tree_weights,
+            default_mode: header.default_mode,
             features,
             leaf_values,
             widths,
-            trees: Vec::with_capacity(n_trees),
+            trees,
         };
-
-        // Trees: record each one's layout and slot offset, then validate it.
-        for _ in 0..n_trees {
-            let layout = if r.read_bool()? {
-                let nodes = r.read(preorder_nodes_bits)?.checked_add(1);
-                Layout::Preorder {
-                    nodes: nodes.ok_or_else(|| format_error("preorder node count overflow"))?,
-                }
-            } else {
-                let depth = r.read(heap_depth_bits)?;
-                if depth > MAX_HEAP_DEPTH {
-                    return Err(format_error(format!(
-                        "heap tree deeper than {MAX_HEAP_DEPTH}"
-                    )));
-                }
-                Layout::Heap {
-                    depth,
-                    complete: r.read_bool()?,
-                }
-            };
-            let total = layout.total_bits(widths);
-            if total > r.remaining() as u128 {
-                return Err(format_error("truncated tree"));
-            }
-            model.trees.push(PackedTree {
-                layout,
-                offset: r.pos,
-            });
-            r.pos += total as usize;
-        }
-        if r.remaining() >= 8 || read_bits(&stream, r.pos, r.remaining() as u32) != 0 {
-            return Err(format_error("trailing data after the last tree"));
-        }
-        model.stream = stream;
         for t in 0..model.trees.len() {
             model.validate_tree(t)?;
         }
-        model.bytes = bytes.to_vec();
         Ok(model)
+    }
+
+    /// The serialized bytes, without the padding.
+    fn serialized(&self) -> &[u8] {
+        &self.bytes[..self.bytes.len() - STREAM_PAD]
     }
 
     /// Check every reachable slot of tree `t`: references inside the
@@ -881,7 +970,7 @@ impl CompactModel {
     #[inline]
     fn slot(&self, tree: PackedTree, i: u32, leaf_level: bool) -> Slot {
         let w = self.widths;
-        let s = &self.stream;
+        let s = &self.bytes;
         let (mut pos, flagged) = match tree.layout {
             Layout::Heap { depth, complete } => {
                 let internal = (1usize << depth) - 1;
@@ -1020,17 +1109,17 @@ impl CompactModel {
 
     /// The serialized model (the exact bytes it was parsed from).
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.bytes.clone()
+        self.serialized().to_vec()
     }
 
     /// Serialized size in bytes.
     pub fn size_bytes(&self) -> usize {
-        self.bytes.len()
+        self.serialized().len()
     }
 
     /// Save the serialized model to a file.
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        std::fs::write(path, &self.bytes)?;
+        std::fs::write(path, self.serialized())?;
         Ok(())
     }
 
@@ -1172,27 +1261,42 @@ struct MapEntry {
     dict: Dictionary,
 }
 
-/// Depth of the deepest leaf (root = 0) and whether every leaf sits there.
-fn depth_and_completeness(tree: &RegTree) -> (u32, bool) {
-    let mut depths = Vec::new();
-    let mut stack = vec![(0usize, 0u32)];
+/// `cats` sorted and deduplicated into `scratch`: the set identity under
+/// which the dictionaries store categorical splits
+/// ([`canonical_categories`](crate::tree::reuse::canonical_categories)).
+fn canonical<'s>(cats: &[u32], scratch: &'s mut Vec<u32>) -> &'s [u32] {
+    scratch.clear();
+    scratch.extend_from_slice(cats);
+    scratch.sort_unstable();
+    scratch.dedup();
+    scratch
+}
+
+/// Depth of the deepest leaf (root = 0) and whether every leaf sits there;
+/// `stack` is scratch.
+fn depth_and_completeness(tree: &RegTree, stack: &mut Vec<(usize, u32)>) -> (u32, bool) {
+    stack.clear();
+    stack.push((0, 0));
+    let (mut shallowest, mut deepest) = (u32::MAX, 0);
     while let Some((id, d)) = stack.pop() {
         let node = tree.node(id);
         if node.is_leaf() {
-            depths.push(d);
+            shallowest = shallowest.min(d);
+            deepest = deepest.max(d);
         } else {
             stack.push((node.left as usize, d + 1));
             stack.push((node.right as usize, d + 1));
         }
     }
-    let max = depths.iter().copied().max().unwrap_or(0);
-    (max, depths.iter().all(|&d| d == max))
+    (deepest, shallowest >= deepest)
 }
 
-/// Node ids in preorder (node, left subtree, right subtree).
-fn preorder(tree: &RegTree) -> Vec<usize> {
-    let mut order = Vec::with_capacity(tree.num_nodes());
-    let mut stack = vec![0usize];
+/// Node ids in preorder (node, left subtree, right subtree) into `order`;
+/// `stack` is scratch.
+fn preorder(tree: &RegTree, order: &mut Vec<usize>, stack: &mut Vec<usize>) {
+    order.clear();
+    stack.clear();
+    stack.push(0);
     while let Some(id) = stack.pop() {
         order.push(id);
         let node = tree.node(id);
@@ -1201,11 +1305,10 @@ fn preorder(tree: &RegTree) -> Vec<usize> {
             stack.push(node.left as usize);
         }
     }
-    order
 }
 
-/// Serialize `model` in the compact layout.
-fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
+/// Refuse the models the compact layout cannot express.
+fn check_encodable(model: &BoostedModel) -> Result<()> {
     if model.linear().is_some() {
         return Err(format_error(
             "gblinear models have no trees to store; use the native format",
@@ -1225,14 +1328,25 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
             "vector-leaf trees (`multi_output_tree`) have no compact encoding; use the native format",
         ));
     }
-    let trees = &model.trees()[..model.effective_num_trees()];
-    let n_features = model.n_features();
+    Ok(())
+}
 
-    // Dictionaries: used features, their thresholds/sets, leaf values.
-    let mut collected: BTreeMap<u32, Collected> = BTreeMap::new();
+/// The dictionaries of `trees`: each used feature's thresholds or sets, the
+/// distinct leaf values in first-seen order with their index, and the
+/// default-direction mode.
+struct Collection {
+    features: BTreeMap<u32, Collected>,
+    leaf_index: HashMap<u32, u32>,
+    leaf_values: Vec<f32>,
+    default_mode: u32,
+}
+
+fn collect(trees: &[RegTree]) -> Result<Collection> {
+    let mut features: BTreeMap<u32, Collected> = BTreeMap::new();
     let mut leaf_index: HashMap<u32, u32> = HashMap::new();
     let mut leaf_values: Vec<f32> = Vec::new();
     let (mut any_left, mut any_right) = (false, false);
+    let mut cats = Vec::new();
     for tree in trees {
         for node in tree.nodes() {
             if node.is_leaf() {
@@ -1246,7 +1360,7 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
             }
             any_left |= node.default_left;
             any_right |= !node.default_left;
-            let entry = collected.entry(node.split_feature).or_insert_with(|| {
+            let entry = features.entry(node.split_feature).or_insert_with(|| {
                 if node.is_categorical {
                     Collected::Categorical(BTreeSet::new())
                 } else {
@@ -1258,7 +1372,10 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
                     set.insert(node.split_cond.to_bits());
                 }
                 (Collected::Categorical(sets), true) => {
-                    sets.insert(canonical_categories(tree.node_categories(node)));
+                    let set = canonical(tree.node_categories(node), &mut cats);
+                    if !sets.contains(set) {
+                        sets.insert(set.to_vec());
+                    }
                 }
                 _ => {
                     return Err(format_error(format!(
@@ -1274,68 +1391,62 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
         (false, true) => DEFAULT_ALL_RIGHT,
         _ => DEFAULT_ALL_LEFT,
     };
+    Ok(Collection {
+        features,
+        leaf_index,
+        leaf_values,
+        default_mode,
+    })
+}
 
-    // Feature map entries with sorted dictionaries and reference lookups.
-    let mut map: Vec<MapEntry> = Vec::with_capacity(collected.len());
-    let mut feature_ref: HashMap<u32, u32> = HashMap::new();
-    let mut numeric_ref: HashMap<(u32, u32), u32> = HashMap::new();
-    let mut set_ref: HashMap<(u32, Vec<u32>), u32> = HashMap::new();
-    for (&input, dict) in &collected {
-        feature_ref.insert(input, map.len() as u32);
-        match dict {
+/// Feature map entries in ascending input order, with sorted dictionaries
+/// and their narrowest encodings.
+fn feature_map(features: BTreeMap<u32, Collected>) -> Vec<MapEntry> {
+    features
+        .into_iter()
+        .map(|(input, dict)| match dict {
             Collected::Numeric(set) => {
                 let mut values: Vec<f32> = set.iter().map(|&b| f32::from_bits(b)).collect();
                 values.sort_by(f32::total_cmp);
-                for (i, v) in values.iter().enumerate() {
-                    numeric_ref.insert((input, v.to_bits()), i as u32);
-                }
                 let (kind, code) = numeric_encoding(&values);
-                map.push(MapEntry {
+                MapEntry {
                     input,
                     kind,
                     code,
                     len_bits: 0,
                     dict: Dictionary::Numeric(values),
-                });
+                }
             }
             Collected::Categorical(sets) => {
-                let sets: Vec<Vec<u32>> = sets.iter().cloned().collect();
+                let sets: Vec<Vec<u32>> = sets.into_iter().collect();
                 let max_cat = sets.iter().flatten().copied().max().unwrap_or(0);
                 let code = (0..=5u32)
                     .find(|&c| bits(u64::from(max_cat)) <= 1 << c)
                     .unwrap_or(5);
                 let max_len = sets.iter().map(Vec::len).max().unwrap_or(0);
-                for (i, s) in sets.iter().enumerate() {
-                    set_ref.insert((input, s.clone()), i as u32);
-                }
-                map.push(MapEntry {
+                MapEntry {
                     input,
                     kind: KIND_CATEGORICAL,
                     code,
                     len_bits: bits(max_len as u64).max(1),
                     dict: Dictionary::Categorical(sets),
-                });
+                }
             }
-        }
-    }
-    let max_thresholds = map.iter().map(|e| e.dict.len()).max().unwrap_or(0);
-    let widths = Widths::new(map.len(), max_thresholds, leaf_values.len(), default_mode);
-    if u32::try_from(max_thresholds).is_err()
-        || u32::try_from(leaf_values.len()).is_err()
-        || u32::try_from(trees.len()).is_err()
-        || u32::try_from(n_features).is_err()
-    {
-        return Err(format_error("model too large for 32-bit counts"));
-    }
+        })
+        .collect()
+}
 
-    // Per-tree layout choice.
+/// The smaller layout of each tree (heap only up to [`MAX_HEAP_DEPTH`]),
+/// and the widths of the heap depths and preorder node counts.
+fn choose_layouts(trees: &[RegTree], widths: Widths) -> (Vec<Layout>, u32, u32) {
+    let mut stack = Vec::new();
     let layouts: Vec<Layout> = trees
         .iter()
         .map(|tree| {
             let preorder = Layout::Preorder {
                 nodes: tree.num_nodes() as u32,
             };
-            let (depth, complete) = depth_and_completeness(tree);
+            let (depth, complete) = depth_and_completeness(tree, &mut stack);
             let heap = Layout::Heap { depth, complete };
             if depth <= MAX_HEAP_DEPTH && heap.total_bits(widths) <= preorder.total_bits(widths) {
                 heap
@@ -1355,152 +1466,278 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
             }
         }
     }
+    (layouts, heap_depth_bits, preorder_nodes_bits)
+}
 
-    let mut w = BitWriter::default();
-    w.write(n_features as u64, 32);
-    w.write(model.n_outputs() as u64, 32);
-    for &b in model.base_scores() {
-        w.write_f32(b);
-    }
-    w.write(trees.len() as u64, 32);
-    let weights: Vec<f32> = (0..trees.len()).map(|t| model.tree_weight(t)).collect();
-    let weighted = weights.iter().any(|&x| x.to_bits() != 1.0f32.to_bits());
-    w.write_bool(weighted);
-    if weighted {
-        for &x in &weights {
-            w.write_f32(x);
-        }
-    }
-    w.write(u64::from(default_mode), 2);
-    w.write(map.len() as u64, 32);
-    w.write(max_thresholds as u64, 32);
-    w.write(leaf_values.len() as u64, 32);
-    w.write(u64::from(heap_depth_bits), 6);
-    w.write(u64::from(preorder_nodes_bits), 6);
+/// Everything [`encode`] derives from the model before writing the bit
+/// stream: the stored trees, their dictionaries and field widths, and each
+/// tree's layout.
+struct Encoding<'a> {
+    model: &'a BoostedModel,
+    trees: &'a [RegTree],
+    map: Vec<MapEntry>,
+    leaf_index: HashMap<u32, u32>,
+    leaf_values: Vec<f32>,
+    default_mode: u32,
+    max_thresholds: usize,
+    widths: Widths,
+    layouts: Vec<Layout>,
+    heap_depth_bits: u32,
+    preorder_nodes_bits: u32,
+}
 
-    let input_bits = bits(n_features as u64 - 1);
-    for e in &map {
-        w.write(u64::from(e.input), input_bits);
-        w.write(u64::from(e.kind), 2);
-        w.write(u64::from(e.code), 3);
-        w.write(e.dict.len() as u64 - 1, widths.threshold_ref);
-        if e.kind == KIND_CATEGORICAL {
-            w.write(u64::from(e.len_bits), 6);
+/// Per-tree buffers the tree writers reuse.
+#[derive(Default)]
+struct TreeScratch {
+    heap: Vec<Option<usize>>,
+    order: Vec<usize>,
+    stack: Vec<usize>,
+    position: Vec<u32>,
+    cats: Vec<u32>,
+}
+
+impl<'a> Encoding<'a> {
+    fn plan(model: &'a BoostedModel) -> Result<Self> {
+        check_encodable(model)?;
+        let trees = &model.trees()[..model.effective_num_trees()];
+        let Collection {
+            features,
+            leaf_index,
+            leaf_values,
+            default_mode,
+        } = collect(trees)?;
+        let map = feature_map(features);
+        let max_thresholds = map.iter().map(|e| e.dict.len()).max().unwrap_or(0);
+        let widths = Widths::new(map.len(), max_thresholds, leaf_values.len(), default_mode);
+        if u32::try_from(max_thresholds).is_err()
+            || u32::try_from(leaf_values.len()).is_err()
+            || u32::try_from(trees.len()).is_err()
+            || u32::try_from(model.n_features()).is_err()
+        {
+            return Err(format_error("model too large for 32-bit counts"));
         }
+        let (layouts, heap_depth_bits, preorder_nodes_bits) = choose_layouts(trees, widths);
+        Ok(Encoding {
+            model,
+            trees,
+            map,
+            leaf_index,
+            leaf_values,
+            default_mode,
+            max_thresholds,
+            widths,
+            layouts,
+            heap_depth_bits,
+            preorder_nodes_bits,
+        })
     }
-    for e in &map {
-        let width = 1u32 << e.code;
-        match &e.dict {
-            Dictionary::Numeric(values) => {
-                for &v in values {
-                    w.write(encode_threshold(v, e.kind, width), width);
-                }
+
+    /// Layout items 1 to 4: the metadata fields, the feature map, the
+    /// dictionaries, and the leaf values.
+    fn write_tables(&self, w: &mut BitWriter) {
+        let model = self.model;
+        let n_features = model.n_features();
+        w.write(n_features as u64, 32);
+        w.write(model.n_outputs() as u64, 32);
+        for &b in model.base_scores() {
+            w.write_f32(b);
+        }
+        let n_trees = self.trees.len();
+        w.write(n_trees as u64, 32);
+        let weighted = (0..n_trees).any(|t| model.tree_weight(t).to_bits() != 1.0f32.to_bits());
+        w.write_bool(weighted);
+        if weighted {
+            for t in 0..n_trees {
+                w.write_f32(model.tree_weight(t));
             }
-            Dictionary::Categorical(sets) => {
-                for set in sets {
-                    w.write(set.len() as u64, e.len_bits);
-                    for &c in set {
-                        w.write(u64::from(c), width);
+        }
+        w.write(u64::from(self.default_mode), 2);
+        w.write(self.map.len() as u64, 32);
+        w.write(self.max_thresholds as u64, 32);
+        w.write(self.leaf_values.len() as u64, 32);
+        w.write(u64::from(self.heap_depth_bits), 6);
+        w.write(u64::from(self.preorder_nodes_bits), 6);
+
+        let input_bits = bits(n_features as u64 - 1);
+        for e in &self.map {
+            w.write(u64::from(e.input), input_bits);
+            w.write(u64::from(e.kind), 2);
+            w.write(u64::from(e.code), 3);
+            w.write(e.dict.len() as u64 - 1, self.widths.threshold_ref);
+            if e.kind == KIND_CATEGORICAL {
+                w.write(u64::from(e.len_bits), 6);
+            }
+        }
+        for e in &self.map {
+            let width = 1u32 << e.code;
+            match &e.dict {
+                Dictionary::Numeric(values) => {
+                    for &v in values {
+                        w.write(encode_threshold(v, e.kind, width), width);
+                    }
+                }
+                Dictionary::Categorical(sets) => {
+                    for set in sets {
+                        w.write(set.len() as u64, e.len_bits);
+                        for &c in set {
+                            w.write(u64::from(c), width);
+                        }
                     }
                 }
             }
         }
-    }
-    for &v in &leaf_values {
-        w.write_f32(v);
+        for &v in &self.leaf_values {
+            w.write_f32(v);
+        }
     }
 
-    // Leaf reference, or split fields of an internal node.
-    let write_node = |w: &mut BitWriter, tree: &RegTree, node: &Node| {
+    /// Layout item 5: every tree in its chosen layout.
+    fn write_trees(&self, w: &mut BitWriter) {
+        let mut scratch = TreeScratch::default();
+        for (tree, &layout) in self.trees.iter().zip(&self.layouts) {
+            match layout {
+                Layout::Heap { depth, complete } => {
+                    self.write_heap_tree(w, tree, depth, complete, &mut scratch);
+                }
+                Layout::Preorder { nodes } => {
+                    self.write_preorder_tree(w, tree, nodes, &mut scratch);
+                }
+            }
+        }
+    }
+
+    /// A leaf's reference, or an internal node's split fields.
+    fn write_node(&self, w: &mut BitWriter, tree: &RegTree, node: &Node, cats: &mut Vec<u32>) {
+        let widths = self.widths;
         if node.is_leaf() {
             w.write(
-                u64::from(leaf_index[&node.leaf_value.to_bits()]),
+                u64::from(self.leaf_index[&node.leaf_value.to_bits()]),
                 widths.leaf_ref,
             );
             return;
         }
-        let f = node.split_feature;
-        w.write(u64::from(feature_ref[&f]), widths.feature_ref);
-        let t = if node.is_categorical {
-            set_ref[&(f, canonical_categories(tree.node_categories(node)))]
-        } else {
-            numeric_ref[&(f, node.split_cond.to_bits())]
-        };
-        w.write(u64::from(t), widths.threshold_ref);
+        let feature = self
+            .map
+            .binary_search_by_key(&node.split_feature, |e| e.input)
+            .expect("every split feature has a map entry");
+        w.write(feature as u64, widths.feature_ref);
+        let threshold = match &self.map[feature].dict {
+            Dictionary::Numeric(values) => {
+                values.binary_search_by(|v| v.total_cmp(&node.split_cond))
+            }
+            Dictionary::Categorical(sets) => {
+                let set = canonical(tree.node_categories(node), cats);
+                sets.binary_search_by(|s| s.as_slice().cmp(set))
+            }
+        }
+        .expect("every split threshold is in its feature's dictionary");
+        w.write(threshold as u64, widths.threshold_ref);
         if widths.default_bit == 1 {
             w.write_bool(node.default_left);
         }
-    };
-    for (tree, &layout) in trees.iter().zip(&layouts) {
-        let slot_width = layout.slot_width(widths);
-        match layout {
-            Layout::Heap { depth, complete } => {
-                w.write_bool(false);
-                w.write(u64::from(depth), heap_depth_bits);
-                w.write_bool(complete);
-                let internal = (1usize << depth) - 1;
-                let mut heap: Vec<Option<usize>> = vec![None; 2 * internal + 1];
-                heap[0] = Some(0);
-                for i in 0..internal {
-                    if let Some(id) = heap[i] {
-                        let node = tree.node(id);
-                        if !node.is_leaf() {
-                            heap[2 * i + 1] = Some(node.left as usize);
-                            heap[2 * i + 2] = Some(node.right as usize);
-                        }
-                    }
-                }
-                for (i, slot) in heap.iter().enumerate() {
-                    let start = w.len;
-                    if let Some(id) = *slot {
-                        let node = tree.node(id);
-                        if i < internal && !complete {
-                            w.write_bool(node.is_leaf());
-                        }
-                        write_node(&mut w, tree, node);
-                    }
-                    let width = if i < internal {
-                        slot_width
-                    } else {
-                        widths.leaf_ref
-                    };
-                    w.write(0, width - (w.len - start) as u32);
-                }
-            }
-            Layout::Preorder { nodes } => {
-                w.write_bool(true);
-                w.write(u64::from(nodes) - 1, preorder_nodes_bits);
-                let order = preorder(tree);
-                let mut position = vec![0u32; tree.num_nodes()];
-                for (p, &id) in order.iter().enumerate() {
-                    position[id] = p as u32;
-                }
-                let offset_bits = bits(u64::from(nodes) - 1);
-                for (p, &id) in order.iter().enumerate() {
-                    let start = w.len;
-                    let node = tree.node(id);
-                    w.write_bool(node.is_leaf());
-                    write_node(&mut w, tree, node);
-                    if !node.is_leaf() {
-                        let right = position[node.right as usize] - p as u32;
-                        w.write(u64::from(right), offset_bits);
-                    }
-                    w.write(0, slot_width - (w.len - start) as u32);
+    }
+
+    /// A tree in the heap layout of `depth`: slot `i` holds node `heap[i]`,
+    /// every slot padded to its fixed width.
+    fn write_heap_tree(
+        &self,
+        w: &mut BitWriter,
+        tree: &RegTree,
+        depth: u32,
+        complete: bool,
+        scratch: &mut TreeScratch,
+    ) {
+        let slot_width = Layout::Heap { depth, complete }.slot_width(self.widths);
+        w.write_bool(false);
+        w.write(u64::from(depth), self.heap_depth_bits);
+        w.write_bool(complete);
+        let internal = (1usize << depth) - 1;
+        let heap = &mut scratch.heap;
+        heap.clear();
+        heap.resize(2 * internal + 1, None);
+        heap[0] = Some(0);
+        for i in 0..internal {
+            if let Some(id) = heap[i] {
+                let node = tree.node(id);
+                if !node.is_leaf() {
+                    heap[2 * i + 1] = Some(node.left as usize);
+                    heap[2 * i + 2] = Some(node.right as usize);
                 }
             }
         }
+        for (i, slot) in heap.iter().enumerate() {
+            let start = w.len;
+            if let Some(id) = *slot {
+                let node = tree.node(id);
+                if i < internal && !complete {
+                    w.write_bool(node.is_leaf());
+                }
+                self.write_node(w, tree, node, &mut scratch.cats);
+            }
+            let width = if i < internal {
+                slot_width
+            } else {
+                self.widths.leaf_ref
+            };
+            w.write(0, width - (w.len - start) as u32);
+        }
     }
 
-    let meta = Meta {
-        objective: model.objective().to_string(),
-        objective_params: (*model.objective_params()
-            != ObjectiveParams::defaults_for(model.objective()))
-        .then(|| model.objective_params().clone()),
-        num_class: model.num_class(),
-        n_targets: model.n_targets(),
-        num_parallel_tree: model.num_parallel_tree(),
-    };
-    Ok(frame(&meta.encode(), &w.bytes))
+    /// A tree in the preorder layout of `nodes` nodes: each split stores the
+    /// distance to its right child.
+    fn write_preorder_tree(
+        &self,
+        w: &mut BitWriter,
+        tree: &RegTree,
+        nodes: u32,
+        scratch: &mut TreeScratch,
+    ) {
+        let slot_width = Layout::Preorder { nodes }.slot_width(self.widths);
+        w.write_bool(true);
+        w.write(u64::from(nodes) - 1, self.preorder_nodes_bits);
+        preorder(tree, &mut scratch.order, &mut scratch.stack);
+        let position = &mut scratch.position;
+        position.clear();
+        position.resize(tree.num_nodes(), 0);
+        for (p, &id) in scratch.order.iter().enumerate() {
+            position[id] = p as u32;
+        }
+        let offset_bits = bits(u64::from(nodes) - 1);
+        for (p, &id) in scratch.order.iter().enumerate() {
+            let start = w.len;
+            let node = tree.node(id);
+            w.write_bool(node.is_leaf());
+            self.write_node(w, tree, node, &mut scratch.cats);
+            if !node.is_leaf() {
+                let right = position[node.right as usize] - p as u32;
+                w.write(u64::from(right), offset_bits);
+            }
+            w.write(0, slot_width - (w.len - start) as u32);
+        }
+    }
+
+    /// The compact metadata section table.
+    fn meta(&self) -> Meta {
+        let model = self.model;
+        Meta {
+            objective: model.objective().to_string(),
+            objective_params: (*model.objective_params()
+                != ObjectiveParams::defaults_for(model.objective()))
+            .then(|| model.objective_params().clone()),
+            num_class: model.num_class(),
+            n_targets: model.n_targets(),
+            num_parallel_tree: model.num_parallel_tree(),
+        }
+    }
+}
+
+/// Serialize `model` in the compact layout.
+fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
+    let encoding = Encoding::plan(model)?;
+    let mut w = BitWriter::default();
+    encoding.write_tables(&mut w);
+    encoding.write_trees(&mut w);
+    Ok(frame(&encoding.meta(), &w.bytes))
 }
 
 #[cfg(test)]
@@ -1826,7 +2063,7 @@ mod tests {
         let (meta, stream) = split_frame(bytes).unwrap();
         let mut meta = Meta::decode(meta).unwrap();
         edit(&mut meta);
-        frame(&meta.encode(), stream)
+        frame(&meta, stream)
     }
 
     #[test]
@@ -1896,7 +2133,7 @@ mod tests {
             n_targets: 1,
             num_parallel_tree: 1,
         };
-        frame(&meta.encode(), &w.bytes)
+        frame(&meta, &w.bytes)
     }
 
     /// Validation work is bounded by the input: 4096 zero-width depth-24

@@ -31,21 +31,20 @@ pub(super) struct Writer {
 
 impl Writer {
     /// Add a section with raw `payload` bytes and `flags`.
-    pub(super) fn raw(&mut self, name: &'static str, flags: u8, payload: Vec<u8>) {
-        debug_assert!(u8::try_from(name.len()).is_ok());
-        self.sections.push((name, flags, payload));
+    pub(super) fn raw(&mut self, name: &'static str, flags: u8, payload: &[u8]) {
+        self.push(name, flags, payload.to_vec());
     }
 
     pub(super) fn str(&mut self, name: &'static str, value: &str) {
-        self.raw(name, REQUIRED, value.as_bytes().to_vec());
+        self.raw(name, REQUIRED, value.as_bytes());
     }
 
     pub(super) fn u64(&mut self, name: &'static str, value: u64) {
-        self.raw(name, REQUIRED, value.to_le_bytes().to_vec());
+        self.raw(name, REQUIRED, &value.to_le_bytes());
     }
 
     pub(super) fn f64(&mut self, name: &'static str, value: f64) {
-        self.raw(name, REQUIRED, value.to_le_bytes().to_vec());
+        self.raw(name, REQUIRED, &value.to_le_bytes());
     }
 
     /// An array of 4- or 8-byte values.
@@ -55,15 +54,32 @@ impl Writer {
         values: impl IntoIterator<Item = T>,
         to_le: fn(T) -> [u8; N],
     ) {
-        let mut payload = Vec::new();
+        let values = values.into_iter();
+        let mut payload = Vec::with_capacity(values.size_hint().0.saturating_mul(N));
         for v in values {
             payload.extend_from_slice(&to_le(v));
         }
-        self.raw(name, REQUIRED, payload);
+        self.push(name, REQUIRED, payload);
+    }
+
+    fn push(&mut self, name: &'static str, flags: u8, payload: Vec<u8>) {
+        debug_assert!(u8::try_from(name.len()).is_ok());
+        self.sections.push((name, flags, payload));
+    }
+
+    /// The number of bytes [`Writer::finish`] appends: the table, then the
+    /// payloads.
+    pub(super) fn encoded_len(&self) -> usize {
+        4 + self
+            .sections
+            .iter()
+            .map(|(name, _, payload)| 1 + name.len() + 1 + 8 + payload.len())
+            .sum::<usize>()
     }
 
     /// Append the table and payloads to `out`.
     pub(super) fn finish(self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
         out.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
         for (name, flags, payload) in &self.sections {
             out.push(name.len() as u8);
@@ -71,8 +87,8 @@ impl Writer {
             out.push(*flags);
             out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         }
-        for (_, _, payload) in self.sections {
-            out.extend_from_slice(&payload);
+        for (_, _, payload) in &self.sections {
+            out.extend_from_slice(payload);
         }
     }
 }
@@ -165,6 +181,33 @@ impl<'a> Sections<'a> {
         }
         Ok(values.iter().map(|&v| from_le(v)).collect())
     }
+
+    /// Section `name`'s payload, which must be exactly `len` bytes (`None`,
+    /// an overflowed size, never matches).
+    pub(super) fn bytes_exact(&self, name: &str, len: Option<usize>) -> Result<&'a [u8]> {
+        let bytes = self.bytes(name)?;
+        if Some(bytes.len()) == len {
+            Ok(bytes)
+        } else {
+            Err(wrong_length(name))
+        }
+    }
+
+    /// An array of exactly `count` 4- or 8-byte values.
+    pub(super) fn array_exact<const N: usize, T>(
+        &self,
+        name: &str,
+        count: usize,
+        from_le: fn([u8; N]) -> T,
+    ) -> Result<Vec<T>> {
+        let bytes = self.bytes_exact(name, count.checked_mul(N))?;
+        Ok(bytes
+            .as_chunks::<N>()
+            .0
+            .iter()
+            .map(|&v| from_le(v))
+            .collect())
+    }
 }
 
 /// A cursor over untrusted bytes.
@@ -189,4 +232,10 @@ impl<'a> Reader<'a> {
 
 pub(super) fn format_error(msg: impl Into<String>) -> HessboostError {
     HessboostError::model_format(msg)
+}
+
+/// The error for a section whose length disagrees with the counts that
+/// size it.
+pub(super) fn wrong_length(name: &str) -> HessboostError {
+    format_error(format!("section `{name}` has the wrong length"))
 }

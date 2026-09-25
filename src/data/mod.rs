@@ -11,6 +11,6 @@ mod sketch;
 pub mod target_stats;
 
 pub use dmatrix::DMatrix;
-pub(crate) use dmatrix::{Entry, is_missing};
+pub(crate) use dmatrix::is_missing;
 pub use loaders::{CsvOptions, load_csv, load_libsvm, read_csv, read_libsvm};
 pub use meta::{FeatureType, GroupInfo, MetaInfo};

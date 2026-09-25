@@ -22,6 +22,30 @@ fn parse_num<T: FromStr>(field: &str, lineno: usize, what: &str) -> Result<T> {
         .map_err(|_| parse_err(lineno, format!("invalid {what} `{field}`")))
 }
 
+/// Call `visit(lineno, line)` for every line of `reader` (0-based numbers,
+/// the line without its `\n` or `\r\n`, like [`BufRead::lines`]), reading
+/// into one reused buffer.
+fn for_each_line<R: Read>(
+    reader: R,
+    mut visit: impl FnMut(usize, &str) -> Result<()>,
+) -> Result<()> {
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    for lineno in 0.. {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        // Like `BufRead::lines`: `\r` goes only with a following `\n`.
+        let text = match line.strip_suffix('\n') {
+            Some(text) => text.strip_suffix('\r').unwrap_or(text),
+            None => &line,
+        };
+        visit(lineno, text)?;
+    }
+    Ok(())
+}
+
 /// Load a libsvm / SVMLight file into a sparse [`DMatrix`].
 ///
 /// Each line is `label idx:value idx:value ...` with **0-based** feature
@@ -32,18 +56,16 @@ pub fn load_libsvm(path: impl AsRef<Path>) -> Result<DMatrix> {
 
 /// Parse libsvm-formatted text from any reader.
 pub fn read_libsvm<R: Read>(reader: R) -> Result<DMatrix> {
-    let reader = BufReader::new(reader);
     let mut indptr = vec![0usize];
     let mut indices: Vec<u32> = Vec::new();
     let mut values: Vec<f32> = Vec::new();
     let mut labels: Vec<f32> = Vec::new();
     let mut max_index = 0u32;
 
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = line?;
+    for_each_line(reader, |lineno, line| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
-            continue;
+            return Ok(());
         }
         let mut it = line.split_whitespace();
         let label_tok = it
@@ -62,7 +84,8 @@ pub fn read_libsvm<R: Read>(reader: R) -> Result<DMatrix> {
             max_index = max_index.max(idx);
         }
         indptr.push(values.len());
-    }
+        Ok(())
+    })?;
 
     if labels.is_empty() {
         return Err(HessboostError::EmptyDataset("libsvm: no rows parsed"));
@@ -104,19 +127,14 @@ pub fn load_csv(path: impl AsRef<Path>, opts: &CsvOptions) -> Result<DMatrix> {
 
 /// Parse CSV text from any reader.
 pub fn read_csv<R: Read>(reader: R, opts: &CsvOptions) -> Result<DMatrix> {
-    let reader = BufReader::new(reader);
     let mut flat: Vec<f32> = Vec::new();
     let mut n_rows = 0;
     let mut labels: Vec<f32> = Vec::new();
     let mut n_cols: Option<usize> = None;
 
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = line?;
-        if opts.has_header && lineno == 0 {
-            continue;
-        }
-        if line.trim().is_empty() {
-            continue;
+    for_each_line(reader, |lineno, line| {
+        if (opts.has_header && lineno == 0) || line.trim().is_empty() {
+            return Ok(());
         }
         let start = flat.len();
         for (c, raw) in line.split(opts.delimiter).enumerate() {
@@ -144,7 +162,8 @@ pub fn read_csv<R: Read>(reader: R, opts: &CsvOptions) -> Result<DMatrix> {
             _ => {}
         }
         n_rows += 1;
-    }
+        Ok(())
+    })?;
 
     let n_cols = n_cols.ok_or(HessboostError::EmptyDataset("csv: no data rows"))?;
     let d = DMatrix::from_dense(&flat, n_rows, n_cols)?;
@@ -183,6 +202,27 @@ mod tests {
         assert_eq!(d.get(0, 0), Some(0.5));
         assert_eq!(d.get(1, 0), None); // empty field -> missing
         assert_eq!(d.get(1, 1), Some(0.75));
+    }
+
+    #[test]
+    fn line_endings_match_buf_read_lines() {
+        let opts = CsvOptions {
+            has_header: false,
+            label_column: None,
+            ..CsvOptions::default()
+        };
+        // CRLF and LF line ends are stripped; a final line may lack one.
+        let d = read_csv(Cursor::new("1,2\r\n3,4\n5,6"), &opts).unwrap();
+        assert_eq!((d.n_rows(), d.n_cols()), (3, 2));
+        assert_eq!(d.get(2, 1), Some(6.0));
+        // A `\r` without a following `\n` is part of the line.
+        let cr = CsvOptions {
+            delimiter: '\r',
+            ..opts
+        };
+        let d = read_csv(Cursor::new("1\r2\r"), &cr).unwrap();
+        assert_eq!((d.n_rows(), d.n_cols()), (1, 3));
+        assert_eq!(d.get(0, 2), None);
     }
 
     #[test]

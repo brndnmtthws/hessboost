@@ -26,9 +26,9 @@ fn exp_transform(preds: &mut [f32]) {
 /// `MetaInfo::LabelAbsSort`, a stable sort). Shared with the `cox-nloglik`
 /// metric.
 pub(crate) fn abs_label_order(labels: &[f32]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..labels.len()).collect();
-    order.sort_by(|&a, &b| labels[a].abs().total_cmp(&labels[b].abs()));
-    order
+    crate::metric::stable_argsort(labels.len(), |&a, &b| {
+        labels[a].abs().total_cmp(&labels[b].abs())
+    })
 }
 
 /// Cox proportional-hazards regression (`survival:cox`) on right-censored

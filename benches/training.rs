@@ -768,6 +768,8 @@ fn bench_other_metrics(c: &mut Criterion) {
     let mut run = |name: &str, params: &TrainingParams, data: &DMatrix, preds: &[f32]| {
         let metric = create_metric(name.split('/').next().unwrap(), params).unwrap();
         let info = data.info();
+        // A NaN would time an input check, not the metric.
+        assert!(metric.eval_info(preds, &info).is_finite(), "{name}");
         group.throughput(Throughput::Elements(data.n_rows() as u64));
         group.bench_function(name.replace('/', "_"), |b| {
             b.iter(|| black_box(metric.eval_info(preds, &info)));
@@ -795,7 +797,7 @@ fn bench_other_metrics(c: &mut Criterion) {
         .unwrap()
         .with_group_sizes(&group_sizes(n, 100))
         .unwrap();
-    for name in ["ndcg", "ndcg@10", "map", "map@10", "pre@5", "auc"] {
+    for name in ["ndcg", "ndcg@10", "map", "map@10", "auc"] {
         run(
             &format!("{name}/100k_groups100"),
             &default,
@@ -803,6 +805,18 @@ fn bench_other_metrics(c: &mut Criterion) {
             &scores[..n],
         );
     }
+    // Precision needs binary relevance.
+    let ranked_binary = meta_rows(n)
+        .with_labels(&alternating_labels(n))
+        .unwrap()
+        .with_group_sizes(&group_sizes(n, 100))
+        .unwrap();
+    run(
+        "pre@5/100k_groups100",
+        &default,
+        &ranked_binary,
+        &scores[..n],
+    );
     let positive = meta_rows(N).with_labels(&positive_labels(N)).unwrap();
     let predictions: Vec<f32> = (0..N).map(|i| 0.3 + (i % 997) as f32 * 0.002).collect();
     for name in ["rmsle", "mape", "mphe"] {

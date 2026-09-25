@@ -571,6 +571,41 @@ Measured like the partition changes above (same host and method, the
 Single-threaded Poisson and LambdaRank gradients run unchanged serial code;
 their differences are host noise.
 
+### Evaluation metrics
+
+AUC, AUCPR, the ranking metrics without query groups, and `cox-nloglik`
+sort their rows with rayon's stable parallel merge sort once they are long,
+which yields the same order as the serial stable sort; NDCG, MAP, and
+`pre@k` score their query groups in parallel and reduce the scores in group
+order; and `aft-nloglik` and `interval-regression-accuracy` compute their row
+values in parallel and sum them in row order. Values are unchanged (a unit
+test compares 4 threads with 1 bit for bit); serial evaluation keeps its
+loops. Measured like the changes above (`eval_metric_other`):
+
+| Case | Threads | Before (ms) | After (ms) |
+|---|---:|---:|---:|
+| `auc_100k` | 1 | 1.831 | 1.864 |
+| `auc_100k` | 16 | 1.833 | 0.833 |
+| `aucpr_100k` | 1 | 2.068 | 2.098 |
+| `aucpr_100k` | 16 | 2.084 | 1.218 |
+| `auc_100k_k3_matrix` | 1 | 5.809 | 5.674 |
+| `auc_100k_k3_matrix` | 16 | 5.582 | 2.775 |
+| `ndcg_100k_groups100` | 1 | 2.390 | 2.386 |
+| `ndcg_100k_groups100` | 16 | 2.388 | 0.180 |
+| `map_100k_groups100` | 1 | 0.968 | 0.954 |
+| `map_100k_groups100` | 16 | 0.970 | 0.093 |
+| `pre@5_100k_groups100` | 1 | 0.945 | 0.940 |
+| `pre@5_100k_groups100` | 16 | 0.945 | 0.171 |
+| `aft-nloglik_100k` | 1 | 2.841 | 2.529 |
+| `aft-nloglik_100k` | 16 | 2.841 | 0.241 |
+| `interval-regression-accuracy_100k` | 1 | 0.285 | 0.283 |
+| `interval-regression-accuracy_100k` | 16 | 0.285 | 0.108 |
+| `cox-nloglik_100k` | 1 | 1.509 | 1.533 |
+| `cox-nloglik_100k` | 16 | 1.506 | 1.115 |
+
+Single-threaded AUC, AUCPR, ranking, interval-accuracy, and Cox evaluation
+run unchanged serial code; their differences are host noise.
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks

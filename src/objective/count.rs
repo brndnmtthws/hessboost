@@ -74,8 +74,18 @@ impl Objective for Poisson {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        crate::simd::poisson_gradient(preds, labels, weights, self.max_delta_step, out);
+        let max_delta_step = self.max_delta_step;
+        super::rowwise_gradient(
+            labels.len(),
+            1,
+            preds,
+            labels,
+            weights,
+            out,
+            |p, l, w, o| {
+                crate::simd::poisson_gradient(p, l, w, max_delta_step, o);
+            },
+        );
     }
 
     log_link_objective!();
@@ -111,8 +121,17 @@ impl Objective for Gamma {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        crate::simd::gamma_gradient(preds, labels, weights, out);
+        super::rowwise_gradient(
+            labels.len(),
+            1,
+            preds,
+            labels,
+            weights,
+            out,
+            |p, l, w, o| {
+                crate::simd::gamma_gradient(p, l, w, o);
+            },
+        );
     }
 
     log_link_objective!();
@@ -166,8 +185,18 @@ impl Objective for Tweedie {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        crate::simd::tweedie_gradient(preds, labels, weights, self.rho, out);
+        let rho = self.rho;
+        super::rowwise_gradient(
+            labels.len(),
+            1,
+            preds,
+            labels,
+            weights,
+            out,
+            |p, l, w, o| {
+                crate::simd::tweedie_gradient(p, l, w, rho, o);
+            },
+        );
     }
 
     log_link_objective!();

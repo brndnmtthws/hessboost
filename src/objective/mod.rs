@@ -773,6 +773,17 @@ mod tests {
                 1,
                 (1..=15).map(|r| 2 * c + r).collect(),
             ),
+            (
+                Box::new(Poisson::new(0.7)),
+                1,
+                (1..=15).map(|r| 2 * c + r).collect(),
+            ),
+            (Box::new(Gamma), 1, (1..=15).map(|r| 2 * c + r).collect()),
+            (
+                Box::new(Tweedie::new(1.3)),
+                1,
+                (1..=15).map(|r| 2 * c + r).collect(),
+            ),
             (Box::new(Softmax::new(2, true)), 2, vec![2 * c + 4]),
             (Box::new(Softmax::new(3, true)), 3, vec![2 * c + 4]),
             (Box::new(Softmax::new(9, false)), 9, vec![2 * c + 1]),

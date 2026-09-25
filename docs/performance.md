@@ -539,6 +539,38 @@ categorical and three numeric features, `max_bin = 4096`, single timed runs):
 a split's per-bin left-set table marks each left category's bin (a binary
 search per category) instead of testing every bin against the whole set.
 
+### Objective gradients
+
+Poisson, Gamma, and Tweedie gradients now run their vector kernels in the
+same fixed row chunks as the logistic and softmax gradients; LambdaRank
+computes its query groups in parallel (each query writes only its own rows);
+AFT evaluates each row's endpoint densities once for its gradient and
+Hessian; and expectile gradients rebuild each row's expectiles once instead
+of once per output. Every gradient keeps its arithmetic and order, so the
+values are unchanged (unit tests compare the chunked and parallel paths with
+the serial ones bit for bit).
+
+Measured like the partition changes above (same host and method, the
+`objective_gradient` and `objective_gradient_other` groups), before and after:
+
+| Case | Threads | Before (ms) | After (ms) |
+|---|---:|---:|---:|
+| `poisson_unweighted_1m` | 1 | 1.606 | 1.604 |
+| `poisson_unweighted_1m` | 16 | 1.599 | 0.120 |
+| `gamma_unweighted_1m` | 16 | 1.041 | 0.082 |
+| `tweedie_unweighted_1m` | 16 | 1.858 | 0.136 |
+| `rank_ndcg_100k_groups100` | 1 | 21.607 | 21.319 |
+| `rank_ndcg_100k_groups100` | 16 | 21.602 | 1.387 |
+| `rank_map_100k_groups100` | 16 | 19.557 | 1.279 |
+| `rank_pairwise_100k_groups100` | 16 | 17.288 | 1.117 |
+| `aft_normal_1m` | 1 | 60.156 | 32.679 |
+| `aft_normal_1m` | 16 | 3.784 | 2.063 |
+| `expectile_a3_1m_outputs` | 1 | 19.340 | 11.091 |
+| `expectile_a3_1m_outputs` | 16 | 1.446 | 0.837 |
+
+Single-threaded Poisson and LambdaRank gradients run unchanged serial code;
+their differences are host noise.
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks

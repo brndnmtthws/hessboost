@@ -717,12 +717,34 @@ impl Grow<'_, '_> {
             w_left.push(l);
             w_right.push(r);
         }
+        let (route, (xgb_left, xgb_right)) = self.expand(nid, best);
+        self.store_children(nid, dir, best, [&w_left, &w_right], [xgb_left, xgb_right]);
+
+        let categorical = best.is_categorical();
+        let (rows_tree_left, rows_tree_right) = partition_rows(self.ghist, &entry.rows, &route);
+        let rows = if categorical {
+            (rows_tree_right, rows_tree_left)
+        } else {
+            (rows_tree_left, rows_tree_right)
+        };
+        Expanded {
+            entry: Entry {
+                rows: Vec::new(),
+                ..entry
+            },
+            children: (xgb_left, xgb_right),
+            rows,
+            child_valid,
+        }
+    }
+
+    /// Expand node `nid` of the tree by `best`: the split the rows are
+    /// routed by, and the ids of XGBoost's left and right children.
+    /// hessboost's categorical nodes route their set to the tree's left
+    /// child, which is XGBoost's right child.
+    fn expand(&mut self, nid: usize, best: &Candidate) -> (BestSplit, (usize, usize)) {
         let left_hess: f64 = best.left.iter().map(|g| g.hess).sum();
         let right_hess: f64 = best.right.iter().map(|g| g.hess).sum();
-
-        // hessboost's categorical nodes route their set to the tree's left
-        // child, which is XGBoost's right child.
-        let categorical = best.is_categorical();
         let mut route = BestSplit::none();
         route.feature = best.feature;
         let (tree_left, tree_right) = match &best.loc {
@@ -756,22 +778,36 @@ impl Grow<'_, '_> {
         };
         self.tree.set_split_gain(nid, best.loss_chg);
         self.tree.set_sum_hess(nid, (left_hess + right_hess) as f32);
-        let (xgb_left, xgb_right) = if categorical {
+        let children = if best.is_categorical() {
             (tree_right, tree_left)
         } else {
             (tree_left, tree_right)
         };
+        (route, children)
+    }
 
-        // Per-node state for both new ids, then each child's values.
+    /// Per-node state of the new children `[left, right]` (XGBoost's
+    /// orientation) of `nid`: statistics, weights `[w_left, w_right]`, gains,
+    /// and, under monotone constraints, the weight bounds split at the
+    /// children's midpoint by direction `dir`.
+    fn store_children(
+        &mut self,
+        nid: usize,
+        dir: i8,
+        best: &Candidate,
+        [w_left, w_right]: [&[f32]; 2],
+        [xgb_left, xgb_right]: [usize; 2],
+    ) {
+        let s = self.n_split();
         let n_nodes = self.tree.num_nodes();
         self.stats.resize(n_nodes * s, GradStats::default());
         self.weights.resize(n_nodes * s, 0.0);
         self.gain.resize(n_nodes, 0.0);
-        let gl = self.b.gain_given_weights(&best.left, &w_left);
-        let gr = self.b.gain_given_weights(&best.right, &w_right);
+        let gl = self.b.gain_given_weights(&best.left, w_left);
+        let gr = self.b.gain_given_weights(&best.right, w_right);
         for (child, stats, w, gain) in [
-            (xgb_left, &best.left, &w_left, gl),
-            (xgb_right, &best.right, &w_right, gr),
+            (xgb_left, &best.left, w_left, gl),
+            (xgb_right, &best.right, w_right, gr),
         ] {
             self.stats[child * s..(child + 1) * s].copy_from_slice(stats);
             self.weights[child * s..(child + 1) * s].copy_from_slice(w);
@@ -796,22 +832,6 @@ impl Grow<'_, '_> {
                 self.lower[xgb_right * s + t] = r_lo;
                 self.upper[xgb_right * s + t] = r_hi;
             }
-        }
-
-        let (rows_tree_left, rows_tree_right) = partition_rows(self.ghist, &entry.rows, &route);
-        let rows = if categorical {
-            (rows_tree_right, rows_tree_left)
-        } else {
-            (rows_tree_left, rows_tree_right)
-        };
-        Expanded {
-            entry: Entry {
-                rows: Vec::new(),
-                ..entry
-            },
-            children: (xgb_left, xgb_right),
-            rows,
-            child_valid,
         }
     }
 

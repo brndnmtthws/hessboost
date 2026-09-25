@@ -246,61 +246,20 @@ impl<'a> HistTreeBuilder<'a> {
                 capture_rows,
             );
         }
-        let total_bins = ghist.total_bins();
-        debug_assert!(self.reuse.as_ref().is_none_or(|r| r.n_bins() == total_bins));
+        debug_assert!(
+            self.reuse
+                .as_ref()
+                .is_none_or(|r| r.n_bins() == ghist.total_bins())
+        );
         // Leaf renewal recomputes leaf values from full-precision sums, which
         // needs every leaf's rows.
         let renew = self.params.use_quantized_grad && self.params.quant_train_renew_leaf;
-
-        let (root_stats, root_hist, root_quant) = if self.params.use_quantized_grad {
-            let (quant, stats, hist) =
-                QuantNode::root(ghist, gpair, row_subset, self.params, self.rounding_seed);
-            (stats, hist, Some(quant))
-        } else {
-            // The root sum is a sequential pass; it runs beside the
-            // (parallel) root histogram instead of before it.
-            let build_hist = || {
-                let mut root_hist = zeroed(total_bins);
-                self.backend.build(ghist, row_subset, gpair, &mut root_hist);
-                root_hist
-            };
-            let (root_stats, root_hist) = if rayon_available() {
-                rayon::join(|| sum_rows(gpair, row_subset), build_hist)
-            } else {
-                (sum_rows(gpair, row_subset), build_hist())
-            };
-            (root_stats, root_hist, None)
-        };
-
+        let (root, root_stats) = self.root(ghist, gpair, row_subset, sampler);
         let mut tree = RegTree::with_root(root_stats.hess as f32);
         let mut store = NodeStore {
             stats: vec![root_stats],
             bounds: vec![Bounds::default()],
             leaf_rows: (capture_rows || renew).then(Vec::new),
-        };
-
-        // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
-        let root_feats = sampler.sample(0);
-        let tree_seed = sampler.seed();
-        let root_ctx = NodeCtx {
-            id: 0,
-            stats: root_stats,
-            bounds: Bounds::default(),
-            rows: row_subset.len(),
-            output: xgb_calc_weight(root_stats, &self.reg),
-            tree_seed,
-        };
-        let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
-        let root = NodeEntry {
-            nid: 0,
-            depth: 0,
-            rows: row_subset.to_vec(),
-            hist: root_hist,
-            best,
-            bounds: Bounds::default(),
-            allowed: None,
-            tree_seed,
-            quant: root_quant,
         };
 
         match self.params.grow_policy {
@@ -332,6 +291,62 @@ impl<'a> HistTreeBuilder<'a> {
             Vec::new()
         };
         (tree, leaf_rows)
+    }
+
+    /// The root node (its histogram, statistics, and best split) of a tree
+    /// over `row_subset`, drawing the root's column sample.
+    fn root(
+        &self,
+        ghist: &GHistIndex,
+        gpair: &[GradPair],
+        row_subset: &[u32],
+        sampler: &mut ColumnSampler,
+    ) -> (NodeEntry, GradStats) {
+        let total_bins = ghist.total_bins();
+        let (root_stats, root_hist, root_quant) = if self.params.use_quantized_grad {
+            let (quant, stats, hist) =
+                QuantNode::root(ghist, gpair, row_subset, self.params, self.rounding_seed);
+            (stats, hist, Some(quant))
+        } else {
+            // The root sum is a sequential pass; it runs beside the
+            // (parallel) root histogram instead of before it.
+            let build_hist = || {
+                let mut root_hist = zeroed(total_bins);
+                self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+                root_hist
+            };
+            let (root_stats, root_hist) = if rayon_available() {
+                rayon::join(|| sum_rows(gpair, row_subset), build_hist)
+            } else {
+                (sum_rows(gpair, row_subset), build_hist())
+            };
+            (root_stats, root_hist, None)
+        };
+
+        // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
+        let root_feats = sampler.sample(0);
+        let tree_seed = sampler.seed();
+        let root_ctx = NodeCtx {
+            id: 0,
+            stats: root_stats,
+            bounds: Bounds::default(),
+            rows: row_subset.len(),
+            output: xgb_calc_weight(root_stats, &self.reg),
+            tree_seed,
+        };
+        let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
+        let root = NodeEntry {
+            nid: 0,
+            depth: 0,
+            rows: row_subset.to_vec(),
+            hist: root_hist,
+            best,
+            bounds: Bounds::default(),
+            allowed: None,
+            tree_seed,
+            quant: root_quant,
+        };
+        (root, root_stats)
     }
 
     fn grow_depthwise(
@@ -413,14 +428,10 @@ impl<'a> HistTreeBuilder<'a> {
                     // queue's next best candidates, at most as many as can
                     // still be expanded.
                     let budget = (max_leaves - n_leaves).min(SPECULATE_NODES);
-                    let mut queued: Vec<&NodeEntry> = heap
+                    let queued = heap
                         .iter()
-                        .filter(|e| expandable(e) && !ready.contains_key(&e.nid))
-                        .collect();
-                    queued.sort_by(|a, b| b.cmp(a));
-                    let batch: Vec<&NodeEntry> = std::iter::once(&entry)
-                        .chain(queued.into_iter().take(budget - 1))
-                        .collect();
+                        .filter(|e| expandable(e) && !ready.contains_key(&e.nid));
+                    let batch = speculation_batch(&entry, queued, budget);
                     let built: Vec<_> = batch
                         .par_iter()
                         .map(|e| (e.nid, self.speculate_children(ghist, gpair, e, features)))
@@ -854,6 +865,21 @@ impl<'a> HistTreeBuilder<'a> {
                 .collect(),
         )
     }
+}
+
+/// The nodes whose children loss-guided growth builds together: `entry` (the
+/// node due now) and the best `budget - 1` of the other expandable `queued`
+/// nodes, in queue order (the heap's order: largest loss change first).
+fn speculation_batch<'e>(
+    entry: &'e NodeEntry,
+    queued: impl Iterator<Item = &'e NodeEntry>,
+    budget: usize,
+) -> Vec<&'e NodeEntry> {
+    let mut queued: Vec<&NodeEntry> = queued.collect();
+    queued.sort_by(|a, b| b.cmp(a));
+    std::iter::once(entry)
+        .chain(queued.into_iter().take(budget - 1))
+        .collect()
 }
 
 /// Rows per parallel partition chunk. Large nodes near the root are routed in

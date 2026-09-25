@@ -552,13 +552,7 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
             let threshold = ghist.cuts().cut_value(best.split_bin);
             SplitRule::numeric(best.feature, threshold, best.default_left)
         } else {
-            let mut cats_left: Vec<u32> = best
-                .cat_bins
-                .iter()
-                .map(|&b| ghist.cuts().cut_value(b) as u32)
-                .collect();
-            cats_left.sort_unstable();
-            cats = cats_left;
+            cats = left_categories(ghist, &best);
             SplitRule::categorical(best.feature, &cats, best.default_left)
         };
         let (left_id, right_id) = tree.expand(
@@ -617,6 +611,17 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
         index,
         leaves,
     })
+}
+
+/// The category values (ascending) of a categorical split's left bins.
+fn left_categories(ghist: &GHistIndex, split: &Candidate) -> Vec<u32> {
+    let mut cats: Vec<u32> = split
+        .cat_bins
+        .iter()
+        .map(|&b| ghist.cuts().cut_value(b) as u32)
+        .collect();
+    cats.sort_unstable();
+    cats
 }
 
 /// Recompute the loss decrement of `rows` now that their leaf value is

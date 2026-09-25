@@ -1,7 +1,9 @@
 //! The exactness domain of the Metal backend's histogram sums.
 //!
-//! The CPU accumulates each histogram bin as a chain of `f64` additions in
-//! row order. The GPU instead sums integers: at staging time every value
+//! The CPU accumulates each histogram bin in `f64`: a chain of additions in
+//! row order within each fixed block of rows, then the block partials in
+//! block order (`tree::hist::CpuBackend`). The GPU instead sums integers:
+//! at staging time every value
 //! `x` becomes the integer `k = x / u`, where `u = 2^grain` is the largest
 //! power of two dividing every value of the slice, the kernels add the
 //! `k`s in 64-bit integers (any grouping, any order), and the host scales
@@ -25,13 +27,14 @@
 //!   `f64` exactly (`|K| <= 2^53`), and multiplying by `u` is exact (a
 //!   nonzero result is at least `2^-149`, a normal `f64`).
 //! - CPU: every partial sum `K u` with `|K| <= 2^53` is an `f64`, so each
-//!   add of the chain is exact and the bin holds the same `K u`.
+//!   add is exact (within a block's chain, and adding a block's partial to
+//!   the running total alike) and the bin holds the same `K u`.
 //!
 //! The kernels therefore never touch a float, so neither rounding modes nor
 //! subnormal flushing matter. The check computes `n M` exactly in integers,
 //! so it needs no margin. It is also the widest bound these statistics
-//! allow: past `2^53` grains the CPU chain itself can round (a test below
-//! shows one), and no parallel grouping reproduces that rounding.
+//! allow: past `2^53` grains the CPU's sums themselves can round (a test
+//! below shows one), and no other grouping reproduces that rounding.
 
 /// The largest exact bin sum, in grains: `f64`'s 53-bit significand.
 const MAX_UNITS: u64 = 1 << 53;
@@ -80,7 +83,7 @@ impl SumDomain {
     }
 
     /// Whether every sum of at most `n` of the values, in any order and
-    /// grouping, is computed exactly by both the CPU's `f64` chain and the
+    /// grouping, is computed exactly by both the CPU's `f64` sums and the
     /// GPU's integer accumulation of [`units`](Self::units), so that the
     /// two agree bit for bit: `n * max <= 2^53` grains, computed exactly.
     /// Non-finite values are never exact.

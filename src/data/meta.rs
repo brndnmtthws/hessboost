@@ -173,9 +173,26 @@ impl<'a> MetaInfo<'a> {
     /// # Errors
     ///
     /// The [`check_layout`](Self::check_layout) error when the lengths are
-    /// inconsistent (nothing is allocated then).
+    /// inconsistent, and an `InvalidParameter` naming `labels` when the
+    /// labels do not back every cell (`labels.len() != n_rows * n_targets`,
+    /// e.g. no labels at all): the cells are the label matrix's, so the
+    /// broadcast is never longer than the labels (nothing is allocated on
+    /// error).
     pub(crate) fn cell_weights(&self) -> Result<Option<Vec<f32>>> {
         self.check_layout()?;
+        // `check_layout` accepts empty labels (bounds-only metadata), so the
+        // cell count it checked is not yet backed by any data.
+        if self.n_rows.checked_mul(self.n_targets) != Some(self.labels.len()) {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                format!(
+                    "dataset has {} labels for {} rows of {} targets",
+                    self.labels.len(),
+                    self.n_rows,
+                    self.n_targets
+                ),
+            ));
+        }
         Ok(self.weights.map(|w| {
             w.iter()
                 .flat_map(|&wi| std::iter::repeat_n(wi, self.n_targets))

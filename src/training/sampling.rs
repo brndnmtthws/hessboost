@@ -17,7 +17,8 @@
 //! Arithmetic mirrors upstream in `f32` (including the sequential running
 //! sum). Where that overflows (finite gradients whose squares or sums exceed
 //! `f32`, e.g. from labels near `1e20`), `r` and `u` are recomputed from
-//! gradients scaled by a power of two, which leaves every ratio `r_i / u`
+//! gradients scaled by a power of two (with upstream's `kRtEps` floor on `u`
+//! applied to the unscaled value), which leaves every ratio `r_i / u`
 //! exact; non-finite gradients, or rescaled ones that overflow, are an error.
 //! The random stream is hessboost's own: one `u64` seed per call from the
 //! caller's RNG, then one uniform draw per row from a stream fixed per block
@@ -93,13 +94,15 @@ pub(crate) fn gradient_based_sample(
     }
 
     // XGBoost's `f32` arithmetic, unless it overflows.
-    let (reg_abs_grad, threshold) =
-        if let Some(stats) = sampling_statistics(gpair, n_targets, budget, 1.0) {
-            stats
-        } else {
-            let scale = overflow_scale(gpair)?;
-            sampling_statistics(gpair, n_targets, budget, scale).ok_or_else(non_finite)?
-        };
+    let (reg_abs_grad, threshold, scale) = if let Some((r, u)) =
+        sampling_statistics(gpair, n_targets, budget, 1.0)
+    {
+        (r, u, 1.0)
+    } else {
+        let scale = overflow_scale(gpair)?;
+        let (r, u) = sampling_statistics(gpair, n_targets, budget, scale).ok_or_else(non_finite)?;
+        (r, u, scale)
+    };
 
     let blocks: Vec<(Vec<u32>, Vec<f32>, Vec<GradPair>)> = gpair
         .par_chunks(BLOCK_ROWS * n_targets)
@@ -112,7 +115,7 @@ pub(crate) fn gradient_based_sample(
             let mut kept_p = Vec::new();
             let mut out = vec![GradPair::default(); pairs.len()];
             for (i, &r) in rag.iter().enumerate() {
-                let p = probability(threshold, r);
+                let p = probability(threshold, r, scale);
                 // Exactly one draw per row, kept or not.
                 let draw = stream.f32();
                 if p >= 1.0 || (p > 0.0 && draw <= p) {
@@ -168,11 +171,11 @@ fn sampling_statistics(
 }
 
 /// The power of two that brings the largest gradient or Hessian magnitude
-/// of `gpair` to at most `1`, so neither the squares nor the sums over rows
-/// of the scaled regularized gradients overflow. Scaling by a power of two
-/// is exact, so every ratio `r_i / u` is the one unbounded `f32` would give
-/// (up to underflow of values `2^-126` below the largest). Fails for a
-/// non-finite value.
+/// of `gpair` into `(1/2, 1]` (magnitudes at most `1` are left unscaled),
+/// so neither the squares nor the sums over rows of the scaled regularized
+/// gradients overflow. Scaling by a power of two is exact, so every ratio
+/// `r_i / u` is the one unbounded `f32` would give (up to underflow of
+/// values `2^-126` below the largest). Fails for a non-finite value.
 fn overflow_scale(gpair: &[GradPair]) -> Result<f32> {
     let mut largest = 0.0f32;
     for g in gpair {
@@ -181,10 +184,17 @@ fn overflow_scale(gpair: &[GradPair]) -> Result<f32> {
         }
         largest = largest.max(g.grad.abs()).max(g.hess.abs());
     }
-    // `largest < 2^128`, so the exponent is at most 128 and `2^-exponent`
-    // (subnormal only at 128) is exact.
-    let exponent = largest.log2().ceil().max(0.0) as i32;
-    Ok(2.0f32.powi(-exponent))
+    if largest <= 1.0 {
+        return Ok(1.0);
+    }
+    // The smallest `k` with `largest <= 2^k`, from the bits (`largest` is
+    // normal and below `2^128`, so `1 <= k <= 128`).
+    let bits = largest.to_bits();
+    let k = (bits >> 23) as i32 - 127 + i32::from(bits & 0x007f_ffff != 0);
+    // `2^-k` is exact in `f32` (subnormal for `k > 126`). Built as a normal
+    // `f64` and narrowed exactly: `powi` would compute `1 / 2^k`, which is
+    // `1 / inf = 0` at `k = 128`.
+    Ok(f64::from_bits(((1023 - k) as u64) << 52) as f32)
 }
 
 /// The error for gradients the sample cannot be computed from.
@@ -251,15 +261,19 @@ fn threshold(reg_abs_grad: &[f32], budget: usize) -> f32 {
 }
 
 /// XGBoost `SamplingProbability`: `r / u`, with `|u|` floored at `kRtEps`.
-/// Upstream's `0` for an infinite `u` is unreachable here:
-/// [`sampling_statistics`] only yields finite thresholds.
-fn probability(threshold: f32, reg_abs_grad: f32) -> f32 {
-    let u = if threshold.abs() < K_RT_EPS_F32 {
-        K_RT_EPS_F32.copysign(threshold)
+/// `threshold` and `reg_abs_grad` are scaled by the power of two `scale`
+/// (`1` reproduces XGBoost exactly); the floor applies to the unscaled `u`,
+/// and a floored ratio divides the unscaled `r` (infinite only where the
+/// ratio would be anyway, which keeps the row unscaled), so the ratio is
+/// the unscaled one. Upstream's `0` for an infinite `u` is unreachable
+/// here: [`sampling_statistics`] only yields finite thresholds.
+fn probability(threshold: f32, reg_abs_grad: f32, scale: f32) -> f32 {
+    // Exact in `f64`: `scale` is a power of two.
+    if f64::from(threshold.abs()) < f64::from(K_RT_EPS_F32) * f64::from(scale) {
+        (reg_abs_grad / scale) / K_RT_EPS_F32.copysign(threshold)
     } else {
-        threshold
-    };
-    reg_abs_grad / u
+        reg_abs_grad / threshold
+    }
 }
 
 /// XGBoost `RescaleGrad`: divide a kept pair by its inclusion probability.
@@ -472,28 +486,67 @@ mod tests {
 
     /// Finite gradients whose squares overflow `f32` sample exactly like the
     /// same gradients at an ordinary scale: the same rows with the same
-    /// probabilities, and the rescaled pairs scaled back up.
+    /// probabilities, and the rescaled pairs scaled back up. The second case
+    /// has rows at `f32::MAX` (scale `2^-128`, subnormal); they are certain
+    /// (`p = 1`), so the rows rescaled by `1 / p` stay finite.
     #[test]
     fn overflowing_gradients_sample_like_scaled_down_ones() {
-        let g = gradients(3000, 2, 6);
-        let big: Vec<GradPair> = g
-            .iter()
-            .map(|p| GradPair::new(p.grad * 2f32.powi(70), p.hess * 2f32.powi(70)))
-            .collect();
-        assert!(rag(&big, 2).iter().any(|r| r.is_infinite()));
-        let s = gradient_based_sample(&g, 2, 0.3, &mut Rng::new(3))
-            .unwrap()
-            .unwrap();
-        let b = gradient_based_sample(&big, 2, 0.3, &mut Rng::new(3))
-            .unwrap()
-            .unwrap();
-        assert!(!s.rows.is_empty());
-        assert_eq!(b.rows, s.rows);
-        assert_eq!(b.probability, s.probability);
-        for (bp, sp) in b.gpair.iter().zip(&s.gpair) {
-            assert_eq!(bp.grad, sp.grad * 2f32.powi(70));
-            assert_eq!(bp.hess, sp.hess * 2f32.powi(70));
+        let mut near_max = gradients(3000, 1, 6);
+        for (i, row) in [5usize, 1234, 2999].into_iter().enumerate() {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            near_max[row] = GradPair::new(sign * f32::MAX * 2f32.powi(-85), 1.0);
         }
+        for (g, n_targets, exponent) in [(gradients(3000, 2, 6), 2, 70), (near_max, 1, 85)] {
+            let factor = 2f32.powi(exponent);
+            let big: Vec<GradPair> = g
+                .iter()
+                .map(|p| GradPair::new(p.grad * factor, p.hess * factor))
+                .collect();
+            assert!(rag(&big, n_targets).iter().any(|r| r.is_infinite()));
+            let s = gradient_based_sample(&g, n_targets, 0.3, &mut Rng::new(3))
+                .unwrap()
+                .unwrap();
+            let b = gradient_based_sample(&big, n_targets, 0.3, &mut Rng::new(3))
+                .unwrap()
+                .unwrap();
+            assert!(!s.rows.is_empty());
+            assert_eq!(b.rows, s.rows, "2^{exponent}");
+            assert_eq!(b.probability, s.probability, "2^{exponent}");
+            if exponent == 85 {
+                assert_eq!(big[1234].grad, -f32::MAX);
+                assert!([5, 1234, 2999].iter().all(|r| b.rows.contains(r)));
+            }
+            for (bp, sp) in b.gpair.iter().zip(&s.gpair) {
+                assert_eq!(bp.grad, sp.grad * factor);
+                assert_eq!(bp.hess, sp.hess * factor);
+            }
+        }
+    }
+
+    /// The scale is the exact power of two bringing the largest magnitude
+    /// into `(1/2, 1]`, also where it is subnormal (`2^-127`, `2^-128`).
+    #[test]
+    fn overflow_scale_is_an_exact_power_of_two_up_to_f32_max() {
+        let pow2 = |e: i32| 2f32.powi(e);
+        for (largest, exponent) in [
+            (1.5, 1),
+            (pow2(126), 126),
+            (pow2(126) * 1.5, 127),
+            (pow2(127), 127),
+            (pow2(127) * 1.5, 128),
+            (f32::MAX, 128),
+        ] {
+            // A runtime value, as in training.
+            let largest: f32 = std::hint::black_box(largest);
+            let scale = overflow_scale(&[GradPair::new(1.0, -largest)]).unwrap();
+            assert!(scale > 0.0 && scale.is_finite(), "{largest}: {scale}");
+            assert_eq!(f64::from(scale), (-f64::from(exponent)).exp2(), "{largest}");
+            let scaled = largest * scale;
+            assert!(scaled > 0.5 && scaled <= 1.0, "{largest}: {scaled}");
+        }
+        // Magnitudes at most 1 are not scaled.
+        assert_eq!(overflow_scale(&[GradPair::new(0.25, 1.0)]).unwrap(), 1.0);
+        assert_eq!(overflow_scale(&[GradPair::new(0.0, 0.0)]).unwrap(), 1.0);
     }
 
     #[test]

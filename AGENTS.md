@@ -145,7 +145,11 @@ nouns there.
 - **Determinism:** identical params, data, and seed give identical
   predictions (`tests/properties.rs`), independent of the thread count:
   every grow policy must grow the same tree serially and in parallel, and
-  parallel reductions keep a fixed order. Sequential sampling (rows,
+  parallel reductions keep a fixed order. CPU `f64` histograms
+  (`tree/hist/mod.rs`) add each bin's rows in row order, splitting a large
+  node on a sparse (or large dense) index into fixed blocks of rows reduced
+  in block order: partitions depend on the data, never on the thread
+  count, and the serial build sums the same blocks. Sequential sampling (rows,
   columns, DART, folds, target-stat permutations) draws from `rng::Rng`
   (the same stream on every platform). Keyed draws (`extra_trees` node
   seeds, the `dist:*` random split direction, quantized stochastic rounding,
@@ -156,9 +160,9 @@ nouns there.
   model bit for bit: gradients are staged as integer multiples of each
   component's grain, the GPU adds them in 64-bit integers (exact in any
   order, no atomics), and a node goes to the GPU only inside the domain
-  where the CPU's `f64` chain is exact too (`n * max <= 2^53` grains,
+  where the CPU's `f64` sums are exact too (`n * max <= 2^53` grains,
   `backend/exact_sum.rs`). Other nodes, small nodes, non-finite gradients,
-  and failed command buffers run on the CPU's sequential path.
+  and failed command buffers run on the CPU backend.
 - **Unsafe:** confined to `simd/`, the hot loops in `tree/compact.rs`,
   `tree/hist/`, and `tree/builder/hist.rs`, and the Metal FFI in
   `backend/metal.rs`. Every block needs a `// SAFETY:` comment;

@@ -9,14 +9,14 @@
 //!   `BoostedModel::to_gpu`).
 //!
 //! The backends keep the crate's determinism contract: a GPU run reproduces
-//! the single-threaded CPU result bit for bit (work the GPU cannot compute
-//! exactly runs on the CPU; see [`metal`]), and repeats itself exactly
+//! the CPU result bit for bit (work the GPU cannot compute exactly runs on
+//! the CPU; see [`metal`]), and repeats itself exactly
 //! across runs and machines.
 //!
 //! A future `wgpu` backend will extend the same seam to Linux and Windows.
 
 /// When the Metal backend's integer histogram sums reproduce the CPU's
-/// `f64` chain (platform-independent, so its proof is tested everywhere).
+/// `f64` sums (platform-independent, so its proof is tested everywhere).
 #[cfg_attr(
     not(all(target_os = "macos", feature = "metal")),
     allow(

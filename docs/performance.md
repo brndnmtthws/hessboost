@@ -427,6 +427,50 @@ per-column search stops early), and a reused per-worker `(sum, count)` buffer
 for ordered target statistics (17% slower than allocating two zeroed vectors
 per column).
 
+### Training rounds
+
+Under `approx` with a non-constant Hessian, every tree of an output's forest
+(`num_parallel_tree > 1`) weights its per-round cuts by the same gradients
+(one row sample, and under gradient-based sampling one gradient sample,
+serves the whole forest), so each output's gradient index is now built
+once per round instead of once per tree, and the weighted sketch reads the
+Hessians in place. The parallel tree loop also gathers each output's
+gradients once. Trained models are unchanged.
+
+Measured like the cases above against the previous commit, on 50,000
+rows × 20 features, 20 rounds, depth 6, in a throwaway harness
+(`binary:logistic`, `tree_method = approx`, `num_parallel_tree = 4`).
+
+| Case | Threads | Before (ms) | After (ms) | Less time |
+|---|---:|---:|---:|---:|
+| `approx` logistic forest of 4 | 1 | 2896.9 | 981.7 | 66.1% |
+| `approx` logistic forest of 4 | 16 | 223.6 | 107.5 | 52.0% |
+
+With `linear_tree`, the histogram builder's final row partition now feeds
+the linear-leaf fit (and, when every row took part, the training margin
+update through the leaf models) instead of routing every training row
+through the new tree again, when no training row has a zero weight. Then
+every training value was sketched, so each leaf sees the rows routing gives
+it, in the same ascending order, and the fitted models are unchanged. A
+zero-weight row's value can lie beyond the last cut, where the builder and
+the tree place it differently, so with zero weights the linear leaves route
+every row as before.
+
+| Case | Threads | Before (ms) | After (ms) | Less time |
+|---|---:|---:|---:|---:|
+| `train_variants_50k_x20_20rounds/linear_tree` | 1 | 223.8 | 139.0 | 37.9% |
+| `train_variants_50k_x20_20rounds/linear_tree` | 16 | 35.0 | 27.8 | 20.5% |
+
+`train_variants_50k_x20_20rounds` (DART, CSR, `approx_forest4` with
+squared error, eval sets, vector leaves, one tree per output) is unchanged
+within host noise. Three candidates were dropped: a dense scratch row for
+the margin updates on CSR data (12% slower single-threaded on 20-feature
+rows, where the row scans it replaces are short), extending the cached
+prediction layout per new tree instead of rebuilding it (every training run
+builds the layout for its initial margins, so the extension added about 2%
+to all variants, and DART's own rebuild does not measure), and writing the
+gradient-based sample in place (no gain).
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks

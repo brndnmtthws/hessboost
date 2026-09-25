@@ -40,8 +40,10 @@
 
 use std::io::Read;
 
-use super::LinearModel;
-use super::sections::{Sections, Writer, format_error};
+use std::sync::OnceLock;
+
+use super::sections::{Sections, Writer, format_error, wrong_length};
+use super::{BoostedModel, LinearModel};
 use crate::config::{AftDistribution, DistGradient, DistSplitDirection, ObjectiveParams};
 use crate::error::Result;
 use crate::objective::distributional::DistFamily;
@@ -126,42 +128,10 @@ pub(super) const OBJECTIVE_SECTIONS: &[&str] = &[
     "objective.distribution",
 ];
 
-/// A model's stored fields, as [`read`] returns them.
-pub(super) struct Stored {
-    pub(super) trees: Vec<RegTree>,
-    pub(super) base_score: Vec<f32>,
-    pub(super) objective: String,
-    pub(super) objective_params: ObjectiveParams,
-    pub(super) num_class: usize,
-    pub(super) n_outputs: usize,
-    pub(super) n_targets: usize,
-    pub(super) n_features: usize,
-    pub(super) best_iteration: Option<usize>,
-    pub(super) tree_weights: Vec<f32>,
-    pub(super) num_parallel_tree: usize,
-    pub(super) linear: Option<LinearModel>,
-}
-
-/// The fields [`write`] reads, by reference.
-pub(super) struct StoredRef<'a> {
-    pub(super) trees: &'a [RegTree],
-    pub(super) base_score: &'a [f32],
-    pub(super) objective: &'a str,
-    pub(super) objective_params: &'a ObjectiveParams,
-    pub(super) num_class: usize,
-    pub(super) n_outputs: usize,
-    pub(super) n_targets: usize,
-    pub(super) n_features: usize,
-    pub(super) best_iteration: Option<usize>,
-    pub(super) tree_weights: &'a [f32],
-    pub(super) num_parallel_tree: usize,
-    pub(super) linear: Option<&'a LinearModel>,
-}
-
-/// Encode a model as a container: zstd-compressed unless the frame would
+/// Encode `model` as a container: zstd-compressed unless the frame would
 /// expand further than [`read`] accepts (see [`pack`]).
-pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
-    let trees = m.trees;
+pub(super) fn write(model: &BoostedModel) -> Result<Vec<u8>> {
+    let trees = &model.trees;
     // Per-tree counts and array offsets are stored as `u32`.
     let total_nodes: usize = trees.iter().map(RegTree::num_nodes).sum();
     let total_categories: usize = trees.iter().map(|t| t.categories().len()).sum();
@@ -171,10 +141,16 @@ pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
     {
         return Err(format_error("model is too large for the native format"));
     }
-
     let mut w = Writer::default();
-    w.str("model.objective", m.objective);
-    w.raw("model.writer", 0, WRITER.as_bytes().to_vec());
+    write_model_sections(&mut w, model);
+    write_tree_sections(&mut w, trees);
+    finish_container(w)
+}
+
+/// The `model.*`, `gblinear.*`, and `objective.*` sections.
+fn write_model_sections(w: &mut Writer, m: &BoostedModel) {
+    w.str("model.objective", &m.objective);
+    w.raw("model.writer", 0, WRITER.as_bytes());
     w.array(
         "model.base_score",
         m.base_score.iter().copied(),
@@ -193,7 +169,7 @@ pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
         f32::to_le_bytes,
     );
     w.u64("model.num_parallel_tree", m.num_parallel_tree as u64);
-    if let Some(linear) = m.linear {
+    if let Some(linear) = &m.linear {
         w.array(
             "gblinear.weights",
             linear.weights().iter().copied(),
@@ -205,8 +181,12 @@ pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
             f32::to_le_bytes,
         );
     }
-    write_objective_params(&mut w, m.objective_params);
+    write_objective_params(w, &m.objective_params);
+}
 
+/// The trees, column-wise: `tree.*` per-tree arrays, `node.*` per-node
+/// arrays across all trees, and the `leaf_linear.*` pools.
+fn write_tree_sections(w: &mut Writer, trees: &[RegTree]) {
     let nodes = || trees.iter().flat_map(RegTree::nodes);
     let per_tree = |count: fn(&RegTree) -> usize| trees.iter().map(move |t| count(t) as u32);
     w.array(
@@ -306,8 +286,12 @@ pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
         linear().flat_map(|p| p.3.iter().copied()),
         f64::to_le_bytes,
     );
+}
 
-    let mut out = Vec::new();
+/// Frame the section table as a container: magic, version, the table, and
+/// the checksum of everything before it; then [`pack`] it.
+fn finish_container(w: Writer) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(MAGIC.len() + 1 + w.encoded_len() + 8);
     out.extend_from_slice(MAGIC);
     out.push(CONTAINER_VERSION);
     w.finish(&mut out);
@@ -344,8 +328,8 @@ fn expansion_accepted(compressed: u64, decompressed: u64) -> bool {
 }
 
 /// Decode a container (zstd-compressed or not). The caller validates the
-/// model it forms.
-pub(super) fn read(bytes: &[u8]) -> Result<Stored> {
+/// model it forms ([`BoostedModel::validate_structure`]).
+pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
     let decompressed;
     let container = if bytes.starts_with(&ZSTD_MAGIC) {
         decompressed = decompress(bytes)?;
@@ -401,7 +385,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Stored> {
     } else {
         None
     };
-    Ok(Stored {
+    Ok(BoostedModel {
         trees: read_trees(&s)?,
         base_score: s.array("model.base_score", f32::from_le_bytes)?,
         objective,
@@ -418,6 +402,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<Stored> {
         tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
+        compact: OnceLock::new(),
     })
 }
 
@@ -425,60 +410,31 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
     let node_count = s.array("tree.node_count", u32::from_le_bytes)?;
     let n_trees = node_count.len();
     let n_nodes = checked_sum(&node_count)?;
-    // `n_nodes` sums untrusted per-tree counts, so its product may overflow.
-    let column = |name: &str, width: usize| -> Result<()> {
-        if Some(s.bytes(name)?.len()) == n_nodes.checked_mul(width) {
-            Ok(())
-        } else {
-            Err(wrong_length(name))
-        }
-    };
-    let per_tree = |name: &str, width: usize| -> Result<()> {
-        if s.bytes(name)?.len() == n_trees * width {
-            Ok(())
-        } else {
-            Err(wrong_length(name))
-        }
-    };
-    for name in [
-        "node.split_feature",
-        "node.split_cond",
-        "node.left",
-        "node.right",
-        "node.leaf_value",
-        "node.sum_hess",
-        "node.split_gain",
-        "node.cat_begin",
-        "node.cat_end",
-    ] {
-        column(name, 4)?;
-    }
-    column("node.flags", 1)?;
-    per_tree("tree.category_count", 4)?;
-    per_tree("tree.size_leaf_vector", 4)?;
-    per_tree("tree.has_linear", 1)?;
-
-    let split_feature = s.array("node.split_feature", u32::from_le_bytes)?;
-    let split_cond = s.array("node.split_cond", f32::from_le_bytes)?;
-    let left = s.array("node.left", i32::from_le_bytes)?;
-    let right = s.array("node.right", i32::from_le_bytes)?;
-    let leaf_value = s.array("node.leaf_value", f32::from_le_bytes)?;
-    let sum_hess = s.array("node.sum_hess", f32::from_le_bytes)?;
-    let split_gain = s.array("node.split_gain", f32::from_le_bytes)?;
-    let cat_begin = s.array("node.cat_begin", u32::from_le_bytes)?;
-    let cat_end = s.array("node.cat_end", u32::from_le_bytes)?;
-    let flags = s.bytes("node.flags")?;
+    // Every column's length is checked (in this order) before any value:
+    // `n_nodes` sums untrusted per-tree counts, so its products may overflow.
+    let u32s = |name: &str, count: usize| s.array_exact(name, count, u32::from_le_bytes);
+    let f32s = |name: &str| s.array_exact(name, n_nodes, f32::from_le_bytes);
+    let split_feature = u32s("node.split_feature", n_nodes)?;
+    let split_cond = f32s("node.split_cond")?;
+    let left = s.array_exact("node.left", n_nodes, i32::from_le_bytes)?;
+    let right = s.array_exact("node.right", n_nodes, i32::from_le_bytes)?;
+    let leaf_value = f32s("node.leaf_value")?;
+    let sum_hess = f32s("node.sum_hess")?;
+    let split_gain = f32s("node.split_gain")?;
+    let cat_begin = u32s("node.cat_begin", n_nodes)?;
+    let cat_end = u32s("node.cat_end", n_nodes)?;
+    let flags = s.bytes_exact("node.flags", Some(n_nodes))?;
+    let category_count = u32s("tree.category_count", n_trees)?;
+    let size_leaf_vector = u32s("tree.size_leaf_vector", n_trees)?;
+    let has_linear = s.bytes_exact("tree.has_linear", Some(n_trees))?;
     if let Some(&bad) = flags.iter().find(|&&f| f & !NODE_FLAGS != 0) {
         return Err(format_error(format!(
             "`node.flags` holds undefined bits {:#04x}",
             bad & !NODE_FLAGS
         )));
     }
-    let category_count = s.array("tree.category_count", u32::from_le_bytes)?;
     let mut categories = Cursor::new(s.array("tree.categories", u32::from_le_bytes)?);
-    let size_leaf_vector = s.array("tree.size_leaf_vector", u32::from_le_bytes)?;
     let mut leaf_vectors = Cursor::new(s.array("tree.leaf_vectors", f32::from_le_bytes)?);
-    let has_linear = s.bytes("tree.has_linear")?;
     if let Some(&bad) = has_linear.iter().find(|&&b| b > 1) {
         return Err(format_error(format!(
             "`tree.has_linear` holds {bad}, not 0 or 1"
@@ -780,10 +736,6 @@ fn checked_sum(counts: &[u32]) -> Result<usize> {
         .ok_or_else(|| format_error("section lengths overflow"))
 }
 
-fn wrong_length(name: &str) -> crate::error::HessboostError {
-    format_error(format!("section `{name}` has the wrong length"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::sections::REQUIRED;
@@ -1026,20 +978,20 @@ mod tests {
     /// The container bytes of a gblinear model with `n_features` zero
     /// weights: the most compressible model there is.
     fn zero_linear_model(n_features: usize) -> Vec<u8> {
-        let linear = LinearModel::new(vec![0.0; n_features], vec![0.0]);
-        write(&StoredRef {
-            trees: &[],
-            base_score: &[0.5],
-            objective: "reg:squarederror",
-            objective_params: &ObjectiveParams::defaults_for("reg:squarederror"),
+        write(&BoostedModel {
+            trees: Vec::new(),
+            base_score: vec![0.5],
+            objective: "reg:squarederror".to_string(),
+            objective_params: ObjectiveParams::defaults_for("reg:squarederror"),
             num_class: 0,
             n_outputs: 1,
             n_targets: 1,
             n_features,
             best_iteration: None,
-            tree_weights: &[],
+            tree_weights: Vec::new(),
             num_parallel_tree: 1,
-            linear: Some(&linear),
+            linear: Some(LinearModel::new(vec![0.0; n_features], vec![0.0])),
+            compact: OnceLock::new(),
         })
         .unwrap()
     }

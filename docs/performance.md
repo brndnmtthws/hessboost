@@ -355,6 +355,35 @@ scheduling, and data-preparation changes described under
 
 Prediction and SHAP are unchanged code; their differences are host noise.
 
+### Model serialization
+
+The section-table writer sizes each array payload from its iterator and the
+whole container (with the checksum, or the compact bit stream) before
+filling it, and the compact encoder writes its bit stream a byte at a time
+(previously bit by bit) and looks references up by binary search in the
+sorted dictionaries. A parsed `CompactModel` keeps one padded copy of its
+bytes instead of two. Output bytes are unchanged.
+
+Measured on the 192-core **AWS Neoverse-V3** host (Rust 1.98.1, bench
+profile) on 2026-09-25 UTC with `scripts/compare_benchmarks.py`
+(baseline/optimized/optimized/baseline, 20 samples, mean of the two run
+medians), `RAYON_NUM_THREADS=1`, while the host ran other jobs (load average
+about 100). The models have 100 trees trained on 20,000 rows × 20 features:
+depth six, and loss-guide growth with up to 255 leaves (compact preorder
+layout). The compact cases come from a throwaway harness with models of that
+shape; the others are `model_io_100trees_depth6`.
+
+| Case | Threads | Before (ms) | After (ms) | Less time |
+|---|---:|---:|---:|---:|
+| `to_compact_bytes`, depth 6 | 1 | 1.921 | 0.779 | 59.4% |
+| `to_compact_bytes`, loss-guide | 1 | 8.909 | 4.406 | 50.5% |
+
+`CompactModel::from_bytes`, compact prediction (unchanged code), and the
+native `BoostedModel::to_bytes` / `from_bytes` are unchanged within host
+noise (under 2%). The native writer is dominated by zstd compression. A variant appending every
+payload to one shared buffer instead measured 14% slower on `to_bytes` and
+was dropped.
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks

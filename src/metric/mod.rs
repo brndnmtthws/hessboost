@@ -30,6 +30,7 @@ pub use survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
 use crate::config::{ObjectiveParams, TrainingParams};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
+use rayon::prelude::*;
 
 /// An evaluation metric over predictions and labels.
 pub trait Metric: Send + Sync {
@@ -296,8 +297,7 @@ impl Metric for Auc {
     fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
         nan_unless_consistent!(preds, labels, weights, 1);
         let n = preds.len();
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| preds[a].total_cmp(&preds[b]));
+        let order = stable_argsort(n, |&a, &b| preds[a].total_cmp(&preds[b]));
 
         // Assign average ranks (1-based), resolving ties.
         let mut ranks = vec![0.0f64; n];
@@ -382,12 +382,29 @@ pub(crate) fn group_ranges(
 /// consistent total preorder.
 /// Shared by the ranking metrics and the LambdaMART objective.
 pub(crate) fn argsort_desc(values: &[f32]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..values.len()).collect();
-    order.sort_by(|&a, &b| {
+    stable_argsort(values.len(), |&a, &b| {
         values[b]
             .partial_cmp(&values[a])
             .unwrap_or_else(|| values[b].total_cmp(&values[a]))
-    });
+    })
+}
+
+/// Inputs at least this long are sorted in parallel.
+const PARALLEL_SORT_LEN: usize = 1 << 15;
+
+/// The indices `0..n` stably sorted by `cmp`. Long inputs use rayon's
+/// parallel merge sort, which is stable too, so the order is the same.
+/// Shared by the curve and ranking metrics and the objectives that sort rows.
+pub(crate) fn stable_argsort(
+    n: usize,
+    cmp: impl Fn(&usize, &usize) -> std::cmp::Ordering + Sync,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    if n >= PARALLEL_SORT_LEN && rayon::current_num_threads() > 1 {
+        order.par_sort_by(cmp);
+    } else {
+        order.sort_by(cmp);
+    }
     order
 }
 
@@ -401,19 +418,53 @@ fn grouped_average(
     labels: &[f32],
     weights: Option<&[f32]>,
     group: Option<&crate::data::GroupInfo>,
-    mut score: impl FnMut(&[f32], &[f32]) -> f64,
+    score: impl Fn(&[f32], &[f32]) -> f64 + Sync,
 ) -> f64 {
-    let mut sum = 0.0;
-    let mut weight_sum = 0.0;
-    for (start, end) in group_ranges(preds.len(), group) {
-        let weight = weights.map_or(1.0, |values| f64::from(values[start]));
-        if weight == 0.0 {
-            continue;
-        }
-        sum += weight * score(&preds[start..end], &labels[start..end]);
-        weight_sum += weight;
+    let ranges = group_ranges(preds.len(), group);
+    let weight = |start: usize| weights.map_or(1.0, |values| f64::from(values[start]));
+    let totals = fold_groups(
+        &ranges,
+        |start, end| (weight(start) != 0.0).then(|| score(&preds[start..end], &labels[start..end])),
+        (0.0, 0.0),
+        |(sum, weight_sum), (start, _), score| match score {
+            Some(score) => {
+                let weight = weight(start);
+                (sum + weight * score, weight_sum + weight)
+            }
+            None => (sum, weight_sum),
+        },
+    );
+    weighted_mean(totals)
+}
+
+/// Query groups covering at least this many rows are scored in parallel.
+const PARALLEL_GROUP_ROWS: usize = 4096;
+
+/// `fold` over `f(start, end)` of every `(start, end)` range, in range
+/// order. When the ranges cover many rows and the pool has several threads,
+/// the `f` values are computed in parallel first; the fold always runs in
+/// range order, so its result does not depend on the thread count.
+pub(super) fn fold_groups<T: Send, A>(
+    ranges: &[(usize, usize)],
+    f: impl Fn(usize, usize) -> T + Sync,
+    init: A,
+    mut fold: impl FnMut(A, (usize, usize), T) -> A,
+) -> A {
+    let rows: usize = ranges.iter().map(|(start, end)| end - start).sum();
+    if ranges.len() > 1 && rows >= PARALLEL_GROUP_ROWS && rayon::current_num_threads() > 1 {
+        let values: Vec<T> = ranges
+            .par_iter()
+            .map(|&(start, end)| f(start, end))
+            .collect();
+        ranges
+            .iter()
+            .zip(values)
+            .fold(init, |acc, (&range, value)| fold(acc, range, value))
+    } else {
+        ranges.iter().fold(init, |acc, &(start, end)| {
+            fold(acc, (start, end), f(start, end))
+        })
     }
-    weighted_mean((sum, weight_sum))
 }
 
 /// Normalized Discounted Cumulative Gain (`ndcg`), averaged over query groups.
@@ -754,21 +805,8 @@ pub(crate) fn build(
         Some((b, s)) => (b, Some(s)),
         None => (name, None),
     };
-    let invalid =
-        |reason: &str| HessboostError::invalid_param("eval_metric", format!("`{name}`: {reason}"));
-    // Rank cutoff `@k`: decimal digits only (`usize::from_str` also takes a
-    // leading `+`), so `2.9`, `abc`, `1@2`, or an empty suffix are refused
-    // rather than truncated or dropped.
-    let cutoff = || match suffix {
-        None => Ok(None),
-        Some(s) if s.ends_with('-') => Err(invalid(
-            "the `-` variants of the ranking metrics are not implemented",
-        )),
-        Some(s) => match s.parse::<usize>() {
-            Ok(k) if k >= 1 && s.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(k)),
-            _ => Err(invalid("the `@k` cutoff must be a positive integer")),
-        },
-    };
+    let invalid = |reason: &str| invalid_metric(name, reason);
+    let cutoff = || rank_cutoff(name, suffix);
     let metric: Result<Box<dyn Metric>> = match base {
         "rmse" => Ok(Box::new(Rmse)),
         "mae" => Ok(Box::new(Mae)),
@@ -784,19 +822,9 @@ pub(crate) fn build(
         })),
         "poisson-nloglik" => Ok(Box::new(PoissonNLogLik)),
         "gamma-nloglik" => Ok(Box::new(GammaNLogLik)),
-        "tweedie-nloglik" => {
-            // The range `TrainingParams::validate` gives the objective's
-            // `tweedie_variance_power`, whose default metric this is.
-            let rho = match suffix {
-                None => 1.5,
-                Some(s) => s
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|r| r.is_finite() && (1.0f32..2.0).contains(&(*r as f32)))
-                    .ok_or_else(|| invalid("the variance power `@rho` must be in [1, 2)"))?,
-            };
-            Ok(Box::new(TweedieNLogLik { rho }))
-        }
+        "tweedie-nloglik" => Ok(Box::new(TweedieNLogLik {
+            rho: tweedie_power(name, suffix)?,
+        })),
         "ndcg" => Ok(Box::new(Ndcg::new(cutoff()?))),
         "map" => Ok(Box::new(MeanAveragePrecision::new(cutoff()?))),
         "rmsle" => Ok(Box::new(Rmsle)),
@@ -844,6 +872,45 @@ pub(crate) fn build(
     Ok(metric)
 }
 
+/// The parameter error of metric `name`.
+fn invalid_metric(name: &str, reason: &str) -> HessboostError {
+    HessboostError::invalid_param("eval_metric", format!("`{name}`: {reason}"))
+}
+
+/// The rank cutoff `@k` of ranking metric `name`: decimal digits only
+/// (`usize::from_str` also takes a leading `+`), so `2.9`, `abc`, `1@2`, or
+/// an empty suffix are refused rather than truncated or dropped.
+fn rank_cutoff(name: &str, suffix: Option<&str>) -> Result<Option<usize>> {
+    match suffix {
+        None => Ok(None),
+        Some(s) if s.ends_with('-') => Err(invalid_metric(
+            name,
+            "the `-` variants of the ranking metrics are not implemented",
+        )),
+        Some(s) => match s.parse::<usize>() {
+            Ok(k) if k >= 1 && s.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(k)),
+            _ => Err(invalid_metric(
+                name,
+                "the `@k` cutoff must be a positive integer",
+            )),
+        },
+    }
+}
+
+/// The variance power `@rho` of `tweedie-nloglik` (`1.5` without a
+/// suffix), in the range `TrainingParams::validate` gives the objective's
+/// `tweedie_variance_power`, whose default metric this is.
+fn tweedie_power(name: &str, suffix: Option<&str>) -> Result<f64> {
+    match suffix {
+        None => Ok(1.5),
+        Some(s) => s
+            .parse::<f64>()
+            .ok()
+            .filter(|r| r.is_finite() && (1.0f32..2.0).contains(&(*r as f32)))
+            .ok_or_else(|| invalid_metric(name, "the variance power `@rho` must be in [1, 2)")),
+    }
+}
+
 /// Build the list of metrics to evaluate: the user's `eval_metric` list if any,
 /// otherwise the single `default_name` supplied by the objective. `num_class`
 /// and `objective` are forwarded to [`build`].
@@ -878,6 +945,88 @@ pub(crate) fn create_metrics(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// The parallel sorts, per-group scores, and per-row interval values give
+    /// the serial metric values bit for bit: large inputs with many ties, many
+    /// query groups (one empty), weights, and label matrices.
+    #[test]
+    fn parallel_evaluation_matches_serial() {
+        use crate::config::AftDistribution;
+        use crate::data::GroupInfo;
+        let n = 3 * PARALLEL_SORT_LEN + 17;
+        let preds: Vec<f32> = (0..3 * n)
+            .map(|i| ((i * 7919) % 1013) as f32 / 1013.0)
+            .collect();
+        let labels: Vec<f32> = (0..3 * n).map(|i| ((i * 31) % 7 % 2) as f32).collect();
+        let relevance: Vec<f32> = (0..n).map(|i| ((i * 13) % 5) as f32).collect();
+        let weights: Vec<f32> = (0..n).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
+        let mut sizes: Vec<usize> = (0..n / 40).map(|g| 1 + (g * 17) % 79).collect();
+        sizes[2] = 0;
+        let covered: usize = sizes.iter().sum();
+        sizes.push(n - covered);
+        let group = GroupInfo::from_sizes(&sizes);
+        let times: Vec<f32> = (0..n)
+            .map(|i| if i % 4 == 0 { -1.0 } else { 1.0 } * (1.0 + (i % 97) as f32))
+            .collect();
+        let lower: Vec<f32> = (0..n).map(|i| 0.5 + (i % 101) as f32 * 0.03).collect();
+        let upper: Vec<f32> = lower
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| {
+                if i % 3 == 2 {
+                    f32::INFINITY
+                } else {
+                    l * (1.0 + (i % 3) as f32)
+                }
+            })
+            .collect();
+        let margins: Vec<f32> = (0..n)
+            .map(|i| ((i * 37) % 211) as f32 / 50.0 - 2.0)
+            .collect();
+        // Cox reads hazards: strictly positive, so its value is finite.
+        let hazards: Vec<f32> = margins.iter().map(|m| m.exp()).collect();
+        let evaluate = || {
+            let p = &preds[..n];
+            let w = Some(weights.as_slice());
+            let matrix = MetaInfo {
+                n_rows: n,
+                n_targets: 3,
+                ..MetaInfo::new(&labels, Some(&weights), None)
+            };
+            let bounds = MetaInfo {
+                n_rows: n,
+                label_lower_bound: Some(&lower),
+                label_upper_bound: Some(&upper),
+                ..MetaInfo::new(&[], Some(&weights), None)
+            };
+            let g = Some(&group);
+            [
+                Auc.eval(p, &labels[..n], None),
+                AucPr.eval(p, &labels[..n], w),
+                Auc.eval_info(&preds, &matrix),
+                Ndcg::new(None).eval_grouped(p, &relevance, w, g),
+                Ndcg::new(Some(5)).eval_grouped(p, &relevance, w, g),
+                MeanAveragePrecision::new(Some(10)).eval_grouped(p, &relevance, w, g),
+                Precision::new("pre@3", Some(3)).eval_grouped(p, &labels[..n], w, g),
+                Ndcg::new(Some(20)).eval(p, &relevance, None),
+                CoxNLogLik.eval(&hazards, &times, None),
+                AftNLogLik::new(AftDistribution::Logistic, 1.2).eval_info(&margins, &bounds),
+                IntervalRegressionAccuracy.eval_info(&margins, &bounds),
+            ]
+        };
+        let pool = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+        };
+        let serial = pool(1).install(evaluate);
+        // A NaN or infinite value would compare equal without exercising
+        // the accumulation.
+        assert!(serial.iter().all(|v| v.is_finite()), "{serial:?}");
+        let parallel = pool(4).install(evaluate);
+        assert_eq!(serial.map(f64::to_bits), parallel.map(f64::to_bits));
+    }
 
     #[test]
     fn rmse_basic() {

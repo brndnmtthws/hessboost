@@ -1,6 +1,6 @@
 //! Precision at `k` (`pre`, `pre@k`) for learning to rank.
 
-use super::{Metric, argsort_desc, group_ranges, weighted_mean};
+use super::{Metric, argsort_desc, fold_groups, group_ranges, weighted_mean};
 use crate::K_RT_EPS_F32;
 
 /// XGBoost's default ranking cutoff (`LambdaRankParam::DefaultK`), used by
@@ -61,23 +61,30 @@ impl Metric for Precision {
         if !labels.iter().all(|&y| binary(y)) {
             return f64::NAN;
         }
-        let mut score = 0.0f64;
-        let mut weight_sum = 0.0f64;
-        for (start, end) in group_ranges(preds.len(), group) {
-            let weight = weights.map_or(1.0f32, |w| w[start]);
-            if weight == 0.0 {
-                continue;
-            }
-            let order = argsort_desc(&preds[start..end]);
-            let n = self.k.min(end - start);
-            let hits: f64 = order[..n]
-                .iter()
-                .map(|&i| f64::from(labels[start + i] * weight))
-                .sum();
-            score += hits / n as f64;
-            weight_sum += f64::from(weight);
-        }
-        weighted_mean((score, weight_sum)).min(1.0)
+        let ranges = group_ranges(preds.len(), group);
+        let weight = |start: usize| weights.map_or(1.0f32, |w| w[start]);
+        let precision = |start: usize, end: usize| {
+            let weight = weight(start);
+            (weight != 0.0).then(|| {
+                let order = argsort_desc(&preds[start..end]);
+                let n = self.k.min(end - start);
+                let hits: f64 = order[..n]
+                    .iter()
+                    .map(|&i| f64::from(labels[start + i] * weight))
+                    .sum();
+                hits / n as f64
+            })
+        };
+        let totals = fold_groups(
+            &ranges,
+            precision,
+            (0.0f64, 0.0f64),
+            |(score, weight_sum), (start, _), precision| match precision {
+                Some(precision) => (score + precision, weight_sum + f64::from(weight(start))),
+                None => (score, weight_sum),
+            },
+        );
+        weighted_mean(totals).min(1.0)
     }
 
     /// Precision ranks one label per row within each query group.

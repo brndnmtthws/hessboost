@@ -7,6 +7,7 @@ use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use crate::objective::{abs_label_order, aft_nloglik};
+use rayon::prelude::*;
 
 /// Negative log partial likelihood of the Cox model (`cox-nloglik`), per
 /// observed event, with Breslow ties.
@@ -58,12 +59,15 @@ impl Metric for CoxNLogLik {
     }
 }
 
+/// Rows at which [`interval_mean`] evaluates its rows in parallel.
+const PARALLEL_INTERVAL_ROWS: usize = 16_384;
+
 /// Weighted mean of `row(lower, upper, margin)` over the label intervals,
 /// XGBoost's survival-metric reduction (`esum / wsum`, or `esum` when the
 /// total weight is zero). Without label bounds, the labels are used as
 /// observed times (`lower == upper == label`). NaN unless the predictions,
 /// intervals, and weights all have one entry per row.
-fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> f64) -> f64 {
+fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> f64 + Sync) -> f64 {
     let (lower, upper) = match (info.label_lower_bound, info.label_upper_bound) {
         (Some(lower), Some(upper)) => (lower, upper),
         _ => (info.labels, info.labels),
@@ -71,12 +75,35 @@ fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> 
     if upper.len() != lower.len() || !consistent(preds, lower, info.weights, 1) {
         return f64::NAN;
     }
+    let value = |i: usize| {
+        row(
+            f64::from(lower[i]),
+            f64::from(upper[i]),
+            f64::from(preds[i]),
+        )
+    };
+    let weight = |i: usize| info.weights.map_or(1.0, |w| f64::from(w[i]));
+    let n = lower.len();
     let mut residue_sum = 0.0f64;
     let mut weights_sum = 0.0f64;
-    for (i, ((&lo, &hi), &pred)) in lower.iter().zip(upper).zip(preds).enumerate() {
-        let w = info.weights.map_or(1.0, |w| f64::from(w[i]));
-        residue_sum += row(f64::from(lo), f64::from(hi), f64::from(pred)) * w;
-        weights_sum += w;
+    if n >= PARALLEL_INTERVAL_ROWS && rayon::current_num_threads() > 1 {
+        // Row values in parallel, summed in row order as below.
+        let values: Vec<f64> = (0..n)
+            .into_par_iter()
+            .with_min_len(4096)
+            .map(value)
+            .collect();
+        for (i, v) in values.into_iter().enumerate() {
+            let w = weight(i);
+            residue_sum += v * w;
+            weights_sum += w;
+        }
+    } else {
+        for (i, ((&lo, &hi), &pred)) in lower.iter().zip(upper).zip(preds).enumerate() {
+            let w = weight(i);
+            residue_sum += row(f64::from(lo), f64::from(hi), f64::from(pred)) * w;
+            weights_sum += w;
+        }
     }
     if weights_sum == 0.0 {
         residue_sum

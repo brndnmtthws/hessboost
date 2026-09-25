@@ -391,6 +391,42 @@ that spread. The native writer is dominated by zstd compression. A variant
 appending every payload to one shared buffer instead measured 14% slower on
 `to_bytes` and was dropped.
 
+### Data preparation
+
+CSR rows are binned straight from the matrix instead of being copied into a
+per-row entry buffer first; the quantile and sketch radix sorts share one
+implementation, whose buckets each cut-building worker reuses across its
+columns (and which returns at once for fewer than two values); sketch merges
+swap buffers instead of copying the merged summary back; CSR cut
+construction takes each column's count from the column view; the text
+loaders read every line into one reused buffer. Cut values and bins are
+unchanged.
+
+Measured like the serialization cases above (192-core Neoverse-V3 under
+load, `scripts/compare_benchmarks.py`) against the previous commit. The index
+and cut cases are `data_prep_100k_x30` (20 samples); the loader cases parse
+1,000,000 rows × 20 features from memory in a throwaway harness, against the
+same source with `BufRead::lines` (10 samples).
+
+| Case | Threads | Before (ms) | After (ms) | Less time |
+|---|---:|---:|---:|---:|
+| `GHistIndex::from_dmatrix`, CSR | 1 | 11.323 | 10.685 | 5.6% |
+| `GHistIndex::from_dmatrix`, CSR | 16 | 0.851 | 0.795 | 6.6% |
+| `HistCuts::from_dmatrix`, dense | 1 | 54.765 | 54.051 | 1.3% |
+| `HistCuts::from_dmatrix`, dense | 16 | 4.353 | 4.282 | 1.6% |
+| `read_csv`, 1M rows | 1 | 454.9 | 436.4 | 4.1% |
+
+The dense cut gain is small but repeated in both runs of each pair
+(1.3%/1.3% single-threaded, 1.4%/1.8% at 16 threads). CSR cut construction
+(0.5% and 0.3%, single pairs from −0.03% to 1.1%), dense binning (unchanged
+code), and `read_libsvm` (1.5% slower on the 1M-row file) are unchanged
+within host noise. Two further candidates measured slower and were dropped:
+validating categorical columns of CSR input in one pass over the stored
+entries (10% slower when the categorical columns lead each row, where the
+per-column search stops early), and a reused per-worker `(sum, count)` buffer
+for ordered target statistics (17% slower than allocating two zeroed vectors
+per column).
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks

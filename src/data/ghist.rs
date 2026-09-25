@@ -9,8 +9,8 @@
 //! features × 256 bins), else `u32`. The build loop is memory-bandwidth bound,
 //! so halving the index width is a direct throughput win.
 
+use crate::data::DMatrix;
 use crate::data::quantile::{BinSearch, HistCuts};
-use crate::data::{DMatrix, Entry};
 use rayon::prelude::*;
 use std::ops::Range;
 
@@ -480,14 +480,16 @@ fn bin_rows_into<B: FromBin>(
             row_ends.push(bins.len());
         }
     } else {
-        let mut row: Vec<Entry> = Vec::new();
         for r in rows {
-            data.row_into(r, &mut row);
-            dense &= row.len() == n_features
-                && row.iter().enumerate().all(|(c, e)| e.index as usize == c);
-            for e in &row {
-                push(&mut bins, cuts.bin_of(e.index as usize, e.value));
-            }
+            // A row is dense when it stores every feature in order.
+            let mut stored = 0usize;
+            let mut in_order = true;
+            data.for_row_entry(r, |index, value| {
+                in_order &= index as usize == stored;
+                stored += 1;
+                push(&mut bins, cuts.bin_of(index as usize, value));
+            });
+            dense &= in_order && stored == n_features;
             row_ends.push(bins.len());
         }
     }

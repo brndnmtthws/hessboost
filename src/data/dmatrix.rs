@@ -51,6 +51,14 @@ fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
     check_len("csr indptr terminal", indptr[indptr.len() - 1], nnz)
 }
 
+/// Reject any non-finite value of `values` under parameter `name`.
+fn check_finite(name: &'static str, values: &[f32], reason: &'static str) -> Result<()> {
+    if values.iter().any(|v| !v.is_finite()) {
+        return Err(HessboostError::invalid_param(name, reason));
+    }
+    Ok(())
+}
+
 /// Reject weights that are negative or non-finite (`invalid`), or none of
 /// which is positive (`none_positive`), under parameter `name`.
 fn check_weights(
@@ -106,15 +114,6 @@ pub struct DMatrix {
     group: Option<GroupInfo>,
     feature_types: Vec<FeatureType>,
     feature_weights: Option<Vec<f32>>,
-}
-
-/// A single materialized `(feature_index, value)` entry from a row.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Entry {
-    /// Column index of the feature.
-    pub index: u32,
-    /// Feature value (guaranteed non-missing when yielded by row iterators).
-    pub value: f32,
 }
 
 impl DMatrix {
@@ -219,12 +218,11 @@ impl DMatrix {
                 num_features: n_cols,
             });
         }
-        if values.iter().any(|v| !v.is_finite()) {
-            return Err(HessboostError::invalid_param(
-                "csr values",
-                "stored feature values must be finite",
-            ));
-        }
+        check_finite(
+            "csr values",
+            &values,
+            "stored feature values must be finite",
+        )?;
         let mut seen = std::collections::HashSet::new();
         for row in 0..n_rows {
             seen.clear();
@@ -268,12 +266,7 @@ impl DMatrix {
             HessboostError::invalid_param("labels", "n_rows * n_targets overflows usize")
         })?;
         check_len("labels", labels.len(), expected)?;
-        if labels.iter().any(|v| !v.is_finite()) {
-            return Err(HessboostError::invalid_param(
-                "labels",
-                "all labels must be finite",
-            ));
-        }
+        check_finite("labels", labels, "all labels must be finite")?;
         self.labels = Some(labels.to_vec());
         self.n_targets = n_targets;
         Ok(self)
@@ -348,12 +341,7 @@ impl DMatrix {
                 "length must be a non-zero multiple of n_rows",
             ));
         }
-        if base_margin.iter().any(|v| !v.is_finite()) {
-            return Err(HessboostError::invalid_param(
-                "base_margin",
-                "all margins must be finite",
-            ));
-        }
+        check_finite("base_margin", base_margin, "all margins must be finite")?;
         self.base_margin = Some(base_margin.to_vec());
         Ok(self)
     }
@@ -589,8 +577,9 @@ impl DMatrix {
     }
 
     /// Visit every non-missing `(index, value)` entry of `row`, in storage
-    /// order. `row` must be in bounds.
-    fn for_row_entry(&self, row: usize, mut f: impl FnMut(u32, f32)) {
+    /// order (ascending columns for dense storage). `row` must be in bounds.
+    #[inline]
+    pub(crate) fn for_row_entry(&self, row: usize, mut f: impl FnMut(u32, f32)) {
         match &self.storage {
             Storage::Dense(data) => {
                 let base = row * self.n_cols;
@@ -617,16 +606,6 @@ impl DMatrix {
         }
     }
 
-    /// Materialize a single row's non-missing `(index, value)` entries into
-    /// `out`. Reuses the buffer to avoid per-row allocation in hot loops.
-    pub(crate) fn row_into(&self, row: usize, out: &mut Vec<Entry>) {
-        out.clear();
-        if row >= self.n_rows {
-            return;
-        }
-        self.for_row_entry(row, |index, value| out.push(Entry { index, value }));
-    }
-
     /// Build a compressed-sparse-**column** view for column-oriented split
     /// finding (used by the exact tree method). Each column lists its
     /// non-missing `(row, value)` pairs.
@@ -635,13 +614,15 @@ impl DMatrix {
         self.for_each_entry(|_row, col, _v| col_counts[col as usize] += 1);
 
         let mut col_ptr = vec![0usize; self.n_cols + 1];
-        for (c, &count) in col_counts.iter().enumerate() {
-            col_ptr[c + 1] = col_ptr[c] + count;
+        for (c, count) in col_counts.iter_mut().enumerate() {
+            col_ptr[c + 1] = col_ptr[c] + *count;
+            // From here on the count is column `c`'s fill cursor.
+            *count = col_ptr[c];
         }
         let nnz = col_ptr[self.n_cols];
         let mut rows = vec![0u32; nnz];
         let mut vals = vec![0f32; nnz];
-        let mut cursor = col_ptr.clone();
+        let mut cursor = col_counts;
         self.for_each_entry(|row, col, v| {
             let c = col as usize;
             let pos = cursor[c];
@@ -770,17 +751,11 @@ mod tests {
     }
 
     #[test]
-    fn row_into_skips_missing() {
+    fn row_entries_skip_missing() {
         let d = sample_dense();
-        let mut buf = Vec::new();
-        d.row_into(1, &mut buf);
-        assert_eq!(
-            buf,
-            vec![Entry {
-                index: 1,
-                value: 5.0
-            }]
-        );
+        let mut entries = Vec::new();
+        d.for_row_entry(1, |index, value| entries.push((index, value)));
+        assert_eq!(entries, [(1, 5.0)]);
     }
 
     #[test]

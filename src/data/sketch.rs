@@ -19,6 +19,8 @@
 //!   `max_bin` entries. Used by `approx`, whose weights are the current
 //!   Hessians.
 
+use super::quantile::{RadixScratch, radix_sort, sort_key};
+
 /// One summary entry (`WQSummary::Entry`): a value with its rank interval
 /// `[rmin, rmax]` and the weight `wmin` of the value itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -99,47 +101,6 @@ fn set_from_sorted(queue: &[(f32, f32)], out: &mut Vec<Entry>) {
         out.push(Entry::new(wsum, wsum + w, w, value));
         wsum += w;
         i = j;
-    }
-}
-
-/// Sort `queue` by value in `f32::total_cmp` order with an LSD radix sort
-/// over the order-preserving key of each value's bits (11, 11, and 10 bit
-/// digits; a digit every key shares is skipped). Stable, `scratch` is reused.
-fn radix_sort_by_value(queue: &mut Vec<(f32, f32)>, scratch: &mut Vec<(f32, f32)>) {
-    // Negative values reverse all bits, others set the sign bit: unsigned
-    // order of the keys is `total_cmp` order of the values.
-    let key = |v: f32| {
-        let bits = v.to_bits();
-        if bits >> 31 == 1 {
-            !bits
-        } else {
-            bits | 0x8000_0000
-        }
-    };
-    let n = queue.len();
-    scratch.clear();
-    scratch.resize(n, (0.0, 0.0));
-    let mut counts = [0usize; 2048];
-    for shift in [0u32, 11, 22] {
-        counts.fill(0);
-        for &(v, _) in queue.iter() {
-            counts[((key(v) >> shift) & 0x7ff) as usize] += 1;
-        }
-        if counts.contains(&n) {
-            continue;
-        }
-        let mut offset = 0;
-        for count in &mut counts {
-            let c = *count;
-            *count = offset;
-            offset += c;
-        }
-        for &entry in queue.iter() {
-            let digit = ((key(entry.0) >> shift) & 0x7ff) as usize;
-            scratch[counts[digit]] = entry;
-            counts[digit] += 1;
-        }
-        std::mem::swap(queue, scratch);
     }
 }
 
@@ -292,8 +253,8 @@ fn set_combine(this: &mut Vec<Entry>, other: &[Entry], workspace: &mut Vec<Entry
         }
     }
     fix_error(workspace);
-    this.clear();
-    this.extend_from_slice(workspace);
+    // The merged summary becomes `this`; the old one is the next scratch.
+    std::mem::swap(this, workspace);
 }
 
 /// `WQSummary::SetPruneSorted`: summarise a whole column of `(value, weight)`
@@ -440,7 +401,7 @@ pub(crate) struct WQSketch {
     /// Every pushed weight is `1` ([`Self::with_unit_weights`]).
     unit_weights: bool,
     /// Scratch buffer of the radix sort.
-    sort_scratch: Vec<(f32, f32)>,
+    sort_scratch: RadixScratch<(f32, f32)>,
 }
 
 impl WQSketch {
@@ -457,8 +418,20 @@ impl WQSketch {
             workspace: Vec::new(),
             num_elements: 0,
             unit_weights: false,
-            sort_scratch: Vec::new(),
+            sort_scratch: RadixScratch::default(),
         }
+    }
+
+    /// Sort with `scratch`'s buffers (reused across sketches), returned by
+    /// [`Self::into_sort_scratch`].
+    pub(crate) fn with_sort_scratch(mut self, scratch: RadixScratch<(f32, f32)>) -> Self {
+        self.sort_scratch = scratch;
+        self
+    }
+
+    /// The radix sort's buffers, for the next sketch.
+    pub(crate) fn into_sort_scratch(self) -> RadixScratch<(f32, f32)> {
+        self.sort_scratch
     }
 
     /// `WQuantileSketch::Push`: add one value in row order.
@@ -507,7 +480,9 @@ impl WQSketch {
         // the sort orders them: any value-ordered permutation gives the
         // summary the comparison sort gives.
         if self.unit_weights && self.num_elements < 1 << 24 {
-            radix_sort_by_value(&mut self.queue, &mut self.sort_scratch);
+            radix_sort(&mut self.queue, &mut self.sort_scratch, |&(v, _)| {
+                sort_key(v)
+            });
         } else {
             self.queue.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         }
@@ -532,7 +507,8 @@ impl WQSketch {
             }
             l += 1;
         }
-        self.levels[l].extend_from_slice(&self.temp);
+        // `levels[l]` is empty here; `temp` is refilled before its next use.
+        std::mem::swap(&mut self.levels[l], &mut self.temp);
     }
 
     /// `WQuantileSketch::PushSorted`: ingest a whole column of `(value,
@@ -547,7 +523,7 @@ impl WQSketch {
 
     /// `WQuantileSketch::GetSummary`: flush and merge every level into one
     /// summary of at most `max_size` entries.
-    fn summary(mut self, max_size: usize) -> Vec<Entry> {
+    fn summary(&mut self, max_size: usize) -> Vec<Entry> {
         self.flush_queue();
         let prune_size = max_size.max(self.limit_size);
         let mut out = Vec::new();
@@ -563,7 +539,7 @@ impl WQSketch {
     /// one worker): the final summary is pruned to the budget for the values
     /// actually seen, then queried for at most `max_bin` cuts plus the
     /// sentinel.
-    pub(crate) fn cut_values(self, out: &mut Vec<f32>) {
+    pub(crate) fn cut_values(&mut self, out: &mut Vec<f32>) {
         let max_bin = self.max_bin;
         let budget = summary_budget(max_bin, self.num_elements);
         let summary = self.summary(budget);

@@ -224,7 +224,9 @@ nouns there.
     `config::PartialObjectiveParams`, every field optional: a missing one
     takes `ObjectiveParams::defaults_for(<recorded objective>)` (the
     defaults depend on the objective, so no per-field serde default), and a
-    new `ObjectiveParams` field goes there too. A tree may omit
+    new `ObjectiveParams` field goes there too: add it to the
+    `objective_param_mirrors!` list in `config/params.rs`, which generates
+    that mirror and `ObjectiveParams::training_params`. A tree may omit
     `size_leaf_vector` (0) and `leaf_vectors`, but a multi-output model's
     trees must state `size_leaf_vector` (it decides vector vs scalar
     layout). Everything else predictions depend on (`objective`,
@@ -300,9 +302,9 @@ nouns there.
   `ndcg`/`map`/`pre` take an `@k` suffix and `tweedie-nloglik` an `@rho`;
   any other suffix is refused), and `training/budget.rs`. Budget mode and
   the refresh updater (`reject_unused_by_refresh`) compare the serialized
-  params against the defaults plus an allow-list of what they read, so a
-  non-default value of any other field, including one added later, is
-  refused automatically.
+  params against the defaults plus an allow-list of what they read
+  (`TrainingParams::refuse_changes_from`), so a non-default value of any
+  other field, including one added later, is refused automatically.
 - **Parity-fixed options:** options that XGBoost has but hessboost supports
   at one setting (README, "Not implemented") are not `TrainingParams`
   fields. `tests/parity.rs` (`expect_fixed`) fails a fixture that sets

@@ -560,6 +560,16 @@ pub(crate) fn reject_missing_param(params: &TrainingParams) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `dtrain`'s feature weights on a training path that samples no
+/// columns (`reason` names it): they only steer the tree builders' column
+/// sampling.
+pub(crate) fn reject_feature_weights(dtrain: &DMatrix, reason: &'static str) -> Result<()> {
+    if dtrain.feature_weights().is_some() {
+        return Err(HessboostError::invalid_param("feature_weights", reason));
+    }
+    Ok(())
+}
+
 /// The core boosting loop, generic over single- and multi-output objectives.
 ///
 /// Margins and gradients are laid out `[instance][output]`. Each round computes
@@ -635,21 +645,11 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
             });
         }
     }
-    // Feature weights only steer the tree builders' column sampling, which
-    // neither the linear booster nor the refresh updater performs.
-    if dtrain.feature_weights().is_some() {
-        if params.booster == BoosterKind::GbLinear {
-            return Err(HessboostError::invalid_param(
-                "feature_weights",
-                "gblinear does not sample columns",
-            ));
-        }
-        if params.process_type == ProcessType::Update {
-            return Err(HessboostError::invalid_param(
-                "feature_weights",
-                "`process_type=update` does not sample columns",
-            ));
-        }
+    if params.booster == BoosterKind::GbLinear {
+        reject_feature_weights(dtrain, "gblinear does not sample columns")?;
+    }
+    if params.process_type == ProcessType::Update {
+        reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
 
     BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)?;

@@ -220,7 +220,7 @@ mod shap;
 mod ubjson;
 mod xgboost;
 
-use crate::config::ObjectiveParams;
+use crate::config::{ObjectiveParams, PartialObjectiveParams};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::objective::create_objective;
@@ -319,12 +319,25 @@ pub struct BoostedModel {
 /// same names and layout), before validation. `BoostedModel`'s
 /// `Deserialize` converts it with [`BoostedModel::try_from`], which runs
 /// [`BoostedModel::validate_structure`].
+///
+/// Everything predictions depend on is required, including the nullable
+/// `linear` (the gblinear weights), which a plain `Option` field would
+/// default to `null` when absent; an absent `best_iteration` means none was
+/// selected (every iteration predicts). Only the objective
+/// parameters may be omitted (all of them, or any subset): each missing
+/// one takes the recorded objective's default
+/// ([`ObjectiveParams::defaults_for`]). A tree may omit `size_leaf_vector`
+/// (scalar) and `leaf_vectors` (none), except that a multi-output model's
+/// trees must state `size_leaf_vector`, since it decides whether they are
+/// vector-leaf trees; each tree's `linear` is required
+/// ([`UncheckedRegTree`]).
 #[derive(Deserialize)]
 struct UncheckedBoostedModel {
     trees: Vec<UncheckedRegTree>,
     base_score: Vec<f32>,
     objective: String,
-    objective_params: ObjectiveParams,
+    #[serde(default)]
+    objective_params: PartialObjectiveParams,
     num_class: usize,
     n_outputs: usize,
     n_targets: usize,
@@ -332,6 +345,7 @@ struct UncheckedBoostedModel {
     best_iteration: Option<usize>,
     tree_weights: Vec<f32>,
     num_parallel_tree: usize,
+    #[serde(deserialize_with = "Option::deserialize")]
     linear: Option<LinearModel>,
 }
 
@@ -339,6 +353,14 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
     type Error = HessboostError;
 
     fn try_from(m: UncheckedBoostedModel) -> Result<Self> {
+        if m.n_outputs > 1
+            && let Some(tree) = m.trees.iter().position(|t| !t.states_leaf_width())
+        {
+            return Err(HessboostError::ModelFormat(format!(
+                "tree {tree} of a {}-output model does not state size_leaf_vector",
+                m.n_outputs
+            )));
+        }
         let model = BoostedModel {
             trees: m
                 .trees
@@ -346,8 +368,8 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
                 .map(UncheckedRegTree::into_unchecked)
                 .collect(),
             base_score: m.base_score,
+            objective_params: m.objective_params.fill(&m.objective),
             objective: m.objective,
-            objective_params: m.objective_params,
             num_class: m.num_class,
             n_outputs: m.n_outputs,
             n_targets: m.n_targets,

@@ -320,6 +320,12 @@ pub struct TrainResult {
     /// after continued training starts at the initial model's
     /// [`num_boost_rounds`](BoostedModel::num_boost_rounds).
     pub history: Vec<RoundEval>,
+    /// With [`early_stopping_rounds`](Trainer::early_stopping_rounds), the
+    /// watched metric's value at the model's
+    /// [`best_iteration`](BoostedModel::best_iteration) (XGBoost's
+    /// `best_score`), whether or not training stopped early; `None` without
+    /// early stopping or when no round ran.
+    pub best_score: Option<f64>,
 }
 
 /// Train a model for `num_boost_round` iterations with no eval sets, early
@@ -398,10 +404,16 @@ impl<'a> Trainer<'a> {
     }
 
     /// Stop when the watched metric fails to improve for `rounds`
-    /// consecutive rounds, and set the model's
-    /// [`best_iteration`](BoostedModel::best_iteration). As in XGBoost, the
-    /// watched metric is the **last** metric of the **last** eval set. Needs
-    /// at least one [`eval`](Self::eval) set and `rounds > 0`.
+    /// consecutive rounds. As in XGBoost, the watched metric is the **last**
+    /// metric of the **last** eval set. Needs at least one
+    /// [`eval`](Self::eval) set and `rounds > 0`.
+    ///
+    /// The model's [`best_iteration`](BoostedModel::best_iteration) and
+    /// [`TrainResult::best_score`] record the best round whether training
+    /// stopped early or ran all `rounds` (as XGBoost's `best_iteration`
+    /// does), so plain prediction uses the iterations up to the best one
+    /// either way. When the metric never improves (it is NaN), the best
+    /// round is this run's first.
     ///
     /// After [`init_model`](Self::init_model) the early-stopping state starts
     /// fresh; `best_iteration` and the history's iterations are absolute
@@ -690,6 +702,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
         return Ok(TrainResult {
             model,
             history: Vec::new(),
+            best_score: None,
         });
     }
 
@@ -721,12 +734,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     // A caller-supplied metric replaces the configured/default metric list.
     let metrics = match metric_override {
         Some(m) => vec![m],
-        None => create_metrics(
-            &params.eval_metric,
-            &objective.default_metric(),
-            params.num_class,
-            &objective_params,
-        )?,
+        None => configured_metrics(params, objective)?,
     };
     if dtrain.n_targets() > 1
         && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
@@ -982,7 +990,6 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                 } else {
                     rounds_since_improve += 1;
                     if rounds_since_improve >= patience {
-                        model.set_best_iteration(Some(best_iter));
                         break;
                     }
                 }
@@ -990,7 +997,37 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
         }
     }
 
-    Ok(TrainResult { model, history })
+    // XGBoost records the best iteration whenever early stopping is on, not
+    // only when patience runs out.
+    let mut best_round_score = None;
+    if early_stopping_rounds.is_some()
+        && let Some(first) = history.first()
+    {
+        let round = &history[best_iter - first.iteration];
+        best_round_score = round.scores.last().map(|&(_, _, v)| v);
+        model.set_best_iteration(Some(best_iter));
+    }
+
+    Ok(TrainResult {
+        model,
+        history,
+        best_score: best_round_score,
+    })
+}
+
+/// The metrics training evaluates without a custom metric:
+/// `params.eval_metric`, or `objective`'s default. The last one is the
+/// early-stopping metric.
+pub(crate) fn configured_metrics(
+    params: &TrainingParams,
+    objective: &dyn Objective,
+) -> Result<Vec<Box<dyn Metric>>> {
+    create_metrics(
+        &params.eval_metric,
+        &objective.default_metric(),
+        params.num_class,
+        &ObjectiveParams::for_objective(params, objective.name()),
+    )
 }
 
 /// An empty model that `objective` trains on `dtrain` with `params`, starting

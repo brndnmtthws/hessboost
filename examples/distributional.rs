@@ -8,7 +8,7 @@
 //!
 //! Run with: `cargo run --release --example distributional`
 
-use hessboost::config::{MultiStrategy, TreeMethod};
+use hessboost::config::MultiStrategy;
 use hessboost::conformal::ConformalizedQuantile;
 use hessboost::objective::distributional::Dist;
 use hessboost::prelude::*;

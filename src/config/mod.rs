@@ -2,6 +2,7 @@
 
 mod params;
 
+pub(crate) use params::PartialObjectiveParams;
 pub use params::{
     AftDistribution, BoosterKind, Device, DistGradient, DistSplitDirection, GrowPolicy,
     MAX_SYMMETRIC_DEPTH, Monotone, MultiStrategy, ObjectiveParams, ProcessType, SamplingMethod,

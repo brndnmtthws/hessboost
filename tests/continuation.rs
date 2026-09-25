@@ -139,6 +139,44 @@ fn continuation_keeps_the_intercept_unless_base_score_is_given() {
     assert_eq!(replaced.base_scores(), [1.5]);
 }
 
+/// Early stopping records the best iteration and score even when the round
+/// limit comes before patience runs out (XGBoost's `best_iteration`).
+#[test]
+fn early_stopping_records_the_best_round_without_stopping() {
+    let d = noisy(300, 0);
+    let valid = noisy(120, 6);
+    let params = base().build().unwrap();
+    let stopped = Trainer::new(&params, &d, 200)
+        .eval(&valid, "valid")
+        .early_stopping_rounds(2)
+        .train()
+        .unwrap();
+    let best = stopped.model.best_iteration().expect("stops early");
+    // Rounds `best + 1` and `best + 2` did not improve; stop at the same
+    // round count with patience to spare.
+    assert_eq!(stopped.history.len(), best + 3);
+    let out = Trainer::new(&params, &d, best + 3)
+        .eval(&valid, "valid")
+        .early_stopping_rounds(50)
+        .train()
+        .unwrap();
+    assert_eq!(out.model.num_boost_rounds(), best + 3);
+    assert_eq!(out.model.best_iteration(), Some(best));
+    assert_eq!(out.best_score, Some(out.history[best].scores[0].2));
+    assert_eq!(stopped.best_score, out.best_score);
+    assert_eq!(
+        out.model.predict(&valid).unwrap(),
+        out.model.predict_range(&valid, ..=best).unwrap()
+    );
+    // Without early stopping nothing is selected.
+    let plain = Trainer::new(&params, &d, best + 3)
+        .eval(&valid, "valid")
+        .train()
+        .unwrap();
+    assert_eq!(plain.model.best_iteration(), None);
+    assert_eq!(plain.best_score, None);
+}
+
 #[test]
 fn early_stopping_after_continuation_reports_absolute_iterations() {
     let d = noisy(300, 0);

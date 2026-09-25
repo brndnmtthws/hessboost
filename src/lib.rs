@@ -15,7 +15,6 @@
 //! [`predict`](model::BoostedModel::predict):
 //!
 //! ```
-//! use hessboost::config::TreeMethod;
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {
@@ -41,8 +40,9 @@
 //! # }
 //! ```
 //!
-//! [`prelude`] holds only this workflow's items; everything else is
-//! imported from its module.
+//! [`prelude`] holds only this workflow's items (including
+//! [`TreeMethod`](config::TreeMethod)); everything else is imported from its
+//! module.
 //!
 //! ## Modules
 //!
@@ -107,7 +107,10 @@
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
 //!   XGBoost-format JSON and UBJSON model import/export
 //!   ([XGBoost interchange](model#xgboost-interchange)).
-//! - **Validation:** cross-validation ([`cv`](training::cv)).
+//! - **Validation:** cross-validation ([`cv`](training::cv)), or over
+//!   caller-supplied or forward-chaining (time-ordered, purged)
+//!   [`Fold`](training::Fold)s with fold-mean early stopping
+//!   ([`CrossValidation`](training::CrossValidation)).
 //! - **Beyond XGBoost (opt-in, none changes default training):**
 //!   - split-conformal and conformalized-quantile prediction intervals with
 //!     finite-sample marginal coverage ([`conformal`]);
@@ -192,13 +195,20 @@ pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 /// The train-and-predict workflow in one import: `use hessboost::prelude::*;`.
 ///
 /// Holds the data container, the parameters, the training entry points, the
-/// model, and the error types. Everything else (parameter enums, objectives,
-/// metrics, conformal intervals, ...) is imported from its module.
+/// model, the error types, and the types their everyday methods take:
+/// [`TreeMethod`](config::TreeMethod) (for
+/// [`TrainingParamsBuilder::tree_method`](config::TrainingParamsBuilder::tree_method)),
+/// [`ImportanceType`](model::ImportanceType) (for
+/// [`BoostedModel::feature_importance`](model::BoostedModel::feature_importance)),
+/// and [`ObjectiveParams`](config::ObjectiveParams) (a model's
+/// [`objective_params`](model::BoostedModel::objective_params)). Everything
+/// else (the other parameter enums, objectives, metrics, conformal
+/// intervals, ...) is imported from its module.
 pub mod prelude {
-    pub use crate::config::TrainingParams;
+    pub use crate::config::{ObjectiveParams, TrainingParams, TreeMethod};
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
-    pub use crate::model::BoostedModel;
+    pub use crate::model::{BoostedModel, ImportanceType};
     pub use crate::training::{Trainer, train};
 }
 /// Implementation details the crate's own benchmarks and parity tests

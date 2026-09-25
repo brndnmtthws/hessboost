@@ -4,8 +4,9 @@ hessboost is a Rust reimplementation of XGBoost gradient boosting: one
 library crate, with no C/C++ or FFI apart from the `zstd` crate (the
 official libzstd, compressing native model files) and, on macOS with the
 opt-in `metal` feature, the `objc2-metal` bindings to Apple's Metal
-framework. User docs are `README.md`, `CHANGELOG.md`, the rustdoc
-(`src/lib.rs` and module docs), `examples/`, and `docs/performance.md`.
+framework. User docs are `README.md`, the rustdoc (`src/lib.rs` and
+module docs), `examples/`, and `docs/performance.md`; there is no
+changelog file (release notes are written when releasing).
 This file covers working on the code.
 
 ## Toolchain
@@ -109,7 +110,7 @@ nouns there.
 | `metric/` | Eval metrics by XGBoost name: `mod.rs` (factory, defaults, rmse, mae, logloss, error, auc/aucpr, multiclass, count, ndcg/map, custom), `elementwise` (rmsle, mape, mphe), `ranking` (`pre@k`), `quantile`, `survival` (cox/aft-nloglik, interval accuracy), `distributional` (`nll`, `crps`) |
 | `tree/` | `regtree` (`RegTree`, scalar or vector leaves), `gain`, `constraints` (monotone/interaction), `sampler` (colsample bytree/bylevel/bynode, optionally feature-weighted), `builder/` (see below), `hist/` (histogram accumulation; `hist/quantized` for quantized gradients), `compact` (prediction-optimized layout, scalar and vector leaves), `oblivious` (bit-pattern prediction for symmetric trees), `linear` (opt-in `linear_tree` leaves, `LinearLeaves`), `reuse` (opt-in Trees-on-a-Diet reuse penalties); only `RegTree`, `Node`, `LinearLeaves` are public |
 | `tree/builder/` | `mod.rs` (split enumeration shared by all builders, incl. `sweep_categorical`; batched numeric scans `scan_numeric_splits` with the `f32` prefilter `approx_run`/`APPROX_MARGIN` and the exact method's `cannot_beat` bound, both proven to keep the sequential choice), `exact`, `hist` (also `approx`; speculative parallel loss-guide expansion), `multi` (vector-leaf trees), and the opt-in `oblivious` (symmetric growth), `lightgbm` (`extra_trees`/`path_smooth` search), `budget` (generalization-gated grower) |
-| `training/` | `train` (`train`, `Trainer`, `TrainResult`; gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `gblinear` (coordinate descent), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv`, `budget` (public; opt-in PerpetualBooster-style training) |
+| `training/` | `train` (`train`, `Trainer`, `TrainResult`; gbtree, DART, gblinear; `approx` = hist builder with per-round weighted cuts; `num_parallel_tree` forests), `gblinear` (coordinate descent), `multi_output` (vector-leaf rounds, reduced split gradients), `sampling` (gradient-based row sampling), `continuation` (continued training / `process_type=update` checks), `refresh` (refresh updater), `cv` (shuffled k-fold, caller-supplied and forward-chaining `Fold`s, fold-mean early stopping), `budget` (public; opt-in PerpetualBooster-style training) |
 | `model/` | `mod.rs` (`BoostedModel`: iteration layout, slicing, `iteration_range` prediction, save/load entry points; user docs for XGBoost interchange), `native` (native binary container), `sections` (section table shared by the native and compact formats), `shap` (QuadratureTreeSHAP), `compact` (public; `CompactModel`, `HBTD` format), `xgboost` (XGBoost JSON/UBJSON schema mapping), `ubjson` (UBJSON codec over `serde_json::Value`) |
 | `conformal.rs` | split-conformal / CQR intervals (`SplitConformal`, `ConformalizedQuantile`) |
 | `backend/` | opt-in compute backends: `metal.rs` (macOS, `metal` feature; `MetalHistBackend` for GPU histograms, `GpuModel` for GPU prediction, runtime-compiled MSL kernels, exact 64-bit integer histogram sums), `exact_sum.rs` (`SumDomain`: when those sums equal the CPU's `f64` chain, with the proof; compiled and tested on every platform) |
@@ -219,7 +220,21 @@ nouns there.
     mirrors (`UncheckedBoostedModel`, `UncheckedRegTree`,
     `UncheckedLinearLeaves`) and validate the result. A new serialized field
     goes in both the type and its mirror, with `#[serde(default)]` on the
-    mirror reproducing older files.
+    mirror reproducing older files. Objective parameters are read through
+    `config::PartialObjectiveParams`, every field optional: a missing one
+    takes `ObjectiveParams::defaults_for(<recorded objective>)` (the
+    defaults depend on the objective, so no per-field serde default), and a
+    new `ObjectiveParams` field goes there too. A tree may omit
+    `size_leaf_vector` (0) and `leaf_vectors`, but a multi-output model's
+    trees must state `size_leaf_vector` (it decides vector vs scalar
+    layout). Everything else predictions depend on (`objective`,
+    `base_score`, `num_class`, `n_features`, `n_outputs`, `n_targets`,
+    `trees` with `nodes`/`categories`/`linear`, `tree_weights`,
+    `num_parallel_tree`, the model's `linear`) is required (an absent
+    `best_iteration` selects none);
+    the nullable ones use `deserialize_with = "Option::deserialize"`, since
+    a plain `Option` field defaults when absent and nothing else marks a
+    linear-leaf tree or a gblinear model. Writers still emit every field.
   - Compact (`HBTD`, documented in `model/compact.rs`): metadata is a
     section table like the native one; a change to the bit stream bumps its
     version byte (currently 1).
@@ -298,10 +313,13 @@ nouns there.
 
 The crate root exports only modules. Rules:
 
-- `hessboost::prelude` holds only the train-and-predict workflow:
-  `TrainingParams`, `DMatrix`, `train`, `Trainer`, `BoostedModel`,
-  `HessboostError`, `Result`. Parameter enums, objectives, metrics, and
-  opt-in features are imported from their modules.
+- `hessboost::prelude` holds only the train-and-predict workflow and the
+  types its everyday methods take: `TrainingParams`, `DMatrix`, `train`,
+  `Trainer`, `BoostedModel`, `HessboostError`, `Result`, `TreeMethod`
+  (`TrainingParamsBuilder::tree_method`), `ImportanceType`
+  (`feature_importance`), and `ObjectiveParams` (`objective_params`). Other
+  parameter enums, objectives, metrics, and opt-in features are imported
+  from their modules.
 - Each item has exactly one public path (the prelude re-exports are the only
   second path): no flat re-exports of a public submodule's items, no
   aliases.
@@ -323,7 +341,8 @@ Paths: `config` (`TrainingParams`, `TrainingParamsBuilder`, the parameter
 enums, `ObjectiveParams`, `MAX_SYMMETRIC_DEPTH`); `data` (`DMatrix`,
 `FeatureType`, `MetaInfo`, `GroupInfo`, `CsvOptions`,
 `{load,read}_{csv,libsvm}`); `training` (`train`, `Trainer`, `TrainResult`,
-`RoundEval`, `cv`, `CvResult`); `model` (`BoostedModel`, `ImportanceType`);
+`RoundEval`, `cv`, `CrossValidation`, `Fold`, `CvResult`); `model`
+(`BoostedModel`, `ImportanceType`);
 `objective` (`Objective`, `GradPair`, `SplitGradient`, `PointwiseLoss`,
 `CustomObjective`, `create_objective`, built-ins named without an
 `Objective` suffix: `SquaredError`, `Logistic`, `Softmax`, `LambdaMart`,
@@ -338,8 +357,17 @@ enums, `ObjectiveParams`, `MAX_SYMMETRIC_DEPTH`); `data` (`DMatrix`,
     `.objective(&dyn Objective)`, `.custom_metric(Box<dyn Metric>)`,
     `.init_model(&model)` (continued training; with
     `process_type(ProcessType::Update)` the refresh updater), then
-    `.train()` → `TrainResult { model, history }`.
-  - `cv(&params, &data, rounds, nfold, seed: u64)` → `Vec<CvResult>`.
+    `.train()` → `TrainResult { model, history, best_score }`. With early
+    stopping, `best_iteration`/`best_score` are set whether or not
+    patience ran out.
+  - `cv(&params, &data, rounds, nfold, seed: u64)` → `Vec<CvResult>`
+    (shuffled `Fold::k_fold`); `CrossValidation::new(&params, &data,
+    rounds, folds: Vec<Fold>)` with optional `.early_stopping_rounds(k)`
+    (fold-mean metric; results truncated to the best round), then `.run()`.
+    `Fold::new(train, test)`, `Fold::k_fold(n_rows, nfold, seed)`,
+    `Fold::forward_chaining(n_rows, n_splits, gap)` (time-ordered rows,
+    `gap` rows purged before each test block).
+  - `TrainingParamsBuilder::from(params)` re-opens a built configuration.
   - `training::budget::train_with_budget(&params, &dtrain,
     &BudgetConfig::new(budget))` → `BudgetResult { model, eta, stop }` (no
     round count).
@@ -389,18 +417,16 @@ forest; XGBoost export, SHAP, and the compact format refuse them.
 
 Update, in the same change: the rustdoc of the touched items, the
 README feature lists (and "Not implemented"), the `lib.rs` "What's here"
-list, this file's layout and invariants, the examples that exercise it,
-and `CHANGELOG.md` (the upcoming version's section) for user-visible
-changes.
+list, this file's layout and invariants, and the examples that exercise
+it.
 New options need a `TrainingParams` field, builder setter, and validation;
 beyond-XGBoost options must default to off.
 
 ## Releases
 
 Bump `version` in `Cargo.toml`, write `tests/data/saved/<version>/` (see
-Formats), date the version's `CHANGELOG.md` section (`## [x.y.z] -
-YYYY-MM-DD`), merge, then push a `v<version>` tag: `publish.yml` checks the
-tag against the crate version and the dated CHANGELOG section, runs the
-tests on all three platforms, publishes to crates.io, and creates the
-GitHub release (the CHANGELOG section followed by the pull requests,
-grouped by `.github/release.yml`) with a discussion.
+Formats), merge, then push a `v<version>` tag: `publish.yml` checks the
+tag against the crate version, runs the tests on all three platforms,
+publishes to crates.io, and creates the GitHub release with a discussion.
+Its notes start as the pull requests since the previous tag (grouped by
+`.github/release.yml`); the release notes are written then, by hand.

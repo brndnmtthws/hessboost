@@ -5,7 +5,7 @@ use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
-use hessboost::config::{GrowPolicy, Monotone, TreeMethod};
+use hessboost::config::{GrowPolicy, Monotone};
 use hessboost::internals::{
     ColumnSampler, CpuBackend, GHistIndex, HistCuts, HistTreeBuilder, HistogramBackend, zeroed,
 };

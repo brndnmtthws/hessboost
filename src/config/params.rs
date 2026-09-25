@@ -582,6 +582,25 @@ fn narrows(name: &'static str, v: f64, positive: bool) -> Result<()> {
 
 impl TrainingParams {
     /// Start a builder for ergonomic, chained configuration.
+    ///
+    /// To derive a variant of an existing configuration through the same
+    /// setters and validation, convert it back into a builder
+    /// ([`TrainingParamsBuilder::from`]):
+    ///
+    /// ```
+    /// use hessboost::config::TrainingParamsBuilder;
+    /// use hessboost::prelude::*;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let base = TrainingParams::builder().max_depth(3).build()?;
+    /// let smoothed = TrainingParamsBuilder::from(base.clone())
+    ///     .path_smooth(1.0)
+    ///     .build()?;
+    /// assert_eq!(smoothed.max_depth, 3);
+    /// assert_eq!(smoothed.path_smooth, 1.0);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn builder() -> TrainingParamsBuilder {
         TrainingParamsBuilder {
             params: TrainingParams::default(),
@@ -1048,6 +1067,97 @@ impl Default for ObjectiveParams {
     }
 }
 
+/// [`ObjectiveParams`] as the native JSON format stores them, with every
+/// field optional: [`PartialObjectiveParams::fill`] takes each missing one
+/// from the recorded objective's defaults
+/// ([`ObjectiveParams::defaults_for`]), which a per-field serde default
+/// could not (they depend on the objective). A stored value is read as
+/// strictly as before (`null` only where the field is an `Option`).
+#[derive(Deserialize, Default)]
+pub(crate) struct PartialObjectiveParams {
+    #[serde(default)]
+    scale_pos_weight: Stored<f64>,
+    #[serde(default)]
+    max_delta_step: Stored<f64>,
+    #[serde(default)]
+    tweedie_variance_power: Stored<f64>,
+    #[serde(default)]
+    huber_slope: Stored<f64>,
+    #[serde(default)]
+    lambdarank_num_pair_per_sample: Stored<usize>,
+    #[serde(default)]
+    quantile_alpha: Stored<Vec<f64>>,
+    #[serde(default)]
+    expectile_alpha: Stored<Vec<f64>>,
+    #[serde(default)]
+    aft_loss_distribution: Stored<AftDistribution>,
+    #[serde(default)]
+    aft_loss_distribution_scale: Stored<f64>,
+    #[serde(default)]
+    dist_gradient: Stored<DistGradient>,
+    #[serde(default)]
+    dist_split_direction: Stored<DistSplitDirection>,
+    #[serde(default)]
+    distribution: Stored<Option<crate::objective::distributional::DistFamily>>,
+}
+
+/// A field that is absent from the document, or present with a value
+/// (which may itself be `None`: `Option<Option<_>>` would read `null` as
+/// absent).
+#[derive(Default)]
+pub(crate) enum Stored<T> {
+    #[default]
+    Absent,
+    Present(T),
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Stored<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Stored::Present)
+    }
+}
+
+impl<T> Stored<T> {
+    fn unwrap_or(self, default: T) -> T {
+        match self {
+            Stored::Absent => default,
+            Stored::Present(value) => value,
+        }
+    }
+}
+
+impl PartialObjectiveParams {
+    /// The stored parameters, with each missing one taken from `objective`'s
+    /// defaults.
+    pub(crate) fn fill(self, objective: &str) -> ObjectiveParams {
+        let d = ObjectiveParams::defaults_for(objective);
+        ObjectiveParams {
+            scale_pos_weight: self.scale_pos_weight.unwrap_or(d.scale_pos_weight),
+            max_delta_step: self.max_delta_step.unwrap_or(d.max_delta_step),
+            tweedie_variance_power: self
+                .tweedie_variance_power
+                .unwrap_or(d.tweedie_variance_power),
+            huber_slope: self.huber_slope.unwrap_or(d.huber_slope),
+            lambdarank_num_pair_per_sample: self
+                .lambdarank_num_pair_per_sample
+                .unwrap_or(d.lambdarank_num_pair_per_sample),
+            quantile_alpha: self.quantile_alpha.unwrap_or(d.quantile_alpha),
+            expectile_alpha: self.expectile_alpha.unwrap_or(d.expectile_alpha),
+            aft_loss_distribution: self
+                .aft_loss_distribution
+                .unwrap_or(d.aft_loss_distribution),
+            aft_loss_distribution_scale: self
+                .aft_loss_distribution_scale
+                .unwrap_or(d.aft_loss_distribution_scale),
+            dist_gradient: self.dist_gradient.unwrap_or(d.dist_gradient),
+            dist_split_direction: self.dist_split_direction.unwrap_or(d.dist_split_direction),
+            distribution: self.distribution.unwrap_or(d.distribution),
+        }
+    }
+}
+
 /// Builder for [`TrainingParams`].
 ///
 /// Every setter returns `self` for chaining. Terminal method is
@@ -1213,6 +1323,14 @@ impl TrainingParamsBuilder {
     /// Produce the [`TrainingParams`] without validation (useful in tests).
     pub fn build_unchecked(self) -> TrainingParams {
         self.params
+    }
+}
+
+impl From<TrainingParams> for TrainingParamsBuilder {
+    /// A builder starting from `params` (validated again by
+    /// [`build`](TrainingParamsBuilder::build)).
+    fn from(params: TrainingParams) -> Self {
+        TrainingParamsBuilder { params }
     }
 }
 

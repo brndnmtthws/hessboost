@@ -2,7 +2,7 @@
 //! `sampling_method=gradient_based` (XGBoost's CPU MVS sampler) and
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
-use hessboost::config::{BoosterKind, SamplingMethod, TrainingParamsBuilder, TreeMethod};
+use hessboost::config::{BoosterKind, SamplingMethod, TrainingParamsBuilder};
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 

@@ -3,7 +3,7 @@
 //! Driven by `scripts/bench_xgb.py`. File I/O and test-data preparation are
 //! outside the timer, and each fit constructs a fresh training `DMatrix`.
 
-use hessboost::config::{GrowPolicy, TreeMethod};
+use hessboost::config::GrowPolicy;
 use hessboost::metric::create_metric;
 use hessboost::prelude::*;
 use std::path::Path;

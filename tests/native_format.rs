@@ -10,7 +10,7 @@
 //! regenerated: they are what later versions must keep reading.
 
 use hessboost::config::{
-    AftDistribution, BoosterKind, DistGradient, DistSplitDirection, MultiStrategy, TreeMethod,
+    AftDistribution, BoosterKind, DistGradient, DistSplitDirection, MultiStrategy,
 };
 use hessboost::data::FeatureType;
 use hessboost::model::compact::CompactModel;
@@ -78,19 +78,201 @@ fn load_doc(doc: &Value) -> hessboost::error::Result<BoostedModel> {
     BoostedModel::from_json(&doc.to_string())
 }
 
-/// Every stored field is required: a document missing one is refused
-/// rather than filled in with a guess.
+/// A trained four-round model's native JSON document.
+fn trained_doc(params: &TrainingParams, data: &DMatrix) -> Value {
+    let model = train(params, data, 4).unwrap();
+    serde_json::from_str(&model.to_json().unwrap()).unwrap()
+}
+
+fn assert_refused(doc: &Value, what: &str) {
+    let err = load_doc(doc).expect_err(what);
+    assert!(
+        matches!(
+            err,
+            HessboostError::Json(_) | HessboostError::ModelFormat(_)
+        ),
+        "{what}: {err}"
+    );
+}
+
+/// Everything predictions depend on is required: a document missing it is
+/// refused rather than filled in with a guess.
 #[test]
 fn incomplete_json_documents_are_refused() {
+    let doc = trained_doc(&base().build().unwrap(), &matrix(1));
     for field in [
-        "objective_params",
+        "objective",
+        "base_score",
+        "num_class",
+        "n_features",
+        "n_outputs",
         "n_targets",
+        "trees",
         "tree_weights",
         "num_parallel_tree",
+        "linear",
     ] {
-        let mut doc = empty_model_doc();
+        let mut doc = doc.clone();
         doc.as_object_mut().unwrap().remove(field);
-        assert!(load_doc(&doc).is_err(), "{field}");
+        assert_refused(&doc, field);
+    }
+    for field in ["nodes", "categories", "linear"] {
+        let mut doc = doc.clone();
+        doc["trees"][0].as_object_mut().unwrap().remove(field);
+        assert_refused(&doc, field);
+    }
+
+    // Vector leaves: a multi-output model's trees must state their leaf
+    // width (omitted, they would read as scalar trees), and a vector-leaf
+    // tree must carry its leaf vectors.
+    let vector = trained_doc(
+        &base()
+            .multi_strategy(MultiStrategy::MultiOutputTree)
+            .build()
+            .unwrap(),
+        &matrix(3),
+    );
+    assert!(load_doc(&vector).unwrap().has_vector_leaves());
+    for field in ["size_leaf_vector", "leaf_vectors"] {
+        let mut doc = vector.clone();
+        doc["trees"][0].as_object_mut().unwrap().remove(field);
+        assert_refused(&doc, field);
+    }
+    // So must a scalar-leaf multi-output model's.
+    let mut doc = trained_doc(&base().build().unwrap(), &matrix(2));
+    doc["trees"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("size_leaf_vector");
+    assert_refused(&doc, "multi-target size_leaf_vector");
+
+    // Linear leaves: a tree that has them must carry them, with all of
+    // their parts (nothing else marks a linear-leaf tree).
+    let linear = trained_doc(&base().linear_tree(true).build().unwrap(), &matrix(1));
+    let tree = linear["trees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|t| t["linear"].is_object())
+        .expect("a tree with linear leaves");
+    let parts: Vec<String> = linear["trees"][tree]["linear"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let mut doc = linear.clone();
+    doc["trees"][tree].as_object_mut().unwrap().remove("linear");
+    assert_refused(&doc, "linear leaves");
+    for part in &parts {
+        let mut doc = linear.clone();
+        doc["trees"][tree]["linear"]
+            .as_object_mut()
+            .unwrap()
+            .remove(part);
+        assert_refused(&doc, part);
+    }
+}
+
+/// Remove what the loader fills in: the objective parameters equal to the
+/// recorded objective's defaults (the whole block when all are), and the
+/// leaf-vector fields of scalar trees (`size_leaf_vector` only in a
+/// single-output model). Returns how many objective parameters were
+/// removed.
+fn strip_defaults(doc: &mut Value) -> usize {
+    let single_output = doc["n_outputs"] == 1;
+    let objective = doc["objective"].as_str().unwrap().to_string();
+    let defaults = serde_json::to_value(ObjectiveParams::defaults_for(&objective)).unwrap();
+    let params = doc["objective_params"].as_object_mut().unwrap();
+    let before = params.len();
+    params.retain(|key, value| defaults[key] != *value);
+    let removed = before - params.len();
+    if params.is_empty() {
+        doc.as_object_mut().unwrap().remove("objective_params");
+    }
+    for tree in doc["trees"].as_array_mut().unwrap() {
+        let tree = tree.as_object_mut().unwrap();
+        if tree["size_leaf_vector"] == 0 {
+            tree.remove("leaf_vectors");
+            if single_output {
+                tree.remove("size_leaf_vector");
+            }
+        }
+    }
+    removed
+}
+
+/// Hand-written documents may leave out default objective parameters and
+/// scalar trees' leaf-vector fields: the loader takes each missing parameter from
+/// the recorded objective's defaults (`max_delta_step = 0.7` for
+/// `count:poisson`, the distribution family of `dist:*`), so the model
+/// reloads bit for bit.
+#[test]
+fn json_documents_may_omit_defaults() {
+    let (x, _) = train_data(1);
+    let n = x.len() / COLS;
+    let counts: Vec<f32> = (0..n).map(|i| ((i * 7) % 9) as f32).collect();
+    let cases = [
+        ("reg:squarederror", base().build().unwrap(), matrix(1)),
+        (
+            "count:poisson",
+            base().objective("count:poisson").build().unwrap(),
+            labeled_dense(&x, COLS, &counts),
+        ),
+        (
+            "reg:quantileerror",
+            base()
+                .objective("reg:quantileerror")
+                .quantile_alpha(vec![0.1, 0.5, 0.9])
+                .build()
+                .unwrap(),
+            matrix(1),
+        ),
+        (
+            "dist:normal",
+            base().objective("dist:normal").build().unwrap(),
+            matrix(1),
+        ),
+    ];
+    for (name, params, data) in cases {
+        let model = train(&params, &data, 4).unwrap();
+        let mut doc: Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        let removed = strip_defaults(&mut doc);
+        let quantiles = name == "reg:quantileerror";
+        // Every parameter but the configured alphas was a default.
+        assert_eq!(removed, if quantiles { 11 } else { 12 }, "{name}");
+        assert!(doc["trees"][0].get("leaf_vectors").is_none(), "{name}");
+
+        let restored = load_doc(&doc).unwrap();
+        assert_eq!(
+            restored.objective_params(),
+            model.objective_params(),
+            "{name}"
+        );
+        assert_eq!(
+            restored.to_bytes().unwrap(),
+            model.to_bytes().unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            bits(&restored.predict(&data).unwrap()),
+            bits(&model.predict(&data).unwrap()),
+            "{name}"
+        );
+        // Saving writes every field again.
+        let rewritten: Value = serde_json::from_str(&restored.to_json().unwrap()).unwrap();
+        assert_eq!(
+            rewritten,
+            serde_json::from_str::<Value>(&model.to_json().unwrap()).unwrap(),
+            "{name}"
+        );
+
+        if quantiles {
+            // The alphas decide the outputs: without them the default (none)
+            // does not fit the three stored outputs.
+            doc.as_object_mut().unwrap().remove("objective_params");
+            assert_refused(&doc, "quantile_alpha");
+        }
     }
 }
 

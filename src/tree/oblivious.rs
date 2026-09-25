@@ -63,10 +63,11 @@ impl SymmetricTree {
         let mut levels: Vec<(u32, u32)> = Vec::new();
         let mut n_leaves = 0usize;
         let mut frontier = vec![root];
+        let mut next = Vec::new();
         while !frontier.is_empty() {
-            let mut next = Vec::with_capacity(2 * frontier.len());
+            next.clear();
             let mut level = None;
-            for id in frontier {
+            for &id in &frontier {
                 match node(id) {
                     ArenaNode::Leaf(_) => n_leaves += 1,
                     ArenaNode::Numeric { slot, key, first } => {
@@ -84,7 +85,7 @@ impl SymmetricTree {
                 }
                 levels.push(level);
             }
-            frontier = next;
+            std::mem::swap(&mut frontier, &mut next);
         }
         let depth = levels.len();
         if depth < 2 || (1usize << depth) > MAX_SLOTS_PER_LEAF * n_leaves {
@@ -130,11 +131,9 @@ impl SymmetricTree {
         group_len: usize,
         sink: &mut impl FnMut(usize, u32),
     ) {
-        for (g, grp) in lanes.chunks_exact(group_len).take(groups).enumerate() {
-            for (j, &p) in self.patterns(grp).iter().enumerate() {
-                sink(g * LANES + j, self.leaves[p as usize]);
-            }
-        }
+        self.for_each_pattern(lanes, groups, group_len, |row, p| {
+            sink(row, self.leaves[p as usize]);
+        });
     }
 
     /// `out[r * stride] += weight * leaf_value(row r)` for the first `groups`
@@ -149,9 +148,24 @@ impl SymmetricTree {
         out: &mut [f32],
         stride: usize,
     ) {
+        self.for_each_pattern(lanes, groups, group_len, |row, p| {
+            out[row * stride] += weight * self.values[p as usize];
+        });
+    }
+
+    /// Call `sink(row, pattern)` with the bit pattern of every row of the
+    /// first `groups` lane groups, in row order.
+    #[inline(always)]
+    fn for_each_pattern(
+        &self,
+        lanes: &[u32],
+        groups: usize,
+        group_len: usize,
+        mut sink: impl FnMut(usize, u32),
+    ) {
         for (g, grp) in lanes.chunks_exact(group_len).take(groups).enumerate() {
             for (j, &p) in self.patterns(grp).iter().enumerate() {
-                out[(g * LANES + j) * stride] += weight * self.values[p as usize];
+                sink(g * LANES + j, p);
             }
         }
     }

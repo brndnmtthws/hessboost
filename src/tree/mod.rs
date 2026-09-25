@@ -32,3 +32,25 @@ pub(crate) fn scalar_tree_output(t: usize, num_parallel_tree: usize, n_outputs: 
 pub(crate) fn in_category_set(categories: &[u32], v: f32) -> bool {
     categories.contains(&(v as u32))
 }
+
+/// What a split compares a present value with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SplitTest<'a> {
+    /// Rows with `value < threshold` go left, other present values right.
+    Threshold(f32),
+    /// Rows whose category is in the set go left, other present categories
+    /// right.
+    Categories(&'a [u32]),
+}
+
+/// Whether a row whose split value is `value` (`None` = missing) goes left:
+/// a missing value follows `default_left`, a present one `test`. The one
+/// routing rule of [`RegTree`] and the SHAP walk.
+#[inline]
+pub(crate) fn split_goes_left(value: Option<f32>, default_left: bool, test: SplitTest<'_>) -> bool {
+    match (value, test) {
+        (None, _) => default_left,
+        (Some(v), SplitTest::Threshold(threshold)) => v < threshold,
+        (Some(v), SplitTest::Categories(categories)) => in_category_set(categories, v),
+    }
+}

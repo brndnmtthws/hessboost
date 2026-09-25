@@ -13,8 +13,8 @@
 
 use crate::data::DMatrix;
 use crate::error::HessboostError;
-use crate::tree::in_category_set;
 use crate::tree::linear::{LinearLeaves, UncheckedLinearLeaves};
+use crate::tree::{SplitTest, split_goes_left};
 use serde::{Deserialize, Serialize};
 
 /// Sentinel used in child pointers to mark "no child" (i.e. a leaf).
@@ -84,16 +84,6 @@ pub(crate) struct SplitRule<'a> {
     feature: u32,
     test: SplitTest<'a>,
     default_left: bool,
-}
-
-/// The test of a [`SplitRule`].
-#[derive(Debug, Clone, Copy)]
-enum SplitTest<'a> {
-    /// Rows with `value < threshold` go left, other present values right.
-    Threshold(f32),
-    /// Rows whose category is in the set go left, other present categories
-    /// right.
-    Categories(&'a [u32]),
 }
 
 impl<'a> SplitRule<'a> {
@@ -311,21 +301,6 @@ impl RegTree {
         let k = self.size_leaf_vector;
         debug_assert!(k > 1 && values.len() == k);
         self.leaf_vectors[nid * k..(nid + 1) * k].copy_from_slice(values);
-    }
-
-    /// The scalar tree predicting output `output` of this vector-leaf tree:
-    /// the same nodes (splits, covers, gains, categories) with each leaf's
-    /// value taken from its vector.
-    pub(crate) fn output_tree(&self, output: usize) -> RegTree {
-        let k = self.size_leaf_vector;
-        debug_assert!(k > 1 && output < k);
-        let mut nodes = self.nodes.clone();
-        for (id, node) in nodes.iter_mut().enumerate() {
-            if node.is_leaf() {
-                node.leaf_value = self.leaf_vectors[id * k + output];
-            }
-        }
-        RegTree::from_scalar_parts(nodes, self.categories.clone())
     }
 
     /// Give two freshly pushed child nodes their (zero) leaf vectors.
@@ -557,13 +532,14 @@ impl RegTree {
     /// missing) goes left at internal node `node` of this tree.
     #[inline]
     pub(crate) fn goes_left(&self, node: &Node, value: Option<f32>) -> bool {
-        match value {
-            // Categories are integer-coded; membership in the left set routes
-            // left, everything else (present, not in set) right.
-            Some(v) if node.is_categorical => in_category_set(self.node_categories(node), v),
-            Some(v) => v < node.split_cond,
-            None => node.default_left,
-        }
+        // Categories are integer-coded; membership in the left set routes
+        // left, everything else (present, not in set) right.
+        let test = if node.is_categorical {
+            SplitTest::Categories(self.node_categories(node))
+        } else {
+            SplitTest::Threshold(node.split_cond)
+        };
+        split_goes_left(value, node.default_left, test)
     }
 
     /// Route a dense feature row (indexed by feature id, `missing` sentinel for

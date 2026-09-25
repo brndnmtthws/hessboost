@@ -110,15 +110,10 @@ impl<'a> SplitConformal<'a> {
         validate_alpha(alpha)?;
         let labels = calibration_labels(calibration)?;
         let preds = single_output_predictions(model, calibration)?;
-        let mut scores: Vec<f64> = preds
-            .iter()
-            .zip(labels)
-            .map(|(&p, &y)| {
-                let (y, p) = (f64::from(y), f64::from(p));
-                sub_round_up(y, p).max(sub_round_up(p, y))
-            })
-            .collect();
-        let half_width = conformal_quantile(&mut scores, alpha);
+        let half_width = score_quantile(labels, alpha, |i, y| {
+            let p = f64::from(preds[i]);
+            sub_round_up(y, p).max(sub_round_up(p, y))
+        });
         Ok(SplitConformal {
             model,
             alpha,
@@ -216,8 +211,12 @@ impl QuantileBand<'_> {
     fn check(self, data: &DMatrix) -> Result<()> {
         match self {
             QuantileBand::Distribution { model, .. } => model.predict_distribution(data).map(drop),
-            QuantileBand::Pair { .. } | QuantileBand::Outputs { .. } => {
-                self.predict(data).map(drop)
+            QuantileBand::Pair { lower, upper } => {
+                single_output_predictions(lower, data)?;
+                single_output_predictions(upper, data).map(drop)
+            }
+            QuantileBand::Outputs { model, .. } => {
+                checked_predictions(model, data, model.n_outputs()).map(drop)
             }
         }
     }
@@ -368,15 +367,10 @@ impl<'a> ConformalizedQuantile<'a> {
             f64::INFINITY
         } else {
             let raw = band.predict(calibration)?;
-            let mut scores: Vec<f64> = raw
-                .iter()
-                .zip(labels)
-                .map(|(&(lo, hi), &y)| {
-                    let y = f64::from(y);
-                    sub_round_up(f64::from(lo), y).max(sub_round_up(y, f64::from(hi)))
-                })
-                .collect();
-            conformal_quantile(&mut scores, alpha)
+            score_quantile(labels, alpha, |i, y| {
+                let (lo, hi) = raw[i];
+                sub_round_up(f64::from(lo), y).max(sub_round_up(y, f64::from(hi)))
+            })
         };
         Ok(ConformalizedQuantile {
             band,
@@ -522,6 +516,17 @@ fn conformal_rank(n: usize, alpha: f64) -> Option<usize> {
     // `0 < alpha < 1` bounds the floor to `[0, n]`, so `1 <= k <= n + 1`.
     let k = n1 - ((n1 as f64) * alpha).floor() as usize;
     (k <= n).then_some(k)
+}
+
+/// [`conformal_quantile`] of the calibration scores `score(i, y_i)` over
+/// the `labels` `y_i`, in row order.
+fn score_quantile(labels: &[f32], alpha: f64, score: impl Fn(usize, f64) -> f64) -> f64 {
+    let mut scores: Vec<f64> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, &y)| score(i, f64::from(y)))
+        .collect();
+    conformal_quantile(&mut scores, alpha)
 }
 
 /// The `k`-th smallest score with `k` from [`conformal_rank`], or `+∞` when

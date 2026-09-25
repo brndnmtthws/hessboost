@@ -323,6 +323,8 @@ impl Objective for Expectile {
             weights,
             out,
             |preds, labels, weights, out| {
+                // Each row's expectiles `q_kk`, rebuilt once per row.
+                let mut q = vec![0.0f32; k];
                 for (i, (row, out_row)) in preds
                     .chunks_exact(k)
                     .zip(out.chunks_exact_mut(k))
@@ -330,20 +332,21 @@ impl Objective for Expectile {
                 {
                     let label = labels[i];
                     let w = weights.map_or(1.0, |ws| ws[i]);
+                    let mut pred = row[0];
+                    for (kk, slot) in q.iter_mut().enumerate() {
+                        if kk > 0 {
+                            pred += K_RT_EPS_F32 + softplus(row[kk]);
+                        }
+                        *slot = pred;
+                    }
                     for j in 0..k {
-                        let mut pred = row[0];
                         let mut grad_sum = 0.0f32;
                         let mut hess_sum = 0.0f32;
-                        for (kk, &a) in alpha.iter().enumerate() {
-                            if kk > 0 {
-                                pred += K_RT_EPS_F32 + softplus(row[kk]);
-                            }
-                            if kk >= j {
-                                let diff = pred - label;
-                                let scale = expectile_scale(diff, a);
-                                grad_sum += scale * diff * w;
-                                hess_sum += scale * w;
-                            }
+                        for (&pred, &a) in q[j..].iter().zip(&alpha[j..]) {
+                            let diff = pred - label;
+                            let scale = expectile_scale(diff, a);
+                            grad_sum += scale * diff * w;
+                            hess_sum += scale * w;
                         }
                         let chain = if j == 0 {
                             1.0

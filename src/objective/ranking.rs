@@ -12,6 +12,7 @@ use super::{GradPair, MIN_HESS_F64, Objective, check_label_domain};
 use crate::data::{GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::{argsort_desc, group_ranges};
+use rayon::prelude::*;
 
 /// Which ranking loss the LambdaMART objective optimizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,30 +112,39 @@ impl LambdaMart {
             }
         }
 
-        // XGBoost `CalcLambdaForGroup`: `norm` (double) scales the pairs only
-        // when it differs from 1, then `w` (float), then `w_norm` (double);
-        // each `GradientPair::operator*(float)` rounds its factor to f32 and
-        // multiplies separately, so the three factors are never pre-combined.
-        let norm = if sum_lambda > 0.0 {
-            (sum_lambda + 1.0).log2() / sum_lambda
-        } else {
-            1.0
-        };
-        if norm != 1.0 {
-            let norm = norm as f32;
-            for g in out.iter_mut() {
-                g.grad *= norm;
-                g.hess *= norm;
-            }
-        }
-        for g in out.iter_mut() {
-            g.grad *= query_weight;
-            g.hess *= query_weight;
-            g.grad *= weight_norm;
-            g.hess *= weight_norm;
-        }
+        normalize_group(out, sum_lambda, query_weight, weight_norm);
     }
 }
+
+/// XGBoost `CalcLambdaForGroup`'s scaling of one query's accumulated pairs:
+/// `norm` (double) scales them only when it differs from 1, then `w`
+/// (float), then `w_norm` (double); each `GradientPair::operator*(float)`
+/// rounds its factor to f32 and multiplies separately, so the three factors
+/// are never pre-combined.
+fn normalize_group(out: &mut [GradPair], sum_lambda: f64, query_weight: f32, weight_norm: f32) {
+    let norm = if sum_lambda > 0.0 {
+        (sum_lambda + 1.0).log2() / sum_lambda
+    } else {
+        1.0
+    };
+    if norm != 1.0 {
+        let norm = norm as f32;
+        for g in out.iter_mut() {
+            g.grad *= norm;
+            g.hess *= norm;
+        }
+    }
+    for g in out.iter_mut() {
+        g.grad *= query_weight;
+        g.hess *= query_weight;
+        g.grad *= weight_norm;
+        g.hess *= weight_norm;
+    }
+}
+
+/// Queries at least this many rows in total compute their gradients in
+/// parallel (each query writes only its own rows).
+const PARALLEL_RANK_ROWS: usize = 4096;
 
 impl Objective for LambdaMart {
     fn name(&self) -> &str {
@@ -179,14 +189,35 @@ impl Objective for LambdaMart {
         } else {
             (ranges.len() as f64 / sum_w) as f32
         };
-        for ((start, end), weight) in ranges.into_iter().zip(group_weights) {
+        // The ranges tile the rows in order, so each query gets its own
+        // disjoint slice of `out`.
+        let mut queries = Vec::with_capacity(ranges.len());
+        let mut rest = &mut out[..];
+        let mut offset = 0;
+        for (&(start, end), &weight) in ranges.iter().zip(&group_weights) {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - offset);
+            let (rows, tail) = tail.split_at_mut(end - start);
+            rest = tail;
+            offset = end;
+            queries.push((start, rows, weight));
+        }
+        let query = |(start, out, weight): (usize, &mut [GradPair], f32)| {
+            let end = start + out.len();
             self.accumulate_group(
                 &preds[start..end],
                 &labels[start..end],
                 weight,
                 weight_norm,
-                &mut out[start..end],
+                out,
             );
+        };
+        if preds.len() >= PARALLEL_RANK_ROWS
+            && queries.len() > 1
+            && rayon::current_num_threads() > 1
+        {
+            queries.into_par_iter().for_each(query);
+        } else {
+            queries.into_iter().for_each(query);
         }
     }
 
@@ -338,6 +369,39 @@ mod tests {
         let group = GroupInfo::from_sizes(sizes);
         obj.gradient_grouped(preds, labels, weights, Some(&group), &mut out);
         out
+    }
+
+    /// Queries computed in parallel give the serial gradients bit for bit,
+    /// with empty groups and query weights in the mix.
+    #[test]
+    fn parallel_queries_match_serial() {
+        let mut sizes: Vec<usize> = (0..400).map(|g| 1 + (g * 37) % 60).collect();
+        sizes[3] = 0;
+        let n: usize = sizes.iter().sum();
+        assert!(n >= PARALLEL_RANK_ROWS);
+        let preds: Vec<f32> = (0..n).map(|i| ((i * 7919) % 1009) as f32 / 101.0).collect();
+        let labels: Vec<f32> = (0..n).map(|i| ((i * 31) % 5) as f32).collect();
+        let mut weights = Vec::with_capacity(n);
+        for (g, &size) in sizes.iter().enumerate() {
+            weights.extend(std::iter::repeat_n(0.5 + (g % 4) as f32 * 0.25, size));
+        }
+        let pool = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+        };
+        for obj in [
+            LambdaMart::pairwise(32),
+            LambdaMart::ndcg(8),
+            LambdaMart::map(32),
+        ] {
+            for w in [None, Some(weights.as_slice())] {
+                let serial = pool(1).install(|| grouped(obj, &preds, &labels, w, &sizes));
+                let parallel = pool(4).install(|| grouped(obj, &preds, &labels, w, &sizes));
+                assert_eq!(serial, parallel, "{}", obj.name());
+            }
+        }
     }
 
     #[test]

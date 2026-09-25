@@ -160,8 +160,8 @@ impl Aft {
                 f64::from(upper[i]),
                 f64::from(preds[i]),
             );
-            let grad = aft_gradient::<D>(lo, hi, pred, sigma) as f32;
-            let hess = aft_hessian::<D>(lo, hi, pred, sigma) as f32;
+            let (grad, hess) = aft_grad_hess::<D>(lo, hi, pred, sigma);
+            let (grad, hess) = (grad as f32, hess as f32);
             let w = weights.map_or(1.0, |w| w[i]);
             *gp = GradPair::new(grad * w, hess * w);
         };
@@ -524,42 +524,22 @@ fn aft_loss<D: Distribution>(y_lower: f64, y_upper: f64, pred: f64, sigma: f64) 
     }
 }
 
-/// d loss / d margin (XGBoost `AFTLoss::Gradient`), clipped.
-fn aft_gradient<D: Distribution>(y_lower: f64, y_upper: f64, pred: f64, sigma: f64) -> f64 {
-    let (numerator, denominator, censoring, z_sign) = if y_lower == y_upper {
-        let z = (y_lower.ln() - pred) / sigma;
-        (
-            D::grad_pdf(z),
-            sigma * D::pdf(z),
-            Censoring::Uncensored,
-            z > 0.0,
-        )
-    } else {
-        let (lo, hi, censoring) = censored_ends::<D>(y_lower, y_upper, pred, sigma);
-        (
-            hi.pdf - lo.pdf,
-            sigma * (hi.cdf - lo.cdf),
-            censoring,
-            hi.z > 0.0 || lo.z > 0.0,
-        )
-    };
-    let mut gradient = numerator / denominator;
-    if denominator < EPS && !gradient.is_finite() {
-        gradient = limit_grad::<D>(censoring, z_sign, sigma);
-    }
-    clip(gradient, MIN_GRADIENT, MAX_GRADIENT)
-}
-
-/// d² loss / d margin² (XGBoost `AFTLoss::Hessian`), clipped.
-fn aft_hessian<D: Distribution>(y_lower: f64, y_upper: f64, pred: f64, sigma: f64) -> f64 {
-    let (numerator, denominator, censoring, z_sign) = if y_lower == y_upper {
+/// d loss / d margin and d² loss / d margin² (XGBoost `AFTLoss::Gradient`
+/// and `AFTLoss::Hessian`), each clipped. Both are formed from the same
+/// endpoint values, computed once.
+fn aft_grad_hess<D: Distribution>(y_lower: f64, y_upper: f64, pred: f64, sigma: f64) -> (f64, f64) {
+    // `(numerator, denominator)` of the gradient and of the Hessian.
+    let (grad, hess, censoring, z_sign) = if y_lower == y_upper {
         let z = (y_lower.ln() - pred) / sigma;
         let pdf = D::pdf(z);
         let grad_pdf = D::grad_pdf(z);
         let hess_pdf = D::hess_pdf(z);
         (
-            -(pdf * hess_pdf - grad_pdf * grad_pdf),
-            sigma * sigma * pdf * pdf,
+            (grad_pdf, sigma * pdf),
+            (
+                -(pdf * hess_pdf - grad_pdf * grad_pdf),
+                sigma * sigma * pdf * pdf,
+            ),
             Censoring::Uncensored,
             z > 0.0,
         )
@@ -570,17 +550,27 @@ fn aft_hessian<D: Distribution>(y_lower: f64, y_upper: f64, pred: f64, sigma: f6
         let grad_diff = hi.grad_pdf - lo.grad_pdf;
         let sqrt_denominator = sigma * cdf_diff;
         (
-            -(cdf_diff * grad_diff - pdf_diff * pdf_diff),
-            sqrt_denominator * sqrt_denominator,
+            (pdf_diff, sigma * cdf_diff),
+            (
+                -(cdf_diff * grad_diff - pdf_diff * pdf_diff),
+                sqrt_denominator * sqrt_denominator,
+            ),
             censoring,
             hi.z > 0.0 || lo.z > 0.0,
         )
     };
-    let mut hessian = numerator / denominator;
-    if denominator < EPS && !hessian.is_finite() {
+    let mut gradient = grad.0 / grad.1;
+    if grad.1 < EPS && !gradient.is_finite() {
+        gradient = limit_grad::<D>(censoring, z_sign, sigma);
+    }
+    let mut hessian = hess.0 / hess.1;
+    if hess.1 < EPS && !hessian.is_finite() {
         hessian = D::limit_hess(censoring, z_sign, sigma);
     }
-    clip(hessian, MIN_HESS_F64, MAX_HESSIAN)
+    (
+        clip(gradient, MIN_GRADIENT, MAX_GRADIENT),
+        clip(hessian, MIN_HESS_F64, MAX_HESSIAN),
+    )
 }
 
 /// XGBoost `aft::Clip` (NaN passes through unchanged).
@@ -878,16 +868,16 @@ mod tests {
                     let loss = |m: f64| aft_nloglik(dist, lo, hi, m, sigma);
                     let (grad, hess) = match dist {
                         AftDistribution::Normal => (
-                            aft_gradient::<Normal>(lo, hi, pred, sigma),
-                            aft_hessian::<Normal>(lo, hi, pred, sigma),
+                            aft_grad_hess::<Normal>(lo, hi, pred, sigma).0,
+                            aft_grad_hess::<Normal>(lo, hi, pred, sigma).1,
                         ),
                         AftDistribution::Logistic => (
-                            aft_gradient::<Logistic>(lo, hi, pred, sigma),
-                            aft_hessian::<Logistic>(lo, hi, pred, sigma),
+                            aft_grad_hess::<Logistic>(lo, hi, pred, sigma).0,
+                            aft_grad_hess::<Logistic>(lo, hi, pred, sigma).1,
                         ),
                         AftDistribution::Extreme => (
-                            aft_gradient::<Extreme>(lo, hi, pred, sigma),
-                            aft_hessian::<Extreme>(lo, hi, pred, sigma),
+                            aft_grad_hess::<Extreme>(lo, hi, pred, sigma).0,
+                            aft_grad_hess::<Extreme>(lo, hi, pred, sigma).1,
                         ),
                     };
                     let fd_grad = (loss(pred + h) - loss(pred - h)) / (2.0 * h);
@@ -908,19 +898,19 @@ mod tests {
     #[test]
     fn aft_extreme_predictions_use_limits() {
         // Uncensored, prediction far below the observed log-time: z >> 0.
-        let g = aft_gradient::<Normal>(1.0, 1.0, -100.0, 1.0);
+        let g = aft_grad_hess::<Normal>(1.0, 1.0, -100.0, 1.0).0;
         assert_eq!(g, MIN_GRADIENT);
-        assert_eq!(aft_hessian::<Normal>(1.0, 1.0, -100.0, 1.0), 1.0);
+        assert_eq!(aft_grad_hess::<Normal>(1.0, 1.0, -100.0, 1.0).1, 1.0);
         // Right-censored with the prediction far above the bound: the loss
         // vanishes and so does the gradient.
-        let g = aft_gradient::<Logistic>(1.0, f64::INFINITY, 1e3, 1.0);
+        let g = aft_grad_hess::<Logistic>(1.0, f64::INFINITY, 1e3, 1.0).0;
         assert_eq!(g, 0.0);
         assert_eq!(
-            aft_hessian::<Logistic>(1.0, f64::INFINITY, 1e3, 1.0),
+            aft_grad_hess::<Logistic>(1.0, f64::INFINITY, 1e3, 1.0).1,
             MIN_HESS_F64
         );
         // Interval far below the prediction.
-        let g = aft_gradient::<Extreme>(1.0, 2.0, 50.0, 1.0);
+        let g = aft_grad_hess::<Extreme>(1.0, 2.0, 50.0, 1.0).0;
         assert!(g.is_finite());
     }
 
@@ -946,8 +936,8 @@ mod tests {
                 f64::from(upper[i]),
                 f64::from(preds[i]),
             );
-            let g = aft_gradient::<Normal>(lo, hi, p, 1.0) as f32 * weights[i];
-            let h = aft_hessian::<Normal>(lo, hi, p, 1.0) as f32 * weights[i];
+            let g = aft_grad_hess::<Normal>(lo, hi, p, 1.0).0 as f32 * weights[i];
+            let h = aft_grad_hess::<Normal>(lo, hi, p, 1.0).1 as f32 * weights[i];
             assert_eq!(out[i], GradPair::new(g, h));
         }
         let unbounded = MetaInfo::new(&[1.0], None, None);

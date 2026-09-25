@@ -1430,11 +1430,10 @@ mod tests {
             )
         };
         let json = format!(
-            r#"{{"trees": [{{"nodes": [{}, {}, {}], "categories": [], "size_leaf_vector": 0, "leaf_vectors": []}}], "base_score": [0.0], "objective": "reg:squarederror", "objective_params": {}, "num_class": 0, "n_outputs": 1, "n_targets": 1, "n_features": 1, "tree_weights": [], "num_parallel_tree": 1}}"#,
+            r#"{{"trees": [{{"nodes": [{}, {}, {}], "categories": [], "linear": null}}], "base_score": [0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 1, "n_targets": 1, "n_features": 1, "best_iteration": null, "tree_weights": [], "num_parallel_tree": 1, "linear": null}}"#,
             node(0, 1, 2, 0.0, 1.0),
             node(0, -1, -1, 1.0, -1.0),
             node(0, -1, -1, 2.0, 2.0),
-            serde_json::to_string(&crate::config::ObjectiveParams::default()).unwrap(),
         );
         let model = crate::model::BoostedModel::from_json(&json).unwrap();
         let d = DMatrix::from_dense(&[0.2], 1, 1).unwrap();

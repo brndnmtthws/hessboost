@@ -10,12 +10,6 @@ fn node(feature: u32, left: i32, right: i32, value: f64, hess: f64) -> String {
     )
 }
 
-/// The native-JSON `objective_params` object of a model without
-/// objective-specific parameters.
-fn default_objective_params() -> String {
-    serde_json::to_string(&ObjectiveParams::default()).unwrap()
-}
-
 /// A single-output squared-error model over `n_features` whose trees are
 /// the given [`node`] lists.
 fn scalar_model(trees: &[&[String]], n_features: usize) -> BoostedModel {
@@ -23,15 +17,14 @@ fn scalar_model(trees: &[&[String]], n_features: usize) -> BoostedModel {
         .iter()
         .map(|nodes| {
             format!(
-                r#"{{"nodes": [{}], "categories": [], "size_leaf_vector": 0, "leaf_vectors": []}}"#,
+                r#"{{"nodes": [{}], "categories": [], "linear": null}}"#,
                 nodes.join(", ")
             )
         })
         .collect();
     BoostedModel::from_json(&format!(
-        r#"{{"trees": [{}], "tree_weights": [], "base_score": [0.0], "objective": "reg:squarederror", "objective_params": {}, "num_class": 0, "n_outputs": 1, "n_targets": 1, "num_parallel_tree": 1, "n_features": {n_features}}}"#,
+        r#"{{"trees": [{}], "tree_weights": [], "base_score": [0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 1, "n_targets": 1, "num_parallel_tree": 1, "n_features": {n_features}, "linear": null}}"#,
         trees.join(", "),
-        default_objective_params()
     ))
     .unwrap()
 }
@@ -150,14 +143,13 @@ fn repeated_feature_basis_update_stays_finite() {
 fn vector_leaf_bias_accumulates_leaves_top_down() {
     let huge = 2f64.powi(60);
     let model_json = format!(
-        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}], "categories": [], "size_leaf_vector": 2, "leaf_vectors": [0.0, 0.0, {huge:e}, 0.0, 0.0, 0.0, {neg:e}, 0.0, 1.0, 0.0]}}], "tree_weights": [], "base_score": [0.0, 0.0], "objective": "reg:squarederror", "objective_params": {objective_params}, "num_class": 0, "n_outputs": 2, "n_targets": 2, "num_parallel_tree": 1, "n_features": 2}}"#,
+        r#"{{"trees": [{{"nodes": [{}, {}, {}, {}, {}], "categories": [], "size_leaf_vector": 2, "leaf_vectors": [0.0, 0.0, {huge:e}, 0.0, 0.0, 0.0, {neg:e}, 0.0, 1.0, 0.0], "linear": null}}], "tree_weights": [], "base_score": [0.0, 0.0], "objective": "reg:squarederror", "linear": null, "num_class": 0, "n_outputs": 2, "n_targets": 2, "num_parallel_tree": 1, "n_features": 2}}"#,
         node(0, 1, 2, 0.0, 3.0),
         node(0, -1, -1, 0.0, 1.0),
         node(1, 3, 4, 0.0, 2.0),
         node(0, -1, -1, 0.0, 1.0),
         node(0, -1, -1, 0.0, 1.0),
         neg = -huge,
-        objective_params = default_objective_params(),
     );
     let model = BoostedModel::from_json(&model_json).unwrap();
     let row = DMatrix::from_dense(&[0.7f32, 0.7], 1, 2).unwrap();

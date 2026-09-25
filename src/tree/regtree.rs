@@ -164,9 +164,11 @@ pub struct RegTree {
 /// validation. `RegTree`'s `Deserialize` goes through it; the native JSON
 /// reader keeps it unchecked so the model validates each tree against its
 /// feature count ([`UncheckedRegTree::into_unchecked`]). A scalar tree may
-/// omit `size_leaf_vector` (`0`), `leaf_vectors` (empty), and `linear`
-/// (constant leaves); a multi-output model requires `size_leaf_vector`
-/// ([`UncheckedRegTree::states_leaf_width`]).
+/// omit `size_leaf_vector` (`0`) and `leaf_vectors` (empty); a multi-output
+/// model requires `size_leaf_vector`
+/// ([`UncheckedRegTree::states_leaf_width`]). `linear` is required (`null`
+/// for constant leaves): nothing else marks a linear-leaf tree, so an
+/// omitted one would silently predict its constant leaf values.
 #[derive(Deserialize)]
 pub(crate) struct UncheckedRegTree {
     nodes: Vec<Node>,
@@ -174,6 +176,8 @@ pub(crate) struct UncheckedRegTree {
     size_leaf_vector: Option<usize>,
     #[serde(default)]
     leaf_vectors: Vec<f32>,
+    // Present but nullable: a plain `Option` field would default when absent.
+    #[serde(deserialize_with = "Option::deserialize")]
     linear: Option<UncheckedLinearLeaves>,
 }
 

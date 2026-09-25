@@ -110,12 +110,13 @@ fn incomplete_json_documents_are_refused() {
         "trees",
         "tree_weights",
         "num_parallel_tree",
+        "linear",
     ] {
         let mut doc = doc.clone();
         doc.as_object_mut().unwrap().remove(field);
         assert_refused(&doc, field);
     }
-    for field in ["nodes", "categories"] {
+    for field in ["nodes", "categories", "linear"] {
         let mut doc = doc.clone();
         doc["trees"][0].as_object_mut().unwrap().remove(field);
         assert_refused(&doc, field);
@@ -145,7 +146,8 @@ fn incomplete_json_documents_are_refused() {
         .remove("size_leaf_vector");
     assert_refused(&doc, "multi-target size_leaf_vector");
 
-    // Linear leaves: a tree that has them must carry all of their parts.
+    // Linear leaves: a tree that has them must carry them, with all of
+    // their parts (nothing else marks a linear-leaf tree).
     let linear = trained_doc(&base().linear_tree(true).build().unwrap(), &matrix(1));
     let tree = linear["trees"]
         .as_array()
@@ -159,6 +161,9 @@ fn incomplete_json_documents_are_refused() {
         .keys()
         .cloned()
         .collect();
+    let mut doc = linear.clone();
+    doc["trees"][tree].as_object_mut().unwrap().remove("linear");
+    assert_refused(&doc, "linear leaves");
     for part in &parts {
         let mut doc = linear.clone();
         doc["trees"][tree]["linear"]
@@ -171,7 +176,7 @@ fn incomplete_json_documents_are_refused() {
 
 /// Remove what the loader fills in: the objective parameters equal to the
 /// recorded objective's defaults (the whole block when all are), and the
-/// leaf fields of scalar constant-leaf trees (`size_leaf_vector` only in a
+/// leaf-vector fields of scalar trees (`size_leaf_vector` only in a
 /// single-output model). Returns how many objective parameters were
 /// removed.
 fn strip_defaults(doc: &mut Value) -> usize {
@@ -193,15 +198,12 @@ fn strip_defaults(doc: &mut Value) -> usize {
                 tree.remove("size_leaf_vector");
             }
         }
-        if tree["linear"].is_null() {
-            tree.remove("linear");
-        }
     }
     removed
 }
 
 /// Hand-written documents may leave out default objective parameters and
-/// scalar trees' leaf fields: the loader takes each missing parameter from
+/// scalar trees' leaf-vector fields: the loader takes each missing parameter from
 /// the recorded objective's defaults (`max_delta_step = 0.7` for
 /// `count:poisson`, the distribution family of `dist:*`), so the model
 /// reloads bit for bit.

@@ -320,13 +320,17 @@ pub struct BoostedModel {
 /// `Deserialize` converts it with [`BoostedModel::try_from`], which runs
 /// [`BoostedModel::validate_structure`].
 ///
-/// Everything predictions depend on is required. Only the objective
+/// Everything predictions depend on is required, including the nullable
+/// `linear` (the gblinear weights), which a plain `Option` field would
+/// default to `null` when absent; an absent `best_iteration` means none was
+/// selected (every iteration predicts). Only the objective
 /// parameters may be omitted (all of them, or any subset): each missing
 /// one takes the recorded objective's default
 /// ([`ObjectiveParams::defaults_for`]). A tree may omit `size_leaf_vector`
-/// (scalar), `leaf_vectors` (none), and `linear` (constant leaves), except
-/// that a multi-output model's trees must state `size_leaf_vector`, since
-/// it decides whether they are vector-leaf trees.
+/// (scalar) and `leaf_vectors` (none), except that a multi-output model's
+/// trees must state `size_leaf_vector`, since it decides whether they are
+/// vector-leaf trees; each tree's `linear` is required
+/// ([`UncheckedRegTree`]).
 #[derive(Deserialize)]
 struct UncheckedBoostedModel {
     trees: Vec<UncheckedRegTree>,
@@ -341,6 +345,7 @@ struct UncheckedBoostedModel {
     best_iteration: Option<usize>,
     tree_weights: Vec<f32>,
     num_parallel_tree: usize,
+    #[serde(deserialize_with = "Option::deserialize")]
     linear: Option<LinearModel>,
 }
 

@@ -98,13 +98,15 @@ impl Fold {
         if n_splits == 0 {
             return Err(HessboostError::invalid_param("n_splits", "must be >= 1"));
         }
-        let block = n_rows / (n_splits + 1);
-        if block == 0 {
+        // `n_splits < n_rows` keeps `n_splits + 1` from overflowing and every
+        // block non-empty.
+        if n_splits >= n_rows {
             return Err(HessboostError::invalid_param(
                 "n_splits",
-                format!("{n_rows} rows do not fill {} blocks", n_splits + 1),
+                format!("{n_rows} rows do not fill {n_splits} + 1 blocks"),
             ));
         }
+        let block = n_rows / (n_splits + 1);
         let first_test = n_rows - n_splits * block;
         if first_test <= gap {
             return Err(HessboostError::invalid_param(
@@ -238,9 +240,9 @@ impl<'a> CrossValidation<'a> {
         let metrics = configured_metrics(params, objective.as_ref())?;
         let maximize = metrics.last().is_some_and(|m| m.maximize());
 
-        // values[metric][round][fold]
-        let mut values =
-            vec![vec![Vec::with_capacity(folds.len()); num_boost_round]; metrics.len()];
+        // values[metric][round][fold], grown as rounds arrive (not sized by
+        // `num_boost_round`, which is caller input).
+        let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); metrics.len()];
         for fold in &folds {
             let dtrain = data.select_rows(&fold.train)?;
             let dtest = data.select_rows(&fold.test)?;
@@ -248,8 +250,11 @@ impl<'a> CrossValidation<'a> {
                 .eval(&dtest, "test")
                 .train()?;
             for (round, eval) in res.history.iter().enumerate() {
-                for (m, (_, _, value)) in eval.scores.iter().enumerate() {
-                    values[m][round].push(*value);
+                for (per_round, (_, _, value)) in values.iter_mut().zip(&eval.scores) {
+                    if per_round.len() == round {
+                        per_round.push(Vec::with_capacity(folds.len()));
+                    }
+                    per_round[round].push(*value);
                 }
             }
         }
@@ -390,7 +395,14 @@ mod tests {
         // that does not.
         assert_eq!(Fold::forward_chaining(23, 3, 7).unwrap()[0].train, [0]);
         assert!(Fold::forward_chaining(23, 3, 8).is_err());
+        // One row per block is the most splits the rows allow; more are
+        // refused, up to the largest count (whose `+ 1` would overflow).
+        let tight = Fold::forward_chaining(4, 3, 0).unwrap();
+        assert_eq!(tight[0], Fold::new(vec![0], vec![1]));
+        assert_eq!(tight[2], Fold::new(vec![0, 1, 2], vec![3]));
         assert!(Fold::forward_chaining(3, 3, 0).is_err());
+        assert!(Fold::forward_chaining(10, usize::MAX, 0).is_err());
+        assert!(Fold::forward_chaining(10, 2, usize::MAX).is_err());
         assert!(Fold::forward_chaining(10, 0, 0).is_err());
     }
 

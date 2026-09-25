@@ -225,13 +225,16 @@ nouns there.
     takes `ObjectiveParams::defaults_for(<recorded objective>)` (the
     defaults depend on the objective, so no per-field serde default), and a
     new `ObjectiveParams` field goes there too. A tree may omit
-    `size_leaf_vector` (0), `leaf_vectors`, and `linear`, but a multi-output
-    model's trees must state `size_leaf_vector` (it decides vector vs scalar
+    `size_leaf_vector` (0) and `leaf_vectors`, but a multi-output model's
+    trees must state `size_leaf_vector` (it decides vector vs scalar
     layout). Everything else predictions depend on (`objective`,
     `base_score`, `num_class`, `n_features`, `n_outputs`, `n_targets`,
-    `trees` with `nodes`/`categories`, `tree_weights`, `num_parallel_tree`,
-    each part of a present `linear`) is required. Writers still emit every
-    field.
+    `trees` with `nodes`/`categories`/`linear`, `tree_weights`,
+    `num_parallel_tree`, the model's `linear`) is required (an absent
+    `best_iteration` selects none);
+    the nullable ones use `deserialize_with = "Option::deserialize"`, since
+    a plain `Option` field defaults when absent and nothing else marks a
+    linear-leaf tree or a gblinear model. Writers still emit every field.
   - Compact (`HBTD`, documented in `model/compact.rs`): metadata is a
     section table like the native one; a change to the bit stream bumps its
     version byte (currently 1).

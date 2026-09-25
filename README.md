@@ -261,7 +261,8 @@ Predictions for multi-output models are row-major, `[row][output]`.
   and later load in every later release; native binary and JSON files from
   0.1.x are refused. A hand-written JSON document may leave out
   objective parameters (the recorded objective's defaults apply) and a
-  scalar tree's leaf fields; anything predictions depend on is required.
+  scalar tree's leaf-vector fields; anything predictions depend on,
+  including each tree's `linear` (`null` for constant leaves), is required.
 - **XGBoost interchange:** import and export `gbtree` and DART models
   (numeric and categorical splits, forests, multi-output and vector-leaf
   trees) as XGBoost JSON (`save_xgboost_json` / `load_xgboost_json`) or

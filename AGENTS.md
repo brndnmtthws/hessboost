@@ -194,22 +194,26 @@ nouns there.
   unchanged, and stay out of the parity fixtures.
 - **Formats:** from 0.2.0 on, files written by a release keep loading in
   every later one (0.1.x native binary and JSON files are refused).
-  - Native binary (`model/native.rs`): a zstd frame holding `SQB\0`, a
-    container version byte (`CONTAINER_VERSION`, currently 3), a section
-    table (`model/sections.rs`), and an XXH64 checksum of the preceding
-    bytes. Sections hold model scalars (`model.*`), objective parameters
-    (`objective.*`), trees column-wise (`tree.*`, `node.*`,
-    `leaf_linear.*`), and gblinear weights (`gblinear.*`). A new stored
-    field is a new section: flag it `REQUIRED` when readers that do not know
-    it must refuse the file rather than skip it, and read its absence with a
-    default that reproduces older files (for objective parameters, the
-    objective's defaults). Changing an existing section's meaning or the
-    container layout bumps `CONTAINER_VERSION`; the reader accepts only the
-    current version, so such a change must add a reader for the previous
-    one. The reader bounds decompression (`ALWAYS_ALLOWED`,
-    `MAX_EXPANSION`); a container whose zstd frame would exceed that is
-    written uncompressed, which the reader also accepts, so every save
-    loads.
+  - Native binary (`model/native.rs`): a zstd frame holding `HBM\0` (0.1.x
+    files, magic `SQB\0`, are refused by name), a container version byte
+    (`CONTAINER_VERSION`, currently 3), a section table
+    (`model/sections.rs`), and an XXH64 checksum of the preceding bytes.
+    Sections hold model scalars (`model.*`, including the optional,
+    never-read `model.writer`), objective parameters (`objective.*`), trees
+    column-wise (`tree.*`, `node.*`, `leaf_linear.*`), and gblinear weights
+    (`gblinear.*`). A new stored field is a new section: flag it `REQUIRED`
+    when readers that do not know it must refuse the file rather than skip
+    it, and read its absence with a default that reproduces older files
+    (for objective parameters, the objective's defaults). The reader refuses
+    what it does not define inside known sections (unknown `node.flags`
+    bits, `tree.has_linear` other than 0/1, bytes after the last section),
+    so a new flag bit is safe for old readers only because they refuse it.
+    Changing an existing section's meaning or the container layout bumps
+    `CONTAINER_VERSION`; the reader accepts only the current version, so
+    such a change must add a reader for the previous one. The reader bounds
+    decompression (`ALWAYS_ALLOWED`, `MAX_EXPANSION`); a container whose
+    zstd frame would exceed that is written uncompressed, which the reader
+    also accepts, so every save loads.
   - Native JSON (the serde fields by name): `BoostedModel`, `RegTree`, and
     `LinearLeaves` deserialize through `#[serde(try_from = "Unchecked…")]`
     mirrors (`UncheckedBoostedModel`, `UncheckedRegTree`,

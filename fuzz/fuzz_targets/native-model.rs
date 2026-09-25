@@ -14,8 +14,8 @@ use libfuzzer_sys::fuzz_target;
 #[path = "common.rs"]
 mod common;
 
-/// `b"SQB\0"` and the container version (`model/native.rs`).
-const HEADER: &[u8] = b"SQB\0\x03";
+/// `b"HBM\0"` and the container version (`model/native.rs`).
+const HEADER: &[u8] = b"HBM\0\x03";
 
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {

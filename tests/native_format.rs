@@ -35,7 +35,7 @@ fn unknown_and_corrupt_native_payloads_are_refused() {
     // The uncompressed container loads too; its version byte follows the
     // magic.
     let container = zstd::stream::decode_all(bytes.as_slice()).unwrap();
-    assert_eq!(&container[..4], b"SQB\0");
+    assert_eq!(&container[..4], b"HBM\0");
     assert_eq!(
         bits(
             &BoostedModel::from_bytes(&container)

@@ -71,7 +71,7 @@ Fuzzing: `fuzz/` is a separate cargo-fuzz crate. Its `mise.toml` layers a
 pinned nightly and cargo-fuzz over the repository's tools, so run it from
 there: `./run.sh [seconds] [target...]` rebuilds the seeds (the saved
 models in `tests/data/`, plus `fuzz/fixed-seeds/`) and runs each target for
-that long (30 s in CI's `fuzz` job). `fixed-seeds/train/*` are decoded by
+that long (10 s in CI's `fuzz` job). `fixed-seeds/train/*` are decoded by
 `train.rs`'s input layout: after changing it, re-check them with
 `cargo fuzz fmt train <file>`. A crash leaves its input in
 `fuzz/artifacts/<target>/`; replay it with `cargo fuzz run <target> <file>`.

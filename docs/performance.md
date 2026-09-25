@@ -604,6 +604,17 @@ RAYON_NUM_THREADS=1 cargo bench --bench training
 The quantized-gradient rows use the `*_quantized` cases of
 `hist_tree_build` and the `Hist_quantized` / `quantized` training cases.
 
+Groups without recorded results cover the remaining paths for comparisons
+with `scripts/compare_benchmarks.py`: `objective_gradient_other` (absolute
+error, alpha lists, label matrices, AFT, Cox, LambdaRank), `eval_metric_other`
+(AUC/AUCPR incl. label matrices, NDCG/MAP/`pre@k`, elementwise, quantile,
+survival, `dist:*` NLL/CRPS), `train_variants_50k_x20_20rounds` (sampling and
+constraints, categorical, exact, `approx` forests, DART, CSR input, vector
+leaves, symmetric, `extra_trees`, `path_smooth`, `linear_tree`, reuse
+penalties, eval sets, budget mode), `predict_csr_100trees_depth6`,
+`model_io_100trees_depth6`, `data_prep_100k_x30`, and the `sparse` case of
+`histogram_build`.
+
 To regenerate the charts in this guide from the `.dat` files after updating
 the tables, run:
 

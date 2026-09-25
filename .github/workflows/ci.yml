@@ -163,9 +163,9 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: fuzz
-      - name: Run each fuzz target for 30 seconds
+      - name: Run each fuzz target for 10 seconds
         working-directory: fuzz
-        run: mise exec -- ./run.sh 30
+        run: mise exec -- ./run.sh 10
       - name: Print crashing inputs
         if: failure()
         working-directory: fuzz

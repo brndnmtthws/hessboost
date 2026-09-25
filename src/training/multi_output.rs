@@ -4,11 +4,10 @@
 //! gradients supplied by the objective ([`Objective::split_gradient`]).
 
 use super::train::{
-    EvalSet, TrainContext, dart_new_tree_weight, finish_dart, for_each_row_margins,
-    gradient_sampling, make_column_sampler, round_gradients, sample_rows, tree_eta,
+    MarginCaches, TrainContext, TreeOutput, dart_new_tree_weight, finish_dart, gradient_sampling,
+    iteration_row_subsets, make_column_sampler, round_gradients, tree_eta,
 };
 use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMethod};
-use crate::data::DMatrix;
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
@@ -94,12 +93,11 @@ fn split_gradient(
     Ok(Some(split))
 }
 
-/// What every vector-leaf round reads: the run's shared inputs, the training
-/// matrix's gradient index, and the eval sets whose margins it keeps current.
+/// What every vector-leaf round reads: the run's shared inputs and the
+/// training matrix's gradient index.
 pub(super) struct VectorRound<'a> {
     pub(super) run: TrainContext<'a>,
     pub(super) ghist: &'a GHistIndex,
-    pub(super) evals: &'a [EvalSet<'a>],
 }
 
 /// One boosting iteration: grow `num_parallel_tree` vector-leaf trees from
@@ -111,40 +109,34 @@ pub(super) fn boost_round(
     ctx: &VectorRound,
     model: &mut BoostedModel,
     iteration: usize,
-    train_margin: &mut [f32],
-    eval_margins: &mut [Vec<f32>],
+    margins: &mut MarginCaches,
     gpair: &mut [GradPair],
 ) -> Result<()> {
     let params = ctx.run.params;
     let n = ctx.run.dtrain.n_rows();
     let n_out = model.n_outputs();
-    let (mut rng, dropped) = round_gradients(&ctx.run, model, iteration, train_margin, gpair);
+    let (mut rng, dropped) = round_gradients(&ctx.run, model, iteration, &margins.train, gpair);
     let split = split_gradient(ctx.run.objective, params, iteration, gpair, n)?;
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
-    // One row sample per parallel tree, all drawn before the trees.
-    let row_subsets: Vec<Vec<u32>> = (0..params.num_parallel_tree)
-        .map(|_| sample_rows(n, params, &mut rng))
-        .collect();
-    for rows in &row_subsets {
+    // The row samples, all drawn before the trees: one per parallel tree
+    // under uniform sampling, else one all-rows subset they share.
+    let row_subsets = iteration_row_subsets(n, params, false, &mut rng);
+    for p in 0..params.num_parallel_tree {
+        let rows = &row_subsets[p % row_subsets.len()];
         let (tree, leaf_rows) = fit_tree(ctx, gpair, split.as_ref(), &mut rng, rows, n_out)?;
         // DART's gradients come from the ensemble, not the margin caches
         // (`finish_dart` recomputes the eval ones).
         if dropped.is_none() {
             // Leaf row lists identify every training row's leaf when all
             // rows took part in growing the tree.
-            if rows.len() == n && !gradient_sampling(params) {
-                add_leaf_rows(&tree, &leaf_rows, train_margin, n_out);
-            } else {
-                add_tree(&tree, ctx.run.dtrain, train_margin, n_out);
-            }
-            for (margins, (d, _)) in eval_margins.iter_mut().zip(ctx.evals) {
-                add_tree(&tree, d, margins, n_out);
-            }
+            let captured =
+                (rows.len() == n && !gradient_sampling(params)).then_some(leaf_rows.as_slice());
+            margins.add_tree(&tree, TreeOutput::Vector, captured);
         }
         model.push_tree_weighted(tree, weight);
     }
     if let Some(dropped) = &dropped {
-        finish_dart(model, params, dropped, ctx.evals, eval_margins);
+        finish_dart(model, params, dropped, margins);
     }
     Ok(())
 }
@@ -187,28 +179,4 @@ fn fit_tree(
         MultiTreeBuilder::new(params).build(ctx.ghist, &grad, rows, &mut sampler);
     tree.scale_leaves(tree_eta(params));
     Ok((tree, leaf_rows))
-}
-
-/// Add a vector-leaf tree's leaf vector to every row's margins (`[row][k]`).
-fn add_tree(tree: &RegTree, data: &DMatrix, margins: &mut [f32], k: usize) {
-    for_each_row_margins(margins, k, |(row, margin)| {
-        let leaf = tree.leaf_id_with(|f| data.get(row, f as usize));
-        for (m, &v) in margin.iter_mut().zip(tree.leaf_vector(leaf)) {
-            *m += v;
-        }
-    });
-}
-
-/// Add each leaf's vector to the margins of the training rows that reached
-/// it.
-fn add_leaf_rows(tree: &RegTree, leaf_rows: &[LeafRows], margins: &mut [f32], k: usize) {
-    for leaf in leaf_rows {
-        let value = tree.leaf_vector(leaf.node);
-        for &row in &leaf.rows {
-            let margin = &mut margins[row as usize * k..(row as usize + 1) * k];
-            for (m, &v) in margin.iter_mut().zip(value) {
-                *m += v;
-            }
-        }
-    }
 }

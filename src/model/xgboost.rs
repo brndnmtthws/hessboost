@@ -312,14 +312,15 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
                     trees.len()
                 )));
             }
-            let weights = entries
+            if !entries.iter().all(|w| scalar_f64(w).is_some()) {
+                return Err(HessboostError::model_format(
+                    "`weight_drop` contains a non-numeric entry",
+                ));
+            }
+            order
                 .iter()
-                .map(|w| scalar_f64(w).map(|w| w as f32))
-                .collect::<Option<Vec<f32>>>()
-                .ok_or_else(|| {
-                    HessboostError::model_format("`weight_drop` contains a non-numeric entry")
-                })?;
-            order.iter().map(|&i| weights[i]).collect()
+                .map(|&i| scalar_f64(&entries[i]).map_or(0.0, |w| w as f32))
+                .collect()
         }
     };
 
@@ -482,7 +483,9 @@ fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Value {
 /// must hold a vector for every leaf: the storage is then smaller than twice
 /// the serialized leaf weights.
 fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Vec<f32>> {
-    let leaf_weights = required_arr(tj, "leaf_weights")?;
+    // Converted once: leaves may share a slot, so a lazy per-leaf read would
+    // re-parse string entries once per referencing leaf.
+    let leaf_weights = Scalars::required(tj, "leaf_weights")?.to_f32s();
     let n_leaves = left.iter().filter(|&&l| l == -1).count();
     if n_leaves.checked_mul(2) != left.len().checked_add(1) {
         return Err(HessboostError::model_format(format!(
@@ -517,26 +520,196 @@ fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Ve
             .ok_or_else(|| {
                 HessboostError::model_format(format!("leaf {i} has an invalid leaf index {r}"))
             })?;
-        for (dst, &w) in out[i * k..(i + 1) * k]
-            .iter_mut()
-            .zip(&leaf_weights[slot * k..(slot + 1) * k])
-        {
-            *dst = w as f32;
+        for (j, dst) in out[i * k..(i + 1) * k].iter_mut().enumerate() {
+            *dst = leaf_weights[slot * k + j];
         }
     }
     Ok(out)
 }
 
+/// A tree's categorical splits: each node's segment of the `categories`
+/// array, validated.
+struct TreeCategories {
+    values: Vec<u64>,
+    /// `(begin, end)` in `values` per node, for the nodes that have one.
+    segments: Vec<Option<(usize, usize)>>,
+    /// Total segment length.
+    total: usize,
+}
+
+impl TreeCategories {
+    /// Read and check the categorical arrays of a tree of `n` nodes.
+    fn read(tj: &Value, n: usize) -> Result<Self> {
+        let values = strict_nonnegative_integer_array(tj, "categories")?;
+        let category_nodes = strict_nonnegative_integer_array(tj, "categories_nodes")?;
+        let category_segments = strict_nonnegative_integer_array(tj, "categories_segments")?;
+        let category_sizes = strict_nonnegative_integer_array(tj, "categories_sizes")?;
+        if category_nodes.len() != category_segments.len()
+            || category_nodes.len() != category_sizes.len()
+        {
+            return Err(HessboostError::model_format(
+                "categorical node, segment, and size arrays have different lengths",
+            ));
+        }
+        let mut segments = vec![None; n];
+        // Every node gets its own copy of its segment, so overlapping
+        // segments could expand the array quadratically. XGBoost writes
+        // disjoint segments; together they hold at most the whole array.
+        let mut total = 0usize;
+        for slot in 0..category_nodes.len() {
+            let node = category_nodes[slot] as usize;
+            let begin = category_segments[slot] as usize;
+            let size = category_sizes[slot] as usize;
+            let end = begin
+                .checked_add(size)
+                .ok_or_else(|| HessboostError::model_format("categorical segment overflow"))?;
+            total = total.saturating_add(size);
+            if node >= n
+                || segments[node].is_some()
+                || size == 0
+                || end > values.len()
+                || total > values.len()
+            {
+                return Err(HessboostError::model_format("invalid categorical arrays"));
+            }
+            if values[begin..end]
+                .iter()
+                .any(|&v| u32::try_from(v).is_err())
+            {
+                return Err(HessboostError::model_format("category exceeds u32"));
+            }
+            segments[node] = Some((begin, end));
+        }
+        Ok(TreeCategories {
+            values,
+            segments,
+            total,
+        })
+    }
+
+    /// Whether node `i` has a category segment.
+    fn has(&self, i: usize) -> bool {
+        self.segments[i].is_some()
+    }
+
+    /// The category lists concatenated in node order, with each node's
+    /// range recorded in `nodes`.
+    fn flatten_into(&self, nodes: &mut [Node]) -> Vec<u32> {
+        let mut flat = Vec::with_capacity(self.total);
+        for (node, segment) in nodes.iter_mut().zip(&self.segments) {
+            if let Some((begin, end)) = *segment {
+                node.cat_begin = flat.len() as u32;
+                flat.extend(self.values[begin..end].iter().map(|&v| v as u32));
+                node.cat_end = flat.len() as u32;
+            }
+        }
+        flat
+    }
+}
+
+/// A tree's per-node arrays, as [`decode_nodes`] reads them.
+struct NodeColumns<'a> {
+    left: &'a [i32],
+    right: &'a [i32],
+    split_type: &'a [u64],
+    split_indices: Scalars<'a>,
+    split_conditions: Scalars<'a>,
+    default_left: Scalars<'a>,
+    base_weights: Scalars<'a>,
+    sum_hessian: Scalars<'a>,
+    loss_changes: Scalars<'a>,
+}
+
+/// `size_leaf_vector`: 0 or 1 for scalar trees and the model's output count
+/// for vector-leaf trees (`MultiTargetTree`); anything else, including a
+/// width too large to allocate, is malformed.
+fn leaf_vector_width(tj: &Value, n_outputs: usize) -> Result<usize> {
+    match tj.pointer("/tree_param/size_leaf_vector") {
+        None => Ok(0),
+        Some(value) => match scalar_f64(value) {
+            Some(k) if k == 0.0 || k == 1.0 => Ok(k as usize),
+            Some(k) if k == n_outputs as f64 => Ok(n_outputs),
+            _ => Err(HessboostError::model_format(format!(
+                "`size_leaf_vector` {value} is neither 0, 1, nor the model's {n_outputs} outputs"
+            ))),
+        },
+    }
+}
+
+/// The nodes of a tree with `cols`, their categorical splits checked
+/// against `categories` (whose ranges [`TreeCategories::flatten_into`]
+/// fills in afterwards).
+fn decode_nodes(
+    cols: &NodeColumns,
+    categories: &TreeCategories,
+    size_leaf_vector: usize,
+) -> Result<Vec<Node>> {
+    let NodeColumns {
+        left,
+        right,
+        split_type,
+        ..
+    } = *cols;
+    let n = left.len();
+    let mut nodes = Vec::with_capacity(n);
+    for i in 0..n {
+        let sum_hess = cols.sum_hessian.at(i) as f32;
+        if left[i] == -1 && size_leaf_vector > 1 {
+            // Vector leaf: the weights live in `leaf_vectors`.
+            nodes.push(Node::leaf(0.0, sum_hess));
+        } else if left[i] == -1 {
+            // Leaf: prefer split_conditions, fall back to base_weights.
+            let leaf_value = cols
+                .split_conditions
+                .get(i)
+                .or_else(|| cols.base_weights.get(i))
+                .unwrap_or(0.0) as f32;
+            nodes.push(Node::leaf(leaf_value, sum_hess));
+        } else {
+            if left[i] < 0 || right[i] < 0 || left[i] as usize >= n || right[i] as usize >= n {
+                return Err(HessboostError::model_format(format!(
+                    "node {i} has an invalid child index"
+                )));
+            }
+            let is_categorical = split_type.get(i).copied().unwrap_or(0) != 0;
+            if is_categorical && !categories.has(i) {
+                return Err(HessboostError::model_format(format!(
+                    "categorical node {i} has no category segment"
+                )));
+            }
+            let default_left = cols.default_left.at(i);
+            nodes.push(Node {
+                split_feature: cols.split_indices.at(i) as u32,
+                split_cond: cols.split_conditions.at(i) as f32,
+                default_left: if is_categorical {
+                    default_left == 0.0
+                } else {
+                    default_left != 0.0
+                },
+                left: if is_categorical { right[i] } else { left[i] },
+                right: if is_categorical { left[i] } else { right[i] },
+                leaf_value: 0.0,
+                sum_hess,
+                split_gain: cols.loss_changes.at(i) as f32,
+                is_categorical,
+                cat_begin: 0,
+                cat_end: 0,
+            });
+        }
+    }
+    Ok(nodes)
+}
+
 /// Decode one XGBoost tree object into a [`RegTree`] of a model with
 /// `n_outputs` outputs.
 fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
-    let left = required_i32_arr(tj, "left_children")?;
+    let left = Scalars::required(tj, "left_children")?.to_i32s();
     let n = left.len();
     if n == 0 {
         return Err(HessboostError::model_format("tree contains no nodes"));
     }
 
-    let right = required_i32_arr(tj, "right_children")?;
+    let right = Scalars::required(tj, "right_children")?.to_i32s();
     if right.len() != n {
         return Err(HessboostError::model_format(
             "child arrays have different lengths",
@@ -549,133 +722,26 @@ fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
             "`split_type` length does not match the node count",
         ));
     }
-    let categories = strict_nonnegative_integer_array(tj, "categories")?;
-    let category_nodes = strict_nonnegative_integer_array(tj, "categories_nodes")?;
-    let category_segments = strict_nonnegative_integer_array(tj, "categories_segments")?;
-    let category_sizes = strict_nonnegative_integer_array(tj, "categories_sizes")?;
-    if category_nodes.len() != category_segments.len()
-        || category_nodes.len() != category_sizes.len()
-    {
-        return Err(HessboostError::model_format(
-            "categorical node, segment, and size arrays have different lengths",
-        ));
-    }
-    let mut node_categories: Vec<Vec<u32>> = vec![Vec::new(); n];
-    let mut seen_category_node = vec![false; n];
-    // Every node copies its segment, so overlapping segments could expand
-    // the array quadratically. XGBoost writes disjoint segments; together
-    // they hold at most the whole array.
-    let mut copied = 0usize;
-    for slot in 0..category_nodes.len() {
-        let node = category_nodes[slot] as usize;
-        let begin = category_segments[slot] as usize;
-        let size = category_sizes[slot] as usize;
-        let end = begin
-            .checked_add(size)
-            .ok_or_else(|| HessboostError::model_format("categorical segment overflow"))?;
-        copied = copied.saturating_add(size);
-        if node >= n
-            || seen_category_node[node]
-            || size == 0
-            || end > categories.len()
-            || copied > categories.len()
-        {
-            return Err(HessboostError::model_format("invalid categorical arrays"));
-        }
-        seen_category_node[node] = true;
-        node_categories[node] = categories[begin..end]
-            .iter()
-            .map(|&v| {
-                u32::try_from(v).map_err(|_| HessboostError::model_format("category exceeds u32"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-    }
-
-    let split_indices = arr_or_empty(tj, "split_indices");
-    let split_conditions = required_arr(tj, "split_conditions")?;
-    let default_left = arr_or_empty(tj, "default_left");
-    let base_weights = arr_or_empty(tj, "base_weights");
-    let sum_hessian = arr_or_empty(tj, "sum_hessian");
-    let loss_changes = arr_or_empty(tj, "loss_changes");
-
-    let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
-    // `size_leaf_vector` is 0 or 1 for scalar trees and the model's output
-    // count for vector-leaf trees (`MultiTargetTree`); anything else,
-    // including a width too large to allocate, is malformed.
-    let size_leaf_vector = match tj.pointer("/tree_param/size_leaf_vector") {
-        None => 0,
-        Some(value) => match scalar_f64(value) {
-            Some(k) if k == 0.0 || k == 1.0 => k as usize,
-            Some(k) if k == n_outputs as f64 => n_outputs,
-            _ => {
-                return Err(HessboostError::model_format(format!(
-                    "`size_leaf_vector` {value} is neither 0, 1, nor the model's {n_outputs} outputs"
-                )));
-            }
-        },
+    let categories = TreeCategories::read(tj, n)?;
+    let cols = NodeColumns {
+        left: &left,
+        right: &right,
+        split_type: &split_type,
+        split_indices: Scalars::optional(tj, "split_indices"),
+        split_conditions: Scalars::required(tj, "split_conditions")?,
+        default_left: Scalars::optional(tj, "default_left"),
+        base_weights: Scalars::optional(tj, "base_weights"),
+        sum_hessian: Scalars::optional(tj, "sum_hessian"),
+        loss_changes: Scalars::optional(tj, "loss_changes"),
     };
-
-    let mut nodes = Vec::with_capacity(n);
-    for i in 0..n {
-        let sum_hess = at(&sum_hessian, i) as f32;
-        if left[i] == -1 && size_leaf_vector > 1 {
-            // Vector leaf: the weights live in `leaf_vectors`.
-            nodes.push(Node::leaf(0.0, sum_hess));
-        } else if left[i] == -1 {
-            // Leaf: prefer split_conditions, fall back to base_weights.
-            let leaf_value = split_conditions
-                .get(i)
-                .copied()
-                .or_else(|| base_weights.get(i).copied())
-                .unwrap_or(0.0) as f32;
-            nodes.push(Node::leaf(leaf_value, sum_hess));
-        } else {
-            if left[i] < 0 || right[i] < 0 || left[i] as usize >= n || right[i] as usize >= n {
-                return Err(HessboostError::model_format(format!(
-                    "node {i} has an invalid child index"
-                )));
-            }
-            let is_categorical = split_type.get(i).copied().unwrap_or(0) != 0;
-            if is_categorical && !seen_category_node[i] {
-                return Err(HessboostError::model_format(format!(
-                    "categorical node {i} has no category segment"
-                )));
-            }
-            nodes.push(Node {
-                split_feature: at(&split_indices, i) as u32,
-                split_cond: at(&split_conditions, i) as f32,
-                default_left: if is_categorical {
-                    at(&default_left, i) == 0.0
-                } else {
-                    at(&default_left, i) != 0.0
-                },
-                left: if is_categorical { right[i] } else { left[i] },
-                right: if is_categorical { left[i] } else { right[i] },
-                leaf_value: 0.0,
-                sum_hess,
-                split_gain: at(&loss_changes, i) as f32,
-                is_categorical,
-                cat_begin: 0,
-                cat_end: 0,
-            });
-        }
-    }
-
+    let size_leaf_vector = leaf_vector_width(tj, n_outputs)?;
+    let mut nodes = decode_nodes(&cols, &categories, size_leaf_vector)?;
     let leaf_vectors = if size_leaf_vector > 1 {
         vector_leaves(tj, &left, &right, size_leaf_vector)?
     } else {
         Vec::new()
     };
-
-    // Flatten the category lists in node order.
-    let mut flat_categories: Vec<u32> = Vec::with_capacity(copied);
-    for (i, cats) in node_categories.iter().enumerate() {
-        if !cats.is_empty() {
-            nodes[i].cat_begin = flat_categories.len() as u32;
-            flat_categories.extend(cats);
-            nodes[i].cat_end = flat_categories.len() as u32;
-        }
-    }
+    let flat_categories = categories.flatten_into(&mut nodes);
     // Unchecked here: the model's `validate_structure` checks every tree.
     Ok(RegTree::from_parts(
         nodes,
@@ -809,8 +875,17 @@ const AFT_LOSS_PARAM: &str = "aft_loss_param";
 /// Encode `values` as XGBoost's float vector string (`"[0.1,0.5,0.9]"`): the
 /// form of `base_score` and of `ParamArray<float>` alpha lists.
 fn format_float_vector(values: impl IntoIterator<Item = f32>) -> String {
-    let entries: Vec<String> = values.into_iter().map(|v| v.to_string()).collect();
-    format!("[{}]", entries.join(","))
+    use std::fmt::Write;
+    let mut out = String::from("[");
+    for (i, v) in values.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // Writing to a `String` cannot fail.
+        let _ = write!(out, "{v}");
+    }
+    out.push(']');
+    out
 }
 
 /// Decode XGBoost's `ParamArray<float>` string: a JSON array or a single
@@ -862,7 +937,7 @@ fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams
             EXPECTILE_ALPHA,
             format_float_vector(params.expectile_alpha.iter().map(|&v| v as f32)),
         ),
-        "multi:softmax" | "multi:softprob" => (SOFTMAX_NUM_CLASS, num_class.to_string()),
+        name if is_multiclass(name) => (SOFTMAX_NUM_CLASS, num_class.to_string()),
         "count:poisson" => (MAX_DELTA_STEP, params.max_delta_step.to_string()),
         "reg:tweedie" => (
             TWEEDIE_VARIANCE_POWER,
@@ -1001,38 +1076,8 @@ fn iteration_tree_order(
         )));
     }
 
-    let num_parallel_tree = model
-        .get("gbtree_model_param")
-        .and_then(|p| p.get("num_parallel_tree"))
-        .map_or(Some(1.0), scalar_f64)
-        .filter(|&v| v >= 1.0 && v.fract() == 0.0)
-        .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
-        as usize;
-    let indptr = if model.get("iteration_indptr").is_some() {
-        let indptr = strict_nonnegative_integer_array(model, "iteration_indptr")?;
-        let bounded = indptr.first() == Some(&0)
-            && indptr.last() == Some(&(n_trees as u64))
-            && indptr.windows(2).all(|w| w[0] <= w[1]);
-        if !bounded {
-            return Err(HessboostError::model_format(
-                "`iteration_indptr` must run monotonically from 0 to the number of trees",
-            ));
-        }
-        indptr.iter().map(|&i| i as usize).collect::<Vec<_>>()
-    } else {
-        let per_iteration = num_parallel_tree
-            .checked_mul(n_outputs)
-            .ok_or_else(|| HessboostError::model_format("trees per iteration overflow"))?;
-        if !n_trees.is_multiple_of(per_iteration) {
-            return Err(HessboostError::model_format(format!(
-                "{n_trees} trees do not form whole iterations of {per_iteration} \
-                 (num_parallel_tree × outputs)"
-            )));
-        }
-        (0..=n_trees / per_iteration)
-            .map(|k| k * per_iteration)
-            .collect()
-    };
+    let num_parallel_tree = num_parallel_tree_param(model)?;
+    let indptr = iteration_indptr(model, n_trees, num_parallel_tree, n_outputs)?;
 
     if n_trees == 0 {
         // Every iteration of a tree-less model is empty.
@@ -1081,6 +1126,52 @@ fn iteration_tree_order(
         Some(size) => Ok((order, size)),
         None => Ok((order, num_parallel_tree)),
     }
+}
+
+/// `gbtree_model_param.num_parallel_tree`, `1` when absent.
+fn num_parallel_tree_param(model: &Value) -> Result<usize> {
+    Ok(model
+        .get("gbtree_model_param")
+        .and_then(|p| p.get("num_parallel_tree"))
+        .map_or(Some(1.0), scalar_f64)
+        .filter(|&v| v >= 1.0 && v.fract() == 0.0)
+        .ok_or_else(|| HessboostError::model_format("invalid `num_parallel_tree`"))?
+        as usize)
+}
+
+/// The iteration boundaries of `n_trees` trees: `iteration_indptr`, checked
+/// to run monotonically from 0 to `n_trees`, or when absent XGBoost's
+/// `MakeIndptr` of `num_parallel_tree × n_outputs` trees per iteration.
+fn iteration_indptr(
+    model: &Value,
+    n_trees: usize,
+    num_parallel_tree: usize,
+    n_outputs: usize,
+) -> Result<Vec<usize>> {
+    if model.get("iteration_indptr").is_some() {
+        let indptr = strict_nonnegative_integer_array(model, "iteration_indptr")?;
+        let bounded = indptr.first() == Some(&0)
+            && indptr.last() == Some(&(n_trees as u64))
+            && indptr.windows(2).all(|w| w[0] <= w[1]);
+        if !bounded {
+            return Err(HessboostError::model_format(
+                "`iteration_indptr` must run monotonically from 0 to the number of trees",
+            ));
+        }
+        return Ok(indptr.iter().map(|&i| i as usize).collect());
+    }
+    let per_iteration = num_parallel_tree
+        .checked_mul(n_outputs)
+        .ok_or_else(|| HessboostError::model_format("trees per iteration overflow"))?;
+    if !n_trees.is_multiple_of(per_iteration) {
+        return Err(HessboostError::model_format(format!(
+            "{n_trees} trees do not form whole iterations of {per_iteration} \
+             (num_parallel_tree × outputs)"
+        )));
+    }
+    Ok((0..=n_trees / per_iteration)
+        .map(|k| k * per_iteration)
+        .collect())
 }
 
 /// Fetch a required object field, erroring with its name if absent.
@@ -1142,29 +1233,55 @@ fn scalar_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// Read a JSON array field, coercing each element with [`scalar_f64`] (`0`
-/// for non-scalar entries). Returns `None` if the field is missing or is not
-/// an array.
-fn arr(v: &Value, key: &str) -> Option<Vec<f64>> {
-    v.get(key)?
-        .as_array()
-        .map(|a| a.iter().map(|e| scalar_f64(e).unwrap_or(0.0)).collect())
-}
+/// A JSON array field read element by element, each entry coerced with
+/// [`scalar_f64`] (`0` for non-scalar entries), without copying the array.
+#[derive(Clone, Copy)]
+struct Scalars<'a>(&'a [Value]);
 
-/// Read a required JSON array field; a missing or non-array field is a
-/// missing-field error naming `key`.
-fn required_arr(v: &Value, key: &str) -> Result<Vec<f64>> {
-    arr(v, key).ok_or_else(|| HessboostError::missing_field(key))
-}
+impl<'a> Scalars<'a> {
+    /// The array field `key` of `v`, empty when absent or not an array.
+    fn optional(v: &'a Value, key: &str) -> Self {
+        Scalars(
+            v.get(key)
+                .and_then(Value::as_array)
+                .map_or(&[], Vec::as_slice),
+        )
+    }
 
-/// Read a required JSON array field as `i32`s.
-fn required_i32_arr(v: &Value, key: &str) -> Result<Vec<i32>> {
-    Ok(required_arr(v, key)?.iter().map(|&x| x as i32).collect())
-}
+    /// The array field `key` of `v`; a missing or non-array field is a
+    /// missing-field error naming `key`.
+    fn required(v: &'a Value, key: &str) -> Result<Self> {
+        v.get(key)
+            .and_then(Value::as_array)
+            .map(|a| Scalars(a))
+            .ok_or_else(|| HessboostError::missing_field(key))
+    }
 
-/// Read a JSON array field, defaulting to an empty vector when absent.
-fn arr_or_empty(v: &Value, key: &str) -> Vec<f64> {
-    arr(v, key).unwrap_or_default()
+    /// Entry `i`, `None` past the end.
+    fn get(self, i: usize) -> Option<f64> {
+        self.0.get(i).map(|e| scalar_f64(e).unwrap_or(0.0))
+    }
+
+    /// Entry `i`, `0` past the end.
+    fn at(self, i: usize) -> f64 {
+        self.get(i).unwrap_or(0.0)
+    }
+
+    /// Every entry as `f32`.
+    fn to_f32s(self) -> Vec<f32> {
+        self.0
+            .iter()
+            .map(|e| scalar_f64(e).unwrap_or(0.0) as f32)
+            .collect()
+    }
+
+    /// Every entry as `i32` (truncated).
+    fn to_i32s(self) -> Vec<i32> {
+        self.0
+            .iter()
+            .map(|e| scalar_f64(e).unwrap_or(0.0) as i32)
+            .collect()
+    }
 }
 
 /// Read a JSON array whose entries are finite, non-negative integers.

@@ -78,11 +78,7 @@ fn split_features(model: &BoostedModel) -> Vec<u32> {
 fn gradient_based_sampling_is_seeded_and_thread_count_independent() {
     let data = dataset(6000, 5);
     let run = |threads: usize, seed: u64| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap()
-            .install(|| predictions(&mvs_params(seed), &data, 8))
+        common::with_threads(threads, || predictions(&mvs_params(seed), &data, 8))
     };
     let serial = run(1, 3);
     assert_eq!(serial, run(4, 3), "serial and parallel training differ");

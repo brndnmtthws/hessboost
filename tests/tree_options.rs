@@ -84,11 +84,9 @@ fn options_grow_the_same_model_serially_and_in_parallel() {
         .build()
         .unwrap();
     let fit = |threads: usize| {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap();
-        pool.install(|| train(&params, &data, 4).unwrap().to_bytes().unwrap())
+        common::with_threads(threads, || {
+            train(&params, &data, 4).unwrap().to_bytes().unwrap()
+        })
     };
     assert_eq!(fit(1), fit(4));
 }

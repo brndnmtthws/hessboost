@@ -5,6 +5,8 @@
 
 #![cfg(all(target_os = "macos", feature = "metal"))]
 
+mod common;
+
 use hessboost::backend::metal;
 use hessboost::config::{BoosterKind, Device, ProcessType};
 use hessboost::prelude::*;
@@ -92,13 +94,7 @@ fn device_metal_training_matches_single_threaded_cpu() {
             .build()
             .unwrap()
     };
-    let train_one = |params| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap()
-            .install(|| train(&params, &data, 10).unwrap())
-    };
+    let train_one = |params| common::with_threads(1, || train(&params, &data, 10).unwrap());
     let cpu = train_one(build(Device::Cpu));
     let gpu = train_one(build(Device::Metal));
     assert_eq!(
@@ -126,11 +122,9 @@ fn device_metal_training_is_deterministic() {
         .build()
         .unwrap();
     let run = |threads| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap()
-            .install(|| train(&params, &data, 8).unwrap().to_bytes().unwrap())
+        common::with_threads(threads, || {
+            train(&params, &data, 8).unwrap().to_bytes().unwrap()
+        })
     };
     assert_eq!(run(1), run(1));
     assert_eq!(run(1), run(4));
@@ -309,14 +303,10 @@ fn histogram(
     gpair: &[hessboost::objective::GradPair],
 ) -> Vec<(f64, f64)> {
     let mut out = hessboost::internals::zeroed(index.total_bins());
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .unwrap()
-        .install(|| {
-            backend.prepare(index, gpair);
-            backend.build(index, rows, gpair, &mut out);
-        });
+    common::with_threads(1, || {
+        backend.prepare(index, gpair);
+        backend.build(index, rows, gpair, &mut out);
+    });
     out.iter().map(|s| (s.grad, s.hess)).collect()
 }
 
@@ -371,13 +361,7 @@ fn wide_dynamic_range_training_matches_single_threaded_cpu() {
             .build()
             .unwrap()
     };
-    let train_one = |params| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap()
-            .install(|| train(&params, &data, 2).unwrap())
-    };
+    let train_one = |params| common::with_threads(1, || train(&params, &data, 2).unwrap());
     assert_eq!(
         train_one(build(Device::Cpu)).to_bytes().unwrap(),
         train_one(build(Device::Metal)).to_bytes().unwrap()

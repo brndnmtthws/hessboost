@@ -362,8 +362,10 @@ impl RegTree {
         if !locally_valid {
             return false;
         }
+        // `size_leaf_vector` is untrusted: an overflowing product is invalid.
         if self.is_vector_leaf()
-            && (self.leaf_vectors.len() != self.nodes.len() * self.size_leaf_vector
+            && (self.nodes.len().checked_mul(self.size_leaf_vector)
+                != Some(self.leaf_vectors.len())
                 || self.leaf_vectors.iter().any(|w| !w.is_finite()))
         {
             return false;
@@ -597,7 +599,8 @@ mod tests {
 
     /// A deserialized tree is traversable: serde refuses child links out of
     /// range, cycles, and unreachable nodes (which traversal would follow
-    /// out of bounds or forever) and a leaf vector of the wrong length.
+    /// out of bounds or forever) and a leaf vector of the wrong length,
+    /// including a width whose storage size overflows `usize`.
     #[test]
     fn deserialization_refuses_malformed_trees() {
         let doc = serde_json::to_value(stump()).unwrap();
@@ -617,6 +620,11 @@ mod tests {
         assert!(serde_json::from_value::<RegTree>(vector.clone()).is_ok());
         vector["leaf_vectors"] = serde_json::json!([0.0]);
         assert!(serde_json::from_value::<RegTree>(vector).is_err());
+        // Three nodes of `usize::MAX` weights each overflow the count.
+        let mut wide = doc;
+        wide["size_leaf_vector"] = usize::MAX.into();
+        wide["leaf_vectors"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<RegTree>(wide).is_err());
     }
 
     #[test]

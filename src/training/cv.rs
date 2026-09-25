@@ -8,7 +8,7 @@ use crate::error::{HessboostError, Result};
 use crate::objective::create_objective;
 use crate::rng::Rng;
 use crate::training::Trainer;
-use crate::training::train::configured_metrics;
+use crate::training::train::{EarlyStopping, configured_metrics};
 
 /// Per-metric cross-validation history, aggregated across folds.
 #[derive(Debug, Clone)]
@@ -213,71 +213,17 @@ impl<'a> CrossValidation<'a> {
         if folds.is_empty() {
             return Err(HessboostError::invalid_param("folds", "no folds"));
         }
-        if early_stopping_rounds == Some(0) {
-            return Err(HessboostError::invalid_param(
-                "early_stopping_rounds",
-                "must be greater than zero",
-            ));
-        }
-        let n = data.n_rows();
-        for (f, fold) in folds.iter().enumerate() {
-            for (name, rows) in [("training", &fold.train), ("test", &fold.test)] {
-                if rows.is_empty() {
-                    return Err(HessboostError::invalid_param(
-                        "folds",
-                        format!("fold {f} has no {name} rows"),
-                    ));
-                }
-                if let Some(&row) = rows.iter().find(|&&row| row >= n) {
-                    return Err(HessboostError::invalid_param(
-                        "folds",
-                        format!("fold {f}: {name} row {row} is out of bounds for {n} rows"),
-                    ));
-                }
-            }
-        }
+        EarlyStopping::check_patience(early_stopping_rounds)?;
+        validate_folds(&folds, data.n_rows())?;
         let objective = create_objective(params, data.n_targets())?;
         let metrics = configured_metrics(params, objective.as_ref())?;
         let maximize = metrics.last().is_some_and(|m| m.maximize());
 
-        // values[metric][round][fold], grown as rounds arrive (not sized by
-        // `num_boost_round`, which is caller input).
-        let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); metrics.len()];
-        for fold in &folds {
-            let dtrain = data.select_rows(&fold.train)?;
-            let dtest = data.select_rows(&fold.test)?;
-            let res = Trainer::new(params, &dtrain, num_boost_round)
-                .eval(&dtest, "test")
-                .train()?;
-            for (round, eval) in res.history.iter().enumerate() {
-                for (per_round, (_, _, value)) in values.iter_mut().zip(&eval.scores) {
-                    if per_round.len() == round {
-                        per_round.push(Vec::with_capacity(folds.len()));
-                    }
-                    per_round[round].push(*value);
-                }
-            }
-        }
-
+        let values = fold_scores(params, data, num_boost_round, &folds, metrics.len())?;
         let mut out: Vec<CvResult> = metrics
             .iter()
             .zip(values)
-            .map(|(metric, per_round)| {
-                let (test_mean, test_std) = per_round
-                    .iter()
-                    .map(|vals| {
-                        let len = vals.len() as f64;
-                        let mean = vals.iter().sum::<f64>() / len;
-                        let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / len;
-                        (mean, var.sqrt())
-                    })
-                    .unzip();
-                CvResult {
-                    metric: metric.name().to_string(),
-                    test_mean,
-                    test_std,
-                }
-            })
+            .map(|(metric, per_round)| aggregate(metric.name(), &per_round))
             .collect();
 
         if let Some(patience) = early_stopping_rounds
@@ -294,31 +240,85 @@ impl<'a> CrossValidation<'a> {
     }
 }
 
-/// The round early stopping selects on `scores`: the same rule as
-/// [`Trainer::early_stopping_rounds`] (strict improvement; round 0 when no
-/// score ever improves, e.g. NaN).
-fn best_round(scores: &[f64], patience: usize, maximize: bool) -> usize {
-    let mut best = if maximize {
-        f64::NEG_INFINITY
-    } else {
-        f64::INFINITY
-    };
-    let mut best_round = 0;
-    let mut since = 0;
-    for (round, &score) in scores.iter().enumerate() {
-        let improved = if maximize { score > best } else { score < best };
-        if improved {
-            best = score;
-            best_round = round;
-            since = 0;
-        } else {
-            since += 1;
-            if since >= patience {
-                break;
+/// Refuse a fold without training or test rows, or naming a row past `n`.
+fn validate_folds(folds: &[Fold], n: usize) -> Result<()> {
+    for (f, fold) in folds.iter().enumerate() {
+        for (name, rows) in [("training", &fold.train), ("test", &fold.test)] {
+            if rows.is_empty() {
+                return Err(HessboostError::invalid_param(
+                    "folds",
+                    format!("fold {f} has no {name} rows"),
+                ));
+            }
+            if let Some(&row) = rows.iter().find(|&&row| row >= n) {
+                return Err(HessboostError::invalid_param(
+                    "folds",
+                    format!("fold {f}: {name} row {row} is out of bounds for {n} rows"),
+                ));
             }
         }
     }
-    best_round
+    Ok(())
+}
+
+/// Train on every fold in order and collect its test scores as
+/// `values[metric][round][fold]`, grown as rounds arrive (not sized by
+/// `num_boost_round`, which is caller input).
+fn fold_scores(
+    params: &TrainingParams,
+    data: &DMatrix,
+    num_boost_round: usize,
+    folds: &[Fold],
+    n_metrics: usize,
+) -> Result<Vec<Vec<Vec<f64>>>> {
+    let mut values: Vec<Vec<Vec<f64>>> = vec![Vec::new(); n_metrics];
+    for fold in folds {
+        let dtrain = data.select_rows(&fold.train)?;
+        let dtest = data.select_rows(&fold.test)?;
+        let res = Trainer::new(params, &dtrain, num_boost_round)
+            .eval(&dtest, "test")
+            .train()?;
+        for (round, eval) in res.history.iter().enumerate() {
+            for (per_round, (_, _, value)) in values.iter_mut().zip(&eval.scores) {
+                if per_round.len() == round {
+                    per_round.push(Vec::with_capacity(folds.len()));
+                }
+                per_round[round].push(*value);
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// A metric's per-round fold mean and (population) standard deviation.
+fn aggregate(metric: &str, per_round: &[Vec<f64>]) -> CvResult {
+    let (test_mean, test_std) = per_round
+        .iter()
+        .map(|vals| {
+            let len = vals.len() as f64;
+            let mean = vals.iter().sum::<f64>() / len;
+            let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / len;
+            (mean, var.sqrt())
+        })
+        .unzip();
+    CvResult {
+        metric: metric.to_string(),
+        test_mean,
+        test_std,
+    }
+}
+
+/// The round early stopping selects on `scores`: the same rule as
+/// [`Trainer::early_stopping_rounds`] ([`EarlyStopping`]; round 0 when no
+/// score ever improves, e.g. NaN).
+fn best_round(scores: &[f64], patience: usize, maximize: bool) -> usize {
+    let mut stopping = EarlyStopping::new(patience, maximize, 0);
+    for (round, &score) in scores.iter().enumerate() {
+        if stopping.observe(round, score) {
+            break;
+        }
+    }
+    stopping.best_round()
 }
 
 /// Shuffled `nfold` cross-validation ([`Fold::k_fold`] folds), returning one

@@ -293,7 +293,7 @@ nouns there.
   hist`/`auto`, and a tree booster, and refuses `use_quantized_grad` and
   `process_type = update`; `gblinear` refuses row and column sampling,
   `gradient_based`, `num_parallel_tree > 1`, and tree constraints;
-  `num_parallel_tree` is at most `MAX_NUM_PARALLEL_TREE`), `train_impl` in
+  `num_parallel_tree` is at most `MAX_NUM_PARALLEL_TREE`), `validate_request` in
   `training/train.rs` (data-dependent checks, e.g. feature weights with
   `gblinear` or `process_type = update`), `training/multi_output.rs::validate`
   (`multi_output_tree` needs `hist` or `auto`, and refuses vector-leaf

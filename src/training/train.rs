@@ -590,15 +590,208 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
         init_model,
     } = trainer;
     let evals: &[EvalSet] = &evals;
+    validate_request(
+        &TrainRequest {
+            params,
+            dtrain,
+            evals,
+            early_stopping_rounds,
+        },
+        objective,
+    )?;
+    let info = dtrain.info();
+    let n = dtrain.n_rows();
+    let n_out = objective.n_outputs();
+    let intercepts = || initial_intercepts(params, objective, &info, n_out);
+    let mut model = if let Some(init) = init_model {
+        resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?
+    } else {
+        require_model_for_update(params)?;
+        new_model(params, objective, dtrain, intercepts()?)
+    };
+
+    if params.booster == BoosterKind::GbLinear {
+        return train_linear(
+            &TrainRequest {
+                params,
+                dtrain,
+                evals,
+                early_stopping_rounds,
+            },
+            num_boost_round,
+            objective,
+            model,
+        );
+    }
+
+    // `process_type=update` refreshes the model's own trees (re-appended one
+    // iteration per round) instead of growing new ones, so it needs no
+    // builder state.
+    let mut plan = if params.process_type == ProcessType::Update {
+        RoundPlan::Refresh(model.take_trees())
+    } else {
+        RoundPlan::Grow(prepare_builder(params, dtrain, objective.const_hess())?)
+    };
+    // Continued training numbers its rounds after the model's iterations, so
+    // the per-round RNG streams continue where the earlier run stopped.
+    let start_iteration = model.num_boost_rounds();
+    // Opt-in reuse penalties: the features and thresholds the ensemble already
+    // uses, extended by every tree the loop grows. `None` on the default path.
+    let reuse = ReuseSet::from_params(params, dtrain.n_cols(), model.trees());
+    let margins = MarginCaches::new(&model, dtrain, evals);
+    let mut eval_plan = EvalPlan::new(
+        params,
+        objective,
+        metric_override,
+        evals,
+        dtrain.n_targets(),
+    )?;
+
+    let run = TrainContext {
+        params,
+        dtrain,
+        info: &info,
+        objective,
+    };
+    let mut state = RoundState {
+        model,
+        margins,
+        gpair: vec![GradPair::default(); n * n_out],
+        // Per-output gradient scratch; single-output objectives read `gpair`
+        // itself ([`gather_output`]).
+        gpair_k: if n_out > 1 {
+            vec![GradPair::default(); n]
+        } else {
+            Vec::new()
+        },
+        reuse,
+    };
+    if start_iteration > 0
+        && let RoundPlan::Grow(prepared) = &plan
+    {
+        prepared.resume_approx_cache(
+            &run,
+            &state.model.margin_from_trees(dtrain, 0..0),
+            &mut state.gpair,
+            &mut state.gpair_k,
+            n_out,
+        )?;
+    }
+    let mut history: Vec<RoundEval> = Vec::new();
+    let mut stopping = early_stopping_rounds
+        .map(|patience| EarlyStopping::new(patience, eval_plan.maximize(), start_iteration));
+    // `multi_strategy = multi_output_tree` grows vector-leaf trees when there
+    // is more than one output (a single output keeps scalar trees, as
+    // XGBoost's `LeafLength` does).
+    let vector_leaf = multi_output::vector_leaf(params, n_out);
+
+    for round in 0..num_boost_round {
+        let iteration = start_iteration + round;
+        match &mut plan {
+            RoundPlan::Grow(Prepared::Hist { index: ghist, .. }) if vector_leaf => {
+                multi_output::boost_round(
+                    &multi_output::VectorRound { run, ghist },
+                    &mut state.model,
+                    iteration,
+                    &mut state.margins,
+                    &mut state.gpair,
+                )?;
+            }
+            RoundPlan::Refresh(queue) => refresh_round(&run, queue, iteration, &mut state)?,
+            RoundPlan::Grow(prepared) => grow_round(&run, prepared, iteration, &mut state)?,
+        }
+        if !evals.is_empty() {
+            let score = eval_plan.record(objective, iteration, &state.margins, &mut history);
+            if let Some(stopping) = &mut stopping
+                && stopping.observe(iteration, score)
+            {
+                break;
+            }
+        }
+    }
+
+    let mut model = state.model;
+    // XGBoost records the best iteration whenever early stopping is on, not
+    // only when patience runs out.
+    let mut best_round_score = None;
+    if let Some(stopping) = &stopping
+        && let Some(first) = history.first()
+    {
+        let best_iter = stopping.best_round();
+        let round = &history[best_iter - first.iteration];
+        best_round_score = round.scores.last().map(|&(_, _, v)| v);
+        model.set_best_iteration(Some(best_iter));
+    }
+
+    Ok(TrainResult {
+        model,
+        history,
+        best_score: best_round_score,
+    })
+}
+
+/// The linear (`gblinear`) booster: fit `model`'s coordinate-descent linear
+/// model instead of growing trees, continuing from its weights and margins.
+/// Eval sets and early stopping are refused (the history stays empty).
+fn train_linear(
+    request: &TrainRequest,
+    num_boost_round: usize,
+    objective: &dyn Objective,
+    mut model: BoostedModel,
+) -> Result<TrainResult> {
+    let &TrainRequest {
+        params,
+        dtrain,
+        evals,
+        early_stopping_rounds,
+    } = request;
+    if !evals.is_empty() || early_stopping_rounds.is_some() {
+        return Err(HessboostError::invalid_param(
+            "booster",
+            "gblinear does not yet support evaluation sets or early stopping",
+        ));
+    }
+    let linear = crate::training::gblinear::train_gblinear(
+        params,
+        dtrain,
+        num_boost_round,
+        &model.margin_from_trees(dtrain, 0..0),
+        objective.n_outputs(),
+        objective,
+        model.linear(),
+    )?;
+    model.set_linear(linear);
+    Ok(TrainResult {
+        model,
+        history: Vec::new(),
+        best_score: None,
+    })
+}
+
+/// What [`validate_request`] checks: the training call's configuration and
+/// data, before anything is built.
+struct TrainRequest<'a> {
+    params: &'a TrainingParams,
+    dtrain: &'a DMatrix,
+    evals: &'a [EvalSet<'a>],
+    early_stopping_rounds: Option<usize>,
+}
+
+/// Refuse a training call that cannot run: invalid parameters, early
+/// stopping without eval sets, unlabeled or mismatched data, constraints
+/// naming missing features, feature weights on a path that samples no
+/// columns, and objective settings a saved model could not rebuild.
+fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result<()> {
+    let &TrainRequest {
+        params,
+        dtrain,
+        evals,
+        early_stopping_rounds,
+    } = request;
     params.validate()?;
     multi_output::validate(params, objective.n_outputs())?;
     reject_missing_param(params)?;
-    if early_stopping_rounds == Some(0) {
-        return Err(HessboostError::invalid_param(
-            "early_stopping_rounds",
-            "must be greater than zero",
-        ));
-    }
+    EarlyStopping::check_patience(early_stopping_rounds)?;
     if early_stopping_rounds.is_some() && evals.is_empty() {
         return Err(HessboostError::invalid_param(
             "early_stopping_rounds",
@@ -609,8 +802,6 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     if objective.requires_labels() && dtrain.labels().is_none() {
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
     }
-    let info = dtrain.info();
-    let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
     check_num_class(params, objective)?;
@@ -669,350 +860,344 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
             "objective",
             format!("the training parameters do not describe the given objective: {e}"),
         )
-    })?;
-    let intercepts = || initial_intercepts(params, objective, &info, n_out);
-    let mut model = if let Some(init) = init_model {
-        resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?
-    } else {
-        require_model_for_update(params)?;
-        new_model(params, objective, dtrain, intercepts()?)
-    };
+    })
+}
 
-    // The linear (`gblinear`) booster fits a coordinate-descent linear model
-    // instead of growing trees; it skips the tree/dart path entirely. Eval sets
-    // and early stopping are rejected for it (the history stays empty).
-    if params.booster == BoosterKind::GbLinear {
-        if !evals.is_empty() || early_stopping_rounds.is_some() {
-            return Err(HessboostError::invalid_param(
-                "booster",
-                "gblinear does not yet support evaluation sets or early stopping",
-            ));
-        }
-        // Continued training resumes from the model's weights and margins.
-        let linear = crate::training::gblinear::train_gblinear(
-            params,
-            dtrain,
-            num_boost_round,
-            &model.margin_from_trees(dtrain, 0..0),
-            n_out,
-            objective,
-            model.linear(),
-        )?;
-        model.set_linear(linear);
-        return Ok(TrainResult {
-            model,
-            history: Vec::new(),
-            best_score: None,
-        });
-    }
+/// What the tree-growing and refresh rounds update: the ensemble, its
+/// margin caches, the gradient buffers, and the reuse dictionary.
+struct RoundState<'a> {
+    model: BoostedModel,
+    margins: MarginCaches<'a>,
+    /// Every output's gradients, `[row][n_out]`.
+    gpair: Vec<GradPair>,
+    /// One output's gradients gathered from `gpair` (empty for
+    /// single-output objectives, which read `gpair` directly).
+    gpair_k: Vec<GradPair>,
+    reuse: Option<ReuseSet>,
+}
 
-    // `process_type=update` refreshes the model's own trees (re-appended one
-    // iteration per round) instead of growing new ones, so it needs no
-    // builder state.
-    let mut plan = if params.process_type == ProcessType::Update {
-        RoundPlan::Refresh(model.take_trees())
-    } else {
-        RoundPlan::Grow(prepare_builder(params, dtrain, objective.const_hess())?)
-    };
-    // Continued training numbers its rounds after the model's iterations, so
-    // the per-round RNG streams continue where the earlier run stopped.
-    let start_iteration = model.num_boost_rounds();
-    let parallel = params.num_parallel_tree;
-    // Opt-in reuse penalties: the features and thresholds the ensemble already
-    // uses, extended by every tree the loop grows. `None` on the default path.
-    let mut reuse = ReuseSet::from_params(params, n_features, model.trees());
-
-    // Incremental margin caches (length rows × n_out), starting from the
-    // model's full current predictions. A dataset's per-instance
-    // `base_margin`, when present, overrides the per-output intercepts.
-    let mut train_margin = model.margin_from_trees(dtrain, 0..model.num_trees());
-    let mut eval_margins: Vec<Vec<f32>> = evals
-        .iter()
-        .map(|(d, _)| model.margin_from_trees(d, 0..model.num_trees()))
-        .collect();
-
-    // A caller-supplied metric replaces the configured/default metric list.
-    let metrics = match metric_override {
-        Some(m) => vec![m],
-        None => configured_metrics(params, objective)?,
-    };
-    if dtrain.n_targets() > 1
-        && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
-    {
-        return Err(HessboostError::invalid_param(
-            "eval_metric",
-            format!(
-                "metric `{}` does not support multi-target labels",
-                metric.name()
-            ),
-        ));
-    }
-    for (data, name) in evals {
-        let info = data.info();
-        for metric in &metrics {
-            metric
-                .validate_info(&info)
-                .and_then(|()| check_prediction_width(metric.as_ref(), &info, n_out))
-                .map_err(|error| name_dataset(error, name))?;
-        }
-    }
-
-    let run = TrainContext {
+/// `process_type=update`: refresh iteration `iteration`'s trees of `queue`
+/// output by output, from the gradients of the already refreshed ones, and
+/// re-append them.
+fn refresh_round(
+    run: &TrainContext,
+    queue: &mut [RegTree],
+    iteration: usize,
+    state: &mut RoundState,
+) -> Result<()> {
+    let TrainContext {
         params,
         dtrain,
-        info: &info,
+        info,
         objective,
-    };
-    let mut gpair = vec![GradPair::default(); n * n_out];
-    // Per-output gradient buffer reused across classes (single-output aliases it).
-    let mut gpair_k = vec![GradPair::default(); n];
-    if start_iteration > 0
-        && let RoundPlan::Grow(prepared) = &plan
-    {
-        prepared.resume_approx_cache(
-            &run,
-            &model.margin_from_trees(dtrain, 0..0),
-            &mut gpair,
-            &mut gpair_k,
-            n_out,
-        )?;
+    } = *run;
+    let n_out = objective.n_outputs();
+    let parallel = params.num_parallel_tree;
+    // Gradients from the already refreshed iterations; iteration `i`'s trees
+    // are then refreshed in place, output by output.
+    objective.gradient_info(&state.margins.train, info, &mut state.gpair);
+    multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
+    let per_iteration = n_out * parallel;
+    for slot in 0..per_iteration {
+        let k = slot / parallel;
+        let gk = gather_output(&state.gpair, &mut state.gpair_k, n_out, k);
+        let mut tree = std::mem::replace(
+            &mut queue[iteration * per_iteration + slot],
+            RegTree::with_root(0.0),
+        );
+        refresh_tree(&mut tree, dtrain, gk, params, tree_eta(params));
+        state.margins.add_tree(&tree, TreeOutput::Scalar(k), None);
+        state.model.push_tree_weighted(tree, 1.0);
     }
-    let mut history: Vec<RoundEval> = Vec::new();
+    Ok(())
+}
 
-    // Early-stopping bookkeeping.
-    let maximize = metrics.last().is_some_and(|m| m.maximize());
-    let mut best_score = if maximize {
-        f64::NEG_INFINITY
+/// Grow one iteration's scalar-leaf trees (gbtree or DART) with `prepared`
+/// and append them.
+fn grow_round(
+    run: &TrainContext,
+    prepared: &Prepared,
+    iteration: usize,
+    state: &mut RoundState,
+) -> Result<()> {
+    let TrainContext {
+        params,
+        dtrain,
+        objective,
+        ..
+    } = *run;
+    let n = dtrain.n_rows();
+    let n_out = objective.n_outputs();
+    let parallel = params.num_parallel_tree;
+    // 1. Gradients from the current margins (all outputs at once), DART's
+    //    from the ensemble minus this round's dropout set.
+    let (mut rng, dropped) = round_gradients(
+        run,
+        &state.model,
+        iteration,
+        &state.margins.train,
+        &mut state.gpair,
+    );
+    multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
+    let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
+
+    // 2. Uniform row subsets, drawn before the trees and shared across the
+    //    per-output fits.
+    let row_subsets = iteration_row_subsets(n, params, prepared.samples_per_forest(), &mut rng);
+    // An output's gradient-based sample, when its whole forest shares one.
+    let mut forest_sample = None;
+    let grow = GrowRound {
+        run,
+        prepared,
+        gpair: &state.gpair,
+        n_out,
+        iteration,
+    };
+
+    // 3. `num_parallel_tree` trees per output from the same gradients,
+    //    output-major like XGBoost's layout.
+    let slots: Vec<TreeSlot> = (0..n_out * parallel)
+        .map(|slot| {
+            let row_subset = &row_subsets[(slot % parallel) % row_subsets.len()];
+            // Retaining the final row partitions replaces a per-row tree
+            // traversal of the raw feature matrix with one sequential pass
+            // per leaf (constant leaves only).
+            let capture_rows = matches!(prepared, Prepared::Hist { .. })
+                && dropped.is_none()
+                && row_subset.len() == n
+                && !gradient_sampling(params)
+                && !params.linear_tree;
+            TreeSlot {
+                output: slot / parallel,
+                parallel: slot % parallel,
+                rows: row_subset,
+                capture_rows,
+            }
+        })
+        .collect();
+    // The trees of an iteration share the round's gradients and do not read
+    // each other. Without gradient-based sampling or a reuse dictionary, each
+    // tree's RNG draws are its column sampler and rounding seed, drawn here
+    // in slot order as the sequential path draws them; the trees are then
+    // grown in parallel. A GPU backend stages one tree's gradients at a
+    // time, so it keeps the sequential path.
+    let trees: Vec<(RegTree, Vec<LeafRows>)> = if slots.len() > 1
+        && state.reuse.is_none()
+        && !gradient_sampling(params)
+        && params.device == Device::Cpu
+        && rayon::current_num_threads() > 1
+    {
+        // The first tree's cuts, before any tree reads them.
+        prepared.fill_approx_cache(
+            run,
+            gather_output(&state.gpair, &mut state.gpair_k, n_out, 0),
+        );
+        let draws: Vec<(ColumnSampler, u64)> = slots
+            .iter()
+            .map(|_| {
+                let sampler = make_column_sampler(dtrain, params, &mut rng);
+                (sampler, quantization_seed(params, &mut rng))
+            })
+            .collect();
+        slots
+            .par_iter()
+            .zip(draws)
+            .map(|(slot, (mut sampler, rounding_seed))| {
+                let mut scratch = if n_out > 1 {
+                    vec![GradPair::default(); n]
+                } else {
+                    Vec::new()
+                };
+                let gk = gather_output(&state.gpair, &mut scratch, n_out, slot.output);
+                let sample = TreeSample {
+                    gpair: gk,
+                    rows: slot.rows,
+                };
+                grow_sampled_tree(&grow, slot, sample, &mut sampler, rounding_seed, None)
+            })
+            .collect()
     } else {
-        f64::INFINITY
+        slots
+            .iter()
+            .map(|slot| {
+                fit_output_tree(
+                    &grow,
+                    slot,
+                    &mut state.gpair_k,
+                    &mut rng,
+                    &mut forest_sample,
+                    state.reuse.as_mut(),
+                )
+            })
+            .collect::<Result<_>>()?
     };
-    // The first iteration of this run, not of the model: when no score ever
-    // improves (a NaN metric), a continuation must not select an iteration
-    // of the initial model it was asked to extend.
-    let mut best_iter = start_iteration;
-    let mut rounds_since_improve = 0usize;
 
-    // `multi_strategy = multi_output_tree` grows vector-leaf trees when there
-    // is more than one output (a single output keeps scalar trees, as
-    // XGBoost's `LeafLength` does).
-    let vector_leaf = multi_output::vector_leaf(params, n_out);
+    for (slot, (tree, leaf_rows)) in slots.iter().zip(trees) {
+        // DART's gradients come from the ensemble, not the margin caches
+        // (`finish_dart` recomputes the eval ones).
+        if dropped.is_none() {
+            // Row partitions already identify training leaves when every row
+            // participated in histogram construction.
+            let captured = (!leaf_rows.is_empty()).then_some(leaf_rows.as_slice());
+            state
+                .margins
+                .add_tree(&tree, TreeOutput::Scalar(slot.output), captured);
+        }
+        state.model.push_tree_weighted(tree, weight);
+    }
+    if let Some(dropped) = &dropped {
+        finish_dart(&mut state.model, params, dropped, &mut state.margins);
+    }
+    Ok(())
+}
 
-    for round in 0..num_boost_round {
-        let iteration = start_iteration + round;
-        match &mut plan {
-            RoundPlan::Grow(Prepared::Hist { index: ghist, .. }) if vector_leaf => {
-                multi_output::boost_round(
-                    &multi_output::VectorRound { run, ghist, evals },
-                    &mut model,
-                    iteration,
-                    &mut train_margin,
-                    &mut eval_margins,
-                    &mut gpair,
-                )?;
-            }
-            RoundPlan::Refresh(queue) => {
-                // Gradients from the already refreshed iterations; iteration
-                // `i`'s trees are then refreshed in place, output by output.
-                objective.gradient_info(&train_margin, &info, &mut gpair);
-                multi_output::reject_split_gradient(objective, iteration, &gpair)?;
-                let per_iteration = n_out * parallel;
-                for slot in 0..per_iteration {
-                    let k = slot / parallel;
-                    let gk = gather_output(&gpair, &mut gpair_k, n_out, k);
-                    let mut tree = std::mem::replace(
-                        &mut queue[iteration * per_iteration + slot],
-                        RegTree::with_root(0.0),
-                    );
-                    refresh_tree(&mut tree, dtrain, gk, params, tree_eta(params));
-                    update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
-                    for (ei, (d, _)) in evals.iter().enumerate() {
-                        update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
-                    }
-                    model.push_tree_weighted(tree, 1.0);
-                }
-            }
-            RoundPlan::Grow(prepared) => {
-                // 1. Gradients from the current margins (all outputs at once),
-                //    DART's from the ensemble minus this round's dropout set.
-                let (mut rng, dropped) =
-                    round_gradients(&run, &model, iteration, &train_margin, &mut gpair);
-                multi_output::reject_split_gradient(objective, iteration, &gpair)?;
-                let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
+/// The eval sets' metrics and the buffer their predictions are transformed
+/// in, reused every round.
+struct EvalPlan<'a> {
+    evals: &'a [EvalSet<'a>],
+    infos: Vec<MetaInfo<'a>>,
+    metrics: Vec<Box<dyn Metric>>,
+    preds: Vec<f32>,
+}
 
-                // 2. Uniform row subsets, drawn before the trees and shared
-                //    across the per-output fits.
-                let row_subsets = iteration_row_subsets(n, params, prepared, &mut rng);
-                // An output's gradient-based sample, when its whole forest
-                // shares one.
-                let mut forest_sample = None;
-                let grow = GrowRound {
-                    run: &run,
-                    prepared,
-                    gpair: &gpair,
-                    n_out,
-                    iteration,
-                };
-
-                // 3. `num_parallel_tree` trees per output from the same
-                //    gradients, output-major like XGBoost's layout.
-                let slots: Vec<TreeSlot> = (0..n_out * parallel)
-                    .map(|slot| {
-                        let row_subset = &row_subsets[(slot % parallel) % row_subsets.len()];
-                        // Retaining the final row partitions replaces a per-row
-                        // tree traversal of the raw feature matrix with one
-                        // sequential pass per leaf (constant leaves only).
-                        let capture_rows = matches!(prepared, Prepared::Hist { .. })
-                            && dropped.is_none()
-                            && row_subset.len() == n
-                            && !gradient_sampling(params)
-                            && !params.linear_tree;
-                        TreeSlot {
-                            output: slot / parallel,
-                            parallel: slot % parallel,
-                            rows: row_subset,
-                            capture_rows,
-                        }
-                    })
-                    .collect();
-                // The trees of an iteration share the round's gradients and
-                // do not read each other. Without gradient-based sampling or
-                // a reuse dictionary, each tree's RNG draws are its column
-                // sampler and rounding seed, drawn here in slot order as the
-                // sequential path draws them; the trees are then grown in
-                // parallel. A GPU backend stages one tree's gradients at a
-                // time, so it keeps the sequential path.
-                let trees: Vec<(RegTree, Vec<LeafRows>)> = if slots.len() > 1
-                    && reuse.is_none()
-                    && !gradient_sampling(params)
-                    && params.device == Device::Cpu
-                    && rayon::current_num_threads() > 1
-                {
-                    // The first tree's cuts, before any tree reads them.
-                    prepared.fill_approx_cache(&run, gather_output(&gpair, &mut gpair_k, n_out, 0));
-                    let draws: Vec<(ColumnSampler, u64)> = slots
-                        .iter()
-                        .map(|_| {
-                            let sampler = make_column_sampler(dtrain, params, &mut rng);
-                            (sampler, quantization_seed(params, &mut rng))
-                        })
-                        .collect();
-                    slots
-                        .par_iter()
-                        .zip(draws)
-                        .map(|(slot, (mut sampler, rounding_seed))| {
-                            let mut scratch = if n_out > 1 {
-                                vec![GradPair::default(); n]
-                            } else {
-                                Vec::new()
-                            };
-                            let gk = gather_output(&gpair, &mut scratch, n_out, slot.output);
-                            let sample = TreeSample {
-                                gpair: gk,
-                                rows: slot.rows,
-                            };
-                            grow_sampled_tree(
-                                &grow,
-                                slot,
-                                sample,
-                                &mut sampler,
-                                rounding_seed,
-                                None,
-                            )
-                        })
-                        .collect()
-                } else {
-                    slots
-                        .iter()
-                        .map(|slot| {
-                            fit_output_tree(
-                                &grow,
-                                slot,
-                                &mut gpair_k,
-                                &mut rng,
-                                &mut forest_sample,
-                                reuse.as_mut(),
-                            )
-                        })
-                        .collect::<Result<_>>()?
-                };
-
-                for (slot, (tree, leaf_rows)) in slots.iter().zip(trees) {
-                    let k = slot.output;
-                    // DART's gradients come from the ensemble, not the margin
-                    // caches (`finish_dart` recomputes the eval ones).
-                    if dropped.is_none() {
-                        // Row partitions already identify training leaves when
-                        // every row participated in histogram construction.
-                        if leaf_rows.is_empty() {
-                            update_tree_margins(&tree, dtrain, &mut train_margin, n_out, k);
-                        } else {
-                            apply_leaf_rows(&tree, &leaf_rows, &mut train_margin, n_out, k);
-                        }
-                        for (ei, (d, _)) in evals.iter().enumerate() {
-                            update_tree_margins(&tree, d, &mut eval_margins[ei], n_out, k);
-                        }
-                    }
-                    model.push_tree_weighted(tree, weight);
-                }
-                if let Some(dropped) = &dropped {
-                    finish_dart(&mut model, params, dropped, evals, &mut eval_margins);
-                }
+impl<'a> EvalPlan<'a> {
+    /// The metrics every eval set reports (`metric_override`, else the
+    /// configured or default ones), refusing a metric that cannot read the
+    /// label layout or the model's prediction width.
+    fn new(
+        params: &TrainingParams,
+        objective: &dyn Objective,
+        metric_override: Option<Box<dyn Metric>>,
+        evals: &'a [EvalSet<'a>],
+        n_targets: usize,
+    ) -> Result<Self> {
+        let n_out = objective.n_outputs();
+        let metrics = match metric_override {
+            Some(m) => vec![m],
+            None => configured_metrics(params, objective)?,
+        };
+        if n_targets > 1
+            && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
+        {
+            return Err(HessboostError::invalid_param(
+                "eval_metric",
+                format!(
+                    "metric `{}` does not support multi-target labels",
+                    metric.name()
+                ),
+            ));
+        }
+        let infos: Vec<MetaInfo> = evals.iter().map(|(data, _)| data.info()).collect();
+        for (info, (_, name)) in infos.iter().zip(evals) {
+            for metric in &metrics {
+                metric
+                    .validate_info(info)
+                    .and_then(|()| check_prediction_width(metric.as_ref(), info, n_out))
+                    .map_err(|error| name_dataset(error, name))?;
             }
         }
+        Ok(EvalPlan {
+            evals,
+            infos,
+            metrics,
+            preds: Vec::new(),
+        })
+    }
 
-        // 4. Evaluate metrics on each eval set.
-        if !evals.is_empty() {
-            let mut scores = Vec::new();
-            let mut last_metric_value = 0.0;
-            for (ei, (d, name)) in evals.iter().enumerate() {
-                let mut preds = eval_margins[ei].clone();
-                objective.eval_transform(&mut preds);
-                let d_info = d.info();
-                for m in &metrics {
-                    let v = m.eval_info(&preds, &d_info);
-                    scores.push((name.to_string(), m.name().to_string(), v));
-                    last_metric_value = v;
-                }
-            }
-            history.push(RoundEval { iteration, scores });
+    /// Whether the early-stopping metric (the last one) is maximized.
+    fn maximize(&self) -> bool {
+        self.metrics.last().is_some_and(|m| m.maximize())
+    }
 
-            // 5. Early stopping on the last metric of the last eval set.
-            if let Some(patience) = early_stopping_rounds {
-                let improved = if maximize {
-                    last_metric_value > best_score
-                } else {
-                    last_metric_value < best_score
-                };
-                if improved {
-                    best_score = last_metric_value;
-                    best_iter = iteration;
-                    rounds_since_improve = 0;
-                } else {
-                    rounds_since_improve += 1;
-                    if rounds_since_improve >= patience {
-                        break;
-                    }
-                }
+    /// Evaluate every metric on every eval set's `margins`, append the
+    /// scores to `history`, and return the last one (the early-stopping
+    /// metric of the last eval set).
+    fn record(
+        &mut self,
+        objective: &dyn Objective,
+        iteration: usize,
+        margins: &MarginCaches,
+        history: &mut Vec<RoundEval>,
+    ) -> f64 {
+        let mut scores = Vec::with_capacity(self.evals.len() * self.metrics.len());
+        let mut last_metric_value = 0.0;
+        for (ei, (_, name)) in self.evals.iter().enumerate() {
+            self.preds.clear();
+            self.preds.extend_from_slice(&margins.evals[ei]);
+            objective.eval_transform(&mut self.preds);
+            for m in &self.metrics {
+                let v = m.eval_info(&self.preds, &self.infos[ei]);
+                scores.push((name.to_string(), m.name().to_string(), v));
+                last_metric_value = v;
             }
+        }
+        history.push(RoundEval { iteration, scores });
+        last_metric_value
+    }
+}
+
+/// XGBoost's early-stopping rule: a round improves on the best score so
+/// far only strictly (so a NaN score never does), and training stops after
+/// `patience` rounds without improvement. Shared by [`Trainer`] and
+/// [`CrossValidation`](crate::training::CrossValidation).
+pub(crate) struct EarlyStopping {
+    patience: usize,
+    maximize: bool,
+    best_score: f64,
+    best_round: usize,
+    since_improved: usize,
+}
+
+impl EarlyStopping {
+    /// Refuse early stopping with a patience of zero rounds.
+    pub(crate) fn check_patience(rounds: Option<usize>) -> Result<()> {
+        if rounds == Some(0) {
+            return Err(HessboostError::invalid_param(
+                "early_stopping_rounds",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Tracking that starts at round `first_round`, which stays the best
+    /// one when no score ever improves.
+    pub(crate) fn new(patience: usize, maximize: bool, first_round: usize) -> Self {
+        EarlyStopping {
+            patience,
+            maximize,
+            best_score: if maximize {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            },
+            best_round: first_round,
+            since_improved: 0,
         }
     }
 
-    // XGBoost records the best iteration whenever early stopping is on, not
-    // only when patience runs out.
-    let mut best_round_score = None;
-    if early_stopping_rounds.is_some()
-        && let Some(first) = history.first()
-    {
-        let round = &history[best_iter - first.iteration];
-        best_round_score = round.scores.last().map(|&(_, _, v)| v);
-        model.set_best_iteration(Some(best_iter));
+    /// Record `round`'s `score`; `true` once patience has run out.
+    pub(crate) fn observe(&mut self, round: usize, score: f64) -> bool {
+        let improved = if self.maximize {
+            score > self.best_score
+        } else {
+            score < self.best_score
+        };
+        if improved {
+            self.best_score = score;
+            self.best_round = round;
+            self.since_improved = 0;
+            false
+        } else {
+            self.since_improved += 1;
+            self.since_improved >= self.patience
+        }
     }
 
-    Ok(TrainResult {
-        model,
-        history,
-        best_score: best_round_score,
-    })
+    /// The best round so far.
+    pub(crate) fn best_round(&self) -> usize {
+        self.best_round
+    }
 }
 
 /// The metrics training evaluates without a custom metric:
@@ -1151,36 +1336,148 @@ pub(super) fn for_each_row_margins(
     }
 }
 
-/// Add one tree's predictions to one output column.
-fn update_tree_margins(
+/// Which margins of a row a tree adds to.
+#[derive(Clone, Copy)]
+pub(super) enum TreeOutput {
+    /// A scalar-leaf tree feeding one output.
+    Scalar(usize),
+    /// A vector-leaf tree feeding every output.
+    Vector,
+}
+
+/// The margins training keeps current, `[row][n_out]`: the training
+/// matrix's and each eval set's, starting from the model's full current
+/// predictions (a dataset's per-instance `base_margin`, when present,
+/// overrides the per-output intercepts). Each new tree adds to every cell
+/// once, so every cell sums its trees in ensemble order.
+pub(super) struct MarginCaches<'a> {
+    dtrain: &'a DMatrix,
+    eval_sets: &'a [EvalSet<'a>],
+    n_out: usize,
+    /// The training matrix's margins.
+    pub(super) train: Vec<f32>,
+    /// Each eval set's margins, in eval-set order.
+    pub(super) evals: Vec<Vec<f32>>,
+}
+
+impl<'a> MarginCaches<'a> {
+    pub(super) fn new(
+        model: &BoostedModel,
+        dtrain: &'a DMatrix,
+        eval_sets: &'a [EvalSet<'a>],
+    ) -> Self {
+        let trees = 0..model.num_trees();
+        MarginCaches {
+            dtrain,
+            eval_sets,
+            n_out: model.n_outputs(),
+            train: model.margin_from_trees(dtrain, trees.clone()),
+            evals: eval_sets
+                .iter()
+                .map(|(d, _)| model.margin_from_trees(d, trees.clone()))
+                .collect(),
+        }
+    }
+
+    /// Add `tree`'s predictions to every cache. `leaf_rows`, when given,
+    /// lists the leaf of every training row and replaces the training
+    /// matrix's traversal.
+    pub(super) fn add_tree(
+        &mut self,
+        tree: &RegTree,
+        output: TreeOutput,
+        leaf_rows: Option<&[LeafRows]>,
+    ) {
+        match leaf_rows {
+            Some(leaf_rows) => {
+                apply_leaf_rows(tree, leaf_rows, &mut self.train, self.n_out, output);
+            }
+            None => add_tree_margins(tree, self.dtrain, &mut self.train, self.n_out, output),
+        }
+        for (margins, (d, _)) in self.evals.iter_mut().zip(self.eval_sets) {
+            add_tree_margins(tree, d, margins, self.n_out, output);
+        }
+    }
+
+    /// Recompute the eval caches from `model` (after a DART rescaling, which
+    /// makes them non-additive).
+    pub(super) fn recompute_evals(&mut self, model: &BoostedModel) {
+        for (margins, (d, _)) in self.evals.iter_mut().zip(self.eval_sets) {
+            *margins = model.margin_from_trees(d, 0..model.num_trees());
+        }
+    }
+}
+
+/// Add `tree`'s prediction of every row of `data` to `margins`.
+fn add_tree_margins(
     tree: &RegTree,
     data: &DMatrix,
     margins: &mut [f32],
     n_out: usize,
-    output: usize,
+    output: TreeOutput,
 ) {
-    for_each_row_margins(margins, n_out, |(row, margin)| {
-        margin[output] += tree.predict_row(data, row);
-    });
+    match output {
+        TreeOutput::Scalar(k) => for_each_row_margins(margins, n_out, |(row, margin)| {
+            margin[k] += tree.predict_row(data, row);
+        }),
+        TreeOutput::Vector => for_each_row_margins(margins, n_out, |(row, margin)| {
+            let leaf = tree.leaf_id_with(|f| data.get(row, f as usize));
+            for (m, &v) in margin.iter_mut().zip(tree.leaf_vector(leaf)) {
+                *m += v;
+            }
+        }),
+    }
 }
 
-/// Add each leaf's value to the margins of the rows that reached it. Leaf row
-/// lists are ascending, so each parallel row chunk locates its slice of every
-/// leaf by binary search. The per-row addition order is unchanged.
+/// Add each leaf's value (or vector) to the margins of the training rows
+/// that reached it.
 fn apply_leaf_rows(
     tree: &RegTree,
     leaf_rows: &[LeafRows],
     margins: &mut [f32],
     n_out: usize,
-    output: usize,
+    output: TreeOutput,
+) {
+    match output {
+        TreeOutput::Scalar(k) => apply_leaf_values(
+            leaf_rows,
+            margins,
+            n_out,
+            |node| tree.node(node).leaf_value,
+            |margins, base, value| margins[base + k] += value,
+        ),
+        TreeOutput::Vector => apply_leaf_values(
+            leaf_rows,
+            margins,
+            n_out,
+            |node| tree.leaf_vector(node),
+            |margins, base, value: &[f32]| {
+                for (m, &v) in margins[base..base + n_out].iter_mut().zip(value) {
+                    *m += v;
+                }
+            },
+        ),
+    }
+}
+
+/// `add(margins, row * n_out, value(leaf))` for every row of every leaf of
+/// `leaf_rows`, in parallel row chunks for large inputs. Leaf row lists are
+/// ascending, so each chunk locates its slice of every leaf by binary
+/// search; each row still receives one addition per tree.
+fn apply_leaf_values<V: Copy + Send + Sync>(
+    leaf_rows: &[LeafRows],
+    margins: &mut [f32],
+    n_out: usize,
+    value: impl Fn(usize) -> V + Sync,
+    add: impl Fn(&mut [f32], usize, V) + Sync,
 ) {
     const CHUNK_ROWS: usize = 8192;
     let n = margins.len() / n_out;
     if n < 2 * CHUNK_ROWS || rayon::current_num_threads() <= 1 {
         for leaf in leaf_rows {
-            let value = tree.node(leaf.node).leaf_value;
+            let v = value(leaf.node);
             for &row in &leaf.rows {
-                margins[row as usize * n_out + output] += value;
+                add(margins, row as usize * n_out, v);
             }
         }
         return;
@@ -1192,11 +1489,11 @@ fn apply_leaf_rows(
             let first = (chunk * CHUNK_ROWS) as u32;
             let last = first + (margins.len() / n_out) as u32;
             for leaf in leaf_rows {
-                let value = tree.node(leaf.node).leaf_value;
+                let v = value(leaf.node);
                 let start = leaf.rows.partition_point(|&row| row < first);
                 let end = start + leaf.rows[start..].partition_point(|&row| row < last);
                 for &row in &leaf.rows[start..end] {
-                    margins[(row - first) as usize * n_out + output] += value;
+                    add(margins, (row - first) as usize * n_out, v);
                 }
             }
         });
@@ -1285,17 +1582,14 @@ pub(super) fn finish_dart(
     model: &mut BoostedModel,
     params: &TrainingParams,
     drop_indices: &[usize],
-    evals: &[EvalSet],
-    eval_margins: &mut [Vec<f32>],
+    margins: &mut MarginCaches,
 ) {
     let k = drop_indices.len() as f32;
     let factor = k / (k + params.eta as f32);
     for &i in drop_indices {
         model.scale_tree_weight(i, factor);
     }
-    for (margins, (d, _)) in eval_margins.iter_mut().zip(evals) {
-        *margins = model.margin_from_trees(d, 0..model.num_trees());
-    }
+    margins.recompute_evals(model);
 }
 
 /// Borrow the gradient slice for output `k`: the whole buffer for
@@ -1452,18 +1746,19 @@ pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut Rng) -> V
 }
 
 /// One iteration's uniform row subsets, drawn before its trees: one per
-/// parallel tree, or a single subset for the whole forest under `approx`
-/// ([`Prepared::samples_per_forest`]) or when there is no uniform sampling
-/// (every tree then reads all rows, and [`sample_rows`] draws nothing).
-/// Parallel tree `p` uses entry `p % len`, shared across its per-output fits.
-fn iteration_row_subsets(
+/// parallel tree, or a single subset for the whole forest when
+/// `per_forest` (`approx`, [`Prepared::samples_per_forest`]) or when there is
+/// no uniform sampling (every tree then reads all rows, and [`sample_rows`]
+/// draws nothing). Parallel tree `p` uses entry `p % len`, shared across its
+/// per-output fits.
+pub(super) fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
-    prepared: &Prepared,
+    per_forest: bool,
     rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
     let uniform = params.subsample < 1.0 && params.sampling_method == SamplingMethod::Uniform;
-    let draws = if prepared.samples_per_forest() || !uniform {
+    let draws = if per_forest || !uniform {
         1
     } else {
         params.num_parallel_tree
@@ -1659,10 +1954,93 @@ mod tests {
                 for row in 0..n {
                     expected[row * outputs + output] += tree.predict_row(&data, row);
                 }
-                pool.install(|| update_tree_margins(&tree, &data, &mut actual, outputs, output));
+                pool.install(|| {
+                    add_tree_margins(
+                        &tree,
+                        &data,
+                        &mut actual,
+                        outputs,
+                        TreeOutput::Scalar(output),
+                    );
+                });
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn chunked_leaf_rows_match_the_serial_traversal() {
+        // Enough rows for the chunked parallel path (two 8192-row chunks
+        // and a partial third); leaves interleave across chunk boundaries.
+        let n = 20_000;
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 13 == 0 {
+                    f32::NAN
+                } else {
+                    (i % 7) as f32
+                }
+            })
+            .collect();
+        let data = DMatrix::from_dense(&x, n, 1).unwrap();
+        let leaf_rows_of = |tree: &RegTree| {
+            let mut leaves: Vec<LeafRows> = Vec::new();
+            for row in 0..n {
+                let node = tree.leaf_id_with(|f| data.get(row, f as usize));
+                match leaves.iter_mut().find(|l| l.node == node) {
+                    Some(leaf) => leaf.rows.push(row as u32),
+                    None => leaves.push(LeafRows {
+                        node,
+                        rows: vec![row as u32],
+                    }),
+                }
+            }
+            leaves
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let start = |outputs: usize| -> Vec<f32> {
+            (0..n * outputs).map(|i| (i % 97) as f32 / 8.0).collect()
+        };
+
+        let mut scalar = RegTree::with_root(n as f32);
+        scalar.expand(
+            0,
+            SplitRule::numeric(0, 3.0, true),
+            ChildLeaf::new(-0.25, 1.0),
+            ChildLeaf::new(0.75, 1.0),
+        );
+        let leaves = leaf_rows_of(&scalar);
+        let mut expected = start(3);
+        add_tree_margins(&scalar, &data, &mut expected, 3, TreeOutput::Scalar(1));
+        let mut actual = start(3);
+        pool.install(|| apply_leaf_rows(&scalar, &leaves, &mut actual, 3, TreeOutput::Scalar(1)));
+        assert_eq!(actual, expected);
+
+        let mut vector = RegTree::with_vector_root(3, n as f32);
+        let (left, right) = vector.expand(
+            0,
+            SplitRule::numeric(0, 3.0, false),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(0.0, 1.0),
+        );
+        let (ll, lr) = vector.expand(
+            left,
+            SplitRule::numeric(0, 1.0, true),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(0.0, 1.0),
+        );
+        vector.set_leaf_vector(ll, &[0.5, -1.0, 0.125]);
+        vector.set_leaf_vector(lr, &[-0.75, 0.25, 2.0]);
+        vector.set_leaf_vector(right, &[1.5, 0.0625, -0.5]);
+        let leaves = leaf_rows_of(&vector);
+        let mut expected = start(3);
+        add_tree_margins(&vector, &data, &mut expected, 3, TreeOutput::Vector);
+        let mut actual = start(3);
+        pool.install(|| apply_leaf_rows(&vector, &leaves, &mut actual, 3, TreeOutput::Vector));
+        assert_eq!(actual, expected);
     }
 
     /// Squared error around `y` with fixed, per-output Hessians: output 0

@@ -57,3 +57,13 @@ pub fn rmse(model: &BoostedModel, data: &DMatrix) -> f64 {
         .sum();
     (sse / labels.len() as f64).sqrt()
 }
+
+/// Run `f` in a fresh Rayon pool of `threads` threads (thread-count
+/// determinism checks).
+pub fn with_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+        .install(f)
+}

@@ -154,11 +154,9 @@ fn training_is_independent_of_the_thread_count() {
         .build()
         .unwrap();
     let train_on = |threads| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap()
-            .install(|| train(&params, &data, 2).unwrap().to_bytes().unwrap())
+        common::with_threads(threads, || {
+            train(&params, &data, 2).unwrap().to_bytes().unwrap()
+        })
     };
     let serial = train_on(1);
     for threads in [2, 4, 8] {

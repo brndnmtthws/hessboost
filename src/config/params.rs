@@ -169,6 +169,17 @@ pub enum MultiStrategy {
     /// One tree per round whose leaves hold a vector of all outputs
     /// (vector-leaf trees; `tree_method = hist` only). With a single output
     /// it trains scalar trees, like XGBoost.
+    ///
+    /// Vector-leaf trees are refused by the options that replace or bypass
+    /// the XGBoost split search: symmetric growth, the reuse penalties,
+    /// quantized gradients, `extra_trees`, `path_smooth`, `linear_tree`,
+    /// budget mode ([`training::budget`](crate::training::budget)), and a
+    /// GPU [`device`](TrainingParams::device). The refresh updater
+    /// (`process_type = update`) and the compact format
+    /// ([`model::compact`](crate::model::compact)) refuse vector-leaf
+    /// models. Reduced split gradients
+    /// ([`Objective::split_gradient`](crate::objective::Objective::split_gradient))
+    /// cannot be combined with monotone constraints.
     MultiOutputTree,
 }
 
@@ -378,6 +389,12 @@ pub struct TrainingParams {
     pub interaction_constraints: Vec<Vec<u32>>,
     /// Trees grown per output per round (boosted random forests; in
     /// `1..=65536`). XGBoost `num_parallel_tree`. `gblinear` needs `1`.
+    ///
+    /// Every tree of a round's forest grows from the same gradients, draws
+    /// its own column sample, and has its leaves shrunk by
+    /// `eta / num_parallel_tree`. Under `hist` and `exact` each tree also
+    /// draws its own row sample; under `approx` the forest shares one, as
+    /// XGBoost's approx updater does.
     pub num_parallel_tree: usize,
     /// Row subsampling method. XGBoost `sampling_method`.
     pub sampling_method: SamplingMethod,
@@ -396,7 +413,8 @@ pub struct TrainingParams {
     /// numerical feature is scored at one random bin boundary per node, drawn
     /// uniformly between the node's lowest and highest occupied bin, and every
     /// categorical feature at one random prefix of its gradient-ordered
-    /// categories. Requires the histogram builder (`hist`/`approx`).
+    /// categories. Requires the histogram builder (`hist`/`approx`) and one
+    /// output per tree; refused with `grow_policy = symmetric`.
     pub extra_trees: bool,
     /// Seed of the [`extra_trees`](Self::extra_trees) threshold draws,
     /// combined with the per-tree seed derived from [`seed`](Self::seed).
@@ -406,13 +424,18 @@ pub struct TrainingParams {
     /// Each child's output is pulled toward its parent's:
     /// `w = w_raw·(n/s)/(n/s + 1) + w_parent/(n/s + 1)` with `n` the child's
     /// row count, and splits are scored at the smoothed outputs. Requires the
-    /// histogram builder (`hist`/`approx`).
+    /// histogram builder (`hist`/`approx`) and one output per tree; refused
+    /// with `grow_policy = symmetric`.
     pub path_smooth: f64,
     /// Fit a ridge-regularized linear model in every leaf (LightGBM
     /// `linear_tree`) on the numerical features split on along the leaf's
     /// path; rows with a missing value in any of them predict the constant
     /// leaf value. The first boosting round keeps constant leaves. Requires
-    /// the histogram builder (`hist`/`approx`).
+    /// the histogram builder (`hist`/`approx`) and one output per tree;
+    /// refused with `reg:absoluteerror` and `reg:quantileerror`, whose leaves
+    /// are re-estimated after growth. Linear-leaf models use the native
+    /// formats only: SHAP, XGBoost export, and the compact format refuse
+    /// them.
     pub linear_tree: bool,
     /// L2 penalty on the leaf linear models' slopes (not their intercepts),
     /// `>= 0`. LightGBM `linear_lambda`.
@@ -452,7 +475,10 @@ pub struct TrainingParams {
     /// default) disables it. Pair with
     /// [`BoostedModel::to_compact_bytes`](crate::model::BoostedModel::to_compact_bytes),
     /// whose dictionaries shrink as features and thresholds are reused. The
-    /// paper's `toad_penalty_feature`.
+    /// paper's `toad_penalty_feature`. Both penalties act in the XGBoost
+    /// split searches of every tree method, and are refused with
+    /// `extra_trees`, `path_smooth`, `grow_policy = symmetric`, and
+    /// `multi_strategy = multi_output_tree`.
     pub toad_penalty_feature: f64,
     /// Penalty `ξ` subtracted from the loss change of a split at a threshold
     /// (or categorical left set) not yet used for its feature anywhere in the

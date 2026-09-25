@@ -82,12 +82,12 @@ pub trait HistogramBackend: Send + Sync {
 ///
 /// Each bin's `f64` sum is a function of the rows alone, never of the
 /// thread count, so the serial and parallel builds agree bit for bit. A node
-/// below [`PARALLEL_THRESHOLD`] rows, and a column-major index swept by
-/// feature (a contiguous row range, or any subset of an index of at most
-/// [`GATHER_MAX_ROWS`] rows), add each bin's rows in ascending order: the
-/// plain chain XGBoost's single-threaded build forms. Every other node (a
-/// sparse index, or a row subset of a larger dense one) sums fixed blocks
-/// of about [`ROWS_PER_TASK`] rows, each in row order from zero, and adds
+/// below 8,192 rows, and a column-major index swept by feature (a
+/// contiguous row range, or any subset of an index of at most 2^18 rows),
+/// add each bin's rows in ascending order: the plain chain XGBoost's
+/// single-threaded build forms. Every other node (a sparse index, or a row
+/// subset of a larger dense one) sums fixed blocks of about 4,096 rows,
+/// each in row order from zero, and adds
 /// the block partials to the first block's in block order. Outside the
 /// range where `f64` sums are exact (`backend/exact_sum.rs`) that can round
 /// differently from the chain, which XGBoost's threaded build does too

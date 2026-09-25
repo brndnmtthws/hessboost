@@ -4,9 +4,10 @@ hessboost is a Rust reimplementation of XGBoost gradient boosting: one
 library crate, with no C/C++ or FFI apart from the `zstd` crate (the
 official libzstd, compressing native model files) and, on macOS with the
 opt-in `metal` feature, the `objc2-metal` bindings to Apple's Metal
-framework. User docs are `README.md`, the rustdoc (`src/lib.rs` and
-module docs), `examples/`, and `docs/performance.md`; there is no
-changelog file (release notes are written when releasing).
+framework. User docs are `README.md` (a high-level overview: what the crate
+offers, getting started, caveats; details go in the rustdoc), the rustdoc
+(`src/lib.rs` and module docs), `examples/`, and `docs/performance.md`;
+there is no changelog file (release notes are written when releasing).
 This file covers working on the code.
 
 ## Toolchain
@@ -306,7 +307,7 @@ nouns there.
   (`TrainingParams::refuse_changes_from`), so a non-default value of any
   other field, including one added later, is refused automatically.
 - **Parity-fixed options:** options that XGBoost has but hessboost supports
-  at one setting (README, "Not implemented") are not `TrainingParams`
+  at one setting (`lib.rs`, "Not implemented") are not `TrainingParams`
   fields. `tests/parity.rs` (`expect_fixed`) fails a fixture that sets
   `updater`, `feature_selector`, or `lambdarank_pair_method` to anything
   else.
@@ -418,9 +419,9 @@ forest; XGBoost export, SHAP, and the compact format refuse them.
 ## When changing behavior
 
 Update, in the same change: the rustdoc of the touched items, the
-README feature lists (and "Not implemented"), the `lib.rs` "What's here"
-list, this file's layout and invariants, and the examples that exercise
-it.
+README's feature lists and caveats, the `lib.rs` "What's here" and "Not
+implemented" lists, this file's layout and invariants, and the examples
+that exercise it.
 New options need a `TrainingParams` field, builder setter, and validation;
 beyond-XGBoost options must default to off.
 

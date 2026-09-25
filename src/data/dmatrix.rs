@@ -334,6 +334,11 @@ impl DMatrix {
 
     /// Attach a per-instance base margin (raw prediction offset, `len == n_rows`
     /// for single-output objectives).
+    ///
+    /// The margin replaces the model intercept for this matrix's rows, in
+    /// training, evaluation, and prediction (XGBoost `base_margin`), e.g. to
+    /// boost from a pretrained model's logits. It is not saved with the
+    /// model: predicting on a matrix without one uses the intercept.
     pub fn with_base_margin(mut self, base_margin: &[f32]) -> Result<Self> {
         if base_margin.is_empty() || !base_margin.len().is_multiple_of(self.n_rows) {
             return Err(HessboostError::invalid_param(

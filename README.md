@@ -258,11 +258,8 @@ Predictions for multi-output models are row-major, `[row][output]`.
 - **Native formats:** a checksummed, zstd-compressed binary format
   (`save_binary` / `load_binary`) and JSON (`save_json` / `load_json`),
   both covering every model hessboost trains. Files written by 0.2.0
-  and later load in every later release. Native binary and JSON files from
-  0.1.x are refused: export such a model with 0.1.1's `save_xgboost_json`
-  and load it with `BoostedModel::load_xgboost_json` (gbtree and DART
-  models reload with identical predictions; retrain gblinear and
-  custom-objective models). A hand-written JSON document may leave out
+  and later load in every later release; native binary and JSON files from
+  0.1.x are refused. A hand-written JSON document may leave out
   objective parameters (the recorded objective's defaults apply) and a
   scalar tree's leaf fields; anything predictions depend on is required.
 - **XGBoost interchange:** import and export `gbtree` and DART models

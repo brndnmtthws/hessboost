@@ -6,7 +6,7 @@ official libzstd, compressing native model files) and, on macOS with the
 opt-in `metal` feature, the `objc2-metal` bindings to Apple's Metal
 framework. User docs are `README.md`, the rustdoc (`src/lib.rs` and
 module docs), `examples/`, and `docs/performance.md`; there is no
-changelog file (the git log and the release's pull-request list are it).
+changelog file (release notes are written when releasing).
 This file covers working on the code.
 
 ## Toolchain
@@ -415,8 +415,7 @@ forest; XGBoost export, SHAP, and the compact format refuse them.
 Update, in the same change: the rustdoc of the touched items, the
 README feature lists (and "Not implemented"), the `lib.rs` "What's here"
 list, this file's layout and invariants, and the examples that exercise
-it. Describe user-visible changes in the pull request: the release notes
-are the merged pull requests' titles.
+it.
 New options need a `TrainingParams` field, builder setter, and validation;
 beyond-XGBoost options must default to off.
 
@@ -425,6 +424,6 @@ beyond-XGBoost options must default to off.
 Bump `version` in `Cargo.toml`, write `tests/data/saved/<version>/` (see
 Formats), merge, then push a `v<version>` tag: `publish.yml` checks the
 tag against the crate version, runs the tests on all three platforms,
-publishes to crates.io, and creates the GitHub release (the pull requests
-since the previous tag, grouped by `.github/release.yml`) with a
-discussion.
+publishes to crates.io, and creates the GitHub release with a discussion.
+Its notes start as the pull requests since the previous tag (grouped by
+`.github/release.yml`); the release notes are written then, by hand.

@@ -105,8 +105,8 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, create_objective};
 use crate::training::train::{
-    check_num_class, initial_intercepts, new_model, reject_missing_param, validate_dataset,
-    validate_trained_model, with_thread_pool,
+    check_num_class, initial_intercepts, new_model, reject_feature_weights, reject_missing_param,
+    validate_dataset, validate_trained_model, with_thread_pool,
 };
 use crate::tree::builder::budget::{
     ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
@@ -322,36 +322,11 @@ fn reject_tuned_params(params: &TrainingParams) -> Result<()> {
     reference.base_score = params.base_score;
     reference.max_bin = params.max_bin;
     reference.nthread = params.nthread;
-    let (Ok(serde_json::Value::Object(set)), Ok(serde_json::Value::Object(allowed))) = (
-        serde_json::to_value(params),
-        serde_json::to_value(&reference),
-    ) else {
-        return Err(HessboostError::invalid_param(
-            "budget",
-            "training parameters could not be compared",
-        ));
-    };
-    let changed: Vec<&str> = set
-        .iter()
-        .filter(|(key, value)| allowed.get(*key) != Some(*value))
-        .map(|(key, _)| key.as_str())
-        .collect();
-    if changed.is_empty() {
-        Ok(())
-    } else {
-        Err(HessboostError::invalid_param(
-            "budget",
-            format!(
-                "budget mode derives the learning rate, tree shape, and round count itself; \
-                 leave {} at the default",
-                changed
-                    .iter()
-                    .map(|k| format!("`{k}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ))
-    }
+    params.refuse_changes_from(
+        &reference,
+        "budget",
+        "budget mode derives the learning rate, tree shape, and round count itself",
+    )
 }
 
 fn train_budget_inner(
@@ -362,12 +337,7 @@ fn train_budget_inner(
     config.validate()?;
     params.validate()?;
     reject_missing_param(params)?;
-    if dtrain.feature_weights().is_some() {
-        return Err(HessboostError::invalid_param(
-            "feature_weights",
-            "budget mode does not sample columns",
-        ));
-    }
+    reject_feature_weights(dtrain, "budget mode does not sample columns")?;
     let objective = create_objective(params, dtrain.n_targets())?;
     let n_out = objective.n_outputs();
     let loss_fn = match objective.pointwise_loss() {

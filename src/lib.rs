@@ -148,9 +148,10 @@
 //!     stub.
 //!
 //! Runnable examples live in the crate's `examples/` directory (e.g.
-//! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `metal` (`--features metal`, macOS)). Run one with
+//! `train_regression`, `binary_classification`, `multiclass`, `ranking`,
+//! `shap`, `model_io`, `custom_objective`, `constraints`, `conformal`,
+//! `compact_model`, `distributional`, `budget`, `ordered_target_stats`,
+//! `pfn_boost`, `metal` (`--features metal`, macOS)). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes

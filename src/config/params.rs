@@ -608,7 +608,39 @@ impl TrainingParams {
     }
 
     /// Validate mutually-consistent ranges. Called automatically before training.
+    ///
+    /// The checks run in a fixed order (numeric ranges, reuse penalties,
+    /// device, objective parameters, booster, tree shape, training modes,
+    /// tree options), so a configuration that breaks several rules always
+    /// reports the same one.
     pub fn validate(&self) -> Result<()> {
+        self.validate_ranges()?;
+        self.validate_reuse_penalties()?;
+        self.validate_device()?;
+        self.validate_objective_params()?;
+        ensure(
+            "num_parallel_tree",
+            (1..=MAX_NUM_PARALLEL_TREE).contains(&self.num_parallel_tree),
+            format!(
+                "must be in [1, {MAX_NUM_PARALLEL_TREE}], got {}",
+                self.num_parallel_tree
+            ),
+        )?;
+        if self.booster == BoosterKind::GbLinear {
+            self.validate_gblinear()?;
+        }
+        self.validate_tree_shape()?;
+        self.validate_training_modes()?;
+        self.validate_tree_options()
+    }
+
+    /// Whether either reuse penalty (Trees-on-a-Diet) is on.
+    fn reuse_penalties_on(&self) -> bool {
+        self.toad_penalty_feature > 0.0 || self.toad_penalty_threshold > 0.0
+    }
+
+    /// Ranges of the learning rate, regularization, and sampling ratios.
+    fn validate_ranges(&self) -> Result<()> {
         positive("eta", self.eta)?;
         narrows("eta", self.eta, true)?;
         non_negative("gamma", self.gamma)?;
@@ -632,7 +664,11 @@ impl TrainingParams {
         unit("colsample_bylevel", self.colsample_bylevel)?;
         unit("colsample_bynode", self.colsample_bynode)?;
         unit("rate_drop", self.rate_drop)?;
-        unit("skip_drop", self.skip_drop)?;
+        unit("skip_drop", self.skip_drop)
+    }
+
+    /// Ranges of the reuse penalties and the split searches that apply them.
+    fn validate_reuse_penalties(&self) -> Result<()> {
         non_negative("toad_penalty_feature", self.toad_penalty_feature)?;
         non_negative("toad_penalty_threshold", self.toad_penalty_threshold)?;
         ensure(
@@ -644,7 +680,7 @@ impl TrainingParams {
         // The penalties act in the XGBoost histogram/exact split searches;
         // the LightGBM split search and symmetric level-wise growth do not
         // apply them, so refuse the combination instead of ignoring it.
-        let reuse_on = self.toad_penalty_feature > 0.0 || self.toad_penalty_threshold > 0.0;
+        let reuse_on = self.reuse_penalties_on();
         ensure(
             "toad_penalty_feature",
             !(reuse_on
@@ -653,11 +689,13 @@ impl TrainingParams {
                     || self.grow_policy == GrowPolicy::Symmetric)),
             "reuse penalties are not supported with `extra_trees`, `path_smooth`, or \
              `grow_policy=symmetric`",
-        )?;
+        )
+    }
 
-        // The GPU backend accelerates the histogram tree method only; the
-        // other tree methods, the quantized path, and `gblinear` have their
-        // own accumulation loops that would silently ignore the device.
+    /// The GPU backend accelerates the histogram tree method only; the
+    /// other tree methods, the quantized path, and `gblinear` have their
+    /// own accumulation loops that would silently ignore the device.
+    fn validate_device(&self) -> Result<()> {
         if self.device != Device::Cpu {
             ensure(
                 "device",
@@ -685,7 +723,11 @@ impl TrainingParams {
                 "`metal` does not support `process_type = update` (refresh grows no trees)",
             )?;
         }
+        Ok(())
+    }
 
+    /// Ranges of the objective parameters (and `base_score`).
+    fn validate_objective_params(&self) -> Result<()> {
         if let Some(base_score) = self.base_score {
             ensure("base_score", base_score.is_finite(), "must be finite")?;
         }
@@ -737,19 +779,11 @@ impl TrainingParams {
                 "must stay positive and finite in f32, got {}",
                 self.aft_loss_distribution_scale
             ),
-        )?;
-        ensure(
-            "num_parallel_tree",
-            (1..=MAX_NUM_PARALLEL_TREE).contains(&self.num_parallel_tree),
-            format!(
-                "must be in [1, {MAX_NUM_PARALLEL_TREE}], got {}",
-                self.num_parallel_tree
-            ),
-        )?;
-        if self.booster == BoosterKind::GbLinear {
-            self.validate_gblinear()?;
-        }
+        )
+    }
 
+    /// Histogram bins, tree size bounds, and the symmetric-growth depth.
+    fn validate_tree_shape(&self) -> Result<()> {
         ensure(
             "max_bin",
             self.max_bin >= 2,
@@ -786,7 +820,11 @@ impl TrainingParams {
             "num_grad_quant_bins",
             (2..=127).contains(&self.num_grad_quant_bins),
             format!("must be in [2, 127], got {}", self.num_grad_quant_bins),
-        )?;
+        )
+    }
+
+    /// Compatibility of the vector-leaf and quantized training modes.
+    fn validate_training_modes(&self) -> Result<()> {
         if self.multi_strategy == MultiStrategy::MultiOutputTree {
             // The vector-leaf builder has its own (XGBoost) split search:
             // symmetric level-wise growth and the reuse penalties do not
@@ -798,7 +836,7 @@ impl TrainingParams {
             )?;
             ensure(
                 "toad_penalty_feature",
-                !reuse_on,
+                !self.reuse_penalties_on(),
                 "reuse penalties are not supported with `multi_strategy=multi_output_tree`",
             )?;
         }
@@ -828,7 +866,7 @@ impl TrainingParams {
                 "leaf renewal is not supported with `path_smooth`",
             )?;
         }
-        self.validate_tree_options()
+        Ok(())
     }
 
     /// Refuse the tree-booster settings `gblinear` cannot apply. Coordinate
@@ -943,16 +981,55 @@ impl TrainingParams {
     }
 
     /// The `max_delta_step` in effect: the configured value, or XGBoost's
-    /// default when unset (`0.7` for `count:poisson`, which XGBoost's learner
-    /// injects before configuring the objective and tree updater; `0`,
-    /// unconstrained, otherwise).
+    /// default when unset ([`default_max_delta_step`]).
     pub(crate) fn effective_max_delta_step(&self) -> f64 {
         self.max_delta_step
-            .unwrap_or(if self.objective == "count:poisson" {
-                0.7
-            } else {
-                0.0
-            })
+            .unwrap_or_else(|| default_max_delta_step(&self.objective))
+    }
+
+    /// Refuse every field of `self` that differs from `allowed`, comparing
+    /// the serialized configurations so a field added later is covered too
+    /// (budget mode and the refresh updater: `allowed` is the defaults plus
+    /// what they read). The error names `param` and lists the fields after
+    /// `reason`: "`reason`; leave `a`, `b` at the default".
+    pub(crate) fn refuse_changes_from(
+        &self,
+        allowed: &TrainingParams,
+        param: &'static str,
+        reason: &str,
+    ) -> Result<()> {
+        let (Ok(serde_json::Value::Object(set)), Ok(serde_json::Value::Object(allowed))) =
+            (serde_json::to_value(self), serde_json::to_value(allowed))
+        else {
+            return Err(HessboostError::invalid_param(
+                param,
+                "training parameters could not be compared",
+            ));
+        };
+        let changed: Vec<String> = set
+            .iter()
+            .filter(|(key, value)| allowed.get(*key) != Some(*value))
+            .map(|(key, _)| format!("`{key}`"))
+            .collect();
+        if changed.is_empty() {
+            Ok(())
+        } else {
+            Err(HessboostError::invalid_param(
+                param,
+                format!("{reason}; leave {} at the default", changed.join(", ")),
+            ))
+        }
+    }
+}
+
+/// XGBoost's `max_delta_step` for `objective` when none is configured: `0.7`
+/// for `count:poisson`, which XGBoost's learner injects before configuring
+/// the objective and tree updater; `0`, unconstrained, otherwise.
+fn default_max_delta_step(objective: &str) -> f64 {
+    if objective == "count:poisson" {
+        0.7
+    } else {
+        0.0
     }
 }
 
@@ -1032,31 +1109,11 @@ impl ObjectiveParams {
     /// XGBoost's defaults for `objective` (e.g. `max_delta_step = 0.7` for
     /// `count:poisson`).
     pub fn defaults_for(objective: &str) -> Self {
-        Self::from_params(
-            &TrainingParams::builder()
-                .objective(objective)
-                .build_unchecked(),
-        )
-    }
-
-    /// A training configuration for `objective` (with `num_class`) carrying
-    /// these parameters: the objective it rebuilds is the one the model was
-    /// trained with. Callers `build()` to validate or `build_unchecked()`.
-    pub fn training_params(&self, objective: &str, num_class: usize) -> TrainingParamsBuilder {
-        TrainingParams::builder()
-            .objective(objective)
-            .num_class(num_class)
-            .scale_pos_weight(self.scale_pos_weight)
-            .max_delta_step(self.max_delta_step)
-            .tweedie_variance_power(self.tweedie_variance_power)
-            .huber_slope(self.huber_slope)
-            .lambdarank_num_pair_per_sample(self.lambdarank_num_pair_per_sample)
-            .quantile_alpha(self.quantile_alpha.clone())
-            .expectile_alpha(self.expectile_alpha.clone())
-            .aft_loss_distribution(self.aft_loss_distribution)
-            .aft_loss_distribution_scale(self.aft_loss_distribution_scale)
-            .dist_gradient(self.dist_gradient)
-            .dist_split_direction(self.dist_split_direction)
+        ObjectiveParams {
+            max_delta_step: default_max_delta_step(objective),
+            distribution: crate::objective::distributional::DistFamily::from_objective(objective),
+            ..Self::default()
+        }
     }
 }
 
@@ -1067,38 +1124,77 @@ impl Default for ObjectiveParams {
     }
 }
 
-/// [`ObjectiveParams`] as the native JSON format stores them, with every
-/// field optional: [`PartialObjectiveParams::fill`] takes each missing one
-/// from the recorded objective's defaults
-/// ([`ObjectiveParams::defaults_for`]), which a per-field serde default
-/// could not (they depend on the objective). A stored value is read as
-/// strictly as before (`null` only where the field is an `Option`).
-#[derive(Deserialize, Default)]
-pub(crate) struct PartialObjectiveParams {
-    #[serde(default)]
-    scale_pos_weight: Stored<f64>,
-    #[serde(default)]
-    max_delta_step: Stored<f64>,
-    #[serde(default)]
-    tweedie_variance_power: Stored<f64>,
-    #[serde(default)]
-    huber_slope: Stored<f64>,
-    #[serde(default)]
-    lambdarank_num_pair_per_sample: Stored<usize>,
-    #[serde(default)]
-    quantile_alpha: Stored<Vec<f64>>,
-    #[serde(default)]
-    expectile_alpha: Stored<Vec<f64>>,
-    #[serde(default)]
-    aft_loss_distribution: Stored<AftDistribution>,
-    #[serde(default)]
-    aft_loss_distribution_scale: Stored<f64>,
-    #[serde(default)]
-    dist_gradient: Stored<DistGradient>,
-    #[serde(default)]
-    dist_split_direction: Stored<DistSplitDirection>,
-    #[serde(default)]
-    distribution: Stored<Option<crate::objective::distributional::DistFamily>>,
+/// Generates, from one list of the [`ObjectiveParams`] fields that are
+/// parameters (all but the derived `distribution`), the mirrors that must
+/// cover every one of them: [`ObjectiveParams::training_params`] and the
+/// native JSON reader's [`PartialObjectiveParams`] with its `fill`. Each
+/// field's [`TrainingParamsBuilder`] setter shares its name and type.
+macro_rules! objective_param_mirrors {
+    ($($field:ident: $ty:ty,)*) => {
+        impl ObjectiveParams {
+            /// A training configuration for `objective` (with `num_class`)
+            /// carrying these parameters: the objective it rebuilds is the one
+            /// the model was trained with. Callers `build()` to validate or
+            /// `build_unchecked()`.
+            pub fn training_params(
+                &self,
+                objective: &str,
+                num_class: usize,
+            ) -> TrainingParamsBuilder {
+                let ObjectiveParams {
+                    $($field,)*
+                    distribution: _,
+                } = self.clone();
+                TrainingParams::builder()
+                    .objective(objective)
+                    .num_class(num_class)
+                    $(.$field($field))*
+            }
+        }
+
+        /// [`ObjectiveParams`] as the native JSON format stores them, with
+        /// every field optional: [`PartialObjectiveParams::fill`] takes each
+        /// missing one from the recorded objective's defaults
+        /// ([`ObjectiveParams::defaults_for`]), which a per-field serde
+        /// default could not (they depend on the objective). A stored value
+        /// is read as strictly as before (`null` only where the field is an
+        /// `Option`).
+        #[derive(Deserialize, Default)]
+        pub(crate) struct PartialObjectiveParams {
+            $(
+                #[serde(default)]
+                $field: Stored<$ty>,
+            )*
+            #[serde(default)]
+            distribution: Stored<Option<crate::objective::distributional::DistFamily>>,
+        }
+
+        impl PartialObjectiveParams {
+            /// The stored parameters, with each missing one taken from
+            /// `objective`'s defaults.
+            pub(crate) fn fill(self, objective: &str) -> ObjectiveParams {
+                let d = ObjectiveParams::defaults_for(objective);
+                ObjectiveParams {
+                    $($field: self.$field.unwrap_or(d.$field),)*
+                    distribution: self.distribution.unwrap_or(d.distribution),
+                }
+            }
+        }
+    };
+}
+
+objective_param_mirrors! {
+    scale_pos_weight: f64,
+    max_delta_step: f64,
+    tweedie_variance_power: f64,
+    huber_slope: f64,
+    lambdarank_num_pair_per_sample: usize,
+    quantile_alpha: Vec<f64>,
+    expectile_alpha: Vec<f64>,
+    aft_loss_distribution: AftDistribution,
+    aft_loss_distribution_scale: f64,
+    dist_gradient: DistGradient,
+    dist_split_direction: DistSplitDirection,
 }
 
 /// A field that is absent from the document, or present with a value
@@ -1124,36 +1220,6 @@ impl<T> Stored<T> {
         match self {
             Stored::Absent => default,
             Stored::Present(value) => value,
-        }
-    }
-}
-
-impl PartialObjectiveParams {
-    /// The stored parameters, with each missing one taken from `objective`'s
-    /// defaults.
-    pub(crate) fn fill(self, objective: &str) -> ObjectiveParams {
-        let d = ObjectiveParams::defaults_for(objective);
-        ObjectiveParams {
-            scale_pos_weight: self.scale_pos_weight.unwrap_or(d.scale_pos_weight),
-            max_delta_step: self.max_delta_step.unwrap_or(d.max_delta_step),
-            tweedie_variance_power: self
-                .tweedie_variance_power
-                .unwrap_or(d.tweedie_variance_power),
-            huber_slope: self.huber_slope.unwrap_or(d.huber_slope),
-            lambdarank_num_pair_per_sample: self
-                .lambdarank_num_pair_per_sample
-                .unwrap_or(d.lambdarank_num_pair_per_sample),
-            quantile_alpha: self.quantile_alpha.unwrap_or(d.quantile_alpha),
-            expectile_alpha: self.expectile_alpha.unwrap_or(d.expectile_alpha),
-            aft_loss_distribution: self
-                .aft_loss_distribution
-                .unwrap_or(d.aft_loss_distribution),
-            aft_loss_distribution_scale: self
-                .aft_loss_distribution_scale
-                .unwrap_or(d.aft_loss_distribution_scale),
-            dist_gradient: self.dist_gradient.unwrap_or(d.dist_gradient),
-            dist_split_direction: self.dist_split_direction.unwrap_or(d.dist_split_direction),
-            distribution: self.distribution.unwrap_or(d.distribution),
         }
     }
 }

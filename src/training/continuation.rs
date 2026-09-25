@@ -263,32 +263,12 @@ fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
         },
         ..TrainingParams::default()
     };
-    let (Ok(serde_json::Value::Object(set)), Ok(serde_json::Value::Object(allowed))) = (
-        serde_json::to_value(params),
-        serde_json::to_value(&reference),
-    ) else {
-        return Err(HessboostError::invalid_param(
-            "process_type",
-            "training parameters could not be compared",
-        ));
-    };
-    let changed: Vec<String> = set
-        .iter()
-        .filter(|(key, value)| allowed.get(*key) != Some(*value))
-        .map(|(key, _)| format!("`{key}`"))
-        .collect();
-    if changed.is_empty() {
-        Ok(())
-    } else {
-        Err(HessboostError::invalid_param(
-            "process_type",
-            format!(
-                "`update` keeps the existing splits and refreshes them from every row, so it \
-                 applies no sampling, growth, or split-search options; leave {} at the default",
-                changed.join(", ")
-            ),
-        ))
-    }
+    params.refuse_changes_from(
+        &reference,
+        "process_type",
+        "`update` keeps the existing splits and refreshes them from every row, so it applies \
+         no sampling, growth, or split-search options",
+    )
 }
 
 /// Reject `process_type=update` without a model to update.

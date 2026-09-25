@@ -45,11 +45,14 @@ impl SortedColumns {
     pub fn from_dmatrix(data: &DMatrix) -> Self {
         let csc = data.to_csc();
         let n_cols = csc.n_cols();
-        let mut col_ptr = vec![0usize; n_cols + 1];
-        #[allow(clippy::needless_range_loop)]
-        for c in 0..n_cols {
-            col_ptr[c + 1] = col_ptr[c] + csc.col_len(c);
-        }
+        // `map` keeps the exact size hint, so `collect` allocates once.
+        let mut end = 0;
+        let col_ptr: Vec<usize> = std::iter::once(0)
+            .chain((0..n_cols).map(|c| {
+                end += csc.col_len(c);
+                end
+            }))
+            .collect();
         let nnz = col_ptr[n_cols];
         let mut rows = vec![0u32; nnz];
         let mut vals = vec![0f32; nnz];

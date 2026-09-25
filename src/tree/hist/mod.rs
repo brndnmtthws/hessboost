@@ -2,9 +2,11 @@
 //!
 //! The [`HistogramBackend`] trait is the single seam a future GPU implementation
 //! plugs into: everything above it (the histogram tree builder) is
-//! backend-agnostic. The CPU backend uses `rayon` to accumulate per-thread
-//! partial histograms and reduce them, and provides the *subtraction trick*
-//! (`sibling = parent − child`) that halves histogram construction cost.
+//! backend-agnostic. The CPU backend uses `rayon` to split the work by
+//! feature or into fixed blocks of rows whose partial histograms it reduces
+//! in block order, so every histogram is independent of the thread count,
+//! and provides the *subtraction trick* (`sibling = parent − child`) that
+//! halves histogram construction cost.
 
 pub(crate) mod quantized;
 
@@ -77,13 +79,27 @@ pub trait HistogramBackend: Send + Sync {
 }
 
 /// Multi-core CPU histogram backend.
+///
+/// Each bin's `f64` sum is a function of the rows alone, never of the
+/// thread count, so the serial and parallel builds agree bit for bit. A node
+/// below [`PARALLEL_THRESHOLD`] rows, and a column-major index swept by
+/// feature (a contiguous row range, or any subset of an index of at most
+/// [`GATHER_MAX_ROWS`] rows), add each bin's rows in ascending order: the
+/// plain chain XGBoost's single-threaded build forms. Every other node (a
+/// sparse index, or a row subset of a larger dense one) sums fixed blocks
+/// of about [`ROWS_PER_TASK`] rows, each in row order from zero, and adds
+/// the block partials to the first block's in block order. Outside the
+/// range where `f64` sums are exact (`backend/exact_sum.rs`) that can round
+/// differently from the chain, which XGBoost's threaded build does too
+/// (its per-thread buffers are reduced in thread order); inside it every
+/// grouping gives the chain's sum.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuBackend;
 
-/// Each task needs enough rows to amortize its histogram allocation and merge.
-/// Capping the task count avoids creating a full histogram for every worker
-/// when a shallow node has only a few thousand rows.
+/// Rows per block of the blocked build, and per task of the quantized one:
+/// enough to amortize a partial histogram's zeroing and reduction.
 const ROWS_PER_TASK: usize = 4096;
+/// Nodes below this many rows are one block (built as a single chain).
 const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
 /// Bins per task when the partial histograms are summed.
 const REDUCE_BINS: usize = 2048;
@@ -93,9 +109,24 @@ const GATHER_MAX_ROWS: usize = 1 << 18;
 
 impl HistogramBackend for CpuBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        let total = out.len();
+        if rows.len() < PARALLEL_THRESHOLD {
+            out.fill(GradStats::default());
+            accumulate(ghist, rows, gpair, out);
+            return;
+        }
         let threads = rayon::current_num_threads();
-        if threads <= 1 || rows.len() < PARALLEL_THRESHOLD {
+        let Some(columns) = ghist.column_bins() else {
+            accumulate_blocks(ghist, rows, gpair, out, threads);
+            return;
+        };
+        let range = contiguous_range(rows);
+        if range.is_none() && ghist.n_rows() > GATHER_MAX_ROWS {
+            accumulate_blocks(ghist, rows, gpair, out, threads);
+            return;
+        }
+        // The feature sweeps below are chains in row order, as is
+        // `accumulate`, which runs them serially.
+        if threads <= 1 {
             out.fill(GradStats::default());
             accumulate(ghist, rows, gpair, out);
             return;
@@ -109,7 +140,7 @@ impl HistogramBackend for CpuBackend {
         // to the sequential sweep. Tasks take as few features as keep every
         // worker busy, swept in pairs so each pass reads the gradients once
         // for two features.
-        if let (Some(columns), Some(range)) = (ghist.column_bins(), contiguous_range(rows)) {
+        if let Some(range) = range {
             let n_rows = ghist.n_rows();
             let per_task = ghist.n_cols().div_ceil(threads).clamp(1, 4);
             let mut slices = feature_slices(ghist, out, 1);
@@ -133,48 +164,75 @@ impl HistogramBackend for CpuBackend {
             return;
         }
 
-        // Any other row subset of a column-major index is gathered the same
-        // way, per feature pair: still one writer per bin in ascending row
-        // order (so the sums are the sequential ones, for every worker
-        // count), with no partial histograms to allocate and reduce. Every
-        // pair re-reads the gradients, so this pays only while they stay in
-        // a core's cache.
-        if let Some(columns) = ghist.column_bins()
-            && ghist.n_rows() <= GATHER_MAX_ROWS
-        {
-            let n_rows = ghist.n_rows();
-            let mut slices = feature_slices(ghist, out, 1);
-            slices
-                .par_chunks_mut(2)
-                .enumerate()
-                .for_each(|(pair, features)| match columns {
-                    Bins::U16(c) => gather_feature_pair(c, n_rows, 2 * pair, features, rows, gpair),
-                    Bins::U32(c) => gather_feature_pair(c, n_rows, 2 * pair, features, rows, gpair),
-                });
-            return;
-        }
+        // Any other row subset of a small enough column-major index is
+        // gathered the same way, per feature pair: still one writer per bin
+        // in ascending row order, with no partial histograms to allocate and
+        // reduce. Every pair re-reads the gradients, so this pays only while
+        // they stay in a core's cache.
+        let n_rows = ghist.n_rows();
+        let mut slices = feature_slices(ghist, out, 1);
+        slices
+            .par_chunks_mut(2)
+            .enumerate()
+            .for_each(|(pair, features)| match columns {
+                Bins::U16(c) => gather_feature_pair(c, n_rows, 2 * pair, features, rows, gpair),
+                Bins::U32(c) => gather_feature_pair(c, n_rows, 2 * pair, features, rows, gpair),
+            });
+    }
+}
 
-        // Each task builds a private histogram over a contiguous run of rows.
-        // The partials are then summed into `out` in task order, so the result
-        // is deterministic for a given worker count; the reduction is split by
-        // bin range, which keeps that per-bin order while using every worker.
-        let tasks = threads.min(rows.len() / ROWS_PER_TASK);
-        let grain = rows.len().div_ceil(tasks);
-        let partials: Vec<Histogram> = rows
-            .par_chunks(grain)
-            .map(|chunk| {
-                let mut local = zeroed(total);
-                accumulate(ghist, chunk, gpair, &mut local);
-                local
-            })
-            .collect();
+/// The blocked build of [`CpuBackend`]: `rows` (at least
+/// [`PARALLEL_THRESHOLD`]) split into `rows.len() / ROWS_PER_TASK` blocks
+/// of equal size (the last shorter), each accumulated from zero into a
+/// partial histogram, and `out` = the first partial plus every later one in
+/// block order. The blocks depend only on the row count; `threads` only
+/// sets how many are built at once (in waves, each reduced into `out`
+/// before the next), which bounds the partials held to one per thread.
+fn accumulate_blocks(
+    ghist: &GHistIndex,
+    rows: &[u32],
+    gpair: &[GradPair],
+    out: &mut [GradStats],
+    threads: usize,
+) {
+    let total = out.len();
+    let blocks = rows.len() / ROWS_PER_TASK;
+    let grain = rows.len().div_ceil(blocks);
+    let wave = threads.clamp(1, blocks);
+    let mut partials: Vec<Histogram> = Vec::with_capacity(wave);
+    for (w, wave_rows) in rows.chunks(grain * wave).enumerate() {
+        let built = wave_rows.len().div_ceil(grain);
+        if w == 0 {
+            // Each task allocates (and zeroes) its own partial.
+            wave_rows
+                .par_chunks(grain)
+                .map(|block| {
+                    let mut partial = zeroed(total);
+                    accumulate(ghist, block, gpair, &mut partial);
+                    partial
+                })
+                .collect_into_vec(&mut partials);
+        } else {
+            partials
+                .par_iter_mut()
+                .zip(wave_rows.par_chunks(grain))
+                .for_each(|(partial, block)| {
+                    partial.fill(GradStats::default());
+                    accumulate(ghist, block, gpair, partial);
+                });
+        }
+        // Split by bin range, which keeps each bin's block order while
+        // using every worker.
+        let (head, rest) = partials[..built].split_at(usize::from(w == 0));
         out.par_chunks_mut(REDUCE_BINS)
             .enumerate()
             .for_each(|(i, out)| {
                 let start = i * REDUCE_BINS;
                 let end = start + out.len();
-                out.copy_from_slice(&partials[0][start..end]);
-                for partial in &partials[1..] {
+                if let [first] = head {
+                    out.copy_from_slice(&first[start..end]);
+                }
+                for partial in rest {
                     for (o, p) in out.iter_mut().zip(&partial[start..end]) {
                         o.add(*p);
                     }
@@ -247,12 +305,7 @@ impl BinIndex for u32 {
 /// Sequential accumulation of `rows` into `out` (added, not reset). Specialized
 /// on the bin-index width so the inner loop reads the narrowest integers.
 #[inline]
-pub(crate) fn accumulate(
-    ghist: &GHistIndex,
-    rows: &[u32],
-    gpair: &[GradPair],
-    out: &mut [GradStats],
-) {
+fn accumulate(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
     match ghist.bins() {
         Bins::U16(bins) => accumulate_bins(ghist, bins, rows, gpair, out),
         Bins::U32(bins) => accumulate_bins(ghist, bins, rows, gpair, out),
@@ -606,6 +659,111 @@ mod tests {
                     .install(|| CpuBackend.build(&ghist, rows, &gpair, &mut out));
                 assert_eq!(bits(&out), expect, "rows={} threads={threads}", rows.len());
             }
+        }
+    }
+
+    /// A sparse index of `n` rows holding only feature 0 (of 3), binned from
+    /// `x`.
+    fn sparse_index(x: &[f32]) -> GHistIndex {
+        let n = x.len();
+        let data = DMatrix::from_csr((0..=n).collect(), vec![0; n], x.to_vec(), 3).unwrap();
+        let cuts = HistCuts::from_dmatrix(&data, 256);
+        let ghist = GHistIndex::from_dmatrix(&data, cuts);
+        assert!(
+            ghist.column_bins().is_none(),
+            "sparse index has no column copy"
+        );
+        ghist
+    }
+
+    fn build_on(
+        threads: usize,
+        ghist: &GHistIndex,
+        rows: &[u32],
+        gpair: &[GradPair],
+    ) -> Vec<(f64, f64)> {
+        let mut out = zeroed(ghist.total_bins());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| CpuBackend.build(ghist, rows, gpair, &mut out));
+        out.iter().map(|s| (s.grad, s.hess)).collect()
+    }
+
+    /// The reported case: 8,192 sparse rows in one bin, gradients `2^54` at
+    /// row 0, `-2^54` at row 4096, `1` at row 4097. The row-order chain sums
+    /// to `1`; the two blocks of 4,096 rows sum to `2^54` and
+    /// `-2^54 + 1 = -2^54` (rounded), so `0`. Every thread count, one
+    /// included, builds the blocks.
+    #[test]
+    fn histograms_do_not_depend_on_the_thread_count() {
+        let n = 2 * ROWS_PER_TASK;
+        let ghist = sparse_index(&vec![1.0; n]);
+        assert_eq!(
+            ghist.cuts().feature_bins(0),
+            (0, 1),
+            "feature 0 has one bin"
+        );
+        let mut gpair = vec![GradPair::new(0.0, 1.0); n];
+        gpair[0].grad = 2f32.powi(54);
+        gpair[4096].grad = -(2f32.powi(54));
+        gpair[4097].grad = 1.0;
+        let rows: Vec<u32> = (0..n as u32).collect();
+        for threads in [1, 2, 4, 8] {
+            let hist = build_on(threads, &ghist, &rows, &gpair);
+            assert_eq!(hist[0], (0.0, n as f64), "{threads} threads");
+            assert!(
+                hist[1..].iter().all(|&b| b == (0.0, 0.0)),
+                "{threads} threads"
+            );
+        }
+    }
+
+    /// The blocked build over several waves (five blocks, built two or
+    /// three at a time) equals an independent block-order reference for
+    /// every thread count, on gradients spanning enough exponents that the
+    /// grouping shows in the low bits.
+    #[test]
+    fn blocked_build_matches_the_block_order_reference() {
+        let n = 6 * ROWS_PER_TASK + 123;
+        let x: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+        let ghist = sparse_index(&x);
+        let gpair: Vec<GradPair> = (0..n)
+            .map(|i| {
+                let scale = 2f32.powi((i * 37 % 61) as i32 - 30);
+                GradPair::new(((i * 7919) % 1237) as f32 / 331.0 * scale - 1.0, scale)
+            })
+            .collect();
+        let rows: Vec<u32> = (0..n as u32).filter(|r| r % 11 != 3).collect();
+        let grain = rows.len().div_ceil(rows.len() / ROWS_PER_TASK);
+        let mut expect = zeroed(ghist.total_bins());
+        for block in rows.chunks(grain) {
+            let mut partial = zeroed(ghist.total_bins());
+            for &r in block {
+                let bin = match ghist.bins() {
+                    Bins::U16(b) => usize::from(b[ghist.row_ptr()[r as usize]]),
+                    Bins::U32(b) => b[ghist.row_ptr()[r as usize]] as usize,
+                };
+                partial[bin].add(GradStats::from_pair(gpair[r as usize]));
+            }
+            for (e, p) in expect.iter_mut().zip(&partial) {
+                e.add(*p);
+            }
+        }
+        let expect: Vec<(f64, f64)> = expect.iter().map(|s| (s.grad, s.hess)).collect();
+        let chain: Vec<(f64, f64)> = {
+            let mut h = zeroed(ghist.total_bins());
+            accumulate(&ghist, &rows, &gpair, &mut h);
+            h.iter().map(|s| (s.grad, s.hess)).collect()
+        };
+        assert_ne!(expect, chain, "the case must separate the groupings");
+        for threads in [1, 2, 3, 8] {
+            assert_eq!(
+                build_on(threads, &ghist, &rows, &gpair),
+                expect,
+                "{threads} threads"
+            );
         }
     }
 }

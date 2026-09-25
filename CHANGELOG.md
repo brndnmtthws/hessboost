@@ -141,7 +141,7 @@ may break the API).
   - `OrderedTargetEncoder` refuses priors beyond ±`f32::MAX`.
 - **Metal:** `device = metal` histograms, which could differ from the
   CPU's, are exact 64-bit integer sums for every node whose sums the CPU's
-  `f64` chain computes exactly (`n * max <= 2^53` grains); other nodes run
+  `f64` adds compute exactly (`n * max <= 2^53` grains); other nodes run
   on the CPU. The backend now needs macOS 10.15 (Metal 2.2).
 - **Serde:** deserializing a `BoostedModel`, `RegTree`, or `LinearLeaves`
   validates it and refuses inconsistent data; the native JSON format is
@@ -158,8 +158,13 @@ may break the API).
     meet very large Hessians (e.g. weights near `1e38`).
   - Multi-output `approx` training with a constant-Hessian custom objective
     no longer depends on the thread count.
+  - CPU histograms of nodes with 8,192 or more rows on sparse data (or row
+    subsets of dense data past 2^18 rows) no longer depend on the thread
+    count: the rows are summed in fixed blocks reduced in block order, at
+    every thread count (single-threaded training on such data can differ
+    in the last bits from before).
   - Gradient-based sampling handles gradients whose `f32` squares overflow
-    and reports non-finite gradients as an error.
+    (up to `f32::MAX`) and reports non-finite gradients as an error.
   - `reg:absoluteerror`/`reg:quantileerror` scales stay finite when
     zero-weight rows have overflowing residuals.
   - A structurally invalid init model is a `ModelFormat` error, not a
@@ -176,8 +181,8 @@ may break the API).
   - Ranking metrics score 0 on empty input or empty groups instead of
     panicking; `LambdaMart::validate_info` errors on mismatched groups or
     weights.
-  - Inconsistent `MetaInfo` lengths give NaN metrics and hook errors
-    instead of allocation panics.
+  - Inconsistent `MetaInfo` lengths (including a label matrix with no
+    labels) give NaN metrics and hook errors instead of allocation panics.
   - `nll`/`crps` ignore zero-weight rows whose score overflows.
   - `Dist::quantile` for Poisson and negative-binomial means beyond `2^53`
     returns instead of looping forever.
@@ -186,6 +191,8 @@ may break the API).
     zero weights) are written uncompressed and now load.
   - SHAP contributions and interactions stay finite when a repeated
     feature's path probability overflows `f32`.
+  - A deserialized `RegTree` whose leaf-vector size overflows is refused
+    instead of panicking.
 - **Metal:** buffer writes are bounds-checked, inputs are validated before
   dispatch, gradient staging cannot race a running build, and failed
   command buffers fall back to the CPU (histograms) or return an error

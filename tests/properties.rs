@@ -1,8 +1,9 @@
 //! Property-based tests (proptest) over randomized data and configs.
 //!
 //! These lock in invariants that unit tests only spot-check: training
-//! determinism, dense/sparse prediction equivalence, monotone-constraint
-//! guarantees, and lossless model round-trips.
+//! determinism (also across thread counts), dense/sparse prediction
+//! equivalence, monotone-constraint guarantees, and lossless model
+//! round-trips.
 
 use hessboost::config::Monotone;
 use hessboost::prelude::*;
@@ -122,5 +123,45 @@ proptest! {
         for (a, b) in before.iter().zip(&after_json) {
             prop_assert!((a - b).abs() < 1e-6);
         }
+    }
+}
+
+/// Training is independent of the thread count where `f64` histogram sums
+/// round differently under another grouping. With `base_score = 0`, squared
+/// error's gradients are the negated labels: `2^54` at row 0, `-2^54` at
+/// row 4096, `1` at row 4097, `0` elsewhere. In row order they sum to `1`;
+/// split at row 4096 (as two worker threads once split these 8,192 sparse
+/// rows), `-2^54 + 1` rounds to `-2^54` and the sum is `0`. The rows of bin
+/// 0 carry those gradients, so its sum sets the split's leaf values.
+#[test]
+fn training_is_independent_of_the_thread_count() {
+    let n = 8192;
+    // Only feature 0 of 3 is present: a sparse index, with no column copy.
+    let indptr: Vec<usize> = (0..=n).collect();
+    let values: Vec<f32> = (0..n).map(|r| f32::from(r >= 8000)).collect();
+    let mut labels = vec![0.0f32; n];
+    labels[0] = -(2f32.powi(54));
+    labels[4096] = 2f32.powi(54);
+    labels[4097] = -1.0;
+    let data = DMatrix::from_csr(indptr, vec![0; n], values, 3)
+        .unwrap()
+        .with_labels(&labels)
+        .unwrap();
+    let params = TrainingParams::builder()
+        .objective("reg:squarederror")
+        .base_score(0.0)
+        .max_depth(2)
+        .build()
+        .unwrap();
+    let train_on = |threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| train(&params, &data, 2).unwrap().to_bytes().unwrap())
+    };
+    let serial = train_on(1);
+    for threads in [2, 4, 8] {
+        assert!(train_on(threads) == serial, "{threads} threads");
     }
 }

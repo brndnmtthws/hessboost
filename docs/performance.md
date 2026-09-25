@@ -409,10 +409,15 @@ incumbent. `tree::builder::tests` checks both against the sequential search.
 Histogram accumulation over a contiguous row range (the root) sweeps the
 column-major bin copy two features at a time, one writer per bin. Other row
 subsets of datasets up to 2^18 rows are gathered per feature pair from the
-same copy, so no partial histograms are allocated or reduced; larger ones use
-one partial histogram per task of at least 4,096 rows. Row sweeps load four
-of a row's bins (distinct features) before storing them. Every bin receives
-its rows in ascending order on every path.
+same copy, so no partial histograms are allocated or reduced; every bin
+receives its rows in ascending order. Sparse indexes and larger datasets split
+a node of 8,192 or more rows into `n / 4,096` fixed blocks, each summed from
+zero into a partial histogram, built one wave per worker count at a time and
+added in block order, so the sums depend on the rows, never on the thread
+count (serial builds sum the same blocks). Row sweeps load four of a row's
+bins (distinct features) before storing them. At 8 threads the fixed blocks
+cost about 5% on the 50k-row `missing` tree build (12 blocks where 8 tasks
+ran before) and nothing measurable on the 1M-row one.
 
 Leaves at `max_depth` need no histograms or split searches. With full row
 sampling, training retains their final row partitions (depthwise and
@@ -570,7 +575,7 @@ accumulation at roughly six times the arithmetic of the CPU's native `f64`
 adds, and the single-writer-per-bin layout routes row/column/gradient loads
 through the GPU's scalar path. The current kernels sum 64-bit integers
 instead (one add per component, but 16-byte gradient pairs instead of 8),
-for every node whose sums the CPU's `f64` chain computes exactly; other
+for every node whose sums the CPU's `f64` adds compute exactly; other
 nodes run on the CPU. Wider feature blocks and cooperative
 (threadgroup-memory) loading are the known tuning directions; measured
 attempts with the double-float kernels (wider blocks up to 1024 threads,

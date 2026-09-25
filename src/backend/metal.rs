@@ -28,8 +28,10 @@
 //!
 //! # Determinism
 //!
-//! The CPU accumulates each histogram bin as a chain of `f64` additions in
-//! row order. Metal on Apple GPUs has no `double`, so the GPU sums integers
+//! The CPU accumulates each histogram bin in `f64`: a chain of additions in
+//! row order within fixed blocks of rows, and the block partials added in
+//! block order (a node below 8,192 rows is one chain). Metal on Apple GPUs
+//! has no `double`, so the GPU sums integers
 //! instead. When the backend stages a tree's gradients it finds, per
 //! component (gradients, Hessians), the grain `u`: the largest power of
 //! two that divides every value. It uploads each value as the integer
@@ -37,13 +39,13 @@
 //! slice and then across slices, and the host scales each bin total back
 //! by `u`. A node of `n` rows goes to the GPU only when `n * max <= 2^53 u`
 //! for both components, checked exactly. Inside that bound every integer
-//! partial is exact. So is every partial sum of the CPU's `f64` chain, a
-//! multiple of `u` below `2^53 u`, which makes the two histograms equal bit
-//! for bit (proof in the private `backend::exact_sum` module). No wider
-//! bound on these statistics works: past it the CPU chain itself can
-//! round, and no parallel grouping reproduces that rounding. Every other
-//! build runs the CPU's sequential path inside the backend, so a
-//! `device = metal` training run reproduces the single-threaded CPU model
+//! partial is exact. So is every partial sum the CPU forms, a multiple of
+//! `u` below `2^53 u`, which makes the two histograms equal bit for bit
+//! (proof in the private `backend::exact_sum` module). No wider bound on
+//! these statistics works: past it the CPU's sums themselves can round,
+//! and no other grouping reproduces that rounding. Every other build runs
+//! the CPU backend's build inside the backend, so a `device = metal`
+//! training run reproduces the CPU model (the same at every thread count)
 //! exactly. The result is also identical across runs, thread counts, and
 //! machines: there are no atomics, and integer sums do not depend on the
 //! order.
@@ -59,7 +61,7 @@
 //! Guard rails keep the two paths identical in the remaining edge cases:
 //! nodes below 8,192 rows, non-finite gradients, inputs that do not match
 //! the index the backend was built from, and GPU command failures run on
-//! the CPU's sequential path. The kernels are compiled with safe math
+//! the CPU backend. The kernels are compiled with safe math
 //! (`mathMode = safe` from macOS 15 on, `fastMathEnabled = false` before)
 //! and FP contraction off, so the compiler cannot change the prediction's
 //! rounding order.
@@ -92,8 +94,7 @@ use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, initial_margins, transform_model_margins};
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;
-use crate::tree::hist::HistogramBackend;
-use crate::tree::hist::accumulate as cpu_accumulate;
+use crate::tree::hist::{CpuBackend, HistogramBackend};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -121,10 +122,8 @@ const CHUNK_ROWS: usize = 65_536;
 /// threadgroups in flight to hide memory latency. Like the chunking, it
 /// does not affect results.
 const ROW_SLICES: usize = 64;
-/// Nodes below this many rows run on the CPU's sequential path: the kernel
-/// dispatch and readback cost more than the scan. Below this size the CPU
-/// path is sequential anyway (it matches `CpuBackend`'s own threshold), so
-/// the results agree bit for bit.
+/// Nodes below this many rows run on the CPU backend: the kernel dispatch
+/// and readback cost more than the scan.
 const CPU_ROWS: usize = 8_192;
 /// Threads of one histogram threadgroup per feature: 64 threads times 4
 /// register bins cover a feature's whole 256-bin window, so a group covers
@@ -841,9 +840,9 @@ struct CallBuffers {
 /// Training selects it automatically through
 /// [`device = metal`](crate::config::TrainingParams::device); constructing it
 /// directly serves custom training loops against a [`GHistIndex`]. Its
-/// histograms equal the single-threaded CPU backend's bit for bit: nodes
-/// the GPU cannot sum exactly (see the [module docs](crate::backend::metal))
-/// run the CPU's sequential path instead. `build` must receive the index
+/// histograms equal the CPU backend's bit for bit: nodes the GPU cannot sum
+/// exactly (see the [module docs](crate::backend::metal)) run the CPU
+/// backend's build instead. `build` must receive the index
 /// the backend was built from, and the gradient slice must not change
 /// between `prepare` and the tree's last `build`; inputs that do not fit
 /// the backend's buffers (a different index shape, a gradient slice of
@@ -1078,13 +1077,12 @@ impl MetalHistBackend {
             .push(call);
     }
 
-    /// The sequential CPU path, used below the row threshold and whenever
+    /// The CPU backend's build, used below the row threshold and whenever
     /// the GPU cannot take a node. Inside the exactness domain the GPU
     /// reproduces it bit for bit; its own bounds checks reject inputs that
     /// do not match `ghist`, as the CPU backend's do.
-    fn serial(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        out.fill(GradStats::default());
-        cpu_accumulate(ghist, rows, gpair, out);
+    fn cpu(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
+        CpuBackend.build(ghist, rows, gpair, out);
     }
 
     /// Build the histogram of `rows` into `out` on the GPU when the inputs
@@ -1252,11 +1250,10 @@ impl HistogramBackend for MetalHistBackend {
     fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
         // Small nodes, and every node the GPU cannot take (inputs that do
         // not fit, sums outside the exactness domain, a failed dispatch),
-        // run on the sequential CPU path. The histogram is a pure function
-        // of the inputs, so a GPU failure costs time, never the training
-        // run.
+        // run on the CPU backend. The histogram is a pure function of the
+        // inputs, so a GPU failure costs time, never the training run.
         if rows.len() < CPU_ROWS || !self.try_gpu(ghist, rows, gpair, out) {
-            Self::serial(ghist, rows, gpair, out);
+            Self::cpu(ghist, rows, gpair, out);
         }
     }
 
@@ -1707,7 +1704,6 @@ fn materialize_rows(data: &crate::data::DMatrix, rows: &mut [f32]) {
 mod tests {
     use super::*;
     use crate::data::quantile::HistCuts;
-    use crate::tree::hist::CpuBackend;
 
     fn context() -> bool {
         if let Some(reason) = super::unavailable_reason() {

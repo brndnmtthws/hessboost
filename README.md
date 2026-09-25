@@ -5,6 +5,8 @@
 [![CI](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml/badge.svg)](https://github.com/brndnmtthws/hessboost/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+![hessboost](hessboost.png)
+
 **XGBoost gradient boosting in Rust, trained faster.** hessboost takes
 XGBoost's parameters, reproduces XGBoost 3.4.2's predictions (checked
 against XGBoost in CI), and reads and writes XGBoost model files. On an Apple

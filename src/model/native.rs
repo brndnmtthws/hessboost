@@ -2,9 +2,9 @@
 //! a magic and a container version, compressed as one zstd frame.
 //!
 //! ```text
-//! b"SQB\0"   magic
+//! b"HBM\0"   magic
 //! u8         container version (CONTAINER_VERSION)
-//! sections   the model (see below)
+//! sections   the model (see below), nothing after the last payload
 //! u64        XXH64 (seed 0) of every byte before it
 //! ```
 //!
@@ -12,7 +12,14 @@
 //! parameters `objective.*`, and the trees are stored column-wise: one array
 //! per node field across all trees (`node.*`), split per tree by
 //! `tree.node_count`, plus per-tree category pools, leaf vectors and leaf
-//! linear models.
+//! linear models. `model.writer` (optional, not `REQUIRED`, never read back)
+//! names the release that wrote the file, e.g. `hessboost 0.2.0`.
+//!
+//! The reader is strict about everything it knows: `node.flags` bits it
+//! does not define, `tree.has_linear` bytes other than 0 and 1, and bytes
+//! between the last payload and the checksum are refused, so a later
+//! writer can give any of them a meaning without this version misreading
+//! the file.
 //!
 //! # Compatibility
 //!
@@ -41,7 +48,12 @@ use crate::objective::distributional::DistFamily;
 use crate::tree::linear::LinearLeaves;
 use crate::tree::{Node, RegTree};
 
-const MAGIC: &[u8; 4] = b"SQB\0";
+const MAGIC: &[u8; 4] = b"HBM\0";
+/// The magic of the pre-0.2.0 native format (hessboost 0.1.x), which this
+/// version refuses with a pointer to the upgrade notes.
+const LEGACY_MAGIC: &[u8; 4] = b"SQB\0";
+/// The `model.writer` section: the release that wrote the file.
+const WRITER: &str = concat!("hessboost ", env!("CARGO_PKG_VERSION"));
 /// Layout version of the container (not of the model it holds).
 const CONTAINER_VERSION: u8 = 3;
 /// The zstd frame magic number, little-endian.
@@ -58,10 +70,13 @@ const MAX_EXPANSION: u64 = 1 << 12;
 const DEFAULT_LEFT: u8 = 1;
 /// `is_categorical` in `node.flags`.
 const CATEGORICAL: u8 = 2;
+/// Every bit `node.flags` defines; the reader refuses the others.
+const NODE_FLAGS: u8 = DEFAULT_LEFT | CATEGORICAL;
 
 /// Every section this version reads.
 const KNOWN: &[&str] = &[
     "model.objective",
+    "model.writer",
     "model.base_score",
     "model.num_class",
     "model.n_outputs",
@@ -159,6 +174,7 @@ pub(super) fn write(m: &StoredRef) -> Result<Vec<u8>> {
 
     let mut w = Writer::default();
     w.str("model.objective", m.objective);
+    w.raw("model.writer", 0, WRITER.as_bytes().to_vec());
     w.array(
         "model.base_score",
         m.base_score.iter().copied(),
@@ -338,6 +354,12 @@ pub(super) fn read(bytes: &[u8]) -> Result<Stored> {
         bytes
     };
     let Some(body) = container.strip_prefix(MAGIC) else {
+        if container.starts_with(LEGACY_MAGIC) {
+            return Err(format_error(
+                "a native model from hessboost 0.1.x, which 0.2.0 and later cannot read \
+                 (see the CHANGELOG's upgrade notes)",
+            ));
+        }
         return Err(format_error("invalid native model header"));
     };
     let Some(&version) = body.first() else {
@@ -359,9 +381,15 @@ pub(super) fn read(bytes: &[u8]) -> Result<Stored> {
     if xxh64(checked).to_le_bytes() != checksum {
         return Err(format_error("native model checksum mismatch"));
     }
-    let (s, _) = Sections::parse(&checked[MAGIC.len() + 1..], |name| {
+    let (s, rest) = Sections::parse(&checked[MAGIC.len() + 1..], |name| {
         KNOWN.contains(&name) || OBJECTIVE_SECTIONS.contains(&name)
     })?;
+    if !rest.is_empty() {
+        return Err(format_error(format!(
+            "{} unexpected bytes after the last section",
+            rest.len()
+        )));
+    }
 
     let objective = s.str("model.objective")?.to_string();
     let objective_params = read_objective_params(&s, ObjectiveParams::defaults_for(&objective))?;
@@ -440,11 +468,22 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
     let cat_begin = s.array("node.cat_begin", u32::from_le_bytes)?;
     let cat_end = s.array("node.cat_end", u32::from_le_bytes)?;
     let flags = s.bytes("node.flags")?;
+    if let Some(&bad) = flags.iter().find(|&&f| f & !NODE_FLAGS != 0) {
+        return Err(format_error(format!(
+            "`node.flags` holds undefined bits {:#04x}",
+            bad & !NODE_FLAGS
+        )));
+    }
     let category_count = s.array("tree.category_count", u32::from_le_bytes)?;
     let mut categories = Cursor::new(s.array("tree.categories", u32::from_le_bytes)?);
     let size_leaf_vector = s.array("tree.size_leaf_vector", u32::from_le_bytes)?;
     let mut leaf_vectors = Cursor::new(s.array("tree.leaf_vectors", f32::from_le_bytes)?);
     let has_linear = s.bytes("tree.has_linear")?;
+    if let Some(&bad) = has_linear.iter().find(|&&b| b > 1) {
+        return Err(format_error(format!(
+            "`tree.has_linear` holds {bad}, not 0 or 1"
+        )));
+    }
     let mut offsets = Cursor::new(s.array("leaf_linear.offsets", u32::from_le_bytes)?);
     let mut intercepts = Cursor::new(s.array("leaf_linear.intercepts", f64::from_le_bytes)?);
     let mut features = Cursor::new(s.array("leaf_linear.features", u32::from_le_bytes)?);
@@ -474,7 +513,7 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
         let n_weights = n
             .checked_mul(width)
             .ok_or_else(|| format_error("leaf vectors overflow"))?;
-        let linear = if has_linear[t] != 0 {
+        let linear = if has_linear[t] == 1 {
             let offsets = offsets.take(n + 1, "leaf_linear.offsets")?;
             let n_terms = offsets.last().map_or(0, |&end| end as usize);
             Some(LinearLeaves::from_parts(
@@ -843,6 +882,78 @@ mod tests {
                 assert!(err.contains("future.feature"), "{err}");
             }
         }
+    }
+
+    /// Every file names its writer in an optional section, so a reader that
+    /// predates the section (or drops it) loads the file the same.
+    #[test]
+    fn files_name_their_writer_in_an_optional_section() {
+        let (model, data) = model();
+        let bytes = model.to_bytes().unwrap();
+        let mut writer = None;
+        let without = rewrite(&bytes, |entries| {
+            let at = entries
+                .iter()
+                .position(|e| e.name == "model.writer")
+                .unwrap();
+            let entry = entries.remove(at);
+            writer = Some((entry.flags, String::from_utf8(entry.payload).unwrap()));
+        });
+        let (flags, name) = writer.unwrap();
+        assert_eq!(flags, 0);
+        assert_eq!(name, concat!("hessboost ", env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            BoostedModel::from_bytes(&without)
+                .unwrap()
+                .predict(&data)
+                .unwrap(),
+            model.predict(&data).unwrap()
+        );
+    }
+
+    /// Values a later writer could give a meaning are refused rather than
+    /// ignored: undefined `node.flags` bits, `tree.has_linear` bytes other
+    /// than 0 and 1, and bytes after the last section.
+    #[test]
+    fn undefined_encodings_are_refused() {
+        let (model, _) = model();
+        let bytes = model.to_bytes().unwrap();
+        let set = |name: &'static str, value: u8| {
+            rewrite(&bytes, |entries| {
+                let entry = entries.iter_mut().find(|e| e.name == name).unwrap();
+                entry.payload[0] |= value;
+            })
+        };
+        for (edited, needle) in [
+            (set("node.flags", 4), "node.flags"),
+            (set("node.flags", 0x80), "node.flags"),
+            (set("tree.has_linear", 2), "tree.has_linear"),
+        ] {
+            let err = BoostedModel::from_bytes(&edited).unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+
+        let container = rewrite(&bytes, |_| {});
+        let mut trailing = container[..container.len() - 8].to_vec();
+        trailing.push(0);
+        let checksum = xxh64(&trailing);
+        trailing.extend_from_slice(&checksum.to_le_bytes());
+        let err = BoostedModel::from_bytes(&trailing).unwrap_err().to_string();
+        assert!(err.contains("after the last section"), "{err}");
+        // The unedited re-encoding still loads: the refusals come from the
+        // edits alone.
+        assert!(BoostedModel::from_bytes(&container).is_ok());
+    }
+
+    /// Files of the pre-0.2.0 format are recognized by their magic and
+    /// refused with a pointer to the upgrade notes.
+    #[test]
+    fn pre_0_2_files_are_named_in_the_refusal() {
+        let (model, _) = model();
+        let mut legacy = rewrite(&model.to_bytes().unwrap(), |_| {});
+        legacy[..4].copy_from_slice(LEGACY_MAGIC);
+        let err = BoostedModel::from_bytes(&legacy).unwrap_err().to_string();
+        assert!(err.contains("0.1.x"), "{err}");
     }
 
     /// An objective parameter a file does not store takes the objective's

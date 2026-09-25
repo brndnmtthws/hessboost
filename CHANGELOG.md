@@ -104,11 +104,13 @@ may break the API).
   label matrices, groups): `Objective::gradient_info`, `validate_info`,
   `split_gradient`; `Metric::eval_info`, `validate_info`,
   `prediction_width`.
-- **Formats:** a native binary container (version 3: a section table,
-  zstd-compressed, with an XXH64 checksum), the compact bit-packed `HBTD`
-  format (`model::compact`), XGBoost UBJSON import and export, and XGBoost
-  JSON for categorical splits, forests, and multi-output and vector-leaf
-  models ([formats]).
+- **Formats:** a native binary container (magic `HBM\0`, version 3: a
+  section table, zstd-compressed, with an XXH64 checksum and an optional
+  `model.writer` section naming the release that wrote it; readers refuse
+  undefined flag bits and trailing bytes, and name 0.1.x files as such),
+  the compact bit-packed `HBTD` format (`model::compact`), XGBoost UBJSON
+  import and export, and XGBoost JSON for categorical splits, forests, and
+  multi-output and vector-leaf models ([formats]).
 - **Opt-in extensions** (off by default, never change default training):
   conformal prediction intervals, distributional `dist:*` boosting, budget
   training, ordered target statistics, `linear_tree` leaves,

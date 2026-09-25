@@ -1119,7 +1119,8 @@ mod tests {
 
     /// Metadata whose `n_targets` disagrees with its lengths evaluates to
     /// NaN through the default `eval_info` (a `usize::MAX` once overflowed
-    /// the per-cell weight allocation).
+    /// the per-cell weight allocation, and with no labels to back the cells
+    /// once allocated `n_rows * n_targets` weights).
     #[test]
     fn inconsistent_label_matrix_metadata_evaluates_to_nan() {
         let labels = [1.0f32, 2.0, 3.0, 4.0];
@@ -1134,6 +1135,23 @@ mod tests {
             let bad = MetaInfo { n_targets, ..info };
             assert!(Rmse.eval_info(&labels, &bad).is_nan(), "{n_targets}");
         }
+        let mut unlabeled = MetaInfo::new(&[], Some(&[1.0]), None);
+        unlabeled.n_rows = 1;
+        for n_targets in [2, usize::MAX] {
+            unlabeled.n_targets = n_targets;
+            assert!(Rmse.eval_info(&[], &unlabeled).is_nan(), "{n_targets}");
+        }
+        // Bounds-only metadata (no labels) stays valid where it is read.
+        let bounds = [1.0f32];
+        let aft = MetaInfo {
+            label_lower_bound: Some(&bounds),
+            label_upper_bound: Some(&bounds),
+            ..MetaInfo::new(&[], Some(&[1.0]), None)
+        };
+        let aft = MetaInfo { n_rows: 1, ..aft };
+        let nloglik = AftNLogLik::new(crate::config::AftDistribution::Normal, 1.0);
+        assert!(nloglik.validate_info(&aft).is_ok());
+        assert!(nloglik.eval_info(&[0.0], &aft).is_finite());
     }
 
     #[test]

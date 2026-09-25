@@ -655,13 +655,23 @@ impl BoostedModel {
         // (empty) tree ensemble: margin(row, k) = base_score[k] + bias[k] +
         // Σ_f weights[f][k] * x[row, f], with missing features contributing 0.
         if let Some(lm) = &self.linear {
-            for row in 0..n {
-                for c in 0..k {
-                    out[row * k + c] += lm.bias[c];
+            // Each row adds its bias, then its features in ascending order.
+            let add_row = |(row, margin): (usize, &mut [f32])| {
+                for (m, &b) in margin.iter_mut().zip(&lm.bias) {
+                    *m += b;
                 }
                 self.for_each_linear_contribution(data, row, |_f, c, v| {
-                    out[row * k + c] += v as f32;
+                    margin[c] += v as f32;
                 });
+            };
+            // Rows are independent, so parallel rows give the serial result.
+            if n >= PREDICT_BLOCK_ROWS && rayon::current_num_threads() > 1 {
+                out.par_chunks_mut(k)
+                    .with_min_len(PREDICT_BLOCK_ROWS)
+                    .enumerate()
+                    .for_each(add_row);
+            } else {
+                out.chunks_mut(k).enumerate().for_each(add_row);
             }
             return out;
         }
@@ -1323,7 +1333,17 @@ impl BoostedModel {
         Self::try_from(serde_json::from_str::<UncheckedBoostedModel>(s)?)
     }
 
+    /// Check everything prediction and the formats rely on: the output
+    /// layout, the objective and its parameters, and the stored values
+    /// (in that order; the first failure is reported).
     pub(crate) fn validate_structure(&self) -> Result<()> {
+        self.validate_layout()?;
+        self.validate_objective()?;
+        self.validate_values()
+    }
+
+    /// Feature count, outputs, targets, forest size, and tree kinds.
+    fn validate_layout(&self) -> Result<()> {
         if self.n_features == 0 {
             return Err(HessboostError::model_format(
                 "model has an invalid feature count",
@@ -1355,6 +1375,11 @@ impl BoostedModel {
                 self.trees.len()
             )));
         }
+        Ok(())
+    }
+
+    /// The objective's output width and parameters.
+    fn validate_objective(&self) -> Result<()> {
         check_objective_width(
             &self.objective,
             &self.objective_params,
@@ -1380,6 +1405,12 @@ impl BoostedModel {
                 self.objective_params.distribution, self.objective
             )));
         }
+        Ok(())
+    }
+
+    /// `best_iteration`, intercepts, tree weights, trees, and the linear
+    /// booster's parameters.
+    fn validate_values(&self) -> Result<()> {
         // Early stopping selects iterations of a tree ensemble; gblinear has
         // none (training refuses early stopping for it), and a stored value
         // would make plain prediction ask it for an iteration range.
@@ -1840,11 +1871,40 @@ impl<'a> RowBlock<'a> {
     fn original_leaf_ids_for_row(&self, forest: &CompactForest, r: usize, out: &mut [u32]) {
         match self.row(r) {
             Some(row) => forest.original_leaf_ids_for_row(row, out),
-            None => {
-                for (t, slot) in out.iter_mut().enumerate() {
-                    *slot = forest.original_id(forest.leaf_id_with(t, |f| self.get(r, f)));
-                }
-            }
+            None => self.wide_row_leaves(forest, r, 0..out.len(), |t, leaf| {
+                out[t] = forest.original_id(leaf);
+            }),
+        }
+    }
+
+    /// The wide sparse fallback of the per-row walks: `sink(t, leaf)` with
+    /// loaded row `r`'s arena leaf in each tree of `trees`, features looked
+    /// up one at a time.
+    #[inline]
+    fn wide_row_leaves(
+        &self,
+        forest: &CompactForest,
+        r: usize,
+        trees: std::ops::Range<usize>,
+        mut sink: impl FnMut(usize, u32),
+    ) {
+        for t in trees {
+            sink(t, forest.leaf_id_with(t, |f| self.get(r, f)));
+        }
+    }
+
+    /// The wide sparse fallback of the block walks: `sink(r, leaf)` with the
+    /// arena leaf of each of the first `rows` loaded rows in tree `t`.
+    #[inline]
+    fn wide_leaves(
+        &self,
+        forest: &CompactForest,
+        t: usize,
+        rows: usize,
+        mut sink: impl FnMut(usize, u32),
+    ) {
+        for r in 0..rows {
+            sink(r, forest.leaf_id_with(t, |f| self.get(r, f)));
         }
     }
 
@@ -1864,10 +1924,9 @@ impl<'a> RowBlock<'a> {
             forest.accumulate_row(row, trees, parallel, weight, out);
         } else {
             let k = out.len();
-            for t in trees {
-                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+            self.wide_row_leaves(forest, r, trees, |t, leaf| {
                 out[scalar_tree_output(t, parallel, k)] += weight(t) * forest.leaf_value(leaf);
-            }
+            });
         }
     }
 
@@ -1885,13 +1944,12 @@ impl<'a> RowBlock<'a> {
             forest.accumulate_row_vector(row, trees, weight, out);
         } else {
             let k = out.len();
-            for t in trees {
-                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+            self.wide_row_leaves(forest, r, trees, |t, leaf| {
                 let w = weight(t);
                 for (o, &v) in out.iter_mut().zip(forest.leaf_vector(leaf, k)) {
                     *o += w * v;
                 }
-            }
+            });
         }
     }
 
@@ -1940,10 +1998,9 @@ impl<'a> RowBlock<'a> {
         if let Some(block) = self.lane_block(rows) {
             forest.original_leaf_ids(t, block, out, stride);
         } else {
-            for r in 0..rows {
-                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+            self.wide_leaves(forest, t, rows, |r, leaf| {
                 out[r * stride] = forest.original_id(leaf);
-            }
+            });
         }
     }
 
@@ -1961,13 +2018,12 @@ impl<'a> RowBlock<'a> {
         if let Some(block) = self.lane_block(rows) {
             forest.accumulate_vector(t, block, stride, weight, out, stride);
         } else {
-            for r in 0..rows {
-                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+            self.wide_leaves(forest, t, rows, |r, leaf| {
                 let dst = &mut out[r * stride..(r + 1) * stride];
                 for (o, &v) in dst.iter_mut().zip(forest.leaf_vector(leaf, stride)) {
                     *o += weight * v;
                 }
-            }
+            });
         }
     }
 
@@ -1985,10 +2041,9 @@ impl<'a> RowBlock<'a> {
         if let Some(block) = self.lane_block(rows) {
             forest.accumulate(t, block, weight, out, stride);
         } else {
-            for r in 0..rows {
-                let leaf = forest.leaf_id_with(t, |f| self.get(r, f));
+            self.wide_leaves(forest, t, rows, |r, leaf| {
                 out[r * stride] += weight * forest.leaf_value(leaf);
-            }
+            });
         }
     }
 }

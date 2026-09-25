@@ -40,7 +40,7 @@
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, RowBlock};
-use crate::tree::{RegTree, in_category_set};
+use crate::tree::{RegTree, SplitTest, split_goes_left};
 use rayon::prelude::*;
 use std::ops::RangeBounds;
 use std::sync::LazyLock;
@@ -336,11 +336,13 @@ fn root_mean_values(tree: &RegTree, nid: usize, path_weight: f64, out: &mut [f64
 }
 
 impl ShapTree {
-    fn from_tree(tree: &RegTree) -> Result<Self> {
+    /// The SHAP walk tree of `tree` with leaf `id` holding `leaf_value(id)`
+    /// (its value, or one output of a vector leaf).
+    fn from_tree(tree: &RegTree, leaf_value: impl Fn(usize) -> f32) -> Result<Self> {
         let src = tree.nodes();
         let mut features = Vec::new();
         let mut nodes = Vec::with_capacity(src.len());
-        for n in src {
+        for (id, n) in src.iter().enumerate() {
             let mut node = ShapNode {
                 feature: n.split_feature,
                 cond: n.split_cond,
@@ -352,7 +354,7 @@ impl ShapTree {
                 second: NO_CHILD,
                 first_weight: 0.0,
                 second_weight: 0.0,
-                value: n.leaf_value,
+                value: if n.is_leaf() { leaf_value(id) } else { 0.0 },
             };
             if !n.is_leaf() {
                 let (l, r) = xgboost_children(n);
@@ -551,16 +553,14 @@ impl<F: Formulation> Walk<'_, F> {
         }
         // Route with hessboost's orientation, then map onto XGBoost's order.
         let v = self.row[node.feature as usize];
-        let goes_left = if v.is_nan() {
-            node.default_left
-        } else if node.is_categorical {
-            in_category_set(
+        let test = if node.is_categorical {
+            SplitTest::Categories(
                 &self.tree.categories[node.cat_begin as usize..node.cat_end as usize],
-                v,
             )
         } else {
-            v < node.cond
+            SplitTest::Threshold(node.cond)
         };
+        let goes_left = split_goes_left((!v.is_nan()).then_some(v), node.default_left, test);
         let goes_first = goes_left != node.is_categorical;
         let branch = |child, weight, satisfies| Branch {
             feature: node.feature,
@@ -670,12 +670,11 @@ impl BoostedModel {
         let mut weights = Vec::with_capacity(trees.len());
         let mut shap_trees = Vec::with_capacity(trees.len());
         let mut root_means = vec![0f64; k];
-        let mut push = |tree: &RegTree, c: usize, root_mean: f64, weight: f32| -> Result<()> {
+        let mut push = |tree: ShapTree, c: usize, root_mean: f64, weight: f32| {
             by_output[c].push(shap_trees.len());
-            shap_trees.push(ShapTree::from_tree(tree)?);
+            shap_trees.push(tree);
             sums[c] = madd64(root_mean, f64::from(weight), sums[c]);
             weights.push(weight);
-            Ok(())
         };
         for (ti, tree) in trees.iter().enumerate() {
             let weight = self.tree_weight(ti);
@@ -687,11 +686,14 @@ impl BoostedModel {
                 // from the per-output bottom-up reduction.
                 root_means.fill(0.0);
                 root_mean_values(tree, 0, 1.0, &mut root_means);
+                let (width, leaves) = tree.leaf_vector_parts();
                 for (c, &root_mean) in root_means.iter().enumerate() {
-                    push(&tree.output_tree(c), c, root_mean, weight)?;
+                    let shap = ShapTree::from_tree(tree, |id| leaves[id * width + c])?;
+                    push(shap, c, root_mean, weight);
                 }
             } else {
-                push(tree, self.tree_output(ti), root_mean_value(tree, 0), weight)?;
+                let shap = ShapTree::from_tree(tree, |id| tree.node(id).leaf_value)?;
+                push(shap, self.tree_output(ti), root_mean_value(tree, 0), weight);
             }
         }
         Ok(ShapForest {
@@ -920,33 +922,37 @@ impl BoostedModel {
                     }
                     diag[nf] += forest.root_mean_sums[c];
                     diag[nf] += initial[row * k + c];
-
-                    // Average the two directed estimates of each pair, then
-                    // set each diagonal so its row sums to the additive value.
-                    for r in 0..width {
-                        for cc in r + 1..width {
-                            #[allow(
-                                clippy::manual_midpoint,
-                                reason = "XGBoost rounds the sum, then halves"
-                            )]
-                            let sym = 0.5 * (m[r * width + cc] + m[cc * width + r]);
-                            m[r * width + cc] = sym;
-                            m[cc * width + r] = sym;
-                        }
-                    }
-                    for r in 0..width {
-                        let mut value = diag[r];
-                        for cc in 0..width {
-                            if cc != r {
-                                value -= m[r * width + cc];
-                            }
-                        }
-                        m[r * width + r] = value;
-                    }
+                    finalize_interactions(m, diag, width);
                 }
             },
         );
         Ok(out)
+    }
+}
+
+/// Finish one output's `width × width` interaction matrix `m` from its
+/// directed estimates: average the two estimates of each pair, then set
+/// each diagonal cell so its row sums to the additive value in `diag`.
+fn finalize_interactions(m: &mut [f32], diag: &[f32], width: usize) {
+    for r in 0..width {
+        for cc in r + 1..width {
+            #[allow(
+                clippy::manual_midpoint,
+                reason = "XGBoost rounds the sum, then halves"
+            )]
+            let sym = 0.5 * (m[r * width + cc] + m[cc * width + r]);
+            m[r * width + cc] = sym;
+            m[cc * width + r] = sym;
+        }
+    }
+    for r in 0..width {
+        let mut value = diag[r];
+        for cc in 0..width {
+            if cc != r {
+                value -= m[r * width + cc];
+            }
+        }
+        m[r * width + r] = value;
     }
 }
 

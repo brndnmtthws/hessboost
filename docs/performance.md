@@ -471,6 +471,39 @@ builds the layout for its initial margins, so the extension added about 2%
 to all variants, and DART's own rebuild does not measure), and writing the
 gradient-based sample in place (no gain).
 
+### Prediction and explanations
+
+The single-row compact walk keeps the keys of rows with up to 128 features
+on the stack instead of allocating a buffer per call, the compact layout is
+built by one breadth-first ordering plus a per-node encoder, gblinear
+margins are computed in parallel over rows (each row keeps its addition
+order), and SHAP takes each output's tree of a vector-leaf model straight
+from the leaf vectors instead of cloning the whole tree per output.
+Predictions and attributions are unchanged.
+
+Measured like the cases above against the previous commit, in a throwaway
+harness on the `predict_100k_x30_100trees_depth6` model shape (100
+depth-six trees over 30 features; gblinear on 100,000 rows × 30 features).
+
+| Case | Threads | Before (ms) | After (ms) | Less time |
+|---|---:|---:|---:|---:|
+| `predict_margin`, 1 row | 1 | 0.0009 | 0.0008 | 8.3% |
+| `predict_margin`, 8 rows | 1 | 0.0065 | 0.0059 | 8.4% |
+| `predict_leaf`, 8 rows | 1 | 0.0045 | 0.0040 | 10.1% |
+| `predict_contribs`, vector leaves, 1 row | 1 | 0.405 | 0.391 | 3.5% |
+| gblinear `predict_margin`, 100k rows | 16 | 6.581 | 0.717 | 89.1% |
+
+Batch prediction (`predict_100k_x30_100trees_depth6`,
+`predict_csr_100trees_depth6`), SHAP (`shap_x20_100trees_depth6`),
+single-threaded gblinear, and conformal calibration are unchanged: their
+hot loops are the same code, and their differences (within about ±4%, in
+both directions across rebuilds) are binary layout. Two builds of the
+previous commit's prediction code, differing only in unrelated training
+code, measured the depthwise case at 140.0 ms and 132.8 ms. Sharing the
+block tail walk between the generic and symmetric kernels was dropped: it
+made quantile prediction 4.6% and symmetric prediction 2.2% slower in the
+same build comparison.
+
 ## Implementation
 
 The private `simd` module owns dispatch and numerical kernels. AArch64 checks

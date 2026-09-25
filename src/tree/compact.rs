@@ -40,7 +40,7 @@
 //! full lane groups and reaches the same arena leaves.
 
 use crate::tree::oblivious::{ArenaNode, SymmetricTables};
-use crate::tree::{RegTree, in_category_set, scalar_tree_output};
+use crate::tree::{Node, RegTree, in_category_set, scalar_tree_output};
 
 /// Rows (or trees) walked in lockstep by the fixed-depth kernel.
 pub(crate) const LANES: usize = 16;
@@ -205,6 +205,57 @@ impl TreeMeta {
     }
 }
 
+/// A tree's nodes in arena (breadth-first) order: children are pushed as
+/// an adjacent pair, the `false` child (missing values' destination) first.
+struct BreadthFirst {
+    /// Source node ids in arena order.
+    order: Vec<u32>,
+    /// Arena id of each source node.
+    new_id: Vec<u32>,
+    /// Depth of each source node (root 0).
+    depth_of: Vec<u32>,
+}
+
+impl BreadthFirst {
+    /// The order of `src`'s nodes in an arena whose first node is `base`.
+    fn of(src: &[Node], base: u32) -> Self {
+        let mut order: Vec<u32> = Vec::with_capacity(src.len());
+        let mut new_id = vec![u32::MAX; src.len()];
+        let mut depth_of = vec![0u32; src.len()];
+        order.push(0);
+        new_id[0] = base;
+        let mut i = 0;
+        while i < order.len() {
+            let old = order[i] as usize;
+            let n = &src[old];
+            if !n.is_leaf() {
+                // Numeric splits whose missing values go right are stored
+                // mirrored; categorical nodes keep (left, right).
+                let (first, second) = if n.default_left || n.is_categorical {
+                    (n.left, n.right)
+                } else {
+                    (n.right, n.left)
+                };
+                for child in [first as usize, second as usize] {
+                    new_id[child] = base + order.len() as u32;
+                    depth_of[child] = depth_of[old] + 1;
+                    order.push(child as u32);
+                }
+            }
+            i += 1;
+        }
+        BreadthFirst {
+            order,
+            new_id,
+            depth_of,
+        }
+    }
+}
+
+/// Keys (two per feature) [`CompactForest::walk_row`] keeps on the stack;
+/// wider rows key into a heap buffer.
+const INLINE_KEYS: usize = 256;
+
 /// A block of dense rows as the batch kernels consume it: the full
 /// [`LANES`]-row groups keyed lane-major (see [`fill_lanes`]) and the
 /// remaining `rows % LANES` rows raw.
@@ -270,111 +321,28 @@ impl CompactForest {
     }
 
     fn push_tree(&mut self, tree: &RegTree) {
-        let src = tree.nodes();
         let base = self.nodes.len() as u32;
         let cat_base = self.categories.len() as u32;
         self.categories.extend_from_slice(tree.categories());
-        // Breadth-first order: children are pushed as an adjacent pair, the
-        // `false` child (missing values' destination) first.
-        let mut order: Vec<u32> = Vec::with_capacity(src.len());
-        let mut new_id = vec![u32::MAX; src.len()];
-        let mut depth_of = vec![0u32; src.len()];
-        order.push(0);
-        new_id[0] = base;
-        let mut i = 0;
-        while i < order.len() {
-            let old = order[i] as usize;
-            let n = &src[old];
-            if !n.is_leaf() {
-                // Numeric splits whose missing values go right are stored
-                // mirrored; categorical nodes keep (left, right).
-                let (first, second) = if n.default_left || n.is_categorical {
-                    (n.left, n.right)
-                } else {
-                    (n.right, n.left)
-                };
-                for child in [first as usize, second as usize] {
-                    new_id[child] = base + order.len() as u32;
-                    depth_of[child] = depth_of[old] + 1;
-                    order.push(child as u32);
-                }
-            }
-            i += 1;
-        }
-        let mut has_categorical = false;
-        let mut depth = 0u32;
-        let mut max_feature = 0u32;
-        for &old in &order {
-            let n = &src[old as usize];
-            let id = self.nodes.len() as u32;
-            depth = depth.max(depth_of[old as usize]);
-            let node = if n.is_leaf() {
-                let aux = if tree.is_vector_leaf() {
-                    let offset = u32::try_from(self.leaf_vectors.len())
-                        .expect("leaf vectors exceed the compact encoding");
-                    self.leaf_vectors
-                        .extend_from_slice(tree.leaf_vector(old as usize));
-                    offset
-                } else {
-                    n.leaf_value.to_bits()
-                };
-                CNode {
-                    slot: 0,
-                    key: LEAF_KEY,
-                    left: id,
-                    aux,
-                }
-            } else if n.is_categorical {
-                has_categorical = true;
-                max_feature = max_feature.max(n.split_feature);
-                let (begin, end) = (cat_base + n.cat_begin, cat_base + n.cat_end);
-                assert!(
-                    end < (1 << (32 - CAT_END_SHIFT)),
-                    "categorical set range does not fit the compact encoding"
-                );
-                let mut aux = CATEGORICAL | (end << CAT_END_SHIFT);
-                if n.default_left {
-                    aux |= CAT_DEFAULT_LEFT;
-                }
-                CNode {
-                    slot: n.split_feature * FEATURE_LANES as u32,
-                    key: begin,
-                    left: new_id[n.left as usize],
-                    aux,
-                }
-            } else if n.default_left {
-                // go right (to `right`) iff v >= cond  <=>  v > next_below(cond)
-                max_feature = max_feature.max(n.split_feature);
-                CNode {
-                    slot: n.split_feature * FEATURE_LANES as u32,
-                    key: key(next_below(n.split_cond)),
-                    left: new_id[n.left as usize],
-                    aux: 0,
-                }
-            } else {
-                // children mirrored: go to `left` (second) iff v < cond
-                //   <=>  -v > -cond, read from the negated key half
-                max_feature = max_feature.max(n.split_feature);
-                CNode {
-                    slot: n.split_feature * FEATURE_LANES as u32 + LANES as u32,
-                    key: key(-n.split_cond),
-                    left: new_id[n.right as usize],
-                    aux: 0,
-                }
-            };
+        let layout = BreadthFirst::of(tree.nodes(), base);
+        let mut meta = TreeMeta {
+            root: base,
+            depth: 0,
+            has_categorical: false,
+            max_feature: 0,
+        };
+        for &old in &layout.order {
+            meta.depth = meta.depth.max(layout.depth_of[old as usize]);
+            let node = self.encode_node(tree, old as usize, &layout.new_id, cat_base, &mut meta);
             self.nodes.push(node);
             self.orig_id.push(old);
         }
         assert!(
-            max_feature <= MAX_SLOT_FEATURE,
-            "feature index {max_feature} does not fit the compact split encoding"
+            meta.max_feature <= MAX_SLOT_FEATURE,
+            "feature index {} does not fit the compact split encoding",
+            meta.max_feature
         );
-        self.trees.push(TreeMeta {
-            root: base,
-            depth,
-            has_categorical,
-            max_feature,
-        });
+        self.trees.push(meta);
         let nodes = &self.nodes;
         self.symmetric.push(base, |id| {
             let node = &nodes[id as usize];
@@ -390,6 +358,73 @@ impl CompactForest {
                 }
             }
         });
+    }
+
+    /// The arena node of `tree`'s node `old`, whose children sit at
+    /// `new_id` (a leaf's vector is appended to the pool), recording its
+    /// split in `meta`.
+    fn encode_node(
+        &mut self,
+        tree: &RegTree,
+        old: usize,
+        new_id: &[u32],
+        cat_base: u32,
+        meta: &mut TreeMeta,
+    ) -> CNode {
+        let n = &tree.nodes()[old];
+        let id = self.nodes.len() as u32;
+        if n.is_leaf() {
+            let aux = if tree.is_vector_leaf() {
+                let offset = u32::try_from(self.leaf_vectors.len())
+                    .expect("leaf vectors exceed the compact encoding");
+                self.leaf_vectors.extend_from_slice(tree.leaf_vector(old));
+                offset
+            } else {
+                n.leaf_value.to_bits()
+            };
+            return CNode {
+                slot: 0,
+                key: LEAF_KEY,
+                left: id,
+                aux,
+            };
+        }
+        meta.max_feature = meta.max_feature.max(n.split_feature);
+        if n.is_categorical {
+            meta.has_categorical = true;
+            let (begin, end) = (cat_base + n.cat_begin, cat_base + n.cat_end);
+            assert!(
+                end < (1 << (32 - CAT_END_SHIFT)),
+                "categorical set range does not fit the compact encoding"
+            );
+            let mut aux = CATEGORICAL | (end << CAT_END_SHIFT);
+            if n.default_left {
+                aux |= CAT_DEFAULT_LEFT;
+            }
+            CNode {
+                slot: n.split_feature * FEATURE_LANES as u32,
+                key: begin,
+                left: new_id[n.left as usize],
+                aux,
+            }
+        } else if n.default_left {
+            // go right (to `right`) iff v >= cond  <=>  v > next_below(cond)
+            CNode {
+                slot: n.split_feature * FEATURE_LANES as u32,
+                key: key(next_below(n.split_cond)),
+                left: new_id[n.left as usize],
+                aux: 0,
+            }
+        } else {
+            // children mirrored: go to `left` (second) iff v < cond
+            //   <=>  -v > -cond, read from the negated key half
+            CNode {
+                slot: n.split_feature * FEATURE_LANES as u32 + LANES as u32,
+                key: key(-n.split_cond),
+                left: new_id[n.right as usize],
+                aux: 0,
+            }
+        }
     }
 
     /// Weight vector (`k` outputs) of vector-leaf arena node `id`.
@@ -739,7 +774,11 @@ impl CompactForest {
         let begin = trees.start;
         let groups = trees.len() / LANES;
         let full = begin + groups * LANES;
-        let mut keys: Vec<u32> = Vec::new();
+        // The row's keys, filled when the first lockstep group needs them:
+        // on the stack for rows of up to `INLINE_KEYS / 2` features.
+        let mut inline = [0u32; INLINE_KEYS];
+        let mut heap: Vec<u32> = Vec::new();
+        let mut keyed = false;
         for g in 0..groups {
             let first = begin + g * LANES;
             let group = &self.trees[first..first + LANES];
@@ -758,14 +797,24 @@ impl CompactForest {
             for meta in group {
                 meta.check_width(row.len());
             }
-            if keys.is_empty() {
-                keys.reserve(2 * row.len());
-                for &v in row {
-                    keys.push(key(v));
-                    keys.push(key(-v));
+            let len = 2 * row.len();
+            if !keyed {
+                let buf: &mut [u32] = if len <= INLINE_KEYS {
+                    &mut inline[..len]
+                } else {
+                    heap.resize(len, 0);
+                    &mut heap
+                };
+                for (pair, &v) in buf.as_chunks_mut::<2>().0.iter_mut().zip(row) {
+                    *pair = [key(v), key(-v)];
                 }
+                keyed = true;
             }
-            let keys = &keys[..];
+            let keys: &[u32] = if len <= INLINE_KEYS {
+                &inline[..len]
+            } else {
+                &heap
+            };
             let mut nid = [0usize; LANES];
             for (n, meta) in nid.iter_mut().zip(group) {
                 *n = meta.root as usize;

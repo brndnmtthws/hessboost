@@ -8,7 +8,12 @@
 //! margins, [`predict_class`] class indices or thresholded labels,
 //! [`predict_leaf`] the leaf index each row reaches in every tree, and
 //! [`predict_distribution`] the fitted conditional distribution of a `dist:*`
-//! model. Multi-output predictions are row-major `[row][output]`.
+//! model. All but the last return [`Predictions`]: a row-major
+//! `[row][output]` buffer with its [`n_rows`](Predictions::n_rows) and
+//! [`width`](Predictions::width) (`num_class` for `multi:softprob`, 1 for
+//! `multi:softmax`'s class index, the tree count for leaves), read by row or
+//! element, or as one flat slice via [`as_slice`](Predictions::as_slice) /
+//! [`into_vec`](Predictions::into_vec).
 //!
 //! Each has a `_range` variant ([`predict_range`], [`predict_margin_range`],
 //! [`predict_leaf_range`], [`predict_contribs_range`],
@@ -20,10 +25,13 @@
 //!
 //! # Explanation
 //!
-//! [`predict_contribs`] gives per-feature SHAP contributions (QuadratureTreeSHAP),
-//! `[row][n_features + 1]` with the bias last; [`predict_interactions`] gives
-//! SHAP interaction values, `[row][(n_features + 1)^2]`. Multi-output models
-//! add an output axis. [`BoostedModel::feature_importance`] scores features by
+//! [`predict_contribs`] gives per-feature SHAP contributions
+//! (QuadratureTreeSHAP) as [`Contributions`]: `n_features + 1` values per row
+//! and output with the bias last ([`Contributions::get`],
+//! [`Contributions::bias`]); [`predict_interactions`] gives SHAP interaction
+//! values as [`Interactions`]: an `(n_features + 1)^2` matrix per row and
+//! output ([`Interactions::get`], [`Interactions::at`]).
+//! [`BoostedModel::feature_importance`] scores features by
 //! [`ImportanceType`] (XGBoost's `importance_type`).
 //!
 //! # Persistence
@@ -312,12 +320,14 @@ pub mod compact;
 mod lightgbm;
 mod native;
 mod objective;
+mod predictions;
 mod sections;
 mod shap;
 mod ubjson;
 mod xgboost;
 
 pub use objective::ModelObjective;
+pub use predictions::{Contributions, Interactions, Predictions};
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -959,13 +969,12 @@ impl BoostedModel {
         &self,
         data: &DMatrix,
         iterations: impl RangeBounds<usize>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<Predictions> {
         let margin = self.predict_margin_range(data, iterations)?;
         Ok(transform_model_margins(
             &self.objective,
             self.max_delta_step,
             self.n_targets,
-            self.n_outputs(),
             margin,
         ))
     }
@@ -975,23 +984,30 @@ impl BoostedModel {
     /// to the nearest class at 0.5. A multi-target model (label matrix) is
     /// multi-label: each target is thresholded at 0.5 independently, giving
     /// `n_rows × n_targets` decisions laid out `[row][target]`.
-    pub fn predict_class(&self, data: &DMatrix) -> Result<Vec<u32>> {
+    pub fn predict_class(&self, data: &DMatrix) -> Result<Predictions<u32>> {
         let probs = self.predict(data)?;
         let k = self.n_outputs();
         if k == 1 || self.n_targets > 1 {
-            return Ok(probs.iter().map(|&p| u32::from(p > 0.5)).collect());
+            let values = probs
+                .as_slice()
+                .iter()
+                .map(|&p| u32::from(p > 0.5))
+                .collect();
+            return Ok(Predictions::new(values, probs.n_rows(), probs.width()));
         }
         if self
             .objective
             .built_in()
             .is_some_and(Objective::predicts_class_index)
         {
-            return Ok(probs.iter().map(|&class| class as u32).collect());
+            let values = probs.as_slice().iter().map(|&class| class as u32).collect();
+            return Ok(Predictions::new(values, probs.n_rows(), 1));
         }
-        Ok(probs
-            .chunks_exact(k)
+        let values = probs
+            .rows()
             .map(|row| crate::simd::argmax_scalar(row) as u32)
-            .collect())
+            .collect();
+        Ok(Predictions::new(values, probs.n_rows(), 1))
     }
 
     /// [`Self::predict_leaf`] for the trees of the iterations in
@@ -1005,13 +1021,13 @@ impl BoostedModel {
         &self,
         data: &DMatrix,
         iterations: impl RangeBounds<usize>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Predictions<u32>> {
         self.validate_prediction_data(data)?;
         let t = self.prefix_trees(iterations, "leaf prediction")?;
         let n = data.n_rows();
         let mut out = vec![0u32; n * t];
         if t == 0 {
-            return Ok(out);
+            return Ok(Predictions::new(out, n, t));
         }
         self.traverse_blocks(
             data,
@@ -1023,7 +1039,7 @@ impl BoostedModel {
                 block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], stride);
             },
         );
-        Ok(out)
+        Ok(Predictions::new(out, n, t))
     }
 
     /// Compute feature importance of the requested type, returned as a map from
@@ -1315,9 +1331,9 @@ impl BoostedModel {
     }
 
     /// Raw margin predictions using the effective iterations (`[0,
-    /// best_iteration + 1)` after early stopping, else all). The output is
-    /// laid out `[instance][output]` (length `n_rows × n_outputs`).
-    pub fn predict_margin(&self, data: &DMatrix) -> Result<Vec<f32>> {
+    /// best_iteration + 1)` after early stopping, else all), laid out
+    /// `[row][output]` (`n_outputs` wide).
+    pub fn predict_margin(&self, data: &DMatrix) -> Result<Predictions> {
         self.predict_margin_range(data, self.default_iteration_range())
     }
 
@@ -1331,17 +1347,18 @@ impl BoostedModel {
         &self,
         data: &DMatrix,
         iterations: impl RangeBounds<usize>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<Predictions> {
         self.validate_prediction_data(data)?;
         let trees = self.iteration_trees(self.resolve_iterations(iterations, "iterations")?);
-        Ok(self.margin_from_trees(data, trees))
+        let values = self.margin_from_trees(data, trees);
+        Ok(Predictions::new(values, data.n_rows(), self.n_outputs()))
     }
 
     /// Predictions in the objective's reported space. `multi:softprob` returns
     /// an `n_rows × num_class` probability matrix while `multi:softmax` returns
     /// one class index per row, encoded as `f32`. Uses the effective
     /// iterations, like [`Self::predict_margin`].
-    pub fn predict(&self, data: &DMatrix) -> Result<Vec<f32>> {
+    pub fn predict(&self, data: &DMatrix) -> Result<Predictions> {
         self.predict_range(data, self.default_iteration_range())
     }
 
@@ -1382,6 +1399,7 @@ impl BoostedModel {
             })?;
         let margin = self.predict_margin_range(data, iterations)?;
         Ok(margin
+            .as_slice()
             .chunks_exact(family.n_params())
             .map(|row| {
                 let mut eta = [0.0; 2];
@@ -1396,7 +1414,7 @@ impl BoostedModel {
     /// Per-row leaf indices for each tree (shape `n_rows × num_trees`,
     /// row-major, trees in [`Self::trees`] order). Walks every tree,
     /// regardless of early stopping.
-    pub fn predict_leaf(&self, data: &DMatrix) -> Result<Vec<u32>> {
+    pub fn predict_leaf(&self, data: &DMatrix) -> Result<Predictions<u32>> {
         self.predict_leaf_range(data, ..)
     }
 
@@ -1833,27 +1851,27 @@ pub(crate) fn check_objective_width(
     }
 }
 
-/// Turn raw margins (`[row][output]`, `n_outputs` wide) of a model with the
-/// given objective into predictions in the objective's reported space: the
-/// objective's transform (identity for an objective the crate does not
-/// implement, e.g. a custom loss, mirroring how XGBoost returns margins
-/// then), and for `multi:softmax` the per-row argmax class index encoded as
-/// `f32`.
+/// Turn raw margins (`[row][output]`) of a model with the given objective
+/// into predictions in the objective's reported space: the objective's
+/// transform (identity for an objective the crate does not implement, e.g. a
+/// custom loss, mirroring how XGBoost returns margins then), and for
+/// `multi:softmax` the per-row argmax class index encoded as `f32` (width 1).
 pub(crate) fn transform_model_margins(
     objective: &ModelObjective,
     max_delta_step: f64,
     n_targets: usize,
-    n_outputs: usize,
-    mut margin: Vec<f32>,
-) -> Vec<f32> {
+    margin: Predictions,
+) -> Predictions {
+    let (n_rows, n_outputs) = (margin.n_rows(), margin.width());
+    let mut values = margin.into_vec();
     if let Some(Ok(loss)) = rebuild_objective(objective, max_delta_step, n_targets) {
-        loss.pred_transform(&mut margin);
+        loss.pred_transform(&mut values);
     }
     if objective
         .built_in()
         .is_some_and(Objective::predicts_class_index)
     {
-        return margin
+        let classes = values
             .chunks_exact(n_outputs)
             .map(|row| {
                 row.iter()
@@ -1862,8 +1880,9 @@ pub(crate) fn transform_model_margins(
                     .map_or(0.0, |(i, _)| i as f32)
             })
             .collect();
+        return Predictions::new(classes, n_rows, 1);
     }
-    margin
+    Predictions::new(values, n_rows, n_outputs)
 }
 
 /// Rows per prediction block: the block's feature rows stay in cache while
@@ -2252,11 +2271,12 @@ mod tests {
             .unwrap()
             .with_label_matrix(&y, 2)
             .unwrap();
-        // Built unchecked: `train` itself must refuse the layout, whatever the
-        // builder's own bounds.
-        let params = TrainingParams::builder()
-            .num_parallel_tree(1usize << (usize::BITS - 1))
-            .build_unchecked();
+        // Set directly, unvalidated: `train` itself must refuse the layout,
+        // whatever the builder's own bounds.
+        let params = TrainingParams {
+            num_parallel_tree: 1usize << (usize::BITS - 1),
+            ..TrainingParams::default()
+        };
         for rounds in [0, 1] {
             assert!(matches!(
                 train(&params, &d, rounds),

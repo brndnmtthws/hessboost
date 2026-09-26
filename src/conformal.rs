@@ -68,14 +68,35 @@
 //!
 //! let conformal = SplitConformal::calibrate(&model, &dcal, 0.1)?;
 //! let intervals = conformal.predict_interval(&dcal)?;
-//! assert!(intervals.iter().all(|(lo, hi)| lo <= hi));
+//! assert!(intervals.iter().all(|i| i.lower <= i.upper));
 //! # Ok(())
 //! # }
 //! ```
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
+use crate::model::{BoostedModel, Predictions};
+
+/// A prediction interval `[lower, upper]` for one row.
+///
+/// Split-conformal intervals always have `lower <= upper`; a conformalized
+/// quantile band shrunk by a negative correction may not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Interval {
+    /// The lower bound.
+    pub lower: f32,
+    /// The upper bound.
+    pub upper: f32,
+}
+
+impl Interval {
+    /// `[-∞, +∞]`, returned when the calibration set is too small for the
+    /// requested coverage.
+    const UNBOUNDED: Interval = Interval {
+        lower: f32::NEG_INFINITY,
+        upper: f32::INFINITY,
+    };
+}
 
 /// Split-conformal intervals `[f(x) - Q, f(x) + Q]` around a single-output
 /// point model `f`.
@@ -111,7 +132,8 @@ impl<'a> SplitConformal<'a> {
     pub fn calibrate(model: &'a BoostedModel, calibration: &DMatrix, alpha: f64) -> Result<Self> {
         validate_alpha(alpha)?;
         let labels = calibration_labels(calibration)?;
-        let preds = single_output_predictions(model, calibration)?;
+        // One value per row.
+        let preds = single_output_predictions(model, calibration)?.into_vec();
         let half_width = score_quantile(labels, alpha, |i, y| {
             let p = f64::from(preds[i]);
             sub_round_up(y, p).max(sub_round_up(p, y))
@@ -134,11 +156,12 @@ impl<'a> SplitConformal<'a> {
     ///
     /// [`HessboostError::DimensionMismatch`] on a feature-count mismatch and
     /// [`HessboostError::InvalidParameter`] if a prediction is not finite.
-    pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
+    pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<Interval>> {
         let preds = single_output_predictions(self.model, data)?;
         Ok(preds
+            .as_slice()
             .iter()
-            .map(|&p| widen(p, p, self.half_width))
+            .map(|&p| widen(Interval { lower: p, upper: p }, self.half_width))
             .collect())
     }
 
@@ -223,24 +246,31 @@ impl QuantileBand<'_> {
         }
     }
 
-    /// The raw `(q_lo, q_hi)` predictions for every row, validated finite.
-    fn predict(self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
+    /// The raw `[q_lo, q_hi]` band for every row, validated finite.
+    fn predict(self, data: &DMatrix) -> Result<Vec<Interval>> {
         match self {
             QuantileBand::Pair { lower, upper } => {
                 let lo = single_output_predictions(lower, data)?;
                 let hi = single_output_predictions(upper, data)?;
-                Ok(lo.into_iter().zip(hi).collect())
+                Ok(lo
+                    .as_slice()
+                    .iter()
+                    .zip(hi.as_slice())
+                    .map(|(&lower, &upper)| Interval { lower, upper })
+                    .collect())
             }
             QuantileBand::Outputs {
                 model,
                 lower,
                 upper,
             } => {
-                let k = model.n_outputs();
-                let preds = checked_predictions(model, data, k)?;
+                let preds = checked_predictions(model, data, model.n_outputs())?;
                 Ok(preds
-                    .chunks_exact(k)
-                    .map(|row| (row[lower], row[upper]))
+                    .rows()
+                    .map(|row| Interval {
+                        lower: row[lower],
+                        upper: row[upper],
+                    })
                     .collect())
             }
             QuantileBand::Distribution {
@@ -248,12 +278,15 @@ impl QuantileBand<'_> {
                 lower,
                 upper,
             } => {
-                let band: Vec<(f32, f32)> = model
+                let band: Vec<Interval> = model
                     .predict_distribution(data)?
                     .iter()
-                    .map(|d| (round_down(d.quantile(lower)), round_up(d.quantile(upper))))
+                    .map(|d| Interval {
+                        lower: round_down(d.quantile(lower)),
+                        upper: round_up(d.quantile(upper)),
+                    })
                     .collect();
-                check_finite(band.iter().flat_map(|&(lo, hi)| [lo, hi]))?;
+                check_finite(band.iter().flat_map(|i| [i.lower, i.upper]))?;
                 Ok(band)
             }
         }
@@ -370,8 +403,8 @@ impl<'a> ConformalizedQuantile<'a> {
         } else {
             let raw = band.predict(calibration)?;
             score_quantile(labels, alpha, |i, y| {
-                let (lo, hi) = raw[i];
-                sub_round_up(f64::from(lo), y).max(sub_round_up(y, f64::from(hi)))
+                let band = raw[i];
+                sub_round_up(f64::from(band.lower), y).max(sub_round_up(y, f64::from(band.upper)))
             })
         };
         Ok(ConformalizedQuantile {
@@ -392,16 +425,16 @@ impl<'a> ConformalizedQuantile<'a> {
     ///
     /// [`HessboostError::DimensionMismatch`] on a feature-count mismatch and
     /// [`HessboostError::InvalidParameter`] if a prediction is not finite.
-    pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<(f32, f32)>> {
+    pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<Interval>> {
         if self.correction == f64::INFINITY {
             self.band.check(data)?;
-            return Ok(vec![(f32::NEG_INFINITY, f32::INFINITY); data.n_rows()]);
+            return Ok(vec![Interval::UNBOUNDED; data.n_rows()]);
         }
         Ok(self
             .band
             .predict(data)?
             .into_iter()
-            .map(|(lo, hi)| widen(lo, hi, self.correction))
+            .map(|band| widen(band, self.correction))
             .collect())
     }
 
@@ -467,7 +500,7 @@ fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
 }
 
 /// `model.predict(data)` for a single-output model, validated finite.
-fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Vec<f32>> {
+fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Predictions> {
     if model.n_outputs() != 1 {
         return Err(HessboostError::invalid_param(
             "model",
@@ -481,19 +514,18 @@ fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Vec
 }
 
 /// `model.predict(data)`, validated as `width` finite values per row.
-fn checked_predictions(model: &BoostedModel, data: &DMatrix, width: usize) -> Result<Vec<f32>> {
+fn checked_predictions(model: &BoostedModel, data: &DMatrix, width: usize) -> Result<Predictions> {
     let preds = model.predict(data)?;
-    let expected = data.n_rows() * width;
-    if preds.len() != expected {
+    if preds.width() != width {
         return Err(HessboostError::invalid_param(
             "model",
             format!(
-                "predictions must be laid out [row][output] ({expected} values), got {} values",
-                preds.len()
+                "predictions must have one value per output ({width}), got {} per row",
+                preds.width()
             ),
         ));
     }
-    check_finite(preds.iter().copied())?;
+    check_finite(preds.as_slice().iter().copied())?;
     Ok(preds)
 }
 
@@ -558,9 +590,12 @@ fn sub_round_up(a: f64, b: f64) -> f64 {
     if err > 0.0 { s.next_up() } else { s }
 }
 
-/// `(lo - q, hi + q)` in `f64`, rounded outward to `f32`.
-fn widen(lo: f32, hi: f32, q: f64) -> (f32, f32) {
-    (round_down(f64::from(lo) - q), round_up(f64::from(hi) + q))
+/// `[lower - q, upper + q]` in `f64`, rounded outward to `f32`.
+fn widen(band: Interval, q: f64) -> Interval {
+    Interval {
+        lower: round_down(f64::from(band.lower) - q),
+        upper: round_up(f64::from(band.upper) + q),
+    }
 }
 
 /// The largest `f32` not above `x`.
@@ -640,11 +675,11 @@ mod tests {
         train(&params, d, 150).unwrap()
     }
 
-    fn coverage(intervals: &[(f32, f32)], d: &DMatrix) -> f64 {
+    fn coverage(intervals: &[Interval], d: &DMatrix) -> f64 {
         let covered = intervals
             .iter()
             .zip(d.labels().unwrap())
-            .filter(|&(&(lo, hi), &y)| lo <= y && y <= hi)
+            .filter(|&(i, &y)| i.lower <= y && y <= i.upper)
             .count();
         covered as f64 / intervals.len() as f64
     }
@@ -663,7 +698,7 @@ mod tests {
     /// using `calibrate` to build the interval predictor.
     fn mean_coverage(
         seed: u64,
-        mut intervals: impl FnMut(&DMatrix, &DMatrix) -> Vec<(f32, f32)>,
+        mut intervals: impl FnMut(&DMatrix, &DMatrix) -> Vec<Interval>,
     ) -> f64 {
         let mut rng = Rng::new(seed);
         let total: f64 = (0..TRIALS)
@@ -757,7 +792,7 @@ mod tests {
             .predict_interval(&probe)
             .unwrap()
             .iter()
-            .map(|(lo, hi)| hi - lo)
+            .map(|i| i.upper - i.lower)
             .collect();
         assert!(
             widths[1] > 2.0 * widths[0],
@@ -793,11 +828,7 @@ mod tests {
         assert_eq!(sc.half_width(), f64::INFINITY);
         assert_eq!(sc.n_calibration(), 9);
         let intervals = sc.predict_interval(&test).unwrap();
-        assert!(
-            intervals
-                .iter()
-                .all(|&iv| iv == (f32::NEG_INFINITY, f32::INFINITY))
-        );
+        assert!(intervals.iter().all(|&iv| iv == Interval::UNBOUNDED));
 
         let cqr = ConformalizedQuantile::calibrate(&model, &model, &cal, 0.05).unwrap();
         assert_eq!(cqr.correction(), f64::INFINITY);
@@ -805,7 +836,7 @@ mod tests {
             cqr.predict_interval(&test)
                 .unwrap()
                 .iter()
-                .all(|&iv| iv == (f32::NEG_INFINITY, f32::INFINITY))
+                .all(|&iv| iv == Interval::UNBOUNDED)
         );
     }
 
@@ -834,10 +865,11 @@ mod tests {
         assert_eq!(round_up(0.5), 0.5);
         assert_eq!(round_up(1e300), f32::INFINITY);
         assert_eq!(round_down(1e300), f32::MAX);
-        assert_eq!(
-            widen(1.0, 2.0, f64::INFINITY),
-            (f32::NEG_INFINITY, f32::INFINITY)
-        );
+        let band = Interval {
+            lower: 1.0,
+            upper: 2.0,
+        };
+        assert_eq!(widen(band, f64::INFINITY), Interval::UNBOUNDED);
     }
 
     #[test]
@@ -852,8 +884,8 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &cal, 0).unwrap();
-        assert_eq!(model.predict(&cal).unwrap(), [1.0]);
-        let covers = |(lo, hi): (f32, f32)| lo <= y && y <= hi;
+        assert_eq!(model.predict(&cal).unwrap().as_slice(), [1.0]);
+        let covers = |i: Interval| i.lower <= y && y <= i.upper;
 
         let sc = SplitConformal::calibrate(&model, &cal, 0.5).unwrap();
         assert!(sc.half_width() > 1.0);
@@ -888,7 +920,7 @@ mod tests {
         assert_eq!(cqr.correction(), f64::INFINITY);
         assert_eq!(
             cqr.predict_interval(&test).unwrap(),
-            vec![(f32::NEG_INFINITY, f32::INFINITY); 4]
+            vec![Interval::UNBOUNDED; 4]
         );
         // The model and data are still validated without evaluating the band.
         let point = point_model(&train_set);

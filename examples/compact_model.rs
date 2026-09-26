@@ -70,7 +70,7 @@ fn main() -> Result<()> {
             .toad_penalty_threshold(xi)
             .build()?;
         let model = train(&params, &dtrain, 100)?;
-        let acc = accuracy(&model.predict_class(&dtest)?, &labels);
+        let acc = accuracy(model.predict_class(&dtest)?.as_slice(), &labels);
 
         let compact = CompactModel::from_bytes(&model.to_compact_bytes()?)?;
         assert_eq!(

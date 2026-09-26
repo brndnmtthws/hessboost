@@ -9,6 +9,7 @@ use hessboost::prelude::*;
 use libfuzzer_sys::arbitrary::{Arbitrary, Error as ArbError, Result as ArbResult, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Map, Value, json};
+use std::num::NonZeroUsize;
 
 #[path = "common.rs"]
 mod common;
@@ -436,7 +437,7 @@ impl<'a> Arbitrary<'a> for Case {
 
 fn fit(case: &Case, nthread: usize) -> Option<BoostedModel> {
     let mut params = case.params.clone();
-    params.nthread = nthread;
+    params.nthread = NonZeroUsize::new(nthread);
     let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds);
     // gblinear refuses evaluation sets and early stopping; attaching them
     // would reject every linear case before it trains.
@@ -459,13 +460,16 @@ fuzz_target!(|case: Case| {
     let margin = model
         .predict_margin(&case.dtrain)
         .expect("a model predicts its training data");
-    assert_eq!(margin.len(), case.dtrain.n_rows() * model.n_outputs());
+    assert_eq!(
+        (margin.n_rows(), margin.width()),
+        (case.dtrain.n_rows(), model.n_outputs())
+    );
     let parallel = fit(&case, 3).expect("training succeeds whatever the thread count");
     let parallel = parallel
         .predict_margin(&case.dtrain)
         .expect("a model predicts its training data");
     assert!(
-        common::same_bits(&margin, &parallel),
+        common::same_bits(margin.as_slice(), parallel.as_slice()),
         "training depends on the thread count"
     );
 });

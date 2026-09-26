@@ -384,10 +384,14 @@ mod tests {
             let mut want = model.base_score();
             for (t, tree) in model.trees().iter().enumerate() {
                 let leaf = tree.leaf_id_dense(row, f32::NAN);
-                assert_eq!(leaves[r * model.num_trees() + t] as usize, leaf);
+                assert_eq!(leaves.get(r, t).copied(), Some(leaf as u32));
                 want += 1.0 * tree.node(leaf).leaf_value;
             }
-            assert_eq!(margins[r].to_bits(), want.to_bits(), "row {r}");
+            assert_eq!(
+                margins.get(r, 0).map(|m| m.to_bits()),
+                Some(want.to_bits()),
+                "row {r}"
+            );
         }
     }
 }

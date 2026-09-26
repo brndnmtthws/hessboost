@@ -352,8 +352,31 @@ pub struct RoundEval {
     /// The 0-based boosting iteration of the model (after continued training,
     /// counted from the start of the initial model).
     pub iteration: usize,
-    /// `(dataset_name, metric_name, value)` triples.
-    pub scores: Vec<(String, String, f64)>,
+    /// Every eval set's metric values, in eval-set order and, within a set,
+    /// in metric order (a [`Trainer::custom_metric`] last).
+    pub scores: Vec<Score>,
+}
+
+impl RoundEval {
+    /// The value of `metric` on the eval set named `dataset`, if recorded.
+    pub fn score(&self, dataset: &str, metric: &str) -> Option<f64> {
+        self.scores
+            .iter()
+            .find(|score| score.dataset == dataset && score.metric == metric)
+            .map(|score| score.value)
+    }
+}
+
+/// One metric value on one eval set in a [`RoundEval`].
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Score {
+    /// The eval set's name, as passed to [`Trainer::eval`].
+    pub dataset: String,
+    /// The metric's name: XGBoost's `evals_result` key (`rmse`, `ndcg@5`).
+    pub metric: String,
+    /// The metric's value.
+    pub value: f64,
 }
 
 /// The result of [`Trainer::train`]: the model plus the per-round evaluation
@@ -597,16 +620,16 @@ pub(crate) fn validate_trained_model(model: &BoostedModel) -> Result<()> {
 }
 
 /// Run `train` on a dedicated pool of `params.nthread` threads, or on the
-/// global rayon pool when `nthread` is `0`.
+/// global rayon pool when `nthread` is unset.
 pub(crate) fn with_thread_pool<T: Send>(
     params: &TrainingParams,
     train: impl FnOnce() -> Result<T> + Send,
 ) -> Result<T> {
-    if params.nthread == 0 {
+    let Some(threads) = params.nthread else {
         return train();
-    }
+    };
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(params.nthread)
+        .num_threads(threads.get())
         .build()
         .map_err(|error| HessboostError::invalid_param("nthread", error.to_string()))?;
     pool.install(train)
@@ -792,7 +815,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
     {
         let best_iter = stopping.best_round();
         let round = &history[best_iter - first.iteration];
-        best_round_score = round.scores.last().map(|&(_, _, v)| v);
+        best_round_score = round.scores.last().map(|score| score.value);
         model.set_best_iteration(Some(best_iter));
     }
 
@@ -1247,7 +1270,11 @@ impl<'a> EvalPlan<'a> {
             objective.eval_transform(&mut self.preds);
             for m in &self.metrics {
                 let v = m.eval_info(&self.preds, &self.infos[ei]);
-                scores.push((name.to_string(), m.name().to_string(), v));
+                scores.push(Score {
+                    dataset: name.to_string(),
+                    metric: m.name().to_string(),
+                    value: v,
+                });
                 last_metric_value = v;
             }
         }
@@ -2369,7 +2396,10 @@ mod tests {
             .build()
             .unwrap();
         let model = Trainer::new(&params, &data, 2).train().unwrap().model;
-        assert_eq!(model.predict(&data).unwrap(), [1.5, 0.0, 7.5, 0.0, 0.0]);
+        assert_eq!(
+            model.predict(&data).unwrap().as_slice(),
+            [1.5, 0.0, 7.5, 0.0, 0.0]
+        );
         let linear = model.trees()[1].linear_leaves().unwrap();
         let intercepts: Vec<u64> = (0..5).map(|id| linear.intercept(id).to_bits()).collect();
         let routed: Vec<u64> = [0.0f64, 0.0, 2.5, 0.5, -0.0].map(f64::to_bits).to_vec();
@@ -2422,7 +2452,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 50).unwrap();
-        let preds = model.predict(&d).unwrap(); // probabilities
+        let preds = model.predict(&d).unwrap().into_vec(); // probabilities, one per row
         // Low-x rows -> ~0, high-x rows -> ~1.
         assert!(preds[0] < 0.1, "expected ~0, got {}", preds[0]);
         assert!(preds[99] > 0.9, "expected ~1, got {}", preds[99]);
@@ -2439,7 +2469,7 @@ mod tests {
         let model = train(&params, &d, 0).unwrap();
         let preds = model.predict(&d).unwrap();
         let mean = d.labels().unwrap().iter().sum::<f32>() / 10.0;
-        for p in preds {
+        for p in preds.into_vec() {
             assert!((p - mean).abs() < 1e-6);
         }
     }
@@ -2457,7 +2487,7 @@ mod tests {
                 .unwrap();
             let model = train(&params, &d, 60).unwrap();
             let preds = model.predict(&d).unwrap();
-            Rmse.eval(&preds, d.labels().unwrap(), None)
+            Rmse.eval(preds.as_slice(), d.labels().unwrap(), None)
         };
         let rmse_hist = rmse(TreeMethod::Hist);
         assert!(rmse_hist < 0.05, "hist rmse {rmse_hist}");
@@ -2482,7 +2512,7 @@ mod tests {
             .unwrap();
         let model = train(&params, &d, 60).unwrap();
         let preds = model.predict(&d).unwrap();
-        let rmse = Rmse.eval(&preds, d.labels().unwrap(), None);
+        let rmse = Rmse.eval(preds.as_slice(), d.labels().unwrap(), None);
         assert!(rmse < 0.06, "lossguide rmse {rmse}");
     }
 
@@ -2563,17 +2593,18 @@ mod tests {
         assert_eq!(model.num_trees(), 180); // 60 rounds * 3 classes
         assert_eq!(model.num_boost_rounds(), 60);
 
-        // Probabilities: shape n*3, each row sums to 1.
+        // Probabilities: three per row, each row sums to 1.
         let probs = model.predict(&d).unwrap();
-        assert_eq!(probs.len(), n * 3);
-        for i in 0..n {
-            let s: f32 = probs[i * 3..i * 3 + 3].iter().sum();
+        assert_eq!((probs.n_rows(), probs.width()), (n, 3));
+        for row in probs.rows() {
+            let s: f32 = row.iter().sum();
             assert!((s - 1.0).abs() < 1e-4);
         }
 
         // Predicted classes match the region labels on almost all rows.
         let classes = model.predict_class(&d).unwrap();
         let correct = classes
+            .as_slice()
             .iter()
             .zip(&y)
             .filter(|(c, l)| **c == **l as u32)
@@ -2596,7 +2627,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 60).unwrap();
-        let preds = model.predict(&d).unwrap(); // rates (exp transform)
+        let preds = model.predict(&d).unwrap().into_vec(); // rates (exp transform), one per row
         assert!(preds.iter().all(|&p| p > 0.0), "rates must be positive");
         // Higher x should predict a higher rate: compare mean predicted rate for
         // low-x vs high-x rows (the feature is randomized, so bucket by value).
@@ -2645,7 +2676,7 @@ mod tests {
             train(&p, &d, 30).unwrap().predict(&d).unwrap()
         };
 
-        for (a, b) in builtin.iter().zip(&custom) {
+        for (a, b) in builtin.as_slice().iter().zip(custom.as_slice()) {
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
         }
     }
@@ -2678,18 +2709,18 @@ mod tests {
         assert_eq!(model.num_trees(), 2 * rounds);
 
         let margin = model.predict_margin(&d).unwrap();
-        assert_eq!(margin.len(), 2 * n);
+        assert_eq!((margin.n_rows(), margin.width()), (n, 2));
         // Unknown objective name: `predict` falls back to raw margins.
         assert_eq!(model.predict(&d).unwrap(), margin);
 
         let labels = d.labels().unwrap();
         let (mut err0, mut err1, mut err_init) = (0.0f32, 0.0f32, 0.0f32);
-        for i in 0..n {
-            let (o0, o1) = (margin[2 * i], margin[2 * i + 1]);
+        for (i, (row, &y)) in margin.rows().zip(labels).enumerate() {
+            let (o0, o1) = (row[0], row[1]);
             assert!((o0 + o1).abs() < 1e-5, "row {i}: {o0} vs {o1} not mirrored");
-            err0 += (o0 - labels[i]).abs();
-            err1 += (o1 + labels[i]).abs();
-            err_init += labels[i].abs(); // initial margin is 0.0
+            err0 += (o0 - y).abs();
+            err1 += (o1 + y).abs();
+            err_init += y.abs(); // initial margin is 0.0
         }
         assert!(
             err0 < 0.5 * err_init,
@@ -2746,7 +2777,7 @@ mod tests {
         assert!(!res.history.is_empty());
 
         // rank:ndcg's default metric: XGBoost's `ndcg@32`.
-        let ndcg_of = |r: &RoundEval| r.scores.iter().find(|(_, m, _)| m == "ndcg@32").unwrap().2;
+        let ndcg_of = |r: &RoundEval| r.score("train", "ndcg@32").unwrap();
         let first = ndcg_of(&res.history[0]);
         let last = ndcg_of(res.history.last().unwrap());
 
@@ -2777,7 +2808,7 @@ mod tests {
 
         // It should learn the step: RMSE well below a constant predictor.
         let preds = model.predict(&d).unwrap();
-        let rmse = Rmse.eval(&preds, d.labels().unwrap(), None);
+        let rmse = Rmse.eval(preds.as_slice(), d.labels().unwrap(), None);
         assert!(rmse < 0.1, "dart rmse too high: {rmse}");
 
         // Native and JSON round-trips preserve predictions (weights included).
@@ -2810,7 +2841,8 @@ mod tests {
                 *m += tree.predict_row(&d, row);
             }
         }
-        for (a, b) in preds.iter().zip(&manual) {
+        assert_eq!(preds.width(), 1);
+        for (a, b) in preds.as_slice().iter().zip(&manual) {
             assert_eq!(*a, *b, "gbtree weighting changed the sum");
         }
     }
@@ -2848,7 +2880,7 @@ mod tests {
                     .build()
                     .unwrap();
                 let m = train(&p, d, 40).unwrap();
-                Rmse.eval(&m.predict(d).unwrap(), d.labels().unwrap(), None)
+                Rmse.eval(m.predict(d).unwrap().as_slice(), d.labels().unwrap(), None)
             };
             let rmse_num = mk(&numeric);
             let rmse_cat = mk(&categorical);
@@ -2889,7 +2921,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 50).unwrap();
-        let preds = model.predict(&d).unwrap();
+        let preds = model.predict(&d).unwrap().into_vec(); // one value per row
         let mut prev = f32::NEG_INFINITY;
         for (i, p) in preds.iter().enumerate() {
             assert!(
@@ -2915,11 +2947,11 @@ mod tests {
             .build()
             .unwrap();
         let initial = train(&params, &d_bm, 0).unwrap();
-        assert_eq!(initial.predict_margin(&d_bm).unwrap(), bm);
+        assert_eq!(initial.predict_margin(&d_bm).unwrap().as_slice(), bm);
 
         let fitted = train(&params, &d_bm, 10).unwrap();
         let margin = fitted.predict_margin(&d_bm).unwrap();
-        let rmse = Rmse.eval(&margin, d_bm.labels().unwrap(), None);
+        let rmse = Rmse.eval(margin.as_slice(), d_bm.labels().unwrap(), None);
         assert!(
             rmse < 0.2,
             "the trees did not fit the base-margin residuals: {rmse}"
@@ -2958,7 +2990,11 @@ mod tests {
         let full = train_with(1.0);
         let sampled = train_with(0.5);
         // With per-node sampling active, the fitted model must differ.
-        let differs = full.iter().zip(&sampled).any(|(a, b)| (a - b).abs() > 1e-6);
+        let differs = full
+            .as_slice()
+            .iter()
+            .zip(sampled.as_slice())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
         assert!(differs, "colsample_bynode had no effect on the model");
     }
 
@@ -2997,7 +3033,7 @@ mod tests {
 
         let preds = model.predict(&d).unwrap();
         let y = d.labels().unwrap();
-        let rmse = Rmse.eval(&preds, y, None);
+        let rmse = Rmse.eval(preds.as_slice(), y, None);
 
         // Baseline: predicting the label mean.
         let mean = y.iter().sum::<f32>() / y.len() as f32;
@@ -3082,12 +3118,18 @@ mod tests {
         // As in XGBoost's `xgb.train`, the custom metric is reported after
         // the configured (here the default) ones and, being last, drives
         // early stopping.
-        let names: Vec<&str> = custom.history[0]
+        let history = &custom.history[0];
+        let names: Vec<&str> = history
             .scores
             .iter()
-            .map(|(_, m, _)| m.as_str())
+            .map(|score| score.metric.as_str())
             .collect();
         assert_eq!(names, vec!["rmse", "my-rmse"]);
+        assert_eq!(
+            history.score("train", "my-rmse"),
+            Some(history.scores[1].value)
+        );
+        assert_eq!(history.score("valid", "my-rmse"), None);
     }
 
     #[test]
@@ -3104,15 +3146,17 @@ mod tests {
             .unwrap();
         let model = train(&params, &d, 20).unwrap();
         let predictions = model.predict(&d).unwrap();
-        assert_eq!(predictions.len(), d.n_rows());
+        assert_eq!((predictions.n_rows(), predictions.width()), (d.n_rows(), 1));
         assert!(
             predictions
+                .as_slice()
                 .iter()
                 .all(|value| value.fract() == 0.0 && *value < 3.0)
         );
         assert_eq!(
-            model.predict_class(&d).unwrap(),
+            model.predict_class(&d).unwrap().as_slice(),
             predictions
+                .as_slice()
                 .iter()
                 .map(|value| *value as u32)
                 .collect::<Vec<_>>()
@@ -3142,6 +3186,7 @@ mod tests {
                 model
                     .predict(&d)
                     .unwrap()
+                    .as_slice()
                     .iter()
                     .all(|p| (0.0..=1.0).contains(p))
             );
@@ -3173,6 +3218,7 @@ mod tests {
             model
                 .predict(&d)
                 .unwrap()
+                .as_slice()
                 .iter()
                 .all(|prediction| (*prediction - 0.5).abs() < 1e-6)
         );
@@ -3377,7 +3423,7 @@ mod tests {
                 let model = train(&params, &d, 4).unwrap();
                 assert_eq!((model.n_outputs(), model.n_targets()), (2, 2));
                 let preds = model.predict(&d).unwrap();
-                assert_eq!(preds.len(), 2 * d.n_rows());
+                assert_eq!((preds.n_rows(), preds.width()), (d.n_rows(), 2));
                 for (j, col) in cols.iter().enumerate() {
                     let single = d
                         .clone()
@@ -3392,9 +3438,9 @@ mod tests {
                         "{name} {method:?} intercept {j}"
                     );
                     let expected = reference.predict(&single).unwrap();
-                    for (row, e) in expected.iter().enumerate() {
+                    for (row, e) in expected.as_slice().iter().enumerate() {
                         assert_eq!(
-                            preds[row * 2 + j].to_bits(),
+                            preds.get(row, j).unwrap().to_bits(),
                             e.to_bits(),
                             "{name} {method:?} ({row},{j})"
                         );
@@ -3418,8 +3464,8 @@ mod tests {
         let model = train(&params, &d, 10).unwrap();
         let preds = model.predict(&d).unwrap();
         let classes = model.predict_class(&d).unwrap();
-        assert_eq!(classes.len(), 2 * d.n_rows());
-        for (i, (&c, &p)) in classes.iter().zip(&preds).enumerate() {
+        assert_eq!((classes.n_rows(), classes.width()), (d.n_rows(), 2));
+        for (i, (&c, &p)) in classes.as_slice().iter().zip(preds.as_slice()).enumerate() {
             assert_eq!(c, u32::from(p > 0.5), "cell {i}");
             assert_eq!(c as f32, cols[i % 2][i / 2], "separable cell {i}");
         }
@@ -3504,7 +3550,7 @@ mod tests {
         // Base margin is the mean midpoint (1 and 5 → 3); one full-step tree
         // then lands every row on its own midpoint.
         assert_eq!(model.base_score(), 3.0);
-        let preds = model.predict_margin(&d).unwrap();
+        let preds = model.predict_margin(&d).unwrap().into_vec(); // one per row
         for (row, p) in preds.iter().enumerate() {
             let expected = if row < 16 { 1.0 } else { 5.0 };
             assert!((p - expected).abs() < 1e-3, "row {row}: {p}");
@@ -3557,7 +3603,7 @@ mod tests {
                 .eval(&d, "eval")
                 .train()
                 .unwrap();
-            assert!(run.history[1].scores[0].2.is_finite(), "{metric}");
+            assert!(run.history[1].scores[0].value.is_finite(), "{metric}");
         }
         for metric in ["rmse", "mae", "cox-nloglik"] {
             let run = Trainer::new(&params(metric), &d, 2)
@@ -3690,7 +3736,7 @@ mod tests {
         ] {
             let history = run(params.build().unwrap()).unwrap();
             assert!(
-                history[1].scores.iter().all(|s| s.2.is_finite()),
+                history[1].scores.iter().all(|s| s.value.is_finite()),
                 "{history:?}"
             );
         }

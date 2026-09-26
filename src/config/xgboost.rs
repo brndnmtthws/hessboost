@@ -5,8 +5,8 @@
 
 use super::groups::{BalancedBagging, Dart, ExtraTrees, LinearTree, QuantizedGrad, Refresh};
 use super::params::{
-    BoosterKind, Device, GrowPolicy, Monotone, MultiStrategy, ProcessType, SamplingMethod,
-    TrainingParams, TreeMethod,
+    BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
+    SamplingMethod, TrainingParams, TreeMethod,
 };
 use crate::error::{HessboostError, Result};
 use crate::metric::{EvalMetric, XgboostMetricSource};
@@ -14,6 +14,7 @@ use crate::objective::distributional::{DistGradient, DistSplitDirection};
 use crate::objective::{AftDistribution, Objective, ObjectiveParts};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
+use std::num::NonZeroUsize;
 
 /// XGBoost's aliases and the key each one sets.
 const ALIASES: &[(&str, &str)] = &[
@@ -426,7 +427,7 @@ impl Flat {
         let d = TrainingParams::default();
         Ok(TrainingParams {
             booster,
-            nthread: nthread.unwrap_or(d.nthread),
+            nthread: nthread.map_or(d.nthread, NonZeroUsize::new),
             seed: seed.unwrap_or(d.seed),
             device: device.unwrap_or(d.device),
             objective,
@@ -434,10 +435,14 @@ impl Flat {
             eval_metric,
             eta: eta.unwrap_or(d.eta),
             gamma: gamma.unwrap_or(d.gamma),
-            max_depth: max_depth.unwrap_or(d.max_depth),
-            max_leaves: max_leaves.unwrap_or(d.max_leaves),
+            max_depth: max_depth.map_or(d.max_depth, NonZeroUsize::new),
+            max_leaves: max_leaves.map_or(d.max_leaves, NonZeroUsize::new),
             min_child_weight: min_child_weight.unwrap_or(d.min_child_weight),
-            max_delta_step: max_delta_step.unwrap_or(d.max_delta_step),
+            max_delta_step: match max_delta_step.flatten() {
+                None => MaxDeltaStep::ObjectiveDefault,
+                Some(0.0) => MaxDeltaStep::Unbounded,
+                Some(bound) => MaxDeltaStep::Bounded(bound),
+            },
             subsample: subsample.unwrap_or(d.subsample),
             colsample_bytree: colsample_bytree.unwrap_or(d.colsample_bytree),
             colsample_bylevel: colsample_bylevel.unwrap_or(d.colsample_bylevel),
@@ -655,7 +660,10 @@ impl TrainingParams {
     /// (`updater = "coord_descent"` with `booster = gblinear`,
     /// `feature_selector = "cyclic"`, `lambdarank_pair_method = "topk"`,
     /// `max_cat_to_onehot = 4`, `max_cat_threshold = 64`) are accepted at
-    /// that setting.
+    /// that setting. XGBoost's `0` for `max_depth`, `max_leaves`, and
+    /// `nthread` reads as `None` (no limit, the global pool), and
+    /// `max_delta_step` as a [`MaxDeltaStep`]: absent or `null` is
+    /// `ObjectiveDefault`, `0` is `Unbounded`, anything else `Bounded`.
     ///
     /// # Errors
     ///
@@ -746,8 +754,8 @@ impl TrainingParams {
     /// canonical keys [`from_xgboost`](Self::from_xgboost) reads back to the
     /// same configuration: the objective's name and the keys of its own
     /// parameters, the metrics' names and the objective keys they borrow,
-    /// monotone constraints as `-1`/`0`/`1`; an unset `base_score` or
-    /// `max_delta_step` is left out.
+    /// monotone constraints as `-1`/`0`/`1`, `None` limits as `0`; an unset
+    /// `base_score` or [`MaxDeltaStep::ObjectiveDefault`] is left out.
     ///
     /// # Errors
     ///
@@ -839,7 +847,7 @@ impl TrainingParams {
                 set("skip_drop", json(dart.skip_drop()));
             }
         }
-        set("nthread", json(nthread));
+        set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));
         set("seed", json(seed));
         set("device", json(device));
         set("objective", json(objective.name()));
@@ -853,11 +861,13 @@ impl TrainingParams {
         set("eval_metric", json(names));
         set("eta", json(eta));
         set("gamma", json(gamma));
-        set("max_depth", json(max_depth));
-        set("max_leaves", json(max_leaves));
+        set("max_depth", json(max_depth.map_or(0, NonZeroUsize::get)));
+        set("max_leaves", json(max_leaves.map_or(0, NonZeroUsize::get)));
         set("min_child_weight", json(min_child_weight));
-        if let Some(max_delta_step) = max_delta_step {
-            set("max_delta_step", json(max_delta_step));
+        match max_delta_step {
+            MaxDeltaStep::ObjectiveDefault => {}
+            MaxDeltaStep::Unbounded => set("max_delta_step", json(0.0)),
+            MaxDeltaStep::Bounded(bound) => set("max_delta_step", json(bound)),
         }
         set("subsample", json(subsample));
         set("colsample_bytree", json(colsample_bytree));
@@ -1086,7 +1096,7 @@ mod tests {
         );
         assert_eq!(p.interaction_constraints, [vec![0, 1], vec![2]]);
         assert_eq!((p.eta, p.lambda), (0.1, 2.0));
-        assert_eq!(p.max_delta_step, Some(0.0));
+        assert_eq!(p.max_delta_step, MaxDeltaStep::Unbounded);
 
         let flat = p.to_xgboost().unwrap();
         let back = TrainingParams::from_xgboost(flat.clone()).unwrap();
@@ -1203,6 +1213,61 @@ mod tests {
         };
         let flat = p.to_xgboost().unwrap();
         assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), p);
+    }
+
+    /// XGBoost's `0` limits are `None`, and `max_delta_step` keeps its three
+    /// states: absent or `null` is the objective's default, `0` no bound,
+    /// anything else a bound. Each reads back from its flat form.
+    #[test]
+    fn sentinels_map_to_typed_states_and_back() {
+        let parse = |pairs: Value| TrainingParams::from_xgboost(pairs.as_object().unwrap().clone());
+        let p = parse(
+            json!({"max_depth": 0, "max_leaves": 0, "nthread": 0, "grow_policy": "depthwise"}),
+        )
+        .unwrap();
+        assert_eq!((p.max_depth, p.max_leaves, p.nthread), (None, None, None));
+        let p = parse(json!({"max_depth": 3, "max_leaves": 7, "nthread": 2})).unwrap();
+        assert_eq!(
+            (p.max_depth, p.max_leaves, p.nthread),
+            (
+                NonZeroUsize::new(3),
+                NonZeroUsize::new(7),
+                NonZeroUsize::new(2)
+            )
+        );
+        for (value, step) in [
+            (None, MaxDeltaStep::ObjectiveDefault),
+            (Some(json!(null)), MaxDeltaStep::ObjectiveDefault),
+            (Some(json!(0.0)), MaxDeltaStep::Unbounded),
+            (Some(json!(0.5)), MaxDeltaStep::Bounded(0.5)),
+        ] {
+            let mut pairs = json!({"objective": "count:poisson"});
+            if let Some(value) = value.clone() {
+                pairs["max_delta_step"] = value;
+            }
+            let p = parse(pairs).unwrap();
+            assert_eq!(p.max_delta_step, step, "{value:?}");
+            let back = TrainingParams::from_xgboost(p.to_xgboost().unwrap()).unwrap();
+            assert_eq!(back, p, "{value:?}");
+        }
+        let unlimited = TrainingParams {
+            max_depth: None,
+            grow_policy: GrowPolicy::LossGuide,
+            max_leaves: NonZeroUsize::new(5),
+            ..TrainingParams::default()
+        };
+        let flat = unlimited.to_xgboost().unwrap();
+        assert_eq!(
+            (flat["max_depth"].clone(), flat["nthread"].clone()),
+            (json!(0), json!(0))
+        );
+        assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), unlimited);
+        let negative = parse(json!({"max_delta_step": -1.0})).unwrap_err();
+        assert!(
+            negative
+                .to_string()
+                .starts_with("invalid parameter `max_delta_step`")
+        );
     }
 
     /// Every built-in objective's flat form (its name and the keys of its

@@ -2,7 +2,7 @@
 //! calibration of the predicted distributions, metrics, serialization, and
 //! conformalized intervals.
 
-use hessboost::config::{MultiStrategy, TrainingParamsBuilder, TreeMethod};
+use hessboost::config::{MaxDeltaStep, MultiStrategy, TrainingParamsBuilder, TreeMethod};
 use hessboost::conformal::ConformalizedQuantile;
 use hessboost::metric::EvalMetric;
 use hessboost::objective::distributional::{
@@ -132,7 +132,7 @@ fn heteroscedastic_intervals_are_calibrated_and_track_the_noise() {
     assert!(rel_err < 0.2, "mean relative error of sigma {rel_err}");
     // `predict` reports the natural parameters (mu, sigma).
     let natural = model.predict(&dtest).unwrap();
-    for (row, d) in natural.as_chunks::<2>().0.iter().zip(&dists) {
+    for (row, d) in natural.rows().zip(&dists) {
         let Dist::Normal { mu, sigma } = *d else {
             panic!("not a normal distribution")
         };
@@ -157,7 +157,7 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
         &dvalid,
     );
     // Baseline: the point model with the training residuals' deviation.
-    let fitted = point.predict(&dtrain).unwrap();
+    let fitted = point.predict(&dtrain).unwrap().into_vec(); // one value per row
     let train_labels = dtrain.labels().unwrap();
     let sd = (fitted
         .iter()
@@ -169,6 +169,7 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
     let baseline: Vec<Dist> = point
         .predict(&dtest)
         .unwrap()
+        .as_slice()
         .iter()
         .map(|&mu| Dist::Normal {
             mu: f64::from(mu),
@@ -242,18 +243,21 @@ fn every_family_and_gradient_mode_learns() {
             let best = model.best_iteration().expect("early stopping triggered");
             let first = &result.history[0].scores;
             let at_best = &result.history[best].scores;
-            assert_eq!((first[0].1.as_str(), first[1].1.as_str()), ("crps", "nll"));
+            assert_eq!(
+                (first[0].metric.as_str(), first[1].metric.as_str()),
+                ("crps", "nll")
+            );
             assert!(
-                at_best[0].2 < first[0].2 && at_best[1].2 < first[1].2,
+                at_best[0].value < first[0].value && at_best[1].value < first[1].value,
                 "{objective} {mode:?}"
             );
             // The reported metric is the mean NLL of the predicted
             // distributions (up to the f32 rounding of the parameters).
             let valid = mean_nll(&model.predict_distribution(&dvalid).unwrap(), &dvalid);
             assert!(
-                (valid - at_best[1].2).abs() < 1e-3 * valid.abs().max(1.0),
+                (valid - at_best[1].value).abs() < 1e-3 * valid.abs().max(1.0),
                 "{objective}: {valid} vs {}",
-                at_best[1].2
+                at_best[1].value
             );
             let nll = mean_nll(&model.predict_distribution(&dtest).unwrap(), &dtest);
             let marginal = train(&p, &dtrain, 0).unwrap();
@@ -273,14 +277,14 @@ fn dist_poisson_trains_like_count_poisson_without_max_delta_step() {
     });
     let fit = |objective: Objective| {
         let p = params(objective)
-            .max_delta_step(0.0)
+            .max_delta_step(MaxDeltaStep::Unbounded)
             .base_score(2.0)
             .build()
             .unwrap();
         train(&p, &d, 40).unwrap().predict(&d).unwrap()
     };
     let (dist, count) = (fit(dist(DistFamily::Poisson)), fit(Objective::Poisson));
-    for (a, b) in dist.iter().zip(&count) {
+    for (a, b) in dist.as_slice().iter().zip(count.as_slice()) {
         assert!((a - b).abs() <= 1e-4 * b.abs(), "{a} vs {b}");
     }
 }
@@ -373,7 +377,7 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
     let got = coverage(
         conformal
             .iter()
-            .map(|&(lo, hi)| (f64::from(lo), f64::from(hi))),
+            .map(|i| (f64::from(i.lower), f64::from(i.upper))),
         labels,
     );
     assert!(
@@ -383,8 +387,8 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
     // The raw band differs from the calibrated one by exactly the correction.
     let raw = model.predict_distribution(&dtest).unwrap();
     let (lo, hi) = raw[0].interval(1.0 - alpha);
-    assert!((f64::from(conformal[0].0) - (lo - cqr.correction())).abs() < 1e-4);
-    assert!((f64::from(conformal[0].1) - (hi + cqr.correction())).abs() < 1e-4);
+    assert!((f64::from(conformal[0].lower) - (lo - cqr.correction())).abs() < 1e-4);
+    assert!((f64::from(conformal[0].upper) - (hi + cqr.correction())).abs() < 1e-4);
     // Only distributional models qualify.
     let point = train(
         &params(Objective::SquaredError).build().unwrap(),

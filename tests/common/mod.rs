@@ -51,6 +51,7 @@ pub fn rmse(model: &BoostedModel, data: &DMatrix) -> f64 {
     let preds = model.predict(data).unwrap();
     let labels = data.labels().unwrap();
     let sse: f64 = preds
+        .as_slice()
         .iter()
         .zip(labels)
         .map(|(p, y)| f64::from(p - y).powi(2))

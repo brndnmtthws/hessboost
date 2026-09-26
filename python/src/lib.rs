@@ -11,8 +11,8 @@
 //! `unsafe` code and no global mutable state, and every class is `frozen`.
 //! Models and matrices are immutable and shared read-only between threads;
 //! the Python layer swaps whole objects rather than mutating them. The one
-//! exception, `OnlineModel`, updates in place under a mutex it only locks
-//! with the GIL released.
+//! exception, `OnlineModel`, updates in place under a mutex it never waits
+//! for: access during an update fails fast rather than deadlock.
 
 mod booster;
 mod conformal;

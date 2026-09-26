@@ -1010,33 +1010,40 @@ mod tests {
             let data = DMatrix::from_dense(&x, x.len() / n_cols, n_cols).unwrap();
             assert_close(
                 "raw",
-                &model.predict_margin(&data).unwrap(),
+                model.predict_margin(&data).unwrap().as_slice(),
                 &floats(&expected, "raw"),
             );
             assert_close(
                 "pred",
-                &model.predict(&data).unwrap(),
+                model.predict(&data).unwrap().as_slice(),
                 &floats(&expected, "pred"),
             );
             match expected["contribs"] {
                 Value::Null => assert!(model.predict_contribs(&data).is_err()),
                 _ => assert_close(
                     "contribs",
-                    &model.predict_contribs(&data).unwrap(),
+                    model.predict_contribs(&data).unwrap().as_slice(),
                     &floats(&expected, "contribs"),
                 ),
             }
             // LightGBM's leaf `j` is node `num_leaves - 1 + j`.
             let leaves = model.predict_leaf(&data).unwrap();
-            for (i, (&node, leaf)) in leaves.iter().zip(floats(&expected, "leaf")).enumerate() {
-                let tree = &model.trees()[i % model.num_trees()];
-                assert_eq!(node as usize, tree.num_leaves() - 1 + leaf as usize);
+            let expected_leaves = floats(&expected, "leaf");
+            assert_eq!(leaves.width(), model.num_trees());
+            assert_eq!(leaves.as_slice().len(), expected_leaves.len());
+            for (row, want) in leaves
+                .rows()
+                .zip(expected_leaves.chunks_exact(leaves.width()))
+            {
+                for ((&node, &leaf), tree) in row.iter().zip(want).zip(model.trees()) {
+                    assert_eq!(node as usize, tree.num_leaves() - 1 + leaf as usize);
+                }
             }
             let half = expected["slice_iterations"].as_u64().unwrap() as usize;
             let sliced = model.slice(..half, 1).unwrap();
             assert_close(
                 "raw_slice",
-                &sliced.predict_margin(&data).unwrap(),
+                sliced.predict_margin(&data).unwrap().as_slice(),
                 &floats(&expected, "raw_slice"),
             );
             let restored = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
@@ -1070,7 +1077,7 @@ mod tests {
     fn route(model: &str, values: &[f32]) -> Vec<f32> {
         let model = BoostedModel::from_lightgbm_text(model).unwrap();
         let data = DMatrix::from_dense(values, values.len(), 1).unwrap();
-        model.predict_margin(&data).unwrap()
+        model.predict_margin(&data).unwrap().into_vec() // one value per row
     }
 
     /// A header claiming `usize::MAX` classes with no trees is refused

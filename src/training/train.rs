@@ -1172,7 +1172,7 @@ fn validate_boulevard_request(
 /// terms of one run are boosted round by round, so no prefix of the trees
 /// is a model of every term); with `ebm_boulevard` also Boulevard's
 /// refusals (squared error, unit row weights, no base margins).
-fn validate_ebm_request(request: &TrainRequest, objective: &dyn Objective) -> Result<()> {
+fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     let refuse = |name: &'static str, reason: &str| {
         Err(HessboostError::invalid_param(
             name,

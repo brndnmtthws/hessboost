@@ -151,6 +151,12 @@ flat_params! {
     posterior_sampling: bool,
     boulevard_dropout: f64,
     boulevard_truncation: f64,
+    ebm_interactions: usize,
+    ebm_outer_bags: usize,
+    ebm_bag_fraction: f64,
+    ebm_boulevard: bool,
+    ebm_early_stopping_rounds: usize,
+    ebm_early_stopping_tolerance: f64,
 }
 
 /// The flat keys of the objective parameters, with the objectives and
@@ -272,6 +278,12 @@ impl Flat {
             posterior_sampling,
             boulevard_dropout,
             boulevard_truncation,
+            ebm_interactions,
+            ebm_outer_bags,
+            ebm_bag_fraction,
+            ebm_boulevard,
+            ebm_early_stopping_rounds,
+            ebm_early_stopping_tolerance,
         } = self;
         // Aligned with `OBJECTIVE_KEYS`.
         let present = [
@@ -577,6 +589,14 @@ impl Flat {
             langevin,
             model_shrink,
             posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
+            ebm_interactions: ebm_interactions.unwrap_or(d.ebm_interactions),
+            ebm_outer_bags: ebm_outer_bags.unwrap_or(d.ebm_outer_bags),
+            ebm_bag_fraction: ebm_bag_fraction.unwrap_or(d.ebm_bag_fraction),
+            ebm_boulevard: ebm_boulevard.unwrap_or(d.ebm_boulevard),
+            ebm_early_stopping_rounds: ebm_early_stopping_rounds
+                .unwrap_or(d.ebm_early_stopping_rounds),
+            ebm_early_stopping_tolerance: ebm_early_stopping_tolerance
+                .unwrap_or(d.ebm_early_stopping_tolerance),
         })
     }
 }

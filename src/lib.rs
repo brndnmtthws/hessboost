@@ -22,7 +22,7 @@
 //! let dtrain = DMatrix::from_dense(&x, 6, 2)?.with_labels(&y)?;
 //!
 //! let params = TrainingParams::builder()
-//!     .objective("reg:squarederror") // XGBoost-compatible names
+//!     .objective(Objective::SquaredError) // XGBoost's `reg:squarederror`
 //!     .tree_method(TreeMethod::Hist)
 //!     .max_depth(3)
 //!     .eta(0.1)
@@ -39,8 +39,8 @@
 //! ```
 //!
 //! [`prelude`] holds only this workflow's items (including
-//! [`TreeMethod`](config::TreeMethod)); everything else is imported from its
-//! module.
+//! [`TreeMethod`](config::TreeMethod) and [`Objective`](objective::Objective));
+//! everything else is imported from its module.
 //!
 //! ## Modules
 //!
@@ -48,12 +48,15 @@
 //! - [`data`]: [`DMatrix`], [`MetaInfo`](data::MetaInfo), feature types,
 //!   CSV/libsvm loaders, [`data::target_stats`].
 //! - [`training`]: [`train`], [`Trainer`], [`cv`](training::cv),
-//!   [`training::budget`].
+//!   [`training::budget`], [`training::online`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
-//!   native and XGBoost JSON/UBJSON); [`model::compact`].
-//! - [`objective`]: the `Objective` trait, the built-in objectives,
-//!   `CustomObjective`, [`objective::distributional`] (`dist:*` objectives).
-//! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
+//!   native and XGBoost JSON/UBJSON, LightGBM text import);
+//!   [`model::compact`].
+//! - [`objective`]: [`Objective`](objective::Objective) and its parameter
+//!   types, the `Loss` trait, `CustomLoss`, [`objective::distributional`]
+//!   (`dist:*` objectives).
+//! - [`metric`]: [`EvalMetric`](metric::EvalMetric) (the built-in metrics),
+//!   the `Metric` trait, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
@@ -74,28 +77,36 @@
 //!   growth; uniform or `gradient_based` row sampling; column sampling with
 //!   optional per-feature weights
 //!   ([`DMatrix::with_feature_weights`](data::DMatrix::with_feature_weights)).
-//! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
+//! - **Objectives** ([`Objective`](objective::Objective), each with its
+//!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
 //!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
-//!   `survival:aft` on censored bounds), plus a custom hook
-//!   ([`Trainer::objective`](training::Trainer::objective)).
+//!   `survival:aft` on censored bounds), plus custom losses
+//!   ([`Objective::Custom`](objective::Objective::Custom), e.g. a
+//!   [`CustomLoss`](objective::CustomLoss)).
 //! - **Multi-output:** label matrices
 //!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
 //!   tree per output or vector-leaf trees
 //!   ([`MultiStrategy::MultiOutputTree`](config::MultiStrategy::MultiOutputTree)).
-//! - **Metrics:** rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
+//! - **Metrics** ([`EvalMetric`](metric::EvalMetric), each with its own
+//!   parameters): rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
 //!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, plus
-//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric));
+//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric),
+//!   reported after them as in XGBoost). XGBoost's names parse through
+//!   [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost):
 //!   `@k` ranking cutoffs and `@rho` on tweedie-nloglik, other suffixes
-//!   refused ([`create_metric`](metric::create_metric)).
+//!   refused.
 //! - **Modeling:** monotone and interaction constraints, native categorical
 //!   splits, early stopping, feature importance, QuadratureTreeSHAP values
 //!   and interactions
 //!   ([`predict_contribs`](model::BoostedModel::predict_contribs) /
 //!   [`predict_interactions`](model::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON, XGBoost JSON and
-//!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)).
+//!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)),
+//!   LightGBM 4.x text model import
+//!   ([`from_lightgbm_text`](model::BoostedModel::from_lightgbm_text); see
+//!   [LightGBM import](model#lightgbm-import)).
 //! - **Validation:** cross-validation ([`cv`](training::cv)), custom,
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
 //!   (timestamped rows, purged by each label window,
@@ -111,8 +122,9 @@
 //!     [`path_smooth`](config::TrainingParams::path_smooth),
 //!     [`linear_tree`](config::TrainingParams::linear_tree),
 //!     [`LinearLeaves`](tree::LinearLeaves));
-//!   - LightGBM binary class-stratified bagging with `pos_bagging_fraction`
-//!     and `neg_bagging_fraction`; when enabled it supersedes `subsample`.
+//!   - LightGBM class-balanced bagging for binary classification
+//!     ([`BalancedBagging`](config::BalancedBagging): `pos_bagging_fraction`,
+//!     `neg_bagging_fraction`), in place of `subsample`;
 //!   - CatBoost-style symmetric trees
 //!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), routed by
 //!     bit pattern in batch prediction;
@@ -120,9 +132,12 @@
 //!     (`toad_penalty_feature`, `toad_penalty_threshold`) and a bit-packed
 //!     layout with bit-identical margins ([`model::compact`]);
 //!   - LightGBM-style quantized gradients
-//!     ([`use_quantized_grad`](config::TrainingParams::use_quantized_grad));
+//!     ([`QuantizedGrad`](config::QuantizedGrad), `use_quantized_grad`);
 //!   - PerpetualBooster-style budget training: one `budget` instead of
 //!     `eta`/depth/rounds ([`training::budget`]);
+//!   - in-place row addition and deletion (incremental learning and machine
+//!     unlearning) for trained hist models, exact or approximate
+//!     ([`training::online`]);
 //!   - distributional boosting (NGBoost / XGBoostLSS style): `dist:normal`,
 //!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`
 //!     per-row distributions
@@ -139,14 +154,17 @@
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `balanced_bagging`, `ordered_target_stats`,
-//! `pfn_boost`, and `metal` with `--features metal` on macOS). Run one with
-//! `cargo run --release --example balanced_bagging`.
+//! `distributional`, `budget`, `balanced_bagging`, `online_update`,
+//! `ordered_target_stats`, `pfn_boost`, `metal` with `--features metal` on
+//! macOS). Run one with `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
 //!
 //! Parameter, objective, and metric names are XGBoost's, so an XGBoost
-//! configuration carries over; unsupported settings are refused. Parity with
+//! configuration carries over:
+//! [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost)
+//! reads an XGBoost `params` dict (keys, aliases, and value spellings), and
+//! unsupported settings are refused. Parity with
 //! XGBoost 3.4.2 is CI-tested: deterministic fixtures reproduce XGBoost
 //! within `1e-4` (quantile cuts bit for bit), and imported XGBoost models
 //! predict and explain as XGBoost does. RNG-driven options (subsampling,
@@ -156,7 +174,8 @@
 //!
 //! - Distributed and external-memory training; GPU training outside macOS.
 //! - XGBoost options available at one setting only (so they are not
-//!   [`TrainingParams`] fields): gblinear uses `updater = coord_descent`
+//!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
+//!   setting): gblinear uses `updater = coord_descent`
 //!   with `feature_selector = cyclic`; LambdaMART uses
 //!   `lambdarank_pair_method = topk` (no `lambdarank_unbiased` or
 //!   `ndcg_exp_gain`); DART has no `sample_type`, `normalize_type`, or
@@ -166,6 +185,11 @@
 //!   threshold suffix), and the `-` variants of the ranking metrics
 //!   (`ndcg-`, `ndcg@k-`, `map-`, `map@k-`); these names are refused.
 //! - XGBoost import and export of gblinear models.
+//! - `scale_pos_weight` outside the logistic objectives: XGBoost also
+//!   weights the positive rows of `reg:squarederror` and `reg:gamma` with
+//!   it; [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost)
+//!   refuses it there, and XGBoost import drops it (predictions do not read
+//!   it).
 //!
 //! [`DMatrix`]: data::DMatrix
 //! [`TrainingParams`]: config::TrainingParams
@@ -204,15 +228,19 @@ pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 /// [`TrainingParamsBuilder::tree_method`](config::TrainingParamsBuilder::tree_method)),
 /// [`ImportanceType`](model::ImportanceType) (for
 /// [`BoostedModel::feature_importance`](model::BoostedModel::feature_importance)),
-/// and [`ObjectiveParams`](config::ObjectiveParams) (a model's
-/// [`objective_params`](model::BoostedModel::objective_params)). Everything
-/// else (the other parameter enums, objectives, metrics, conformal
-/// intervals, ...) is imported from its module.
+/// [`Objective`](objective::Objective) (for
+/// [`TrainingParamsBuilder::objective`](config::TrainingParamsBuilder::objective)),
+/// and [`EvalMetric`](metric::EvalMetric) (for
+/// [`TrainingParamsBuilder::eval_metric`](config::TrainingParamsBuilder::eval_metric)).
+/// Everything else (the other parameter enums, the objectives' and metrics'
+/// parameters, conformal intervals, ...) is imported from its module.
 pub mod prelude {
-    pub use crate::config::{ObjectiveParams, TrainingParams, TreeMethod};
+    pub use crate::config::{TrainingParams, TreeMethod};
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
+    pub use crate::metric::EvalMetric;
     pub use crate::model::{BoostedModel, ImportanceType};
+    pub use crate::objective::Objective;
     pub use crate::training::{Trainer, train};
 }
 /// Implementation details the crate's own benchmarks and parity tests

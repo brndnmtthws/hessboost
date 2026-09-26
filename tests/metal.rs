@@ -8,7 +8,10 @@
 mod common;
 
 use hessboost::backend::metal;
-use hessboost::config::{BoosterKind, Device, ProcessType};
+use hessboost::config::{
+    BoosterKind, Dart, Device, LinearTree, ProcessType, QuantizedGrad, Refresh,
+};
+use hessboost::objective::{GradPair, Logistic, Multiclass};
 use hessboost::prelude::*;
 
 /// Whether a Metal device is present, with the skip reason printed so a
@@ -86,7 +89,7 @@ fn device_metal_training_matches_single_threaded_cpu() {
     let data = dataset(40_000, 12);
     let build = |device| {
         TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .tree_method(TreeMethod::Hist)
             .max_depth(6)
             .eta(0.3)
@@ -113,7 +116,7 @@ fn device_metal_training_is_deterministic() {
     }
     let data = dataset(20_000, 9);
     let params = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .tree_method(TreeMethod::Hist)
         .max_depth(6)
         .eta(0.3)
@@ -152,13 +155,16 @@ fn device_metal_refuses_unsupported_combinations() {
             with(|p| p.tree_method = TreeMethod::Exact),
             "tree_method=exact",
         ),
-        (with(|p| p.use_quantized_grad = true), "use_quantized_grad"),
+        (
+            with(|p| p.quantized = Some(QuantizedGrad::default())),
+            "use_quantized_grad",
+        ),
         (
             with(|p| p.booster = BoosterKind::GbLinear),
             "booster=gblinear",
         ),
         (
-            with(|p| p.process_type = ProcessType::Update),
+            with(|p| p.process_type = ProcessType::Update(Refresh::default())),
             "process_type=update",
         ),
     ];
@@ -175,13 +181,14 @@ fn to_gpu_predicts_bit_identically() {
     if !device() {
         return;
     }
-    let cases: Vec<(&str, usize)> = [
-        ("reg:squarederror", 0),
-        ("binary:logistic", 0),
-        ("multi:softmax", 4),
-    ]
-    .to_vec();
-    for (objective, num_class) in cases {
+    let cases = [
+        Objective::SquaredError,
+        Objective::BinaryLogistic(Logistic::default()),
+        Objective::Softmax(Multiclass::new(4).unwrap()),
+    ];
+    for spec in cases {
+        let objective = spec.name();
+        let num_class = spec.num_class().unwrap_or(0);
         let data = dataset(6_000, 7);
         let labels: Vec<f32> = data
             .labels()
@@ -198,16 +205,15 @@ fn to_gpu_predicts_bit_identically() {
             })
             .collect();
         let data = data.with_labels(&labels).unwrap();
-        let mut builder = TrainingParams::builder()
-            .objective(objective)
+        let params = TrainingParams::builder()
+            .objective(spec.clone())
             .tree_method(TreeMethod::Hist)
             .max_depth(5)
             .eta(0.4)
-            .booster(BoosterKind::Dart);
-        if num_class > 0 {
-            builder = builder.num_class(num_class);
-        }
-        let model = train(&builder.build().unwrap(), &data, 15).unwrap();
+            .booster(BoosterKind::Dart(Dart::default()))
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 15).unwrap();
         let gpu = model.to_gpu().unwrap();
         assert_eq!(
             model.predict(&data).unwrap(),
@@ -256,7 +262,7 @@ fn to_gpu_refuses_unsupported_models() {
     let linear = train(
         &TrainingParams::builder()
             .tree_method(TreeMethod::Hist)
-            .linear_tree(true)
+            .linear_tree(LinearTree::default())
             .build()
             .unwrap(),
         &data,
@@ -300,7 +306,7 @@ fn histogram(
     backend: &dyn hessboost::internals::HistogramBackend,
     index: &hessboost::internals::GHistIndex,
     rows: &[u32],
-    gpair: &[hessboost::objective::GradPair],
+    gpair: &[GradPair],
 ) -> Vec<(f64, f64)> {
     let mut out = hessboost::internals::zeroed(index.total_bins());
     common::with_threads(1, || {
@@ -326,10 +332,7 @@ fn wide_dynamic_range_histogram_matches_cpu() {
     }
     let (x, grad) = dynamic_range_case();
     let index = index_of(&x);
-    let gpair: Vec<_> = grad
-        .iter()
-        .map(|&g| hessboost::objective::GradPair::new(g, 1.0))
-        .collect();
+    let gpair: Vec<_> = grad.iter().map(|&g| GradPair::new(g, 1.0)).collect();
     let rows: Vec<u32> = (0..x.len() as u32).collect();
     let cpu = histogram(&hessboost::internals::CpuBackend, &index, &rows, &gpair);
     assert_eq!(cpu, [(64.0, 4096.0), (-64.0, 4096.0)]);
@@ -353,7 +356,7 @@ fn wide_dynamic_range_training_matches_single_threaded_cpu() {
         .unwrap();
     let build = |device| {
         TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .tree_method(TreeMethod::Hist)
             .base_score(0.0)
             .max_depth(2)
@@ -384,7 +387,7 @@ fn mismatched_inputs_match_the_cpu_backend() {
     let cpu = hessboost::internals::CpuBackend;
     let backend = metal::MetalHistBackend::new(&index).unwrap();
     let long: Vec<_> = (0..n + 1000)
-        .map(|i| hessboost::objective::GradPair::new((i % 7) as f32 - 3.0, 1.0))
+        .map(|i| GradPair::new((i % 7) as f32 - 3.0, 1.0))
         .collect();
     let rows: Vec<u32> = (0..n as u32).collect();
     assert_eq!(

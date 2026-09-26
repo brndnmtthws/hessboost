@@ -124,7 +124,7 @@ jobs:
       - run: mbx build --all-features
 
   parity:
-    name: XGBoost parity
+    name: XGBoost and LightGBM parity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -140,6 +140,10 @@ jobs:
         run: mbx nextest run --test parity --release --run-ignored only --no-capture
       - name: Export parity (reload in XGBoost)
         run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
+      - name: Generate LightGBM import fixtures from LightGBM 4.7.0
+        run: uv run --with-requirements scripts/requirements-lightgbm.txt python scripts/gen_lightgbm_fixtures.py
+      - name: LightGBM import parity
+        run: mbx nextest run --test lightgbm_parity --release --run-ignored only --no-capture
 
   semver:
     name: semver compatibility

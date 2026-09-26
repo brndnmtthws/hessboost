@@ -2,7 +2,10 @@
 //! `sampling_method=gradient_based` (XGBoost's CPU MVS sampler) and
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
-use hessboost::config::{BoosterKind, SamplingMethod, TrainingParamsBuilder};
+use hessboost::config::{
+    BalancedBagging, BoosterKind, Dart, ProcessType, Refresh, SamplingMethod, TrainingParamsBuilder,
+};
+use hessboost::objective::Logistic;
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -134,7 +137,7 @@ fn gradient_based_sampling_tree_method_support() {
     }
     // DART grows its trees through the same per-tree sampling.
     let dart = TrainingParams::builder()
-        .booster(BoosterKind::Dart)
+        .booster(BoosterKind::Dart(Dart::default()))
         .sampling_method(SamplingMethod::GradientBased)
         .subsample(0.4)
         .build()
@@ -142,6 +145,8 @@ fn gradient_based_sampling_tree_method_support() {
     assert!(train(&dart, &data, 3).is_ok());
 }
 
+/// Class-balanced bagging draws a different, seed-deterministic sample of
+/// each class every round.
 #[test]
 fn balanced_bagging_changes_binary_training_deterministically() {
     let (n_pos, n_neg) = (200usize, 800usize);
@@ -155,7 +160,7 @@ fn balanced_bagging_changes_binary_training_deterministically() {
     let data = labeled_dense(&x, 1, &y);
     let base = || {
         TrainingParams::builder()
-            .objective("binary:logistic")
+            .objective(binary())
             .tree_method(TreeMethod::Hist)
             .max_depth(2)
             .seed(53)
@@ -165,9 +170,7 @@ fn balanced_bagging_changes_binary_training_deterministically() {
         .trees()
         .to_vec();
     let balanced = base()
-        .pos_bagging_fraction(0.6)
-        .neg_bagging_fraction(0.1)
-        .subsample(1.0)
+        .balanced_bagging(BalancedBagging::new(0.6, 0.1).unwrap())
         .build()
         .unwrap();
     let sampled = train(&balanced, &data, 3).unwrap().trees().to_vec();
@@ -175,59 +178,46 @@ fn balanced_bagging_changes_binary_training_deterministically() {
     assert_eq!(sampled, train(&balanced, &data, 3).unwrap().trees());
 }
 
+/// Balanced bagging needs a binary objective on a tree booster, uniform
+/// sampling, `subsample = 1`, and one label column of `0`/`1` labels.
 #[test]
 fn balanced_bagging_refuses_unsupported_parameters_and_labels() {
-    let builder = || TrainingParams::builder().pos_bagging_fraction(0.5);
-    assert_eq!(invalid_param(builder().build()), "pos_bagging_fraction");
-    assert_eq!(
-        invalid_param(
+    let bagging = BalancedBagging::new(0.5, 1.0).unwrap();
+    let builder = || TrainingParams::builder().balanced_bagging(bagging);
+    for (params, name) in [
+        (builder(), "pos_bagging_fraction"),
+        (
             builder()
-                .objective("binary:logistic")
-                .sampling_method(SamplingMethod::GradientBased)
-                .build()
+                .objective(binary())
+                .sampling_method(SamplingMethod::GradientBased),
+            "sampling_method",
         ),
-        "sampling_method"
-    );
-    assert_eq!(
-        invalid_param(
-            TrainingParams::builder()
-                .objective("reg:squarederror")
-                .pos_bagging_fraction(0.5)
-                .build()
+        (builder().objective(binary()).subsample(0.8), "subsample"),
+        (
+            builder().objective(binary()).booster(BoosterKind::GbLinear),
+            "pos_bagging_fraction",
         ),
-        "pos_bagging_fraction"
-    );
-    assert_eq!(
-        invalid_param(
-            TrainingParams::builder()
-                .objective("binary:logistic")
-                .pos_bagging_fraction(0.5)
-                .subsample(0.8)
-                .build()
-        ),
-        "subsample"
-    );
-    assert_eq!(
-        invalid_param(
-            TrainingParams::builder()
-                .objective("binary:logistic")
-                .booster(BoosterKind::GbLinear)
-                .pos_bagging_fraction(0.5)
-                .build()
-        ),
-        "pos_bagging_fraction"
-    );
+    ] {
+        assert_eq!(invalid_param(params.build()), name);
+    }
+    let binary = builder().objective(binary()).build().unwrap();
     let multi = DMatrix::from_dense(&[0.0, 1.0, 1.0, 0.0], 2, 2)
         .unwrap()
         .with_label_matrix(&[0.0, 1.0, 1.0, 0.0], 2)
         .unwrap();
-    let binary = TrainingParams::builder()
-        .objective("binary:logistic")
-        .pos_bagging_fraction(0.5)
-        .build()
-        .unwrap();
     assert_eq!(invalid_param(train(&binary, &multi, 1)), "labels");
+    let graded = labeled_dense(&[0.0, 1.0], 1, &[0.0, 0.5]);
+    assert_eq!(invalid_param(train(&binary, &graded, 1)), "labels");
 }
+
+/// `binary:logistic`.
+fn binary() -> Objective {
+    Objective::BinaryLogistic(Logistic::default())
+}
+
+/// Zero weights are epsilon weights (floored at 1e-6, as in XGBoost): against
+/// weights far above the floor they practically never win, so on these fixed
+/// seeds a stage that keeps as many features as have positive weight never
 /// splits on a zero-weight feature, for every tree method and sampling stage.
 #[test]
 fn zero_weight_features_are_practically_never_split_on() {
@@ -383,7 +373,7 @@ fn plain(method: TreeMethod, booster: BoosterKind) -> TrainingParamsBuilder {
 #[test]
 fn approx_parallel_trees_share_one_row_sample() {
     let data = step_rows(|_| 0.0);
-    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
         for (sampling, subsample) in [
             (SamplingMethod::GradientBased, 0.25),
             (SamplingMethod::Uniform, 0.5),
@@ -422,7 +412,7 @@ fn approx_parallel_trees_share_one_row_sample() {
 fn approx_gradient_sampling_continuation_matches_uninterrupted_training() {
     let step = step_rows(|i| i as f32);
     let wide = dataset(400, 3);
-    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
         for (data, depth, split) in [(&step, 1, [1, 1]), (&wide, 3, [2, 3])] {
             let params = plain(TreeMethod::Approx, booster)
                 .sampling_method(SamplingMethod::GradientBased)
@@ -484,7 +474,7 @@ fn feature_weights_are_refused_where_columns_are_not_sampled() {
     );
     let model = train(&TrainingParams::default(), &data, 2).unwrap();
     let update = TrainingParams::builder()
-        .process_type(hessboost::config::ProcessType::Update)
+        .process_type(ProcessType::Update(Refresh::default()))
         .build()
         .unwrap();
     let refresh = |data: &DMatrix| Trainer::new(&update, data, 2).init_model(&model).train();

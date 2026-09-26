@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --release --example train_regression`
 
-use hessboost::metric::{Metric, Rmse};
+use hessboost::metric::EvalMetric;
 use hessboost::prelude::*;
 
 mod common;
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     let dtrain = DMatrix::from_dense(&x, n_rows, n_cols)?.with_labels(&y)?;
 
     let params = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .max_depth(4)
         .eta(0.1)
         .subsample(0.9)
@@ -42,7 +42,9 @@ fn main() -> Result<()> {
     let model = train(&params, &dtrain, 200)?;
 
     let preds = model.predict(&dtrain)?;
-    let rmse = Rmse::default().eval(&preds, dtrain.labels().unwrap(), None);
+    let rmse = EvalMetric::Rmse
+        .build(1)?
+        .eval(&preds, dtrain.labels().unwrap(), None);
     println!("trained {} trees", model.num_trees());
     println!("training RMSE: {rmse:.5}");
 

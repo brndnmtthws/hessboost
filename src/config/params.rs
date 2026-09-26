@@ -5,21 +5,24 @@
 //! exposes aliases (e.g. `eta`/`learning_rate`), we pick the canonical field
 //! name and document the alias.
 
+use super::groups::{BalancedBagging, Dart, ExtraTrees, LinearTree, QuantizedGrad, Refresh};
 use crate::error::{HessboostError, Result};
+use crate::objective::{Loss, LossContext, Objective, ObjectiveParts};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Which booster to use in the ensemble.
 ///
 /// Mirrors XGBoost's `booster` parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[non_exhaustive]
 pub enum BoosterKind {
     /// Gradient boosted trees (XGBoost `gbtree`).
     #[default]
     GbTree,
-    /// Dropout Additive Regression Trees (XGBoost `dart`).
-    Dart,
+    /// Dropout Additive Regression Trees (XGBoost `dart`) with this
+    /// dropout.
+    Dart(Dart),
     /// Linear booster with coordinate descent (XGBoost `gblinear`). It
     /// updates from every row and feature and grows no trees, so row and
     /// column sampling, `num_parallel_tree > 1`, tree constraints, and
@@ -121,22 +124,6 @@ pub enum Monotone {
     Decreasing,
 }
 
-/// Noise distribution of the accelerated-failure-time survival loss.
-///
-/// Mirrors XGBoost's `aft_loss_distribution`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum AftDistribution {
-    /// Normal (Gaussian) noise. XGBoost default.
-    #[default]
-    Normal,
-    /// Logistic noise.
-    Logistic,
-    /// Type-1 extreme-value (Gumbel minimum) noise.
-    Extreme,
-}
-
 /// How rows are subsampled each round.
 ///
 /// Mirrors XGBoost's `sampling_method`.
@@ -178,7 +165,7 @@ pub enum MultiStrategy {
     /// (`process_type = update`) and the compact format
     /// ([`model::compact`](crate::model::compact)) refuse vector-leaf
     /// models. Reduced split gradients
-    /// ([`Objective::split_gradient`](crate::objective::Objective::split_gradient))
+    /// ([`Loss::split_gradient`](crate::objective::Loss::split_gradient))
     /// cannot be combined with monotone constraints.
     MultiOutputTree,
 }
@@ -186,8 +173,7 @@ pub enum MultiStrategy {
 /// Whether a round grows new trees or updates existing ones.
 ///
 /// Mirrors XGBoost's `process_type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ProcessType {
     /// Grow new trees. XGBoost default.
@@ -200,87 +186,15 @@ pub enum ProcessType {
     /// (row and column sampling, symmetric growth, DART dropout, the
     /// beyond-XGBoost tree options) and training-matrix feature weights
     /// must keep their defaults.
-    Update,
-}
-
-/// The second-order statistic the `dist:*` distributional objectives give
-/// the trees (beyond XGBoost; see [`crate::objective::distributional`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum DistGradient {
-    /// Gradient of the negative log-likelihood with the diagonal Fisher
-    /// information as Hessian (Fisher scoring; a natural-gradient Newton
-    /// step for the orthogonal parameterizations used).
-    #[default]
-    Fisher,
-    /// Gradient with the diagonal of the exact (observed) Hessian, floored
-    /// at `1e-16` (XGBoostLSS-style).
-    Hessian,
-    /// NGBoost's natural gradient `I⁻¹ ∇` with unit Hessian: trees regress
-    /// the natural gradient by least squares.
-    Natural,
-}
-
-/// How the shared tree of a `dist:*` objective chooses its structure under
-/// `multi_strategy = multi_output_tree` (beyond XGBoost; see
-/// [`crate::objective::distributional`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum DistSplitDirection {
-    /// Parallel gradient boosting (Chapelle et al., 2026, Algorithm 1): each
-    /// round grows the structure from the gradients of one distribution
-    /// parameter drawn uniformly at random (seeded by `seed` and the
-    /// iteration), a canonical descent direction `e_m`.
-    #[default]
-    Random,
-    /// Parallel gradient boosting with a deterministic sweep: parameter
-    /// `iteration mod n_params` drives round `iteration`.
-    Cyclic,
-    /// Plain vector-leaf trees: the split gain sums over every parameter.
-    All,
-}
-
-/// Stable names of the enums a model file stores, matching their serde
-/// (and XGBoost) spellings.
-macro_rules! stored_names {
-    ($($ty:ident { $($variant:ident => $name:literal),+ $(,)? })+) => {$(
-        impl $ty {
-            /// The variant's stored name.
-            pub(crate) fn name(self) -> &'static str {
-                match self {
-                    $($ty::$variant => $name,)+
-                }
-            }
-
-            /// The variant stored as `name`, if any.
-            pub(crate) fn from_name(name: &str) -> Option<Self> {
-                match name {
-                    $($name => Some($ty::$variant),)+
-                    _ => None,
-                }
-            }
-        }
-    )+};
-}
-
-stored_names! {
-    AftDistribution { Normal => "normal", Logistic => "logistic", Extreme => "extreme" }
-    DistGradient { Fisher => "fisher", Hessian => "hessian", Natural => "natural" }
-    DistSplitDirection { Random => "random", Cyclic => "cyclic", All => "all" }
+    Update(Refresh),
 }
 
 /// The complete training configuration.
 ///
-/// Construct with [`TrainingParams::builder`] or start from
-/// [`TrainingParams::default`] and mutate fields directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent XGBoost/LightGBM switches, not a state machine"
-)]
+/// Construct with [`TrainingParams::builder`], start from
+/// [`TrainingParams::default`] and mutate fields directly, or parse
+/// XGBoost's flat key/value form with [`TrainingParams::from_xgboost`].
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct TrainingParams {
     // ---- General ----
@@ -297,51 +211,20 @@ pub struct TrainingParams {
     pub device: Device,
 
     // ---- Learning task ----
-    /// Objective function name, e.g. `"reg:squarederror"`, `"binary:logistic"`.
-    /// XGBoost `objective`.
-    pub objective: String,
-    /// Number of classes for multiclass objectives. XGBoost `num_class`.
-    pub num_class: usize,
+    /// The learning objective with its parameters, or a custom loss
+    /// ([`Objective::Custom`]). XGBoost `objective` (plus the parameters
+    /// each objective reads: `num_class`, `scale_pos_weight`,
+    /// `tweedie_variance_power`, ...).
+    pub objective: Objective,
     /// Global bias / initial prediction (in probability space where applicable).
     /// `None` means "estimate from the labels", matching modern XGBoost.
     /// XGBoost `base_score`.
     pub base_score: Option<f64>,
-    /// Evaluation metric names. Empty means "use the objective's default".
+    /// The metrics evaluated on every eval set, in order (the last one
+    /// drives early stopping). Empty means the loss's default
+    /// ([`Loss::default_metric`](crate::objective::Loss::default_metric)).
     /// XGBoost `eval_metric`.
-    pub eval_metric: Vec<String>,
-
-    // ---- Objective-specific ----
-    /// Variance power of the Tweedie distribution for `reg:tweedie`, in
-    /// `[1, 2)` (1 = Poisson, 2 = Gamma). XGBoost `tweedie_variance_power`.
-    pub tweedie_variance_power: f64,
-    /// Slope `δ` of the pseudo-Huber loss for `reg:pseudohubererror` and the
-    /// `mphe` metric (which rejects `0`). XGBoost `huber_slope`.
-    pub huber_slope: f64,
-    /// Number of top-ranked documents paired with all lower-ranked documents
-    /// by LambdaRank's `topk` pair method. XGBoost
-    /// `lambdarank_num_pair_per_sample` (default 32 for `topk`).
-    pub lambdarank_num_pair_per_sample: usize,
-    /// Target quantiles for `reg:quantileerror`: non-empty, ascending, each in
-    /// `[0, 1]`. XGBoost `quantile_alpha`.
-    pub quantile_alpha: Vec<f64>,
-    /// Target expectiles for `reg:expectileerror`: non-empty, ascending, each
-    /// in `[0, 1]`. XGBoost `expectile_alpha`.
-    pub expectile_alpha: Vec<f64>,
-    /// Noise distribution for `survival:aft`. XGBoost `aft_loss_distribution`.
-    pub aft_loss_distribution: AftDistribution,
-    /// Scale of the `survival:aft` noise distribution (`> 0` and finite, also
-    /// once rounded to the `f32` the objective computes in).
-    /// XGBoost `aft_loss_distribution_scale`.
-    pub aft_loss_distribution_scale: f64,
-    /// Second-order statistic of the `dist:*` objectives (beyond XGBoost):
-    /// Fisher information (default), exact Hessian, or NGBoost natural
-    /// gradient. Ignored by every other objective.
-    pub dist_gradient: DistGradient,
-    /// Split direction of the shared (vector-leaf) trees of the `dist:*`
-    /// objectives with `multi_strategy = multi_output_tree` (beyond XGBoost):
-    /// parallel gradient boosting on a random (default) or cyclic parameter,
-    /// or the full vector-leaf gain. Ignored otherwise.
-    pub dist_split_direction: DistSplitDirection,
+    pub eval_metric: Vec<crate::metric::EvalMetric>,
 
     // ---- Tree booster ----
     /// Learning rate / step-size shrinkage. XGBoost `eta` / `learning_rate`.
@@ -357,8 +240,9 @@ pub struct TrainingParams {
     pub min_child_weight: f64,
     /// Maximum delta step allowed for each leaf weight; `Some(0.0)` means no
     /// constraint. `None` leaves XGBoost's objective-dependent default: `0.7`
-    /// for `count:poisson` (where the same value also stabilizes the Poisson
-    /// Hessian), otherwise unconstrained. XGBoost `max_delta_step`.
+    /// for [`Objective::Poisson`] (where the same value also stabilizes the
+    /// Poisson Hessian), otherwise unconstrained (also for a custom loss).
+    /// XGBoost `max_delta_step`.
     pub max_delta_step: Option<f64>,
     /// Row subsample ratio per boosting round. XGBoost `subsample`.
     pub subsample: f64,
@@ -372,9 +256,6 @@ pub struct TrainingParams {
     pub lambda: f64,
     /// L1 regularization on leaf weights. XGBoost `alpha` / `reg_alpha`.
     pub alpha: f64,
-    /// Balancing of positive/negative weights for imbalanced binary problems.
-    /// XGBoost `scale_pos_weight`.
-    pub scale_pos_weight: f64,
     /// Tree construction algorithm. XGBoost `tree_method`.
     pub tree_method: TreeMethod,
     /// Tree growth order. XGBoost `grow_policy`.
@@ -398,38 +279,26 @@ pub struct TrainingParams {
     pub num_parallel_tree: usize,
     /// Row subsampling method. XGBoost `sampling_method`.
     pub sampling_method: SamplingMethod,
+    /// LightGBM's class-balanced bagging for binary classification
+    /// ([`BalancedBagging`]; `pos_bagging_fraction` /
+    /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
+    /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
+    /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
+    /// booster, uniform sampling, and one label column of `0`/`1` labels.
+    pub balanced_bagging: Option<BalancedBagging>,
     /// Output-to-tree allocation for multi-output models. XGBoost
     /// `multi_strategy`.
     pub multi_strategy: MultiStrategy,
-    /// Grow new trees or update existing ones. XGBoost `process_type`.
+    /// Grow new trees or update existing ones (with the refresh updater's
+    /// options). XGBoost `process_type`.
     pub process_type: ProcessType,
-    /// With `process_type = update`, whether the refresh updater also
-    /// rewrites leaf values (not only node statistics). XGBoost
-    /// `refresh_leaf`.
-    pub refresh_leaf: bool,
 
-    /// Positive-label Bernoulli bagging fraction for binary classification
-    /// (LightGBM `pos_bagging_fraction`; `1` disables the positive override).
-    /// With either class fraction below `1`, stratified sampling is active and
-    /// `subsample` must remain `1`; LightGBM ignores `bagging_fraction`, while
-    /// hessboost refuses that conflicting setting.
-    pub pos_bagging_fraction: f64,
-    /// Negative-label Bernoulli bagging fraction for binary classification
-    /// (LightGBM `neg_bagging_fraction`; `1` disables the negative override).
-    /// Balanced bagging is off when both class fractions are `1`.
-    pub neg_bagging_fraction: f64,
     // ---- LightGBM tree options (opt-in, beyond XGBoost) ----
-    /// Extremely randomized split search (LightGBM `extra_trees`): every
-    /// numerical feature is scored at one random bin boundary per node, drawn
-    /// uniformly between the node's lowest and highest occupied bin, and every
-    /// categorical feature at one random prefix of its gradient-ordered
-    /// categories. Requires the histogram builder (`hist`/`approx`) and one
-    /// output per tree; refused with `grow_policy = symmetric`.
-    pub extra_trees: bool,
-    /// Seed of the [`extra_trees`](Self::extra_trees) threshold draws,
-    /// combined with the per-tree seed derived from [`seed`](Self::seed).
-    /// LightGBM `extra_seed` (default `6`).
-    pub extra_seed: u64,
+    /// Extremely randomized split search (LightGBM `extra_trees`), `None`
+    /// for XGBoost's exhaustive search. Requires the histogram builder
+    /// (`hist`/`approx`) and one output per tree; refused with
+    /// `grow_policy = symmetric`.
+    pub extra_trees: Option<ExtraTrees>,
     /// Path smoothing strength `s >= 0` (LightGBM `path_smooth`, `0` = off).
     /// Each child's output is pulled toward its parent's:
     /// `w = w_raw·(n/s)/(n/s + 1) + w_parent/(n/s + 1)` with `n` the child's
@@ -446,37 +315,11 @@ pub struct TrainingParams {
     /// are re-estimated after growth. Linear-leaf models use the native
     /// formats only: SHAP, XGBoost export, and the compact format refuse
     /// them.
-    pub linear_tree: bool,
-    /// L2 penalty on the leaf linear models' slopes (not their intercepts),
-    /// `>= 0`. LightGBM `linear_lambda`.
-    pub linear_lambda: f64,
-    // ---- Quantized training (LightGBM; beyond XGBoost) ----
-    /// Train on gradients and Hessians quantized to small integers with
-    /// integer histograms (LightGBM `use_quantized_grad`; Shi et al., NeurIPS
-    /// 2022). Opt-in and not part of XGBoost: trees differ from
-    /// full-precision training. Needs `tree_method` `hist`/`approx` (or
-    /// `auto`) and a tree booster.
-    pub use_quantized_grad: bool,
-    /// Quantization levels `Q` for [`use_quantized_grad`](Self::use_quantized_grad):
-    /// gradients map to integers in `[-⌊Q/2⌋, ⌊Q/2⌋]`, non-negative Hessians
-    /// to `[0, Q]`. In `[2, 127]` (LightGBM stores each value in 8 bits).
-    /// LightGBM `num_grad_quant_bins`.
-    pub num_grad_quant_bins: usize,
-    /// Round quantized gradients stochastically (unbiased) rather than to the
-    /// nearest level. Only used with `use_quantized_grad`. LightGBM
-    /// `stochastic_rounding`.
-    pub stochastic_rounding: bool,
-    /// Recompute each leaf value from the full-precision gradients of its rows
-    /// once a quantized tree is grown. Only used with `use_quantized_grad`;
-    /// refused with [`path_smooth`](Self::path_smooth), whose leaves keep the
-    /// outputs their splits recorded. LightGBM `quant_train_renew_leaf`.
-    pub quant_train_renew_leaf: bool,
-
-    // ---- DART-specific ----
-    /// Fraction of trees to drop each round (DART). XGBoost `rate_drop`.
-    pub rate_drop: f64,
-    /// Probability of skipping dropout in a round (DART). XGBoost `skip_drop`.
-    pub skip_drop: f64,
+    pub linear_tree: Option<LinearTree>,
+    /// Train on quantized gradients (LightGBM `use_quantized_grad`), `None`
+    /// for full precision. Needs `tree_method` `hist`/`approx` (or `auto`)
+    /// and a tree booster.
+    pub quantized: Option<QuantizedGrad>,
 
     // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
     /// Penalty `ι` subtracted from the loss change of a split on a feature the
@@ -496,10 +339,6 @@ pub struct TrainingParams {
     /// [`gamma`](Self::gamma); `0` (the default) disables it. The paper's
     /// `toad_penalty_threshold`.
     pub toad_penalty_threshold: f64,
-
-    // ---- Missing value ----
-    /// Value treated as "missing" in dense inputs. Defaults to NaN, like XGBoost.
-    pub missing: f64,
 }
 
 impl Default for TrainingParams {
@@ -509,19 +348,9 @@ impl Default for TrainingParams {
             nthread: 0,
             seed: 0,
             device: Device::Cpu,
-            objective: "reg:squarederror".to_string(),
-            num_class: 0,
+            objective: Objective::SquaredError,
             base_score: None,
             eval_metric: Vec::new(),
-            tweedie_variance_power: 1.5,
-            huber_slope: 1.0,
-            lambdarank_num_pair_per_sample: 32,
-            quantile_alpha: Vec::new(),
-            expectile_alpha: Vec::new(),
-            aft_loss_distribution: AftDistribution::Normal,
-            aft_loss_distribution_scale: 1.0,
-            dist_gradient: DistGradient::Fisher,
-            dist_split_direction: DistSplitDirection::Random,
             eta: 0.3,
             gamma: 0.0,
             max_depth: 6,
@@ -534,33 +363,22 @@ impl Default for TrainingParams {
             colsample_bynode: 1.0,
             lambda: 1.0,
             alpha: 0.0,
-            scale_pos_weight: 1.0,
             tree_method: TreeMethod::Auto,
             grow_policy: GrowPolicy::DepthWise,
             max_bin: 256,
             monotone_constraints: Vec::new(),
             interaction_constraints: Vec::new(),
-            pos_bagging_fraction: 1.0,
-            neg_bagging_fraction: 1.0,
             num_parallel_tree: 1,
             sampling_method: SamplingMethod::Uniform,
+            balanced_bagging: None,
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
-            refresh_leaf: true,
-            extra_trees: false,
-            extra_seed: 6,
+            extra_trees: None,
             path_smooth: 0.0,
-            linear_tree: false,
-            linear_lambda: 0.0,
-            use_quantized_grad: false,
-            num_grad_quant_bins: 4,
-            stochastic_rounding: true,
-            quant_train_renew_leaf: false,
-            rate_drop: 0.0,
-            skip_drop: 0.0,
+            linear_tree: None,
+            quantized: None,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
-            missing: f64::NAN,
         }
     }
 }
@@ -673,6 +491,39 @@ impl TrainingParams {
         self.validate_tree_options()
     }
 
+    /// Class-balanced bagging: a binary objective on a tree booster, with
+    /// uniform sampling and no `subsample` it would override.
+    fn validate_balanced_bagging(&self) -> Result<()> {
+        if self.balanced_bagging.is_none() {
+            return Ok(());
+        }
+        ensure(
+            "pos_bagging_fraction",
+            self.booster != BoosterKind::GbLinear,
+            "balanced bagging needs a tree booster: `gblinear` samples no rows",
+        )?;
+        ensure(
+            "pos_bagging_fraction",
+            self.objective.is_binary_classifier(),
+            format!(
+                "balanced bagging needs a `binary:*` objective, not `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            "subsample",
+            self.subsample == 1.0,
+            "balanced bagging replaces `subsample` (LightGBM ignores \
+             `bagging_fraction` then); leave it at 1",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "balanced bagging samples uniformly within each class; \
+             `gradient_based` is not supported with it",
+        )
+    }
+
     /// Whether either reuse penalty (Trees-on-a-Diet) is on.
     fn reuse_penalties_on(&self) -> bool {
         self.toad_penalty_feature > 0.0 || self.toad_penalty_threshold > 0.0
@@ -694,59 +545,12 @@ impl TrainingParams {
         narrows("lambda", self.lambda, false)?;
         non_negative("alpha", self.alpha)?;
         narrows("alpha", self.alpha, false)?;
-        positive("scale_pos_weight", self.scale_pos_weight)?;
-        narrows("scale_pos_weight", self.scale_pos_weight, true)?;
         unit("subsample", self.subsample)?;
         // subsample of exactly 0 is meaningless.
         ensure("subsample", self.subsample != 0.0, "must be > 0")?;
         unit("colsample_bytree", self.colsample_bytree)?;
         unit("colsample_bylevel", self.colsample_bylevel)?;
-        unit("colsample_bynode", self.colsample_bynode)?;
-        unit("pos_bagging_fraction", self.pos_bagging_fraction)?;
-        ensure(
-            "pos_bagging_fraction",
-            self.pos_bagging_fraction > 0.0,
-            "must be > 0",
-        )?;
-        unit("neg_bagging_fraction", self.neg_bagging_fraction)?;
-        ensure(
-            "neg_bagging_fraction",
-            self.neg_bagging_fraction > 0.0,
-            "must be > 0",
-        )?;
-        unit("rate_drop", self.rate_drop)?;
-        unit("skip_drop", self.skip_drop)
-    }
-
-    fn validate_balanced_bagging(&self) -> Result<()> {
-        let enabled = self.pos_bagging_fraction < 1.0 || self.neg_bagging_fraction < 1.0;
-        if !enabled {
-            return Ok(());
-        }
-        ensure(
-            "pos_bagging_fraction",
-            self.booster != BoosterKind::GbLinear,
-            "balanced bagging is not supported with `booster=gblinear` because it samples no rows",
-        )?;
-        ensure(
-            "pos_bagging_fraction",
-            matches!(
-                self.objective.as_str(),
-                "binary:logistic" | "binary:logitraw" | "binary:hinge"
-            ),
-            "balanced bagging requires a binary classification objective",
-        )?;
-        ensure(
-            "subsample",
-            self.subsample == 1.0,
-            "LightGBM ignores `bagging_fraction` when balanced bagging is enabled; \
-             hessboost refuses `subsample < 1` together with class bagging fractions",
-        )?;
-        ensure(
-            "sampling_method",
-            self.sampling_method == SamplingMethod::Uniform,
-            "balanced bagging is not supported with `gradient_based` sampling",
-        )
+        unit("colsample_bynode", self.colsample_bynode)
     }
 
     /// Ranges of the reuse penalties and the split searches that apply them.
@@ -766,7 +570,7 @@ impl TrainingParams {
         ensure(
             "toad_penalty_feature",
             !(reuse_on
-                && (self.extra_trees
+                && (self.extra_trees.is_some()
                     || self.path_smooth > 0.0
                     || self.grow_policy == GrowPolicy::Symmetric)),
             "reuse penalties are not supported with `extra_trees`, `path_smooth`, or \
@@ -791,7 +595,7 @@ impl TrainingParams {
             )?;
             ensure(
                 "device",
-                !self.use_quantized_grad,
+                self.quantized.is_none(),
                 "`metal` does not support `use_quantized_grad`",
             )?;
             ensure(
@@ -801,67 +605,44 @@ impl TrainingParams {
             )?;
             ensure(
                 "device",
-                self.process_type != ProcessType::Update,
+                !matches!(self.process_type, ProcessType::Update(_)),
                 "`metal` does not support `process_type = update` (refresh grows no trees)",
             )?;
         }
         Ok(())
     }
 
-    /// Ranges of the objective parameters (and `base_score`).
+    /// `base_score` and the objective settings its parameter structs cannot
+    /// check alone.
     fn validate_objective_params(&self) -> Result<()> {
         if let Some(base_score) = self.base_score {
             ensure("base_score", base_score.is_finite(), "must be finite")?;
         }
-        // Models store both lists whatever the objective, so an entry no
-        // objective could use (e.g. NaN) must not reach a saved model. Their
-        // own objectives also require a non-empty, ascending list.
-        for alpha in &self.quantile_alpha {
-            unit("quantile_alpha", *alpha)?;
+        // A model records a custom loss by its name; a built-in objective's
+        // name would reload as that objective, with its transform.
+        if let Objective::Custom(loss) = &self.objective {
+            ensure(
+                "objective",
+                Objective::from_parts(loss.name(), &ObjectiveParts::default()).is_none(),
+                format!(
+                    "the custom loss is named `{}`, a built-in objective's name, as which a \
+                     saved model would reload; rename the loss",
+                    loss.name()
+                ),
+            )?;
         }
-        for alpha in &self.expectile_alpha {
-            unit("expectile_alpha", *alpha)?;
+        // Only shared (vector-leaf) trees choose their structure from one
+        // distribution parameter; other layouts would ignore the direction.
+        if let Objective::Dist(dist) = &self.objective {
+            ensure(
+                "dist_split_direction",
+                dist.split_direction().is_none()
+                    || self.multi_strategy == MultiStrategy::MultiOutputTree,
+                "chooses the structure of shared trees and needs \
+                 `multi_strategy=multi_output_tree`",
+            )?;
         }
-        // The objectives run in `f32`: validate the narrowed values so a
-        // configuration cannot pass here and leave the documented range once
-        // it reaches the objective.
-        let rho = self.tweedie_variance_power as f32;
-        ensure(
-            "tweedie_variance_power",
-            self.tweedie_variance_power.is_finite() && (1.0f32..2.0).contains(&rho),
-            format!(
-                "must be in [1, 2) (as f32), got {}",
-                self.tweedie_variance_power
-            ),
-        )?;
-        positive("huber_slope", self.huber_slope)?;
-        let slope_sq = (self.huber_slope as f32) * (self.huber_slope as f32);
-        ensure(
-            "huber_slope",
-            slope_sq.is_finite() && slope_sq > 0.0,
-            format!(
-                "squared slope must stay positive and finite in f32, got {}",
-                self.huber_slope
-            ),
-        )?;
-        ensure(
-            "lambdarank_num_pair_per_sample",
-            self.lambdarank_num_pair_per_sample >= 1,
-            "must be >= 1",
-        )?;
-        positive(
-            "aft_loss_distribution_scale",
-            self.aft_loss_distribution_scale,
-        )?;
-        let aft_scale = self.aft_loss_distribution_scale as f32;
-        ensure(
-            "aft_loss_distribution_scale",
-            aft_scale.is_finite() && aft_scale > 0.0,
-            format!(
-                "must stay positive and finite in f32, got {}",
-                self.aft_loss_distribution_scale
-            ),
-        )
+        Ok(())
     }
 
     /// Histogram bins, tree size bounds, and the symmetric-growth depth.
@@ -898,11 +679,7 @@ impl TrainingParams {
                 "symmetric growth sizes trees by max_depth; max_leaves must be 0",
             )?;
         }
-        ensure(
-            "num_grad_quant_bins",
-            (2..=127).contains(&self.num_grad_quant_bins),
-            format!("must be in [2, 127], got {}", self.num_grad_quant_bins),
-        )
+        Ok(())
     }
 
     /// Compatibility of the vector-leaf and quantized training modes.
@@ -922,7 +699,7 @@ impl TrainingParams {
                 "reuse penalties are not supported with `multi_strategy=multi_output_tree`",
             )?;
         }
-        if self.use_quantized_grad {
+        if let Some(quantized) = &self.quantized {
             ensure(
                 "use_quantized_grad",
                 self.tree_method != TreeMethod::Exact && self.booster != BoosterKind::GbLinear,
@@ -944,7 +721,7 @@ impl TrainingParams {
             // recorded, so renewed leaf statistics would be discarded.
             ensure(
                 "quant_train_renew_leaf",
-                !(self.quant_train_renew_leaf && self.path_smooth > 0.0),
+                !(quantized.renew_leaf() && self.path_smooth > 0.0),
                 "leaf renewal is not supported with `path_smooth`",
             )?;
         }
@@ -1013,13 +790,12 @@ impl TrainingParams {
     /// linear leaves are fitted after growth and apply to symmetric trees.
     fn validate_tree_options(&self) -> Result<()> {
         non_negative("path_smooth", self.path_smooth)?;
-        non_negative("linear_lambda", self.linear_lambda)?;
         // The compatibility checks do not depend on the option, so the first
         // enabled one names the error.
         let enabled = [
-            ("extra_trees", self.extra_trees),
+            ("extra_trees", self.extra_trees.is_some()),
             ("path_smooth", self.path_smooth > 0.0),
-            ("linear_tree", self.linear_tree),
+            ("linear_tree", self.linear_tree.is_some()),
         ];
         if let Some(&(name, _)) = enabled.iter().find(|&&(_, on)| on) {
             ensure(
@@ -1050,48 +826,63 @@ impl TrainingParams {
         // would overwrite the constant that linear leaves fall back to.
         ensure(
             "linear_tree",
-            !(self.linear_tree
-                && matches!(
-                    self.objective.as_str(),
-                    "reg:absoluteerror" | "reg:quantileerror"
-                )),
+            !(self.linear_tree.is_some() && self.objective.has_adaptive_leaves()),
             format!(
                 "is not supported with the adaptive-leaf objective `{}`",
-                self.objective
+                self.objective.name()
             ),
         )
     }
 
-    /// The `max_delta_step` in effect: the configured value, or XGBoost's
-    /// default when unset ([`default_max_delta_step`]).
+    /// The `max_delta_step` in effect: the configured value, or the
+    /// objective's default when unset (XGBoost's 0.7 for `count:poisson`).
     pub(crate) fn effective_max_delta_step(&self) -> f64 {
         self.max_delta_step
-            .unwrap_or_else(|| default_max_delta_step(&self.objective))
+            .unwrap_or_else(|| self.objective.default_max_delta_step())
     }
 
-    /// Refuse every field of `self` that differs from `allowed`, comparing
-    /// the serialized configurations so a field added later is covered too
-    /// (budget mode and the refresh updater: `allowed` is the defaults plus
-    /// what they read). The error names `param` and lists the fields after
-    /// `reason`: "`reason`; leave `a`, `b` at the default".
+    /// The loss this configuration trains with on data with `n_targets`
+    /// label columns: the custom loss itself, or the built-in objective's
+    /// with its parameters, the `max_delta_step` in effect, and (with
+    /// `multi_strategy = multi_output_tree`) the shared-tree split of a
+    /// `dist:*` objective.
+    ///
+    /// `reg:squarederror`, `reg:pseudohubererror`, `reg:logistic`,
+    /// `binary:logistic`, and `reg:absoluteerror` accept a label matrix and
+    /// give one output per label column, as in XGBoost; quantile and
+    /// expectile regression give one output per level, `dist:*` one per
+    /// distribution parameter, multiclass one per class.
+    ///
+    /// # Errors
+    ///
+    /// `n_targets > 1` for an objective that models one target per row
+    /// (`invalid parameter "labels"`).
+    pub fn loss(&self, n_targets: usize) -> Result<Arc<dyn Loss>> {
+        self.objective.build_loss(&LossContext {
+            n_targets,
+            max_delta_step: self.effective_max_delta_step(),
+            shared_tree_seed: (self.multi_strategy == MultiStrategy::MultiOutputTree)
+                .then_some(self.seed),
+        })
+    }
+
+    /// Refuse every setting of `self` that differs from `allowed` (budget
+    /// mode and the refresh updater: `allowed` is the defaults plus what
+    /// they read). Every field is compared
+    /// ([`TrainingParams::changed_keys`] destructures the whole struct, so a
+    /// field added later is covered too). The error names `param` and lists
+    /// the XGBoost keys after `reason`: "`reason`; leave `a`, `b` at the
+    /// default".
     pub(crate) fn refuse_changes_from(
         &self,
         allowed: &TrainingParams,
         param: &'static str,
         reason: &str,
     ) -> Result<()> {
-        let (Ok(serde_json::Value::Object(set)), Ok(serde_json::Value::Object(allowed))) =
-            (serde_json::to_value(self), serde_json::to_value(allowed))
-        else {
-            return Err(HessboostError::invalid_param(
-                param,
-                "training parameters could not be compared",
-            ));
-        };
-        let changed: Vec<String> = set
-            .iter()
-            .filter(|(key, value)| allowed.get(*key) != Some(*value))
-            .map(|(key, _)| format!("`{key}`"))
+        let changed: Vec<String> = self
+            .changed_keys(allowed)
+            .into_iter()
+            .map(|key| format!("`{key}`"))
             .collect();
         if changed.is_empty() {
             Ok(())
@@ -1100,208 +891,6 @@ impl TrainingParams {
                 param,
                 format!("{reason}; leave {} at the default", changed.join(", ")),
             ))
-        }
-    }
-}
-
-/// XGBoost's `max_delta_step` for `objective` when none is configured: `0.7`
-/// for `count:poisson`, which XGBoost's learner injects before configuring
-/// the objective and tree updater; `0`, unconstrained, otherwise.
-fn default_max_delta_step(objective: &str) -> f64 {
-    if objective == "count:poisson" {
-        0.7
-    } else {
-        0.0
-    }
-}
-
-/// The objective hyper-parameters a trained [`BoostedModel`](crate::model::BoostedModel)
-/// retains. XGBoost saves them in the model's `objective` block, so they are
-/// needed to write an XGBoost-format model faithfully and to rebuild the
-/// objective when predicting. Tree-construction parameters are not retained.
-///
-/// Construct with [`ObjectiveParams::default`], [`ObjectiveParams::defaults_for`],
-/// or [`ObjectiveParams::from_params`], then set fields directly.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct ObjectiveParams {
-    /// XGBoost `scale_pos_weight` (`reg_loss_param`).
-    pub scale_pos_weight: f64,
-    /// The effective `max_delta_step` (`poisson_regression_param`): the
-    /// configured [`TrainingParams::max_delta_step`], or `0.7` for
-    /// `count:poisson` and `0` otherwise when unset.
-    pub max_delta_step: f64,
-    /// XGBoost `tweedie_variance_power` (`tweedie_regression_param`).
-    pub tweedie_variance_power: f64,
-    /// XGBoost `huber_slope` (`pseudo_huber_param`).
-    pub huber_slope: f64,
-    /// XGBoost `lambdarank_num_pair_per_sample` (`lambdarank_param`).
-    pub lambdarank_num_pair_per_sample: usize,
-    /// XGBoost `quantile_alpha` (`reg:quantileerror`).
-    pub quantile_alpha: Vec<f64>,
-    /// XGBoost `expectile_alpha` (`reg:expectileerror`).
-    pub expectile_alpha: Vec<f64>,
-    /// XGBoost `aft_loss_distribution` (`survival:aft`).
-    pub aft_loss_distribution: AftDistribution,
-    /// XGBoost `aft_loss_distribution_scale` (`survival:aft`).
-    pub aft_loss_distribution_scale: f64,
-    /// Second-order statistic of the `dist:*` objectives (beyond XGBoost).
-    pub dist_gradient: DistGradient,
-    /// Shared-tree split direction of the `dist:*` objectives (beyond
-    /// XGBoost).
-    pub dist_split_direction: DistSplitDirection,
-    /// The distribution family of a `dist:*` objective, derived from the
-    /// objective name (not a parameter): the `nll` / `crps` metrics read it.
-    pub distribution: Option<crate::objective::distributional::DistFamily>,
-}
-
-impl ObjectiveParams {
-    /// Snapshot the objective parameters of a training configuration.
-    pub fn from_params(p: &TrainingParams) -> Self {
-        ObjectiveParams {
-            scale_pos_weight: p.scale_pos_weight,
-            max_delta_step: p.effective_max_delta_step(),
-            tweedie_variance_power: p.tweedie_variance_power,
-            huber_slope: p.huber_slope,
-            lambdarank_num_pair_per_sample: p.lambdarank_num_pair_per_sample,
-            quantile_alpha: p.quantile_alpha.clone(),
-            expectile_alpha: p.expectile_alpha.clone(),
-            aft_loss_distribution: p.aft_loss_distribution,
-            aft_loss_distribution_scale: p.aft_loss_distribution_scale,
-            dist_gradient: p.dist_gradient,
-            dist_split_direction: p.dist_split_direction,
-            distribution: crate::objective::distributional::DistFamily::from_objective(
-                &p.objective,
-            ),
-        }
-    }
-
-    /// [`Self::from_params`] for a model that records `objective`, which
-    /// may differ from `p.objective` (an objective passed to
-    /// [`Trainer::objective`](crate::training::Trainer::objective), or a
-    /// continued model's): the distribution family follows the recorded
-    /// objective, as loading requires.
-    pub(crate) fn for_objective(p: &TrainingParams, objective: &str) -> Self {
-        ObjectiveParams {
-            distribution: crate::objective::distributional::DistFamily::from_objective(objective),
-            ..Self::from_params(p)
-        }
-    }
-
-    /// XGBoost's defaults for `objective` (e.g. `max_delta_step = 0.7` for
-    /// `count:poisson`).
-    pub fn defaults_for(objective: &str) -> Self {
-        ObjectiveParams {
-            max_delta_step: default_max_delta_step(objective),
-            distribution: crate::objective::distributional::DistFamily::from_objective(objective),
-            ..Self::default()
-        }
-    }
-}
-
-impl Default for ObjectiveParams {
-    /// XGBoost's defaults (those of [`TrainingParams::default`]).
-    fn default() -> Self {
-        Self::from_params(&TrainingParams::default())
-    }
-}
-
-/// Generates, from one list of the [`ObjectiveParams`] fields that are
-/// parameters (all but the derived `distribution`), the mirrors that must
-/// cover every one of them: [`ObjectiveParams::training_params`] and the
-/// native JSON reader's [`PartialObjectiveParams`] with its `fill`. Each
-/// field's [`TrainingParamsBuilder`] setter shares its name and type.
-macro_rules! objective_param_mirrors {
-    ($($field:ident: $ty:ty,)*) => {
-        impl ObjectiveParams {
-            /// A training configuration for `objective` (with `num_class`)
-            /// carrying these parameters: the objective it rebuilds is the one
-            /// the model was trained with. Callers `build()` to validate or
-            /// `build_unchecked()`.
-            pub fn training_params(
-                &self,
-                objective: &str,
-                num_class: usize,
-            ) -> TrainingParamsBuilder {
-                let ObjectiveParams {
-                    $($field,)*
-                    distribution: _,
-                } = self.clone();
-                TrainingParams::builder()
-                    .objective(objective)
-                    .num_class(num_class)
-                    $(.$field($field))*
-            }
-        }
-
-        /// [`ObjectiveParams`] as the native JSON format stores them, with
-        /// every field optional: [`PartialObjectiveParams::fill`] takes each
-        /// missing one from the recorded objective's defaults
-        /// ([`ObjectiveParams::defaults_for`]), which a per-field serde
-        /// default could not (they depend on the objective). A stored value
-        /// is read as strictly as before (`null` only where the field is an
-        /// `Option`).
-        #[derive(Deserialize, Default)]
-        pub(crate) struct PartialObjectiveParams {
-            $(
-                #[serde(default)]
-                $field: Stored<$ty>,
-            )*
-            #[serde(default)]
-            distribution: Stored<Option<crate::objective::distributional::DistFamily>>,
-        }
-
-        impl PartialObjectiveParams {
-            /// The stored parameters, with each missing one taken from
-            /// `objective`'s defaults.
-            pub(crate) fn fill(self, objective: &str) -> ObjectiveParams {
-                let d = ObjectiveParams::defaults_for(objective);
-                ObjectiveParams {
-                    $($field: self.$field.unwrap_or(d.$field),)*
-                    distribution: self.distribution.unwrap_or(d.distribution),
-                }
-            }
-        }
-    };
-}
-
-objective_param_mirrors! {
-    scale_pos_weight: f64,
-    max_delta_step: f64,
-    tweedie_variance_power: f64,
-    huber_slope: f64,
-    lambdarank_num_pair_per_sample: usize,
-    quantile_alpha: Vec<f64>,
-    expectile_alpha: Vec<f64>,
-    aft_loss_distribution: AftDistribution,
-    aft_loss_distribution_scale: f64,
-    dist_gradient: DistGradient,
-    dist_split_direction: DistSplitDirection,
-}
-
-/// A field that is absent from the document, or present with a value
-/// (which may itself be `None`: `Option<Option<_>>` would read `null` as
-/// absent).
-#[derive(Default)]
-pub(crate) enum Stored<T> {
-    #[default]
-    Absent,
-    Present(T),
-}
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Stored<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        T::deserialize(deserializer).map(Stored::Present)
-    }
-}
-
-impl<T> Stored<T> {
-    fn unwrap_or(self, default: T) -> T {
-        match self {
-            Stored::Absent => default,
-            Stored::Present(value) => value,
         }
     }
 }
@@ -1333,8 +922,6 @@ impl TrainingParamsBuilder {
         nthread, usize);
     setter!(/// Set the RNG seed.
         seed, u64);
-    setter!(/// Set the number of classes (multiclass objectives).
-        num_class, usize);
     setter!(/// Set the processor training runs on (XGBoost `device`).
         device, Device);
     setter!(/// Set the learning rate (`eta`).
@@ -1366,77 +953,60 @@ impl TrainingParamsBuilder {
         lambda, f64);
     setter!(/// Set the L1 regularization (`alpha`).
         alpha, f64);
-    setter!(/// Set the positive-class weight scaling.
-        scale_pos_weight, f64);
     setter!(/// Set the tree construction method.
         tree_method, TreeMethod);
     setter!(/// Set the tree growth policy.
         grow_policy, GrowPolicy);
     setter!(/// Set the maximum histogram bins per feature.
         max_bin, usize);
-    setter!(/// Set the DART per-round drop rate (`rate_drop`).
-        rate_drop, f64);
-    setter!(/// Set the DART dropout-skip probability (`skip_drop`).
-        skip_drop, f64);
-    setter!(/// Set the Tweedie variance power (`tweedie_variance_power`).
-        tweedie_variance_power, f64);
-    setter!(/// Set the pseudo-Huber slope (`huber_slope`).
-        huber_slope, f64);
-    setter!(/// Set LambdaRank's top-k pair count (`lambdarank_num_pair_per_sample`).
-        lambdarank_num_pair_per_sample, usize);
-    setter!(/// Set the target quantiles of `reg:quantileerror` (`quantile_alpha`).
-        quantile_alpha, Vec<f64>);
-    setter!(/// Set the target expectiles of `reg:expectileerror` (`expectile_alpha`).
-        expectile_alpha, Vec<f64>);
-    setter!(/// Set the `survival:aft` noise distribution (`aft_loss_distribution`).
-        aft_loss_distribution, AftDistribution);
-    setter!(/// Set the `survival:aft` noise scale (`aft_loss_distribution_scale`).
-        aft_loss_distribution_scale, f64);
-    setter!(/// Set the second-order statistic of the `dist:*` objectives (`dist_gradient`).
-        dist_gradient, DistGradient);
-    setter!(/// Set the shared-tree split direction of the `dist:*` objectives (`dist_split_direction`).
-        dist_split_direction, DistSplitDirection);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
         num_parallel_tree, usize);
     setter!(/// Set the row subsampling method (`sampling_method`).
         sampling_method, SamplingMethod);
-    setter!(/// Set LightGBM's positive-class bagging fraction.
-        pos_bagging_fraction, f64);
-    setter!(/// Set LightGBM's negative-class bagging fraction.
-        neg_bagging_fraction, f64);
     setter!(/// Set the multi-output tree strategy (`multi_strategy`).
         multi_strategy, MultiStrategy);
     setter!(/// Set whether rounds grow or update trees (`process_type`).
         process_type, ProcessType);
-    setter!(/// Set whether `process_type = update` refreshes leaf values (`refresh_leaf`).
-        refresh_leaf, bool);
-    setter!(/// Enable LightGBM's randomized split search (`extra_trees`).
-        extra_trees, bool);
-    setter!(/// Set the seed of the `extra_trees` threshold draws (`extra_seed`).
-        extra_seed, u64);
     setter!(/// Set LightGBM's path smoothing strength (`path_smooth`, `0` = off).
         path_smooth, f64);
-    setter!(/// Enable LightGBM's per-leaf linear models (`linear_tree`).
-        linear_tree, bool);
-    setter!(/// Set the L2 penalty on leaf linear-model slopes (`linear_lambda`).
-        linear_lambda, f64);
     setter!(/// Set the new-feature reuse penalty `ι` (`toad_penalty_feature`).
         toad_penalty_feature, f64);
     setter!(/// Set the new-threshold reuse penalty `ξ` (`toad_penalty_threshold`).
         toad_penalty_threshold, f64);
-    setter!(/// Enable quantized-gradient training (`use_quantized_grad`, LightGBM).
-        use_quantized_grad, bool);
-    setter!(/// Set the gradient quantization levels (`num_grad_quant_bins`, LightGBM).
-        num_grad_quant_bins, usize);
-    setter!(/// Set stochastic rounding of quantized gradients (`stochastic_rounding`, LightGBM).
-        stochastic_rounding, bool);
-    setter!(/// Set full-precision leaf renewal after quantized growth (`quant_train_renew_leaf`, LightGBM).
-        quant_train_renew_leaf, bool);
 
-    /// Set the objective by name (e.g. `"binary:logistic"`).
+    /// Enable LightGBM's randomized split search (`extra_trees`).
     #[must_use]
-    pub fn objective(mut self, name: impl Into<String>) -> Self {
-        self.params.objective = name.into();
+    pub fn extra_trees(mut self, extra_trees: ExtraTrees) -> Self {
+        self.params.extra_trees = Some(extra_trees);
+        self
+    }
+
+    /// Enable LightGBM's per-leaf linear models (`linear_tree`).
+    #[must_use]
+    pub fn linear_tree(mut self, linear_tree: LinearTree) -> Self {
+        self.params.linear_tree = Some(linear_tree);
+        self
+    }
+
+    /// Enable LightGBM's class-balanced bagging (`pos_bagging_fraction`,
+    /// `neg_bagging_fraction`).
+    #[must_use]
+    pub fn balanced_bagging(mut self, bagging: BalancedBagging) -> Self {
+        self.params.balanced_bagging = Some(bagging);
+        self
+    }
+
+    /// Enable quantized-gradient training (LightGBM `use_quantized_grad`).
+    #[must_use]
+    pub fn quantized(mut self, quantized: QuantizedGrad) -> Self {
+        self.params.quantized = Some(quantized);
+        self
+    }
+
+    /// Set the objective (default [`Objective::SquaredError`]).
+    #[must_use]
+    pub fn objective(mut self, objective: Objective) -> Self {
+        self.params.objective = objective;
         self
     }
 
@@ -1447,10 +1017,10 @@ impl TrainingParamsBuilder {
         self
     }
 
-    /// Add an evaluation metric by name.
+    /// Add an evaluation metric (evaluated after the ones added before).
     #[must_use]
-    pub fn eval_metric(mut self, name: impl Into<String>) -> Self {
-        self.params.eval_metric.push(name.into());
+    pub fn eval_metric(mut self, metric: crate::metric::EvalMetric) -> Self {
+        self.params.eval_metric.push(metric);
         self
     }
 
@@ -1510,22 +1080,23 @@ mod tests {
         assert_eq!(p.booster, BoosterKind::GbTree);
         assert_eq!(p.grow_policy, GrowPolicy::DepthWise);
         assert!(p.base_score.is_none());
-        assert_eq!(p.tweedie_variance_power, 1.5);
-        assert_eq!(p.huber_slope, 1.0);
+        assert_eq!(p.objective, Objective::SquaredError);
         p.validate().unwrap();
     }
 
     #[test]
     fn builder_chains_and_validates() {
         let p = TrainingParams::builder()
-            .objective("binary:logistic")
+            .objective(Objective::BinaryLogistic(
+                crate::objective::Logistic::default(),
+            ))
             .eta(0.1)
             .max_depth(4)
             .subsample(0.8)
             .lambda(2.0)
             .build()
             .unwrap();
-        assert_eq!(p.objective, "binary:logistic");
+        assert_eq!(p.objective.name(), "binary:logistic");
         assert_eq!(p.eta, 0.1);
         assert_eq!(p.max_depth, 4);
         assert_eq!(p.subsample, 0.8);
@@ -1537,28 +1108,8 @@ mod tests {
         for (name, builder) in [
             ("eta", b().eta(0.0)),
             ("subsample", b().subsample(1.5)),
-            ("colsample_bytree", b().colsample_bytree(1.5)),
-            ("colsample_bytree", b().colsample_bytree(f64::NAN)),
-            ("colsample_bylevel", b().colsample_bylevel(1.5)),
-            ("colsample_bylevel", b().colsample_bylevel(f64::NAN)),
-            ("colsample_bynode", b().colsample_bynode(1.5)),
-            ("colsample_bynode", b().colsample_bynode(f64::NAN)),
             ("lambda", b().lambda(-1.0)),
             ("max_bin", b().max_bin(1)),
-            ("tweedie_variance_power", b().tweedie_variance_power(2.0)),
-            // Passes the f64 range but rounds to 2.0 in f32, where the objective runs.
-            (
-                "tweedie_variance_power",
-                b().tweedie_variance_power(2.0 - f64::EPSILON),
-            ),
-            ("huber_slope", b().huber_slope(0.0)),
-            // Finite and positive in f64, but the f32 square overflows / vanishes.
-            ("huber_slope", b().huber_slope(2e19)),
-            ("huber_slope", b().huber_slope(1e-30)),
-            (
-                "lambdarank_num_pair_per_sample",
-                b().lambdarank_num_pair_per_sample(0),
-            ),
             ("max_delta_step", b().max_delta_step(-1.0)),
             ("num_parallel_tree", b().num_parallel_tree(0)),
             // Would overflow the iteration's allocations.
@@ -1567,9 +1118,6 @@ mod tests {
                 "num_parallel_tree",
                 b().num_parallel_tree(MAX_NUM_PARALLEL_TREE + 1),
             ),
-            // Stored with every model, so checked whatever the objective.
-            ("quantile_alpha", b().quantile_alpha(vec![0.5, f64::NAN])),
-            ("expectile_alpha", b().expectile_alpha(vec![1.5])),
             // Finite in f64, but infinite or zero in the f32 the split
             // search and objectives use.
             ("eta", b().eta(1e39)),
@@ -1579,7 +1127,6 @@ mod tests {
             ("lambda", b().lambda(1e39)),
             ("alpha", b().alpha(1e39)),
             ("max_delta_step", b().max_delta_step(1e39)),
-            ("scale_pos_weight", b().scale_pos_weight(1e-50)),
             // Lossguide growth needs a leaf or depth bound.
             (
                 "max_leaves",
@@ -1590,22 +1137,12 @@ mod tests {
         ] {
             assert_eq!(rejected(builder), Some(name));
         }
-        assert!(b().tweedie_variance_power(1.0).build().is_ok());
         assert!(
             b().grow_policy(GrowPolicy::LossGuide)
                 .max_leaves(31)
                 .build()
                 .is_ok()
         );
-        // Positive finite `f64` scales that become infinite or zero once
-        // narrowed to the `f32` the objective and metric compute in.
-        for scale in [0.0, -1.0, f64::INFINITY, f64::NAN, 1e100, 1e-50] {
-            assert_eq!(
-                rejected(b().aft_loss_distribution_scale(scale)),
-                Some("aft_loss_distribution_scale"),
-                "scale {scale}"
-            );
-        }
     }
 
     /// XGBoost injects `max_delta_step = 0.7` for `count:poisson` only when
@@ -1613,12 +1150,12 @@ mod tests {
     #[test]
     fn poisson_delta_step_default_respects_explicit_zero() {
         let unset = TrainingParams::builder()
-            .objective("count:poisson")
+            .objective(Objective::Poisson)
             .build()
             .unwrap();
         assert_eq!(unset.effective_max_delta_step(), 0.7);
         let zero = TrainingParams::builder()
-            .objective("count:poisson")
+            .objective(Objective::Poisson)
             .max_delta_step(0.0)
             .build()
             .unwrap();
@@ -1626,90 +1163,34 @@ mod tests {
         assert_eq!(TrainingParams::default().effective_max_delta_step(), 0.0);
     }
 
-    /// Parameters take XGBoost's names on the wire, so JSON
-    /// configurations written for XGBoost deserialize unchanged, and a
-    /// configuration that omits them gets XGBoost's defaults.
+    /// A `dist:*` split direction chooses the structure of shared trees
+    /// only; other tree layouts would ignore it.
     #[test]
-    fn params_use_xgboost_spellings_and_defaults() {
-        let p: TrainingParams = serde_json::from_str(
-            r#"{"aft_loss_distribution": "extreme", "sampling_method": "gradient_based",
-                "multi_strategy": "multi_output_tree", "process_type": "update",
-                "refresh_leaf": false, "num_parallel_tree": 4,
-                "quantile_alpha": [0.1, 0.9]}"#,
-        )
-        .unwrap();
-        assert_eq!(p.aft_loss_distribution, AftDistribution::Extreme);
-        assert_eq!(p.sampling_method, SamplingMethod::GradientBased);
-        assert_eq!(p.multi_strategy, MultiStrategy::MultiOutputTree);
-        assert_eq!(p.process_type, ProcessType::Update);
-        assert!(!p.refresh_leaf);
-        assert_eq!(p.num_parallel_tree, 4);
-        assert_eq!(p.quantile_alpha, vec![0.1, 0.9]);
-
-        let d: TrainingParams = serde_json::from_str("{}").unwrap();
-        assert_eq!(d.aft_loss_distribution, AftDistribution::Normal);
-        assert_eq!(d.aft_loss_distribution_scale, 1.0);
-        assert_eq!(d.num_parallel_tree, 1);
-        assert_eq!(d.sampling_method, SamplingMethod::Uniform);
-        assert_eq!(d.multi_strategy, MultiStrategy::OneOutputPerTree);
-        assert_eq!(d.process_type, ProcessType::Default);
-        assert!(d.refresh_leaf);
-        assert!(d.quantile_alpha.is_empty() && d.expectile_alpha.is_empty());
-        d.validate().unwrap();
-    }
-
-    #[test]
-    fn balanced_bagging_fractions_must_be_positive_and_bounded() {
-        for invalid in [0.0, f64::NAN, f64::INFINITY, 1.1] {
-            let result = TrainingParams::builder()
-                .objective("binary:logistic")
-                .pos_bagging_fraction(invalid)
-                .build();
-            assert!(result.is_err(), "accepted positive fraction {invalid}");
-        }
-        for invalid in [0.0, f64::NAN, f64::INFINITY, 1.1] {
-            let result = TrainingParams::builder()
-                .objective("binary:logistic")
-                .neg_bagging_fraction(invalid)
-                .build();
-            assert!(result.is_err(), "accepted negative fraction {invalid}");
-        }
-    }
-
-    #[test]
-    fn balanced_bagging_refuses_combined_subsample() {
-        let err = TrainingParams::builder()
-            .objective("binary:logistic")
-            .pos_bagging_fraction(0.5)
-            .subsample(0.8)
-            .build()
-            .unwrap_err();
+    fn dist_split_direction_needs_shared_trees() {
+        use crate::objective::distributional::{DistFamily, DistSplitDirection, Distributional};
+        let cyclic = Objective::Dist(
+            Distributional::new(DistFamily::Normal)
+                .with_split_direction(DistSplitDirection::Cyclic),
+        );
+        let b = || TrainingParams::builder().objective(cyclic.clone());
+        assert_eq!(rejected(b()), Some("dist_split_direction"));
         assert!(
-            err.to_string()
-                .contains("LightGBM ignores `bagging_fraction`")
+            b().multi_strategy(MultiStrategy::MultiOutputTree)
+                .build()
+                .is_ok()
         );
     }
 
-    /// A trained model rebuilds its objective from `ObjectiveParams`, so the
-    /// objective-specific parameters must survive the snapshot/restore trip.
+    /// Adaptive-leaf objectives re-estimate their leaves after growth, which
+    /// would overwrite the constants linear leaves fall back to.
     #[test]
-    fn objective_params_round_trip_objective_fields() {
-        let p = TrainingParams::builder()
-            .objective("survival:aft")
-            .quantile_alpha(vec![0.25, 0.75])
-            .expectile_alpha(vec![0.5])
-            .aft_loss_distribution(AftDistribution::Logistic)
-            .aft_loss_distribution_scale(1.7)
-            .build_unchecked();
-        let snapshot = ObjectiveParams::from_params(&p);
-        let restored = snapshot
-            .training_params("survival:aft", 0)
-            .build_unchecked();
-        assert_eq!(restored.quantile_alpha, vec![0.25, 0.75]);
-        assert_eq!(restored.expectile_alpha, vec![0.5]);
-        assert_eq!(restored.aft_loss_distribution, AftDistribution::Logistic);
-        assert_eq!(restored.aft_loss_distribution_scale, 1.7);
-        assert_eq!(ObjectiveParams::from_params(&restored), snapshot);
+    fn linear_leaves_refuse_adaptive_leaf_objectives() {
+        let linear = || TrainingParams::builder().linear_tree(LinearTree::default());
+        assert_eq!(
+            rejected(linear().objective(Objective::AbsoluteError)),
+            Some("linear_tree")
+        );
+        assert!(linear().objective(Objective::Gamma).build().is_ok());
     }
 
     /// Reuse penalties apply in the XGBoost split searches only; the LightGBM
@@ -1718,13 +1199,13 @@ mod tests {
     fn reuse_penalties_refuse_searches_that_ignore_them() {
         let toad = || TrainingParams::builder().toad_penalty_feature(1.0);
         for params in [
-            toad().extra_trees(true),
+            toad().extra_trees(ExtraTrees::default()),
             toad().path_smooth(1.0),
             toad().grow_policy(GrowPolicy::Symmetric).max_depth(3),
         ] {
             assert_eq!(rejected(params), Some("toad_penalty_feature"));
         }
-        assert!(toad().linear_tree(true).build().is_ok());
+        assert!(toad().linear_tree(LinearTree::default()).build().is_ok());
     }
 
     /// Symmetric growth builds histograms outside the quantized path, and
@@ -1733,9 +1214,10 @@ mod tests {
     fn quantized_training_refuses_options_it_would_ignore() {
         let q = || {
             TrainingParams::builder()
-                .use_quantized_grad(true)
+                .quantized(QuantizedGrad::default())
                 .max_depth(3)
         };
+        let renewed = QuantizedGrad::builder().renew_leaf(true).build().unwrap();
         assert_eq!(
             rejected(q().grow_policy(GrowPolicy::Symmetric)),
             Some("use_quantized_grad")
@@ -1744,10 +1226,10 @@ mod tests {
         // Leaf renewal would be discarded: path-smoothed leaves keep the
         // outputs their quantized splits recorded.
         assert_eq!(
-            rejected(q().quant_train_renew_leaf(true).path_smooth(1.0)),
+            rejected(q().quantized(renewed).path_smooth(1.0)),
             Some("quant_train_renew_leaf")
         );
-        assert!(q().quant_train_renew_leaf(true).build().is_ok());
+        assert!(q().quantized(renewed).build().is_ok());
         assert!(q().path_smooth(1.0).build().is_ok());
     }
 
@@ -1764,7 +1246,12 @@ mod tests {
             rejected(sym().booster(BoosterKind::GbLinear)),
             Some("grow_policy")
         );
-        assert!(sym().booster(BoosterKind::Dart).build().is_ok());
+        assert!(
+            sym()
+                .booster(BoosterKind::Dart(Dart::default()))
+                .build()
+                .is_ok()
+        );
     }
 
     /// Coordinate descent reads every row and feature and grows no trees:
@@ -1803,7 +1290,7 @@ mod tests {
             .monotone_constraints(vec![Monotone::None])
             .build()
             .unwrap();
-        for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+        for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
             TrainingParams::builder()
                 .booster(booster)
                 .num_parallel_tree(2)
@@ -1812,49 +1299,5 @@ mod tests {
                 .build()
                 .unwrap();
         }
-    }
-
-    /// The names model files store are the serde (and XGBoost) spellings,
-    /// and read back to the same variant.
-    #[test]
-    fn stored_enum_names_match_serde_and_read_back() {
-        fn check<T: Serialize + Copy + PartialEq + std::fmt::Debug>(
-            variants: &[T],
-            name: fn(T) -> &'static str,
-            from_name: fn(&str) -> Option<T>,
-        ) {
-            for &v in variants {
-                assert_eq!(serde_json::to_value(v).unwrap(), name(v), "{v:?}");
-                assert_eq!(from_name(name(v)), Some(v));
-            }
-            assert_eq!(from_name("no such variant"), None);
-        }
-        check(
-            &[
-                AftDistribution::Normal,
-                AftDistribution::Logistic,
-                AftDistribution::Extreme,
-            ],
-            AftDistribution::name,
-            AftDistribution::from_name,
-        );
-        check(
-            &[
-                DistGradient::Fisher,
-                DistGradient::Hessian,
-                DistGradient::Natural,
-            ],
-            DistGradient::name,
-            DistGradient::from_name,
-        );
-        check(
-            &[
-                DistSplitDirection::Random,
-                DistSplitDirection::Cyclic,
-                DistSplitDirection::All,
-            ],
-            DistSplitDirection::name,
-            DistSplitDirection::from_name,
-        );
     }
 }

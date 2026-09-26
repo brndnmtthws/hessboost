@@ -148,13 +148,16 @@ it.
 | Method | Formats |
 |---|---|
 | `save_model(path, format=None)` | by extension: `.json` native JSON, `.ubj` XGBoost UBJSON, anything else native binary; or `format="binary" \| "json" \| "xgboost-json" \| "xgboost-ubjson"` |
-| `Booster(path_or_bytes)`, `load_model(...)` | any of the four, detected from the content |
+| `Booster(path_or_bytes)`, `load_model(...)` | any of the four, or a LightGBM 4.x text model (`format="lightgbm"`, import only), detected from the content |
 | `save_raw(format="binary")` | the same formats as bytes |
 | `pickle` / `copy` | native binary plus feature names, categories, and `best_score` |
 
 The native binary format is compressed, checksummed, and lossless; files
 written by 0.2.0 or later load in every later release. Use
-`format="xgboost-json"` or `.ubj` for a file XGBoost loads. `booster[a:b]`
+`format="xgboost-json"` or `.ubj` for a file XGBoost loads. A LightGBM
+model (`lightgbm.Booster.save_model`) predicts LightGBM's values for
+missing values as `NaN` and categorical features as non-negative codes;
+models with no exact equivalent raise `ModelFormatError`. `booster[a:b]`
 slices boosting iterations.
 
 ## Beyond XGBoost
@@ -170,10 +173,28 @@ lower, upper = cqr.predict_interval(X_test).T   # >= 90% coverage, finite-sample
 dist = hessboost.train({"objective": "dist:normal"}, hessboost.DMatrix(X_train, y_train), 300)
 d = dist.predict_distribution(X_test)
 d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
+
+from hessboost.online import OnlineModel
+
+online = OnlineModel.train({"tree_method": "hist", "max_depth": 6},
+                           hessboost.DMatrix(X_train, y_train), 100, tolerance=0.1)
+report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
+online.model.predict(X_test)   # online.data: the updated training rows
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
   (from two quantile models, two outputs of one, or a `dist:*` model).
+- `hessboost.online`: `OnlineModel` adds and deletes training rows of a
+  trained model in place (incremental learning, machine unlearning).
+  `tolerance=0` is exact: every update equals `hessboost.train` on
+  `online.data` bit for bit; `tolerance > 0` (default `0.1`) keeps splits
+  that still rank near the top and is faster than retraining for small
+  changes. `update(additions, deletions, callback=...)` returns an
+  `UpdateReport` (`nodes_kept`, `subtrees_regrown`, `rows_refreshed`), or
+  `None` when `callback(iteration)` returned `True`; a refused, stopped, or
+  interrupted (Ctrl-C) update changes nothing. `OnlineModel.from_model`
+  resumes from a saved `Booster` and its training data. Updates need `hist`
+  depth-wise trees without sampling or constraints and unweighted data.
 - `hessboost.folds`: `k_fold`, `forward_chaining` (expanding-window,
   purged by a row `gap`), and `purged_forward` (timestamped rows, purged
   by each row's own label window, for overlapping or irregular horizons)
@@ -197,7 +218,10 @@ d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
 - `custom_metric(predictions, labels, weights)` returns a float and is named
   by the function's `__name__` (XGBoost passes a `DMatrix` and returns
   `(name, value)`). `obj(margins, dtrain)` matches XGBoost; the model then
-  predicts margins from a zero intercept (or `base_score`).
+  predicts margins from a zero intercept (or `base_score`). `obj` replaces
+  `objective`, which `params` must then not set, and `num_class` is the
+  custom objective's output count (XGBoost's custom-softmax convention;
+  default: one per label column).
 - `cv` returns a dict of numpy arrays (`test-<metric>-mean`/`-std`) with
   held-out metrics only; there is no `stratified` or `as_pandas`.
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's

@@ -1,7 +1,8 @@
 //! LightGBM-style class-stratified bagging for imbalanced binary targets.
 //! Run: `cargo run --release --example balanced_bagging`.
 
-use hessboost::metric::{Auc, Metric};
+use hessboost::config::BalancedBagging;
+use hessboost::objective::Logistic;
 use hessboost::prelude::*;
 
 fn main() -> Result<()> {
@@ -32,16 +33,16 @@ fn main() -> Result<()> {
     let dvalid = DMatrix::from_dense(&x[split..], n - train_rows, features)?
         .with_labels(&y[train_rows..])?;
     let params = TrainingParams::builder()
-        .objective("binary:logistic")
+        .objective(Objective::BinaryLogistic(Logistic::default()))
         .tree_method(TreeMethod::Hist)
-        .pos_bagging_fraction(0.7)
-        .neg_bagging_fraction(0.2)
+        // Keep 70% of the positives and 20% of the negatives each round.
+        .balanced_bagging(BalancedBagging::new(0.7, 0.2)?)
         .seed(17)
         .max_depth(4)
         .eta(0.1)
         .build()?;
     let model = train(&params, &dtrain, 100)?;
-    let auc = Auc::default().eval(
+    let auc = EvalMetric::Auc.build(1)?.eval(
         &model.predict(&dvalid)?,
         dvalid.labels().unwrap_or_default(),
         None,

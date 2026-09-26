@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Runs every fuzz target for a fixed wall time: a smoke test, not a fuzzing
 # campaign. Seeds come from the models each release saved
-# (tests/data/saved/*/) and the XGBoost saves the importer tests use, so new
-# formats and releases are picked up without checked-in copies, plus the
-# inputs in fixed-seeds/ that reach paths the fuzzer is slow to find (e.g. a
-# gblinear case that trains).
+# (tests/data/saved/*/) and the XGBoost and LightGBM saves the importer tests
+# use, so new formats and releases are picked up without checked-in copies,
+# plus the inputs in fixed-seeds/ that reach paths the fuzzer is slow to find
+# (e.g. a gblinear case that trains, LightGBM zero-as-missing and `inf`
+# splits).
 #
 # Usage (from fuzz/, where mise provides nightly Rust and cargo-fuzz):
 #   ./run.sh [seconds-per-target] [target...]
@@ -27,6 +28,7 @@ seed json-model
 seed compact-model
 seed xgboost-json-model
 seed xgboost-ubjson-model
+seed lightgbm-model
 seed loaders
 for version in "$data"/saved/*/; do
   v="$(basename "$version")"
@@ -47,6 +49,7 @@ for version in "$data"/saved/*/; do
 done
 cp "$data"/xgboost-*.json seeds/xgboost-json-model/
 cp "$data"/xgboost-*.ubj seeds/xgboost-ubjson-model/
+cp "$data"/lightgbm-*.txt seeds/lightgbm-model/
 # The first byte selects the CSV options (see loaders.rs).
 printf '\x00# comment\n1 0:1.5 3:-2\n0 1:0.25\n\n2 2:1e3 0:7\n' > seeds/loaders/libsvm
 printf '\x09y,a,b\n1,2.5,\n0,,-3\n1,4,5\n' > seeds/loaders/csv-header-label0

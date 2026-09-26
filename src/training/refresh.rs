@@ -16,7 +16,7 @@
 //! no `min_child_weight` floor: a node with any positive Hessian gets its
 //! regularized weight (`CalcWeight` / `CalcGain` in `src/tree/param.h`).
 
-use crate::config::TrainingParams;
+use crate::config::{Refresh, TrainingParams};
 use crate::data::DMatrix;
 use crate::objective::GradPair;
 use crate::tree::RegTree;
@@ -41,6 +41,7 @@ pub(super) fn refresh_tree(
     data: &DMatrix,
     gpair: &[GradPair],
     params: &TrainingParams,
+    refresh: Refresh,
     learning_rate: f32,
 ) {
     let reg = &RegParams {
@@ -52,7 +53,7 @@ pub(super) fn refresh_tree(
         let node = *tree.node(nid);
         tree.set_sum_hess(nid, stats[nid].hess as f32);
         if node.is_leaf() {
-            if params.refresh_leaf {
+            if refresh.refresh_leaf() {
                 let base_weight = calc_weight(stats[nid], reg) as f32;
                 tree.set_leaf_value(nid, base_weight * learning_rate);
             }
@@ -152,7 +153,7 @@ mod tests {
             ..RegParams::from_params(&params)
         };
         let mut tree = stump();
-        refresh_tree(&mut tree, &data, &gpair, &params, 0.25);
+        refresh_tree(&mut tree, &data, &gpair, &params, Refresh::default(), 0.25);
 
         let (left, right, root) = (
             GradStats::new(3.5, 2.5),
@@ -170,11 +171,14 @@ mod tests {
 
         // Without refresh_leaf the statistics change but the leaves do not.
         let mut kept = stump();
-        let keep_leaves = TrainingParams {
-            refresh_leaf: false,
-            ..params
-        };
-        refresh_tree(&mut kept, &data, &gpair, &keep_leaves, 0.25);
+        refresh_tree(
+            &mut kept,
+            &data,
+            &gpair,
+            &params,
+            Refresh::stats_only(),
+            0.25,
+        );
         assert_eq!(kept.node(1).leaf_value, 7.0);
         assert_eq!(kept.node(2).leaf_value, -7.0);
         assert_eq!(kept.node(0).sum_hess, 4.5);
@@ -186,7 +190,14 @@ mod tests {
         let data = DMatrix::from_dense(&[0.1, 0.2], 2, 1).unwrap();
         let gpair = [GradPair::new(1.0, 1.0), GradPair::new(1.0, 1.0)];
         let mut tree = stump();
-        refresh_tree(&mut tree, &data, &gpair, &TrainingParams::default(), 0.3);
+        refresh_tree(
+            &mut tree,
+            &data,
+            &gpair,
+            &TrainingParams::default(),
+            Refresh::default(),
+            0.3,
+        );
         assert_eq!(tree.node(2).sum_hess, 0.0);
         assert_eq!(tree.node(2).leaf_value, 0.0);
     }

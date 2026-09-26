@@ -70,6 +70,29 @@ def _params(params: Mapping[str, Any], dtrain: DMatrix) -> _hessboost.Params:
     return _hessboost.Params(resolved)
 
 
+def _custom_objective_params(params: Mapping[str, Any]) -> tuple[dict[str, Any], int | None]:
+    """``params`` for a custom objective, without ``num_class``, and that
+    count: the objective's output count (XGBoost's custom-softmax
+    convention), ``None`` for one per label column (absent or ``0``)."""
+    if not isinstance(params, Mapping):
+        raise TypeError(f"params must be a mapping, got {type(params).__name__}")
+    if "objective" in params:
+        raise HessboostError(
+            "obj replaces objective; params must not also set objective "
+            f"(got {params['objective']!r})"
+        )
+    resolved = dict(params)
+    outputs = resolved.pop("num_class", None)
+    if outputs is None:
+        return resolved, None
+    if isinstance(outputs, bool) or not isinstance(outputs, (int, np.integer)) or outputs < 0:
+        raise HessboostError(
+            "num_class (the custom objective's output count) must be a non-negative "
+            f"integer, got {outputs!r}"
+        )
+    return resolved, int(outputs) or None
+
+
 def _init_model(xgb_model: str | os.PathLike[str] | Booster | None) -> Booster | None:
     if xgb_model is None or isinstance(xgb_model, Booster):
         return xgb_model
@@ -150,9 +173,13 @@ def train(
             in them. Codes without recorded categories (numpy data with
             ``feature_types``) are taken to be ``dtrain``'s.
         obj: A custom objective (see :data:`Objective`); the model then
-            predicts raw margins.
-        custom_metric: A custom metric (see :data:`CustomMetric`), replacing
-            the configured ones.
+            predicts raw margins. It replaces ``objective``, which ``params``
+            must then not set; ``num_class`` in ``params`` is its output
+            count, as for XGBoost's custom softmax (default: one output per
+            label column of ``dtrain``).
+        custom_metric: A custom metric (see :data:`CustomMetric`), reported
+            after the configured (or default) metrics, as in XGBoost, and
+            so the one early stopping watches.
         maximize: Whether ``custom_metric`` improves upward (default
             ``False``). Built-in metrics know their direction.
         early_stopping_rounds: Stop once the last metric on the last eval
@@ -184,6 +211,9 @@ def train(
     """
     if not isinstance(dtrain, DMatrix):
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
+    outputs: int | None = None
+    if obj is not None:
+        params, outputs = _custom_objective_params(params)
     native = _params(params, dtrain)
     init = _init_model(xgb_model)
     # Every matrix meets the model being continued as well as dtrain, and a
@@ -217,6 +247,7 @@ def train(
             )
 
         request["obj"] = gradients
+        request["outputs"] = outputs
     if custom_metric is not None:
         request["custom_metric"] = {
             "function": custom_metric,

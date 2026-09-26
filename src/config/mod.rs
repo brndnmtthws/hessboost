@@ -1,10 +1,14 @@
 //! Training configuration types.
 
+mod groups;
 mod params;
+mod xgboost;
 
-pub(crate) use params::PartialObjectiveParams;
+pub use groups::{
+    BalancedBagging, Dart, DartBuilder, ExtraTrees, LinearTree, QuantizedGrad,
+    QuantizedGradBuilder, Refresh,
+};
 pub use params::{
-    AftDistribution, BoosterKind, Device, DistGradient, DistSplitDirection, GrowPolicy,
-    MAX_SYMMETRIC_DEPTH, Monotone, MultiStrategy, ObjectiveParams, ProcessType, SamplingMethod,
-    TrainingParams, TrainingParamsBuilder, TreeMethod,
+    BoosterKind, Device, GrowPolicy, MAX_SYMMETRIC_DEPTH, Monotone, MultiStrategy, ProcessType,
+    SamplingMethod, TrainingParams, TrainingParamsBuilder, TreeMethod,
 };

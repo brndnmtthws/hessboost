@@ -40,9 +40,99 @@
 //!   and the `_xgboost_ubjson` counterparts ([`to_xgboost_ubjson`],
 //!   [`from_xgboost_ubjson`], [`save_xgboost_ubjson`],
 //!   [`load_xgboost_ubjson`]); see [XGBoost interchange](#xgboost-interchange).
+//! - **LightGBM import:** [`BoostedModel::from_lightgbm_text`] /
+//!   [`BoostedModel::load_lightgbm_text`] read LightGBM 4.x text models
+//!   (`model.txt`); see [LightGBM import](#lightgbm-import).
 //! - **Compact:** [`BoostedModel::to_compact`] builds a bit-packed
 //!   [`CompactModel`](compact::CompactModel) predicting bit-identical margins
 //!   in a fraction of the size; see [`compact`].
+//!
+//! # LightGBM import
+//!
+//! [`BoostedModel::from_lightgbm_text`] reads the text model LightGBM 4.x
+//! writes with `Booster.save_model` / `model_to_string` (format `v4`).
+//! The imported model predicts, explains ([`predict_contribs`] matches
+//! LightGBM's `pred_contrib`), slices, and saves natively like any other,
+//! and exports to XGBoost JSON/UBJSON unless it has linear leaves. Import
+//! only: there is no LightGBM export. LightGBM's `dump_model` JSON is not
+//! read: LightGBM cannot load it itself (the text model is its interchange
+//! format, which every booster writes), and its nesting follows tree depth,
+//! which deep trees take past `serde_json`'s recursion limit.
+//!
+//! Predictions are LightGBM's for **dense inputs with missing values as
+//! `NaN`** and **categorical values as non-negative codes** (what
+//! [`DMatrix::with_feature_types`](crate::data::DMatrix::with_feature_types)
+//! accepts). hessboost reads absent sparse entries as missing where
+//! LightGBM reads them as `0`, and reads a categorical value below 0 as
+//! category 0 where LightGBM sends it right like `NaN`: pass `NaN` for
+//! LightGBM's negative "missing" categories. LightGBM's dense-matrix
+//! prediction also zeroes inputs with `|x| <= 1e-35` before the trees, while
+//! the import follows the trees' own rule (as LightGBM's CSR path does);
+//! the two differ only for such inputs at a split whose threshold lies in
+//! that band. Leaf values are rounded to `f32` and summed in `f32`
+//! (LightGBM: `f64`); the parity fixtures agree within `1e-5` relative.
+//!
+//! ## Mapping
+//!
+//! - **Layout:** tree `t` is iteration `t / num_tree_per_iteration`, output
+//!   `t % num_tree_per_iteration`, hessboost's layout with one tree per
+//!   output. `init_score` / `boost_from_average` live in the first trees,
+//!   so the intercepts are 0. LightGBM's internal node `i` is node `i`, its
+//!   leaf `j` node `num_leaves - 1 + j` ([`predict_leaf`] reports node ids).
+//!   Covers (`sum_hess`) are the node data counts LightGBM's TreeSHAP
+//!   weighs paths by; gains are `split_gain`.
+//! - **Numeric splits:** LightGBM sends `x <= threshold` left, comparing the
+//!   `f64` threshold with the input widened to `f64`. For every `f32` `x`
+//!   that holds exactly when `x < c`, where `c` is the smallest `f32` above
+//!   the threshold, so `c` becomes the split condition. A threshold at or
+//!   above `f32::MAX` (LightGBM writes `inf` for "all values") sends every
+//!   finite value left, which no finite `c` does: the node's children swap
+//!   and `c = -f32::MAX` sends every finite value to the former left child
+//!   (hessboost's matrices hold no infinities).
+//! - **Missing types:** `None` (`NaN` read as `0`): missing values go where
+//!   `0` goes. `NaN`: missing values take the default direction. `Zero`:
+//!   missing values and `|x| <= 1e-35` take the default direction, which one
+//!   threshold expresses only when that band borders the half-line on the
+//!   default side (zeros left with a threshold at or above `-1e-35`, or
+//!   right with one at or below `1e-35`); such splits map with the band
+//!   folded into `c`, and any other `zero_as_missing` split is refused.
+//! - **Categorical splits:** the `cat_threshold` bitset becomes the left
+//!   category set; `NaN` goes right, and like LightGBM a value's integer
+//!   part is looked up. Each split must own its bitset, as LightGBM writes
+//!   them, and categories must stay below `2^31`.
+//! - **Linear leaves** (`linear_tree`): `leaf_const`, `leaf_features` and
+//!   `leaf_coeff` become the tree's [`LinearLeaves`](crate::tree::LinearLeaves),
+//!   in `f64`; a row with a `NaN` feature of the leaf's model gets the
+//!   leaf's constant value, LightGBM's rule. As in LightGBM, such models
+//!   have no SHAP values.
+//! - **Objectives** map by prediction transform (the loss also sets what
+//!   continued training in hessboost optimizes; objective parameters come
+//!   from the file's `parameters:` section, else LightGBM's defaults):
+//!
+//! |LightGBM|hessboost|transform|
+//! |---|---|---|
+//! |`regression`, `fair`|`reg:squarederror`|identity|
+//! |`regression_l1`, `mape`|`reg:absoluteerror`|identity|
+//! |`huber` (`alpha` as `huber_slope`)|`reg:pseudohubererror`|identity|
+//! |`quantile` (`alpha`)|`reg:quantileerror`|identity|
+//! |`poisson` (`poisson_max_delta_step`)|`count:poisson`|`exp`|
+//! |`gamma`|`reg:gamma`|`exp`|
+//! |`tweedie` (`tweedie_variance_power`)|`reg:tweedie`|`exp`|
+//! |`binary` with `sigmoid:1`|`binary:logistic`|sigmoid|
+//! |`cross_entropy`|`reg:logistic`|sigmoid|
+//! |`multiclass`|`multi:softprob`|softmax|
+//! |`multiclassova` with `sigmoid:1`|`binary:logistic` over `num_class` targets|sigmoid per class|
+//! |`lambdarank`, `rank_xendcg`|`rank:ndcg`|identity|
+//!
+//! Refused with a [`HessboostError::ModelFormat`] naming the reason:
+//! `sigmoid` other than 1 (`binary`, `multiclassova`), `reg_sqrt`,
+//! `cross_entropy_lambda` (`log(1 + exp(x))`), models without an objective
+//! (custom objectives), random forests (`average_output`: LightGBM averages
+//! their trees in predictions but sums them in raw scores and SHAP), the
+//! `zero_as_missing` splits above, versions other than `v4`, and anything
+//! malformed or unknown (header or tree keys, decision-type bits, child
+//! references, `tree_sizes` that disagree with the tree blocks, as in a
+//! file converted to CRLF line ends, which LightGBM's loader rejects too).
 //!
 //! # XGBoost interchange
 //!
@@ -132,11 +222,16 @@
 //! `quantile_loss_param.quantile_alpha`,
 //! `expectile_loss_param.expectile_alpha`,
 //! `aft_loss_param.{aft_loss_distribution, aft_loss_distribution_scale}`)
-//! round-trips through the model's [`ObjectiveParams`]; absent fields take
-//! XGBoost's defaults. The alpha lists are XGBoost's array strings
+//! becomes the parameters of the model's [`Objective`]
+//! ([`ModelObjective::BuiltIn`]); absent fields take XGBoost's defaults, and
+//! parameters the objective does not read are dropped (e.g.
+//! `reg_loss_param.scale_pos_weight` of `reg:squarederror` or `reg:gamma`,
+//! which hessboost does not apply). The alpha lists are XGBoost's array strings
 //! (`"[0.1,0.5,0.9]"`, `(..)` also read); `reg:absoluteerror` and
-//! `survival:cox` have no block. A supported objective whose parameters do
-//! not rebuild it (e.g. an empty or unsorted alpha list) is a format error.
+//! `survival:cox` have no block. A value that does not parse, or an invalid
+//! parameter of the objective (e.g. an empty or unsorted alpha list), is a
+//! format error. An objective hessboost does not implement imports as
+//! [`ModelObjective::Other`]: its model predicts margins.
 //!
 //! ## `base_score`
 //!
@@ -148,9 +243,9 @@
 //! `binary:logistic`, not its logit). `hessboost` stores per-output
 //! intercepts in **margin** space, so on **import** the vector is mapped
 //! through the objective's inverse link
-//! ([`Objective::probs_to_margins`](crate::objective::Objective::probs_to_margins))
+//! ([`Loss::probs_to_margins`])
 //! and on **export** the margin row is mapped back with
-//! [`Objective::margins_to_probs`](crate::objective::Objective::margins_to_probs)
+//! [`Loss::margins_to_probs`]
 //! (the forward transform, except for `binary:hinge` and
 //! `reg:quantileerror`, whose transforms (threshold, sort) are not their
 //! links). Multiclass objectives (and any objective that cannot be
@@ -214,23 +309,28 @@
 //! [`load_xgboost_ubjson`]: BoostedModel::load_xgboost_ubjson
 
 pub mod compact;
+mod lightgbm;
 mod native;
+mod objective;
 mod sections;
 mod shap;
 mod ubjson;
 mod xgboost;
 
-use crate::config::{ObjectiveParams, PartialObjectiveParams};
+pub use objective::ModelObjective;
+
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::objective::create_objective;
-use crate::objective::distributional::{Dist, DistFamily};
+use crate::objective::distributional::Dist;
+use crate::objective::{Loss, LossContext, Objective};
 use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, key};
 use crate::tree::{RegTree, UncheckedRegTree, scalar_tree_output};
+use objective::{PartialStoredObjectiveParams, StoredObjectiveParams};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Bound, Range, RangeBounds};
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 /// The kind of feature-importance score to compute, mirroring XGBoost's
@@ -268,7 +368,7 @@ pub enum ImportanceType {
 /// Deserializing validates the model like every loader does and refuses an
 /// inconsistent one, so a model deserialized through serde directly is as
 /// safe to predict with and train on as a loaded one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "UncheckedBoostedModel")]
 #[allow(
     clippy::unsafe_derive_deserialize,
@@ -279,13 +379,14 @@ pub struct BoostedModel {
     trees: Vec<RegTree>,
     /// Per-output intercept in margin space (length `n_outputs`).
     base_score: Vec<f32>,
-    /// The objective's XGBoost name (`Objective::name`), which drives the
-    /// prediction transform.
-    objective: String,
-    /// Objective hyper-parameters, retained for XGBoost-format export and for
-    /// rebuilding the objective.
-    objective_params: ObjectiveParams,
-    /// The configured `num_class` (`0` for scalar objectives).
+    /// The objective, which drives the prediction transform and XGBoost
+    /// export.
+    objective: ModelObjective,
+    /// The `max_delta_step` training used (XGBoost stores it with
+    /// `count:poisson`), kept as stored.
+    max_delta_step: f64,
+    /// The stored `num_class`: a multiclass objective's class count, `0`
+    /// otherwise (a custom model keeps what it was saved with).
     num_class: usize,
     /// Raw outputs per instance: `num_class` for multiclass objectives, the
     /// objective's own output count otherwise (custom objectives may have
@@ -311,8 +412,48 @@ pub struct BoostedModel {
     linear: Option<LinearModel>,
     /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
     /// never serialized. Reset whenever `trees` changes.
-    #[serde(skip)]
     compact: OnceLock<CompactForest>,
+}
+
+/// A [`BoostedModel`] as native JSON stores it (same names and order as
+/// [`UncheckedBoostedModel`]), borrowed from the model.
+#[derive(Serialize)]
+struct SerializedBoostedModel<'a> {
+    trees: &'a [RegTree],
+    base_score: &'a [f32],
+    objective: &'a str,
+    objective_params: StoredObjectiveParams,
+    num_class: usize,
+    n_outputs: usize,
+    n_targets: usize,
+    n_features: usize,
+    best_iteration: Option<usize>,
+    tree_weights: &'a [f32],
+    num_parallel_tree: usize,
+    linear: &'a Option<LinearModel>,
+}
+
+impl Serialize for BoostedModel {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        SerializedBoostedModel {
+            trees: &self.trees,
+            base_score: &self.base_score,
+            objective: self.objective.name(),
+            objective_params: StoredObjectiveParams::of(&self.objective, self.max_delta_step),
+            num_class: self.num_class,
+            n_outputs: self.n_outputs,
+            n_targets: self.n_targets,
+            n_features: self.n_features,
+            best_iteration: self.best_iteration,
+            tree_weights: &self.tree_weights,
+            num_parallel_tree: self.num_parallel_tree,
+            linear: &self.linear,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// The serialized fields of a [`BoostedModel`] (the native JSON format:
@@ -326,7 +467,7 @@ pub struct BoostedModel {
 /// selected (every iteration predicts). Only the objective
 /// parameters may be omitted (all of them, or any subset): each missing
 /// one takes the recorded objective's default
-/// ([`ObjectiveParams::defaults_for`]). A tree may omit `size_leaf_vector`
+/// ([`StoredObjectiveParams::defaults_for`]). A tree may omit `size_leaf_vector`
 /// (scalar) and `leaf_vectors` (none), except that a multi-output model's
 /// trees must state `size_leaf_vector`, since it decides whether they are
 /// vector-leaf trees; each tree's `linear` is required
@@ -337,7 +478,7 @@ struct UncheckedBoostedModel {
     base_score: Vec<f32>,
     objective: String,
     #[serde(default)]
-    objective_params: PartialObjectiveParams,
+    objective_params: PartialStoredObjectiveParams,
     num_class: usize,
     n_outputs: usize,
     n_targets: usize,
@@ -361,6 +502,8 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
                 m.n_outputs
             )));
         }
+        let stored = m.objective_params.fill(&m.objective);
+        let objective = ModelObjective::from_stored(&m.objective, &stored, m.num_class)?;
         let model = BoostedModel {
             trees: m
                 .trees
@@ -368,8 +511,8 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
                 .map(UncheckedRegTree::into_unchecked)
                 .collect(),
             base_score: m.base_score,
-            objective_params: m.objective_params.fill(&m.objective),
-            objective: m.objective,
+            max_delta_step: stored.max_delta_step,
+            objective,
             num_class: m.num_class,
             n_outputs: m.n_outputs,
             n_targets: m.n_targets,
@@ -437,14 +580,15 @@ struct AttributionPrologue<'a> {
 }
 
 /// The metadata a model is assembled with: what it predicts and how its trees
-/// are laid out. Shared by training and the XGBoost-JSON importer.
+/// are laid out. Shared by training and the XGBoost and LightGBM importers.
 pub(crate) struct ModelSpec {
-    /// The objective's XGBoost name (`Objective::name`).
-    pub(crate) objective: String,
-    pub(crate) objective_params: ObjectiveParams,
-    /// Configured `num_class` (`0` for scalar objectives).
+    /// The objective's XGBoost name (`Loss::name`).
+    pub(crate) objective: ModelObjective,
+    /// The `max_delta_step` training used.
+    pub(crate) max_delta_step: f64,
+    /// `num_class` (`0` for non-multiclass objectives).
     pub(crate) num_class: usize,
-    /// Raw outputs per instance (`Objective::n_outputs`).
+    /// Raw outputs per instance (`Loss::n_outputs`).
     pub(crate) n_outputs: usize,
     /// Label columns per training row ([`DMatrix::n_targets`]).
     pub(crate) n_targets: usize,
@@ -460,6 +604,28 @@ impl BoostedModel {
     /// the linear model instead of the (empty) tree ensemble.
     pub(crate) fn set_linear(&mut self, linear: LinearModel) {
         self.linear = Some(linear);
+    }
+
+    /// A copy of this model's metadata (intercepts, objective, layout) with
+    /// `trees` instead of its own, every tree weighing `1` and no
+    /// `best_iteration`: the result of an in-place data update
+    /// ([`crate::training::online`]).
+    pub(crate) fn with_trees(&self, trees: Vec<RegTree>) -> BoostedModel {
+        BoostedModel {
+            trees,
+            base_score: self.base_score.clone(),
+            objective: self.objective.clone(),
+            max_delta_step: self.max_delta_step,
+            num_class: self.num_class,
+            n_outputs: self.n_outputs,
+            n_targets: self.n_targets,
+            n_features: self.n_features,
+            best_iteration: None,
+            tree_weights: Vec::new(),
+            num_parallel_tree: self.num_parallel_tree,
+            linear: None,
+            compact: OnceLock::new(),
+        }
     }
 
     /// Append a tree with an explicit contribution weight (`1.0` for plain
@@ -556,8 +722,8 @@ impl BoostedModel {
         self.best_iteration = it;
     }
 
-    /// Reassemble a model from its constituent parts. Used by the XGBoost-JSON
-    /// importer, which builds trees and metadata externally. `tree_weights`
+    /// Reassemble a model from its constituent parts. Used by the XGBoost and
+    /// LightGBM importers, which build trees and metadata externally. `tree_weights`
     /// is either empty (every tree weighs `1.0`) or holds one DART weight per
     /// tree; [`BoostedModel::validate_structure`] enforces the length.
     pub(crate) fn from_parts(
@@ -570,7 +736,7 @@ impl BoostedModel {
             trees,
             base_score,
             objective: spec.objective,
-            objective_params: spec.objective_params,
+            max_delta_step: spec.max_delta_step,
             num_class: spec.num_class,
             n_outputs: spec.n_outputs,
             n_targets: spec.n_targets,
@@ -588,9 +754,9 @@ impl BoostedModel {
         self.num_class
     }
 
-    /// The objective hyper-parameters the model was trained with.
-    pub fn objective_params(&self) -> &ObjectiveParams {
-        &self.objective_params
+    /// The `max_delta_step` training used (`0` when unbounded).
+    pub(crate) fn max_delta_step(&self) -> f64 {
+        self.max_delta_step
     }
 
     /// Number of raw outputs per instance: `num_class` for multiclass, the
@@ -629,8 +795,8 @@ impl BoostedModel {
         &self.base_score
     }
 
-    /// The objective name this model was trained with.
-    pub fn objective(&self) -> &str {
+    /// The objective this model was trained (or imported) with.
+    pub fn objective(&self) -> &ModelObjective {
         &self.objective
     }
 
@@ -797,8 +963,7 @@ impl BoostedModel {
         let margin = self.predict_margin_range(data, iterations)?;
         Ok(transform_model_margins(
             &self.objective,
-            &self.objective_params,
-            self.num_class,
+            self.max_delta_step,
             self.n_targets,
             self.n_outputs(),
             margin,
@@ -816,7 +981,11 @@ impl BoostedModel {
         if k == 1 || self.n_targets > 1 {
             return Ok(probs.iter().map(|&p| u32::from(p > 0.5)).collect());
         }
-        if self.objective == "multi:softmax" {
+        if self
+            .objective
+            .built_in()
+            .is_some_and(Objective::predicts_class_index)
+        {
             return Ok(probs.iter().map(|&class| class as u32).collect());
         }
         Ok(probs
@@ -974,10 +1143,12 @@ impl BoostedModel {
         self.base_score = base_score;
     }
 
-    /// Replace the objective hyper-parameters (continued training adopts the
-    /// new configuration, as XGBoost's `set_param` does).
-    pub(crate) fn set_objective_params(&mut self, params: ObjectiveParams) {
-        self.objective_params = params;
+    /// Replace the objective and the `max_delta_step` (continued training
+    /// adopts the new configuration's parameters, as XGBoost's `set_param`
+    /// does).
+    pub(crate) fn set_objective(&mut self, objective: ModelObjective, max_delta_step: f64) {
+        self.objective = objective;
+        self.max_delta_step = max_delta_step;
     }
 
     /// Give every tree an explicit contribution weight (`1.0` where absent),
@@ -1196,15 +1367,19 @@ impl BoostedModel {
         data: &DMatrix,
         iterations: impl RangeBounds<usize>,
     ) -> Result<Vec<Dist>> {
-        let family = DistFamily::from_objective(&self.objective).ok_or_else(|| {
-            HessboostError::invalid_param(
-                "objective",
-                format!(
-                    "`{}` does not predict distributions; train with a `dist:*` objective",
-                    self.objective
-                ),
-            )
-        })?;
+        let family = self
+            .objective
+            .built_in()
+            .and_then(Objective::dist_family)
+            .ok_or_else(|| {
+                HessboostError::invalid_param(
+                    "objective",
+                    format!(
+                        "`{}` does not predict distributions; train with a `dist:*` objective",
+                        self.objective.name()
+                    ),
+                )
+            })?;
         let margin = self.predict_margin_range(data, iterations)?;
         Ok(margin
             .chunks_exact(family.n_params())
@@ -1273,7 +1448,7 @@ impl BoostedModel {
             trees,
             base_score: self.base_score.clone(),
             objective: self.objective.clone(),
-            objective_params: self.objective_params.clone(),
+            max_delta_step: self.max_delta_step,
             num_class: self.num_class,
             n_outputs: self.n_outputs,
             n_targets: self.n_targets,
@@ -1378,34 +1553,22 @@ impl BoostedModel {
         Ok(())
     }
 
-    /// The objective's output width and parameters.
+    /// The objective's output width and the stored `max_delta_step`
+    /// (the objective's own parameters are valid by construction).
     fn validate_objective(&self) -> Result<()> {
+        if !(self.max_delta_step.is_finite() && self.max_delta_step >= 0.0) {
+            return Err(HessboostError::model_format(format!(
+                "invalid objective parameters: max_delta_step {} is not finite and >= 0",
+                self.max_delta_step
+            )));
+        }
         check_objective_width(
             &self.objective,
-            &self.objective_params,
+            self.max_delta_step,
             self.num_class,
             self.n_targets,
             self.n_outputs,
-        )?;
-        // The same rules the XGBoost importer and training apply, so a loaded
-        // model's parameters also export and rebuild.
-        self.objective_params
-            .training_params(&self.objective, self.num_class)
-            .build()
-            .map_err(|e| {
-                HessboostError::model_format(format!("invalid objective parameters: {e}"))
-            })?;
-        // Derived from the objective name, not configured: the binary format
-        // re-derives it, so a stored value must agree.
-        if self.objective_params.distribution
-            != crate::objective::distributional::DistFamily::from_objective(&self.objective)
-        {
-            return Err(HessboostError::model_format(format!(
-                "objective parameters name distribution {:?} for objective `{}`",
-                self.objective_params.distribution, self.objective
-            )));
-        }
-        Ok(())
+        )
     }
 
     /// `best_iteration`, intercepts, tree weights, trees, and the linear
@@ -1536,16 +1699,27 @@ impl BoostedModel {
         Self::from_xgboost_ubjson(&std::fs::read(path)?)
     }
 
-    /// The objective the model was trained with, rebuilt from its name,
-    /// `num_class` and retained parameters. Fails for objectives the crate
-    /// cannot construct by name (custom objectives).
-    pub(crate) fn rebuild_objective(&self) -> Result<Box<dyn crate::objective::Objective>> {
-        rebuild_objective(
-            &self.objective,
-            &self.objective_params,
-            self.num_class,
-            self.n_targets,
-        )
+    /// Parse a LightGBM 4.x text model: the file `booster.save_model("model.txt")`
+    /// writes, or `booster.model_to_string()`. The model predicts, explains,
+    /// slices, and saves like any other; see
+    /// [LightGBM import](crate::model#lightgbm-import) for the mapping, the
+    /// input conventions it assumes (missing values as `NaN`, categories as
+    /// non-negative codes), and the models it refuses with a
+    /// [`HessboostError::ModelFormat`].
+    pub fn from_lightgbm_text(text: &str) -> Result<Self> {
+        crate::model::lightgbm::import_lightgbm_text(text)
+    }
+
+    /// Load a LightGBM 4.x text model file (`booster.save_model("model.txt")`);
+    /// see [`BoostedModel::from_lightgbm_text`].
+    pub fn load_lightgbm_text(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_lightgbm_text(&std::fs::read_to_string(path)?)
+    }
+
+    /// The loss of the model's built-in objective (`None` for another
+    /// objective, whose predictions are margins).
+    pub(crate) fn rebuild_objective(&self) -> Option<Result<Arc<dyn Loss>>> {
+        rebuild_objective(&self.objective, self.max_delta_step, self.n_targets)
     }
 }
 
@@ -1598,79 +1772,87 @@ pub(crate) fn validate_prediction_data(
     Ok(())
 }
 
-/// The objective named `objective`, rebuilt from its retained parameters.
-/// Fails for objectives the crate cannot construct by name (custom
-/// objectives).
+/// The loss of `objective` for a model with `n_targets` label columns that
+/// trained with `max_delta_step`: `None` for an objective the crate does not
+/// implement (custom losses).
 fn rebuild_objective(
-    objective: &str,
-    params: &ObjectiveParams,
-    num_class: usize,
+    objective: &ModelObjective,
+    max_delta_step: f64,
     n_targets: usize,
-) -> Result<Box<dyn crate::objective::Objective>> {
-    let params = params
-        .training_params(objective, num_class)
-        .build_unchecked();
-    create_objective(&params, n_targets)
+) -> Option<Result<Arc<dyn Loss>>> {
+    objective.built_in().map(|objective| {
+        objective.build_loss(&LossContext {
+            n_targets,
+            max_delta_step,
+            shared_tree_seed: None,
+        })
+    })
 }
 
-/// Check that the objective a model names, when the crate can rebuild it,
-/// produces the model's `n_outputs` outputs. Loaders call this before
-/// returning a model: the prediction transform of a multi-output objective
-/// works on `[row][output]` blocks of its own width, so a mismatched width
-/// would transform values of neighboring rows together. Only objectives the
-/// crate does not know by name (custom objectives) are skipped: they predict
-/// margins. A built-in objective that cannot be rebuilt from the stored
-/// configuration (e.g. a distribution with a label matrix) is a format error,
-/// since predicting without its transform would misreport every output.
-/// So is a `num_class >= 2` on a built-in objective other than
+/// Check that a built-in objective produces the model's `n_outputs`
+/// outputs. Loaders call this before returning a model: the prediction
+/// transform of a multi-output objective works on `[row][output]` blocks of
+/// its own width, so a mismatched width would transform values of
+/// neighboring rows together. Other objectives (custom losses) are skipped:
+/// they predict margins. A built-in objective that cannot be rebuilt for the
+/// stored layout (e.g. a distribution with a label matrix) is a format
+/// error, since predicting without its transform would misreport every
+/// output. So is a `num_class >= 2` on a built-in objective other than
 /// `multi:softmax`/`multi:softprob`: XGBoost reads `num_class` as the
 /// multiclass class count and refuses it together with several targets.
 pub(crate) fn check_objective_width(
-    objective: &str,
-    params: &ObjectiveParams,
+    objective: &ModelObjective,
+    max_delta_step: f64,
     num_class: usize,
     n_targets: usize,
     n_outputs: usize,
 ) -> Result<()> {
-    match rebuild_objective(objective, params, num_class, n_targets) {
-        Ok(rebuilt) if rebuilt.n_outputs() != n_outputs => {
-            Err(HessboostError::ModelFormat(format!(
-                "objective `{objective}` has {} outputs but the model stores {n_outputs}",
-                rebuilt.n_outputs()
-            )))
+    let name = objective.name();
+    let multiclass = objective
+        .built_in()
+        .and_then(Objective::num_class)
+        .is_some();
+    match rebuild_objective(objective, max_delta_step, n_targets) {
+        None => Ok(()),
+        Some(Ok(rebuilt)) if rebuilt.n_outputs() == n_outputs => {
+            if num_class >= 2 && !multiclass {
+                Err(HessboostError::ModelFormat(format!(
+                    "num_class {num_class} applies only to multiclass objectives, not `{name}`"
+                )))
+            } else {
+                Ok(())
+            }
         }
-        Ok(_) if num_class >= 2 && !matches!(objective, "multi:softmax" | "multi:softprob") => {
-            Err(HessboostError::ModelFormat(format!(
-                "num_class {num_class} applies only to multiclass objectives, not `{objective}`"
-            )))
-        }
-        Ok(_)
-        | Err(HessboostError::Unknown {
-            kind: "objective", ..
-        }) => Ok(()),
-        Err(e) => Err(HessboostError::ModelFormat(format!(
-            "objective `{objective}` cannot be rebuilt from the stored configuration: {e}"
+        Some(Ok(rebuilt)) => Err(HessboostError::ModelFormat(format!(
+            "objective `{name}` has {} outputs but the model stores {n_outputs}",
+            rebuilt.n_outputs()
+        ))),
+        Some(Err(e)) => Err(HessboostError::ModelFormat(format!(
+            "objective `{name}` cannot be rebuilt from the stored configuration: {e}"
         ))),
     }
 }
 
 /// Turn raw margins (`[row][output]`, `n_outputs` wide) of a model with the
-/// given objective metadata into predictions in the objective's reported
-/// space: the objective's transform (identity when it cannot be rebuilt,
-/// e.g. a custom objective, mirroring how XGBoost returns margins then), and
-/// for `multi:softmax` the per-row argmax class index encoded as `f32`.
+/// given objective into predictions in the objective's reported space: the
+/// objective's transform (identity for an objective the crate does not
+/// implement, e.g. a custom loss, mirroring how XGBoost returns margins
+/// then), and for `multi:softmax` the per-row argmax class index encoded as
+/// `f32`.
 pub(crate) fn transform_model_margins(
-    objective: &str,
-    params: &ObjectiveParams,
-    num_class: usize,
+    objective: &ModelObjective,
+    max_delta_step: f64,
     n_targets: usize,
     n_outputs: usize,
     mut margin: Vec<f32>,
 ) -> Vec<f32> {
-    if let Ok(obj) = rebuild_objective(objective, params, num_class, n_targets) {
-        obj.pred_transform(&mut margin);
+    if let Some(Ok(loss)) = rebuild_objective(objective, max_delta_step, n_targets) {
+        loss.pred_transform(&mut margin);
     }
-    if objective == "multi:softmax" {
+    if objective
+        .built_in()
+        .is_some_and(Objective::predicts_class_index)
+    {
         return margin
             .chunks_exact(n_outputs)
             .map(|row| {
@@ -2054,6 +2236,7 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::error::HessboostError;
+    use crate::objective::{Logistic, Objective};
     use crate::test_support::labeled_dense;
     use crate::training::train;
 
@@ -2099,7 +2282,8 @@ mod tests {
         ));
         value["objective"] = "my:custom".into();
         let custom = BoostedModel::from_json(&value.to_string()).unwrap();
-        assert_eq!(custom.objective(), "my:custom");
+        assert_eq!(custom.objective().name(), "my:custom");
+        assert_eq!(custom.objective().built_in(), None);
     }
 
     /// Non-finite gblinear parameters would save as JSON `null` (and
@@ -2197,18 +2381,18 @@ mod tests {
             .unwrap()
             .with_label_matrix(&y, 2)
             .unwrap();
-        let params = |num_class| {
-            TrainingParams::builder()
-                .objective("binary:logistic")
-                .num_class(num_class)
-                .build()
-                .unwrap()
-        };
         assert!(matches!(
-            train(&params(2), &d, 1),
-            Err(HessboostError::InvalidParameter { .. })
+            TrainingParams::from_xgboost([
+                ("objective", serde_json::json!("binary:logistic")),
+                ("num_class", serde_json::json!(2)),
+            ]),
+            Err(HessboostError::InvalidParameter { name, .. }) if name == "num_class"
         ));
-        let model = train(&params(0), &d, 1).unwrap();
+        let params = TrainingParams::builder()
+            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .build()
+            .unwrap();
+        let model = train(&params, &d, 1).unwrap();
         let mut doc: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
         assert!(BoostedModel::from_json(&doc.to_string()).is_ok());
         doc["num_class"] = 2.into();

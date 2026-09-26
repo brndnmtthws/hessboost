@@ -52,7 +52,7 @@
 //! truncation, structural-plateau stopping, and objective/shape-specific
 //! adjustments of the schedules above) are not reproduced, so results match
 //! Perpetual's behavior in kind, not number for number. Losses are the
-//! objectives' [`pointwise_loss`](crate::objective::Objective::pointwise_loss)
+//! objectives' [`pointwise_loss`](crate::objective::Loss::pointwise_loss)
 //! (deviance form for the log-link objectives, where Perpetual uses the
 //! unshifted negative log-likelihood).
 //!
@@ -84,12 +84,12 @@
 //! # Parameters
 //!
 //! Budget mode derives the learning rate, tree size, and round count itself.
-//! It reads `objective`, `num_class`, `base_score`, `max_bin`, `nthread`,
-//! `missing`, and the one objective parameter the trained objective consumes
-//! (`scale_pos_weight` for the logistic objectives, `huber_slope` for
-//! `reg:pseudohubererror`, `tweedie_variance_power` for `reg:tweedie`,
-//! `max_delta_step` for `count:poisson`); every other [`TrainingParams`]
-//! field must keep its default, or training fails naming the fields.
+//! It reads `objective` (with its parameters: `scale_pos_weight` of the
+//! logistic objectives, `huber_slope` of `reg:pseudohubererror`,
+//! `tweedie_variance_power` of `reg:tweedie`), `base_score`, `max_bin`,
+//! `nthread`, and `max_delta_step` for `count:poisson`; every other
+//! [`TrainingParams`] field must keep its default, or training fails naming
+//! the fields.
 //! Supported objectives are the single-output ones with a pointwise loss:
 //! `reg:squarederror`, `reg:pseudohubererror`, `binary:logistic`,
 //! `binary:logitraw`, `reg:logistic`, `count:poisson`, `reg:gamma`, and
@@ -103,10 +103,10 @@ use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::objective::{GradPair, create_objective};
+use crate::objective::{GradPair, Objective};
 use crate::training::train::{
-    check_num_class, initial_intercepts, new_model, reject_feature_weights, reject_missing_param,
-    validate_dataset, validate_trained_model, with_thread_pool,
+    initial_intercepts, new_model, reject_feature_weights, validate_dataset,
+    validate_trained_model, with_thread_pool,
 };
 use crate::tree::builder::budget::{
     ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
@@ -300,24 +300,17 @@ pub fn train_with_budget(
 }
 
 /// Refuse every [`TrainingParams`] field budget mode does not read (they are
-/// derived from the budget or have no budget-mode meaning), comparing the
-/// serialized configuration against the defaults so newly added fields are
-/// covered too. Of the objective parameters only the one the supported
-/// objective consumes may differ from its default.
+/// derived from the budget or have no budget-mode meaning), comparing every
+/// field against the defaults so newly added fields are covered too. The
+/// objective (with its parameters) is what budget mode trains.
 fn reject_tuned_params(params: &TrainingParams) -> Result<()> {
-    let mut reference = TrainingParams::builder()
-        .objective(&params.objective)
-        .num_class(params.num_class)
-        .build_unchecked();
-    match params.objective.as_str() {
-        "binary:logistic" | "binary:logitraw" | "reg:logistic" => {
-            reference.scale_pos_weight = params.scale_pos_weight;
-        }
-        "reg:pseudohubererror" => reference.huber_slope = params.huber_slope,
-        "reg:tweedie" => reference.tweedie_variance_power = params.tweedie_variance_power,
-        // The Hessian safeguard and leaf-step bound of `count:poisson`.
-        "count:poisson" => reference.max_delta_step = params.max_delta_step,
-        _ => {}
+    let mut reference = TrainingParams {
+        objective: params.objective.clone(),
+        ..TrainingParams::default()
+    };
+    // The Hessian safeguard and leaf-step bound of `count:poisson`.
+    if matches!(params.objective, Objective::Poisson) {
+        reference.max_delta_step = params.max_delta_step;
     }
     reference.base_score = params.base_score;
     reference.max_bin = params.max_bin;
@@ -336,9 +329,8 @@ fn train_budget_inner(
 ) -> Result<BudgetResult> {
     config.validate()?;
     params.validate()?;
-    reject_missing_param(params)?;
     reject_feature_weights(dtrain, "budget mode does not sample columns")?;
-    let objective = create_objective(params, dtrain.n_targets())?;
+    let objective = params.loss(dtrain.n_targets())?;
     let n_out = objective.n_outputs();
     let loss_fn = match objective.pointwise_loss() {
         Some(loss) if n_out == 1 => loss,
@@ -353,7 +345,6 @@ fn train_budget_inner(
             ));
         }
     };
-    check_num_class(params, objective.as_ref())?;
     reject_tuned_params(params)?;
     let Some(labels) = dtrain.labels() else {
         return Err(HessboostError::EmptyDataset(
@@ -385,8 +376,8 @@ fn train_budget_inner(
     let eta = config.eta();
     let stopping_rounds = config.effective_stopping_rounds();
     let regression_like = matches!(
-        objective.name(),
-        "reg:squarederror" | "reg:pseudohubererror"
+        params.objective,
+        Objective::SquaredError | Objective::PseudoHuber(_)
     );
     let initial_loss = average(&loss);
     let mut previous_loss = initial_loss;

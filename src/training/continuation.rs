@@ -8,13 +8,11 @@
 //! stored intercept, while an absent one keeps it: the intercept is never
 //! re-estimated from the new labels.
 
-use crate::config::{
-    BoosterKind, GrowPolicy, Monotone, ObjectiveParams, ProcessType, TrainingParams,
-};
+use crate::config::{BoosterKind, GrowPolicy, Monotone, ProcessType, TrainingParams};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
-use crate::objective::Objective;
+use crate::model::{BoostedModel, ModelObjective};
+use crate::objective::Loss;
 use crate::training::multi_output;
 
 /// Check that `init` can be trained further with `params` on `dtrain` and
@@ -32,7 +30,7 @@ use crate::training::multi_output;
 pub(super) fn resume_model(
     init: &BoostedModel,
     params: &TrainingParams,
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     dtrain: &DMatrix,
     num_boost_round: usize,
     intercepts: impl FnOnce() -> Result<Vec<f32>>,
@@ -55,25 +53,24 @@ pub(super) fn resume_model(
             },
         ));
     }
-    if objective.name() != init.objective() {
+    if params.objective.name() != init.objective().name() {
         return Err(HessboostError::invalid_param(
             "objective",
             format!(
                 "`{}` does not match the model's objective `{}`",
-                objective.name(),
-                init.objective()
+                params.objective.name(),
+                init.objective().name()
             ),
         ));
     }
-    if params.num_class != init.num_class() || objective.n_outputs() != init.n_outputs() {
+    if objective.n_outputs() != init.n_outputs() {
         return Err(HessboostError::invalid_param(
             "num_class",
             format!(
-                "{} (with {} outputs) does not match the model's num_class {} ({} outputs)",
-                params.num_class,
+                "the objective's {} outputs do not match the model's {} (num_class {})",
                 objective.n_outputs(),
-                init.num_class(),
-                init.n_outputs()
+                init.n_outputs(),
+                init.num_class()
             ),
         ));
     }
@@ -117,13 +114,16 @@ pub(super) fn resume_model(
             ));
         }
     }
-    if params.process_type == ProcessType::Update {
+    if matches!(params.process_type, ProcessType::Update(_)) {
         check_update(init, params, num_boost_round)?;
     }
 
     let mut model = init.clone();
     model.set_best_iteration(None);
-    model.set_objective_params(ObjectiveParams::for_objective(params, init.objective()));
+    model.set_objective(
+        ModelObjective::trained_with(&params.objective),
+        params.effective_max_delta_step(),
+    );
     model.set_num_parallel_tree(params.num_parallel_tree);
     model.materialize_tree_weights();
     if params.base_score.is_some() {
@@ -204,10 +204,10 @@ fn check_update(
 /// default are:
 ///
 /// * what refresh or the objective's gradients read: the booster and
-///   device (checked elsewhere), `nthread`, `seed`, the objective and its
-///   parameters, `eval_metric`, `eta`, `lambda`, `alpha`, `max_delta_step`,
+///   device (checked elsewhere), `nthread`, `seed`, the objective (with its
+///   parameters), `eval_metric`, `eta`, `lambda`, `alpha`, `max_delta_step`,
 ///   `num_parallel_tree`, `multi_strategy`, `monotone_constraints` (refused
-///   with their own message), `process_type`, `refresh_leaf`, `missing`;
+///   with their own message), `process_type`, `refresh_leaf`;
 /// * XGBoost's tree-shape settings, which describe how the refreshed trees
 ///   were grown and which XGBoost 3.4.2's refresh updater accepts with a
 ///   training run's parameters: `tree_method`, `max_depth`, `max_leaves`,
@@ -227,19 +227,8 @@ fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
         seed: p.seed,
         device: p.device,
         objective: p.objective,
-        num_class: p.num_class,
         base_score: p.base_score,
         eval_metric: p.eval_metric,
-        tweedie_variance_power: p.tweedie_variance_power,
-        huber_slope: p.huber_slope,
-        lambdarank_num_pair_per_sample: p.lambdarank_num_pair_per_sample,
-        quantile_alpha: p.quantile_alpha,
-        expectile_alpha: p.expectile_alpha,
-        aft_loss_distribution: p.aft_loss_distribution,
-        aft_loss_distribution_scale: p.aft_loss_distribution_scale,
-        dist_gradient: p.dist_gradient,
-        dist_split_direction: p.dist_split_direction,
-        scale_pos_weight: p.scale_pos_weight,
         eta: p.eta,
         lambda: p.lambda,
         alpha: p.alpha,
@@ -248,8 +237,6 @@ fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
         multi_strategy: p.multi_strategy,
         monotone_constraints: p.monotone_constraints,
         process_type: p.process_type,
-        refresh_leaf: p.refresh_leaf,
-        missing: p.missing,
         tree_method: p.tree_method,
         max_depth: p.max_depth,
         max_leaves: p.max_leaves,
@@ -273,7 +260,7 @@ fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
 
 /// Reject `process_type=update` without a model to update.
 pub(super) fn require_model_for_update(params: &TrainingParams) -> Result<()> {
-    if params.process_type == ProcessType::Update {
+    if matches!(params.process_type, ProcessType::Update(_)) {
         return Err(HessboostError::invalid_param(
             "process_type",
             "`update` refreshes an existing model; use Trainer::init_model",

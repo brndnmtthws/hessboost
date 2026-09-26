@@ -30,7 +30,7 @@ def dtrain() -> DMatrix:
         ({"max_depth": 2.5}, r"parameter `max_depth`"),
         ({"tree_method": "gpu_hist"}, r"unknown variant `gpu_hist`"),
         ({"device": "cuda"}, r"unknown variant `cuda`"),
-        ({"eta": 0.1, "learning_rate": 0.2}, r"`eta` is set twice"),
+        ({"eta": 0.1, "learning_rate": 0.2}, r"`eta`: is set twice"),
         ({"subsample": 1.5}, r"subsample"),
         ({"eta": float("nan")}, r"`eta` must be finite"),
         ({"missing": 0.0}, r"DMatrix\(data, missing=\.\.\.\)"),
@@ -93,11 +93,11 @@ def test_balanced_bagging_params_are_accepted_and_validated() -> None:
     first = hessboost.train(params, dtrain, 4)
     second = hessboost.train(params, dtrain, 4)
     assert first.save_raw() == second.save_raw()
-    with pytest.raises(HessboostError, match="balanced bagging requires a binary"):
+    with pytest.raises(HessboostError, match="balanced bagging needs a `binary:\\*` objective"):
         hessboost.train(
             {"objective": "reg:squarederror", "pos_bagging_fraction": 0.5}, dtrain, 1
         )
-    with pytest.raises(HessboostError, match="LightGBM ignores `bagging_fraction`"):
+    with pytest.raises(HessboostError, match="balanced bagging replaces `subsample`"):
         hessboost.train(
             {
                 "objective": "binary:logistic",

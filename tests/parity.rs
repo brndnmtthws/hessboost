@@ -23,10 +23,7 @@
 //! uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 //! ```
 
-use hessboost::config::{
-    AftDistribution, BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType, SamplingMethod,
-    TreeMethod,
-};
+use hessboost::config::{ProcessType, Refresh};
 use hessboost::data::FeatureType;
 use hessboost::internals::HistCuts;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
@@ -250,167 +247,32 @@ fn load_all<T: for<'de> Deserialize<'de>>(dir: &Path, what: &str) -> Vec<T> {
 // XGBoost params -> TrainingParams
 // ---------------------------------------------------------------------------
 
-fn f64_of(key: &str, v: &Value) -> Result<f64, String> {
-    v.as_f64()
-        .ok_or_else(|| format!("`{key}` must be a number, got {v}"))
-}
-
-fn usize_of(key: &str, v: &Value) -> Result<usize, String> {
-    v.as_u64()
-        .map(|n| n as usize)
-        .ok_or_else(|| format!("`{key}` must be a non-negative integer, got {v}"))
-}
-
-fn str_of<'a>(key: &str, v: &'a Value) -> Result<&'a str, String> {
-    v.as_str()
-        .ok_or_else(|| format!("`{key}` must be a string, got {v}"))
-}
-
-/// XGBoost `ParamArray<float>` inputs (`quantile_alpha`): a number or a list
-/// of numbers.
-fn f64_list_of(key: &str, v: &Value) -> Result<Vec<f64>, String> {
-    match v {
-        Value::Array(items) => items.iter().map(|item| f64_of(key, item)).collect(),
-        other => Ok(vec![f64_of(key, other)?]),
-    }
-}
-
-/// A parameter hessboost implements only one way: the fixture must carry exactly
-/// that value, otherwise the case is not comparable.
-fn expect_fixed(key: &str, v: &Value, want: &Value) -> Result<(), String> {
-    if v == want {
-        Ok(())
-    } else {
-        Err(format!(
-            "`{key}` must be {want} (hessboost's only implementation), got {v}"
-        ))
-    }
-}
-
-/// `"(1,-1,0)"` -> per-feature [`Monotone`].
-fn parse_monotone(s: &str) -> Result<Vec<Monotone>, String> {
-    s.trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .map(|t| match t.trim() {
-            "1" => Ok(Monotone::Increasing),
-            "-1" => Ok(Monotone::Decreasing),
-            "0" => Ok(Monotone::None),
-            other => Err(format!("monotone_constraints: bad entry `{other}`")),
-        })
-        .collect()
-}
-
-/// Map the fixture's XGBoost parameter dict onto the builder. Every key must be
-/// handled: an unknown key is a failure, never a silent skip.
+/// The fixture's XGBoost parameter dict, through the crate's one XGBoost
+/// boundary ([`TrainingParams::from_xgboost`]): every key must be handled
+/// there (an unknown key is a failure, never a silent skip), and options
+/// hessboost implements one way only (`updater`, `feature_selector`,
+/// `lambdarank_pair_method`, ...) must carry exactly that setting, otherwise
+/// the case is not comparable.
+///
+/// rank:*: hessboost pairs every document with every other in the query;
+/// XGBoost does the same with `topk` truncated at the group size, so the pair
+/// count may not exceed a training group.
 fn build_params(fx: &Fixture) -> Result<TrainingParams, String> {
-    let mut b = TrainingParams::builder();
-    for (key, v) in &fx.params {
-        let k = key.as_str();
-        b = match k {
-            "objective" => b.objective(str_of(k, v)?),
-            "eval_metric" => match v {
-                Value::String(name) => b.eval_metric(name.as_str()),
-                Value::Array(names) => names.iter().try_fold(b, |b, name| {
-                    Ok::<_, String>(b.eval_metric(str_of(k, name)?))
-                })?,
-                _ => return Err(format!("`{k}` is neither a string nor a list")),
-            },
-            "num_class" => b.num_class(usize_of(k, v)?),
-            "base_score" => b.base_score(f64_of(k, v)?),
-            "eta" => b.eta(f64_of(k, v)?),
-            "gamma" => b.gamma(f64_of(k, v)?),
-            "max_depth" => b.max_depth(usize_of(k, v)?),
-            "max_leaves" => b.max_leaves(usize_of(k, v)?),
-            "min_child_weight" => b.min_child_weight(f64_of(k, v)?),
-            "max_delta_step" => b.max_delta_step(f64_of(k, v)?),
-            "reg_lambda" => b.lambda(f64_of(k, v)?),
-            "reg_alpha" => b.alpha(f64_of(k, v)?),
-            "scale_pos_weight" => b.scale_pos_weight(f64_of(k, v)?),
-            "max_bin" => b.max_bin(usize_of(k, v)?),
-            "subsample" => b.subsample(f64_of(k, v)?),
-            "colsample_bytree" => b.colsample_bytree(f64_of(k, v)?),
-            "colsample_bylevel" => b.colsample_bylevel(f64_of(k, v)?),
-            "colsample_bynode" => b.colsample_bynode(f64_of(k, v)?),
-            "sampling_method" => b.sampling_method(match str_of(k, v)? {
-                "uniform" => SamplingMethod::Uniform,
-                "gradient_based" => SamplingMethod::GradientBased,
-                other => return Err(format!("sampling_method `{other}` not mapped")),
-            }),
-            "num_parallel_tree" => b.num_parallel_tree(usize_of(k, v)?),
-            "seed" => b.seed(usize_of(k, v)? as u64),
-            "tweedie_variance_power" => b.tweedie_variance_power(f64_of(k, v)?),
-            "huber_slope" => b.huber_slope(f64_of(k, v)?),
-            "quantile_alpha" => b.quantile_alpha(f64_list_of(k, v)?),
-            "expectile_alpha" => b.expectile_alpha(f64_list_of(k, v)?),
-            "aft_loss_distribution" => b.aft_loss_distribution(match str_of(k, v)? {
-                "normal" => AftDistribution::Normal,
-                "logistic" => AftDistribution::Logistic,
-                "extreme" => AftDistribution::Extreme,
-                other => return Err(format!("aft_loss_distribution `{other}` not mapped")),
-            }),
-            "aft_loss_distribution_scale" => b.aft_loss_distribution_scale(f64_of(k, v)?),
-            "rate_drop" => b.rate_drop(f64_of(k, v)?),
-            "skip_drop" => b.skip_drop(f64_of(k, v)?),
-            "tree_method" => b.tree_method(match str_of(k, v)? {
-                "exact" => TreeMethod::Exact,
-                "approx" => TreeMethod::Approx,
-                "hist" => TreeMethod::Hist,
-                other => return Err(format!("tree_method `{other}` not mapped")),
-            }),
-            "multi_strategy" => b.multi_strategy(match str_of(k, v)? {
-                "one_output_per_tree" => MultiStrategy::OneOutputPerTree,
-                "multi_output_tree" => MultiStrategy::MultiOutputTree,
-                other => return Err(format!("multi_strategy `{other}` not mapped")),
-            }),
-            "grow_policy" => b.grow_policy(match str_of(k, v)? {
-                "depthwise" => GrowPolicy::DepthWise,
-                "lossguide" => GrowPolicy::LossGuide,
-                other => return Err(format!("grow_policy `{other}` not mapped")),
-            }),
-            "booster" => b.booster(match str_of(k, v)? {
-                "gbtree" => BoosterKind::GbTree,
-                "gblinear" => BoosterKind::GbLinear,
-                "dart" => BoosterKind::Dart,
-                other => return Err(format!("booster `{other}` not mapped")),
-            }),
-            "monotone_constraints" => b.monotone_constraints(parse_monotone(str_of(k, v)?)?),
-            "interaction_constraints" => b.interaction_constraints(
-                serde_json::from_str::<Vec<Vec<u32>>>(str_of(k, v)?)
-                    .map_err(|e| format!("interaction_constraints: {e}"))?,
-            ),
-            // gblinear: hessboost implements exactly cyclic coordinate descent.
-            "updater" => {
-                expect_fixed(k, v, &Value::from("coord_descent"))?;
-                b
-            }
-            "feature_selector" => {
-                expect_fixed(k, v, &Value::from("cyclic"))?;
-                b
-            }
-            // rank:*: hessboost pairs every document with every other in the
-            // query; XGBoost does the same with `topk` truncated at the group
-            // size, so both values are pinned to that configuration.
-            "lambdarank_pair_method" => {
-                expect_fixed(k, v, &Value::from("topk"))?;
-                b
-            }
-            "lambdarank_num_pair_per_sample" => {
-                let n = usize_of(k, v)?;
-                let groups = fx
-                    .group_sizes
-                    .as_deref()
-                    .ok_or("lambdarank_num_pair_per_sample without group_sizes")?;
-                if groups.iter().any(|&g| g < n) {
-                    return Err(format!("`{k}`={n} exceeds a train group size"));
-                }
-                b.lambdarank_num_pair_per_sample(n)
-            }
-            other => return Err(format!("unmapped XGBoost parameter `{other}`")),
-        };
+    if let Some(v) = fx.params.get("lambdarank_num_pair_per_sample") {
+        let n = v.as_u64().ok_or_else(|| {
+            format!("`lambdarank_num_pair_per_sample` must be an integer, got {v}")
+        })?;
+        let groups = fx
+            .group_sizes
+            .as_deref()
+            .ok_or("lambdarank_num_pair_per_sample without group_sizes")?;
+        if groups.iter().any(|&g| (g as u64) < n) {
+            return Err(format!(
+                "`lambdarank_num_pair_per_sample`={n} exceeds a train group size"
+            ));
+        }
     }
-    b.build().map_err(|e| format!("invalid params: {e}"))
+    TrainingParams::from_xgboost(fx.params.clone()).map_err(|e| format!("invalid params: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -768,8 +630,11 @@ impl Case<'_> {
     ) -> Result<f64, String> {
         let fx = self.fx;
         let mut params = build_params(fx)?;
-        params.process_type = ProcessType::Update;
-        params.refresh_leaf = r.refresh_leaf;
+        params.process_type = ProcessType::Update(if r.refresh_leaf {
+            Refresh::default()
+        } else {
+            Refresh::stats_only()
+        });
         let data = self
             .dmatrix(&fx.x_train[..r.n_rows * fx.n_cols], r.n_rows)?
             .with_labels(&r.y)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from typing import Any, Literal, TypeAlias, overload
+from typing import Any, Literal, Protocol, TypeAlias, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -277,9 +277,18 @@ def _feature_label(names: list[str] | None, column: int) -> str:
     return repr(names[column]) if names is not None and column < len(names) else str(column)
 
 
+class _Features(Protocol):
+    """The recorded features :func:`_check_schema` compares: a matrix's, a
+    model's, or an online model's training data's."""
+
+    _feature_names: list[str] | None
+    _feature_types: list[str] | None
+    _categories: _data.Categories
+
+
 def _check_schema(
-    reference: DMatrix | Booster,
-    data: DMatrix | Booster,
+    reference: _Features,
+    data: _Features,
     subject: str,
     against: str,
     *,
@@ -330,7 +339,7 @@ class Booster:
 
     Args:
         model_file: A path or the bytes of a saved model in any format
-            (detected from the content), or ``None`` for an empty booster
+            (detected from the content), including LightGBM text models, or ``None`` for an empty booster
             to :meth:`load_model` into.
     """
 
@@ -546,11 +555,18 @@ class Booster:
         self,
         fname: PathLike | bytes | bytearray | memoryview,
         *,
-        format: ModelFormat | None = None,
+        format: ModelFormat | Literal["lightgbm"] | None = None,
     ) -> None:
         """Replaces the model with one read from a path or bytes, in
         ``format`` or (by default) the format its content has: native
-        binary or JSON, or an XGBoost JSON or UBJSON document.
+        binary or JSON, an XGBoost JSON or UBJSON document, or a LightGBM
+        4.x text model (``lightgbm.Booster.save_model``; import only). An
+        imported LightGBM model predicts LightGBM's values for inputs with
+        missing values as ``NaN`` and categorical features as non-negative
+        codes; LightGBM models with no exact equivalent (``zero_as_missing``
+        splits a threshold cannot express, ``sigmoid`` other than 1, random
+        forests, ...) raise :class:`ModelFormatError`. See the Rust crate's
+        "LightGBM import" docs for the mapping.
 
         Raises:
             ModelFormatError: The content is not a valid model.

@@ -15,11 +15,12 @@ Submodules:
 * :mod:`hessboost.sklearn` -- scikit-learn estimators (needs scikit-learn)
 * :mod:`hessboost.conformal` -- conformal prediction intervals
 * :mod:`hessboost.folds` -- k-fold and forward-chaining (purged) folds
+* :mod:`hessboost.online` -- adding and deleting training rows in place
 """
 
 from importlib.metadata import version as _version
 
-from hessboost import conformal, folds
+from hessboost import conformal, folds, online
 from hessboost._core import Booster, DMatrix, Distributions, ImportanceType, ModelFormat
 from hessboost._exceptions import HessboostError, ModelFormatError
 from hessboost._training import (
@@ -50,5 +51,6 @@ __all__ = [
     "conformal",
     "cv",
     "folds",
+    "online",
     "train",
 ]

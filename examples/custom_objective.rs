@@ -1,8 +1,8 @@
 //! Bring-your-own loss and metric: the custom-objective and custom-metric hooks.
 //! Run: `cargo run --release --example custom_objective`.
 
-use hessboost::metric::{CustomMetric, Metric, Rmse};
-use hessboost::objective::{CustomObjective, GradPair};
+use hessboost::metric::{CustomMetric, EvalMetric};
+use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::prelude::*;
 
 mod common;
@@ -18,25 +18,23 @@ fn main() -> Result<()> {
         y[i] = 1.5 * x[i * f] - x[i * f + 1];
     }
     let d = DMatrix::from_dense(&x, n, f)?.with_labels(&y)?;
-    let params = TrainingParams::builder().max_depth(3).eta(0.2).build()?;
 
     // --- Custom objective: squared error via first/second-order gradients. ---
     // Signature: (raw_margins, labels, optional_weights, out_gradients).
-    let obj = CustomObjective::new(
-        "my:squarederror",
-        1,
-        0.0,
-        "rmse",
-        |preds, labels, w, out| {
-            for i in 0..preds.len() {
-                let wi = w.map_or(1.0, |ws| ws[i]);
-                out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi); // grad, hess
-            }
-        },
-    );
-    let model = Trainer::new(&params, &d, 60).objective(&obj).train()?.model;
+    let obj = CustomLoss::new("my:squarederror", 1, |preds, labels, w, out| {
+        for i in 0..preds.len() {
+            let wi = w.map_or(1.0, |ws| ws[i]);
+            out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi); // grad, hess
+        }
+    });
+    let params = TrainingParams::builder()
+        .objective(Objective::custom(obj))
+        .max_depth(3)
+        .eta(0.2)
+        .build()?;
+    let model = Trainer::new(&params, &d, 60).train()?.model;
     let preds = model.predict(&d)?;
-    let rmse = Rmse::default().eval(&preds, &y, None);
+    let rmse = EvalMetric::Rmse.build(1)?.eval(&preds, &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
 
     // --- Custom metric: mean absolute error, used for early stopping. ---
@@ -49,7 +47,7 @@ fn main() -> Result<()> {
             / p.len() as f64
     });
     let builtin = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .max_depth(3)
         .eta(0.2)
         .build()?;

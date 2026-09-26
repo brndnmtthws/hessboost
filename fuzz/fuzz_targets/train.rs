@@ -414,7 +414,7 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
             set(key, value);
         }
     }
-    let Ok(params) = TrainingParams::from_xgboost(flat) else {
+    let Ok(mut params) = TrainingParams::from_xgboost(flat) else {
         return Ok(None);
     };
 

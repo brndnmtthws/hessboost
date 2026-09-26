@@ -1082,7 +1082,7 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
 /// noise per row, around the intercept alone. Early stopping is refused
 /// too: the prediction averages every round, so a `best_iteration` prefix
 /// of the trees is not a Boulevard estimate.
-fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Objective) -> Result<()> {
+fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     let refuse = |name: &'static str, reason: &str| {
         Err(HessboostError::invalid_param(
             name,

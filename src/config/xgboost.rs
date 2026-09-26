@@ -148,6 +148,8 @@ flat_params! {
     model_shrink_rate: f64,
     model_shrink_mode: ModelShrinkMode,
     posterior_sampling: bool,
+    boulevard_dropout: f64,
+    boulevard_truncation: f64,
 }
 
 /// The flat keys of the objective parameters, with the objectives and
@@ -267,6 +269,8 @@ impl Flat {
             model_shrink_rate,
             model_shrink_mode,
             posterior_sampling,
+            boulevard_dropout,
+            boulevard_truncation,
         } = self;
         // Aligned with `OBJECTIVE_KEYS`.
         let present = [
@@ -550,6 +554,8 @@ impl Flat {
             langevin,
             model_shrink,
             posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
+            boulevard_dropout: boulevard_dropout.unwrap_or(d.boulevard_dropout),
+            boulevard_truncation: boulevard_truncation.unwrap_or(d.boulevard_truncation),
         })
     }
 }
@@ -890,6 +896,8 @@ impl TrainingParams {
             langevin,
             model_shrink,
             posterior_sampling,
+            boulevard_dropout,
+            boulevard_truncation,
         } = self;
         if let Objective::Custom(loss) = objective {
             return Err(HessboostError::invalid_param(
@@ -1022,6 +1030,8 @@ impl TrainingParams {
             set("model_shrink_mode", json(shrink.mode()));
         }
         set("posterior_sampling", json(posterior_sampling));
+        set("boulevard_dropout", json(boulevard_dropout));
+        set("boulevard_truncation", json(boulevard_truncation));
         Ok(flat)
     }
 
@@ -1068,6 +1078,8 @@ impl TrainingParams {
             langevin,
             model_shrink,
             posterior_sampling,
+            boulevard_dropout,
+            boulevard_truncation,
         } = self;
         let mut changed = Vec::new();
         let mut differs = |key: &'static str, same: bool| {
@@ -1155,6 +1167,14 @@ impl TrainingParams {
         differs(
             "posterior_sampling",
             *posterior_sampling == other.posterior_sampling,
+        );
+        differs(
+            "boulevard_dropout",
+            *boulevard_dropout == other.boulevard_dropout,
+        );
+        differs(
+            "boulevard_truncation",
+            *boulevard_truncation == other.boulevard_truncation,
         );
         changed.sort_unstable();
         changed

@@ -339,8 +339,8 @@ class Booster:
 
     Args:
         model_file: A path or the bytes of a saved model in any format
-            (detected from the content), including LightGBM text models, or ``None`` for an empty booster
-            to :meth:`load_model` into.
+            (detected from the content), including LightGBM text models, or
+            ``None`` for an empty booster to :meth:`load_model` into.
     """
 
     __module__ = "hessboost"

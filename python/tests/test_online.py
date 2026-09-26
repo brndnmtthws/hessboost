@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import classes, regression
 from numpy.typing import NDArray
 
 import hessboost
+from conftest import classes, regression
 from hessboost import DMatrix, HessboostError
 from hessboost.online import OnlineModel, UpdateReport
 
@@ -119,7 +119,8 @@ def test_a_stopping_callback_abandons_the_update(tolerance: float) -> None:
         return False
 
     report = online.update(binary(10, 7), [0, 1], callback=watch)
-    assert report is not None and calls == list(range(ROUNDS))
+    assert report is not None
+    assert calls == list(range(ROUNDS))
     fresh = OnlineModel.train(PARAMS, binary(300, 6), ROUNDS, tolerance)
     fresh.update(binary(10, 7), [0, 1])
     assert state(online) == state(fresh)
@@ -195,7 +196,7 @@ def test_access_from_the_update_callback_fails_fast(tolerance: float) -> None:
 
     code = _REENTRANT.replace("TOLERANCE", repr(tolerance))
     done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=False
     )
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "ok"
@@ -243,10 +244,10 @@ def test_unsupported_configurations_and_changes_are_refused() -> None:
         online.update(DMatrix(x[:2]))
     assert state(online) == before
     with pytest.raises(TypeError):
-        online.update(x[:2])  # type: ignore[call-overload]
+        online.update(x[:2])  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
-        online.update(None, [0.5])  # type: ignore[list-item]
+        online.update(None, [0.5])  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
-        OnlineModel.train(PARAMS, dtrain, 3, tolerance="0.1")  # type: ignore[arg-type]
+        OnlineModel.train(PARAMS, dtrain, 3, tolerance="0.1")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
         OnlineModel()

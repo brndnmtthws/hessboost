@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import classes, regression
 from numpy.typing import NDArray
 
 import hessboost
+from conftest import classes, regression
 from hessboost import DMatrix, HessboostError
 
 
@@ -39,7 +39,9 @@ def test_regression_learns_and_reports_the_history() -> None:
     assert rmse(predictions, y[300:]) == pytest.approx(valid[-1], rel=1e-5)
 
 
-def test_verbose_eval_prints_every_nth_round_and_the_last(capsys: pytest.CaptureFixture[str]) -> None:
+def test_verbose_eval_prints_every_nth_round_and_the_last(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     x, y = regression(rows=100)
     dtrain = DMatrix(x, y)
     hessboost.train({}, dtrain, 7, evals=[(dtrain, "train")], verbose_eval=3)
@@ -203,7 +205,8 @@ def test_distributional_objective_predicts_distributions() -> None:
     assert 0.8 < np.mean((y >= interval[:, 0]) & (y <= interval[:, 1])) < 0.97
     np.testing.assert_allclose(dists.quantile(0.5), dists.mean())
     np.testing.assert_allclose(dists.cdf(dists.mean().astype(np.float32)), 0.5, atol=1e-6)
-    assert np.all(np.isfinite(dists.log_prob(y))) and np.all(dists.crps(y) >= 0)
+    assert np.all(np.isfinite(dists.log_prob(y)))
+    assert np.all(dists.crps(y) >= 0)
     with pytest.raises(HessboostError, match="600 distributions"):
         dists.cdf(y[:5])
     point = hessboost.train({}, DMatrix(x, y), 5)
@@ -280,7 +283,9 @@ def test_refresh_updates_leaves_on_new_data() -> None:
     )
     assert refreshed.num_boosted_rounds() == 10
     # Same splits, leaves moved toward the shifted labels.
-    np.testing.assert_array_equal(refreshed.predict(x, pred_leaf=True), old.predict(x, pred_leaf=True))
+    np.testing.assert_array_equal(
+        refreshed.predict(x, pred_leaf=True), old.predict(x, pred_leaf=True)
+    )
     assert np.mean(refreshed.predict(x) - old.predict(x)) > 1.0
 
 
@@ -360,7 +365,6 @@ def test_custom_objective_outputs_come_from_num_class() -> None:
         hessboost.train({"num_class": -1}, DMatrix(x, y), 2, obj=spread)
 
 
-
 def test_custom_metric_drives_early_stopping() -> None:
     x, y = regression(rows=300)
     dvalid = DMatrix(x[200:], y[200:])
@@ -391,7 +395,8 @@ def test_custom_metric_drives_early_stopping() -> None:
     assert list(history["valid"]) == ["rmse", "mae"]
     assert set(calls) == {100}
     best = booster.best_iteration
-    assert best is not None and booster.best_score == min(history["valid"]["mae"])
+    assert best is not None
+    assert booster.best_score == min(history["valid"]["mae"])
 
     with pytest.raises(HessboostError, match="maximize"):
         hessboost.train({}, DMatrix(x, y), 2, maximize=True)
@@ -427,7 +432,7 @@ def test_cv_reports_test_metrics_per_round() -> None:
 
 
 def test_cv_accepts_explicit_folds_and_splitters() -> None:
-    from sklearn.model_selection import KFold  # type: ignore[import-untyped]
+    from sklearn.model_selection import KFold
 
     x, y = regression()
     dtrain = DMatrix(x, y)
@@ -462,30 +467,29 @@ def test_folds() -> None:
         hessboost.folds.k_fold(10, 1)
 
 
-
 def test_purged_forward_folds_purge_by_each_rows_label_window() -> None:
     day = 86_400
     # Three rows per day for 10 days; labels end two days after decision.
     decision_at = np.repeat(np.arange(10) * day, 3)
     label_end = decision_at + 2 * day
-    (train_rows, test_rows), = hessboost.folds.purged_forward(
+    ((train_rows, test_rows),) = hessboost.folds.purged_forward(
         decision_at, label_end, validation_fraction=0.2
     )
     # Days 8 and 9 test; day 7's labels reach past day 8's start and are
     # purged, day 6's end exactly at it and train.
     np.testing.assert_array_equal(decision_at[test_rows], np.repeat([8 * day, 9 * day], 3))
-    assert decision_at[train_rows].max() == 6 * day
+    assert np.max(decision_at[train_rows]) == 6 * day
     assert len(train_rows) == 21
     # Row-varying windows: one short-label row per day survives the purge.
     short = label_end.copy()
     short[::3] = decision_at[::3] + 1
-    (train_rows, _), = hessboost.folds.purged_forward(decision_at, short, validation_fraction=0.2)
+    ((train_rows, _),) = hessboost.folds.purged_forward(decision_at, short, validation_fraction=0.2)
     np.testing.assert_array_equal(np.sort(train_rows)[-1:], [21])
     assert set(decision_at[train_rows] // day) == set(range(8))
     # One tick past the block start purges day 6 too.
     later = label_end + 1
-    (train_rows, _), = hessboost.folds.purged_forward(decision_at, later, validation_fraction=0.2)
-    assert decision_at[train_rows].max() == 5 * day
+    ((train_rows, _),) = hessboost.folds.purged_forward(decision_at, later, validation_fraction=0.2)
+    assert np.max(decision_at[train_rows]) == 5 * day
     # datetime64 works, rows in any order, several blocks.
     stamps = np.datetime64("2026-01-01") + decision_at.astype("timedelta64[s]")
     ends = np.datetime64("2026-01-01") + label_end.astype("timedelta64[s]")
@@ -498,8 +502,10 @@ def test_purged_forward_folds_purge_by_each_rows_label_window() -> None:
         assert stamps[order][train_rows].max() < stamps[order][test_rows].min()
     with pytest.raises(HessboostError, match="before its decision"):
         hessboost.folds.purged_forward([5, 6], [4, 7], validation_fraction=0.5)
-    with pytest.raises(HessboostError, match="min_train|purged training rows"):
-        hessboost.folds.purged_forward(decision_at, label_end, validation_fraction=0.2, min_train=100)
+    with pytest.raises(HessboostError, match=r"min_train|purged training rows"):
+        hessboost.folds.purged_forward(
+            decision_at, label_end, validation_fraction=0.2, min_train=100
+        )
     with pytest.raises(TypeError, match="integer times"):
         hessboost.folds.purged_forward([0.5], [1.0], validation_fraction=0.5)
 
@@ -512,7 +518,9 @@ class Recorder(hessboost.TrainingCallback):
         self.stop_at = stop_at
 
     def after_iteration(self, iteration: int, evals_log: hessboost.EvalsResult) -> bool:
-        lengths = {data: {m: len(v) for m, v in metrics.items()} for data, metrics in evals_log.items()}
+        lengths = {
+            data: {m: len(v) for m, v in metrics.items()} for data, metrics in evals_log.items()
+        }
         self.calls.append((iteration, lengths))
         return iteration == self.stop_at
 

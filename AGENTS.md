@@ -55,8 +55,9 @@ tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal tests
 needing a device skip without one; a guard test still fails if the kernels
 do not compile). Its Python jobs build and test the extension on
 x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows across CPython 3.11,
-latest Python 3.x, and free-threaded 3.14t, plus static typing/stub checks
-and an sdist round trip. Root fmt also checks `python/Cargo.toml`; Python
+latest Python 3.x, and free-threaded 3.14t, plus pyright's public-type
+check, a ruff/ty lint job over all of the repository's Python, and an sdist
+round trip. Root fmt also checks `python/Cargo.toml`; Python
 clippy runs in both the x86_64-linux and aarch64-macOS lint jobs (the
 latter checks the Metal feature). `all-checks-passed` gates merges. After
 touching `simd/` or `cfg(target_arch)` code, lint the architecture your
@@ -91,11 +92,18 @@ dependencies run `cargo update --manifest-path python/Cargo.toml
 ```sh
 uv sync --locked
 uv run --locked pytest
-uv run --locked python -m mypy.stubtest hessboost._hessboost
-uv run --locked mypy --strict
 uv run --locked pyright --verifytypes hessboost --ignoreexternal
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+```
+
+Python lint and types, for `python/`, `scripts/`, `release.py`, and
+Markdown's Python snippets (`ruff.toml`, `ty.toml`), from the root:
+
+```sh
+uv run --project python --locked ruff check
+uv run --project python --locked ruff format --check
+uv run --project python --locked ty check
 ```
 
 ## Lints
@@ -105,6 +113,11 @@ Clippy `pedantic` is on (`Cargo.toml` lists the allowed lints). A new local
 site. Never allow `clippy::too_many_arguments`: group parameters into a
 named struct of things that belong together (e.g. per-call context vs.
 per-node state). Add new proper nouns in docs to `clippy.toml`.
+
+Python: `ruff.toml` selects the rule families (and says why naming and
+signature rules are off); `ty.toml` fails on warnings and honors only
+`# ty: ignore[rule]`, which is for tests that pass a wrong type on purpose.
+Fix findings rather than suppress them.
 
 ## Layout (`src/`)
 
@@ -306,7 +319,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   objective's name: the model records it as `ModelObjective::Other(name)`.
 - **Python:** `python/` uses only the crate's public API. The public
   Python API is pure Python; the extension is private, fully stubbed
-  (stubtest), `unsafe`-free (`forbid`), declares `gil_used = false`, keeps
+  (`_hessboost.pyi`, which ty checks callers against; nothing checks it
+  against the built module, so change both together), `unsafe`-free
+  (`forbid`), declares `gil_used = false`, keeps
   every class `frozen`, and releases the GIL around matrix construction,
   training, prediction, and model encode/decode. Parameter mappings go
   through `TrainingParams::from_xgboost`, the crate's one XGBoost

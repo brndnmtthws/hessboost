@@ -123,8 +123,9 @@ distributional, and in-place update extras:
 ```python
 import hessboost
 
-booster = hessboost.train({"objective": "binary:logistic", "max_depth": 4},
-                          hessboost.DMatrix(X, label=y), 100)
+booster = hessboost.train(
+    {"objective": "binary:logistic", "max_depth": 4}, hessboost.DMatrix(X, label=y), 100
+)
 probabilities = booster.predict(X_test)
 ```
 

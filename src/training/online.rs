@@ -52,8 +52,8 @@
 //! Updating is sound only where retraining the same parameters on the
 //! updated data is deterministic in the data alone and every node's
 //! subtree depends on the node's rows only: `gbtree` with `tree_method =
-//! hist` (or `auto`), depth-wise growth with a positive `max_depth` and no
-//! `max_leaves`, one output, `num_parallel_tree = 1`, no row or column
+//! hist` (or `auto`), depth-wise growth with a `max_depth` (never unlimited) and
+//! no `max_leaves`, one output, `num_parallel_tree = 1`, no row or column
 //! sampling (a retrain draws its samples sequentially over the rows, so
 //! they would change with any added or deleted row), no monotone or
 //! interaction constraints, none of the beyond-XGBoost split options
@@ -116,6 +116,7 @@
 //! # }
 //! ```
 
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use super::train::{RoundEval, Trainer, validate_training_data};
@@ -279,12 +280,16 @@ impl OnlineModel {
             || categorical
             || model.linear().is_some()
             || model.trees().iter().any(|t| t.linear_leaves().is_some())
+            || model
+                .trees()
+                .iter()
+                .any(|t| splits_at_or_below(t, params.max_depth))
             || (0..model.num_trees()).any(|t| model.tree_weight(t) != 1.0)
         {
             return Err(HessboostError::invalid_param(
                 "model",
-                "not a single-output, unweighted, numeric gbtree model with constant leaves of \
-                 these parameters and data",
+                "not a single-output, unweighted, numeric gbtree model with constant leaves, \
+                 no deeper than max_depth, of these parameters and data",
             ));
         }
         let cache = if online.tolerance > 0.0 {
@@ -478,6 +483,29 @@ fn kept_nodes(before: &BoostedModel, after: &BoostedModel) -> usize {
         .sum()
 }
 
+/// Whether `tree` splits a node at depth `max_depth` or deeper (the root at
+/// depth 0), which training with that limit never does.
+fn splits_at_or_below(tree: &RegTree, max_depth: Option<NonZeroUsize>) -> bool {
+    let Some(max_depth) = max_depth else {
+        return false;
+    };
+    let mut stack = vec![(0usize, 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        let Some(node) = tree.nodes().get(id) else {
+            continue;
+        };
+        if node.is_leaf() {
+            continue;
+        }
+        if depth >= max_depth.get() {
+            return true;
+        }
+        stack.push((node.left as usize, depth + 1));
+        stack.push((node.right as usize, depth + 1));
+    }
+    false
+}
+
 /// The refusals of the module docs.
 fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams) -> Result<()> {
     params.validate()?;
@@ -501,12 +529,12 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         return refuse("tree_method", "tree_method = hist");
     }
     if params.grow_policy != GrowPolicy::DepthWise
-        || params.max_leaves != 0
-        || params.max_depth == 0
+        || params.max_leaves.is_some()
+        || params.max_depth.is_none()
     {
         return refuse(
             "grow_policy",
-            "depth-wise growth with max_depth > 0 and no max_leaves (a node's subtree must \
+            "depth-wise growth with a max_depth and no max_leaves (a node's subtree must \
              depend on its rows only)",
         );
     }
@@ -1023,8 +1051,14 @@ impl TreeUpdate<'_> {
                 .filter(|&i| tree.leaf_id_with(|f| new.get(i, f as usize)) == new_id)
                 .map(|i| i as u32)
                 .collect();
+            // A split node lies above `max_depth` (`check_supported` requires
+            // one, `from_model` refuses deeper trees), so its subtree keeps
+            // at least one level.
             let sub_params = TrainingParams {
-                max_depth: params.max_depth - depth,
+                max_depth: params
+                    .max_depth
+                    .and_then(|d| d.get().checked_sub(depth))
+                    .and_then(NonZeroUsize::new),
                 ..params.clone()
             };
             let mut sampler = ColumnSampler::new(new.n_cols(), None, 1.0, 1.0, 1.0, params.seed);

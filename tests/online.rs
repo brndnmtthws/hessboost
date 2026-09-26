@@ -3,6 +3,7 @@
 //! it, updates are deterministic and atomic, and unsound configurations are
 //! refused.
 
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use hessboost::config::{BoosterKind, Dart, GrowPolicy};
@@ -320,5 +321,25 @@ fn from_model_refuses_linear_leaves() {
         // A model of these parameters on this data is accepted.
         let trained = train(&p, &data, 3).unwrap();
         assert!(OnlineModel::from_model(trained, &p, &data, online).is_ok());
+    }
+}
+
+/// A model with splits deeper than the parameters' `max_depth` is refused:
+/// a retrain with that limit never grows one, and regrowing such a node
+/// would leave no depth for its subtree.
+#[test]
+fn from_model_refuses_trees_deeper_than_max_depth() {
+    let data = data(300, 4, false);
+    let p = params(Objective::SquaredError);
+    let mut deep = p.clone();
+    deep.max_depth = NonZeroUsize::new(8);
+    let model = train(&deep, &data, 3).unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
+            "model"
+        );
+        assert!(OnlineModel::from_model(model.clone(), &deep, &data, online).is_ok());
     }
 }

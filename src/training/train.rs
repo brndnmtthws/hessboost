@@ -2177,6 +2177,7 @@ mod tests {
             "negative rate {neg_rate}"
         );
     }
+    /// A deterministic uniform `[0, 1)` stream (a 64-bit LCG's top 31 bits).
     fn lcg(mut s: u64) -> impl FnMut() -> f32 {
         move || {
             s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);

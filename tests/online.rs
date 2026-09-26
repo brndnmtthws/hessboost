@@ -146,6 +146,21 @@ fn an_interrupted_update_changes_nothing() {
         );
         assert_eq!(online.model().to_json().unwrap(), before);
         assert_eq!(online.data().n_rows(), 300);
+        // Refusing the commit after every iteration ran abandons it too.
+        let mut rounds = 0;
+        let refused = online.update_with_commit(
+            None,
+            &[0, 1],
+            |_| {
+                rounds += 1;
+                ControlFlow::Continue(())
+            },
+            || ControlFlow::Break(()),
+        );
+        assert_eq!(invalid_param(refused), "on_round");
+        assert_eq!(rounds, 10);
+        assert_eq!(online.model().to_json().unwrap(), before);
+        assert_eq!(online.data().n_rows(), 300);
         // The model still updates afterwards, as an uninterrupted one would.
         online.update(None, &[0, 1]).unwrap();
         let mut fresh =

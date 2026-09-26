@@ -202,3 +202,32 @@ fn settings_that_break_the_linear_smoother_are_refused() {
         .train();
     assert_eq!(invalid_param(stopping), "early_stopping_rounds");
 }
+
+#[test]
+fn the_round_hook_sees_every_round_and_break_keeps_a_boulevard_average() {
+    let params = builder().build().unwrap();
+    let dtrain = data(200, 13);
+    let mut seen = Vec::new();
+    let stopped = Trainer::new(&params, &dtrain, 50)
+        .on_round(|round| {
+            seen.push(round.iteration);
+            if round.iteration == 9 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .train()
+        .unwrap()
+        .model;
+    assert_eq!(seen, (0..10).collect::<Vec<_>>());
+    // Stopping after 10 rounds gives the 10-round Boulevard average, not a
+    // prefix of a longer run's leaves.
+    let ten = train(&params, &dtrain, 10).unwrap();
+    assert_eq!(stopped.num_boost_rounds(), 10);
+    assert_eq!(
+        stopped.predict(&dtrain).unwrap(),
+        ten.predict(&dtrain).unwrap()
+    );
+    assert!(stopped.boulevard().is_some());
+}

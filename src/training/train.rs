@@ -571,7 +571,8 @@ impl<'a> Trainer<'a> {
     /// still records the best round so far as
     /// [`best_iteration`](BoostedModel::best_iteration) (with its
     /// [`TrainResult::best_score`]). With `process_type=update` the model
-    /// holds the iterations refreshed so far. For `gblinear`, which stores
+    /// holds the iterations refreshed so far; with `booster = boulevard` it
+    /// is the Boulevard average of the rounds run so far. For `gblinear`, which stores
     /// no boosting iterations, [`RoundEval::iteration`] counts this run's
     /// rounds from 0.
     ///
@@ -802,6 +803,14 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
         super::boulevard::boost(&run, prepared, boost, num_boost_round, |round, margins| {
             if !evals.is_empty() {
                 eval_plan.record(objective, round, margins, &mut history);
+            }
+            match (&mut on_round, history.last()) {
+                (None, _) => ControlFlow::Continue(()),
+                (Some(hook), Some(last)) if last.iteration == round => hook(last),
+                (Some(hook), _) => hook(&RoundEval {
+                    iteration: round,
+                    scores: Vec::new(),
+                }),
             }
         })?;
         return Ok(TrainResult {

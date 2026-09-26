@@ -12,6 +12,7 @@
 //! recursion runs; the model's leaves get [`Recursion::scale`] at the end.
 
 use rayon::prelude::*;
+use std::ops::ControlFlow;
 
 use super::train::{
     MarginCaches, Prepared, TrainContext, TreeSample, make_column_sampler, sample_rows,
@@ -285,14 +286,15 @@ pub(super) struct BoostState<'m, 'a> {
 
 /// Train `rounds` Boulevard rounds into `state.model` with the prepared
 /// builder, calling `after_round(iteration, margins)` once each round's
-/// eval margins are current; then scale the leaves and record the
+/// eval margins are current (a `Break` ends training after that round);
+/// then scale the leaves to the average of the rounds run and record the
 /// [`BoulevardInfo`].
 pub(super) fn boost(
     run: &TrainContext,
     prepared: &Prepared,
     state: BoostState<'_, '_>,
     rounds: usize,
-    mut after_round: impl FnMut(usize, &MarginCaches),
+    mut after_round: impl FnMut(usize, &MarginCaches) -> ControlFlow<()>,
 ) -> Result<()> {
     let TrainContext {
         params,
@@ -373,7 +375,9 @@ pub(super) fn boost(
                 *m = (f64::from(mu) + scale * s) as f32;
             }
         }
-        after_round(round, &*margins);
+        if after_round(round, &*margins).is_break() {
+            break;
+        }
     }
     model.scale_all_leaves(recursion.scale() as f32);
     model.set_boulevard(Some(BoulevardInfo {

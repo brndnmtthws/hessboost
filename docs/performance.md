@@ -1,27 +1,20 @@
 # Performance
 
-hessboost combines runtime-detected SIMD numerical kernels — NEON on
-AArch64; AVX2+FMA (exponential and sigmoid transforms, logistic and
-short-softmax gradients) and SSE2 (quantile bin search) on x86-64 — with
-parallel histogram training. Split search is scalar. Data preparation and independent
-depthwise nodes share the worker pool; histogram task sizes follow node size,
-the two children of a large node are evaluated concurrently, and partial
-histograms are reduced in parallel by bin range. Training reuses row partitions
-where they reduce prediction work, and terminal leaves skip histogram and split
-searches. Prediction compares monotone integer keys in a branch-free lockstep
-walk. Scalar Rust handles other architectures and inputs outside the vector
-paths. Split choices, histogram sums, and prediction results match the scalar
-path exactly; the transcendental kernels stay within a few f32 ULPs of the
-scalar library functions. This guide compares CPU training with XGBoost and
-measures the numerical and tree-building optimizations within hessboost.
+hessboost trains on parallel histograms with runtime-detected SIMD kernels:
+NEON on AArch64; AVX2+FMA (gradients, exp/sigmoid/softmax) and SSE2 (bin
+search) on x86-64. Split search stays scalar; prediction walks monotone
+integer keys branch-free. Everything else falls back to scalar Rust. Split
+choices, histogram sums, and predictions match the scalar path exactly;
+transcendental kernels stay within a few f32 ULPs of the scalar functions.
+Below: CPU training against XGBoost, then the optimizations inside hessboost.
 
 ## XGBoost comparison
 
 Measured on **Apple M3 Max** against [XGBoost 3.4.1](https://pypi.org/project/xgboost/3.4.1/),
-the latest stable PyPI release checked on **2026-09-26 UTC**. Both engines use the
-same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
-256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
-preparation and training, and report the median of six fits after warmup.
+the latest stable PyPI release checked on **2026-09-26 UTC**. Same dense `f32`
+data and CPU `hist` settings on both sides: 100 rounds, depth 6, 256 bins,
+`eta=0.1`, `lambda=1`. Times cover fresh training-matrix preparation plus
+training; each is the median of six fits after warmup.
 
 | Workload | Threads | hessboost | XGBoost 3.4.1 |
 |---|---:|---:|---:|
@@ -38,44 +31,41 @@ preparation and training, and report the median of six fits after warmup.
 | 4-class, 50k × 30 | 4 | 0.299 s | 0.972 s |
 | 4-class, 50k × 30 | 16 | 0.235 s | 1.188 s |
 
-hessboost has lower median fit time in all 12 configurations in this run.
-Single-thread speedups range from 2.56× on 30-feature regression to 3.05× on
-wide regression; binary classification reaches 2.60× and multiclass 2.70×. At
-four threads, speedups range from 2.32× to 3.25×, and at sixteen threads from
-1.77× to 5.05× (multiclass; the remaining three range from 1.77× to 2.01×).
+hessboost is faster in all 12 configurations: 2.6–3.0× single-threaded,
+2.3–3.3× at four threads, and 1.8–2.0× at sixteen threads (5.0× on
+multiclass).
 
 ![hessboost speedup over XGBoost 3.4.1 by workload and thread count](benchmarks/xgboost-speedup.svg)
 
 ![Median fit time by workload and thread count, log scale](benchmarks/xgboost-threads.svg)
 
-The charts in this guide are rendered by
-[`benchmarks/charts.gp`](benchmarks/charts.gp) from the table values recorded
-in [`benchmarks/xgboost.dat`](benchmarks/xgboost.dat) and
-[`benchmarks/optimization.dat`](benchmarks/optimization.dat). Regenerate
-them with `gnuplot -c docs/benchmarks/charts.gp` after updating a data
-file. The data files also carry the measurement provenance for each chart.
+Charts are rendered by
+[`benchmarks/charts.gp`](benchmarks/charts.gp) from the table values in
+[`benchmarks/xgboost.dat`](benchmarks/xgboost.dat) and
+[`benchmarks/optimization.dat`](benchmarks/optimization.dat); regenerate with
+`gnuplot -c docs/benchmarks/charts.gp` after updating a data file.
 
 ### CPU scheduling
 
-XGBoost distributes histogram work across nodes and row blocks, and split
-searches across nodes and features. Its updater also produces final row
-positions. These are useful places to look when a faster numerical kernel has
-little effect on total training time. See the upstream
+XGBoost spreads histogram work over nodes and row blocks, split search over
+nodes and features, and its updater also emits final row positions — the
+places to look when a faster kernel barely moves total training time. See the
+upstream
 [histogram builder](https://github.com/dmlc/xgboost/blob/v3.4.1/src/tree/hist/histogram.h),
 [split evaluator](https://github.com/dmlc/xgboost/blob/v3.4.1/src/tree/hist/evaluate_splits.h),
 and [hist updater](https://github.com/dmlc/xgboost/blob/v3.4.1/src/tree/updater_quantile_hist.cc).
 
-hessboost's scheduler overlaps independent depthwise nodes and limits histogram
-allocations by the rows available. Data preparation and margin updates also
-share the worker pool. The measured benefit depends on tree shape, feature
-count, sampling, and worker count; more workers do not guarantee a faster fit.
+hessboost overlaps independent depthwise nodes, sizes histogram tasks by
+node, and shares the worker pool with data preparation and margin updates.
+Gains depend on tree shape, feature count, sampling, and worker count; more
+workers isn't always faster.
 
 ### Model quality
 
-Both engines receive the same held-out rows, generated independently of the
-training rows from the same distribution. The following scores are from the
-single-thread fits; lower is better. These synthetic tasks measure comparable
-fit quality under identical hyperparameters, not quality across all datasets.
+Same held-out rows on both sides, drawn separately from the training rows.
+Scores below are the single-thread fits; lower is better. Synthetic tasks
+with identical hyperparameters — a comparability check, not a general
+quality claim.
 
 | Workload | Held-out rows | Metric | hessboost | XGBoost 3.4.1 |
 |---|---:|---|---:|---:|
@@ -84,47 +74,40 @@ fit quality under identical hyperparameters, not quality across all datasets.
 | Binary, 100k × 30 | 20,000 | logloss | 0.516273 | 0.516273 |
 | 4-class, 50k × 30 | 10,000 | mlogloss | 0.150027 | 0.150027 |
 
-The scores above are from the M3 Max run itself (2026-09-26, both engines):
-hessboost matches XGBoost to within 1e-9 on every workload, so the timing
-differences reflect training speed, not fit quality.
+From the M3 Max run itself (2026-09-26, both engines): hessboost matches
+XGBoost within 1e-9 on every workload, so the timing gaps are speed, not
+fit quality.
 
 ### Workloads and method
 
-- Regression predicts `2*x0 - 3*x1² + 0.5*x2 + x3*x4` with Gaussian noise
-  of standard deviation 0.05. The 128-feature case adds irrelevant features.
-- Binary labels are Bernoulli draws with log-odds
-  `4*(x0-0.5) - 3*(x1-0.5) + 2*(x2-0.5)`.
-- Four-class labels select the largest of `3*xi - x((i+1) mod 4)` plus Gaussian
-  noise of standard deviation 0.1. Each boosting round constructs four trees.
+- Regression: `2*x0 - 3*x1² + 0.5*x2 + x3*x4` plus N(0, 0.05²). The
+  128-feature case adds irrelevant features.
+- Binary: Bernoulli draws with log-odds `4*(x0-0.5) - 3*(x1-0.5) + 2*(x2-0.5)`.
+- Four-class: argmax of `3*xi - x((i+1) mod 4)` plus N(0, 0.1²); four trees
+  per round.
 
-Features are uniform on `[0, 1)`. The NumPy generator and training seed are
-1234. Held-out sets have one fifth as many rows as their training sets. Both
-engines use depthwise growth, a fixed `base_score=0.5`, `alpha=0`, `gamma=0`,
-`min_child_weight=1`, and full row/column sampling. No early stopping or eval
-callbacks run inside the timer.
+Features uniform on `[0, 1)`; NumPy and training seed 1234. Held-out sets are
+one fifth the training rows. Both sides: depthwise growth,
+`base_score=0.5`, `alpha=0`, `gamma=0`, `min_child_weight=1`, full
+row/column sampling, no early stopping or eval callbacks in the timer.
 
-XGBoost uses its macOS ARM64 PyPI wheel with OpenMP enabled and
-`QuantileDMatrix`, with quantile construction inside the timer. hessboost
-constructs a fresh `DMatrix` inside the timer and bins during training. Both
-read identical binary data before timing. Test-matrix preparation, file I/O,
-process startup, prediction, scoring, and model destruction are excluded.
+XGBoost uses its macOS ARM64 PyPI wheel (OpenMP) with `QuantileDMatrix`
+built in the timer; hessboost builds a fresh `DMatrix` in the timer and bins
+during training. Both read identical binary data beforehand. Excluded from
+timing: test-matrix prep, file I/O, startup, prediction, scoring, teardown.
 
-The runtime is macOS 27.0, Rust 1.98.1 / LLVM 22.1.8, uv-managed Python
-3.14.5, NumPy 2.5.2, and XGBoost 3.4.1. Rust uses the release profile
-(`opt-level=3`, thin LTO, one codegen unit) without extra `RUSTFLAGS`.
-XGBoost's native build reports Clang 15 and OpenMP support. Compilation finishes
-before measurements; the two engines run sequentially. This is an interactive
-workstation with unrelated CPU activity, so small differences should be treated
-as near parity rather than an isolated-machine result.
+Runtime: macOS 27.0, Rust 1.98.1 / LLVM 22.1.8, uv Python 3.14.5, NumPy
+2.5.2, XGBoost 3.4.1. Rust release profile, no extra `RUSTFLAGS`; XGBoost
+native build reports Clang 15 + OpenMP. Compiled first, engines run
+sequentially. Interactive workstation with unrelated CPU activity — treat
+small gaps as near parity.
 
-For each workload and thread count, batches run in
-XGBoost/hessboost/hessboost/XGBoost order. Each batch discards one warmup fit and
-records three fits. The table uses the median of all six recorded fits per
-engine. These numbers describe this CPU and these synthetic workloads; they do
-not establish GPU or other-platform performance. The full per-fit samples,
-scores, build info, and source hashes are in `/tmp/hessboost-xgb-full`
-(`comparison.json` alongside the shared datasets); rerunning the harness
-regenerates equivalent data in a new output directory.
+Batches run XGBoost/hessboost/hessboost/XGBoost per workload and thread
+count: one warmup fit discarded, three recorded, per batch; the table takes
+the median of all six fits per engine. This CPU and these synthetic
+workloads only — no GPU or cross-platform claim. Full per-fit samples,
+scores, build info, and source hashes land in the output directory
+(`/tmp/hessboost-xgb-full` for this run; reruns write a new one).
 
 Reproduce from the repository root, using a new output directory:
 
@@ -135,35 +118,28 @@ uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
   --output /tmp/hessboost-xgb --threads 1 4 16
 ```
 
-The [script documentation](../scripts/README.md#xgboost-comparison) describes
-workload selection and a quick harness check.
+Workload selection and a quick harness check are in the
+[script docs](../scripts/README.md#xgboost-comparison).
 
 ## Optimization benchmarks
 
-These measurements compare the optimized implementation with the scalar
-baseline, using the same benchmark source and compiler.
+Optimized vs scalar baseline, same source and compiler. **Apple M3 Max** (16
+physical cores), macOS 26.6.2, **Rust 1.98.1 / LLVM 22.1.8**, 2026-09-14
+UTC. Both builds: `opt-level=3`, thin LTO, one codegen unit, no
+`RUSTFLAGS`; `RAYON_NUM_THREADS` fixed per comparison. Compiled and tested
+before timing; binaries run sequentially on a live workstation, alternating
+order to cut (not kill) timing bias.
 
-Measured on **Apple M3 Max**, 16 physical cores,
-macOS 26.6.2, with **Rust 1.98.1 / LLVM 22.1.8**, on 2026-09-14 UTC.
-Both builds use `opt-level=3`, thin LTO, one codegen unit, and no `RUSTFLAGS`.
-`RAYON_NUM_THREADS` is fixed per comparison. Compilation and tests finish before
-timing begins; the benchmark executables run sequentially. Unrelated workstation
-activity remains uncontrolled; alternating run order reduces timing bias but
-does not eliminate it.
-
-Each value is the mean of two Criterion run medians, collected in
-baseline/optimized/optimized/baseline order. Each run requests 0.5 seconds of
-warmup, 1 second of measurement, 20 samples, and 10,000 bootstrap resamples.
-Criterion extends measurement time when
-needed to collect them. **Less time** is `100 × (1 − optimized / baseline)`.
-These are results for the specified machine and workloads, not a guarantee for
-every dataset or AArch64 CPU.
+Each value is the mean of two Criterion run medians in
+baseline/optimized/optimized/baseline order (0.5 s warmup, 1 s measurement,
+20 samples, 10k bootstraps; Criterion extends as needed). **Less time** is
+`100 × (1 − optimized / baseline)`. This machine and these workloads only.
 
 ### Full training
 
-All cases train 50 depth-six trees on 50,000 rows × 20 features. Data creation
-is outside the timer; training includes quantile preparation, gradients,
-tree construction, and training-prediction updates.
+All cases train 50 depth-six trees on 50,000 × 20. Data creation is outside
+the timer; training covers quantile prep, gradients, tree building, and
+training-prediction updates.
 
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
@@ -180,9 +156,8 @@ tree construction, and training-prediction updates.
 
 ### Single histogram tree
 
-Cuts, binned data, and gradients are prepared outside the timer. These cases
-isolate tree construction, including the column sampler, histogram building,
-row partitioning, and split evaluation.
+Cuts, bins, and gradients are prepared outside the timer; the cases isolate
+tree construction (sampling, histograms, partitioning, split evaluation).
 
 | Workload | Threads | Baseline (ms) | Optimized (ms) | Less time |
 |---|---:|---:|---:|---:|
@@ -201,22 +176,19 @@ row partitioning, and split evaluation.
 | Loss-guide growth | 1 | 6.843 | 3.077 | 55.0% |
 | Loss-guide growth | 4 | 6.680 | 2.924 | 56.2% |
 
-Depth cases use 50,000 rows × 20 features. The wide case uses 10,000 rows × 128
-features at depth six. Missing, monotone, and loss-guide cases use the depth-six
-dataset; missing values occupy 2 of every 11 feature entries, the first feature
-has an increasing constraint in the monotone case. All cases use 256 bins.
-Loss-guide growth uses a 64-leaf limit; depthwise growth stops at its configured
-depth.
+Depth cases: 50,000 × 20. Wide: 10,000 × 128 at depth six. Missing,
+monotone, and loss-guide reuse the depth-six set; missing fills 2 of every
+11 entries, monotone constrains the first feature upward. All 256 bins;
+loss-guide caps at 64 leaves.
 
 ![Histogram tree-build time cut vs scalar baseline](benchmarks/tree-optimization.svg)
 
 ### Numerical kernels
 
-Pointwise cases process one million predictions. Multiclass cases contain
-`floor(1,000,000 / classes)` rows, keeping the output count near one million.
-Transforms include copying the input into the reusable output buffer. Metrics
-include final normalization. These single-thread measurements use prepared
-inputs, not tree training.
+Pointwise cases run one million predictions (multiclass: `1M / classes`
+rows, ~1M outputs). Transforms include the copy into the reusable output
+buffer; metrics include final normalization. Prepared inputs, single
+thread, no tree training.
 
 ![Objective gradient time cut vs scalar baseline](benchmarks/gradient-optimization.svg)
 
@@ -255,29 +227,23 @@ inputs, not tree training.
 | Multiclass log loss, 32 classes, weighted | 1 | 0.102 | 0.062 | 39.5% |
 | Multiclass error, 32 classes, weighted | 1 | 1.616 | 0.244 | 84.9% |
 
-The benchmark suite also covers unweighted metrics, additional class counts,
-and histogram-accumulation controls. Histogram accumulation controls exercise
-the scalar accumulation loop and task scheduling; tree construction also
-measures split evaluation, parallel nodes, and avoiding unnecessary child work.
+The suite also covers unweighted metrics, more class counts, and
+histogram-accumulation controls (scalar loop and scheduling).
 
 ### Quantized-gradient training (opt-in)
 
-`use_quantized_grad` (LightGBM's quantized training; not XGBoost behavior)
-replaces each bin's two `f64` sums with one packed integer. Its width follows
-the node's row count (32-bit up to `32767 / Q` rows, else 64-bit). Nodes too
-large for 32 bits still accumulate runs of rows in a 32-bit scratch histogram,
-which fits in L1, before adding them into the node's bins. Rows are read as
-one `i32` instead of an 8-byte gradient pair. Split evaluation is unchanged:
-it reads the dequantized sums, and each split pays one extra pass to
-dequantize both child histograms.
+`use_quantized_grad` (LightGBM-style quantized training, not XGBoost
+behavior) packs each bin's two `f64` sums into one integer — 32-bit up to
+`32767 / Q` rows, else 64-bit. Oversized nodes accumulate row runs in an
+L1-resident 32-bit scratch histogram first. Rows read as one `i32` instead
+of an 8-byte gradient pair. Split scoring reads dequantized sums, paying one
+extra pass per split to dequantize both child histograms.
 
-Measured on **AWS Neoverse-V3** (192 cores, Linux 6.12) with **Rust 1.98.1**,
-`opt-level=3`, thin LTO, one codegen unit, on 2026-09-23 UTC. Each value is the
-Criterion median (2 s warm-up, 6 s measurement). The host also ran other
-agents' builds, so treat differences under about 3% as noise. Q = 4 levels,
-stochastic rounding, no leaf renewal. The full-precision column measures the
-same cases on this machine in the same run, plus a 1M × 50 case
-(`large_depth8`).
+**AWS Neoverse-V3** (192 cores, Linux 6.12), **Rust 1.98.1**, `opt-level=3`,
+thin LTO, one codegen unit, 2026-09-23 UTC. Criterion medians (2 s warmup,
+6 s measurement) on a busy host — treat gaps under ~3% as noise. Q = 4,
+stochastic rounding, no leaf renewal. The full-precision column is the same
+cases on the same machine and run, plus a 1M × 50 case.
 
 | Workload | Threads | Full precision (ms) | Quantized (ms) | Speedup |
 |---|---:|---:|---:|---:|
@@ -296,31 +262,25 @@ same cases on this machine in the same run, plus a 1M × 50 case
 | Training, binary, 50 rounds | 1 | 309.4 | 323.7 | 0.96× |
 | Training, binary, 50 rounds | 16 | 80.24 | 75.01 | 1.07× |
 
-Quantization pays off only when histogram accumulation dominates the tree
-build, as in the 1M-row case, where accumulation takes about half the
-full-precision profile. On the 50k-row and 128-feature cases, the per-bin gain
-evaluation takes most of the time. It is the same code in both modes. The
-integer histograms save about a third of the smaller accumulation share, and
-the per-tree quantization pass plus the per-split dequantization give most of
-that back. Single-threaded training on 50k rows is therefore 3–4% *slower*,
-and 16 threads gain about 7%. The integer loops are scalar: widths are chosen
-per node, and serial and parallel builds agree bit for bit. There is no SIMD
+Only worth it when accumulation dominates the build — the 1M-row case, where
+it is about half the profile. On 50k rows and 128 features, gain evaluation
+(identical code in both modes) dominates: the integer histograms save about
+a third of the smaller accumulation share, and the quantization plus
+per-split dequantization passes give most of it back. Net: 3–4% slower
+single-threaded training on 50k rows, ~7% faster at 16 threads. The integer
+loops are scalar (per-node widths, bit-identical serial/parallel); no SIMD
 path to keep in sync.
 
 ### Split search, histogram, and scheduling changes
 
-Sixteen fixed workloads, timed as the median of five fits after a warmup
-(a fresh `DMatrix` inside the timer; prediction and SHAP time only the
-call), all run at once, each pinned to its own NUMA-local CPU set. Every
-case's output bits (held-out margins, predictions, contributions) were
-hashed before and after: none changed, at any thread count, and the XGBoost
-parity suite passes.
+Sixteen fixed workloads, median of five fits after warmup (fresh `DMatrix`
+in the timer; prediction/SHAP time only the call), all at once on
+NUMA-local CPU sets. Output bits hashed before and after — none changed at
+any thread count; XGBoost parity passes.
 
-Measured on the 192-core **AWS Neoverse-V3** host (Rust 1.98.1, release
-profile) on 2026-09-24 UTC, before and after the split-scoring, histogram,
-scheduling, and data-preparation changes described under
-[Implementation](#implementation). The host ran other jobs at the same time
-(load averages up to about 90), so single values vary by up to about 10%.
+192-core **AWS Neoverse-V3** (Rust 1.98.1, release), 2026-09-24 UTC, before
+and after the changes under [Implementation](#implementation). Busy host
+(load ~90), so single values vary up to ~10%.
 
 | Case | Threads | Before (ms) | After (ms) |
 |---|---:|---:|---:|
@@ -342,54 +302,37 @@ scheduling, and data-preparation changes described under
 | SHAP contributions, 2k rows | 16 | 27.9 | 27.6 |
 | **Geometric mean** | | **501.8** | **247.5** |
 
-Prediction and SHAP are unchanged code; their differences are host noise.
+Prediction and SHAP run unchanged code; deltas are host noise.
 
 ### Hot-loop code generation
 
-The kernels that dominate each workload were rewritten where the generated
-code, not the algorithm, was the limit:
+Rewritten where codegen, not the algorithm, was the limit:
 
-- **Prediction:** the lockstep tree walk steps each lane with a `cmp` +
-  `cinc` pair (`simd::step_if_greater`); LLVM compiled the plain select to a
-  branch that random rows mispredict about a quarter of the time. Row keys
-  are formed branch-free and written a row at a time before being scattered
-  to their lane slots.
-- **SHAP:** eight rows walk each tree in lockstep, so their dependent `f32`
-  chains overlap. The per-lane edge terms and child bases are NEON kernels
-  (LLVM had scalarized their divisions). Subtrees return their weighted
-  returns by value instead of through zero-filled buffers. Path
-  probabilities and row values are stored feature-major, the lockstep rows
-  side by side, and return edges are summed two rows at a time.
-- **Exact method:** the per-row scan keeps the node's statistics in
-  registers at the root level. The incumbent test is precomputed per node, so
-  each candidate is screened with about ten flops. Each scan direction runs
-  its own loop over the sorted column's `(row, value)` pairs, with the
-  direction as a constant. Each leaf's rows update the training margins
-  directly.
-- **Histogram training:**
-  - Numeric features are scanned in pairs so their prefix-sum chains
-    overlap.
-  - With non-negative Hessians the running sums' extremes are their
-    endpoints.
-  - Dense accumulation tiles 1,024 rows.
-  - Partition loops keep their predicate in registers and write through
-    raw pointers.
-  - Parallel split scans take about 2,048 candidates per task.
-  - The two children are evaluated side by side from 4,096 rows.
-- **Data preparation:**
-  - Fully present 64-row blocks are binned feature by feature.
-  - The sketch merges its summaries as two interleaved branch-free halves.
-  - Unit-weight queues radix-sort bare keys.
+- **Prediction:** lockstep walk steps each lane with `cmp` + `cinc`
+  (`simd::step_if_greater`) — LLVM had compiled the plain select to a
+  branch random rows mispredict ~25% of the time. Keys form branch-free,
+  one row at a time, then scatter to lane slots.
+- **SHAP:** eight rows walk each tree in lockstep, overlapping their `f32`
+  chains. Edge terms and child bases are NEON kernels (LLVM had scalarized
+  the divisions); subtrees return weighted values by value; paths and rows
+  sit feature-major; return edges sum two rows at a time.
+- **Exact:** per-row scan keeps node stats in registers; precomputed
+  incumbent test screens each candidate in ~10 flops; one loop per scan
+  direction with direction as a constant; leaf rows update margins directly.
+- **Histogram:** paired feature scans overlap prefix-sum chains; non-negative
+  Hessians take extremes at endpoints; dense accumulation tiles 1,024 rows;
+  register-resident partition predicates with raw-pointer writes; ~2,048
+  candidates per split-scan task; children evaluated side by side from
+  4,096 rows.
+- **Data prep:** fully present 64-row blocks binned feature by feature;
+  interleaved branch-free sketch merges; bare-key radix sort for
+  unit-weight queues.
 
-Measured on **Apple M3 Max** (macOS 27.0, Rust 1.98.1) on 2026-09-26 UTC,
-before (`35b2cd9`) and after (`c94b0c8`), with eight fixed workloads at 1
-and 8 threads: the median of fifteen fits per case (a fresh `DMatrix`
-inside the timer for training; prediction and SHAP time only the call),
-runs of the two builds interleaved (baseline/optimized/optimized/baseline)
-via a throwaway driver (`HOTLOOP_THREADS`/`RAYON_NUM_THREADS` per thread
-count). Every case's output hash (held-out margins, predictions,
-contributions) is identical between the two builds. Values are the mean of
-the two run medians.
+**Apple M3 Max** (macOS 27.0, Rust 1.98.1), 2026-09-26 UTC, before
+(`35b2cd9`) vs after (`c94b0c8`): eight workloads at 1 and 8 threads,
+median of fifteen fits each (fresh `DMatrix` in the timer for training),
+builds interleaved baseline/optimized/optimized/baseline. Output hashes
+identical; values are the mean of the two run medians.
 
 | Case | Threads | Before (ms) | After (ms) | Speedup |
 |---|---:|---:|---:|---:|
@@ -413,38 +356,28 @@ the two run medians.
 | **Geometric mean (per-thread)** | 8 | **93.7** | **67.1** | **1.40×** |
 | **Geometric mean (all 16)** | | **177.7** | **129.1** | **1.38×** |
 
-Histogram training gains about 1.2× (the previous Neoverse-V3 run measured
-1.15–1.30× on the same shapes; see git history for the replaced table),
-exact about 2.4–2.6× (was 1.94–2.73×), and SHAP contributions about
-1.9–2.0× (was 2.00–2.05×). Prediction differs: this MacBook measures the
-`predict_100k_x30_100trees_depth6` bench shape (a depthwise model through
-the generic lockstep walk, ~1.03–1.08×), which the bench-shaped comparison
-under [Prediction and explanations](#prediction-and-explanations) reports as
-unchanged within binary-layout noise. The replaced table's 4× prediction
-row replayed the `step_if_greater` microbenchmark conditions (random rows
-that mispredict the old branch).
+Hist training ~1.2× (Neoverse-V3 measured 1.15–1.30× on the same shapes),
+exact ~2.4–2.6× (was 1.94–2.73×), SHAP ~1.9–2.0× (was 2.00–2.05×).
+Prediction here is the `predict_100k_x30_100trees_depth6` bench shape
+(depthwise model, generic lockstep walk, ~1.03–1.08×) — unchanged within
+binary-layout noise per [Prediction and explanations](#prediction-and-explanations).
+The old 4× prediction row replayed the `step_if_greater` microbenchmark
+(random rows mispredicting the old branch).
 
 ### Model serialization
 
-The section-table writer sizes each array payload from its iterator and the
-whole container (with the checksum, or the compact bit stream) before
-filling it, and the compact encoder writes its bit stream a byte at a time
-(previously bit by bit) and looks references up by binary search in the
-sorted dictionaries. A parsed `CompactModel` keeps one padded copy of its
-bytes instead of two. The XGBoost importer reads each tree's node arrays in
-place instead of copying six of them into `f64` vectors per tree, and keeps
-category segments as ranges instead of one vector per node. Output bytes
-are unchanged.
+The writer pre-sizes each payload and the whole container before filling;
+the compact encoder emits bytes not bits and binary-searches the sorted
+dictionaries. Parsed `CompactModel` keeps one padded byte copy, not two.
+The XGBoost importer reads node arrays in place (no per-tree `f64` copies)
+and keeps category segments as ranges. Output bytes unchanged.
 
-Measured on the 192-core **AWS Neoverse-V3** host (Rust 1.98.1, bench
-profile) on 2026-09-25 UTC with `scripts/compare_benchmarks.py`
-(baseline/optimized/optimized/baseline, 20 samples, mean of the two run
-medians), `RAYON_NUM_THREADS=1`, while the host ran other jobs (load average
-about 100). The models have 100 trees trained on 20,000 rows × 20 features:
-depth six, and loss-guide growth with up to 255 leaves (compact preorder
-layout). The compact cases come from a throwaway harness with models of that
-shape (as are the UBJSON cases, measured against the previous commit); the
-others are `model_io_100trees_depth6`.
+192-core **AWS Neoverse-V3** (Rust 1.98.1, bench profile), 2026-09-25 UTC,
+`scripts/compare_benchmarks.py` (baseline/optimized/optimized/baseline, 20
+samples, mean of run medians), `RAYON_NUM_THREADS=1`, busy host (load
+~100). Models: 100 trees on 20,000 × 20, depth six and loss-guide (255
+leaves). Compact and UBJSON cases from a throwaway harness of the same
+shape; the rest is `model_io_100trees_depth6`.
 
 | Case | Threads | Before (ms) | After (ms) | Less time |
 |---|---:|---:|---:|---:|
@@ -452,30 +385,22 @@ others are `model_io_100trees_depth6`.
 | `to_compact_bytes`, loss-guide | 1 | 8.909 | 4.406 | 50.5% |
 | `from_xgboost_ubjson`, depth 6 | 1 | 2.450 | 2.191 | 10.6% |
 
-`CompactModel::from_bytes`, compact prediction (unchanged code), the
-native `BoostedModel::to_bytes` / `from_bytes`, and the XGBoost exporters
-(which change only their `base_score` formatting) are unchanged within host
-noise (under 2%); `from_xgboost_json` measured 3.2% faster, at the edge of
-that spread. The native writer is dominated by zstd compression. A variant
-appending every payload to one shared buffer instead measured 14% slower on
-`to_bytes` and was dropped.
+`CompactModel::from_bytes`, compact prediction, native `to_bytes` /
+`from_bytes`, and the XGBoost exporters are unchanged within host noise
+(under 2%; `from_xgboost_json` +3.2%, at the edge of it). The native writer
+is zstd-bound. A shared-buffer writer variant measured 14% slower and was
+dropped.
 
 ### Data preparation
 
-CSR rows are binned straight from the matrix instead of being copied into a
-per-row entry buffer first; the quantile and sketch radix sorts share one
-implementation, whose buckets each cut-building worker reuses across its
-columns (and which returns at once for fewer than two values); sketch merges
-swap buffers instead of copying the merged summary back; CSR cut
-construction takes each column's count from the column view; the text
-loaders read every line into one reused buffer. Cut values and bins are
-unchanged.
+CSR rows bin straight from the matrix (no per-row entry copy); quantile and
+sketch radix sorts share one implementation with per-worker reusable
+buckets; sketch merges swap buffers; CSR cut counts come from the column
+view; text loaders reuse one line buffer. Cuts and bins unchanged.
 
-Measured like the serialization cases above (192-core Neoverse-V3 under
-load, `scripts/compare_benchmarks.py`) against the previous commit. The index
-and cut cases are `data_prep_100k_x30` (20 samples); the loader cases parse
-1,000,000 rows × 20 features from memory in a throwaway harness, against the
-same source with `BufRead::lines` (10 samples).
+Same host/method as serialization, vs the previous commit.
+`data_prep_100k_x30` (20 samples); loaders parse 1M × 20 from memory vs
+`BufRead::lines` (10 samples).
 
 | Case | Threads | Before (ms) | After (ms) | Less time |
 |---|---:|---:|---:|---:|
@@ -485,74 +410,57 @@ same source with `BufRead::lines` (10 samples).
 | `HistCuts::from_dmatrix`, dense | 16 | 4.353 | 4.282 | 1.6% |
 | `read_csv`, 1M rows | 1 | 454.9 | 436.4 | 4.1% |
 
-The dense cut gain is small but repeated in both runs of each pair
-(1.3%/1.3% single-threaded, 1.4%/1.8% at 16 threads). CSR cut construction
-(0.5% and 0.3%, single pairs from −0.03% to 1.1%), dense binning (unchanged
-code), and `read_libsvm` (1.5% slower on the 1M-row file) are unchanged
-within host noise. Two further candidates measured slower and were dropped:
-validating categorical columns of CSR input in one pass over the stored
-entries (10% slower when the categorical columns lead each row, where the
-per-column search stops early), and a reused per-worker `(sum, count)` buffer
-for ordered target statistics (17% slower than allocating two zeroed vectors
-per column).
+Dense cuts repeat in both runs of each pair (+1.3%/+1.3% at 1 thread,
++1.4%/+1.8% at 16). CSR cut construction, dense binning, and `read_libsvm`
+are within noise. Dropped as slower: one-pass CSR categorical validation
+(10% slower when categorical columns lead), a reused `(sum, count)` buffer
+for target stats (17% slower).
 
 ### Training rounds
 
-Under `approx` with a non-constant Hessian, every tree of an output's forest
-(`num_parallel_tree > 1`) weights its per-round cuts by the same gradients
-(one row sample, and under gradient-based sampling one gradient sample,
-serves the whole forest), so each output's gradient index is now built
-once per round instead of once per tree, and the weighted sketch reads the
-Hessians in place. The parallel tree loop also gathers each output's
-gradients once. Trained models are unchanged.
+Under `approx` with a non-constant Hessian, every tree of an output's
+forest (`num_parallel_tree > 1`) now shares one row/gradient sample and one
+per-round cut weighting per output — the gradient index builds once per
+round, not once per tree, and the weighted sketch reads Hessians in place.
+Models unchanged.
 
-Measured like the cases above against the previous commit, on 50,000
-rows × 20 features, 20 rounds, depth 6, in a throwaway harness
-(`binary:logistic`, `tree_method = approx`, `num_parallel_tree = 4`).
+Same host/method vs the previous commit: 50,000 × 20, 20 rounds, depth 6,
+`binary:logistic`, `approx`, forest of 4, throwaway harness.
 
 | Case | Threads | Before (ms) | After (ms) | Less time |
 |---|---:|---:|---:|---:|
 | `approx` logistic forest of 4 | 1 | 2896.9 | 981.7 | 66.1% |
 | `approx` logistic forest of 4 | 16 | 223.6 | 107.5 | 52.0% |
 
-With `linear_tree`, the histogram builder's final row partition now feeds
-the linear-leaf fit (and, when every row took part, the training margin
-update through the leaf models) instead of routing every training row
-through the new tree again, when no training row has a zero weight. Then
-every training value was sketched, so each leaf sees the rows routing gives
-it, in the same ascending order, and the fitted models are unchanged. A
-zero-weight row's value can lie beyond the last cut, where the builder and
-the tree place it differently, so with zero weights the linear leaves route
-every row as before.
+With `linear_tree` and no zero-weight rows, the builder's final partition
+feeds the linear-leaf fit (and the margin update through the leaf models)
+instead of re-routing every row through the new tree. Every value was
+sketched, so each leaf sees the same rows in the same order; models
+unchanged. Zero weights keep the old routing (a zero-weight row can sit past
+the last cut, where builder and tree disagree).
 
 | Case | Threads | Before (ms) | After (ms) | Less time |
 |---|---:|---:|---:|---:|
 | `train_variants_50k_x20_20rounds/linear_tree` | 1 | 223.8 | 139.0 | 37.9% |
 | `train_variants_50k_x20_20rounds/linear_tree` | 16 | 35.0 | 27.8 | 20.5% |
 
-`train_variants_50k_x20_20rounds` (DART, CSR, `approx_forest4` with
-squared error, eval sets, vector leaves, one tree per output) is unchanged
-within host noise. Three candidates were dropped: a dense scratch row for
-the margin updates on CSR data (12% slower single-threaded on 20-feature
-rows, where the row scans it replaces are short), extending the cached
-prediction layout per new tree instead of rebuilding it (every training run
-builds the layout for its initial margins, so the extension added about 2%
-to all variants, and DART's own rebuild does not measure), and writing the
-gradient-based sample in place (no gain).
+The other `train_variants_50k_x20_20rounds` cases (DART, CSR, `approx`
+forests, eval sets, vector leaves, one-tree-per-output) are within noise.
+Dropped as slower or flat: a dense CSR margin scratch row (+12% at 1
+thread), extending the cached prediction layout per tree (+2% everywhere),
+in-place gradient sampling (no gain).
 
 ### Prediction and explanations
 
-The single-row compact walk keeps the keys of rows with up to 128 features
-on the stack instead of allocating a buffer per call, the compact layout is
-built by one breadth-first ordering plus a per-node encoder, gblinear
-margins are computed in parallel over rows (each row keeps its addition
-order), and SHAP takes each output's tree of a vector-leaf model straight
-from the leaf vectors instead of cloning the whole tree per output.
-Predictions and attributions are unchanged.
+Single-row compact walk keeps ≤128-feature keys on the stack; compact
+layout builds in one breadth-first pass; gblinear margins parallelize over
+rows in order; vector-leaf SHAP reads each output's tree from the leaf
+vectors instead of cloning per output. Predictions and attributions
+unchanged.
 
-Measured like the cases above against the previous commit, in a throwaway
-harness on the `predict_100k_x30_100trees_depth6` model shape (100
-depth-six trees over 30 features; gblinear on 100,000 rows × 30 features).
+Same host/method vs the previous commit, throwaway harness:
+`predict_100k_x30_100trees_depth6` shape (100 depth-six trees, 30 features;
+gblinear on 100,000 × 30).
 
 | Case | Threads | Before (ms) | After (ms) | Less time |
 |---|---:|---:|---:|---:|
@@ -562,32 +470,24 @@ depth-six trees over 30 features; gblinear on 100,000 rows × 30 features).
 | `predict_contribs`, vector leaves, 1 row | 1 | 0.405 | 0.391 | 3.5% |
 | gblinear `predict_margin`, 100k rows | 16 | 6.581 | 0.717 | 89.1% |
 
-Batch prediction (`predict_100k_x30_100trees_depth6`,
-`predict_csr_100trees_depth6`), SHAP (`shap_x20_100trees_depth6`),
-single-threaded gblinear, and conformal calibration are unchanged: their
-hot loops are the same code, and their differences (within about ±4%, in
-both directions across rebuilds) are binary layout. Two builds of the
-previous commit's prediction code, differing only in unrelated training
-code, measured the depthwise case at 140.0 ms and 132.8 ms. Sharing the
-block tail walk between the generic and symmetric kernels was dropped: it
-made quantile prediction 4.6% and symmetric prediction 2.2% slower in the
-same build comparison.
+Batch prediction, SHAP, single-threaded gblinear, and conformal calibration
+are unchanged — same hot loops, deltas within ±4% binary-layout noise (two
+builds of the old code differing only in unrelated training code measured
+140.0 vs 132.8 ms). A shared block-tail walk for generic and symmetric
+kernels was dropped (+4.6% quantile, +2.2% symmetric).
 
 ### Categorical and sparse partitions
 
-Categorical splits used to route every row through a per-row bin lookup and a
-scan of the category set, and indexes without a column copy (sparse, less than
-half full) through an out-of-line per-row lookup, serially. Both now use the
-branch-free partition loop (see [Implementation](#implementation)); every row
-goes where its bin decides, so trees are unchanged (a unit test compares every
-layout with per-row routing).
+Categorical splits and sub-half-full indexes used to partition serially
+through per-row lookups; both now use the branch-free partition loop
+([Implementation](#implementation)) keyed off the bin, so trees are
+unchanged (unit-tested vs per-row routing).
 
-Measured on the 192-core **AWS Neoverse-V3** host (Rust 1.98.1, bench profile)
-on 2026-09-25 UTC with `scripts/compare_benchmarks.py` (Criterion medians,
-baseline/optimized/optimized/baseline; 10 samples per run, except
-`hist_tree_build/missing`, whose benchmark group sets 100), before and after
-this change, applied to the benchmark-coverage commit (without the changes
-described above). The host ran other jobs at the same time.
+192-core **AWS Neoverse-V3** (Rust 1.98.1, bench profile), 2026-09-25 UTC,
+`scripts/compare_benchmarks.py` (medians,
+baseline/optimized/optimized/baseline; 10 samples, 100 for
+`hist_tree_build/missing`), before/after on the benchmark-coverage commit,
+busy host.
 
 | Case | Threads | Before (ms) | After (ms) |
 |---|---:|---:|---:|
@@ -602,25 +502,20 @@ described above). The host ran other jobs at the same time.
 | 4,000-category feature, 50k rows, depth 10, 20 rounds | 1 | 985.2 | 155.7 |
 | 4,000-category feature, 50k rows, depth 10, 20 rounds | 16 | 903.3 | 67.4 |
 
-Dense numeric and half-full cases take unchanged code; their differences are
-host noise. The 4,000-category case comes from a throwaway harness (one
-categorical and three numeric features, `max_bin = 4096`, single timed runs):
-a split's per-bin left-set table marks each left category's bin (a binary
-search per category) instead of testing every bin against the whole set.
+Dense numeric and half-full cases run unchanged code — host noise. The
+4,000-category throwaway (one categorical + three numeric features,
+`max_bin = 4096`, single runs): each split builds a per-bin left-set table
+(binary search per category) instead of testing every bin against the set.
 
 ### Objective gradients
 
-Poisson, Gamma, and Tweedie gradients now run their vector kernels in the
-same fixed row chunks as the logistic and softmax gradients; LambdaRank
-computes its query groups in parallel (each query writes only its own rows);
-AFT evaluates each row's endpoint densities once for its gradient and
-Hessian; and expectile gradients rebuild each row's expectiles once instead
-of once per output. Every gradient keeps its arithmetic and order, so the
-values are unchanged (unit tests compare the chunked and parallel paths with
-the serial ones bit for bit).
+Count gradients share the logistic/softmax fixed row chunks; LambdaRank
+parallelizes over query groups (disjoint row writes); AFT evaluates each
+row's endpoint densities once; expectile gradients rebuild each row's
+expectiles once, not once per output. Arithmetic and order unchanged
+(bit-for-bit vs serial, unit-tested).
 
-Measured like the partition changes above (same host and method, the
-`objective_gradient` and `objective_gradient_other` groups), before and after:
+Same host/method (`objective_gradient`, `objective_gradient_other`):
 
 | Case | Threads | Before (ms) | After (ms) |
 |---|---:|---:|---:|
@@ -637,19 +532,16 @@ Measured like the partition changes above (same host and method, the
 | `expectile_a3_1m_outputs` | 1 | 19.340 | 11.091 |
 | `expectile_a3_1m_outputs` | 16 | 1.446 | 0.837 |
 
-Single-threaded Poisson and LambdaRank gradients run unchanged serial code;
-their differences are host noise.
+Single-threaded Poisson/LambdaRank run the serial code — host noise.
 
 ### Evaluation metrics
 
-AUC, AUCPR, the ranking metrics without query groups, and `cox-nloglik`
-sort their rows with rayon's stable parallel merge sort once they are long,
-which yields the same order as the serial stable sort; NDCG, MAP, and
-`pre@k` score their query groups in parallel and reduce the scores in group
-order; and `aft-nloglik` and `interval-regression-accuracy` compute their row
-values in parallel and sum them in row order. Values are unchanged (a unit
-test compares 4 threads with 1 bit for bit); serial evaluation keeps its
-loops. Measured like the changes above (`eval_metric_other`):
+AUC, AUCPR, ungrouped ranking metrics, and `cox-nloglik` sort once via
+rayon's stable parallel merge sort (same order as serial); NDCG/MAP/`pre@k`
+score groups in parallel and reduce in group order; `aft-nloglik` and
+`interval-regression-accuracy` parallelize row values and sum in row order.
+Values unchanged (bit-for-bit 4-vs-1 threads, unit-tested); serial paths
+keep their loops. Same host/method (`eval_metric_other`):
 
 | Case | Threads | Before (ms) | After (ms) |
 |---|---:|---:|---:|
@@ -672,18 +564,15 @@ loops. Measured like the changes above (`eval_metric_other`):
 | `cox-nloglik_100k` | 1 | 1.509 | 1.533 |
 | `cox-nloglik_100k` | 16 | 1.506 | 1.115 |
 
-Single-threaded AUC, AUCPR, ranking, interval-accuracy, and Cox evaluation
-run unchanged serial code; their differences are host noise.
+Single-threaded paths run the serial code — host noise.
 
 ## Implementation
 
-The private `simd` module owns dispatch and numerical kernels. AArch64 checks
-NEON support and x86-64 checks AVX2+FMA support once per process and caches
-the result. Other architectures use scalar Rust; no target-specific build
-flags are required. Dispatch checks the
-slice lengths before entering an unsafe kernel, and vector loads and stores
-stay within complete blocks. Scalar formulas are shared by whole-input
-fallbacks, exceptional blocks, and tails.
+The private `simd` module owns dispatch and kernels. AArch64 checks NEON
+once per process, x86-64 checks AVX2+FMA once; the result is cached.
+Everything else is scalar Rust, no target flags needed. Dispatch checks
+lengths before entering an unsafe kernel; vector traffic stays in complete
+blocks. Scalar formulas serve fallbacks, exceptional blocks, and tails.
 
 | Operation | NEON path |
 |---|---|
@@ -695,112 +584,88 @@ fallbacks, exceptional blocks, and tails.
 | Multiclass log loss | Gathered label probabilities with `f64` logarithms |
 | Multiclass error, 8+ classes | Vector row maxima |
 
-Most kernels require at least 16 input elements. Softmax with 5–7 classes uses
-the scalar path. The `f32` exponential uses range reduction and a degree-seven
-polynomial for finite inputs in `[-80, 80]`; other inputs use `f32::exp`.
-Softmax subtracts the row maximum and falls back for nonfinite rows or a margin
-spread above 80. The exponential uses Estrin evaluation for gradients and
-small-class softmax, and Horner evaluation for wide in-place softmax. Metric
-logarithms and Tweedie exponentials use `f64` throughout.
+Minimum 16 elements for most kernels; 5–7-class softmax stays scalar. The
+`f32` exp is range reduction plus a degree-seven polynomial on finite
+`[-80, 80]`, `f32::exp` elsewhere; softmax subtracts the row max and bails
+on nonfinite rows or margin spread above 80. Estrin evaluation for
+gradients and narrow softmax, Horner for wide in-place softmax. Metric logs
+and Tweedie exps stay `f64`.
 
 Depthwise growth expands nodes and draws child feature samples in traversal
-order, then partitions rows, builds histograms, and evaluates the independent
-nodes in parallel. A wide node also splits its numeric split scans into
-feature chunks that run in parallel; each feature's best candidate is merged
-in feature order with XGBoost's tie rule, which is the sequential result.
-Loss-guide growth retains its priority-queue ordering: node ids, statistics,
-and sampler draws follow the queue, but without per-level or per-node column
-sampling the children of the queue's next best nodes are built ahead of their
-turn, in parallel. The trees of one iteration (one per class, or a
-`num_parallel_tree` forest) are grown concurrently once their RNG draws are
-taken in slot order. The exact method scans a level's features in parallel
-the same way.
+order, then partitions, histograms, and evaluates independent nodes in
+parallel. Wide nodes also split numeric scans into parallel feature chunks,
+merged in feature order under XGBoost's tie rule — the sequential result.
+Loss-guide keeps priority-queue order (ids, stats, sampler draws), building
+the next-best children ahead of turn in parallel unless per-level/per-node
+column sampling is on. One iteration's trees (per class, or a
+`num_parallel_tree` forest) grow concurrently after slot-ordered RNG draws.
+Exact scans a level's features in parallel the same way.
 
-Split scoring is batched per feature. Prefix sums are formed in bin order,
-then every candidate is scored by an `f32` closed form `G · (G / (H + λ))`
-per child that vectorizes; only candidates within `2^-16` (relative) of the
-best approximation, twice the derived rounding bound times an order of
-magnitude, are scored exactly, in order. Configurations the bound does not
-cover (monotone constraints, `alpha`, `max_delta_step`, reuse penalties,
-non-finite statistics) score every candidate exactly, still batched. The
-exact method skips candidates a division-free bound shows cannot beat the
-incumbent. `tree::builder::tests` checks both against the sequential search.
+Split scoring batches per feature: prefix sums in bin order, then an `f32`
+closed form `G · (G / (H + λ))` per child that vectorizes. Only candidates
+within `2^-16` relative of the best approximation re-score exactly, in
+order; monotone/`alpha`/`max_delta_step`/reuse-penalty/non-finite
+configs score everything exactly, still batched. Exact skips candidates a
+division-free bound rules out. `tree::builder::tests` checks both against
+sequential search.
 
-Histogram accumulation over a contiguous row range (the root) sweeps the
-column-major bin copy two features at a time, one writer per bin. Other row
-subsets of datasets up to 2^18 rows are gathered per feature pair from the
-same copy, so no partial histograms are allocated or reduced; every bin
-receives its rows in ascending order. Sparse indexes and larger datasets split
-a node of 8,192 or more rows into `n / 4,096` fixed blocks, each summed from
-zero into a partial histogram, built one wave per worker count at a time and
-added in block order, so the sums depend on the rows, never on the thread
-count (serial builds sum the same blocks). Row sweeps load four of a row's
-bins (distinct features) before storing them. At 8 threads the fixed blocks
-cost about 5% on the 50k-row `missing` tree build (12 blocks where 8 tasks
-ran before) and nothing measurable on the 1M-row one.
+The root sweeps the column-major bin copy two features at a time, one
+writer per bin. Other subsets up to 2^18 rows gather per feature pair from
+the same copy — no partial histograms, rows ascending per bin. Larger nodes
+(8,192+ rows, sparse or big) split into `n / 4,096` fixed blocks, each
+summed from zero and added in block order, one wave per worker count — sums
+depend on rows, never thread count (serial sums the same blocks). Row
+sweeps prefetch four bins before storing. At 8 threads the fixed blocks
+cost ~5% on the 50k-row `missing` build, nothing measurable at 1M rows.
 
-Leaves at `max_depth` need no histograms or split searches. With full row
-sampling, training retains their final row partitions (depthwise,
-loss-guided, and exact) and adds the finalized leaf values directly to cached training
-margins. Sampled training and evaluation datasets update independent rows in
-parallel, skipping small inputs where task overhead would dominate. Leaf
-statistics, monotone bounds, and column-sampler draws are preserved.
+Leaves at `max_depth` skip histograms and split search. Under full row
+sampling, training keeps their final partitions (depthwise, loss-guide,
+exact) and adds leaf values straight into cached margins. Sampled and eval
+sets update disjoint rows in parallel, skipping inputs too small to
+parallelize. Stats, monotone bounds, and sampler draws preserved.
 
-Quantile cuts are sorted independently by feature, and rows are binned in
-parallel chunks. Without sample weights the sketch's queue is radix-sorted
-(its weights are whole numbers, so equal values sum identically in any
-order). Large dense inputs are validated and copied in parallel. Ordered
-collection preserves the cut layout, row order, missing-value handling,
-categorical bins, and the choice of 16- or 32-bit bin storage. A sparse index
-at least half full also keeps a column-major copy with a missing sentinel,
-so partitions stream one column; categorical splits stream the same columns
-through a per-bin table of the left category set. Sparser indexes route each
-row by scanning its stored bins inline, in fixed row-order chunks in parallel
-for large nodes. This scheduling is independent of the CPU architecture.
+Cuts sort per feature; rows bin in parallel chunks. Unweighted sketch
+queues radix-sort (whole-number weights sum identically in any order).
+Large dense inputs validate and copy in parallel. Collection preserves cut
+layout, row order, missing handling, categorical bins, and 16/32-bit bin
+choice. Half-full-or-denser sparse indexes keep a column-major copy with a
+missing sentinel for single-column streaming (categorical splits stream the
+same columns through a per-bin left-set table); sparser ones scan stored
+bins inline, in parallel row-order chunks for large nodes. Architecture-independent.
 
 ### Prediction
 
-`BoostedModel` lazily derives a prediction layout of the ensemble on first use
-and drops it whenever a tree is appended; it is never serialized. Every tree is
-renumbered breadth-first into one 16-byte-node arena so that the two children
-of a node are adjacent, and each numeric split is stored as a single ordered
-compare that is false for missing values: splits whose missing values go left
-store the next-lower threshold, splits whose missing values go right store
-mirrored children, a negated threshold, and a sign mask applied to the feature
-value. Leaves point at themselves. A traversal step is therefore a node load, a
-feature load, an XOR, a compare, and an add, with no data-dependent branch.
-Sixteen rows are walked in lockstep for a fixed number of levels (the tree
-depth), and batches of fewer than sixteen rows walk sixteen trees in lockstep
-instead. Rows are processed in 256-row blocks in parallel; each block stores
-its full sixteen-row groups feature-major (`[group][feature][lane]`) so a
-lane's value is an immediate offset from the group's feature base and the
-kernel needs no per-lane address registers. Within a block the trees are
-summed in order, so results match the sequential sum bit for bit. CSR rows and
-dense matrices with a non-`NaN` missing sentinel are scattered straight into
-that layout per block; matrices wider than 4,096 sparse columns use per-lookup
-access. Categorical splits and trees deeper than 16 levels use an early-exit
-walk. The kernel runs at roughly six instructions per cycle on a Neoverse V3
-and is bound by instruction issue, not memory.
+`BoostedModel` derives a prediction layout lazily on first use, drops it
+when a tree is appended, never serializes it. Each tree is renumbered
+breadth-first into a 16-byte-node arena with adjacent children; each
+numeric split becomes one ordered compare that is false for missing (left-
+missing stores the next-lower threshold; right-missing mirrors children and
+stores a negated threshold plus sign mask; leaves self-loop). One step: node
+load, feature load, XOR, compare, add — no data-dependent branch. Sixteen
+rows walk in lockstep for the tree depth; batches under sixteen rows walk
+sixteen trees in lockstep instead. 256-row blocks run in parallel, each
+block's sixteen-row groups stored feature-major (`[group][feature][lane]`);
+trees sum in order, bit-identical to sequential. Non-`NaN` sentinels scatter
+straight in; >4,096 sparse columns use per-lookup access. Categorical
+splits and depth-16+ trees take an early-exit walk. ~6 IPC on Neoverse V3,
+issue-bound.
 
 #### Symmetric trees
 
-Trees in which every internal node of a level carries the same split (grown
-with `grow_policy = symmetric`, or any imported tree of that shape) skip the
-node walk for full sixteen-row groups. The layout records each level's split
-as one `(slot, key)` compare and a `2^depth` table of leaf ids and values
-indexed by the bit pattern of the level outcomes (root most significant);
-collapsed subtrees fill every slot below them. A level is one contiguous
-16-lane key load compared against a single threshold, which vectorizes and
-carries no dependent load chain. The compares and the leaves reached are the
-generic walk's, so margins and leaf indices are bit-identical (unit-tested);
-tail rows, single-row batches, trees shallower than two levels or deeper than
-16, and tables that would exceed four slots per leaf keep the generic walk.
+Symmetric trees (same split at every node of a level: `grow_policy =
+symmetric`, or any imported tree of that shape) skip the walk for full
+sixteen-row groups. Each level stores one `(slot, key)` compare plus a
+`2^depth` leaf table indexed by the level-outcome bit pattern (root most
+significant); collapsed subtrees fill their slots. One vectorizable 16-lane
+compare per level, no dependent load chain. Same compares and leaves as the
+generic walk, so margins and leaf ids are bit-identical (unit-tested); tails,
+tiny batches, depth < 2 or > 16, and oversized tables keep the generic walk.
 
-`cargo bench --bench training -- predict_100k` predicts 100,000 × 30 rows with
-100 depth-6 trees (`eta = 0.1`, other parameters default). Criterion medians
-on a 192-core **Neoverse V3**, Rust 1.98.1, 2026-09-23, `RAYON_NUM_THREADS`
-fixed per row. The middle column is the same symmetric model with the table
-path disabled (a one-line local change), isolating the kernel:
+`cargo bench --bench training -- predict_100k` on 100,000 × 30 with 100
+depth-6 trees (`eta = 0.1`, rest default). Criterion medians on 192-core
+**Neoverse V3** (Rust 1.98.1, 2026-09-23), `RAYON_NUM_THREADS` fixed. The
+middle column disables the table path (one-line local change) to isolate
+the kernel:
 
 | Threads | Depthwise model (ms) | Symmetric model, generic walk (ms) | Symmetric model, bit pattern (ms) | Speedup, same model |
 |---:|---:|---:|---:|---:|
@@ -808,25 +673,19 @@ path disabled (a one-line local change), isolating the kernel:
 | 16 | 8.63 | 6.57 | 1.03 | 6.4× |
 | 192 | 1.66 | 1.42 | 0.70 | 2.0× |
 
-At full width the per-block row loading and scheduling, which both paths
-share, dominate.
+Shared row loading and scheduling dominate at full width. The 10–20× figure
+vs per-node traversal is an informal spot check from another machine, not a
+recorded artifact.
 
-On a Neoverse V3 core this layout predicts dense, sparse, and multiclass
-batches 10–20× faster than a per-node traversal. That figure is an informal
-spot measurement from a separate machine. It is not part of the recorded
-artifacts in this document.
-
-SHAP values use XGBoost 3.4's QuadratureTreeSHAP. One recursive walk per tree
-carries an 8-lane quadrature basis in `f32` and extracts each return edge's
-contribution from its subtree's return, so contributions cost `O(L · D)` per
-tree and row (`L` leaves, `D` depth) and interactions `O(L · D²)`. Classic
-path-dependent TreeSHAP needs `O(L · D²)` for contributions and repeats a
-conditioned walk per feature for interactions. Each tree's precomputed nodes
-hold both child branch weights, only the tree's split features are cleared
-and accumulated per tree, and rows are processed in parallel. Spot
-measurements on the 192-core Neoverse V3 host (hist, 20 features, 100 trees
-trained on 20,000 rows; mean of 3–5 calls; not part of the Criterion
-artifacts):
+SHAP is XGBoost 3.4's QuadratureTreeSHAP: one recursive walk per tree with
+an 8-lane `f32` quadrature basis, each return edge's contribution read off
+its subtree's return. Contributions `O(L · D)` per tree and row, interactions
+`O(L · D²)` (`L` leaves, `D` depth); classic path-dependent TreeSHAP needs
+`O(L · D²)` for contributions and a conditioned walk per feature for
+interactions. Precomputed nodes hold both branch weights; only the tree's own
+split features are cleared and accumulated; rows run in parallel. Spot
+check on 192-core Neoverse V3 (hist, 20 features, 100 trees on 20,000 rows;
+mean of 3–5 calls, not a Criterion artifact):
 
 | Workload | Threads | Classic TreeSHAP | QuadratureTreeSHAP | Speedup |
 |---|---:|---:|---:|---:|
@@ -841,38 +700,31 @@ artifacts):
 
 ## Numerical behavior and validation
 
-Objective outputs remain `f32`; metrics and histogram statistics accumulate
-in `f64`. SIMD reductions and polynomial evaluation can change rounding, so
-cross-architecture predictions are not promised to be bit-identical. Repeated
-training with the same inputs, parameters, seed, and execution configuration
-remains deterministic.
+Objectives output `f32`; metrics and histogram stats accumulate `f64`. SIMD
+rounding means cross-architecture results aren't bit-identical. Same
+inputs, params, seed, and execution config still trains deterministically.
 
-SHAP values follow XGBoost 3.4.2's arithmetic: the quadrature rule is built in
-`f64` and stored as `f32`, the recurrence and every accumulation are `f32` in
-XGBoost's order (categorical children are walked in XGBoost's orientation),
-and each tree's expected value is summed in `f64` and rounded once. XGBoost's
-aarch64 builds contract `a * b + c` into fused multiply-adds while its x86_64
-wheels do not, and hessboost mirrors this per target, so imported models
-reproduce XGBoost's contributions and interaction values bit for bit on the
-parity fixtures (checked on aarch64 Linux). The unfused arithmetic stays
-within 2e-5 of the fused one on the same fixtures. The 8-point rule is exact
-for paths with at most seven distinct features; longer paths are the same
-quadrature approximation XGBoost computes.
+SHAP mirrors XGBoost 3.4.2's arithmetic: quadrature rule built in `f64`,
+stored `f32`; recurrence and accumulations `f32` in XGBoost's order
+(categorical children in XGBoost's orientation); per-tree expected value
+summed in `f64`, rounded once. aarch64 XGBoost fuses `a * b + c`, x86_64
+wheels don't; hessboost matches per target, so imported models reproduce
+XGBoost's contributions and interactions bit for bit on the parity fixtures
+(aarch64 Linux). Unfused stays within 2e-5 of fused there. The 8-point rule
+is exact up to seven distinct path features; longer paths are XGBoost's own
+quadrature approximation.
 
-The test suite compares kernels against scalar formulas, including short
-inputs, vector tails, optional weights, saturation, NaNs, infinities, and
-softmax ties. Gradient checks use `1e-6 * max(1, |reference|)`; metric checks use
-relative tolerances between `1e-12` and `3e-12` for their finite test datasets.
-Split tests check candidate order and the sequential gain epsilon. These are
-test tolerances, not universal error bounds for arbitrary inputs.
+Kernels are tested against scalar formulas (short inputs, tails, weights,
+saturation, NaN/inf, softmax ties). Gradient tolerance `1e-6 * max(1,
+|reference|)`; metrics `1e-12`–`3e-12` relative on finite fixtures; split
+tests check order and the sequential gain epsilon. Test tolerances, not
+general error bounds.
 
 ## Metal GPU (macOS)
 
-The `metal` feature adds a native Metal backend (see `src/backend/metal.rs`
-for its design, determinism contract, and limitations). Measured on **Apple
-M4 Max** (40-core GPU, 14 performance+efficiency CPU cores, macOS 26.6.2,
-Rust 1.98.1, 2026-09-24), `cargo bench --features metal --bench training --
-metal` and `cargo run --release --features metal --example metal`:
+The `metal` feature adds a native Metal backend (`src/backend/metal.rs` has
+the design and determinism contract). **Apple M4 Max** (40-core GPU, 14 CPU
+cores, macOS 26.6.2, Rust 1.98.1, 2026-09-24):
 
 | Workload | CPU | Metal | Speedup |
 |---|---|---|---|
@@ -881,27 +733,20 @@ metal` and `cargo run --release --features metal --example metal`:
 | hist build, 1M rows × 30 features (root node)\* | 2.0 ms | 11.2 ms | 0.18× |
 | train, 200k × 30, depth 8, 50 rounds\* | 278 ms | 501 ms | 0.56× |
 
-\* Measured with the earlier double-float histogram kernels. The current
-integer kernels have not been measured yet.
+\* Old double-float histogram kernels; the current integer kernels are unmeasured.
 
-GPU **prediction** is the speed path: the per-row walk is independent, the
-compact forest stays L2-resident, and the fixed per-call row upload
-amortizes as batches and ensembles grow (the 200-tree example measures
-2.5×; larger models widen the gap).
+GPU **prediction** is the win: independent per-row walks, L2-resident
+compact forest, fixed upload cost amortized over bigger batches and
+ensembles (2.5× at 200 trees; larger models widen it).
 
-GPU **histogram construction** (`device = metal`) was slower than the
-14-core CPU path with the double-float kernels. The determinism contract
-(bit-identical to single-threaded CPU training, no floating-point atomics)
-plus Apple GPUs' lack of `double` forced an exact double-float (two-sum)
-accumulation at roughly six times the arithmetic of the CPU's native `f64`
-adds, and the single-writer-per-bin layout routes row/column/gradient loads
-through the GPU's scalar path. The current kernels sum 64-bit integers
-instead (one add per component, but 16-byte gradient pairs instead of 8),
-for every node whose sums the CPU's `f64` adds compute exactly; other
-nodes run on the CPU. Wider feature blocks and cooperative
-(threadgroup-memory) loading are the known tuning directions; measured
-attempts with the double-float kernels (wider blocks up to 1024 threads,
-interleaved `uint4` records) regressed.
+GPU **histograms** (`device = metal`) trailed the 14-core CPU path under the
+double-float kernels. Bit-identical training without FP atomics, on GPUs
+without `double`, meant exact two-sum accumulation (~6× the CPU's native
+`f64` adds) with a single-writer-per-bin layout stuck on the scalar path.
+Current kernels sum 64-bit integers (one add per component, 16-byte pairs)
+wherever the CPU's `f64` sums are exact, else CPU fallback. Wider blocks
+and threadgroup-memory loading are the known next steps; tried variants
+(up to 1024 threads, interleaved `uint4`) regressed.
 
 Run the Metal benches on a Mac with a Metal device:
 
@@ -910,41 +755,32 @@ cargo bench --features metal --bench training -- metal
 cargo run --release --features metal --example metal
 ```
 
-Hosted macOS CI runners have no Metal device; the device-dependent tests
-skip there and run on real hardware.
+Hosted macOS CI has no Metal device: those tests skip there.
 
 ## Reproduce the measurements
 
-The benchmark definitions live in
-[`benches/training.rs`](../benches/training.rs). To run the
-suite on the current checkout:
+Benchmarks live in [`benches/training.rs`](../benches/training.rs). Run the
+suite on the current checkout with:
 
 ```sh
 RAYON_NUM_THREADS=1 cargo bench --bench training
 ```
 
-The quantized-gradient rows use the `*_quantized` cases of
-`hist_tree_build` and the `Hist_quantized` / `quantized` training cases.
+The quantized-gradient rows use the `*_quantized` cases of `hist_tree_build`
+and the `Hist_quantized` / `quantized` training cases.
 
-Groups without recorded results cover the remaining paths for comparisons
-with `scripts/compare_benchmarks.py`: `objective_gradient_other` (absolute
-error, alpha lists, label matrices, AFT, Cox, LambdaRank), `eval_metric_other`
-(AUC/AUCPR incl. label matrices, NDCG/MAP/`pre@k`, elementwise, quantile,
-survival, `dist:*` NLL/CRPS), `train_variants_50k_x20_20rounds` (sampling and
-constraints, categorical, exact, `approx` forests, DART, CSR input, vector
-leaves, symmetric, `extra_trees`, `path_smooth`, `linear_tree`, reuse
-penalties, eval sets, budget mode), `predict_csr_100trees_depth6`,
-`model_io_100trees_depth6`, `data_prep_100k_x30`, and the `sparse` case of
-`histogram_build`.
+Unrecorded groups exist for `scripts/compare_benchmarks.py` coverage:
+`objective_gradient_other`, `eval_metric_other`, the rest of
+`train_variants_50k_x20_20rounds`, `predict_csr_100trees_depth6`,
+`model_io_100trees_depth6`, `data_prep_100k_x30`, and `histogram_build`'s
+`sparse` case.
 
-To regenerate the charts in this guide from the `.dat` files after updating
-the tables, run:
+Charts regenerate from the `.dat` files with:
 
 ```sh
 gnuplot -c docs/benchmarks/charts.gp
 ```
 
-To compare two builds of the benchmark binary, use
-`scripts/compare_benchmarks.py`; see
-[Development scripts](../scripts/README.md) for it, the XGBoost quality
-fixtures, and the XGBoost timing harness.
+Build-to-build comparison uses `scripts/compare_benchmarks.py`; see
+[Development scripts](../scripts/README.md) for it, the quality fixtures,
+and the timing harness.

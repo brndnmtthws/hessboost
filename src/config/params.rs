@@ -273,10 +273,10 @@ stored_names! {
 
 /// The complete training configuration.
 ///
-/// Construct with [`TrainingParams::builder`] or start from
-/// [`TrainingParams::default`] and mutate fields directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+/// Construct with [`TrainingParams::builder`], start from
+/// [`TrainingParams::default`] and mutate fields directly, or parse
+/// XGBoost's flat key/value form with [`TrainingParams::from_xgboost`].
+#[derive(Debug, Clone, PartialEq)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "independent XGBoost/LightGBM switches, not a state machine"
@@ -486,10 +486,6 @@ pub struct TrainingParams {
     /// [`gamma`](Self::gamma); `0` (the default) disables it. The paper's
     /// `toad_penalty_threshold`.
     pub toad_penalty_threshold: f64,
-
-    // ---- Missing value ----
-    /// Value treated as "missing" in dense inputs. Defaults to NaN, like XGBoost.
-    pub missing: f64,
 }
 
 impl Default for TrainingParams {
@@ -548,7 +544,6 @@ impl Default for TrainingParams {
             skip_drop: 0.0,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
-            missing: f64::NAN,
         }
     }
 }
@@ -1013,29 +1008,23 @@ impl TrainingParams {
             .unwrap_or_else(|| default_max_delta_step(&self.objective))
     }
 
-    /// Refuse every field of `self` that differs from `allowed`, comparing
-    /// the serialized configurations so a field added later is covered too
-    /// (budget mode and the refresh updater: `allowed` is the defaults plus
-    /// what they read). The error names `param` and lists the fields after
-    /// `reason`: "`reason`; leave `a`, `b` at the default".
+    /// Refuse every setting of `self` that differs from `allowed` (budget
+    /// mode and the refresh updater: `allowed` is the defaults plus what
+    /// they read). Every field is compared
+    /// ([`TrainingParams::changed_keys`] destructures the whole struct, so a
+    /// field added later is covered too). The error names `param` and lists
+    /// the XGBoost keys after `reason`: "`reason`; leave `a`, `b` at the
+    /// default".
     pub(crate) fn refuse_changes_from(
         &self,
         allowed: &TrainingParams,
         param: &'static str,
         reason: &str,
     ) -> Result<()> {
-        let (Ok(serde_json::Value::Object(set)), Ok(serde_json::Value::Object(allowed))) =
-            (serde_json::to_value(self), serde_json::to_value(allowed))
-        else {
-            return Err(HessboostError::invalid_param(
-                param,
-                "training parameters could not be compared",
-            ));
-        };
-        let changed: Vec<String> = set
-            .iter()
-            .filter(|(key, value)| allowed.get(*key) != Some(*value))
-            .map(|(key, _)| format!("`{key}`"))
+        let changed: Vec<String> = self
+            .changed_keys(allowed)
+            .into_iter()
+            .map(|key| format!("`{key}`"))
             .collect();
         if changed.is_empty() {
             Ok(())
@@ -1558,38 +1547,6 @@ mod tests {
             .unwrap();
         assert_eq!(zero.effective_max_delta_step(), 0.0);
         assert_eq!(TrainingParams::default().effective_max_delta_step(), 0.0);
-    }
-
-    /// Parameters take XGBoost's names on the wire, so JSON
-    /// configurations written for XGBoost deserialize unchanged, and a
-    /// configuration that omits them gets XGBoost's defaults.
-    #[test]
-    fn params_use_xgboost_spellings_and_defaults() {
-        let p: TrainingParams = serde_json::from_str(
-            r#"{"aft_loss_distribution": "extreme", "sampling_method": "gradient_based",
-                "multi_strategy": "multi_output_tree", "process_type": "update",
-                "refresh_leaf": false, "num_parallel_tree": 4,
-                "quantile_alpha": [0.1, 0.9]}"#,
-        )
-        .unwrap();
-        assert_eq!(p.aft_loss_distribution, AftDistribution::Extreme);
-        assert_eq!(p.sampling_method, SamplingMethod::GradientBased);
-        assert_eq!(p.multi_strategy, MultiStrategy::MultiOutputTree);
-        assert_eq!(p.process_type, ProcessType::Update);
-        assert!(!p.refresh_leaf);
-        assert_eq!(p.num_parallel_tree, 4);
-        assert_eq!(p.quantile_alpha, vec![0.1, 0.9]);
-
-        let d: TrainingParams = serde_json::from_str("{}").unwrap();
-        assert_eq!(d.aft_loss_distribution, AftDistribution::Normal);
-        assert_eq!(d.aft_loss_distribution_scale, 1.0);
-        assert_eq!(d.num_parallel_tree, 1);
-        assert_eq!(d.sampling_method, SamplingMethod::Uniform);
-        assert_eq!(d.multi_strategy, MultiStrategy::OneOutputPerTree);
-        assert_eq!(d.process_type, ProcessType::Default);
-        assert!(d.refresh_leaf);
-        assert!(d.quantile_alpha.is_empty() && d.expectile_alpha.is_empty());
-        d.validate().unwrap();
     }
 
     /// A trained model rebuilds its objective from `ObjectiveParams`, so the

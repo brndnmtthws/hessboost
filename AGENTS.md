@@ -105,6 +105,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams|
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, parameter enums, `ObjectiveParams`|
+|`config/xgboost.rs`|XGBoost's flat parameter form: `TrainingParams::from_xgboost`/`to_xgboost` (keys, aliases, value spellings, one-setting options), `changed_keys`|
 |`objective/`|files by XGBoost family; `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`)|
 |`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
@@ -182,8 +183,10 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   opt-in, default off, and absent from fixtures.
 - **Parity-fixed options:** XGBoost options supported at one setting only
   ("Not implemented" in `lib.rs`) are not `TrainingParams` fields;
-  `tests/parity.rs` (`expect_fixed`) fails fixtures that set `updater`,
-  `feature_selector`, or `lambdarank_pair_method` otherwise.
+  `TrainingParams::from_xgboost` (`FIXED` in `config/xgboost.rs`) accepts
+  `updater`, `feature_selector`, `lambdarank_pair_method`,
+  `max_cat_to_onehot`, and `max_cat_threshold` at that setting only, so
+  parity fixtures that set them otherwise fail.
 - **Formats:** every file written since 0.2.0 loads in every later release;
   0.1.x files are refused.
   - Native binary (`model/native.rs`): zstd frame of magic `HBM\0` (0.1.x's
@@ -248,20 +251,22 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   (`ndcg@5`, `pre@3`, `tweedie-nloglik@1.5`), so parity compares names.
 - **Refusals:** unsupported parameters or combinations error, never get
   ignored. Checks live in `TrainingParams::validate` (static),
+  `TrainingParams::from_xgboost` (keys and value spellings),
   `validate_request` in `training/train.rs` (data-dependent),
   `training/multi_output.rs::validate`, `training/continuation.rs`,
   `metric/mod.rs::build` (metric suffixes), and `training/budget.rs`.
   Budget mode and refresh compare params against defaults plus an
-  allow-list (`TrainingParams::refuse_changes_from`), so any new field is
-  refused there automatically.
+  allow-list (`TrainingParams::refuse_changes_from`, over `changed_keys`,
+  which destructures every field), so any new field is refused there
+  automatically.
 - **Python:** `python/` uses only the crate's public API. The public
   Python API is pure Python; the extension is private, fully stubbed
   (stubtest), `unsafe`-free (`forbid`), declares `gil_used = false`, keeps
   every class `frozen`, and releases the GIL around matrix construction,
-  training, prediction, and model encode/decode. Parameter mappings
-  deserialize through `TrainingParams`' serde (XGBoost) names plus the
-  aliases and one-setting options in `python/src/params.rs`, so a new
-  field is accepted automatically and unknown keys are refused. `train`
+  training, prediction, and model encode/decode. Parameter mappings go
+  through `TrainingParams::from_xgboost`, the crate's one XGBoost
+  boundary (also used by `tests/parity.rs` and the `train` fuzz target),
+  so unknown keys are refused. `train`
   runs on a worker thread while the caller polls for signals; Python
   callbacks (objective, metric, per-round) re-attach to the interpreter,
   and the first exception (or Ctrl-C's `KeyboardInterrupt`) stops
@@ -299,7 +304,9 @@ XGBoost export, SHAP, and compact refuse them.
 In the same change, update the touched items' rustdoc, the README's
 feature lists and caveats, `lib.rs` "What's here" and "Not implemented",
 this file, and affected examples. New options need a `TrainingParams`
-field, builder setter, and validation.
+field, builder setter, validation, and their key in `config/xgboost.rs`
+(`flat_params!`, `into_params`, `to_xgboost`, `changed_keys`; each
+destructures the struct, so a missing one does not compile).
 
 ## Releases
 

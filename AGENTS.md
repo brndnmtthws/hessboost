@@ -377,10 +377,13 @@ online updates, and needs `eta = 1` with `num_parallel_tree > 1` (BRAT-P); its
 leaves carry the final `1/B` scale, so exports and SHAP see a plain gbtree
 ensemble, and slices drop the `BoulevardInfo`. `booster = ebm` counts every
 tree as an iteration (`num_boost_round` counts EBM rounds, one tree per term
-each), needs one output and numerical features, refuses eval sets, early
-stopping, continuation, column sampling, interaction constraints, forests,
-feature weights, and base margins; `ebm_boulevard` adds Boulevard's refusals plus outer
-bags and `base_score`. Slices and exports drop the `EbmInfo`. Linear-leaf models predict through `tree::linear`;
+each, and caps each stage under `ebm_early_stopping_rounds`, which stops
+every bag on its held-out rows), needs one output, refuses eval sets,
+`Trainer::early_stopping_rounds`, continuation, column sampling,
+interaction constraints, forests, feature weights, and base margins, and
+calls `on_round` after every round of both stages; `ebm_boulevard` adds
+Boulevard's refusals plus outer bags, early stopping, and `base_score`, and
+its loaders check the stage-contiguous round-robin tree layout. Slices and exports drop the `EbmInfo`. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.
 
 ## When changing behavior

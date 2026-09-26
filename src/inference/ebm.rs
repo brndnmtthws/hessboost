@@ -332,11 +332,11 @@ impl<'a> EbmInference<'a> {
         check_alpha(alpha)?;
         self.slot(term)?;
         let shape = shape_functions(self.model)?.terms.swap_remove(term);
-        let cells: Vec<usize> = (0..shape.values.len()).collect();
+        let cells: Vec<usize> = (0..shape.values().len()).collect();
         let standard_errors = self.cell_standard_errors(term, &cells)?;
         let z = z_value(alpha);
         let (lower, upper) = shape
-            .values
+            .values()
             .iter()
             .zip(&standard_errors)
             .map(|(&v, &se)| (v - z * se, v + z * se))

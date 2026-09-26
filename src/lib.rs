@@ -127,7 +127,8 @@
 //!     ([`BoosterKind::Boulevard`](config::BoosterKind::Boulevard),
 //!     [`inference`]);
 //!   - explainable boosting machines (GA²M: cyclic per-feature boosting,
-//!     outer bags, FAST pair terms; Lou et al., KDD 2012/2013, InterpretML)
+//!     early-stopped outer bags, FAST pair terms, numerical and categorical
+//!     terms; Lou et al., KDD 2012/2013, InterpretML)
 //!     with per-term shape functions, and their Boulevard variant (Fang, Tan,
 //!     Pipping & Hooker, AISTATS 2026) with confidence bands on every shape
 //!     ([`BoosterKind::Ebm`](config::BoosterKind::Ebm), [`ebm`],

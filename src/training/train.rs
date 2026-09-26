@@ -577,10 +577,12 @@ impl<'a> Trainer<'a> {
     /// is the Boulevard average of the rounds run so far. For `gblinear`, which stores
     /// no boosting iterations, [`RoundEval::iteration`] counts this run's
     /// rounds from 0. For `booster = ebm` it counts EBM rounds from 0
-    /// through the main-effect stage and on through the pair stage (so
-    /// `2 · num_boost_round` rounds with interactions); a `Break` keeps the
-    /// completed rounds, a stopped main-effect stage gets no pair terms, and
-    /// with interactions the result is then not a shorter run's model.
+    /// through the main-effect stage and on through the pair stage (up to
+    /// `num_boost_round` each, fewer once every bag has early-stopped); a
+    /// `Break` keeps the completed rounds (each bag's best ones under
+    /// `ebm_early_stopping_rounds`), a stopped main-effect stage gets no
+    /// pair terms, and with interactions the result is then not a shorter
+    /// run's model.
     ///
     /// Observing never changes the model: training with a hook that always
     /// continues gives the same result as training without one.

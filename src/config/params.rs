@@ -192,6 +192,9 @@ pub(crate) const MAX_NUM_PARALLEL_TREE: usize = 1 << 16;
 /// over the training rows while the bags train.
 pub(crate) const MAX_EBM_OUTER_BAGS: usize = 1024;
 
+/// Default [`TrainingParams::ebm_early_stopping_tolerance`] (InterpretML's).
+const EBM_EARLY_STOPPING_TOLERANCE: f64 = 1e-5;
+
 /// Per-feature monotonicity direction: XGBoost's `-1`/`0`/`1`, a complete
 /// set, so it can be matched exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -440,6 +443,23 @@ pub struct TrainingParams {
     /// only, with Boulevard's refusals. `false` (the default) is the
     /// classic cyclic EBM. Must be `false` with any other booster.
     pub ebm_boulevard: bool,
+    /// Early stopping of every outer bag of a classic `booster = ebm` on
+    /// its own held-out rows (the `1 − ebm_bag_fraction` it does not train
+    /// on), after InterpretML: after every tree the bag scores its
+    /// held-out rows with the last eval metric (`eval_metric`, else the
+    /// objective's default), stops once no tree of the last
+    /// `ebm_early_stopping_rounds × terms` improved on the best score before
+    /// them by the tolerance, and keeps its trees up to its best score. Each
+    /// stage (main effects, pairs) stops separately; `num_boost_round` is
+    /// the most rounds a stage runs. `0` (the default) is off. Needs
+    /// `ebm_bag_fraction < 1`; refused with `ebm_boulevard`.
+    pub ebm_early_stopping_rounds: usize,
+    /// The relative improvement `ebm_early_stopping_rounds` requires
+    /// (InterpretML's `early_stopping_tolerance`, a fraction of the best
+    /// score so far; negative values let each bag overfit a little, which
+    /// averaging can offset). Default `1e-5`; only used with
+    /// `ebm_early_stopping_rounds`.
+    pub ebm_early_stopping_tolerance: f64,
 
     // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
     /// Penalty `ι` subtracted from the loss change of a split on a feature the
@@ -539,6 +559,8 @@ impl Default for TrainingParams {
             ebm_outer_bags: 1,
             ebm_bag_fraction: 1.0,
             ebm_boulevard: false,
+            ebm_early_stopping_rounds: 0,
+            ebm_early_stopping_tolerance: EBM_EARLY_STOPPING_TOLERANCE,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
             langevin: None,
@@ -1296,7 +1318,25 @@ impl TrainingParams {
             fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
             format!("must be in (0, 1], got {fraction}"),
         )?;
+        let tolerance = self.ebm_early_stopping_tolerance;
+        ensure(
+            "ebm_early_stopping_tolerance",
+            tolerance.is_finite(),
+            format!("must be finite, got {tolerance}"),
+        )?;
+        if self.ebm_early_stopping_rounds == 0 {
+            ensure(
+                "ebm_early_stopping_tolerance",
+                tolerance == EBM_EARLY_STOPPING_TOLERANCE,
+                "is only used with `ebm_early_stopping_rounds > 0`",
+            )?;
+        }
         if self.booster != BoosterKind::Ebm {
+            ensure(
+                "ebm_early_stopping_rounds",
+                self.ebm_early_stopping_rounds == 0,
+                "is only used by `booster = ebm`; must be 0",
+            )?;
             let only = "is only used by `booster = ebm`";
             ensure(
                 "ebm_interactions",
@@ -1357,6 +1397,18 @@ impl TrainingParams {
             self.sampling_method == SamplingMethod::Uniform,
             "`booster = ebm` samples rows uniformly (`subsample`)",
         )?;
+        if self.ebm_early_stopping_rounds > 0 {
+            ensure(
+                "ebm_early_stopping_rounds",
+                !self.ebm_boulevard,
+                "a Boulevard EBM averages every round, so it cannot stop at a best round",
+            )?;
+            ensure(
+                "ebm_early_stopping_rounds",
+                fraction < 1.0,
+                "each bag stops on the rows it does not train on; set `ebm_bag_fraction < 1`",
+            )?;
+        }
         if !self.ebm_boulevard {
             return Ok(());
         }
@@ -1576,6 +1628,10 @@ impl TrainingParamsBuilder {
         ebm_bag_fraction, f64);
     setter!(/// Boulevard-average the EBM terms for inference (`ebm_boulevard`).
         ebm_boulevard, bool);
+    setter!(/// Set the per-bag EBM early-stopping patience in rounds (`ebm_early_stopping_rounds`, `0` = off).
+        ebm_early_stopping_rounds, usize);
+    setter!(/// Set the EBM early-stopping tolerance (`ebm_early_stopping_tolerance`).
+        ebm_early_stopping_tolerance, f64);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
         num_parallel_tree, usize);
     setter!(/// Set the row subsampling method (`sampling_method`).

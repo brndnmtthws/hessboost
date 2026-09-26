@@ -28,18 +28,29 @@
 //!   round the terms take turns in feature order, each tree fitted to the
 //!   gradients of the model so far (including the round's earlier terms)
 //!   and added with learning rate `eta`. Any single-output objective works;
-//!   the shapes are on the margin scale.
+//!   the shapes are on the margin scale. Categorical features
+//!   ([`DMatrix::with_feature_types`](crate::data::DMatrix::with_feature_types))
+//!   get the builders' native set-membership splits.
 //! - **Outer bags** ([`ebm_outer_bags`](crate::config::TrainingParams::ebm_outer_bags)
 //!   `= B`): each bag boosts every term on its own row sample
 //!   ([`ebm_bag_fraction`](crate::config::TrainingParams::ebm_bag_fraction))
 //!   and the model averages the bags (each bag's trees carry `1/B`). The
 //!   bags train in parallel and are combined in bag order.
+//! - **Early stopping** ([`ebm_early_stopping_rounds`](crate::config::TrainingParams::ebm_early_stopping_rounds)):
+//!   InterpretML's rule. Every bag scores the rows it does not train on
+//!   after every tree, stops a stage once the last `rounds × terms` trees
+//!   failed to beat its best earlier score by
+//!   [`ebm_early_stopping_tolerance`](crate::config::TrainingParams::ebm_early_stopping_tolerance)
+//!   (relative), and keeps its trees up to its best score, so the bags
+//!   stop at different rounds and `num_boost_round` only caps them.
 //! - **Interactions** ([`ebm_interactions`](crate::config::TrainingParams::ebm_interactions)
 //!   `= k`): after the main effects, FAST (Lou, Caruana, Gehrke & Hooker,
 //!   *Accurate intelligible models with pairwise interactions*, KDD 2013)
 //!   ranks every pair of features by the best four-quadrant split of the
 //!   main-effect model's gradients on their histogram bins (`max_bin`
-//!   quantile bins; rows missing either feature sit out), scored as
+//!   quantile bins, one bin per category for categorical features, ordered
+//!   by the category's mean gradient; rows missing either feature sit
+//!   out), scored as
 //!   `Σ_q G_q² / (H_q + lambda) − G² / (H + lambda)`. The top `k` pairs
 //!   (ties by feature order) become terms, boosted with the main effects
 //!   frozen, as InterpretML does.
@@ -57,29 +68,35 @@
 //! # Shape functions
 //!
 //! [`shape_functions`] merges every term's trees into one piecewise-constant
-//! function on the grid the union of their thresholds cuts the term's
-//! features into, missing values included ([`TermShape`]), centered to mean
+//! function on the grid their splits cut the term's features into: the
+//! union of the thresholds of a numerical feature, one cell per category a
+//! split sends left (plus one for every other category) of a categorical
+//! one, and a missing-value cell on each ([`TermShape`], [`TermAxis`]),
+//! centered to mean
 //! zero over the training rows; the intercept collects `base_score` and the
 //! terms' training means, so `intercept + Σ_t shape_t(x)` is the model's
 //! margin.
 //!
 //! # Refusals
 //!
-//! `booster = ebm` needs one output, numerical features, and no
-//! `init_model`, eval sets, or early stopping (the terms of one run are
-//! fixed); it refuses `num_parallel_tree > 1`, column sampling, interaction
+//! `booster = ebm` needs one output and no `init_model`, eval sets, or
+//! `Trainer::early_stopping_rounds` (the terms of one run are fixed; stop
+//! with `ebm_early_stopping_rounds` instead); it refuses `num_parallel_tree > 1`, column sampling, interaction
 //! constraints (the terms fix every tree's features), linear leaves, the
 //! reuse penalties, `process_type = update`, feature weights, and base
 //! margins (the shapes and their centering assume the intercept alone).
 //! With `ebm_boulevard` also everything Boulevard inference refuses
 //! (non-squared-error objectives, row weights, L1 or clipped
 //! leaves, quantized gradients, smoothed leaves, gradient-based sampling),
-//! outer bags, and `base_score`. See
+//! outer bags, early stopping, and `base_score`. See
 //! [`TrainingParams::validate`](crate::config::TrainingParams::validate).
 //!
 //! # Deviations from InterpretML
 //!
-//! No early stopping or inner bags; pairs use the main effects' `max_bin`
+//! No inner bags, smoothing rounds, or greedy rounds, and early stopping
+//! keeps each bag's best model per stage (InterpretML's stopping rule and
+//! tolerance) without its per-step greedy term selection; pairs use the
+//! main effects' `max_bin`
 //! bins rather than a separate `max_interaction_bins`, FAST runs once on the
 //! bag-averaged main effects rather than per bag, and the shapes are not
 //! purified (Lengerich et al., AISTATS 2020): a pair term keeps whatever
@@ -207,6 +224,8 @@ impl EbmInfo {
                 ));
             }
         }
+        // Per term and axis: whether its splits are categorical, once seen.
+        let mut categorical: Vec<[Option<bool>; 2]> = vec![[None; 2]; self.terms.len()];
         for (i, (&term, tree)) in self.tree_terms.iter().zip(model.trees()).enumerate() {
             let Some(features) = self.terms.get(term as usize) else {
                 return fail(format!(
@@ -214,14 +233,17 @@ impl EbmInfo {
                     self.terms.len()
                 ));
             };
-            if tree
-                .nodes()
-                .iter()
-                .any(|n| !n.is_leaf() && (n.is_categorical || !features.contains(&n.split_feature)))
-            {
-                return fail(format!(
-                    "tree {i} splits outside its term's features or categorically"
-                ));
+            for n in tree.nodes().iter().filter(|n| !n.is_leaf()) {
+                let Some(a) = features.iter().position(|&f| f == n.split_feature) else {
+                    return fail(format!("tree {i} splits outside its term's features"));
+                };
+                let kind = &mut categorical[term as usize][a];
+                if *kind.get_or_insert(n.is_categorical) != n.is_categorical {
+                    return fail(format!(
+                        "term {term} splits feature {} both numerically and categorically",
+                        n.split_feature
+                    ));
+                }
             }
         }
         if let Some(b) = &self.boulevard {
@@ -237,6 +259,44 @@ impl EbmInfo {
             if model.objective() != "reg:squarederror" {
                 return fail("a Boulevard EBM is a reg:squarederror model".into());
             }
+            self.validate_stages().or_else(fail)?;
+        }
+        Ok(())
+    }
+
+    /// The layout a Boulevard EBM's inference and refit read: the main
+    /// terms first, then the pairs, and each stage's trees contiguous,
+    /// round by round, one per term of the stage in term order.
+    fn validate_stages(&self) -> std::result::Result<(), String> {
+        let mains = self.terms.iter().take_while(|t| t.len() == 1).count();
+        if self.terms[mains..].iter().any(|t| t.len() == 1) {
+            return Err("a Boulevard EBM lists its main terms before its pairs".into());
+        }
+        let mut at = 0;
+        for stage in [0..mains, mains..self.terms.len()] {
+            let k = stage.len();
+            let trees = self.tree_terms[at..]
+                .iter()
+                .take_while(|&&t| stage.contains(&(t as usize)))
+                .count();
+            if k == 0 {
+                continue;
+            }
+            let round_robin = self.tree_terms[at..at + trees]
+                .iter()
+                .enumerate()
+                .all(|(i, &t)| t as usize == stage.start + i % k);
+            if trees % k != 0 || !round_robin {
+                return Err(format!(
+                    "a Boulevard EBM stage must hold whole rounds of its {k} terms in term order"
+                ));
+            }
+            at += trees;
+        }
+        if at != self.tree_terms.len() {
+            return Err(
+                "a Boulevard EBM's trees must be its main stage, then its pair stage".into(),
+            );
         }
         Ok(())
     }
@@ -299,30 +359,92 @@ pub struct ShapeFunctions {
     pub terms: Vec<TermShape>,
 }
 
-/// One term's shape function: piecewise constant on the grid its trees'
-/// thresholds cut its features into, centered to mean zero over the
-/// training rows.
-///
-/// Along feature `a` (`features[a]`) the `edges[a]` `e_0 < … < e_{m−2}`
-/// give `m + 1` cells: the intervals `(−∞, e_0), [e_0, e_1), …,
-/// [e_{m−2}, ∞)` and then the cell of missing values. `values` holds one
-/// value per grid cell, row-major (the first feature's cell slowest), so a
-/// main term has `edges[0].len() + 2` values and a pair
-/// `(edges[0].len() + 2) × (edges[1].len() + 2)`.
+/// The cells of one feature of a term ([`TermShape::axes`]). Either way
+/// the last cell holds missing values.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+pub enum TermAxis {
+    /// A numerical feature: its thresholds `e_0 < … < e_{m−2}` give the
+    /// intervals `(−∞, e_0), [e_0, e_1), …, [e_{m−2}, ∞)`, then the
+    /// missing cell (`edges.len() + 2` cells).
+    #[non_exhaustive]
+    Numeric {
+        /// The sorted thresholds the term's trees split at.
+        edges: Vec<f32>,
+    },
+    /// A categorical feature: one cell per category some split of the
+    /// term sends left (ascending codes), one for every other category
+    /// (including categories every split sends right), then
+    /// the missing cell (`categories.len() + 2` cells). Values are
+    /// category codes as [`DMatrix`] stores them (truncated to integers, as
+    /// the trees route them).
+    #[non_exhaustive]
+    Categorical {
+        /// The category codes the term's trees split on, ascending.
+        categories: Vec<u32>,
+    },
+}
+
+impl TermAxis {
+    /// Number of cells, the missing cell included.
+    pub fn cells(&self) -> usize {
+        match self {
+            TermAxis::Numeric { edges } => edges.len() + 2,
+            TermAxis::Categorical { categories } => categories.len() + 2,
+        }
+    }
+
+    /// The cell of `value` (`None` or NaN: missing).
+    pub(crate) fn cell(&self, value: Option<f32>) -> usize {
+        match value {
+            Some(x) if !x.is_nan() => match self {
+                TermAxis::Numeric { edges } => edges.partition_point(|&e| e <= x),
+                TermAxis::Categorical { categories } => {
+                    // The trees' own truncation of the code.
+                    let code = x as u32;
+                    categories.binary_search(&code).unwrap_or(categories.len())
+                }
+            },
+            _ => self.cells() - 1,
+        }
+    }
+}
+
+/// One term's shape function: piecewise constant on the grid its trees cut
+/// its features into, centered to mean zero over the training rows.
+///
+/// Feature `a` of the term ([`features`](Self::features)) has the cells of
+/// [`axes`](Self::axes)`[a]`; [`values`](Self::values) holds one value per
+/// grid cell, row-major (the first feature's cell slowest), so a main term
+/// has `axes[0].cells()` values and a pair `axes[0].cells() ×
+/// axes[1].cells()`. Built only by [`shape_functions`], so the three always
+/// agree.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TermShape {
-    /// The term's features (one, or two ascending).
-    pub features: Vec<u32>,
-    /// The thresholds along each feature.
-    pub edges: Vec<Vec<f32>>,
-    /// The shape's value on every cell.
-    pub values: Vec<f64>,
+    features: Vec<u32>,
+    axes: Vec<TermAxis>,
+    values: Vec<f64>,
 }
 
 impl TermShape {
+    /// The term's features (one, or two ascending).
+    pub fn features(&self) -> &[u32] {
+        &self.features
+    }
+
+    /// The cells along each feature.
+    pub fn axes(&self) -> &[TermAxis] {
+        &self.axes
+    }
+
+    /// The shape's value on every cell, row-major.
+    pub fn values(&self) -> &[f64] {
+        &self.values
+    }
+
     /// The index into [`values`](Self::values) of the cell holding the
-    /// feature values `x` (one per feature of the term; NaN is missing).
+    /// feature values `x` (one per feature of the term; NaN is missing, a
+    /// category no split names is the axis's "other" cell).
     ///
     /// # Errors
     ///
@@ -336,18 +458,9 @@ impl TermShape {
                 x.len(),
             ));
         }
-        let cell = |a: usize| {
-            let edges = &self.edges[a];
-            if x[a].is_nan() {
-                edges.len() + 1
-            } else {
-                edges.partition_point(|&e| e <= x[a])
-            }
-        };
-        Ok(match self.edges.len() {
-            1 => cell(0),
-            _ => cell(0) * (self.edges[1].len() + 2) + cell(1),
-        })
+        Ok(self.axes.iter().zip(x).fold(0, |cell, (axis, &v)| {
+            cell * axis.cells() + axis.cell(Some(v))
+        }))
     }
 
     /// The shape's value at the feature values `x` (as [`cell`](Self::cell)).
@@ -385,7 +498,7 @@ pub fn shape_functions(model: &BoostedModel) -> Result<ShapeFunctions> {
                 .collect();
             TermShape {
                 features: info.terms[t].clone(),
-                edges: grid.axes.iter().map(|a| a.edges.clone()).collect(),
+                axes: grid.axes.iter().map(|a| a.kind.clone()).collect(),
                 values,
             }
         })

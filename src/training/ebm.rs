@@ -3,17 +3,19 @@
 //! each followed by FAST pair selection and pair-term boosting. See
 //! [`crate::ebm`] for the algorithms.
 
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
 use rayon::prelude::*;
 
 use super::boulevard::{Recursion, RoundRequest, Schedule, tree_rows};
-use super::train::{Prepared, TrainContext, TreeSample, sample_rows};
+use super::train::{Prepared, TrainContext, TreeSample, configured_metrics, sample_rows};
 use crate::config::{Device, TrainingParams};
 use crate::data::DMatrix;
 use crate::data::quantile::HistCuts;
 use crate::ebm::{EbmBoulevard, EbmInfo};
 use crate::error::{HessboostError, Result};
+use crate::metric::Metric;
 use crate::model::BoostedModel;
 use crate::objective::GradPair;
 use crate::rng::{GOLDEN, Rng, splitmix64};
@@ -134,7 +136,7 @@ pub(super) fn boost(
             Some(info),
         )
     } else {
-        (classic(run, prepared, &mains, mu, rounds, &mut hook), None)
+        (classic(run, prepared, &mains, mu, rounds, &mut hook)?, None)
     };
     let mut terms = mains;
     terms.extend(pairs);
@@ -177,17 +179,95 @@ fn subsample_of(pool: &[u32], subsample: f64, rng: &mut Rng) -> Vec<u32> {
     rows
 }
 
+/// The rows an outer bag does not train on, which it early-stops on.
+struct Holdout {
+    rows: Vec<u32>,
+    data: DMatrix,
+}
+
+/// A bag's early stopping in one stage (InterpretML's rule): after every
+/// tree, the held-out score `m` (lower is better); stop once the best score
+/// of the last `window` trees fails to beat the best before them by the
+/// relative tolerance; keep the trees up to the best score.
+struct Stopper {
+    window: VecDeque<f64>,
+    capacity: usize,
+    tolerance: f64,
+    /// Best score of every tree so far, and of the trees before the window.
+    min_all: f64,
+    min_before: f64,
+    /// The best score (the stage's starting model included), how many of
+    /// the bag's trees it had, and its margins.
+    best: f64,
+    best_len: usize,
+    best_margins: Vec<f32>,
+    done: bool,
+}
+
+impl Stopper {
+    fn new(capacity: usize, tolerance: f64, start: f64, bag: &Bag) -> Self {
+        Stopper {
+            window: VecDeque::with_capacity(capacity),
+            capacity,
+            tolerance,
+            min_all: f64::INFINITY,
+            min_before: f64::INFINITY,
+            best: start,
+            best_len: bag.trees.len(),
+            best_margins: bag.margins.clone(),
+            done: false,
+        }
+    }
+
+    /// Record the score `m` of the model with `len` trees and `margins`.
+    fn observe(&mut self, m: f64, len: usize, margins: &[f32]) {
+        let m = if m.is_nan() { f64::INFINITY } else { m };
+        if m < self.best {
+            self.best = m;
+            self.best_len = len;
+            self.best_margins.copy_from_slice(margins);
+        }
+        let mut tolerance = self.min_all.abs().min(self.min_before.abs()) * self.tolerance;
+        if !tolerance.is_finite() {
+            tolerance = 0.0;
+        }
+        self.min_all = self.min_all.min(m);
+        if self.window.len() == self.capacity
+            && let Some(oldest) = self.window.pop_front()
+        {
+            self.min_before = self.min_before.min(oldest);
+        }
+        self.window.push_back(m);
+        let recent = self.window.iter().copied().fold(f64::INFINITY, f64::min);
+        if self.window.len() == self.capacity && self.min_before - tolerance <= recent {
+            self.done = true;
+        }
+    }
+}
+
+/// How a bag scores its held-out rows: the early-stopping metric and
+/// whether it is maximized (scores are negated then, so lower is better).
+struct Scorer<'m> {
+    metric: &'m dyn Metric,
+    sign: f64,
+}
+
 /// One outer bag of the classic EBM: its rows, its margins over every
-/// training row, and its trees (learning rate applied, not yet `1/B`).
+/// training row, its trees (learning rate applied, not yet `1/B`), and with
+/// early stopping its held-out rows and the current stage's stopper.
 struct Bag {
     index: u64,
     rows: Vec<u32>,
     margins: Vec<f32>,
     trees: Vec<(u32, RegTree)>,
+    holdout: Option<Holdout>,
+    stopper: Option<Stopper>,
 }
 
 impl Bag {
-    fn new(params: &TrainingParams, n: usize, index: usize, mu: f64) -> Self {
+    fn new(run: &TrainContext, index: usize, mu: f64) -> Result<Self> {
+        let TrainContext { params, dtrain, .. } = *run;
+        let n = dtrain.n_rows();
         let index = index as u64;
         let rows = if params.ebm_bag_fraction >= 1.0 {
             all_rows(n)
@@ -197,24 +277,92 @@ impl Bag {
             ));
             subsample_of(&all_rows(n), params.ebm_bag_fraction, &mut rng)
         };
-        Bag {
+        let holdout = if params.ebm_early_stopping_rounds > 0 {
+            let mut in_bag = vec![false; n];
+            for &r in &rows {
+                in_bag[r as usize] = true;
+            }
+            let held: Vec<usize> = (0..n).filter(|&r| !in_bag[r]).collect();
+            if held.is_empty() {
+                return Err(HessboostError::invalid_param(
+                    "ebm_early_stopping_rounds",
+                    format!(
+                        "outer bag {index} holds out no rows to stop on; lower `ebm_bag_fraction`"
+                    ),
+                ));
+            }
+            Some(Holdout {
+                rows: held.iter().map(|&r| r as u32).collect(),
+                data: dtrain.select_rows(&held)?,
+            })
+        } else {
+            None
+        };
+        Ok(Bag {
             index,
             rows,
             margins: vec![mu as f32; n],
             trees: Vec::new(),
+            holdout,
+            stopper: None,
+        })
+    }
+
+    /// The held-out score of the bag's current margins (lower is better).
+    fn score(&self, run: &TrainContext, scorer: &Scorer) -> f64 {
+        let Some(holdout) = &self.holdout else {
+            return 0.0;
+        };
+        let mut preds: Vec<f32> = holdout
+            .rows
+            .iter()
+            .map(|&r| self.margins[r as usize])
+            .collect();
+        run.objective.eval_transform(&mut preds);
+        scorer.sign * scorer.metric.eval_info(&preds, &holdout.data.info())
+    }
+
+    /// Start a stage of `terms` terms: with early stopping, a stopper
+    /// seeded with the current model.
+    fn start_stage(&mut self, run: &TrainContext, scorer: Option<&Scorer>, terms: usize) {
+        self.stopper = scorer.map(|scorer| {
+            let capacity = run.params.ebm_early_stopping_rounds * terms;
+            let start = self.score(run, scorer);
+            Stopper::new(
+                capacity,
+                run.params.ebm_early_stopping_tolerance,
+                start,
+                self,
+            )
+        });
+    }
+
+    /// End a stage: an early-stopped bag keeps its trees up to its best
+    /// held-out score.
+    fn finish_stage(&mut self) {
+        if let Some(stopper) = self.stopper.take() {
+            self.trees.truncate(stopper.best_len);
+            self.margins = stopper.best_margins;
         }
     }
 
+    /// Whether the bag's current stage has stopped early.
+    fn stopped(&self) -> bool {
+        self.stopper.as_ref().is_some_and(|s| s.done)
+    }
+
     /// Round `round` of cyclic boosting over `terms`: each tree fits the
-    /// gradients of everything before it.
+    /// gradients of everything before it; with early stopping each tree is
+    /// scored, and the round ends where the bag stops.
     fn cycle(
         &mut self,
         run: &TrainContext,
         prepared: &Prepared,
         terms: &[Term],
-        round: u64,
-        stage: u64,
+        round: (u64, u64),
+        scorer: Option<&Scorer>,
     ) {
+        let (stage, round) = round;
         let params = run.params;
         let eta = params.eta as f32;
         let key = params.seed
@@ -223,6 +371,9 @@ impl Bag {
             ^ splitmix64(self.index ^ round.wrapping_mul(GOLDEN));
         let mut rng = Rng::new(splitmix64(key));
         for &(term, features) in terms {
+            if self.stopped() {
+                return;
+            }
             let gpair = gradients(run, &self.margins);
             let rows = subsample_of(&self.rows, params.subsample, &mut rng);
             let seed = rng.next_u64();
@@ -233,31 +384,46 @@ impl Bag {
                 *m += p;
             }
             self.trees.push((term, tree));
+            if let Some(scorer) = scorer {
+                let score = self.score(run, scorer);
+                if let Some(stopper) = &mut self.stopper {
+                    stopper.observe(score, self.trees.len(), &self.margins);
+                }
+            }
         }
     }
 }
 
-/// Run `rounds` rounds of `terms` in every bag (the bags of a round in
-/// parallel when allowed), reporting each round to `hook` until it stops.
+/// Run up to `rounds` rounds of `terms` in every bag (the bags of a round
+/// in parallel when allowed), reporting each round to `hook`, until the
+/// hook stops or every bag has stopped early; then each bag keeps its best
+/// trees.
 fn cycle_bags(
     run: &TrainContext,
     prepared: &Prepared,
     bags: &mut [Bag],
     terms: &[Term],
     stage: (u64, usize),
+    scorer: Option<&Scorer>,
     hook: &mut Hook,
 ) {
     let (stage, rounds) = stage;
+    for bag in bags.iter_mut() {
+        bag.start_stage(run, scorer, terms.len());
+    }
     for round in 0..rounds as u64 {
-        let f = |bag: &mut Bag| bag.cycle(run, prepared, terms, round, stage);
+        let f = |bag: &mut Bag| bag.cycle(run, prepared, terms, (stage, round), scorer);
         if parallel(run.params) && bags.len() > 1 {
             bags.par_iter_mut().for_each(f);
         } else {
             bags.iter_mut().for_each(f);
         }
-        if !hook.next() {
-            return;
+        if !hook.next() || bags.iter().all(Bag::stopped) {
+            break;
         }
+    }
+    for bag in bags.iter_mut() {
+        bag.finish_stage();
     }
 }
 
@@ -270,17 +436,36 @@ fn classic(
     mu: f64,
     rounds: usize,
     hook: &mut Hook,
-) -> Grown {
+) -> Result<Grown> {
     let params = run.params;
     let n = run.dtrain.n_rows();
     let n_bags = params.ebm_outer_bags;
-    let mut bags: Vec<Bag> = (0..n_bags).map(|b| Bag::new(params, n, b, mu)).collect();
+    let mut bags = (0..n_bags)
+        .map(|b| Bag::new(run, b, mu))
+        .collect::<Result<Vec<Bag>>>()?;
+    let metric = if params.ebm_early_stopping_rounds > 0 {
+        configured_metrics(params, run.objective)?.pop()
+    } else {
+        None
+    };
+    let scorer = metric.as_deref().map(|metric| Scorer {
+        metric,
+        sign: if metric.maximize() { -1.0 } else { 1.0 },
+    });
     let main_terms: Vec<Term> = mains
         .iter()
         .enumerate()
         .map(|(t, f)| (t as u32, f.as_slice()))
         .collect();
-    cycle_bags(run, prepared, &mut bags, &main_terms, (0, rounds), hook);
+    cycle_bags(
+        run,
+        prepared,
+        &mut bags,
+        &main_terms,
+        (0, rounds),
+        scorer.as_ref(),
+        hook,
+    );
     let mut main_trees: Vec<(u32, RegTree)> = Vec::new();
     for bag in &mut bags {
         main_trees.append(&mut bag.trees);
@@ -300,7 +485,15 @@ fn classic(
             .enumerate()
             .map(|(k, f)| ((mains.len() + k) as u32, f.as_slice()))
             .collect();
-        cycle_bags(run, prepared, &mut bags, &pair_terms, (1, rounds), hook);
+        cycle_bags(
+            run,
+            prepared,
+            &mut bags,
+            &pair_terms,
+            (1, rounds),
+            scorer.as_ref(),
+            hook,
+        );
     }
     let mut trees = main_trees;
     for bag in &mut bags {
@@ -312,7 +505,7 @@ fn classic(
             tree.scale_leaves(inv);
         }
     }
-    Grown { trees, pairs }
+    Ok(Grown { trees, pairs })
 }
 
 /// The Boulevard EBM: a Boulevard stage of the main effects from the
@@ -430,7 +623,10 @@ fn boulevard_stage(
 /// FAST (Lou, Caruana, Gehrke & Hooker, KDD 2013): rank every feature pair
 /// by its best four-quadrant split of `gpair` on the features' histogram
 /// bins, `Σ_q G_q² / (H_q + λ) − G² / (H + λ)` over the rows present in
-/// both, and return the top `k` (ties broken by feature order).
+/// both, and return the top `k` (ties broken by feature order). A
+/// categorical feature has one bin per category, ordered by the category's
+/// mean gradient `G / (H + λ)` (the order in which a binary partition's
+/// best split is a cut, as in LightGBM's and XGBoost's categorical search).
 fn fast_pairs(run: &TrainContext, gpair: &[GradPair], k: usize) -> Vec<Vec<u32>> {
     let TrainContext { params, dtrain, .. } = *run;
     let p = dtrain.n_cols();
@@ -448,6 +644,17 @@ fn fast_pairs(run: &TrainContext, gpair: &[GradPair], k: usize) -> Vec<Vec<u32>>
         })
         .collect();
     let lambda = params.lambda;
+    let bins: Vec<Vec<u32>> = bins
+        .into_iter()
+        .enumerate()
+        .map(|(f, b)| {
+            if cuts.is_categorical(f) {
+                order_categories(b, cuts.num_bins(f), gpair, lambda)
+            } else {
+                b
+            }
+        })
+        .collect();
     let pairs: Vec<(usize, usize)> = (0..p)
         .flat_map(|a| (a + 1..p).map(move |b| (a, b)))
         .collect();
@@ -473,6 +680,36 @@ fn fast_pairs(run: &TrainContext, gpair: &[GradPair], k: usize) -> Vec<Vec<u32>>
         .into_iter()
         .take(k)
         .map(|(_, i)| vec![pairs[i].0 as u32, pairs[i].1 as u32])
+        .collect()
+}
+
+/// Renumber a categorical feature's bins by their mean gradient
+/// `G / (H + λ)` (ties by bin), so FAST's cuts over them are the binary
+/// partitions worth scoring.
+fn order_categories(bins: Vec<u32>, m: usize, gpair: &[GradPair], lambda: f64) -> Vec<u32> {
+    let mut g = vec![0.0f64; m];
+    let mut h = vec![0.0f64; m];
+    for (&b, gp) in bins.iter().zip(gpair) {
+        if b != u32::MAX {
+            g[b as usize] += f64::from(gp.grad);
+            h[b as usize] += f64::from(gp.hess);
+        }
+    }
+    let ratio = |b: usize| {
+        if h[b] + lambda > 0.0 {
+            g[b] / (h[b] + lambda)
+        } else {
+            0.0
+        }
+    };
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&a, &b| ratio(a).total_cmp(&ratio(b)).then(a.cmp(&b)));
+    let mut rank = vec![0u32; m];
+    for (r, &b) in order.iter().enumerate() {
+        rank[b] = r as u32;
+    }
+    bins.into_iter()
+        .map(|b| if b == u32::MAX { b } else { rank[b as usize] })
         .collect()
 }
 
@@ -529,19 +766,9 @@ fn pair_gain(
     best - score(gt, ht)
 }
 
-/// Refuse the training data `booster = ebm` cannot use: categorical
-/// features (shape functions need thresholds) and feature weights (no
-/// column sampling).
+/// Refuse the training data `booster = ebm` cannot use: feature weights
+/// (it samples no columns).
 pub(super) fn validate_data(dtrain: &DMatrix) -> Result<()> {
-    if dtrain
-        .feature_types()
-        .contains(&crate::data::FeatureType::Categorical)
-    {
-        return Err(HessboostError::invalid_param(
-            "feature_types",
-            "`booster = ebm` supports numerical features only",
-        ));
-    }
     if dtrain.feature_weights().is_some() {
         return Err(HessboostError::invalid_param(
             "feature_weights",

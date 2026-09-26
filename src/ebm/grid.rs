@@ -1,56 +1,69 @@
 //! The grid an EBM term's trees partition its features into.
 //!
-//! Every tree of a term splits only on the term's one or two features, at
-//! thresholds. Along each feature (an [`Axis`]) the union of the term's
+//! Every tree of a term splits only on the term's one or two features.
+//! Along a numerical feature (an [`Axis`]) the union of the term's
 //! thresholds `e_0 < … < e_{m−2}` cuts the line into `m` cells
-//! `(−∞, e_0), [e_0, e_1), …, [e_{m−2}, ∞)` plus a last cell for missing
-//! values, so every tree is constant on every cell of the product grid and
-//! each of its leaves covers a union of at most two intervals per axis (the
-//! non-missing values it receives, and the missing cell when its path's
-//! default directions lead there): at most four boxes. The shape functions
-//! add leaf values over boxes, the term kernel adds leaf weights over them,
-//! both with difference arrays (`O(leaves + cells)`).
+//! `(−∞, e_0), [e_0, e_1), …, [e_{m−2}, ∞)`; along a categorical one every
+//! category some split sends left gets a cell, then one cell holds every other
+//! category. Either way a last cell holds missing values, every tree is
+//! constant on every cell of the product grid, and each leaf receives a set
+//! of cells per axis, stored as the runs of consecutive cells it covers
+//! (for a numerical axis at most two: the values it receives, and the
+//! missing cell when its path's default directions lead there). The shape
+//! functions add leaf values over the leaves' boxes, the term kernel adds
+//! leaf weights over them, both with difference arrays (`O(boxes + cells)`).
 
+use super::TermAxis;
 use crate::data::DMatrix;
 use crate::tree::RegTree;
 
-/// One feature of a term and the thresholds its trees split it at.
+/// One feature of a term and its cells.
 #[derive(Debug, Clone)]
 pub(crate) struct Axis {
     pub(crate) feature: u32,
-    /// Sorted, distinct thresholds.
-    pub(crate) edges: Vec<f32>,
+    pub(crate) kind: TermAxis,
 }
 
 impl Axis {
-    /// Cells along the axis: the `edges.len() + 1` intervals, then missing.
+    /// Cells along the axis (the last one holds missing values).
     pub(crate) fn cells(&self) -> usize {
-        self.edges.len() + 2
+        self.kind.cells()
     }
 
     /// The cell of missing values (the last one).
     pub(crate) fn missing_cell(&self) -> usize {
-        self.edges.len() + 1
+        self.kind.cells() - 1
     }
 
     /// The cell of `value` (`None` or NaN: missing).
     pub(crate) fn cell(&self, value: Option<f32>) -> usize {
-        match value {
-            Some(x) if !x.is_nan() => self.edges.partition_point(|&e| e <= x),
-            _ => self.missing_cell(),
-        }
+        self.kind.cell(value)
     }
 
     /// A value inside cell `c` (`None` for the missing cell), which every
     /// tree of the term routes like all the cell's values.
     fn representative(&self, c: usize) -> Option<f32> {
         if c == self.missing_cell() {
-            None
-        } else if c == 0 {
-            Some(f32::NEG_INFINITY)
-        } else {
-            Some(self.edges[c - 1])
+            return None;
         }
+        match &self.kind {
+            TermAxis::Numeric { edges } => Some(if c == 0 {
+                f32::NEG_INFINITY
+            } else {
+                edges[c - 1]
+            }),
+            // Past the listed categories: one that no split names.
+            TermAxis::Categorical { categories } => Some(match categories.get(c) {
+                Some(&k) => k as f32,
+                None => categories.last().map_or(0.0, |&k| k as f32 + 1.0),
+            }),
+        }
+    }
+
+    /// Whether a present value in non-missing cell `c` goes left at
+    /// `node` (a split on this axis) of `tree`.
+    fn goes_left(&self, tree: &RegTree, node: &crate::tree::Node, c: usize) -> bool {
+        tree.goes_left(node, self.representative(c))
     }
 }
 
@@ -82,31 +95,24 @@ pub(crate) struct TermGrid {
     node_start: Vec<usize>,
 }
 
-/// The per-axis cell intervals a leaf receives: `[lo, hi)` of the non-missing
-/// cells and whether the missing cell is included.
-#[derive(Clone, Copy)]
-struct Reach {
-    lo: usize,
-    hi: usize,
-    missing: bool,
-}
+/// The cells of each axis a leaf receives.
+type Reach = [Vec<bool>; 2];
 
-impl Reach {
-    /// The reached cells as at most two intervals, merged when adjacent.
-    fn intervals(self, missing_cell: usize) -> Vec<(usize, usize)> {
-        let mut out = Vec::with_capacity(2);
-        if self.lo < self.hi {
-            if self.missing && self.hi == missing_cell {
-                out.push((self.lo, missing_cell + 1));
-                return out;
+/// The runs of consecutive `true` cells, as `[lo, hi)` intervals.
+fn runs(cells: &[bool]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, &on) in cells.iter().chain(std::iter::once(&false)).enumerate() {
+        match (on, start) {
+            (true, None) => start = Some(i),
+            (false, Some(lo)) => {
+                out.push((lo, i));
+                start = None;
             }
-            out.push((self.lo, self.hi));
+            _ => {}
         }
-        if self.missing {
-            out.push((missing_cell, missing_cell + 1));
-        }
-        out
     }
+    out
 }
 
 impl TermGrid {
@@ -117,15 +123,28 @@ impl TermGrid {
         let axes: Vec<Axis> = features
             .iter()
             .map(|&feature| {
-                let mut edges: Vec<f32> = trees
-                    .iter()
-                    .flat_map(|t| t.nodes())
-                    .filter(|n| !n.is_leaf() && n.split_feature == feature)
-                    .map(|n| n.split_cond)
-                    .collect();
-                edges.sort_by(f32::total_cmp);
-                edges.dedup();
-                Axis { feature, edges }
+                let splits = || {
+                    trees.iter().flat_map(|t| {
+                        t.nodes()
+                            .iter()
+                            .filter(move |n| !n.is_leaf() && n.split_feature == feature)
+                            .map(move |n| (*t, n))
+                    })
+                };
+                let kind = if splits().any(|(_, n)| n.is_categorical) {
+                    let mut categories: Vec<u32> = splits()
+                        .flat_map(|(t, n)| t.node_categories(n).iter().copied())
+                        .collect();
+                    categories.sort_unstable();
+                    categories.dedup();
+                    TermAxis::Categorical { categories }
+                } else {
+                    let mut edges: Vec<f32> = splits().map(|(_, n)| n.split_cond).collect();
+                    edges.sort_by(f32::total_cmp);
+                    edges.dedup();
+                    TermAxis::Numeric { edges }
+                };
+                Axis { feature, kind }
             })
             .collect();
         let dims = [axes[0].cells(), axes.get(1).map_or(1, Axis::cells)];
@@ -138,34 +157,13 @@ impl TermGrid {
             node_start.push(node_leaf.len());
             let base = node_leaf.len();
             node_leaf.resize(base + tree.num_nodes(), u32::MAX);
-            let full = |a: &Axis| Reach {
-                lo: 0,
-                hi: a.missing_cell(),
-                missing: true,
-            };
-            let mut stack = vec![(
-                0usize,
-                [
-                    full(&axes[0]),
-                    axes.get(1).map_or(
-                        Reach {
-                            lo: 0,
-                            hi: 1,
-                            missing: false,
-                        },
-                        full,
-                    ),
-                ],
-            )];
+            let all: Reach = [vec![true; dims[0]], vec![true; dims[1]]];
+            let mut stack = vec![(0usize, all)];
             while let Some((id, reach)) = stack.pop() {
                 let node = tree.node(id);
                 if node.is_leaf() {
-                    let first = reach[0].intervals(axes[0].missing_cell());
-                    let second = match axes.get(1) {
-                        Some(a) => reach[1].intervals(a.missing_cell()),
-                        None => vec![(0, 1)],
-                    };
-                    let boxes = first
+                    let second = runs(&reach[1]);
+                    let boxes = runs(&reach[0])
                         .iter()
                         .flat_map(|&(lo0, hi0)| {
                             second.iter().map(move |&(lo1, hi1)| [lo0, hi0, lo1, hi1])
@@ -179,20 +177,24 @@ impl TermGrid {
                     continue;
                 }
                 let a = usize::from(axes[0].feature != node.split_feature);
-                let e = axes[a].edges.partition_point(|&v| v < node.split_cond);
-                let r = reach[a];
-                let mut left = reach;
-                left[a] = Reach {
-                    lo: r.lo,
-                    hi: r.hi.min(e + 1),
-                    missing: r.missing && node.default_left,
-                };
-                let mut right = reach;
-                right[a] = Reach {
-                    lo: r.lo.max(e + 1),
-                    hi: r.hi,
-                    missing: r.missing && !node.default_left,
-                };
+                let axis = &axes[a];
+                let missing = axis.missing_cell();
+                let (mut left, mut right) = (reach.clone(), reach);
+                for c in 0..axis.cells() {
+                    if !left[a][c] {
+                        continue;
+                    }
+                    let goes_left = if c == missing {
+                        node.default_left
+                    } else {
+                        axis.goes_left(tree, node, c)
+                    };
+                    if goes_left {
+                        right[a][c] = false;
+                    } else {
+                        left[a][c] = false;
+                    }
+                }
                 stack.push((node.right as usize, right));
                 stack.push((node.left as usize, left));
             }

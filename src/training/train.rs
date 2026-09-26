@@ -597,16 +597,16 @@ pub(crate) fn validate_trained_model(model: &BoostedModel) -> Result<()> {
 }
 
 /// Run `train` on a dedicated pool of `params.nthread` threads, or on the
-/// global rayon pool when `nthread` is `0`.
+/// global rayon pool when `nthread` is unset.
 pub(crate) fn with_thread_pool<T: Send>(
     params: &TrainingParams,
     train: impl FnOnce() -> Result<T> + Send,
 ) -> Result<T> {
-    if params.nthread == 0 {
+    let Some(threads) = params.nthread else {
         return train();
-    }
+    };
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(params.nthread)
+        .num_threads(threads.get())
         .build()
         .map_err(|error| HessboostError::invalid_param("nthread", error.to_string()))?;
     pool.install(train)

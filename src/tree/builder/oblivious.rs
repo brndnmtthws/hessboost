@@ -63,6 +63,7 @@ use crate::tree::hist::{Histogram, HistogramBackend, zeroed};
 use crate::tree::sampler::ColumnSampler;
 use crate::tree::{ChildLeaf, RegTree, SplitRule};
 use rayon::prelude::*;
+use std::num::NonZeroUsize;
 
 /// Histogram bins scanned per level (nodes × total bins) at which candidate
 /// features are scored concurrently.
@@ -199,7 +200,8 @@ impl<'a> SymmetricTreeBuilder<'a> {
             Bounds::default(),
         )];
         let mut allowed: Option<InteractionState> = None;
-        let depth_limit = self.params.max_depth;
+        // Validation bounds symmetric trees to `1..=MAX_SYMMETRIC_DEPTH`.
+        let depth_limit = self.params.max_depth.map_or(0, NonZeroUsize::get);
         for depth in 0..depth_limit {
             let features: Vec<u32> = sampler
                 .sample(depth)

@@ -905,13 +905,13 @@ impl Grow<'_, '_> {
         !(loss <= K_RT_EPS_F32
             || loss < self.b.params.gamma as f32
             || e.depth == limit_or_unbounded(self.b.params.max_depth)
-            || (self.b.params.max_leaves > 0 && self.num_leaves == self.b.params.max_leaves))
+            || self.num_leaves == limit_or_unbounded(self.b.params.max_leaves))
     }
 
     /// XGBoost's `Driver::IsChildValid`.
     fn child_valid(&self, e: &Entry) -> bool {
         !(e.depth + 1 >= limit_or_unbounded(self.b.params.max_depth)
-            || (self.b.params.max_leaves > 0 && self.num_leaves >= self.b.params.max_leaves))
+            || self.num_leaves >= limit_or_unbounded(self.b.params.max_leaves))
     }
 
     /// XGBoost's `Driver::Pop`. Popped entries that cannot expand become
@@ -1213,7 +1213,7 @@ mod tests {
         let (ghist, g) = two_target_data(400);
         let params = TrainingParams::builder()
             .grow_policy(GrowPolicy::LossGuide)
-            .max_depth(0)
+            .unlimited_depth()
             .max_leaves(3)
             .build()
             .unwrap();

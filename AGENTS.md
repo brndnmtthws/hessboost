@@ -280,7 +280,10 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `xgb.train` does.
 - **Refusals:** unsupported parameters or combinations error, never get
   ignored. Checks live in the parameter structs' constructors (ranges),
-  `TrainingParams::validate` (static combinations),
+  `TrainingParams::validate` (static combinations), the builder (a
+  setter value its field cannot hold, e.g. `max_depth(0)`, is reported by
+  `build()` under its key; limits are `Option<NonZeroUsize>`, never a `0`
+  sentinel),
   `TrainingParams::from_xgboost` (keys and value spellings; an objective
   parameter key that neither the objective nor a listed metric reads is
   refused, `OBJECTIVE_KEYS` in `config/xgboost.rs`, as is a dependent key

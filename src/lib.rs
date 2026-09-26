@@ -22,7 +22,7 @@
 //! let dtrain = DMatrix::from_dense(&x, 6, 2)?.with_labels(&y)?;
 //!
 //! let params = TrainingParams::builder()
-//!     .objective("reg:squarederror") // XGBoost-compatible names
+//!     .objective(Objective::SquaredError) // XGBoost's `reg:squarederror`
 //!     .tree_method(TreeMethod::Hist)
 //!     .max_depth(3)
 //!     .eta(0.1)
@@ -39,8 +39,8 @@
 //! ```
 //!
 //! [`prelude`] holds only this workflow's items (including
-//! [`TreeMethod`](config::TreeMethod)); everything else is imported from its
-//! module.
+//! [`TreeMethod`](config::TreeMethod) and [`Objective`](objective::Objective));
+//! everything else is imported from its module.
 //!
 //! ## Modules
 //!
@@ -51,8 +51,9 @@
 //!   [`training::budget`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
 //!   native and XGBoost JSON/UBJSON); [`model::compact`].
-//! - [`objective`]: the `Loss` trait, the built-in objectives,
-//!   `CustomLoss`, [`objective::distributional`] (`dist:*` objectives).
+//! - [`objective`]: [`Objective`](objective::Objective) and its parameter
+//!   types, the `Loss` trait, `CustomLoss`, [`objective::distributional`]
+//!   (`dist:*` objectives).
 //! - [`metric`]: [`EvalMetric`](metric::EvalMetric) (the built-in metrics),
 //!   the `Metric` trait, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
@@ -75,12 +76,13 @@
 //!   growth; uniform or `gradient_based` row sampling; column sampling with
 //!   optional per-feature weights
 //!   ([`DMatrix::with_feature_weights`](data::DMatrix::with_feature_weights)).
-//! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
+//! - **Objectives** ([`Objective`](objective::Objective), each with its
+//!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
 //!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
 //!   `survival:aft` on censored bounds), plus custom losses
-//!   ([`CustomLoss`](objective::CustomLoss) through
-//!   [`Trainer::loss`](training::Trainer::loss)).
+//!   ([`Objective::Custom`](objective::Objective::Custom), e.g. a
+//!   [`CustomLoss`](objective::CustomLoss)).
 //! - **Multi-output:** label matrices
 //!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
 //!   tree per output or vector-leaf trees
@@ -173,6 +175,11 @@
 //!   threshold suffix), and the `-` variants of the ranking metrics
 //!   (`ndcg-`, `ndcg@k-`, `map-`, `map@k-`); these names are refused.
 //! - XGBoost import and export of gblinear models.
+//! - `scale_pos_weight` outside the logistic objectives: XGBoost also
+//!   weights the positive rows of `reg:squarederror` and `reg:gamma` with
+//!   it; [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost)
+//!   refuses it there, and XGBoost import drops it (predictions do not read
+//!   it).
 //!
 //! [`DMatrix`]: data::DMatrix
 //! [`TrainingParams`]: config::TrainingParams
@@ -211,18 +218,19 @@ pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 /// [`TrainingParamsBuilder::tree_method`](config::TrainingParamsBuilder::tree_method)),
 /// [`ImportanceType`](model::ImportanceType) (for
 /// [`BoostedModel::feature_importance`](model::BoostedModel::feature_importance)),
-/// [`EvalMetric`](metric::EvalMetric) (for
-/// [`TrainingParamsBuilder::eval_metric`](config::TrainingParamsBuilder::eval_metric)),
-/// and [`ObjectiveParams`](config::ObjectiveParams) (a model's
-/// [`objective_params`](model::BoostedModel::objective_params)). Everything
-/// else (the other parameter enums, objectives, metric parameters,
-/// conformal intervals, ...) is imported from its module.
+/// [`Objective`](objective::Objective) (for
+/// [`TrainingParamsBuilder::objective`](config::TrainingParamsBuilder::objective)),
+/// and [`EvalMetric`](metric::EvalMetric) (for
+/// [`TrainingParamsBuilder::eval_metric`](config::TrainingParamsBuilder::eval_metric)).
+/// Everything else (the other parameter enums, the objectives' and metrics'
+/// parameters, conformal intervals, ...) is imported from its module.
 pub mod prelude {
-    pub use crate::config::{ObjectiveParams, TrainingParams, TreeMethod};
+    pub use crate::config::{TrainingParams, TreeMethod};
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
     pub use crate::metric::EvalMetric;
     pub use crate::model::{BoostedModel, ImportanceType};
+    pub use crate::objective::Objective;
     pub use crate::training::{Trainer, train};
 }
 /// Implementation details the crate's own benchmarks and parity tests

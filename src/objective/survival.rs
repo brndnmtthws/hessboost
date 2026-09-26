@@ -10,9 +10,9 @@
 use rayon::prelude::*;
 
 use super::{GradPair, Loss, MIN_HESS_F64, OutputDomain, check_base_score_domain, log_link};
-use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
+use crate::objective::AftDistribution;
 
 /// `exp` of every element in `f32` (XGBoost's `std::exp` on a float), used
 /// by both survival objectives' prediction transform.
@@ -798,6 +798,7 @@ fn erf(x: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::objective::gradient_pairs;
+    use crate::objective::{Aft, Objective};
     use approx::assert_relative_eq;
 
     #[test]
@@ -982,7 +983,7 @@ mod tests {
             .with_label_bounds(&t, &upper)
             .unwrap();
         let params = TrainingParams::builder()
-            .objective("survival:aft")
+            .objective(Objective::Aft(Aft::default()))
             .max_depth(2)
             .eta(0.5)
             .build()

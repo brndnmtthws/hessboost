@@ -3,9 +3,9 @@
 //! `metric/survival_metric.cu`).
 
 use super::{Metric, consistent};
-use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
+use crate::objective::AftDistribution;
 use crate::objective::{abs_label_order, aft_nloglik};
 use rayon::prelude::*;
 

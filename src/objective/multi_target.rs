@@ -131,15 +131,17 @@ mod tests {
     use super::*;
     use crate::config::TrainingParams;
     use crate::error::HessboostError;
-    use crate::objective::{base_margins, create_objective};
+    use crate::objective::base_margins;
+    use serde_json::json;
+    use std::sync::Arc;
 
-    fn objective(name: &str, n_targets: usize) -> Box<dyn Loss> {
-        let params = TrainingParams::builder()
-            .objective(name)
-            .scale_pos_weight(if name == "binary:logistic" { 2.0 } else { 1.0 })
-            .build()
-            .unwrap();
-        create_objective(&params, n_targets).unwrap()
+    fn objective(name: &str, n_targets: usize) -> Arc<dyn Loss> {
+        let mut flat = vec![("objective", json!(name))];
+        if name == "binary:logistic" {
+            flat.push(("scale_pos_weight", json!(2.0)));
+        }
+        let params = TrainingParams::from_xgboost(flat).unwrap();
+        params.loss(n_targets).unwrap()
     }
 
     /// Two label columns as a `[row][target]` matrix plus each column alone.

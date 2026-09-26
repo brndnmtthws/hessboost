@@ -82,6 +82,7 @@
 use hessboost::config::BoosterKind;
 use hessboost::data::{CsvOptions, load_csv};
 use hessboost::metric::EvalMetric;
+use hessboost::objective::Logistic;
 use hessboost::prelude::*;
 use std::path::Path;
 
@@ -143,8 +144,8 @@ struct Comparison {
 
 fn params() -> Result<TrainingParams> {
     TrainingParams::builder()
-        .objective("binary:logistic")
-        .eval_metric(hessboost::metric::EvalMetric::LogLoss)
+        .objective(Objective::BinaryLogistic(Logistic::default()))
+        .eval_metric(EvalMetric::LogLoss)
         .max_depth(3)
         .eta(0.05)
         .build()
@@ -283,7 +284,7 @@ fn run_synthetic() -> Result<()> {
     // related task. Any model that emits per-row logits plays the same role.
     let pretraining = sample(20_000, 7, pretraining_logit)?;
     let prior_params = TrainingParams::builder()
-        .objective("binary:logistic")
+        .objective(Objective::BinaryLogistic(Logistic::default()))
         .booster(BoosterKind::GbLinear)
         .eta(0.5)
         .build()?;

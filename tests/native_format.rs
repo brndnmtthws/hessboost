@@ -9,12 +9,13 @@
 //! and commit the files it writes. Directories of earlier versions are never
 //! regenerated: they are what later versions must keep reading.
 
-use hessboost::config::{
-    AftDistribution, BoosterKind, DistGradient, DistSplitDirection, MultiStrategy,
-};
+use hessboost::config::{BoosterKind, MultiStrategy};
 use hessboost::data::FeatureType;
 use hessboost::model::compact::CompactModel;
-use hessboost::objective::distributional::DistFamily;
+use hessboost::objective::distributional::{
+    DistFamily, DistGradient, DistSplitDirection, Distributional,
+};
+use hessboost::objective::{Aft, AftDistribution, Expectiles, Multiclass, Quantiles};
 use hessboost::prelude::*;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -174,6 +175,21 @@ fn incomplete_json_documents_are_refused() {
     }
 }
 
+/// The `objective_params` a model of `objective` stores when every
+/// parameter keeps its default: a default `reg:squarederror` model's record
+/// with the two defaults that depend on the objective, XGBoost's
+/// `max_delta_step = 0.7` for `count:poisson` and the family of `dist:*`.
+fn default_objective_params(objective: &str) -> Value {
+    let mut defaults = empty_model_doc()["objective_params"].clone();
+    assert_eq!(defaults["max_delta_step"], 0.0);
+    assert!(defaults["distribution"].is_null());
+    if objective == "count:poisson" {
+        defaults["max_delta_step"] = 0.7.into();
+    }
+    defaults["distribution"] = serde_json::to_value(DistFamily::from_objective(objective)).unwrap();
+    defaults
+}
+
 /// Remove what the loader fills in: the objective parameters equal to the
 /// recorded objective's defaults (the whole block when all are), and the
 /// leaf-vector fields of scalar trees (`size_leaf_vector` only in a
@@ -181,8 +197,7 @@ fn incomplete_json_documents_are_refused() {
 /// removed.
 fn strip_defaults(doc: &mut Value) -> usize {
     let single_output = doc["n_outputs"] == 1;
-    let objective = doc["objective"].as_str().unwrap().to_string();
-    let defaults = serde_json::to_value(ObjectiveParams::defaults_for(&objective)).unwrap();
+    let defaults = default_objective_params(doc["objective"].as_str().unwrap());
     let params = doc["objective_params"].as_object_mut().unwrap();
     let before = params.len();
     params.retain(|key, value| defaults[key] != *value);
@@ -216,21 +231,25 @@ fn json_documents_may_omit_defaults() {
         ("reg:squarederror", base().build().unwrap(), matrix(1)),
         (
             "count:poisson",
-            base().objective("count:poisson").build().unwrap(),
+            base().objective(Objective::Poisson).build().unwrap(),
             labeled_dense(&x, COLS, &counts),
         ),
         (
             "reg:quantileerror",
             base()
-                .objective("reg:quantileerror")
-                .quantile_alpha(vec![0.1, 0.5, 0.9])
+                .objective(Objective::Quantile(
+                    Quantiles::new([0.1, 0.5, 0.9]).unwrap(),
+                ))
                 .build()
                 .unwrap(),
             matrix(1),
         ),
         (
             "dist:normal",
-            base().objective("dist:normal").build().unwrap(),
+            base()
+                .objective(Objective::Dist(Distributional::new(DistFamily::Normal)))
+                .build()
+                .unwrap(),
             matrix(1),
         ),
     ];
@@ -244,11 +263,7 @@ fn json_documents_may_omit_defaults() {
         assert!(doc["trees"][0].get("leaf_vectors").is_none(), "{name}");
 
         let restored = load_doc(&doc).unwrap();
-        assert_eq!(
-            restored.objective_params(),
-            model.objective_params(),
-            "{name}"
-        );
+        assert_eq!(restored.objective(), model.objective(), "{name}");
         assert_eq!(
             restored.to_bytes().unwrap(),
             model.to_bytes().unwrap(),
@@ -510,8 +525,7 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         (
             "multiclass forest",
             base()
-                .objective("multi:softprob")
-                .num_class(3)
+                .objective(Objective::Softprob(Multiclass::new(3).unwrap()))
                 .num_parallel_tree(3)
                 .subsample(0.7)
                 .colsample_bynode(0.6)
@@ -526,8 +540,9 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         (
             "quantiles",
             base()
-                .objective("reg:quantileerror")
-                .quantile_alpha(vec![0.1, 0.5, 0.9])
+                .objective(Objective::Quantile(
+                    Quantiles::new([0.1, 0.5, 0.9]).unwrap(),
+                ))
                 .build()
                 .unwrap(),
             matrix(1),
@@ -536,8 +551,7 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         (
             "expectiles",
             base()
-                .objective("reg:expectileerror")
-                .expectile_alpha(vec![0.2, 0.8])
+                .objective(Objective::Expectile(Expectiles::new([0.2, 0.8]).unwrap()))
                 .build()
                 .unwrap(),
             matrix(1),
@@ -546,26 +560,29 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         (
             "aft",
             base()
-                .objective("survival:aft")
-                .aft_loss_distribution(AftDistribution::Logistic)
-                .aft_loss_distribution_scale(0.7)
+                .objective(Objective::Aft(
+                    Aft::new(AftDistribution::Logistic, 0.7).unwrap(),
+                ))
                 .build()
                 .unwrap(),
             aft,
-            |m| m.objective_params().aft_loss_distribution == AftDistribution::Logistic,
+            |m| {
+                matches!(m.objective().built_in(), Some(Objective::Aft(a))
+                    if a.distribution() == AftDistribution::Logistic)
+            },
         ),
         (
             "dist:normal",
             base()
-                .objective("dist:normal")
-                .dist_gradient(DistGradient::Hessian)
+                .objective(Objective::Dist(
+                    Distributional::new(DistFamily::Normal).with_gradient(DistGradient::Hessian),
+                ))
                 .build()
                 .unwrap(),
             matrix(1),
             |m| {
-                let p = m.objective_params();
-                p.distribution == Some(DistFamily::Normal)
-                    && p.dist_gradient == DistGradient::Hessian
+                matches!(m.objective().built_in(), Some(Objective::Dist(d))
+                    if d.family() == DistFamily::Normal && d.gradient() == DistGradient::Hessian)
                     && m.n_outputs() == 2
                     && !m.has_vector_leaves()
             },
@@ -573,24 +590,34 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         (
             "dist:normal vector leaves",
             base()
-                .objective("dist:normal")
+                .objective(Objective::Dist(
+                    Distributional::new(DistFamily::Normal)
+                        .with_split_direction(DistSplitDirection::Cyclic),
+                ))
                 .multi_strategy(MultiStrategy::MultiOutputTree)
-                .dist_split_direction(DistSplitDirection::Cyclic)
                 .build()
                 .unwrap(),
             matrix(1),
             |m| {
-                let p = m.objective_params();
-                p.distribution == Some(DistFamily::Normal)
-                    && p.dist_split_direction == DistSplitDirection::Cyclic
+                matches!(m.objective().built_in(), Some(Objective::Dist(d))
+                    if d.family() == DistFamily::Normal
+                        && d.split_direction() == Some(DistSplitDirection::Cyclic))
                     && m.has_vector_leaves()
             },
         ),
         (
             "dist:negbinomial",
-            base().objective("dist:negbinomial").build().unwrap(),
+            base()
+                .objective(Objective::Dist(Distributional::new(
+                    DistFamily::NegativeBinomial,
+                )))
+                .build()
+                .unwrap(),
             negbinomial,
-            |m| m.objective_params().distribution == Some(DistFamily::NegativeBinomial),
+            |m| {
+                m.objective().built_in().and_then(Objective::dist_family)
+                    == Some(DistFamily::NegativeBinomial)
+            },
         ),
     ];
     let mut models: Vec<(&str, BoostedModel, DMatrix, Has)> = cases
@@ -633,11 +660,7 @@ fn native_formats_round_trip_every_model_feature() {
                 model.has_vector_leaves(),
                 "{name}"
             );
-            assert_eq!(
-                restored.objective_params(),
-                model.objective_params(),
-                "{name}"
-            );
+            assert_eq!(restored.objective(), model.objective(), "{name}");
         }
     }
 }

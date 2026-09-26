@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     let dtrain = DMatrix::from_dense(&x, n_rows, n_cols)?.with_labels(&y)?;
 
     let params = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .tree_method(TreeMethod::Hist)
         .max_depth(6)
         .eta(0.1)
@@ -140,6 +140,9 @@ From XGBoost:
 - XGBoost's CPU objectives — regression (incl. quantile and expectile),
   binary/multiclass classification, counts, LambdaMART ranking, Cox/AFT
   survival — and nearly all its metrics, plus custom objectives and metrics.
+  Objectives and metrics are typed (`Objective::Tweedie(Tweedie::new(1.3)?)`,
+  `EvalMetric::Ndcg(Cutoff::top(5)?)`), and
+  `TrainingParams::from_xgboost` reads an XGBoost `params` dict.
 - Multi-output models: multi-target label matrices and vector-leaf trees.
 - Cross-validation (shuffled, custom, time-ordered, or purged by each row's
   label window), continued training, tree refresh, a per-round hook

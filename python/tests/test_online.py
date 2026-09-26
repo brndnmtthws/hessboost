@@ -250,3 +250,28 @@ def test_unsupported_configurations_and_changes_are_refused() -> None:
         OnlineModel.train(PARAMS, dtrain, 3, tolerance="0.1")  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         OnlineModel()
+
+
+@pytest.mark.parametrize("tolerance", [0.1, 0.0])
+def test_an_interrupted_update_keeps_the_update_state(tolerance: float) -> None:
+    """Ctrl-C at the last iteration (refused at the commit gate) after an
+    earlier update restores the exact update state: later updates equal
+    those of a model that never tried the interrupted one."""
+    import _thread
+
+    dtrain, a, b, c = binary(400, 20), binary(20, 21), binary(15, 22), binary(25, 23)
+    online, control = (OnlineModel.train(PARAMS, dtrain, ROUNDS, tolerance) for _ in range(2))
+    for model in (online, control):
+        model.update(a, [0, 5, 9])
+
+    def interrupt_at_last(iteration: int) -> bool:
+        if iteration == ROUNDS - 1:
+            _thread.interrupt_main()
+        return False
+
+    with pytest.raises(KeyboardInterrupt):
+        online.update(b, [1, 2], callback=interrupt_at_last)
+    assert state(online) == state(control)
+    for additions, deletions in [(c, [3, 7]), (None, [0, 1, 40])]:
+        assert online.update(additions, deletions) == control.update(additions, deletions)
+        assert state(online) == state(control)

@@ -133,15 +133,21 @@ const KNOWN: &[&str] = &[
 /// all written together. Not `REQUIRED`: predictions do not read them, so a
 /// reader that predates them loads the model as a plain `gbtree` ensemble.
 fn write_boulevard(w: &mut Writer, info: &BoulevardInfo) {
-    w.f64("boulevard.dropout", info.dropout);
-    w.f64("boulevard.learning_rate", info.learning_rate);
-    w.f64("boulevard.subsample", info.subsample);
-    w.f64("boulevard.reg_lambda", info.reg_lambda);
-    w.f64("boulevard.truncation", info.truncation);
-    w.u64("boulevard.seed", info.seed);
-    w.u64(
+    let f64s = [
+        ("boulevard.dropout", info.dropout),
+        ("boulevard.learning_rate", info.learning_rate),
+        ("boulevard.subsample", info.subsample),
+        ("boulevard.reg_lambda", info.reg_lambda),
+        ("boulevard.truncation", info.truncation),
+    ];
+    for (name, value) in f64s {
+        w.raw(name, 0, &value.to_le_bytes());
+    }
+    w.raw("boulevard.seed", 0, &info.seed.to_le_bytes());
+    w.raw(
         "boulevard.intercept_from_labels",
-        u64::from(info.intercept_from_labels),
+        0,
+        &u64::from(info.intercept_from_labels).to_le_bytes(),
     );
 }
 
@@ -932,6 +938,34 @@ mod tests {
                 assert!(err.contains("future.feature"), "{err}");
             }
         }
+    }
+
+    /// A reader that predates the `boulevard.*` sections (here: they are
+    /// renamed to names this reader does not know) still loads a Boulevard
+    /// model and predicts the same, because the sections are optional.
+    #[test]
+    fn boulevard_sections_are_optional_for_older_readers() {
+        let (_, data) = model();
+        let params = TrainingParams::builder()
+            .booster(crate::config::BoosterKind::Boulevard)
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 3).unwrap();
+        let bytes = model.to_bytes().unwrap();
+        let edited = rewrite(&bytes, |entries| {
+            for e in entries.iter_mut() {
+                if let Some(rest) = e.name.strip_prefix("boulevard.") {
+                    e.name = format!("future.{rest}");
+                }
+            }
+        });
+        let loaded = BoostedModel::from_bytes(&edited).unwrap();
+        assert!(loaded.boulevard().is_none());
+        assert_eq!(
+            loaded.predict(&data).unwrap(),
+            model.predict(&data).unwrap()
+        );
     }
 
     /// Every file names its writer in an optional section, so a reader that

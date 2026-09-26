@@ -308,6 +308,74 @@ pub(super) unsafe fn count_le_16(cuts: &[f32], value: f32) -> usize {
     }
 }
 
+/// `alpha * h[i] / fma(alpha, u[i], 1)` for eight lanes, four at a time.
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn edge_terms_8(alpha: f32, h: &[f32; 8], u: &[f32; 8]) -> [f32; 8] {
+    let mut out = [0f32; 8];
+    // SAFETY: the caller guarantees NEON support; each access covers one
+    // half of an eight-lane array.
+    unsafe {
+        let a = vdupq_n_f32(alpha);
+        let one = vdupq_n_f32(1.0);
+        for half in 0..2 {
+            let offset = half * VECTOR_WIDTH;
+            let hv = vld1q_f32(h.as_ptr().add(offset));
+            let uv = vld1q_f32(u.as_ptr().add(offset));
+            let t = vdivq_f32(vmulq_f32(a, hv), vfmaq_f32(one, a, uv));
+            vst1q_f32(out.as_mut_ptr().add(offset), t);
+        }
+    }
+    out
+}
+
+/// `c[i] * fma(alpha, u[i], 1)` for eight lanes, four at a time.
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn scaled_basis_8(alpha: f32, c: &[f32; 8], u: &[f32; 8]) -> [f32; 8] {
+    let mut out = [0f32; 8];
+    // SAFETY: the caller guarantees NEON support; each access covers one
+    // half of an eight-lane array.
+    unsafe {
+        let a = vdupq_n_f32(alpha);
+        let one = vdupq_n_f32(1.0);
+        for half in 0..2 {
+            let offset = half * VECTOR_WIDTH;
+            let cv = vld1q_f32(c.as_ptr().add(offset));
+            let uv = vld1q_f32(u.as_ptr().add(offset));
+            vst1q_f32(
+                out.as_mut_ptr().add(offset),
+                vmulq_f32(cv, vfmaq_f32(one, a, uv)),
+            );
+        }
+    }
+    out
+}
+
+/// `c[i] / fma(alpha, u[i], 1)` for eight lanes when every `c[i]` and
+/// every denominator is finite, else `None`.
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn divided_basis_8(alpha: f32, c: &[f32; 8], u: &[f32; 8]) -> Option<[f32; 8]> {
+    let mut out = [0f32; 8];
+    // SAFETY: the caller guarantees NEON support; each access covers one
+    // half of an eight-lane array.
+    unsafe {
+        let a = vdupq_n_f32(alpha);
+        let one = vdupq_n_f32(1.0);
+        let inf = vdupq_n_f32(f32::INFINITY);
+        let mut finite = vdupq_n_u32(u32::MAX);
+        for half in 0..2 {
+            let offset = half * VECTOR_WIDTH;
+            let cv = vld1q_f32(c.as_ptr().add(offset));
+            let uv = vld1q_f32(u.as_ptr().add(offset));
+            let old = vfmaq_f32(one, a, uv);
+            // `|x| < inf` is false exactly for infinities and NaN.
+            finite = vandq_u32(finite, vcltq_f32(vabsq_f32(cv), inf));
+            finite = vandq_u32(finite, vcltq_f32(vabsq_f32(old), inf));
+            vst1q_f32(out.as_mut_ptr().add(offset), vdivq_f32(cv, old));
+        }
+        (vminvq_u32(finite) == u32::MAX).then_some(out)
+    }
+}
+
 /// Vector-loop shell of a `&mut [f32]` unary inplace kernel: vector fast path
 /// for regular lanes, scalar per-lane fallback otherwise. The kernel and
 /// scalar formulas (intrinsics included) are passed in as expressions.

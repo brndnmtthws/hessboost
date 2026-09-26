@@ -17,6 +17,7 @@ pub(crate) use hist::LeafRows;
 pub(crate) use multi::{MultiTreeBuilder, VectorGradients};
 pub(crate) use oblivious::check_symmetric_input;
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 
 use crate::K_RT_EPS;
@@ -393,54 +394,149 @@ impl SplitScorer<'_> {
             && self.root_gain.is_finite()
     }
 
-    /// Whether the candidate `(left, right)` certainly cannot score a loss
-    /// change above `incumbent` under [`Self::loss_chg`], decided without a
-    /// division: `U = Σ G² / (H + λ)` bounds the exact loss change by
-    /// `U - root_gain` within the exact scorer's share of the
-    /// [`APPROX_MARGIN`] and [`UNDERFLOW_MARGIN`] analysis, and the
-    /// comparison is cross-multiplied. `false` whenever [`Self::approx_exact`]
-    /// does not hold or `U` overflows, so a `true` never hides a winner. (A
-    /// loss change that overflows or is NaN never replaces an incumbent from
-    /// the same or an earlier feature, so a `true` for it is harmless.)
-    #[inline]
+    /// [`Screen::cannot_beat`] of this node: `false` whenever
+    /// [`Self::approx_exact`] does not hold.
+    #[cfg(test)]
     pub(super) fn cannot_beat(&self, left: GradStats, right: GradStats, incumbent: f64) -> bool {
-        // The exact score is within `4ε(U + |root|) + (D_l + D_r + 2)τ` of
-        // `U - root` ([`APPROX_MARGIN`]); `κ = 2^-19` is eight times the
-        // relative part, and `UNDERFLOW_MARGIN · (D_l + D_r + 1)` over
-        // thirty times the absolute one.
-        const KAPPA: f64 = 1.0 / 524_288.0;
-        if !self.approx_exact() {
-            return false;
-        }
-        let lambda = self.reg.lambda;
+        self.screen()
+            .is_some_and(|screen| screen.cannot_beat(left, right, incumbent))
+    }
+
+    /// The node constants of the division-free screen, or `None` where
+    /// [`Self::approx_exact`] does not hold (nothing may be screened): taken
+    /// once so a scan over many candidates of one node screens each with a
+    /// few multiplications.
+    #[inline]
+    pub(super) fn screen(&self) -> Option<Screen> {
+        self.approx_exact().then(|| Screen {
+            lambda: self.reg.lambda,
+            root: f64::from(self.root_gain),
+        })
+    }
+}
+
+/// A node's division-free candidate screen ([`SplitScorer::screen`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Screen {
+    lambda: f64,
+    root: f64,
+}
+
+impl Screen {
+    /// Whether the candidate `(left, right)` certainly cannot score a loss
+    /// change above `incumbent` under [`SplitScorer::loss_chg`], decided
+    /// without a division: `U = Σ G² / (H + λ)` bounds the exact loss change
+    /// by `U - root_gain` within the exact scorer's share of the
+    /// [`APPROX_MARGIN`] and [`UNDERFLOW_MARGIN`] analysis, and the
+    /// comparison is cross-multiplied. `false` whenever `U` overflows, so a
+    /// `true` never hides a winner. (A loss change that overflows or is NaN
+    /// never replaces an incumbent from the same or an earlier feature, so a
+    /// `true` for it is harmless.)
+    #[cfg(test)]
+    pub(super) fn cannot_beat(self, left: GradStats, right: GradStats, incumbent: f64) -> bool {
+        let Screen { lambda, root } = self;
         let (hl, hr) = (left.hess + lambda, right.hess + lambda);
         if !(hl > 0.0 && hr > 0.0) {
             return false;
         }
-        let root = f64::from(self.root_gain);
         // The exact loss change is at most `U(1 + κ) - root + κ|root| + a`,
         // `a` the absolute allowance; it stays at most the incumbent while
         // `U(1 + κ) < incumbent + root - κ(|root| + |incumbent|) - a`.
         let absolute = UNDERFLOW_MARGIN * (hl + hr + 1.0);
-        let bound = incumbent + root - KAPPA * (root.abs() + incumbent.abs()) - absolute;
+        let bound = incumbent + root - SCREEN_KAPPA * (root.abs() + incumbent.abs()) - absolute;
         let n = left.grad * left.grad * hr + right.grad * right.grad * hl;
-        n * (1.0 + KAPPA) < bound * (hl * hr)
+        n * (1.0 + SCREEN_KAPPA) < bound * (hl * hr)
     }
 
-    /// An `f32` approximation of [`Self::score_run`] (same arguments and
-    /// `-inf` for invalid candidates, validity decided exactly): each child
-    /// contributes `G · (G / (H + λ))`, the closed form of its gain at the
-    /// optimal weight. Valid only under [`Self::approx_exact`].
+    /// `Self::cannot_beat` (the per-candidate bound the tests check against) of
+    /// the node whose statistics have Hessian
+    /// `total_hess`, against `incumbent`, with everything but the
+    /// candidate's own terms computed once ([`ScreenBound::rules_out`]).
     #[inline]
+    pub(super) fn bound(self, total_hess: f64, incumbent: f64) -> ScreenBound {
+        // Every candidate's allowance `a = UNDERFLOW_MARGIN · (D_l + D_r +
+        // 1)` is at most this one: its children have `H_l, H_r >= 0` with
+        // `H_r = H - H_l` rounded, so `H_l + H_r <= H(1 + ε)` and the rounded
+        // `D_l + D_r` stays within `(H + 2λ)(1 + 4ε)`; `2^-20` covers every
+        // rounding here.
+        const SLACK: f64 = 1.0 + 1.0 / 1_048_576.0;
+        let Screen { lambda, root } = self;
+        let allowance = UNDERFLOW_MARGIN * ((total_hess + 2.0 * lambda) * SLACK + 1.0) * SLACK;
+        ScreenBound {
+            lambda,
+            limit: incumbent + root - SCREEN_KAPPA * (root.abs() + incumbent.abs()) - allowance,
+        }
+    }
+}
+
+/// `κ = 2^-19` of the division-free screen: the exact score is within
+/// `4ε(U + |root|) + (D_l + D_r + 2)τ` of `U - root` ([`APPROX_MARGIN`]);
+/// `κ` is eight times the relative part, and `UNDERFLOW_MARGIN · (D_l +
+/// D_r + 1)` over thirty times the absolute one.
+const SCREEN_KAPPA: f64 = 1.0 / 524_288.0;
+
+/// The division-free screen bound to one node and incumbent
+/// ([`Screen::bound`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ScreenBound {
+    lambda: f64,
+    /// `incumbent + root - κ(|root| + |incumbent|)` less the largest
+    /// allowance of any candidate of the node.
+    limit: f64,
+}
+
+impl ScreenBound {
+    /// Whether the candidate `(left, right)`, whose children's Hessians are
+    /// non-negative and sum to the node's (`right = total - left`, or the
+    /// reverse), certainly cannot beat the incumbent. Implies
+    /// `Screen::cannot_beat`: its limit is at most every candidate's own
+    /// bound, and both sides of the comparison round monotonically.
+    #[inline]
+    pub(super) fn rules_out(self, left: GradStats, right: GradStats) -> bool {
+        let (hl, hr) = (left.hess + self.lambda, right.hess + self.lambda);
+        if !(hl > 0.0 && hr > 0.0) {
+            return false;
+        }
+        let n = left.grad * left.grad * hr + right.grad * right.grad * hl;
+        n * (1.0 + SCREEN_KAPPA) < self.limit * (hl * hr)
+    }
+}
+
+impl SplitScorer<'_> {
+    /// An `f32` approximation of [`Self::score_run`] (`acc` holds each
+    /// candidate's accumulated statistics; `-inf` for invalid candidates,
+    /// validity decided exactly): each child contributes `G · (G / (H +
+    /// λ))`, the closed form of its gain at the optimal weight. Valid only
+    /// under [`Self::approx_exact`].
+    #[inline]
+    pub(super) fn approx_run<const ACC_LEFT: bool>(
+        &self,
+        total: GradStats,
+        acc: &[GradStats],
+        approx: &mut [f32],
+    ) {
+        // A child is valid when `H > 0` and `H >= min_child_weight`: one
+        // of the two tests implies the other, so each child needs one
+        // compare.
+        if self.reg.min_child_weight > 0.0 {
+            self.approx_run_with::<ACC_LEFT, true>(total, acc, approx);
+        } else {
+            self.approx_run_with::<ACC_LEFT, false>(total, acc, approx);
+        }
+    }
+
+    /// [`Self::approx_run`] with `MCW_POSITIVE` = `min_child_weight > 0`
+    /// (a child is then valid when `H >= min_child_weight`, else when
+    /// `H > 0`).
+    #[inline(always)]
     #[allow(
         clippy::needless_bitwise_bool,
         reason = "non-short-circuit validity keeps the loop branch-free so it vectorizes"
     )]
-    pub(super) fn approx_run<const ACC_LEFT: bool>(
+    fn approx_run_with<const ACC_LEFT: bool, const MCW_POSITIVE: bool>(
         &self,
         total: GradStats,
-        acc_grad: &[f64],
-        acc_hess: &[f64],
+        acc: &[GradStats],
         approx: &mut [f32],
     ) {
         let RegParams {
@@ -453,10 +549,17 @@ impl SplitScorer<'_> {
             let g = g as f32;
             g * (g / (h + lambda) as f32)
         };
+        let valid_child = |h: f64| {
+            if MCW_POSITIVE {
+                h >= min_child_weight
+            } else {
+                h > 0.0
+            }
+        };
         let n = approx.len();
-        let (acc_grad, acc_hess) = (&acc_grad[..n], &acc_hess[..n]);
+        let acc = &acc[..n];
         for i in 0..n {
-            let (ag, ah) = (acc_grad[i], acc_hess[i]);
+            let (ag, ah) = (acc[i].grad, acc[i].hess);
             let (og, oh) = (total.grad - ag, total.hess - ah);
             let (lg, lh, rg, rh) = if ACC_LEFT {
                 (ag, ah, og, oh)
@@ -465,8 +568,7 @@ impl SplitScorer<'_> {
             };
             // Non-short-circuit `&` keeps the loop free of branches, so it
             // vectorizes.
-            let valid =
-                (lh > 0.0) & (rh > 0.0) & (lh >= min_child_weight) & (rh >= min_child_weight);
+            let valid = valid_child(lh) & valid_child(rh);
             let chg = (gain(lg, lh) + gain(rg, rh)) - root_gain;
             approx[i] = if valid { chg } else { f32::NEG_INFINITY };
         }
@@ -600,6 +702,18 @@ pub(super) fn scan_numeric_splits(
     {
         return scan;
     }
+    scan_batched(bins, first, total, dense, scorer)
+}
+
+/// [`scan_numeric_splits`] without the approximate prefilter: every
+/// candidate scored exactly, in runs of [`SCAN_RUN`].
+fn scan_batched(
+    bins: &[GradStats],
+    first: usize,
+    total: GradStats,
+    dense: bool,
+    scorer: &SplitScorer,
+) -> NumericScan {
     let mut run = RunMax {
         best: f32::NEG_INFINITY,
         at: None,
@@ -720,10 +834,6 @@ const UNDERFLOW_MARGIN: f64 = f64::from_bits((1023 - 144) << 52);
 /// least the approximate maximum's exact value. The result is therefore the
 /// exact scan's. `None` (non-finite approximations, or gains or `H + λ` too
 /// large for the error bound) defers to the exact scan.
-#[allow(
-    clippy::needless_bitwise_bool,
-    reason = "branch-free overflow and threshold tests vectorize"
-)]
 fn scan_filtered(
     bins: &[GradStats],
     first: usize,
@@ -733,33 +843,150 @@ fn scan_filtered(
     scratch: &mut ScanScratch,
 ) -> Option<NumericScan> {
     let n = bins.len();
-    let ScanScratch { grad, hess, approx } = scratch;
-    let (grad, hess, approx) = (&mut grad[..2 * n], &mut hess[..2 * n], &mut approx[..2 * n]);
-    let mut acc = GradStats::default();
-    // The extreme accumulated Hessians, which bound every child's `H`.
-    let (mut hess_lo, mut hess_hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for ((&bin, g), h) in bins.iter().zip(&mut grad[..n]).zip(&mut hess[..n]) {
-        acc.add(bin);
-        *g = acc.grad;
-        *h = acc.hess;
-        hess_lo = hess_lo.min(acc.hess);
-        hess_hi = hess_hi.max(acc.hess);
+    let mut prefix = Prefix::default();
+    for (&bin, s) in bins.iter().zip(&mut scratch.acc[..n]) {
+        prefix.add(bin);
+        *s = prefix.acc;
     }
-    scorer.approx_run::<true>(total, &grad[..n], &hess[..n], &mut approx[..n]);
+    scan_filtered_rest(bins, first, total, dense, scorer, scratch, prefix)
+}
+
+/// A forward prefix sum in progress: the running statistics and whether
+/// every bin so far has a non-negative Hessian (tracked alongside, where
+/// the sum's dependent chain leaves the vector units idle).
+#[derive(Clone, Copy)]
+struct Prefix {
+    acc: GradStats,
+    nonneg: bool,
+}
+
+impl Default for Prefix {
+    fn default() -> Self {
+        Prefix {
+            acc: GradStats::default(),
+            nonneg: true,
+        }
+    }
+}
+
+impl Prefix {
+    #[inline(always)]
+    fn add(&mut self, bin: GradStats) {
+        self.acc.add(bin);
+        self.nonneg &= bin.hess >= 0.0;
+    }
+}
+
+/// [`scan_numeric_splits`] of two features, whose forward prefix sums (one
+/// dependent `f64` chain per feature) are formed in one interleaved loop so
+/// the two chains overlap. Each feature's result is its own scan's.
+pub(super) fn scan_numeric_pair(
+    a: &NumericInput,
+    b: &NumericInput,
+    scratch: [&mut ScanScratch; 2],
+) -> [NumericScan; 2] {
+    let [sa, sb] = scratch;
+    let filtered = |x: &NumericInput| x.bins.len() <= FILTER_BINS && x.scorer.approx_exact();
+    if !(filtered(a) && filtered(b)) {
+        return [a.scan(sa), b.scan(sb)];
+    }
+    let (na, nb) = (a.bins.len(), b.bins.len());
+    let common = na.min(nb);
+    let (mut acc_a, mut acc_b) = (Prefix::default(), Prefix::default());
+    {
+        let (sa, sb) = (&mut sa.acc[..common], &mut sb.acc[..common]);
+        let (ba, bb) = (&a.bins[..common], &b.bins[..common]);
+        for i in 0..common {
+            acc_a.add(ba[i]);
+            acc_b.add(bb[i]);
+            (sa[i], sb[i]) = (acc_a.acc, acc_b.acc);
+        }
+    }
+    for (x, s, acc) in [(a, &mut *sa, &mut acc_a), (b, &mut *sb, &mut acc_b)] {
+        let n = x.bins.len();
+        for i in common..n {
+            acc.add(x.bins[i]);
+            s.acc[i] = acc.acc;
+        }
+    }
+    let finish = |x: &NumericInput, s: &mut ScanScratch, acc| {
+        scan_filtered_rest(x.bins, x.first, x.total, x.dense, &x.scorer, s, acc)
+            .unwrap_or_else(|| scan_batched(x.bins, x.first, x.total, x.dense, &x.scorer))
+    };
+    [finish(a, sa, acc_a), finish(b, sb, acc_b)]
+}
+
+/// One feature's histogram and scoring context, as [`scan_numeric_splits`]
+/// takes them.
+pub(super) struct NumericInput<'a> {
+    /// The feature's bins (global bins from `first`).
+    pub(super) bins: &'a [GradStats],
+    pub(super) first: usize,
+    /// The node's statistics.
+    pub(super) total: GradStats,
+    /// The index has no missing values.
+    pub(super) dense: bool,
+    pub(super) scorer: SplitScorer<'a>,
+}
+
+impl NumericInput<'_> {
+    /// [`scan_numeric_splits`] of this feature.
+    pub(super) fn scan(&self, scratch: &mut ScanScratch) -> NumericScan {
+        scan_numeric_splits(
+            self.bins,
+            self.first,
+            self.total,
+            self.dense,
+            &self.scorer,
+            scratch,
+        )
+    }
+}
+
+/// [`scan_filtered`] after its forward prefix sums: `scratch.acc` holds
+/// them for every bin, and `prefix` is their last value (with whether every
+/// bin's Hessian is non-negative).
+#[allow(
+    clippy::needless_bitwise_bool,
+    reason = "branch-free overflow and threshold tests vectorize"
+)]
+fn scan_filtered_rest(
+    bins: &[GradStats],
+    first: usize,
+    total: GradStats,
+    dense: bool,
+    scorer: &SplitScorer,
+    scratch: &mut ScanScratch,
+    prefix: Prefix,
+) -> Option<NumericScan> {
+    let Prefix { acc, nonneg } = prefix;
+    let n = bins.len();
+    let ScanScratch { acc: stats, approx } = scratch;
+    let (stats, approx) = (&mut stats[..2 * n], &mut approx[..2 * n]);
+    // The extreme accumulated Hessians, which bound every child's `H`. With
+    // every bin's Hessian non-negative (the usual case) each running sum
+    // only grows, since adding a non-negative value never rounds below the
+    // sum, so they are the first and last sums; otherwise a separate pass
+    // finds them.
+    let extremes = |sums: &[GradStats]| match (nonneg, sums.first(), sums.last()) {
+        (true, Some(first), Some(last)) => (first.hess, last.hess),
+        _ => min_max_hess(sums),
+    };
+    let (mut hess_lo, mut hess_hi) = extremes(&stats[..n]);
+    scorer.approx_run::<true>(total, &stats[..n], &mut approx[..n]);
     // Candidates `n..2n` are the backward pass, whose accumulated statistics
     // are the right child's.
     let mut m = n;
     if !(dense || acc == total) {
         let mut suffix = GradStats::default();
-        for ((&bin, g), h) in bins.iter().rev().zip(&mut grad[n..]).zip(&mut hess[n..]) {
+        for (&bin, s) in bins.iter().rev().zip(&mut stats[n..]) {
             suffix.add(bin);
-            *g = suffix.grad;
-            *h = suffix.hess;
-            hess_lo = hess_lo.min(suffix.hess);
-            hess_hi = hess_hi.max(suffix.hess);
+            *s = suffix;
         }
-        let (grad, hess) = (&grad[n..], &hess[n..]);
-        scorer.approx_run::<false>(total, grad, hess, &mut approx[n..]);
+        let (lo, hi) = extremes(&stats[n..]);
+        hess_lo = hess_lo.min(lo);
+        hess_hi = hess_hi.max(hi);
+        scorer.approx_run::<false>(total, &stats[n..], &mut approx[n..]);
         m = 2 * n;
     }
     let mut max = f32::NEG_INFINITY;
@@ -809,7 +1036,7 @@ fn scan_filtered(
                 continue;
             }
             let i = chunk * FILTER_RUN + k;
-            let acc = GradStats::new(grad[i], hess[i]);
+            let acc = stats[i];
             let (pos, children) = if i < n {
                 (
                     SplitPos::Bin(first + i),
@@ -847,18 +1074,57 @@ fn scan_filtered(
     })
 }
 
+/// The smallest and largest non-NaN Hessians of `stats` (`(inf, -inf)` when
+/// there are none), over four independent lanes so the comparisons neither
+/// form one long dependency chain nor depend on the order.
+#[inline]
+fn min_max_hess(stats: &[GradStats]) -> (f64, f64) {
+    let mut lo = [f64::INFINITY; 4];
+    let mut hi = [f64::NEG_INFINITY; 4];
+    let (quads, rest) = stats.as_chunks::<4>();
+    for quad in quads {
+        for k in 0..4 {
+            lo[k] = lo[k].min(quad[k].hess);
+            hi[k] = hi[k].max(quad[k].hess);
+        }
+    }
+    for (k, s) in rest.iter().enumerate() {
+        lo[k] = lo[k].min(s.hess);
+        hi[k] = hi[k].max(s.hess);
+    }
+    (
+        lo[0].min(lo[1]).min(lo[2].min(lo[3])),
+        hi[0].max(hi[1]).max(hi[2].max(hi[3])),
+    )
+}
+
+thread_local! {
+    /// Each thread's pair of [`ScanScratch`] buffers ([`with_scan_scratch`]).
+    static SCAN_SCRATCH: RefCell<[ScanScratch; 2]> =
+        RefCell::new([ScanScratch::new(), ScanScratch::new()]);
+}
+
+/// Run `f` with this thread's pair of scan buffers, allocated once per
+/// thread instead of per node (fresh ones if a caller up the stack holds
+/// them).
+pub(super) fn with_scan_scratch<R>(f: impl FnOnce(&mut [ScanScratch; 2]) -> R) -> R {
+    SCAN_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => f(&mut scratch),
+        Err(_) => f(&mut [ScanScratch::new(), ScanScratch::new()]),
+    })
+}
+
 /// Candidate buffers of [`scan_numeric_splits`], reused across features.
 pub(super) struct ScanScratch {
-    grad: Vec<f64>,
-    hess: Vec<f64>,
+    /// Each candidate's accumulated statistics (forward pass, then backward).
+    acc: Vec<GradStats>,
     approx: Vec<f32>,
 }
 
 impl ScanScratch {
     pub(super) fn new() -> Self {
         ScanScratch {
-            grad: vec![0.0; 2 * FILTER_BINS],
-            hess: vec![0.0; 2 * FILTER_BINS],
+            acc: vec![GradStats::default(); 2 * FILTER_BINS],
             approx: vec![0.0; 2 * FILTER_BINS],
         }
     }
@@ -1526,7 +1792,7 @@ mod tests {
         assert_eq!(split_key(&actual), split_key(&expected));
     }
 
-    /// [`SplitScorer::cannot_beat`] on the true winner of
+    /// [`Screen::cannot_beat`] on the true winner of
     /// [`numeric_scan_keeps_the_winner_when_weights_square_to_subnormals`],
     /// whose exact loss change exceeds its `G² / (H + λ)` estimate by 1.2%:
     /// no incumbent below the exact loss change rules it out.
@@ -1549,7 +1815,7 @@ mod tests {
         }
     }
 
-    /// [`SplitScorer::cannot_beat`] never rules out a candidate whose exact
+    /// [`Screen::cannot_beat`] never rules out a candidate whose exact
     /// loss change exceeds the incumbent, including incumbents a few `f32`
     /// steps around the exact value, and does rule out clearly worse ones.
     #[test]
@@ -1592,6 +1858,72 @@ mod tests {
             }
             if scorer.cannot_beat(left, right, f64::from(exact) + f64::from(exact.abs()) + 1.0) {
                 ruled_out += 1;
+            }
+        }
+        assert!(ruled_out > 10_000, "{ruled_out}");
+    }
+
+    /// [`ScreenBound::rules_out`], the exact builder's precomputed screen,
+    /// rules out only candidates [`Screen::cannot_beat`] rules out, for
+    /// children formed as the scan forms them (`right = total - left`, both
+    /// Hessians non-negative), in either orientation, at magnitudes where
+    /// the underflow allowance matters, and for incumbents around each
+    /// candidate's own score.
+    #[test]
+    fn screen_bound_implies_cannot_beat() {
+        let mut rng = crate::rng::Rng::new(23);
+        let mut ruled_out = 0;
+        for _ in 0..20_000 {
+            let g_scale = [1e-30f64, 1e-3, 1.0, 1e3, 1e30][rng.range(0..5)];
+            let h_scale = [1e-30f64, 1e-3, 1.0, 1e3, 1e30][rng.range(0..5)];
+            let total = GradStats::new(
+                (rng.f64() * 2.0 - 1.0) * g_scale,
+                0.01 * h_scale + rng.f64() * h_scale,
+            );
+            let left = GradStats::new((rng.f64() * 2.0 - 1.0) * g_scale, rng.f64() * total.hess);
+            let right = total.sub(left);
+            if right.hess < 0.0 {
+                continue;
+            }
+            let lambda = [1.0, 1e-3, 0.0][rng.range(0..3)];
+            let reg = RegParams {
+                lambda,
+                alpha: 0.0,
+                max_delta_step: 0.0,
+                min_child_weight: 1e-3,
+            };
+            let scorer = SplitScorer {
+                reg: &reg,
+                root_gain: xgb_node_gain(total, &reg, Bounds::default()),
+                bounds: Bounds::default(),
+                dir: 0,
+            };
+            let Some(screen) = scorer.screen() else {
+                continue;
+            };
+            for (l, r) in [(left, right), (right, left)] {
+                let Some(score) = scorer.loss_chg(l, r) else {
+                    continue;
+                };
+                let mut incumbent = score.loss_chg;
+                for _ in 0..4 {
+                    incumbent = incumbent.next_down();
+                }
+                for _ in 0..8 {
+                    let incumbent64 = f64::from(incumbent);
+                    if screen.bound(total.hess, incumbent64).rules_out(l, r) {
+                        assert!(
+                            screen.cannot_beat(l, r, incumbent64),
+                            "{l:?} {r:?} {total:?} {incumbent}"
+                        );
+                    }
+                    incumbent = incumbent.next_up();
+                }
+                let far = f64::from(score.loss_chg) + f64::from(score.loss_chg.abs()) + 1.0;
+                if screen.bound(total.hess, far).rules_out(l, r) {
+                    assert!(screen.cannot_beat(l, r, far));
+                    ruled_out += 1;
+                }
             }
         }
         assert!(ruled_out > 10_000, "{ruled_out}");

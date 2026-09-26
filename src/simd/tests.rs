@@ -497,6 +497,135 @@ fn count_le_16_matches_scalar_on_special_values() {
 }
 
 #[test]
+fn shap_edge_terms_match_the_scalar_expression_bit_for_bit() {
+    // SHAP values must equal XGBoost's per-lane arithmetic exactly, including
+    // overflowing, underflowing, and NaN lanes, so the vector kernel is
+    // compared bitwise with the scalar expression (fused multiply-add on
+    // AArch64, as `shap::madd` rounds).
+    let scalar = |alpha: f32, h: f32, u: f32| {
+        let denominator = if cfg!(target_arch = "aarch64") {
+            alpha.mul_add(u, 1.0)
+        } else {
+            alpha * u + 1.0
+        };
+        alpha * h / denominator
+    };
+    let u = [
+        0.0,
+        0.019_855_07,
+        0.101_666_76,
+        0.237_233_8,
+        0.408_282_68,
+        0.591_717_3,
+        0.762_766_2,
+        1.0,
+    ];
+    let h = [
+        1.5,
+        -2.25,
+        1e-30,
+        3.0e38,
+        -0.0,
+        f32::INFINITY,
+        f32::NAN,
+        7.0,
+    ];
+    for alpha in [
+        -1.0,
+        -0.999_999,
+        -0.5,
+        0.0,
+        0.3,
+        1.0,
+        12.5,
+        1e30,
+        -3.4e38,
+        f32::NAN,
+    ] {
+        let terms = shap_edge_terms(alpha, &h, &u);
+        for i in 0..8 {
+            let expected = scalar(alpha, h[i], u[i]);
+            assert_eq!(
+                terms[i].to_bits(),
+                expected.to_bits(),
+                "alpha {alpha} lane {i}: {} vs {expected}",
+                terms[i]
+            );
+        }
+    }
+}
+
+#[test]
+fn shap_basis_kernels_match_the_scalar_expressions_bit_for_bit() {
+    // The child basis `c · (1 + α·u)` and the divided-out factor
+    // `c / (1 + α·u)` must equal the per-lane scalar arithmetic exactly;
+    // the division declines (`None`) whenever an input lane or denominator is
+    // not finite, where the caller redoes the lanes in `f64`.
+    let denominator = |alpha: f32, u: f32| {
+        if cfg!(target_arch = "aarch64") {
+            alpha.mul_add(u, 1.0)
+        } else {
+            alpha * u + 1.0
+        }
+    };
+    let u = [
+        0.0,
+        0.019_855_07,
+        0.101_666_76,
+        0.237_233_8,
+        0.408_282_68,
+        0.591_717_3,
+        0.762_766_2,
+        1.0,
+    ];
+    let finite = [1.5, -2.25, 1e-30, 3.0e38, -0.0, 1e-45, 7.0, 0.125];
+    let mut non_finite = finite;
+    non_finite[5] = f32::INFINITY;
+    let mut nan = finite;
+    nan[2] = f32::NAN;
+    for alpha in [
+        -1.0,
+        -0.999_999,
+        -0.5,
+        0.0,
+        0.3,
+        1.0,
+        12.5,
+        1e30,
+        -3.4e38,
+        f32::NAN,
+    ] {
+        for c in [finite, non_finite, nan] {
+            let scaled = shap_scaled_basis(alpha, &c, &u);
+            for i in 0..8 {
+                let expected = c[i] * denominator(alpha, u[i]);
+                assert_eq!(
+                    scaled[i].to_bits(),
+                    expected.to_bits(),
+                    "scaled alpha {alpha} lane {i}"
+                );
+            }
+            let old: [f32; 8] = std::array::from_fn(|i| denominator(alpha, u[i]));
+            let all_finite = c.iter().chain(&old).all(|v| v.is_finite());
+            match shap_divided_basis(alpha, &c, &u) {
+                Some(divided) => {
+                    assert!(all_finite, "alpha {alpha}: divided a non-finite lane");
+                    for i in 0..8 {
+                        let expected = c[i] / old[i];
+                        assert_eq!(
+                            divided[i].to_bits(),
+                            expected.to_bits(),
+                            "divided alpha {alpha} lane {i}"
+                        );
+                    }
+                }
+                None => assert!(!all_finite, "alpha {alpha}: declined finite lanes"),
+            }
+        }
+    }
+}
+
+#[test]
 fn pointwise_metric_sums_are_close_to_scalar() {
     let preds: Vec<f32> = (0..4_103).map(|i| (i % 1_001) as f32 * 0.001).collect();
     let labels: Vec<f32> = (0..preds.len()).map(|i| (i % 2) as f32).collect();

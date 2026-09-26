@@ -81,7 +81,7 @@ enum Prepared {
 
 impl Prepared {
     /// Grow one tree on `sample`, with the rows that reached each leaf when
-    /// `capture_rows` (histogram method only; empty otherwise). With reuse
+    /// `capture_rows` (histogram and exact methods; empty otherwise). With reuse
     /// penalties (`reuse` is `Some`) the split search is penalized by the
     /// ensemble's dictionary, which the new tree's splits then extend.
     /// `rounding_seed` keys the stochastic rounding of quantized training.
@@ -115,12 +115,17 @@ impl Prepared {
             }
         };
         let (tree, leaf_rows) = match self {
-            Prepared::Exact(cols) => (
-                ExactTreeBuilder::new(params)
-                    .with_reuse(reuse.as_deref())
-                    .build(cols, dtrain, gpair, rows, sampler),
-                Vec::new(),
-            ),
+            Prepared::Exact(cols) => {
+                let builder = ExactTreeBuilder::new(params).with_reuse(reuse.as_deref());
+                if capture_rows {
+                    builder.build_with_leaf_rows(cols, dtrain, gpair, rows, sampler)
+                } else {
+                    (
+                        builder.build(cols, dtrain, gpair, rows, sampler),
+                        Vec::new(),
+                    )
+                }
+            }
             Prepared::Hist { index, backend, .. } => {
                 hist(index, backend.as_ref(), reuse.as_deref(), sampler)
             }
@@ -1008,14 +1013,17 @@ fn grow_round(
             // per leaf: the training margin update's, when every row took
             // part, and the linear-leaf fit's. Linear leaves use them only
             // when they equal raw routing (see `rows_route_like_trees`).
-            let (hist, linear_rows) = match prepared {
+            let (routed, linear_rows) = match prepared {
                 Prepared::Hist {
                     rows_route_like_trees,
                     ..
                 } => (true, params.linear_tree && *rows_route_like_trees),
-                _ => (false, false),
+                // The exact builder routes rows by their raw values, as
+                // prediction does.
+                Prepared::Exact(_) => (true, false),
+                Prepared::Approx { .. } => (false, false),
             };
-            let margin_rows = hist
+            let margin_rows = routed
                 && dropped.is_none()
                 && row_subset.len() == n
                 && !gradient_sampling(params)
@@ -1104,8 +1112,8 @@ fn grow_round(
         // DART's gradients come from the ensemble, not the margin caches
         // (`finish_dart` recomputes the eval ones).
         if dropped.is_none() {
-            // Row partitions already identify training leaves when every row
-            // participated in histogram construction.
+            // The builder's final row partitions already identify the training
+            // leaves when every row took part in growing the tree.
             let captured = slot.margin_rows.then_some(leaf_rows.as_slice());
             state
                 .margins

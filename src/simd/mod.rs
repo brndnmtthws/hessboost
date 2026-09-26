@@ -154,11 +154,14 @@ macro_rules! dispatch_softmax {
 
 /// Resolve the process-wide AArch64 backend lazily on the first numeric-kernel
 /// call. `LazyLock` makes feature detection a one-time initialization cost, and
-/// subsequent calls are a cached load and comparison.
+/// subsequent calls are a cached load and comparison. A build whose target
+/// enables NEON (every standard AArch64 target) needs no check at all, which
+/// keeps per-element callers (SHAP's edge terms, cut search) free of the
+/// load's acquire ordering.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn neon_available() -> bool {
-    *NEON_AVAILABLE
+    cfg!(target_feature = "neon") || *NEON_AVAILABLE
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -192,6 +195,40 @@ pub(crate) fn prefetch_read<T>(value: &T) {
     let _ = value;
 }
 
+/// `base + 1` when `a > b`, else `base`, computed without a branch.
+///
+/// Tree walks step to `left + (key > threshold)` for rows whose outcomes
+/// are data-dependent and unpredictable; LLVM's AArch64 backend lowers that
+/// select (in any spelling) to a conditional branch, which such rows
+/// mispredict about a quarter of the time. The AArch64 path pins the
+/// conditional increment in one instruction.
+#[inline(always)]
+pub(crate) fn step_if_greater(base: usize, a: u32, b: u32) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let out: usize;
+        // SAFETY: a compare and a conditional increment of registers; no
+        // memory access, and `preserves_flags` is not claimed, so the
+        // compiler treats the condition flags as clobbered.
+        unsafe {
+            std::arch::asm!(
+                "cmp {a:w}, {b:w}",
+                "cinc {out}, {base}, hi",
+                a = in(reg) a,
+                b = in(reg) b,
+                base = in(reg) base,
+                out = lateout(reg) out,
+                options(pure, nomem, nostack)
+            );
+        }
+        out
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        base + usize::from(a > b)
+    }
+}
+
 /// Number of entries of `cuts` that are `<= value` (ordered comparison).
 #[inline]
 pub(crate) fn count_le(cuts: &[f32], value: f32) -> usize {
@@ -206,6 +243,61 @@ pub(crate) fn count_le(cuts: &[f32], value: f32) -> usize {
         return unsafe { x86_64::count_le_16(cuts, value) };
     }
     cuts.iter().filter(|&&cut| cut <= value).count()
+}
+
+/// QuadratureTreeSHAP's return-edge terms `α·h[i] / (1 + α·u[i])` for the
+/// eight quadrature lanes, with the denominator's multiply-add fused on
+/// AArch64 (as XGBoost's builds there contract it) and unfused elsewhere.
+/// Every lane is the scalar expression's value exactly.
+#[inline(always)]
+pub(crate) fn shap_edge_terms(alpha: f32, h: &[f32; 8], u: &[f32; 8]) -> [f32; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if neon_available() {
+        // SAFETY: NEON is present.
+        return unsafe { aarch64::edge_terms_8(alpha, h, u) };
+    }
+    std::array::from_fn(|i| alpha * h[i] / shap_denominator(alpha, u[i]))
+}
+
+/// QuadratureTreeSHAP's child basis `c[i] · (1 + α·u[i])` for the eight
+/// quadrature lanes, the multiply-add fused as in [`shap_edge_terms`]. Every
+/// lane is the scalar expression's value exactly.
+#[inline(always)]
+pub(crate) fn shap_scaled_basis(alpha: f32, c: &[f32; 8], u: &[f32; 8]) -> [f32; 8] {
+    #[cfg(target_arch = "aarch64")]
+    if neon_available() {
+        // SAFETY: NEON is present.
+        return unsafe { aarch64::scaled_basis_8(alpha, c, u) };
+    }
+    std::array::from_fn(|i| c[i] * shap_denominator(alpha, u[i]))
+}
+
+/// `c[i] / (1 + α·u[i])` for the eight quadrature lanes (the multiply-add
+/// fused as in [`shap_edge_terms`]) when every `c[i]` and every denominator
+/// is finite, else `None`. Every lane is the scalar expression's value
+/// exactly.
+#[inline(always)]
+pub(crate) fn shap_divided_basis(alpha: f32, c: &[f32; 8], u: &[f32; 8]) -> Option<[f32; 8]> {
+    #[cfg(target_arch = "aarch64")]
+    if neon_available() {
+        // SAFETY: NEON is present.
+        return unsafe { aarch64::divided_basis_8(alpha, c, u) };
+    }
+    let old: [f32; 8] = std::array::from_fn(|i| shap_denominator(alpha, u[i]));
+    c.iter()
+        .zip(&old)
+        .all(|(c, o)| c.is_finite() && o.is_finite())
+        .then(|| std::array::from_fn(|i| c[i] / old[i]))
+}
+
+/// `1 + α·u`, fused on AArch64 (as XGBoost's builds there contract it).
+#[inline(always)]
+fn shap_denominator(alpha: f32, u: f32) -> f32 {
+    if cfg!(target_arch = "aarch64") {
+        alpha.mul_add(u, 1.0)
+    } else {
+        alpha * u + 1.0
+    }
 }
 
 /// Whether a gradient kernel may take the vector path: at least

@@ -19,7 +19,7 @@
 //!   `max_bin` entries. Used by `approx`, whose weights are the current
 //!   Hessians.
 
-use super::quantile::{RadixScratch, radix_sort, sort_key};
+use super::quantile::{RadixScratch, radix_sort, sort_key, unsort_key};
 
 /// One summary entry (`WQSummary::Entry`): a value with its rank interval
 /// `[rmin, rmax]` and the weight `wmin` of the value itself.
@@ -96,6 +96,26 @@ fn set_from_sorted(queue: &[(f32, f32)], out: &mut Vec<Entry>) {
         let mut j = i + 1;
         while j < queue.len() && queue[j].0 == value {
             w += queue[j].1;
+            j += 1;
+        }
+        out.push(Entry::new(wsum, wsum + w, w, value));
+        wsum += w;
+        i = j;
+    }
+}
+
+/// [`set_from_sorted`] of values that each carry weight `1`, given as
+/// ascending [`sort_key`]s.
+fn set_from_sorted_keys(keys: &[u32], out: &mut Vec<Entry>) {
+    out.clear();
+    let mut wsum = 0f32;
+    let mut i = 0;
+    while i < keys.len() {
+        let value = unsort_key(keys[i]);
+        let mut w = 1f32;
+        let mut j = i + 1;
+        while j < keys.len() && unsort_key(keys[j]) == value {
+            w += 1.0;
             j += 1;
         }
         out.push(Entry::new(wsum, wsum + w, w, value));
@@ -183,8 +203,20 @@ fn fix_error(data: &mut [Entry]) {
     }
 }
 
+/// When either input is shorter than this, the merge runs in one pass.
+const SPLIT_COMBINE_LEN: usize = 256;
+
 /// `WQSummary::SetCombine`: merge `other` into `this`. `workspace` is scratch
 /// reused across calls.
+///
+/// Every merged entry depends only on its position in the merge: on the
+/// entries at the two cursors and the last entry taken from each input
+/// (their `rmin_next`). Both summaries hold strictly increasing values, so
+/// long inputs are split at a value `v` into the entries below `v` and the
+/// rest, and the two merges run interleaved, their dependency chains
+/// overlapping, each written to its own part of `workspace`. A value never
+/// straddles the split, so the entries are exactly those of one merge. With
+/// a `NaN` value (which orders against nothing) the merge runs in one pass.
 fn set_combine(this: &mut Vec<Entry>, other: &[Entry], workspace: &mut Vec<Entry>) {
     if other.is_empty() {
         return;
@@ -193,68 +225,127 @@ fn set_combine(this: &mut Vec<Entry>, other: &[Entry], workspace: &mut Vec<Entry
         this.extend_from_slice(other);
         return;
     }
-    workspace.clear();
     let (a, b) = (this.as_slice(), other);
-    let (mut ia, mut ib) = (0usize, 0usize);
-    let (mut aprev_rmin, mut bprev_rmin) = (0f32, 0f32);
-    while ia < a.len() && ib < b.len() {
-        let (ea, eb) = (a[ia], b[ib]);
-        if ea.value == eb.value {
-            workspace.push(Entry::new(
-                ea.rmin + eb.rmin,
-                ea.rmax + eb.rmax,
-                ea.wmin + eb.wmin,
-                ea.value,
-            ));
-            aprev_rmin = ea.rmin_next();
-            bprev_rmin = eb.rmin_next();
-            ia += 1;
-            ib += 1;
-        } else if ea.value < eb.value {
-            workspace.push(Entry::new(
-                ea.rmin + bprev_rmin,
-                ea.rmax + eb.rmax_prev(),
-                ea.wmin,
-                ea.value,
-            ));
-            aprev_rmin = ea.rmin_next();
-            ia += 1;
-        } else {
-            workspace.push(Entry::new(
-                eb.rmin + aprev_rmin,
-                eb.rmax + ea.rmax_prev(),
-                eb.wmin,
-                eb.value,
-            ));
-            bprev_rmin = eb.rmin_next();
-            ib += 1;
+    let (na, nb) = (a.len(), b.len());
+    workspace.clear();
+    workspace.resize(na + nb, Entry::new(0.0, 0.0, 0.0, 0.0));
+    let out = workspace.as_mut_slice();
+    let whole = MergeCursor {
+        ia: 0,
+        ib: 0,
+        aprev: 0.0,
+        bprev: 0.0,
+        out: 0,
+    };
+    let len = if na.min(nb) < SPLIT_COMBINE_LEN || a.iter().chain(b).any(|e| e.value.is_nan()) {
+        let mut c = whole;
+        c.finish(a, b, (na, nb), out);
+        c.out
+    } else {
+        let ia_m = na / 2;
+        let v = a[ia_m].value;
+        let ib_m = b.partition_point(|e| e.value < v);
+        let (mut lo, mut hi) = (
+            whole,
+            MergeCursor {
+                ia: ia_m,
+                ib: ib_m,
+                aprev: ia_m.checked_sub(1).map_or(0.0, |i| a[i].rmin_next()),
+                bprev: ib_m.checked_sub(1).map_or(0.0, |i| b[i].rmin_next()),
+                out: ia_m + ib_m,
+            },
+        );
+        while lo.ia < ia_m && lo.ib < ib_m && hi.ia < na && hi.ib < nb {
+            lo.step(a, b, out);
+            hi.step(a, b, out);
         }
-    }
-    if ia < a.len() {
-        let brmax = b[b.len() - 1].rmax;
-        for ea in &a[ia..] {
-            workspace.push(Entry::new(
-                ea.rmin + bprev_rmin,
-                ea.rmax + brmax,
-                ea.wmin,
-                ea.value,
-            ));
-        }
-    }
-    if ib < b.len() {
-        let armax = a[a.len() - 1].rmax;
-        for eb in &b[ib..] {
-            workspace.push(Entry::new(
-                eb.rmin + aprev_rmin,
-                eb.rmax + armax,
-                eb.wmin,
-                eb.value,
-            ));
-        }
-    }
+        lo.finish(a, b, (ia_m, ib_m), out);
+        hi.finish(a, b, (na, nb), out);
+        out.copy_within(ia_m + ib_m..hi.out, lo.out);
+        lo.out + (hi.out - (ia_m + ib_m))
+    };
+    workspace.truncate(len);
     fix_error(workspace);
     // The merged summary becomes `this`; the old one is the next scratch.
     std::mem::swap(this, workspace);
+}
+
+/// One merge of [`set_combine`] in progress: the cursors into both inputs,
+/// the `rmin_next` of the last entry taken from each (`0` before the
+/// first), and the next output slot.
+#[derive(Clone, Copy)]
+struct MergeCursor {
+    ia: usize,
+    ib: usize,
+    aprev: f32,
+    bprev: f32,
+    out: usize,
+}
+
+impl MergeCursor {
+    /// Merge the entry (or equal pair) at the cursors, both of which point
+    /// into their inputs; branch-free, since which input comes next is
+    /// data-dependent.
+    #[inline(always)]
+    fn step(&mut self, a: &[Entry], b: &[Entry], out: &mut [Entry]) {
+        let (ea, eb) = (a[self.ia], b[self.ib]);
+        let eq = ea.value == eb.value;
+        let lt = ea.value < eb.value;
+        // Equal values take both; otherwise the smaller (`b` also when the
+        // comparison fails, as upstream's `else`).
+        let take_a = eq | lt;
+        let take_b = !lt;
+        let pick = |c: bool, x: f32, y: f32| std::hint::select_unpredictable(c, x, y);
+        // Upstream's three cases, operand for operand: a lone `a` entry adds
+        // the last `b` entry's `rmin_next` and the next one's `rmax_prev`,
+        // and symmetrically (`+` commutes exactly).
+        let rmin = pick(take_a, ea.rmin, self.aprev) + pick(take_b, eb.rmin, self.bprev);
+        let rmax = pick(take_a, ea.rmax, ea.rmax_prev()) + pick(take_b, eb.rmax, eb.rmax_prev());
+        let wmin = if eq {
+            ea.wmin + eb.wmin
+        } else {
+            pick(lt, ea.wmin, eb.wmin)
+        };
+        out[self.out] = Entry::new(rmin, rmax, wmin, pick(take_a, ea.value, eb.value));
+        self.out += 1;
+        self.aprev = pick(take_a, ea.rmin_next(), self.aprev);
+        self.bprev = pick(take_b, eb.rmin_next(), self.bprev);
+        self.ia += usize::from(take_a);
+        self.ib += usize::from(take_b);
+    }
+
+    /// Merge up to `a[..a_end]` and `b[..b_end]`. Once one of them is used
+    /// up, the other's entries take their bounds from the whole input's next
+    /// entry, or its last `rmax` past the end (upstream's tail loops).
+    fn finish(
+        &mut self,
+        a: &[Entry],
+        b: &[Entry],
+        (a_end, b_end): (usize, usize),
+        out: &mut [Entry],
+    ) {
+        while self.ia < a_end && self.ib < b_end {
+            self.step(a, b, out);
+        }
+        for ea in &a[self.ia..a_end] {
+            let next = b
+                .get(self.ib)
+                .map_or(b[b.len() - 1].rmax, |eb| eb.rmax_prev());
+            out[self.out] = Entry::new(ea.rmin + self.bprev, ea.rmax + next, ea.wmin, ea.value);
+            self.out += 1;
+            self.aprev = ea.rmin_next();
+        }
+        self.ia = self.ia.max(a_end);
+        for eb in &b[self.ib..b_end] {
+            let next = a
+                .get(self.ia)
+                .map_or(a[a.len() - 1].rmax, |ea| ea.rmax_prev());
+            out[self.out] = Entry::new(eb.rmin + self.aprev, eb.rmax + next, eb.wmin, eb.value);
+            self.out += 1;
+            self.bprev = eb.rmin_next();
+        }
+        self.ib = self.ib.max(b_end);
+    }
 }
 
 /// `WQSummary::SetPruneSorted`: summarise a whole column of `(value, weight)`
@@ -400,8 +491,17 @@ pub(crate) struct WQSketch {
     num_elements: usize,
     /// Every pushed weight is `1` ([`Self::with_unit_weights`]).
     unit_weights: bool,
-    /// Scratch buffer of the radix sort.
-    sort_scratch: RadixScratch<(f32, f32)>,
+    /// Scratch buffers of the radix sorts.
+    sort_scratch: SketchScratch,
+}
+
+/// Radix sort buffers a [`WQSketch`] reuses, lent across sketches.
+#[derive(Default)]
+pub(crate) struct SketchScratch {
+    pairs: RadixScratch<(f32, f32)>,
+    /// The queue's values as [`sort_key`]s, when every weight is `1`.
+    keys: Vec<u32>,
+    key_sort: RadixScratch<u32>,
 }
 
 impl WQSketch {
@@ -418,19 +518,19 @@ impl WQSketch {
             workspace: Vec::new(),
             num_elements: 0,
             unit_weights: false,
-            sort_scratch: RadixScratch::default(),
+            sort_scratch: SketchScratch::default(),
         }
     }
 
     /// Sort with `scratch`'s buffers (reused across sketches), returned by
     /// [`Self::into_sort_scratch`].
-    pub(crate) fn with_sort_scratch(mut self, scratch: RadixScratch<(f32, f32)>) -> Self {
+    pub(crate) fn with_sort_scratch(mut self, scratch: SketchScratch) -> Self {
         self.sort_scratch = scratch;
         self
     }
 
     /// The radix sort's buffers, for the next sketch.
-    pub(crate) fn into_sort_scratch(self) -> RadixScratch<(f32, f32)> {
+    pub(crate) fn into_sort_scratch(self) -> SketchScratch {
         self.sort_scratch
     }
 
@@ -480,7 +580,19 @@ impl WQSketch {
         // the sort orders them: any value-ordered permutation gives the
         // summary the comparison sort gives.
         if self.unit_weights && self.num_elements < 1 << 24 {
-            radix_sort(&mut self.queue, &mut self.sort_scratch, |&(v, _)| {
+            if self.queue.iter().all(|&(_, w)| w == 1.0) {
+                // Every weight is `1` (no value repeated in a row): sort the
+                // values alone, half the bytes the pairs would move.
+                let SketchScratch { keys, key_sort, .. } = &mut self.sort_scratch;
+                keys.clear();
+                keys.extend(self.queue.iter().map(|&(v, _)| sort_key(v)));
+                radix_sort(keys, key_sort, |&k| k);
+                set_from_sorted_keys(keys, &mut self.temp);
+                self.queue.clear();
+                self.push_summary();
+                return;
+            }
+            radix_sort(&mut self.queue, &mut self.sort_scratch.pairs, |&(v, _)| {
                 sort_key(v)
             });
         } else {
@@ -563,19 +675,21 @@ mod tests {
 
     /// The unit-weight sketch (radix-sorted queue) cuts exactly where the
     /// comparison-sorted one does, on streams with heavy repeats, signed
-    /// zeros, negatives, and infinities, long enough to flush the queue.
+    /// zeros, negatives, and infinities, long enough to flush the queue, and
+    /// on streams without consecutive repeats (queues of weight-1 values,
+    /// sorted as bare keys).
     #[test]
     fn unit_weight_sketch_matches_comparison_sort() {
         let mut rng = crate::rng::Rng::new(3);
-        for case in 0..6 {
+        for case in 0..9 {
             let n = 20_000 + case * 7_000;
             let values: Vec<f32> = (0..n)
-                .map(|i| match rng.range(0..10) {
+                .map(|i| match if case < 6 { rng.range(0..10) } else { 9 } {
                     0 => -0.0,
                     1 => 0.0,
                     2 => f32::NEG_INFINITY,
                     3 => ((i % 17) as f32) - 8.0,
-                    _ => (rng.f32() - 0.5) * 10f32.powi(case as i32 - 2),
+                    _ => (rng.f32() - 0.5) * 10f32.powi(case as i32 % 6 - 2),
                 })
                 .collect();
             let mut radix = WQSketch::new(n, 64).with_unit_weights();
@@ -587,6 +701,125 @@ mod tests {
             let expected = cuts_of(&values, 64);
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&out), bits(&expected), "case {case}");
+        }
+    }
+
+    /// Upstream's `SetCombine` as one sequential merge: the reference the
+    /// split, interleaved [`set_combine`] must reproduce bit for bit.
+    fn set_combine_one_pass(this: &mut Vec<Entry>, other: &[Entry], workspace: &mut Vec<Entry>) {
+        if other.is_empty() {
+            return;
+        }
+        if this.is_empty() {
+            this.extend_from_slice(other);
+            return;
+        }
+        workspace.clear();
+        let (a, b) = (this.as_slice(), other);
+        let (mut ia, mut ib) = (0usize, 0usize);
+        let (mut aprev_rmin, mut bprev_rmin) = (0f32, 0f32);
+        while ia < a.len() && ib < b.len() {
+            let (ea, eb) = (a[ia], b[ib]);
+            if ea.value == eb.value {
+                workspace.push(Entry::new(
+                    ea.rmin + eb.rmin,
+                    ea.rmax + eb.rmax,
+                    ea.wmin + eb.wmin,
+                    ea.value,
+                ));
+                aprev_rmin = ea.rmin_next();
+                bprev_rmin = eb.rmin_next();
+                ia += 1;
+                ib += 1;
+            } else if ea.value < eb.value {
+                workspace.push(Entry::new(
+                    ea.rmin + bprev_rmin,
+                    ea.rmax + eb.rmax_prev(),
+                    ea.wmin,
+                    ea.value,
+                ));
+                aprev_rmin = ea.rmin_next();
+                ia += 1;
+            } else {
+                workspace.push(Entry::new(
+                    eb.rmin + aprev_rmin,
+                    eb.rmax + ea.rmax_prev(),
+                    eb.wmin,
+                    eb.value,
+                ));
+                bprev_rmin = eb.rmin_next();
+                ib += 1;
+            }
+        }
+        if ia < a.len() {
+            let brmax = b[b.len() - 1].rmax;
+            for ea in &a[ia..] {
+                workspace.push(Entry::new(
+                    ea.rmin + bprev_rmin,
+                    ea.rmax + brmax,
+                    ea.wmin,
+                    ea.value,
+                ));
+            }
+        }
+        if ib < b.len() {
+            let armax = a[a.len() - 1].rmax;
+            for eb in &b[ib..] {
+                workspace.push(Entry::new(
+                    eb.rmin + aprev_rmin,
+                    eb.rmax + armax,
+                    eb.wmin,
+                    eb.value,
+                ));
+            }
+        }
+        fix_error(workspace);
+        // The merged summary becomes `this`; the old one is the next scratch.
+        std::mem::swap(this, workspace);
+    }
+
+    /// A summary of `n` distinct values drawn from `pool` (sorted, weights
+    /// in `1..4`), pruned like the sketch's levels.
+    fn random_summary(rng: &mut crate::rng::Rng, pool: &[f32], n: usize) -> Vec<Entry> {
+        let mut values: Vec<f32> = (0..n).map(|_| pool[rng.range(0..pool.len())]).collect();
+        values.sort_by(f32::total_cmp);
+        let pairs: Vec<(f32, f32)> = values
+            .iter()
+            .map(|&v| (v, rng.range(1..4) as f32))
+            .collect();
+        let mut out = Vec::new();
+        set_from_sorted(&pairs, &mut out);
+        set_prune(&mut out, n / 2 + 1);
+        out
+    }
+
+    #[test]
+    fn split_combine_matches_the_one_pass_merge_bit_for_bit() {
+        let mut rng = crate::rng::Rng::new(9);
+        let bits = |v: &[Entry]| {
+            v.iter()
+                .map(|e| [e.rmin, e.rmax, e.wmin, e.value].map(f32::to_bits))
+                .collect::<Vec<_>>()
+        };
+        for case in 0..40 {
+            // Shared values across the two summaries (a small pool), signed
+            // zeros, infinities, and in some cases a NaN (one-pass path).
+            let mut pool: Vec<f32> = (0..[50, 4000, 100_000][case % 3])
+                .map(|_| (rng.f32() - 0.5) * 100.0)
+                .collect();
+            pool.extend([-0.0, 0.0, f32::INFINITY, f32::NEG_INFINITY]);
+            if case % 7 == 6 {
+                pool.push(f32::NAN);
+            }
+            let n = rng.range(1..6000);
+            let a = random_summary(&mut rng, &pool, n);
+            let n = rng.range(1..6000);
+            let b = random_summary(&mut rng, &pool, n);
+            let (mut expected, mut workspace) = (a.clone(), Vec::new());
+            set_combine_one_pass(&mut expected, &b, &mut workspace);
+            let mut merged = a.clone();
+            set_combine(&mut merged, &b, &mut workspace);
+            assert_eq!(bits(&merged), bits(&expected), "case {case}");
         }
     }
 

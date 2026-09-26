@@ -461,23 +461,63 @@ fn bin_rows_into<B: FromBin>(
     let mut bins: Vec<B> = Vec::with_capacity(nnz);
     let mut dense = true;
     let mut max_bin = 0u32;
-    let mut push = |bins: &mut Vec<B>, bin: u32| {
-        max_bin = max_bin.max(bin);
+    let push = |bins: &mut Vec<B>, max_bin: &mut u32, bin: u32| {
+        *max_bin = (*max_bin).max(bin);
         bins.push(B::from_bin(bin));
     };
     if let Some(values) = data.dense_values() {
-        // Dense storage: read the row in place; features are already ascending.
+        // Dense storage: read the rows in place; features are already
+        // ascending. A block of rows with every value present is binned
+        // feature by feature (each feature's search tables stay in
+        // registers across the block's rows) straight into its row-major
+        // slots; a block with a missing value goes row by row.
+        const BLOCK_ROWS: usize = 64;
         let missing = data.missing();
-        for r in rows {
-            let row = &values[r * n_features..(r + 1) * n_features];
-            let start = bins.len();
-            for (c, &v) in row.iter().enumerate() {
-                if !crate::data::dmatrix::is_missing(v, missing) {
-                    push(&mut bins, cuts.bin_of(c, v));
+        let is_missing = |v: f32| crate::data::dmatrix::is_missing(v, missing);
+        for block in rows.clone().step_by(BLOCK_ROWS) {
+            let end = (block + BLOCK_ROWS).min(rows.end);
+            let src = &values[block * n_features..end * n_features];
+            // Non-short-circuit folds with the sentinel test hoisted, so
+            // the check vectorizes.
+            #[allow(
+                clippy::needless_bitwise_bool,
+                reason = "a non-short-circuit fold vectorizes"
+            )]
+            let any_missing = if missing.is_nan() {
+                src.iter().fold(false, |any, &v| any | v.is_nan())
+            } else {
+                src.iter().fold(false, |any, &v| any | (v == missing))
+            };
+            if n_features > 0 && !any_missing {
+                let base = bins.len();
+                bins.resize(base + src.len(), B::from_bin(0));
+                let out = &mut bins[base..];
+                for f in 0..n_features {
+                    let search = cuts.feature(f);
+                    for (o, &v) in out[f..]
+                        .iter_mut()
+                        .step_by(n_features)
+                        .zip(src[f..].iter().step_by(n_features))
+                    {
+                        let bin = search.bin_of(v);
+                        max_bin = max_bin.max(bin);
+                        *o = B::from_bin(bin);
+                    }
                 }
+                row_ends.extend((1..=end - block).map(|i| base + i * n_features));
+                continue;
             }
-            dense &= bins.len() - start == n_features;
-            row_ends.push(bins.len());
+            for r in block..end {
+                let row = &values[r * n_features..(r + 1) * n_features];
+                let start = bins.len();
+                for (c, &v) in row.iter().enumerate() {
+                    if !is_missing(v) {
+                        push(&mut bins, &mut max_bin, cuts.bin_of(c, v));
+                    }
+                }
+                dense &= bins.len() - start == n_features;
+                row_ends.push(bins.len());
+            }
         }
     } else {
         for r in rows {
@@ -487,7 +527,7 @@ fn bin_rows_into<B: FromBin>(
             data.for_row_entry(r, |index, value| {
                 in_order &= index as usize == stored;
                 stored += 1;
-                push(&mut bins, cuts.bin_of(index as usize, value));
+                push(&mut bins, &mut max_bin, cuts.bin_of(index as usize, value));
             });
             dense &= in_order && stored == n_features;
             row_ends.push(bins.len());

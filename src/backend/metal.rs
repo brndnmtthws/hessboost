@@ -1548,8 +1548,7 @@ impl GpuModel {
         let margin = self.predict_margin(data)?;
         Ok(transform_model_margins(
             self.model.objective(),
-            self.model.objective_params(),
-            self.model.num_class(),
+            self.model.max_delta_step(),
             self.model.n_targets(),
             self.model.n_outputs(),
             margin,
@@ -1565,7 +1564,12 @@ impl GpuModel {
         if k == 1 || self.model.n_targets() > 1 {
             return Ok(probs.iter().map(|&p| u32::from(p > 0.5)).collect());
         }
-        if self.model.objective() == "multi:softmax" {
+        if self
+            .model
+            .objective()
+            .built_in()
+            .is_some_and(crate::objective::Objective::predicts_class_index)
+        {
             return Ok(probs.iter().map(|&class| class as u32).collect());
         }
         Ok(probs
@@ -2025,7 +2029,7 @@ mod tests {
             .with_labels(&y)
             .unwrap();
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .tree_method(TreeMethod::Hist)
             .max_depth(5)
             .eta(0.3)

@@ -6,6 +6,8 @@
 //!
 //! Run with: `cargo run --release --example virtual_ensembles`
 
+use hessboost::objective::Objective;
+use hessboost::objective::distributional::{DistFamily, Distributional};
 use hessboost::prelude::*;
 
 mod common;
@@ -65,7 +67,7 @@ fn main() -> Result<()> {
 
     // `posterior_sampling` sets Langevin noise at temperature N and model
     // shrinkage at rate 1/(2N) (N = training rows), as CatBoost does.
-    let params = |objective: &str| {
+    let params = |objective: Objective| {
         TrainingParams::builder()
             .objective(objective)
             .tree_method(TreeMethod::Hist)
@@ -76,7 +78,7 @@ fn main() -> Result<()> {
             .build()
     };
 
-    let model = train(&params("reg:squarederror")?, &dtrain, 1000)?;
+    let model = train(&params(Objective::SquaredError)?, &dtrain, 1000)?;
     let members = model.predict_virtual_ensembles(&test, 10)?;
     println!(
         "reg:squarederror, {} members: the models after iterations {:?}",
@@ -108,7 +110,11 @@ fn main() -> Result<()> {
 
     // A `dist:normal` model predicts a variance per row: data uncertainty
     // (its mean over the members) against the true noise variance.
-    let dist = train(&params("dist:normal")?, &dtrain, 100)?;
+    let dist = train(
+        &params(Objective::Dist(Distributional::new(DistFamily::Normal)))?,
+        &dtrain,
+        100,
+    )?;
     println!(
         "\ndist:normal: {:<22} {:>10} {:>10} {:>10} {:>10}",
         "inputs", "knowledge", "data", "total", "true var"

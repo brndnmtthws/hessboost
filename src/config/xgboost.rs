@@ -4,13 +4,13 @@
 //! and the training fuzz target all go through it.
 
 use super::params::{
-    AftDistribution, BoosterKind, Device, DistGradient, DistSplitDirection, GrowPolicy,
-    ModelShrinkMode, Monotone, MultiStrategy, ProcessType, SamplingMethod, TrainingParams,
-    TreeMethod,
+    BoosterKind, Device, GrowPolicy, ModelShrinkMode, Monotone, MultiStrategy, ProcessType,
+    SamplingMethod, TrainingParams, TreeMethod,
 };
 use crate::error::{HessboostError, Result};
 use crate::metric::{EvalMetric, XgboostMetricSource};
-use crate::objective::distributional::DistFamily;
+use crate::objective::distributional::{DistGradient, DistSplitDirection};
+use crate::objective::{AftDistribution, Objective, ObjectiveParts};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
@@ -124,10 +124,59 @@ flat_params! {
     posterior_sampling: bool,
 }
 
+/// The flat keys of the objective parameters, with the objectives and
+/// metrics that read each (for the refusal of a key nothing reads).
+const OBJECTIVE_KEYS: &[(&str, &str)] = &[
+    ("num_class", "`multi:softmax` and `multi:softprob`"),
+    (
+        "scale_pos_weight",
+        "`binary:logistic`, `binary:logitraw`, and `reg:logistic` (hessboost does not apply \
+         it to `reg:squarederror` or `reg:gamma`)",
+    ),
+    ("tweedie_variance_power", "`reg:tweedie`"),
+    (
+        "huber_slope",
+        "`reg:pseudohubererror` and the `mphe` metric",
+    ),
+    ("lambdarank_num_pair_per_sample", "the `rank:*` objectives"),
+    (
+        "quantile_alpha",
+        "`reg:quantileerror` and the `quantile` metric",
+    ),
+    (
+        "expectile_alpha",
+        "`reg:expectileerror` and the `expectile` metric",
+    ),
+    (
+        "aft_loss_distribution",
+        "`survival:aft` and the `aft-nloglik` metric",
+    ),
+    (
+        "aft_loss_distribution_scale",
+        "`survival:aft` and the `aft-nloglik` metric",
+    ),
+    ("dist_gradient", "the `dist:*` objectives"),
+    ("dist_split_direction", "the `dist:*` objectives"),
+];
+
+/// The flat keys a metric named `name` borrows (XGBoost's metrics read
+/// them from the objective's parameters, whatever the objective).
+fn borrowed_keys(name: &str) -> &'static [&'static str] {
+    match name {
+        "mphe" => &["huber_slope"],
+        "quantile" => &["quantile_alpha"],
+        "expectile" => &["expectile_alpha"],
+        "aft-nloglik" => &["aft_loss_distribution", "aft_loss_distribution_scale"],
+        _ => &[],
+    }
+}
+
 impl Flat {
     /// The configuration these settings describe, every absent key at its
-    /// default. Metric names are read as XGBoost reads them, with the flat
-    /// parameters of the metrics that borrow them.
+    /// default. The objective reads its parameters from their keys, metric
+    /// names are read as XGBoost reads them (with the flat parameters the
+    /// metrics borrow), and an objective-parameter key neither reads is
+    /// refused.
     fn into_params(self) -> Result<TrainingParams> {
         let Flat {
             booster,
@@ -189,27 +238,76 @@ impl Flat {
             model_shrink_mode,
             posterior_sampling,
         } = self;
+        // Aligned with `OBJECTIVE_KEYS`.
+        let present = [
+            num_class.is_some(),
+            scale_pos_weight.is_some(),
+            tweedie_variance_power.is_some(),
+            huber_slope.is_some(),
+            lambdarank_num_pair_per_sample.is_some(),
+            quantile_alpha.is_some(),
+            expectile_alpha.is_some(),
+            aft_loss_distribution.is_some(),
+            aft_loss_distribution_scale.is_some(),
+            dist_gradient.is_some(),
+            dist_split_direction.is_some(),
+        ];
+        let p = ObjectiveParts::default();
+        let parts = ObjectiveParts {
+            num_class: num_class.unwrap_or(p.num_class),
+            scale_pos_weight: scale_pos_weight.unwrap_or(p.scale_pos_weight),
+            tweedie_variance_power: tweedie_variance_power.unwrap_or(p.tweedie_variance_power),
+            huber_slope: huber_slope.unwrap_or(p.huber_slope),
+            lambdarank_num_pair_per_sample: lambdarank_num_pair_per_sample
+                .unwrap_or(p.lambdarank_num_pair_per_sample),
+            quantile_alpha: quantile_alpha.unwrap_or(p.quantile_alpha),
+            expectile_alpha: expectile_alpha.unwrap_or(p.expectile_alpha),
+            aft_loss_distribution: aft_loss_distribution.unwrap_or(p.aft_loss_distribution),
+            aft_loss_distribution_scale: aft_loss_distribution_scale
+                .unwrap_or(p.aft_loss_distribution_scale),
+            dist_gradient: dist_gradient.unwrap_or(p.dist_gradient),
+            dist_split_direction: dist_split_direction.or(p.dist_split_direction),
+        };
+        let name = objective.as_deref().unwrap_or("reg:squarederror");
+        let objective = Objective::from_parts(name, &parts)
+            .ok_or_else(|| HessboostError::unknown("objective", name))??;
+        let metric_names = eval_metric.unwrap_or_default();
+        for (&(key, users), set) in OBJECTIVE_KEYS.iter().zip(present) {
+            let read = objective.parameter_keys().contains(&key)
+                || metric_names
+                    .iter()
+                    .any(|metric| borrowed_keys(metric).contains(&key));
+            if set && !read {
+                return Err(HessboostError::invalid_param(
+                    key,
+                    format!(
+                        "applies only to {users}; nothing reads it with objective `{}`",
+                        objective.name()
+                    ),
+                ));
+            }
+        }
+        let source = XgboostMetricSource {
+            huber_slope: parts.huber_slope,
+            quantile_alpha: &parts.quantile_alpha,
+            expectile_alpha: &parts.expectile_alpha,
+            aft_loss_distribution: parts.aft_loss_distribution,
+            aft_loss_distribution_scale: parts.aft_loss_distribution_scale,
+            distribution: objective.dist_family(),
+        };
+        let eval_metric = metric_names
+            .iter()
+            .map(|name| EvalMetric::from_xgboost(name, &source))
+            .collect::<Result<Vec<_>>>()?;
         let d = TrainingParams::default();
-        let mut params = TrainingParams {
+        Ok(TrainingParams {
             booster: booster.unwrap_or(d.booster),
             nthread: nthread.unwrap_or(d.nthread),
             seed: seed.unwrap_or(d.seed),
             device: device.unwrap_or(d.device),
-            objective: objective.unwrap_or(d.objective),
-            num_class: num_class.unwrap_or(d.num_class),
+            objective,
             base_score: base_score.unwrap_or(d.base_score),
-            eval_metric: Vec::new(),
-            tweedie_variance_power: tweedie_variance_power.unwrap_or(d.tweedie_variance_power),
-            huber_slope: huber_slope.unwrap_or(d.huber_slope),
-            lambdarank_num_pair_per_sample: lambdarank_num_pair_per_sample
-                .unwrap_or(d.lambdarank_num_pair_per_sample),
-            quantile_alpha: quantile_alpha.unwrap_or(d.quantile_alpha),
-            expectile_alpha: expectile_alpha.unwrap_or(d.expectile_alpha),
-            aft_loss_distribution: aft_loss_distribution.unwrap_or(d.aft_loss_distribution),
-            aft_loss_distribution_scale: aft_loss_distribution_scale
-                .unwrap_or(d.aft_loss_distribution_scale),
-            dist_gradient: dist_gradient.unwrap_or(d.dist_gradient),
-            dist_split_direction: dist_split_direction.unwrap_or(d.dist_split_direction),
+            eval_metric,
             eta: eta.unwrap_or(d.eta),
             gamma: gamma.unwrap_or(d.gamma),
             max_depth: max_depth.unwrap_or(d.max_depth),
@@ -222,7 +320,6 @@ impl Flat {
             colsample_bynode: colsample_bynode.unwrap_or(d.colsample_bynode),
             lambda: lambda.unwrap_or(d.lambda),
             alpha: alpha.unwrap_or(d.alpha),
-            scale_pos_weight: scale_pos_weight.unwrap_or(d.scale_pos_weight),
             tree_method: tree_method.unwrap_or(d.tree_method),
             grow_policy: grow_policy.unwrap_or(d.grow_policy),
             max_bin: max_bin.unwrap_or(d.max_bin),
@@ -251,31 +348,66 @@ impl Flat {
             model_shrink_rate: model_shrink_rate.unwrap_or(d.model_shrink_rate),
             model_shrink_mode: model_shrink_mode.unwrap_or(d.model_shrink_mode),
             posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
-        };
-        let source = metric_source(&params);
-        let metrics = eval_metric
-            .unwrap_or_default()
-            .iter()
-            .map(|name| EvalMetric::from_xgboost(name, &source))
-            .collect::<Result<Vec<_>>>()?;
-        params.eval_metric = metrics;
-        Ok(params)
+        })
     }
 }
 
-/// The flat parameters the metrics in `eval_metric` read, as XGBoost gives
-/// them: `mphe` the `huber_slope`, `quantile` / `expectile` the alpha lists,
-/// `aft-nloglik` the AFT noise, whatever the objective; `nll` / `crps` the
-/// family of a `dist:*` objective.
-fn metric_source(params: &TrainingParams) -> XgboostMetricSource<'_> {
-    XgboostMetricSource {
-        huber_slope: params.huber_slope,
-        quantile_alpha: &params.quantile_alpha,
-        expectile_alpha: &params.expectile_alpha,
-        aft_loss_distribution: params.aft_loss_distribution,
-        aft_loss_distribution_scale: params.aft_loss_distribution_scale,
-        distribution: DistFamily::from_objective(&params.objective),
-    }
+/// The flat keys and values of `objective`'s own parameters (a default
+/// split direction is left out).
+fn objective_keys(objective: &Objective) -> Vec<(&'static str, Value)> {
+    let parts = objective.parts();
+    objective
+        .parameter_keys()
+        .iter()
+        .filter_map(|&key| {
+            let value = match key {
+                "num_class" => json(parts.num_class),
+                "scale_pos_weight" => json(parts.scale_pos_weight),
+                "tweedie_variance_power" => json(parts.tweedie_variance_power),
+                "huber_slope" => json(parts.huber_slope),
+                "lambdarank_num_pair_per_sample" => json(parts.lambdarank_num_pair_per_sample),
+                "quantile_alpha" => json(&parts.quantile_alpha),
+                "expectile_alpha" => json(&parts.expectile_alpha),
+                "aft_loss_distribution" => json(parts.aft_loss_distribution),
+                "aft_loss_distribution_scale" => json(parts.aft_loss_distribution_scale),
+                "dist_gradient" => json(parts.dist_gradient),
+                "dist_split_direction" => json(parts.dist_split_direction?),
+                _ => return None,
+            };
+            Some((key, value))
+        })
+        .collect()
+}
+
+/// The flat keys and values `metric`'s parameters take in XGBoost's form,
+/// where they are the objective's parameters (`mphe`'s `huber_slope`, ...);
+/// `nll` and `crps` take the `dist:*` objective's family, so another family
+/// has no flat form.
+fn metric_keys(metric: &EvalMetric, objective: &Objective) -> Result<Vec<(&'static str, Value)>> {
+    Ok(match metric {
+        EvalMetric::Mphe(huber) => vec![("huber_slope", json(huber.slope()))],
+        EvalMetric::Quantile(q) => vec![("quantile_alpha", json(q.alpha()))],
+        EvalMetric::Expectile(e) => vec![("expectile_alpha", json(e.alpha()))],
+        EvalMetric::AftNLogLik(aft) => vec![
+            ("aft_loss_distribution", json(aft.distribution())),
+            ("aft_loss_distribution_scale", json(aft.scale())),
+        ],
+        EvalMetric::Nll(family) | EvalMetric::Crps(family)
+            if objective.dist_family() != Some(*family) =>
+        {
+            return Err(HessboostError::invalid_param(
+                "eval_metric",
+                format!(
+                    "`{}` of the `{}` family has no flat form with objective `{}` (XGBoost's \
+                     form takes the family from the `dist:*` objective)",
+                    metric.name(),
+                    family.objective_name(),
+                    objective.name()
+                ),
+            ));
+        }
+        _ => Vec::new(),
+    })
 }
 
 /// Levenshtein distance, for suggesting a key.
@@ -418,8 +550,12 @@ impl TrainingParams {
     /// Refuses, never ignores: an unknown key (suggesting the closest
     /// known one), a key set twice (directly and through an alias), a value
     /// of the wrong type, `missing` (a property of the data), a one-setting
-    /// option at another setting, and every configuration
-    /// [`validate`](Self::validate) refuses.
+    /// option at another setting, an objective parameter that neither the
+    /// objective nor a listed metric reads (e.g. `num_class` with
+    /// `binary:logistic`; the error names the objectives and metrics that
+    /// read it), `lambdarank_pair_method` without a `rank:*` objective,
+    /// `updater`/`feature_selector` without `booster = gblinear`, and every
+    /// configuration [`validate`](Self::validate) refuses.
     ///
     /// ```
     /// use hessboost::prelude::*;
@@ -440,7 +576,7 @@ impl TrainingParams {
         params: impl IntoIterator<Item = (K, Value)>,
     ) -> Result<Self> {
         let mut settings = Map::new();
-        let mut updater = false;
+        let mut fixed_set = Vec::new();
         for (key, value) in params {
             let key = key.as_ref();
             if let Some(&(name, fixed)) = FIXED.iter().find(|&&(name, _)| name == key) {
@@ -451,7 +587,7 @@ impl TrainingParams {
                         format!("is only implemented as {fixed}, got {value}"),
                     ));
                 }
-                updater |= name == "updater";
+                fixed_set.push(name);
                 continue;
             }
             let canonical = canonical_key(key)?;
@@ -469,11 +605,26 @@ impl TrainingParams {
             }
         }
         let params = flat_from("params", settings)?.into_params()?;
-        if updater && params.booster != BoosterKind::GbLinear {
-            return Err(HessboostError::invalid_param(
-                "updater",
-                "`coord_descent` is gblinear's updater; tree boosters take no `updater`",
-            ));
+        for name in fixed_set {
+            let gblinear = params.booster == BoosterKind::GbLinear;
+            let refusal = match name {
+                "updater" if !gblinear => {
+                    "`coord_descent` is gblinear's updater; tree boosters take no `updater`"
+                }
+                "feature_selector" if !gblinear => {
+                    "is gblinear's coordinate selection; tree boosters take no `feature_selector`"
+                }
+                "lambdarank_pair_method"
+                    if !matches!(
+                        params.objective,
+                        Objective::RankPairwise(_) | Objective::RankNdcg(_) | Objective::RankMap(_)
+                    ) =>
+                {
+                    "applies only to the `rank:*` objectives"
+                }
+                _ => continue,
+            };
+            return Err(HessboostError::invalid_param(name, refusal));
         }
         params.validate()?;
         Ok(params)
@@ -481,46 +632,26 @@ impl TrainingParams {
 
     /// This configuration in XGBoost's flat parameter form, under the
     /// canonical keys [`from_xgboost`](Self::from_xgboost) reads back to the
-    /// same configuration (monotone constraints as `-1`/`0`/`1`; an unset
-    /// `base_score` or `max_delta_step` is left out).
+    /// same configuration: the objective's name and the keys of its own
+    /// parameters, the metrics' names and the objective keys they borrow,
+    /// monotone constraints as `-1`/`0`/`1`; an unset `base_score` or
+    /// `max_delta_step` is left out.
     ///
     /// # Errors
     ///
-    /// A metric whose parameters XGBoost's flat form cannot state: XGBoost
-    /// gives `mphe`, `quantile`, `expectile`, and `aft-nloglik` the flat
-    /// `huber_slope`, alpha lists, and AFT noise, and `nll` / `crps` the
-    /// objective's `dist:*` family, so a metric with other parameters has no
-    /// XGBoost name.
+    /// A configuration XGBoost's form cannot state: a custom loss, or a
+    /// metric whose parameters differ from the objective's (XGBoost's
+    /// `mphe`, `quantile`, `expectile`, and `aft-nloglik` read the same
+    /// keys as the objective, and `nll` / `crps` its `dist:*` family).
     pub fn to_xgboost(&self) -> Result<Map<String, Value>> {
-        let source = metric_source(self);
-        if let Some(metric) = self.eval_metric.iter().find(|m| !source.expresses(m)) {
-            return Err(HessboostError::invalid_param(
-                "eval_metric",
-                format!(
-                    "`{}` has parameters XGBoost's flat form cannot state (it reads them from \
-                     the objective's parameters)",
-                    metric.name()
-                ),
-            ));
-        }
         let TrainingParams {
             booster,
             nthread,
             seed,
             device,
             objective,
-            num_class,
             base_score,
             eval_metric,
-            tweedie_variance_power,
-            huber_slope,
-            lambdarank_num_pair_per_sample,
-            quantile_alpha,
-            expectile_alpha,
-            aft_loss_distribution,
-            aft_loss_distribution_scale,
-            dist_gradient,
-            dist_split_direction,
             eta,
             gamma,
             max_depth,
@@ -533,7 +664,6 @@ impl TrainingParams {
             colsample_bynode,
             lambda,
             alpha,
-            scale_pos_weight,
             tree_method,
             grow_policy,
             max_bin,
@@ -563,6 +693,31 @@ impl TrainingParams {
             model_shrink_mode,
             posterior_sampling,
         } = self;
+        if let Objective::Custom(loss) = objective {
+            return Err(HessboostError::invalid_param(
+                "objective",
+                format!("the custom loss `{}` has no XGBoost flat form", loss.name()),
+            ));
+        }
+        let mut objective_keys = objective_keys(objective);
+        for metric in eval_metric {
+            for (key, value) in metric_keys(metric, objective)? {
+                match objective_keys.iter().find(|(k, _)| *k == key) {
+                    Some((_, set)) if *set != value => {
+                        return Err(HessboostError::invalid_param(
+                            "eval_metric",
+                            format!(
+                                "`{}` reads `{key}` = {value} in XGBoost's flat form, which the \
+                                 configuration sets to {set}",
+                                metric.name()
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => objective_keys.push((key, value)),
+                }
+            }
+        }
         let monotone: Vec<i8> = monotone_constraints
             .iter()
             .map(|m| match m {
@@ -579,28 +734,15 @@ impl TrainingParams {
         set("nthread", json(nthread));
         set("seed", json(seed));
         set("device", json(device));
-        set("objective", json(objective));
-        set("num_class", json(num_class));
+        set("objective", json(objective.name()));
+        for (key, value) in objective_keys {
+            set(key, value);
+        }
         if let Some(base_score) = base_score {
             set("base_score", json(base_score));
         }
         let names: Vec<_> = eval_metric.iter().map(EvalMetric::name).collect();
         set("eval_metric", json(names));
-        set("tweedie_variance_power", json(tweedie_variance_power));
-        set("huber_slope", json(huber_slope));
-        set(
-            "lambdarank_num_pair_per_sample",
-            json(lambdarank_num_pair_per_sample),
-        );
-        set("quantile_alpha", json(quantile_alpha));
-        set("expectile_alpha", json(expectile_alpha));
-        set("aft_loss_distribution", json(aft_loss_distribution));
-        set(
-            "aft_loss_distribution_scale",
-            json(aft_loss_distribution_scale),
-        );
-        set("dist_gradient", json(dist_gradient));
-        set("dist_split_direction", json(dist_split_direction));
         set("eta", json(eta));
         set("gamma", json(gamma));
         set("max_depth", json(max_depth));
@@ -615,7 +757,6 @@ impl TrainingParams {
         set("colsample_bynode", json(colsample_bynode));
         set("lambda", json(lambda));
         set("alpha", json(alpha));
-        set("scale_pos_weight", json(scale_pos_weight));
         set("tree_method", json(tree_method));
         set("grow_policy", json(grow_policy));
         set("max_bin", json(max_bin));
@@ -662,18 +803,8 @@ impl TrainingParams {
             seed,
             device,
             objective,
-            num_class,
             base_score,
             eval_metric,
-            tweedie_variance_power,
-            huber_slope,
-            lambdarank_num_pair_per_sample,
-            quantile_alpha,
-            expectile_alpha,
-            aft_loss_distribution,
-            aft_loss_distribution_scale,
-            dist_gradient,
-            dist_split_direction,
             eta,
             gamma,
             max_depth,
@@ -686,7 +817,6 @@ impl TrainingParams {
             colsample_bynode,
             lambda,
             alpha,
-            scale_pos_weight,
             tree_method,
             grow_policy,
             max_bin,
@@ -727,33 +857,8 @@ impl TrainingParams {
         differs("seed", *seed == other.seed);
         differs("device", *device == other.device);
         differs("objective", *objective == other.objective);
-        differs("num_class", *num_class == other.num_class);
         differs("base_score", *base_score == other.base_score);
         differs("eval_metric", *eval_metric == other.eval_metric);
-        differs(
-            "tweedie_variance_power",
-            *tweedie_variance_power == other.tweedie_variance_power,
-        );
-        differs("huber_slope", *huber_slope == other.huber_slope);
-        differs(
-            "lambdarank_num_pair_per_sample",
-            *lambdarank_num_pair_per_sample == other.lambdarank_num_pair_per_sample,
-        );
-        differs("quantile_alpha", *quantile_alpha == other.quantile_alpha);
-        differs("expectile_alpha", *expectile_alpha == other.expectile_alpha);
-        differs(
-            "aft_loss_distribution",
-            *aft_loss_distribution == other.aft_loss_distribution,
-        );
-        differs(
-            "aft_loss_distribution_scale",
-            *aft_loss_distribution_scale == other.aft_loss_distribution_scale,
-        );
-        differs("dist_gradient", *dist_gradient == other.dist_gradient);
-        differs(
-            "dist_split_direction",
-            *dist_split_direction == other.dist_split_direction,
-        );
         differs("eta", *eta == other.eta);
         differs("gamma", *gamma == other.gamma);
         differs("max_depth", *max_depth == other.max_depth);
@@ -778,10 +883,6 @@ impl TrainingParams {
         );
         differs("lambda", *lambda == other.lambda);
         differs("alpha", *alpha == other.alpha);
-        differs(
-            "scale_pos_weight",
-            *scale_pos_weight == other.scale_pos_weight,
-        );
         differs("tree_method", *tree_method == other.tree_method);
         differs("grow_policy", *grow_policy == other.grow_policy);
         differs("max_bin", *max_bin == other.max_bin);
@@ -857,6 +958,10 @@ impl TrainingParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::distributional::{DistFamily, Distributional};
+    use crate::objective::{
+        Aft, Expectiles, LambdaRank, Logistic, Multiclass, PseudoHuber, Quantiles, Tweedie,
+    };
     use serde_json::json;
 
     /// The parameter [`TrainingParams::from_xgboost`] refuses, if any.
@@ -874,6 +979,7 @@ mod tests {
     #[test]
     fn xgboost_spellings_parse_and_round_trip() {
         let p = TrainingParams::from_xgboost([
+            ("objective", json!("reg:quantileerror")),
             ("aft_loss_distribution", json!("extreme")),
             ("sampling_method", json!("gradient_based")),
             ("multi_strategy", json!("multi_output_tree")),
@@ -881,23 +987,29 @@ mod tests {
             ("refresh_leaf", json!(false)),
             ("num_parallel_tree", json!(4)),
             ("quantile_alpha", json!(0.25)),
-            ("eval_metric", json!("mae")),
+            ("eval_metric", json!("aft-nloglik")),
             ("monotone_constraints", json!("(1,-1,0)")),
             ("interaction_constraints", json!("[[0, 1], [2]]")),
             ("learning_rate", json!(0.1)),
             ("reg_lambda", json!(2.0)),
             ("max_delta_step", json!(0.0)),
-            ("lambdarank_pair_method", json!("topk")),
         ])
         .unwrap();
-        assert_eq!(p.aft_loss_distribution, AftDistribution::Extreme);
+        assert_eq!(
+            p.objective,
+            Objective::Quantile(Quantiles::new([0.25]).unwrap())
+        );
+        assert_eq!(
+            p.eval_metric,
+            [EvalMetric::AftNLogLik(Aft::with_distribution(
+                AftDistribution::Extreme
+            ))]
+        );
         assert_eq!(p.sampling_method, SamplingMethod::GradientBased);
         assert_eq!(p.multi_strategy, MultiStrategy::MultiOutputTree);
         assert_eq!(p.process_type, ProcessType::Update);
         assert!(!p.refresh_leaf);
         assert_eq!(p.num_parallel_tree, 4);
-        assert_eq!(p.quantile_alpha, [0.25]);
-        assert_eq!(p.eval_metric, [EvalMetric::Mae]);
         assert_eq!(
             p.monotone_constraints,
             [Monotone::Increasing, Monotone::Decreasing, Monotone::None]
@@ -920,6 +1032,108 @@ mod tests {
                 .unwrap()
                 .contains_key("max_delta_step")
         );
+        let rank = TrainingParams::from_xgboost([
+            ("objective", json!("rank:ndcg")),
+            ("lambdarank_pair_method", json!("topk")),
+        ])
+        .unwrap();
+        assert_eq!(rank.objective, Objective::RankNdcg(LambdaRank::default()));
+    }
+
+    /// Every built-in objective's flat form (its name and the keys of its
+    /// own parameters) reads back to the same objective.
+    #[test]
+    fn typed_objectives_round_trip_through_the_flat_form() {
+        let dist = Distributional::new(DistFamily::Gamma).with_gradient(DistGradient::Natural);
+        let objectives = [
+            Objective::SquaredError,
+            Objective::SquaredLogError,
+            Objective::PseudoHuber(PseudoHuber::new(0.4).unwrap()),
+            Objective::AbsoluteError,
+            Objective::Quantile(Quantiles::new([0.1, 0.5, 0.9]).unwrap()),
+            Objective::Expectile(Expectiles::new([0.2, 0.8]).unwrap()),
+            Objective::RegLogistic(Logistic::new(3.0).unwrap()),
+            Objective::BinaryLogistic(Logistic::new(2.5).unwrap()),
+            Objective::BinaryLogitRaw(Logistic::new(0.5).unwrap()),
+            Objective::BinaryHinge,
+            Objective::Softmax(Multiclass::new(4).unwrap()),
+            Objective::Softprob(Multiclass::new(3).unwrap()),
+            Objective::Poisson,
+            Objective::Gamma,
+            Objective::Tweedie(Tweedie::new(1.3).unwrap()),
+            Objective::RankPairwise(LambdaRank::new(4).unwrap()),
+            Objective::RankNdcg(LambdaRank::new(8).unwrap()),
+            Objective::RankMap(LambdaRank::default()),
+            Objective::Cox,
+            Objective::Aft(Aft::new(AftDistribution::Logistic, 1.7).unwrap()),
+            Objective::Dist(dist),
+        ];
+        for objective in objectives {
+            let p = TrainingParams {
+                objective: objective.clone(),
+                ..TrainingParams::default()
+            };
+            let flat = p.to_xgboost().unwrap();
+            assert_eq!(flat["objective"], json!(objective.name()));
+            let back = TrainingParams::from_xgboost(flat).unwrap();
+            assert_eq!(back.objective, objective, "{}", objective.name());
+            assert_eq!(back, p, "{}", objective.name());
+        }
+        // A split direction needs shared vector-leaf trees.
+        let p = TrainingParams {
+            objective: Objective::Dist(dist.with_split_direction(DistSplitDirection::Cyclic)),
+            multi_strategy: MultiStrategy::MultiOutputTree,
+            ..TrainingParams::default()
+        };
+        let flat = p.to_xgboost().unwrap();
+        assert_eq!(flat["dist_split_direction"], json!("cyclic"));
+        assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), p);
+    }
+
+    /// An objective-parameter key the objective does not read is refused by
+    /// name, unless a configured metric borrows it (as XGBoost's metrics
+    /// read the objective's parameters).
+    #[test]
+    fn objective_keys_nothing_reads_are_refused_by_name() {
+        for (pairs, key) in [
+            (
+                json!({"objective": "binary:logistic", "num_class": 3}),
+                "num_class",
+            ),
+            (
+                json!({"objective": "reg:squarederror", "scale_pos_weight": 2.0}),
+                "scale_pos_weight",
+            ),
+            (
+                json!({"objective": "reg:gamma", "dist_gradient": "hessian"}),
+                "dist_gradient",
+            ),
+            (
+                json!({"objective": "reg:squarederror", "huber_slope": 0.5}),
+                "huber_slope",
+            ),
+            (
+                json!({"objective": "multi:softprob", "num_class": 3, "tweedie_variance_power": 1.2}),
+                "tweedie_variance_power",
+            ),
+        ] {
+            let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
+            assert!(
+                refusal.starts_with(&format!("invalid parameter `{key}`")),
+                "{pairs}: {refusal}"
+            );
+        }
+        let p = TrainingParams::from_xgboost([
+            ("objective", json!("reg:squarederror")),
+            ("eval_metric", json!("mphe")),
+            ("huber_slope", json!(0.5)),
+        ])
+        .unwrap();
+        assert_eq!(p.objective, Objective::SquaredError);
+        assert_eq!(
+            p.eval_metric,
+            [EvalMetric::Mphe(PseudoHuber::new(0.5).unwrap())]
+        );
     }
 
     /// XGBoost's metrics read the flat parameters whatever the objective:
@@ -929,7 +1143,6 @@ mod tests {
     #[test]
     fn metrics_take_the_flat_parameters_xgboost_gives_them() {
         use crate::objective::distributional::DistFamily;
-        use crate::objective::{Aft, PseudoHuber, Quantiles};
         let p = TrainingParams::from_xgboost([
             ("huber_slope", json!(0.7)),
             ("quantile_alpha", json!([0.2, 0.8])),
@@ -956,9 +1169,22 @@ mod tests {
         );
         assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), p);
 
+        // One flat `huber_slope` serves the objective and every metric, so
+        // metrics or an objective with another slope have no flat form.
+        let slope = |s| PseudoHuber::new(s).unwrap();
         let mut other_slope = p.clone();
-        other_slope.eval_metric = vec![EvalMetric::Mphe(PseudoHuber::new(2.0).unwrap())];
+        other_slope.eval_metric = vec![EvalMetric::Mphe(slope(2.0))];
+        let flat = other_slope.to_xgboost().unwrap();
+        assert_eq!(flat["huber_slope"], json!(2.0));
+        assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), other_slope);
+        other_slope.eval_metric.push(EvalMetric::Mphe(slope(0.7)));
         assert!(other_slope.to_xgboost().is_err());
+        let huber = TrainingParams {
+            objective: Objective::PseudoHuber(slope(0.7)),
+            eval_metric: vec![EvalMetric::Mphe(slope(2.0))],
+            ..TrainingParams::default()
+        };
+        assert!(huber.to_xgboost().is_err());
         let no_dist = TrainingParams {
             eval_metric: vec![EvalMetric::Nll(DistFamily::Normal)],
             ..TrainingParams::default()

@@ -8,6 +8,8 @@ mod common;
 use hessboost::config::{
     BoosterKind, ModelShrinkMode, Monotone, MultiStrategy, TrainingParamsBuilder,
 };
+use hessboost::objective::distributional::{DistFamily, Distributional};
+use hessboost::objective::{Logistic, Multiclass, Objective};
 use hessboost::prelude::*;
 
 /// `n` rows of a noisy regression target over four features (feature 3
@@ -65,7 +67,7 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             "exact decreasing shrinkage with Langevin",
             base()
                 .tree_method(TreeMethod::Exact)
-                .objective("binary:logistic")
+                .objective(Objective::BinaryLogistic(Logistic::default()))
                 .langevin(true)
                 .diffusion_temperature(50.0)
                 .model_shrink_mode(ModelShrinkMode::Decreasing)
@@ -78,8 +80,7 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             "approx multiclass posterior sampling",
             base()
                 .tree_method(TreeMethod::Approx)
-                .objective("multi:softprob")
-                .num_class(3)
+                .objective(Objective::Softprob(Multiclass::new(3).unwrap()))
                 .posterior_sampling(true)
                 .build()
                 .unwrap(),
@@ -89,7 +90,7 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             "vector-leaf dist:normal posterior sampling",
             base()
                 .tree_method(TreeMethod::Hist)
-                .objective("dist:normal")
+                .objective(Objective::Dist(Distributional::new(DistFamily::Normal)))
                 .multi_strategy(MultiStrategy::MultiOutputTree)
                 .posterior_sampling(true)
                 .build()
@@ -174,7 +175,7 @@ fn langevin_training_is_thread_count_independent() {
     let data = regression(20_000);
     let params = |seed| {
         TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .tree_method(TreeMethod::Hist)
             .max_depth(4)
             .posterior_sampling(true)
@@ -418,7 +419,7 @@ fn langevin_continuation_matches_the_uninterrupted_run() {
 #[test]
 fn uncertainty_decomposes_per_objective() {
     let binary = classification(300, 2);
-    let params = |objective: &str| {
+    let params = |objective: Objective| {
         TrainingParams::builder()
             .objective(objective)
             .max_depth(3)
@@ -426,7 +427,12 @@ fn uncertainty_decomposes_per_objective() {
             .build()
             .unwrap()
     };
-    let model = train(&params("binary:logistic"), &binary, 40).unwrap();
+    let model = train(
+        &params(Objective::BinaryLogistic(Logistic::default())),
+        &binary,
+        40,
+    )
+    .unwrap();
     let u = model.predict_uncertainty(&binary, 10).unwrap();
     let (data, total) = (u.data.unwrap(), u.total.unwrap());
     for ((&k, &d), &t) in u.knowledge.iter().zip(&data).zip(&total) {
@@ -436,7 +442,12 @@ fn uncertainty_decomposes_per_objective() {
     assert!(u.mean.iter().all(|&p| (0.0..=1.0).contains(&p)));
 
     let reg = regression(300);
-    let dist = train(&params("dist:normal"), &reg, 40).unwrap();
+    let dist = train(
+        &params(Objective::Dist(Distributional::new(DistFamily::Normal))),
+        &reg,
+        40,
+    )
+    .unwrap();
     let u = dist.predict_uncertainty(&reg, 5).unwrap();
     let (data, total) = (u.data.unwrap(), u.total.unwrap());
     for ((&k, &d), &t) in u.knowledge.iter().zip(&data).zip(&total) {
@@ -444,7 +455,7 @@ fn uncertainty_decomposes_per_objective() {
         assert_eq!(t, k + d);
     }
 
-    let squared = train(&params("reg:squarederror"), &reg, 40).unwrap();
+    let squared = train(&params(Objective::SquaredError), &reg, 40).unwrap();
     let u = squared.predict_uncertainty(&reg, 5).unwrap();
     assert!(u.data.is_none() && u.total.is_none());
     assert!(u.knowledge.iter().all(|&k| k >= 0.0));

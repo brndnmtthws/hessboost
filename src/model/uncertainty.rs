@@ -83,9 +83,10 @@
 //! # }
 //! ```
 
-use super::{BoostedModel, transform_model_margins};
+use super::{BoostedModel, ModelObjective, transform_model_margins};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
+use crate::objective::Objective;
 use crate::objective::distributional::{Dist, DistFamily};
 
 /// The predictions of a model's virtual ensemble
@@ -189,28 +190,47 @@ enum Decomposition {
 }
 
 impl Decomposition {
-    fn of(objective: &str) -> Result<Self> {
-        if let Some(family) = DistFamily::from_objective(objective) {
-            return Ok(Decomposition::Distributional(family));
-        }
-        Ok(match objective {
-            "binary:logistic" | "binary:logitraw" | "reg:logistic" => Decomposition::Binary,
-            "multi:softprob" | "multi:softmax" => Decomposition::Multiclass,
-            _ if ["reg:", "count:", "survival:"]
-                .iter()
-                .any(|prefix| objective.starts_with(prefix)) =>
-            {
-                Decomposition::Regression
-            }
-            _ => {
-                return Err(HessboostError::invalid_param(
-                    "objective",
-                    format!(
-                        "uncertainty is defined for regression, `dist:*`, and probabilistic \
-                         classification objectives, not `{objective}`"
-                    ),
-                ));
-            }
+    fn of(objective: &ModelObjective) -> Result<Self> {
+        let refused = || {
+            Err(HessboostError::invalid_param(
+                "objective",
+                format!(
+                    "uncertainty is defined for regression, `dist:*`, and probabilistic \
+                     classification objectives, not `{}`",
+                    objective.name()
+                ),
+            ))
+        };
+        let Some(built_in) = objective.built_in() else {
+            return refused();
+        };
+        Ok(match built_in {
+            Objective::Dist(_) => match built_in.dist_family() {
+                Some(family) => Decomposition::Distributional(family),
+                None => return refused(),
+            },
+            Objective::BinaryLogistic(_)
+            | Objective::BinaryLogitRaw(_)
+            | Objective::RegLogistic(_) => Decomposition::Binary,
+            Objective::Softmax(_) | Objective::Softprob(_) => Decomposition::Multiclass,
+            Objective::SquaredError
+            | Objective::SquaredLogError
+            | Objective::PseudoHuber(_)
+            | Objective::AbsoluteError
+            | Objective::Quantile(_)
+            | Objective::Expectile(_)
+            | Objective::Poisson
+            | Objective::Gamma
+            | Objective::Tweedie(_)
+            | Objective::Cox
+            | Objective::Aft(_) => Decomposition::Regression,
+            // Hinge predicts no probabilities, ranking scores are only
+            // ordered, and a custom loss's predictions are unknown.
+            Objective::BinaryHinge
+            | Objective::RankPairwise(_)
+            | Objective::RankNdcg(_)
+            | Objective::RankMap(_)
+            | Objective::Custom(_) => return refused(),
         })
     }
 }
@@ -287,8 +307,7 @@ impl BoostedModel {
             margins.extend_from_slice(&margin);
             predictions.extend(transform_model_margins(
                 &self.objective,
-                &self.objective_params,
-                self.num_class,
+                self.max_delta_step,
                 self.n_targets,
                 self.n_outputs,
                 margin,
@@ -296,7 +315,11 @@ impl BoostedModel {
         }
         Ok(VirtualEnsembles {
             // `predict`'s layout: one class index per row for `multi:softmax`.
-            width: if self.objective == "multi:softmax" {
+            width: if self
+                .objective
+                .built_in()
+                .is_some_and(Objective::predicts_class_index)
+            {
                 1
             } else {
                 self.n_outputs

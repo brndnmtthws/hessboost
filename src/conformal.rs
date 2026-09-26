@@ -61,7 +61,9 @@
 //! let all = DMatrix::from_dense(&x, n, 1)?.with_labels(&y)?;
 //! let (dtrain, dcal) = (all.select_rows(&train_rows)?, all.select_rows(&cal_rows)?);
 //!
-//! let params = TrainingParams::builder().objective("reg:squarederror").build()?;
+//! let params = TrainingParams::builder()
+//!     .objective(Objective::SquaredError)
+//!     .build()?;
 //! let model = train(&params, &dtrain, 20)?;
 //!
 //! let conformal = SplitConformal::calibrate(&model, &dcal, 0.1)?;
@@ -577,10 +579,12 @@ fn round_up(x: f64) -> f32 {
 mod tests {
     use super::*;
     use crate::config::TrainingParams;
-    use crate::objective::{CustomLoss, GradPair};
+    use crate::objective::Multiclass;
+    use crate::objective::distributional::{DistFamily, Distributional};
+    use crate::objective::{CustomLoss, GradPair, Objective};
     use crate::rng::Rng;
     use crate::test_support::labeled_dense;
-    use crate::training::{Trainer, train};
+    use crate::training::train;
 
     const N_FEATURES: usize = 2;
 
@@ -608,7 +612,7 @@ mod tests {
 
     fn point_model(d: &DMatrix) -> BoostedModel {
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -628,15 +632,12 @@ mod tests {
         })
         .with_default_metric(crate::metric::EvalMetric::Mae);
         let params = TrainingParams::builder()
+            .objective(Objective::custom(obj))
             .max_depth(4)
             .eta(0.3)
             .build()
             .unwrap();
-        Trainer::new(&params, d, 150)
-            .loss(&obj)
-            .train()
-            .unwrap()
-            .model
+        train(&params, d, 150).unwrap()
     }
 
     fn coverage(intervals: &[(f32, f32)], d: &DMatrix) -> f64 {
@@ -846,7 +847,7 @@ mod tests {
         let y = -(2f32.powi(-80));
         let cal = labeled_dense(&[0.0], 1, 1, &[y]);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .base_score(1.0)
             .build()
             .unwrap();
@@ -875,7 +876,7 @@ mod tests {
         // an unbounded interval, not a non-finite-prediction error.
         let train_set = hetero(300, &mut Rng::new(17));
         let params = TrainingParams::builder()
-            .objective("dist:normal")
+            .objective(Objective::Dist(Distributional::new(DistFamily::Normal)))
             .max_depth(2)
             .build()
             .unwrap();
@@ -1014,12 +1015,12 @@ mod tests {
                 *g = GradPair::new(-1e36, 1.0);
             }
         });
-        let params = TrainingParams::builder().max_depth(1).build().unwrap();
-        let exploding = Trainer::new(&params, &train_set, 1)
-            .loss(&exploding)
-            .train()
-            .unwrap()
-            .model;
+        let params = TrainingParams::builder()
+            .objective(Objective::custom(exploding))
+            .max_depth(1)
+            .build()
+            .unwrap();
+        let exploding = train(&params, &train_set, 1).unwrap();
         let at_max = |d: DMatrix| {
             let n = d.n_rows();
             d.with_base_margin(&vec![f32::MAX; n]).unwrap()
@@ -1042,8 +1043,7 @@ mod tests {
         let y: Vec<f32> = (0..n).map(|i| (i % 3) as f32).collect();
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective("multi:softmax")
-            .num_class(3)
+            .objective(Objective::Softmax(Multiclass::new(3).unwrap()))
             .build()
             .unwrap();
         let model = train(&params, &d, 2).unwrap();

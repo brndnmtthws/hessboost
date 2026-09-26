@@ -275,13 +275,14 @@ fn mean_sketch(g: &[GradPair]) -> SplitGradient {
 #[test]
 fn reduced_gradients_grow_structure_from_the_sketch() {
     let dtrain = dtrain();
-    let params = vector_params().lambda(0.0).build().unwrap();
-    let obj = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
-    let model = Trainer::new(&params, &dtrain, 1)
-        .loss(&obj)
-        .train()
-        .unwrap()
-        .model;
+    let sketched = vector_params()
+        .lambda(0.0)
+        .objective(Objective::custom(
+            squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g))),
+        ))
+        .build()
+        .unwrap();
+    let model = train(&sketched, &dtrain, 1).unwrap();
     let tree = &model.trees()[0];
     // Leaf vectors are refit per target from the full gradients: with unit
     // Hessians and no regularization each is eta × the leaf's mean residual.
@@ -306,11 +307,12 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
         }
     }
     // The sketch changes the structure relative to the full gradients.
-    let full = Trainer::new(&params, &dtrain, 1)
-        .loss(&squared_error(K))
-        .train()
-        .unwrap()
-        .model;
+    let full_params = vector_params()
+        .lambda(0.0)
+        .objective(Objective::custom(squared_error(K)))
+        .build()
+        .unwrap();
+    let full = train(&full_params, &dtrain, 1).unwrap();
     assert_ne!(full.trees()[0].nodes(), tree.nodes());
 }
 
@@ -323,12 +325,13 @@ fn unsupported_combinations_are_rejected() {
         .unwrap();
     assert_eq!(invalid_param(train(&exact, &dtrain, 1)), "multi_strategy");
 
-    let sketch = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
-    let per_output = TrainingParams::builder().build().unwrap();
-    assert_eq!(
-        invalid_param(Trainer::new(&per_output, &dtrain, 1).loss(&sketch).train()),
-        "objective"
-    );
+    let sketch =
+        Objective::custom(squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g))));
+    let per_output = TrainingParams::builder()
+        .objective(sketch.clone())
+        .build()
+        .unwrap();
+    assert_eq!(invalid_param(train(&per_output, &dtrain, 1)), "objective");
     // The linear booster grows no trees, so it refuses the hook rather than
     // ignoring it.
     for strategy in [
@@ -338,28 +341,29 @@ fn unsupported_combinations_are_rejected() {
         let linear = TrainingParams::builder()
             .booster(BoosterKind::GbLinear)
             .multi_strategy(strategy)
+            .objective(sketch.clone())
             .build()
             .unwrap();
-        assert_eq!(
-            invalid_param(Trainer::new(&linear, &dtrain, 1).loss(&sketch).train()),
-            "objective"
-        );
+        assert_eq!(invalid_param(train(&linear, &dtrain, 1)), "objective");
     }
     let monotone = vector_params()
         .monotone_constraints(vec![Monotone::Increasing])
+        .objective(sketch)
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(Trainer::new(&monotone, &dtrain, 1).loss(&sketch).train()),
+        invalid_param(train(&monotone, &dtrain, 1)),
         "monotone_constraints"
     );
 
-    let wrong =
-        squared_error(K).with_split_gradient(|_, g| Some(SplitGradient::new(g[1..].to_vec(), 1)));
+    let wrong = vector_params()
+        .objective(Objective::custom(squared_error(K).with_split_gradient(
+            |_, g| Some(SplitGradient::new(g[1..].to_vec(), 1)),
+        )))
+        .build()
+        .unwrap();
     assert!(matches!(
-        Trainer::new(&vector_params().build().unwrap(), &dtrain, 1)
-            .loss(&wrong)
-            .train(),
+        train(&wrong, &dtrain, 1),
         Err(HessboostError::DimensionMismatch { .. })
     ));
 }

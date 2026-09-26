@@ -47,11 +47,13 @@ use std::io::Read;
 
 use std::sync::OnceLock;
 
+use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer, format_error, wrong_length};
 use super::{BoostedModel, LinearModel, Shrinkage};
-use crate::config::{AftDistribution, DistGradient, DistSplitDirection, ObjectiveParams};
 use crate::error::Result;
+use crate::objective::AftDistribution;
 use crate::objective::distributional::DistFamily;
+use crate::objective::distributional::{DistGradient, DistSplitDirection};
 use crate::tree::linear::LinearLeaves;
 use crate::tree::{Node, RegTree};
 
@@ -156,7 +158,7 @@ pub(super) fn write(model: &BoostedModel) -> Result<Vec<u8>> {
 
 /// The `model.*`, `gblinear.*`, and `objective.*` sections.
 fn write_model_sections(w: &mut Writer, m: &BoostedModel) {
-    w.str("model.objective", &m.objective);
+    w.str("model.objective", m.objective.name());
     w.raw("model.writer", 0, WRITER.as_bytes());
     w.array(
         "model.base_score",
@@ -200,7 +202,10 @@ fn write_model_sections(w: &mut Writer, m: &BoostedModel) {
             f32::to_le_bytes,
         );
     }
-    write_objective_params(w, &m.objective_params);
+    write_objective_params(
+        w,
+        &StoredObjectiveParams::of(&m.objective, m.max_delta_step),
+    );
 }
 
 /// The trees, column-wise: `tree.*` per-tree arrays, `node.*` per-node
@@ -394,8 +399,10 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         )));
     }
 
-    let objective = s.str("model.objective")?.to_string();
-    let objective_params = read_objective_params(&s, ObjectiveParams::defaults_for(&objective))?;
+    let name = s.str("model.objective")?;
+    let stored = read_objective_params(&s, StoredObjectiveParams::defaults_for(name))?;
+    let num_class = s.usize("model.num_class")?;
+    let objective = ModelObjective::from_stored(name, &stored, num_class)?;
     let linear = if s.has("gblinear.weights") || s.has("gblinear.bias") {
         Some(LinearModel::new(
             s.array("gblinear.weights", f32::from_le_bytes)?,
@@ -408,8 +415,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         trees: read_trees(&s)?,
         base_score: s.array("model.base_score", f32::from_le_bytes)?,
         objective,
-        objective_params,
-        num_class: s.usize("model.num_class")?,
+        max_delta_step: stored.max_delta_step,
+        num_class,
         n_outputs: s.usize("model.n_outputs")?,
         n_targets: s.usize("model.n_targets")?,
         n_features: s.usize("model.n_features")?,
@@ -532,7 +539,7 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
 }
 
 /// Write every objective parameter as its own `objective.*` section.
-pub(super) fn write_objective_params(w: &mut Writer, p: &ObjectiveParams) {
+pub(super) fn write_objective_params(w: &mut Writer, p: &StoredObjectiveParams) {
     w.f64("objective.scale_pos_weight", p.scale_pos_weight);
     w.f64("objective.max_delta_step", p.max_delta_step);
     w.f64("objective.tweedie_variance_power", p.tweedie_variance_power);
@@ -573,10 +580,10 @@ pub(super) fn write_objective_params(w: &mut Writer, p: &ObjectiveParams) {
 /// its value from `base` (the objective's defaults).
 pub(super) fn read_objective_params(
     s: &Sections,
-    base: ObjectiveParams,
-) -> Result<ObjectiveParams> {
+    base: StoredObjectiveParams,
+) -> Result<StoredObjectiveParams> {
     let f64s = |s: &Sections, name: &str| s.array(name, f64::from_le_bytes);
-    Ok(ObjectiveParams {
+    Ok(StoredObjectiveParams {
         scale_pos_weight: or(
             s,
             "objective.scale_pos_weight",
@@ -768,6 +775,7 @@ mod tests {
     use super::super::sections::REQUIRED;
     use super::*;
     use crate::config::TrainingParams;
+    use crate::objective::{Objective, PseudoHuber};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
 
@@ -828,8 +836,7 @@ mod tests {
         let y: Vec<f32> = x.iter().map(|v| v * 0.5).collect();
         let data = labeled_dense(&x, 40, 1, &y);
         let params = TrainingParams::builder()
-            .objective("reg:pseudohubererror")
-            .huber_slope(3.0)
+            .objective(Objective::PseudoHuber(PseudoHuber::new(3.0).unwrap()))
             .max_depth(2)
             .build()
             .unwrap();
@@ -940,12 +947,13 @@ mod tests {
     #[test]
     fn absent_objective_sections_take_their_defaults() {
         let (model, _) = model();
-        assert_eq!(model.objective_params().huber_slope, 3.0);
+        let huber = |slope| Some(Objective::PseudoHuber(PseudoHuber::new(slope).unwrap()));
+        assert_eq!(model.objective().built_in().cloned(), huber(3.0));
         let edited = rewrite(&model.to_bytes().unwrap(), |entries| {
             entries.retain(|e| e.name != "objective.huber_slope");
         });
         let loaded = BoostedModel::from_bytes(&edited).unwrap();
-        assert_eq!(loaded.objective_params().huber_slope, 1.0);
+        assert_eq!(loaded.objective().built_in().cloned(), huber(1.0));
     }
 
     /// Sections the model needs must be present and consistent.
@@ -1008,8 +1016,8 @@ mod tests {
         write(&BoostedModel {
             trees: Vec::new(),
             base_score: vec![0.5],
-            objective: "reg:squarederror".to_string(),
-            objective_params: ObjectiveParams::defaults_for("reg:squarederror"),
+            objective: ModelObjective::BuiltIn(Objective::SquaredError),
+            max_delta_step: 0.0,
             num_class: 0,
             n_outputs: 1,
             n_targets: 1,

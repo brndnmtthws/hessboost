@@ -119,8 +119,8 @@
 //! ```
 
 use super::native::{OBJECTIVE_SECTIONS, read_objective_params, write_objective_params};
+use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer};
-use crate::config::ObjectiveParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{
@@ -163,9 +163,9 @@ fn format_error(msg: impl Into<String>) -> HessboostError {
 /// Metadata the transform and dimension checks need.
 #[derive(Debug, Clone)]
 struct Meta {
-    objective: String,
-    /// `None` when equal to [`ObjectiveParams::defaults_for`] the objective.
-    objective_params: Option<ObjectiveParams>,
+    objective: ModelObjective,
+    /// The `max_delta_step` training used.
+    max_delta_step: f64,
     num_class: usize,
     n_targets: usize,
     /// Trees per output in each boosting iteration: tree `t` feeds output
@@ -177,22 +177,19 @@ struct Meta {
 const META_SECTIONS: &[&str] = &["objective", "num_class", "n_targets", "num_parallel_tree"];
 
 impl Meta {
-    fn objective_params(&self) -> ObjectiveParams {
-        self.objective_params
-            .clone()
-            .unwrap_or_else(|| ObjectiveParams::defaults_for(&self.objective))
-    }
-
     /// The metadata as a section table, the objective parameters only when
-    /// they differ from the objective's defaults.
+    /// they differ from the objective's defaults
+    /// ([`StoredObjectiveParams::defaults_for`]).
     fn section_table(&self) -> Writer {
         let mut w = Writer::default();
-        w.str("objective", &self.objective);
+        let name = self.objective.name();
+        w.str("objective", name);
         w.u64("num_class", self.num_class as u64);
         w.u64("n_targets", self.n_targets as u64);
         w.u64("num_parallel_tree", self.num_parallel_tree as u64);
-        if let Some(params) = &self.objective_params {
-            write_objective_params(&mut w, params);
+        let params = StoredObjectiveParams::of(&self.objective, self.max_delta_step);
+        if params != StoredObjectiveParams::defaults_for(name) {
+            write_objective_params(&mut w, &params);
         }
         w
     }
@@ -205,13 +202,13 @@ impl Meta {
         if !rest.is_empty() {
             return Err(format_error("metadata has trailing bytes"));
         }
-        let objective = s.str("objective")?.to_string();
-        let defaults = ObjectiveParams::defaults_for(&objective);
-        let params = read_objective_params(&s, defaults.clone())?;
+        let name = s.str("objective")?;
+        let params = read_objective_params(&s, StoredObjectiveParams::defaults_for(name))?;
+        let num_class = s.usize("num_class")?;
         Ok(Meta {
-            objective_params: (params != defaults).then_some(params),
-            objective,
-            num_class: s.usize("num_class")?,
+            objective: ModelObjective::from_stored(name, &params, num_class)?,
+            max_delta_step: params.max_delta_step,
+            num_class,
             n_targets: s.usize("n_targets")?,
             num_parallel_tree: s.usize("num_parallel_tree")?,
         })
@@ -653,7 +650,7 @@ fn read_header(r: &mut BitReader, meta: &Meta) -> Result<Header> {
     }
     check_objective_width(
         &meta.objective,
-        &meta.objective_params(),
+        meta.max_delta_step,
         meta.num_class,
         meta.n_targets,
         n_outputs,
@@ -1099,8 +1096,7 @@ impl CompactModel {
         let margin = self.predict_margin(data)?;
         Ok(transform_model_margins(
             &self.meta.objective,
-            &self.meta.objective_params(),
-            self.meta.num_class,
+            self.meta.max_delta_step,
             self.meta.n_targets,
             self.n_outputs(),
             margin,
@@ -1128,8 +1124,8 @@ impl CompactModel {
         Self::from_bytes(&std::fs::read(path)?)
     }
 
-    /// The objective name that drives [`CompactModel::predict`].
-    pub fn objective(&self) -> &str {
+    /// The objective that drives [`CompactModel::predict`].
+    pub fn objective(&self) -> &ModelObjective {
         &self.meta.objective
     }
 
@@ -1720,10 +1716,8 @@ impl<'a> Encoding<'a> {
     fn meta(&self) -> Meta {
         let model = self.model;
         Meta {
-            objective: model.objective().to_string(),
-            objective_params: (*model.objective_params()
-                != ObjectiveParams::defaults_for(model.objective()))
-            .then(|| model.objective_params().clone()),
+            objective: model.objective().clone(),
+            max_delta_step: model.max_delta_step(),
             num_class: model.num_class(),
             n_targets: model.n_targets(),
             num_parallel_tree: model.num_parallel_tree(),
@@ -1745,6 +1739,7 @@ mod tests {
     use super::*;
     use crate::config::{BoosterKind, GrowPolicy, TrainingParams, TreeMethod};
     use crate::data::FeatureType;
+    use crate::objective::{Logistic, Multiclass, Objective, Quantiles};
     use crate::test_support::labeled_dense;
     use crate::training::{Trainer, train};
 
@@ -1812,12 +1807,13 @@ mod tests {
         let targets2 = data.clone().with_label_matrix(&matrix, 2).unwrap();
 
         let base = || TrainingParams::builder().max_depth(4).eta(0.2);
+        let classes = || Multiclass::new(3).unwrap();
         let cases: Vec<(TrainingParams, &DMatrix)> = vec![
             (base().build().unwrap(), &data),
             (
                 base()
                     .tree_method(TreeMethod::Exact)
-                    .objective("binary:logistic")
+                    .objective(Objective::BinaryLogistic(Logistic::default()))
                     .build()
                     .unwrap(),
                 &binary,
@@ -1825,16 +1821,14 @@ mod tests {
             (
                 base()
                     .tree_method(TreeMethod::Approx)
-                    .objective("multi:softprob")
-                    .num_class(3)
+                    .objective(Objective::Softprob(classes()))
                     .build()
                     .unwrap(),
                 &multi,
             ),
             (
                 base()
-                    .objective("multi:softmax")
-                    .num_class(3)
+                    .objective(Objective::Softmax(classes()))
                     .build()
                     .unwrap(),
                 &multi,
@@ -1859,8 +1853,7 @@ mod tests {
             // `(t / num_parallel_tree) % n_outputs`.
             (
                 base()
-                    .objective("multi:softprob")
-                    .num_class(3)
+                    .objective(Objective::Softprob(classes()))
                     .num_parallel_tree(2)
                     .build()
                     .unwrap(),
@@ -1869,8 +1862,7 @@ mod tests {
             (base().num_parallel_tree(2).build().unwrap(), &targets2),
             (
                 base()
-                    .objective("reg:quantileerror")
-                    .quantile_alpha(vec![0.2, 0.8])
+                    .objective(Objective::Quantile(Quantiles::new([0.2, 0.8]).unwrap()))
                     .build()
                     .unwrap(),
                 &data,
@@ -2087,11 +2079,10 @@ mod tests {
         ));
         // A three-alpha objective cannot describe a two-output layout.
         let widened = with_meta(&bytes, |m| {
-            m.objective = "reg:quantileerror".to_string();
+            m.objective = ModelObjective::BuiltIn(Objective::Quantile(
+                Quantiles::new([0.1, 0.5, 0.9]).unwrap(),
+            ));
             m.n_targets = 1;
-            let mut params = ObjectiveParams::defaults_for("reg:quantileerror");
-            params.quantile_alpha = vec![0.1, 0.5, 0.9];
-            m.objective_params = Some(params);
         });
         assert!(matches!(
             CompactModel::from_bytes(&widened),
@@ -2127,8 +2118,8 @@ mod tests {
             w.write_bool(true); // complete
         }
         let meta = Meta {
-            objective: "reg:squarederror".to_string(),
-            objective_params: None,
+            objective: ModelObjective::BuiltIn(Objective::SquaredError),
+            max_delta_step: 0.0,
             num_class: 0,
             n_targets: 1,
             num_parallel_tree: 1,

@@ -4,7 +4,7 @@
 //! the configuration contract.
 
 use hessboost::data::FeatureType;
-use hessboost::objective::{GradPair, create_objective};
+use hessboost::objective::{GradPair, Logistic, Multiclass, PseudoHuber, Tweedie};
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, BudgetStop, train_with_budget};
 
@@ -53,7 +53,7 @@ fn binary(n: usize, seed: u64) -> DMatrix {
     labeled_dense(&x, N_FEATURES, &y)
 }
 
-fn params(objective: &str) -> TrainingParams {
+fn params(objective: Objective) -> TrainingParams {
     TrainingParams::builder()
         .objective(objective)
         .build()
@@ -69,7 +69,7 @@ fn loss(model: &BoostedModel, data: &DMatrix) -> f64 {
         .zip(labels)
         .map(|(&p, &y)| {
             let (p, y) = (f64::from(p), f64::from(y));
-            if model.objective() == "binary:logistic" {
+            if model.objective().name() == "binary:logistic" {
                 let p = p.clamp(1e-15, 1.0 - 1e-15);
                 -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
             } else {
@@ -88,26 +88,35 @@ fn loss(model: &BoostedModel, data: &DMatrix) -> f64 {
 fn larger_budgets_train_more_trees_and_fit_held_out_data_at_least_as_well() {
     for (objective, data, test) in [
         (
-            "reg:squarederror",
+            Objective::SquaredError,
             regression(1500, 1),
             regression(4000, 101),
         ),
-        ("binary:logistic", binary(1500, 1), binary(4000, 101)),
+        (
+            Objective::BinaryLogistic(Logistic::default()),
+            binary(1500, 1),
+            binary(4000, 101),
+        ),
     ] {
+        let name = objective.name();
         let mut previous: Option<(usize, f64)> = None;
         for budget in [0.5, 1.0, 1.5] {
-            let result =
-                train_with_budget(&params(objective), &data, &BudgetConfig::new(budget)).unwrap();
+            let result = train_with_budget(
+                &params(objective.clone()),
+                &data,
+                &BudgetConfig::new(budget),
+            )
+            .unwrap();
             let trees = result.model.num_trees();
             let test_loss = loss(&result.model, &test);
             if let Some((prev_trees, prev_loss)) = previous {
                 assert!(
                     trees > prev_trees,
-                    "{objective} budget {budget}: {trees} trees <= {prev_trees}"
+                    "{name} budget {budget}: {trees} trees <= {prev_trees}"
                 );
                 assert!(
                     test_loss <= prev_loss,
-                    "{objective} budget {budget}: held-out loss {test_loss} > {prev_loss}"
+                    "{name} budget {budget}: held-out loss {test_loss} > {prev_loss}"
                 );
             }
             previous = Some((trees, test_loss));
@@ -123,24 +132,29 @@ fn larger_budgets_train_more_trees_and_fit_held_out_data_at_least_as_well() {
 fn held_out_quality_is_comparable_to_validation_tuned_training() {
     for (objective, train_set, valid, test, band) in [
         (
-            "reg:squarederror",
+            Objective::SquaredError,
             regression(1500, 3),
             regression(1000, 4),
             regression(4000, 5),
             1.10,
         ),
         (
-            "binary:logistic",
+            Objective::BinaryLogistic(Logistic::default()),
             binary(1500, 6),
             binary(1000, 7),
             binary(4000, 8),
             1.10,
         ),
     ] {
-        let budget =
-            train_with_budget(&params(objective), &train_set, &BudgetConfig::new(1.0)).unwrap();
+        let name = objective.name();
+        let budget = train_with_budget(
+            &params(objective.clone()),
+            &train_set,
+            &BudgetConfig::new(1.0),
+        )
+        .unwrap();
         let tuned_params = TrainingParams::builder()
-            .objective(objective)
+            .objective(objective.clone())
             .eta(0.05)
             .build()
             .unwrap();
@@ -150,15 +164,15 @@ fn held_out_quality_is_comparable_to_validation_tuned_training() {
             .train()
             .unwrap()
             .model;
-        let untuned = train(&params(objective), &train_set, 100).unwrap();
+        let untuned = train(&params(objective.clone()), &train_set, 100).unwrap();
         let (budget_loss, tuned_loss) = (loss(&budget.model, &test), loss(&tuned, &test));
         assert!(
             budget_loss <= band * tuned_loss,
-            "{objective}: budget {budget_loss} vs tuned {tuned_loss}"
+            "{name}: budget {budget_loss} vs tuned {tuned_loss}"
         );
         assert!(
             budget_loss < loss(&untuned, &test),
-            "{objective}: budget {budget_loss} is not better than untuned default training"
+            "{name}: budget {budget_loss} is not better than untuned default training"
         );
     }
 }
@@ -168,7 +182,7 @@ fn training_is_deterministic_and_independent_of_the_thread_count() {
     let data = binary(6000, 9);
     let run = |nthread: usize| {
         let p = TrainingParams::builder()
-            .objective("binary:logistic")
+            .objective(Objective::BinaryLogistic(Logistic::default()))
             .nthread(nthread)
             .build()
             .unwrap();
@@ -183,9 +197,13 @@ fn training_is_deterministic_and_independent_of_the_thread_count() {
 #[test]
 fn budget_models_are_ordinary_gbtree_models() {
     let data = regression(800, 10);
-    let model = train_with_budget(&params("reg:squarederror"), &data, &BudgetConfig::new(0.5))
-        .unwrap()
-        .model;
+    let model = train_with_budget(
+        &params(Objective::SquaredError),
+        &data,
+        &BudgetConfig::new(0.5),
+    )
+    .unwrap()
+    .model;
     let preds = model.predict(&data).unwrap();
     let via_xgboost = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
     let via_native = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
@@ -202,23 +220,23 @@ fn budget_models_are_ordinary_gbtree_models() {
 /// safeguard, its Hessian as the second derivative).
 #[test]
 fn pointwise_losses_differentiate_to_the_objective_gradients() {
-    let cases: [(&str, &[f32]); 7] = [
-        ("reg:squarederror", &[-1.5, 0.0, 2.0]),
-        ("reg:pseudohubererror", &[-1.5, 0.0, 2.0]),
-        ("binary:logistic", &[0.0, 1.0]),
-        ("reg:logistic", &[0.3, 0.8]),
-        ("count:poisson", &[0.0, 3.0]),
-        ("reg:gamma", &[0.5, 4.0]),
-        ("reg:tweedie", &[0.0, 2.5]),
+    let weighted = || Logistic::new(2.0).unwrap();
+    let cases: [(Objective, &[f32]); 7] = [
+        (Objective::SquaredError, &[-1.5, 0.0, 2.0]),
+        (
+            Objective::PseudoHuber(PseudoHuber::default()),
+            &[-1.5, 0.0, 2.0],
+        ),
+        (Objective::BinaryLogistic(weighted()), &[0.0, 1.0]),
+        (Objective::RegLogistic(weighted()), &[0.3, 0.8]),
+        (Objective::Poisson, &[0.0, 3.0]),
+        (Objective::Gamma, &[0.5, 4.0]),
+        (Objective::Tweedie(Tweedie::default()), &[0.0, 2.5]),
     ];
     let margins = [-1.2f32, 0.1, 0.9];
-    for (name, labels) in cases {
-        let p = TrainingParams::builder()
-            .objective(name)
-            .scale_pos_weight(2.0)
-            .build()
-            .unwrap();
-        let objective = create_objective(&p, 1).unwrap();
+    for (spec, labels) in cases {
+        let name = spec.name();
+        let objective = params(spec.clone()).loss(1).unwrap();
         let loss = objective.pointwise_loss().expect(name);
         for &y in labels {
             for &m in &margins {
@@ -265,8 +283,12 @@ fn learns_missing_value_directions_and_categorical_splits() {
     let data = labeled_dense(&x, 2, &y)
         .with_feature_types(&[FeatureType::Numerical, FeatureType::Categorical])
         .unwrap();
-    let result =
-        train_with_budget(&params("reg:squarederror"), &data, &BudgetConfig::new(1.0)).unwrap();
+    let result = train_with_budget(
+        &params(Objective::SquaredError),
+        &data,
+        &BudgetConfig::new(1.0),
+    )
+    .unwrap();
     assert!(
         result
             .model
@@ -283,7 +305,7 @@ fn learns_missing_value_directions_and_categorical_splits() {
 fn iteration_limit_caps_the_rounds() {
     let data = regression(1000, 12);
     let result = train_with_budget(
-        &params("reg:squarederror"),
+        &params(Objective::SquaredError),
         &data,
         &BudgetConfig::new(1.5).iteration_limit(7),
     )
@@ -301,7 +323,7 @@ fn unbounded_stopping_rounds_override_trains() {
     let config = BudgetConfig::new(0.5).iteration_limit(30);
     let train = |rounds| {
         let result = train_with_budget(
-            &params("reg:squarederror"),
+            &params(Objective::SquaredError),
             &data,
             &config.stopping_rounds(rounds),
         )
@@ -322,7 +344,7 @@ fn poisson_leaf_steps_are_bounded() {
     x[n - 1] = 1.0;
     let data = labeled_dense(&x, 1, &x);
     let result =
-        train_with_budget(&params("count:poisson"), &data, &BudgetConfig::new(0.5)).unwrap();
+        train_with_budget(&params(Objective::Poisson), &data, &BudgetConfig::new(0.5)).unwrap();
     let preds = result.model.predict(&data).unwrap();
     assert!(preds.iter().all(|p| p.is_finite()), "{:?}", result.stop);
     assert!(preds[0] < 1e-3, "zero-count prediction {}", preds[0]);
@@ -345,7 +367,8 @@ fn non_finite_steps_are_not_appended() {
     let mut y = vec![1.0f32; n];
     y[n - 1] = 1e-30;
     let data = labeled_dense(&x, 1, &y);
-    let result = train_with_budget(&params("reg:gamma"), &data, &BudgetConfig::new(0.5)).unwrap();
+    let result =
+        train_with_budget(&params(Objective::Gamma), &data, &BudgetConfig::new(0.5)).unwrap();
     assert_eq!(result.stop, BudgetStop::NonFiniteLoss);
     let preds = result.model.predict(&data).unwrap();
     assert!(preds.iter().all(|p| p.is_finite()));
@@ -358,7 +381,7 @@ fn non_finite_steps_are_not_appended() {
 fn undefined_root_generalization_keeps_the_best_split() {
     let data = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 1, &[0.0, 0.0, 1.0, 1.0]);
     let result = train_with_budget(
-        &params("reg:squarederror"),
+        &params(Objective::SquaredError),
         &data,
         &BudgetConfig::default().iteration_limit(1),
     )
@@ -371,7 +394,7 @@ fn undefined_root_generalization_keeps_the_best_split() {
 /// format; returns its training predictions and the reason training stopped.
 fn one_saved_tree(data: &DMatrix) -> (Vec<f32>, BudgetStop) {
     let result = train_with_budget(
-        &params("reg:squarederror"),
+        &params(Objective::SquaredError),
         data,
         &BudgetConfig::default().iteration_limit(1),
     )
@@ -402,7 +425,7 @@ fn roots_with_overflowing_hessian_sums_are_errors() {
     let data = labeled_dense(&[0.0, 0.0], 1, &[0.0, 0.0])
         .with_weights(&[3e38, 3e38])
         .unwrap();
-    let params = params("reg:squarederror");
+    let params = params(Objective::SquaredError);
     assert!(matches!(
         train(&params, &data, 1),
         Err(HessboostError::ModelFormat(_))
@@ -459,8 +482,7 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
 
     // Objective parameters and the parameters budget mode reads are accepted.
     let accepted = TrainingParams::builder()
-        .objective("binary:logistic")
-        .scale_pos_weight(3.0)
+        .objective(Objective::BinaryLogistic(Logistic::new(3.0).unwrap()))
         .max_bin(64)
         .nthread(2)
         .base_score(0.4)
@@ -468,60 +490,51 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
         .unwrap();
     train_with_budget(&accepted, &binary(300, 14), &BudgetConfig::default()).unwrap();
     let huber = TrainingParams::builder()
-        .objective("reg:pseudohubererror")
-        .huber_slope(2.0)
+        .objective(Objective::PseudoHuber(PseudoHuber::new(2.0).unwrap()))
         .build()
         .unwrap();
     train_with_budget(&huber, &data, &BudgetConfig::default()).unwrap();
 
-    // Parameters of other objectives are unused, so they are refused too.
-    let foreign = TrainingParams::builder()
-        .quantile_alpha(vec![0.3])
-        .expectile_alpha(vec![0.7])
-        .lambdarank_num_pair_per_sample(4)
-        .huber_slope(2.0)
-        .scale_pos_weight(3.0)
-        .build()
-        .unwrap();
-    let (name, reason) = rejection(&foreign, &data, &BudgetConfig::default());
+    // `max_delta_step` is read by `count:poisson` only: accepted there,
+    // unused (and so refused) with any other objective.
+    let bounded = |objective| {
+        TrainingParams::builder()
+            .objective(objective)
+            .max_delta_step(0.5)
+            .build()
+            .unwrap()
+    };
+    let counts = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 1, &[0.0, 1.0, 2.0, 3.0]);
+    train_with_budget(
+        &bounded(Objective::Poisson),
+        &counts,
+        &BudgetConfig::default(),
+    )
+    .unwrap();
+    let (name, reason) = rejection(
+        &bounded(Objective::SquaredError),
+        &data,
+        &BudgetConfig::default(),
+    );
     assert_eq!(name, "budget");
-    for name in [
-        "quantile_alpha",
-        "expectile_alpha",
-        "lambdarank_num_pair_per_sample",
-        "huber_slope",
-        "scale_pos_weight",
-    ] {
-        assert!(reason.contains(&format!("`{name}`")), "{name}: {reason}");
-    }
+    assert!(reason.contains("`max_delta_step`"), "{reason}");
 }
 
 #[test]
 fn unsupported_objectives_and_budgets_are_rejected() {
     let data = binary(200, 15);
     let multiclass = TrainingParams::builder()
-        .objective("multi:softprob")
-        .num_class(2)
+        .objective(Objective::Softprob(Multiclass::new(2).unwrap()))
         .build()
         .unwrap();
     let (name, _) = rejection(&multiclass, &data, &BudgetConfig::default());
     assert_eq!(name, "objective");
     for budget in [0.0, -1.0, 5.0, f64::NAN] {
         let (name, _) = rejection(
-            &params("binary:logistic"),
+            &params(Objective::BinaryLogistic(Logistic::default())),
             &data,
             &BudgetConfig::new(budget),
         );
         assert_eq!(name, "budget", "budget {budget}");
     }
-}
-
-/// A `num_class` the single-output objective does not use would record an
-/// output layout saved models refuse; it is refused before training.
-#[test]
-fn num_class_the_objective_does_not_use_is_rejected() {
-    let data = regression(8, 17);
-    let params = TrainingParams::builder().num_class(3).build().unwrap();
-    let (name, _) = rejection(&params, &data, &BudgetConfig::new(0.5));
-    assert_eq!(name, "num_class");
 }

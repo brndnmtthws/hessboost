@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     let dtrain = DMatrix::from_dense(&x, n_rows, n_cols)?.with_labels(&y)?;
 
     let params = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .max_depth(4)
         .eta(0.1)
         .subsample(0.9)

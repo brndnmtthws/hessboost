@@ -18,12 +18,12 @@ use crate::metric::EvalMetric;
 /// `max(p (1 − p), ε)`. `scale_pos_weight` rescales the loss of positive
 /// instances to combat class imbalance, exactly as in XGBoost.
 #[derive(Debug, Clone, Copy)]
-pub struct Logistic {
+pub struct LogisticLoss {
     scale_pos_weight: f32,
     variant: LogisticVariant,
 }
 
-/// Which XGBoost objective a [`Logistic`] is.
+/// Which XGBoost objective a [`LogisticLoss`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogisticVariant {
     /// `binary:logistic`.
@@ -34,10 +34,10 @@ enum LogisticVariant {
     Raw,
 }
 
-impl Logistic {
+impl LogisticLoss {
     /// `binary:logistic` with the given positive-class weight.
     pub fn new(scale_pos_weight: f32) -> Self {
-        Logistic {
+        LogisticLoss {
             scale_pos_weight,
             variant: LogisticVariant::Binary,
         }
@@ -46,7 +46,7 @@ impl Logistic {
     /// `reg:logistic` with the given positive-class weight: the same loss,
     /// named and evaluated (`rmse`) as XGBoost's probability regression.
     pub fn regression(scale_pos_weight: f32) -> Self {
-        Logistic {
+        LogisticLoss {
             scale_pos_weight,
             variant: LogisticVariant::Regression,
         }
@@ -57,7 +57,7 @@ impl Logistic {
     /// XGBoost's `LogisticRaw`. Its unweighted-positive intercept is the
     /// plain label mean, taken as a margin.
     pub fn raw(scale_pos_weight: f32) -> Self {
-        Logistic {
+        LogisticLoss {
             scale_pos_weight,
             variant: LogisticVariant::Raw,
         }
@@ -76,13 +76,13 @@ impl Logistic {
     }
 }
 
-impl Default for Logistic {
+impl Default for LogisticLoss {
     fn default() -> Self {
         Self::new(1.0)
     }
 }
 
-impl Loss for Logistic {
+impl Loss for LogisticLoss {
     fn name(&self) -> &str {
         match self.variant {
             LogisticVariant::Binary => "binary:logistic",
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn sigmoid_symmetry() {
         let mut values = [0.0, 2.0, -2.0, 80.0, -80.0];
-        Logistic::default().pred_transform(&mut values);
+        LogisticLoss::default().pred_transform(&mut values);
         assert_relative_eq!(values[0], 0.5, epsilon = 1e-6);
         assert_relative_eq!(values[1] + values[2], 1.0, epsilon = 1e-6);
         // Extreme values do not overflow.
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn gradient_matches_closed_form() {
-        let obj = Logistic::default();
+        let obj = LogisticLoss::default();
         // margin 0 -> p = 0.5
         let preds = [0.0f32];
         let labels = [1.0f32];
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn scale_pos_weight_scales_positive() {
-        let obj = Logistic::new(3.0);
+        let obj = LogisticLoss::new(3.0);
         let preds = [0.0f32, 0.0];
         let labels = [1.0f32, 0.0];
         let out = gradient_pairs(&obj, &preds, &labels, None);
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn base_margins_is_logit_of_rate() {
-        let obj = Logistic::default();
+        let obj = LogisticLoss::default();
         // 50% positive -> logit(0.5) = 0; 25% -> -ln(3) with XGBoost's f32 logit.
         assert_eq!(base_margins(&obj, &[1.0, 0.0], None), vec![0.0]);
         let quarter = base_margins(&obj, &[1.0, 0.0, 0.0, 0.0], None);
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn probs_to_margins_clamps_to_xgboost_bounds() {
-        let obj = Logistic::default();
+        let obj = LogisticLoss::default();
         let mut scores = [0.0, 1e-6, 1.0, 1.0 - 1e-6];
         obj.probs_to_margins(&mut scores);
         assert_eq!(scores[0], scores[1]);
@@ -292,7 +292,7 @@ mod tests {
     /// (XGBoost stores the mean as the margin, not its logit).
     #[test]
     fn logitraw_keeps_margins_and_uses_mean_intercept() {
-        let raw = Logistic::raw(1.0);
+        let raw = LogisticLoss::raw(1.0);
         let mut values = [-3.0f32, 0.5];
         raw.pred_transform(&mut values);
         assert_eq!(values, [-3.0, 0.5]);
@@ -300,7 +300,7 @@ mod tests {
         let (preds, labels) = ([0.3, -1.2], [1.0, 0.0]);
         assert_eq!(
             gradient_pairs(&raw, &preds, &labels, None),
-            gradient_pairs(&Logistic::new(1.0), &preds, &labels, None)
+            gradient_pairs(&LogisticLoss::new(1.0), &preds, &labels, None)
         );
     }
 

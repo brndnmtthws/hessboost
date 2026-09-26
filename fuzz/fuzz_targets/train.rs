@@ -438,6 +438,15 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
         if params.validate().is_err() {
             return Ok(None);
         }
+    } else if !u.ratio(3, 4)? {
+        params.booster = BoosterKind::Ebm;
+        params.ebm_interactions = u.int_in_range(0..=2)?;
+        params.ebm_outer_bags = u.int_in_range(1..=3)?;
+        params.ebm_bag_fraction = param(u, &[0.85, 0.5, 1.0])?;
+        params.ebm_boulevard = u.arbitrary()?;
+        if params.validate().is_err() {
+            return Ok(None);
+        }
     }
     Ok(Some(Case {
         params,
@@ -457,9 +466,9 @@ fn fit(case: &Case, nthread: usize) -> Option<BoostedModel> {
     let mut params = case.params.clone();
     params.nthread = NonZeroUsize::new(nthread);
     let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds);
-    // gblinear refuses evaluation sets and early stopping; attaching them
-    // would reject every linear case before it trains.
-    if params.booster != BoosterKind::GbLinear {
+    // gblinear and ebm refuse evaluation sets and early stopping; attaching
+    // them would reject every such case before it trains.
+    if !matches!(params.booster, BoosterKind::GbLinear | BoosterKind::Ebm) {
         trainer = trainer.eval(&case.dtrain, "train");
         if let Some(rounds) = case.early_stopping {
             trainer = trainer.early_stopping_rounds(rounds);

@@ -3,6 +3,8 @@
 //! each followed by FAST pair selection and pair-term boosting. See
 //! [`crate::ebm`] for the algorithms.
 
+use std::ops::ControlFlow;
+
 use rayon::prelude::*;
 
 use super::boulevard::{Recursion, RoundRequest, Schedule, tree_rows};
@@ -70,15 +72,43 @@ fn parallel(params: &TrainingParams) -> bool {
     params.device == Device::Cpu && rayon::current_num_threads() > 1
 }
 
+/// The per-round hook of training ([`Trainer::on_round`](super::Trainer::on_round))
+/// across the stages: rounds are numbered from 0 through the main-effect
+/// stage and on through the pair stage, and a `Break` ends training.
+struct Hook<'h> {
+    after_round: &'h mut dyn FnMut(usize) -> ControlFlow<()>,
+    done: usize,
+    stopped: bool,
+}
+
+impl Hook<'_> {
+    /// Report a finished round; whether training goes on.
+    fn next(&mut self) -> bool {
+        self.stopped |= (self.after_round)(self.done).is_break();
+        self.done += 1;
+        !self.stopped
+    }
+}
+
 /// Train `rounds` EBM rounds of main effects, then of the
 /// [`ebm_interactions`](TrainingParams::ebm_interactions) FAST pairs, into
-/// `model` (which holds only the intercept) and record its [`EbmInfo`].
+/// `model` (which holds only the intercept) and record its [`EbmInfo`],
+/// calling `after_round` after every round of either stage. A `Break` stops
+/// training there: the model keeps the completed rounds (a stopped
+/// Boulevard stage averages those), and a stop in the main-effect stage
+/// skips the pairs.
 pub(super) fn boost(
     run: &TrainContext,
     prepared: &Prepared,
     model: &mut BoostedModel,
     rounds: usize,
+    after_round: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<()> {
+    let mut hook = Hook {
+        after_round,
+        done: 0,
+        stopped: false,
+    };
     let params = run.params;
     let p = run.dtrain.n_cols();
     let max_pairs = p * p.saturating_sub(1) / 2;
@@ -99,9 +129,12 @@ pub(super) fn boost(
             subsample: params.subsample,
             reg_lambda: params.lambda,
         };
-        (boulevard(run, prepared, &mains, mu, rounds)?, Some(info))
+        (
+            boulevard(run, prepared, &mains, mu, rounds, &mut hook)?,
+            Some(info),
+        )
     } else {
-        (classic(run, prepared, &mains, mu, rounds), None)
+        (classic(run, prepared, &mains, mu, rounds, &mut hook), None)
     };
     let mut terms = mains;
     terms.extend(pairs);
@@ -172,46 +205,59 @@ impl Bag {
         }
     }
 
-    /// Cyclic boosting of `terms` for `rounds` rounds: each tree fits the
+    /// Round `round` of cyclic boosting over `terms`: each tree fits the
     /// gradients of everything before it.
     fn cycle(
         &mut self,
         run: &TrainContext,
         prepared: &Prepared,
         terms: &[Term],
-        rounds: usize,
+        round: u64,
         stage: u64,
     ) {
         let params = run.params;
         let eta = params.eta as f32;
-        for round in 0..rounds as u64 {
-            let key = params.seed
-                ^ EBM_SALT
-                ^ stage.wrapping_mul(GOLDEN)
-                ^ splitmix64(self.index ^ round.wrapping_mul(GOLDEN));
-            let mut rng = Rng::new(splitmix64(key));
-            for &(term, features) in terms {
-                let gpair = gradients(run, &self.margins);
-                let rows = subsample_of(&self.rows, params.subsample, &mut rng);
-                let seed = rng.next_u64();
-                prepared.fill_approx_cache(run, &gpair);
-                let mut tree = grow(run, prepared, &gpair, &rows, features, seed);
-                tree.scale_leaves(eta);
-                for (m, p) in self.margins.iter_mut().zip(tree_rows(&tree, run.dtrain)) {
-                    *m += p;
-                }
-                self.trees.push((term, tree));
+        let key = params.seed
+            ^ EBM_SALT
+            ^ stage.wrapping_mul(GOLDEN)
+            ^ splitmix64(self.index ^ round.wrapping_mul(GOLDEN));
+        let mut rng = Rng::new(splitmix64(key));
+        for &(term, features) in terms {
+            let gpair = gradients(run, &self.margins);
+            let rows = subsample_of(&self.rows, params.subsample, &mut rng);
+            let seed = rng.next_u64();
+            prepared.fill_approx_cache(run, &gpair);
+            let mut tree = grow(run, prepared, &gpair, &rows, features, seed);
+            tree.scale_leaves(eta);
+            for (m, p) in self.margins.iter_mut().zip(tree_rows(&tree, run.dtrain)) {
+                *m += p;
             }
+            self.trees.push((term, tree));
         }
     }
 }
 
-/// Run `f` on every bag, in parallel when allowed, keeping bag order.
-fn each_bag(params: &TrainingParams, bags: &mut [Bag], f: impl Fn(&mut Bag) + Sync + Send) {
-    if parallel(params) && bags.len() > 1 {
-        bags.par_iter_mut().for_each(f);
-    } else {
-        bags.iter_mut().for_each(f);
+/// Run `rounds` rounds of `terms` in every bag (the bags of a round in
+/// parallel when allowed), reporting each round to `hook` until it stops.
+fn cycle_bags(
+    run: &TrainContext,
+    prepared: &Prepared,
+    bags: &mut [Bag],
+    terms: &[Term],
+    stage: (u64, usize),
+    hook: &mut Hook,
+) {
+    let (stage, rounds) = stage;
+    for round in 0..rounds as u64 {
+        let f = |bag: &mut Bag| bag.cycle(run, prepared, terms, round, stage);
+        if parallel(run.params) && bags.len() > 1 {
+            bags.par_iter_mut().for_each(f);
+        } else {
+            bags.iter_mut().for_each(f);
+        }
+        if !hook.next() {
+            return;
+        }
     }
 }
 
@@ -223,6 +269,7 @@ fn classic(
     mains: &[Vec<u32>],
     mu: f64,
     rounds: usize,
+    hook: &mut Hook,
 ) -> Grown {
     let params = run.params;
     let n = run.dtrain.n_rows();
@@ -233,15 +280,13 @@ fn classic(
         .enumerate()
         .map(|(t, f)| (t as u32, f.as_slice()))
         .collect();
-    each_bag(params, &mut bags, |bag| {
-        bag.cycle(run, prepared, &main_terms, rounds, 0);
-    });
+    cycle_bags(run, prepared, &mut bags, &main_terms, (0, rounds), hook);
     let mut main_trees: Vec<(u32, RegTree)> = Vec::new();
     for bag in &mut bags {
         main_trees.append(&mut bag.trees);
     }
     let mut pairs = Vec::new();
-    if params.ebm_interactions > 0 {
+    if params.ebm_interactions > 0 && !hook.stopped {
         let inv = 1.0 / n_bags as f64;
         let averaged: Vec<f32> = (0..n)
             .map(|i| {
@@ -255,9 +300,7 @@ fn classic(
             .enumerate()
             .map(|(k, f)| ((mains.len() + k) as u32, f.as_slice()))
             .collect();
-        each_bag(params, &mut bags, |bag| {
-            bag.cycle(run, prepared, &pair_terms, rounds, 1);
-        });
+        cycle_bags(run, prepared, &mut bags, &pair_terms, (1, rounds), hook);
     }
     let mut trees = main_trees;
     for bag in &mut bags {
@@ -281,6 +324,7 @@ fn boulevard(
     mains: &[Vec<u32>],
     mu: f64,
     rounds: usize,
+    hook: &mut Hook,
 ) -> Result<Grown> {
     let params = run.params;
     let n = run.dtrain.n_rows();
@@ -291,9 +335,9 @@ fn boulevard(
         .collect();
     let base = vec![mu; n];
     let StageFit { mut trees, fitted } =
-        boulevard_stage(run, prepared, &main_terms, &base, rounds, 0)?;
+        boulevard_stage(run, prepared, &main_terms, &base, (0, rounds), hook)?;
     let mut pairs = Vec::new();
-    if params.ebm_interactions > 0 {
+    if params.ebm_interactions > 0 && !hook.stopped {
         let margins: Vec<f32> = fitted.iter().map(|&m| m as f32).collect();
         pairs = fast_pairs(run, &gradients(run, &margins), params.ebm_interactions);
         let pair_terms: Vec<Term> = pairs
@@ -301,7 +345,8 @@ fn boulevard(
             .enumerate()
             .map(|(k, f)| ((mains.len() + k) as u32, f.as_slice()))
             .collect();
-        trees.extend(boulevard_stage(run, prepared, &pair_terms, &fitted, rounds, 1)?.trees);
+        let stage = boulevard_stage(run, prepared, &pair_terms, &fitted, (1, rounds), hook)?;
+        trees.extend(stage.trees);
     }
     Ok(Grown { trees, pairs })
 }
@@ -309,15 +354,17 @@ fn boulevard(
 /// One Boulevard stage over `terms` from the per-row margins `base`: every
 /// round's trees fit the same residuals of `base` plus the stage's current
 /// average, each centered on the training rows, and the stage's leaves end
-/// scaled by Algorithm 1's `(1 + λ)/λ · λ/B`.
+/// scaled by Algorithm 1's `(1 + λ)/λ · λ/B` for the `B` rounds run
+/// (`stage` is the stage index and its rounds; `hook` may stop it early).
 fn boulevard_stage(
     run: &TrainContext,
     prepared: &Prepared,
     terms: &[Term],
     base: &[f64],
-    rounds: usize,
-    stage: u64,
+    stage: (u64, usize),
+    hook: &mut Hook,
 ) -> Result<StageFit> {
+    let (stage, rounds) = stage;
     let TrainContext { params, dtrain, .. } = *run;
     let n = dtrain.n_rows();
     let schedule = Schedule {
@@ -364,6 +411,9 @@ fn boulevard_stage(
             }
             Ok(vec![round_sum.iter().map(|&s| s as f32).collect()])
         })?;
+        if !hook.next() {
+            break;
+        }
     }
     let scale = recursion.scale();
     for (_, tree) in &mut trees {

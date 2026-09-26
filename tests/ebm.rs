@@ -6,6 +6,7 @@ use hessboost::data::FeatureType;
 use hessboost::ebm::shape_functions;
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::prelude::*;
+use std::ops::ControlFlow;
 
 mod common;
 use common::{invalid_param, labeled_dense, lcg, with_threads};
@@ -251,4 +252,58 @@ fn unsupported_combinations_are_refused() {
         invalid_param(train(&boulevard().build().unwrap(), &weighted, 2)),
         "weights"
     );
+}
+
+#[test]
+fn the_round_hook_sees_both_stages_and_stops_training() {
+    let (_, dtrain) = data(300, 8);
+    for (params, bags) in [(classic(), 3), (boulevard(), 1)] {
+        let params = params.build().unwrap();
+        let plain = train(&params, &dtrain, 6).unwrap();
+        let mut seen = Vec::new();
+        let observed = Trainer::new(&params, &dtrain, 6)
+            .on_round(|round| {
+                seen.push(round.iteration);
+                ControlFlow::Continue(())
+            })
+            .train()
+            .unwrap()
+            .model;
+        // Six main-effect rounds, then six pair rounds; observing changes
+        // nothing.
+        assert_eq!(seen, (0..12).collect::<Vec<_>>());
+        assert_eq!(observed.to_bytes().unwrap(), plain.to_bytes().unwrap());
+        let stop_at = |k: usize| {
+            Trainer::new(&params, &dtrain, 6)
+                .on_round(move |round| {
+                    if round.iteration == k {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+                .train()
+                .unwrap()
+                .model
+        };
+        // Stopped in the main-effect stage: three rounds of the three main
+        // terms per bag, no pair term.
+        let early = stop_at(2);
+        assert_eq!(early.num_trees(), bags * 3 * 3);
+        assert_eq!(shape_functions(&early).unwrap().terms.len(), 3);
+        // Stopped in the pair stage: every main round, two pair rounds.
+        let late = stop_at(7);
+        assert_eq!(late.num_trees(), bags * (6 * 3 + 2));
+        assert_eq!(shape_functions(&late).unwrap().terms.len(), 4);
+        if params.ebm_boulevard {
+            let inference = EbmInference::fit(
+                &late,
+                &dtrain,
+                NoiseVariance::Known(0.04),
+                KernelSolver::Exact,
+            )
+            .unwrap();
+            assert!(inference.term_bands(3, 0.1).is_ok());
+        }
+    }
 }

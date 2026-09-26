@@ -576,7 +576,11 @@ impl<'a> Trainer<'a> {
     /// holds the iterations refreshed so far; with `booster = boulevard` it
     /// is the Boulevard average of the rounds run so far. For `gblinear`, which stores
     /// no boosting iterations, [`RoundEval::iteration`] counts this run's
-    /// rounds from 0.
+    /// rounds from 0. For `booster = ebm` it counts EBM rounds from 0
+    /// through the main-effect stage and on through the pair stage (so
+    /// `2 · num_boost_round` rounds with interactions); a `Break` keeps the
+    /// completed rounds, a stopped main-effect stage gets no pair terms, and
+    /// with interactions the result is then not a shorter run's model.
     ///
     /// Observing never changes the model: training with a hook that always
     /// continues gives the same result as training without one.
@@ -832,7 +836,20 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
                 "`booster = ebm` grows new trees only",
             ));
         };
-        super::ebm::boost(&run, prepared, &mut state.model, num_boost_round)?;
+        super::ebm::boost(
+            &run,
+            prepared,
+            &mut state.model,
+            num_boost_round,
+            &mut |iteration| {
+                on_round.as_mut().map_or(ControlFlow::Continue(()), |hook| {
+                    hook(&RoundEval {
+                        iteration,
+                        scores: Vec::new(),
+                    })
+                })
+            },
+        )?;
         return Ok(TrainResult {
             model: state.model,
             history,

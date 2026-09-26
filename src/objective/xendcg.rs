@@ -14,9 +14,28 @@ use crate::error::{HessboostError, Result};
 use crate::metric::group_ranges;
 use crate::rng::{GOLDEN, mix64};
 
+use rayon::prelude::*;
+
+/// Query batches this large use the same disjoint-group parallel strategy as LambdaMART.
+const PARALLEL_XENDCG_ROWS: usize = 4096;
 /// XE-NDCG objective (LightGBM `rank_xendcg`, named `rank:xendcg` here).
 pub struct Xendcg {
     seed: u64,
+}
+
+struct QueryGradient<'a> {
+    seed: u64,
+    iteration: usize,
+    query: usize,
+    scores: &'a [f32],
+    labels: &'a [f32],
+    weights: Option<&'a [f32]>,
+}
+
+#[derive(Default)]
+struct QueryScratch {
+    rho: Vec<f64>,
+    target: Vec<f64>,
 }
 
 impl Xendcg {
@@ -26,40 +45,44 @@ impl Xendcg {
     }
 
     fn accumulate_query(
-        seed: u64,
-        iteration: usize,
-        query: usize,
-        scores: &[f32],
-        labels: &[f32],
-        weights: Option<&[f32]>,
+        context: &QueryGradient<'_>,
         out: &mut [GradPair],
+        scratch: &mut QueryScratch,
     ) {
+        let QueryGradient {
+            seed,
+            iteration,
+            query,
+            scores,
+            labels,
+            weights,
+        } = context;
+        let QueryScratch { rho, target } = scratch;
         let n = scores.len();
         if n <= 1 {
             out.fill(GradPair::default());
             return;
         }
         let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut rho: Vec<f64> = scores
-            .iter()
-            .map(|&score| (f64::from(score) - f64::from(max_score)).exp())
-            .collect();
+        rho.clear();
+        rho.extend(
+            scores
+                .iter()
+                .map(|&score| (f64::from(score) - f64::from(max_score)).exp()),
+        );
         let denominator: f64 = rho.iter().sum();
-        for probability in &mut rho {
+        for probability in rho.iter_mut() {
             *probability /= denominator;
         }
-        let seed_key = mix64(seed);
-        let iter_key = mix64(seed_key ^ (iteration as u64).wrapping_mul(GOLDEN));
-        let query_key = mix64(iter_key ^ (query as u64).wrapping_mul(GOLDEN));
-        let mut target: Vec<f64> = labels
-            .iter()
-            .enumerate()
-            .map(|(doc, &label)| {
-                let bits = mix64(query_key ^ (doc as u64).wrapping_mul(GOLDEN));
-                let draw = (bits >> 40) as f32 * (1.0 / (1u32 << 24) as f32);
-                2.0f64.powf(f64::from(label)) - f64::from(draw)
-            })
-            .collect();
+        let seed_key = mix64(*seed);
+        let iter_key = mix64(seed_key ^ (*iteration as u64).wrapping_mul(GOLDEN));
+        let query_key = mix64(iter_key ^ (*query as u64).wrapping_mul(GOLDEN));
+        target.clear();
+        target.extend(labels.iter().enumerate().map(|(doc, &label)| {
+            let bits = mix64(query_key ^ (doc as u64).wrapping_mul(GOLDEN));
+            let draw = (bits >> 40) as f32 * (1.0 / (1u32 << 24) as f32);
+            2.0f64.powf(f64::from(label)) - f64::from(draw)
+        }));
         let inv_denominator = 1.0 / target.iter().sum::<f64>().max(1e-15);
         let mut sum_l1 = 0.0;
         for i in 0..n {
@@ -123,16 +146,47 @@ impl Objective for Xendcg {
     ) {
         super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         out.fill(GradPair::default());
-        for (query, (start, end)) in group_ranges(preds.len(), group).into_iter().enumerate() {
-            Self::accumulate_query(
-                self.seed,
-                iteration,
-                query,
-                &preds[start..end],
-                &labels[start..end],
-                weights.map(|w| &w[start..end]),
-                &mut out[start..end],
-            );
+        let ranges = group_ranges(preds.len(), group);
+        let mut queries = Vec::with_capacity(ranges.len());
+        let mut rest = &mut out[..];
+        let mut offset = 0;
+        for (start, end) in ranges {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - offset);
+            let (query_out, tail) = tail.split_at_mut(end - start);
+            rest = tail;
+            offset = end;
+            queries.push((start, query_out));
+        }
+        let process_query =
+            |scratch: &mut QueryScratch,
+             (query, (start, query_out)): (usize, (usize, &mut [GradPair]))| {
+                let end = start + query_out.len();
+                Self::accumulate_query(
+                    &QueryGradient {
+                        seed: self.seed,
+                        iteration,
+                        query,
+                        scores: &preds[start..end],
+                        labels: &labels[start..end],
+                        weights: weights.map(|w| &w[start..end]),
+                    },
+                    query_out,
+                    scratch,
+                );
+            };
+        if preds.len() >= PARALLEL_XENDCG_ROWS
+            && queries.len() > 1
+            && rayon::current_num_threads() > 1
+        {
+            queries
+                .into_par_iter()
+                .enumerate()
+                .for_each_init(QueryScratch::default, process_query);
+        } else {
+            let mut scratch = QueryScratch::default();
+            for item in queries.into_iter().enumerate() {
+                process_query(&mut scratch, item);
+            }
         }
     }
 
@@ -224,5 +278,31 @@ mod tests {
         let mut again = [GradPair::default(); 2];
         objective.gradient_grouped_at(&scores, &labels, None, None, &mut again, 4);
         assert_ne!(actual, again);
+    }
+    #[test]
+    fn grouped_gradients_are_bit_identical_across_thread_counts() {
+        let scores = vec![0.0; 4096];
+        let labels: Vec<f32> = (0..4096).map(|i| (i % 5) as f32).collect();
+        let group = GroupInfo::from_sizes(&vec![8; 512]);
+        let objective = Xendcg::new(123);
+        let compute = |threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut result = vec![GradPair::default(); scores.len()];
+                objective.gradient_grouped_at(
+                    &scores,
+                    &labels,
+                    None,
+                    Some(&group),
+                    &mut result,
+                    12,
+                );
+                result
+            })
+        };
+        assert_eq!(compute(1), compute(4));
     }
 }

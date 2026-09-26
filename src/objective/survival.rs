@@ -9,7 +9,7 @@
 
 use rayon::prelude::*;
 
-use super::{GradPair, MIN_HESS_F64, Objective, log_link};
+use super::{GradPair, Loss, MIN_HESS_F64, OutputDomain, check_base_score_domain, log_link};
 use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -44,7 +44,7 @@ pub(crate) fn abs_label_order(labels: &[f32]) -> Vec<usize> {
 #[non_exhaustive]
 pub struct Cox;
 
-impl Objective for Cox {
+impl Loss for Cox {
     fn name(&self) -> &'static str {
         "survival:cox"
     }
@@ -101,8 +101,12 @@ impl Objective for Cox {
         log_link(scores);
     }
 
-    fn default_metric(&self) -> String {
-        "cox-nloglik".to_string()
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        check_base_score_domain(base_score, OutputDomain::Positive)
+    }
+
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::CoxNLogLik
     }
 }
 
@@ -125,19 +129,19 @@ impl Objective for Cox {
 /// in XGBoost.
 ///
 /// Training reads only the label bounds. Called without bounds
-/// ([`Objective::gradient`]), the ordinary labels are treated as observed
+/// ([`Loss::gradient`]), the ordinary labels are treated as observed
 /// times.
 #[derive(Debug, Clone, Copy)]
-pub struct Aft {
+pub struct AftLoss {
     distribution: AftDistribution,
     sigma: f32,
 }
 
-impl Aft {
+impl AftLoss {
     /// Create with the noise `distribution` and its scale `sigma`
     /// (XGBoost `aft_loss_distribution`, `aft_loss_distribution_scale`).
     pub fn new(distribution: AftDistribution, sigma: f32) -> Self {
-        Aft {
+        AftLoss {
             distribution,
             sigma,
         }
@@ -198,14 +202,14 @@ impl Aft {
     }
 }
 
-impl Default for Aft {
+impl Default for AftLoss {
     /// XGBoost's defaults: normal noise with scale 1.
     fn default() -> Self {
-        Aft::new(AftDistribution::Normal, 1.0)
+        AftLoss::new(AftDistribution::Normal, 1.0)
     }
 }
 
-impl Objective for Aft {
+impl Loss for AftLoss {
     fn name(&self) -> &'static str {
         "survival:aft"
     }
@@ -239,6 +243,10 @@ impl Objective for Aft {
         log_link(scores);
     }
 
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        check_base_score_domain(base_score, OutputDomain::Positive)
+    }
+
     /// XGBoost does not estimate an AFT intercept: its default `base_score`
     /// 0.5 maps to the margin `ln 0.5`.
     fn base_margins_info(&self, _info: &MetaInfo) -> Vec<f32> {
@@ -260,8 +268,15 @@ impl Objective for Aft {
         false
     }
 
-    fn default_metric(&self) -> String {
-        "aft-nloglik".to_string()
+    /// XGBoost configures the default metric from the objective's
+    /// `DefaultMetricConfig` but without the user's parameters (the learner
+    /// has cleared them by the time it evaluates): the distribution carries
+    /// over while the scale falls back to its default 1. List `aft-nloglik`
+    /// in `eval_metric` to evaluate the likelihood at the configured scale.
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::AftNLogLik(crate::objective::Aft::with_distribution(
+            self.distribution,
+        ))
     }
 }
 
@@ -916,7 +931,7 @@ mod tests {
 
     #[test]
     fn aft_reads_bounds_and_weights() {
-        let obj = Aft::new(AftDistribution::Normal, 1.0);
+        let obj = AftLoss::new(AftDistribution::Normal, 1.0);
         let lower = [1.0, 2.0, 0.0];
         let upper = [1.0, f32::INFINITY, 3.0];
         let weights = [1.0, 2.0, 0.5];

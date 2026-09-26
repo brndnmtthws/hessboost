@@ -52,9 +52,10 @@
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
 //!   native and XGBoost JSON/UBJSON, LightGBM text import);
 //!   [`model::compact`].
-//! - [`objective`]: the `Objective` trait, the built-in objectives,
-//!   `CustomObjective`, [`objective::distributional`] (`dist:*` objectives).
-//! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
+//! - [`objective`]: the `Loss` trait, the built-in objectives,
+//!   `CustomLoss`, [`objective::distributional`] (`dist:*` objectives).
+//! - [`metric`]: [`EvalMetric`](metric::EvalMetric) (the built-in metrics),
+//!   the `Metric` trait, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
@@ -78,18 +79,22 @@
 //! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
 //!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
-//!   `survival:aft` on censored bounds), plus a custom hook
-//!   ([`Trainer::objective`](training::Trainer::objective)).
+//!   `survival:aft` on censored bounds), plus custom losses
+//!   ([`CustomLoss`](objective::CustomLoss) through
+//!   [`Trainer::loss`](training::Trainer::loss)).
 //! - **Multi-output:** label matrices
 //!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
 //!   tree per output or vector-leaf trees
 //!   ([`MultiStrategy::MultiOutputTree`](config::MultiStrategy::MultiOutputTree)).
-//! - **Metrics:** rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
+//! - **Metrics** ([`EvalMetric`](metric::EvalMetric), each with its own
+//!   parameters): rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
 //!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, plus
-//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric));
+//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric),
+//!   reported after them as in XGBoost). XGBoost's names parse through
+//!   [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost):
 //!   `@k` ranking cutoffs and `@rho` on tweedie-nloglik, other suffixes
-//!   refused ([`create_metric`](metric::create_metric)).
+//!   refused.
 //! - **Modeling:** monotone and interaction constraints, native categorical
 //!   splits, early stopping, feature importance, QuadratureTreeSHAP values
 //!   and interactions
@@ -148,7 +153,10 @@
 //! ## Compatibility notes
 //!
 //! Parameter, objective, and metric names are XGBoost's, so an XGBoost
-//! configuration carries over; unsupported settings are refused. Parity with
+//! configuration carries over:
+//! [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost)
+//! reads an XGBoost `params` dict (keys, aliases, and value spellings), and
+//! unsupported settings are refused. Parity with
 //! XGBoost 3.4.2 is CI-tested: deterministic fixtures reproduce XGBoost
 //! within `1e-4` (quantile cuts bit for bit), and imported XGBoost models
 //! predict and explain as XGBoost does. RNG-driven options (subsampling,
@@ -158,7 +166,8 @@
 //!
 //! - Distributed and external-memory training; GPU training outside macOS.
 //! - XGBoost options available at one setting only (so they are not
-//!   [`TrainingParams`] fields): gblinear uses `updater = coord_descent`
+//!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
+//!   setting): gblinear uses `updater = coord_descent`
 //!   with `feature_selector = cyclic`; LambdaMART uses
 //!   `lambdarank_pair_method = topk` (no `lambdarank_unbiased` or
 //!   `ndcg_exp_gain`); DART has no `sample_type`, `normalize_type`, or
@@ -206,14 +215,17 @@ pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 /// [`TrainingParamsBuilder::tree_method`](config::TrainingParamsBuilder::tree_method)),
 /// [`ImportanceType`](model::ImportanceType) (for
 /// [`BoostedModel::feature_importance`](model::BoostedModel::feature_importance)),
+/// [`EvalMetric`](metric::EvalMetric) (for
+/// [`TrainingParamsBuilder::eval_metric`](config::TrainingParamsBuilder::eval_metric)),
 /// and [`ObjectiveParams`](config::ObjectiveParams) (a model's
 /// [`objective_params`](model::BoostedModel::objective_params)). Everything
-/// else (the other parameter enums, objectives, metrics, conformal
-/// intervals, ...) is imported from its module.
+/// else (the other parameter enums, objectives, metric parameters,
+/// conformal intervals, ...) is imported from its module.
 pub mod prelude {
     pub use crate::config::{ObjectiveParams, TrainingParams, TreeMethod};
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
+    pub use crate::metric::EvalMetric;
     pub use crate::model::{BoostedModel, ImportanceType};
     pub use crate::training::{Trainer, train};
 }

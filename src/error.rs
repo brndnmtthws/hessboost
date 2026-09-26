@@ -41,12 +41,14 @@ pub enum HessboostError {
         num_features: usize,
     },
 
-    /// The requested objective/metric/booster name is not recognized.
+    /// The requested objective/metric/parameter name is not recognized.
     Unknown {
         /// What kind of item was being looked up (objective, metric, ...).
         kind: &'static str,
         /// The name that failed to resolve.
         name: String,
+        /// The closest known name, when `name` looks like a typo of it.
+        suggestion: Option<&'static str>,
     },
 
     /// A parsing error while loading data (libsvm/CSV). Non-exhaustive:
@@ -96,7 +98,17 @@ impl fmt::Display for HessboostError {
                 f,
                 "feature index {index} out of bounds (num_features = {num_features})"
             ),
-            Self::Unknown { kind, name } => write!(f, "unknown {kind} `{name}`"),
+            Self::Unknown {
+                kind,
+                name,
+                suggestion,
+            } => {
+                write!(f, "unknown {kind} `{name}`")?;
+                if let Some(suggestion) = suggestion {
+                    write!(f, " (did you mean `{suggestion}`?)")?;
+                }
+                Ok(())
+            }
             Self::Parse { line, reason } => write!(f, "parse error at line {line}: {reason}"),
             Self::ModelFormat(msg) => write!(f, "model format error: {msg}"),
             Self::Gpu(msg) => write!(f, "GPU backend error: {msg}"),
@@ -143,6 +155,7 @@ impl HessboostError {
         HessboostError::Unknown {
             kind,
             name: name.into(),
+            suggestion: None,
         }
     }
 

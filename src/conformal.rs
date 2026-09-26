@@ -577,7 +577,7 @@ fn round_up(x: f64) -> f32 {
 mod tests {
     use super::*;
     use crate::config::TrainingParams;
-    use crate::objective::{CustomObjective, GradPair};
+    use crate::objective::{CustomLoss, GradPair};
     use crate::rng::Rng;
     use crate::test_support::labeled_dense;
     use crate::training::{Trainer, train};
@@ -618,21 +618,22 @@ mod tests {
 
     /// Two-output pinball-loss model at quantile levels `taus`.
     fn quantile_model(d: &DMatrix, taus: [f32; 2]) -> BoostedModel {
-        let obj = CustomObjective::new("test:quantile", 2, 0.0, "mae", move |p, y, _w, out| {
+        let obj = CustomLoss::new("test:quantile", 2, move |p, y, _w, out| {
             for (i, &yi) in y.iter().enumerate() {
                 for (j, tau) in taus.iter().enumerate() {
                     let g = if p[2 * i + j] > yi { 1.0 - tau } else { -tau };
                     out[2 * i + j] = GradPair::new(g, 1.0);
                 }
             }
-        });
+        })
+        .with_default_metric(crate::metric::EvalMetric::Mae);
         let params = TrainingParams::builder()
             .max_depth(4)
             .eta(0.3)
             .build()
             .unwrap();
         Trainer::new(&params, d, 150)
-            .objective(&obj)
+            .loss(&obj)
             .train()
             .unwrap()
             .model
@@ -1008,14 +1009,14 @@ mod tests {
 
         // Non-finite predictions: a base margin at f32::MAX plus large positive
         // leaves overflows to +inf.
-        let exploding = CustomObjective::new("test:explode", 1, 0.0, "rmse", |p, _y, _w, out| {
+        let exploding = CustomLoss::new("test:explode", 1, |p, _y, _w, out| {
             for g in out.iter_mut().take(p.len()) {
                 *g = GradPair::new(-1e36, 1.0);
             }
         });
         let params = TrainingParams::builder().max_depth(1).build().unwrap();
         let exploding = Trainer::new(&params, &train_set, 1)
-            .objective(&exploding)
+            .loss(&exploding)
             .train()
             .unwrap()
             .model;

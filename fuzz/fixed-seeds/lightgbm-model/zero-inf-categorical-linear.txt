@@ -1,0 +1,55 @@
+tree
+version=v4
+num_class=1
+num_tree_per_iteration=1
+label_index=0
+max_feature_idx=1
+objective=regression
+feature_names=a b
+feature_infos=none none
+
+Tree=0
+num_leaves=3
+num_cat=0
+split_feature=0 1
+split_gain=2 1
+threshold=0.5 inf
+decision_type=6 8
+left_child=1 -1
+right_child=-2 -3
+leaf_value=1 2 3
+leaf_weight=1 1 1
+leaf_count=2 1 1
+internal_value=0 0
+internal_weight=4 3
+internal_count=4 3
+is_linear=0
+shrinkage=1
+
+
+Tree=1
+num_leaves=2
+num_cat=1
+split_feature=1
+split_gain=1
+threshold=0
+decision_type=9
+left_child=-1
+right_child=-2
+leaf_value=-1 1
+leaf_weight=1 1
+leaf_count=1 1
+internal_value=0
+internal_weight=2
+internal_count=2
+cat_boundaries=0 2
+cat_threshold=10 2
+is_linear=1
+leaf_const=0.5 -0.5
+num_features=1 0
+leaf_features=0  
+leaf_coeff=0.25  
+shrinkage=1
+
+
+end of trees

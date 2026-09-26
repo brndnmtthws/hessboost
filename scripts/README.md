@@ -132,6 +132,35 @@ Fixtures are not checked in; CI regenerates them (`.github/workflows/ci.yml`,
 job `parity`). The generator refuses any XGBoost version other than 3.4.2, pinned in
 `requirements-xgboost.txt` (a source build: 3.4.2 has no PyPI wheel).
 
+## LightGBM import parity
+
+`gen_lightgbm_fixtures.py` trains **real LightGBM 4.7.0**
+(`requirements-lightgbm.txt`; single thread, `deterministic`) and writes each
+case to `../fixtures/lightgbm/<name>.txt` (the `save_model` text model) and
+`<name>.json` (test rows, LightGBM's raw scores, predictions,
+`pred_contrib` SHAP values, `pred_leaf` indices, raw scores of a half-length
+slice, and what the import must do). The test rows include, for up to 40
+numeric splits, the threshold rounded to `f32` and its two `f32`
+neighbours, so the `<=`-on-doubles conversion is checked at its edge. Cases:
+numeric, `NaN` and zero missing values, `zero_as_missing` (a small model
+whose splits all map, and one that must be refused), categorical splits
+with multi-word bitsets, multiclass and one-vs-all, `lambdarank` and
+`rank_xendcg`, `linear_tree` (with categorical routing), every other
+objective, DART and GOSS; refusals: `sigmoid` other than 1, `reg_sqrt`,
+`cross_entropy_lambda`, and random forests (`average_output`).
+
+`tests/lightgbm_parity.rs` imports each model and compares pointwise within
+`1e-5` relative (`max(1, |LightGBM|)`), checks leaf indices, the slice, and
+native binary/JSON and XGBoost JSON round trips; refused cases must fail
+with a `ModelFormat` error naming the reason. `--test-data` instead
+rewrites the small checked-in `tests/data/lightgbm-4.7.0-*` models and
+their `*.expected.json` predictions.
+
+```sh
+uv run --with-requirements scripts/requirements-lightgbm.txt python scripts/gen_lightgbm_fixtures.py
+cargo nextest run --test lightgbm_parity --release --run-ignored only --no-capture
+```
+
 ## Criterion comparisons
 
 `compare_benchmarks.py` runs two compiled Criterion executables in

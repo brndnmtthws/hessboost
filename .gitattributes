@@ -1,0 +1,4 @@
+# LightGBM text models: their `tree_sizes` header records byte counts,
+# which CRLF conversion on checkout would break (LightGBM refuses such files).
+tests/data/lightgbm-*.txt -text
+fuzz/fixed-seeds/lightgbm-model/* -text

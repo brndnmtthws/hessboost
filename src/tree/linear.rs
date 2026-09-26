@@ -106,7 +106,8 @@ impl LinearLeaves {
         self.intercepts[node]
     }
 
-    /// The `(features, slopes)` of leaf `node`, features ascending.
+    /// The `(features, slopes)` of leaf `node`, in evaluation order
+    /// (features ascending in the models hessboost trains).
     #[inline]
     pub fn terms(&self, node: usize) -> (&[u32], &[f64]) {
         let range = self.offsets[node] as usize..self.offsets[node + 1] as usize;

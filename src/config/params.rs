@@ -522,7 +522,13 @@ pub struct TrainingParams {
     /// `linear_tree`, `path_smooth` (all of which the re-estimated leaves
     /// would bypass), gradient-based sampling (whose row probabilities the
     /// noise would distort), and `process_type = update`.
-    pub langevin: bool,
+    ///
+    /// `None` (unset) is off, unless
+    /// [`posterior_sampling`](Self::posterior_sampling) turns it on; an
+    /// explicit `Some(false)` with posterior sampling is refused, as in
+    /// CatBoost (`TCatBoostOptions::Validate`: `Langevin.NotSet() ||
+    /// Langevin.Get()`).
+    pub langevin: Option<bool>,
     /// Inverse diffusion temperature `T > 0` of the Langevin noise
     /// (CatBoost `diffusion_temperature`; larger is quieter). `None` takes
     /// CatBoost's `10000`, or the training row count with
@@ -620,7 +626,7 @@ impl Default for TrainingParams {
             skip_drop: 0.0,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
-            langevin: false,
+            langevin: None,
             diffusion_temperature: None,
             model_shrink_rate: None,
             model_shrink_mode: ModelShrinkMode::Constant,
@@ -1087,7 +1093,7 @@ impl TrainingParams {
     /// Whether Stochastic Gradient Langevin Boosting is on: set directly or
     /// through [`posterior_sampling`](Self::posterior_sampling).
     pub(crate) fn langevin_on(&self) -> bool {
-        self.langevin || self.posterior_sampling
+        self.langevin == Some(true) || self.posterior_sampling
     }
 
     /// The Langevin diffusion temperature in effect for `n_rows` training
@@ -1109,13 +1115,14 @@ impl TrainingParams {
         if self.posterior_sampling {
             return 1.0 / (2.0 * n_rows as f64);
         }
-        self.model_shrink_rate.unwrap_or(if !self.langevin {
-            0.0
-        } else if self.model_shrink_mode == ModelShrinkMode::Constant {
-            0.001
-        } else {
-            0.01
-        })
+        self.model_shrink_rate
+            .unwrap_or(if self.langevin != Some(true) {
+                0.0
+            } else if self.model_shrink_mode == ModelShrinkMode::Constant {
+                0.001
+            } else {
+                0.01
+            })
     }
 
     /// Whether training shrinks the model every iteration (known without
@@ -1129,6 +1136,11 @@ impl TrainingParams {
     /// `TCatBoostOptions::Validate`, plus what the tree path here supports).
     fn validate_sglb(&self) -> Result<()> {
         if self.posterior_sampling {
+            ensure(
+                "langevin",
+                self.langevin != Some(false),
+                "`posterior_sampling` requires Langevin boosting; leave `langevin` unset or true",
+            )?;
             // CatBoost derives these from the row count and refuses explicit
             // values instead of overriding them.
             ensure(
@@ -1151,7 +1163,7 @@ impl TrainingParams {
             positive("diffusion_temperature", temperature)?;
             ensure(
                 "diffusion_temperature",
-                self.langevin,
+                self.langevin == Some(true),
                 "is only used with `langevin`; enable it",
             )?;
         }
@@ -1600,8 +1612,13 @@ impl TrainingParamsBuilder {
         stochastic_rounding, bool);
     setter!(/// Set full-precision leaf renewal after quantized growth (`quant_train_renew_leaf`, LightGBM).
         quant_train_renew_leaf, bool);
-    setter!(/// Enable Stochastic Gradient Langevin Boosting (`langevin`, CatBoost).
-        langevin, bool);
+    /// Set Stochastic Gradient Langevin Boosting on or off (`langevin`,
+    /// CatBoost). Unset, it is off unless `posterior_sampling` turns it on.
+    #[must_use]
+    pub fn langevin(mut self, v: bool) -> Self {
+        self.params.langevin = Some(v);
+        self
+    }
     /// Set the Langevin inverse diffusion temperature (`diffusion_temperature`,
     /// CatBoost). Unset, it is `10000`.
     #[must_use]

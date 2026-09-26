@@ -292,6 +292,23 @@ fn unsupported_combinations_are_refused() {
         ),
         "model_shrink_mode"
     );
+    // An explicit `langevin(false)` conflicts with posterior sampling, in
+    // either setter order (CatBoost: `Langevin.NotSet() || Langevin.Get()`).
+    assert_eq!(
+        refused(base().langevin(false).posterior_sampling(true)),
+        "langevin"
+    );
+    assert_eq!(
+        refused(base().posterior_sampling(true).langevin(false)),
+        "langevin"
+    );
+    assert!(
+        base()
+            .posterior_sampling(true)
+            .langevin(true)
+            .build()
+            .is_ok()
+    );
     assert_eq!(
         refused(base().diffusion_temperature(10.0)),
         "diffusion_temperature"

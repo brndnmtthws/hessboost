@@ -7,6 +7,9 @@
 //! keyed by seed, boosting iteration, query, and document. LightGBM seeds a
 //! mutable `Random` stream for each query with `objective_seed + query_index`;
 //! the formula matches, but the RNG values and trained trees differ.
+//! Unlike LightGBM's direct `1 - rho` denominator, softmax complements are
+//! computed stably; for complements below `f32::EPSILON`, the higher-order
+//! correction is replaced by its finite first-order gradient limit.
 
 use super::{GradPair, Objective, check_label_domain, check_label_width};
 use crate::data::{GroupInfo, MetaInfo};

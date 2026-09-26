@@ -1880,7 +1880,7 @@ mod tests {
         let data = labeled(800, 4, true);
         let params = TrainingParams::builder()
             .grow_policy(GrowPolicy::LossGuide)
-            .max_depth(0)
+            .unlimited_depth()
             .max_leaves(48)
             .build()
             .unwrap();

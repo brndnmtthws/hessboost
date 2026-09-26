@@ -9,7 +9,62 @@ use super::groups::{Dart, ExtraTrees, LinearTree, QuantizedGrad, Refresh};
 use crate::error::{HessboostError, Result};
 use crate::objective::{Loss, LossContext, Objective, ObjectiveParts};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+
+/// The bound on each leaf weight's absolute value. XGBoost
+/// `max_delta_step`.
+///
+/// XGBoost reads an unset `max_delta_step` as the objective's default and
+/// an explicit `0` as "no bound", so the three states stay distinct: for
+/// [`Objective::Poisson`] the default is `0.7` (the same value also
+/// stabilizes the Poisson Hessian), and [`Unbounded`](Self::Unbounded)
+/// turns that off.
+///
+/// ```
+/// use hessboost::config::MaxDeltaStep;
+/// use hessboost::prelude::*;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let bounded = TrainingParams::builder()
+///     .max_delta_step(MaxDeltaStep::Bounded(0.5))
+///     .build()?;
+/// assert_eq!(bounded.max_delta_step, MaxDeltaStep::Bounded(0.5));
+/// // A bound must be positive: no bound is `Unbounded`.
+/// assert!(
+///     TrainingParams::builder()
+///         .max_delta_step(MaxDeltaStep::Bounded(0.0))
+///         .build()
+///         .is_err()
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
+pub enum MaxDeltaStep {
+    /// The objective's default: `0.7` for [`Objective::Poisson`], otherwise
+    /// no bound (also for a custom loss). XGBoost's unset `max_delta_step`.
+    #[default]
+    ObjectiveDefault,
+    /// No bound, even where the objective has a default. XGBoost
+    /// `max_delta_step = 0`.
+    Unbounded,
+    /// Every leaf weight lies in `[-v, v]`; `v` must be positive and finite
+    /// once rounded to `f32`.
+    Bounded(f64),
+}
+
+impl MaxDeltaStep {
+    /// The bound in effect for `objective`, with XGBoost's `0` for none.
+    pub(crate) fn resolve(self, objective: &Objective) -> f64 {
+        match self {
+            MaxDeltaStep::ObjectiveDefault => objective.default_max_delta_step(),
+            MaxDeltaStep::Unbounded => 0.0,
+            MaxDeltaStep::Bounded(v) => v,
+        }
+    }
+}
 
 /// Which booster to use in the ensemble.
 ///
@@ -66,7 +121,7 @@ pub enum GrowPolicy {
     /// the summed gain over the level's nodes. Beyond XGBoost (opt-in). Needs
     /// a tree booster (`gbtree` or `dart`), `tree_method = hist` or `approx`,
     /// numerical features only, `max_depth`
-    /// in `1..=`[`MAX_SYMMETRIC_DEPTH`], and `max_leaves = 0`. A node whose
+    /// in `1..=`[`MAX_SYMMETRIC_DEPTH`], and no `max_leaves`. A node whose
     /// level split would violate `min_child_weight`, `gamma`, or a monotone
     /// constraint stays a leaf. The trees are ordinary [`RegTree`]s, so they
     /// export to XGBoost unchanged; prediction routes rows through them by
@@ -200,8 +255,9 @@ pub struct TrainingParams {
     // ---- General ----
     /// Which booster to train. XGBoost `booster`.
     pub booster: BoosterKind,
-    /// Number of worker threads. `0` uses the global Rayon pool. XGBoost `nthread`.
-    pub nthread: usize,
+    /// Number of worker threads; `None` uses the global Rayon pool.
+    /// XGBoost `nthread` (`0` there is `None` here).
+    pub nthread: Option<NonZeroUsize>,
     /// RNG seed for subsampling and column sampling. XGBoost `seed`.
     pub seed: u64,
 
@@ -231,19 +287,17 @@ pub struct TrainingParams {
     pub eta: f64,
     /// Minimum loss reduction to make a split. XGBoost `gamma` / `min_split_loss`.
     pub gamma: f64,
-    /// Maximum tree depth (`0` = no limit). XGBoost `max_depth`.
-    pub max_depth: usize,
-    /// Maximum number of leaves for `LossGuide` growth (`0` = no limit).
-    /// XGBoost `max_leaves`.
-    pub max_leaves: usize,
+    /// Maximum tree depth; `None` is no limit. XGBoost `max_depth` (`0`
+    /// there is `None` here).
+    pub max_depth: Option<NonZeroUsize>,
+    /// Maximum number of leaves per tree; `None` is no limit. XGBoost
+    /// `max_leaves` (`0` there is `None` here).
+    pub max_leaves: Option<NonZeroUsize>,
     /// Minimum sum of instance hessian needed in a child. XGBoost `min_child_weight`.
     pub min_child_weight: f64,
-    /// Maximum delta step allowed for each leaf weight; `Some(0.0)` means no
-    /// constraint. `None` leaves XGBoost's objective-dependent default: `0.7`
-    /// for [`Objective::Poisson`] (where the same value also stabilizes the
-    /// Poisson Hessian), otherwise unconstrained (also for a custom loss).
-    /// XGBoost `max_delta_step`.
-    pub max_delta_step: Option<f64>,
+    /// The bound on each leaf weight ([`MaxDeltaStep`]). XGBoost
+    /// `max_delta_step`.
+    pub max_delta_step: MaxDeltaStep,
     /// Row subsample ratio per boosting round. XGBoost `subsample`.
     pub subsample: f64,
     /// Column subsample ratio per tree. XGBoost `colsample_bytree`.
@@ -338,7 +392,7 @@ impl Default for TrainingParams {
     fn default() -> Self {
         TrainingParams {
             booster: BoosterKind::GbTree,
-            nthread: 0,
+            nthread: None,
             seed: 0,
             device: Device::Cpu,
             objective: Objective::SquaredError,
@@ -346,10 +400,10 @@ impl Default for TrainingParams {
             eval_metric: Vec::new(),
             eta: 0.3,
             gamma: 0.0,
-            max_depth: 6,
-            max_leaves: 0,
+            max_depth: NonZeroUsize::new(6),
+            max_leaves: None,
             min_child_weight: 1.0,
-            max_delta_step: None,
+            max_delta_step: MaxDeltaStep::ObjectiveDefault,
             subsample: 1.0,
             colsample_bytree: 1.0,
             colsample_bylevel: 1.0,
@@ -444,15 +498,13 @@ impl TrainingParams {
     /// let smoothed = TrainingParamsBuilder::from(base.clone())
     ///     .path_smooth(1.0)
     ///     .build()?;
-    /// assert_eq!(smoothed.max_depth, 3);
+    /// assert_eq!(smoothed.max_depth, std::num::NonZeroUsize::new(3));
     /// assert_eq!(smoothed.path_smooth, 1.0);
     /// # Ok(())
     /// # }
     /// ```
     pub fn builder() -> TrainingParamsBuilder {
-        TrainingParamsBuilder {
-            params: TrainingParams::default(),
-        }
+        TrainingParams::default().into()
     }
 
     /// Validate mutually-consistent ranges. Called automatically before training.
@@ -495,9 +547,13 @@ impl TrainingParams {
         narrows("gamma", self.gamma, false)?;
         non_negative("min_child_weight", self.min_child_weight)?;
         narrows("min_child_weight", self.min_child_weight, false)?;
-        if let Some(max_delta_step) = self.max_delta_step {
-            non_negative("max_delta_step", max_delta_step)?;
-            narrows("max_delta_step", max_delta_step, false)?;
+        if let MaxDeltaStep::Bounded(bound) = self.max_delta_step {
+            ensure(
+                "max_delta_step",
+                bound.is_finite() && bound > 0.0,
+                format!("a bound must be > 0 (no bound is `MaxDeltaStep::Unbounded`), got {bound}"),
+            )?;
+            narrows("max_delta_step", bound, true)?;
         }
         non_negative("lambda", self.lambda)?;
         narrows("lambda", self.lambda, false)?;
@@ -613,9 +669,9 @@ impl TrainingParams {
         ensure(
             "max_leaves",
             !(self.grow_policy == GrowPolicy::LossGuide
-                && self.max_leaves == 0
-                && self.max_depth == 0),
-            "lossguide growth needs a bound: set max_leaves or max_depth > 0",
+                && self.max_leaves.is_none()
+                && self.max_depth.is_none()),
+            "lossguide growth needs a bound: set max_leaves or max_depth",
         )?;
         if self.grow_policy == GrowPolicy::Symmetric {
             ensure(
@@ -625,16 +681,18 @@ impl TrainingParams {
             )?;
             ensure(
                 "max_depth",
-                (1..=MAX_SYMMETRIC_DEPTH).contains(&self.max_depth),
+                self.max_depth
+                    .is_some_and(|depth| depth.get() <= MAX_SYMMETRIC_DEPTH),
                 format!(
-                    "symmetric growth needs 1 <= max_depth <= {MAX_SYMMETRIC_DEPTH}, got {}",
+                    "symmetric growth needs a max_depth in 1..={MAX_SYMMETRIC_DEPTH}, got {}",
                     self.max_depth
+                        .map_or_else(|| "no limit".to_owned(), |d| d.to_string())
                 ),
             )?;
             ensure(
                 "max_leaves",
-                self.max_leaves == 0,
-                "symmetric growth sizes trees by max_depth; max_leaves must be 0",
+                self.max_leaves.is_none(),
+                "symmetric growth sizes trees by max_depth; leave max_leaves unset",
             )?;
         }
         Ok(())
@@ -792,11 +850,11 @@ impl TrainingParams {
         )
     }
 
-    /// The `max_delta_step` in effect: the configured value, or the
-    /// objective's default when unset (XGBoost's 0.7 for `count:poisson`).
+    /// The `max_delta_step` in effect (`0` = no bound): the configured
+    /// bound, or the objective's default (XGBoost's 0.7 for
+    /// `count:poisson`).
     pub(crate) fn effective_max_delta_step(&self) -> f64 {
-        self.max_delta_step
-            .unwrap_or_else(|| self.objective.default_max_delta_step())
+        self.max_delta_step.resolve(&self.objective)
     }
 
     /// The loss this configuration trains with on data with `n_targets`
@@ -856,10 +914,14 @@ impl TrainingParams {
 /// Builder for [`TrainingParams`].
 ///
 /// Every setter returns `self` for chaining. Terminal method is
-/// [`TrainingParamsBuilder::build`], which validates the configuration.
+/// [`TrainingParamsBuilder::build`], which validates the configuration and
+/// reports a setter's refused value (e.g. `max_depth(0)`) by its key.
 #[derive(Debug, Clone)]
 pub struct TrainingParamsBuilder {
     params: TrainingParams,
+    /// Keys whose setter got a value no field can hold, with the reason
+    /// [`build`](Self::build) reports.
+    refused: Vec<(&'static str, &'static str)>,
 }
 
 macro_rules! setter {
@@ -876,8 +938,25 @@ macro_rules! setter {
 impl TrainingParamsBuilder {
     setter!(/// Set the booster kind.
         booster, BoosterKind);
-    setter!(/// Set the number of worker threads (`0` = global pool).
-        nthread, usize);
+    /// Set the number of worker threads. `0` is refused at
+    /// [`build`](Self::build); [`global_pool`](Self::global_pool) uses the
+    /// global Rayon pool (the default).
+    #[must_use]
+    pub fn nthread(mut self, threads: usize) -> Self {
+        self.params.nthread = self.non_zero(
+            "nthread",
+            threads,
+            "must be >= 1 (`global_pool()` uses the global Rayon pool), got 0",
+        );
+        self
+    }
+    /// Train on the global Rayon pool (the default; XGBoost `nthread = 0`).
+    #[must_use]
+    pub fn global_pool(mut self) -> Self {
+        self.forget("nthread");
+        self.params.nthread = None;
+        self
+    }
     setter!(/// Set the RNG seed.
         seed, u64);
     setter!(/// Set the processor training runs on (XGBoost `device`).
@@ -886,19 +965,48 @@ impl TrainingParamsBuilder {
         eta, f64);
     setter!(/// Set the minimum split loss (`gamma`).
         gamma, f64);
-    setter!(/// Set the maximum tree depth.
-        max_depth, usize);
-    setter!(/// Set the maximum number of leaves (lossguide).
-        max_leaves, usize);
-    setter!(/// Set the minimum child hessian weight.
-        min_child_weight, f64);
-    /// Set the maximum delta step (`0` = no constraint). Unset, `count:poisson`
-    /// defaults to `0.7` like XGBoost.
+    /// Set the maximum tree depth. `0` is refused at [`build`](Self::build);
+    /// [`unlimited_depth`](Self::unlimited_depth) removes the limit.
     #[must_use]
-    pub fn max_delta_step(mut self, v: f64) -> Self {
-        self.params.max_delta_step = Some(v);
+    pub fn max_depth(mut self, depth: usize) -> Self {
+        self.params.max_depth = self.non_zero(
+            "max_depth",
+            depth,
+            "must be >= 1 (`unlimited_depth()` removes the limit), got 0",
+        );
         self
     }
+    /// Grow trees without a depth limit (XGBoost `max_depth = 0`).
+    #[must_use]
+    pub fn unlimited_depth(mut self) -> Self {
+        self.forget("max_depth");
+        self.params.max_depth = None;
+        self
+    }
+    /// Set the maximum number of leaves per tree. `0` is refused at
+    /// [`build`](Self::build); [`unlimited_leaves`](Self::unlimited_leaves)
+    /// removes the limit (the default).
+    #[must_use]
+    pub fn max_leaves(mut self, leaves: usize) -> Self {
+        self.params.max_leaves = self.non_zero(
+            "max_leaves",
+            leaves,
+            "must be >= 1 (`unlimited_leaves()` removes the limit), got 0",
+        );
+        self
+    }
+    /// Grow trees without a leaf limit (the default; XGBoost
+    /// `max_leaves = 0`).
+    #[must_use]
+    pub fn unlimited_leaves(mut self) -> Self {
+        self.forget("max_leaves");
+        self.params.max_leaves = None;
+        self
+    }
+    setter!(/// Set the minimum child hessian weight.
+        min_child_weight, f64);
+    setter!(/// Set the bound on each leaf weight (XGBoost `max_delta_step`).
+        max_delta_step, MaxDeltaStep);
     setter!(/// Set the row subsample ratio.
         subsample, f64);
     setter!(/// Set the per-tree column subsample ratio.
@@ -986,15 +1094,40 @@ impl TrainingParamsBuilder {
         Vec<Vec<u32>>
     );
 
-    /// Validate and produce the [`TrainingParams`].
-    pub fn build(self) -> Result<TrainingParams> {
-        self.params.validate()?;
-        Ok(self.params)
+    /// Drop the refusal recorded for `key`, if any.
+    fn forget(&mut self, key: &'static str) {
+        self.refused.retain(|&(refused, _)| refused != key);
     }
 
-    /// Produce the [`TrainingParams`] without validation (useful in tests).
-    pub fn build_unchecked(self) -> TrainingParams {
-        self.params
+    /// `value` as a limit, recording `reason` for `key` when it is `0`
+    /// (a later setting of the same key replaces the refusal).
+    fn non_zero(
+        &mut self,
+        key: &'static str,
+        value: usize,
+        reason: &'static str,
+    ) -> Option<NonZeroUsize> {
+        self.forget(key);
+        let limit = NonZeroUsize::new(value);
+        if limit.is_none() {
+            self.refused.push((key, reason));
+        }
+        limit
+    }
+
+    /// Validate and produce the [`TrainingParams`].
+    ///
+    /// # Errors
+    ///
+    /// A value a setter refused (`max_depth(0)`, ...) or one
+    /// [`TrainingParams::validate`] refuses, as `invalid parameter` naming
+    /// the key.
+    pub fn build(self) -> Result<TrainingParams> {
+        if let Some(&(key, reason)) = self.refused.first() {
+            return Err(HessboostError::invalid_param(key, reason));
+        }
+        self.params.validate()?;
+        Ok(self.params)
     }
 }
 
@@ -1002,7 +1135,10 @@ impl From<TrainingParams> for TrainingParamsBuilder {
     /// A builder starting from `params` (validated again by
     /// [`build`](TrainingParamsBuilder::build)).
     fn from(params: TrainingParams) -> Self {
-        TrainingParamsBuilder { params }
+        TrainingParamsBuilder {
+            params,
+            refused: Vec::new(),
+        }
     }
 }
 
@@ -1022,7 +1158,10 @@ mod tests {
     fn defaults_match_xgboost() {
         let p = TrainingParams::default();
         assert_eq!(p.eta, 0.3);
-        assert_eq!(p.max_depth, 6);
+        assert_eq!(p.max_depth, NonZeroUsize::new(6));
+        assert_eq!(p.max_leaves, None);
+        assert_eq!(p.nthread, None);
+        assert_eq!(p.max_delta_step, MaxDeltaStep::ObjectiveDefault);
         assert_eq!(p.min_child_weight, 1.0);
         assert_eq!(p.lambda, 1.0);
         assert_eq!(p.alpha, 0.0);
@@ -1048,7 +1187,7 @@ mod tests {
             .unwrap();
         assert_eq!(p.objective.name(), "binary:logistic");
         assert_eq!(p.eta, 0.1);
-        assert_eq!(p.max_depth, 4);
+        assert_eq!(p.max_depth, NonZeroUsize::new(4));
         assert_eq!(p.subsample, 0.8);
     }
 
@@ -1060,7 +1199,19 @@ mod tests {
             ("subsample", b().subsample(1.5)),
             ("lambda", b().lambda(-1.0)),
             ("max_bin", b().max_bin(1)),
-            ("max_delta_step", b().max_delta_step(-1.0)),
+            (
+                "max_delta_step",
+                b().max_delta_step(MaxDeltaStep::Bounded(-1.0)),
+            ),
+            // No bound is `Unbounded`, not a zero bound.
+            (
+                "max_delta_step",
+                b().max_delta_step(MaxDeltaStep::Bounded(0.0)),
+            ),
+            (
+                "max_delta_step",
+                b().max_delta_step(MaxDeltaStep::Bounded(f64::NAN)),
+            ),
             ("num_parallel_tree", b().num_parallel_tree(0)),
             // Would overflow the iteration's allocations.
             ("num_parallel_tree", b().num_parallel_tree(1 << 63)),
@@ -1076,13 +1227,18 @@ mod tests {
             ("min_child_weight", b().min_child_weight(1e39)),
             ("lambda", b().lambda(1e39)),
             ("alpha", b().alpha(1e39)),
-            ("max_delta_step", b().max_delta_step(1e39)),
+            (
+                "max_delta_step",
+                b().max_delta_step(MaxDeltaStep::Bounded(1e39)),
+            ),
+            (
+                "max_delta_step",
+                b().max_delta_step(MaxDeltaStep::Bounded(1e-50)),
+            ),
             // Lossguide growth needs a leaf or depth bound.
             (
                 "max_leaves",
-                b().grow_policy(GrowPolicy::LossGuide)
-                    .max_depth(0)
-                    .max_leaves(0),
+                b().grow_policy(GrowPolicy::LossGuide).unlimited_depth(),
             ),
         ] {
             assert_eq!(rejected(builder), Some(name));
@@ -1095,21 +1251,51 @@ mod tests {
         );
     }
 
+    /// A zero limit is refused by `build` under its key, the last setting
+    /// of a key wins, and the `unlimited_*` / `global_pool` setters are the
+    /// way to lift a limit.
+    #[test]
+    fn zero_limits_are_refused_until_replaced() {
+        let b = TrainingParams::builder;
+        for (name, builder) in [
+            ("max_depth", b().max_depth(0)),
+            ("max_leaves", b().max_leaves(0)),
+            ("nthread", b().nthread(0)),
+            // A refusal is reported even if validation would fail too.
+            ("max_depth", b().max_depth(0).eta(0.0)),
+        ] {
+            assert_eq!(rejected(builder), Some(name));
+        }
+        let fixed = b().max_depth(0).max_depth(3).nthread(0).global_pool();
+        let p = fixed.build().unwrap();
+        assert_eq!((p.max_depth, p.nthread), (NonZeroUsize::new(3), None));
+        let lifted = b()
+            .max_depth(0)
+            .unlimited_depth()
+            .max_leaves(0)
+            .max_leaves(8);
+        let p = lifted.build().unwrap();
+        assert_eq!((p.max_depth, p.max_leaves), (None, NonZeroUsize::new(8)));
+        // A later zero replaces a valid setting.
+        assert_eq!(rejected(b().max_depth(4).max_depth(0)), Some("max_depth"));
+    }
+
     /// XGBoost injects `max_delta_step = 0.7` for `count:poisson` only when
-    /// the user did not set it; an explicit `0` disables the constraint.
+    /// the user did not set it; an explicit `0` (`Unbounded`) disables the
+    /// constraint, and a bound replaces the default.
     #[test]
     fn poisson_delta_step_default_respects_explicit_zero() {
-        let unset = TrainingParams::builder()
-            .objective(Objective::Poisson)
-            .build()
-            .unwrap();
-        assert_eq!(unset.effective_max_delta_step(), 0.7);
-        let zero = TrainingParams::builder()
-            .objective(Objective::Poisson)
-            .max_delta_step(0.0)
-            .build()
-            .unwrap();
-        assert_eq!(zero.effective_max_delta_step(), 0.0);
+        let poisson = |step| {
+            TrainingParams::builder()
+                .objective(Objective::Poisson)
+                .max_delta_step(step)
+                .build()
+                .unwrap()
+                .effective_max_delta_step()
+        };
+        assert_eq!(poisson(MaxDeltaStep::ObjectiveDefault), 0.7);
+        assert_eq!(poisson(MaxDeltaStep::Unbounded), 0.0);
+        assert_eq!(poisson(MaxDeltaStep::Bounded(0.3)), 0.3);
         assert_eq!(TrainingParams::default().effective_max_delta_step(), 0.0);
     }
 

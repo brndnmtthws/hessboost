@@ -2252,11 +2252,12 @@ mod tests {
             .unwrap()
             .with_label_matrix(&y, 2)
             .unwrap();
-        // Built unchecked: `train` itself must refuse the layout, whatever the
-        // builder's own bounds.
-        let params = TrainingParams::builder()
-            .num_parallel_tree(1usize << (usize::BITS - 1))
-            .build_unchecked();
+        // Set directly, unvalidated: `train` itself must refuse the layout,
+        // whatever the builder's own bounds.
+        let params = TrainingParams {
+            num_parallel_tree: 1usize << (usize::BITS - 1),
+            ..TrainingParams::default()
+        };
         for rounds in [0, 1] {
             assert!(matches!(
                 train(&params, &d, rounds),

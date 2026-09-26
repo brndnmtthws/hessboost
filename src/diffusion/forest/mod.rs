@@ -962,10 +962,12 @@ impl ForestModel {
         }
         for column in &self.columns {
             let sorted = column.categories.windows(2).all(|w| w[0] < w[1]);
-            let valid = column.min.is_finite()
-                && column.max.is_finite()
+            // Ranges and categories come from `f32` data and decode back
+            // to `f32`: anything else is not a model fit here produced.
+            let valid = f32_exact(column.min)
+                && f32_exact(column.max)
                 && column.min <= column.max
-                && column.categories.iter().all(|v| v.is_finite())
+                && column.categories.iter().all(|&v| f32_exact(v))
                 && sorted
                 && (column.kind == ColumnKind::Categorical) != column.categories.is_empty();
             if !valid {
@@ -982,7 +984,7 @@ impl ForestModel {
         let classes_sorted = self.classes.windows(2).all(|w| w[0] < w[1]);
         if !classes_sorted
             || self.classes.len() != self.class_probs.len()
-            || !self.classes.iter().all(|v| v.is_finite())
+            || !self.classes.iter().all(|&v| f32_exact(v))
             || !self.class_probs.iter().all(|p| p.is_finite() && *p >= 0.0)
         {
             return bad("the classes are invalid".into());
@@ -1339,4 +1341,11 @@ fn check_finite(x: &[f64]) -> Result<()> {
 
 fn diverged() -> HessboostError {
     HessboostError::invalid_param("n_t", "sampling diverged to non-finite values")
+}
+
+/// `v` is a finite `f32` value stored in `f64` (every label, category and
+/// range a fit records is one).
+fn f32_exact(v: f64) -> bool {
+    let narrowed = v as f32;
+    narrowed.is_finite() && f64::from(narrowed) == v
 }

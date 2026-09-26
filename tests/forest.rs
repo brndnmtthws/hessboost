@@ -251,3 +251,25 @@ fn refresh_training_params_are_refused() {
         "training"
     );
 }
+
+#[test]
+fn stored_values_outside_f32_are_refused() {
+    // Labels, categories and ranges decode to `f32`: a document holding a
+    // value no `f32` fit could have produced is not a model.
+    let (x, y) = table(60, 7);
+    let model = ForestModel::fit(&quick(ForestParams::diffusion()), &labelled(&x, &y)).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    for (path, value) in [
+        ("/classes/0", serde_json::json!(-1e100)),
+        ("/classes/0", serde_json::json!(0.1)),
+        ("/columns/2/categories/0", serde_json::json!(1e300)),
+        ("/columns/0/max", serde_json::json!(1e39)),
+    ] {
+        let mut doc = json.clone();
+        *doc.pointer_mut(path).unwrap() = value;
+        assert!(
+            ForestModel::from_json(&doc.to_string()).is_err(),
+            "{path} accepted"
+        );
+    }
+}

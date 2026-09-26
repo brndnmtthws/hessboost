@@ -151,6 +151,47 @@ fn an_interrupted_update_changes_nothing() {
     }
 }
 
+/// Updates refuse what retraining on the updated data refuses, in both
+/// modes and before anything changes: the approximate mode computes
+/// gradients directly, so a label outside `binary:logistic`'s `[0, 1]` would
+/// otherwise slip through.
+#[test]
+fn updates_refuse_labels_retraining_refuses() {
+    let p = params("binary:logistic");
+    let train_data = data(300, 10, true);
+    let bad = DMatrix::from_dense(&[0.5; COLS], 1, COLS)
+        .unwrap()
+        .with_labels(&[2.0])
+        .unwrap();
+    let good = data(5, 11, true);
+    for tolerance in [0.1, 0.0] {
+        let mut online =
+            OnlineModel::train(&p, &train_data, 8, OnlineParams::with_tolerance(tolerance))
+                .unwrap();
+        let before = online.model().to_json().unwrap();
+        // Retraining refuses the added row's label under the same name.
+        let retrain_err = invalid_param(train(&p, &bad, 8));
+        assert_eq!(
+            invalid_param(online.update(Some(&bad), &[0])),
+            retrain_err,
+            "tolerance {tolerance}"
+        );
+        assert_eq!(online.model().to_json().unwrap(), before);
+        assert_eq!(online.data().n_rows(), 300);
+        // A later valid update still works, as on a fresh model.
+        online.update(Some(&good), &[0]).unwrap();
+        assert_eq!(online.data().n_rows(), 304);
+        let mut fresh =
+            OnlineModel::train(&p, &train_data, 8, OnlineParams::with_tolerance(tolerance))
+                .unwrap();
+        fresh.update(Some(&good), &[0]).unwrap();
+        assert_eq!(
+            online.model().to_json().unwrap(),
+            fresh.model().to_json().unwrap()
+        );
+    }
+}
+
 #[test]
 fn unsound_configurations_and_changes_are_refused() {
     let train_data = data(200, 9, false);

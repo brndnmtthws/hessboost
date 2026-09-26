@@ -117,7 +117,7 @@
 
 use std::ops::ControlFlow;
 
-use super::train::{RoundEval, Trainer};
+use super::train::{RoundEval, Trainer, validate_training_data};
 use crate::config::{
     BoosterKind, Device, GrowPolicy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
 };
@@ -282,7 +282,9 @@ impl OnlineModel {
     ///
     /// [`HessboostError::InvalidParameter`] for out-of-range or repeated
     /// deletions, deleting every row, additions without labels or with
-    /// metadata, or of another shape; the errors of training.
+    /// metadata, or of another shape; whatever training refuses on the
+    /// updated data (such as labels outside the objective's domain), checked
+    /// before anything changes; the errors of training.
     pub fn update(
         &mut self,
         additions: Option<&DMatrix>,
@@ -307,6 +309,10 @@ impl OnlineModel {
     ) -> Result<UpdateReport> {
         let deleted = self.check_change(additions, deletions)?;
         let updated = compose(&self.data, &deleted, additions)?;
+        // Refuse what retraining on `updated` refuses (e.g. labels outside
+        // the loss's domain) before any state changes: the approximate mode
+        // computes gradients without going through the trainer's checks.
+        validate_training_data(&self.params, &updated)?;
         let rounds = self.model.num_boost_rounds();
         // The cache is updated in place (copying it would cost more than
         // the update); on failure it is rebuilt from the unchanged model and
@@ -535,7 +541,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
             "numerical features for tolerance > 0 (the exact mode accepts categorical ones)",
         );
     }
-    Ok(())
+    validate_training_data(params, data)
 }
 
 /// Labels and none of the metadata updates cannot honor.

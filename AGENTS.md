@@ -88,7 +88,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
@@ -115,6 +115,9 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   `dist:*` split direction, quantized stochastic rounding, per-block
   row-sampling seeds) use SplitMix64 streams keyed by seed and index.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
+  `Trainer::on_round` only observes: a hook that always continues leaves
+  the model byte-identical, and a `Break` after round `k` gives the
+  `k + 1`-round model (`tests/round_hook.rs`).
 - **Metal:** `device = metal` reproduces the single-threaded CPU model bit
   for bit: gradients are staged as integer multiples of a per-component
   grain and summed in 64-bit integers (order-free, no atomics), and a node
@@ -209,6 +212,8 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   refuses. Every eval set is checked before training (`validate_info`;
   `prediction_width` equal to the model's outputs, or for `None` a whole
   number per label column); `Metric::eval` returns NaN on length mismatch.
+  `Metric::name` is XGBoost's `evals_result` key, suffix included
+  (`ndcg@5`, `pre@3`, `tweedie-nloglik@1.5`), so parity compares names.
 - **Refusals:** unsupported parameters or combinations error, never get
   ignored. Checks live in `TrainingParams::validate` (static),
   `validate_request` in `training/train.rs` (data-dependent),

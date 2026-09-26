@@ -63,7 +63,9 @@
 //! - **Boosters:** `gbtree`, `dart`, `gblinear`, boosted random forests
 //!   (`num_parallel_tree`).
 //! - **Lifecycle:** continued training and `process_type=update` refresh
-//!   ([`Trainer::init_model`](training::Trainer::init_model)), slicing
+//!   ([`Trainer::init_model`](training::Trainer::init_model)), a per-round
+//!   hook for progress, custom stopping, and cancellation
+//!   ([`Trainer::on_round`](training::Trainer::on_round)), slicing
 //!   ([`BoostedModel::slice`](model::BoostedModel::slice)), `iteration_range`
 //!   prediction as Rust ranges
 //!   ([`predict_margin_range`](model::BoostedModel::predict_margin_range) and
@@ -94,9 +96,12 @@
 //!   [`predict_interactions`](model::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON, XGBoost JSON and
 //!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)).
-//! - **Validation:** cross-validation ([`cv`](training::cv)), custom or
-//!   forward-chaining (time-ordered, purged) [`Fold`](training::Fold)s with
-//!   fold-mean early stopping ([`CrossValidation`](training::CrossValidation)).
+//! - **Validation:** cross-validation ([`cv`](training::cv)), custom,
+//!   forward-chaining (time-ordered, purged by a row gap), or purged forward
+//!   (timestamped rows, purged by each label window,
+//!   [`Fold::purged_forward`](training::Fold::purged_forward))
+//!   [`Fold`](training::Fold)s with fold-mean early stopping
+//!   ([`CrossValidation`](training::CrossValidation)).
 //! - **Beyond XGBoost (opt-in, default training unchanged):**
 //!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);

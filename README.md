@@ -119,8 +119,10 @@ From XGBoost:
   binary/multiclass classification, counts, LambdaMART ranking, Cox/AFT
   survival — and nearly all its metrics, plus custom objectives and metrics.
 - Multi-output models: multi-target label matrices and vector-leaf trees.
-- Cross-validation (shuffled, custom, time-ordered), continued training, tree
-  refresh, model slicing, iteration ranges.
+- Cross-validation (shuffled, custom, time-ordered, or purged by each row's
+  label window), continued training, tree refresh, a per-round hook
+  (progress, custom stopping, cancellation), model slicing, iteration
+  ranges.
 - Margins, classes, leaf indices, SHAP values and interactions, feature
   importance.
 - Dense and sparse input, libsvm/CSV loaders, native binary and JSON models.

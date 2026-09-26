@@ -24,6 +24,7 @@ use crate::error::Result;
 use crate::model::for_each_present_value;
 use crate::objective::{GradPair, Objective};
 use crate::{model::LinearModel, training::reject_split_gradient};
+use std::ops::ControlFlow;
 
 /// One feature's present entries, stored column-major as parallel `(row, value)`
 /// vectors so a coordinate update touches only the rows where the feature is
@@ -53,22 +54,25 @@ fn coordinate_delta(sum_grad: f64, sum_hess: f64, w: f64, alpha: f64, lambda: f6
 
 /// Fit a linear booster by coordinate descent.
 ///
-/// `initial_margin` contains the per-row starting margins, and `n_out` is the
-/// number of outputs (`num_class` for multiclass, the label columns for
-/// multi-target labels, else 1). The returned [`LinearModel`] holds `weights`
-/// laid out `[feature][output]` and a per-output `bias`. Continued training
-/// passes the model's current linear booster as `start`, which fitting
-/// resumes from instead of zeros. Fails when the objective supplies reduced
-/// split gradients, which only vector-leaf trees use.
+/// `initial_margin` contains the per-row starting margins; the model has
+/// one output per objective output (`num_class` for multiclass, the label
+/// columns for multi-target labels, else 1). The returned [`LinearModel`]
+/// holds `weights` laid out `[feature][output]` and a per-output `bias`.
+/// Continued training passes the model's current linear booster as `start`,
+/// which fitting resumes from instead of zeros. `after_round(round)` runs
+/// after each round; `Break` ends fitting with the rounds so far. Fails when
+/// the objective supplies reduced split gradients, which only vector-leaf
+/// trees use.
 pub(crate) fn train_gblinear(
     params: &TrainingParams,
     dtrain: &DMatrix,
     num_round: usize,
     initial_margin: Vec<f32>,
-    n_out: usize,
     objective: &dyn Objective,
     start: Option<&LinearModel>,
+    after_round: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<LinearModel> {
+    let n_out = objective.n_outputs();
     let n = dtrain.n_rows();
     let n_features = dtrain.n_cols();
     // Label presence was validated by the training entry point (only
@@ -154,6 +158,9 @@ pub(crate) fn train_gblinear(
                     margin[row as usize * n_out + k] += x * dw32;
                 }
             }
+        }
+        if after_round(round).is_break() {
+            break;
         }
     }
 

@@ -353,10 +353,38 @@ simple_metric!(
     GammaNLogLik, "gamma-nloglik", crate::simd::positive_nloglik_sum::<true>
 );
 
-simple_metric!(
-    /// Tweedie negative log-likelihood (`tweedie-nloglik`) with variance power `rho`.
-    TweedieNLogLik, "tweedie-nloglik", rho: f64, crate::simd::tweedie_nloglik_sum
-);
+/// Tweedie negative log-likelihood (`tweedie-nloglik`) with variance power
+/// `rho`, named `tweedie-nloglik@rho` as XGBoost reports it (`rho` to six
+/// significant digits: `tweedie-nloglik@1.5`, `tweedie-nloglik@1`).
+#[derive(Debug, Clone)]
+pub struct TweedieNLogLik {
+    rho: f64,
+    name: String,
+}
+
+impl TweedieNLogLik {
+    fn new(rho: f64) -> Self {
+        // C++'s default stream precision: six significant digits, then the
+        // shortest form (`1.0` -> `1`), which Rust's `Display` gives.
+        let rounded: f64 = format!("{rho:.5e}").parse().unwrap_or(rho);
+        TweedieNLogLik {
+            rho,
+            name: format!("tweedie-nloglik@{rounded}"),
+        }
+    }
+}
+
+impl Metric for TweedieNLogLik {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
+        weighted_mean(crate::simd::tweedie_nloglik_sum(
+            preds, labels, weights, self.rho,
+        ))
+    }
+}
 
 /// The non-empty `(start, end)` row ranges of `group` when it partitions the
 /// `n` rows (`GroupInfo::partitions`), otherwise the whole batch as one
@@ -471,17 +499,29 @@ pub(super) fn fold_groups<T: Send, A>(
 ///
 /// Gains are `2^rel - 1` with the standard `1 / log2(rank + 2)` discount.
 /// Supports XGBoost's `@k` truncation (e.g. `ndcg@5`). Higher is better.
-/// A group whose ideal DCG is zero contributes `0`.
-#[derive(Debug, Clone, Copy, Default)]
+/// A group whose ideal DCG is zero contributes `0`. Named `ndcg@k` with a
+/// cutoff, else `ndcg`, as XGBoost reports it.
+#[derive(Debug, Clone)]
 pub struct Ndcg {
     /// Optional rank cutoff `k`. `None` uses the full list.
     k: Option<usize>,
+    name: String,
+}
+
+impl Default for Ndcg {
+    /// `ndcg` over the full list.
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl Ndcg {
     /// Create an NDCG metric with an optional `@k` truncation.
     pub fn new(k: Option<usize>) -> Self {
-        Ndcg { k }
+        Ndcg {
+            k,
+            name: cutoff_name("ndcg", k),
+        }
     }
 
     /// NDCG of a single group given its predictions and labels.
@@ -504,8 +544,8 @@ impl Ndcg {
 }
 
 impl Metric for Ndcg {
-    fn name(&self) -> &'static str {
-        "ndcg"
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn maximize(&self) -> bool {
@@ -561,17 +601,29 @@ fn ideal_dcg(labels: &[f32], cut: usize) -> f64 {
 ///
 /// Relevance is binarized as `label > 0`. Supports `@k` truncation (e.g.
 /// `map@10`), which restricts the precision sum to the top-`k` ranks. Higher is
-/// better. A group with no relevant documents contributes `0`.
-#[derive(Debug, Clone, Copy, Default)]
+/// better. A group with no relevant documents contributes `0`. Named `map@k`
+/// with a cutoff, else `map`, as XGBoost reports it.
+#[derive(Debug, Clone)]
 pub struct MeanAveragePrecision {
     /// Optional rank cutoff `k`. `None` uses the full list.
     k: Option<usize>,
+    name: String,
+}
+
+impl Default for MeanAveragePrecision {
+    /// `map` over the full list.
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 impl MeanAveragePrecision {
     /// Create a MAP metric with an optional `@k` truncation.
     pub fn new(k: Option<usize>) -> Self {
-        MeanAveragePrecision { k }
+        MeanAveragePrecision {
+            k,
+            name: cutoff_name("map", k),
+        }
     }
 
     /// Average precision of a single group.
@@ -599,8 +651,8 @@ impl MeanAveragePrecision {
 }
 
 impl Metric for MeanAveragePrecision {
-    fn name(&self) -> &'static str {
-        "map"
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn maximize(&self) -> bool {
@@ -822,9 +874,7 @@ pub(crate) fn build(
         })),
         "poisson-nloglik" => Ok(Box::new(PoissonNLogLik)),
         "gamma-nloglik" => Ok(Box::new(GammaNLogLik)),
-        "tweedie-nloglik" => Ok(Box::new(TweedieNLogLik {
-            rho: tweedie_power(name, suffix)?,
-        })),
+        "tweedie-nloglik" => Ok(Box::new(TweedieNLogLik::new(tweedie_power(name, suffix)?))),
         "ndcg" => Ok(Box::new(Ndcg::new(cutoff()?))),
         "map" => Ok(Box::new(MeanAveragePrecision::new(cutoff()?))),
         "rmsle" => Ok(Box::new(Rmsle)),
@@ -839,7 +889,7 @@ pub(crate) fn build(
             }
             Ok(Box::new(PseudoHuberError::new(slope)))
         }
-        "pre" => Ok(Box::new(Precision::new(name, cutoff()?))),
+        "pre" => Ok(Box::new(Precision::new(cutoff()?))),
         "quantile" => Ok(Box::new(QuantileError::new(&objective.quantile_alpha)?)),
         "expectile" => Ok(Box::new(ExpectileError::new(&objective.expectile_alpha)?)),
         "cox-nloglik" => Ok(Box::new(CoxNLogLik)),
@@ -870,6 +920,11 @@ pub(crate) fn build(
         return Err(invalid(&format!("`{base}` takes no `@` suffix")));
     }
     Ok(metric)
+}
+
+/// XGBoost's name of a ranking metric: `base@k` with a cutoff, else `base`.
+pub(crate) fn cutoff_name(base: &str, k: Option<usize>) -> String {
+    k.map_or_else(|| base.to_string(), |k| format!("{base}@{k}"))
 }
 
 /// The parameter error of metric `name`.
@@ -1007,7 +1062,7 @@ mod tests {
                 Ndcg::new(None).eval_grouped(p, &relevance, w, g),
                 Ndcg::new(Some(5)).eval_grouped(p, &relevance, w, g),
                 MeanAveragePrecision::new(Some(10)).eval_grouped(p, &relevance, w, g),
-                Precision::new("pre@3", Some(3)).eval_grouped(p, &labels[..n], w, g),
+                Precision::new(Some(3)).eval_grouped(p, &labels[..n], w, g),
                 Ndcg::new(Some(20)).eval(p, &relevance, None),
                 CoxNLogLik.eval(&hazards, &times, None),
                 AftNLogLik::new(AftDistribution::Logistic, 1.2).eval_info(&margins, &bounds),
@@ -1379,18 +1434,30 @@ mod tests {
         );
     }
 
+    /// Metrics report the names XGBoost 3.4.2 gives them in
+    /// `evals_result`: the parsed `@k` cutoff or `@rho` power kept (so
+    /// `ndcg@5` and `ndcg@10` stay apart), the power to six significant
+    /// digits.
     #[test]
-    fn factory_parses_ranking_metrics_with_k() {
-        // An `@k` suffix parses and is dropped from the name.
-        for (name, base) in [
+    fn metric_names_keep_their_suffix_as_xgboost_reports_it() {
+        for (name, reported) in [
             ("ndcg", "ndcg"),
+            ("ndcg@5", "ndcg@5"),
+            ("ndcg@05", "ndcg@5"),
             ("map", "map"),
-            ("ndcg@5", "ndcg"),
-            ("map@10", "map"),
+            ("map@10", "map@10"),
+            ("pre", "pre"),
+            ("pre@2", "pre@2"),
+            ("tweedie-nloglik", "tweedie-nloglik@1.5"),
+            ("tweedie-nloglik@1.30", "tweedie-nloglik@1.3"),
+            ("tweedie-nloglik@1.0", "tweedie-nloglik@1"),
+            ("tweedie-nloglik@1.23456789", "tweedie-nloglik@1.23457"),
         ] {
             let metric = build(name, 0, &ObjectiveParams::default()).unwrap();
-            assert_eq!(metric.name(), base, "{name}");
+            assert_eq!(metric.name(), reported, "{name}");
         }
+        assert_eq!(Ndcg::default().name(), "ndcg");
+        assert_eq!(MeanAveragePrecision::new(Some(3)).name(), "map@3");
     }
 
     #[test]

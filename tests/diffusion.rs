@@ -2,7 +2,9 @@
 //! learned distribution's shape, sampling determinism, persistence, and
 //! refusals.
 
-use hessboost::diffusion::{DiffusionModel, DiffusionParams, Method, ScoreConfig, Sde};
+use hessboost::diffusion::{
+    DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, ScoreConfig, Sde,
+};
 use hessboost::prelude::*;
 
 mod common;
@@ -218,6 +220,32 @@ fn unsupported_inputs_are_refused() {
     assert_eq!(invalid_param(DiffusionModel::fit(&params, &data)), "sde");
 
     let weighted = bimodal(300, 6).with_weights(&[1.0; 300]).unwrap();
+
+    // Finite bounds whose kernel overflows (σ_max² > f64::MAX) are refused,
+    // not a panic in the time sampling; so is a schedule whose noise scale
+    // vanishes, and likewise for a flow path.
+    for (sigma_min, sigma_max) in [(1e200, 2e200), (1e-320, 1e-310)] {
+        let mut params = quick(DiffusionParams::default());
+        params.residualizer = None;
+        params.early_stopping = None;
+        let mut overflowing = ScoreConfig::default();
+        overflowing.sde = Sde::VarianceExploding {
+            sigma_min,
+            sigma_max,
+        };
+        params.method = Method::Score(overflowing);
+        assert_eq!(invalid_param(DiffusionModel::fit(&params, &data)), "sde");
+    }
+    let mut params = quick(DiffusionParams::flow_matching());
+    params.residualizer = None;
+    params.early_stopping = None;
+    let mut vanishing = FlowMatchingConfig::default();
+    vanishing.path = FlowPath::VariancePreserving {
+        beta_min: 1e-321,
+        beta_max: 2e-321,
+    };
+    params.method = Method::FlowMatching(vanishing);
+    assert_eq!(invalid_param(DiffusionModel::fit(&params, &data)), "path");
     assert_eq!(
         invalid_param(DiffusionModel::fit(
             &quick(DiffusionParams::default()),

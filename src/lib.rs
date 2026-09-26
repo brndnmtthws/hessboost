@@ -51,8 +51,8 @@
 //!   [`training::budget`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
 //!   native and XGBoost JSON/UBJSON); [`model::compact`].
-//! - [`objective`]: the `Objective` trait, the built-in objectives,
-//!   `CustomObjective`, [`objective::distributional`] (`dist:*` objectives).
+//! - [`objective`]: the `Loss` trait, the built-in objectives,
+//!   `CustomLoss`, [`objective::distributional`] (`dist:*` objectives).
 //! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
@@ -77,8 +77,9 @@
 //! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
 //!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
-//!   `survival:aft` on censored bounds), plus a custom hook
-//!   ([`Trainer::objective`](training::Trainer::objective)).
+//!   `survival:aft` on censored bounds), plus custom losses
+//!   ([`CustomLoss`](objective::CustomLoss) through
+//!   [`Trainer::loss`](training::Trainer::loss)).
 //! - **Multi-output:** label matrices
 //!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
 //!   tree per output or vector-leaf trees

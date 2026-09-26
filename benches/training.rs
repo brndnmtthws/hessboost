@@ -16,7 +16,7 @@ use hessboost::metric::{
     ErrorRate, GammaNLogLik, LogLoss, Mae, Metric, PoissonNLogLik, Rmse, create_metric,
 };
 use hessboost::objective::{
-    Gamma, GradPair, Logistic, Objective, Poisson, Softmax, Tweedie, create_objective,
+    Gamma, GradPair, Logistic, Loss, Poisson, Softmax, Tweedie, create_objective,
 };
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, train_with_budget};
@@ -294,7 +294,7 @@ fn bench_objective_gradients(c: &mut Criterion) {
     let mut group = c.benchmark_group("objective_gradient");
     group.throughput(Throughput::Elements(N as u64));
 
-    let mut run = |name: &str, objective: &dyn Objective, y: &[f32], weights: Option<&[f32]>| {
+    let mut run = |name: &str, objective: &dyn Loss, y: &[f32], weights: Option<&[f32]>| {
         group.bench_function(name, |b| {
             b.iter(|| {
                 objective.gradient(&preds, y, weights, &mut out);
@@ -499,23 +499,19 @@ fn bench_multiclass_metrics(c: &mut Criterion) {
     group.finish();
 }
 
-fn scalar_logistic_objective(base_margin: f32) -> hessboost::objective::CustomObjective {
-    hessboost::objective::CustomObjective::new(
-        "scalar:logistic",
-        1,
-        base_margin,
-        "logloss",
-        |preds, labels, weights, out| {
-            for i in 0..preds.len() {
-                let probability = scalar_sigmoid(preds[i]);
-                let weight = weights.map_or(1.0, |values| values[i]);
-                out[i] = GradPair::new(
-                    (probability - labels[i]) * weight,
-                    (probability * (1.0 - probability)).max(1e-16) * weight,
-                );
-            }
-        },
-    )
+fn scalar_logistic_objective(base_margin: f32) -> hessboost::objective::CustomLoss {
+    hessboost::objective::CustomLoss::new("scalar:logistic", 1, |preds, labels, weights, out| {
+        for i in 0..preds.len() {
+            let probability = scalar_sigmoid(preds[i]);
+            let weight = weights.map_or(1.0, |values| values[i]);
+            out[i] = GradPair::new(
+                (probability - labels[i]) * weight,
+                (probability * (1.0 - probability)).max(1e-16) * weight,
+            );
+        }
+    })
+    .with_base_margin(base_margin)
+    .with_default_metric("logloss")
 }
 
 fn bench_binary_train(c: &mut Criterion) {
@@ -540,7 +536,7 @@ fn bench_binary_train(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 Trainer::new(&params, &data, 50)
-                    .objective(&scalar_logistic_objective(base_margin))
+                    .loss(&scalar_logistic_objective(base_margin))
                     .train()
                     .unwrap()
                     .model,
@@ -650,7 +646,7 @@ fn bench_other_gradients(c: &mut Criterion) {
         |len: usize| -> Vec<f32> { (0..len).map(|i| (i % 1_001) as f32 * 0.004 - 2.0).collect() };
     let regression_labels =
         |n: usize| -> Vec<f32> { (0..n).map(|i| (i % 997) as f32 * 0.004 - 2.0).collect() };
-    let mut run = |name: &str, objective: &dyn Objective, data: &DMatrix, width: usize| {
+    let mut run = |name: &str, objective: &dyn Loss, data: &DMatrix, width: usize| {
         let n = data.n_rows();
         let preds = margins(n * width);
         let mut out = vec![GradPair::default(); n * width];

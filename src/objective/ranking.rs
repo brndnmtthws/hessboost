@@ -8,7 +8,7 @@
 //! change. Pair values, accumulation, per-query normalization, and query
 //! weighting use XGBoost's float/double conversion points.
 
-use super::{GradPair, MIN_HESS_F64, Objective, check_label_domain};
+use super::{GradPair, Loss, MIN_HESS_F64, check_label_domain};
 use crate::data::{GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::{argsort_desc, group_ranges};
@@ -146,7 +146,7 @@ fn normalize_group(out: &mut [GradPair], sum_lambda: f64, query_weight: f32, wei
 /// parallel (each query writes only its own rows).
 const PARALLEL_RANK_ROWS: usize = 4096;
 
-impl Objective for LambdaMart {
+impl Loss for LambdaMart {
     fn name(&self) -> &str {
         match self.mode {
             RankMode::Pairwise => "rank:pairwise",

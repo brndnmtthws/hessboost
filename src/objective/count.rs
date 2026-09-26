@@ -1,7 +1,10 @@
 //! Count and positive-continuous regression objectives with a log link:
 //! Poisson, Gamma, and Tweedie. All predict `exp(margin)`.
 
-use super::{GradPair, Objective, check_label_domain, log_link, weighted_label_mean};
+use super::{
+    GradPair, Loss, OutputDomain, check_base_score_domain, check_label_domain, log_link,
+    weighted_label_mean,
+};
 use crate::data::MetaInfo;
 use crate::error::Result;
 
@@ -17,8 +20,9 @@ fn poisson_deviance(margin: f32, label: f32) -> f64 {
     }
 }
 
-/// Emit the `pred_transform`/`probs_to_margins`/`base_margins_info` trio
-/// shared by the log-link objectives (all predict `exp(margin)`). The link is
+/// Emit the `pred_transform`/`probs_to_margins`/`validate_base_score`/
+/// `base_margins_info` hooks shared by the log-link objectives (all predict
+/// `exp(margin)`). The link is
 /// XGBoost's `ProbToMargin`, `ln(v)` in `f32`; the intercept is XGBoost's
 /// `FitInterceptGlmLike`, the (weighted) label mean through that link.
 macro_rules! log_link_objective {
@@ -29,6 +33,10 @@ macro_rules! log_link_objective {
 
         fn probs_to_margins(&self, scores: &mut [f32]) {
             log_link(scores);
+        }
+
+        fn validate_base_score(&self, base_score: f64) -> Result<()> {
+            check_base_score_domain(base_score, OutputDomain::Positive)
         }
 
         fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
@@ -62,7 +70,7 @@ impl Default for Poisson {
     }
 }
 
-impl Objective for Poisson {
+impl Loss for Poisson {
     fn name(&self) -> &'static str {
         "count:poisson"
     }
@@ -109,7 +117,7 @@ impl Objective for Poisson {
 #[non_exhaustive]
 pub struct Gamma;
 
-impl Objective for Gamma {
+impl Loss for Gamma {
     fn name(&self) -> &'static str {
         "reg:gamma"
     }
@@ -173,7 +181,7 @@ impl Default for Tweedie {
     }
 }
 
-impl Objective for Tweedie {
+impl Loss for Tweedie {
     fn name(&self) -> &'static str {
         "reg:tweedie"
     }

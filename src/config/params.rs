@@ -178,7 +178,7 @@ pub enum MultiStrategy {
     /// (`process_type = update`) and the compact format
     /// ([`model::compact`](crate::model::compact)) refuse vector-leaf
     /// models. Reduced split gradients
-    /// ([`Objective::split_gradient`](crate::objective::Objective::split_gradient))
+    /// ([`Loss::split_gradient`](crate::objective::Loss::split_gradient))
     /// cannot be combined with monotone constraints.
     MultiOutputTree,
 }

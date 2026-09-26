@@ -94,7 +94,7 @@
 //!   `iteration mod n_params`; either visits every parameter infinitely
 //!   often, the paper's convergence condition. The tree structure is grown
 //!   from that parameter's gradient pairs alone
-//!   ([`Objective::split_gradient`], the projected pseudo-residuals
+//!   ([`Loss::split_gradient`], the projected pseudo-residuals
 //!   `⟨∇L_i, e_m⟩`), and every leaf then takes the per-parameter Newton step
 //!   `-G_k / (H_k + λ)` over its rows. That is the second-order form of the
 //!   paper's leaf-wise multidimensional line search `argmin_γ Σ L(g + h γ)`:
@@ -123,7 +123,7 @@ mod special;
 
 use serde::{Deserialize, Serialize};
 
-use super::{GradPair, MIN_HESS, Objective, SplitGradient, check_label_domain};
+use super::{GradPair, Loss, MIN_HESS, SplitGradient, check_label_domain};
 use crate::config::{DistGradient, DistSplitDirection};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -1182,7 +1182,7 @@ fn bisect_quantile(x: f64, residual: impl Fn(f64) -> f64) -> f64 {
 /// with the second-order statistic chosen by [`DistGradient`] (see the
 /// [module docs](self)).
 #[derive(Debug, Clone, Copy)]
-pub struct DistObjective {
+pub struct DistLoss {
     family: DistFamily,
     gradient: DistGradient,
     /// Parallel-gradient-boosting direction and seed for shared trees, set
@@ -1190,11 +1190,11 @@ pub struct DistObjective {
     shared: Option<(DistSplitDirection, u64)>,
 }
 
-impl DistObjective {
+impl DistLoss {
     /// The objective for `family` with gradient mode `gradient`, growing one
     /// tree per parameter (no reduced split gradients).
     pub fn new(family: DistFamily, gradient: DistGradient) -> Self {
-        DistObjective {
+        DistLoss {
             family,
             gradient,
             shared: None,
@@ -1202,7 +1202,7 @@ impl DistObjective {
     }
 
     /// Grow shared vector-leaf trees (`multi_strategy = multi_output_tree`)
-    /// with the given split direction: [`Objective::split_gradient`] then
+    /// with the given split direction: [`Loss::split_gradient`] then
     /// returns the gradients of the parameter the direction selects for the
     /// round (`seed` drives [`DistSplitDirection::Random`]), or `None` for
     /// [`DistSplitDirection::All`] and one-parameter families.
@@ -1249,7 +1249,7 @@ impl DistObjective {
     }
 }
 
-impl Objective for DistObjective {
+impl Loss for DistLoss {
     fn name(&self) -> &str {
         self.family.objective_name()
     }
@@ -1321,6 +1321,22 @@ impl Objective for DistObjective {
                 }
             }
         }
+    }
+
+    /// A scalar cannot set several distribution parameters; a one-parameter
+    /// family (`dist:poisson`) takes a value in its support.
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        if self.family.n_params() > 1 {
+            return Err(HessboostError::invalid_param(
+                "base_score",
+                "a scalar cannot set the several parameters of a `dist:*` objective; \
+                 supply per-row `base_margin` instead",
+            ));
+        }
+        if self.family.log_link(0) {
+            super::check_base_score_domain(base_score, super::OutputDomain::Positive)?;
+        }
+        Ok(())
     }
 
     /// Maximum-likelihood fit of the marginal label distribution.

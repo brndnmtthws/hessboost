@@ -1,7 +1,7 @@
 //! Evaluation metrics used for reporting and early stopping.
 //!
 //! Metrics receive predictions that have already passed through the objective's
-//! [`crate::objective::Objective::eval_transform`] (so classification metrics
+//! [`crate::objective::Loss::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
 /// Short-circuit a [`Metric::eval`] to NaN when its inputs are not

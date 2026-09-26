@@ -3,7 +3,7 @@
 //! against the same scalar label.
 
 use super::absolute::residual_scales;
-use super::{GradPair, Objective, fit_stump, weighted_label_mean};
+use super::{GradPair, Loss, fit_stump, weighted_label_mean};
 use crate::K_RT_EPS_F32;
 use crate::error::{HessboostError, Result};
 
@@ -148,7 +148,7 @@ fn weighted_quantile(alpha: f32, labels: &[f32], weights: &[f32], order: &[usize
     labels[order[idx]]
 }
 
-impl Objective for Quantile {
+impl Loss for Quantile {
     fn name(&self) -> &'static str {
         "reg:quantileerror"
     }
@@ -296,7 +296,7 @@ fn expectile_scale(diff: f32, alpha: f32) -> f32 {
     if diff >= 0.0 { 1.0 - alpha } else { alpha }
 }
 
-impl Objective for Expectile {
+impl Loss for Expectile {
     fn name(&self) -> &'static str {
         "reg:expectileerror"
     }
@@ -680,13 +680,13 @@ mod tests {
             .with_label_matrix(&[0.0, 1.0, 1.0, 2.0], 2)
             .unwrap();
         let params = TrainingParams::builder().build().unwrap();
-        let objectives: [Box<dyn Objective>; 2] = [
+        let objectives: [Box<dyn Loss>; 2] = [
             Box::new(Quantile::new(&[0.1, 0.9]).unwrap()),
             Box::new(Expectile::new(&[0.1, 0.9]).unwrap()),
         ];
         for obj in &objectives {
             assert!(matches!(
-                Trainer::new(&params, &d, 1).objective(obj.as_ref()).train(),
+                Trainer::new(&params, &d, 1).loss(obj.as_ref()).train(),
                 Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
             ));
         }
@@ -708,7 +708,7 @@ mod tests {
                 .build()
                 .unwrap();
             assert!(matches!(
-                Trainer::new(&params, &d, 1).objective(&obj).train(),
+                Trainer::new(&params, &d, 1).loss(&obj).train(),
                 Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
             ));
         }
@@ -717,7 +717,7 @@ mod tests {
             .build()
             .unwrap();
         let model = Trainer::new(&params, &d, 1)
-            .objective(&obj)
+            .loss(&obj)
             .train()
             .unwrap()
             .model;

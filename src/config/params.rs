@@ -408,6 +408,16 @@ pub struct TrainingParams {
     /// `refresh_leaf`.
     pub refresh_leaf: bool,
 
+    /// Positive-label Bernoulli bagging fraction for binary classification
+    /// (LightGBM `pos_bagging_fraction`; `1` disables the positive override).
+    /// When either fraction is below `1`, both fractions define stratified row
+    /// sampling and `subsample` is ignored. Uses seeded sequential Bernoulli
+    /// draws; each class is sampled independently.
+    pub pos_bagging_fraction: f64,
+    /// Negative-label Bernoulli bagging fraction for binary classification
+    /// (LightGBM `neg_bagging_fraction`; `1` disables the negative override).
+    /// Balanced bagging is off when both class fractions are `1`.
+    pub neg_bagging_fraction: f64,
     // ---- LightGBM tree options (opt-in, beyond XGBoost) ----
     /// Extremely randomized split search (LightGBM `extra_trees`): every
     /// numerical feature is scored at one random bin boundary per node, drawn
@@ -530,6 +540,8 @@ impl Default for TrainingParams {
             max_bin: 256,
             monotone_constraints: Vec::new(),
             interaction_constraints: Vec::new(),
+            pos_bagging_fraction: 1.0,
+            neg_bagging_fraction: 1.0,
             num_parallel_tree: 1,
             sampling_method: SamplingMethod::Uniform,
             multi_strategy: MultiStrategy::OneOutputPerTree,
@@ -657,6 +669,7 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
+        self.validate_balanced_bagging()?;
         self.validate_tree_options()
     }
 
@@ -681,16 +694,44 @@ impl TrainingParams {
         narrows("lambda", self.lambda, false)?;
         non_negative("alpha", self.alpha)?;
         narrows("alpha", self.alpha, false)?;
+        unit("subsample", self.subsample)?;
+        ensure("subsample", self.subsample != 0.0, "must be > 0")?;
         positive("scale_pos_weight", self.scale_pos_weight)?;
         narrows("scale_pos_weight", self.scale_pos_weight, true)?;
-        unit("subsample", self.subsample)?;
-        // subsample of exactly 0 is meaningless.
-        ensure("subsample", self.subsample != 0.0, "must be > 0")?;
-        unit("colsample_bytree", self.colsample_bytree)?;
-        unit("colsample_bylevel", self.colsample_bylevel)?;
-        unit("colsample_bynode", self.colsample_bynode)?;
+        unit("pos_bagging_fraction", self.pos_bagging_fraction)?;
+        ensure(
+            "pos_bagging_fraction",
+            self.pos_bagging_fraction > 0.0,
+            "must be > 0",
+        )?;
+        unit("neg_bagging_fraction", self.neg_bagging_fraction)?;
+        ensure(
+            "neg_bagging_fraction",
+            self.neg_bagging_fraction > 0.0,
+            "must be > 0",
+        )?;
         unit("rate_drop", self.rate_drop)?;
         unit("skip_drop", self.skip_drop)
+    }
+
+    fn validate_balanced_bagging(&self) -> Result<()> {
+        let enabled = self.pos_bagging_fraction < 1.0 || self.neg_bagging_fraction < 1.0;
+        if !enabled {
+            return Ok(());
+        }
+        ensure(
+            "pos_bagging_fraction",
+            matches!(
+                self.objective.as_str(),
+                "binary:logistic" | "binary:logitraw" | "binary:hinge"
+            ),
+            "balanced bagging requires a binary classification objective",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "balanced bagging is not supported with `gradient_based` sampling",
+        )
     }
 
     /// Ranges of the reuse penalties and the split searches that apply them.
@@ -1344,6 +1385,10 @@ impl TrainingParamsBuilder {
         num_parallel_tree, usize);
     setter!(/// Set the row subsampling method (`sampling_method`).
         sampling_method, SamplingMethod);
+    setter!(/// Set LightGBM's positive-class bagging fraction.
+        pos_bagging_fraction, f64);
+    setter!(/// Set LightGBM's negative-class bagging fraction.
+        neg_bagging_fraction, f64);
     setter!(/// Set the multi-output tree strategy (`multi_strategy`).
         multi_strategy, MultiStrategy);
     setter!(/// Set whether rounds grow or update trees (`process_type`).
@@ -1590,6 +1635,20 @@ mod tests {
         assert!(d.refresh_leaf);
         assert!(d.quantile_alpha.is_empty() && d.expectile_alpha.is_empty());
         d.validate().unwrap();
+    }
+
+    #[test]
+    fn balanced_bagging_defaults_and_fraction_ranges() {
+        let params = TrainingParams::default();
+        assert_eq!(params.pos_bagging_fraction, 1.0);
+        assert_eq!(params.neg_bagging_fraction, 1.0);
+        for invalid in [0.0, f64::NAN, f64::INFINITY, 1.1] {
+            let result = TrainingParams::builder()
+                .objective("binary:logistic")
+                .pos_bagging_fraction(invalid)
+                .build();
+            assert!(result.is_err(), "accepted fraction {invalid}");
+        }
     }
 
     /// A trained model rebuilds its objective from `ObjectiveParams`, so the

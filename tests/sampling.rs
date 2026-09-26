@@ -142,6 +142,70 @@ fn gradient_based_sampling_tree_method_support() {
     assert!(train(&dart, &data, 3).is_ok());
 }
 
+#[test]
+fn balanced_bagging_changes_binary_training_deterministically() {
+    let (n_pos, n_neg) = (200usize, 800usize);
+    let n = n_pos + n_neg;
+    let mut x = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        x.push((i % 100) as f32 / 100.0);
+        y.push(if i < n_pos { 1.0 } else { 0.0 });
+    }
+    let data = labeled_dense(&x, 1, &y);
+    let base = || {
+        TrainingParams::builder()
+            .objective("binary:logistic")
+            .tree_method(TreeMethod::Hist)
+            .max_depth(2)
+            .seed(53)
+    };
+    let all = train(&base().build().unwrap(), &data, 3)
+        .unwrap()
+        .trees()
+        .to_vec();
+    let balanced = base()
+        .pos_bagging_fraction(0.6)
+        .neg_bagging_fraction(0.1)
+        .subsample(0.95)
+        .build()
+        .unwrap();
+    let sampled = train(&balanced, &data, 3).unwrap().trees().to_vec();
+    assert_ne!(all, sampled);
+    assert_eq!(sampled, train(&balanced, &data, 3).unwrap().trees());
+}
+
+#[test]
+fn balanced_bagging_refuses_unsupported_parameters_and_labels() {
+    let builder = || TrainingParams::builder().pos_bagging_fraction(0.5);
+    assert_eq!(invalid_param(builder().build()), "pos_bagging_fraction");
+    assert_eq!(
+        invalid_param(
+            builder()
+                .objective("binary:logistic")
+                .sampling_method(SamplingMethod::GradientBased)
+                .build()
+        ),
+        "sampling_method"
+    );
+    assert_eq!(
+        invalid_param(
+            TrainingParams::builder()
+                .objective("reg:squarederror")
+                .pos_bagging_fraction(0.5)
+                .build()
+        ),
+        "pos_bagging_fraction"
+    );
+    let soft_labels = labeled_dense(&[0.0, 1.0], 1, &[0.25, 0.75]);
+    let params = builder()
+        .objective("binary:logistic")
+        .neg_bagging_fraction(0.5)
+        .build()
+        .unwrap();
+    assert_eq!(invalid_param(train(&params, &soft_labels, 1)), "labels");
+}
+
 /// Zero weights are epsilon weights (floored at 1e-6, as in XGBoost): against
 /// weights far above the floor they practically never win, so on these fixed
 /// seeds a stage that keeps as many features as have positive weight never

@@ -3725,6 +3725,29 @@ mod tests {
         }
     }
 
+    /// A multi-output model that is not multiclass (three quantiles) gives
+    /// `mlogloss` / `merror` their width, but its regression labels are not
+    /// class indices: the metrics refuse the eval set instead of reading a
+    /// probability past the row.
+    #[test]
+    fn class_index_metrics_refuse_non_class_labels() {
+        let x: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..32).map(|i| 10.0 + i as f32).collect();
+        let d = labeled_dense(&x, 32, 1, &y);
+        for metric in ["mlogloss", "merror"] {
+            let params = TrainingParams::builder()
+                .objective(Objective::Quantile(
+                    crate::objective::Quantiles::new([0.1, 0.5, 0.9]).unwrap(),
+                ))
+                .eval_metric(named_metric(metric))
+                .build()
+                .unwrap();
+            let run = Trainer::new(&params, &d, 2).eval(&d, "eval").train();
+            let reason = eval_metric_rejection(run, metric);
+            assert!(reason.contains("class"), "{reason}");
+        }
+    }
+
     #[test]
     fn per_row_metrics_refuse_label_matrices() {
         // The survival metrics read one interval and weight per row, and

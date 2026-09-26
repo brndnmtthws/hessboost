@@ -3,7 +3,8 @@
 //! refusals.
 
 use hessboost::diffusion::{
-    DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, ScoreConfig, Sde,
+    DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, Samples, ScoreConfig,
+    Sde,
 };
 use hessboost::prelude::*;
 
@@ -133,6 +134,28 @@ fn draws_depend_only_on_their_row_and_sample_index() {
     assert_eq!(first.row(0), all.row(0));
     // Another seed: other draws.
     assert_ne!(model.sample(&probes(&[0.1]), 30, 8).unwrap(), first);
+}
+
+#[test]
+fn stored_draws_rebuild_their_samples() {
+    let data = bimodal(300, 5);
+    let model = DiffusionModel::fit(&quick(DiffusionParams::flow_matching()), &data).unwrap();
+    let samples = model.sample(&probes(&[0.2, 0.6, 0.9]), 40, 1).unwrap();
+    let rebuilt = Samples::new(samples.values().to_vec(), 40, 1).unwrap();
+    assert_eq!(rebuilt, samples);
+    assert_eq!(rebuilt.n_rows(), 3);
+    // Wrong layouts and non-finite draws are refused.
+    for (values, n_samples, n_outputs) in [
+        (vec![0.0; 6], 4, 1),
+        (vec![0.0; 6], 0, 1),
+        (vec![0.0; 6], 3, 0),
+        (vec![0.0, f32::NAN], 2, 1),
+    ] {
+        assert_eq!(
+            invalid_param(Samples::new(values, n_samples, n_outputs)),
+            "samples"
+        );
+    }
 }
 
 #[test]

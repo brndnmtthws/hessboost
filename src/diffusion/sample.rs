@@ -26,6 +26,48 @@ pub struct Samples {
 }
 
 impl Samples {
+    /// Draws laid out `[row][sample][output]` (such as
+    /// [`DiffusionModel::sample`]'s, stored and read back), for their
+    /// summaries.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::InvalidParameter`] for zero `n_samples` or
+    /// `n_outputs`, a length that is not a whole number of rows of
+    /// `n_samples · n_outputs` draws, or a non-finite draw.
+    pub fn new(values: Vec<f32>, n_samples: usize, n_outputs: usize) -> Result<Self> {
+        if n_samples == 0 || n_outputs == 0 {
+            return Err(HessboostError::invalid_param(
+                "samples",
+                format!(
+                    "needs at least one sample and one output, got {n_samples} and {n_outputs}"
+                ),
+            ));
+        }
+        let width = n_samples.saturating_mul(n_outputs);
+        if !values.len().is_multiple_of(width) {
+            return Err(HessboostError::invalid_param(
+                "samples",
+                format!(
+                    "{} draws are not whole rows of {n_samples} samples × {n_outputs} outputs",
+                    values.len()
+                ),
+            ));
+        }
+        if !values.iter().all(|v| v.is_finite()) {
+            return Err(HessboostError::invalid_param(
+                "samples",
+                "all draws must be finite",
+            ));
+        }
+        Ok(Samples {
+            n_rows: values.len() / width,
+            values,
+            per_row: n_samples,
+            n_outputs,
+        })
+    }
+
     /// Every draw, `[row][sample][output]`.
     pub fn values(&self) -> &[f32] {
         &self.values

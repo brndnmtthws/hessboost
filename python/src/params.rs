@@ -86,7 +86,7 @@ impl Params {
 }
 
 /// A Python object from a JSON value.
-fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
     Ok(match value {
         Value::Null => py.None().into_bound(py),
         Value::Bool(value) => PyBool::new(py, *value).to_owned().into_any(),

@@ -194,6 +194,13 @@ trained = hessboost.train(params, hessboost.DMatrix(X_struct, y_struct), 200)
 model = honest_refit(trained, X_values, y_values)   # leaves from independent rows
 inference = BoulevardInference.fit(model, X_values, holdout=X_cal, holdout_label=y_cal)
 lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T   # for f(x)
+
+from hessboost.diffusion import DiffusionModel, DiffusionParams, crps, quantiles
+
+model = DiffusionModel.fit(DiffusionParams.flow_matching(), X_train, y_train)
+draws = model.sample(X_test, 200, seed=0)   # (rows, 200, outputs) float32
+quantiles(draws, [0.05, 0.5, 0.95])         # (rows, 3, outputs)
+crps(draws, y_test)                         # (rows, outputs)
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
@@ -222,6 +229,19 @@ lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T   # for f(x)
   `Booster.boulevard`. The intervals are conditional on the tree
   structures: nominal for low-dimensional smooth signals after an honest
   refit, under-covering elsewhere (see the crate's `inference` docs).
+- `hessboost.diffusion`: nonparametric `p(y | x)` for scalar or vector
+  labels (multimodal, skewed, heavy-tailed) by conditional diffusion or
+  flow matching with GBDT score models, after Treeffuser and DiffGBM.
+  `DiffusionParams` is a frozen dataclass tree (`Score`/`FlowMatching` and
+  their SDEs, paths, and time sampling; `EarlyStopping`, `Residualizer`)
+  with presets `default()`, `treeffuser()`, and `flow_matching()`; its
+  `training` mappings are XGBoost parameters, as `train` reads them.
+  `DiffusionModel.sample` returns `(rows, n_samples, outputs)` draws,
+  deterministic per seed; `mean`, `quantiles`, and `crps` summarize them.
+  Models save with `to_bytes`/`save_binary` and `to_json`/`save_json`
+  (and load with `from_bytes`/`load_binary`, `from_json`/`load_json`) or
+  pickle (which also keeps feature names and categories). `fit` releases
+  the GIL but cannot be interrupted: Ctrl-C takes effect once it returns.
 - `hessboost.folds`: `k_fold`, `forward_chaining` (expanding-window,
   purged by a row `gap`), and `purged_forward` (timestamped rows, purged
   by each row's own label window, for overlapping or irregular horizons)

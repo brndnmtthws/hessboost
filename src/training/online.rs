@@ -90,6 +90,8 @@
 //! per-iteration hook as [`Trainer::on_round`] does. Breaking stops
 //! training after the iteration (as it stops [`Trainer`]) and abandons an
 //! update, leaving the model, data and state unchanged.
+//! [`OnlineModel::update_with_commit`] also asks for a last confirmation
+//! once the update is computed, before it is applied.
 //!
 //! # Example
 //!
@@ -333,7 +335,25 @@ impl OnlineModel {
         &mut self,
         additions: Option<&DMatrix>,
         deletions: &[usize],
+        on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+    ) -> Result<UpdateReport> {
+        self.update_with_commit(additions, deletions, on_round, || ControlFlow::Continue(()))
+    }
+
+    /// [`Self::update_with`] asking `commit` once the update is computed,
+    /// just before it is applied: [`ControlFlow::Break`] abandons it as a
+    /// break from `on_round` does (for a caller whose interruption can
+    /// arrive after the last iteration's hook, such as a signal).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::update_with`].
+    pub fn update_with_commit(
+        &mut self,
+        additions: Option<&DMatrix>,
+        deletions: &[usize],
         mut on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+        commit: impl FnOnce() -> ControlFlow<()>,
     ) -> Result<UpdateReport> {
         let deleted = self.check_change(additions, deletions)?;
         let updated = compose(&self.data, &deleted, additions)?;
@@ -355,7 +375,7 @@ impl OnlineModel {
                 })
                 .train()?
                 .model;
-            if stopped || model.num_boost_rounds() != rounds {
+            if stopped || model.num_boost_rounds() != rounds || commit().is_break() {
                 return Err(interrupted());
             }
             let report = UpdateReport {
@@ -375,7 +395,13 @@ impl OnlineModel {
             deleted: &deleted,
             model: &self.model,
         };
-        match run.run(&mut cache, &mut on_round) {
+        let outcome = run
+            .run(&mut cache, &mut on_round)
+            .and_then(|done| match commit() {
+                ControlFlow::Continue(()) => Ok(done),
+                ControlFlow::Break(()) => Err(interrupted()),
+            });
+        match outcome {
             Ok((trees, report)) => {
                 self.model = self.model.with_trees(trees);
                 self.data = updated;

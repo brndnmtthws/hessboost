@@ -14,8 +14,8 @@ XGBoost JSON and UBJSON model files.
 - **Typed** (`py.typed`, complete type information), with the GIL released
   while training and predicting, and free-threaded CPython supported.
 - **More than XGBoost, opt-in.** Conformal prediction intervals,
-  distributional boosting (a predictive distribution per row), and
-  LightGBM/CatBoost tree options.
+  distributional boosting (a predictive distribution per row), LightGBM/CatBoost
+  tree options and class-balanced binary bagging.
 
 ## Installation
 
@@ -179,8 +179,9 @@ d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
   by each row's own label window, for overlapping or irregular horizons)
   folds for `cv` or your own validation loops.
 - Every hessboost training option (`path_smooth`, `extra_trees`,
-  `linear_tree`, `grow_policy="symmetric"`, `use_quantized_grad`, the
-  `dist:*` objectives and their `dist_gradient`, ...) is a `params` key.
+  `linear_tree`, `grow_policy="symmetric"`, `use_quantized_grad`,
+  `pos_bagging_fraction`, `neg_bagging_fraction`, and `dist:*` objectives are
+  `params` keys.
 
 ## Differences from XGBoost's Python package
 

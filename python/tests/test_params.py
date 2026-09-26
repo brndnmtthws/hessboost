@@ -79,6 +79,25 @@ def test_aliases_and_numpy_values_set_the_same_model(dtrain: DMatrix) -> None:
     other = hessboost.train({"eta": 0.2}, dtrain, 5)
     assert other.save_raw() != canonical.save_raw()
 
+def test_balanced_bagging_params_are_accepted_and_validated() -> None:
+    x = np.linspace(-2, 2, 400).reshape(-1, 1)
+    y = (x[:, 0] > 0).astype(np.float32)
+    dtrain = DMatrix(x, y)
+    params = {
+        "objective": "binary:logistic",
+        "pos_bagging_fraction": 0.7,
+        "neg_bagging_fraction": 0.3,
+        "subsample": 0.9,
+        "seed": 9,
+    }
+    first = hessboost.train(params, dtrain, 4)
+    second = hessboost.train(params, dtrain, 4)
+    assert first.save_raw() == second.save_raw()
+    with pytest.raises(HessboostError, match="balanced bagging requires a binary"):
+        hessboost.train(
+            {"objective": "reg:squarederror", "pos_bagging_fraction": 0.5}, dtrain, 1
+        )
+
 
 def test_fixed_options_are_accepted_at_their_only_setting(dtrain: DMatrix) -> None:
     hessboost.train({"max_cat_to_onehot": 4, "max_cat_threshold": 64}, dtrain, 1)

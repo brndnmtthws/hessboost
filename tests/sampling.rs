@@ -207,6 +207,16 @@ fn balanced_bagging_refuses_unsupported_parameters_and_labels() {
         ),
         "subsample"
     );
+    assert_eq!(
+        invalid_param(
+            TrainingParams::builder()
+                .objective("binary:logistic")
+                .booster(BoosterKind::GbLinear)
+                .pos_bagging_fraction(0.5)
+                .build()
+        ),
+        "pos_bagging_fraction"
+    );
 }
 /// splits on a zero-weight feature, for every tree method and sampling stage.
 #[test]

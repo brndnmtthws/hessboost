@@ -725,6 +725,11 @@ impl TrainingParams {
         }
         ensure(
             "pos_bagging_fraction",
+            self.booster != BoosterKind::GbLinear,
+            "balanced bagging is not supported with `booster=gblinear` because it samples no rows",
+        )?;
+        ensure(
+            "pos_bagging_fraction",
             matches!(
                 self.objective.as_str(),
                 "binary:logistic" | "binary:logitraw" | "binary:hinge"

@@ -70,6 +70,19 @@
 //! so the result depends only on the model, the input, and the seed: never
 //! on the thread count.
 //!
+//! # Model size
+//!
+//! A model holds `max(classes, 1) × n_t` GBDTs, times the number of encoded
+//! columns when the training data has missing values (one GBDT per column
+//! instead of one multi-output GBDT). Each GBDT has `num_boost_round` trees
+//! per encoded column, each up to `2^max_depth` leaves, so the size grows
+//! as `classes × n_t × num_boost_round × encoded columns × 2^max_depth`.
+//! The `forest_flow` example (2 classes, `n_t = 20`, 5 encoded columns, 100
+//! rounds of depth 7: 40 GBDTs, 20,000 trees) saves to 38.6 MB; halve
+//! `n_t`, the rounds, or the depth (each step of depth halves the leaves)
+//! to shrink it. Generation and imputation cost one batch prediction per
+//! level, proportional to the same tree count.
+//!
 //! # Persistence
 //!
 //! [`ForestModel::to_bytes`] writes the diffusion container framing with its
@@ -792,6 +805,50 @@ impl ForestModel {
     /// [`HessboostError::ModelFormat`] for an inconsistent model.
     pub fn from_json(json: &str) -> Result<Self> {
         Ok(serde_json::from_str(json)?)
+    }
+
+    /// Save to a file in the binary format.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::to_bytes`] and of writing the file.
+    pub fn save_binary(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        Ok(std::fs::write(path, self.to_bytes()?)?)
+    }
+
+    /// Load a binary file.
+    ///
+    /// # Errors
+    ///
+    /// The errors of reading the file and of [`Self::from_bytes`].
+    pub fn load_binary(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_bytes(&std::fs::read(path)?)
+    }
+
+    /// Save to a file as JSON.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::to_json`] and of writing the file.
+    pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        Ok(std::fs::write(path, self.to_json()?)?)
+    }
+
+    /// Load a JSON file.
+    ///
+    /// # Errors
+    ///
+    /// The errors of reading the file and of [`Self::from_json`].
+    pub fn load_json(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_json(&std::fs::read_to_string(path)?)
+    }
+
+    /// Every GBDT, in `[class][level]` order, or `[class][level][encoded
+    /// column]` for a model fitted with missing values; see the
+    /// [module docs](self#model-size) for their count. Each takes the
+    /// scaled encoded columns as features.
+    pub fn gbdts(&self) -> &[BoostedModel] {
+        &self.models
     }
 
     /// Indices into [`Self::classes`] of `labels`.

@@ -77,9 +77,9 @@ reject. After changing `train.rs`'s input layout, re-check
 `fixed-seeds/train/*` with `cargo fuzz fmt train <file>`. Targets:
 `native-model`, `json-model`, `xgboost-json-model`, `xgboost-ubjson-model`,
 `lightgbm-model`, `compact-model` (accepted models must predict and
-round-trip), `diffusion-model` (binary and JSON; accepted models must
-sample and round-trip), `loaders`, `train` (valid params must train or
-error, identically across thread counts).
+round-trip), `diffusion-model` and `forest-model` (binary and JSON;
+accepted models must sample and round-trip), `loaders`, `train` (valid
+params must train or error, identically across thread counts).
 
 Python bindings: `python/` is its own crate (like `fuzz/`), built by
 maturin through uv. Unlike the root, its `Cargo.lock` and `uv.lock` are

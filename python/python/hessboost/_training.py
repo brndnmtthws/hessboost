@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _hessboost
-from hessboost._core import Booster, DMatrix
+from hessboost._core import Booster, DMatrix, _check_schema
 from hessboost._exceptions import HessboostError
 
 __all__ = ["CustomMetric", "Objective", "TrainingCallback", "cv", "train"]
@@ -143,7 +143,12 @@ def train(
         dtrain: The training data.
         num_boost_round: Boosting iterations (with ``process_type="update"``,
             the number of iterations of ``xgb_model`` to refresh).
-        evals: ``(data, name)`` pairs evaluated after every round.
+        evals: ``(data, name)`` pairs evaluated after every round. Each must
+            have ``dtrain``'s features: the same names and categorical
+            features (where both record them) and, for pandas categoricals,
+            the same categories in the same order, since codes are positions
+            in them. Codes without recorded categories (numpy data with
+            ``feature_types``) are taken to be ``dtrain``'s.
         obj: A custom objective (see :data:`Objective`); the model then
             predicts raw margins.
         custom_metric: A custom metric (see :data:`CustomMetric`), replacing
@@ -159,7 +164,8 @@ def train(
             eval sets): every round for ``True``, every ``n``-th round and
             the last for an int ``n``.
         xgb_model: A booster (or model file) to continue boosting from, or
-            to refresh with ``process_type="update"``.
+            to refresh with ``process_type="update"``. ``dtrain`` must have
+            its features, compared as for ``evals``.
         callbacks: :class:`TrainingCallback` instances run after every round;
             any returning ``True`` stops training.
 
@@ -179,6 +185,10 @@ def train(
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
     native = _params(params, dtrain)
     init = _init_model(xgb_model)
+    for data, name in evals:
+        _check_schema(dtrain, data, f"eval set {str(name)!r}", "dtrain's")
+    if init is not None:
+        _check_schema(init, dtrain, "dtrain", "xgb_model's")
     request: dict[str, object] = {
         "params": native,
         "dtrain": dtrain._core,

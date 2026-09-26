@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from conftest import frame, reorder_colors
 
 import hessboost
 from hessboost import DMatrix, HessboostError
@@ -104,3 +105,28 @@ def test_calibration_refusals() -> None:
         ConformalizedQuantile.calibrate_distribution(booster, x, y, alpha=0.1)
     with pytest.raises(TypeError, match="calibrate"):
         SplitConformal()
+
+
+def test_calibration_recodes_categories_and_refuses_mismatched_bands() -> None:
+    df, y = frame(rows=900)
+    fit, calibration, test = slice(0, 300), slice(300, 600), slice(600, 900)
+    booster = hessboost.train({"max_depth": 3}, DMatrix(df[fit], y[fit]), 20)
+    right = SplitConformal.calibrate(booster, df[calibration], y[calibration], alpha=0.1)
+    swapped = SplitConformal.calibrate(
+        booster, reorder_colors(df[calibration]), y[calibration], alpha=0.1
+    )
+    assert swapped.half_width == right.half_width
+    np.testing.assert_array_equal(
+        swapped.predict_interval(reorder_colors(df[test])), right.predict_interval(df[test])
+    )
+    # A band's two models are evaluated on one matrix, so they must share
+    # their categories.
+    quantile = {"objective": "reg:quantileerror", "max_depth": 3}
+    lower = hessboost.train(
+        {**quantile, "quantile_alpha": 0.05}, DMatrix(df[fit], y[fit]), 20
+    )
+    upper = hessboost.train(
+        {**quantile, "quantile_alpha": 0.95}, DMatrix(reorder_colors(df[fit]), y[fit]), 20
+    )
+    with pytest.raises(HessboostError, match="upper: the categories of feature 'color' differ"):
+        ConformalizedQuantile.calibrate(lower, upper, df[calibration], y[calibration], alpha=0.1)

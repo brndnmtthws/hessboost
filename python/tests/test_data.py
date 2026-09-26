@@ -3,11 +3,13 @@ categoricals, scipy sparse matrices, and DMatrix metadata."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse
-from conftest import regression
+from conftest import frame, regression, reorder_colors
 
 import hessboost
 from hessboost import DMatrix, HessboostError
@@ -125,24 +127,6 @@ def test_scipy_sparse_matrices_equal_dense_with_nan() -> None:
     np.testing.assert_array_equal(DMatrix(coo.tocsr(), [0, 1]).num_col(), 3)
 
 
-def frame(rows: int = 400, seed: int = 0) -> tuple[pd.DataFrame, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    colors = np.array(["red", "green", "blue", "cyan", "plum"])
-    color = colors[rng.integers(0, 5, rows)]
-    effect = {"red": 0.0, "green": 3.0, "blue": -2.0, "cyan": 1.0, "plum": 5.0}
-    size = rng.normal(size=rows)
-    y = np.array([effect[c] for c in color]) + size
-    df = pd.DataFrame(
-        {
-            "color": pd.Categorical(color),
-            "size": size,
-            "count": pd.array(rng.integers(0, 5, rows), dtype="Int64"),
-            "flag": rng.random(rows) < 0.5,
-        }
-    )
-    return df, y
-
-
 def test_pandas_frames_keep_names_and_categories() -> None:
     df, y = frame()
     df.loc[3, "count"] = pd.NA
@@ -163,14 +147,10 @@ def test_prediction_recodes_categories_to_the_training_ones() -> None:
     booster = hessboost.train({"max_depth": 3}, DMatrix(df, y), 30)
     expected = booster.predict(df)
     # Same values, categories listed in another order: different codes.
-    reordered = df.copy()
-    reordered["color"] = reordered["color"].cat.reorder_categories(
-        ["plum", "cyan", "blue", "green", "red"]
-    )
-    assert not np.array_equal(reordered["color"].cat.codes, df["color"].cat.codes)
+    reordered = reorder_colors(df)
     np.testing.assert_array_equal(booster.predict(reordered), expected)
     # A DMatrix built from it cannot be re-coded, so it is refused.
-    with pytest.raises(HessboostError, match="categories of feature 0 differ"):
+    with pytest.raises(HessboostError, match="categories of feature 'color' differ"):
         booster.predict(DMatrix(reordered))
     # An unseen category is missing.
     unseen = df.head(3).copy()
@@ -178,6 +158,56 @@ def test_prediction_recodes_categories_to_the_training_ones() -> None:
     missing = df.head(3).copy()
     missing["color"] = pd.Categorical([None] * 3, categories=["red"])
     np.testing.assert_array_equal(booster.predict(unseen), booster.predict(missing))
+
+
+def test_eval_sets_must_share_the_training_categories() -> None:
+    df, y = frame()
+    dtrain = DMatrix(df[:300], y[:300])
+    params = {"max_depth": 3}
+    with pytest.raises(
+        HessboostError, match="eval set 'valid': the categories of feature 'color' differ"
+    ):
+        hessboost.train(
+            params, dtrain, 3, evals=[(DMatrix(reorder_colors(df[300:]), y[300:]), "valid")]
+        )
+    # Codes without recorded categories (numpy with feature_types) are taken
+    # as dtrain's codes; only which features are categorical is checked.
+    codes = np.column_stack(
+        [df["color"].cat.codes, df["size"], df["count"].astype(float), df["flag"]]
+    )[300:]
+    expected: hessboost.EvalsResult = {}
+    hessboost.train(
+        params, dtrain, 3, evals=[(DMatrix(df[300:], y[300:]), "valid")], evals_result=expected
+    )
+    history: hessboost.EvalsResult = {}
+    hessboost.train(
+        params,
+        dtrain,
+        3,
+        evals=[(DMatrix(codes, y[300:], feature_types=["c", "q", "q", "q"]), "valid")],
+        evals_result=history,
+    )
+    assert history == expected
+    numerical = DMatrix(codes, y[300:], feature_types=["q"] * 4)
+    with pytest.raises(HessboostError, match="eval set 'valid': categorical features differ"):
+        hessboost.train(params, dtrain, 3, evals=[(numerical, "valid")])
+
+
+def test_continuation_and_refresh_refuse_data_with_other_categories() -> None:
+    df, y = frame()
+    first = hessboost.train({"max_depth": 3}, DMatrix(df, y), 5)
+    reordered = DMatrix(reorder_colors(df), y)
+    settings: list[dict[str, Any]] = [
+        {"max_depth": 3},
+        {"process_type": "update", "refresh_leaf": True},
+    ]
+    for params in settings:
+        with pytest.raises(
+            HessboostError, match="dtrain: the categories of feature 'color' differ"
+        ):
+            hessboost.train(params, reordered, 5, xgb_model=first)
+        # The training order is accepted.
+        hessboost.train(params, DMatrix(df, y), 5, xgb_model=first)
 
 
 def test_frames_need_numeric_or_category_columns() -> None:

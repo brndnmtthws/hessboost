@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import classes, regression
+from conftest import classes, frame, regression, reorder_colors
 from sklearn.base import clone  # type: ignore[import-untyped]
 from sklearn.model_selection import GridSearchCV  # type: ignore[import-untyped]
 from sklearn.pipeline import make_pipeline  # type: ignore[import-untyped]
@@ -82,6 +82,35 @@ def test_classifier_objectives_without_probabilities() -> None:
     assert set(np.unique(hinge.predict(x))) <= {0, 1}
     with pytest.raises(HessboostError, match="probabilities"):
         hinge.predict_proba(x)
+
+
+def test_eval_sets_and_continuation_are_recoded_to_the_training_categories() -> None:
+    df, y = frame(rows=600)
+    fit_df, fit_y, valid_df, valid_y = df[:400], y[:400], df[400:], y[400:]
+    settings: dict[str, Any] = {
+        "n_estimators": 200,
+        "max_depth": 3,
+        "learning_rate": 0.3,
+        "early_stopping_rounds": 5,
+    }
+    right = HessboostRegressor(**settings).fit(fit_df, fit_y, eval_set=[(valid_df, valid_y)])
+    swapped = HessboostRegressor(**settings).fit(
+        fit_df, fit_y, eval_set=[(reorder_colors(valid_df), valid_y)]
+    )
+    assert right.best_iteration is not None and right.best_iteration < 199
+    assert swapped.evals_result() == right.evals_result()
+    assert swapped.best_iteration == right.best_iteration
+    # Continuing or refreshing an earlier fit re-codes X to its categories.
+    first = HessboostRegressor(n_estimators=10, max_depth=3).fit(fit_df, fit_y)
+    refresh: dict[str, Any] = {"process_type": "update", "refresh_leaf": True}
+    for params in [None, refresh]:
+        expected = HessboostRegressor(n_estimators=5, max_depth=3, params=params).fit(
+            fit_df, fit_y + 1.0, xgb_model=first
+        )
+        continued = HessboostRegressor(n_estimators=5, max_depth=3, params=params).fit(
+            reorder_colors(fit_df), fit_y + 1.0, xgb_model=first
+        )
+        np.testing.assert_array_equal(continued.predict(df), expected.predict(df))
 
 
 def test_early_stopping_with_eval_sets() -> None:

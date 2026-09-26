@@ -127,7 +127,7 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
 |---|---|
 |`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `metal` on macOS|
 |`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `train` (`Trainer` on a signal-polled worker thread, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `dist`|
-|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `folds`; `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
+|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`, `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `folds`; `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
 |`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit|
 
 ## Invariants

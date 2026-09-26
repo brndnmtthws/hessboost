@@ -55,11 +55,19 @@ class DMatrix:
     ``data`` may be a 2-D numpy array of any numeric dtype and memory
     layout (converted to C-contiguous ``float32``, without a copy when it
     already is), a pandas ``DataFrame`` (column names become
-    ``feature_names``; ``category`` columns become categorical features,
-    their categories recorded and later re-coded at prediction), a scipy
+    ``feature_names``; ``category`` columns become categorical features
+    coded by position in their categories, which are recorded), a scipy
     sparse matrix (absent entries are missing), or any array-like numpy
     accepts. Values equal to ``missing`` (every NaN by default) are missing;
     infinities are refused.
+
+    A matrix is coded when it is built, so a model or matrix it is used with
+    (``predict``, ``train``'s ``evals`` and ``xgb_model``) must have its
+    features: the same names and categorical features (where both record
+    them) and the same categories in the same order; a mismatch raises
+    :class:`HessboostError`. Codes without recorded categories (numpy data
+    with ``feature_types``) are taken to be the other side's. Frames passed
+    to prediction directly are re-coded to the model's categories instead.
 
     Args:
         data: The ``(rows, features)`` feature matrix.
@@ -143,11 +151,12 @@ class DMatrix:
         self._categories = features.categories
 
     @classmethod
-    def _for_model(
-        cls, data: object, booster: Booster, missing: float, info: dict[str, object]
+    def _coded(
+        cls, data: object, categories: _data.Categories, missing: float, info: dict[str, object]
     ) -> DMatrix:
-        """``data`` converted for ``booster``: pandas categories re-coded to
-        the ones it was trained on."""
+        """``data`` converted with its pandas categories re-coded to
+        ``categories`` (a model's or a training matrix's; values they lack
+        become missing)."""
         matrix = cls.__new__(cls)
         matrix._set(
             _data.features(
@@ -156,7 +165,7 @@ class DMatrix:
                 feature_names=None,
                 feature_types=None,
                 enable_categorical=True,
-                reference=booster._categories or None,
+                reference=categories or None,
                 info=info,
             )
         )
@@ -260,6 +269,52 @@ def _or_empty(values: NDArray[np.float32] | None) -> NDArray[np.float32]:
     return np.empty(0, dtype=np.float32) if values is None else values
 
 
+def _feature_label(names: list[str] | None, column: int) -> str:
+    return repr(names[column]) if names is not None and column < len(names) else str(column)
+
+
+def _check_schema(
+    reference: DMatrix | Booster,
+    data: DMatrix | Booster,
+    subject: str,
+    against: str,
+    *,
+    names: bool = True,
+    hint: str = "",
+) -> None:
+    """Refuses ``data`` whose features ``reference`` would read differently:
+    other feature names (checked with ``names``), other categorical
+    features, or a categorical feature whose recorded categories (their
+    values and order, which define its codes) differ. Only what both sides
+    record is compared: category codes without recorded categories (numpy
+    data with ``feature_types``, a model loaded from a file) are taken to be
+    the reference's codes. ``subject`` and ``against`` name the two sides in
+    the error; ``hint`` ends a categories error."""
+    ref_names, data_names = reference._feature_names, data._feature_names
+    if names and ref_names is not None and data_names is not None and ref_names != data_names:
+        raise HessboostError(
+            f"{subject}: feature names differ from {against}: {ref_names} vs {data_names}"
+        )
+    label_names = ref_names if ref_names is not None else data_names
+    ref_types, data_types = reference._feature_types, data._feature_types
+    if ref_types is not None and data_types is not None and len(ref_types) == len(data_types):
+        ref_columns = [column for column, kind in enumerate(ref_types) if kind == "c"]
+        data_columns = [column for column, kind in enumerate(data_types) if kind == "c"]
+        if ref_columns != data_columns:
+            raise HessboostError(
+                f"{subject}: categorical features differ from {against}: "
+                f"[{', '.join(_feature_label(label_names, c) for c in ref_columns)}] vs "
+                f"[{', '.join(_feature_label(label_names, c) for c in data_columns)}]"
+            )
+    for column, categories in data._categories.items():
+        expected = reference._categories.get(column)
+        if expected is not None and expected != categories:
+            raise HessboostError(
+                f"{subject}: the categories of feature {_feature_label(label_names, column)} "
+                f"differ from {against}{hint}"
+            )
+
+
 class Booster:
     """A trained gradient-boosting model, as XGBoost's ``xgboost.Booster``.
 
@@ -350,27 +405,27 @@ class Booster:
         """The number of features the model takes."""
         return self._model.num_features
 
-    def _matrix(self, data: object, base_margin: ArrayLike | None, missing: float, validate: bool) -> DMatrix:
+    def _matrix(
+        self, data: object, base_margin: ArrayLike | None, missing: float, validate: bool
+    ) -> DMatrix:
+        """``data`` as a matrix for this model: other input converted with its
+        pandas categories re-coded to the model's, and either checked with
+        :func:`_check_schema` (feature names only with ``validate``)."""
         if isinstance(data, DMatrix):
             if base_margin is not None:
                 raise HessboostError("set base_margin on the DMatrix, not in predict()")
             matrix = data
-            if matrix._categories and self._categories:
-                for column, categories in matrix._categories.items():
-                    if self._categories.get(column, categories) != categories:
-                        raise HessboostError(
-                            f"the categories of feature {column} differ from training; pass the "
-                            "DataFrame to predict() directly, which re-codes them"
-                        )
         else:
             info = _data.info(base_margin=base_margin)
-            matrix = DMatrix._for_model(data, self, missing, info)
-        if validate and self._feature_names is not None and matrix._feature_names is not None:
-            if matrix._feature_names != self._feature_names:
-                raise HessboostError(
-                    f"feature names differ: the model has {self._feature_names}, the data "
-                    f"{matrix._feature_names}"
-                )
+            matrix = DMatrix._coded(data, self._categories, missing, info)
+        _check_schema(
+            self,
+            matrix,
+            "the data",
+            "the model's",
+            names=validate,
+            hint="; pass the DataFrame itself, which is re-coded to the model's categories",
+        )
         return matrix
 
     @staticmethod

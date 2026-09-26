@@ -85,10 +85,11 @@ hessboost.train(params, dtrain, 1000, evals=[(dvalid, "valid")],
 ### pandas and categorical features
 
 DataFrame column names become feature names, and `category` columns become
-native categorical features. The booster remembers each column's
-categories, so predicting on a frame whose categories are ordered
-differently (or include unseen values, which count as missing) re-codes
-them first:
+native categorical features. A category's code is its position in the
+column's categories, so the booster remembers each column's categories and
+re-codes a frame passed to `predict` (and the other prediction and
+calibration methods) whose categories are ordered differently or include
+unseen values (which count as missing):
 
 ```python
 import pandas as pd
@@ -98,6 +99,23 @@ df = pd.DataFrame({"color": pd.Categorical(["red", "blue", "red"] * 100),
 booster = hessboost.train({}, hessboost.DMatrix(df, label=np.arange(300.0)), 20)
 booster.predict(df)
 ```
+
+A `DMatrix` is coded once, when it is built, so it must have the features
+of whatever it meets: `predict` and the calibrators check it against the
+model, and `train` checks every `evals` matrix against `dtrain` and `dtrain`
+against `xgb_model` (continued training or refresh). Feature names (where
+both have them; `predict(validate_features=False)` skips them), which
+features are categorical, and each categorical feature's categories, in
+order, must match; a mismatch raises `HessboostError` naming the eval set
+and the feature. Build eval frames with the training frame's categories
+(for example
+`valid["color"].cat.set_categories(train["color"].cat.categories)`). Codes
+without recorded categories (numpy data with `feature_types=["c", ...]`)
+are taken to be the other side's codes; only which features are categorical
+is compared. `ConformalizedQuantile.calibrate` likewise needs its two models
+to share their features. The scikit-learn estimators re-code every
+`eval_set` frame to the training frame's categories and, with `xgb_model`,
+the training frame to the earlier model's.
 
 ## scikit-learn
 

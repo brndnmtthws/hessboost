@@ -12,7 +12,10 @@ weights, base margins, eval sets and ``verbose`` (live per-round output,
 
 Needs scikit-learn (``pip install 'hessboost[scikit-learn]'``); ``import
 hessboost`` itself does not import it. pandas frames keep their
-``category`` columns as categorical features.
+``category`` columns as categorical features: ``eval_set`` frames are
+re-coded to the training frame's categories, a frame continuing an earlier
+fit (``xgb_model``) to that model's, and prediction frames to the fitted
+model's (values they lack become missing).
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ except ImportError as _missing:  # pragma: no cover - exercised without scikit-l
 from hessboost import _data
 from hessboost._core import Booster, DMatrix, Distributions, ImportanceType
 from hessboost._exceptions import HessboostError
-from hessboost._training import EvalsResult, TrainingCallback, train
+from hessboost._training import EvalsResult, TrainingCallback, _init_model, train
 
 __all__ = [
     "HessboostClassifier",
@@ -221,16 +224,13 @@ class _HessboostModel(BaseEstimator):
         y: ArrayLike | None,
         weight: ArrayLike | None,
         base_margin: ArrayLike | None,
-        extra: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None,
+        categories: _data.Categories,
     ) -> DMatrix:
-        return DMatrix(
-            X,
-            y,
-            weight=weight,
-            base_margin=base_margin,
-            missing=self.missing,
-            **(extra or {}),
-        )
+        """``X`` and its metadata as a matrix, pandas categories re-coded to
+        ``categories`` (values they lack become missing)."""
+        info = _data.info(label=y, weight=weight, base_margin=base_margin, **(extra or {}))
+        return DMatrix._coded(X, categories, self.missing, info)
 
     def _fit(
         self,
@@ -250,7 +250,14 @@ class _HessboostModel(BaseEstimator):
         eval_groups: Sequence[Mapping[str, Any]] | None = None,
     ) -> Self:
         X = self._check_X(X, reset=True)
-        dtrain = self._matrix(X, y, sample_weight, base_margin, group)
+        init = _init_model(
+            xgb_model.get_booster() if isinstance(xgb_model, _HessboostModel) else xgb_model
+        )
+        # Continuing or refreshing reads X with the earlier model's codes, and
+        # every eval set with the training ones.
+        dtrain = self._matrix(
+            X, y, sample_weight, base_margin, group, {} if init is None else init._categories
+        )
         evals: list[tuple[DMatrix, str]] = []
         for index, (X_eval, y_eval) in enumerate(eval_set or ()):
             X_eval = self._check_X(X_eval, reset=False)
@@ -259,9 +266,11 @@ class _HessboostModel(BaseEstimator):
             labels = encode(y_eval) if encode is not None else y_eval
             extra = None if eval_groups is None else eval_groups[index]
             evals.append(
-                (self._matrix(X_eval, labels, weight, margin, extra), f"validation_{index}")
+                (
+                    self._matrix(X_eval, labels, weight, margin, extra, dtrain._categories),
+                    f"validation_{index}",
+                )
             )
-        init = xgb_model.get_booster() if isinstance(xgb_model, _HessboostModel) else xgb_model
         self._evals_result = {}
         self._booster = train(
             params,

@@ -32,23 +32,24 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _data, _hessboost
-from hessboost._core import Booster, DMatrix
+from hessboost._core import Booster, DMatrix, _check_schema
 from hessboost._exceptions import HessboostError
 
 __all__ = ["ConformalizedQuantile", "SplitConformal"]
 
 
 def _calibration(booster: Booster, data: object, label: ArrayLike | None) -> _hessboost.DMatrix:
-    """A labelled calibration matrix for ``booster``."""
+    """A labelled calibration matrix for ``booster``, converted and checked
+    as for prediction (pandas categories re-coded to the model's)."""
     if isinstance(data, DMatrix):
+        matrix = booster._matrix(data, None, np.nan, True)._core
         if label is None:
-            return booster._matrix(data, None, np.nan, True)._core
-        return booster._matrix(data, None, np.nan, True)._core.with_info(
-            {**_data.info(label=label), "categorical": None}
-        )
+            return matrix
+        return matrix.with_info({**_data.info(label=label), "categorical": None})
     if label is None:
         raise HessboostError("calibration needs labels: pass label= or a labelled DMatrix")
-    return DMatrix._for_model(data, booster, np.nan, _data.info(label=label))._core
+    coded = DMatrix._coded(data, booster._categories, np.nan, _data.info(label=label))
+    return booster._matrix(coded, None, np.nan, True)._core
 
 
 def _check_alpha(alpha: float) -> float:
@@ -155,7 +156,14 @@ class ConformalizedQuantile:
         alpha: float,
     ) -> Self:
         """A band from two single-output models, ``lower`` (e.g. trained at
-        quantile ``alpha / 2``) and ``upper`` (at ``1 - alpha / 2``)."""
+        quantile ``alpha / 2``) and ``upper`` (at ``1 - alpha / 2``). Both
+        read the same matrices, so they must have the same features
+        (names, categorical features, and categories in the same order).
+
+        Raises:
+            HessboostError: The models' features differ.
+        """
+        _check_schema(lower, upper, "upper", "lower's")
         core = _hessboost.ConformalizedQuantile.calibrate(
             (lower._model, upper._model),
             _calibration(lower, data, label),

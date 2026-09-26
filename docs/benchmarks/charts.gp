@@ -47,8 +47,8 @@ set output "docs/benchmarks/xgboost-speedup.svg"
 
 set title "hessboost speedup over XGBoost 3.4.1 (higher is better)\n{/*0.8 median of six fits, Apple M3 Max, CPU hist, 100 rounds}"
 set ylabel "fit time ratio, XGBoost / hessboost"
-set yrange [0:3.2]
-set ytics 0.5
+set yrange [0:5.5]
+set ytics 1.0
 set arrow 1 from -0.5,1 to 3.5,1 nohead lc rgb "#303030" dt 2 lw 1.5 front
 set key top right reverse Left samplen 2 spacing 1.3
 plot xgb_data using ($3/$2):xtic(1) lc rgb seq_t1  title "1 thread", \

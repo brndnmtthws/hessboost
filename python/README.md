@@ -201,6 +201,12 @@ model = DiffusionModel.fit(DiffusionParams.flow_matching(), X_train, y_train)
 draws = model.sample(X_test, 200, seed=0)   # (rows, 200, outputs) float32
 quantiles(draws, [0.05, 0.5, 0.95])         # (rows, 3, outputs)
 crps(draws, y_test)                         # (rows, outputs)
+
+from hessboost.diffusion.forest import ForestModel, ForestParams
+
+forest = ForestModel.fit(ForestParams.diffusion(), X_with_nans)
+values, labels = forest.generate(1000, seed=0)            # (1000, columns), None
+filled = forest.impute(X_with_nans, n_imputations=5)      # (5, rows, columns)
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
@@ -242,6 +248,18 @@ crps(draws, y_test)                         # (rows, outputs)
   (and load with `from_bytes`/`load_binary`, `from_json`/`load_json`) or
   pickle (which also keeps feature names and categories). `fit` releases
   the GIL but cannot be interrupted: Ctrl-C takes effect once it returns.
+- `hessboost.diffusion.forest`: ForestFlow / ForestDiffusion synthetic
+  tabular rows (optionally per class of a label) and missing-value
+  imputation with per-noise-level GBDTs. `ForestParams` (method `"flow"`
+  or `Diffusion(beta_min, beta_max)`, `n_t`, `duplicate_k`, one
+  `"continuous"`/`"integer"`/`"categorical"` kind per column, XGBoost
+  `training` parameters) has presets `default()` and `diffusion()`.
+  `ForestModel.generate(n_rows)` returns `(values, labels)` (labels only
+  for a class-conditional model), `generate_for_labels(labels)` one row
+  per label, and `impute(X, y, n_imputations=, repaint=Repaint(...))`
+  `(n_imputations, rows, columns)` with the observed entries kept
+  (diffusion only). Values are in the data's own coding. Models save and
+  load like `DiffusionModel`s.
 - `hessboost.folds`: `k_fold`, `forward_chaining` (expanding-window,
   purged by a row `gap`), and `purged_forward` (timestamped rows, purged
   by each row's own label window, for overlapping or irregular horizons)

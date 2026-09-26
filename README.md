@@ -127,7 +127,7 @@ runnable programs live in [`examples/`](examples)
 [`python/`](python) holds the Python package (`pip install hessboost`),
 with XGBoost's Python API (`DMatrix`, `train`, `cv`, `Booster`),
 scikit-learn estimators, pandas categorical input, and the conformal,
-distributional, tree-diffusion, and in-place update extras:
+distributional, tree-diffusion, ForestFlow, and in-place update extras:
 
 ```python
 import hessboost

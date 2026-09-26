@@ -41,6 +41,9 @@ Draws are deterministic for a given model, input, ``n_samples`` and seed at
 any thread count, and the first ``k`` draws of a row are the same for every
 ``n_samples >= k``. :meth:`DiffusionModel.fit` releases the GIL but cannot
 be interrupted: Ctrl-C takes effect once it returns.
+
+:mod:`hessboost.diffusion.forest` generates and imputes tabular rows with
+ForestFlow and ForestDiffusion.
 """
 
 from __future__ import annotations
@@ -78,6 +81,7 @@ __all__ = [
     "VarianceExploding",
     "VariancePreserving",
     "crps",
+    "forest",
     "mean",
     "quantiles",
 ]
@@ -777,3 +781,7 @@ class DiffusionModel:
             f"outputs={self.n_outputs}, n_steps={self.n_steps}, "
             f"residualized={self.is_residualized})"
         )
+
+
+# Last: `forest` reuses this module's helpers.
+from hessboost.diffusion import forest

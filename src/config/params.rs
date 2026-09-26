@@ -697,8 +697,8 @@ impl TrainingParams {
         positive("scale_pos_weight", self.scale_pos_weight)?;
         narrows("scale_pos_weight", self.scale_pos_weight, true)?;
         unit("subsample", self.subsample)?;
-        ensure("subsample", self.subsample != 0.0, "must be > 0")?;
         // subsample of exactly 0 is meaningless.
+        ensure("subsample", self.subsample != 0.0, "must be > 0")?;
         unit("colsample_bytree", self.colsample_bytree)?;
         unit("colsample_bylevel", self.colsample_bylevel)?;
         unit("colsample_bynode", self.colsample_bynode)?;

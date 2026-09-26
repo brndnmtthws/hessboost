@@ -3,6 +3,7 @@
 //! distributions of `t`, and the standard-normal draws.
 
 use super::{FlowPath, Sde, TimeSampling};
+use crate::error::{HessboostError, Result};
 use crate::rng::{GOLDEN, Rng, mix64};
 
 /// Smallest time drawn for training and the end point of reverse-time
@@ -144,34 +145,50 @@ pub(super) fn draw_times(
     anchor_endpoint: bool,
     rng: &mut Rng,
     normal: &mut Normal,
-) -> Vec<f64> {
+) -> Result<Vec<f64>> {
+    let mut t = try_filled(n, 0.0, "n_repeats")?;
     match sampling {
         TimeSampling::Uniform => {
-            let mut t: Vec<f64> = (0..n).map(|_| rng.f64() * (1.0 - T_EPS) + T_EPS).collect();
+            for v in &mut t {
+                *v = rng.f64() * (1.0 - T_EPS) + T_EPS;
+            }
             if anchor_endpoint && n > 0 {
                 let count = ((n as f64 * ENDPOINT_FRACTION).round_ties_even() as usize).clamp(1, n);
                 // A uniform `count`-subset: the head of a partial Fisher–Yates shuffle.
-                let mut rows: Vec<usize> = (0..n).collect();
+                let mut rows = try_filled(n, 0usize, "n_repeats")?;
+                for (i, row) in rows.iter_mut().enumerate() {
+                    *row = i;
+                }
                 for i in 0..count {
                     let j = rng.range(i..n);
                     rows.swap(i, j);
                     t[rows[i]] = 1.0;
                 }
             }
-            t
         }
         TimeSampling::LogNoiseNormal { mean, std } => {
             let (log_scale, times) = log_noise_table(noise_scale);
             let (lo, hi) = (log_scale[0], log_scale[TABLE_SIZE - 1]);
-            (0..n)
-                .map(|_| {
-                    // `max`/`min`, not `clamp`: they never panic, whatever the bounds.
-                    let draw = (mean + std * normal.draw(rng)).max(lo).min(hi);
-                    interpolate(&log_scale, &times, draw)
-                })
-                .collect()
+            for v in &mut t {
+                // `max`/`min`, not `clamp`: they never panic, whatever the bounds.
+                let draw = (mean + std * normal.draw(rng)).max(lo).min(hi);
+                *v = interpolate(&log_scale, &times, draw);
+            }
         }
     }
+    Ok(t)
+}
+
+/// `len` copies of `value`, or [`HessboostError::InvalidParameter`] naming
+/// `what` when they cannot be allocated (where `vec!` would panic on a
+/// capacity overflow or abort when out of memory).
+pub(super) fn try_filled<T: Clone>(len: usize, value: T, what: &'static str) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| {
+        HessboostError::invalid_param(what, format!("{len} values do not fit in memory"))
+    })?;
+    v.resize(len, value);
+    Ok(v)
 }
 
 /// `(ln noise_scale(tᵢ), tᵢ)` on an even grid of [`TABLE_SIZE`] times over
@@ -319,7 +336,8 @@ mod tests {
             false,
             &mut rng,
             &mut Normal::default(),
-        );
+        )
+        .unwrap();
         let logs: Vec<f64> = times.iter().map(|&t| sde.marginal(t).1.ln()).collect();
         let mean = logs.iter().sum::<f64>() / logs.len() as f64;
         assert!((mean - -1.2).abs() < 0.1, "mean log σ {mean}");

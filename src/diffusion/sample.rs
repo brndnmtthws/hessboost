@@ -2,7 +2,7 @@
 //! the [`Samples`] it returns.
 
 use super::fit::{Edm, dense_features, quantile_sorted, residual_mean};
-use super::process::{T_EPS, keyed_normal};
+use super::process::{T_EPS, keyed_normal, try_filled};
 use super::{DiffusionModel, Method, OdeSolver, Parameterization, ScoreConfig};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -94,7 +94,12 @@ impl Samples {
             ));
         }
         let (k, d) = (levels.len(), self.n_outputs);
-        let mut out = vec![0.0; self.n_rows * k * d];
+        let len = self
+            .n_rows
+            .checked_mul(k)
+            .and_then(|n| n.checked_mul(d))
+            .unwrap_or(usize::MAX);
+        let mut out = try_filled(len, 0.0, "levels")?;
         let mut column = vec![0.0; self.per_row];
         for row in 0..self.n_rows {
             for o in 0..d {
@@ -207,7 +212,7 @@ pub(super) fn sample(
         n_samples,
         key: splitmix64(seed ^ SAMPLE_STREAM),
     };
-    let mut values = vec![0.0f32; total];
+    let mut values = try_filled(total, 0.0f32, "n_samples")?;
     let n_pairs = n_rows * n_samples;
     for (chunk, out) in values.chunks_mut(CHUNK_PAIRS * d).enumerate() {
         let start = chunk * CHUNK_PAIRS;

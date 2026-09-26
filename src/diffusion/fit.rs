@@ -1,7 +1,7 @@
 //! [`DiffusionModel::fit`]: label standardization, residualization, the
 //! noisy training set, and the score/velocity GBDT.
 
-use super::process::{Normal, draw_times};
+use super::process::{Normal, draw_times, try_filled};
 use super::{
     DiffusionModel, DiffusionParams, FittedResidualizer, Method, Parameterization, Residualizer,
 };
@@ -328,6 +328,8 @@ impl TrainingSet<'_> {
             .ok_or_else(|| {
                 HessboostError::invalid_param("n_repeats", "the training set size overflows usize")
             })?;
+        let mut features = try_filled(n_aug * cols, 0.0f32, "n_repeats")?;
+        let mut labels = try_filled(n_aug * d, 0.0f32, "n_repeats")?;
         let times = match self.method {
             Method::Score(score) => draw_times(
                 n_aug,
@@ -336,7 +338,7 @@ impl TrainingSet<'_> {
                 false,
                 rng,
                 normal,
-            ),
+            )?,
             Method::FlowMatching(flow) => draw_times(
                 n_aug,
                 flow.time_sampling,
@@ -344,10 +346,8 @@ impl TrainingSet<'_> {
                 true,
                 rng,
                 normal,
-            ),
+            )?,
         };
-        let mut features = vec![0.0f32; n_aug * cols];
-        let mut labels = vec![0.0f32; n_aug * d];
         // Repetition-major, as Treeffuser tiles the data.
         let augmented = (0..repeats).flat_map(|_| rows.iter().copied());
         for (((row, &t), feature_row), label_row) in augmented

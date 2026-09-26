@@ -275,6 +275,27 @@ fn unsupported_inputs_are_refused() {
         invalid_param(model.sample(&probes(&[0.5]), 0, 1)),
         "n_samples"
     );
+    // Requests too large to allocate are refused, not a capacity-overflow
+    // panic: the samples, and the noisy training set (whose element count
+    // fits in `usize` but whose bytes exceed `isize::MAX`).
+    assert_eq!(
+        invalid_param(model.sample(&probes(&[0.5]), usize::MAX, 1)),
+        "n_samples"
+    );
+    assert_eq!(
+        invalid_param(model.sample(&probes(&[0.5]), usize::MAX / 2, 1)),
+        "n_samples"
+    );
+    for n_repeats in [usize::MAX, (1usize << 62) / (50 * 4)] {
+        let mut params = quick(DiffusionParams::default());
+        params.residualizer = None;
+        params.early_stopping = None;
+        params.n_repeats = n_repeats;
+        assert_eq!(
+            invalid_param(DiffusionModel::fit(&params, &small)),
+            "n_repeats"
+        );
+    }
     assert!(matches!(
         model.sample(&DMatrix::from_dense(&[0.5, 0.5], 1, 2).unwrap(), 5, 1),
         Err(HessboostError::DimensionMismatch { .. })

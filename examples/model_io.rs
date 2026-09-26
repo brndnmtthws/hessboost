@@ -56,8 +56,9 @@ fn main() -> Result<()> {
     ] {
         let after = m.predict(&d)?;
         let max_diff = before
+            .as_slice()
             .iter()
-            .zip(&after)
+            .zip(after.as_slice())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         println!("{label:<13} round-trip max |Δ| = {max_diff:.2e}");

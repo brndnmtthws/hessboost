@@ -92,8 +92,11 @@ class OnlineModel:
     with :meth:`train` or :meth:`from_model`; see :mod:`hessboost.online`.
 
     Updates are atomic: a refused, interrupted, or stopped update leaves the
-    model and data as they were. Concurrent updates of one model run one at
-    a time.
+    model and data as they were. While an update runs, :attr:`model`,
+    :attr:`data` and another :meth:`update` of the same online model raise
+    :class:`~hessboost.HessboostError`, from other threads and from the
+    update's own callback alike; :meth:`num_row` and :attr:`tolerance` stay
+    readable.
     """
 
     __module__ = "hessboost.online"
@@ -233,13 +236,16 @@ class OnlineModel:
         Ctrl-C abandons the update at the end of the current iteration and
         raises ``KeyboardInterrupt``; an exception from ``callback`` does the
         same and propagates. A refused, abandoned, or interrupted update
-        changes nothing.
+        changes nothing. The update is applied only after a last check for
+        Ctrl-C once every iteration is done; one pressed later is raised
+        after ``update`` returns.
 
         Raises:
-            HessboostError: The change is refused: out-of-range or repeated
-                deletions, deleting every row, additions without labels or
-                with metadata or other features, or updated data retraining
-                refuses (such as labels outside the objective's domain).
+            HessboostError: The model is being updated, or the change is
+                refused: out-of-range or repeated deletions, deleting every
+                row, additions without labels or with metadata or other
+                features, or updated data retraining refuses (such as labels
+                outside the objective's domain).
             KeyboardInterrupt: The update was interrupted.
         """
         matrix = None

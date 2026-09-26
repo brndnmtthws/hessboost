@@ -74,7 +74,7 @@ proptest! {
         let params = base_params(seed);
         let pd = train(&params, &dense, 15).unwrap().predict(&dense).unwrap();
         let ps = train(&params, &sparse, 15).unwrap().predict(&sparse).unwrap();
-        for (a, b) in pd.iter().zip(&ps) {
+        for (a, b) in pd.as_slice().iter().zip(ps.as_slice()) {
             prop_assert!((a - b).abs() < 1e-4, "dense {a} vs sparse {b}");
         }
     }
@@ -95,7 +95,7 @@ proptest! {
             .build()
             .unwrap();
         let model = train(&params, &d, 20).unwrap();
-        let preds = model.predict(&d).unwrap();
+        let preds = model.predict(&d).unwrap().into_vec(); // one value per row
 
         // Sort rows by feature value; predictions must be non-decreasing.
         let mut idx: Vec<usize> = (0..ROWS).collect();
@@ -120,7 +120,7 @@ proptest! {
 
         let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
         let after_json = from_json.predict(&d).unwrap();
-        for (a, b) in before.iter().zip(&after_json) {
+        for (a, b) in before.as_slice().iter().zip(after_json.as_slice()) {
             prop_assert!((a - b).abs() < 1e-6);
         }
     }

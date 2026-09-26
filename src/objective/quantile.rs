@@ -607,12 +607,12 @@ mod tests {
             .train()
             .unwrap();
         let history = &result.history;
-        assert_eq!(history[0].scores[0].1, "quantile");
-        assert!(history.last().unwrap().scores[0].2 < history[0].scores[0].2);
+        assert_eq!(history[0].scores[0].metric, "quantile");
+        assert!(history.last().unwrap().scores[0].value < history[0].scores[0].value);
         let pred = result.model.predict(&d).unwrap();
-        assert_eq!(pred.len(), 3 * n);
+        assert_eq!((pred.n_rows(), pred.width()), (n, 3));
         let mut below = [0usize; 3];
-        for (row, &yi) in pred.as_chunks::<3>().0.iter().zip(&y) {
+        for (row, &yi) in pred.rows().zip(&y) {
             assert!(row[0] <= row[1] && row[1] <= row[2], "{row:?}");
             for (count, &q) in below.iter_mut().zip(row) {
                 *count += usize::from(yi <= q);
@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn quantile_xgboost_round_trip_keeps_intercept_order() {
         use crate::config::TrainingParams;
-        use crate::model::BoostedModel;
+        use crate::model::{BoostedModel, Predictions};
         let n = 32;
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let d = crate::test_support::labeled_dense(&x, n, 1, &x);
@@ -652,9 +652,9 @@ mod tests {
         model.set_base_scores(vec![10.0, 0.0]);
         let restored = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
         assert_eq!(restored.base_scores(), [10.0, 0.0]);
-        let close = |a: Vec<f32>, b: Vec<f32>| {
-            assert_eq!(a.len(), b.len());
-            for (x, y) in a.iter().zip(&b) {
+        let close = |a: Predictions, b: Predictions| {
+            assert_eq!((a.n_rows(), a.width()), (b.n_rows(), b.width()));
+            for (x, y) in a.as_slice().iter().zip(b.as_slice()) {
                 assert!((x - y).abs() <= 1e-5 * x.abs().max(1.0), "{a:?} vs {b:?}");
             }
         };

@@ -45,7 +45,11 @@ fn mvs_params(seed: u64) -> TrainingParams {
 }
 
 fn predictions(params: &TrainingParams, data: &DMatrix, rounds: usize) -> Vec<f32> {
-    train(params, data, rounds).unwrap().predict(data).unwrap()
+    train(params, data, rounds)
+        .unwrap()
+        .predict(data)
+        .unwrap()
+        .into_vec()
 }
 
 /// Every feature any split of `tree` uses on some root-to-leaf path, one set

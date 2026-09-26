@@ -990,8 +990,9 @@ mod tests {
             .unwrap();
         let model = train(&params, &d, 20).unwrap();
         assert_eq!(model.base_scores(), &[0.5f32.ln()]);
-        let pred = model.predict(&d).unwrap();
-        let margin = model.predict_margin(&d).unwrap();
+        // One value per row.
+        let pred = model.predict(&d).unwrap().into_vec();
+        let margin = model.predict_margin(&d).unwrap().into_vec();
         for (p, m) in pred.iter().zip(&margin) {
             assert_eq!(*p, m.exp());
         }

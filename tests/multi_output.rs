@@ -6,6 +6,7 @@ use hessboost::config::{
     BoosterKind, Dart, GrowPolicy, Monotone, MultiStrategy, ProcessType, Refresh, TreeMethod,
 };
 use hessboost::data::FeatureType;
+use hessboost::model::{Contributions, Predictions};
 use hessboost::objective::{CustomLoss, GradPair, SplitGradient};
 use hessboost::prelude::*;
 
@@ -69,11 +70,20 @@ fn reference_margins(model: &BoostedModel, x: &[f32], n: usize) -> Vec<f32> {
 }
 
 /// Every row-and-output's contributions (bias included) sum to its margin.
-fn assert_contribs_sum_to(contribs: &[f32], margins: &[f32]) {
-    assert_eq!(contribs.len(), margins.len() * (COLS + 1));
-    for (row_out, m) in contribs.as_chunks::<{ COLS + 1 }>().0.iter().zip(margins) {
-        let sum: f32 = row_out.iter().sum();
-        assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");
+fn assert_contribs_sum_to(contribs: &Contributions, margins: &Predictions) {
+    assert_eq!(
+        (
+            contribs.n_rows(),
+            contribs.n_outputs(),
+            contribs.n_features()
+        ),
+        (margins.n_rows(), margins.width(), COLS)
+    );
+    for (r, row) in margins.rows().enumerate() {
+        for (o, m) in row.iter().enumerate() {
+            let sum: f32 = contribs.get(r, o).unwrap().iter().sum();
+            assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");
+        }
     }
 }
 
@@ -88,9 +98,12 @@ fn one_vector_tree_per_round_predicts_every_output() {
     let want = reference_margins(&model, &x, N);
     // Block kernels (lockstep groups plus a tail) and the small-batch path.
     let d = DMatrix::from_dense(&x, N, COLS).unwrap();
-    assert_eq!(model.predict_margin(&d).unwrap(), want);
+    assert_eq!(model.predict_margin(&d).unwrap().as_slice(), want);
     let few = DMatrix::from_dense(&x[..5 * COLS], 5, COLS).unwrap();
-    assert_eq!(model.predict_margin(&few).unwrap(), want[..5 * K]);
+    assert_eq!(
+        model.predict_margin(&few).unwrap().as_slice(),
+        &want[..5 * K]
+    );
     // CSR rows (missing entries absent) take the scratch-block path.
     let (mut indptr, mut indices, mut values) = (vec![0], Vec::new(), Vec::new());
     for r in 0..N {
@@ -104,9 +117,9 @@ fn one_vector_tree_per_round_predicts_every_output() {
         indptr.push(indices.len());
     }
     let csr = DMatrix::from_csr(indptr, indices, values, COLS).unwrap();
-    assert_eq!(model.predict_margin(&csr).unwrap(), want);
+    assert_eq!(model.predict_margin(&csr).unwrap().as_slice(), want);
     // Squared error: predictions are the margins, `[row][output]`.
-    assert_eq!(model.predict(&d).unwrap(), want);
+    assert_eq!(model.predict(&d).unwrap().as_slice(), want);
 }
 
 #[test]
@@ -123,7 +136,7 @@ fn training_margins_match_the_final_model() {
     .train()
     .unwrap();
     let rmse = rmse(&result.model, &dtrain);
-    let last = result.history.last().unwrap().scores[0].2;
+    let last = result.history.last().unwrap().scores[0].value;
     assert!((last - rmse).abs() < 1e-6, "history {last} vs model {rmse}");
 }
 
@@ -138,14 +151,16 @@ fn shap_is_additive_per_output() {
     let contribs = model.predict_contribs(&d).unwrap();
     assert_contribs_sum_to(&contribs, &margin);
     let inter = model.predict_interactions(&d).unwrap();
-    assert_eq!(inter.len(), n * K * width * width);
-    for (mat, phi) in inter
-        .chunks_exact(width * width)
-        .zip(contribs.chunks_exact(width))
-    {
-        for (row, &p) in mat.chunks_exact(width).zip(phi) {
-            let sum: f32 = row.iter().sum();
-            assert!((sum - p).abs() < 1e-4, "{sum} vs {p}");
+    assert_eq!(
+        (inter.n_rows(), inter.n_outputs(), inter.n_features()),
+        (n, K, COLS)
+    );
+    for r in 0..n {
+        for o in 0..K {
+            for (i, &p) in contribs.get(r, o).unwrap().iter().enumerate() {
+                let sum: f32 = (0..width).map(|j| inter.at(r, o, i, j).unwrap()).sum();
+                assert!((sum - p).abs() < 1e-4, "{sum} vs {p}");
+            }
         }
     }
 }
@@ -247,7 +262,7 @@ fn dart_rounds_train_vector_trees() {
     // Dropout rescales earlier trees, so the margins are the weighted sum.
     let margins = model.predict_margin(&d).unwrap();
     let unweighted = reference_margins(&model, &x, N);
-    assert_ne!(margins, unweighted);
+    assert_ne!(margins.as_slice(), unweighted);
     assert_contribs_sum_to(&model.predict_contribs(&d).unwrap(), &margins);
 }
 
@@ -384,7 +399,7 @@ fn vector_forests_hold_num_parallel_tree_trees_per_iteration() {
     // Without sampling the forest's trees are identical, each shrunk by
     // eta / 3, and the iteration ranges select whole forests.
     let all = model.predict_margin(&d).unwrap();
-    assert_eq!(all, reference_margins(&model, &x, N));
+    assert_eq!(all.as_slice(), reference_margins(&model, &x, N));
     let first_two = model.predict_margin_range(&d, ..2).unwrap();
     assert_eq!(
         first_two,
@@ -441,15 +456,19 @@ fn unsupported_vector_layouts_are_rejected() {
         "multi_strategy"
     );
     // The opt-in growth modes that bypass the vector-leaf split search.
+    // Set directly, unvalidated: `train` itself must refuse them.
+    let unchecked = |edit: fn(&mut TrainingParams)| {
+        let mut params = vector_params().build().unwrap();
+        edit(&mut params);
+        params
+    };
     for (params, name) in [
         (
-            vector_params()
-                .grow_policy(GrowPolicy::Symmetric)
-                .build_unchecked(),
+            unchecked(|p| p.grow_policy = GrowPolicy::Symmetric),
             "grow_policy",
         ),
         (
-            vector_params().toad_penalty_feature(0.1).build_unchecked(),
+            unchecked(|p| p.toad_penalty_feature = 0.1),
             "toad_penalty_feature",
         ),
     ] {
@@ -478,7 +497,7 @@ fn categorical_two_targets(x: &[f32], cols: usize, y: &[f32]) -> DMatrix {
 
 /// One unregularized, unshrunk round fits every row whose leaf holds a single
 /// label value exactly.
-fn one_round_margins(params: hessboost::config::TrainingParamsBuilder, d: &DMatrix) -> Vec<f32> {
+fn one_round_margins(params: hessboost::config::TrainingParamsBuilder, d: &DMatrix) -> Predictions {
     let params = params
         .multi_strategy(MultiStrategy::MultiOutputTree)
         .lambda(0.0)
@@ -489,11 +508,13 @@ fn one_round_margins(params: hessboost::config::TrainingParamsBuilder, d: &DMatr
     train(&params, d, 1).unwrap().predict_margin(d).unwrap()
 }
 
-fn assert_margins(got: &[f32], want: &[f32]) {
-    let want: Vec<f32> = want.iter().flat_map(|&v| [v, v]).collect();
-    assert_eq!(got.len(), want.len());
-    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        assert!((g - w).abs() < 1e-4, "margin {i}: {got:?} vs {want:?}");
+/// Each row's two margins equal its label `want[row]`.
+fn assert_margins(got: &Predictions, want: &[f32]) {
+    assert_eq!((got.n_rows(), got.width()), (want.len(), 2));
+    for (r, (row, &w)) in got.rows().zip(want).enumerate() {
+        for g in row {
+            assert!((g - w).abs() < 1e-4, "row {r}: {got:?} vs {want:?}");
+        }
     }
 }
 

@@ -690,9 +690,10 @@ mod tests {
 
     /// The params with objective `objective`.
     fn with_objective(objective: Objective) -> TrainingParams {
-        TrainingParams::builder()
-            .objective(objective)
-            .build_unchecked()
+        TrainingParams {
+            objective,
+            ..TrainingParams::default()
+        }
     }
 
     /// Only XGBoost's elementwise multi-target objectives (and

@@ -126,25 +126,79 @@ def test_a_stopping_callback_abandons_the_update(tolerance: float) -> None:
 
 
 @pytest.mark.parametrize("tolerance", [0.1, 0.0])
-def test_keyboard_interrupt_abandons_the_update(tolerance: float) -> None:
+@pytest.mark.parametrize("at", [2, ROUNDS - 1])
+@pytest.mark.parametrize("wait", [0.3, 0.0])
+def test_keyboard_interrupt_abandons_the_update(tolerance: float, at: int, wait: float) -> None:
+    """Ctrl-C during any iteration's callback, the last included, and
+    whether or not the waiting caller sees it before the callback returns,
+    raises with the state unchanged."""
     import _thread
     import time
 
     online = OnlineModel.train(PARAMS, binary(300, 8), ROUNDS, tolerance)
     before = state(online)
 
-    def interrupt_at_2(iteration: int) -> bool:
-        if iteration == 2:
+    def interrupt(iteration: int) -> bool:
+        if iteration == at:
             _thread.interrupt_main()
-            # Long enough for the waiting caller to see the signal.
-            time.sleep(0.3)
+            time.sleep(wait)
         return False
 
     with pytest.raises(KeyboardInterrupt):
-        online.update(binary(10, 9), [5], callback=interrupt_at_2)
+        online.update(binary(10, 9), [5], callback=interrupt)
     assert state(online) == before
     assert online.update(binary(10, 9), [5]).rows_refreshed > 0
     assert online.num_row() == 309
+
+
+_REENTRANT = """
+import numpy as np
+import hessboost
+from hessboost import DMatrix, HessboostError
+from hessboost.online import OnlineModel
+
+rng = np.random.default_rng(0)
+x = rng.normal(size=(300, 4))
+y = x[:, 0] - x[:, 1]
+online = OnlineModel.train(
+    {"tree_method": "hist", "max_depth": 3}, DMatrix(x, y), 6, tolerance=TOLERANCE
+)
+seen = []
+
+def callback(iteration):
+    seen.append((online.num_row(), online.tolerance, repr(online)))
+    for access in (lambda: online.model, lambda: online.data, lambda: online.update(None, [0])):
+        try:
+            access()
+        except HessboostError as error:
+            assert "being updated" in str(error), error
+        else:
+            raise AssertionError("reentrant access was not refused")
+    return False
+
+report = online.update(DMatrix(x[:5], y[:5]), [1, 2], callback=callback)
+assert report is not None
+assert [rows for rows, _, _ in seen] == [300] * 6, seen
+assert online.num_row() == 303 == online.data.num_row()
+assert online.model.num_boosted_rounds() == 6
+print("ok")
+"""
+
+
+@pytest.mark.parametrize("tolerance", [0.1, 0.0])
+def test_access_from_the_update_callback_fails_fast(tolerance: float) -> None:
+    """Reading the model or data, or updating again, from an update's own
+    callback raises instead of deadlocking; the row count and tolerance stay
+    readable. Run in a subprocess, so a deadlock fails the test by timeout."""
+    import subprocess
+    import sys
+
+    code = _REENTRANT.replace("TOLERANCE", repr(tolerance))
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
 
 
 @pytest.mark.parametrize("tolerance", [0.1, 0.0])

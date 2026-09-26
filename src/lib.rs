@@ -30,7 +30,7 @@
 //!
 //! let model = train(&params, &dtrain, 50)?;
 //! let preds = model.predict(&dtrain)?;
-//! assert_eq!(preds.len(), 6);
+//! assert_eq!((preds.n_rows(), preds.width()), (6, 1)); // `[row][output]`
 //!
 //! model.save_binary("model.bin")?;      // native format
 //! # std::fs::remove_file("model.bin").ok();

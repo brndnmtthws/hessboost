@@ -13,7 +13,8 @@ use pyo3::panic::PanicException;
 use pyo3::prelude::*;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::Thread;
 use std::time::Duration;
 
 /// The first exception a Python callback raised during training (or the
@@ -136,27 +137,32 @@ const SIGNAL_POLL: Duration = Duration::from_millis(50);
 /// The per-round hook: stops training once a callback failed or the caller
 /// was interrupted, else calls `function(iteration, scores)` (if any), whose
 /// truthy result stops training and whose exception is recorded and stops
-/// it.
+/// it. The interruption is checked again after `function` returns, so one
+/// that arrived while it ran stops the work even after the last round.
 fn round_hook(
     function: Option<Py<PyAny>>,
     failure: Failure,
     interrupted: Arc<AtomicBool>,
 ) -> impl FnMut(&RoundEval) -> ControlFlow<()> + Send {
     move |round| {
-        if interrupted.load(Ordering::Relaxed) || failure.failed() {
+        let stopped = || interrupted.load(Ordering::Relaxed) || failure.failed();
+        if stopped() {
             return ControlFlow::Break(());
         }
         let Some(function) = &function else {
             return ControlFlow::Continue(());
         };
-        let stop = Python::attach(|py| {
-            function
-                .call1(py, (round.iteration, round.scores.clone()))?
-                .is_truthy(py)
-        });
+        // Python sees XGBoost's `(dataset, metric, value)` triples.
+        let scores: Vec<(&str, &str, f64)> = round
+            .scores
+            .iter()
+            .map(|score| (score.dataset.as_str(), score.metric.as_str(), score.value))
+            .collect();
+        let stop =
+            Python::attach(|py| function.call1(py, (round.iteration, scores))?.is_truthy(py));
         match stop {
-            Ok(false) => ControlFlow::Continue(()),
-            Ok(true) => ControlFlow::Break(()),
+            Ok(false) if !stopped() => ControlFlow::Continue(()),
+            Ok(_) => ControlFlow::Break(()),
             Err(error) => {
                 failure.record(error);
                 ControlFlow::Break(())
@@ -165,15 +171,85 @@ fn round_hook(
     }
 }
 
+/// Where a [`CommitGate`] is.
+enum Phase {
+    Working,
+    Asking,
+    Answered(bool),
+}
+
+/// The worker's last question to its waiting caller: may the finished work
+/// be applied? The caller answers after one more signal check and checks no
+/// more signals after answering, so an interruption either reaches the work
+/// before it is applied or is left for the interpreter to raise after the
+/// call returns, never raised over applied work.
+#[derive(Clone)]
+pub(crate) struct CommitGate(Arc<GateState>);
+
+struct GateState {
+    phase: Mutex<Phase>,
+    answered: Condvar,
+    caller: Thread,
+}
+
+impl CommitGate {
+    fn new(caller: Thread) -> Self {
+        Self(Arc::new(GateState {
+            phase: Mutex::new(Phase::Working),
+            answered: Condvar::new(),
+            caller,
+        }))
+    }
+
+    /// Worker side: wakes the caller and waits for its answer.
+    pub(crate) fn confirm(&self) -> ControlFlow<()> {
+        let state = &self.0;
+        let mut phase = state.phase.lock().unwrap_or_else(PoisonError::into_inner);
+        *phase = Phase::Asking;
+        state.caller.unpark();
+        loop {
+            match *phase {
+                Phase::Answered(true) => return ControlFlow::Continue(()),
+                Phase::Answered(false) => return ControlFlow::Break(()),
+                Phase::Working | Phase::Asking => {
+                    phase = state
+                        .answered
+                        .wait(phase)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+        }
+    }
+
+    /// Caller side: answers a pending question with `commit()`; whether it
+    /// has been answered.
+    fn answer(&self, commit: impl FnOnce() -> bool) -> bool {
+        let state = &self.0;
+        let mut phase = state.phase.lock().unwrap_or_else(PoisonError::into_inner);
+        match *phase {
+            Phase::Working => false,
+            Phase::Asking => {
+                *phase = Phase::Answered(commit());
+                state.answered.notify_all();
+                true
+            }
+            Phase::Answered(_) => true,
+        }
+    }
+}
+
 /// Runs `work` on a worker thread while the caller, detached, wakes every
 /// [`SIGNAL_POLL`] to run the interpreter's signal handlers (only the main
 /// thread's do anything), passing a raised exception (`KeyboardInterrupt`)
-/// to `on_signal`. `work` sees the interruption through its round hook and
-/// stops at the end of the round.
+/// to `on_signal`, and answers `gate` with `may_commit` after a signal
+/// check. `work` sees the interruption through its round hook and stops at
+/// the end of the round.
 fn interruptible<T: Send>(
     py: Python<'_>,
     work: impl FnOnce() -> T + Send,
     on_signal: impl Fn(PyErr),
+    gate: &CommitGate,
+    may_commit: impl Fn() -> bool,
 ) -> PyResult<T> {
     let caller = std::thread::current();
     std::thread::scope(|scope| {
@@ -182,11 +258,16 @@ fn interruptible<T: Send>(
             caller.unpark();
             out
         });
+        let mut answered = false;
         while !worker.is_finished() {
             py.detach(|| std::thread::park_timeout(SIGNAL_POLL));
+            if answered {
+                continue;
+            }
             if let Err(error) = py.check_signals() {
                 on_signal(error);
             }
+            answered = gate.answer(&may_commit);
         }
         worker
             .join()
@@ -197,14 +278,16 @@ fn interruptible<T: Send>(
 /// The round hook [`run_hooked`] hands its work.
 pub(crate) type RoundHook = Box<dyn FnMut(&RoundEval) -> ControlFlow<()> + Send>;
 
-/// Runs `work` [`interruptible`] with a [`round_hook`] calling `on_round`,
-/// and raises the first exception a callback recorded in `failure`, or the
-/// caller's `KeyboardInterrupt`, in place of `work`'s result.
+/// Runs `work` [`interruptible`] with a [`round_hook`] calling `on_round`
+/// and a [`CommitGate`] that lets it apply its result only if nothing
+/// failed or interrupted it, and raises the first exception a callback
+/// recorded in `failure`, or the caller's `KeyboardInterrupt`, in place of
+/// `work`'s result.
 pub(crate) fn run_hooked<T: Send>(
     py: Python<'_>,
     on_round: Option<Py<PyAny>>,
     failure: &Failure,
-    work: impl FnOnce(RoundHook) -> T + Send,
+    work: impl FnOnce(RoundHook, CommitGate) -> T + Send,
 ) -> PyResult<T> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let hook = Box::new(round_hook(
@@ -212,13 +295,17 @@ pub(crate) fn run_hooked<T: Send>(
         failure.clone(),
         Arc::clone(&interrupted),
     ));
+    let gate = CommitGate::new(std::thread::current());
+    let worker_gate = gate.clone();
     let out = interruptible(
         py,
-        move || work(hook),
+        move || work(hook, worker_gate),
         |error| {
             interrupted.store(true, Ordering::Relaxed);
             failure.record(error);
         },
+        &gate,
+        || !interrupted.load(Ordering::Relaxed) && !failure.failed(),
     )?;
     match failure.take() {
         Some(error) => Err(error),
@@ -295,7 +382,7 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
     let metric = request
         .custom_metric
         .map(|metric| custom_metric(metric, targets, failure.clone()));
-    let result = run_hooked(py, request.on_round, &failure, |hook| {
+    let result = run_hooked(py, request.on_round, &failure, |hook, _gate| {
         let mut trainer = Trainer::new(params, dtrain, request.num_boost_round).on_round(hook);
         for (data, name) in &evals {
             trainer = trainer.eval(data, name);

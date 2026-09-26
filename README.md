@@ -70,7 +70,7 @@ fn main() -> Result<()> {
 
     let model = train(&params, &dtrain, 200)?;
     let preds = model.predict(&dtrain)?;
-    println!("first prediction: {}", preds[0]);
+    println!("first prediction: {}", preds.get(0, 0).unwrap());
 
     model.save_binary("model.bin")?;
     let reloaded = BoostedModel::load_binary("model.bin")?;

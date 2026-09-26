@@ -24,20 +24,19 @@ fn main() -> Result<()> {
         .build()?;
     let model = train(&params, &d, 80)?;
 
-    // Contributions: shape [row][n_features + 1]; last column is the bias.
+    // Contributions: n_features + 1 values per row and output, bias last.
     // Their sum equals the raw margin prediction (SHAP additivity).
     let contribs = model.predict_contribs(&d)?;
-    let width = f + 1;
-    let margin0 = model.predict_margin(&d)?[0];
-    let sum0: f32 = contribs[0..width].iter().sum();
-    println!("row 0 SHAP contributions {:?}", &contribs[0..width]);
+    let row0 = contribs.get(0, 0).expect("row 0 exists");
+    let margin0 = *model.predict_margin(&d)?.get(0, 0).expect("row 0 exists");
+    let sum0: f32 = row0.iter().sum();
+    println!("row 0 SHAP contributions {row0:?}");
     println!("  sum {sum0:.4} ≈ margin {margin0:.4}");
 
-    // Interaction values: shape [row][(n_features+1) x (n_features+1)].
+    // Interaction values: an (n_features + 1)^2 matrix per row and output.
     // Off-diagonal (0,2) should be non-trivial thanks to the x0*x2 term.
     let inter = model.predict_interactions(&d)?;
-    let w2 = width * width;
-    let m = |row: usize, i: usize, j: usize| inter[row * w2 + i * width + j];
-    println!("row 0 interaction[0][2] = {:.4}", m(0, 0, 2));
+    let value = inter.at(0, 0, 0, 2).expect("row 0, features 0 and 2 exist");
+    println!("row 0 interaction[0][2] = {value:.4}");
     Ok(())
 }

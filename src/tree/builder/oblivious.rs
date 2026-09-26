@@ -753,7 +753,7 @@ mod tests {
                     let mut row = vec![s as f32 / 40.0];
                     row.extend(&base);
                     let d = DMatrix::from_dense(&row, 1, 4).unwrap();
-                    model.predict(&d).unwrap()[0]
+                    *model.predict(&d).unwrap().get(0, 0).unwrap()
                 })
                 .collect();
             assert!(preds.windows(2).all(|w| w[1] <= w[0]), "{preds:?}");
@@ -817,7 +817,12 @@ mod tests {
                 .unwrap()
                 .predict(&dtest)
                 .unwrap();
-            let se: f32 = pred.iter().zip(&ytest).map(|(p, y)| (p - y).powi(2)).sum();
+            let se: f32 = pred
+                .as_slice()
+                .iter()
+                .zip(&ytest)
+                .map(|(p, y)| (p - y).powi(2))
+                .sum();
             (se / ytest.len() as f32).sqrt()
         };
         let mean = ytest.iter().sum::<f32>() / ytest.len() as f32;

@@ -34,9 +34,9 @@ fn main() -> Result<()> {
 
     let model = train(&params, &dtrain, 60)?;
 
-    // Probabilities are laid out `[row][class]` (length n * num_class).
+    // Probabilities: one row of num_class values per input row.
     let probs = model.predict(&dtrain)?;
-    let row0 = &probs[0..k];
+    let row0 = probs.row(0).expect("row 0 exists");
     println!(
         "row 0 class probabilities: {row0:?} (sums to {:.3})",
         row0.iter().sum::<f32>()
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
 
     // Hard predictions via argmax.
     let classes = model.predict_class(&dtrain)?;
-    let acc = accuracy(&classes, &y);
+    let acc = accuracy(classes.as_slice(), &y);
     println!("training accuracy: {acc:.3}");
     Ok(())
 }

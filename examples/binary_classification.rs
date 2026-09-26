@@ -48,10 +48,10 @@ fn main() -> Result<()> {
 
     let probs = model.predict(&dvalid)?; // probabilities in [0, 1]
     let classes = model.predict_class(&dvalid)?; // hard 0/1 labels
-    let acc = accuracy(&classes, dvalid.labels().unwrap());
+    let acc = accuracy(classes.as_slice(), dvalid.labels().unwrap());
     let auc = EvalMetric::Auc
         .build(1)?
-        .eval(&probs, dvalid.labels().unwrap(), None);
+        .eval(probs.as_slice(), dvalid.labels().unwrap(), None);
     println!("valid accuracy {acc:.3}, AUC {auc:.3}");
     Ok(())
 }

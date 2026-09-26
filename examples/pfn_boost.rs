@@ -187,10 +187,11 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
             .early_stopping_rounds(EARLY_STOPPING)
             .train()?
             .model;
-        let valid_loss =
-            EvalMetric::LogLoss
-                .build(1)?
-                .eval(&model.predict(&dvalid)?, valid.labels(), None);
+        let valid_loss = EvalMetric::LogLoss.build(1)?.eval(
+            model.predict(&dvalid)?.as_slice(),
+            valid.labels(),
+            None,
+        );
         if best.as_ref().is_none_or(|(loss, ..)| valid_loss < *loss) {
             best = Some((valid_loss, s, c, model));
         }
@@ -200,12 +201,12 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
     let dtest = test.with_prior(scale, c)?;
     Ok(Comparison {
         prior,
-        scratch: score(&scratch.predict(&test.data)?, test.labels())?,
+        scratch: score(scratch.predict(&test.data)?.as_slice(), test.labels())?,
         scratch_trees: used_rounds(&scratch),
-        boosted: score(&boosted.predict(&dtest)?, test.labels())?,
+        boosted: score(boosted.predict(&dtest)?.as_slice(), test.labels())?,
         boosted_trees: used_rounds(&boosted),
         scale,
-        forgot_prior: score(&boosted.predict(&test.data)?, test.labels())?,
+        forgot_prior: score(boosted.predict(&test.data)?.as_slice(), test.labels())?,
     })
 }
 
@@ -290,7 +291,8 @@ fn run_synthetic() -> Result<()> {
         .build()?;
     let prior_model = train(&prior_params, &pretraining, 100)?;
     let as_split = |data: DMatrix| -> Result<Split> {
-        let prior = prior_model.predict_margin(&data)?;
+        // One logit per row.
+        let prior = prior_model.predict_margin(&data)?.into_vec();
         Ok(Split { data, prior })
     };
 

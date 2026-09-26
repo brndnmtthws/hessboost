@@ -5,6 +5,7 @@ use hessboost::config::{
     BoosterKind, Dart, ExtraTrees, GrowPolicy, LinearTree, ProcessType, QuantizedGrad, Refresh,
     SamplingMethod, TreeMethod,
 };
+use hessboost::model::Predictions;
 use hessboost::objective::{Multiclass, PseudoHuber};
 use hessboost::prelude::{
     BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
@@ -134,7 +135,13 @@ fn continuation_keeps_the_intercept_unless_base_score_is_given() {
     // The new rounds fit the shifted labels from the old margins.
     let before = first.predict(&shifted).unwrap();
     let after = kept.predict(&shifted).unwrap();
-    assert!(after.iter().zip(&before).all(|(a, b)| a > b));
+    assert!(
+        after
+            .as_slice()
+            .iter()
+            .zip(before.as_slice())
+            .all(|(a, b)| a > b)
+    );
 
     let explicit = base().base_score(1.5).build().unwrap();
     let replaced = Trainer::new(&explicit, &shifted, 2)
@@ -168,7 +175,7 @@ fn early_stopping_records_the_best_round_without_stopping() {
         .unwrap();
     assert_eq!(out.model.num_boost_rounds(), best + 3);
     assert_eq!(out.model.best_iteration(), Some(best));
-    assert_eq!(out.best_score, Some(out.history[best].scores[0].2));
+    assert_eq!(out.best_score, Some(out.history[best].scores[0].value));
     assert_eq!(stopped.best_score, out.best_score);
     assert_eq!(
         out.model.predict(&valid).unwrap(),
@@ -240,7 +247,7 @@ fn continuation_without_an_improving_metric_keeps_the_initial_model() {
         .early_stopping_rounds(2)
         .train()
         .unwrap();
-    assert!(out.history.iter().all(|r| r.scores[0].2.is_nan()));
+    assert!(out.history.iter().all(|r| r.scores[0].value.is_nan()));
     assert_eq!(out.model.best_iteration(), Some(4));
     assert_eq!(
         out.model.predict(&train_set).unwrap(),
@@ -297,7 +304,12 @@ fn gblinear_continues_from_its_weights() {
     // Coordinate descent resumes: agrees with the uninterrupted run up to
     // the f32 margin rounding of recomputing predictions.
     let (a, b) = (resumed.predict(&d).unwrap(), whole.predict(&d).unwrap());
-    assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-4));
+    assert!(
+        a.as_slice()
+            .iter()
+            .zip(b.as_slice())
+            .all(|(x, y)| (x - y).abs() < 1e-4)
+    );
     assert!(rmse(&resumed, &d) < rmse(&first, &d));
 }
 
@@ -319,7 +331,10 @@ fn refreshing_on_the_training_data_reproduces_the_model() {
             .model;
         let (a, b) = (model.predict(&d).unwrap(), refreshed.predict(&d).unwrap());
         assert!(
-            a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-5),
+            a.as_slice()
+                .iter()
+                .zip(b.as_slice())
+                .all(|(x, y)| (x - y).abs() < 1e-5),
             "{method:?}"
         );
         for (old, new) in model.trees().iter().zip(refreshed.trees()) {
@@ -371,7 +386,13 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     // The refreshed leaves chase the shifted labels.
     let shifted = partial.predict(&half).unwrap();
     let original = model.slice(..4, 1).unwrap().predict(&half).unwrap();
-    assert!(shifted.iter().zip(&original).all(|(s, o)| s > o));
+    assert!(
+        shifted
+            .as_slice()
+            .iter()
+            .zip(original.as_slice())
+            .all(|(s, o)| s > o)
+    );
 
     assert_eq!(
         invalid_param(Trainer::new(&update, &half, 7).init_model(&model).train()),
@@ -529,20 +550,24 @@ fn iteration_ranges_select_whole_iterations() {
     let middle = model.predict_margin_range(&d, 2..5).unwrap();
     let sliced = model.slice(2..5, 1).unwrap().predict_margin(&d).unwrap();
     let diff = middle
+        .as_slice()
         .iter()
-        .zip(&sliced)
+        .zip(sliced.as_slice())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max);
     assert!(diff < 1e-5, "{diff}");
 
-    let bad = |r| invalid_param::<Vec<f32>>(r) == "iterations";
+    let bad = |r| invalid_param::<Predictions>(r) == "iterations";
     assert!(bad(model.predict_margin_range(&d, ..7)));
     assert!(bad(model.predict_margin_range(
         &d,
         (Bound::Included(4), Bound::Excluded(3))
     )));
     // Attributions and leaves, as in XGBoost, only take prefixes.
-    assert!(bad(model.predict_contribs_range(&d, 1..3)));
+    assert_eq!(
+        invalid_param(model.predict_contribs_range(&d, 1..3)),
+        "iterations"
+    );
     assert_eq!(
         invalid_param(model.predict_leaf_range(&d, 1..)),
         "iterations"
@@ -585,14 +610,22 @@ fn slicing_selects_iterations_with_their_dart_weights() {
     // Iterations 1, 4, 7 contribute exactly their weighted trees.
     let pick = |m: &BoostedModel, it: usize| {
         let full = m.predict_margin_range(&d, it..=it).unwrap();
-        full.iter().map(|v| v - m.base_score()).collect::<Vec<_>>()
+        full.as_slice()
+            .iter()
+            .map(|v| v - m.base_score())
+            .collect::<Vec<_>>()
     };
     let picked = [1, 4, 7].map(|it| pick(&model, it));
     let expected: Vec<f32> = (0..d.n_rows())
         .map(|r| model.base_score() + picked.iter().map(|p| p[r]).sum::<f32>())
         .collect();
     let got = sliced.predict_margin(&d).unwrap();
-    assert!(got.iter().zip(&expected).all(|(a, b)| (a - b).abs() < 1e-5));
+    assert!(
+        got.as_slice()
+            .iter()
+            .zip(&expected)
+            .all(|(a, b)| (a - b).abs() < 1e-5)
+    );
     for (s, it) in [(0, 1), (1, 4), (2, 7)] {
         assert_eq!(pick(&sliced, s), pick(&model, it));
     }

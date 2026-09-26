@@ -2159,7 +2159,7 @@ mod tests {
             .objective("binary:logistic")
             .pos_bagging_fraction(0.6)
             .neg_bagging_fraction(0.1)
-            .subsample(0.95)
+            .subsample(1.0)
             .seed(53)
             .build()
             .unwrap();

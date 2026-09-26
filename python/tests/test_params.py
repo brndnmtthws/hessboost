@@ -87,7 +87,7 @@ def test_balanced_bagging_params_are_accepted_and_validated() -> None:
         "objective": "binary:logistic",
         "pos_bagging_fraction": 0.7,
         "neg_bagging_fraction": 0.3,
-        "subsample": 0.9,
+        "subsample": 1.0,
         "seed": 9,
     }
     first = hessboost.train(params, dtrain, 4)
@@ -96,6 +96,17 @@ def test_balanced_bagging_params_are_accepted_and_validated() -> None:
     with pytest.raises(HessboostError, match="balanced bagging requires a binary"):
         hessboost.train(
             {"objective": "reg:squarederror", "pos_bagging_fraction": 0.5}, dtrain, 1
+        )
+    with pytest.raises(HessboostError, match="LightGBM ignores `bagging_fraction`"):
+        hessboost.train(
+            {
+                "objective": "binary:logistic",
+                "pos_bagging_fraction": 0.7,
+                "neg_bagging_fraction": 0.3,
+                "subsample": 0.9,
+            },
+            dtrain,
+            1,
         )
 
 

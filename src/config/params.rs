@@ -410,9 +410,9 @@ pub struct TrainingParams {
 
     /// Positive-label Bernoulli bagging fraction for binary classification
     /// (LightGBM `pos_bagging_fraction`; `1` disables the positive override).
-    /// When either fraction is below `1`, both fractions define stratified row
-    /// sampling and `subsample` is ignored. Uses seeded sequential Bernoulli
-    /// draws; each class is sampled independently.
+    /// With either class fraction below `1`, stratified sampling is active and
+    /// `subsample` must remain `1`; LightGBM ignores `bagging_fraction`, while
+    /// hessboost refuses that conflicting setting.
     pub pos_bagging_fraction: f64,
     /// Negative-label Bernoulli bagging fraction for binary classification
     /// (LightGBM `neg_bagging_fraction`; `1` disables the negative override).
@@ -696,6 +696,9 @@ impl TrainingParams {
         narrows("alpha", self.alpha, false)?;
         unit("subsample", self.subsample)?;
         ensure("subsample", self.subsample != 0.0, "must be > 0")?;
+        unit("colsample_bytree", self.colsample_bytree)?;
+        unit("colsample_bylevel", self.colsample_bylevel)?;
+        unit("colsample_bynode", self.colsample_bynode)?;
         positive("scale_pos_weight", self.scale_pos_weight)?;
         narrows("scale_pos_weight", self.scale_pos_weight, true)?;
         unit("pos_bagging_fraction", self.pos_bagging_fraction)?;
@@ -726,6 +729,12 @@ impl TrainingParams {
                 "binary:logistic" | "binary:logitraw" | "binary:hinge"
             ),
             "balanced bagging requires a binary classification objective",
+        )?;
+        ensure(
+            "subsample",
+            self.subsample == 1.0,
+            "LightGBM ignores `bagging_fraction` when balanced bagging is enabled; \
+             hessboost refuses `subsample < 1` together with class bagging fractions",
         )?;
         ensure(
             "sampling_method",
@@ -1522,6 +1531,12 @@ mod tests {
         for (name, builder) in [
             ("eta", b().eta(0.0)),
             ("subsample", b().subsample(1.5)),
+            ("colsample_bytree", b().colsample_bytree(1.5)),
+            ("colsample_bytree", b().colsample_bytree(f64::NAN)),
+            ("colsample_bylevel", b().colsample_bylevel(1.5)),
+            ("colsample_bylevel", b().colsample_bylevel(f64::NAN)),
+            ("colsample_bynode", b().colsample_bynode(1.5)),
+            ("colsample_bynode", b().colsample_bynode(f64::NAN)),
             ("lambda", b().lambda(-1.0)),
             ("max_bin", b().max_bin(1)),
             ("tweedie_variance_power", b().tweedie_variance_power(2.0)),
@@ -1649,6 +1664,20 @@ mod tests {
                 .build();
             assert!(result.is_err(), "accepted fraction {invalid}");
         }
+    }
+
+    #[test]
+    fn balanced_bagging_refuses_combined_subsample() {
+        let err = TrainingParams::builder()
+            .objective("binary:logistic")
+            .pos_bagging_fraction(0.5)
+            .subsample(0.8)
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("LightGBM ignores `bagging_fraction`")
+        );
     }
 
     /// A trained model rebuilds its objective from `ObjectiveParams`, so the

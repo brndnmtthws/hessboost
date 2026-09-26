@@ -163,13 +163,12 @@ Beyond XGBoost (opt-in, none changes default training):
 | [Ordered target statistics](https://docs.rs/hessboost/latest/hessboost/data/target_stats/) | CatBoost-style ordered target encoding of high-cardinality categoricals |
 | Boosting from a pretrained model | start from TabPFN or LLM logits through `base_margin` (PFN-Boost, LLM-Boost) |
 | Metal GPU (macOS, `--features metal`) | GPU prediction about 2.5× faster than the CPU on an M4 Max, and GPU training that reproduces CPU training bit for bit |
-
 ## Caveats
 
-- Randomized training (sampling, forests, DART) matches XGBoost's quality,
-  not its trees: the random streams differ.
-- With either class fraction below `1`, `subsample` is ignored and class-specific
-  Bernoulli rates control row inclusion; this is binary-only and requires 0/1 labels.
+- With either class fraction below `1`, class-specific Bernoulli rates control
+  row inclusion and `subsample` must remain `1`; LightGBM ignores
+  `bagging_fraction` here, while hessboost refuses that conflict. This mode is
+  binary-only and requires labels exactly 0 or 1.
 - gblinear, custom-objective, `dist:*`, and linear-leaf models have no
   XGBoost encoding — native formats only.
 - 0.1.x native model files are refused.

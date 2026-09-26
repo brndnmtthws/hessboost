@@ -41,7 +41,9 @@ uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check
 ```
 
 CI (`.github/workflows/ci.yml`) runs these through `mbx` with
-`RUSTFLAGS=-D warnings`. Tests run on x86_64 Linux, aarch64 Linux, and
+`RUSTFLAGS=-D warnings`. mise-action caches mise's tools; `MISE_ENV=ci`
+loads `mise.ci.toml`, which moves rustup's toolchains into that cache.
+Tests run on x86_64 Linux, aarch64 Linux, and
 aarch64 macOS (Metal tests needing a device skip without one; a guard test
 still fails if the kernels do not compile). Clippy runs on x86_64 Linux and
 aarch64 macOS; everything else on x86_64 Linux only. `all-checks-passed`

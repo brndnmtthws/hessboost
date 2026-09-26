@@ -1,0 +1,8 @@
+# Loaded in CI only (MISE_ENV=ci in .github/workflows/).
+[env]
+# rustup keeps toolchains in $RUSTUP_HOME, outside mise's data directory,
+# and mise's `rust` install is only a link to rustup's proxies. mise-action
+# caches just the data directory, so without this a cache hit restored the
+# link but not the toolchain behind it. Inside the data directory the
+# toolchains (fuzz/mise.toml's nightly included) are cached with the rest.
+RUSTUP_HOME = "{{env.HOME}}/.local/share/mise/rustup"

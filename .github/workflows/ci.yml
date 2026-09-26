@@ -14,6 +14,7 @@ permissions:
   contents: read
 
 env:
+  MISE_ENV: ci
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -21,10 +22,14 @@ env:
 # Toolchain and tool versions (rust, mbx, nextest, uv) come from mise.toml,
 # pinned by mise.lock. mise-action runs before mr-boxington-action so the
 # cache key sees the pinned rustc, and the cache action reuses the mbx that
-# mise put on PATH. mise's own cache is off: it would restore the rust
-# install symlink without rustup's toolchain. Both actions authenticate their
-# GitHub downloads with the job's token by default (mise-action exports it as
-# MISE_GITHUB_TOKEN for later mise calls), so they are not rate limited.
+# mise put on PATH. mise-action caches mise's data directory (the mise
+# binary and every tool) per runner image and config hash, so a warm job
+# downloads nothing; MISE_ENV=ci loads mise.ci.toml, which moves rustup's
+# toolchains into that directory. Jobs whose tool set differs (msrv, fuzz)
+# get their own cache_key_prefix: jobs sharing a key would save whichever
+# set finished first. Both actions authenticate their GitHub downloads with
+# the job's token by default (mise-action exports it as MISE_GITHUB_TOKEN
+# for later mise calls), so they are not rate limited.
 
 jobs:
   fmt:
@@ -35,8 +40,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
       - run: cargo fmt --all --check
       - run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
 
@@ -56,8 +59,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: clippy-${{ matrix.name }}
@@ -79,8 +80,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: test
@@ -98,8 +97,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: docs
@@ -117,7 +114,8 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@v4
         with:
-          cache: false
+          # Different tools from the other jobs' (same config files).
+          cache_key_prefix: mise-v1-msrv
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: msrv
@@ -131,8 +129,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: parity
@@ -151,8 +147,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: semver
@@ -175,7 +169,7 @@ jobs:
       # `mise exec` there selects them and routes cargo through mbx.
       - uses: jdx/mise-action@v4
         with:
-          cache: false
+          cache_key_prefix: mise-v1-fuzz
           working_directory: fuzz
       - uses: jdx/mr-boxington-action@v1
         with:

@@ -30,6 +30,11 @@ version = "0.9.146"
 backend = "cargo:cargo-nextest"
 specifiers = ["0.9.146"]
 
+[[tools."cargo:cargo-semver-checks"]]
+version = "0.50.0"
+backend = "cargo:cargo-semver-checks"
+specifiers = ["0.50.0"]
+
 [[tools.mr-boxington]]
 version = "1.16.0"
 backend = "packslip:github.com/jdx/mr-boxington"

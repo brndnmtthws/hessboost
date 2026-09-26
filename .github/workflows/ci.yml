@@ -143,6 +143,23 @@ jobs:
       - name: Export parity (reload in XGBoost)
         run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 
+  semver:
+    name: semver compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+        with:
+          cache: false
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: semver
+      # Compares the public API against the latest crates.io release; fails
+      # when Cargo.toml's version is too small a bump for the changes.
+      - run: mbx semver-checks --verbose
+
   fuzz:
     name: fuzz (smoke)
     runs-on: ubuntu-latest
@@ -179,7 +196,7 @@ jobs:
 
   all-checks-passed:
     permissions: {}
-    needs: [fmt, clippy, test, docs, msrv, parity, fuzz]
+    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run on upstream failure too (so branch protection sees a failure), but

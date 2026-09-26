@@ -50,7 +50,8 @@
 //! - [`training`]: [`train`], [`Trainer`], [`cv`](training::cv),
 //!   [`training::budget`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
-//!   native and XGBoost JSON/UBJSON); [`model::compact`].
+//!   native and XGBoost JSON/UBJSON, LightGBM text import);
+//!   [`model::compact`].
 //! - [`objective`]: the `Objective` trait, the built-in objectives,
 //!   `CustomObjective`, [`objective::distributional`] (`dist:*` objectives).
 //! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
@@ -95,7 +96,10 @@
 //!   ([`predict_contribs`](model::BoostedModel::predict_contribs) /
 //!   [`predict_interactions`](model::BoostedModel::predict_interactions)).
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON, XGBoost JSON and
-//!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)).
+//!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)),
+//!   LightGBM 4.x text model import
+//!   ([`from_lightgbm_text`](model::BoostedModel::from_lightgbm_text); see
+//!   [LightGBM import](model#lightgbm-import)).
 //! - **Validation:** cross-validation ([`cv`](training::cv)), custom,
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
 //!   (timestamped rows, purged by each label window,

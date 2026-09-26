@@ -148,13 +148,16 @@ it.
 | Method | Formats |
 |---|---|
 | `save_model(path, format=None)` | by extension: `.json` native JSON, `.ubj` XGBoost UBJSON, anything else native binary; or `format="binary" \| "json" \| "xgboost-json" \| "xgboost-ubjson"` |
-| `Booster(path_or_bytes)`, `load_model(...)` | any of the four, detected from the content |
+| `Booster(path_or_bytes)`, `load_model(...)` | any of the four, or a LightGBM 4.x text model (`format="lightgbm"`, import only), detected from the content |
 | `save_raw(format="binary")` | the same formats as bytes |
 | `pickle` / `copy` | native binary plus feature names, categories, and `best_score` |
 
 The native binary format is compressed, checksummed, and lossless; files
 written by 0.2.0 or later load in every later release. Use
-`format="xgboost-json"` or `.ubj` for a file XGBoost loads. `booster[a:b]`
+`format="xgboost-json"` or `.ubj` for a file XGBoost loads. A LightGBM
+model (`lightgbm.Booster.save_model`) predicts LightGBM's values for
+missing values as `NaN` and categorical features as non-negative codes;
+models with no exact equivalent raise `ModelFormatError`. `booster[a:b]`
 slices boosting iterations.
 
 ## Beyond XGBoost

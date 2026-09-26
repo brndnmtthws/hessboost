@@ -19,6 +19,8 @@ enum Format {
     Json,
     XgboostJson,
     XgboostUbjson,
+    /// LightGBM 4.x text models (import only).
+    Lightgbm,
 }
 
 impl Format {
@@ -28,10 +30,11 @@ impl Format {
             "json" => Self::Json,
             "xgboost-json" => Self::XgboostJson,
             "xgboost-ubjson" => Self::XgboostUbjson,
+            "lightgbm" => Self::Lightgbm,
             other => {
                 return Err(PyValueError::new_err(format!(
                     "unknown model format {other:?}; expected \"binary\", \"json\", \
-                     \"xgboost-json\" or \"xgboost-ubjson\""
+                     \"xgboost-json\", \"xgboost-ubjson\" or (to load) \"lightgbm\""
                 )));
             }
         })
@@ -39,13 +42,16 @@ impl Format {
 
     /// The format of `bytes`: a JSON document (`{` then `"` or `}`) is
     /// XGBoost's when it has a `learner` key, else native; any other `{` is
-    /// UBJSON (whose keys start with a length marker); everything else is
-    /// native binary.
+    /// UBJSON (whose keys start with a length marker); a first line `tree`
+    /// is a LightGBM text model; everything else is native binary.
     fn detect(bytes: &[u8]) -> Self {
-        let mut rest = bytes
-            .iter()
-            .skip_while(|byte| byte.is_ascii_whitespace())
-            .copied();
+        let text = bytes.trim_ascii_start();
+        if let Some(rest) = text.strip_prefix(b"tree")
+            && matches!(rest.first(), Some(b'\n' | b'\r'))
+        {
+            return Self::Lightgbm;
+        }
+        let mut rest = text.iter().copied();
         if rest.next() != Some(b'{') {
             return Self::Binary;
         }
@@ -64,7 +70,7 @@ impl Format {
 
 fn utf8(bytes: &[u8]) -> hessboost::error::Result<&str> {
     std::str::from_utf8(bytes).map_err(|error| {
-        hessboost::error::HessboostError::model_format(format!("JSON model is not UTF-8: {error}"))
+        hessboost::error::HessboostError::model_format(format!("text model is not UTF-8: {error}"))
     })
 }
 
@@ -119,6 +125,7 @@ impl Booster {
                 Format::Json => BoostedModel::from_json(utf8(data)?),
                 Format::XgboostJson => BoostedModel::from_xgboost_json(utf8(data)?),
                 Format::XgboostUbjson => BoostedModel::from_xgboost_ubjson(data),
+                Format::Lightgbm => BoostedModel::from_lightgbm_text(utf8(data)?),
             })
             .or_raise()?;
         Ok(Self::new(model))
@@ -133,6 +140,10 @@ impl Booster {
                 Format::Json => self.model.to_json().map(String::into_bytes),
                 Format::XgboostJson => self.model.to_xgboost_json().map(String::into_bytes),
                 Format::XgboostUbjson => self.model.to_xgboost_ubjson(),
+                Format::Lightgbm => Err(hessboost::error::HessboostError::invalid_param(
+                    "format",
+                    "\"lightgbm\" is an import-only format: LightGBM models load, but do not save",
+                )),
             })
             .or_raise()?;
         Ok(PyBytes::new(py, &bytes))

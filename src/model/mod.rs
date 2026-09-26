@@ -40,9 +40,98 @@
 //!   and the `_xgboost_ubjson` counterparts ([`to_xgboost_ubjson`],
 //!   [`from_xgboost_ubjson`], [`save_xgboost_ubjson`],
 //!   [`load_xgboost_ubjson`]); see [XGBoost interchange](#xgboost-interchange).
+//! - **LightGBM import:** [`BoostedModel::from_lightgbm_text`] /
+//!   [`BoostedModel::load_lightgbm_text`] read LightGBM 4.x text models
+//!   (`model.txt`); see [LightGBM import](#lightgbm-import).
 //! - **Compact:** [`BoostedModel::to_compact`] builds a bit-packed
 //!   [`CompactModel`](compact::CompactModel) predicting bit-identical margins
 //!   in a fraction of the size; see [`compact`].
+//!
+//! # LightGBM import
+//!
+//! [`BoostedModel::from_lightgbm_text`] reads the text model LightGBM 4.x
+//! writes with `Booster.save_model` / `model_to_string` (format `v4`).
+//! The imported model predicts, explains ([`predict_contribs`] matches
+//! LightGBM's `pred_contrib`), slices, and saves natively like any other,
+//! and exports to XGBoost JSON/UBJSON unless it has linear leaves. Import
+//! only: there is no LightGBM export. LightGBM's `dump_model` JSON is not
+//! read: LightGBM cannot load it itself (the text model is its interchange
+//! format, which every booster writes), and its nesting follows tree depth,
+//! which deep trees take past `serde_json`'s recursion limit.
+//!
+//! Predictions are LightGBM's for **dense inputs with missing values as
+//! `NaN`** and **categorical values as non-negative codes** (what
+//! [`DMatrix::with_feature_types`](crate::data::DMatrix::with_feature_types)
+//! accepts). hessboost reads absent sparse entries as missing where
+//! LightGBM reads them as `0`, and reads a categorical value below 0 as
+//! category 0 where LightGBM sends it right like `NaN`: pass `NaN` for
+//! LightGBM's negative "missing" categories. LightGBM's dense-matrix
+//! prediction also zeroes inputs with `|x| <= 1e-35` before the trees, while
+//! the import follows the trees' own rule (as LightGBM's CSR path does);
+//! the two differ only for such inputs at a split whose threshold lies in
+//! that band. Leaf values are rounded to `f32` and summed in `f32`
+//! (LightGBM: `f64`); the parity fixtures agree within `1e-5` relative.
+//!
+//! ## Mapping
+//!
+//! - **Layout:** tree `t` is iteration `t / num_tree_per_iteration`, output
+//!   `t % num_tree_per_iteration`, hessboost's layout with one tree per
+//!   output. `init_score` / `boost_from_average` live in the first trees,
+//!   so the intercepts are 0. LightGBM's internal node `i` is node `i`, its
+//!   leaf `j` node `num_leaves - 1 + j` ([`predict_leaf`] reports node ids).
+//!   Covers (`sum_hess`) are the node data counts LightGBM's TreeSHAP
+//!   weighs paths by; gains are `split_gain`.
+//! - **Numeric splits:** LightGBM sends `x <= threshold` left, comparing the
+//!   `f64` threshold with the input widened to `f64`. For every `f32` `x`
+//!   that holds exactly when `x < c`, where `c` is the smallest `f32` above
+//!   the threshold, so `c` becomes the split condition. A threshold at or
+//!   above `f32::MAX` (LightGBM writes `inf` for "all values") sends every
+//!   finite value left, which no finite `c` does: the node's children swap
+//!   and `c = -f32::MAX` sends every finite value to the former left child
+//!   (hessboost's matrices hold no infinities).
+//! - **Missing types:** `None` (`NaN` read as `0`): missing values go where
+//!   `0` goes. `NaN`: missing values take the default direction. `Zero`:
+//!   missing values and `|x| <= 1e-35` take the default direction, which one
+//!   threshold expresses only when that band borders the half-line on the
+//!   default side (zeros left with a threshold at or above `-1e-35`, or
+//!   right with one at or below `1e-35`); such splits map with the band
+//!   folded into `c`, and any other `zero_as_missing` split is refused.
+//! - **Categorical splits:** the `cat_threshold` bitset becomes the left
+//!   category set; `NaN` goes right, and like LightGBM a value's integer
+//!   part is looked up. Each split must own its bitset, as LightGBM writes
+//!   them, and categories must stay below `2^31`.
+//! - **Linear leaves** (`linear_tree`): `leaf_const`, `leaf_features` and
+//!   `leaf_coeff` become the tree's [`LinearLeaves`](crate::tree::LinearLeaves),
+//!   in `f64`; a row with a `NaN` feature of the leaf's model gets the
+//!   leaf's constant value, LightGBM's rule. As in LightGBM, such models
+//!   have no SHAP values.
+//! - **Objectives** map by prediction transform (the loss also sets what
+//!   continued training in hessboost optimizes; objective parameters come
+//!   from the file's `parameters:` section, else LightGBM's defaults):
+//!
+//! |LightGBM|hessboost|transform|
+//! |---|---|---|
+//! |`regression`, `fair`|`reg:squarederror`|identity|
+//! |`regression_l1`, `mape`|`reg:absoluteerror`|identity|
+//! |`huber` (`alpha` as `huber_slope`)|`reg:pseudohubererror`|identity|
+//! |`quantile` (`alpha`)|`reg:quantileerror`|identity|
+//! |`poisson` (`poisson_max_delta_step`)|`count:poisson`|`exp`|
+//! |`gamma`|`reg:gamma`|`exp`|
+//! |`tweedie` (`tweedie_variance_power`)|`reg:tweedie`|`exp`|
+//! |`binary` with `sigmoid:1`|`binary:logistic`|sigmoid|
+//! |`cross_entropy`|`reg:logistic`|sigmoid|
+//! |`multiclass`|`multi:softprob`|softmax|
+//! |`multiclassova` with `sigmoid:1`|`binary:logistic` over `num_class` targets|sigmoid per class|
+//! |`lambdarank`, `rank_xendcg`|`rank:ndcg`|identity|
+//!
+//! Refused with a [`HessboostError::ModelFormat`] naming the reason:
+//! `sigmoid` other than 1 (`binary`, `multiclassova`), `reg_sqrt`,
+//! `cross_entropy_lambda` (`log(1 + exp(x))`), models without an objective
+//! (custom objectives), random forests (`average_output`: LightGBM averages
+//! their trees in predictions but sums them in raw scores and SHAP), the
+//! `zero_as_missing` splits above, versions other than `v4`, and anything
+//! malformed or unknown (header or tree keys, decision-type bits, child
+//! references, `tree_sizes` that disagree with the tree blocks).
 //!
 //! # XGBoost interchange
 //!
@@ -214,6 +303,7 @@
 //! [`load_xgboost_ubjson`]: BoostedModel::load_xgboost_ubjson
 
 pub mod compact;
+mod lightgbm;
 mod native;
 mod sections;
 mod shap;
@@ -437,7 +527,7 @@ struct AttributionPrologue<'a> {
 }
 
 /// The metadata a model is assembled with: what it predicts and how its trees
-/// are laid out. Shared by training and the XGBoost-JSON importer.
+/// are laid out. Shared by training and the XGBoost and LightGBM importers.
 pub(crate) struct ModelSpec {
     /// The objective's XGBoost name (`Objective::name`).
     pub(crate) objective: String,
@@ -556,8 +646,8 @@ impl BoostedModel {
         self.best_iteration = it;
     }
 
-    /// Reassemble a model from its constituent parts. Used by the XGBoost-JSON
-    /// importer, which builds trees and metadata externally. `tree_weights`
+    /// Reassemble a model from its constituent parts. Used by the XGBoost and
+    /// LightGBM importers, which build trees and metadata externally. `tree_weights`
     /// is either empty (every tree weighs `1.0`) or holds one DART weight per
     /// tree; [`BoostedModel::validate_structure`] enforces the length.
     pub(crate) fn from_parts(
@@ -1534,6 +1624,23 @@ impl BoostedModel {
     /// Load a model from a file written in XGBoost's UBJSON model format.
     pub fn load_xgboost_ubjson(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Self::from_xgboost_ubjson(&std::fs::read(path)?)
+    }
+
+    /// Parse a LightGBM 4.x text model: the file `booster.save_model("model.txt")`
+    /// writes, or `booster.model_to_string()`. The model predicts, explains,
+    /// slices, and saves like any other; see
+    /// [LightGBM import](crate::model#lightgbm-import) for the mapping, the
+    /// input conventions it assumes (missing values as `NaN`, categories as
+    /// non-negative codes), and the models it refuses with a
+    /// [`HessboostError::ModelFormat`].
+    pub fn from_lightgbm_text(text: &str) -> Result<Self> {
+        crate::model::lightgbm::import_lightgbm_text(text)
+    }
+
+    /// Load a LightGBM 4.x text model file (`booster.save_model("model.txt")`);
+    /// see [`BoostedModel::from_lightgbm_text`].
+    pub fn load_lightgbm_text(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_lightgbm_text(&std::fs::read_to_string(path)?)
     }
 
     /// The objective the model was trained with, rebuilt from its name,

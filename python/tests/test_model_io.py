@@ -4,6 +4,7 @@ copying, slicing, and prediction layouts (SHAP, leaves)."""
 from __future__ import annotations
 
 import copy
+import json
 import pickle
 from pathlib import Path
 
@@ -234,3 +235,25 @@ def test_feature_importance(trained: tuple[Booster, np.ndarray]) -> None:
     assert set(unnamed.get_score()) <= {"f0", "f1", "f2", "f3", "f4"}
     with pytest.raises(ValueError, match="importance_type"):
         booster.get_score("split")  # type: ignore[arg-type]
+
+
+def test_lightgbm_text_models_load_and_predict_lightgbms_values() -> None:
+    root = saved_models_dir().parent
+    for name in ("lightgbm-4.7.0-binary", "lightgbm-4.7.0-linear"):
+        expected = json.loads((root / f"{name}.expected.json").read_text())
+        x = np.array([np.nan if v is None else v for v in expected["x_test"]], dtype=np.float32)
+        x = x.reshape(-1, expected["n_cols"])
+        path = root / f"{name}.txt"
+        for booster in (Booster(str(path)), Booster(path.read_bytes())):
+            margin = booster.predict(x, output_margin=True).reshape(-1)
+            np.testing.assert_allclose(margin, expected["raw"], rtol=1e-5, atol=1e-5)
+            pred = booster.predict(x).reshape(-1)
+            np.testing.assert_allclose(pred, expected["pred"], rtol=1e-5, atol=1e-5)
+        explicit = Booster()
+        explicit.load_model(path, format="lightgbm")
+        assert explicit.save_raw() == booster.save_raw()
+    with pytest.raises(HessboostError, match="import-only"):
+        booster.save_raw("lightgbm")  # type: ignore[arg-type]
+    refused = path.read_text().replace("version=v4", "version=v3", 1)
+    with pytest.raises(ModelFormatError, match="LightGBM model: model version"):
+        Booster(refused.encode())

@@ -1922,10 +1922,12 @@ pub(super) fn iteration_row_subsets(
     } else {
         params.num_parallel_tree
     };
+    let group_ranges = params
+        .bagging_by_query
+        .then(|| group.map_or_else(|| vec![(0, n)], |groups| groups.iter_ranges().collect()));
     (0..draws)
         .map(|_| {
-            if params.bagging_by_query {
-                let ranges = group.map_or_else(|| vec![(0, n)], |g| g.iter_ranges().collect());
+            if let Some(ranges) = &group_ranges {
                 let queries = sample_rows(ranges.len(), params, rng);
                 queries
                     .into_iter()
@@ -1991,8 +1993,8 @@ pub(super) fn gradient_sampling(params: &TrainingParams) -> bool {
 }
 
 /// Shape and metadata checks for the training matrix and every eval set,
-///
-/// [`validate_info`]: crate::objective::Objective::validate_info
+/// followed by the objective's own [`validate_info`] label-domain checks.
+/// [`validate_info`]: `crate::objective::Objective::validate_info`
 pub(crate) fn validate_dataset(
     objective: &dyn crate::objective::Objective,
     data: &DMatrix,

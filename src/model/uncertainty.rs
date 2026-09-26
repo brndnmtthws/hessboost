@@ -127,6 +127,9 @@ impl VirtualEnsembles {
     /// Member `m`'s predictions in [`BoostedModel::predict`]'s layout
     /// (`n_rows * width`), or `None` past the last member.
     pub fn member_predictions(&self, m: usize) -> Option<&[f32]> {
+        if m >= self.n_members() {
+            return None;
+        }
         let len = self.n_rows * self.width;
         self.predictions.get(m * len..(m + 1) * len)
     }
@@ -134,6 +137,9 @@ impl VirtualEnsembles {
     /// Member `m`'s raw margins in [`BoostedModel::predict_margin`]'s layout
     /// (`n_rows * n_outputs`), or `None` past the last member.
     pub fn member_margins(&self, m: usize) -> Option<&[f32]> {
+        if m >= self.n_members() {
+            return None;
+        }
         let len = self.n_rows * self.n_outputs;
         self.margins.get(m * len..(m + 1) * len)
     }
@@ -247,7 +253,7 @@ impl BoostedModel {
                 format!(
                     "{count} virtual ensembles need a model of at least {} iterations, this one \
                      has {end}",
-                    2 * count
+                    count.saturating_mul(2)
                 ),
             ));
         }

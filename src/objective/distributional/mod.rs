@@ -124,7 +124,6 @@ mod special;
 use serde::{Deserialize, Serialize};
 
 use super::{GradPair, Loss, MIN_HESS, SplitGradient, check_label_domain};
-use crate::config::{DistGradient, DistSplitDirection};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use crate::rng::splitmix64;
@@ -133,6 +132,115 @@ use special::{
     ln_gamma_prefactor, ln_gamma_ratio, ln_norm_cdf, log_gap, norm_cdf, norm_pdf, norm_ppf,
     trigamma_minus_inv,
 };
+
+/// The second-order statistic the `dist:*` distributional objectives give
+/// the trees (beyond XGBoost; see [`crate::objective::distributional`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum DistGradient {
+    /// Gradient of the negative log-likelihood with the diagonal Fisher
+    /// information as Hessian (Fisher scoring; a natural-gradient Newton
+    /// step for the orthogonal parameterizations used).
+    #[default]
+    Fisher,
+    /// Gradient with the diagonal of the exact (observed) Hessian, floored
+    /// at `1e-16` (XGBoostLSS-style).
+    Hessian,
+    /// NGBoost's natural gradient `I⁻¹ ∇` with unit Hessian: trees regress
+    /// the natural gradient by least squares.
+    Natural,
+}
+
+/// How the shared tree of a `dist:*` objective chooses its structure under
+/// `multi_strategy = multi_output_tree` (beyond XGBoost; see
+/// [`crate::objective::distributional`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum DistSplitDirection {
+    /// Parallel gradient boosting (Chapelle et al., 2026, Algorithm 1): each
+    /// round grows the structure from the gradients of one distribution
+    /// parameter drawn uniformly at random (seeded by `seed` and the
+    /// iteration), a canonical descent direction `e_m`.
+    #[default]
+    Random,
+    /// Parallel gradient boosting with a deterministic sweep: parameter
+    /// `iteration mod n_params` drives round `iteration`.
+    Cyclic,
+    /// Plain vector-leaf trees: the split gain sums over every parameter.
+    All,
+}
+
+stored_names! {
+    DistGradient { Fisher => "fisher", Hessian => "hessian", Natural => "natural" }
+    DistSplitDirection { Random => "random", Cyclic => "cyclic", All => "all" }
+}
+
+/// A `dist:*` objective: the distribution family whose parameters the model
+/// predicts, the second-order statistic its trees see, and, for shared
+/// (vector-leaf) trees, how their structure is chosen.
+///
+/// ```
+/// use hessboost::objective::distributional::{
+///     DistFamily, DistGradient, DistSplitDirection, Distributional,
+/// };
+///
+/// let normal = Distributional::new(DistFamily::Normal)
+///     .with_gradient(DistGradient::Natural)
+///     .with_split_direction(DistSplitDirection::Cyclic);
+/// assert_eq!(normal.split_direction(), Some(DistSplitDirection::Cyclic));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Distributional {
+    family: DistFamily,
+    gradient: DistGradient,
+    split_direction: Option<DistSplitDirection>,
+}
+
+impl Distributional {
+    /// The objective `dist:<family>` with Fisher scoring and, for shared
+    /// trees, the default random split direction.
+    pub fn new(family: DistFamily) -> Self {
+        Distributional {
+            family,
+            gradient: DistGradient::Fisher,
+            split_direction: None,
+        }
+    }
+
+    /// Give the trees `gradient`'s second-order statistic (default
+    /// [`DistGradient::Fisher`]).
+    #[must_use]
+    pub fn with_gradient(mut self, gradient: DistGradient) -> Self {
+        self.gradient = gradient;
+        self
+    }
+
+    /// Choose the structure of shared (vector-leaf) trees by `direction`
+    /// (default [`DistSplitDirection::Random`]). Only shared trees have one:
+    /// training refuses it without `multi_strategy = multi_output_tree`.
+    #[must_use]
+    pub fn with_split_direction(mut self, direction: DistSplitDirection) -> Self {
+        self.split_direction = Some(direction);
+        self
+    }
+
+    /// The distribution family.
+    pub fn family(&self) -> DistFamily {
+        self.family
+    }
+
+    /// The trees' second-order statistic.
+    pub fn gradient(&self) -> DistGradient {
+        self.gradient
+    }
+
+    /// The shared-tree split direction, `None` for the default (random).
+    pub fn split_direction(&self) -> Option<DistSplitDirection> {
+        self.split_direction
+    }
+}
 
 /// Bound on log-link margins: `ln` of a positive parameter is clamped to
 /// `[-LOG_LINK_BOUND, LOG_LINK_BOUND]` before the link is applied.

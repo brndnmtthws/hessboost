@@ -4,11 +4,40 @@
 //! Every objective trains through a [`Loss`]. Boosting works in *margin*
 //! space (raw additive scores). The [`Loss::pred_transform`] maps margins to
 //! the reported prediction (e.g. the logistic sigmoid). This mirrors
-//! XGBoost's separation of `GetGradient` / `PredTransform`. The built-in
-//! losses are built from a configuration by [`create_objective`]; their
-//! parameters ([`PseudoHuber`], [`Quantiles`], [`Expectiles`], [`Tweedie`],
-//! [`Aft`]) are validated when constructed and shared with the metrics
-//! that read them.
+//! XGBoost's separation of `GetGradient` / `PredTransform`.
+//!
+//! A configuration names its objective with [`Objective`]: a built-in
+//! XGBoost objective with its parameters ([`Logistic`], [`Multiclass`],
+//! [`PseudoHuber`], [`Quantiles`], [`Expectiles`], [`Tweedie`],
+//! [`LambdaRank`], [`Aft`], [`distributional::Distributional`]; each
+//! validated when constructed, several shared with the metrics that read
+//! them), or [`Objective::Custom`] with any [`Loss`] such as
+//! [`CustomLoss`].
+//! [`TrainingParams::loss`](crate::config::TrainingParams::loss) builds the
+//! loss a configuration trains with.
+
+/// Stable names of the enums a model file stores, matching their serde
+/// (and XGBoost) spellings. Defined before the submodules so they can use it.
+macro_rules! stored_names {
+    ($($ty:ident { $($variant:ident => $name:literal),+ $(,)? })+) => {$(
+        impl $ty {
+            /// The variant's stored name.
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $($ty::$variant => $name,)+
+                }
+            }
+
+            /// The variant stored as `name`, if any.
+            pub(crate) fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some($ty::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    )+};
+}
 
 mod absolute;
 mod classification;
@@ -21,17 +50,23 @@ mod params;
 mod quantile;
 mod ranking;
 mod regression;
+mod spec;
 mod survival;
 
 pub(crate) use absolute::AbsoluteError;
-pub(crate) use classification::{Hinge, Logistic};
+pub(crate) use classification::{Hinge, LogisticLoss};
 pub(crate) use count::{Gamma, Poisson, TweedieLoss};
 pub use custom::CustomLoss;
 pub(crate) use multiclass::Softmax;
-pub use params::{Aft, Expectiles, PseudoHuber, Quantiles, Tweedie};
+pub use params::{
+    Aft, AftDistribution, Expectiles, LambdaRank, Logistic, Multiclass, PseudoHuber, Quantiles,
+    Tweedie,
+};
 pub(crate) use quantile::{Expectile, Quantile};
 pub(crate) use ranking::LambdaMart;
 pub(crate) use regression::{PseudoHuberLoss, SquaredError, SquaredLogError};
+pub use spec::Objective;
+pub(crate) use spec::{LossContext, ObjectiveParts};
 
 pub(crate) use survival::{AftLoss, Cox};
 
@@ -39,10 +74,8 @@ pub(crate) use survival::{abs_label_order, aft_nloglik};
 
 use rayon::prelude::*;
 
-use crate::config::TrainingParams;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
-use distributional::{DistFamily, DistLoss};
 
 /// A first- and second-order gradient for one instance/output: a fixed
 /// pair, built with [`GradPair::new`] or a struct literal.
@@ -241,8 +274,8 @@ pub(crate) fn check_gradient_inputs(
 /// A differentiable training loss: gradients, Hessians, the prediction
 /// transform, and the intercept estimate of one learning objective. Every
 /// built-in objective is one, and [`CustomLoss`] (or any other
-/// implementation) trains through
-/// [`Trainer::loss`](crate::training::Trainer::loss).
+/// implementation) trains as [`Objective::Custom`] (built with
+/// [`Objective::custom`]).
 ///
 /// Implementors are `Send + Sync` so gradient computation can be parallelized.
 pub trait Loss: Send + Sync {
@@ -512,8 +545,9 @@ pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool)
 
 /// Shared [`Loss::validate_info`] label-width check: reject the dataset
 /// unless it carries the `n_targets` label columns the objective's outputs
-/// are paired with (objectives passed to training directly are not sized
-/// from the dataset, unlike [`create_objective`]'s).
+/// are paired with (custom losses are not sized from the dataset, unlike
+/// the built-in objectives'
+/// [`TrainingParams::loss`](crate::config::TrainingParams::loss)).
 pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()> {
     if info.n_targets != n_targets {
         return Err(HessboostError::invalid_param(
@@ -525,37 +559,6 @@ pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()>
         ));
     }
     Ok(())
-}
-
-/// Objectives XGBoost 3.4.2 trains on a label matrix: elementwise losses whose
-/// output `j` fits label column `j` (`Targets(info) = labels.Shape(1)`).
-const MULTI_TARGET_OBJECTIVES: &[&str] = &[
-    "reg:squarederror",
-    "reg:pseudohubererror",
-    "reg:logistic",
-    "binary:logistic",
-];
-
-/// Fit `n_targets` label columns with `objective`: one per output through
-/// [`multi_target::MultiTarget`] for the objectives in
-/// [`MULTI_TARGET_OBJECTIVES`], unchanged for one column, and an
-/// `invalid parameter "labels"` error for any other objective.
-fn with_targets(objective: Box<dyn Loss>, n_targets: usize) -> Result<Box<dyn Loss>> {
-    if n_targets <= 1 {
-        return Ok(objective);
-    }
-    if MULTI_TARGET_OBJECTIVES.contains(&objective.name()) {
-        return Ok(Box::new(multi_target::MultiTarget::new(
-            objective, n_targets,
-        )));
-    }
-    Err(HessboostError::invalid_param(
-        "labels",
-        format!(
-            "objective `{}` supports one target per row, got {n_targets}",
-            objective.name()
-        ),
-    ))
 }
 
 /// Weighted mean of `labels`, or the plain mean when `weights` is `None`, as
@@ -586,75 +589,11 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
     mean as f32
 }
 
-/// Resolve an objective by name, configured from `params`, for a dataset with
-/// `n_targets` label columns per row.
-///
-/// `reg:squarederror`, `reg:pseudohubererror`, `reg:logistic`,
-/// `binary:logistic`, and `reg:absoluteerror` accept a label matrix and give
-/// one output per label column, as in XGBoost. `reg:quantileerror` /
-/// `reg:expectileerror` produce one output per `quantile_alpha` /
-/// `expectile_alpha` entry and reject an empty, unsorted, or out-of-`[0, 1]`
-/// list. The distributional `dist:*` objectives (beyond XGBoost, see
-/// [`distributional`]) give one output per distribution parameter. Every
-/// other objective models a single target and rejects `n_targets > 1` with
-/// an `invalid parameter "labels"` error.
-pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Loss>> {
-    let objective: Box<dyn Loss> = match params.objective.as_str() {
-        "reg:squarederror" | "reg:linear" => Box::new(SquaredError),
-        "reg:pseudohubererror" => {
-            Box::new(PseudoHuberLoss::new(PseudoHuber::new(params.huber_slope)?))
-        }
-        "binary:logistic" => Box::new(Logistic::new(params.scale_pos_weight as f32)),
-        "binary:logitraw" => Box::new(Logistic::raw(params.scale_pos_weight as f32)),
-        "binary:hinge" => Box::new(Hinge),
-        "reg:squaredlogerror" => Box::new(SquaredLogError),
-        "reg:logistic" => Box::new(Logistic::regression(params.scale_pos_weight as f32)),
-        "multi:softmax" | "multi:softprob" => {
-            if params.num_class < 2 {
-                return Err(HessboostError::invalid_param(
-                    "num_class",
-                    "multiclass objectives require num_class >= 2",
-                ));
-            }
-            let prob = params.objective == "multi:softprob";
-            Box::new(Softmax::new(params.num_class, prob))
-        }
-        "count:poisson" => Box::new(Poisson::new(params.effective_max_delta_step() as f32)),
-        "reg:gamma" => Box::new(Gamma),
-        "reg:tweedie" => Box::new(TweedieLoss::new(Tweedie::new(
-            params.tweedie_variance_power,
-        )?)),
-        "reg:quantileerror" => Box::new(Quantile::new(&params.quantile_alpha)?),
-        "reg:expectileerror" => Box::new(Expectile::new(&params.expectile_alpha)?),
-        "reg:absoluteerror" => return Ok(Box::new(AbsoluteError::new(n_targets))),
-        "rank:pairwise" => Box::new(LambdaMart::pairwise(params.lambdarank_num_pair_per_sample)),
-        "rank:ndcg" => Box::new(LambdaMart::ndcg(params.lambdarank_num_pair_per_sample)),
-        "rank:map" => Box::new(LambdaMart::map(params.lambdarank_num_pair_per_sample)),
-        "survival:cox" => Box::new(Cox),
-        "survival:aft" => Box::new(AftLoss::new(
-            params.aft_loss_distribution,
-            params.aft_loss_distribution_scale as f32,
-        )),
-        other => match DistFamily::from_objective(other) {
-            Some(family) => {
-                let objective = DistLoss::new(family, params.dist_gradient);
-                Box::new(
-                    if params.multi_strategy == crate::config::MultiStrategy::MultiOutputTree {
-                        objective.with_split_direction(params.dist_split_direction, params.seed)
-                    } else {
-                        objective
-                    },
-                )
-            }
-            None => return Err(HessboostError::unknown("objective", other)),
-        },
-    };
-    with_targets(objective, n_targets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TrainingParams;
+    use serde_json::json;
 
     #[test]
     fn weighted_mean_basic() {
@@ -671,7 +610,7 @@ mod tests {
     /// `h = ¼·w`, then sigmoid then logit (XGBoost's Newton fallback).
     #[test]
     fn default_base_margins_is_newton_step_through_link() {
-        let obj = Logistic::new(2.0);
+        let obj = LogisticLoss::new(2.0);
         let labels = [1.0f32, 0.0, 0.0, 0.0];
         let margins = base_margins(&obj, &labels, None);
         assert_eq!(margins.len(), 1);
@@ -727,14 +666,16 @@ mod tests {
 
     #[test]
     fn factory_resolves_known_and_rejects_unknown() {
-        let p = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .build_unchecked();
-        assert_eq!(create_objective(&p, 1).unwrap().name(), "reg:squarederror");
-        let p = TrainingParams::builder()
-            .objective("nope:whatever")
-            .build_unchecked();
-        assert!(create_objective(&p, 1).is_err());
+        let p = TrainingParams::from_xgboost([("objective", json!("reg:squarederror"))]).unwrap();
+        assert_eq!(p.loss(1).unwrap().name(), "reg:squarederror");
+        assert!(TrainingParams::from_xgboost([("objective", json!("nope:whatever"))]).is_err());
+    }
+
+    /// The params with objective `objective`.
+    fn with_objective(objective: Objective) -> TrainingParams {
+        TrainingParams::builder()
+            .objective(objective)
+            .build_unchecked()
     }
 
     /// Only XGBoost's elementwise multi-target objectives (and
@@ -752,26 +693,22 @@ mod tests {
             "reg:logistic",
             "reg:absoluteerror",
         ] {
-            let p = TrainingParams::builder().objective(name).build_unchecked();
-            assert_eq!(create_objective(&p, 3).unwrap().n_outputs(), 3, "{name}");
+            let p = TrainingParams::from_xgboost([("objective", json!(name))]).unwrap();
+            assert_eq!(p.loss(3).unwrap().n_outputs(), 3, "{name}");
         }
-        for name in [
-            "multi:softprob",
-            "count:poisson",
-            "reg:gamma",
-            "reg:tweedie",
-            "reg:quantileerror",
-            "reg:expectileerror",
-            "rank:ndcg",
+        for objective in [
+            Objective::Softprob(Multiclass::new(3).unwrap()),
+            Objective::Poisson,
+            Objective::Gamma,
+            Objective::Tweedie(Tweedie::default()),
+            Objective::Quantile(Quantiles::new([0.5]).unwrap()),
+            Objective::Expectile(Expectiles::new([0.5]).unwrap()),
+            Objective::RankNdcg(LambdaRank::default()),
         ] {
-            let p = TrainingParams::builder()
-                .objective(name)
-                .num_class(3)
-                .quantile_alpha(vec![0.5])
-                .expectile_alpha(vec![0.5])
-                .build_unchecked();
-            assert!(create_objective(&p, 1).is_ok(), "{name}");
-            match create_objective(&p, 2) {
+            let name = objective.name().to_owned();
+            let p = with_objective(objective);
+            assert!(p.loss(1).is_ok(), "{name}");
+            match p.loss(2) {
                 Err(HessboostError::InvalidParameter { name: param, .. }) => {
                     assert_eq!(param, "labels", "{name}");
                 }
@@ -789,18 +726,17 @@ mod tests {
             ("reg:quantileerror", "quantile_alpha"),
             ("reg:expectileerror", "expectile_alpha"),
         ] {
-            let p = TrainingParams::builder().objective(name).build_unchecked();
-            match create_objective(&p, 1) {
+            match TrainingParams::from_xgboost([("objective", json!(name))]) {
                 Err(HessboostError::InvalidParameter { name: got, .. }) => assert_eq!(got, param),
                 Err(other) => panic!("{name}: unexpected error {other}"),
                 Ok(_) => panic!("{name}: accepted an empty alpha list"),
             }
-            let p = TrainingParams::builder()
-                .objective(name)
-                .quantile_alpha(vec![0.1, 0.5, 0.9])
-                .expectile_alpha(vec![0.1, 0.5, 0.9])
-                .build_unchecked();
-            assert_eq!(create_objective(&p, 1).unwrap().n_outputs(), 3, "{name}");
+            let p = TrainingParams::from_xgboost([
+                ("objective", json!(name)),
+                (param, json!([0.1, 0.5, 0.9])),
+            ])
+            .unwrap();
+            assert_eq!(p.loss(1).unwrap().n_outputs(), 3, "{name}");
         }
     }
 
@@ -818,7 +754,7 @@ mod tests {
         let objectives: Vec<(Box<dyn Loss>, usize, Vec<usize>)> = vec![
             (Box::new(SquaredError), 1, vec![2 * c + 4097]),
             (
-                Box::new(Logistic::new(1.5)),
+                Box::new(LogisticLoss::new(1.5)),
                 1,
                 (1..=15).map(|r| 2 * c + r).collect(),
             ),

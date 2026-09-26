@@ -1,8 +1,9 @@
 //! User-defined loss hook.
 //!
-//! Wraps caller-supplied closures so any custom loss can drive training via
-//! [`crate::training::Trainer`]. The gradient closure receives raw
-//! margins and writes gradient/Hessian pairs, matching the built-in losses.
+//! Wraps caller-supplied closures so any custom loss can drive training as
+//! [`Objective::Custom`](super::Objective::Custom). The gradient closure
+//! receives raw margins and writes gradient/Hessian pairs, matching the
+//! built-in losses.
 
 use super::{GradPair, Loss, SplitGradient};
 use crate::metric::EvalMetric;

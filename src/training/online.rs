@@ -58,12 +58,12 @@
 //! they would change with any added or deleted row), no monotone or
 //! interaction constraints, none of the beyond-XGBoost split options
 //! (`extra_trees`, `path_smooth`, `linear_tree`, quantized gradients, reuse
-//! penalties), CPU, and an objective whose gradients are per row and whose
-//! leaves are plain Newton steps (not ranking, `survival:cox`,
-//! `reg:absoluteerror`, or `reg:quantileerror`). The data may not carry
-//! weights, base margins, groups, label bounds, or feature weights, and
-//! the approximate mode needs numerical features. Everything else is
-//! refused.
+//! penalties), CPU, and a built-in objective whose gradients are per row
+//! and whose leaves are plain Newton steps (not ranking, `survival:cox`,
+//! `reg:absoluteerror`, `reg:quantileerror`, or a custom loss). The data
+//! may not carry weights, base margins, groups, label bounds, or feature
+//! weights, and the approximate mode needs numerical features. Everything
+//! else is refused.
 //!
 //! # Memory
 //!
@@ -127,7 +127,7 @@ use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::objective::{GradPair, Loss, create_objective};
+use crate::objective::{GradPair, Loss, Objective};
 use crate::tree::builder::HistTreeBuilder;
 use crate::tree::builder::online::rank_split;
 use crate::tree::gain::{GradStats, RegParams, calc_weight};
@@ -270,7 +270,7 @@ impl OnlineModel {
             .trees()
             .iter()
             .any(|t| t.nodes().iter().any(|n| n.is_categorical));
-        if model.objective() != params.objective
+        if model.objective().built_in() != Some(&params.objective)
             || model.n_outputs() != 1
             || model.num_parallel_tree() != 1
             || model.n_features() != data.n_cols()
@@ -541,20 +541,39 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
     if params.device != Device::Cpu {
         return refuse("device", "device = cpu");
     }
-    let o = params.objective.as_str();
-    if o.starts_with("rank:")
-        || matches!(
-            o,
-            "survival:cox" | "reg:absoluteerror" | "reg:quantileerror"
-        )
-    {
+    // Exhaustive, so a new objective has to be classified here.
+    let per_row_newton = match &params.objective {
+        Objective::SquaredError
+        | Objective::SquaredLogError
+        | Objective::PseudoHuber(_)
+        | Objective::Expectile(_)
+        | Objective::RegLogistic(_)
+        | Objective::BinaryLogistic(_)
+        | Objective::BinaryLogitRaw(_)
+        | Objective::BinaryHinge
+        | Objective::Softmax(_)
+        | Objective::Softprob(_)
+        | Objective::Poisson
+        | Objective::Gamma
+        | Objective::Tweedie(_)
+        | Objective::Aft(_)
+        | Objective::Dist(_) => true,
+        Objective::AbsoluteError
+        | Objective::Quantile(_)
+        | Objective::RankPairwise(_)
+        | Objective::RankNdcg(_)
+        | Objective::RankMap(_)
+        | Objective::Cox
+        | Objective::Custom(_) => false,
+    };
+    if !per_row_newton {
         return refuse(
             "objective",
-            "per-row gradients and Newton-step leaves (not ranking, survival:cox, \
-             reg:absoluteerror, or reg:quantileerror)",
+            "a built-in objective with per-row gradients and Newton-step leaves (not \
+             ranking, survival:cox, reg:absoluteerror, reg:quantileerror, or a custom loss)",
         );
     }
-    let objective = create_objective(params, 1)?;
+    let objective = params.loss(1)?;
     if objective.n_outputs() != 1 {
         return refuse("objective", "a single-output objective");
     }
@@ -700,7 +719,7 @@ impl Cache {
     fn build(model: &BoostedModel, params: &TrainingParams, data: &DMatrix) -> Result<Self> {
         let cuts = HistCuts::from_dmatrix(data, params.max_bin);
         let ghist = GHistIndex::from_dmatrix(data, cuts.clone());
-        let objective = create_objective(params, 1)?;
+        let objective = params.loss(1)?;
         let mut margins = vec![model.base_scores()[0]; data.n_rows()];
         let mut trees = Vec::with_capacity(model.num_trees());
         for tree in model.trees() {
@@ -764,7 +783,7 @@ impl Incremental<'_> {
             .map(Some)
             .chain(std::iter::repeat_n(None, n_added))
             .collect();
-        let objective = create_objective(self.params, 1)?;
+        let objective = self.params.loss(1)?;
         let reg = RegParams::from_params(self.params);
         let eta = self.params.eta as f32;
         let base = self.model.base_scores()[0];

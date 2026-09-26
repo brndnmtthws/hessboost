@@ -2,7 +2,10 @@
 //! model slicing and iteration-range prediction.
 
 use hessboost::config::{BoosterKind, GrowPolicy, ProcessType, SamplingMethod, TreeMethod};
-use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
+use hessboost::objective::{Multiclass, PseudoHuber};
+use hessboost::prelude::{
+    BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
+};
 use std::ops::Bound;
 
 mod common;
@@ -57,8 +60,7 @@ fn base() -> hessboost::config::TrainingParamsBuilder {
 fn continuing_grows_the_same_trees_as_training_in_one_run() {
     let d = regression(300, 0.0);
     let softprob = base()
-        .objective("multi:softprob")
-        .num_class(3)
+        .objective(Objective::Softprob(Multiclass::new(3).unwrap()))
         .subsample(0.7)
         .colsample_bytree(0.6)
         .num_parallel_tree(2)
@@ -226,7 +228,7 @@ fn continuation_without_an_improving_metric_keeps_the_initial_model() {
     let censored = d
         .with_labels(&times.iter().map(|t| -t).collect::<Vec<_>>())
         .unwrap();
-    let params = base().objective("survival:cox").build().unwrap();
+    let params = base().objective(Objective::Cox).build().unwrap();
     let first = train(&params, &train_set, 4).unwrap();
     let out = Trainer::new(&params, &train_set, 10)
         .init_model(&first)
@@ -246,7 +248,10 @@ fn continuation_without_an_improving_metric_keeps_the_initial_model() {
 fn incompatible_continuations_are_rejected() {
     let d = regression(100, 0.0);
     let first = train(&base().build().unwrap(), &d, 2).unwrap();
-    let objective = base().objective("reg:pseudohubererror").build().unwrap();
+    let objective = base()
+        .objective(Objective::PseudoHuber(PseudoHuber::default()))
+        .build()
+        .unwrap();
     assert_eq!(
         invalid_param(Trainer::new(&objective, &d, 1).init_model(&first).train()),
         "objective"
@@ -442,8 +447,7 @@ fn refresh_refuses_options_it_cannot_apply() {
 fn parallel_trees_form_one_iteration_and_share_the_learning_rate() {
     let d = multiclass(240);
     let forest = base()
-        .objective("multi:softprob")
-        .num_class(3)
+        .objective(Objective::Softprob(Multiclass::new(3).unwrap()))
         .num_parallel_tree(3)
         .build()
         .unwrap();
@@ -454,8 +458,7 @@ fn parallel_trees_form_one_iteration_and_share_the_learning_rate() {
     // carrying a third of the single tree's step.
     let single = train(
         &base()
-            .objective("multi:softprob")
-            .num_class(3)
+            .objective(Objective::Softprob(Multiclass::new(3).unwrap()))
             .build()
             .unwrap(),
         &d,
@@ -481,8 +484,7 @@ fn parallel_trees_form_one_iteration_and_share_the_learning_rate() {
 fn iteration_ranges_select_whole_iterations() {
     let d = multiclass(200);
     let params = base()
-        .objective("multi:softprob")
-        .num_class(3)
+        .objective(Objective::Softprob(Multiclass::new(3).unwrap()))
         .num_parallel_tree(2)
         .build()
         .unwrap();

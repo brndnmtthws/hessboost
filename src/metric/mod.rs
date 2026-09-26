@@ -27,11 +27,10 @@ use quantile::{ExpectileError, QuantileError};
 use ranking::Precision;
 use survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
 
-use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use crate::objective::distributional::DistFamily;
-use crate::objective::{Aft, Expectiles, PseudoHuber, Quantiles, Tweedie};
+use crate::objective::{Aft, AftDistribution, Expectiles, PseudoHuber, Quantiles, Tweedie};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
@@ -1155,21 +1154,6 @@ impl XgboostMetricSource<'_> {
     fn aft(&self) -> Result<Aft> {
         Aft::new(self.aft_loss_distribution, self.aft_loss_distribution_scale)
     }
-
-    /// Whether `metric` has an XGBoost name here: its parameters are the
-    /// ones [`EvalMetric::from_xgboost`] would read from this source.
-    pub(crate) fn expresses(&self, metric: &EvalMetric) -> bool {
-        match metric {
-            EvalMetric::Mphe(huber) => self.huber().is_ok_and(|h| h == *huber),
-            EvalMetric::Quantile(q) => self.quantiles().is_ok_and(|s| s == *q),
-            EvalMetric::Expectile(e) => self.expectiles().is_ok_and(|s| s == *e),
-            EvalMetric::AftNLogLik(aft) => self.aft().is_ok_and(|a| a == *aft),
-            EvalMetric::Nll(family) | EvalMetric::Crps(family) => {
-                self.distribution == Some(*family)
-            }
-            _ => true,
-        }
-    }
 }
 
 /// The parameter error of metric `name`.
@@ -1244,7 +1228,6 @@ mod tests {
     /// query groups (one empty), weights, and label matrices.
     #[test]
     fn parallel_evaluation_matches_serial() {
-        use crate::config::AftDistribution;
         use crate::data::GroupInfo;
         let n = 3 * PARALLEL_SORT_LEN + 17;
         let preds: Vec<f32> = (0..3 * n)
@@ -1394,7 +1377,6 @@ mod tests {
             let metric = EvalMetric::from_xgboost(name, &source).unwrap();
             assert_eq!(metric.name(), name);
             assert_eq!(metric.build(3).unwrap().name(), name);
-            assert!(source.expresses(&metric), "{name}");
         }
         // No suffix is the default power; the name always carries it.
         assert_eq!(
@@ -1653,7 +1635,7 @@ mod tests {
             ..MetaInfo::new(&[], Some(&[1.0]), None)
         };
         let aft = MetaInfo { n_rows: 1, ..aft };
-        let nloglik = AftNLogLik::new(crate::config::AftDistribution::Normal, 1.0);
+        let nloglik = AftNLogLik::new(crate::objective::AftDistribution::Normal, 1.0);
         assert!(nloglik.validate_info(&aft).is_ok());
         assert!(nloglik.eval_info(&[0.0], &aft).is_finite());
     }

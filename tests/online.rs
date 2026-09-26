@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 
 use hessboost::config::{BoosterKind, GrowPolicy};
 use hessboost::data::FeatureType;
+use hessboost::objective::{Logistic, Objective};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
 use hessboost::training::online::{OnlineModel, OnlineParams};
@@ -15,6 +16,10 @@ mod common;
 use common::{invalid_param, lcg, rmse, with_threads};
 
 const COLS: usize = 4;
+
+fn logistic() -> Objective {
+    Objective::BinaryLogistic(Logistic::default())
+}
 
 /// `y = 3 x0 - 2 x1 + x2 x3 + noise`, or its sign for classification.
 fn data(n: usize, seed: u64, binary: bool) -> DMatrix {
@@ -32,7 +37,7 @@ fn data(n: usize, seed: u64, binary: bool) -> DMatrix {
         .unwrap()
 }
 
-fn params(objective: &str) -> TrainingParams {
+fn params(objective: Objective) -> TrainingParams {
     TrainingParams::builder()
         .objective(objective)
         .tree_method(TreeMethod::Hist)
@@ -44,12 +49,14 @@ fn params(objective: &str) -> TrainingParams {
 
 #[test]
 fn exact_updates_equal_retraining_bit_for_bit() {
-    for objective in ["reg:squarederror", "binary:logistic"] {
+    for objective in [Objective::SquaredError, logistic()] {
+        let binary = matches!(objective, Objective::BinaryLogistic(_));
+        let name = objective.name().to_owned();
         let p = params(objective);
-        let train_data = data(400, 1, objective.starts_with("binary"));
+        let train_data = data(400, 1, binary);
         let mut online =
             OnlineModel::train(&p, &train_data, 15, OnlineParams::with_tolerance(0.0)).unwrap();
-        let added = data(30, 2, objective.starts_with("binary"));
+        let added = data(30, 2, binary);
         // Several updates in a row: each equals retraining on the data so far.
         for (additions, deletions) in [
             (Some(&added), vec![0, 7, 399]),
@@ -61,7 +68,7 @@ fn exact_updates_equal_retraining_bit_for_bit() {
             assert_eq!(
                 online.model().to_json().unwrap(),
                 retrained.to_json().unwrap(),
-                "{objective}"
+                "{name}"
             );
         }
         assert_eq!(online.data().n_rows(), 400 - 3 + 30 - 3 + 30);
@@ -70,7 +77,7 @@ fn exact_updates_equal_retraining_bit_for_bit() {
 
 #[test]
 fn approximate_updates_stay_close_to_retraining() {
-    let p = params("reg:squarederror");
+    let p = params(Objective::SquaredError);
     let train_data = data(2000, 3, false);
     let test = data(1000, 4, false);
     let added = data(40, 5, false);
@@ -101,7 +108,7 @@ fn approximate_updates_stay_close_to_retraining() {
 
 #[test]
 fn updates_ignore_the_thread_count() {
-    let p = params("binary:logistic");
+    let p = params(logistic());
     let train_data = data(600, 6, true);
     let added = data(20, 7, true);
     let run = |threads| {
@@ -118,7 +125,7 @@ fn updates_ignore_the_thread_count() {
 
 #[test]
 fn an_interrupted_update_changes_nothing() {
-    let p = params("reg:squarederror");
+    let p = params(Objective::SquaredError);
     let train_data = data(300, 8, false);
     for tolerance in [0.0, 0.1] {
         let mut online =
@@ -157,7 +164,7 @@ fn an_interrupted_update_changes_nothing() {
 /// otherwise slip through.
 #[test]
 fn updates_refuse_labels_retraining_refuses() {
-    let p = params("binary:logistic");
+    let p = params(logistic());
     let train_data = data(300, 10, true);
     let bad = DMatrix::from_dense(&[0.5; COLS], 1, COLS)
         .unwrap()
@@ -221,7 +228,7 @@ fn unsound_configurations_and_changes_are_refused() {
             "num_parallel_tree",
         ),
         (
-            base().objective("reg:absoluteerror").build().unwrap(),
+            base().objective(Objective::AbsoluteError).build().unwrap(),
             "objective",
         ),
     ] {

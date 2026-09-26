@@ -1200,13 +1200,14 @@ fn finalize_interactions(m: &mut [f32], diag: &[f32], width: usize) {
 mod tests {
     use crate::config::{BoosterKind, TrainingParams, TreeMethod};
     use crate::data::{DMatrix, FeatureType};
+    use crate::objective::{Multiclass, Objective};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
 
     /// A `reg:squarederror` model with `eta = 0.3`.
     fn squared_error_model(d: &DMatrix, max_depth: usize, rounds: usize) -> BoostedModel {
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(max_depth)
             .eta(0.3)
             .build()
@@ -1245,8 +1246,7 @@ mod tests {
         }
         let d = labeled_dense(&x, n, nf, &y);
         let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(k)
+            .objective(Objective::Softprob(Multiclass::new(k).unwrap()))
             .max_depth(3)
             .eta(0.3)
             .build()

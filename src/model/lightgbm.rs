@@ -255,7 +255,7 @@ impl<'a> Document<'a> {
             }
             trees.push(TreeFields { values });
         };
-        header.check_tree_sizes(&starts, end_of_trees)?;
+        header.check_tree_sizes(text, &starts, end_of_trees)?;
 
         // Training parameters (only objective parameters are read).
         let mut parameters = HashMap::new();
@@ -347,7 +347,7 @@ impl<'a> Header<'a> {
     /// Check `tree_sizes` (when present) against the tree blocks: LightGBM
     /// seeks each tree by these byte counts, so a file whose blocks
     /// disagree with them is one LightGBM reads differently.
-    fn check_tree_sizes(&self, starts: &[usize], end_of_trees: usize) -> Result<()> {
+    fn check_tree_sizes(&self, text: &str, starts: &[usize], end_of_trees: usize) -> Result<()> {
         let Some(sizes) = self.optional("tree_sizes") else {
             return Ok(());
         };
@@ -357,8 +357,15 @@ impl<'a> Header<'a> {
             match sizes.next().map(str::parse::<usize>) {
                 Some(Ok(size)) if size == end - start => {}
                 Some(Ok(size)) => {
+                    // LightGBM writes `\n` line ends and seeks by these
+                    // counts, so it too refuses a file converted to CRLF.
+                    let crlf = if text.contains("\r\n") {
+                        " (the file has CRLF line ends; LightGBM writes LF)"
+                    } else {
+                        ""
+                    };
                     return Err(format_error(format!(
-                        "tree {i} spans {} bytes but `tree_sizes` records {size}",
+                        "tree {i} spans {} bytes but `tree_sizes` records {size}{crlf}",
                         end - start
                     )));
                 }
@@ -1200,6 +1207,7 @@ mod tests {
                 BINARY.replacen("tree_sizes=782", "tree_sizes=781", 1),
                 "tree_sizes",
             ),
+            (BINARY.replace('\n', "\r\n"), "CRLF"),
             (
                 base[..base.find("end of trees").unwrap()].to_string(),
                 "end of trees",

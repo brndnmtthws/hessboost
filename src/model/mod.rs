@@ -131,7 +131,8 @@
 //! their trees in predictions but sums them in raw scores and SHAP), the
 //! `zero_as_missing` splits above, versions other than `v4`, and anything
 //! malformed or unknown (header or tree keys, decision-type bits, child
-//! references, `tree_sizes` that disagree with the tree blocks).
+//! references, `tree_sizes` that disagree with the tree blocks, as in a
+//! file converted to CRLF line ends, which LightGBM's loader rejects too).
 //!
 //! # XGBoost interchange
 //!

@@ -157,7 +157,9 @@ Beyond XGBoost (opt-in, none changes default training):
 - Boulevard's intervals for `f(x)` are asymptotic and ignore the fit's
   bias: they reach nominal coverage when the leaves are refitted on an
   independent sample (`honest_refit`) and the bias is small, and
-  under-cover otherwise (in 5 dimensions, badly).
+  under-cover otherwise (in 5 dimensions, badly). The variable-importance
+  test inherits this: its size is 10–12% at a nominal 5% in one dimension
+  and far above it in the paper's 3-d setup (see `importance_test`).
 
 ## Not implemented
 

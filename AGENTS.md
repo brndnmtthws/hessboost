@@ -40,15 +40,19 @@ cargo nextest run --test parity --release --run-ignored only --no-capture
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 
-CI (`.github/workflows/ci.yml`) runs these through `mbx` with
+CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 `RUSTFLAGS=-D warnings`. mise-action caches mise's tools; `MISE_ENV=ci`
-loads `mise.ci.toml`, which moves rustup's toolchains into that cache.
-Tests run on x86_64 Linux, aarch64 Linux, and
-aarch64 macOS (Metal tests needing a device skip without one; a guard test
-still fails if the kernels do not compile). Clippy runs on x86_64 Linux and
-aarch64 macOS; everything else on x86_64 Linux only. `all-checks-passed`
-gates merges. After touching `simd/` or `cfg(target_arch)` code, lint the
-architecture your host is not:
+loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
+tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal tests
+needing a device skip without one; a guard test still fails if the kernels
+do not compile). Its Python jobs build and test the extension on
+x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows across CPython 3.11,
+latest Python 3.x, and free-threaded 3.14t, plus static typing/stub checks
+and an sdist round trip. Root fmt also checks `python/Cargo.toml`; Python
+clippy runs in both the x86_64-linux and aarch64-macOS lint jobs (the
+latter checks the Metal feature). `all-checks-passed` gates merges. After
+touching `simd/` or `cfg(target_arch)` code, lint the architecture your
+host is not:
 
 ```sh
 cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
@@ -67,6 +71,23 @@ reject. After changing `train.rs`'s input layout, re-check
 `compact-model` (accepted models must predict and round-trip), `loaders`,
 `train` (valid params must train or error, identically across thread
 counts).
+
+Python bindings: `python/` is its own crate (like `fuzz/`), built by
+maturin through uv. Unlike the root, its `Cargo.lock` and `uv.lock` are
+committed and every build is locked; after changing the root crate's
+dependencies run `cargo update --manifest-path python/Cargo.toml
+--workspace`, after changing `python/pyproject.toml` run `uv lock`. From
+`python/`:
+
+```sh
+uv sync --locked
+uv run --locked pytest
+uv run --locked python -m mypy.stubtest hessboost._hessboost
+uv run --locked mypy --strict
+uv run --locked pyright --verifytypes hessboost --ignoreexternal
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
 
 ## Lints
 
@@ -88,7 +109,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
@@ -99,6 +120,15 @@ proptest; shared helpers are in `tests/common/` and `examples/common/`.
 `.json`, `.hbtd`, `.margins`); `tests/data/xgboost-3.4.2-categorical.*` are
 XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
 (Criterion) results go in `docs/performance.md`.
+
+## Layout (`python/`)
+
+|Path|Non-obvious contents|
+|---|---|
+|`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `metal` on macOS|
+|`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `train` (`Trainer` on a signal-polled worker thread, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `dist`|
+|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `folds`; `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
+|`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit|
 
 ## Invariants
 
@@ -115,6 +145,9 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   `dist:*` split direction, quantized stochastic rounding, per-block
   row-sampling seeds) use SplitMix64 streams keyed by seed and index.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
+  `Trainer::on_round` only observes: a hook that always continues leaves
+  the model byte-identical, and a `Break` after round `k` gives the
+  `k + 1`-round model (`tests/round_hook.rs`).
 - **Metal:** `device = metal` reproduces the single-threaded CPU model bit
   for bit: gradients are staged as integer multiples of a per-component
   grain and summed in 64-bit integers (order-free, no atomics), and a node
@@ -209,6 +242,8 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   refuses. Every eval set is checked before training (`validate_info`;
   `prediction_width` equal to the model's outputs, or for `None` a whole
   number per label column); `Metric::eval` returns NaN on length mismatch.
+  `Metric::name` is XGBoost's `evals_result` key, suffix included
+  (`ndcg@5`, `pre@3`, `tweedie-nloglik@1.5`), so parity compares names.
 - **Refusals:** unsupported parameters or combinations error, never get
   ignored. Checks live in `TrainingParams::validate` (static),
   `validate_request` in `training/train.rs` (data-dependent),
@@ -217,6 +252,20 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   Budget mode and refresh compare params against defaults plus an
   allow-list (`TrainingParams::refuse_changes_from`), so any new field is
   refused there automatically.
+- **Python:** `python/` uses only the crate's public API. The public
+  Python API is pure Python; the extension is private, fully stubbed
+  (stubtest), `unsafe`-free (`forbid`), declares `gil_used = false`, keeps
+  every class `frozen`, and releases the GIL around matrix construction,
+  training, prediction, and model encode/decode. Parameter mappings
+  deserialize through `TrainingParams`' serde (XGBoost) names plus the
+  aliases and one-setting options in `python/src/params.rs`, so a new
+  field is accepted automatically and unknown keys are refused. `train`
+  runs on a worker thread while the caller polls for signals; Python
+  callbacks (objective, metric, per-round) re-attach to the interpreter,
+  and the first exception (or Ctrl-C's `KeyboardInterrupt`) stops
+  training through `Trainer::on_round` at the end of the round and is
+  re-raised. Crate errors map to `HessboostError` (a `ValueError`),
+  `ModelFormatError`, and `OSError`; wrong Python types raise `TypeError`.
 
 ## Public API
 
@@ -252,10 +301,22 @@ field, builder setter, and validation.
 
 ## Releases
 
-Bump `version` in `Cargo.toml`; write `tests/data/saved/<version>/` with
+Bump `version` in both `Cargo.toml` and `python/Cargo.toml`; run
+`cargo update -p hessboost --manifest-path python/Cargo.toml` and `uv lock`
+from `python/`, then commit both lockfiles. Save this version's models with
 `cargo nextest run --test native_format --run-ignored only
-save_models_of_this_version` and commit it (never regenerate an older
-version's directory); merge; push tag `v<version>`. `publish.yml` checks
-the tag, tests on all three platforms, publishes to crates.io, and creates
-the GitHub release (with a discussion), its notes seeded from PRs since the
-last tag (grouped by `.github/release.yml`); rewrite them by hand then.
+save_models_of_this_version` and commit `tests/data/saved/<version>/` (never
+regenerate an older version's directory). Merge the bump and saved-model
+changes, then run `./release.py` from a clean, up-to-date `main`; use
+`./release.py --dry-run` first if desired. It checks versions and lockfiles,
+the saved-model directory is tracked, registry availability, and successful
+CI before creating and pushing an annotated `v<version>` tag. The tag runs
+`.github/workflows/publish.yml`, which verifies the Rust tests and Python
+wheels/sdist before publishing to crates.io and PyPI and creating a GitHub
+release with a discussion and generated notes. The notes are seeded from PRs
+since the last tag and grouped by `.github/release.yml`; rewrite them by hand
+afterward.
+
+One-time setup: configure PyPI's pending trusted publisher for owner
+`brndnmtthws`, repository `hessboost`, workflow `publish.yml`, environment
+`pypi`; create the GitHub `pypi` environment.

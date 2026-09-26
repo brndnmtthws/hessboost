@@ -1,0 +1,85 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hessboost"
+dynamic = ["version"]
+description = "XGBoost reimplemented in Rust: gradient boosted trees with XGBoost's parameters, model formats and Python API"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Brenden Matthews", email = "brenden@brndn.io" }]
+keywords = ["xgboost", "gradient-boosting", "gbdt", "machine-learning", "decision-trees", "rust"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Free Threading :: 3 - Stable",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+dependencies = ["numpy>=2"]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.2"]
+scikit-learn = ["scikit-learn>=1.6"]
+
+[project.urls]
+Homepage = "https://github.com/brndnmtthws/hessboost"
+Documentation = "https://github.com/brndnmtthws/hessboost/tree/main/python#readme"
+Repository = "https://github.com/brndnmtthws/hessboost"
+Issues = "https://github.com/brndnmtthws/hessboost/issues"
+Changelog = "https://github.com/brndnmtthws/hessboost/releases"
+
+[dependency-groups]
+test = [
+  "pytest>=9.1",
+  "mypy>=2.3",
+  "pyright>=1.1.414",
+  "pandas>=2.2",
+  "pandas-stubs>=2.2",
+  "scikit-learn>=1.6",
+  "scipy>=1.14",
+  "scipy-stubs>=1.14",
+]
+dev = [{ include-group = "test" }, "maturin>=1.15,<2"]
+
+[tool.maturin]
+# Every build (maturin CLI, `uv sync`/`uv run`, pip from the sdist) uses the
+# committed Cargo.lock and fails instead of updating it.
+locked = true
+module-name = "hessboost._hessboost"
+python-source = "python"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+xfail_strict = true
+
+[tool.mypy]
+files = ["python/hessboost", "tests"]
+strict = true
+
+[tool.uv]
+# `uv sync` and `uv run` rebuild the extension when these change (by default
+# uv only watches pyproject.toml). The root crate is a path dependency.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "Cargo.lock" },
+  { file = "src/**/*.rs" },
+  { file = "../Cargo.toml" },
+  { file = "../src/**/*.rs" },
+]

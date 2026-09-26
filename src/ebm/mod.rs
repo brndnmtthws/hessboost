@@ -69,9 +69,10 @@
 //! `init_model`, eval sets, or early stopping (the terms of one run are
 //! fixed); it refuses `num_parallel_tree > 1`, column sampling, interaction
 //! constraints (the terms fix every tree's features), linear leaves, the
-//! reuse penalties, `process_type = update`, and feature weights. With
-//! `ebm_boulevard` also everything Boulevard inference refuses
-//! (non-squared-error objectives, row weights, base margins, L1 or clipped
+//! reuse penalties, `process_type = update`, feature weights, and base
+//! margins (the shapes and their centering assume the intercept alone).
+//! With `ebm_boulevard` also everything Boulevard inference refuses
+//! (non-squared-error objectives, row weights, L1 or clipped
 //! leaves, quantized gradients, smoothed leaves, gradient-based sampling),
 //! outer bags, and `base_score`. See
 //! [`TrainingParams::validate`](crate::config::TrainingParams::validate).

@@ -379,7 +379,7 @@ ensemble, and slices drop the `BoulevardInfo`. `booster = ebm` counts every
 tree as an iteration (`num_boost_round` counts EBM rounds, one tree per term
 each), needs one output and numerical features, refuses eval sets, early
 stopping, continuation, column sampling, interaction constraints, forests,
-and feature weights; `ebm_boulevard` adds Boulevard's refusals plus outer
+feature weights, and base margins; `ebm_boulevard` adds Boulevard's refusals plus outer
 bags and `base_score`. Slices and exports drop the `EbmInfo`. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.
 

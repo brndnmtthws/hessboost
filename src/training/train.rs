@@ -1162,7 +1162,8 @@ fn validate_boulevard_request(
 }
 
 /// The data-dependent refusals of `booster = ebm`: one output, numerical
-/// features, no feature weights, and no eval sets or early stopping (the
+/// features, no feature weights or base margins (the terms and their
+/// centering assume the intercept alone), and no eval sets or early stopping (the
 /// terms of one run are boosted round by round, so no prefix of the trees
 /// is a model of every term); with `ebm_boulevard` also Boulevard's
 /// refusals (squared error, unit row weights, no base margins).
@@ -1186,6 +1187,13 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Objective) -> Re
                 "needs a single-output objective, got `{}`",
                 objective.name()
             ),
+        );
+    }
+    if request.dtrain.base_margin().is_some() {
+        return refuse(
+            "base_margin",
+            "base margins are not supported: the terms and their centering assume the \
+             intercept alone",
         );
     }
     super::ebm::validate_data(request.dtrain)?;

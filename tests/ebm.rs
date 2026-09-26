@@ -247,6 +247,10 @@ fn unsupported_combinations_are_refused() {
         invalid_param(train(&params, &categorical, 2)),
         "feature_types"
     );
+    // Classic EBMs start every margin at the intercept, so a base margin
+    // would split training from prediction.
+    let offset = dtrain.clone().with_base_margin(&[0.5; 100]).unwrap();
+    assert_eq!(invalid_param(train(&params, &offset, 2)), "base_margin");
     let weighted = dtrain.clone().with_weights(&[2.0; 100]).unwrap();
     assert_eq!(
         invalid_param(train(&boulevard().build().unwrap(), &weighted, 2)),

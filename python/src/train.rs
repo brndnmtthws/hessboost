@@ -22,7 +22,7 @@ use std::time::Duration;
 /// callbacks are skipped: the objective returns zero gradients and the
 /// metric NaN.
 #[derive(Clone, Default)]
-struct Failure(Arc<Mutex<Option<PyErr>>>);
+pub(crate) struct Failure(Arc<Mutex<Option<PyErr>>>);
 
 impl Failure {
     fn failed(&self) -> bool {
@@ -194,6 +194,38 @@ fn interruptible<T: Send>(
     })
 }
 
+/// The round hook [`run_hooked`] hands its work.
+pub(crate) type RoundHook = Box<dyn FnMut(&RoundEval) -> ControlFlow<()> + Send>;
+
+/// Runs `work` [`interruptible`] with a [`round_hook`] calling `on_round`,
+/// and raises the first exception a callback recorded in `failure`, or the
+/// caller's `KeyboardInterrupt`, in place of `work`'s result.
+pub(crate) fn run_hooked<T: Send>(
+    py: Python<'_>,
+    on_round: Option<Py<PyAny>>,
+    failure: &Failure,
+    work: impl FnOnce(RoundHook) -> T + Send,
+) -> PyResult<T> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let hook = Box::new(round_hook(
+        on_round,
+        failure.clone(),
+        Arc::clone(&interrupted),
+    ));
+    let out = interruptible(
+        py,
+        move || work(hook),
+        |error| {
+            interrupted.store(true, Ordering::Relaxed);
+            failure.record(error);
+        },
+    )?;
+    match failure.take() {
+        Some(error) => Err(error),
+        None => Ok(out),
+    }
+}
+
 /// A custom metric callback with its reported name and direction.
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
@@ -254,37 +286,25 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
     let metric = request
         .custom_metric
         .map(|metric| custom_metric(metric, targets, failure.clone()));
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let hook = round_hook(request.on_round, failure.clone(), Arc::clone(&interrupted));
-    let result = interruptible(
-        py,
-        || {
-            let mut trainer = Trainer::new(params, dtrain, request.num_boost_round).on_round(hook);
-            for (data, name) in &evals {
-                trainer = trainer.eval(data, name);
-            }
-            if let Some(rounds) = request.early_stopping_rounds {
-                trainer = trainer.early_stopping_rounds(rounds);
-            }
-            if let Some(model) = init {
-                trainer = trainer.init_model(model);
-            }
-            if let Some(objective) = &objective {
-                trainer = trainer.loss(objective);
-            }
-            if let Some(metric) = metric {
-                trainer = trainer.custom_metric(Box::new(metric));
-            }
-            trainer.train()
-        },
-        |error| {
-            interrupted.store(true, Ordering::Relaxed);
-            failure.record(error);
-        },
-    )?;
-    if let Some(error) = failure.take() {
-        return Err(error);
-    }
+    let result = run_hooked(py, request.on_round, &failure, |hook| {
+        let mut trainer = Trainer::new(params, dtrain, request.num_boost_round).on_round(hook);
+        for (data, name) in &evals {
+            trainer = trainer.eval(data, name);
+        }
+        if let Some(rounds) = request.early_stopping_rounds {
+            trainer = trainer.early_stopping_rounds(rounds);
+        }
+        if let Some(model) = init {
+            trainer = trainer.init_model(model);
+        }
+        if let Some(objective) = &objective {
+            trainer = trainer.loss(objective);
+        }
+        if let Some(metric) = metric {
+            trainer = trainer.custom_metric(Box::new(metric));
+        }
+        trainer.train()
+    })?;
     let result = result.or_raise()?;
     Ok((Booster::new(result.model), result.best_score))
 }

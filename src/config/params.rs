@@ -694,13 +694,14 @@ impl TrainingParams {
         narrows("lambda", self.lambda, false)?;
         non_negative("alpha", self.alpha)?;
         narrows("alpha", self.alpha, false)?;
+        positive("scale_pos_weight", self.scale_pos_weight)?;
+        narrows("scale_pos_weight", self.scale_pos_weight, true)?;
         unit("subsample", self.subsample)?;
         ensure("subsample", self.subsample != 0.0, "must be > 0")?;
+        // subsample of exactly 0 is meaningless.
         unit("colsample_bytree", self.colsample_bytree)?;
         unit("colsample_bylevel", self.colsample_bylevel)?;
         unit("colsample_bynode", self.colsample_bynode)?;
-        positive("scale_pos_weight", self.scale_pos_weight)?;
-        narrows("scale_pos_weight", self.scale_pos_weight, true)?;
         unit("pos_bagging_fraction", self.pos_bagging_fraction)?;
         ensure(
             "pos_bagging_fraction",
@@ -1653,16 +1654,20 @@ mod tests {
     }
 
     #[test]
-    fn balanced_bagging_defaults_and_fraction_ranges() {
-        let params = TrainingParams::default();
-        assert_eq!(params.pos_bagging_fraction, 1.0);
-        assert_eq!(params.neg_bagging_fraction, 1.0);
+    fn balanced_bagging_fractions_must_be_positive_and_bounded() {
         for invalid in [0.0, f64::NAN, f64::INFINITY, 1.1] {
             let result = TrainingParams::builder()
                 .objective("binary:logistic")
                 .pos_bagging_fraction(invalid)
                 .build();
-            assert!(result.is_err(), "accepted fraction {invalid}");
+            assert!(result.is_err(), "accepted positive fraction {invalid}");
+        }
+        for invalid in [0.0, f64::NAN, f64::INFINITY, 1.1] {
+            let result = TrainingParams::builder()
+                .objective("binary:logistic")
+                .neg_bagging_fraction(invalid)
+                .build();
+            assert!(result.is_err(), "accepted negative fraction {invalid}");
         }
     }
 

@@ -1,9 +1,18 @@
-name: Publish to crates.io
+name: Publish
 
 on:
   push:
-    tags:
-      - v*
+    tags: [v*]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/publish.yml
+      - python/**
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   MISE_ENV: ci
@@ -13,10 +22,38 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Validate crate and Python bindings
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@v4
+      - name: Verify versions and lockfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          root_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "hessboost") | .version')"
+          python_version="$(cargo metadata --no-deps --format-version 1 --manifest-path python/Cargo.toml | jq -r '.packages[] | select(.name == "hessboost-python") | .version')"
+          if [[ "${GITHUB_REF_NAME}" != "v${root_version}" || "${python_version}" != "${root_version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME}, root version ${root_version}, and Python binding version ${python_version} must match" >&2
+            exit 1
+          fi
+          cargo metadata --locked --format-version 1 --manifest-path python/Cargo.toml > /dev/null
+          uv lock --check --directory python
+      - name: Verify crate package contents
+        run: cargo package
+
   test:
-    name: test (${{ matrix.name }})
+    name: Rust test (${{ matrix.name }})
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { name: x86_64-linux, runner: ubuntu-26.04 }
@@ -29,74 +66,231 @@ jobs:
       - uses: jdx/mise-action@v4
       - uses: jdx/mr-boxington-action@v1
         with:
-          cache-generation: publish-test
+          cache-generation: publish-test-${{ matrix.name }}
       - run: mbx nextest run --all-features
-      # nextest does not run doctests.
       - run: mbx test --doc --all-features
 
-  publish:
-    runs-on: ubuntu-latest
-    needs: [test]
+  python-wheels:
+    name: Python wheels / ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
-      discussions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: manylinux x86_64, slug: manylinux-x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: "2_28", ft_interpreter: /opt/python/cp314-cp314t/bin/python3.14t }
+          - { name: manylinux aarch64, slug: manylinux-aarch64, runner: ubuntu-26.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2_28", ft_interpreter: /opt/python/cp314-cp314t/bin/python3.14t }
+          - { name: macOS arm64, slug: macos-arm64, runner: macos-latest, target: aarch64-apple-darwin, manylinux: "", ft_interpreter: "" }
+          - { name: Windows x86_64, slug: windows-x86_64, runner: windows-latest, target: x86_64-pc-windows-msvc, manylinux: "", ft_interpreter: "" }
+    env:
+      UV_MANAGED_PYTHON: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: false
+          working-directory: python
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+          working-directory: python
+      - name: Test abi3 wheel on latest Python
+        run: |
+          uv sync --locked --only-group test --python 3
+          uv pip install dist/*cp311-abi3*.whl
+          uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"
+          uv run --no-sync pytest -p no:cacheprovider tests
+        working-directory: python
+      - name: Test abi3 wheel on Python 3.11
+        run: |
+          uv sync --locked --only-group test --python 3.11
+          uv pip install dist/*cp311-abi3*.whl
+          uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"
+          uv run --no-sync pytest -p no:cacheprovider tests
+        working-directory: python
+      - name: Set up free-threaded Python for macOS and Windows
+        if: "!startsWith(matrix.target, 'x86_64-unknown-linux') && !startsWith(matrix.target, 'aarch64-unknown-linux')"
+        id: ft-python
+        run: |
+          uv python install 3.14t
+          echo "python-path=$(uv python find 3.14t)" >> "$GITHUB_OUTPUT"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -i "${{ matrix.ft_interpreter || steps.ft-python.outputs.python-path }}"
+          working-directory: python
+      - name: Test free-threaded wheel
+        run: |
+          uv sync --locked --only-group test --python 3.14t
+          uv pip install dist/*cp314-cp314t*.whl
+          uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"
+          uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled()"
+          uv run --no-sync pytest -p no:cacheprovider tests
+        working-directory: python
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-wheel-${{ matrix.slug }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  python-sdist:
+    name: Python source distribution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: python
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-sdist
+          path: python/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-dists:
+    name: Verify Python distributions
+    needs: [python-wheels, python-sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+      - name: Verify distribution set
+        run: |
+          shopt -s nullglob
+          files=(dist/*)
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          [[ ${#wheels[@]} -eq 8 && ${#sdists[@]} -eq 1 && ${#files[@]} -eq 9 ]] || {
+            echo "Expected exactly eight wheels and one sdist; found ${#wheels[@]} wheels, ${#sdists[@]} sdists, ${#files[@]} files." >&2
+            exit 1
+          }
+          expected=(
+            'cp311-abi3-manylinux_*_x86_64'
+            'cp311-abi3-manylinux_*_aarch64'
+            'cp311-abi3-macosx_*_arm64'
+            'cp311-abi3-win_amd64'
+            'cp314-cp314t-manylinux_*_x86_64'
+            'cp314-cp314t-manylinux_*_aarch64'
+            'cp314-cp314t-macosx_*_arm64'
+            'cp314-cp314t-win_amd64'
+          )
+          for tag in "${expected[@]}"; do
+            compgen -G "dist/*${tag}*.whl" > /dev/null || { echo "Missing wheel matching ${tag}" >&2; exit 1; }
+          done
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: false
+      - run: uvx twine check --strict dist/*
+      - run: uvx check-wheel-contents dist/*.whl
+
+  crates-publish:
+    name: Publish crate to crates.io
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, test, verify-dists]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-
       # Toolchain from mise.toml (mise-action caches the tools, see ci.yml).
       # No compiler cache: the published crate must not depend on restored
       # build outputs.
       - uses: jdx/mise-action@v4
-
-      - name: Verify tag matches crate version
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          crate_version="$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "hessboost") | .version')"
-          echo "tag=$tag crate=$crate_version"
-          if [ "$tag" != "$crate_version" ]; then
-            echo "::error::Git tag v$tag does not match hessboost Cargo.toml version $crate_version"
-            exit 1
-          fi
-
       - name: Select crates.io authentication method
         id: auth-mode
         env:
           CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
-          if [[ -n "$CRATES_IO_TOKEN" ]]; then
-            echo "method=api-token" >> "$GITHUB_OUTPUT"
-          else
-            echo "method=trusted-publishing" >> "$GITHUB_OUTPUT"
-          fi
-
+          if [[ -n "$CRATES_IO_TOKEN" ]]; then echo "method=api-token" >> "$GITHUB_OUTPUT"; else echo "method=trusted-publishing" >> "$GITHUB_OUTPUT"; fi
       - name: Authenticate with crates.io using trusted publishing
         id: auth
         if: steps.auth-mode.outputs.method == 'trusted-publishing'
         uses: rust-lang/crates-io-auth-action@v1
-
-      - name: Publish using API token
-        if: steps.auth-mode.outputs.method == 'api-token'
-        run: cargo publish --all-features
+      - name: Publish crate if absent
+        shell: bash
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          TRUSTED_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' -H 'User-Agent: hessboost release workflow (https://github.com/brndnmtthws/hessboost)' "https://crates.io/api/v1/crates/hessboost/${version}")"
+          case "$status" in
+            200) echo "hessboost ${version} is already published; skipping." ;;
+            404)
+              export CARGO_REGISTRY_TOKEN="${TOKEN:-$TRUSTED_TOKEN}"
+              cargo publish --all-features
+              ;;
+            *) echo "Unexpected HTTP status ${status} from crates.io." >&2; exit 1 ;;
+          esac
 
-      - name: Publish using trusted publishing
-        if: steps.auth-mode.outputs.method == 'trusted-publishing'
-        run: cargo publish --all-features
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+  pypi-publish:
+    name: Publish Python package to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, verify-dists]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hessboost
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+          skip-existing: true
 
-      - name: Create release
-        uses: softprops/action-gh-release@v3
+  github-release:
+    name: Create GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [crates-publish, pypi-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      discussions: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
         with:
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           discussion_category_name: General
-          # Notes are the pull requests merged since the previous tag,
-          # grouped by .github/release.yml.
           generate_release_notes: true
+          files: dist/*

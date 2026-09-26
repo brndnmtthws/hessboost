@@ -41,6 +41,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@v4
       - run: cargo fmt --all --check
+      - run: cargo fmt --all --check --manifest-path python/Cargo.toml
       - run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
 
   clippy:
@@ -64,6 +65,7 @@ jobs:
           cache-generation: clippy-${{ matrix.name }}
       # Lint levels (pedantic) live in Cargo.toml's [lints] table.
       - run: mbx clippy --all-targets --all-features -- -D warnings
+      - run: mbx clippy --manifest-path python/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.name }})
@@ -188,9 +190,114 @@ jobs:
             echo
           done
 
+  python:
+    name: Python / ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    env:
+      UV_MANAGED_PYTHON: "1"
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+          - macos-latest
+          - windows-latest
+        python-version: ["3.11", "3"]
+        include:
+          - os: ubuntu-26.04
+            python-version: "3.14t"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python-version }}
+          working-directory: python
+      - name: Install selected Python
+        id: python
+        run: |
+          uv python install
+          echo "path=$(uv python find)" >> "$GITHUB_OUTPUT"
+        working-directory: python
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          manylinux: ${{ matrix.python-version == '3.14t' && 'off' || '' }}
+          args: --release --locked --out dist ${{ matrix.python-version == '3.14t' && format('-i {0}', steps.python.outputs.path) || '' }}
+          working-directory: python
+      - name: Install test dependencies
+        run: uv sync --locked --only-group test
+        working-directory: python
+      - name: Install built wheel
+        run: uv pip install dist/*.whl
+        working-directory: python
+      - name: Verify imports use installed wheel
+        run: uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"
+        working-directory: python
+      - name: Run Python tests
+        run: uv run --no-sync pytest -p no:cacheprovider tests
+        working-directory: python
+      - name: Check stubs and public types
+        if: matrix.os == 'ubuntu-26.04' && matrix.python-version == '3'
+        run: |
+          uv run --no-sync python -m mypy.stubtest hessboost._hessboost
+          uv run --no-sync mypy --strict
+          uv run --no-sync pyright --verifytypes hessboost --ignoreexternal
+        working-directory: python
+
+  python-sdist:
+    name: Python sdist round-trip
+    runs-on: ubuntu-latest
+    env:
+      UV_MANAGED_PYTHON: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.11"
+          working-directory: python
+      - name: Build source distribution
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: python
+      - name: Build wheel from source distribution
+        run: |
+          mkdir extracted
+          tar -xzf python/dist/*.tar.gz -C extracted
+          sdist_dir=(extracted/*)
+          mv "${sdist_dir[0]}" extracted/sdist
+          cd extracted/sdist
+          uvx --from 'maturin>=1.15,<2' maturin build --release --locked --out "$GITHUB_WORKSPACE/python/dist"
+      # The source distribution carries no uv.lock, so resolve the test group afresh.
+      - name: Install test dependencies from extracted project
+        run: uv sync --only-group test
+        working-directory: extracted/sdist
+      - name: Install built wheel
+        run: uv pip install "$GITHUB_WORKSPACE"/python/dist/*.whl
+        working-directory: extracted/sdist
+      - name: Verify installed wheel import
+        run: uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"
+        working-directory: extracted/sdist
+      - name: Run tests from extracted source distribution
+        run: uv run --no-sync pytest -p no:cacheprovider python/tests
+        working-directory: extracted/sdist
+
   all-checks-passed:
     permissions: {}
-    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz]
+    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz, python, python-sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run on upstream failure too (so branch protection sees a failure), but

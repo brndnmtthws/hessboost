@@ -40,15 +40,19 @@ cargo nextest run --test parity --release --run-ignored only --no-capture
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 
-CI (`.github/workflows/ci.yml`) runs these through `mbx` with
+CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 `RUSTFLAGS=-D warnings`. mise-action caches mise's tools; `MISE_ENV=ci`
-loads `mise.ci.toml`, which moves rustup's toolchains into that cache.
-Tests run on x86_64 Linux, aarch64 Linux, and
-aarch64 macOS (Metal tests needing a device skip without one; a guard test
-still fails if the kernels do not compile). Clippy runs on x86_64 Linux and
-aarch64 macOS; everything else on x86_64 Linux only. `all-checks-passed`
-gates merges. After touching `simd/` or `cfg(target_arch)` code, lint the
-architecture your host is not:
+loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
+tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal tests
+needing a device skip without one; a guard test still fails if the kernels
+do not compile). Its Python jobs build and test the extension on
+x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows across CPython 3.11,
+latest Python 3.x, and free-threaded 3.14t, plus static typing/stub checks
+and an sdist round trip. Root fmt also checks `python/Cargo.toml`; Python
+clippy runs in both the x86_64-linux and aarch64-macOS lint jobs (the
+latter checks the Metal feature). `all-checks-passed` gates merges. After
+touching `simd/` or `cfg(target_arch)` code, lint the architecture your
+host is not:
 
 ```sh
 cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
@@ -297,10 +301,22 @@ field, builder setter, and validation.
 
 ## Releases
 
-Bump `version` in `Cargo.toml`; write `tests/data/saved/<version>/` with
+Bump `version` in both `Cargo.toml` and `python/Cargo.toml`; run
+`cargo update -p hessboost --manifest-path python/Cargo.toml` and `uv lock`
+from `python/`, then commit both lockfiles. Save this version's models with
 `cargo nextest run --test native_format --run-ignored only
-save_models_of_this_version` and commit it (never regenerate an older
-version's directory); merge; push tag `v<version>`. `publish.yml` checks
-the tag, tests on all three platforms, publishes to crates.io, and creates
-the GitHub release (with a discussion), its notes seeded from PRs since the
-last tag (grouped by `.github/release.yml`); rewrite them by hand then.
+save_models_of_this_version` and commit `tests/data/saved/<version>/` (never
+regenerate an older version's directory). Merge the bump and saved-model
+changes, then run `./release.py` from a clean, up-to-date `main`; use
+`./release.py --dry-run` first if desired. It checks versions and lockfiles,
+the saved-model directory is tracked, registry availability, and successful
+CI before creating and pushing an annotated `v<version>` tag. The tag runs
+`.github/workflows/publish.yml`, which verifies the Rust tests and Python
+wheels/sdist before publishing to crates.io and PyPI and creating a GitHub
+release with a discussion and generated notes. The notes are seeded from PRs
+since the last tag and grouped by `.github/release.yml`; rewrite them by hand
+afterward.
+
+One-time setup: configure PyPI's pending trusted publisher for owner
+`brndnmtthws`, repository `hessboost`, workflow `publish.yml`, environment
+`pypi`; create the GitHub `pypi` environment.

@@ -647,18 +647,6 @@ pub(crate) fn with_thread_pool<T: Send>(
     pool.install(train)
 }
 
-/// Refuse a `missing` parameter other than the default: the sentinel belongs
-/// to the training matrix.
-pub(crate) fn reject_missing_param(params: &TrainingParams) -> Result<()> {
-    if !params.missing.is_nan() {
-        return Err(HessboostError::invalid_param(
-            "missing",
-            "set the sentinel when constructing DMatrix with from_dense_with_missing",
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse `dtrain`'s feature weights on a training path that samples no
 /// columns (`reason` names it): they only steer the tree builders' column
 /// sampling.
@@ -912,7 +900,6 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     } = request;
     params.validate()?;
     multi_output::validate(params, objective.n_outputs())?;
-    reject_missing_param(params)?;
     EarlyStopping::check_patience(early_stopping_rounds)?;
     if early_stopping_rounds.is_some() && evals.is_empty() {
         return Err(HessboostError::invalid_param(

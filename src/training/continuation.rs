@@ -207,7 +207,7 @@ fn check_update(
 ///   device (checked elsewhere), `nthread`, `seed`, the objective and its
 ///   parameters, `eval_metric`, `eta`, `lambda`, `alpha`, `max_delta_step`,
 ///   `num_parallel_tree`, `multi_strategy`, `monotone_constraints` (refused
-///   with their own message), `process_type`, `refresh_leaf`, `missing`;
+///   with their own message), `process_type`, `refresh_leaf`;
 /// * XGBoost's tree-shape settings, which describe how the refreshed trees
 ///   were grown and which XGBoost 3.4.2's refresh updater accepts with a
 ///   training run's parameters: `tree_method`, `max_depth`, `max_leaves`,
@@ -249,7 +249,6 @@ fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
         monotone_constraints: p.monotone_constraints,
         process_type: p.process_type,
         refresh_leaf: p.refresh_leaf,
-        missing: p.missing,
         tree_method: p.tree_method,
         max_depth: p.max_depth,
         max_leaves: p.max_leaves,

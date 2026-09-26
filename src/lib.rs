@@ -145,7 +145,10 @@
 //! ## Compatibility notes
 //!
 //! Parameter, objective, and metric names are XGBoost's, so an XGBoost
-//! configuration carries over; unsupported settings are refused. Parity with
+//! configuration carries over:
+//! [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost)
+//! reads an XGBoost `params` dict (keys, aliases, and value spellings), and
+//! unsupported settings are refused. Parity with
 //! XGBoost 3.4.2 is CI-tested: deterministic fixtures reproduce XGBoost
 //! within `1e-4` (quantile cuts bit for bit), and imported XGBoost models
 //! predict and explain as XGBoost does. RNG-driven options (subsampling,
@@ -155,7 +158,8 @@
 //!
 //! - Distributed and external-memory training; GPU training outside macOS.
 //! - XGBoost options available at one setting only (so they are not
-//!   [`TrainingParams`] fields): gblinear uses `updater = coord_descent`
+//!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
+//!   setting): gblinear uses `updater = coord_descent`
 //!   with `feature_selector = cyclic`; LambdaMART uses
 //!   `lambdarank_pair_method = topk` (no `lambdarank_unbiased` or
 //!   `ndcg_exp_gain`); DART has no `sample_type`, `normalize_type`, or

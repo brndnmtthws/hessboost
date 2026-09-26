@@ -1,6 +1,7 @@
 //! Training configuration types.
 
 mod params;
+mod xgboost;
 
 pub(crate) use params::PartialObjectiveParams;
 pub use params::{

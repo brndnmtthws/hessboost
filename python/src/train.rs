@@ -149,11 +149,14 @@ fn round_hook(
         let Some(function) = &function else {
             return ControlFlow::Continue(());
         };
-        let stop = Python::attach(|py| {
-            function
-                .call1(py, (round.iteration, round.scores.clone()))?
-                .is_truthy(py)
-        });
+        // Python sees XGBoost's `(dataset, metric, value)` triples.
+        let scores: Vec<(&str, &str, f64)> = round
+            .scores
+            .iter()
+            .map(|score| (score.dataset.as_str(), score.metric.as_str(), score.value))
+            .collect();
+        let stop =
+            Python::attach(|py| function.call1(py, (round.iteration, scores))?.is_truthy(py));
         match stop {
             Ok(false) => ControlFlow::Continue(()),
             Ok(true) => ControlFlow::Break(()),

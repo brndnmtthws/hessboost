@@ -8,7 +8,7 @@
 //!
 //! Run with: `cargo run --release --example conformal`
 
-use hessboost::conformal::{ConformalizedQuantile, SplitConformal};
+use hessboost::conformal::{ConformalizedQuantile, Interval, SplitConformal};
 use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::prelude::*;
 
@@ -32,14 +32,14 @@ fn dataset(n: usize, seed: u64) -> Result<DMatrix> {
 }
 
 /// Fraction of rows whose label lies in its interval, and the mean width.
-fn summarize(intervals: &[(f32, f32)], data: &DMatrix) -> (f64, f64) {
+fn summarize(intervals: &[Interval], data: &DMatrix) -> (f64, f64) {
     let labels = data.labels().unwrap_or_default();
     let covered = intervals
         .iter()
         .zip(labels)
-        .filter(|&(&(lo, hi), &y)| lo <= y && y <= hi)
+        .filter(|&(i, &y)| i.lower <= y && y <= i.upper)
         .count();
-    let width: f64 = intervals.iter().map(|(lo, hi)| f64::from(hi - lo)).sum();
+    let width: f64 = intervals.iter().map(|i| f64::from(i.upper - i.lower)).sum();
     let n = intervals.len() as f64;
     (covered as f64 / n, width / n)
 }
@@ -82,11 +82,12 @@ fn main() -> Result<()> {
     let quantiles = train(&quantile_params, &dtrain, 200)?;
     // The uncalibrated band, for comparison: predictions are `[row][output]`.
     let preds = quantiles.predict(&dtest)?;
-    let band: Vec<(f32, f32)> = preds
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&[lo, hi]| (lo, hi))
+    let band: Vec<Interval> = preds
+        .rows()
+        .map(|row| Interval {
+            lower: row[0],
+            upper: row[1],
+        })
         .collect();
     let (cov, width) = summarize(&band, &dtest);
     println!("raw quantiles:   coverage {cov:.3}, mean width {width:.3}");
@@ -107,8 +108,8 @@ fn main() -> Result<()> {
         println!(
             "{x1:5.2}   {:8.2}   {:11.3}   {:9.3}",
             0.1 + x1,
-            split_probe[i].1 - split_probe[i].0,
-            cqr_probe[i].1 - cqr_probe[i].0
+            split_probe[i].upper - split_probe[i].lower,
+            cqr_probe[i].upper - cqr_probe[i].lower
         );
     }
     // The guarantee averages over calibration draws: for this one calibration

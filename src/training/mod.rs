@@ -14,4 +14,4 @@ mod train;
 
 pub use cv::{CrossValidation, CvResult, Fold, cv};
 pub(crate) use multi_output::reject_split_gradient;
-pub use train::{RoundEval, TrainResult, Trainer, train};
+pub use train::{RoundEval, Score, TrainResult, Trainer, train};

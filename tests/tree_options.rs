@@ -141,12 +141,11 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
         model.to_xgboost_ubjson(),
         Err(HessboostError::ModelFormat(_))
     ));
-    for result in [
-        model.predict_contribs(&data),
-        model.predict_interactions(&data),
-    ] {
-        assert_eq!(invalid_param(result), "linear_tree");
-    }
+    assert_eq!(invalid_param(model.predict_contribs(&data)), "linear_tree");
+    assert_eq!(
+        invalid_param(model.predict_interactions(&data)),
+        "linear_tree"
+    );
 }
 
 #[test]
@@ -203,7 +202,11 @@ fn vanishing_path_smoothing_approaches_the_unsmoothed_tree() {
         .base_score(0.0)
         .build()
         .unwrap();
-    let preds = train(&params, &data, 1).unwrap().predict(&data).unwrap();
+    let preds = train(&params, &data, 1)
+        .unwrap()
+        .predict(&data)
+        .unwrap()
+        .into_vec(); // one value per row
     assert!(
         (preds[0] + 1.0).abs() < 1e-6 && (preds[1] - 1.0).abs() < 1e-6,
         "{preds:?}"
@@ -233,7 +236,11 @@ fn categorical_splits_keep_their_monotone_leaves() {
             .build()
             .unwrap();
         let preds = train(&params, &data, 1).unwrap().predict(&data).unwrap();
-        assert_eq!(preds, [0.0, 0.0, 2.0, 2.0], "extra_trees {extra_trees}");
+        assert_eq!(
+            preds.as_slice(),
+            [0.0, 0.0, 2.0, 2.0],
+            "extra_trees {extra_trees}"
+        );
     }
 }
 

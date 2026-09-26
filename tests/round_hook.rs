@@ -164,7 +164,7 @@ fn break_under_early_stopping_records_the_best_round_so_far() {
     let scores: Vec<f64> = stopped
         .history
         .iter()
-        .map(|round| round.scores[0].2)
+        .map(|round| round.scores[0].value)
         .collect();
     let best_so_far = (0..scores.len())
         .min_by(|&a, &b| scores[a].total_cmp(&scores[b]))

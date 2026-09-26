@@ -161,7 +161,7 @@ fn quantized_binary_classification_stays_close_to_full_precision() {
         .eta(0.1);
     let score = |builder: TrainingParamsBuilder| {
         let model = train(&builder.build().unwrap(), &d, 150).unwrap();
-        logloss(&model.predict(&dt).unwrap(), &yt)
+        logloss(model.predict(&dt).unwrap().as_slice(), &yt)
     };
     let full = score(base.clone());
     for (name, variant) in [
@@ -200,7 +200,7 @@ fn renewed_leaves_use_full_precision_gradients() {
             train(&params, &d, 1).unwrap()
         };
         let mismatch = |model: &BoostedModel| {
-            let leaves = model.predict_leaf(&d).unwrap();
+            let leaves = model.predict_leaf(&d).unwrap().into_vec(); // one tree: a leaf per row
             let tree = &model.trees()[0];
             let mut sums = vec![(0f64, 0usize); tree.num_nodes()];
             for (&leaf, &t) in leaves.iter().zip(&y) {
@@ -239,7 +239,11 @@ fn subnormal_gradients_survive_quantization() {
             .build()
             .unwrap();
         let model = train(&params, &d, 1).unwrap();
-        assert_eq!(model.predict(&d).unwrap(), vec![1.0, 1.0], "{weights:?}");
+        assert_eq!(
+            model.predict(&d).unwrap().as_slice(),
+            vec![1.0, 1.0],
+            "{weights:?}"
+        );
     }
 }
 

@@ -91,13 +91,21 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
     }
     let data = DMatrix::from_dense(&fx.x_test, fx.n_test, fx.n_cols).map_err(|e| e.to_string())?;
     let margin = model.predict_margin(&data).map_err(|e| e.to_string())?;
-    let raw = compare("raw", &margin, fx.raw.as_deref().unwrap_or_default())?;
+    let raw = compare(
+        "raw",
+        margin.as_slice(),
+        fx.raw.as_deref().unwrap_or_default(),
+    )?;
     let predictions = model.predict(&data).map_err(|e| e.to_string())?;
-    let pred = compare("pred", &predictions, fx.pred.as_deref().unwrap_or_default())?;
+    let pred = compare(
+        "pred",
+        predictions.as_slice(),
+        fx.pred.as_deref().unwrap_or_default(),
+    )?;
     let shap = match &fx.contribs {
         Some(contribs) => {
             let got = model.predict_contribs(&data).map_err(|e| e.to_string())?;
-            format!("{:.1e}", compare("contribs", &got, contribs)?)
+            format!("{:.1e}", compare("contribs", got.as_slice(), contribs)?)
         }
         // LightGBM refuses SHAP for linear trees; so does hessboost.
         None => match model.predict_contribs(&data) {
@@ -119,7 +127,7 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
             (tree.num_leaves() - 1) as u32 + j
         })
         .collect();
-    if leaves != expected_leaves {
+    if leaves.as_slice() != expected_leaves {
         return Err("leaf indices differ".to_string());
     }
 
@@ -128,7 +136,7 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
     let sliced_margin = sliced.predict_margin(&data).map_err(|e| e.to_string())?;
     compare(
         "raw_slice",
-        &sliced_margin,
+        sliced_margin.as_slice(),
         fx.raw_slice.as_deref().unwrap_or_default(),
     )?;
 
@@ -138,8 +146,11 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     for (what, restored) in [("native binary", &from_bytes), ("native JSON", &from_json)] {
         if !same_bits(
-            &restored.predict(&data).map_err(|e| e.to_string())?,
-            &predictions,
+            restored
+                .predict(&data)
+                .map_err(|e| e.to_string())?
+                .as_slice(),
+            predictions.as_slice(),
         ) {
             return Err(format!("{what} round trip changed predictions"));
         }
@@ -148,8 +159,11 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
         (Ok(json), true) => {
             let restored = BoostedModel::from_xgboost_json(&json).map_err(|e| e.to_string())?;
             if !same_bits(
-                &restored.predict(&data).map_err(|e| e.to_string())?,
-                &predictions,
+                restored
+                    .predict(&data)
+                    .map_err(|e| e.to_string())?
+                    .as_slice(),
+                predictions.as_slice(),
             ) {
                 return Err("XGBoost JSON round trip changed predictions".to_string());
             }

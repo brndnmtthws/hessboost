@@ -407,11 +407,11 @@ fn fold_scores(
             .eval(&dtest, "test")
             .train()?;
         for (round, eval) in res.history.iter().enumerate() {
-            for (per_round, (_, _, value)) in values.iter_mut().zip(&eval.scores) {
+            for (per_round, score) in values.iter_mut().zip(&eval.scores) {
                 if per_round.len() == round {
                     per_round.push(Vec::with_capacity(folds.len()));
                 }
-                per_round[round].push(*value);
+                per_round[round].push(score.value);
             }
         }
     }

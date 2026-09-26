@@ -104,7 +104,8 @@ fn main() -> Result<()> {
 
     // Homoscedastic baseline: squared-error point model, one global sigma.
     let point = fit(Objective::SquaredError)?;
-    let fitted = point.predict(&dtrain)?;
+    // One value per row.
+    let fitted = point.predict(&dtrain)?.into_vec();
     let labels = dtrain.labels().unwrap_or_default();
     let sigma = (fitted
         .iter()
@@ -115,8 +116,9 @@ fn main() -> Result<()> {
         .sqrt();
     let baseline: Vec<Dist> = point
         .predict(&dtest)?
-        .iter()
-        .map(|&mu| Dist::Normal {
+        .into_vec()
+        .into_iter()
+        .map(|mu| Dist::Normal {
             mu: f64::from(mu),
             sigma,
         })
@@ -151,7 +153,7 @@ fn main() -> Result<()> {
     let conformal: Vec<(f64, f64)> = cqr
         .predict_interval(&dtest)?
         .into_iter()
-        .map(|(lo, hi)| (f64::from(lo), f64::from(hi)))
+        .map(|i| (f64::from(i.lower), f64::from(i.upper)))
         .collect();
     let (c, w) = summarize(&conformal, &dtest);
     println!(

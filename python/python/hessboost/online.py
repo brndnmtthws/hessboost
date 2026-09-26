@@ -172,7 +172,9 @@ class OnlineModel:
             HessboostError: The refusals of :meth:`train`, or ``booster`` is
                 not a model ``params`` could have trained on ``dtrain``
                 (another objective, several outputs, weighted or categorical
-                trees, another feature count or other features).
+                trees, linear leaves such as an imported LightGBM
+                ``linear_tree`` model's, another feature count or other
+                features).
         """
         if not isinstance(booster, Booster):
             raise TypeError(f"booster must be a Booster, got {type(booster).__name__}")

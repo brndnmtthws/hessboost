@@ -291,3 +291,34 @@ fn unsound_configurations_and_changes_are_refused() {
         .unwrap();
     assert_eq!(invalid_param(model.update(Some(&narrow), &[])), "additions");
 }
+
+/// Models whose trees updates cannot replay are refused: linear leaves
+/// (an imported LightGBM `linear_tree` model) have no Newton-step leaf to
+/// recompute.
+#[test]
+fn from_model_refuses_linear_leaves() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/lightgbm-4.7.0-linear.txt"
+    );
+    let model = BoostedModel::load_lightgbm_text(path).unwrap();
+    assert_eq!(model.n_features(), 6);
+    let mut next = lcg(12);
+    let x: Vec<f32> = (0..200 * 6).map(|_| next()).collect();
+    let y: Vec<f32> = x.chunks(6).map(|r| r[0] - r[1]).collect();
+    let data = DMatrix::from_dense(&x, 200, 6)
+        .unwrap()
+        .with_labels(&y)
+        .unwrap();
+    let p = params(Objective::SquaredError);
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
+            "model"
+        );
+        // A model of these parameters on this data is accepted.
+        let trained = train(&p, &data, 3).unwrap();
+        assert!(OnlineModel::from_model(trained, &p, &data, online).is_ok());
+    }
+}

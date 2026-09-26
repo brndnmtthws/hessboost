@@ -51,6 +51,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "lightgbm-model"
+path = "fuzz_targets/lightgbm-model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "compact-model"
 path = "fuzz_targets/compact-model.rs"
 test = false

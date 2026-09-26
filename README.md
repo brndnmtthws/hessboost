@@ -162,6 +162,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/) | add or delete training rows of a trained model (incremental learning, machine unlearning): exact, or approximate and faster than retraining for small changes, after Lin et al. |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
+| [LightGBM model import](https://docs.rs/hessboost/latest/hessboost/model/#lightgbm-import) | load LightGBM 4.x text models (`model.txt`) that predict, explain with SHAP, slice, and save like native ones, checked against LightGBM's predictions and `pred_contrib`; splits or objectives with no exact equivalent are refused |
 | LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), and symmetric trees |
 | Quantized-gradient training | up to 1.85× faster tree building on large data (`use_quantized_grad`) |
 | [Ordered target statistics](https://docs.rs/hessboost/latest/hessboost/data/target_stats/) | CatBoost-style ordered target encoding of high-cardinality categoricals |

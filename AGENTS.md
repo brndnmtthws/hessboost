@@ -40,6 +40,14 @@ cargo nextest run --test parity --release --run-ignored only --no-capture
 uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 ```
 
+LightGBM import parity (LightGBM 4.7.0 wheels; fixtures in
+`fixtures/lightgbm/`, pointwise within `1e-5` relative, refusals by message):
+
+```sh
+uv run --with-requirements scripts/requirements-lightgbm.txt python scripts/gen_lightgbm_fixtures.py
+cargo nextest run --test lightgbm_parity --release --run-ignored only --no-capture
+```
+
 CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 `RUSTFLAGS=-D warnings`. mise-action caches mise's tools; `MISE_ENV=ci`
 loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
@@ -61,14 +69,15 @@ cargo clippy --all-targets --all-features --target aarch64-unknown-linux-gnu -- 
 
 Fuzzing: run from `fuzz/` (its own crate; its `mise.toml` adds nightly and
 cargo-fuzz). `./run.sh [seconds] [target...]` rebuilds seeds from
-`tests/data/saved/` and `fuzz/fixed-seeds/`, then runs each target (CI: 10
+`tests/data/` and `fuzz/fixed-seeds/`, then runs each target (CI: 10
 s). A crash is saved in `fuzz/artifacts/<target>/`; replay with
 `cargo fuzz run <target> <file>`. Pass `--target <host triple>` as `run.sh`
 does: prebuilt x86_64 cargo-fuzz defaults to musl, which the sanitizers
 reject. After changing `train.rs`'s input layout, re-check
 `fixed-seeds/train/*` with `cargo fuzz fmt train <file>`. Targets:
 `native-model`, `json-model`, `xgboost-json-model`, `xgboost-ubjson-model`,
-`compact-model` (accepted models must predict and round-trip), `loaders`,
+`lightgbm-model`, `compact-model` (accepted models must predict and
+round-trip), `loaders`,
 `train` (valid params must train or error, identically across thread
 counts).
 
@@ -112,15 +121,17 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`, `online` (split ranking for `training::online`)|
 |`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
-|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
+|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
-Tests: `tests/parity.rs` is ignored without fixtures; `properties.rs` is
+Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixtures; `properties.rs` is
 proptest; shared helpers are in `tests/common/` and `examples/common/`.
 `tests/data/saved/<version>/` holds each release's saved models (`.bin`,
 `.json`, `.hbtd`, `.margins`); `tests/data/xgboost-3.4.2-categorical.*` are
-XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
+XGBoost saves for `model/xgboost.rs` tests, and `tests/data/lightgbm-4.7.0-*`
+LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
+`gen_lightgbm_fixtures.py --test-data`) for `model/lightgbm.rs` tests. `benches/training.rs`
 (Criterion) results go in `docs/performance.md`.
 
 ## Layout (`python/`)

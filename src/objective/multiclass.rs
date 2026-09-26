@@ -4,7 +4,7 @@
 //! carries `K` raw margins, laid out `[instance][class]` (row-major). Each round
 //! the trainer grows one tree per class from that class's gradient slice.
 
-use super::{GradPair, MIN_HESS, Objective, check_label_domain};
+use super::{GradPair, Loss, MIN_HESS, check_label_domain};
 use crate::data::MetaInfo;
 use crate::error::Result;
 
@@ -27,7 +27,7 @@ impl Softmax {
     }
 }
 
-impl Objective for Softmax {
+impl Loss for Softmax {
     fn name(&self) -> &str {
         if self.output_prob {
             "multi:softprob"
@@ -94,8 +94,8 @@ impl Objective for Softmax {
         check_label_domain(info, |y| y.fract() != 0.0 || y < 0.0 || y >= k)
     }
 
-    fn default_metric(&self) -> String {
-        "mlogloss".to_string()
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::MLogLoss
     }
 }
 

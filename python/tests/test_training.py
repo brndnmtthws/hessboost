@@ -408,7 +408,9 @@ def test_custom_metric_drives_early_stopping() -> None:
         evals_result=history,
         verbose_eval=False,
     )
-    assert list(history["valid"]) == ["mae"]
+    # As in XGBoost, the custom metric follows the default one and, being
+    # last, drives early stopping.
+    assert list(history["valid"]) == ["rmse", "mae"]
     assert set(calls) == {100}
     best = booster.best_iteration
     assert best is not None and booster.best_score == min(history["valid"]["mae"])

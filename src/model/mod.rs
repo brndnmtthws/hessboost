@@ -162,9 +162,9 @@
 //! `binary:logistic`, not its logit). `hessboost` stores per-output
 //! intercepts in **margin** space, so on **import** the vector is mapped
 //! through the objective's inverse link
-//! ([`Objective::probs_to_margins`](crate::objective::Objective::probs_to_margins))
+//! ([`Loss::probs_to_margins`](crate::objective::Loss::probs_to_margins))
 //! and on **export** the margin row is mapped back with
-//! [`Objective::margins_to_probs`](crate::objective::Objective::margins_to_probs)
+//! [`Loss::margins_to_probs`](crate::objective::Loss::margins_to_probs)
 //! (the forward transform, except for `binary:hinge` and
 //! `reg:quantileerror`, whose transforms (threshold, sort) are not their
 //! links). Multiclass objectives (and any objective that cannot be
@@ -299,7 +299,7 @@ pub struct BoostedModel {
     trees: Vec<RegTree>,
     /// Per-output intercept in margin space (length `n_outputs`).
     base_score: Vec<f32>,
-    /// The objective's XGBoost name (`Objective::name`), which drives the
+    /// The objective's XGBoost name (`Loss::name`), which drives the
     /// prediction transform.
     objective: String,
     /// Objective hyper-parameters, retained for XGBoost-format export and for
@@ -467,12 +467,12 @@ struct AttributionPrologue<'a> {
 /// The metadata a model is assembled with: what it predicts and how its trees
 /// are laid out. Shared by training and the XGBoost-JSON importer.
 pub(crate) struct ModelSpec {
-    /// The objective's XGBoost name (`Objective::name`).
+    /// The objective's XGBoost name (`Loss::name`).
     pub(crate) objective: String,
     pub(crate) objective_params: ObjectiveParams,
     /// Configured `num_class` (`0` for scalar objectives).
     pub(crate) num_class: usize,
-    /// Raw outputs per instance (`Objective::n_outputs`).
+    /// Raw outputs per instance (`Loss::n_outputs`).
     pub(crate) n_outputs: usize,
     /// Label columns per training row ([`DMatrix::n_targets`]).
     pub(crate) n_targets: usize,
@@ -1718,7 +1718,7 @@ impl BoostedModel {
     /// The objective the model was trained with, rebuilt from its name,
     /// `num_class` and retained parameters. Fails for objectives the crate
     /// cannot construct by name (custom objectives).
-    pub(crate) fn rebuild_objective(&self) -> Result<Box<dyn crate::objective::Objective>> {
+    pub(crate) fn rebuild_objective(&self) -> Result<Box<dyn crate::objective::Loss>> {
         rebuild_objective(
             &self.objective,
             &self.objective_params,
@@ -1785,7 +1785,7 @@ fn rebuild_objective(
     params: &ObjectiveParams,
     num_class: usize,
     n_targets: usize,
-) -> Result<Box<dyn crate::objective::Objective>> {
+) -> Result<Box<dyn crate::objective::Loss>> {
     let params = params
         .training_params(objective, num_class)
         .build_unchecked();

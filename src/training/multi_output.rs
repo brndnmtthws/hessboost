@@ -1,7 +1,7 @@
 //! Boosting rounds for `multi_strategy = multi_output_tree`: one vector-leaf
 //! tree per round fits every output at once (XGBoost's `IsVectorLeaf` path),
 //! for `gbtree` and DART, optionally growing its structure from reduced split
-//! gradients supplied by the objective ([`Objective::split_gradient`]).
+//! gradients supplied by the objective ([`Loss::split_gradient`]).
 
 use super::train::{
     MarginCaches, TrainContext, TreeOutput, dart_new_tree_weight, finish_dart, gradient_sampling,
@@ -11,7 +11,7 @@ use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMeth
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::objective::{GradPair, Objective, SplitGradient};
+use crate::objective::{GradPair, Loss, SplitGradient};
 use crate::rng::Rng;
 use crate::training::sampling::gradient_based_sample;
 use crate::training::sglb::LeafRenewal;
@@ -53,7 +53,7 @@ pub(super) fn validate(params: &TrainingParams, n_outputs: usize) -> Result<()> 
 /// Reduced split gradients are defined for vector-leaf trees only: refuse an
 /// objective that supplies them to any other booster or strategy.
 pub(crate) fn reject_split_gradient(
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     round: usize,
     gpair: &[GradPair],
 ) -> Result<()> {
@@ -69,7 +69,7 @@ pub(crate) fn reject_split_gradient(
 
 /// The objective's split gradients for this round, shape-checked.
 fn split_gradient(
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     params: &TrainingParams,
     round: usize,
     gpair: &[GradPair],

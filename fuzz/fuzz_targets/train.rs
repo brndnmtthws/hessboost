@@ -1,16 +1,14 @@
 #![no_main]
 //! End-to-end training on small fuzzed datasets and configurations. Any
-//! configuration `TrainingParams::validate` accepts must train or return an
+//! configuration `TrainingParams::from_xgboost` accepts must train or return an
 //! error, never panic; a trained model must be deterministic across thread
 //! counts and survive every prediction and serialization API.
-use hessboost::config::{
-    AftDistribution, BoosterKind, DistGradient, DistSplitDirection, GrowPolicy, Monotone,
-    MultiStrategy, SamplingMethod, TreeMethod,
-};
+use hessboost::config::BoosterKind;
 use hessboost::data::FeatureType;
 use hessboost::prelude::*;
 use libfuzzer_sys::arbitrary::{Arbitrary, Error as ArbError, Result as ArbResult, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use serde_json::{Map, Value, json};
 
 #[path = "common.rs"]
 mod common;
@@ -242,106 +240,111 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     };
     let n_cols = dtrain.n_cols();
 
-    let mut params = TrainingParams::default();
-    params.booster = *u.choose(&[
-        BoosterKind::GbTree,
-        BoosterKind::Dart,
-        BoosterKind::GbLinear,
-    ])?;
-    params.seed = u.arbitrary()?;
-    params.objective = objective.to_string();
-    params.num_class = num_class;
-    params.base_score = if u.arbitrary()? {
-        Some(param(u, &[0.0, 0.5, 1.0, -1.0, 2.0])?)
-    } else {
-        None
+    // XGBoost's flat form, read in a fixed order so a corpus input keeps
+    // its meaning; `from_xgboost` refuses what `validate` would.
+    let mut flat = Map::new();
+    let mut set = |key: &str, value: Value| {
+        flat.insert(key.to_owned(), value);
     };
-    params.tweedie_variance_power = param(u, &[1.5, 1.0, 2.0])?;
-    params.huber_slope = param(u, &[1.0, 0.1, 10.0])?;
-    params.lambdarank_num_pair_per_sample = u.int_in_range(0..=4)?;
-    params.quantile_alpha = alphas(u)?;
-    params.expectile_alpha = alphas(u)?;
-    params.aft_loss_distribution = *u.choose(&[
-        AftDistribution::Normal,
-        AftDistribution::Logistic,
-        AftDistribution::Extreme,
-    ])?;
-    params.aft_loss_distribution_scale = param(u, &[1.0, 0.5, 2.0])?;
-    params.dist_gradient = *u.choose(&[DistGradient::Fisher, DistGradient::Hessian])?;
-    params.dist_split_direction =
-        *u.choose(&[DistSplitDirection::Random, DistSplitDirection::Cyclic])?;
-    params.eta = param(u, &[0.3, 0.1, 1.0, 1e-3, 10.0])?;
-    params.gamma = param(u, &[0.0, 0.5, 10.0])?;
-    params.max_depth = u.int_in_range(0..=6)?;
-    params.max_leaves = u.int_in_range(0..=8)?;
-    params.min_child_weight = param(u, &[1.0, 0.0, 0.1, 5.0])?;
-    params.max_delta_step = if u.ratio(1, 4)? {
-        Some(param(u, &[0.0, 0.7, 1.0])?)
-    } else {
-        None
-    };
-    params.subsample = param(u, &[1.0, 0.5, 0.1])?;
-    params.colsample_bytree = param(u, &[1.0, 0.5, 0.0])?;
-    params.colsample_bylevel = param(u, &[1.0, 0.5, 0.0])?;
-    params.colsample_bynode = param(u, &[1.0, 0.5, 0.0])?;
-    params.lambda = param(u, &[1.0, 0.0, 10.0])?;
-    params.alpha = param(u, &[0.0, 1.0])?;
-    params.scale_pos_weight = param(u, &[1.0, 0.5, 4.0])?;
-    params.tree_method = *u.choose(&[
-        TreeMethod::Auto,
-        TreeMethod::Exact,
-        TreeMethod::Approx,
-        TreeMethod::Hist,
-    ])?;
-    params.grow_policy = *u.choose(&[
-        GrowPolicy::DepthWise,
-        GrowPolicy::LossGuide,
-        GrowPolicy::Symmetric,
-    ])?;
-    params.max_bin = u.int_in_range(0..=32)?;
-    params.num_parallel_tree = u.int_in_range(0..=3)?;
-    params.sampling_method =
-        *u.choose(&[SamplingMethod::Uniform, SamplingMethod::GradientBased])?;
-    params.multi_strategy = *u.choose(&[
-        MultiStrategy::OneOutputPerTree,
-        MultiStrategy::MultiOutputTree,
-    ])?;
-    params.extra_trees = u.ratio(1, 6)?;
-    params.extra_seed = u.arbitrary()?;
-    params.path_smooth = param(u, &[0.0, 0.0, 1.0])?;
-    params.linear_tree = u.ratio(1, 6)?;
-    params.linear_lambda = param(u, &[0.0, 1.0])?;
-    params.use_quantized_grad = u.ratio(1, 6)?;
-    params.num_grad_quant_bins = u.int_in_range(0..=8)?;
-    params.stochastic_rounding = u.arbitrary()?;
-    params.quant_train_renew_leaf = u.arbitrary()?;
-    params.rate_drop = param(u, &[0.0, 0.5, 1.0])?;
-    params.skip_drop = param(u, &[0.0, 0.5, 1.0])?;
-    params.toad_penalty_feature = param(u, &[0.0, 0.0, 1.0])?;
-    params.toad_penalty_threshold = param(u, &[0.0, 0.0, 1.0])?;
+    set(
+        "booster",
+        json!(*u.choose(&["gbtree", "dart", "gblinear"])?),
+    );
+    set("seed", json!(u.arbitrary::<u64>()?));
+    set("objective", json!(objective));
+    set("num_class", json!(num_class));
+    if u.arbitrary()? {
+        set("base_score", json!(param(u, &[0.0, 0.5, 1.0, -1.0, 2.0])?));
+    }
+    set("tweedie_variance_power", json!(param(u, &[1.5, 1.0, 2.0])?));
+    set("huber_slope", json!(param(u, &[1.0, 0.1, 10.0])?));
+    set(
+        "lambdarank_num_pair_per_sample",
+        json!(u.int_in_range(0..=4)?),
+    );
+    set("quantile_alpha", json!(alphas(u)?));
+    set("expectile_alpha", json!(alphas(u)?));
+    set(
+        "aft_loss_distribution",
+        json!(*u.choose(&["normal", "logistic", "extreme"])?),
+    );
+    set(
+        "aft_loss_distribution_scale",
+        json!(param(u, &[1.0, 0.5, 2.0])?),
+    );
+    set("dist_gradient", json!(*u.choose(&["fisher", "hessian"])?));
+    set(
+        "dist_split_direction",
+        json!(*u.choose(&["random", "cyclic"])?),
+    );
+    set("eta", json!(param(u, &[0.3, 0.1, 1.0, 1e-3, 10.0])?));
+    set("gamma", json!(param(u, &[0.0, 0.5, 10.0])?));
+    set("max_depth", json!(u.int_in_range(0..=6)?));
+    set("max_leaves", json!(u.int_in_range(0..=8)?));
+    set("min_child_weight", json!(param(u, &[1.0, 0.0, 0.1, 5.0])?));
     if u.ratio(1, 4)? {
-        for _ in 0..n_cols {
-            params.monotone_constraints.push(*u.choose(&[
-                Monotone::None,
-                Monotone::Increasing,
-                Monotone::Decreasing,
-            ])?);
-        }
+        set("max_delta_step", json!(param(u, &[0.0, 0.7, 1.0])?));
+    }
+    set("subsample", json!(param(u, &[1.0, 0.5, 0.1])?));
+    set("colsample_bytree", json!(param(u, &[1.0, 0.5, 0.0])?));
+    set("colsample_bylevel", json!(param(u, &[1.0, 0.5, 0.0])?));
+    set("colsample_bynode", json!(param(u, &[1.0, 0.5, 0.0])?));
+    set("lambda", json!(param(u, &[1.0, 0.0, 10.0])?));
+    set("alpha", json!(param(u, &[0.0, 1.0])?));
+    set("scale_pos_weight", json!(param(u, &[1.0, 0.5, 4.0])?));
+    set(
+        "tree_method",
+        json!(*u.choose(&["auto", "exact", "approx", "hist"])?),
+    );
+    set(
+        "grow_policy",
+        json!(*u.choose(&["depthwise", "lossguide", "symmetric"])?),
+    );
+    set("max_bin", json!(u.int_in_range(0..=32)?));
+    set("num_parallel_tree", json!(u.int_in_range(0..=3)?));
+    set(
+        "sampling_method",
+        json!(*u.choose(&["uniform", "gradient_based"])?),
+    );
+    set(
+        "multi_strategy",
+        json!(*u.choose(&["one_output_per_tree", "multi_output_tree"])?),
+    );
+    set("extra_trees", json!(u.ratio(1, 6)?));
+    set("extra_seed", json!(u.arbitrary::<u64>()?));
+    set("path_smooth", json!(param(u, &[0.0, 0.0, 1.0])?));
+    set("linear_tree", json!(u.ratio(1, 6)?));
+    set("linear_lambda", json!(param(u, &[0.0, 1.0])?));
+    set("use_quantized_grad", json!(u.ratio(1, 6)?));
+    set("num_grad_quant_bins", json!(u.int_in_range(0..=8)?));
+    set("stochastic_rounding", json!(u.arbitrary::<bool>()?));
+    set("quant_train_renew_leaf", json!(u.arbitrary::<bool>()?));
+    set("rate_drop", json!(param(u, &[0.0, 0.5, 1.0])?));
+    set("skip_drop", json!(param(u, &[0.0, 0.5, 1.0])?));
+    set("toad_penalty_feature", json!(param(u, &[0.0, 0.0, 1.0])?));
+    set("toad_penalty_threshold", json!(param(u, &[0.0, 0.0, 1.0])?));
+    if u.ratio(1, 4)? {
+        let monotone = (0..n_cols)
+            .map(|_| u.choose(&[0, 1, -1]).copied())
+            .collect::<ArbResult<Vec<i8>>>()?;
+        set("monotone_constraints", json!(monotone));
     }
     if u.ratio(1, 4)? {
-        for _ in 0..u.int_in_range(1..=3)? {
-            let group = (0..u.int_in_range(1..=n_cols)?)
-                .map(|_| u.int_in_range(0..=n_cols as u32 - 1))
-                .collect::<ArbResult<Vec<_>>>()?;
-            params.interaction_constraints.push(group);
-        }
+        let groups = (0..u.int_in_range(1..=3)?)
+            .map(|_| {
+                (0..u.int_in_range(1..=n_cols)?)
+                    .map(|_| u.int_in_range(0..=n_cols as u32 - 1))
+                    .collect::<ArbResult<Vec<_>>>()
+            })
+            .collect::<ArbResult<Vec<_>>>()?;
+        set("interaction_constraints", json!(groups));
     }
     if u.ratio(1, 4)? {
-        params.eval_metric.push((*u.choose(METRICS)?).to_string());
+        set("eval_metric", json!([*u.choose(METRICS)?]));
     }
-    if params.validate().is_err() {
+    let Ok(params) = TrainingParams::from_xgboost(flat) else {
         return Ok(None);
-    }
+    };
 
     Ok(Some(Case {
         params,

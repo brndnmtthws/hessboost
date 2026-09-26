@@ -1,11 +1,13 @@
 //! Classification objectives.
 
 use super::{
-    GradPair, MIN_HESS, Objective, check_label_domain, newton_intercepts, weighted_label_mean,
+    GradPair, Loss, MIN_HESS, OutputDomain, check_base_score_domain, check_label_domain,
+    newton_intercepts, weighted_label_mean,
 };
 use crate::K_RT_EPS_F32;
 use crate::data::MetaInfo;
 use crate::error::Result;
+use crate::metric::EvalMetric;
 
 /// Logistic loss: `binary:logistic` (classification, reported with
 /// `logloss`), `reg:logistic` (probability regression, reported with `rmse`
@@ -80,7 +82,7 @@ impl Default for Logistic {
     }
 }
 
-impl Objective for Logistic {
+impl Loss for Logistic {
     fn name(&self) -> &str {
         match self.variant {
             LogisticVariant::Binary => "binary:logistic",
@@ -140,6 +142,14 @@ impl Objective for Logistic {
         }
     }
 
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        // `binary:logitraw`'s link is the identity: any margin is valid.
+        if self.variant == LogisticVariant::Raw {
+            return Ok(());
+        }
+        check_base_score_domain(base_score, OutputDomain::Probability)
+    }
+
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
         // Cross-entropy `softplus(m) − y·m` (stable form), with positives
         // reweighted by `scale_pos_weight` exactly as in the gradient.
@@ -158,12 +168,11 @@ impl Objective for Logistic {
         check_label_domain(info, |y| !(0.0..=1.0).contains(&y))
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> EvalMetric {
         match self.variant {
-            LogisticVariant::Regression => "rmse",
-            LogisticVariant::Binary | LogisticVariant::Raw => "logloss",
+            LogisticVariant::Regression => EvalMetric::Rmse,
+            LogisticVariant::Binary | LogisticVariant::Raw => EvalMetric::LogLoss,
         }
-        .to_string()
     }
 }
 
@@ -179,7 +188,7 @@ impl Objective for Logistic {
 #[non_exhaustive]
 pub struct Hinge;
 
-impl Objective for Hinge {
+impl Loss for Hinge {
     fn name(&self) -> &'static str {
         "binary:hinge"
     }
@@ -212,8 +221,8 @@ impl Objective for Hinge {
         // `base_score` is the margin itself, not the thresholded prediction.
     }
 
-    fn default_metric(&self) -> String {
-        "error".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::Error
     }
 }
 

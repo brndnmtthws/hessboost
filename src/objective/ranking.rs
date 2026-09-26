@@ -8,7 +8,7 @@
 //! change. Pair values, accumulation, per-query normalization, and query
 //! weighting use XGBoost's float/double conversion points.
 
-use super::{GradPair, MIN_HESS_F64, Objective, check_label_domain};
+use super::{GradPair, Loss, MIN_HESS_F64, check_label_domain};
 use crate::data::{GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::{argsort_desc, group_ranges};
@@ -146,7 +146,7 @@ fn normalize_group(out: &mut [GradPair], sum_lambda: f64, query_weight: f32, wei
 /// parallel (each query writes only its own rows).
 const PARALLEL_RANK_ROWS: usize = 4096;
 
-impl Objective for LambdaMart {
+impl Loss for LambdaMart {
     fn name(&self) -> &str {
         match self.mode {
             RankMode::Pairwise => "rank:pairwise",
@@ -264,14 +264,15 @@ impl Objective for LambdaMart {
         Ok(())
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> crate::metric::EvalMetric {
         // XGBoost `RankEvalMetric`: `ndcg@k` for `rank:pairwise` and
         // `rank:ndcg`, `map@k` for `rank:map`, with `k` the `topk` pair count.
-        let base = match self.mode {
-            RankMode::Pairwise | RankMode::Ndcg => "ndcg",
-            RankMode::Map => "map",
-        };
-        format!("{base}@{}", self.top_k)
+        use crate::metric::{Cutoff, EvalMetric};
+        let cutoff = std::num::NonZeroUsize::new(self.top_k).map_or_else(Cutoff::all, Cutoff::from);
+        match self.mode {
+            RankMode::Pairwise | RankMode::Ndcg => EvalMetric::Ndcg(cutoff),
+            RankMode::Map => EvalMetric::Map(cutoff),
+        }
     }
 }
 
@@ -507,9 +508,9 @@ mod tests {
 
     #[test]
     fn default_metric_follows_mode_and_top_k() {
-        assert_eq!(LambdaMart::pairwise(32).default_metric(), "ndcg@32");
-        assert_eq!(LambdaMart::ndcg(5).default_metric(), "ndcg@5");
-        assert_eq!(LambdaMart::map(10).default_metric(), "map@10");
+        assert_eq!(LambdaMart::pairwise(32).default_metric().name(), "ndcg@32");
+        assert_eq!(LambdaMart::ndcg(5).default_metric().name(), "ndcg@5");
+        assert_eq!(LambdaMart::map(10).default_metric().name(), "map@10");
     }
 
     /// Groups or weights that do not match the rows are refused before any

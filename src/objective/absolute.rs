@@ -1,6 +1,6 @@
 //! Mean absolute error regression (`reg:absoluteerror`).
 
-use super::{GradPair, Objective, fit_stump, weighted_label_mean};
+use super::{GradPair, Loss, fit_stump, weighted_label_mean};
 use crate::data::MetaInfo;
 
 /// Total row weight in `f64` (`n_rows` without weights), or `None` when it is
@@ -81,7 +81,7 @@ impl Default for AbsoluteError {
     }
 }
 
-impl Objective for AbsoluteError {
+impl Loss for AbsoluteError {
     fn name(&self) -> &'static str {
         "reg:absoluteerror"
     }
@@ -156,8 +156,8 @@ impl Objective for AbsoluteError {
         super::check_label_width(info, self.n_targets)
     }
 
-    fn default_metric(&self) -> String {
-        "mae".to_string()
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::Mae
     }
 }
 
@@ -293,10 +293,10 @@ mod tests {
         let params = TrainingParams::builder().build().unwrap();
         let two = AbsoluteError::new(2);
         assert!(matches!(
-            Trainer::new(&params, &d, 1).objective(&two).train(),
+            Trainer::new(&params, &d, 1).loss(&two).train(),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
         ));
         let one = AbsoluteError::new(1);
-        assert!(Trainer::new(&params, &d, 1).objective(&one).train().is_ok());
+        assert!(Trainer::new(&params, &d, 1).loss(&one).train().is_ok());
     }
 }

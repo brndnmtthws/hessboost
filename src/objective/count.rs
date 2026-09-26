@@ -1,9 +1,14 @@
 //! Count and positive-continuous regression objectives with a log link:
 //! Poisson, Gamma, and Tweedie. All predict `exp(margin)`.
 
-use super::{GradPair, Objective, check_label_domain, log_link, weighted_label_mean};
+use super::{
+    GradPair, Loss, OutputDomain, check_base_score_domain, check_label_domain, log_link,
+    weighted_label_mean,
+};
 use crate::data::MetaInfo;
 use crate::error::Result;
+use crate::metric::EvalMetric;
+use crate::objective::Tweedie;
 
 /// Half the Poisson unit deviance at log-mean `margin`: `y ln(y/μ) − (y − μ)`,
 /// whose margin derivative is the Poisson gradient `μ − y`.
@@ -17,8 +22,9 @@ fn poisson_deviance(margin: f32, label: f32) -> f64 {
     }
 }
 
-/// Emit the `pred_transform`/`probs_to_margins`/`base_margins_info` trio
-/// shared by the log-link objectives (all predict `exp(margin)`). The link is
+/// Emit the `pred_transform`/`probs_to_margins`/`validate_base_score`/
+/// `base_margins_info` hooks shared by the log-link objectives (all predict
+/// `exp(margin)`). The link is
 /// XGBoost's `ProbToMargin`, `ln(v)` in `f32`; the intercept is XGBoost's
 /// `FitInterceptGlmLike`, the (weighted) label mean through that link.
 macro_rules! log_link_objective {
@@ -29,6 +35,10 @@ macro_rules! log_link_objective {
 
         fn probs_to_margins(&self, scores: &mut [f32]) {
             log_link(scores);
+        }
+
+        fn validate_base_score(&self, base_score: f64) -> Result<()> {
+            check_base_score_domain(base_score, OutputDomain::Positive)
         }
 
         fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
@@ -62,7 +72,7 @@ impl Default for Poisson {
     }
 }
 
-impl Objective for Poisson {
+impl Loss for Poisson {
     fn name(&self) -> &'static str {
         "count:poisson"
     }
@@ -98,8 +108,8 @@ impl Objective for Poisson {
         check_label_domain(info, |y| y < 0.0)
     }
 
-    fn default_metric(&self) -> String {
-        "poisson-nloglik".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::PoissonNLogLik
     }
 }
 
@@ -109,7 +119,7 @@ impl Objective for Poisson {
 #[non_exhaustive]
 pub struct Gamma;
 
-impl Objective for Gamma {
+impl Loss for Gamma {
     fn name(&self) -> &'static str {
         "reg:gamma"
     }
@@ -148,32 +158,36 @@ impl Objective for Gamma {
         check_label_domain(info, |y| y <= 0.0)
     }
 
-    fn default_metric(&self) -> String {
-        "gamma-nloglik".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::GammaNLogLik
     }
 }
 
 /// Tweedie regression (`reg:tweedie`) with variance power `rho ∈ [1, 2)`
 /// (XGBoost `tweedie_variance_power`; 1 is Poisson, 2 would be Gamma).
 #[derive(Debug, Clone, Copy)]
-pub struct Tweedie {
+pub(crate) struct TweedieLoss {
+    param: Tweedie,
     rho: f32,
 }
 
-impl Tweedie {
-    /// Create with the given Tweedie variance power.
-    pub fn new(rho: f32) -> Self {
-        Tweedie { rho }
+impl TweedieLoss {
+    /// The loss at variance power `param`.
+    pub(crate) fn new(param: Tweedie) -> Self {
+        TweedieLoss {
+            param,
+            rho: param.variance_power() as f32,
+        }
     }
 }
 
-impl Default for Tweedie {
+impl Default for TweedieLoss {
     fn default() -> Self {
-        Tweedie { rho: 1.5 }
+        TweedieLoss::new(Tweedie::default())
     }
 }
 
-impl Objective for Tweedie {
+impl Loss for TweedieLoss {
     fn name(&self) -> &'static str {
         "reg:tweedie"
     }
@@ -219,10 +233,10 @@ impl Objective for Tweedie {
         check_label_domain(info, |y| y < 0.0)
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> EvalMetric {
         // XGBoost `TweedieRegression::Configure` names the metric with the
         // configured power so evaluation uses the same distribution.
-        format!("tweedie-nloglik@{}", self.rho)
+        EvalMetric::TweedieNLogLik(self.param)
     }
 }
 
@@ -256,7 +270,7 @@ mod tests {
 
     #[test]
     fn tweedie_transform_is_exp() {
-        let obj = Tweedie::default();
+        let obj = TweedieLoss::default();
         let mut p = [0.0f32, 1.0];
         obj.pred_transform(&mut p);
         assert_relative_eq!(p[0], 1.0, epsilon = 1e-6);

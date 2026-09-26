@@ -3,8 +3,9 @@
 //! probability score (`crps`) of the predicted distributions.
 //!
 //! Both read predictions as the objective reports them, one row of natural
-//! parameters per instance (`[row][parameter]`), and take the family from
-//! the objective (`ObjectiveParams::distribution`).
+//! parameters per instance (`[row][parameter]`), of the family they carry
+//! (`EvalMetric::Nll` / `EvalMetric::Crps`; XGBoost's flat form takes it
+//! from the `dist:*` objective).
 
 use super::{Metric, weighted_mean};
 use crate::data::MetaInfo;
@@ -55,13 +56,13 @@ fn mean_score(
 /// (`nll`, the `dist:*` objectives' default metric): the log density for the
 /// continuous families, the log probability mass for the count families.
 #[derive(Debug, Clone, Copy)]
-pub struct DistNll {
+pub(crate) struct DistNll {
     family: DistFamily,
 }
 
 impl DistNll {
     /// The metric for `family`.
-    pub fn new(family: DistFamily) -> Self {
+    pub(crate) fn new(family: DistFamily) -> Self {
         DistNll { family }
     }
 }
@@ -89,13 +90,13 @@ impl Metric for DistNll {
 /// (`crps`), in the label's units; see [`Dist::crps`] for the closed forms
 /// and the exact step sums of the count families.
 #[derive(Debug, Clone, Copy)]
-pub struct DistCrps {
+pub(crate) struct DistCrps {
     family: DistFamily,
 }
 
 impl DistCrps {
     /// The metric for `family`.
-    pub fn new(family: DistFamily) -> Self {
+    pub(crate) fn new(family: DistFamily) -> Self {
         DistCrps { family }
     }
 }
@@ -122,8 +123,7 @@ impl Metric for DistCrps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ObjectiveParams;
-    use crate::metric::build;
+    use crate::metric::{DEFAULT_SOURCE, XgboostMetricSource, named};
 
     #[test]
     fn metrics_average_the_per_row_scores_with_weights() {
@@ -166,14 +166,16 @@ mod tests {
 
     #[test]
     fn factory_takes_the_family_from_the_objective() {
-        let dist = ObjectiveParams::defaults_for("dist:gamma");
-        assert_eq!(dist.distribution, Some(DistFamily::Gamma));
+        let dist = XgboostMetricSource {
+            distribution: Some(DistFamily::Gamma),
+            ..DEFAULT_SOURCE
+        };
         for name in ["nll", "crps"] {
-            let metric = build(name, 0, &dist).unwrap();
+            let metric = named(name, 2, &dist).unwrap();
             assert_eq!(metric.name(), name);
             assert!(!metric.maximize());
             // Not a distributional objective: nothing to score.
-            assert!(build(name, 0, &ObjectiveParams::default()).is_err());
+            assert!(named(name, 2, &DEFAULT_SOURCE).is_err());
         }
     }
 }

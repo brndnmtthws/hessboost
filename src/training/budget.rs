@@ -52,7 +52,7 @@
 //! truncation, structural-plateau stopping, and objective/shape-specific
 //! adjustments of the schedules above) are not reproduced, so results match
 //! Perpetual's behavior in kind, not number for number. Losses are the
-//! objectives' [`pointwise_loss`](crate::objective::Objective::pointwise_loss)
+//! objectives' [`pointwise_loss`](crate::objective::Loss::pointwise_loss)
 //! (deviance form for the log-link objectives, where Perpetual uses the
 //! unshifted negative log-likelihood).
 //!
@@ -105,8 +105,8 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, create_objective};
 use crate::training::train::{
-    check_num_class, initial_intercepts, new_model, reject_feature_weights, reject_missing_param,
-    validate_dataset, validate_trained_model, with_thread_pool,
+    check_num_class, initial_intercepts, new_model, reject_feature_weights, validate_dataset,
+    validate_trained_model, with_thread_pool,
 };
 use crate::tree::builder::budget::{
     ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
@@ -336,7 +336,6 @@ fn train_budget_inner(
 ) -> Result<BudgetResult> {
     config.validate()?;
     params.validate()?;
-    reject_missing_param(params)?;
     reject_feature_weights(dtrain, "budget mode does not sample columns")?;
     let objective = create_objective(params, dtrain.n_targets())?;
     let n_out = objective.n_outputs();

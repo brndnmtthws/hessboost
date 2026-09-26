@@ -5,7 +5,7 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::model::ModelSpec;
 use crate::model::ubjson::{self, ElementType};
-use crate::objective::{Objective, create_objective};
+use crate::objective::{Loss, create_objective};
 use crate::tree::{Node, RegTree};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -120,7 +120,7 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     let objective = model.objective();
     reject_extension_objective(objective)?;
     // XGBoost can only load objectives it knows; a custom objective
-    // (`Trainer::objective`) has no XGBoost counterpart.
+    // (`Trainer::loss`) has no XGBoost counterpart.
     let objective_impl = model.rebuild_objective().map_err(|_| {
         HessboostError::model_format(format!(
             "objective `{objective}` has no XGBoost equivalent; cannot export"
@@ -788,7 +788,7 @@ fn build_objective(
     num_class: usize,
     n_targets: usize,
     params: &ObjectiveParams,
-) -> Result<Option<Box<dyn Objective>>> {
+) -> Result<Option<Box<dyn Loss>>> {
     let params = params.training_params(name, num_class).build_unchecked();
     match create_objective(&params, n_targets) {
         Ok(objective) => Ok(Some(objective)),
@@ -810,11 +810,11 @@ fn is_multiclass(objective: &str) -> bool {
 
 /// Render the per-output margin intercepts as XGBoost 3.x's `base_score`
 /// vector string, `"[v0,v1,...]"`, in the space XGBoost stores it in: the
-/// whole row mapped through [`Objective::margins_to_probs`], the inverse of
+/// whole row mapped through [`Loss::margins_to_probs`], the inverse of
 /// the objective's `ProbToMargin`. Multiclass (softmax) values pass through
 /// unchanged, since XGBoost's softmax `ProbToMargin` is the identity while
 /// its transform normalizes across classes.
-fn format_base_score(margins: &[f32], objective: &dyn Objective) -> String {
+fn format_base_score(margins: &[f32], objective: &dyn Loss) -> String {
     let mut stored = margins.to_vec();
     if !is_multiclass(objective.name()) {
         objective.margins_to_probs(&mut stored);
@@ -837,7 +837,7 @@ const MAX_BROADCAST_OUTPUTS: usize = 1 << 16;
 /// (values pass through unchanged for an objective we cannot reconstruct).
 fn parse_base_score(
     stored: &str,
-    objective: Option<&dyn Objective>,
+    objective: Option<&dyn Loss>,
     n_outputs: usize,
 ) -> Result<Vec<f32>> {
     let invalid = || HessboostError::model_format(format!("invalid `base_score` `{stored}`"));
@@ -2333,7 +2333,7 @@ mod tests {
 
     #[test]
     fn custom_objective_export_is_rejected() {
-        use crate::objective::{CustomObjective, GradPair};
+        use crate::objective::{CustomLoss, GradPair};
         use crate::training::Trainer;
         let (_, d) = reg_model();
         let params = TrainingParams::builder()
@@ -2341,14 +2341,14 @@ mod tests {
             .max_depth(2)
             .build()
             .unwrap();
-        let obj = CustomObjective::new("custom:test", 1, 0.0, "rmse", |preds, labels, w, out| {
+        let obj = CustomLoss::new("custom:test", 1, |preds, labels, w, out| {
             for i in 0..preds.len() {
                 let wi = w.map_or(1.0, |ws| ws[i]);
                 out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi);
             }
         });
         let model = Trainer::new(&params, &d, 2)
-            .objective(&obj)
+            .loss(&obj)
             .train()
             .unwrap()
             .model;

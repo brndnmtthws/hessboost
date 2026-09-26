@@ -6,7 +6,7 @@ use hessboost::config::{
     BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType, TreeMethod,
 };
 use hessboost::data::FeatureType;
-use hessboost::objective::{CustomObjective, GradPair, SplitGradient};
+use hessboost::objective::{CustomLoss, GradPair, SplitGradient};
 use hessboost::prelude::*;
 
 mod common;
@@ -247,12 +247,13 @@ fn dart_rounds_train_vector_trees() {
     assert_contribs_sum_to(&model.predict_contribs(&d).unwrap(), &margins);
 }
 
-fn squared_error(k: usize) -> CustomObjective {
-    CustomObjective::new("custom:sqerr", k, 0.5, "rmse", |p, y, _w, out| {
+fn squared_error(k: usize) -> CustomLoss {
+    CustomLoss::new("custom:sqerr", k, |p, y, _w, out| {
         for (o, (p, y)) in out.iter_mut().zip(p.iter().zip(y)) {
             *o = GradPair::new(p - y, 1.0);
         }
     })
+    .with_base_margin(0.5)
 }
 
 /// Mean over targets, XGBoost's `multioutput_reduced_gradient.py` sketch.
@@ -277,7 +278,7 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
     let params = vector_params().lambda(0.0).build().unwrap();
     let obj = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
     let model = Trainer::new(&params, &dtrain, 1)
-        .objective(&obj)
+        .loss(&obj)
         .train()
         .unwrap()
         .model;
@@ -306,7 +307,7 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
     }
     // The sketch changes the structure relative to the full gradients.
     let full = Trainer::new(&params, &dtrain, 1)
-        .objective(&squared_error(K))
+        .loss(&squared_error(K))
         .train()
         .unwrap()
         .model;
@@ -325,11 +326,7 @@ fn unsupported_combinations_are_rejected() {
     let sketch = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
     let per_output = TrainingParams::builder().build().unwrap();
     assert_eq!(
-        invalid_param(
-            Trainer::new(&per_output, &dtrain, 1)
-                .objective(&sketch)
-                .train()
-        ),
+        invalid_param(Trainer::new(&per_output, &dtrain, 1).loss(&sketch).train()),
         "objective"
     );
     // The linear booster grows no trees, so it refuses the hook rather than
@@ -344,7 +341,7 @@ fn unsupported_combinations_are_rejected() {
             .build()
             .unwrap();
         assert_eq!(
-            invalid_param(Trainer::new(&linear, &dtrain, 1).objective(&sketch).train()),
+            invalid_param(Trainer::new(&linear, &dtrain, 1).loss(&sketch).train()),
             "objective"
         );
     }
@@ -353,11 +350,7 @@ fn unsupported_combinations_are_rejected() {
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(
-            Trainer::new(&monotone, &dtrain, 1)
-                .objective(&sketch)
-                .train()
-        ),
+        invalid_param(Trainer::new(&monotone, &dtrain, 1).loss(&sketch).train()),
         "monotone_constraints"
     );
 
@@ -365,7 +358,7 @@ fn unsupported_combinations_are_rejected() {
         squared_error(K).with_split_gradient(|_, g| Some(SplitGradient::new(g[1..].to_vec(), 1)));
     assert!(matches!(
         Trainer::new(&vector_params().build().unwrap(), &dtrain, 1)
-            .objective(&wrong)
+            .loss(&wrong)
             .train(),
         Err(HessboostError::DimensionMismatch { .. })
     ));

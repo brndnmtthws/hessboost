@@ -19,7 +19,7 @@ const DEFAULT_TOP_K: usize = 32;
 /// binary (within `1e-6` of `0` or `1`); XGBoost aborts otherwise, and this
 /// metric returns NaN. Higher is better.
 #[derive(Debug, Clone)]
-pub struct Precision {
+pub(crate) struct Precision {
     k: usize,
     name: String,
 }
@@ -136,11 +136,9 @@ mod tests {
     /// dividing `0 / 0`.
     #[test]
     fn precision_of_empty_input_and_groups() {
-        use crate::config::{ObjectiveParams, TrainingParams};
-        use crate::metric::build;
-        let defaults = ObjectiveParams::from_params(&TrainingParams::default());
+        use crate::metric::{DEFAULT_SOURCE, named};
         for name in ["pre@5", "ndcg", "map"] {
-            let m = build(name, 0, &defaults).unwrap();
+            let m = named(name, 1, &DEFAULT_SOURCE).unwrap();
             assert_eq!(m.eval(&[], &[], Some(&[])), 0.0, "{name}");
             assert_eq!(m.eval(&[], &[], None), 0.0, "{name}");
         }
@@ -155,18 +153,16 @@ mod tests {
     /// parameter error rather than a NaN score.
     #[test]
     fn factory_names_and_rejections() {
-        use crate::config::{ObjectiveParams, TrainingParams};
-        use crate::metric::build;
-        let defaults = ObjectiveParams::from_params(&TrainingParams::default());
+        use crate::metric::{DEFAULT_SOURCE, XgboostMetricSource, named};
         for name in ["pre", "pre@5"] {
-            let m = build(name, 0, &defaults).unwrap();
+            let m = named(name, 1, &DEFAULT_SOURCE).unwrap();
             assert_eq!(m.name(), name);
             assert!(m.maximize());
         }
-        let flat = ObjectiveParams {
+        let flat = XgboostMetricSource {
             huber_slope: 0.0,
-            ..defaults
+            ..DEFAULT_SOURCE
         };
-        assert!(build("mphe", 0, &flat).is_err());
+        assert!(named("mphe", 1, &flat).is_err());
     }
 }

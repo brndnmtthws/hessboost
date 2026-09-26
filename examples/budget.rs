@@ -7,7 +7,7 @@
 //!
 //! Run with: `cargo run --release --example budget`
 
-use hessboost::metric::{LogLoss, Metric, Rmse};
+use hessboost::metric::EvalMetric;
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, train_with_budget};
 use std::time::Instant;
@@ -74,8 +74,9 @@ fn report(
     dtrain: &DMatrix,
     dvalid: &DMatrix,
     dtest: &DMatrix,
-    metric: &dyn Metric,
+    metric: &EvalMetric,
 ) -> Result<()> {
+    let metric = metric.build(1)?;
     let labels = dtest.labels().unwrap_or_default();
     let score = |preds: &[f32]| metric.eval(preds, labels, None);
     let params = TrainingParams::builder().objective(objective).build()?;
@@ -145,7 +146,7 @@ fn main() -> Result<()> {
         &regression(5000, 1)?,
         &regression(2000, 2)?,
         &regression(10_000, 3)?,
-        &Rmse::default(),
+        &EvalMetric::Rmse,
     )?;
     report(
         "Friedman #1 binary classification, 5000 rows",
@@ -153,7 +154,7 @@ fn main() -> Result<()> {
         &binary(5000, 4)?,
         &binary(2000, 5)?,
         &binary(10_000, 6)?,
-        &LogLoss::default(),
+        &EvalMetric::LogLoss,
     )?;
     Ok(())
 }

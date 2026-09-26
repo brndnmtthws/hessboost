@@ -12,12 +12,8 @@ use hessboost::data::FeatureType;
 use hessboost::internals::{
     ColumnSampler, CpuBackend, GHistIndex, HistCuts, HistTreeBuilder, HistogramBackend, zeroed,
 };
-use hessboost::metric::{
-    ErrorRate, GammaNLogLik, LogLoss, Mae, Metric, PoissonNLogLik, Rmse, create_metric,
-};
-use hessboost::objective::{
-    Gamma, GradPair, Logistic, Objective, Poisson, Softmax, Tweedie, create_objective,
-};
+use hessboost::metric::{EvalMetric, Metric};
+use hessboost::objective::{GradPair, Loss, Tweedie, create_objective};
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, train_with_budget};
 use std::hint::black_box;
@@ -294,7 +290,10 @@ fn bench_objective_gradients(c: &mut Criterion) {
     let mut group = c.benchmark_group("objective_gradient");
     group.throughput(Throughput::Elements(N as u64));
 
-    let mut run = |name: &str, objective: &dyn Objective, y: &[f32], weights: Option<&[f32]>| {
+    let loss = |b: TrainingParamsBuilder| create_objective(&b.build().unwrap(), 1).unwrap();
+    let logistic = loss(TrainingParams::builder().objective("binary:logistic"));
+    let gamma = loss(TrainingParams::builder().objective("reg:gamma"));
+    let mut run = |name: &str, objective: &dyn Loss, y: &[f32], weights: Option<&[f32]>| {
         group.bench_function(name, |b| {
             b.iter(|| {
                 objective.gradient(&preds, y, weights, &mut out);
@@ -302,33 +301,33 @@ fn bench_objective_gradients(c: &mut Criterion) {
             });
         });
     };
-    run(
-        "logistic_unweighted_1m",
-        &Logistic::default(),
-        &labels,
-        None,
-    );
+    run("logistic_unweighted_1m", logistic.as_ref(), &labels, None);
     run(
         "logistic_weighted_1m",
-        &Logistic::new(1.5),
+        loss(
+            TrainingParams::builder()
+                .objective("binary:logistic")
+                .scale_pos_weight(1.5),
+        )
+        .as_ref(),
         &labels,
         Some(&weights),
     );
     run(
         "poisson_unweighted_1m",
-        &Poisson::default(),
+        loss(TrainingParams::builder().objective("count:poisson")).as_ref(),
         &positive_labels,
         None,
     );
     run(
         "gamma_unweighted_1m",
-        &Gamma::default(),
+        gamma.as_ref(),
         &positive_labels,
         None,
     );
     run(
         "tweedie_unweighted_1m",
-        &Tweedie::default(),
+        loss(TrainingParams::builder().objective("reg:tweedie")).as_ref(),
         &positive_labels,
         None,
     );
@@ -343,7 +342,11 @@ fn bench_objective_gradients(c: &mut Criterion) {
         let multi_labels: Vec<f32> = (0..rows).map(|i| (i % k) as f32).collect();
         let multi_weights: Vec<f32> = make_weights(rows);
         let mut multi_out = vec![GradPair::default(); rows * k];
-        let softmax = Softmax::new(k, true);
+        let softmax = loss(
+            TrainingParams::builder()
+                .objective("multi:softprob")
+                .num_class(k),
+        );
         group.throughput(Throughput::Elements((rows * k) as u64));
         for (suffix, weights) in [("", None), ("_weighted", Some(multi_weights.as_slice()))] {
             group.bench_function(format!("softmax_k{k}{suffix}_1m_outputs"), |b| {
@@ -358,6 +361,9 @@ fn bench_objective_gradients(c: &mut Criterion) {
 }
 
 fn bench_prediction_transforms(c: &mut Criterion) {
+    let loss = |b: TrainingParamsBuilder| create_objective(&b.build().unwrap(), 1).unwrap();
+    let logistic = loss(TrainingParams::builder().objective("binary:logistic"));
+    let gamma = loss(TrainingParams::builder().objective("reg:gamma"));
     let source: Vec<f32> = wide_range(N);
     let mut values = source.clone();
     let mut group = c.benchmark_group("prediction_transform");
@@ -366,7 +372,7 @@ fn bench_prediction_transforms(c: &mut Criterion) {
     group.bench_function("logistic_automatic", |b| {
         b.iter(|| {
             values.copy_from_slice(&source);
-            Logistic::default().pred_transform(&mut values);
+            logistic.pred_transform(&mut values);
             black_box(&values);
         });
     });
@@ -382,7 +388,7 @@ fn bench_prediction_transforms(c: &mut Criterion) {
     group.bench_function("exp_automatic", |b| {
         b.iter(|| {
             values.copy_from_slice(&source);
-            Gamma::default().pred_transform(&mut values);
+            gamma.pred_transform(&mut values);
             black_box(&values);
         });
     });
@@ -402,7 +408,11 @@ fn bench_prediction_transforms(c: &mut Criterion) {
         let len = N / num_class * num_class;
         let source = &source[..len];
         let mut values = source.to_vec();
-        let objective = Softmax::new(num_class, true);
+        let objective = loss(
+            TrainingParams::builder()
+                .objective("multi:softprob")
+                .num_class(num_class),
+        );
         group.throughput(Throughput::Elements(len as u64));
         group.bench_function(format!("softmax_k{num_class}_1m_outputs"), |b| {
             b.iter(|| {
@@ -423,11 +433,12 @@ fn bench_pointwise_metrics(c: &mut Criterion) {
     group.throughput(Throughput::Elements(N as u64));
 
     for (name, metric) in [
-        ("rmse", &Rmse::default() as &dyn Metric),
-        ("mae", &Mae::default() as &dyn Metric),
-        ("error", &ErrorRate::default() as &dyn Metric),
+        ("rmse", EvalMetric::Rmse),
+        ("mae", EvalMetric::Mae),
+        ("error", EvalMetric::Error),
     ] {
-        bench_metric_pair(&mut group, name, metric, &preds, &labels, &weights);
+        let metric = metric.build(1).unwrap();
+        bench_metric_pair(&mut group, name, metric.as_ref(), &preds, &labels, &weights);
     }
     group.finish();
 }
@@ -440,30 +451,33 @@ fn bench_log_metrics(c: &mut Criterion) {
     let mut group = c.benchmark_group("log_metric");
     group.throughput(Throughput::Elements(N as u64));
 
-    let tweedie = create_metric("tweedie-nloglik@1.5", &TrainingParams::default()).unwrap();
     for (name, metric, labels) in [
-        (
-            "logloss",
-            &LogLoss::default() as &dyn Metric,
-            binary_labels.as_slice(),
-        ),
+        ("logloss", EvalMetric::LogLoss, binary_labels.as_slice()),
         (
             "poisson_nloglik",
-            &PoissonNLogLik::default() as &dyn Metric,
+            EvalMetric::PoissonNLogLik,
             positive_labels.as_slice(),
         ),
         (
             "gamma_nloglik",
-            &GammaNLogLik::default() as &dyn Metric,
+            EvalMetric::GammaNLogLik,
             positive_labels.as_slice(),
         ),
         (
             "tweedie_nloglik",
-            tweedie.as_ref(),
+            EvalMetric::TweedieNLogLik(Tweedie::default()),
             positive_labels.as_slice(),
         ),
     ] {
-        bench_metric_pair(&mut group, name, metric, &probabilities, labels, &weights);
+        let metric = metric.build(1).unwrap();
+        bench_metric_pair(
+            &mut group,
+            name,
+            metric.as_ref(),
+            &probabilities,
+            labels,
+            &weights,
+        );
     }
     group.finish();
 }
@@ -481,13 +495,11 @@ fn bench_multiclass_metrics(c: &mut Criterion) {
             .collect();
         let weights: Vec<f32> = make_weights(rows);
         group.throughput(Throughput::Elements(rows as u64));
-        let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(num_class)
-            .build()
-            .unwrap();
-        for metric_name in ["mlogloss", "merror"] {
-            let metric = create_metric(metric_name, &params).unwrap();
+        for (metric_name, metric) in [
+            ("mlogloss", EvalMetric::MLogLoss),
+            ("merror", EvalMetric::MError),
+        ] {
+            let metric = metric.build(num_class).unwrap();
             group.bench_function(format!("{metric_name}_k{num_class}_unweighted"), |b| {
                 b.iter(|| black_box(metric.eval(&probabilities, &labels, None)));
             });
@@ -499,23 +511,19 @@ fn bench_multiclass_metrics(c: &mut Criterion) {
     group.finish();
 }
 
-fn scalar_logistic_objective(base_margin: f32) -> hessboost::objective::CustomObjective {
-    hessboost::objective::CustomObjective::new(
-        "scalar:logistic",
-        1,
-        base_margin,
-        "logloss",
-        |preds, labels, weights, out| {
-            for i in 0..preds.len() {
-                let probability = scalar_sigmoid(preds[i]);
-                let weight = weights.map_or(1.0, |values| values[i]);
-                out[i] = GradPair::new(
-                    (probability - labels[i]) * weight,
-                    (probability * (1.0 - probability)).max(1e-16) * weight,
-                );
-            }
-        },
-    )
+fn scalar_logistic_objective(base_margin: f32) -> hessboost::objective::CustomLoss {
+    hessboost::objective::CustomLoss::new("scalar:logistic", 1, |preds, labels, weights, out| {
+        for i in 0..preds.len() {
+            let probability = scalar_sigmoid(preds[i]);
+            let weight = weights.map_or(1.0, |values| values[i]);
+            out[i] = GradPair::new(
+                (probability - labels[i]) * weight,
+                (probability * (1.0 - probability)).max(1e-16) * weight,
+            );
+        }
+    })
+    .with_base_margin(base_margin)
+    .with_default_metric(hessboost::metric::EvalMetric::LogLoss)
 }
 
 fn bench_binary_train(c: &mut Criterion) {
@@ -540,7 +548,7 @@ fn bench_binary_train(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 Trainer::new(&params, &data, 50)
-                    .objective(&scalar_logistic_objective(base_margin))
+                    .loss(&scalar_logistic_objective(base_margin))
                     .train()
                     .unwrap()
                     .model,
@@ -650,7 +658,7 @@ fn bench_other_gradients(c: &mut Criterion) {
         |len: usize| -> Vec<f32> { (0..len).map(|i| (i % 1_001) as f32 * 0.004 - 2.0).collect() };
     let regression_labels =
         |n: usize| -> Vec<f32> { (0..n).map(|i| (i % 997) as f32 * 0.004 - 2.0).collect() };
-    let mut run = |name: &str, objective: &dyn Objective, data: &DMatrix, width: usize| {
+    let mut run = |name: &str, objective: &dyn Loss, data: &DMatrix, width: usize| {
         let n = data.n_rows();
         let preds = margins(n * width);
         let mut out = vec![GradPair::default(); n * width];
@@ -759,6 +767,16 @@ fn bench_other_gradients(c: &mut Criterion) {
     group.finish();
 }
 
+/// The metric XGBoost names `name` under `params` (which supply the flat
+/// parameters `mphe`, `quantile`, `aft-nloglik`, `nll`, ... read).
+fn named_metric(name: &str, params: &TrainingParams) -> Box<dyn Metric> {
+    let mut flat = params.to_xgboost().unwrap();
+    flat.insert("eval_metric".to_owned(), serde_json::json!(name));
+    TrainingParams::from_xgboost(flat).unwrap().eval_metric[0]
+        .build(1)
+        .unwrap()
+}
+
 /// Evaluation metrics outside the pointwise kernels, through `eval_info`
 /// (the training path): curves, ranking, survival, alpha lists, the
 /// elementwise metrics, and the `dist:*` scores.
@@ -766,7 +784,7 @@ fn bench_other_metrics(c: &mut Criterion) {
     let mut group = c.benchmark_group("eval_metric_other");
     let n = 100_000;
     let mut run = |name: &str, params: &TrainingParams, data: &DMatrix, preds: &[f32]| {
-        let metric = create_metric(name.split('/').next().unwrap(), params).unwrap();
+        let metric = named_metric(name.split('/').next().unwrap(), params);
         let info = data.info();
         // A NaN would time an input check, not the metric.
         assert!(metric.eval_info(preds, &info).is_finite(), "{name}");
@@ -1007,8 +1025,8 @@ fn bench_train_variants(c: &mut Criterion) {
         });
     }
     let params = base()
-        .eval_metric("rmse")
-        .eval_metric("mae")
+        .eval_metric(hessboost::metric::EvalMetric::Rmse)
+        .eval_metric(hessboost::metric::EvalMetric::Mae)
         .build()
         .unwrap();
     group.bench_function("eval_set_rmse_mae", |b| {

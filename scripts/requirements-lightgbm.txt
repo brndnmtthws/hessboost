@@ -1,0 +1,4 @@
+# The LightGBM release the LightGBM import parity fixtures target
+# (scripts/gen_lightgbm_fixtures.py checks the installed version).
+lightgbm==4.7.0
+numpy

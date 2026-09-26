@@ -1160,10 +1160,10 @@ impl TrainingParams {
         }
         ensure(
             "objective",
-            matches!(self.objective.as_str(), "reg:squarederror" | "reg:linear"),
+            matches!(self.objective, Objective::SquaredError),
             format!(
                 "`booster = boulevard` supports `reg:squarederror` only, got `{}`",
-                self.objective
+                self.objective.name()
             ),
         )?;
         if self.num_parallel_tree > 1 {

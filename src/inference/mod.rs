@@ -196,7 +196,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
+use crate::model::{BoostedModel, ModelObjective};
+use crate::objective::Objective;
 use crate::objective::distributional::special::norm_ppf;
 use kernel::LeafKernel;
 use rayon::prelude::*;
@@ -267,8 +268,10 @@ impl BoulevardInfo {
         if model.num_parallel_tree() > 1 && (self.dropout != 0.0 || self.learning_rate != 1.0) {
             return fail("BRAT-P (num_parallel_tree > 1) needs dropout 0 and learning_rate 1");
         }
-        if model.objective() != "reg:squarederror"
-            || model.n_outputs() != 1
+        if !matches!(
+            model.objective(),
+            ModelObjective::BuiltIn(Objective::SquaredError)
+        ) || model.n_outputs() != 1
             || model.has_vector_leaves()
             || model.has_non_unit_tree_weights()
             || model.trees().iter().any(|t| t.linear_leaves().is_some())

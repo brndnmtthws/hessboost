@@ -2,6 +2,7 @@
 
 use hessboost::config::{BoosterKind, TrainingParams, TrainingParamsBuilder};
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
+use hessboost::objective::Objective;
 use hessboost::prelude::*;
 
 mod common;
@@ -178,7 +179,7 @@ fn settings_that_break_the_linear_smoother_are_refused() {
         other => panic!("expected a refusal, got {other:?}"),
     };
     assert_eq!(
-        refused(builder().objective("reg:pseudohubererror")),
+        refused(builder().objective(Objective::SquaredLogError)),
         "objective"
     );
     assert_eq!(refused(builder().alpha(1.0)), "alpha");

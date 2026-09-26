@@ -350,9 +350,9 @@ pub use predictions::{Contributions, Interactions, Predictions};
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
+use crate::inference::BoulevardInfo;
 use crate::objective::distributional::Dist;
 use crate::objective::{Loss, LossContext, Objective};
-use crate::inference::BoulevardInfo;
 use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, key};
 use crate::tree::{RegTree, UncheckedRegTree, scalar_tree_output};
 use objective::{PartialStoredObjectiveParams, StoredObjectiveParams};
@@ -472,6 +472,7 @@ struct SerializedBoostedModel<'a> {
     num_parallel_tree: usize,
     linear: &'a Option<LinearModel>,
     shrinkage: &'a Option<Shrinkage>,
+    boulevard: &'a Option<BoulevardInfo>,
 }
 
 impl Serialize for BoostedModel {
@@ -493,6 +494,7 @@ impl Serialize for BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: &self.linear,
             shrinkage: &self.shrinkage,
+            boulevard: &self.boulevard,
         }
         .serialize(serializer)
     }

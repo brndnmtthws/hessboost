@@ -52,10 +52,12 @@ impl Axis {
             } else {
                 edges[c - 1]
             }),
-            // Past the listed categories: one that no split names.
+            // Past the listed categories: the smallest code no split names
+            // (at most `categories.len()`, so exact in `f32`; "largest + 1"
+            // is not above 2^24, where it can round onto a listed code).
             TermAxis::Categorical { categories } => Some(match categories.get(c) {
                 Some(&k) => k as f32,
-                None => categories.last().map_or(0.0, |&k| k as f32 + 1.0),
+                None => unnamed_code(categories) as f32,
             }),
         }
     }
@@ -65,6 +67,19 @@ impl Axis {
     fn goes_left(&self, tree: &RegTree, node: &crate::tree::Node, c: usize) -> bool {
         tree.goes_left(node, self.representative(c))
     }
+}
+
+/// The smallest category code not in the ascending, deduplicated
+/// `categories`.
+fn unnamed_code(categories: &[u32]) -> u32 {
+    let mut code = 0u32;
+    for &k in categories {
+        if k != code {
+            break;
+        }
+        code += 1;
+    }
+    code
 }
 
 /// A box of cells, `[lo0, hi0) × [lo1, hi1)` (the second axis is `[0, 1)`

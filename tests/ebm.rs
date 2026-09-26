@@ -394,6 +394,40 @@ fn categorical_shapes_recover_the_per_category_effects() {
 }
 
 #[test]
+fn categorical_shapes_reconstruct_the_margins_for_codes_past_2_pow_24() {
+    // Codes 2^24 + 2c (all exact in f32): "one past the largest" would
+    // round onto a listed code there.
+    let (x, _) = categorical_data(1500, 12);
+    let shifted: Vec<f32> = x
+        .chunks(2)
+        .flat_map(|r| {
+            let code = if r[0].is_nan() {
+                f32::NAN
+            } else {
+                16_777_216.0 + 2.0 * r[0]
+            };
+            [code, r[1]]
+        })
+        .collect();
+    let (_, labelled) = categorical_data(1500, 12);
+    let dtrain = DMatrix::from_dense(&shifted, 1500, 2)
+        .unwrap()
+        .with_labels(labelled.labels().unwrap())
+        .unwrap()
+        .with_feature_types(&[FeatureType::Categorical, FeatureType::Numerical])
+        .unwrap();
+    let model = train(&classic().ebm_interactions(0).build().unwrap(), &dtrain, 40).unwrap();
+    let shapes = shape_functions(&model).unwrap();
+    let preds = model.predict(&dtrain).unwrap();
+    for (row, &p) in shifted.chunks(2).zip(&preds) {
+        let margin = shapes.intercept
+            + shapes.terms[0].value(&row[..1]).unwrap()
+            + shapes.terms[1].value(&row[1..]).unwrap();
+        assert!((margin - f64::from(p)).abs() < 1e-4, "{margin} vs {p}");
+    }
+}
+
+#[test]
 fn shape_lookups_refuse_or_absorb_malformed_points() {
     let (_, dtrain) = categorical_data(300, 10);
     let model = train(&classic().ebm_interactions(1).build().unwrap(), &dtrain, 10).unwrap();

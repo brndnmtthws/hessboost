@@ -93,7 +93,7 @@ impl Hook<'_> {
 }
 
 /// Train `rounds` EBM rounds of main effects, then of the
-/// [`ebm_interactions`](TrainingParams::ebm_interactions) FAST pairs, into
+/// [`Ebm::interactions`](crate::config::Ebm::interactions) FAST pairs, into
 /// `model` (which holds only the intercept) and record its [`EbmInfo`],
 /// calling `after_round` after every round of either stage. A `Break` stops
 /// training there: the model keeps the completed rounds (a stopped
@@ -115,18 +115,18 @@ pub(super) fn boost(
     let params = run.params;
     let p = run.dtrain.n_cols();
     let max_pairs = p * p.saturating_sub(1) / 2;
-    if params.ebm_interactions > max_pairs {
+    if params.ebm_settings().interactions() > max_pairs {
         return Err(HessboostError::invalid_param(
             "ebm_interactions",
             format!(
                 "{p} features have {max_pairs} pairs, got {}",
-                params.ebm_interactions
+                params.ebm_settings().interactions()
             ),
         ));
     }
     let mains: Vec<Vec<u32>> = (0..p as u32).map(|f| vec![f]).collect();
     let mu = f64::from(model.base_scores()[0]);
-    let (Grown { trees, pairs }, boulevard) = if params.ebm_boulevard {
+    let (Grown { trees, pairs }, boulevard) = if params.ebm_settings().boulevard() {
         let info = EbmBoulevard {
             learning_rate: params.eta,
             subsample: params.subsample,
@@ -274,15 +274,15 @@ impl Bag {
         let TrainContext { params, dtrain, .. } = *run;
         let n = dtrain.n_rows();
         let index = index as u64;
-        let rows = if params.ebm_bag_fraction >= 1.0 {
+        let rows = if params.ebm_settings().bag_fraction() >= 1.0 {
             all_rows(n)
         } else {
             let mut rng = Rng::new(splitmix64(
                 params.seed ^ EBM_BAG_SALT ^ index.wrapping_mul(GOLDEN),
             ));
-            subsample_of(&all_rows(n), params.ebm_bag_fraction, &mut rng)
+            subsample_of(&all_rows(n), params.ebm_settings().bag_fraction(), &mut rng)
         };
-        let holdout = if params.ebm_early_stopping_rounds > 0 {
+        let holdout = if params.ebm_settings().early_stopping_rounds() > 0 {
             let mut in_bag = vec![false; n];
             for &r in &rows {
                 in_bag[r as usize] = true;
@@ -331,11 +331,15 @@ impl Bag {
     /// seeded with the current model.
     fn start_stage(&mut self, run: &TrainContext, scorer: Option<&Scorer>, terms: usize) {
         self.stopper = scorer.map(|scorer| {
-            let capacity = run.params.ebm_early_stopping_rounds.saturating_mul(terms);
+            let capacity = run
+                .params
+                .ebm_settings()
+                .early_stopping_rounds()
+                .saturating_mul(terms);
             let start = self.score(run, scorer);
             Stopper::new(
                 capacity,
-                run.params.ebm_early_stopping_tolerance,
+                run.params.ebm_settings().early_stopping_tolerance(),
                 start,
                 self,
             )
@@ -445,11 +449,11 @@ fn classic(
 ) -> Result<Grown> {
     let params = run.params;
     let n = run.dtrain.n_rows();
-    let n_bags = params.ebm_outer_bags;
+    let n_bags = params.ebm_settings().outer_bags();
     let mut bags = (0..n_bags)
         .map(|b| Bag::new(run, b, mu))
         .collect::<Result<Vec<Bag>>>()?;
-    let metric = metric.filter(|_| params.ebm_early_stopping_rounds > 0);
+    let metric = metric.filter(|_| params.ebm_settings().early_stopping_rounds() > 0);
     let scorer = metric.map(|metric| Scorer {
         metric,
         sign: if metric.maximize() { -1.0 } else { 1.0 },
@@ -473,7 +477,7 @@ fn classic(
         main_trees.append(&mut bag.trees);
     }
     let mut pairs = Vec::new();
-    if params.ebm_interactions > 0 && !hook.stopped {
+    if params.ebm_settings().interactions() > 0 && !hook.stopped {
         let inv = 1.0 / n_bags as f64;
         let averaged: Vec<f32> = (0..n)
             .map(|i| {
@@ -481,7 +485,11 @@ fn classic(
                 (mu + sum * inv) as f32
             })
             .collect();
-        pairs = fast_pairs(run, &gradients(run, &averaged), params.ebm_interactions);
+        pairs = fast_pairs(
+            run,
+            &gradients(run, &averaged),
+            params.ebm_settings().interactions(),
+        );
         let pair_terms: Vec<Term> = pairs
             .iter()
             .enumerate()
@@ -532,9 +540,13 @@ fn boulevard(
     let StageFit { mut trees, fitted } =
         boulevard_stage(run, prepared, &main_terms, &base, (0, rounds), hook)?;
     let mut pairs = Vec::new();
-    if params.ebm_interactions > 0 && !hook.stopped {
+    if params.ebm_settings().interactions() > 0 && !hook.stopped {
         let margins: Vec<f32> = fitted.iter().map(|&m| m as f32).collect();
-        pairs = fast_pairs(run, &gradients(run, &margins), params.ebm_interactions);
+        pairs = fast_pairs(
+            run,
+            &gradients(run, &margins),
+            params.ebm_settings().interactions(),
+        );
         let pair_terms: Vec<Term> = pairs
             .iter()
             .enumerate()

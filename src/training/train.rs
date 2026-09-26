@@ -829,7 +829,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
         });
     }
 
-    if params.booster == BoosterKind::Ebm {
+    if matches!(params.booster, BoosterKind::Ebm(_)) {
         // `validate` refuses `process_type = update` for EBMs, and
         // `validate_request` eval sets and early stopping.
         let RoundPlan::Grow(prepared) = &plan else {
@@ -1101,7 +1101,7 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     if matches!(params.booster, BoosterKind::Boulevard(_)) {
         validate_boulevard_request(request, objective, "booster = boulevard")?;
     }
-    if params.booster == BoosterKind::Ebm {
+    if matches!(params.booster, BoosterKind::Ebm(_)) {
         validate_ebm_request(request, objective)?;
     }
 
@@ -1202,7 +1202,7 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
         );
     }
     super::ebm::validate_data(request.dtrain)?;
-    if request.params.ebm_boulevard {
+    if request.params.ebm_settings().boulevard() {
         validate_boulevard_request(request, objective, "ebm_boulevard")?;
     }
     Ok(())

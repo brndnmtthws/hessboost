@@ -3,7 +3,7 @@
 //! Beyond XGBoost and opt-in: train with
 //! [`BoosterKind::Ebm`](crate::config::BoosterKind::Ebm), read the shape
 //! functions with [`shape_functions`], and, for an
-//! [`ebm_boulevard`](crate::config::TrainingParams::ebm_boulevard) model,
+//! [`Ebm::boulevard`](crate::config::Ebm::boulevard) model,
 //! their bands with [`EbmInference`](crate::inference::EbmInference).
 //!
 //! An EBM (Lou, Caruana & Gehrke, KDD 2012; Nori et al., *InterpretML*,
@@ -31,19 +31,19 @@
 //!   the shapes are on the margin scale. Categorical features
 //!   ([`DMatrix::with_feature_types`](crate::data::DMatrix::with_feature_types))
 //!   get the builders' native set-membership splits.
-//! - **Outer bags** ([`ebm_outer_bags`](crate::config::TrainingParams::ebm_outer_bags)
+//! - **Outer bags** ([`Ebm::outer_bags`](crate::config::Ebm::outer_bags)
 //!   `= B`): each bag boosts every term on its own row sample
-//!   ([`ebm_bag_fraction`](crate::config::TrainingParams::ebm_bag_fraction))
+//!   ([`Ebm::bag_fraction`](crate::config::Ebm::bag_fraction))
 //!   and the model averages the bags (each bag's trees carry `1/B`). The
 //!   bags train in parallel and are combined in bag order.
-//! - **Early stopping** ([`ebm_early_stopping_rounds`](crate::config::TrainingParams::ebm_early_stopping_rounds)):
+//! - **Early stopping** ([`Ebm::early_stopping_rounds`](crate::config::Ebm::early_stopping_rounds)):
 //!   InterpretML's rule. Every bag scores the rows it does not train on
 //!   after every tree, stops a stage once the last `rounds × terms` trees
 //!   failed to beat its best earlier score by
-//!   [`ebm_early_stopping_tolerance`](crate::config::TrainingParams::ebm_early_stopping_tolerance)
+//!   [`Ebm::early_stopping_tolerance`](crate::config::Ebm::early_stopping_tolerance)
 //!   (relative), and keeps its trees up to its best score, so the bags
 //!   stop at different rounds and `num_boost_round` only caps them.
-//! - **Interactions** ([`ebm_interactions`](crate::config::TrainingParams::ebm_interactions)
+//! - **Interactions** ([`Ebm::interactions`](crate::config::Ebm::interactions)
 //!   `= k`): after the main effects, FAST (Lou, Caruana, Gehrke & Hooker,
 //!   *Accurate intelligible models with pairwise interactions*, KDD 2013)
 //!   ranks every pair of features by the best four-quadrant split of the
@@ -54,7 +54,7 @@
 //!   `Σ_q G_q² / (H_q + lambda) − G² / (H + lambda)`. The top `k` pairs
 //!   (ties by feature order) become terms, boosted with the main effects
 //!   frozen, as InterpretML does.
-//! - **Boulevard** ([`ebm_boulevard`](crate::config::TrainingParams::ebm_boulevard)):
+//! - **Boulevard** ([`Ebm::boulevard`](crate::config::Ebm::boulevard)):
 //!   Fang, Tan, Pipping & Hooker's inferable EBM (*Statistical Inference for
 //!   Explainable Boosting Machines*, AISTATS 2026, Algorithm 1). Round `b`
 //!   fits every term's tree to the same residuals
@@ -105,7 +105,7 @@
 //! # Example
 //!
 //! ```
-//! use hessboost::config::{BoosterKind, GrowPolicy};
+//! use hessboost::config::{BoosterKind, Ebm, GrowPolicy};
 //! use hessboost::ebm::shape_functions;
 //! use hessboost::prelude::*;
 //!
@@ -115,7 +115,7 @@
 //! let y: Vec<f32> = x.chunks(2).map(|r| (6.0 * r[0]).sin() + r[1] * r[1]).collect();
 //! let dtrain = DMatrix::from_dense(&x, n, 2)?.with_labels(&y)?;
 //! let params = TrainingParams::builder()
-//!     .booster(BoosterKind::Ebm)
+//!     .booster(BoosterKind::Ebm(Ebm::default()))
 //!     .eta(0.1)
 //!     .grow_policy(GrowPolicy::LossGuide)
 //!     .max_leaves(3)
@@ -159,7 +159,7 @@ pub struct EbmInfo {
     /// which [`shape_functions`] moves into the intercept.
     pub term_means: Vec<f64>,
     /// The Boulevard settings of an
-    /// [`ebm_boulevard`](crate::config::TrainingParams::ebm_boulevard) fit;
+    /// [`Ebm::boulevard`](crate::config::Ebm::boulevard) fit;
     /// `None` for a classic EBM.
     #[serde(deserialize_with = "Option::deserialize")]
     pub boulevard: Option<EbmBoulevard>,

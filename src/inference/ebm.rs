@@ -38,7 +38,7 @@ struct Stage<'a> {
 }
 
 /// The variance machinery of a Boulevard EBM
-/// ([`ebm_boulevard`](crate::config::TrainingParams::ebm_boulevard)): the
+/// ([`Ebm::boulevard`](crate::config::Ebm::boulevard)): the
 /// additive term kernels over the training rows, their factored ridge
 /// systems, and a noise estimate. Fit once with [`fit`](Self::fit), then
 /// query shape-function bands ([`term_bands`](Self::term_bands)) or
@@ -116,7 +116,7 @@ struct Stage<'a> {
 /// # Example
 ///
 /// ```
-/// use hessboost::config::{BoosterKind, GrowPolicy};
+/// use hessboost::config::{BoosterKind, Ebm, GrowPolicy};
 /// use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance};
 /// use hessboost::prelude::*;
 ///
@@ -130,8 +130,7 @@ struct Stage<'a> {
 ///     .collect();
 /// let dtrain = DMatrix::from_dense(&x, n, 2)?.with_labels(&y)?;
 /// let params = TrainingParams::builder()
-///     .booster(BoosterKind::Ebm)
-///     .ebm_boulevard(true)
+///     .booster(BoosterKind::Ebm(Ebm::builder().boulevard(true).build()?))
 ///     .eta(0.5)
 ///     .subsample(0.8)
 ///     .grow_policy(GrowPolicy::LossGuide)

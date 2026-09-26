@@ -69,7 +69,7 @@ pub(super) fn resume_model(
     }
     // An EBM's record assigns every tree to a term of one run; appended
     // trees would belong to none, and a sum cannot continue into terms.
-    if params.booster == BoosterKind::Ebm || init.ebm().is_some() {
+    if matches!(params.booster, BoosterKind::Ebm(_)) || init.ebm().is_some() {
         return Err(HessboostError::invalid_param(
             "init_model",
             "EBMs are boosted term by term in one run and cannot be trained further, and \

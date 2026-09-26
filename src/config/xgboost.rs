@@ -4,7 +4,7 @@
 //! and the training fuzz target all go through it.
 
 use super::groups::{
-    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    BalancedBagging, Boulevard, Dart, Ebm, ExtraTrees, Langevin, LinearTree, ModelShrink,
     ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
 use super::params::{
@@ -48,6 +48,7 @@ enum FlatBooster {
     Dart,
     GbLinear,
     Boulevard,
+    Ebm,
 }
 
 /// XGBoost's `process_type` names.
@@ -379,6 +380,42 @@ impl Flat {
                 "`booster=boulevard`",
             ),
             (
+                "ebm_interactions",
+                ebm_interactions.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_outer_bags",
+                ebm_outer_bags.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_bag_fraction",
+                ebm_bag_fraction.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_boulevard",
+                ebm_boulevard.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_early_stopping_rounds",
+                ebm_early_stopping_rounds.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_early_stopping_tolerance",
+                ebm_early_stopping_tolerance.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
                 "refresh_leaf",
                 refresh_leaf.is_some(),
                 process_type == Some(FlatProcess::Update),
@@ -460,6 +497,28 @@ impl Flat {
                     boulevard = boulevard.truncation(truncation);
                 }
                 BoosterKind::Boulevard(boulevard.build()?)
+            }
+            FlatBooster::Ebm => {
+                let mut ebm = Ebm::builder();
+                if let Some(v) = ebm_interactions {
+                    ebm = ebm.interactions(v);
+                }
+                if let Some(v) = ebm_outer_bags {
+                    ebm = ebm.outer_bags(v);
+                }
+                if let Some(v) = ebm_bag_fraction {
+                    ebm = ebm.bag_fraction(v);
+                }
+                if let Some(v) = ebm_boulevard {
+                    ebm = ebm.boulevard(v);
+                }
+                if let Some(v) = ebm_early_stopping_rounds {
+                    ebm = ebm.early_stopping_rounds(v);
+                }
+                if let Some(v) = ebm_early_stopping_tolerance {
+                    ebm = ebm.early_stopping_tolerance(v);
+                }
+                BoosterKind::Ebm(ebm.build()?)
             }
         };
         let process_type = match process_type.unwrap_or(FlatProcess::Default) {
@@ -589,14 +648,6 @@ impl Flat {
             langevin,
             model_shrink,
             posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
-            ebm_interactions: ebm_interactions.unwrap_or(d.ebm_interactions),
-            ebm_outer_bags: ebm_outer_bags.unwrap_or(d.ebm_outer_bags),
-            ebm_bag_fraction: ebm_bag_fraction.unwrap_or(d.ebm_bag_fraction),
-            ebm_boulevard: ebm_boulevard.unwrap_or(d.ebm_boulevard),
-            ebm_early_stopping_rounds: ebm_early_stopping_rounds
-                .unwrap_or(d.ebm_early_stopping_rounds),
-            ebm_early_stopping_tolerance: ebm_early_stopping_tolerance
-                .unwrap_or(d.ebm_early_stopping_tolerance),
         })
     }
 }
@@ -991,6 +1042,21 @@ impl TrainingParams {
                 set("booster", json("boulevard"));
                 set("boulevard_dropout", json(boulevard.dropout()));
                 set("boulevard_truncation", json(boulevard.truncation()));
+            }
+            BoosterKind::Ebm(ebm) => {
+                set("booster", json("ebm"));
+                set("ebm_interactions", json(ebm.interactions()));
+                set("ebm_outer_bags", json(ebm.outer_bags()));
+                set("ebm_bag_fraction", json(ebm.bag_fraction()));
+                set("ebm_boulevard", json(ebm.boulevard()));
+                set(
+                    "ebm_early_stopping_rounds",
+                    json(ebm.early_stopping_rounds()),
+                );
+                set(
+                    "ebm_early_stopping_tolerance",
+                    json(ebm.early_stopping_tolerance()),
+                );
             }
         }
         set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));

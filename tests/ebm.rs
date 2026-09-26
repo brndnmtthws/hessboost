@@ -1,7 +1,9 @@
 //! `booster = ebm`: cyclic GA²M boosting, its shape functions
 //! ([`hessboost::ebm`]), and the Boulevard EBM's bands.
 
-use hessboost::config::{BoosterKind, GrowPolicy, TrainingParams, TrainingParamsBuilder};
+use hessboost::config::{
+    BoosterKind, Ebm, EbmBuilder, GrowPolicy, TrainingParams, TrainingParamsBuilder,
+};
 use hessboost::data::FeatureType;
 use hessboost::ebm::TermAxis;
 use hessboost::ebm::shape_functions;
@@ -37,28 +39,46 @@ fn data(n: usize, seed: u64) -> (Vec<f32>, DMatrix) {
     (x, d)
 }
 
-fn classic() -> TrainingParamsBuilder {
+/// The classic EBM settings of [`classic`].
+fn classic_ebm() -> EbmBuilder {
+    Ebm::builder()
+        .interactions(1)
+        .outer_bags(3)
+        .bag_fraction(0.85)
+}
+
+/// A classic cyclic EBM with the EBM settings `ebm`.
+fn classic_with(ebm: EbmBuilder) -> TrainingParamsBuilder {
     TrainingParams::builder()
-        .booster(BoosterKind::Ebm)
+        .booster(BoosterKind::Ebm(ebm.build().unwrap()))
         .eta(0.1)
         .subsample(0.8)
         .grow_policy(GrowPolicy::LossGuide)
         .max_leaves(3)
-        .ebm_interactions(1)
-        .ebm_outer_bags(3)
-        .ebm_bag_fraction(0.85)
 }
 
-fn boulevard() -> TrainingParamsBuilder {
+fn classic() -> TrainingParamsBuilder {
+    classic_with(classic_ebm())
+}
+
+/// The Boulevard EBM settings of [`boulevard`].
+fn boulevard_ebm() -> EbmBuilder {
+    Ebm::builder().boulevard(true).interactions(1)
+}
+
+/// A Boulevard EBM with the EBM settings `ebm`.
+fn boulevard_with(ebm: EbmBuilder) -> TrainingParamsBuilder {
     TrainingParams::builder()
-        .booster(BoosterKind::Ebm)
-        .ebm_boulevard(true)
+        .booster(BoosterKind::Ebm(ebm.build().unwrap()))
         .eta(0.5)
         .subsample(0.8)
         .grow_policy(GrowPolicy::LossGuide)
         .max_leaves(8)
         .min_child_weight(10.0)
-        .ebm_interactions(1)
+}
+
+fn boulevard() -> TrainingParamsBuilder {
+    boulevard_with(boulevard_ebm())
 }
 
 #[test]
@@ -200,8 +220,11 @@ fn unsupported_combinations_are_refused() {
         Err(HessboostError::InvalidParameter { name, .. }) => name,
         other => panic!("expected a refusal, got {other:?}"),
     };
+    let serde_json::Value::Object(flat) = serde_json::json!({"ebm_interactions": 2}) else {
+        unreachable!()
+    };
     assert_eq!(
-        refused(TrainingParams::builder().ebm_interactions(2)),
+        invalid_param(TrainingParams::from_xgboost(flat)),
         "ebm_interactions"
     );
     assert_eq!(refused(classic().colsample_bynode(0.5)), "colsample_bynode");
@@ -214,20 +237,28 @@ fn unsupported_combinations_are_refused() {
         refused(boulevard().objective(Objective::SquaredLogError)),
         "objective"
     );
-    assert_eq!(refused(boulevard().ebm_outer_bags(2)), "ebm_outer_bags");
+    assert_eq!(
+        invalid_param(boulevard_ebm().outer_bags(2).build()),
+        "ebm_outer_bags"
+    );
     assert_eq!(refused(boulevard().base_score(0.5)), "base_score");
     assert_eq!(refused(boulevard().alpha(1.0)), "alpha");
 
     assert_eq!(
-        refused(boulevard().ebm_early_stopping_rounds(5)),
+        invalid_param(boulevard_ebm().early_stopping_rounds(5).build()),
         "ebm_early_stopping_rounds"
     );
     assert_eq!(
-        refused(classic().ebm_bag_fraction(1.0).ebm_early_stopping_rounds(5)),
+        invalid_param(
+            classic_ebm()
+                .bag_fraction(1.0)
+                .early_stopping_rounds(5)
+                .build()
+        ),
         "ebm_early_stopping_rounds"
     );
     assert_eq!(
-        refused(classic().ebm_early_stopping_tolerance(0.0)),
+        invalid_param(classic_ebm().early_stopping_tolerance(0.0).build()),
         "ebm_early_stopping_tolerance"
     );
 
@@ -237,7 +268,7 @@ fn unsupported_combinations_are_refused() {
         .eval(&dtrain, "train")
         .train();
     assert_eq!(invalid_param(evals), "early_stopping_rounds");
-    let too_many = classic().ebm_interactions(4).build().unwrap();
+    let too_many = classic_with(classic_ebm().interactions(4)).build().unwrap();
     assert_eq!(
         invalid_param(train(&too_many, &dtrain, 2)),
         "ebm_interactions"
@@ -294,7 +325,7 @@ fn the_round_hook_sees_both_stages_and_stops_training() {
         let late = stop_at(7);
         assert_eq!(late.num_trees(), bags * (6 * 3 + 2));
         assert_eq!(shape_functions(&late).unwrap().terms.len(), 4);
-        if params.ebm_boulevard {
+        if matches!(params.booster, BoosterKind::Ebm(e) if e.boulevard()) {
             let inference = EbmInference::fit(
                 &late,
                 &dtrain,
@@ -339,8 +370,8 @@ fn categorical_data(n: usize, seed: u64) -> (Vec<f32>, DMatrix) {
 fn categorical_shapes_recover_the_per_category_effects() {
     let (x, dtrain) = categorical_data(2000, 9);
     for params in [
-        classic().ebm_interactions(0),
-        boulevard().ebm_interactions(0),
+        classic_with(classic_ebm().interactions(0)),
+        boulevard_with(boulevard_ebm().interactions(0)),
     ] {
         let model = train(&params.build().unwrap(), &dtrain, 60).unwrap();
         let shapes = shape_functions(&model).unwrap();
@@ -417,7 +448,12 @@ fn categorical_shapes_reconstruct_the_margins_for_codes_past_2_pow_24() {
         .unwrap()
         .with_feature_types(&[FeatureType::Categorical, FeatureType::Numerical])
         .unwrap();
-    let model = train(&classic().ebm_interactions(0).build().unwrap(), &dtrain, 40).unwrap();
+    let model = train(
+        &classic_with(classic_ebm().interactions(0)).build().unwrap(),
+        &dtrain,
+        40,
+    )
+    .unwrap();
     let shapes = shape_functions(&model).unwrap();
     let preds = model.predict(&dtrain).unwrap();
     for (row, &p) in shifted.chunks(2).zip(&preds) {
@@ -431,7 +467,12 @@ fn categorical_shapes_reconstruct_the_margins_for_codes_past_2_pow_24() {
 #[test]
 fn shape_lookups_refuse_or_absorb_malformed_points() {
     let (_, dtrain) = categorical_data(300, 10);
-    let model = train(&classic().ebm_interactions(1).build().unwrap(), &dtrain, 10).unwrap();
+    let model = train(
+        &classic_with(classic_ebm().interactions(1)).build().unwrap(),
+        &dtrain,
+        10,
+    )
+    .unwrap();
     let shapes = shape_functions(&model).unwrap();
     let (categorical, pair) = (&shapes.terms[0], &shapes.terms[2]);
     for bad in [&[][..], &[1.0, 2.0, 3.0][..]] {
@@ -457,9 +498,8 @@ fn early_stopping_scores_bags_with_the_custom_metric() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     let (_, dtrain) = data(400, 13);
-    let params = classic()
+    let params = classic_with(classic_ebm().early_stopping_rounds(3))
         .eta(0.3)
-        .ebm_early_stopping_rounds(3)
         .build()
         .unwrap();
     let metric = CustomMetric::new("mae", false, |preds, labels, _| {
@@ -481,8 +521,7 @@ fn early_stopping_scores_bags_with_the_custom_metric() {
 #[test]
 fn an_oversized_early_stopping_patience_just_never_stops() {
     let (_, dtrain) = data(200, 14);
-    let params = classic()
-        .ebm_early_stopping_rounds(usize::MAX)
+    let params = classic_with(classic_ebm().early_stopping_rounds(usize::MAX))
         .build()
         .unwrap();
     let model = train(&params, &dtrain, 2).unwrap();
@@ -492,9 +531,8 @@ fn an_oversized_early_stopping_patience_just_never_stops() {
 #[test]
 fn early_stopping_ends_every_bag_at_its_best_round() {
     let (_, dtrain) = data(600, 11);
-    let params = classic()
+    let params = classic_with(classic_ebm().early_stopping_rounds(5))
         .eta(0.3)
-        .ebm_early_stopping_rounds(5)
         .build()
         .unwrap();
     let rounds = |max: usize| {
@@ -527,7 +565,9 @@ fn early_stopping_ends_every_bag_at_its_best_round() {
 fn a_boulevard_ebm_with_a_broken_round_layout_does_not_load() {
     let (_, dtrain) = data(200, 12);
     let model = train(
-        &boulevard().ebm_interactions(0).build().unwrap(),
+        &boulevard_with(boulevard_ebm().interactions(0))
+            .build()
+            .unwrap(),
         &dtrain,
         3,
     )

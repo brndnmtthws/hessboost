@@ -5,7 +5,7 @@
 //!
 //! `cargo run --release --example ebm`
 
-use hessboost::config::{BoosterKind, GrowPolicy};
+use hessboost::config::{BoosterKind, Ebm, GrowPolicy};
 use hessboost::data::FeatureType;
 use hessboost::ebm::{TermAxis, shape_functions};
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
@@ -59,15 +59,18 @@ fn main() -> Result<()> {
     // 85% of the rows, each stopped on its other 15% after 50 rounds
     // without improvement, and one FAST pair.
     let params = TrainingParams::builder()
-        .booster(BoosterKind::Ebm)
+        .booster(BoosterKind::Ebm(
+            Ebm::builder()
+                .outer_bags(8)
+                .bag_fraction(0.85)
+                .early_stopping_rounds(50)
+                .interactions(1)
+                .build()?,
+        ))
         .eta(0.04)
         .grow_policy(GrowPolicy::LossGuide)
         .max_leaves(3)
         .min_child_weight(4.0)
-        .ebm_outer_bags(8)
-        .ebm_bag_fraction(0.85)
-        .ebm_early_stopping_rounds(50)
-        .ebm_interactions(1)
         .build()?;
     let model = train(&params, &dtrain, 5000)?;
     let rmse = |m: &BoostedModel| -> Result<f64> {
@@ -119,15 +122,15 @@ fn main() -> Result<()> {
     // Boulevard EBM: structures from `dtrain`, leaves refitted on an
     // independent sample, bands from the refit.
     let params = TrainingParams::builder()
-        .booster(BoosterKind::Ebm)
-        .ebm_boulevard(true)
+        .booster(BoosterKind::Ebm(
+            Ebm::builder().boulevard(true).interactions(1).build()?,
+        ))
         .eta(1.0)
         .subsample(0.8)
         .grow_policy(GrowPolicy::LossGuide)
         .max_leaves(32)
         .min_child_weight(5.0)
         .max_bin(64)
-        .ebm_interactions(1)
         .build()?;
     let values = simulate(2000, 3)?;
     let model = honest_refit(&train(&params, &dtrain, 300)?, &values)?;

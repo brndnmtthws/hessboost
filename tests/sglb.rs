@@ -440,4 +440,13 @@ fn uncertainty_decomposes_per_objective() {
         common::invalid_param(squared.predict_virtual_ensembles(&reg, 0)),
         "virtual_ensembles_count"
     );
+    assert_eq!(
+        common::invalid_param(squared.predict_virtual_ensembles(&reg, usize::MAX)),
+        "virtual_ensembles_count"
+    );
+    let members = squared.predict_virtual_ensembles(&reg, 5).unwrap();
+    assert!(members.member_margins(4).is_some());
+    assert!(members.member_margins(5).is_none());
+    assert!(members.member_predictions(usize::MAX).is_none());
+    assert!(members.member_margins(usize::MAX).is_none());
 }

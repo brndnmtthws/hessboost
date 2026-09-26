@@ -124,7 +124,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `EbmInference`, `TermBands`, `honest_refit`); `kernel` (the `Kernel` trait the solvers read; leaf kernel over the training rows), `term_kernel` (a Boulevard EBM stage's centered additive kernel, computed on term grids), `solver` (exact Cholesky or Nyström ridge solves, Gram or solution vectors), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`, Boulevard models and Boulevard EBMs), `ebm` (shape-function bands)|
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means), `shape_functions`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds, leaves as boxes, difference arrays)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
-|`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `Samples`), `format` (`HBDM` container embedding native GBDT containers; JSON)|
+|`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `Samples`), `format` (`HBDM` container embedding native GBDT containers; JSON), `forest/` (public, ForestFlow/ForestDiffusion: per-level GBDTs, generation, RePaint imputation; `format`: `HBFF`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -256,6 +256,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     (`model::native::frame`, `section_table`) with its own magic and version
     byte (1), the same section rules, and the GBDTs embedded as uncompressed
     native containers; its JSON validates through `UncheckedDiffusionModel`.
+  - Forest (`HBFF`, `diffusion/forest/format.rs`): the same framing, version byte (1), GBDTs concatenated in `[class][level][column]` order; JSON validates through `UncheckedForestModel`.
 - **Tree layout:** iteration `i` owns trees `i * trees_per_iteration ..`.
   Scalar leaves: `n_outputs × num_parallel_tree` per iteration, grouped by
   output; tree `t` feeds output `(t / num_parallel_tree) % n_outputs`.

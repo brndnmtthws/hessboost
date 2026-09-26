@@ -114,6 +114,7 @@ runnable programs live in [`examples/`](examples)
 | `distributional` | predictive distributions, intervals, and NLL |
 | `virtual_ensembles` | SGLB posterior sampling: knowledge uncertainty rising off the training data |
 | `tree_diffusion` | sampling multimodal and skewed `p(y \| x)` with tree diffusion and flow matching |
+| `forest_flow` | synthetic tabular rows and imputation with ForestFlow / ForestDiffusion |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
 | `budget` | budget training against default and tuned training |
@@ -171,6 +172,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
 | [Tree-based diffusion](https://docs.rs/hessboost/latest/hessboost/diffusion/) | nonparametric `p(y \| x)` for scalar or vector labels (multimodal, skewed, heavy-tailed) by conditional diffusion or flow matching with GBDT score models, after Treeffuser and DiffGBM |
+| [ForestFlow / ForestDiffusion](https://docs.rs/hessboost/latest/hessboost/diffusion/forest/) | synthetic mixed-type tabular rows (optionally per class) and missing-value imputation with per-noise-level GBDTs |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/) | add or delete training rows of a trained model (incremental learning, machine unlearning): exact, or approximate and faster than retraining for small changes, after Lin et al. |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |

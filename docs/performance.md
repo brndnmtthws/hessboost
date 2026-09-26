@@ -18,31 +18,31 @@ measures the numerical and tree-building optimizations within hessboost.
 ## XGBoost comparison
 
 Measured on **Apple M3 Max** against [XGBoost 3.4.1](https://pypi.org/project/xgboost/3.4.1/),
-the latest stable PyPI release checked on **2026-09-14 UTC**. Both engines use the
+the latest stable PyPI release checked on **2026-09-26 UTC**. Both engines use the
 same dense `f32` data and CPU `hist` parameters: 100 boosting rounds, depth 6,
 256 bins, `eta=0.1`, and `lambda=1`. Times include fresh training-matrix
 preparation and training, and report the median of six fits after warmup.
 
 | Workload | Threads | hessboost | XGBoost 3.4.1 |
 |---|---:|---:|---:|
-| Regression, 100k × 30 | 1 | 0.458 s | 1.054 s |
-| Regression, 100k × 30 | 4 | 0.201 s | 0.366 s |
-| Regression, 100k × 30 | 16 | 0.264 s | 0.362 s |
-| Regression, 50k × 128 | 1 | 1.153 s | 3.200 s |
-| Regression, 50k × 128 | 4 | 0.452 s | 0.994 s |
-| Regression, 50k × 128 | 16 | 0.428 s | 0.669 s |
-| Binary, 100k × 30 | 1 | 0.459 s | 1.044 s |
-| Binary, 100k × 30 | 4 | 0.197 s | 0.366 s |
-| Binary, 100k × 30 | 16 | 0.256 s | 0.361 s |
-| 4-class, 50k × 30 | 1 | 1.094 s | 2.506 s |
-| 4-class, 50k × 30 | 4 | 0.523 s | 0.981 s |
-| 4-class, 50k × 30 | 16 | 0.746 s | 1.219 s |
+| Regression, 100k × 30 | 1 | 0.412 s | 1.054 s |
+| Regression, 100k × 30 | 4 | 0.158 s | 0.367 s |
+| Regression, 100k × 30 | 16 | 0.203 s | 0.360 s |
+| Regression, 50k × 128 | 1 | 1.057 s | 3.220 s |
+| Regression, 50k × 128 | 4 | 0.357 s | 0.986 s |
+| Regression, 50k × 128 | 16 | 0.326 s | 0.657 s |
+| Binary, 100k × 30 | 1 | 0.402 s | 1.044 s |
+| Binary, 100k × 30 | 4 | 0.156 s | 0.363 s |
+| Binary, 100k × 30 | 16 | 0.199 s | 0.356 s |
+| 4-class, 50k × 30 | 1 | 0.929 s | 2.505 s |
+| 4-class, 50k × 30 | 4 | 0.299 s | 0.972 s |
+| 4-class, 50k × 30 | 16 | 0.235 s | 1.188 s |
 
 hessboost has lower median fit time in all 12 configurations in this run.
-Single-thread speedups range from 2.28× on binary classification to 2.77× on
-wide regression; 30-feature regression reaches 2.30× and multiclass 2.29×. At
-four threads, speedups range from 1.82× to 2.20×, and at sixteen threads from
-1.37× to 1.63×.
+Single-thread speedups range from 2.56× on 30-feature regression to 3.05× on
+wide regression; binary classification reaches 2.60× and multiclass 2.70×. At
+four threads, speedups range from 2.32× to 3.25×, and at sixteen threads from
+1.77× to 5.05× (multiclass; the remaining three range from 1.77× to 2.01×).
 
 ![hessboost speedup over XGBoost 3.4.1 by workload and thread count](benchmarks/xgboost-speedup.svg)
 
@@ -84,13 +84,9 @@ fit quality under identical hyperparameters, not quality across all datasets.
 | Binary, 100k × 30 | 20,000 | logloss | 0.516273 | 0.516273 |
 | 4-class, 50k × 30 | 10,000 | mlogloss | 0.150027 | 0.150027 |
 
-The XGBoost column is from the M3 Max run above. The hessboost column was
-measured on 2026-09-23 on the AWS Neoverse-V3 host (aarch64 Linux 6.12)
-with `bench_xgb.py --threads 1` against XGBoost 3.4.2 built from source
-(`scripts/requirements-xgboost.txt`): XGBoost 3.4.2 reproduces the M3 3.4.1
-scores to all six digits, and hessboost matches XGBoost to within 1e-9 on
-every workload. hessboost's quality was not measured on the M3 Max (both
-hosts are AArch64 and dispatch the same NEON kernels).
+The scores above are from the M3 Max run itself (2026-09-26, both engines):
+hessboost matches XGBoost to within 1e-9 on every workload, so the timing
+differences reflect training speed, not fit quality.
 
 ### Workloads and method
 
@@ -113,7 +109,7 @@ constructs a fresh `DMatrix` inside the timer and bins during training. Both
 read identical binary data before timing. Test-matrix preparation, file I/O,
 process startup, prediction, scoring, and model destruction are excluded.
 
-The runtime is macOS 26.6.2, Rust 1.98.1 / LLVM 22.1.8, uv-managed Python
+The runtime is macOS 27.0, Rust 1.98.1 / LLVM 22.1.8, uv-managed Python
 3.14.5, NumPy 2.5.2, and XGBoost 3.4.1. Rust uses the release profile
 (`opt-level=3`, thin LTO, one codegen unit) without extra `RUSTFLAGS`.
 XGBoost's native build reports Clang 15 and OpenMP support. Compilation finishes
@@ -125,7 +121,10 @@ For each workload and thread count, batches run in
 XGBoost/hessboost/hessboost/XGBoost order. Each batch discards one warmup fit and
 records three fits. The table uses the median of all six recorded fits per
 engine. These numbers describe this CPU and these synthetic workloads; they do
-not establish GPU or other-platform performance.
+not establish GPU or other-platform performance. The full per-fit samples,
+scores, build info, and source hashes are in `/tmp/hessboost-xgb-full`
+(`comparison.json` alongside the shared datasets); rerunning the harness
+regenerates equivalent data in a new output directory.
 
 Reproduce from the repository root, using a new output directory:
 
@@ -134,16 +133,6 @@ cargo build --release --example bench_compare
 uv run --with xgboost==3.4.1 --with numpy==2.5.2 python scripts/bench_xgb.py \
   --hessboost target/release/examples/bench_compare \
   --output /tmp/hessboost-xgb --threads 1 4 16
-```
-
-The quality measurement uses the parity pin instead of the 3.4.1 wheel (a
-source build of XGBoost 3.4.2; one measured fit per batch is enough for
-scores):
-
-```sh
-uv run --with-requirements scripts/requirements-xgboost.txt python scripts/bench_xgb.py \
-  --hessboost target/release/examples/bench_compare \
-  --output /tmp/hessboost-xgb-quality --threads 1 --repeats 1
 ```
 
 The [script documentation](../scripts/README.md#xgboost-comparison) describes
@@ -392,31 +381,48 @@ code, not the algorithm, was the limit:
   - The sketch merges its summaries as two interleaved branch-free halves.
   - Unit-weight queues radix-sort bare keys.
 
-Measured as above (eight fixed workloads at 1 and 8 threads, the minimum
-of fifteen fits per case, runs of the two builds interleaved on the nine
-idlest CPUs of one NUMA node) on the same host on 2026-09-26 UTC, before and
-after. Every case's output bits (held-out predictions, SHAP values) are
-identical between the two builds.
+Measured on **Apple M3 Max** (macOS 27.0, Rust 1.98.1) on 2026-09-26 UTC,
+before (`35b2cd9`) and after (`c94b0c8`), with eight fixed workloads at 1
+and 8 threads: the median of fifteen fits per case (a fresh `DMatrix`
+inside the timer for training; prediction and SHAP time only the call),
+runs of the two builds interleaved (baseline/optimized/optimized/baseline)
+via a throwaway driver (`HOTLOOP_THREADS`/`RAYON_NUM_THREADS` per thread
+count). Every case's output hash (held-out margins, predictions,
+contributions) is identical between the two builds. Values are the mean of
+the two run medians.
 
 | Case | Threads | Before (ms) | After (ms) | Speedup |
 |---|---:|---:|---:|---:|
-| Regression 100k × 30, depth 6, 100 rounds | 1 | 679.0 | 583.7 | 1.16× |
-| Binary 100k × 30, depth 6, 100 rounds | 1 | 661.0 | 573.0 | 1.15× |
-| 4-class 50k × 30, depth 6, 50 rounds | 1 | 830.1 | 703.9 | 1.18× |
-| Regression 50k × 128, depth 6, 50 rounds | 1 | 1013.6 | 841.7 | 1.20× |
-| Loss-guide (64 leaves) 100k × 30, 50 rounds | 1 | 549.9 | 462.6 | 1.19× |
-| Exact 20k × 20, depth 6, 30 rounds | 1 | 716.0 | 262.7 | 2.73× |
-| Predict 100k × 30, 100 trees | 1 | 128.8 | 30.6 | 4.22× |
-| SHAP contributions, 2k × 20, 100 trees | 1 | 480.6 | 234.4 | 2.05× |
-| Regression 100k × 30, depth 6, 100 rounds | 8 | 154.8 | 128.7 | 1.20× |
-| Binary 100k × 30, depth 6, 100 rounds | 8 | 150.5 | 124.5 | 1.21× |
-| 4-class 50k × 30, depth 6, 50 rounds | 8 | 152.8 | 117.4 | 1.30× |
-| Regression 50k × 128, depth 6, 50 rounds | 8 | 197.9 | 159.1 | 1.24× |
-| Loss-guide (64 leaves) 100k × 30, 50 rounds | 8 | 133.2 | 107.9 | 1.23× |
-| Exact 20k × 20, depth 6, 30 rounds | 8 | 127.1 | 65.4 | 1.94× |
-| Predict 100k × 30, 100 trees | 8 | 16.29 | 4.01 | 4.06× |
-| SHAP contributions, 2k × 20, 100 trees | 8 | 60.42 | 30.23 | 2.00× |
-| **Geometric mean** | | **238.3** | **146.3** | **1.63×** |
+| Regression 100k × 30, depth 6, 100 rounds | 1 | 480.2 | 408.0 | 1.18× |
+| Binary 100k × 30, depth 6, 100 rounds | 1 | 512.8 | 443.2 | 1.16× |
+| 4-class 50k × 30, depth 6, 50 rounds | 1 | 493.2 | 398.7 | 1.24× |
+| Regression 50k × 128, depth 6, 50 rounds | 1 | 744.1 | 624.0 | 1.19× |
+| Loss-guide (64 leaves) 100k × 30, 50 rounds | 1 | 389.7 | 327.5 | 1.19× |
+| Exact 20k × 20, depth 6, 30 rounds | 1 | 582.9 | 246.4 | 2.37× |
+| Predict 100k × 30, 100 trees | 1 | 25.57 | 23.62 | 1.08× |
+| SHAP contributions, 2k × 20, 100 trees | 1 | 319.3 | 170.3 | 1.87× |
+| Regression 100k × 30, depth 6, 100 rounds | 8 | 183.8 | 153.8 | 1.19× |
+| Binary 100k × 30, depth 6, 100 rounds | 8 | 189.5 | 157.2 | 1.21× |
+| 4-class 50k × 30, depth 6, 50 rounds | 8 | 131.5 | 102.3 | 1.29× |
+| Regression 50k × 128, depth 6, 50 rounds | 8 | 194.3 | 162.3 | 1.20× |
+| Loss-guide (64 leaves) 100k × 30, 50 rounds | 8 | 146.2 | 122.0 | 1.20× |
+| Exact 20k × 20, depth 6, 30 rounds | 8 | 204.9 | 79.1 | 2.59× |
+| Predict 100k × 30, 100 trees | 8 | 4.00 | 3.88 | 1.03× |
+| SHAP contributions, 2k × 20, 100 trees | 8 | 55.6 | 27.4 | 2.03× |
+| **Geometric mean (per-thread)** | 1 | **337.3** | **248.6** | **1.36×** |
+| **Geometric mean (per-thread)** | 8 | **93.7** | **67.1** | **1.40×** |
+| **Geometric mean (all 16)** | | **177.7** | **129.1** | **1.38×** |
+
+Histogram training gains about 1.2× (the previous Neoverse-V3 run measured
+1.15–1.30× on the same shapes; see git history for the replaced table),
+exact about 2.4–2.6× (was 1.94–2.73×), and SHAP contributions about
+1.9–2.0× (was 2.00–2.05×). Prediction differs: this MacBook measures the
+`predict_100k_x30_100trees_depth6` bench shape (a depthwise model through
+the generic lockstep walk, ~1.03–1.08×), which the bench-shaped comparison
+under [Prediction and explanations](#prediction-and-explanations) reports as
+unchanged within binary-layout noise. The replaced table's 4× prediction
+row replayed the `step_if_greater` microbenchmark conditions (random rows
+that mispredict the old branch).
 
 ### Model serialization
 

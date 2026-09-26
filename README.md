@@ -10,9 +10,9 @@
 **XGBoost gradient boosting in Rust, trained faster.** hessboost takes
 XGBoost's parameters, reproduces XGBoost 3.4.2's predictions (checked
 against XGBoost in CI), and reads and writes XGBoost model files. On an Apple
-M3 Max it trains 2.3–2.8× faster than XGBoost on one thread and 1.4–1.6×
-faster on 16, with the same held-out scores. The only native dependency is
-libzstd.
+M3 Max it trains 2.6–3.0× faster than XGBoost on one thread and 1.8–5.0×
+faster on 16 (multiclass; 1.8–2.0× on the other three workloads), with the
+same held-out scores. The only native dependency is libzstd.
 
 The name comes from the Hessian: like XGBoost, hessboost fits each tree to
 the loss's second derivatives as well as its gradients (Newton boosting).

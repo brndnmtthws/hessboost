@@ -8,7 +8,7 @@ use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
-use crate::metric::{Metric, create_metrics};
+use crate::metric::Metric;
 use crate::model::{BoostedModel, ModelSpec, check_objective_width};
 use crate::objective::{GradPair, Loss, create_objective};
 use crate::rng::Rng;
@@ -488,11 +488,12 @@ impl<'a> Trainer<'a> {
         self
     }
 
-    /// Report `metric` (the custom-metric hook, e.g. a
-    /// [`CustomMetric`](crate::metric::CustomMetric)) instead of the metrics
-    /// `eval_metric` or the objective's default would build: it is the sole
-    /// metric reported for each eval set and the one driving early stopping
-    /// (per its [`maximize`](Metric::maximize)).
+    /// Also report `metric` (the custom-metric hook, e.g. a
+    /// [`CustomMetric`](crate::metric::CustomMetric)), as XGBoost's
+    /// `xgb.train(custom_metric=...)` does: every eval set reports the
+    /// `eval_metric` list (or the loss's default metric) and then `metric`,
+    /// which, being last, drives early stopping (per its
+    /// [`maximize`](Metric::maximize)).
     #[must_use]
     pub fn custom_metric(mut self, metric: Box<dyn Metric>) -> Self {
         self.metric = Some(metric);
@@ -1199,9 +1200,10 @@ struct EvalPlan<'a> {
 }
 
 impl<'a> EvalPlan<'a> {
-    /// The metrics every eval set reports (`metric_override`, else the
-    /// configured or default ones), refusing a metric that cannot read the
-    /// label layout or the model's prediction width.
+    /// The metrics every eval set reports: the configured or default ones,
+    /// then `metric_override` (as XGBoost's `xgb.train` appends its
+    /// `custom_metric`), refusing a metric that cannot read the label
+    /// layout or the model's prediction width.
     fn new(
         params: &TrainingParams,
         objective: &dyn Loss,
@@ -1210,10 +1212,8 @@ impl<'a> EvalPlan<'a> {
         n_targets: usize,
     ) -> Result<Self> {
         let n_out = objective.n_outputs();
-        let metrics = match metric_override {
-            Some(m) => vec![m],
-            None => configured_metrics(params, objective)?,
-        };
+        let mut metrics = configured_metrics(params, objective)?;
+        metrics.extend(metric_override);
         if n_targets > 1
             && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
         {
@@ -1338,19 +1338,23 @@ impl EarlyStopping {
     }
 }
 
-/// The metrics training evaluates without a custom metric:
-/// `params.eval_metric`, or `objective`'s default. The last one is the
-/// early-stopping metric.
+/// The metrics `params` configure for `loss`: `params.eval_metric`, or the
+/// loss's default, each built for its output count. Without a custom metric
+/// the last one is the early-stopping metric.
 pub(crate) fn configured_metrics(
     params: &TrainingParams,
-    objective: &dyn Loss,
+    loss: &dyn Loss,
 ) -> Result<Vec<Box<dyn Metric>>> {
-    create_metrics(
-        &params.eval_metric,
-        &objective.default_metric(),
-        params.num_class,
-        &ObjectiveParams::for_objective(params, objective.name()),
-    )
+    let n_outputs = loss.n_outputs();
+    if params.eval_metric.is_empty() {
+        Ok(vec![loss.default_metric().build(n_outputs)?])
+    } else {
+        params
+            .eval_metric
+            .iter()
+            .map(|metric| metric.build(n_outputs))
+            .collect()
+    }
 }
 
 /// An empty model that `objective` trains on `dtrain` with `params`, starting
@@ -2257,8 +2261,8 @@ mod tests {
         fn const_hess(&self) -> bool {
             true
         }
-        fn default_metric(&self) -> String {
-            "rmse".into()
+        fn default_metric(&self) -> crate::metric::EvalMetric {
+            crate::metric::EvalMetric::Rmse
         }
     }
 
@@ -3029,7 +3033,7 @@ mod tests {
             .unwrap();
 
         // Custom path: a CustomMetric reimplementing RMSE (minimize).
-        let rmse_metric = CustomMetric::new("rmse", false, |preds, labels, weights| {
+        let rmse_metric = CustomMetric::new("my-rmse", false, |preds, labels, weights| {
             let mut sq = 0.0f64;
             let mut wsum = 0.0f64;
             for i in 0..preds.len() {
@@ -3058,13 +3062,15 @@ mod tests {
             builtin.model.predict(&d).unwrap()
         );
 
-        // The custom metric was actually recorded in the history.
+        // As in XGBoost's `xgb.train`, the custom metric is reported after
+        // the configured (here the default) ones and, being last, drives
+        // early stopping.
         let names: Vec<&str> = custom.history[0]
             .scores
             .iter()
             .map(|(_, m, _)| m.as_str())
             .collect();
-        assert_eq!(names, vec!["rmse"]);
+        assert_eq!(names, vec!["rmse", "my-rmse"]);
     }
 
     #[test]
@@ -3283,7 +3289,7 @@ mod tests {
             Err(HessboostError::DimensionMismatch { .. })
         ));
         let ndcg = TrainingParams::builder()
-            .eval_metric("ndcg")
+            .eval_metric(crate::metric::EvalMetric::Ndcg(crate::metric::Cutoff::all()))
             .build()
             .unwrap();
         eval_metric_rejection(train(&ndcg, &two_targets, 1), "ndcg");
@@ -3453,8 +3459,8 @@ mod tests {
             false
         }
 
-        fn default_metric(&self) -> String {
-            "rmse".to_string()
+        fn default_metric(&self) -> crate::metric::EvalMetric {
+            crate::metric::EvalMetric::Rmse
         }
     }
 
@@ -3493,6 +3499,11 @@ mod tests {
         ));
     }
 
+    /// The metric XGBoost names `name`, with default parameters.
+    fn named_metric(name: &str) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::from_xgboost(name, &crate::metric::DEFAULT_SOURCE).unwrap()
+    }
+
     /// The reason of an `eval_metric` rejection of the `context` run,
     /// panicking on any other outcome.
     fn eval_metric_rejection<T: std::fmt::Debug>(result: Result<T>, context: &str) -> String {
@@ -3519,7 +3530,7 @@ mod tests {
         let params = |metric: &str| {
             TrainingParams::builder()
                 .objective("survival:aft")
-                .eval_metric(metric)
+                .eval_metric(named_metric(metric))
                 .build()
                 .unwrap()
         };
@@ -3558,7 +3569,7 @@ mod tests {
             .unwrap();
         for metric in ["aft-nloglik", "interval-regression-accuracy", "pre@3"] {
             let params = TrainingParams::builder()
-                .eval_metric(metric)
+                .eval_metric(named_metric(metric))
                 .build()
                 .unwrap();
             eval_metric_rejection(
@@ -3600,15 +3611,29 @@ mod tests {
                 .map(|r| r.history)
         };
         for (params, metric) in [
-            (quantile().eval_metric("rmse"), "rmse"),
-            (expectile().eval_metric("mae"), "mae"),
-            (normal().eval_metric("rmse"), "rmse"),
-            (softprob().eval_metric("rmse"), "rmse"),
-            (softprob().eval_metric("auc"), "auc"),
-            (quantile().eval_metric("logloss"), "logloss"),
             (
-                TrainingParams::builder().eval_metric("mlogloss"),
-                "mlogloss",
+                quantile().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                expectile().eval_metric(crate::metric::EvalMetric::Mae),
+                "mae",
+            ),
+            (
+                normal().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                softprob().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                softprob().eval_metric(crate::metric::EvalMetric::Auc),
+                "auc",
+            ),
+            (
+                quantile().eval_metric(crate::metric::EvalMetric::LogLoss),
+                "logloss",
             ),
         ] {
             let reason = eval_metric_rejection(run(params.build().unwrap()), metric);
@@ -3617,15 +3642,27 @@ mod tests {
                 "{reason}"
             );
         }
+        // The multiclass metrics read one probability per output: a
+        // single-output model is refused before any eval set is read.
+        let single = TrainingParams::builder()
+            .eval_metric(crate::metric::EvalMetric::MLogLoss)
+            .build()
+            .unwrap();
+        let reason = eval_metric_rejection(run(single), "mlogloss");
+        assert!(reason.contains("mlogloss"), "{reason}");
         // The defaults and matching metrics still evaluate.
         for params in [
             quantile(),
-            quantile().eval_metric("quantile"),
+            quantile().eval_metric(crate::metric::EvalMetric::Quantile(
+                crate::objective::Quantiles::new([0.2, 0.8]).unwrap(),
+            )),
             expectile(),
             normal(),
-            normal().eval_metric("crps"),
+            normal().eval_metric(crate::metric::EvalMetric::Crps(
+                crate::objective::distributional::DistFamily::Normal,
+            )),
             softprob(),
-            softprob().eval_metric("merror"),
+            softprob().eval_metric(crate::metric::EvalMetric::MError),
         ] {
             let history = run(params.build().unwrap()).unwrap();
             assert!(

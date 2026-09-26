@@ -1,7 +1,7 @@
 //! Bring-your-own loss and metric: the custom-objective and custom-metric hooks.
 //! Run: `cargo run --release --example custom_objective`.
 
-use hessboost::metric::{CustomMetric, Metric, Rmse};
+use hessboost::metric::{CustomMetric, EvalMetric};
 use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::prelude::*;
 
@@ -30,7 +30,7 @@ fn main() -> Result<()> {
     });
     let model = Trainer::new(&params, &d, 60).loss(&obj).train()?.model;
     let preds = model.predict(&d)?;
-    let rmse = Rmse::default().eval(&preds, &y, None);
+    let rmse = EvalMetric::Rmse.build(1)?.eval(&preds, &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
 
     // --- Custom metric: mean absolute error, used for early stopping. ---

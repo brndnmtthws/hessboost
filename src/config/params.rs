@@ -306,9 +306,11 @@ pub struct TrainingParams {
     /// `None` means "estimate from the labels", matching modern XGBoost.
     /// XGBoost `base_score`.
     pub base_score: Option<f64>,
-    /// Evaluation metric names. Empty means "use the objective's default".
+    /// The metrics evaluated on every eval set, in order (the last one
+    /// drives early stopping). Empty means the loss's default
+    /// ([`Loss::default_metric`](crate::objective::Loss::default_metric)).
     /// XGBoost `eval_metric`.
-    pub eval_metric: Vec<String>,
+    pub eval_metric: Vec<crate::metric::EvalMetric>,
 
     // ---- Objective-specific ----
     /// Variance power of the Tweedie distribution for `reg:tweedie`, in
@@ -1376,10 +1378,10 @@ impl TrainingParamsBuilder {
         self
     }
 
-    /// Add an evaluation metric by name.
+    /// Add an evaluation metric (evaluated after the ones added before).
     #[must_use]
-    pub fn eval_metric(mut self, name: impl Into<String>) -> Self {
-        self.params.eval_metric.push(name.into());
+    pub fn eval_metric(mut self, metric: crate::metric::EvalMetric) -> Self {
+        self.params.eval_metric.push(metric);
         self
     }
 

@@ -3,8 +3,6 @@
 
 use super::{Metric, weighted_mean};
 use crate::data::MetaInfo;
-use crate::error::Result;
-use crate::objective::validate_alphas;
 
 /// Sum `loss(alpha, pred, label) · w` and the matching weights over every
 /// (row, alpha, target) cell of `preds` laid out `[row][alpha][target]`
@@ -53,20 +51,14 @@ fn alpha_average(
 /// the one prediction per row. A prediction count that is not labels ×
 /// alphas evaluates to `NaN` (XGBoost raises an error).
 #[derive(Debug, Clone)]
-pub struct QuantileError {
+pub(crate) struct QuantileError {
     alpha: Vec<f32>,
 }
 
 impl QuantileError {
-    /// Create for the quantile levels `alpha` (XGBoost `quantile_alpha`).
-    ///
-    /// # Errors
-    ///
-    /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
-    pub fn new(alpha: &[f64]) -> Result<Self> {
-        Ok(QuantileError {
-            alpha: validate_alphas("quantile_alpha", alpha)?,
-        })
+    /// The pinball loss at the (validated) quantile levels `alpha`.
+    pub(crate) fn new(alpha: Vec<f32>) -> Self {
+        QuantileError { alpha }
     }
 }
 
@@ -105,20 +97,14 @@ impl Metric for QuantileError {
 /// every `expectile_alpha` exactly like [`QuantileError`] (including its
 /// `NaN` on a prediction count that is not labels × alphas).
 #[derive(Debug, Clone)]
-pub struct ExpectileError {
+pub(crate) struct ExpectileError {
     alpha: Vec<f32>,
 }
 
 impl ExpectileError {
-    /// Create for the expectile levels `alpha` (XGBoost `expectile_alpha`).
-    ///
-    /// # Errors
-    ///
-    /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
-    pub fn new(alpha: &[f64]) -> Result<Self> {
-        Ok(ExpectileError {
-            alpha: validate_alphas("expectile_alpha", alpha)?,
-        })
+    /// The expectile loss at the (validated) levels `alpha`.
+    pub(crate) fn new(alpha: Vec<f32>) -> Self {
+        ExpectileError { alpha }
     }
 }
 
@@ -160,7 +146,7 @@ mod tests {
     /// with its row weight.
     #[test]
     fn quantile_averages_pinball_over_alphas() {
-        let m = QuantileError::new(&[0.25, 0.75]).unwrap();
+        let m = QuantileError::new(vec![0.25, 0.75]);
         // Row 0 (y = 1): preds 0 (d = 1 → 0.25), 2 (d = −1 → 0.25).
         // Row 1 (y = 0): preds 0, 0 (d = 0 → 0).
         let preds = [0.0, 2.0, 0.0, 0.0];
@@ -169,12 +155,11 @@ mod tests {
         let v = m.eval(&preds, &[1.0, 0.0], Some(&[3.0, 1.0]));
         assert!((v - 1.5 / 8.0).abs() < 1e-12, "{v}");
         assert!(m.eval(&preds[..2], &[1.0, 0.0], None).is_nan());
-        assert!(QuantileError::new(&[]).is_err());
     }
 
     #[test]
     fn expectile_weights_residual_sides() {
-        let m = ExpectileError::new(&[0.2]).unwrap();
+        let m = ExpectileError::new(vec![0.2]);
         // Over-prediction by 2 → 0.8·4; under-prediction by 1 → 0.2·1.
         let v = m.eval(&[2.0, -1.0], &[0.0, 0.0], None);
         assert!((v - 1.7).abs() < 1e-6, "{v}");
@@ -188,8 +173,8 @@ mod tests {
             n_rows: 3,
             ..MetaInfo::new(&[], None, None)
         };
-        let q = QuantileError::new(&[0.5]).unwrap();
-        let e = ExpectileError::new(&[0.2, 0.8]).unwrap();
+        let q = QuantileError::new(vec![0.5]);
+        let e = ExpectileError::new(vec![0.2, 0.8]);
         assert!(q.eval_info(&[], &info).is_nan());
         assert!(e.eval_info(&[], &info).is_nan());
     }

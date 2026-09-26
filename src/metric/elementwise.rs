@@ -32,7 +32,7 @@ fn weighted_sum(
 /// `-1` give NaN, as upstream (no clamp).
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct Rmsle;
+pub(crate) struct Rmsle;
 
 impl Metric for Rmsle {
     fn name(&self) -> &'static str {
@@ -52,7 +52,7 @@ impl Metric for Rmsle {
 /// zero label divides by zero (infinite or NaN), as upstream.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct Mape;
+pub(crate) struct Mape;
 
 impl Metric for Mape {
     fn name(&self) -> &'static str {
@@ -70,7 +70,7 @@ impl Metric for Mape {
 /// `Σ w δ² (√(1 + ((y − p)/δ)²) − 1) / Σ w`. This is the plain pseudo-Huber
 /// loss, without the objective's factor conventions.
 #[derive(Debug, Clone, Copy)]
-pub struct PseudoHuberError {
+pub(crate) struct PseudoHuberError {
     slope: f32,
 }
 

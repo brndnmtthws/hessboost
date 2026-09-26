@@ -3,9 +3,8 @@
 //! Driven by `scripts/bench_xgb.py`. File I/O and test-data preparation are
 //! outside the timer, and each fit constructs a fresh training `DMatrix`.
 
-use hessboost::config::GrowPolicy;
-use hessboost::metric::create_metric;
 use hessboost::prelude::*;
+use serde_json::json;
 use std::path::Path;
 use std::time::Instant;
 
@@ -21,19 +20,24 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let x_test = read_f32(&dir.join("X_test.bin"))?;
     let y_test = read_f32(&dir.join("y_test.bin"))?;
     let dtest = DMatrix::from_dense(&x_test, meta.n_test, meta.n_cols)?.with_labels(&y_test)?;
-    let params = TrainingParams::builder()
-        .objective(meta.objective)
-        .num_class(meta.num_class)
-        .tree_method(TreeMethod::Hist)
-        .grow_policy(GrowPolicy::DepthWise)
-        .max_depth(meta.max_depth)
-        .eta(meta.eta)
-        .lambda(meta.lambda)
-        .max_bin(meta.max_bin)
-        .base_score(meta.base_score)
-        .seed(meta.seed)
-        .build()?;
-    let metric = create_metric(&meta.metric, &params)?;
+    // The XGBoost parameter dict `scripts/bench_xgb.py` trains XGBoost with.
+    let mut xgboost = vec![
+        ("objective", json!(meta.objective)),
+        ("tree_method", json!("hist")),
+        ("grow_policy", json!("depthwise")),
+        ("max_depth", json!(meta.max_depth)),
+        ("eta", json!(meta.eta)),
+        ("lambda", json!(meta.lambda)),
+        ("max_bin", json!(meta.max_bin)),
+        ("base_score", json!(meta.base_score)),
+        ("seed", json!(meta.seed)),
+        ("eval_metric", json!(meta.metric)),
+    ];
+    if meta.num_class > 0 {
+        xgboost.push(("num_class", json!(meta.num_class)));
+    }
+    let params = TrainingParams::from_xgboost(xgboost)?;
+    let metric = params.eval_metric[0].build(meta.num_class.max(1))?;
     let repeats: usize = std::env::var("BENCH_REPEATS")
         .unwrap_or_else(|_| "3".to_owned())
         .parse()?;

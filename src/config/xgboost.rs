@@ -8,6 +8,8 @@ use super::params::{
     MultiStrategy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
 };
 use crate::error::{HessboostError, Result};
+use crate::metric::{EvalMetric, XgboostMetricSource};
+use crate::objective::distributional::DistFamily;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
@@ -118,8 +120,9 @@ flat_params! {
 
 impl Flat {
     /// The configuration these settings describe, every absent key at its
-    /// default.
-    fn into_params(self) -> TrainingParams {
+    /// default. Metric names are read as XGBoost reads them, with the flat
+    /// parameters of the metrics that borrow them.
+    fn into_params(self) -> Result<TrainingParams> {
         let Flat {
             booster,
             nthread,
@@ -176,7 +179,7 @@ impl Flat {
             toad_penalty_threshold,
         } = self;
         let d = TrainingParams::default();
-        TrainingParams {
+        let mut params = TrainingParams {
             booster: booster.unwrap_or(d.booster),
             nthread: nthread.unwrap_or(d.nthread),
             seed: seed.unwrap_or(d.seed),
@@ -184,7 +187,7 @@ impl Flat {
             objective: objective.unwrap_or(d.objective),
             num_class: num_class.unwrap_or(d.num_class),
             base_score: base_score.unwrap_or(d.base_score),
-            eval_metric: eval_metric.unwrap_or(d.eval_metric),
+            eval_metric: Vec::new(),
             tweedie_variance_power: tweedie_variance_power.unwrap_or(d.tweedie_variance_power),
             huber_slope: huber_slope.unwrap_or(d.huber_slope),
             lambdarank_num_pair_per_sample: lambdarank_num_pair_per_sample
@@ -232,7 +235,30 @@ impl Flat {
             skip_drop: skip_drop.unwrap_or(d.skip_drop),
             toad_penalty_feature: toad_penalty_feature.unwrap_or(d.toad_penalty_feature),
             toad_penalty_threshold: toad_penalty_threshold.unwrap_or(d.toad_penalty_threshold),
-        }
+        };
+        let source = metric_source(&params);
+        let metrics = eval_metric
+            .unwrap_or_default()
+            .iter()
+            .map(|name| EvalMetric::from_xgboost(name, &source))
+            .collect::<Result<Vec<_>>>()?;
+        params.eval_metric = metrics;
+        Ok(params)
+    }
+}
+
+/// The flat parameters the metrics in `eval_metric` read, as XGBoost gives
+/// them: `mphe` the `huber_slope`, `quantile` / `expectile` the alpha lists,
+/// `aft-nloglik` the AFT noise, whatever the objective; `nll` / `crps` the
+/// family of a `dist:*` objective.
+fn metric_source(params: &TrainingParams) -> XgboostMetricSource<'_> {
+    XgboostMetricSource {
+        huber_slope: params.huber_slope,
+        quantile_alpha: &params.quantile_alpha,
+        expectile_alpha: &params.expectile_alpha,
+        aft_loss_distribution: params.aft_loss_distribution,
+        aft_loss_distribution_scale: params.aft_loss_distribution_scale,
+        distribution: DistFamily::from_objective(&params.objective),
     }
 }
 
@@ -426,7 +452,7 @@ impl TrainingParams {
                 ));
             }
         }
-        let params = flat_from("params", settings)?.into_params();
+        let params = flat_from("params", settings)?.into_params()?;
         if updater && params.booster != BoosterKind::GbLinear {
             return Err(HessboostError::invalid_param(
                 "updater",
@@ -444,8 +470,23 @@ impl TrainingParams {
     ///
     /// # Errors
     ///
-    /// None yet: every configuration has a flat form.
+    /// A metric whose parameters XGBoost's flat form cannot state: XGBoost
+    /// gives `mphe`, `quantile`, `expectile`, and `aft-nloglik` the flat
+    /// `huber_slope`, alpha lists, and AFT noise, and `nll` / `crps` the
+    /// objective's `dist:*` family, so a metric with other parameters has no
+    /// XGBoost name.
     pub fn to_xgboost(&self) -> Result<Map<String, Value>> {
+        let source = metric_source(self);
+        if let Some(metric) = self.eval_metric.iter().find(|m| !source.expresses(m)) {
+            return Err(HessboostError::invalid_param(
+                "eval_metric",
+                format!(
+                    "`{}` has parameters XGBoost's flat form cannot state (it reads them from \
+                     the objective's parameters)",
+                    metric.name()
+                ),
+            ));
+        }
         let TrainingParams {
             booster,
             nthread,
@@ -522,7 +563,8 @@ impl TrainingParams {
         if let Some(base_score) = base_score {
             set("base_score", json(base_score));
         }
-        set("eval_metric", json(eval_metric));
+        let names: Vec<_> = eval_metric.iter().map(EvalMetric::name).collect();
+        set("eval_metric", json(names));
         set("tweedie_variance_power", json(tweedie_variance_power));
         set("huber_slope", json(huber_slope));
         set(
@@ -801,7 +843,7 @@ mod tests {
         assert!(!p.refresh_leaf);
         assert_eq!(p.num_parallel_tree, 4);
         assert_eq!(p.quantile_alpha, [0.25]);
-        assert_eq!(p.eval_metric, ["mae"]);
+        assert_eq!(p.eval_metric, [EvalMetric::Mae]);
         assert_eq!(
             p.monotone_constraints,
             [Monotone::Increasing, Monotone::Decreasing, Monotone::None]
@@ -823,6 +865,65 @@ mod tests {
                 .to_xgboost()
                 .unwrap()
                 .contains_key("max_delta_step")
+        );
+    }
+
+    /// XGBoost's metrics read the flat parameters whatever the objective:
+    /// `mphe` the `huber_slope`, `quantile` / `expectile` the alpha lists,
+    /// `aft-nloglik` the AFT noise, and `nll` / `crps` the `dist:*` family.
+    /// A metric with other parameters has no flat form.
+    #[test]
+    fn metrics_take_the_flat_parameters_xgboost_gives_them() {
+        use crate::objective::distributional::DistFamily;
+        use crate::objective::{Aft, PseudoHuber, Quantiles};
+        let p = TrainingParams::from_xgboost([
+            ("huber_slope", json!(0.7)),
+            ("quantile_alpha", json!([0.2, 0.8])),
+            ("aft_loss_distribution", json!("logistic")),
+            (
+                "eval_metric",
+                json!(["mphe", "quantile", "aft-nloglik", "ndcg@3"]),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            p.eval_metric,
+            [
+                EvalMetric::Mphe(PseudoHuber::new(0.7).unwrap()),
+                EvalMetric::Quantile(Quantiles::new([0.2, 0.8]).unwrap()),
+                EvalMetric::AftNLogLik(Aft::with_distribution(AftDistribution::Logistic)),
+                EvalMetric::Ndcg(crate::metric::Cutoff::top(3).unwrap()),
+            ]
+        );
+        let flat = p.to_xgboost().unwrap();
+        assert_eq!(
+            flat["eval_metric"],
+            json!(["mphe", "quantile", "aft-nloglik", "ndcg@3"])
+        );
+        assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), p);
+
+        let mut other_slope = p.clone();
+        other_slope.eval_metric = vec![EvalMetric::Mphe(PseudoHuber::new(2.0).unwrap())];
+        assert!(other_slope.to_xgboost().is_err());
+        let no_dist = TrainingParams {
+            eval_metric: vec![EvalMetric::Nll(DistFamily::Normal)],
+            ..TrainingParams::default()
+        };
+        assert!(no_dist.to_xgboost().is_err());
+
+        assert!(refused(json!({"eval_metric": "nll"})).is_some());
+        assert!(refused(json!({"eval_metric": "quantile"})).is_some());
+        let dist = TrainingParams::from_xgboost([
+            ("objective", json!("dist:normal")),
+            ("eval_metric", json!(["nll", "crps"])),
+        ])
+        .unwrap();
+        assert_eq!(
+            dist.eval_metric,
+            [
+                EvalMetric::Nll(DistFamily::Normal),
+                EvalMetric::Crps(DistFamily::Normal)
+            ]
         );
     }
 

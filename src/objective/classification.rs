@@ -7,6 +7,7 @@ use super::{
 use crate::K_RT_EPS_F32;
 use crate::data::MetaInfo;
 use crate::error::Result;
+use crate::metric::EvalMetric;
 
 /// Logistic loss: `binary:logistic` (classification, reported with
 /// `logloss`), `reg:logistic` (probability regression, reported with `rmse`
@@ -167,12 +168,11 @@ impl Loss for Logistic {
         check_label_domain(info, |y| !(0.0..=1.0).contains(&y))
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> EvalMetric {
         match self.variant {
-            LogisticVariant::Regression => "rmse",
-            LogisticVariant::Binary | LogisticVariant::Raw => "logloss",
+            LogisticVariant::Regression => EvalMetric::Rmse,
+            LogisticVariant::Binary | LogisticVariant::Raw => EvalMetric::LogLoss,
         }
-        .to_string()
     }
 }
 
@@ -221,8 +221,8 @@ impl Loss for Hinge {
         // `base_score` is the margin itself, not the thresholded prediction.
     }
 
-    fn default_metric(&self) -> String {
-        "error".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::Error
     }
 }
 

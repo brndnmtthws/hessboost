@@ -4,6 +4,7 @@
 
 use hessboost::config::{DistGradient, DistSplitDirection, MultiStrategy, TreeMethod};
 use hessboost::conformal::ConformalizedQuantile;
+use hessboost::metric::EvalMetric;
 use hessboost::objective::distributional::{Dist, DistFamily};
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
 use rand::rngs::StdRng;
@@ -207,8 +208,8 @@ fn every_family_and_gradient_mode_learns() {
         ] {
             let p = params(objective)
                 .dist_gradient(mode)
-                .eval_metric("crps")
-                .eval_metric("nll")
+                .eval_metric(EvalMetric::Crps(family))
+                .eval_metric(EvalMetric::Nll(family))
                 .build()
                 .unwrap();
             let result = Trainer::new(&p, &dtrain, 1000)
@@ -383,9 +384,10 @@ fn configuration_errors() {
     let y = vec![0.5f32; 200];
     let multi = d.clone().with_label_matrix(&y, 2).unwrap();
     assert!(train(&params("dist:normal").build().unwrap(), &multi, 1).is_err());
-    // `nll` / `crps` need a distributional objective.
+    // `nll` / `crps` score distributions: a point model's single output is
+    // not a Normal's two parameters.
     let p = params("reg:squarederror")
-        .eval_metric("crps")
+        .eval_metric(EvalMetric::Crps(DistFamily::Normal))
         .build()
         .unwrap();
     assert!(Trainer::new(&p, &d, 1).eval(&d, "d").train().is_err());

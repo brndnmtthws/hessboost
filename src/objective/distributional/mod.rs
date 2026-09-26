@@ -1352,8 +1352,8 @@ impl Loss for DistLoss {
         check_label_domain(info, |y| self.family.below_support(f64::from(y)))
     }
 
-    fn default_metric(&self) -> String {
-        "nll".to_string()
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::Nll(self.family)
     }
 
     /// Parallel gradient boosting (Chapelle et al., 2026): the chosen

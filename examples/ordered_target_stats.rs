@@ -5,7 +5,7 @@
 
 use hessboost::data::FeatureType;
 use hessboost::data::target_stats::{FittedTargetEncoder, OrderedTargetEncoder};
-use hessboost::metric::{Metric, Rmse};
+use hessboost::metric::EvalMetric;
 use hessboost::prelude::*;
 
 mod common;
@@ -41,7 +41,7 @@ fn fit_rmse(
 ) -> Result<(f64, f64)> {
     let model = train(params, train_set, 200)?;
     let rmse = |data: &DMatrix| -> Result<f64> {
-        Ok(Rmse::default().eval(
+        Ok(EvalMetric::Rmse.build(1)?.eval(
             &model.predict(data)?,
             data.labels().unwrap_or_default(),
             None,

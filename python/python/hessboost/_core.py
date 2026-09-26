@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias, overload
 
 import numpy as np
@@ -12,9 +13,44 @@ from numpy.typing import ArrayLike, NDArray
 from hessboost import _data, _hessboost
 from hessboost._exceptions import HessboostError
 
-__all__ = ["Booster", "DMatrix", "Distributions", "ImportanceType", "ModelFormat"]
+__all__ = [
+    "Booster",
+    "DMatrix",
+    "Distributions",
+    "ImportanceType",
+    "ModelFormat",
+    "Uncertainty",
+]
 
 Distributions = _hessboost.Distributions
+
+
+@dataclass(frozen=True)
+class Uncertainty:
+    """A virtual ensemble's uncertainty decomposition
+    (:meth:`Booster.predict_uncertainty`), after CatBoost.
+
+    ``knowledge``, ``data`` and ``total`` are ``(rows,)``, or ``(rows, K)``
+    for multi-output regression (one per output) and multi-label
+    classification (one per label column).
+    """
+
+    mean: NDArray[np.float64]
+    """The members' mean prediction: predictions for regression, predicted
+    means for ``dist:*``, probabilities for classification (one per class
+    for ``multi:*``, so ``(rows, classes)``)."""
+    knowledge: NDArray[np.float64]
+    """Knowledge (epistemic) uncertainty: the variance of the members'
+    predictions (means for ``dist:*``) for regression, the mutual
+    information (total minus data) for classification."""
+    data: NDArray[np.float64] | None
+    """Data (aleatoric) uncertainty: the mean predicted variance for
+    ``dist:*``, the mean member entropy for classification; ``None`` for
+    plain regression."""
+    total: NDArray[np.float64] | None
+    """``data + knowledge`` for ``dist:*``; the entropy of the mean
+    probabilities for classification; ``None`` for plain regression."""
+
 
 ModelFormat: TypeAlias = Literal["binary", "json", "xgboost-json", "xgboost-ubjson"]
 """A model file format:
@@ -514,6 +550,63 @@ class Booster:
         model = self._model
         matrix = self._matrix(data, base_margin, missing, True)._core
         return model.predict_distribution(matrix, self._range(iteration_range))
+
+    def predict_virtual_ensembles(
+        self,
+        data: object,
+        count: int = 10,
+        *,
+        output_margin: bool = False,
+        base_margin: ArrayLike | None = None,
+        missing: float = np.nan,
+    ) -> tuple[NDArray[np.float32], list[int]]:
+        """Predicts ``data`` with a virtual ensemble of ``count`` members
+        (CatBoost's ``virtual_ensembles_predict``): the models after several
+        iterations of the second half of this model's iterations, rebuilt
+        exactly from its model shrinkage. Meant for models trained with
+        ``posterior_sampling``; any tree model is accepted.
+
+        Returns:
+            The members' predictions (``output_margin``: raw margins),
+            member-major: ``(count, rows)``, or ``(count, rows, K)`` with
+            ``K`` values per row as :meth:`predict` returns them; and each
+            member's iteration count, ascending (the last is the whole
+            model).
+
+        Raises:
+            HessboostError: ``count`` is 0, the model has too few iterations
+                for ``count`` members (about ``2 * count``), or it is a
+                ``gblinear`` model.
+        """
+        if count < 1:
+            raise HessboostError(f"count must be at least 1, got {count}")
+        matrix = self._matrix(data, base_margin, missing, True)._core
+        return self._model.predict_virtual_ensembles(matrix, count, output_margin)
+
+    def predict_uncertainty(
+        self,
+        data: object,
+        count: int = 10,
+        *,
+        base_margin: ArrayLike | None = None,
+        missing: float = np.nan,
+    ) -> Uncertainty:
+        """The knowledge, data and total uncertainty of every row of
+        ``data`` under a virtual ensemble of ``count`` members
+        (:meth:`predict_virtual_ensembles`), decomposed as CatBoost does:
+        variances for regression and ``dist:*``, entropies for
+        classification (see :class:`Uncertainty`).
+
+        Raises:
+            HessboostError: The objective has no decomposition (ranking,
+                ``binary:hinge``, custom objectives), or as
+                :meth:`predict_virtual_ensembles`.
+        """
+        if count < 1:
+            raise HessboostError(f"count must be at least 1, got {count}")
+        matrix = self._matrix(data, base_margin, missing, True)._core
+        mean, knowledge, aleatoric, total = self._model.predict_uncertainty(matrix, count)
+        return Uncertainty(mean=mean, knowledge=knowledge, data=aleatoric, total=total)
 
     def get_score(self, importance_type: ImportanceType = "weight") -> dict[str, float]:
         """Feature importance by feature name (``f0``, ``f1``, ... without

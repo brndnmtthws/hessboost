@@ -211,6 +211,49 @@ def test_distributional_objective_predicts_distributions() -> None:
         point.predict_distribution(x)
 
 
+def test_virtual_ensembles_and_uncertainty() -> None:
+    x, y = regression(rows=300)
+    params = {"posterior_sampling": True, "max_depth": 3}
+    booster = hessboost.train(params, DMatrix(x, y), 40)
+    members, iterations = booster.predict_virtual_ensembles(x, 4)
+    assert iterations == [25, 30, 35, 40]
+    assert members.dtype == np.float32 and members.shape == (4, 300)
+    # Members are the models after their iterations, the last the whole model.
+    np.testing.assert_array_equal(members[-1], booster.predict(x))
+    np.testing.assert_array_equal(members[0], booster.predict(x, iteration_range=(0, 25)))
+    margins, _ = booster.predict_virtual_ensembles(x, 4, output_margin=True)
+    np.testing.assert_array_equal(margins, members)
+    u = booster.predict_uncertainty(x, 4)
+    assert isinstance(u, hessboost.Uncertainty)
+    assert u.mean.shape == u.knowledge.shape == (300,)
+    np.testing.assert_allclose(
+        u.knowledge, members.astype(np.float64).var(axis=0), rtol=1e-6, atol=1e-12
+    )
+    assert u.data is None and u.total is None
+
+    x, labels = classes(rows=300, n_classes=3)
+    softprob = hessboost.train(
+        {"objective": "multi:softprob", "num_class": 3, "posterior_sampling": True},
+        DMatrix(x, labels),
+        30,
+    )
+    probs, _ = softprob.predict_virtual_ensembles(x, 3)
+    assert probs.shape == (3, 300, 3)
+    u = softprob.predict_uncertainty(x, 3)
+    assert u.mean.shape == (300, 3) and u.knowledge.shape == (300,)
+    assert u.data is not None and u.total is not None
+    np.testing.assert_allclose(u.knowledge, u.total - u.data)
+
+    with pytest.raises(HessboostError, match="virtual_ensembles_count"):
+        booster.predict_uncertainty(x, 21)
+    with pytest.raises(HessboostError, match="at least 1"):
+        booster.predict_virtual_ensembles(x, 0)
+    ranker = hessboost.train({"objective": "rank:ndcg"}, DMatrix(x[:40], labels[:40], group=[40]), 4)
+    with pytest.raises(HessboostError, match="uncertainty is defined"):
+        ranker.predict_uncertainty(x[:40], 2)
+
+
+
 def test_early_stopping_records_the_best_iteration() -> None:
     x, y = regression(rows=300)
     dtrain = DMatrix(x[:200], y[:200])

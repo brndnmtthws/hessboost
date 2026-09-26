@@ -109,6 +109,17 @@ class Booster:
     def predict_distribution(
         self, data: DMatrix, iteration_range: tuple[int, int] | None = None
     ) -> Distributions: ...
+    def predict_virtual_ensembles(
+        self, data: DMatrix, count: int, output_margin: bool
+    ) -> tuple[NDArray[np.float32], list[int]]: ...
+    def predict_uncertainty(
+        self, data: DMatrix, count: int
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64] | None,
+        NDArray[np.float64] | None,
+    ]: ...
     def feature_importance(self, importance_type: str) -> dict[int, float]: ...
     def slice(self, begin: int, end: int, step: int) -> Booster: ...
     @property

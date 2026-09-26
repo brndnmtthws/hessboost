@@ -170,6 +170,10 @@ lower, upper = cqr.predict_interval(X_test).T   # >= 90% coverage, finite-sample
 dist = hessboost.train({"objective": "dist:normal"}, hessboost.DMatrix(X_train, y_train), 300)
 d = dist.predict_distribution(X_test)
 d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
+
+sglb = hessboost.train({"posterior_sampling": True}, hessboost.DMatrix(X_train, y_train), 1000)
+members, iterations = sglb.predict_virtual_ensembles(X_test, 10)   # (10, rows)
+u = sglb.predict_uncertainty(X_test, 10)   # u.knowledge rises off the training data
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
@@ -178,6 +182,10 @@ d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
   purged by a row `gap`), and `purged_forward` (timestamped rows, purged
   by each row's own label window, for overlapping or irregular horizons)
   folds for `cv` or your own validation loops.
+- `Booster.predict_virtual_ensembles` / `predict_uncertainty`: CatBoost's
+  virtual ensembles of an SGLB model (`posterior_sampling`, `langevin`,
+  `model_shrink_rate`), with knowledge, data, and total uncertainty
+  (`hessboost.Uncertainty`).
 - Every hessboost training option (`path_smooth`, `extra_trees`,
   `linear_tree`, `grow_policy="symmetric"`, `use_quantized_grad`, the
   `dist:*` objectives and their `dist_gradient`, ...) is a `params` key.

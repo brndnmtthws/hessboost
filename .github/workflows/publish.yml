@@ -6,6 +6,7 @@ on:
       - v*
 
 env:
+  MISE_ENV: ci
   CARGO_TERM_COLOR: always
 
 permissions:
@@ -26,8 +27,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: publish-test
@@ -47,11 +46,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # Toolchain from mise.toml. No compiler cache: the published crate must
-      # not depend on restored build outputs.
+      # Toolchain from mise.toml (mise-action caches the tools, see ci.yml).
+      # No compiler cache: the published crate must not depend on restored
+      # build outputs.
       - uses: jdx/mise-action@v4
-        with:
-          cache: false
 
       - name: Verify tag matches crate version
         run: |

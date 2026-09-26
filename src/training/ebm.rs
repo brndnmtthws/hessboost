@@ -9,7 +9,7 @@ use std::ops::ControlFlow;
 use rayon::prelude::*;
 
 use super::boulevard::{Recursion, RoundRequest, Schedule, tree_rows};
-use super::train::{Prepared, TrainContext, TreeSample, configured_metrics, sample_rows};
+use super::train::{Prepared, TrainContext, TreeSample, sample_rows};
 use crate::config::{Device, TrainingParams};
 use crate::data::DMatrix;
 use crate::data::quantile::HistCuts;
@@ -104,6 +104,7 @@ pub(super) fn boost(
     prepared: &Prepared,
     model: &mut BoostedModel,
     rounds: usize,
+    metric: Option<&dyn Metric>,
     after_round: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<()> {
     let mut hook = Hook {
@@ -136,7 +137,10 @@ pub(super) fn boost(
             Some(info),
         )
     } else {
-        (classic(run, prepared, &mains, mu, rounds, &mut hook)?, None)
+        (
+            classic(run, prepared, &mains, mu, rounds, metric, &mut hook)?,
+            None,
+        )
     };
     let mut terms = mains;
     terms.extend(pairs);
@@ -207,7 +211,8 @@ struct Stopper {
 impl Stopper {
     fn new(capacity: usize, tolerance: f64, start: f64, bag: &Bag) -> Self {
         Stopper {
-            window: VecDeque::with_capacity(capacity),
+            // Grown as trees arrive: the patience may exceed any run.
+            window: VecDeque::new(),
             capacity,
             tolerance,
             min_all: f64::INFINITY,
@@ -326,7 +331,7 @@ impl Bag {
     /// seeded with the current model.
     fn start_stage(&mut self, run: &TrainContext, scorer: Option<&Scorer>, terms: usize) {
         self.stopper = scorer.map(|scorer| {
-            let capacity = run.params.ebm_early_stopping_rounds * terms;
+            let capacity = run.params.ebm_early_stopping_rounds.saturating_mul(terms);
             let start = self.score(run, scorer);
             Stopper::new(
                 capacity,
@@ -435,6 +440,7 @@ fn classic(
     mains: &[Vec<u32>],
     mu: f64,
     rounds: usize,
+    metric: Option<&dyn Metric>,
     hook: &mut Hook,
 ) -> Result<Grown> {
     let params = run.params;
@@ -443,12 +449,8 @@ fn classic(
     let mut bags = (0..n_bags)
         .map(|b| Bag::new(run, b, mu))
         .collect::<Result<Vec<Bag>>>()?;
-    let metric = if params.ebm_early_stopping_rounds > 0 {
-        configured_metrics(params, run.objective)?.pop()
-    } else {
-        None
-    };
-    let scorer = metric.as_deref().map(|metric| Scorer {
+    let metric = metric.filter(|_| params.ebm_early_stopping_rounds > 0);
+    let scorer = metric.map(|metric| Scorer {
         metric,
         sign: if metric.maximize() { -1.0 } else { 1.0 },
     });

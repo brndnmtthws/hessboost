@@ -843,6 +843,9 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
             prepared,
             &mut state.model,
             num_boost_round,
+            // The early-stopping metric: `Trainer::custom_metric`'s, else
+            // the last configured one.
+            eval_plan.metrics.last().map(AsRef::as_ref),
             &mut |iteration| {
                 on_round.as_mut().map_or(ControlFlow::Continue(()), |hook| {
                     hook(&RoundEval {

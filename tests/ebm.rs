@@ -451,6 +451,44 @@ fn shape_lookups_refuse_or_absorb_malformed_points() {
 }
 
 #[test]
+fn early_stopping_scores_bags_with_the_custom_metric() {
+    use hessboost::metric::CustomMetric;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let (_, dtrain) = data(400, 13);
+    let params = classic()
+        .eta(0.3)
+        .ebm_early_stopping_rounds(3)
+        .build()
+        .unwrap();
+    let metric = CustomMetric::new("mae", false, |preds, labels, _| {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        preds
+            .iter()
+            .zip(labels)
+            .map(|(p, y)| f64::from((p - y).abs()))
+            .sum::<f64>()
+            / preds.len() as f64
+    });
+    Trainer::new(&params, &dtrain, 200)
+        .custom_metric(Box::new(metric))
+        .train()
+        .unwrap();
+    assert!(CALLS.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn an_oversized_early_stopping_patience_just_never_stops() {
+    let (_, dtrain) = data(200, 14);
+    let params = classic()
+        .ebm_early_stopping_rounds(usize::MAX)
+        .build()
+        .unwrap();
+    let model = train(&params, &dtrain, 2).unwrap();
+    assert!(model.num_trees() > 0);
+}
+
+#[test]
 fn early_stopping_ends_every_bag_at_its_best_round() {
     let (_, dtrain) = data(600, 11);
     let params = classic()

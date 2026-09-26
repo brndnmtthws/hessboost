@@ -446,8 +446,9 @@ pub struct TrainingParams {
     /// Early stopping of every outer bag of a classic `booster = ebm` on
     /// its own held-out rows (the `1 − ebm_bag_fraction` it does not train
     /// on), after InterpretML: after every tree the bag scores its
-    /// held-out rows with the last eval metric (`eval_metric`, else the
-    /// objective's default), stops once no tree of the last
+    /// held-out rows with [`Trainer::custom_metric`](crate::training::Trainer::custom_metric)'s
+    /// metric when given, else the last eval metric (`eval_metric`, else
+    /// the objective's default), stops once no tree of the last
     /// `ebm_early_stopping_rounds × terms` improved on the best score before
     /// them by the tolerance, and keeps its trees up to its best score. Each
     /// stage (main effects, pairs) stops separately; `num_boost_round` is

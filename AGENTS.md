@@ -119,8 +119,8 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
 |`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
-|`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public)|
+|`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`, `online` (split ranking for `training::online`)|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
@@ -139,8 +139,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 |Path|Non-obvious contents|
 |---|---|
 |`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `metal` on macOS|
-|`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `train` (`Trainer` on a signal-polled worker thread, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `dist`|
-|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`, `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `folds`; `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
+|`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `online` (`OnlineModel`: the one mutable class, its state behind a mutex locked only detached; updates through `run_hooked`), `dist`|
+|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`, `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `folds`, `online` (`OnlineModel`, `UpdateReport`); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
 |`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit|
 
 ## Invariants
@@ -287,7 +287,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   without its switch, e.g. `rate_drop` without `booster=dart`),
   `validate_request` in `training/train.rs` (data-dependent),
   `training/multi_output.rs::validate`, `training/continuation.rs`,
-  `EvalMetric::from_xgboost` (metric names and suffixes), and `training/budget.rs`.
+  `EvalMetric::from_xgboost` (metric names and suffixes), `training/budget.rs`,
+  and `training/online.rs::check_supported`.
   Budget mode and refresh compare params against defaults plus an
   allow-list (`TrainingParams::refuse_changes_from`, over `changed_keys`,
   which destructures every field), so any new field is refused there
@@ -325,7 +326,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   aliases.
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
-  `objective::distributional`, `conformal`).
+  `objective::distributional`, `conformal`, `training::online`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.

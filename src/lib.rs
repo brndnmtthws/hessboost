@@ -48,7 +48,7 @@
 //! - [`data`]: [`DMatrix`], [`MetaInfo`](data::MetaInfo), feature types,
 //!   CSV/libsvm loaders, [`data::target_stats`].
 //! - [`training`]: [`train`], [`Trainer`], [`cv`](training::cv),
-//!   [`training::budget`].
+//!   [`training::budget`], [`training::online`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
 //!   native and XGBoost JSON/UBJSON, LightGBM text import);
 //!   [`model::compact`].
@@ -132,6 +132,9 @@
 //!     ([`QuantizedGrad`](config::QuantizedGrad), `use_quantized_grad`);
 //!   - PerpetualBooster-style budget training: one `budget` instead of
 //!     `eta`/depth/rounds ([`training::budget`]);
+//!   - in-place row addition and deletion (incremental learning and machine
+//!     unlearning) for trained hist models, exact or approximate
+//!     ([`training::online`]);
 //!   - distributional boosting (NGBoost / XGBoostLSS style): `dist:normal`,
 //!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`
 //!     per-row distributions
@@ -148,8 +151,8 @@
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `ordered_target_stats`, `pfn_boost`, `metal`
-//! with `--features metal` on macOS). Run one with
+//! `distributional`, `budget`, `online_update`, `ordered_target_stats`,
+//! `pfn_boost`, `metal` with `--features metal` on macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes

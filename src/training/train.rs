@@ -843,6 +843,23 @@ fn train_linear(
     })
 }
 
+/// The checks [`Trainer::train`] runs on `params` and `dtrain` before
+/// anything is built (no eval sets, no early stopping), with the loss
+/// `params` train: for callers that train on `dtrain` without going through
+/// [`Trainer`] and must refuse exactly what training refuses.
+pub(crate) fn validate_training_data(params: &TrainingParams, dtrain: &DMatrix) -> Result<()> {
+    let objective = params.loss(dtrain.n_targets())?;
+    validate_request(
+        &TrainRequest {
+            params,
+            dtrain,
+            evals: &[],
+            early_stopping_rounds: None,
+        },
+        objective.as_ref(),
+    )
+}
+
 /// What [`validate_request`] checks: the training call's configuration and
 /// data, before anything is built.
 struct TrainRequest<'a> {

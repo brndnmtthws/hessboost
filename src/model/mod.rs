@@ -606,6 +606,28 @@ impl BoostedModel {
         self.linear = Some(linear);
     }
 
+    /// A copy of this model's metadata (intercepts, objective, layout) with
+    /// `trees` instead of its own, every tree weighing `1` and no
+    /// `best_iteration`: the result of an in-place data update
+    /// ([`crate::training::online`]).
+    pub(crate) fn with_trees(&self, trees: Vec<RegTree>) -> BoostedModel {
+        BoostedModel {
+            trees,
+            base_score: self.base_score.clone(),
+            objective: self.objective.clone(),
+            max_delta_step: self.max_delta_step,
+            num_class: self.num_class,
+            n_outputs: self.n_outputs,
+            n_targets: self.n_targets,
+            n_features: self.n_features,
+            best_iteration: None,
+            tree_weights: Vec::new(),
+            num_parallel_tree: self.num_parallel_tree,
+            linear: None,
+            compact: OnceLock::new(),
+        }
+    }
+
     /// Append a tree with an explicit contribution weight (`1.0` for plain
     /// `gbtree`; DART stores fractional weights so dropped trees can be
     /// rescaled).

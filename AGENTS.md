@@ -120,7 +120,8 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`, `online` (split ranking for `training::online`)|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts; uniform, class-balanced, and query-level row sampling), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts; uniform, class-balanced, and query-level row sampling), `boulevard` (BRAT-D/BRAT-P `Recursion`, shared with the honest refit), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
+|`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `importance_test`); `kernel` (leaf kernel over the training rows), `solver` (exact Cholesky or Nyström ridge solves), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; exact truncations), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
@@ -157,7 +158,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   permutations) use `rng::Rng`. Keyed draws (`extra_trees` node seeds,
   `dist:*` split direction, quantized stochastic rounding, per-block
   row-sampling seeds, Langevin noise) use SplitMix64 streams keyed by seed
-  and index.
+  and index. Boulevard rounds (dropout sets, row samples) and Nyström
+  landmarks draw from `rng::Rng` seeded per round; the inference's parallel
+  loops split by rows or fixed row blocks, never by thread.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
   `Trainer::on_round` only observes: a hook that always continues leaves
   the model byte-identical, and a `Break` after round `k` gives the
@@ -207,7 +210,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     (`model/sections.rs`), XXH64 of the preceding bytes. A new stored field
     is a new section: flag it `REQUIRED` if unaware readers must refuse
     rather than skip it, and default its absence to reproduce older files
-    (objective parameters: the objective's defaults). Readers refuse
+    (objective parameters: the objective's defaults; the optional
+    `boulevard.*` sections: not a Boulevard fit). Readers refuse
     anything undefined inside known sections (unknown `node.flags` bits,
     `tree.has_linear` not 0/1, trailing bytes), which is what makes new flag
     bits safe. Changing a section's meaning or the container layout bumps
@@ -231,6 +235,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     parameters the objective does not read are dropped). `ModelObjective`
     keeps its representation private so a recorded name is never a
     built-in objective's and a built-in objective never a custom loss.
+    A missing `boulevard` is `None`.
     Everything predictions depend on is required, nullable ones via
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
@@ -300,6 +305,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   refused, `OBJECTIVE_KEYS` in `config/xgboost.rs`, as is a dependent key
   without its switch, e.g. `rate_drop` without `booster=dart`),
   `validate_request` in `training/train.rs` (data-dependent),
+  `validate_boulevard_request` there too,
   `training/multi_output.rs::validate`, `training/continuation.rs`,
   `EvalMetric::from_xgboost` (metric names and suffixes), `training/budget.rs`,
   and `training/online.rs::check_supported`; SGLB and model shrinkage in
@@ -344,7 +350,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
   `objective::distributional`, `conformal`, `model::uncertainty`,
-  `training::online`).
+  `inference`, `training::online`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.
@@ -359,7 +365,11 @@ Easy-to-miss requirements: multiclass needs `Multiclass::new(k)`; ranking needs
 losses randomized per round (XE-NDCG) take the round from
 `Loss::gradient_info_at`, so every training loop calls it;
 `Loss::split_gradient` serves vector-leaf trees only, not with
-monotone constraints. Linear-leaf models predict through `tree::linear`;
+monotone constraints. `booster = boulevard` is squared error only, refuses
+nonlinear-leaf options, weights, base margins, early stopping and
+continuation, and needs `eta = 1` with `num_parallel_tree > 1` (BRAT-P); its
+leaves carry the final `1/B` scale, so exports and SHAP see a plain gbtree
+ensemble, and slices drop the `BoulevardInfo`. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.
 
 ## When changing behavior

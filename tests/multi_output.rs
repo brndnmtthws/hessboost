@@ -3,7 +3,7 @@
 //! reduced split gradients, and configuration errors.
 
 use hessboost::config::{
-    BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType, TreeMethod,
+    BoosterKind, Dart, GrowPolicy, Monotone, MultiStrategy, ProcessType, Refresh, TreeMethod,
 };
 use hessboost::data::FeatureType;
 use hessboost::objective::{CustomLoss, GradPair, SplitGradient};
@@ -229,9 +229,13 @@ fn single_output_builds_scalar_trees() {
 #[test]
 fn dart_rounds_train_vector_trees() {
     let params = vector_params()
-        .booster(BoosterKind::Dart)
-        .rate_drop(0.5)
-        .skip_drop(0.0)
+        .booster(BoosterKind::Dart(
+            Dart::builder()
+                .rate_drop(0.5)
+                .skip_drop(0.0)
+                .build()
+                .unwrap(),
+        ))
         .seed(7)
         .build()
         .unwrap();
@@ -415,7 +419,7 @@ fn unsupported_vector_layouts_are_rejected() {
     let vector = model();
     // XGBoost's refresh updater handles single-target trees only.
     let refresh = vector_params()
-        .process_type(ProcessType::Update)
+        .process_type(ProcessType::Update(Refresh::default()))
         .build()
         .unwrap();
     assert_eq!(

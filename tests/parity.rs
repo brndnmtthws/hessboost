@@ -23,7 +23,7 @@
 //! uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
 //! ```
 
-use hessboost::config::ProcessType;
+use hessboost::config::{ProcessType, Refresh};
 use hessboost::data::FeatureType;
 use hessboost::internals::HistCuts;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
@@ -630,8 +630,11 @@ impl Case<'_> {
     ) -> Result<f64, String> {
         let fx = self.fx;
         let mut params = build_params(fx)?;
-        params.process_type = ProcessType::Update;
-        params.refresh_leaf = r.refresh_leaf;
+        params.process_type = ProcessType::Update(if r.refresh_leaf {
+            Refresh::default()
+        } else {
+            Refresh::stats_only()
+        });
         let data = self
             .dmatrix(&fx.x_train[..r.n_rows * fx.n_cols], r.n_rows)?
             .with_labels(&r.y)

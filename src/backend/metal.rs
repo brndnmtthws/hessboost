@@ -1988,7 +1988,7 @@ mod tests {
     /// splits, missing values) predicts identically through `to_gpu`.
     #[test]
     fn gpu_predicts_like_cpu() {
-        use crate::config::{BoosterKind, Device, TreeMethod};
+        use crate::config::{BoosterKind, Dart, Device, TreeMethod};
         use crate::data::FeatureType;
         use crate::prelude::*;
         if !context() {
@@ -2030,7 +2030,7 @@ mod tests {
             .tree_method(TreeMethod::Hist)
             .max_depth(5)
             .eta(0.3)
-            .booster(BoosterKind::Dart)
+            .booster(BoosterKind::Dart(Dart::default()))
             .device(Device::Metal)
             .build()
             .unwrap();

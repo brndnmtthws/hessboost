@@ -8,7 +8,9 @@
 mod common;
 
 use hessboost::backend::metal;
-use hessboost::config::{BoosterKind, Device, ProcessType};
+use hessboost::config::{
+    BoosterKind, Dart, Device, LinearTree, ProcessType, QuantizedGrad, Refresh,
+};
 use hessboost::objective::{GradPair, Logistic, Multiclass};
 use hessboost::prelude::*;
 
@@ -153,13 +155,16 @@ fn device_metal_refuses_unsupported_combinations() {
             with(|p| p.tree_method = TreeMethod::Exact),
             "tree_method=exact",
         ),
-        (with(|p| p.use_quantized_grad = true), "use_quantized_grad"),
+        (
+            with(|p| p.quantized = Some(QuantizedGrad::default())),
+            "use_quantized_grad",
+        ),
         (
             with(|p| p.booster = BoosterKind::GbLinear),
             "booster=gblinear",
         ),
         (
-            with(|p| p.process_type = ProcessType::Update),
+            with(|p| p.process_type = ProcessType::Update(Refresh::default())),
             "process_type=update",
         ),
     ];
@@ -205,7 +210,7 @@ fn to_gpu_predicts_bit_identically() {
             .tree_method(TreeMethod::Hist)
             .max_depth(5)
             .eta(0.4)
-            .booster(BoosterKind::Dart)
+            .booster(BoosterKind::Dart(Dart::default()))
             .build()
             .unwrap();
         let model = train(&params, &data, 15).unwrap();
@@ -257,7 +262,7 @@ fn to_gpu_refuses_unsupported_models() {
     let linear = train(
         &TrainingParams::builder()
             .tree_method(TreeMethod::Hist)
-            .linear_tree(true)
+            .linear_tree(LinearTree::default())
             .build()
             .unwrap(),
         &data,

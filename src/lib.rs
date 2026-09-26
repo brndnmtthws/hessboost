@@ -59,7 +59,7 @@
 //!   the `Metric` trait, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
 //! - [`inference`]: Boulevard boosting's confidence and prediction intervals
-//!   for `f(x)` and its variable-importance test.
+//!   for `f(x)`.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
 //!
@@ -121,7 +121,7 @@
 //!   - Boulevard boosting (Zhou & Hooker, JMLR 2022) and its dropout
 //!     (BRAT-D) and parallel (BRAT-P) variants (Fang, Tan & Hooker, NeurIPS
 //!     2025) with CLT-based confidence intervals for `f(x)`, prediction and
-//!     reproduction intervals, a chi-squared variable-importance test, an
+//!     reproduction intervals, an
 //!     honest leaf refit, and exact or Nyström variance
 //!     ([`BoosterKind::Boulevard`](config::BoosterKind::Boulevard),
 //!     [`inference`]);

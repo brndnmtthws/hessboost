@@ -1,7 +1,8 @@
 //! Statistical inference for Boulevard boosting: confidence intervals for
 //! the regression function `f(x)`, prediction intervals for new labels,
-//! reproduction intervals, and a variable-importance test, with asymptotic
-//! (central-limit) guarantees. Beyond XGBoost and opt-in: train with
+//! and reproduction intervals, with asymptotic (central-limit) guarantees
+//! under the assumptions below and validated only in the regimes listed in
+//! [Validation](#validation). Beyond XGBoost and opt-in: train with
 //! [`BoosterKind::Boulevard`](crate::config::BoosterKind::Boulevard), then
 //! fit a [`BoulevardInference`] on the training rows.
 //!
@@ -96,11 +97,53 @@
 //! - Every variance here is **conditional on the tree structures** (the
 //!   kernel is treated as fixed, as in both papers). How the structures, and
 //!   with them the fit's bias, vary between training samples is not
-//!   included. In one dimension with small bias this is negligible (honest
-//!   95% intervals cover at 0.95); in several dimensions the true variance
-//!   can be a multiple of the estimate, intervals under-cover, and
-//!   [`importance_test`] rejects a true null far more often than its level
-//!   (see its documentation for measured sizes).
+//!   included. In one dimension with small bias this is negligible; in
+//!   several dimensions the true variance can be a multiple of the estimate
+//!   and the intervals under-cover (see [Validation](#validation)).
+//! - Prediction intervals additionally need **Gaussian noise**: the
+//!   estimate's error is asymptotically normal, but the new label's own
+//!   noise is not averaged, so `± z σ̂` covers `1 − α` of it only when that
+//!   noise is normal (uniform noise, for one, is covered with probability
+//!   1 at 95%). Otherwise use
+//!   [`calibrated_prediction_intervals`](BoulevardInference::calibrated_prediction_intervals),
+//!   which rescales the widths by an empirical quantile, or [`crate::conformal`].
+//!
+//! # Validation
+//!
+//! Simulations (50 training samples each, 100 fixed test points,
+//! coverage of the true `f`, `σ̂²` from a holdout of `n/2` rows):
+//!
+//! | setting | `n` | 90% CI | 95% CI | 95% PI |
+//! |---|---|---|---|---|
+//! | `f = sin 2πx + x²/2` (1-d), BRAT-D `λ = 0.6`, `p = 0.6`, `ξ = 0.6`, depth 8, 200 trees, [`honest_refit`] | 500 | 0.899 | 0.949 | 0.959 |
+//! | same | 1000 | 0.904 | 0.953 | 0.955 |
+//! | same | 2000 | 0.901 | 0.952 | 0.955 |
+//! | same, Nyström `s = 1000` | 4000 | 0.909 | 0.957 | 0.953 |
+//! | same, `p = 0` (Zhou & Hooker's Boulevard) | 1000 | 0.903 | 0.952 | 0.955 |
+//! | same, BRAT-P `K = 4`, 100 rounds | 1000 | 0.883 | 0.936 | 0.956 |
+//! | same, **without** [`honest_refit`] | 1000 | 0.756 | 0.845 | 0.957 |
+//! | `f = 4x₁ − x₂²` on `[0, 1]³` (the NeurIPS paper's §6 test function), `λ = 1`, `p = 0.95`, `ξ = 1`, depth 6, 100 trees, [`honest_refit`] | 1000 | 0.651 | 0.726 | — |
+//! | same | 2000 | 0.626 | 0.711 | — |
+//! | same, without [`honest_refit`] | 1000 | 0.543 | 0.632 | — |
+//! | Friedman #1 (5-d), BRAT-D `p = 0.6`, depth 6, [`honest_refit`] (20 samples) | 2000 | 0.122 | 0.148 | 0.959 |
+//!
+//! In the 1-d setting the estimated variance matches the across-sample
+//! variance of the estimate to within 5% (BRAT-P: 8% low). In the 3-d
+//! setting it is about half of it: 1.06 × when the tree structures are held
+//! fixed and only the refit sample is redrawn, 1.96 × when they are
+//! retrained, so the missing term is the structures' sample-to-sample
+//! variation. In 5-d the fit's bias dominates. The authors' reference
+//! package (`boulevard-boosting` 0.1.0a1) gives the same coverage, interval
+//! widths, and MSE as this module in the settings compared (within
+//! seed-to-seed noise). Treat the confidence intervals as validated for
+//! low-dimensional smooth signals with honest refits only.
+//!
+//! The NeurIPS paper's variable-importance test (§4) is not provided: with
+//! the variances above its statistic is anti-conservative (82–94% rejection
+//! of a true null at a nominal 5% in the §6 setup with honest refits; 95%
+//! with the reference package's own weights), and the paper's reported
+//! size comes from a different regime (both fits on the same training
+//! sample, noise standard deviation `0.01`, `n ≤ 200`, depth 8).
 //!
 //! # Example
 //!
@@ -154,9 +197,8 @@ use serde::{Deserialize, Serialize};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::objective::distributional::special::{gamma_q, norm_ppf};
+use crate::objective::distributional::special::norm_ppf;
 use kernel::LeafKernel;
-use linalg::{forward_solve, pivoted_cholesky};
 use rayon::prelude::*;
 use solver::RidgeSolver;
 
@@ -164,11 +206,6 @@ pub use refit::honest_refit;
 
 /// Query points solved together: one block of right-hand sides.
 const QUERY_BLOCK: usize = 32;
-
-/// Relative diagonal tolerance of the importance test's covariance: test
-/// points whose weight vectors are (numerically) combinations of the others'
-/// are dropped, and the degrees of freedom count the rest.
-const TEST_POINT_TOL: f64 = 1e-9;
 
 /// Largest training set [`KernelSolver::Exact`] factors (its `n × n`
 /// system takes `8 n²` bytes: 512 MiB here).
@@ -606,9 +643,13 @@ impl<'a> BoulevardInference<'a> {
     }
 
     /// Prediction intervals for a new label `y` at every row of `data`:
-    /// `f̂(x) ± z_{1−α/2} sqrt(σ̂² + σ̂² ‖w(x)‖²)`, covering `y | x` with
-    /// asymptotic probability `1 − alpha` (conditionally on `x`, unlike
-    /// [`crate::conformal`]'s marginal guarantee).
+    /// `f̂(x) ± z_{1−α/2} sqrt(σ̂² + σ̂² ‖w(x)‖²)`. With **Gaussian** noise
+    /// this covers `y | x` with asymptotic probability `1 − alpha`
+    /// (conditionally on `x`, unlike [`crate::conformal`]'s marginal
+    /// guarantee); with other noise the new label's own error keeps its
+    /// distribution and the coverage differs, so use
+    /// [`calibrated_prediction_intervals`](Self::calibrated_prediction_intervals)
+    /// or [`crate::conformal`] then.
     ///
     /// The paper's display scales the noise term by BRAT-D's `(1 + λq) / λ`
     /// as well; that factor belongs to the estimate only (the new label's
@@ -690,122 +731,4 @@ impl<'a> BoulevardInference<'a> {
             })
             .collect())
     }
-}
-
-/// The outcome of [`importance_test`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
-pub struct ImportanceTest {
-    /// The chi-squared statistic `σ̂⁻² dᵀ Ξ⁻¹ d`.
-    pub statistic: f64,
-    /// Its degrees of freedom: the number of test points kept (those whose
-    /// weight vectors are not numerically combinations of the others').
-    pub degrees_of_freedom: usize,
-    /// `P(χ²_df ≥ statistic)`.
-    pub p_value: f64,
-}
-
-/// Fang, Tan & Hooker's variable-importance test (Section 4): does `f`
-/// depend on features that a reduced model leaves out?
-///
-/// Split the training data into two independent halves; train `full` (all
-/// features) on the first and `reduced` (the features kept under the null)
-/// on the second, and fit each one's [`BoulevardInference`] on its own half.
-/// At `m` test points (`full_points` and `reduced_points`: the same rows in
-/// each model's feature layout) the difference of the predictions `d` is,
-/// under `H₀: f = g` (the projection of `f` on the kept features),
-/// asymptotically `N(0, σ² Ξ)` with `Ξ = W₁ W₁ᵀ + W₂ W₂ᵀ` (the two
-/// estimates' weight vectors, independent by the split), so
-/// `σ̂⁻² dᵀ Ξ⁻¹ d ~ χ²_m`. `σ̂²` is the full model's noise estimate. Test
-/// points that duplicate others (numerically) are dropped from `Ξ` and the
-/// degrees of freedom. Keep `m` well below the training sizes; the cost is
-/// that of `m` variance queries plus `O(m³)`.
-///
-/// # Size: the test is anti-conservative outside a narrow regime
-///
-/// `Ξ` is the variance of `d` **given the two ensembles' tree
-/// structures**, as every variance in this module is (the papers' kernel
-/// ridge limit treats the kernel as fixed). It omits how much each
-/// estimate's structure-dependent bias varies from one training sample to
-/// the next. [`honest_refit`] removes the adaptivity of the leaves but not
-/// this term, so the statistic is inflated by roughly the ratio of the
-/// estimates' true to estimated variance, and the inflation compounds over
-/// the `m` points. Measured (honest refits of both fits, BRAT-D, independent
-/// halves, `m = 20` points, nominal 5%):
-///
-/// | setting | `n` | rejection rate under `H₀` |
-/// |---|---|---|
-/// | 1-d signal, `λ = 0.6`, `p = 0.6`, depth 8 (40 seeds) | 1000 | 0.100 |
-/// | same | 2000 | 0.125 |
-/// | paper's §6 setup `4x₁ − x₂² (+ w x₃)`, `λ = 1`, `p = 0.95`, depth 6 (100 seeds) | 1000 | 0.82 |
-/// | same | 2000 | 0.94 |
-/// | same, `m = 1` (200 seeds; mean `T / df` = 2.1) | 1000 | 0.195 |
-///
-/// Fitting the reduced model on a permuted copy of the tested features
-/// (so both fits smooth the same number of dimensions) does not change
-/// these numbers, and neither do more rounds, so neither mismatched
-/// smoothing bias nor Monte-Carlo noise of the ensemble drives them. In
-/// the paper's setup the ratio of the across-sample variance of an honest
-/// estimate to [`BoulevardInference::standard_errors`]`²` is 1.06 when the
-/// tree structures are held fixed and only the refit sample is redrawn, but
-/// 1.96 when the structures are retrained too, which locates the missing
-/// term. The authors' reference package (`boulevard-boosting` 0.1.0a1, no
-/// honest refit), with the test assembled from its own weight vectors,
-/// rejects the null at 0.95 (mean `T / df` 3.4) in the same setup at
-/// `n = 1000`, as this crate does without the refit (0.99, 3.4). Read a
-/// rejection as evidence only when the per-point variance is calibrated for
-/// the problem at hand: a simulation of [`BoulevardInference::standard_errors`]
-/// against the across-sample spread of the predictions (their ratio is the
-/// expected `T / df` under `H₀`), low dimension, small bias, and few test
-/// points.
-///
-/// # Errors
-///
-/// [`HessboostError::DimensionMismatch`] when the two point sets differ in
-/// row count, plus those of [`BoulevardInference::standard_errors`] for
-/// either model's points.
-pub fn importance_test(
-    full: &BoulevardInference,
-    full_points: &DMatrix,
-    reduced: &BoulevardInference,
-    reduced_points: &DMatrix,
-) -> Result<ImportanceTest> {
-    let m = full_points.n_rows();
-    if reduced_points.n_rows() != m {
-        return Err(HessboostError::dimension_mismatch(
-            "importance test points",
-            m,
-            reduced_points.n_rows(),
-        ));
-    }
-    let gram = |inf: &BoulevardInference, data: &DMatrix| -> Result<Vec<f64>> {
-        let leaves = inf.leaves(data)?;
-        let k = inf.kernel_vectors(&leaves, 0..m);
-        let solved = inf.solver.solve(&k, m, inf.c);
-        Ok(inf.weight_gram(&solved.gram, &solved.sums, m))
-    };
-    let (g1, g2) = (gram(full, full_points)?, gram(reduced, reduced_points)?);
-    let xi: Vec<f64> = g1.iter().zip(&g2).map(|(a, b)| a + b).collect();
-    let p1 = full.model.predict(full_points)?;
-    let p2 = reduced.model.predict(reduced_points)?;
-    let d: Vec<f64> = p1
-        .iter()
-        .zip(&p2)
-        .map(|(&a, &b)| f64::from(a) - f64::from(b))
-        .collect();
-    let pivoted = pivoted_cholesky(&xi, m, TEST_POINT_TOL);
-    let r = pivoted.rank();
-    let mut y: Vec<f64> = pivoted.pivots.iter().map(|&p| d[p]).collect();
-    forward_solve(&pivoted.factor, r, &mut y, 1);
-    let statistic = y.iter().map(|v| v * v).sum::<f64>() / full.noise_variance;
-    let p_value = if r == 0 {
-        1.0
-    } else {
-        gamma_q(r as f64 / 2.0, statistic / 2.0)
-    };
-    Ok(ImportanceTest {
-        statistic,
-        degrees_of_freedom: r,
-        p_value,
-    })
 }

@@ -108,7 +108,7 @@ runnable programs live in [`examples/`](examples)
 | `shap` | SHAP contributions and interaction values |
 | `model_io` | native and XGBoost JSON/UBJSON save and load |
 | `conformal` | calibrated prediction intervals |
-| `boulevard_inference` | confidence intervals for `f(x)`, prediction intervals, a variable-importance test |
+| `boulevard_inference` | confidence intervals for `f(x)` and prediction intervals |
 | `distributional` | predictive distributions, intervals, and NLL |
 | `virtual_ensembles` | SGLB posterior sampling: knowledge uncertainty rising off the training data |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
@@ -163,7 +163,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | Feature | What it gives you |
 |---|---|
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
-| [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/) | Boulevard boosting (`booster = boulevard`, with BRAT-D dropout and BRAT-P parallel variants) and its asymptotic confidence intervals for `f(x)`, prediction intervals, and variable-importance test, after Zhou & Hooker (JMLR 2022) and Fang, Tan & Hooker (NeurIPS 2025); squared error only |
+| [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/) | Boulevard boosting (`booster = boulevard`, with BRAT-D dropout and BRAT-P parallel variants) and its asymptotic confidence intervals for `f(x)` and prediction intervals, after Zhou & Hooker (JMLR 2022) and Fang, Tan & Hooker (NeurIPS 2025); squared error only |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
@@ -201,9 +201,9 @@ Beyond XGBoost (opt-in, none changes default training):
 - Boulevard's intervals for `f(x)` are asymptotic and ignore the fit's
   bias: they reach nominal coverage when the leaves are refitted on an
   independent sample (`honest_refit`) and the bias is small, and
-  under-cover otherwise (in 5 dimensions, badly). The variable-importance
-  test inherits this: its size is 10–12% at a nominal 5% in one dimension
-  and far above it in the paper's 3-d setup (see `importance_test`).
+  under-cover otherwise: 95% intervals cover 0.73 of the time in the
+  paper's 3-d test setup and 0.15 in 5 dimensions (validated table in the
+  `inference` docs). Its prediction intervals assume Gaussian noise.
 
 ## Not implemented
 

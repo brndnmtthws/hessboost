@@ -1,6 +1,6 @@
 //! Boulevard boosting with statistical inference on the regression function:
-//! confidence intervals for `f(x)`, prediction intervals for new labels,
-//! and a variable-importance test, on data with a known `f`.
+//! confidence intervals for `f(x)` and prediction intervals for new labels,
+//! on data with a known `f`.
 //!
 //! The model is trained with `booster = boulevard` (BRAT-D: dropout
 //! Boulevard), its leaves are refitted on an independent sample
@@ -10,9 +10,7 @@
 //! Run with: `cargo run --release --example boulevard_inference`
 
 use hessboost::config::{BoosterKind, TrainingParams};
-use hessboost::inference::{
-    BoulevardInference, KernelSolver, NoiseVariance, honest_refit, importance_test,
-};
+use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::prelude::*;
 
 mod common;
@@ -43,11 +41,6 @@ fn dataset(n: usize, w: f32, seed: u64) -> (Vec<f32>, Vec<f32>) {
 
 fn matrix(x: &[f32], y: &[f32], cols: usize) -> Result<DMatrix> {
     DMatrix::from_dense(x, y.len(), cols)?.with_labels(y)
-}
-
-/// The first column of a two-column row-major matrix.
-fn first_column(x: &[f32]) -> Vec<f32> {
-    x.as_chunks::<2>().0.iter().map(|r| r[0]).collect()
 }
 
 fn params() -> Result<TrainingParams> {
@@ -136,50 +129,6 @@ fn main() -> Result<()> {
             100.0 * (1.0 - alpha),
             100.0 * covered_f as f64 / ci.len() as f64,
             100.0 * covered_y as f64 / pi.len() as f64
-        );
-    }
-
-    // Variable importance: is x1 needed? Full model on (x0, x1), reduced on
-    // x0 alone, each trained and refitted on its own half of the data.
-    println!("\nvariable-importance test of x1 (20 test points):");
-    let points: Vec<f32> = (0..20)
-        .flat_map(|i| [0.025 + 0.05 * i as f32, ((i * 7) % 20) as f32 / 20.0])
-        .collect();
-    let (dfull_points, dreduced_points) = (
-        DMatrix::from_dense(&points, 20, 2)?,
-        DMatrix::from_dense(&first_column(&points), 20, 1)?,
-    );
-    for w in [0.0, 1.0] {
-        let data = |seed| dataset(n, w, seed);
-        let ((x1s, y1s), (x1v, y1v), (x2s, y2s), (x2v, y2v), (xh, yh)) =
-            (data(11), data(12), data(13), data(14), data(15));
-        let full_values = matrix(&x1v, &y1v, 2)?;
-        let full = honest_refit(
-            &train(&params()?, &matrix(&x1s, &y1s, 2)?, 200)?,
-            &full_values,
-        )?;
-        let reduced_values = matrix(&first_column(&x2v), &y2v, 1)?;
-        let reduced = honest_refit(
-            &train(&params()?, &matrix(&first_column(&x2s), &y2s, 1)?, 200)?,
-            &reduced_values,
-        )?;
-        let holdout = matrix(&xh, &yh, 2)?;
-        let full_inf = BoulevardInference::fit(
-            &full,
-            &full_values,
-            NoiseVariance::Holdout(&holdout),
-            KernelSolver::Exact,
-        )?;
-        let reduced_inf = BoulevardInference::fit(
-            &reduced,
-            &reduced_values,
-            NoiseVariance::TrainingResiduals,
-            KernelSolver::Exact,
-        )?;
-        let test = importance_test(&full_inf, &dfull_points, &reduced_inf, &dreduced_points)?;
-        println!(
-            "  y = f(x0) + {w} x1 + ε: chi² = {:.1} on {} df, p = {:.4}",
-            test.statistic, test.degrees_of_freedom, test.p_value
         );
     }
 

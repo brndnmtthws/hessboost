@@ -1,16 +1,15 @@
 //! # hessboost
 //!
-//! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting, implemented
-//! in Rust. Its only C dependency is the official zstd library, which
-//! compresses native model files; the opt-in `metal` feature additionally
-//! binds Apple's Metal framework for GPU prediction and (bit-identical) GPU
-//! histograms on macOS.
+//! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting in Rust. The
+//! only C dependency is zstd (native model files); the opt-in `metal`
+//! feature adds Apple's Metal framework for GPU prediction and bit-identical
+//! GPU histograms on macOS.
 //!
 //! ## Quick start
 //!
-//! Build a [`DMatrix`], configure [`TrainingParams`] with a builder, train
-//! with [`train`] (or [`Trainer`] for eval sets, early stopping, custom
-//! hooks, and continued training), then
+//! Build a [`DMatrix`], set [`TrainingParams`] with its builder, train with
+//! [`train`] (or [`Trainer`] for eval sets, early stopping, custom hooks,
+//! and continued training), then
 //! [`predict`](model::BoostedModel::predict):
 //!
 //! ```
@@ -45,124 +44,106 @@
 //!
 //! ## Modules
 //!
-//! - [`config`]: [`TrainingParams`], its builder, and the parameter enums
-//!   ([`TreeMethod`](config::TreeMethod), [`GrowPolicy`](config::GrowPolicy),
-//!   [`Monotone`](config::Monotone), ...).
-//! - [`data`]: [`DMatrix`], [`MetaInfo`](data::MetaInfo), feature types, the
-//!   CSV/libsvm loaders; [`data::target_stats`] (ordered target statistics).
-//! - [`training`]: [`train`], [`Trainer`], [`cv`](training::cv);
-//!   [`training::budget`] (budget-mode training).
+//! - [`config`]: [`TrainingParams`], builder, parameter enums.
+//! - [`data`]: [`DMatrix`], [`MetaInfo`](data::MetaInfo), feature types,
+//!   CSV/libsvm loaders, [`data::target_stats`].
+//! - [`training`]: [`train`], [`Trainer`], [`cv`](training::cv),
+//!   [`training::budget`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
-//!   native and XGBoost JSON/UBJSON formats); [`model::compact`]
-//!   (bit-packed inference format).
-//! - [`objective`]: the [`Objective`](objective::Objective) trait, the
-//!   built-in objectives, [`CustomObjective`](objective::CustomObjective);
-//!   [`objective::distributional`] (`dist:*` objectives).
-//! - [`metric`]: the [`Metric`](metric::Metric) trait, the built-in metrics,
-//!   [`CustomMetric`](metric::CustomMetric).
-//! - [`conformal`]: split-conformal and conformalized-quantile prediction
-//!   intervals.
-//! - [`tree`]: [`RegTree`](tree::RegTree) and its nodes, for inspecting a
-//!   trained model.
-//! - [`error`]: [`HessboostError`](error::HessboostError) and
-//!   [`Result`](error::Result).
+//!   native and XGBoost JSON/UBJSON); [`model::compact`].
+//! - [`objective`]: the `Objective` trait, the built-in objectives,
+//!   `CustomObjective`, [`objective::distributional`] (`dist:*` objectives).
+//! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
+//! - [`conformal`]: split-conformal and conformalized-quantile intervals.
+//! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
+//! - [`error`]: `HessboostError` and `Result`.
 //!
 //! ## What's here
 //!
-//! - **Boosters:** `gbtree`, `dart`, `gblinear`, and boosted random forests
+//! - **Boosters:** `gbtree`, `dart`, `gblinear`, boosted random forests
 //!   (`num_parallel_tree`).
-//! - **Training lifecycle:** continued training from an existing model and
-//!   `process_type=update` tree refresh
-//!   ([`Trainer::init_model`](training::Trainer::init_model)), model slicing
-//!   ([`BoostedModel::slice`](model::BoostedModel::slice)) and
-//!   `iteration_range` prediction as Rust ranges
+//! - **Lifecycle:** continued training and `process_type=update` refresh
+//!   ([`Trainer::init_model`](training::Trainer::init_model)), slicing
+//!   ([`BoostedModel::slice`](model::BoostedModel::slice)), `iteration_range`
+//!   prediction as Rust ranges
 //!   ([`predict_margin_range`](model::BoostedModel::predict_margin_range) and
 //!   siblings).
-//! - **Tree methods:** `exact`, `hist`, and `approx`, with `depthwise` or
-//!   `lossguide` growth; uniform or `gradient_based` row sampling and
-//!   column sampling, optionally weighted per feature
+//! - **Tree methods:** `exact`, `hist`, `approx`; `depthwise`/`lossguide`
+//!   growth; uniform or `gradient_based` row sampling; column sampling with
+//!   optional per-feature weights
 //!   ([`DMatrix::with_feature_weights`](data::DMatrix::with_feature_weights)).
 //! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
-//!   absolute error, quantile and expectile alpha lists), binary
-//!   (logistic, logitraw, hinge) and multiclass classification, count
-//!   (poisson/gamma/tweedie), learning-to-rank (LambdaMART), survival
-//!   (`survival:cox`, `survival:aft` on censored label bounds), and a custom
-//!   hook ([`Trainer::objective`](training::Trainer::objective)).
-//! - **Multi-output:** multi-target label matrices
-//!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)),
-//!   one tree per output or vector-leaf trees
+//!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
+//!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
+//!   `survival:aft` on censored bounds), plus a custom hook
+//!   ([`Trainer::objective`](training::Trainer::objective)).
+//! - **Multi-output:** label matrices
+//!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
+//!   tree per output or vector-leaf trees
 //!   ([`MultiStrategy::MultiOutputTree`](config::MultiStrategy::MultiOutputTree)).
 //! - **Metrics:** rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
-//!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, and
+//!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, plus
 //!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric));
-//!   `@k` cutoffs on the ranking metrics and `@rho` on tweedie-nloglik, any
-//!   other suffix refused ([`create_metric`](metric::create_metric)).
-//! - **Modeling:** monotone & interaction constraints, native categorical
-//!   splits, early stopping, feature importance, QuadratureTreeSHAP
-//!   contributions and interaction values
+//!   `@k` ranking cutoffs and `@rho` on tweedie-nloglik, other suffixes
+//!   refused ([`create_metric`](metric::create_metric)).
+//! - **Modeling:** monotone and interaction constraints, native categorical
+//!   splits, early stopping, feature importance, QuadratureTreeSHAP values
+//!   and interactions
 //!   ([`predict_contribs`](model::BoostedModel::predict_contribs) /
 //!   [`predict_interactions`](model::BoostedModel::predict_interactions)).
-//! - **I/O:** libsvm/CSV loaders, native binary + JSON model I/O, and
-//!   XGBoost-format JSON and UBJSON model import/export
-//!   ([XGBoost interchange](model#xgboost-interchange)).
-//! - **Validation:** cross-validation ([`cv`](training::cv)), or over
-//!   caller-supplied or forward-chaining (time-ordered, purged)
-//!   [`Fold`](training::Fold)s with fold-mean early stopping
-//!   ([`CrossValidation`](training::CrossValidation)).
-//! - **Beyond XGBoost (opt-in, none changes default training):**
-//!   - split-conformal and conformalized-quantile prediction intervals with
+//! - **I/O:** libsvm/CSV loaders, native binary + JSON, XGBoost JSON and
+//!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)).
+//! - **Validation:** cross-validation ([`cv`](training::cv)), custom or
+//!   forward-chaining (time-ordered, purged) [`Fold`](training::Fold)s with
+//!   fold-mean early stopping ([`CrossValidation`](training::CrossValidation)).
+//! - **Beyond XGBoost (opt-in, default training unchanged):**
+//!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);
-//!   - CatBoost-style ordered target statistics for categorical columns
-//!     ([`data::target_stats`]);
-//!   - LightGBM tree options `extra_trees`, `path_smooth`, and `linear_tree`
-//!     leaves ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
+//!   - CatBoost-style ordered target statistics ([`data::target_stats`]);
+//!   - LightGBM options `extra_trees`, `path_smooth`, `linear_tree` leaves
+//!     ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
 //!     [`path_smooth`](config::TrainingParams::path_smooth),
 //!     [`linear_tree`](config::TrainingParams::linear_tree),
 //!     [`LinearLeaves`](tree::LinearLeaves));
-//!   - CatBoost-style symmetric (oblivious) trees
-//!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), which batch
-//!     prediction routes by bit pattern;
-//!   - compact models after *Boosted Trees on a Diet*: feature/threshold
-//!     reuse penalties (`toad_penalty_feature`, `toad_penalty_threshold`) and
-//!     a bit-packed layout predicting bit-identical margins
-//!     ([`model::compact`]);
-//!   - LightGBM-style quantized-gradient training
+//!   - CatBoost-style symmetric trees
+//!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), routed by
+//!     bit pattern in batch prediction;
+//!   - *Boosted Trees on a Diet* reuse penalties
+//!     (`toad_penalty_feature`, `toad_penalty_threshold`) and a bit-packed
+//!     layout with bit-identical margins ([`model::compact`]);
+//!   - LightGBM-style quantized gradients
 //!     ([`use_quantized_grad`](config::TrainingParams::use_quantized_grad));
-//!   - PerpetualBooster-style budget training, one `budget` number instead of
-//!     tuning `eta`/depth/rounds ([`training::budget`]);
+//!   - PerpetualBooster-style budget training: one `budget` instead of
+//!     `eta`/depth/rounds ([`training::budget`]);
 //!   - distributional boosting (NGBoost / XGBoostLSS style): `dist:normal`,
 //!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`
-//!     predict a full conditional distribution per row
+//!     per-row distributions
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
 //!     [`objective::distributional`]), scored by `nll` / `crps`.
-//!   - GPU acceleration on macOS 10.15+ through native Metal (`metal`
-//!     feature): bit-identical GPU prediction
-//!     ([`to_gpu`](model::BoostedModel::to_gpu), roughly 2.5x faster at
-//!     scale) and bit-identical GPU histogram training
+//!   - native Metal on macOS 10.15+ (`metal` feature): bit-identical GPU
+//!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~2.5x faster at
+//!     scale) and bit-identical GPU histograms
 //!     ([`device`](config::TrainingParams::device) = `metal`; exact integer
-//!     sums, with a CPU fallback outside their exact domain). The Metal API
-//!     is documented only in macOS builds with the feature
-//!     (`cargo doc --features metal`); elsewhere [`backend::metal`] is a
-//!     stub.
+//!     sums, CPU fallback outside their exact domain). Documented only in
+//!     macOS builds with the feature (`cargo doc --features metal`);
+//!     elsewhere [`backend::metal`] is a stub.
 //!
-//! Runnable examples live in the crate's `examples/` directory (e.g.
-//! `train_regression`, `binary_classification`, `multiclass`, `ranking`,
-//! `shap`, `model_io`, `custom_objective`, `constraints`, `conformal`,
-//! `compact_model`, `distributional`, `budget`, `ordered_target_stats`,
-//! `pfn_boost`, `metal` (`--features metal`, macOS)). Run one with
+//! `examples/` has one program per topic (`train_regression`,
+//! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
+//! `custom_objective`, `constraints`, `conformal`, `compact_model`,
+//! `distributional`, `budget`, `ordered_target_stats`, `pfn_boost`, `metal`
+//! with `--features metal` on macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
 //!
-//! Objective, metric, and parameter names are XGBoost's, so an XGBoost
-//! configuration carries over as is; a setting hessboost does not support
-//! is refused with an error. Parity with XGBoost 3.4.2 is CI-tested: on the
-//! parity fixtures, deterministic configurations reproduce XGBoost's
-//! predictions within `1e-4` (quantile cuts bit for bit), and imported
-//! XGBoost models predict and explain as XGBoost does. RNG-driven options
-//! (row/column subsampling, forests, DART) match only in model quality,
-//! because the random streams differ.
+//! Parameter, objective, and metric names are XGBoost's, so an XGBoost
+//! configuration carries over; unsupported settings are refused. Parity with
+//! XGBoost 3.4.2 is CI-tested: deterministic fixtures reproduce XGBoost
+//! within `1e-4` (quantile cuts bit for bit), and imported XGBoost models
+//! predict and explain as XGBoost does. RNG-driven options (subsampling,
+//! forests, DART) match in quality only — the streams differ.
 //!
 //! ### Not implemented
 //!

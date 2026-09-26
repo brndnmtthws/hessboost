@@ -35,6 +35,7 @@ struct QueryGradient<'a> {
 #[derive(Default)]
 struct QueryScratch {
     rho: Vec<f64>,
+    one_minus_rho: Vec<f64>,
     target: Vec<f64>,
 }
 
@@ -57,12 +58,17 @@ impl Xendcg {
             labels,
             weights,
         } = context;
-        let QueryScratch { rho, target } = scratch;
+        let QueryScratch {
+            rho,
+            one_minus_rho,
+            target,
+        } = scratch;
         let n = scores.len();
         if n <= 1 {
             out.fill(GradPair::default());
             return;
         }
+
         let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         rho.clear();
         rho.extend(
@@ -71,9 +77,28 @@ impl Xendcg {
                 .map(|&score| (f64::from(score) - f64::from(max_score)).exp()),
         );
         let denominator: f64 = rho.iter().sum();
+        let max_index = scores
+            .iter()
+            .position(|&score| score == max_score)
+            .unwrap_or(0);
+        let max_count = scores.iter().filter(|&&score| score == max_score).count();
+        one_minus_rho.clear();
+        one_minus_rho.extend(rho.iter().enumerate().map(|(index, &value)| {
+            if max_count == 1 && index == max_index {
+                rho.iter()
+                    .enumerate()
+                    .filter(|(tail_index, _)| *tail_index != max_index)
+                    .map(|(_, probability)| probability)
+                    .sum::<f64>()
+                    / denominator
+            } else {
+                (denominator - value) / denominator
+            }
+        }));
         for probability in rho.iter_mut() {
             *probability /= denominator;
         }
+
         let seed_key = mix64(*seed);
         let iter_key = mix64(seed_key ^ (*iteration as u64).wrapping_mul(GOLDEN));
         let query_key = mix64(iter_key ^ (*query as u64).wrapping_mul(GOLDEN));
@@ -83,24 +108,38 @@ impl Xendcg {
             let draw = (bits >> 40) as f32 * (1.0 / (1u32 << 24) as f32);
             2.0f64.powf(f64::from(label)) - f64::from(draw)
         }));
-        let inv_denominator = 1.0 / target.iter().sum::<f64>().max(1e-15);
+        let inv_target_sum = 1.0 / target.iter().sum::<f64>().max(1e-15);
+        // The higher-order correction divides twice by 1 - rho. When the
+        // softmax is saturated, use the finite first-order gradient limit.
+        if one_minus_rho.iter().any(|&q| q < f64::from(f32::EPSILON)) {
+            for (i, pair) in out.iter_mut().enumerate() {
+                pair.grad = (rho[i] - target[i] * inv_target_sum) as f32;
+                pair.hess = (rho[i] * one_minus_rho[i]) as f32;
+                if let Some(weights) = weights {
+                    pair.grad *= weights[i];
+                    pair.hess *= weights[i];
+                }
+            }
+            return;
+        }
         let mut sum_l1 = 0.0;
         for i in 0..n {
-            let term = -target[i] * inv_denominator + rho[i];
+            let term = -target[i] * inv_target_sum + rho[i];
             out[i].grad = term as f32;
-            target[i] = term / (1.0 - rho[i]);
+            target[i] = term / one_minus_rho[i];
             sum_l1 += target[i];
         }
         let mut sum_l2 = 0.0;
         for i in 0..n {
             let term = rho[i] * (sum_l1 - target[i]);
             out[i].grad += term as f32;
-            target[i] = term / (1.0 - rho[i]);
+            target[i] = term / one_minus_rho[i];
             sum_l2 += target[i];
         }
+
         for i in 0..n {
             out[i].grad += (rho[i] * (sum_l2 - target[i])) as f32;
-            out[i].hess = (rho[i] * (1.0 - rho[i])) as f32;
+            out[i].hess = (rho[i] * one_minus_rho[i]) as f32;
             if let Some(weights) = weights {
                 out[i].grad *= weights[i];
                 out[i].hess *= weights[i];
@@ -279,6 +318,22 @@ mod tests {
         objective.gradient_grouped_at(&scores, &labels, None, None, &mut again, 4);
         assert_ne!(actual, again);
     }
+    #[test]
+    fn extreme_score_margins_keep_gradients_finite() {
+        let labels = [1.0, 0.0];
+        let objective = Xendcg::new(0);
+        let mut actual = [GradPair::default(); 2];
+        for scores in [[100.0, 0.0], [f32::MAX, -f32::MAX]] {
+            objective.gradient_grouped_at(&scores, &labels, None, None, &mut actual, 0);
+            assert!(
+                actual
+                    .iter()
+                    .all(|pair| pair.grad.is_finite() && pair.hess.is_finite())
+            );
+            assert!(actual.iter().all(|pair| pair.hess >= 0.0));
+        }
+    }
+
     #[test]
     fn grouped_gradients_are_bit_identical_across_thread_counts() {
         let scores = vec![0.0; 4096];

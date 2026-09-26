@@ -591,3 +591,28 @@ fn a_boulevard_ebm_with_a_broken_round_layout_does_not_load() {
         Err(HessboostError::ModelFormat(_))
     ));
 }
+
+/// In-place updates regrow trees on every feature, which would break the
+/// one-term-per-tree structure the shape functions read.
+#[test]
+fn online_updates_refuse_an_ebm() {
+    use hessboost::training::online::{OnlineModel, OnlineParams};
+    let (_, dtrain) = data(200, 16);
+    let model = train(&classic().build().unwrap(), &dtrain, 3).unwrap();
+    let gbtree = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .build()
+        .unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(
+                model.clone(),
+                &gbtree,
+                &dtrain,
+                online
+            )),
+            "model"
+        );
+    }
+}

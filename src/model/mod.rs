@@ -688,6 +688,7 @@ impl BoostedModel {
             linear: None,
             shrinkage: None,
             boulevard: None,
+            ebm: None,
             compact: OnceLock::new(),
         }
     }

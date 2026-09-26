@@ -641,12 +641,40 @@ impl Method {
                 }
                 if let Parameterization::Edm { sigma_data } = score.parameterization {
                     check_positive("sigma_data", sigma_data)?;
+                    // The coefficients divide by `σ_d²`-sized terms.
+                    check_positive("sigma_data", sigma_data * sigma_data)?;
+                }
+                // Finite parameters can still overflow the kernel (e.g. a VE
+                // `σ_max²` beyond `f64::MAX`); every quantity is monotone in
+                // `t`, so the endpoints bound it on `[T_EPS, 1]`.
+                let finite = [process::T_EPS, 1.0].iter().all(|&t| {
+                    let (alpha, std) = score.sde.marginal(t);
+                    let (c, g2) = score.sde.drift_diffusion(t);
+                    [alpha, std, std.ln(), c, g2].iter().all(|v| v.is_finite())
+                }) && score.sde.prior_std().is_finite();
+                if !finite {
+                    return Err(HessboostError::invalid_param(
+                        "sde",
+                        "the schedule's noise scale or drift is zero or overflows on [1e-5, 1]",
+                    ));
                 }
                 score.time_sampling.validate()
             }
             Method::FlowMatching(flow) => {
                 if let FlowPath::VariancePreserving { beta_min, beta_max } = flow.path {
                     check_schedule("path", beta_min, beta_max)?;
+                }
+                let finite = [process::T_EPS, 1.0].iter().all(|&t| {
+                    let c = flow.path.coefficients(t);
+                    [c.a, c.b, c.b.ln(), c.da, c.db]
+                        .iter()
+                        .all(|v| v.is_finite())
+                });
+                if !finite {
+                    return Err(HessboostError::invalid_param(
+                        "path",
+                        "the path's noise scale or velocity is zero or overflows on [1e-5, 1]",
+                    ));
                 }
                 flow.time_sampling.validate()
             }

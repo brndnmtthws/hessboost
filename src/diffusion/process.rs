@@ -165,7 +165,8 @@ pub(super) fn draw_times(
             let (lo, hi) = (log_scale[0], log_scale[TABLE_SIZE - 1]);
             (0..n)
                 .map(|_| {
-                    let draw = (mean + std * normal.draw(rng)).clamp(lo, hi);
+                    // `max`/`min`, not `clamp`: they never panic, whatever the bounds.
+                    let draw = (mean + std * normal.draw(rng)).max(lo).min(hi);
                     interpolate(&log_scale, &times, draw)
                 })
                 .collect()

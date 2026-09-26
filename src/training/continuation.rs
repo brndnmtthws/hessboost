@@ -44,6 +44,17 @@ pub(super) fn resume_model(
         };
         HessboostError::model_format(format!("invalid init model: {reason}"))
     })?;
+    // A Boulevard model averages all of its rounds (its leaves carry the
+    // `1/B` of the run), so appending or refreshing rounds, with any
+    // booster, would not give a Boulevard average; nor can Boulevard
+    // continue another model's sum.
+    if params.booster == BoosterKind::Boulevard || init.boulevard().is_some() {
+        return Err(HessboostError::invalid_param(
+            "init_model",
+            "Boulevard models average every round of one run and cannot be trained further, \
+             and `booster = boulevard` cannot continue another model",
+        ));
+    }
     let is_linear = init.linear().is_some();
     if is_linear != (params.booster == BoosterKind::GbLinear) {
         return Err(HessboostError::invalid_param(

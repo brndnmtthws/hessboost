@@ -32,9 +32,10 @@ and `λ` is the L2 penalty `lambda`.
   any thread count.
 - **Stable model files.** Anything saved by 0.2.0 or later loads in every
   later release.
-- **More than XGBoost, opt-in.** Conformal intervals, distributional
-  boosting, budget training, compact models, and more — all off by default,
-  none of them changes default training.
+- **More than XGBoost, opt-in.** Conformal intervals, confidence intervals
+  for the regression function (Boulevard boosting), distributional boosting,
+  budget training, compact models, and more — all off by default, none of
+  them changes default training.
 
 ## Getting started
 
@@ -100,6 +101,7 @@ runnable programs live in [`examples/`](examples)
 | `shap` | SHAP contributions and interaction values |
 | `model_io` | native and XGBoost JSON/UBJSON save and load |
 | `conformal` | calibrated prediction intervals |
+| `boulevard_inference` | confidence intervals for `f(x)`, prediction intervals, a variable-importance test |
 | `distributional` | predictive distributions, intervals, and NLL |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
@@ -130,6 +132,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | Feature | What it gives you |
 |---|---|
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
+| [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/) | Boulevard boosting (`booster = boulevard`, with BRAT-D dropout and BRAT-P parallel variants) and its asymptotic confidence intervals for `f(x)`, prediction intervals, and variable-importance test, after Zhou & Hooker (JMLR 2022) and Fang, Tan & Hooker (NeurIPS 2025); squared error only |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
@@ -151,6 +154,10 @@ Beyond XGBoost (opt-in, none changes default training):
 - Budget training runs 10–54× a depth-6 `hist` fit with the same tree count.
 - Quantized gradients only pay off when histogram building dominates; on
   50,000 rows they're break-even.
+- Boulevard's intervals for `f(x)` are asymptotic and ignore the fit's
+  bias: they reach nominal coverage when the leaves are refitted on an
+  independent sample (`honest_refit`) and the bias is small, and
+  under-cover otherwise (in 5 dimensions, badly).
 
 ## Not implemented
 

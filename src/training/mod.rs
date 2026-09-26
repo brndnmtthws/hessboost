@@ -2,6 +2,7 @@
 //! ([`cv`], or [`CrossValidation`] over caller-supplied or time-ordered
 //! [`Fold`]s), and opt-in [`budget`] training.
 
+pub(crate) mod boulevard;
 pub mod budget;
 mod continuation;
 mod cv;

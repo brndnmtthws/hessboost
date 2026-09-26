@@ -88,7 +88,8 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `boulevard` (BRAT-D/BRAT-P `Recursion`, shared with the honest refit), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
+|`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `importance_test`); `kernel` (leaf kernel over the training rows), `solver` (exact Cholesky or Nyström ridge solves), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
@@ -114,6 +115,9 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   permutations) use `rng::Rng`. Keyed draws (`extra_trees` node seeds,
   `dist:*` split direction, quantized stochastic rounding, per-block
   row-sampling seeds) use SplitMix64 streams keyed by seed and index.
+  Boulevard rounds (dropout sets, row samples) and Nyström landmarks draw
+  from `rng::Rng` seeded per round; the inference's parallel loops split by
+  rows or fixed row blocks, never by thread.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
 - **Metal:** `device = metal` reproduces the single-threaded CPU model bit
   for bit: gradients are staged as integer multiples of a per-component
@@ -158,7 +162,8 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
     (`model/sections.rs`), XXH64 of the preceding bytes. A new stored field
     is a new section: flag it `REQUIRED` if unaware readers must refuse
     rather than skip it, and default its absence to reproduce older files
-    (objective parameters: the objective's defaults). Readers refuse
+    (objective parameters: the objective's defaults; the optional
+    `boulevard.*` sections: not a Boulevard fit). Readers refuse
     anything undefined inside known sections (unknown `node.flags` bits,
     `tree.has_linear` not 0/1, trailing bytes), which is what makes new flag
     bits safe. Changing a section's meaning or the container layout bumps
@@ -171,7 +176,8 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
     field goes in the type and its mirror, with a `#[serde(default)]` on the
     mirror that reproduces older files. A new `ObjectiveParams` field goes
     in the `objective_param_mirrors!` list (`config/params.rs`); missing
-    objective fields take `ObjectiveParams::defaults_for(objective)`.
+    objective fields take `ObjectiveParams::defaults_for(objective)`; a
+    missing `boulevard` is `None`.
     Everything predictions depend on is required, nullable ones via
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
@@ -212,6 +218,7 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
 - **Refusals:** unsupported parameters or combinations error, never get
   ignored. Checks live in `TrainingParams::validate` (static),
   `validate_request` in `training/train.rs` (data-dependent),
+  `validate_boulevard_request` there too,
   `training/multi_output.rs::validate`, `training/continuation.rs`,
   `metric/mod.rs::build` (metric suffixes), and `training/budget.rs`.
   Budget mode and refresh compare params against defaults plus an
@@ -227,7 +234,7 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   aliases.
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
-  `objective::distributional`, `conformal`).
+  `objective::distributional`, `conformal`, `inference`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.
@@ -240,7 +247,11 @@ Easy-to-miss requirements: multiclass needs `.num_class(k)`; ranking needs
 `.with_group_sizes`; `survival:aft` needs `.with_label_bounds`;
 `survival:cox` reads non-positive labels as right-censored;
 `Objective::split_gradient` serves vector-leaf trees only, not with
-monotone constraints. Linear-leaf models predict through `tree::linear`;
+monotone constraints. `booster = boulevard` is squared error only, refuses
+nonlinear-leaf options, weights, base margins, early stopping and
+continuation, and needs `eta = 1` with `num_parallel_tree > 1` (BRAT-P); its
+leaves carry the final `1/B` scale, so exports and SHAP see a plain gbtree
+ensemble, and slices drop the `BoulevardInfo`. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.
 
 ## When changing behavior

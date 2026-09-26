@@ -1,6 +1,7 @@
 //! Multiclass classification with `multi:softprob` (per-class probabilities) and
 //! `predict_class` (argmax). Run: `cargo run --release --example multiclass`.
 
+use hessboost::objective::Multiclass;
 use hessboost::prelude::*;
 
 mod common;
@@ -26,8 +27,7 @@ fn main() -> Result<()> {
     let dtrain = DMatrix::from_dense(&x, n, f)?.with_labels(&y)?;
 
     let params = TrainingParams::builder()
-        .objective("multi:softprob")
-        .num_class(k) // required for multiclass
+        .objective(Objective::Softprob(Multiclass::new(k)?)) // required for multiclass
         .max_depth(4)
         .eta(0.2)
         .build()?;

@@ -10,7 +10,7 @@
 
 use hessboost::config::MultiStrategy;
 use hessboost::conformal::ConformalizedQuantile;
-use hessboost::objective::distributional::Dist;
+use hessboost::objective::distributional::{Dist, DistFamily, Distributional};
 use hessboost::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     let dvalid = dataset(2000, 2)?;
     let dcal = dataset(2000, 3)?;
     let dtest = dataset(6000, 4)?;
-    let fit_with = |objective: &str, strategy: MultiStrategy| -> Result<BoostedModel> {
+    let fit_with = |objective: Objective, strategy: MultiStrategy| -> Result<BoostedModel> {
         let params = TrainingParams::builder()
             .objective(objective)
             .tree_method(TreeMethod::Hist)
@@ -83,10 +83,11 @@ fn main() -> Result<()> {
             .train()?
             .model)
     };
-    let fit = |objective: &str| fit_with(objective, MultiStrategy::OneOutputPerTree);
+    let fit = |objective: Objective| fit_with(objective, MultiStrategy::OneOutputPerTree);
+    let normal = Objective::Dist(Distributional::new(DistFamily::Normal));
 
     // One tree per distribution parameter and round: (μ, ln σ).
-    let model = fit("dist:normal")?;
+    let model = fit(normal.clone())?;
     let dists = model.predict_distribution(&dtest)?;
     println!(
         "dist:normal: {} rounds, first test rows:",
@@ -102,7 +103,7 @@ fn main() -> Result<()> {
     }
 
     // Homoscedastic baseline: squared-error point model, one global sigma.
-    let point = fit("reg:squarederror")?;
+    let point = fit(Objective::SquaredError)?;
     let fitted = point.predict(&dtrain)?;
     let labels = dtrain.labels().unwrap_or_default();
     let sigma = (fitted
@@ -129,7 +130,7 @@ fn main() -> Result<()> {
     );
     // Parallel gradient boosting: one shared tree per round for (μ, ln σ),
     // its structure grown from one randomly chosen parameter's gradients.
-    let shared = fit_with("dist:normal", MultiStrategy::MultiOutputTree)?;
+    let shared = fit_with(normal, MultiStrategy::MultiOutputTree)?;
     println!(
         "  shared trees (PGB)     {:.4}  ({} trees vs {} for one tree per parameter)",
         mean_nll(&shared.predict_distribution(&dtest)?, &dtest),

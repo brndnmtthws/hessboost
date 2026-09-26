@@ -79,10 +79,10 @@ fn same_bits(a: &[f32], b: &[f32]) -> bool {
 fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
     let model = BoostedModel::from_lightgbm_text(text).map_err(|e| format!("import: {e}"))?;
     let expected_objective = fx.objective.as_deref().unwrap_or_default();
-    if model.objective() != expected_objective {
+    if model.objective().name() != expected_objective {
         return Err(format!(
             "objective {}, expected {expected_objective}",
-            model.objective()
+            model.objective().name()
         ));
     }
     let k = fx.n_outputs.unwrap_or(1);

@@ -199,7 +199,10 @@ d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
 - `custom_metric(predictions, labels, weights)` returns a float and is named
   by the function's `__name__` (XGBoost passes a `DMatrix` and returns
   `(name, value)`). `obj(margins, dtrain)` matches XGBoost; the model then
-  predicts margins from a zero intercept (or `base_score`).
+  predicts margins from a zero intercept (or `base_score`). `obj` replaces
+  `objective`, which `params` must then not set, and `num_class` is the
+  custom objective's output count (XGBoost's custom-softmax convention;
+  default: one per label column).
 - `cv` returns a dict of numpy arrays (`test-<metric>-mean`/`-std`) with
   held-out metrics only; there is no `stratified` or `as_pandas`.
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's

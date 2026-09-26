@@ -298,7 +298,7 @@ impl Booster {
 
     #[getter]
     fn objective(&self) -> &str {
-        self.model.objective()
+        self.model.objective().name()
     }
 
     #[getter]

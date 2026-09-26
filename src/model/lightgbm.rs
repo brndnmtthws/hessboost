@@ -1,8 +1,10 @@
 //! LightGBM text model import; user docs: `model` module, "LightGBM import".
 
-use crate::config::ObjectiveParams;
 use crate::error::{HessboostError, Result};
-use crate::model::{BoostedModel, ModelSpec};
+use crate::model::{BoostedModel, ModelObjective, ModelSpec};
+use crate::objective::{
+    LambdaRank, Logistic, Multiclass, Objective, PseudoHuber, Quantiles, Tweedie,
+};
 use crate::tree::{LinearLeaves, Node, RegTree};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -84,8 +86,8 @@ pub(crate) fn import_lightgbm_text(text: &str) -> Result<BoostedModel> {
         Vec::new(),
         vec![0.0; n_outputs],
         ModelSpec {
-            objective: objective.name.to_string(),
-            objective_params: objective.params,
+            objective: ModelObjective::BuiltIn(objective.objective),
+            max_delta_step: objective.max_delta_step,
             num_class: objective.num_class,
             n_outputs,
             n_targets: objective.n_targets,
@@ -403,8 +405,10 @@ impl<'a> Header<'a> {
 
 /// The hessboost objective a LightGBM objective maps to.
 struct MappedObjective {
-    name: &'static str,
-    params: ObjectiveParams,
+    objective: Objective,
+    /// XGBoost's `max_delta_step` for the objective: LightGBM's
+    /// `poisson_max_delta_step` for `poisson`, else the objective's default.
+    max_delta_step: f64,
     num_class: usize,
     n_outputs: usize,
     n_targets: usize,
@@ -502,18 +506,25 @@ fn map_objective(
         }
         (_, None) => {}
     }
-    let hessboost = match name {
-        "regression" | "fair" => "reg:squarederror",
-        "regression_l1" | "mape" => "reg:absoluteerror",
-        "huber" => "reg:pseudohubererror",
-        "quantile" => "reg:quantileerror",
-        "poisson" => "count:poisson",
-        "gamma" => "reg:gamma",
-        "tweedie" => "reg:tweedie",
-        "binary" | "multiclassova" => "binary:logistic",
-        "cross_entropy" => "reg:logistic",
-        "multiclass" => "multi:softprob",
-        "lambdarank" | "rank_xendcg" => "rank:ndcg",
+    let invalid = |e: HessboostError| format_error(format!("objective `{}`: {e}", clip(line)));
+    let objective = match name {
+        "regression" | "fair" => Objective::SquaredError,
+        "regression_l1" | "mape" => Objective::AbsoluteError,
+        "huber" => Objective::PseudoHuber(
+            PseudoHuber::new(parameter(parameters, "alpha", 0.9)?).map_err(invalid)?,
+        ),
+        "quantile" => Objective::Quantile(
+            Quantiles::new([parameter(parameters, "alpha", 0.9)?]).map_err(invalid)?,
+        ),
+        "poisson" => Objective::Poisson,
+        "gamma" => Objective::Gamma,
+        "tweedie" => Objective::Tweedie(
+            Tweedie::new(parameter(parameters, "tweedie_variance_power", 1.5)?).map_err(invalid)?,
+        ),
+        "binary" | "multiclassova" => Objective::BinaryLogistic(Logistic::default()),
+        "cross_entropy" => Objective::RegLogistic(Logistic::default()),
+        "multiclass" => Objective::Softprob(Multiclass::new(num_class).map_err(invalid)?),
+        "lambdarank" | "rank_xendcg" => Objective::RankNdcg(LambdaRank::default()),
         "cross_entropy_lambda" => {
             return Err(format_error(
                 "objective `cross_entropy_lambda` predicts `log(1 + exp(x))`, a transform no \
@@ -527,16 +538,11 @@ fn map_objective(
             )));
         }
     };
-    let mut params = ObjectiveParams::defaults_for(hessboost);
-    match name {
-        "huber" => params.huber_slope = parameter(parameters, "alpha", 0.9)?,
-        "quantile" => params.quantile_alpha = vec![parameter(parameters, "alpha", 0.9)?],
-        "poisson" => params.max_delta_step = parameter(parameters, "poisson_max_delta_step", 0.7)?,
-        "tweedie" => {
-            params.tweedie_variance_power = parameter(parameters, "tweedie_variance_power", 1.5)?;
-        }
-        _ => {}
-    }
+    let max_delta_step = if name == "poisson" {
+        parameter(parameters, "poisson_max_delta_step", 0.7)?
+    } else {
+        objective.default_max_delta_step()
+    };
     let (num_class, n_outputs, n_targets) = match name {
         "multiclass" => (num_class, num_class, 1),
         // One-vs-all: an independent logistic output per class, which is a
@@ -544,13 +550,9 @@ fn map_objective(
         "multiclassova" => (0, num_class, num_class),
         _ => (0, 1, 1),
     };
-    params
-        .training_params(hessboost, num_class)
-        .build()
-        .map_err(|e| format_error(format!("objective `{}`: {e}", clip(line))))?;
     Ok(MappedObjective {
-        name: hessboost,
-        params,
+        objective,
+        max_delta_step,
         num_class,
         n_outputs,
         n_targets,
@@ -999,7 +1001,7 @@ mod tests {
         ] {
             let expected: Value = serde_json::from_str(expected).unwrap();
             let model = BoostedModel::from_lightgbm_text(text).unwrap();
-            assert_eq!(model.objective(), objective);
+            assert_eq!(model.objective().name(), objective);
             let x: Vec<f32> = floats(&expected, "x_test")
                 .iter()
                 .map(|&v| v as f32)

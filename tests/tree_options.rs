@@ -175,7 +175,7 @@ fn incompatible_configurations_are_rejected() {
         "linear_tree",
     );
     invalid(
-        base().linear_tree(true).objective("reg:absoluteerror"),
+        base().linear_tree(true).objective(Objective::AbsoluteError),
         "linear_tree",
     );
     // The histogram-based `approx` builder accepts every option.

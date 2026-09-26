@@ -8,6 +8,7 @@
 //! Run with: `cargo run --release --example budget`
 
 use hessboost::metric::EvalMetric;
+use hessboost::objective::Logistic;
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, train_with_budget};
 use std::time::Instant;
@@ -70,7 +71,7 @@ fn row(label: &str, model: &BoostedModel, trees: usize, score: f64, seconds: f64
 
 fn report(
     task: &str,
-    objective: &str,
+    objective: &Objective,
     dtrain: &DMatrix,
     dvalid: &DMatrix,
     dtest: &DMatrix,
@@ -79,7 +80,9 @@ fn report(
     let metric = metric.build(1)?;
     let labels = dtest.labels().unwrap_or_default();
     let score = |preds: &[f32]| metric.eval(preds, labels, None);
-    let params = TrainingParams::builder().objective(objective).build()?;
+    let params = TrainingParams::builder()
+        .objective(objective.clone())
+        .build()?;
     println!("{task} (test {}):", metric.name());
     println!(
         "  {:<34} {:>6} {:>7} {:>9} {:>8}",
@@ -101,7 +104,7 @@ fn report(
     // Tuned: a smaller learning rate with early stopping on the validation
     // set (the tuning budget mode replaces).
     let tuned_params = TrainingParams::builder()
-        .objective(objective)
+        .objective(objective.clone())
         .eta(0.05)
         .build()?;
     let start = Instant::now();
@@ -142,7 +145,7 @@ fn report(
 fn main() -> Result<()> {
     report(
         "Friedman #1 regression, 5000 rows",
-        "reg:squarederror",
+        &Objective::SquaredError,
         &regression(5000, 1)?,
         &regression(2000, 2)?,
         &regression(10_000, 3)?,
@@ -150,7 +153,7 @@ fn main() -> Result<()> {
     )?;
     report(
         "Friedman #1 binary classification, 5000 rows",
-        "binary:logistic",
+        &Objective::BinaryLogistic(Logistic::default()),
         &binary(5000, 4)?,
         &binary(2000, 5)?,
         &binary(10_000, 6)?,

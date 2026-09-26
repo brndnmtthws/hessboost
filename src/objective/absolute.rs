@@ -164,8 +164,8 @@ impl Loss for AbsoluteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::Objective;
     use crate::objective::{base_margins, gradient_pairs};
-    use crate::training::Trainer;
 
     /// `δ = (Σ√|r| / n)²`; `g = r·δ/√(δ² + r²)`, `h = δ/√(δ² + r²)`, which
     /// tends to `sign(r)` and `δ/|r|` for large residuals.
@@ -264,7 +264,7 @@ mod tests {
         let y1: Vec<f32> = (0..n).map(|i| (x[2 * i + 1] * 9.0).sin() * 3.0).collect();
         let matrix: Vec<f32> = y0.iter().zip(&y1).flat_map(|(&a, &b)| [a, b]).collect();
         let params = TrainingParams::builder()
-            .objective("reg:absoluteerror")
+            .objective(Objective::AbsoluteError)
             .max_depth(3)
             .build()
             .unwrap();
@@ -282,21 +282,28 @@ mod tests {
         }
     }
 
-    /// An objective handed to training directly is not sized from the
-    /// dataset: a label width other than its `n_targets` is a parameter
-    /// error, not a gradient over mismatched predictions and labels.
+    /// An objective's label width is its own, not the dataset's: a label
+    /// width other than its `n_targets` is a parameter error, not a
+    /// gradient over mismatched predictions and labels; training sizes the
+    /// built-in objective from the dataset.
     #[test]
-    fn training_rejects_a_different_label_width() {
+    fn a_different_label_width_is_refused() {
         use crate::config::TrainingParams;
+        use crate::data::MetaInfo;
         use crate::error::HessboostError;
-        let d = crate::test_support::labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
-        let params = TrainingParams::builder().build().unwrap();
-        let two = AbsoluteError::new(2);
+        use crate::objective::Objective;
+        let labels = [0.0f32, 1.0];
+        let info = MetaInfo::new(&labels, None, None);
         assert!(matches!(
-            Trainer::new(&params, &d, 1).loss(&two).train(),
+            AbsoluteError::new(2).validate_info(&info),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
         ));
-        let one = AbsoluteError::new(1);
-        assert!(Trainer::new(&params, &d, 1).loss(&one).train().is_ok());
+        AbsoluteError::new(1).validate_info(&info).unwrap();
+        let d = crate::test_support::labeled_dense(&[0.0, 1.0], 2, 1, &labels);
+        let params = TrainingParams::builder()
+            .objective(Objective::AbsoluteError)
+            .build()
+            .unwrap();
+        assert!(crate::training::train(&params, &d, 1).is_ok());
     }
 }

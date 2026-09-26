@@ -76,11 +76,10 @@ fn main() -> Result<()> {
             }
         }
     })
-    .with_default_metric(hessboost::metric::EvalMetric::Mae);
-    let quantiles = Trainer::new(&params, &dtrain, 200)
-        .loss(&pinball)
-        .train()?
-        .model;
+    .with_default_metric(EvalMetric::Mae);
+    let mut quantile_params = params;
+    quantile_params.objective = Objective::custom(pinball);
+    let quantiles = train(&quantile_params, &dtrain, 200)?;
     // The uncalibrated band, for comparison: predictions are `[row][output]`.
     let preds = quantiles.predict(&dtest)?;
     let band: Vec<(f32, f32)> = preds

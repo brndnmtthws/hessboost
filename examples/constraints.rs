@@ -22,7 +22,7 @@ fn main() -> Result<()> {
     }
     let d = DMatrix::from_dense(&x, n, 1)?.with_labels(&y)?;
     let params = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .monotone_constraints(vec![Monotone::Increasing]) // one entry per feature
         .max_depth(4)
         .eta(0.2)
@@ -45,7 +45,7 @@ fn main() -> Result<()> {
     }
     let d2 = DMatrix::from_dense(&x2, n2, f2)?.with_labels(&y2)?;
     let params2 = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         // Feature 0 may only co-occur with 1; feature 2 only with 3.
         .interaction_constraints(vec![vec![0, 1], vec![2, 3]])
         .max_depth(4)
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         .with_feature_types(&[FeatureType::Categorical])?;
     let mc = train(
         &TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(2)
             .eta(0.3)
             .build()?,

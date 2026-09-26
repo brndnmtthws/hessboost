@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
     let preds = model
         .predict(&probe)
         .expect("probe matrix matches the model");
-    let expected = if model.objective() == "multi:softmax" {
+    let expected = if model.objective().name() == "multi:softmax" {
         1
     } else {
         k

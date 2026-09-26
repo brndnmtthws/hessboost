@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     }
     let d = DMatrix::from_dense(&x, n, f)?.with_labels(&y)?;
     let params = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .max_depth(4)
         .eta(0.2)
         .build()?;

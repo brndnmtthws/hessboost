@@ -9,13 +9,14 @@ use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::{Metric, create_metrics};
-use crate::model::{BoostedModel, ModelSpec, check_objective_width};
+use crate::model::{BoostedModel, ModelSpec, Shrinkage, check_objective_width};
 use crate::objective::{GradPair, Objective, create_objective};
 use crate::rng::Rng;
 use crate::training::continuation::{require_model_for_update, resume_model};
 use crate::training::multi_output;
 use crate::training::refresh::refresh_tree;
 use crate::training::sampling::{GradientSample, gradient_based_sample};
+use crate::training::sglb::{Langevin, LeafRenewal, Sglb};
 use crate::tree::RegTree;
 use crate::tree::builder::{
     ExactTreeBuilder, HistTreeBuilder, LeafRows, SortedColumns, all_rows, check_symmetric_input,
@@ -26,13 +27,15 @@ use rayon::prelude::*;
 use std::sync::OnceLock;
 
 /// What every boosting round of one training run reads: the parameters, the
-/// training matrix with its metadata, and the objective.
+/// training matrix with its metadata, the objective, and the Langevin noise
+/// (`None` unless SGLB is on).
 #[derive(Clone, Copy)]
 pub(super) struct TrainContext<'a> {
     pub(super) params: &'a TrainingParams,
     pub(super) dtrain: &'a DMatrix,
     pub(super) info: &'a MetaInfo<'a>,
     pub(super) objective: &'a dyn Objective,
+    pub(super) langevin: Option<&'a Langevin>,
 }
 
 /// The gradients one tree grows on and the rows that take part: an output's
@@ -462,6 +465,13 @@ impl<'a> Trainer<'a> {
     /// either way. When the metric never improves (it is NaN), the best
     /// round is this run's first.
     ///
+    /// A model trained with model shrinkage
+    /// ([`model_shrink_rate`](crate::config::TrainingParams::model_shrink_rate),
+    /// posterior sampling) is instead cut back to its best iteration, as
+    /// CatBoost's `use_best_model` does: every later iteration rescaled the
+    /// earlier ones, so the returned model is the one the run held after the
+    /// best iteration, and its `best_iteration` is its last.
+    ///
     /// After [`init_model`](Self::init_model) the early-stopping state starts
     /// fresh; `best_iteration` and the history's iterations are absolute
     /// iteration indices of the continued model (XGBoost's `starting_round`
@@ -523,6 +533,12 @@ impl<'a> Trainer<'a> {
     /// DART dropout, the beyond-XGBoost tree options) must keep their
     /// defaults, while XGBoost's tree-shape settings (`tree_method`,
     /// `max_depth`, `min_child_weight`, ...) are accepted.
+    ///
+    /// Model shrinkage is refused on both sides, as in CatBoost: a model
+    /// trained with it cannot be continued, and shrinkage parameters cannot
+    /// continue a model. Langevin noise without shrinkage (an explicit
+    /// `model_shrink_rate` of `0`) continues exactly: its draws are keyed by
+    /// the absolute iteration.
     ///
     /// The model must be structurally valid, as every loaded model is.
     #[must_use]
@@ -649,6 +665,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     let info = dtrain.info();
     let n = dtrain.n_rows();
     let n_out = objective.n_outputs();
+    let sglb = Sglb::resolve(params, n)?;
     let intercepts = || initial_intercepts(params, objective, &info, n_out);
     let mut model = if let Some(init) = init_model {
         resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?
@@ -699,6 +716,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
         dtrain,
         info: &info,
         objective,
+        langevin: sglb.langevin.as_ref(),
     };
     let mut state = RoundState {
         model,
@@ -712,6 +730,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
             Vec::new()
         },
         reuse,
+        noisy_gpair: Vec::new(),
     };
     if start_iteration > 0
         && let RoundPlan::Grow(prepared) = &plan
@@ -731,9 +750,21 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     // is more than one output (a single output keeps scalar trees, as
     // XGBoost's `LeafLength` does).
     let vector_leaf = multi_output::vector_leaf(params, n_out);
+    // Model shrinkage: the intercepts before any shrinkage and every
+    // iteration's coefficient (continued training is refused with it, so
+    // iterations count from 0).
+    let unshrunk_base = state.model.base_scores().to_vec();
+    let mut shrink_factors = Vec::new();
 
     for round in 0..num_boost_round {
         let iteration = start_iteration + round;
+        if let Some(shrink) = &sglb.shrink {
+            let factor = shrink.factor(iteration);
+            if factor != 1.0 {
+                state.margins.scale(factor);
+            }
+            shrink_factors.push(factor);
+        }
         match &mut plan {
             RoundPlan::Grow(Prepared::Hist { index: ghist, .. }) if vector_leaf => {
                 multi_output::boost_round(
@@ -742,6 +773,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                     iteration,
                     &mut state.margins,
                     &mut state.gpair,
+                    &mut state.noisy_gpair,
                 )?;
             }
             RoundPlan::Refresh(queue) => refresh_round(&run, queue, iteration, &mut state)?,
@@ -758,6 +790,9 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     }
 
     let mut model = state.model;
+    if sglb.shrink.is_some() {
+        model.set_shrinkage(Shrinkage::new(shrink_factors, unshrunk_base));
+    }
     // XGBoost records the best iteration whenever early stopping is on, not
     // only when patience runs out.
     let mut best_round_score = None;
@@ -767,6 +802,10 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
         let best_iter = stopping.best_round();
         let round = &history[best_iter - first.iteration];
         best_round_score = round.scores.last().map(|&(_, _, v)| v);
+        // A shrunk model's later iterations rescaled the best one, so keep
+        // the model as it was after the best iteration (CatBoost's
+        // `use_best_model`) instead of hiding the rest behind the selection.
+        model.truncate_shrunk(best_iter + 1);
         model.set_best_iteration(Some(best_iter));
     }
 
@@ -890,6 +929,20 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
 
+    // Model shrinkage multiplies the intercept-and-trees margin every
+    // iteration; a per-row `base_margin` replaces the intercept and would be
+    // shrunk with it in the caches but not in prediction (CatBoost refuses
+    // baselines with shrinkage too, `options_helper.cpp`).
+    if params.model_shrinkage_on()
+        && let Some(name) = std::iter::once((dtrain, "dtrain"))
+            .chain(evals.iter().copied())
+            .find_map(|(data, name)| data.base_margin().map(|_| name))
+    {
+        return Err(HessboostError::invalid_param(
+            "model_shrink_rate",
+            format!("model shrinkage is not supported with a `base_margin` (dataset `{name}`)"),
+        ));
+    }
     BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)?;
     // A built-in objective passed to `Trainer::objective` is recorded by
     // name with `params`' objective settings; refuse settings that would not
@@ -921,6 +974,8 @@ struct RoundState<'a> {
     /// single-output objectives, which read `gpair` directly).
     gpair_k: Vec<GradPair>,
     reuse: Option<ReuseSet>,
+    /// SGLB's noisy structure gradients, `[row][n_out]` (empty otherwise).
+    noisy_gpair: Vec<GradPair>,
 }
 
 /// `process_type=update`: refresh iteration `iteration`'s trees of `queue`
@@ -937,6 +992,7 @@ fn refresh_round(
         dtrain,
         info,
         objective,
+        ..
     } = *run;
     let n_out = objective.n_outputs();
     let parallel = params.num_parallel_tree;
@@ -987,6 +1043,14 @@ fn grow_round(
     );
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
+    // SGLB: the structure is searched on noisy gradients; `state.gpair`
+    // keeps the noise-free ones the leaves are re-estimated from.
+    let structure: &[GradPair] = match run.langevin {
+        Some(langevin) => {
+            langevin.structure_gradients(&state.gpair, iteration, &mut state.noisy_gpair)
+        }
+        None => &state.gpair,
+    };
 
     // 2. Uniform row subsets, drawn before the trees and shared across the
     //    per-output fits.
@@ -997,7 +1061,8 @@ fn grow_round(
     let grow = GrowRound {
         run,
         prepared,
-        gpair: &state.gpair,
+        gpair: structure,
+        clean_gpair: &state.gpair,
         n_out,
         iteration,
         forest_indices: &forest_indices,
@@ -1032,7 +1097,8 @@ fn grow_round(
                 output: slot / parallel,
                 parallel: slot % parallel,
                 rows: row_subset,
-                capture_rows: margin_rows || linear_rows,
+                // Leaf re-estimation (SGLB) reads the partitions too.
+                capture_rows: margin_rows || linear_rows || (routed && run.langevin.is_some()),
                 margin_rows,
             }
         })
@@ -1050,10 +1116,7 @@ fn grow_round(
         && rayon::current_num_threads() > 1
     {
         // The first tree's cuts, before any tree reads them.
-        prepared.fill_approx_cache(
-            run,
-            gather_output(&state.gpair, &mut state.gpair_k, n_out, 0),
-        );
+        prepared.fill_approx_cache(run, gather_output(structure, &mut state.gpair_k, n_out, 0));
         let draws: Vec<(ColumnSampler, u64)> = slots
             .iter()
             .map(|_| {
@@ -1063,10 +1126,10 @@ fn grow_round(
             .collect();
         // Every output's gradients gathered once, output-major, for all of
         // its parallel trees (single-output objectives read `gpair`).
-        let gathered = gather_outputs(&state.gpair, n_out);
+        let gathered = gather_outputs(structure, n_out);
         let output_gpair = |k: usize| {
             if n_out == 1 {
-                &state.gpair[..]
+                structure
             } else {
                 &gathered[k * n..(k + 1) * n]
             }
@@ -1476,6 +1539,20 @@ impl<'a> MarginCaches<'a> {
         }
     }
 
+    /// Multiply every cached margin by `factor` (model shrinkage, in `f64`
+    /// and rounded once per cell). Cells are independent, so the parallel
+    /// pass gives the serial result.
+    pub(super) fn scale(&mut self, factor: f64) {
+        let n_out = self.n_out;
+        for margins in std::iter::once(&mut self.train).chain(&mut self.evals) {
+            for_each_row_margins(margins, n_out, |(_, row)| {
+                for m in row {
+                    *m = (f64::from(*m) * factor) as f32;
+                }
+            });
+        }
+    }
+
     /// Recompute the eval caches from `model` (after a DART rescaling, which
     /// makes them non-additive).
     pub(super) fn recompute_evals(&mut self, model: &BoostedModel) {
@@ -1608,6 +1685,7 @@ pub(super) fn round_gradients(
         dtrain,
         info,
         objective,
+        ..
     } = *run;
     if params.booster != BoosterKind::Dart {
         objective.gradient_info(margin, info, gpair);
@@ -1730,8 +1808,12 @@ fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> Rng {
 struct GrowRound<'a> {
     run: &'a TrainContext<'a>,
     prepared: &'a Prepared,
-    /// Every output's gradients for this iteration, `[row][n_out]`.
+    /// Every output's gradients the structures are searched on,
+    /// `[row][n_out]` (with Langevin noise under SGLB).
     gpair: &'a [GradPair],
+    /// The noise-free gradients SGLB re-estimates the leaves from (the
+    /// same as `gpair` otherwise).
+    clean_gpair: &'a [GradPair],
     n_out: usize,
     /// The model's absolute iteration index.
     iteration: usize,
@@ -1834,6 +1916,18 @@ fn grow_sampled_tree(
         rounding_seed,
         slot.capture_rows,
     );
+    if let Some(langevin) = grow.run.langevin {
+        let at = LeafRenewal {
+            data: dtrain,
+            gpair: grow.clean_gpair,
+            n_out: grow.n_out,
+            rows,
+            leaf_rows: &leaf_rows,
+            iteration: grow.iteration,
+            tree: slot.output * params.num_parallel_tree + slot.parallel,
+        };
+        langevin.renew_leaves(&mut tree, TreeOutput::Scalar(slot.output), &at);
+    }
     // LightGBM keeps the first iteration's trees constant.
     if params.linear_tree && grow.iteration > 0 {
         let lambda = params.linear_lambda;

@@ -242,6 +242,22 @@ pub enum DistSplitDirection {
     All,
 }
 
+/// How the model shrinkage coefficient of each boosting iteration is
+/// computed (CatBoost `model_shrink_mode`; beyond XGBoost). At the start of
+/// iteration `i >= 1` the whole current model, intercept included, is
+/// multiplied by the coefficient `s_i`; iteration `0` does not shrink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ModelShrinkMode {
+    /// `s_i = 1 - model_shrink_rate * eta` (CatBoost's default). The mode
+    /// [`posterior_sampling`](TrainingParams::posterior_sampling) needs.
+    #[default]
+    Constant,
+    /// `s_i = 1 - model_shrink_rate / i`.
+    Decreasing,
+}
+
 /// Stable names of the enums a model file stores, matching their serde
 /// (and XGBoost) spellings.
 macro_rules! stored_names {
@@ -487,6 +503,62 @@ pub struct TrainingParams {
     /// `toad_penalty_threshold`.
     pub toad_penalty_threshold: f64,
 
+    // ---- SGLB and model shrinkage (CatBoost; beyond XGBoost, opt-in) ----
+    /// Stochastic Gradient Langevin Boosting (CatBoost `langevin`;
+    /// Ustimenko and Prokhorenkova, ICML 2021): every round adds Gaussian
+    /// noise of standard deviation `sqrt(2 / (eta * T))` (`T` the
+    /// [`diffusion_temperature`](Self::diffusion_temperature)) to the
+    /// gradient of every row that the tree structure is searched on
+    /// (CatBoost's per-row noise), then re-estimates every leaf from the noise-free
+    /// gradients of its rows plus independent noise `sqrt(2 / (eta * T)) *
+    /// sqrt(|H| + lambda)` on the leaf's gradient sum (CatBoost's Newton
+    /// leaves). The draws are keyed by `seed`, iteration, tree, and row or
+    /// leaf, so they do not depend on the thread count. With `langevin` on,
+    /// an unset [`model_shrink_rate`](Self::model_shrink_rate) defaults to
+    /// CatBoost's `0.001` (`constant`) or `0.01` (`decreasing`).
+    ///
+    /// Needs `booster = gbtree` with one tree per output and iteration
+    /// (`num_parallel_tree = 1`); refused with monotone constraints,
+    /// `linear_tree`, `path_smooth` (all of which the re-estimated leaves
+    /// would bypass), gradient-based sampling (whose row probabilities the
+    /// noise would distort), and `process_type = update`.
+    pub langevin: bool,
+    /// Inverse diffusion temperature `T > 0` of the Langevin noise
+    /// (CatBoost `diffusion_temperature`; larger is quieter). `None` takes
+    /// CatBoost's `10000`, or the training row count with
+    /// [`posterior_sampling`](Self::posterior_sampling). Only used with
+    /// [`langevin`](Self::langevin), and refused otherwise.
+    pub diffusion_temperature: Option<f64>,
+    /// Model shrinkage rate `r >= 0` (CatBoost `model_shrink_rate`): at the
+    /// start of every iteration `i >= 1` the current model (trees and
+    /// intercept) is multiplied by `1 - r * eta` (`constant`) or `1 - r / i`
+    /// (`decreasing`), which must stay in `(0, 1]`. `None` means `0` (off),
+    /// or the defaults described under [`langevin`](Self::langevin) and
+    /// [`posterior_sampling`](Self::posterior_sampling).
+    ///
+    /// A shrunk model stores its trees unscaled with the per-iteration
+    /// factors: each tree's contribution weight is the product of the
+    /// factors applied after it was grown, so iteration ranges `..k`,
+    /// [`slice`](crate::model::BoostedModel::slice)`(..k, 1)`, and early
+    /// stopping reproduce the model trained for `k` rounds exactly. Refused
+    /// with `dart`, `gblinear`, `process_type = update`, continued training,
+    /// and per-row `base_margin`s.
+    pub model_shrink_rate: Option<f64>,
+    /// How the shrinkage coefficient is computed from
+    /// [`model_shrink_rate`](Self::model_shrink_rate) (CatBoost
+    /// `model_shrink_mode`). Refused as `decreasing` without shrinkage.
+    pub model_shrink_mode: ModelShrinkMode,
+    /// SGLB posterior sampling (CatBoost `posterior_sampling`): turns
+    /// [`langevin`](Self::langevin) on with `diffusion_temperature = N` and
+    /// `model_shrink_rate = 1 / (2N)` in `constant` mode, `N` the number of
+    /// training rows, so the iterates sample the Bayesian posterior of the
+    /// ensemble. The basis of
+    /// [`predict_virtual_ensembles`](crate::model::BoostedModel::predict_virtual_ensembles)'
+    /// knowledge uncertainty. Explicit `diffusion_temperature`,
+    /// `model_shrink_rate`, or a `decreasing` mode are refused rather than
+    /// overridden.
+    pub posterior_sampling: bool,
+
     // ---- Missing value ----
     /// Value treated as "missing" in dense inputs. Defaults to NaN, like XGBoost.
     pub missing: f64,
@@ -548,6 +620,11 @@ impl Default for TrainingParams {
             skip_drop: 0.0,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
+            langevin: false,
+            diffusion_temperature: None,
+            model_shrink_rate: None,
+            model_shrink_mode: ModelShrinkMode::Constant,
+            posterior_sampling: false,
             missing: f64::NAN,
         }
     }
@@ -637,8 +714,8 @@ impl TrainingParams {
     ///
     /// The checks run in a fixed order (numeric ranges, reuse penalties,
     /// device, objective parameters, booster, tree shape, training modes,
-    /// tree options), so a configuration that breaks several rules always
-    /// reports the same one.
+    /// tree options, SGLB and model shrinkage), so a configuration that
+    /// breaks several rules always reports the same one.
     pub fn validate(&self) -> Result<()> {
         self.validate_ranges()?;
         self.validate_reuse_penalties()?;
@@ -657,7 +734,8 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
-        self.validate_tree_options()
+        self.validate_tree_options()?;
+        self.validate_sglb()
     }
 
     /// Whether either reuse penalty (Trees-on-a-Diet) is on.
@@ -1004,6 +1082,156 @@ impl TrainingParams {
                 self.objective
             ),
         )
+    }
+
+    /// Whether Stochastic Gradient Langevin Boosting is on: set directly or
+    /// through [`posterior_sampling`](Self::posterior_sampling).
+    pub(crate) fn langevin_on(&self) -> bool {
+        self.langevin || self.posterior_sampling
+    }
+
+    /// The Langevin diffusion temperature in effect for `n_rows` training
+    /// rows: the row count under posterior sampling, else the configured
+    /// value or CatBoost's `10000`.
+    pub(crate) fn effective_diffusion_temperature(&self, n_rows: usize) -> f64 {
+        if self.posterior_sampling {
+            n_rows as f64
+        } else {
+            self.diffusion_temperature.unwrap_or(1e4)
+        }
+    }
+
+    /// The model shrinkage rate in effect for `n_rows` training rows:
+    /// `1 / (2 n_rows)` under posterior sampling, else the configured rate,
+    /// CatBoost's Langevin default (`0.001` constant, `0.01` decreasing), or
+    /// `0`.
+    pub(crate) fn effective_model_shrink_rate(&self, n_rows: usize) -> f64 {
+        if self.posterior_sampling {
+            return 1.0 / (2.0 * n_rows as f64);
+        }
+        self.model_shrink_rate.unwrap_or(if !self.langevin {
+            0.0
+        } else if self.model_shrink_mode == ModelShrinkMode::Constant {
+            0.001
+        } else {
+            0.01
+        })
+    }
+
+    /// Whether training shrinks the model every iteration (known without
+    /// the data: posterior sampling always shrinks at a positive rate).
+    pub(crate) fn model_shrinkage_on(&self) -> bool {
+        self.posterior_sampling || self.effective_model_shrink_rate(1) > 0.0
+    }
+
+    /// Ranges and compatibility of Langevin boosting and model shrinkage
+    /// (CatBoost's `TBoostingOptions::Validate` and
+    /// `TCatBoostOptions::Validate`, plus what the tree path here supports).
+    fn validate_sglb(&self) -> Result<()> {
+        if self.posterior_sampling {
+            // CatBoost derives these from the row count and refuses explicit
+            // values instead of overriding them.
+            ensure(
+                "diffusion_temperature",
+                self.diffusion_temperature.is_none(),
+                "is derived by `posterior_sampling` (the training row count); leave it unset",
+            )?;
+            ensure(
+                "model_shrink_rate",
+                self.model_shrink_rate.is_none(),
+                "is derived by `posterior_sampling` (1 / (2 * rows)); leave it unset",
+            )?;
+            ensure(
+                "model_shrink_mode",
+                self.model_shrink_mode == ModelShrinkMode::Constant,
+                "`posterior_sampling` requires the `constant` shrink mode",
+            )?;
+        }
+        if let Some(temperature) = self.diffusion_temperature {
+            positive("diffusion_temperature", temperature)?;
+            ensure(
+                "diffusion_temperature",
+                self.langevin,
+                "is only used with `langevin`; enable it",
+            )?;
+        }
+        if let Some(rate) = self.model_shrink_rate {
+            non_negative("model_shrink_rate", rate)?;
+        }
+        // Posterior sampling's rate depends on the row count; its coefficient
+        // is checked with the data (`validate_request`).
+        let rate = self.effective_model_shrink_rate(1);
+        match self.model_shrink_mode {
+            ModelShrinkMode::Constant => ensure(
+                "model_shrink_rate",
+                self.posterior_sampling || rate * self.eta < 1.0,
+                format!(
+                    "the constant shrink coefficient 1 - model_shrink_rate * eta must stay \
+                     positive, got rate {rate} with eta {}",
+                    self.eta
+                ),
+            )?,
+            ModelShrinkMode::Decreasing => {
+                ensure(
+                    "model_shrink_rate",
+                    rate < 1.0,
+                    format!("must be < 1 in the decreasing mode, got {rate}"),
+                )?;
+                ensure(
+                    "model_shrink_mode",
+                    rate > 0.0,
+                    "`decreasing` is only used with model_shrink_rate > 0",
+                )?;
+            }
+        }
+        let enabled = [
+            ("langevin", self.langevin_on()),
+            ("model_shrink_rate", self.model_shrinkage_on()),
+        ];
+        for (name, _) in enabled.iter().filter(|&&(_, on)| on) {
+            // DART rescales its trees with the contribution weights that
+            // shrinkage stores; gblinear grows no trees; refresh grows
+            // nothing new.
+            ensure(
+                name,
+                self.booster == BoosterKind::GbTree,
+                "requires `booster = gbtree`",
+            )?;
+            ensure(
+                name,
+                self.process_type == ProcessType::Default,
+                "is not supported with `process_type = update` (refresh grows no trees)",
+            )?;
+        }
+        if self.langevin_on() {
+            // The noise scale assumes one tree carries each output's whole
+            // step; the re-estimated leaves would bypass the constraint
+            // bounds, the path-smoothed outputs, and the leaf linear fits.
+            ensure(
+                "langevin",
+                self.num_parallel_tree == 1,
+                "requires `num_parallel_tree = 1`",
+            )?;
+            ensure(
+                "langevin",
+                self.monotone_constraints
+                    .iter()
+                    .all(|&m| m == Monotone::None),
+                "is not supported with monotone constraints",
+            )?;
+            ensure(
+                "langevin",
+                !self.linear_tree && self.path_smooth == 0.0,
+                "is not supported with `linear_tree` or `path_smooth`",
+            )?;
+            ensure(
+                "langevin",
+                !(self.sampling_method == SamplingMethod::GradientBased && self.subsample < 1.0),
+                "is not supported with `sampling_method = gradient_based` (the noise would \
+                 distort its row probabilities)",
+            )?;
+        }
+        Ok(())
     }
 
     /// The `max_delta_step` in effect: the configured value, or XGBoost's
@@ -1372,6 +1600,26 @@ impl TrainingParamsBuilder {
         stochastic_rounding, bool);
     setter!(/// Set full-precision leaf renewal after quantized growth (`quant_train_renew_leaf`, LightGBM).
         quant_train_renew_leaf, bool);
+    setter!(/// Enable Stochastic Gradient Langevin Boosting (`langevin`, CatBoost).
+        langevin, bool);
+    /// Set the Langevin inverse diffusion temperature (`diffusion_temperature`,
+    /// CatBoost). Unset, it is `10000`.
+    #[must_use]
+    pub fn diffusion_temperature(mut self, v: f64) -> Self {
+        self.params.diffusion_temperature = Some(v);
+        self
+    }
+    /// Set the per-iteration model shrinkage rate (`model_shrink_rate`,
+    /// CatBoost). Unset, it is `0`, or CatBoost's default with `langevin`.
+    #[must_use]
+    pub fn model_shrink_rate(mut self, v: f64) -> Self {
+        self.params.model_shrink_rate = Some(v);
+        self
+    }
+    setter!(/// Set how the shrinkage coefficient is computed (`model_shrink_mode`, CatBoost).
+        model_shrink_mode, ModelShrinkMode);
+    setter!(/// Enable SGLB posterior sampling (`posterior_sampling`, CatBoost).
+        posterior_sampling, bool);
 
     /// Set the objective by name (e.g. `"binary:logistic"`).
     #[must_use]

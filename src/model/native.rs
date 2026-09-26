@@ -13,7 +13,12 @@
 //! per node field across all trees (`node.*`), split per tree by
 //! `tree.node_count`, plus per-tree category pools, leaf vectors and leaf
 //! linear models. `model.writer` (optional, not `REQUIRED`, never read back)
-//! names the release that wrote the file, e.g. `hessboost 0.2.0`.
+//! names the release that wrote the file, e.g. `hessboost 0.2.0`. A model
+//! trained with model shrinkage adds `shrinkage.factors` (`f64`, one
+//! coefficient per iteration) and `shrinkage.base_score` (`f32`, the
+//! intercepts before shrinkage), both `REQUIRED`: a reader unaware of them
+//! would read iteration ranges as tree prefixes. Their absence means no
+//! shrinkage.
 //!
 //! The reader is strict about everything it knows: `node.flags` bits it
 //! does not define, `tree.has_linear` bytes other than 0 and 1, and bytes
@@ -43,7 +48,7 @@ use std::io::Read;
 use std::sync::OnceLock;
 
 use super::sections::{Sections, Writer, format_error, wrong_length};
-use super::{BoostedModel, LinearModel};
+use super::{BoostedModel, LinearModel, Shrinkage};
 use crate::config::{AftDistribution, DistGradient, DistSplitDirection, ObjectiveParams};
 use crate::error::Result;
 use crate::objective::distributional::DistFamily;
@@ -87,6 +92,8 @@ const KNOWN: &[&str] = &[
     "model.best_iteration",
     "model.tree_weights",
     "model.num_parallel_tree",
+    "shrinkage.factors",
+    "shrinkage.base_score",
     "gblinear.weights",
     "gblinear.bias",
     "tree.node_count",
@@ -178,6 +185,18 @@ fn write_model_sections(w: &mut Writer, m: &BoostedModel) {
         w.array(
             "gblinear.bias",
             linear.bias().iter().copied(),
+            f32::to_le_bytes,
+        );
+    }
+    if let Some(shrinkage) = &m.shrinkage {
+        w.array(
+            "shrinkage.factors",
+            shrinkage.factors().iter().copied(),
+            f64::to_le_bytes,
+        );
+        w.array(
+            "shrinkage.base_score",
+            shrinkage.base_score().iter().copied(),
             f32::to_le_bytes,
         );
     }
@@ -402,6 +421,14 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
+        shrinkage: if s.has("shrinkage.factors") || s.has("shrinkage.base_score") {
+            Some(Shrinkage::new(
+                s.array("shrinkage.factors", f64::from_le_bytes)?,
+                s.array("shrinkage.base_score", f32::from_le_bytes)?,
+            ))
+        } else {
+            None
+        },
         compact: OnceLock::new(),
     })
 }
@@ -991,6 +1018,7 @@ mod tests {
             tree_weights: Vec::new(),
             num_parallel_tree: 1,
             linear: Some(LinearModel::new(vec![0.0; n_features], vec![0.0])),
+            shrinkage: None,
             compact: OnceLock::new(),
         })
         .unwrap()

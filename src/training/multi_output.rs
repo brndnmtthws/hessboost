@@ -14,6 +14,7 @@ use crate::model::BoostedModel;
 use crate::objective::{GradPair, Objective, SplitGradient};
 use crate::rng::Rng;
 use crate::training::sampling::gradient_based_sample;
+use crate::training::sglb::LeafRenewal;
 use crate::tree::RegTree;
 use crate::tree::builder::{LeafRows, MultiTreeBuilder, VectorGradients};
 use crate::tree::constraints::MonotoneConstraints;
@@ -105,12 +106,14 @@ pub(super) struct VectorRound<'a> {
 /// iteration's dropout set), add them to the model, and bring the train and
 /// eval margin caches up to date. `iteration` is the model's absolute
 /// iteration index (continued training counts on), which seeds the RNG.
+/// `noisy` holds SGLB's structure gradients (unused otherwise).
 pub(super) fn boost_round(
     ctx: &VectorRound,
     model: &mut BoostedModel,
     iteration: usize,
     margins: &mut MarginCaches,
     gpair: &mut [GradPair],
+    noisy: &mut Vec<GradPair>,
 ) -> Result<()> {
     let params = ctx.run.params;
     let n = ctx.run.dtrain.n_rows();
@@ -118,12 +121,26 @@ pub(super) fn boost_round(
     let (mut rng, dropped) = round_gradients(&ctx.run, model, iteration, &margins.train, gpair);
     let split = split_gradient(ctx.run.objective, params, iteration, gpair, n)?;
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
+    // SGLB: the structure grows on the split gradients (or the gradients)
+    // plus noise; the builder's leaves then come from them too, and the
+    // re-estimation replaces them.
+    let structure = ctx.run.langevin.map(|langevin| {
+        let searched = split.as_ref().map_or(&gpair[..], |s| &s.gpair[..]);
+        langevin.structure_gradients(searched, iteration, noisy)
+    });
+    let grads = IterationGradients {
+        gpair,
+        split: split.as_ref(),
+        structure,
+        n_out,
+        iteration,
+    };
     // The row samples, all drawn before the trees: one per parallel tree
     // under uniform sampling, else one all-rows subset they share.
     let row_subsets = iteration_row_subsets(n, params, false, &mut rng);
     for p in 0..params.num_parallel_tree {
         let rows = &row_subsets[p % row_subsets.len()];
-        let (tree, leaf_rows) = fit_tree(ctx, gpair, split.as_ref(), &mut rng, rows, n_out)?;
+        let (tree, leaf_rows) = fit_tree(ctx, &grads, &mut rng, rows)?;
         // DART's gradients come from the ensemble, not the margin caches
         // (`finish_dart` recomputes the eval ones).
         if dropped.is_none() {
@@ -141,19 +158,39 @@ pub(super) fn boost_round(
     Ok(())
 }
 
+/// The gradients of one vector-leaf iteration: every output's gradients
+/// (`[row][n_out]`, also the leaf values' unless the objective splits on
+/// reduced ones), the objective's split gradients, and SGLB's noisy
+/// structure gradients, which replace the split gradients in the search.
+struct IterationGradients<'a> {
+    gpair: &'a [GradPair],
+    split: Option<&'a SplitGradient>,
+    structure: Option<&'a [GradPair]>,
+    n_out: usize,
+    iteration: usize,
+}
+
 /// Grow one vector-leaf tree: gradient-based row sampling (on the split
 /// gradients, replayed on the value gradients), the tree's column sampler,
 /// the build, and `eta / num_parallel_tree` shrinkage of every leaf vector.
+/// Under SGLB the structure grows on the noisy gradients and the leaf
+/// vectors are re-estimated from `gpair` (validation guarantees
+/// `num_parallel_tree = 1` and no gradient-based sampling then).
 fn fit_tree(
     ctx: &VectorRound,
-    gpair: &[GradPair],
-    split: Option<&SplitGradient>,
+    grads: &IterationGradients,
     rng: &mut Rng,
     rows: &[u32],
-    n_out: usize,
 ) -> Result<(RegTree, Vec<LeafRows>)> {
     let params = ctx.run.params;
+    let IterationGradients {
+        gpair,
+        split,
+        n_out,
+        ..
+    } = *grads;
     let (split_gpair, n_split) = split.map_or((gpair, n_out), |s| (&s.gpair[..], s.n_targets));
+    let split_gpair = grads.structure.unwrap_or(split_gpair);
     let sampled = if gradient_sampling(params) {
         gradient_based_sample(split_gpair, n_split, params.subsample, rng)?
     } else {
@@ -177,6 +214,18 @@ fn fit_tree(
     };
     let (mut tree, leaf_rows) =
         MultiTreeBuilder::new(params).build(ctx.ghist, &grad, rows, &mut sampler);
+    if let Some(langevin) = ctx.run.langevin {
+        let at = LeafRenewal {
+            data: ctx.run.dtrain,
+            gpair,
+            n_out,
+            rows,
+            leaf_rows: &leaf_rows,
+            iteration: grads.iteration,
+            tree: 0,
+        };
+        langevin.renew_leaves(&mut tree, TreeOutput::Vector, &at);
+    }
     tree.scale_leaves(tree_eta(params));
     Ok((tree, leaf_rows))
 }

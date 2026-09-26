@@ -33,8 +33,8 @@ and `λ` is the L2 penalty `lambda`.
 - **Stable model files.** Anything saved by 0.2.0 or later loads in every
   later release.
 - **More than XGBoost, opt-in.** Conformal intervals, distributional
-  boosting, budget training, compact models, and more — all off by default,
-  none of them changes default training.
+  boosting, SGLB uncertainty, budget training, compact models, and more —
+  all off by default, none of them changes default training.
 
 ## Getting started
 
@@ -101,6 +101,7 @@ runnable programs live in [`examples/`](examples)
 | `model_io` | native and XGBoost JSON/UBJSON save and load |
 | `conformal` | calibrated prediction intervals |
 | `distributional` | predictive distributions, intervals, and NLL |
+| `virtual_ensembles` | SGLB posterior sampling: knowledge uncertainty rising off the training data |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
 | `budget` | budget training against default and tuned training |
@@ -131,6 +132,7 @@ Beyond XGBoost (opt-in, none changes default training):
 |---|---|
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
+| [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
 | LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), and symmetric trees |
@@ -151,6 +153,9 @@ Beyond XGBoost (opt-in, none changes default training):
 - Budget training runs 10–54× a depth-6 `hist` fit with the same tree count.
 - Quantized gradients only pay off when histogram building dominates; on
   50,000 rows they're break-even.
+- SGLB needs `gbtree` with one tree per output and iteration; model
+  shrinkage refuses DART, continued training, and per-row `base_margin`s,
+  and a shrunk model's iteration ranges must start at 0.
 
 ## Not implemented
 

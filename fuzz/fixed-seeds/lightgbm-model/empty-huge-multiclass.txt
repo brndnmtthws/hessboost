@@ -1,0 +1,11 @@
+tree
+version=v4
+num_class=18446744073709551615
+num_tree_per_iteration=18446744073709551615
+label_index=0
+max_feature_idx=0
+objective=multiclass num_class:18446744073709551615
+feature_names=x
+feature_infos=none
+
+end of trees

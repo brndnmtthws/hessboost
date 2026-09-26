@@ -34,6 +34,16 @@ pub(crate) fn import_lightgbm_text(text: &str) -> Result<BoostedModel> {
         Some(_) => header.number("num_tree_per_iteration")?,
         None => num_class,
     };
+    // The output count sizes allocations (the intercepts, the objective's
+    // per-class state) and comes from untrusted text: bound it by the parsed
+    // trees, requiring at least one whole iteration (an empty model has no
+    // outputs to check `num_class` against).
+    if trees_per_iteration == 0 || document.trees.len() < trees_per_iteration {
+        return Err(format_error(format!(
+            "{} trees do not hold one whole iteration of {trees_per_iteration} trees",
+            document.trees.len()
+        )));
+    }
     if header.values.contains_key("average_output") {
         return Err(format_error(
             "`average_output` (random forest, `boosting=rf`) models are not supported: \
@@ -1059,6 +1069,37 @@ mod tests {
         let model = BoostedModel::from_lightgbm_text(model).unwrap();
         let data = DMatrix::from_dense(values, values.len(), 1).unwrap();
         model.predict_margin(&data).unwrap()
+    }
+
+    /// A header claiming `usize::MAX` classes with no trees is refused
+    /// before anything is sized by the class count (it would otherwise
+    /// allocate one intercept per claimed class).
+    #[test]
+    fn class_counts_are_bounded_by_the_parsed_trees() {
+        let header = |classes: &str| {
+            format!(
+                "tree\nversion=v4\nnum_class={classes}\nnum_tree_per_iteration={classes}\n\
+                 label_index=0\nmax_feature_idx=0\nobjective=multiclass num_class:{classes}\n\
+                 feature_names=x\nfeature_infos=none\n\nend of trees\n"
+            )
+        };
+        for classes in [usize::MAX.to_string(), "3".to_string()] {
+            let err = BoostedModel::from_lightgbm_text(&header(&classes))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("whole iteration"), "{err}");
+        }
+        // A one-tree model claiming more outputs than it has trees too.
+        let wide = stump("0.5", NONE, None)
+            .replace(
+                "num_class=1\nnum_tree_per_iteration=1",
+                "num_class=3\nnum_tree_per_iteration=3",
+            )
+            .replace("objective=regression", "objective=multiclass num_class:3");
+        let err = BoostedModel::from_lightgbm_text(&wide)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whole iteration"), "{err}");
     }
 
     const NONE: u8 = 0;

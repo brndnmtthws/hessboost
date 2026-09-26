@@ -92,7 +92,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: false
           working-directory: python
@@ -202,7 +202,7 @@ jobs:
           for tag in "${expected[@]}"; do
             compgen -G "dist/*${tag}*.whl" > /dev/null || { echo "Missing wheel matching ${tag}" >&2; exit 1; }
           done
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: false
       - run: uvx twine check --strict dist/*

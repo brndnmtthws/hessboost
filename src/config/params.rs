@@ -508,8 +508,8 @@ pub struct TrainingParams {
     /// Ustimenko and Prokhorenkova, ICML 2021): every round adds Gaussian
     /// noise of standard deviation `sqrt(2 / (eta * T))` (`T` the
     /// [`diffusion_temperature`](Self::diffusion_temperature)) to the
-    /// gradients the tree structure is searched on, scaled per row by
-    /// `sqrt(|h|)`, then re-estimates every leaf from the noise-free
+    /// gradient of every row that the tree structure is searched on
+    /// (CatBoost's per-row noise), then re-estimates every leaf from the noise-free
     /// gradients of its rows plus independent noise `sqrt(2 / (eta * T)) *
     /// sqrt(|H| + lambda)` on the leaf's gradient sum (CatBoost's Newton
     /// leaves). The draws are keyed by `seed`, iteration, tree, and row or

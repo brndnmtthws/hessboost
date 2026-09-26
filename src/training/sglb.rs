@@ -18,13 +18,13 @@
 //!    gradients plus Gaussian noise of standard deviation
 //!    `sigma = sqrt(2 / (eta * T))` (`CalcLangevinNoiseRate` in
 //!    `catboost/private/libs/algo_helpers/langevin_utils.cpp`, applied to
-//!    the per-row derivatives by `AddLangevinNoiseToDerivatives`). CatBoost
-//!    adds `sigma` to every row's weighted derivative; the Newton split
-//!    search here scores `G² / (H + λ)`, so each row's noise is scaled by
-//!    `sqrt(|h|)`, giving a node's gradient sum noise of variance
-//!    `sigma² · H`, the same scale the leaves get below. Squared error with
-//!    unit weights (`h = 1`) matches CatBoost exactly; zero-weight rows stay
-//!    noise-free.
+//!    the per-row derivatives by `AddLangevinNoiseToDerivatives`): every
+//!    row's gradient gets `sigma * ξ`, the same for every row whatever its
+//!    Hessian or weight, exactly as CatBoost adds it to every weighted
+//!    derivative. This is also the paper's prescription: Algorithm 2 (and
+//!    eq. 7) perturbs the gradient vector with isotropic noise
+//!    `N(0, (2N / (εβ)) I_N)` for the structure search, with no
+//!    per-row (Hessian) covariance.
 //! 3. **Independent leaf noise.** With the structure fixed, every leaf is
 //!    re-estimated from the noise-free gradients of its rows with fresh noise
 //!    on its gradient sum: `G + sigma * sqrt(|H| + λ) * ξ`
@@ -157,8 +157,8 @@ pub(super) struct LeafRenewal<'a> {
 
 impl Langevin {
     /// Fill `noisy` with `gpair` (`[row][n_out]`) plus iteration
-    /// `iteration`'s structure noise, `g + sigma * sqrt(|h|) * ξ` per cell
-    /// (Hessians unchanged), and return it.
+    /// `iteration`'s structure noise, `g + sigma * ξ` per cell (CatBoost's
+    /// unit per-row noise; Hessians unchanged), and return it.
     pub(super) fn structure_gradients<'a>(
         &self,
         gpair: &[GradPair],
@@ -175,9 +175,8 @@ impl Langevin {
             .for_each(|(chunk, cells)| {
                 let first = chunk * NOISE_CHUNK;
                 for (i, cell) in cells.iter_mut().enumerate() {
-                    let scale = sigma * f64::from(cell.hess).abs().sqrt();
                     let z = keyed_normal(key, (first + i) as u64);
-                    cell.grad = (f64::from(cell.grad) + scale * z) as f32;
+                    cell.grad = (f64::from(cell.grad) + sigma * z) as f32;
                 }
             });
         noisy

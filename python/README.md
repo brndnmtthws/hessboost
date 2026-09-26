@@ -101,21 +101,23 @@ booster.predict(df)
 ```
 
 A `DMatrix` is coded once, when it is built, so it must have the features
-of whatever it meets: `predict` and the calibrators check it against the
-model, and `train` checks every `evals` matrix against `dtrain` and `dtrain`
-against `xgb_model` (continued training or refresh). Feature names (where
-both have them; `predict(validate_features=False)` skips them), which
-features are categorical, and each categorical feature's categories, in
-order, must match; a mismatch raises `HessboostError` naming the eval set
-and the feature. Build eval frames with the training frame's categories
-(for example
-`valid["color"].cat.set_categories(train["color"].cat.categories)`). Codes
-without recorded categories (numpy data with `feature_types=["c", ...]`)
-are taken to be the other side's codes; only which features are categorical
-is compared. `ConformalizedQuantile.calibrate` likewise needs its two models
-to share their features. The scikit-learn estimators re-code every
-`eval_set` frame to the training frame's categories and, with `xgb_model`,
-the training frame to the earlier model's.
+of every model or matrix it meets: `predict` and the calibrators check it
+against each model reading it, and `train` checks every `evals` matrix
+against `dtrain` and against `xgb_model`, and `dtrain` against `xgb_model`
+(continued training or refresh). Feature names (where both have them;
+`predict(validate_features=False)` skips them), which features are
+categorical, and each categorical feature's categories, in order, must
+match; a mismatch raises `HessboostError` naming the eval set and the
+feature. Build eval frames with the training frame's categories (for
+example `valid["color"].cat.set_categories(train["color"].cat.categories)`).
+Codes without recorded categories (numpy data with
+`feature_types=["c", ...]`) are taken to be the other side's codes; only
+which features are categorical is compared, and a model continued on them
+keeps the earlier model's categories. `ConformalizedQuantile.calibrate`
+likewise needs its two models to share their features, and re-codes frames
+to whichever model records categories. The scikit-learn estimators re-code
+every `eval_set` frame to the training frame's categories and, with
+`xgb_model`, the training frame to the earlier model's.
 
 ## scikit-learn
 

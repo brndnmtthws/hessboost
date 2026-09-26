@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse
-from conftest import frame, regression, reorder_colors
+from conftest import FRAME_TYPES, frame, numpy_codes, regression, reorder_colors
 
 import hessboost
 from hessboost import DMatrix, HessboostError
@@ -172,9 +172,7 @@ def test_eval_sets_must_share_the_training_categories() -> None:
         )
     # Codes without recorded categories (numpy with feature_types) are taken
     # as dtrain's codes; only which features are categorical is checked.
-    codes = np.column_stack(
-        [df["color"].cat.codes, df["size"], df["count"].astype(float), df["flag"]]
-    )[300:]
+    codes = numpy_codes(df)[300:]
     expected: hessboost.EvalsResult = {}
     hessboost.train(
         params, dtrain, 3, evals=[(DMatrix(df[300:], y[300:]), "valid")], evals_result=expected
@@ -184,7 +182,7 @@ def test_eval_sets_must_share_the_training_categories() -> None:
         params,
         dtrain,
         3,
-        evals=[(DMatrix(codes, y[300:], feature_types=["c", "q", "q", "q"]), "valid")],
+        evals=[(DMatrix(codes, y[300:], feature_types=FRAME_TYPES), "valid")],
         evals_result=history,
     )
     assert history == expected
@@ -208,6 +206,24 @@ def test_continuation_and_refresh_refuse_data_with_other_categories() -> None:
             hessboost.train(params, reordered, 5, xgb_model=first)
         # The training order is accepted.
         hessboost.train(params, DMatrix(df, y), 5, xgb_model=first)
+
+
+def test_numpy_codes_do_not_bridge_other_categories_into_a_continued_model() -> None:
+    # dtrain without recorded categories matches both sides, so the model
+    # being continued is checked against the eval sets itself and keeps its
+    # categories for prediction.
+    df, y = frame()
+    first = hessboost.train({"max_depth": 3}, DMatrix(df, y), 5)
+    dtrain = DMatrix(numpy_codes(df), y, feature_types=FRAME_TYPES)
+    dvalid = DMatrix(reorder_colors(df), y)
+    with pytest.raises(
+        HessboostError,
+        match="eval set 'valid': the categories of feature 'color' differ from xgb_model's",
+    ):
+        hessboost.train({}, dtrain, 5, evals=[(dvalid, "valid")], xgb_model=first)
+    continued = hessboost.train({}, dtrain, 5, xgb_model=first)
+    assert continued.feature_names == first.feature_names
+    np.testing.assert_array_equal(continued.predict(reorder_colors(df)), continued.predict(df))
 
 
 def test_frames_need_numeric_or_category_columns() -> None:

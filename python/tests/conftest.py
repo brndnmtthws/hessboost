@@ -73,3 +73,14 @@ def reorder_colors(df: pd.DataFrame) -> pd.DataFrame:
     )
     assert not np.array_equal(reordered["color"].cat.codes, df["color"].cat.codes)
     return reordered
+
+
+def numpy_codes(df: pd.DataFrame) -> NDArray[np.float64]:
+    """A :func:`frame` as plain numbers, ``color`` as its category codes
+    (train with ``feature_types=FRAME_TYPES``)."""
+    return np.column_stack(
+        [df["color"].cat.codes, df["size"], df["count"].astype(float), df["flag"]]
+    ).astype(np.float64)
+
+
+FRAME_TYPES = ["c", "q", "q", "q"]

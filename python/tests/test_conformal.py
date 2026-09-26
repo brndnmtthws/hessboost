@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import frame, reorder_colors
+from conftest import FRAME_TYPES, frame, numpy_codes, reorder_colors
 
 import hessboost
 from hessboost import DMatrix, HessboostError
@@ -130,3 +130,23 @@ def test_calibration_recodes_categories_and_refuses_mismatched_bands() -> None:
     )
     with pytest.raises(HessboostError, match="upper: the categories of feature 'color' differ"):
         ConformalizedQuantile.calibrate(lower, upper, df[calibration], y[calibration], alpha=0.1)
+    # A lower model trained on numpy codes (here upper's) records no
+    # categories, so frames are re-coded to upper's and checked against each
+    # model.
+    numpy_lower = hessboost.train(
+        {**quantile, "quantile_alpha": 0.05},
+        DMatrix(numpy_codes(reorder_colors(df[fit])), y[fit], feature_types=FRAME_TYPES),
+        20,
+    )
+    band = ConformalizedQuantile.calibrate(
+        numpy_lower, upper, reorder_colors(df[calibration]), y[calibration], alpha=0.1
+    )
+    again = ConformalizedQuantile.calibrate(
+        numpy_lower, upper, df[calibration], y[calibration], alpha=0.1
+    )
+    assert band.correction == again.correction
+    np.testing.assert_array_equal(
+        band.predict_interval(df[test]), band.predict_interval(reorder_colors(df[test]))
+    )
+    with pytest.raises(HessboostError, match="the data: the categories of feature 'color'"):
+        band.predict_interval(DMatrix(df[test]))

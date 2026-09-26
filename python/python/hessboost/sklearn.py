@@ -254,10 +254,11 @@ class _HessboostModel(BaseEstimator):
             xgb_model.get_booster() if isinstance(xgb_model, _HessboostModel) else xgb_model
         )
         # Continuing or refreshing reads X with the earlier model's codes, and
-        # every eval set with the training ones.
-        dtrain = self._matrix(
-            X, y, sample_weight, base_margin, group, {} if init is None else init._categories
-        )
+        # every eval set with the training ones (the earlier model's where X
+        # records none, as for numpy codes).
+        earlier = {} if init is None else init._categories
+        dtrain = self._matrix(X, y, sample_weight, base_margin, group, earlier)
+        categories = {**earlier, **dtrain._categories}
         evals: list[tuple[DMatrix, str]] = []
         for index, (X_eval, y_eval) in enumerate(eval_set or ()):
             X_eval = self._check_X(X_eval, reset=False)
@@ -267,7 +268,7 @@ class _HessboostModel(BaseEstimator):
             extra = None if eval_groups is None else eval_groups[index]
             evals.append(
                 (
-                    self._matrix(X_eval, labels, weight, margin, extra, dtrain._categories),
+                    self._matrix(X_eval, labels, weight, margin, extra, categories),
                     f"validation_{index}",
                 )
             )

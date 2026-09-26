@@ -265,6 +265,10 @@ class DMatrix:
         return f"DMatrix(rows={self.num_row()}, features={self.num_col()})"
 
 
+_RECODE_HINT = "; pass the DataFrame itself, which is re-coded to the model's categories"
+"""Ends a categories error where a frame would have been re-coded."""
+
+
 def _or_empty(values: NDArray[np.float32] | None) -> NDArray[np.float32]:
     return np.empty(0, dtype=np.float32) if values is None else values
 
@@ -418,14 +422,7 @@ class Booster:
         else:
             info = _data.info(base_margin=base_margin)
             matrix = DMatrix._coded(data, self._categories, missing, info)
-        _check_schema(
-            self,
-            matrix,
-            "the data",
-            "the model's",
-            names=validate,
-            hint="; pass the DataFrame itself, which is re-coded to the model's categories",
-        )
+        _check_schema(self, matrix, "the data", "the model's", names=validate, hint=_RECODE_HINT)
         return matrix
 
     @staticmethod

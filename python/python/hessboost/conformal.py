@@ -26,30 +26,47 @@ When ``alpha < 1 / (n + 1)`` the set is too small and every interval is
 
 from __future__ import annotations
 
-from typing import Self
+from collections.abc import Callable
+from typing import Self, TypeAlias
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _data, _hessboost
-from hessboost._core import Booster, DMatrix, _check_schema
+from hessboost._core import _RECODE_HINT, Booster, DMatrix, _check_schema
 from hessboost._exceptions import HessboostError
 
 __all__ = ["ConformalizedQuantile", "SplitConformal"]
 
 
-def _calibration(booster: Booster, data: object, label: ArrayLike | None) -> _hessboost.DMatrix:
-    """A labelled calibration matrix for ``booster``, converted and checked
-    as for prediction (pandas categories re-coded to the model's)."""
+_Models: TypeAlias = tuple[tuple[Booster, str], ...]
+"""The models reading one matrix, each with its name in errors."""
+
+
+def _matrix(
+    models: _Models, data: object, label: ArrayLike | None, *, calibration: bool
+) -> _hessboost.DMatrix:
+    """``data`` as a matrix every one of ``models`` reads, labelled by
+    ``label`` (a calibration matrix needs labels): other input converted
+    with its pandas categories re-coded to the models' (they agree wherever
+    both record them), and checked against each model, since a side without
+    recorded categories matches anything."""
     if isinstance(data, DMatrix):
-        matrix = booster._matrix(data, None, np.nan, True)._core
-        if label is None:
-            return matrix
-        return matrix.with_info({**_data.info(label=label), "categorical": None})
+        matrix = data
+    else:
+        if calibration and label is None:
+            raise HessboostError("calibration needs labels: pass label= or a labelled DMatrix")
+        categories: _data.Categories = {}
+        for model, _ in reversed(models):
+            categories.update(model._categories)
+        info = {} if label is None else _data.info(label=label)
+        matrix = DMatrix._coded(data, categories, np.nan, info)
+        label = None
+    for model, name in models:
+        _check_schema(model, matrix, "the data", f"{name}'s", hint=_RECODE_HINT)
     if label is None:
-        raise HessboostError("calibration needs labels: pass label= or a labelled DMatrix")
-    coded = DMatrix._coded(data, booster._categories, np.nan, _data.info(label=label))
-    return booster._matrix(coded, None, np.nan, True)._core
+        return matrix._core
+    return matrix._core.with_info({**_data.info(label=label), "categorical": None})
 
 
 def _check_alpha(alpha: float) -> float:
@@ -66,7 +83,7 @@ class SplitConformal:
     __module__ = "hessboost.conformal"
 
     _core: _hessboost.SplitConformal
-    _booster: Booster
+    _models: _Models
 
     def __init__(self) -> None:
         raise TypeError("use SplitConformal.calibrate(...)")
@@ -85,16 +102,18 @@ class SplitConformal:
                 non-uniformly.
         """
         self = object.__new__(cls)
-        self._booster = booster
+        self._models = ((booster, "the model"),)
         self._core = _hessboost.SplitConformal.calibrate(
-            booster._model, _calibration(booster, data, label), _check_alpha(alpha)
+            booster._model,
+            _matrix(self._models, data, label, calibration=True),
+            _check_alpha(alpha),
         )
         return self
 
     def predict_interval(self, data: object) -> NDArray[np.float32]:
         """``(rows, 2)`` ``[lower, upper]`` intervals for every row of
         ``data``."""
-        return self._core.predict_interval(self._booster._matrix(data, None, np.nan, True)._core)
+        return self._core.predict_interval(_matrix(self._models, data, None, calibration=False))
 
     @property
     def half_width(self) -> float:
@@ -133,16 +152,22 @@ class ConformalizedQuantile:
     __module__ = "hessboost.conformal"
 
     _core: _hessboost.ConformalizedQuantile
-    _booster: Booster
+    _models: _Models
 
     def __init__(self) -> None:
         raise TypeError("use ConformalizedQuantile.calibrate(...) or its siblings")
 
     @classmethod
-    def _build(cls, booster: Booster, core: _hessboost.ConformalizedQuantile) -> Self:
+    def _calibrate(
+        cls,
+        models: _Models,
+        data: object,
+        label: ArrayLike | None,
+        build: Callable[[_hessboost.DMatrix], _hessboost.ConformalizedQuantile],
+    ) -> Self:
         self = object.__new__(cls)
-        self._booster = booster
-        self._core = core
+        self._models = models
+        self._core = build(_matrix(models, data, label, calibration=True))
         return self
 
     @classmethod
@@ -164,12 +189,14 @@ class ConformalizedQuantile:
             HessboostError: The models' features differ.
         """
         _check_schema(lower, upper, "upper", "lower's")
-        core = _hessboost.ConformalizedQuantile.calibrate(
-            (lower._model, upper._model),
-            _calibration(lower, data, label),
-            _check_alpha(alpha),
+        return cls._calibrate(
+            ((lower, "lower"), (upper, "upper")),
+            data,
+            label,
+            lambda matrix: _hessboost.ConformalizedQuantile.calibrate(
+                (lower._model, upper._model), matrix, _check_alpha(alpha)
+            ),
         )
-        return cls._build(lower, core)
 
     @classmethod
     def calibrate_outputs(
@@ -184,13 +211,14 @@ class ConformalizedQuantile:
         """A band from the ``outputs = (lower, upper)`` outputs of one model,
         e.g. ``reg:quantileerror`` with ``quantile_alpha=[alpha / 2, 1 -
         alpha / 2]``."""
-        core = _hessboost.ConformalizedQuantile.calibrate_outputs(
-            booster._model,
-            (int(outputs[0]), int(outputs[1])),
-            _calibration(booster, data, label),
-            _check_alpha(alpha),
+        return cls._calibrate(
+            ((booster, "the model"),),
+            data,
+            label,
+            lambda matrix: _hessboost.ConformalizedQuantile.calibrate_outputs(
+                booster._model, (int(outputs[0]), int(outputs[1])), matrix, _check_alpha(alpha)
+            ),
         )
-        return cls._build(booster, core)
 
     @classmethod
     def calibrate_distribution(
@@ -204,16 +232,20 @@ class ConformalizedQuantile:
         """A band from a ``dist:*`` model's ``alpha / 2`` and ``1 - alpha /
         2`` quantiles, restoring finite-sample coverage whether or not the
         distribution is well specified."""
-        core = _hessboost.ConformalizedQuantile.calibrate_distribution(
-            booster._model, _calibration(booster, data, label), _check_alpha(alpha)
+        return cls._calibrate(
+            ((booster, "the model"),),
+            data,
+            label,
+            lambda matrix: _hessboost.ConformalizedQuantile.calibrate_distribution(
+                booster._model, matrix, _check_alpha(alpha)
+            ),
         )
-        return cls._build(booster, core)
 
     def predict_interval(self, data: object) -> NDArray[np.float32]:
         """``(rows, 2)`` ``[lower, upper]`` intervals for every row of
         ``data``; a row whose adjusted bounds cross is returned as is (the
         empty set)."""
-        return self._core.predict_interval(self._booster._matrix(data, None, np.nan, True)._core)
+        return self._core.predict_interval(_matrix(self._models, data, None, calibration=False))
 
     @property
     def correction(self) -> float:

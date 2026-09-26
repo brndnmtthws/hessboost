@@ -164,8 +164,9 @@ def train(
             eval sets): every round for ``True``, every ``n``-th round and
             the last for an int ``n``.
         xgb_model: A booster (or model file) to continue boosting from, or
-            to refresh with ``process_type="update"``. ``dtrain`` must have
-            its features, compared as for ``evals``.
+            to refresh with ``process_type="update"``. ``dtrain`` and every
+            eval set must have its features, compared as for ``evals``; the
+            new booster keeps its categories where ``dtrain`` records none.
         callbacks: :class:`TrainingCallback` instances run after every round;
             any returning ``True`` stops training.
 
@@ -185,10 +186,16 @@ def train(
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
     native = _params(params, dtrain)
     init = _init_model(xgb_model)
-    for data, name in evals:
-        _check_schema(dtrain, data, f"eval set {str(name)!r}", "dtrain's")
+    # Every matrix meets the model being continued as well as dtrain, and a
+    # side without recorded categories matches anything, so each pairing is
+    # checked on its own (the checks are not transitive).
+    references: list[tuple[DMatrix | Booster, str]] = [(dtrain, "dtrain's")]
     if init is not None:
         _check_schema(init, dtrain, "dtrain", "xgb_model's")
+        references.append((init, "xgb_model's"))
+    for data, name in evals:
+        for reference, against in references:
+            _check_schema(reference, data, f"eval set {str(name)!r}", against)
     request: dict[str, object] = {
         "params": native,
         "dtrain": dtrain._core,
@@ -248,9 +255,19 @@ def train(
     core, best_score = _hessboost.train(request)
     if unprinted is not None:
         print(unprinted, flush=True)
-    booster = Booster._wrap(
-        core, dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories)
-    )
+    if init is None:
+        booster = Booster._wrap(
+            core, dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories)
+        )
+    else:
+        # What dtrain does not record (numpy codes) is still the earlier
+        # model's, and prediction keeps re-coding frames to it.
+        booster = Booster._wrap(
+            core,
+            dtrain._feature_names if dtrain._feature_names is not None else init._feature_names,
+            dtrain._feature_types if dtrain._feature_types is not None else init._feature_types,
+            {**init._categories, **dtrain._categories},
+        )
     booster.best_score = best_score
     return booster
 

@@ -43,7 +43,7 @@ fn main() -> Result<()> {
         .build()?;
     let model = train(&params, &dtrain, 100)?;
     let auc = EvalMetric::Auc.build(1)?.eval(
-        &model.predict(&dvalid)?,
+        model.predict(&dvalid)?.as_slice(),
         dvalid.labels().unwrap_or_default(),
         None,
     );

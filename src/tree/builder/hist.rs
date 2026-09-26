@@ -8,10 +8,10 @@
 
 use super::lightgbm::{SplitOptions, finalize_smoothed_leaves};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, NumericScan, ScanScratch, SplitPos, SplitScorer,
-    build_interaction_sets, finalize_leaf_values, for_each_numeric_split, limit_or_unbounded,
-    need_replace, next_allowed, permits, scan_numeric_splits, sum_rows, sweep_categorical,
-    xgb_calc_weight, xgb_node_gain, xgb_update,
+    BELOW_ALL_VALUES, BestSplit, InteractionState, NumericInput, NumericScan, SplitPos,
+    SplitScorer, build_interaction_sets, finalize_leaf_values, for_each_numeric_split,
+    limit_or_unbounded, need_replace, next_allowed, permits, scan_numeric_pair, sum_rows,
+    sweep_categorical, with_scan_scratch, xgb_calc_weight, xgb_node_gain, xgb_update,
 };
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
@@ -37,7 +37,7 @@ const SPECULATE_NODES: usize = 8;
 /// Nodes with at least this many rows evaluate their two children's splits
 /// concurrently. Smaller nodes appear in frontiers wide enough to keep the
 /// pool busy, and their evaluation is too short to be worth a fork.
-const PARALLEL_EVALUATE_ROWS: usize = 16_384;
+const PARALLEL_EVALUATE_ROWS: usize = 4096;
 
 /// Combined level rows at which depthwise and symmetric growth build a
 /// level's child histograms concurrently. Below this, the fork costs more
@@ -47,7 +47,7 @@ pub(super) const PARALLEL_FRONTIER_ROWS: usize = 4096;
 /// Split candidates (feature bins) at which a node's numeric scans run in
 /// parallel chunks of about [`SCAN_TASK_BINS`] candidates each.
 const PARALLEL_SCAN_BINS: usize = 4096;
-const SCAN_TASK_BINS: usize = 1024;
+const SCAN_TASK_BINS: usize = 2048;
 
 /// Whether the rayon pool has more than one thread, so parallelism can pay off.
 pub(super) fn rayon_available() -> bool {
@@ -745,19 +745,59 @@ impl<'a> HistTreeBuilder<'a> {
             bounds: node.bounds,
             dir: 0,
         };
-        let scan = |f: u32, scratch: &mut ScanScratch| {
+        let input = |f: u32| {
             let (fs, fe) = cuts.feature_bins(f as usize);
-            let scorer = SplitScorer {
-                dir: self.cons.dir(f as usize),
-                ..node_scorer
+            NumericInput {
+                bins: &hist[fs..fe],
+                first: fs,
+                total,
+                dense,
+                scorer: SplitScorer {
+                    dir: self.cons.dir(f as usize),
+                    ..node_scorer
+                },
+            }
+        };
+        // [`scan_numeric_splits`] of every plain numeric feature of `chunk`
+        // (by position; `None` for the others), two at a time so their
+        // prefix-sum chains overlap.
+        let scan_chunk = |chunk: &[u32]| -> Vec<Option<NumericScan>> {
+            let plain = |f: u32| {
+                let (fs, fe) = cuts.feature_bins(f as usize);
+                !cuts.is_categorical(f as usize) && fe > fs + 1
             };
-            scan_numeric_splits(&hist[fs..fe], fs, total, dense, &scorer, scratch)
+            let mut out: Vec<Option<NumericScan>> = chunk.iter().map(|_| None).collect();
+            with_scan_scratch(|[sa, sb]| {
+                let mut pending = None;
+                for (i, &f) in chunk.iter().enumerate() {
+                    if !plain(f) {
+                        continue;
+                    }
+                    match pending.take() {
+                        None => pending = Some(i),
+                        Some(j) => {
+                            let [x, y] = scan_numeric_pair(&input(chunk[j]), &input(f), [sa, sb]);
+                            (out[j], out[i]) = (Some(x), Some(y));
+                        }
+                    }
+                }
+                if let Some(j) = pending {
+                    out[j] = Some(input(chunk[j]).scan(sa));
+                }
+            });
+            out
         };
         // The scans of plain numeric features do not depend on the
-        // incumbent, so a wide search computes them in parallel up front;
-        // they are then merged in feature order exactly as below.
-        let mut scans = self.parallel_scans(cuts, feature_subset, scan);
-        let mut scratch = None;
+        // incumbent, so they are computed up front (a wide search in
+        // parallel); they are then merged in feature order exactly as below.
+        let mut scans = if self.reuse.is_some() {
+            None
+        } else {
+            Some(
+                Self::parallel_scans(cuts, feature_subset, scan_chunk)
+                    .unwrap_or_else(|| scan_chunk(feature_subset)),
+            )
+        };
 
         for (i, &f) in feature_subset.iter().enumerate() {
             let (fs, fe) = cuts.feature_bins(f as usize);
@@ -802,7 +842,7 @@ impl<'a> HistTreeBuilder<'a> {
                 continue;
             }
             let scanned = scans.as_mut().and_then(|scans| scans[i].take());
-            match scanned.unwrap_or_else(|| scan(f, scratch.get_or_insert_with(ScanScratch::new))) {
+            match scanned.unwrap_or_else(|| with_scan_scratch(|[s, _]| input(f).scan(s))) {
                 NumericScan::Empty => {}
                 NumericScan::Best {
                     loss_chg,
@@ -827,17 +867,15 @@ impl<'a> HistTreeBuilder<'a> {
         best
     }
 
-    /// [`scan_numeric_splits`] of every plain numeric feature of
-    /// `feature_subset` (by position; `None` for the others), computed in
-    /// parallel chunks, when the subset holds enough candidates to pay for
-    /// the tasks. `None` otherwise.
+    /// `scan_chunk` over parallel chunks of `feature_subset`, concatenated,
+    /// when the subset holds enough candidates to pay for the tasks. `None`
+    /// otherwise.
     fn parallel_scans(
-        &self,
         cuts: &HistCuts,
         feature_subset: &[u32],
-        scan: impl Fn(u32, &mut ScanScratch) -> NumericScan + Sync,
+        scan_chunk: impl Fn(&[u32]) -> Vec<Option<NumericScan>> + Sync,
     ) -> Option<Vec<Option<NumericScan>>> {
-        if self.reuse.is_some() || !rayon_available() {
+        if !rayon_available() {
             return None;
         }
         let bins = |f: u32| {
@@ -852,16 +890,7 @@ impl<'a> HistTreeBuilder<'a> {
         Some(
             feature_subset
                 .par_chunks(per_task.max(1))
-                .flat_map_iter(|chunk| {
-                    let mut scratch = ScanScratch::new();
-                    chunk
-                        .iter()
-                        .map(|&f| {
-                            (!cuts.is_categorical(f as usize) && bins(f) > 1)
-                                .then(|| scan(f, &mut scratch))
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .flat_map_iter(&scan_chunk)
                 .collect(),
         )
     }
@@ -896,18 +925,28 @@ const PARTITION_CHUNK_ROWS: usize = 16_384;
 /// the column it reads stays in registers (measured: a closure argument adds
 /// loads to the dense partition loop).
 macro_rules! route_rows {
-    ($rows:expr, |$r:ident| $go_left:expr) => {{
+    ($rows:expr, |$r:ident| $go_left:expr) => {
+        route_rows!($rows, [], |$r| $go_left)
+    };
+    ($rows:expr, [$($copy:ident),*], |$r:ident| $go_left:expr) => {{
         let route = |rows: &[u32]| {
             let n = rows.len();
             let mut left: Vec<u32> = Vec::with_capacity(n);
             let mut right: Vec<u32> = Vec::with_capacity(n);
             let (mut nl, mut nr) = (0usize, 0usize);
             {
-                let (lp, rp) = (left.spare_capacity_mut(), right.spare_capacity_mut());
+                // Copied into locals so they stay in registers across the
+                // loop's stores.
+                $(let $copy = $copy;)*
+                let (lp, rp) = (left.as_mut_ptr(), right.as_mut_ptr());
                 for &$r in rows {
                     let go_left: bool = $go_left;
-                    lp[nl].write($r);
-                    rp[nr].write($r);
+                    // SAFETY: `nl + nr` rows were routed before this one, so
+                    // `nl, nr < n`, the reserved capacity of both buffers.
+                    unsafe {
+                        lp.add(nl).write($r);
+                        rp.add(nr).write($r);
+                    }
                     nl += usize::from(go_left);
                     nr += usize::from(!go_left);
                 }
@@ -956,10 +995,10 @@ pub(super) fn partition_rows(
         };
         let n_rows = ghist.n_rows();
         return match columns {
-            Bins::U16(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+            Bins::U16(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
                 b <= split_bin
             }),
-            Bins::U32(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+            Bins::U32(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
                 b <= split_bin
             }),
         };
@@ -973,13 +1012,13 @@ pub(super) fn partition_rows(
         return match columns {
             Bins::U16(bins) => {
                 let missing = usize::from(u16::MAX);
-                route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+                route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
                     (b < limit) | ((b == missing) & default_left)
                 })
             }
             Bins::U32(bins) => {
                 let missing = u32::MAX as usize;
-                route_column(rows, &bins[feature * n_rows..][..n_rows], |b| {
+                route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
                     (b < limit) | ((b == missing) & default_left)
                 })
             }
@@ -1106,9 +1145,11 @@ pub(super) fn child_histograms(
 fn route_column<B: BinIndex>(
     rows: &[u32],
     column: &[B],
-    go_left: impl Fn(usize) -> bool + Sync,
+    go_left: impl Fn(usize) -> bool + Sync + Copy,
 ) -> (Vec<u32>, Vec<u32>) {
-    route_rows!(rows, |r| go_left(column[r as usize].index()))
+    route_rows!(rows, [go_left, column], |r| go_left(
+        column[r as usize].index()
+    ))
 }
 
 /// Whether a sparse row whose stored bins are `row` goes left on the feature

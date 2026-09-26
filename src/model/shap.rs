@@ -159,27 +159,92 @@ fn branch_weight(cover: f32, parent_cover: f32) -> f32 {
 /// Contribution of one return edge whose feature entered the subtree with
 /// probability `p_enter` and had `p_exit` above it (`1.0` = not on the path).
 ///
-/// Path probabilities are kept in `f64` (see [`Walk::child`]); ordinary ones
+/// Path probabilities are kept in `f64` (see [`enter_child`]); ordinary ones
 /// are `f32` values and take XGBoost's `f32` arithmetic. When that overflows
 /// (a probability beyond `f32`, or `α·h` exceeding it) the edge is redone in
 /// `f64`, whose quotients `α·h / (1 + α·u)` stay representable.
+#[inline(always)]
 fn edge_delta(rule: &QuadratureRule, h: &Lanes, p_enter: f64, p_exit: f64) -> f32 {
+    // The lane terms are formed by `shap_edge_terms` (four at a time on
+    // NEON), then summed in lane order.
     let mut acc = 0.0f32;
     if p_enter != 1.0 {
-        let alpha = p_enter as f32 - 1.0;
-        for (&hi, &u) in h.iter().zip(&rule.nodes) {
-            acc += alpha * hi / madd(alpha, u, 1.0);
+        for t in crate::simd::shap_edge_terms(p_enter as f32 - 1.0, h, &rule.nodes) {
+            acc += t;
         }
     }
     if p_exit != 1.0 {
-        let alpha = p_exit as f32 - 1.0;
-        for (&hi, &u) in h.iter().zip(&rule.nodes) {
-            acc -= alpha * hi / madd(alpha, u, 1.0);
+        for t in crate::simd::shap_edge_terms(p_exit as f32 - 1.0, h, &rule.nodes) {
+            acc -= t;
         }
     }
     if acc.is_finite() {
         return acc;
     }
+    edge_delta_f64(rule, h, p_enter, p_exit)
+}
+
+/// Rows whose return edges [`Formulation::on_return_group`] records together.
+const RETURN_GROUP: usize = 2;
+
+/// One row's return edge: the subtree return `h` and the feature's path
+/// probabilities on entry and above the split ([`edge_delta`]).
+#[derive(Clone, Copy)]
+struct ReturnEdge<'a> {
+    h: &'a Lanes,
+    p_enter: f64,
+    p_exit: f64,
+}
+
+/// [`edge_delta`] of `N` rows. When all take the same terms, each row's
+/// lane sum is still formed in lane order, but the rows' sums advance
+/// together, so their dependent chains of additions overlap.
+#[inline(always)]
+fn edge_deltas<const N: usize>(rule: &QuadratureRule, edges: [ReturnEdge<'_>; N]) -> [f32; N] {
+    let (enter, exit) = (edges[0].p_enter != 1.0, edges[0].p_exit != 1.0);
+    if edges
+        .iter()
+        .any(|e| (e.p_enter != 1.0) != enter || (e.p_exit != 1.0) != exit)
+    {
+        return edges.map(|e| edge_delta(rule, e.h, e.p_enter, e.p_exit));
+    }
+    let terms = |p: fn(&ReturnEdge<'_>) -> f64| -> [Lanes; N] {
+        std::array::from_fn(|k| {
+            crate::simd::shap_edge_terms(p(&edges[k]) as f32 - 1.0, edges[k].h, &rule.nodes)
+        })
+    };
+    let mut acc = [0.0f32; N];
+    if enter {
+        let t = terms(|e| e.p_enter);
+        for i in 0..POINTS {
+            for (a, t) in acc.iter_mut().zip(&t) {
+                *a += t[i];
+            }
+        }
+    }
+    if exit {
+        let t = terms(|e| e.p_exit);
+        for i in 0..POINTS {
+            for (a, t) in acc.iter_mut().zip(&t) {
+                *a -= t[i];
+            }
+        }
+    }
+    std::array::from_fn(|k| {
+        let e = &edges[k];
+        if acc[k].is_finite() {
+            acc[k]
+        } else {
+            edge_delta_f64(rule, e.h, e.p_enter, e.p_exit)
+        }
+    })
+}
+
+/// [`edge_delta`] in `f64`, for edges whose `f32` sum overflows. Kept out of
+/// line so the inlined `f32` path stays small.
+#[cold]
+#[inline(never)]
+fn edge_delta_f64(rule: &QuadratureRule, h: &Lanes, p_enter: f64, p_exit: f64) -> f32 {
     let term = |p: f64| {
         let alpha = p - 1.0;
         h.iter()
@@ -399,6 +464,20 @@ trait Formulation {
         p_enter: f64,
         p_exit: f64,
     );
+
+    /// [`Formulation::on_return`] of [`RETURN_GROUP`] rows walked in
+    /// lockstep.
+    #[inline(always)]
+    fn on_return_group(
+        forms: [&mut Self; RETURN_GROUP],
+        rule: &QuadratureRule,
+        feature: u32,
+        edges: [ReturnEdge<'_>; RETURN_GROUP],
+    ) {
+        for (form, e) in forms.into_iter().zip(edges) {
+            form.on_return(rule, feature, e.h, e.p_enter, e.p_exit);
+        }
+    }
 }
 
 /// Additive SHAP: one feature contribution per return edge.
@@ -423,6 +502,18 @@ impl Formulation for Additive<'_> {
         p_exit: f64,
     ) {
         self.phi[feature as usize] += edge_delta(rule, h, p_enter, p_exit);
+    }
+
+    #[inline(always)]
+    fn on_return_group(
+        forms: [&mut Self; RETURN_GROUP],
+        rule: &QuadratureRule,
+        feature: u32,
+        edges: [ReturnEdge<'_>; RETURN_GROUP],
+    ) {
+        for (form, d) in forms.into_iter().zip(edge_deltas(rule, edges)) {
+            form.phi[feature as usize] += d;
+        }
     }
 }
 
@@ -510,49 +601,54 @@ impl Formulation for Interaction<'_> {
 
 /// One outgoing edge of a split, as [`Walk::child`] descends it.
 #[derive(Clone, Copy)]
-struct Branch {
+struct Branch<const R: usize> {
     /// The parent's split feature.
     feature: u32,
     /// The child node id.
     child: u32,
     /// The child's cover fraction of its parent.
     weight: f32,
-    /// The row takes this edge.
-    satisfies: bool,
+    /// Whether each row takes this edge.
+    satisfies: [bool; R],
 }
 
-/// One QuadratureTreeSHAP walk of a tree for a dense row (`NaN` = missing).
-/// `path_prob` holds [`UNSEEN`] for every feature on entry and on exit.
-struct Walk<'a, F> {
+/// QuadratureTreeSHAP walks of a tree for `R` dense rows (`NaN` = missing)
+/// in lockstep. Every row visits every node in the same order (both children
+/// of each split), so one traversal serves them all; each row keeps its own
+/// path probabilities, bases, returns, and formulation, and its arithmetic
+/// is exactly that of a walk on its own. Interleaving the rows overlaps
+/// their dependent floating-point chains. `path_prob` holds [`UNSEEN`] for
+/// every feature on entry and on exit.
+struct Walk<'a, F, const R: usize> {
     tree: &'a ShapTree,
-    row: &'a [f32],
+    /// Per feature, every row's value (`NaN` = missing).
+    rows: &'a [[f32; R]],
     rule: &'a QuadratureRule,
-    path_prob: &'a mut [f64],
-    form: F,
+    /// Per feature, every row's path probability.
+    path_prob: &'a mut [[f64; R]],
+    forms: [F; R],
 }
 
-impl<F: Formulation> Walk<'_, F> {
+impl<F: Formulation, const R: usize> Walk<'_, F, R> {
     fn run(mut self) {
         if self.tree.nodes[0].first == NO_CHILD {
             return;
         }
-        let mut h = [0.0; POINTS];
-        self.node(0, &[1.0; POINTS], 1.0, &mut h);
+        self.node(0, &[[1.0; POINTS]; R], &[1.0; R]);
     }
 
-    /// Walk the subtree at `nid` with basis `c` and path cover product
-    /// `w_prod`, writing its weighted return into `out`.
-    fn node(&mut self, nid: usize, c: &Lanes, w_prod: f32, out: &mut Lanes) {
+    /// Walk the subtree at `nid` with each row's basis `c` and path cover
+    /// product `w_prod`, returning its weighted returns (returned by value:
+    /// every lane is written, so no buffer is zero-filled first).
+    fn node(&mut self, nid: usize, c: &[Lanes; R], w_prod: &[f32; R]) -> [Lanes; R] {
         let node = self.tree.nodes[nid];
         if node.first == NO_CHILD {
-            let scale = w_prod * node.value;
-            for i in 0..POINTS {
-                out[i] = c[i] * scale * self.rule.weights[i];
-            }
-            return;
+            return std::array::from_fn(|r| {
+                let scale = w_prod[r] * node.value;
+                std::array::from_fn(|i| c[r][i] * scale * self.rule.weights[i])
+            });
         }
         // Route with hessboost's orientation, then map onto XGBoost's order.
-        let v = self.row[node.feature as usize];
         let test = if node.is_categorical {
             SplitTest::Categories(
                 &self.tree.categories[node.cat_begin as usize..node.cat_end as usize],
@@ -560,42 +656,33 @@ impl<F: Formulation> Walk<'_, F> {
         } else {
             SplitTest::Threshold(node.cond)
         };
-        let goes_left = split_goes_left((!v.is_nan()).then_some(v), node.default_left, test);
-        let goes_first = goes_left != node.is_categorical;
+        let goes_first = self.rows[node.feature as usize].map(|v| {
+            let goes_left = split_goes_left((!v.is_nan()).then_some(v), node.default_left, test);
+            goes_left != node.is_categorical
+        });
         let branch = |child, weight, satisfies| Branch {
             feature: node.feature,
             child,
             weight,
             satisfies,
         };
-        let mut second = [0.0; POINTS];
-        self.child(
-            branch(node.first, node.first_weight, goes_first),
+        let mut out = self.child(branch(node.first, node.first_weight, goes_first), c, w_prod);
+        let second = self.child(
+            branch(node.second, node.second_weight, goes_first.map(|g| !g)),
             c,
             w_prod,
-            out,
         );
-        self.child(
-            branch(node.second, node.second_weight, !goes_first),
-            c,
-            w_prod,
-            &mut second,
-        );
-        for i in 0..POINTS {
-            out[i] += second[i];
+        for r in 0..R {
+            for i in 0..POINTS {
+                out[r][i] += second[r][i];
+            }
         }
+        out
     }
 
-    /// Descend `branch` from a node with basis `c` and path cover product
-    /// `w_prod`, writing the child's weighted return into `out`.
-    ///
-    /// Path probabilities are stored in `f64` but computed in `f32` like
-    /// XGBoost's, so they are `f32` values unless a feature repeated down
-    /// the path divides its probability past `f32`'s range (e.g. child cover
-    /// fractions of `2^-32` four times, `2^128`); that one continues in
-    /// `f64`, and the recurrences reading it fall back to `f64` where their
-    /// `f32` results overflow.
-    fn child(&mut self, branch: Branch, c: &Lanes, w_prod: f32, out: &mut Lanes) {
+    /// Descend `branch` from a node with each row's basis `c` and path cover
+    /// product `w_prod`, returning the child's weighted returns.
+    fn child(&mut self, branch: Branch<R>, c: &[Lanes; R], w_prod: &[f32; R]) -> [Lanes; R] {
         let Branch {
             feature,
             child,
@@ -603,51 +690,192 @@ impl<F: Formulation> Walk<'_, F> {
             satisfies,
         } = branch;
         let rule = self.rule;
-        let p_old = self.path_prob[feature as usize];
-        let seen = p_old != UNSEEN;
-        let p_enter = match (satisfies, seen) {
-            (false, _) => 0.0,
-            (true, false) => f64::from(1.0 / weight),
-            (true, true) => {
-                let p = p_old as f32 / weight;
-                if p.is_finite() {
-                    f64::from(p)
-                } else {
-                    p_old / f64::from(weight)
-                }
-            }
+        let f = feature as usize;
+        let p_old: [f64; R] = self.path_prob[f];
+        let mut p_enter = [0.0; R];
+        let mut c_child = [[0.0; POINTS]; R];
+        for r in 0..R {
+            (p_enter[r], c_child[r]) = enter_child(rule, p_old[r], weight, satisfies[r], &c[r]);
+            self.forms[r].push(feature, p_enter[r]);
+        }
+        self.path_prob[f] = p_enter;
+        let out = self.node(child as usize, &c_child, &w_prod.map(|w| w * weight));
+        let edge = |r: usize| ReturnEdge {
+            h: &out[r],
+            p_enter: p_enter[r],
+            p_exit: if p_old[r] == UNSEEN { 1.0 } else { p_old[r] },
         };
-        let mut c_child = *c;
-        let alpha = p_enter as f32 - 1.0;
-        for (ci, &u) in c_child.iter_mut().zip(&rule.nodes) {
-            *ci *= madd(alpha, u, 1.0);
+        // Rows a group at a time, so their return sums overlap.
+        let (groups, rest) = self.forms.as_chunks_mut::<RETURN_GROUP>();
+        for (k, group) in groups.iter_mut().enumerate() {
+            F::on_return_group(
+                group.each_mut(),
+                rule,
+                feature,
+                std::array::from_fn(|i| edge(RETURN_GROUP * k + i)),
+            );
         }
-        if seen {
-            let alpha_old = p_old as f32 - 1.0;
-            if alpha_old != 0.0 {
-                for ((ci, &u), &c0) in c_child.iter_mut().zip(&rule.nodes).zip(c) {
-                    let old = madd(alpha_old, u, 1.0);
-                    *ci = if ci.is_finite() && old.is_finite() {
-                        *ci / old
-                    } else {
-                        // A factor overflowed f32 before the overwritten one
-                        // was divided out; the quotient may still be finite,
-                        // so redo this lane in f64.
-                        let u = f64::from(u);
-                        let enter = madd64(p_enter - 1.0, u, 1.0);
-                        let old = madd64(p_old - 1.0, u, 1.0);
-                        (f64::from(c0) * enter / old) as f32
-                    };
-                }
+        for (form, r) in rest.iter_mut().zip(R - R % RETURN_GROUP..) {
+            let e = edge(r);
+            form.on_return(rule, feature, e.h, e.p_enter, e.p_exit);
+        }
+        for form in &mut self.forms {
+            form.pop();
+        }
+        self.path_prob[f] = p_old;
+        out
+    }
+}
+
+/// One row's entry into the child of a split on a feature whose current path
+/// probability is `p_old` ([`UNSEEN`] when not on the path): the child's path
+/// probability and its basis from the parent's `c`.
+///
+/// Path probabilities are stored in `f64` but computed in `f32` like
+/// XGBoost's, so they are `f32` values unless a feature repeated down the
+/// path divides its probability past `f32`'s range (e.g. child cover
+/// fractions of `2^-32` four times, `2^128`); that one continues in `f64`,
+/// and the recurrences reading it fall back to `f64` where their `f32`
+/// results overflow.
+#[inline(always)]
+fn enter_child(
+    rule: &QuadratureRule,
+    p_old: f64,
+    weight: f32,
+    satisfies: bool,
+    c: &Lanes,
+) -> (f64, Lanes) {
+    let seen = p_old != UNSEEN;
+    let p_enter = match (satisfies, seen) {
+        (false, _) => 0.0,
+        (true, false) => f64::from(1.0 / weight),
+        (true, true) => {
+            let p = p_old as f32 / weight;
+            if p.is_finite() {
+                f64::from(p)
+            } else {
+                p_old / f64::from(weight)
             }
         }
-        self.path_prob[feature as usize] = p_enter;
-        self.form.push(feature, p_enter);
-        self.node(child as usize, &c_child, w_prod * weight, out);
-        let p_exit = if seen { p_old } else { 1.0 };
-        self.form.on_return(rule, feature, out, p_enter, p_exit);
-        self.form.pop();
-        self.path_prob[feature as usize] = p_old;
+    };
+    let alpha = p_enter as f32 - 1.0;
+    let mut c_child = crate::simd::shap_scaled_basis(alpha, c, &rule.nodes);
+    if seen {
+        let alpha_old = p_old as f32 - 1.0;
+        if alpha_old != 0.0 {
+            // Usually every lane is finite: divide them all at once.
+            if let Some(divided) = crate::simd::shap_divided_basis(alpha_old, &c_child, &rule.nodes)
+            {
+                return (p_enter, divided);
+            }
+            let old: Lanes = std::array::from_fn(|i| madd(alpha_old, rule.nodes[i], 1.0));
+            for (((ci, &u), &c0), &old) in c_child.iter_mut().zip(&rule.nodes).zip(c).zip(&old) {
+                *ci = if ci.is_finite() && old.is_finite() {
+                    *ci / old
+                } else {
+                    // A factor overflowed f32 before the overwritten one
+                    // was divided out; the quotient may still be finite,
+                    // so redo this lane in f64.
+                    let u = f64::from(u);
+                    let enter = madd64(p_enter - 1.0, u, 1.0);
+                    let old = madd64(p_old - 1.0, u, 1.0);
+                    (f64::from(c0) * enter / old) as f32
+                };
+            }
+        }
+    }
+    (p_enter, c_child)
+}
+
+/// Rows [`BoostedModel::predict_contribs_range`] walks in lockstep. Fewer
+/// than a lane group, so a single-row [`RowBlock`] loaded with them keeps
+/// every one row-major.
+const SHAP_ROWS: usize = 8;
+const _: () = assert!(SHAP_ROWS < crate::tree::compact::LANES);
+
+/// The per-call state of [`BoostedModel::predict_contribs_range`].
+struct ContribContext<'a> {
+    forest: &'a ShapForest,
+    rule: &'a QuadratureRule,
+    /// Initial margins, `[row][output]`.
+    initial: &'a [f32],
+    nf: usize,
+    /// Values per output of an output row: `nf + 1`.
+    width: usize,
+    /// Outputs.
+    k: usize,
+}
+
+impl ContribContext<'_> {
+    /// The contributions of the `R` rows `row` (dense values `x`) into their
+    /// output rows `out`, using `scratch`. Each row's arithmetic is that of
+    /// a walk on its own.
+    fn rows<const R: usize>(
+        &self,
+        row: [usize; R],
+        x: [&[f32]; R],
+        scratch: &mut GroupScratch<R>,
+        mut out: [&mut [f32]; R],
+    ) {
+        let (forest, nf, width, k) = (self.forest, self.nf, self.width, self.k);
+        let GroupScratch {
+            phi,
+            path_prob,
+            values,
+        } = scratch;
+        let mut phi = phi.each_mut().map(Vec::as_mut_slice);
+        values.clear();
+        values.extend((0..nf).map(|f| x.map(|row| row[f])));
+        for c in 0..k {
+            for &ti in &forest.by_output[c] {
+                let tree = &forest.trees[ti];
+                for phi in &mut phi {
+                    for &f in &tree.features {
+                        phi[f as usize] = 0.0;
+                    }
+                }
+                Walk {
+                    tree,
+                    rows: values,
+                    rule: self.rule,
+                    path_prob,
+                    forms: phi.each_mut().map(|phi| Additive { phi }),
+                }
+                .run();
+                let weight = forest.weights[ti];
+                for (phi, out) in phi.iter().zip(&mut out) {
+                    let acc = &mut out[c * width..(c + 1) * width];
+                    for &f in &tree.features {
+                        acc[f as usize] = madd(phi[f as usize], weight, acc[f as usize]);
+                    }
+                }
+            }
+            for (&row, out) in row.iter().zip(&mut out) {
+                let acc = &mut out[c * width..(c + 1) * width];
+                acc[nf] += forest.root_mean_sums[c];
+                acc[nf] += self.initial[row * k + c];
+            }
+        }
+    }
+}
+
+/// The per-worker buffers of [`ContribContext::rows`] for `R` rows.
+struct GroupScratch<const R: usize> {
+    /// Each row's contributions of one tree.
+    phi: [Vec<f32>; R],
+    /// Per feature, every row's path probability ([`UNSEEN`] between walks).
+    path_prob: Vec<[f64; R]>,
+    /// Per feature, every row's value, as the walk routes them.
+    values: Vec<[f32; R]>,
+}
+
+impl<const R: usize> GroupScratch<R> {
+    fn new(nf: usize) -> Self {
+        GroupScratch {
+            phi: [(); R].map(|()| vec![0.0; nf]),
+            path_prob: vec![[UNSEEN; R]; nf],
+            values: Vec::with_capacity(nf),
+        }
     }
 }
 
@@ -771,46 +999,53 @@ impl BoostedModel {
         let forest = self.shap_forest(trees, k)?;
         let rule = &*RULE;
 
-        let mut out = vec![0f32; n * k * width];
-        out.par_chunks_mut(k * width).enumerate().for_each_init(
-            || {
-                (
-                    RowBlock::single_rows(data),
-                    vec![0f32; nf],
-                    vec![UNSEEN; nf],
-                )
-            },
-            |(rows, phi, path_prob), (row, out_row)| {
-                if self.linear().is_some() {
-                    self.linear_contribs(data, row, &initial, out_row);
-                    return;
-                }
-                rows.load(row, 1);
-                let x = rows.row(0).expect("single-row blocks are dense");
-                for (c, acc) in out_row.chunks_exact_mut(width).enumerate() {
-                    for &ti in &forest.by_output[c] {
-                        let tree = &forest.trees[ti];
-                        for &f in &tree.features {
-                            phi[f as usize] = 0.0;
+        let row_len = k * width;
+        let ctx = ContribContext {
+            forest: &forest,
+            rule,
+            initial: &initial,
+            nf,
+            width,
+            k,
+        };
+        let mut out = vec![0f32; n * row_len];
+        out.par_chunks_mut(SHAP_ROWS * row_len)
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        RowBlock::single_rows(data),
+                        GroupScratch::<SHAP_ROWS>::new(nf),
+                        GroupScratch::<1>::new(nf),
+                    )
+                },
+                |(rows, group, single), (chunk, out_rows)| {
+                    let first = chunk * SHAP_ROWS;
+                    if self.linear().is_some() {
+                        for (i, out_row) in out_rows.chunks_exact_mut(row_len).enumerate() {
+                            self.linear_contribs(data, first + i, &initial, out_row);
                         }
-                        Walk {
-                            tree,
-                            row: x,
-                            rule,
-                            path_prob,
-                            form: Additive { phi },
-                        }
-                        .run();
-                        let weight = forest.weights[ti];
-                        for &f in &tree.features {
-                            acc[f as usize] = madd(phi[f as usize], weight, acc[f as usize]);
+                        return;
+                    }
+                    let count = out_rows.len() / row_len;
+                    rows.load(first, count);
+                    let x = |i: usize| rows.row(i).expect("single-row blocks are dense");
+                    if count == SHAP_ROWS {
+                        let mut outs = out_rows.chunks_exact_mut(row_len);
+                        let outs = [(); SHAP_ROWS].map(|()| outs.next().expect("a full group"));
+                        ctx.rows(
+                            std::array::from_fn(|i| first + i),
+                            std::array::from_fn(x),
+                            group,
+                            outs,
+                        );
+                    } else {
+                        for (i, out_row) in out_rows.chunks_exact_mut(row_len).enumerate() {
+                            ctx.rows([first + i], [x(i)], single, [out_row]);
                         }
                     }
-                    acc[nf] += forest.root_mean_sums[c];
-                    acc[nf] += initial[row * k + c];
-                }
-            },
-        );
+                },
+            );
         Ok(out)
     }
 
@@ -863,7 +1098,9 @@ impl BoostedModel {
             rows: RowBlock<'a>,
             contribs: Vec<f32>,
             diag: Vec<f32>,
-            path_prob: Vec<f64>,
+            path_prob: Vec<[f64; 1]>,
+            /// The row's values as the walk reads them.
+            values: Vec<[f32; 1]>,
             path: Vec<PathEntry>,
             last: Vec<u32>,
         }
@@ -881,7 +1118,8 @@ impl BoostedModel {
                 rows: RowBlock::single_rows(data),
                 contribs: vec![0f32; k * width],
                 diag: vec![0f32; width],
-                path_prob: vec![UNSEEN; nf],
+                path_prob: vec![[UNSEEN; 1]; nf],
+                values: Vec::with_capacity(nf),
                 path: Vec::new(),
                 last: vec![NO_ENTRY; nf],
             },
@@ -900,23 +1138,25 @@ impl BoostedModel {
                 }
                 s.rows.load(row, 1);
                 let x = s.rows.row(0).expect("single-row blocks are dense");
+                s.values.clear();
+                s.values.extend(x.iter().map(|&v| [v]));
                 for (c, m) in out_row.chunks_exact_mut(mwidth).enumerate() {
                     let diag = &mut s.diag;
                     diag.fill(0.0);
                     for &ti in &forest.by_output[c] {
                         Walk {
                             tree: &forest.trees[ti],
-                            row: x,
+                            rows: &s.values,
                             rule,
                             path_prob: &mut s.path_prob,
-                            form: Interaction {
+                            forms: [Interaction {
                                 path: &mut s.path,
                                 last: &mut s.last,
                                 diag,
                                 matrix: m,
                                 width,
                                 scale: forest.weights[ti],
-                            },
+                            }],
                         }
                         .run();
                     }

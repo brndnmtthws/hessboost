@@ -64,14 +64,13 @@ const SIGN: u32 = 1 << 31;
 /// than a threshold.
 #[inline(always)]
 pub(crate) fn key(v: f32) -> u32 {
-    if v.is_nan() {
-        return 0;
-    }
     // `-0.0 + 0.0` is `+0.0`; every other value is unchanged.
     let bits = (v + 0.0).to_bits();
     // Negative: complement all bits (reverses their order below zero).
     // Non-negative: set the sign bit (places them above every negative).
-    bits ^ ((((bits as i32) >> 31) as u32) | SIGN)
+    let key = bits ^ ((((bits as i32) >> 31) as u32) | SIGN);
+    // `NaN` masks to `0` without a branch.
+    key & u32::from(!v.is_nan()).wrapping_neg()
 }
 
 /// Inverse of [`key`] up to the `NaN` payload and the sign of zero.
@@ -86,14 +85,30 @@ fn unkey(key: u32) -> f32 {
 /// immediate offset from the node's slot.
 pub(crate) fn fill_lanes(lanes: &mut Vec<u32>, rows: &[f32], n_cols: usize) {
     let groups = rows.len() / n_cols / LANES;
-    lanes.clear();
+    // Every slot is written below, so only slots the buffer gains are zeroed.
     lanes.resize(groups * FEATURE_LANES * n_cols, 0);
-    for (g, dst) in lanes.chunks_exact_mut(FEATURE_LANES * n_cols).enumerate() {
-        let src = &rows[g * LANES * n_cols..(g + 1) * LANES * n_cols];
+    if groups == 0 {
+        return;
+    }
+    // One row's keys of `v` and of `-v`, formed with contiguous (vector)
+    // arithmetic before they are scattered to their lane slots.
+    let mut keyed = vec![0u32; 2 * n_cols];
+    let dst_groups = lanes.chunks_exact_mut(FEATURE_LANES * n_cols);
+    for (dst, src) in dst_groups.zip(rows.chunks_exact(LANES * n_cols)) {
         for (j, row) in src.chunks_exact(n_cols).enumerate() {
-            for (f, &v) in row.iter().enumerate() {
-                dst[f * FEATURE_LANES + j] = key(v);
-                dst[f * FEATURE_LANES + LANES + j] = key(-v);
+            let (pos, neg) = keyed.split_at_mut(n_cols);
+            for ((p, q), &v) in pos.iter_mut().zip(neg.iter_mut()).zip(row) {
+                (*p, *q) = (key(v), key(-v));
+            }
+            for ((keys, &p), &q) in dst
+                .as_chunks_mut::<FEATURE_LANES>()
+                .0
+                .iter_mut()
+                .zip(&*pos)
+                .zip(&*neg)
+            {
+                keys[j] = p;
+                keys[LANES + j] = q;
             }
         }
     }
@@ -506,12 +521,13 @@ impl CompactForest {
     }
 
     /// [`Self::next`] for a numeric node given the key of the (already
-    /// sign-adjusted) feature value: one unsigned compare, no select (see the
+    /// sign-adjusted) feature value: one unsigned compare and a
+    /// branch-free increment ([`crate::simd::step_if_greater`]; see the
     /// module docs for the encoding). Leaves yield themselves. The result is
     /// `usize`: with `u32` lane state LLVM emits a ~3x slower loop on aarch64.
     #[inline(always)]
     fn next_numeric(node: &CNode, key: u32) -> usize {
-        node.left as usize + usize::from(key > node.key)
+        crate::simd::step_if_greater(node.left as usize, key, node.key)
     }
 
     /// `(slot, key)` of a node. On x86-64 the lockstep kernel is bound by
@@ -624,7 +640,7 @@ impl CompactForest {
                             // SAFETY: see above; `slot + j` indexes that
                             // feature's FEATURE_LANES keys.
                             let k = unsafe { *grp.get_unchecked(slot + $j) };
-                            nid[$j] = node.left as usize + usize::from(k > key);
+                            nid[$j] = crate::simd::step_if_greater(node.left as usize, k, key);
                         )*};
                     }
                     lane!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);

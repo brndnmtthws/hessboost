@@ -355,6 +355,69 @@ scheduling, and data-preparation changes described under
 
 Prediction and SHAP are unchanged code; their differences are host noise.
 
+### Hot-loop code generation
+
+The kernels that dominate each workload were rewritten where the generated
+code, not the algorithm, was the limit:
+
+- **Prediction:** the lockstep tree walk steps each lane with a `cmp` +
+  `cinc` pair (`simd::step_if_greater`); LLVM compiled the plain select to a
+  branch that random rows mispredict about a quarter of the time. Row keys
+  are formed branch-free and written a row at a time before being scattered
+  to their lane slots.
+- **SHAP:** eight rows walk each tree in lockstep, so their dependent `f32`
+  chains overlap. The per-lane edge terms and child bases are NEON kernels
+  (LLVM had scalarized their divisions). Subtrees return their weighted
+  returns by value instead of through zero-filled buffers. Path
+  probabilities and row values are stored feature-major, the lockstep rows
+  side by side, and return edges are summed two rows at a time.
+- **Exact method:** the per-row scan keeps the node's statistics in
+  registers at the root level. The incumbent test is precomputed per node, so
+  each candidate is screened with about ten flops. Each scan direction runs
+  its own loop over the sorted column's `(row, value)` pairs, with the
+  direction as a constant. Each leaf's rows update the training margins
+  directly.
+- **Histogram training:**
+  - Numeric features are scanned in pairs so their prefix-sum chains
+    overlap.
+  - With non-negative Hessians the running sums' extremes are their
+    endpoints.
+  - Dense accumulation tiles 1,024 rows.
+  - Partition loops keep their predicate in registers and write through
+    raw pointers.
+  - Parallel split scans take about 2,048 candidates per task.
+  - The two children are evaluated side by side from 4,096 rows.
+- **Data preparation:**
+  - Fully present 64-row blocks are binned feature by feature.
+  - The sketch merges its summaries as two interleaved branch-free halves.
+  - Unit-weight queues radix-sort bare keys.
+
+Measured as above (eight fixed workloads at 1 and 8 threads, the minimum
+of fifteen fits per case, runs of the two builds interleaved on the nine
+idlest CPUs of one NUMA node) on the same host on 2026-09-26 UTC, before and
+after. Every case's output bits (held-out predictions, SHAP values) are
+identical between the two builds.
+
+| Case | Threads | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|---:|
+| Regression 100k × 30, depth 6, 100 rounds | 1 | 679.0 | 583.7 | 1.16× |
+| Binary 100k × 30, depth 6, 100 rounds | 1 | 661.0 | 573.0 | 1.15× |
+| 4-class 50k × 30, depth 6, 50 rounds | 1 | 830.1 | 703.9 | 1.18× |
+| Regression 50k × 128, depth 6, 50 rounds | 1 | 1013.6 | 841.7 | 1.20× |
+| Loss-guide (64 leaves) 100k × 30, 50 rounds | 1 | 549.9 | 462.6 | 1.19× |
+| Exact 20k × 20, depth 6, 30 rounds | 1 | 716.0 | 262.7 | 2.73× |
+| Predict 100k × 30, 100 trees | 1 | 128.8 | 30.6 | 4.22× |
+| SHAP contributions, 2k × 20, 100 trees | 1 | 480.6 | 234.4 | 2.05× |
+| Regression 100k × 30, depth 6, 100 rounds | 8 | 154.8 | 128.7 | 1.20× |
+| Binary 100k × 30, depth 6, 100 rounds | 8 | 150.5 | 124.5 | 1.21× |
+| 4-class 50k × 30, depth 6, 50 rounds | 8 | 152.8 | 117.4 | 1.30× |
+| Regression 50k × 128, depth 6, 50 rounds | 8 | 197.9 | 159.1 | 1.24× |
+| Loss-guide (64 leaves) 100k × 30, 50 rounds | 8 | 133.2 | 107.9 | 1.23× |
+| Exact 20k × 20, depth 6, 30 rounds | 8 | 127.1 | 65.4 | 1.94× |
+| Predict 100k × 30, 100 trees | 8 | 16.29 | 4.01 | 4.06× |
+| SHAP contributions, 2k × 20, 100 trees | 8 | 60.42 | 30.23 | 2.00× |
+| **Geometric mean** | | **238.3** | **146.3** | **1.63×** |
+
 ### Model serialization
 
 The section-table writer sizes each array payload from its iterator and the
@@ -671,8 +734,8 @@ cost about 5% on the 50k-row `missing` tree build (12 blocks where 8 tasks
 ran before) and nothing measurable on the 1M-row one.
 
 Leaves at `max_depth` need no histograms or split searches. With full row
-sampling, training retains their final row partitions (depthwise and
-loss-guided) and adds the finalized leaf values directly to cached training
+sampling, training retains their final row partitions (depthwise,
+loss-guided, and exact) and adds the finalized leaf values directly to cached training
 margins. Sampled training and evaluation datasets update independent rows in
 parallel, skipping small inputs where task overhead would dominate. Leaf
 statistics, monotone bounds, and column-sampler draws are preserved.

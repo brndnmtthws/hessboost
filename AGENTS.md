@@ -84,7 +84,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`objective/`|files by XGBoost family; `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`)|
 |`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
-|`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `cannot_beat` bound, both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
+|`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
 |`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
@@ -122,12 +122,17 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   `tree/builder/hist.rs`, and `backend/metal.rs`. Each block needs
   `// SAFETY:`.
 - **SIMD:** covers objective gradients, exp/sigmoid/softmax, metric sums,
-  and cut search (`count_le`), with runtime dispatch falling back to
+  cut search (`count_le`), and SHAP's per-lane kernels (return-edge terms
+  `shap_edge_terms`, child basis `shap_scaled_basis`/`shap_divided_basis`),
+  with runtime dispatch falling back to
   `simd/scalar.rs` (also below minimum lengths and outside approximation
-  ranges). Cut search matches scalar exactly; transcendentals stay within
-  `simd/tests.rs` tolerances. Split search, histograms, and prediction are
-  scalar, follow XGBoost's `f32` operation order, and their optimized paths
-  must stay bit-identical to the plain ones.
+  ranges). Cut search and the SHAP kernels match scalar exactly;
+  transcendentals stay within `simd/tests.rs` tolerances. Split search,
+  histograms, and prediction are scalar, follow XGBoost's `f32` operation
+  order, and their optimized paths must stay bit-identical to the plain
+  ones. Data-dependent tree-walk steps go through `step_if_greater`
+  (AArch64 `cmp` + `cinc`): LLVM lowers the plain select to a branch that
+  random rows mispredict.
 - **Parity (XGBoost 3.4.2):** fixture tiers `exact` (pointwise
   train/import/export, incl. `rank:*`), `quality` (RNG-driven: subsampling,
   colsample, forests, DART; training within a quality band, import/export

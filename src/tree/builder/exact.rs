@@ -11,11 +11,11 @@
 //!
 //! Monotone and interaction constraints are honored during split search.
 
-use super::hist::rayon_available;
+use super::hist::{LeafRows, rayon_available};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, Children, InteractionState, SplitPos, SplitScorer,
-    build_interaction_sets, finalize_leaf_values, limit_or_unbounded, need_replace, next_allowed,
-    permits, sum_rows, sweep_categorical, xgb_node_gain, xgb_update,
+    BELOW_ALL_VALUES, BestSplit, Children, InteractionState, Screen, ScreenBound, SplitPos,
+    SplitScorer, build_interaction_sets, finalize_leaf_values, limit_or_unbounded, need_replace,
+    next_allowed, permits, sum_rows, sweep_categorical, xgb_node_gain, xgb_update,
 };
 use crate::K_RT_EPS_F32;
 use crate::config::TrainingParams;
@@ -158,6 +158,33 @@ impl<'a> ExactTreeBuilder<'a> {
         row_subset: &[u32],
         sampler: &mut ColumnSampler,
     ) -> RegTree {
+        self.build_inner(cols, data, gpair, row_subset, sampler, false)
+            .0
+    }
+
+    /// [`Self::build`], also returning the sampled rows each leaf holds
+    /// (ascending), so the training margins can be updated per leaf instead
+    /// of routing every row through the tree again.
+    pub(crate) fn build_with_leaf_rows(
+        &self,
+        cols: &SortedColumns,
+        data: &DMatrix,
+        gpair: &[GradPair],
+        row_subset: &[u32],
+        sampler: &mut ColumnSampler,
+    ) -> (RegTree, Vec<LeafRows>) {
+        self.build_inner(cols, data, gpair, row_subset, sampler, true)
+    }
+
+    fn build_inner(
+        &self,
+        cols: &SortedColumns,
+        data: &DMatrix,
+        gpair: &[GradPair],
+        row_subset: &[u32],
+        sampler: &mut ColumnSampler,
+        capture_rows: bool,
+    ) -> (RegTree, Vec<LeafRows>) {
         let n_rows = cols.n_rows();
 
         // node_of_row[r] = current node id for row r, or -1 if r is not sampled.
@@ -340,7 +367,27 @@ impl<'a> ExactTreeBuilder<'a> {
 
         // Finalize every leaf's weight (respecting each leaf's monotone bounds).
         finalize_leaf_values(&mut tree, &node_stats, &node_bounds, &self.reg);
-        tree
+        if !capture_rows {
+            return (tree, Vec::new());
+        }
+        // Every sampled row now sits at its leaf.
+        let mut slot_of_leaf = vec![usize::MAX; tree.num_nodes()];
+        let mut leaves: Vec<LeafRows> = Vec::new();
+        for (r, &nid) in node_of_row.iter().enumerate() {
+            let Ok(nid) = usize::try_from(nid) else {
+                continue;
+            };
+            let slot = &mut slot_of_leaf[nid];
+            if *slot == usize::MAX {
+                *slot = leaves.len();
+                leaves.push(LeafRows {
+                    node: nid,
+                    rows: Vec::new(),
+                });
+            }
+            leaves[*slot].rows.push(r as u32);
+        }
+        (tree, leaves)
     }
 }
 
@@ -348,17 +395,56 @@ impl<'a> ExactTreeBuilder<'a> {
 /// parallel.
 const PARALLEL_LEVEL_ROWS: usize = 4096;
 
+/// One active node's running scan state for the current feature, with the
+/// constants its per-row step needs gathered in one place.
+#[derive(Debug, Clone, Copy)]
+struct SlotScan {
+    /// Statistics of the rows scanned so far.
+    acc: GradStats,
+    /// Value of the last row scanned.
+    last_val: f32,
+    /// The node's statistics.
+    total: GradStats,
+    /// The node's [`SplitScorer::screen`], `None` where it may not screen
+    /// (no division-free bound, or reuse penalties).
+    node_screen: Option<Screen>,
+    /// `node_screen` bound to the incumbent while it comes from this or an
+    /// earlier feature (a candidate then needs a strictly larger loss change
+    /// to replace it), else `None`.
+    screen: Option<ScreenBound>,
+    /// The node may split on the current feature.
+    allowed: bool,
+}
+
+impl SlotScan {
+    /// Whether `children` certainly cannot replace the incumbent. Only for
+    /// candidates whose children both have non-negative Hessians (which the
+    /// scan's `min_child_weight` tests establish first).
+    #[inline(always)]
+    fn rules_out(&self, children: &Children) -> bool {
+        self.screen
+            .is_some_and(|screen| screen.rules_out(children.left, children.right))
+    }
+
+    /// Take the incumbent from `best` for a scan of feature `f`.
+    #[inline]
+    fn sync(&mut self, best: &BestSplit, f: u32) {
+        self.screen = self
+            .node_screen
+            .filter(|_| best.feature <= f)
+            .map(|screen| screen.bound(self.total.hess, best.loss_chg));
+    }
+}
+
 /// Per-node scan state, reused across features and scan directions.
 struct Scratch {
-    acc: Vec<GradStats>,
-    last_val: Vec<f32>,
+    slots: Vec<SlotScan>,
 }
 
 impl Scratch {
     fn new(k: usize) -> Self {
         Scratch {
-            acc: vec![GradStats::default(); k],
-            last_val: vec![0f32; k],
+            slots: Vec::with_capacity(k),
         }
     }
 }
@@ -387,7 +473,6 @@ impl Level<'_> {
     /// Offer every candidate split of feature `f` to the active nodes' `best`
     /// entries, in `ColMaker` order.
     fn scan_feature(&self, f: u32, best: &mut [BestSplit], scratch: &mut Scratch) {
-        let Scratch { acc, last_val } = scratch;
         let (crows, cvals) = self.cols.column(f as usize);
         let dir = self.cons.dir(f as usize);
         let gpair = self.gpair;
@@ -457,59 +542,125 @@ impl Level<'_> {
         // not constant scans forward (missing right); every column
         // scans backward (missing left).
         let indicator = !cvals.is_empty() && cvals[0] == cvals[cvals.len() - 1];
-        let mut scan = |d_step: i8, acc: &mut [GradStats], last_val: &mut [f32]| {
-            acc.fill(GradStats::default());
-            let mut visit = |r: usize, val: f32| {
-                let Some((nid, slot)) = active_slot(r) else {
-                    return;
-                };
-                let e = &mut acc[slot];
-                // `UpdateEnumeration`: the first rows with positive Hessian
-                // only seed the running statistics.
-                if e.hess != 0.0 && val != last_val[slot] && e.hess >= reg.min_child_weight {
-                    let c = self.node_stats[nid].sub(*e);
-                    if c.hess >= reg.min_child_weight {
-                        let children = if d_step < 0 {
-                            Children::new(true, c, *e)
-                        } else {
-                            Children::new(false, *e, c)
-                        };
-                        // ColMaker's midpoint `(fvalue + last) * 0.5f`
-                        // overflows to `±inf` for two same-sign values
-                        // near `±f32::MAX`. Only then fall back to the
-                        // halved form, which is finite and still lies
-                        // between the two values, so the partition is
-                        // unchanged. Trees must stay finite.
-                        let last = last_val[slot];
-                        let thr = || {
-                            let mut mid = f32::midpoint(val, last);
-                            if !mid.is_finite() {
-                                mid = val * 0.5 + last * 0.5;
-                            }
-                            if mid == val { last } else { mid }
-                        };
-                        self.try_split(&mut best[slot], &scorer(slot, nid), f, thr, children);
-                    }
-                }
-                e.add(GradStats::from_pair(gpair[r]));
-                last_val[slot] = val;
+        let slots = &mut scratch.slots;
+        slots.clear();
+        slots.extend(self.active.iter().enumerate().map(|(slot, &nid)| {
+            let mut s = SlotScan {
+                acc: GradStats::default(),
+                last_val: 0.0,
+                total: self.node_stats[nid],
+                node_screen: if self.reuse.is_none() {
+                    scorer(slot, nid).screen()
+                } else {
+                    None
+                },
+                screen: None,
+                allowed: permits(self.node_allowed[nid].as_ref(), f),
             };
-            if d_step > 0 {
-                for (&rr, &val) in crows.iter().zip(cvals) {
-                    visit(rr as usize, val);
-                }
+            s.sync(&best[slot], f);
+            s
+        }));
+        let (row_slot, mcw) = (self.row_slot, reg.min_child_weight);
+        let mut scan = |d_step: i8, slots: &mut [SlotScan]| {
+            // Loop invariants copied into the closure's own locals: read
+            // through its captures, they were reloaded past every store of
+            // the per-row step instead of staying in registers.
+            let (row_slot, mcw, gpair) = (row_slot, mcw, gpair);
+            for s in slots.iter_mut() {
+                s.acc = GradStats::default();
+            }
+            // The per-row step on slot `$slot`'s state `$s`.
+            macro_rules! visit {
+                ($s:expr, $slot:expr, $r:expr, $val:expr, $step:expr) => {{
+                    let (s, slot, r, val, d_step): (&mut SlotScan, usize, usize, f32, i8) =
+                        (&mut $s, $slot, $r, $val, $step);
+                    if s.allowed {
+                        let e = s.acc;
+                        // `UpdateEnumeration`: the first rows with positive
+                        // Hessian only seed the running statistics.
+                        if e.hess != 0.0 && val != s.last_val && e.hess >= mcw {
+                            let c = s.total.sub(e);
+                            if c.hess >= mcw {
+                                let children = if d_step < 0 {
+                                    Children::new(true, c, e)
+                                } else {
+                                    Children::new(false, e, c)
+                                };
+                                // ColMaker's midpoint `(fvalue + last) * 0.5f`
+                                // overflows to `±inf` for two same-sign
+                                // values near `±f32::MAX`. Only then fall
+                                // back to the halved form, which is finite
+                                // and still lies between the two values, so
+                                // the partition is unchanged. Trees must
+                                // stay finite.
+                                let last = s.last_val;
+                                let thr = || {
+                                    let mut mid = f32::midpoint(val, last);
+                                    if !mid.is_finite() {
+                                        mid = val * 0.5 + last * 0.5;
+                                    }
+                                    if mid == val { last } else { mid }
+                                };
+                                if !s.rules_out(&children) {
+                                    let nid = self.active[slot];
+                                    self.offer(
+                                        &mut best[slot],
+                                        &scorer(slot, nid),
+                                        f,
+                                        thr,
+                                        children,
+                                    );
+                                    s.sync(&best[slot], f);
+                                }
+                            }
+                        }
+                        s.acc.add(GradStats::from_pair(gpair[r]));
+                        s.last_val = val;
+                    }
+                }};
+            }
+            // The column's `(row, value)` pairs in scan order.
+            macro_rules! each_row {
+                (|$step:ident, $r:ident, $val:ident| $body:block) => {
+                    // Each direction's loop sees its step as a constant.
+                    if d_step > 0 {
+                        let $step: i8 = 1;
+                        for (&$r, &$val) in crows.iter().zip(cvals) $body
+                    } else {
+                        let $step: i8 = -1;
+                        for (&$r, &$val) in crows.iter().zip(cvals).rev() $body
+                    }
+                };
+            }
+            if let [only] = slots {
+                // A single active node (the root level): its state lives in
+                // registers instead of a store-to-load chain through memory.
+                let mut state = *only;
+                each_row!(|step, r, val| {
+                    let r = r as usize;
+                    if row_slot[r] != u32::MAX {
+                        visit!(state, 0, r, val, step);
+                    }
+                });
+                *only = state;
             } else {
-                for (&rr, &val) in crows.iter().zip(cvals).rev() {
-                    visit(rr as usize, val);
-                }
+                each_row!(|step, r, val| {
+                    let r = r as usize;
+                    let slot = row_slot[r];
+                    if slot != u32::MAX {
+                        let slot = slot as usize;
+                        visit!(slots[slot], slot, r, val, step);
+                    }
+                });
             }
             // Endpoint: every present value on the scanned side, the
             // missing mass on the other.
             for (slot, &nid) in self.active.iter().enumerate() {
-                let e = acc[slot];
-                let c = self.node_stats[nid].sub(e);
+                let s = &mut slots[slot];
+                let e = s.acc;
+                let c = s.total.sub(e);
                 if e.hess >= reg.min_child_weight && c.hess >= reg.min_child_weight {
-                    let last = last_val[slot];
+                    let last = s.last_val;
                     let gap = last.abs() + K_RT_EPS_F32;
                     let thr = if d_step > 0 { last + gap } else { last - gap };
                     // ColMaker's `last_fvalue ± delta` overflows to `±inf`
@@ -534,25 +685,25 @@ impl Level<'_> {
                     } else {
                         Children::new(false, e, c)
                     };
-                    self.try_split(&mut best[slot], &scorer(slot, nid), f, || thr, children);
+                    if !s.rules_out(&children) {
+                        self.offer(&mut best[slot], &scorer(slot, nid), f, || thr, children);
+                        s.sync(&best[slot], f);
+                    }
                 }
             }
         };
         if cvals.len() < self.n_rows && !indicator {
-            scan(1, acc, last_val);
+            scan(1, slots);
         }
-        scan(-1, acc, last_val);
+        scan(-1, slots);
     }
 
     /// Evaluate one candidate partition exactly as XGBoost's `ColMaker` does
     /// (`CalcSplitGain − root_gain` in `f32`, `SplitEntry::Update` tie rule)
-    /// and record it in `best` when it wins. Without reuse penalties, a
-    /// candidate that [`SplitScorer::cannot_beat`] the incumbent (from this
-    /// or an earlier feature, so it needs a strictly larger loss change) is
-    /// skipped unscored. Inlined: most calls end at the screen, and a call
-    /// would spill the scan's registers.
-    #[inline(always)]
-    fn try_split(
+    /// and record it in `best` when it wins. The scan skips candidates that
+    /// [`SlotScan::rules_out`] before offering them.
+    #[inline]
+    fn offer(
         &self,
         best: &mut BestSplit,
         scorer: &SplitScorer,
@@ -560,12 +711,6 @@ impl Level<'_> {
         threshold: impl FnOnce() -> f32,
         children: Children,
     ) {
-        if self.reuse.is_none()
-            && best.feature <= feature
-            && scorer.cannot_beat(children.left, children.right, best.loss_chg)
-        {
-            return;
-        }
         if let Some(mut score) = scorer.loss_chg(children.left, children.right) {
             let threshold = threshold();
             if let Some(reuse) = self.reuse {

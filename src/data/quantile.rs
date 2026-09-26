@@ -13,7 +13,7 @@
 
 use crate::data::DMatrix;
 use crate::data::meta::FeatureType;
-use crate::data::sketch::WQSketch;
+use crate::data::sketch::{SketchScratch, WQSketch};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -306,48 +306,71 @@ const SEARCH_BLOCK: usize = 16;
 /// vector compares, and the result equals `partition_point(|c| c <= value)`.
 pub struct BinSearch<'a> {
     cuts: &'a HistCuts,
-    /// Padded cuts, `padded_offset[f]..padded_offset[f + 1]` per feature.
+    /// Where each feature's tables are, one load per lookup.
+    features: Vec<FeatureSearch>,
+    /// Padded cuts of every numeric feature.
     padded: Vec<f32>,
-    padded_offset: Vec<usize>,
-    /// Last cut of each block, padded with `+inf` to whole blocks,
-    /// `level1_offset[f]..level1_offset[f + 1]` per feature.
+    /// Last cut of each block, padded with `+inf` to whole blocks.
     level1: Vec<f32>,
-    level1_offset: Vec<usize>,
+}
+
+/// One feature's slice of the [`BinSearch`] tables.
+#[derive(Debug, Clone, Copy)]
+struct FeatureSearch {
+    /// First global bin.
+    start: usize,
+    /// Number of cuts (bins).
+    n_cuts: usize,
+    /// Start of the padded cuts; `padded_len` of them.
+    padded: usize,
+    padded_len: usize,
+    /// Start of the first-level table; `level1_len` entries, a multiple of
+    /// `SEARCH_BLOCK`.
+    level1: usize,
+    level1_len: usize,
+    categorical: bool,
 }
 
 impl<'a> BinSearch<'a> {
     /// Build the index for every numeric feature of `cuts`.
     pub fn new(cuts: &'a HistCuts) -> Self {
         let mut padded = Vec::new();
-        let mut padded_offset = vec![0];
         let mut level1 = Vec::new();
-        let mut level1_offset = vec![0];
+        let mut features = Vec::with_capacity(cuts.n_features());
         for f in 0..cuts.n_features() {
-            if !cuts.is_categorical(f) {
-                let (start, end) = cuts.feature_bins(f);
+            let (start, end) = cuts.feature_bins(f);
+            let (padded_start, level1_start) = (padded.len(), level1.len());
+            let categorical = cuts.is_categorical(f);
+            if !categorical {
                 let feature = &cuts.cut_values[start..end];
                 let blocks = feature.len().div_ceil(SEARCH_BLOCK);
                 padded.extend_from_slice(feature);
-                padded.resize(padded_offset[f] + blocks * SEARCH_BLOCK, f32::INFINITY);
+                padded.resize(padded_start + blocks * SEARCH_BLOCK, f32::INFINITY);
                 level1.extend(
                     feature
                         .chunks(SEARCH_BLOCK)
                         .map(|block| *block.last().expect("blocks are non-empty")),
                 );
                 level1.resize(
-                    level1_offset[f] + blocks.div_ceil(SEARCH_BLOCK) * SEARCH_BLOCK,
+                    level1_start + blocks.div_ceil(SEARCH_BLOCK) * SEARCH_BLOCK,
                     f32::INFINITY,
                 );
             }
-            padded_offset.push(padded.len());
-            level1_offset.push(level1.len());
+            features.push(FeatureSearch {
+                start,
+                n_cuts: end - start,
+                padded: padded_start,
+                padded_len: padded.len() - padded_start,
+                level1: level1_start,
+                level1_len: level1.len() - level1_start,
+                categorical,
+            });
         }
         BinSearch {
             cuts,
+            features,
             padded,
-            padded_offset,
             level1,
-            level1_offset,
         }
     }
 
@@ -359,28 +382,60 @@ impl<'a> BinSearch<'a> {
 
     /// Map a feature value to its global bin index, with the same result as
     /// [`HistCuts::bin_of`].
-    #[inline]
+    #[inline(always)]
     pub fn bin_of(&self, f: usize, value: f32) -> u32 {
-        if self.cuts.is_categorical(f) {
-            return self.cuts.bin_of(f, value);
+        self.feature(f).bin_of(value)
+    }
+
+    /// Feature `f`'s tables, for binning many of its values in a row.
+    #[inline(always)]
+    pub(crate) fn feature(&self, f: usize) -> FeatureBins<'_> {
+        let feature = self.features[f];
+        FeatureBins {
+            cuts: self.cuts,
+            f,
+            categorical: feature.categorical,
+            start: feature.start,
+            n_cuts: feature.n_cuts,
+            level1: &self.level1[feature.level1..][..feature.level1_len],
+            padded: &self.padded[feature.padded..][..feature.padded_len],
         }
-        let (start, end) = self.cuts.feature_bins(f);
-        let level1 = &self.level1[self.level1_offset[f]..self.level1_offset[f + 1]];
+    }
+}
+
+/// One feature's view of a [`BinSearch`] ([`BinSearch::feature`]).
+#[derive(Clone, Copy)]
+pub(crate) struct FeatureBins<'a> {
+    cuts: &'a HistCuts,
+    f: usize,
+    categorical: bool,
+    start: usize,
+    n_cuts: usize,
+    level1: &'a [f32],
+    padded: &'a [f32],
+}
+
+impl FeatureBins<'_> {
+    /// [`BinSearch::bin_of`] for this feature.
+    #[inline(always)]
+    pub(crate) fn bin_of(&self, value: f32) -> u32 {
+        if self.categorical {
+            return self.cuts.bin_of(self.f, value);
+        }
         let mut block = 0;
-        for chunk in level1.as_chunks::<SEARCH_BLOCK>().0 {
+        for chunk in self.level1.as_chunks::<SEARCH_BLOCK>().0 {
             block += crate::simd::count_le(chunk, value);
         }
-        let padded = &self.padded[self.padded_offset[f]..self.padded_offset[f + 1]];
-        let local = if block * SEARCH_BLOCK < padded.len() {
+        let local = if block * SEARCH_BLOCK < self.padded.len() {
             block * SEARCH_BLOCK
                 + crate::simd::count_le(
-                    &padded[block * SEARCH_BLOCK..(block + 1) * SEARCH_BLOCK],
+                    &self.padded[block * SEARCH_BLOCK..(block + 1) * SEARCH_BLOCK],
                     value,
                 )
         } else {
-            end - start
+            self.n_cuts
         };
-        global_bin(start, local, end - start)
+        global_bin(self.start, local, self.n_cuts)
     }
 }
 
@@ -401,12 +456,22 @@ pub(super) fn sort_key(value: f32) -> u32 {
     }
 }
 
+/// Inverse of [`sort_key`].
+#[inline]
+pub(super) fn unsort_key(key: u32) -> f32 {
+    f32::from_bits(if key & 0x8000_0000 != 0 {
+        key & !0x8000_0000
+    } else {
+        !key
+    })
+}
+
 /// Buffers [`radix_sort`] reuses across calls.
 #[derive(Default)]
 pub(super) struct RadixScratch<T> {
     spare: Vec<T>,
     /// Bucket counts of the three passes, `3 × RADIX_BUCKETS`.
-    counts: Vec<usize>,
+    counts: Vec<u32>,
 }
 
 /// One cut-building worker's reused buffers.
@@ -419,12 +484,13 @@ struct ColumnScratch {
     /// A numeric column's `(value, weight)` pairs (sorted ingestion).
     pairs: Vec<(f32, f32)>,
     /// Radix scratch lent to each numeric column's sketch.
-    sketch_sort: RadixScratch<(f32, f32)>,
+    sketch_sort: SketchScratch,
 }
 
 /// Stable three-pass LSD radix sort of `items` by `key` (11, 11, and 10 bit
 /// digits; a digit every key shares is skipped), ascending in the key's
-/// unsigned order.
+/// unsigned order. Inputs of `2^32` items or more (beyond the `u32` bucket
+/// counts) take a comparison sort by the same key instead.
 pub(super) fn radix_sort<T: Copy + Default>(
     items: &mut Vec<T>,
     scratch: &mut RadixScratch<T>,
@@ -434,6 +500,10 @@ pub(super) fn radix_sort<T: Copy + Default>(
     if n < 2 {
         return;
     }
+    let Ok(n32) = u32::try_from(n) else {
+        items.sort_by_key(key);
+        return;
+    };
     let RadixScratch { spare, counts } = scratch;
     // Bucket counts for all passes in one sweep.
     counts.clear();
@@ -449,7 +519,8 @@ pub(super) fn radix_sort<T: Copy + Default>(
             count[((k >> (RADIX_BITS * pass as u32)) & (RADIX_BUCKETS as u32 - 1)) as usize] += 1;
         }
     }
-    spare.clear();
+    // Every slot of the spare buffer is written before it is read, so only
+    // slots it gains are initialized.
     spare.resize(n, T::default());
     // Passes ping-pong between the two buffers; track which one holds the data.
     let mut in_spare = false;
@@ -460,7 +531,7 @@ pub(super) fn radix_sort<T: Copy + Default>(
         .enumerate()
     {
         // A pass whose digit is constant across the input is a no-op.
-        if count.contains(&n) {
+        if count.contains(&n32) {
             continue;
         }
         let mut offset = 0;
@@ -477,7 +548,7 @@ pub(super) fn radix_sort<T: Copy + Default>(
         };
         for item in src {
             let bucket = ((key(item) >> shift) & (RADIX_BUCKETS as u32 - 1)) as usize;
-            dst[count[bucket]] = *item;
+            dst[count[bucket] as usize] = *item;
             count[bucket] += 1;
         }
         in_spare = !in_spare;

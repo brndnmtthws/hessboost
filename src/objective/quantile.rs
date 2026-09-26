@@ -51,6 +51,7 @@ impl Quantile {
     /// # Errors
     ///
     /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
+    #[cfg(test)]
     pub(crate) fn new(alpha: &[f64]) -> Result<Self> {
         Ok(Quantile::from_levels(Quantiles::new(
             alpha.iter().copied(),
@@ -257,6 +258,7 @@ impl Expectile {
     /// # Errors
     ///
     /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
+    #[cfg(test)]
     pub(crate) fn new(alpha: &[f64]) -> Result<Self> {
         Ok(Expectile::from_levels(Expectiles::new(
             alpha.iter().copied(),
@@ -412,6 +414,7 @@ impl Loss for Expectile {
 mod tests {
     use super::*;
     use crate::error::HessboostError;
+    use crate::objective::Objective;
     use crate::objective::{base_margins, gradient_pairs};
     use crate::training::Trainer;
 
@@ -592,8 +595,9 @@ mod tests {
             .collect();
         let d = crate::test_support::labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective("reg:quantileerror")
-            .quantile_alpha(vec![0.1, 0.5, 0.9])
+            .objective(Objective::Quantile(
+                Quantiles::new(vec![0.1, 0.5, 0.9]).unwrap(),
+            ))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -640,8 +644,7 @@ mod tests {
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let d = crate::test_support::labeled_dense(&x, n, 1, &x);
         let params = TrainingParams::builder()
-            .objective("reg:quantileerror")
-            .quantile_alpha(vec![0.1, 0.9])
+            .objective(Objective::Quantile(Quantiles::new(vec![0.1, 0.9]).unwrap()))
             .max_depth(2)
             .build()
             .unwrap();
@@ -662,58 +665,48 @@ mod tests {
         close(model.predict(&d).unwrap(), restored.predict(&d).unwrap());
     }
 
-    /// Every alpha output fits the one label column: a label matrix handed
-    /// to training with a directly constructed objective is refused.
+    /// Every alpha output fits the one label column: a label matrix is
+    /// refused for the alpha objectives.
     #[test]
     fn alpha_objectives_require_one_label_column() {
         use crate::config::TrainingParams;
         use crate::data::DMatrix;
+        use crate::objective::{Expectiles, Objective, Quantiles};
         let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
             .unwrap()
             .with_label_matrix(&[0.0, 1.0, 1.0, 2.0], 2)
             .unwrap();
-        let params = TrainingParams::builder().build().unwrap();
-        let objectives: [Box<dyn Loss>; 2] = [
-            Box::new(Quantile::new(&[0.1, 0.9]).unwrap()),
-            Box::new(Expectile::new(&[0.1, 0.9]).unwrap()),
-        ];
-        for obj in &objectives {
+        for objective in [
+            Objective::Quantile(Quantiles::new([0.1, 0.9]).unwrap()),
+            Objective::Expectile(Expectiles::new([0.1, 0.9]).unwrap()),
+        ] {
+            let params = TrainingParams::builder()
+                .objective(objective)
+                .build()
+                .unwrap();
             assert!(matches!(
-                Trainer::new(&params, &d, 1).loss(obj.as_ref()).train(),
+                Trainer::new(&params, &d, 1).train(),
                 Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
             ));
         }
     }
 
-    /// A directly constructed built-in objective must match the training
-    /// parameters it is saved with, or the trained model could not be loaded:
-    /// training refuses the mismatch and accepts the matching alphas.
+    /// A trained quantile model records its alphas, so the saved model
+    /// rebuilds its objective and loads.
     #[test]
-    fn training_refuses_alphas_the_saved_model_cannot_rebuild() {
+    fn trained_alphas_rebuild_on_load() {
         use crate::config::TrainingParams;
         use crate::model::BoostedModel;
+        use crate::objective::{Objective, Quantiles};
         let d =
             crate::test_support::labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 1.0, 2.0, 3.0]);
-        let obj = Quantile::new(&[0.1, 0.9]).unwrap();
-        for alphas in [vec![], vec![0.5]] {
-            let params = TrainingParams::builder()
-                .quantile_alpha(alphas)
-                .build()
-                .unwrap();
-            assert!(matches!(
-                Trainer::new(&params, &d, 1).loss(&obj).train(),
-                Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
-            ));
-        }
+        let objective = Objective::Quantile(Quantiles::new([0.1, 0.9]).unwrap());
         let params = TrainingParams::builder()
-            .quantile_alpha(vec![0.1, 0.9])
+            .objective(objective.clone())
             .build()
             .unwrap();
-        let model = Trainer::new(&params, &d, 1)
-            .loss(&obj)
-            .train()
-            .unwrap()
-            .model;
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        let model = Trainer::new(&params, &d, 1).train().unwrap().model;
+        let loaded = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        assert_eq!(loaded.objective().built_in(), Some(&objective));
     }
 }

@@ -232,6 +232,39 @@ fn alphas(u: &mut Unstructured) -> ArbResult<Vec<f64>> {
         .collect()
 }
 
+/// Whether `objective` reads the objective-parameter key `key` (with
+/// `shared_trees` for `multi_strategy = multi_output_tree`, the only
+/// setting a `dist:*` split direction applies to).
+fn objective_reads(objective: &str, key: &str, shared_trees: bool) -> bool {
+    match key {
+        "num_class" => objective.starts_with("multi:"),
+        "scale_pos_weight" => matches!(
+            objective,
+            "binary:logistic" | "binary:logitraw" | "reg:logistic"
+        ),
+        "tweedie_variance_power" => objective == "reg:tweedie",
+        "huber_slope" => objective == "reg:pseudohubererror",
+        "lambdarank_num_pair_per_sample" => objective.starts_with("rank:"),
+        "quantile_alpha" => objective == "reg:quantileerror",
+        "expectile_alpha" => objective == "reg:expectileerror",
+        "aft_loss_distribution" | "aft_loss_distribution_scale" => objective == "survival:aft",
+        "dist_gradient" => objective.starts_with("dist:"),
+        "dist_split_direction" => objective.starts_with("dist:") && shared_trees,
+        _ => false,
+    }
+}
+
+/// Whether the metric `metric` borrows the objective-parameter key `key`.
+fn metric_borrows(metric: &str, key: &str) -> bool {
+    match metric {
+        "mphe" => key == "huber_slope",
+        "quantile" => key == "quantile_alpha",
+        "expectile" => key == "expectile_alpha",
+        "aft-nloglik" => key.starts_with("aft_loss_distribution"),
+        _ => false,
+    }
+}
+
 fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     let objective = *u.choose(OBJECTIVES)?;
     let num_class = u.int_in_range(0..=4)?;
@@ -241,8 +274,12 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     let n_cols = dtrain.n_cols();
 
     // XGBoost's flat form, read in a fixed order so a corpus input keeps
-    // its meaning; `from_xgboost` refuses what `validate` would.
+    // its meaning; `from_xgboost` refuses what `validate` would. The
+    // objective parameters are drawn in place but set only when the
+    // objective or the metric (drawn last) reads them, since `from_xgboost`
+    // refuses a key nothing reads.
     let mut flat = Map::new();
+    let mut objective_params: Vec<(&str, Value)> = Vec::new();
     let mut set = |key: &str, value: Value| {
         flat.insert(key.to_owned(), value);
     };
@@ -252,31 +289,31 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     );
     set("seed", json!(u.arbitrary::<u64>()?));
     set("objective", json!(objective));
-    set("num_class", json!(num_class));
+    objective_params.push(("num_class", json!(num_class)));
     if u.arbitrary()? {
         set("base_score", json!(param(u, &[0.0, 0.5, 1.0, -1.0, 2.0])?));
     }
-    set("tweedie_variance_power", json!(param(u, &[1.5, 1.0, 2.0])?));
-    set("huber_slope", json!(param(u, &[1.0, 0.1, 10.0])?));
-    set(
+    objective_params.push(("tweedie_variance_power", json!(param(u, &[1.5, 1.0, 2.0])?)));
+    objective_params.push(("huber_slope", json!(param(u, &[1.0, 0.1, 10.0])?)));
+    objective_params.push((
         "lambdarank_num_pair_per_sample",
         json!(u.int_in_range(0..=4)?),
-    );
-    set("quantile_alpha", json!(alphas(u)?));
-    set("expectile_alpha", json!(alphas(u)?));
-    set(
+    ));
+    objective_params.push(("quantile_alpha", json!(alphas(u)?)));
+    objective_params.push(("expectile_alpha", json!(alphas(u)?)));
+    objective_params.push((
         "aft_loss_distribution",
         json!(*u.choose(&["normal", "logistic", "extreme"])?),
-    );
-    set(
+    ));
+    objective_params.push((
         "aft_loss_distribution_scale",
         json!(param(u, &[1.0, 0.5, 2.0])?),
-    );
-    set("dist_gradient", json!(*u.choose(&["fisher", "hessian"])?));
-    set(
+    ));
+    objective_params.push(("dist_gradient", json!(*u.choose(&["fisher", "hessian"])?)));
+    objective_params.push((
         "dist_split_direction",
         json!(*u.choose(&["random", "cyclic"])?),
-    );
+    ));
     set("eta", json!(param(u, &[0.3, 0.1, 1.0, 1e-3, 10.0])?));
     set("gamma", json!(param(u, &[0.0, 0.5, 10.0])?));
     set("max_depth", json!(u.int_in_range(0..=6)?));
@@ -291,7 +328,7 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     set("colsample_bynode", json!(param(u, &[1.0, 0.5, 0.0])?));
     set("lambda", json!(param(u, &[1.0, 0.0, 10.0])?));
     set("alpha", json!(param(u, &[0.0, 1.0])?));
-    set("scale_pos_weight", json!(param(u, &[1.0, 0.5, 4.0])?));
+    objective_params.push(("scale_pos_weight", json!(param(u, &[1.0, 0.5, 4.0])?)));
     set(
         "tree_method",
         json!(*u.choose(&["auto", "exact", "approx", "hist"])?),
@@ -306,10 +343,8 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
         "sampling_method",
         json!(*u.choose(&["uniform", "gradient_based"])?),
     );
-    set(
-        "multi_strategy",
-        json!(*u.choose(&["one_output_per_tree", "multi_output_tree"])?),
-    );
+    let multi_strategy = *u.choose(&["one_output_per_tree", "multi_output_tree"])?;
+    set("multi_strategy", json!(multi_strategy));
     set("extra_trees", json!(u.ratio(1, 6)?));
     set("extra_seed", json!(u.arbitrary::<u64>()?));
     set("path_smooth", json!(param(u, &[0.0, 0.0, 1.0])?));
@@ -339,8 +374,21 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
             .collect::<ArbResult<Vec<_>>>()?;
         set("interaction_constraints", json!(groups));
     }
-    if u.ratio(1, 4)? {
-        set("eval_metric", json!([*u.choose(METRICS)?]));
+    let metric = if u.ratio(1, 4)? {
+        Some(*u.choose(METRICS)?)
+    } else {
+        None
+    };
+    if let Some(metric) = metric {
+        set("eval_metric", json!([metric]));
+    }
+    let shared_trees = multi_strategy == "multi_output_tree";
+    for (key, value) in objective_params {
+        if objective_reads(objective, key, shared_trees)
+            || metric.is_some_and(|metric| metric_borrows(metric, key))
+        {
+            set(key, value);
+        }
     }
     let Ok(params) = TrainingParams::from_xgboost(flat) else {
         return Ok(None);

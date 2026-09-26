@@ -104,14 +104,14 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`lib.rs`|crate docs ("What's here", "Not implemented"), `prelude`, hidden `internals`|
 |`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams|
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
-|`config/params.rs`|`TrainingParams`, builder, `validate`, parameter enums, `ObjectiveParams`|
+|`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
 |`config/xgboost.rs`|XGBoost's flat parameter form: `TrainingParams::from_xgboost`/`to_xgboost` (keys, aliases, value spellings, one-setting options), `changed_keys`|
-|`objective/`|files by XGBoost family; `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`)|
+|`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
 |`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
 |`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public)|
-|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
+|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -205,9 +205,17 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   - Native JSON: `BoostedModel`, `RegTree`, and `LinearLeaves` deserialize
     via `Unchecked…` mirrors (`#[serde(try_from)]`) and validate. A new
     field goes in the type and its mirror, with a `#[serde(default)]` on the
-    mirror that reproduces older files. A new `ObjectiveParams` field goes
-    in the `objective_param_mirrors!` list (`config/params.rs`); missing
-    objective fields take `ObjectiveParams::defaults_for(objective)`.
+    mirror that reproduces older files. A model's objective is stored as
+    its name plus `StoredObjectiveParams` (`model/objective.rs`): every
+    built-in objective's parameters, the defaults for those the objective
+    does not read, so saves stay byte-identical to 0.2.0's. A new objective
+    parameter goes in `StoredObjectiveParams` and
+    `PartialStoredObjectiveParams` (each member a `Stored`, so `null` stays
+    an error), and missing members take
+    `StoredObjectiveParams::defaults_for(objective)`. Loading maps the
+    record to `ModelObjective::from_stored` (unknown names are
+    `ModelObjective::Other`; parameters the objective does not read are
+    dropped).
     Everything predictions depend on is required, nullable ones via
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
@@ -239,9 +247,10 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   objective's name). `margins_to_probs` exports `base_score`
   (default `pred_transform`; `binary:hinge` and `reg:quantileerror`
   override it). Label-domain checks go in each loss's `validate_info`.
-  Label matrices: `create_objective` wraps `MULTI_TARGET_OBJECTIVES` in
-  `MultiTarget` (row weight per cell, per-column intercepts);
-  `reg:absoluteerror` handles them itself; other built-ins refuse them. The
+  Label matrices: `Objective::build_loss` wraps the `LabelMatrix::PerColumn`
+  objectives in `MultiTarget` (row weight per cell, per-column intercepts);
+  `reg:absoluteerror` and custom losses handle them themselves; other
+  built-ins refuse them. The
   default `Metric::eval_info` reduces them elementwise; other metrics
   override it or report `supports_label_matrix() == false`, which training
   refuses. Every eval set is checked before training (`validate_info`;
@@ -258,8 +267,11 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   evaluated after the configured or default metrics, as XGBoost's
   `xgb.train` does.
 - **Refusals:** unsupported parameters or combinations error, never get
-  ignored. Checks live in `TrainingParams::validate` (static),
-  `TrainingParams::from_xgboost` (keys and value spellings),
+  ignored. Checks live in the parameter structs' constructors (ranges),
+  `TrainingParams::validate` (static combinations),
+  `TrainingParams::from_xgboost` (keys and value spellings; an objective
+  parameter key that neither the objective nor a listed metric reads is
+  refused, `OBJECTIVE_KEYS` in `config/xgboost.rs`),
   `validate_request` in `training/train.rs` (data-dependent),
   `training/multi_output.rs::validate`, `training/continuation.rs`,
   `EvalMetric::from_xgboost` (metric names and suffixes), and `training/budget.rs`.
@@ -267,6 +279,12 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   allow-list (`TrainingParams::refuse_changes_from`, over `changed_keys`,
   which destructures every field), so any new field is refused there
   automatically.
+- **One objective:** `TrainingParams::objective` is the only source of
+  the trained loss (`TrainingParams::loss`); a custom loss is
+  `Objective::Custom`, so every property (base-score domain, default
+  metric, default `max_delta_step`, adaptive leaves, output count) comes
+  from the loss being trained. A custom loss may not take a built-in
+  objective's name: the model records it as `ModelObjective::Other(name)`.
 - **Python:** `python/` uses only the crate's public API. The public
   Python API is pure Python; the extension is private, fully stubbed
   (stubtest), `unsafe`-free (`forbid`), declares `gil_used = false`, keeps
@@ -274,7 +292,10 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   training, prediction, and model encode/decode. Parameter mappings go
   through `TrainingParams::from_xgboost`, the crate's one XGBoost
   boundary (also used by `tests/parity.rs` and the `train` fuzz target),
-  so unknown keys are refused. `train`
+  so unknown keys are refused. `train(obj=...)` trains
+  `Objective::Custom` (the mapping may not set `objective`; its
+  `num_class` is the custom loss's output count, XGBoost's convention).
+  `train`
   runs on a worker thread while the caller polls for signals; Python
   callbacks (objective, metric, per-round) re-attach to the interpreter,
   and the first exception (or Ctrl-C's `KeyboardInterrupt`) stops
@@ -300,7 +321,7 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   builder, or a constructor. Only closed sets stay exhaustive (`Monotone`,
   `GradPair`, `Dist`'s variants).
 
-Easy-to-miss requirements: multiclass needs `.num_class(k)`; ranking needs
+Easy-to-miss requirements: multiclass needs `Multiclass::new(k)`; ranking needs
 `.with_group_sizes`; `survival:aft` needs `.with_label_bounds`;
 `survival:cox` reads non-positive labels as right-censored;
 `Loss::split_gradient` serves vector-leaf trees only, not with
@@ -314,7 +335,11 @@ feature lists and caveats, `lib.rs` "What's here" and "Not implemented",
 this file, and affected examples. New options need a `TrainingParams`
 field, builder setter, validation, and their key in `config/xgboost.rs`
 (`flat_params!`, `into_params`, `to_xgboost`, `changed_keys`; each
-destructures the struct, so a missing one does not compile).
+destructures the struct, so a missing one does not compile). A new
+objective is an `Objective` variant (the compiler then asks for it in
+every property match of `objective/spec.rs`, `objective_to_json`, ...),
+and a new objective parameter a field of its parameter struct plus its
+flat key (`ObjectiveParts`, `OBJECTIVE_KEYS`) and stored member.
 
 ## Releases
 

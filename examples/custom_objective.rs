@@ -18,7 +18,6 @@ fn main() -> Result<()> {
         y[i] = 1.5 * x[i * f] - x[i * f + 1];
     }
     let d = DMatrix::from_dense(&x, n, f)?.with_labels(&y)?;
-    let params = TrainingParams::builder().max_depth(3).eta(0.2).build()?;
 
     // --- Custom objective: squared error via first/second-order gradients. ---
     // Signature: (raw_margins, labels, optional_weights, out_gradients).
@@ -28,7 +27,12 @@ fn main() -> Result<()> {
             out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi); // grad, hess
         }
     });
-    let model = Trainer::new(&params, &d, 60).loss(&obj).train()?.model;
+    let params = TrainingParams::builder()
+        .objective(Objective::custom(obj))
+        .max_depth(3)
+        .eta(0.2)
+        .build()?;
+    let model = Trainer::new(&params, &d, 60).train()?.model;
     let preds = model.predict(&d)?;
     let rmse = EvalMetric::Rmse.build(1)?.eval(&preds, &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
@@ -43,7 +47,7 @@ fn main() -> Result<()> {
             / p.len() as f64
     });
     let builtin = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .max_depth(3)
         .eta(0.2)
         .build()?;

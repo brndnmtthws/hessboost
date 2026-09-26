@@ -3,8 +3,29 @@
 //! is validated when it is built, with the XGBoost parameter name in the
 //! error, so a value that exists is valid.
 
-use crate::config::AftDistribution;
 use crate::error::{HessboostError, Result};
+use serde::{Deserialize, Serialize};
+use std::num::NonZeroUsize;
+
+/// Noise distribution of the accelerated-failure-time survival loss.
+///
+/// Mirrors XGBoost's `aft_loss_distribution`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum AftDistribution {
+    /// Normal (Gaussian) noise. XGBoost default.
+    #[default]
+    Normal,
+    /// Logistic noise.
+    Logistic,
+    /// Type-1 extreme-value (Gumbel minimum) noise.
+    Extreme,
+}
+
+stored_names! {
+    AftDistribution { Normal => "normal", Logistic => "logistic", Extreme => "extreme" }
+}
 
 /// The slope `δ` of the pseudo-Huber loss (`reg:pseudohubererror` and the
 /// `mphe` metric). XGBoost `huber_slope`, default `1`.
@@ -231,6 +252,128 @@ impl Default for Aft {
     }
 }
 
+/// The positive-class weight of the logistic objectives (`binary:logistic`,
+/// `binary:logitraw`, `reg:logistic`): the loss of every row labeled `1` is
+/// multiplied by it, to balance imbalanced classes. XGBoost
+/// `scale_pos_weight`, default `1`.
+///
+/// XGBoost also applies `scale_pos_weight` in `reg:squarederror` and
+/// `reg:gamma`; hessboost does not, so only the logistic objectives carry
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Logistic {
+    scale_pos_weight: f64,
+}
+
+impl Logistic {
+    /// The logistic loss with positive-class weight `scale_pos_weight`.
+    ///
+    /// # Errors
+    ///
+    /// `scale_pos_weight` is not finite and positive, also once rounded to
+    /// the `f32` the loss computes in.
+    pub fn new(scale_pos_weight: f64) -> Result<Self> {
+        let narrowed = scale_pos_weight as f32;
+        if !(scale_pos_weight.is_finite() && scale_pos_weight > 0.0) {
+            return Err(HessboostError::invalid_param(
+                "scale_pos_weight",
+                format!("must be > 0, got {scale_pos_weight}"),
+            ));
+        }
+        if !(narrowed.is_finite() && narrowed > 0.0) {
+            return Err(HessboostError::invalid_param(
+                "scale_pos_weight",
+                format!("must stay positive and finite in f32, got {scale_pos_weight}"),
+            ));
+        }
+        Ok(Logistic { scale_pos_weight })
+    }
+
+    /// The positive-class weight.
+    pub fn scale_pos_weight(&self) -> f64 {
+        self.scale_pos_weight
+    }
+}
+
+impl Default for Logistic {
+    /// XGBoost's default weight `1` (positives and negatives weigh the same).
+    fn default() -> Self {
+        Logistic {
+            scale_pos_weight: 1.0,
+        }
+    }
+}
+
+/// The class count of the multiclass objectives (`multi:softmax`,
+/// `multi:softprob`): one model output per class. XGBoost `num_class`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Multiclass {
+    num_class: usize,
+}
+
+impl Multiclass {
+    /// `num_class` classes, labeled `0 .. num_class`.
+    ///
+    /// # Errors
+    ///
+    /// `num_class` is below 2.
+    pub fn new(num_class: usize) -> Result<Self> {
+        if num_class < 2 {
+            return Err(HessboostError::invalid_param(
+                "num_class",
+                "multiclass objectives require num_class >= 2",
+            ));
+        }
+        Ok(Multiclass { num_class })
+    }
+
+    /// The class count.
+    pub fn num_class(&self) -> usize {
+        self.num_class
+    }
+}
+
+/// The LambdaMART ranking objectives' pairing (`rank:pairwise`,
+/// `rank:ndcg`, `rank:map`): XGBoost's `topk` pair method pairs each of the
+/// top `num_pair_per_sample` documents of a query with every lower-ranked
+/// one. XGBoost `lambdarank_num_pair_per_sample`, default `32`; the default
+/// evaluation metric is `ndcg@k` / `map@k` with this `k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LambdaRank {
+    num_pair_per_sample: NonZeroUsize,
+}
+
+impl LambdaRank {
+    /// Pair the top `num_pair_per_sample` documents of every query.
+    ///
+    /// # Errors
+    ///
+    /// `num_pair_per_sample` is 0.
+    pub fn new(num_pair_per_sample: usize) -> Result<Self> {
+        NonZeroUsize::new(num_pair_per_sample)
+            .map(|num_pair_per_sample| LambdaRank {
+                num_pair_per_sample,
+            })
+            .ok_or_else(|| {
+                HessboostError::invalid_param("lambdarank_num_pair_per_sample", "must be >= 1")
+            })
+    }
+
+    /// The top-k pair count.
+    pub fn num_pair_per_sample(&self) -> usize {
+        self.num_pair_per_sample.get()
+    }
+}
+
+impl Default for LambdaRank {
+    /// XGBoost's default pair count 32.
+    fn default() -> Self {
+        LambdaRank {
+            num_pair_per_sample: NonZeroUsize::new(32).unwrap_or(NonZeroUsize::MIN),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +427,50 @@ mod tests {
         assert_eq!(
             Quantiles::new([0.1, 0.1, 0.9]).unwrap().alpha(),
             [0.1, 0.1, 0.9]
+        );
+    }
+
+    /// The names model files store are the serde (and XGBoost) spellings,
+    /// and read back to the same variant.
+    #[test]
+    fn stored_enum_names_match_serde_and_read_back() {
+        fn check<T: serde::Serialize + Copy + PartialEq + std::fmt::Debug>(
+            variants: &[T],
+            name: fn(T) -> &'static str,
+            from_name: fn(&str) -> Option<T>,
+        ) {
+            for &v in variants {
+                assert_eq!(serde_json::to_value(v).unwrap(), name(v), "{v:?}");
+                assert_eq!(from_name(name(v)), Some(v));
+            }
+            assert_eq!(from_name("no such variant"), None);
+        }
+        check(
+            &[
+                AftDistribution::Normal,
+                AftDistribution::Logistic,
+                AftDistribution::Extreme,
+            ],
+            AftDistribution::name,
+            AftDistribution::from_name,
+        );
+        check(
+            &[
+                crate::objective::distributional::DistGradient::Fisher,
+                crate::objective::distributional::DistGradient::Hessian,
+                crate::objective::distributional::DistGradient::Natural,
+            ],
+            crate::objective::distributional::DistGradient::name,
+            crate::objective::distributional::DistGradient::from_name,
+        );
+        check(
+            &[
+                crate::objective::distributional::DistSplitDirection::Random,
+                crate::objective::distributional::DistSplitDirection::Cyclic,
+                crate::objective::distributional::DistSplitDirection::All,
+            ],
+            crate::objective::distributional::DistSplitDirection::name,
+            crate::objective::distributional::DistSplitDirection::from_name,
         );
     }
 }

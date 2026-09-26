@@ -50,7 +50,8 @@
 //! - [`training`]: [`train`], [`Trainer`], [`cv`](training::cv),
 //!   [`training::budget`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
-//!   native and XGBoost JSON/UBJSON); [`model::compact`].
+//!   native and XGBoost JSON/UBJSON); [`model::compact`],
+//!   [`model::uncertainty`].
 //! - [`objective`]: the `Objective` trait, the built-in objectives,
 //!   `CustomObjective`, [`objective::distributional`] (`dist:*` objectives).
 //! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
@@ -121,6 +122,14 @@
 //!     per-row distributions
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
 //!     [`objective::distributional`]), scored by `nll` / `crps`.
+//!   - CatBoost's Stochastic Gradient Langevin Boosting and model shrinkage
+//!     ([`langevin`](config::TrainingParams::langevin),
+//!     [`model_shrink_rate`](config::TrainingParams::model_shrink_rate),
+//!     [`posterior_sampling`](config::TrainingParams::posterior_sampling))
+//!     with virtual ensembles: knowledge, data, and total uncertainty from
+//!     one model's exactly rebuilt truncations
+//!     ([`predict_uncertainty`](model::BoostedModel::predict_uncertainty),
+//!     [`model::uncertainty`]);
 //!   - native Metal on macOS 10.15+ (`metal` feature): bit-identical GPU
 //!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~2.5x faster at
 //!     scale) and bit-identical GPU histograms
@@ -132,8 +141,8 @@
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `ordered_target_stats`, `pfn_boost`, `metal`
-//! with `--features metal` on macOS). Run one with
+//! `distributional`, `virtual_ensembles`, `budget`, `ordered_target_stats`,
+//! `pfn_boost`, `metal` with `--features metal` on macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes

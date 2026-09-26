@@ -18,6 +18,16 @@
 //! interaction ranges must start at 0. [`BoostedModel::slice`] cuts a
 //! sub-model out of an iteration range with a step.
 //!
+//! A model trained with per-iteration model shrinkage
+//! ([`model_shrink_rate`](crate::config::TrainingParams::model_shrink_rate),
+//! SGLB) rescales its whole ensemble every iteration, so the first `k`
+//! iterations of it are not a prefix of its trees: `..k` ranges and
+//! [`BoostedModel::slice`]`(..k, 1)` rebuild the model after `k` iterations
+//! exactly, and ranges starting later are refused.
+//! [`BoostedModel::predict_virtual_ensembles`] predicts with several such
+//! truncations at once and decomposes their spread into knowledge and data
+//! uncertainty ([`uncertainty`]).
+//!
 //! # Explanation
 //!
 //! [`predict_contribs`] gives per-feature SHAP contributions (QuadratureTreeSHAP),
@@ -88,7 +98,11 @@
 //! XGBoost saves `booster=dart` as `gbtree` plus a per-tree
 //! `model.weight_drop` array; those weights become the model's DART tree
 //! weights on import, and a model with non-unit tree weights writes them back
-//! as `weight_drop` on export. Other booster kinds (`gblinear`) yield a clear
+//! as `weight_drop` on export. A model trained with model shrinkage instead
+//! exports plain `gbtree` trees with each tree's weight multiplied into its
+//! leaves (as CatBoost bakes its shrinkage), predicting the same margins bit
+//! for bit; the imported model has no shrinkage record, so its iteration
+//! ranges are tree prefixes. Other booster kinds (`gblinear`) yield a clear
 //! [`HessboostError::ModelFormat`]. Numeric and categorical splits both
 //! round-trip in either direction. Export refuses what XGBoost cannot load:
 //! `gblinear` models, linear-leaf trees (`linear_tree`), custom objectives,
@@ -217,8 +231,12 @@ pub mod compact;
 mod native;
 mod sections;
 mod shap;
+mod shrinkage;
 mod ubjson;
+pub mod uncertainty;
 mod xgboost;
+
+pub(crate) use shrinkage::Shrinkage;
 
 use crate::config::{ObjectiveParams, PartialObjectiveParams};
 use crate::data::DMatrix;
@@ -253,7 +271,9 @@ pub enum ImportanceType {
 /// A gradient-boosted tree ensemble.
 ///
 /// Leaf weights already include the learning rate (shrinkage), so a raw margin
-/// prediction for output `k` is simply `base_score[k] + Σ tree_k(x)`. The
+/// prediction for output `k` is `base_score[k] + Σ w_t · tree_t(x)` over the
+/// output's trees, where the contribution weight `w_t` is `1` except for DART
+/// and model-shrinkage models. The
 /// stored `objective` name drives the prediction transform (e.g. the logistic
 /// sigmoid).
 ///
@@ -309,6 +329,10 @@ pub struct BoostedModel {
     /// `gblinear` models, in which case predictions come from the linear model
     /// and the `trees` vector is empty.
     linear: Option<LinearModel>,
+    /// The per-iteration model shrinkage record (`model_shrink_rate`,
+    /// posterior sampling): `Some` exactly when training shrank the model,
+    /// whose tree weights and intercepts it then determines.
+    shrinkage: Option<Shrinkage>,
     /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
     /// never serialized. Reset whenever `trees` changes.
     #[serde(skip)]
@@ -347,6 +371,9 @@ struct UncheckedBoostedModel {
     num_parallel_tree: usize,
     #[serde(deserialize_with = "Option::deserialize")]
     linear: Option<LinearModel>,
+    /// Absent in files written before model shrinkage existed: none.
+    #[serde(default)]
+    shrinkage: Option<Shrinkage>,
 }
 
 impl TryFrom<UncheckedBoostedModel> for BoostedModel {
@@ -378,6 +405,7 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
             tree_weights: m.tree_weights,
             num_parallel_tree: m.num_parallel_tree,
             linear: m.linear,
+            shrinkage: m.shrinkage,
             compact: OnceLock::new(),
         };
         model.validate_structure()?;
@@ -579,6 +607,7 @@ impl BoostedModel {
             tree_weights,
             num_parallel_tree: 1,
             linear: None,
+            shrinkage: None,
             compact: OnceLock::new(),
         }
     }
@@ -944,6 +973,7 @@ impl BoostedModel {
     ) -> Result<AttributionPrologue<'_>> {
         self.validate_prediction_data(data)?;
         let end = self.prefix_trees(iterations, what)?;
+        self.refuse_partial_shrunk_range(&(0..end), what)?;
         let trees = &self.trees[..end];
         if trees.iter().any(|tree| tree.linear_leaves().is_some()) {
             return Err(HessboostError::invalid_param(
@@ -1156,14 +1186,62 @@ impl BoostedModel {
     /// `2..5` iterations 2 to 4. The intercept / dataset `base_margin` is
     /// always included, so an empty range predicts it alone. A `gblinear`
     /// model has no boosting iterations to select and accepts only `..`.
+    ///
+    /// For a model trained with model shrinkage
+    /// ([`TrainingParams::model_shrink_rate`](crate::config::TrainingParams::model_shrink_rate)),
+    /// `..n` is the model after `n` iterations, rebuilt exactly (bit for bit
+    /// the predictions of the same training run stopped after `n` rounds):
+    /// its trees reweighted by the shrinkage applied up to iteration `n` and
+    /// its intercepts shrunk as far. Ranges starting after iteration 0 are
+    /// refused, since the ensemble is rescaled every iteration.
     pub fn predict_margin_range(
         &self,
         data: &DMatrix,
         iterations: impl RangeBounds<usize>,
     ) -> Result<Vec<f32>> {
         self.validate_prediction_data(data)?;
-        let trees = self.iteration_trees(self.resolve_iterations(iterations, "iterations")?);
-        Ok(self.margin_from_trees(data, trees))
+        let iterations = self.resolve_iterations(iterations, "iterations")?;
+        if let Some(shrinkage) = &self.shrinkage {
+            // Every later iteration rescaled the earlier ones, so the
+            // iterations `a..b` alone are no model.
+            if iterations.start != 0 {
+                return Err(HessboostError::invalid_param(
+                    "iterations",
+                    format!(
+                        "a model trained with model shrinkage rescales its earlier iterations \
+                         every iteration, so {}..{} has no meaning; use a range starting at 0",
+                        iterations.start, iterations.end
+                    ),
+                ));
+            }
+            if iterations.end < self.num_boost_rounds() {
+                let (weights, base) = shrinkage.scaling(iterations.end, self.trees_per_iteration());
+                let mut out = initial_margins(&base, data);
+                self.accumulate_forest(data, &mut out, 0..weights.len(), |t| weights[t]);
+                return Ok(out);
+            }
+        }
+        Ok(self.margin_from_trees(data, self.iteration_trees(iterations)))
+    }
+
+    /// Refuse anything but the whole ensemble of a shrunk model, for the
+    /// predictions (`what`) that read the stored tree weights directly;
+    /// [`Self::slice`]`(..k, 1)` builds the model after `k` iterations.
+    pub(crate) fn refuse_partial_shrunk_range(
+        &self,
+        trees: &Range<usize>,
+        what: &str,
+    ) -> Result<()> {
+        if self.shrinkage.is_none() || (trees.start == 0 && trees.end == self.trees.len()) {
+            return Ok(());
+        }
+        Err(HessboostError::invalid_param(
+            "iterations",
+            format!(
+                "{what} of a model trained with model shrinkage covers the whole ensemble \
+                 only; `slice(..k, 1)` builds the model after `k` iterations"
+            ),
+        ))
     }
 
     /// Predictions in the objective's reported space. `multi:softprob` returns
@@ -1234,6 +1312,11 @@ impl BoostedModel {
     /// no refit happens. As in XGBoost the slice drops `best_iteration`, so
     /// it predicts with all of its iterations.
     ///
+    /// A model trained with model shrinkage slices to prefixes only
+    /// (`..k` with step 1): the result is the model after `k` iterations,
+    /// bit for bit the model the same training run stopped after `k` rounds
+    /// returns (see [`Self::predict_margin_range`]).
+    ///
     /// `step` must be at least 1 and the range non-empty and within
     /// [`Self::num_boost_rounds`]. XGBoost 3.4.2 additionally trips an
     /// internal check when `end - begin` is not a multiple of `step`; here
@@ -1259,6 +1342,15 @@ impl BoostedModel {
                 format!("empty slice {begin}..{end} is not allowed"),
             ));
         }
+        if let Some(shrinkage) = &self.shrinkage {
+            if begin != 0 || step != 1 {
+                return Err(HessboostError::invalid_param(
+                    "slice",
+                    "a model trained with model shrinkage slices to prefixes only (`..k`, step 1)",
+                ));
+            }
+            return Ok(self.shrunk_prefix(shrinkage, end));
+        }
         let per = self.trees_per_iteration();
         let mut trees = Vec::with_capacity((end - begin).div_ceil(step) * per);
         let mut tree_weights = Vec::new();
@@ -1282,8 +1374,60 @@ impl BoostedModel {
             tree_weights,
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
+            shrinkage: None,
             compact: OnceLock::new(),
         })
+    }
+
+    /// The model after the first `k` iterations of this shrunk model:
+    /// their trees, reweighted by the record's first `k` coefficients, and
+    /// the intercepts shrunk as far ([`Shrinkage::scaling`]).
+    fn shrunk_prefix(&self, shrinkage: &Shrinkage, k: usize) -> BoostedModel {
+        let per = self.trees_per_iteration();
+        let (tree_weights, base_score) = shrinkage.scaling(k, per);
+        BoostedModel {
+            trees: self.trees[..k * per].to_vec(),
+            base_score,
+            objective: self.objective.clone(),
+            objective_params: self.objective_params.clone(),
+            num_class: self.num_class,
+            n_outputs: self.n_outputs,
+            n_targets: self.n_targets,
+            n_features: self.n_features,
+            best_iteration: None,
+            tree_weights,
+            num_parallel_tree: self.num_parallel_tree,
+            linear: None,
+            shrinkage: Some(shrinkage.truncated(k)),
+            compact: OnceLock::new(),
+        }
+    }
+
+    /// Record the shrinkage training applied (one coefficient per
+    /// iteration, and the intercepts before it) and derive the tree weights
+    /// and intercepts of the full model from it.
+    pub(crate) fn set_shrinkage(&mut self, shrinkage: Shrinkage) {
+        let (tree_weights, base_score) =
+            shrinkage.scaling(self.num_boost_rounds(), self.trees_per_iteration());
+        self.tree_weights = tree_weights;
+        self.base_score = base_score;
+        self.shrinkage = Some(shrinkage);
+    }
+
+    /// Cut a shrunk model back to its first `k` iterations (early stopping's
+    /// best model, as CatBoost's `use_best_model` does); a no-op otherwise.
+    pub(crate) fn truncate_shrunk(&mut self, k: usize) {
+        if let Some(shrinkage) = &self.shrinkage
+            && k < self.num_boost_rounds()
+        {
+            *self = self.shrunk_prefix(shrinkage, k);
+        }
+    }
+
+    /// The per-iteration shrinkage record, if the model was trained with
+    /// model shrinkage.
+    pub(crate) fn shrinkage(&self) -> Option<&Shrinkage> {
+        self.shrinkage.as_ref()
     }
 
     /// The iteration range the attribution predictions use by default (the
@@ -1470,6 +1614,41 @@ impl BoostedModel {
                     "linear model parameters must be finite",
                 ));
             }
+        }
+        self.validate_shrinkage()
+    }
+
+    /// A shrinkage record must describe a tree model's iterations and
+    /// agree bit for bit with the tree weights and intercepts it derives,
+    /// and early stopping of a shrunk model keeps only the best iterations,
+    /// so a `best_iteration` can only name the last one.
+    fn validate_shrinkage(&self) -> Result<()> {
+        let Some(shrinkage) = &self.shrinkage else {
+            return Ok(());
+        };
+        if self.linear.is_some() {
+            return Err(HessboostError::model_format(
+                "gblinear models cannot carry a shrinkage record",
+            ));
+        }
+        let rounds = self.num_boost_rounds();
+        shrinkage.validate(rounds, self.n_outputs)?;
+        if self.best_iteration.is_some_and(|best| best + 1 != rounds) {
+            return Err(HessboostError::model_format(
+                "a shrunk model's best_iteration must be its last iteration",
+            ));
+        }
+        let (weights, base) = shrinkage.scaling(rounds, self.trees_per_iteration());
+        let same = |a: f32, b: f32| a.to_bits() == b.to_bits();
+        if !(weights
+            .iter()
+            .enumerate()
+            .all(|(t, &w)| same(w, self.tree_weight(t)))
+            && base.iter().zip(&self.base_score).all(|(&a, &b)| same(a, b)))
+        {
+            return Err(HessboostError::model_format(
+                "the tree weights and intercepts do not match the shrinkage record",
+            ));
         }
         Ok(())
     }

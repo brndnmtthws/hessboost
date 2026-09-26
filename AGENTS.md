@@ -78,15 +78,15 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |Path|Non-obvious contents|
 |---|---|
 |`lib.rs`|crate docs ("What's here", "Not implemented"), `prelude`, hidden `internals`|
-|`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams|
+|`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams (`stream_key`, `keyed_normal`)|
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, parameter enums, `ObjectiveParams`|
 |`objective/`|files by XGBoost family; `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`)|
 |`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
-|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv`, `budget` (public)|
+|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; exact truncations), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -110,7 +110,8 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   blocks. Sequential draws (rows, columns, DART, folds, target-stat
   permutations) use `rng::Rng`. Keyed draws (`extra_trees` node seeds,
   `dist:*` split direction, quantized stochastic rounding, per-block
-  row-sampling seeds) use SplitMix64 streams keyed by seed and index.
+  row-sampling seeds, Langevin noise) use SplitMix64 streams keyed by seed
+  and index.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
 - **Metal:** `device = metal` reproduces the single-threaded CPU model bit
   for bit: gradients are staged as integer multiples of a per-component
@@ -173,7 +174,8 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
     (0) except in multi-output models, and `leaf_vectors`; an absent
-    `best_iteration` means none. Writers emit every field.
+    `best_iteration` means none, and an absent `shrinkage` means no model
+    shrinkage. Writers emit every field.
   - Compact (`HBTD`, `model/compact.rs`): section-table metadata; a bit
     stream change bumps its version byte (1).
 - **Tree layout:** iteration `i` owns trees `i * trees_per_iteration ..`.
@@ -181,7 +183,12 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   output; tree `t` feeds output `(t / num_parallel_tree) % n_outputs`.
   Vector leaves: `num_parallel_tree` per iteration, each feeding all
   outputs. Counts, `best_iteration`, slicing, and ranges are in iterations,
-  never trees.
+  never trees. Tree weights are DART's or model shrinkage's: a shrunk
+  model stores unscaled trees, per-iteration coefficients, and the
+  unshrunk intercepts (`model/shrinkage.rs`), from which its tree weights
+  and intercepts derive bit for bit; its `..k` ranges and `slice(..k, 1)`
+  rebuild the `k`-round model exactly, later starts are refused, and
+  early stopping truncates it to the best iteration.
 - **Prediction layout:** single-output and `multi:softmax` give `n_rows`
   values; `multi:softprob` `n_rows * num_class`; other multi-output models
   `n_rows * n_outputs`, row-major. Multi-target `predict_class` thresholds
@@ -210,7 +217,9 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   ignored. Checks live in `TrainingParams::validate` (static),
   `validate_request` in `training/train.rs` (data-dependent),
   `training/multi_output.rs::validate`, `training/continuation.rs`,
-  `metric/mod.rs::build` (metric suffixes), and `training/budget.rs`.
+  `metric/mod.rs::build` (metric suffixes), and `training/budget.rs`; SGLB
+  and model shrinkage in `TrainingParams::validate_sglb` (static) and
+  `training/sglb.rs::Sglb::resolve` (posterior sampling's row count).
   Budget mode and refresh compare params against defaults plus an
   allow-list (`TrainingParams::refuse_changes_from`), so any new field is
   refused there automatically.
@@ -224,7 +233,7 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   aliases.
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
-  `objective::distributional`, `conformal`).
+  `objective::distributional`, `conformal`, `model::uncertainty`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.

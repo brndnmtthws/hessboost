@@ -138,7 +138,25 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     let n_trees = model.effective_num_trees();
     let per_iteration = model.trees_per_iteration();
 
-    let trees: Vec<Value> = model.trees()[..n_trees]
+    // A shrunk model's contribution weights go into its leaves (as CatBoost
+    // bakes its shrinkage), so XGBoost reads plain gbtree trees; the `f32`
+    // product is the one prediction forms, so margins stay bit-identical.
+    let baked: Vec<RegTree>;
+    let exported = if model.shrinkage().is_some() {
+        baked = model.trees()[..n_trees]
+            .iter()
+            .enumerate()
+            .map(|(t, tree)| {
+                let mut tree = tree.clone();
+                tree.scale_leaves(model.tree_weight(t));
+                tree
+            })
+            .collect();
+        &baked[..]
+    } else {
+        &model.trees()[..n_trees]
+    };
+    let trees: Vec<Value> = exported
         .iter()
         .enumerate()
         .map(|(id, t)| tree_to_json(id, t, num_feature))
@@ -166,7 +184,7 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     });
     // DART: XGBoost 3.4.1 keeps the booster name `gbtree` and stores the
     // per-tree weights alongside the trees.
-    if model.has_non_unit_tree_weights() {
+    if model.shrinkage().is_none() && model.has_non_unit_tree_weights() {
         let weight_drop: Vec<Value> = (0..n_trees).map(|t| json!(model.tree_weight(t))).collect();
         booster_model["weight_drop"] = Value::Array(weight_drop);
     }

@@ -77,31 +77,37 @@ fn dataset(n: usize, cols: usize) -> DMatrix {
 }
 
 /// `device = metal` training reproduces single-threaded CPU training bit for
-/// bit, tree for tree (the whole serialized model compares equal).
+/// bit, tree for tree (the whole serialized model compares equal), SGLB
+/// posterior sampling included (its noise is drawn on the CPU and its
+/// leaves re-estimated there).
 #[test]
 fn device_metal_training_matches_single_threaded_cpu() {
     if !device() {
         return;
     }
     let data = dataset(40_000, 12);
-    let build = |device| {
-        TrainingParams::builder()
-            .objective("reg:squarederror")
-            .tree_method(TreeMethod::Hist)
-            .max_depth(6)
-            .eta(0.3)
-            .device(device)
-            .build()
-            .unwrap()
-    };
-    let train_one = |params| common::with_threads(1, || train(&params, &data, 10).unwrap());
-    let cpu = train_one(build(Device::Cpu));
-    let gpu = train_one(build(Device::Metal));
-    assert_eq!(
-        cpu.to_bytes().unwrap(),
-        gpu.to_bytes().unwrap(),
-        "the metal-trained model must be bit-identical to the CPU's"
-    );
+    for posterior_sampling in [false, true] {
+        let build = |device| {
+            TrainingParams::builder()
+                .objective("reg:squarederror")
+                .tree_method(TreeMethod::Hist)
+                .max_depth(6)
+                .eta(0.3)
+                .posterior_sampling(posterior_sampling)
+                .device(device)
+                .build()
+                .unwrap()
+        };
+        let train_one = |params| common::with_threads(1, || train(&params, &data, 10).unwrap());
+        let cpu = train_one(build(Device::Cpu));
+        let gpu = train_one(build(Device::Metal));
+        assert_eq!(
+            cpu.to_bytes().unwrap(),
+            gpu.to_bytes().unwrap(),
+            "the metal-trained model must be bit-identical to the CPU's \
+             (posterior sampling {posterior_sampling})"
+        );
+    }
 }
 
 /// A `device = metal` run repeats itself exactly, independent of the worker

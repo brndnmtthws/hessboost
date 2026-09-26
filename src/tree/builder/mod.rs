@@ -1178,7 +1178,7 @@ pub(super) const BELOW_ALL_VALUES: f32 = f32::MIN;
 /// XGBoost's `CalcWeight` in `f64`: `−Tα(G)/(H+λ)`, `0` without positive
 /// Hessian, clamped to `max_delta_step` when set.
 #[inline]
-pub(super) fn xgb_calc_weight(stats: GradStats, reg: &RegParams) -> f64 {
+pub(crate) fn xgb_calc_weight(stats: GradStats, reg: &RegParams) -> f64 {
     if stats.hess <= 0.0 {
         return 0.0;
     }

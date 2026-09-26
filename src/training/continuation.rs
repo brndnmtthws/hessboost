@@ -44,6 +44,20 @@ pub(super) fn resume_model(
         };
         HessboostError::model_format(format!("invalid init model: {reason}"))
     })?;
+    // CatBoost refuses model shrinkage with learning continuation
+    // (`AdjustPosteriorSamplingDeafultValues`, `DropModelShrinkageIfBaselineUsed`
+    // in `catboost/libs/train_lib/options_helper.cpp`): the continued run's
+    // coefficients would rescale a model whose margins it did not cache.
+    if init.shrinkage().is_some() || params.model_shrinkage_on() {
+        return Err(HessboostError::invalid_param(
+            "model_shrink_rate",
+            if init.shrinkage().is_some() {
+                "a model trained with model shrinkage cannot be trained further"
+            } else {
+                "model shrinkage is not supported with continued training"
+            },
+        ));
+    }
     let is_linear = init.linear().is_some();
     if is_linear != (params.booster == BoosterKind::GbLinear) {
         return Err(HessboostError::invalid_param(

@@ -116,6 +116,7 @@
 //! # }
 //! ```
 
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use super::train::{RoundEval, Trainer, validate_training_data};
@@ -279,6 +280,10 @@ impl OnlineModel {
             || categorical
             || model.linear().is_some()
             || model.trees().iter().any(|t| t.linear_leaves().is_some())
+            || model
+                .trees()
+                .iter()
+                .any(|t| splits_below(t, params.max_depth))
             || (0..model.num_trees()).any(|t| model.tree_weight(t) != 1.0)
         {
             return Err(HessboostError::invalid_param(
@@ -501,12 +506,12 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         return refuse("tree_method", "tree_method = hist");
     }
     if params.grow_policy != GrowPolicy::DepthWise
-        || params.max_leaves != 0
-        || params.max_depth == 0
+        || params.max_leaves.is_some()
+        || params.max_depth.is_none()
     {
         return refuse(
             "grow_policy",
-            "depth-wise growth with max_depth > 0 and no max_leaves (a node's subtree must \
+            "depth-wise growth with a max_depth and no max_leaves (a node's subtree must \
              depend on its rows only)",
         );
     }
@@ -1023,8 +1028,13 @@ impl TreeUpdate<'_> {
                 .filter(|&i| tree.leaf_id_with(|f| new.get(i, f as usize)) == new_id)
                 .map(|i| i as u32)
                 .collect();
+            // A split node lies above `max_depth` (`check_supported` requires
+            // one, `from_model` refuses deeper trees), so its subtree keeps at
+            // least one level.
             let sub_params = TrainingParams {
-                max_depth: params.max_depth - depth,
+                max_depth: params
+                    .max_depth
+                    .and_then(|limit| NonZeroUsize::new(limit.get().saturating_sub(depth))),
                 ..params.clone()
             };
             let mut sampler = ColumnSampler::new(new.n_cols(), None, 1.0, 1.0, 1.0, params.seed);
@@ -1045,6 +1055,27 @@ impl TreeUpdate<'_> {
         }
         (tree, nodes, regrown_rows)
     }
+}
+
+/// Whether `tree` splits a node at depth `max_depth` or deeper (`None`: no
+/// limit), which depth-wise training to that depth never does.
+fn splits_below(tree: &RegTree, max_depth: Option<NonZeroUsize>) -> bool {
+    let Some(limit) = max_depth else {
+        return false;
+    };
+    let mut stack = vec![(0usize, 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        let node = tree.node(id);
+        if node.is_leaf() {
+            continue;
+        }
+        if depth >= limit.get() {
+            return true;
+        }
+        stack.push((node.left as usize, depth + 1));
+        stack.push((node.right as usize, depth + 1));
+    }
+    false
 }
 
 /// Reset the caches of `root`'s subtree in `tree`.

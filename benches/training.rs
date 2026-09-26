@@ -747,7 +747,7 @@ fn bench_other_gradients(c: &mut Criterion) {
         .unwrap()
         .with_group_sizes(&group_sizes(n, 100))
         .unwrap();
-    for name in ["rank:ndcg", "rank:map", "rank:pairwise"] {
+    for name in ["rank:ndcg", "rank:map", "rank:pairwise", "rank:xendcg"] {
         let id = format!("{}_100k_groups100", name.replace(':', "_"));
         run(
             &id,

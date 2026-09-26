@@ -33,8 +33,8 @@ and `λ` is the L2 penalty `lambda`.
 - **Stable model files.** Anything saved by 0.2.0 or later loads in every
   later release.
 - **More than XGBoost, opt-in.** Conformal intervals, distributional
-  boosting, budget training, compact models, and more — all off by default,
-  none of them changes default training.
+  boosting, budget training, compact models, XE-NDCG ranking, and more — all
+  off by default; none changes default training.
 
 ## Getting started
 
@@ -94,7 +94,7 @@ runnable programs live in [`examples/`](examples)
 | `train_regression` | end-to-end regression with feature importance |
 | `binary_classification` | a watched eval set, early stopping, AUC |
 | `multiclass` | per-class probabilities and predicted classes |
-| `ranking` | LambdaMART over query groups |
+| `ranking` / `rank_xendcg` | LambdaMART and XE-NDCG with query bagging |
 | `constraints` | monotone and interaction constraints, categorical features |
 | `custom_objective` | a custom loss and eval metric |
 | `shap` | SHAP contributions and interaction values |
@@ -133,7 +133,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
-| LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), and symmetric trees |
+| LightGBM and CatBoost options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), symmetric trees, query-level ranking bagging (`bagging_by_query`), and XE-NDCG ranking (`rank:xendcg`) |
 | Quantized-gradient training | up to 1.85× faster tree building on large data (`use_quantized_grad`) |
 | [Ordered target statistics](https://docs.rs/hessboost/latest/hessboost/data/target_stats/) | CatBoost-style ordered target encoding of high-cardinality categoricals |
 | Boosting from a pretrained model | start from TabPFN or LLM logits through `base_margin` (PFN-Boost, LLM-Boost) |
@@ -143,6 +143,9 @@ Beyond XGBoost (opt-in, none changes default training):
 
 - Randomized training (sampling, forests, DART) matches XGBoost's quality,
   not its trees: the random streams differ.
+- `rank:xendcg` uses stateless keyed SplitMix64 draws per seed, iteration,
+  query, and document, so its random values and trained trees differ from
+  LightGBM's `rank_xendcg` RNG.
 - gblinear, custom-objective, `dist:*`, and linear-leaf models have no
   XGBoost encoding — native formats only.
 - 0.1.x native model files are refused.

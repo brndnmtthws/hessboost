@@ -17,7 +17,7 @@ use std::ops::ControlFlow;
 use super::train::{
     MarginCaches, Prepared, TrainContext, TreeSample, make_column_sampler, sample_rows,
 };
-use crate::config::{BoosterKind, TrainingParams};
+use crate::config::{BoosterKind, Boulevard, TrainingParams};
 use crate::data::DMatrix;
 use crate::error::Result;
 use crate::inference::BoulevardInfo;
@@ -33,6 +33,15 @@ const ROW_CHUNK: usize = 4096;
 
 /// The Boulevard round RNG's salt (gbtree uses `0`, DART `0x0DA27`).
 pub(crate) const BOULEVARD_SALT: u64 = 0xB0_07E7;
+
+/// The `booster = boulevard` settings of `params` (the defaults for any
+/// other booster, which never reaches the recursion).
+fn settings(params: &TrainingParams) -> Boulevard {
+    match params.booster {
+        BoosterKind::Boulevard(boulevard) => boulevard,
+        _ => Boulevard::default(),
+    }
+}
 
 /// The Boulevard settings that shape the recursion.
 #[derive(Debug, Clone, Copy)]
@@ -55,9 +64,9 @@ impl Schedule {
     /// The schedule of training with `params`.
     pub(crate) fn from_params(params: &TrainingParams) -> Self {
         Schedule {
-            dropout: params.boulevard_dropout,
+            dropout: settings(params).dropout(),
             learning_rate: params.eta,
-            truncation: params.boulevard_truncation,
+            truncation: settings(params).truncation(),
             parallel: params.num_parallel_tree,
             seed: params.seed,
             salt: BOULEVARD_SALT,
@@ -302,7 +311,7 @@ pub(super) fn boost(
         info,
         objective,
     } = *run;
-    debug_assert_eq!(params.booster, BoosterKind::Boulevard);
+    debug_assert!(matches!(params.booster, BoosterKind::Boulevard(_)));
     let BoostState {
         model,
         margins,
@@ -381,11 +390,11 @@ pub(super) fn boost(
     }
     model.scale_all_leaves(recursion.scale() as f32);
     model.set_boulevard(Some(BoulevardInfo {
-        dropout: params.boulevard_dropout,
+        dropout: settings(params).dropout(),
         learning_rate: params.eta,
         subsample: params.subsample,
         reg_lambda: params.lambda,
-        truncation: params.boulevard_truncation,
+        truncation: settings(params).truncation(),
         seed: params.seed,
         intercept_from_labels: params.base_score.is_none(),
     }));

@@ -4,8 +4,8 @@
 //! and the training fuzz target all go through it.
 
 use super::groups::{
-    BalancedBagging, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
-    QuantizedGrad, QueryBagging, Refresh,
+    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
@@ -47,6 +47,7 @@ enum FlatBooster {
     GbTree,
     Dart,
     GbLinear,
+    Boulevard,
 }
 
 /// XGBoost's `process_type` names.
@@ -354,6 +355,18 @@ impl Flat {
                 "`booster=dart`",
             ),
             (
+                "boulevard_dropout",
+                boulevard_dropout.is_some(),
+                booster == Some(FlatBooster::Boulevard),
+                "`booster=boulevard`",
+            ),
+            (
+                "boulevard_truncation",
+                boulevard_truncation.is_some(),
+                booster == Some(FlatBooster::Boulevard),
+                "`booster=boulevard`",
+            ),
+            (
                 "refresh_leaf",
                 refresh_leaf.is_some(),
                 process_type == Some(FlatProcess::Update),
@@ -425,6 +438,16 @@ impl Flat {
                     dart = dart.one_drop(one_drop);
                 }
                 BoosterKind::Dart(dart.build()?)
+            }
+            FlatBooster::Boulevard => {
+                let mut boulevard = Boulevard::builder();
+                if let Some(dropout) = boulevard_dropout {
+                    boulevard = boulevard.dropout(dropout);
+                }
+                if let Some(truncation) = boulevard_truncation {
+                    boulevard = boulevard.truncation(truncation);
+                }
+                BoosterKind::Boulevard(boulevard.build()?)
             }
         };
         let process_type = match process_type.unwrap_or(FlatProcess::Default) {
@@ -554,8 +577,6 @@ impl Flat {
             langevin,
             model_shrink,
             posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
-            boulevard_dropout: boulevard_dropout.unwrap_or(d.boulevard_dropout),
-            boulevard_truncation: boulevard_truncation.unwrap_or(d.boulevard_truncation),
         })
     }
 }
@@ -896,8 +917,6 @@ impl TrainingParams {
             langevin,
             model_shrink,
             posterior_sampling,
-            boulevard_dropout,
-            boulevard_truncation,
         } = self;
         if let Objective::Custom(loss) = objective {
             return Err(HessboostError::invalid_param(
@@ -947,6 +966,11 @@ impl TrainingParams {
                 set("rate_drop", json(dart.rate_drop()));
                 set("skip_drop", json(dart.skip_drop()));
                 set("one_drop", json(dart.one_drop()));
+            }
+            BoosterKind::Boulevard(boulevard) => {
+                set("booster", json("boulevard"));
+                set("boulevard_dropout", json(boulevard.dropout()));
+                set("boulevard_truncation", json(boulevard.truncation()));
             }
         }
         set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));
@@ -1030,8 +1054,6 @@ impl TrainingParams {
             set("model_shrink_mode", json(shrink.mode()));
         }
         set("posterior_sampling", json(posterior_sampling));
-        set("boulevard_dropout", json(boulevard_dropout));
-        set("boulevard_truncation", json(boulevard_truncation));
         Ok(flat)
     }
 
@@ -1078,8 +1100,6 @@ impl TrainingParams {
             langevin,
             model_shrink,
             posterior_sampling,
-            boulevard_dropout,
-            boulevard_truncation,
         } = self;
         let mut changed = Vec::new();
         let mut differs = |key: &'static str, same: bool| {
@@ -1167,14 +1187,6 @@ impl TrainingParams {
         differs(
             "posterior_sampling",
             *posterior_sampling == other.posterior_sampling,
-        );
-        differs(
-            "boulevard_dropout",
-            *boulevard_dropout == other.boulevard_dropout,
-        );
-        differs(
-            "boulevard_truncation",
-            *boulevard_truncation == other.boulevard_truncation,
         );
         changed.sort_unstable();
         changed

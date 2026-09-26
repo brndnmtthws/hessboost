@@ -60,7 +60,7 @@ pub(super) fn resume_model(
     // `1/B` of the run), so appending or refreshing rounds, with any
     // booster, would not give a Boulevard average; nor can Boulevard
     // continue another model's sum.
-    if params.booster == BoosterKind::Boulevard || init.boulevard().is_some() {
+    if matches!(params.booster, BoosterKind::Boulevard(_)) || init.boulevard().is_some() {
         return Err(HessboostError::invalid_param(
             "init_model",
             "Boulevard models average every round of one run and cannot be trained further, \

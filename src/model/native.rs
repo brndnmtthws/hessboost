@@ -947,7 +947,9 @@ mod tests {
     fn boulevard_sections_are_optional_for_older_readers() {
         let (_, data) = model();
         let params = TrainingParams::builder()
-            .booster(crate::config::BoosterKind::Boulevard)
+            .booster(crate::config::BoosterKind::Boulevard(
+                crate::config::Boulevard::default(),
+            ))
             .max_depth(2)
             .build()
             .unwrap();

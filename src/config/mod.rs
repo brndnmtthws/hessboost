@@ -5,7 +5,7 @@ mod params;
 mod xgboost;
 
 pub use groups::{
-    BalancedBagging, Dart, DartBuilder, ExtraTrees, Langevin, LangevinBuilder, LinearTree,
+    BalancedBagging, Boulevard, BoulevardBuilder, Dart, DartBuilder, ExtraTrees, Langevin, LangevinBuilder, LinearTree,
     ModelShrink, ModelShrinkBuilder, ModelShrinkMode, QuantizedGrad, QuantizedGradBuilder,
     QueryBagging, Refresh,
 };

@@ -785,7 +785,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
     let unshrunk_base = state.model.base_scores().to_vec();
     let mut shrink_factors = Vec::new();
 
-    if params.booster == BoosterKind::Boulevard {
+    if matches!(params.booster, BoosterKind::Boulevard(_)) {
         // `validate` refuses `process_type = update` for Boulevard, and
         // `validate_request` early stopping, so every round grows trees
         // and the history is the whole run's.
@@ -1056,7 +1056,7 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     if matches!(params.process_type, ProcessType::Update(_)) {
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
-    if params.booster == BoosterKind::Boulevard {
+    if matches!(params.booster, BoosterKind::Boulevard(_)) {
         validate_boulevard_request(request, objective)?;
     }
 

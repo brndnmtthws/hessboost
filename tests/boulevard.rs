@@ -1,6 +1,6 @@
 //! `booster = boulevard` and its statistical inference ([`hessboost::inference`]).
 
-use hessboost::config::{BoosterKind, TrainingParams, TrainingParamsBuilder};
+use hessboost::config::{BoosterKind, Boulevard, TrainingParams, TrainingParamsBuilder};
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::objective::Objective;
 use hessboost::prelude::*;
@@ -21,11 +21,14 @@ fn data(n: usize, seed: u64) -> DMatrix {
     labeled_dense(&x, 2, &y)
 }
 
+fn boulevard(dropout: f64) -> BoosterKind {
+    BoosterKind::Boulevard(Boulevard::builder().dropout(dropout).build().unwrap())
+}
+
 fn builder() -> TrainingParamsBuilder {
     TrainingParams::builder()
-        .booster(BoosterKind::Boulevard)
+        .booster(boulevard(0.5))
         .eta(0.8)
-        .boulevard_dropout(0.5)
         .subsample(0.8)
         .max_depth(4)
         .min_child_weight(5.0)
@@ -67,7 +70,7 @@ fn nystrom_on_every_row_reproduces_the_exact_solver() {
         let mut b = builder();
         if parallel > 1 {
             b = b
-                .boulevard_dropout(0.0)
+                .booster(boulevard(0.0))
                 .eta(1.0)
                 .num_parallel_tree(parallel);
         }
@@ -186,11 +189,20 @@ fn settings_that_break_the_linear_smoother_are_refused() {
     assert_eq!(refused(builder().eta(1.5)), "eta");
     assert_eq!(refused(builder().num_parallel_tree(2)), "boulevard_dropout");
     assert_eq!(
-        refused(builder().boulevard_dropout(0.0).num_parallel_tree(2)),
+        refused(builder().booster(boulevard(0.0)).num_parallel_tree(2)),
         "eta"
     );
+    // A dropout of 1 keeps no tree; flat keys need their booster.
     assert_eq!(
-        refused(TrainingParams::builder().boulevard_dropout(0.2)),
+        invalid_param(Boulevard::builder().dropout(1.0).build()),
+        "boulevard_dropout"
+    );
+    let flat = serde_json::json!({"booster": "gbtree", "boulevard_dropout": 0.2});
+    let serde_json::Value::Object(flat) = flat else {
+        unreachable!()
+    };
+    assert_eq!(
+        invalid_param(TrainingParams::from_xgboost(flat)),
         "boulevard_dropout"
     );
     let dtrain = data(100, 12);

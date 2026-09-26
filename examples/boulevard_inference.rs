@@ -9,7 +9,7 @@
 //!
 //! Run with: `cargo run --release --example boulevard_inference`
 
-use hessboost::config::{BoosterKind, TrainingParams};
+use hessboost::config::{BoosterKind, Boulevard, TrainingParams};
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::prelude::*;
 
@@ -45,9 +45,10 @@ fn matrix(x: &[f32], y: &[f32], cols: usize) -> Result<DMatrix> {
 
 fn params() -> Result<TrainingParams> {
     TrainingParams::builder()
-        .booster(BoosterKind::Boulevard)
+        .booster(BoosterKind::Boulevard(
+            Boulevard::builder().dropout(0.6).build()?,
+        ))
         .eta(0.6)
-        .boulevard_dropout(0.6)
         .subsample(0.6)
         .max_depth(8)
         .min_child_weight(5.0)

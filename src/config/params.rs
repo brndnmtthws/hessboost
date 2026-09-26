@@ -6,7 +6,7 @@
 //! name and document the alias.
 
 use super::groups::{
-    BalancedBagging, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
+    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
     QuantizedGrad, QueryBagging, Refresh,
 };
 use crate::error::{HessboostError, Result};
@@ -91,11 +91,11 @@ pub enum BoosterKind {
     /// ensemble converges to a kernel ridge regression with a central limit
     /// theorem. `num_parallel_tree = 1` runs BRAT-D (Fang, Tan & Hooker,
     /// NeurIPS 2025, Algorithm 1; Zhou & Hooker's Boulevard at
-    /// [`boulevard_dropout`](TrainingParams::boulevard_dropout) `= 0`), more
+    /// [`Boulevard::dropout`] `= 0`), more
     /// trees per iteration BRAT-P (Algorithm 2). Squared-error regression
     /// only; see [`crate::inference`] for the trained model's confidence and
     /// prediction intervals and the settings it refuses.
-    Boulevard,
+    Boulevard(Boulevard),
 }
 
 /// Tree construction algorithm.
@@ -397,22 +397,6 @@ pub struct TrainingParams {
     /// and a tree booster.
     pub quantized: Option<QuantizedGrad>,
 
-    // ---- Boulevard (beyond XGBoost, opt-in) ----
-    /// Dropout probability `p` in `[0, 1)` of `booster = boulevard` with one
-    /// tree per iteration (BRAT-D): each earlier tree is left out of a
-    /// round's residuals independently with probability `p`, and the kept
-    /// ones are still divided by the full tree count, so each new tree fits
-    /// more of the signal. `0` (the default) is Zhou & Hooker's Boulevard.
-    /// Must be `0` with any other booster and with `num_parallel_tree > 1`
-    /// (BRAT-P, which leaves one tree per round out instead).
-    pub boulevard_dropout: f64,
-    /// Truncation level `M > 0` of `booster = boulevard`: the ensemble part
-    /// subtracted from the labels in a round's residuals is clipped to
-    /// `[-M, M]` (the `Γ_M` of Fang, Tan & Hooker's convergence proof; on the
-    /// label scale, after the intercept). `0` (the default) disables it. Must
-    /// be `0` with any other booster.
-    pub boulevard_truncation: f64,
-
     // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
     /// Penalty `ι` subtracted from the loss change of a split on a feature the
     /// ensemble does not use yet (Herrmann et al., *Boosted Trees on a Diet*,
@@ -507,8 +491,6 @@ impl Default for TrainingParams {
             path_smooth: 0.0,
             linear_tree: None,
             quantized: None,
-            boulevard_dropout: 0.0,
-            boulevard_truncation: 0.0,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
             langevin: None,
@@ -1139,25 +1121,10 @@ impl TrainingParams {
     /// `min_child_weight`, `gamma`, column sampling, `extra_trees`,
     /// interaction constraints, categorical splits) are accepted.
     fn validate_boulevard(&self) -> Result<()> {
-        let dropout = self.boulevard_dropout;
-        ensure(
-            "boulevard_dropout",
-            dropout.is_finite() && (0.0..1.0).contains(&dropout),
-            format!("must be in [0, 1), got {dropout}"),
-        )?;
-        non_negative("boulevard_truncation", self.boulevard_truncation)?;
-        if self.booster != BoosterKind::Boulevard {
-            ensure(
-                "boulevard_dropout",
-                dropout == 0.0,
-                "is only used by `booster = boulevard`; must be 0",
-            )?;
-            return ensure(
-                "boulevard_truncation",
-                self.boulevard_truncation == 0.0,
-                "is only used by `booster = boulevard`; must be 0",
-            );
-        }
+        let BoosterKind::Boulevard(boulevard) = self.booster else {
+            return Ok(());
+        };
+        let dropout = boulevard.dropout();
         ensure(
             "objective",
             matches!(self.objective, Objective::SquaredError),
@@ -1212,12 +1179,12 @@ impl TrainingParams {
         )?;
         ensure(
             "use_quantized_grad",
-            !self.use_quantized_grad,
+            self.quantized.is_none(),
             format!("quantized gradients {nonlinear}"),
         )?;
         ensure(
             "linear_tree",
-            !self.linear_tree,
+            self.linear_tree.is_none(),
             "linear leaves are not constant smoothers; Boulevard needs constant leaves",
         )?;
         ensure(
@@ -1415,10 +1382,6 @@ impl TrainingParamsBuilder {
         grow_policy, GrowPolicy);
     setter!(/// Set the maximum histogram bins per feature.
         max_bin, usize);
-    setter!(/// Set Boulevard's BRAT-D dropout probability (`boulevard_dropout`).
-        boulevard_dropout, f64);
-    setter!(/// Set Boulevard's residual truncation level (`boulevard_truncation`, `0` = off).
-        boulevard_truncation, f64);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
         num_parallel_tree, usize);
     setter!(/// Set the row subsampling method (`sampling_method`).

@@ -23,7 +23,7 @@
 //!
 //! - **BRAT-D** (their Algorithm 1; `num_parallel_tree = 1`): round `b`
 //!   drops each earlier tree independently with probability `p`
-//!   ([`boulevard_dropout`](crate::config::TrainingParams::boulevard_dropout);
+//!   ([`Boulevard::dropout`](crate::config::Boulevard::dropout);
 //!   `p = 0` is Zhou & Hooker's Boulevard) and fits the new tree to
 //!   `y − μ − (λ / (b−1)) Σ_{kept} t_s(x)`, dividing by every earlier tree,
 //!   not only the kept ones. The model predicts `μ + ((1 + λq) / B) Σ t_b`
@@ -35,7 +35,7 @@
 //!   `μ + (1/B) Σ_{b,k} t_{b,k}`.
 //!
 //! `μ` is the intercept (the label mean unless `base_score` is set). With
-//! [`boulevard_truncation`](crate::config::TrainingParams::boulevard_truncation)
+//! [`Boulevard::truncation`](crate::config::Boulevard::truncation)
 //! `M > 0` the subtracted ensemble part is clipped to `[−M, M]`, the `Γ_M`
 //! of the convergence proofs. The trained trees are ordinary
 //! [`RegTree`](crate::tree::RegTree)s whose leaves already carry the final
@@ -148,7 +148,7 @@
 //! # Example
 //!
 //! ```
-//! use hessboost::config::BoosterKind;
+//! use hessboost::config::{BoosterKind, Boulevard};
 //! use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance};
 //! use hessboost::prelude::*;
 //!
@@ -165,9 +165,8 @@
 //! let (dtrain, dcal) = (all.select_rows(&fit_rows)?, all.select_rows(&cal_rows)?);
 //!
 //! let params = TrainingParams::builder()
-//!     .booster(BoosterKind::Boulevard)
+//!     .booster(BoosterKind::Boulevard(Boulevard::builder().dropout(0.5).build()?))
 //!     .eta(0.8)
-//!     .boulevard_dropout(0.5)
 //!     .subsample(0.8)
 //!     .max_depth(3)
 //!     .min_child_weight(5.0)
@@ -221,7 +220,7 @@ pub const MAX_EXACT_ROWS: usize = 8192;
 #[non_exhaustive]
 pub struct BoulevardInfo {
     /// BRAT-D's dropout probability `p`
-    /// ([`boulevard_dropout`](crate::config::TrainingParams::boulevard_dropout);
+    /// ([`Boulevard::dropout`](crate::config::Boulevard::dropout);
     /// `0` for BRAT-P).
     pub dropout: f64,
     /// The learning rate `λ` (`eta`; `1` for BRAT-P).
@@ -231,7 +230,7 @@ pub struct BoulevardInfo {
     /// The L2 leaf penalty (`lambda`).
     pub reg_lambda: f64,
     /// The residual truncation level `M`
-    /// ([`boulevard_truncation`](crate::config::TrainingParams::boulevard_truncation);
+    /// ([`Boulevard::truncation`](crate::config::Boulevard::truncation);
     /// `0` = none).
     pub truncation: f64,
     /// The training seed, which [`honest_refit`] derives its draws from.

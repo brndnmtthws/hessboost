@@ -1,9 +1,9 @@
 //! The option groups of [`TrainingParams`](super::TrainingParams): settings
 //! that only mean something when a switch is on live inside that switch
-//! (`BoosterKind::Dart(Dart)`, `ProcessType::Update(Refresh)`,
-//! `Option<QuantizedGrad>`, `Option<ExtraTrees>`, `Option<LinearTree>`,
-//! `Option<BalancedBagging>`, `Option<QueryBagging>`, `Option<Langevin>`,
-//! `Option<ModelShrink>`), so
+//! (`BoosterKind::Dart(Dart)`, `BoosterKind::Boulevard(Boulevard)`,
+//! `ProcessType::Update(Refresh)`, `Option<QuantizedGrad>`,
+//! `Option<ExtraTrees>`, `Option<LinearTree>`, `Option<BalancedBagging>`,
+//! `Option<QueryBagging>`, `Option<Langevin>`, `Option<ModelShrink>`), so
 //! they cannot be set while the switch is off. Each validates its values
 //! when built.
 
@@ -107,6 +107,100 @@ impl DartBuilder {
         unit("rate_drop", self.dart.rate)?;
         unit("skip_drop", self.dart.skip)?;
         Ok(self.dart)
+    }
+}
+
+/// Boulevard boosting's settings (`booster = boulevard`, beyond XGBoost;
+/// see [`crate::inference`]): BRAT-D's dropout probability `p` in `[0, 1)`
+/// (each earlier tree left out of a round's residuals independently with
+/// probability `p`, the kept ones still divided by the full tree count;
+/// `0`, the default, is Zhou & Hooker's Boulevard, and BRAT-P with
+/// `num_parallel_tree > 1` needs `0`), and the truncation level `M >= 0` of
+/// the ensemble part subtracted in a round's residuals (clipped to
+/// `[-M, M]`, the `Γ_M` of Fang, Tan & Hooker's proofs; `0`, the default,
+/// is none).
+///
+/// ```
+/// use hessboost::config::Boulevard;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let boulevard = Boulevard::builder().dropout(0.5).build()?;
+/// assert_eq!((boulevard.dropout(), boulevard.truncation()), (0.5, 0.0));
+/// assert!(Boulevard::builder().dropout(1.0).build().is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Boulevard {
+    dropout: f64,
+    truncation: f64,
+}
+
+impl Boulevard {
+    /// Start a builder at the defaults (no dropout, no truncation).
+    pub fn builder() -> BoulevardBuilder {
+        BoulevardBuilder {
+            boulevard: Boulevard::default(),
+        }
+    }
+
+    /// BRAT-D's dropout probability `p` (`boulevard_dropout`).
+    pub fn dropout(&self) -> f64 {
+        self.dropout
+    }
+
+    /// The residual truncation level `M`, `0` for none
+    /// (`boulevard_truncation`).
+    pub fn truncation(&self) -> f64 {
+        self.truncation
+    }
+}
+
+/// Builder of [`Boulevard`].
+#[derive(Debug, Clone, Copy)]
+pub struct BoulevardBuilder {
+    boulevard: Boulevard,
+}
+
+impl BoulevardBuilder {
+    /// Set BRAT-D's dropout probability (`boulevard_dropout`).
+    #[must_use]
+    pub fn dropout(mut self, dropout: f64) -> Self {
+        self.boulevard.dropout = dropout;
+        self
+    }
+
+    /// Set the residual truncation level (`boulevard_truncation`, `0` =
+    /// none).
+    #[must_use]
+    pub fn truncation(mut self, truncation: f64) -> Self {
+        self.boulevard.truncation = truncation;
+        self
+    }
+
+    /// The validated settings.
+    ///
+    /// # Errors
+    ///
+    /// `dropout` outside `[0, 1)` or `truncation` negative or non-finite.
+    pub fn build(self) -> Result<Boulevard> {
+        let Boulevard {
+            dropout,
+            truncation,
+        } = self.boulevard;
+        if !(dropout.is_finite() && (0.0..1.0).contains(&dropout)) {
+            return Err(HessboostError::invalid_param(
+                "boulevard_dropout",
+                format!("must be in [0, 1), got {dropout}"),
+            ));
+        }
+        if !(truncation.is_finite() && truncation >= 0.0) {
+            return Err(HessboostError::invalid_param(
+                "boulevard_truncation",
+                format!("must be finite and >= 0, got {truncation}"),
+            ));
+        }
+        Ok(self.boulevard)
     }
 }
 

@@ -823,6 +823,23 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
         });
     }
 
+    if params.booster == BoosterKind::Ebm {
+        // `validate` refuses `process_type = update` for EBMs, and
+        // `validate_request` eval sets and early stopping.
+        let RoundPlan::Grow(prepared) = &plan else {
+            return Err(HessboostError::invalid_param(
+                "process_type",
+                "`booster = ebm` grows new trees only",
+            ));
+        };
+        super::ebm::boost(&run, prepared, &mut state.model, num_boost_round)?;
+        return Ok(TrainResult {
+            model: state.model,
+            history,
+            best_score: None,
+        });
+    }
+
     for round in 0..num_boost_round {
         let iteration = start_iteration + round;
         if let Some(shrink) = &sglb.shrink {
@@ -1060,7 +1077,10 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
     if matches!(params.booster, BoosterKind::Boulevard(_)) {
-        validate_boulevard_request(request, objective)?;
+        validate_boulevard_request(request, objective, "booster = boulevard")?;
+    }
+    if params.booster == BoosterKind::Ebm {
+        validate_ebm_request(request, objective)?;
     }
 
     // Model shrinkage multiplies the intercept-and-trees margin every
@@ -1080,16 +1100,21 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)
 }
 
-/// The data-dependent refusals of `booster = boulevard`: its inference
-/// ([`crate::inference`]) models one squared-error label column with equal
-/// noise per row, around the intercept alone. Early stopping is refused
-/// too: the prediction averages every round, so a `best_iteration` prefix
-/// of the trees is not a Boulevard estimate.
-fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
+/// The data-dependent refusals of `booster = boulevard` (and, as `who`
+/// names, of the Boulevard EBM): its inference ([`crate::inference`])
+/// models one squared-error label column with equal noise per row, around
+/// the intercept alone. Early stopping is refused too: the prediction
+/// averages every round, so a `best_iteration` prefix of the trees is not a
+/// Boulevard estimate.
+fn validate_boulevard_request(
+    request: &TrainRequest,
+    objective: &dyn Loss,
+    who: &str,
+) -> Result<()> {
     let refuse = |name: &'static str, reason: &str| {
         Err(HessboostError::invalid_param(
             name,
-            format!("`booster = boulevard`: {reason}"),
+            format!("`{who}`: {reason}"),
         ))
     };
     if request.early_stopping_rounds.is_some() {
@@ -1115,6 +1140,40 @@ fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Loss) -> R
         if data.base_margin().is_some() {
             return refuse("base_margin", "base margins are not supported");
         }
+    }
+    Ok(())
+}
+
+/// The data-dependent refusals of `booster = ebm`: one output, numerical
+/// features, no feature weights, and no eval sets or early stopping (the
+/// terms of one run are boosted round by round, so no prefix of the trees
+/// is a model of every term); with `ebm_boulevard` also Boulevard's
+/// refusals (squared error, unit row weights, no base margins).
+fn validate_ebm_request(request: &TrainRequest, objective: &dyn Objective) -> Result<()> {
+    let refuse = |name: &'static str, reason: &str| {
+        Err(HessboostError::invalid_param(
+            name,
+            format!("`booster = ebm`: {reason}"),
+        ))
+    };
+    if request.early_stopping_rounds.is_some() || !request.evals.is_empty() {
+        return refuse(
+            "early_stopping_rounds",
+            "eval sets and early stopping are not supported; evaluate the trained model",
+        );
+    }
+    if objective.n_outputs() != 1 || request.dtrain.n_targets() != 1 {
+        return refuse(
+            "objective",
+            &format!(
+                "needs a single-output objective, got `{}`",
+                objective.name()
+            ),
+        );
+    }
+    super::ebm::validate_data(request.dtrain)?;
+    if request.params.ebm_boulevard {
+        validate_boulevard_request(request, objective, "ebm_boulevard")?;
     }
     Ok(())
 }

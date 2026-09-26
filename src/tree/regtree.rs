@@ -494,6 +494,16 @@ impl RegTree {
         }
     }
 
+    /// Add `delta` to every (scalar) leaf weight: EBM's centering of a tree
+    /// by its mean over the training rows.
+    pub(crate) fn shift_leaves(&mut self, delta: f32) {
+        for n in &mut self.nodes {
+            if n.is_leaf() {
+                n.leaf_value += delta;
+            }
+        }
+    }
+
     /// Route a single feature vector (via an accessor) to its leaf id.
     ///
     /// `get` returns `None` for a missing feature. Generic over the accessor so

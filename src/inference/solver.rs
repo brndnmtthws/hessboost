@@ -10,7 +10,7 @@
 
 use rayon::prelude::*;
 
-use super::kernel::LeafKernel;
+use super::kernel::Kernel;
 use super::linalg::{backward_solve, cholesky_in_place, dot, forward_solve, pivoted_cholesky};
 use crate::error::{HessboostError, Result};
 use crate::rng::Rng;
@@ -60,7 +60,7 @@ fn not_positive_definite() -> HessboostError {
 
 impl RidgeSolver {
     /// Factor `c I + K` exactly.
-    pub(super) fn exact(kernel: &LeafKernel, c: f64) -> Result<Self> {
+    pub(super) fn exact(kernel: &impl Kernel, c: f64) -> Result<Self> {
         let n = kernel.n();
         let mut a = kernel.dense();
         for i in 0..n {
@@ -75,7 +75,7 @@ impl RidgeSolver {
     /// `seed`; landmarks that are numerically combinations of the others
     /// are dropped (diagonally pivoted Cholesky of their kernel block).
     pub(super) fn nystrom(
-        kernel: &LeafKernel,
+        kernel: &impl Kernel,
         c: f64,
         landmarks: usize,
         seed: u64,
@@ -236,6 +236,48 @@ impl RidgeSolver {
                 }
                 symmetrize(&mut gram, m);
                 Solved { gram, sums }
+            }
+        }
+    }
+
+    /// Solve `(c I + K) u_a = k_a` for the `m` right-hand sides `rhs`
+    /// (`m × n`, one per row), overwriting each with its solution `u_a`.
+    pub(super) fn solve_vectors(&self, rhs: &mut [f64], m: usize, c: f64) {
+        match self {
+            RidgeSolver::Exact { factor, n } => {
+                let n = *n;
+                let mut u = vec![0.0; n * m];
+                for (a, k) in rhs.chunks_exact(n).enumerate() {
+                    for (i, &v) in k.iter().enumerate() {
+                        u[i * m + a] = v;
+                    }
+                }
+                forward_solve(factor, n, &mut u, m);
+                backward_solve(factor, n, &mut u, m);
+                for (a, k) in rhs.chunks_exact_mut(n).enumerate() {
+                    for (i, v) in k.iter_mut().enumerate() {
+                        *v = u[i * m + a];
+                    }
+                }
+            }
+            RidgeSolver::Nystrom {
+                f, n, r, m_factor, ..
+            } => {
+                // u = (k − F M⁻¹ Fᵀ k) / c (Woodbury).
+                let (n, r) = (*n, *r);
+                for k in rhs.chunks_exact_mut(n) {
+                    let mut z = vec![0.0; r];
+                    for (i, &ki) in k.iter().enumerate() {
+                        if ki != 0.0 {
+                            super::linalg::axpy(ki, &f[i * r..(i + 1) * r], &mut z);
+                        }
+                    }
+                    forward_solve(m_factor, r, &mut z, 1);
+                    backward_solve(m_factor, r, &mut z, 1);
+                    for (i, ki) in k.iter_mut().enumerate() {
+                        *ki = (*ki - dot(&f[i * r..(i + 1) * r], &z)) / c;
+                    }
+                }
             }
         }
     }

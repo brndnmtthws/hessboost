@@ -349,6 +349,7 @@ pub use objective::ModelObjective;
 pub use predictions::{Contributions, Interactions, Predictions};
 
 use crate::data::DMatrix;
+use crate::ebm::EbmInfo;
 use crate::error::{HessboostError, Result};
 use crate::inference::BoulevardInfo;
 use crate::objective::distributional::Dist;
@@ -450,6 +451,9 @@ pub struct BoostedModel {
     /// inference reads ([`crate::inference`]); `None` for every other model.
     /// Predictions do not depend on it.
     boulevard: Option<BoulevardInfo>,
+    /// The terms of a `booster = ebm` model ([`crate::ebm`]); `None` for
+    /// every other model. Predictions do not depend on it.
+    ebm: Option<EbmInfo>,
     /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
     /// never serialized. Reset whenever `trees` changes.
     compact: OnceLock<CompactForest>,
@@ -515,8 +519,8 @@ impl Serialize for BoostedModel {
 /// (scalar) and `leaf_vectors` (none), except that a multi-output model's
 /// trees must state `size_leaf_vector`, since it decides whether they are
 /// vector-leaf trees; each tree's `linear` is required
-/// ([`UncheckedRegTree`]). An absent `boulevard` (files written before
-/// Boulevard boosting existed) means the model is not a Boulevard fit.
+/// ([`UncheckedRegTree`]). An absent `boulevard` or `ebm` (files written
+/// before those boosters existed) means the model is not such a fit.
 #[derive(Deserialize)]
 struct UncheckedBoostedModel {
     trees: Vec<UncheckedRegTree>,
@@ -538,6 +542,8 @@ struct UncheckedBoostedModel {
     shrinkage: Option<Shrinkage>,
     #[serde(default)]
     boulevard: Option<BoulevardInfo>,
+    #[serde(default)]
+    ebm: Option<EbmInfo>,
 }
 
 impl TryFrom<UncheckedBoostedModel> for BoostedModel {
@@ -573,6 +579,7 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
             linear: m.linear,
             shrinkage: m.shrinkage,
             boulevard: m.boulevard,
+            ebm: m.ebm,
             compact: OnceLock::new(),
         };
         model.validate_structure()?;
@@ -791,6 +798,21 @@ impl BoostedModel {
         self.boulevard.as_ref()
     }
 
+    /// Record (or clear) the terms of a `booster = ebm` model.
+    pub(crate) fn set_ebm(&mut self, info: Option<EbmInfo>) {
+        self.ebm = info;
+    }
+
+    /// The terms of a `booster = ebm` model (beyond XGBoost), which
+    /// [`crate::ebm::shape_functions`] and
+    /// [`crate::inference::EbmInference`] read; `None` for every other
+    /// model, including an EBM's [`slice`](Self::slice)s and its
+    /// XGBoost-format or compact exports (which predict the same but no
+    /// longer know their terms).
+    pub fn ebm(&self) -> Option<&EbmInfo> {
+        self.ebm.as_ref()
+    }
+
     /// Reassemble a model from its constituent parts. Used by the XGBoost and
     /// LightGBM importers, which build trees and metadata externally. `tree_weights`
     /// is either empty (every tree weighs `1.0`) or holds one DART weight per
@@ -816,6 +838,7 @@ impl BoostedModel {
             linear: None,
             shrinkage: None,
             boulevard: None,
+            ebm: None,
             compact: OnceLock::new(),
         }
     }
@@ -1615,8 +1638,10 @@ impl BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
             shrinkage: None,
-            // A slice of a Boulevard average is not itself one.
+            // A slice of a Boulevard average is not itself one, and a slice
+            // of an EBM drops some of its terms' trees.
             boulevard: None,
+            ebm: None,
             compact: OnceLock::new(),
         })
     }
@@ -1847,6 +1872,9 @@ impl BoostedModel {
             }
         }
         if let Some(info) = &self.boulevard {
+            info.validate(self)?;
+        }
+        if let Some(info) = &self.ebm {
             info.validate(self)?;
         }
         self.validate_shrinkage()

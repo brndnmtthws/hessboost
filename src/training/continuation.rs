@@ -67,6 +67,15 @@ pub(super) fn resume_model(
              and `booster = boulevard` cannot continue another model",
         ));
     }
+    // An EBM's record assigns every tree to a term of one run; appended
+    // trees would belong to none, and a sum cannot continue into terms.
+    if params.booster == BoosterKind::Ebm || init.ebm().is_some() {
+        return Err(HessboostError::invalid_param(
+            "init_model",
+            "EBMs are boosted term by term in one run and cannot be trained further, and \
+             `booster = ebm` cannot continue another model",
+        ));
+    }
     let is_linear = init.linear().is_some();
     if is_linear != (params.booster == BoosterKind::GbLinear) {
         return Err(HessboostError::invalid_param(

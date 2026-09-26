@@ -6,6 +6,7 @@ pub(crate) mod boulevard;
 pub mod budget;
 mod continuation;
 mod cv;
+mod ebm;
 mod gblinear;
 mod multi_output;
 pub mod online;

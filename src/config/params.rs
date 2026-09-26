@@ -96,6 +96,16 @@ pub enum BoosterKind {
     /// only; see [`crate::inference`] for the trained model's confidence and
     /// prediction intervals and the settings it refuses.
     Boulevard(Boulevard),
+    /// Explainable boosting machine (EBM, a GA²M; beyond XGBoost, opt-in):
+    /// cyclic boosting of one small tree per feature at a time, so the
+    /// model is a sum of per-feature shape functions, optionally followed
+    /// by pairwise interaction terms (FAST detection,
+    /// [`ebm_interactions`](TrainingParams::ebm_interactions)) and outer
+    /// bagging. With [`ebm_boulevard`](TrainingParams::ebm_boulevard) the
+    /// terms are Boulevard-averaged instead, which gives the shape
+    /// functions confidence bands. See [`crate::ebm`] for the algorithms,
+    /// the shape functions, and the settings it refuses.
+    Ebm,
 }
 
 /// Tree construction algorithm.
@@ -177,6 +187,10 @@ pub const MAX_SYMMETRIC_DEPTH: usize = 16;
 /// grown and held in memory at once (with one row sample per tree), so the
 /// count is bounded well below what its bookkeeping could address.
 pub(crate) const MAX_NUM_PARALLEL_TREE: usize = 1 << 16;
+
+/// Largest [`TrainingParams::ebm_outer_bags`]: every bag keeps its margins
+/// over the training rows while the bags train.
+pub(crate) const MAX_EBM_OUTER_BAGS: usize = 1024;
 
 /// Per-feature monotonicity direction: XGBoost's `-1`/`0`/`1`, a complete
 /// set, so it can be matched exhaustively.
@@ -398,6 +412,35 @@ pub struct TrainingParams {
     /// and a tree booster.
     pub quantized: Option<QuantizedGrad>,
 
+    // ---- Explainable boosting machine (beyond XGBoost, opt-in) ----
+    /// Number of pairwise interaction terms `booster = ebm` adds after its
+    /// main effects: the top pairs by FAST (Lou et al., KDD 2013) on the
+    /// main-effect model's gradients, each then boosted like a main effect
+    /// on its two features. At most `n_features (n_features − 1) / 2`.
+    /// `0` (the default) fits main effects only. Must be `0` with any other
+    /// booster.
+    pub ebm_interactions: usize,
+    /// Outer bags of `booster = ebm` (InterpretML's `outer_bags`): each bag
+    /// boosts its own copy of every term on its own row sample
+    /// ([`ebm_bag_fraction`](Self::ebm_bag_fraction)), and the model
+    /// averages the bags. In `1..=1024`; `1` (the default) is one fit on
+    /// every row. Refused with [`ebm_boulevard`](Self::ebm_boulevard).
+    pub ebm_outer_bags: usize,
+    /// Fraction of the rows in `(0, 1]` each outer bag of `booster = ebm`
+    /// trains on, drawn without replacement per bag (InterpretML trains
+    /// each bag on `1 − validation_size = 0.85`). `1` (the default) gives
+    /// every bag every row. Must be `1` with any other booster.
+    pub ebm_bag_fraction: f64,
+    /// Boulevard-regularized EBM (Fang, Tan, Pipping & Hooker, AISTATS
+    /// 2026, Algorithm 1): every round fits one tree per term to the same
+    /// residuals, centers it, and averages it into its term with learning
+    /// rate `eta ∈ (0, 1]`, so the terms converge to a feature-wise kernel
+    /// ridge regression with confidence bands
+    /// ([`EbmInference`](crate::inference::EbmInference)). Squared error
+    /// only, with Boulevard's refusals. `false` (the default) is the
+    /// classic cyclic EBM. Must be `false` with any other booster.
+    pub ebm_boulevard: bool,
+
     // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
     /// Penalty `ι` subtracted from the loss change of a split on a feature the
     /// ensemble does not use yet (Herrmann et al., *Boosted Trees on a Diet*,
@@ -492,6 +535,10 @@ impl Default for TrainingParams {
             path_smooth: 0.0,
             linear_tree: None,
             quantized: None,
+            ebm_interactions: 0,
+            ebm_outer_bags: 1,
+            ebm_bag_fraction: 1.0,
+            ebm_boulevard: false,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
             langevin: None,
@@ -608,6 +655,7 @@ impl TrainingParams {
         self.validate_tree_options()?;
         self.validate_sglb()?;
         self.validate_boulevard()?;
+        self.validate_ebm()?;
         self.validate_balanced_bagging()
     }
 
@@ -1175,6 +1223,13 @@ impl TrainingParams {
                 ),
             )?;
         }
+        self.validate_linear_smoother()
+    }
+
+    /// The settings Boulevard inference (of `booster = boulevard` and of
+    /// `booster = ebm` with `ebm_boulevard`) refuses: every tree must be a
+    /// linear smoother of its round's residuals with constant leaves.
+    fn validate_linear_smoother(&self) -> Result<()> {
         let nonlinear = "makes leaf values nonlinear in the labels, which Boulevard inference \
                          cannot represent";
         ensure(
@@ -1220,6 +1275,120 @@ impl TrainingParams {
             self.process_type == ProcessType::Default,
             "`update` refreshes existing trees; Boulevard models are grown in one run",
         )
+    }
+
+    /// Ranges of the EBM options, the settings `booster = ebm` refuses
+    /// (anything that would let a tree reach features outside its term, or
+    /// leaves the shape functions cannot read), and with `ebm_boulevard`
+    /// the Boulevard inference refusals.
+    fn validate_ebm(&self) -> Result<()> {
+        ensure(
+            "ebm_outer_bags",
+            (1..=MAX_EBM_OUTER_BAGS).contains(&self.ebm_outer_bags),
+            format!(
+                "must be in [1, {MAX_EBM_OUTER_BAGS}], got {}",
+                self.ebm_outer_bags
+            ),
+        )?;
+        let fraction = self.ebm_bag_fraction;
+        ensure(
+            "ebm_bag_fraction",
+            fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
+            format!("must be in (0, 1], got {fraction}"),
+        )?;
+        if self.booster != BoosterKind::Ebm {
+            let only = "is only used by `booster = ebm`";
+            ensure(
+                "ebm_interactions",
+                self.ebm_interactions == 0,
+                format!("{only}; must be 0"),
+            )?;
+            ensure(
+                "ebm_outer_bags",
+                self.ebm_outer_bags == 1,
+                format!("{only}; must be 1"),
+            )?;
+            ensure(
+                "ebm_bag_fraction",
+                fraction == 1.0,
+                format!("{only}; must be 1"),
+            )?;
+            return ensure(
+                "ebm_boulevard",
+                !self.ebm_boulevard,
+                format!("{only}; must be false"),
+            );
+        }
+        let term = "`booster = ebm` fixes every tree's features to its term";
+        ensure(
+            "num_parallel_tree",
+            self.num_parallel_tree == 1,
+            "`booster = ebm` grows one tree per term at a time; must be 1",
+        )?;
+        for (name, ratio) in [
+            ("colsample_bytree", self.colsample_bytree),
+            ("colsample_bylevel", self.colsample_bylevel),
+            ("colsample_bynode", self.colsample_bynode),
+        ] {
+            ensure(name, ratio == 1.0, format!("{term}; must be 1"))?;
+        }
+        ensure(
+            "interaction_constraints",
+            self.interaction_constraints.is_empty(),
+            format!("{term}; must be empty"),
+        )?;
+        ensure(
+            "linear_tree",
+            !self.linear_tree,
+            "EBM shape functions need constant leaves",
+        )?;
+        ensure(
+            "toad_penalty_feature",
+            !self.reuse_penalties_on(),
+            "reuse penalties are not supported with `booster = ebm`",
+        )?;
+        ensure(
+            "process_type",
+            self.process_type == ProcessType::Default,
+            "`update` refreshes existing trees; EBM models are grown in one run",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "`booster = ebm` samples rows uniformly (`subsample`)",
+        )?;
+        if !self.ebm_boulevard {
+            return Ok(());
+        }
+        ensure(
+            "objective",
+            matches!(self.objective.as_str(), "reg:squarederror" | "reg:linear"),
+            format!(
+                "`ebm_boulevard` supports `reg:squarederror` only, got `{}`",
+                self.objective
+            ),
+        )?;
+        ensure(
+            "eta",
+            self.eta <= 1.0,
+            format!(
+                "Boulevard's learning rate must be in (0, 1], got {}",
+                self.eta
+            ),
+        )?;
+        ensure(
+            "ebm_outer_bags",
+            self.ebm_outer_bags == 1 && fraction == 1.0,
+            "a bagged Boulevard EBM has no kernel ridge limit its inference covers; use one bag \
+             of every row",
+        )?;
+        ensure(
+            "base_score",
+            self.base_score.is_none(),
+            "the Boulevard EBM's centered terms leave the label mean as the intercept; leave it \
+             unset",
+        )?;
+        self.validate_linear_smoother()
     }
 
     /// The `max_delta_step` in effect (`0` = no bound): the configured
@@ -1399,6 +1568,14 @@ impl TrainingParamsBuilder {
         grow_policy, GrowPolicy);
     setter!(/// Set the maximum histogram bins per feature.
         max_bin, usize);
+    setter!(/// Set the number of EBM pairwise interaction terms (`ebm_interactions`).
+        ebm_interactions, usize);
+    setter!(/// Set the number of EBM outer bags (`ebm_outer_bags`).
+        ebm_outer_bags, usize);
+    setter!(/// Set the row fraction of each EBM outer bag (`ebm_bag_fraction`).
+        ebm_bag_fraction, f64);
+    setter!(/// Boulevard-average the EBM terms for inference (`ebm_boulevard`).
+        ebm_boulevard, bool);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
         num_parallel_tree, usize);
     setter!(/// Set the row subsampling method (`sampling_method`).

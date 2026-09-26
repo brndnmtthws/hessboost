@@ -33,10 +33,10 @@ and `λ` is the L2 penalty `lambda`.
 - **Stable model files.** Anything saved by 0.2.0 or later loads in every
   later release.
 - **More than XGBoost, opt-in.** Conformal intervals, confidence intervals
-  for the regression function (Boulevard boosting), distributional
-  boosting, SGLB uncertainty, budget training, compact models, XE-NDCG
-  ranking, and more — all off by default, none of them changes default
-  training.
+  for the regression function (Boulevard boosting), explainable boosting
+  machines with shape-function bands, distributional boosting, SGLB
+  uncertainty, budget training, compact models, XE-NDCG ranking, and more —
+  all off by default, none of them changes default training.
 
 ## Getting started
 
@@ -109,6 +109,7 @@ runnable programs live in [`examples/`](examples)
 | `model_io` | native and XGBoost JSON/UBJSON save and load |
 | `conformal` | calibrated prediction intervals |
 | `boulevard_inference` | confidence intervals for `f(x)` and prediction intervals |
+| `ebm` | an explainable boosting machine's shape functions and their confidence bands |
 | `distributional` | predictive distributions, intervals, and NLL |
 | `virtual_ensembles` | SGLB posterior sampling: knowledge uncertainty rising off the training data |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
@@ -164,6 +165,7 @@ Beyond XGBoost (opt-in, none changes default training):
 |---|---|
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
 | [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/) | Boulevard boosting (`booster = boulevard`, with BRAT-D dropout and BRAT-P parallel variants) and its asymptotic confidence intervals for `f(x)` and prediction intervals, after Zhou & Hooker (JMLR 2022) and Fang, Tan & Hooker (NeurIPS 2025); squared error only |
+| [Explainable boosting machines](https://docs.rs/hessboost/latest/hessboost/ebm/) | GA²M models (`booster = ebm`): cyclic per-feature trees, outer bags, FAST pair terms (Lou et al., KDD 2013; InterpretML), per-term shape functions, and with `ebm_boulevard` confidence bands on every shape (Fang, Tan, Pipping & Hooker, AISTATS 2026) |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
@@ -204,6 +206,11 @@ Beyond XGBoost (opt-in, none changes default training):
   under-cover otherwise: 95% intervals cover 0.73 of the time in the
   paper's 3-d test setup and 0.15 in 5 dimensions (validated table in the
   `inference` docs). Its prediction intervals assume Gaussian noise.
+- A Boulevard EBM's shape-function bands (`ebm_boulevard`) share those
+  caveats: they are conditional on the trees, so 95% bands covered
+  0.76–0.86 of the time with `honest_refit` and 0.57–0.71 in-sample in the
+  simulations of the `EbmInference` docs. Classic EBMs are not
+  early-stopped: pick the round count yourself.
 
 ## Not implemented
 

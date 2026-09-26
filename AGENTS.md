@@ -301,21 +301,21 @@ field, builder setter, and validation.
 
 ## Releases
 
-Bump `version` in both `Cargo.toml` and `python/Cargo.toml`; run
-`cargo update -p hessboost --manifest-path python/Cargo.toml` and `uv lock`
-from `python/`, then commit both lockfiles. Save this version's models with
-`cargo nextest run --test native_format --run-ignored only
-save_models_of_this_version` and commit `tests/data/saved/<version>/` (never
-regenerate an older version's directory). Merge the bump and saved-model
-changes, then run `./release.py` from a clean, up-to-date `main`; use
-`./release.py --dry-run` first if desired. It checks versions and lockfiles,
-the saved-model directory is tracked, registry availability, and successful
-CI before creating and pushing an annotated `v<version>` tag. The tag runs
+Bump releases with `./release.py bump major|minor|patch` (or an explicit
+SemVer such as `1.2.3-rc.1`). This creates a release branch, updates the crate
+and Python versions and lockfiles, refreshes current dependency snippets,
+saves `tests/data/saved/<version>/`, pushes the branch, and opens a PR.
+Review and merge that PR; then, on `main`, run `./release.py --dry-run` and
+`./release.py` to create and push the annotated release tag. The tag runs
 `.github/workflows/publish.yml`, which verifies the Rust tests and Python
 wheels/sdist before publishing to crates.io and PyPI and creating a GitHub
 release with a discussion and generated notes. The notes are seeded from PRs
 since the last tag and grouped by `.github/release.yml`; rewrite them by hand
 afterward.
+
+Use `./release.py bump <part> --dry-run` to inspect the bump plan without
+changes, `--yes` to skip confirmation, or `--no-pr` to push without opening
+a PR.
 
 One-time setup: configure PyPI's pending trusted publisher for owner
 `brndnmtthws`, repository `hessboost`, workflow `publish.yml`, environment

@@ -41,6 +41,11 @@ and `λ` is the L2 penalty `lambda`.
 ```sh
 cargo add hessboost
 ```
+For users pinning a release series in a Cargo manifest:
+
+```toml
+hessboost = "0.2"
+```
 
 Needs Rust 1.93 or newer and a C compiler (to build libzstd).
 

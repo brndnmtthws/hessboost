@@ -1,9 +1,14 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["tomlkit>=0.13"]
 # ///
-"""Check a hessboost release, then create and push its annotated tag."""
+"""Check, bump, and publish a hessboost release.
+
+`./release.py bump {major|minor|patch|X.Y.Z[-alpha.N|-beta.N|-rc.N]}` prepares,
+pushes, and opens the release-bump PR. After merging it, `./release.py` creates
+and pushes the annotated release tag. The no-subcommand flow remains tagging.
+"""
 
 import argparse
 import json
@@ -17,6 +22,7 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
+import tomlkit
 import tomllib
 
 ROOT = Path(__file__).resolve().parent
@@ -266,16 +272,284 @@ def publish_run_url(tag: str) -> str:
     return f"https://github.com/{REPO}/actions/workflows/publish.yml"
 
 
+VERSION_REFERENCE_FILES = (
+    "README.md",
+    "python/README.md",
+    "src/lib.rs",
+    "examples/ranking.rs",
+    "examples/bench_compare.rs",
+    "examples/binary_classification.rs",
+    "examples/budget.rs",
+    "examples/compact_model.rs",
+    "examples/conformal.rs",
+    "examples/constraints.rs",
+    "examples/custom_objective.rs",
+    "examples/distributional.rs",
+    "examples/metal.rs",
+    "examples/model_io.rs",
+    "examples/multiclass.rs",
+    "examples/ordered_target_stats.rs",
+    "examples/pfn_boost.rs",
+    "examples/shap.rs",
+    "examples/train_regression.rs",
+    "docs/performance.md",
+)
+DEPENDENCY_VERSION = re.compile(r'(hessboost\s*=\s*")([0-9]+\.[0-9]+)(")')
+
+
+def bumped_version(current: str, part: str) -> str:
+    major, minor, patch, _, _ = semver_key(current)
+    match = SEMVER.fullmatch(current)
+    assert match is not None
+    if part == "major":
+        return f"{major + 1}.0.0"
+    if part == "minor":
+        return f"{major}.{minor + 1}.0"
+    if part == "patch":
+        return (
+            f"{major}.{minor}.{patch}" if match[4] else f"{major}.{minor}.{patch + 1}"
+        )
+    if SEMVER.fullmatch(part) is None:
+        raise CheckError(f"{part!r} is not an accepted SemVer release version")
+    semver_key(part)
+    pep440(part)
+    return part
+
+
+def check_bump_tools(no_pr: bool) -> str:
+    required = ("git", "cargo", "cargo-nextest", "uv") + (() if no_pr else ("gh",))
+    missing = [tool for tool in required if shutil.which(tool) is None]
+    if missing:
+        raise CheckError(f"not on PATH: {', '.join(missing)}")
+    return ", ".join(required)
+
+
+def check_bump_version(version: str, current: str) -> str:
+    semver_key(version)
+    wheel = pep440(version)
+    if semver_key(version) <= semver_key(current):
+        raise CheckError(f"{version} is not newer than current version {current}")
+    check_newer(version)
+    return f"{version} (PyPI {wheel}) > current {current} and newest crates.io release"
+
+
+def check_bump_targets(version: str) -> str:
+    tag = f"v{version}"
+    check_tag(tag)
+    saved = ROOT / "tests" / "data" / "saved" / version
+    if saved.exists():
+        raise CheckError(f"{saved.relative_to(ROOT)}/ already exists")
+    branch = f"release/v{version}"
+    if (
+        execute(
+            "git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
+        ).returncode
+        == 0
+    ):
+        raise CheckError(f"branch {branch} already exists locally")
+    if run("git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"):
+        raise CheckError(f"branch {branch} already exists on origin")
+    return (
+        f"{tag} and {saved.relative_to(ROOT)}/ do not exist; branch name is available"
+    )
+
+
+def replace_package_version(manifest: str, version: str) -> None:
+    path = ROOT / manifest
+    document = tomlkit.parse(path.read_text())
+    document["package"]["version"] = version
+    path.write_text(tomlkit.dumps(document))
+
+
+def update_version_references(current: str, version: str) -> list[str]:
+    old_minor = ".".join(current.split(".")[:2])
+    new_minor = ".".join(version.split(".")[:2])
+    changed = []
+    for name in VERSION_REFERENCE_FILES:
+        path = ROOT / name
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        updated = DEPENDENCY_VERSION.sub(
+            lambda match: (
+                match[1] + new_minor + match[3] if match[2] == old_minor else match[0]
+            ),
+            text,
+        )
+        if updated != text:
+            path.write_text(updated)
+            changed.append(name)
+    return changed
+
+
+def step(name: str, check: Callable[[], str]) -> bool:
+    try:
+        print(f"  ✓ {name}: {check()}")
+        return True
+    except (CheckError, OSError, KeyError, ValueError) as err:
+        print(f"  ✗ {name}: {err}")
+        return False
+
+
+def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
+    try:
+        current = package_version("Cargo.toml")
+        version = bumped_version(current, version_arg)
+    except (CheckError, OSError, tomllib.TOMLDecodeError, KeyError) as err:
+        print(f"error: cannot compute release version: {err}", file=sys.stderr)
+        return 1
+    branch = f"release/v{version}"
+    checks: list[tuple[str, Callable[[], str]]] = [
+        ("tools", lambda: check_bump_tools(no_pr)),
+        ("git state", check_git),
+        ("version", lambda: check_bump_version(version, current)),
+        ("release targets", lambda: check_bump_targets(version)),
+    ]
+    print(f"Checking release bump hessboost {current} → {version}")
+    failed = 0
+    for name, check in checks:
+        if not step(name, check):
+            failed += 1
+    if failed:
+        print("\nPreconditions failed; no changes made.")
+        return 1
+    print(
+        f"\nPlan: hessboost {current} → {version}\n  PyPI:   {pep440(version)}\n  branch: {branch}"
+    )
+    if dry_run:
+        print("\nDry run: preconditions passed; no changes made.")
+        return 0
+    if not yes:
+        try:
+            answer = input(f"\nCreate and push {branch}? [y/N] ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+    created = False
+    try:
+        run("git", "switch", "-c", branch)
+        created = True
+        print(f"  ✓ branch: created {branch}")
+
+        def manifest_versions() -> str:
+            replace_package_version("Cargo.toml", version)
+            replace_package_version("python/Cargo.toml", version)
+            if (
+                package_version("Cargo.toml") != version
+                or package_version("python/Cargo.toml") != version
+            ):
+                raise CheckError("manifest version verification failed")
+            return f"Cargo.toml and python/Cargo.toml are {version}"
+
+        if not step("manifest versions", manifest_versions):
+            raise CheckError("manifest update failed")
+
+        def lockfiles() -> str:
+            run(
+                "cargo",
+                "update",
+                "-p",
+                "hessboost",
+                "--manifest-path",
+                "python/Cargo.toml",
+            )
+            run("uv", "lock", cwd=ROOT / "python")
+            return check_locks()
+
+        if not step("lockfiles", lockfiles):
+            raise CheckError("lockfile refresh failed")
+        references = update_version_references(current, version)
+        print(
+            "  ✓ version references: "
+            + (
+                ", ".join(references)
+                if references
+                else "no current-release snippets found"
+            )
+        )
+        before_saved = run("git", "status", "--porcelain", "--", "tests/data/saved")
+        if not step(
+            "saved models",
+            lambda: run(
+                "cargo",
+                "nextest",
+                "run",
+                "--test",
+                "native_format",
+                "--run-ignored",
+                "only",
+                "save_models_of_this_version",
+            ),
+        ):
+            raise CheckError("saved-model generation failed")
+        saved = ROOT / "tests" / "data" / "saved" / version
+        after_saved = run("git", "status", "--porcelain", "--", "tests/data/saved")
+        if not saved.is_dir() or not any(saved.iterdir()):
+            raise CheckError(f"{saved.relative_to(ROOT)}/ was not created with files")
+        expected_status = f"?? tests/data/saved/{version}/"
+        if after_saved.strip() != expected_status or before_saved:
+            raise CheckError(
+                "saved-model status changed outside the new version directory"
+            )
+        print(f"  ✓ saved models: {saved.relative_to(ROOT)}/ contains new files only")
+        run("git", "add", "-A")
+        run("git", "commit", "-m", f"chore(release): v{version}")
+        run("git", "push", "-u", "origin", branch)
+        print(f"  ✓ push: pushed {branch} to origin")
+        if not no_pr:
+            body = f"## Release bump\n\nUpdated hessboost to `{version}`, refreshed Rust/Python lockfiles, and saved this version's native models.\n\nAfter merge, on `main`: `./release.py --dry-run` then `./release.py`."
+            url = run(
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                "main",
+                "--head",
+                branch,
+                "--title",
+                f"chore(release): v{version}",
+                "--body",
+                body,
+            )
+            print(f"  ✓ pull request: {url}")
+        return 0
+    except (CheckError, OSError, KeyError, ValueError) as err:
+        if created:
+            print(
+                f"\n✗ Release bump stopped: {err}\nBranch {branch} holds partial changes. Discard it with `git checkout main && git branch -D {branch}`.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"error: {err}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("version", nargs="?", help="default: root Cargo.toml version")
-    parser.add_argument("--dry-run", action="store_true", help="run checks only")
+    commands = parser.add_subparsers(dest="command")
+    bump_parser = commands.add_parser("bump", help="prepare and open a version-bump PR")
+    bump_parser.add_argument("version", help="major, minor, patch, or explicit SemVer")
+    bump_parser.add_argument(
+        "--dry-run", action="store_true", help="show plan without changes"
+    )
+    bump_parser.add_argument("--yes", action="store_true", help="skip confirmation")
+    bump_parser.add_argument(
+        "--no-pr", action="store_true", help="push branch without opening a PR"
+    )
+    parser.add_argument(
+        "tag_version", nargs="?", help="tag version; defaults to root Cargo.toml"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="run tag checks only")
     parser.add_argument(
         "--yes", action="store_true", help="tag and push without asking"
     )
     args = parser.parse_args()
+    if args.command == "bump":
+        return bump(args.version, args.dry_run, args.yes, args.no_pr)
     try:
-        version = (args.version or package_version("Cargo.toml")).removeprefix("v")
+        version = (args.tag_version or package_version("Cargo.toml")).removeprefix("v")
     except (OSError, tomllib.TOMLDecodeError, KeyError) as err:
         print(f"error: cannot read version from Cargo.toml: {err}", file=sys.stderr)
         return 1

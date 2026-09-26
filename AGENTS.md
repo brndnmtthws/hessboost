@@ -366,8 +366,8 @@ losses randomized per round (XE-NDCG) take the round from
 `Loss::gradient_info_at`, so every training loop calls it;
 `Loss::split_gradient` serves vector-leaf trees only, not with
 monotone constraints. `booster = boulevard` is squared error only, refuses
-nonlinear-leaf options, weights, base margins, early stopping and
-continuation, and needs `eta = 1` with `num_parallel_tree > 1` (BRAT-P); its
+nonlinear-leaf options, weights, base margins, early stopping,
+continuation, and online updates, and needs `eta = 1` with `num_parallel_tree > 1` (BRAT-P); its
 leaves carry the final `1/B` scale, so exports and SHAP see a plain gbtree
 ensemble, and slices drop the `BoulevardInfo`. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.

@@ -244,3 +244,29 @@ fn the_round_hook_sees_every_round_and_break_keeps_a_boulevard_average() {
     );
     assert!(stopped.boulevard().is_some());
 }
+
+/// In-place updates regrow trees as ordinary boosting would, which would
+/// leave a model that claims to be a Boulevard average of trees it no
+/// longer is.
+#[test]
+fn online_updates_refuse_a_boulevard_model() {
+    use hessboost::training::online::{OnlineModel, OnlineParams};
+    let dtrain = data(200, 15);
+    let model = train(&builder().build().unwrap(), &dtrain, 5).unwrap();
+    let gbtree = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .build()
+        .unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(
+                model.clone(),
+                &gbtree,
+                &dtrain,
+                online
+            )),
+            "model"
+        );
+    }
+}

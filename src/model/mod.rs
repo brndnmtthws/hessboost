@@ -678,6 +678,7 @@ impl BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
             shrinkage: None,
+            boulevard: None,
             compact: OnceLock::new(),
         }
     }

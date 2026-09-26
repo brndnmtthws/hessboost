@@ -263,9 +263,9 @@ impl OnlineModel {
     /// The refusals of [`Self::train`], and
     /// [`HessboostError::InvalidParameter`] for a model that `params` could
     /// not have trained (another objective, several outputs, weighted or
-    /// categorical trees, linear leaves or a `gblinear` booster, for
-    /// example from an imported LightGBM `linear_tree` model, model
-    /// shrinkage, a different feature count).
+    /// categorical trees, linear leaves, a `gblinear` or `boulevard`
+    /// booster, for example from an imported LightGBM `linear_tree` model,
+    /// model shrinkage, a different feature count).
     pub fn from_model(
         model: BoostedModel,
         params: &TrainingParams,
@@ -283,6 +283,7 @@ impl OnlineModel {
             || model.n_features() != data.n_cols()
             || categorical
             || model.linear().is_some()
+            || model.boulevard().is_some()
             || model.trees().iter().any(|t| t.linear_leaves().is_some())
             || model
                 .trees()
@@ -295,8 +296,8 @@ impl OnlineModel {
         {
             return Err(HessboostError::invalid_param(
                 "model",
-                "not a single-output, unweighted, unshrunk, numeric gbtree model with constant \
-                 leaves of these parameters and data",
+                "not a single-output, unweighted, unshrunk, numeric gbtree model (not \
+                 Boulevard) with constant leaves of these parameters and data",
             ));
         }
         let cache = if online.tolerance > 0.0 {

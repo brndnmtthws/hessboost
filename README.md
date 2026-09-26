@@ -107,6 +107,23 @@ runnable programs live in [`examples/`](examples)
 | `pfn_boost` | boosting from a pretrained model's logits |
 | `metal` | CPU vs GPU prediction (macOS, `--features metal`) |
 
+## Python
+
+[`python/`](python) holds the Python package (`pip install hessboost`),
+with XGBoost's Python API (`DMatrix`, `train`, `cv`, `Booster`),
+scikit-learn estimators, pandas categorical input, and the conformal and
+distributional extras:
+
+```python
+import hessboost
+
+booster = hessboost.train({"objective": "binary:logistic", "max_depth": 4},
+                          hessboost.DMatrix(X, label=y), 100)
+probabilities = booster.predict(X_test)
+```
+
+See [`python/README.md`](python/README.md).
+
 ## What's included
 
 From XGBoost:
@@ -157,7 +174,7 @@ Beyond XGBoost (opt-in, none changes default training):
 ## Not implemented
 
 - Distributed and external-memory training.
-- Python, CLI, and C bindings.
+- CLI and C bindings.
 - GPU training outside macOS (a `wgpu` backend is planned).
 - A few XGBoost options exist at one setting only, and a few metrics are
   missing; the [API docs](https://docs.rs/hessboost/latest/hessboost/#not-implemented)

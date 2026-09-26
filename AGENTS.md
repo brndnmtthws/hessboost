@@ -68,6 +68,23 @@ reject. After changing `train.rs`'s input layout, re-check
 `train` (valid params must train or error, identically across thread
 counts).
 
+Python bindings: `python/` is its own crate (like `fuzz/`), built by
+maturin through uv. Unlike the root, its `Cargo.lock` and `uv.lock` are
+committed and every build is locked; after changing the root crate's
+dependencies run `cargo update --manifest-path python/Cargo.toml
+--workspace`, after changing `python/pyproject.toml` run `uv lock`. From
+`python/`:
+
+```sh
+uv sync --locked
+uv run --locked pytest
+uv run --locked python -m mypy.stubtest hessboost._hessboost
+uv run --locked mypy --strict
+uv run --locked pyright --verifytypes hessboost --ignoreexternal
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
 ## Lints
 
 Clippy `pedantic` is on (`Cargo.toml` lists the allowed lints). A new local
@@ -99,6 +116,15 @@ proptest; shared helpers are in `tests/common/` and `examples/common/`.
 `.json`, `.hbtd`, `.margins`); `tests/data/xgboost-3.4.2-categorical.*` are
 XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
 (Criterion) results go in `docs/performance.md`.
+
+## Layout (`python/`)
+
+|Path|Non-obvious contents|
+|---|---|
+|`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `metal` on macOS|
+|`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `train` (`Trainer` on a signal-polled worker thread, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `dist`|
+|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `folds`; `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
+|`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit|
 
 ## Invariants
 
@@ -222,6 +248,20 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   Budget mode and refresh compare params against defaults plus an
   allow-list (`TrainingParams::refuse_changes_from`), so any new field is
   refused there automatically.
+- **Python:** `python/` uses only the crate's public API. The public
+  Python API is pure Python; the extension is private, fully stubbed
+  (stubtest), `unsafe`-free (`forbid`), declares `gil_used = false`, keeps
+  every class `frozen`, and releases the GIL around matrix construction,
+  training, prediction, and model encode/decode. Parameter mappings
+  deserialize through `TrainingParams`' serde (XGBoost) names plus the
+  aliases and one-setting options in `python/src/params.rs`, so a new
+  field is accepted automatically and unknown keys are refused. `train`
+  runs on a worker thread while the caller polls for signals; Python
+  callbacks (objective, metric, per-round) re-attach to the interpreter,
+  and the first exception (or Ctrl-C's `KeyboardInterrupt`) stops
+  training through `Trainer::on_round` at the end of the round and is
+  re-raised. Crate errors map to `HessboostError` (a `ValueError`),
+  `ModelFormatError`, and `OSError`; wrong Python types raise `TypeError`.
 
 ## Public API
 

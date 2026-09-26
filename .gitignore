@@ -1,5 +1,7 @@
 /target
 **/*.rs.bk
 Cargo.lock
+# Committed: the Python extension's lockfile pins its wheels' dependencies.
+!/python/Cargo.lock
 /fixtures/**
 __pycache__/

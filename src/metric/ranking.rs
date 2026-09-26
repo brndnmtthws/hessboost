@@ -27,10 +27,10 @@ pub struct Precision {
 impl Precision {
     /// `pre@k`, or `pre` (cutoff 32) when `k` is `None`. The caller
     /// guarantees `k >= 1`.
-    pub(super) fn new(name: &str, k: Option<usize>) -> Self {
+    pub(super) fn new(k: Option<usize>) -> Self {
         Precision {
             k: k.unwrap_or(DEFAULT_TOP_K),
-            name: name.to_string(),
+            name: super::cutoff_name("pre", k),
         }
     }
 }
@@ -105,12 +105,12 @@ mod tests {
         let preds = [0.9, 0.8, 0.1, 0.7, 0.2, 0.6, 0.5, 0.1];
         let labels = [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
         let group = GroupInfo::from_sizes(&[4, 4]);
-        let at2 = Precision::new("pre@2", Some(2));
+        let at2 = Precision::new(Some(2));
         // Group 1 top-2 = rows 0, 1 -> 1/2; group 2 top-2 = rows 5, 6 -> 1.
         let v = at2.eval_grouped(&preds, &labels, None, Some(&group));
         assert!((v - 0.75).abs() < 1e-12, "{v}");
         // Default k = 32 covers each whole group: 2/4 in both.
-        let v = Precision::new("pre", None).eval_grouped(&preds, &labels, None, Some(&group));
+        let v = Precision::new(None).eval_grouped(&preds, &labels, None, Some(&group));
         assert!((v - 0.5).abs() < 1e-12, "{v}");
     }
 
@@ -121,18 +121,13 @@ mod tests {
         let labels = [1.0, 0.0, 0.0, 1.0];
         let weights = [3.0, 3.0, 1.0, 1.0];
         let group = GroupInfo::from_sizes(&[2, 2]);
-        let v = Precision::new("pre@1", Some(1)).eval_grouped(
-            &preds,
-            &labels,
-            Some(&weights),
-            Some(&group),
-        );
+        let v = Precision::new(Some(1)).eval_grouped(&preds, &labels, Some(&weights), Some(&group));
         assert!((v - 0.75).abs() < 1e-12, "{v}");
     }
 
     #[test]
     fn precision_rejects_graded_labels() {
-        let v = Precision::new("pre", None).eval(&[0.5, 0.2], &[2.0, 0.0], None);
+        let v = Precision::new(None).eval(&[0.5, 0.2], &[2.0, 0.0], None);
         assert!(v.is_nan());
     }
 
@@ -150,7 +145,7 @@ mod tests {
             assert_eq!(m.eval(&[], &[], None), 0.0, "{name}");
         }
         // A trailing empty group starts past the last row.
-        let pre = Precision::new("pre@1", Some(1));
+        let pre = Precision::new(Some(1));
         let group = GroupInfo::from_sizes(&[2, 0]);
         let v = pre.eval_grouped(&[0.9, 0.1], &[1.0, 0.0], Some(&[1.0, 1.0]), Some(&group));
         assert_eq!(v, 1.0);

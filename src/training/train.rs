@@ -23,6 +23,7 @@ use crate::tree::builder::{
 use crate::tree::reuse::ReuseSet;
 use crate::tree::sampler::ColumnSampler;
 use rayon::prelude::*;
+use std::ops::ControlFlow;
 use std::sync::OnceLock;
 
 /// What every boosting round of one training run reads: the parameters, the
@@ -423,7 +424,11 @@ pub struct Trainer<'a> {
     objective: Option<&'a dyn Objective>,
     metric: Option<Box<dyn Metric>>,
     init_model: Option<&'a BoostedModel>,
+    on_round: Option<RoundHook<'a>>,
 }
+
+/// The per-round hook of [`Trainer::on_round`].
+type RoundHook<'a> = Box<dyn FnMut(&RoundEval) -> ControlFlow<()> + Send + 'a>;
 
 impl<'a> Trainer<'a> {
     /// Train on `dtrain` for (at most) `num_boost_round` iterations with
@@ -438,6 +443,7 @@ impl<'a> Trainer<'a> {
             objective: None,
             metric: None,
             init_model: None,
+            on_round: None,
         }
     }
 
@@ -528,6 +534,53 @@ impl<'a> Trainer<'a> {
     #[must_use]
     pub fn init_model(mut self, model: &'a BoostedModel) -> Self {
         self.init_model = Some(model);
+        self
+    }
+
+    /// Call `hook` after every boosting round, once the round's eval sets
+    /// are scored: progress reporting, custom stopping rules, or
+    /// cancellation. It runs on the training thread, in round order, and
+    /// sees the round as [`TrainResult::history`] records it (with empty
+    /// `scores` when there are no eval sets). Returning
+    /// [`ControlFlow::Break`] ends training after that round; the result
+    /// keeps every completed round and is otherwise what training for that
+    /// many rounds would have produced.
+    ///
+    /// With [`early_stopping_rounds`](Self::early_stopping_rounds), the
+    /// hook also sees the round on which patience runs out, and a `Break`
+    /// still records the best round so far as
+    /// [`best_iteration`](BoostedModel::best_iteration) (with its
+    /// [`TrainResult::best_score`]). With `process_type=update` the model
+    /// holds the iterations refreshed so far. For `gblinear`, which stores
+    /// no boosting iterations, [`RoundEval::iteration`] counts this run's
+    /// rounds from 0.
+    ///
+    /// Observing never changes the model: training with a hook that always
+    /// continues gives the same result as training without one.
+    ///
+    /// ```
+    /// use hessboost::prelude::*;
+    /// use std::ops::ControlFlow;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+    /// let dtrain = DMatrix::from_dense(&x, 6, 1)?.with_labels(&x)?;
+    /// let params = TrainingParams::builder().max_depth(2).build()?;
+    /// let mut seen = Vec::new();
+    /// let result = Trainer::new(&params, &dtrain, 100)
+    ///     .on_round(|round| {
+    ///         seen.push(round.iteration);
+    ///         if round.iteration == 4 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+    ///     })
+    ///     .train()?;
+    /// assert_eq!(result.model.num_boost_rounds(), 5);
+    /// assert_eq!(seen, [0, 1, 2, 3, 4]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn on_round(mut self, hook: impl FnMut(&RoundEval) -> ControlFlow<()> + Send + 'a) -> Self {
+        self.on_round = Some(Box::new(hook));
         self
     }
 
@@ -635,6 +688,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
         objective: _,
         metric: metric_override,
         init_model,
+        mut on_round,
     } = trainer;
     let evals: &[EvalSet] = &evals;
     validate_request(
@@ -668,6 +722,14 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
             num_boost_round,
             objective,
             model,
+            &mut |iteration| {
+                on_round.as_mut().map_or(ControlFlow::Continue(()), |hook| {
+                    hook(&RoundEval {
+                        iteration,
+                        scores: Vec::new(),
+                    })
+                })
+            },
         );
     }
 
@@ -747,13 +809,25 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
             RoundPlan::Refresh(queue) => refresh_round(&run, queue, iteration, &mut state)?,
             RoundPlan::Grow(prepared) => grow_round(&run, prepared, iteration, &mut state)?,
         }
+        let mut stop = false;
         if !evals.is_empty() {
             let score = eval_plan.record(objective, iteration, &state.margins, &mut history);
-            if let Some(stopping) = &mut stopping
-                && stopping.observe(iteration, score)
-            {
-                break;
+            if let Some(stopping) = &mut stopping {
+                stop = stopping.observe(iteration, score);
             }
+        }
+        if let Some(hook) = &mut on_round {
+            let flow = match history.last() {
+                Some(round) if round.iteration == iteration => hook(round),
+                _ => hook(&RoundEval {
+                    iteration,
+                    scores: Vec::new(),
+                }),
+            };
+            stop |= flow.is_break();
+        }
+        if stop {
+            break;
         }
     }
 
@@ -778,13 +852,15 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
 }
 
 /// The linear (`gblinear`) booster: fit `model`'s coordinate-descent linear
-/// model instead of growing trees, continuing from its weights and margins.
-/// Eval sets and early stopping are refused (the history stays empty).
+/// model instead of growing trees, continuing from its weights and margins,
+/// with `after_round` after each round. Eval sets and early stopping are
+/// refused (the history stays empty).
 fn train_linear(
     request: &TrainRequest,
     num_boost_round: usize,
     objective: &dyn Objective,
     mut model: BoostedModel,
+    after_round: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<TrainResult> {
     let &TrainRequest {
         params,
@@ -803,9 +879,9 @@ fn train_linear(
         dtrain,
         num_boost_round,
         model.margin_from_trees(dtrain, 0..0),
-        objective.n_outputs(),
         objective,
         model.linear(),
+        after_round,
     )?;
     model.set_linear(linear);
     Ok(TrainResult {
@@ -2683,7 +2759,8 @@ mod tests {
             .unwrap();
         assert!(!res.history.is_empty());
 
-        let ndcg_of = |r: &RoundEval| r.scores.iter().find(|(_, m, _)| m == "ndcg").unwrap().2;
+        // rank:ndcg's default metric: XGBoost's `ndcg@32`.
+        let ndcg_of = |r: &RoundEval| r.scores.iter().find(|(_, m, _)| m == "ndcg@32").unwrap().2;
         let first = ndcg_of(&res.history[0]);
         let last = ndcg_of(res.history.last().unwrap());
 

@@ -33,12 +33,13 @@ fn main() -> Result<()> {
         .eta(0.2)
         .build()?;
 
-    // Watch NDCG on the training set to see it improve.
+    // Watch NDCG on the training set to see it improve. rank:ndcg's default
+    // metric is XGBoost's `ndcg@32` (NDCG of each query's top 32).
     let out = Trainer::new(&params, &dtrain, 40)
         .eval(&dtrain, "train")
         .train()?;
     let ndcg = |r: &hessboost::training::RoundEval| {
-        r.scores.iter().find(|(_, m, _)| m == "ndcg").unwrap().2
+        r.scores.iter().find(|(_, m, _)| m == "ndcg@32").unwrap().2
     };
     println!(
         "NDCG: round 0 = {:.3}  →  final = {:.3}",

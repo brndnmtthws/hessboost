@@ -77,9 +77,9 @@ reject. After changing `train.rs`'s input layout, re-check
 `fixed-seeds/train/*` with `cargo fuzz fmt train <file>`. Targets:
 `native-model`, `json-model`, `xgboost-json-model`, `xgboost-ubjson-model`,
 `lightgbm-model`, `compact-model` (accepted models must predict and
-round-trip), `loaders`,
-`train` (valid params must train or error, identically across thread
-counts).
+round-trip), `diffusion-model` (binary and JSON; accepted models must
+sample and round-trip), `loaders`, `train` (valid params must train or
+error, identically across thread counts).
 
 Python bindings: `python/` is its own crate (like `fuzz/`), built by
 maturin through uv. Unlike the root, its `Cargo.lock` and `uv.lock` are
@@ -124,6 +124,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `EbmInference`, `TermBands`, `honest_refit`); `kernel` (the `Kernel` trait the solvers read; leaf kernel over the training rows), `term_kernel` (a Boulevard EBM stage's centered additive kernel, computed on term grids), `solver` (exact Cholesky or Nyström ridge solves, Gram or solution vectors), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`, Boulevard models and Boulevard EBMs), `ebm` (shape-function bands)|
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means), `shape_functions`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds, leaves as boxes, difference arrays)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
+|`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `Samples`), `format` (`HBDM` container embedding native GBDT containers; JSON)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -156,15 +157,17 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   node splits into fixed row blocks reduced in block order, partitioned by
   the data, never the thread count, and the serial build sums the same
   blocks. Sequential draws (rows, columns, DART, folds, target-stat
-  permutations) use `rng::Rng`. Keyed draws (`extra_trees` node seeds,
-  `dist:*` split direction, quantized stochastic rounding, per-block
-  row-sampling seeds, Langevin noise) use SplitMix64 streams keyed by seed
-  and index. Boulevard rounds (dropout sets, row samples) and Nyström
-  landmarks draw from `rng::Rng` seeded per round; the inference's parallel
-  loops split by rows or fixed row blocks, never by thread. EBM rounds draw
-  from `Rng` keyed by seed, bag, stage, and round (bags' rows from
-  SplitMix64 keyed by bag); bags and a Boulevard round's per-term trees may
-  grow in parallel and are combined in bag and term order.
+  permutations, diffusion training noise, splits and folds) use
+  `rng::Rng`. Keyed draws (`extra_trees` node seeds, `dist:*` split
+  direction, quantized stochastic rounding, per-block row-sampling seeds,
+  Langevin noise, diffusion sampler noise keyed by row and sample) use
+  SplitMix64 streams keyed by seed and index. Boulevard rounds (dropout
+  sets, row samples) and Nyström landmarks draw from `rng::Rng` seeded per
+  round; the inference's parallel loops split by rows or fixed row blocks,
+  never by thread. EBM rounds draw from `Rng` keyed by seed, bag, stage,
+  and round (bags' rows from SplitMix64 keyed by bag); bags and a Boulevard
+  round's per-term trees may grow in parallel and are combined in bag and
+  term order.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
   `Trainer::on_round` only observes: a hook that always continues leaves
   the model byte-identical, and a `Break` after round `k` gives the
@@ -249,6 +252,10 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     shrinkage. Writers emit every field.
   - Compact (`HBTD`, `model/compact.rs`): section-table metadata; a bit
     stream change bumps its version byte (1).
+  - Diffusion (`HBDM`, `diffusion/format.rs`): the native container framing
+    (`model::native::frame`, `section_table`) with its own magic and version
+    byte (1), the same section rules, and the GBDTs embedded as uncompressed
+    native containers; its JSON validates through `UncheckedDiffusionModel`.
 - **Tree layout:** iteration `i` owns trees `i * trees_per_iteration ..`.
   Scalar leaves: `n_outputs × num_parallel_tree` per iteration, grouped by
   output; tree `t` feeds output `(t / num_parallel_tree) % n_outputs`.
@@ -358,7 +365,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
   `objective::distributional`, `conformal`, `model::uncertainty`,
-  `inference`, `ebm`, `training::online`).
+  `inference`, `ebm`, `diffusion`, `training::online`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.

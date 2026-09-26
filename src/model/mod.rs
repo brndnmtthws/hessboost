@@ -337,10 +337,10 @@
 
 pub mod compact;
 mod lightgbm;
-mod native;
+pub(crate) mod native;
 mod objective;
 mod predictions;
-mod sections;
+pub(crate) mod sections;
 mod shap;
 mod shrinkage;
 mod ubjson;

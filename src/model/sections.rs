@@ -21,34 +21,34 @@ use std::collections::HashMap;
 use crate::error::{HessboostError, Result};
 
 /// Section flag: readers that do not know the section must refuse the data.
-pub(super) const REQUIRED: u8 = 1;
+pub(crate) const REQUIRED: u8 = 1;
 
 /// Builds a section table.
 #[derive(Default)]
-pub(super) struct Writer {
+pub(crate) struct Writer {
     sections: Vec<(&'static str, u8, Vec<u8>)>,
 }
 
 impl Writer {
     /// Add a section with raw `payload` bytes and `flags`.
-    pub(super) fn raw(&mut self, name: &'static str, flags: u8, payload: &[u8]) {
+    pub(crate) fn raw(&mut self, name: &'static str, flags: u8, payload: &[u8]) {
         self.push(name, flags, payload.to_vec());
     }
 
-    pub(super) fn str(&mut self, name: &'static str, value: &str) {
+    pub(crate) fn str(&mut self, name: &'static str, value: &str) {
         self.raw(name, REQUIRED, value.as_bytes());
     }
 
-    pub(super) fn u64(&mut self, name: &'static str, value: u64) {
+    pub(crate) fn u64(&mut self, name: &'static str, value: u64) {
         self.raw(name, REQUIRED, &value.to_le_bytes());
     }
 
-    pub(super) fn f64(&mut self, name: &'static str, value: f64) {
+    pub(crate) fn f64(&mut self, name: &'static str, value: f64) {
         self.raw(name, REQUIRED, &value.to_le_bytes());
     }
 
     /// An array of 4- or 8-byte values.
-    pub(super) fn array<const N: usize, T: Copy>(
+    pub(crate) fn array<const N: usize, T: Copy>(
         &mut self,
         name: &'static str,
         values: impl IntoIterator<Item = T>,
@@ -69,7 +69,7 @@ impl Writer {
 
     /// The number of bytes [`Writer::finish`] appends: the table, then the
     /// payloads.
-    pub(super) fn encoded_len(&self) -> usize {
+    pub(crate) fn encoded_len(&self) -> usize {
         4 + self
             .sections
             .iter()
@@ -78,7 +78,7 @@ impl Writer {
     }
 
     /// Append the table and payloads to `out`.
-    pub(super) fn finish(self, out: &mut Vec<u8>) {
+    pub(crate) fn finish(self, out: &mut Vec<u8>) {
         out.reserve(self.encoded_len());
         out.extend_from_slice(&(self.sections.len() as u32).to_le_bytes());
         for (name, flags, payload) in &self.sections {
@@ -94,13 +94,13 @@ impl Writer {
 }
 
 /// A parsed section table.
-pub(super) struct Sections<'a>(HashMap<&'a str, &'a [u8]>);
+pub(crate) struct Sections<'a>(HashMap<&'a str, &'a [u8]>);
 
 impl<'a> Sections<'a> {
     /// Parse the table at the start of `bytes`, keeping the sections for
     /// which `known` holds. Returns the sections and the bytes after the
     /// last payload.
-    pub(super) fn parse(bytes: &'a [u8], known: impl Fn(&str) -> bool) -> Result<(Self, &'a [u8])> {
+    pub(crate) fn parse(bytes: &'a [u8], known: impl Fn(&str) -> bool) -> Result<(Self, &'a [u8])> {
         let mut r = Reader(bytes);
         let count = u32::from_le_bytes(r.array()?);
         let mut table = Vec::new();
@@ -131,33 +131,33 @@ impl<'a> Sections<'a> {
         Ok((Sections(sections), r.0))
     }
 
-    pub(super) fn has(&self, name: &str) -> bool {
+    pub(crate) fn has(&self, name: &str) -> bool {
         self.0.contains_key(name)
     }
 
-    pub(super) fn bytes(&self, name: &str) -> Result<&'a [u8]> {
+    pub(crate) fn bytes(&self, name: &str) -> Result<&'a [u8]> {
         self.0
             .get(name)
             .copied()
             .ok_or_else(|| format_error(format!("missing section `{name}`")))
     }
 
-    pub(super) fn str(&self, name: &str) -> Result<&'a str> {
+    pub(crate) fn str(&self, name: &str) -> Result<&'a str> {
         std::str::from_utf8(self.bytes(name)?)
             .map_err(|_| format_error(format!("section `{name}` is not UTF-8")))
     }
 
-    pub(super) fn u64(&self, name: &str) -> Result<u64> {
+    pub(crate) fn u64(&self, name: &str) -> Result<u64> {
         Ok(u64::from_le_bytes(self.scalar(name)?))
     }
 
     /// A `u64` section holding a count or index.
-    pub(super) fn usize(&self, name: &str) -> Result<usize> {
+    pub(crate) fn usize(&self, name: &str) -> Result<usize> {
         usize::try_from(self.u64(name)?)
             .map_err(|_| format_error(format!("section `{name}` is out of range")))
     }
 
-    pub(super) fn f64(&self, name: &str) -> Result<f64> {
+    pub(crate) fn f64(&self, name: &str) -> Result<f64> {
         Ok(f64::from_le_bytes(self.scalar(name)?))
     }
 
@@ -168,7 +168,7 @@ impl<'a> Sections<'a> {
     }
 
     /// An array of 4- or 8-byte values.
-    pub(super) fn array<const N: usize, T>(
+    pub(crate) fn array<const N: usize, T>(
         &self,
         name: &str,
         from_le: fn([u8; N]) -> T,
@@ -184,7 +184,7 @@ impl<'a> Sections<'a> {
 
     /// Section `name`'s payload, which must be exactly `len` bytes (`None`,
     /// an overflowed size, never matches).
-    pub(super) fn bytes_exact(&self, name: &str, len: Option<usize>) -> Result<&'a [u8]> {
+    pub(crate) fn bytes_exact(&self, name: &str, len: Option<usize>) -> Result<&'a [u8]> {
         let bytes = self.bytes(name)?;
         if Some(bytes.len()) == len {
             Ok(bytes)
@@ -194,7 +194,7 @@ impl<'a> Sections<'a> {
     }
 
     /// An array of exactly `count` 4- or 8-byte values.
-    pub(super) fn array_exact<const N: usize, T>(
+    pub(crate) fn array_exact<const N: usize, T>(
         &self,
         name: &str,
         count: usize,
@@ -230,12 +230,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(super) fn format_error(msg: impl Into<String>) -> HessboostError {
+pub(crate) fn format_error(msg: impl Into<String>) -> HessboostError {
     HessboostError::model_format(msg)
 }
 
 /// The error for a section whose length disagrees with the counts that
 /// size it.
-pub(super) fn wrong_length(name: &str) -> HessboostError {
+pub(crate) fn wrong_length(name: &str) -> HessboostError {
     format_error(format!("section `{name}` has the wrong length"))
 }

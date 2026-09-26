@@ -35,8 +35,9 @@ and `λ` is the L2 penalty `lambda`.
 - **More than XGBoost, opt-in.** Conformal intervals, confidence intervals
   for the regression function (Boulevard boosting), explainable boosting
   machines with shape-function bands, distributional boosting, SGLB
-  uncertainty, budget training, compact models, XE-NDCG ranking, and more —
-  all off by default, none of them changes default training.
+  uncertainty, tree-based diffusion, budget training, compact models,
+  XE-NDCG ranking, and more — all off by default, none of them changes
+  default training.
 
 ## Getting started
 
@@ -112,6 +113,7 @@ runnable programs live in [`examples/`](examples)
 | `ebm` | an explainable boosting machine's shape functions and their confidence bands |
 | `distributional` | predictive distributions, intervals, and NLL |
 | `virtual_ensembles` | SGLB posterior sampling: knowledge uncertainty rising off the training data |
+| `tree_diffusion` | sampling multimodal and skewed `p(y \| x)` with tree diffusion and flow matching |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
 | `budget` | budget training against default and tuned training |
@@ -168,6 +170,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | [Explainable boosting machines](https://docs.rs/hessboost/latest/hessboost/ebm/) | GA²M models (`booster = ebm`): cyclic per-feature trees, outer bags with per-bag early stopping, FAST pair terms (Lou et al., KDD 2013; InterpretML), numerical and categorical terms, per-term shape functions, and with `ebm_boulevard` confidence bands on every shape (Fang, Tan, Pipping & Hooker, AISTATS 2026) |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
+| [Tree-based diffusion](https://docs.rs/hessboost/latest/hessboost/diffusion/) | nonparametric `p(y \| x)` for scalar or vector labels (multimodal, skewed, heavy-tailed) by conditional diffusion or flow matching with GBDT score models, after Treeffuser and DiffGBM |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/) | add or delete training rows of a trained model (incremental learning, machine unlearning): exact, or approximate and faster than retraining for small changes, after Lin et al. |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
@@ -192,6 +195,10 @@ Beyond XGBoost (opt-in, none changes default training):
 - gblinear, custom-objective, `dist:*`, and linear-leaf models have no
   XGBoost encoding — native formats only.
 - 0.1.x native model files are refused.
+- Diffusion models return samples, not densities, and save in their own
+  native and JSON formats only. Each sampling step is one batch prediction
+  (two for Heun) over every row × sample pair: 50 steps for score
+  diffusion, 5 for flow matching.
 - GPU training is exact, not fast yet: unmeasured against multicore CPU.
   Metal needs macOS 10.15+ and a 64-bit-integer GPU (all Apple Silicon).
 - Budget training runs 10–54× a depth-6 `hist` fit with the same tree count.

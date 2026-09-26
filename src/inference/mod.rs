@@ -744,7 +744,15 @@ pub struct ImportanceTest {
 /// Fitting the reduced model on a permuted copy of the tested features
 /// (so both fits smooth the same number of dimensions) does not change
 /// these numbers, and neither do more rounds, so neither mismatched
-/// smoothing bias nor Monte-Carlo noise of the ensemble drives them. Read a
+/// smoothing bias nor Monte-Carlo noise of the ensemble drives them. In
+/// the paper's setup the ratio of the across-sample variance of an honest
+/// estimate to [`BoulevardInference::standard_errors`]`²` is 1.06 when the
+/// tree structures are held fixed and only the refit sample is redrawn, but
+/// 1.96 when the structures are retrained too, which locates the missing
+/// term. The authors' reference package (`boulevard-boosting` 0.1.0a1, no
+/// honest refit), with the test assembled from its own weight vectors,
+/// rejects the null at 0.95 (mean `T / df` 3.4) in the same setup at
+/// `n = 1000`, as this crate does without the refit (0.99, 3.4). Read a
 /// rejection as evidence only when the per-point variance is calibrated for
 /// the problem at hand: a simulation of [`BoulevardInference::standard_errors`]
 /// against the across-sample spread of the predictions (their ratio is the

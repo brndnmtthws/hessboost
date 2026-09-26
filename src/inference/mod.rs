@@ -93,6 +93,14 @@
 //!   the intervals behave well in practice without enforcing all of them.
 //! - Enough rounds that the ensemble is near its limit: the variance is the
 //!   limit's.
+//! - Every variance here is **conditional on the tree structures** (the
+//!   kernel is treated as fixed, as in both papers). How the structures, and
+//!   with them the fit's bias, vary between training samples is not
+//!   included. In one dimension with small bias this is negligible (honest
+//!   95% intervals cover at 0.95); in several dimensions the true variance
+//!   can be a multiple of the estimate, intervals under-cover, and
+//!   [`importance_test`] rejects a true null far more often than its level
+//!   (see its documentation for measured sizes).
 //!
 //! # Example
 //!
@@ -712,6 +720,36 @@ pub struct ImportanceTest {
 /// points that duplicate others (numerically) are dropped from `Ξ` and the
 /// degrees of freedom. Keep `m` well below the training sizes; the cost is
 /// that of `m` variance queries plus `O(m³)`.
+///
+/// # Size: the test is anti-conservative outside a narrow regime
+///
+/// `Ξ` is the variance of `d` **given the two ensembles' tree
+/// structures**, as every variance in this module is (the papers' kernel
+/// ridge limit treats the kernel as fixed). It omits how much each
+/// estimate's structure-dependent bias varies from one training sample to
+/// the next. [`honest_refit`] removes the adaptivity of the leaves but not
+/// this term, so the statistic is inflated by roughly the ratio of the
+/// estimates' true to estimated variance, and the inflation compounds over
+/// the `m` points. Measured (honest refits of both fits, BRAT-D, independent
+/// halves, `m = 20` points, nominal 5%):
+///
+/// | setting | `n` | rejection rate under `H₀` |
+/// |---|---|---|
+/// | 1-d signal, `λ = 0.6`, `p = 0.6`, depth 8 (40 seeds) | 1000 | 0.100 |
+/// | same | 2000 | 0.125 |
+/// | paper's §6 setup `4x₁ − x₂² (+ w x₃)`, `λ = 1`, `p = 0.95`, depth 6 (100 seeds) | 1000 | 0.82 |
+/// | same | 2000 | 0.94 |
+/// | same, `m = 1` (200 seeds; mean `T / df` = 2.1) | 1000 | 0.195 |
+///
+/// Fitting the reduced model on a permuted copy of the tested features
+/// (so both fits smooth the same number of dimensions) does not change
+/// these numbers, and neither do more rounds, so neither mismatched
+/// smoothing bias nor Monte-Carlo noise of the ensemble drives them. Read a
+/// rejection as evidence only when the per-point variance is calibrated for
+/// the problem at hand: a simulation of [`BoulevardInference::standard_errors`]
+/// against the across-sample spread of the predictions (their ratio is the
+/// expected `T / df` under `H₀`), low dimension, small bias, and few test
+/// points.
 ///
 /// # Errors
 ///

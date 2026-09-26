@@ -217,6 +217,16 @@ fn balanced_bagging_refuses_unsupported_parameters_and_labels() {
         ),
         "pos_bagging_fraction"
     );
+    let multi = DMatrix::from_dense(&[0.0, 1.0, 1.0, 0.0], 2, 2)
+        .unwrap()
+        .with_label_matrix(&[0.0, 1.0, 1.0, 0.0], 2)
+        .unwrap();
+    let binary = TrainingParams::builder()
+        .objective("binary:logistic")
+        .pos_bagging_fraction(0.5)
+        .build()
+        .unwrap();
+    assert_eq!(invalid_param(train(&binary, &multi, 1)), "labels");
 }
 /// splits on a zero-weight feature, for every tree method and sampling stage.
 #[test]

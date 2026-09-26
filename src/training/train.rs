@@ -926,6 +926,12 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
     }
     if params.pos_bagging_fraction < 1.0 || params.neg_bagging_fraction < 1.0 {
+        if dtrain.n_targets() != 1 {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                "balanced bagging requires exactly one label column",
+            ));
+        }
         let labels = dtrain.labels().ok_or(HessboostError::EmptyDataset(
             "train: balanced bagging requires binary labels",
         ))?;

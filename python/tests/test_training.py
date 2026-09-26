@@ -3,6 +3,8 @@ determinism invariants."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 from conftest import classes, regression
@@ -252,6 +254,39 @@ def test_virtual_ensembles_and_uncertainty() -> None:
     with pytest.raises(HessboostError, match="uncertainty is defined"):
         ranker.predict_uncertainty(x[:40], 2)
 
+
+def test_sglb_parameters_train_and_refuse_conflicts() -> None:
+    x, y = regression(rows=200)
+    dtrain = DMatrix(x, y)
+    explicit = hessboost.train(
+        {
+            "langevin": True,
+            "diffusion_temperature": 50.0,
+            "model_shrink_rate": 0.3,
+            "model_shrink_mode": "decreasing",
+            "max_depth": 2,
+        },
+        dtrain,
+        12,
+    )
+    # Shrinkage rescales every iteration: a later range start is refused, and
+    # a prefix slice is the model after that many iterations.
+    with pytest.raises(HessboostError, match="model shrinkage"):
+        explicit.predict(x, iteration_range=(2, 5))
+    np.testing.assert_array_equal(
+        explicit[:5].predict(x), explicit.predict(x, iteration_range=(0, 5))
+    )
+    conflicts: list[tuple[dict[str, Any], str]] = [
+        ({"posterior_sampling": True, "langevin": False}, "langevin"),
+        ({"posterior_sampling": True, "diffusion_temperature": 5.0}, "diffusion_temperature"),
+        ({"model_shrink_mode": "decreasing"}, "model_shrink_mode"),
+        ({"langevin": True, "booster": "dart"}, "langevin"),
+    ]
+    for conflict, key in conflicts:
+        with pytest.raises(HessboostError, match=key):
+            hessboost.train(conflict, dtrain, 2)
+    with pytest.raises(HessboostError, match="model_shrink_mode"):
+        hessboost.train({"model_shrink_mode": "sometimes"}, dtrain, 2)
 
 
 def test_early_stopping_records_the_best_iteration() -> None:

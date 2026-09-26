@@ -3,9 +3,10 @@
 //! against the same scalar label.
 
 use super::absolute::residual_scales;
-use super::{GradPair, Objective, fit_stump, weighted_label_mean};
+use super::{Expectiles, GradPair, Loss, Quantiles, fit_stump, weighted_label_mean};
 use crate::K_RT_EPS_F32;
-use crate::error::{HessboostError, Result};
+use crate::error::Result;
+use crate::metric::EvalMetric;
 
 /// Bandwidth factor `c` of XGBoost's smoothed quantile score
 /// (`kSmoothingScale`).
@@ -13,33 +14,6 @@ const SMOOTHING_SCALE: f32 = 0.04;
 /// Relative floor of the quantile surrogate curvature `tanh(x)/x`
 /// (`kMinSurrogateRatio`).
 const MIN_SURROGATE_RATIO: f32 = 3.0e-4;
-
-/// Check an alpha list the way XGBoost's `QuantileLossParam::Validate` /
-/// `ExpectileLossParam::Validate` do (after rounding to `f32`, as XGBoost
-/// stores them): non-empty, every entry in `[0, 1]`, ascending (equal
-/// neighbours allowed).
-pub(crate) fn validate_alphas(param: &'static str, alphas: &[f64]) -> Result<Vec<f32>> {
-    let alpha: Vec<f32> = alphas.iter().map(|&a| a as f32).collect();
-    if alpha.is_empty() {
-        return Err(HessboostError::invalid_param(
-            param,
-            "is required and must list at least one value",
-        ));
-    }
-    if !alpha.iter().all(|a| (0.0..=1.0).contains(a)) {
-        return Err(HessboostError::invalid_param(
-            param,
-            "every value must be in the range [0, 1]",
-        ));
-    }
-    if !alpha.is_sorted() {
-        return Err(HessboostError::invalid_param(
-            param,
-            "values must be sorted in ascending order",
-        ));
-    }
-    Ok(alpha)
-}
 
 /// Quantile regression (`reg:quantileerror`) with XGBoost 3.4's
 /// automatically scaled, logistic-smoothed pinball score.
@@ -58,20 +32,30 @@ pub(crate) fn validate_alphas(param: &'static str, alphas: &[f64]) -> Result<Vec
 /// `WeightedQuantile`). Predictions sort each row's outputs ascending, so
 /// reported quantiles never cross; there is no link function.
 #[derive(Debug, Clone)]
-pub struct Quantile {
+pub(crate) struct Quantile {
+    levels: Quantiles,
     alpha: Vec<f32>,
 }
 
 impl Quantile {
-    /// Create for the quantile levels `alpha` (XGBoost `quantile_alpha`).
+    /// The loss at the levels `levels`.
+    pub(crate) fn from_levels(levels: Quantiles) -> Self {
+        Quantile {
+            alpha: levels.alpha_f32(),
+            levels,
+        }
+    }
+
+    /// The loss at the quantile levels `alpha` (XGBoost `quantile_alpha`).
     ///
     /// # Errors
     ///
     /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
-    pub fn new(alpha: &[f64]) -> Result<Self> {
-        Ok(Quantile {
-            alpha: validate_alphas("quantile_alpha", alpha)?,
-        })
+    #[cfg(test)]
+    pub(crate) fn new(alpha: &[f64]) -> Result<Self> {
+        Ok(Quantile::from_levels(Quantiles::new(
+            alpha.iter().copied(),
+        )?))
     }
 }
 
@@ -148,7 +132,7 @@ fn weighted_quantile(alpha: f32, labels: &[f32], weights: &[f32], order: &[usize
     labels[order[idx]]
 }
 
-impl Objective for Quantile {
+impl Loss for Quantile {
     fn name(&self) -> &'static str {
         "reg:quantileerror"
     }
@@ -236,8 +220,8 @@ impl Objective for Quantile {
         }
     }
 
-    fn default_metric(&self) -> String {
-        "quantile".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::Quantile(self.levels.clone())
     }
 }
 
@@ -255,20 +239,30 @@ impl Objective for Quantile {
 /// (weighted) label mean, plus the mean, made non-decreasing by a running
 /// maximum, then mapped to margins with the inverse softplus gaps.
 #[derive(Debug, Clone)]
-pub struct Expectile {
+pub(crate) struct Expectile {
+    levels: Expectiles,
     alpha: Vec<f32>,
 }
 
 impl Expectile {
-    /// Create for the expectile levels `alpha` (XGBoost `expectile_alpha`).
+    /// The loss at the levels `levels`.
+    pub(crate) fn from_levels(levels: Expectiles) -> Self {
+        Expectile {
+            alpha: levels.alpha_f32(),
+            levels,
+        }
+    }
+
+    /// The loss at the expectile levels `alpha` (XGBoost `expectile_alpha`).
     ///
     /// # Errors
     ///
     /// `alpha` is empty, has an entry outside `[0, 1]`, or is not ascending.
-    pub fn new(alpha: &[f64]) -> Result<Self> {
-        Ok(Expectile {
-            alpha: validate_alphas("expectile_alpha", alpha)?,
-        })
+    #[cfg(test)]
+    pub(crate) fn new(alpha: &[f64]) -> Result<Self> {
+        Ok(Expectile::from_levels(Expectiles::new(
+            alpha.iter().copied(),
+        )?))
     }
 }
 
@@ -296,7 +290,7 @@ fn expectile_scale(diff: f32, alpha: f32) -> f32 {
     if diff >= 0.0 { 1.0 - alpha } else { alpha }
 }
 
-impl Objective for Expectile {
+impl Loss for Expectile {
     fn name(&self) -> &'static str {
         "reg:expectileerror"
     }
@@ -411,14 +405,16 @@ impl Objective for Expectile {
         out
     }
 
-    fn default_metric(&self) -> String {
-        "expectile".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::Expectile(self.levels.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::HessboostError;
+    use crate::objective::Objective;
     use crate::objective::{base_margins, gradient_pairs};
     use crate::training::Trainer;
 
@@ -599,8 +595,9 @@ mod tests {
             .collect();
         let d = crate::test_support::labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective("reg:quantileerror")
-            .quantile_alpha(vec![0.1, 0.5, 0.9])
+            .objective(Objective::Quantile(
+                Quantiles::new(vec![0.1, 0.5, 0.9]).unwrap(),
+            ))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -647,8 +644,7 @@ mod tests {
         let x: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
         let d = crate::test_support::labeled_dense(&x, n, 1, &x);
         let params = TrainingParams::builder()
-            .objective("reg:quantileerror")
-            .quantile_alpha(vec![0.1, 0.9])
+            .objective(Objective::Quantile(Quantiles::new(vec![0.1, 0.9]).unwrap()))
             .max_depth(2)
             .build()
             .unwrap();
@@ -669,58 +665,48 @@ mod tests {
         close(model.predict(&d).unwrap(), restored.predict(&d).unwrap());
     }
 
-    /// Every alpha output fits the one label column: a label matrix handed
-    /// to training with a directly constructed objective is refused.
+    /// Every alpha output fits the one label column: a label matrix is
+    /// refused for the alpha objectives.
     #[test]
     fn alpha_objectives_require_one_label_column() {
         use crate::config::TrainingParams;
         use crate::data::DMatrix;
+        use crate::objective::{Expectiles, Objective, Quantiles};
         let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1)
             .unwrap()
             .with_label_matrix(&[0.0, 1.0, 1.0, 2.0], 2)
             .unwrap();
-        let params = TrainingParams::builder().build().unwrap();
-        let objectives: [Box<dyn Objective>; 2] = [
-            Box::new(Quantile::new(&[0.1, 0.9]).unwrap()),
-            Box::new(Expectile::new(&[0.1, 0.9]).unwrap()),
-        ];
-        for obj in &objectives {
+        for objective in [
+            Objective::Quantile(Quantiles::new([0.1, 0.9]).unwrap()),
+            Objective::Expectile(Expectiles::new([0.1, 0.9]).unwrap()),
+        ] {
+            let params = TrainingParams::builder()
+                .objective(objective)
+                .build()
+                .unwrap();
             assert!(matches!(
-                Trainer::new(&params, &d, 1).objective(obj.as_ref()).train(),
+                Trainer::new(&params, &d, 1).train(),
                 Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
             ));
         }
     }
 
-    /// A directly constructed built-in objective must match the training
-    /// parameters it is saved with, or the trained model could not be loaded:
-    /// training refuses the mismatch and accepts the matching alphas.
+    /// A trained quantile model records its alphas, so the saved model
+    /// rebuilds its objective and loads.
     #[test]
-    fn training_refuses_alphas_the_saved_model_cannot_rebuild() {
+    fn trained_alphas_rebuild_on_load() {
         use crate::config::TrainingParams;
         use crate::model::BoostedModel;
+        use crate::objective::{Objective, Quantiles};
         let d =
             crate::test_support::labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 1.0, 2.0, 3.0]);
-        let obj = Quantile::new(&[0.1, 0.9]).unwrap();
-        for alphas in [vec![], vec![0.5]] {
-            let params = TrainingParams::builder()
-                .quantile_alpha(alphas)
-                .build()
-                .unwrap();
-            assert!(matches!(
-                Trainer::new(&params, &d, 1).objective(&obj).train(),
-                Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
-            ));
-        }
+        let objective = Objective::Quantile(Quantiles::new([0.1, 0.9]).unwrap());
         let params = TrainingParams::builder()
-            .quantile_alpha(vec![0.1, 0.9])
+            .objective(objective.clone())
             .build()
             .unwrap();
-        let model = Trainer::new(&params, &d, 1)
-            .objective(&obj)
-            .train()
-            .unwrap()
-            .model;
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        let model = Trainer::new(&params, &d, 1).train().unwrap().model;
+        let loaded = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        assert_eq!(loaded.objective().built_in(), Some(&objective));
     }
 }

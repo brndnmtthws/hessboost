@@ -11,7 +11,7 @@
 //! computed stably; for complements below `f32::EPSILON`, the higher-order
 //! correction is replaced by its finite first-order gradient limit.
 
-use super::{GradPair, Objective, check_label_domain, check_label_width};
+use super::{GradPair, Loss, check_label_domain, check_label_width};
 use crate::data::{GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::group_ranges;
@@ -21,8 +21,8 @@ use rayon::prelude::*;
 
 /// Query batches this large use the same disjoint-group parallel strategy as LambdaMART.
 const PARALLEL_XENDCG_ROWS: usize = 4096;
-/// XE-NDCG objective (LightGBM `rank_xendcg`, named `rank:xendcg` here).
-pub struct Xendcg {
+/// XE-NDCG loss (LightGBM `rank_xendcg`, named `rank:xendcg` here).
+pub(crate) struct Xendcg {
     seed: u64,
 }
 
@@ -44,8 +44,65 @@ struct QueryScratch {
 
 impl Xendcg {
     /// Construct XE-NDCG with the seed used to key its random draws.
-    pub fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { seed }
+    }
+
+    /// The gradients of boosting round `iteration`, query by query (the
+    /// whole input is one query without `group`).
+    fn query_gradients(
+        &self,
+        preds: &[f32],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        group: Option<&GroupInfo>,
+        out: &mut [GradPair],
+        iteration: usize,
+    ) {
+        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
+        out.fill(GradPair::default());
+        let ranges = group_ranges(preds.len(), group);
+        let mut queries = Vec::with_capacity(ranges.len());
+        let mut rest = &mut out[..];
+        let mut offset = 0;
+        for (start, end) in ranges {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - offset);
+            let (query_out, tail) = tail.split_at_mut(end - start);
+            rest = tail;
+            offset = end;
+            queries.push((start, query_out));
+        }
+        let process_query =
+            |scratch: &mut QueryScratch,
+             (query, (start, query_out)): (usize, (usize, &mut [GradPair]))| {
+                let end = start + query_out.len();
+                Self::accumulate_query(
+                    &QueryGradient {
+                        seed: self.seed,
+                        iteration,
+                        query,
+                        scores: &preds[start..end],
+                        labels: &labels[start..end],
+                        weights: weights.map(|w| &w[start..end]),
+                    },
+                    query_out,
+                    scratch,
+                );
+            };
+        if preds.len() >= PARALLEL_XENDCG_ROWS
+            && queries.len() > 1
+            && rayon::current_num_threads() > 1
+        {
+            queries
+                .into_par_iter()
+                .enumerate()
+                .for_each_init(QueryScratch::default, process_query);
+        } else {
+            let mut scratch = QueryScratch::default();
+            for item in queries.into_iter().enumerate() {
+                process_query(&mut scratch, item);
+            }
+        }
     }
 
     fn accumulate_query(
@@ -151,7 +208,7 @@ impl Xendcg {
     }
 }
 
-impl Objective for Xendcg {
+impl Loss for Xendcg {
     fn name(&self) -> &'static str {
         "rank:xendcg"
     }
@@ -163,7 +220,7 @@ impl Objective for Xendcg {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        self.gradient_grouped_at(preds, labels, weights, None, out, 0);
+        self.query_gradients(preds, labels, weights, None, out, 0);
     }
 
     fn gradient_grouped(
@@ -174,62 +231,7 @@ impl Objective for Xendcg {
         group: Option<&GroupInfo>,
         out: &mut [GradPair],
     ) {
-        self.gradient_grouped_at(preds, labels, weights, group, out, 0);
-    }
-
-    fn gradient_grouped_at(
-        &self,
-        preds: &[f32],
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        group: Option<&GroupInfo>,
-        out: &mut [GradPair],
-        iteration: usize,
-    ) {
-        super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
-        out.fill(GradPair::default());
-        let ranges = group_ranges(preds.len(), group);
-        let mut queries = Vec::with_capacity(ranges.len());
-        let mut rest = &mut out[..];
-        let mut offset = 0;
-        for (start, end) in ranges {
-            let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - offset);
-            let (query_out, tail) = tail.split_at_mut(end - start);
-            rest = tail;
-            offset = end;
-            queries.push((start, query_out));
-        }
-        let process_query =
-            |scratch: &mut QueryScratch,
-             (query, (start, query_out)): (usize, (usize, &mut [GradPair]))| {
-                let end = start + query_out.len();
-                Self::accumulate_query(
-                    &QueryGradient {
-                        seed: self.seed,
-                        iteration,
-                        query,
-                        scores: &preds[start..end],
-                        labels: &labels[start..end],
-                        weights: weights.map(|w| &w[start..end]),
-                    },
-                    query_out,
-                    scratch,
-                );
-            };
-        if preds.len() >= PARALLEL_XENDCG_ROWS
-            && queries.len() > 1
-            && rayon::current_num_threads() > 1
-        {
-            queries
-                .into_par_iter()
-                .enumerate()
-                .for_each_init(QueryScratch::default, process_query);
-        } else {
-            let mut scratch = QueryScratch::default();
-            for item in queries.into_iter().enumerate() {
-                process_query(&mut scratch, item);
-            }
-        }
+        self.query_gradients(preds, labels, weights, group, out, 0);
     }
 
     fn gradient_info_at(
@@ -239,7 +241,7 @@ impl Objective for Xendcg {
         out: &mut [GradPair],
         iteration: usize,
     ) {
-        self.gradient_grouped_at(preds, info.labels, info.weights, info.group, out, iteration);
+        self.query_gradients(preds, info.labels, info.weights, info.group, out, iteration);
     }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
@@ -274,8 +276,9 @@ impl Objective for Xendcg {
         Ok(())
     }
 
-    fn default_metric(&self) -> String {
-        "ndcg".to_owned()
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        // LightGBM's default `ndcg` metric, over whole queries.
+        crate::metric::EvalMetric::Ndcg(crate::metric::Cutoff::all())
     }
 }
 
@@ -312,13 +315,13 @@ mod tests {
         ];
         let objective = Xendcg::new(0);
         let mut actual = [GradPair::default(); 2];
-        objective.gradient_grouped_at(&scores, &labels, None, None, &mut actual, 0);
+        objective.query_gradients(&scores, &labels, None, None, &mut actual, 0);
         assert_eq!(actual[0].grad, expected[0]);
         assert_eq!(actual[1].grad, expected[1]);
         assert_eq!(actual[0].hess, 0.25);
         assert_eq!(actual[1].hess, 0.25);
         let mut again = [GradPair::default(); 2];
-        objective.gradient_grouped_at(&scores, &labels, None, None, &mut again, 4);
+        objective.query_gradients(&scores, &labels, None, None, &mut again, 4);
         assert_ne!(actual, again);
     }
     #[test]
@@ -327,7 +330,7 @@ mod tests {
         let objective = Xendcg::new(0);
         let mut actual = [GradPair::default(); 2];
         for scores in [[100.0, 0.0], [f32::MAX, -f32::MAX]] {
-            objective.gradient_grouped_at(&scores, &labels, None, None, &mut actual, 0);
+            objective.query_gradients(&scores, &labels, None, None, &mut actual, 0);
             assert!(
                 actual
                     .iter()
@@ -350,14 +353,7 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let mut result = vec![GradPair::default(); scores.len()];
-                objective.gradient_grouped_at(
-                    &scores,
-                    &labels,
-                    None,
-                    Some(&group),
-                    &mut result,
-                    12,
-                );
+                objective.query_gradients(&scores, &labels, None, Some(&group), &mut result, 12);
                 result
             })
         };

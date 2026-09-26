@@ -30,7 +30,7 @@ def dtrain() -> DMatrix:
         ({"max_depth": 2.5}, r"parameter `max_depth`"),
         ({"tree_method": "gpu_hist"}, r"unknown variant `gpu_hist`"),
         ({"device": "cuda"}, r"unknown variant `cuda`"),
-        ({"eta": 0.1, "learning_rate": 0.2}, r"`eta` is set twice"),
+        ({"eta": 0.1, "learning_rate": 0.2}, r"`eta`: is set twice"),
         ({"subsample": 1.5}, r"subsample"),
         ({"eta": float("nan")}, r"`eta` must be finite"),
         ({"missing": 0.0}, r"DMatrix\(data, missing=\.\.\.\)"),

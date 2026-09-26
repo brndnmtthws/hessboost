@@ -1,10 +1,43 @@
 //! Learning objectives: gradients, Hessians, prediction transforms, and base
 //! score estimation.
 //!
-//! Every objective implements [`Objective`]. Boosting works in *margin* space
-//! (raw additive scores). The [`Objective::pred_transform`] maps margins to the
-//! reported prediction (e.g. the logistic sigmoid). This mirrors XGBoost's
-//! separation of `GetGradient` / `PredTransform`.
+//! Every objective trains through a [`Loss`]. Boosting works in *margin*
+//! space (raw additive scores). The [`Loss::pred_transform`] maps margins to
+//! the reported prediction (e.g. the logistic sigmoid). This mirrors
+//! XGBoost's separation of `GetGradient` / `PredTransform`.
+//!
+//! A configuration names its objective with [`Objective`]: a built-in
+//! XGBoost objective with its parameters ([`Logistic`], [`Multiclass`],
+//! [`PseudoHuber`], [`Quantiles`], [`Expectiles`], [`Tweedie`],
+//! [`LambdaRank`], [`Aft`], [`distributional::Distributional`]; each
+//! validated when constructed, several shared with the metrics that read
+//! them), or [`Objective::Custom`] with any [`Loss`] such as
+//! [`CustomLoss`].
+//! [`TrainingParams::loss`](crate::config::TrainingParams::loss) builds the
+//! loss a configuration trains with.
+
+/// Stable names of the enums a model file stores, matching their serde
+/// (and XGBoost) spellings. Defined before the submodules so they can use it.
+macro_rules! stored_names {
+    ($($ty:ident { $($variant:ident => $name:literal),+ $(,)? })+) => {$(
+        impl $ty {
+            /// The variant's stored name.
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $($ty::$variant => $name,)+
+                }
+            }
+
+            /// The variant stored as `name`, if any.
+            pub(crate) fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some($ty::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    )+};
+}
 
 mod absolute;
 mod classification;
@@ -13,34 +46,38 @@ mod custom;
 pub mod distributional;
 mod multi_target;
 mod multiclass;
+mod params;
 mod quantile;
 mod ranking;
 mod regression;
+mod spec;
 mod survival;
 mod xendcg;
 
-pub use absolute::AbsoluteError;
-pub use classification::{Hinge, Logistic};
-pub use count::{Gamma, Poisson, Tweedie};
-pub use custom::CustomObjective;
-pub use multiclass::Softmax;
-pub use quantile::{Expectile, Quantile};
-pub use ranking::LambdaMart;
-pub use regression::{PseudoHuber, SquaredError, SquaredLogError};
-pub use xendcg::Xendcg;
+pub(crate) use absolute::AbsoluteError;
+pub(crate) use classification::{Hinge, LogisticLoss};
+pub(crate) use count::{Gamma, Poisson, TweedieLoss};
+pub use custom::CustomLoss;
+pub(crate) use multiclass::Softmax;
+pub use params::{
+    Aft, AftDistribution, Expectiles, LambdaRank, Logistic, Multiclass, PseudoHuber, Quantiles,
+    Tweedie,
+};
+pub(crate) use quantile::{Expectile, Quantile};
+pub(crate) use ranking::LambdaMart;
+pub(crate) use regression::{PseudoHuberLoss, SquaredError, SquaredLogError};
+pub use spec::Objective;
+pub(crate) use spec::{LossContext, ObjectiveParts};
+pub(crate) use xendcg::Xendcg;
 
-pub(crate) use quantile::validate_alphas;
-
-pub use survival::{Aft, Cox};
+pub(crate) use survival::{AftLoss, Cox};
 
 pub(crate) use survival::{abs_label_order, aft_nloglik};
 
 use rayon::prelude::*;
 
-use crate::config::TrainingParams;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
-use distributional::{DistFamily, DistObjective};
 
 /// A first- and second-order gradient for one instance/output: a fixed
 /// pair, built with [`GradPair::new`] or a struct literal.
@@ -67,11 +104,11 @@ impl GradPair {
 /// A per-row loss `ℓ(margin, label)`, unweighted by the sample weight, whose
 /// first and second derivatives with respect to the margin are the gradient
 /// pairs the objective produces (up to Hessian safeguards such as
-/// `max_delta_step`). Returned by [`Objective::pointwise_loss`].
+/// `max_delta_step`). Returned by [`Loss::pointwise_loss`].
 pub type PointwiseLoss<'a> = Box<dyn Fn(f32, f32) -> f64 + Send + Sync + 'a>;
 
 /// Reduced gradients a custom objective supplies for the *split search* of
-/// vector-leaf trees (see [`Objective::split_gradient`]). Build with
+/// vector-leaf trees (see [`Loss::split_gradient`]). Build with
 /// [`SplitGradient::new`].
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -198,7 +235,7 @@ pub(crate) fn elementwise_gradient(
 /// The pairs `objective.gradient` writes for `preds` (one per margin).
 #[cfg(test)]
 fn gradient_pairs(
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
@@ -211,11 +248,11 @@ fn gradient_pairs(
 /// The intercepts `objective.base_margins_info` estimates from single-target
 /// labels and weights.
 #[cfg(test)]
-fn base_margins(objective: &dyn Objective, labels: &[f32], weights: Option<&[f32]>) -> Vec<f32> {
+fn base_margins(objective: &dyn Loss, labels: &[f32], weights: Option<&[f32]>) -> Vec<f32> {
     objective.base_margins_info(&MetaInfo::new(labels, weights, None))
 }
 
-/// Debug-only shape check shared by every [`Objective::gradient`]: `preds` and
+/// Debug-only shape check shared by every [`Loss::gradient`]: `preds` and
 /// `out` hold `n_rows * n_outputs` values while `labels` (and `weights`, when
 /// present) hold one per row. Release builds skip it; [`rowwise_gradient`]
 /// runs it and re-validates the same shapes at runtime for its chunking
@@ -236,10 +273,14 @@ pub(crate) fn check_gradient_inputs(
     }
 }
 
-/// A differentiable learning objective.
+/// A differentiable training loss: gradients, Hessians, the prediction
+/// transform, and the intercept estimate of one learning objective. Every
+/// built-in objective is one, and [`CustomLoss`] (or any other
+/// implementation) trains as [`Objective::Custom`] (built with
+/// [`Objective::custom`]).
 ///
 /// Implementors are `Send + Sync` so gradient computation can be parallelized.
-pub trait Objective: Send + Sync {
+pub trait Loss: Send + Sync {
     /// The XGBoost-compatible objective name (e.g. `"reg:squarederror"`).
     fn name(&self) -> &str;
 
@@ -267,7 +308,7 @@ pub trait Objective: Send + Sync {
     ///
     /// Learning-to-rank objectives (LambdaMART) override this to form document
     /// pairs *within* each group supplied by `group`. The default forwards to
-    /// [`Objective::gradient`], ignoring the grouping. This is correct for all
+    /// [`Loss::gradient`], ignoring the grouping. This is correct for all
     /// non-ranking objectives.
     fn gradient_grouped(
         &self,
@@ -279,29 +320,22 @@ pub trait Objective: Send + Sync {
     ) {
         self.gradient(preds, labels, weights, out);
     }
-    /// Grouped gradient hook with the absolute boosting iteration. This lets
-    fn gradient_grouped_at(
-        &self,
-        preds: &[f32],
-        labels: &[f32],
-        weights: Option<&[f32]>,
-        group: Option<&crate::data::GroupInfo>,
-        out: &mut [GradPair],
-        _iteration: usize,
-    ) {
-        self.gradient_grouped(preds, labels, weights, group, out);
-    }
 
     /// Compute gradients from a dataset's full metadata view.
     ///
     /// This is the entry point the training loops call. The default forwards
-    /// the labels, weights, and groups to [`Objective::gradient_grouped`];
+    /// the labels, weights, and groups to [`Loss::gradient_grouped`];
     /// objectives that read other metadata (label bounds, several targets per
     /// row) override it.
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
         self.gradient_grouped(preds, info.labels, info.weights, info.group, out);
     }
-    /// Metadata-aware gradient hook with the absolute boosting iteration.
+
+    /// Compute the gradients of boosting round `iteration` (counted from
+    /// the model's first round, so continued training carries on) from a
+    /// dataset's full metadata view: what training calls. Losses whose
+    /// gradients are randomized per round (XE-NDCG's targets) override it;
+    /// the default forwards to [`Loss::gradient_info`].
     fn gradient_info_at(
         &self,
         preds: &[f32],
@@ -321,22 +355,22 @@ pub trait Objective: Send + Sync {
     /// Transform raw margins into reported predictions, in place. Default is the
     /// identity (used by squared-error regression). An objective whose
     /// transform is an inverse link also overrides
-    /// [`Objective::probs_to_margins`] with the link, which the intercept
+    /// [`Loss::probs_to_margins`] with the link, which the intercept
     /// estimate and a user-supplied `base_score` go through.
     fn pred_transform(&self, _preds: &mut [f32]) {}
 
     /// Estimate the per-output intercepts in *margin* space from a dataset's
     /// full metadata view; the single hook training uses to initialize the
     /// model's `base_score` when the user does not supply one. Returns
-    /// exactly [`Objective::n_outputs`] values. To estimate from bare
+    /// exactly [`Loss::n_outputs`] values. To estimate from bare
     /// labels, weights, and groups, pass [`MetaInfo::new`].
     ///
     /// The default is XGBoost's `FitIntercept::InitEstimation`: one Newton
-    /// step from all-zero margins over [`Objective::gradient_info`] on `info`
+    /// step from all-zero margins over [`Loss::gradient_info`] on `info`
     /// itself (so label bounds and label matrices reach the gradient),
     /// `w_k = -Σg_k / max(Σh_k, 1e-6)` (sums in `f64`, step rounded to
-    /// `f32`), mapped through [`Objective::pred_transform`] and back through
-    /// [`Objective::probs_to_margins`] to reproduce XGBoost's `f32` rounding;
+    /// `f32`), mapped through [`Loss::pred_transform`] and back through
+    /// [`Loss::probs_to_margins`] to reproduce XGBoost's `f32` rounding;
     /// `NaN` intercepts (which training refuses) when `info`'s lengths are
     /// inconsistent. Objectives whose optimal constant has a closed form
     /// (label mean, class frequencies) override it.
@@ -346,24 +380,33 @@ pub trait Objective: Send + Sync {
 
     /// Transform raw margins into the values evaluation metrics receive
     /// (XGBoost `EvalTransform`), in place. Defaults to
-    /// [`Objective::pred_transform`].
+    /// [`Loss::pred_transform`].
     fn eval_transform(&self, preds: &mut [f32]) {
         self.pred_transform(preds);
     }
 
     /// Map one row of prediction-space intercepts (length
-    /// [`Objective::n_outputs`]) to margin space, in place: XGBoost
+    /// [`Loss::n_outputs`]) to margin space, in place: XGBoost
     /// `ProbToMargin` on the base-score vector, in `f32`. Training applies
     /// it to a user-supplied `base_score`, XGBoost-model import to the
-    /// stored one, and the default [`Objective::base_margins_info`] to its
+    /// stored one, and the default [`Loss::base_margins_info`] to its
     /// Newton step. Default is the identity; objectives with a link
     /// function (e.g. the logit of `binary:logistic`) override it.
     fn probs_to_margins(&self, _scores: &mut [f32]) {}
 
+    /// Refuse a user-supplied `base_score` (prediction space) this loss's
+    /// [`Loss::probs_to_margins`] cannot map to a margin, e.g. a probability
+    /// outside `(0, 1)` for `binary:logistic`. Training calls it on the loss
+    /// it trains, before the link is applied. The default accepts every
+    /// value (training refuses non-finite intercepts after the link).
+    fn validate_base_score(&self, _base_score: f64) -> Result<()> {
+        Ok(())
+    }
+
     /// Map one row of margin-space intercepts back to the prediction space
     /// XGBoost stores `base_score` in (the inverse of
-    /// [`Objective::probs_to_margins`]), in place; used by XGBoost-JSON
-    /// export. Defaults to [`Objective::pred_transform`], which inverts the
+    /// [`Loss::probs_to_margins`]), in place; used by XGBoost-JSON
+    /// export. Defaults to [`Loss::pred_transform`], which inverts the
     /// link of every objective whose transform is its link; objectives whose
     /// transform is not the inverse link (`binary:hinge` thresholds and
     /// `reg:quantileerror` sorts, while their `ProbToMargin` is the identity)
@@ -394,7 +437,7 @@ pub trait Objective: Send + Sync {
     ///
     /// With `multi_strategy = multi_output_tree`, training calls this every
     /// round (`iteration` counts from 0) with that round's full gradients
-    /// `gpair` (`[row][output]`, [`Objective::n_outputs`] pairs per row, row
+    /// `gpair` (`[row][output]`, [`Loss::n_outputs`] pairs per row, row
     /// weights applied). Returning `Some` grows the tree's structure — its
     /// histograms, split search and internal weights — from the returned
     /// (typically much narrower) gradients, while every leaf's weight vector
@@ -418,21 +461,22 @@ pub trait Objective: Send + Sync {
         None
     }
 
-    /// The default evaluation metric for this objective, as XGBoost's
-    /// `DefaultEvalMetric` names it — including any configuration-dependent
-    /// suffix such as `ndcg@32` (LambdaRank's top-k) or `tweedie-nloglik@1.5`.
-    fn default_metric(&self) -> String;
+    /// The metric training evaluates when no `eval_metric` is configured:
+    /// XGBoost's `DefaultEvalMetric`, with the parameters it gives it (e.g.
+    /// `ndcg@32` from LambdaRank's top-k, `tweedie-nloglik@1.5` from the
+    /// variance power, the loss's own alphas or slope).
+    fn default_metric(&self) -> crate::metric::EvalMetric;
 }
 
 /// One Newton step from all-zero margins, per output: `w_k = -Σg_k /
 /// max(Σh_k, 1e-6)` with the sums in `f64` and the step rounded to `f32`, then
-/// mapped through [`Objective::pred_transform`] and back through
-/// [`Objective::probs_to_margins`]. XGBoost (`FitIntercept::InitEstimation` +
+/// mapped through [`Loss::pred_transform`] and back through
+/// [`Loss::probs_to_margins`]. XGBoost (`FitIntercept::InitEstimation` +
 /// `tree::FitStump`) stores the intercept in prediction space and re-applies
 /// the link on use; taking the same round trip reproduces its `f32` rounding.
 /// `NaN` for every output when `info` fails [`MetaInfo::check_layout`] or
 /// the margin buffer would overflow, before anything is allocated.
-pub(crate) fn newton_intercepts<O: Objective + ?Sized>(objective: &O, info: &MetaInfo) -> Vec<f32> {
+pub(crate) fn newton_intercepts<O: Loss + ?Sized>(objective: &O, info: &MetaInfo) -> Vec<f32> {
     let k = objective.n_outputs();
     let Some(len) = info
         .n_rows
@@ -469,7 +513,7 @@ pub(crate) fn fit_stump(gpair: &[GradPair], k: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The log link's [`Objective::probs_to_margins`] (XGBoost `ProbToMargin`
+/// The log link's [`Loss::probs_to_margins`] (XGBoost `ProbToMargin`
 /// of the log-link objectives): `ln(v)` of every entry, in `f32`.
 pub(crate) fn log_link(scores: &mut [f32]) {
     for s in scores {
@@ -477,7 +521,34 @@ pub(crate) fn log_link(scores: &mut [f32]) {
     }
 }
 
-/// Shared [`Objective::validate_info`] label-domain check: reject the dataset
+/// Shared [`Loss::validate_base_score`] check: refuse a `base_score`
+/// outside the output domain of the objective, `(0, 1)` for the logistic
+/// link and `(0, ∞)` for the log link.
+pub(crate) fn check_base_score_domain(base_score: f64, domain: OutputDomain) -> Result<()> {
+    let inside = match domain {
+        OutputDomain::Probability => 0.0 < base_score && base_score < 1.0,
+        OutputDomain::Positive => base_score > 0.0,
+    };
+    if inside {
+        Ok(())
+    } else {
+        Err(HessboostError::invalid_param(
+            "base_score",
+            "is outside the objective's valid output domain",
+        ))
+    }
+}
+
+/// The prediction space a link maps from ([`check_base_score_domain`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OutputDomain {
+    /// `(0, 1)`: the logistic link.
+    Probability,
+    /// `(0, ∞)`: the log link.
+    Positive,
+}
+
+/// Shared [`Loss::validate_info`] label-domain check: reject the dataset
 /// when any label satisfies `invalid`.
 pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool) -> Result<()> {
     if info.labels.iter().any(|&y| invalid(y)) {
@@ -489,10 +560,11 @@ pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool)
     Ok(())
 }
 
-/// Shared [`Objective::validate_info`] label-width check: reject the dataset
+/// Shared [`Loss::validate_info`] label-width check: reject the dataset
 /// unless it carries the `n_targets` label columns the objective's outputs
-/// are paired with (objectives passed to training directly are not sized
-/// from the dataset, unlike [`create_objective`]'s).
+/// are paired with (custom losses are not sized from the dataset, unlike
+/// the built-in objectives'
+/// [`TrainingParams::loss`](crate::config::TrainingParams::loss)).
 pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()> {
     if info.n_targets != n_targets {
         return Err(HessboostError::invalid_param(
@@ -504,37 +576,6 @@ pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()>
         ));
     }
     Ok(())
-}
-
-/// Objectives XGBoost 3.4.2 trains on a label matrix: elementwise losses whose
-/// output `j` fits label column `j` (`Targets(info) = labels.Shape(1)`).
-const MULTI_TARGET_OBJECTIVES: &[&str] = &[
-    "reg:squarederror",
-    "reg:pseudohubererror",
-    "reg:logistic",
-    "binary:logistic",
-];
-
-/// Fit `n_targets` label columns with `objective`: one per output through
-/// [`multi_target::MultiTarget`] for the objectives in
-/// [`MULTI_TARGET_OBJECTIVES`], unchanged for one column, and an
-/// `invalid parameter "labels"` error for any other objective.
-fn with_targets(objective: Box<dyn Objective>, n_targets: usize) -> Result<Box<dyn Objective>> {
-    if n_targets <= 1 {
-        return Ok(objective);
-    }
-    if MULTI_TARGET_OBJECTIVES.contains(&objective.name()) {
-        return Ok(Box::new(multi_target::MultiTarget::new(
-            objective, n_targets,
-        )));
-    }
-    Err(HessboostError::invalid_param(
-        "labels",
-        format!(
-            "objective `{}` supports one target per row, got {n_targets}",
-            objective.name()
-        ),
-    ))
 }
 
 /// Weighted mean of `labels`, or the plain mean when `weights` is `None`, as
@@ -565,72 +606,11 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
     mean as f32
 }
 
-/// Resolve an objective by name, configured from `params`, for a dataset with
-/// `n_targets` label columns per row.
-///
-/// `reg:squarederror`, `reg:pseudohubererror`, `reg:logistic`,
-/// `binary:logistic`, and `reg:absoluteerror` accept a label matrix and give
-/// one output per label column, as in XGBoost. `reg:quantileerror` /
-/// `reg:expectileerror` produce one output per `quantile_alpha` /
-/// `expectile_alpha` entry and reject an empty, unsorted, or out-of-`[0, 1]`
-/// list. The distributional `dist:*` objectives (beyond XGBoost, see
-/// [`distributional`]) give one output per distribution parameter. Every
-/// other objective models a single target and rejects `n_targets > 1` with
-/// an `invalid parameter "labels"` error.
-pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Objective>> {
-    let objective: Box<dyn Objective> = match params.objective.as_str() {
-        "reg:squarederror" | "reg:linear" => Box::new(SquaredError),
-        "reg:pseudohubererror" => Box::new(PseudoHuber::new(params.huber_slope as f32)),
-        "binary:logistic" => Box::new(Logistic::new(params.scale_pos_weight as f32)),
-        "binary:logitraw" => Box::new(Logistic::raw(params.scale_pos_weight as f32)),
-        "binary:hinge" => Box::new(Hinge),
-        "reg:squaredlogerror" => Box::new(SquaredLogError),
-        "reg:logistic" => Box::new(Logistic::regression(params.scale_pos_weight as f32)),
-        "multi:softmax" | "multi:softprob" => {
-            if params.num_class < 2 {
-                return Err(HessboostError::invalid_param(
-                    "num_class",
-                    "multiclass objectives require num_class >= 2",
-                ));
-            }
-            let prob = params.objective == "multi:softprob";
-            Box::new(Softmax::new(params.num_class, prob))
-        }
-        "count:poisson" => Box::new(Poisson::new(params.effective_max_delta_step() as f32)),
-        "reg:gamma" => Box::new(Gamma),
-        "reg:tweedie" => Box::new(Tweedie::new(params.tweedie_variance_power as f32)),
-        "reg:quantileerror" => Box::new(Quantile::new(&params.quantile_alpha)?),
-        "reg:expectileerror" => Box::new(Expectile::new(&params.expectile_alpha)?),
-        "reg:absoluteerror" => return Ok(Box::new(AbsoluteError::new(n_targets))),
-        "rank:pairwise" => Box::new(LambdaMart::pairwise(params.lambdarank_num_pair_per_sample)),
-        "rank:ndcg" => Box::new(LambdaMart::ndcg(params.lambdarank_num_pair_per_sample)),
-        "rank:map" => Box::new(LambdaMart::map(params.lambdarank_num_pair_per_sample)),
-        "rank:xendcg" => Box::new(Xendcg::new(params.seed)),
-        "survival:cox" => Box::new(Cox),
-        "survival:aft" => Box::new(Aft::new(
-            params.aft_loss_distribution,
-            params.aft_loss_distribution_scale as f32,
-        )),
-        other => match DistFamily::from_objective(other) {
-            Some(family) => {
-                let objective = DistObjective::new(family, params.dist_gradient);
-                Box::new(
-                    if params.multi_strategy == crate::config::MultiStrategy::MultiOutputTree {
-                        objective.with_split_direction(params.dist_split_direction, params.seed)
-                    } else {
-                        objective
-                    },
-                )
-            }
-            None => return Err(HessboostError::unknown("objective", other)),
-        },
-    };
-    with_targets(objective, n_targets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TrainingParams;
+    use serde_json::json;
 
     #[test]
     fn weighted_mean_basic() {
@@ -647,7 +627,7 @@ mod tests {
     /// `h = ¼·w`, then sigmoid then logit (XGBoost's Newton fallback).
     #[test]
     fn default_base_margins_is_newton_step_through_link() {
-        let obj = Logistic::new(2.0);
+        let obj = LogisticLoss::new(2.0);
         let labels = [1.0f32, 0.0, 0.0, 0.0];
         let margins = base_margins(&obj, &labels, None);
         assert_eq!(margins.len(), 1);
@@ -667,7 +647,7 @@ mod tests {
     #[test]
     fn default_intercept_reads_the_original_metadata() {
         struct Midpoint;
-        impl Objective for Midpoint {
+        impl Loss for Midpoint {
             fn name(&self) -> &'static str {
                 "test:midpoint"
             }
@@ -682,8 +662,8 @@ mod tests {
                     *g = GradPair::new(preds[i] - f32::midpoint(lo[i], hi[i]), 1.0);
                 }
             }
-            fn default_metric(&self) -> String {
-                "rmse".to_string()
+            fn default_metric(&self) -> crate::metric::EvalMetric {
+                crate::metric::EvalMetric::Rmse
             }
         }
         let (lower, upper) = ([0.0f32, 4.0], [2.0f32, 6.0]);
@@ -703,14 +683,16 @@ mod tests {
 
     #[test]
     fn factory_resolves_known_and_rejects_unknown() {
-        let p = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .build_unchecked();
-        assert_eq!(create_objective(&p, 1).unwrap().name(), "reg:squarederror");
-        let p = TrainingParams::builder()
-            .objective("nope:whatever")
-            .build_unchecked();
-        assert!(create_objective(&p, 1).is_err());
+        let p = TrainingParams::from_xgboost([("objective", json!("reg:squarederror"))]).unwrap();
+        assert_eq!(p.loss(1).unwrap().name(), "reg:squarederror");
+        assert!(TrainingParams::from_xgboost([("objective", json!("nope:whatever"))]).is_err());
+    }
+
+    /// The params with objective `objective`.
+    fn with_objective(objective: Objective) -> TrainingParams {
+        TrainingParams::builder()
+            .objective(objective)
+            .build_unchecked()
     }
 
     /// Only XGBoost's elementwise multi-target objectives (and
@@ -728,26 +710,22 @@ mod tests {
             "reg:logistic",
             "reg:absoluteerror",
         ] {
-            let p = TrainingParams::builder().objective(name).build_unchecked();
-            assert_eq!(create_objective(&p, 3).unwrap().n_outputs(), 3, "{name}");
+            let p = TrainingParams::from_xgboost([("objective", json!(name))]).unwrap();
+            assert_eq!(p.loss(3).unwrap().n_outputs(), 3, "{name}");
         }
-        for name in [
-            "multi:softprob",
-            "count:poisson",
-            "reg:gamma",
-            "reg:tweedie",
-            "reg:quantileerror",
-            "reg:expectileerror",
-            "rank:ndcg",
+        for objective in [
+            Objective::Softprob(Multiclass::new(3).unwrap()),
+            Objective::Poisson,
+            Objective::Gamma,
+            Objective::Tweedie(Tweedie::default()),
+            Objective::Quantile(Quantiles::new([0.5]).unwrap()),
+            Objective::Expectile(Expectiles::new([0.5]).unwrap()),
+            Objective::RankNdcg(LambdaRank::default()),
         ] {
-            let p = TrainingParams::builder()
-                .objective(name)
-                .num_class(3)
-                .quantile_alpha(vec![0.5])
-                .expectile_alpha(vec![0.5])
-                .build_unchecked();
-            assert!(create_objective(&p, 1).is_ok(), "{name}");
-            match create_objective(&p, 2) {
+            let name = objective.name().to_owned();
+            let p = with_objective(objective);
+            assert!(p.loss(1).is_ok(), "{name}");
+            match p.loss(2) {
                 Err(HessboostError::InvalidParameter { name: param, .. }) => {
                     assert_eq!(param, "labels", "{name}");
                 }
@@ -765,18 +743,17 @@ mod tests {
             ("reg:quantileerror", "quantile_alpha"),
             ("reg:expectileerror", "expectile_alpha"),
         ] {
-            let p = TrainingParams::builder().objective(name).build_unchecked();
-            match create_objective(&p, 1) {
+            match TrainingParams::from_xgboost([("objective", json!(name))]) {
                 Err(HessboostError::InvalidParameter { name: got, .. }) => assert_eq!(got, param),
                 Err(other) => panic!("{name}: unexpected error {other}"),
                 Ok(_) => panic!("{name}: accepted an empty alpha list"),
             }
-            let p = TrainingParams::builder()
-                .objective(name)
-                .quantile_alpha(vec![0.1, 0.5, 0.9])
-                .expectile_alpha(vec![0.1, 0.5, 0.9])
-                .build_unchecked();
-            assert_eq!(create_objective(&p, 1).unwrap().n_outputs(), 3, "{name}");
+            let p = TrainingParams::from_xgboost([
+                ("objective", json!(name)),
+                (param, json!([0.1, 0.5, 0.9])),
+            ])
+            .unwrap();
+            assert_eq!(p.loss(1).unwrap().n_outputs(), 3, "{name}");
         }
     }
 
@@ -791,10 +768,10 @@ mod tests {
     #[test]
     fn chunked_gradients_match_whole_batch() {
         let c = GRADIENT_CHUNK_ROWS;
-        let objectives: Vec<(Box<dyn Objective>, usize, Vec<usize>)> = vec![
+        let objectives: Vec<(Box<dyn Loss>, usize, Vec<usize>)> = vec![
             (Box::new(SquaredError), 1, vec![2 * c + 4097]),
             (
-                Box::new(Logistic::new(1.5)),
+                Box::new(LogisticLoss::new(1.5)),
                 1,
                 (1..=15).map(|r| 2 * c + r).collect(),
             ),
@@ -805,7 +782,7 @@ mod tests {
             ),
             (Box::new(Gamma), 1, (1..=15).map(|r| 2 * c + r).collect()),
             (
-                Box::new(Tweedie::new(1.3)),
+                Box::new(TweedieLoss::new(Tweedie::new(1.3).unwrap())),
                 1,
                 (1..=15).map(|r| 2 * c + r).collect(),
             ),

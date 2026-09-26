@@ -6,7 +6,6 @@
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::objective::create_objective;
 use crate::rng::Rng;
 use crate::training::Trainer;
 use crate::training::train::{EarlyStopping, configured_metrics};
@@ -344,7 +343,7 @@ impl<'a> CrossValidation<'a> {
         }
         EarlyStopping::check_patience(early_stopping_rounds)?;
         validate_folds(&folds, data.n_rows())?;
-        let objective = create_objective(params, data.n_targets())?;
+        let objective = params.loss(data.n_targets())?;
         let metrics = configured_metrics(params, objective.as_ref())?;
         let maximize = metrics.last().is_some_and(|m| m.maximize());
 
@@ -471,6 +470,7 @@ pub fn cv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::Objective;
     use crate::test_support::labeled_dense;
 
     /// Six rows per daily decision over 20 days, labels ending `horizon`
@@ -615,7 +615,7 @@ mod tests {
         }
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -687,8 +687,8 @@ mod tests {
     fn metrics_keep_their_configured_order() {
         let d = step_data(60);
         let params = TrainingParams::builder()
-            .eval_metric("rmse")
-            .eval_metric("mae")
+            .eval_metric(crate::metric::EvalMetric::Rmse)
+            .eval_metric(crate::metric::EvalMetric::Mae)
             .build()
             .unwrap();
         let results = cv(&params, &d, 3, 3, 1).unwrap();
@@ -700,8 +700,8 @@ mod tests {
     fn early_stopping_ends_at_the_best_mean_round() {
         let d = step_data(120);
         let params = TrainingParams::builder()
-            .eval_metric("mae")
-            .eval_metric("rmse")
+            .eval_metric(crate::metric::EvalMetric::Mae)
+            .eval_metric(crate::metric::EvalMetric::Rmse)
             .max_depth(6)
             .eta(0.8)
             .build()

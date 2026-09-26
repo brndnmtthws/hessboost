@@ -3,10 +3,10 @@
 //! reduced split gradients, and configuration errors.
 
 use hessboost::config::{
-    BoosterKind, GrowPolicy, Monotone, MultiStrategy, ProcessType, TreeMethod,
+    BoosterKind, Dart, GrowPolicy, Monotone, MultiStrategy, ProcessType, Refresh, TreeMethod,
 };
 use hessboost::data::FeatureType;
-use hessboost::objective::{CustomObjective, GradPair, SplitGradient};
+use hessboost::objective::{CustomLoss, GradPair, SplitGradient};
 use hessboost::prelude::*;
 
 mod common;
@@ -229,9 +229,13 @@ fn single_output_builds_scalar_trees() {
 #[test]
 fn dart_rounds_train_vector_trees() {
     let params = vector_params()
-        .booster(BoosterKind::Dart)
-        .rate_drop(0.5)
-        .skip_drop(0.0)
+        .booster(BoosterKind::Dart(
+            Dart::builder()
+                .rate_drop(0.5)
+                .skip_drop(0.0)
+                .build()
+                .unwrap(),
+        ))
         .seed(7)
         .build()
         .unwrap();
@@ -247,12 +251,13 @@ fn dart_rounds_train_vector_trees() {
     assert_contribs_sum_to(&model.predict_contribs(&d).unwrap(), &margins);
 }
 
-fn squared_error(k: usize) -> CustomObjective {
-    CustomObjective::new("custom:sqerr", k, 0.5, "rmse", |p, y, _w, out| {
+fn squared_error(k: usize) -> CustomLoss {
+    CustomLoss::new("custom:sqerr", k, |p, y, _w, out| {
         for (o, (p, y)) in out.iter_mut().zip(p.iter().zip(y)) {
             *o = GradPair::new(p - y, 1.0);
         }
     })
+    .with_base_margin(0.5)
 }
 
 /// Mean over targets, XGBoost's `multioutput_reduced_gradient.py` sketch.
@@ -274,13 +279,14 @@ fn mean_sketch(g: &[GradPair]) -> SplitGradient {
 #[test]
 fn reduced_gradients_grow_structure_from_the_sketch() {
     let dtrain = dtrain();
-    let params = vector_params().lambda(0.0).build().unwrap();
-    let obj = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
-    let model = Trainer::new(&params, &dtrain, 1)
-        .objective(&obj)
-        .train()
-        .unwrap()
-        .model;
+    let sketched = vector_params()
+        .lambda(0.0)
+        .objective(Objective::custom(
+            squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g))),
+        ))
+        .build()
+        .unwrap();
+    let model = train(&sketched, &dtrain, 1).unwrap();
     let tree = &model.trees()[0];
     // Leaf vectors are refit per target from the full gradients: with unit
     // Hessians and no regularization each is eta × the leaf's mean residual.
@@ -305,11 +311,12 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
         }
     }
     // The sketch changes the structure relative to the full gradients.
-    let full = Trainer::new(&params, &dtrain, 1)
-        .objective(&squared_error(K))
-        .train()
-        .unwrap()
-        .model;
+    let full_params = vector_params()
+        .lambda(0.0)
+        .objective(Objective::custom(squared_error(K)))
+        .build()
+        .unwrap();
+    let full = train(&full_params, &dtrain, 1).unwrap();
     assert_ne!(full.trees()[0].nodes(), tree.nodes());
 }
 
@@ -322,16 +329,13 @@ fn unsupported_combinations_are_rejected() {
         .unwrap();
     assert_eq!(invalid_param(train(&exact, &dtrain, 1)), "multi_strategy");
 
-    let sketch = squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g)));
-    let per_output = TrainingParams::builder().build().unwrap();
-    assert_eq!(
-        invalid_param(
-            Trainer::new(&per_output, &dtrain, 1)
-                .objective(&sketch)
-                .train()
-        ),
-        "objective"
-    );
+    let sketch =
+        Objective::custom(squared_error(K).with_split_gradient(|_, g| Some(mean_sketch(g))));
+    let per_output = TrainingParams::builder()
+        .objective(sketch.clone())
+        .build()
+        .unwrap();
+    assert_eq!(invalid_param(train(&per_output, &dtrain, 1)), "objective");
     // The linear booster grows no trees, so it refuses the hook rather than
     // ignoring it.
     for strategy in [
@@ -341,32 +345,29 @@ fn unsupported_combinations_are_rejected() {
         let linear = TrainingParams::builder()
             .booster(BoosterKind::GbLinear)
             .multi_strategy(strategy)
+            .objective(sketch.clone())
             .build()
             .unwrap();
-        assert_eq!(
-            invalid_param(Trainer::new(&linear, &dtrain, 1).objective(&sketch).train()),
-            "objective"
-        );
+        assert_eq!(invalid_param(train(&linear, &dtrain, 1)), "objective");
     }
     let monotone = vector_params()
         .monotone_constraints(vec![Monotone::Increasing])
+        .objective(sketch)
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(
-            Trainer::new(&monotone, &dtrain, 1)
-                .objective(&sketch)
-                .train()
-        ),
+        invalid_param(train(&monotone, &dtrain, 1)),
         "monotone_constraints"
     );
 
-    let wrong =
-        squared_error(K).with_split_gradient(|_, g| Some(SplitGradient::new(g[1..].to_vec(), 1)));
+    let wrong = vector_params()
+        .objective(Objective::custom(squared_error(K).with_split_gradient(
+            |_, g| Some(SplitGradient::new(g[1..].to_vec(), 1)),
+        )))
+        .build()
+        .unwrap();
     assert!(matches!(
-        Trainer::new(&vector_params().build().unwrap(), &dtrain, 1)
-            .objective(&wrong)
-            .train(),
+        train(&wrong, &dtrain, 1),
         Err(HessboostError::DimensionMismatch { .. })
     ));
 }
@@ -418,7 +419,7 @@ fn unsupported_vector_layouts_are_rejected() {
     let vector = model();
     // XGBoost's refresh updater handles single-target trees only.
     let refresh = vector_params()
-        .process_type(ProcessType::Update)
+        .process_type(ProcessType::Update(Refresh::default()))
         .build()
         .unwrap();
     assert_eq!(

@@ -12,6 +12,8 @@ libfuzzer-sys = "0.4"
 # The native-model target seals fuzzed section bytes in a container with a
 # valid checksum, so mutations reach the section parser.
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+# The train target builds XGBoost-form parameter maps.
+serde_json = "1.0"
 
 [dependencies.hessboost]
 path = ".."
@@ -44,6 +46,13 @@ bench = false
 [[bin]]
 name = "xgboost-ubjson-model"
 path = "fuzz_targets/xgboost-ubjson-model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lightgbm-model"
+path = "fuzz_targets/lightgbm-model.rs"
 test = false
 doc = false
 bench = false

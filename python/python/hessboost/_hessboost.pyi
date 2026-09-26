@@ -1,6 +1,6 @@
 """Native extension module. Import from :mod:`hessboost` instead."""
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, final
 
 import numpy as np
@@ -11,6 +11,7 @@ __all__ = [
     "ConformalizedQuantile",
     "DMatrix",
     "Distributions",
+    "OnlineModel",
     "Params",
     "SplitConformal",
     "cv",
@@ -165,6 +166,31 @@ class ConformalizedQuantile:
     def alpha(self) -> float: ...
     @property
     def n_calibration(self) -> int: ...
+
+@final
+class OnlineModel:
+    @staticmethod
+    def train(
+        params: Params, dtrain: DMatrix, num_boost_round: int, tolerance: float
+    ) -> OnlineModel: ...
+    @staticmethod
+    def from_model(
+        booster: Booster, params: Params, dtrain: DMatrix, tolerance: float
+    ) -> OnlineModel: ...
+    def update(
+        self,
+        additions: DMatrix | None,
+        deletions: NDArray[np.int64],
+        on_round: Callable[[int, list[tuple[str, str, float]]], object] | None = None,
+    ) -> tuple[int, int, int] | None: ...
+    @property
+    def model(self) -> Booster: ...
+    @property
+    def data(self) -> DMatrix: ...
+    @property
+    def num_row(self) -> int: ...
+    @property
+    def tolerance(self) -> float: ...
 
 def train(request: Mapping[str, object]) -> tuple[Booster, float | None]: ...
 def cv(

@@ -57,8 +57,8 @@ impl SplitOptions {
     /// The options enabled by `params`, or `None` when the builder should run
     /// XGBoost's split search unchanged.
     pub(super) fn from_params(params: &TrainingParams) -> Option<Self> {
-        (params.extra_trees || params.path_smooth > 0.0).then_some(SplitOptions {
-            extra_seed: params.extra_trees.then_some(params.extra_seed),
+        (params.extra_trees.is_some() || params.path_smooth > 0.0).then_some(SplitOptions {
+            extra_seed: params.extra_trees.map(|extra| extra.seed()),
             path_smooth: params.path_smooth,
         })
     }
@@ -383,6 +383,7 @@ fn sweep_prefixes(
 mod tests {
     use super::super::test_support::{binned, gp};
     use super::*;
+    use crate::config::ExtraTrees;
     use crate::data::DMatrix;
     use crate::objective::GradPair;
     use crate::tree::builder::{HistTreeBuilder, all_rows};
@@ -422,7 +423,7 @@ mod tests {
     fn extra(depth: usize) -> TrainingParams {
         TrainingParams::builder()
             .max_depth(depth)
-            .extra_trees(true)
+            .extra_trees(ExtraTrees::default())
             .build()
             .unwrap()
     }
@@ -445,7 +446,7 @@ mod tests {
         );
         assert_ne!(a, grow(&params, &data, &gpair, 12));
         let reseeded = TrainingParams {
-            extra_seed: 7,
+            extra_trees: Some(ExtraTrees::with_seed(7)),
             ..params
         };
         assert_ne!(a, grow(&reseeded, &data, &gpair, 11));

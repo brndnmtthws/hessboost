@@ -1,7 +1,7 @@
 //! `Trainer::on_round`: the per-round hook sees every round in order, never
 //! changes the model, and a `Break` ends training with the rounds so far.
 
-use hessboost::config::{BoosterKind, ProcessType};
+use hessboost::config::{BoosterKind, Dart, ProcessType, Refresh};
 use hessboost::prelude::{BoostedModel, DMatrix, Trainer, TrainingParams, train};
 use hessboost::training::RoundEval;
 use std::ops::ControlFlow;
@@ -32,8 +32,9 @@ fn bytes(model: &BoostedModel) -> Vec<u8> {
 /// Row sampling and DART dropout: a hook must not disturb the RNG streams.
 fn sampled() -> TrainingParams {
     TrainingParams::builder()
-        .booster(BoosterKind::Dart)
-        .rate_drop(0.2)
+        .booster(BoosterKind::Dart(
+            Dart::builder().rate_drop(0.2).build().unwrap(),
+        ))
         .subsample(0.7)
         .colsample_bynode(0.8)
         .seed(9)
@@ -179,7 +180,7 @@ fn refresh_and_gblinear_stop_on_break_too() {
     let old = train(&base, &data(300, 5), 6).unwrap();
     let update = TrainingParams::builder()
         .max_depth(3)
-        .process_type(ProcessType::Update)
+        .process_type(ProcessType::Update(Refresh::default()))
         .build()
         .unwrap();
     let refreshed = Trainer::new(&update, &dtrain, 6)

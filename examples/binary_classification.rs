@@ -1,7 +1,8 @@
 //! Binary classification with `binary:logistic`, a watched eval set, and early
 //! stopping. Run: `cargo run --release --example binary_classification`.
 
-use hessboost::metric::{Auc, Metric};
+use hessboost::metric::EvalMetric;
+use hessboost::objective::Logistic;
 use hessboost::prelude::*;
 
 mod common;
@@ -25,9 +26,9 @@ fn main() -> Result<()> {
     let dvalid = DMatrix::from_dense(&x[split..], 400, f)?.with_labels(&y[1600..])?;
 
     let params = TrainingParams::builder()
-        .objective("binary:logistic")
-        .eval_metric("logloss")
-        .eval_metric("auc")
+        .objective(Objective::BinaryLogistic(Logistic::default()))
+        .eval_metric(EvalMetric::LogLoss)
+        .eval_metric(EvalMetric::Auc)
         .max_depth(4)
         .eta(0.1)
         .subsample(0.9)
@@ -48,7 +49,9 @@ fn main() -> Result<()> {
     let probs = model.predict(&dvalid)?; // probabilities in [0, 1]
     let classes = model.predict_class(&dvalid)?; // hard 0/1 labels
     let acc = accuracy(&classes, dvalid.labels().unwrap());
-    let auc = Auc::default().eval(&probs, dvalid.labels().unwrap(), None);
+    let auc = EvalMetric::Auc
+        .build(1)?
+        .eval(&probs, dvalid.labels().unwrap(), None);
     println!("valid accuracy {acc:.3}, AUC {auc:.3}");
     Ok(())
 }

@@ -340,6 +340,27 @@ def test_custom_objective_errors_propagate() -> None:
         hessboost.train({}, DMatrix(x, y), 3, obj=short)
 
 
+def test_custom_objective_outputs_come_from_num_class() -> None:
+    x, y = regression(rows=60)
+    shapes: list[tuple[int, ...]] = []
+
+    def spread(
+        margins: NDArray[np.float32], data: DMatrix
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        shapes.append(margins.shape)
+        return (margins - np.arange(3, dtype=np.float32)).astype(np.float32), np.ones_like(margins)
+
+    # XGBoost's custom-softmax convention: num_class is the output count.
+    booster = hessboost.train({"num_class": 3}, DMatrix(x, y), 2, obj=spread)
+    assert shapes == [(60, 3)] * 2
+    assert booster.predict(x).shape == (60, 3)
+    with pytest.raises(HessboostError, match="obj replaces objective"):
+        hessboost.train({"objective": "multi:softprob"}, DMatrix(x, y), 2, obj=spread)
+    with pytest.raises(HessboostError, match="num_class"):
+        hessboost.train({"num_class": -1}, DMatrix(x, y), 2, obj=spread)
+
+
+
 def test_custom_metric_drives_early_stopping() -> None:
     x, y = regression(rows=300)
     dvalid = DMatrix(x[200:], y[200:])
@@ -365,7 +386,9 @@ def test_custom_metric_drives_early_stopping() -> None:
         evals_result=history,
         verbose_eval=False,
     )
-    assert list(history["valid"]) == ["mae"]
+    # As in XGBoost, the custom metric follows the default one and, being
+    # last, drives early stopping.
+    assert list(history["valid"]) == ["rmse", "mae"]
     assert set(calls) == {100}
     best = booster.best_iteration
     assert best is not None and booster.best_score == min(history["valid"]["mae"])

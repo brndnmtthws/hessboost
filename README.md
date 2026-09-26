@@ -34,7 +34,7 @@ and `λ` is the L2 penalty `lambda`.
   later release.
 - **More than XGBoost, opt-in.** Conformal intervals, distributional
   boosting, budget training, compact models, XE-NDCG ranking, and more — all
-  off by default; none changes default training.
+  off by default, none of them changes default training.
 
 ## Getting started
 
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     let dtrain = DMatrix::from_dense(&x, n_rows, n_cols)?.with_labels(&y)?;
 
     let params = TrainingParams::builder()
-        .objective("reg:squarederror")
+        .objective(Objective::SquaredError)
         .tree_method(TreeMethod::Hist)
         .max_depth(6)
         .eta(0.1)
@@ -109,6 +109,7 @@ runnable programs live in [`examples/`](examples)
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
 | `budget` | budget training against default and tuned training |
+| `online_update` | adding and deleting training rows in place, and exact unlearning |
 | `pfn_boost` | boosting from a pretrained model's logits |
 | `metal` | CPU vs GPU prediction (macOS, `--features metal`) |
 
@@ -116,8 +117,8 @@ runnable programs live in [`examples/`](examples)
 
 [`python/`](python) holds the Python package (`pip install hessboost`),
 with XGBoost's Python API (`DMatrix`, `train`, `cv`, `Booster`),
-scikit-learn estimators, pandas categorical input, and the conformal and
-distributional extras:
+scikit-learn estimators, pandas categorical input, and the conformal,
+distributional, and in-place update extras:
 
 ```python
 import hessboost
@@ -140,6 +141,9 @@ From XGBoost:
 - XGBoost's CPU objectives — regression (incl. quantile and expectile),
   binary/multiclass classification, counts, LambdaMART ranking, Cox/AFT
   survival — and nearly all its metrics, plus custom objectives and metrics.
+  Objectives and metrics are typed (`Objective::Tweedie(Tweedie::new(1.3)?)`,
+  `EvalMetric::Ndcg(Cutoff::top(5)?)`), and
+  `TrainingParams::from_xgboost` reads an XGBoost `params` dict.
 - Multi-output models: multi-target label matrices and vector-leaf trees.
 - Cross-validation (shuffled, custom, time-ordered, or purged by each row's
   label window), continued training, tree refresh, a per-round hook
@@ -156,7 +160,9 @@ Beyond XGBoost (opt-in, none changes default training):
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
+| [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/) | add or delete training rows of a trained model (incremental learning, machine unlearning): exact, or approximate and faster than retraining for small changes, after Lin et al. |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
+| [LightGBM model import](https://docs.rs/hessboost/latest/hessboost/model/#lightgbm-import) | load LightGBM 4.x text models (`model.txt`) that predict, explain with SHAP, slice, and save like native ones, checked against LightGBM's predictions and `pred_contrib`; splits or objectives with no exact equivalent are refused |
 | LightGBM and CatBoost options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), symmetric trees, query-level ranking bagging (`bagging_by_query`), and XE-NDCG ranking (`rank:xendcg`) |
 | Quantized-gradient training | up to 1.85× faster tree building on large data (`use_quantized_grad`) |
 | [Ordered target statistics](https://docs.rs/hessboost/latest/hessboost/data/target_stats/) | CatBoost-style ordered target encoding of high-cardinality categoricals |
@@ -165,6 +171,11 @@ Beyond XGBoost (opt-in, none changes default training):
 
 ## Caveats
 
+- Approximate in-place updates (`training::online`, tolerance > 0) stay close
+  to retraining without matching it, and pay off for small changes (1.3–4.8x
+  faster than retraining for 0.1–1% of the rows in its benchmarks; slower
+  beyond a few percent). Unlearning is exact only at tolerance 0, which
+  costs a retrain.
 - Randomized training (sampling, forests, DART) matches XGBoost's quality,
   not its trees: the random streams differ.
 - `rank:xendcg` uses stateless keyed SplitMix64 draws per seed, iteration,

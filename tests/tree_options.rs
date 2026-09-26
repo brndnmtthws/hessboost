@@ -1,7 +1,9 @@
 //! End-to-end behavior of the opt-in LightGBM tree options: `extra_trees`,
 //! `path_smooth`, and `linear_tree` / `linear_lambda`.
 
-use hessboost::config::{BoosterKind, Monotone, MultiStrategy, TrainingParamsBuilder};
+use hessboost::config::{
+    BoosterKind, ExtraTrees, LinearTree, Monotone, MultiStrategy, TrainingParamsBuilder,
+};
 use hessboost::data::FeatureType;
 use hessboost::prelude::*;
 
@@ -40,14 +42,9 @@ fn base() -> TrainingParamsBuilder {
 fn disabled_options_keep_the_default_model_bit_for_bit() {
     let data = piecewise_linear(500, 1);
     let default = train(&base().build().unwrap(), &data, 10).unwrap();
-    let explicit = base()
-        .extra_trees(false)
-        .extra_seed(99)
-        .path_smooth(0.0)
-        .linear_tree(false)
-        .linear_lambda(3.0)
-        .build()
-        .unwrap();
+    // `extra_seed` and `linear_lambda` live inside their switches, so with
+    // the switches off only `path_smooth` can be spelled out.
+    let explicit = base().path_smooth(0.0).build().unwrap();
     let off = train(&explicit, &data, 10).unwrap();
     assert_eq!(default.to_bytes().unwrap(), off.to_bytes().unwrap());
 }
@@ -60,9 +57,9 @@ fn every_option_changes_the_model_and_is_reproducible() {
         .to_bytes()
         .unwrap();
     for params in [
-        base().extra_trees(true).build().unwrap(),
+        base().extra_trees(ExtraTrees::default()).build().unwrap(),
         base().path_smooth(5.0).build().unwrap(),
-        base().linear_tree(true).build().unwrap(),
+        base().linear_tree(LinearTree::default()).build().unwrap(),
     ] {
         let a = train(&params, &data, 10).unwrap().to_bytes().unwrap();
         assert_eq!(a, train(&params, &data, 10).unwrap().to_bytes().unwrap());
@@ -76,10 +73,9 @@ fn options_grow_the_same_model_serially_and_in_parallel() {
     let data = piecewise_linear(40_000, 3);
     let params = base()
         .max_depth(5)
-        .extra_trees(true)
+        .extra_trees(ExtraTrees::default())
         .path_smooth(2.0)
-        .linear_tree(true)
-        .linear_lambda(0.1)
+        .linear_tree(LinearTree::new(0.1).unwrap())
         .subsample(0.8)
         .build()
         .unwrap();
@@ -95,12 +91,11 @@ fn options_grow_the_same_model_serially_and_in_parallel() {
 fn linear_leaves_fit_piecewise_linear_targets_far_better() {
     let (train_set, test_set) = (piecewise_linear(2000, 4), piecewise_linear(1000, 5));
     let fit = |linear: bool| {
-        let params = base()
-            .max_depth(2)
-            .eta(0.5)
-            .linear_tree(linear)
-            .build()
-            .unwrap();
+        let mut builder = base().max_depth(2).eta(0.5);
+        if linear {
+            builder = builder.linear_tree(LinearTree::default());
+        }
+        let params = builder.build().unwrap();
         train(&params, &train_set, 10).unwrap()
     };
     let (constant, linear) = (fit(false), fit(true));
@@ -129,7 +124,7 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
         .map(|r| 3.0 * r[0] - r[1])
         .collect();
     let data = labeled_dense(&values, 2, &y);
-    let params = base().linear_tree(true).build().unwrap();
+    let params = base().linear_tree(LinearTree::default()).build().unwrap();
     let model = train(&params, &data, 6).unwrap();
     let before = model.predict(&data).unwrap();
 
@@ -159,9 +154,11 @@ fn incompatible_configurations_are_rejected() {
     let invalid =
         |builder: TrainingParamsBuilder, name| assert_eq!(invalid_param(builder.build()), name);
     invalid(base().path_smooth(-1.0), "path_smooth");
-    invalid(base().linear_lambda(f64::NAN), "linear_lambda");
+    assert_eq!(invalid_param(LinearTree::new(f64::NAN)), "linear_lambda");
     invalid(
-        base().extra_trees(true).tree_method(TreeMethod::Exact),
+        base()
+            .extra_trees(ExtraTrees::default())
+            .tree_method(TreeMethod::Exact),
         "extra_trees",
     );
     invalid(
@@ -170,20 +167,22 @@ fn incompatible_configurations_are_rejected() {
     );
     invalid(
         base()
-            .linear_tree(true)
+            .linear_tree(LinearTree::default())
             .multi_strategy(MultiStrategy::MultiOutputTree),
         "linear_tree",
     );
     invalid(
-        base().linear_tree(true).objective("reg:absoluteerror"),
+        base()
+            .linear_tree(LinearTree::default())
+            .objective(Objective::AbsoluteError),
         "linear_tree",
     );
     // The histogram-based `approx` builder accepts every option.
     base()
         .tree_method(TreeMethod::Approx)
-        .extra_trees(true)
+        .extra_trees(ExtraTrees::default())
         .path_smooth(1.0)
-        .linear_tree(true)
+        .linear_tree(LinearTree::default())
         .build()
         .unwrap();
 }
@@ -221,9 +220,11 @@ fn categorical_splits_keep_their_monotone_leaves() {
         .with_feature_types(&[FeatureType::Categorical])
         .unwrap();
     for extra_trees in [false, true] {
-        let params = TrainingParams::builder()
-            .tree_method(TreeMethod::Hist)
-            .extra_trees(extra_trees)
+        let mut builder = TrainingParams::builder().tree_method(TreeMethod::Hist);
+        if extra_trees {
+            builder = builder.extra_trees(ExtraTrees::default());
+        }
+        let params = builder
             .monotone_constraints(vec![Monotone::Decreasing])
             .lambda(0.0)
             .eta(1.0)
@@ -247,7 +248,10 @@ fn categorical_splits_with_unrepresentable_gains_are_skipped() {
         .with_feature_types(&[FeatureType::Categorical])
         .unwrap();
     let numerical = labeled_dense(&x, 1, &y);
-    for builder in [base().extra_trees(true), base().path_smooth(1.0)] {
+    for builder in [
+        base().extra_trees(ExtraTrees::default()),
+        base().path_smooth(1.0),
+    ] {
         let params = builder.base_score(0.0).build().unwrap();
         let preds = |data: &DMatrix| train(&params, data, 1).unwrap().predict(data).unwrap();
         assert_eq!(preds(&categorical), preds(&numerical));

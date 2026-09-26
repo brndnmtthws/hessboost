@@ -2,7 +2,10 @@
 //! `sampling_method=gradient_based` (XGBoost's CPU MVS sampler) and
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
-use hessboost::config::{BoosterKind, SamplingMethod, TrainingParamsBuilder};
+use hessboost::config::{
+    BoosterKind, Dart, ProcessType, QueryBagging, Refresh, SamplingMethod, TrainingParamsBuilder,
+};
+use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -134,7 +137,7 @@ fn gradient_based_sampling_tree_method_support() {
     }
     // DART grows its trees through the same per-tree sampling.
     let dart = TrainingParams::builder()
-        .booster(BoosterKind::Dart)
+        .booster(BoosterKind::Dart(Dart::default()))
         .sampling_method(SamplingMethod::GradientBased)
         .subsample(0.4)
         .build()
@@ -142,6 +145,7 @@ fn gradient_based_sampling_tree_method_support() {
     assert!(train(&dart, &data, 3).is_ok());
 }
 
+/// Query bagging trains deterministically from the seed and still splits.
 #[test]
 fn bagging_by_query_is_seeded_and_keeps_whole_groups() {
     let n_groups = 30;
@@ -159,10 +163,9 @@ fn bagging_by_query_is_seeded_and_keeps_whole_groups() {
         .with_group_sizes(&vec![group_size; n_groups])
         .unwrap();
     let params = TrainingParams::builder()
-        .objective("rank:ndcg")
+        .objective(Objective::RankNdcg(LambdaRank::default()))
         .tree_method(TreeMethod::Hist)
-        .bagging_by_query(true)
-        .subsample(0.5)
+        .bagging_by_query(QueryBagging::new(0.5).unwrap())
         .seed(22)
         .max_depth(2)
         .build()
@@ -175,30 +178,34 @@ fn bagging_by_query_is_seeded_and_keeps_whole_groups() {
     }
 }
 
+/// Query bagging needs a `rank:*` objective on a tree booster, uniform
+/// sampling, `subsample = 1`, and query groups on the training data.
 #[test]
 fn bagging_by_query_refuses_non_ranking_or_incompatible_sampling() {
+    let bagging = QueryBagging::new(0.5).unwrap();
     let ranking = || {
         TrainingParams::builder()
-            .objective("rank:ndcg")
-            .bagging_by_query(true)
+            .objective(Objective::RankNdcg(LambdaRank::default()))
+            .bagging_by_query(bagging)
     };
-    assert_eq!(invalid_param(ranking().build()), "bagging_by_query");
-    assert_eq!(
-        invalid_param(
-            ranking()
-                .subsample(0.5)
-                .sampling_method(SamplingMethod::GradientBased)
-                .build()
+    for (params, name) in [
+        (ranking().subsample(0.8), "subsample"),
+        (
+            ranking().sampling_method(SamplingMethod::GradientBased),
+            "sampling_method",
         ),
-        "bagging_by_query"
-    );
-    assert_eq!(
-        invalid_param(
-            TrainingParams::builder()
-                .bagging_by_query(true)
-                .subsample(0.5)
-                .build()
+        (ranking().booster(BoosterKind::GbLinear), "bagging_by_query"),
+        (
+            TrainingParams::builder().bagging_by_query(bagging),
+            "bagging_by_query",
         ),
+    ] {
+        assert_eq!(invalid_param(params.build()), name);
+    }
+    // Query groups are data, so they are checked at training.
+    let ungrouped = labeled_dense(&[0.0, 1.0], 1, &[0.0, 1.0]);
+    assert_eq!(
+        invalid_param(train(&ranking().build().unwrap(), &ungrouped, 1)),
         "bagging_by_query"
     );
 }
@@ -361,7 +368,7 @@ fn plain(method: TreeMethod, booster: BoosterKind) -> TrainingParamsBuilder {
 #[test]
 fn approx_parallel_trees_share_one_row_sample() {
     let data = step_rows(|_| 0.0);
-    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
         for (sampling, subsample) in [
             (SamplingMethod::GradientBased, 0.25),
             (SamplingMethod::Uniform, 0.5),
@@ -400,7 +407,7 @@ fn approx_parallel_trees_share_one_row_sample() {
 fn approx_gradient_sampling_continuation_matches_uninterrupted_training() {
     let step = step_rows(|i| i as f32);
     let wide = dataset(400, 3);
-    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
         for (data, depth, split) in [(&step, 1, [1, 1]), (&wide, 3, [2, 3])] {
             let params = plain(TreeMethod::Approx, booster)
                 .sampling_method(SamplingMethod::GradientBased)
@@ -462,7 +469,7 @@ fn feature_weights_are_refused_where_columns_are_not_sampled() {
     );
     let model = train(&TrainingParams::default(), &data, 2).unwrap();
     let update = TrainingParams::builder()
-        .process_type(hessboost::config::ProcessType::Update)
+        .process_type(ProcessType::Update(Refresh::default()))
         .build()
         .unwrap();
     let refresh = |data: &DMatrix| Trainer::new(&update, data, 2).init_model(&model).train();

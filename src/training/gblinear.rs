@@ -22,7 +22,7 @@ use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::error::Result;
 use crate::model::for_each_present_value;
-use crate::objective::{GradPair, Objective};
+use crate::objective::{GradPair, Loss};
 use crate::{model::LinearModel, training::reject_split_gradient};
 use std::ops::ControlFlow;
 
@@ -68,7 +68,7 @@ pub(crate) fn train_gblinear(
     dtrain: &DMatrix,
     num_round: usize,
     initial_margin: Vec<f32>,
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     start: Option<&LinearModel>,
     after_round: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<LinearModel> {
@@ -111,7 +111,7 @@ pub(crate) fn train_gblinear(
     let mut gpair = vec![GradPair::default(); n * n_out];
 
     for round in 0..num_round {
-        objective.gradient_info(&margin, &info, &mut gpair);
+        objective.gradient_info_at(&margin, &info, &mut gpair, round);
         reject_split_gradient(objective, round, &gpair)?;
 
         for k in 0..n_out {

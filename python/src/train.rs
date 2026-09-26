@@ -5,7 +5,7 @@ use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{OrRaise, refuse};
 use crate::params::Params;
 use hessboost::metric::CustomMetric;
-use hessboost::objective::{CustomObjective, GradPair};
+use hessboost::objective::{CustomLoss, GradPair, Objective};
 use hessboost::training::{CrossValidation, Fold, RoundEval, Trainer};
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
@@ -22,7 +22,7 @@ use std::time::Duration;
 /// callbacks are skipped: the objective returns zero gradients and the
 /// metric NaN.
 #[derive(Clone, Default)]
-struct Failure(Arc<Mutex<Option<PyErr>>>);
+pub(crate) struct Failure(Arc<Mutex<Option<PyErr>>>);
 
 impl Failure {
     fn failed(&self) -> bool {
@@ -61,12 +61,10 @@ fn custom_objective(
     outputs: usize,
     base: f32,
     failure: Failure,
-) -> CustomObjective {
-    CustomObjective::new(
+) -> CustomLoss {
+    CustomLoss::new(
         "custom",
         outputs,
-        base,
-        "rmse",
         move |margins, _labels, _weights, out: &mut [GradPair]| {
             out.fill(GradPair::default());
             if failure.failed() {
@@ -97,6 +95,7 @@ fn custom_objective(
             }
         },
     )
+    .with_base_margin(base)
 }
 
 /// The custom metric: `function(predictions, labels, weights) -> float`.
@@ -195,6 +194,38 @@ fn interruptible<T: Send>(
     })
 }
 
+/// The round hook [`run_hooked`] hands its work.
+pub(crate) type RoundHook = Box<dyn FnMut(&RoundEval) -> ControlFlow<()> + Send>;
+
+/// Runs `work` [`interruptible`] with a [`round_hook`] calling `on_round`,
+/// and raises the first exception a callback recorded in `failure`, or the
+/// caller's `KeyboardInterrupt`, in place of `work`'s result.
+pub(crate) fn run_hooked<T: Send>(
+    py: Python<'_>,
+    on_round: Option<Py<PyAny>>,
+    failure: &Failure,
+    work: impl FnOnce(RoundHook) -> T + Send,
+) -> PyResult<T> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let hook = Box::new(round_hook(
+        on_round,
+        failure.clone(),
+        Arc::clone(&interrupted),
+    ));
+    let out = interruptible(
+        py,
+        move || work(hook),
+        |error| {
+            interrupted.store(true, Ordering::Relaxed);
+            failure.record(error);
+        },
+    )?;
+    match failure.take() {
+        Some(error) => Err(error),
+        None => Ok(out),
+    }
+}
+
 /// A custom metric callback with its reported name and direction.
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
@@ -217,8 +248,13 @@ pub(crate) struct TrainRequest {
     early_stopping_rounds: Option<usize>,
     #[pyo3(default)]
     init_model: Option<Py<Booster>>,
+    /// The custom objective, `function(margins) -> (grad, hess)`.
     #[pyo3(default)]
     obj: Option<Py<PyAny>>,
+    /// The custom objective's output count (default: one per label column
+    /// of `dtrain`).
+    #[pyo3(default)]
+    outputs: Option<usize>,
     #[pyo3(default)]
     custom_metric: Option<MetricRequest>,
     /// `on_round(iteration, scores) -> stop`, called after every round.
@@ -230,7 +266,7 @@ pub(crate) struct TrainRequest {
 /// The evaluation history reaches Python through `on_round`.
 #[pyfunction]
 pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster, Option<f64>)> {
-    let params = &request.params.get().inner;
+    let parsed = &request.params.get().inner;
     let dtrain = &request.dtrain.get().inner;
     let evals: Vec<(&hessboost::data::DMatrix, &str)> = request
         .evals
@@ -242,50 +278,39 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
         .as_ref()
         .map(|booster| &*booster.get().model);
     let failure = Failure::default();
-    let outputs = if params.num_class > 0 {
-        params.num_class
-    } else {
-        dtrain.n_targets()
+    let custom;
+    let params = match request.obj {
+        Some(function) => {
+            let outputs = request.outputs.unwrap_or_else(|| dtrain.n_targets());
+            let base = parsed.base_score.unwrap_or(0.0) as f32;
+            let mut params = parsed.clone();
+            params.objective =
+                Objective::custom(custom_objective(function, outputs, base, failure.clone()));
+            custom = params;
+            &custom
+        }
+        None => parsed,
     };
-    let objective = request.obj.map(|function| {
-        let base = params.base_score.unwrap_or(0.0) as f32;
-        custom_objective(function, outputs, base, failure.clone())
-    });
     let targets = dtrain.n_targets();
     let metric = request
         .custom_metric
         .map(|metric| custom_metric(metric, targets, failure.clone()));
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let hook = round_hook(request.on_round, failure.clone(), Arc::clone(&interrupted));
-    let result = interruptible(
-        py,
-        || {
-            let mut trainer = Trainer::new(params, dtrain, request.num_boost_round).on_round(hook);
-            for (data, name) in &evals {
-                trainer = trainer.eval(data, name);
-            }
-            if let Some(rounds) = request.early_stopping_rounds {
-                trainer = trainer.early_stopping_rounds(rounds);
-            }
-            if let Some(model) = init {
-                trainer = trainer.init_model(model);
-            }
-            if let Some(objective) = &objective {
-                trainer = trainer.objective(objective);
-            }
-            if let Some(metric) = metric {
-                trainer = trainer.custom_metric(Box::new(metric));
-            }
-            trainer.train()
-        },
-        |error| {
-            interrupted.store(true, Ordering::Relaxed);
-            failure.record(error);
-        },
-    )?;
-    if let Some(error) = failure.take() {
-        return Err(error);
-    }
+    let result = run_hooked(py, request.on_round, &failure, |hook| {
+        let mut trainer = Trainer::new(params, dtrain, request.num_boost_round).on_round(hook);
+        for (data, name) in &evals {
+            trainer = trainer.eval(data, name);
+        }
+        if let Some(rounds) = request.early_stopping_rounds {
+            trainer = trainer.early_stopping_rounds(rounds);
+        }
+        if let Some(model) = init {
+            trainer = trainer.init_model(model);
+        }
+        if let Some(metric) = metric {
+            trainer = trainer.custom_metric(Box::new(metric));
+        }
+        trainer.train()
+    })?;
     let result = result.or_raise()?;
     Ok((Booster::new(result.model), result.best_score))
 }

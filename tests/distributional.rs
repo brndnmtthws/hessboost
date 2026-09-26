@@ -2,10 +2,15 @@
 //! calibration of the predicted distributions, metrics, serialization, and
 //! conformalized intervals.
 
-use hessboost::config::{DistGradient, DistSplitDirection, MultiStrategy, TreeMethod};
+use hessboost::config::{MultiStrategy, TrainingParamsBuilder, TreeMethod};
 use hessboost::conformal::ConformalizedQuantile;
-use hessboost::objective::distributional::{Dist, DistFamily};
-use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
+use hessboost::metric::EvalMetric;
+use hessboost::objective::distributional::{
+    Dist, DistFamily, DistGradient, DistSplitDirection, Distributional,
+};
+use hessboost::prelude::{
+    BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
+};
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
@@ -48,7 +53,12 @@ fn sampled(n: usize, seed: u64, dist_of: impl Fn(f64, f64) -> Dist) -> DMatrix {
     labeled_dense(&x, 2, &y)
 }
 
-fn params(objective: &str) -> hessboost::config::TrainingParamsBuilder {
+/// The `dist:*` objective of `family` with its default settings.
+fn dist(family: DistFamily) -> Objective {
+    Objective::Dist(Distributional::new(family))
+}
+
+fn params(objective: Objective) -> TrainingParamsBuilder {
     TrainingParams::builder()
         .objective(objective)
         .tree_method(TreeMethod::Hist)
@@ -96,7 +106,11 @@ fn heteroscedastic_intervals_are_calibrated_and_track_the_noise() {
     let (dtrain, _) = heteroscedastic(6000, 1);
     let (dvalid, _) = heteroscedastic(2000, 21);
     let (dtest, sigma) = heteroscedastic(6000, 2);
-    let model = fit(&params("dist:normal").build().unwrap(), &dtrain, &dvalid);
+    let model = fit(
+        &params(dist(DistFamily::Normal)).build().unwrap(),
+        &dtrain,
+        &dvalid,
+    );
     assert_eq!(model.n_outputs(), 2);
     let dists = model.predict_distribution(&dtest).unwrap();
     let labels = dtest.labels().unwrap();
@@ -132,9 +146,13 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
     let (dtrain, _) = heteroscedastic(4000, 3);
     let (dvalid, _) = heteroscedastic(2000, 31);
     let (dtest, _) = heteroscedastic(4000, 4);
-    let dist = fit(&params("dist:normal").build().unwrap(), &dtrain, &dvalid);
+    let dist = fit(
+        &params(dist(DistFamily::Normal)).build().unwrap(),
+        &dtrain,
+        &dvalid,
+    );
     let point = fit(
-        &params("reg:squarederror").build().unwrap(),
+        &params(Objective::SquaredError).build().unwrap(),
         &dtrain,
         &dvalid,
     );
@@ -174,43 +192,46 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
 #[test]
 fn every_family_and_gradient_mode_learns() {
     type Truth = fn(f64, f64) -> Dist;
-    let cases: [(&str, Truth); 5] = [
-        ("dist:normal", |a, b| Dist::Normal {
+    let cases: [(DistFamily, Truth); 5] = [
+        (DistFamily::Normal, |a, b| Dist::Normal {
             mu: 3.0 * a,
             sigma: 0.2 + b,
         }),
-        ("dist:lognormal", |a, b| Dist::LogNormal {
+        (DistFamily::LogNormal, |a, b| Dist::LogNormal {
             mu: a,
             sigma: 0.2 + 0.8 * b,
         }),
-        ("dist:gamma", |a, b| Dist::Gamma {
+        (DistFamily::Gamma, |a, b| Dist::Gamma {
             mean: 1.0 + 4.0 * a,
             shape: 0.5 + 6.0 * b,
         }),
-        ("dist:poisson", |a, _| Dist::Poisson {
+        (DistFamily::Poisson, |a, _| Dist::Poisson {
             rate: 0.5 + 10.0 * a,
         }),
-        ("dist:negbinomial", |a, b| Dist::NegativeBinomial {
-            mean: 1.0 + 10.0 * a,
-            size: 0.3 + 10.0 * b,
+        (DistFamily::NegativeBinomial, |a, b| {
+            Dist::NegativeBinomial {
+                mean: 1.0 + 10.0 * a,
+                size: 0.3 + 10.0 * b,
+            }
         }),
     ];
-    for (objective, dist_of) in cases {
+    for (family, dist_of) in cases {
+        let objective = family.objective_name();
         let dtrain = sampled(3000, 5, dist_of);
         let dvalid = sampled(2000, 6, dist_of);
         let dtest = sampled(3000, 7, dist_of);
-        let family = DistFamily::from_objective(objective).unwrap();
         for mode in [
             DistGradient::Fisher,
             DistGradient::Hessian,
             DistGradient::Natural,
         ] {
-            let p = params(objective)
-                .dist_gradient(mode)
-                .eval_metric("crps")
-                .eval_metric("nll")
-                .build()
-                .unwrap();
+            let p = params(Objective::Dist(
+                Distributional::new(family).with_gradient(mode),
+            ))
+            .eval_metric(EvalMetric::Crps(family))
+            .eval_metric(EvalMetric::Nll(family))
+            .build()
+            .unwrap();
             let result = Trainer::new(&p, &dtrain, 1000)
                 .eval(&dvalid, "valid")
                 .early_stopping_rounds(20)
@@ -250,7 +271,7 @@ fn dist_poisson_trains_like_count_poisson_without_max_delta_step() {
     let d = sampled(2000, 8, |a, b| Dist::Poisson {
         rate: 0.5 + 8.0 * a * b,
     });
-    let fit = |objective: &str| {
+    let fit = |objective: Objective| {
         let p = params(objective)
             .max_delta_step(0.0)
             .base_score(2.0)
@@ -258,7 +279,7 @@ fn dist_poisson_trains_like_count_poisson_without_max_delta_step() {
             .unwrap();
         train(&p, &d, 40).unwrap().predict(&d).unwrap()
     };
-    let (dist, count) = (fit("dist:poisson"), fit("count:poisson"));
+    let (dist, count) = (fit(dist(DistFamily::Poisson)), fit(Objective::Poisson));
     for (a, b) in dist.iter().zip(&count) {
         assert!((a - b).abs() <= 1e-4 * b.abs(), "{a} vs {b}");
     }
@@ -270,7 +291,10 @@ fn native_round_trip_and_determinism() {
         mean: 1.0 + a,
         shape: 1.0 + 5.0 * b,
     });
-    let p = params("dist:gamma").subsample(0.8).build().unwrap();
+    let p = params(dist(DistFamily::Gamma))
+        .subsample(0.8)
+        .build()
+        .unwrap();
     let model = train(&p, &d, 30).unwrap();
     let again = train(&p, &d, 30).unwrap();
     let margins = model.predict_margin(&d).unwrap();
@@ -284,7 +308,7 @@ fn native_round_trip_and_determinism() {
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
         BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
     ] {
-        assert_eq!(restored.objective(), "dist:gamma");
+        assert_eq!(restored.objective().name(), "dist:gamma");
         assert_eq!(restored.predict_distribution(&d).unwrap(), dists);
         assert_eq!(restored.predict(&d).unwrap(), model.predict(&d).unwrap());
     }
@@ -293,7 +317,7 @@ fn native_round_trip_and_determinism() {
 #[test]
 fn xgboost_formats_refuse_distributional_models() {
     let d = sampled(300, 10, |a, _| Dist::Normal { mu: a, sigma: 1.0 });
-    let model = train(&params("dist:normal").build().unwrap(), &d, 3).unwrap();
+    let model = train(&params(dist(DistFamily::Normal)).build().unwrap(), &d, 3).unwrap();
     assert!(matches!(
         model.to_xgboost_json(),
         Err(HessboostError::ModelFormat(_))
@@ -303,7 +327,7 @@ fn xgboost_formats_refuse_distributional_models() {
         Err(HessboostError::ModelFormat(_))
     ));
     // A document claiming a `dist:*` objective is refused on import too.
-    let point = train(&params("reg:squarederror").build().unwrap(), &d, 3).unwrap();
+    let point = train(&params(Objective::SquaredError).build().unwrap(), &d, 3).unwrap();
     let doc = point
         .to_xgboost_json()
         .unwrap()
@@ -337,7 +361,7 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
     };
     let (dtrain, dcal, dtest) = (make(3000, 11), make(3000, 12), make(6000, 13));
     let model = fit(
-        &params("dist:normal").build().unwrap(),
+        &params(dist(DistFamily::Normal)).build().unwrap(),
         &dtrain,
         &make(1000, 14),
     );
@@ -362,7 +386,12 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
     assert!((f64::from(conformal[0].0) - (lo - cqr.correction())).abs() < 1e-4);
     assert!((f64::from(conformal[0].1) - (hi + cqr.correction())).abs() < 1e-4);
     // Only distributional models qualify.
-    let point = train(&params("reg:squarederror").build().unwrap(), &dtrain, 5).unwrap();
+    let point = train(
+        &params(Objective::SquaredError).build().unwrap(),
+        &dtrain,
+        5,
+    )
+    .unwrap();
     assert!(ConformalizedQuantile::calibrate_distribution(&point, &dcal, alpha).is_err());
 }
 
@@ -370,27 +399,41 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
 fn configuration_errors() {
     let d = sampled(100, 14, |a, _| Dist::Normal { mu: a, sigma: 1.0 });
     // Labels outside the support.
-    assert!(train(&params("dist:lognormal").build().unwrap(), &d, 1).is_err());
-    assert!(train(&params("dist:gamma").build().unwrap(), &d, 1).is_err());
+    assert!(train(&params(dist(DistFamily::LogNormal)).build().unwrap(), &d, 1).is_err());
+    assert!(train(&params(dist(DistFamily::Gamma)).build().unwrap(), &d, 1).is_err());
     // A scalar base_score cannot set two parameters; the Poisson rate can.
-    let p = params("dist:normal").base_score(1.0).build().unwrap();
+    let p = params(dist(DistFamily::Normal))
+        .base_score(1.0)
+        .build()
+        .unwrap();
     assert!(train(&p, &d, 1).is_err());
     let counts = sampled(100, 15, |_, _| Dist::Poisson { rate: 2.0 });
-    let p = params("dist:poisson").base_score(2.0).build().unwrap();
+    let p = params(dist(DistFamily::Poisson))
+        .base_score(2.0)
+        .build()
+        .unwrap();
     let m = train(&p, &counts, 0).unwrap();
     assert!((m.base_score() - 2f32.ln()).abs() < 1e-7);
     // Label matrices are not distributional targets.
     let y = vec![0.5f32; 200];
     let multi = d.clone().with_label_matrix(&y, 2).unwrap();
-    assert!(train(&params("dist:normal").build().unwrap(), &multi, 1).is_err());
-    // `nll` / `crps` need a distributional objective.
-    let p = params("reg:squarederror")
-        .eval_metric("crps")
+    assert!(
+        train(
+            &params(dist(DistFamily::Normal)).build().unwrap(),
+            &multi,
+            1
+        )
+        .is_err()
+    );
+    // `nll` / `crps` score distributions: a point model's single output is
+    // not a Normal's two parameters.
+    let p = params(Objective::SquaredError)
+        .eval_metric(EvalMetric::Crps(DistFamily::Normal))
         .build()
         .unwrap();
     assert!(Trainer::new(&p, &d, 1).eval(&d, "d").train().is_err());
     // Point models do not predict distributions.
-    let point = train(&params("reg:squarederror").build().unwrap(), &d, 1).unwrap();
+    let point = train(&params(Objective::SquaredError).build().unwrap(), &d, 1).unwrap();
     assert!(point.predict_distribution(&d).is_err());
 }
 
@@ -402,18 +445,23 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
     let (dtrain, _) = heteroscedastic(6000, 1);
     let (dvalid, _) = heteroscedastic(2000, 21);
     let (dtest, _) = heteroscedastic(6000, 2);
-    let reference = fit(&params("dist:normal").build().unwrap(), &dtrain, &dvalid);
+    let reference = fit(
+        &params(dist(DistFamily::Normal)).build().unwrap(),
+        &dtrain,
+        &dvalid,
+    );
     let reference_nll = mean_nll(&reference.predict_distribution(&dtest).unwrap(), &dtest);
     for direction in [
         DistSplitDirection::Random,
         DistSplitDirection::Cyclic,
         DistSplitDirection::All,
     ] {
-        let p = params("dist:normal")
-            .multi_strategy(MultiStrategy::MultiOutputTree)
-            .dist_split_direction(direction)
-            .build()
-            .unwrap();
+        let p = params(Objective::Dist(
+            Distributional::new(DistFamily::Normal).with_split_direction(direction),
+        ))
+        .multi_strategy(MultiStrategy::MultiOutputTree)
+        .build()
+        .unwrap();
         let model = fit(&p, &dtrain, &dvalid);
         assert_eq!(model.num_trees(), model.num_boost_rounds(), "{direction:?}");
         let dists = model.predict_distribution(&dtest).unwrap();
@@ -440,7 +488,7 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
     }
     // The random direction follows the seed.
     let with_seed = |seed| {
-        let p = params("dist:normal")
+        let p = params(dist(DistFamily::Normal))
             .multi_strategy(MultiStrategy::MultiOutputTree)
             .seed(seed)
             .build()
@@ -455,7 +503,7 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
     let counts = sampled(500, 22, |a, _| Dist::Poisson {
         rate: 1.0 + 5.0 * a,
     });
-    let p = params("dist:poisson")
+    let p = params(dist(DistFamily::Poisson))
         .multi_strategy(MultiStrategy::MultiOutputTree)
         .build()
         .unwrap();

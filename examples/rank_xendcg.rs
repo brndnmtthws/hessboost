@@ -1,6 +1,7 @@
 //! Train XE-NDCG ranking with whole-query subsampling. Run:
 //! `cargo run --release --example rank_xendcg`.
 
+use hessboost::config::QueryBagging;
 use hessboost::prelude::*;
 
 fn main() -> Result<()> {
@@ -19,10 +20,10 @@ fn main() -> Result<()> {
         .with_labels(&y)?
         .with_group_sizes(&vec![per; queries])?;
     let params = TrainingParams::builder()
-        .objective("rank:xendcg")
+        .objective(Objective::RankXendcg)
         .tree_method(TreeMethod::Hist)
-        .bagging_by_query(true)
-        .subsample(0.8)
+        // Keep 80% of the queries, each whole, every round.
+        .bagging_by_query(QueryBagging::new(0.8)?)
         .max_depth(3)
         .eta(0.1)
         .seed(7)

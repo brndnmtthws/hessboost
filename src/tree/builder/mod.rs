@@ -10,6 +10,7 @@ mod hist;
 mod lightgbm;
 mod multi;
 mod oblivious;
+pub(crate) mod online;
 
 pub(crate) use exact::{ExactTreeBuilder, SortedColumns, all_rows};
 pub use hist::HistTreeBuilder;

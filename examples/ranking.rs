@@ -1,6 +1,7 @@
 //! Learning-to-rank with LambdaMART (`rank:ndcg`) over query groups. Run:
 //! `cargo run --release --example ranking`.
 
+use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
@@ -28,7 +29,7 @@ fn main() -> Result<()> {
         .with_group_sizes(&sizes)?;
 
     let params = TrainingParams::builder()
-        .objective("rank:ndcg")
+        .objective(Objective::RankNdcg(LambdaRank::default()))
         .max_depth(3)
         .eta(0.2)
         .build()?;

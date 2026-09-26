@@ -3,9 +3,9 @@
 //! `metric/survival_metric.cu`).
 
 use super::{Metric, consistent};
-use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
+use crate::objective::AftDistribution;
 use crate::objective::{abs_label_order, aft_nloglik};
 use rayon::prelude::*;
 
@@ -19,7 +19,7 @@ use rayon::prelude::*;
 /// sets span one label per row, so label matrices are refused.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct CoxNLogLik;
+pub(crate) struct CoxNLogLik;
 
 impl Metric for CoxNLogLik {
     fn name(&self) -> &'static str {
@@ -133,14 +133,14 @@ fn validate_intervals(name: &str, info: &MetaInfo) -> Result<()> {
 /// and scale come from the objective's parameters
 /// (`aft_loss_distribution`, `aft_loss_distribution_scale`).
 #[derive(Debug, Clone, Copy)]
-pub struct AftNLogLik {
+pub(crate) struct AftNLogLik {
     distribution: AftDistribution,
     sigma: f32,
 }
 
 impl AftNLogLik {
     /// Create for the noise `distribution` with scale `sigma`.
-    pub fn new(distribution: AftDistribution, sigma: f32) -> Self {
+    pub(crate) fn new(distribution: AftDistribution, sigma: f32) -> Self {
         AftNLogLik {
             distribution,
             sigma,
@@ -180,7 +180,7 @@ impl Metric for AftNLogLik {
 /// weighted. Receives raw log-time margins. Higher is better.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct IntervalRegressionAccuracy;
+pub(crate) struct IntervalRegressionAccuracy;
 
 impl Metric for IntervalRegressionAccuracy {
     fn name(&self) -> &'static str {
@@ -260,7 +260,7 @@ mod tests {
             .with_label_matrix(&[1.0, 2.0, -3.0, 4.0, 2.0, 1.0, 3.0, -4.0], 2)
             .unwrap();
         let params = TrainingParams::builder()
-            .eval_metric("cox-nloglik")
+            .eval_metric(crate::metric::EvalMetric::CoxNLogLik)
             .build()
             .unwrap();
         assert!(matches!(
@@ -312,21 +312,23 @@ mod tests {
     /// scale.
     #[test]
     fn default_aft_metric_uses_unit_scale() {
-        use crate::config::ObjectiveParams;
-        use crate::metric::create_metrics;
+        use crate::metric::{DEFAULT_SOURCE, XgboostMetricSource, named};
+        use crate::objective::{AftLoss, Loss};
 
         let lower = [1.5f32, 0.0, 2.0];
         let upper = [1.5f32, 3.0, f32::INFINITY];
         let margins = [0.2f32, 0.5, 0.1];
         let info = bounded(&lower, &upper, None);
-        let params = ObjectiveParams {
+        let default = AftLoss::new(AftDistribution::Logistic, 0.8)
+            .default_metric()
+            .build(1)
+            .unwrap();
+        let source = XgboostMetricSource {
             aft_loss_distribution: AftDistribution::Logistic,
             aft_loss_distribution_scale: 0.8,
-            ..ObjectiveParams::defaults_for("survival:aft")
+            ..DEFAULT_SOURCE
         };
-        let default = &create_metrics(&[], "aft-nloglik", 0, &params).unwrap()[0];
-        let explicit =
-            &create_metrics(&["aft-nloglik".to_string()], "aft-nloglik", 0, &params).unwrap()[0];
+        let explicit = named("aft-nloglik", 1, &source).unwrap();
         let unit = AftNLogLik::new(AftDistribution::Logistic, 1.0).eval_info(&margins, &info);
         let scaled = AftNLogLik::new(AftDistribution::Logistic, 0.8).eval_info(&margins, &info);
         assert_ne!(unit, scaled);

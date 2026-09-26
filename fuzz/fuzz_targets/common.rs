@@ -129,7 +129,7 @@ fn predict_all(model: &BoostedModel) -> Vec<f32> {
     let preds = model
         .predict(&data)
         .expect("probe matrix matches the model");
-    let expected = if model.objective() == "multi:softmax" {
+    let expected = if model.objective().name() == "multi:softmax" {
         n
     } else {
         n * k
@@ -159,7 +159,7 @@ fn predict_all(model: &BoostedModel) -> Vec<f32> {
             n * k * (n_features + 1) * (n_features + 1)
         );
     }
-    if DistFamily::from_objective(model.objective()).is_some() {
+    if DistFamily::from_objective(model.objective().name()).is_some() {
         model
             .predict_distribution(&data)
             .expect("dist:* models predict distributions");

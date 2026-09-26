@@ -1198,15 +1198,16 @@ fn finalize_interactions(m: &mut [f32], diag: &[f32], width: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{BoosterKind, TrainingParams, TreeMethod};
+    use crate::config::{BoosterKind, Dart, TrainingParams, TreeMethod};
     use crate::data::{DMatrix, FeatureType};
+    use crate::objective::{Multiclass, Objective};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
 
     /// A `reg:squarederror` model with `eta = 0.3`.
     fn squared_error_model(d: &DMatrix, max_depth: usize, rounds: usize) -> BoostedModel {
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(max_depth)
             .eta(0.3)
             .build()
@@ -1245,8 +1246,7 @@ mod tests {
         }
         let d = labeled_dense(&x, n, nf, &y);
         let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(k)
+            .objective(Objective::Softprob(Multiclass::new(k).unwrap()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -1580,10 +1580,10 @@ mod tests {
         let base: Vec<f32> = (0..n).map(|row| row as f32 / 100.0).collect();
         let d = labeled_dense(&x, n, 2, &y).with_base_margin(&base).unwrap();
 
-        for booster in [BoosterKind::Dart, BoosterKind::GbLinear] {
+        let dart = BoosterKind::Dart(Dart::builder().rate_drop(0.5).build().unwrap());
+        for booster in [dart, BoosterKind::GbLinear] {
             let params = TrainingParams::builder()
                 .booster(booster)
-                .rate_drop(0.5)
                 .eta(0.2)
                 .max_depth(2)
                 .build()

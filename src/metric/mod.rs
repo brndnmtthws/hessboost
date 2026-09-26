@@ -1,7 +1,7 @@
 //! Evaluation metrics used for reporting and early stopping.
 //!
 //! Metrics receive predictions that have already passed through the objective's
-//! [`crate::objective::Objective::eval_transform`] (so classification metrics
+//! [`crate::objective::Loss::eval_transform`] (so classification metrics
 //! see probabilities), matching XGBoost's evaluation pipeline.
 
 /// Short-circuit a [`Metric::eval`] to NaN when its inputs are not
@@ -21,16 +21,19 @@ mod quantile;
 mod ranking;
 mod survival;
 
-pub use distributional::{DistCrps, DistNll};
-pub use elementwise::{Mape, PseudoHuberError, Rmsle};
-pub use quantile::{ExpectileError, QuantileError};
-pub use ranking::Precision;
-pub use survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
+use distributional::{DistCrps, DistNll};
+use elementwise::{Mape, PseudoHuberError, Rmsle};
+use quantile::{ExpectileError, QuantileError};
+use ranking::Precision;
+use survival::{AftNLogLik, CoxNLogLik, IntervalRegressionAccuracy};
 
-use crate::config::{ObjectiveParams, TrainingParams};
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
+use crate::objective::distributional::DistFamily;
+use crate::objective::{Aft, AftDistribution, Expectiles, PseudoHuber, Quantiles, Tweedie};
 use rayon::prelude::*;
+use std::borrow::Cow;
+use std::num::NonZeroUsize;
 
 /// An evaluation metric over predictions and labels.
 pub trait Metric: Send + Sync {
@@ -158,7 +161,7 @@ macro_rules! simple_metric {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, Default)]
         #[non_exhaustive]
-        pub struct $ty;
+        pub(crate) struct $ty;
         impl Metric for $ty {
             fn name(&self) -> &str {
                 $name
@@ -172,7 +175,7 @@ macro_rules! simple_metric {
     ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy)]
-        pub struct $ty {
+        pub(crate) struct $ty {
             $field: $field_ty,
         }
         impl Metric for $ty {
@@ -189,7 +192,7 @@ macro_rules! simple_metric {
         per_label) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy)]
-        pub struct $ty {
+        pub(crate) struct $ty {
             $field: $field_ty,
         }
         impl Metric for $ty {
@@ -283,7 +286,7 @@ fn macro_average_targets(metric: &dyn Metric, preds: &[f32], info: &MetaInfo) ->
 /// multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct Auc;
+pub(crate) struct Auc;
 
 impl Metric for Auc {
     fn name(&self) -> &'static str {
@@ -357,21 +360,26 @@ simple_metric!(
 /// `rho`, named `tweedie-nloglik@rho` as XGBoost reports it (`rho` to six
 /// significant digits: `tweedie-nloglik@1.5`, `tweedie-nloglik@1`).
 #[derive(Debug, Clone)]
-pub struct TweedieNLogLik {
+pub(crate) struct TweedieNLogLik {
     rho: f64,
     name: String,
 }
 
 impl TweedieNLogLik {
     fn new(rho: f64) -> Self {
-        // C++'s default stream precision: six significant digits, then the
-        // shortest form (`1.0` -> `1`), which Rust's `Display` gives.
-        let rounded: f64 = format!("{rho:.5e}").parse().unwrap_or(rho);
         TweedieNLogLik {
             rho,
-            name: format!("tweedie-nloglik@{rounded}"),
+            name: tweedie_name(rho),
         }
     }
+}
+
+/// `tweedie-nloglik@rho` as XGBoost names it: C++'s default stream
+/// precision, six significant digits, then the shortest form (`1.0` ->
+/// `1`), which Rust's `Display` gives.
+fn tweedie_name(rho: f64) -> String {
+    let rounded: f64 = format!("{rho:.5e}").parse().unwrap_or(rho);
+    format!("tweedie-nloglik@{rounded}")
 }
 
 impl Metric for TweedieNLogLik {
@@ -502,7 +510,7 @@ pub(super) fn fold_groups<T: Send, A>(
 /// A group whose ideal DCG is zero contributes `0`. Named `ndcg@k` with a
 /// cutoff, else `ndcg`, as XGBoost reports it.
 #[derive(Debug, Clone)]
-pub struct Ndcg {
+pub(crate) struct Ndcg {
     /// Optional rank cutoff `k`. `None` uses the full list.
     k: Option<usize>,
     name: String,
@@ -517,7 +525,7 @@ impl Default for Ndcg {
 
 impl Ndcg {
     /// Create an NDCG metric with an optional `@k` truncation.
-    pub fn new(k: Option<usize>) -> Self {
+    pub(crate) fn new(k: Option<usize>) -> Self {
         Ndcg {
             k,
             name: cutoff_name("ndcg", k),
@@ -604,7 +612,7 @@ fn ideal_dcg(labels: &[f32], cut: usize) -> f64 {
 /// better. A group with no relevant documents contributes `0`. Named `map@k`
 /// with a cutoff, else `map`, as XGBoost reports it.
 #[derive(Debug, Clone)]
-pub struct MeanAveragePrecision {
+pub(crate) struct MeanAveragePrecision {
     /// Optional rank cutoff `k`. `None` uses the full list.
     k: Option<usize>,
     name: String,
@@ -619,7 +627,7 @@ impl Default for MeanAveragePrecision {
 
 impl MeanAveragePrecision {
     /// Create a MAP metric with an optional `@k` truncation.
-    pub fn new(k: Option<usize>) -> Self {
+    pub(crate) fn new(k: Option<usize>) -> Self {
         MeanAveragePrecision {
             k,
             name: cutoff_name("map", k),
@@ -689,7 +697,7 @@ impl Metric for MeanAveragePrecision {
 /// is the mean of the per-target areas (XGBoost's multi-label macro average).
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct AucPr;
+pub(crate) struct AucPr;
 
 impl Metric for AucPr {
     fn name(&self) -> &'static str {
@@ -824,107 +832,328 @@ impl Metric for CustomMetric {
     }
 }
 
-/// The metric XGBoost calls `name` (e.g. `"auc"`, `"ndcg@5"`,
-/// `"tweedie-nloglik@1.5"`), configured from `params`: multiclass metrics
-/// read `num_class`, and objective-dependent metrics the loss parameters:
-/// `mphe` takes its slope from `huber_slope`, `aft-nloglik` the AFT
-/// distribution and scale, and `quantile` / `expectile` the configured
-/// `quantile_alpha` / `expectile_alpha` (whatever the objective, like
-/// XGBoost), failing when that list is empty or invalid. The distributional
-/// metrics `nll` and `crps` (beyond XGBoost) take the family of a `dist:*`
-/// objective and fail without one.
-///
-/// Only `ndcg`, `map`, and `pre` (a positive integer rank cutoff `@k`, as
-/// the lower bound 1 XGBoost puts on the top-k it sets from the suffix) and
-/// `tweedie-nloglik` (a variance power `@rho` in `[1, 2)`) take an `@`
-/// suffix; any other suffix, including XGBoost's `error@t` threshold and the
-/// `-` variants (`ndcg@3-`), is a parameter error.
-pub fn create_metric(name: &str, params: &TrainingParams) -> Result<Box<dyn Metric>> {
-    build(
-        name,
-        params.num_class,
-        &ObjectiveParams::from_params(params),
-    )
+/// A rank cutoff of the ranking metrics (`ndcg`, `map`, `pre`): the top
+/// `k` documents of every query group, or the whole list. XGBoost's `@k`
+/// metric suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cutoff {
+    top_k: Option<NonZeroUsize>,
 }
 
-/// [`create_metric`] from a model's retained objective parameters.
-pub(crate) fn build(
-    name: &str,
-    num_class: usize,
-    objective: &ObjectiveParams,
-) -> Result<Box<dyn Metric>> {
-    let (base, suffix) = match name.split_once('@') {
-        Some((b, s)) => (b, Some(s)),
-        None => (name, None),
-    };
-    let invalid = |reason: &str| invalid_metric(name, reason);
-    let cutoff = || rank_cutoff(name, suffix);
-    let metric: Result<Box<dyn Metric>> = match base {
-        "rmse" => Ok(Box::new(Rmse)),
-        "mae" => Ok(Box::new(Mae)),
-        "logloss" => Ok(Box::new(LogLoss)),
-        "error" => Ok(Box::new(ErrorRate)),
-        "auc" => Ok(Box::new(Auc)),
-        "aucpr" => Ok(Box::new(AucPr)),
-        "mlogloss" => Ok(Box::new(MLogLoss {
-            num_class: num_class.max(2),
-        })),
-        "merror" => Ok(Box::new(MError {
-            num_class: num_class.max(2),
-        })),
-        "poisson-nloglik" => Ok(Box::new(PoissonNLogLik)),
-        "gamma-nloglik" => Ok(Box::new(GammaNLogLik)),
-        "tweedie-nloglik" => Ok(Box::new(TweedieNLogLik::new(tweedie_power(name, suffix)?))),
-        "ndcg" => Ok(Box::new(Ndcg::new(cutoff()?))),
-        "map" => Ok(Box::new(MeanAveragePrecision::new(cutoff()?))),
-        "rmsle" => Ok(Box::new(Rmsle)),
-        "mape" => Ok(Box::new(Mape)),
-        "mphe" => {
-            let slope = objective.huber_slope as f32;
-            if slope == 0.0 {
-                return Err(HessboostError::invalid_param(
-                    "huber_slope",
-                    "the slope of `mphe` cannot be 0",
-                ));
-            }
-            Ok(Box::new(PseudoHuberError::new(slope)))
-        }
-        "pre" => Ok(Box::new(Precision::new(cutoff()?))),
-        "quantile" => Ok(Box::new(QuantileError::new(&objective.quantile_alpha)?)),
-        "expectile" => Ok(Box::new(ExpectileError::new(&objective.expectile_alpha)?)),
-        "cox-nloglik" => Ok(Box::new(CoxNLogLik)),
-        "aft-nloglik" => Ok(Box::new(AftNLogLik::new(
-            objective.aft_loss_distribution,
-            objective.aft_loss_distribution_scale as f32,
-        ))),
-        "interval-regression-accuracy" => Ok(Box::new(IntervalRegressionAccuracy)),
-        "nll" | "crps" => {
-            let family = objective.distribution.ok_or_else(|| {
-                HessboostError::invalid_param(
-                    "eval_metric",
-                    format!(
-                        "`{name}` scores predicted distributions and needs a `dist:*` objective"
-                    ),
-                )
-            })?;
-            Ok(if base == "nll" {
-                Box::new(DistNll::new(family))
-            } else {
-                Box::new(DistCrps::new(family))
-            })
-        }
-        other => Err(HessboostError::unknown("metric", other)),
-    };
-    let metric = metric?;
-    if suffix.is_some() && !matches!(base, "tweedie-nloglik" | "ndcg" | "map" | "pre") {
-        return Err(invalid(&format!("`{base}` takes no `@` suffix")));
+impl Cutoff {
+    /// No cutoff: `ndcg` and `map` score the whole list; `pre` without a
+    /// cutoff scores the top 32, as XGBoost does, and is still named `pre`.
+    pub fn all() -> Self {
+        Cutoff { top_k: None }
     }
-    Ok(metric)
+
+    /// The top `k` documents (`@k`).
+    ///
+    /// # Errors
+    ///
+    /// `k` is 0 (XGBoost's lower bound on the top-k it reads from the
+    /// suffix is 1).
+    pub fn top(k: usize) -> Result<Self> {
+        NonZeroUsize::new(k).map(Cutoff::from).ok_or_else(|| {
+            HessboostError::invalid_param("eval_metric", "the `@k` cutoff must be at least 1")
+        })
+    }
+
+    /// The cutoff `k`, `None` for the whole list.
+    pub fn top_k(&self) -> Option<NonZeroUsize> {
+        self.top_k
+    }
+
+    /// The cutoff as the ranking metrics compute with it.
+    fn k(self) -> Option<usize> {
+        self.top_k.map(NonZeroUsize::get)
+    }
+}
+
+impl From<NonZeroUsize> for Cutoff {
+    fn from(k: NonZeroUsize) -> Self {
+        Cutoff { top_k: Some(k) }
+    }
+}
+
+/// A built-in evaluation metric with its parameters: the typed form of
+/// XGBoost's `eval_metric` names, which training builds with
+/// [`EvalMetric::build`]. Every metric carries the parameters it evaluates
+/// with (unlike XGBoost, where `mphe`, `quantile`, `expectile`, and
+/// `aft-nloglik` read the objective's parameters);
+/// [`TrainingParams::from_xgboost`](crate::config::TrainingParams::from_xgboost)
+/// reads XGBoost's names and fills those parameters the way XGBoost does.
+///
+/// [`name`](EvalMetric::name) is XGBoost's `evals_result` key, suffix
+/// included (`ndcg@5`, `tweedie-nloglik@1.5`).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum EvalMetric {
+    /// Root-mean-square error (`rmse`).
+    Rmse,
+    /// Root-mean-square log error (`rmsle`).
+    Rmsle,
+    /// Mean absolute error (`mae`).
+    Mae,
+    /// Mean absolute percentage error (`mape`).
+    Mape,
+    /// Mean pseudo-Huber error (`mphe`) with this slope.
+    Mphe(PseudoHuber),
+    /// Binary log loss (`logloss`); raw margins for `binary:logitraw`.
+    LogLoss,
+    /// Binary error rate at threshold 0.5 (`error`).
+    Error,
+    /// ROC AUC (`auc`); the mean per-target AUC for a label matrix.
+    Auc,
+    /// Area under the precision-recall curve (`aucpr`).
+    AucPr,
+    /// Multiclass log loss (`mlogloss`), one probability per class.
+    MLogLoss,
+    /// Multiclass error rate (`merror`).
+    MError,
+    /// Poisson negative log-likelihood (`poisson-nloglik`).
+    PoissonNLogLik,
+    /// Gamma negative log-likelihood (`gamma-nloglik`).
+    GammaNLogLik,
+    /// Tweedie negative log-likelihood (`tweedie-nloglik@rho`) at this
+    /// variance power.
+    TweedieNLogLik(Tweedie),
+    /// Normalized discounted cumulative gain (`ndcg`, `ndcg@k`).
+    Ndcg(Cutoff),
+    /// Mean average precision (`map`, `map@k`).
+    Map(Cutoff),
+    /// Precision (`pre`, `pre@k`).
+    Precision(Cutoff),
+    /// Pinball loss at these quantiles (`quantile`), one prediction per
+    /// level.
+    Quantile(Quantiles),
+    /// Expectile loss at these levels (`expectile`).
+    Expectile(Expectiles),
+    /// Cox proportional-hazards negative partial log-likelihood
+    /// (`cox-nloglik`).
+    CoxNLogLik,
+    /// Accelerated-failure-time negative log-likelihood (`aft-nloglik`)
+    /// under this noise model.
+    AftNLogLik(Aft),
+    /// Fraction of predictions inside their label interval
+    /// (`interval-regression-accuracy`).
+    IntervalRegressionAccuracy,
+    /// Negative log-likelihood of predicted distributions of this family
+    /// (`nll`, beyond XGBoost; see [`crate::objective::distributional`]).
+    Nll(DistFamily),
+    /// Continuous ranked probability score of predicted distributions of
+    /// this family (`crps`, beyond XGBoost).
+    Crps(DistFamily),
 }
 
 /// XGBoost's name of a ranking metric: `base@k` with a cutoff, else `base`.
-pub(crate) fn cutoff_name(base: &str, k: Option<usize>) -> String {
+fn cutoff_name(base: &str, k: Option<usize>) -> String {
     k.map_or_else(|| base.to_string(), |k| format!("{base}@{k}"))
+}
+
+impl EvalMetric {
+    /// XGBoost's `evals_result` key: the metric's name with its suffix
+    /// (`ndcg@5`, `tweedie-nloglik@1.5`), as
+    /// [`Metric::name`] of the built metric reports it.
+    pub fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
+            EvalMetric::Rmse => "rmse",
+            EvalMetric::Rmsle => "rmsle",
+            EvalMetric::Mae => "mae",
+            EvalMetric::Mape => "mape",
+            EvalMetric::Mphe(_) => "mphe",
+            EvalMetric::LogLoss => "logloss",
+            EvalMetric::Error => "error",
+            EvalMetric::Auc => "auc",
+            EvalMetric::AucPr => "aucpr",
+            EvalMetric::MLogLoss => "mlogloss",
+            EvalMetric::MError => "merror",
+            EvalMetric::PoissonNLogLik => "poisson-nloglik",
+            EvalMetric::GammaNLogLik => "gamma-nloglik",
+            EvalMetric::TweedieNLogLik(tweedie) => {
+                return Cow::Owned(tweedie_name(tweedie.variance_power()));
+            }
+            EvalMetric::Ndcg(cutoff) => return Cow::Owned(cutoff_name("ndcg", cutoff.k())),
+            EvalMetric::Map(cutoff) => return Cow::Owned(cutoff_name("map", cutoff.k())),
+            EvalMetric::Precision(cutoff) => return Cow::Owned(cutoff_name("pre", cutoff.k())),
+            EvalMetric::Quantile(_) => "quantile",
+            EvalMetric::Expectile(_) => "expectile",
+            EvalMetric::CoxNLogLik => "cox-nloglik",
+            EvalMetric::AftNLogLik(_) => "aft-nloglik",
+            EvalMetric::IntervalRegressionAccuracy => "interval-regression-accuracy",
+            EvalMetric::Nll(_) => "nll",
+            EvalMetric::Crps(_) => "crps",
+        })
+    }
+
+    /// The metric, ready to evaluate the predictions of a model with
+    /// `n_outputs` outputs per row (`mlogloss` and `merror` read one
+    /// probability per class).
+    ///
+    /// # Errors
+    ///
+    /// `mlogloss` or `merror` for fewer than two outputs.
+    ///
+    /// ```
+    /// use hessboost::metric::{EvalMetric, Metric};
+    ///
+    /// # fn main() -> hessboost::error::Result<()> {
+    /// let rmse = EvalMetric::Rmse.build(1)?;
+    /// assert_eq!(rmse.eval(&[1.0, 3.0], &[1.0, 1.0], None), 2f64.sqrt());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build(&self, n_outputs: usize) -> Result<Box<dyn Metric>> {
+        let classes = || {
+            if n_outputs >= 2 {
+                Ok(n_outputs)
+            } else {
+                Err(HessboostError::invalid_param(
+                    "eval_metric",
+                    format!(
+                        "`{}` scores one probability per class and needs a multiclass model, \
+                         got {n_outputs} output(s)",
+                        self.name()
+                    ),
+                ))
+            }
+        };
+        Ok(match self {
+            EvalMetric::Rmse => Box::new(Rmse),
+            EvalMetric::Rmsle => Box::new(Rmsle),
+            EvalMetric::Mae => Box::new(Mae),
+            EvalMetric::Mape => Box::new(Mape),
+            EvalMetric::Mphe(huber) => Box::new(PseudoHuberError::new(huber.slope() as f32)),
+            EvalMetric::LogLoss => Box::new(LogLoss),
+            EvalMetric::Error => Box::new(ErrorRate),
+            EvalMetric::Auc => Box::new(Auc),
+            EvalMetric::AucPr => Box::new(AucPr),
+            EvalMetric::MLogLoss => Box::new(MLogLoss {
+                num_class: classes()?,
+            }),
+            EvalMetric::MError => Box::new(MError {
+                num_class: classes()?,
+            }),
+            EvalMetric::PoissonNLogLik => Box::new(PoissonNLogLik),
+            EvalMetric::GammaNLogLik => Box::new(GammaNLogLik),
+            EvalMetric::TweedieNLogLik(tweedie) => {
+                Box::new(TweedieNLogLik::new(tweedie.variance_power()))
+            }
+            EvalMetric::Ndcg(cutoff) => Box::new(Ndcg::new(cutoff.k())),
+            EvalMetric::Map(cutoff) => Box::new(MeanAveragePrecision::new(cutoff.k())),
+            EvalMetric::Precision(cutoff) => Box::new(Precision::new(cutoff.k())),
+            EvalMetric::Quantile(quantiles) => Box::new(QuantileError::new(quantiles.alpha_f32())),
+            EvalMetric::Expectile(expectiles) => {
+                Box::new(ExpectileError::new(expectiles.alpha_f32()))
+            }
+            EvalMetric::CoxNLogLik => Box::new(CoxNLogLik),
+            EvalMetric::AftNLogLik(aft) => {
+                Box::new(AftNLogLik::new(aft.distribution(), aft.scale() as f32))
+            }
+            EvalMetric::IntervalRegressionAccuracy => Box::new(IntervalRegressionAccuracy),
+            EvalMetric::Nll(family) => Box::new(DistNll::new(*family)),
+            EvalMetric::Crps(family) => Box::new(DistCrps::new(*family)),
+        })
+    }
+
+    /// The metric XGBoost names `name`, with the parameters XGBoost would
+    /// give it: the `@k` cutoff of `ndcg`/`map`/`pre` and the `@rho` power of
+    /// `tweedie-nloglik` (1.5 without one) from the suffix, the rest from
+    /// `source` (the flat parameters `mphe`, `quantile`, `expectile`, and
+    /// `aft-nloglik` read, and the `dist:*` family `nll` and `crps` score).
+    ///
+    /// Only those four names take an `@` suffix; any other suffix, including
+    /// XGBoost's `error@t` threshold and the `-` variants (`ndcg@3-`), is
+    /// refused, as are unknown names.
+    pub(crate) fn from_xgboost(name: &str, source: &XgboostMetricSource<'_>) -> Result<Self> {
+        let (base, suffix) = match name.split_once('@') {
+            Some((b, s)) => (b, Some(s)),
+            None => (name, None),
+        };
+        if suffix.is_some() && !matches!(base, "tweedie-nloglik" | "ndcg" | "map" | "pre") {
+            return Err(invalid_metric(
+                name,
+                &format!("`{base}` takes no `@` suffix"),
+            ));
+        }
+        let cutoff = || rank_cutoff(name, suffix);
+        Ok(match base {
+            "rmse" => EvalMetric::Rmse,
+            "rmsle" => EvalMetric::Rmsle,
+            "mae" => EvalMetric::Mae,
+            "mape" => EvalMetric::Mape,
+            "mphe" => EvalMetric::Mphe(source.huber()?),
+            "logloss" => EvalMetric::LogLoss,
+            "error" => EvalMetric::Error,
+            "auc" => EvalMetric::Auc,
+            "aucpr" => EvalMetric::AucPr,
+            "mlogloss" => EvalMetric::MLogLoss,
+            "merror" => EvalMetric::MError,
+            "poisson-nloglik" => EvalMetric::PoissonNLogLik,
+            "gamma-nloglik" => EvalMetric::GammaNLogLik,
+            "tweedie-nloglik" => EvalMetric::TweedieNLogLik(tweedie_power(name, suffix)?),
+            "ndcg" => EvalMetric::Ndcg(cutoff()?),
+            "map" => EvalMetric::Map(cutoff()?),
+            "pre" => EvalMetric::Precision(cutoff()?),
+            "quantile" => EvalMetric::Quantile(source.quantiles()?),
+            "expectile" => EvalMetric::Expectile(source.expectiles()?),
+            "cox-nloglik" => EvalMetric::CoxNLogLik,
+            "aft-nloglik" => EvalMetric::AftNLogLik(source.aft()?),
+            "interval-regression-accuracy" => EvalMetric::IntervalRegressionAccuracy,
+            "nll" | "crps" => {
+                let family = source.distribution.ok_or_else(|| {
+                    HessboostError::invalid_param(
+                        "eval_metric",
+                        format!(
+                            "`{name}` scores predicted distributions and needs a `dist:*` objective"
+                        ),
+                    )
+                })?;
+                if base == "nll" {
+                    EvalMetric::Nll(family)
+                } else {
+                    EvalMetric::Crps(family)
+                }
+            }
+            other => return Err(HessboostError::unknown("metric", other)),
+        })
+    }
+}
+
+/// The flat XGBoost parameters the metrics named in `eval_metric` read
+/// ([`EvalMetric::from_xgboost`]), as XGBoost gives them whatever the
+/// objective.
+pub(crate) struct XgboostMetricSource<'a> {
+    /// `huber_slope` (`mphe`).
+    pub(crate) huber_slope: f64,
+    /// `quantile_alpha` (`quantile`).
+    pub(crate) quantile_alpha: &'a [f64],
+    /// `expectile_alpha` (`expectile`).
+    pub(crate) expectile_alpha: &'a [f64],
+    /// `aft_loss_distribution` (`aft-nloglik`).
+    pub(crate) aft_loss_distribution: AftDistribution,
+    /// `aft_loss_distribution_scale` (`aft-nloglik`).
+    pub(crate) aft_loss_distribution_scale: f64,
+    /// The family of a `dist:*` objective (`nll`, `crps`).
+    pub(crate) distribution: Option<DistFamily>,
+}
+
+impl XgboostMetricSource<'_> {
+    fn huber(&self) -> Result<PseudoHuber> {
+        PseudoHuber::new(self.huber_slope)
+    }
+
+    fn quantiles(&self) -> Result<Quantiles> {
+        Quantiles::new(self.quantile_alpha.iter().copied())
+    }
+
+    fn expectiles(&self) -> Result<Expectiles> {
+        Expectiles::new(self.expectile_alpha.iter().copied())
+    }
+
+    fn aft(&self) -> Result<Aft> {
+        Aft::new(self.aft_loss_distribution, self.aft_loss_distribution_scale)
+    }
 }
 
 /// The parameter error of metric `name`.
@@ -935,15 +1164,15 @@ fn invalid_metric(name: &str, reason: &str) -> HessboostError {
 /// The rank cutoff `@k` of ranking metric `name`: decimal digits only
 /// (`usize::from_str` also takes a leading `+`), so `2.9`, `abc`, `1@2`, or
 /// an empty suffix are refused rather than truncated or dropped.
-fn rank_cutoff(name: &str, suffix: Option<&str>) -> Result<Option<usize>> {
+fn rank_cutoff(name: &str, suffix: Option<&str>) -> Result<Cutoff> {
     match suffix {
-        None => Ok(None),
+        None => Ok(Cutoff::all()),
         Some(s) if s.ends_with('-') => Err(invalid_metric(
             name,
             "the `-` variants of the ranking metrics are not implemented",
         )),
-        Some(s) => match s.parse::<usize>() {
-            Ok(k) if k >= 1 && s.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(k)),
+        Some(s) => match s.parse::<usize>().ok().and_then(NonZeroUsize::new) {
+            Some(k) if s.bytes().all(|b| b.is_ascii_digit()) => Ok(Cutoff::from(k)),
             _ => Err(invalid_metric(
                 name,
                 "the `@k` cutoff must be a positive integer",
@@ -953,48 +1182,41 @@ fn rank_cutoff(name: &str, suffix: Option<&str>) -> Result<Option<usize>> {
 }
 
 /// The variance power `@rho` of `tweedie-nloglik` (`1.5` without a
-/// suffix), in the range `TrainingParams::validate` gives the objective's
-/// `tweedie_variance_power`, whose default metric this is.
-fn tweedie_power(name: &str, suffix: Option<&str>) -> Result<f64> {
+/// suffix), in the range of the objective's `tweedie_variance_power`,
+/// whose default metric this is.
+fn tweedie_power(name: &str, suffix: Option<&str>) -> Result<Tweedie> {
     match suffix {
-        None => Ok(1.5),
+        None => Ok(Tweedie::default()),
         Some(s) => s
             .parse::<f64>()
             .ok()
-            .filter(|r| r.is_finite() && (1.0f32..2.0).contains(&(*r as f32)))
+            .and_then(|rho| Tweedie::new(rho).ok())
             .ok_or_else(|| invalid_metric(name, "the variance power `@rho` must be in [1, 2)")),
     }
 }
 
-/// Build the list of metrics to evaluate: the user's `eval_metric` list if any,
-/// otherwise the single `default_name` supplied by the objective. `num_class`
-/// and `objective` are forwarded to [`build`].
-///
-/// XGBoost configures the default metric from the objective's
-/// `DefaultMetricConfig` but without the user's parameters (the learner has
-/// cleared them by the time it evaluates). For `aft-nloglik` that keeps the
-/// objective's distribution while the scale falls back to its default 1, so
-/// the default metric here is built the same way; list `aft-nloglik` in
-/// `eval_metric` to evaluate the likelihood at the configured scale.
-pub(crate) fn create_metrics(
-    eval_metric: &[String],
-    default_name: &str,
-    num_class: usize,
-    objective: &ObjectiveParams,
-) -> Result<Vec<Box<dyn Metric>>> {
-    if eval_metric.is_empty() {
-        let default_config = ObjectiveParams {
-            aft_loss_distribution_scale: ObjectiveParams::default().aft_loss_distribution_scale,
-            ..objective.clone()
-        };
-        Ok(vec![build(default_name, num_class, &default_config)?])
-    } else {
-        eval_metric
-            .iter()
-            .map(|n| build(n, num_class, objective))
-            .collect()
-    }
+/// The metric XGBoost names `name`, parameterized from `source` and built
+/// for `n_outputs` outputs (tests).
+#[cfg(test)]
+pub(crate) fn named(
+    name: &str,
+    n_outputs: usize,
+    source: &XgboostMetricSource<'_>,
+) -> Result<Box<dyn Metric>> {
+    EvalMetric::from_xgboost(name, source)?.build(n_outputs)
 }
+
+/// XGBoost's default flat parameters of the metrics (tests): slope 1, no
+/// alphas, normal AFT noise at scale 1, no `dist:*` family.
+#[cfg(test)]
+pub(crate) const DEFAULT_SOURCE: XgboostMetricSource<'static> = XgboostMetricSource {
+    huber_slope: 1.0,
+    quantile_alpha: &[],
+    expectile_alpha: &[],
+    aft_loss_distribution: AftDistribution::Normal,
+    aft_loss_distribution_scale: 1.0,
+    distribution: None,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1006,7 +1228,6 @@ mod tests {
     /// query groups (one empty), weights, and label matrices.
     #[test]
     fn parallel_evaluation_matches_serial() {
-        use crate::config::AftDistribution;
         use crate::data::GroupInfo;
         let n = 3 * PARALLEL_SORT_LEN + 17;
         let preds: Vec<f32> = (0..3 * n)
@@ -1112,13 +1333,76 @@ mod tests {
         );
     }
 
+    /// Every XGBoost metric name reads back as the metric whose name it is,
+    /// and that name is the built metric's `evals_result` key; unknown
+    /// names are refused.
     #[test]
-    fn factory_defaults_to_objective_metric() {
-        let obj = ObjectiveParams::default();
-        let ms = create_metrics(&[], "rmse", 0, &obj).unwrap();
-        assert_eq!(ms.len(), 1);
-        assert_eq!(ms[0].name(), "rmse");
-        assert!(create_metrics(&["nope".to_string()], "rmse", 0, &obj).is_err());
+    fn xgboost_names_parse_to_metrics_of_that_name() {
+        let source = XgboostMetricSource {
+            quantile_alpha: &[0.2, 0.8],
+            expectile_alpha: &[0.5],
+            distribution: Some(DistFamily::Normal),
+            ..DEFAULT_SOURCE
+        };
+        for name in [
+            "rmse",
+            "rmsle",
+            "mae",
+            "mape",
+            "mphe",
+            "logloss",
+            "error",
+            "auc",
+            "aucpr",
+            "mlogloss",
+            "merror",
+            "poisson-nloglik",
+            "gamma-nloglik",
+            "tweedie-nloglik@1.5",
+            "tweedie-nloglik@1",
+            "ndcg",
+            "ndcg@5",
+            "map",
+            "map@3",
+            "pre",
+            "pre@2",
+            "quantile",
+            "expectile",
+            "cox-nloglik",
+            "aft-nloglik",
+            "interval-regression-accuracy",
+            "nll",
+            "crps",
+        ] {
+            let metric = EvalMetric::from_xgboost(name, &source).unwrap();
+            assert_eq!(metric.name(), name);
+            assert_eq!(metric.build(3).unwrap().name(), name);
+        }
+        // No suffix is the default power; the name always carries it.
+        assert_eq!(
+            EvalMetric::from_xgboost("tweedie-nloglik", &source).unwrap(),
+            EvalMetric::TweedieNLogLik(Tweedie::default())
+        );
+        assert_eq!(
+            EvalMetric::from_xgboost("ndcg@05", &source).unwrap().name(),
+            "ndcg@5"
+        );
+        assert!(matches!(
+            EvalMetric::from_xgboost("nope", &source),
+            Err(HessboostError::Unknown { .. })
+        ));
+    }
+
+    /// The multiclass metrics read one probability per model output, so
+    /// they refuse a single-output model.
+    #[test]
+    fn multiclass_metrics_need_several_outputs() {
+        for metric in [EvalMetric::MLogLoss, EvalMetric::MError] {
+            assert!(metric.build(1).is_err());
+            let built = metric.build(4).unwrap();
+            let info = MetaInfo::new(&[0.0], None, None);
+            assert_eq!(built.prediction_width(&info), Some(4));
+        }
     }
 
     /// XGBoost's elementwise reduction over a label matrix: every
@@ -1181,7 +1465,6 @@ mod tests {
     /// metrics accept them.
     #[test]
     fn label_matrix_support_is_declared_per_metric() {
-        let obj = ObjectiveParams::default();
         for (name, supported) in [
             ("rmse", true),
             ("logloss", true),
@@ -1198,7 +1481,7 @@ mod tests {
             ("aft-nloglik", false),
             ("interval-regression-accuracy", false),
         ] {
-            let metric = build(name, 3, &obj).unwrap();
+            let metric = named(name, 3, &DEFAULT_SOURCE).unwrap();
             assert_eq!(metric.supports_label_matrix(), supported, "{name}");
         }
     }
@@ -1210,7 +1493,6 @@ mod tests {
     /// `tweedie-nloglik`'s variance power in `[1, 2)`.
     #[test]
     fn metrics_reject_invalid_suffixes() {
-        let obj = ObjectiveParams::default();
         let mut names: Vec<String> = [
             "pre@0.5",
             "pre@2.9",
@@ -1234,7 +1516,7 @@ mod tests {
             }
         }
         for name in &names {
-            let err = build(name, 0, &obj).err();
+            let err = named(name, 1, &DEFAULT_SOURCE).err();
             assert!(
                 matches!(err, Some(HessboostError::InvalidParameter { name: param, .. }) if param == "eval_metric"),
                 "{name}: {err:?}"
@@ -1249,9 +1531,9 @@ mod tests {
             "tweedie-nloglik@1",
             "tweedie-nloglik@1.25",
         ] {
-            assert!(build(name, 0, &obj).is_ok(), "{name}");
+            assert!(named(name, 1, &DEFAULT_SOURCE).is_ok(), "{name}");
         }
-        let m = build("pre@2", 0, &obj).unwrap();
+        let m = named("pre@2", 1, &DEFAULT_SOURCE).unwrap();
         // All labels zero: no hits at any cutoff.
         assert_eq!(m.eval(&[0.9, 0.5, 0.1], &[0.0, 0.0, 0.0], None), 0.0);
     }
@@ -1261,11 +1543,11 @@ mod tests {
     /// out of bounds.
     #[test]
     fn mismatched_lengths_evaluate_to_nan() {
-        let obj = ObjectiveParams {
-            quantile_alpha: vec![0.2, 0.8],
-            expectile_alpha: vec![0.5],
-            distribution: Some(crate::objective::distributional::DistFamily::Normal),
-            ..ObjectiveParams::default()
+        let source = XgboostMetricSource {
+            quantile_alpha: &[0.2, 0.8],
+            expectile_alpha: &[0.5],
+            distribution: Some(DistFamily::Normal),
+            ..DEFAULT_SOURCE
         };
         let widths = [
             ("rmse", 1),
@@ -1296,7 +1578,7 @@ mod tests {
         let labels = [1.0, 0.0, 1.0];
         let info = MetaInfo::new(&labels, None, None);
         for (name, width) in widths {
-            let metric = build(name, 3, &obj).unwrap();
+            let metric = named(name, 3, &source).unwrap();
             assert_eq!(metric.prediction_width(&info), Some(width), "{name}");
             let preds = vec![0.5f32; labels.len() * width + 1];
             let valid = &preds[..labels.len() * width];
@@ -1353,7 +1635,7 @@ mod tests {
             ..MetaInfo::new(&[], Some(&[1.0]), None)
         };
         let aft = MetaInfo { n_rows: 1, ..aft };
-        let nloglik = AftNLogLik::new(crate::config::AftDistribution::Normal, 1.0);
+        let nloglik = AftNLogLik::new(crate::objective::AftDistribution::Normal, 1.0);
         assert!(nloglik.validate_info(&aft).is_ok());
         assert!(nloglik.eval_info(&[0.0], &aft).is_finite());
     }
@@ -1453,7 +1735,7 @@ mod tests {
             ("tweedie-nloglik@1.0", "tweedie-nloglik@1"),
             ("tweedie-nloglik@1.23456789", "tweedie-nloglik@1.23457"),
         ] {
-            let metric = build(name, 0, &ObjectiveParams::default()).unwrap();
+            let metric = named(name, 1, &DEFAULT_SOURCE).unwrap();
             assert_eq!(metric.name(), reported, "{name}");
         }
         assert_eq!(Ndcg::default().name(), "ndcg");
@@ -1464,12 +1746,7 @@ mod tests {
     fn aucpr_perfect_and_ranks_better_than_random() {
         let m = AucPr;
         assert!(m.maximize());
-        assert_eq!(
-            build("aucpr", 0, &ObjectiveParams::default())
-                .unwrap()
-                .name(),
-            "aucpr"
-        );
+        assert_eq!(named("aucpr", 1, &DEFAULT_SOURCE).unwrap().name(), "aucpr");
 
         // Perfectly separable: all positives scored above all negatives -> ~1.
         let perfect = m.eval(&[0.1, 0.2, 0.8, 0.9], &[0.0, 0.0, 1.0, 1.0], None);

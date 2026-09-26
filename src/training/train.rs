@@ -1,16 +1,16 @@
 //! The gradient-boosting training loop.
 
 use crate::config::{
-    BoosterKind, Device, GrowPolicy, ObjectiveParams, ProcessType, SamplingMethod, TrainingParams,
+    BoosterKind, Dart, Device, GrowPolicy, ProcessType, Refresh, SamplingMethod, TrainingParams,
     TreeMethod,
 };
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
-use crate::data::{DMatrix, MetaInfo};
+use crate::data::{DMatrix, GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
-use crate::metric::{Metric, create_metrics};
-use crate::model::{BoostedModel, ModelSpec, check_objective_width};
-use crate::objective::{GradPair, Objective, create_objective};
+use crate::metric::Metric;
+use crate::model::{BoostedModel, ModelSpec};
+use crate::objective::{GradPair, Loss};
 use crate::rng::Rng;
 use crate::training::continuation::{require_model_for_update, resume_model};
 use crate::training::multi_output;
@@ -33,7 +33,7 @@ pub(super) struct TrainContext<'a> {
     pub(super) params: &'a TrainingParams,
     pub(super) dtrain: &'a DMatrix,
     pub(super) info: &'a MetaInfo<'a>,
-    pub(super) objective: &'a dyn Objective,
+    pub(super) objective: &'a dyn Loss,
 }
 
 /// The gradients one tree grows on and the rows that take part: an output's
@@ -211,7 +211,7 @@ impl Prepared {
         // draws its skip variate (`select_dropout` over an empty ensemble
         // draws nothing more), and `sample_rows` draws nothing under
         // gradient sampling.
-        let mut rng = if params.booster == BoosterKind::Dart {
+        let mut rng = if matches!(params.booster, BoosterKind::Dart(_)) {
             let mut rng = round_rng(params, 0, DART_SALT);
             let _skip = rng.f64();
             rng
@@ -261,7 +261,7 @@ fn approx_index(
 
 /// Resolve `tree_method` (handling `Auto`) and prepare the matching builder
 /// state once, up front. `const_hess` is the objective's
-/// [`Objective::const_hess`](crate::objective::Objective::const_hess), which
+/// [`Loss::const_hess`](crate::objective::Loss::const_hess), which
 /// decides whether `approx` regenerates its cuts every round.
 fn prepare_builder(
     params: &TrainingParams,
@@ -421,7 +421,6 @@ pub struct Trainer<'a> {
     num_boost_round: usize,
     evals: Vec<EvalSet<'a>>,
     early_stopping_rounds: Option<usize>,
-    objective: Option<&'a dyn Objective>,
     metric: Option<Box<dyn Metric>>,
     init_model: Option<&'a BoostedModel>,
     on_round: Option<RoundHook<'a>>,
@@ -440,7 +439,6 @@ impl<'a> Trainer<'a> {
             num_boost_round,
             evals: Vec::new(),
             early_stopping_rounds: None,
-            objective: None,
             metric: None,
             init_model: None,
             on_round: None,
@@ -478,22 +476,12 @@ impl<'a> Trainer<'a> {
         self
     }
 
-    /// Boost `objective` (the custom-objective hook, e.g. a
-    /// [`CustomObjective`](crate::objective::CustomObjective)) instead of
-    /// the one `params.objective` names. The model records the objective's
-    /// [`name`](Objective::name); a built-in objective must match `params`'
-    /// objective settings so the saved model can be loaded again.
-    #[must_use]
-    pub fn objective(mut self, objective: &'a dyn Objective) -> Self {
-        self.objective = Some(objective);
-        self
-    }
-
-    /// Report `metric` (the custom-metric hook, e.g. a
-    /// [`CustomMetric`](crate::metric::CustomMetric)) instead of the metrics
-    /// `eval_metric` or the objective's default would build: it is the sole
-    /// metric reported for each eval set and the one driving early stopping
-    /// (per its [`maximize`](Metric::maximize)).
+    /// Also report `metric` (the custom-metric hook, e.g. a
+    /// [`CustomMetric`](crate::metric::CustomMetric)), as XGBoost's
+    /// `xgb.train(custom_metric=...)` does: every eval set reports the
+    /// `eval_metric` list (or the loss's default metric) and then `metric`,
+    /// which, being last, drives early stopping (per its
+    /// [`maximize`](Metric::maximize)).
     #[must_use]
     pub fn custom_metric(mut self, metric: Box<dyn Metric>) -> Self {
         self.metric = Some(metric);
@@ -586,15 +574,9 @@ impl<'a> Trainer<'a> {
 
     /// Run the configured training.
     pub fn train(self) -> Result<TrainResult> {
-        let built;
-        let objective = if let Some(objective) = self.objective {
-            objective
-        } else {
-            built = create_objective(self.params, self.dtrain.n_targets())?;
-            built.as_ref()
-        };
+        let loss = self.params.loss(self.dtrain.n_targets())?;
         let params = self.params;
-        let result = with_thread_pool(params, || train_impl(self, objective))?;
+        let result = with_thread_pool(params, || train_impl(self, loss.as_ref()))?;
         validate_trained_model(&result.model)?;
         Ok(result)
     }
@@ -614,24 +596,6 @@ pub(crate) fn validate_trained_model(model: &BoostedModel) -> Result<()> {
     })
 }
 
-/// Refuse a `num_class >= 2` that differs from `objective`'s output count:
-/// saved models require the two to agree, so a `num_class` the objective
-/// does not use would train an unloadable model.
-pub(crate) fn check_num_class(params: &TrainingParams, objective: &dyn Objective) -> Result<()> {
-    let n_out = objective.n_outputs();
-    if params.num_class >= 2 && params.num_class != n_out {
-        return Err(HessboostError::invalid_param(
-            "num_class",
-            format!(
-                "objective `{}` has {n_out} outputs, so num_class {} does not apply to it",
-                objective.name(),
-                params.num_class
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Run `train` on a dedicated pool of `params.nthread` threads, or on the
 /// global rayon pool when `nthread` is `0`.
 pub(crate) fn with_thread_pool<T: Send>(
@@ -646,18 +610,6 @@ pub(crate) fn with_thread_pool<T: Send>(
         .build()
         .map_err(|error| HessboostError::invalid_param("nthread", error.to_string()))?;
     pool.install(train)
-}
-
-/// Refuse a `missing` parameter other than the default: the sentinel belongs
-/// to the training matrix.
-pub(crate) fn reject_missing_param(params: &TrainingParams) -> Result<()> {
-    if !params.missing.is_nan() {
-        return Err(HessboostError::invalid_param(
-            "missing",
-            "set the sentinel when constructing DMatrix with from_dense_with_missing",
-        ));
-    }
-    Ok(())
 }
 
 /// Refuse `dtrain`'s feature weights on a training path that samples no
@@ -678,14 +630,13 @@ pub(crate) fn reject_feature_weights(dtrain: &DMatrix, reason: &'static str) -> 
 /// gradient boosting used by multiclass. `init_model` continues training
 /// from an existing model ([`Trainer::init_model`]). `objective` is the
 /// trainer's own or the one `params` name.
-fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainResult> {
+fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult> {
     let Trainer {
         params,
         dtrain,
         num_boost_round,
         evals,
         early_stopping_rounds,
-        objective: _,
         metric: metric_override,
         init_model,
         mut on_round,
@@ -736,10 +687,9 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
     // `process_type=update` refreshes the model's own trees (re-appended one
     // iteration per round) instead of growing new ones, so it needs no
     // builder state.
-    let mut plan = if params.process_type == ProcessType::Update {
-        RoundPlan::Refresh(model.take_trees())
-    } else {
-        RoundPlan::Grow(prepare_builder(params, dtrain, objective.const_hess())?)
+    let mut plan = match params.process_type {
+        ProcessType::Update(refresh) => RoundPlan::Refresh(model.take_trees(), refresh),
+        _ => RoundPlan::Grow(prepare_builder(params, dtrain, objective.const_hess())?),
     };
     // Continued training numbers its rounds after the model's iterations, so
     // the per-round RNG streams continue where the earlier run stopped.
@@ -806,7 +756,9 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
                     &mut state.gpair,
                 )?;
             }
-            RoundPlan::Refresh(queue) => refresh_round(&run, queue, iteration, &mut state)?,
+            RoundPlan::Refresh(queue, refresh) => {
+                refresh_round(&run, queue, *refresh, iteration, &mut state)?;
+            }
             RoundPlan::Grow(prepared) => grow_round(&run, prepared, iteration, &mut state)?,
         }
         let mut stop = false;
@@ -858,7 +810,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
 fn train_linear(
     request: &TrainRequest,
     num_boost_round: usize,
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     mut model: BoostedModel,
     after_round: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<TrainResult> {
@@ -891,6 +843,23 @@ fn train_linear(
     })
 }
 
+/// The checks [`Trainer::train`] runs on `params` and `dtrain` before
+/// anything is built (no eval sets, no early stopping), with the loss
+/// `params` train: for callers that train on `dtrain` without going through
+/// [`Trainer`] and must refuse exactly what training refuses.
+pub(crate) fn validate_training_data(params: &TrainingParams, dtrain: &DMatrix) -> Result<()> {
+    let objective = params.loss(dtrain.n_targets())?;
+    validate_request(
+        &TrainRequest {
+            params,
+            dtrain,
+            evals: &[],
+            early_stopping_rounds: None,
+        },
+        objective.as_ref(),
+    )
+}
+
 /// What [`validate_request`] checks: the training call's configuration and
 /// data, before anything is built.
 struct TrainRequest<'a> {
@@ -904,7 +873,7 @@ struct TrainRequest<'a> {
 /// stopping without eval sets, unlabeled or mismatched data, constraints
 /// naming missing features, feature weights on a path that samples no
 /// columns, and objective settings a saved model could not rebuild.
-fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result<()> {
+fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     let &TrainRequest {
         params,
         dtrain,
@@ -913,7 +882,6 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
     } = request;
     params.validate()?;
     multi_output::validate(params, objective.n_outputs())?;
-    reject_missing_param(params)?;
     EarlyStopping::check_patience(early_stopping_rounds)?;
     if early_stopping_rounds.is_some() && evals.is_empty() {
         return Err(HessboostError::invalid_param(
@@ -922,7 +890,7 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
         ));
     }
 
-    if params.bagging_by_query {
+    if params.bagging_by_query.is_some() {
         let Some(group) = dtrain.group() else {
             return Err(HessboostError::invalid_param(
                 "bagging_by_query",
@@ -943,7 +911,6 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
     }
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
-    check_num_class(params, objective)?;
     validate_dataset(
         objective,
         dtrain,
@@ -978,28 +945,11 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
     if params.booster == BoosterKind::GbLinear {
         reject_feature_weights(dtrain, "gblinear does not sample columns")?;
     }
-    if params.process_type == ProcessType::Update {
+    if matches!(params.process_type, ProcessType::Update(_)) {
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
 
-    BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)?;
-    // A built-in objective passed to `Trainer::objective` is recorded by
-    // name with `params`' objective settings; refuse settings that would not
-    // rebuild it, since the saved model could not be loaded again.
-    let objective_params = ObjectiveParams::for_objective(params, objective.name());
-    check_objective_width(
-        objective.name(),
-        &objective_params,
-        params.num_class,
-        dtrain.n_targets(),
-        n_out,
-    )
-    .map_err(|e| {
-        HessboostError::invalid_param(
-            "objective",
-            format!("the training parameters do not describe the given objective: {e}"),
-        )
-    })
+    BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)
 }
 
 /// What the tree-growing and refresh rounds update: the ensemble, its
@@ -1016,11 +966,12 @@ struct RoundState<'a> {
 }
 
 /// `process_type=update`: refresh iteration `iteration`'s trees of `queue`
-/// output by output, from the gradients of the already refreshed ones, and
-/// re-append them.
+/// output by output with `refresh`'s options, from the gradients of the
+/// already refreshed ones, and re-append them.
 fn refresh_round(
     run: &TrainContext,
     queue: &mut [RegTree],
+    refresh: Refresh,
     iteration: usize,
     state: &mut RoundState,
 ) -> Result<()> {
@@ -1044,7 +995,7 @@ fn refresh_round(
             &mut queue[iteration * per_iteration + slot],
             RegTree::with_root(0.0),
         );
-        refresh_tree(&mut tree, dtrain, gk, params, tree_eta(params));
+        refresh_tree(&mut tree, dtrain, gk, params, refresh, tree_eta(params));
         state.margins.add_tree(&tree, TreeOutput::Scalar(k), None);
         state.model.push_tree_weighted(tree, 1.0);
     }
@@ -1115,7 +1066,7 @@ fn grow_round(
                 Prepared::Hist {
                     rows_route_like_trees,
                     ..
-                } => (true, params.linear_tree && *rows_route_like_trees),
+                } => (true, params.linear_tree.is_some() && *rows_route_like_trees),
                 // The exact builder routes rows by their raw values, as
                 // prediction does.
                 Prepared::Exact(_) => (true, false),
@@ -1125,7 +1076,7 @@ fn grow_round(
                 && dropped.is_none()
                 && row_subset.len() == n
                 && !gradient_sampling(params)
-                && (!params.linear_tree || linear_rows);
+                && (params.linear_tree.is_none() || linear_rows);
             TreeSlot {
                 output: slot / parallel,
                 parallel: slot % parallel,
@@ -1235,21 +1186,20 @@ struct EvalPlan<'a> {
 }
 
 impl<'a> EvalPlan<'a> {
-    /// The metrics every eval set reports (`metric_override`, else the
-    /// configured or default ones), refusing a metric that cannot read the
-    /// label layout or the model's prediction width.
+    /// The metrics every eval set reports: the configured or default ones,
+    /// then `metric_override` (as XGBoost's `xgb.train` appends its
+    /// `custom_metric`), refusing a metric that cannot read the label
+    /// layout or the model's prediction width.
     fn new(
         params: &TrainingParams,
-        objective: &dyn Objective,
+        objective: &dyn Loss,
         metric_override: Option<Box<dyn Metric>>,
         evals: &'a [EvalSet<'a>],
         n_targets: usize,
     ) -> Result<Self> {
         let n_out = objective.n_outputs();
-        let metrics = match metric_override {
-            Some(m) => vec![m],
-            None => configured_metrics(params, objective)?,
-        };
+        let mut metrics = configured_metrics(params, objective)?;
+        metrics.extend(metric_override);
         if n_targets > 1
             && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
         {
@@ -1288,7 +1238,7 @@ impl<'a> EvalPlan<'a> {
     /// metric of the last eval set).
     fn record(
         &mut self,
-        objective: &dyn Objective,
+        objective: &dyn Loss,
         iteration: usize,
         margins: &MarginCaches,
         history: &mut Vec<RoundEval>,
@@ -1374,40 +1324,43 @@ impl EarlyStopping {
     }
 }
 
-/// The metrics training evaluates without a custom metric:
-/// `params.eval_metric`, or `objective`'s default. The last one is the
-/// early-stopping metric.
+/// The metrics `params` configure for `loss`: `params.eval_metric`, or the
+/// loss's default, each built for its output count. Without a custom metric
+/// the last one is the early-stopping metric.
 pub(crate) fn configured_metrics(
     params: &TrainingParams,
-    objective: &dyn Objective,
+    loss: &dyn Loss,
 ) -> Result<Vec<Box<dyn Metric>>> {
-    create_metrics(
-        &params.eval_metric,
-        &objective.default_metric(),
-        params.num_class,
-        &ObjectiveParams::for_objective(params, objective.name()),
-    )
+    let n_outputs = loss.n_outputs();
+    if params.eval_metric.is_empty() {
+        Ok(vec![loss.default_metric().build(n_outputs)?])
+    } else {
+        params
+            .eval_metric
+            .iter()
+            .map(|metric| metric.build(n_outputs))
+            .collect()
+    }
 }
 
-/// An empty model that `objective` trains on `dtrain` with `params`, starting
-/// from the margin-space intercepts `base_margins`. The model records the
-/// objective's own name and output count (not the configured string /
-/// `num_class`): a `reg:linear` alias is saved as `reg:squarederror` like
-/// XGBoost does, and a custom objective's outputs determine the tree layout
-/// even though `num_class` is 0.
+/// An empty model that `loss` (built from `params.objective`) trains on
+/// `dtrain`, starting from the margin-space intercepts `base_margins`. The
+/// model records `params`' objective (a custom loss by its name), the
+/// `max_delta_step` in effect, and the loss's output count, which decides
+/// the tree layout (a custom loss's outputs included).
 pub(crate) fn new_model(
     params: &TrainingParams,
-    objective: &dyn crate::objective::Objective,
+    loss: &dyn crate::objective::Loss,
     dtrain: &DMatrix,
     base_margins: Vec<f32>,
 ) -> BoostedModel {
     let mut model = BoostedModel::new(
         base_margins,
         ModelSpec {
-            objective: objective.name().to_string(),
-            objective_params: ObjectiveParams::for_objective(params, objective.name()),
-            num_class: params.num_class,
-            n_outputs: objective.n_outputs(),
+            objective: crate::model::ModelObjective::trained_with(&params.objective),
+            max_delta_step: params.effective_max_delta_step(),
+            num_class: params.objective.num_class().unwrap_or(0),
+            n_outputs: loss.n_outputs(),
             n_targets: dtrain.n_targets(),
             n_features: dtrain.n_cols(),
         },
@@ -1417,47 +1370,27 @@ pub(crate) fn new_model(
 }
 
 /// Per-output intercepts in margin space. A user-supplied `base_score` is
-/// given in prediction space and broadcast to every output through the
-/// objective's link (XGBoost `ProbToMargin`; for multiclass this is a
-/// uniform nonzero margin, as in XGBoost); otherwise the objective estimates
-/// them from the labels (XGBoost `InitEstimation`).
+/// given in prediction space, checked against `loss`'s output domain
+/// ([`Loss::validate_base_score`](crate::objective::Loss::validate_base_score)),
+/// and broadcast to every output through its link (XGBoost `ProbToMargin`;
+/// for multiclass this is a uniform nonzero margin, as in XGBoost);
+/// otherwise the loss estimates them from the labels (XGBoost
+/// `InitEstimation`). Both go through the loss being trained, never the
+/// configured objective's name.
 pub(crate) fn initial_intercepts(
     params: &TrainingParams,
-    objective: &dyn crate::objective::Objective,
+    loss: &dyn crate::objective::Loss,
     info: &MetaInfo,
     n_out: usize,
 ) -> Result<Vec<f32>> {
-    if let Some(base_score) = params.base_score {
-        if n_out > 1
-            && crate::objective::distributional::DistFamily::from_objective(&params.objective)
-                .is_some()
-        {
-            return Err(HessboostError::invalid_param(
-                "base_score",
-                "a scalar cannot set the several parameters of a `dist:*` objective; \
-                 supply per-row `base_margin` instead",
-            ));
-        }
-        let invalid = match params.objective.as_str() {
-            "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
-            "count:poisson" | "reg:gamma" | "reg:tweedie" | "survival:cox" | "survival:aft"
-            | "dist:poisson" => base_score <= 0.0,
-            _ => false,
-        };
-        if invalid {
-            return Err(HessboostError::invalid_param(
-                "base_score",
-                "is outside the objective's valid output domain",
-            ));
-        }
-    }
     let base_margins = match params.base_score {
         Some(bs) => {
+            loss.validate_base_score(bs)?;
             let mut scores = vec![bs as f32; n_out];
-            objective.probs_to_margins(&mut scores);
+            loss.probs_to_margins(&mut scores);
             scores
         }
-        None => objective.base_margins_info(info),
+        None => loss.base_margins_info(info),
     };
     if base_margins.len() != n_out {
         return Err(HessboostError::dimension_mismatch(
@@ -1480,8 +1413,8 @@ enum RoundPlan {
     /// Grow new trees with the prepared builder state.
     Grow(Prepared),
     /// `process_type=update`: refresh the queued trees of the initial model,
-    /// one iteration per round.
-    Refresh(Vec<RegTree>),
+    /// one iteration per round, with the refresh updater's options.
+    Refresh(Vec<RegTree>, Refresh),
 }
 
 /// The learning rate applied to each new tree: `eta / num_parallel_tree`
@@ -1707,12 +1640,12 @@ pub(super) fn round_gradients(
         info,
         objective,
     } = *run;
-    if params.booster != BoosterKind::Dart {
+    let BoosterKind::Dart(dart) = params.booster else {
         objective.gradient_info_at(margin, info, gpair, iteration);
         return (round_rng(params, iteration, 0), None);
-    }
+    };
     let mut rng = round_rng(params, iteration, DART_SALT);
-    let (dropped, drop_indices) = select_dropout(model, params, &mut rng);
+    let (dropped, drop_indices) = select_dropout(model, &dart, &mut rng);
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
     objective.gradient_info_at(&margin_excl, info, gpair, iteration);
     (rng, Some(drop_indices))
@@ -1725,18 +1658,14 @@ const DART_SALT: u64 = 0x0DA27;
 /// probability `skip_drop`, otherwise each tree independently with
 /// probability `rate_drop`, and at least one tree when any exist (as
 /// XGBoost). Returns the per-tree mask and the dropped indices.
-fn select_dropout(
-    model: &BoostedModel,
-    params: &TrainingParams,
-    rng: &mut Rng,
-) -> (Vec<bool>, Vec<usize>) {
+fn select_dropout(model: &BoostedModel, dart: &Dart, rng: &mut Rng) -> (Vec<bool>, Vec<usize>) {
     let existing = model.num_trees();
     let mut dropped = vec![false; existing];
     let mut drop_indices: Vec<usize> = Vec::new();
-    let skip = rng.f64() < params.skip_drop;
+    let skip = rng.f64() < dart.skip_drop();
     if !skip && existing > 0 {
         for (i, d) in dropped.iter_mut().enumerate() {
-            if rng.f64() < params.rate_drop {
+            if rng.f64() < dart.rate_drop() {
                 *d = true;
                 drop_indices.push(i);
             }
@@ -1933,8 +1862,10 @@ fn grow_sampled_tree(
         slot.capture_rows,
     );
     // LightGBM keeps the first iteration's trees constant.
-    if params.linear_tree && grow.iteration > 0 {
-        let lambda = params.linear_lambda;
+    if let Some(linear_tree) = params.linear_tree
+        && grow.iteration > 0
+    {
+        let lambda = linear_tree.lambda();
         if leaf_rows.is_empty() {
             crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, lambda);
         } else {
@@ -1953,7 +1884,7 @@ fn grow_sampled_tree(
 /// continued training resumes the same streams. Draws nothing unless
 /// `use_quantized_grad` is on, leaving the default RNG streams untouched.
 fn quantization_seed(params: &TrainingParams, rng: &mut Rng) -> u64 {
-    if params.use_quantized_grad {
+    if params.quantized.is_some() {
         rng.next_u64()
     } else {
         0
@@ -1969,98 +1900,59 @@ pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut Rng) -> V
     if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
-    // Sized for the expected sample plus a few standard deviations.
-    let expected = n as f64 * subsample;
-    let mut rows: Vec<u32> = Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize);
-    rows.extend((0..n as u32).filter(|_| rng.f64() < subsample));
-    if rows.is_empty() {
-        rows.push(rng.range(0..n) as u32);
-    }
-    rows
+    bernoulli_sample(n, subsample, rng)
 }
 
-/// One iteration's uniform row subsets, drawn before its trees: one per
-/// parallel tree, or a single subset for the whole forest when
-/// `per_forest` (`approx`, [`Prepared::samples_per_forest`]) or when there is
-/// no uniform sampling (every tree then reads all rows, and [`sample_rows`]
-/// draws nothing). Parallel tree `p` uses entry `p % len`, shared across its
-/// per-output fits.
+/// The indices in `0..n` kept by one `rng` draw each with probability
+/// `fraction`, or one random index when none is kept.
+fn bernoulli_sample(n: usize, fraction: f64, rng: &mut Rng) -> Vec<u32> {
+    // Sized for the expected sample plus a few standard deviations.
+    let expected = n as f64 * fraction;
+    let mut kept: Vec<u32> = Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize);
+    kept.extend((0..n as u32).filter(|_| rng.f64() < fraction));
+    if kept.is_empty() {
+        kept.push(rng.range(0..n) as u32);
+    }
+    kept
+}
+
+/// One iteration's row subsets, drawn before its trees: one per parallel
+/// tree, or a single subset for the whole forest when `per_forest`
+/// (`approx`, [`Prepared::samples_per_forest`]) or when there is no uniform
+/// sampling (every tree then reads all rows, and [`sample_rows`] draws
+/// nothing). Parallel tree `p` uses entry `p % len`, shared across its
+/// per-output fits. With query bagging each subset is the rows of the
+/// query groups (`group`, the whole matrix without one) a draw keeps.
 pub(super) fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
     per_forest: bool,
-    group: Option<&crate::data::GroupInfo>,
+    group: Option<&GroupInfo>,
     rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
-    let uniform = params.subsample < 1.0 && params.sampling_method == SamplingMethod::Uniform;
-    let draws = if per_forest || !uniform {
+    let samples = params.sampling_method == SamplingMethod::Uniform
+        && (params.subsample < 1.0 || params.bagging_by_query.is_some());
+    let draws = if per_forest || !samples {
         1
     } else {
         params.num_parallel_tree
     };
-    let group_ranges = params
-        .bagging_by_query
-        .then(|| group.map_or_else(|| vec![(0, n)], |groups| groups.iter_ranges().collect()));
+    let Some(bagging) = params.bagging_by_query else {
+        return (0..draws).map(|_| sample_rows(n, params, rng)).collect();
+    };
+    let queries: Vec<(usize, usize)> =
+        group.map_or_else(|| vec![(0, n)], |group| group.iter_ranges().collect());
     (0..draws)
         .map(|_| {
-            if let Some(ranges) = &group_ranges {
-                let queries = sample_rows(ranges.len(), params, rng);
-                queries
-                    .into_iter()
-                    .flat_map(|query| {
-                        let (start, end) = ranges[query as usize];
-                        start as u32..end as u32
-                    })
-                    .collect()
-            } else {
-                sample_rows(n, params, rng)
-            }
+            bernoulli_sample(queries.len(), bagging.fraction(), rng)
+                .into_iter()
+                .flat_map(|query| {
+                    let (start, end) = queries[query as usize];
+                    start as u32..end as u32
+                })
+                .collect()
         })
         .collect()
-}
-
-#[cfg(test)]
-mod query_bagging_tests {
-    use super::*;
-    use crate::config::TrainingParams;
-    use crate::data::GroupInfo;
-
-    #[test]
-    fn group_subset_is_indivisible_and_thread_count_independent() {
-        let group_sizes = vec![3, 7, 2, 8, 4, 5, 6];
-        let group = GroupInfo::from_sizes(&group_sizes);
-        let n: usize = group_sizes.iter().sum();
-        let params = TrainingParams::builder()
-            .objective("rank:ndcg")
-            .bagging_by_query(true)
-            .subsample(0.5)
-            .seed(17)
-            .build()
-            .unwrap();
-        let select = |threads| {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap();
-            pool.install(|| {
-                iteration_row_subsets(n, &params, false, Some(&group), &mut Rng::new(41))
-            })
-        };
-        let one = select(1);
-        let many = select(4);
-        assert_eq!(one, many);
-        let selected = &one[0];
-        for (query, (start, end)) in group.iter_ranges().enumerate() {
-            let included = selected
-                .iter()
-                .filter(|&&row| (start..end).contains(&(row as usize)))
-                .count();
-            assert!(
-                included == 0 || included == end - start,
-                "query {query} split"
-            );
-        }
-    }
 }
 
 /// Whether trees are grown on gradient-based (MVS) row samples.
@@ -2070,9 +1962,10 @@ pub(super) fn gradient_sampling(params: &TrainingParams) -> bool {
 
 /// Shape and metadata checks for the training matrix and every eval set,
 /// followed by the objective's own [`validate_info`] label-domain checks.
-/// [`validate_info`]: `crate::objective::Objective::validate_info`
+///
+/// [`validate_info`]: crate::objective::Loss::validate_info
 pub(crate) fn validate_dataset(
-    objective: &dyn crate::objective::Objective,
+    objective: &dyn crate::objective::Loss,
     data: &DMatrix,
     n_targets: usize,
     n_features: usize,
@@ -2128,7 +2021,7 @@ pub(crate) fn validate_dataset(
 /// "dataset" in the reason becomes ``dataset `name` `` (reasons without that
 /// word get a ``dataset `name`: `` prefix).
 ///
-/// [`validate_info`]: crate::objective::Objective::validate_info
+/// [`validate_info`]: crate::objective::Loss::validate_info
 fn name_dataset(error: HessboostError, dataset: &str) -> HessboostError {
     match error {
         HessboostError::InvalidParameter { name, reason } => {
@@ -2195,9 +2088,51 @@ pub(super) fn make_column_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LinearTree;
     use crate::metric::{Metric, Rmse};
+    use crate::objective::{
+        Aft, CustomLoss, LambdaRank, Logistic, Multiclass, Objective, PseudoHuber,
+    };
     use crate::test_support::labeled_dense;
     use crate::tree::{ChildLeaf, SplitRule};
+
+    /// Query bagging keeps or drops each query whole, and its draw does not
+    /// depend on the thread count.
+    #[test]
+    fn query_subsets_keep_whole_groups_at_any_thread_count() {
+        let group_sizes = vec![3, 7, 2, 8, 4, 5, 6];
+        let group = GroupInfo::from_sizes(&group_sizes);
+        let n: usize = group_sizes.iter().sum();
+        let params = TrainingParams::builder()
+            .objective(Objective::RankNdcg(LambdaRank::default()))
+            .bagging_by_query(crate::config::QueryBagging::new(0.5).unwrap())
+            .seed(17)
+            .build()
+            .unwrap();
+        let select = |threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                iteration_row_subsets(n, &params, false, Some(&group), &mut Rng::new(41))
+            })
+        };
+        let one = select(1);
+        assert_eq!(one, select(4));
+        let selected = &one[0];
+        assert!(!selected.is_empty() && selected.len() < n);
+        for (query, (start, end)) in group.iter_ranges().enumerate() {
+            let included = selected
+                .iter()
+                .filter(|&&row| (start..end).contains(&(row as usize)))
+                .count();
+            assert!(
+                included == 0 || included == end - start,
+                "query {query} split"
+            );
+        }
+    }
 
     /// A deterministic uniform `[0, 1)` stream (a 64-bit LCG's top 31 bits).
     fn lcg(mut s: u64) -> impl FnMut() -> f32 {
@@ -2357,7 +2292,7 @@ mod tests {
     /// `approx` cuts differ.
     struct PerOutputHessians;
 
-    impl Objective for PerOutputHessians {
+    impl Loss for PerOutputHessians {
         fn name(&self) -> &'static str {
             "custom:per_output_hessians"
         }
@@ -2375,8 +2310,8 @@ mod tests {
         fn const_hess(&self) -> bool {
             true
         }
-        fn default_metric(&self) -> String {
-            "rmse".into()
+        fn default_metric(&self) -> crate::metric::EvalMetric {
+            crate::metric::EvalMetric::Rmse
         }
     }
 
@@ -2387,6 +2322,7 @@ mod tests {
         let d = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 1.0, 2.0, 3.0]);
         let fit = |nthread: usize| {
             let params = TrainingParams::builder()
+                .objective(Objective::custom(PerOutputHessians))
                 .tree_method(TreeMethod::Approx)
                 .max_bin(2)
                 .max_depth(1)
@@ -2394,11 +2330,7 @@ mod tests {
                 .nthread(nthread)
                 .build()
                 .unwrap();
-            let model = Trainer::new(&params, &d, 3)
-                .objective(&PerOutputHessians)
-                .train()
-                .unwrap()
-                .model;
+            let model = train(&params, &d, 3).unwrap();
             model.predict_margin(&d).unwrap()
         };
         let serial = fit(1);
@@ -2425,11 +2357,10 @@ mod tests {
             .unwrap();
         let params = TrainingParams::builder()
             .tree_method(TreeMethod::Hist)
-            .linear_tree(true)
+            .linear_tree(LinearTree::new(1.0).unwrap())
             .base_score(0.0)
             .eta(1.0)
             .lambda(1.0)
-            .linear_lambda(1.0)
             .max_depth(2)
             .build()
             .unwrap();
@@ -2460,8 +2391,9 @@ mod tests {
         let d = labeled_dense(&x, n, 4, &y);
         let fit = |nthread: usize| {
             let params = TrainingParams::builder()
-                .objective("multi:softprob")
-                .num_class(2)
+                .objective(Objective::Softprob(
+                    crate::objective::Multiclass::new(2).unwrap(),
+                ))
                 .tree_method(TreeMethod::Approx)
                 .num_parallel_tree(4)
                 .max_depth(3)
@@ -2480,7 +2412,7 @@ mod tests {
     fn binary_logistic_separates_classes() {
         let d = step_dataset(100);
         let params = TrainingParams::builder()
-            .objective("binary:logistic")
+            .objective(Objective::BinaryLogistic(Logistic::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -2497,7 +2429,7 @@ mod tests {
         // Zero rounds -> prediction is just the base score (label mean).
         let d = step_dataset(10);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .build()
             .unwrap();
         let model = train(&params, &d, 0).unwrap();
@@ -2513,7 +2445,7 @@ mod tests {
         let d = step_dataset(120);
         let rmse = |method: TreeMethod| {
             let params = TrainingParams::builder()
-                .objective("reg:squarederror")
+                .objective(Objective::SquaredError)
                 .tree_method(method)
                 .max_depth(3)
                 .eta(0.3)
@@ -2537,7 +2469,7 @@ mod tests {
     fn lossguide_trains_end_to_end() {
         let d = step_dataset(120);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .tree_method(TreeMethod::Hist)
             .grow_policy(GrowPolicy::LossGuide)
             .max_leaves(16)
@@ -2566,61 +2498,34 @@ mod tests {
     }
 
     #[test]
-    fn objective_override_records_its_own_distribution() {
-        // `params` name a `dist:*` objective, but `Trainer::objective`
-        // boosts squared error: the model's objective metadata must follow
-        // the objective it records, or loading refuses it.
-        let x: Vec<f32> = (0..24).map(|i| i as f32).collect();
-        let y: Vec<f32> = (0..24).map(|i| (i % 5) as f32).collect();
-        let d = labeled_dense(&x, 24, 1, &y);
-        let params = TrainingParams::builder()
-            .objective("dist:normal")
-            .build()
-            .unwrap();
-        let squared = crate::objective::SquaredError;
-        let model = Trainer::new(&params, &d, 3)
-            .objective(&squared)
-            .train()
-            .unwrap()
-            .model;
-        assert_eq!(model.objective(), "reg:squarederror");
-        assert_eq!(model.objective_params().distribution, None);
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
-        // Continued training records the initial model's objective too.
-        let more = Trainer::new(&params, &d, 2)
-            .objective(&squared)
-            .init_model(&model)
-            .train()
-            .unwrap()
-            .model;
-        assert_eq!(more.objective_params().distribution, None);
-        assert_eq!(more.num_boost_rounds(), 5);
-    }
-
-    #[test]
     fn num_class_must_match_the_objective_outputs() {
         let x: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let y: Vec<f32> = (0..12).map(|i| (i % 3) as f32).collect();
         let d = labeled_dense(&x, 12, 1, &y);
-        let params = |objective: &str, num_class| {
+        let params = |objective: Objective| {
             TrainingParams::builder()
                 .objective(objective)
-                .num_class(num_class)
                 .build()
                 .unwrap()
         };
         // A stray num_class used to train a single-output model that
-        // `from_bytes`/`from_json` then refused.
-        assert!(matches!(
-            train(&params("reg:squarederror", 3), &d, 2),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "num_class"
-        ));
-        for num_class in [0, 1] {
-            let model = train(&params("reg:squarederror", num_class), &d, 2).unwrap();
+        // `from_bytes`/`from_json` then refused; the class count now lives
+        // in the multiclass objective only.
+        for (objective, num_class) in [
+            (Objective::SquaredError, 0),
+            (Objective::Softprob(Multiclass::new(3).unwrap()), 3),
+        ] {
+            let model = train(&params(objective), &d, 2).unwrap();
+            assert_eq!(
+                model
+                    .objective()
+                    .built_in()
+                    .and_then(Objective::num_class)
+                    .unwrap_or(0),
+                num_class
+            );
             BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
         }
-        let model = train(&params("multi:softprob", 3), &d, 2).unwrap();
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
     }
 
     #[test]
@@ -2642,8 +2547,9 @@ mod tests {
         }
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective("multi:softprob")
-            .num_class(3)
+            .objective(Objective::Softprob(
+                crate::objective::Multiclass::new(3).unwrap(),
+            ))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -2680,7 +2586,7 @@ mod tests {
         let y: Vec<f32> = x.iter().map(|xi| (1.0 + 5.0 * xi).round()).collect();
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective("count:poisson")
+            .objective(Objective::Poisson)
             .max_depth(3)
             .eta(0.2)
             .build()
@@ -2706,12 +2612,11 @@ mod tests {
 
     #[test]
     fn custom_objective_matches_builtin_squared_error() {
-        use crate::objective::CustomObjective;
         let d = step_dataset(80);
 
         let builtin = {
             let p = TrainingParams::builder()
-                .objective("reg:squarederror")
+                .objective(Objective::SquaredError)
                 .max_depth(3)
                 .eta(0.3)
                 .base_score(0.0)
@@ -2721,25 +2626,19 @@ mod tests {
         };
 
         let custom = {
-            let p = TrainingParams::builder()
-                .objective("custom")
-                .max_depth(3)
-                .eta(0.3)
-                .build()
-                .unwrap();
-            let obj = CustomObjective::new("custom", 1, 0.0, "rmse", |preds, labels, w, out| {
+            let obj = CustomLoss::new("custom", 1, |preds, labels, w, out| {
                 for i in 0..preds.len() {
                     let wi = w.map_or(1.0, |ws| ws[i]);
                     out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi);
                 }
             });
-            Trainer::new(&p, &d, 30)
-                .objective(&obj)
-                .train()
-                .unwrap()
-                .model
-                .predict(&d)
-                .unwrap()
+            let p = TrainingParams::builder()
+                .objective(Objective::custom(obj))
+                .max_depth(3)
+                .eta(0.3)
+                .build()
+                .unwrap();
+            train(&p, &d, 30).unwrap().predict(&d).unwrap()
         };
 
         for (a, b) in builtin.iter().zip(&custom) {
@@ -2749,7 +2648,6 @@ mod tests {
 
     #[test]
     fn custom_multi_output_objective_trains_with_stride_and_round_trips() {
-        use crate::objective::CustomObjective;
         let d = step_dataset(80);
         let n = d.n_rows();
         let rounds = 5usize;
@@ -2757,19 +2655,19 @@ mod tests {
         // Two outputs, `[row][output]` layout: output 0 fits the label, output 1
         // fits its negation. Same data with mirrored targets, so the learned
         // outputs must mirror each other.
-        let obj = CustomObjective::new("custom:two", 2, 0.0, "rmse", |preds, labels, w, out| {
+        let obj = CustomLoss::new("custom:two", 2, |preds, labels, w, out| {
             for i in 0..labels.len() {
                 let wi = w.map_or(1.0, |ws| ws[i]);
                 out[2 * i] = GradPair::new((preds[2 * i] - labels[i]) * wi, wi);
                 out[2 * i + 1] = GradPair::new((preds[2 * i + 1] + labels[i]) * wi, wi);
             }
         });
-        let p = TrainingParams::builder().max_depth(2).build().unwrap();
-        let model = Trainer::new(&p, &d, rounds)
-            .objective(&obj)
-            .train()
-            .unwrap()
-            .model;
+        let p = TrainingParams::builder()
+            .objective(Objective::custom(obj))
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = train(&p, &d, rounds).unwrap();
 
         assert_eq!(model.n_outputs(), 2);
         assert_eq!(model.base_scores().len(), 2);
@@ -2832,7 +2730,7 @@ mod tests {
             .unwrap();
 
         let params = TrainingParams::builder()
-            .objective("rank:ndcg")
+            .objective(Objective::RankNdcg(LambdaRank::default()))
             .max_depth(3)
             .eta(0.2)
             .build()
@@ -2862,9 +2760,10 @@ mod tests {
     fn dart_trains_reduces_error_and_roundtrips() {
         let d = step_dataset(120);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
-            .booster(BoosterKind::Dart)
-            .rate_drop(0.1)
+            .objective(Objective::SquaredError)
+            .booster(BoosterKind::Dart(
+                Dart::builder().rate_drop(0.1).build().unwrap(),
+            ))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -2892,7 +2791,7 @@ mod tests {
         // bit-for-bit the unweighted tree sum.
         let d = step_dataset(100);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -2938,7 +2837,7 @@ mod tests {
         for method in [TreeMethod::Auto, TreeMethod::Exact] {
             let mk = |d: &DMatrix| {
                 let p = TrainingParams::builder()
-                    .objective("reg:squarederror")
+                    .objective(Objective::SquaredError)
                     .tree_method(method)
                     .max_depth(1)
                     .eta(0.3)
@@ -2978,7 +2877,7 @@ mod tests {
         }
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .tree_method(TreeMethod::Exact)
             .max_depth(4)
             .eta(0.3)
@@ -3006,7 +2905,7 @@ mod tests {
         let bm: Vec<f32> = (0..60).map(|i| i as f32 * 0.01 + 1.5).collect();
         let d_bm = d.with_base_margin(&bm).unwrap();
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -3043,7 +2942,7 @@ mod tests {
 
         let train_with = |bynode: f64| {
             let p = TrainingParams::builder()
-                .objective("reg:squarederror")
+                .objective(Objective::SquaredError)
                 .max_depth(4)
                 .eta(0.3)
                 .colsample_bynode(bynode)
@@ -3083,7 +2982,7 @@ mod tests {
     fn gblinear_fits_linear_target() {
         let d = linear_dataset(400);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .booster(BoosterKind::GbLinear)
             .eta(0.5)
             .base_score(0.0)
@@ -3112,7 +3011,7 @@ mod tests {
     fn gblinear_roundtrips() {
         let d = linear_dataset(200);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .booster(BoosterKind::GbLinear)
             .eta(0.5)
             .build()
@@ -3133,7 +3032,7 @@ mod tests {
         use crate::metric::CustomMetric;
         let d = step_dataset(80);
         let params = TrainingParams::builder()
-            .objective("reg:squarederror")
+            .objective(Objective::SquaredError)
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -3147,7 +3046,7 @@ mod tests {
             .unwrap();
 
         // Custom path: a CustomMetric reimplementing RMSE (minimize).
-        let rmse_metric = CustomMetric::new("rmse", false, |preds, labels, weights| {
+        let rmse_metric = CustomMetric::new("my-rmse", false, |preds, labels, weights| {
             let mut sq = 0.0f64;
             let mut wsum = 0.0f64;
             for i in 0..preds.len() {
@@ -3176,13 +3075,15 @@ mod tests {
             builtin.model.predict(&d).unwrap()
         );
 
-        // The custom metric was actually recorded in the history.
+        // As in XGBoost's `xgb.train`, the custom metric is reported after
+        // the configured (here the default) ones and, being last, drives
+        // early stopping.
         let names: Vec<&str> = custom.history[0]
             .scores
             .iter()
             .map(|(_, m, _)| m.as_str())
             .collect();
-        assert_eq!(names, vec!["rmse"]);
+        assert_eq!(names, vec!["rmse", "my-rmse"]);
     }
 
     #[test]
@@ -3191,8 +3092,9 @@ mod tests {
         let y = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0];
         let d = labeled_dense(&x, 6, 1, &y);
         let params = TrainingParams::builder()
-            .objective("multi:softmax")
-            .num_class(3)
+            .objective(Objective::Softmax(
+                crate::objective::Multiclass::new(3).unwrap(),
+            ))
             .max_depth(2)
             .build()
             .unwrap();
@@ -3219,15 +3121,19 @@ mod tests {
     fn logistic_objectives_accept_probability_labels() {
         let x: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
         let soft = [0.25f32, 0.75, 0.0, 1.0, 0.5, 0.9, 0.1, 0.6];
-        for objective in ["reg:logistic", "binary:logistic"] {
+        for objective in [
+            Objective::RegLogistic(Logistic::default()),
+            Objective::BinaryLogistic(Logistic::default()),
+        ] {
+            let name = objective.name();
             let params = TrainingParams::builder()
-                .objective(objective)
+                .objective(objective.clone())
                 .max_depth(2)
                 .build()
                 .unwrap();
             let d = labeled_dense(&x, 8, 1, &soft);
             let model = train(&params, &d, 3).unwrap();
-            assert_eq!(model.objective(), objective);
+            assert_eq!(model.objective().name(), name);
             assert!(
                 model
                     .predict(&d)
@@ -3244,7 +3150,7 @@ mod tests {
                         train(&params, &d, 3),
                         Err(HessboostError::InvalidParameter { .. })
                     ),
-                    "{objective} should reject label {bad}"
+                    "{name} should reject label {bad}"
                 );
             }
         }
@@ -3254,7 +3160,7 @@ mod tests {
     fn count_base_score_is_in_reported_space() {
         let d = labeled_dense(&[0.0, 1.0], 2, 1, &[1.0, 2.0]);
         let params = TrainingParams::builder()
-            .objective("count:poisson")
+            .objective(Objective::Poisson)
             .base_score(0.5)
             .build()
             .unwrap();
@@ -3268,11 +3174,43 @@ mod tests {
         );
     }
 
+    /// `base_score` is checked against the trained loss's output domain: a
+    /// logistic loss refuses a probability outside `(0, 1)`, and an
+    /// identity-link custom loss accepts one.
+    #[test]
+    fn base_score_domain_follows_the_trained_loss() {
+        let d = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
+        let outside = TrainingParams::builder()
+            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .base_score(2.0)
+            .build()
+            .unwrap();
+        assert!(matches!(
+            train(&outside, &d, 1),
+            Err(HessboostError::InvalidParameter {
+                name: "base_score",
+                ..
+            })
+        ));
+        let identity = CustomLoss::new("custom:identity", 1, |p, y, _w, out| {
+            for ((pair, &p), &y) in out.iter_mut().zip(p).zip(y) {
+                *pair = GradPair::new(p - y, 1.0);
+            }
+        });
+        let custom = TrainingParams::builder()
+            .objective(Objective::custom(identity))
+            .base_score(2.0)
+            .build()
+            .unwrap();
+        let model = train(&custom, &d, 0).unwrap();
+        assert_eq!(model.base_score(), 2.0);
+    }
+
     #[test]
     fn invalid_training_and_evaluation_inputs_return_errors() {
         let d = step_dataset(20);
         let params = TrainingParams::builder()
-            .objective("binary:logistic")
+            .objective(Objective::BinaryLogistic(Logistic::default()))
             .build()
             .unwrap();
         assert!(
@@ -3309,13 +3247,13 @@ mod tests {
         assert!(model.predict_leaf(&wrong_features).is_err());
     }
 
-    /// Label-domain checks run through `Objective::validate_info` for every
+    /// Label-domain checks run through `Loss::validate_info` for every
     /// eval set, and the error names the offending dataset.
     #[test]
     fn eval_set_label_domain_errors_name_the_dataset() {
         let d = step_dataset(20);
         let params = TrainingParams::builder()
-            .objective("binary:logistic")
+            .objective(Objective::BinaryLogistic(Logistic::default()))
             .build()
             .unwrap();
         let holdout = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 2.0]);
@@ -3347,7 +3285,7 @@ mod tests {
             .with_label_matrix(&[1.0; 8], 2)
             .unwrap();
         let poisson = TrainingParams::builder()
-            .objective("count:poisson")
+            .objective(Objective::Poisson)
             .build()
             .unwrap();
         assert!(matches!(
@@ -3367,7 +3305,7 @@ mod tests {
             Err(HessboostError::DimensionMismatch { .. })
         ));
         let ndcg = TrainingParams::builder()
-            .eval_metric("ndcg")
+            .eval_metric(crate::metric::EvalMetric::Ndcg(crate::metric::Cutoff::all()))
             .build()
             .unwrap();
         eval_metric_rejection(train(&ndcg, &two_targets, 1), "ndcg");
@@ -3418,15 +3356,16 @@ mod tests {
     #[test]
     fn multi_target_outputs_equal_per_column_models() {
         for (objective, logistic) in [
-            ("reg:squarederror", false),
-            ("reg:pseudohubererror", false),
-            ("binary:logistic", true),
-            ("reg:logistic", true),
+            (Objective::SquaredError, false),
+            (Objective::PseudoHuber(PseudoHuber::default()), false),
+            (Objective::BinaryLogistic(Logistic::default()), true),
+            (Objective::RegLogistic(Logistic::default()), true),
         ] {
+            let name = objective.name();
             for method in [TreeMethod::Hist, TreeMethod::Exact, TreeMethod::Approx] {
                 let (d, cols, weights) = two_target_dataset(logistic);
                 let params = TrainingParams::builder()
-                    .objective(objective)
+                    .objective(objective.clone())
                     .tree_method(method)
                     .max_depth(3)
                     .build()
@@ -3446,14 +3385,14 @@ mod tests {
                     assert_eq!(
                         model.base_scores()[j].to_bits(),
                         reference.base_score().to_bits(),
-                        "{objective} {method:?} intercept {j}"
+                        "{name} {method:?} intercept {j}"
                     );
                     let expected = reference.predict(&single).unwrap();
                     for (row, e) in expected.iter().enumerate() {
                         assert_eq!(
                             preds[row * 2 + j].to_bits(),
                             e.to_bits(),
-                            "{objective} {method:?} ({row},{j})"
+                            "{name} {method:?} ({row},{j})"
                         );
                     }
                 }
@@ -3468,7 +3407,7 @@ mod tests {
     fn multi_label_model_round_trips_and_classifies_per_label() {
         let (d, cols, _) = two_target_dataset(true);
         let params = TrainingParams::builder()
-            .objective("binary:logistic")
+            .objective(Objective::BinaryLogistic(Logistic::default()))
             .eta(0.5)
             .build()
             .unwrap();
@@ -3503,7 +3442,7 @@ mod tests {
         }
     }
 
-    impl crate::objective::Objective for BoundsMidpoint {
+    impl crate::objective::Loss for BoundsMidpoint {
         fn name(&self) -> &'static str {
             "test:bounds_midpoint"
         }
@@ -3537,8 +3476,8 @@ mod tests {
             false
         }
 
-        fn default_metric(&self) -> String {
-            "rmse".to_string()
+        fn default_metric(&self) -> crate::metric::EvalMetric {
+            crate::metric::EvalMetric::Rmse
         }
     }
 
@@ -3552,15 +3491,12 @@ mod tests {
             .with_label_bounds(&lower, &upper)
             .unwrap();
         let params = TrainingParams::builder()
+            .objective(Objective::custom(BoundsMidpoint))
             .eta(1.0)
             .lambda(0.0)
             .build()
             .unwrap();
-        let model = Trainer::new(&params, &d, 3)
-            .objective(&BoundsMidpoint)
-            .train()
-            .unwrap()
-            .model;
+        let model = train(&params, &d, 3).unwrap();
         // Base margin is the mean midpoint (1 and 5 → 3); one full-step tree
         // then lands every row on its own midpoint.
         assert_eq!(model.base_score(), 3.0);
@@ -3572,9 +3508,14 @@ mod tests {
 
         let unbounded = DMatrix::from_dense(&x, 32, 1).unwrap();
         assert!(matches!(
-            Trainer::new(&params, &unbounded, 1).objective(&BoundsMidpoint).train(),
+            train(&params, &unbounded, 1),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "label_lower_bound"
         ));
+    }
+
+    /// The metric XGBoost names `name`, with default parameters.
+    fn named_metric(name: &str) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::from_xgboost(name, &crate::metric::DEFAULT_SOURCE).unwrap()
     }
 
     /// The reason of an `eval_metric` rejection of the `context` run,
@@ -3602,8 +3543,8 @@ mod tests {
             .unwrap();
         let params = |metric: &str| {
             TrainingParams::builder()
-                .objective("survival:aft")
-                .eval_metric(metric)
+                .objective(Objective::Aft(Aft::default()))
+                .eval_metric(named_metric(metric))
                 .build()
                 .unwrap()
         };
@@ -3642,7 +3583,7 @@ mod tests {
             .unwrap();
         for metric in ["aft-nloglik", "interval-regression-accuracy", "pre@3"] {
             let params = TrainingParams::builder()
-                .eval_metric(metric)
+                .eval_metric(named_metric(metric))
                 .build()
                 .unwrap();
             eval_metric_rejection(
@@ -3662,20 +3603,26 @@ mod tests {
         let y: Vec<f32> = (0..n).map(|i| 1.0 + (i % 3) as f32).collect();
         let d = labeled_dense(&x, n, 1, &y);
         let quantile = || {
-            TrainingParams::builder()
-                .objective("reg:quantileerror")
-                .quantile_alpha(vec![0.2, 0.8])
+            TrainingParams::builder().objective(Objective::Quantile(
+                crate::objective::Quantiles::new(vec![0.2, 0.8]).unwrap(),
+            ))
         };
         let expectile = || {
-            TrainingParams::builder()
-                .objective("reg:expectileerror")
-                .expectile_alpha(vec![0.3, 0.5, 0.7])
+            TrainingParams::builder().objective(Objective::Expectile(
+                crate::objective::Expectiles::new(vec![0.3, 0.5, 0.7]).unwrap(),
+            ))
         };
-        let normal = || TrainingParams::builder().objective("dist:normal");
+        let normal = || {
+            TrainingParams::builder().objective(Objective::Dist(
+                crate::objective::distributional::Distributional::new(
+                    crate::objective::distributional::DistFamily::Normal,
+                ),
+            ))
+        };
         let softprob = || {
-            TrainingParams::builder()
-                .objective("multi:softprob")
-                .num_class(4)
+            TrainingParams::builder().objective(Objective::Softprob(
+                crate::objective::Multiclass::new(4).unwrap(),
+            ))
         };
         let run = |params: TrainingParams| {
             Trainer::new(&params, &d, 2)
@@ -3684,15 +3631,29 @@ mod tests {
                 .map(|r| r.history)
         };
         for (params, metric) in [
-            (quantile().eval_metric("rmse"), "rmse"),
-            (expectile().eval_metric("mae"), "mae"),
-            (normal().eval_metric("rmse"), "rmse"),
-            (softprob().eval_metric("rmse"), "rmse"),
-            (softprob().eval_metric("auc"), "auc"),
-            (quantile().eval_metric("logloss"), "logloss"),
             (
-                TrainingParams::builder().eval_metric("mlogloss"),
-                "mlogloss",
+                quantile().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                expectile().eval_metric(crate::metric::EvalMetric::Mae),
+                "mae",
+            ),
+            (
+                normal().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                softprob().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                softprob().eval_metric(crate::metric::EvalMetric::Auc),
+                "auc",
+            ),
+            (
+                quantile().eval_metric(crate::metric::EvalMetric::LogLoss),
+                "logloss",
             ),
         ] {
             let reason = eval_metric_rejection(run(params.build().unwrap()), metric);
@@ -3701,15 +3662,27 @@ mod tests {
                 "{reason}"
             );
         }
+        // The multiclass metrics read one probability per output: a
+        // single-output model is refused before any eval set is read.
+        let single = TrainingParams::builder()
+            .eval_metric(crate::metric::EvalMetric::MLogLoss)
+            .build()
+            .unwrap();
+        let reason = eval_metric_rejection(run(single), "mlogloss");
+        assert!(reason.contains("mlogloss"), "{reason}");
         // The defaults and matching metrics still evaluate.
         for params in [
             quantile(),
-            quantile().eval_metric("quantile"),
+            quantile().eval_metric(crate::metric::EvalMetric::Quantile(
+                crate::objective::Quantiles::new([0.2, 0.8]).unwrap(),
+            )),
             expectile(),
             normal(),
-            normal().eval_metric("crps"),
+            normal().eval_metric(crate::metric::EvalMetric::Crps(
+                crate::objective::distributional::DistFamily::Normal,
+            )),
             softprob(),
-            softprob().eval_metric("merror"),
+            softprob().eval_metric(crate::metric::EvalMetric::MError),
         ] {
             let history = run(params.build().unwrap()).unwrap();
             assert!(
@@ -3732,11 +3705,11 @@ mod tests {
             .with_label_matrix(&y, 2)
             .unwrap();
         let objective = |k: usize| {
-            crate::objective::CustomObjective::new("custom:k", k, 0.0, "rmse", |_p, _y, _w, out| {
+            Objective::custom(CustomLoss::new("custom:k", k, |_p, _y, _w, out| {
                 for g in out.iter_mut() {
                     *g = GradPair::new(0.1, 1.0);
                 }
-            })
+            }))
         };
         let sums = || {
             Box::new(crate::metric::CustomMetric::new(
@@ -3745,11 +3718,13 @@ mod tests {
                 |p, _y, _w| p.iter().map(|&v| f64::from(v)).sum(),
             ))
         };
-        let params = TrainingParams::builder().build().unwrap();
         let run = |k: usize| {
+            let params = TrainingParams::builder()
+                .objective(objective(k))
+                .build()
+                .unwrap();
             Trainer::new(&params, &d, 1)
                 .eval(&d, "eval")
-                .objective(&objective(k))
                 .custom_metric(sums())
                 .train()
         };

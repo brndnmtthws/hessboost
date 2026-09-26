@@ -1168,7 +1168,7 @@ impl TrainingParams {
         ensure(
             "max_delta_step",
             self.effective_max_delta_step() == 0.0,
-            format!("clipping leaves {nonlinear}; must be 0"),
+            format!("clipping leaves {nonlinear}; leave it unbounded"),
         )?;
         ensure(
             "monotone_constraints",

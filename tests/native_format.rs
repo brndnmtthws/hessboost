@@ -732,7 +732,7 @@ fn saved_models_keep_loading_with_their_margins() {
             if !file("hbdm").exists() {
                 continue;
             }
-            let expected = std::fs::read(file("margins")).unwrap();
+            let expected = std::fs::read(file("hbdm.probe")).unwrap();
             let binary = DiffusionModel::load_binary(file("hbdm")).unwrap();
             let json = DiffusionModel::load_json(file("hbdm.json")).unwrap();
             for (format, model) in [("hbdm", binary), ("hbdm.json", json)] {
@@ -771,7 +771,7 @@ fn save_models_of_this_version() {
         let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
         model.save_binary(file("hbdm")).unwrap();
         model.save_json(file("hbdm.json")).unwrap();
-        std::fs::write(file("margins"), regressor_margins(&model)).unwrap();
+        std::fs::write(file("hbdm.probe"), regressor_margins(&model)).unwrap();
     }
 }
 
@@ -811,6 +811,8 @@ fn diffusion_models() -> Vec<(&'static str, DiffusionModel)> {
 /// The margins of a diffusion model's regressor on a fixed probe, as bytes:
 /// prediction is plain arithmetic, so they match bit for bit on every
 /// platform (samples pass through `ln`/`exp`, which need not).
+/// Saved as `.hbdm.probe`, not `.margins`: every `.margins` file names a
+/// GBDT saved as `.bin` and `.json`, which the Python bindings check.
 fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
     let regressor = model.regressor();
     let cols = regressor.n_features();

@@ -9,7 +9,7 @@
 //! Run with: `cargo run --release --example conformal`
 
 use hessboost::conformal::{ConformalizedQuantile, SplitConformal};
-use hessboost::objective::{CustomObjective, GradPair};
+use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::prelude::*;
 
 mod common;
@@ -68,16 +68,17 @@ fn main() -> Result<()> {
     // loss is supplied through the custom-objective hook: output j fits
     // quantile level taus[j].
     let taus = [(alpha / 2.0) as f32, (1.0 - alpha / 2.0) as f32];
-    let pinball = CustomObjective::new("pinball", 2, 0.0, "mae", move |p, y, _w, out| {
+    let pinball = CustomLoss::new("pinball", 2, move |p, y, _w, out| {
         for (i, &yi) in y.iter().enumerate() {
             for (j, tau) in taus.iter().enumerate() {
                 let g = if p[2 * i + j] > yi { 1.0 - tau } else { -tau };
                 out[2 * i + j] = GradPair::new(g, 1.0);
             }
         }
-    });
+    })
+    .with_default_metric(hessboost::metric::EvalMetric::Mae);
     let quantiles = Trainer::new(&params, &dtrain, 200)
-        .objective(&pinball)
+        .loss(&pinball)
         .train()?
         .model;
     // The uncalibrated band, for comparison: predictions are `[row][output]`.

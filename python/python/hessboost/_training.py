@@ -151,8 +151,9 @@ def train(
             ``feature_types``) are taken to be ``dtrain``'s.
         obj: A custom objective (see :data:`Objective`); the model then
             predicts raw margins.
-        custom_metric: A custom metric (see :data:`CustomMetric`), replacing
-            the configured ones.
+        custom_metric: A custom metric (see :data:`CustomMetric`), reported
+            after the configured (or default) metrics, as in XGBoost, and
+            so the one early stopping watches.
         maximize: Whether ``custom_metric`` improves upward (default
             ``False``). Built-in metrics know their direction.
         early_stopping_rounds: Stop once the last metric on the last eval

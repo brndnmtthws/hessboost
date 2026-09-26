@@ -126,7 +126,7 @@ use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::objective::{GradPair, Objective, create_objective};
+use crate::objective::{GradPair, Loss, create_objective};
 use crate::tree::builder::HistTreeBuilder;
 use crate::tree::builder::online::rank_split;
 use crate::tree::gain::{GradStats, RegParams, calc_weight};
@@ -606,7 +606,7 @@ fn compose(data: &DMatrix, deleted: &[bool], additions: Option<&DMatrix>) -> Res
 }
 
 /// Gradient pairs of every row of `data` at `margins`.
-fn gradients(objective: &dyn Objective, data: &DMatrix, margins: &[f32]) -> Vec<GradPair> {
+fn gradients(objective: &dyn Loss, data: &DMatrix, margins: &[f32]) -> Vec<GradPair> {
     let mut out = vec![GradPair::default(); data.n_rows()];
     objective.gradient_info(margins, &data.info(), &mut out);
     out

@@ -8,9 +8,9 @@ use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, MetaInfo};
 use crate::error::{HessboostError, Result};
-use crate::metric::{Metric, create_metrics};
+use crate::metric::Metric;
 use crate::model::{BoostedModel, ModelSpec, check_objective_width};
-use crate::objective::{GradPair, Objective, create_objective};
+use crate::objective::{GradPair, Loss, create_objective};
 use crate::rng::Rng;
 use crate::training::continuation::{require_model_for_update, resume_model};
 use crate::training::multi_output;
@@ -33,7 +33,7 @@ pub(super) struct TrainContext<'a> {
     pub(super) params: &'a TrainingParams,
     pub(super) dtrain: &'a DMatrix,
     pub(super) info: &'a MetaInfo<'a>,
-    pub(super) objective: &'a dyn Objective,
+    pub(super) objective: &'a dyn Loss,
 }
 
 /// The gradients one tree grows on and the rows that take part: an output's
@@ -261,7 +261,7 @@ fn approx_index(
 
 /// Resolve `tree_method` (handling `Auto`) and prepare the matching builder
 /// state once, up front. `const_hess` is the objective's
-/// [`Objective::const_hess`](crate::objective::Objective::const_hess), which
+/// [`Loss::const_hess`](crate::objective::Loss::const_hess), which
 /// decides whether `approx` regenerates its cuts every round.
 fn prepare_builder(
     params: &TrainingParams,
@@ -421,7 +421,7 @@ pub struct Trainer<'a> {
     num_boost_round: usize,
     evals: Vec<EvalSet<'a>>,
     early_stopping_rounds: Option<usize>,
-    objective: Option<&'a dyn Objective>,
+    loss: Option<&'a dyn Loss>,
     metric: Option<Box<dyn Metric>>,
     init_model: Option<&'a BoostedModel>,
     on_round: Option<RoundHook<'a>>,
@@ -440,7 +440,7 @@ impl<'a> Trainer<'a> {
             num_boost_round,
             evals: Vec::new(),
             early_stopping_rounds: None,
-            objective: None,
+            loss: None,
             metric: None,
             init_model: None,
             on_round: None,
@@ -478,22 +478,22 @@ impl<'a> Trainer<'a> {
         self
     }
 
-    /// Boost `objective` (the custom-objective hook, e.g. a
-    /// [`CustomObjective`](crate::objective::CustomObjective)) instead of
-    /// the one `params.objective` names. The model records the objective's
-    /// [`name`](Objective::name); a built-in objective must match `params`'
+    /// Boost `loss` (e.g. a [`CustomLoss`](crate::objective::CustomLoss))
+    /// instead of the one `params.objective` names. The model records the
+    /// loss's [`name`](Loss::name); a built-in loss must match `params`'
     /// objective settings so the saved model can be loaded again.
     #[must_use]
-    pub fn objective(mut self, objective: &'a dyn Objective) -> Self {
-        self.objective = Some(objective);
+    pub fn loss(mut self, loss: &'a dyn Loss) -> Self {
+        self.loss = Some(loss);
         self
     }
 
-    /// Report `metric` (the custom-metric hook, e.g. a
-    /// [`CustomMetric`](crate::metric::CustomMetric)) instead of the metrics
-    /// `eval_metric` or the objective's default would build: it is the sole
-    /// metric reported for each eval set and the one driving early stopping
-    /// (per its [`maximize`](Metric::maximize)).
+    /// Also report `metric` (the custom-metric hook, e.g. a
+    /// [`CustomMetric`](crate::metric::CustomMetric)), as XGBoost's
+    /// `xgb.train(custom_metric=...)` does: every eval set reports the
+    /// `eval_metric` list (or the loss's default metric) and then `metric`,
+    /// which, being last, drives early stopping (per its
+    /// [`maximize`](Metric::maximize)).
     #[must_use]
     pub fn custom_metric(mut self, metric: Box<dyn Metric>) -> Self {
         self.metric = Some(metric);
@@ -587,8 +587,8 @@ impl<'a> Trainer<'a> {
     /// Run the configured training.
     pub fn train(self) -> Result<TrainResult> {
         let built;
-        let objective = if let Some(objective) = self.objective {
-            objective
+        let objective = if let Some(loss) = self.loss {
+            loss
         } else {
             built = create_objective(self.params, self.dtrain.n_targets())?;
             built.as_ref()
@@ -617,7 +617,7 @@ pub(crate) fn validate_trained_model(model: &BoostedModel) -> Result<()> {
 /// Refuse a `num_class >= 2` that differs from `objective`'s output count:
 /// saved models require the two to agree, so a `num_class` the objective
 /// does not use would train an unloadable model.
-pub(crate) fn check_num_class(params: &TrainingParams, objective: &dyn Objective) -> Result<()> {
+pub(crate) fn check_num_class(params: &TrainingParams, objective: &dyn Loss) -> Result<()> {
     let n_out = objective.n_outputs();
     if params.num_class >= 2 && params.num_class != n_out {
         return Err(HessboostError::invalid_param(
@@ -648,18 +648,6 @@ pub(crate) fn with_thread_pool<T: Send>(
     pool.install(train)
 }
 
-/// Refuse a `missing` parameter other than the default: the sentinel belongs
-/// to the training matrix.
-pub(crate) fn reject_missing_param(params: &TrainingParams) -> Result<()> {
-    if !params.missing.is_nan() {
-        return Err(HessboostError::invalid_param(
-            "missing",
-            "set the sentinel when constructing DMatrix with from_dense_with_missing",
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse `dtrain`'s feature weights on a training path that samples no
 /// columns (`reason` names it): they only steer the tree builders' column
 /// sampling.
@@ -678,14 +666,14 @@ pub(crate) fn reject_feature_weights(dtrain: &DMatrix, reason: &'static str) -> 
 /// gradient boosting used by multiclass. `init_model` continues training
 /// from an existing model ([`Trainer::init_model`]). `objective` is the
 /// trainer's own or the one `params` name.
-fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainResult> {
+fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult> {
     let Trainer {
         params,
         dtrain,
         num_boost_round,
         evals,
         early_stopping_rounds,
-        objective: _,
+        loss: _,
         metric: metric_override,
         init_model,
         mut on_round,
@@ -858,7 +846,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Objective) -> Result<TrainRe
 fn train_linear(
     request: &TrainRequest,
     num_boost_round: usize,
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     mut model: BoostedModel,
     after_round: &mut dyn FnMut(usize) -> ControlFlow<()>,
 ) -> Result<TrainResult> {
@@ -904,7 +892,7 @@ struct TrainRequest<'a> {
 /// stopping without eval sets, unlabeled or mismatched data, constraints
 /// naming missing features, feature weights on a path that samples no
 /// columns, and objective settings a saved model could not rebuild.
-fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result<()> {
+fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     let &TrainRequest {
         params,
         dtrain,
@@ -913,7 +901,6 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
     } = request;
     params.validate()?;
     multi_output::validate(params, objective.n_outputs())?;
-    reject_missing_param(params)?;
     EarlyStopping::check_patience(early_stopping_rounds)?;
     if early_stopping_rounds.is_some() && evals.is_empty() {
         return Err(HessboostError::invalid_param(
@@ -1213,21 +1200,20 @@ struct EvalPlan<'a> {
 }
 
 impl<'a> EvalPlan<'a> {
-    /// The metrics every eval set reports (`metric_override`, else the
-    /// configured or default ones), refusing a metric that cannot read the
-    /// label layout or the model's prediction width.
+    /// The metrics every eval set reports: the configured or default ones,
+    /// then `metric_override` (as XGBoost's `xgb.train` appends its
+    /// `custom_metric`), refusing a metric that cannot read the label
+    /// layout or the model's prediction width.
     fn new(
         params: &TrainingParams,
-        objective: &dyn Objective,
+        objective: &dyn Loss,
         metric_override: Option<Box<dyn Metric>>,
         evals: &'a [EvalSet<'a>],
         n_targets: usize,
     ) -> Result<Self> {
         let n_out = objective.n_outputs();
-        let metrics = match metric_override {
-            Some(m) => vec![m],
-            None => configured_metrics(params, objective)?,
-        };
+        let mut metrics = configured_metrics(params, objective)?;
+        metrics.extend(metric_override);
         if n_targets > 1
             && let Some(metric) = metrics.iter().find(|m| !m.supports_label_matrix())
         {
@@ -1266,7 +1252,7 @@ impl<'a> EvalPlan<'a> {
     /// metric of the last eval set).
     fn record(
         &mut self,
-        objective: &dyn Objective,
+        objective: &dyn Loss,
         iteration: usize,
         margins: &MarginCaches,
         history: &mut Vec<RoundEval>,
@@ -1352,19 +1338,23 @@ impl EarlyStopping {
     }
 }
 
-/// The metrics training evaluates without a custom metric:
-/// `params.eval_metric`, or `objective`'s default. The last one is the
-/// early-stopping metric.
+/// The metrics `params` configure for `loss`: `params.eval_metric`, or the
+/// loss's default, each built for its output count. Without a custom metric
+/// the last one is the early-stopping metric.
 pub(crate) fn configured_metrics(
     params: &TrainingParams,
-    objective: &dyn Objective,
+    loss: &dyn Loss,
 ) -> Result<Vec<Box<dyn Metric>>> {
-    create_metrics(
-        &params.eval_metric,
-        &objective.default_metric(),
-        params.num_class,
-        &ObjectiveParams::for_objective(params, objective.name()),
-    )
+    let n_outputs = loss.n_outputs();
+    if params.eval_metric.is_empty() {
+        Ok(vec![loss.default_metric().build(n_outputs)?])
+    } else {
+        params
+            .eval_metric
+            .iter()
+            .map(|metric| metric.build(n_outputs))
+            .collect()
+    }
 }
 
 /// An empty model that `objective` trains on `dtrain` with `params`, starting
@@ -1375,7 +1365,7 @@ pub(crate) fn configured_metrics(
 /// even though `num_class` is 0.
 pub(crate) fn new_model(
     params: &TrainingParams,
-    objective: &dyn crate::objective::Objective,
+    objective: &dyn crate::objective::Loss,
     dtrain: &DMatrix,
     base_margins: Vec<f32>,
 ) -> BoostedModel {
@@ -1395,47 +1385,27 @@ pub(crate) fn new_model(
 }
 
 /// Per-output intercepts in margin space. A user-supplied `base_score` is
-/// given in prediction space and broadcast to every output through the
-/// objective's link (XGBoost `ProbToMargin`; for multiclass this is a
-/// uniform nonzero margin, as in XGBoost); otherwise the objective estimates
-/// them from the labels (XGBoost `InitEstimation`).
+/// given in prediction space, checked against `loss`'s output domain
+/// ([`Loss::validate_base_score`](crate::objective::Loss::validate_base_score)),
+/// and broadcast to every output through its link (XGBoost `ProbToMargin`;
+/// for multiclass this is a uniform nonzero margin, as in XGBoost);
+/// otherwise the loss estimates them from the labels (XGBoost
+/// `InitEstimation`). Both go through the loss being trained, never the
+/// configured objective's name.
 pub(crate) fn initial_intercepts(
     params: &TrainingParams,
-    objective: &dyn crate::objective::Objective,
+    loss: &dyn crate::objective::Loss,
     info: &MetaInfo,
     n_out: usize,
 ) -> Result<Vec<f32>> {
-    if let Some(base_score) = params.base_score {
-        if n_out > 1
-            && crate::objective::distributional::DistFamily::from_objective(&params.objective)
-                .is_some()
-        {
-            return Err(HessboostError::invalid_param(
-                "base_score",
-                "a scalar cannot set the several parameters of a `dist:*` objective; \
-                 supply per-row `base_margin` instead",
-            ));
-        }
-        let invalid = match params.objective.as_str() {
-            "binary:logistic" | "reg:logistic" => !(0.0 < base_score && base_score < 1.0),
-            "count:poisson" | "reg:gamma" | "reg:tweedie" | "survival:cox" | "survival:aft"
-            | "dist:poisson" => base_score <= 0.0,
-            _ => false,
-        };
-        if invalid {
-            return Err(HessboostError::invalid_param(
-                "base_score",
-                "is outside the objective's valid output domain",
-            ));
-        }
-    }
     let base_margins = match params.base_score {
         Some(bs) => {
+            loss.validate_base_score(bs)?;
             let mut scores = vec![bs as f32; n_out];
-            objective.probs_to_margins(&mut scores);
+            loss.probs_to_margins(&mut scores);
             scores
         }
-        None => objective.base_margins_info(info),
+        None => loss.base_margins_info(info),
     };
     if base_margins.len() != n_out {
         return Err(HessboostError::dimension_mismatch(
@@ -1986,9 +1956,9 @@ pub(super) fn gradient_sampling(params: &TrainingParams) -> bool {
 /// Shape and metadata checks for the training matrix and every eval set,
 /// followed by the objective's own [`validate_info`] label-domain checks.
 ///
-/// [`validate_info`]: crate::objective::Objective::validate_info
+/// [`validate_info`]: crate::objective::Loss::validate_info
 pub(crate) fn validate_dataset(
-    objective: &dyn crate::objective::Objective,
+    objective: &dyn crate::objective::Loss,
     data: &DMatrix,
     n_targets: usize,
     n_features: usize,
@@ -2044,7 +2014,7 @@ pub(crate) fn validate_dataset(
 /// "dataset" in the reason becomes ``dataset `name` `` (reasons without that
 /// word get a ``dataset `name`: `` prefix).
 ///
-/// [`validate_info`]: crate::objective::Objective::validate_info
+/// [`validate_info`]: crate::objective::Loss::validate_info
 fn name_dataset(error: HessboostError, dataset: &str) -> HessboostError {
     match error {
         HessboostError::InvalidParameter { name, reason } => {
@@ -2273,7 +2243,7 @@ mod tests {
     /// `approx` cuts differ.
     struct PerOutputHessians;
 
-    impl Objective for PerOutputHessians {
+    impl Loss for PerOutputHessians {
         fn name(&self) -> &'static str {
             "custom:per_output_hessians"
         }
@@ -2291,8 +2261,8 @@ mod tests {
         fn const_hess(&self) -> bool {
             true
         }
-        fn default_metric(&self) -> String {
-            "rmse".into()
+        fn default_metric(&self) -> crate::metric::EvalMetric {
+            crate::metric::EvalMetric::Rmse
         }
     }
 
@@ -2311,7 +2281,7 @@ mod tests {
                 .build()
                 .unwrap();
             let model = Trainer::new(&params, &d, 3)
-                .objective(&PerOutputHessians)
+                .loss(&PerOutputHessians)
                 .train()
                 .unwrap()
                 .model;
@@ -2495,7 +2465,7 @@ mod tests {
             .unwrap();
         let squared = crate::objective::SquaredError;
         let model = Trainer::new(&params, &d, 3)
-            .objective(&squared)
+            .loss(&squared)
             .train()
             .unwrap()
             .model;
@@ -2504,7 +2474,7 @@ mod tests {
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
         // Continued training records the initial model's objective too.
         let more = Trainer::new(&params, &d, 2)
-            .objective(&squared)
+            .loss(&squared)
             .init_model(&model)
             .train()
             .unwrap()
@@ -2622,7 +2592,7 @@ mod tests {
 
     #[test]
     fn custom_objective_matches_builtin_squared_error() {
-        use crate::objective::CustomObjective;
+        use crate::objective::CustomLoss;
         let d = step_dataset(80);
 
         let builtin = {
@@ -2643,14 +2613,14 @@ mod tests {
                 .eta(0.3)
                 .build()
                 .unwrap();
-            let obj = CustomObjective::new("custom", 1, 0.0, "rmse", |preds, labels, w, out| {
+            let obj = CustomLoss::new("custom", 1, |preds, labels, w, out| {
                 for i in 0..preds.len() {
                     let wi = w.map_or(1.0, |ws| ws[i]);
                     out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi);
                 }
             });
             Trainer::new(&p, &d, 30)
-                .objective(&obj)
+                .loss(&obj)
                 .train()
                 .unwrap()
                 .model
@@ -2665,7 +2635,7 @@ mod tests {
 
     #[test]
     fn custom_multi_output_objective_trains_with_stride_and_round_trips() {
-        use crate::objective::CustomObjective;
+        use crate::objective::CustomLoss;
         let d = step_dataset(80);
         let n = d.n_rows();
         let rounds = 5usize;
@@ -2673,7 +2643,7 @@ mod tests {
         // Two outputs, `[row][output]` layout: output 0 fits the label, output 1
         // fits its negation. Same data with mirrored targets, so the learned
         // outputs must mirror each other.
-        let obj = CustomObjective::new("custom:two", 2, 0.0, "rmse", |preds, labels, w, out| {
+        let obj = CustomLoss::new("custom:two", 2, |preds, labels, w, out| {
             for i in 0..labels.len() {
                 let wi = w.map_or(1.0, |ws| ws[i]);
                 out[2 * i] = GradPair::new((preds[2 * i] - labels[i]) * wi, wi);
@@ -2682,7 +2652,7 @@ mod tests {
         });
         let p = TrainingParams::builder().max_depth(2).build().unwrap();
         let model = Trainer::new(&p, &d, rounds)
-            .objective(&obj)
+            .loss(&obj)
             .train()
             .unwrap()
             .model;
@@ -3063,7 +3033,7 @@ mod tests {
             .unwrap();
 
         // Custom path: a CustomMetric reimplementing RMSE (minimize).
-        let rmse_metric = CustomMetric::new("rmse", false, |preds, labels, weights| {
+        let rmse_metric = CustomMetric::new("my-rmse", false, |preds, labels, weights| {
             let mut sq = 0.0f64;
             let mut wsum = 0.0f64;
             for i in 0..preds.len() {
@@ -3092,13 +3062,15 @@ mod tests {
             builtin.model.predict(&d).unwrap()
         );
 
-        // The custom metric was actually recorded in the history.
+        // As in XGBoost's `xgb.train`, the custom metric is reported after
+        // the configured (here the default) ones and, being last, drives
+        // early stopping.
         let names: Vec<&str> = custom.history[0]
             .scores
             .iter()
             .map(|(_, m, _)| m.as_str())
             .collect();
-        assert_eq!(names, vec!["rmse"]);
+        assert_eq!(names, vec!["rmse", "my-rmse"]);
     }
 
     #[test]
@@ -3184,6 +3156,40 @@ mod tests {
         );
     }
 
+    /// `base_score` is checked against the loss being trained, not the
+    /// objective `params` names: a logistic loss refuses a probability
+    /// outside `(0, 1)` under the default objective, and an identity-link
+    /// custom loss accepts one under `binary:logistic`.
+    #[test]
+    fn base_score_domain_follows_the_trained_loss() {
+        let d = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
+        let outside = TrainingParams::builder().base_score(2.0).build().unwrap();
+        let logistic = crate::objective::Logistic::default();
+        assert!(matches!(
+            Trainer::new(&outside, &d, 1).loss(&logistic).train(),
+            Err(HessboostError::InvalidParameter {
+                name: "base_score",
+                ..
+            })
+        ));
+        let identity = crate::objective::CustomLoss::new("custom", 1, |p, y, _w, out| {
+            for ((pair, &p), &y) in out.iter_mut().zip(p).zip(y) {
+                *pair = GradPair::new(p - y, 1.0);
+            }
+        });
+        let named_logistic = TrainingParams::builder()
+            .objective("binary:logistic")
+            .base_score(2.0)
+            .build()
+            .unwrap();
+        let model = Trainer::new(&named_logistic, &d, 0)
+            .loss(&identity)
+            .train()
+            .unwrap()
+            .model;
+        assert_eq!(model.base_score(), 2.0);
+    }
+
     #[test]
     fn invalid_training_and_evaluation_inputs_return_errors() {
         let d = step_dataset(20);
@@ -3225,7 +3231,7 @@ mod tests {
         assert!(model.predict_leaf(&wrong_features).is_err());
     }
 
-    /// Label-domain checks run through `Objective::validate_info` for every
+    /// Label-domain checks run through `Loss::validate_info` for every
     /// eval set, and the error names the offending dataset.
     #[test]
     fn eval_set_label_domain_errors_name_the_dataset() {
@@ -3283,7 +3289,7 @@ mod tests {
             Err(HessboostError::DimensionMismatch { .. })
         ));
         let ndcg = TrainingParams::builder()
-            .eval_metric("ndcg")
+            .eval_metric(crate::metric::EvalMetric::Ndcg(crate::metric::Cutoff::all()))
             .build()
             .unwrap();
         eval_metric_rejection(train(&ndcg, &two_targets, 1), "ndcg");
@@ -3419,7 +3425,7 @@ mod tests {
         }
     }
 
-    impl crate::objective::Objective for BoundsMidpoint {
+    impl crate::objective::Loss for BoundsMidpoint {
         fn name(&self) -> &'static str {
             "test:bounds_midpoint"
         }
@@ -3453,8 +3459,8 @@ mod tests {
             false
         }
 
-        fn default_metric(&self) -> String {
-            "rmse".to_string()
+        fn default_metric(&self) -> crate::metric::EvalMetric {
+            crate::metric::EvalMetric::Rmse
         }
     }
 
@@ -3473,7 +3479,7 @@ mod tests {
             .build()
             .unwrap();
         let model = Trainer::new(&params, &d, 3)
-            .objective(&BoundsMidpoint)
+            .loss(&BoundsMidpoint)
             .train()
             .unwrap()
             .model;
@@ -3488,9 +3494,14 @@ mod tests {
 
         let unbounded = DMatrix::from_dense(&x, 32, 1).unwrap();
         assert!(matches!(
-            Trainer::new(&params, &unbounded, 1).objective(&BoundsMidpoint).train(),
+            Trainer::new(&params, &unbounded, 1).loss(&BoundsMidpoint).train(),
             Err(HessboostError::InvalidParameter { name, .. }) if name == "label_lower_bound"
         ));
+    }
+
+    /// The metric XGBoost names `name`, with default parameters.
+    fn named_metric(name: &str) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::from_xgboost(name, &crate::metric::DEFAULT_SOURCE).unwrap()
     }
 
     /// The reason of an `eval_metric` rejection of the `context` run,
@@ -3519,7 +3530,7 @@ mod tests {
         let params = |metric: &str| {
             TrainingParams::builder()
                 .objective("survival:aft")
-                .eval_metric(metric)
+                .eval_metric(named_metric(metric))
                 .build()
                 .unwrap()
         };
@@ -3558,7 +3569,7 @@ mod tests {
             .unwrap();
         for metric in ["aft-nloglik", "interval-regression-accuracy", "pre@3"] {
             let params = TrainingParams::builder()
-                .eval_metric(metric)
+                .eval_metric(named_metric(metric))
                 .build()
                 .unwrap();
             eval_metric_rejection(
@@ -3600,15 +3611,29 @@ mod tests {
                 .map(|r| r.history)
         };
         for (params, metric) in [
-            (quantile().eval_metric("rmse"), "rmse"),
-            (expectile().eval_metric("mae"), "mae"),
-            (normal().eval_metric("rmse"), "rmse"),
-            (softprob().eval_metric("rmse"), "rmse"),
-            (softprob().eval_metric("auc"), "auc"),
-            (quantile().eval_metric("logloss"), "logloss"),
             (
-                TrainingParams::builder().eval_metric("mlogloss"),
-                "mlogloss",
+                quantile().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                expectile().eval_metric(crate::metric::EvalMetric::Mae),
+                "mae",
+            ),
+            (
+                normal().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                softprob().eval_metric(crate::metric::EvalMetric::Rmse),
+                "rmse",
+            ),
+            (
+                softprob().eval_metric(crate::metric::EvalMetric::Auc),
+                "auc",
+            ),
+            (
+                quantile().eval_metric(crate::metric::EvalMetric::LogLoss),
+                "logloss",
             ),
         ] {
             let reason = eval_metric_rejection(run(params.build().unwrap()), metric);
@@ -3617,15 +3642,27 @@ mod tests {
                 "{reason}"
             );
         }
+        // The multiclass metrics read one probability per output: a
+        // single-output model is refused before any eval set is read.
+        let single = TrainingParams::builder()
+            .eval_metric(crate::metric::EvalMetric::MLogLoss)
+            .build()
+            .unwrap();
+        let reason = eval_metric_rejection(run(single), "mlogloss");
+        assert!(reason.contains("mlogloss"), "{reason}");
         // The defaults and matching metrics still evaluate.
         for params in [
             quantile(),
-            quantile().eval_metric("quantile"),
+            quantile().eval_metric(crate::metric::EvalMetric::Quantile(
+                crate::objective::Quantiles::new([0.2, 0.8]).unwrap(),
+            )),
             expectile(),
             normal(),
-            normal().eval_metric("crps"),
+            normal().eval_metric(crate::metric::EvalMetric::Crps(
+                crate::objective::distributional::DistFamily::Normal,
+            )),
             softprob(),
-            softprob().eval_metric("merror"),
+            softprob().eval_metric(crate::metric::EvalMetric::MError),
         ] {
             let history = run(params.build().unwrap()).unwrap();
             assert!(
@@ -3648,7 +3685,7 @@ mod tests {
             .with_label_matrix(&y, 2)
             .unwrap();
         let objective = |k: usize| {
-            crate::objective::CustomObjective::new("custom:k", k, 0.0, "rmse", |_p, _y, _w, out| {
+            crate::objective::CustomLoss::new("custom:k", k, |_p, _y, _w, out| {
                 for g in out.iter_mut() {
                     *g = GradPair::new(0.1, 1.0);
                 }
@@ -3665,7 +3702,7 @@ mod tests {
         let run = |k: usize| {
             Trainer::new(&params, &d, 1)
                 .eval(&d, "eval")
-                .objective(&objective(k))
+                .loss(&objective(k))
                 .custom_metric(sums())
                 .train()
         };

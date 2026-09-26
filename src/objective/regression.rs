@@ -1,8 +1,10 @@
 //! Regression objectives.
 
-use super::{GradPair, Objective, check_label_domain, weighted_label_mean};
+use super::{GradPair, Loss, check_label_domain, weighted_label_mean};
 use crate::data::MetaInfo;
 use crate::error::Result;
+use crate::metric::EvalMetric;
+use crate::objective::PseudoHuber;
 
 /// Squared-error regression (`reg:squarederror`).
 ///
@@ -13,7 +15,7 @@ use crate::error::Result;
 #[non_exhaustive]
 pub struct SquaredError;
 
-impl Objective for SquaredError {
+impl Loss for SquaredError {
     fn name(&self) -> &'static str {
         "reg:squarederror"
     }
@@ -46,8 +48,8 @@ impl Objective for SquaredError {
         }))
     }
 
-    fn default_metric(&self) -> String {
-        "rmse".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::Rmse
     }
 }
 
@@ -58,24 +60,28 @@ impl Objective for SquaredError {
 /// like XGBoost's `PseudoHuberRegression`. The intercept is the trait's
 /// default Newton step (XGBoost `FitIntercept`).
 #[derive(Debug, Clone, Copy)]
-pub struct PseudoHuber {
+pub(crate) struct PseudoHuberLoss {
+    param: PseudoHuber,
     slope: f32,
 }
 
-impl PseudoHuber {
-    /// Create with the given Huber slope `δ`.
-    pub fn new(slope: f32) -> Self {
-        PseudoHuber { slope }
+impl PseudoHuberLoss {
+    /// The loss with slope `param`.
+    pub(crate) fn new(param: PseudoHuber) -> Self {
+        PseudoHuberLoss {
+            param,
+            slope: param.slope() as f32,
+        }
     }
 }
 
-impl Default for PseudoHuber {
+impl Default for PseudoHuberLoss {
     fn default() -> Self {
-        PseudoHuber { slope: 1.0 }
+        PseudoHuberLoss::new(PseudoHuber::default())
     }
 }
 
-impl Objective for PseudoHuber {
+impl Loss for PseudoHuberLoss {
     fn name(&self) -> &'static str {
         "reg:pseudohubererror"
     }
@@ -108,8 +114,8 @@ impl Objective for PseudoHuber {
         }))
     }
 
-    fn default_metric(&self) -> String {
-        "mphe".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::Mphe(self.param)
     }
 }
 
@@ -130,7 +136,7 @@ pub struct SquaredLogError;
 /// `f32`.
 const SQUARED_LOG_MIN_PRED: f32 = (-1.0f64 + 1e-6) as f32;
 
-impl Objective for SquaredLogError {
+impl Loss for SquaredLogError {
     fn name(&self) -> &'static str {
         "reg:squaredlogerror"
     }
@@ -157,8 +163,8 @@ impl Objective for SquaredLogError {
         check_label_domain(info, |y| y <= -1.0)
     }
 
-    fn default_metric(&self) -> String {
-        "rmsle".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::Rmsle
     }
 }
 
@@ -198,7 +204,7 @@ mod tests {
     /// Hessian `1/(2√2)`, so a wrong slope scaling would be visible.
     #[test]
     fn pseudo_huber_slope_scales_gradient() {
-        let obj = PseudoHuber::new(2.0);
+        let obj = PseudoHuberLoss::new(PseudoHuber::new(2.0).unwrap());
         let out = gradient_pairs(&obj, &[2.0], &[0.0], None);
         let root2 = 2f32.sqrt();
         assert!(
@@ -212,7 +218,7 @@ mod tests {
             out[0].hess
         );
         // Unit slope reproduces the classic form d/√(1+d²), 1/(1+d²)^{3/2}.
-        let out = gradient_pairs(&PseudoHuber::default(), &[2.0], &[0.0], None);
+        let out = gradient_pairs(&PseudoHuberLoss::default(), &[2.0], &[0.0], None);
         let s = 5f32;
         assert_eq!(out[0], GradPair::new(2.0 / s.sqrt(), 1.0 / (s * s.sqrt())));
     }
@@ -223,7 +229,7 @@ mod tests {
     /// `h = 1/(1+z²)^{3/2}`, fall well short of it.
     #[test]
     fn pseudo_huber_intercept_is_newton_step() {
-        let obj = PseudoHuber::default();
+        let obj = PseudoHuberLoss::default();
         let labels = [0.0f32, 4.0];
         let margins = base_margins(&obj, &labels, None);
         let s = 17f32; // 1 + 4²
@@ -243,11 +249,11 @@ mod tests {
     /// where that form is accurate.
     #[test]
     fn pseudo_huber_loss_survives_large_slopes() {
-        let obj = PseudoHuber::new(1e9);
+        let obj = PseudoHuberLoss::new(PseudoHuber::new(1e9).unwrap());
         let loss = obj.pointwise_loss().unwrap();
         assert!((loss(0.0, 1.0) - 0.5).abs() < 1e-12, "{}", loss(0.0, 1.0));
 
-        let obj = PseudoHuber::new(2.0);
+        let obj = PseudoHuberLoss::new(PseudoHuber::new(2.0).unwrap());
         let loss = obj.pointwise_loss().unwrap();
         let naive = 4.0 * ((1.0f64 + 9.0 / 4.0).sqrt() - 1.0);
         assert!((loss(3.0, 0.0) - naive).abs() < 1e-12);

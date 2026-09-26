@@ -1,51 +1,84 @@
-//! User-defined objective hook.
+//! User-defined loss hook.
 //!
 //! Wraps caller-supplied closures so any custom loss can drive training via
 //! [`crate::training::Trainer`]. The gradient closure receives raw
-//! margins and writes gradient/Hessian pairs, matching the built-in objectives.
+//! margins and writes gradient/Hessian pairs, matching the built-in losses.
 
-use super::{GradPair, Objective, SplitGradient};
+use super::{GradPair, Loss, SplitGradient};
+use crate::metric::EvalMetric;
 
 type GradFn = dyn Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Send + Sync;
 type TransformFn = dyn Fn(&mut [f32]) + Send + Sync;
 type SplitGradFn = dyn Fn(usize, &[GradPair]) -> Option<SplitGradient> + Send + Sync;
 
-/// An [`Objective`] backed by user closures.
-pub struct CustomObjective {
+/// A [`Loss`] backed by user closures: a gradient closure plus optional
+/// intercept, default metric, prediction transform, and split-gradient
+/// hook.
+///
+/// ```
+/// use hessboost::metric::EvalMetric;
+/// use hessboost::objective::{CustomLoss, GradPair};
+///
+/// let squared = CustomLoss::new("my:squarederror", 1, |margins, labels, _weights, out| {
+///     for ((pair, &m), &y) in out.iter_mut().zip(margins).zip(labels) {
+///         *pair = GradPair::new(m - y, 1.0);
+///     }
+/// })
+/// .with_base_margin(0.5)
+/// .with_default_metric(EvalMetric::Mae);
+/// # let _ = squared;
+/// ```
+pub struct CustomLoss {
     name: String,
     n_outputs: usize,
     base: f32,
-    default_metric: String,
+    default_metric: EvalMetric,
     grad_fn: Box<GradFn>,
     transform_fn: Option<Box<TransformFn>>,
     split_grad_fn: Option<Box<SplitGradFn>>,
 }
 
-impl CustomObjective {
-    /// Build a custom objective.
+impl CustomLoss {
+    /// A custom loss named `name` with `n_outputs` margins per row, whose
+    /// gradients come from `gradient`: `(margins, labels, weights, out)`
+    /// fills `out` (margins and `out` are `[row][output]`; labels hold one
+    /// value per row, or `[row][target]` for a label matrix, which then
+    /// needs one column per output).
     ///
-    /// * `grad_fn`: `(margins, labels, weights, out)` fills `out` with gradients
-    ///   (margins and `out` are `[row][output]`; labels hold one value per row,
-    ///   or `[row][target]` for a label matrix, which then needs one column
-    ///   per output).
-    /// * `base`: the initial margin (base score), used for every output.
-    /// * `transform_fn`: optional prediction transform (identity if `None`).
+    /// The intercept defaults to margin `0` for every output
+    /// ([`with_base_margin`](Self::with_base_margin)), the default metric to
+    /// `rmse` ([`with_default_metric`](Self::with_default_metric)), and the
+    /// prediction transform to the identity
+    /// ([`with_transform`](Self::with_transform)).
     pub fn new(
         name: impl Into<String>,
         n_outputs: usize,
-        base: f32,
-        default_metric: impl Into<String>,
-        grad_fn: impl Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Send + Sync + 'static,
+        gradient: impl Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Send + Sync + 'static,
     ) -> Self {
-        CustomObjective {
+        CustomLoss {
             name: name.into(),
             n_outputs,
-            base,
-            default_metric: default_metric.into(),
-            grad_fn: Box::new(grad_fn),
+            base: 0.0,
+            default_metric: EvalMetric::Rmse,
+            grad_fn: Box::new(gradient),
             transform_fn: None,
             split_grad_fn: None,
         }
+    }
+
+    /// Start training from margin `base` for every output (the intercept
+    /// used when `base_score` is not set).
+    #[must_use]
+    pub fn with_base_margin(mut self, base: f32) -> Self {
+        self.base = base;
+        self
+    }
+
+    /// Evaluate with `metric` when no `eval_metric` is configured.
+    #[must_use]
+    pub fn with_default_metric(mut self, metric: EvalMetric) -> Self {
+        self.default_metric = metric;
+        self
     }
 
     /// Attach a prediction transform.
@@ -63,7 +96,7 @@ impl CustomObjective {
     /// receives the round's full `[row][output]` gradients and returns the
     /// narrower `[row][target]` gradients the tree structure is grown from,
     /// or `None` to use the full gradients that round. See
-    /// [`Objective::split_gradient`].
+    /// [`Loss::split_gradient`].
     #[must_use]
     pub fn with_split_gradient(
         mut self,
@@ -74,7 +107,7 @@ impl CustomObjective {
     }
 }
 
-impl Objective for CustomObjective {
+impl Loss for CustomLoss {
     fn name(&self) -> &str {
         &self.name
     }
@@ -126,7 +159,7 @@ impl Objective for CustomObjective {
         vec![self.base; self.n_outputs]
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> EvalMetric {
         self.default_metric.clone()
     }
 
@@ -144,7 +177,7 @@ mod tests {
     #[test]
     fn custom_squared_error_behaves() {
         // Reimplement squared error as a custom objective.
-        let obj = CustomObjective::new("custom:sqerr", 1, 0.0, "rmse", |preds, labels, w, out| {
+        let obj = CustomLoss::new("custom:sqerr", 1, |preds, labels, w, out| {
             for i in 0..preds.len() {
                 let wi = w.map_or(1.0, |ws| ws[i]);
                 out[i] = GradPair::new((preds[i] - labels[i]) * wi, wi);

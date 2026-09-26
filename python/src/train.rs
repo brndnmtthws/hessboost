@@ -5,7 +5,7 @@ use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{OrRaise, refuse};
 use crate::params::Params;
 use hessboost::metric::CustomMetric;
-use hessboost::objective::{CustomObjective, GradPair};
+use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::training::{CrossValidation, Fold, RoundEval, Trainer};
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
@@ -61,12 +61,10 @@ fn custom_objective(
     outputs: usize,
     base: f32,
     failure: Failure,
-) -> CustomObjective {
-    CustomObjective::new(
+) -> CustomLoss {
+    CustomLoss::new(
         "custom",
         outputs,
-        base,
-        "rmse",
         move |margins, _labels, _weights, out: &mut [GradPair]| {
             out.fill(GradPair::default());
             if failure.failed() {
@@ -97,6 +95,7 @@ fn custom_objective(
             }
         },
     )
+    .with_base_margin(base)
 }
 
 /// The custom metric: `function(predictions, labels, weights) -> float`.
@@ -271,7 +270,7 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
                 trainer = trainer.init_model(model);
             }
             if let Some(objective) = &objective {
-                trainer = trainer.objective(objective);
+                trainer = trainer.loss(objective);
             }
             if let Some(metric) = metric {
                 trainer = trainer.custom_metric(Box::new(metric));

@@ -253,7 +253,7 @@ impl<'a> HistTreeBuilder<'a> {
         );
         // Leaf renewal recomputes leaf values from full-precision sums, which
         // needs every leaf's rows.
-        let renew = self.params.use_quantized_grad && self.params.quant_train_renew_leaf;
+        let renew = self.params.quantized.is_some_and(|q| q.renew_leaf());
         let (root, root_stats) = self.root(ghist, gpair, row_subset, sampler);
         let mut tree = RegTree::with_root(root_stats.hess as f32);
         let mut store = NodeStore {
@@ -303,9 +303,9 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
     ) -> (NodeEntry, GradStats) {
         let total_bins = ghist.total_bins();
-        let (root_stats, root_hist, root_quant) = if self.params.use_quantized_grad {
+        let (root_stats, root_hist, root_quant) = if let Some(quantized) = self.params.quantized {
             let (quant, stats, hist) =
-                QuantNode::root(ghist, gpair, row_subset, self.params, self.rounding_seed);
+                QuantNode::root(ghist, gpair, row_subset, quantized, self.rounding_seed);
             (stats, hist, Some(quant))
         } else {
             // The root sum is a sequential pass; it runs beside the
@@ -474,7 +474,7 @@ impl<'a> HistTreeBuilder<'a> {
     fn speculative_features(&self, sampler: &ColumnSampler) -> Option<Vec<u32>> {
         if self.reuse.is_some()
             || self.options.is_some()
-            || self.params.use_quantized_grad
+            || self.params.quantized.is_some()
             || !rayon_available()
         {
             return None;

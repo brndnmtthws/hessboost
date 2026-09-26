@@ -1,7 +1,10 @@
 //! Continued training, `process_type=update`, `num_parallel_tree` forests,
 //! model slicing and iteration-range prediction.
 
-use hessboost::config::{BoosterKind, GrowPolicy, ProcessType, SamplingMethod, TreeMethod};
+use hessboost::config::{
+    BoosterKind, Dart, ExtraTrees, GrowPolicy, LinearTree, ProcessType, QuantizedGrad, Refresh,
+    SamplingMethod, TreeMethod,
+};
 use hessboost::objective::{Multiclass, PseudoHuber};
 use hessboost::prelude::{
     BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
@@ -73,8 +76,9 @@ fn continuing_grows_the_same_trees_as_training_in_one_run() {
         ),
         (
             base()
-                .booster(BoosterKind::Dart)
-                .rate_drop(0.3)
+                .booster(BoosterKind::Dart(
+                    Dart::builder().rate_drop(0.3).build().unwrap(),
+                ))
                 .build()
                 .unwrap(),
             d.clone(),
@@ -305,7 +309,7 @@ fn refreshing_on_the_training_data_reproduces_the_model() {
         let model = train(&params, &d, 6).unwrap();
         let update = base()
             .tree_method(method)
-            .process_type(ProcessType::Update)
+            .process_type(ProcessType::Update(Refresh::default()))
             .build()
             .unwrap();
         let refreshed = Trainer::new(&update, &d, 6)
@@ -337,8 +341,7 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     let half = regression(150, 3.0);
     let model = train(&base().build().unwrap(), &d, 6).unwrap();
     let keep_leaves = base()
-        .process_type(ProcessType::Update)
-        .refresh_leaf(false)
+        .process_type(ProcessType::Update(Refresh::stats_only()))
         .build()
         .unwrap();
     let stats_only = Trainer::new(&keep_leaves, &half, 6)
@@ -355,7 +358,10 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
             .all(|t| t.node(0).sum_hess == 150.0)
     );
 
-    let update = base().process_type(ProcessType::Update).build().unwrap();
+    let update = base()
+        .process_type(ProcessType::Update(Refresh::default()))
+        .build()
+        .unwrap();
     let partial = Trainer::new(&update, &half, 4)
         .init_model(&model)
         .train()
@@ -388,19 +394,24 @@ fn refresh_refuses_options_it_cannot_apply() {
     let refused = |params: &TrainingParams, model: &BoostedModel| {
         invalid_param(Trainer::new(params, &d, 2).init_model(model).train()) == "process_type"
     };
-    let update = || base().process_type(ProcessType::Update);
-    let linear = train(&base().linear_tree(true).build().unwrap(), &d, 3).unwrap();
+    let update = || base().process_type(ProcessType::Update(Refresh::default()));
+    let linear = train(
+        &base().linear_tree(LinearTree::default()).build().unwrap(),
+        &d,
+        3,
+    )
+    .unwrap();
     assert!(refused(&update().build().unwrap(), &linear));
     let plain = train(&base().build().unwrap(), &d, 3).unwrap();
     for params in [
-        update().linear_tree(true),
+        update().linear_tree(LinearTree::default()),
         update().path_smooth(1.0),
         // Refresh sums full-precision gradients, so quantization would be
         // silently skipped.
-        update().use_quantized_grad(true),
+        update().quantized(QuantizedGrad::default()),
         // Refresh keeps the existing splits, so split-search-only options
         // would silently do nothing.
-        update().extra_trees(true),
+        update().extra_trees(ExtraTrees::default()),
         update().toad_penalty_feature(1.0),
         update().toad_penalty_threshold(0.5),
         // Refresh sums every row over every existing split: it samples
@@ -412,7 +423,9 @@ fn refresh_refuses_options_it_cannot_apply() {
         update().colsample_bytree(0.5),
         update().colsample_bynode(0.5),
         update().grow_policy(GrowPolicy::Symmetric),
-        update().rate_drop(0.5),
+        update().booster(BoosterKind::Dart(
+            Dart::builder().rate_drop(0.5).build().unwrap(),
+        )),
     ] {
         assert!(refused(&params.build().unwrap(), &plain));
     }
@@ -559,8 +572,9 @@ fn gblinear_accepts_only_the_whole_range() {
 fn slicing_selects_iterations_with_their_dart_weights() {
     let d = regression(200, 0.0);
     let params = base()
-        .booster(BoosterKind::Dart)
-        .rate_drop(0.4)
+        .booster(BoosterKind::Dart(
+            Dart::builder().rate_drop(0.4).build().unwrap(),
+        ))
         .num_parallel_tree(2)
         .build()
         .unwrap();

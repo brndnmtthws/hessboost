@@ -529,10 +529,10 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
             "no monotone or interaction constraints",
         );
     }
-    if params.extra_trees
+    if params.extra_trees.is_some()
         || params.path_smooth != 0.0
-        || params.linear_tree
-        || params.use_quantized_grad
+        || params.linear_tree.is_some()
+        || params.quantized.is_some()
         || params.toad_penalty_feature != 0.0
         || params.toad_penalty_threshold != 0.0
     {

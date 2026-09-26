@@ -2,7 +2,9 @@
 //! `sampling_method=gradient_based` (XGBoost's CPU MVS sampler) and
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
-use hessboost::config::{BoosterKind, SamplingMethod, TrainingParamsBuilder};
+use hessboost::config::{
+    BoosterKind, Dart, ProcessType, Refresh, SamplingMethod, TrainingParamsBuilder,
+};
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -134,7 +136,7 @@ fn gradient_based_sampling_tree_method_support() {
     }
     // DART grows its trees through the same per-tree sampling.
     let dart = TrainingParams::builder()
-        .booster(BoosterKind::Dart)
+        .booster(BoosterKind::Dart(Dart::default()))
         .sampling_method(SamplingMethod::GradientBased)
         .subsample(0.4)
         .build()
@@ -300,7 +302,7 @@ fn plain(method: TreeMethod, booster: BoosterKind) -> TrainingParamsBuilder {
 #[test]
 fn approx_parallel_trees_share_one_row_sample() {
     let data = step_rows(|_| 0.0);
-    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
         for (sampling, subsample) in [
             (SamplingMethod::GradientBased, 0.25),
             (SamplingMethod::Uniform, 0.5),
@@ -339,7 +341,7 @@ fn approx_parallel_trees_share_one_row_sample() {
 fn approx_gradient_sampling_continuation_matches_uninterrupted_training() {
     let step = step_rows(|i| i as f32);
     let wide = dataset(400, 3);
-    for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+    for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
         for (data, depth, split) in [(&step, 1, [1, 1]), (&wide, 3, [2, 3])] {
             let params = plain(TreeMethod::Approx, booster)
                 .sampling_method(SamplingMethod::GradientBased)
@@ -401,7 +403,7 @@ fn feature_weights_are_refused_where_columns_are_not_sampled() {
     );
     let model = train(&TrainingParams::default(), &data, 2).unwrap();
     let update = TrainingParams::builder()
-        .process_type(hessboost::config::ProcessType::Update)
+        .process_type(ProcessType::Update(Refresh::default()))
         .build()
         .unwrap();
     let refresh = |data: &DMatrix| Trainer::new(&update, data, 2).init_model(&model).train();

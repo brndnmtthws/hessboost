@@ -31,7 +31,7 @@ use super::{
     BinIndex, PARALLEL_THRESHOLD, PREFETCH_ROWS, REDUCE_BINS, ROWS_PER_TASK, TILE_ROWS,
     contiguous_range, feature_blocks, feature_slices, prefetch_bins,
 };
-use crate::config::TrainingParams;
+use crate::config::QuantizedGrad;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
 use crate::rng::{GOLDEN, mix64};
@@ -418,21 +418,21 @@ pub(crate) struct QuantNode {
 }
 
 impl QuantNode {
-    /// Quantize the tree's gradients (`params.num_grad_quant_bins` levels,
-    /// rounded per `params.stochastic_rounding` from the stream `seed`) and
+    /// Quantize the tree's gradients (`quantized.bins()` levels, rounded
+    /// per `quantized.stochastic_rounding()` from the stream `seed`) and
     /// build the root over `rows`. Returns the node, its dequantized
     /// statistics, and its dequantized histogram.
     pub(crate) fn root(
         ghist: &GHistIndex,
         gpair: &[GradPair],
         rows: &[u32],
-        params: &TrainingParams,
+        quantized: QuantizedGrad,
         seed: u64,
     ) -> (Self, GradStats, Vec<GradStats>) {
         let grads = Arc::new(QuantizedGradients::quantize(
             gpair,
-            params.num_grad_quant_bins,
-            params.stochastic_rounding,
+            quantized.bins(),
+            quantized.stochastic_rounding(),
             seed,
         ));
         let hist = grads.build(ghist, rows);

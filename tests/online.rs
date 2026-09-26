@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use hessboost::config::{BoosterKind, GrowPolicy};
+use hessboost::config::{BoosterKind, Dart, GrowPolicy};
 use hessboost::data::FeatureType;
 use hessboost::objective::{Logistic, Objective};
 use hessboost::prelude::*;
@@ -220,7 +220,10 @@ fn unsound_configurations_and_changes_are_refused() {
             "grow_policy",
         ),
         (
-            base().booster(BoosterKind::Dart).build().unwrap(),
+            base()
+                .booster(BoosterKind::Dart(Dart::default()))
+                .build()
+                .unwrap(),
             "booster",
         ),
         (

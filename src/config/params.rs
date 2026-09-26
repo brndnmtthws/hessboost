@@ -25,6 +25,16 @@ pub enum BoosterKind {
     /// column sampling, `num_parallel_tree > 1`, tree constraints, and
     /// training-matrix feature weights are refused with it.
     GbLinear,
+    /// Boulevard boosting for statistical inference (beyond XGBoost, opt-in):
+    /// every iteration's trees are averaged rather than summed, so the
+    /// ensemble converges to a kernel ridge regression with a central limit
+    /// theorem. `num_parallel_tree = 1` runs BRAT-D (Fang, Tan & Hooker,
+    /// NeurIPS 2025, Algorithm 1; Zhou & Hooker's Boulevard at
+    /// [`boulevard_dropout`](TrainingParams::boulevard_dropout) `= 0`), more
+    /// trees per iteration BRAT-P (Algorithm 2). Squared-error regression
+    /// only; see [`crate::inference`] for the trained model's confidence and
+    /// prediction intervals and the settings it refuses.
+    Boulevard,
 }
 
 /// Tree construction algorithm.
@@ -468,6 +478,22 @@ pub struct TrainingParams {
     /// Probability of skipping dropout in a round (DART). XGBoost `skip_drop`.
     pub skip_drop: f64,
 
+    // ---- Boulevard (beyond XGBoost, opt-in) ----
+    /// Dropout probability `p` in `[0, 1)` of `booster = boulevard` with one
+    /// tree per iteration (BRAT-D): each earlier tree is left out of a
+    /// round's residuals independently with probability `p`, and the kept
+    /// ones are still divided by the full tree count, so each new tree fits
+    /// more of the signal. `0` (the default) is Zhou & Hooker's Boulevard.
+    /// Must be `0` with any other booster and with `num_parallel_tree > 1`
+    /// (BRAT-P, which leaves one tree per round out instead).
+    pub boulevard_dropout: f64,
+    /// Truncation level `M > 0` of `booster = boulevard`: the ensemble part
+    /// subtracted from the labels in a round's residuals is clipped to
+    /// `[-M, M]` (the `Γ_M` of Fang, Tan & Hooker's convergence proof; on the
+    /// label scale, after the intercept). `0` (the default) disables it. Must
+    /// be `0` with any other booster.
+    pub boulevard_truncation: f64,
+
     // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
     /// Penalty `ι` subtracted from the loss change of a split on a feature the
     /// ensemble does not use yet (Herrmann et al., *Boosted Trees on a Diet*,
@@ -546,6 +572,8 @@ impl Default for TrainingParams {
             quant_train_renew_leaf: false,
             rate_drop: 0.0,
             skip_drop: 0.0,
+            boulevard_dropout: 0.0,
+            boulevard_truncation: 0.0,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
             missing: f64::NAN,
@@ -637,8 +665,8 @@ impl TrainingParams {
     ///
     /// The checks run in a fixed order (numeric ranges, reuse penalties,
     /// device, objective parameters, booster, tree shape, training modes,
-    /// tree options), so a configuration that breaks several rules always
-    /// reports the same one.
+    /// tree options, Boulevard), so a configuration that breaks several rules
+    /// always reports the same one.
     pub fn validate(&self) -> Result<()> {
         self.validate_ranges()?;
         self.validate_reuse_penalties()?;
@@ -657,7 +685,8 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
-        self.validate_tree_options()
+        self.validate_tree_options()?;
+        self.validate_boulevard()
     }
 
     /// Whether either reuse penalty (Trees-on-a-Diet) is on.
@@ -1006,6 +1035,116 @@ impl TrainingParams {
         )
     }
 
+    /// Ranges of the Boulevard options, and the settings `booster =
+    /// boulevard` refuses. Its inference ([`crate::inference`]) reads every
+    /// tree as a linear smoother of the round's residuals (a leaf predicts
+    /// `Σ z / (m + lambda)` over its `m` sampled rows), so the options that
+    /// make leaf values nonlinear in the labels (L1 leaves, clipped leaves,
+    /// monotone clipping, quantized gradients, linear or smoothed leaves),
+    /// that reweight rows by their residuals (gradient-based sampling), or
+    /// that change the loss are refused. Structure-only options (depth,
+    /// `min_child_weight`, `gamma`, column sampling, `extra_trees`,
+    /// interaction constraints, categorical splits) are accepted.
+    fn validate_boulevard(&self) -> Result<()> {
+        let dropout = self.boulevard_dropout;
+        ensure(
+            "boulevard_dropout",
+            dropout.is_finite() && (0.0..1.0).contains(&dropout),
+            format!("must be in [0, 1), got {dropout}"),
+        )?;
+        non_negative("boulevard_truncation", self.boulevard_truncation)?;
+        if self.booster != BoosterKind::Boulevard {
+            ensure(
+                "boulevard_dropout",
+                dropout == 0.0,
+                "is only used by `booster = boulevard`; must be 0",
+            )?;
+            return ensure(
+                "boulevard_truncation",
+                self.boulevard_truncation == 0.0,
+                "is only used by `booster = boulevard`; must be 0",
+            );
+        }
+        ensure(
+            "objective",
+            matches!(self.objective.as_str(), "reg:squarederror" | "reg:linear"),
+            format!(
+                "`booster = boulevard` supports `reg:squarederror` only, got `{}`",
+                self.objective
+            ),
+        )?;
+        if self.num_parallel_tree > 1 {
+            ensure(
+                "boulevard_dropout",
+                dropout == 0.0,
+                "BRAT-P (`num_parallel_tree > 1`) leaves one tree per round out instead of \
+                 dropping trees at random; must be 0",
+            )?;
+            ensure(
+                "eta",
+                self.eta == 1.0,
+                format!(
+                    "BRAT-P (`num_parallel_tree > 1`) has no learning rate; must be 1, got {}",
+                    self.eta
+                ),
+            )?;
+        } else {
+            ensure(
+                "eta",
+                self.eta <= 1.0,
+                format!(
+                    "Boulevard's learning rate must be in (0, 1], got {}",
+                    self.eta
+                ),
+            )?;
+        }
+        let nonlinear = "makes leaf values nonlinear in the labels, which Boulevard inference \
+                         cannot represent";
+        ensure(
+            "alpha",
+            self.alpha == 0.0,
+            format!("L1 regularization {nonlinear}; must be 0"),
+        )?;
+        ensure(
+            "max_delta_step",
+            self.effective_max_delta_step() == 0.0,
+            format!("clipping leaves {nonlinear}; must be 0"),
+        )?;
+        ensure(
+            "monotone_constraints",
+            self.monotone_constraints
+                .iter()
+                .all(|&m| m == Monotone::None),
+            format!("clipping leaves to monotone bounds {nonlinear}"),
+        )?;
+        ensure(
+            "use_quantized_grad",
+            !self.use_quantized_grad,
+            format!("quantized gradients {nonlinear}"),
+        )?;
+        ensure(
+            "linear_tree",
+            !self.linear_tree,
+            "linear leaves are not constant smoothers; Boulevard needs constant leaves",
+        )?;
+        ensure(
+            "path_smooth",
+            self.path_smooth == 0.0,
+            "smoothed leaves mix in their ancestors' rows; must be 0",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "gradient-based sampling reweights rows by their residuals; Boulevard needs uniform \
+             subsampling",
+        )?;
+        ensure(
+            "process_type",
+            self.process_type == ProcessType::Default,
+            "`update` refreshes existing trees; Boulevard models are grown in one run",
+        )
+    }
+
     /// The `max_delta_step` in effect: the configured value, or XGBoost's
     /// default when unset ([`default_max_delta_step`]).
     pub(crate) fn effective_max_delta_step(&self) -> f64 {
@@ -1322,6 +1461,10 @@ impl TrainingParamsBuilder {
         rate_drop, f64);
     setter!(/// Set the DART dropout-skip probability (`skip_drop`).
         skip_drop, f64);
+    setter!(/// Set Boulevard's BRAT-D dropout probability (`boulevard_dropout`).
+        boulevard_dropout, f64);
+    setter!(/// Set Boulevard's residual truncation level (`boulevard_truncation`, `0` = off).
+        boulevard_truncation, f64);
     setter!(/// Set the Tweedie variance power (`tweedie_variance_power`).
         tweedie_variance_power, f64);
     setter!(/// Set the pseudo-Huber slope (`huber_slope`).

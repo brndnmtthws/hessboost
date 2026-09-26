@@ -343,15 +343,27 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
         return Ok(None);
     }
 
+    let rounds = u.int_in_range(1..=MAX_ROUNDS)?;
+    let early_stopping = if u.arbitrary()? {
+        Some(u.int_in_range(1..=2)?)
+    } else {
+        None
+    };
+    // Drawn last so earlier seeds keep their meaning; exhausted input
+    // (`ratio` then answers true) keeps the booster drawn above.
+    if !u.ratio(3, 4)? {
+        params.booster = BoosterKind::Boulevard;
+        params.boulevard_dropout = param(u, &[0.0, 0.5, 0.9])?;
+        params.boulevard_truncation = param(u, &[0.0, 1.0])?;
+        if params.validate().is_err() {
+            return Ok(None);
+        }
+    }
     Ok(Some(Case {
         params,
         dtrain,
-        rounds: u.int_in_range(1..=MAX_ROUNDS)?,
-        early_stopping: if u.arbitrary()? {
-            Some(u.int_in_range(1..=2)?)
-        } else {
-            None
-        },
+        rounds,
+        early_stopping,
     }))
 }
 

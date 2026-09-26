@@ -55,6 +55,8 @@
 //!   `CustomObjective`, [`objective::distributional`] (`dist:*` objectives).
 //! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
+//! - [`inference`]: Boulevard boosting's confidence and prediction intervals
+//!   for `f(x)` and its variable-importance test.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
 //!
@@ -100,6 +102,13 @@
 //! - **Beyond XGBoost (opt-in, default training unchanged):**
 //!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);
+//!   - Boulevard boosting (Zhou & Hooker, JMLR 2022) and its dropout
+//!     (BRAT-D) and parallel (BRAT-P) variants (Fang, Tan & Hooker, NeurIPS
+//!     2025) with CLT-based confidence intervals for `f(x)`, prediction and
+//!     reproduction intervals, a chi-squared variable-importance test, an
+//!     honest leaf refit, and exact or Nyström variance
+//!     ([`BoosterKind::Boulevard`](config::BoosterKind::Boulevard),
+//!     [`inference`]);
 //!   - CatBoost-style ordered target statistics ([`data::target_stats`]);
 //!   - LightGBM options `extra_trees`, `path_smooth`, `linear_tree` leaves
 //!     ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
@@ -131,9 +140,9 @@
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `ordered_target_stats`, `pfn_boost`, `metal`
-//! with `--features metal` on macOS). Run one with
+//! `custom_objective`, `constraints`, `conformal`, `boulevard_inference`,
+//! `compact_model`, `distributional`, `budget`, `ordered_target_stats`,
+//! `pfn_boost`, `metal` with `--features metal` on macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -173,6 +182,7 @@ pub mod config;
 pub mod conformal;
 pub mod data;
 pub mod error;
+pub mod inference;
 pub mod metric;
 pub mod model;
 pub mod objective;

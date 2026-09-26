@@ -13,7 +13,9 @@
 //! per node field across all trees (`node.*`), split per tree by
 //! `tree.node_count`, plus per-tree category pools, leaf vectors and leaf
 //! linear models. `model.writer` (optional, not `REQUIRED`, never read back)
-//! names the release that wrote the file, e.g. `hessboost 0.2.0`.
+//! names the release that wrote the file, e.g. `hessboost 0.2.0`. A
+//! Boulevard fit adds the `boulevard.*` sections of its
+//! [`BoulevardInfo`] (not `REQUIRED`: predictions do not read them).
 //!
 //! The reader is strict about everything it knows: `node.flags` bits it
 //! does not define, `tree.has_linear` bytes other than 0 and 1, and bytes
@@ -46,6 +48,7 @@ use super::sections::{Sections, Writer, format_error, wrong_length};
 use super::{BoostedModel, LinearModel};
 use crate::config::{AftDistribution, DistGradient, DistSplitDirection, ObjectiveParams};
 use crate::error::Result;
+use crate::inference::BoulevardInfo;
 use crate::objective::distributional::DistFamily;
 use crate::tree::linear::LinearLeaves;
 use crate::tree::{Node, RegTree};
@@ -109,7 +112,65 @@ const KNOWN: &[&str] = &[
     "leaf_linear.intercepts",
     "leaf_linear.features",
     "leaf_linear.coeffs",
+    "boulevard.dropout",
+    "boulevard.learning_rate",
+    "boulevard.subsample",
+    "boulevard.reg_lambda",
+    "boulevard.truncation",
+    "boulevard.seed",
+    "boulevard.intercept_from_labels",
 ];
+
+/// The `boulevard.*` sections of a Boulevard model ([`BoulevardInfo`]),
+/// all written together. Not `REQUIRED`: predictions do not read them, so a
+/// reader that predates them loads the model as a plain `gbtree` ensemble.
+fn write_boulevard(w: &mut Writer, info: &BoulevardInfo) {
+    w.f64("boulevard.dropout", info.dropout);
+    w.f64("boulevard.learning_rate", info.learning_rate);
+    w.f64("boulevard.subsample", info.subsample);
+    w.f64("boulevard.reg_lambda", info.reg_lambda);
+    w.f64("boulevard.truncation", info.truncation);
+    w.u64("boulevard.seed", info.seed);
+    w.u64(
+        "boulevard.intercept_from_labels",
+        u64::from(info.intercept_from_labels),
+    );
+}
+
+/// The [`BoulevardInfo`] of the `boulevard.*` sections: `None` when the file
+/// has none of them (every model that is not a Boulevard fit, and files
+/// written before they existed), an error when only some are present.
+fn read_boulevard(s: &Sections) -> Result<Option<BoulevardInfo>> {
+    if !s.has("boulevard.dropout") {
+        if let Some(name) = KNOWN
+            .iter()
+            .find(|name| name.starts_with("boulevard.") && s.has(name))
+        {
+            return Err(format_error(format!(
+                "`{name}` without `boulevard.dropout`"
+            )));
+        }
+        return Ok(None);
+    }
+    let intercept_from_labels = match s.u64("boulevard.intercept_from_labels")? {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(format_error(format!(
+                "`boulevard.intercept_from_labels` must be 0 or 1, got {other}"
+            )));
+        }
+    };
+    Ok(Some(BoulevardInfo {
+        dropout: s.f64("boulevard.dropout")?,
+        learning_rate: s.f64("boulevard.learning_rate")?,
+        subsample: s.f64("boulevard.subsample")?,
+        reg_lambda: s.f64("boulevard.reg_lambda")?,
+        truncation: s.f64("boulevard.truncation")?,
+        seed: s.u64("boulevard.seed")?,
+        intercept_from_labels,
+    }))
+}
 
 /// The `objective.*` sections [`write_objective_params`] writes, shared by
 /// the native and compact formats.
@@ -182,6 +243,9 @@ fn write_model_sections(w: &mut Writer, m: &BoostedModel) {
         );
     }
     write_objective_params(w, &m.objective_params);
+    if let Some(info) = &m.boulevard {
+        write_boulevard(w, info);
+    }
 }
 
 /// The trees, column-wise: `tree.*` per-tree arrays, `node.*` per-node
@@ -402,6 +466,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
+        boulevard: read_boulevard(&s)?,
         compact: OnceLock::new(),
     })
 }
@@ -991,6 +1056,7 @@ mod tests {
             tree_weights: Vec::new(),
             num_parallel_tree: 1,
             linear: Some(LinearModel::new(vec![0.0; n_features], vec![0.0])),
+            boulevard: None,
             compact: OnceLock::new(),
         })
         .unwrap()

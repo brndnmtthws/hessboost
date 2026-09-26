@@ -8,44 +8,57 @@ use crate::train::{Failure, run_hooked};
 use hessboost::training::online::{self, OnlineParams};
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 /// `(nodes_kept, subtrees_regrown, rows_refreshed)`.
 type Report = (usize, usize, usize);
 
 /// A model with its training data and update state. The one class with
 /// mutable state: an update changes it in place (copying the per-node
-/// histograms would cost more than the update), under a mutex that is only
-/// ever locked detached, so an update's callback can re-attach while another
-/// thread waits for it.
+/// histograms would cost more than the update) under a mutex that is never
+/// waited for: while an update holds it (its callback included), reading
+/// the model or data and starting another update fail fast instead of
+/// deadlocking on it. The row count and tolerance are readable throughout.
 #[pyclass(frozen, module = "hessboost._hessboost")]
 pub struct OnlineModel {
     state: Mutex<online::OnlineModel>,
+    /// The committed data's row count.
+    rows: AtomicUsize,
+    tolerance: f64,
 }
 
 impl OnlineModel {
     fn new(online: online::OnlineModel) -> Self {
         Self {
+            rows: AtomicUsize::new(online.data().n_rows()),
+            tolerance: online.online_params().tolerance,
             state: Mutex::new(online),
         }
     }
 
-    /// `read` of the state, detached. A poisoned lock (a panic mid-update)
-    /// leaves the state unknown, so it is refused from then on.
+    /// The state, unless an update holds it. A poisoned lock (a panic
+    /// mid-update) leaves the state unknown, so it is refused from then on.
+    fn try_state(&self) -> PyResult<MutexGuard<'_, online::OnlineModel>> {
+        self.state.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => refuse(
+                "the online model is being updated (from another thread or this update's \
+                 callback); its model, data and updates are available once the update returns",
+            ),
+            TryLockError::Poisoned(_) => {
+                refuse("an earlier update of this online model panicked; its state is unknown")
+            }
+        })
+    }
+
+    /// `read` of the state, detached.
     fn with<T: Send>(
         &self,
         py: Python<'_>,
         read: impl FnOnce(&online::OnlineModel) -> T + Send,
     ) -> PyResult<T> {
-        py.detach(|| {
-            let state = self.state.lock().map_err(|_| poisoned())?;
-            Ok(read(&state))
-        })
+        py.detach(|| Ok(read(&*self.try_state()?)))
     }
-}
-
-fn poisoned() -> PyErr {
-    refuse("an earlier update of this online model panicked; its state is unknown")
 }
 
 #[pymethods]
@@ -62,7 +75,7 @@ impl OnlineModel {
     ) -> PyResult<Self> {
         let online = OnlineParams::with_tolerance(tolerance);
         let failure = Failure::default();
-        let trained = run_hooked(py, None, &failure, |hook| {
+        let trained = run_hooked(py, None, &failure, |hook, _gate| {
             online::OnlineModel::train_with(
                 &params.inner,
                 &dtrain.inner,
@@ -100,7 +113,9 @@ impl OnlineModel {
     /// Adds `additions`' rows and deletes the rows `deletions`, calling
     /// `on_round(iteration, scores) -> stop` after every updated iteration.
     /// Returns `None` when `on_round` stopped the update, which then changed
-    /// nothing, as does an exception or `KeyboardInterrupt` (re-raised).
+    /// nothing, as does an exception or `KeyboardInterrupt` (re-raised): the
+    /// update is applied only once the caller has checked for signals after
+    /// the last iteration.
     #[pyo3(signature = (additions, deletions, on_round=None))]
     fn update(
         &self,
@@ -118,16 +133,25 @@ impl OnlineModel {
             .collect::<PyResult<Vec<_>>>()?;
         let additions = additions.map(|matrix| &matrix.inner);
         let failure = Failure::default();
-        let (result, stopped) = run_hooked(py, on_round, &failure, |mut hook| {
-            let Ok(mut state) = self.state.lock() else {
-                return (Err(poisoned()), false);
+        let (result, stopped) = run_hooked(py, on_round, &failure, |mut hook, gate| {
+            let mut state = match self.try_state() {
+                Ok(state) => state,
+                Err(error) => return (Err(error), false),
             };
             let mut stopped = false;
-            let result = state.update_with(additions, &deletions, |round| {
-                let flow = hook(round);
-                stopped |= flow.is_break();
-                flow
-            });
+            let result = state.update_with_commit(
+                additions,
+                &deletions,
+                |round| {
+                    let flow = hook(round);
+                    stopped |= flow.is_break();
+                    flow
+                },
+                || gate.confirm(),
+            );
+            if result.is_ok() {
+                self.rows.store(state.data().n_rows(), Ordering::Relaxed);
+            }
             (result.or_raise(), stopped)
         })?;
         if stopped {
@@ -156,12 +180,12 @@ impl OnlineModel {
     }
 
     #[getter]
-    fn num_row(&self, py: Python<'_>) -> PyResult<usize> {
-        self.with(py, |state| state.data().n_rows())
+    fn num_row(&self) -> usize {
+        self.rows.load(Ordering::Relaxed)
     }
 
     #[getter]
-    fn tolerance(&self, py: Python<'_>) -> PyResult<f64> {
-        self.with(py, |state| state.online_params().tolerance)
+    fn tolerance(&self) -> f64 {
+        self.tolerance
     }
 }

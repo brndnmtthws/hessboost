@@ -74,8 +74,8 @@
 //!   ([`DMatrix::with_feature_weights`](data::DMatrix::with_feature_weights)).
 //! - **Objectives:** regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
-//!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
-//!   `survival:aft` on censored bounds), plus a custom hook
+//!   and multiclass, counts, LambdaMART and XE-NDCG ranking, survival
+//!   (`survival:cox`, `survival:aft` on censored bounds), plus a custom hook
 //!   ([`Trainer::objective`](training::Trainer::objective)).
 //! - **Multi-output:** label matrices
 //!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
@@ -106,6 +106,9 @@
 //!     [`path_smooth`](config::TrainingParams::path_smooth),
 //!     [`linear_tree`](config::TrainingParams::linear_tree),
 //!     [`LinearLeaves`](tree::LinearLeaves));
+//!   - LightGBM XE-NDCG (`rank:xendcg`) and query-level bagging
+//!     ([`config::TrainingParams::bagging_by_query`]); XE-NDCG uses keyed per-round
+//!     draws distinct from LightGBM's RNG stream.
 //!   - CatBoost-style symmetric trees
 //!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), routed by
 //!     bit pattern in batch prediction;
@@ -130,11 +133,11 @@
 //!     elsewhere [`backend::metal`] is a stub.
 //!
 //! `examples/` has one program per topic (`train_regression`,
-//! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `ordered_target_stats`, `pfn_boost`, `metal`
-//! with `--features metal` on macOS). Run one with
-//! `cargo run --release --example binary_classification`.
+//! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
+//! `model_io`, `custom_objective`, `constraints`, `conformal`,
+//! `compact_model`, `distributional`, `budget`, `ordered_target_stats`,
+//! `pfn_boost`, and `metal` with `--features metal` on macOS). Run one with
+//! `cargo run --release --example rank_xendcg`.
 //!
 //! ## Compatibility notes
 //!

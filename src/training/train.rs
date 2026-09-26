@@ -846,6 +846,22 @@ fn validate_request(request: &TrainRequest, objective: &dyn Objective) -> Result
         ));
     }
 
+    if params.bagging_by_query {
+        let Some(group) = dtrain.group() else {
+            return Err(HessboostError::invalid_param(
+                "bagging_by_query",
+                "requires query group sizes on the training dataset",
+            ));
+        };
+        if !group.partitions(dtrain.n_rows())
+            || group.iter_ranges().any(|(start, end)| start == end)
+        {
+            return Err(HessboostError::invalid_param(
+                "bagging_by_query",
+                "requires non-empty query groups covering all training rows",
+            ));
+        }
+    }
     if objective.requires_labels() && dtrain.labels().is_none() {
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
     }
@@ -942,7 +958,7 @@ fn refresh_round(
     let parallel = params.num_parallel_tree;
     // Gradients from the already refreshed iterations; iteration `i`'s trees
     // are then refreshed in place, output by output.
-    objective.gradient_info(&state.margins.train, info, &mut state.gpair);
+    objective.gradient_info_at(&state.margins.train, info, &mut state.gpair, iteration);
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
     let per_iteration = n_out * parallel;
     for slot in 0..per_iteration {
@@ -990,7 +1006,13 @@ fn grow_round(
 
     // 2. Uniform row subsets, drawn before the trees and shared across the
     //    per-output fits.
-    let row_subsets = iteration_row_subsets(n, params, prepared.samples_per_forest(), &mut rng);
+    let row_subsets = iteration_row_subsets(
+        n,
+        params,
+        prepared.samples_per_forest(),
+        dtrain.group(),
+        &mut rng,
+    );
     // An output's gradient-based sample, when its whole forest shares one.
     let mut forest_sample = None;
     let forest_indices = prepared.forest_indices(n_out, parallel);
@@ -1610,13 +1632,13 @@ pub(super) fn round_gradients(
         objective,
     } = *run;
     if params.booster != BoosterKind::Dart {
-        objective.gradient_info(margin, info, gpair);
+        objective.gradient_info_at(margin, info, gpair, iteration);
         return (round_rng(params, iteration, 0), None);
     }
     let mut rng = round_rng(params, iteration, DART_SALT);
     let (dropped, drop_indices) = select_dropout(model, params, &mut rng);
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
-    objective.gradient_info(&margin_excl, info, gpair);
+    objective.gradient_info_at(&margin_excl, info, gpair, iteration);
     (rng, Some(drop_indices))
 }
 
@@ -1891,6 +1913,7 @@ pub(super) fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
     per_forest: bool,
+    group: Option<&crate::data::GroupInfo>,
     rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
     let uniform = params.subsample < 1.0 && params.sampling_method == SamplingMethod::Uniform;
@@ -1899,7 +1922,67 @@ pub(super) fn iteration_row_subsets(
     } else {
         params.num_parallel_tree
     };
-    (0..draws).map(|_| sample_rows(n, params, rng)).collect()
+    (0..draws)
+        .map(|_| {
+            if params.bagging_by_query {
+                let ranges = group.map_or_else(|| vec![(0, n)], |g| g.iter_ranges().collect());
+                let queries = sample_rows(ranges.len(), params, rng);
+                queries
+                    .into_iter()
+                    .flat_map(|query| {
+                        let (start, end) = ranges[query as usize];
+                        start as u32..end as u32
+                    })
+                    .collect()
+            } else {
+                sample_rows(n, params, rng)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod query_bagging_tests {
+    use super::*;
+    use crate::config::TrainingParams;
+    use crate::data::GroupInfo;
+
+    #[test]
+    fn group_subset_is_indivisible_and_thread_count_independent() {
+        let group_sizes = vec![3, 7, 2, 8, 4, 5, 6];
+        let group = GroupInfo::from_sizes(&group_sizes);
+        let n: usize = group_sizes.iter().sum();
+        let params = TrainingParams::builder()
+            .objective("rank:ndcg")
+            .bagging_by_query(true)
+            .subsample(0.5)
+            .seed(17)
+            .build()
+            .unwrap();
+        let select = |threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                iteration_row_subsets(n, &params, false, Some(&group), &mut Rng::new(41))
+            })
+        };
+        let one = select(1);
+        let many = select(4);
+        assert_eq!(one, many);
+        let selected = &one[0];
+        for (query, (start, end)) in group.iter_ranges().enumerate() {
+            let included = selected
+                .iter()
+                .filter(|&&row| (start..end).contains(&(row as usize)))
+                .count();
+            assert!(
+                included == 0 || included == end - start,
+                "query {query} split"
+            );
+        }
+    }
 }
 
 /// Whether trees are grown on gradient-based (MVS) row samples.
@@ -1908,7 +1991,6 @@ pub(super) fn gradient_sampling(params: &TrainingParams) -> bool {
 }
 
 /// Shape and metadata checks for the training matrix and every eval set,
-/// followed by the objective's own [`validate_info`] label-domain checks.
 ///
 /// [`validate_info`]: crate::objective::Objective::validate_info
 pub(crate) fn validate_dataset(

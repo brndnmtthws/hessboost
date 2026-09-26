@@ -17,6 +17,7 @@ mod quantile;
 mod ranking;
 mod regression;
 mod survival;
+mod xendcg;
 
 pub use absolute::AbsoluteError;
 pub use classification::{Hinge, Logistic};
@@ -26,6 +27,7 @@ pub use multiclass::Softmax;
 pub use quantile::{Expectile, Quantile};
 pub use ranking::LambdaMart;
 pub use regression::{PseudoHuber, SquaredError, SquaredLogError};
+pub use xendcg::Xendcg;
 
 pub(crate) use quantile::validate_alphas;
 
@@ -277,6 +279,18 @@ pub trait Objective: Send + Sync {
     ) {
         self.gradient(preds, labels, weights, out);
     }
+    /// Grouped gradient hook with the absolute boosting iteration. This lets
+    fn gradient_grouped_at(
+        &self,
+        preds: &[f32],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        group: Option<&crate::data::GroupInfo>,
+        out: &mut [GradPair],
+        _iteration: usize,
+    ) {
+        self.gradient_grouped(preds, labels, weights, group, out);
+    }
 
     /// Compute gradients from a dataset's full metadata view.
     ///
@@ -286,6 +300,16 @@ pub trait Objective: Send + Sync {
     /// row) override it.
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
         self.gradient_grouped(preds, info.labels, info.weights, info.group, out);
+    }
+    /// Metadata-aware gradient hook with the absolute boosting iteration.
+    fn gradient_info_at(
+        &self,
+        preds: &[f32],
+        info: &MetaInfo,
+        out: &mut [GradPair],
+        _iteration: usize,
+    ) {
+        self.gradient_info(preds, info, out);
     }
 
     /// Whether the Hessian is constant across margins (XGBoost
@@ -581,6 +605,7 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         "rank:pairwise" => Box::new(LambdaMart::pairwise(params.lambdarank_num_pair_per_sample)),
         "rank:ndcg" => Box::new(LambdaMart::ndcg(params.lambdarank_num_pair_per_sample)),
         "rank:map" => Box::new(LambdaMart::map(params.lambdarank_num_pair_per_sample)),
+        "rank:xendcg" => Box::new(Xendcg::new(params.seed)),
         "survival:cox" => Box::new(Cox),
         "survival:aft" => Box::new(Aft::new(
             params.aft_loss_distribution,

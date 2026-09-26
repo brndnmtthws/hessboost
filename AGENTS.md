@@ -81,11 +81,10 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams|
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, parameter enums, `ObjectiveParams`|
-|`objective/`|files by XGBoost family; `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`)|
-|`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
+|`objective/`|files by XGBoost family; `ranking` (LambdaMART), `xendcg` (LightGBM XE-NDCG; query RNG differs), `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based and query-level), `continuation`, `refresh`, `cv`, `budget` (public)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
@@ -238,7 +237,8 @@ Easy-to-miss requirements: multiclass needs `.num_class(k)`; ranking needs
 `survival:cox` reads non-positive labels as right-censored;
 `Objective::split_gradient` serves vector-leaf trees only, not with
 monotone constraints. Linear-leaf models predict through `tree::linear`;
-XGBoost export, SHAP, and compact refuse them.
+XE-NDCG uses hessboost's own per-query RNG stream; query bagging requires
+ranking groups and uniform sampling.
 
 ## When changing behavior
 

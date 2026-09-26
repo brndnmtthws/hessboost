@@ -1415,10 +1415,10 @@ impl TrainingParams {
         }
         ensure(
             "objective",
-            matches!(self.objective.as_str(), "reg:squarederror" | "reg:linear"),
+            matches!(self.objective, Objective::SquaredError),
             format!(
                 "`ebm_boulevard` supports `reg:squarederror` only, got `{}`",
-                self.objective
+                self.objective.name()
             ),
         )?;
         ensure(

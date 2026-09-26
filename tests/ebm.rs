@@ -6,6 +6,7 @@ use hessboost::data::FeatureType;
 use hessboost::ebm::TermAxis;
 use hessboost::ebm::shape_functions;
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
+use hessboost::objective::Objective;
 use hessboost::prelude::*;
 use std::ops::ControlFlow;
 
@@ -210,7 +211,7 @@ fn unsupported_combinations_are_refused() {
         "interaction_constraints"
     );
     assert_eq!(
-        refused(boulevard().objective("binary:logistic")),
+        refused(boulevard().objective(Objective::SquaredLogError)),
         "objective"
     );
     assert_eq!(refused(boulevard().ebm_outer_bags(2)), "ebm_outer_bags");

@@ -477,6 +477,7 @@ struct SerializedBoostedModel<'a> {
     linear: &'a Option<LinearModel>,
     shrinkage: &'a Option<Shrinkage>,
     boulevard: &'a Option<BoulevardInfo>,
+    ebm: &'a Option<EbmInfo>,
 }
 
 impl Serialize for BoostedModel {
@@ -499,6 +500,7 @@ impl Serialize for BoostedModel {
             linear: &self.linear,
             shrinkage: &self.shrinkage,
             boulevard: &self.boulevard,
+            ebm: &self.ebm,
         }
         .serialize(serializer)
     }

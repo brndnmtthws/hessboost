@@ -541,6 +541,33 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
     if params.device != Device::Cpu {
         return refuse("device", "device = cpu");
     }
+    // Every other setting, including any added later, stays at its default:
+    // a new training option is refused until it is shown sound here.
+    let reference = TrainingParams {
+        booster: params.booster,
+        nthread: params.nthread,
+        seed: params.seed,
+        device: params.device,
+        objective: params.objective.clone(),
+        base_score: params.base_score,
+        eval_metric: params.eval_metric.clone(),
+        eta: params.eta,
+        gamma: params.gamma,
+        max_depth: params.max_depth,
+        min_child_weight: params.min_child_weight,
+        max_delta_step: params.max_delta_step,
+        lambda: params.lambda,
+        alpha: params.alpha,
+        tree_method: params.tree_method,
+        max_bin: params.max_bin,
+        multi_strategy: params.multi_strategy,
+        ..TrainingParams::default()
+    };
+    params.refuse_changes_from(
+        &reference,
+        "params",
+        "in-place updates support only the settings they are proven sound for",
+    )?;
     // Exhaustive, so a new objective has to be classified here.
     let per_row_newton = match &params.objective {
         Objective::SquaredError

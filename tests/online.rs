@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 
 use hessboost::config::{BoosterKind, Dart, GrowPolicy};
 use hessboost::data::FeatureType;
-use hessboost::objective::{Logistic, Objective};
+use hessboost::objective::{CustomLoss, GradPair, Logistic, Objective};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
 use hessboost::training::online::{OnlineModel, OnlineParams};
@@ -232,6 +232,21 @@ fn unsound_configurations_and_changes_are_refused() {
         ),
         (
             base().objective(Objective::AbsoluteError).build().unwrap(),
+            "objective",
+        ),
+        (
+            base()
+                .objective(Objective::custom(CustomLoss::new(
+                    "custom:sqerr",
+                    1,
+                    |p, y, _w, out| {
+                        for (o, (p, y)) in out.iter_mut().zip(p.iter().zip(y)) {
+                            *o = GradPair::new(p - y, 1.0);
+                        }
+                    },
+                )))
+                .build()
+                .unwrap(),
             "objective",
         ),
     ] {

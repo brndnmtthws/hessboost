@@ -86,9 +86,10 @@
 //!
 //! # Interruption
 //!
-//! [`OnlineModel::update_with`] calls a per-iteration hook as
-//! [`Trainer::on_round`] does; breaking abandons the update and leaves the
-//! model, data and state unchanged.
+//! [`OnlineModel::train_with`] and [`OnlineModel::update_with`] call a
+//! per-iteration hook as [`Trainer::on_round`] does. Breaking stops
+//! training after the iteration (as it stops [`Trainer`]) and abandons an
+//! update, leaving the model, data and state unchanged.
 //!
 //! # Example
 //!
@@ -220,8 +221,31 @@ impl OnlineModel {
         num_boost_round: usize,
         online: OnlineParams,
     ) -> Result<Self> {
+        Self::train_with(params, data, num_boost_round, online, |_| {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// [`Self::train`] calling `on_round` after every iteration, as
+    /// [`Trainer::on_round`] does: [`ControlFlow::Break`] stops training
+    /// after the iteration, and the online model keeps the iterations so
+    /// far (updates then retrain or update that many).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::train`].
+    pub fn train_with(
+        params: &TrainingParams,
+        data: &DMatrix,
+        num_boost_round: usize,
+        online: OnlineParams,
+        on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+    ) -> Result<Self> {
         check_supported(params, data, online)?;
-        let model = Trainer::new(params, data, num_boost_round).train()?.model;
+        let model = Trainer::new(params, data, num_boost_round)
+            .on_round(on_round)
+            .train()?
+            .model;
         Self::from_model(model, params, data, online)
     }
 

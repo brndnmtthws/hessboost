@@ -14,6 +14,12 @@ M3 Max it trains 2.3–2.8× faster than XGBoost on one thread and 1.4–1.6×
 faster on 16, with the same held-out scores. The only native dependency is
 libzstd.
 
+The name comes from the Hessian: like XGBoost, hessboost fits each tree to
+the loss's second derivatives as well as its gradients (Newton boosting).
+Without an L1 penalty (`alpha`) or a `max_delta_step` clamp, a leaf's weight
+is `w* = −G / (H + λ)`, where `G` and `H` sum its rows' gradients and
+Hessians and `λ` is the L2 penalty `lambda`.
+
 ## Why hessboost
 
 - **XGBoost-compatible.** Same parameter, objective, and metric names.

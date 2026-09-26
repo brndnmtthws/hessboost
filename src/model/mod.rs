@@ -19,7 +19,7 @@
 //! sub-model out of an iteration range with a step.
 //!
 //! A model trained with per-iteration model shrinkage
-//! ([`model_shrink_rate`](crate::config::TrainingParams::model_shrink_rate),
+//! ([`model_shrink`](crate::config::TrainingParams::model_shrink),
 //! SGLB) rescales its whole ensemble every iteration, so the first `k`
 //! iterations of it are not a prefix of its trees: `..k` ranges and
 //! [`BoostedModel::slice`]`(..k, 1)` rebuild the model after `k` iterations
@@ -1248,7 +1248,7 @@ impl BoostedModel {
     /// model has no boosting iterations to select and accepts only `..`.
     ///
     /// For a model trained with model shrinkage
-    /// ([`TrainingParams::model_shrink_rate`](crate::config::TrainingParams::model_shrink_rate)),
+    /// ([`TrainingParams::model_shrink`](crate::config::TrainingParams::model_shrink)),
     /// `..n` is the model after `n` iterations, rebuilt exactly (bit for bit
     /// the predictions of the same training run stopped after `n` rounds):
     /// its trees reweighted by the shrinkage applied up to iteration `n` and

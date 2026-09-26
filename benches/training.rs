@@ -7,7 +7,10 @@ use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
-use hessboost::config::{BoosterKind, GrowPolicy, Monotone, MultiStrategy, TrainingParamsBuilder};
+use hessboost::config::{
+    BoosterKind, Dart, ExtraTrees, GrowPolicy, LinearTree, Monotone, MultiStrategy, QuantizedGrad,
+    TrainingParamsBuilder,
+};
 use hessboost::data::FeatureType;
 use hessboost::internals::{
     ColumnSampler, CpuBackend, GHistIndex, HistCuts, HistTreeBuilder, HistogramBackend, zeroed,
@@ -252,7 +255,7 @@ fn bench_hist_tree_build(c: &mut Criterion) {
         group.sample_size(if n >= 1_000_000 { 10 } else { 100 });
         let variants: &[bool] = if quantized { &[false, true] } else { &[false] };
         for &use_quantized_grad in variants {
-            let params = TrainingParams::builder()
+            let mut builder = TrainingParams::builder()
                 .max_depth(depth)
                 .grow_policy(if name == "lossguide" {
                     GrowPolicy::LossGuide
@@ -264,10 +267,11 @@ fn bench_hist_tree_build(c: &mut Criterion) {
                     vec![Monotone::Increasing]
                 } else {
                     Vec::new()
-                })
-                .use_quantized_grad(use_quantized_grad)
-                .build()
-                .unwrap();
+                });
+            if use_quantized_grad {
+                builder = builder.quantized(QuantizedGrad::default());
+            }
+            let params = builder.build().unwrap();
             let builder = HistTreeBuilder::new(&params);
             let id = if use_quantized_grad {
                 format!("{name}_quantized")
@@ -555,7 +559,7 @@ fn bench_binary_train(c: &mut Criterion) {
         b.iter(|| black_box(train(&scalar, &data, 50).unwrap()));
     });
     let mut quantized = params.clone();
-    quantized.use_quantized_grad = true;
+    quantized.quantized = Some(QuantizedGrad::default());
     group.bench_function("quantized", |b| {
         b.iter(|| black_box(train(&quantized, &data, 50).unwrap()));
     });
@@ -574,16 +578,17 @@ fn bench_train(c: &mut Criterion) {
         ("Hist_16bins", TreeMethod::Hist, 0.0, 16, false),
         ("Hist_quantized", TreeMethod::Hist, 0.0, 256, true),
     ] {
-        let params = TrainingParams::builder()
+        let mut builder = TrainingParams::builder()
             .objective(Objective::SquaredError)
             .tree_method(method)
             .max_depth(6)
             .eta(0.1)
             .alpha(alpha)
-            .max_bin(max_bin)
-            .use_quantized_grad(quantized)
-            .build()
-            .unwrap();
+            .max_bin(max_bin);
+        if quantized {
+            builder = builder.quantized(QuantizedGrad::default());
+        }
+        let params = builder.build().unwrap();
         group.bench_function(name, |b| {
             b.iter(|| train(&params, &data, 50).unwrap());
         });
@@ -1012,7 +1017,9 @@ fn bench_train_variants(c: &mut Criterion) {
         ),
         (
             "dart",
-            base().booster(BoosterKind::Dart).rate_drop(0.1),
+            base().booster(BoosterKind::Dart(
+                Dart::builder().rate_drop(0.1).build().unwrap(),
+            )),
             &data,
         ),
         ("csr", base(), &sparse),
@@ -1027,9 +1034,17 @@ fn bench_train_variants(c: &mut Criterion) {
             base().grow_policy(GrowPolicy::Symmetric),
             &data,
         ),
-        ("extra_trees", base().extra_trees(true), &data),
+        (
+            "extra_trees",
+            base().extra_trees(ExtraTrees::default()),
+            &data,
+        ),
         ("path_smooth", base().path_smooth(1.0), &data),
-        ("linear_tree", base().linear_tree(true), &data),
+        (
+            "linear_tree",
+            base().linear_tree(LinearTree::default()),
+            &data,
+        ),
         (
             "reuse_penalties",
             base().toad_penalty_feature(0.5).toad_penalty_threshold(0.1),

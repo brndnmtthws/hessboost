@@ -1344,7 +1344,7 @@ fn strict_nonnegative_integer_array(v: &Value, key: &str) -> Result<Vec<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BoosterKind, TrainingParams};
+    use crate::config::{BoosterKind, Dart, TrainingParams};
     use crate::data::{DMatrix, FeatureType};
     use crate::objective::{Aft, LambdaRank, Logistic, PseudoHuber, Tweedie};
     use crate::objective::{Objective, Quantiles};
@@ -1376,8 +1376,9 @@ mod tests {
     /// A DART model on `d` with non-unit tree weights.
     fn dart_model(d: &DMatrix) -> BoostedModel {
         let params = TrainingParams::builder()
-            .booster(BoosterKind::Dart)
-            .rate_drop(0.5)
+            .booster(BoosterKind::Dart(
+                Dart::builder().rate_drop(0.5).build().unwrap(),
+            ))
             .max_depth(3)
             .build()
             .unwrap();

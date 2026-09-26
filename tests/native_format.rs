@@ -9,7 +9,7 @@
 //! and commit the files it writes. Directories of earlier versions are never
 //! regenerated: they are what later versions must keep reading.
 
-use hessboost::config::{BoosterKind, MultiStrategy};
+use hessboost::config::{BoosterKind, Dart, LinearTree, MultiStrategy};
 use hessboost::data::FeatureType;
 use hessboost::model::compact::CompactModel;
 use hessboost::objective::distributional::{
@@ -149,7 +149,10 @@ fn incomplete_json_documents_are_refused() {
 
     // Linear leaves: a tree that has them must carry them, with all of
     // their parts (nothing else marks a linear-leaf tree).
-    let linear = trained_doc(&base().linear_tree(true).build().unwrap(), &matrix(1));
+    let linear = trained_doc(
+        &base().linear_tree(LinearTree::default()).build().unwrap(),
+        &matrix(1),
+    );
     let tree = linear["trees"]
         .as_array()
         .unwrap()
@@ -484,8 +487,9 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         (
             "dart",
             base()
-                .booster(BoosterKind::Dart)
-                .rate_drop(0.5)
+                .booster(BoosterKind::Dart(
+                    Dart::builder().rate_drop(0.5).build().unwrap(),
+                ))
                 .build()
                 .unwrap(),
             matrix(1),
@@ -518,7 +522,7 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         ),
         (
             "linear leaves",
-            base().linear_tree(true).build().unwrap(),
+            base().linear_tree(LinearTree::default()).build().unwrap(),
             matrix(1),
             |m| m.trees().iter().any(|t| t.linear_leaves().is_some()),
         ),

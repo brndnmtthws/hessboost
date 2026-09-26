@@ -6,11 +6,13 @@
 mod common;
 
 use hessboost::config::{
-    BoosterKind, ModelShrinkMode, Monotone, MultiStrategy, TrainingParamsBuilder,
+    BoosterKind, Dart, Langevin, LinearTree, ModelShrink, ModelShrinkMode, Monotone, MultiStrategy,
+    TrainingParamsBuilder,
 };
 use hessboost::objective::distributional::{DistFamily, Distributional};
 use hessboost::objective::{Logistic, Multiclass, Objective};
 use hessboost::prelude::*;
+use serde_json::json;
 
 /// `n` rows of a noisy regression target over four features (feature 3
 /// has missing values).
@@ -38,6 +40,15 @@ fn classification(n: usize, classes: usize) -> DMatrix {
         y.push(((score * classes as f32 / 1.8) as usize).min(classes - 1) as f32);
     }
     common::labeled_dense(&x, 4, &y)
+}
+
+/// Model shrinkage at `rate` in `mode`.
+fn shrink(rate: f64, mode: ModelShrinkMode) -> ModelShrink {
+    ModelShrink::builder()
+        .rate(rate)
+        .mode(mode)
+        .build()
+        .unwrap()
 }
 
 fn bits(values: &[f32]) -> Vec<u32> {
@@ -68,10 +79,13 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             base()
                 .tree_method(TreeMethod::Exact)
                 .objective(Objective::BinaryLogistic(Logistic::default()))
-                .langevin(true)
-                .diffusion_temperature(50.0)
-                .model_shrink_mode(ModelShrinkMode::Decreasing)
-                .model_shrink_rate(0.3)
+                .langevin(
+                    Langevin::builder()
+                        .diffusion_temperature(50.0)
+                        .build()
+                        .unwrap(),
+                )
+                .model_shrink(shrink(0.3, ModelShrinkMode::Decreasing))
                 .build()
                 .unwrap(),
             classification(300, 2),
@@ -101,7 +115,7 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             "shrinkage alone, boosted forest",
             base()
                 .tree_method(TreeMethod::Hist)
-                .model_shrink_rate(0.5)
+                .model_shrink(shrink(0.5, ModelShrinkMode::Constant))
                 .num_parallel_tree(2)
                 .subsample(0.7)
                 .build()
@@ -254,7 +268,7 @@ fn shrunk_models_refuse_non_prefix_selections() {
     let data = regression(100);
     let params = TrainingParams::builder()
         .max_depth(2)
-        .model_shrink_rate(0.1)
+        .model_shrink(shrink(0.1, ModelShrinkMode::Constant))
         .build()
         .unwrap();
     let model = train(&params, &data, 10).unwrap();
@@ -277,86 +291,88 @@ fn shrunk_models_refuse_non_prefix_selections() {
 fn unsupported_combinations_are_refused() {
     let refused = |builder: TrainingParamsBuilder| common::invalid_param(builder.build());
     let base = TrainingParams::builder;
+    let tempered = || {
+        Langevin::builder()
+            .diffusion_temperature(10.0)
+            .build()
+            .unwrap()
+    };
+    let constant = |rate| shrink(rate, ModelShrinkMode::Constant);
+    // Posterior sampling derives the temperature and the shrinkage.
     assert_eq!(
-        refused(base().posterior_sampling(true).diffusion_temperature(10.0)),
+        refused(base().posterior_sampling(true).langevin(tempered())),
         "diffusion_temperature"
     );
     assert_eq!(
-        refused(base().posterior_sampling(true).model_shrink_rate(0.01)),
+        refused(base().posterior_sampling(true).model_shrink(constant(0.01))),
         "model_shrink_rate"
-    );
-    assert_eq!(
-        refused(
-            base()
-                .posterior_sampling(true)
-                .model_shrink_mode(ModelShrinkMode::Decreasing)
-        ),
-        "model_shrink_mode"
-    );
-    // An explicit `langevin(false)` conflicts with posterior sampling, in
-    // either setter order (CatBoost: `Langevin.NotSet() || Langevin.Get()`).
-    assert_eq!(
-        refused(base().langevin(false).posterior_sampling(true)),
-        "langevin"
-    );
-    assert_eq!(
-        refused(base().posterior_sampling(true).langevin(false)),
-        "langevin"
     );
     assert!(
         base()
             .posterior_sampling(true)
-            .langevin(true)
+            .langevin(Langevin::default())
             .build()
             .is_ok()
     );
-    assert_eq!(
-        refused(base().diffusion_temperature(10.0)),
-        "diffusion_temperature"
-    );
-    assert_eq!(
-        refused(base().langevin(true).diffusion_temperature(0.0)),
-        "diffusion_temperature"
-    );
-    assert_eq!(refused(base().model_shrink_rate(-0.1)), "model_shrink_rate");
     // The constant coefficient 1 - rate * eta must stay positive.
     assert_eq!(
-        refused(base().eta(0.5).model_shrink_rate(2.0)),
+        refused(base().eta(0.5).model_shrink(constant(2.0))),
+        "model_shrink_rate"
+    );
+    let dart = BoosterKind::Dart(Dart::default());
+    assert_eq!(
+        refused(base().langevin(Langevin::default()).booster(dart)),
+        "langevin"
+    );
+    assert_eq!(
+        refused(base().model_shrink(constant(0.1)).booster(dart)),
         "model_shrink_rate"
     );
     assert_eq!(
-        refused(base().model_shrink_mode(ModelShrinkMode::Decreasing)),
+        refused(
+            base()
+                .model_shrink(constant(0.1))
+                .booster(BoosterKind::GbLinear)
+        ),
+        "model_shrink_rate"
+    );
+    for builder in [
+        base().num_parallel_tree(2),
+        base().monotone_constraints(vec![Monotone::Increasing]),
+        base().path_smooth(1.0),
+        base().linear_tree(LinearTree::default()),
+    ] {
+        assert_eq!(refused(builder.langevin(Langevin::default())), "langevin");
+    }
+    // The flat (XGBoost/Python) keys: dependent keys need their switch, and
+    // an explicit `langevin=false` conflicts with posterior sampling.
+    let flat = |pairs: &[(&str, serde_json::Value)]| {
+        common::invalid_param(TrainingParams::from_xgboost(pairs.iter().cloned()))
+    };
+    assert_eq!(
+        flat(&[("diffusion_temperature", json!(10.0))]),
+        "diffusion_temperature"
+    );
+    assert_eq!(
+        flat(&[("model_shrink_mode", json!("decreasing"))]),
         "model_shrink_mode"
     );
     assert_eq!(
-        refused(
-            base()
-                .model_shrink_mode(ModelShrinkMode::Decreasing)
-                .model_shrink_rate(1.0)
-        ),
-        "model_shrink_rate"
-    );
-    assert_eq!(
-        refused(base().langevin(true).booster(BoosterKind::Dart)),
+        flat(&[
+            ("posterior_sampling", json!(true)),
+            ("langevin", json!(false))
+        ]),
         "langevin"
     );
+    let round_trip = base()
+        .langevin(tempered())
+        .model_shrink(shrink(0.2, ModelShrinkMode::Decreasing))
+        .build()
+        .unwrap();
     assert_eq!(
-        refused(base().model_shrink_rate(0.1).booster(BoosterKind::GbLinear)),
-        "model_shrink_rate"
+        TrainingParams::from_xgboost(round_trip.to_xgboost().unwrap()).unwrap(),
+        round_trip
     );
-    assert_eq!(
-        refused(base().langevin(true).num_parallel_tree(2)),
-        "langevin"
-    );
-    assert_eq!(
-        refused(
-            base()
-                .langevin(true)
-                .monotone_constraints(vec![Monotone::Increasing])
-        ),
-        "langevin"
-    );
-    assert_eq!(refused(base().langevin(true).path_smooth(1.0)), "langevin");
 
     let data = regression(50);
     let params = base().posterior_sampling(true).build().unwrap();
@@ -396,8 +412,8 @@ fn langevin_continuation_matches_the_uninterrupted_run() {
     let data = regression(200);
     let params = TrainingParams::builder()
         .max_depth(3)
-        .langevin(true)
-        .model_shrink_rate(0.0)
+        .langevin(Langevin::default())
+        .model_shrink(shrink(0.0, ModelShrinkMode::Constant))
         .build()
         .unwrap();
     let first = train(&params, &data, 5).unwrap();

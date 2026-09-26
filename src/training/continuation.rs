@@ -128,7 +128,7 @@ pub(super) fn resume_model(
             ));
         }
     }
-    if params.process_type == ProcessType::Update {
+    if matches!(params.process_type, ProcessType::Update(_)) {
         check_update(init, params, num_boost_round)?;
     }
 
@@ -251,7 +251,6 @@ fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
         multi_strategy: p.multi_strategy,
         monotone_constraints: p.monotone_constraints,
         process_type: p.process_type,
-        refresh_leaf: p.refresh_leaf,
         tree_method: p.tree_method,
         max_depth: p.max_depth,
         max_leaves: p.max_leaves,
@@ -275,7 +274,7 @@ fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {
 
 /// Reject `process_type=update` without a model to update.
 pub(super) fn require_model_for_update(params: &TrainingParams) -> Result<()> {
-    if params.process_type == ProcessType::Update {
+    if matches!(params.process_type, ProcessType::Update(_)) {
         return Err(HessboostError::invalid_param(
             "process_type",
             "`update` refreshes an existing model; use Trainer::init_model",

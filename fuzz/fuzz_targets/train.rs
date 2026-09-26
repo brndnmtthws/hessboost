@@ -277,16 +277,15 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     // its meaning; `from_xgboost` refuses what `validate` would. The
     // objective parameters are drawn in place but set only when the
     // objective or the metric (drawn last) reads them, since `from_xgboost`
-    // refuses a key nothing reads.
+    // refuses a key nothing reads; likewise every option-group key is drawn
+    // but set only when its switch is on.
     let mut flat = Map::new();
     let mut objective_params: Vec<(&str, Value)> = Vec::new();
     let mut set = |key: &str, value: Value| {
         flat.insert(key.to_owned(), value);
     };
-    set(
-        "booster",
-        json!(*u.choose(&["gbtree", "dart", "gblinear"])?),
-    );
+    let booster = *u.choose(&["gbtree", "dart", "gblinear"])?;
+    set("booster", json!(booster));
     set("seed", json!(u.arbitrary::<u64>()?));
     set("objective", json!(objective));
     objective_params.push(("num_class", json!(num_class)));
@@ -345,17 +344,40 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
     );
     let multi_strategy = *u.choose(&["one_output_per_tree", "multi_output_tree"])?;
     set("multi_strategy", json!(multi_strategy));
-    set("extra_trees", json!(u.ratio(1, 6)?));
-    set("extra_seed", json!(u.arbitrary::<u64>()?));
+    let extra_trees = u.ratio(1, 6)?;
+    set("extra_trees", json!(extra_trees));
+    let extra_seed = u.arbitrary::<u64>()?;
+    if extra_trees {
+        set("extra_seed", json!(extra_seed));
+    }
     set("path_smooth", json!(param(u, &[0.0, 0.0, 1.0])?));
-    set("linear_tree", json!(u.ratio(1, 6)?));
-    set("linear_lambda", json!(param(u, &[0.0, 1.0])?));
-    set("use_quantized_grad", json!(u.ratio(1, 6)?));
-    set("num_grad_quant_bins", json!(u.int_in_range(0..=8)?));
-    set("stochastic_rounding", json!(u.arbitrary::<bool>()?));
-    set("quant_train_renew_leaf", json!(u.arbitrary::<bool>()?));
-    set("rate_drop", json!(param(u, &[0.0, 0.5, 1.0])?));
-    set("skip_drop", json!(param(u, &[0.0, 0.5, 1.0])?));
+    let linear_tree = u.ratio(1, 6)?;
+    set("linear_tree", json!(linear_tree));
+    let linear_lambda = param(u, &[0.0, 1.0])?;
+    if linear_tree {
+        set("linear_lambda", json!(linear_lambda));
+    }
+    let quantized = u.ratio(1, 6)?;
+    set("use_quantized_grad", json!(quantized));
+    let quantization = [
+        ("num_grad_quant_bins", json!(u.int_in_range(0..=8)?)),
+        ("stochastic_rounding", json!(u.arbitrary::<bool>()?)),
+        ("quant_train_renew_leaf", json!(u.arbitrary::<bool>()?)),
+    ];
+    if quantized {
+        for (key, value) in quantization {
+            set(key, value);
+        }
+    }
+    let dropout = [
+        ("rate_drop", json!(param(u, &[0.0, 0.5, 1.0])?)),
+        ("skip_drop", json!(param(u, &[0.0, 0.5, 1.0])?)),
+    ];
+    if booster == "dart" {
+        for (key, value) in dropout {
+            set(key, value);
+        }
+    }
     set("toad_penalty_feature", json!(param(u, &[0.0, 0.0, 1.0])?));
     set("toad_penalty_threshold", json!(param(u, &[0.0, 0.0, 1.0])?));
     if u.ratio(1, 4)? {

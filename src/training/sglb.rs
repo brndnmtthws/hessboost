@@ -80,7 +80,7 @@ impl Sglb {
                 "needs training rows to derive its temperature and shrink rate from",
             ));
         }
-        let rate = params.effective_model_shrink_rate(n_rows);
+        let (rate, mode) = params.effective_model_shrink(n_rows);
         if params.posterior_sampling && rate * params.eta >= 1.0 {
             return Err(HessboostError::invalid_param(
                 "posterior_sampling",
@@ -101,7 +101,7 @@ impl Sglb {
             }
         });
         let shrink = (rate > 0.0).then_some(Shrink {
-            mode: params.model_shrink_mode,
+            mode,
             rate,
             eta: params.eta,
         });

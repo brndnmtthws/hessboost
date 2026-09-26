@@ -1,7 +1,8 @@
 //! The gradient-boosting training loop.
 
 use crate::config::{
-    BoosterKind, Device, GrowPolicy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
+    BoosterKind, Dart, Device, GrowPolicy, ProcessType, Refresh, SamplingMethod, TrainingParams,
+    TreeMethod,
 };
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
@@ -213,7 +214,7 @@ impl Prepared {
         // draws its skip variate (`select_dropout` over an empty ensemble
         // draws nothing more), and `sample_rows` draws nothing under
         // gradient sampling.
-        let mut rng = if params.booster == BoosterKind::Dart {
+        let mut rng = if matches!(params.booster, BoosterKind::Dart(_)) {
             let mut rng = round_rng(params, 0, DART_SALT);
             let _skip = rng.f64();
             rng
@@ -469,7 +470,7 @@ impl<'a> Trainer<'a> {
     /// round is this run's first.
     ///
     /// A model trained with model shrinkage
-    /// ([`model_shrink_rate`](crate::config::TrainingParams::model_shrink_rate),
+    /// ([`model_shrink`](crate::config::TrainingParams::model_shrink),
     /// posterior sampling) is instead cut back to its best iteration, as
     /// CatBoost's `use_best_model` does: every later iteration rescaled the
     /// earlier ones, so the returned model is the one the run held after the
@@ -703,10 +704,9 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
     // `process_type=update` refreshes the model's own trees (re-appended one
     // iteration per round) instead of growing new ones, so it needs no
     // builder state.
-    let mut plan = if params.process_type == ProcessType::Update {
-        RoundPlan::Refresh(model.take_trees())
-    } else {
-        RoundPlan::Grow(prepare_builder(params, dtrain, objective.const_hess())?)
+    let mut plan = match params.process_type {
+        ProcessType::Update(refresh) => RoundPlan::Refresh(model.take_trees(), refresh),
+        _ => RoundPlan::Grow(prepare_builder(params, dtrain, objective.const_hess())?),
     };
     // Continued training numbers its rounds after the model's iterations, so
     // the per-round RNG streams continue where the earlier run stopped.
@@ -788,7 +788,9 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
                     &mut state.noisy_gpair,
                 )?;
             }
-            RoundPlan::Refresh(queue) => refresh_round(&run, queue, iteration, &mut state)?,
+            RoundPlan::Refresh(queue, refresh) => {
+                refresh_round(&run, queue, *refresh, iteration, &mut state)?;
+            }
             RoundPlan::Grow(prepared) => grow_round(&run, prepared, iteration, &mut state)?,
         }
         let mut stop = false;
@@ -949,7 +951,7 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     if params.booster == BoosterKind::GbLinear {
         reject_feature_weights(dtrain, "gblinear does not sample columns")?;
     }
-    if params.process_type == ProcessType::Update {
+    if matches!(params.process_type, ProcessType::Update(_)) {
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
 
@@ -986,11 +988,12 @@ struct RoundState<'a> {
 }
 
 /// `process_type=update`: refresh iteration `iteration`'s trees of `queue`
-/// output by output, from the gradients of the already refreshed ones, and
-/// re-append them.
+/// output by output with `refresh`'s options, from the gradients of the
+/// already refreshed ones, and re-append them.
 fn refresh_round(
     run: &TrainContext,
     queue: &mut [RegTree],
+    refresh: Refresh,
     iteration: usize,
     state: &mut RoundState,
 ) -> Result<()> {
@@ -1015,7 +1018,7 @@ fn refresh_round(
             &mut queue[iteration * per_iteration + slot],
             RegTree::with_root(0.0),
         );
-        refresh_tree(&mut tree, dtrain, gk, params, tree_eta(params));
+        refresh_tree(&mut tree, dtrain, gk, params, refresh, tree_eta(params));
         state.margins.add_tree(&tree, TreeOutput::Scalar(k), None);
         state.model.push_tree_weighted(tree, 1.0);
     }
@@ -1089,7 +1092,7 @@ fn grow_round(
                 Prepared::Hist {
                     rows_route_like_trees,
                     ..
-                } => (true, params.linear_tree && *rows_route_like_trees),
+                } => (true, params.linear_tree.is_some() && *rows_route_like_trees),
                 // The exact builder routes rows by their raw values, as
                 // prediction does.
                 Prepared::Exact(_) => (true, false),
@@ -1099,7 +1102,7 @@ fn grow_round(
                 && dropped.is_none()
                 && row_subset.len() == n
                 && !gradient_sampling(params)
-                && (!params.linear_tree || linear_rows);
+                && (params.linear_tree.is_none() || linear_rows);
             TreeSlot {
                 output: slot / parallel,
                 parallel: slot % parallel,
@@ -1434,8 +1437,8 @@ enum RoundPlan {
     /// Grow new trees with the prepared builder state.
     Grow(Prepared),
     /// `process_type=update`: refresh the queued trees of the initial model,
-    /// one iteration per round.
-    Refresh(Vec<RegTree>),
+    /// one iteration per round, with the refresh updater's options.
+    Refresh(Vec<RegTree>, Refresh),
 }
 
 /// The learning rate applied to each new tree: `eta / num_parallel_tree`
@@ -1676,12 +1679,12 @@ pub(super) fn round_gradients(
         objective,
         ..
     } = *run;
-    if params.booster != BoosterKind::Dart {
+    let BoosterKind::Dart(dart) = params.booster else {
         objective.gradient_info(margin, info, gpair);
         return (round_rng(params, iteration, 0), None);
-    }
+    };
     let mut rng = round_rng(params, iteration, DART_SALT);
-    let (dropped, drop_indices) = select_dropout(model, params, &mut rng);
+    let (dropped, drop_indices) = select_dropout(model, &dart, &mut rng);
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
     objective.gradient_info(&margin_excl, info, gpair);
     (rng, Some(drop_indices))
@@ -1694,18 +1697,14 @@ const DART_SALT: u64 = 0x0DA27;
 /// probability `skip_drop`, otherwise each tree independently with
 /// probability `rate_drop`, and at least one tree when any exist (as
 /// XGBoost). Returns the per-tree mask and the dropped indices.
-fn select_dropout(
-    model: &BoostedModel,
-    params: &TrainingParams,
-    rng: &mut Rng,
-) -> (Vec<bool>, Vec<usize>) {
+fn select_dropout(model: &BoostedModel, dart: &Dart, rng: &mut Rng) -> (Vec<bool>, Vec<usize>) {
     let existing = model.num_trees();
     let mut dropped = vec![false; existing];
     let mut drop_indices: Vec<usize> = Vec::new();
-    let skip = rng.f64() < params.skip_drop;
+    let skip = rng.f64() < dart.skip_drop();
     if !skip && existing > 0 {
         for (i, d) in dropped.iter_mut().enumerate() {
-            if rng.f64() < params.rate_drop {
+            if rng.f64() < dart.rate_drop() {
                 *d = true;
                 drop_indices.push(i);
             }
@@ -1918,8 +1917,10 @@ fn grow_sampled_tree(
         langevin.renew_leaves(&mut tree, TreeOutput::Scalar(slot.output), &at);
     }
     // LightGBM keeps the first iteration's trees constant.
-    if params.linear_tree && grow.iteration > 0 {
-        let lambda = params.linear_lambda;
+    if let Some(linear_tree) = params.linear_tree
+        && grow.iteration > 0
+    {
+        let lambda = linear_tree.lambda();
         if leaf_rows.is_empty() {
             crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, lambda);
         } else {
@@ -1938,7 +1939,7 @@ fn grow_sampled_tree(
 /// continued training resumes the same streams. Draws nothing unless
 /// `use_quantized_grad` is on, leaving the default RNG streams untouched.
 fn quantization_seed(params: &TrainingParams, rng: &mut Rng) -> u64 {
-    if params.use_quantized_grad {
+    if params.quantized.is_some() {
         rng.next_u64()
     } else {
         0
@@ -2118,6 +2119,7 @@ pub(super) fn make_column_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LinearTree;
     use crate::metric::{Metric, Rmse};
     use crate::objective::{
         Aft, CustomLoss, LambdaRank, Logistic, Multiclass, Objective, PseudoHuber,
@@ -2348,11 +2350,10 @@ mod tests {
             .unwrap();
         let params = TrainingParams::builder()
             .tree_method(TreeMethod::Hist)
-            .linear_tree(true)
+            .linear_tree(LinearTree::new(1.0).unwrap())
             .base_score(0.0)
             .eta(1.0)
             .lambda(1.0)
-            .linear_lambda(1.0)
             .max_depth(2)
             .build()
             .unwrap();
@@ -2753,8 +2754,9 @@ mod tests {
         let d = step_dataset(120);
         let params = TrainingParams::builder()
             .objective(Objective::SquaredError)
-            .booster(BoosterKind::Dart)
-            .rate_drop(0.1)
+            .booster(BoosterKind::Dart(
+                Dart::builder().rate_drop(0.1).build().unwrap(),
+            ))
             .max_depth(3)
             .eta(0.3)
             .build()

@@ -3,9 +3,12 @@
 //! and [`TrainingParams::to_xgboost`]. The Python bindings, the parity tests,
 //! and the training fuzz target all go through it.
 
+use super::groups::{
+    Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode, QuantizedGrad, Refresh,
+};
 use super::params::{
-    BoosterKind, Device, GrowPolicy, ModelShrinkMode, Monotone, MultiStrategy, ProcessType,
-    SamplingMethod, TrainingParams, TreeMethod,
+    BoosterKind, Device, GrowPolicy, Monotone, MultiStrategy, ProcessType, SamplingMethod,
+    TrainingParams, TreeMethod,
 };
 use crate::error::{HessboostError, Result};
 use crate::metric::{EvalMetric, XgboostMetricSource};
@@ -34,6 +37,23 @@ const FIXED: &[(&str, &str)] = &[
     ("max_cat_to_onehot", "4"),
     ("max_cat_threshold", "64"),
 ];
+
+/// XGBoost's `booster` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FlatBooster {
+    GbTree,
+    Dart,
+    GbLinear,
+}
+
+/// XGBoost's `process_type` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FlatProcess {
+    Default,
+    Update,
+}
 
 /// A key that is present, with a value that may itself be `null` only
 /// where the type is an `Option` (plain `Option` fields would read `null`
@@ -64,7 +84,7 @@ macro_rules! flat_params {
 }
 
 flat_params! {
-    booster: BoosterKind,
+    booster: FlatBooster,
     nthread: usize,
     seed: u64,
     device: Device,
@@ -102,7 +122,7 @@ flat_params! {
     num_parallel_tree: usize,
     sampling_method: SamplingMethod,
     multi_strategy: MultiStrategy,
-    process_type: ProcessType,
+    process_type: FlatProcess,
     refresh_leaf: bool,
     extra_trees: bool,
     extra_seed: u64,
@@ -117,9 +137,9 @@ flat_params! {
     skip_drop: f64,
     toad_penalty_feature: f64,
     toad_penalty_threshold: f64,
-    langevin: Option<bool>,
-    diffusion_temperature: Option<f64>,
-    model_shrink_rate: Option<f64>,
+    langevin: bool,
+    diffusion_temperature: f64,
+    model_shrink_rate: f64,
     model_shrink_mode: ModelShrinkMode,
     posterior_sampling: bool,
 }
@@ -299,9 +319,149 @@ impl Flat {
             .iter()
             .map(|name| EvalMetric::from_xgboost(name, &source))
             .collect::<Result<Vec<_>>>()?;
+        // Group keys only mean something under their switch.
+        let switches = [
+            (
+                "rate_drop",
+                rate_drop.is_some(),
+                booster == Some(FlatBooster::Dart),
+                "`booster=dart`",
+            ),
+            (
+                "skip_drop",
+                skip_drop.is_some(),
+                booster == Some(FlatBooster::Dart),
+                "`booster=dart`",
+            ),
+            (
+                "refresh_leaf",
+                refresh_leaf.is_some(),
+                process_type == Some(FlatProcess::Update),
+                "`process_type=update`",
+            ),
+            (
+                "extra_seed",
+                extra_seed.is_some(),
+                extra_trees == Some(true),
+                "`extra_trees=true`",
+            ),
+            (
+                "linear_lambda",
+                linear_lambda.is_some(),
+                linear_tree == Some(true),
+                "`linear_tree=true`",
+            ),
+            (
+                "num_grad_quant_bins",
+                num_grad_quant_bins.is_some(),
+                use_quantized_grad == Some(true),
+                "`use_quantized_grad=true`",
+            ),
+            (
+                "stochastic_rounding",
+                stochastic_rounding.is_some(),
+                use_quantized_grad == Some(true),
+                "`use_quantized_grad=true`",
+            ),
+            (
+                "quant_train_renew_leaf",
+                quant_train_renew_leaf.is_some(),
+                use_quantized_grad == Some(true),
+                "`use_quantized_grad=true`",
+            ),
+            (
+                "diffusion_temperature",
+                diffusion_temperature.is_some(),
+                langevin == Some(true),
+                "`langevin=true`",
+            ),
+            (
+                "model_shrink_mode",
+                model_shrink_mode.is_some(),
+                model_shrink_rate.is_some(),
+                "`model_shrink_rate`",
+            ),
+        ];
+        for (key, set, on, needs) in switches {
+            if set && !on {
+                return Err(HessboostError::invalid_param(
+                    key,
+                    format!("applies only with {needs}"),
+                ));
+            }
+        }
+        let booster = match booster.unwrap_or(FlatBooster::GbTree) {
+            FlatBooster::GbTree => BoosterKind::GbTree,
+            FlatBooster::GbLinear => BoosterKind::GbLinear,
+            FlatBooster::Dart => {
+                let mut dart = Dart::builder();
+                if let Some(rate_drop) = rate_drop {
+                    dart = dart.rate_drop(rate_drop);
+                }
+                if let Some(skip_drop) = skip_drop {
+                    dart = dart.skip_drop(skip_drop);
+                }
+                BoosterKind::Dart(dart.build()?)
+            }
+        };
+        let process_type = match process_type.unwrap_or(FlatProcess::Default) {
+            FlatProcess::Default => ProcessType::Default,
+            FlatProcess::Update => ProcessType::Update(match refresh_leaf {
+                Some(false) => Refresh::stats_only(),
+                Some(true) | None => Refresh::default(),
+            }),
+        };
+        let extra_trees = (extra_trees == Some(true))
+            .then(|| extra_seed.map_or_else(ExtraTrees::default, ExtraTrees::with_seed));
+        let linear_tree = if linear_tree == Some(true) {
+            Some(LinearTree::new(linear_lambda.unwrap_or_default())?)
+        } else {
+            None
+        };
+        let quantized = if use_quantized_grad == Some(true) {
+            let mut q = QuantizedGrad::builder();
+            if let Some(bins) = num_grad_quant_bins {
+                q = q.bins(bins);
+            }
+            if let Some(stochastic) = stochastic_rounding {
+                q = q.stochastic_rounding(stochastic);
+            }
+            if let Some(renew) = quant_train_renew_leaf {
+                q = q.renew_leaf(renew);
+            }
+            Some(q.build()?)
+        } else {
+            None
+        };
+        // CatBoost: posterior sampling needs Langevin "not set or true".
+        if posterior_sampling == Some(true) && langevin == Some(false) {
+            return Err(HessboostError::invalid_param(
+                "langevin",
+                "`posterior_sampling` requires Langevin boosting; leave `langevin` unset or true",
+            ));
+        }
+        let langevin = if langevin == Some(true) {
+            let mut l = Langevin::builder();
+            if let Some(temperature) = diffusion_temperature {
+                l = l.diffusion_temperature(temperature);
+            }
+            Some(l.build()?)
+        } else {
+            None
+        };
+        let model_shrink = match model_shrink_rate {
+            Some(rate) => {
+                let mut shrink = ModelShrink::builder().rate(rate);
+                if let Some(mode) = model_shrink_mode {
+                    shrink = shrink.mode(mode);
+                }
+                Some(shrink.build()?)
+            }
+            None => None,
+        };
         let d = TrainingParams::default();
         Ok(TrainingParams {
-            booster: booster.unwrap_or(d.booster),
+            booster,
             nthread: nthread.unwrap_or(d.nthread),
             seed: seed.unwrap_or(d.seed),
             device: device.unwrap_or(d.device),
@@ -328,25 +488,15 @@ impl Flat {
             num_parallel_tree: num_parallel_tree.unwrap_or(d.num_parallel_tree),
             sampling_method: sampling_method.unwrap_or(d.sampling_method),
             multi_strategy: multi_strategy.unwrap_or(d.multi_strategy),
-            process_type: process_type.unwrap_or(d.process_type),
-            refresh_leaf: refresh_leaf.unwrap_or(d.refresh_leaf),
-            extra_trees: extra_trees.unwrap_or(d.extra_trees),
-            extra_seed: extra_seed.unwrap_or(d.extra_seed),
+            process_type,
+            extra_trees,
             path_smooth: path_smooth.unwrap_or(d.path_smooth),
-            linear_tree: linear_tree.unwrap_or(d.linear_tree),
-            linear_lambda: linear_lambda.unwrap_or(d.linear_lambda),
-            use_quantized_grad: use_quantized_grad.unwrap_or(d.use_quantized_grad),
-            num_grad_quant_bins: num_grad_quant_bins.unwrap_or(d.num_grad_quant_bins),
-            stochastic_rounding: stochastic_rounding.unwrap_or(d.stochastic_rounding),
-            quant_train_renew_leaf: quant_train_renew_leaf.unwrap_or(d.quant_train_renew_leaf),
-            rate_drop: rate_drop.unwrap_or(d.rate_drop),
-            skip_drop: skip_drop.unwrap_or(d.skip_drop),
+            linear_tree,
+            quantized,
             toad_penalty_feature: toad_penalty_feature.unwrap_or(d.toad_penalty_feature),
             toad_penalty_threshold: toad_penalty_threshold.unwrap_or(d.toad_penalty_threshold),
-            langevin: langevin.unwrap_or(d.langevin),
-            diffusion_temperature: diffusion_temperature.unwrap_or(d.diffusion_temperature),
-            model_shrink_rate: model_shrink_rate.unwrap_or(d.model_shrink_rate),
-            model_shrink_mode: model_shrink_mode.unwrap_or(d.model_shrink_mode),
+            langevin,
+            model_shrink,
             posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
         })
     }
@@ -673,24 +823,14 @@ impl TrainingParams {
             sampling_method,
             multi_strategy,
             process_type,
-            refresh_leaf,
             extra_trees,
-            extra_seed,
             path_smooth,
             linear_tree,
-            linear_lambda,
-            use_quantized_grad,
-            num_grad_quant_bins,
-            stochastic_rounding,
-            quant_train_renew_leaf,
-            rate_drop,
-            skip_drop,
+            quantized,
             toad_penalty_feature,
             toad_penalty_threshold,
             langevin,
-            diffusion_temperature,
-            model_shrink_rate,
-            model_shrink_mode,
+            model_shrink,
             posterior_sampling,
         } = self;
         if let Objective::Custom(loss) = objective {
@@ -730,7 +870,15 @@ impl TrainingParams {
         let mut set = |key: &str, value: Value| {
             flat.insert(key.to_owned(), value);
         };
-        set("booster", json(booster));
+        match booster {
+            BoosterKind::GbTree => set("booster", json("gbtree")),
+            BoosterKind::GbLinear => set("booster", json("gblinear")),
+            BoosterKind::Dart(dart) => {
+                set("booster", json("dart"));
+                set("rate_drop", json(dart.rate_drop()));
+                set("skip_drop", json(dart.skip_drop()));
+            }
+        }
         set("nthread", json(nthread));
         set("seed", json(seed));
         set("device", json(device));
@@ -765,31 +913,40 @@ impl TrainingParams {
         set("num_parallel_tree", json(num_parallel_tree));
         set("sampling_method", json(sampling_method));
         set("multi_strategy", json(multi_strategy));
-        set("process_type", json(process_type));
-        set("refresh_leaf", json(refresh_leaf));
-        set("extra_trees", json(extra_trees));
-        set("extra_seed", json(extra_seed));
+        match process_type {
+            ProcessType::Default => set("process_type", json("default")),
+            ProcessType::Update(refresh) => {
+                set("process_type", json("update"));
+                set("refresh_leaf", json(refresh.refresh_leaf()));
+            }
+        }
+        set("extra_trees", json(extra_trees.is_some()));
+        if let Some(extra_trees) = extra_trees {
+            set("extra_seed", json(extra_trees.seed()));
+        }
         set("path_smooth", json(path_smooth));
-        set("linear_tree", json(linear_tree));
-        set("linear_lambda", json(linear_lambda));
-        set("use_quantized_grad", json(use_quantized_grad));
-        set("num_grad_quant_bins", json(num_grad_quant_bins));
-        set("stochastic_rounding", json(stochastic_rounding));
-        set("quant_train_renew_leaf", json(quant_train_renew_leaf));
-        set("rate_drop", json(rate_drop));
-        set("skip_drop", json(skip_drop));
+        set("linear_tree", json(linear_tree.is_some()));
+        if let Some(linear_tree) = linear_tree {
+            set("linear_lambda", json(linear_tree.lambda()));
+        }
+        set("use_quantized_grad", json(quantized.is_some()));
+        if let Some(quantized) = quantized {
+            set("num_grad_quant_bins", json(quantized.bins()));
+            set("stochastic_rounding", json(quantized.stochastic_rounding()));
+            set("quant_train_renew_leaf", json(quantized.renew_leaf()));
+        }
         set("toad_penalty_feature", json(toad_penalty_feature));
         set("toad_penalty_threshold", json(toad_penalty_threshold));
         if let Some(langevin) = langevin {
-            set("langevin", json(langevin));
+            set("langevin", json(true));
+            if let Some(temperature) = langevin.diffusion_temperature() {
+                set("diffusion_temperature", json(temperature));
+            }
         }
-        if let Some(temperature) = diffusion_temperature {
-            set("diffusion_temperature", json(temperature));
+        if let Some(shrink) = model_shrink {
+            set("model_shrink_rate", json(shrink.rate()));
+            set("model_shrink_mode", json(shrink.mode()));
         }
-        if let Some(rate) = model_shrink_rate {
-            set("model_shrink_rate", json(rate));
-        }
-        set("model_shrink_mode", json(model_shrink_mode));
         set("posterior_sampling", json(posterior_sampling));
         Ok(flat)
     }
@@ -826,24 +983,14 @@ impl TrainingParams {
             sampling_method,
             multi_strategy,
             process_type,
-            refresh_leaf,
             extra_trees,
-            extra_seed,
             path_smooth,
             linear_tree,
-            linear_lambda,
-            use_quantized_grad,
-            num_grad_quant_bins,
-            stochastic_rounding,
-            quant_train_renew_leaf,
-            rate_drop,
-            skip_drop,
+            quantized,
             toad_penalty_feature,
             toad_penalty_threshold,
             langevin,
-            diffusion_temperature,
-            model_shrink_rate,
-            model_shrink_mode,
+            model_shrink,
             posterior_sampling,
         } = self;
         let mut changed = Vec::new();
@@ -901,30 +1048,10 @@ impl TrainingParams {
         differs("sampling_method", *sampling_method == other.sampling_method);
         differs("multi_strategy", *multi_strategy == other.multi_strategy);
         differs("process_type", *process_type == other.process_type);
-        differs("refresh_leaf", *refresh_leaf == other.refresh_leaf);
         differs("extra_trees", *extra_trees == other.extra_trees);
-        differs("extra_seed", *extra_seed == other.extra_seed);
         differs("path_smooth", *path_smooth == other.path_smooth);
         differs("linear_tree", *linear_tree == other.linear_tree);
-        differs("linear_lambda", *linear_lambda == other.linear_lambda);
-        differs(
-            "use_quantized_grad",
-            *use_quantized_grad == other.use_quantized_grad,
-        );
-        differs(
-            "num_grad_quant_bins",
-            *num_grad_quant_bins == other.num_grad_quant_bins,
-        );
-        differs(
-            "stochastic_rounding",
-            *stochastic_rounding == other.stochastic_rounding,
-        );
-        differs(
-            "quant_train_renew_leaf",
-            *quant_train_renew_leaf == other.quant_train_renew_leaf,
-        );
-        differs("rate_drop", *rate_drop == other.rate_drop);
-        differs("skip_drop", *skip_drop == other.skip_drop);
+        differs("use_quantized_grad", *quantized == other.quantized);
         differs(
             "toad_penalty_feature",
             *toad_penalty_feature == other.toad_penalty_feature,
@@ -934,18 +1061,7 @@ impl TrainingParams {
             *toad_penalty_threshold == other.toad_penalty_threshold,
         );
         differs("langevin", *langevin == other.langevin);
-        differs(
-            "diffusion_temperature",
-            *diffusion_temperature == other.diffusion_temperature,
-        );
-        differs(
-            "model_shrink_rate",
-            *model_shrink_rate == other.model_shrink_rate,
-        );
-        differs(
-            "model_shrink_mode",
-            *model_shrink_mode == other.model_shrink_mode,
-        );
+        differs("model_shrink_rate", *model_shrink == other.model_shrink);
         differs(
             "posterior_sampling",
             *posterior_sampling == other.posterior_sampling,
@@ -1007,8 +1123,7 @@ mod tests {
         );
         assert_eq!(p.sampling_method, SamplingMethod::GradientBased);
         assert_eq!(p.multi_strategy, MultiStrategy::MultiOutputTree);
-        assert_eq!(p.process_type, ProcessType::Update);
-        assert!(!p.refresh_leaf);
+        assert_eq!(p.process_type, ProcessType::Update(Refresh::stats_only()));
         assert_eq!(p.num_parallel_tree, 4);
         assert_eq!(
             p.monotone_constraints,
@@ -1038,6 +1153,55 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(rank.objective, Objective::RankNdcg(LambdaRank::default()));
+    }
+
+    /// A key of an option group means nothing while the group's switch is
+    /// off, so it is refused by name rather than ignored.
+    #[test]
+    fn dependent_keys_without_their_switch_are_refused_by_name() {
+        for (pairs, key) in [
+            (json!({"booster": "gbtree", "rate_drop": 0.1}), "rate_drop"),
+            (json!({"refresh_leaf": false}), "refresh_leaf"),
+            (json!({"extra_seed": 3}), "extra_seed"),
+            (json!({"extra_trees": false, "extra_seed": 3}), "extra_seed"),
+            (json!({"linear_lambda": 0.5}), "linear_lambda"),
+            (json!({"num_grad_quant_bins": 8}), "num_grad_quant_bins"),
+        ] {
+            let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
+            assert!(
+                refusal.starts_with(&format!("invalid parameter `{key}`")),
+                "{pairs}: {refusal}"
+            );
+        }
+    }
+
+    /// Every option group, switched on with non-default values, reads back
+    /// from its flat form unchanged.
+    #[test]
+    fn option_groups_round_trip_through_the_flat_form() {
+        let p = TrainingParams {
+            booster: BoosterKind::Dart(
+                Dart::builder()
+                    .rate_drop(0.2)
+                    .skip_drop(0.3)
+                    .build()
+                    .unwrap(),
+            ),
+            process_type: ProcessType::Update(Refresh::stats_only()),
+            extra_trees: Some(ExtraTrees::with_seed(11)),
+            linear_tree: Some(LinearTree::new(0.5).unwrap()),
+            quantized: Some(
+                QuantizedGrad::builder()
+                    .bins(8)
+                    .stochastic_rounding(false)
+                    .renew_leaf(true)
+                    .build()
+                    .unwrap(),
+            ),
+            ..TrainingParams::default()
+        };
+        let flat = p.to_xgboost().unwrap();
+        assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), p);
     }
 
     /// Every built-in objective's flat form (its name and the keys of its

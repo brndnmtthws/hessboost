@@ -209,6 +209,13 @@ lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T   # for f(x)
   interrupted (Ctrl-C) update changes nothing. `OnlineModel.from_model`
   resumes from a saved `Booster` and its training data. Updates need `hist`
   depth-wise trees without sampling or constraints and unweighted data.
+- `hessboost.ebm`: explainable boosting machines (`{"booster": "ebm"}`,
+  cyclic GA2M with outer bags, FAST pairs, per-bag early stopping, and
+  categorical terms): `shape_functions` returns every term's
+  piecewise-constant shape (`NumericAxis` edges or `CategoricalAxis`
+  codes, plus a missing cell per axis) and `Booster.ebm`;
+  `hessboost.inference.EbmInference` puts confidence bands on the shapes of
+  an `ebm_boulevard` model.
 - `hessboost.inference`: Boulevard boosting's asymptotic confidence,
   prediction (Gaussian noise), and reproduction intervals for `f(x)`
   (`BoulevardInference`, exact or Nystrom), `honest_refit`, and

@@ -455,4 +455,10 @@ impl Booster {
     fn boulevard<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         crate::inference::boulevard_info(py, &self.model)
     }
+
+    /// The EBM record of a `booster = ebm` model, else `None`.
+    #[getter]
+    fn ebm<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        crate::ebm::ebm_info(py, &self.model)
+    }
 }

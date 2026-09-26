@@ -12,14 +12,17 @@ __all__ = [
     "ConformalizedQuantile",
     "DMatrix",
     "Distributions",
+    "EbmInference",
     "OnlineModel",
     "Params",
     "SplitConformal",
+    "TermShape",
     "cv",
     "forward_chaining",
     "honest_refit",
     "k_fold",
     "purged_forward",
+    "shape_functions",
     "train",
 ]
 
@@ -147,6 +150,8 @@ class Booster:
     def vector_leaves(self) -> bool: ...
     @property
     def boulevard(self) -> dict[str, Any] | None: ...
+    @property
+    def ebm(self) -> dict[str, Any] | None: ...
 
 @final
 class SplitConformal:
@@ -229,6 +234,41 @@ class BoulevardInference:
     ) -> NDArray[np.float64]: ...
 
 def honest_refit(booster: Booster, values: DMatrix) -> Booster: ...
+
+@final
+class TermShape:
+    @property
+    def features(self) -> list[int]: ...
+    @property
+    def axes(self) -> list[tuple[str, Any]]: ...
+    @property
+    def values(self) -> NDArray[np.float64]: ...
+    def cell(self, x: list[float]) -> int: ...
+    def value(self, x: list[float]) -> float: ...
+
+def shape_functions(booster: Booster) -> tuple[float, list[TermShape]]: ...
+@final
+class EbmInference:
+    @staticmethod
+    def fit(
+        booster: Booster,
+        train: DMatrix,
+        holdout: DMatrix | None,
+        noise_variance: float | None,
+        landmarks: int | None,
+        seed: int,
+    ) -> EbmInference: ...
+    @property
+    def noise_variance(self) -> float: ...
+    @property
+    def intercept_standard_error(self) -> float: ...
+    def term_bands(
+        self, term: int, alpha: float
+    ) -> tuple[TermShape, NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]: ...
+    def term_standard_errors(self, term: int, data: DMatrix) -> NDArray[np.float64]: ...
+    def standard_errors(self, data: DMatrix) -> NDArray[np.float64]: ...
+    def confidence_intervals(self, data: DMatrix, alpha: float) -> NDArray[np.float64]: ...
+    def prediction_intervals(self, data: DMatrix, alpha: float) -> NDArray[np.float64]: ...
 def train(request: Mapping[str, object]) -> tuple[Booster, float | None]: ...
 def cv(
     params: Params,

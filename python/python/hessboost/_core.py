@@ -14,6 +14,7 @@ from hessboost import _data, _hessboost
 from hessboost._exceptions import HessboostError
 
 if TYPE_CHECKING:
+    from hessboost.ebm import EbmInfo
     from hessboost.inference import BoulevardInfo
 
 __all__ = [
@@ -450,6 +451,14 @@ class Booster:
         from hessboost.inference import BoulevardInfo
 
         return BoulevardInfo._from_core(self._model.boulevard)
+
+    @property
+    def ebm(self) -> EbmInfo | None:
+        """How a ``booster = ebm`` model was trained, or ``None`` (see
+        :mod:`hessboost.ebm`)."""
+        from hessboost.ebm import EbmInfo
+
+        return EbmInfo._from_core(self._model.ebm)
 
     @property
     def best_iteration(self) -> int | None:

@@ -36,8 +36,9 @@ from hessboost import _hessboost
 from hessboost._core import Booster
 from hessboost._exceptions import HessboostError
 from hessboost.conformal import _check_alpha, _matrix
+from hessboost.ebm import TermShape
 
-__all__ = ["BoulevardInference", "BoulevardInfo", "honest_refit"]
+__all__ = ["BoulevardInference", "BoulevardInfo", "EbmInference", "TermBands", "honest_refit"]
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,119 @@ class BoulevardInference:
 
     def __repr__(self) -> str:
         return f"BoulevardInference(noise_variance={self.noise_variance})"
+
+
+@dataclass(frozen=True)
+class TermBands:
+    """Pointwise confidence bands of one term's shape function
+    (:meth:`EbmInference.term_bands`), on the shape's grid."""
+
+    __module__ = "hessboost.inference"
+
+    shape: TermShape
+    """The term's shape function."""
+    standard_errors: NDArray[np.float64]
+    """The standard error at every cell."""
+    lower: NDArray[np.float64]
+    """The shape minus ``z * standard error`` at every cell."""
+    upper: NDArray[np.float64]
+    """The shape plus ``z * standard error`` at every cell."""
+
+
+class EbmInference:
+    """Confidence bands on the shape functions of a Boulevard EBM
+    (``{"booster": "ebm", "ebm_boulevard": True}``; Fang, Tan, Pipping &
+    Hooker, AISTATS 2026). Conditional on the tree structures, so they
+    under-cover across training samples (see the Rust crate's
+    ``hessboost::inference::EbmInference`` validation table)."""
+
+    __module__ = "hessboost.inference"
+
+    _core: _hessboost.EbmInference
+    _models: tuple[tuple[Booster, str], ...]
+
+    def __init__(self) -> None:
+        raise TypeError("use EbmInference.fit(...)")
+
+    @classmethod
+    def fit(
+        cls,
+        booster: Booster,
+        data: object,
+        label: ArrayLike | None = None,
+        *,
+        holdout: object | None = None,
+        holdout_label: ArrayLike | None = None,
+        noise_variance: float | None = None,
+        landmarks: int | None = None,
+        seed: int = 0,
+    ) -> Self:
+        """As :meth:`BoulevardInference.fit`, for a Boulevard EBM.
+
+        Raises:
+            HessboostError: ``booster`` is not a Boulevard EBM, or as
+                :meth:`BoulevardInference.fit`.
+        """
+        self = object.__new__(cls)
+        self._models = ((booster, "the model"),)
+        train = _matrix(self._models, data, label, calibration=False)
+        held = (
+            None
+            if holdout is None
+            else _matrix(self._models, holdout, holdout_label, calibration=True)
+        )
+        seed = _check_count("seed", seed) or 0
+        self._core = _hessboost.EbmInference.fit(
+            booster._model,
+            train,
+            held,
+            _check_noise(noise_variance),
+            _check_count("landmarks", landmarks),
+            seed,
+        )
+        return self
+
+    @property
+    def noise_variance(self) -> float:
+        """The noise variance estimate."""
+        return self._core.noise_variance
+
+    @property
+    def intercept_standard_error(self) -> float:
+        """The standard error of the intercept."""
+        return self._core.intercept_standard_error
+
+    def _data(self, data: object) -> _hessboost.DMatrix:
+        return _matrix(self._models, data, None, calibration=False)
+
+    def term_bands(self, term: int, *, alpha: float) -> TermBands:
+        """Bands on every cell of term ``term``'s shape function at
+        miscoverage ``alpha``."""
+        index = _check_count("term", term) or 0
+        shape, se, lower, upper = self._core.term_bands(index, _check_alpha(alpha))
+        return TermBands(TermShape._wrap(shape), se, lower, upper)
+
+    def term_standard_errors(self, term: int, data: object) -> NDArray[np.float64]:
+        """The standard error of term ``term``'s shape at every row of
+        ``data``."""
+        index = _check_count("term", term) or 0
+        return self._core.term_standard_errors(index, self._data(data))
+
+    def standard_errors(self, data: object) -> NDArray[np.float64]:
+        """The standard error of the whole prediction at every row."""
+        return self._core.standard_errors(self._data(data))
+
+    def confidence_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
+        """``(rows, 2)`` confidence intervals for the model's ``f(x)``."""
+        return self._core.confidence_intervals(self._data(data), _check_alpha(alpha))
+
+    def prediction_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
+        """``(rows, 2)`` prediction intervals for a new label (Gaussian
+        noise)."""
+        return self._core.prediction_intervals(self._data(data), _check_alpha(alpha))
+
+    def __repr__(self) -> str:
+        return f"EbmInference(noise_variance={self.noise_variance})"
 
 
 def honest_refit(booster: Booster, data: object, label: ArrayLike | None = None) -> Booster:

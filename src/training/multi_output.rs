@@ -120,7 +120,7 @@ pub(super) fn boost_round(
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
     // The row samples, all drawn before the trees: one per parallel tree
     // under uniform sampling, else one all-rows subset they share.
-    let row_subsets = iteration_row_subsets(n, params, false, &mut rng);
+    let row_subsets = iteration_row_subsets(n, params, false, ctx.run.dtrain.group(), &mut rng);
     for p in 0..params.num_parallel_tree {
         let rows = &row_subsets[p % row_subsets.len()];
         let (tree, leaf_rows) = fit_tree(ctx, gpair, split.as_ref(), &mut rng, rows, n_out)?;

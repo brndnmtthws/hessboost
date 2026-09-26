@@ -408,6 +408,10 @@ pub struct TrainingParams {
     /// `refresh_leaf`.
     pub refresh_leaf: bool,
 
+    /// Sample whole ranking queries rather than individual rows (LightGBM
+    /// `bagging_by_query`, beyond XGBoost). Requires ranking data, a ranking
+    /// objective, `subsample < 1`, and uniform sampling.
+    pub bagging_by_query: bool,
     // ---- LightGBM tree options (opt-in, beyond XGBoost) ----
     /// Extremely randomized split search (LightGBM `extra_trees`): every
     /// numerical feature is scored at one random bin boundary per node, drawn
@@ -530,6 +534,7 @@ impl Default for TrainingParams {
             max_bin: 256,
             monotone_constraints: Vec::new(),
             interaction_constraints: Vec::new(),
+            bagging_by_query: false,
             num_parallel_tree: 1,
             sampling_method: SamplingMethod::Uniform,
             multi_strategy: MultiStrategy::OneOutputPerTree,
@@ -657,7 +662,32 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
+        self.validate_bagging_by_query()?;
         self.validate_tree_options()
+    }
+
+    fn validate_bagging_by_query(&self) -> Result<()> {
+        if self.bagging_by_query {
+            ensure(
+                "bagging_by_query",
+                self.subsample < 1.0,
+                "requires `subsample < 1`",
+            )?;
+            ensure(
+                "bagging_by_query",
+                self.sampling_method == SamplingMethod::Uniform,
+                "is not supported with `sampling_method=gradient_based`",
+            )?;
+            ensure(
+                "bagging_by_query",
+                matches!(
+                    self.objective.as_str(),
+                    "rank:pairwise" | "rank:ndcg" | "rank:map" | "rank:xendcg"
+                ),
+                "requires a ranking objective",
+            )?;
+        }
+        Ok(())
     }
 
     /// Whether either reuse penalty (Trees-on-a-Diet) is on.
@@ -1342,6 +1372,8 @@ impl TrainingParamsBuilder {
         dist_split_direction, DistSplitDirection);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
         num_parallel_tree, usize);
+    setter!(/// Enable LightGBM-style whole-query row subsampling.
+        bagging_by_query, bool);
     setter!(/// Set the row subsampling method (`sampling_method`).
         sampling_method, SamplingMethod);
     setter!(/// Set the multi-output tree strategy (`multi_strategy`).

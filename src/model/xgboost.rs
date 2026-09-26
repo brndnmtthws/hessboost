@@ -948,6 +948,7 @@ fn objective_to_json(objective: &str, num_class: usize, params: &ObjectiveParams
             LAMBDARANK_NUM_PAIR,
             params.lambdarank_num_pair_per_sample.to_string(),
         ),
+        "rank:xendcg" => return Value::Object(out),
         _ => (SCALE_POS_WEIGHT, params.scale_pos_weight.to_string()),
     };
     let mut fields = Map::new();

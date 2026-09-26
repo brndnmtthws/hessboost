@@ -142,6 +142,67 @@ fn gradient_based_sampling_tree_method_support() {
     assert!(train(&dart, &data, 3).is_ok());
 }
 
+#[test]
+fn bagging_by_query_is_seeded_and_keeps_whole_groups() {
+    let n_groups = 30;
+    let group_size = 4;
+    let n = n_groups * group_size;
+    let mut x = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    for group in 0..n_groups {
+        for doc in 0..group_size {
+            x.push(doc as f32 + group as f32 * 0.001);
+            y.push(doc as f32);
+        }
+    }
+    let data = labeled_dense(&x, 1, &y)
+        .with_group_sizes(&vec![group_size; n_groups])
+        .unwrap();
+    let params = TrainingParams::builder()
+        .objective("rank:ndcg")
+        .tree_method(TreeMethod::Hist)
+        .bagging_by_query(true)
+        .subsample(0.5)
+        .seed(22)
+        .max_depth(2)
+        .build()
+        .unwrap();
+    let first = train(&params, &data, 4).unwrap().trees().to_vec();
+    let second = train(&params, &data, 4).unwrap().trees().to_vec();
+    assert_eq!(first, second);
+    for tree in &first {
+        assert!(tree.nodes().iter().any(|node| !node.is_leaf()));
+    }
+}
+
+#[test]
+fn bagging_by_query_refuses_non_ranking_or_incompatible_sampling() {
+    let ranking = || {
+        TrainingParams::builder()
+            .objective("rank:ndcg")
+            .bagging_by_query(true)
+    };
+    assert_eq!(invalid_param(ranking().build()), "bagging_by_query");
+    assert_eq!(
+        invalid_param(
+            ranking()
+                .subsample(0.5)
+                .sampling_method(SamplingMethod::GradientBased)
+                .build()
+        ),
+        "bagging_by_query"
+    );
+    assert_eq!(
+        invalid_param(
+            TrainingParams::builder()
+                .bagging_by_query(true)
+                .subsample(0.5)
+                .build()
+        ),
+        "bagging_by_query"
+    );
+}
+
 /// Zero weights are epsilon weights (floored at 1e-6, as in XGBoost): against
 /// weights far above the floor they practically never win, so on these fixed
 /// seeds a stage that keeps as many features as have positive weight never

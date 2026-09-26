@@ -1,4 +1,4 @@
-//! Learning-to-rank objectives (XGBoost 3.4.1 LambdaRank).
+//! Learning-to-rank objectives (XGBoost 3.4.1 LambdaRank and LightGBM XE-NDCG).
 //!
 //! Query groups are contiguous row blocks ([`crate::data::GroupInfo`]). Within
 //! each group, documents are stably ranked by descending prediction. The

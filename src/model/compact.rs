@@ -1737,7 +1737,7 @@ fn encode(model: &BoostedModel) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BoosterKind, GrowPolicy, TrainingParams, TreeMethod};
+    use crate::config::{BoosterKind, Dart, GrowPolicy, LinearTree, TrainingParams, TreeMethod};
     use crate::data::FeatureType;
     use crate::objective::{Logistic, Multiclass, Objective, Quantiles};
     use crate::test_support::labeled_dense;
@@ -1835,8 +1835,9 @@ mod tests {
             ),
             (
                 base()
-                    .booster(BoosterKind::Dart)
-                    .rate_drop(0.3)
+                    .booster(BoosterKind::Dart(
+                        Dart::builder().rate_drop(0.3).build().unwrap(),
+                    ))
                     .build()
                     .unwrap(),
                 &data,
@@ -2150,7 +2151,9 @@ mod tests {
         let data = labeled(200, 3, false);
         for params in [
             TrainingParams::builder().booster(BoosterKind::GbLinear),
-            TrainingParams::builder().max_depth(3).linear_tree(true),
+            TrainingParams::builder()
+                .max_depth(3)
+                .linear_tree(LinearTree::default()),
         ] {
             let model = train(&params.build().unwrap(), &data, 3).unwrap();
             assert!(matches!(

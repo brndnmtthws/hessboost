@@ -4,7 +4,8 @@
 //! validation.
 
 use hessboost::config::{
-    BoosterKind, GrowPolicy, MultiStrategy, TrainingParamsBuilder, TreeMethod,
+    BoosterKind, GrowPolicy, MultiStrategy, QuantizedGrad, QuantizedGradBuilder,
+    TrainingParamsBuilder, TreeMethod,
 };
 use hessboost::objective::Logistic;
 use hessboost::prelude::*;
@@ -62,7 +63,15 @@ fn logloss(pred: &[f32], y: &[f32]) -> f64 {
 }
 
 fn quantized(builder: TrainingParamsBuilder) -> TrainingParamsBuilder {
-    builder.use_quantized_grad(true)
+    builder.quantized(QuantizedGrad::default())
+}
+
+/// `builder` with the quantization `group` configures.
+fn quantized_with(
+    builder: TrainingParamsBuilder,
+    group: QuantizedGradBuilder,
+) -> TrainingParamsBuilder {
+    builder.quantized(group.build().unwrap())
 }
 
 #[test]
@@ -108,9 +117,18 @@ fn quantized_regression_stays_close_to_full_precision() {
         };
         let full = score(base.clone());
         let stochastic = score(quantized(base.clone()));
-        let nearest = score(quantized(base.clone()).stochastic_rounding(false));
-        let renewed = score(quantized(base.clone()).quant_train_renew_leaf(true));
-        let fine = score(quantized(base.clone()).num_grad_quant_bins(16));
+        let nearest = score(quantized_with(
+            base.clone(),
+            QuantizedGrad::builder().stochastic_rounding(false),
+        ));
+        let renewed = score(quantized_with(
+            base.clone(),
+            QuantizedGrad::builder().renew_leaf(true),
+        ));
+        let fine = score(quantized_with(
+            base.clone(),
+            QuantizedGrad::builder().bins(16),
+        ));
         // Two gradient levels per sign cost a few percent; renewal and finer
         // levels close most of the gap (measured: +4.4%, +1.6%, -0.6%).
         assert!(
@@ -150,7 +168,7 @@ fn quantized_binary_classification_stays_close_to_full_precision() {
         ("stochastic", quantized(base.clone())),
         (
             "renewed",
-            quantized(base.clone()).quant_train_renew_leaf(true),
+            quantized_with(base.clone(), QuantizedGrad::builder().renew_leaf(true)),
         ),
     ] {
         let q = score(variant);
@@ -168,15 +186,17 @@ fn renewed_leaves_use_full_precision_gradients() {
     let d = labeled_dense(&x, FEATURES, &y);
     for policy in [GrowPolicy::DepthWise, GrowPolicy::LossGuide] {
         let fit = |renew: bool| {
-            let params = quantized(TrainingParams::builder())
-                .quant_train_renew_leaf(renew)
-                .grow_policy(policy)
-                .max_leaves(24)
-                .max_depth(5)
-                .base_score(0.0)
-                .eta(0.5)
-                .build()
-                .unwrap();
+            let params = quantized_with(
+                TrainingParams::builder(),
+                QuantizedGrad::builder().renew_leaf(renew),
+            )
+            .grow_policy(policy)
+            .max_leaves(24)
+            .max_depth(5)
+            .base_score(0.0)
+            .eta(0.5)
+            .build()
+            .unwrap();
             train(&params, &d, 1).unwrap()
         };
         let mismatch = |model: &BoostedModel| {
@@ -233,13 +253,15 @@ fn quantized_parameters_are_validated() {
         assert_eq!(invalid_param(builder.build()), "use_quantized_grad");
     }
     for bins in [0, 1, 128] {
-        let builder = TrainingParams::builder().num_grad_quant_bins(bins);
-        assert_eq!(invalid_param(builder.build()), "num_grad_quant_bins");
+        let group = QuantizedGrad::builder().bins(bins).build();
+        assert_eq!(invalid_param(group), "num_grad_quant_bins");
     }
     for bins in [2, 3, 127] {
-        quantized(TrainingParams::builder())
-            .num_grad_quant_bins(bins)
-            .build()
-            .unwrap();
+        quantized_with(
+            TrainingParams::builder(),
+            QuantizedGrad::builder().bins(bins),
+        )
+        .build()
+        .unwrap();
     }
 }

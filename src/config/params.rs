@@ -5,6 +5,7 @@
 //! exposes aliases (e.g. `eta`/`learning_rate`), we pick the canonical field
 //! name and document the alias.
 
+use super::groups::{Dart, ExtraTrees, LinearTree, QuantizedGrad, Refresh};
 use crate::error::{HessboostError, Result};
 use crate::objective::{Loss, LossContext, Objective, ObjectiveParts};
 use serde::{Deserialize, Serialize};
@@ -13,15 +14,15 @@ use std::sync::Arc;
 /// Which booster to use in the ensemble.
 ///
 /// Mirrors XGBoost's `booster` parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[non_exhaustive]
 pub enum BoosterKind {
     /// Gradient boosted trees (XGBoost `gbtree`).
     #[default]
     GbTree,
-    /// Dropout Additive Regression Trees (XGBoost `dart`).
-    Dart,
+    /// Dropout Additive Regression Trees (XGBoost `dart`) with this
+    /// dropout.
+    Dart(Dart),
     /// Linear booster with coordinate descent (XGBoost `gblinear`). It
     /// updates from every row and feature and grows no trees, so row and
     /// column sampling, `num_parallel_tree > 1`, tree constraints, and
@@ -172,8 +173,7 @@ pub enum MultiStrategy {
 /// Whether a round grows new trees or updates existing ones.
 ///
 /// Mirrors XGBoost's `process_type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ProcessType {
     /// Grow new trees. XGBoost default.
@@ -186,7 +186,7 @@ pub enum ProcessType {
     /// (row and column sampling, symmetric growth, DART dropout, the
     /// beyond-XGBoost tree options) and training-matrix feature weights
     /// must keep their defaults.
-    Update,
+    Update(Refresh),
 }
 
 /// The complete training configuration.
@@ -195,10 +195,6 @@ pub enum ProcessType {
 /// [`TrainingParams::default`] and mutate fields directly, or parse
 /// XGBoost's flat key/value form with [`TrainingParams::from_xgboost`].
 #[derive(Debug, Clone, PartialEq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent XGBoost/LightGBM switches, not a state machine"
-)]
 #[non_exhaustive]
 pub struct TrainingParams {
     // ---- General ----
@@ -286,25 +282,16 @@ pub struct TrainingParams {
     /// Output-to-tree allocation for multi-output models. XGBoost
     /// `multi_strategy`.
     pub multi_strategy: MultiStrategy,
-    /// Grow new trees or update existing ones. XGBoost `process_type`.
+    /// Grow new trees or update existing ones (with the refresh updater's
+    /// options). XGBoost `process_type`.
     pub process_type: ProcessType,
-    /// With `process_type = update`, whether the refresh updater also
-    /// rewrites leaf values (not only node statistics). XGBoost
-    /// `refresh_leaf`.
-    pub refresh_leaf: bool,
 
     // ---- LightGBM tree options (opt-in, beyond XGBoost) ----
-    /// Extremely randomized split search (LightGBM `extra_trees`): every
-    /// numerical feature is scored at one random bin boundary per node, drawn
-    /// uniformly between the node's lowest and highest occupied bin, and every
-    /// categorical feature at one random prefix of its gradient-ordered
-    /// categories. Requires the histogram builder (`hist`/`approx`) and one
-    /// output per tree; refused with `grow_policy = symmetric`.
-    pub extra_trees: bool,
-    /// Seed of the [`extra_trees`](Self::extra_trees) threshold draws,
-    /// combined with the per-tree seed derived from [`seed`](Self::seed).
-    /// LightGBM `extra_seed` (default `6`).
-    pub extra_seed: u64,
+    /// Extremely randomized split search (LightGBM `extra_trees`), `None`
+    /// for XGBoost's exhaustive search. Requires the histogram builder
+    /// (`hist`/`approx`) and one output per tree; refused with
+    /// `grow_policy = symmetric`.
+    pub extra_trees: Option<ExtraTrees>,
     /// Path smoothing strength `s >= 0` (LightGBM `path_smooth`, `0` = off).
     /// Each child's output is pulled toward its parent's:
     /// `w = w_raw·(n/s)/(n/s + 1) + w_parent/(n/s + 1)` with `n` the child's
@@ -321,37 +308,11 @@ pub struct TrainingParams {
     /// are re-estimated after growth. Linear-leaf models use the native
     /// formats only: SHAP, XGBoost export, and the compact format refuse
     /// them.
-    pub linear_tree: bool,
-    /// L2 penalty on the leaf linear models' slopes (not their intercepts),
-    /// `>= 0`. LightGBM `linear_lambda`.
-    pub linear_lambda: f64,
-    // ---- Quantized training (LightGBM; beyond XGBoost) ----
-    /// Train on gradients and Hessians quantized to small integers with
-    /// integer histograms (LightGBM `use_quantized_grad`; Shi et al., NeurIPS
-    /// 2022). Opt-in and not part of XGBoost: trees differ from
-    /// full-precision training. Needs `tree_method` `hist`/`approx` (or
-    /// `auto`) and a tree booster.
-    pub use_quantized_grad: bool,
-    /// Quantization levels `Q` for [`use_quantized_grad`](Self::use_quantized_grad):
-    /// gradients map to integers in `[-⌊Q/2⌋, ⌊Q/2⌋]`, non-negative Hessians
-    /// to `[0, Q]`. In `[2, 127]` (LightGBM stores each value in 8 bits).
-    /// LightGBM `num_grad_quant_bins`.
-    pub num_grad_quant_bins: usize,
-    /// Round quantized gradients stochastically (unbiased) rather than to the
-    /// nearest level. Only used with `use_quantized_grad`. LightGBM
-    /// `stochastic_rounding`.
-    pub stochastic_rounding: bool,
-    /// Recompute each leaf value from the full-precision gradients of its rows
-    /// once a quantized tree is grown. Only used with `use_quantized_grad`;
-    /// refused with [`path_smooth`](Self::path_smooth), whose leaves keep the
-    /// outputs their splits recorded. LightGBM `quant_train_renew_leaf`.
-    pub quant_train_renew_leaf: bool,
-
-    // ---- DART-specific ----
-    /// Fraction of trees to drop each round (DART). XGBoost `rate_drop`.
-    pub rate_drop: f64,
-    /// Probability of skipping dropout in a round (DART). XGBoost `skip_drop`.
-    pub skip_drop: f64,
+    pub linear_tree: Option<LinearTree>,
+    /// Train on quantized gradients (LightGBM `use_quantized_grad`), `None`
+    /// for full precision. Needs `tree_method` `hist`/`approx` (or `auto`)
+    /// and a tree booster.
+    pub quantized: Option<QuantizedGrad>,
 
     // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
     /// Penalty `ι` subtracted from the loss change of a split on a feature the
@@ -404,18 +365,10 @@ impl Default for TrainingParams {
             sampling_method: SamplingMethod::Uniform,
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
-            refresh_leaf: true,
-            extra_trees: false,
-            extra_seed: 6,
+            extra_trees: None,
             path_smooth: 0.0,
-            linear_tree: false,
-            linear_lambda: 0.0,
-            use_quantized_grad: false,
-            num_grad_quant_bins: 4,
-            stochastic_rounding: true,
-            quant_train_renew_leaf: false,
-            rate_drop: 0.0,
-            skip_drop: 0.0,
+            linear_tree: None,
+            quantized: None,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
         }
@@ -555,9 +508,7 @@ impl TrainingParams {
         ensure("subsample", self.subsample != 0.0, "must be > 0")?;
         unit("colsample_bytree", self.colsample_bytree)?;
         unit("colsample_bylevel", self.colsample_bylevel)?;
-        unit("colsample_bynode", self.colsample_bynode)?;
-        unit("rate_drop", self.rate_drop)?;
-        unit("skip_drop", self.skip_drop)
+        unit("colsample_bynode", self.colsample_bynode)
     }
 
     /// Ranges of the reuse penalties and the split searches that apply them.
@@ -577,7 +528,7 @@ impl TrainingParams {
         ensure(
             "toad_penalty_feature",
             !(reuse_on
-                && (self.extra_trees
+                && (self.extra_trees.is_some()
                     || self.path_smooth > 0.0
                     || self.grow_policy == GrowPolicy::Symmetric)),
             "reuse penalties are not supported with `extra_trees`, `path_smooth`, or \
@@ -602,7 +553,7 @@ impl TrainingParams {
             )?;
             ensure(
                 "device",
-                !self.use_quantized_grad,
+                self.quantized.is_none(),
                 "`metal` does not support `use_quantized_grad`",
             )?;
             ensure(
@@ -612,7 +563,7 @@ impl TrainingParams {
             )?;
             ensure(
                 "device",
-                self.process_type != ProcessType::Update,
+                !matches!(self.process_type, ProcessType::Update(_)),
                 "`metal` does not support `process_type = update` (refresh grows no trees)",
             )?;
         }
@@ -686,11 +637,7 @@ impl TrainingParams {
                 "symmetric growth sizes trees by max_depth; max_leaves must be 0",
             )?;
         }
-        ensure(
-            "num_grad_quant_bins",
-            (2..=127).contains(&self.num_grad_quant_bins),
-            format!("must be in [2, 127], got {}", self.num_grad_quant_bins),
-        )
+        Ok(())
     }
 
     /// Compatibility of the vector-leaf and quantized training modes.
@@ -710,7 +657,7 @@ impl TrainingParams {
                 "reuse penalties are not supported with `multi_strategy=multi_output_tree`",
             )?;
         }
-        if self.use_quantized_grad {
+        if let Some(quantized) = &self.quantized {
             ensure(
                 "use_quantized_grad",
                 self.tree_method != TreeMethod::Exact && self.booster != BoosterKind::GbLinear,
@@ -732,7 +679,7 @@ impl TrainingParams {
             // recorded, so renewed leaf statistics would be discarded.
             ensure(
                 "quant_train_renew_leaf",
-                !(self.quant_train_renew_leaf && self.path_smooth > 0.0),
+                !(quantized.renew_leaf() && self.path_smooth > 0.0),
                 "leaf renewal is not supported with `path_smooth`",
             )?;
         }
@@ -801,13 +748,12 @@ impl TrainingParams {
     /// linear leaves are fitted after growth and apply to symmetric trees.
     fn validate_tree_options(&self) -> Result<()> {
         non_negative("path_smooth", self.path_smooth)?;
-        non_negative("linear_lambda", self.linear_lambda)?;
         // The compatibility checks do not depend on the option, so the first
         // enabled one names the error.
         let enabled = [
-            ("extra_trees", self.extra_trees),
+            ("extra_trees", self.extra_trees.is_some()),
             ("path_smooth", self.path_smooth > 0.0),
-            ("linear_tree", self.linear_tree),
+            ("linear_tree", self.linear_tree.is_some()),
         ];
         if let Some(&(name, _)) = enabled.iter().find(|&&(_, on)| on) {
             ensure(
@@ -838,7 +784,7 @@ impl TrainingParams {
         // would overwrite the constant that linear leaves fall back to.
         ensure(
             "linear_tree",
-            !(self.linear_tree && self.objective.has_adaptive_leaves()),
+            !(self.linear_tree.is_some() && self.objective.has_adaptive_leaves()),
             format!(
                 "is not supported with the adaptive-leaf objective `{}`",
                 self.objective.name()
@@ -971,10 +917,6 @@ impl TrainingParamsBuilder {
         grow_policy, GrowPolicy);
     setter!(/// Set the maximum histogram bins per feature.
         max_bin, usize);
-    setter!(/// Set the DART per-round drop rate (`rate_drop`).
-        rate_drop, f64);
-    setter!(/// Set the DART dropout-skip probability (`skip_drop`).
-        skip_drop, f64);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
         num_parallel_tree, usize);
     setter!(/// Set the row subsampling method (`sampling_method`).
@@ -983,30 +925,33 @@ impl TrainingParamsBuilder {
         multi_strategy, MultiStrategy);
     setter!(/// Set whether rounds grow or update trees (`process_type`).
         process_type, ProcessType);
-    setter!(/// Set whether `process_type = update` refreshes leaf values (`refresh_leaf`).
-        refresh_leaf, bool);
-    setter!(/// Enable LightGBM's randomized split search (`extra_trees`).
-        extra_trees, bool);
-    setter!(/// Set the seed of the `extra_trees` threshold draws (`extra_seed`).
-        extra_seed, u64);
     setter!(/// Set LightGBM's path smoothing strength (`path_smooth`, `0` = off).
         path_smooth, f64);
-    setter!(/// Enable LightGBM's per-leaf linear models (`linear_tree`).
-        linear_tree, bool);
-    setter!(/// Set the L2 penalty on leaf linear-model slopes (`linear_lambda`).
-        linear_lambda, f64);
     setter!(/// Set the new-feature reuse penalty `ι` (`toad_penalty_feature`).
         toad_penalty_feature, f64);
     setter!(/// Set the new-threshold reuse penalty `ξ` (`toad_penalty_threshold`).
         toad_penalty_threshold, f64);
-    setter!(/// Enable quantized-gradient training (`use_quantized_grad`, LightGBM).
-        use_quantized_grad, bool);
-    setter!(/// Set the gradient quantization levels (`num_grad_quant_bins`, LightGBM).
-        num_grad_quant_bins, usize);
-    setter!(/// Set stochastic rounding of quantized gradients (`stochastic_rounding`, LightGBM).
-        stochastic_rounding, bool);
-    setter!(/// Set full-precision leaf renewal after quantized growth (`quant_train_renew_leaf`, LightGBM).
-        quant_train_renew_leaf, bool);
+
+    /// Enable LightGBM's randomized split search (`extra_trees`).
+    #[must_use]
+    pub fn extra_trees(mut self, extra_trees: ExtraTrees) -> Self {
+        self.params.extra_trees = Some(extra_trees);
+        self
+    }
+
+    /// Enable LightGBM's per-leaf linear models (`linear_tree`).
+    #[must_use]
+    pub fn linear_tree(mut self, linear_tree: LinearTree) -> Self {
+        self.params.linear_tree = Some(linear_tree);
+        self
+    }
+
+    /// Enable quantized-gradient training (LightGBM `use_quantized_grad`).
+    #[must_use]
+    pub fn quantized(mut self, quantized: QuantizedGrad) -> Self {
+        self.params.quantized = Some(quantized);
+        self
+    }
 
     /// Set the objective (default [`Objective::SquaredError`]).
     #[must_use]
@@ -1190,7 +1135,7 @@ mod tests {
     /// would overwrite the constants linear leaves fall back to.
     #[test]
     fn linear_leaves_refuse_adaptive_leaf_objectives() {
-        let linear = || TrainingParams::builder().linear_tree(true);
+        let linear = || TrainingParams::builder().linear_tree(LinearTree::default());
         assert_eq!(
             rejected(linear().objective(Objective::AbsoluteError)),
             Some("linear_tree")
@@ -1204,13 +1149,13 @@ mod tests {
     fn reuse_penalties_refuse_searches_that_ignore_them() {
         let toad = || TrainingParams::builder().toad_penalty_feature(1.0);
         for params in [
-            toad().extra_trees(true),
+            toad().extra_trees(ExtraTrees::default()),
             toad().path_smooth(1.0),
             toad().grow_policy(GrowPolicy::Symmetric).max_depth(3),
         ] {
             assert_eq!(rejected(params), Some("toad_penalty_feature"));
         }
-        assert!(toad().linear_tree(true).build().is_ok());
+        assert!(toad().linear_tree(LinearTree::default()).build().is_ok());
     }
 
     /// Symmetric growth builds histograms outside the quantized path, and
@@ -1219,9 +1164,10 @@ mod tests {
     fn quantized_training_refuses_options_it_would_ignore() {
         let q = || {
             TrainingParams::builder()
-                .use_quantized_grad(true)
+                .quantized(QuantizedGrad::default())
                 .max_depth(3)
         };
+        let renewed = QuantizedGrad::builder().renew_leaf(true).build().unwrap();
         assert_eq!(
             rejected(q().grow_policy(GrowPolicy::Symmetric)),
             Some("use_quantized_grad")
@@ -1230,10 +1176,10 @@ mod tests {
         // Leaf renewal would be discarded: path-smoothed leaves keep the
         // outputs their quantized splits recorded.
         assert_eq!(
-            rejected(q().quant_train_renew_leaf(true).path_smooth(1.0)),
+            rejected(q().quantized(renewed).path_smooth(1.0)),
             Some("quant_train_renew_leaf")
         );
-        assert!(q().quant_train_renew_leaf(true).build().is_ok());
+        assert!(q().quantized(renewed).build().is_ok());
         assert!(q().path_smooth(1.0).build().is_ok());
     }
 
@@ -1250,7 +1196,12 @@ mod tests {
             rejected(sym().booster(BoosterKind::GbLinear)),
             Some("grow_policy")
         );
-        assert!(sym().booster(BoosterKind::Dart).build().is_ok());
+        assert!(
+            sym()
+                .booster(BoosterKind::Dart(Dart::default()))
+                .build()
+                .is_ok()
+        );
     }
 
     /// Coordinate descent reads every row and feature and grows no trees:
@@ -1289,7 +1240,7 @@ mod tests {
             .monotone_constraints(vec![Monotone::None])
             .build()
             .unwrap();
-        for booster in [BoosterKind::GbTree, BoosterKind::Dart] {
+        for booster in [BoosterKind::GbTree, BoosterKind::Dart(Dart::default())] {
             TrainingParams::builder()
                 .booster(booster)
                 .num_parallel_tree(2)

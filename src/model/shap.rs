@@ -1198,7 +1198,7 @@ fn finalize_interactions(m: &mut [f32], diag: &[f32], width: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{BoosterKind, TrainingParams, TreeMethod};
+    use crate::config::{BoosterKind, Dart, TrainingParams, TreeMethod};
     use crate::data::{DMatrix, FeatureType};
     use crate::objective::{Multiclass, Objective};
     use crate::test_support::labeled_dense;
@@ -1580,10 +1580,10 @@ mod tests {
         let base: Vec<f32> = (0..n).map(|row| row as f32 / 100.0).collect();
         let d = labeled_dense(&x, n, 2, &y).with_base_margin(&base).unwrap();
 
-        for booster in [BoosterKind::Dart, BoosterKind::GbLinear] {
+        let dart = BoosterKind::Dart(Dart::builder().rate_drop(0.5).build().unwrap());
+        for booster in [dart, BoosterKind::GbLinear] {
             let params = TrainingParams::builder()
                 .booster(booster)
-                .rate_drop(0.5)
                 .eta(0.2)
                 .max_depth(2)
                 .build()

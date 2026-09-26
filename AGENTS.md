@@ -105,6 +105,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams|
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
+|`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree` (`Option` fields); each validates when built|
 |`config/xgboost.rs`|XGBoost's flat parameter form: `TrainingParams::from_xgboost`/`to_xgboost` (keys, aliases, value spellings, one-setting options), `changed_keys`|
 |`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
 |`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
@@ -271,7 +272,8 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   `TrainingParams::validate` (static combinations),
   `TrainingParams::from_xgboost` (keys and value spellings; an objective
   parameter key that neither the objective nor a listed metric reads is
-  refused, `OBJECTIVE_KEYS` in `config/xgboost.rs`),
+  refused, `OBJECTIVE_KEYS` in `config/xgboost.rs`, as is a dependent key
+  without its switch, e.g. `rate_drop` without `booster=dart`),
   `validate_request` in `training/train.rs` (data-dependent),
   `training/multi_output.rs::validate`, `training/continuation.rs`,
   `EvalMetric::from_xgboost` (metric names and suffixes), and `training/budget.rs`.

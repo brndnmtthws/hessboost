@@ -125,7 +125,7 @@
 //!     (`toad_penalty_feature`, `toad_penalty_threshold`) and a bit-packed
 //!     layout with bit-identical margins ([`model::compact`]);
 //!   - LightGBM-style quantized gradients
-//!     ([`use_quantized_grad`](config::TrainingParams::use_quantized_grad));
+//!     ([`QuantizedGrad`](config::QuantizedGrad), `use_quantized_grad`);
 //!   - PerpetualBooster-style budget training: one `budget` instead of
 //!     `eta`/depth/rounds ([`training::budget`]);
 //!   - distributional boosting (NGBoost / XGBoostLSS style): `dist:normal`,

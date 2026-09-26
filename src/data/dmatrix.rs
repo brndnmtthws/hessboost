@@ -76,6 +76,44 @@ fn check_weights(
     Ok(())
 }
 
+/// Validate a row-major dense matrix: a non-empty shape matching
+/// `data.len()`, every non-missing value finite. Returns whether `data` is
+/// large enough to be checked (and copied) in parallel.
+fn check_dense(data: &[f32], n_rows: usize, n_cols: usize, missing: f32) -> Result<bool> {
+    if n_rows == 0 || n_cols == 0 {
+        return Err(HessboostError::EmptyDataset(
+            "from_dense: zero rows or columns",
+        ));
+    }
+    let expected = n_rows.checked_mul(n_cols).ok_or_else(|| {
+        HessboostError::invalid_param("matrix shape", "n_rows * n_cols overflows usize")
+    })?;
+    check_len("dense data length", data.len(), expected)?;
+    // With the NaN sentinel the only rejected values are infinities, a
+    // branch-free check the compiler vectorizes; other sentinels need the
+    // general test. Large inputs are checked in parallel.
+    let parallel = data.len() >= PARALLEL_COPY_VALUES && rayon::current_num_threads() > 1;
+    let rejects = |chunk: &[f32]| {
+        if missing.is_nan() {
+            chunk.iter().any(|v| v.is_infinite())
+        } else {
+            chunk.iter().any(|&v| v != missing && !v.is_finite())
+        }
+    };
+    let invalid = if parallel {
+        data.par_chunks(PARALLEL_COPY_VALUES / 16).any(rejects)
+    } else {
+        rejects(data)
+    };
+    if invalid {
+        return Err(HessboostError::invalid_param(
+            "dense data",
+            "non-missing feature values must be finite",
+        ));
+    }
+    Ok(parallel)
+}
+
 /// Backing storage for the feature matrix.
 #[derive(Debug, Clone)]
 enum Storage {
@@ -149,43 +187,20 @@ impl DMatrix {
         n_cols: usize,
         missing: f32,
     ) -> Result<Self> {
-        if n_rows == 0 || n_cols == 0 {
-            return Err(HessboostError::EmptyDataset(
-                "from_dense: zero rows or columns",
-            ));
-        }
-        let expected = n_rows.checked_mul(n_cols).ok_or_else(|| {
-            HessboostError::invalid_param("matrix shape", "n_rows * n_cols overflows usize")
-        })?;
-        check_len("dense data length", data.len(), expected)?;
-        // With the NaN sentinel the only rejected values are infinities, a
-        // branch-free check the compiler vectorizes; other sentinels need the
-        // general test. Large inputs are checked and copied in parallel.
-        let parallel = data.len() >= PARALLEL_COPY_VALUES && rayon::current_num_threads() > 1;
-        let rejects = |chunk: &[f32]| {
-            if missing.is_nan() {
-                chunk.iter().any(|v| v.is_infinite())
-            } else {
-                chunk.iter().any(|&v| v != missing && !v.is_finite())
-            }
-        };
-        let invalid = if parallel {
-            data.par_chunks(PARALLEL_COPY_VALUES / 16).any(rejects)
-        } else {
-            rejects(data)
-        };
-        if invalid {
-            return Err(HessboostError::invalid_param(
-                "dense data",
-                "non-missing feature values must be finite",
-            ));
-        }
+        let parallel = check_dense(data, n_rows, n_cols, missing)?;
         let values = if parallel {
             data.par_iter().copied().collect()
         } else {
             data.to_vec()
         };
         Ok(Self::new(n_rows, n_cols, Storage::Dense(values), missing))
+    }
+
+    /// [`DMatrix::from_dense`] taking ownership of `data` instead of copying
+    /// it (the missing sentinel is NaN).
+    pub(crate) fn from_dense_vec(data: Vec<f32>, n_rows: usize, n_cols: usize) -> Result<Self> {
+        check_dense(&data, n_rows, n_cols, f32::NAN)?;
+        Ok(Self::new(n_rows, n_cols, Storage::Dense(data), f32::NAN))
     }
 
     /// Build a matrix from compressed-sparse-row arrays.
@@ -542,6 +557,17 @@ impl DMatrix {
                 indices,
                 values,
             } => Some((indptr, indices, values)),
+        }
+    }
+
+    /// Mutable row-major storage of a dense matrix, or `None` for sparse
+    /// storage. Callers keep the constructors' invariant: every value is
+    /// finite or the missing sentinel.
+    #[inline]
+    pub(crate) fn dense_values_mut(&mut self) -> Option<&mut [f32]> {
+        match &mut self.storage {
+            Storage::Dense(data) => Some(data),
+            Storage::Csr { .. } => None,
         }
     }
 

@@ -33,8 +33,8 @@ and `λ` is the L2 penalty `lambda`.
 - **Stable model files.** Anything saved by 0.2.0 or later loads in every
   later release.
 - **More than XGBoost, opt-in.** Conformal intervals, distributional
-  boosting, budget training, compact models, and more — all off by default,
-  none of them changes default training.
+  boosting, tree-based diffusion, budget training, compact models, and more
+  — all off by default, none of them changes default training.
 
 ## Getting started
 
@@ -101,6 +101,7 @@ runnable programs live in [`examples/`](examples)
 | `model_io` | native and XGBoost JSON/UBJSON save and load |
 | `conformal` | calibrated prediction intervals |
 | `distributional` | predictive distributions, intervals, and NLL |
+| `tree_diffusion` | sampling multimodal and skewed `p(y \| x)` with tree diffusion and flow matching |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
 | `budget` | budget training against default and tuned training |
@@ -131,6 +132,7 @@ Beyond XGBoost (opt-in, none changes default training):
 |---|---|
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
+| [Tree-based diffusion](https://docs.rs/hessboost/latest/hessboost/diffusion/) | nonparametric `p(y \| x)` for scalar or vector labels (multimodal, skewed, heavy-tailed) by conditional diffusion or flow matching with GBDT score models, after Treeffuser and DiffGBM |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
 | LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), and symmetric trees |
@@ -146,6 +148,10 @@ Beyond XGBoost (opt-in, none changes default training):
 - gblinear, custom-objective, `dist:*`, and linear-leaf models have no
   XGBoost encoding — native formats only.
 - 0.1.x native model files are refused.
+- Diffusion models return samples, not densities, and save in their own
+  native and JSON formats only. Each sampling step is one batch prediction
+  (two for Heun) over every row × sample pair: 50 steps for score
+  diffusion, 5 for flow matching.
 - GPU training is exact, not fast yet: unmeasured against multicore CPU.
   Metal needs macOS 10.15+ and a 64-bit-integer GPU (all Apple Silicon).
 - Budget training runs 10–54× a depth-6 `hist` fit with the same tree count.

@@ -131,6 +131,12 @@ pub(super) const OBJECTIVE_SECTIONS: &[&str] = &[
 /// Encode `model` as a container: zstd-compressed unless the frame would
 /// expand further than [`read`] accepts (see [`pack`]).
 pub(super) fn write(model: &BoostedModel) -> Result<Vec<u8>> {
+    pack(write_container(model)?)
+}
+
+/// Encode `model` as an uncompressed container, the form other containers
+/// embed (a diffusion model's regressors) and [`read`] accepts as is.
+pub(crate) fn write_container(model: &BoostedModel) -> Result<Vec<u8>> {
     let trees = &model.trees;
     // Per-tree counts and array offsets are stored as `u32`.
     let total_nodes: usize = trees.iter().map(RegTree::num_nodes).sum();
@@ -144,7 +150,7 @@ pub(super) fn write(model: &BoostedModel) -> Result<Vec<u8>> {
     let mut w = Writer::default();
     write_model_sections(&mut w, model);
     write_tree_sections(&mut w, trees);
-    finish_container(w)
+    Ok(frame(*MAGIC, CONTAINER_VERSION, w))
 }
 
 /// The `model.*`, `gblinear.*`, and `objective.*` sections.
@@ -288,23 +294,24 @@ fn write_tree_sections(w: &mut Writer, trees: &[RegTree]) {
     );
 }
 
-/// Frame the section table as a container: magic, version, the table, and
-/// the checksum of everything before it; then [`pack`] it.
-fn finish_container(w: Writer) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(MAGIC.len() + 1 + w.encoded_len() + 8);
-    out.extend_from_slice(MAGIC);
-    out.push(CONTAINER_VERSION);
+/// Frame the section table as a container: `magic`, `version`, the table,
+/// and the checksum of everything before it. Shared by every format built
+/// on this container (the native model and the diffusion model).
+pub(crate) fn frame(magic: [u8; 4], version: u8, w: Writer) -> Vec<u8> {
+    let mut out = Vec::with_capacity(magic.len() + 1 + w.encoded_len() + 8);
+    out.extend_from_slice(&magic);
+    out.push(version);
     w.finish(&mut out);
     let checksum = xxh64(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
-    pack(out)
+    out
 }
 
 /// The file form of a finished container: its zstd frame, or the container
 /// itself when [`read`] would refuse the frame as expanding too far (a large,
 /// highly repetitive model, such as a gblinear model of mostly zero weights).
 /// Every container of at most [`ALWAYS_ALLOWED`] bytes is compressed.
-fn pack(container: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn pack(container: Vec<u8>) -> Result<Vec<u8>> {
     let frame = zstd::bulk::compress(&container, zstd::DEFAULT_COMPRESSION_LEVEL)?;
     Ok(
         if expansion_accepted(frame.len() as u64, container.len() as u64) {
@@ -313,6 +320,48 @@ fn pack(container: Vec<u8>) -> Result<Vec<u8>> {
             container
         },
     )
+}
+
+/// The container in `bytes`: decompressed from its zstd frame (bounded by
+/// [`expansion_limit`]) or borrowed when stored uncompressed.
+pub(crate) fn unpack(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    Ok(if bytes.starts_with(&ZSTD_MAGIC) {
+        std::borrow::Cow::Owned(decompress(bytes)?)
+    } else {
+        std::borrow::Cow::Borrowed(bytes)
+    })
+}
+
+/// The section table of `container` (see [`unpack`]) after checking its
+/// `magic`, its `version`, and its checksum. `what` names the format in
+/// errors ("native model").
+pub(crate) fn section_table<'a>(
+    container: &'a [u8],
+    magic: [u8; 4],
+    version: u8,
+    what: &str,
+) -> Result<&'a [u8]> {
+    let Some(body) = container.strip_prefix(&magic) else {
+        return Err(format_error(format!("invalid {what} header")));
+    };
+    let Some(&stored) = body.first() else {
+        return Err(format_error(format!("truncated {what}")));
+    };
+    if stored != version {
+        return Err(format_error(format!("unsupported {what} version {stored}")));
+    }
+    let Some(split) = container
+        .len()
+        .checked_sub(8)
+        .filter(|&at| at > magic.len())
+    else {
+        return Err(format_error(format!("truncated {what}")));
+    };
+    let (checked, checksum) = container.split_at(split);
+    if xxh64(checked).to_le_bytes() != checksum {
+        return Err(format_error(format!("{what} checksum mismatch")));
+    }
+    Ok(&checked[magic.len() + 1..])
 }
 
 /// Largest container [`read`] decompresses from a zstd frame of `compressed`
@@ -330,42 +379,15 @@ fn expansion_accepted(compressed: u64, decompressed: u64) -> bool {
 /// Decode a container (zstd-compressed or not). The caller validates the
 /// model it forms ([`BoostedModel::validate_structure`]).
 pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
-    let decompressed;
-    let container = if bytes.starts_with(&ZSTD_MAGIC) {
-        decompressed = decompress(bytes)?;
-        decompressed.as_slice()
-    } else {
-        bytes
-    };
-    let Some(body) = container.strip_prefix(MAGIC) else {
-        if container.starts_with(LEGACY_MAGIC) {
-            return Err(format_error(
-                "a native model from hessboost 0.1.x, which 0.2.0 and later cannot read \
-                 (export it with 0.1.1's `save_xgboost_json` and load that)",
-            ));
-        }
-        return Err(format_error("invalid native model header"));
-    };
-    let Some(&version) = body.first() else {
-        return Err(format_error("truncated native model"));
-    };
-    if version != CONTAINER_VERSION {
-        return Err(format_error(format!(
-            "unsupported native model version {version}"
-        )));
+    let container = unpack(bytes)?;
+    if container.starts_with(LEGACY_MAGIC) {
+        return Err(format_error(
+            "a native model from hessboost 0.1.x, which 0.2.0 and later cannot read \
+             (export it with 0.1.1's `save_xgboost_json` and load that)",
+        ));
     }
-    let Some(split) = container
-        .len()
-        .checked_sub(8)
-        .filter(|&at| at > MAGIC.len())
-    else {
-        return Err(format_error("truncated native model"));
-    };
-    let (checked, checksum) = container.split_at(split);
-    if xxh64(checked).to_le_bytes() != checksum {
-        return Err(format_error("native model checksum mismatch"));
-    }
-    let (s, rest) = Sections::parse(&checked[MAGIC.len() + 1..], |name| {
+    let table = section_table(&container, *MAGIC, CONTAINER_VERSION, "native model")?;
+    let (s, rest) = Sections::parse(table, |name| {
         KNOWN.contains(&name) || OBJECTIVE_SECTIONS.contains(&name)
     })?;
     if !rest.is_empty() {

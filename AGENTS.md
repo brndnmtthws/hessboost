@@ -64,9 +64,10 @@ does: prebuilt x86_64 cargo-fuzz defaults to musl, which the sanitizers
 reject. After changing `train.rs`'s input layout, re-check
 `fixed-seeds/train/*` with `cargo fuzz fmt train <file>`. Targets:
 `native-model`, `json-model`, `xgboost-json-model`, `xgboost-ubjson-model`,
-`compact-model` (accepted models must predict and round-trip), `loaders`,
-`train` (valid params must train or error, identically across thread
-counts).
+`compact-model` (accepted models must predict and round-trip),
+`diffusion-model` (binary and JSON; accepted models must sample and
+round-trip), `loaders`, `train` (valid params must train or error,
+identically across thread counts).
 
 ## Lints
 
@@ -90,6 +91,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
 |`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv`, `budget` (public)|
 |`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`)|
+|`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `Samples`), `format` (`HBDM` container embedding native GBDT containers; JSON)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -111,9 +113,11 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   node splits into fixed row blocks reduced in block order, partitioned by
   the data, never the thread count, and the serial build sums the same
   blocks. Sequential draws (rows, columns, DART, folds, target-stat
-  permutations) use `rng::Rng`. Keyed draws (`extra_trees` node seeds,
-  `dist:*` split direction, quantized stochastic rounding, per-block
-  row-sampling seeds) use SplitMix64 streams keyed by seed and index.
+  permutations, diffusion training noise, splits and folds) use
+  `rng::Rng`. Keyed draws (`extra_trees` node seeds, `dist:*` split
+  direction, quantized stochastic rounding, per-block row-sampling seeds,
+  diffusion sampler noise keyed by row and sample) use SplitMix64 streams
+  keyed by seed and index.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
 - **Metal:** `device = metal` reproduces the single-threaded CPU model bit
   for bit: gradients are staged as integer multiples of a per-component
@@ -179,6 +183,10 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
     `best_iteration` means none. Writers emit every field.
   - Compact (`HBTD`, `model/compact.rs`): section-table metadata; a bit
     stream change bumps its version byte (1).
+  - Diffusion (`HBDM`, `diffusion/format.rs`): the native container framing
+    (`model::native::frame`, `section_table`) with its own magic and version
+    byte (1), the same section rules, and the GBDTs embedded as uncompressed
+    native containers; its JSON validates through `UncheckedDiffusionModel`.
 - **Tree layout:** iteration `i` owns trees `i * trees_per_iteration ..`.
   Scalar leaves: `n_outputs × num_parallel_tree` per iteration, grouped by
   output; tree `t` feeds output `(t / num_parallel_tree) % n_outputs`.
@@ -227,7 +235,7 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   aliases.
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
-  `objective::distributional`, `conformal`).
+  `objective::distributional`, `conformal`, `diffusion`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.

@@ -13,20 +13,20 @@
 //! cell, and intercepts come from the objective's own estimator on each label
 //! column.
 
-use super::{GradPair, Objective};
+use super::{GradPair, Loss};
 use crate::data::MetaInfo;
 use crate::error::Result;
 
 /// An elementwise single-target objective applied to each of `n_targets`
 /// label columns (output `j` fits `labels[row * n_targets + j]`).
 pub(crate) struct MultiTarget {
-    inner: Box<dyn Objective>,
+    inner: Box<dyn Loss>,
     n_targets: usize,
 }
 
 impl MultiTarget {
     /// Wrap the elementwise objective `inner` for `n_targets` label columns.
-    pub(crate) fn new(inner: Box<dyn Objective>, n_targets: usize) -> Self {
+    pub(crate) fn new(inner: Box<dyn Loss>, n_targets: usize) -> Self {
         debug_assert_eq!(inner.n_outputs(), 1);
         MultiTarget { inner, n_targets }
     }
@@ -39,7 +39,7 @@ impl MultiTarget {
     }
 }
 
-impl Objective for MultiTarget {
+impl Loss for MultiTarget {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -63,7 +63,7 @@ impl Objective for MultiTarget {
         self.gradient_info(preds, &info, out);
     }
 
-    /// Inconsistent metadata (which [`Objective::validate_info`] refuses)
+    /// Inconsistent metadata (which [`Loss::validate_info`] refuses)
     /// gives zero pairs rather than broadcasting weights it cannot pair up.
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
         let Ok(cell_weights) = info.cell_weights() else {
@@ -104,6 +104,10 @@ impl Objective for MultiTarget {
         self.inner.probs_to_margins(scores);
     }
 
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        self.inner.validate_base_score(base_score)
+    }
+
     /// The dataset must carry this objective's label width: every cell of
     /// the flattened metadata is paired with one output margin.
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
@@ -129,7 +133,7 @@ mod tests {
     use crate::error::HessboostError;
     use crate::objective::{base_margins, create_objective};
 
-    fn objective(name: &str, n_targets: usize) -> Box<dyn Objective> {
+    fn objective(name: &str, n_targets: usize) -> Box<dyn Loss> {
         let params = TrainingParams::builder()
             .objective(name)
             .scale_pos_weight(if name == "binary:logistic" { 2.0 } else { 1.0 })

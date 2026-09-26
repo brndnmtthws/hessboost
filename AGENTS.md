@@ -225,15 +225,17 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   `[row][(n_features + 1)^2]`, plus an output axis for multi-output.
   `n_targets` counts label columns; XGBoost's `num_target` counts outputs
   (columns or alphas) and is 1 for multiclass.
-- **Objective/metric hooks:** training and evaluation read data only via
-  `MetaInfo` hooks (`Objective::gradient_info`, `base_margins_info`,
+- **Loss/metric hooks:** training and evaluation read data only via
+  `MetaInfo` hooks (`Loss::gradient_info`, `base_margins_info`,
   `eval_transform`, `validate_info`, `requires_labels`;
   `Metric::eval_info`, `validate_info`, `prediction_width`,
   `supports_label_matrix`). `base_margins_info` is the only intercept hook;
   `probs_to_margins` is the only link hook, applied to user, imported, and
-  Newton-default `base_score`. `margins_to_probs` exports `base_score`
+  Newton-default `base_score`; a user `base_score` is first checked by
+  `validate_base_score` of the loss being trained (never by the configured
+  objective's name). `margins_to_probs` exports `base_score`
   (default `pred_transform`; `binary:hinge` and `reg:quantileerror`
-  override it). Label-domain checks go in each objective's `validate_info`.
+  override it). Label-domain checks go in each loss's `validate_info`.
   Label matrices: `create_objective` wraps `MULTI_TARGET_OBJECTIVES` in
   `MultiTarget` (row weight per cell, per-column intercepts);
   `reg:absoluteerror` handles them itself; other built-ins refuse them. The
@@ -288,7 +290,7 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
 Easy-to-miss requirements: multiclass needs `.num_class(k)`; ranking needs
 `.with_group_sizes`; `survival:aft` needs `.with_label_bounds`;
 `survival:cox` reads non-positive labels as right-censored;
-`Objective::split_gradient` serves vector-leaf trees only, not with
+`Loss::split_gradient` serves vector-leaf trees only, not with
 monotone constraints. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.
 

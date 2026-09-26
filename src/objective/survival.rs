@@ -9,7 +9,7 @@
 
 use rayon::prelude::*;
 
-use super::{GradPair, MIN_HESS_F64, Objective, log_link};
+use super::{GradPair, Loss, MIN_HESS_F64, OutputDomain, check_base_score_domain, log_link};
 use crate::config::AftDistribution;
 use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
@@ -44,7 +44,7 @@ pub(crate) fn abs_label_order(labels: &[f32]) -> Vec<usize> {
 #[non_exhaustive]
 pub struct Cox;
 
-impl Objective for Cox {
+impl Loss for Cox {
     fn name(&self) -> &'static str {
         "survival:cox"
     }
@@ -101,6 +101,10 @@ impl Objective for Cox {
         log_link(scores);
     }
 
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        check_base_score_domain(base_score, OutputDomain::Positive)
+    }
+
     fn default_metric(&self) -> String {
         "cox-nloglik".to_string()
     }
@@ -125,7 +129,7 @@ impl Objective for Cox {
 /// in XGBoost.
 ///
 /// Training reads only the label bounds. Called without bounds
-/// ([`Objective::gradient`]), the ordinary labels are treated as observed
+/// ([`Loss::gradient`]), the ordinary labels are treated as observed
 /// times.
 #[derive(Debug, Clone, Copy)]
 pub struct Aft {
@@ -205,7 +209,7 @@ impl Default for Aft {
     }
 }
 
-impl Objective for Aft {
+impl Loss for Aft {
     fn name(&self) -> &'static str {
         "survival:aft"
     }
@@ -237,6 +241,10 @@ impl Objective for Aft {
 
     fn probs_to_margins(&self, scores: &mut [f32]) {
         log_link(scores);
+    }
+
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        check_base_score_domain(base_score, OutputDomain::Positive)
     }
 
     /// XGBoost does not estimate an AFT intercept: its default `base_score`

@@ -1,6 +1,6 @@
 //! Regression objectives.
 
-use super::{GradPair, Objective, check_label_domain, weighted_label_mean};
+use super::{GradPair, Loss, check_label_domain, weighted_label_mean};
 use crate::data::MetaInfo;
 use crate::error::Result;
 
@@ -13,7 +13,7 @@ use crate::error::Result;
 #[non_exhaustive]
 pub struct SquaredError;
 
-impl Objective for SquaredError {
+impl Loss for SquaredError {
     fn name(&self) -> &'static str {
         "reg:squarederror"
     }
@@ -75,7 +75,7 @@ impl Default for PseudoHuber {
     }
 }
 
-impl Objective for PseudoHuber {
+impl Loss for PseudoHuber {
     fn name(&self) -> &'static str {
         "reg:pseudohubererror"
     }
@@ -130,7 +130,7 @@ pub struct SquaredLogError;
 /// `f32`.
 const SQUARED_LOG_MIN_PRED: f32 = (-1.0f64 + 1e-6) as f32;
 
-impl Objective for SquaredLogError {
+impl Loss for SquaredLogError {
     fn name(&self) -> &'static str {
         "reg:squaredlogerror"
     }

@@ -52,7 +52,7 @@
 //! truncation, structural-plateau stopping, and objective/shape-specific
 //! adjustments of the schedules above) are not reproduced, so results match
 //! Perpetual's behavior in kind, not number for number. Losses are the
-//! objectives' [`pointwise_loss`](crate::objective::Objective::pointwise_loss)
+//! objectives' [`pointwise_loss`](crate::objective::Loss::pointwise_loss)
 //! (deviance form for the log-link objectives, where Perpetual uses the
 //! unshifted negative log-likelihood).
 //!

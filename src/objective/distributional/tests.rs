@@ -496,7 +496,7 @@ fn poisson_matches_count_poisson_without_max_delta_step() {
     let preds = [0.3f32, -1.0, 2.5, 0.0];
     let labels = [2.0f32, 0.0, 14.0, 1.0];
     let weights = [1.0f32, 0.5, 2.0, 1.5];
-    let dist = DistObjective::new(DistFamily::Poisson, DistGradient::Fisher);
+    let dist = DistLoss::new(DistFamily::Poisson, DistGradient::Fisher);
     let count = crate::objective::Poisson::new(0.0);
     for w in [None, Some(weights.as_slice())] {
         let a = gradient_pairs(&dist, &preds, &labels, w);
@@ -519,7 +519,7 @@ fn gradient_modes_pair_the_gradient_with_the_selected_curvature() {
         DistGradient::Hessian,
         DistGradient::Natural,
     ] {
-        let objective = DistObjective::new(family, mode);
+        let objective = DistLoss::new(family, mode);
         let out = gradient_pairs(&objective, &preds, &labels, Some(&weights));
         for i in 0..2 {
             let eta = [f64::from(preds[2 * i]), f64::from(preds[2 * i + 1])];
@@ -546,14 +546,14 @@ fn gradient_modes_pair_the_gradient_with_the_selected_curvature() {
     let family = DistFamily::NegativeBinomial;
     let eta = [0.0, 3.0];
     assert!(family.hessian(&eta, 5.0)[1][1] < 0.0);
-    let objective = DistObjective::new(family, DistGradient::Hessian);
+    let objective = DistLoss::new(family, DistGradient::Hessian);
     let out = gradient_pairs(&objective, &[0.0, 3.0], &[5.0], None);
     assert_eq!(out[1].hess, crate::objective::MIN_HESS);
 }
 
 #[test]
 fn transforms_and_links_round_trip() {
-    let objective = DistObjective::new(DistFamily::Normal, DistGradient::Fisher);
+    let objective = DistLoss::new(DistFamily::Normal, DistGradient::Fisher);
     let mut preds = [1.5f32, 0.25f32.ln(), -2.0, 50.0];
     objective.pred_transform(&mut preds);
     assert_eq!(preds[0], 1.5);
@@ -600,7 +600,7 @@ fn shared_trees_split_on_one_parameter_column() {
     let gpair: Vec<GradPair> = (0..6)
         .map(|i| GradPair::new(i as f32, 10.0 + i as f32))
         .collect();
-    let plain = DistObjective::new(DistFamily::Gamma, DistGradient::Fisher);
+    let plain = DistLoss::new(DistFamily::Gamma, DistGradient::Fisher);
     assert_eq!(plain.split_gradient(0, &gpair), None);
     let all = plain.with_split_direction(DistSplitDirection::All, 0);
     assert_eq!(all.split_gradient(0, &gpair), None);
@@ -626,7 +626,7 @@ fn shared_trees_split_on_one_parameter_column() {
     let ones = first.iter().filter(|&&m| m == 1).count();
     assert!((900..1100).contains(&ones), "{ones} of 2000");
     // One parameter: nothing to reduce.
-    let poisson = DistObjective::new(DistFamily::Poisson, DistGradient::Fisher)
+    let poisson = DistLoss::new(DistFamily::Poisson, DistGradient::Fisher)
         .with_split_direction(DistSplitDirection::Random, 0);
     assert_eq!(poisson.split_gradient(0, &gpair[..3]), None);
 }

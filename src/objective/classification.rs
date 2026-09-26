@@ -1,7 +1,8 @@
 //! Classification objectives.
 
 use super::{
-    GradPair, MIN_HESS, Objective, check_label_domain, newton_intercepts, weighted_label_mean,
+    GradPair, Loss, MIN_HESS, OutputDomain, check_base_score_domain, check_label_domain,
+    newton_intercepts, weighted_label_mean,
 };
 use crate::K_RT_EPS_F32;
 use crate::data::MetaInfo;
@@ -80,7 +81,7 @@ impl Default for Logistic {
     }
 }
 
-impl Objective for Logistic {
+impl Loss for Logistic {
     fn name(&self) -> &str {
         match self.variant {
             LogisticVariant::Binary => "binary:logistic",
@@ -140,6 +141,14 @@ impl Objective for Logistic {
         }
     }
 
+    fn validate_base_score(&self, base_score: f64) -> Result<()> {
+        // `binary:logitraw`'s link is the identity: any margin is valid.
+        if self.variant == LogisticVariant::Raw {
+            return Ok(());
+        }
+        check_base_score_domain(base_score, OutputDomain::Probability)
+    }
+
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
         // Cross-entropy `softplus(m) − y·m` (stable form), with positives
         // reweighted by `scale_pos_weight` exactly as in the gradient.
@@ -179,7 +188,7 @@ impl Objective for Logistic {
 #[non_exhaustive]
 pub struct Hinge;
 
-impl Objective for Hinge {
+impl Loss for Hinge {
     fn name(&self) -> &'static str {
         "binary:hinge"
     }

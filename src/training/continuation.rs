@@ -14,7 +14,7 @@ use crate::config::{
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::objective::Objective;
+use crate::objective::Loss;
 use crate::training::multi_output;
 
 /// Check that `init` can be trained further with `params` on `dtrain` and
@@ -32,7 +32,7 @@ use crate::training::multi_output;
 pub(super) fn resume_model(
     init: &BoostedModel,
     params: &TrainingParams,
-    objective: &dyn Objective,
+    objective: &dyn Loss,
     dtrain: &DMatrix,
     num_boost_round: usize,
     intercepts: impl FnOnce() -> Result<Vec<f32>>,

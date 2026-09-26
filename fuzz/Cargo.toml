@@ -68,3 +68,10 @@ path = "fuzz_targets/train.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "diffusion-model"
+path = "fuzz_targets/diffusion-model.rs"
+test = false
+doc = false
+bench = false

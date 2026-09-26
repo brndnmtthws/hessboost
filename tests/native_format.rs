@@ -13,6 +13,7 @@ use hessboost::config::{
     AftDistribution, BoosterKind, DistGradient, DistSplitDirection, MultiStrategy,
 };
 use hessboost::data::FeatureType;
+use hessboost::diffusion::{DiffusionModel, DiffusionParams, Method, ScoreConfig, Sde};
 use hessboost::model::compact::CompactModel;
 use hessboost::objective::distributional::DistFamily;
 use hessboost::prelude::*;
@@ -692,6 +693,23 @@ fn saved_models_keep_loading_with_their_margins() {
                 assert!(margins == expected, "{}: {name} (compact)", dir.display());
             }
         }
+        // Diffusion models are saved from the release after 0.2.0 on; its and
+        // later directories hold every case.
+        for (name, case) in diffusion_models() {
+            let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
+            if !file("hbdm").exists() {
+                continue;
+            }
+            let expected = std::fs::read(file("margins")).unwrap();
+            let binary = DiffusionModel::load_binary(file("hbdm")).unwrap();
+            let json = DiffusionModel::load_json(file("hbdm.json")).unwrap();
+            for (format, model) in [("hbdm", binary), ("hbdm.json", json)] {
+                assert_eq!(model.method(), case.method(), "{name} ({format})");
+                let margins = regressor_margins(&model);
+                assert!(margins == expected, "{}: {name} ({format})", dir.display());
+                assert!(model.sample(&matrix(1), 2, 0).is_ok(), "{name} ({format})");
+            }
+        }
     }
 }
 
@@ -717,4 +735,56 @@ fn save_models_of_this_version() {
         let margins = model.predict_margin(&data).unwrap();
         std::fs::write(file("margins"), margin_bytes(&margins)).unwrap();
     }
+    for (name, model) in diffusion_models() {
+        let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
+        model.save_binary(file("hbdm")).unwrap();
+        model.save_json(file("hbdm.json")).unwrap();
+        std::fs::write(file("margins"), regressor_margins(&model)).unwrap();
+    }
+}
+
+/// One small diffusion model per method, as saved for each release.
+fn diffusion_models() -> Vec<(&'static str, DiffusionModel)> {
+    let tiny = |mut params: DiffusionParams| {
+        params.n_repeats = 2;
+        params.num_boost_round = 4;
+        params.early_stopping = None;
+        params.training.nthread = 1;
+        if let Some(r) = &mut params.residualizer {
+            r.num_boost_round = 3;
+        }
+        params
+    };
+    let mut vp = ScoreConfig::treeffuser();
+    vp.sde = Sde::VariancePreserving {
+        beta_min: 0.1,
+        beta_max: 20.0,
+    };
+    let mut treeffuser_vp = tiny(DiffusionParams::treeffuser());
+    treeffuser_vp.method = Method::Score(vp);
+    [
+        ("diffusion score", tiny(DiffusionParams::default()), 1),
+        ("diffusion treeffuser vp", treeffuser_vp, 2),
+        (
+            "diffusion flow matching",
+            tiny(DiffusionParams::flow_matching()),
+            1,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, params, k)| (name, DiffusionModel::fit(&params, &matrix(k)).unwrap()))
+    .collect()
+}
+
+/// The margins of a diffusion model's regressor on a fixed probe, as bytes:
+/// prediction is plain arithmetic, so they match bit for bit on every
+/// platform (samples pass through `ln`/`exp`, which need not).
+fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
+    let regressor = model.regressor();
+    let cols = regressor.n_features();
+    let x: Vec<f32> = (0..16 * cols)
+        .map(|i| ((i * 37) % 101) as f32 / 25.0 - 2.0)
+        .collect();
+    let probe = DMatrix::from_dense(&x, 16, cols).unwrap();
+    margin_bytes(&regressor.predict_margin(&probe).unwrap())
 }

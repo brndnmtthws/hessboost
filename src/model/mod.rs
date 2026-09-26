@@ -214,8 +214,8 @@
 //! [`load_xgboost_ubjson`]: BoostedModel::load_xgboost_ubjson
 
 pub mod compact;
-mod native;
-mod sections;
+pub(crate) mod native;
+pub(crate) mod sections;
 mod shap;
 mod ubjson;
 mod xgboost;

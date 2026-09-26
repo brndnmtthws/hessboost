@@ -28,6 +28,7 @@ seed compact-model
 seed xgboost-json-model
 seed xgboost-ubjson-model
 seed loaders
+seed diffusion-model
 for version in "$data"/saved/*/; do
   v="$(basename "$version")"
   for file in "$version"*.bin; do

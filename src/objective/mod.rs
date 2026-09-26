@@ -1,10 +1,14 @@
 //! Learning objectives: gradients, Hessians, prediction transforms, and base
 //! score estimation.
 //!
-//! Every objective implements [`Loss`]. Boosting works in *margin* space
-//! (raw additive scores). The [`Loss::pred_transform`] maps margins to the
-//! reported prediction (e.g. the logistic sigmoid). This mirrors XGBoost's
-//! separation of `GetGradient` / `PredTransform`.
+//! Every objective trains through a [`Loss`]. Boosting works in *margin*
+//! space (raw additive scores). The [`Loss::pred_transform`] maps margins to
+//! the reported prediction (e.g. the logistic sigmoid). This mirrors
+//! XGBoost's separation of `GetGradient` / `PredTransform`. The built-in
+//! losses are built from a configuration by [`create_objective`]; their
+//! parameters ([`PseudoHuber`], [`Quantiles`], [`Expectiles`], [`Tweedie`],
+//! [`Aft`]) are validated when constructed and shared with the metrics
+//! that read them.
 
 mod absolute;
 mod classification;
@@ -13,23 +17,23 @@ mod custom;
 pub mod distributional;
 mod multi_target;
 mod multiclass;
+mod params;
 mod quantile;
 mod ranking;
 mod regression;
 mod survival;
 
-pub use absolute::AbsoluteError;
-pub use classification::{Hinge, Logistic};
-pub use count::{Gamma, Poisson, Tweedie};
+pub(crate) use absolute::AbsoluteError;
+pub(crate) use classification::{Hinge, Logistic};
+pub(crate) use count::{Gamma, Poisson, TweedieLoss};
 pub use custom::CustomLoss;
-pub use multiclass::Softmax;
-pub use quantile::{Expectile, Quantile};
-pub use ranking::LambdaMart;
-pub use regression::{PseudoHuber, SquaredError, SquaredLogError};
+pub(crate) use multiclass::Softmax;
+pub use params::{Aft, Expectiles, PseudoHuber, Quantiles, Tweedie};
+pub(crate) use quantile::{Expectile, Quantile};
+pub(crate) use ranking::LambdaMart;
+pub(crate) use regression::{PseudoHuberLoss, SquaredError, SquaredLogError};
 
-pub(crate) use quantile::validate_alphas;
-
-pub use survival::{Aft, Cox};
+pub(crate) use survival::{AftLoss, Cox};
 
 pub(crate) use survival::{abs_label_order, aft_nloglik};
 
@@ -407,10 +411,11 @@ pub trait Loss: Send + Sync {
         None
     }
 
-    /// The default evaluation metric for this objective, as XGBoost's
-    /// `DefaultEvalMetric` names it — including any configuration-dependent
-    /// suffix such as `ndcg@32` (LambdaRank's top-k) or `tweedie-nloglik@1.5`.
-    fn default_metric(&self) -> String;
+    /// The metric training evaluates when no `eval_metric` is configured:
+    /// XGBoost's `DefaultEvalMetric`, with the parameters it gives it (e.g.
+    /// `ndcg@32` from LambdaRank's top-k, `tweedie-nloglik@1.5` from the
+    /// variance power, the loss's own alphas or slope).
+    fn default_metric(&self) -> crate::metric::EvalMetric;
 }
 
 /// One Newton step from all-zero margins, per output: `w_k = -Σg_k /
@@ -596,7 +601,9 @@ pub(crate) fn weighted_label_mean(labels: &[f32], weights: Option<&[f32]>) -> f3
 pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box<dyn Loss>> {
     let objective: Box<dyn Loss> = match params.objective.as_str() {
         "reg:squarederror" | "reg:linear" => Box::new(SquaredError),
-        "reg:pseudohubererror" => Box::new(PseudoHuber::new(params.huber_slope as f32)),
+        "reg:pseudohubererror" => {
+            Box::new(PseudoHuberLoss::new(PseudoHuber::new(params.huber_slope)?))
+        }
         "binary:logistic" => Box::new(Logistic::new(params.scale_pos_weight as f32)),
         "binary:logitraw" => Box::new(Logistic::raw(params.scale_pos_weight as f32)),
         "binary:hinge" => Box::new(Hinge),
@@ -614,7 +621,9 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         }
         "count:poisson" => Box::new(Poisson::new(params.effective_max_delta_step() as f32)),
         "reg:gamma" => Box::new(Gamma),
-        "reg:tweedie" => Box::new(Tweedie::new(params.tweedie_variance_power as f32)),
+        "reg:tweedie" => Box::new(TweedieLoss::new(Tweedie::new(
+            params.tweedie_variance_power,
+        )?)),
         "reg:quantileerror" => Box::new(Quantile::new(&params.quantile_alpha)?),
         "reg:expectileerror" => Box::new(Expectile::new(&params.expectile_alpha)?),
         "reg:absoluteerror" => return Ok(Box::new(AbsoluteError::new(n_targets))),
@@ -622,7 +631,7 @@ pub fn create_objective(params: &TrainingParams, n_targets: usize) -> Result<Box
         "rank:ndcg" => Box::new(LambdaMart::ndcg(params.lambdarank_num_pair_per_sample)),
         "rank:map" => Box::new(LambdaMart::map(params.lambdarank_num_pair_per_sample)),
         "survival:cox" => Box::new(Cox),
-        "survival:aft" => Box::new(Aft::new(
+        "survival:aft" => Box::new(AftLoss::new(
             params.aft_loss_distribution,
             params.aft_loss_distribution_scale as f32,
         )),
@@ -697,8 +706,8 @@ mod tests {
                     *g = GradPair::new(preds[i] - f32::midpoint(lo[i], hi[i]), 1.0);
                 }
             }
-            fn default_metric(&self) -> String {
-                "rmse".to_string()
+            fn default_metric(&self) -> crate::metric::EvalMetric {
+                crate::metric::EvalMetric::Rmse
             }
         }
         let (lower, upper) = ([0.0f32, 4.0], [2.0f32, 6.0]);
@@ -820,7 +829,7 @@ mod tests {
             ),
             (Box::new(Gamma), 1, (1..=15).map(|r| 2 * c + r).collect()),
             (
-                Box::new(Tweedie::new(1.3)),
+                Box::new(TweedieLoss::new(Tweedie::new(1.3).unwrap())),
                 1,
                 (1..=15).map(|r| 2 * c + r).collect(),
             ),

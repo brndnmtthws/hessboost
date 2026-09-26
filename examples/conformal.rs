@@ -76,7 +76,7 @@ fn main() -> Result<()> {
             }
         }
     })
-    .with_default_metric("mae");
+    .with_default_metric(hessboost::metric::EvalMetric::Mae);
     let quantiles = Trainer::new(&params, &dtrain, 200)
         .loss(&pinball)
         .train()?

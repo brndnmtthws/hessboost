@@ -53,7 +53,8 @@
 //!   native and XGBoost JSON/UBJSON); [`model::compact`].
 //! - [`objective`]: the `Loss` trait, the built-in objectives,
 //!   `CustomLoss`, [`objective::distributional`] (`dist:*` objectives).
-//! - [`metric`]: the `Metric` trait, the built-in metrics, `CustomMetric`.
+//! - [`metric`]: [`EvalMetric`](metric::EvalMetric) (the built-in metrics),
+//!   the `Metric` trait, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
@@ -84,12 +85,15 @@
 //!   ([`DMatrix::with_label_matrix`](data::DMatrix::with_label_matrix)), one
 //!   tree per output or vector-leaf trees
 //!   ([`MultiStrategy::MultiOutputTree`](config::MultiStrategy::MultiOutputTree)).
-//! - **Metrics:** rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
+//! - **Metrics** ([`EvalMetric`](metric::EvalMetric), each with its own
+//!   parameters): rmse, rmsle, mae, mape, mphe, logloss, error, auc, aucpr,
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
 //!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, plus
-//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric));
+//!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric),
+//!   reported after them as in XGBoost). XGBoost's names parse through
+//!   [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost):
 //!   `@k` ranking cutoffs and `@rho` on tweedie-nloglik, other suffixes
-//!   refused ([`create_metric`](metric::create_metric)).
+//!   refused.
 //! - **Modeling:** monotone and interaction constraints, native categorical
 //!   splits, early stopping, feature importance, QuadratureTreeSHAP values
 //!   and interactions
@@ -207,14 +211,17 @@ pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 /// [`TrainingParamsBuilder::tree_method`](config::TrainingParamsBuilder::tree_method)),
 /// [`ImportanceType`](model::ImportanceType) (for
 /// [`BoostedModel::feature_importance`](model::BoostedModel::feature_importance)),
+/// [`EvalMetric`](metric::EvalMetric) (for
+/// [`TrainingParamsBuilder::eval_metric`](config::TrainingParamsBuilder::eval_metric)),
 /// and [`ObjectiveParams`](config::ObjectiveParams) (a model's
 /// [`objective_params`](model::BoostedModel::objective_params)). Everything
-/// else (the other parameter enums, objectives, metrics, conformal
-/// intervals, ...) is imported from its module.
+/// else (the other parameter enums, objectives, metric parameters,
+/// conformal intervals, ...) is imported from its module.
 pub mod prelude {
     pub use crate::config::{ObjectiveParams, TrainingParams, TreeMethod};
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
+    pub use crate::metric::EvalMetric;
     pub use crate::model::{BoostedModel, ImportanceType};
     pub use crate::training::{Trainer, train};
 }

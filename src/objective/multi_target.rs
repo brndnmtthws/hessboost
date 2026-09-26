@@ -121,7 +121,7 @@ impl Loss for MultiTarget {
         self.inner.requires_labels()
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> crate::metric::EvalMetric {
         self.inner.default_metric()
     }
 }

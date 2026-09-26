@@ -94,8 +94,8 @@ impl Loss for Softmax {
         check_label_domain(info, |y| y.fract() != 0.0 || y < 0.0 || y >= k)
     }
 
-    fn default_metric(&self) -> String {
-        "mlogloss".to_string()
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::MLogLoss
     }
 }
 

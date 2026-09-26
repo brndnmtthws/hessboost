@@ -626,7 +626,7 @@ mod tests {
                 }
             }
         })
-        .with_default_metric("mae");
+        .with_default_metric(crate::metric::EvalMetric::Mae);
         let params = TrainingParams::builder()
             .max_depth(4)
             .eta(0.3)

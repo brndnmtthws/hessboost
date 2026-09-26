@@ -156,8 +156,8 @@ impl Loss for AbsoluteError {
         super::check_label_width(info, self.n_targets)
     }
 
-    fn default_metric(&self) -> String {
-        "mae".to_string()
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::Mae
     }
 }
 

@@ -105,8 +105,8 @@ impl Loss for Cox {
         check_base_score_domain(base_score, OutputDomain::Positive)
     }
 
-    fn default_metric(&self) -> String {
-        "cox-nloglik".to_string()
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::CoxNLogLik
     }
 }
 
@@ -132,16 +132,16 @@ impl Loss for Cox {
 /// ([`Loss::gradient`]), the ordinary labels are treated as observed
 /// times.
 #[derive(Debug, Clone, Copy)]
-pub struct Aft {
+pub struct AftLoss {
     distribution: AftDistribution,
     sigma: f32,
 }
 
-impl Aft {
+impl AftLoss {
     /// Create with the noise `distribution` and its scale `sigma`
     /// (XGBoost `aft_loss_distribution`, `aft_loss_distribution_scale`).
     pub fn new(distribution: AftDistribution, sigma: f32) -> Self {
-        Aft {
+        AftLoss {
             distribution,
             sigma,
         }
@@ -202,14 +202,14 @@ impl Aft {
     }
 }
 
-impl Default for Aft {
+impl Default for AftLoss {
     /// XGBoost's defaults: normal noise with scale 1.
     fn default() -> Self {
-        Aft::new(AftDistribution::Normal, 1.0)
+        AftLoss::new(AftDistribution::Normal, 1.0)
     }
 }
 
-impl Loss for Aft {
+impl Loss for AftLoss {
     fn name(&self) -> &'static str {
         "survival:aft"
     }
@@ -268,8 +268,15 @@ impl Loss for Aft {
         false
     }
 
-    fn default_metric(&self) -> String {
-        "aft-nloglik".to_string()
+    /// XGBoost configures the default metric from the objective's
+    /// `DefaultMetricConfig` but without the user's parameters (the learner
+    /// has cleared them by the time it evaluates): the distribution carries
+    /// over while the scale falls back to its default 1. List `aft-nloglik`
+    /// in `eval_metric` to evaluate the likelihood at the configured scale.
+    fn default_metric(&self) -> crate::metric::EvalMetric {
+        crate::metric::EvalMetric::AftNLogLik(crate::objective::Aft::with_distribution(
+            self.distribution,
+        ))
     }
 }
 
@@ -924,7 +931,7 @@ mod tests {
 
     #[test]
     fn aft_reads_bounds_and_weights() {
-        let obj = Aft::new(AftDistribution::Normal, 1.0);
+        let obj = AftLoss::new(AftDistribution::Normal, 1.0);
         let lower = [1.0, 2.0, 0.0];
         let upper = [1.0, f32::INFINITY, 3.0];
         let weights = [1.0, 2.0, 0.5];

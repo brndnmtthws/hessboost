@@ -107,7 +107,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`config/params.rs`|`TrainingParams`, builder, `validate`, parameter enums, `ObjectiveParams`|
 |`config/xgboost.rs`|XGBoost's flat parameter form: `TrainingParams::from_xgboost`/`to_xgboost` (keys, aliases, value spellings, one-setting options), `changed_keys`|
 |`objective/`|files by XGBoost family; `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`)|
-|`metric/`|`mod.rs` holds the factory, defaults, and most metrics; the rest by family|
+|`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`|
 |`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public)|
@@ -247,14 +247,22 @@ XGBoost saves for `model/xgboost.rs` tests. `benches/training.rs`
   refuses. Every eval set is checked before training (`validate_info`;
   `prediction_width` equal to the model's outputs, or for `None` a whole
   number per label column); `Metric::eval` returns NaN on length mismatch.
-  `Metric::name` is XGBoost's `evals_result` key, suffix included
-  (`ndcg@5`, `pre@3`, `tweedie-nloglik@1.5`), so parity compares names.
+  `Metric::name` (and `EvalMetric::name`, equal to it) is XGBoost's
+  `evals_result` key, suffix included (`ndcg@5`, `pre@3`,
+  `tweedie-nloglik@1.5`), so parity compares names. Every `EvalMetric`
+  carries its own parameters; only `from_xgboost` fills them from the
+  flat keys XGBoost's metrics borrow (`huber_slope`, the alpha lists, the
+  AFT noise, the `dist:*` family), and `Loss::default_metric` gives the
+  loss's own (AFT's at scale 1, as XGBoost). `mlogloss`/`merror` read the
+  class count from the model's outputs. A `Trainer::custom_metric` is
+  evaluated after the configured or default metrics, as XGBoost's
+  `xgb.train` does.
 - **Refusals:** unsupported parameters or combinations error, never get
   ignored. Checks live in `TrainingParams::validate` (static),
   `TrainingParams::from_xgboost` (keys and value spellings),
   `validate_request` in `training/train.rs` (data-dependent),
   `training/multi_output.rs::validate`, `training/continuation.rs`,
-  `metric/mod.rs::build` (metric suffixes), and `training/budget.rs`.
+  `EvalMetric::from_xgboost` (metric names and suffixes), and `training/budget.rs`.
   Budget mode and refresh compare params against defaults plus an
   allow-list (`TrainingParams::refuse_changes_from`, over `changed_keys`,
   which destructures every field), so any new field is refused there

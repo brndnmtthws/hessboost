@@ -5,6 +5,7 @@
 //! margins and writes gradient/Hessian pairs, matching the built-in losses.
 
 use super::{GradPair, Loss, SplitGradient};
+use crate::metric::EvalMetric;
 
 type GradFn = dyn Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Send + Sync;
 type TransformFn = dyn Fn(&mut [f32]) + Send + Sync;
@@ -15,6 +16,7 @@ type SplitGradFn = dyn Fn(usize, &[GradPair]) -> Option<SplitGradient> + Send + 
 /// hook.
 ///
 /// ```
+/// use hessboost::metric::EvalMetric;
 /// use hessboost::objective::{CustomLoss, GradPair};
 ///
 /// let squared = CustomLoss::new("my:squarederror", 1, |margins, labels, _weights, out| {
@@ -23,14 +25,14 @@ type SplitGradFn = dyn Fn(usize, &[GradPair]) -> Option<SplitGradient> + Send + 
 ///     }
 /// })
 /// .with_base_margin(0.5)
-/// .with_default_metric("mae");
+/// .with_default_metric(EvalMetric::Mae);
 /// # let _ = squared;
 /// ```
 pub struct CustomLoss {
     name: String,
     n_outputs: usize,
     base: f32,
-    default_metric: String,
+    default_metric: EvalMetric,
     grad_fn: Box<GradFn>,
     transform_fn: Option<Box<TransformFn>>,
     split_grad_fn: Option<Box<SplitGradFn>>,
@@ -57,7 +59,7 @@ impl CustomLoss {
             name: name.into(),
             n_outputs,
             base: 0.0,
-            default_metric: "rmse".to_owned(),
+            default_metric: EvalMetric::Rmse,
             grad_fn: Box::new(gradient),
             transform_fn: None,
             split_grad_fn: None,
@@ -74,8 +76,8 @@ impl CustomLoss {
 
     /// Evaluate with `metric` when no `eval_metric` is configured.
     #[must_use]
-    pub fn with_default_metric(mut self, metric: impl Into<String>) -> Self {
-        self.default_metric = metric.into();
+    pub fn with_default_metric(mut self, metric: EvalMetric) -> Self {
+        self.default_metric = metric;
         self
     }
 
@@ -157,7 +159,7 @@ impl Loss for CustomLoss {
         vec![self.base; self.n_outputs]
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> EvalMetric {
         self.default_metric.clone()
     }
 

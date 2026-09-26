@@ -3,7 +3,7 @@
 
 use hessboost::config::Monotone;
 use hessboost::data::FeatureType;
-use hessboost::metric::{Metric, Rmse};
+use hessboost::metric::EvalMetric;
 use hessboost::prelude::*;
 
 mod common;
@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         30,
     )?;
     let pc = mc.predict(&dc)?;
-    let rmse = Rmse::default().eval(&pc, &yc, None);
+    let rmse = EvalMetric::Rmse.build(1)?.eval(&pc, &yc, None);
     println!("categorical fit RMSE on non-ordinal pattern: {rmse:.4}");
     Ok(())
 }

@@ -7,6 +7,8 @@ use super::{
 };
 use crate::data::MetaInfo;
 use crate::error::Result;
+use crate::metric::EvalMetric;
+use crate::objective::Tweedie;
 
 /// Half the Poisson unit deviance at log-mean `margin`: `y ln(y/μ) − (y − μ)`,
 /// whose margin derivative is the Poisson gradient `μ − y`.
@@ -106,8 +108,8 @@ impl Loss for Poisson {
         check_label_domain(info, |y| y < 0.0)
     }
 
-    fn default_metric(&self) -> String {
-        "poisson-nloglik".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::PoissonNLogLik
     }
 }
 
@@ -156,32 +158,36 @@ impl Loss for Gamma {
         check_label_domain(info, |y| y <= 0.0)
     }
 
-    fn default_metric(&self) -> String {
-        "gamma-nloglik".to_string()
+    fn default_metric(&self) -> EvalMetric {
+        EvalMetric::GammaNLogLik
     }
 }
 
 /// Tweedie regression (`reg:tweedie`) with variance power `rho ∈ [1, 2)`
 /// (XGBoost `tweedie_variance_power`; 1 is Poisson, 2 would be Gamma).
 #[derive(Debug, Clone, Copy)]
-pub struct Tweedie {
+pub(crate) struct TweedieLoss {
+    param: Tweedie,
     rho: f32,
 }
 
-impl Tweedie {
-    /// Create with the given Tweedie variance power.
-    pub fn new(rho: f32) -> Self {
-        Tweedie { rho }
+impl TweedieLoss {
+    /// The loss at variance power `param`.
+    pub(crate) fn new(param: Tweedie) -> Self {
+        TweedieLoss {
+            param,
+            rho: param.variance_power() as f32,
+        }
     }
 }
 
-impl Default for Tweedie {
+impl Default for TweedieLoss {
     fn default() -> Self {
-        Tweedie { rho: 1.5 }
+        TweedieLoss::new(Tweedie::default())
     }
 }
 
-impl Loss for Tweedie {
+impl Loss for TweedieLoss {
     fn name(&self) -> &'static str {
         "reg:tweedie"
     }
@@ -227,10 +233,10 @@ impl Loss for Tweedie {
         check_label_domain(info, |y| y < 0.0)
     }
 
-    fn default_metric(&self) -> String {
+    fn default_metric(&self) -> EvalMetric {
         // XGBoost `TweedieRegression::Configure` names the metric with the
         // configured power so evaluation uses the same distribution.
-        format!("tweedie-nloglik@{}", self.rho)
+        EvalMetric::TweedieNLogLik(self.param)
     }
 }
 
@@ -264,7 +270,7 @@ mod tests {
 
     #[test]
     fn tweedie_transform_is_exp() {
-        let obj = Tweedie::default();
+        let obj = TweedieLoss::default();
         let mut p = [0.0f32, 1.0];
         obj.pred_transform(&mut p);
         assert_relative_eq!(p[0], 1.0, epsilon = 1e-6);

@@ -81,7 +81,7 @@
 
 use hessboost::config::BoosterKind;
 use hessboost::data::{CsvOptions, load_csv};
-use hessboost::metric::{Auc, LogLoss, Metric};
+use hessboost::metric::EvalMetric;
 use hessboost::prelude::*;
 use std::path::Path;
 
@@ -118,11 +118,11 @@ struct Score {
     auc: f64,
 }
 
-fn score(p: &[f32], y: &[f32]) -> Score {
-    Score {
-        logloss: LogLoss::default().eval(p, y, None),
-        auc: Auc::default().eval(p, y, None),
-    }
+fn score(p: &[f32], y: &[f32]) -> Result<Score> {
+    Ok(Score {
+        logloss: EvalMetric::LogLoss.build(1)?.eval(p, y, None),
+        auc: EvalMetric::Auc.build(1)?.eval(p, y, None),
+    })
 }
 
 fn sigmoid(z: f32) -> f32 {
@@ -144,7 +144,7 @@ struct Comparison {
 fn params() -> Result<TrainingParams> {
     TrainingParams::builder()
         .objective("binary:logistic")
-        .eval_metric("logloss")
+        .eval_metric(hessboost::metric::EvalMetric::LogLoss)
         .max_depth(3)
         .eta(0.05)
         .build()
@@ -162,7 +162,7 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
     let prior = score(
         &test.prior.iter().map(|&z| sigmoid(z)).collect::<Vec<_>>(),
         test.labels(),
-    );
+    )?;
 
     // Baseline: boosting from the constant intercept, early-stopped on `valid`.
     let scratch = Trainer::new(&params, &train.data, MAX_ROUNDS)
@@ -186,7 +186,10 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
             .early_stopping_rounds(EARLY_STOPPING)
             .train()?
             .model;
-        let valid_loss = LogLoss::default().eval(&model.predict(&dvalid)?, valid.labels(), None);
+        let valid_loss =
+            EvalMetric::LogLoss
+                .build(1)?
+                .eval(&model.predict(&dvalid)?, valid.labels(), None);
         if best.as_ref().is_none_or(|(loss, ..)| valid_loss < *loss) {
             best = Some((valid_loss, s, c, model));
         }
@@ -196,12 +199,12 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
     let dtest = test.with_prior(scale, c)?;
     Ok(Comparison {
         prior,
-        scratch: score(&scratch.predict(&test.data)?, test.labels()),
+        scratch: score(&scratch.predict(&test.data)?, test.labels())?,
         scratch_trees: used_rounds(&scratch),
-        boosted: score(&boosted.predict(&dtest)?, test.labels()),
+        boosted: score(&boosted.predict(&dtest)?, test.labels())?,
         boosted_trees: used_rounds(&boosted),
         scale,
-        forgot_prior: score(&boosted.predict(&test.data)?, test.labels()),
+        forgot_prior: score(&boosted.predict(&test.data)?, test.labels())?,
     })
 }
 

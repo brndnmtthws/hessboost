@@ -5,13 +5,16 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _data, _hessboost
 from hessboost._exceptions import HessboostError
+
+if TYPE_CHECKING:
+    from hessboost.inference import BoulevardInfo
 
 __all__ = [
     "Booster",
@@ -439,6 +442,14 @@ class Booster:
     def objective(self) -> str:
         """The objective the model was trained with, e.g. ``"binary:logistic"``."""
         return self._model.objective
+
+    @property
+    def boulevard(self) -> BoulevardInfo | None:
+        """How a ``booster = boulevard`` model was trained, or ``None`` (see
+        :mod:`hessboost.inference`)."""
+        from hessboost.inference import BoulevardInfo
+
+        return BoulevardInfo._from_core(self._model.boulevard)
 
     @property
     def best_iteration(self) -> int | None:

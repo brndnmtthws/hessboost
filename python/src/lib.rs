@@ -19,6 +19,7 @@ mod conformal;
 mod data;
 mod dist;
 mod errors;
+mod inference;
 mod online;
 mod params;
 mod train;
@@ -34,6 +35,8 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<conformal::SplitConformal>()?;
     m.add_class::<conformal::ConformalizedQuantile>()?;
     m.add_class::<online::OnlineModel>()?;
+    m.add_class::<inference::BoulevardInference>()?;
+    m.add_function(wrap_pyfunction!(inference::honest_refit, m)?)?;
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
     m.add_function(wrap_pyfunction!(train::cv, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;

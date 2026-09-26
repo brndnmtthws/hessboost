@@ -449,4 +449,10 @@ impl Booster {
     fn vector_leaves(&self) -> bool {
         self.model.has_vector_leaves()
     }
+
+    /// The Boulevard record of a `booster = boulevard` model, else `None`.
+    #[getter]
+    fn boulevard<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        crate::inference::boulevard_info(py, &self.model)
+    }
 }

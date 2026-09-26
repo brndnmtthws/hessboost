@@ -14,6 +14,7 @@ XGBoost JSON and UBJSON model files.
 - **Typed** (`py.typed`, complete type information), with the GIL released
   while training and predicting, and free-threaded CPython supported.
 - **More than XGBoost, opt-in.** Conformal prediction intervals,
+  confidence intervals for the regression function (Boulevard boosting),
   distributional boosting (a predictive distribution per row), LightGBM/CatBoost
   tree options, class-balanced binary bagging, and XE-NDCG ranking
   (`objective="rank:xendcg"`).
@@ -185,6 +186,14 @@ online = OnlineModel.train({"tree_method": "hist", "max_depth": 6},
                            hessboost.DMatrix(X_train, y_train), 100, tolerance=0.1)
 report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
 online.model.predict(X_test)   # online.data: the updated training rows
+
+from hessboost.inference import BoulevardInference, honest_refit
+
+params = {"booster": "boulevard", "eta": 0.8, "boulevard_dropout": 0.5, "subsample": 0.8}
+trained = hessboost.train(params, hessboost.DMatrix(X_struct, y_struct), 200)
+model = honest_refit(trained, X_values, y_values)   # leaves from independent rows
+inference = BoulevardInference.fit(model, X_values, holdout=X_cal, holdout_label=y_cal)
+lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T   # for f(x)
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
@@ -200,6 +209,12 @@ online.model.predict(X_test)   # online.data: the updated training rows
   interrupted (Ctrl-C) update changes nothing. `OnlineModel.from_model`
   resumes from a saved `Booster` and its training data. Updates need `hist`
   depth-wise trees without sampling or constraints and unweighted data.
+- `hessboost.inference`: Boulevard boosting's asymptotic confidence,
+  prediction (Gaussian noise), and reproduction intervals for `f(x)`
+  (`BoulevardInference`, exact or Nystrom), `honest_refit`, and
+  `Booster.boulevard`. The intervals are conditional on the tree
+  structures: nominal for low-dimensional smooth signals after an honest
+  refit, under-covering elsewhere (see the crate's `inference` docs).
 - `hessboost.folds`: `k_fold`, `forward_chaining` (expanding-window,
   purged by a row `gap`), and `purged_forward` (timestamped rows, purged
   by each row's own label window, for overlapping or irregular horizons)

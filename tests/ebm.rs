@@ -299,13 +299,18 @@ fn unsupported_combinations_are_refused() {
     ])
     .unwrap();
     assert_eq!(off, flat(&[("booster", ebm.clone())]).unwrap());
-    assert_eq!(
-        invalid_param(flat(&[
-            ("booster", ebm.clone()),
-            ("ebm_early_stopping_tolerance", serde_json::json!(0.0)),
-        ])),
-        "ebm_early_stopping_tolerance"
-    );
+    // Even the default tolerance (which the `0`-rounds form used to accept)
+    // is refused without early stopping, rounds absent or `0`.
+    for tolerance in [0.0, EbmEarlyStopping::DEFAULT_TOLERANCE] {
+        let tolerance = ("ebm_early_stopping_tolerance", serde_json::json!(tolerance));
+        let zero = ("ebm_early_stopping_rounds", serde_json::json!(0));
+        for pairs in [
+            vec![("booster", ebm.clone()), tolerance.clone()],
+            vec![("booster", ebm.clone()), zero, tolerance],
+        ] {
+            assert_eq!(invalid_param(flat(&pairs)), "ebm_early_stopping_tolerance");
+        }
+    }
     let on = flat(&[
         ("booster", ebm.clone()),
         ("ebm_bag_fraction", serde_json::json!(0.8)),

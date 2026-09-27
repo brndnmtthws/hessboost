@@ -155,7 +155,13 @@ def test_early_stopping_rounds_zero_is_off() -> None:
     off = hessboost.train({**CLASSIC, "ebm_early_stopping_rounds": 0}, dtrain, 5)
     plain = hessboost.train(CLASSIC, dtrain, 5)
     np.testing.assert_array_equal(off.predict(x), plain.predict(x))
-    with pytest.raises(hessboost.HessboostError, match="ebm_early_stopping_tolerance"):
-        hessboost.train({**CLASSIC, "ebm_early_stopping_tolerance": 0.01}, dtrain, 5)
+    # Even the default tolerance is refused without early stopping, rounds
+    # absent or 0.
+    for off_rounds in ({}, {"ebm_early_stopping_rounds": 0}):
+        for tolerance in (0.01, 1e-5):
+            with pytest.raises(hessboost.HessboostError, match="ebm_early_stopping_tolerance"):
+                hessboost.train(
+                    {**CLASSIC, **off_rounds, "ebm_early_stopping_tolerance": tolerance}, dtrain, 5
+                )
     stopped = {**CLASSIC, "ebm_bag_fraction": 0.8, "ebm_early_stopping_rounds": 2}
     hessboost.train({**stopped, "ebm_early_stopping_tolerance": 0.01}, dtrain, 5)

@@ -11,6 +11,8 @@ use super::{
     Xendcg, multi_target::MultiTarget,
 };
 use crate::error::{HessboostError, Result};
+use serde::Serialize;
+use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
 
@@ -222,6 +224,113 @@ impl Default for ObjectiveParts {
     }
 }
 
+/// One flat XGBoost key of an objective parameter: who reads it and its
+/// value in [`ObjectiveParts`]. [`OBJECTIVE_PARAMS`] lists every one.
+pub(crate) struct ObjectiveParam {
+    /// The flat key.
+    pub(crate) key: &'static str,
+    /// The objectives and metrics that read it, for the refusal of a key
+    /// nothing reads.
+    pub(crate) users: &'static str,
+    /// Whether `objective` reads it.
+    pub(crate) read_by: fn(&Objective) -> bool,
+    /// Its flat value in `parts`; `None` leaves it out (a default split
+    /// direction).
+    pub(crate) value: fn(&ObjectiveParts) -> Option<Value>,
+}
+
+/// `value` as JSON; every parameter serializes.
+fn json(value: impl Serialize) -> Option<Value> {
+    serde_json::to_value(value).ok()
+}
+
+/// Every flat objective-parameter key, the one registry of which
+/// objectives read which key (metrics borrow theirs through
+/// `EvalMetric::borrowed_keys`).
+pub(crate) const OBJECTIVE_PARAMS: &[ObjectiveParam] = &[
+    ObjectiveParam {
+        key: "num_class",
+        users: "`multi:softmax` and `multi:softprob`",
+        read_by: |o| matches!(o, Objective::Softmax(_) | Objective::Softprob(_)),
+        value: |p| json(p.num_class),
+    },
+    ObjectiveParam {
+        key: "scale_pos_weight",
+        users: "`reg:squarederror`, `reg:gamma`, `reg:logistic`, `binary:logistic`, and \
+                `binary:logitraw`",
+        read_by: |o| {
+            matches!(
+                o,
+                Objective::SquaredError(_)
+                    | Objective::RegLogistic(_)
+                    | Objective::BinaryLogistic(_)
+                    | Objective::BinaryLogitRaw(_)
+                    | Objective::Gamma(_)
+            )
+        },
+        value: |p| json(p.scale_pos_weight),
+    },
+    ObjectiveParam {
+        key: "tweedie_variance_power",
+        users: "`reg:tweedie`",
+        read_by: |o| matches!(o, Objective::Tweedie(_)),
+        value: |p| json(p.tweedie_variance_power),
+    },
+    ObjectiveParam {
+        key: "huber_slope",
+        users: "`reg:pseudohubererror` and the `mphe` metric",
+        read_by: |o| matches!(o, Objective::PseudoHuber(_)),
+        value: |p| json(p.huber_slope),
+    },
+    ObjectiveParam {
+        key: "lambdarank_num_pair_per_sample",
+        users: "the `rank:*` objectives",
+        read_by: |o| {
+            matches!(
+                o,
+                Objective::RankPairwise(_) | Objective::RankNdcg(_) | Objective::RankMap(_)
+            )
+        },
+        value: |p| json(p.lambdarank_num_pair_per_sample),
+    },
+    ObjectiveParam {
+        key: "quantile_alpha",
+        users: "`reg:quantileerror` and the `quantile` metric",
+        read_by: |o| matches!(o, Objective::Quantile(_)),
+        value: |p| json(&p.quantile_alpha),
+    },
+    ObjectiveParam {
+        key: "expectile_alpha",
+        users: "`reg:expectileerror` and the `expectile` metric",
+        read_by: |o| matches!(o, Objective::Expectile(_)),
+        value: |p| json(&p.expectile_alpha),
+    },
+    ObjectiveParam {
+        key: "aft_loss_distribution",
+        users: "`survival:aft` and the `aft-nloglik` metric",
+        read_by: |o| matches!(o, Objective::Aft(_)),
+        value: |p| json(p.aft_loss_distribution),
+    },
+    ObjectiveParam {
+        key: "aft_loss_distribution_scale",
+        users: "`survival:aft` and the `aft-nloglik` metric",
+        read_by: |o| matches!(o, Objective::Aft(_)),
+        value: |p| json(p.aft_loss_distribution_scale),
+    },
+    ObjectiveParam {
+        key: "dist_gradient",
+        users: "the `dist:*` objectives",
+        read_by: |o| matches!(o, Objective::Dist(_)),
+        value: |p| json(p.dist_gradient),
+    },
+    ObjectiveParam {
+        key: "dist_split_direction",
+        users: "the `dist:*` objectives",
+        read_by: |o| matches!(o, Objective::Dist(_)),
+        value: |p| json(p.dist_split_direction?),
+    },
+];
+
 impl Objective {
     /// A custom loss as the objective.
     pub fn custom(loss: impl Loss + 'static) -> Self {
@@ -350,34 +459,6 @@ impl Objective {
             | Objective::Cox
             | Objective::Aft(_)
             | Objective::Dist(_) => LabelMatrix::Refused,
-        }
-    }
-
-    /// The flat XGBoost keys whose values this objective reads.
-    pub(crate) fn parameter_keys(&self) -> &'static [&'static str] {
-        match self {
-            Objective::PseudoHuber(_) => &["huber_slope"],
-            Objective::Quantile(_) => &["quantile_alpha"],
-            Objective::Expectile(_) => &["expectile_alpha"],
-            Objective::SquaredError(_)
-            | Objective::RegLogistic(_)
-            | Objective::BinaryLogistic(_)
-            | Objective::BinaryLogitRaw(_)
-            | Objective::Gamma(_) => &["scale_pos_weight"],
-            Objective::Softmax(_) | Objective::Softprob(_) => &["num_class"],
-            Objective::Tweedie(_) => &["tweedie_variance_power"],
-            Objective::RankPairwise(_) | Objective::RankNdcg(_) | Objective::RankMap(_) => {
-                &["lambdarank_num_pair_per_sample"]
-            }
-            Objective::Aft(_) => &["aft_loss_distribution", "aft_loss_distribution_scale"],
-            Objective::Dist(_) => &["dist_gradient", "dist_split_direction"],
-            Objective::SquaredLogError
-            | Objective::AbsoluteError
-            | Objective::BinaryHinge
-            | Objective::Poisson
-            | Objective::RankXendcg
-            | Objective::Cox
-            | Objective::Custom(_) => &[],
         }
     }
 

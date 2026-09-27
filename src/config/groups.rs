@@ -10,7 +10,8 @@
 
 use std::num::NonZeroUsize;
 
-use crate::error::{HessboostError, Result};
+use crate::check::{ensure, fraction, non_negative, positive, unit};
+use crate::error::Result;
 
 /// DART's dropout (XGBoost `booster = dart`): each round drops every
 /// existing tree with probability `rate_drop`, unless the whole dropout is
@@ -79,27 +80,21 @@ pub struct DartBuilder {
 }
 
 impl DartBuilder {
-    /// Set the fraction of trees dropped each round (`rate_drop`).
-    #[must_use]
-    pub fn rate_drop(mut self, rate_drop: f64) -> Self {
-        self.dart.rate = rate_drop;
-        self
-    }
+    setter!(
+        /// Set the fraction of trees dropped each round (`rate_drop`).
+        rate_drop: f64 => dart.rate
+    );
 
-    /// Set the probability of skipping the dropout (`skip_drop`).
-    #[must_use]
-    pub fn skip_drop(mut self, skip_drop: f64) -> Self {
-        self.dart.skip = skip_drop;
-        self
-    }
+    setter!(
+        /// Set the probability of skipping the dropout (`skip_drop`).
+        skip_drop: f64 => dart.skip
+    );
 
-    /// Set whether a round that draws no tree drops one at random
-    /// (`one_drop`).
-    #[must_use]
-    pub fn one_drop(mut self, one_drop: bool) -> Self {
-        self.dart.force_one = one_drop;
-        self
-    }
+    setter!(
+        /// Set whether a round that draws no tree drops one at random
+        /// (`one_drop`).
+        one_drop: bool => dart.force_one
+    );
 
     /// The validated dropout.
     ///
@@ -168,20 +163,16 @@ pub struct BoulevardBuilder {
 }
 
 impl BoulevardBuilder {
-    /// Set BRAT-D's dropout probability (`boulevard_dropout`).
-    #[must_use]
-    pub fn dropout(mut self, dropout: f64) -> Self {
-        self.boulevard.dropout = dropout;
-        self
-    }
+    setter!(
+        /// Set BRAT-D's dropout probability (`boulevard_dropout`).
+        dropout: f64 => boulevard.dropout
+    );
 
-    /// Set the residual truncation level `M > 0` (`boulevard_truncation`;
-    /// leave it unset for none).
-    #[must_use]
-    pub fn truncation(mut self, truncation: f64) -> Self {
-        self.boulevard.truncation = Some(truncation);
-        self
-    }
+    setter!(
+        /// Set the residual truncation level `M > 0` (`boulevard_truncation`;
+        /// leave it unset for none).
+        truncation: f64 => Some(boulevard.truncation)
+    );
 
     /// The validated settings.
     ///
@@ -194,19 +185,17 @@ impl BoulevardBuilder {
             dropout,
             truncation,
         } = self.boulevard;
-        if !(dropout.is_finite() && (0.0..1.0).contains(&dropout)) {
-            return Err(HessboostError::invalid_param(
-                "boulevard_dropout",
-                format!("must be in [0, 1), got {dropout}"),
-            ));
-        }
-        if let Some(truncation) = truncation
-            && !(truncation.is_finite() && truncation > 0.0)
-        {
-            return Err(HessboostError::invalid_param(
+        ensure(
+            "boulevard_dropout",
+            dropout.is_finite() && (0.0..1.0).contains(&dropout),
+            format!("must be in [0, 1), got {dropout}"),
+        )?;
+        if let Some(truncation) = truncation {
+            ensure(
                 "boulevard_truncation",
+                truncation.is_finite() && truncation > 0.0,
                 format!("must be finite and > 0 (leave it unset for none), got {truncation}"),
-            ));
+            )?;
         }
         Ok(self.boulevard)
     }
@@ -256,12 +245,11 @@ impl EbmEarlyStopping {
     ///
     /// A tolerance that is not finite, named `ebm_early_stopping_tolerance`.
     pub fn new(rounds: NonZeroUsize, tolerance: f64) -> Result<Self> {
-        if !tolerance.is_finite() {
-            return Err(HessboostError::invalid_param(
-                "ebm_early_stopping_tolerance",
-                format!("must be finite, got {tolerance}"),
-            ));
-        }
+        ensure(
+            "ebm_early_stopping_tolerance",
+            tolerance.is_finite(),
+            format!("must be finite, got {tolerance}"),
+        )?;
         Ok(EbmEarlyStopping { rounds, tolerance })
     }
 
@@ -382,41 +370,31 @@ pub struct EbmBuilder {
 }
 
 impl EbmBuilder {
-    /// Set the number of pairwise interaction terms (`ebm_interactions`).
-    #[must_use]
-    pub fn interactions(mut self, interactions: usize) -> Self {
-        self.ebm.interactions = interactions;
-        self
-    }
+    setter!(
+        /// Set the number of pairwise interaction terms (`ebm_interactions`).
+        interactions: usize => ebm.interactions
+    );
 
-    /// Set the number of outer bags (`ebm_outer_bags`).
-    #[must_use]
-    pub fn outer_bags(mut self, outer_bags: usize) -> Self {
-        self.ebm.outer_bags = outer_bags;
-        self
-    }
+    setter!(
+        /// Set the number of outer bags (`ebm_outer_bags`).
+        outer_bags: usize => ebm.outer_bags
+    );
 
-    /// Set the row fraction of each outer bag (`ebm_bag_fraction`).
-    #[must_use]
-    pub fn bag_fraction(mut self, bag_fraction: f64) -> Self {
-        self.ebm.bag_fraction = bag_fraction;
-        self
-    }
+    setter!(
+        /// Set the row fraction of each outer bag (`ebm_bag_fraction`).
+        bag_fraction: f64 => ebm.bag_fraction
+    );
 
-    /// Boulevard-average the terms for inference (`ebm_boulevard`).
-    #[must_use]
-    pub fn boulevard(mut self, boulevard: bool) -> Self {
-        self.ebm.boulevard = boulevard;
-        self
-    }
+    setter!(
+        /// Boulevard-average the terms for inference (`ebm_boulevard`).
+        boulevard: bool => ebm.boulevard
+    );
 
-    /// Stop each bag early on its held-out rows (`ebm_early_stopping_rounds`
-    /// and `ebm_early_stopping_tolerance`).
-    #[must_use]
-    pub fn early_stopping(mut self, early_stopping: EbmEarlyStopping) -> Self {
-        self.ebm.early_stopping = Some(early_stopping);
-        self
-    }
+    setter!(
+        /// Stop each bag early on its held-out rows (`ebm_early_stopping_rounds`
+        /// and `ebm_early_stopping_tolerance`).
+        early_stopping: EbmEarlyStopping => Some(ebm.early_stopping)
+    );
 
     /// The validated settings.
     ///
@@ -428,41 +406,30 @@ impl EbmBuilder {
     /// below 1.
     pub fn build(self) -> Result<Ebm> {
         let e = self.ebm;
-        let fail =
-            |name: &'static str, reason: String| Err(HessboostError::invalid_param(name, reason));
-        if !(1..=MAX_EBM_OUTER_BAGS).contains(&e.outer_bags) {
-            return fail(
-                "ebm_outer_bags",
-                format!("must be in [1, {MAX_EBM_OUTER_BAGS}], got {}", e.outer_bags),
-            );
-        }
-        if !(e.bag_fraction.is_finite() && e.bag_fraction > 0.0 && e.bag_fraction <= 1.0) {
-            return fail(
-                "ebm_bag_fraction",
-                format!("must be in (0, 1], got {}", e.bag_fraction),
-            );
-        }
-        if e.early_stopping.is_none() {
-        } else if e.boulevard {
-            return fail(
+        ensure(
+            "ebm_outer_bags",
+            (1..=MAX_EBM_OUTER_BAGS).contains(&e.outer_bags),
+            format!("must be in [1, {MAX_EBM_OUTER_BAGS}], got {}", e.outer_bags),
+        )?;
+        fraction("ebm_bag_fraction", e.bag_fraction)?;
+        if e.early_stopping.is_some() {
+            ensure(
                 "ebm_early_stopping_rounds",
-                "a Boulevard EBM averages every round, so it cannot stop at a best round".into(),
-            );
-        } else if e.bag_fraction >= 1.0 {
-            return fail(
+                !e.boulevard,
+                "a Boulevard EBM averages every round, so it cannot stop at a best round",
+            )?;
+            ensure(
                 "ebm_early_stopping_rounds",
-                "each bag stops on the rows it does not train on; set `ebm_bag_fraction < 1`"
-                    .into(),
-            );
+                e.bag_fraction < 1.0,
+                "each bag stops on the rows it does not train on; set `ebm_bag_fraction < 1`",
+            )?;
         }
-        if e.boulevard && (e.outer_bags != 1 || e.bag_fraction != 1.0) {
-            return fail(
-                "ebm_outer_bags",
-                "a bagged Boulevard EBM has no kernel ridge limit its inference covers; use one \
-                 bag of every row"
-                    .into(),
-            );
-        }
+        ensure(
+            "ebm_outer_bags",
+            !e.boulevard || (e.outer_bags == 1 && e.bag_fraction == 1.0),
+            "a bagged Boulevard EBM has no kernel ridge limit its inference covers; use one \
+             bag of every row",
+        )?;
         Ok(e)
     }
 }
@@ -566,26 +533,20 @@ pub struct QuantizedGradBuilder {
 }
 
 impl QuantizedGradBuilder {
-    /// Set the quantization levels (`num_grad_quant_bins`).
-    #[must_use]
-    pub fn bins(mut self, bins: usize) -> Self {
-        self.quantized.bins = bins;
-        self
-    }
+    setter!(
+        /// Set the quantization levels (`num_grad_quant_bins`).
+        bins: usize => quantized.bins
+    );
 
-    /// Set stochastic rounding (`stochastic_rounding`).
-    #[must_use]
-    pub fn stochastic_rounding(mut self, stochastic: bool) -> Self {
-        self.quantized.stochastic_rounding = stochastic;
-        self
-    }
+    setter!(
+        /// Set stochastic rounding (`stochastic_rounding`).
+        stochastic_rounding: bool => quantized.stochastic_rounding
+    );
 
-    /// Set full-precision leaf renewal (`quant_train_renew_leaf`).
-    #[must_use]
-    pub fn renew_leaf(mut self, renew: bool) -> Self {
-        self.quantized.renew_leaf = renew;
-        self
-    }
+    setter!(
+        /// Set full-precision leaf renewal (`quant_train_renew_leaf`).
+        renew_leaf: bool => quantized.renew_leaf
+    );
 
     /// The validated quantization.
     ///
@@ -594,12 +555,11 @@ impl QuantizedGradBuilder {
     /// `bins` outside `[2, 127]` (LightGBM stores each value in 8 bits).
     pub fn build(self) -> Result<QuantizedGrad> {
         let bins = self.quantized.bins;
-        if !(2..=127).contains(&bins) {
-            return Err(HessboostError::invalid_param(
-                "num_grad_quant_bins",
-                format!("must be in [2, 127], got {bins}"),
-            ));
-        }
+        ensure(
+            "num_grad_quant_bins",
+            (2..=127).contains(&bins),
+            format!("must be in [2, 127], got {bins}"),
+        )?;
         Ok(self.quantized)
     }
 }
@@ -650,12 +610,7 @@ impl LinearTree {
     ///
     /// `linear_lambda` is negative or not finite.
     pub fn new(lambda: f64) -> Result<Self> {
-        if !(lambda.is_finite() && lambda >= 0.0) {
-            return Err(HessboostError::invalid_param(
-                "linear_lambda",
-                format!("must be >= 0, got {lambda}"),
-            ));
-        }
+        non_negative("linear_lambda", lambda)?;
         Ok(LinearTree { lambda })
     }
 
@@ -714,12 +669,10 @@ pub struct LangevinBuilder {
 }
 
 impl LangevinBuilder {
-    /// Set the inverse diffusion temperature (`diffusion_temperature`).
-    #[must_use]
-    pub fn diffusion_temperature(mut self, temperature: f64) -> Self {
-        self.langevin.diffusion_temperature = Some(temperature);
-        self
-    }
+    setter!(
+        /// Set the inverse diffusion temperature (`diffusion_temperature`).
+        diffusion_temperature: f64 => Some(langevin.diffusion_temperature)
+    );
 
     /// The validated settings. The noise scale `sqrt(2 / (eta * T))` needs
     /// the learning rate: [`TrainingParams::validate`](super::TrainingParams::validate)
@@ -730,13 +683,8 @@ impl LangevinBuilder {
     /// A diffusion temperature that is not finite and positive (`0` would
     /// switch off the noise Langevin asks for).
     pub fn build(self) -> Result<Langevin> {
-        if let Some(t) = self.langevin.diffusion_temperature
-            && !(t.is_finite() && t > 0.0)
-        {
-            return Err(HessboostError::invalid_param(
-                "diffusion_temperature",
-                format!("must be > 0, got {t}"),
-            ));
+        if let Some(t) = self.langevin.diffusion_temperature {
+            positive("diffusion_temperature", t)?;
         }
         Ok(self.langevin)
     }
@@ -794,18 +742,16 @@ impl ModelShrink {
     /// (CatBoost's range, keeping every `1 - rate / i` positive). Named
     /// `model_shrink_rate`.
     pub fn new(rate: f64, mode: ModelShrinkMode) -> Result<Self> {
-        if !(rate.is_finite() && rate > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "model_shrink_rate",
-                format!("must be > 0 (leave model shrinkage unset for none), got {rate}"),
-            ));
-        }
-        if mode == ModelShrinkMode::Decreasing && rate >= 1.0 {
-            return Err(HessboostError::invalid_param(
-                "model_shrink_rate",
-                format!("must be in (0, 1) in the decreasing mode, got {rate}"),
-            ));
-        }
+        ensure(
+            "model_shrink_rate",
+            rate.is_finite() && rate > 0.0,
+            format!("must be > 0 (leave model shrinkage unset for none), got {rate}"),
+        )?;
+        ensure(
+            "model_shrink_rate",
+            mode != ModelShrinkMode::Decreasing || rate < 1.0,
+            format!("must be in (0, 1) in the decreasing mode, got {rate}"),
+        )?;
         Ok(ModelShrink { rate, mode })
     }
 
@@ -847,12 +793,11 @@ impl QueryBagging {
     /// `fraction` outside `(0, 1)` (at `1` nothing is bagged: leave the
     /// option unset), named `bagging_by_query`.
     pub fn new(fraction: f64) -> Result<Self> {
-        if !(fraction > 0.0 && fraction < 1.0) {
-            return Err(HessboostError::invalid_param(
-                "bagging_by_query",
-                format!("the fraction of queries kept must be in (0, 1), got {fraction}"),
-            ));
-        }
+        ensure(
+            "bagging_by_query",
+            fraction > 0.0 && fraction < 1.0,
+            format!("the fraction of queries kept must be in (0, 1), got {fraction}"),
+        )?;
         Ok(QueryBagging { fraction })
     }
 
@@ -896,13 +841,12 @@ impl BalancedBagging {
     pub fn new(pos: f64, neg: f64) -> Result<Self> {
         fraction("pos_bagging_fraction", pos)?;
         fraction("neg_bagging_fraction", neg)?;
-        if pos == 1.0 && neg == 1.0 {
-            return Err(HessboostError::invalid_param(
-                "pos_bagging_fraction",
-                "with `neg_bagging_fraction` also 1 nothing is bagged; \
-                 leave balanced bagging unset",
-            ));
-        }
+        ensure(
+            "pos_bagging_fraction",
+            pos != 1.0 || neg != 1.0,
+            "with `neg_bagging_fraction` also 1 nothing is bagged; \
+             leave balanced bagging unset",
+        )?;
         Ok(BalancedBagging { pos, neg })
     }
 
@@ -919,33 +863,10 @@ impl BalancedBagging {
     }
 }
 
-/// Fail unless `v` is in `(0, 1]`.
-fn fraction(name: &'static str, v: f64) -> Result<()> {
-    if v > 0.0 && v <= 1.0 {
-        Ok(())
-    } else {
-        Err(HessboostError::invalid_param(
-            name,
-            format!("must be in (0, 1], got {v}"),
-        ))
-    }
-}
-
-/// Fail unless `v` is finite and in `[0, 1]`.
-fn unit(name: &'static str, v: f64) -> Result<()> {
-    if v.is_finite() && (0.0..=1.0).contains(&v) {
-        Ok(())
-    } else {
-        Err(HessboostError::invalid_param(
-            name,
-            format!("must be in [0, 1], got {v}"),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::HessboostError;
 
     /// The parameter a build refuses, if any.
     fn refused<T>(built: &Result<T>) -> Option<&'static str> {

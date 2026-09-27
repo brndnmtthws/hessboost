@@ -9,6 +9,7 @@ use super::groups::{
     BalancedBagging, Boulevard, Dart, Ebm, ExtraTrees, Langevin, LinearTree, ModelShrink,
     ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
+use crate::check::{ensure, narrows, non_negative, positive, unit};
 use crate::error::{HessboostError, Result};
 use crate::objective::{Loss, LossContext, Objective};
 use serde::{Deserialize, Serialize};
@@ -514,16 +515,6 @@ impl Default for TrainingParams {
     }
 }
 
-/// Fail with [`HessboostError::invalid_param`] unless `ok`. Shared by the range
-/// checks in [`TrainingParams::validate`].
-fn ensure(name: &'static str, ok: bool, reason: impl Into<String>) -> Result<()> {
-    if ok {
-        Ok(())
-    } else {
-        Err(HessboostError::invalid_param(name, reason))
-    }
-}
-
 /// [`ensure`] that `objective` is `reg:squarederror` at `scale_pos_weight =
 /// 1`, which `who` (a Boulevard fit, which also refuses sample weights)
 /// needs.
@@ -539,49 +530,6 @@ fn unweighted_squared_error(objective: &Objective, who: &str) -> Result<()> {
         "objective",
         objective.is_unweighted_squared_error(),
         format!("{who} supports `reg:squarederror` at `scale_pos_weight = 1` only, got {got}"),
-    )
-}
-
-/// [`ensure`] that `v` is finite and in `[0, 1]`.
-fn unit(name: &'static str, v: f64) -> Result<()> {
-    ensure(
-        name,
-        v.is_finite() && (0.0..=1.0).contains(&v),
-        format!("must be in [0, 1], got {v}"),
-    )
-}
-
-/// [`ensure`] that `v` is finite and `> 0`.
-fn positive(name: &'static str, v: f64) -> Result<()> {
-    ensure(
-        name,
-        v.is_finite() && v > 0.0,
-        format!("must be > 0, got {v}"),
-    )
-}
-
-/// [`ensure`] that `v` is finite and `>= 0`.
-fn non_negative(name: &'static str, v: f64) -> Result<()> {
-    ensure(
-        name,
-        v.is_finite() && v >= 0.0,
-        format!("must be >= 0, got {v}"),
-    )
-}
-
-/// [`ensure`] that `v` stays finite (and `> 0` when `positive`) once
-/// narrowed to `f32`, as the split search and objectives use it (XGBoost's
-/// `float` parameters), so a setting cannot pass validation and then
-/// overflow or vanish.
-fn narrows(name: &'static str, v: f64, positive: bool) -> Result<()> {
-    let narrowed = v as f32;
-    ensure(
-        name,
-        narrowed.is_finite() && (!positive || narrowed > 0.0),
-        format!(
-            "must stay {}finite in f32, got {v}",
-            if positive { "positive and " } else { "" }
-        ),
     )
 }
 
@@ -1444,20 +1392,9 @@ pub struct TrainingParamsBuilder {
     refused: Vec<(&'static str, &'static str)>,
 }
 
-macro_rules! setter {
-    ($(#[$m:meta])* $name:ident, $ty:ty) => {
-        $(#[$m])*
-        #[must_use]
-        pub fn $name(mut self, v: $ty) -> Self {
-            self.params.$name = v;
-            self
-        }
-    };
-}
-
 impl TrainingParamsBuilder {
     setter!(/// Set the booster kind.
-        booster, BoosterKind);
+        booster: BoosterKind => params.booster);
     /// Set the number of worker threads. `0` is refused at
     /// [`build`](Self::build); [`global_pool`](Self::global_pool) uses the
     /// global Rayon pool (the default).
@@ -1478,13 +1415,13 @@ impl TrainingParamsBuilder {
         self
     }
     setter!(/// Set the RNG seed.
-        seed, u64);
+        seed: u64 => params.seed);
     setter!(/// Set the processor training runs on (XGBoost `device`).
-        device, Device);
+        device: Device => params.device);
     setter!(/// Set the learning rate (`eta`).
-        eta, f64);
+        eta: f64 => params.eta);
     setter!(/// Set the minimum split loss (`gamma`).
-        gamma, f64);
+        gamma: f64 => params.gamma);
     /// Set the maximum tree depth. `0` is refused at [`build`](Self::build);
     /// [`unlimited_depth`](Self::unlimited_depth) removes the limit.
     #[must_use]
@@ -1525,41 +1462,41 @@ impl TrainingParamsBuilder {
         self
     }
     setter!(/// Set the minimum child hessian weight.
-        min_child_weight, f64);
+        min_child_weight: f64 => params.min_child_weight);
     setter!(/// Set the bound on each leaf weight (XGBoost `max_delta_step`).
-        max_delta_step, MaxDeltaStep);
+        max_delta_step: MaxDeltaStep => params.max_delta_step);
     setter!(/// Set the row subsample ratio.
-        subsample, f64);
+        subsample: f64 => params.subsample);
     setter!(/// Set the per-tree column subsample ratio.
-        colsample_bytree, f64);
+        colsample_bytree: f64 => params.colsample_bytree);
     setter!(/// Set the per-level column subsample ratio.
-        colsample_bylevel, f64);
+        colsample_bylevel: f64 => params.colsample_bylevel);
     setter!(/// Set the per-node column subsample ratio.
-        colsample_bynode, f64);
+        colsample_bynode: f64 => params.colsample_bynode);
     setter!(/// Set the L2 regularization (`lambda`).
-        lambda, f64);
+        lambda: f64 => params.lambda);
     setter!(/// Set the L1 regularization (`alpha`).
-        alpha, f64);
+        alpha: f64 => params.alpha);
     setter!(/// Set the tree construction method.
-        tree_method, TreeMethod);
+        tree_method: TreeMethod => params.tree_method);
     setter!(/// Set the tree growth policy.
-        grow_policy, GrowPolicy);
+        grow_policy: GrowPolicy => params.grow_policy);
     setter!(/// Set the maximum histogram bins per feature.
-        max_bin, usize);
+        max_bin: usize => params.max_bin);
     setter!(/// Set the number of trees grown per output per round (`num_parallel_tree`).
-        num_parallel_tree, usize);
+        num_parallel_tree: usize => params.num_parallel_tree);
     setter!(/// Set the row subsampling method (`sampling_method`).
-        sampling_method, SamplingMethod);
+        sampling_method: SamplingMethod => params.sampling_method);
     setter!(/// Set the multi-output tree strategy (`multi_strategy`).
-        multi_strategy, MultiStrategy);
+        multi_strategy: MultiStrategy => params.multi_strategy);
     setter!(/// Set whether rounds grow or update trees (`process_type`).
-        process_type, ProcessType);
+        process_type: ProcessType => params.process_type);
     setter!(/// Set LightGBM's path smoothing strength (`path_smooth`, `0` = off).
-        path_smooth, f64);
+        path_smooth: f64 => params.path_smooth);
     setter!(/// Set the new-feature reuse penalty `ι` (`toad_penalty_feature`).
-        toad_penalty_feature, f64);
+        toad_penalty_feature: f64 => params.toad_penalty_feature);
     setter!(/// Set the new-threshold reuse penalty `ξ` (`toad_penalty_threshold`).
-        toad_penalty_threshold, f64);
+        toad_penalty_threshold: f64 => params.toad_penalty_threshold);
 
     /// Enable LightGBM's randomized split search (`extra_trees`).
     #[must_use]
@@ -1640,15 +1577,14 @@ impl TrainingParamsBuilder {
     }
 
     setter!(/// Set the per-feature monotone constraints.
-        monotone_constraints, Vec<Monotone>);
+        monotone_constraints: Vec<Monotone> => params.monotone_constraints);
     setter!(
         /// Set the allowed feature-interaction groups.
         ///
         /// Each inner vector lists feature indices that are permitted to appear
         /// together on a single root-to-leaf path. An empty list disables the
         /// constraint. Mirrors XGBoost `interaction_constraints`.
-        interaction_constraints,
-        Vec<Vec<u32>>
+        interaction_constraints: Vec<Vec<u32>> => params.interaction_constraints
     );
 
     /// Drop the refusal recorded for `key`, if any.

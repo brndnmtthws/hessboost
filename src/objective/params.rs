@@ -3,6 +3,7 @@
 //! is validated when it is built, with the XGBoost parameter name in the
 //! error, so a value that exists is valid.
 
+use crate::check::{ensure, narrows, positive};
 use crate::error::{HessboostError, Result};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
@@ -42,19 +43,13 @@ impl PseudoHuber {
     /// `huber_slope` is not finite and positive, or its square is not
     /// positive and finite in the `f32` the loss computes in.
     pub fn new(slope: f64) -> Result<Self> {
-        if !(slope.is_finite() && slope > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "huber_slope",
-                format!("must be > 0, got {slope}"),
-            ));
-        }
+        positive("huber_slope", slope)?;
         let square = (slope as f32) * (slope as f32);
-        if !(square.is_finite() && square > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "huber_slope",
-                format!("squared slope must stay positive and finite in f32, got {slope}"),
-            ));
-        }
+        ensure(
+            "huber_slope",
+            square.is_finite() && square > 0.0,
+            format!("squared slope must stay positive and finite in f32, got {slope}"),
+        )?;
         Ok(PseudoHuber { slope })
     }
 
@@ -165,12 +160,11 @@ impl Tweedie {
     /// `f32` the loss computes in.
     pub fn new(variance_power: f64) -> Result<Self> {
         let rho = variance_power as f32;
-        if !(variance_power.is_finite() && (1.0f32..2.0).contains(&rho)) {
-            return Err(HessboostError::invalid_param(
-                "tweedie_variance_power",
-                format!("must be in [1, 2) (as f32), got {variance_power}"),
-            ));
-        }
+        ensure(
+            "tweedie_variance_power",
+            variance_power.is_finite() && (1.0f32..2.0).contains(&rho),
+            format!("must be in [1, 2) (as f32), got {variance_power}"),
+        )?;
         Ok(Tweedie { variance_power })
     }
 
@@ -207,19 +201,8 @@ impl Aft {
     /// `aft_loss_distribution_scale` is not finite and positive, also once
     /// rounded to the `f32` the loss computes in.
     pub fn new(distribution: AftDistribution, scale: f64) -> Result<Self> {
-        let narrowed = scale as f32;
-        if !(scale.is_finite() && scale > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "aft_loss_distribution_scale",
-                format!("must be > 0, got {scale}"),
-            ));
-        }
-        if !(narrowed.is_finite() && narrowed > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "aft_loss_distribution_scale",
-                format!("must stay positive and finite in f32, got {scale}"),
-            ));
-        }
+        positive("aft_loss_distribution_scale", scale)?;
+        narrows("aft_loss_distribution_scale", scale, true)?;
         Ok(Aft {
             distribution,
             scale,
@@ -287,19 +270,8 @@ impl RegLoss {
     /// `scale_pos_weight` is not finite and positive, also once rounded to
     /// the `f32` the loss computes in.
     pub fn new(scale_pos_weight: f64) -> Result<Self> {
-        let narrowed = scale_pos_weight as f32;
-        if !(scale_pos_weight.is_finite() && scale_pos_weight > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "scale_pos_weight",
-                format!("must be > 0, got {scale_pos_weight}"),
-            ));
-        }
-        if !(narrowed.is_finite() && narrowed > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "scale_pos_weight",
-                format!("must stay positive and finite in f32, got {scale_pos_weight}"),
-            ));
-        }
+        positive("scale_pos_weight", scale_pos_weight)?;
+        narrows("scale_pos_weight", scale_pos_weight, true)?;
         Ok(RegLoss { scale_pos_weight })
     }
 

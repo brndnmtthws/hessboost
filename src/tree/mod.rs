@@ -8,6 +8,7 @@ pub(crate) mod constraints;
 pub(crate) mod gain;
 pub(crate) mod hist;
 pub(crate) mod linear;
+pub(crate) mod linear_fit;
 pub(crate) mod oblivious;
 mod regtree;
 pub(crate) mod reuse;

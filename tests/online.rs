@@ -5,9 +5,11 @@
 
 use std::ops::ControlFlow;
 
-use hessboost::config::{BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink};
+use hessboost::config::{
+    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink, QueryBagging,
+};
 use hessboost::data::FeatureType;
-use hessboost::objective::{CustomLoss, GradPair, Logistic, Objective};
+use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Logistic, Objective};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
 use hessboost::training::online::{OnlineModel, OnlineParams};
@@ -321,6 +323,50 @@ fn unsound_configurations_and_changes_are_refused() {
         .with_labels(&[1.0])
         .unwrap();
     assert_eq!(invalid_param(model.update(Some(&narrow), &[])), "additions");
+}
+
+/// LightGBM's class-balanced and query-level bagging draw a fresh per-class
+/// or per-query row sample every round, which an in-place update cannot
+/// replay: both are refused by `train` and `from_model` at either
+/// tolerance, in otherwise valid configurations (a `binary:*` objective for
+/// the first; `rank:*` with query groups for the second).
+#[test]
+fn row_bagging_is_refused() {
+    let balanced = TrainingParams::builder()
+        .objective(logistic())
+        .tree_method(TreeMethod::Hist)
+        .max_depth(3)
+        .balanced_bagging(BalancedBagging::new(0.5, 0.8).unwrap())
+        .build()
+        .unwrap();
+    let binary = data(200, 9, true);
+    let ranking = TrainingParams::builder()
+        .objective(Objective::RankPairwise(LambdaRank::default()))
+        .tree_method(TreeMethod::Hist)
+        .max_depth(3)
+        .bagging_by_query(QueryBagging::new(0.5).unwrap())
+        .build()
+        .unwrap();
+    let queries = data(200, 9, true).with_group_sizes(&[50; 4]).unwrap();
+    // Both configurations train normally.
+    assert!(train(&balanced, &binary, 3).is_ok());
+    assert!(train(&ranking, &queries, 3).is_ok());
+    let model = train(&params(logistic()), &binary, 3).unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        for (p, d) in [(&balanced, &binary), (&ranking, &queries)] {
+            assert_eq!(
+                invalid_param(OnlineModel::train(p, d, 3, online)),
+                "params",
+                "train, tolerance {tolerance}"
+            );
+            assert_eq!(
+                invalid_param(OnlineModel::from_model(model.clone(), p, d, online)),
+                "params",
+                "from_model, tolerance {tolerance}"
+            );
+        }
+    }
 }
 
 /// Models whose trees updates cannot replay are refused: linear leaves

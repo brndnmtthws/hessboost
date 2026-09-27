@@ -139,6 +139,7 @@ flat_params! {
     quant_train_renew_leaf: bool,
     rate_drop: f64,
     skip_drop: f64,
+    one_drop: bool,
     toad_penalty_feature: f64,
     toad_penalty_threshold: f64,
 }
@@ -252,6 +253,7 @@ impl Flat {
             quant_train_renew_leaf,
             rate_drop,
             skip_drop,
+            one_drop,
             toad_penalty_feature,
             toad_penalty_threshold,
         } = self;
@@ -331,6 +333,12 @@ impl Flat {
                 "`booster=dart`",
             ),
             (
+                "one_drop",
+                one_drop.is_some(),
+                booster == Some(FlatBooster::Dart),
+                "`booster=dart`",
+            ),
+            (
                 "refresh_leaf",
                 refresh_leaf.is_some(),
                 process_type == Some(FlatProcess::Update),
@@ -385,6 +393,9 @@ impl Flat {
                 }
                 if let Some(skip_drop) = skip_drop {
                     dart = dart.skip_drop(skip_drop);
+                }
+                if let Some(one_drop) = one_drop {
+                    dart = dart.one_drop(one_drop);
                 }
                 BoosterKind::Dart(dart.build()?)
             }
@@ -872,6 +883,7 @@ impl TrainingParams {
                 set("booster", json("dart"));
                 set("rate_drop", json(dart.rate_drop()));
                 set("skip_drop", json(dart.skip_drop()));
+                set("one_drop", json(dart.one_drop()));
             }
         }
         set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));
@@ -1164,6 +1176,7 @@ mod tests {
     fn dependent_keys_without_their_switch_are_refused_by_name() {
         for (pairs, key) in [
             (json!({"booster": "gbtree", "rate_drop": 0.1}), "rate_drop"),
+            (json!({"one_drop": true}), "one_drop"),
             (json!({"refresh_leaf": false}), "refresh_leaf"),
             (json!({"extra_seed": 3}), "extra_seed"),
             (json!({"extra_trees": false, "extra_seed": 3}), "extra_seed"),
@@ -1270,6 +1283,7 @@ mod tests {
                 Dart::builder()
                     .rate_drop(0.2)
                     .skip_drop(0.3)
+                    .one_drop(true)
                     .build()
                     .unwrap(),
             ),

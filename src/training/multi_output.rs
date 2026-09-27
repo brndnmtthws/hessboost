@@ -125,8 +125,8 @@ pub(super) fn boost_round(
     for p in 0..params.num_parallel_tree {
         let rows = &row_subsets[p % row_subsets.len()];
         let (tree, leaf_rows) = fit_tree(ctx, gpair, split.as_ref(), &mut rng, rows, n_out)?;
-        // DART's gradients come from the ensemble, not the margin caches
-        // (`finish_dart` recomputes the eval ones).
+        // A dropout round's gradients come from the ensemble, not the margin
+        // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // Leaf row lists identify every training row's leaf when all
             // rows took part in growing the tree.

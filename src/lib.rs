@@ -182,8 +182,9 @@
 //!   setting): gblinear uses `updater = coord_descent`
 //!   with `feature_selector = cyclic`; LambdaMART uses
 //!   `lambdarank_pair_method = topk` (no `lambdarank_unbiased` or
-//!   `ndcg_exp_gain`); DART has no `sample_type`, `normalize_type`, or
-//!   `one_drop`; categorical splits use XGBoost's defaults
+//!   `ndcg_exp_gain`); DART has no `sample_type` or `normalize_type` (it
+//!   samples uniformly and normalizes by `tree`); categorical splits use
+//!   XGBoost's defaults
 //!   `max_cat_to_onehot = 4` and `max_cat_threshold = 64`.
 //! - The metrics `gamma-deviance`, `error@t` (XGBoost's classification
 //!   threshold suffix), and the `-` variants of the ranking metrics

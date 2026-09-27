@@ -8,9 +8,13 @@
 
 use crate::error::{HessboostError, Result};
 
-/// DART's dropout (XGBoost `booster = dart`): the fraction of trees
-/// dropped each round (`rate_drop`) and the probability of skipping the
-/// dropout in a round (`skip_drop`), both in `[0, 1]` and `0` by default.
+/// DART's dropout (XGBoost `booster = dart`): each round drops every
+/// existing tree with probability `rate_drop`, unless the whole dropout is
+/// skipped (probability `skip_drop`); both are in `[0, 1]` and `0` by
+/// default. When no tree is drawn, `one_drop` (default `false`) drops one
+/// at random; otherwise nothing is dropped and the round's trees are not
+/// normalized. At the defaults DART never drops a tree and trains exactly
+/// like `gbtree`, as in XGBoost (`GBTree::DropTrees`).
 ///
 /// ```
 /// use hessboost::config::Dart;
@@ -24,12 +28,17 @@ use crate::error::{HessboostError, Result};
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Dart {
-    rate_drop: f64,
-    skip_drop: f64,
+    /// `rate_drop`.
+    rate: f64,
+    /// `skip_drop`.
+    skip: f64,
+    /// `one_drop`.
+    force_one: bool,
 }
 
 impl Dart {
-    /// Start a builder at XGBoost's defaults (no dropout).
+    /// Start a builder at XGBoost's defaults (`rate_drop = skip_drop = 0`,
+    /// `one_drop = false`: no dropout).
     pub fn builder() -> DartBuilder {
         DartBuilder {
             dart: Dart::default(),
@@ -38,12 +47,24 @@ impl Dart {
 
     /// Fraction of trees dropped each round. XGBoost `rate_drop`.
     pub fn rate_drop(&self) -> f64 {
-        self.rate_drop
+        self.rate
     }
 
     /// Probability of skipping the dropout in a round. XGBoost `skip_drop`.
     pub fn skip_drop(&self) -> f64 {
-        self.skip_drop
+        self.skip
+    }
+
+    /// Whether a round that draws no tree drops one at random. XGBoost
+    /// `one_drop`.
+    pub fn one_drop(&self) -> bool {
+        self.force_one
+    }
+
+    /// Whether any round can drop a tree (XGBoost `HasDropout`); without it
+    /// DART trains as `gbtree`.
+    pub(crate) fn has_dropout(&self) -> bool {
+        self.rate != 0.0 || self.force_one || self.skip != 0.0
     }
 }
 
@@ -57,14 +78,22 @@ impl DartBuilder {
     /// Set the fraction of trees dropped each round (`rate_drop`).
     #[must_use]
     pub fn rate_drop(mut self, rate_drop: f64) -> Self {
-        self.dart.rate_drop = rate_drop;
+        self.dart.rate = rate_drop;
         self
     }
 
     /// Set the probability of skipping the dropout (`skip_drop`).
     #[must_use]
     pub fn skip_drop(mut self, skip_drop: f64) -> Self {
-        self.dart.skip_drop = skip_drop;
+        self.dart.skip = skip_drop;
+        self
+    }
+
+    /// Set whether a round that draws no tree drops one at random
+    /// (`one_drop`).
+    #[must_use]
+    pub fn one_drop(mut self, one_drop: bool) -> Self {
+        self.dart.force_one = one_drop;
         self
     }
 
@@ -74,8 +103,8 @@ impl DartBuilder {
     ///
     /// `rate_drop` or `skip_drop` outside `[0, 1]`.
     pub fn build(self) -> Result<Dart> {
-        unit("rate_drop", self.dart.rate_drop)?;
-        unit("skip_drop", self.dart.skip_drop)?;
+        unit("rate_drop", self.dart.rate)?;
+        unit("skip_drop", self.dart.skip)?;
         Ok(self.dart)
     }
 }

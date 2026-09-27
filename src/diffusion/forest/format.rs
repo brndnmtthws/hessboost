@@ -1,6 +1,6 @@
 //! The forest model's binary and JSON formats.
 //!
-//! Binary: the diffusion container framing ([`crate::model::native`]) with
+//! Binary: the shared model container ([`crate::model::container`]) with
 //! magic `HBFF` and its own version byte, zstd-compressed:
 //!
 //! ```text
@@ -23,12 +23,17 @@ use serde::Deserialize;
 use super::{Column, ColumnKind, ForestMethod, ForestModel, Scale};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::model::native::{frame, pack, section_table, unpack, write_container};
-use crate::model::sections::{REQUIRED, Sections, Writer, format_error};
+use crate::model::container::{ContainerSpec, WRITER, read_models, write_models};
+use crate::model::sections::{REQUIRED, Sections, Writer, format_error, unknown_value as unknown};
 
-const MAGIC: &[u8; 4] = b"HBFF";
-const VERSION: u8 = 1;
-const WRITER: &str = concat!("hessboost ", env!("CARGO_PKG_VERSION"));
+/// The forest model container.
+const HBFF: ContainerSpec = ContainerSpec {
+    magic: *b"HBFF",
+    version: 1,
+    what: "forest model",
+    known: |name| KNOWN.contains(&name),
+    legacy: None,
+};
 
 const KNOWN: &[&str] = &[
     "forest.writer",
@@ -113,28 +118,17 @@ pub(super) fn write(model: &ForestModel) -> Result<Vec<u8>> {
         model.class_probs.iter().copied(),
         f64::to_le_bytes,
     );
-    let mut lengths = Vec::with_capacity(model.models.len());
-    let mut data = Vec::new();
-    for m in &model.models {
-        let bytes = write_container(m)?;
-        lengths.push(bytes.len() as u64);
-        data.extend_from_slice(&bytes);
-    }
+    let (lengths, data) = write_models(&model.models)?;
     w.array("models.lengths", lengths, u64::to_le_bytes);
-    w.raw("models.data", REQUIRED, &data);
-    pack(frame(*MAGIC, VERSION, w))
+    w.raw_owned("models.data", REQUIRED, data);
+    HBFF.seal(w)
 }
 
 pub(super) fn read(bytes: &[u8]) -> Result<ForestModel> {
-    let container = unpack(bytes)?;
-    let table = section_table(&container, *MAGIC, VERSION, "forest model")?;
-    let (s, rest) = Sections::parse(table, |name| KNOWN.contains(&name))?;
-    if !rest.is_empty() {
-        return Err(format_error(format!(
-            "{} unexpected bytes after the last section",
-            rest.len()
-        )));
-    }
+    HBFF.read(bytes, read_model)
+}
+
+fn read_model(s: &Sections) -> Result<ForestModel> {
     let method = match s.str("forest.method")? {
         "flow" => ForestMethod::Flow,
         "diffusion" => ForestMethod::Diffusion {
@@ -188,23 +182,12 @@ pub(super) fn read(bytes: &[u8]) -> Result<ForestModel> {
     let scale_range = s.array_exact("scales.range", scale_min.len(), f64::from_le_bytes)?;
     let classes = s.array("classes.values", f64::from_le_bytes)?;
     let class_probs = s.array_exact("classes.probs", classes.len(), f64::from_le_bytes)?;
-    let lengths = s.array("models.lengths", u64::from_le_bytes)?;
-    let mut blob = s.bytes("models.data")?;
-    let mut models = Vec::with_capacity(lengths.len().min(blob.len()));
-    for len in lengths {
-        let len = usize::try_from(len)
-            .ok()
-            .filter(|&len| len <= blob.len())
-            .ok_or_else(|| format_error("section `models.lengths` is out of range"))?;
-        let (model, rest) = blob.split_at(len);
-        models.push(BoostedModel::from_bytes(model)?);
-        blob = rest;
-    }
-    if !blob.is_empty() {
-        return Err(format_error(
-            "section `models.data` has bytes past its models",
-        ));
-    }
+    let models = read_models(
+        &s.array("models.lengths", u64::from_le_bytes)?,
+        s.bytes("models.data")?,
+        "models.lengths",
+        "models.data",
+    )?;
     let model = ForestModel {
         method,
         n_t: s.usize("forest.n_t")?,
@@ -221,10 +204,6 @@ pub(super) fn read(bytes: &[u8]) -> Result<ForestModel> {
     };
     model.validate()?;
     Ok(model)
-}
-
-fn unknown(name: &str, value: &str) -> HessboostError {
-    format_error(format!("unknown `{name}` value `{value}`"))
 }
 
 /// The serialized fields of a [`ForestModel`] (its JSON format), before

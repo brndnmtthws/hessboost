@@ -42,15 +42,14 @@
 //! Files are written as a single zstd frame, so `zstd -d` recovers the
 //! container; uncompressed containers are read as well. A container that
 //! compresses beyond what the reader accepts from a frame (see
-//! [`MAX_EXPANSION`]) is written uncompressed instead, so every written file
+//! [`super::container`]) is written uncompressed instead, so every written file
 //! loads. The trailing checksum catches corruption either way.
-
-use std::io::Read;
 
 use std::sync::OnceLock;
 
+use super::container::{ContainerSpec, WRITER};
 use super::objective::{ModelObjective, StoredObjectiveParams};
-use super::sections::{Sections, Writer, format_error, wrong_length};
+use super::sections::{Sections, Writer, format_error, unknown_value, wrong_length};
 use super::{BoostedModel, LinearModel, Shrinkage};
 use crate::ebm::{EbmBoulevard, EbmInfo};
 use crate::error::Result;
@@ -65,19 +64,20 @@ const MAGIC: &[u8; 4] = b"HBM\0";
 /// The magic of the pre-0.2.0 native format (hessboost 0.1.x), which this
 /// version refuses, naming the upgrade path.
 const LEGACY_MAGIC: &[u8; 4] = b"SQB\0";
-/// The `model.writer` section: the release that wrote the file.
-const WRITER: &str = concat!("hessboost ", env!("CARGO_PKG_VERSION"));
 /// Layout version of the container (not of the model it holds).
 const CONTAINER_VERSION: u8 = 3;
-/// The zstd frame magic number, little-endian.
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-/// Decompressed containers up to this size always load; larger ones must
-/// stay within [`MAX_EXPANSION`] of their compressed size. Together they
-/// bound what a small malicious file can make the reader allocate.
-const ALWAYS_ALLOWED: u64 = 256 << 20;
-/// Largest accepted ratio of decompressed to compressed size above
-/// [`ALWAYS_ALLOWED`].
-const MAX_EXPANSION: u64 = 1 << 12;
+/// The native model container.
+const NATIVE: ContainerSpec = ContainerSpec {
+    magic: *MAGIC,
+    version: CONTAINER_VERSION,
+    what: "native model",
+    known: |name| KNOWN.contains(&name) || OBJECTIVE_SECTIONS.contains(&name),
+    legacy: Some((
+        *LEGACY_MAGIC,
+        "a native model from hessboost 0.1.x, which 0.2.0 and later cannot read \
+         (export it with 0.1.1's `save_xgboost_json` and load that)",
+    )),
+};
 
 /// `default_left` in `node.flags`.
 const DEFAULT_LEFT: u8 = 1;
@@ -338,14 +338,25 @@ pub(super) fn read_shrinkage(s: &Sections) -> Result<Option<Shrinkage>> {
 }
 
 /// Encode `model` as a container: zstd-compressed unless the frame would
-/// expand further than [`read`] accepts (see [`pack`]).
+/// expand further than [`read`] accepts (see [`ContainerSpec::seal`]).
 pub(super) fn write(model: &BoostedModel) -> Result<Vec<u8>> {
-    pack(write_container(model)?)
+    NATIVE.seal(sections(model)?)
 }
 
 /// Encode `model` as an uncompressed container, the form other containers
 /// embed (a diffusion model's regressors) and [`read`] accepts as is.
 pub(crate) fn write_container(model: &BoostedModel) -> Result<Vec<u8>> {
+    Ok(NATIVE.frame(sections(model)?))
+}
+
+/// Append [`write_container`]'s bytes for `model` to `out`.
+pub(super) fn write_container_into(model: &BoostedModel, out: &mut Vec<u8>) -> Result<()> {
+    NATIVE.frame_into(sections(model)?, out);
+    Ok(())
+}
+
+/// The section table of `model`.
+fn sections(model: &BoostedModel) -> Result<Writer> {
     let trees = &model.trees;
     // Per-tree counts and array offsets are stored as `u32`.
     let total_nodes: usize = trees.iter().map(RegTree::num_nodes).sum();
@@ -359,7 +370,7 @@ pub(crate) fn write_container(model: &BoostedModel) -> Result<Vec<u8>> {
     let mut w = Writer::default();
     write_model_sections(&mut w, model);
     write_tree_sections(&mut w, trees);
-    Ok(frame(*MAGIC, CONTAINER_VERSION, w))
+    Ok(w)
 }
 
 /// The `model.*`, `gblinear.*`, and `objective.*` sections.
@@ -515,111 +526,15 @@ fn write_tree_sections(w: &mut Writer, trees: &[RegTree]) {
     );
 }
 
-/// Frame the section table as a container: `magic`, `version`, the table,
-/// and the checksum of everything before it. Shared by every format built
-/// on this container (the native model and the diffusion model).
-pub(crate) fn frame(magic: [u8; 4], version: u8, w: Writer) -> Vec<u8> {
-    let mut out = Vec::with_capacity(magic.len() + 1 + w.encoded_len() + 8);
-    out.extend_from_slice(&magic);
-    out.push(version);
-    w.finish(&mut out);
-    let checksum = xxh64(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
-    out
-}
-
-/// The file form of a finished container: its zstd frame, or the container
-/// itself when [`read`] would refuse the frame as expanding too far (a large,
-/// highly repetitive model, such as a gblinear model of mostly zero weights).
-/// Every container of at most [`ALWAYS_ALLOWED`] bytes is compressed.
-pub(crate) fn pack(container: Vec<u8>) -> Result<Vec<u8>> {
-    let frame = zstd::bulk::compress(&container, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    Ok(
-        if expansion_accepted(frame.len() as u64, container.len() as u64) {
-            frame
-        } else {
-            container
-        },
-    )
-}
-
-/// The container in `bytes`: decompressed from its zstd frame (bounded by
-/// [`expansion_limit`]) or borrowed when stored uncompressed.
-pub(crate) fn unpack(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
-    Ok(if bytes.starts_with(&ZSTD_MAGIC) {
-        std::borrow::Cow::Owned(decompress(bytes)?)
-    } else {
-        std::borrow::Cow::Borrowed(bytes)
-    })
-}
-
-/// The section table of `container` (see [`unpack`]) after checking its
-/// `magic`, its `version`, and its checksum. `what` names the format in
-/// errors ("native model").
-pub(crate) fn section_table<'a>(
-    container: &'a [u8],
-    magic: [u8; 4],
-    version: u8,
-    what: &str,
-) -> Result<&'a [u8]> {
-    let Some(body) = container.strip_prefix(&magic) else {
-        return Err(format_error(format!("invalid {what} header")));
-    };
-    let Some(&stored) = body.first() else {
-        return Err(format_error(format!("truncated {what}")));
-    };
-    if stored != version {
-        return Err(format_error(format!("unsupported {what} version {stored}")));
-    }
-    let Some(split) = container
-        .len()
-        .checked_sub(8)
-        .filter(|&at| at > magic.len())
-    else {
-        return Err(format_error(format!("truncated {what}")));
-    };
-    let (checked, checksum) = container.split_at(split);
-    if xxh64(checked).to_le_bytes() != checksum {
-        return Err(format_error(format!("{what} checksum mismatch")));
-    }
-    Ok(&checked[magic.len() + 1..])
-}
-
-/// Largest container [`read`] decompresses from a zstd frame of `compressed`
-/// bytes.
-fn expansion_limit(compressed: u64) -> u64 {
-    compressed.saturating_mul(MAX_EXPANSION).max(ALWAYS_ALLOWED)
-}
-
-/// Whether [`read`] accepts a zstd frame of `compressed` bytes holding a
-/// container of `decompressed` bytes.
-fn expansion_accepted(compressed: u64, decompressed: u64) -> bool {
-    decompressed <= expansion_limit(compressed)
-}
-
 /// Decode a container (zstd-compressed or not). The caller validates the
 /// model it forms ([`BoostedModel::validate_structure`]).
 pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
-    let container = unpack(bytes)?;
-    if container.starts_with(LEGACY_MAGIC) {
-        return Err(format_error(
-            "a native model from hessboost 0.1.x, which 0.2.0 and later cannot read \
-             (export it with 0.1.1's `save_xgboost_json` and load that)",
-        ));
-    }
-    let table = section_table(&container, *MAGIC, CONTAINER_VERSION, "native model")?;
-    let (s, rest) = Sections::parse(table, |name| {
-        KNOWN.contains(&name) || OBJECTIVE_SECTIONS.contains(&name)
-    })?;
-    if !rest.is_empty() {
-        return Err(format_error(format!(
-            "{} unexpected bytes after the last section",
-            rest.len()
-        )));
-    }
+    NATIVE.read(bytes, read_model)
+}
 
+fn read_model(s: &Sections) -> Result<BoostedModel> {
     let name = s.str("model.objective")?;
-    let stored = read_objective_params(&s, StoredObjectiveParams::defaults_for(name))?;
+    let stored = read_objective_params(s, StoredObjectiveParams::defaults_for(name))?;
     let num_class = s.usize("model.num_class")?;
     let objective = ModelObjective::from_stored(name, &stored, num_class)?;
     let linear = if s.has("gblinear.weights") || s.has("gblinear.bias") {
@@ -631,7 +546,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         None
     };
     Ok(BoostedModel {
-        trees: read_trees(&s)?,
+        trees: read_trees(s)?,
         base_score: s.array("model.base_score", f32::from_le_bytes)?,
         objective,
         max_delta_step: stored.max_delta_step,
@@ -647,9 +562,9 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
-        boulevard: read_boulevard(&s)?,
-        ebm: read_ebm(&s)?,
-        shrinkage: read_shrinkage(&s)?,
+        boulevard: read_boulevard(s)?,
+        ebm: read_ebm(s)?,
+        shrinkage: read_shrinkage(s)?,
         compact: OnceLock::new(),
     })
 }
@@ -872,7 +787,7 @@ fn named<T>(s: &Sections, name: &str, from: fn(&str) -> Option<T>) -> Result<Opt
     let value = s.str(name)?;
     from(value)
         .map(Some)
-        .ok_or_else(|| format_error(format!("unknown `{name}` value `{value}`")))
+        .ok_or_else(|| unknown_value(name, value))
 }
 
 /// Consumes a decoded array front to back, one tree's share at a time.
@@ -902,81 +817,6 @@ impl<T: Clone> Cursor<T> {
     }
 }
 
-fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
-    let limit = expansion_limit(bytes.len() as u64);
-    let decoder = zstd::stream::read::Decoder::with_buffer(bytes)
-        .map_err(|e| format_error(format!("zstd: {e}")))?;
-    let mut out = Vec::new();
-    decoder
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut out)
-        .map_err(|e| format_error(format!("zstd: {e}")))?;
-    if out.len() as u64 > limit {
-        return Err(format_error("zstd frame expands too far"));
-    }
-    Ok(out)
-}
-
-/// XXH64 of `data` with seed 0 (Collet's xxHash, 64-bit variant).
-fn xxh64(data: &[u8]) -> u64 {
-    const P1: u64 = 0x9E37_79B1_85EB_CA87;
-    const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
-    const P3: u64 = 0x1656_67B1_9E37_79F9;
-    const P4: u64 = 0x85EB_CA77_C2B2_AE63;
-    const P5: u64 = 0x27D4_EB2F_1656_67C5;
-    let round = |acc: u64, lane: u64| {
-        acc.wrapping_add(lane.wrapping_mul(P2))
-            .rotate_left(31)
-            .wrapping_mul(P1)
-    };
-    let merge = |acc: u64, v: u64| (acc ^ round(0, v)).wrapping_mul(P1).wrapping_add(P4);
-
-    let (stripes, tail) = data.as_chunks::<32>();
-    let mut h = if stripes.is_empty() {
-        P5
-    } else {
-        let mut v = [P1.wrapping_add(P2), P2, 0, P1.wrapping_neg()];
-        for stripe in stripes {
-            for (lane, acc) in stripe.as_chunks::<8>().0.iter().zip(&mut v) {
-                *acc = round(*acc, u64::from_le_bytes(*lane));
-            }
-        }
-        let h = v[0]
-            .rotate_left(1)
-            .wrapping_add(v[1].rotate_left(7))
-            .wrapping_add(v[2].rotate_left(12))
-            .wrapping_add(v[3].rotate_left(18));
-        v.into_iter().fold(h, merge)
-    };
-    h = h.wrapping_add(data.len() as u64);
-
-    let (words, mut rest) = tail.as_chunks::<8>();
-    for word in words {
-        h = (h ^ round(0, u64::from_le_bytes(*word)))
-            .rotate_left(27)
-            .wrapping_mul(P1)
-            .wrapping_add(P4);
-    }
-    if let Some((half, after)) = rest.split_first_chunk::<4>() {
-        let half = u32::from_le_bytes(*half);
-        h = (h ^ u64::from(half).wrapping_mul(P1))
-            .rotate_left(23)
-            .wrapping_mul(P2)
-            .wrapping_add(P3);
-        rest = after;
-    }
-    for &byte in rest {
-        h = (h ^ u64::from(byte).wrapping_mul(P5))
-            .rotate_left(11)
-            .wrapping_mul(P1);
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(P2);
-    h ^= h >> 29;
-    h = h.wrapping_mul(P3);
-    h ^ (h >> 32)
-}
-
 fn checked_sum(counts: &[u32]) -> Result<usize> {
     counts
         .iter()
@@ -986,6 +826,7 @@ fn checked_sum(counts: &[u32]) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::container::{MAX_EXPANSION, ZSTD_MAGIC, decompress, xxh64};
     use super::super::sections::REQUIRED;
     use super::*;
     use crate::config::TrainingParams;
@@ -1221,24 +1062,6 @@ mod tests {
         }
     }
 
-    /// Reference digests from the `xxhash` C library, covering the short
-    /// path, every tail length class, and the 32-byte stripes.
-    #[test]
-    fn xxh64_matches_the_reference() {
-        let bytes: Vec<u8> = (0..100).collect();
-        for (data, expected) in [
-            (&b""[..], 0xef46_db37_51d8_e999),
-            (b"a", 0xd24e_c4f1_a98c_6e5b),
-            (b"abc", 0x44bc_2cf5_ad77_0999),
-            (b"0123456789abcdef", 0x5c5b_90c3_4e37_6d0b),
-            (&bytes[..31], 0xc346_d2b5_9b4d_8ee1),
-            (&bytes[..32], 0xcbf5_9c51_16ff_32b4),
-            (&bytes[..], 0x6ac1_e580_3216_6597),
-        ] {
-            assert_eq!(xxh64(data), expected, "{} bytes", data.len());
-        }
-    }
-
     /// Any flipped bit of a stored value is refused, not loaded as a
     /// different model.
     #[test]
@@ -1276,20 +1099,6 @@ mod tests {
             compact: OnceLock::new(),
         })
         .unwrap()
-    }
-
-    /// The reader's frame policy: containers up to [`ALWAYS_ALLOWED`] bytes
-    /// always decompress, larger ones only within [`MAX_EXPANSION`] of the
-    /// frame; the writer keeps a container uncompressed exactly when this
-    /// refuses its frame.
-    #[test]
-    fn frame_expansion_policy_boundaries() {
-        assert!(expansion_accepted(1, ALWAYS_ALLOWED));
-        assert!(!expansion_accepted(1, ALWAYS_ALLOWED + 1));
-        let frame = ALWAYS_ALLOWED / MAX_EXPANSION + 1;
-        assert!(expansion_accepted(frame, frame * MAX_EXPANSION));
-        assert!(!expansion_accepted(frame, frame * MAX_EXPANSION + 1));
-        assert!(expansion_accepted(u64::MAX, u64::MAX));
     }
 
     /// A frame expanding far beyond [`MAX_EXPANSION`] below the size cap

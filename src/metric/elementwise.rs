@@ -3,7 +3,8 @@
 //! row weight in `f32` before the `f64` sums, exactly as XGBoost's
 //! `elementwise_metric.cu` reduction does.
 
-use super::{Metric, consistent, weighted_mean};
+use super::{CellMetric, Metric, cells_consistent, weighted_mean};
+use crate::simd::RowWeights;
 
 /// `(Σ wᵢ·loss(yᵢ, pᵢ), Σ wᵢ)` with the per-row product in `f32`; absent
 /// weights count as `1`. Inconsistent lengths give `(NaN, 1)`, so the
@@ -11,16 +12,16 @@ use super::{Metric, consistent, weighted_mean};
 fn weighted_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     loss: impl Fn(f32, f32) -> f32,
 ) -> (f64, f64) {
-    if !consistent(preds, labels, weights, 1) {
+    if !cells_consistent(preds, labels, weights) {
         return (f64::NAN, 1.0);
     }
     let mut total = 0.0f64;
     let mut weight = 0.0f64;
     for (i, (&p, &y)) in preds.iter().zip(labels).enumerate() {
-        let w = weights.map_or(1.0, |ws| ws[i]);
+        let w = weights.map_or(1.0, |ws| ws.get(i));
         total += f64::from(loss(y, p) * w);
         weight += f64::from(w);
     }
@@ -39,7 +40,11 @@ impl Metric for Rmsle {
         "rmsle"
     }
 
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+    cell_metric_eval!();
+}
+
+impl CellMetric for Rmsle {
+    fn eval_cells(&self, preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_>>) -> f64 {
         weighted_mean(weighted_sum(preds, labels, weights, |y, p| {
             let diff = y.ln_1p() - p.ln_1p();
             diff * diff
@@ -59,7 +64,11 @@ impl Metric for Mape {
         "mape"
     }
 
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+    cell_metric_eval!();
+}
+
+impl CellMetric for Mape {
+    fn eval_cells(&self, preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_>>) -> f64 {
         weighted_mean(weighted_sum(preds, labels, weights, |y, p| {
             ((y - p) / y).abs()
         }))
@@ -86,7 +95,11 @@ impl Metric for PseudoHuberError {
         "mphe"
     }
 
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+    cell_metric_eval!();
+}
+
+impl CellMetric for PseudoHuberError {
+    fn eval_cells(&self, preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_>>) -> f64 {
         let slope = self.slope;
         weighted_mean(weighted_sum(preds, labels, weights, |y, p| {
             let scaled = (y - p) / slope;

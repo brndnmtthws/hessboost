@@ -202,7 +202,7 @@ impl Loss for Quantile {
     }
 
     fn base_margins_info(&self, info: &crate::data::MetaInfo) -> Vec<f32> {
-        let (labels, weights) = (info.labels, info.weights);
+        let (labels, weights) = (info.label_values(), info.weights);
         let order = stable_order(labels);
         match weights {
             None => {
@@ -382,7 +382,7 @@ impl Loss for Expectile {
     }
 
     fn base_margins_info(&self, info: &crate::data::MetaInfo) -> Vec<f32> {
-        let (labels, weights) = (info.labels, info.weights);
+        let (labels, weights) = (info.label_values(), info.weights);
         let k = self.alpha.len();
         let mean = weighted_label_mean(labels, weights);
         let mut gpair = Vec::with_capacity(labels.len() * k);

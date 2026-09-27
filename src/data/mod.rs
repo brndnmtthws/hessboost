@@ -8,9 +8,10 @@ mod loaders;
 mod meta;
 pub(crate) mod quantile;
 mod sketch;
+mod sort;
 pub mod target_stats;
 
 pub use dmatrix::DMatrix;
 pub(crate) use dmatrix::is_missing;
 pub use loaders::{CsvOptions, load_csv, load_libsvm, read_csv, read_libsvm};
-pub use meta::{FeatureType, GroupInfo, MetaInfo};
+pub use meta::{FeatureType, GroupInfo, LabelBounds, Labels, MetaInfo};

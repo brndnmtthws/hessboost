@@ -258,4 +258,5 @@ Budget training reimplements
 
 The error function used by the AFT normal distribution is ported from
 glibc 2.41's `s_erf.c`, derived from Sun Microsystems' fdlibm (Copyright (C)
-1993 Sun Microsystems, Inc.); `src/objective/survival.rs` carries its notice.
+1993 Sun Microsystems, Inc.); `src/objective/distributional/special.rs`
+carries its notice.

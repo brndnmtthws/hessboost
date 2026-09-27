@@ -12,19 +12,16 @@
 //! computed stably; for complements below `f32::EPSILON`, the higher-order
 //! correction is replaced by its finite first-order gradient limit.
 
-use super::{GradPair, Loss, check_label_domain, check_label_width};
+use super::query::{for_each_query, validate_query_info};
+use super::{GradPair, Loss};
 use crate::data::{GroupInfo, MetaInfo};
-use crate::error::{HessboostError, Result};
+use crate::error::Result;
 use crate::metric::group_ranges;
 use crate::rng::{keyed_unit_f32, stream_key};
-
-use rayon::prelude::*;
 
 /// Salt of the XE-NDCG target stream (`"xendcg"`), keeping its draws apart
 /// from every other keyed stream of the same seed.
 const TARGET_STREAM: u64 = 0x0000_7865_6E64_6367;
-/// Query batches this large use the same disjoint-group parallel strategy as LambdaMART.
-const PARALLEL_XENDCG_ROWS: usize = 4096;
 /// XE-NDCG loss (LightGBM `rank_xendcg`, named `rank:xendcg` here).
 pub(crate) struct Xendcg {
     seed: u64,
@@ -66,19 +63,11 @@ impl Xendcg {
         super::check_gradient_inputs(labels.len(), 1, preds, labels, weights, out);
         out.fill(GradPair::default());
         let ranges = group_ranges(preds.len(), group);
-        let mut queries = Vec::with_capacity(ranges.len());
-        let mut rest = &mut out[..];
-        let mut offset = 0;
-        for (start, end) in ranges {
-            let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - offset);
-            let (query_out, tail) = tail.split_at_mut(end - start);
-            rest = tail;
-            offset = end;
-            queries.push((start, query_out));
-        }
-        let process_query =
-            |scratch: &mut QueryScratch,
-             (query, (start, query_out)): (usize, (usize, &mut [GradPair]))| {
+        for_each_query(
+            &ranges,
+            out,
+            QueryScratch::default,
+            |scratch, query, start, query_out| {
                 let end = start + query_out.len();
                 Self::accumulate_query(
                     &QueryGradient {
@@ -92,21 +81,8 @@ impl Xendcg {
                     query_out,
                     scratch,
                 );
-            };
-        if preds.len() >= PARALLEL_XENDCG_ROWS
-            && queries.len() > 1
-            && rayon::current_num_threads() > 1
-        {
-            queries
-                .into_par_iter()
-                .enumerate()
-                .for_each_init(QueryScratch::default, process_query);
-        } else {
-            let mut scratch = QueryScratch::default();
-            for item in queries.into_iter().enumerate() {
-                process_query(&mut scratch, item);
-            }
-        }
+            },
+        );
     }
 
     fn accumulate_query(
@@ -242,39 +218,18 @@ impl Loss for Xendcg {
         out: &mut [GradPair],
         iteration: usize,
     ) {
-        self.query_gradients(preds, info.labels, info.weights, info.group, out, iteration);
+        self.query_gradients(
+            preds,
+            info.label_values(),
+            info.weights,
+            info.group,
+            out,
+            iteration,
+        );
     }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
-        info.check_layout()?;
-        check_label_width(info, 1)?;
-        check_label_domain(info, |y| !(0.0..=31.0).contains(&y) || y.fract() != 0.0)?;
-        let Some(group) = info.group else {
-            return Err(HessboostError::invalid_param(
-                "group_sizes",
-                "ranking dataset requires group information",
-            ));
-        };
-        if !group.partitions(info.n_rows) || group.iter_ranges().any(|(start, end)| start == end) {
-            return Err(HessboostError::invalid_param(
-                "group_sizes",
-                "ranking dataset requires non-empty consecutive query groups covering all rows",
-            ));
-        }
-        if let Some(weights) = info.weights {
-            for (start, end) in group.iter_ranges() {
-                if weights[start..end]
-                    .iter()
-                    .any(|weight| *weight != weights[start])
-                {
-                    return Err(HessboostError::invalid_param(
-                        "weights",
-                        "ranking dataset requires one constant weight per query group",
-                    ));
-                }
-            }
-        }
-        Ok(())
+        validate_query_info(info, |y| !(0.0..=31.0).contains(&y) || y.fract() != 0.0)
     }
 
     fn default_metric(&self) -> crate::metric::EvalMetric {

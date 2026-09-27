@@ -121,15 +121,16 @@ impl Loss for AbsoluteError {
                     };
                 }
             };
-        if k == 1 {
-            super::rowwise_gradient(n, 1, preds, labels, weights, out, kernel);
-        } else {
-            kernel(preds, labels, weights, out);
-        }
+        let shape = super::RowShape {
+            n_rows: n,
+            n_outputs: k,
+            label_cols: k,
+        };
+        super::rowwise_cells(shape, preds, labels, weights, out, kernel);
     }
 
     fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
-        let (labels, weights) = (info.labels, info.weights);
+        let (labels, weights) = (info.label_values(), info.weights);
         let k = self.n_targets;
         let n = labels.len() / k;
         if total_weight(weights, n).is_none() {

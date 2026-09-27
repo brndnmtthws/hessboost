@@ -75,7 +75,7 @@ impl Metric for QuantileError {
         alpha_average(
             &self.alpha,
             preds,
-            info.labels,
+            info.label_values(),
             info.weights,
             info.n_rows,
             |a, p, y| {
@@ -88,7 +88,7 @@ impl Metric for QuantileError {
 
     /// One prediction per alpha and label column.
     fn prediction_width(&self, info: &MetaInfo) -> Option<usize> {
-        Some(self.alpha.len() * info.n_targets)
+        Some(self.alpha.len() * info.n_targets())
     }
 }
 
@@ -121,7 +121,7 @@ impl Metric for ExpectileError {
         alpha_average(
             &self.alpha,
             preds,
-            info.labels,
+            info.label_values(),
             info.weights,
             info.n_rows,
             |a, p, y| {
@@ -134,7 +134,7 @@ impl Metric for ExpectileError {
 
     /// One prediction per alpha and label column.
     fn prediction_width(&self, info: &MetaInfo) -> Option<usize> {
-        Some(self.alpha.len() * info.n_targets)
+        Some(self.alpha.len() * info.n_targets())
     }
 }
 
@@ -171,7 +171,8 @@ mod tests {
     fn empty_labels_evaluate_to_nan() {
         let info = MetaInfo {
             n_rows: 3,
-            ..MetaInfo::new(&[], None, None)
+            weights: None,
+            ..MetaInfo::unlabeled(0)
         };
         let q = QuantileError::new(vec![0.5]);
         let e = ExpectileError::new(vec![0.2, 0.8]);

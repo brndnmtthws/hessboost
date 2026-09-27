@@ -125,14 +125,14 @@ Fix findings rather than suppress them.
 |---|---|
 |`lib.rs`|crate docs ("What's here", "Not implemented"), `prelude`, hidden `internals`|
 |`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams (`stream_key`, `keyed_normal`)|
-|`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
+|`data/`|`dmatrix` (`DMatrix`; `select_rows` keeps dense storage dense), `loaders`, `meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`) over `sort` (float sort keys, radix sort), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
 |`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Boulevard` (`BoosterKind::Boulevard`), `Ebm` (`BoosterKind::Ebm`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree`, `BalancedBagging`, `QueryBagging`, `Langevin`, `ModelShrink` (`Option` fields); each validates when built|
 |`config/mod.rs`|re-exports; the `setter!` macro both builders' plain setters use|
 |`config/xgboost/`|XGBoost's flat parameter form: `schema.rs` (`flat_params!` declaring `Flat`, every key and its value type; aliases, `FIXED` one-setting options, key lookup with typo suggestions, the parser-private `FlatLimit`/`FlatRate` for the flat `0`-means-unset values), `parse.rs` (`TrainingParams::from_xgboost`, value spellings, `Flat::into_params` split into `objective_and_metrics`, `check_switch_dependencies`, `booster_kind`, `mode_options`), `emit.rs` (`to_xgboost`, `changed_keys`)|
 |`check.rs`|crate-private range checks (`ensure`, `unit`, `fraction`, `positive`, `non_negative`, `narrows`) shared by the parameter constructors; keep the boundary in the message|
-|`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `xendcg` (LightGBM XE-NDCG; its own keyed RNG stream), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
-|`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
+|`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `query` (query-group validation and slicing shared by `ranking` and `xendcg`), `survival/` (`cox`, `aft`), `xendcg` (LightGBM XE-NDCG; its own keyed RNG stream), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`: `family` (the `dist_families!` table, derivatives, MLE), `dist` (`Dist` ops), `count` (count sums, CRPS, quantile roots), `loss` (`DistLoss`), `special` (special functions, incl. glibc's `erf` for AFT))|
+|`metric/`|`mod.rs`: the `Metric` trait, `CustomMetric`, the SIMD-backed pointwise metrics (`CellMetric`: label-matrix row weights read strided via `simd::RowWeights`, never materialized), shared sorts; `factory` (private; `EvalMetric`, `Cutoff`, naming, `from_xgboost` reading XGBoost names with the flat parameters they borrow); by family: `curve` (AUC/AUCPR, strided per-target columns), `ranking` (NDCG/MAP/`pre`), `elementwise`, `quantile`, `survival`, `distributional` (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`, `online` (split ranking for `training::online`)|
 |`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts; uniform, class-balanced, and query-level row sampling), `boulevard` (BRAT-D/BRAT-P `Recursion`, shared with the honest refit), `ebm` (classic cyclic EBM with outer bags, Boulevard EBM stages on the same `Recursion`, FAST pair ranking), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
@@ -299,7 +299,12 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `MetaInfo` hooks (`Loss::gradient_info`, `base_margins_info`,
   `eval_transform`, `validate_info`, `requires_labels`;
   `Metric::eval_info`, `validate_info`, `prediction_width`,
-  `supports_label_matrix`). `base_margins_info` is the only intercept hook;
+  `supports_label_matrix`). `MetaInfo` states presence explicitly:
+  `labels: Option<Labels>` (values plus `NonZeroUsize` targets; `n_targets()`
+  is 1 without labels) and `bounds: Option<LabelBounds>` (lower and upper
+  together). Losses and metrics that read bounds fall back to the labels
+  only when `bounds` is `None`; `label_values()` (empty without labels) is
+  what the slice hooks receive. `base_margins_info` is the only intercept hook;
   `probs_to_margins` is the only link hook, applied to user, imported, and
   Newton-default `base_score`; a user `base_score` is first checked by
   `validate_base_score` of the loss being trained (never by the configured

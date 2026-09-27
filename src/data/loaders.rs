@@ -166,7 +166,7 @@ pub fn read_csv<R: Read>(reader: R, opts: &CsvOptions) -> Result<DMatrix> {
     })?;
 
     let n_cols = n_cols.ok_or(HessboostError::EmptyDataset("csv: no data rows"))?;
-    let d = DMatrix::from_dense(&flat, n_rows, n_cols)?;
+    let d = DMatrix::from_dense_vec(flat, n_rows, n_cols)?;
     if labels.is_empty() {
         Ok(d)
     } else {

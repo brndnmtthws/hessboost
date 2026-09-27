@@ -15,8 +15,9 @@
 //! column.
 
 use super::{GradPair, Loss};
-use crate::data::MetaInfo;
+use crate::data::{Labels, MetaInfo};
 use crate::error::Result;
+use std::num::NonZeroUsize;
 
 /// An elementwise single-target objective applied to each of `n_targets`
 /// label columns (output `j` fits `labels[row * n_targets + j]`).
@@ -36,7 +37,7 @@ impl MultiTarget {
     /// one per cell, carrying `cell_weights` (the row weights broadcast per
     /// cell).
     fn cells<'a>(info: &MetaInfo<'a>, cell_weights: Option<&'a [f32]>) -> MetaInfo<'a> {
-        MetaInfo::new(info.labels, cell_weights, None)
+        MetaInfo::new(info.label_values(), cell_weights, None)
     }
 }
 
@@ -56,9 +57,10 @@ impl Loss for MultiTarget {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
+        let n_targets = NonZeroUsize::new(self.n_targets).expect("a label matrix has targets");
         let info = MetaInfo {
             n_rows: labels.len() / self.n_targets,
-            n_targets: self.n_targets,
+            labels: Some(Labels::new(labels, n_targets)),
             ..MetaInfo::new(labels, weights, None)
         };
         self.gradient_info(preds, &info, out);
@@ -90,7 +92,7 @@ impl Loss for MultiTarget {
         (0..self.n_targets)
             .map(|j| {
                 column.clear();
-                column.extend(info.labels.iter().skip(j).step_by(self.n_targets));
+                column.extend(info.label_values().iter().skip(j).step_by(self.n_targets));
                 self.inner
                     .base_margins_info(&MetaInfo::new(&column, info.weights, None))[0]
             })
@@ -176,7 +178,10 @@ mod tests {
             for w in [None, Some(weights.as_slice())] {
                 let info = MetaInfo {
                     n_rows: 7,
-                    n_targets: 2,
+                    labels: Some(crate::data::Labels::new(
+                        &matrix,
+                        std::num::NonZeroUsize::new(2).unwrap(),
+                    )),
                     ..MetaInfo::new(&matrix, w, None)
                 };
                 let mut out = vec![GradPair::default(); 14];
@@ -206,12 +211,18 @@ mod tests {
         let labels = [0.0, 1.0, 1.0, 1.5];
         let info = MetaInfo {
             n_rows: 2,
-            n_targets: 2,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
             ..MetaInfo::new(&labels, None, None)
         };
         assert!(multi.validate_info(&info).is_err());
         let info = MetaInfo {
-            labels: &[0.0, 1.0, 1.0, 0.5],
+            labels: Some(crate::data::Labels::new(
+                &[0.0, 1.0, 1.0, 0.5],
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
             ..info
         };
         assert!(multi.validate_info(&info).is_ok());
@@ -239,7 +250,10 @@ mod tests {
         let labels = [0.0, 1.0, 1.0, 0.0];
         let info = MetaInfo {
             n_rows: 2,
-            n_targets: 2,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
             ..MetaInfo::new(&labels, Some(&[1.0]), None)
         };
         assert!(matches!(
@@ -247,7 +261,10 @@ mod tests {
             Err(HessboostError::InvalidParameter { name, .. }) if name == "weights"
         ));
         let huge = MetaInfo {
-            n_targets: usize::MAX,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::MAX,
+            )),
             weights: Some(&[1.0, 1.0]),
             ..info
         };

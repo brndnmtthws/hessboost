@@ -48,6 +48,7 @@ mod multi_target;
 mod multiclass;
 mod params;
 mod quantile;
+mod query;
 mod ranking;
 mod regression;
 mod spec;
@@ -141,13 +142,9 @@ pub(crate) const MIN_HESS: f32 = 1e-16;
 pub(crate) const MIN_HESS_F64: f64 = 1e-16;
 
 /// Run a row-independent gradient `kernel` over `n_rows` instances with
-/// `n_outputs` values each, in parallel row chunks when the batch is large and
-/// a thread pool is available. Every row's outputs depend only on that row,
-/// and the chunking is fixed (not thread-count dependent): a short final
-/// chunk is folded into the last full chunk so every row takes the same
-/// vector/scalar path as in one whole-batch call, and the result is
-/// identical. Debug builds first assert the shapes with
-/// [`check_gradient_inputs`].
+/// `n_outputs` values each and one label per row, in parallel row chunks when
+/// the batch is large and a thread pool is available
+/// ([`rowwise_cells`] with one label column).
 pub(crate) fn rowwise_gradient<K>(
     n_rows: usize,
     n_outputs: usize,
@@ -160,10 +157,51 @@ pub(crate) fn rowwise_gradient<K>(
     K: Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Sync,
 {
     check_gradient_inputs(n_rows, n_outputs, preds, labels, weights, out);
+    let shape = RowShape {
+        n_rows,
+        n_outputs,
+        label_cols: 1,
+    };
+    rowwise_cells(shape, preds, labels, weights, out, kernel);
+}
+
+/// The per-row layout of a [`rowwise_cells`] batch: `preds` and `out` hold
+/// `n_outputs` values per row, `labels` hold `label_cols`, and weights one.
+#[derive(Clone, Copy)]
+pub(crate) struct RowShape {
+    pub(crate) n_rows: usize,
+    pub(crate) n_outputs: usize,
+    pub(crate) label_cols: usize,
+}
+
+/// Run a row-independent gradient `kernel` over `shape.n_rows` rows, in
+/// parallel row chunks when the batch is large and a thread pool is
+/// available. Every row's outputs depend only on that row, and the chunking
+/// is fixed (not thread-count dependent): a short final chunk is folded into
+/// the last full chunk so every row takes the same vector/scalar path as in
+/// one whole-batch call, and the result is identical. Mis-shaped inputs run
+/// as one whole-batch call.
+pub(crate) fn rowwise_cells<K>(
+    shape: RowShape,
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    out: &mut [GradPair],
+    kernel: K,
+) where
+    K: Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Sync,
+{
+    let RowShape {
+        n_rows,
+        n_outputs,
+        label_cols,
+    } = shape;
     let complete = n_rows
         .checked_mul(n_outputs)
         .is_some_and(|values| preds.len() == values && out.len() == values)
-        && labels.len() == n_rows
+        && n_rows
+            .checked_mul(label_cols)
+            .is_some_and(|values| labels.len() == values)
         && weights.is_none_or(|w| w.len() == n_rows);
     if !complete
         || n_rows == 0
@@ -178,7 +216,7 @@ pub(crate) fn rowwise_gradient<K>(
         let rows = out.len() / n_outputs;
         kernel(
             &preds[first * n_outputs..(first + rows) * n_outputs],
-            &labels[first..first + rows],
+            &labels[first * label_cols..(first + rows) * label_cols],
             weights.map(|w| &w[first..first + rows]),
             out,
         );
@@ -328,7 +366,7 @@ pub trait Loss: Send + Sync {
     /// objectives that read other metadata (label bounds, several targets per
     /// row) override it.
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
-        self.gradient_grouped(preds, info.labels, info.weights, info.group, out);
+        self.gradient_grouped(preds, info.label_values(), info.weights, info.group, out);
     }
 
     /// Compute the gradients of boosting round `iteration` (counted from
@@ -551,7 +589,7 @@ pub(crate) enum OutputDomain {
 /// Shared [`Loss::validate_info`] label-domain check: reject the dataset
 /// when any label satisfies `invalid`.
 pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool) -> Result<()> {
-    if info.labels.iter().any(|&y| invalid(y)) {
+    if info.label_values().iter().any(|&y| invalid(y)) {
         return Err(HessboostError::invalid_param(
             "labels",
             "dataset has labels outside the objective's valid domain",
@@ -566,12 +604,12 @@ pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool)
 /// the built-in objectives'
 /// [`TrainingParams::loss`](crate::config::TrainingParams::loss)).
 pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()> {
-    if info.n_targets != n_targets {
+    if info.n_targets() != n_targets {
         return Err(HessboostError::invalid_param(
             "labels",
             format!(
                 "dataset has {} label columns but the objective models {n_targets}",
-                info.n_targets
+                info.n_targets()
             ),
         ));
     }
@@ -655,8 +693,8 @@ mod tests {
                 out.fill(GradPair::new(f32::NAN, 1.0));
             }
             fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
-                let (Some(lo), Some(hi)) = (info.label_lower_bound, info.label_upper_bound) else {
-                    return self.gradient(preds, info.labels, info.weights, out);
+                let Some((lo, hi)) = info.bounds.map(|b| (b.lower(), b.upper())) else {
+                    return self.gradient(preds, info.label_values(), info.weights, out);
                 };
                 for (i, g) in out.iter_mut().enumerate() {
                     *g = GradPair::new(preds[i] - f32::midpoint(lo[i], hi[i]), 1.0);
@@ -669,13 +707,13 @@ mod tests {
         let (lower, upper) = ([0.0f32, 4.0], [2.0f32, 6.0]);
         let info = MetaInfo {
             n_rows: 2,
-            label_lower_bound: Some(&lower),
-            label_upper_bound: Some(&upper),
-            ..MetaInfo::new(&[], None, None)
+            bounds: Some(crate::data::LabelBounds::new(&lower, &upper)),
+            weights: None,
+            ..MetaInfo::unlabeled(0)
         };
         assert_eq!(Midpoint.base_margins_info(&info), vec![3.0]);
         let inconsistent = MetaInfo {
-            n_targets: usize::MAX,
+            labels: Some(crate::data::Labels::new(&[], std::num::NonZeroUsize::MAX)),
             ..info
         };
         assert!(Midpoint.base_margins_info(&inconsistent)[0].is_nan());

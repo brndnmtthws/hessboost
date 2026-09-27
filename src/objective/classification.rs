@@ -133,7 +133,7 @@ impl Loss for LogisticLoss {
         if (self.scale_pos_weight - 1.0).abs() > K_RT_EPS_F32 {
             return newton_intercepts(self, info);
         }
-        vec![self.link(weighted_label_mean(info.labels, info.weights))]
+        vec![self.link(weighted_label_mean(info.label_values(), info.weights))]
     }
 
     fn probs_to_margins(&self, scores: &mut [f32]) {

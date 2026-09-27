@@ -44,7 +44,9 @@ def test_shape_functions_add_up_to_the_margin() -> None:
         assert total == pytest.approx(float(m), abs=1e-4)
     assert main.cell([np.nan]) == (main.axes[0].cells - 1,)
     info = booster.ebm
-    assert isinstance(info, EbmInfo) and info.boulevard is None and len(info.terms) == 4
+    assert isinstance(info, EbmInfo)
+    assert info.boulevard is None
+    assert len(info.terms) == 4
     with pytest.raises(hessboost.HessboostError):
         main.value([0.5, 0.5])
 
@@ -56,10 +58,13 @@ def test_categorical_terms_report_per_category_cells() -> None:
     effect = np.array([-1.0, 0.5, 0.0, 2.0])
     frame = pd.DataFrame({"c": pd.Categorical(codes), "b": b})
     y = effect[codes] + np.sin(6 * b)
-    booster = hessboost.train(CLASSIC, hessboost.DMatrix(frame, label=y, enable_categorical=True), 60)
+    booster = hessboost.train(
+        CLASSIC, hessboost.DMatrix(frame, label=y, enable_categorical=True), 60
+    )
     shape = shape_functions(booster).terms[0]
     axis = shape.axes[0]
-    assert isinstance(axis, CategoricalAxis) and shape.values.shape == (axis.cells,)
+    assert isinstance(axis, CategoricalAxis)
+    assert shape.values.shape == (axis.cells,)
     zero = shape.value([2.0])
     for code in (0, 1, 3):
         assert shape.value([float(code)]) - zero == pytest.approx(effect[code], abs=0.3)
@@ -72,13 +77,17 @@ def test_boulevard_bands() -> None:
     bands = inference.term_bands(0, alpha=0.05)
     assert isinstance(bands, TermBands)
     assert bands.standard_errors.shape == bands.shape.values.shape
-    assert np.all(bands.lower <= bands.shape.values) and np.all(bands.shape.values <= bands.upper)
+    assert np.all(bands.lower <= bands.shape.values)
+    assert np.all(bands.shape.values <= bands.upper)
     assert inference.term_standard_errors(1, x[:10]).shape == (10,)
     ci = inference.confidence_intervals(x[:10], alpha=0.1)
     pi = inference.prediction_intervals(x[:10], alpha=0.1)
-    assert np.all(pi[:, 0] < ci[:, 0]) and inference.standard_errors(x[:10]).shape == (10,)
-    assert inference.intercept_standard_error > 0 and inference.noise_variance > 0
-    assert booster.ebm is not None and booster.ebm.boulevard is not None
+    assert np.all(pi[:, 0] < ci[:, 0])
+    assert inference.standard_errors(x[:10]).shape == (10,)
+    assert inference.intercept_standard_error > 0
+    assert inference.noise_variance > 0
+    assert booster.ebm is not None
+    assert booster.ebm.boulevard is not None
 
 
 def test_refusals() -> None:
@@ -96,7 +105,10 @@ def test_refusals() -> None:
     # kernel cannot represent, whatever the objective.
     # (A non-binary objective is refused first by balanced bagging itself.)
     labels = (y > np.median(y)).astype(float)
-    for objective, reason in (("binary:logistic", "linear smoother"), ("reg:squarederror", "binary")):
+    for objective, reason in (
+        ("binary:logistic", "linear smoother"),
+        ("reg:squarederror", "binary"),
+    ):
         balanced = {**BOULEVARD, "subsample": 1.0, "objective": objective}
         with pytest.raises(hessboost.HessboostError, match=reason):
             hessboost.train(
@@ -115,7 +127,7 @@ def test_classic_ebms_bag_rows_by_class() -> None:
 
 
 def test_classic_ebms_bag_whole_queries() -> None:
-    x, y = data(400, 6)
+    x, _ = data(400, 6)
     relevance = np.minimum(np.floor(3 * (x[:, 0] + 0.5 * x[:, 1])), 3)
     dtrain = hessboost.DMatrix(x, label=relevance, group=[10] * 40)
     params = {**CLASSIC, "objective": "rank:ndcg"}

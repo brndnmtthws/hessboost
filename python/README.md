@@ -55,7 +55,7 @@ booster = hessboost.train(
     early_stopping_rounds=20,
     verbose_eval=False,
 )
-probabilities = booster.predict(X[800:])       # through booster.best_iteration
+probabilities = booster.predict(X[800:])  # through booster.best_iteration
 shap = booster.predict(X[800:], pred_contribs=True)  # (rows, features + 1)
 print(booster.best_iteration, booster.get_score(importance_type="gain"))
 ```
@@ -78,10 +78,10 @@ shuffled folds, explicit folds, or a scikit-learn splitter.
 ```python
 class StopAtTarget(hessboost.TrainingCallback):
     def after_iteration(self, iteration, evals_log):
-        return evals_log["valid"]["auc"][-1] > 0.99   # True stops training
+        return evals_log["valid"]["auc"][-1] > 0.99  # True stops training
 
-hessboost.train(params, dtrain, 1000, evals=[(dvalid, "valid")],
-                callbacks=[StopAtTarget()])
+
+hessboost.train(params, dtrain, 1000, evals=[(dvalid, "valid")], callbacks=[StopAtTarget()])
 ```
 
 ### pandas and categorical features
@@ -96,8 +96,7 @@ unseen values (which count as missing):
 ```python
 import pandas as pd
 
-df = pd.DataFrame({"color": pd.Categorical(["red", "blue", "red"] * 100),
-                   "size": np.arange(300.0)})
+df = pd.DataFrame({"color": pd.Categorical(["red", "blue", "red"] * 100), "size": np.arange(300.0)})
 booster = hessboost.train({}, hessboost.DMatrix(df, label=np.arange(300.0)), 20)
 booster.predict(df)
 ```
@@ -126,8 +125,9 @@ every `eval_set` frame to the training frame's categories and, with
 ```python
 from hessboost.sklearn import HessboostClassifier
 
-model = HessboostClassifier(n_estimators=300, max_depth=4, learning_rate=0.1,
-                            early_stopping_rounds=20)
+model = HessboostClassifier(
+    n_estimators=300, max_depth=4, learning_rate=0.1, early_stopping_rounds=20
+)
 model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
 model.predict_proba(X_test)
 model.feature_importances_
@@ -167,33 +167,37 @@ slices boosting iterations.
 ```python
 from hessboost.conformal import ConformalizedQuantile
 
-band = hessboost.train({"objective": "reg:quantileerror", "quantile_alpha": [0.05, 0.95]},
-                       hessboost.DMatrix(X_train, y_train), 200)
+band = hessboost.train(
+    {"objective": "reg:quantileerror", "quantile_alpha": [0.05, 0.95]},
+    hessboost.DMatrix(X_train, y_train),
+    200,
+)
 cqr = ConformalizedQuantile.calibrate_outputs(band, X_cal, y_cal, alpha=0.1)
-lower, upper = cqr.predict_interval(X_test).T   # >= 90% coverage, finite-sample
+lower, upper = cqr.predict_interval(X_test).T  # >= 90% coverage, finite-sample
 
 dist = hessboost.train({"objective": "dist:normal"}, hessboost.DMatrix(X_train, y_train), 300)
 d = dist.predict_distribution(X_test)
 d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
 
 sglb = hessboost.train({"posterior_sampling": True}, hessboost.DMatrix(X_train, y_train), 1000)
-members, iterations = sglb.predict_virtual_ensembles(X_test, 10)   # (10, rows)
-u = sglb.predict_uncertainty(X_test, 10)   # u.knowledge rises off the training data
+members, iterations = sglb.predict_virtual_ensembles(X_test, 10)  # (10, rows)
+u = sglb.predict_uncertainty(X_test, 10)  # u.knowledge rises off the training data
 
 from hessboost.online import OnlineModel
 
-online = OnlineModel.train({"tree_method": "hist", "max_depth": 6},
-                           hessboost.DMatrix(X_train, y_train), 100, tolerance=0.1)
+online = OnlineModel.train(
+    {"tree_method": "hist", "max_depth": 6}, hessboost.DMatrix(X_train, y_train), 100, tolerance=0.1
+)
 report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
-online.model.predict(X_test)   # online.data: the updated training rows
+online.model.predict(X_test)  # online.data: the updated training rows
 
 from hessboost.inference import BoulevardInference, honest_refit
 
 params = {"booster": "boulevard", "eta": 0.8, "boulevard_dropout": 0.5, "subsample": 0.8}
 trained = hessboost.train(params, hessboost.DMatrix(X_struct, y_struct), 200)
-model = honest_refit(trained, X_values, y_values)   # leaves from independent rows
+model = honest_refit(trained, X_values, y_values)  # leaves from independent rows
 inference = BoulevardInference.fit(model, X_values, holdout=X_cal, holdout_label=y_cal)
-lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T   # for f(x)
+lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T  # for f(x)
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
@@ -274,9 +278,16 @@ with [uv](https://docs.astral.sh/uv/):
 ```sh
 uv sync                        # build the extension and install dev tools
 uv run pytest
-uv run python -m mypy.stubtest hessboost._hessboost
-uv run mypy --strict
 uv run pyright --verifytypes hessboost --ignoreexternal
+```
+
+Lint, format, and type-check all of the repository's Python from its root
+(configuration: `ruff.toml`, `ty.toml`):
+
+```sh
+uv run --project python ruff check
+uv run --project python ruff format --check
+uv run --project python ty check
 ```
 
 ## License

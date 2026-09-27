@@ -6,20 +6,20 @@ matrix construction plus training; file I/O, warmup, and evaluation are excluded
 """
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import statistics
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import xgboost as xgb
-
 
 WORKLOADS = {
     "regression": (100_000, 30, "reg:squarederror", 0, "rmse"),
@@ -45,18 +45,35 @@ def make_dataset(folder, workload, rounds, rows_override):
             margin = 4 * (x[:, 0] - 0.5) - 3 * (x[:, 1] - 0.5) + 2 * (x[:, 2] - 0.5)
             y = (rng.random(count) < 1 / (1 + np.exp(-margin))).astype(np.float32)
         elif classes:
-            scores = np.column_stack([
-                3 * x[:, i] - x[:, (i + 1) % classes] for i in range(classes)
-            ])
+            scores = np.column_stack(
+                [3 * x[:, i] - x[:, (i + 1) % classes] for i in range(classes)]
+            )
             y = np.argmax(scores + 0.1 * rng.standard_normal(scores.shape), axis=1)
         else:
-            y = (2 * x[:, 0] - 3 * x[:, 1] ** 2 + 0.5 * x[:, 2] + x[:, 3] * x[:, 4]
-                 + 0.05 * rng.standard_normal(count).astype(np.float32))
+            y = (
+                2 * x[:, 0]
+                - 3 * x[:, 1] ** 2
+                + 0.5 * x[:, 2]
+                + x[:, 3] * x[:, 4]
+                + 0.05 * rng.standard_normal(count).astype(np.float32)
+            )
         np.asarray(x, dtype="<f4").tofile(folder / f"X{suffix}.bin")
         np.asarray(y, dtype="<f4").tofile(folder / f"y{suffix}.bin")
-    meta = dict(n_rows=rows, n_test=n_test, n_cols=cols, objective=objective,
-                num_class=classes, metric=metric, num_round=rounds, max_depth=6,
-                eta=0.1, **{"lambda": 1.0}, max_bin=256, base_score=0.5, seed=1234)
+    meta = dict(
+        n_rows=rows,
+        n_test=n_test,
+        n_cols=cols,
+        objective=objective,
+        num_class=classes,
+        metric=metric,
+        num_round=rounds,
+        max_depth=6,
+        eta=0.1,
+        **{"lambda": 1.0},
+        max_bin=256,
+        base_score=0.5,
+        seed=1234,
+    )
     (folder / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
 
@@ -78,13 +95,26 @@ def xgboost_batch(folder, meta, threads, repeats):
     xt = np.fromfile(folder / "X_test.bin", dtype="<f4").reshape(-1, meta["n_cols"])
     yt = np.fromfile(folder / "y_test.bin", dtype="<f4")
     dtest = xgb.DMatrix(xt, label=yt, nthread=threads)
-    params = dict(objective=meta["objective"], tree_method="hist", device="cpu",
-                  grow_policy="depthwise", max_depth=meta["max_depth"],
-                  eta=meta["eta"], reg_lambda=meta["lambda"], reg_alpha=0.0,
-                  gamma=0.0, min_child_weight=1.0, max_bin=meta["max_bin"],
-                  subsample=1.0, colsample_bytree=1.0, colsample_bylevel=1.0,
-                  colsample_bynode=1.0, base_score=meta["base_score"],
-                  nthread=threads, seed=meta["seed"])
+    params = {
+        "objective": meta["objective"],
+        "tree_method": "hist",
+        "device": "cpu",
+        "grow_policy": "depthwise",
+        "max_depth": meta["max_depth"],
+        "eta": meta["eta"],
+        "reg_lambda": meta["lambda"],
+        "reg_alpha": 0.0,
+        "gamma": 0.0,
+        "min_child_weight": 1.0,
+        "max_bin": meta["max_bin"],
+        "subsample": 1.0,
+        "colsample_bytree": 1.0,
+        "colsample_bylevel": 1.0,
+        "colsample_bynode": 1.0,
+        "base_score": meta["base_score"],
+        "nthread": threads,
+        "seed": meta["seed"],
+    }
     if meta["num_class"]:
         params["num_class"] = meta["num_class"]
     samples, score = [], None
@@ -99,78 +129,128 @@ def xgboost_batch(folder, meta, threads, repeats):
             score = test_score(booster.predict(dtest), yt, meta["metric"])
             config = json.loads(booster.save_config())
         del booster, dtrain
-    return dict(engine="xgboost", threads=threads, fit_seconds=samples,
-                test_metric=meta["metric"], test_score=score, config=config)
+    return {
+        "engine": "xgboost",
+        "threads": threads,
+        "fit_seconds": samples,
+        "test_metric": meta["metric"],
+        "test_score": score,
+        "config": config,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hessboost", type=Path, required=True, help="Compiled bench_compare example")
-    parser.add_argument("--output", type=Path, required=True, help="New directory for data and results")
+    parser.add_argument(
+        "--hessboost", type=Path, required=True, help="Compiled bench_compare example"
+    )
+    parser.add_argument(
+        "--output", type=Path, required=True, help="New directory for data and results"
+    )
     parser.add_argument("--threads", nargs="+", type=int, default=[1, 4, 16])
     parser.add_argument("--workloads", nargs="+", choices=WORKLOADS, default=list(WORKLOADS))
     parser.add_argument("--rounds", type=int, default=100)
-    parser.add_argument("--repeats", type=int, default=3, help="Measured fits per batch; two batches per engine")
+    parser.add_argument(
+        "--repeats", type=int, default=3, help="Measured fits per batch; two batches per engine"
+    )
     parser.add_argument("--rows", type=int, help="Override training rows for a smoke check")
     args = parser.parse_args()
-    if min(args.threads + [args.rounds, args.repeats, args.rows if args.rows is not None else 1]) < 1:
+    counts = [*args.threads, args.rounds, args.repeats, 1 if args.rows is None else args.rows]
+    if min(counts) < 1:
         parser.error("thread, round, repeat, and row counts must be positive")
     executable = args.hessboost.resolve(strict=True)
     args.output.mkdir(parents=True, exist_ok=False)
     library = Path(xgb.core._LIB._name)
-    cpu = (subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
-           if sys.platform == "darwin" else platform.processor())
-    sources = [Path(__file__), Path("examples/bench_compare.rs"),
-               Path("Cargo.toml"), Path("Cargo.lock"),
-               *sorted(Path("src").rglob("*.rs"))]
+    cpu = (
+        subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+        if sys.platform == "darwin"
+        else platform.processor()
+    )
+    sources = [
+        Path(__file__),
+        Path("examples/bench_compare.rs"),
+        Path("Cargo.toml"),
+        Path("Cargo.lock"),
+        *sorted(Path("src").rglob("*.rs")),
+    ]
     report = {
         "metadata": {
-            "started_at": datetime.now(timezone.utc).isoformat(), "cpu": cpu,
-            "platform": platform.platform(), "python": sys.version, "numpy": np.__version__,
-            "xgboost": xgb.__version__, "xgboost_build_info": xgb.build_info(),
-            "xgboost_library_sha256": sha256(library), "hessboost_executable_sha256": sha256(executable),
+            "started_at": datetime.now(UTC).isoformat(),
+            "cpu": cpu,
+            "platform": platform.platform(),
+            "python": sys.version,
+            "numpy": np.__version__,
+            "xgboost": xgb.__version__,
+            "xgboost_build_info": xgb.build_info(),
+            "xgboost_library_sha256": sha256(library),
+            "hessboost_executable_sha256": sha256(executable),
             "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
             "source_sha256": {str(p): sha256(p) for p in sources},
             "matrix": "XGBoost QuantileDMatrix; hessboost DMatrix",
-            "timing": "Fresh training matrix construction plus train; I/O, evaluation, and destruction excluded",
+            "timing": (
+                "Fresh training matrix construction plus train; I/O, evaluation, and "
+                "destruction excluded"
+            ),
             "order": ["xgboost", "hessboost", "hessboost", "xgboost"],
-            "warmup_fits_per_batch": 1, "measured_fits_per_batch": args.repeats,
+            "warmup_fits_per_batch": 1,
+            "measured_fits_per_batch": args.repeats,
             "threads": args.threads,
         },
-        "datasets": {}, "results": [],
+        "datasets": {},
+        "results": [],
     }
     for workload in args.workloads:
         folder = args.output / workload
         meta = make_dataset(folder, workload, args.rounds, args.rows)
-        report["datasets"][workload] = dict(parameters=meta,
-            sha256={p.name: sha256(p) for p in sorted(folder.iterdir())})
+        report["datasets"][workload] = {
+            "parameters": meta,
+            "sha256": {p.name: sha256(p) for p in sorted(folder.iterdir())},
+        }
         for threads in args.threads:
             batches = []
             for engine in report["metadata"]["order"]:
-                started = datetime.now(timezone.utc).isoformat()
+                started = datetime.now(UTC).isoformat()
                 if engine == "xgboost":
                     batch = xgboost_batch(folder, meta, threads, args.repeats)
                 else:
-                    env = dict(os.environ, BENCH_DIR=str(folder.resolve()),
-                               BENCH_REPEATS=str(args.repeats), RAYON_NUM_THREADS=str(threads))
+                    env = dict(
+                        os.environ,
+                        BENCH_DIR=str(folder.resolve()),
+                        BENCH_REPEATS=str(args.repeats),
+                        RAYON_NUM_THREADS=str(threads),
+                    )
                     batch = json.loads(subprocess.check_output([str(executable)], env=env))
                     assert batch["threads"] == threads
                 batch["started_at"] = started
                 batches.append(batch)
-                print(f"{workload}, {threads} threads, {engine}: "
-                      f"{statistics.median(batch['fit_seconds']):.3f} s", flush=True)
-            engines = {}
+                print(
+                    f"{workload}, {threads} threads, {engine}: "
+                    f"{statistics.median(batch['fit_seconds']):.3f} s",
+                    flush=True,
+                )
+            engines: dict[str, dict[str, Any]] = {}
             for engine in report["metadata"]["order"][:2]:
                 selected = [b for b in batches if b["engine"] == engine]
                 samples = [t for b in selected for t in b["fit_seconds"]]
-                engines[engine] = dict(median_fit_seconds=statistics.median(samples),
-                    min_fit_seconds=min(samples), max_fit_seconds=max(samples),
-                    test_metric=meta["metric"], test_scores=[b["test_score"] for b in selected])
-            report["results"].append(dict(workload=workload, threads=threads, engines=engines,
-                hessboost_speedup=engines["xgboost"]["median_fit_seconds"] /
-                                engines["hessboost"]["median_fit_seconds"], batches=batches))
+                engines[engine] = {
+                    "median_fit_seconds": statistics.median(samples),
+                    "min_fit_seconds": min(samples),
+                    "max_fit_seconds": max(samples),
+                    "test_metric": meta["metric"],
+                    "test_scores": [b["test_score"] for b in selected],
+                }
+            report["results"].append(
+                {
+                    "workload": workload,
+                    "threads": threads,
+                    "engines": engines,
+                    "hessboost_speedup": engines["xgboost"]["median_fit_seconds"]
+                    / engines["hessboost"]["median_fit_seconds"],
+                    "batches": batches,
+                }
+            )
             (args.output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
-    report["metadata"]["finished_at"] = datetime.now(timezone.utc).isoformat()
+    report["metadata"]["finished_at"] = datetime.now(UTC).isoformat()
     (args.output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
 
 

@@ -350,7 +350,9 @@ def cv(
             (np.asarray(train).reshape(-1).tolist(), np.asarray(test).reshape(-1).tolist())
             for train, test in chosen
         ]
-    results = _hessboost.cv(native, dtrain._core, int(num_boost_round), pairs, early_stopping_rounds)
+    results = _hessboost.cv(
+        native, dtrain._core, int(num_boost_round), pairs, early_stopping_rounds
+    )
     out: dict[str, NDArray[np.float64]] = {}
     for metric, mean, std in results:
         out[f"test-{metric}-mean"] = np.asarray(mean, dtype=np.float64)

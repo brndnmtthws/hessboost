@@ -11,9 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
-from conftest import regression
 
 import hessboost
+from conftest import regression
 from hessboost import DMatrix
 
 
@@ -74,4 +74,5 @@ def test_training_releases_the_gil() -> None:
     not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="not a free-threaded build"
 )
 def test_importing_the_extension_keeps_the_gil_disabled() -> None:
+    assert sys.version_info >= (3, 13), "free-threaded builds start at 3.13"
     assert not sys._is_gil_enabled()

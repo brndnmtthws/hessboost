@@ -247,13 +247,33 @@ jobs:
       - name: Run Python tests
         run: uv run --no-sync pytest -p no:cacheprovider tests
         working-directory: python
-      - name: Check stubs and public types
+      - name: Check public types
         if: matrix.os == 'ubuntu-26.04' && matrix.python-version == '3'
-        run: |
-          uv run --no-sync python -m mypy.stubtest hessboost._hessboost
-          uv run --no-sync mypy --strict
-          uv run --no-sync pyright --verifytypes hessboost --ignoreexternal
+        run: uv run --no-sync pyright --verifytypes hessboost --ignoreexternal
         working-directory: python
+
+  python-lint:
+    name: Python lint (ruff, ty)
+    runs-on: ubuntu-latest
+    env:
+      UV_MANAGED_PYTHON: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.11"
+          working-directory: python
+      # The lint group without the project: ty reads the extension's stub,
+      # so nothing is compiled. ruff.toml and ty.toml at the root cover
+      # python/, scripts/, release.py, and Markdown snippets.
+      - name: Install lint dependencies
+        run: uv sync --locked --only-group lint
+        working-directory: python
+      - run: uv run --project python --no-sync ruff check --output-format github
+      - run: uv run --project python --no-sync ruff format --check
+      - run: uv run --project python --no-sync ty check --output-format github
 
   python-sdist:
     name: Python sdist round-trip
@@ -301,7 +321,7 @@ jobs:
 
   all-checks-passed:
     permissions: {}
-    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz, python, python-sdist]
+    needs: [fmt, clippy, test, docs, msrv, parity, semver, fuzz, python, python-lint, python-sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run on upstream failure too (so branch protection sees a failure), but

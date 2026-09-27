@@ -736,9 +736,9 @@ fn online_updates_refuse_an_ebm() {
 /// are refused.
 #[test]
 fn sglb_and_virtual_ensembles_are_refused() {
-    use hessboost::config::{Langevin, ModelShrink};
+    use hessboost::config::{Langevin, ModelShrink, ModelShrinkMode};
     let refused = |b: TrainingParamsBuilder| invalid_param(b.build());
-    let shrink = ModelShrink::builder().rate(0.01).build().unwrap();
+    let shrink = ModelShrink::new(0.01, ModelShrinkMode::Constant).unwrap();
     for ebm in [classic, boulevard] {
         assert_eq!(refused(ebm().langevin(Langevin::default())), "langevin");
         assert_eq!(refused(ebm().posterior_sampling(true)), "langevin");

@@ -11,6 +11,7 @@ use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
 use pyo3::panic::PanicException;
 use pyo3::prelude::*;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -143,7 +144,7 @@ fn round_hook(
     function: Option<Py<PyAny>>,
     failure: Failure,
     interrupted: Arc<AtomicBool>,
-) -> impl FnMut(&RoundEval) -> ControlFlow<()> + Send {
+) -> impl FnMut(RoundEval<'_>) -> ControlFlow<()> + Send {
     move |round| {
         let stopped = || interrupted.load(Ordering::Relaxed) || failure.failed();
         if stopped() {
@@ -153,13 +154,12 @@ fn round_hook(
             return ControlFlow::Continue(());
         };
         // Python sees XGBoost's `(dataset, metric, value)` triples.
-        let scores: Vec<(&str, &str, f64)> = round
-            .scores
-            .iter()
-            .map(|score| (score.dataset.as_str(), score.metric.as_str(), score.value))
-            .collect();
-        let stop =
-            Python::attach(|py| function.call1(py, (round.iteration, scores))?.is_truthy(py));
+        let scores: Vec<(&str, &str, f64)> = round.scores().collect();
+        let stop = Python::attach(|py| {
+            function
+                .call1(py, (round.iteration(), scores))?
+                .is_truthy(py)
+        });
         match stop {
             Ok(false) if !stopped() => ControlFlow::Continue(()),
             Ok(_) => ControlFlow::Break(()),
@@ -276,7 +276,7 @@ fn interruptible<T: Send>(
 }
 
 /// The round hook [`run_hooked`] hands its work.
-pub(crate) type RoundHook = Box<dyn FnMut(&RoundEval) -> ControlFlow<()> + Send>;
+pub(crate) type RoundHook = Box<dyn FnMut(RoundEval<'_>) -> ControlFlow<()> + Send>;
 
 /// Runs `work` [`interruptible`] with a [`round_hook`] calling `on_round`
 /// and a [`CommitGate`] that lets it apply its result only if nothing
@@ -349,12 +349,29 @@ pub(crate) struct TrainRequest {
     on_round: Option<Py<PyAny>>,
 }
 
+/// `early_stopping_rounds` as Python passes it: `0` is refused, as the
+/// Rust API's `NonZeroUsize` cannot express it.
+fn patience(rounds: Option<usize>) -> PyResult<Option<NonZeroUsize>> {
+    rounds
+        .map(|rounds| {
+            NonZeroUsize::new(rounds).ok_or_else(|| {
+                hessboost::error::HessboostError::invalid_param(
+                    "early_stopping_rounds",
+                    "must be greater than zero",
+                )
+            })
+        })
+        .transpose()
+        .or_raise()
+}
+
 /// Trains a model; returns it with the best score (with early stopping).
 /// The evaluation history reaches Python through `on_round`.
 #[pyfunction]
 pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster, Option<f64>)> {
     let parsed = &request.params.get().inner;
     let dtrain = &request.dtrain.get().inner;
+    let early_stopping_rounds = patience(request.early_stopping_rounds)?;
     let evals: Vec<(&hessboost::data::DMatrix, &str)> = request
         .evals
         .iter()
@@ -387,7 +404,7 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
         for (data, name) in &evals {
             trainer = trainer.eval(data, name);
         }
-        if let Some(rounds) = request.early_stopping_rounds {
+        if let Some(rounds) = early_stopping_rounds {
             trainer = trainer.early_stopping_rounds(rounds);
         }
         if let Some(model) = init {
@@ -416,6 +433,7 @@ pub(crate) fn cv(
     folds: Vec<(Vec<usize>, Vec<usize>)>,
     early_stopping_rounds: Option<usize>,
 ) -> PyResult<CvHistory> {
+    let early_stopping_rounds = patience(early_stopping_rounds)?;
     let folds = folds
         .into_iter()
         .map(|(train, test)| Fold::new(train, test))
@@ -431,7 +449,14 @@ pub(crate) fn cv(
         .or_raise()?;
     Ok(results
         .into_iter()
-        .map(|result| (result.metric, result.test_mean, result.test_std))
+        .map(|result| {
+            let (means, stds) = result
+                .rounds
+                .iter()
+                .map(|round| (round.mean, round.std))
+                .unzip();
+            (result.metric, means, stds)
+        })
         .collect())
 }
 

@@ -3,6 +3,7 @@
 //! it, updates are deterministic and atomic, and unsound configurations are
 //! refused.
 
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use hessboost::config::{
@@ -14,7 +15,7 @@ use hessboost::metric::EvalMetric;
 use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
-use hessboost::training::online::{OnlineModel, OnlineParams};
+use hessboost::training::online::{OnlineMode, OnlineModel, OnlineParams};
 
 mod common;
 use common::{invalid_param, lcg, rmse, with_threads};
@@ -140,8 +141,8 @@ fn an_interrupted_update_changes_nothing() {
     ] {
         let mut online = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
         let before = online.model().to_json().unwrap();
-        let stop = |round: &RoundEval| {
-            if round.iteration == 3 {
+        let stop = |round: RoundEval| {
+            if round.iteration() == 3 {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -299,7 +300,7 @@ fn unsound_configurations_and_changes_are_refused() {
             "tolerance"
         );
     }
-    assert_eq!(OnlineParams::exact().tolerance(), None);
+    assert_eq!(OnlineParams::exact().mode(), OnlineMode::Exact);
     let weighted = data(200, 9, false).with_weights(&[1.0; 200]).unwrap();
     assert_eq!(
         invalid_param(OnlineModel::train(&p, &weighted, 3, online)),
@@ -467,8 +468,8 @@ fn an_abandoned_update_keeps_the_update_state() {
         let mut online = OnlineModel::train(&p, &train_data, 10, online).unwrap();
         online.update(Some(&a), &[0, 5, 9]).unwrap();
         let mut control = online.clone();
-        let stop = |round: &RoundEval| {
-            if round.iteration == 4 {
+        let stop = |round: RoundEval| {
+            if round.iteration() == 4 {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -534,7 +535,7 @@ fn from_model_refuses_models_and_metrics_training_would_not_give() {
     let p = params(Objective::SquaredError(RegLoss::default()));
     let stopped = Trainer::new(&p, &d, 200)
         .eval(&valid, "valid")
-        .early_stopping_rounds(2)
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .train()
         .unwrap()
         .model;

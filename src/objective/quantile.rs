@@ -607,8 +607,8 @@ mod tests {
             .train()
             .unwrap();
         let history = &result.history;
-        assert_eq!(history[0].scores[0].metric, "quantile");
-        assert!(history.last().unwrap().scores[0].value < history[0].scores[0].value);
+        assert_eq!(history.metrics(), ["quantile"]);
+        assert!(history.last().unwrap().values()[0] < history.round(0).unwrap().values()[0]);
         let pred = result.model.predict(&d).unwrap();
         assert_eq!((pred.n_rows(), pred.width()), (n, 3));
         let mut below = [0usize; 3];

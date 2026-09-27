@@ -4,6 +4,7 @@
 use hessboost::config::{BoosterKind, Dart, ProcessType, Refresh};
 use hessboost::prelude::{BoostedModel, DMatrix, Trainer, TrainingParams, train};
 use hessboost::training::RoundEval;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 mod common;
@@ -43,9 +44,9 @@ fn sampled() -> TrainingParams {
         .unwrap()
 }
 
-fn stop_at(last: usize) -> impl FnMut(&RoundEval) -> ControlFlow<()> + Send {
+fn stop_at(last: usize) -> impl FnMut(RoundEval<'_>) -> ControlFlow<()> + Send {
     move |round| {
-        if round.iteration == last {
+        if round.iteration() == last {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -65,7 +66,7 @@ fn a_continuing_hook_changes_nothing_and_sees_every_round_in_order() {
     let hooked = Trainer::new(&params, &dtrain, 12)
         .eval(&dvalid, "valid")
         .on_round(|round| {
-            seen.push((round.iteration, round.scores.clone()));
+            seen.push((round.iteration(), round.values().to_vec()));
             ControlFlow::Continue(())
         })
         .train()
@@ -73,16 +74,16 @@ fn a_continuing_hook_changes_nothing_and_sees_every_round_in_order() {
     assert_eq!(bytes(&hooked.model), bytes(&plain.model));
     let history: Vec<_> = plain
         .history
-        .iter()
-        .map(|round| (round.iteration, round.scores.clone()))
+        .rounds()
+        .map(|round| (round.iteration(), round.values().to_vec()))
         .collect();
     assert_eq!(seen, history);
     // Without eval sets the hook still runs every round, with no scores.
     let mut iterations = Vec::new();
     let unscored = Trainer::new(&params, &dtrain, 5)
         .on_round(|round| {
-            assert!(round.scores.is_empty());
-            iterations.push(round.iteration);
+            assert!(round.values().is_empty());
+            iterations.push(round.iteration());
             ControlFlow::Continue(())
         })
         .train()
@@ -114,7 +115,7 @@ fn break_keeps_the_rounds_so_far_as_a_shorter_run_would() {
     let continued = Trainer::new(&params, &dtrain, 10)
         .init_model(&short.model)
         .on_round(|round| {
-            seen.push(round.iteration);
+            seen.push(round.iteration());
             ControlFlow::Break(())
         })
         .train()
@@ -133,7 +134,7 @@ fn break_under_early_stopping_records_the_best_round_so_far() {
         .unwrap();
     let full = Trainer::new(&params, &dtrain, 200)
         .eval(&dvalid, "valid")
-        .early_stopping_rounds(3)
+        .early_stopping_rounds(NonZeroUsize::new(3).unwrap())
         .train()
         .unwrap();
     let best = full.model.best_iteration().unwrap();
@@ -143,9 +144,9 @@ fn break_under_early_stopping_records_the_best_round_so_far() {
     let mut seen = Vec::new();
     let watched = Trainer::new(&params, &dtrain, 200)
         .eval(&dvalid, "valid")
-        .early_stopping_rounds(3)
+        .early_stopping_rounds(NonZeroUsize::new(3).unwrap())
         .on_round(|round| {
-            seen.push(round.iteration);
+            seen.push(round.iteration());
             ControlFlow::Continue(())
         })
         .train()
@@ -156,15 +157,15 @@ fn break_under_early_stopping_records_the_best_round_so_far() {
     let cut = best - 1;
     let stopped = Trainer::new(&params, &dtrain, 200)
         .eval(&dvalid, "valid")
-        .early_stopping_rounds(3)
+        .early_stopping_rounds(NonZeroUsize::new(3).unwrap())
         .on_round(stop_at(cut))
         .train()
         .unwrap();
     assert_eq!(stopped.model.num_boost_rounds(), cut + 1);
     let scores: Vec<f64> = stopped
         .history
-        .iter()
-        .map(|round| round.scores[0].value)
+        .rounds()
+        .map(|round| round.values()[0])
         .collect();
     let best_so_far = (0..scores.len())
         .min_by(|&a, &b| scores[a].total_cmp(&scores[b]))
@@ -202,8 +203,8 @@ fn refresh_and_gblinear_stop_on_break_too() {
     let mut seen = Vec::new();
     let stopped = Trainer::new(&linear, &dtrain, 50)
         .on_round(|round| {
-            seen.push(round.iteration);
-            if round.iteration == 3 {
+            seen.push(round.iteration());
+            if round.iteration() == 3 {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())

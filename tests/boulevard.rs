@@ -7,6 +7,7 @@ use hessboost::config::{
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::objective::{LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
+use std::num::NonZeroUsize;
 
 mod common;
 use common::{invalid_param, labeled_dense, lcg, with_threads};
@@ -361,7 +362,7 @@ fn settings_that_break_the_linear_smoother_are_refused() {
     assert_eq!(invalid_param(train(&params, &weighted, 2)), "weights");
     let stopping = Trainer::new(&params, &dtrain, 5)
         .eval(&dtrain, "train")
-        .early_stopping_rounds(2)
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .train();
     assert_eq!(invalid_param(stopping), "early_stopping_rounds");
 }
@@ -373,8 +374,8 @@ fn the_round_hook_sees_every_round_and_break_keeps_a_boulevard_average() {
     let mut seen = Vec::new();
     let stopped = Trainer::new(&params, &dtrain, 50)
         .on_round(|round| {
-            seen.push(round.iteration);
-            if round.iteration == 9 {
+            seen.push(round.iteration());
+            if round.iteration() == 9 {
                 std::ops::ControlFlow::Break(())
             } else {
                 std::ops::ControlFlow::Continue(())

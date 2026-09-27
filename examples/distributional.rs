@@ -14,6 +14,7 @@ use hessboost::objective::distributional::{Dist, DistFamily, Distributional};
 use hessboost::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::num::NonZeroUsize;
 
 mod common;
 use common::lcg;
@@ -79,7 +80,7 @@ fn main() -> Result<()> {
         // Early stopping on the validation NLL (the `dist:*` default metric).
         Ok(Trainer::new(&params, &dtrain, 1000)
             .eval(&dvalid, "valid")
-            .early_stopping_rounds(20)
+            .early_stopping_rounds(NonZeroUsize::new(20).unwrap())
             .train()?
             .model)
     };

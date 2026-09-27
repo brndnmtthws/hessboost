@@ -11,6 +11,7 @@
 //!
 //! Run with: `cargo run --release --example tree_diffusion`
 
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use hessboost::diffusion::{DiffusionModel, DiffusionParams, Samples};
@@ -67,7 +68,7 @@ fn normal_crps(train: &DMatrix, test: &DMatrix) -> Result<f64> {
         .build()?;
     let model = Trainer::new(&params, train, 1000)
         .eval(test, "test")
-        .early_stopping_rounds(50)
+        .early_stopping_rounds(NonZeroUsize::new(50).unwrap())
         .train()?
         .model;
     let labels = test.labels().unwrap_or_default();

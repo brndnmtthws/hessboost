@@ -9,6 +9,7 @@ use hessboost::data::FeatureType;
 use hessboost::model::{Contributions, Predictions};
 use hessboost::objective::{CustomLoss, GradPair, SplitGradient};
 use hessboost::prelude::*;
+use std::num::NonZeroUsize;
 
 mod common;
 use common::{four_features, invalid_param, labeled_dense, rmse};
@@ -136,7 +137,7 @@ fn training_margins_match_the_final_model() {
     .train()
     .unwrap();
     let rmse = rmse(&result.model, &dtrain);
-    let last = result.history.last().unwrap().scores[0].value;
+    let last = result.history.last().unwrap().values()[0];
     assert!((last - rmse).abs() < 1e-6, "history {last} vs model {rmse}");
 }
 
@@ -206,7 +207,7 @@ fn early_stopping_keeps_whole_vector_rounds() {
         40,
     )
     .eval(&holdout, "holdout")
-    .early_stopping_rounds(1)
+    .early_stopping_rounds(NonZeroUsize::new(1).unwrap())
     .train()
     .unwrap();
     let model = result.model;

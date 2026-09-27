@@ -53,7 +53,7 @@ use crate::tree::RegTree;
 use crate::tree::builder::{LeafRows, xgb_calc_weight};
 use crate::tree::gain::{GradStats, RegParams};
 
-use super::train::TreeOutput;
+use super::margins::TreeOutput;
 
 /// Stream salt of the structure-search noise.
 const STRUCTURE_STREAM: u64 = 0x5347_4C42_5F73_7472;

@@ -18,6 +18,7 @@ __all__ = [
     "ForestModel",
     "ForestParams",
     "OnlineModel",
+    "OnlineParams",
     "Params",
     "SplitConformal",
     "TermShape",
@@ -195,14 +196,21 @@ class ConformalizedQuantile:
     def n_calibration(self) -> int: ...
 
 @final
+class OnlineParams:
+    @staticmethod
+    def exact() -> OnlineParams: ...
+    @staticmethod
+    def approximate(tolerance: float) -> OnlineParams: ...
+
+@final
 class OnlineModel:
     @staticmethod
     def train(
-        params: Params, dtrain: DMatrix, num_boost_round: int, tolerance: float
+        params: Params, dtrain: DMatrix, num_boost_round: int, mode: OnlineParams
     ) -> OnlineModel: ...
     @staticmethod
     def from_model(
-        booster: Booster, params: Params, dtrain: DMatrix, tolerance: float
+        booster: Booster, params: Params, dtrain: DMatrix, mode: OnlineParams
     ) -> OnlineModel: ...
     def update(
         self,
@@ -216,8 +224,6 @@ class OnlineModel:
     def data(self) -> DMatrix: ...
     @property
     def num_row(self) -> int: ...
-    @property
-    def tolerance(self) -> float: ...
 
 @final
 class BoulevardInference:

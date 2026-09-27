@@ -86,9 +86,11 @@ For eval sets, early stopping, custom objectives, or continued training, use
 `Trainer` (the `xgb.train` keyword-argument equivalent):
 
 ```rust
+use std::num::NonZeroUsize;
+
 let result = Trainer::new(&params, &dtrain, 1000)
     .eval(&dvalid, "valid")
-    .early_stopping_rounds(20)
+    .early_stopping_rounds(NonZeroUsize::new(20).unwrap())
     .train()?;
 let model = result.model; // predicts with the best iteration
 ```
@@ -191,7 +193,7 @@ Beyond XGBoost (opt-in, none changes default training):
   of the rows in its benchmarks; slower beyond a few percent). They keep the
   training bins, so they refuse added values beyond the training range.
   Unlearning is exact only in the exact mode (`OnlineParams::exact`; Python
-  `tolerance=0`), which costs a retrain.
+  `mode=Exact()`), which costs a retrain.
 - Randomized training (sampling, forests, DART) matches XGBoost's quality,
   not its trees: the random streams differ.
 - `rank:xendcg` uses stateless keyed SplitMix64 draws per seed, iteration,

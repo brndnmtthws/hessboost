@@ -38,6 +38,7 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<conformal::SplitConformal>()?;
     m.add_class::<conformal::ConformalizedQuantile>()?;
     m.add_class::<online::OnlineModel>()?;
+    m.add_class::<online::OnlineParams>()?;
     m.add_class::<inference::BoulevardInference>()?;
     m.add_function(wrap_pyfunction!(inference::honest_refit, m)?)?;
     m.add_class::<ebm::TermShape>()?;

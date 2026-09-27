@@ -39,10 +39,10 @@ fn main() -> Result<()> {
     let out = Trainer::new(&params, &dtrain, 40)
         .eval(&dtrain, "train")
         .train()?;
-    let ndcg = |r: &hessboost::training::RoundEval| r.score("train", "ndcg@32").unwrap();
+    let ndcg = |r: hessboost::training::RoundEval| r.score("train", "ndcg@32").unwrap();
     println!(
         "NDCG: round 0 = {:.3}  →  final = {:.3}",
-        ndcg(&out.history[0]),
+        ndcg(out.history.round(0).unwrap()),
         ndcg(out.history.last().unwrap())
     );
     Ok(())

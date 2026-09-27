@@ -108,7 +108,7 @@ struct Case {
     params: TrainingParams,
     dtrain: DMatrix,
     rounds: usize,
-    early_stopping: Option<usize>,
+    early_stopping: Option<NonZeroUsize>,
 }
 
 /// Applies a fallible `DMatrix` builder step; `None` skips the input.
@@ -425,7 +425,7 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
 
     let rounds = u.int_in_range(1..=MAX_ROUNDS)?;
     let early_stopping = if u.arbitrary()? {
-        Some(u.int_in_range(1..=2)?)
+        NonZeroUsize::new(u.int_in_range(1..=2)?)
     } else {
         None
     };

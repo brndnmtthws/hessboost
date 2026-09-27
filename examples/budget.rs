@@ -11,6 +11,7 @@ use hessboost::metric::EvalMetric;
 use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, train_with_budget};
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 mod common;
@@ -110,7 +111,7 @@ fn report(
     let start = Instant::now();
     let tuned = Trainer::new(&tuned_params, dtrain, 2000)
         .eval(dvalid, "valid")
-        .early_stopping_rounds(50)
+        .early_stopping_rounds(NonZeroUsize::new(50).unwrap())
         .train()?
         .model;
     let seconds = start.elapsed().as_secs_f64();

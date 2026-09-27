@@ -15,6 +15,8 @@ use std::arch::aarch64::*;
 // The compiler inlines these constant function pointers.
 
 const VECTOR_WIDTH: usize = 4;
+// `objective::GRADIENT_BLOCK_ROWS`'s contract: its blocks start on vector blocks.
+const _: () = assert!(crate::objective::GRADIENT_BLOCK_ROWS.is_multiple_of(VECTOR_WIDTH));
 // Shared vector-loop scaffolding for the gradient and metric-sum kernels below.
 // Lane formulas stay inline in each kernel; only the identical accumulate,
 // fallback, store, and reduction shells live here, so numerics are untouched.

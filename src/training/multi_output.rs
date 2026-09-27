@@ -3,10 +3,11 @@
 //! for `gbtree` and DART, optionally growing its structure from reduced split
 //! gradients supplied by the objective ([`Loss::split_gradient`]).
 
-use super::train::{
-    MarginCaches, TrainContext, TreeOutput, dart_new_tree_weight, finish_dart, gradient_sampling,
-    iteration_row_subsets, make_column_sampler, round_gradients, tree_eta,
-};
+use super::dart::{dart_new_tree_weight, finish_dart, round_gradients};
+use super::margins::{MarginCaches, TreeOutput};
+use super::prepare::TrainContext;
+use super::round::tree_eta;
+use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
 use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMethod};
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};
@@ -99,6 +100,8 @@ fn split_gradient(
 pub(super) struct VectorRound<'a> {
     pub(super) run: TrainContext<'a>,
     pub(super) ghist: &'a GHistIndex,
+    /// Every training row, ascending: the rows of an unsampled round.
+    pub(super) all_rows: &'a [u32],
 }
 
 /// One boosting iteration: grow `num_parallel_tree` vector-leaf trees from
@@ -120,7 +123,7 @@ pub(super) fn boost_round(
     let n_out = model.n_outputs();
     let (mut rng, dropped) = round_gradients(&ctx.run, model, iteration, &margins.train, gpair);
     let split = split_gradient(ctx.run.objective, params, iteration, gpair, n)?;
-    let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
+    let weight = dart_new_tree_weight(dropped.as_ref(), params);
     // SGLB: the structure grows on the split gradients (or the gradients)
     // plus noise; the builder's leaves then come from them too, and the
     // re-estimation replaces them.
@@ -137,9 +140,9 @@ pub(super) fn boost_round(
     };
     // The row samples, all drawn before the trees: one per parallel tree
     // under uniform sampling, else one all-rows subset they share.
-    let row_subsets = iteration_row_subsets(n, params, false, ctx.run.rows, &mut rng);
+    let row_subsets = iteration_row_subsets(params, false, ctx.run.rows, ctx.all_rows, &mut rng);
     for p in 0..params.num_parallel_tree {
-        let rows = &row_subsets[p % row_subsets.len()];
+        let rows = row_subsets.rows(p);
         let (tree, leaf_rows) = fit_tree(ctx, &grads, &mut rng, rows)?;
         // A dropout round's gradients come from the ensemble, not the margin
         // caches, which `finish_dart` recomputes.

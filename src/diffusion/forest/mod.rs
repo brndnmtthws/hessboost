@@ -445,7 +445,9 @@ impl ForestModel {
     /// `column_kinds` of the wrong length, a categorical column with
     /// non-integral or out-of-range values... (see [`ColumnKind`]), a column
     /// with no observed value (overall or in a class, with missing values),
-    /// and the errors of training.
+    /// and the errors of training: each level's GBDT regresses a label
+    /// matrix of every column, which `booster = boulevard` and
+    /// `booster = ebm` refuse for a table of several columns.
     pub fn fit(params: &ForestParams, data: &DMatrix) -> Result<Self> {
         params.validate()?;
         refuse_metadata(data)?;

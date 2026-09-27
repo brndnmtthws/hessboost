@@ -1071,11 +1071,11 @@ mod tests {
         assert_eq!(vector.num_nodes(), scalar.num_nodes());
         for r in 0..400usize {
             let row = [(r % 17) as f32 / 17.0, (r % 11) as f32 / 11.0];
-            let vl = vector.leaf_id_dense(&row, f32::NAN);
-            let sl = scalar.leaf_id_dense(&row, f32::NAN);
-            let w = vector.leaf_vector(vl);
+            let vl = vector.leaf_id_dense(&row, f32::NAN).unwrap();
+            let sl = scalar.leaf_id_dense(&row, f32::NAN).unwrap();
+            let w = vector.leaf_weights(vl);
             assert_eq!(w[0], w[1]);
-            assert_eq!(w[0], scalar.node(sl).leaf_value);
+            assert_eq!(w[0], scalar.node_at(sl).leaf_value);
         }
     }
 
@@ -1098,7 +1098,7 @@ mod tests {
         all.sort_unstable();
         assert_eq!(all, (0..400).collect::<Vec<_>>());
         // Cover is the summed Hessian over targets.
-        assert_eq!(tree.node(0).sum_hess, 800.0);
+        assert_eq!(tree.node_at(0).sum_hess, 800.0);
     }
 
     /// `min_child_weight` applies to the mean Hessian over targets: with a
@@ -1155,7 +1155,7 @@ mod tests {
             let n = leaf.rows.len() as f32;
             for t in 0..2 {
                 let sum: f32 = leaf.rows.iter().map(|&r| g[r as usize * 2 + t].grad).sum();
-                let w = tree.leaf_vector(leaf.node)[t];
+                let w = tree.leaf_weights(leaf.node)[t];
                 assert!((w + sum / n).abs() < 1e-5, "leaf {} target {t}", leaf.node);
             }
         }

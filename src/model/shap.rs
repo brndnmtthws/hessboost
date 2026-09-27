@@ -315,14 +315,14 @@ const NO_CHILD: u32 = u32::MAX;
 /// A split's children in XGBoost's order. XGBoost routes a categorical split's
 /// category set right, hessboost routes it left, so the importer swaps those
 /// children. Walking them in XGBoost's order keeps every accumulation in
-/// XGBoost's sequence.
-fn xgboost_children(node: &crate::tree::Node) -> (usize, usize) {
-    let (left, right) = (node.left as usize, node.right as usize);
-    if node.is_categorical {
+/// XGBoost's sequence. `None` for a leaf.
+fn xgboost_children(node: &crate::tree::Node) -> Option<(usize, usize)> {
+    let (left, right) = node.children()?;
+    Some(if node.is_categorical {
         (right, left)
     } else {
         (left, right)
-    }
+    })
 }
 
 /// A tree node with its routing data and both child branch weights.
@@ -355,11 +355,10 @@ struct ShapTree {
 /// Cover-weighted expected output of the subtree at `nid`, in `f64`
 /// (XGBoost's `FillRootMeanValue`). A coverless split averages its children.
 fn root_mean_value(tree: &RegTree, nid: usize) -> f64 {
-    let node = tree.node(nid);
-    if node.is_leaf() {
+    let node = tree.node_at(nid);
+    let Some((l, r)) = xgboost_children(node) else {
         return f64::from(node.leaf_value);
-    }
-    let (l, r) = xgboost_children(node);
+    };
     let left_mean = root_mean_value(tree, l);
     let right_mean = root_mean_value(tree, r);
     if node.sum_hess == 0.0 {
@@ -369,8 +368,8 @@ fn root_mean_value(tree: &RegTree, nid: usize) -> f64 {
         )]
         return 0.5 * (left_mean + right_mean);
     }
-    let right_part = right_mean * f64::from(tree.node(r).sum_hess);
-    madd64(left_mean, f64::from(tree.node(l).sum_hess), right_part) / f64::from(node.sum_hess)
+    let right_part = right_mean * f64::from(tree.node_at(r).sum_hess);
+    madd64(left_mean, f64::from(tree.node_at(l).sum_hess), right_part) / f64::from(node.sum_hess)
 }
 
 /// Adds `path_weight ×` the cover-weighted expected leaf vector of vector-leaf
@@ -379,22 +378,21 @@ fn root_mean_value(tree: &RegTree, nid: usize) -> f64 {
 /// path's product of cover fractions, in depth-first leaf order. A coverless
 /// split halves the path weight of both children.
 fn root_mean_values(tree: &RegTree, nid: usize, path_weight: f64, out: &mut [f64]) {
-    let node = tree.node(nid);
-    if node.is_leaf() {
-        for (o, &v) in out.iter_mut().zip(tree.leaf_vector(nid)) {
+    let node = tree.node_at(nid);
+    let Some((l, r)) = xgboost_children(node) else {
+        for (o, &v) in out.iter_mut().zip(tree.leaf_weights(nid)) {
             *o = madd64(path_weight, f64::from(v), *o);
         }
         return;
-    }
-    let (l, r) = xgboost_children(node);
+    };
     if node.sum_hess == 0.0 {
         root_mean_values(tree, l, path_weight * 0.5, out);
         root_mean_values(tree, r, path_weight * 0.5, out);
     } else {
         let parent = f64::from(node.sum_hess);
-        let left = path_weight * f64::from(tree.node(l).sum_hess) / parent;
+        let left = path_weight * f64::from(tree.node_at(l).sum_hess) / parent;
         root_mean_values(tree, l, left, out);
-        let right = path_weight * f64::from(tree.node(r).sum_hess) / parent;
+        let right = path_weight * f64::from(tree.node_at(r).sum_hess) / parent;
         root_mean_values(tree, r, right, out);
     }
 }
@@ -420,8 +418,7 @@ impl ShapTree {
                 second_weight: 0.0,
                 value: if n.is_leaf() { leaf_value(id) } else { 0.0 },
             };
-            if !n.is_leaf() {
-                let (l, r) = xgboost_children(n);
+            if let Some((l, r)) = xgboost_children(n) {
                 let (left, right) = (&src[l], &src[r]);
                 // `!(x >= 0)` also rejects NaN, as XGBoost's `CHECK_GE` does.
                 if !(n.sum_hess >= 0.0 && left.sum_hess >= 0.0 && right.sum_hess >= 0.0) {
@@ -919,7 +916,7 @@ impl BoostedModel {
                     push(shap, c, root_mean, weight);
                 }
             } else {
-                let shap = ShapTree::from_tree(tree, |id| tree.node(id).leaf_value)?;
+                let shap = ShapTree::from_tree(tree, |id| tree.node_at(id).leaf_value)?;
                 push(shap, self.tree_output(ti), root_mean_value(tree, 0), weight);
             }
         }
@@ -1384,15 +1381,15 @@ mod tests {
             fn recurse(&mut self, node: usize, mut m: Vec<El>, pz: f64, po: f64, pi: i64) {
                 let tree = self.tree;
                 extend(&mut m, pz, po, pi);
-                let n = tree.node(node);
-                if n.is_leaf() {
+                let n = tree.node_at(node);
+                let Some((left, right)) = n.children() else {
                     for i in 1..m.len() {
                         let w = unwound_sum(&m, i);
                         self.phi[m[i].d as usize] +=
                             w * (m[i].o - m[i].z) * f64::from(n.leaf_value);
                     }
                     return;
-                }
+                };
                 let v = self.x[n.split_feature as usize];
                 let go_left = if v.is_nan() {
                     n.default_left
@@ -1405,9 +1402,9 @@ mod tests {
                     v < n.split_cond
                 };
                 let (hot, cold) = if go_left {
-                    (n.left as usize, n.right as usize)
+                    (left, right)
                 } else {
-                    (n.right as usize, n.left as usize)
+                    (right, left)
                 };
                 let cover = f64::from(n.sum_hess);
                 let (mut iz, mut io) = (1.0, 1.0);
@@ -1417,8 +1414,8 @@ mod tests {
                     unwind(&mut m, k);
                 }
                 let f = i64::from(n.split_feature);
-                let hz = f64::from(tree.node(hot).sum_hess) / cover;
-                let cz = f64::from(tree.node(cold).sum_hess) / cover;
+                let hz = f64::from(tree.node_at(hot).sum_hess) / cover;
+                let cz = f64::from(tree.node_at(cold).sum_hess) / cover;
                 self.recurse(hot, m.clone(), hz * iz, io, f);
                 self.recurse(cold, m, cz * iz, 0.0, f);
             }
@@ -1638,10 +1635,9 @@ mod tests {
             let mut stack = vec![(0usize, 0usize)];
             while let Some((nid, dep)) = stack.pop() {
                 best = best.max(dep);
-                let node = t.node(nid);
-                if !node.is_leaf() {
-                    stack.push((node.left as usize, dep + 1));
-                    stack.push((node.right as usize, dep + 1));
+                if let Some((left, right)) = t.node_at(nid).children() {
+                    stack.push((left, dep + 1));
+                    stack.push((right, dep + 1));
                 }
             }
             best

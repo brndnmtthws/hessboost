@@ -623,7 +623,7 @@ fn kept_nodes(before: &BoostedModel, after: &BoostedModel) -> usize {
                 .iter()
                 .zip(b.nodes())
                 .filter(|(x, y)| {
-                    x.left == y.left
+                    x.children() == y.children()
                         && x.split_feature == y.split_feature
                         && x.split_cond == y.split_cond
                         && x.default_left == y.default_left
@@ -842,15 +842,14 @@ fn splits_below(tree: &RegTree, max_depth: Option<NonZeroUsize>) -> bool {
     };
     let mut stack = vec![(0usize, 0usize)];
     while let Some((id, depth)) = stack.pop() {
-        let node = tree.node(id);
-        if node.is_leaf() {
+        let Some((left, right)) = tree.node_at(id).children() else {
             continue;
-        }
+        };
         if depth >= limit.get() {
             return true;
         }
-        stack.push((node.left as usize, depth + 1));
-        stack.push((node.right as usize, depth + 1));
+        stack.push((left, depth + 1));
+        stack.push((right, depth + 1));
     }
     false
 }

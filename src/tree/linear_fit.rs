@@ -109,10 +109,10 @@ fn path_features(nodes: &[Node], types: &[FeatureType]) -> Vec<Vec<u32>> {
     let mut stack: Vec<(usize, Vec<u32>)> = vec![(0, Vec::new())];
     while let Some((id, mut path)) = stack.pop() {
         let node = &nodes[id];
-        if node.is_leaf() {
+        let Some((left, right)) = node.children() else {
             out[id] = path;
             continue;
-        }
+        };
         let f = node.split_feature;
         let numerical = !node.is_categorical
             && types
@@ -121,8 +121,8 @@ fn path_features(nodes: &[Node], types: &[FeatureType]) -> Vec<Vec<u32>> {
         if numerical && let Err(pos) = path.binary_search(&f) {
             path.insert(pos, f);
         }
-        stack.push((node.left as usize, path.clone()));
-        stack.push((node.right as usize, path));
+        stack.push((left, path.clone()));
+        stack.push((right, path));
     }
     out
 }
@@ -318,11 +318,11 @@ mod tests {
         let slope = (n * sxy - sx * sy) / det;
         let intercept = (sxx * sy - sx * sxy) / det;
         let linear = tree.linear_leaves().unwrap();
-        let (features, coeffs) = linear.terms(2);
+        let (features, coeffs) = linear.terms(2).unwrap();
         assert_eq!(features, &[0]);
         assert!((coeffs[0] - slope).abs() < 1e-12, "{coeffs:?} vs {slope}");
-        assert!((linear.intercept(2) - intercept).abs() < 1e-12);
-        assert!(linear.terms(1).0.is_empty());
+        assert!((linear.intercept(2).unwrap() - intercept).abs() < 1e-12);
+        assert!(linear.terms(1).unwrap().0.is_empty());
         assert_eq!(tree.predict_row(&data, 0), -0.5);
         // Without a penalty the fit recovers the line.
         let mut exact = stump(true);

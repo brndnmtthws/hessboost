@@ -766,9 +766,9 @@ mod tests {
                 let mut node_depth = vec![0usize; tree.num_nodes()];
                 for (nid, node) in tree.nodes().iter().enumerate() {
                     expected.sample(node_depth[nid]);
-                    if !node.is_leaf() {
-                        node_depth[node.left as usize] = node_depth[nid] + 1;
-                        node_depth[node.right as usize] = node_depth[nid] + 1;
+                    if let Some((left, right)) = node.children() {
+                        node_depth[left] = node_depth[nid] + 1;
+                        node_depth[right] = node_depth[nid] + 1;
                     }
                 }
                 for depth in 0..4 {
@@ -847,7 +847,7 @@ mod tests {
                 assert_eq!(captured, expected, "{mode}");
                 let mut seen = vec![false; n];
                 for leaf in leaves {
-                    assert!(captured.node(leaf.node).is_leaf());
+                    assert!(captured.node_at(leaf.node).is_leaf());
                     for row in leaf.rows {
                         let row = row as usize;
                         assert!(!seen[row]);
@@ -926,7 +926,7 @@ mod tests {
         };
         let (expected, _) = grow(1);
         assert_eq!(
-            expected.node(0).split_feature,
+            expected.node_at(0).split_feature,
             0,
             "the root separates the halves"
         );
@@ -1018,14 +1018,14 @@ mod tests {
     // Collect the split features along every root-to-leaf path.
     fn root_to_leaf_feature_sets(tree: &RegTree) -> Vec<Vec<u32>> {
         fn walk(tree: &RegTree, id: usize, path: &mut Vec<u32>, out: &mut Vec<Vec<u32>>) {
-            let node = tree.node(id);
-            if node.is_leaf() {
+            let node = tree.node_at(id);
+            let Some((left, right)) = node.children() else {
                 out.push(path.clone());
                 return;
-            }
+            };
             path.push(node.split_feature);
-            walk(tree, node.left as usize, path, out);
-            walk(tree, node.right as usize, path, out);
+            walk(tree, left, path, out);
+            walk(tree, right, path, out);
             path.pop();
         }
         let mut out = Vec::new();
@@ -1134,11 +1134,11 @@ mod tests {
             .unwrap();
         let tree = grow_hist(&params, &ghist, &gpair);
         assert_eq!(tree.num_nodes(), 3);
-        let root = tree.node(0);
+        let root = tree.node_at(0);
         assert!(root.default_left);
         assert!(root.split_cond.is_finite());
-        let left = tree.node(root.left as usize);
-        let right = tree.node(root.right as usize);
+        let (left, right) = root.children().unwrap();
+        let (left, right) = (tree.node_at(left), tree.node_at(right));
         assert!(
             (left.sum_hess - 2.0).abs() < 1e-6,
             "left cover {}",
@@ -1208,7 +1208,7 @@ mod tests {
             .unwrap();
         let tree = grow_hist(&params, &ghist, &gpair);
         assert_eq!(tree.num_nodes(), 3);
-        let root = tree.node(0);
+        let root = tree.node_at(0);
         assert_eq!(root.split_feature, 0);
         assert!(!root.default_left);
         assert!(

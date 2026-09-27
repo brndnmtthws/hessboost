@@ -442,8 +442,8 @@ fn write_tree_sections(w: &mut Writer, trees: &[RegTree]) {
         nodes().map(|n| n.split_cond),
         f32::to_le_bytes,
     );
-    w.array("node.left", nodes().map(|n| n.left), i32::to_le_bytes);
-    w.array("node.right", nodes().map(|n| n.right), i32::to_le_bytes);
+    w.array("node.left", nodes().map(|n| n.links().0), i32::to_le_bytes);
+    w.array("node.right", nodes().map(|n| n.links().1), i32::to_le_bytes);
     w.array(
         "node.leaf_value",
         nodes().map(|n| n.leaf_value),
@@ -613,18 +613,17 @@ fn read_trees(s: &Sections) -> Result<Vec<RegTree>> {
     for t in 0..n_trees {
         let n = node_count[t] as usize;
         let nodes = (first..first + n)
-            .map(|i| Node {
-                split_feature: split_feature[i],
-                split_cond: split_cond[i],
-                default_left: flags[i] & DEFAULT_LEFT != 0,
-                left: left[i],
-                right: right[i],
-                leaf_value: leaf_value[i],
-                sum_hess: sum_hess[i],
-                split_gain: split_gain[i],
-                is_categorical: flags[i] & CATEGORICAL != 0,
-                cat_begin: cat_begin[i],
-                cat_end: cat_end[i],
+            .map(|i| {
+                let mut node = Node::leaf(leaf_value[i], sum_hess[i]);
+                node.split_feature = split_feature[i];
+                node.split_cond = split_cond[i];
+                node.default_left = flags[i] & DEFAULT_LEFT != 0;
+                node.set_links(left[i], right[i]);
+                node.split_gain = split_gain[i];
+                node.is_categorical = flags[i] & CATEGORICAL != 0;
+                node.cat_begin = cat_begin[i];
+                node.cat_end = cat_end[i];
+                node
             })
             .collect();
         first += n;

@@ -94,16 +94,24 @@ impl TryFrom<UncheckedLinearLeaves> for LinearLeaves {
 }
 
 impl LinearLeaves {
-    /// The intercept of leaf `node`.
+    /// The intercept of leaf `node`, or `None` when the tree has no node
+    /// `node`.
     #[inline]
-    pub fn intercept(&self, node: usize) -> f64 {
-        self.intercepts[node]
+    pub fn intercept(&self, node: usize) -> Option<f64> {
+        self.intercepts.get(node).copied()
     }
 
     /// The `(features, slopes)` of leaf `node`, in evaluation order
-    /// (features ascending in the models hessboost trains).
+    /// (features ascending in the models hessboost trains), or `None` when the
+    /// tree has no node `node`.
     #[inline]
-    pub fn terms(&self, node: usize) -> (&[u32], &[f64]) {
+    pub fn terms(&self, node: usize) -> Option<(&[u32], &[f64])> {
+        (node < self.intercepts.len()).then(|| self.node_terms(node))
+    }
+
+    /// [`Self::terms`] of a node id of the owning (validated) tree.
+    #[inline]
+    fn node_terms(&self, node: usize) -> (&[u32], &[f64]) {
         let range = self.offsets[node] as usize..self.offsets[node + 1] as usize;
         (&self.features[range.clone()], &self.coeffs[range])
     }
@@ -117,7 +125,7 @@ impl LinearLeaves {
         constant: f32,
         get: impl Fn(u32) -> Option<f32>,
     ) -> f32 {
-        let (features, coeffs) = self.terms(node);
+        let (features, coeffs) = self.node_terms(node);
         let mut out = self.intercepts[node];
         for (&f, &c) in features.iter().zip(coeffs) {
             match get(f) {
@@ -235,7 +243,7 @@ mod tests {
             format!(r#"{{"offsets":{offsets},"intercepts":[0.5],"features":[0],"coeffs":[2.0]}}"#)
         };
         let linear: LinearLeaves = serde_json::from_str(&doc("[0,1]")).unwrap();
-        assert_eq!(linear.terms(0), (&[0u32][..], &[2.0][..]));
+        assert_eq!(linear.terms(0).unwrap(), (&[0u32][..], &[2.0][..]));
         for offsets in ["[0,2]", "[1,1]", "[0]", "[0,1,1]"] {
             assert!(
                 serde_json::from_str::<LinearLeaves>(&doc(offsets)).is_err(),

@@ -176,8 +176,8 @@ impl TermGrid {
             let all: Reach = [vec![true; dims[0]], vec![true; dims[1]]];
             let mut stack = vec![(0usize, all)];
             while let Some((id, reach)) = stack.pop() {
-                let node = tree.node(id);
-                if node.is_leaf() {
+                let node = tree.node_at(id);
+                let Some((left_id, right_id)) = node.children() else {
                     let second = runs(&reach[1]);
                     let boxes = runs(&reach[0])
                         .iter()
@@ -191,7 +191,7 @@ impl TermGrid {
                         boxes,
                     });
                     continue;
-                }
+                };
                 let a = usize::from(axes[0].feature != node.split_feature);
                 let axis = &axes[a];
                 let missing = axis.missing_cell();
@@ -211,8 +211,8 @@ impl TermGrid {
                         left[a][c] = false;
                     }
                 }
-                stack.push((node.right as usize, right));
-                stack.push((node.left as usize, left));
+                stack.push((right_id, right));
+                stack.push((left_id, left));
             }
         }
         leaf_start.push(leaves.len());

@@ -179,7 +179,7 @@ pub(super) fn finalize_leaf_values(
 ) {
     let n_nodes = tree.num_nodes();
     for (id, (&stats, &bounds)) in stats[..n_nodes].iter().zip(&bounds[..n_nodes]).enumerate() {
-        if tree.node(id).is_leaf() {
+        if tree.node_at(id).is_leaf() {
             let w = calc_weight_bounded(stats, reg, bounds);
             tree.set_leaf_value(id, w as f32);
         }

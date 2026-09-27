@@ -223,7 +223,7 @@ fn renewed_leaves_use_full_precision_gradients() {
                 .filter(|(_, (_, n))| *n > 0)
                 .map(|(leaf, &(sum, n))| {
                     let expected = 0.5 * sum / (n as f64 + 1.0);
-                    (f64::from(tree.node(leaf).leaf_value) - expected).abs()
+                    (f64::from(tree.node(leaf).unwrap().leaf_value) - expected).abs()
                 })
                 .fold(0.0, f64::max)
         };

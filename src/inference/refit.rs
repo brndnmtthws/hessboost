@@ -21,11 +21,9 @@ fn node_counts(tree: &RegTree, leaf_counts: &[usize]) -> Vec<usize> {
     // Post-order without assuming children follow their parents.
     let mut stack = vec![(0usize, false)];
     while let Some((id, expanded)) = stack.pop() {
-        let node = &nodes[id];
-        if node.is_leaf() {
+        let Some((l, r)) = nodes[id].children() else {
             continue;
-        }
-        let (l, r) = (node.left as usize, node.right as usize);
+        };
         if expanded {
             counts[id] = counts[l] + counts[r];
         } else {

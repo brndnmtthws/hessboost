@@ -348,9 +348,9 @@ mod tests {
             let mut leaves = vec![0u32; n];
             forest.original_leaf_ids(t, block, &mut leaves, 1);
             for (r, row) in data.chunks_exact(n_cols).enumerate() {
-                let leaf = tree.leaf_id_dense(row, f32::NAN);
+                let leaf = tree.leaf_id_dense(row, f32::NAN).unwrap();
                 assert_eq!(leaves[r] as usize, leaf, "tree {t} row {r} {row:?}");
-                let want = 0.25f32 + tree.node(leaf).leaf_value;
+                let want = 0.25f32 + tree.node_at(leaf).leaf_value;
                 assert_eq!(margins[r].to_bits(), want.to_bits());
             }
         }
@@ -384,9 +384,9 @@ mod tests {
         for (r, row) in x.chunks_exact(n_cols).enumerate() {
             let mut want = model.base_score();
             for (t, tree) in model.trees().iter().enumerate() {
-                let leaf = tree.leaf_id_dense(row, f32::NAN);
+                let leaf = tree.leaf_id_dense(row, f32::NAN).unwrap();
                 assert_eq!(leaves.get(r, t).copied(), Some(leaf as u32));
-                want += 1.0 * tree.node(leaf).leaf_value;
+                want += 1.0 * tree.node_at(leaf).leaf_value;
             }
             assert_eq!(
                 margins.get(r, 0).map(|m| m.to_bits()),

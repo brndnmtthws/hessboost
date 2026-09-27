@@ -44,9 +44,9 @@ pub(super) fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Val
     let mut categories_sizes = Vec::<i64>::new();
     let mut parents = vec![if vector { -1 } else { INVALID_NODE }; n];
     for (i, node) in nodes.iter().enumerate() {
-        if !node.is_leaf() {
-            parents[node.left as usize] = i as i32;
-            parents[node.right as usize] = i as i32;
+        if let Some((left, right)) = node.children() {
+            parents[left] = i as i32;
+            parents[right] = i as i32;
         }
     }
 
@@ -72,12 +72,13 @@ pub(super) fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Val
                 n_leaves += 1;
                 split_conditions.push(DFT_BAD_VALUE);
                 default_left.push(0i32);
-                base_weights.extend_from_slice(tree.leaf_vector(node_id));
-                leaf_weights.extend_from_slice(tree.leaf_vector(node_id));
+                base_weights.extend_from_slice(tree.leaf_weights(node_id));
+                leaf_weights.extend_from_slice(tree.leaf_weights(node_id));
             } else {
                 // XGBoost carries the leaf weight in both arrays for leaves.
-                left.push(node.left);
-                right.push(node.right);
+                let (l, r) = node.links();
+                left.push(l);
+                right.push(r);
                 split_conditions.push(node.leaf_value);
                 base_weights.push(node.leaf_value);
                 default_left.push(1i32);
@@ -87,10 +88,11 @@ pub(super) fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Val
         split_indices.push(node.split_feature);
         loss_changes.push(node.split_gain);
         base_weights.extend(std::iter::repeat_n(0.0f32, k));
+        let (l, r) = node.links();
         if node.is_categorical {
             // XGBoost sends the category set right; hessboost keeps it left.
-            left.push(node.right);
-            right.push(node.left);
+            left.push(r);
+            right.push(l);
             split_conditions.push(if vector {
                 DFT_BAD_VALUE
             } else {
@@ -98,8 +100,8 @@ pub(super) fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Val
             });
             default_left.push(i32::from(!node.default_left));
         } else {
-            left.push(node.left);
-            right.push(node.right);
+            left.push(l);
+            right.push(r);
             split_conditions.push(node.split_cond);
             default_left.push(i32::from(node.default_left));
         }
@@ -376,21 +378,20 @@ pub(super) fn decode_nodes(
                 )));
             }
             let default_left = cols.default_left[i] == 1;
-            nodes.push(Node {
-                split_feature: cols.split_indices[i],
-                split_cond: cols.split_conditions[i],
-                // XGBoost sends missing values of a categorical split
-                // the other way round (its children are swapped).
-                default_left: default_left != is_categorical,
-                left: if is_categorical { right[i] } else { left[i] },
-                right: if is_categorical { left[i] } else { right[i] },
-                leaf_value: 0.0,
-                sum_hess,
-                split_gain: cols.loss_changes[i],
-                is_categorical,
-                cat_begin: 0,
-                cat_end: 0,
-            });
+            let mut node = Node::leaf(0.0, sum_hess);
+            node.split_feature = cols.split_indices[i];
+            node.split_cond = cols.split_conditions[i];
+            // XGBoost sends missing values of a categorical split the other
+            // way round (its children are swapped).
+            node.default_left = default_left != is_categorical;
+            if is_categorical {
+                node.set_links(right[i], left[i]);
+            } else {
+                node.set_links(left[i], right[i]);
+            }
+            node.split_gain = cols.loss_changes[i];
+            node.is_categorical = is_categorical;
+            nodes.push(node);
         }
     }
     Ok(nodes)

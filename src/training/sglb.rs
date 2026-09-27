@@ -224,7 +224,7 @@ impl Langevin {
         let key = stream_key(&[self.seed, LEAF_STREAM, at.iteration as u64, at.tree as u64]);
         let mut values = vec![0.0f32; width];
         for node in 0..tree.num_nodes() {
-            if !tree.node(node).is_leaf() {
+            if !tree.node_at(node).is_leaf() {
                 continue;
             }
             for (out, value) in values.iter_mut().enumerate() {

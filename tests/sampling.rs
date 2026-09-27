@@ -59,14 +59,14 @@ fn path_features(tree: &RegTree) -> Vec<Vec<u32>> {
     let mut out = Vec::new();
     let mut stack = vec![(0usize, Vec::new())];
     while let Some((nid, mut path)) = stack.pop() {
-        let node = tree.node(nid);
-        if node.is_leaf() {
+        let node = tree.node(nid).unwrap();
+        let Some((left, right)) = node.children() else {
             out.push(path);
             continue;
-        }
+        };
         path.push(node.split_feature);
-        stack.push((node.left as usize, path.clone()));
-        stack.push((node.right as usize, path));
+        stack.push((left, path.clone()));
+        stack.push((right, path));
     }
     out
 }
@@ -466,7 +466,11 @@ fn approx_parallel_trees_share_one_row_sample() {
                     .build()
                     .unwrap();
                 let model = train(&params, &data, 3).unwrap();
-                let leaves: Vec<f32> = model.trees().iter().map(|t| t.node(0).leaf_value).collect();
+                let leaves: Vec<f32> = model
+                    .trees()
+                    .iter()
+                    .map(|t| t.node(0).unwrap().leaf_value)
+                    .collect();
                 assert_eq!(leaves.len(), 12);
                 leaves
             };

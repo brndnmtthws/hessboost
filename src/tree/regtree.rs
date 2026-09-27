@@ -30,10 +30,11 @@ pub struct Node {
     pub split_cond: f32,
     /// Direction taken by instances with a missing value at this node.
     pub default_left: bool,
-    /// Left child index, or `-1` for a leaf.
-    pub left: i32,
+    /// Left child index, or `-1` for a leaf ([`Node::children`]). Stored
+    /// as XGBoost's `i32` link so the serialized form stays `left`/`right`.
+    left: i32,
     /// Right child index, or `-1` for a leaf.
-    pub right: i32,
+    right: i32,
     /// Leaf weight (used only for leaves).
     pub leaf_value: f32,
     /// Sum of Hessians routed through this node (for cover-based importance/SHAP).
@@ -74,6 +75,28 @@ impl Node {
     #[inline]
     pub fn is_leaf(&self) -> bool {
         self.left == NO_CHILD
+    }
+
+    /// The ids of this node's `(left, right)` children, or `None` for a leaf.
+    /// In a [`RegTree`] both are node ids of that tree.
+    #[inline]
+    pub fn children(&self) -> Option<(usize, usize)> {
+        (!self.is_leaf()).then_some((self.left as usize, self.right as usize))
+    }
+
+    /// The stored child links (`-1` for none), as the native and XGBoost
+    /// formats write them.
+    #[inline]
+    pub(crate) fn links(&self) -> (i32, i32) {
+        (self.left, self.right)
+    }
+
+    /// Set the stored child links read from a model file. The owning tree
+    /// validates them ([`RegTree::is_valid_for_features`]).
+    #[inline]
+    pub(crate) fn set_links(&mut self, left: i32, right: i32) {
+        self.left = left;
+        self.right = right;
     }
 }
 
@@ -285,9 +308,17 @@ impl RegTree {
     /// a row (as XGBoost's `GetLeafIndex` and `LeafValue`), except in a
     /// linear-leaf tree, where the leaf predicts its
     /// [`linear_leaves`](Self::linear_leaves) model and the weight is only its
-    /// fallback for rows missing one of the model's features.
+    /// fallback for rows missing one of the model's features. `None` when
+    /// `nid` is not a node of this tree.
     #[inline]
-    pub fn leaf_vector(&self, nid: usize) -> &[f32] {
+    pub fn leaf_vector(&self, nid: usize) -> Option<&[f32]> {
+        (nid < self.nodes.len()).then(|| self.leaf_weights(nid))
+    }
+
+    /// [`Self::leaf_vector`] of a node id the caller has from this tree
+    /// (a traversal's leaf, a loop over its nodes).
+    #[inline]
+    pub(crate) fn leaf_weights(&self, nid: usize) -> &[f32] {
         if self.is_vector_leaf() {
             let k = self.size_leaf_vector;
             &self.leaf_vectors[nid * k..(nid + 1) * k]
@@ -329,10 +360,11 @@ impl RegTree {
                     && node.leaf_value.is_finite()
                     && node.split_cond.is_finite()
                     && node.split_gain.is_finite()
-                    // A leaf has no right child either: the XGBoost
-                    // importer refuses any other entry, so an accepted model
-                    // must export to what it imports.
-                    && ((node.is_leaf() && node.right == NO_CHILD)
+                    // Both links are `-1` (a leaf) or both are node ids: no
+                    // writer (ours or XGBoost's) emits a one-sided node, and
+                    // the XGBoost importer refuses one, so an accepted model
+                    // exports to what it imports.
+                    && ((node.left == NO_CHILD && node.right == NO_CHILD)
                         || ((node.split_feature as usize) < n_features
                             && node.left >= 0
                             && node.right >= 0
@@ -377,10 +409,9 @@ impl RegTree {
                 return false;
             }
             seen[node_id] = true;
-            let node = &self.nodes[node_id];
-            if !node.is_leaf() {
-                stack.push(node.left as usize);
-                stack.push(node.right as usize);
+            if let Some((left, right)) = self.nodes[node_id].children() {
+                stack.push(left);
+                stack.push(right);
             }
         }
         seen.into_iter().all(|visited| visited)
@@ -417,9 +448,16 @@ impl RegTree {
         self.linear = Some(linear);
     }
 
-    /// Access a node by id.
+    /// Node `id`, or `None` when the tree has no such node.
     #[inline]
-    pub fn node(&self, id: usize) -> &Node {
+    pub fn node(&self, id: usize) -> Option<&Node> {
+        self.nodes.get(id)
+    }
+
+    /// [`Self::node`] of an id the caller has from this tree (a traversal's
+    /// leaf, a child link, a loop over its nodes).
+    #[inline]
+    pub(crate) fn node_at(&self, id: usize) -> &Node {
         &self.nodes[id]
     }
 
@@ -518,13 +556,13 @@ impl RegTree {
         let mut nid = 0usize;
         loop {
             let node = &nodes[nid];
-            if node.is_leaf() {
+            let Some((left, right)) = node.children() else {
                 return nid;
-            }
+            };
             nid = if self.goes_left(node, get(node.split_feature)) {
-                node.left as usize
+                left
             } else {
-                node.right as usize
+                right
             };
         }
     }
@@ -556,13 +594,19 @@ impl RegTree {
     }
 
     /// Route a dense feature row (indexed by feature id, `missing` sentinel for
-    /// absent values) to its leaf id.
+    /// absent values) to its leaf id. `None` when the path tests a feature
+    /// past the end of `row`.
     #[inline]
-    pub fn leaf_id_dense(&self, row: &[f32], missing: f32) -> usize {
-        self.leaf_id_with(|f| {
-            let v = row[f as usize];
+    pub fn leaf_id_dense(&self, row: &[f32], missing: f32) -> Option<usize> {
+        let short = std::cell::Cell::new(false);
+        let leaf = self.leaf_id_with(|f| {
+            let Some(&v) = row.get(f as usize) else {
+                short.set(true);
+                return None;
+            };
             (!crate::data::is_missing(v, missing)).then_some(v)
-        })
+        });
+        (!short.get()).then_some(leaf)
     }
 
     /// The raw output of row `row` of `data` in this *scalar* tree: its
@@ -643,7 +687,7 @@ mod tests {
         let t = stump();
         // missing -> default_left = true -> left leaf
         assert_eq!(t.leaf_id_with(|_| None), 1);
-        assert_eq!(t.node(1).leaf_value, -1.0);
+        assert_eq!(t.node_at(1).leaf_value, -1.0);
     }
 
     #[test]
@@ -656,7 +700,7 @@ mod tests {
             ChildLeaf::new(-1.0, 5.0),
             ChildLeaf::new(2.0, 5.0),
         );
-        assert!(t.node(0).is_categorical);
+        assert!(t.node_at(0).is_categorical);
         // In-set categories route left (leaf 1, value -1.0).
         assert_eq!(t.leaf_id_with(|_| Some(0.0)), 1);
         assert_eq!(t.leaf_id_with(|_| Some(2.0)), 1);
@@ -699,11 +743,32 @@ mod tests {
     /// A leaf (no left child) with a right child is invalid: the XGBoost
     /// formats refuse it, so accepting it would load a model that cannot be
     /// exported and imported again.
+    /// A node's links are both `-1` (a leaf) or both node ids: every
+    /// one-sided shape is refused, whichever side is missing.
     #[test]
-    fn a_leaf_refuses_a_right_child() {
-        let mut tree = RegTree::with_root(1.0);
-        assert!(tree.is_valid_for_features(1));
-        tree.nodes[0].right = -2;
-        assert!(!tree.is_valid_for_features(1));
+    fn one_sided_nodes_are_refused() {
+        let doc = serde_json::to_value(stump()).unwrap();
+        for (node, left, right) in [(1, -1, -2), (1, -1, 2), (0, 1, -1), (0, -1, 2)] {
+            let mut bad = doc.clone();
+            bad["nodes"][node]["left"] = left.into();
+            bad["nodes"][node]["right"] = right.into();
+            assert!(
+                serde_json::from_value::<RegTree>(bad).is_err(),
+                "node {node}: ({left}, {right})"
+            );
+        }
+    }
+
+    /// Ids and rows outside the tree answer `None` instead of panicking.
+    #[test]
+    fn indexed_accessors_refuse_foreign_ids() {
+        let t = stump();
+        assert_eq!(t.node_at(0).children(), Some((1, 2)));
+        assert_eq!(t.node(1).and_then(Node::children), None);
+        assert!(t.node(3).is_none());
+        assert_eq!(t.leaf_vector(2), Some(&[2.0f32][..]));
+        assert!(t.leaf_vector(3).is_none());
+        assert_eq!(t.leaf_id_dense(&[0.9], f32::NAN), Some(2));
+        assert_eq!(t.leaf_id_dense(&[], f32::NAN), None);
     }
 }

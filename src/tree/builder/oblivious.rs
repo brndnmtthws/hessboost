@@ -580,13 +580,13 @@ mod tests {
             let mut next = Vec::new();
             let mut level = None;
             for id in frontier {
-                let n = tree.node(id);
-                if n.is_leaf() {
+                let n = tree.node_at(id);
+                let Some((left, right)) = n.children() else {
                     continue;
-                }
+                };
                 let split = (n.split_feature, n.split_cond.to_bits(), n.default_left);
                 assert_eq!(*level.get_or_insert(split), split, "node {id} breaks level");
-                next.extend([n.left as usize, n.right as usize]);
+                next.extend([left, right]);
             }
             levels.extend(level);
             frontier = next;
@@ -648,7 +648,7 @@ mod tests {
             .build()
             .unwrap();
         let dw = grow(&depthwise, &data, &gpair);
-        let (l, r) = (dw.node(1), dw.node(2));
+        let (l, r) = (dw.node_at(1), dw.node_at(2));
         assert_eq!((l.split_feature, r.split_feature), (1, 2));
 
         let params = symmetric().max_depth(2).build().unwrap();
@@ -656,8 +656,8 @@ mod tests {
         let lv = levels(&tree);
         assert_eq!(lv.iter().map(|l| l.0).collect::<Vec<_>>(), [0, 1]);
         // x1 carries no signal on the right, so that node stays a leaf.
-        assert!(!tree.node(1).is_leaf());
-        assert!(tree.node(2).is_leaf());
+        assert!(!tree.node_at(1).is_leaf());
+        assert!(tree.node_at(2).is_leaf());
     }
 
     #[test]

@@ -114,7 +114,7 @@ _LoadFormat: TypeAlias = _ModelFormat | Literal["auto", "lightgbm"]
 _PredictKind: TypeAlias = Literal["value", "margin", "contribs", "interactions"]
 _ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
 _DiffusionPreset: TypeAlias = Literal["default", "treeffuser", "flow_matching"]
-_ForestPreset: TypeAlias = Literal["default", "diffusion"]
+_ForestPreset: TypeAlias = Literal["forest_flow", "forest_diffusion"]
 
 @final
 class Booster:

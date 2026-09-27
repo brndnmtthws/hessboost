@@ -497,7 +497,8 @@ impl Flat {
                 if let Some(dropout) = boulevard_dropout {
                     boulevard = boulevard.dropout(dropout);
                 }
-                if let Some(truncation) = boulevard_truncation {
+                // The flat `0` is no truncation.
+                if let Some(truncation) = boulevard_truncation.filter(|&t| t != 0.0) {
                     boulevard = boulevard.truncation(truncation);
                 }
                 BoosterKind::Boulevard(boulevard.build()?)
@@ -1062,7 +1063,10 @@ impl TrainingParams {
             BoosterKind::Boulevard(boulevard) => {
                 set("booster", json("boulevard"));
                 set("boulevard_dropout", json(boulevard.dropout()));
-                set("boulevard_truncation", json(boulevard.truncation()));
+                set(
+                    "boulevard_truncation",
+                    json(boulevard.truncation().unwrap_or(0.0)),
+                );
             }
             BoosterKind::Ebm(ebm) => {
                 set("booster", json("ebm"));

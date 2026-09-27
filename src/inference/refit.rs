@@ -207,7 +207,7 @@ fn ebm_refit(
         let schedule = Schedule {
             dropout: 0.0,
             learning_rate: settings.learning_rate,
-            truncation: 0.0,
+            truncation: None,
             parallel: 1,
             seed: 0,
             salt: REFIT_SALT ^ stage as u64,

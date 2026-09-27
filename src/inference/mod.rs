@@ -236,15 +236,25 @@ pub struct BoulevardInfo {
     pub subsample: f64,
     /// The L2 leaf penalty (`lambda`).
     pub reg_lambda: f64,
-    /// The residual truncation level `M`
-    /// ([`Boulevard::truncation`](crate::config::Boulevard::truncation);
-    /// `0` = none).
-    pub truncation: f64,
+    /// The residual truncation level `M`, if any
+    /// ([`Boulevard::truncation`](crate::config::Boulevard::truncation)).
+    /// JSON writes none as `null` and reads a `0` (older files) as none.
+    #[serde(deserialize_with = "truncation_from_json")]
+    pub truncation: Option<f64>,
     /// The training seed, which [`honest_refit`] derives its draws from.
     pub seed: u64,
     /// Whether the intercept is the training-label mean (`base_score`
     /// unset), which the variance then includes.
     pub intercept_from_labels: bool,
+}
+
+/// [`BoulevardInfo::truncation`] from JSON: a number or `null` (the field
+/// itself stays required), a `0` meaning none as files written before it
+/// was optional record it.
+fn truncation_from_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error> {
+    Ok(Option::<f64>::deserialize(deserializer)?.filter(|&t| t != 0.0))
 }
 
 impl BoulevardInfo {
@@ -268,8 +278,8 @@ impl BoulevardInfo {
         if !(self.reg_lambda.is_finite() && self.reg_lambda >= 0.0) {
             return fail("reg_lambda must be finite and >= 0");
         }
-        if !(self.truncation.is_finite() && self.truncation >= 0.0) {
-            return fail("truncation must be finite and >= 0");
+        if self.truncation.is_some_and(|t| !(t.is_finite() && t > 0.0)) {
+            return fail("truncation must be finite and > 0");
         }
         if model.num_parallel_tree() > 1 && (self.dropout != 0.0 || self.learning_rate != 1.0) {
             return fail("BRAT-P (num_parallel_tree > 1) needs dropout 0 and learning_rate 1");

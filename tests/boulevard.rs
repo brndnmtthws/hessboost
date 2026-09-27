@@ -216,6 +216,63 @@ fn inference_on_empty_inputs_is_refused_or_empty() {
     }
 }
 
+/// No truncation is `None`, never a level of 0: the builder refuses `0`,
+/// the flat and native `0` read as none, JSON writes none as `null` and
+/// reads an older file's `0` as none.
+#[test]
+fn no_truncation_is_none() {
+    assert_eq!(Boulevard::default().truncation(), None);
+    for level in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let built = Boulevard::builder().truncation(level).build();
+        assert_eq!(invalid_param(built), "boulevard_truncation");
+    }
+    let flat = |truncation: f64| {
+        TrainingParams::from_xgboost([
+            ("booster", serde_json::json!("boulevard")),
+            ("boulevard_truncation", serde_json::json!(truncation)),
+        ])
+        .unwrap()
+    };
+    for (level, expected) in [(0.0, None), (2.5, Some(2.5))] {
+        let params = flat(level);
+        let BoosterKind::Boulevard(settings) = params.booster else {
+            panic!("a Boulevard booster");
+        };
+        assert_eq!(settings.truncation(), expected);
+        assert_eq!(
+            TrainingParams::from_xgboost(params.to_xgboost().unwrap()).unwrap(),
+            params
+        );
+    }
+    let dtrain = data(150, 14);
+    let model = train(&builder().build().unwrap(), &dtrain, 4).unwrap();
+    assert_eq!(model.boulevard().unwrap().truncation, None);
+    let json = model.to_json().unwrap();
+    let mut doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["boulevard"]["truncation"], serde_json::Value::Null);
+    doc["boulevard"]["truncation"] = serde_json::json!(0.0);
+    let older = BoostedModel::from_json(&doc.to_string()).unwrap();
+    assert_eq!(older.boulevard(), model.boulevard());
+    let native = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+    assert_eq!(native.boulevard(), model.boulevard());
+    let truncated = builder()
+        .booster(BoosterKind::Boulevard(
+            Boulevard::builder()
+                .dropout(0.5)
+                .truncation(0.2)
+                .build()
+                .unwrap(),
+        ))
+        .build()
+        .unwrap();
+    let clipped = train(&truncated, &dtrain, 4).unwrap();
+    assert_eq!(clipped.boulevard().unwrap().truncation, Some(0.2));
+    assert_ne!(
+        clipped.predict(&dtrain).unwrap(),
+        model.predict(&dtrain).unwrap()
+    );
+}
+
 #[test]
 fn settings_that_break_the_linear_smoother_are_refused() {
     let refused = |b: TrainingParamsBuilder| match b.build() {

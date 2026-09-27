@@ -33,3 +33,7 @@ select = [
 # arguments).
 # Docstrings use math notation (`σ`, the split robustness tolerance).
 allowed-confusables = ["σ"]
+
+[lint.flake8-bugbear]
+# Frozen dataclasses used as argument defaults.
+extend-immutable-calls = ["hessboost.online.Approximate"]

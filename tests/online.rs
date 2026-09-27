@@ -15,7 +15,7 @@ use hessboost::metric::EvalMetric;
 use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
-use hessboost::training::online::{OnlineModel, OnlineParams};
+use hessboost::training::online::{OnlineMode, OnlineModel, OnlineParams};
 
 mod common;
 use common::{invalid_param, lcg, rmse, with_threads};
@@ -300,7 +300,7 @@ fn unsound_configurations_and_changes_are_refused() {
             "tolerance"
         );
     }
-    assert_eq!(OnlineParams::exact().tolerance(), None);
+    assert_eq!(OnlineParams::exact().mode(), OnlineMode::Exact);
     let weighted = data(200, 9, false).with_weights(&[1.0; 200]).unwrap();
     assert_eq!(
         invalid_param(OnlineModel::train(&p, &weighted, 3, online)),

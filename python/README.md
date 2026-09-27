@@ -184,10 +184,13 @@ sglb = hessboost.train({"posterior_sampling": True}, hessboost.DMatrix(X_train, 
 members, iterations = sglb.predict_virtual_ensembles(X_test, 10)  # (10, rows)
 u = sglb.predict_uncertainty(X_test, 10)  # u.knowledge rises off the training data
 
-from hessboost.online import OnlineModel
+from hessboost.online import Approximate, OnlineModel
 
 online = OnlineModel.train(
-    {"tree_method": "hist", "max_depth": 6}, hessboost.DMatrix(X_train, y_train), 100, tolerance=0.1
+    {"tree_method": "hist", "max_depth": 6},
+    hessboost.DMatrix(X_train, y_train),
+    100,
+    Approximate(0.1),
 )
 report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
 online.model.predict(X_test)  # online.data: the updated training rows
@@ -217,11 +220,12 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
   (from two quantile models, two outputs of one, or a `dist:*` model).
 - `hessboost.online`: `OnlineModel` adds and deletes training rows of a
   trained model in place (incremental learning, machine unlearning).
-  `tolerance=0` is exact: every update equals `hessboost.train` on
-  `online.data` bit for bit; `tolerance > 0` (default `0.1`) keeps splits
-  that still rank near the top and is faster than retraining for small
-  changes. `update(additions, deletions, callback=...)` returns an
-  `UpdateReport` (`nodes_kept`, `subtrees_regrown`, `rows_refreshed`), or
+  `mode=Exact()` is exact: every update equals `hessboost.train` on
+  `online.data` bit for bit; `Approximate(tolerance)` (the default, at
+  `0.1`) keeps splits that still rank near the top and is faster than
+  retraining for small changes. `update(additions, deletions, callback=...)`
+  returns an `UpdateReport` (`nodes_kept`, `subtrees_regrown`,
+  `rows_refreshed`), or
   `None` when `callback(iteration)` returned `True`; a refused, stopped, or
   interrupted (Ctrl-C) update changes nothing. `OnlineModel.from_model`
   resumes from a saved `Booster` and its training data. Updates need `hist`

@@ -237,6 +237,7 @@
 #![warn(missing_docs)]
 
 pub mod backend;
+mod check;
 pub mod config;
 pub mod conformal;
 pub mod data;

@@ -67,7 +67,7 @@ pub(crate) use quantile::{Expectile, Quantile};
 pub(crate) use ranking::LambdaMart;
 pub(crate) use regression::{PseudoHuberLoss, SquaredError, SquaredLogError};
 pub use spec::Objective;
-pub(crate) use spec::{LossContext, ObjectiveParts};
+pub(crate) use spec::{LossContext, OBJECTIVE_PARAMS, ObjectiveParts};
 pub(crate) use xendcg::Xendcg;
 
 pub(crate) use survival::{AftLoss, Cox};

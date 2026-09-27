@@ -1100,6 +1100,19 @@ impl EvalMetric {
         })
     }
 
+    /// The flat objective-parameter keys the metric XGBoost names `name`
+    /// reads (XGBoost's metrics read them from the objective's parameters,
+    /// whatever the objective).
+    pub(crate) fn borrowed_keys(name: &str) -> &'static [&'static str] {
+        match name {
+            "mphe" => &["huber_slope"],
+            "quantile" => &["quantile_alpha"],
+            "expectile" => &["expectile_alpha"],
+            "aft-nloglik" => &["aft_loss_distribution", "aft_loss_distribution_scale"],
+            _ => &[],
+        }
+    }
+
     /// The metric XGBoost names `name`, with the parameters XGBoost would
     /// give it: the `@k` cutoff of `ndcg`/`map`/`pre` and the `@rho` power of
     /// `tweedie-nloglik` (1.5 without one) from the suffix, the rest from

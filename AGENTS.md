@@ -128,7 +128,9 @@ Fix findings rather than suppress them.
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
 |`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Boulevard` (`BoosterKind::Boulevard`), `Ebm` (`BoosterKind::Ebm`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree`, `BalancedBagging`, `QueryBagging`, `Langevin`, `ModelShrink` (`Option` fields); each validates when built|
-|`config/xgboost.rs`|XGBoost's flat parameter form: `TrainingParams::from_xgboost`/`to_xgboost` (keys, aliases, value spellings, one-setting options), `changed_keys`|
+|`config/mod.rs`|re-exports; the `setter!` macro both builders' plain setters use|
+|`config/xgboost/`|XGBoost's flat parameter form: `schema.rs` (`flat_params!` declaring `Flat`, every key and its value type; aliases, `FIXED` one-setting options, key lookup with typo suggestions, the parser-private `FlatLimit`/`FlatRate` for the flat `0`-means-unset values), `parse.rs` (`TrainingParams::from_xgboost`, value spellings, `Flat::into_params` split into `objective_and_metrics`, `check_switch_dependencies`, `booster_kind`, `mode_options`), `emit.rs` (`to_xgboost`, `changed_keys`)|
+|`check.rs`|crate-private range checks (`ensure`, `unit`, `fraction`, `positive`, `non_negative`, `narrows`) shared by the parameter constructors; keep the boundary in the message|
 |`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `xendcg` (LightGBM XE-NDCG; its own keyed RNG stream), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
 |`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
@@ -219,7 +221,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   opt-in, default off, and absent from fixtures.
 - **Parity-fixed options:** XGBoost options supported at one setting only
   ("Not implemented" in `lib.rs`) are not `TrainingParams` fields;
-  `TrainingParams::from_xgboost` (`FIXED` in `config/xgboost.rs`) accepts
+  `TrainingParams::from_xgboost` (`FIXED` in `config/xgboost/schema.rs`) accepts
   `updater`, `feature_selector`, `lambdarank_pair_method`,
   `max_cat_to_onehot`, and `max_cat_threshold` at that setting only, so
   parity fixtures that set them otherwise fail.
@@ -331,7 +333,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   sentinel),
   `TrainingParams::from_xgboost` (keys and value spellings; an objective
   parameter key that neither the objective nor a listed metric reads is
-  refused, `OBJECTIVE_KEYS` in `config/xgboost.rs`, as is a dependent key
+  refused (`OBJECTIVE_PARAMS` in `objective/spec.rs`, the one registry of
+  which objective reads which key; `EvalMetric::borrowed_keys` gives the
+  metrics'), as is a dependent key
   without its switch, e.g. `rate_drop` without `booster=dart`),
   `validate_request` in `training/train.rs` (data-dependent),
   `validate_boulevard_request` and `validate_ebm_request` there too,
@@ -419,13 +423,15 @@ XGBoost export, SHAP, and compact refuse them.
 In the same change, update the touched items' rustdoc, the README's
 feature lists and caveats, `lib.rs` "What's here" and "Not implemented",
 this file, and affected examples. New options need a `TrainingParams`
-field, builder setter, validation, and their key in `config/xgboost.rs`
-(`flat_params!`, `into_params`, `to_xgboost`, `changed_keys`; each
+field, builder setter, validation, and their key in `config/xgboost/`
+(`flat_params!` in `schema.rs`, `Flat::into_params` in `parse.rs`,
+`to_xgboost` and `changed_keys` in `emit.rs`; each
 destructures the struct, so a missing one does not compile). A new
 objective is an `Objective` variant (the compiler then asks for it in
 every property match of `objective/spec.rs`, `objective_to_json`, ...),
 and a new objective parameter a field of its parameter struct plus its
-flat key (`ObjectiveParts`, `OBJECTIVE_KEYS`) and stored member.
+flat key (`ObjectiveParts`, `flat_params!`, an `OBJECTIVE_PARAMS` entry)
+and stored member.
 
 ## Releases
 

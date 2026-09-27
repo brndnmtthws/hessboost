@@ -160,10 +160,12 @@ pub(super) fn boost(
     Ok(())
 }
 
-/// Every row's gradients at `margins`.
-fn gradients(run: &TrainContext, margins: &[f32]) -> Vec<GradPair> {
+/// Every row's gradients at `margins` in boosting round `iteration` (read
+/// by losses whose gradients draw per round, e.g. `rank:xendcg`).
+fn gradients(run: &TrainContext, margins: &[f32], iteration: usize) -> Vec<GradPair> {
     let mut gpair = vec![GradPair::default(); margins.len()];
-    run.objective.gradient_info(margins, run.info, &mut gpair);
+    run.objective
+        .gradient_info_at(margins, run.info, &mut gpair, iteration);
     gpair
 }
 
@@ -303,6 +305,9 @@ struct Bag {
     trees: Vec<(u32, RegTree)>,
     holdout: Option<Holdout>,
     stopper: Option<Stopper>,
+    /// Trees this bag has grown over both stages: each tree's gradient
+    /// iteration.
+    grown: usize,
 }
 
 impl Bag {
@@ -362,6 +367,7 @@ impl Bag {
             trees: Vec::new(),
             holdout,
             stopper: None,
+            grown: 0,
         })
     }
 
@@ -464,7 +470,8 @@ impl Bag {
             if self.stopped() {
                 return;
             }
-            let gpair = gradients(run, &self.margins);
+            let gpair = gradients(run, &self.margins, self.grown);
+            self.grown += 1;
             let rows = self.tree_sample(params, labels, &mut rng);
             let seed = rng.next_u64();
             prepared.fill_approx_cache(run, &gpair);
@@ -568,7 +575,7 @@ fn classic(
             .collect();
         pairs = fast_pairs(
             run,
-            &gradients(run, &averaged),
+            &gradients(run, &averaged, rounds),
             params.ebm_settings().interactions(),
         );
         let pair_terms: Vec<Term> = pairs
@@ -625,7 +632,7 @@ fn boulevard(
         let margins: Vec<f32> = fitted.iter().map(|&m| m as f32).collect();
         pairs = fast_pairs(
             run,
-            &gradients(run, &margins),
+            &gradients(run, &margins, rounds),
             params.ebm_settings().interactions(),
         );
         let pair_terms: Vec<Term> = pairs
@@ -666,7 +673,9 @@ fn boulevard_stage(
     let mut recursion = Recursion::new(schedule, n);
     let mut trees: Vec<(u32, RegTree)> = Vec::with_capacity(rounds * terms.len());
     let mut total = vec![0.0f64; n];
-    for _ in 0..rounds {
+    for round in 0..rounds {
+        // Continuous across the two stages, as the round hook counts.
+        let iteration = stage as usize * rounds + round;
         recursion.step(|request| {
             let RoundRequest { offsets, rng, .. } = request;
             let margins: Vec<f32> = base
@@ -674,7 +683,7 @@ fn boulevard_stage(
                 .zip(&offsets[0])
                 .map(|(&b, &o)| (b + o) as f32)
                 .collect();
-            let gpair = gradients(run, &margins);
+            let gpair = gradients(run, &margins, iteration);
             let rows: Vec<Vec<u32>> = terms
                 .iter()
                 .map(|_| sample_rows(n, params, run.rows, rng))

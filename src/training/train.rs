@@ -1145,13 +1145,19 @@ fn validate_boulevard_request(
             "the model averages every round, so it cannot stop at a best iteration",
         );
     }
-    if objective.name() != "reg:squarederror" || objective.n_outputs() != 1 {
+    if objective.name() != "reg:squarederror" {
         return refuse(
             "objective",
             &format!("supports reg:squarederror only, got `{}`", objective.name()),
         );
     }
     let dtrain = request.dtrain;
+    if dtrain.n_targets() != 1 || objective.n_outputs() != 1 {
+        return refuse(
+            "labels",
+            &format!("needs one label column, got {}", dtrain.n_targets()),
+        );
+    }
     if dtrain
         .weights()
         .is_some_and(|w| w.iter().any(|&v| v != 1.0))
@@ -1185,7 +1191,13 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
             "eval sets and early stopping are not supported; evaluate the trained model",
         );
     }
-    if objective.n_outputs() != 1 || request.dtrain.n_targets() != 1 {
+    if request.dtrain.n_targets() != 1 {
+        return refuse(
+            "labels",
+            &format!("needs one label column, got {}", request.dtrain.n_targets()),
+        );
+    }
+    if objective.n_outputs() != 1 {
         return refuse(
             "objective",
             &format!(
@@ -1199,6 +1211,14 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
             "base_margin",
             "base margins are not supported: the terms and their centering assume the \
              intercept alone",
+        );
+    }
+    if request.params.ebm_settings().early_stopping_rounds() > 0 && request.dtrain.group().is_some()
+    {
+        return refuse(
+            "ebm_early_stopping_rounds",
+            "early stopping scores each bag's held-out rows, which split the query groups; not \
+             supported with query groups",
         );
     }
     super::ebm::validate_data(request.dtrain)?;

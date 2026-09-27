@@ -380,6 +380,17 @@ fn classic_ebms_bag_whole_queries() {
     let with_queries = margins(&bagged);
     assert_ne!(with_queries, margins(&base().build().unwrap()));
     assert_eq!(with_queries, margins(&bagged));
+    // Early stopping scores held-out rows, which would split the queries.
+    let stopping = base()
+        .booster(BoosterKind::Ebm(
+            classic_ebm().early_stopping_rounds(5).build().unwrap(),
+        ))
+        .build()
+        .unwrap();
+    assert_eq!(
+        invalid_param(train(&stopping, &dtrain, 2)),
+        "ebm_early_stopping_rounds"
+    );
     let ungrouped = labeled_dense(&x, 2, &relevance);
     assert_eq!(
         invalid_param(train(&bagged, &ungrouped, 2)),
@@ -739,4 +750,64 @@ fn sglb_and_virtual_ensembles_are_refused() {
         invalid_param(model.predict_virtual_ensembles(&dtrain, 2)),
         "model"
     );
+}
+
+/// Each classic tree's gradients come from its own boosting iteration,
+/// counted per bag over both stages, so losses that draw per round (e.g.
+/// `rank:xendcg`'s targets) advance instead of repeating round 0.
+#[test]
+fn classic_trees_see_advancing_gradient_iterations() {
+    use hessboost::data::MetaInfo;
+    use hessboost::objective::{GradPair, Loss};
+    use std::sync::{Arc, Mutex};
+    struct Recording(Arc<Mutex<Vec<usize>>>);
+    impl Loss for Recording {
+        fn name(&self) -> &'static str {
+            "custom:recording"
+        }
+        fn gradient(&self, preds: &[f32], labels: &[f32], _: Option<&[f32]>, out: &mut [GradPair]) {
+            for ((g, p), y) in out.iter_mut().zip(preds).zip(labels) {
+                *g = GradPair::new(p - y, 1.0);
+            }
+        }
+        fn gradient_info_at(
+            &self,
+            preds: &[f32],
+            info: &MetaInfo,
+            out: &mut [GradPair],
+            iteration: usize,
+        ) {
+            self.0.lock().unwrap().push(iteration);
+            self.gradient_info(preds, info, out);
+        }
+        fn default_metric(&self) -> EvalMetric {
+            EvalMetric::Rmse
+        }
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let params = classic_with(Ebm::builder().outer_bags(1).interactions(1))
+        .objective(Objective::custom(Recording(Arc::clone(&seen))))
+        .build()
+        .unwrap();
+    let (_, dtrain) = data(200, 24);
+    let rounds = 4;
+    train(&params, &dtrain, rounds).unwrap();
+    // Three main terms, one FAST ranking at iteration `rounds`, one pair.
+    let mut expected: Vec<usize> = (0..3 * rounds).collect();
+    expected.push(rounds);
+    expected.extend(3 * rounds..4 * rounds);
+    assert_eq!(*seen.lock().unwrap(), expected);
+}
+
+/// Two label columns are refused under `labels`, not as a wrong objective.
+#[test]
+fn label_matrices_are_refused_as_labels() {
+    let x: Vec<f32> = (0..40).map(|i| i as f32 / 40.0).collect();
+    let y: Vec<f32> = x.iter().flat_map(|&v| [v, 1.0 - v]).collect();
+    let dtrain = DMatrix::from_dense(&x, 40, 1)
+        .unwrap()
+        .with_label_matrix(&y, 2)
+        .unwrap();
+    let params = classic().build().unwrap();
+    assert_eq!(invalid_param(train(&params, &dtrain, 2)), "labels");
 }

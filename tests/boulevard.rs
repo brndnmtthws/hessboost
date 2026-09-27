@@ -317,3 +317,16 @@ fn sglb_and_virtual_ensembles_are_refused() {
         "model"
     );
 }
+
+/// Two label columns are refused under `labels`, not as a wrong objective.
+#[test]
+fn label_matrices_are_refused_as_labels() {
+    let x: Vec<f32> = (0..40).map(|i| i as f32 / 40.0).collect();
+    let y: Vec<f32> = x.iter().flat_map(|&v| [v, 1.0 - v]).collect();
+    let dtrain = DMatrix::from_dense(&x, 40, 1)
+        .unwrap()
+        .with_label_matrix(&y, 2)
+        .unwrap();
+    let params = builder().build().unwrap();
+    assert_eq!(invalid_param(train(&params, &dtrain, 2)), "labels");
+}

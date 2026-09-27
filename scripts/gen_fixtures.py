@@ -31,6 +31,8 @@ import json
 import os
 import tempfile
 import zlib
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import xgboost as xgb
@@ -63,17 +65,17 @@ BAND_RMSE = 1.08
 BAND_ACC = 0.02
 
 # Baseline tree-booster parameters; every case starts from these.
-TREE_BASE = dict(
-    tree_method="hist",
-    max_depth=6,
-    eta=0.1,
-    reg_lambda=1.0,
-    reg_alpha=0.0,
-    gamma=0.0,
-    min_child_weight=1.0,
-    max_bin=256,
-    base_score=0.5,
-)
+TREE_BASE = {
+    "tree_method": "hist",
+    "max_depth": 6,
+    "eta": 0.1,
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.0,
+    "gamma": 0.0,
+    "min_child_weight": 1.0,
+    "max_bin": 256,
+    "base_score": 0.5,
+}
 
 
 def _seed(name: str) -> int:
@@ -152,19 +154,24 @@ def y_multi_regression(x, rng):
     """Three regression targets (a label matrix) of different shapes."""
     n = x.shape[0]
     noise = 0.1 * rng.standard_normal((n, 3))
-    return np.stack(
-        [
-            2 * x[:, 0] - 3 * x[:, 1] ** 2,
-            np.sin(6 * x[:, 2]) + x[:, 3],
-            4 * x[:, 4] * x[:, 5] - 1,
-        ],
-        axis=1,
-    ) + noise
+    return (
+        np.stack(
+            [
+                2 * x[:, 0] - 3 * x[:, 1] ** 2,
+                np.sin(6 * x[:, 2]) + x[:, 3],
+                4 * x[:, 4] * x[:, 5] - 1,
+            ],
+            axis=1,
+        )
+        + noise
+    )
 
 
 def y_multi_label(x, rng):
     """Three independent binary labels (multi-label classification)."""
-    logits = np.stack([3 * x[:, 0] - 2 * x[:, 1], 4 * x[:, 2] - 2, 2 * x[:, 3] - 3 * x[:, 4] + 1], axis=1)
+    logits = np.stack(
+        [3 * x[:, 0] - 2 * x[:, 1], 4 * x[:, 2] - 2, 2 * x[:, 3] - 3 * x[:, 4] + 1], axis=1
+    )
     return (1 / (1 + np.exp(-logits)) > rng.random(logits.shape)).astype(np.float32)
 
 
@@ -227,35 +234,52 @@ def y_aft(x, rng):
 #          `xgb_model=`), refresh (process_type=update of the final model on a
 #          prefix of the training rows with transformed labels), ranges
 #          (iteration_range predictions and model slices)
-CASES = {
+# (target, parameter overrides, options): options mix value types by key.
+CASES: dict[str, tuple[Callable[..., Any], dict[str, Any], dict[str, Any]]] = {
     # tree_method / grow policy / constraints on reg:squarederror
-    "exact_reg_d6": (y_regression, dict(tree_method="exact"), {}),
-    "exact_reg_missing_d4": (y_regression, dict(tree_method="exact", max_depth=4), dict(missing=0.3)),
-    "hist_reg_d1_r1": (y_regression, dict(max_depth=1), dict(num_round=1)),
-    "hist_reg_d6_r50": (y_regression, {}, {}),
-    "hist_reg_bin32_d6": (y_regression, dict(max_bin=32), {}),
-    "hist_reg_missing_d6": (y_regression, {}, dict(missing=0.3)),
-    "approx_reg_d6": (y_regression, dict(tree_method="approx"), {}),
-    "lossguide_reg_l15": (y_regression, dict(grow_policy="lossguide", max_leaves=15, max_depth=0), {}),
-    "monotone_reg_d6": (y_regression, dict(monotone_constraints="(1,-1,0,0,0,0,0,0)"), {}),
-    "interaction_reg_d6": (y_regression, dict(interaction_constraints="[[0,1],[2,3,4],[5,6,7]]"), {}),
-    "gamma_mcw_alpha_reg_d6": (y_regression, dict(gamma=0.05, min_child_weight=10, reg_alpha=0.5), {}),
-    "interaction_overlap_reg_d6": (
+    "exact_reg_d6": (y_regression, {"tree_method": "exact"}, {}),
+    "exact_reg_missing_d4": (
         y_regression,
-        dict(interaction_constraints="[[0,1],[1,2],[3,4,5,6,7]]"),
+        {"tree_method": "exact", "max_depth": 4},
+        {"missing": 0.3},
+    ),
+    "hist_reg_d1_r1": (y_regression, {"max_depth": 1}, {"num_round": 1}),
+    "hist_reg_d6_r50": (y_regression, {}, {}),
+    "hist_reg_bin32_d6": (y_regression, {"max_bin": 32}, {}),
+    "hist_reg_missing_d6": (y_regression, {}, {"missing": 0.3}),
+    "approx_reg_d6": (y_regression, {"tree_method": "approx"}, {}),
+    "lossguide_reg_l15": (
+        y_regression,
+        {"grow_policy": "lossguide", "max_leaves": 15, "max_depth": 0},
         {},
     ),
-    "weighted_reg_d6": (y_regression, {}, dict(weighted=True)),
+    "monotone_reg_d6": (y_regression, {"monotone_constraints": "(1,-1,0,0,0,0,0,0)"}, {}),
+    "interaction_reg_d6": (
+        y_regression,
+        {"interaction_constraints": "[[0,1],[2,3,4],[5,6,7]]"},
+        {},
+    ),
+    "gamma_mcw_alpha_reg_d6": (
+        y_regression,
+        {"gamma": 0.05, "min_child_weight": 10, "reg_alpha": 0.5},
+        {},
+    ),
+    "interaction_overlap_reg_d6": (
+        y_regression,
+        {"interaction_constraints": "[[0,1],[1,2],[3,4,5,6,7]]"},
+        {},
+    ),
+    "weighted_reg_d6": (y_regression, {}, {"weighted": True}),
     # per-round metric oracles on a weighted test set
     "evals_reg_d4": (
         y_regression,
-        dict(max_depth=4, eval_metric=["rmse", "mae"]),
-        dict(evals=True, test_weighted=True),
+        {"max_depth": 4, "eval_metric": ["rmse", "mae"]},
+        {"evals": True, "test_weighted": True},
     ),
     "categorical_reg_d6": (
         y_regression,
         {},
-        dict(categorical=True),
+        {"categorical": True},
     ),
     # categorical splits with missing values in the categorical columns, so
     # the forward and backward partition scans differ; 80 categories exceed
@@ -263,518 +287,665 @@ CASES = {
     "categorical_missing_reg_d6": (
         y_category_effects,
         {},
-        dict(categorical=(6, 80), missing=0.2),
+        {"categorical": (6, 80), "missing": 0.2},
     ),
     # fewer than max_cat_to_onehot (4) categories: one-hot splits
     "categorical_onehot_reg_d6": (
         y_category_effects,
         {},
-        dict(categorical=(3, 2), missing=0.2),
+        {"categorical": (3, 2), "missing": 0.2},
     ),
     # objectives
-    "binary_d6": (y_binary, dict(objective="binary:logistic"), dict(tol_train=TOL_TRAIN_PROB)),
+    "binary_d6": (y_binary, {"objective": "binary:logistic"}, {"tol_train": TOL_TRAIN_PROB}),
     "binary_spw3_d6": (
         y_binary,
-        dict(objective="binary:logistic", scale_pos_weight=3.0),
-        dict(tol_train=TOL_TRAIN_PROB),
+        {"objective": "binary:logistic", "scale_pos_weight": 3.0},
+        {"tol_train": TOL_TRAIN_PROB},
     ),
     # reg:logistic is binary:logistic's loss reported as a probability
     # regression (rmse); XGBoost saves the name as-is.
-    "reg_logistic_d6": (y_binary, dict(objective="reg:logistic"), dict(tol_train=TOL_TRAIN_PROB)),
+    "reg_logistic_d6": (y_binary, {"objective": "reg:logistic"}, {"tol_train": TOL_TRAIN_PROB}),
     # Deprecated alias: XGBoost 3.4.2 trains it as reg:squarederror (with a
     # warning) and saves the model objective as reg:squarederror.
-    "reg_linear_d6": (y_regression, dict(objective="reg:linear"), {}),
+    "reg_linear_d6": (y_regression, {"objective": "reg:linear"}, {}),
     "softprob_d4": (
         y_multiclass,
-        dict(objective="multi:softprob", num_class=3, max_depth=4),
-        dict(tol_train=TOL_TRAIN_PROB),
+        {"objective": "multi:softprob", "num_class": 3, "max_depth": 4},
+        {"tol_train": TOL_TRAIN_PROB},
     ),
-    "softmax_d4": (y_multiclass, dict(objective="multi:softmax", num_class=3, max_depth=4), {}),
-    "poisson_d4": (y_poisson, dict(objective="count:poisson", max_depth=4), {}),
-    "gamma_d4": (y_gamma, dict(objective="reg:gamma", max_depth=4), {}),
+    "softmax_d4": (
+        y_multiclass,
+        {"objective": "multi:softmax", "num_class": 3, "max_depth": 4},
+        {},
+    ),
+    "poisson_d4": (y_poisson, {"objective": "count:poisson", "max_depth": 4}, {}),
+    "gamma_d4": (y_gamma, {"objective": "reg:gamma", "max_depth": 4}, {}),
     "tweedie_d4": (
         y_tweedie,
-        dict(objective="reg:tweedie", tweedie_variance_power=1.5, max_depth=4),
+        {"objective": "reg:tweedie", "tweedie_variance_power": 1.5, "max_depth": 4},
         {},
     ),
     # evals: the default metric is `mphe` (pseudo-Huber without factor 2)
     "huber_d4": (
         y_heavy_tail,
-        dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
-        dict(evals=True),
+        {"objective": "reg:pseudohubererror", "huber_slope": 1.0, "max_depth": 4},
+        {"evals": True},
     ),
     # the default `mphe` keeps the objective's slope (pseudo_huber_param in
     # XGBoost's DefaultMetricConfig survives the metric's empty Configure)
     "huber_slope2p5_d4": (
         y_heavy_tail,
-        dict(objective="reg:pseudohubererror", huber_slope=2.5, max_depth=4),
-        dict(evals=True),
+        {"objective": "reg:pseudohubererror", "huber_slope": 2.5, "max_depth": 4},
+        {"evals": True},
     ),
     # small objectives; `evals` checks each default metric (rmsle, logloss on
     # raw margins, error on the 0/1 hinge output) round by round
-    "squaredlog_d4": (y_gamma, dict(objective="reg:squaredlogerror", max_depth=4), dict(evals=True)),
+    "squaredlog_d4": (
+        y_gamma,
+        {"objective": "reg:squaredlogerror", "max_depth": 4},
+        {"evals": True},
+    ),
     "squaredlog_exact_d4": (
         y_gamma,
-        dict(objective="reg:squaredlogerror", tree_method="exact", max_depth=4),
-        dict(evals=True),
+        {"objective": "reg:squaredlogerror", "tree_method": "exact", "max_depth": 4},
+        {"evals": True},
     ),
     "nobs_squaredlog_weighted_d4": (
         y_gamma,
-        dict(objective="reg:squaredlogerror", max_depth=4),
-        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+        {"objective": "reg:squaredlogerror", "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True, "evals": True, "test_weighted": True},
     ),
-    "logitraw_d6": (y_binary, dict(objective="binary:logitraw"), dict(evals=True)),
+    "logitraw_d6": (y_binary, {"objective": "binary:logitraw"}, {"evals": True}),
     "logitraw_exact_d4": (
         y_binary,
-        dict(objective="binary:logitraw", tree_method="exact", max_depth=4),
-        dict(evals=True),
+        {"objective": "binary:logitraw", "tree_method": "exact", "max_depth": 4},
+        {"evals": True},
     ),
     "nobs_logitraw_weighted_d4": (
         y_binary,
-        dict(objective="binary:logitraw", max_depth=4),
-        dict(drop=("base_score",), weighted=True, evals=True),
+        {"objective": "binary:logitraw", "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True, "evals": True},
     ),
     "nobs_logitraw_spw3_d4": (
         y_binary,
-        dict(objective="binary:logitraw", scale_pos_weight=3.0, max_depth=4),
-        dict(drop=("base_score",), evals=True),
+        {"objective": "binary:logitraw", "scale_pos_weight": 3.0, "max_depth": 4},
+        {"drop": ("base_score",), "evals": True},
     ),
-    "hinge_d4": (y_binary, dict(objective="binary:hinge", max_depth=4), dict(evals=True)),
+    "hinge_d4": (y_binary, {"objective": "binary:hinge", "max_depth": 4}, {"evals": True}),
     "hinge_exact_d4": (
         y_binary,
-        dict(objective="binary:hinge", tree_method="exact", max_depth=4),
-        dict(evals=True),
+        {"objective": "binary:hinge", "tree_method": "exact", "max_depth": 4},
+        {"evals": True},
     ),
     "nobs_hinge_weighted_d4": (
         y_binary,
-        dict(objective="binary:hinge", max_depth=4),
-        dict(drop=("base_score",), weighted=True, evals=True, test_weighted=True),
+        {"objective": "binary:hinge", "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True, "evals": True, "test_weighted": True},
     ),
     # metric oracles: rmsle / mape / mphe (non-default slope) on a positive
     # target, and pre / pre@k on weighted query groups
     "evals_metrics_reg_d4": (
         y_gamma,
-        dict(max_depth=4, huber_slope=0.7, eval_metric=["rmsle", "mape", "mphe"]),
-        dict(evals=True, test_weighted=True),
+        {"max_depth": 4, "huber_slope": 0.7, "eval_metric": ["rmsle", "mape", "mphe"]},
+        {"evals": True, "test_weighted": True},
     ),
     "evals_pre_rank_d4": (
         y_relevance_binary,
-        dict(
-            objective="rank:ndcg",
-            max_depth=4,
-            lambdarank_pair_method="topk",
-            lambdarank_num_pair_per_sample=GROUP_SIZE,
-            eval_metric=["pre", "pre@5"],
-        ),
-        dict(ranking=True, evals=True, test_weighted=True),
+        {
+            "objective": "rank:ndcg",
+            "max_depth": 4,
+            "lambdarank_pair_method": "topk",
+            "lambdarank_num_pair_per_sample": GROUP_SIZE,
+            "eval_metric": ["pre", "pre@5"],
+        },
+        {"ranking": True, "evals": True, "test_weighted": True},
     ),
     # ranking: groups of 20 and topk=20 enumerate every unordered pair. The
     # Rust objective reproduces XGBoost's top-k accumulation/normalization.
     "rank_ndcg_d4": (
         y_relevance,
-        dict(
-            objective="rank:ndcg",
-            max_depth=4,
-            lambdarank_pair_method="topk",
-            lambdarank_num_pair_per_sample=GROUP_SIZE,
-        ),
-        dict(ranking=True),
+        {
+            "objective": "rank:ndcg",
+            "max_depth": 4,
+            "lambdarank_pair_method": "topk",
+            "lambdarank_num_pair_per_sample": GROUP_SIZE,
+        },
+        {"ranking": True},
     ),
     "rank_ndcg_top20_g50_d4": (
         y_relevance,
-        dict(
-            objective="rank:ndcg",
-            max_depth=4,
-            lambdarank_pair_method="topk",
-            lambdarank_num_pair_per_sample=20,
-        ),
-        dict(ranking=True, group_size=50),
+        {
+            "objective": "rank:ndcg",
+            "max_depth": 4,
+            "lambdarank_pair_method": "topk",
+            "lambdarank_num_pair_per_sample": 20,
+        },
+        {"ranking": True, "group_size": 50},
     ),
     "rank_pairwise_d4": (
         y_relevance,
-        dict(
-            objective="rank:pairwise",
-            max_depth=4,
-            lambdarank_pair_method="topk",
-            lambdarank_num_pair_per_sample=GROUP_SIZE,
-        ),
-        dict(ranking=True),
+        {
+            "objective": "rank:pairwise",
+            "max_depth": 4,
+            "lambdarank_pair_method": "topk",
+            "lambdarank_num_pair_per_sample": GROUP_SIZE,
+        },
+        {"ranking": True},
     ),
     "rank_map_d4": (
         y_relevance_binary,
-        dict(
-            objective="rank:map",
-            max_depth=4,
-            lambdarank_pair_method="topk",
-            lambdarank_num_pair_per_sample=GROUP_SIZE,
-        ),
-        dict(ranking=True),
+        {
+            "objective": "rank:map",
+            "max_depth": 4,
+            "lambdarank_pair_method": "topk",
+            "lambdarank_num_pair_per_sample": GROUP_SIZE,
+        },
+        {"ranking": True},
     ),
     # linear booster (coord_descent is the deterministic updater; shotgun is not)
     "gblinear_r50": (
         y_regression,
-        dict(
-            booster="gblinear",
-            updater="coord_descent",
-            feature_selector="cyclic",
-            eta=0.5,
-            reg_lambda=0.0,
-            reg_alpha=0.0,
-        ),
-        dict(tier="trainonly", drop=("tree_method", "max_depth", "gamma", "min_child_weight", "max_bin")),
+        {
+            "booster": "gblinear",
+            "updater": "coord_descent",
+            "feature_selector": "cyclic",
+            "eta": 0.5,
+            "reg_lambda": 0.0,
+            "reg_alpha": 0.0,
+        },
+        {
+            "tier": "trainonly",
+            "drop": ("tree_method", "max_depth", "gamma", "min_child_weight", "max_bin"),
+        },
     ),
     # no base_score -> XGBoost estimates the intercept from the labels
-    "nobs_reg_d4": (y_regression, dict(max_depth=4), dict(drop=("base_score",))),
+    "nobs_reg_d4": (y_regression, {"max_depth": 4}, {"drop": ("base_score",)}),
     "nobs_binary_d4": (
         y_binary,
-        dict(objective="binary:logistic", max_depth=4),
-        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+        {"objective": "binary:logistic", "max_depth": 4},
+        {"drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
     ),
     "nobs_softprob_d4": (
         y_multiclass,
-        dict(objective="multi:softprob", num_class=3, max_depth=4),
-        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+        {"objective": "multi:softprob", "num_class": 3, "max_depth": 4},
+        {"drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
     ),
-    "nobs_poisson_d4": (y_poisson, dict(objective="count:poisson", max_depth=4), dict(drop=("base_score",))),
+    "nobs_poisson_d4": (
+        y_poisson,
+        {"objective": "count:poisson", "max_depth": 4},
+        {"drop": ("base_score",)},
+    ),
     "nobs_huber_d4": (
         y_heavy_tail,
-        dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
-        dict(drop=("base_score",)),
+        {"objective": "reg:pseudohubererror", "huber_slope": 1.0, "max_depth": 4},
+        {"drop": ("base_score",)},
     ),
     # multi-target labels (a label matrix, one output per column) on the
     # default one_output_per_tree strategy; intercepts are estimated per target.
     "multi_reg3_d6": (y_multi_regression, {}, {}),
-    "multi_reg3_nobs_d6": (y_multi_regression, {}, dict(drop=("base_score",))),
-    "multi_reg3_exact_nobs_d6": (y_multi_regression, dict(tree_method="exact"), dict(drop=("base_score",))),
+    "multi_reg3_nobs_d6": (y_multi_regression, {}, {"drop": ("base_score",)}),
+    "multi_reg3_exact_nobs_d6": (
+        y_multi_regression,
+        {"tree_method": "exact"},
+        {"drop": ("base_score",)},
+    ),
     "multi_label_binary_d4": (
         y_multi_label,
-        dict(objective="binary:logistic", max_depth=4),
-        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+        {"objective": "binary:logistic", "max_depth": 4},
+        {"drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
     ),
     "multi_label_spw3_d4": (
         y_multi_label,
-        dict(objective="binary:logistic", scale_pos_weight=3.0, max_depth=4),
-        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+        {"objective": "binary:logistic", "scale_pos_weight": 3.0, "max_depth": 4},
+        {"drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
     ),
     "multi_huber_weighted_d4": (
         y_multi_heavy_tail,
-        dict(objective="reg:pseudohubererror", huber_slope=1.0, max_depth=4),
-        dict(drop=("base_score",), weighted=True),
+        {"objective": "reg:pseudohubererror", "huber_slope": 1.0, "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True},
     ),
     # alpha-list objectives: one output per alpha (quantile_alpha /
     # expectile_alpha lists become one scalar tree per alpha and round) and
     # the smoothed MAE. `nobs_*` cases exercise the per-output intercepts
     # (label quantiles, the MAE Newton step from the mean, the monotone
     # expectile step); the others broadcast base_score through ProbToMargin.
-    "quantile_d4": (y_heavy_tail, dict(objective="reg:quantileerror", quantile_alpha=0.5, max_depth=4), {}),
+    "quantile_d4": (
+        y_heavy_tail,
+        {"objective": "reg:quantileerror", "quantile_alpha": 0.5, "max_depth": 4},
+        {},
+    ),
     "nobs_quantile_multi_d4": (
         y_heavy_tail,
-        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], max_depth=4),
-        dict(drop=("base_score",)),
+        {"objective": "reg:quantileerror", "quantile_alpha": [0.1, 0.5, 0.9], "max_depth": 4},
+        {"drop": ("base_score",)},
     ),
     "nobs_quantile_multi_exact_d4": (
         y_heavy_tail,
-        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], tree_method="exact", max_depth=4),
-        dict(drop=("base_score",)),
+        {
+            "objective": "reg:quantileerror",
+            "quantile_alpha": [0.1, 0.5, 0.9],
+            "tree_method": "exact",
+            "max_depth": 4,
+        },
+        {"drop": ("base_score",)},
     ),
     "nobs_quantile_weighted_d4": (
         y_heavy_tail,
-        dict(objective="reg:quantileerror", quantile_alpha=[0.2, 0.8], max_depth=4),
-        dict(drop=("base_score",), weighted=True),
+        {"objective": "reg:quantileerror", "quantile_alpha": [0.2, 0.8], "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True},
     ),
-    "nobs_mae_d4": (y_heavy_tail, dict(objective="reg:absoluteerror", max_depth=4), dict(drop=("base_score",))),
+    "nobs_mae_d4": (
+        y_heavy_tail,
+        {"objective": "reg:absoluteerror", "max_depth": 4},
+        {"drop": ("base_score",)},
+    ),
     "nobs_mae_weighted_exact_d4": (
         y_heavy_tail,
-        dict(objective="reg:absoluteerror", tree_method="exact", max_depth=4),
-        dict(drop=("base_score",), weighted=True),
+        {"objective": "reg:absoluteerror", "tree_method": "exact", "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True},
     ),
     "nobs_expectile_d4": (
         y_heavy_tail,
-        dict(objective="reg:expectileerror", expectile_alpha=0.3, max_depth=4),
-        dict(drop=("base_score",)),
+        {"objective": "reg:expectileerror", "expectile_alpha": 0.3, "max_depth": 4},
+        {"drop": ("base_score",)},
     ),
     "nobs_expectile_multi_d4": (
         y_heavy_tail,
-        dict(objective="reg:expectileerror", expectile_alpha=[0.1, 0.5, 0.9], max_depth=4),
-        dict(drop=("base_score",)),
+        {"objective": "reg:expectileerror", "expectile_alpha": [0.1, 0.5, 0.9], "max_depth": 4},
+        {"drop": ("base_score",)},
     ),
     "expectile_multi_weighted_d4": (
         y_heavy_tail,
-        dict(objective="reg:expectileerror", expectile_alpha=[0.2, 0.8], max_depth=4),
-        dict(weighted=True),
+        {"objective": "reg:expectileerror", "expectile_alpha": [0.2, 0.8], "max_depth": 4},
+        {"weighted": True},
     ),
     # multi-target smoothed MAE: a label matrix with per-target intercepts.
     "multi_mae_weighted_d4": (
         y_multi_heavy_tail,
-        dict(objective="reg:absoluteerror", max_depth=4),
-        dict(drop=("base_score",), weighted=True),
+        {"objective": "reg:absoluteerror", "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True},
     ),
     # survival: Cox with censoring and tied times; AFT with every censoring
     # type. Metric oracles cover cox-nloglik, aft-nloglik and
     # interval-regression-accuracy.
-    "cox_hist_d4": (y_cox, dict(objective="survival:cox", max_depth=4), dict(evals=True)),
+    "cox_hist_d4": (y_cox, {"objective": "survival:cox", "max_depth": 4}, {"evals": True}),
     "cox_exact_nobs_d4": (
         y_cox,
-        dict(objective="survival:cox", tree_method="exact", max_depth=4),
-        dict(drop=("base_score",), evals=True),
+        {"objective": "survival:cox", "tree_method": "exact", "max_depth": 4},
+        {"drop": ("base_score",), "evals": True},
     ),
     "cox_weighted_nobs_d4": (
         y_cox,
-        dict(objective="survival:cox", max_depth=4),
-        dict(drop=("base_score",), weighted=True),
+        {"objective": "survival:cox", "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True},
     ),
     "aft_normal_d4": (
         y_aft,
-        dict(
-            objective="survival:aft",
-            aft_loss_distribution="normal",
-            aft_loss_distribution_scale=1.2,
-            max_depth=4,
-            eval_metric=["aft-nloglik", "interval-regression-accuracy"],
-        ),
-        dict(evals=True),
+        {
+            "objective": "survival:aft",
+            "aft_loss_distribution": "normal",
+            "aft_loss_distribution_scale": 1.2,
+            "max_depth": 4,
+            "eval_metric": ["aft-nloglik", "interval-regression-accuracy"],
+        },
+        {"evals": True},
     ),
     "aft_logistic_exact_d4": (
         y_aft,
-        dict(
-            objective="survival:aft",
-            aft_loss_distribution="logistic",
-            aft_loss_distribution_scale=0.8,
-            tree_method="exact",
-            max_depth=4,
-        ),
-        dict(evals=True),
+        {
+            "objective": "survival:aft",
+            "aft_loss_distribution": "logistic",
+            "aft_loss_distribution_scale": 0.8,
+            "tree_method": "exact",
+            "max_depth": 4,
+        },
+        {"evals": True},
     ),
     "aft_extreme_d4": (
         y_aft,
-        dict(objective="survival:aft", aft_loss_distribution="extreme", max_depth=4),
-        dict(evals=True),
+        {"objective": "survival:aft", "aft_loss_distribution": "extreme", "max_depth": 4},
+        {"evals": True},
     ),
     "aft_weighted_nobs_d4": (
         y_aft,
-        dict(
-            objective="survival:aft",
-            aft_loss_distribution="normal",
-            max_depth=4,
-            eval_metric=["aft-nloglik", "interval-regression-accuracy"],
-        ),
-        dict(drop=("base_score",), weighted=True, test_weighted=True, evals=True),
+        {
+            "objective": "survival:aft",
+            "aft_loss_distribution": "normal",
+            "max_depth": 4,
+            "eval_metric": ["aft-nloglik", "interval-regression-accuracy"],
+        },
+        {"drop": ("base_score",), "weighted": True, "test_weighted": True, "evals": True},
     ),
     # multi_strategy=multi_output_tree: one vector-leaf tree per round shares
     # its splits across all outputs (hist only).
-    "mot_reg3_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), {}),
+    "mot_reg3_d6": (y_multi_regression, {"multi_strategy": "multi_output_tree"}, {}),
     "mot_reg3_nobs_lossguide_l15": (
         y_multi_regression,
-        dict(multi_strategy="multi_output_tree", grow_policy="lossguide", max_leaves=15, max_depth=0),
-        dict(drop=("base_score",)),
+        {
+            "multi_strategy": "multi_output_tree",
+            "grow_policy": "lossguide",
+            "max_leaves": 15,
+            "max_depth": 0,
+        },
+        {"drop": ("base_score",)},
     ),
-    "mot_reg3_missing_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), dict(missing=0.3)),
+    "mot_reg3_missing_d6": (
+        y_multi_regression,
+        {"multi_strategy": "multi_output_tree"},
+        {"missing": 0.3},
+    ),
     "mot_reg3_regularized_d4": (
         y_multi_regression,
-        dict(
-            multi_strategy="multi_output_tree",
-            max_depth=4,
-            gamma=0.05,
-            min_child_weight=10,
-            reg_alpha=0.5,
-            reg_lambda=2.0,
-            max_delta_step=0.3,
-        ),
+        {
+            "multi_strategy": "multi_output_tree",
+            "max_depth": 4,
+            "gamma": 0.05,
+            "min_child_weight": 10,
+            "reg_alpha": 0.5,
+            "reg_lambda": 2.0,
+            "max_delta_step": 0.3,
+        },
         {},
     ),
     "mot_reg3_monotone_d6": (
         y_multi_regression,
-        dict(multi_strategy="multi_output_tree", monotone_constraints="(1,-1,0,0,0,0,0,0)"),
+        {"multi_strategy": "multi_output_tree", "monotone_constraints": "(1,-1,0,0,0,0,0,0)"},
         {},
     ),
     "mot_reg3_interaction_d6": (
         y_multi_regression,
-        dict(multi_strategy="multi_output_tree", interaction_constraints="[[0,1],[2,3,4],[5,6,7]]"),
+        {
+            "multi_strategy": "multi_output_tree",
+            "interaction_constraints": "[[0,1],[2,3,4],[5,6,7]]",
+        },
         {},
     ),
-    "mot_reg3_categorical_d6": (y_multi_regression, dict(multi_strategy="multi_output_tree"), dict(categorical=True)),
+    "mot_reg3_categorical_d6": (
+        y_multi_regression,
+        {"multi_strategy": "multi_output_tree"},
+        {"categorical": True},
+    ),
     "mot_label_binary_d4": (
         y_multi_label,
-        dict(objective="binary:logistic", multi_strategy="multi_output_tree", max_depth=4),
-        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+        {"objective": "binary:logistic", "multi_strategy": "multi_output_tree", "max_depth": 4},
+        {"drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
     ),
     "mot_softprob_d4": (
         y_multiclass,
-        dict(objective="multi:softprob", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
-        dict(drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+        {
+            "objective": "multi:softprob",
+            "num_class": 3,
+            "multi_strategy": "multi_output_tree",
+            "max_depth": 4,
+        },
+        {"drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
     ),
     "mot_softmax_d4": (
         y_multiclass,
-        dict(objective="multi:softmax", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
+        {
+            "objective": "multi:softmax",
+            "num_class": 3,
+            "multi_strategy": "multi_output_tree",
+            "max_depth": 4,
+        },
         {},
     ),
     "mot_huber_weighted_d4": (
         y_multi_heavy_tail,
-        dict(objective="reg:pseudohubererror", huber_slope=1.0, multi_strategy="multi_output_tree", max_depth=4),
-        dict(drop=("base_score",), weighted=True),
+        {
+            "objective": "reg:pseudohubererror",
+            "huber_slope": 1.0,
+            "multi_strategy": "multi_output_tree",
+            "max_depth": 4,
+        },
+        {"drop": ("base_score",), "weighted": True},
     ),
     "mot_subsample_0p8_d6": (
         y_multi_regression,
-        dict(multi_strategy="multi_output_tree", subsample=0.8, colsample_bynode=0.8, seed=42),
-        dict(tier="quality"),
+        {
+            "multi_strategy": "multi_output_tree",
+            "subsample": 0.8,
+            "colsample_bynode": 0.8,
+            "seed": 42,
+        },
+        {"tier": "quality"},
     ),
     "mot_dart_d4": (
         y_multi_regression,
-        dict(multi_strategy="multi_output_tree", booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
-        dict(tier="quality"),
+        {
+            "multi_strategy": "multi_output_tree",
+            "booster": "dart",
+            "rate_drop": 0.1,
+            "skip_drop": 0.5,
+            "seed": 42,
+            "max_depth": 4,
+        },
+        {"tier": "quality"},
     ),
     # vector leaves on the alpha-list objectives (one output per alpha) and a
     # smoothed-MAE label matrix
     "mot_quantile_multi_nobs_d4": (
         y_heavy_tail,
-        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], multi_strategy="multi_output_tree", max_depth=4),
-        dict(drop=("base_score",)),
+        {
+            "objective": "reg:quantileerror",
+            "quantile_alpha": [0.1, 0.5, 0.9],
+            "multi_strategy": "multi_output_tree",
+            "max_depth": 4,
+        },
+        {"drop": ("base_score",)},
     ),
     "mot_expectile_multi_d4": (
         y_heavy_tail,
-        dict(objective="reg:expectileerror", expectile_alpha=[0.2, 0.8], multi_strategy="multi_output_tree", max_depth=4),
+        {
+            "objective": "reg:expectileerror",
+            "expectile_alpha": [0.2, 0.8],
+            "multi_strategy": "multi_output_tree",
+            "max_depth": 4,
+        },
         {},
     ),
     "mot_mae_weighted_nobs_d4": (
         y_multi_heavy_tail,
-        dict(objective="reg:absoluteerror", multi_strategy="multi_output_tree", max_depth=4),
-        dict(drop=("base_score",), weighted=True),
+        {"objective": "reg:absoluteerror", "multi_strategy": "multi_output_tree", "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True},
     ),
     # vector-leaf forests (num_parallel_tree vector trees per iteration),
     # iteration ranges / slices, and continued training
     "mot_forest_np3_reg3_d4": (
         y_multi_regression,
-        dict(multi_strategy="multi_output_tree", num_parallel_tree=3, max_depth=4),
-        dict(num_round=20, ranges=True),
+        {"multi_strategy": "multi_output_tree", "num_parallel_tree": 3, "max_depth": 4},
+        {"num_round": 20, "ranges": True},
     ),
     "mot_continue_softprob_d4": (
         y_multiclass,
-        dict(objective="multi:softprob", num_class=3, multi_strategy="multi_output_tree", max_depth=4),
-        dict(continue_from=15, tol_train=TOL_TRAIN_PROB, ranges=True),
+        {
+            "objective": "multi:softprob",
+            "num_class": 3,
+            "multi_strategy": "multi_output_tree",
+            "max_depth": 4,
+        },
+        {"continue_from": 15, "tol_train": TOL_TRAIN_PROB, "ranges": True},
     ),
     # quality tier: RNG-driven sampling, pointwise agreement is not expected
-    "subsample_0p8_d6": (y_regression, dict(subsample=0.8, seed=42), dict(tier="quality")),
-    "colsample_bytree_0p5_d6": (y_regression, dict(colsample_bytree=0.5, seed=42), dict(tier="quality")),
+    "subsample_0p8_d6": (y_regression, {"subsample": 0.8, "seed": 42}, {"tier": "quality"}),
+    "colsample_bytree_0p5_d6": (
+        y_regression,
+        {"colsample_bytree": 0.5, "seed": 42},
+        {"tier": "quality"},
+    ),
     # sampling_method=gradient_based: XGBoost's CPU MVS row sampler (hist and approx)
     "gradient_based_0p3_d6": (
         y_regression,
-        dict(sampling_method="gradient_based", subsample=0.3, seed=42),
-        dict(tier="quality"),
+        {"sampling_method": "gradient_based", "subsample": 0.3, "seed": 42},
+        {"tier": "quality"},
     ),
     "gradient_based_binary_0p5_d6": (
         y_binary,
-        dict(objective="binary:logistic", sampling_method="gradient_based", subsample=0.5, seed=42),
-        dict(tier="quality"),
+        {
+            "objective": "binary:logistic",
+            "sampling_method": "gradient_based",
+            "subsample": 0.5,
+            "seed": 42,
+        },
+        {"tier": "quality"},
     ),
     "gradient_based_approx_0p4_d6": (
         y_regression,
-        dict(tree_method="approx", sampling_method="gradient_based", subsample=0.4, seed=42),
-        dict(tier="quality"),
+        {
+            "tree_method": "approx",
+            "sampling_method": "gradient_based",
+            "subsample": 0.4,
+            "seed": 42,
+        },
+        {"tier": "quality"},
     ),
     # feature-weighted column sampling: skewed weights favor the noise columns
     "feature_weights_bynode_0p5_d6": (
         y_regression,
-        dict(colsample_bynode=0.5, seed=42),
-        dict(tier="quality", num_round=100, feature_weights=[0.2, 3.0, 0.5, 1.0, 1.0, 2.0, 4.0, 0.1]),
+        {"colsample_bynode": 0.5, "seed": 42},
+        {
+            "tier": "quality",
+            "num_round": 100,
+            "feature_weights": [0.2, 3.0, 0.5, 1.0, 1.0, 2.0, 4.0, 0.1],
+        },
     ),
     "feature_weights_bytree_bylevel_d6": (
         y_regression,
-        dict(colsample_bytree=0.75, colsample_bylevel=0.5, seed=42),
-        dict(tier="quality", num_round=100, feature_weights=[4.0, 2.0, 1.0, 0.5, 0.0, 0.5, 0.25, 8.0]),
+        {"colsample_bytree": 0.75, "colsample_bylevel": 0.5, "seed": 42},
+        {
+            "tier": "quality",
+            "num_round": 100,
+            "feature_weights": [4.0, 2.0, 1.0, 0.5, 0.0, 0.5, 0.25, 8.0],
+        },
     ),
     "dart_d4": (
         y_regression,
-        dict(booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4),
-        dict(tier="quality"),
+        {"booster": "dart", "rate_drop": 0.1, "skip_drop": 0.5, "seed": 42, "max_depth": 4},
+        {"tier": "quality"},
     ),
     # DART without dropout (XGBoost `DropTrees` never drops a tree) trains
     # exactly as gbtree -> pointwise
     "dart_nodrop_d4": (
         y_regression,
-        dict(booster="dart", seed=42, max_depth=4),
+        {"booster": "dart", "seed": 42, "max_depth": 4},
         {},
     ),
     # `one_drop`: a round that draws no tree drops one at random
     "dart_one_drop_d4": (
         y_regression,
-        dict(booster="dart", rate_drop=0.05, one_drop=True, seed=42, max_depth=4),
-        dict(tier="quality"),
+        {"booster": "dart", "rate_drop": 0.05, "one_drop": True, "seed": 42, "max_depth": 4},
+        {"tier": "quality"},
     ),
     # continued training (`xgb_model=`), deterministic -> pointwise
-    "continue_hist_reg_d6": (y_regression, {}, dict(continue_from=20)),
+    "continue_hist_reg_d6": (y_regression, {}, {"continue_from": 20}),
     "continue_exact_nobs_binary_d4": (
         y_binary,
-        dict(objective="binary:logistic", tree_method="exact", max_depth=4),
-        dict(continue_from=10, drop=("base_score",), tol_train=TOL_TRAIN_PROB),
+        {"objective": "binary:logistic", "tree_method": "exact", "max_depth": 4},
+        {"continue_from": 10, "drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
     ),
     "continue_softprob_d4": (
         y_multiclass,
-        dict(objective="multi:softprob", num_class=3, max_depth=4),
-        dict(continue_from=15, tol_train=TOL_TRAIN_PROB),
+        {"objective": "multi:softprob", "num_class": 3, "max_depth": 4},
+        {"continue_from": 15, "tol_train": TOL_TRAIN_PROB},
     ),
     # process_type=update with the refresh updater
     "refresh_reg_d4": (
         y_regression,
-        dict(max_depth=4),
-        dict(refresh=dict(rows=1000, rounds=NUM_ROUND, refresh_leaf=True, labels=lambda y: 1.5 * y + 0.3)),
+        {"max_depth": 4},
+        {
+            "refresh": {
+                "rows": 1000,
+                "rounds": NUM_ROUND,
+                "refresh_leaf": True,
+                "labels": lambda y: 1.5 * y + 0.3,
+            }
+        },
     ),
     "refresh_keepleaf_binary_d4": (
         y_binary,
-        dict(objective="binary:logistic", max_depth=4),
-        dict(
-            tol_train=TOL_TRAIN_PROB,
-            refresh=dict(rows=1200, rounds=30, refresh_leaf=False, labels=lambda y: 1.0 - y),
-        ),
+        {"objective": "binary:logistic", "max_depth": 4},
+        {
+            "tol_train": TOL_TRAIN_PROB,
+            "refresh": {
+                "rows": 1200,
+                "rounds": 30,
+                "refresh_leaf": False,
+                "labels": lambda y: 1.0 - y,
+            },
+        },
     ),
     "refresh_softprob_d4": (
         y_multiclass,
-        dict(objective="multi:softprob", num_class=3, max_depth=4, num_parallel_tree=2),
-        dict(
-            num_round=20,
-            tol_train=TOL_TRAIN_PROB,
-            refresh=dict(rows=1500, rounds=20, refresh_leaf=True, labels=lambda y: (y + 1) % 3),
-        ),
+        {"objective": "multi:softprob", "num_class": 3, "max_depth": 4, "num_parallel_tree": 2},
+        {
+            "num_round": 20,
+            "tol_train": TOL_TRAIN_PROB,
+            "refresh": {
+                "rows": 1500,
+                "rounds": 20,
+                "refresh_leaf": True,
+                "labels": lambda y: (y + 1) % 3,
+            },
+        },
     ),
     # num_parallel_tree: without sampling every forest tree is identical
-    "forest_np4_reg_d4": (y_regression, dict(num_parallel_tree=4, max_depth=4), dict(ranges=True)),
+    "forest_np4_reg_d4": (y_regression, {"num_parallel_tree": 4, "max_depth": 4}, {"ranges": True}),
     "forest_np2_softprob_d4": (
         y_multiclass,
-        dict(objective="multi:softprob", num_class=3, max_depth=4, num_parallel_tree=2),
-        dict(num_round=20, tol_train=TOL_TRAIN_PROB, ranges=True),
+        {"objective": "multi:softprob", "num_class": 3, "max_depth": 4, "num_parallel_tree": 2},
+        {"num_round": 20, "tol_train": TOL_TRAIN_PROB, "ranges": True},
     ),
-    "ranges_hist_reg_d6": (y_regression, {}, dict(ranges=True)),
+    "ranges_hist_reg_d6": (y_regression, {}, {"ranges": True}),
     # the forest / continuation layouts on the other multi-output models: a
     # label matrix and an alpha list (one output per target / alpha)
     "forest_np2_multi_reg3_d4": (
         y_multi_regression,
-        dict(num_parallel_tree=2, max_depth=4),
-        dict(num_round=20, drop=("base_score",), ranges=True),
+        {"num_parallel_tree": 2, "max_depth": 4},
+        {"num_round": 20, "drop": ("base_score",), "ranges": True},
     ),
     "forest_np2_quantile_multi_d4": (
         y_heavy_tail,
-        dict(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9], num_parallel_tree=2, max_depth=4),
-        dict(num_round=20, drop=("base_score",), ranges=True),
+        {
+            "objective": "reg:quantileerror",
+            "quantile_alpha": [0.1, 0.5, 0.9],
+            "num_parallel_tree": 2,
+            "max_depth": 4,
+        },
+        {"num_round": 20, "drop": ("base_score",), "ranges": True},
     ),
     "continue_multi_reg3_nobs_d4": (
         y_multi_regression,
-        dict(max_depth=4),
-        dict(continue_from=20, drop=("base_score",)),
+        {"max_depth": 4},
+        {"continue_from": 20, "drop": ("base_score",)},
     ),
     # random forest / boosted random forest (quality tier)
     "rf_np8_reg_d6": (
         y_regression,
-        dict(num_parallel_tree=8, subsample=0.8, colsample_bynode=0.8, eta=1.0, seed=42),
-        dict(tier="quality", num_round=1),
+        {"num_parallel_tree": 8, "subsample": 0.8, "colsample_bynode": 0.8, "eta": 1.0, "seed": 42},
+        {"tier": "quality", "num_round": 1},
     ),
     "boosted_rf_np3_reg_d4": (
         y_regression,
-        dict(num_parallel_tree=3, subsample=0.7, colsample_bytree=0.8, max_depth=4, seed=42),
-        dict(tier="quality", num_round=20),
+        {
+            "num_parallel_tree": 3,
+            "subsample": 0.7,
+            "colsample_bytree": 0.8,
+            "max_depth": 4,
+            "seed": 42,
+        },
+        {"tier": "quality", "num_round": 20},
     ),
     "dart_np2_ranges_d4": (
         y_regression,
-        dict(booster="dart", rate_drop=0.1, skip_drop=0.5, seed=42, max_depth=4, num_parallel_tree=2),
-        dict(tier="quality", num_round=20, ranges=True),
+        {
+            "booster": "dart",
+            "rate_drop": 0.1,
+            "skip_drop": 0.5,
+            "seed": 42,
+            "max_depth": 4,
+            "num_parallel_tree": 2,
+        },
+        {"tier": "quality", "num_round": 20, "ranges": True},
     ),
 }
 
@@ -902,7 +1073,8 @@ def build_case(name: str) -> dict:
     group_sizes = test_group_sizes = None
     if opts.get("ranking"):
         group_size = opts.get("group_size", GROUP_SIZE)
-        assert N_TRAIN % group_size == 0 and N_TEST % group_size == 0
+        assert N_TRAIN % group_size == 0
+        assert N_TEST % group_size == 0
         group_sizes = [group_size] * (N_TRAIN // group_size)
         test_group_sizes = [group_size] * (N_TEST // group_size)
 
@@ -953,7 +1125,9 @@ def build_case(name: str) -> dict:
         first = opts["continue_from"]
         initial = xgb.train(train_params, dtrain, num_boost_round=first)
         continuation = {"first_rounds": first, "xgb_model_initial": _save_model_json(initial)}
-        booster = xgb.train(train_params, dtrain, num_boost_round=num_round - first, xgb_model=initial)
+        booster = xgb.train(
+            train_params, dtrain, num_boost_round=num_round - first, xgb_model=initial
+        )
     else:
         booster = xgb.train(
             train_params,
@@ -1020,7 +1194,9 @@ def build_case(name: str) -> dict:
         "slices": [],
     }
     if "refresh" in opts:
-        fixture["refresh"] = _refresh(opts["refresh"], train_params, booster, x_train, y_train, dtest)
+        fixture["refresh"] = _refresh(
+            opts["refresh"], train_params, booster, x_train, y_train, dtest
+        )
     if opts.get("ranges"):
         fixture.update(_ranges(booster, dtest, dcontrib))
     return fixture
@@ -1038,7 +1214,9 @@ def _refresh(spec: dict, train_params: dict, booster: xgb.Booster, x_train, y_tr
         updater="refresh",
         refresh_leaf=int(spec["refresh_leaf"]),
     )
-    refreshed = xgb.train(update, drefresh, num_boost_round=spec["rounds"], xgb_model=booster.copy())
+    refreshed = xgb.train(
+        update, drefresh, num_boost_round=spec["rounds"], xgb_model=booster.copy()
+    )
     return {
         "n_rows": rows,
         "y": _to_json_floats(y),
@@ -1059,15 +1237,21 @@ def _ranges(booster: xgb.Booster, dtest, dcontrib) -> dict:
         {
             "begin": b,
             "end": e,
-            "margin": _to_json_floats(booster.predict(dtest, output_margin=True, iteration_range=(b, e))),
+            "margin": _to_json_floats(
+                booster.predict(dtest, output_margin=True, iteration_range=(b, e))
+            ),
         }
         for b, e in spans
     ]
     range_contribs = [
         {
             "end": e,
-            "contribs": _to_json_floats(booster.predict(dcontrib, pred_contribs=True, iteration_range=(0, e))),
-            "leaf": _to_json_floats(booster.predict(dcontrib, pred_leaf=True, iteration_range=(0, e))),
+            "contribs": _to_json_floats(
+                booster.predict(dcontrib, pred_contribs=True, iteration_range=(0, e))
+            ),
+            "leaf": _to_json_floats(
+                booster.predict(dcontrib, pred_leaf=True, iteration_range=(0, e))
+            ),
         }
         for e in (1, half)
     ]
@@ -1139,7 +1323,15 @@ CUT_CASES = {
     "approx_logit_uniform_2000_b256": (x_uniform, 2000, 4, 256, None, "approx", "binary:logistic"),
     "approx_logit_uniform_2000_b16": (x_uniform, 2000, 4, 16, None, "approx", "binary:logistic"),
     "approx_logit_missing_5000_b256": (x_missing, 5000, 3, 256, None, "approx", "binary:logistic"),
-    "approx_logit_weighted_4000_b32": (x_uniform, 4000, 4, 32, w_sparse, "approx", "binary:logistic"),
+    "approx_logit_weighted_4000_b32": (
+        x_uniform,
+        4000,
+        4,
+        32,
+        w_sparse,
+        "approx",
+        "binary:logistic",
+    ),
     "approx_logit_large_120k_b256": (x_uniform, 120_000, 2, 256, None, "approx", "binary:logistic"),
 }
 
@@ -1153,11 +1345,18 @@ def build_cut_case(name: str) -> dict:
     # Labels are all zero; with base_score=0.5 the round-0 Hessian is 1 for
     # squared error and 0.25 for logistic, times the sample weight.
     d = xgb.DMatrix(x, label=np.zeros(n_rows, dtype=np.float32), weight=w, nthread=1)
-    params = dict(tree_method=tree_method, max_bin=max_bin, max_depth=1, nthread=1,
-                  objective=objective, base_score=0.5)
+    params = {
+        "tree_method": tree_method,
+        "max_bin": max_bin,
+        "max_depth": 1,
+        "nthread": 1,
+        "objective": objective,
+        "base_score": 0.5,
+    }
     xgb.train(params, d, 1)
     indptr, cuts = d.get_quantile_cut()
-    assert indptr.shape == (n_cols + 1,) and cuts.shape == (indptr[-1],)
+    assert indptr.shape == (n_cols + 1,)
+    assert cuts.shape == (indptr[-1],)
     # Each feature's block opens with -inf (its minimum bound); the Rust side
     # compares only the real cut values that follow, so -inf becomes null.
     cuts = np.where(np.isneginf(cuts), np.nan, cuts)

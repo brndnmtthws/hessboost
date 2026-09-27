@@ -24,11 +24,11 @@ Submodules:
 
 from importlib.metadata import version as _version
 
-from hessboost import conformal, ebm, diffusion, folds, online, inference
+from hessboost import conformal, ebm, diffusion, folds, inference, online
 from hessboost._core import (
     Booster,
-    DMatrix,
     Distributions,
+    DMatrix,
     ImportanceType,
     ModelFormat,
     Uncertainty,
@@ -65,7 +65,7 @@ __all__ = [
     "ebm",
     "diffusion",
     "folds",
-    "online",
     "inference",
+    "online",
     "train",
 ]

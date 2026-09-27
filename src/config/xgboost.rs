@@ -4,8 +4,8 @@
 //! and the training fuzz target all go through it.
 
 use super::groups::{
-    BalancedBagging, Boulevard, Dart, Ebm, ExtraTrees, Langevin, LinearTree, ModelShrink,
-    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
+    BalancedBagging, Boulevard, Dart, Ebm, EbmEarlyStopping, ExtraTrees, Langevin, LinearTree,
+    ModelShrink, ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
@@ -416,8 +416,8 @@ impl Flat {
             (
                 "ebm_early_stopping_tolerance",
                 ebm_early_stopping_tolerance.is_some(),
-                booster == Some(FlatBooster::Ebm),
-                "`booster=ebm`",
+                ebm_early_stopping_rounds.is_some_and(|rounds| rounds > 0),
+                "`ebm_early_stopping_rounds > 0`",
             ),
             (
                 "refresh_leaf",
@@ -517,11 +517,11 @@ impl Flat {
                 if let Some(v) = ebm_boulevard {
                     ebm = ebm.boulevard(v);
                 }
-                if let Some(v) = ebm_early_stopping_rounds {
-                    ebm = ebm.early_stopping_rounds(v);
-                }
-                if let Some(v) = ebm_early_stopping_tolerance {
-                    ebm = ebm.early_stopping_tolerance(v);
+                // The flat `0` rounds is no early stopping.
+                if let Some(rounds) = ebm_early_stopping_rounds.and_then(NonZeroUsize::new) {
+                    let tolerance =
+                        ebm_early_stopping_tolerance.unwrap_or(EbmEarlyStopping::DEFAULT_TOLERANCE);
+                    ebm = ebm.early_stopping(EbmEarlyStopping::new(rounds, tolerance)?);
                 }
                 BoosterKind::Ebm(ebm.build()?)
             }
@@ -1074,14 +1074,15 @@ impl TrainingParams {
                 set("ebm_outer_bags", json(ebm.outer_bags()));
                 set("ebm_bag_fraction", json(ebm.bag_fraction()));
                 set("ebm_boulevard", json(ebm.boulevard()));
+                // `0` rounds is no early stopping; the tolerance needs it.
+                let stopping = ebm.early_stopping();
                 set(
                     "ebm_early_stopping_rounds",
-                    json(ebm.early_stopping_rounds()),
+                    json(stopping.map_or(0, |s| s.rounds().get())),
                 );
-                set(
-                    "ebm_early_stopping_tolerance",
-                    json(ebm.early_stopping_tolerance()),
-                );
+                if let Some(stopping) = stopping {
+                    set("ebm_early_stopping_tolerance", json(stopping.tolerance()));
+                }
             }
         }
         set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));

@@ -1,0 +1,35 @@
+# Lint and format settings for every Python file in the repository: the
+# bindings (python/), scripts/, release.py, and the Python snippets in
+# Markdown. CI runs `ruff check` and `ruff format --check` from the root.
+line-length = 100
+target-version = "py311"
+# First-party import roots, for import sorting.
+src = ["python/python", "python/tests", "scripts"]
+
+[lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # Pyflakes
+  "I",    # import sorting
+  "B",    # flake8-bugbear
+  "UP",   # pyupgrade
+  "RUF",  # Ruff-specific
+  "PT",   # flake8-pytest-style
+  "NPY",  # NumPy-specific
+  "PERF", # Perflint
+  "C4",   # flake8-comprehensions
+  "PGH",  # pygrep-hooks (no blanket `ty: ignore`)
+  "PLE",  # Pylint errors
+  "PLW",  # Pylint warnings
+  "RET",  # flake8-return
+  "FURB", # refurb
+  "BLE",  # blind `except Exception`
+  "DTZ",  # naive datetimes
+]
+# Not selected: pep8-naming, flake8-builtins, flake8-boolean-trap, and
+# flake8-unused-arguments flag names and signatures the public API takes
+# from scikit-learn (`X`) and XGBoost (`format`, positional flags, callback
+# arguments).
+# Docstrings use math notation (`σ`, the split robustness tolerance).
+allowed-confusables = ["σ"]

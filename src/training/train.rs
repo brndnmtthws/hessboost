@@ -1213,7 +1213,7 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
              intercept alone",
         );
     }
-    if request.params.ebm_settings().early_stopping_rounds() > 0 && request.dtrain.group().is_some()
+    if request.params.ebm_settings().early_stopping().is_some() && request.dtrain.group().is_some()
     {
         return refuse(
             "ebm_early_stopping_rounds",

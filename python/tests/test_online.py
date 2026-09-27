@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import classes, regression
 from numpy.typing import NDArray
 
 import hessboost
+from conftest import classes, regression
 from hessboost import DMatrix, HessboostError
 from hessboost.online import OnlineModel, UpdateReport
 
@@ -119,7 +119,8 @@ def test_a_stopping_callback_abandons_the_update(tolerance: float) -> None:
         return False
 
     report = online.update(binary(10, 7), [0, 1], callback=watch)
-    assert report is not None and calls == list(range(ROUNDS))
+    assert report is not None
+    assert calls == list(range(ROUNDS))
     fresh = OnlineModel.train(PARAMS, binary(300, 6), ROUNDS, tolerance)
     fresh.update(binary(10, 7), [0, 1])
     assert state(online) == state(fresh)
@@ -195,7 +196,7 @@ def test_access_from_the_update_callback_fails_fast(tolerance: float) -> None:
 
     code = _REENTRANT.replace("TOLERANCE", repr(tolerance))
     done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=False
     )
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "ok"
@@ -215,6 +216,28 @@ def test_labels_retraining_refuses_are_refused(tolerance: float) -> None:
     assert state(online) == before
     online.update(DMatrix(x[:3], y[:3]), [0])
     assert online.num_row() == 302
+
+
+def test_approximate_updates_refuse_values_beyond_the_training_bins() -> None:
+    x = np.array([[0.0], [1.0], [np.nan], [np.nan]], dtype=np.float32)
+    params = {**PARAMS, "max_depth": 1}
+    approximate = OnlineModel.train(params, DMatrix(x, [0.0, 0.0, 1.0, 1.0]), 1)
+    before = state(approximate)
+    with pytest.raises(HessboostError, match="additions"):
+        approximate.update(DMatrix([[3.0]], [0.0]), [0])
+    assert state(approximate) == before
+    exact = OnlineModel.train(params, DMatrix(x, [0.0, 0.0, 1.0, 1.0]), 1, 0.0)
+    exact.update(DMatrix([[3.0]], [0.0]), [0])
+    assert exact.num_row() == 4
+
+
+def test_an_update_that_overflows_is_refused() -> None:
+    top = float(np.finfo(np.float32).max)
+    online = OnlineModel.train({"base_score": top}, DMatrix([[0.0]], [top]), 2)
+    before = state(online)
+    with pytest.raises(hessboost.ModelFormatError):
+        online.update(DMatrix([[0.0]], [-top]))
+    assert state(online) == before
 
 
 def test_unsupported_configurations_and_changes_are_refused() -> None:
@@ -243,11 +266,11 @@ def test_unsupported_configurations_and_changes_are_refused() -> None:
         online.update(DMatrix(x[:2]))
     assert state(online) == before
     with pytest.raises(TypeError):
-        online.update(x[:2])  # type: ignore[call-overload]
+        online.update(x[:2])  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
-        online.update(None, [0.5])  # type: ignore[list-item]
+        online.update(None, [0.5])  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
-        OnlineModel.train(PARAMS, dtrain, 3, tolerance="0.1")  # type: ignore[arg-type]
+        OnlineModel.train(PARAMS, dtrain, 3, tolerance="0.1")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
         OnlineModel()
 

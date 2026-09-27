@@ -5,3 +5,4 @@ Cargo.lock
 !/python/Cargo.lock
 /fixtures/**
 __pycache__/
+.ruff_cache/

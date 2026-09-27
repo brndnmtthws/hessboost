@@ -9,7 +9,7 @@ use std::sync::mpsc::{Sender, channel};
 
 use hessboost::config::{
     BoosterKind, Dart, Langevin, LinearTree, ModelShrink, ModelShrinkMode, Monotone, MultiStrategy,
-    TrainingParamsBuilder,
+    QuantizedGrad, TrainingParamsBuilder,
 };
 use hessboost::metric::Metric;
 use hessboost::objective::distributional::{DistFamily, Distributional};
@@ -472,6 +472,34 @@ fn shrunk_models_refuse_non_prefix_selections() {
     );
     assert!(model.predict_contribs_range(&data, ..).is_ok());
     assert!(model.predict_leaf_range(&data, ..4).is_ok());
+}
+
+/// Quantized training's full-precision leaf renewal would be overwritten
+/// by the Langevin leaf re-estimation, so the combination is refused, in
+/// the typed and the flat form; quantized histograms alone are accepted.
+#[test]
+fn langevin_refuses_quantized_leaf_renewal() {
+    let renewed = QuantizedGrad::builder().renew_leaf(true).build().unwrap();
+    for builder in [
+        TrainingParams::builder().langevin(Langevin::default()),
+        TrainingParams::builder().posterior_sampling(true),
+    ] {
+        let quantized = builder.clone().quantized(QuantizedGrad::default());
+        assert!(quantized.build().is_ok());
+        assert_eq!(
+            common::invalid_param(builder.quantized(renewed).build()),
+            "langevin"
+        );
+    }
+    let flat = [
+        ("posterior_sampling", json!(true)),
+        ("use_quantized_grad", json!(true)),
+        ("quant_train_renew_leaf", json!(true)),
+    ];
+    assert_eq!(
+        common::invalid_param(TrainingParams::from_xgboost(flat)),
+        "langevin"
+    );
 }
 
 /// Unsupported or conflicting SGLB settings are refused, never ignored.

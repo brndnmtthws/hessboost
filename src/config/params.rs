@@ -427,7 +427,8 @@ pub struct TrainingParams {
     ///
     /// Needs `booster = gbtree` with one tree per output and iteration
     /// (`num_parallel_tree = 1`); refused with monotone constraints,
-    /// `linear_tree`, `path_smooth` (all of which the re-estimated leaves
+    /// `linear_tree`, `path_smooth`, quantized leaf renewal
+    /// ([`QuantizedGrad::renew_leaf`]; all of which the re-estimated leaves
     /// would bypass), gradient-based sampling (whose row probabilities the
     /// noise would distort), and `process_type = update`.
     pub langevin: Option<Langevin>,
@@ -1090,7 +1091,8 @@ impl TrainingParams {
         if self.langevin_on() {
             // The noise scale assumes one tree carries each output's whole
             // step; the re-estimated leaves would bypass the constraint
-            // bounds, the path-smoothed outputs, and the leaf linear fits.
+            // bounds, the path-smoothed outputs, the leaf linear fits, and
+            // quantized training's renewed leaves.
             ensure(
                 "langevin",
                 self.num_parallel_tree == 1,
@@ -1107,6 +1109,12 @@ impl TrainingParams {
                 "langevin",
                 self.linear_tree.is_none() && self.path_smooth == 0.0,
                 "is not supported with `linear_tree` or `path_smooth`",
+            )?;
+            ensure(
+                "langevin",
+                self.quantized.is_none_or(|q| !q.renew_leaf()),
+                "is not supported with `quant_train_renew_leaf` (the Langevin leaf \
+                 re-estimation would replace the renewed leaves)",
             )?;
             ensure(
                 "langevin",

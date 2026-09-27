@@ -827,14 +827,14 @@ CASES: dict[str, tuple[Callable[..., Any], dict[str, Any], dict[str, Any]]] = {
     # exactly as gbtree -> pointwise
     "dart_nodrop_d4": (
         y_regression,
-        dict(booster="dart", seed=42, max_depth=4),
+        {"booster": "dart", "seed": 42, "max_depth": 4},
         {},
     ),
     # `one_drop`: a round that draws no tree drops one at random
     "dart_one_drop_d4": (
         y_regression,
-        dict(booster="dart", rate_drop=0.05, one_drop=True, seed=42, max_depth=4),
-        dict(tier="quality"),
+        {"booster": "dart", "rate_drop": 0.05, "one_drop": True, "seed": 42, "max_depth": 4},
+        {"tier": "quality"},
     ),
     # continued training (`xgb_model=`), deterministic -> pointwise
     "continue_hist_reg_d6": (y_regression, {}, {"continue_from": 20}),

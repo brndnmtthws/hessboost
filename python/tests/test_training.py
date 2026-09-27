@@ -222,7 +222,8 @@ def test_virtual_ensembles_and_uncertainty() -> None:
     booster = hessboost.train(params, DMatrix(x, y), 40)
     members, iterations = booster.predict_virtual_ensembles(x, 4)
     assert iterations == [25, 30, 35, 40]
-    assert members.dtype == np.float32 and members.shape == (4, 300)
+    assert members.dtype == np.float32
+    assert members.shape == (4, 300)
     # Members are the models after their iterations, the last the whole model.
     np.testing.assert_array_equal(members[-1], booster.predict(x))
     np.testing.assert_array_equal(members[0], booster.predict(x, iteration_range=(0, 25)))
@@ -234,7 +235,8 @@ def test_virtual_ensembles_and_uncertainty() -> None:
     np.testing.assert_allclose(
         u.knowledge, members.astype(np.float64).var(axis=0), rtol=1e-6, atol=1e-12
     )
-    assert u.data is None and u.total is None
+    assert u.data is None
+    assert u.total is None
 
     x, labels = classes(rows=300, n_classes=3)
     softprob = hessboost.train(
@@ -245,8 +247,10 @@ def test_virtual_ensembles_and_uncertainty() -> None:
     probs, _ = softprob.predict_virtual_ensembles(x, 3)
     assert probs.shape == (3, 300, 3)
     u = softprob.predict_uncertainty(x, 3)
-    assert u.mean.shape == (300, 3) and u.knowledge.shape == (300,)
-    assert u.data is not None and u.total is not None
+    assert u.mean.shape == (300, 3)
+    assert u.knowledge.shape == (300,)
+    assert u.data is not None
+    assert u.total is not None
     np.testing.assert_allclose(u.knowledge, u.total - u.data)
     # Multi-label classification: every part is one column per label.
     two_labels = np.stack([labels % 2, labels // 2], axis=1).astype(np.float32)
@@ -254,14 +258,17 @@ def test_virtual_ensembles_and_uncertainty() -> None:
         {"objective": "binary:logistic", "posterior_sampling": True}, DMatrix(x, two_labels), 30
     )
     u = multi_label.predict_uncertainty(x, 3)
-    assert u.data is not None and u.total is not None
+    assert u.data is not None
+    assert u.total is not None
     assert u.mean.shape == u.knowledge.shape == u.data.shape == u.total.shape == (300, 2)
 
     with pytest.raises(HessboostError, match="virtual_ensembles_count"):
         booster.predict_uncertainty(x, 21)
     with pytest.raises(HessboostError, match="at least 1"):
         booster.predict_virtual_ensembles(x, 0)
-    ranker = hessboost.train({"objective": "rank:ndcg"}, DMatrix(x[:40], labels[:40], group=[40]), 4)
+    ranker = hessboost.train(
+        {"objective": "rank:ndcg"}, DMatrix(x[:40], labels[:40], group=[40]), 4
+    )
     with pytest.raises(HessboostError, match="uncertainty is defined"):
         ranker.predict_uncertainty(x[:40], 2)
 

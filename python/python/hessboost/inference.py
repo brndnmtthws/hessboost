@@ -176,9 +176,7 @@ class BoulevardInference:
         retrained on an independent sample."""
         return self._core.reproduction_intervals(self._data(data), _check_alpha(alpha))
 
-    def calibrated_prediction_intervals(
-        self, data: object, *, alpha: float
-    ) -> NDArray[np.float64]:
+    def calibrated_prediction_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
         """Prediction intervals rescaled by one factor chosen on the
         ``holdout`` rows (a split-conformal quantile); needs ``holdout``."""
         return self._core.calibrated_prediction_intervals(self._data(data), _check_alpha(alpha))
@@ -312,6 +310,4 @@ def honest_refit(booster: Booster, data: object, label: ArrayLike | None = None)
     models = ((booster, "the model"),)
     values = _matrix(models, data, label, calibration=True)
     core = _hessboost.honest_refit(booster._model, values)
-    return Booster._wrap(
-        core, booster._feature_names, booster._feature_types, booster._categories
-    )
+    return Booster._wrap(core, booster._feature_names, booster._feature_types, booster._categories)

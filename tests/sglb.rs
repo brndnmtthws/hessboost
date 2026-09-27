@@ -5,10 +5,13 @@
 
 mod common;
 
+use std::sync::mpsc::{Sender, channel};
+
 use hessboost::config::{
     BoosterKind, Dart, Langevin, LinearTree, ModelShrink, ModelShrinkMode, Monotone, MultiStrategy,
     TrainingParamsBuilder,
 };
+use hessboost::metric::Metric;
 use hessboost::objective::distributional::{DistFamily, Distributional};
 use hessboost::objective::{Logistic, Multiclass, Objective};
 use hessboost::prelude::*;
@@ -182,6 +185,137 @@ fn early_stopping_keeps_the_best_iteration_model() {
     );
 }
 
+/// A metric that sends out the predictions training evaluates each round.
+struct Recorder(Sender<Vec<f32>>);
+
+impl Metric for Recorder {
+    fn name(&self) -> &'static str {
+        "recorded"
+    }
+
+    fn eval(&self, preds: &[f32], _labels: &[f32], _weights: Option<&[f32]>) -> f64 {
+        self.0.send(preds.to_vec()).unwrap();
+        0.0
+    }
+}
+
+/// A shrunk model predicts the margins its training evaluated, bit for
+/// bit, after every round: prediction repeats training's shrink-then-add
+/// arithmetic.
+#[test]
+fn predictions_are_the_training_margins() {
+    // One row whose second tree exactly cancels the shrunk intercept:
+    // training reaches margin 0, which a product-weighted sum of the trees
+    // misses by rounding.
+    let one = DMatrix::from_dense(&[0.0], 1, 1)
+        .unwrap()
+        .with_labels(&[0.0])
+        .unwrap();
+    let params = TrainingParams::builder()
+        .base_score(100_663_296.0)
+        .eta(1.0)
+        .lambda(0.0)
+        .model_shrink(shrink(0.7, ModelShrinkMode::Constant))
+        .build()
+        .unwrap();
+    let result = Trainer::new(&params, &one, 2)
+        .eval(&one, "train")
+        .train()
+        .unwrap();
+    assert_eq!(result.history.last().unwrap().scores[0].value, 0.0);
+    assert_eq!(
+        bits(result.model.predict_margin(&one).unwrap()),
+        bits([0.0])
+    );
+
+    let base = || TrainingParams::builder().max_depth(3).eta(0.3).seed(4);
+    let targets: Vec<f32> = (0..300)
+        .flat_map(|i| [(i % 7) as f32 * 1e3, (i % 5) as f32 - 2.0])
+        .collect();
+    let x: Vec<f32> = (0..300).flat_map(common::four_features).collect();
+    let matrix = DMatrix::from_dense(&x, 300, 4)
+        .unwrap()
+        .with_label_matrix(&targets, 2)
+        .unwrap();
+    let cases: Vec<(&str, TrainingParams, DMatrix)> = vec![
+        (
+            "hist posterior sampling",
+            base()
+                .base_score(1234.5)
+                .posterior_sampling(true)
+                .build()
+                .unwrap(),
+            regression(300),
+        ),
+        (
+            "exact decreasing shrinkage",
+            base()
+                .tree_method(TreeMethod::Exact)
+                .model_shrink(shrink(0.4, ModelShrinkMode::Decreasing))
+                .build()
+                .unwrap(),
+            regression(300),
+        ),
+        (
+            "shrinkage alone, boosted forest",
+            base()
+                .model_shrink(shrink(0.5, ModelShrinkMode::Constant))
+                .num_parallel_tree(2)
+                .subsample(0.7)
+                .build()
+                .unwrap(),
+            regression(300),
+        ),
+        (
+            "shrinkage alone, linear leaves",
+            base()
+                .model_shrink(shrink(0.5, ModelShrinkMode::Constant))
+                .linear_tree(LinearTree::default())
+                .build()
+                .unwrap(),
+            regression(300),
+        ),
+        (
+            "vector leaves over a label matrix",
+            base()
+                .multi_strategy(MultiStrategy::MultiOutputTree)
+                .posterior_sampling(true)
+                .build()
+                .unwrap(),
+            matrix.clone(),
+        ),
+        (
+            "scalar trees over a label matrix",
+            base().posterior_sampling(true).build().unwrap(),
+            matrix,
+        ),
+    ];
+    let rounds = 12;
+    for (name, params, data) in cases {
+        let (tx, rx) = channel();
+        let model = Trainer::new(&params, &data, rounds)
+            .eval(&data, "train")
+            .custom_metric(Box::new(Recorder(tx)))
+            .train()
+            .unwrap()
+            .model;
+        let seen: Vec<Vec<f32>> = rx.try_iter().collect();
+        assert_eq!(seen.len(), rounds, "{name}");
+        for (k, margins) in seen.iter().enumerate() {
+            assert_eq!(
+                bits(model.predict_margin_range(&data, ..=k).unwrap()),
+                bits(margins),
+                "{name}: after round {k}"
+            );
+        }
+        assert_eq!(
+            bits(model.predict_margin(&data).unwrap()),
+            bits(&seen[rounds - 1]),
+            "{name}"
+        );
+    }
+}
+
 /// The Langevin draws are keyed by seed, iteration, and row or leaf, so the
 /// model does not depend on the thread count; the seed does change it.
 #[test]
@@ -213,8 +347,10 @@ fn langevin_training_is_thread_count_independent() {
     assert_ne!(serial, train(&plain, &data, 6).unwrap().to_bytes().unwrap());
 }
 
-/// Every format keeps a shrunk model's predictions, and the native ones
-/// keep its truncations; an inconsistent shrinkage record is refused.
+/// Every format keeps a shrunk model's predictions (the native and compact
+/// ones bit for bit, XGBoost's closed form within `f32` rounding), and the
+/// native ones keep its truncations; an inconsistent shrinkage record is
+/// refused.
 #[test]
 fn shrunk_models_round_trip() {
     let data = regression(200);
@@ -224,7 +360,8 @@ fn shrunk_models_round_trip() {
         .build()
         .unwrap();
     let model = train(&params, &data, 12).unwrap();
-    let margins = bits(model.predict_margin(&data).unwrap());
+    let margin = model.predict_margin(&data).unwrap();
+    let margins = bits(&margin);
     let prefix = bits(model.predict_margin_range(&data, ..5).unwrap());
     for restored in [
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
@@ -237,13 +374,27 @@ fn shrunk_models_round_trip() {
         );
     }
     let xgboost = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
-    assert_eq!(bits(xgboost.predict_margin(&data).unwrap()), margins);
+    for (&x, &m) in xgboost
+        .predict_margin(&data)
+        .unwrap()
+        .as_slice()
+        .iter()
+        .zip(margin.as_slice())
+    {
+        assert!((x - m).abs() <= 1e-5 * m.abs().max(1.0), "{x} vs {m}");
+    }
     let compact = model.to_compact().unwrap();
     assert_eq!(bits(compact.predict_margin(&data).unwrap()), margins);
+    let compact = hessboost::model::compact::CompactModel::from_bytes(&compact.to_bytes()).unwrap();
+    assert_eq!(bits(compact.predict_margin(&data).unwrap()), margins);
+    let offset = regression(200).with_base_margin(&[0.5; 200]).unwrap();
+    assert_eq!(
+        bits(compact.predict_margin(&offset).unwrap()),
+        bits(model.predict_margin(&offset).unwrap())
+    );
     // SHAP attributes the weighted trees: each row's contributions sum to
     // its margin.
     let contribs = model.predict_contribs(&data).unwrap();
-    let margin = model.predict_margin(&data).unwrap();
     for (row, &m) in margin.as_slice().iter().enumerate() {
         let sum: f32 = contribs.get(row, 0).unwrap().iter().sum();
         assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");

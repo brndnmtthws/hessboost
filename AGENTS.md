@@ -139,7 +139,7 @@ Fix findings rather than suppress them.
 |`training/`|`api` (public `Trainer`, `train`, `TrainResult`, `EvalHistory` with its borrowed `RoundEval` rows), `train` (validation, booster dispatch, the tree loop: gbtree, DART, gblinear, forests), `prepare` (`TrainContext`, per-`tree_method` builder state; `approx` = hist with per-round weighted cuts), `round` (one iteration's trees; `process_type=update` refresh), `eval` (eval sets, metrics, `EarlyStopping`, `RoundReporter`: scores → stopping → `on_round`), `margins` (`MarginCaches`, `add_tree_margins`, shared with the online replay), `dart` (dropout, per-round RNG), `row_sampling` (`bernoulli_rows`, the Bernoulli primitive every row sampler draws with, incl. EBM's; uniform, class-balanced, and query-level rows; column samplers), `validate` (request and dataset checks), `boulevard` (BRAT-D/BRAT-P `Recursion`, shared with the honest refit), `ebm/` (`mod.rs`: dispatch and shared stage helpers; `classic` (cyclic EBM with outer bags), `boulevard` (Boulevard EBM stages on the same `Recursion`), `fast` (FAST pair ranking)), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv/` (`mod.rs`: `CrossValidation`, aggregation; `fold`: `Fold` builders incl. `purged_forward`), `budget` (public), `online/` (public: in-place row addition/deletion; exact mode = retraining. `mod.rs`: `OnlineModel`, `OnlineParams`/`OnlineMode`, `check_supported`, `compose`; `cache`: the approximate mode's per-tree gradients and per-node histograms, replayed from a model; `update`: the incremental top-down regrow with split robustness tolerance and lazy gradients, the loss run only on the `GRADIENT_BLOCK_ROWS` blocks holding fresh rows)|
 |`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `EbmInference`, `TermBands`, `honest_refit`); `kernel` (the `Kernel` trait the solvers read; leaf kernel over the training rows), `term_kernel` (a Boulevard EBM stage's centered additive kernel, computed on term grids), `solver` (exact Cholesky or Nyström ridge solves, Gram or solution vectors), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`, Boulevard models and Boulevard EBMs), `ebm` (shape-function bands)|
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means; crate-private `stages`, the Boulevard stage layout validation, inference, and refit share), `shape_functions`, `term_shape`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds and category sets, leaves as boxes, difference arrays)|
-|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
+|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `container` (`ContainerSpec`: the magic/version/checksum framing, zstd packing and expansion bound shared by `HBM`, `HBDM` and `HBFF`; embedded-model blobs), `native`, `sections` (shared by every container and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `Samples`, `Quantiles`), `format` (`HBDM` container embedding native GBDT containers; JSON), `forest/` (public, ForestFlow/ForestDiffusion: per-level GBDTs, generation, RePaint imputation; `format`: `HBFF`)|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
@@ -228,9 +228,10 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   parity fixtures that set them otherwise fail.
 - **Formats:** every file written since 0.2.0 loads in every later release;
   0.1.x files are refused.
-  - Native binary (`model/native.rs`): zstd frame of magic `HBM\0` (0.1.x's
-    `SQB\0` is refused by name), `CONTAINER_VERSION` byte (3), section table
-    (`model/sections.rs`), XXH64 of the preceding bytes. A new stored field
+  - Native binary (`model/native.rs`, framed by `model/container.rs`):
+    zstd frame of magic `HBM\0` (0.1.x's `SQB\0` is refused by name),
+    `CONTAINER_VERSION` byte (3), section table (`model/sections.rs`), XXH64
+    of the preceding bytes. A new stored field
     is a new section: flag it `REQUIRED` if unaware readers must refuse
     rather than skip it, and default its absence to reproduce older files
     (objective parameters: the objective's defaults; the optional
@@ -268,8 +269,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     shrinkage. Writers emit every field.
   - Compact (`HBTD`, `model/compact.rs`): section-table metadata; a bit
     stream change bumps its version byte (1).
-  - Diffusion (`HBDM`, `diffusion/format.rs`): the native container framing
-    (`model::native::frame`, `section_table`) with its own magic and version
+  - Diffusion (`HBDM`, `diffusion/format.rs`): the shared container framing
+    (a `model::container::ContainerSpec`) with its own magic and version
     byte (1), the same section rules, and the GBDTs embedded as uncompressed
     native containers; its JSON validates through `UncheckedDiffusionModel`.
   - Forest (`HBFF`, `diffusion/forest/format.rs`): the same framing, version byte (1), GBDTs concatenated in `[class][level][column]` order; JSON validates through `UncheckedForestModel`.

@@ -337,6 +337,7 @@
 //! [`load_xgboost_ubjson`]: BoostedModel::load_xgboost_ubjson
 
 pub mod compact;
+pub(crate) mod container;
 mod lightgbm;
 pub(crate) mod native;
 mod objective;

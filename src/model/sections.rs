@@ -35,6 +35,12 @@ impl Writer {
         self.push(name, flags, payload.to_vec());
     }
 
+    /// [`Writer::raw`] taking ownership of `payload` (a large blob, such
+    /// as embedded models), without copying it.
+    pub(crate) fn raw_owned(&mut self, name: &'static str, flags: u8, payload: Vec<u8>) {
+        self.push(name, flags, payload);
+    }
+
     pub(crate) fn str(&mut self, name: &'static str, value: &str) {
         self.raw(name, REQUIRED, value.as_bytes());
     }
@@ -238,4 +244,10 @@ pub(crate) fn format_error(msg: impl Into<String>) -> HessboostError {
 /// size it.
 pub(crate) fn wrong_length(name: &str) -> HessboostError {
     format_error(format!("section `{name}` has the wrong length"))
+}
+
+/// The error for a known section holding a value this version does not
+/// define.
+pub(crate) fn unknown_value(name: &str, value: &str) -> HessboostError {
+    format_error(format!("unknown `{name}` value `{value}`"))
 }

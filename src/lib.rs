@@ -68,8 +68,12 @@
 //!
 //! ## What's here
 //!
-//! - **Boosters:** `gbtree`, `dart`, `gblinear`, boosted random forests
-//!   (`num_parallel_tree`).
+//! - **Boosters:** [`BoosterKind::GbTree`](config::BoosterKind::GbTree),
+//!   [`BoosterKind::Dart`](config::BoosterKind::Dart),
+//!   [`BoosterKind::GbLinear`](config::BoosterKind::GbLinear), boosted random
+//!   forests (`num_parallel_tree`),
+//!   [`BoosterKind::Boulevard`](config::BoosterKind::Boulevard), and
+//!   [`BoosterKind::Ebm`](config::BoosterKind::Ebm).
 //! - **Lifecycle:** continued training and `process_type=update` refresh
 //!   ([`Trainer::init_model`](training::Trainer::init_model)), a per-round
 //!   hook for progress, custom stopping, and cancellation

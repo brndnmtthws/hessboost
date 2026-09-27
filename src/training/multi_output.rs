@@ -4,8 +4,8 @@
 //! gradients supplied by the objective ([`Loss::split_gradient`]).
 
 use super::train::{
-    MarginCaches, RowMeta, TrainContext, TreeOutput, dart_new_tree_weight, finish_dart,
-    gradient_sampling, iteration_row_subsets, make_column_sampler, round_gradients, tree_eta,
+    MarginCaches, TrainContext, TreeOutput, dart_new_tree_weight, finish_dart, gradient_sampling,
+    iteration_row_subsets, make_column_sampler, round_gradients, tree_eta,
 };
 use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMethod};
 use crate::data::ghist::GHistIndex;
@@ -137,8 +137,7 @@ pub(super) fn boost_round(
     };
     // The row samples, all drawn before the trees: one per parallel tree
     // under uniform sampling, else one all-rows subset they share.
-    let row_subsets =
-        iteration_row_subsets(n, params, false, RowMeta::of(ctx.run.dtrain), &mut rng);
+    let row_subsets = iteration_row_subsets(n, params, false, ctx.run.rows, &mut rng);
     for p in 0..params.num_parallel_tree {
         let rows = &row_subsets[p % row_subsets.len()];
         let (tree, leaf_rows) = fit_tree(ctx, &grads, &mut rng, rows)?;

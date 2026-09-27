@@ -37,6 +37,8 @@ pub(super) struct TrainContext<'a> {
     pub(super) info: &'a MetaInfo<'a>,
     pub(super) objective: &'a dyn Loss,
     pub(super) langevin: Option<&'a Langevin>,
+    /// What row sampling reads of `dtrain`, gathered once per run.
+    pub(super) rows: RowMeta<'a>,
 }
 
 /// The gradients one tree grows on and the rows that take part: an output's
@@ -752,6 +754,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
         info: &info,
         objective,
         langevin: sglb.langevin.as_ref(),
+        rows: RowMeta::of(dtrain, params),
     };
     let mut state = RoundState {
         model,
@@ -1137,13 +1140,8 @@ fn grow_round(
 
     // 2. Row subsets (uniform, class-balanced, or by query), drawn before
     //    the trees and shared across the per-output fits.
-    let row_subsets = iteration_row_subsets(
-        n,
-        params,
-        prepared.samples_per_forest(),
-        RowMeta::of(dtrain),
-        &mut rng,
-    );
+    let row_subsets =
+        iteration_row_subsets(n, params, prepared.samples_per_forest(), run.rows, &mut rng);
     // An output's gradient-based sample, when its whole forest shares one.
     let mut forest_sample = None;
     let forest_indices = prepared.forest_indices(n_out, parallel);
@@ -2038,7 +2036,7 @@ fn quantization_seed(params: &TrainingParams, rng: &mut Rng) -> u64 {
 pub(super) fn sample_rows(
     n: usize,
     params: &TrainingParams,
-    labels: &[f32],
+    meta: RowMeta<'_>,
     rng: &mut Rng,
 ) -> Vec<u32> {
     if params.sampling_method == SamplingMethod::GradientBased {
@@ -2052,8 +2050,8 @@ pub(super) fn sample_rows(
         };
     };
     let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
-    let labels = &labels[..n];
-    let positives = labels.iter().filter(|&&label| label == 1.0).count();
+    let labels = &meta.labels[..n];
+    let positives = meta.positives;
     let mut rows = with_sample_capacity(positives as f64 * pos + (n - positives) as f64 * neg);
     rows.extend((0..n as u32).filter(|&row| {
         let fraction = if labels[row as usize] == 1.0 {
@@ -2086,19 +2084,31 @@ fn bernoulli_sample(n: usize, fraction: f64, rng: &mut Rng) -> Vec<u32> {
     kept
 }
 
-/// The training metadata row sampling reads: the labels (class-balanced
-/// bagging) and the query groups (query bagging).
+/// The training metadata row sampling reads: the labels and their count
+/// of positives (class-balanced bagging) and the query groups (query
+/// bagging). Built once per training run, so no draw rescans the labels.
 #[derive(Clone, Copy)]
 pub(super) struct RowMeta<'a> {
     labels: &'a [f32],
+    /// Rows labelled `1`, counted only under class-balanced bagging (it
+    /// sizes each draw's row buffer).
+    positives: usize,
     group: Option<&'a GroupInfo>,
 }
 
 impl<'a> RowMeta<'a> {
-    /// `data`'s labels (empty without any) and query groups.
-    pub(super) fn of(data: &'a DMatrix) -> Self {
+    /// `data`'s labels (empty without any), their positives when `params`
+    /// bags by class, and its query groups.
+    pub(super) fn of(data: &'a DMatrix, params: &TrainingParams) -> Self {
+        let labels = data.labels().unwrap_or_default();
+        let positives = if params.balanced_bagging.is_some() {
+            labels.iter().filter(|&&label| label == 1.0).count()
+        } else {
+            0
+        };
         RowMeta {
-            labels: data.labels().unwrap_or_default(),
+            labels,
+            positives,
             group: data.group(),
         }
     }
@@ -2130,7 +2140,7 @@ pub(super) fn iteration_row_subsets(
     };
     let Some(bagging) = params.bagging_by_query else {
         return (0..draws)
-            .map(|_| sample_rows(n, params, meta.labels, rng))
+            .map(|_| sample_rows(n, params, meta, rng))
             .collect();
     };
     let queries: Vec<(usize, usize)> = meta
@@ -2315,6 +2325,7 @@ mod tests {
                     false,
                     RowMeta {
                         labels: &[],
+                        positives: 0,
                         group: Some(&group),
                     },
                     &mut Rng::new(41),
@@ -2348,7 +2359,12 @@ mod tests {
             .seed(53)
             .build()
             .unwrap();
-        let selected = sample_rows(labels.len(), &params, &labels, &mut Rng::new(77));
+        let meta = |labels| RowMeta {
+            labels,
+            positives: labels.iter().filter(|&&label| label == 1.0).count(),
+            group: None,
+        };
+        let selected = sample_rows(labels.len(), &params, meta(&labels), &mut Rng::new(77));
         let positives = selected
             .iter()
             .filter(|&&row| labels[row as usize] == 1.0)
@@ -2363,7 +2379,7 @@ mod tests {
         );
         // Without positives the negative fraction still applies.
         let negatives_only = vec![0.0f32; 20_000];
-        let kept = sample_rows(20_000, &params, &negatives_only, &mut Rng::new(77)).len();
+        let kept = sample_rows(20_000, &params, meta(&negatives_only), &mut Rng::new(77)).len();
         assert!(
             (1_840..2_160).contains(&kept),
             "kept {kept} of 20000 negatives"

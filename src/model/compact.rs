@@ -2008,7 +2008,7 @@ mod tests {
         let params = TrainingParams::builder().build().unwrap();
         let model = Trainer::new(&params, &data, 50)
             .eval(&valid, "valid")
-            .early_stopping_rounds(3)
+            .early_stopping_rounds(std::num::NonZeroUsize::new(3).unwrap())
             .train()
             .unwrap()
             .model;

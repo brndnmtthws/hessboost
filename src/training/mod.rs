@@ -23,6 +23,6 @@ mod sglb;
 mod train;
 mod validate;
 
-pub use api::{RoundEval, Score, TrainResult, Trainer, train};
-pub use cv::{CrossValidation, CvResult, Fold, cv};
+pub use api::{EvalHistory, RoundEval, TrainResult, Trainer, train};
+pub use cv::{CrossValidation, CvResult, CvRound, Fold, cv};
 pub(crate) use multi_output::reject_split_gradient;

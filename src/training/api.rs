@@ -9,41 +9,177 @@ use crate::data::DMatrix;
 use crate::error::Result;
 use crate::metric::Metric;
 use crate::model::BoostedModel;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
-/// One row of the evaluation history: the metric values computed at the end of
-/// a boosting round.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct RoundEval {
-    /// The 0-based boosting iteration of the model (after continued training,
-    /// counted from the start of the initial model).
-    pub iteration: usize,
-    /// Every eval set's metric values, in eval-set order and, within a set,
-    /// in metric order (a [`Trainer::custom_metric`] last).
-    pub scores: Vec<Score>,
+/// The evaluation history of a training run: every eval set's metric values
+/// after each boosting round, stored once per round as a
+/// `[dataset][metric]` block of values with the names kept once.
+///
+/// Rounds are contiguous: round `r` of [`rounds`](Self::rounds) is the
+/// model's iteration [`first_iteration`](Self::first_iteration)` + r`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EvalHistory {
+    datasets: Vec<String>,
+    metrics: Vec<String>,
+    first_iteration: usize,
+    /// `[round][dataset][metric]`.
+    values: Vec<f64>,
 }
 
-impl RoundEval {
-    /// The value of `metric` on the eval set named `dataset`, if recorded.
-    pub fn score(&self, dataset: &str, metric: &str) -> Option<f64> {
-        self.scores
-            .iter()
-            .find(|score| score.dataset == dataset && score.metric == metric)
-            .map(|score| score.value)
+impl EvalHistory {
+    /// An empty history of `datasets` × `metrics` whose first round will be
+    /// iteration `first_iteration`.
+    pub(super) fn new(datasets: Vec<String>, metrics: Vec<String>, first_iteration: usize) -> Self {
+        EvalHistory {
+            datasets,
+            metrics,
+            first_iteration,
+            values: Vec::new(),
+        }
+    }
+
+    /// Append one round's values, `[dataset][metric]`.
+    pub(super) fn push_round(&mut self, values: impl IntoIterator<Item = f64>) {
+        let before = self.values.len();
+        self.values.extend(values);
+        debug_assert_eq!(self.values.len() - before, self.round_width());
+    }
+
+    /// The eval sets' names, in [`Trainer::eval`] order.
+    pub fn datasets(&self) -> &[String] {
+        &self.datasets
+    }
+
+    /// The metrics' names (XGBoost's `evals_result` keys, `rmse`,
+    /// `ndcg@5`), in the order every eval set reports them (a
+    /// [`Trainer::custom_metric`] last).
+    pub fn metrics(&self) -> &[String] {
+        &self.metrics
+    }
+
+    /// The model iteration of the first recorded round (after continued
+    /// training, counted from the start of the initial model).
+    pub fn first_iteration(&self) -> usize {
+        self.first_iteration
+    }
+
+    /// The number of recorded rounds.
+    pub fn len(&self) -> usize {
+        match self.round_width() {
+            0 => 0,
+            width => self.values.len() / width,
+        }
+    }
+
+    /// Whether no round was recorded (always so without eval sets).
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// The recorded rounds, in order.
+    pub fn rounds(&self) -> impl ExactSizeIterator<Item = RoundEval<'_>> + DoubleEndedIterator {
+        (0..self.len()).map(|round| self.view(round))
+    }
+
+    /// The recorded round of model iteration `iteration`, if any.
+    pub fn round(&self, iteration: usize) -> Option<RoundEval<'_>> {
+        let round = iteration.checked_sub(self.first_iteration)?;
+        (round < self.len()).then(|| self.view(round))
+    }
+
+    /// The last recorded round, if any.
+    pub fn last(&self) -> Option<RoundEval<'_>> {
+        self.len().checked_sub(1).map(|round| self.view(round))
+    }
+
+    /// The value of `metric` on the eval set named `dataset` in every
+    /// recorded round, in order; `None` when either name is not recorded.
+    pub fn series(
+        &self,
+        dataset: &str,
+        metric: &str,
+    ) -> Option<impl ExactSizeIterator<Item = f64> + '_> {
+        let cell = self.cell(dataset, metric)?;
+        let width = self.round_width();
+        Some((0..self.len()).map(move |round| self.values[round * width + cell]))
+    }
+
+    /// Values per round: one per (eval set, metric).
+    fn round_width(&self) -> usize {
+        self.datasets.len() * self.metrics.len()
+    }
+
+    /// The position of (`dataset`, `metric`) within a round's values.
+    fn cell(&self, dataset: &str, metric: &str) -> Option<usize> {
+        let d = self.datasets.iter().position(|name| name == dataset)?;
+        let m = self.metrics.iter().position(|name| name == metric)?;
+        Some(d * self.metrics.len() + m)
+    }
+
+    /// The view of recorded round `round` (0-based).
+    fn view(&self, round: usize) -> RoundEval<'_> {
+        let width = self.round_width();
+        RoundEval {
+            iteration: self.first_iteration + round,
+            history: Some(self),
+            values: &self.values[round * width..(round + 1) * width],
+        }
     }
 }
 
-/// One metric value on one eval set in a [`RoundEval`].
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct Score {
-    /// The eval set's name, as passed to [`Trainer::eval`].
-    pub dataset: String,
-    /// The metric's name: XGBoost's `evals_result` key (`rmse`, `ndcg@5`).
-    pub metric: String,
-    /// The metric's value.
-    pub value: f64,
+/// One round of an [`EvalHistory`], borrowed: the metric values computed at
+/// the end of a boosting round, which [`Trainer::on_round`] also sees.
+#[derive(Debug, Clone, Copy)]
+pub struct RoundEval<'a> {
+    iteration: usize,
+    /// The history holding the names (`None` for a round without eval sets).
+    history: Option<&'a EvalHistory>,
+    /// `[dataset][metric]`.
+    values: &'a [f64],
+}
+
+impl<'a> RoundEval<'a> {
+    /// A round without eval sets: no values.
+    pub(super) fn unscored(iteration: usize) -> Self {
+        RoundEval {
+            iteration,
+            history: None,
+            values: &[],
+        }
+    }
+
+    /// The 0-based boosting iteration of the model (after continued training,
+    /// counted from the start of the initial model).
+    pub fn iteration(&self) -> usize {
+        self.iteration
+    }
+
+    /// Every eval set's metric values, in eval-set order and, within a set,
+    /// in [`EvalHistory::metrics`] order (empty without eval sets). The last
+    /// one is the early-stopping metric's on the last eval set.
+    pub fn values(&self) -> &'a [f64] {
+        self.values
+    }
+
+    /// The value of `metric` on the eval set named `dataset`, if recorded.
+    pub fn score(&self, dataset: &str, metric: &str) -> Option<f64> {
+        let cell = self.history?.cell(dataset, metric)?;
+        Some(self.values[cell])
+    }
+
+    /// Every `(dataset, metric, value)`, in [`values`](Self::values) order.
+    pub fn scores(&self) -> impl Iterator<Item = (&'a str, &'a str, f64)> + 'a {
+        let (datasets, metrics): (&[String], &[String]) = match self.history {
+            Some(history) => (&history.datasets, &history.metrics),
+            None => (&[], &[]),
+        };
+        datasets
+            .iter()
+            .flat_map(move |dataset| metrics.iter().map(move |metric| (dataset, metric)))
+            .zip(self.values)
+            .map(|((dataset, metric), &value)| (dataset.as_str(), metric.as_str(), value))
+    }
 }
 
 /// The result of [`Trainer::train`]: the model plus the per-round evaluation
@@ -53,11 +189,11 @@ pub struct Score {
 pub struct TrainResult {
     /// The trained model.
     pub model: BoostedModel,
-    /// Evaluation history (empty when no eval sets were supplied). Each
-    /// entry's `iteration` is the model's absolute iteration index, which
-    /// after continued training starts at the initial model's
+    /// Evaluation history (empty when no eval sets were supplied). Its
+    /// iterations are the model's absolute iteration indices, which after
+    /// continued training start at the initial model's
     /// [`num_boost_rounds`](BoostedModel::num_boost_rounds).
-    pub history: Vec<RoundEval>,
+    pub history: EvalHistory,
     /// With [`early_stopping_rounds`](Trainer::early_stopping_rounds), the
     /// watched metric's value at the model's
     /// [`best_iteration`](BoostedModel::best_iteration) (XGBoost's
@@ -83,6 +219,7 @@ pub fn train(
 ///
 /// ```
 /// use hessboost::prelude::*;
+/// use std::num::NonZeroUsize;
 ///
 /// # fn main() -> Result<()> {
 /// let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
@@ -92,7 +229,7 @@ pub fn train(
 ///
 /// let result = Trainer::new(&params, &dtrain, 100)
 ///     .eval(&dvalid, "valid")
-///     .early_stopping_rounds(5)
+///     .early_stopping_rounds(NonZeroUsize::new(5).unwrap())
 ///     .train()?;
 /// assert!(!result.history.is_empty());
 ///
@@ -110,14 +247,14 @@ pub struct Trainer<'a> {
     pub(super) dtrain: &'a DMatrix,
     pub(super) num_boost_round: usize,
     pub(super) evals: Vec<EvalSet<'a>>,
-    pub(super) early_stopping_rounds: Option<usize>,
+    pub(super) early_stopping_rounds: Option<NonZeroUsize>,
     pub(super) metric: Option<Box<dyn Metric>>,
     pub(super) init_model: Option<&'a BoostedModel>,
     pub(super) on_round: Option<RoundHook<'a>>,
 }
 
 /// The per-round hook of [`Trainer::on_round`].
-pub(super) type RoundHook<'a> = Box<dyn FnMut(&RoundEval) -> ControlFlow<()> + Send + 'a>;
+pub(super) type RoundHook<'a> = Box<dyn FnMut(RoundEval<'_>) -> ControlFlow<()> + Send + 'a>;
 
 impl<'a> Trainer<'a> {
     /// Train on `dtrain` for (at most) `num_boost_round` iterations with
@@ -147,7 +284,7 @@ impl<'a> Trainer<'a> {
     /// Stop when the watched metric fails to improve for `rounds`
     /// consecutive rounds. As in XGBoost, the watched metric is the **last**
     /// metric of the **last** eval set. Needs at least one
-    /// [`eval`](Self::eval) set and `rounds > 0`.
+    /// [`eval`](Self::eval) set.
     ///
     /// The model's [`best_iteration`](BoostedModel::best_iteration) and
     /// [`TrainResult::best_score`] record the best round whether training
@@ -168,7 +305,7 @@ impl<'a> Trainer<'a> {
     /// iteration indices of the continued model (XGBoost's `starting_round`
     /// offset).
     #[must_use]
-    pub fn early_stopping_rounds(mut self, rounds: usize) -> Self {
+    pub fn early_stopping_rounds(mut self, rounds: NonZeroUsize) -> Self {
         self.early_stopping_rounds = Some(rounds);
         self
     }
@@ -231,8 +368,8 @@ impl<'a> Trainer<'a> {
     /// Call `hook` after every boosting round, once the round's eval sets
     /// are scored: progress reporting, custom stopping rules, or
     /// cancellation. It runs on the training thread, in round order, and
-    /// sees the round as [`TrainResult::history`] records it (with empty
-    /// `scores` when there are no eval sets). Returning
+    /// sees the round as [`TrainResult::history`] records it (with no
+    /// [`values`](RoundEval::values) when there are no eval sets). Returning
     /// [`ControlFlow::Break`] ends training after that round; the result
     /// keeps every completed round and is otherwise what training for that
     /// many rounds would have produced.
@@ -267,8 +404,8 @@ impl<'a> Trainer<'a> {
     /// let mut seen = Vec::new();
     /// let result = Trainer::new(&params, &dtrain, 100)
     ///     .on_round(|round| {
-    ///         seen.push(round.iteration);
-    ///         if round.iteration == 4 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+    ///         seen.push(round.iteration());
+    ///         if round.iteration() == 4 { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
     ///     })
     ///     .train()?;
     /// assert_eq!(result.model.num_boost_rounds(), 5);
@@ -277,7 +414,10 @@ impl<'a> Trainer<'a> {
     /// # }
     /// ```
     #[must_use]
-    pub fn on_round(mut self, hook: impl FnMut(&RoundEval) -> ControlFlow<()> + Send + 'a) -> Self {
+    pub fn on_round(
+        mut self,
+        hook: impl FnMut(RoundEval<'_>) -> ControlFlow<()> + Send + 'a,
+    ) -> Self {
         self.on_round = Some(Box::new(hook));
         self
     }

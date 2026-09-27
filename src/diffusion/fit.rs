@@ -81,7 +81,7 @@ pub(super) fn fit(params: &DiffusionParams, data: &DMatrix) -> Result<DiffusionM
             let dval = set.build(val_rows, 1, &mut rng, &mut normal)?;
             Trainer::new(&params.training, &dtrain, params.num_boost_round.get())
                 .eval(&dval, "valid")
-                .early_stopping_rounds(stop.rounds.get())
+                .early_stopping_rounds(stop.rounds)
                 .train()?
                 .model
         }

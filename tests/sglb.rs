@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::num::NonZeroUsize;
 use std::sync::mpsc::{Sender, channel};
 
 use hessboost::config::{
@@ -168,7 +169,7 @@ fn early_stopping_keeps_the_best_iteration_model() {
         .unwrap();
     let result = Trainer::new(&params, &data, 200)
         .eval(&valid, "valid")
-        .early_stopping_rounds(3)
+        .early_stopping_rounds(NonZeroUsize::new(3).unwrap())
         .train()
         .unwrap();
     let model = result.model;
@@ -219,7 +220,7 @@ fn predictions_are_the_training_margins() {
         .eval(&one, "train")
         .train()
         .unwrap();
-    assert_eq!(result.history.last().unwrap().scores[0].value, 0.0);
+    assert_eq!(result.history.last().unwrap().values()[0], 0.0);
     assert_eq!(
         bits(result.model.predict_margin(&one).unwrap()),
         bits([0.0])

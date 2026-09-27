@@ -121,40 +121,43 @@
 //! # }
 //! ```
 
+mod cache;
+mod update;
+
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
+use self::cache::Cache;
+use self::update::Incremental;
 use super::api::{RoundEval, Trainer};
 use super::eval::configured_metrics;
-use super::margins::{TreeOutput, add_tree_margins};
 use super::train::{initial_intercepts, with_thread_pool};
 use super::validate::{validate_trained_model, validate_training_data};
 use crate::config::{
     BoosterKind, Device, GrowPolicy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
 };
-use crate::data::ghist::{Bins, GHistIndex};
 use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::objective::{GradPair, Loss, Objective};
-use crate::tree::builder::HistTreeBuilder;
-use crate::tree::builder::online::rank_split;
-use crate::tree::gain::{GradStats, RegParams, calc_weight};
-use crate::tree::sampler::ColumnSampler;
-use crate::tree::{ChildLeaf, RegTree, SplitRule};
+use crate::objective::Objective;
+use crate::tree::RegTree;
 
-/// Settings of [`OnlineModel`]: the exact mode ([`Self::exact`], see the
-/// [module docs](self#exactness)) or the approximate one with a split
-/// robustness tolerance ([`Self::approximate`]). The default is approximate
-/// at `0.1`, the paper's recommendation.
+/// Settings of [`OnlineModel`]: its [`OnlineMode`], the exact mode
+/// ([`Self::exact`], see the [module docs](self#exactness)) or the
+/// approximate one with a split robustness tolerance
+/// ([`Self::approximate`]). The default is approximate at `0.1`, the
+/// paper's recommendation.
 ///
 /// ```
-/// use hessboost::training::online::OnlineParams;
+/// use hessboost::training::online::{OnlineMode, OnlineParams};
 ///
 /// # fn main() -> hessboost::error::Result<()> {
-/// assert_eq!(OnlineParams::default().tolerance(), Some(0.1));
-/// assert_eq!(OnlineParams::exact().tolerance(), None);
+/// let OnlineMode::Approximate { tolerance, .. } = OnlineParams::default().mode() else {
+///     unreachable!("the default is approximate");
+/// };
+/// assert_eq!(tolerance, 0.1);
+/// assert_eq!(OnlineParams::exact().mode(), OnlineMode::Exact);
 /// // The exact mode is `exact()`, not a tolerance of 0.
 /// assert!(OnlineParams::approximate(0.0).is_err());
 /// # Ok(())
@@ -162,13 +165,31 @@ use crate::tree::{ChildLeaf, RegTree, SplitRule};
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OnlineParams {
-    tolerance: Option<f64>,
+    mode: OnlineMode,
+}
+
+/// How an [`OnlineModel`] updates (see the [module docs](self#exactness)),
+/// read from [`OnlineParams::mode`]; built by [`OnlineParams::exact`] and
+/// [`OnlineParams::approximate`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum OnlineMode {
+    /// Every update reproduces retraining bit for bit, at about its cost.
+    Exact,
+    /// Splits ranked within the tolerance are kept, the rest regrown, on the
+    /// original training's bins and intercept, with lazily refreshed
+    /// gradients.
+    #[non_exhaustive]
+    Approximate {
+        /// The split robustness tolerance `σ`, in `(0, 1]`.
+        tolerance: f64,
+    },
 }
 
 impl Default for OnlineParams {
     fn default() -> Self {
         OnlineParams {
-            tolerance: Some(0.1),
+            mode: OnlineMode::Approximate { tolerance: 0.1 },
         }
     }
 }
@@ -176,7 +197,9 @@ impl Default for OnlineParams {
 impl OnlineParams {
     /// The exact mode: every update reproduces retraining bit for bit.
     pub fn exact() -> Self {
-        OnlineParams { tolerance: None }
+        OnlineParams {
+            mode: OnlineMode::Exact,
+        }
     }
 
     /// The approximate mode with split robustness tolerance `σ` in
@@ -197,13 +220,19 @@ impl OnlineParams {
             ));
         }
         Ok(OnlineParams {
-            tolerance: Some(tolerance),
+            mode: OnlineMode::Approximate { tolerance },
         })
     }
 
-    /// The split robustness tolerance, `None` in the exact mode.
-    pub fn tolerance(&self) -> Option<f64> {
-        self.tolerance
+    /// The update mode.
+    pub fn mode(&self) -> OnlineMode {
+        self.mode
+    }
+
+    /// Whether updates are approximate (and keep the approximate mode's
+    /// state).
+    fn is_approximate(self) -> bool {
+        matches!(self.mode, OnlineMode::Approximate { .. })
     }
 }
 
@@ -230,41 +259,14 @@ pub struct OnlineModel {
     cache: Option<Cache>,
 }
 
-/// The approximate mode's state.
-#[derive(Debug, Clone)]
-struct Cache {
-    /// The split robustness tolerance (the approximate mode's).
-    tolerance: f64,
-    cuts: HistCuts,
-    /// No row has a missing value (the builder then enumerates no missing
-    /// directions).
-    dense: bool,
-    trees: Vec<TreeCache>,
-}
-
-#[derive(Debug, Clone)]
-struct TreeCache {
-    /// Per node of the tree.
-    nodes: Vec<NodeCache>,
-    /// The gradient pair each row of the current data contributes.
-    grads: Vec<GradPair>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct NodeCache {
-    stats: GradStats,
-    /// Per-bin sums (internal nodes only).
-    hist: Vec<GradStats>,
-}
-
 impl OnlineModel {
     /// Train `num_boost_round` iterations on `data` (as
     /// [`train`](super::train) does) and keep what updates need.
     ///
     /// # Errors
     ///
-    /// The refusals of the [module docs](self#supported-configurations), an
-    /// invalid [`OnlineParams::tolerance`], and the errors of training.
+    /// The refusals of the [module docs](self#supported-configurations) and
+    /// the errors of training.
     pub fn train(
         params: &TrainingParams,
         data: &DMatrix,
@@ -334,7 +336,7 @@ impl OnlineModel {
             || model.n_features() != data.n_cols()
             // The approximate mode replays numeric splits only; the exact
             // mode retrains, so categorical trees are fine there.
-            || (categorical && online.tolerance.is_some())
+            || (categorical && online.is_approximate())
             // The objective's `max_delta_step` shapes every leaf: a model
             // trained with another one is not a model of these parameters.
             || model.max_delta_step() != params.effective_max_delta_step()
@@ -371,12 +373,12 @@ impl OnlineModel {
                 ),
             ));
         }
-        let cache = online
-            .tolerance
-            .map(|tolerance| {
-                with_thread_pool(params, || Cache::build(&model, params, data, tolerance))
-            })
-            .transpose()?;
+        let cache = match online.mode {
+            OnlineMode::Exact => None,
+            OnlineMode::Approximate { tolerance } => Some(with_thread_pool(params, || {
+                Cache::build(&model, params, data, tolerance)
+            })?),
+        };
         Ok(OnlineModel {
             params: params.clone(),
             online,
@@ -597,7 +599,7 @@ fn check_within_cuts(cuts: &HistCuts, additions: &DMatrix) -> Result<()> {
                 format!(
                     "added row {row} has feature {c} = {v}, beyond the training data's bins, \
                      which the approximate mode keeps fixed; use the exact mode (`OnlineParams::exact`, \
-                     Python `tolerance=0`), \
+                     Python `mode=Exact()`), \
                      or rebuild the state on data covering it with `OnlineModel::from_model`"
                 ),
             ));
@@ -756,7 +758,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         return refuse("objective", "a single-output objective");
     }
     check_data(data, "data")?;
-    if online.tolerance.is_some() && data.feature_types().contains(&FeatureType::Categorical) {
+    if online.is_approximate() && data.feature_types().contains(&FeatureType::Categorical) {
         return refuse(
             "data",
             "numerical features in the approximate mode (the exact mode accepts categorical ones)",
@@ -832,383 +834,6 @@ fn compose(data: &DMatrix, deleted: &[bool], additions: Option<&DMatrix>) -> Res
     out.with_labels(&labels)
 }
 
-/// Gradient pairs of every row of `data` at `margins`.
-fn gradients(objective: &dyn Loss, data: &DMatrix, margins: &[f32]) -> Vec<GradPair> {
-    let mut out = vec![GradPair::default(); data.n_rows()];
-    objective.gradient_info(margins, &data.info(), &mut out);
-    out
-}
-
-fn stats_of(g: GradPair) -> GradStats {
-    GradStats::new(f64::from(g.grad), f64::from(g.hess))
-}
-
-fn negate(g: GradStats) -> GradStats {
-    GradStats::new(-g.grad, -g.hess)
-}
-
-/// Add `g` to `hist` at every bin of row `row` of `ghist`.
-fn add_index_bins(hist: &mut [GradStats], ghist: &GHistIndex, row: usize, g: GradStats) {
-    let (s, e) = (ghist.row_ptr()[row], ghist.row_ptr()[row + 1]);
-    match ghist.bins() {
-        Bins::U16(b) => b[s..e].iter().for_each(|&bin| hist[bin as usize].add(g)),
-        Bins::U32(b) => b[s..e].iter().for_each(|&bin| hist[bin as usize].add(g)),
-    }
-}
-
-/// The global bins of row `row` of `data` under `cuts` (present features).
-fn row_bins(cuts: &HistCuts, data: &DMatrix, row: usize) -> Vec<u32> {
-    let mut bins = Vec::with_capacity(data.n_cols());
-    data.for_row_entry(row, |c, v| bins.push(cuts.bin_of(c as usize, v)));
-    bins
-}
-
-/// Node statistics of `tree` below `root` from `rows` (row of `data` and
-/// `ghist`, gradient).
-fn accumulate(
-    tree: &RegTree,
-    root: usize,
-    data: &DMatrix,
-    ghist: &GHistIndex,
-    rows: impl Iterator<Item = (usize, GradPair)>,
-    out: &mut [NodeCache],
-) {
-    let bins = ghist.total_bins();
-    for (row, g) in rows {
-        let g = stats_of(g);
-        let mut nid = root;
-        loop {
-            let node = tree.node(nid);
-            out[nid].stats.add(g);
-            if node.is_leaf() {
-                break;
-            }
-            if out[nid].hist.is_empty() {
-                out[nid].hist = vec![GradStats::default(); bins];
-            }
-            add_index_bins(&mut out[nid].hist, ghist, row, g);
-            nid = tree.child(nid, data.get(row, node.split_feature as usize));
-        }
-    }
-}
-
-impl Cache {
-    /// Replay `model`'s trees over `data` (as training grew them).
-    fn build(
-        model: &BoostedModel,
-        params: &TrainingParams,
-        data: &DMatrix,
-        tolerance: f64,
-    ) -> Result<Self> {
-        let cuts = HistCuts::from_dmatrix(data, params.max_bin);
-        let ghist = GHistIndex::from_dmatrix(data, cuts.clone());
-        let objective = params.loss(1)?;
-        let mut margins = vec![model.base_scores()[0]; data.n_rows()];
-        let mut trees = Vec::with_capacity(model.num_trees());
-        for tree in model.trees() {
-            let grads = gradients(objective.as_ref(), data, &margins);
-            let mut nodes = vec![NodeCache::default(); tree.num_nodes()];
-            accumulate(
-                tree,
-                0,
-                data,
-                &ghist,
-                grads.iter().copied().enumerate(),
-                &mut nodes,
-            );
-            add_tree_margins(tree, data, &mut margins, 1, TreeOutput::Scalar(0));
-            trees.push(TreeCache { nodes, grads });
-        }
-        let dense = ghist.dense_stride().is_some();
-        Ok(Cache {
-            tolerance,
-            cuts,
-            dense,
-            trees,
-        })
-    }
-}
-
-/// One approximate update.
-struct Incremental<'a> {
-    params: &'a TrainingParams,
-    tolerance: f64,
-    old: &'a DMatrix,
-    new: &'a DMatrix,
-    deleted: &'a [bool],
-    model: &'a BoostedModel,
-}
-
-/// A changed row's contribution routed down a tree.
-struct Delta {
-    /// Row of the deleted-rows matrix (`true`) or of the new data.
-    deleted: bool,
-    row: usize,
-    /// The change of the row's gradient pair.
-    g: GradStats,
-    /// The row's global bins.
-    bins: Vec<u32>,
-}
-
-impl Incremental<'_> {
-    fn run(
-        &self,
-        cache: &mut Cache,
-        on_round: &mut dyn FnMut(RoundEval<'_>) -> ControlFlow<()>,
-    ) -> Result<(Vec<RegTree>, UpdateReport)> {
-        let (old, new) = (self.old, self.new);
-        let deleted_rows: Vec<usize> = (0..old.n_rows()).filter(|&r| self.deleted[r]).collect();
-        let gone = if deleted_rows.is_empty() {
-            None
-        } else {
-            Some(old.select_rows(&deleted_rows)?)
-        };
-        let n_added = new.n_rows() + deleted_rows.len() - old.n_rows();
-        let new_to_old: Vec<Option<usize>> = (0..old.n_rows())
-            .filter(|&r| !self.deleted[r])
-            .map(Some)
-            .chain(std::iter::repeat_n(None, n_added))
-            .collect();
-        let objective = self.params.loss(1)?;
-        let reg = RegParams::from_params(self.params);
-        let eta = self.params.eta as f32;
-        let base = self.model.base_scores()[0];
-        // Margins under the updated trees, kept for fresh rows only.
-        let mut fresh: Vec<bool> = new_to_old.iter().map(Option::is_none).collect();
-        let mut margins = vec![base; new.n_rows()];
-        let mut ghist: Option<GHistIndex> = None;
-        let mut report = UpdateReport::default();
-        cache.dense &= (0..new.n_rows())
-            .filter(|&i| new_to_old[i].is_none())
-            .all(|i| {
-                let mut present = 0;
-                new.for_row_entry(i, |_, _| present += 1);
-                present == new.n_cols()
-            });
-        let mut trees: Vec<RegTree> = Vec::with_capacity(self.model.num_trees());
-        for (m, old_tree) in self.model.trees().iter().enumerate() {
-            let tc = &mut cache.trees[m];
-            let old_grads = std::mem::take(&mut tc.grads);
-            let g_new = gradients(objective.as_ref(), new, &margins);
-            let cur: Vec<GradPair> = (0..new.n_rows())
-                .map(|i| match new_to_old[i] {
-                    Some(r) if !fresh[i] => old_grads[r],
-                    _ => g_new[i],
-                })
-                .collect();
-            let cuts = &cache.cuts;
-            let mut deltas: Vec<Delta> = Vec::new();
-            if let Some(gone) = &gone {
-                for (k, &r) in deleted_rows.iter().enumerate() {
-                    deltas.push(Delta {
-                        deleted: true,
-                        row: k,
-                        g: negate(stats_of(old_grads[r])),
-                        bins: row_bins(cuts, gone, k),
-                    });
-                }
-            }
-            for i in (0..new.n_rows()).filter(|&i| fresh[i]) {
-                let g = match new_to_old[i] {
-                    // Kept rows sit on the same path in the kept structure:
-                    // their change is the difference.
-                    Some(r) => stats_of(cur[i]).sub(stats_of(old_grads[r])),
-                    None => stats_of(cur[i]),
-                };
-                deltas.push(Delta {
-                    deleted: false,
-                    row: i,
-                    g,
-                    bins: row_bins(cuts, new, i),
-                });
-            }
-            let ctx = TreeUpdate {
-                run: self,
-                dense: cache.dense,
-                reg: &reg,
-                eta,
-                old_tree,
-                gone: gone.as_ref(),
-                cur: &cur,
-                cuts,
-            };
-            let old_nodes = std::mem::take(&mut tc.nodes);
-            let (tree, nodes, regrown_rows) =
-                ctx.update(old_nodes, deltas, &mut ghist, &mut report);
-            tc.nodes = nodes;
-            tc.grads = cur;
-            for (i, v) in margins.iter_mut().enumerate() {
-                if fresh[i] {
-                    *v += tree.predict_row(new, i);
-                }
-            }
-            trees.push(tree);
-            for i in regrown_rows {
-                if !std::mem::replace(&mut fresh[i], true) {
-                    margins[i] = base + trees.iter().map(|t| t.predict_row(new, i)).sum::<f32>();
-                }
-            }
-            if on_round(RoundEval::unscored(m)).is_break() {
-                return Err(interrupted());
-            }
-        }
-        report.rows_refreshed = fresh.iter().filter(|&&f| f).count();
-        Ok((trees, report))
-    }
-}
-
-/// The update of one tree.
-struct TreeUpdate<'a> {
-    run: &'a Incremental<'a>,
-    /// Whether the data (old and new) has no missing value.
-    dense: bool,
-    reg: &'a RegParams,
-    eta: f32,
-    old_tree: &'a RegTree,
-    /// The deleted rows.
-    gone: Option<&'a DMatrix>,
-    /// The gradient every row of the new data contributes now.
-    cur: &'a [GradPair],
-    cuts: &'a HistCuts,
-}
-
-impl TreeUpdate<'_> {
-    fn value(&self, d: &Delta, feature: usize) -> Option<f32> {
-        match (d.deleted, self.gone) {
-            (true, Some(m)) => m.get(d.row, feature),
-            _ => self.run.new.get(d.row, feature),
-        }
-    }
-
-    /// The updated tree, its node caches, and the rows that reached a
-    /// regrown subtree. `ghist`, the new data's index, is built on the first
-    /// regrowth.
-    fn update(
-        &self,
-        mut old_nodes: Vec<NodeCache>,
-        deltas: Vec<Delta>,
-        ghist: &mut Option<GHistIndex>,
-        report: &mut UpdateReport,
-    ) -> (RegTree, Vec<NodeCache>, Vec<usize>) {
-        let params = self.run.params;
-        let new = self.run.new;
-        let mut tree = RegTree::with_root(0.0);
-        let mut nodes: Vec<NodeCache> = vec![NodeCache::default()];
-        let mut regrown_rows = Vec::new();
-        // (old node, new node, depth, deltas reaching it)
-        let mut queue = std::collections::VecDeque::from([(0usize, 0usize, 0usize, deltas)]);
-        while let Some((old_id, new_id, depth, deltas)) = queue.pop_front() {
-            let old = *self.old_tree.node(old_id);
-            let mut cache = std::mem::take(&mut old_nodes[old_id]);
-            // A split no row of the cached data reached has no histogram
-            // yet (a model resumed on other data, or a regrown node the
-            // rows route around): its sums are all zero.
-            if !old.is_leaf() && !deltas.is_empty() && cache.hist.is_empty() {
-                cache.hist = vec![GradStats::default(); self.cuts.total_bins()];
-            }
-            for d in &deltas {
-                cache.stats.add(d.g);
-                if !old.is_leaf() {
-                    for &bin in &d.bins {
-                        cache.hist[bin as usize].add(d.g);
-                    }
-                }
-            }
-            let touched = !deltas.is_empty();
-            if old.is_leaf() {
-                let value = if touched {
-                    (calc_weight(cache.stats, self.reg) as f32) * self.eta
-                } else {
-                    old.leaf_value
-                };
-                tree.set_leaf_value(new_id, value);
-                tree.set_sum_hess(new_id, cache.stats.hess as f32);
-                nodes[new_id] = cache;
-                report.nodes_kept += 1;
-                continue;
-            }
-            // An untouched node's histogram, and so its ranking, is as
-            // before: its split stays.
-            let (keep, gain) = if touched {
-                let rank = rank_split(
-                    self.reg,
-                    self.cuts,
-                    &cache.hist,
-                    cache.stats,
-                    self.dense,
-                    (old.split_feature, old.split_cond, old.default_left),
-                );
-                let allowed = ((self.run.tolerance * rank.candidates as f64) as usize).max(1);
-                let keep = rank.better.is_some_and(|b| b < allowed)
-                    && f64::from(rank.loss_chg) >= params.gamma;
-                (keep, rank.loss_chg)
-            } else {
-                (true, old.split_gain)
-            };
-            if keep {
-                let (l, r) = tree.expand(
-                    new_id,
-                    SplitRule::numeric(old.split_feature, old.split_cond, old.default_left),
-                    ChildLeaf::new(0.0, 0.0),
-                    ChildLeaf::new(0.0, 0.0),
-                );
-                tree.set_sum_hess(new_id, cache.stats.hess as f32);
-                tree.set_split_gain(new_id, gain);
-                nodes[new_id] = cache;
-                nodes.resize(tree.num_nodes(), NodeCache::default());
-                let (mut left, mut right) = (Vec::new(), Vec::new());
-                for d in deltas {
-                    let value = self.value(&d, old.split_feature as usize);
-                    if self.old_tree.child(old_id, value) == old.left as usize {
-                        left.push(d);
-                    } else {
-                        right.push(d);
-                    }
-                }
-                queue.push_back((old.left as usize, l, depth + 1, left));
-                queue.push_back((old.right as usize, r, depth + 1, right));
-                report.nodes_kept += 1;
-                continue;
-            }
-            // Regrow: every row of the new data now reaching this node, with
-            // the builder on the new data's index.
-            let index = match ghist {
-                Some(index) => &*index,
-                None => ghist.insert(GHistIndex::from_dmatrix(new, self.cuts.clone())),
-            };
-            let rows: Vec<u32> = (0..new.n_rows())
-                .filter(|&i| tree.leaf_id_with(|f| new.get(i, f as usize)) == new_id)
-                .map(|i| i as u32)
-                .collect();
-            // A split node lies above `max_depth` (`check_supported` requires
-            // one, `from_model` refuses deeper trees), so its subtree keeps at
-            // least one level.
-            let sub_params = TrainingParams {
-                max_depth: params
-                    .max_depth
-                    .and_then(|limit| NonZeroUsize::new(limit.get().saturating_sub(depth))),
-                ..params.clone()
-            };
-            let mut sampler = ColumnSampler::new(new.n_cols(), None, 1.0, 1.0, 1.0, params.seed);
-            let sub = HistTreeBuilder::new(&sub_params).build(index, self.cur, &rows, &mut sampler);
-            graft(&mut tree, new_id, &sub, 0, self.eta);
-            nodes.resize(tree.num_nodes(), NodeCache::default());
-            clear_subtree(&tree, new_id, &mut nodes);
-            accumulate(
-                &tree,
-                new_id,
-                new,
-                index,
-                rows.iter().map(|&i| (i as usize, self.cur[i as usize])),
-                &mut nodes,
-            );
-            regrown_rows.extend(rows.iter().map(|&i| i as usize));
-            report.subtrees_regrown += 1;
-        }
-        (tree, nodes, regrown_rows)
-    }
-}
-
 /// Whether `tree` splits a node at depth `max_depth` or deeper (`None`: no
 /// limit), which depth-wise training to that depth never does.
 fn splits_below(tree: &RegTree, max_depth: Option<NonZeroUsize>) -> bool {
@@ -1228,37 +853,4 @@ fn splits_below(tree: &RegTree, max_depth: Option<NonZeroUsize>) -> bool {
         stack.push((node.right as usize, depth + 1));
     }
     false
-}
-
-/// Reset the caches of `root`'s subtree in `tree`.
-fn clear_subtree(tree: &RegTree, root: usize, nodes: &mut [NodeCache]) {
-    let mut stack = vec![root];
-    while let Some(nid) = stack.pop() {
-        nodes[nid] = NodeCache::default();
-        let node = tree.node(nid);
-        if !node.is_leaf() {
-            stack.push(node.left as usize);
-            stack.push(node.right as usize);
-        }
-    }
-}
-
-/// Copy `src`'s subtree at `src_id` into `dst` at leaf `dst_id`, scaling
-/// leaf weights by `eta` (the builder leaves them unshrunk).
-fn graft(dst: &mut RegTree, dst_id: usize, src: &RegTree, src_id: usize, eta: f32) {
-    let node = *src.node(src_id);
-    dst.set_sum_hess(dst_id, node.sum_hess);
-    if node.is_leaf() {
-        dst.set_leaf_value(dst_id, node.leaf_value * eta);
-        return;
-    }
-    let (l, r) = dst.expand(
-        dst_id,
-        SplitRule::numeric(node.split_feature, node.split_cond, node.default_left),
-        ChildLeaf::new(0.0, 0.0),
-        ChildLeaf::new(0.0, 0.0),
-    );
-    dst.set_split_gain(dst_id, node.split_gain);
-    graft(dst, l, src, node.left as usize, eta);
-    graft(dst, r, src, node.right as usize, eta);
 }

@@ -11,6 +11,8 @@ use std::arch::x86_64::*;
 
 /// f32 lanes per vector.
 const WIDTH: usize = 8;
+// `objective::GRADIENT_BLOCK_ROWS`'s contract: its blocks start on vector blocks.
+const _: () = assert!(crate::objective::GRADIENT_BLOCK_ROWS.is_multiple_of(WIDTH));
 
 /// Exponential for finite f32 lanes in [-80, 80]: range reduction to
 /// [-ln(2)/2, ln(2)/2] and a seventh-order polynomial (Estrin pairs for

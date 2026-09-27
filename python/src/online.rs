@@ -5,7 +5,7 @@ use crate::data::{DMatrix, row_major};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
 use crate::train::{Failure, run_hooked};
-use hessboost::training::online::{self, OnlineParams};
+use hessboost::training::online;
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,22 +19,33 @@ type Report = (usize, usize, usize);
 /// histograms would cost more than the update) under a mutex that is never
 /// waited for: while an update holds it (its callback included), reading
 /// the model or data and starting another update fail fast instead of
-/// deadlocking on it. The row count and tolerance are readable throughout.
+/// deadlocking on it. The row count is readable throughout.
 #[pyclass(frozen, module = "hessboost._hessboost")]
 pub struct OnlineModel {
     state: Mutex<online::OnlineModel>,
     /// The committed data's row count.
     rows: AtomicUsize,
-    tolerance: f64,
 }
 
-/// Python's `tolerance`: `0` is the exact mode, anything else the
-/// approximate mode's split robustness tolerance.
-fn online_params(tolerance: f64) -> PyResult<OnlineParams> {
-    if tolerance == 0.0 {
-        Ok(OnlineParams::exact())
-    } else {
-        OnlineParams::approximate(tolerance).or_raise()
+/// An update mode (`online::OnlineParams`): `exact()` or `approximate(tolerance)`.
+#[pyclass(frozen, module = "hessboost._hessboost")]
+pub struct OnlineParams {
+    inner: online::OnlineParams,
+}
+
+#[pymethods]
+impl OnlineParams {
+    #[staticmethod]
+    fn exact() -> Self {
+        Self {
+            inner: online::OnlineParams::exact(),
+        }
+    }
+
+    #[staticmethod]
+    fn approximate(tolerance: f64) -> PyResult<Self> {
+        let inner = online::OnlineParams::approximate(tolerance).or_raise()?;
+        Ok(Self { inner })
     }
 }
 
@@ -42,8 +53,6 @@ impl OnlineModel {
     fn new(online: online::OnlineModel) -> Self {
         Self {
             rows: AtomicUsize::new(online.data().n_rows()),
-            // Python's `0` is the exact mode.
-            tolerance: online.online_params().tolerance().unwrap_or(0.0),
             state: Mutex::new(online),
         }
     }
@@ -82,9 +91,9 @@ impl OnlineModel {
         params: &Params,
         dtrain: &DMatrix,
         num_boost_round: usize,
-        tolerance: f64,
+        mode: &OnlineParams,
     ) -> PyResult<Self> {
-        let online = online_params(tolerance)?;
+        let online = mode.inner;
         let failure = Failure::default();
         let trained = run_hooked(py, None, &failure, |hook, _gate| {
             online::OnlineModel::train_with(
@@ -106,9 +115,9 @@ impl OnlineModel {
         booster: &Booster,
         params: &Params,
         dtrain: &DMatrix,
-        tolerance: f64,
+        mode: &OnlineParams,
     ) -> PyResult<Self> {
-        let mode = online_params(tolerance)?;
+        let mode = mode.inner;
         let online = py.detached(|| {
             online::OnlineModel::from_model(
                 (*booster.model).clone(),
@@ -192,10 +201,5 @@ impl OnlineModel {
     #[getter]
     fn num_row(&self) -> usize {
         self.rows.load(Ordering::Relaxed)
-    }
-
-    #[getter]
-    fn tolerance(&self) -> f64 {
-        self.tolerance
     }
 }

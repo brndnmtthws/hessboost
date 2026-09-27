@@ -21,6 +21,10 @@ mod x86_64;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const MIN_SIMD_LEN: usize = 16;
+// `objective::GRADIENT_BLOCK_ROWS`'s contract: a block that long takes the
+// vector path.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const _: () = assert!(MIN_SIMD_LEN <= crate::objective::GRADIENT_BLOCK_ROWS);
 
 // Layout contract the deinterleaving vector loads and stores rely on.
 const _: () = assert!(std::mem::size_of::<GradPair>() == 2 * std::mem::size_of::<f32>());

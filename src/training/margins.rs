@@ -115,7 +115,8 @@ impl<'a> MarginCaches<'a> {
     }
 }
 
-/// Add `tree`'s prediction of every row of `data` to `margins`.
+/// Add `tree`'s prediction of every row of `data` to `margins` (training's
+/// margin caches and the online state's replay).
 pub(super) fn add_tree_margins(
     tree: &RegTree,
     data: &DMatrix,

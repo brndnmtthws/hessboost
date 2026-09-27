@@ -128,11 +128,20 @@ impl SplitGradient {
     }
 }
 
-/// Rows per parallel gradient chunk. A multiple of every vector kernel's block
-/// (4 rows, and 4 values for any class count), so chunk boundaries fall where
-/// the kernels' block boundaries already are and every element is computed
-/// by the same path as in one whole-batch call.
+/// Rows of the blocks a row-independent gradient's value depends on: a
+/// multiple of every vector kernel's block (4 or 8 values, and so of rows for
+/// any class count) and at least the vector path's minimum length. A
+/// [`rowwise_gradient`] call on rows `s..e` of a batch, with `s` a multiple of
+/// it and `e` one too or the batch's end, at least this many rows long (or the
+/// whole batch), computes every one of its rows exactly as one call on the
+/// whole batch does.
+pub(crate) const GRADIENT_BLOCK_ROWS: usize = 16;
+
+/// Rows per parallel gradient chunk. A multiple of [`GRADIENT_BLOCK_ROWS`],
+/// so chunk boundaries fall where the kernels' block boundaries already are
+/// and every element is computed by the same path as in one whole-batch call.
 const GRADIENT_CHUNK_ROWS: usize = 8192;
+const _: () = assert!(GRADIENT_CHUNK_ROWS.is_multiple_of(GRADIENT_BLOCK_ROWS));
 
 /// Lower bound on any per-instance Hessian, matching XGBoost's guard, so that
 /// confidently-classified instances still contribute a positive Hessian.

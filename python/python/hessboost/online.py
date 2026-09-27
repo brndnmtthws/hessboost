@@ -13,14 +13,15 @@ In-Place Updates for Efficient Adding/Deleting Data*, 2025)::
     report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
     online.model.predict(X_test)
 
-``tolerance`` is the split robustness tolerance ``σ`` in ``[0, 1]``: a node
-keeps its split while it ranks within the top ``max(1, ⌊σ · candidates⌋)``
-candidates of the updated statistics, else its subtree is regrown. ``0`` is
-the exact mode: every update equals :func:`hessboost.train` on
-:attr:`~OnlineModel.data` bit for bit, at about the cost of retraining
-(the answer when unlearning must be complete). ``tolerance > 0`` touches
-only the changed rows and the regrown subtrees and stays close to
-retraining for small changes; it forgets deleted rows only partially.
+The update mode is :class:`Approximate` (the default) or :class:`Exact`.
+``Approximate(tolerance)`` has the split robustness tolerance ``σ`` in
+``(0, 1]``: a node keeps its split while it ranks within the top
+``max(1, ⌊σ · candidates⌋)`` candidates of the updated statistics, else its
+subtree is regrown. It touches only the changed rows and the regrown
+subtrees and stays close to retraining for small changes; it forgets
+deleted rows only partially. ``Exact()`` makes every update equal
+:func:`hessboost.train` on :attr:`~OnlineModel.data` bit for bit, at about
+the cost of retraining (the answer when unlearning must be complete).
 
 Updates need a configuration whose retraining depends on the data alone:
 ``gbtree`` with ``tree_method="hist"`` (or ``"auto"``), depth-wise growth
@@ -47,7 +48,7 @@ from hessboost._booster import Booster
 from hessboost._matrix import DMatrix, _check_schema
 from hessboost._training import _params
 
-__all__ = ["OnlineModel", "UpdateCallback", "UpdateReport"]
+__all__ = ["Approximate", "Exact", "OnlineMode", "OnlineModel", "UpdateCallback", "UpdateReport"]
 
 UpdateCallback: TypeAlias = Callable[[int], bool]
 """A per-iteration hook of :meth:`OnlineModel.update`: ``callback(iteration)``
@@ -69,10 +70,41 @@ class UpdateReport:
     """Rows whose gradients were recomputed in at least one tree."""
 
 
-def _check_tolerance(tolerance: float) -> float:
-    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float, np.floating)):
-        raise TypeError(f"tolerance must be a number, got {type(tolerance).__name__}")
-    return float(tolerance)
+@dataclass(frozen=True)
+class Exact:
+    """The exact mode: every update equals :func:`hessboost.train` on the
+    updated data bit for bit, at about the cost of retraining."""
+
+
+@dataclass(frozen=True)
+class Approximate:
+    """The approximate mode with the split robustness tolerance ``σ``: a node
+    keeps its split while it ranks within the top ``max(1, ⌊σ · candidates⌋)``
+    candidates; ``1`` regrows only splits that stopped being valid. Needs
+    ``0 < tolerance <= 1`` (the default ``0.1`` is the paper's
+    recommendation)."""
+
+    tolerance: float = 0.1
+
+    def __post_init__(self) -> None:
+        tolerance = self.tolerance
+        if isinstance(tolerance, bool) or not isinstance(
+            tolerance, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError(f"tolerance must be a number, got {type(tolerance).__name__}")
+        object.__setattr__(self, "tolerance", float(tolerance))
+
+
+OnlineMode: TypeAlias = Exact | Approximate
+"""How an :class:`OnlineModel` updates: :class:`Exact` or :class:`Approximate`."""
+
+
+def _online_params(mode: OnlineMode) -> _hessboost.OnlineParams:
+    if isinstance(mode, Exact):
+        return _hessboost.OnlineParams.exact()
+    if isinstance(mode, Approximate):
+        return _hessboost.OnlineParams.approximate(mode.tolerance)
+    raise TypeError(f"mode must be Exact or Approximate, got {type(mode).__name__}")
 
 
 def _check_matrix(data: object, name: str) -> DMatrix:
@@ -96,13 +128,14 @@ class OnlineModel:
     model and data as they were. While an update runs, :attr:`model`,
     :attr:`data` and another :meth:`update` of the same online model raise
     :class:`~hessboost.HessboostError`, from other threads and from the
-    update's own callback alike; :meth:`num_row` and :attr:`tolerance` stay
+    update's own callback alike; :meth:`num_row` and :attr:`mode` stay
     readable.
     """
 
     __module__ = "hessboost.online"
 
     _core: _hessboost.OnlineModel
+    _mode: OnlineMode
     _feature_names: list[str] | None
     _feature_types: list[str] | None
     _categories: _data.Categories
@@ -114,12 +147,14 @@ class OnlineModel:
     def _wrap(
         cls,
         core: _hessboost.OnlineModel,
+        mode: OnlineMode,
         feature_names: list[str] | None,
         feature_types: list[str] | None,
         categories: _data.Categories,
     ) -> Self:
         self = object.__new__(cls)
         self._core = core
+        self._mode = mode
         self._feature_names = feature_names
         self._feature_types = feature_types
         self._categories = categories
@@ -131,7 +166,7 @@ class OnlineModel:
         params: Mapping[str, Any],
         dtrain: DMatrix,
         num_boost_round: int = 10,
-        tolerance: float = 0.1,
+        mode: OnlineMode = Approximate(),
     ) -> Self:
         """Trains ``num_boost_round`` iterations on ``dtrain``, as
         :func:`hessboost.train` does, and keeps what updates need.
@@ -142,22 +177,22 @@ class OnlineModel:
             dtrain: The training data.
             num_boost_round: Boosting iterations; every update keeps this
                 many.
-            tolerance: The split robustness tolerance in ``[0, 1]`` (``0``
-                is exact; default ``0.1``, the paper's recommendation).
+            mode: The update mode, :class:`Approximate` (default, with
+                tolerance ``0.1``) or :class:`Exact`.
 
         The GIL is released while training. Ctrl-C stops training at the end
         of the current round and raises ``KeyboardInterrupt``.
 
         Raises:
             HessboostError: The parameters or data are refused, or cannot be
-                updated in place.
+                updated in place, or the tolerance is outside ``(0, 1]``.
         """
         dtrain = _check_matrix(dtrain, "dtrain")
         core = _hessboost.OnlineModel.train(
-            _params(params, dtrain), dtrain._core, int(num_boost_round), _check_tolerance(tolerance)
+            _params(params, dtrain), dtrain._core, int(num_boost_round), _online_params(mode)
         )
         return cls._wrap(
-            core, dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories)
+            core, mode, dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories)
         )
 
     @classmethod
@@ -166,7 +201,7 @@ class OnlineModel:
         booster: Booster,
         params: Mapping[str, Any],
         dtrain: DMatrix,
-        tolerance: float = 0.1,
+        mode: OnlineMode = Approximate(),
     ) -> Self:
         """Resumes from ``booster``, trained with ``params`` on ``dtrain``
         (for example one loaded from a file), rebuilding the update state by
@@ -176,7 +211,7 @@ class OnlineModel:
             HessboostError: The refusals of :meth:`train`, or ``booster`` is
                 not a model ``params`` could have trained on ``dtrain``
                 (another objective or ``max_delta_step``, several outputs,
-                weighted trees, categorical trees with ``tolerance > 0``,
+                weighted trees, categorical trees in the :class:`Approximate` mode,
                 linear leaves such as an imported LightGBM ``linear_tree``
                 model's, another feature count or other features), or it was
                 early-stopped (slice it to its best iterations first).
@@ -186,11 +221,12 @@ class OnlineModel:
         dtrain = _check_matrix(dtrain, "dtrain")
         _check_schema(booster, dtrain, "dtrain", "the model's")
         core = _hessboost.OnlineModel.from_model(
-            booster._model, _params(params, dtrain), dtrain._core, _check_tolerance(tolerance)
+            booster._model, _params(params, dtrain), dtrain._core, _online_params(mode)
         )
         # What dtrain does not record (numpy codes) is still the model's.
         return cls._wrap(
             core,
+            mode,
             dtrain._feature_names if dtrain._feature_names is not None else booster._feature_names,
             dtrain._feature_types if dtrain._feature_types is not None else booster._feature_types,
             {**booster._categories, **dtrain._categories},
@@ -246,7 +282,7 @@ class OnlineModel:
             HessboostError: The model is being updated, or the change is
                 refused: out-of-range or repeated deletions, deleting every
                 row, additions without labels or with metadata or other
-                features, (with ``tolerance > 0``) added values beyond the
+                features, (in the :class:`Approximate` mode) added values beyond the
                 training data's bins, or updated data retraining refuses
                 (such as labels outside the objective's domain).
             ModelFormatError: The update overflows ``float32`` (extreme
@@ -294,9 +330,9 @@ class OnlineModel:
         return self._core.num_row
 
     @property
-    def tolerance(self) -> float:
-        """The split robustness tolerance (``0`` is the exact mode)."""
-        return self._core.tolerance
+    def mode(self) -> OnlineMode:
+        """The update mode."""
+        return self._mode
 
     def __repr__(self) -> str:
-        return f"OnlineModel(rows={self.num_row()}, tolerance={self.tolerance})"
+        return f"OnlineModel(rows={self.num_row()}, mode={self.mode})"

@@ -208,8 +208,8 @@ crps(draws, y_test)  # (rows, outputs)
 
 from hessboost.diffusion.forest import ForestModel, ForestParams
 
-forest = ForestModel.fit(ForestParams.diffusion(), X_with_nans)
-values, labels = forest.generate(1000, seed=0)  # (1000, columns), None
+forest = ForestModel.fit(ForestParams.forest_diffusion(), X_with_nans)
+synthetic = forest.sample(1000, seed=0)  # ForestSamples: .values (1000, columns), .labels None
 filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
 ```
 
@@ -247,7 +247,8 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
   with presets `default()`, `treeffuser()`, and `flow_matching()`; its
   `training` mappings are XGBoost parameters, as `train` reads them.
   `DiffusionModel.sample` returns `(rows, n_samples, outputs)` draws,
-  deterministic per seed; `mean`, `quantiles`, and `crps` summarize them.
+  deterministic per seed and step count (`n_steps=` overrides the model's);
+  `mean`, `quantiles`, and `crps` summarize them.
   Models save with `to_bytes`/`save_binary` and `to_json`/`save_json`
   (and load with `from_bytes`/`load_binary`, `from_json`/`load_json`) or
   pickle (which also keeps feature names and categories). `fit` releases
@@ -257,10 +258,10 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
   imputation with per-noise-level GBDTs. `ForestParams` (method `"flow"`
   or `Diffusion(beta_min, beta_max)`, `n_t`, `duplicate_k`, one
   `"continuous"`/`"integer"`/`"categorical"` kind per column, XGBoost
-  `training` parameters) has presets `default()` and `diffusion()`.
-  `ForestModel.generate(n_rows)` returns `(values, labels)` (labels only
-  for a class-conditional model), `generate_for_labels(labels)` one row
-  per label, and `impute(X, y, n_imputations=, repaint=Repaint(...))`
+  `training` parameters) has presets `forest_flow()` (the defaults) and
+  `forest_diffusion()`. `ForestModel.sample(n_rows)` returns a frozen
+  `ForestSamples(values, labels)` (labels only for a class-conditional
+  model), `sample_for_labels(labels)` one row per label, and `impute(X, y, n_imputations=, repaint=Repaint(...))`
   `(n_imputations, rows, columns)` with the observed entries kept
   (diffusion only). Values are in the data's own coding. Models save and
   load like `DiffusionModel`s.

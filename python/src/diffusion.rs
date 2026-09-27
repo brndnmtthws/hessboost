@@ -10,7 +10,9 @@ use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{OrRaise, refuse};
 use crate::params::{Params, to_python};
 use hessboost::config::TrainingParams;
-use hessboost::diffusion::{self, EarlyStopping, Method, Quantiles, Residualizer, Samples};
+use hessboost::diffusion::{
+    self, EarlyStopping, Method, Quantiles, Residualizer, SampleOptions, SamplesView,
+};
 use hessboost::model::Predictions;
 use numpy::{PyArrayDyn, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
@@ -159,29 +161,26 @@ impl DiffusionModel {
 
     /// `n_samples` draws for every row of `data`, `(rows, n_samples,
     /// outputs)`.
+    #[pyo3(signature = (data, n_samples, seed, n_steps=None))]
     fn sample<'py>(
         &self,
         py: Python<'py>,
         data: &DMatrix,
         n_samples: usize,
         seed: u64,
+        n_steps: Option<usize>,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+        let mut options = SampleOptions::seeded(seed);
+        if let Some(n_steps) = n_steps {
+            options = options.with_n_steps(positive("n_steps", n_steps)?);
+        }
         let samples = py
-            .detach(|| self.inner.sample(&data.inner, n_samples, seed))
+            .detach(|| self.inner.sample(&data.inner, n_samples, &options))
             .or_raise()?;
         let shape = [samples.n_rows(), samples.n_samples(), samples.n_outputs()];
         to_numpy(py, samples.into_vec(), &shape)
     }
 
-    /// A copy of the model that samples with `n_steps` integration steps.
-    fn with_n_steps(&self, py: Python<'_>, n_steps: usize) -> PyResult<Self> {
-        let n_steps = positive("n_steps", n_steps)?;
-        let mut inner = py.detach(|| self.inner.clone());
-        inner.set_n_steps(n_steps);
-        Ok(Self { inner })
-    }
-
-    /// Decodes the native binary format.
     #[staticmethod]
     fn from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
         let inner = py
@@ -242,7 +241,7 @@ impl DiffusionModel {
 fn summarize<T: Send>(
     py: Python<'_>,
     samples: &PyReadonlyArrayDyn<'_, f32>,
-    summary: impl FnOnce(&Samples) -> hessboost::error::Result<T> + Send,
+    summary: impl FnOnce(SamplesView<'_>) -> hessboost::error::Result<T> + Send,
 ) -> PyResult<(T, [usize; 2])> {
     let &[rows, n_samples, outputs] = samples.shape() else {
         return Err(refuse(format!(
@@ -252,7 +251,7 @@ fn summarize<T: Send>(
     };
     let values = row_major(samples, "samples")?;
     let out = py
-        .detach(|| summary(&Samples::new(values.to_vec(), n_samples, outputs)?))
+        .detach(|| summary(SamplesView::new(values, n_samples, outputs)?))
         .or_raise()?;
     Ok((out, [rows, outputs]))
 }

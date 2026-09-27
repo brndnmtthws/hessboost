@@ -20,7 +20,7 @@
 
 use serde::Deserialize;
 
-use super::{Column, ColumnKind, ForestMethod, ForestModel, OutputLayout, Scale};
+use super::{Column, ColumnKind, ForestMethod, ForestModel, NoiseLevels, OutputLayout, Scale};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::model::container::{ContainerSpec, WRITER, read_models, write_models};
@@ -66,7 +66,7 @@ pub(super) fn write(model: &ForestModel) -> Result<Vec<u8>> {
             w.f64("forest.beta_max", beta_max);
         }
     }
-    w.u64("forest.n_t", model.n_t as u64);
+    w.u64("forest.n_t", model.n_t.get() as u64);
     w.u64("forest.per_output", u64::from(bool::from(model.layout)));
     let columns = &model.columns;
     w.array(
@@ -190,7 +190,8 @@ fn read_model(s: &Sections) -> Result<ForestModel> {
     )?;
     let model = ForestModel {
         method,
-        n_t: s.usize("forest.n_t")?,
+        n_t: NoiseLevels::new(s.usize("forest.n_t")?)
+            .ok_or_else(|| format_error("section `forest.n_t` must be at least 2"))?,
         columns,
         scales: scale_min
             .into_iter()
@@ -211,7 +212,7 @@ fn read_model(s: &Sections) -> Result<ForestModel> {
 #[derive(Deserialize)]
 pub(super) struct UncheckedForestModel {
     method: ForestMethod,
-    n_t: usize,
+    n_t: NoiseLevels,
     columns: Vec<Column>,
     scales: Vec<Scale>,
     classes: Vec<f64>,

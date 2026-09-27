@@ -37,24 +37,25 @@ def quick(params: ForestParams, **changes: Any) -> ForestParams:
 @pytest.fixture(scope="module")
 def conditional() -> tuple[ForestModel, NDArray[np.float64], NDArray[np.float64]]:
     x, y = table(200, 0)
-    return ForestModel.fit(quick(ForestParams.diffusion()), x, y), x, y
+    return ForestModel.fit(quick(ForestParams.forest_diffusion()), x, y), x, y
 
 
-def test_constructor_defaults_are_the_default_preset() -> None:
-    assert ForestParams() == ForestParams.default()
+def test_constructor_defaults_are_the_forest_flow_preset() -> None:
+    assert ForestParams() == ForestParams.forest_flow()
     assert ForestParams().method == "flow"
-    assert ForestParams.diffusion().method == Diffusion(beta_min=0.1, beta_max=8.0)
+    assert ForestParams.forest_diffusion().method == Diffusion(beta_min=0.1, beta_max=8.0)
     training = ForestParams().training
     assert (training["max_depth"], training["eta"], training["lambda"]) == (7, 0.3, 0.0)
     assert (ForestParams().n_t, ForestParams().duplicate_k) == (50, 100)
 
 
-def test_generated_rows_follow_the_column_kinds() -> None:
+def test_sampled_rows_follow_the_column_kinds() -> None:
     x, _ = table(200, 1)
     model = ForestModel.fit(quick(ForestParams()), x)
     assert (model.method, model.n_t, model.n_columns) == ("flow", 6, 3)
     assert model.classes.size == 0
-    values, labels = model.generate(300, seed=2)
+    synthetic = model.sample(300, seed=2)
+    values, labels = synthetic.values, synthetic.labels
     assert values.shape == (300, 3)
     assert values.dtype == np.float32
     assert labels is None
@@ -67,31 +68,34 @@ def test_generated_rows_follow_the_column_kinds() -> None:
     assert np.corrcoef(values[:, 0], values[:, 1])[0, 1] > 0.3
 
 
-def test_class_conditional_generation(
+def test_class_conditional_sampling(
     conditional: tuple[ForestModel, NDArray[np.float64], NDArray[np.float64]],
 ) -> None:
     model, _, _ = conditional
     np.testing.assert_array_equal(model.classes, [0.0, 1.0])
-    _, labels = model.generate(50, seed=0)
+    labels = model.sample(50, seed=0).labels
     assert labels is not None
     assert labels.shape == (50,)
     assert set(np.unique(labels)) <= {0.0, 1.0}
-    rows = model.generate_for_labels([1, 0, 1], seed=4)
-    assert rows.shape == (3, 3)
-    np.testing.assert_array_equal(model.generate_for_labels([1, 0, 1], seed=4), rows)
+    rows = model.sample_for_labels([1, 0, 1], seed=4)
+    assert rows.values.shape == (3, 3)
+    assert rows.labels is not None
+    np.testing.assert_array_equal(rows.labels, [1.0, 0.0, 1.0])
+    again = model.sample_for_labels([1, 0, 1], seed=4)
+    np.testing.assert_array_equal(again.values, rows.values)
 
 
 def test_draws_are_deterministic_per_seed(
     conditional: tuple[ForestModel, NDArray[np.float64], NDArray[np.float64]],
 ) -> None:
     model, _, _ = conditional
-    values, labels = model.generate(40, seed=3)
-    again, again_labels = model.generate(40, seed=3)
-    np.testing.assert_array_equal(again, values)
-    np.testing.assert_array_equal(again_labels, labels)
-    assert not np.array_equal(model.generate(40, seed=4)[0], values)
+    first = model.sample(40, seed=3)
+    again = model.sample(40, seed=3)
+    np.testing.assert_array_equal(again.values, first.values)
+    np.testing.assert_array_equal(again.labels, first.labels)
+    assert not np.array_equal(model.sample(40, seed=4).values, first.values)
     x, y = table(200, 0)
-    params = quick(ForestParams.diffusion())
+    params = quick(ForestParams.forest_diffusion())
     assert ForestModel.fit(params, x, y).to_bytes() == model.to_bytes()
 
 
@@ -123,7 +127,7 @@ def test_every_format_round_trips_bit_for_bit(
     conditional: tuple[ForestModel, NDArray[np.float64], NDArray[np.float64]], tmp_path: Path
 ) -> None:
     model, x, y = conditional
-    values, _ = model.generate(30, seed=5)
+    values = model.sample(30, seed=5).values
     holes = x[:4].copy()
     holes[:, 0] = np.nan
     filled = model.impute(holes, y[:4], n_imputations=2, seed=5)
@@ -138,7 +142,7 @@ def test_every_format_round_trips_bit_for_bit(
         pickle.loads(pickle.dumps(model)),
     ]
     for other in restored:
-        np.testing.assert_array_equal(other.generate(30, seed=5)[0], values)
+        np.testing.assert_array_equal(other.sample(30, seed=5).values, values)
         np.testing.assert_array_equal(other.impute(holes, y[:4], n_imputations=2, seed=5), filled)
         assert other.to_bytes() == binary
         assert other.method == model.method
@@ -188,11 +192,11 @@ def test_unsupported_requests_are_refused(
     with pytest.raises(HessboostError, match="Diffusion"):
         flow.impute(x[:3])
     with pytest.raises(HessboostError, match="labels"):
-        flow.generate_for_labels([0.0])
+        flow.sample_for_labels([0.0])
     with pytest.raises(HessboostError, match="n_rows"):
-        model.generate(0)
+        model.sample(0)
     with pytest.raises(HessboostError, match="label"):
-        model.generate_for_labels([3.0])
+        model.sample_for_labels([3.0])
     with pytest.raises(HessboostError, match="labels"):
         model.impute(x[:3])
     with pytest.raises(HessboostError, match="column count"):

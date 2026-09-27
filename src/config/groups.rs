@@ -458,7 +458,9 @@ impl LangevinBuilder {
         self
     }
 
-    /// The validated settings.
+    /// The validated settings. The noise scale `sqrt(2 / (eta * T))` needs
+    /// the learning rate: [`TrainingParams::validate`](super::TrainingParams::validate)
+    /// refuses a temperature that puts it outside `f32`'s normal range.
     ///
     /// # Errors
     ///

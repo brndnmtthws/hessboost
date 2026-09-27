@@ -96,11 +96,13 @@ impl Sglb {
                 ),
             ));
         }
+        // `TrainingParams::validate` keeps the scale a normal `f32` (always,
+        // for posterior sampling's row-count temperature).
         let langevin = params.langevin_on().then(|| {
             let temperature = params.effective_diffusion_temperature(n_rows);
             let reg = RegParams::from_params(params);
             Langevin {
-                sigma: (2.0 / (params.eta * temperature)).sqrt(),
+                sigma: params.langevin_noise_scale(temperature),
                 reg,
                 seed: params.seed,
             }

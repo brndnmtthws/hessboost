@@ -499,6 +499,38 @@ fn langevin_refuses_quantized_leaf_renewal() {
     );
 }
 
+/// The Langevin noise scale `sqrt(2 / (eta * T))` must be a finite,
+/// positive `f32` (the gradients' type): an underflowing `eta * T` would
+/// make every noisy gradient infinite, an overflowing one would switch the
+/// noise off. Posterior sampling's `T` (the row count) always gives one.
+#[test]
+fn langevin_noise_scale_must_be_representable() {
+    let params = |eta: f64, temperature: f64| {
+        let langevin = Langevin::builder()
+            .diffusion_temperature(temperature)
+            .build()
+            .unwrap();
+        TrainingParams::builder()
+            .eta(eta)
+            .langevin(langevin)
+            .build()
+    };
+    for (eta, temperature) in [(1e-10, 1e-300), (1e30, 1e300), (1.0, 1e-78), (1.0, 1e78)] {
+        assert_eq!(
+            common::invalid_param(params(eta, temperature)),
+            "diffusion_temperature",
+            "eta {eta}, temperature {temperature}"
+        );
+    }
+    assert!(params(1.0, 1e-70).is_ok() && params(1.0, 1e70).is_ok());
+    let tiny = TrainingParams::builder()
+        .eta(1e-44)
+        .posterior_sampling(true)
+        .build()
+        .unwrap();
+    assert!(train(&tiny, &regression(2), 1).is_ok());
+}
+
 /// Unsupported or conflicting SGLB settings are refused, never ignored.
 #[test]
 fn unsupported_combinations_are_refused() {

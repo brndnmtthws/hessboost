@@ -180,11 +180,12 @@ Beyond XGBoost (opt-in, none changes default training):
 | Metal GPU (macOS, `--features metal`) | GPU prediction about 2.5× faster than the CPU on an M4 Max, and GPU training that reproduces CPU training bit for bit |
 ## Caveats
 
-- Approximate in-place updates (`training::online`, tolerance > 0) stay close
-  to retraining without matching it, and pay off for small changes (1.3–4.8x
-  faster than retraining for 0.1–1% of the rows in its benchmarks; slower
-  beyond a few percent). Unlearning is exact only at tolerance 0, which
-  costs a retrain.
+- Approximate in-place updates (`training::online`,
+  `OnlineParams::approximate`) stay close to retraining without matching it,
+  and pay off for small changes (1.3–4.8x faster than retraining for 0.1–1%
+  of the rows in its benchmarks; slower beyond a few percent). Unlearning is
+  exact only in the exact mode (`OnlineParams::exact`; Python
+  `tolerance=0`), which costs a retrain.
 - Randomized training (sampling, forests, DART) matches XGBoost's quality,
   not its trees: the random streams differ.
 - `rank:xendcg` uses stateless keyed SplitMix64 draws per seed, iteration,

@@ -89,7 +89,7 @@ fn main() -> Result<()> {
 
     // One tree per distribution parameter and round: (μ, ln σ).
     let model = fit(normal.clone())?;
-    let dists = model.predict_distribution(&dtest)?;
+    let dists = model.predict_distribution(&dtest, Iterations::Best)?;
     println!(
         "dist:normal: {} rounds, first test rows:",
         model.best_iteration().map_or(0, |b| b + 1)
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     // Homoscedastic baseline: squared-error point model, one global sigma.
     let point = fit(Objective::SquaredError(RegLoss::default()))?;
     // One value per row.
-    let fitted = point.predict(&dtrain)?.into_vec();
+    let fitted = point.predict(&dtrain, Iterations::Best)?.into_vec();
     let labels = dtrain.labels().unwrap_or_default();
     let sigma = (fitted
         .iter()
@@ -116,7 +116,7 @@ fn main() -> Result<()> {
         / labels.len() as f64)
         .sqrt();
     let baseline: Vec<Dist> = point
-        .predict(&dtest)?
+        .predict(&dtest, Iterations::Best)?
         .into_vec()
         .into_iter()
         .map(|mu| Dist::Normal {
@@ -136,7 +136,10 @@ fn main() -> Result<()> {
     let shared = fit_with(normal, MultiStrategy::MultiOutputTree)?;
     println!(
         "  shared trees (PGB)     {:.4}  ({} trees vs {} for one tree per parameter)",
-        mean_nll(&shared.predict_distribution(&dtest)?, &dtest),
+        mean_nll(
+            &shared.predict_distribution(&dtest, Iterations::Best)?,
+            &dtest
+        ),
         shared.best_iteration().map_or(0, |b| b + 1),
         2 * model.best_iteration().map_or(0, |b| b + 1),
     );

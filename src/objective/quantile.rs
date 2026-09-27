@@ -414,6 +414,7 @@ impl Loss for Expectile {
 mod tests {
     use super::*;
     use crate::error::HessboostError;
+    use crate::model::Iterations;
     use crate::objective::Objective;
     use crate::objective::{base_margins, gradient_pairs};
     use crate::training::Trainer;
@@ -609,7 +610,7 @@ mod tests {
         let history = &result.history;
         assert_eq!(history.metrics(), ["quantile"]);
         assert!(history.last().unwrap().values()[0] < history.round(0).unwrap().values()[0]);
-        let pred = result.model.predict(&d).unwrap();
+        let pred = result.model.predict(&d, Iterations::Best).unwrap();
         assert_eq!((pred.n_rows(), pred.width()), (n, 3));
         let mut below = [0usize; 3];
         for (row, &yi) in pred.rows().zip(&y) {
@@ -659,10 +660,13 @@ mod tests {
             }
         };
         close(
-            model.predict_margin(&d).unwrap(),
-            restored.predict_margin(&d).unwrap(),
+            model.predict_margin(&d, Iterations::Best).unwrap(),
+            restored.predict_margin(&d, Iterations::Best).unwrap(),
         );
-        close(model.predict(&d).unwrap(), restored.predict(&d).unwrap());
+        close(
+            model.predict(&d, Iterations::Best).unwrap(),
+            restored.predict(&d, Iterations::Best).unwrap(),
+        );
     }
 
     /// Every alpha output fits the one label column: a label matrix is

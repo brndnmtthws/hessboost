@@ -15,13 +15,13 @@
 //! element, or as one flat slice via [`as_slice`](Predictions::as_slice) /
 //! [`into_vec`](Predictions::into_vec).
 //!
-//! Each has a `_range` variant ([`predict_range`], [`predict_margin_range`],
-//! [`predict_leaf_range`], [`predict_contribs_range`],
-//! [`predict_interactions_range`], [`predict_distribution_range`]) taking
-//! XGBoost's `iteration_range` as a Rust range of boosting iterations: `..`
-//! for all, `..n` for the first `n`, `2..5`. Leaf, contribution, and
-//! interaction ranges must start at 0. [`BoostedModel::slice`] cuts a
-//! sub-model out of an iteration range with a step.
+//! Every prediction method takes the boosting iterations it uses
+//! ([`Iterations`], XGBoost's `iteration_range`): [`Iterations::Best`] for
+//! the effective iterations (through `best_iteration` after early stopping,
+//! else all), or a Rust range of iterations: `..` for all, `..n` for the
+//! first `n`, `2..5`. Leaf, contribution, and interaction ranges must start
+//! at 0 (`Best` always does). [`BoostedModel::slice`] cuts a sub-model out
+//! of an iteration range with a step.
 //!
 //! A model trained with per-iteration model shrinkage
 //! ([`model_shrink`](crate::config::TrainingParams::model_shrink),
@@ -251,7 +251,7 @@
 //! `quantile_loss_param.quantile_alpha`,
 //! `expectile_loss_param.expectile_alpha`,
 //! `aft_loss_param.{aft_loss_distribution, aft_loss_distribution_scale}`)
-//! becomes the parameters of the model's [`Objective`]
+//! becomes the parameters of the model's [`Objective`](crate::objective::Objective)
 //! ([`ModelObjective::built_in`]), `scale_pos_weight` for every `RegLossObj`
 //! objective (`reg:squarederror`, `reg:gamma`, and the logistic ones); absent
 //! fields take XGBoost's defaults, and parameters the objective does not read
@@ -318,12 +318,6 @@
 //! [`predict_distribution`]: BoostedModel::predict_distribution
 //! [`predict_contribs`]: BoostedModel::predict_contribs
 //! [`predict_interactions`]: BoostedModel::predict_interactions
-//! [`predict_range`]: BoostedModel::predict_range
-//! [`predict_margin_range`]: BoostedModel::predict_margin_range
-//! [`predict_leaf_range`]: BoostedModel::predict_leaf_range
-//! [`predict_contribs_range`]: BoostedModel::predict_contribs_range
-//! [`predict_interactions_range`]: BoostedModel::predict_interactions_range
-//! [`predict_distribution_range`]: BoostedModel::predict_distribution_range
 //! [`from_bytes`]: BoostedModel::from_bytes
 //! [`save_binary`]: BoostedModel::save_binary
 //! [`load_binary`]: BoostedModel::load_binary
@@ -344,31 +338,37 @@ pub mod compact;
 mod lightgbm;
 pub(crate) mod native;
 mod objective;
+mod predict;
 mod predictions;
 pub(crate) mod sections;
+mod serde;
 mod shap;
 mod shrinkage;
+mod slice;
 mod ubjson;
 pub mod uncertainty;
+mod validate;
 mod xgboost;
 
 pub(crate) use shrinkage::{Shrinkage, shrink_margins};
 
 pub use objective::ModelObjective;
+pub use predict::Iterations;
+use predict::RowBlock;
+pub(crate) use predict::{initial_margins, transform_margins_in_place, transform_model_margins};
 pub use predictions::{Contributions, Interactions, Predictions};
+pub(crate) use validate::{check_objective_width, validate_prediction_data};
 
+use self::serde::UncheckedBoostedModel;
 use crate::data::DMatrix;
 use crate::ebm::EbmInfo;
 use crate::error::{HessboostError, Result};
 use crate::inference::BoulevardInfo;
-use crate::objective::distributional::Dist;
-use crate::objective::{Loss, LossContext, Objective};
-use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, key};
-use crate::tree::{RegTree, UncheckedRegTree, scalar_tree_output};
-use objective::{PartialStoredObjectiveParams, StoredObjectiveParams};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use crate::objective::{Loss, LossContext};
+use crate::tree::compact::CompactForest;
+use crate::tree::{RegTree, scalar_tree_output};
+use ::serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -439,11 +439,11 @@ pub struct BoostedModel {
     n_features: usize,
     /// The best iteration index selected by early stopping, if any.
     best_iteration: Option<usize>,
-    /// Per-tree contribution weights: empty when every tree weighs `1.0`
-    /// (e.g. imported or sliced `gbtree` models), otherwise one weight per
-    /// tree. The DART booster stores fractional weights here so dropped trees
-    /// can be rescaled.
-    tree_weights: Vec<f32>,
+    /// Per-tree contribution weights: [`TreeWeights::Unit`] when every tree
+    /// weighs `1.0` (e.g. imported or sliced `gbtree` models), otherwise one
+    /// weight per tree. The DART booster stores fractional weights here so
+    /// dropped trees can be rescaled.
+    tree_weights: TreeWeights,
     /// Trees grown per output in each boosting iteration (XGBoost
     /// `num_parallel_tree`; `1` for ordinary boosting, more for boosted
     /// random forests).
@@ -468,133 +468,85 @@ pub struct BoostedModel {
     compact: OnceLock<CompactForest>,
 }
 
-/// A [`BoostedModel`] as native JSON stores it (same names and order as
-/// [`UncheckedBoostedModel`]), borrowed from the model.
-#[derive(Serialize)]
-struct SerializedBoostedModel<'a> {
-    trees: &'a [RegTree],
-    base_score: &'a [f32],
-    objective: &'a str,
-    objective_params: StoredObjectiveParams,
-    num_class: usize,
-    n_outputs: usize,
-    n_targets: usize,
-    n_features: usize,
-    best_iteration: Option<usize>,
-    tree_weights: &'a [f32],
-    num_parallel_tree: usize,
-    linear: &'a Option<LinearModel>,
-    shrinkage: &'a Option<Shrinkage>,
-    boulevard: &'a Option<BoulevardInfo>,
-    ebm: &'a Option<EbmInfo>,
+/// Per-tree contribution weights of a [`BoostedModel`]. Every format stores
+/// [`Self::Unit`] as an empty list and reads an empty list back as it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TreeWeights {
+    /// Every tree weighs `1.0`.
+    Unit,
+    /// One weight per tree (never empty).
+    Explicit(Vec<f32>),
 }
 
-impl Serialize for BoostedModel {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        SerializedBoostedModel {
-            trees: &self.trees,
-            base_score: &self.base_score,
-            objective: self.objective.name(),
-            objective_params: StoredObjectiveParams::of(&self.objective, self.max_delta_step),
-            num_class: self.num_class,
-            n_outputs: self.n_outputs,
-            n_targets: self.n_targets,
-            n_features: self.n_features,
-            best_iteration: self.best_iteration,
-            tree_weights: &self.tree_weights,
-            num_parallel_tree: self.num_parallel_tree,
-            linear: &self.linear,
-            shrinkage: &self.shrinkage,
-            boulevard: &self.boulevard,
-            ebm: &self.ebm,
+impl TreeWeights {
+    /// The weights stored as `weights`: [`Self::Unit`] when empty.
+    pub(crate) fn from_vec(weights: Vec<f32>) -> Self {
+        if weights.is_empty() {
+            Self::Unit
+        } else {
+            Self::Explicit(weights)
         }
-        .serialize(serializer)
     }
-}
 
-/// The serialized fields of a [`BoostedModel`] (the native JSON format:
-/// same names and layout), before validation. `BoostedModel`'s
-/// `Deserialize` converts it with [`BoostedModel::try_from`], which runs
-/// [`BoostedModel::validate_structure`].
-///
-/// Everything predictions depend on is required, including the nullable
-/// `linear` (the gblinear weights), which a plain `Option` field would
-/// default to `null` when absent; an absent `best_iteration` means none was
-/// selected (every iteration predicts). Only the objective
-/// parameters may be omitted (all of them, or any subset): each missing
-/// one takes the recorded objective's default
-/// ([`StoredObjectiveParams::defaults_for`]). A tree may omit `size_leaf_vector`
-/// (scalar) and `leaf_vectors` (none), except that a multi-output model's
-/// trees must state `size_leaf_vector`, since it decides whether they are
-/// vector-leaf trees; each tree's `linear` is required
-/// ([`UncheckedRegTree`]). An absent `boulevard` or `ebm` (files written
-/// before those boosters existed) means the model is not such a fit.
-#[derive(Deserialize)]
-struct UncheckedBoostedModel {
-    trees: Vec<UncheckedRegTree>,
-    base_score: Vec<f32>,
-    objective: String,
-    #[serde(default)]
-    objective_params: PartialStoredObjectiveParams,
-    num_class: usize,
-    n_outputs: usize,
-    n_targets: usize,
-    n_features: usize,
-    best_iteration: Option<usize>,
-    tree_weights: Vec<f32>,
-    num_parallel_tree: usize,
-    #[serde(deserialize_with = "Option::deserialize")]
-    linear: Option<LinearModel>,
-    /// Absent in files written before model shrinkage existed: none.
-    #[serde(default)]
-    shrinkage: Option<Shrinkage>,
-    #[serde(default)]
-    boulevard: Option<BoulevardInfo>,
-    #[serde(default)]
-    ebm: Option<EbmInfo>,
-}
-
-impl TryFrom<UncheckedBoostedModel> for BoostedModel {
-    type Error = HessboostError;
-
-    fn try_from(m: UncheckedBoostedModel) -> Result<Self> {
-        if m.n_outputs > 1
-            && let Some(tree) = m.trees.iter().position(|t| !t.states_leaf_width())
-        {
-            return Err(HessboostError::ModelFormat(format!(
-                "tree {tree} of a {}-output model does not state size_leaf_vector",
-                m.n_outputs
-            )));
+    /// The stored form: empty for [`Self::Unit`].
+    pub(crate) fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Unit => &[],
+            Self::Explicit(weights) => weights,
         }
-        let stored = m.objective_params.fill(&m.objective);
-        let objective = ModelObjective::from_stored(&m.objective, &stored, m.num_class)?;
-        let model = BoostedModel {
-            trees: m
-                .trees
-                .into_iter()
-                .map(UncheckedRegTree::into_unchecked)
-                .collect(),
-            base_score: m.base_score,
-            max_delta_step: stored.max_delta_step,
-            objective,
-            num_class: m.num_class,
-            n_outputs: m.n_outputs,
-            n_targets: m.n_targets,
-            n_features: m.n_features,
-            best_iteration: m.best_iteration,
-            tree_weights: m.tree_weights,
-            num_parallel_tree: m.num_parallel_tree,
-            linear: m.linear,
-            shrinkage: m.shrinkage,
-            boulevard: m.boulevard,
-            ebm: m.ebm,
-            compact: OnceLock::new(),
-        };
-        model.validate_structure()?;
-        Ok(model)
+    }
+
+    /// The stored weights in order (none for [`Self::Unit`]).
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, f32> {
+        self.as_slice().iter()
+    }
+
+    /// Weight of tree `i`.
+    #[inline]
+    fn get(&self, i: usize) -> f32 {
+        match self {
+            Self::Unit => 1.0,
+            Self::Explicit(weights) => weights[i],
+        }
+    }
+
+    /// Append the weight of a new tree to a forest of `n_trees` trees.
+    fn push(&mut self, n_trees: usize, weight: f32) {
+        self.materialize(n_trees);
+        match self {
+            Self::Unit => *self = Self::Explicit(vec![weight]),
+            Self::Explicit(weights) => weights.push(weight),
+        }
+    }
+
+    /// Store one weight for each of `n_trees` trees (`1.0` where absent).
+    fn materialize(&mut self, n_trees: usize) {
+        match self {
+            Self::Unit if n_trees > 0 => *self = Self::Explicit(vec![1.0; n_trees]),
+            Self::Unit => {}
+            Self::Explicit(weights) => weights.resize(n_trees, 1.0),
+        }
+    }
+
+    /// Multiply tree `i`'s weight by `factor` (a no-op for [`Self::Unit`]).
+    fn scale(&mut self, i: usize, factor: f32) {
+        if let Self::Explicit(weights) = self
+            && let Some(weight) = weights.get_mut(i)
+        {
+            *weight *= factor;
+        }
+    }
+
+    /// The weights of the trees `layers` selects, in order.
+    fn select(&self, layers: impl Iterator<Item = Range<usize>>) -> Self {
+        match self {
+            Self::Unit => Self::Unit,
+            Self::Explicit(weights) => Self::from_vec(
+                layers
+                    .flat_map(|layer| weights[layer].iter().copied())
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -692,7 +644,7 @@ impl BoostedModel {
             n_targets: self.n_targets,
             n_features: self.n_features,
             best_iteration: None,
-            tree_weights: Vec::new(),
+            tree_weights: TreeWeights::Unit,
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
             shrinkage: None,
@@ -706,8 +658,8 @@ impl BoostedModel {
     /// `gbtree`; DART stores fractional weights so dropped trees can be
     /// rescaled).
     pub(crate) fn push_tree_weighted(&mut self, tree: RegTree, weight: f32) {
+        self.tree_weights.push(self.trees.len(), weight);
         self.trees.push(tree);
-        self.tree_weights.push(weight);
         self.compact = OnceLock::new();
     }
 
@@ -722,7 +674,7 @@ impl BoostedModel {
     /// imported models or plain `gbtree`).
     #[inline]
     pub(crate) fn tree_weight(&self, i: usize) -> f32 {
-        self.tree_weights.get(i).copied().unwrap_or(1.0)
+        self.tree_weights.get(i)
     }
 
     /// Whether this is a `gblinear` model, whose predictions come from the
@@ -768,9 +720,7 @@ impl BoostedModel {
 
     /// Multiply tree `i`'s contribution weight by `factor` (DART rescaling).
     pub(crate) fn scale_tree_weight(&mut self, i: usize, factor: f32) {
-        if i < self.tree_weights.len() {
-            self.tree_weights[i] *= factor;
-        }
+        self.tree_weights.scale(i, factor);
     }
 
     /// Raw margin predictions that exclude the trees marked `true` in `dropped`
@@ -845,7 +795,7 @@ impl BoostedModel {
             n_targets: spec.n_targets,
             n_features: spec.n_features,
             best_iteration: None,
-            tree_weights,
+            tree_weights: TreeWeights::from_vec(tree_weights),
             num_parallel_tree: 1,
             linear: None,
             shrinkage: None,
@@ -911,266 +861,33 @@ impl BoostedModel {
         self.best_iteration
     }
 
-    /// Margins from the trees `trees` (tree ids) without validating `data`.
-    pub(crate) fn margin_from_trees(
-        &self,
-        data: &DMatrix,
-        trees: std::ops::Range<usize>,
-    ) -> Vec<f32> {
-        let n = data.n_rows();
-        let k = self.n_outputs();
-        // Initialize from the dataset's per-instance base margin when present
-        // (it overrides the per-output intercepts, matching XGBoost); otherwise
-        // use the trained global bias.
-        let mut out = self.initial_margins(data);
-        // A gblinear model predicts from its linear parameters and ignores the
-        // (empty) tree ensemble: margin(row, k) = base_score[k] + bias[k] +
-        // Σ_f weights[f][k] * x[row, f], with missing features contributing 0.
-        if let Some(lm) = &self.linear {
-            // Each row adds its bias, then its features in ascending order.
-            let add_row = |(row, margin): (usize, &mut [f32])| {
-                for (m, &b) in margin.iter_mut().zip(&lm.bias) {
-                    *m += b;
-                }
-                self.for_each_linear_contribution(data, row, |_f, c, v| {
-                    margin[c] += v as f32;
-                });
-            };
-            // Rows are independent, so parallel rows give the serial result.
-            if n >= PREDICT_BLOCK_ROWS && rayon::current_num_threads() > 1 {
-                out.par_chunks_mut(k)
-                    .with_min_len(PREDICT_BLOCK_ROWS)
-                    .enumerate()
-                    .for_each(add_row);
-            } else {
-                out.chunks_mut(k).enumerate().for_each(add_row);
-            }
-            return out;
-        }
-        self.accumulate_forest(data, &mut out, trees, |ti| self.tree_weight(ti));
-        out
-    }
-
-    /// Sum `weight(t) * leaf(row, t)` into `out[row * k + tree_output(t)]` for
-    /// the trees in `trees`, where `k` is the output count. Rows are traversed
-    /// in cache-friendly blocks (parallel across blocks); per (row, output)
-    /// slot the trees are still summed in ascending order, so the result is
-    /// bit-identical to the sequential tree-outer loop. Ensembles with linear
-    /// leaves take a per-row path instead, since the compact forest stores
-    /// constant leaf values only.
-    fn accumulate_forest(
-        &self,
-        data: &DMatrix,
-        out: &mut [f32],
-        trees: std::ops::Range<usize>,
-        weight: impl Fn(usize) -> f32 + Sync,
-    ) {
-        let k = self.n_outputs();
-        if self.has_vector_leaves() {
-            self.traverse_blocks(
-                data,
-                out,
-                k,
-                trees.clone(),
-                |block, forest, r, out_row| {
-                    block.accumulate_row_vector(forest, r, trees.clone(), &weight, out_row);
-                },
-                |block, forest, ti, rows, out_block, stride| {
-                    block.accumulate_vector(forest, ti, rows, weight(ti), out_block, stride);
-                },
-            );
-            return;
-        }
-        if self.trees[trees.clone()]
-            .iter()
-            .any(|tree| tree.linear_leaves().is_some())
-        {
-            crate::tree::linear::accumulate_forest(
-                &self.trees,
-                trees,
-                |t| self.tree_output(t),
-                data,
-                out,
-                k,
-                weight,
-            );
-            return;
-        }
-        let parallel = self.num_parallel_tree;
-        self.traverse_blocks(
-            data,
-            out,
-            k,
-            trees.clone(),
-            |block, forest, r, out_row| {
-                block.accumulate_row(forest, r, trees.clone(), parallel, &weight, out_row);
-            },
-            |block, forest, ti, rows, out_block, stride| {
-                block.accumulate(
-                    forest,
-                    ti,
-                    rows,
-                    weight(ti),
-                    &mut out_block[self.tree_output(ti)..],
-                    stride,
-                );
-            },
-        );
-    }
-
-    /// Block-parallel traversal of the trees in `trees` over `data`, writing
-    /// into `out` laid out `[row][stride]`: `row_op` handles one loaded row of
-    /// the small-batch path, `tree_op` one tree over a loaded block of rows.
-    /// Tiny batches (online serving) skip the thread pool and overlap the
-    /// trees of each row instead of the rows of each tree; larger inputs
-    /// process rows in blocks whose feature rows stay in cache while every
-    /// tree walks them, with blocks running in parallel.
-    fn traverse_blocks<T: Send>(
-        &self,
-        data: &DMatrix,
-        out: &mut [T],
-        stride: usize,
-        trees: std::ops::Range<usize>,
-        row_op: impl Fn(&RowBlock, &CompactForest, usize, &mut [T]),
-        tree_op: impl Fn(&RowBlock, &CompactForest, usize, usize, &mut [T], usize) + Sync,
-    ) {
-        let n = data.n_rows();
-        let forest = self.compact_forest();
-        if n < LANES {
-            let mut block = RowBlock::new(data);
-            block.load(0, n);
-            for (r, out_row) in out.chunks_exact_mut(stride).enumerate() {
-                row_op(&block, forest, r, out_row);
-            }
-            return;
-        }
-        out.par_chunks_mut(PREDICT_BLOCK_ROWS * stride)
-            .enumerate()
-            .for_each_init(
-                || RowBlock::new(data),
-                |block, (bi, out_block)| {
-                    let start = bi * PREDICT_BLOCK_ROWS;
-                    let rows = out_block.len() / stride;
-                    block.load(start, rows);
-                    for ti in trees.clone() {
-                        tree_op(block, forest, ti, rows, out_block, stride);
-                    }
-                },
-            );
-    }
-
-    /// [`Self::predict`] from the boosting `iterations` only (see
-    /// [`Self::predict_margin_range`] for the range convention).
-    pub fn predict_range(
-        &self,
-        data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
-    ) -> Result<Predictions> {
-        let margin = self.predict_margin_range(data, iterations)?;
-        Ok(transform_model_margins(
-            &self.objective,
-            self.max_delta_step,
-            self.n_targets,
-            margin,
-        ))
-    }
-
-    /// For multiclass, the predicted class index per row (argmax over classes).
-    /// For single-output models this returns the transformed prediction rounded
-    /// to the nearest class at 0.5. A multi-target model (label matrix) is
-    /// multi-label: each target is thresholded at 0.5 independently, giving
-    /// `n_rows × n_targets` decisions laid out `[row][target]`.
-    pub fn predict_class(&self, data: &DMatrix) -> Result<Predictions<u32>> {
-        let probs = self.predict(data)?;
-        let k = self.n_outputs();
-        if k == 1 || self.n_targets > 1 {
-            let values = probs
-                .as_slice()
-                .iter()
-                .map(|&p| u32::from(p > 0.5))
-                .collect();
-            return Ok(Predictions::new(values, probs.n_rows(), probs.width()));
-        }
-        if self
-            .objective
-            .built_in()
-            .is_some_and(Objective::predicts_class_index)
-        {
-            let values = probs.as_slice().iter().map(|&class| class as u32).collect();
-            return Ok(Predictions::new(values, probs.n_rows(), 1));
-        }
-        let values = probs
-            .rows()
-            .map(|row| crate::simd::argmax_scalar(row) as u32)
-            .collect();
-        Ok(Predictions::new(values, probs.n_rows(), 1))
-    }
-
-    /// [`Self::predict_leaf`] for the trees of the iterations in
-    /// `iterations` (shape `n_rows × trees`). As in XGBoost the range
-    /// must start at iteration `0`; use [`Self::slice`] for a later start.
-    #[allow(
-        clippy::redundant_closure_for_method_calls,
-        reason = "the method path is not general enough over the block lifetime"
-    )]
-    pub fn predict_leaf_range(
-        &self,
-        data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
-    ) -> Result<Predictions<u32>> {
-        self.validate_prediction_data(data)?;
-        let t = self.prefix_trees(iterations, "leaf prediction")?;
-        let n = data.n_rows();
-        let mut out = vec![0u32; n * t];
-        if t == 0 {
-            return Ok(Predictions::new(out, n, t));
-        }
-        self.traverse_blocks(
-            data,
-            &mut out,
-            t,
-            0..t,
-            |block, forest, r, out_row| block.original_leaf_ids_for_row(forest, r, out_row),
-            |block, forest, ti, rows, out_block, stride| {
-                block.original_leaf_ids(forest, ti, rows, &mut out_block[ti..], stride);
-            },
-        );
-        Ok(Predictions::new(out, n, t))
-    }
-
     /// Compute feature importance of the requested type, returned as a map from
-    /// feature index to score (features that never split are absent).
-    pub fn feature_importance(&self, kind: ImportanceType) -> HashMap<u32, f64> {
-        let mut count: HashMap<u32, f64> = HashMap::new();
-        let mut cover: HashMap<u32, f64> = HashMap::new();
-        let mut gain: HashMap<u32, f64> = HashMap::new();
+    /// feature index to score in ascending feature order (features that never
+    /// split are absent).
+    pub fn feature_importance(&self, kind: ImportanceType) -> BTreeMap<usize, f64> {
+        let value = |node: &crate::tree::Node| match kind {
+            ImportanceType::Weight => 1.0,
+            ImportanceType::Cover | ImportanceType::TotalCover => f64::from(node.sum_hess),
+            ImportanceType::Gain | ImportanceType::TotalGain => f64::from(node.split_gain),
+        };
+        // Per feature: the total of `value` and the split count.
+        let mut totals: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
         for tree in &self.trees {
             for node in tree.nodes() {
                 if node.is_leaf() {
                     continue;
                 }
-                *count.entry(node.split_feature).or_default() += 1.0;
-                *cover.entry(node.split_feature).or_default() += f64::from(node.sum_hess);
-                *gain.entry(node.split_feature).or_default() += f64::from(node.split_gain);
+                let (total, count) = totals.entry(node.split_feature as usize).or_default();
+                *total += value(node);
+                *count += 1.0;
             }
         }
         // Divide a total by the split count to get the per-split average.
-        let average = |totals: HashMap<u32, f64>| -> HashMap<u32, f64> {
-            totals
-                .into_iter()
-                .map(|(f, t)| {
-                    let n = count.get(&f).copied().unwrap_or(1.0);
-                    (f, t / n)
-                })
-                .collect()
-        };
-        match kind {
-            ImportanceType::Weight => count,
-            ImportanceType::TotalCover => cover,
-            ImportanceType::Cover => average(cover),
-            ImportanceType::TotalGain => gain,
-            ImportanceType::Gain => average(gain),
-        }
+        let average = matches!(kind, ImportanceType::Cover | ImportanceType::Gain);
+        totals
+            .into_iter()
+            .map(|(f, (total, count))| (f, if average { total / count } else { total }))
+            .collect()
     }
 
     /// Lay this model out for GPU batch prediction on Metal. Without the
@@ -1220,7 +937,7 @@ impl BoostedModel {
     fn attribution_prologue(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: Iterations,
         what: &str,
     ) -> Result<AttributionPrologue<'_>> {
         self.validate_prediction_data(data)?;
@@ -1267,14 +984,14 @@ impl BoostedModel {
     /// Give every tree an explicit contribution weight (`1.0` where absent),
     /// so appended trees' weights line up with their tree ids.
     pub(crate) fn materialize_tree_weights(&mut self) {
-        self.tree_weights.resize(self.trees.len(), 1.0);
+        self.tree_weights.materialize(self.trees.len());
     }
 
     /// Remove and return every tree (dropping the contribution weights),
     /// leaving an empty ensemble with the same metadata. Used by
     /// `process_type=update`, which re-appends the refreshed trees.
     pub(crate) fn take_trees(&mut self) -> Vec<RegTree> {
-        self.tree_weights.clear();
+        self.tree_weights = TreeWeights::Unit;
         self.compact = OnceLock::new();
         std::mem::take(&mut self.trees)
     }
@@ -1366,23 +1083,29 @@ impl BoostedModel {
         })
     }
 
-    /// The iteration range plain prediction uses: `..best_iteration + 1`
-    /// when early stopping selected an iteration, else every iteration
-    /// (`..`, which is also the only range a `gblinear` model accepts).
-    pub(crate) fn default_iteration_range(&self) -> (Bound<usize>, Bound<usize>) {
-        let end = self
-            .best_iteration
-            .map_or(Bound::Unbounded, |it| Bound::Excluded(it + 1));
-        (Bound::Unbounded, end)
+    /// The bounds of `iterations`: [`Iterations::Best`] is
+    /// `..best_iteration + 1` when early stopping selected an iteration,
+    /// else every iteration (`..`, which is also the only range a
+    /// `gblinear` model accepts).
+    fn iteration_bounds(&self, iterations: Iterations) -> (Bound<usize>, Bound<usize>) {
+        match iterations {
+            Iterations::Best => {
+                let end = self
+                    .best_iteration
+                    .map_or(Bound::Unbounded, |it| Bound::Excluded(it + 1));
+                (Bound::Unbounded, end)
+            }
+            Iterations::Range { start, end } => (start, end),
+        }
     }
 
-    /// Resolve `iterations`, any range of boosting iterations (`..`, `..end`,
-    /// `begin..end`, ...), against the model's iteration count.
+    /// Resolve `iterations` against the model's iteration count.
     pub(crate) fn resolve_iterations(
         &self,
-        iterations: impl RangeBounds<usize>,
+        iterations: Iterations,
         param: &'static str,
     ) -> Result<Range<usize>> {
+        let iterations = self.iteration_bounds(iterations);
         if self.linear.is_some() {
             // No iterations to select: only the whole model (`..`) is a range.
             let whole = matches!(
@@ -1429,7 +1152,7 @@ impl BoostedModel {
     /// The trees of `iterations` for the attribution and leaf predictions,
     /// which (as in XGBoost) only accept ranges starting at iteration `0`;
     /// slice the model for a later start.
-    fn prefix_trees(&self, iterations: impl RangeBounds<usize>, what: &str) -> Result<usize> {
+    fn prefix_trees(&self, iterations: Iterations, what: &str) -> Result<usize> {
         let trees = self.iteration_trees(self.resolve_iterations(iterations, "iterations")?);
         if trees.start != 0 {
             return Err(HessboostError::invalid_param(
@@ -1442,317 +1165,13 @@ impl BoostedModel {
         Ok(trees.end)
     }
 
-    /// Raw margin predictions using the effective iterations (`[0,
-    /// best_iteration + 1)` after early stopping, else all), laid out
-    /// `[row][output]` (`n_outputs` wide).
-    pub fn predict_margin(&self, data: &DMatrix) -> Result<Predictions> {
-        self.predict_margin_range(data, self.default_iteration_range())
-    }
-
-    /// Raw margin predictions from the boosting `iterations` only (XGBoost's
-    /// `iteration_range`), any range of iteration indices: `..` is the whole
-    /// model regardless of early stopping, `..n` the first `n` iterations,
-    /// `2..5` iterations 2 to 4. The intercept / dataset `base_margin` is
-    /// always included, so an empty range predicts it alone. A `gblinear`
-    /// model has no boosting iterations to select and accepts only `..`.
-    ///
-    /// For a model trained with model shrinkage
-    /// ([`TrainingParams::model_shrink`](crate::config::TrainingParams::model_shrink)),
-    /// `..n` is the model after `n` iterations, predicted with training's
-    /// arithmetic (bit for bit the margins training reached after `n`
-    /// rounds, and the predictions of the same run stopped there): from the
-    /// unshrunk intercepts, every iteration shrinks the margins and adds its
-    /// trees. A dataset's `base_margin` replaces the shrunk intercepts (it
-    /// is added to the trees' shrunk sum). Ranges starting after iteration 0
-    /// are refused, since the ensemble is rescaled every iteration.
-    pub fn predict_margin_range(
-        &self,
-        data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
-    ) -> Result<Predictions> {
-        self.validate_prediction_data(data)?;
-        let iterations = self.resolve_iterations(iterations, "iterations")?;
-        if let Some(shrinkage) = &self.shrinkage {
-            // Every later iteration rescaled the earlier ones, so the
-            // iterations `a..b` alone are no model.
-            if iterations.start != 0 {
-                return Err(HessboostError::invalid_param(
-                    "iterations",
-                    format!(
-                        "a model trained with model shrinkage rescales its earlier iterations \
-                         every iteration, so {}..{} has no meaning; use a range starting at 0",
-                        iterations.start, iterations.end
-                    ),
-                ));
-            }
-            let values = self.shrunk_margins(shrinkage, data, iterations.end);
-            return Ok(Predictions::new(values, data.n_rows(), self.n_outputs()));
-        }
-        let values = self.margin_from_trees(data, self.iteration_trees(iterations));
-        Ok(Predictions::new(values, data.n_rows(), self.n_outputs()))
-    }
-
-    /// The margins of a shrunk model after its first `k` iterations, with
-    /// training's arithmetic ([`shrinkage`]): from
-    /// [`Shrinkage::start_margins`], every iteration shrinks every margin
-    /// ([`shrink_margins`]) and then adds its trees, each once per cell in
-    /// tree order (the blocked traversal keeps that order per cell).
-    fn shrunk_margins(&self, shrinkage: &Shrinkage, data: &DMatrix, k: usize) -> Vec<f32> {
-        let mut out = shrinkage.start_margins(data);
-        let factors = &shrinkage.factors()[..k];
-        let per = self.trees_per_iteration();
-        let n_out = self.n_outputs();
-        let trees = 0..k * per;
-        let unit = |_: usize| 1.0f32;
-        if self.trees[trees.clone()]
-            .iter()
-            .any(|tree| tree.linear_leaves().is_some())
-        {
-            for (i, &factor) in factors.iter().enumerate() {
-                shrink_margins(&mut out, factor);
-                crate::tree::linear::accumulate_forest(
-                    &self.trees,
-                    i * per..(i + 1) * per,
-                    |t| self.tree_output(t),
-                    data,
-                    &mut out,
-                    n_out,
-                    unit,
-                );
-            }
-        } else {
-            let vector = self.has_vector_leaves();
-            let parallel = self.num_parallel_tree;
-            self.traverse_blocks(
-                data,
-                &mut out,
-                n_out,
-                trees,
-                |block, forest, r, out_row| {
-                    for (i, &factor) in factors.iter().enumerate() {
-                        shrink_margins(out_row, factor);
-                        let layer = i * per..(i + 1) * per;
-                        if vector {
-                            block.accumulate_row_vector(forest, r, layer, unit, out_row);
-                        } else {
-                            block.accumulate_row(forest, r, layer, parallel, unit, out_row);
-                        }
-                    }
-                },
-                |block, forest, ti, rows, out_block, stride| {
-                    if ti % per == 0 {
-                        shrink_margins(&mut out_block[..rows * stride], factors[ti / per]);
-                    }
-                    if vector {
-                        block.accumulate_vector(forest, ti, rows, 1.0, out_block, stride);
-                    } else {
-                        let out = &mut out_block[self.tree_output(ti)..];
-                        block.accumulate(forest, ti, rows, 1.0, out, stride);
-                    }
-                },
-            );
-        }
-        shrinkage.finish_margins(data, &mut out);
-        out
-    }
-
-    /// Refuse anything but the whole ensemble of a shrunk model, for the
-    /// predictions (`what`) that read the stored tree weights directly;
-    /// [`Self::slice`]`(..k, 1)` builds the model after `k` iterations.
-    pub(crate) fn refuse_partial_shrunk_range(
-        &self,
-        trees: &Range<usize>,
-        what: &str,
-    ) -> Result<()> {
-        if self.shrinkage.is_none() || (trees.start == 0 && trees.end == self.trees.len()) {
-            return Ok(());
-        }
-        Err(HessboostError::invalid_param(
-            "iterations",
-            format!(
-                "{what} of a model trained with model shrinkage covers the whole ensemble \
-                 only; `slice(..k, 1)` builds the model after `k` iterations"
-            ),
-        ))
-    }
-
-    /// Predictions in the objective's reported space. `multi:softprob` returns
-    /// an `n_rows × num_class` probability matrix while `multi:softmax` returns
-    /// one class index per row, encoded as `f32`. Uses the effective
-    /// iterations, like [`Self::predict_margin`].
-    pub fn predict(&self, data: &DMatrix) -> Result<Predictions> {
-        self.predict_range(data, self.default_iteration_range())
-    }
-
-    /// The predicted distribution of every row for a model trained with a
-    /// distributional `dist:*` objective (beyond XGBoost, see
-    /// [`crate::objective::distributional`]): one [`Dist`] per row, with its
-    /// mean, variance, CDF, quantiles, log density, CRPS, intervals and
-    /// sampling. The margins are mapped through the links in `f64`. Uses the
-    /// effective iterations, like [`Self::predict`].
-    ///
-    /// # Errors
-    ///
-    /// [`HessboostError::InvalidParameter`] if the model's objective is not
-    /// a `dist:*` objective, plus the errors of [`Self::predict_margin`].
-    pub fn predict_distribution(&self, data: &DMatrix) -> Result<Vec<Dist>> {
-        self.predict_distribution_range(data, self.default_iteration_range())
-    }
-
-    /// [`Self::predict_distribution`] from the boosting iterations in
-    /// `iterations` only (see [`Self::predict_margin_range`]).
-    pub fn predict_distribution_range(
-        &self,
-        data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
-    ) -> Result<Vec<Dist>> {
-        let family = self
-            .objective
-            .built_in()
-            .and_then(Objective::dist_family)
-            .ok_or_else(|| {
-                HessboostError::invalid_param(
-                    "objective",
-                    format!(
-                        "`{}` does not predict distributions; train with a `dist:*` objective",
-                        self.objective.name()
-                    ),
-                )
-            })?;
-        let margin = self.predict_margin_range(data, iterations)?;
-        Ok(margin
-            .as_slice()
-            .chunks_exact(family.n_params())
-            .map(|row| {
-                let mut eta = [0.0; 2];
-                for (e, &m) in eta.iter_mut().zip(row) {
-                    *e = f64::from(m);
-                }
-                family.dist_from_margins(&eta[..row.len()])
-            })
-            .collect())
-    }
-
-    /// Per-row leaf indices for each tree (shape `n_rows × num_trees`,
-    /// row-major, trees in [`Self::trees`] order). Walks every tree,
-    /// regardless of early stopping.
-    pub fn predict_leaf(&self, data: &DMatrix) -> Result<Predictions<u32>> {
-        self.predict_leaf_range(data, ..)
-    }
-
-    /// A new model holding every `step`-th boosting iteration of
-    /// `iterations` (Python's `booster[begin:end:step]`; e.g.
-    /// `model.slice(2..8, 3)` keeps iterations 2 and 5, `model.slice(.., 1)`
-    /// all of them). Each selected iteration keeps its whole
-    /// forest (every output and parallel tree) together with its DART tree
-    /// weights; the intercepts, objective and layout carry over unchanged and
-    /// no refit happens. As in XGBoost the slice drops `best_iteration`, so
-    /// it predicts with all of its iterations.
-    ///
-    /// A model trained with model shrinkage slices to prefixes only
-    /// (`..k` with step 1): the result is the model after `k` iterations,
-    /// bit for bit the model the same training run stopped after `k` rounds
-    /// returns (see [`Self::predict_margin_range`]).
-    ///
-    /// `step` must be at least 1 and the range non-empty and within
-    /// [`Self::num_boost_rounds`]. XGBoost 3.4.2 additionally trips an
-    /// internal check when `end - begin` is not a multiple of `step`; here
-    /// every step selects `ceil((end - begin) / step)` iterations, matching
-    /// XGBoost wherever it succeeds.
-    pub fn slice(&self, iterations: impl RangeBounds<usize>, step: usize) -> Result<BoostedModel> {
-        if self.linear.is_some() {
-            return Err(HessboostError::invalid_param(
-                "slice",
-                "gblinear models have no boosting iterations to slice",
-            ));
-        }
-        if step == 0 {
-            return Err(HessboostError::invalid_param(
-                "slice",
-                "step must be at least 1",
-            ));
-        }
-        let Range { start: begin, end } = self.resolve_iterations(iterations, "slice")?;
-        if begin == end {
-            return Err(HessboostError::invalid_param(
-                "slice",
-                format!("empty slice {begin}..{end} is not allowed"),
-            ));
-        }
-        if let Some(shrinkage) = &self.shrinkage {
-            if begin != 0 || step != 1 {
-                return Err(HessboostError::invalid_param(
-                    "slice",
-                    "a model trained with model shrinkage slices to prefixes only (`..k`, step 1)",
-                ));
-            }
-            return Ok(self.shrunk_prefix(shrinkage, end));
-        }
-        let per = self.trees_per_iteration();
-        let mut trees = Vec::with_capacity((end - begin).div_ceil(step) * per);
-        let mut tree_weights = Vec::new();
-        for it in (begin..end).step_by(step) {
-            let layer = it * per..(it + 1) * per;
-            trees.extend_from_slice(&self.trees[layer.clone()]);
-            if !self.tree_weights.is_empty() {
-                tree_weights.extend(layer.map(|t| self.tree_weight(t)));
-            }
-        }
-        Ok(BoostedModel {
-            trees,
-            base_score: self.base_score.clone(),
-            objective: self.objective.clone(),
-            max_delta_step: self.max_delta_step,
-            num_class: self.num_class,
-            n_outputs: self.n_outputs,
-            n_targets: self.n_targets,
-            n_features: self.n_features,
-            best_iteration: None,
-            tree_weights,
-            num_parallel_tree: self.num_parallel_tree,
-            linear: None,
-            shrinkage: None,
-            // A slice of a Boulevard average is not itself one, and a slice
-            // of an EBM drops some of its terms' trees.
-            boulevard: None,
-            ebm: None,
-            compact: OnceLock::new(),
-        })
-    }
-
-    /// The model after the first `k` iterations of this shrunk model:
-    /// their trees, reweighted by the record's first `k` coefficients, and
-    /// the intercepts shrunk as far ([`Shrinkage::scaling`]).
-    fn shrunk_prefix(&self, shrinkage: &Shrinkage, k: usize) -> BoostedModel {
-        let per = self.trees_per_iteration();
-        let (tree_weights, base_score) = shrinkage.scaling(k, per);
-        BoostedModel {
-            trees: self.trees[..k * per].to_vec(),
-            base_score,
-            objective: self.objective.clone(),
-            max_delta_step: self.max_delta_step,
-            num_class: self.num_class,
-            n_outputs: self.n_outputs,
-            n_targets: self.n_targets,
-            n_features: self.n_features,
-            best_iteration: None,
-            tree_weights,
-            num_parallel_tree: self.num_parallel_tree,
-            linear: None,
-            shrinkage: Some(shrinkage.truncated(k)),
-            boulevard: None,
-            ebm: None,
-            compact: OnceLock::new(),
-        }
-    }
-
     /// Record the shrinkage training applied (one coefficient per
     /// iteration, and the intercepts before it) and derive the tree weights
     /// and intercepts of the full model from it.
     pub(crate) fn set_shrinkage(&mut self, shrinkage: Shrinkage) {
         let (tree_weights, base_score) =
             shrinkage.scaling(self.num_boost_rounds(), self.trees_per_iteration());
-        self.tree_weights = tree_weights;
+        self.tree_weights = TreeWeights::from_vec(tree_weights);
         self.base_score = base_score;
         self.shrinkage = Some(shrinkage);
     }
@@ -1819,174 +1238,6 @@ impl BoostedModel {
     pub fn from_json(s: &str) -> Result<Self> {
         Self::try_from(serde_json::from_str::<UncheckedBoostedModel>(s)?)
     }
-
-    /// Check everything prediction and the formats rely on: the output
-    /// layout, the objective and its parameters, and the stored values
-    /// (in that order; the first failure is reported).
-    pub(crate) fn validate_structure(&self) -> Result<()> {
-        self.validate_layout()?;
-        self.validate_objective()?;
-        self.validate_values()
-    }
-
-    /// Feature count, outputs, targets, forest size, and tree kinds.
-    fn validate_layout(&self) -> Result<()> {
-        if self.n_features == 0 {
-            return Err(HessboostError::model_format(
-                "model has an invalid feature count",
-            ));
-        }
-        let vector = self.has_vector_leaves();
-        // Both factors come from the file: check the product before any
-        // divisibility or round-count arithmetic relies on it.
-        let per_iteration = if vector {
-            Some(self.num_parallel_tree)
-        } else {
-            self.n_outputs.checked_mul(self.num_parallel_tree)
-        };
-        if self.n_outputs == 0
-            || self.n_targets == 0
-            || self.num_parallel_tree == 0
-            || (self.num_class >= 2 && self.n_outputs != self.num_class)
-            || per_iteration.is_none_or(|per| !self.trees.len().is_multiple_of(per))
-            || self.trees.iter().any(|tree| {
-                tree.is_vector_leaf() != vector
-                    || (vector && tree.size_leaf_vector() != self.n_outputs)
-            })
-        {
-            return Err(HessboostError::ModelFormat(format!(
-                "invalid output layout: {} outputs, num_class {}, num_parallel_tree {}, {} trees",
-                self.n_outputs,
-                self.num_class,
-                self.num_parallel_tree,
-                self.trees.len()
-            )));
-        }
-        Ok(())
-    }
-
-    /// The objective's output width and the stored `max_delta_step`
-    /// (the objective's own parameters are valid by construction).
-    fn validate_objective(&self) -> Result<()> {
-        if !(self.max_delta_step.is_finite() && self.max_delta_step >= 0.0) {
-            return Err(HessboostError::model_format(format!(
-                "invalid objective parameters: max_delta_step {} is not finite and >= 0",
-                self.max_delta_step
-            )));
-        }
-        check_objective_width(
-            &self.objective,
-            self.max_delta_step,
-            self.num_class,
-            self.n_targets,
-            self.n_outputs,
-        )
-    }
-
-    /// `best_iteration`, intercepts, tree weights, trees, and the linear
-    /// booster's parameters.
-    fn validate_values(&self) -> Result<()> {
-        // Early stopping selects iterations of a tree ensemble; gblinear has
-        // none (training refuses early stopping for it), and a stored value
-        // would make plain prediction ask it for an iteration range.
-        if let Some(best) = self.best_iteration {
-            if self.linear.is_some() {
-                return Err(HessboostError::ModelFormat(format!(
-                    "gblinear models have no boosting iterations, but best_iteration is {best}"
-                )));
-            }
-            if best >= self.num_boost_rounds() {
-                return Err(HessboostError::ModelFormat(format!(
-                    "best_iteration {best} is out of range for {} iterations",
-                    self.num_boost_rounds()
-                )));
-            }
-        }
-        if self.base_score.len() != self.n_outputs()
-            || self.base_score.iter().any(|v| !v.is_finite())
-        {
-            return Err(HessboostError::ModelFormat(format!(
-                "base_score must hold one finite value per output ({} outputs, got {:?})",
-                self.n_outputs(),
-                self.base_score
-            )));
-        }
-        if !self.tree_weights.is_empty() && self.tree_weights.len() != self.trees.len() {
-            return Err(HessboostError::model_format(
-                "tree_weights length does not match trees",
-            ));
-        }
-        if self.tree_weights.iter().any(|weight| !weight.is_finite()) {
-            return Err(HessboostError::model_format("tree weights must be finite"));
-        }
-        for (tree_id, tree) in self.trees.iter().enumerate() {
-            if !tree.is_valid_for_features(self.n_features) {
-                return Err(HessboostError::ModelFormat(format!(
-                    "tree {tree_id} contains invalid nodes"
-                )));
-            }
-        }
-        if let Some(linear) = &self.linear {
-            let outputs = self.n_outputs();
-            if linear.bias.len() != outputs
-                || Some(linear.weights.len()) != self.n_features.checked_mul(outputs)
-            {
-                return Err(HessboostError::model_format(
-                    "linear model dimensions are invalid",
-                ));
-            }
-            if !linear
-                .weights
-                .iter()
-                .chain(&linear.bias)
-                .all(|v| v.is_finite())
-            {
-                return Err(HessboostError::model_format(
-                    "linear model parameters must be finite",
-                ));
-            }
-        }
-        if let Some(info) = &self.boulevard {
-            info.validate(self)?;
-        }
-        if let Some(info) = &self.ebm {
-            info.validate(self)?;
-        }
-        self.validate_shrinkage()
-    }
-
-    /// A shrinkage record must describe a tree model's iterations and
-    /// agree bit for bit with the tree weights and intercepts it derives,
-    /// and early stopping of a shrunk model keeps only the best iterations,
-    /// so a `best_iteration` can only name the last one.
-    fn validate_shrinkage(&self) -> Result<()> {
-        let Some(shrinkage) = &self.shrinkage else {
-            return Ok(());
-        };
-        if self.linear.is_some() {
-            return Err(HessboostError::model_format(
-                "gblinear models cannot carry a shrinkage record",
-            ));
-        }
-        let rounds = self.num_boost_rounds();
-        shrinkage.validate(rounds, self.n_outputs)?;
-        if self.best_iteration.is_some_and(|best| best + 1 != rounds) {
-            return Err(HessboostError::model_format(
-                "a shrunk model's best_iteration must be its last iteration",
-            ));
-        }
-        if !shrinkage.matches(
-            self.trees_per_iteration(),
-            |t| self.tree_weight(t),
-            &self.base_score,
-        ) {
-            return Err(HessboostError::model_format(
-                "the tree weights and intercepts do not match the shrinkage record",
-            ));
-        }
-        Ok(())
-    }
-
     /// Save the model to a JSON file.
     pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
         Ok(std::fs::write(path, self.to_json()?)?)
@@ -2073,55 +1324,6 @@ impl BoostedModel {
     }
 }
 
-/// Margin buffer for `data` (`[row][output]`): the per-output intercepts
-/// `base_score` broadcast to every row, overridden by the dataset's
-/// per-instance `base_margin` when present (one value per row, or one per row
-/// and output). Shared by every model representation that predicts.
-pub(crate) fn initial_margins(base_score: &[f32], data: &DMatrix) -> Vec<f32> {
-    let n = data.n_rows();
-    let k = base_score.len();
-    match data.base_margin() {
-        Some(bm) if bm.len() == n * k => bm.to_vec(),
-        Some(bm) if bm.len() == n => bm.iter().flat_map(|&m| std::iter::repeat_n(m, k)).collect(),
-        _ => {
-            let mut out = Vec::with_capacity(n * k);
-            for _ in 0..n {
-                out.extend_from_slice(base_score);
-            }
-            out
-        }
-    }
-}
-
-/// Check that `data` fits a model with `n_features` inputs and `n_outputs`
-/// outputs: matching column count and a per-row or per-row-and-output
-/// `base_margin`.
-pub(crate) fn validate_prediction_data(
-    n_features: usize,
-    n_outputs: usize,
-    data: &DMatrix,
-) -> Result<()> {
-    if data.n_cols() != n_features {
-        return Err(HessboostError::dimension_mismatch(
-            "prediction feature count",
-            n_features,
-            data.n_cols(),
-        ));
-    }
-    let n = data.n_rows();
-    if let Some(margin) = data.base_margin()
-        && margin.len() != n
-        && margin.len() != n * n_outputs
-    {
-        return Err(HessboostError::dimension_mismatch(
-            "prediction base_margin length",
-            n * n_outputs,
-            margin.len(),
-        ));
-    }
-    Ok(())
-}
-
 /// The loss of `objective` for a model with `n_targets` label columns that
 /// trained with `max_delta_step`: `None` for an objective the crate does not
 /// implement (custom losses).
@@ -2141,454 +1343,13 @@ fn rebuild_objective(
     })
 }
 
-/// Check that a built-in objective produces the model's `n_outputs`
-/// outputs. Loaders call this before returning a model: the prediction
-/// transform of a multi-output objective works on `[row][output]` blocks of
-/// its own width, so a mismatched width would transform values of
-/// neighboring rows together. Other objectives (custom losses) are skipped:
-/// they predict margins. A built-in objective that cannot be rebuilt for the
-/// stored layout (e.g. a distribution with a label matrix) is a format
-/// error, since predicting without its transform would misreport every
-/// output. So is a `num_class >= 2` on a built-in objective other than
-/// `multi:softmax`/`multi:softprob`: XGBoost reads `num_class` as the
-/// multiclass class count and refuses it together with several targets.
-pub(crate) fn check_objective_width(
-    objective: &ModelObjective,
-    max_delta_step: f64,
-    num_class: usize,
-    n_targets: usize,
-    n_outputs: usize,
-) -> Result<()> {
-    let name = objective.name();
-    let multiclass = objective
-        .built_in()
-        .and_then(Objective::num_class)
-        .is_some();
-    match rebuild_objective(objective, max_delta_step, n_targets) {
-        None => Ok(()),
-        Some(Ok(rebuilt)) if rebuilt.n_outputs() == n_outputs => {
-            if num_class >= 2 && !multiclass {
-                Err(HessboostError::ModelFormat(format!(
-                    "num_class {num_class} applies only to multiclass objectives, not `{name}`"
-                )))
-            } else {
-                Ok(())
-            }
-        }
-        Some(Ok(rebuilt)) => Err(HessboostError::ModelFormat(format!(
-            "objective `{name}` has {} outputs but the model stores {n_outputs}",
-            rebuilt.n_outputs()
-        ))),
-        Some(Err(e)) => Err(HessboostError::ModelFormat(format!(
-            "objective `{name}` cannot be rebuilt from the stored configuration: {e}"
-        ))),
-    }
-}
-
-/// Turn raw margins (`[row][output]`) of a model with the given objective
-/// into predictions in the objective's reported space: the objective's
-/// transform (identity for an objective the crate does not implement, e.g. a
-/// custom loss, mirroring how XGBoost returns margins then), and for
-/// `multi:softmax` the per-row argmax class index encoded as `f32` (width 1).
-pub(crate) fn transform_model_margins(
-    objective: &ModelObjective,
-    max_delta_step: f64,
-    n_targets: usize,
-    margin: Predictions,
-) -> Predictions {
-    let (n_rows, n_outputs) = (margin.n_rows(), margin.width());
-    let mut values = margin.into_vec();
-    if let Some(Ok(loss)) = rebuild_objective(objective, max_delta_step, n_targets) {
-        loss.pred_transform(&mut values);
-    }
-    if objective
-        .built_in()
-        .is_some_and(Objective::predicts_class_index)
-    {
-        let classes = values
-            .chunks_exact(n_outputs)
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map_or(0.0, |(i, _)| i as f32)
-            })
-            .collect();
-        return Predictions::new(classes, n_rows, 1);
-    }
-    Predictions::new(values, n_rows, n_outputs)
-}
-
-/// Rows per prediction block: the block's feature rows stay in cache while
-/// every tree walks them. Must be a multiple of [`LANES`].
-const PREDICT_BLOCK_ROWS: usize = 256;
-const _: () = assert!(PREDICT_BLOCK_ROWS.is_multiple_of(LANES));
-
-/// Widest CSR matrix that is densified block-by-block for prediction. Wider
-/// matrices fall back to per-lookup row scans.
-const MAX_DENSIFY_COLS: usize = 4096;
-
-/// A block of consecutive rows exposed as dense feature vectors (`NaN` =
-/// missing) for [`CompactForest`] traversal. Dense `NaN`-sentinel matrices are
-/// viewed in place. Dense matrices with another sentinel and CSR rows are
-/// materialized into a per-block scratch buffer so each node lookup is a single
-/// indexed load. Both keep a lane-major copy of the full [`LANES`]-row groups
-/// for the batch kernel.
-enum RowBlock<'a> {
-    View {
-        data: &'a [f32],
-        n_cols: usize,
-        start: usize,
-        lanes: Vec<u32>,
-    },
-    Scratch {
-        source: &'a DMatrix,
-        n_cols: usize,
-        /// Row-major tail rows (those past the last full [`LANES`] group).
-        scratch: Vec<f32>,
-        lanes: Vec<u32>,
-        /// Block row index of the first tail row.
-        tail_start: usize,
-    },
-    /// Very wide sparse rows: route through `DMatrix::get` per lookup.
-    Wide { data: &'a DMatrix, start: usize },
-}
-
-impl<'a> RowBlock<'a> {
-    /// Blocks for batch traversal: wide CSR matrices stay sparse.
-    fn new(data: &'a DMatrix) -> Self {
-        Self::build(data, MAX_DENSIFY_COLS)
-    }
-
-    /// Blocks that are loaded one row at a time and always expose a dense row
-    /// (for per-row algorithms such as TreeSHAP whose cost per row already
-    /// scales with the feature count).
-    fn single_rows(data: &'a DMatrix) -> Self {
-        Self::build(data, usize::MAX)
-    }
-
-    fn build(data: &'a DMatrix, max_densify_cols: usize) -> Self {
-        let n_cols = data.n_cols();
-        match data.dense_values() {
-            Some(dense) if data.missing().is_nan() => RowBlock::View {
-                data: dense,
-                n_cols,
-                start: 0,
-                lanes: Vec::new(),
-            },
-            None if n_cols > max_densify_cols => RowBlock::Wide { data, start: 0 },
-            _ => RowBlock::Scratch {
-                source: data,
-                n_cols,
-                scratch: Vec::new(),
-                lanes: Vec::new(),
-                tail_start: 0,
-            },
-        }
-    }
-
-    /// Point the block at rows `start..start + rows`.
-    fn load(&mut self, start: usize, rows: usize) {
-        match self {
-            RowBlock::Wide { start: s, .. } => *s = start,
-            RowBlock::View {
-                data,
-                n_cols,
-                start: s,
-                lanes,
-            } => {
-                *s = start;
-                let n_cols = *n_cols;
-                fill_lanes(
-                    lanes,
-                    &data[start * n_cols..(start + rows) * n_cols],
-                    n_cols,
-                );
-            }
-            RowBlock::Scratch {
-                source,
-                n_cols,
-                scratch,
-                lanes,
-                tail_start,
-            } => {
-                let n_cols = *n_cols;
-                let missing = source.missing();
-                let groups = rows / LANES;
-                *tail_start = groups * LANES;
-                lanes.clear();
-                lanes.resize(groups * FEATURE_LANES * n_cols, key(f32::NAN));
-                scratch.clear();
-                scratch.resize((rows - groups * LANES) * n_cols, f32::NAN);
-                // Store feature `f` of block row `r` in its keyed lane slot
-                // (the negated key follows `LANES` later) or its tail slot.
-                let mut put = |r: usize, f: usize, v: f32| {
-                    if r < groups * LANES {
-                        let i =
-                            (r / LANES) * FEATURE_LANES * n_cols + f * FEATURE_LANES + r % LANES;
-                        lanes[i] = key(v);
-                        lanes[i + LANES] = key(-v);
-                    } else {
-                        scratch[(r - groups * LANES) * n_cols + f] = v;
-                    }
-                };
-                if let Some(dense) = source.dense_values() {
-                    for r in 0..rows {
-                        let src = &dense[(start + r) * n_cols..(start + r + 1) * n_cols];
-                        for (f, &v) in src.iter().enumerate() {
-                            put(r, f, if v == missing { f32::NAN } else { v });
-                        }
-                    }
-                } else {
-                    let (indptr, indices, values) =
-                        source.csr_parts().expect("scratch blocks are dense or CSR");
-                    for r in 0..rows {
-                        let row = start + r;
-                        // Reverse order so the first occurrence of a duplicated
-                        // column wins, matching `DMatrix::get`.
-                        for k in (indptr[row]..indptr[row + 1]).rev() {
-                            let v = values[k];
-                            let v = if crate::data::is_missing(v, missing) {
-                                f32::NAN
-                            } else {
-                                v
-                            };
-                            put(r, indices[k] as usize, v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Loaded row `r` as a dense `NaN`-for-missing slice, or `None` for wide
-    /// sparse blocks, which are never materialized. Scratch blocks only keep
-    /// the tail rows (those past the last full [`LANES`] group) row-major.
-    #[inline]
-    fn row(&self, r: usize) -> Option<&[f32]> {
-        match self {
-            RowBlock::View {
-                data,
-                n_cols,
-                start,
-                ..
-            } => Some(&data[(start + r) * n_cols..(start + r + 1) * n_cols]),
-            RowBlock::Scratch {
-                n_cols,
-                scratch,
-                tail_start,
-                ..
-            } => {
-                let i = r
-                    .checked_sub(*tail_start)
-                    .expect("row-major access to a lane-major scratch row");
-                Some(&scratch[i * n_cols..(i + 1) * n_cols])
-            }
-            RowBlock::Wide { .. } => None,
-        }
-    }
-
-    /// Value of feature `f` in loaded row `r`, `None` when missing.
-    #[inline]
-    fn get(&self, r: usize, f: u32) -> Option<f32> {
-        let Some(row) = self.row(r) else {
-            let RowBlock::Wide { data, start } = self else {
-                unreachable!("only wide blocks lack dense rows")
-            };
-            return data.get(start + r, f as usize);
-        };
-        let v = row[f as usize];
-        if v.is_nan() { None } else { Some(v) }
-    }
-
-    /// Original leaf ids of loaded row `r` in trees `0..out.len()`, written to
-    /// `out[t]`.
-    fn original_leaf_ids_for_row(&self, forest: &CompactForest, r: usize, out: &mut [u32]) {
-        match self.row(r) {
-            Some(row) => forest.original_leaf_ids_for_row(row, out),
-            None => self.wide_row_leaves(forest, r, 0..out.len(), |t, leaf| {
-                out[t] = forest.original_id(leaf);
-            }),
-        }
-    }
-
-    /// The wide sparse fallback of the per-row walks: `sink(t, leaf)` with
-    /// loaded row `r`'s arena leaf in each tree of `trees`, features looked
-    /// up one at a time.
-    #[inline]
-    fn wide_row_leaves(
-        &self,
-        forest: &CompactForest,
-        r: usize,
-        trees: std::ops::Range<usize>,
-        mut sink: impl FnMut(usize, u32),
-    ) {
-        for t in trees {
-            sink(t, forest.leaf_id_with(t, |f| self.get(r, f)));
-        }
-    }
-
-    /// The wide sparse fallback of the block walks: `sink(r, leaf)` with the
-    /// arena leaf of each of the first `rows` loaded rows in tree `t`.
-    #[inline]
-    fn wide_leaves(
-        &self,
-        forest: &CompactForest,
-        t: usize,
-        rows: usize,
-        mut sink: impl FnMut(usize, u32),
-    ) {
-        for r in 0..rows {
-            sink(r, forest.leaf_id_with(t, |f| self.get(r, f)));
-        }
-    }
-
-    /// `out[scalar_tree_output(t, parallel, k)] += weight(t) * leaf_value(row
-    /// r, tree t)` for the trees `trees` of loaded row `r`, where `parallel`
-    /// is the model's `num_parallel_tree`.
-    fn accumulate_row(
-        &self,
-        forest: &CompactForest,
-        r: usize,
-        trees: std::ops::Range<usize>,
-        parallel: usize,
-        weight: impl Fn(usize) -> f32,
-        out: &mut [f32],
-    ) {
-        if let Some(row) = self.row(r) {
-            forest.accumulate_row(row, trees, parallel, weight, out);
-        } else {
-            let k = out.len();
-            self.wide_row_leaves(forest, r, trees, |t, leaf| {
-                out[scalar_tree_output(t, parallel, k)] += weight(t) * forest.leaf_value(leaf);
-            });
-        }
-    }
-
-    /// `out[j] += weight(t) * leaf_vector(row r, tree t)[j]` for the
-    /// vector-leaf trees `trees` of loaded row `r`.
-    fn accumulate_row_vector(
-        &self,
-        forest: &CompactForest,
-        r: usize,
-        trees: std::ops::Range<usize>,
-        weight: impl Fn(usize) -> f32,
-        out: &mut [f32],
-    ) {
-        if let Some(row) = self.row(r) {
-            forest.accumulate_row_vector(row, trees, weight, out);
-        } else {
-            let k = out.len();
-            self.wide_row_leaves(forest, r, trees, |t, leaf| {
-                let w = weight(t);
-                for (o, &v) in out.iter_mut().zip(forest.leaf_vector(leaf, k)) {
-                    *o += w * v;
-                }
-            });
-        }
-    }
-
-    /// The first `rows` loaded rows as a [`LaneBlock`] for the batch kernels,
-    /// or `None` for wide sparse blocks.
-    #[inline]
-    fn lane_block(&self, rows: usize) -> Option<LaneBlock<'_>> {
-        let tail_start = rows / LANES * LANES;
-        match self {
-            RowBlock::View {
-                data,
-                n_cols,
-                start,
-                lanes,
-            } => Some(LaneBlock {
-                lanes,
-                tail: &data[(start + tail_start) * n_cols..(start + rows) * n_cols],
-                n_cols: *n_cols,
-                rows,
-            }),
-            RowBlock::Scratch {
-                n_cols,
-                scratch,
-                lanes,
-                ..
-            } => Some(LaneBlock {
-                lanes,
-                tail: &scratch[..(rows - tail_start) * n_cols],
-                n_cols: *n_cols,
-                rows,
-            }),
-            RowBlock::Wide { .. } => None,
-        }
-    }
-
-    /// `out[r * stride] = original leaf id of row r` in tree `t` over the
-    /// loaded rows.
-    fn original_leaf_ids(
-        &self,
-        forest: &CompactForest,
-        t: usize,
-        rows: usize,
-        out: &mut [u32],
-        stride: usize,
-    ) {
-        if let Some(block) = self.lane_block(rows) {
-            forest.original_leaf_ids(t, block, out, stride);
-        } else {
-            self.wide_leaves(forest, t, rows, |r, leaf| {
-                out[r * stride] = forest.original_id(leaf);
-            });
-        }
-    }
-
-    /// `out[r * stride + j] += weight * leaf_vector(row r)[j]` (all `stride`
-    /// outputs) in vector-leaf tree `t` over the loaded rows.
-    fn accumulate_vector(
-        &self,
-        forest: &CompactForest,
-        t: usize,
-        rows: usize,
-        weight: f32,
-        out: &mut [f32],
-        stride: usize,
-    ) {
-        if let Some(block) = self.lane_block(rows) {
-            forest.accumulate_vector(t, block, stride, weight, out, stride);
-        } else {
-            self.wide_leaves(forest, t, rows, |r, leaf| {
-                let dst = &mut out[r * stride..(r + 1) * stride];
-                for (o, &v) in dst.iter_mut().zip(forest.leaf_vector(leaf, stride)) {
-                    *o += weight * v;
-                }
-            });
-        }
-    }
-
-    /// `out[r * stride] += weight * leaf_value(row r)` in tree `t` over the
-    /// loaded rows.
-    fn accumulate(
-        &self,
-        forest: &CompactForest,
-        t: usize,
-        rows: usize,
-        weight: f32,
-        out: &mut [f32],
-        stride: usize,
-    ) {
-        if let Some(block) = self.lane_block(rows) {
-            forest.accumulate(t, block, weight, out, stride);
-        } else {
-            self.wide_leaves(forest, t, rows, |r, leaf| {
-                out[r * stride] += weight * forest.leaf_value(leaf);
-            });
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::BoostedModel;
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::error::HessboostError;
+    use crate::model::Iterations;
     use crate::objective::{Objective, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::training::train;
@@ -2685,7 +1446,10 @@ mod tests {
         let (model, mut doc) = gblinear_doc();
         let valid: BoostedModel = serde_json::from_value(doc.clone()).unwrap();
         let d = DMatrix::from_dense(&[1.0, 2.0], 1, 2).unwrap();
-        assert_eq!(valid.predict(&d).unwrap(), model.predict(&d).unwrap());
+        assert_eq!(
+            valid.predict(&d, Iterations::Best).unwrap(),
+            model.predict(&d, Iterations::Best).unwrap()
+        );
         doc["linear"]["bias"] = serde_json::json!([]);
         assert!(serde_json::from_value::<BoostedModel>(doc.clone()).is_err());
         assert!(matches!(

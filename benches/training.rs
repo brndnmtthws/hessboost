@@ -617,7 +617,11 @@ fn bench_predict(c: &mut Criterion) {
             .unwrap();
         let model = train(&params, &data, 100).unwrap();
         group.bench_function(name, |b| {
-            b.iter(|| model.predict_margin(black_box(&data)).unwrap());
+            b.iter(|| {
+                model
+                    .predict_margin(black_box(&data), Iterations::Best)
+                    .unwrap()
+            });
         });
     }
     group.finish();
@@ -642,10 +646,18 @@ fn bench_shap(c: &mut Criterion) {
     let mut group = c.benchmark_group("shap_x20_100trees_depth6");
     group.sample_size(10);
     group.bench_function("contribs_2k", |b| {
-        b.iter(|| model.predict_contribs(black_box(&rows)).unwrap());
+        b.iter(|| {
+            model
+                .predict_contribs(black_box(&rows), Iterations::Best)
+                .unwrap()
+        });
     });
     group.bench_function("interactions_200", |b| {
-        b.iter(|| model.predict_interactions(black_box(&few_rows)).unwrap());
+        b.iter(|| {
+            model
+                .predict_interactions(black_box(&few_rows), Iterations::Best)
+                .unwrap()
+        });
     });
     group.finish();
 }
@@ -1097,7 +1109,11 @@ fn bench_predict_csr(c: &mut Criterion) {
     let sparse = make_csr_data(100_000, 30);
     group.throughput(Throughput::Elements(sparse.n_rows() as u64));
     group.bench_function("100k_x30", |b| {
-        b.iter(|| model.predict_margin(black_box(&sparse)).unwrap());
+        b.iter(|| {
+            model
+                .predict_margin(black_box(&sparse), Iterations::Best)
+                .unwrap()
+        });
     });
     let (n, f) = (20_000usize, 5_000usize);
     let mut indptr = vec![0usize];
@@ -1138,7 +1154,11 @@ fn bench_predict_csr(c: &mut Criterion) {
     let model = train(&params, &wide, 100).unwrap();
     group.throughput(Throughput::Elements(n as u64));
     group.bench_function("20k_x5000_wide", |b| {
-        b.iter(|| model.predict_margin(black_box(&wide)).unwrap());
+        b.iter(|| {
+            model
+                .predict_margin(black_box(&wide), Iterations::Best)
+                .unwrap()
+        });
     });
     group.finish();
 }
@@ -1270,10 +1290,17 @@ fn bench_metal(c: &mut Criterion) {
         group.sample_size(10);
         group.throughput(Throughput::Elements(data.n_rows() as u64));
         group.bench_function("cpu", |b| {
-            b.iter(|| model.predict_margin(black_box(&data)).unwrap());
+            b.iter(|| {
+                model
+                    .predict_margin(black_box(&data), Iterations::Best)
+                    .unwrap()
+            });
         });
         group.bench_function("metal", |b| {
-            b.iter(|| gpu.predict_margin(black_box(&data)).unwrap());
+            b.iter(|| {
+                gpu.predict_margin(black_box(&data), Iterations::Best)
+                    .unwrap()
+            });
         });
         group.finish();
     }

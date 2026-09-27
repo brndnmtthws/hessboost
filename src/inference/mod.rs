@@ -197,6 +197,7 @@ mod refit;
 mod solver;
 mod term_kernel;
 
+use crate::model::Iterations;
 use serde::{Deserialize, Serialize};
 
 use crate::conformal::Interval;
@@ -446,7 +447,7 @@ fn z_value(alpha: f64) -> f64 {
 
 /// Mean squared residual of `model` on the labelled `data`.
 fn mean_squared_residual(model: &BoostedModel, data: &DMatrix) -> Result<f64> {
-    let preds = model.predict(data)?;
+    let preds = model.predict(data, Iterations::Best)?;
     let labels = data.labels().unwrap_or_default();
     let sum: f64 = preds
         .as_slice()
@@ -546,7 +547,7 @@ impl<'a> BoulevardInference<'a> {
         )?;
         let noise_variance = noise_estimate(model, train, noise)?;
         let (c, s) = info.ridge(model.num_parallel_tree());
-        let leaves = model.predict_leaf_range(train, ..)?;
+        let leaves = model.predict_leaf(train, ..)?;
         let kernel = LeafKernel::new(model.trees(), &leaves, info.kappa())?;
         let solver = build_solver(&kernel, solver, c)?;
         Ok(BoulevardInference {
@@ -598,7 +599,7 @@ impl<'a> BoulevardInference<'a> {
     /// The leaf node ids of `data`'s rows, `[row][tree]`.
     fn leaves(&self, data: &DMatrix) -> Result<Predictions<u32>> {
         check_data(self.model, data, "data", false)?;
-        self.model.predict_leaf_range(data, ..)
+        self.model.predict_leaf(data, ..)
     }
 
     /// The kernel vectors of the `rows` of `leaves` (`[row][tree]`), one
@@ -661,7 +662,7 @@ impl<'a> BoulevardInference<'a> {
         check_alpha(alpha)?;
         let z = z_value(alpha);
         let norms = self.weight_norms(data)?;
-        let preds = self.model.predict(data)?;
+        let preds = self.model.predict(data, Iterations::Best)?;
         Ok(preds
             .as_slice()
             .iter()

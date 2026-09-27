@@ -6,6 +6,7 @@ use crate::config::{BoosterKind, Dart, MaxDeltaStep, TrainingParams};
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
+use crate::model::Iterations;
 use crate::model::ModelSpec;
 use crate::model::objective::ModelObjective;
 use crate::objective::AftDistribution;
@@ -83,11 +84,11 @@ fn assert_format_error<T: std::fmt::Debug>(result: Result<T>, context: impl std:
 #[test]
 fn roundtrip_reg_preserves_predictions() {
     let (model, d) = reg_model();
-    let before = model.predict(&d).unwrap();
+    let before = model.predict(&d, Iterations::Best).unwrap();
 
     let json = export_xgboost_json(&model).unwrap();
     let restored = import_xgboost_json(&json).unwrap();
-    let after = restored.predict(&d).unwrap();
+    let after = restored.predict(&d, Iterations::Best).unwrap();
 
     assert_eq!(restored.num_trees(), model.num_trees());
     assert_eq!(restored.n_features(), model.n_features());
@@ -136,14 +137,14 @@ fn roundtrip_binary_preserves_predictions() {
         .build()
         .unwrap();
     let model = train(&params, &d, 20).unwrap();
-    let before = model.predict(&d).unwrap();
+    let before = model.predict(&d, Iterations::Best).unwrap();
 
     let json = export_xgboost_json(&model).unwrap();
     let restored = import_xgboost_json(&json).unwrap();
     assert_eq!(restored.objective().name(), "binary:logistic");
     // base_score should round-trip through the logit/sigmoid link.
     assert!((restored.base_score() - model.base_score()).abs() < 1e-4);
-    let after = restored.predict(&d).unwrap();
+    let after = restored.predict(&d, Iterations::Best).unwrap();
     for (a, b) in before.as_slice().iter().zip(after.as_slice()) {
         assert!((a - b).abs() < 1e-5, "pred drift: {a} vs {b}");
     }
@@ -251,7 +252,12 @@ fn malformed_node_arrays_are_refused() {
     // Statistics XGBoost does not predict with may be absent, and integral
     // entries may be spelled as floats, strings, or booleans.
     let d = DMatrix::from_dense(&[1.0, 2.0, f32::NAN], 3, 1).unwrap();
-    let margins = |doc: Value| import_doc(&doc).unwrap().predict_margin(&d).unwrap();
+    let margins = |doc: Value| {
+        import_doc(&doc)
+            .unwrap()
+            .predict_margin(&d, Iterations::Best)
+            .unwrap()
+    };
     let expected = margins(hand_stump());
     for key in ["base_weights", "sum_hessian", "loss_changes"] {
         assert_eq!(margins(with(key, None)), expected, "{key}");
@@ -269,13 +275,19 @@ fn import_hand_written_stump_routes_correctly() {
 
     // x=1.0 (< 1.5) -> left leaf +10 ; x=2.0 (>= 1.5) -> right leaf -10.
     let d = DMatrix::from_dense(&[1.0, 2.0], 2, 1).unwrap();
-    let margins = model.predict_margin(&d).unwrap().into_vec(); // one per row
+    let margins = model
+        .predict_margin(&d, Iterations::Best)
+        .unwrap()
+        .into_vec(); // one per row
     assert!((margins[0] - 10.0).abs() < 1e-6, "got {}", margins[0]);
     assert!((margins[1] + 10.0).abs() < 1e-6, "got {}", margins[1]);
 
     // Missing value follows default_left = true -> left leaf.
     let dm = DMatrix::from_dense(&[f32::NAN], 1, 1).unwrap();
-    let mm = model.predict_margin(&dm).unwrap().into_vec();
+    let mm = model
+        .predict_margin(&dm, Iterations::Best)
+        .unwrap()
+        .into_vec();
     assert!(
         (mm[0] - 10.0).abs() < 1e-6,
         "missing routed wrong: {}",
@@ -299,7 +311,7 @@ fn import_multiclass_vector_intercept_offsets_each_class() {
     let expected = [5.329_358_6E-2f32, -1.347_581_1E-1, 8.146_441E-2];
     assert_eq!(model.base_scores(), &expected);
     let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
-    let margins = model.predict_margin(&d).unwrap();
+    let margins = model.predict_margin(&d, Iterations::Best).unwrap();
     assert_eq!(margins.as_slice(), [expected, expected].concat());
 
     // A single entry applies to every class (XGBoost's old-format rule).
@@ -338,7 +350,13 @@ fn vector_stump(width: &str, leaf_weights: &[f32]) -> Value {
 fn vector_leaf_width_is_validated_before_allocating() {
     let model = import_doc(&vector_stump("2", &[1.0, 2.0])).unwrap();
     let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
-    assert_eq!(model.predict_margin(&d).unwrap().as_slice(), [1.0, 2.0]);
+    assert_eq!(
+        model
+            .predict_margin(&d, Iterations::Best)
+            .unwrap()
+            .as_slice(),
+        [1.0, 2.0]
+    );
     // A width that saturates `usize` must not panic allocating the leaf
     // storage: it, a width other than the model's outputs, a fractional
     // width, or one the leaf weights cannot fill is a format error.
@@ -645,7 +663,7 @@ fn dart_roundtrips_through_weight_drop() {
     let (_, d) = reg_model();
     let model = dart_model(&d);
     assert!(model.has_non_unit_tree_weights());
-    let before = model.predict(&d).unwrap();
+    let before = model.predict(&d, Iterations::Best).unwrap();
 
     let (exported, json) = export_json_document(&model);
     assert_eq!(json["learner"]["gradient_booster"]["name"], "gbtree");
@@ -658,7 +676,7 @@ fn dart_roundtrips_through_weight_drop() {
     for t in 0..model.num_trees() {
         assert_eq!(restored.tree_weight(t), model.tree_weight(t), "tree {t}");
     }
-    assert_eq!(restored.predict(&d).unwrap(), before);
+    assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), before);
 }
 
 #[test]
@@ -673,9 +691,12 @@ fn gblinear_export_is_rejected_and_categorical_roundtrips() {
 
     let (model, categorical) = categorical_model();
     assert!(model.trees().iter().any(|tree| tree.node(0).is_categorical));
-    let before = model.predict(&categorical).unwrap();
+    let before = model.predict(&categorical, Iterations::Best).unwrap();
     let restored = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
-    assert_eq!(restored.predict(&categorical).unwrap(), before);
+    assert_eq!(
+        restored.predict(&categorical, Iterations::Best).unwrap(),
+        before
+    );
 }
 
 /// XGBoost 3.4.2 `save_raw("ubj")` / `save_raw("json")` of one booster
@@ -757,8 +778,8 @@ fn ubjson_export_is_the_json_document_with_typed_tree_arrays() {
         }
         let restored = import_xgboost_ubjson(&ubj).unwrap();
         assert_eq!(
-            restored.predict(data).unwrap(),
-            model.predict(data).unwrap()
+            restored.predict(data, Iterations::Best).unwrap(),
+            model.predict(data, Iterations::Best).unwrap()
         );
         let via_json = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
         assert_eq!(restored.to_bytes().unwrap(), via_json.to_bytes().unwrap());
@@ -816,7 +837,10 @@ fn parallel_tree(
 fn class_margins(doc: &Value) -> Vec<f32> {
     let model = import_doc(doc).unwrap();
     let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
-    model.predict_margin(&d).unwrap().into_vec()
+    model
+        .predict_margin(&d, Iterations::Best)
+        .unwrap()
+        .into_vec()
 }
 
 #[test]
@@ -848,7 +872,10 @@ fn import_keeps_parallel_trees_as_iterations() {
     let first = model.slice(0..1, 1).unwrap();
     let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
     assert_eq!(
-        first.predict_margin(&d).unwrap().as_slice(),
+        first
+            .predict_margin(&d, Iterations::Best)
+            .unwrap()
+            .as_slice(),
         [3.0, 30.0, 300.0]
     );
 
@@ -1028,11 +1055,17 @@ fn alpha_list_objectives_roundtrip_and_reject_bad_blocks() {
     let back = import_xgboost_json(&exported).unwrap();
     assert_eq!(back.n_outputs(), 2);
     assert_eq!(back.n_targets(), 1);
-    assert_eq!(back.predict(&d).unwrap(), model.predict(&d).unwrap());
+    assert_eq!(
+        back.predict(&d, Iterations::Best).unwrap(),
+        model.predict(&d, Iterations::Best).unwrap()
+    );
 
     let parenthesized = exported.replace("[0.1,0.9]", "(0.1, 0.9)");
     let back = import_xgboost_json(&parenthesized).unwrap();
-    assert_eq!(back.predict(&d).unwrap(), model.predict(&d).unwrap());
+    assert_eq!(
+        back.predict(&d, Iterations::Best).unwrap(),
+        model.predict(&d, Iterations::Best).unwrap()
+    );
     for bad in ["0.5", "[0.9,0.1]", "[]", "nope"] {
         assert_format_error(
             import_xgboost_json(&exported.replace("[0.1,0.9]", bad)),
@@ -1094,7 +1127,10 @@ fn survival_objectives_roundtrip() {
             Aft::new(AftDistribution::Extreme, 1.5).unwrap()
         ))
     );
-    assert_eq!(back.predict(&d).unwrap(), aft.predict(&d).unwrap());
+    assert_eq!(
+        back.predict(&d, Iterations::Best).unwrap(),
+        aft.predict(&d, Iterations::Best).unwrap()
+    );
 
     let signed: Vec<f32> = times
         .iter()
@@ -1115,7 +1151,10 @@ fn survival_objectives_roundtrip() {
     );
     let back = import_xgboost_json(&exported).unwrap();
     assert_eq!(back.base_scores(), cox.base_scores());
-    assert_eq!(back.predict(&dc).unwrap(), cox.predict(&dc).unwrap());
+    assert_eq!(
+        back.predict(&dc, Iterations::Best).unwrap(),
+        cox.predict(&dc, Iterations::Best).unwrap()
+    );
 }
 
 /// An XE-NDCG model (a hessboost extension) round-trips through the
@@ -1137,8 +1176,8 @@ fn xendcg_native_roundtrip_and_xgboost_exports_refused() {
     assert_eq!(restored.to_bytes().unwrap(), bytes);
     assert_eq!(restored.objective(), model.objective());
     assert_eq!(
-        restored.predict(&data).unwrap(),
-        model.predict(&data).unwrap()
+        restored.predict(&data, Iterations::Best).unwrap(),
+        model.predict(&data, Iterations::Best).unwrap()
     );
     assert_format_error(export_xgboost_json(&model), "hessboost extension");
     assert_format_error(export_xgboost_ubjson(&model), "hessboost extension");

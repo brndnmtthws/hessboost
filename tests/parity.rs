@@ -26,6 +26,7 @@
 use hessboost::config::{ProcessType, Refresh};
 use hessboost::data::FeatureType;
 use hessboost::internals::HistCuts;
+use hessboost::model::Iterations;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
 use hessboost::training::EvalHistory;
 use serde::{Deserialize, Deserializer};
@@ -540,7 +541,9 @@ impl Case<'_> {
                 (model, EvalHistory::default())
             }
         };
-        let preds = model.predict(dtest).map_err(|e| format!("predict: {e}"))?;
+        let preds = model
+            .predict(dtest, Iterations::Best)
+            .map_err(|e| format!("predict: {e}"))?;
         if preds.as_slice().len() != fx.xgb_pred.len() {
             return Err(format!(
                 "train predict: length mismatch (hessboost {}, xgboost {})",
@@ -617,7 +620,9 @@ impl Case<'_> {
         .train()
         .map(|r| r.model)
         .map_err(|e| format!("continue training: {e}"))?;
-        let preds = model.predict(dtest).map_err(|e| e.to_string())?;
+        let preds = model
+            .predict(dtest, Iterations::Best)
+            .map_err(|e| e.to_string())?;
         max_abs_diff("continue imported", preds.as_slice(), &fx.xgb_pred)
     }
 
@@ -644,7 +649,9 @@ impl Case<'_> {
             .train()
             .map(|r| r.model)
             .map_err(|e| format!("refresh: {e}"))?;
-        let preds = model.predict(dtest).map_err(|e| e.to_string())?;
+        let preds = model
+            .predict(dtest, Iterations::Best)
+            .map_err(|e| e.to_string())?;
         max_abs_diff("refresh", preds.as_slice(), &r.xgb_pred)
     }
 
@@ -665,7 +672,7 @@ impl Case<'_> {
         for r in &fx.ranges {
             let what = format!("margin range [{}, {})", r.begin, r.end);
             let d = model
-                .predict_margin_range(dtest, xgb_range(model, r.begin, r.end))
+                .predict_margin(dtest, xgb_range(model, r.begin, r.end))
                 .map_err(|e| e.to_string())
                 .and_then(|p| max_abs_diff(&what, p.as_slice(), &r.margin));
             out.push((what, d, tol));
@@ -673,14 +680,14 @@ impl Case<'_> {
         for r in &fx.range_contribs {
             let what = format!("contribs range [0, {})", r.end);
             let d = model
-                .predict_contribs_range(dcontrib, xgb_range(model, 0, r.end))
+                .predict_contribs(dcontrib, xgb_range(model, 0, r.end))
                 .map_err(|e| e.to_string())
                 .and_then(|p| max_abs_diff(&what, p.as_slice(), &r.contribs));
             out.push((what, d, fx.tol.contribs));
             if with_leaves {
                 let what = format!("leaf range [0, {})", r.end);
                 let d = model
-                    .predict_leaf_range(dcontrib, xgb_range(model, 0, r.end))
+                    .predict_leaf(dcontrib, xgb_range(model, 0, r.end))
                     .map_err(|e| e.to_string())
                     .and_then(|p| {
                         let p: Vec<f32> = p.as_slice().iter().map(|&l| l as f32).collect();
@@ -693,7 +700,7 @@ impl Case<'_> {
             let what = format!("slice [{}:{}:{}]", s.begin, s.end, s.step);
             let d = model
                 .slice(xgb_range(model, s.begin, s.end), s.step)
-                .and_then(|m| m.predict_margin(dtest))
+                .and_then(|m| m.predict_margin(dtest, Iterations::Best))
                 .map_err(|e| e.to_string())
                 .and_then(|p| max_abs_diff(&what, p.as_slice(), &s.margin));
             out.push((what, d, tol));
@@ -829,15 +836,15 @@ impl Case<'_> {
             }
         };
         let pred = model
-            .predict(dtest)
+            .predict(dtest, Iterations::Best)
             .map_err(|e| e.to_string())
             .and_then(|p| max_abs_diff("import predict", p.as_slice(), &fx.xgb_pred));
         let margin = model
-            .predict_margin(dtest)
+            .predict_margin(dtest, Iterations::Best)
             .map_err(|e| e.to_string())
             .and_then(|p| max_abs_diff("import margin", p.as_slice(), &fx.xgb_margin));
         let contribs = model
-            .predict_contribs(dcontrib)
+            .predict_contribs(dcontrib, Iterations::Best)
             .map_err(|e| e.to_string())
             .and_then(|p| max_abs_diff("import contribs", p.as_slice(), &fx.xgb_contribs));
         let interactions = match &fx.xgb_interactions {
@@ -845,7 +852,11 @@ impl Case<'_> {
             Some(want) => {
                 let delta = self
                     .dmatrix(&fx.x_test[..INTERACTION_ROWS * fx.n_cols], INTERACTION_ROWS)
-                    .and_then(|d| model.predict_interactions(&d).map_err(|e| e.to_string()))
+                    .and_then(|d| {
+                        model
+                            .predict_interactions(&d, Iterations::Best)
+                            .map_err(|e| e.to_string())
+                    })
                     .and_then(|p| max_abs_diff("import interactions", p.as_slice(), want));
                 self.check("import interactions", &delta, fx.tol.interactions)
             }

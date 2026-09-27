@@ -208,6 +208,7 @@ impl SymmetricTables {
 #[cfg(test)]
 mod tests {
     use crate::config::{GrowPolicy, TrainingParams, TreeMethod};
+    use crate::model::Iterations;
     use crate::test_support::labeled_dense;
     use crate::training::train;
     use crate::tree::compact::{CompactForest, LANES, LaneBlock, split_lanes};
@@ -378,8 +379,8 @@ mod tests {
         let forest = CompactForest::from_trees(model.trees());
         assert!((0..model.num_trees()).all(|t| forest.is_symmetric(t)));
 
-        let margins = model.predict_margin(&data).unwrap();
-        let leaves = model.predict_leaf(&data).unwrap();
+        let margins = model.predict_margin(&data, Iterations::Best).unwrap();
+        let leaves = model.predict_leaf(&data, ..).unwrap();
         for (r, row) in x.chunks_exact(n_cols).enumerate() {
             let mut want = model.base_score();
             for (t, tree) in model.trees().iter().enumerate() {

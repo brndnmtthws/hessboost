@@ -101,7 +101,7 @@ fn shape_functions_add_up_to_the_prediction() {
         // simulated interaction is between features 0 and 1.
         let features: Vec<Vec<u32>> = shapes.terms.iter().map(|t| t.features().to_vec()).collect();
         assert_eq!(features, [vec![0], vec![1], vec![2], vec![0, 1]]);
-        let preds = model.predict(&dtrain).unwrap();
+        let preds = model.predict(&dtrain, Iterations::Best).unwrap();
         for (row, &p) in x.chunks(3).zip(preds.as_slice()) {
             let margin: f64 = shapes.intercept
                 + shapes
@@ -387,7 +387,7 @@ fn classic_ebms_bag_rows_by_class() {
         .unwrap();
     let mean = |params: &TrainingParams| {
         let model = train(params, &dtrain, 40).unwrap();
-        let preds = model.predict(&dtrain).unwrap();
+        let preds = model.predict(&dtrain, Iterations::Best).unwrap();
         preds.as_slice().iter().map(|&p| f64::from(p)).sum::<f64>() / n as f64
     };
     let (plain, balanced) = (mean(&base().build().unwrap()), mean(&bagged));
@@ -428,7 +428,10 @@ fn classic_ebms_bag_whole_queries() {
         .unwrap();
     let margins = |params: &TrainingParams| {
         let model = train(params, &dtrain, 10).unwrap();
-        model.predict_margin(&dtrain).unwrap().into_vec()
+        model
+            .predict_margin(&dtrain, Iterations::Best)
+            .unwrap()
+            .into_vec()
     };
     let with_queries = margins(&bagged);
     assert_ne!(with_queries, margins(&base().build().unwrap()));
@@ -566,7 +569,7 @@ fn categorical_shapes_recover_the_per_category_effects() {
                 "category {code}: {got} vs {effect}"
             );
         }
-        let preds = model.predict(&dtrain).unwrap();
+        let preds = model.predict(&dtrain, Iterations::Best).unwrap();
         for (row, &p) in x.chunks(2).zip(preds.as_slice()) {
             let margin = shapes.intercept
                 + shapes.terms[0].value(&row[..1]).unwrap()
@@ -622,7 +625,7 @@ fn categorical_shapes_reconstruct_the_margins_for_codes_past_2_pow_24() {
     )
     .unwrap();
     let shapes = shape_functions(&model).unwrap();
-    let preds = model.predict(&dtrain).unwrap();
+    let preds = model.predict(&dtrain, Iterations::Best).unwrap();
     for (row, &p) in shifted.chunks(2).zip(preds.as_slice()) {
         let margin = shapes.intercept
             + shapes.terms[0].value(&row[..1]).unwrap()

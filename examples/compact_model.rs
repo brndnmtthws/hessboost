@@ -9,7 +9,6 @@
 //!
 //! Run with: `cargo run --release --example compact_model`
 
-use hessboost::model::compact::CompactModel;
 use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
 
@@ -70,12 +69,15 @@ fn main() -> Result<()> {
             .toad_penalty_threshold(xi)
             .build()?;
         let model = train(&params, &dtrain, 100)?;
-        let acc = accuracy(model.predict_class(&dtest)?.as_slice(), &labels);
+        let acc = accuracy(
+            model.predict_class(&dtest, Iterations::Best)?.as_slice(),
+            &labels,
+        );
 
-        let compact = CompactModel::from_bytes(&model.to_compact_bytes()?)?;
+        let compact = model.to_compact()?;
         assert_eq!(
             compact.predict_margin(&dtest)?,
-            model.predict_margin(&dtest)?,
+            model.predict_margin(&dtest, Iterations::Best)?,
             "compact margins are bit-identical"
         );
 

@@ -72,12 +72,12 @@ fn main() -> Result<()> {
         .build()?;
 
     let model = train(&params, &dtrain, 200)?;
-    let preds = model.predict(&dtrain)?;
+    let preds = model.predict(&dtrain, Iterations::Best)?;
     println!("first prediction: {}", preds.get(0, 0).unwrap());
 
     model.save_binary("model.bin")?;
     let reloaded = BoostedModel::load_binary("model.bin")?;
-    assert_eq!(reloaded.predict(&dtrain)?, preds);
+    assert_eq!(reloaded.predict(&dtrain, Iterations::Best)?, preds);
     Ok(())
 }
 ```

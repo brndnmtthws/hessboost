@@ -5,6 +5,7 @@
 use hessboost::config::{MaxDeltaStep, MultiStrategy, TrainingParamsBuilder, TreeMethod};
 use hessboost::conformal::ConformalizedQuantile;
 use hessboost::metric::EvalMetric;
+use hessboost::model::Iterations;
 use hessboost::objective::distributional::{
     Dist, DistFamily, DistGradient, DistSplitDirection, Distributional,
 };
@@ -113,7 +114,9 @@ fn heteroscedastic_intervals_are_calibrated_and_track_the_noise() {
         &dvalid,
     );
     assert_eq!(model.n_outputs(), 2);
-    let dists = model.predict_distribution(&dtest).unwrap();
+    let dists = model
+        .predict_distribution(&dtest, Iterations::Best)
+        .unwrap();
     let labels = dtest.labels().unwrap();
     for nominal in [0.5, 0.8, 0.95] {
         let got = coverage(dists.iter().map(|d| d.interval(nominal)), labels);
@@ -132,7 +135,7 @@ fn heteroscedastic_intervals_are_calibrated_and_track_the_noise() {
         / sigma.len() as f64;
     assert!(rel_err < 0.2, "mean relative error of sigma {rel_err}");
     // `predict` reports the natural parameters (mu, sigma).
-    let natural = model.predict(&dtest).unwrap();
+    let natural = model.predict(&dtest, Iterations::Best).unwrap();
     for (row, d) in natural.rows().zip(&dists) {
         let Dist::Normal { mu, sigma } = *d else {
             panic!("not a normal distribution")
@@ -160,7 +163,7 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
         &dvalid,
     );
     // Baseline: the point model with the training residuals' deviation.
-    let fitted = point.predict(&dtrain).unwrap().into_vec(); // one value per row
+    let fitted = point.predict(&dtrain, Iterations::Best).unwrap().into_vec(); // one value per row
     let train_labels = dtrain.labels().unwrap();
     let sd = (fitted
         .iter()
@@ -170,7 +173,7 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
         / fitted.len() as f64)
         .sqrt();
     let baseline: Vec<Dist> = point
-        .predict(&dtest)
+        .predict(&dtest, Iterations::Best)
         .unwrap()
         .as_slice()
         .iter()
@@ -180,7 +183,10 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
         })
         .collect();
     let (nll_dist, nll_base) = (
-        mean_nll(&dist.predict_distribution(&dtest).unwrap(), &dtest),
+        mean_nll(
+            &dist.predict_distribution(&dtest, Iterations::Best).unwrap(),
+            &dtest,
+        ),
         mean_nll(&baseline, &dtest),
     );
     assert!(
@@ -253,15 +259,30 @@ fn every_family_and_gradient_mode_learns() {
             );
             // The reported metric is the mean NLL of the predicted
             // distributions (up to the f32 rounding of the parameters).
-            let valid = mean_nll(&model.predict_distribution(&dvalid).unwrap(), &dvalid);
+            let valid = mean_nll(
+                &model
+                    .predict_distribution(&dvalid, Iterations::Best)
+                    .unwrap(),
+                &dvalid,
+            );
             assert!(
                 (valid - at_best[1]).abs() < 1e-3 * valid.abs().max(1.0),
                 "{objective}: {valid} vs {}",
                 at_best[1]
             );
-            let nll = mean_nll(&model.predict_distribution(&dtest).unwrap(), &dtest);
+            let nll = mean_nll(
+                &model
+                    .predict_distribution(&dtest, Iterations::Best)
+                    .unwrap(),
+                &dtest,
+            );
             let marginal = train(&p, &dtrain, 0).unwrap();
-            let intercept_only = mean_nll(&marginal.predict_distribution(&dtest).unwrap(), &dtest);
+            let intercept_only = mean_nll(
+                &marginal
+                    .predict_distribution(&dtest, Iterations::Best)
+                    .unwrap(),
+                &dtest,
+            );
             assert!(
                 nll < intercept_only - 0.05,
                 "{objective} {mode:?}: {nll} vs {intercept_only}"
@@ -281,7 +302,10 @@ fn dist_poisson_trains_like_count_poisson_without_max_delta_step() {
             .base_score(2.0)
             .build()
             .unwrap();
-        train(&p, &d, 40).unwrap().predict(&d).unwrap()
+        train(&p, &d, 40)
+            .unwrap()
+            .predict(&d, Iterations::Best)
+            .unwrap()
     };
     let (dist, count) = (fit(dist(DistFamily::Poisson)), fit(Objective::Poisson));
     for (a, b) in dist.as_slice().iter().zip(count.as_slice()) {
@@ -301,20 +325,26 @@ fn native_round_trip_and_determinism() {
         .unwrap();
     let model = train(&p, &d, 30).unwrap();
     let again = train(&p, &d, 30).unwrap();
-    let margins = model.predict_margin(&d).unwrap();
+    let margins = model.predict_margin(&d, Iterations::Best).unwrap();
     assert_eq!(
         margins,
-        again.predict_margin(&d).unwrap(),
+        again.predict_margin(&d, Iterations::Best).unwrap(),
         "same seed, same model"
     );
-    let dists = model.predict_distribution(&d).unwrap();
+    let dists = model.predict_distribution(&d, Iterations::Best).unwrap();
     for restored in [
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
         BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
     ] {
         assert_eq!(restored.objective().name(), "dist:gamma");
-        assert_eq!(restored.predict_distribution(&d).unwrap(), dists);
-        assert_eq!(restored.predict(&d).unwrap(), model.predict(&d).unwrap());
+        assert_eq!(
+            restored.predict_distribution(&d, Iterations::Best).unwrap(),
+            dists
+        );
+        assert_eq!(
+            restored.predict(&d, Iterations::Best).unwrap(),
+            model.predict(&d, Iterations::Best).unwrap()
+        );
     }
 }
 
@@ -392,7 +422,9 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
         "conformal coverage {got}"
     );
     // The raw band differs from the calibrated one by exactly the correction.
-    let raw = model.predict_distribution(&dtest).unwrap();
+    let raw = model
+        .predict_distribution(&dtest, Iterations::Best)
+        .unwrap();
     let (lo, hi) = raw[0].interval(1.0 - alpha);
     assert!((f64::from(conformal[0].lower) - (lo - cqr.correction())).abs() < 1e-4);
     assert!((f64::from(conformal[0].upper) - (hi + cqr.correction())).abs() < 1e-4);
@@ -454,7 +486,7 @@ fn configuration_errors() {
         1,
     )
     .unwrap();
-    assert!(point.predict_distribution(&d).is_err());
+    assert!(point.predict_distribution(&d, Iterations::Best).is_err());
 }
 
 /// Parallel gradient boosting (`multi_output_tree`): one shared tree per
@@ -470,7 +502,12 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
         &dtrain,
         &dvalid,
     );
-    let reference_nll = mean_nll(&reference.predict_distribution(&dtest).unwrap(), &dtest);
+    let reference_nll = mean_nll(
+        &reference
+            .predict_distribution(&dtest, Iterations::Best)
+            .unwrap(),
+        &dtest,
+    );
     for direction in [
         DistSplitDirection::Random,
         DistSplitDirection::Cyclic,
@@ -484,7 +521,9 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
         .unwrap();
         let model = fit(&p, &dtrain, &dvalid);
         assert_eq!(model.num_trees(), model.num_boost_rounds(), "{direction:?}");
-        let dists = model.predict_distribution(&dtest).unwrap();
+        let dists = model
+            .predict_distribution(&dtest, Iterations::Best)
+            .unwrap();
         let nll = mean_nll(&dists, &dtest);
         assert!(
             (nll - reference_nll).abs() < 0.03,
@@ -497,14 +536,19 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
         assert!((got - 0.8).abs() < 0.03, "{direction:?} coverage {got}");
         let again = train(&p, &dtrain, 20).unwrap();
         assert_eq!(
-            again.predict_margin(&dtest).unwrap(),
+            again.predict_margin(&dtest, Iterations::Best).unwrap(),
             train(&p, &dtrain, 20)
                 .unwrap()
-                .predict_margin(&dtest)
+                .predict_margin(&dtest, Iterations::Best)
                 .unwrap()
         );
         let restored = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
-        assert_eq!(restored.predict_distribution(&dtest).unwrap(), dists);
+        assert_eq!(
+            restored
+                .predict_distribution(&dtest, Iterations::Best)
+                .unwrap(),
+            dists
+        );
     }
     // The random direction follows the seed.
     let with_seed = |seed| {
@@ -515,7 +559,7 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
             .unwrap();
         train(&p, &dtrain, 10)
             .unwrap()
-            .predict_margin(&dtest)
+            .predict_margin(&dtest, Iterations::Best)
             .unwrap()
     };
     assert_ne!(with_seed(1), with_seed(2));

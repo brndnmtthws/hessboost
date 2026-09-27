@@ -51,7 +51,7 @@ use std::sync::OnceLock;
 
 use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer, format_error, wrong_length};
-use super::{BoostedModel, LinearModel, Shrinkage};
+use super::{BoostedModel, LinearModel, Shrinkage, TreeWeights};
 use crate::ebm::{EbmBoulevard, EbmInfo};
 use crate::error::Result;
 use crate::inference::BoulevardInfo;
@@ -644,7 +644,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         } else {
             None
         },
-        tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
+        tree_weights: TreeWeights::from_vec(s.array("model.tree_weights", f32::from_le_bytes)?),
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
         boulevard: read_boulevard(&s)?,
@@ -989,6 +989,7 @@ mod tests {
     use super::super::sections::REQUIRED;
     use super::*;
     use crate::config::TrainingParams;
+    use crate::model::Iterations;
     use crate::objective::{Objective, PseudoHuber, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
@@ -1074,8 +1075,8 @@ mod tests {
             let loaded = BoostedModel::from_bytes(&edited);
             if flags == 0 {
                 assert_eq!(
-                    loaded.unwrap().predict(&data).unwrap(),
-                    model.predict(&data).unwrap()
+                    loaded.unwrap().predict(&data, Iterations::Best).unwrap(),
+                    model.predict(&data, Iterations::Best).unwrap()
                 );
             } else {
                 let err = loaded.unwrap_err().to_string();
@@ -1109,8 +1110,8 @@ mod tests {
         let loaded = BoostedModel::from_bytes(&edited).unwrap();
         assert!(loaded.boulevard().is_none());
         assert_eq!(
-            loaded.predict(&data).unwrap(),
-            model.predict(&data).unwrap()
+            loaded.predict(&data, Iterations::Best).unwrap(),
+            model.predict(&data, Iterations::Best).unwrap()
         );
     }
 
@@ -1135,9 +1136,9 @@ mod tests {
         assert_eq!(
             BoostedModel::from_bytes(&without)
                 .unwrap()
-                .predict(&data)
+                .predict(&data, Iterations::Best)
                 .unwrap(),
-            model.predict(&data).unwrap()
+            model.predict(&data, Iterations::Best).unwrap()
         );
     }
 
@@ -1267,7 +1268,7 @@ mod tests {
             n_targets: 1,
             n_features,
             best_iteration: None,
-            tree_weights: Vec::new(),
+            tree_weights: TreeWeights::Unit,
             num_parallel_tree: 1,
             linear: Some(LinearModel::new(vec![0.0; n_features], vec![0.0])),
             shrinkage: None,

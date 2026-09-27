@@ -4,6 +4,7 @@ use super::encode::{encode_threshold, frame, numeric_encoding};
 use super::*;
 use crate::config::{BoosterKind, Dart, GrowPolicy, LinearTree, TrainingParams, TreeMethod};
 use crate::data::FeatureType;
+use crate::model::Iterations;
 use crate::objective::{Multiclass, Objective, Quantiles, RegLoss};
 use crate::test_support::labeled_dense;
 use crate::training::{Trainer, train};
@@ -48,11 +49,16 @@ fn assert_bit_identical(model: &BoostedModel, data: &DMatrix) -> CompactModel {
     let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
     assert_eq!(
         bits(compact.predict_margin(data).unwrap().into_vec()),
-        bits(model.predict_margin(data).unwrap().into_vec())
+        bits(
+            model
+                .predict_margin(data, Iterations::Best)
+                .unwrap()
+                .into_vec()
+        )
     );
     assert_eq!(
         bits(compact.predict(data).unwrap().into_vec()),
-        bits(model.predict(data).unwrap().into_vec())
+        bits(model.predict(data, Iterations::Best).unwrap().into_vec())
     );
     compact
 }

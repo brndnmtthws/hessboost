@@ -688,7 +688,9 @@ impl BoostedModel {
         CompactModel::from_bytes(&encode(self)?)
     }
 
-    /// Serialize this model in the compact layout; parse the bytes with
+    /// Serialize this model in the compact layout without parsing the result
+    /// back (the path for writing `HBTD` files; [`Self::to_compact`] is this
+    /// plus [`CompactModel::from_bytes`]). Parse the bytes with
     /// [`CompactModel::from_bytes`].
     pub fn to_compact_bytes(&self) -> Result<Vec<u8>> {
         encode(self)

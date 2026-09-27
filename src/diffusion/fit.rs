@@ -7,7 +7,7 @@ use super::{
 };
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
+use crate::model::{BoostedModel, Iterations};
 use crate::rng::{Rng, splitmix64};
 use crate::training::{Trainer, train};
 
@@ -225,7 +225,7 @@ fn residualize(
             .select_rows(&train_rows)?
             .with_label_matrix(&fold_labels, d)?;
         let model = train(&config.training, &dfold, config.num_boost_round.get())?;
-        let pred = model.predict_margin(&data.select_rows(test)?)?;
+        let pred = model.predict_margin(&data.select_rows(test)?, Iterations::Best)?;
         for (&row, values) in test.iter().zip(pred.as_slice().chunks_exact(d)) {
             for (o, &v) in oof[row * d..(row + 1) * d].iter_mut().zip(values) {
                 *o = f64::from(v);
@@ -427,7 +427,7 @@ impl Edm {
 pub(super) fn residual_mean(models: &[BoostedModel], data: &DMatrix) -> Result<Vec<f64>> {
     let mut mean: Vec<f64> = Vec::new();
     for model in models {
-        let pred = model.predict_margin(data)?;
+        let pred = model.predict_margin(data, Iterations::Best)?;
         if mean.is_empty() {
             mean = vec![0.0; pred.as_slice().len()];
         }

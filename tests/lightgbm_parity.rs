@@ -14,6 +14,7 @@
 //! cargo nextest run --test lightgbm_parity --release --run-ignored only --no-capture
 //! ```
 
+use hessboost::model::Iterations;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError};
 use serde::{Deserialize, Deserializer};
 use std::path::PathBuf;
@@ -90,13 +91,17 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
         return Err(format!("{} outputs, expected {k}", model.n_outputs()));
     }
     let data = DMatrix::from_dense(&fx.x_test, fx.n_test, fx.n_cols).map_err(|e| e.to_string())?;
-    let margin = model.predict_margin(&data).map_err(|e| e.to_string())?;
+    let margin = model
+        .predict_margin(&data, Iterations::Best)
+        .map_err(|e| e.to_string())?;
     let raw = compare(
         "raw",
         margin.as_slice(),
         fx.raw.as_deref().unwrap_or_default(),
     )?;
-    let predictions = model.predict(&data).map_err(|e| e.to_string())?;
+    let predictions = model
+        .predict(&data, Iterations::Best)
+        .map_err(|e| e.to_string())?;
     let pred = compare(
         "pred",
         predictions.as_slice(),
@@ -104,18 +109,20 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
     )?;
     let shap = match &fx.contribs {
         Some(contribs) => {
-            let got = model.predict_contribs(&data).map_err(|e| e.to_string())?;
+            let got = model
+                .predict_contribs(&data, Iterations::Best)
+                .map_err(|e| e.to_string())?;
             format!("{:.1e}", compare("contribs", got.as_slice(), contribs)?)
         }
         // LightGBM refuses SHAP for linear trees; so does hessboost.
-        None => match model.predict_contribs(&data) {
+        None => match model.predict_contribs(&data, Iterations::Best) {
             Err(HessboostError::InvalidParameter { .. }) => "refused".to_string(),
             other => return Err(format!("contribs of a linear-leaf model: {other:?}")),
         },
     };
 
     // Leaf indices: LightGBM's leaf `j` is hessboost node `num_leaves - 1 + j`.
-    let leaves = model.predict_leaf(&data).map_err(|e| e.to_string())?;
+    let leaves = model.predict_leaf(&data, ..).map_err(|e| e.to_string())?;
     let expected_leaves: Vec<u32> = fx
         .leaf
         .as_deref()
@@ -133,7 +140,9 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
 
     let iterations = fx.slice_iterations.unwrap_or(1);
     let sliced = model.slice(..iterations, 1).map_err(|e| e.to_string())?;
-    let sliced_margin = sliced.predict_margin(&data).map_err(|e| e.to_string())?;
+    let sliced_margin = sliced
+        .predict_margin(&data, Iterations::Best)
+        .map_err(|e| e.to_string())?;
     compare(
         "raw_slice",
         sliced_margin.as_slice(),
@@ -147,7 +156,7 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
     for (what, restored) in [("native binary", &from_bytes), ("native JSON", &from_json)] {
         if !same_bits(
             restored
-                .predict(&data)
+                .predict(&data, Iterations::Best)
                 .map_err(|e| e.to_string())?
                 .as_slice(),
             predictions.as_slice(),
@@ -160,7 +169,7 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
             let restored = BoostedModel::from_xgboost_json(&json).map_err(|e| e.to_string())?;
             if !same_bits(
                 restored
-                    .predict(&data)
+                    .predict(&data, Iterations::Best)
                     .map_err(|e| e.to_string())?
                     .as_slice(),
                 predictions.as_slice(),

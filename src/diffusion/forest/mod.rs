@@ -132,6 +132,7 @@
 //! # }
 //! ```
 
+use crate::model::Iterations;
 use std::num::NonZeroUsize;
 
 use rayon::prelude::*;
@@ -1287,7 +1288,7 @@ impl Sampler<'_> {
             let input = DMatrix::from_dense_vec(values, rows.len(), c)?;
             let models = model.level_models(class, level);
             for (m, gbdt) in models.iter().enumerate() {
-                let pred = gbdt.predict_margin(&input)?;
+                let pred = gbdt.predict_margin(&input, Iterations::Best)?;
                 for (&r, p) in rows.iter().zip(pred.rows()) {
                     if model.per_output {
                         out[r * c + m] = f64::from(p[0]);

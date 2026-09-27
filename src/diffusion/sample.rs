@@ -6,7 +6,7 @@ use super::process::{T_EPS, keyed_normal, try_filled};
 use super::{DiffusionModel, Method, OdeSolver, Parameterization, ScoreConfig};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::Predictions;
+use crate::model::{Iterations, Predictions};
 use crate::rng::splitmix64;
 
 /// Stream of the sampler's noise.
@@ -392,7 +392,10 @@ impl Batch {
             }
             row[t_col..].copy_from_slice(&time[..self.cols - t_col]);
         }
-        Ok(model.regressor.predict_margin(&self.input)?.into_vec())
+        Ok(model
+            .regressor
+            .predict_margin(&self.input, Iterations::Best)?
+            .into_vec())
     }
 }
 

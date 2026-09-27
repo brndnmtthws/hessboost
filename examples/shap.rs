@@ -26,16 +26,19 @@ fn main() -> Result<()> {
 
     // Contributions: n_features + 1 values per row and output, bias last.
     // Their sum equals the raw margin prediction (SHAP additivity).
-    let contribs = model.predict_contribs(&d)?;
+    let contribs = model.predict_contribs(&d, Iterations::Best)?;
     let row0 = contribs.get(0, 0).expect("row 0 exists");
-    let margin0 = *model.predict_margin(&d)?.get(0, 0).expect("row 0 exists");
+    let margin0 = *model
+        .predict_margin(&d, Iterations::Best)?
+        .get(0, 0)
+        .expect("row 0 exists");
     let sum0: f32 = row0.iter().sum();
     println!("row 0 SHAP contributions {row0:?}");
     println!("  sum {sum0:.4} ≈ margin {margin0:.4}");
 
     // Interaction values: an (n_features + 1)^2 matrix per row and output.
     // Off-diagonal (0,2) should be non-trivial thanks to the x0*x2 term.
-    let inter = model.predict_interactions(&d)?;
+    let inter = model.predict_interactions(&d, Iterations::Best)?;
     let value = inter.at(0, 0, 0, 2).expect("row 0, features 0 and 2 exist");
     println!("row 0 interaction[0][2] = {value:.4}");
     Ok(())

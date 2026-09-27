@@ -86,7 +86,7 @@ pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedMod
         model.base_score()
     };
     let t_count = model.num_trees();
-    let node_ids = model.predict_leaf_range(values, ..)?.into_vec();
+    let node_ids = model.predict_leaf(values, ..)?.into_vec();
     let parallel = model.num_parallel_tree();
     let schedule = Schedule::from_info(&info, parallel, REFIT_SALT);
     let mut refit = model.clone();
@@ -190,7 +190,7 @@ fn ebm_refit(
     let n = values.n_rows();
     let mu = labels.iter().map(|&y| f64::from(y)).sum::<f64>() / n as f64;
     let t_count = model.num_trees();
-    let node_ids = model.predict_leaf_range(values, ..)?.into_vec();
+    let node_ids = model.predict_leaf(values, ..)?.into_vec();
     let mut refit = model.clone();
     let mut base = vec![mu; n];
     let mut first_tree = 0;

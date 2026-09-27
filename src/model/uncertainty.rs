@@ -29,9 +29,10 @@
 //! in `f32`, which holds for the `constant` shrink mode only. hessboost
 //! rebuilds each member from the stored shrinkage coefficients with the
 //! arithmetic of training (see
-//! [`predict_margin_range`](BoostedModel::predict_margin_range)), so member
+//! [`predict_margin`](BoostedModel::predict_margin)), so member
 //! `k` predicts bit for bit what the same run stopped after `k` rounds
-//! predicts, in either shrink mode. A model trained without shrinkage has
+//! predicts, in either shrink mode. One pass over the trees yields every
+//! member: the margins are copied out at each member's iteration count. A model trained without shrinkage has
 //! plain prefixes as members. EBMs are refused (their trees are ordered by
 //! bag, stage, and term), and so is a `booster = boulevard` model: its
 //! leaves carry the average over all of its rounds, so its prefixes are not
@@ -88,7 +89,7 @@
 //! # }
 //! ```
 
-use super::{BoostedModel, ModelObjective, Predictions, transform_model_margins};
+use super::{BoostedModel, ModelObjective, Predictions, transform_margins_in_place};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::objective::Objective;
@@ -97,13 +98,18 @@ use crate::objective::distributional::{Dist, DistFamily};
 /// The predictions of a model's virtual ensemble
 /// ([`BoostedModel::predict_virtual_ensembles`]): one model per member, the
 /// model after [`iterations`](Self::iterations)`()[m]` boosting iterations.
+/// Every member's margins and predictions are stored contiguously,
+/// `[member][row][value]`.
 #[derive(Debug, Clone)]
 pub struct VirtualEnsembles {
     iterations: Vec<usize>,
     n_rows: usize,
+    /// Values per row of a member's margins (the model's outputs).
+    margin_width: usize,
+    /// Values per row of a member's predictions.
     width: usize,
-    margins: Vec<Predictions>,
-    predictions: Vec<Predictions>,
+    margins: Vec<f32>,
+    predictions: Vec<f32>,
 }
 
 impl VirtualEnsembles {
@@ -129,16 +135,38 @@ impl VirtualEnsembles {
         self.width
     }
 
-    /// Member `m`'s predictions, as [`BoostedModel::predict`] returns them
-    /// for its model, or `None` past the last member.
-    pub fn member_predictions(&self, m: usize) -> Option<&Predictions> {
-        self.predictions.get(m)
+    /// Values per row of a member's margins (the width of
+    /// [`BoostedModel::predict_margin`]'s layout, the model's outputs).
+    pub fn margin_width(&self) -> usize {
+        self.margin_width
     }
 
-    /// Member `m`'s raw margins, as [`BoostedModel::predict_margin`]
-    /// returns them for its model, or `None` past the last member.
-    pub fn member_margins(&self, m: usize) -> Option<&Predictions> {
-        self.margins.get(m)
+    /// Member `m`'s predictions (`[row][value]`, [`Self::width`] wide), as
+    /// [`BoostedModel::predict`] returns them for its model, or `None` past
+    /// the last member.
+    pub fn member_predictions(&self, m: usize) -> Option<&[f32]> {
+        let len = self.n_rows * self.width;
+        (m < self.n_members()).then(|| &self.predictions[m * len..(m + 1) * len])
+    }
+
+    /// Member `m`'s raw margins (`[row][output]`, [`Self::margin_width`]
+    /// wide), as [`BoostedModel::predict_margin`] returns them for its
+    /// model, or `None` past the last member.
+    pub fn member_margins(&self, m: usize) -> Option<&[f32]> {
+        let len = self.n_rows * self.margin_width;
+        (m < self.n_members()).then(|| &self.margins[m * len..(m + 1) * len])
+    }
+
+    /// Every member's predictions, `[member][row][value]`
+    /// ([`Self::width`] values per row).
+    pub fn into_predictions(self) -> Vec<f32> {
+        self.predictions
+    }
+
+    /// Every member's raw margins, `[member][row][output]`
+    /// ([`Self::margin_width`] values per row).
+    pub fn into_margins(self) -> Vec<f32> {
+        self.margins
     }
 }
 
@@ -304,31 +332,38 @@ impl BoostedModel {
         count: usize,
     ) -> Result<VirtualEnsembles> {
         let iterations = self.virtual_ensemble_iterations(count)?;
-        let mut margins = Vec::with_capacity(iterations.len());
-        let mut predictions = Vec::with_capacity(iterations.len());
-        for &k in &iterations {
-            let margin = self.predict_margin_range(data, ..k)?;
-            predictions.push(transform_model_margins(
+        let margins = self.prefix_margins(data, &iterations)?;
+        let (n_rows, k) = (data.n_rows(), self.n_outputs);
+        // `predict`'s layout: one class index per row for `multi:softmax`.
+        let width = if self
+            .objective
+            .built_in()
+            .is_some_and(Objective::predicts_class_index)
+        {
+            1
+        } else {
+            k
+        };
+        let mut predictions = Vec::with_capacity(iterations.len() * n_rows * width);
+        let len = n_rows * k;
+        for m in 0..iterations.len() {
+            let start = predictions.len();
+            predictions.extend_from_slice(&margins[m * len..(m + 1) * len]);
+            let values = &mut predictions[start..];
+            transform_margins_in_place(
                 &self.objective,
                 self.max_delta_step,
                 self.n_targets,
-                margin.clone(),
-            ));
-            margins.push(margin);
+                values,
+                k,
+            );
+            predictions.truncate(start + n_rows * width);
         }
         Ok(VirtualEnsembles {
-            // `predict`'s layout: one class index per row for `multi:softmax`.
-            width: if self
-                .objective
-                .built_in()
-                .is_some_and(Objective::predicts_class_index)
-            {
-                1
-            } else {
-                self.n_outputs
-            },
             iterations,
-            n_rows: data.n_rows(),
+            n_rows,
+            margin_width: k,
+            width,
             margins,
             predictions,
         })
@@ -351,7 +386,7 @@ impl BoostedModel {
         let k = self.n_outputs;
         let members = || 0..ensembles.n_members();
         let margin = |m: usize, row: usize, out: usize| {
-            f64::from(ensembles.margins[m].as_slice()[row * k + out])
+            f64::from(ensembles.margins[(m * n + row) * k + out])
         };
         Ok(match decomposition {
             Decomposition::Regression => {
@@ -360,7 +395,7 @@ impl BoostedModel {
                 let mut knowledge = Vec::with_capacity(n * width);
                 for cell in 0..n * width {
                     let values =
-                        members().map(|m| f64::from(ensembles.predictions[m].as_slice()[cell]));
+                        members().map(|m| f64::from(ensembles.predictions[m * n * width + cell]));
                     let (mu, variance) = mean_variance(values);
                     mean.push(mu);
                     knowledge.push(variance);

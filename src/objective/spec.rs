@@ -270,6 +270,15 @@ impl Objective {
         matches!(self, Objective::AbsoluteError | Objective::Quantile(_))
     }
 
+    /// Whether the objective classifies `0`/`1` labels (`binary:logistic`,
+    /// `binary:logitraw`, `binary:hinge`).
+    pub(crate) fn is_binary_classifier(&self) -> bool {
+        matches!(
+            self,
+            Objective::BinaryLogistic(_) | Objective::BinaryLogitRaw(_) | Objective::BinaryHinge
+        )
+    }
+
     /// Whether predictions are class indices (`multi:softmax`).
     pub(crate) fn predicts_class_index(&self) -> bool {
         matches!(self, Objective::Softmax(_))

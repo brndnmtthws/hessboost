@@ -916,6 +916,23 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     if objective.requires_labels() && dtrain.labels().is_none() {
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
     }
+    if params.balanced_bagging.is_some() {
+        if dtrain.n_targets() != 1 {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                "balanced bagging requires exactly one label column",
+            ));
+        }
+        let labels = dtrain.labels().ok_or(HessboostError::EmptyDataset(
+            "train: balanced bagging requires binary labels",
+        ))?;
+        if labels.iter().any(|&label| label != 0.0 && label != 1.0) {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                "balanced bagging requires labels exactly 0 or 1",
+            ));
+        }
+    }
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
     validate_dataset(
@@ -1038,9 +1055,10 @@ fn grow_round(
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
 
-    // 2. Uniform row subsets, drawn before the trees and shared across the
-    //    per-output fits.
-    let row_subsets = iteration_row_subsets(n, params, prepared.samples_per_forest(), &mut rng);
+    // 2. Uniform or class-stratified row subsets, drawn before trees.
+    let labels = dtrain.labels().unwrap_or_default();
+    let row_subsets =
+        iteration_row_subsets(n, params, prepared.samples_per_forest(), labels, &mut rng);
     // An output's gradient-based sample, when its whole forest shares one.
     let mut forest_sample = None;
     let forest_indices = prepared.forest_indices(n_out, parallel);
@@ -1897,43 +1915,80 @@ fn quantization_seed(params: &TrainingParams, rng: &mut Rng) -> u64 {
 }
 
 /// Bernoulli row subsampling (each row kept with probability `subsample`),
-/// matching XGBoost's default sampling method. Guarantees at least one row.
-/// Gradient-based sampling keeps every row here; it samples the gradients in
-/// [`fit_output_tree`] instead.
-pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut Rng) -> Vec<u32> {
-    let subsample = params.subsample;
-    if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
+/// matching XGBoost's default sampling method, or with LightGBM's
+/// class-balanced bagging (a positive row, label `1`, kept with
+/// probability `pos_fraction`, any other with `neg_fraction`) in its
+/// place. Guarantees at least one row. Gradient-based sampling keeps every
+/// row here; it samples the gradients in [`fit_output_tree`] instead.
+pub(super) fn sample_rows(
+    n: usize,
+    params: &TrainingParams,
+    labels: &[f32],
+    rng: &mut Rng,
+) -> Vec<u32> {
+    if params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
-    // Sized for the expected sample plus a few standard deviations.
-    let expected = n as f64 * subsample;
-    let mut rows: Vec<u32> = Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize);
-    rows.extend((0..n as u32).filter(|_| rng.f64() < subsample));
+    let mut rows = if let Some(bagging) = params.balanced_bagging {
+        let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
+        let labels = &labels[..n];
+        let positives = labels.iter().filter(|&&label| label == 1.0).count();
+        let expected = positives as f64 * pos + (n - positives) as f64 * neg;
+        let mut rows = with_sample_capacity(expected);
+        rows.extend((0..n as u32).filter(|&row| {
+            rng.f64()
+                < if labels[row as usize] == 1.0 {
+                    pos
+                } else {
+                    neg
+                }
+        }));
+        rows
+    } else {
+        let subsample = params.subsample;
+        if subsample >= 1.0 {
+            return all_rows(n);
+        }
+        let mut rows = with_sample_capacity(n as f64 * subsample);
+        rows.extend((0..n as u32).filter(|_| rng.f64() < subsample));
+        rows
+    };
     if rows.is_empty() {
         rows.push(rng.range(0..n) as u32);
     }
     rows
 }
 
-/// One iteration's uniform row subsets, drawn before its trees: one per
-/// parallel tree, or a single subset for the whole forest when
-/// `per_forest` (`approx`, [`Prepared::samples_per_forest`]) or when there is
-/// no uniform sampling (every tree then reads all rows, and [`sample_rows`]
-/// draws nothing). Parallel tree `p` uses entry `p % len`, shared across its
-/// per-output fits.
+/// A row buffer sized for a Bernoulli sample of `expected` rows plus a few
+/// standard deviations.
+fn with_sample_capacity(expected: f64) -> Vec<u32> {
+    Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize)
+}
+
+/// One iteration's row subsets (uniform or class-balanced), drawn before
+/// its trees: one per parallel tree, or a single subset for the whole
+/// forest when `per_forest` (`approx`, [`Prepared::samples_per_forest`]) or
+/// when there is no row sampling (every tree then reads all rows, and
+/// [`sample_rows`] draws nothing). Parallel tree `p` uses entry `p % len`,
+/// shared across its per-output fits. `labels` are the training labels,
+/// read by class-balanced bagging only.
 pub(super) fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
     per_forest: bool,
+    labels: &[f32],
     rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
-    let uniform = params.subsample < 1.0 && params.sampling_method == SamplingMethod::Uniform;
-    let draws = if per_forest || !uniform {
+    let samples = params.sampling_method == SamplingMethod::Uniform
+        && (params.subsample < 1.0 || params.balanced_bagging.is_some());
+    let draws = if per_forest || !samples {
         1
     } else {
         params.num_parallel_tree
     };
-    (0..draws).map(|_| sample_rows(n, params, rng)).collect()
+    (0..draws)
+        .map(|_| sample_rows(n, params, labels, rng))
+        .collect()
 }
 
 /// Whether trees are grown on gradient-based (MVS) row samples.
@@ -2076,6 +2131,39 @@ mod tests {
     };
     use crate::test_support::labeled_dense;
     use crate::tree::{ChildLeaf, SplitRule};
+
+    #[test]
+    fn balanced_row_sampler_respects_class_fractions() {
+        let labels: Vec<f32> = (0..20_000)
+            .map(|row| if row < 4_000 { 1.0 } else { 0.0 })
+            .collect();
+        let params = TrainingParams::builder()
+            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .balanced_bagging(crate::config::BalancedBagging::new(0.6, 0.1).unwrap())
+            .seed(53)
+            .build()
+            .unwrap();
+        let selected = sample_rows(labels.len(), &params, &labels, &mut Rng::new(77));
+        let positives = selected
+            .iter()
+            .filter(|&&row| labels[row as usize] == 1.0)
+            .count();
+        let negatives = selected.len() - positives;
+        let pos_rate = positives as f64 / 4_000.0;
+        let neg_rate = negatives as f64 / 16_000.0;
+        assert!((0.57..0.63).contains(&pos_rate), "positive rate {pos_rate}");
+        assert!(
+            (0.092..0.108).contains(&neg_rate),
+            "negative rate {neg_rate}"
+        );
+        // Without positives the negative fraction still applies.
+        let negatives_only = vec![0.0f32; 20_000];
+        let kept = sample_rows(20_000, &params, &negatives_only, &mut Rng::new(77)).len();
+        assert!(
+            (1_840..2_160).contains(&kept),
+            "kept {kept} of 20000 negatives"
+        );
+    }
 
     /// A deterministic uniform `[0, 1)` stream (a 64-bit LCG's top 31 bits).
     fn lcg(mut s: u64) -> impl FnMut() -> f32 {

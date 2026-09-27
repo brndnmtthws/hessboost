@@ -1,7 +1,8 @@
 //! The option groups of [`TrainingParams`](super::TrainingParams): settings
 //! that only mean something when a switch is on live inside that switch
 //! (`BoosterKind::Dart(Dart)`, `ProcessType::Update(Refresh)`,
-//! `Option<QuantizedGrad>`, `Option<ExtraTrees>`, `Option<LinearTree>`), so
+//! `Option<QuantizedGrad>`, `Option<ExtraTrees>`, `Option<LinearTree>`,
+//! `Option<BalancedBagging>`), so
 //! they cannot be set while the switch is off. Each validates its values
 //! when built.
 
@@ -277,6 +278,75 @@ impl LinearTree {
     }
 }
 
+/// LightGBM's class-balanced bagging for binary classification
+/// (`pos_bagging_fraction`, `neg_bagging_fraction`): every round keeps each
+/// positive row (label `1`) with probability `pos` and each negative row
+/// (label `0`) with probability `neg`, in place of `subsample`. Both
+/// fractions lie in `(0, 1]` and at least one is below `1` (both at `1`
+/// is no bagging: leave the option unset).
+///
+/// ```
+/// use hessboost::config::BalancedBagging;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let bagging = BalancedBagging::new(1.0, 0.2)?;
+/// assert_eq!((bagging.pos_fraction(), bagging.neg_fraction()), (1.0, 0.2));
+/// assert!(BalancedBagging::new(1.0, 1.0).is_err());
+/// assert!(BalancedBagging::new(0.0, 0.5).is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BalancedBagging {
+    pos: f64,
+    neg: f64,
+}
+
+impl BalancedBagging {
+    /// Keep positives with probability `pos` and negatives with `neg`.
+    ///
+    /// # Errors
+    ///
+    /// A fraction outside `(0, 1]` (named `pos_bagging_fraction` or
+    /// `neg_bagging_fraction`), or both at `1`.
+    pub fn new(pos: f64, neg: f64) -> Result<Self> {
+        fraction("pos_bagging_fraction", pos)?;
+        fraction("neg_bagging_fraction", neg)?;
+        if pos == 1.0 && neg == 1.0 {
+            return Err(HessboostError::invalid_param(
+                "pos_bagging_fraction",
+                "with `neg_bagging_fraction` also 1 nothing is bagged; \
+                 leave balanced bagging unset",
+            ));
+        }
+        Ok(BalancedBagging { pos, neg })
+    }
+
+    /// The probability of keeping a positive row (LightGBM
+    /// `pos_bagging_fraction`).
+    pub fn pos_fraction(&self) -> f64 {
+        self.pos
+    }
+
+    /// The probability of keeping a negative row (LightGBM
+    /// `neg_bagging_fraction`).
+    pub fn neg_fraction(&self) -> f64 {
+        self.neg
+    }
+}
+
+/// Fail unless `v` is in `(0, 1]`.
+fn fraction(name: &'static str, v: f64) -> Result<()> {
+    if v > 0.0 && v <= 1.0 {
+        Ok(())
+    } else {
+        Err(HessboostError::invalid_param(
+            name,
+            format!("must be in (0, 1], got {v}"),
+        ))
+    }
+}
+
 /// Fail unless `v` is finite and in `[0, 1]`.
 fn unit(name: &'static str, v: f64) -> Result<()> {
     if v.is_finite() && (0.0..=1.0).contains(&v) {
@@ -328,5 +398,19 @@ mod tests {
         assert!(Refresh::default().refresh_leaf());
         assert!(!Refresh::stats_only().refresh_leaf());
         assert_eq!(ExtraTrees::default().seed(), 6);
+        for v in [0.0, -0.5, 1.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                refused(&BalancedBagging::new(v, 0.5)),
+                Some("pos_bagging_fraction")
+            );
+            assert_eq!(
+                refused(&BalancedBagging::new(0.5, v)),
+                Some("neg_bagging_fraction")
+            );
+        }
+        assert_eq!(
+            refused(&BalancedBagging::new(1.0, 1.0)),
+            Some("pos_bagging_fraction")
+        );
     }
 }

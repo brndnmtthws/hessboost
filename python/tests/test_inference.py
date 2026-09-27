@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import hessboost
+from conftest import additive
 from hessboost.inference import BoulevardInference, BoulevardInfo, honest_refit
 
 PARAMS = {
@@ -18,17 +19,10 @@ PARAMS = {
 }
 
 
-def data(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    x = rng.random((n, 2))
-    y = np.sin(6 * x[:, 0]) + 0.5 * x[:, 1] + 0.2 * rng.standard_normal(n)
-    return x, y
-
-
 def test_intervals_nest_and_match_the_standard_errors() -> None:
-    x, y = data(400, 0)
-    xc, yc = data(200, 1)
-    xt, _ = data(30, 2)
+    x, y = additive(400, 0, features=2, noise=0.2)
+    xc, yc = additive(200, 1, features=2, noise=0.2)
+    xt, _ = additive(30, 2, features=2, noise=0.2)
     booster = hessboost.train(PARAMS, hessboost.DMatrix(x, label=y), 60)
     inference = BoulevardInference.fit(booster, x, holdout=xc, holdout_label=yc)
     se = inference.standard_errors(xt)
@@ -47,7 +41,7 @@ def test_intervals_nest_and_match_the_standard_errors() -> None:
 
 
 def test_nystrom_on_every_row_matches_the_exact_solver() -> None:
-    x, y = data(200, 3)
+    x, y = additive(200, 3, features=2, noise=0.2)
     booster = hessboost.train(PARAMS, hessboost.DMatrix(x, label=y), 20)
     exact = BoulevardInference.fit(booster, x, noise_variance=0.04)
     nystrom = BoulevardInference.fit(booster, x, noise_variance=0.04, landmarks=200)
@@ -55,8 +49,8 @@ def test_nystrom_on_every_row_matches_the_exact_solver() -> None:
 
 
 def test_honest_refit_and_the_boulevard_record() -> None:
-    x, y = data(300, 4)
-    xv, yv = data(300, 5)
+    x, y = additive(300, 4, features=2, noise=0.2)
+    xv, yv = additive(300, 5, features=2, noise=0.2)
     booster = hessboost.train(PARAMS, hessboost.DMatrix(x, label=y), 20)
     info = booster.boulevard
     assert isinstance(info, BoulevardInfo)
@@ -81,7 +75,7 @@ def test_honest_refit_and_the_boulevard_record() -> None:
 
 
 def test_refusals() -> None:
-    x, y = data(100, 6)
+    x, y = additive(100, 6, features=2, noise=0.2)
     booster = hessboost.train(PARAMS, hessboost.DMatrix(x, label=y), 5)
     with pytest.raises(hessboost.HessboostError, match="not both"):
         BoulevardInference.fit(booster, x, holdout=x, holdout_label=y, noise_variance=1.0)
@@ -113,7 +107,7 @@ def test_refusals() -> None:
 
 
 def test_sglb_and_virtual_ensembles_are_refused() -> None:
-    x, y = data(200, 7)
+    x, y = additive(200, 7, features=2, noise=0.2)
     dtrain = hessboost.DMatrix(x, label=y)
     for key, value in (
         ("langevin", True),

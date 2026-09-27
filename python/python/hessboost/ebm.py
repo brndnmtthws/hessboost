@@ -32,7 +32,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from hessboost import _hessboost
-from hessboost._core import Booster
+from hessboost._booster import Booster
+from hessboost._exceptions import HessboostError
 
 __all__ = [
     "CategoricalAxis",
@@ -84,9 +85,14 @@ TermAxis: TypeAlias = NumericAxis | CategoricalAxis
 
 
 def _axis(kind: str, payload: Any) -> TermAxis:
-    if kind == "numeric":
-        return NumericAxis(np.asarray(payload, dtype=np.float32))
-    return CategoricalAxis(tuple(int(c) for c in payload))
+    """The axis the extension reports as ``(kind, payload)``."""
+    match kind:
+        case "numeric":
+            return NumericAxis(np.asarray(payload, dtype=np.float32))
+        case "categorical":
+            return CategoricalAxis(tuple(int(c) for c in payload))
+        case _:
+            raise HessboostError(f"unknown term axis kind {kind!r}")
 
 
 class TermShape:

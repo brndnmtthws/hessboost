@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import pickle
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +10,7 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
+from conftest import reloaded
 from hessboost import DMatrix, HessboostError, ModelFormatError
 from hessboost.diffusion import DiffusionModel, DiffusionParams
 from hessboost.diffusion.forest import Diffusion, ForestModel, ForestParams, Repaint
@@ -132,16 +132,7 @@ def test_every_format_round_trips_bit_for_bit(
     holes[:, 0] = np.nan
     filled = model.impute(holes, y[:4], n_imputations=2, seed=5)
     binary = model.to_bytes()
-    model.save_binary(tmp_path / "model.hbff")
-    model.save_json(tmp_path / "model.json")
-    restored = [
-        ForestModel.from_bytes(binary),
-        ForestModel.from_json(model.to_json()),
-        ForestModel.load_binary(tmp_path / "model.hbff"),
-        ForestModel.load_json(tmp_path / "model.json"),
-        pickle.loads(pickle.dumps(model)),
-    ]
-    for other in restored:
+    for other in reloaded(model, tmp_path, ".hbff"):
         np.testing.assert_array_equal(other.sample(30, seed=5).values, values)
         np.testing.assert_array_equal(other.impute(holes, y[:4], n_imputations=2, seed=5), filled)
         assert other.to_bytes() == binary

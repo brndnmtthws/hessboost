@@ -44,7 +44,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from hessboost import _data, _hessboost
-from hessboost._core import Booster, DMatrix, _check_schema
+from hessboost._booster import Booster
+from hessboost._matrix import DMatrix, _check_schema
 from hessboost._training import _params
 
 __all__ = ["Approximate", "Exact", "OnlineMode", "OnlineModel", "UpdateCallback", "UpdateReport"]

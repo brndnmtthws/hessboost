@@ -12,7 +12,7 @@ import pytest
 from numpy.typing import NDArray
 
 import hessboost
-from conftest import frame, reorder_colors
+from conftest import frame, reloaded, reorder_colors
 from hessboost import DMatrix, HessboostError, ModelFormatError
 from hessboost.diffusion import (
     DiffusionModel,
@@ -125,17 +125,8 @@ def test_every_format_round_trips_bit_for_bit(
 ) -> None:
     model, x = fitted
     draws = model.sample(x[:4], 25, seed=2)
-    binary, text = model.to_bytes(), model.to_json()
-    model.save_binary(tmp_path / "model.hbdm")
-    model.save_json(tmp_path / "model.json")
-    restored = [
-        DiffusionModel.from_bytes(binary),
-        DiffusionModel.from_json(text),
-        DiffusionModel.load_binary(tmp_path / "model.hbdm"),
-        DiffusionModel.load_json(tmp_path / "model.json"),
-        pickle.loads(pickle.dumps(model)),
-    ]
-    for other in restored:
+    binary = model.to_bytes()
+    for other in reloaded(model, tmp_path, ".hbdm"):
         np.testing.assert_array_equal(other.sample(x[:4], 25, seed=2), draws)
         assert other.to_bytes() == binary
         assert other.method == model.method

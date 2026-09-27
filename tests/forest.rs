@@ -14,7 +14,7 @@ use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
-use common::{invalid_param, lcg, with_threads};
+use common::{invalid_param, labeled_dense, lcg, with_threads};
 
 const COLS: usize = 3;
 
@@ -49,14 +49,9 @@ fn quick(mut params: ForestParams) -> ForestParams {
     ]);
     params
 }
-
 fn labelled(x: &[f32], y: &[f32]) -> DMatrix {
-    DMatrix::from_dense(x, y.len(), COLS)
-        .unwrap()
-        .with_labels(y)
-        .unwrap()
+    labeled_dense(x, COLS, y)
 }
-
 #[test]
 fn generated_rows_follow_each_class() {
     let (x, y) = table(300, 1);

@@ -14,37 +14,8 @@ use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 mod common;
+use common::smooth::{continuation_noisy as noisy, regression};
 use common::{invalid_param, labeled_dense, rmse};
-
-/// Deterministic regression data: `n` rows, 4 features, a smooth target.
-fn regression(n: usize, shift: f32) -> DMatrix {
-    let mut x = Vec::with_capacity(n * 4);
-    let mut y = Vec::with_capacity(n);
-    for i in 0..n {
-        let f: Vec<f32> = (0..4)
-            .map(|j| ((i * (7 + 3 * j) + 11 * j) % 97) as f32 / 97.0)
-            .collect();
-        y.push(2.0 * f[0] - 3.0 * f[1] * f[1] + 0.5 * f[2] + shift);
-        x.extend(f);
-    }
-    labeled_dense(&x, 4, &y)
-}
-
-/// [`regression`] with pseudo-random label noise, so boosting eventually
-/// overfits a validation set drawn with different noise.
-fn noisy(n: usize, salt: usize) -> DMatrix {
-    let d = regression(n, 0.0);
-    let y: Vec<f32> = d
-        .labels()
-        .unwrap()
-        .iter()
-        .enumerate()
-        .map(|(i, y)| y + ((i * (31 + salt)) % 23) as f32 / 23.0 - 0.5)
-        .collect();
-    d.with_labels(&y).unwrap()
-}
-
-/// Three-class labels on the same features.
 fn multiclass(n: usize) -> DMatrix {
     let d = regression(n, 0.0);
     let y: Vec<f32> = (0..n)

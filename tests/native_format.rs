@@ -25,13 +25,9 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 mod common;
+use common::bits::bits;
 use common::{four_features, labeled_dense};
-
 const COLS: usize = 4;
-
-fn bits(values: &[f32]) -> Vec<u32> {
-    values.iter().map(|v| v.to_bits()).collect()
-}
 
 #[test]
 fn unknown_and_corrupt_native_payloads_are_refused() {

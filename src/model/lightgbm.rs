@@ -1,6 +1,7 @@
 //! LightGBM text model import; user docs: `model` module, "LightGBM import".
 
 use crate::error::{HessboostError, Result};
+use crate::model::categories::{CategoryPool, PoolError};
 use crate::model::{BoostedModel, ModelObjective, ModelSpec};
 use crate::objective::{
     LambdaRank, Multiclass, Objective, PseudoHuber, Quantiles, RegLoss, Tweedie,
@@ -768,10 +769,15 @@ impl CategorySets {
     }
 
     /// Append the categories of set `threshold` (the split's `threshold`
-    /// holds the set's index) to `pool`, returning their range. Each set
-    /// belongs to one split, as LightGBM writes them, which keeps the pool
-    /// within 32 categories per stored word.
-    fn expand_into(&mut self, threshold: f64, pool: &mut Vec<u32>) -> Result<(u32, u32), String> {
+    /// holds the set's index) to `pool` as `node`'s set. Each set belongs to
+    /// one split, as LightGBM writes them, which keeps the pool within 32
+    /// categories per stored word.
+    fn expand_into(
+        &mut self,
+        threshold: f64,
+        node: &mut Node,
+        pool: &mut CategoryPool,
+    ) -> Result<(), String> {
         let index = (threshold >= 0.0
             && threshold.fract() == 0.0
             && threshold < self.used.len() as f64)
@@ -780,23 +786,17 @@ impl CategorySets {
         if std::mem::replace(&mut self.used[index], true) {
             return Err(format!("category set {index} is used by two splits"));
         }
-        let begin = pool.len();
         let words = &self.words[self.boundaries[index]..self.boundaries[index + 1]];
-        for (w, &word) in words.iter().enumerate() {
-            for bit in 0..32 {
-                if word >> bit & 1 == 1 {
-                    // Below 2^31: at most `MAX_CATEGORY_WORDS` words.
-                    pool.push((w * 32 + bit) as u32);
-                }
-            }
-        }
-        if pool.len() == begin {
-            return Err(format!("category set {index} is empty"));
-        }
-        let range = u32::try_from(begin)
-            .ok()
-            .zip(u32::try_from(pool.len()).ok());
-        range.ok_or_else(|| "too many categories".to_string())
+        // Below 2^31: at most `MAX_CATEGORY_WORDS` words.
+        let ids = words.iter().enumerate().flat_map(|(w, &word)| {
+            (0..32)
+                .filter(move |bit| word >> bit & 1 == 1)
+                .map(move |bit| (w * 32 + bit) as u32)
+        });
+        pool.push_split(node, ids).map_err(|e| match e {
+            PoolError::Empty => format!("category set {index} is empty"),
+            PoolError::TooMany => "too many categories".to_string(),
+        })
     }
 }
 
@@ -834,7 +834,7 @@ fn convert_tree(fields: &TreeFields, n_features: usize) -> Result<RegTree, Strin
     let mut sets = CategorySets::read(fields)?;
 
     let mut nodes = Vec::with_capacity(n_internal + n_leaves);
-    let mut categories = Vec::new();
+    let mut categories = CategoryPool::default();
     for i in 0..n_internal {
         let at = |message: String| format!("node {i}: {message}");
         let feature = u32::try_from(features[i])
@@ -853,12 +853,9 @@ fn convert_tree(fields: &TreeFields, n_features: usize) -> Result<RegTree, Strin
         if decision & CATEGORICAL_MASK != 0 {
             // `CategoricalDecision`: NaN and negative values go right,
             // others by membership of their integer part.
-            let (begin, end) = sets
-                .expand_into(thresholds[i], &mut categories)
+            sets.expand_into(thresholds[i], &mut node, &mut categories)
                 .map_err(at)?;
             node.is_categorical = true;
-            node.cat_begin = begin;
-            node.cat_end = end;
             node.default_left = false;
         } else {
             let missing = match decision >> 2 & 3 {
@@ -895,7 +892,7 @@ fn convert_tree(fields: &TreeFields, n_features: usize) -> Result<RegTree, Strin
     // Unchecked here: the model's `validate_structure` checks every tree.
     Ok(RegTree::from_parts(
         nodes,
-        categories,
+        categories.finish(),
         0,
         Vec::new(),
         linear,
@@ -1054,22 +1051,45 @@ mod tests {
         }
     }
 
-    /// A one-split regression model on one feature: left leaf `1`, right
-    /// leaf `2`.
-    fn stump(threshold: &str, decision_type: u8, categories: Option<&str>) -> String {
+    /// A model header over one feature `x` with `classes` outputs
+    /// (regression for one, else multiclass).
+    fn header(classes: &str) -> String {
+        let objective = if classes == "1" {
+            "regression".to_string()
+        } else {
+            format!("multiclass num_class:{classes}")
+        };
+        format!(
+            "tree\nversion=v4\nnum_class={classes}\nnum_tree_per_iteration={classes}\n\
+             label_index=0\nmax_feature_idx=0\nobjective={objective}\nfeature_names=x\n\
+             feature_infos=none\n\n"
+        )
+    }
+
+    /// The block of a one-split tree on feature 0: left leaf `1`, right leaf
+    /// `2`.
+    fn stump_tree(threshold: &str, decision_type: u8, categories: Option<&str>) -> String {
         let cat_lines = categories.map_or(String::new(), |words| {
             let n = words.split(' ').count();
             format!("cat_boundaries=0 {n}\ncat_threshold={words}\n")
         });
         format!(
-            "tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nlabel_index=0\n\
-             max_feature_idx=0\nobjective=regression\nfeature_names=x\nfeature_infos=none\n\n\
-             Tree=0\nnum_leaves=2\nnum_cat={}\nsplit_feature=0\nsplit_gain=1\n\
+            "Tree=0\nnum_leaves=2\nnum_cat={}\nsplit_feature=0\nsplit_gain=1\n\
              threshold={threshold}\ndecision_type={decision_type}\nleft_child=-1\n\
              right_child=-2\nleaf_value=1 2\nleaf_weight=1 1\nleaf_count=1 1\n\
              internal_value=0\ninternal_weight=2\ninternal_count=2\n{cat_lines}\
-             is_linear=0\nshrinkage=1\n\n\nend of trees\n",
+             is_linear=0\nshrinkage=1\n\n\n",
             u8::from(categories.is_some())
+        )
+    }
+
+    /// A one-split regression model on one feature: left leaf `1`, right
+    /// leaf `2`.
+    fn stump(threshold: &str, decision_type: u8, categories: Option<&str>) -> String {
+        format!(
+            "{}{}end of trees\n",
+            header("1"),
+            stump_tree(threshold, decision_type, categories)
         )
     }
 
@@ -1085,26 +1105,19 @@ mod tests {
     /// allocate one intercept per claimed class).
     #[test]
     fn class_counts_are_bounded_by_the_parsed_trees() {
-        let header = |classes: &str| {
-            format!(
-                "tree\nversion=v4\nnum_class={classes}\nnum_tree_per_iteration={classes}\n\
-                 label_index=0\nmax_feature_idx=0\nobjective=multiclass num_class:{classes}\n\
-                 feature_names=x\nfeature_infos=none\n\nend of trees\n"
-            )
-        };
         for classes in [usize::MAX.to_string(), "3".to_string()] {
-            let err = BoostedModel::from_lightgbm_text(&header(&classes))
-                .unwrap_err()
-                .to_string();
+            let err =
+                BoostedModel::from_lightgbm_text(&format!("{}end of trees\n", header(&classes)))
+                    .unwrap_err()
+                    .to_string();
             assert!(err.contains("whole iteration"), "{err}");
         }
         // A one-tree model claiming more outputs than it has trees too.
-        let wide = stump("0.5", NONE, None)
-            .replace(
-                "num_class=1\nnum_tree_per_iteration=1",
-                "num_class=3\nnum_tree_per_iteration=3",
-            )
-            .replace("objective=regression", "objective=multiclass num_class:3");
+        let wide = format!(
+            "{}{}end of trees\n",
+            header("3"),
+            stump_tree("0.5", NONE, None)
+        );
         let err = BoostedModel::from_lightgbm_text(&wide)
             .unwrap_err()
             .to_string();

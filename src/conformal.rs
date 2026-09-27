@@ -62,7 +62,7 @@
 //! let (dtrain, dcal) = (all.select_rows(&train_rows)?, all.select_rows(&cal_rows)?);
 //!
 //! let params = TrainingParams::builder()
-//!     .objective(Objective::SquaredError)
+//!     .objective(Objective::SquaredError(RegLoss::default()))
 //!     .build()?;
 //! let model = train(&params, &dtrain, 20)?;
 //!
@@ -617,7 +617,7 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::objective::Multiclass;
     use crate::objective::distributional::{DistFamily, Distributional};
-    use crate::objective::{CustomLoss, GradPair, Objective};
+    use crate::objective::{CustomLoss, GradPair, Objective, RegLoss};
     use crate::rng::Rng;
     use crate::test_support::labeled_dense;
     use crate::training::train;
@@ -648,7 +648,7 @@ mod tests {
 
     fn point_model(d: &DMatrix) -> BoostedModel {
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -880,7 +880,7 @@ mod tests {
         let y = -(2f32.powi(-80));
         let cal = labeled_dense(&[0.0], 1, 1, &[y]);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .base_score(1.0)
             .build()
             .unwrap();

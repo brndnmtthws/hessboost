@@ -475,7 +475,7 @@ impl Default for TrainingParams {
             nthread: None,
             seed: 0,
             device: Device::Cpu,
-            objective: Objective::SquaredError,
+            objective: Objective::default(),
             base_score: None,
             eval_metric: Vec::new(),
             eta: 0.3,
@@ -522,6 +522,24 @@ fn ensure(name: &'static str, ok: bool, reason: impl Into<String>) -> Result<()>
     } else {
         Err(HessboostError::invalid_param(name, reason))
     }
+}
+
+/// [`ensure`] that `objective` is `reg:squarederror` at `scale_pos_weight =
+/// 1`, which `who` (a Boulevard fit, which also refuses sample weights)
+/// needs.
+fn unweighted_squared_error(objective: &Objective, who: &str) -> Result<()> {
+    let got = match objective {
+        Objective::SquaredError(r) => format!(
+            "`reg:squarederror` at `scale_pos_weight = {}`",
+            r.scale_pos_weight()
+        ),
+        other => format!("`{}`", other.name()),
+    };
+    ensure(
+        "objective",
+        objective.is_unweighted_squared_error(),
+        format!("{who} supports `reg:squarederror` at `scale_pos_weight = 1` only, got {got}"),
+    )
 }
 
 /// [`ensure`] that `v` is finite and in `[0, 1]`.
@@ -1182,14 +1200,7 @@ impl TrainingParams {
         };
         let dropout = boulevard.dropout();
         self.refuse_balanced_bagging()?;
-        ensure(
-            "objective",
-            matches!(self.objective, Objective::SquaredError),
-            format!(
-                "`booster = boulevard` supports `reg:squarederror` only, got `{}`",
-                self.objective.name()
-            ),
-        )?;
+        unweighted_squared_error(&self.objective, "`booster = boulevard`")?;
         if self.num_parallel_tree > 1 {
             ensure(
                 "boulevard_dropout",
@@ -1332,14 +1343,7 @@ impl TrainingParams {
             return Ok(());
         }
         self.refuse_balanced_bagging()?;
-        ensure(
-            "objective",
-            matches!(self.objective, Objective::SquaredError),
-            format!(
-                "`ebm_boulevard` supports `reg:squarederror` only, got `{}`",
-                self.objective.name()
-            ),
-        )?;
+        unweighted_squared_error(&self.objective, "`ebm_boulevard`")?;
         ensure(
             "eta",
             self.eta <= 1.0,
@@ -1614,7 +1618,7 @@ impl TrainingParamsBuilder {
         self
     }
 
-    /// Set the objective (default [`Objective::SquaredError`]).
+    /// Set the objective (default [`Objective::SquaredError`] at [`RegLoss::default`](crate::objective::RegLoss::default)).
     #[must_use]
     pub fn objective(mut self, objective: Objective) -> Self {
         self.params.objective = objective;
@@ -1698,6 +1702,7 @@ impl From<TrainingParams> for TrainingParamsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::objective::RegLoss;
 
     /// The parameter `builder.build()` rejects, if any.
     fn rejected(builder: TrainingParamsBuilder) -> Option<&'static str> {
@@ -1722,7 +1727,7 @@ mod tests {
         assert_eq!(p.booster, BoosterKind::GbTree);
         assert_eq!(p.grow_policy, GrowPolicy::DepthWise);
         assert!(p.base_score.is_none());
-        assert_eq!(p.objective, Objective::SquaredError);
+        assert_eq!(p.objective, Objective::SquaredError(RegLoss::default()));
         p.validate().unwrap();
     }
 
@@ -1730,7 +1735,7 @@ mod tests {
     fn builder_chains_and_validates() {
         let p = TrainingParams::builder()
             .objective(Objective::BinaryLogistic(
-                crate::objective::Logistic::default(),
+                crate::objective::RegLoss::default(),
             ))
             .eta(0.1)
             .max_depth(4)
@@ -1879,7 +1884,12 @@ mod tests {
             rejected(linear().objective(Objective::AbsoluteError)),
             Some("linear_tree")
         );
-        assert!(linear().objective(Objective::Gamma).build().is_ok());
+        assert!(
+            linear()
+                .objective(Objective::Gamma(RegLoss::default()))
+                .build()
+                .is_ok()
+        );
     }
 
     /// Reuse penalties apply in the XGBoost split searches only; the LightGBM

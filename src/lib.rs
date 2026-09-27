@@ -22,7 +22,7 @@
 //! let dtrain = DMatrix::from_dense(&x, 6, 2)?.with_labels(&y)?;
 //!
 //! let params = TrainingParams::builder()
-//!     .objective(Objective::SquaredError) // XGBoost's `reg:squarederror`
+//!     .objective(Objective::SquaredError(RegLoss::default())) // XGBoost's `reg:squarederror`
 //!     .tree_method(TreeMethod::Hist)
 //!     .max_depth(3)
 //!     .eta(0.1)
@@ -222,11 +222,9 @@
 //!   threshold suffix), and the `-` variants of the ranking metrics
 //!   (`ndcg-`, `ndcg@k-`, `map-`, `map@k-`); these names are refused.
 //! - XGBoost import and export of gblinear models.
-//! - `scale_pos_weight` outside the logistic objectives: XGBoost also
-//!   weights the positive rows of `reg:squarederror` and `reg:gamma` with
-//!   it; [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost)
-//!   refuses it there, and XGBoost import drops it (predictions do not read
-//!   it).
+//! - `scale_pos_weight = 0`: XGBoost's bound is `>= 0`; hessboost's
+//!   [`RegLoss::new`](objective::RegLoss::new) needs a positive weight, so
+//!   configurations and XGBoost files with `0` are refused.
 //!
 //! [`DMatrix`]: data::DMatrix
 //! [`TrainingParams`]: config::TrainingParams
@@ -269,18 +267,19 @@ pub(crate) const K_RT_EPS_F32: f32 = 1e-6;
 /// [`ImportanceType`](model::ImportanceType) (for
 /// [`BoostedModel::feature_importance`](model::BoostedModel::feature_importance)),
 /// [`Objective`](objective::Objective) (for
-/// [`TrainingParamsBuilder::objective`](config::TrainingParamsBuilder::objective)),
-/// and [`EvalMetric`](metric::EvalMetric) (for
+/// [`TrainingParamsBuilder::objective`](config::TrainingParamsBuilder::objective))
+/// with [`RegLoss`](objective::RegLoss) (the parameter of its default
+/// `reg:squarederror`), and [`EvalMetric`](metric::EvalMetric) (for
 /// [`TrainingParamsBuilder::eval_metric`](config::TrainingParamsBuilder::eval_metric)).
-/// Everything else (the other parameter enums, the objectives' and metrics'
-/// parameters, conformal intervals, ...) is imported from its module.
+/// Everything else (the other parameter enums, the other objectives' and
+/// metrics' parameters, conformal intervals, ...) is imported from its module.
 pub mod prelude {
     pub use crate::config::{TrainingParams, TreeMethod};
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
     pub use crate::metric::EvalMetric;
     pub use crate::model::{BoostedModel, ImportanceType};
-    pub use crate::objective::Objective;
+    pub use crate::objective::{Objective, RegLoss};
     pub use crate::training::{Trainer, train};
 }
 /// Implementation details the crate's own benchmarks and parity tests

@@ -6,7 +6,7 @@ use hessboost::config::{
     BalancedBagging, BoosterKind, Dart, ProcessType, QueryBagging, Refresh, SamplingMethod,
     TrainingParamsBuilder,
 };
-use hessboost::objective::{LambdaRank, Logistic};
+use hessboost::objective::{LambdaRank, RegLoss};
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -291,7 +291,7 @@ fn balanced_bagging_refuses_unsupported_parameters_and_labels() {
 
 /// `binary:logistic`.
 fn binary() -> Objective {
-    Objective::BinaryLogistic(Logistic::default())
+    Objective::BinaryLogistic(RegLoss::default())
 }
 
 /// Zero weights are epsilon weights (floored at 1e-6, as in XGBoost): against

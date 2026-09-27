@@ -10,7 +10,7 @@
 //! Run with: `cargo run --release --example compact_model`
 
 use hessboost::model::compact::CompactModel;
-use hessboost::objective::Logistic;
+use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
 
 mod common;
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
         (64.0, 64.0),
     ] {
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .toad_penalty_feature(iota)

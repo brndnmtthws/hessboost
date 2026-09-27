@@ -2,7 +2,7 @@
 //! Run: `cargo run --release --example balanced_bagging`.
 
 use hessboost::config::BalancedBagging;
-use hessboost::objective::Logistic;
+use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
 
 fn main() -> Result<()> {
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     let dvalid = DMatrix::from_dense(&x[split..], n - train_rows, features)?
         .with_labels(&y[train_rows..])?;
     let params = TrainingParams::builder()
-        .objective(Objective::BinaryLogistic(Logistic::default()))
+        .objective(Objective::BinaryLogistic(RegLoss::default()))
         .tree_method(TreeMethod::Hist)
         // Keep 70% of the positives and 20% of the negatives each round.
         .balanced_bagging(BalancedBagging::new(0.7, 0.2)?)

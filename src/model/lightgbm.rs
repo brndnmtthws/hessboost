@@ -3,7 +3,7 @@
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, ModelObjective, ModelSpec};
 use crate::objective::{
-    LambdaRank, Logistic, Multiclass, Objective, PseudoHuber, Quantiles, Tweedie,
+    LambdaRank, Multiclass, Objective, PseudoHuber, Quantiles, RegLoss, Tweedie,
 };
 use crate::tree::{LinearLeaves, Node, RegTree};
 use std::collections::HashMap;
@@ -508,7 +508,7 @@ fn map_objective(
     }
     let invalid = |e: HessboostError| format_error(format!("objective `{}`: {e}", clip(line)));
     let objective = match name {
-        "regression" | "fair" => Objective::SquaredError,
+        "regression" | "fair" => Objective::SquaredError(RegLoss::default()),
         "regression_l1" | "mape" => Objective::AbsoluteError,
         "huber" => Objective::PseudoHuber(
             PseudoHuber::new(parameter(parameters, "alpha", 0.9)?).map_err(invalid)?,
@@ -517,12 +517,12 @@ fn map_objective(
             Quantiles::new([parameter(parameters, "alpha", 0.9)?]).map_err(invalid)?,
         ),
         "poisson" => Objective::Poisson,
-        "gamma" => Objective::Gamma,
+        "gamma" => Objective::Gamma(RegLoss::default()),
         "tweedie" => Objective::Tweedie(
             Tweedie::new(parameter(parameters, "tweedie_variance_power", 1.5)?).map_err(invalid)?,
         ),
-        "binary" | "multiclassova" => Objective::BinaryLogistic(Logistic::default()),
-        "cross_entropy" => Objective::RegLogistic(Logistic::default()),
+        "binary" | "multiclassova" => Objective::BinaryLogistic(RegLoss::default()),
+        "cross_entropy" => Objective::RegLogistic(RegLoss::default()),
         "multiclass" => Objective::Softprob(Multiclass::new(num_class).map_err(invalid)?),
         "lambdarank" | "rank_xendcg" => Objective::RankNdcg(LambdaRank::default()),
         "cross_entropy_lambda" => {

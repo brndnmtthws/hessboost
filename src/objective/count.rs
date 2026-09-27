@@ -3,8 +3,9 @@
 
 use super::{
     GradPair, Loss, OutputDomain, check_base_score_domain, check_label_domain, log_link,
-    weighted_label_mean,
+    newton_intercepts, weighted_label_mean,
 };
+use crate::K_RT_EPS_F32;
 use crate::data::MetaInfo;
 use crate::error::Result;
 use crate::metric::EvalMetric;
@@ -22,11 +23,17 @@ fn poisson_deviance(margin: f32, label: f32) -> f64 {
     }
 }
 
-/// Emit the `pred_transform`/`probs_to_margins`/`validate_base_score`/
-/// `base_margins_info` hooks shared by the log-link objectives (all predict
-/// `exp(margin)`). The link is
-/// XGBoost's `ProbToMargin`, `ln(v)` in `f32`; the intercept is XGBoost's
-/// `FitInterceptGlmLike`, the (weighted) label mean through that link.
+/// The log-link intercept of XGBoost's `FitInterceptGlmLike`: the
+/// (weighted) label mean through the link.
+fn log_label_mean(info: &MetaInfo) -> Vec<f32> {
+    let mut margin = [weighted_label_mean(info.labels, info.weights)];
+    log_link(&mut margin);
+    margin.to_vec()
+}
+
+/// Emit the `pred_transform`/`probs_to_margins`/`validate_base_score`
+/// hooks shared by the log-link objectives (all predict `exp(margin)`). The
+/// link is XGBoost's `ProbToMargin`, `ln(v)` in `f32`.
 macro_rules! log_link_objective {
     () => {
         fn pred_transform(&self, preds: &mut [f32]) {
@@ -39,12 +46,6 @@ macro_rules! log_link_objective {
 
         fn validate_base_score(&self, base_score: f64) -> Result<()> {
             check_base_score_domain(base_score, OutputDomain::Positive)
-        }
-
-        fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
-            let mut margin = [weighted_label_mean(info.labels, info.weights)];
-            log_link(&mut margin);
-            margin.to_vec()
         }
     };
 }
@@ -100,6 +101,10 @@ impl Loss for Poisson {
 
     log_link_objective!();
 
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+        log_label_mean(info)
+    }
+
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
         Some(Box::new(poisson_deviance))
     }
@@ -113,11 +118,30 @@ impl Loss for Poisson {
     }
 }
 
-/// Gamma regression (`reg:gamma`), a log-link objective for positive targets.
-/// Gradient `1 − y·exp(−m)`, Hessian `y·exp(−m)`.
-#[derive(Debug, Clone, Copy, Default)]
-#[non_exhaustive]
-pub struct Gamma;
+/// Gamma regression (`reg:gamma`), a log-link objective for positive
+/// targets: XGBoost's `RegLossObj<GammaDeviance>`. With `p = exp(m)` in
+/// `f32`, gradient `1 − y/p` and Hessian `y/p`, both times the row weight,
+/// which `scale_pos_weight` multiplies for a label of exactly `1`. The
+/// intercept is the (weighted) label mean through the link, or with
+/// `scale_pos_weight != 1` XGBoost's Newton step (`FitIntercept`) on the
+/// reweighted gradients.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Gamma {
+    scale_pos_weight: f32,
+}
+
+impl Gamma {
+    /// The loss with positive-label weight `scale_pos_weight`.
+    pub(crate) fn new(scale_pos_weight: f32) -> Self {
+        Gamma { scale_pos_weight }
+    }
+}
+
+impl Default for Gamma {
+    fn default() -> Self {
+        Gamma::new(1.0)
+    }
+}
 
 impl Loss for Gamma {
     fn name(&self) -> &'static str {
@@ -131,6 +155,7 @@ impl Loss for Gamma {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
+        let scale_pos_weight = self.scale_pos_weight;
         super::rowwise_gradient(
             labels.len(),
             1,
@@ -139,18 +164,29 @@ impl Loss for Gamma {
             weights,
             out,
             |p, l, w, o| {
-                crate::simd::gamma_gradient(p, l, w, o);
+                crate::simd::gamma_gradient(p, l, w, scale_pos_weight, o);
             },
         );
     }
 
     log_link_objective!();
 
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+        // XGBoost `RegLossObj::InitEstimation`, as for `reg:squarederror`.
+        if (self.scale_pos_weight - 1.0).abs() > K_RT_EPS_F32 {
+            return newton_intercepts(self, info);
+        }
+        log_label_mean(info)
+    }
+
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
-        // Half the Gamma unit deviance: `y/μ − ln(y/μ) − 1`.
-        Some(Box::new(|margin, label| {
+        // Half the Gamma unit deviance: `y/μ − ln(y/μ) − 1`, with a label of
+        // 1 reweighted by `scale_pos_weight` exactly as in the gradient.
+        let scale_pos_weight = f64::from(self.scale_pos_weight);
+        Some(Box::new(move |margin, label| {
             let (m, y) = (f64::from(margin), f64::from(label));
-            y * (-m).exp() + m - y.ln() - 1.0
+            let weight = if label == 1.0 { scale_pos_weight } else { 1.0 };
+            weight * (y * (-m).exp() + m - y.ln() - 1.0)
         }))
     }
 
@@ -214,6 +250,10 @@ impl Loss for TweedieLoss {
     }
 
     log_link_objective!();
+
+    fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
+        log_label_mean(info)
+    }
 
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
         // Half the Tweedie unit deviance for `1 < ρ < 2` (Poisson at `ρ = 1`):
@@ -283,12 +323,28 @@ mod tests {
 
     #[test]
     fn gamma_gradient_zero_at_log_y() {
-        let obj = Gamma;
+        let obj = Gamma::default();
         let labels = [3.0f32];
         let preds = [3.0f32.ln()];
         let out = gradient_pairs(&obj, &preds, &labels, None);
         // 1 - y*exp(-log y) = 1 - 1 = 0
         assert_relative_eq!(out[0].grad, 0.0, epsilon = 1e-5);
+    }
+
+    /// `scale_pos_weight` multiplies the weight of the rows labeled exactly
+    /// 1 only, and the intercept becomes the Newton step from margin 0,
+    /// `Σ w'(y − 1) / Σ w'y`, through `exp` and back.
+    #[test]
+    fn gamma_scale_pos_weight_reweights_rows_labeled_one() {
+        let obj = Gamma::new(2.0);
+        let out = gradient_pairs(&obj, &[0.0, 0.0], &[1.0, 4.0], Some(&[3.0, 3.0]));
+        assert_eq!(out[0], GradPair::new(0.0, 6.0)); // (1 - 1) * 6, 1 * 6
+        assert_eq!(out[1], GradPair::new(-9.0, 12.0)); // (1 - 4) * 3, 4 * 3
+        // Labels 1 (weight 2) and 3: (0 + 2) / (2 + 3) = 0.4.
+        let mut expected = [0.4f32];
+        obj.pred_transform(&mut expected);
+        obj.probs_to_margins(&mut expected);
+        assert_eq!(base_margins(&obj, &[1.0, 3.0], None), expected.to_vec());
     }
 
     #[test]
@@ -311,7 +367,7 @@ mod tests {
         let w = [3.0f32, 1.0];
         assert_eq!(base_margins(&obj, &[2.0, 6.0], Some(&w)), vec![3f32.ln()]);
         assert_eq!(
-            base_margins(&Gamma, &[0.0, 0.0], None),
+            base_margins(&Gamma::default(), &[0.0, 0.0], None),
             vec![f32::NEG_INFINITY]
         );
     }

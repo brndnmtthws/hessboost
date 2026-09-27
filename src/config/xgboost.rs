@@ -170,8 +170,8 @@ const OBJECTIVE_KEYS: &[(&str, &str)] = &[
     ("num_class", "`multi:softmax` and `multi:softprob`"),
     (
         "scale_pos_weight",
-        "`binary:logistic`, `binary:logitraw`, and `reg:logistic` (hessboost does not apply \
-         it to `reg:squarederror` or `reg:gamma`)",
+        "`reg:squarederror`, `reg:gamma`, `reg:logistic`, `binary:logistic`, and \
+         `binary:logitraw`",
     ),
     ("tweedie_variance_power", "`reg:tweedie`"),
     (
@@ -1318,7 +1318,7 @@ mod tests {
     use super::*;
     use crate::objective::distributional::{DistFamily, Distributional};
     use crate::objective::{
-        Aft, Expectiles, LambdaRank, Logistic, Multiclass, PseudoHuber, Quantiles, Tweedie,
+        Aft, Expectiles, LambdaRank, Multiclass, PseudoHuber, Quantiles, RegLoss, Tweedie,
     };
     use serde_json::json;
 
@@ -1592,20 +1592,20 @@ mod tests {
     fn typed_objectives_round_trip_through_the_flat_form() {
         let dist = Distributional::new(DistFamily::Gamma).with_gradient(DistGradient::Natural);
         let objectives = [
-            Objective::SquaredError,
+            Objective::SquaredError(RegLoss::new(2.0).unwrap()),
             Objective::SquaredLogError,
             Objective::PseudoHuber(PseudoHuber::new(0.4).unwrap()),
             Objective::AbsoluteError,
             Objective::Quantile(Quantiles::new([0.1, 0.5, 0.9]).unwrap()),
             Objective::Expectile(Expectiles::new([0.2, 0.8]).unwrap()),
-            Objective::RegLogistic(Logistic::new(3.0).unwrap()),
-            Objective::BinaryLogistic(Logistic::new(2.5).unwrap()),
-            Objective::BinaryLogitRaw(Logistic::new(0.5).unwrap()),
+            Objective::RegLogistic(RegLoss::new(3.0).unwrap()),
+            Objective::BinaryLogistic(RegLoss::new(2.5).unwrap()),
+            Objective::BinaryLogitRaw(RegLoss::new(0.5).unwrap()),
             Objective::BinaryHinge,
             Objective::Softmax(Multiclass::new(4).unwrap()),
             Objective::Softprob(Multiclass::new(3).unwrap()),
             Objective::Poisson,
-            Objective::Gamma,
+            Objective::Gamma(RegLoss::new(4.0).unwrap()),
             Objective::Tweedie(Tweedie::new(1.3).unwrap()),
             Objective::RankPairwise(LambdaRank::new(4).unwrap()),
             Objective::RankNdcg(LambdaRank::new(8).unwrap()),
@@ -1648,7 +1648,11 @@ mod tests {
                 "num_class",
             ),
             (
-                json!({"objective": "reg:squarederror", "scale_pos_weight": 2.0}),
+                json!({"objective": "reg:squaredlogerror", "scale_pos_weight": 2.0}),
+                "scale_pos_weight",
+            ),
+            (
+                json!({"objective": "count:poisson", "scale_pos_weight": 2.0}),
                 "scale_pos_weight",
             ),
             (
@@ -1676,7 +1680,7 @@ mod tests {
             ("huber_slope", json!(0.5)),
         ])
         .unwrap();
-        assert_eq!(p.objective, Objective::SquaredError);
+        assert_eq!(p.objective, Objective::SquaredError(RegLoss::default()));
         assert_eq!(
             p.eval_metric,
             [EvalMetric::Mphe(PseudoHuber::new(0.5).unwrap())]

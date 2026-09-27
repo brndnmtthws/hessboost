@@ -628,6 +628,7 @@ impl TrainingParams {
             "query bagging keeps whole queries; `gradient_based` is not supported with it",
         )
     }
+
     /// Class-balanced bagging: a binary objective on a tree booster, with
     /// uniform sampling and no `subsample` it would override.
     fn validate_balanced_bagging(&self) -> Result<()> {

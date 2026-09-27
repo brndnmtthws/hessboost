@@ -2,11 +2,12 @@
 //! learned distribution's shape, sampling determinism, persistence, and
 //! refusals.
 
-use hessboost::config::{ProcessType, Refresh};
+use hessboost::config::{BalancedBagging, ProcessType, QueryBagging, Refresh};
 use hessboost::diffusion::{
     DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, Samples, ScoreConfig,
     Sde,
 };
+use hessboost::objective::{LambdaRank, Logistic};
 use hessboost::prelude::*;
 
 mod common;
@@ -231,6 +232,47 @@ fn refresh_regressor_params_are_refused() {
     let mut params = quick(DiffusionParams::default());
     params.residualizer.as_mut().unwrap().training.process_type = update;
     assert_eq!(invalid_param(params.validate()), "residualizer.training");
+}
+
+#[test]
+fn row_bagging_regressor_params_are_refused() {
+    // LightGBM's class-balanced and query-level bagging sample rows by class
+    // or query; the score regressors fit `reg:squarederror` on the noisy
+    // training set, which has neither. Both are refused alone and with the
+    // objective each one needs, for the score GBDT and the residualizer.
+    let balanced = || Some(BalancedBagging::new(0.5, 0.5).unwrap());
+    let query = || Some(QueryBagging::new(0.5).unwrap());
+    let configs: [&dyn Fn(&mut TrainingParams); 4] = [
+        &|t| t.balanced_bagging = balanced(),
+        &|t| t.bagging_by_query = query(),
+        &|t| {
+            t.objective = Objective::BinaryLogistic(Logistic::default());
+            t.balanced_bagging = balanced();
+        },
+        &|t| {
+            t.objective = Objective::RankPairwise(LambdaRank::default());
+            t.bagging_by_query = query();
+        },
+    ];
+    let data = bimodal(100, 7);
+    let refused = |params: &DiffusionParams| {
+        assert!(matches!(
+            params.validate(),
+            Err(HessboostError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            DiffusionModel::fit(params, &data),
+            Err(HessboostError::InvalidParameter { .. })
+        ));
+    };
+    for set in configs {
+        let mut params = quick(DiffusionParams::default());
+        set(&mut params.training);
+        refused(&params);
+        let mut params = quick(DiffusionParams::default());
+        set(&mut params.residualizer.as_mut().unwrap().training);
+        refused(&params);
+    }
 }
 
 #[test]

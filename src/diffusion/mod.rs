@@ -184,6 +184,7 @@
 //! ```
 
 mod fit;
+pub mod forest;
 mod format;
 mod process;
 mod sample;

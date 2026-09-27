@@ -177,6 +177,8 @@
 //!   - nonparametric `p(y | x)` by tree-based conditional diffusion
 //!     (Treeffuser) and flow matching (DiffGBM) for scalar or vector
 //!     labels, sampled deterministically ([`diffusion`]);
+//!   - ForestFlow / ForestDiffusion tabular generation and imputation
+//!     ([`diffusion::forest`]);
 //!   - native Metal on macOS 10.15+ (`metal` feature): bit-identical GPU
 //!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~2.5x faster at
 //!     scale) and bit-identical GPU histograms
@@ -189,9 +191,9 @@
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
 //! `model_io`, `custom_objective`, `constraints`, `conformal`,
 //! `boulevard_inference`, `ebm`, `compact_model`, `distributional`,
-//! `virtual_ensembles`, `tree_diffusion`, `budget`, `balanced_bagging`,
-//! `online_update`, `ordered_target_stats`, `pfn_boost`, `metal` with
-//! `--features metal` on macOS). Run one with
+//! `virtual_ensembles`, `tree_diffusion`, `forest_flow`, `budget`,
+//! `balanced_bagging`, `online_update`, `ordered_target_stats`, `pfn_boost`,
+//! `metal` with `--features metal` on macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes

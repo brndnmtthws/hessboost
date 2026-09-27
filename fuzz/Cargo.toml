@@ -84,3 +84,10 @@ path = "fuzz_targets/diffusion-model.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "forest-model"
+path = "fuzz_targets/forest-model.rs"
+test = false
+doc = false
+bench = false

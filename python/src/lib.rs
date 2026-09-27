@@ -21,6 +21,7 @@ mod diffusion;
 mod dist;
 mod ebm;
 mod errors;
+mod forest;
 mod inference;
 mod online;
 mod params;
@@ -44,6 +45,8 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ebm::shape_functions, m)?)?;
     m.add_class::<diffusion::DiffusionParams>()?;
     m.add_class::<diffusion::DiffusionModel>()?;
+    m.add_class::<forest::ForestParams>()?;
+    m.add_class::<forest::ForestModel>()?;
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
     m.add_function(wrap_pyfunction!(train::cv, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;

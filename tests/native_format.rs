@@ -11,6 +11,7 @@
 
 use hessboost::config::{BoosterKind, Dart, LinearTree, MultiStrategy};
 use hessboost::data::FeatureType;
+use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams};
 use hessboost::diffusion::{DiffusionModel, DiffusionParams, Method, ScoreConfig, Sde};
 use hessboost::model::compact::CompactModel;
 use hessboost::objective::distributional::{
@@ -742,6 +743,23 @@ fn saved_models_keep_loading_with_their_margins() {
                 assert!(model.sample(&matrix(1), 2, 0).is_ok(), "{name} ({format})");
             }
         }
+        // Forest models likewise, from the release that introduced them.
+        for (name, case) in forest_models() {
+            let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
+            if !file("hbff").exists() {
+                continue;
+            }
+            let expected = std::fs::read(file("hbff.probe")).unwrap();
+            let binary = ForestModel::load_binary(file("hbff")).unwrap();
+            let json = ForestModel::load_json(file("hbff.json")).unwrap();
+            for (format, model) in [("hbff", binary), ("hbff.json", json)] {
+                assert_eq!(model.method(), case.method(), "{name} ({format})");
+                assert_eq!(model.classes(), case.classes(), "{name} ({format})");
+                let margins = forest_margins(&model);
+                assert!(margins == expected, "{}: {name} ({format})", dir.display());
+                assert!(model.generate(2, 0).is_ok(), "{name} ({format})");
+            }
+        }
     }
 }
 
@@ -772,6 +790,12 @@ fn save_models_of_this_version() {
         model.save_binary(file("hbdm")).unwrap();
         model.save_json(file("hbdm.json")).unwrap();
         std::fs::write(file("hbdm.probe"), regressor_margins(&model)).unwrap();
+    }
+    for (name, model) in forest_models() {
+        let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
+        model.save_binary(file("hbff")).unwrap();
+        model.save_json(file("hbff.json")).unwrap();
+        std::fs::write(file("hbff.probe"), forest_margins(&model)).unwrap();
     }
 }
 
@@ -821,4 +845,62 @@ fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
         .collect();
     let probe = DMatrix::from_dense(&x, 16, cols).unwrap();
     margin_bytes(regressor.predict_margin(&probe).unwrap().as_slice())
+}
+
+/// One small forest model per structure, as saved for each release: an
+/// unconditional flow model with a categorical column (one multi-output GBDT
+/// per level) and a class-conditional diffusion model with missing values
+/// (one GBDT per level and column).
+fn forest_models() -> Vec<(&'static str, ForestModel)> {
+    let tiny = |mut params: ForestParams, kinds: Option<Vec<ColumnKind>>| {
+        params.n_t = 3;
+        params.duplicate_k = std::num::NonZeroUsize::new(2).unwrap();
+        params.num_boost_round = std::num::NonZeroUsize::new(3).unwrap();
+        params.training.nthread = std::num::NonZeroUsize::new(1);
+        params.column_kinds = kinds;
+        params
+    };
+    let n = 160;
+    let complete: Vec<f32> = (0..n)
+        .flat_map(|i| {
+            let [a, b, c, _] = four_features(i);
+            [a, b, c, (i % 3) as f32]
+        })
+        .collect();
+    let with_missing: Vec<f32> = (0..n).flat_map(four_features).collect();
+    let classes: Vec<f32> = (0..n).map(|i| (i % 2) as f32).collect();
+    let mut kinds = vec![ColumnKind::Continuous; COLS];
+    kinds[3] = ColumnKind::Categorical;
+    let flow = ForestModel::fit(
+        &tiny(ForestParams::default(), Some(kinds)),
+        &DMatrix::from_dense(&complete, n, COLS).unwrap(),
+    )
+    .unwrap();
+    let diffusion = ForestModel::fit(
+        &tiny(ForestParams::diffusion(), None),
+        &DMatrix::from_dense(&with_missing, n, COLS)
+            .unwrap()
+            .with_labels(&classes)
+            .unwrap(),
+    )
+    .unwrap();
+    vec![("forest flow", flow), ("forest diffusion", diffusion)]
+}
+
+/// Every GBDT's margins on a fixed probe, as bytes (plain arithmetic, so
+/// bit for bit on every platform).
+/// Saved as `.hbff.probe`, not `.margins` (see [`regressor_margins`]).
+fn forest_margins(model: &ForestModel) -> Vec<u8> {
+    let mut out = Vec::new();
+    for gbdt in model.gbdts() {
+        let cols = gbdt.n_features();
+        let x: Vec<f32> = (0..8 * cols)
+            .map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0)
+            .collect();
+        let probe = DMatrix::from_dense(&x, 8, cols).unwrap();
+        out.extend(margin_bytes(
+            gbdt.predict_margin(&probe).unwrap().as_slice(),
+        ));
+    }
+    out
 }

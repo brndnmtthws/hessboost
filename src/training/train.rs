@@ -1950,28 +1950,25 @@ pub(super) fn sample_rows(
     if params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
-    let mut rows = if let Some(bagging) = params.balanced_bagging {
-        let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
-        let labels = &labels[..n];
-        let positives = labels.iter().filter(|&&label| label == 1.0).count();
-        let expected = positives as f64 * pos + (n - positives) as f64 * neg;
-        let mut rows = with_sample_capacity(expected);
-        rows.extend((0..n as u32).filter(|&row| {
-            rng.f64()
-                < if labels[row as usize] == 1.0 {
-                    pos
-                } else {
-                    neg
-                }
-        }));
-        rows
-    } else {
-        let subsample = params.subsample;
-        if subsample >= 1.0 {
-            return all_rows(n);
-        }
-        return bernoulli_sample(n, subsample, rng);
+    let Some(bagging) = params.balanced_bagging else {
+        return if params.subsample >= 1.0 {
+            all_rows(n)
+        } else {
+            bernoulli_sample(n, params.subsample, rng)
+        };
     };
+    let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
+    let labels = &labels[..n];
+    let positives = labels.iter().filter(|&&label| label == 1.0).count();
+    let mut rows = with_sample_capacity(positives as f64 * pos + (n - positives) as f64 * neg);
+    rows.extend((0..n as u32).filter(|&row| {
+        let fraction = if labels[row as usize] == 1.0 {
+            pos
+        } else {
+            neg
+        };
+        rng.f64() < fraction
+    }));
     if rows.is_empty() {
         rows.push(rng.range(0..n) as u32);
     }

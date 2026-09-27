@@ -144,9 +144,8 @@ use crate::config::{TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::rng::{GOLDEN, mix64, splitmix64};
+use crate::rng::{keyed_unit, splitmix64};
 use encoding::encode_row;
-use crate::rng::{Rng, keyed_unit, splitmix64};
 
 mod encoding;
 mod fit;

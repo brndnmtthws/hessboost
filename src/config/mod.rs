@@ -6,7 +6,7 @@ mod xgboost;
 
 pub use groups::{
     BalancedBagging, Dart, DartBuilder, ExtraTrees, LinearTree, QuantizedGrad,
-    QuantizedGradBuilder, Refresh,
+    QuantizedGradBuilder, QueryBagging, Refresh,
 };
 pub use params::{
     BoosterKind, Device, GrowPolicy, MAX_SYMMETRIC_DEPTH, MaxDeltaStep, Monotone, MultiStrategy,

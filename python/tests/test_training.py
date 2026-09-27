@@ -89,7 +89,7 @@ def ranking_data() -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np
     return x, relevance, qid
 
 
-@pytest.mark.parametrize("objective", ["rank:ndcg", "rank:pairwise", "rank:map"])
+@pytest.mark.parametrize("objective", ["rank:ndcg", "rank:pairwise", "rank:map", "rank:xendcg"])
 def test_ranking_orders_documents_within_queries(objective: str) -> None:
     x, relevance, qid = ranking_data()
     by_group = DMatrix(x, relevance, group=[10] * 30)

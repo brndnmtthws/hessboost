@@ -2,7 +2,7 @@
 //! that only mean something when a switch is on live inside that switch
 //! (`BoosterKind::Dart(Dart)`, `ProcessType::Update(Refresh)`,
 //! `Option<QuantizedGrad>`, `Option<ExtraTrees>`, `Option<LinearTree>`,
-//! `Option<BalancedBagging>`), so
+//! `Option<BalancedBagging>`, `Option<QueryBagging>`), so
 //! they cannot be set while the switch is off. Each validates its values
 //! when built.
 
@@ -278,6 +278,47 @@ impl LinearTree {
     }
 }
 
+/// LightGBM's query-level bagging for ranking (`bagging_by_query`): every
+/// round keeps each query group whole with probability `fraction` (its
+/// `bagging_fraction`, in `(0, 1)`), in place of `subsample`'s per-row draw.
+///
+/// ```
+/// use hessboost::config::QueryBagging;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// assert_eq!(QueryBagging::new(0.8)?.fraction(), 0.8);
+/// assert!(QueryBagging::new(1.0).is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueryBagging {
+    fraction: f64,
+}
+
+impl QueryBagging {
+    /// Keep each query with probability `fraction`.
+    ///
+    /// # Errors
+    ///
+    /// `fraction` outside `(0, 1)` (at `1` nothing is bagged: leave the
+    /// option unset), named `bagging_by_query`.
+    pub fn new(fraction: f64) -> Result<Self> {
+        if !(fraction > 0.0 && fraction < 1.0) {
+            return Err(HessboostError::invalid_param(
+                "bagging_by_query",
+                format!("the fraction of queries kept must be in (0, 1), got {fraction}"),
+            ));
+        }
+        Ok(QueryBagging { fraction })
+    }
+
+    /// The probability of keeping a query.
+    pub fn fraction(&self) -> f64 {
+        self.fraction
+    }
+}
+
 /// LightGBM's class-balanced bagging for binary classification
 /// (`pos_bagging_fraction`, `neg_bagging_fraction`): every round keeps each
 /// positive row (label `1`) with probability `pos` and each negative row
@@ -412,5 +453,11 @@ mod tests {
             refused(&BalancedBagging::new(1.0, 1.0)),
             Some("pos_bagging_fraction")
         );
+        for fraction in [0.0, 1.0, 1.5, f64::NAN] {
+            assert_eq!(
+                refused(&QueryBagging::new(fraction)),
+                Some("bagging_by_query")
+            );
+        }
     }
 }

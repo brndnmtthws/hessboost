@@ -1803,6 +1803,8 @@ fn rebuild_objective(
             n_targets,
             max_delta_step,
             shared_tree_seed: None,
+            // Keys training draws only (XE-NDCG); predictions never read it.
+            seed: 0,
         })
     })
 }

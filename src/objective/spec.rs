@@ -8,7 +8,7 @@ use super::{
     AbsoluteError, Aft, AftDistribution, AftLoss, Cox, Expectile, Expectiles, Gamma, Hinge,
     LambdaMart, LambdaRank, Logistic, LogisticLoss, Loss, Multiclass, Poisson, PseudoHuber,
     PseudoHuberLoss, Quantile, Quantiles, Softmax, SquaredError, SquaredLogError, Tweedie,
-    TweedieLoss, multi_target::MultiTarget,
+    TweedieLoss, Xendcg, multi_target::MultiTarget,
 };
 use crate::error::{HessboostError, Result};
 use std::fmt;
@@ -77,6 +77,12 @@ pub enum Objective {
     RankNdcg(LambdaRank),
     /// `rank:map`: LambdaMART on MAP.
     RankMap(LambdaRank),
+    /// `rank:xendcg`: LightGBM's XE-NDCG listwise ranking loss
+    /// (`rank_xendcg`; beyond XGBoost, so its models are saved in the
+    /// native formats only). Its per-round random targets are keyed by
+    /// [`seed`](crate::config::TrainingParams::seed), iteration, query, and
+    /// document, so the trees differ from LightGBM's.
+    RankXendcg,
     /// `survival:cox`: Cox proportional hazards (non-positive labels are
     /// right-censored).
     Cox,
@@ -114,6 +120,7 @@ impl PartialEq for Objective {
             | (O::BinaryHinge, O::BinaryHinge)
             | (O::Poisson, O::Poisson)
             | (O::Gamma, O::Gamma)
+            | (O::RankXendcg, O::RankXendcg)
             | (O::Cox, O::Cox) => true,
             (O::PseudoHuber(a), O::PseudoHuber(b)) => a == b,
             (O::Quantile(a), O::Quantile(b)) => a == b,
@@ -159,6 +166,9 @@ pub(crate) struct LossContext {
     /// (`multi_strategy = multi_output_tree`), which a `dist:*` objective
     /// grows along one parameter per round.
     pub(crate) shared_tree_seed: Option<u64>,
+    /// The configuration's [`seed`](crate::config::TrainingParams::seed),
+    /// which keys XE-NDCG's random targets.
+    pub(crate) seed: u64,
 }
 
 /// The parameters of the built-in objectives by their XGBoost names, at
@@ -228,6 +238,7 @@ impl Objective {
             Objective::RankPairwise(_) => "rank:pairwise",
             Objective::RankNdcg(_) => "rank:ndcg",
             Objective::RankMap(_) => "rank:map",
+            Objective::RankXendcg => "rank:xendcg",
             Objective::Cox => "survival:cox",
             Objective::Aft(_) => "survival:aft",
             Objective::Dist(dist) => dist.family().objective_name(),
@@ -270,6 +281,17 @@ impl Objective {
         matches!(self, Objective::AbsoluteError | Objective::Quantile(_))
     }
 
+    /// Whether the objective ranks documents within query groups (the
+    /// `rank:*` objectives).
+    pub(crate) fn is_ranking(&self) -> bool {
+        matches!(
+            self,
+            Objective::RankPairwise(_)
+                | Objective::RankNdcg(_)
+                | Objective::RankMap(_)
+                | Objective::RankXendcg
+        )
+    }
     /// Whether the objective classifies `0`/`1` labels (`binary:logistic`,
     /// `binary:logitraw`, `binary:hinge`).
     pub(crate) fn is_binary_classifier(&self) -> bool {
@@ -305,6 +327,7 @@ impl Objective {
             | Objective::RankPairwise(_)
             | Objective::RankNdcg(_)
             | Objective::RankMap(_)
+            | Objective::RankXendcg
             | Objective::Cox
             | Objective::Aft(_)
             | Objective::Dist(_) => LabelMatrix::Refused,
@@ -333,6 +356,7 @@ impl Objective {
             | Objective::BinaryHinge
             | Objective::Poisson
             | Objective::Gamma
+            | Objective::RankXendcg
             | Objective::Cox
             | Objective::Custom(_) => &[],
         }
@@ -371,6 +395,7 @@ impl Objective {
             "rank:pairwise" => rank().map(Objective::RankPairwise),
             "rank:ndcg" => rank().map(Objective::RankNdcg),
             "rank:map" => rank().map(Objective::RankMap),
+            "rank:xendcg" => Ok(Objective::RankXendcg),
             "survival:cox" => Ok(Objective::Cox),
             "survival:aft" => Aft::new(
                 parts.aft_loss_distribution,
@@ -442,6 +467,7 @@ impl Objective {
             | Objective::BinaryHinge
             | Objective::Poisson
             | Objective::Gamma
+            | Objective::RankXendcg
             | Objective::Cox
             | Objective::Custom(_) => d,
         }
@@ -482,6 +508,7 @@ impl Objective {
             Objective::RankPairwise(r) => Box::new(LambdaMart::pairwise(r.num_pair_per_sample())),
             Objective::RankNdcg(r) => Box::new(LambdaMart::ndcg(r.num_pair_per_sample())),
             Objective::RankMap(r) => Box::new(LambdaMart::map(r.num_pair_per_sample())),
+            Objective::RankXendcg => Box::new(Xendcg::new(context.seed)),
             Objective::Cox => Box::new(Cox),
             Objective::Aft(aft) => Box::new(AftLoss::new(aft.distribution(), aft.scale() as f32)),
             Objective::Dist(dist) => {

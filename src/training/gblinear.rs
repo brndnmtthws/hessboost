@@ -111,7 +111,7 @@ pub(crate) fn train_gblinear(
     let mut gpair = vec![GradPair::default(); n * n_out];
 
     for round in 0..num_round {
-        objective.gradient_info(&margin, &info, &mut gpair);
+        objective.gradient_info_at(&margin, &info, &mut gpair, round);
         reject_split_gradient(objective, round, &gpair)?;
 
         for k in 0..n_out {

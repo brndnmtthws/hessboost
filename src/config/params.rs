@@ -5,7 +5,9 @@
 //! exposes aliases (e.g. `eta`/`learning_rate`), we pick the canonical field
 //! name and document the alias.
 
-use super::groups::{BalancedBagging, Dart, ExtraTrees, LinearTree, QuantizedGrad, Refresh};
+use super::groups::{
+    BalancedBagging, Dart, ExtraTrees, LinearTree, QuantizedGrad, QueryBagging, Refresh,
+};
 use crate::error::{HessboostError, Result};
 use crate::objective::{Loss, LossContext, Objective, ObjectiveParts};
 use serde::{Deserialize, Serialize};
@@ -340,6 +342,13 @@ pub struct TrainingParams {
     /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
     /// booster, uniform sampling, and one label column of `0`/`1` labels.
     pub balanced_bagging: Option<BalancedBagging>,
+    /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
+    /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
+    /// whole query groups are kept or dropped each round. It replaces
+    /// `subsample`, which must stay `1`, and needs a `rank:*` objective, a
+    /// tree booster, uniform sampling, and query groups on the training
+    /// data.
+    pub bagging_by_query: Option<QueryBagging>,
     /// Output-to-tree allocation for multi-output models. XGBoost
     /// `multi_strategy`.
     pub multi_strategy: MultiStrategy,
@@ -424,6 +433,7 @@ impl Default for TrainingParams {
             interaction_constraints: Vec::new(),
             num_parallel_tree: 1,
             sampling_method: SamplingMethod::Uniform,
+            bagging_by_query: None,
             balanced_bagging: None,
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
@@ -540,9 +550,40 @@ impl TrainingParams {
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
         self.validate_balanced_bagging()?;
+        self.validate_bagging_by_query()?;
         self.validate_tree_options()
     }
 
+    /// Query-level bagging: a ranking objective on a tree booster, with
+    /// uniform sampling and no `subsample` it would override.
+    fn validate_bagging_by_query(&self) -> Result<()> {
+        if self.bagging_by_query.is_none() {
+            return Ok(());
+        }
+        ensure(
+            "bagging_by_query",
+            self.booster != BoosterKind::GbLinear,
+            "query bagging needs a tree booster: `gblinear` samples no rows",
+        )?;
+        ensure(
+            "bagging_by_query",
+            self.objective.is_ranking(),
+            format!(
+                "query bagging needs a `rank:*` objective, not `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            "subsample",
+            self.subsample == 1.0,
+            "query bagging replaces `subsample` with its query fraction; leave it at 1",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "query bagging keeps whole queries; `gradient_based` is not supported with it",
+        )
+    }
     /// Class-balanced bagging: a binary objective on a tree booster, with
     /// uniform sampling and no `subsample` it would override.
     fn validate_balanced_bagging(&self) -> Result<()> {
@@ -921,6 +962,7 @@ impl TrainingParams {
             max_delta_step: self.effective_max_delta_step(),
             shared_tree_seed: (self.multi_strategy == MultiStrategy::MultiOutputTree)
                 .then_some(self.seed),
+            seed: self.seed,
         })
     }
 
@@ -1096,6 +1138,12 @@ impl TrainingParamsBuilder {
         self
     }
 
+    /// Enable LightGBM's query-level bagging (`bagging_by_query`).
+    #[must_use]
+    pub fn bagging_by_query(mut self, bagging: QueryBagging) -> Self {
+        self.params.bagging_by_query = Some(bagging);
+        self
+    }
     /// Enable LightGBM's class-balanced bagging (`pos_bagging_fraction`,
     /// `neg_bagging_fraction`).
     #[must_use]

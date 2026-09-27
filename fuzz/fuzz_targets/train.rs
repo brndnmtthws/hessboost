@@ -38,6 +38,7 @@ const OBJECTIVES: &[&str] = &[
     "rank:pairwise",
     "rank:ndcg",
     "rank:map",
+    "rank:xendcg",
     "survival:cox",
     "survival:aft",
     "dist:normal",

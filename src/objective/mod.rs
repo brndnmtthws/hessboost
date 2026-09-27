@@ -52,6 +52,7 @@ mod ranking;
 mod regression;
 mod spec;
 mod survival;
+mod xendcg;
 
 pub(crate) use absolute::AbsoluteError;
 pub(crate) use classification::{Hinge, LogisticLoss};
@@ -67,6 +68,7 @@ pub(crate) use ranking::LambdaMart;
 pub(crate) use regression::{PseudoHuberLoss, SquaredError, SquaredLogError};
 pub use spec::Objective;
 pub(crate) use spec::{LossContext, ObjectiveParts};
+pub(crate) use xendcg::Xendcg;
 
 pub(crate) use survival::{AftLoss, Cox};
 
@@ -327,6 +329,21 @@ pub trait Loss: Send + Sync {
     /// row) override it.
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
         self.gradient_grouped(preds, info.labels, info.weights, info.group, out);
+    }
+
+    /// Compute the gradients of boosting round `iteration` (counted from
+    /// the model's first round, so continued training carries on) from a
+    /// dataset's full metadata view: what training calls. Losses whose
+    /// gradients are randomized per round (XE-NDCG's targets) override it;
+    /// the default forwards to [`Loss::gradient_info`].
+    fn gradient_info_at(
+        &self,
+        preds: &[f32],
+        info: &MetaInfo,
+        out: &mut [GradPair],
+        _iteration: usize,
+    ) {
+        self.gradient_info(preds, info, out);
     }
 
     /// Whether the Hessian is constant across margins (XGBoost

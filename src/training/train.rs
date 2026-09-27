@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
-use crate::data::{DMatrix, MetaInfo};
+use crate::data::{DMatrix, GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::Metric;
 use crate::model::{BoostedModel, ModelSpec};
@@ -913,6 +913,22 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
         ));
     }
 
+    if params.bagging_by_query.is_some() {
+        let Some(group) = dtrain.group() else {
+            return Err(HessboostError::invalid_param(
+                "bagging_by_query",
+                "requires query group sizes on the training dataset",
+            ));
+        };
+        if !group.partitions(dtrain.n_rows())
+            || group.iter_ranges().any(|(start, end)| start == end)
+        {
+            return Err(HessboostError::invalid_param(
+                "bagging_by_query",
+                "requires non-empty query groups covering all training rows",
+            ));
+        }
+    }
     if objective.requires_labels() && dtrain.labels().is_none() {
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
     }
@@ -1009,7 +1025,7 @@ fn refresh_round(
     let parallel = params.num_parallel_tree;
     // Gradients from the already refreshed iterations; iteration `i`'s trees
     // are then refreshed in place, output by output.
-    objective.gradient_info(&state.margins.train, info, &mut state.gpair);
+    objective.gradient_info_at(&state.margins.train, info, &mut state.gpair, iteration);
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
     let per_iteration = n_out * parallel;
     for slot in 0..per_iteration {
@@ -1055,10 +1071,15 @@ fn grow_round(
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
 
-    // 2. Uniform or class-stratified row subsets, drawn before trees.
-    let labels = dtrain.labels().unwrap_or_default();
-    let row_subsets =
-        iteration_row_subsets(n, params, prepared.samples_per_forest(), labels, &mut rng);
+    // 2. Row subsets (uniform, class-balanced, or by query), drawn before
+    //    the trees and shared across the per-output fits.
+    let row_subsets = iteration_row_subsets(
+        n,
+        params,
+        prepared.samples_per_forest(),
+        RowMeta::of(dtrain),
+        &mut rng,
+    );
     // An output's gradient-based sample, when its whole forest shares one.
     let mut forest_sample = None;
     let forest_indices = prepared.forest_indices(n_out, parallel);
@@ -1664,13 +1685,13 @@ pub(super) fn round_gradients(
         objective,
     } = *run;
     let BoosterKind::Dart(dart) = params.booster else {
-        objective.gradient_info(margin, info, gpair);
+        objective.gradient_info_at(margin, info, gpair, iteration);
         return (round_rng(params, iteration, 0), None);
     };
     let mut rng = round_rng(params, iteration, DART_SALT);
     let (dropped, drop_indices) = select_dropout(model, &dart, &mut rng);
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
-    objective.gradient_info(&margin_excl, info, gpair);
+    objective.gradient_info_at(&margin_excl, info, gpair, iteration);
     (rng, Some(drop_indices))
 }
 
@@ -1929,30 +1950,25 @@ pub(super) fn sample_rows(
     if params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
-    let mut rows = if let Some(bagging) = params.balanced_bagging {
-        let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
-        let labels = &labels[..n];
-        let positives = labels.iter().filter(|&&label| label == 1.0).count();
-        let expected = positives as f64 * pos + (n - positives) as f64 * neg;
-        let mut rows = with_sample_capacity(expected);
-        rows.extend((0..n as u32).filter(|&row| {
-            rng.f64()
-                < if labels[row as usize] == 1.0 {
-                    pos
-                } else {
-                    neg
-                }
-        }));
-        rows
-    } else {
-        let subsample = params.subsample;
-        if subsample >= 1.0 {
-            return all_rows(n);
-        }
-        let mut rows = with_sample_capacity(n as f64 * subsample);
-        rows.extend((0..n as u32).filter(|_| rng.f64() < subsample));
-        rows
+    let Some(bagging) = params.balanced_bagging else {
+        return if params.subsample >= 1.0 {
+            all_rows(n)
+        } else {
+            bernoulli_sample(n, params.subsample, rng)
+        };
     };
+    let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
+    let labels = &labels[..n];
+    let positives = labels.iter().filter(|&&label| label == 1.0).count();
+    let mut rows = with_sample_capacity(positives as f64 * pos + (n - positives) as f64 * neg);
+    rows.extend((0..n as u32).filter(|&row| {
+        let fraction = if labels[row as usize] == 1.0 {
+            pos
+        } else {
+            neg
+        };
+        rng.f64() < fraction
+    }));
     if rows.is_empty() {
         rows.push(rng.range(0..n) as u32);
     }
@@ -1965,29 +1981,77 @@ fn with_sample_capacity(expected: f64) -> Vec<u32> {
     Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize)
 }
 
-/// One iteration's row subsets (uniform or class-balanced), drawn before
-/// its trees: one per parallel tree, or a single subset for the whole
-/// forest when `per_forest` (`approx`, [`Prepared::samples_per_forest`]) or
-/// when there is no row sampling (every tree then reads all rows, and
-/// [`sample_rows`] draws nothing). Parallel tree `p` uses entry `p % len`,
-/// shared across its per-output fits. `labels` are the training labels,
-/// read by class-balanced bagging only.
+/// The indices in `0..n` kept by one `rng` draw each with probability
+/// `fraction`, or one random index when none is kept.
+fn bernoulli_sample(n: usize, fraction: f64, rng: &mut Rng) -> Vec<u32> {
+    let mut kept = with_sample_capacity(n as f64 * fraction);
+    kept.extend((0..n as u32).filter(|_| rng.f64() < fraction));
+    if kept.is_empty() {
+        kept.push(rng.range(0..n) as u32);
+    }
+    kept
+}
+
+/// The training metadata row sampling reads: the labels (class-balanced
+/// bagging) and the query groups (query bagging).
+#[derive(Clone, Copy)]
+pub(super) struct RowMeta<'a> {
+    labels: &'a [f32],
+    group: Option<&'a GroupInfo>,
+}
+
+impl<'a> RowMeta<'a> {
+    /// `data`'s labels (empty without any) and query groups.
+    pub(super) fn of(data: &'a DMatrix) -> Self {
+        RowMeta {
+            labels: data.labels().unwrap_or_default(),
+            group: data.group(),
+        }
+    }
+}
+
+/// One iteration's row subsets (uniform, class-balanced, or by query),
+/// drawn before its trees: one per parallel tree, or a single subset for
+/// the whole forest when `per_forest` (`approx`,
+/// [`Prepared::samples_per_forest`]) or when there is no row sampling
+/// (every tree then reads all rows, and [`sample_rows`] draws nothing).
+/// Parallel tree `p` uses entry `p % len`, shared across its per-output
+/// fits. With query bagging each subset is the rows of the query groups
+/// (the whole matrix without any) a draw keeps.
 pub(super) fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
     per_forest: bool,
-    labels: &[f32],
+    meta: RowMeta<'_>,
     rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
     let samples = params.sampling_method == SamplingMethod::Uniform
-        && (params.subsample < 1.0 || params.balanced_bagging.is_some());
+        && (params.subsample < 1.0
+            || params.balanced_bagging.is_some()
+            || params.bagging_by_query.is_some());
     let draws = if per_forest || !samples {
         1
     } else {
         params.num_parallel_tree
     };
+    let Some(bagging) = params.bagging_by_query else {
+        return (0..draws)
+            .map(|_| sample_rows(n, params, meta.labels, rng))
+            .collect();
+    };
+    let queries: Vec<(usize, usize)> = meta
+        .group
+        .map_or_else(|| vec![(0, n)], |group| group.iter_ranges().collect());
     (0..draws)
-        .map(|_| sample_rows(n, params, labels, rng))
+        .map(|_| {
+            bernoulli_sample(queries.len(), bagging.fraction(), rng)
+                .into_iter()
+                .flat_map(|query| {
+                    let (start, end) = queries[query as usize];
+                    start as u32..end as u32
+                })
+                .collect()
+        })
         .collect()
 }
 
@@ -2131,6 +2195,53 @@ mod tests {
     };
     use crate::test_support::labeled_dense;
     use crate::tree::{ChildLeaf, SplitRule};
+
+    /// Query bagging keeps or drops each query whole, and its draw does not
+    /// depend on the thread count.
+    #[test]
+    fn query_subsets_keep_whole_groups_at_any_thread_count() {
+        let group_sizes = vec![3, 7, 2, 8, 4, 5, 6];
+        let group = GroupInfo::from_sizes(&group_sizes);
+        let n: usize = group_sizes.iter().sum();
+        let params = TrainingParams::builder()
+            .objective(Objective::RankNdcg(LambdaRank::default()))
+            .bagging_by_query(crate::config::QueryBagging::new(0.5).unwrap())
+            .seed(17)
+            .build()
+            .unwrap();
+        let select = |threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                iteration_row_subsets(
+                    n,
+                    &params,
+                    false,
+                    RowMeta {
+                        labels: &[],
+                        group: Some(&group),
+                    },
+                    &mut Rng::new(41),
+                )
+            })
+        };
+        let one = select(1);
+        assert_eq!(one, select(4));
+        let selected = &one[0];
+        assert!(!selected.is_empty() && selected.len() < n);
+        for (query, (start, end)) in group.iter_ranges().enumerate() {
+            let included = selected
+                .iter()
+                .filter(|&&row| (start..end).contains(&(row as usize)))
+                .count();
+            assert!(
+                included == 0 || included == end - start,
+                "query {query} split"
+            );
+        }
+    }
 
     #[test]
     fn balanced_row_sampler_respects_class_fractions() {

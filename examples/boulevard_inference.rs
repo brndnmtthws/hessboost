@@ -133,7 +133,7 @@ fn main() -> Result<()> {
     }
 
     // The Boulevard record survives the native formats.
-    let reloaded = BoostedModel::from_bytes(&model.to_bytes()?)?;
+    let reloaded = BoostedModel::decode(&model.encode(ModelFormat::Binary)?, ModelFormat::Binary)?;
     assert_eq!(reloaded.boulevard(), model.boulevard());
     Ok(())
 }

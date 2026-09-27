@@ -11,6 +11,7 @@
 
 use hessboost::config::{BoosterKind, Dart, LinearTree, MultiStrategy};
 use hessboost::data::FeatureType;
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams, NoiseLevels};
 use hessboost::diffusion::{
     DiffusionModel, DiffusionParams, Method, SampleOptions, ScoreConfig, Sde,
@@ -32,14 +33,14 @@ const COLS: usize = 4;
 #[test]
 fn unknown_and_corrupt_native_payloads_are_refused() {
     let model = train(&base().build().unwrap(), &matrix(1), 3).unwrap();
-    let bytes = model.to_bytes().unwrap();
+    let bytes = model.encode(ModelFormat::Binary).unwrap();
     // The uncompressed container loads too; its version byte follows the
     // magic.
     let container = zstd::stream::decode_all(bytes.as_slice()).unwrap();
     assert_eq!(&container[..4], b"HBM\0");
     assert_eq!(
         bits(
-            BoostedModel::from_bytes(&container)
+            BoostedModel::decode(&container, ModelFormat::Binary)
                 .unwrap()
                 .predict(&matrix(1), Iterations::Best)
                 .unwrap()
@@ -69,7 +70,7 @@ fn unknown_and_corrupt_native_payloads_are_refused() {
         container[..container.len() - 3].to_vec(),
         container[..4].to_vec(),
     ] {
-        let err = BoostedModel::from_bytes(&corrupt).unwrap_err();
+        let err = BoostedModel::decode(&corrupt, ModelFormat::Binary).unwrap_err();
         assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
     }
 }
@@ -78,17 +79,17 @@ fn unknown_and_corrupt_native_payloads_are_refused() {
 /// its layout fields into inconsistent states.
 fn empty_model_doc() -> Value {
     let model = train(&base().build().unwrap(), &matrix(1), 0).unwrap();
-    serde_json::from_str(&model.to_json().unwrap()).unwrap()
+    serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap()
 }
 
 fn load_doc(doc: &Value) -> hessboost::error::Result<BoostedModel> {
-    BoostedModel::from_json(&doc.to_string())
+    BoostedModel::decode(doc.to_string(), ModelFormat::Json)
 }
 
 /// A trained four-round model's native JSON document.
 fn trained_doc(params: &TrainingParams, data: &DMatrix) -> Value {
     let model = train(params, data, 4).unwrap();
-    serde_json::from_str(&model.to_json().unwrap()).unwrap()
+    serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap()
 }
 
 fn assert_refused(doc: &Value, what: &str) {
@@ -264,7 +265,8 @@ fn json_documents_may_omit_defaults() {
     ];
     for (name, params, data) in cases {
         let model = train(&params, &data, 4).unwrap();
-        let mut doc: Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        let mut doc: Value =
+            serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
         let removed = strip_defaults(&mut doc);
         let quantiles = name == "reg:quantileerror";
         // Every parameter but the configured alphas was a default.
@@ -274,8 +276,8 @@ fn json_documents_may_omit_defaults() {
         let restored = load_doc(&doc).unwrap();
         assert_eq!(restored.objective(), model.objective(), "{name}");
         assert_eq!(
-            restored.to_bytes().unwrap(),
-            model.to_bytes().unwrap(),
+            restored.encode(ModelFormat::Binary).unwrap(),
+            model.encode(ModelFormat::Binary).unwrap(),
             "{name}"
         );
         assert_eq!(
@@ -289,10 +291,11 @@ fn json_documents_may_omit_defaults() {
             "{name}"
         );
         // Saving writes every field again.
-        let rewritten: Value = serde_json::from_str(&restored.to_json().unwrap()).unwrap();
+        let rewritten: Value =
+            serde_json::from_slice(&restored.encode(ModelFormat::Json).unwrap()).unwrap();
         assert_eq!(
             rewritten,
-            serde_json::from_str::<Value>(&model.to_json().unwrap()).unwrap(),
+            serde_json::from_slice::<Value>(&model.encode(ModelFormat::Json).unwrap()).unwrap(),
             "{name}"
         );
 
@@ -454,7 +457,7 @@ type Has = fn(&BoostedModel) -> bool;
 
 /// Whether a model stores DART tree weights other than `1.0`.
 fn has_dart_weights(model: &BoostedModel) -> bool {
-    let doc: Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    let doc: Value = serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
     doc["tree_weights"]
         .as_array()
         .unwrap()
@@ -641,9 +644,9 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
         .collect();
     // A stored early-stopping iteration selects the trees `predict` uses.
     let plain = train(&base().build().unwrap(), &matrix(1), 4).unwrap();
-    let mut doc: Value = serde_json::from_str(&plain.to_json().unwrap()).unwrap();
+    let mut doc: Value = serde_json::from_slice(&plain.encode(ModelFormat::Json).unwrap()).unwrap();
     doc["best_iteration"] = 1.into();
-    let stopped = BoostedModel::from_json(&doc.to_string()).unwrap();
+    let stopped = BoostedModel::decode(doc.to_string(), ModelFormat::Json).unwrap();
     models.push(("early stopping", stopped, matrix(1), |m| {
         m.best_iteration() == Some(1)
     }));
@@ -654,11 +657,21 @@ fn feature_models() -> Vec<(&'static str, BoostedModel, DMatrix, Has)> {
 fn native_formats_round_trip_every_model_feature() {
     for (name, model, data, has_feature) in feature_models() {
         assert!(has_feature(&model), "{name}: feature not exercised");
-        let bytes = model.to_bytes().unwrap();
-        let from_binary = BoostedModel::from_bytes(&bytes).unwrap();
-        assert_eq!(from_binary.to_bytes().unwrap(), bytes, "{name}: binary");
-        let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
-        assert_eq!(from_json.to_bytes().unwrap(), bytes, "{name}: JSON");
+        let bytes = model.encode(ModelFormat::Binary).unwrap();
+        let from_binary = BoostedModel::decode(&bytes, ModelFormat::Binary).unwrap();
+        assert_eq!(
+            from_binary.encode(ModelFormat::Binary).unwrap(),
+            bytes,
+            "{name}: binary"
+        );
+        let from_json =
+            BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json)
+                .unwrap();
+        assert_eq!(
+            from_json.encode(ModelFormat::Binary).unwrap(),
+            bytes,
+            "{name}: JSON"
+        );
         let expected = bits(model.predict(&data, Iterations::Best).unwrap().as_slice());
         for restored in [&from_binary, &from_json] {
             assert_eq!(
@@ -727,8 +740,8 @@ fn saved_models_keep_loading_with_their_margins() {
         for (name, _, data, _) in &cases {
             let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
             let expected = std::fs::read(file("margins")).unwrap();
-            let binary = BoostedModel::load_binary(file("bin")).unwrap();
-            let json = BoostedModel::load_json(file("json")).unwrap();
+            let binary = BoostedModel::load(file("bin"), ModelFormat::Binary).unwrap();
+            let json = BoostedModel::load(file("json"), ModelFormat::Json).unwrap();
             for (format, model) in [("bin", binary), ("json", json)] {
                 let margins = margin_bytes(
                     model
@@ -752,8 +765,8 @@ fn saved_models_keep_loading_with_their_margins() {
                 continue;
             }
             let expected = std::fs::read(file("hbdm.probe")).unwrap();
-            let binary = DiffusionModel::load_binary(file("hbdm")).unwrap();
-            let json = DiffusionModel::load_json(file("hbdm.json")).unwrap();
+            let binary = DiffusionModel::load(file("hbdm"), DiffusionFormat::Binary).unwrap();
+            let json = DiffusionModel::load(file("hbdm.json"), DiffusionFormat::Json).unwrap();
             for (format, model) in [("hbdm", binary), ("hbdm.json", json)] {
                 assert_eq!(model.method(), case.method(), "{name} ({format})");
                 let margins = regressor_margins(&model);
@@ -773,8 +786,8 @@ fn saved_models_keep_loading_with_their_margins() {
                 continue;
             }
             let expected = std::fs::read(file("hbff.probe")).unwrap();
-            let binary = ForestModel::load_binary(file("hbff")).unwrap();
-            let json = ForestModel::load_json(file("hbff.json")).unwrap();
+            let binary = ForestModel::load(file("hbff"), DiffusionFormat::Binary).unwrap();
+            let json = ForestModel::load(file("hbff.json"), DiffusionFormat::Json).unwrap();
             for (format, model) in [("hbff", binary), ("hbff.json", json)] {
                 assert_eq!(model.method(), case.method(), "{name} ({format})");
                 assert_eq!(model.classes(), case.classes(), "{name} ({format})");
@@ -813,15 +826,16 @@ fn saved_models_re_save_byte_identically() {
                     let saved_json: Value = serde_json::from_str(&json).unwrap();
                     let saved_json = saved_json.as_object().unwrap();
                     let hbtd = std::fs::read(path.with_extension("hbtd")).ok();
-                    let from_bin = BoostedModel::from_bytes(&stored).unwrap();
-                    let from_json = BoostedModel::from_json(&json).unwrap();
+                    let from_bin = BoostedModel::decode(&stored, ModelFormat::Binary).unwrap();
+                    let from_json = BoostedModel::decode(&json, ModelFormat::Json).unwrap();
                     for (source, model) in [("bin", from_bin), ("json", from_json)] {
                         if current {
-                            let bytes = model.to_bytes().unwrap();
+                            let bytes = model.encode(ModelFormat::Binary).unwrap();
                             assert!(bytes == stored, "{what}: {source} re-saved as bin");
                         }
                         let resaved: Value =
-                            serde_json::from_str(&model.to_json().unwrap()).unwrap();
+                            serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap())
+                                .unwrap();
                         let resaved = resaved.as_object().unwrap();
                         for key in saved_json.keys() {
                             assert!(resaved.contains_key(key), "{what}: {source} drops `{key}`");
@@ -837,16 +851,16 @@ fn saved_models_re_save_byte_identically() {
                     }
                 }
                 Some("hbdm") if current => {
-                    let resaved = DiffusionModel::from_bytes(&stored)
+                    let resaved = DiffusionModel::decode(&stored, DiffusionFormat::Binary)
                         .unwrap()
-                        .to_bytes()
+                        .encode(DiffusionFormat::Binary)
                         .unwrap();
                     assert!(resaved == stored, "{what} re-saves differently");
                 }
                 Some("hbff") if current => {
-                    let resaved = ForestModel::from_bytes(&stored)
+                    let resaved = ForestModel::decode(&stored, DiffusionFormat::Binary)
                         .unwrap()
-                        .to_bytes()
+                        .encode(DiffusionFormat::Binary)
                         .unwrap();
                     assert!(resaved == stored, "{what} re-saves differently");
                 }
@@ -874,8 +888,8 @@ fn save_models_of_this_version() {
     std::fs::create_dir_all(&dir).unwrap();
     for (name, model, data, _) in feature_models() {
         let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
-        model.save_binary(file("bin")).unwrap();
-        model.save_json(file("json")).unwrap();
+        model.save(file("bin"), ModelFormat::Binary).unwrap();
+        model.save(file("json"), ModelFormat::Json).unwrap();
         if let Ok(compact) = model.to_compact() {
             compact.save(file("hbtd")).unwrap();
         }
@@ -884,14 +898,18 @@ fn save_models_of_this_version() {
     }
     for (name, model) in diffusion_models() {
         let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
-        model.save_binary(file("hbdm")).unwrap();
-        model.save_json(file("hbdm.json")).unwrap();
+        model.save(file("hbdm"), DiffusionFormat::Binary).unwrap();
+        model
+            .save(file("hbdm.json"), DiffusionFormat::Json)
+            .unwrap();
         std::fs::write(file("hbdm.probe"), regressor_margins(&model)).unwrap();
     }
     for (name, model) in forest_models() {
         let file = |ext: &str| dir.join(format!("{}.{ext}", slug(name)));
-        model.save_binary(file("hbff")).unwrap();
-        model.save_json(file("hbff.json")).unwrap();
+        model.save(file("hbff"), DiffusionFormat::Binary).unwrap();
+        model
+            .save(file("hbff.json"), DiffusionFormat::Json)
+            .unwrap();
         std::fs::write(file("hbff.probe"), forest_margins(&model)).unwrap();
     }
 }

@@ -1,5 +1,5 @@
 #![no_main]
-//! The native binary model decoder (`BoostedModel::from_bytes`): arbitrary
+//! The native binary model decoder (`ModelFormat::Binary`): arbitrary
 //! bytes either fail to decode or yield a model every prediction and
 //! serialization API handles.
 //!
@@ -26,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
     } else {
         common::seal(HEADER, rest)
     };
-    if let Ok(model) = BoostedModel::from_bytes(&container) {
+    if let Ok(model) = BoostedModel::decode(&container, ModelFormat::Binary) {
         common::exercise(&model);
     }
 });

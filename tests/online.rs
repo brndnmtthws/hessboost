@@ -70,8 +70,8 @@ fn exact_updates_equal_retraining_bit_for_bit() {
             online.update(additions, &deletions).unwrap();
             let retrained = train(&p, online.data(), 15).unwrap();
             assert_eq!(
-                online.model().to_json().unwrap(),
-                retrained.to_json().unwrap(),
+                online.model().encode(ModelFormat::Json).unwrap(),
+                retrained.encode(ModelFormat::Json).unwrap(),
                 "{name}"
             );
         }
@@ -125,7 +125,7 @@ fn updates_ignore_the_thread_count() {
             )
             .unwrap();
             online.update(Some(&added), &[1, 2, 3, 50]).unwrap();
-            online.model().to_json().unwrap()
+            online.model().encode(ModelFormat::Json).unwrap()
         })
     };
     assert_eq!(run(1), run(4));
@@ -140,7 +140,7 @@ fn an_interrupted_update_changes_nothing() {
         OnlineParams::approximate(0.1).unwrap(),
     ] {
         let mut online = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
-        let before = online.model().to_json().unwrap();
+        let before = online.model().encode(ModelFormat::Json).unwrap();
         let stop = |round: RoundEval| {
             if round.iteration() == 3 {
                 ControlFlow::Break(())
@@ -152,7 +152,7 @@ fn an_interrupted_update_changes_nothing() {
             invalid_param(online.update_with(None, &[0, 1], stop)),
             "on_round"
         );
-        assert_eq!(online.model().to_json().unwrap(), before);
+        assert_eq!(online.model().encode(ModelFormat::Json).unwrap(), before);
         assert_eq!(online.data().n_rows(), 300);
         // Refusing the commit after every iteration ran abandons it too.
         let mut rounds = 0;
@@ -167,15 +167,15 @@ fn an_interrupted_update_changes_nothing() {
         );
         assert_eq!(invalid_param(refused), "on_round");
         assert_eq!(rounds, 10);
-        assert_eq!(online.model().to_json().unwrap(), before);
+        assert_eq!(online.model().encode(ModelFormat::Json).unwrap(), before);
         assert_eq!(online.data().n_rows(), 300);
         // The model still updates afterwards, as an uninterrupted one would.
         online.update(None, &[0, 1]).unwrap();
         let mut fresh = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
         fresh.update(None, &[0, 1]).unwrap();
         assert_eq!(
-            online.model().to_json().unwrap(),
-            fresh.model().to_json().unwrap()
+            online.model().encode(ModelFormat::Json).unwrap(),
+            fresh.model().encode(ModelFormat::Json).unwrap()
         );
     }
 }
@@ -198,7 +198,7 @@ fn updates_refuse_labels_retraining_refuses() {
         OnlineParams::exact(),
     ] {
         let mut online = OnlineModel::train(&p, &train_data, 8, mode).unwrap();
-        let before = online.model().to_json().unwrap();
+        let before = online.model().encode(ModelFormat::Json).unwrap();
         // Retraining refuses the added row's label under the same name.
         let retrain_err = invalid_param(train(&p, &bad, 8));
         assert_eq!(
@@ -206,7 +206,7 @@ fn updates_refuse_labels_retraining_refuses() {
             retrain_err,
             "{mode:?}"
         );
-        assert_eq!(online.model().to_json().unwrap(), before);
+        assert_eq!(online.model().encode(ModelFormat::Json).unwrap(), before);
         assert_eq!(online.data().n_rows(), 300);
         // A later valid update still works, as on a fresh model.
         online.update(Some(&good), &[0]).unwrap();
@@ -214,8 +214,8 @@ fn updates_refuse_labels_retraining_refuses() {
         let mut fresh = OnlineModel::train(&p, &train_data, 8, mode).unwrap();
         fresh.update(Some(&good), &[0]).unwrap();
         assert_eq!(
-            online.model().to_json().unwrap(),
-            fresh.model().to_json().unwrap()
+            online.model().encode(ModelFormat::Json).unwrap(),
+            fresh.model().encode(ModelFormat::Json).unwrap()
         );
     }
 }
@@ -383,7 +383,7 @@ fn from_model_refuses_linear_leaves() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/data/lightgbm-4.7.0-linear.txt"
     );
-    let model = BoostedModel::load_lightgbm_text(path).unwrap();
+    let model = BoostedModel::load(path, ModelFormat::LightgbmText).unwrap();
     assert_eq!(model.n_features(), 6);
     let mut next = lcg(12);
     let x: Vec<f32> = (0..200 * 6).map(|_| next()).collect();
@@ -487,15 +487,15 @@ fn an_abandoned_update_keeps_the_update_state() {
         );
         assert_eq!(invalid_param(refused), "on_round");
         assert_eq!(
-            online.model().to_json().unwrap(),
-            control.model().to_json().unwrap()
+            online.model().encode(ModelFormat::Json).unwrap(),
+            control.model().encode(ModelFormat::Json).unwrap()
         );
         for (additions, deletions) in [(Some(&c), vec![3, 7]), (None, vec![0, 1, 40])] {
             let report = online.update(additions, &deletions).unwrap();
             assert_eq!(report, control.update(additions, &deletions).unwrap());
             assert_eq!(
-                online.model().to_json().unwrap(),
-                control.model().to_json().unwrap(),
+                online.model().encode(ModelFormat::Json).unwrap(),
+                control.model().encode(ModelFormat::Json).unwrap(),
                 "{online:?}"
             );
         }

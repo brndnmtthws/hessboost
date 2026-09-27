@@ -131,11 +131,12 @@ def test_every_format_round_trips_bit_for_bit(
     holes = x[:4].copy()
     holes[:, 0] = np.nan
     filled = model.impute(holes, y[:4], n_imputations=2, seed=5)
-    binary = model.to_bytes()
+    binary, text = model.to_bytes(), model.to_bytes("json")
     for other in reloaded(model, tmp_path, ".hbff"):
         np.testing.assert_array_equal(other.sample(30, seed=5).values, values)
         np.testing.assert_array_equal(other.impute(holes, y[:4], n_imputations=2, seed=5), filled)
         assert other.to_bytes() == binary
+        assert other.to_bytes("json") == text
         assert other.method == model.method
 
 
@@ -221,7 +222,7 @@ def test_damaged_models_are_refused(
     with pytest.raises(ModelFormatError):
         ForestModel.from_bytes(model.to_bytes()[:-8])
     with pytest.raises(ModelFormatError):
-        ForestModel.from_json(model.to_json()[:-10])
+        ForestModel.from_bytes(model.to_bytes("json")[:-10])
     diffusion = DiffusionModel.fit(
         dataclasses.replace(DiffusionParams.treeffuser(), n_repeats=2, num_boost_round=3),
         x,
@@ -230,4 +231,4 @@ def test_damaged_models_are_refused(
     with pytest.raises(ModelFormatError):
         ForestModel.from_bytes(diffusion.to_bytes())
     with pytest.raises(FileNotFoundError):
-        ForestModel.load_json(tmp_path / "missing.json")
+        ForestModel.load(tmp_path / "missing.json")

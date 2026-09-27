@@ -79,6 +79,14 @@ const NATIVE: ContainerSpec = ContainerSpec {
     )),
 };
 
+/// Whether `bytes` start like a native model file: a zstd frame, or an
+/// uncompressed container of this format or of 0.1.x's.
+pub(crate) fn is_native_container(bytes: &[u8]) -> bool {
+    super::container::is_zstd_frame(bytes)
+        || bytes.starts_with(MAGIC)
+        || bytes.starts_with(LEGACY_MAGIC)
+}
+
 /// `default_left` in `node.flags`.
 const DEFAULT_LEFT: u8 = 1;
 /// `is_categorical` in `node.flags`.
@@ -831,6 +839,7 @@ mod tests {
     use super::*;
     use crate::config::TrainingParams;
     use crate::model::Iterations;
+    use crate::model::ModelFormat;
     use crate::objective::{Objective, PseudoHuber, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
@@ -904,7 +913,7 @@ mod tests {
     #[test]
     fn unknown_sections_are_skipped_unless_required() {
         let (model, data) = model();
-        let bytes = model.to_bytes().unwrap();
+        let bytes = model.encode(ModelFormat::Binary).unwrap();
         for flags in [0, REQUIRED] {
             let edited = rewrite(&bytes, |entries| {
                 entries.push(Entry {
@@ -913,7 +922,7 @@ mod tests {
                     payload: vec![1, 2, 3],
                 });
             });
-            let loaded = BoostedModel::from_bytes(&edited);
+            let loaded = BoostedModel::decode(&edited, ModelFormat::Binary);
             if flags == 0 {
                 assert_eq!(
                     loaded.unwrap().predict(&data, Iterations::Best).unwrap(),
@@ -940,7 +949,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &data, 3).unwrap();
-        let bytes = model.to_bytes().unwrap();
+        let bytes = model.encode(ModelFormat::Binary).unwrap();
         let edited = rewrite(&bytes, |entries| {
             for e in entries.iter_mut() {
                 if let Some(rest) = e.name.strip_prefix("boulevard.") {
@@ -948,7 +957,7 @@ mod tests {
                 }
             }
         });
-        let loaded = BoostedModel::from_bytes(&edited).unwrap();
+        let loaded = BoostedModel::decode(&edited, ModelFormat::Binary).unwrap();
         assert!(loaded.boulevard().is_none());
         assert_eq!(
             loaded.predict(&data, Iterations::Best).unwrap(),
@@ -961,7 +970,7 @@ mod tests {
     #[test]
     fn files_name_their_writer_in_an_optional_section() {
         let (model, data) = model();
-        let bytes = model.to_bytes().unwrap();
+        let bytes = model.encode(ModelFormat::Binary).unwrap();
         let mut writer = None;
         let without = rewrite(&bytes, |entries| {
             let at = entries
@@ -975,7 +984,7 @@ mod tests {
         assert_eq!(flags, 0);
         assert_eq!(name, concat!("hessboost ", env!("CARGO_PKG_VERSION")));
         assert_eq!(
-            BoostedModel::from_bytes(&without)
+            BoostedModel::decode(&without, ModelFormat::Binary)
                 .unwrap()
                 .predict(&data, Iterations::Best)
                 .unwrap(),
@@ -989,7 +998,7 @@ mod tests {
     #[test]
     fn undefined_encodings_are_refused() {
         let (model, _) = model();
-        let bytes = model.to_bytes().unwrap();
+        let bytes = model.encode(ModelFormat::Binary).unwrap();
         let set = |name: &'static str, value: u8| {
             rewrite(&bytes, |entries| {
                 let entry = entries.iter_mut().find(|e| e.name == name).unwrap();
@@ -1001,7 +1010,9 @@ mod tests {
             (set("node.flags", 0x80), "node.flags"),
             (set("tree.has_linear", 2), "tree.has_linear"),
         ] {
-            let err = BoostedModel::from_bytes(&edited).unwrap_err().to_string();
+            let err = BoostedModel::decode(&edited, ModelFormat::Binary)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(needle), "{err}");
         }
 
@@ -1010,11 +1021,13 @@ mod tests {
         trailing.push(0);
         let checksum = xxh64(&trailing);
         trailing.extend_from_slice(&checksum.to_le_bytes());
-        let err = BoostedModel::from_bytes(&trailing).unwrap_err().to_string();
+        let err = BoostedModel::decode(&trailing, ModelFormat::Binary)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("after the last section"), "{err}");
         // The unedited re-encoding still loads: the refusals come from the
         // edits alone.
-        assert!(BoostedModel::from_bytes(&container).is_ok());
+        assert!(BoostedModel::decode(&container, ModelFormat::Binary).is_ok());
     }
 
     /// Files of the pre-0.2.0 format are recognized by their magic and
@@ -1022,9 +1035,11 @@ mod tests {
     #[test]
     fn pre_0_2_files_are_named_in_the_refusal() {
         let (model, _) = model();
-        let mut legacy = rewrite(&model.to_bytes().unwrap(), |_| {});
+        let mut legacy = rewrite(&model.encode(ModelFormat::Binary).unwrap(), |_| {});
         legacy[..4].copy_from_slice(LEGACY_MAGIC);
-        let err = BoostedModel::from_bytes(&legacy).unwrap_err().to_string();
+        let err = BoostedModel::decode(&legacy, ModelFormat::Binary)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("0.1.x"), "{err}");
     }
 
@@ -1035,10 +1050,10 @@ mod tests {
         let (model, _) = model();
         let huber = |slope| Some(Objective::PseudoHuber(PseudoHuber::new(slope).unwrap()));
         assert_eq!(model.objective().built_in().cloned(), huber(3.0));
-        let edited = rewrite(&model.to_bytes().unwrap(), |entries| {
+        let edited = rewrite(&model.encode(ModelFormat::Binary).unwrap(), |entries| {
             entries.retain(|e| e.name != "objective.huber_slope");
         });
-        let loaded = BoostedModel::from_bytes(&edited).unwrap();
+        let loaded = BoostedModel::decode(&edited, ModelFormat::Binary).unwrap();
         assert_eq!(loaded.objective().built_in().cloned(), huber(1.0));
     }
 
@@ -1046,7 +1061,7 @@ mod tests {
     #[test]
     fn missing_or_inconsistent_sections_are_refused() {
         let (model, _) = model();
-        let bytes = model.to_bytes().unwrap();
+        let bytes = model.encode(ModelFormat::Binary).unwrap();
         let without = rewrite(&bytes, |entries| {
             entries.retain(|e| e.name != "node.leaf_value");
         });
@@ -1057,7 +1072,7 @@ mod tests {
         });
         for edited in [without, shortened] {
             assert!(matches!(
-                BoostedModel::from_bytes(&edited),
+                BoostedModel::decode(&edited, ModelFormat::Binary),
                 Err(crate::error::HessboostError::ModelFormat(_))
             ));
         }
@@ -1068,13 +1083,15 @@ mod tests {
     #[test]
     fn corrupted_values_fail_the_checksum() {
         let (model, _) = model();
-        let container = rewrite(&model.to_bytes().unwrap(), |_| {});
-        assert!(BoostedModel::from_bytes(&container).is_ok());
+        let container = rewrite(&model.encode(ModelFormat::Binary).unwrap(), |_| {});
+        assert!(BoostedModel::decode(&container, ModelFormat::Binary).is_ok());
         let mut corrupt = container.clone();
         // Inside the last section's payload, just before the checksum.
         let at = corrupt.len() - 9;
         corrupt[at] ^= 1;
-        let err = BoostedModel::from_bytes(&corrupt).unwrap_err().to_string();
+        let err = BoostedModel::decode(&corrupt, ModelFormat::Binary)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("checksum"), "{err}");
     }
 

@@ -22,18 +22,6 @@ def write_bytes(path: PathLike, data: bytes) -> None:
         file.write(data)
 
 
-def read_text(path: PathLike) -> str:
-    """The UTF-8 text of the file ``path``."""
-    with open(path, encoding="utf-8") as file:
-        return file.read()
-
-
-def write_text(path: PathLike, text: str) -> None:
-    """Writes ``text`` to the file ``path`` as UTF-8."""
-    with open(path, "w", encoding="utf-8") as file:
-        file.write(text)
-
-
 class _SchemaState:
     """The feature schema a model's wrapper records (names, types and
     pandas categories, which model files do not store), and its pickle

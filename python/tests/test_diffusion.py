@@ -125,10 +125,11 @@ def test_every_format_round_trips_bit_for_bit(
 ) -> None:
     model, x = fitted
     draws = model.sample(x[:4], 25, seed=2)
-    binary = model.to_bytes()
+    binary, text = model.to_bytes(), model.to_bytes("json")
     for other in reloaded(model, tmp_path, ".hbdm"):
         np.testing.assert_array_equal(other.sample(x[:4], 25, seed=2), draws)
         assert other.to_bytes() == binary
+        assert other.to_bytes("json") == text
         assert other.method == model.method
         assert other.n_steps == model.n_steps
 
@@ -225,7 +226,7 @@ def test_wrong_types_raise_type_error() -> None:
     with pytest.raises(TypeError):
         DiffusionModel()
     with pytest.raises(TypeError):
-        DiffusionModel.from_json(b"{}")  # ty: ignore[invalid-argument-type]
+        DiffusionModel.from_bytes("{}")  # ty: ignore[invalid-argument-type]
 
 
 def test_unsupported_data_is_refused(fitted: tuple[DiffusionModel, NDArray[np.float64]]) -> None:
@@ -272,8 +273,14 @@ def test_damaged_models_are_refused(
     with pytest.raises(ModelFormatError):
         DiffusionModel.from_bytes(binary[:-8])
     with pytest.raises(ModelFormatError):
-        DiffusionModel.from_json(model.to_json()[:-10])
+        DiffusionModel.from_bytes(model.to_bytes("json")[:-10])
+    with pytest.raises(ModelFormatError):
+        DiffusionModel.from_bytes(binary, "json")
     with pytest.raises(ModelFormatError):
         DiffusionModel.from_bytes(hessboost.train({}, DMatrix(*bimodal(20, 0)), 2).save_raw())
     with pytest.raises(FileNotFoundError):
-        DiffusionModel.load_binary(tmp_path / "missing.hbdm")
+        DiffusionModel.load(tmp_path / "missing.hbdm")
+    with pytest.raises(ValueError, match="unknown model format"):
+        DiffusionModel.from_bytes(binary, "xgboost-json")  # ty: ignore[invalid-argument-type]
+    with pytest.raises(ValueError, match="unknown model format"):
+        model.to_bytes("auto")  # ty: ignore[invalid-argument-type]

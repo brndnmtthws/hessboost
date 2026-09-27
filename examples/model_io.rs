@@ -32,21 +32,21 @@ fn main() -> Result<()> {
     let ubj = dir.join("hessboost_xgb.ubj");
 
     // 1) Native binary (compact) round-trip.
-    model.save_binary(&bin)?;
-    let m_bin = BoostedModel::load_binary(&bin)?;
+    model.save(&bin, ModelFormat::Binary)?;
+    let m_bin = BoostedModel::load(&bin, ModelFormat::Binary)?;
 
     // 2) Native JSON (human-readable) round-trip.
-    model.save_json(&json)?;
-    let m_json = BoostedModel::load_json(&json)?;
+    model.save(&json, ModelFormat::Json)?;
+    let m_json = BoostedModel::load(&json, ModelFormat::Json)?;
 
     // 3) XGBoost-format JSON, readable by real XGBoost's `Booster.load_model`.
-    model.save_xgboost_json(&xgb)?;
-    let m_xgb = BoostedModel::load_xgboost_json(&xgb)?;
+    model.save(&xgb, ModelFormat::XgboostJson)?;
+    let m_xgb = BoostedModel::load(&xgb, ModelFormat::XgboostJson)?;
 
     // 4) XGBoost-format UBJSON (binary JSON, XGBoost's `.ubj`), the same
     //    document in XGBoost's compact encoding.
-    model.save_xgboost_ubjson(&ubj)?;
-    let m_ubj = BoostedModel::load_xgboost_ubjson(&ubj)?;
+    model.save(&ubj, ModelFormat::XgboostUbjson)?;
+    let m_ubj = BoostedModel::load(&ubj, ModelFormat::XgboostUbjson)?;
 
     for (label, m) in [
         ("binary", &m_bin),

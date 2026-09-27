@@ -45,7 +45,7 @@ fn labeled(n: usize, f: usize, missing: bool) -> DMatrix {
 }
 
 fn assert_bit_identical(model: &BoostedModel, data: &DMatrix) -> CompactModel {
-    let compact = CompactModel::from_bytes(&model.to_compact_bytes().unwrap()).unwrap();
+    let compact = CompactModel::decode(model.to_compact_bytes().unwrap()).unwrap();
     let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
     assert_eq!(
         bits(compact.predict_margin(data).unwrap().into_vec()),
@@ -303,19 +303,16 @@ fn corrupt_input_is_rejected_without_panicking() {
     let model = train(&params, &data, 5).unwrap();
     let bytes = model.to_compact_bytes().unwrap();
     for len in 0..bytes.len() {
-        assert!(
-            CompactModel::from_bytes(&bytes[..len]).is_err(),
-            "prefix {len}"
-        );
+        assert!(CompactModel::decode(&bytes[..len]).is_err(), "prefix {len}");
     }
     let mut longer = bytes.clone();
     longer.push(0);
-    assert!(CompactModel::from_bytes(&longer).is_err());
+    assert!(CompactModel::decode(&longer).is_err());
     // Single bit flips either fail to parse or give a model that predicts.
     for i in 0..bytes.len() * 8 {
         let mut flipped = bytes.clone();
         flipped[i / 8] ^= 1 << (i % 8);
-        if let Ok(m) = CompactModel::from_bytes(&flipped) {
+        if let Ok(m) = CompactModel::decode(&flipped) {
             let _ = m.predict_margin(&data);
         }
     }
@@ -342,11 +339,11 @@ fn inconsistent_layout_metadata_is_rejected() {
         .unwrap()
         .to_compact_bytes()
         .unwrap();
-    assert!(CompactModel::from_bytes(&with_meta(&bytes, |_| ())).is_ok());
+    assert!(CompactModel::decode(with_meta(&bytes, |_| ())).is_ok());
     // Two outputs × 2^63 parallel trees overflows the trees per iteration.
     let overflow = with_meta(&bytes, |m| m.num_parallel_tree = 1 << 63);
     assert!(matches!(
-        CompactModel::from_bytes(&overflow),
+        CompactModel::decode(&overflow),
         Err(HessboostError::ModelFormat(_))
     ));
     // A three-alpha objective cannot describe a two-output layout.
@@ -357,7 +354,7 @@ fn inconsistent_layout_metadata_is_rejected() {
         m.n_targets = 1;
     });
     assert!(matches!(
-        CompactModel::from_bytes(&widened),
+        CompactModel::decode(&widened),
         Err(HessboostError::ModelFormat(_))
     ));
 }
@@ -406,12 +403,12 @@ fn zero_width_heaps(n_trees: usize, n_leaves: u64) -> Vec<u8> {
 fn zero_width_heaps_validate_in_bounded_time() {
     let bytes = zero_width_heaps(4096, 1);
     assert!(bytes.len() < 4096);
-    let model = CompactModel::from_bytes(&bytes).unwrap();
+    let model = CompactModel::decode(&bytes).unwrap();
     let data = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
     assert_eq!(model.predict_margin(&data).unwrap().as_slice(), [4096.5]);
     // The shared zero-width leaf reference is still range-checked.
     assert!(matches!(
-        CompactModel::from_bytes(&zero_width_heaps(4096, 0)),
+        CompactModel::decode(zero_width_heaps(4096, 0)),
         Err(HessboostError::ModelFormat(_))
     ));
 }

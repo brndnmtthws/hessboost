@@ -69,8 +69,8 @@ fn main() -> Result<()> {
     let preds = model.predict(&dtrain, Iterations::Best)?;
     println!("first prediction: {}", preds.get(0, 0).unwrap());
 
-    model.save_binary("model.bin")?;
-    let reloaded = BoostedModel::load_binary("model.bin")?;
+    model.save("model.bin", ModelFormat::Binary)?;
+    let reloaded = BoostedModel::load("model.bin", ModelFormat::Binary)?;
     assert_eq!(reloaded.predict(&dtrain, Iterations::Best)?, preds);
     Ok(())
 }

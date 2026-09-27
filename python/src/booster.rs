@@ -1,7 +1,7 @@
 //! `Booster`: a trained or loaded model, its prediction variants, feature
 //! importance, slicing, and every model format.
 
-use crate::codec::encode_bytes;
+use crate::codec;
 use crate::data::{DMatrix, to_numpy};
 use crate::dist::Distributions;
 use crate::errors::{DetachExt, refuse};
@@ -13,68 +13,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::sync::Arc;
-
-/// Model formats, by the names the Python layer uses.
-#[derive(Clone, Copy)]
-enum Format {
-    Binary,
-    Json,
-    XgboostJson,
-    XgboostUbjson,
-    /// LightGBM 4.x text models (import only).
-    Lightgbm,
-}
-
-impl Format {
-    fn parse(name: &str) -> PyResult<Self> {
-        Ok(match name {
-            "binary" => Self::Binary,
-            "json" => Self::Json,
-            "xgboost-json" => Self::XgboostJson,
-            "xgboost-ubjson" => Self::XgboostUbjson,
-            "lightgbm" => Self::Lightgbm,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown model format {other:?}; expected \"binary\", \"json\", \
-                     \"xgboost-json\", \"xgboost-ubjson\" or (to load) \"lightgbm\""
-                )));
-            }
-        })
-    }
-
-    /// The format of `bytes`: a JSON document (`{` then `"` or `}`) is
-    /// XGBoost's when it has a `learner` key, else native; any other `{` is
-    /// UBJSON (whose keys start with a length marker); a first line `tree`
-    /// is a LightGBM text model; everything else is native binary.
-    fn detect(bytes: &[u8]) -> Self {
-        let text = bytes.trim_ascii_start();
-        if let Some(rest) = text.strip_prefix(b"tree")
-            && matches!(rest.first(), Some(b'\n' | b'\r'))
-        {
-            return Self::Lightgbm;
-        }
-        let mut rest = text.iter().copied();
-        if rest.next() != Some(b'{') {
-            return Self::Binary;
-        }
-        match rest.find(|byte| !byte.is_ascii_whitespace()) {
-            Some(b'"' | b'}') => {
-                if bytes.windows(9).any(|window| window == b"\"learner\"") {
-                    Self::XgboostJson
-                } else {
-                    Self::Json
-                }
-            }
-            _ => Self::XgboostUbjson,
-        }
-    }
-}
-
-fn utf8(bytes: &[u8]) -> hessboost::error::Result<&str> {
-    std::str::from_utf8(bytes).map_err(|error| {
-        hessboost::error::HessboostError::model_format(format!("text model is not UTF-8: {error}"))
-    })
-}
 
 /// What a prediction call returns.
 #[derive(Clone, Copy)]
@@ -159,34 +97,12 @@ impl Booster {
     /// Decodes a model in `format` (`"auto"` detects it from the bytes).
     #[staticmethod]
     fn load(py: Python<'_>, data: &[u8], format: &str) -> PyResult<Self> {
-        let format = if format == "auto" {
-            Format::detect(data)
-        } else {
-            Format::parse(format)?
-        };
-        let model = py.detached(|| match format {
-            Format::Binary => BoostedModel::from_bytes(data),
-            Format::Json => BoostedModel::from_json(utf8(data)?),
-            Format::XgboostJson => BoostedModel::from_xgboost_json(utf8(data)?),
-            Format::XgboostUbjson => BoostedModel::from_xgboost_ubjson(data),
-            Format::Lightgbm => BoostedModel::from_lightgbm_text(utf8(data)?),
-        })?;
-        Ok(Self::new(model))
+        codec::decode(py, data, format, BoostedModel::decode).map(Self::new)
     }
 
     /// The model encoded in `format`.
     fn save<'py>(&self, py: Python<'py>, format: &str) -> PyResult<Bound<'py, PyBytes>> {
-        let format = Format::parse(format)?;
-        encode_bytes(py, || match format {
-            Format::Binary => self.model.to_bytes(),
-            Format::Json => self.model.to_json().map(String::into_bytes),
-            Format::XgboostJson => self.model.to_xgboost_json().map(String::into_bytes),
-            Format::XgboostUbjson => self.model.to_xgboost_ubjson(),
-            Format::Lightgbm => Err(hessboost::error::HessboostError::invalid_param(
-                "format",
-                "\"lightgbm\" is an import-only format: LightGBM models load, but do not save",
-            )),
-        })
+        codec::encode(py, format, |format| self.model.encode(format))
     }
 
     /// Predictions of `kind` (`value`, `margin`, `contribs`,

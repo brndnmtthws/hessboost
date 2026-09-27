@@ -5,6 +5,7 @@
 use crate::booster::Booster;
 use crate::data::{DMatrix, to_numpy};
 use crate::errors::{OrRaise, refuse};
+use hessboost::conformal::Interval;
 use hessboost::data::DMatrix as RustMatrix;
 use hessboost::inference::{self, KernelSolver, NoiseVariance};
 use hessboost::model::BoostedModel;
@@ -32,11 +33,14 @@ self_cell!(
 );
 
 /// `(rows, 2)` `[lower, upper]` bounds.
-fn intervals(py: Python<'_>, bounds: Vec<(f64, f64)>) -> PyResult<Bound<'_, PyArrayDyn<f64>>> {
+pub(crate) fn intervals(
+    py: Python<'_>,
+    bounds: Vec<Interval<f64>>,
+) -> PyResult<Bound<'_, PyArrayDyn<f64>>> {
     let rows = bounds.len();
     let values = bounds
         .into_iter()
-        .flat_map(|(lower, upper)| [lower, upper])
+        .flat_map(|iv| [iv.lower, iv.upper])
         .collect();
     to_numpy(py, values, &[rows, 2])
 }
@@ -145,8 +149,8 @@ impl BoulevardInference {
         let se = py
             .detach(|| self.cell.borrow_dependent().standard_errors(&data.inner))
             .or_raise()?;
-        let rows = se.len();
-        to_numpy(py, se, &[rows])
+        let rows = se.n_rows();
+        to_numpy(py, se.into_vec(), &[rows])
     }
 
     fn confidence_intervals<'py>(

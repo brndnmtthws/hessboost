@@ -10,10 +10,11 @@ use super::{
     KernelSolver, NoiseVariance, QUERY_BLOCK, build_solver, check_alpha, check_data,
     noise_estimate, z_value,
 };
+use crate::conformal::Interval;
 use crate::data::DMatrix;
 use crate::ebm::{EbmInfo, TermShape, shape_functions};
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
+use crate::model::{BoostedModel, Predictions};
 
 /// Pointwise confidence bands of one term's shape function on its grid
 /// ([`EbmInference::term_bands`]), aligned with [`TermShape::values`].
@@ -355,12 +356,13 @@ impl<'a> EbmInference<'a> {
     ///
     /// When `term` is not a term of the model, or `data` does not have the
     /// model's features or has row weights or base margins.
-    pub fn term_standard_errors(&self, term: usize, data: &DMatrix) -> Result<Vec<f64>> {
+    pub fn term_standard_errors(&self, term: usize, data: &DMatrix) -> Result<Predictions<f64>> {
         check_data(self.model, data, "data", false)?;
         let (stage, part) = self.slot(term)?;
         let part = &self.stages[stage].kernel.parts[part];
         let cells: Vec<usize> = (0..data.n_rows()).map(|r| part.cell_of(data, r)).collect();
-        self.cell_standard_errors(term, &cells)
+        let se = self.cell_standard_errors(term, &cells)?;
+        Ok(Predictions::new(se, data.n_rows(), 1))
     }
 
     /// `‖w(x)‖²` of the whole prediction at every row of `data`:
@@ -431,22 +433,23 @@ impl<'a> EbmInference<'a> {
     ///
     /// When `data` does not have the model's features, or has row weights
     /// or base margins.
-    pub fn standard_errors(&self, data: &DMatrix) -> Result<Vec<f64>> {
+    pub fn standard_errors(&self, data: &DMatrix) -> Result<Predictions<f64>> {
         let sigma = self.noise_variance.sqrt();
-        Ok(self
+        let se: Vec<f64> = self
             .prediction_norms(data)?
             .into_iter()
             .map(|w2| sigma * w2.max(0.0).sqrt())
-            .collect())
+            .collect();
+        Ok(Predictions::new(se, data.n_rows(), 1))
     }
 
-    /// `(lower, upper)` of every row with half widths `z · width(‖w‖²)`.
+    /// The interval `prediction ± z · width(‖w‖²)` of every row.
     fn intervals(
         &self,
         data: &DMatrix,
         alpha: f64,
         width: impl Fn(f64) -> f64,
-    ) -> Result<Vec<(f64, f64)>> {
+    ) -> Result<Vec<Interval<f64>>> {
         check_alpha(alpha)?;
         let z = z_value(alpha);
         let norms = self.prediction_norms(data)?;
@@ -457,7 +460,10 @@ impl<'a> EbmInference<'a> {
             .zip(norms)
             .map(|(&p, w2)| {
                 let (center, half) = (f64::from(p), z * width(w2.max(0.0)));
-                (center - half, center + half)
+                Interval {
+                    lower: center - half,
+                    upper: center + half,
+                }
             })
             .collect())
     }
@@ -471,7 +477,7 @@ impl<'a> EbmInference<'a> {
     ///
     /// When `alpha` is not in `(0, 1)`, plus those of
     /// [`standard_errors`](Self::standard_errors).
-    pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * w2).sqrt())
     }
@@ -484,7 +490,7 @@ impl<'a> EbmInference<'a> {
     /// # Errors
     ///
     /// As [`confidence_intervals`](Self::confidence_intervals).
-    pub fn prediction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn prediction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * (1.0 + w2)).sqrt())
     }

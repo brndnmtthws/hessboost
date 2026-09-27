@@ -50,7 +50,7 @@ fn mean_standard_error(n: usize, points: &DMatrix) -> f64 {
         KernelSolver::Exact,
     )
     .unwrap();
-    let se = inference.standard_errors(points).unwrap();
+    let se = inference.standard_errors(points).unwrap().into_vec();
     assert!(se.iter().all(|&s| s.is_finite() && s > 0.0));
     se.iter().sum::<f64>() / se.len() as f64
 }
@@ -91,7 +91,7 @@ fn nystrom_on_every_row_reproduces_the_exact_solver() {
             landmarks: 300,
             seed: 7,
         });
-        for (e, n) in exact.iter().zip(&nystrom) {
+        for (e, n) in exact.as_slice().iter().zip(nystrom.as_slice()) {
             assert!((e - n).abs() <= 1e-9 * e, "{parallel}: {e} vs {n}");
         }
     }
@@ -211,7 +211,7 @@ fn inference_on_empty_inputs_is_refused_or_empty() {
         assert!(
             inference
                 .standard_errors(&none)
-                .is_ok_and(|se| se.is_empty())
+                .is_ok_and(|se| se.n_rows() == 0)
         );
     }
 }
@@ -271,6 +271,35 @@ fn no_truncation_is_none() {
         clipped.predict(&dtrain).unwrap(),
         model.predict(&dtrain).unwrap()
     );
+}
+
+/// Standard errors are one value per row (`Predictions<f64>`) and every
+/// interval a `conformal::Interval<f64>` centred on the prediction, the
+/// prediction interval enclosing the confidence interval.
+#[test]
+fn inference_outputs_are_typed_per_row() {
+    let dtrain = data(200, 15);
+    let model = train(&builder().build().unwrap(), &dtrain, 10).unwrap();
+    let inference = BoulevardInference::fit(
+        &model,
+        &dtrain,
+        NoiseVariance::Known(0.25),
+        KernelSolver::Exact,
+    )
+    .unwrap();
+    let points = data(7, 16);
+    let se = inference.standard_errors(&points).unwrap();
+    assert_eq!((se.n_rows(), se.width()), (7, 1));
+    let ci: Vec<hessboost::conformal::Interval<f64>> =
+        inference.confidence_intervals(&points, 0.1).unwrap();
+    let pi = inference.prediction_intervals(&points, 0.1).unwrap();
+    let preds = model.predict(&points).unwrap();
+    assert_eq!((ci.len(), pi.len()), (7, 7));
+    for ((c, p), &y) in ci.iter().zip(&pi).zip(preds.as_slice()) {
+        let center = f64::midpoint(c.lower, c.upper);
+        assert!((center - f64::from(y)).abs() < 1e-9, "{c:?} around {y}");
+        assert!(p.lower < c.lower && c.lower < c.upper && c.upper < p.upper);
+    }
 }
 
 #[test]

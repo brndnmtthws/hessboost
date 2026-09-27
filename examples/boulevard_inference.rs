@@ -98,11 +98,11 @@ fn main() -> Result<()> {
             grid[2 * i],
             f(grid[2 * i]),
             preds.as_slice()[i],
-            se[i],
-            ci[i].0,
-            ci[i].1,
-            pi[i].0,
-            pi[i].1
+            se.as_slice()[i],
+            ci[i].lower,
+            ci[i].upper,
+            pi[i].lower,
+            pi[i].upper
         );
     }
 
@@ -116,14 +116,14 @@ fn main() -> Result<()> {
         let covered_f = ci
             .iter()
             .zip(xt.as_chunks::<2>().0)
-            .filter(|&(&(lo, hi), x)| lo <= f(x[0]) && f(x[0]) <= hi)
+            .filter(|&(iv, x)| iv.lower <= f(x[0]) && f(x[0]) <= iv.upper)
             .count();
         let covered_y = pi
             .iter()
             .zip(&yt)
-            .filter(|&(&(lo, hi), &y)| lo <= f64::from(y) && f64::from(y) <= hi)
+            .filter(|&(iv, &y)| iv.lower <= f64::from(y) && f64::from(y) <= iv.upper)
             .count();
-        let width: f64 = ci.iter().map(|(lo, hi)| hi - lo).sum::<f64>() / ci.len() as f64;
+        let width: f64 = ci.iter().map(|iv| iv.upper - iv.lower).sum::<f64>() / ci.len() as f64;
         println!(
             "\nnominal {:.0}%: CI covers f at {:.1}% of test points (mean width {width:.3}), PI \
              covers y at {:.1}%",

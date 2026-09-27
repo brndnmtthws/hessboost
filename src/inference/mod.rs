@@ -185,7 +185,7 @@
 //! )?;
 //! let ci = inference.confidence_intervals(&dcal, 0.05)?;
 //! let pi = inference.prediction_intervals(&dcal, 0.05)?;
-//! assert!(ci.iter().zip(&pi).all(|(c, p)| p.0 < c.0 && c.1 < p.1));
+//! assert!(ci.iter().zip(&pi).all(|(c, p)| p.lower < c.lower && c.upper < p.upper));
 //! # Ok(())
 //! # }
 //! ```
@@ -199,6 +199,7 @@ mod term_kernel;
 
 use serde::{Deserialize, Serialize};
 
+use crate::conformal::Interval;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Predictions};
@@ -637,23 +638,23 @@ impl<'a> BoulevardInference<'a> {
     ///
     /// When `data` does not have the model's features, or has row weights
     /// or base margins.
-    pub fn standard_errors(&self, data: &DMatrix) -> Result<Vec<f64>> {
+    pub fn standard_errors(&self, data: &DMatrix) -> Result<Predictions<f64>> {
         let sigma = self.noise_variance.sqrt();
-        Ok(self
+        let se: Vec<f64> = self
             .weight_norms(data)?
             .into_iter()
             .map(|w2| sigma * w2.sqrt())
-            .collect())
+            .collect();
+        Ok(Predictions::new(se, data.n_rows(), 1))
     }
 
-    /// `(prediction, half width)` of every row with half widths
-    /// `z · width(‖w‖²)`.
+    /// The interval `prediction ± z · width(‖w‖²)` of every row.
     fn intervals(
         &self,
         data: &DMatrix,
         alpha: f64,
         width: impl Fn(f64) -> f64,
-    ) -> Result<Vec<(f64, f64)>> {
+    ) -> Result<Vec<Interval<f64>>> {
         check_alpha(alpha)?;
         let z = z_value(alpha);
         let norms = self.weight_norms(data)?;
@@ -664,7 +665,10 @@ impl<'a> BoulevardInference<'a> {
             .zip(norms)
             .map(|(&p, w2)| {
                 let (center, half) = (f64::from(p), z * width(w2));
-                (center - half, center + half)
+                Interval {
+                    lower: center - half,
+                    upper: center + half,
+                }
             })
             .collect())
     }
@@ -678,7 +682,7 @@ impl<'a> BoulevardInference<'a> {
     ///
     /// When `alpha` is not in `(0, 1)`, plus those of
     /// [`standard_errors`](Self::standard_errors).
-    pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * w2).sqrt())
     }
@@ -700,7 +704,7 @@ impl<'a> BoulevardInference<'a> {
     /// # Errors
     ///
     /// As [`confidence_intervals`](Self::confidence_intervals).
-    pub fn prediction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn prediction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * (1.0 + w2)).sqrt())
     }
@@ -713,7 +717,7 @@ impl<'a> BoulevardInference<'a> {
     /// # Errors
     ///
     /// As [`confidence_intervals`](Self::confidence_intervals).
-    pub fn reproduction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn reproduction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (2.0 * sigma2 * w2).sqrt())
     }
@@ -737,7 +741,7 @@ impl<'a> BoulevardInference<'a> {
         &self,
         data: &DMatrix,
         alpha: f64,
-    ) -> Result<Vec<(f64, f64)>> {
+    ) -> Result<Vec<Interval<f64>>> {
         let holdout = self.holdout.ok_or_else(|| {
             HessboostError::invalid_param(
                 "noise",
@@ -749,9 +753,9 @@ impl<'a> BoulevardInference<'a> {
         let mut ratios: Vec<f64> = calibration
             .iter()
             .zip(labels)
-            .map(|(&(lo, hi), &y)| {
-                let half = (hi - lo) / 2.0;
-                let center = f64::midpoint(hi, lo);
+            .map(|(iv, &y)| {
+                let half = (iv.upper - iv.lower) / 2.0;
+                let center = f64::midpoint(iv.upper, iv.lower);
                 (f64::from(y) - center).abs() / half.max(f64::MIN_POSITIVE)
             })
             .collect();
@@ -762,12 +766,18 @@ impl<'a> BoulevardInference<'a> {
         Ok(self
             .prediction_intervals(data, alpha)?
             .into_iter()
-            .map(|(lo, hi)| {
-                let (center, half) = (f64::midpoint(hi, lo), (hi - lo) / 2.0 * scale);
+            .map(|Interval { lower, upper }| {
+                let (center, half) = (f64::midpoint(upper, lower), (upper - lower) / 2.0 * scale);
                 if half.is_finite() {
-                    (center - half, center + half)
+                    Interval {
+                        lower: center - half,
+                        upper: center + half,
+                    }
                 } else {
-                    (f64::NEG_INFINITY, f64::INFINITY)
+                    Interval {
+                        lower: f64::NEG_INFINITY,
+                        upper: f64::INFINITY,
+                    }
                 }
             })
             .collect())

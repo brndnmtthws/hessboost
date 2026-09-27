@@ -184,7 +184,7 @@ fn bands_narrow_with_more_data_and_nystrom_on_every_row_is_exact() {
             // The pair term's errors run through the main stage too.
             let pair = exact.term_standard_errors(3, &values).unwrap();
             let pair_nystrom = nystrom.term_standard_errors(3, &values).unwrap();
-            for (e, s) in pair.iter().zip(&pair_nystrom) {
+            for (e, s) in pair.as_slice().iter().zip(pair_nystrom.as_slice()) {
                 assert!((e - s).abs() <= 1e-8 * e.max(1e-12), "{e} vs {s}");
             }
         }

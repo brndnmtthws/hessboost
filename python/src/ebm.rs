@@ -4,10 +4,11 @@
 use crate::booster::Booster;
 use crate::data::{DMatrix, to_numpy};
 use crate::errors::{OrRaise, refuse};
+use crate::inference::intervals;
 use hessboost::data::DMatrix as RustMatrix;
 use hessboost::ebm::{self, TermAxis};
 use hessboost::inference::{self, KernelSolver, NoiseVariance};
-use hessboost::model::BoostedModel;
+use hessboost::model::{BoostedModel, Predictions};
 use numpy::PyArrayDyn;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -146,20 +147,10 @@ pub struct EbmInference {
     cell: Cell,
 }
 
-/// `(rows, 2)` `[lower, upper]` bounds.
-fn intervals(py: Python<'_>, bounds: Vec<(f64, f64)>) -> PyResult<Bound<'_, PyArrayDyn<f64>>> {
-    let rows = bounds.len();
-    let values = bounds
-        .into_iter()
-        .flat_map(|(lower, upper)| [lower, upper])
-        .collect();
-    to_numpy(py, values, &[rows, 2])
-}
-
-/// A 1-D array of `values`.
-fn column(py: Python<'_>, values: Vec<f64>) -> PyResult<Bound<'_, PyArrayDyn<f64>>> {
-    let n = values.len();
-    to_numpy(py, values, &[n])
+/// A 1-D array of one value per row.
+fn column(py: Python<'_>, values: Predictions<f64>) -> PyResult<Bound<'_, PyArrayDyn<f64>>> {
+    let n = values.n_rows();
+    to_numpy(py, values.into_vec(), &[n])
 }
 
 /// A term's shape with its bands: `(shape, standard errors, lower, upper)`,

@@ -122,6 +122,9 @@
 //!     [`path_smooth`](config::TrainingParams::path_smooth),
 //!     [`linear_tree`](config::TrainingParams::linear_tree),
 //!     [`LinearLeaves`](tree::LinearLeaves));
+//!   - LightGBM class-balanced bagging for binary classification
+//!     ([`BalancedBagging`](config::BalancedBagging): `pos_bagging_fraction`,
+//!     `neg_bagging_fraction`), in place of `subsample`;
 //!   - CatBoost-style symmetric trees
 //!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), routed by
 //!     bit pattern in batch prediction;
@@ -159,9 +162,9 @@
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `virtual_ensembles`, `budget`, `online_update`,
-//! `ordered_target_stats`, `pfn_boost`, `metal` with `--features metal` on
-//! macOS). Run one with
+//! `distributional`, `virtual_ensembles`, `budget`, `balanced_bagging`,
+//! `online_update`, `ordered_target_stats`, `pfn_boost`, `metal` with
+//! `--features metal` on macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes

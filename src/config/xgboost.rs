@@ -4,7 +4,8 @@
 //! and the training fuzz target all go through it.
 
 use super::groups::{
-    Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode, QuantizedGrad, Refresh,
+    BalancedBagging, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
+    QuantizedGrad, Refresh,
 };
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
@@ -122,6 +123,8 @@ flat_params! {
     interaction_constraints: Vec<Vec<u32>>,
     num_parallel_tree: usize,
     sampling_method: SamplingMethod,
+    pos_bagging_fraction: f64,
+    neg_bagging_fraction: f64,
     multi_strategy: MultiStrategy,
     process_type: FlatProcess,
     refresh_leaf: bool,
@@ -237,6 +240,8 @@ impl Flat {
             interaction_constraints,
             num_parallel_tree,
             sampling_method,
+            pos_bagging_fraction,
+            neg_bagging_fraction,
             multi_strategy,
             process_type,
             refresh_leaf,
@@ -434,6 +439,16 @@ impl Flat {
         } else {
             None
         };
+        // LightGBM's default of 1 for both fractions is no balanced bagging.
+        let balanced_bagging = match (pos_bagging_fraction, neg_bagging_fraction) {
+            (None, None) => None,
+            (pos, neg) => {
+                let (pos, neg) = (pos.unwrap_or(1.0), neg.unwrap_or(1.0));
+                (pos != 1.0 || neg != 1.0)
+                    .then(|| BalancedBagging::new(pos, neg))
+                    .transpose()?
+            }
+        };
         // CatBoost: posterior sampling needs Langevin "not set or true".
         if posterior_sampling == Some(true) && langevin == Some(false) {
             return Err(HessboostError::invalid_param(
@@ -492,6 +507,7 @@ impl Flat {
             interaction_constraints: interaction_constraints.unwrap_or(d.interaction_constraints),
             num_parallel_tree: num_parallel_tree.unwrap_or(d.num_parallel_tree),
             sampling_method: sampling_method.unwrap_or(d.sampling_method),
+            balanced_bagging,
             multi_strategy: multi_strategy.unwrap_or(d.multi_strategy),
             process_type,
             extra_trees,
@@ -829,6 +845,7 @@ impl TrainingParams {
             interaction_constraints,
             num_parallel_tree,
             sampling_method,
+            balanced_bagging,
             multi_strategy,
             process_type,
             extra_trees,
@@ -922,6 +939,10 @@ impl TrainingParams {
         set("interaction_constraints", json(interaction_constraints));
         set("num_parallel_tree", json(num_parallel_tree));
         set("sampling_method", json(sampling_method));
+        if let Some(bagging) = balanced_bagging {
+            set("pos_bagging_fraction", json(bagging.pos_fraction()));
+            set("neg_bagging_fraction", json(bagging.neg_fraction()));
+        }
         set("multi_strategy", json(multi_strategy));
         match process_type {
             ProcessType::Default => set("process_type", json("default")),
@@ -991,6 +1012,7 @@ impl TrainingParams {
             interaction_constraints,
             num_parallel_tree,
             sampling_method,
+            balanced_bagging,
             multi_strategy,
             process_type,
             extra_trees,
@@ -1056,6 +1078,16 @@ impl TrainingParams {
             *num_parallel_tree == other.num_parallel_tree,
         );
         differs("sampling_method", *sampling_method == other.sampling_method);
+        // Each fraction as LightGBM states it, 1 when balanced bagging is off.
+        let fractions = |bagging: &Option<BalancedBagging>| {
+            bagging.map_or((1.0, 1.0), |b| (b.pos_fraction(), b.neg_fraction()))
+        };
+        let (ours, theirs) = (
+            fractions(balanced_bagging),
+            fractions(&other.balanced_bagging),
+        );
+        differs("pos_bagging_fraction", ours.0 == theirs.0);
+        differs("neg_bagging_fraction", ours.1 == theirs.1);
         differs("multi_strategy", *multi_strategy == other.multi_strategy);
         differs("process_type", *process_type == other.process_type);
         differs("extra_trees", *extra_trees == other.extra_trees);
@@ -1176,6 +1208,52 @@ mod tests {
             (json!({"extra_trees": false, "extra_seed": 3}), "extra_seed"),
             (json!({"linear_lambda": 0.5}), "linear_lambda"),
             (json!({"num_grad_quant_bins": 8}), "num_grad_quant_bins"),
+        ] {
+            let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
+            assert!(
+                refusal.starts_with(&format!("invalid parameter `{key}`")),
+                "{pairs}: {refusal}"
+            );
+        }
+    }
+
+    /// LightGBM's class fractions become one [`BalancedBagging`] (a missing
+    /// one at LightGBM's default 1, both at 1 meaning off) and read back
+    /// from the flat form; the fractions are refused by name where nothing
+    /// would bag by class.
+    #[test]
+    fn balanced_bagging_reads_lightgbm_fractions() {
+        let binary = json!("binary:logistic");
+        let p = TrainingParams::from_xgboost([
+            ("objective", binary.clone()),
+            ("neg_bagging_fraction", json!(0.2)),
+        ])
+        .unwrap();
+        assert_eq!(
+            p.balanced_bagging,
+            Some(BalancedBagging::new(1.0, 0.2).unwrap())
+        );
+        assert_eq!(
+            TrainingParams::from_xgboost(p.to_xgboost().unwrap()).unwrap(),
+            p
+        );
+        let off = TrainingParams::from_xgboost([
+            ("objective", binary.clone()),
+            ("pos_bagging_fraction", json!(1.0)),
+            ("neg_bagging_fraction", json!(1.0)),
+        ])
+        .unwrap();
+        assert_eq!(off.balanced_bagging, None);
+        for (pairs, key) in [
+            (json!({"pos_bagging_fraction": 0.5}), "pos_bagging_fraction"),
+            (
+                json!({"objective": binary, "neg_bagging_fraction": 0.5, "subsample": 0.8}),
+                "subsample",
+            ),
+            (
+                json!({"objective": binary, "neg_bagging_fraction": 0.0}),
+                "neg_bagging_fraction",
+            ),
         ] {
             let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
             assert!(

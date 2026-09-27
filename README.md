@@ -98,6 +98,7 @@ runnable programs live in [`examples/`](examples)
 |---|---|
 | `train_regression` | end-to-end regression with feature importance |
 | `binary_classification` | a watched eval set, early stopping, AUC |
+| `balanced_bagging` | LightGBM class-stratified sampling for imbalanced binary classification |
 | `multiclass` | per-class probabilities and predicted classes |
 | `ranking` | LambdaMART over query groups |
 | `constraints` | monotone and interaction constraints, categorical features |
@@ -165,12 +166,11 @@ Beyond XGBoost (opt-in, none changes default training):
 | [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/) | add or delete training rows of a trained model (incremental learning, machine unlearning): exact, or approximate and faster than retraining for small changes, after Lin et al. |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
 | [LightGBM model import](https://docs.rs/hessboost/latest/hessboost/model/#lightgbm-import) | load LightGBM 4.x text models (`model.txt`) that predict, explain with SHAP, slice, and save like native ones, checked against LightGBM's predictions and `pred_contrib`; splits or objectives with no exact equivalent are refused |
-| LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), and symmetric trees |
+| LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), symmetric trees, and class-balanced bagging for binary classification (`pos_bagging_fraction`, `neg_bagging_fraction`; replaces `subsample`) |
 | Quantized-gradient training | up to 1.85× faster tree building on large data (`use_quantized_grad`) |
 | [Ordered target statistics](https://docs.rs/hessboost/latest/hessboost/data/target_stats/) | CatBoost-style ordered target encoding of high-cardinality categoricals |
 | Boosting from a pretrained model | start from TabPFN or LLM logits through `base_margin` (PFN-Boost, LLM-Boost) |
 | Metal GPU (macOS, `--features metal`) | GPU prediction about 2.5× faster than the CPU on an M4 Max, and GPU training that reproduces CPU training bit for bit |
-
 ## Caveats
 
 - Approximate in-place updates (`training::online`, tolerance > 0) stay close

@@ -10,6 +10,7 @@ use hessboost::objective::{Multiclass, PseudoHuber};
 use hessboost::prelude::{
     BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
 };
+use std::num::NonZeroUsize;
 use std::ops::Bound;
 
 mod common;
@@ -161,7 +162,7 @@ fn early_stopping_records_the_best_round_without_stopping() {
     let params = base().build().unwrap();
     let stopped = Trainer::new(&params, &d, 200)
         .eval(&valid, "valid")
-        .early_stopping_rounds(2)
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .train()
         .unwrap();
     let best = stopped.model.best_iteration().expect("stops early");
@@ -170,12 +171,15 @@ fn early_stopping_records_the_best_round_without_stopping() {
     assert_eq!(stopped.history.len(), best + 3);
     let out = Trainer::new(&params, &d, best + 3)
         .eval(&valid, "valid")
-        .early_stopping_rounds(50)
+        .early_stopping_rounds(NonZeroUsize::new(50).unwrap())
         .train()
         .unwrap();
     assert_eq!(out.model.num_boost_rounds(), best + 3);
     assert_eq!(out.model.best_iteration(), Some(best));
-    assert_eq!(out.best_score, Some(out.history[best].scores[0].value));
+    assert_eq!(
+        out.best_score,
+        Some(out.history.round(best).unwrap().values()[0])
+    );
     assert_eq!(stopped.best_score, out.best_score);
     assert_eq!(
         out.model.predict(&valid).unwrap(),
@@ -197,7 +201,7 @@ fn early_stopping_after_continuation_reports_absolute_iterations() {
     let params = base().build().unwrap();
     let first = Trainer::new(&params, &d, 200)
         .eval(&valid, "valid")
-        .early_stopping_rounds(2)
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .train()
         .unwrap();
     let first = first.model;
@@ -215,10 +219,10 @@ fn early_stopping_after_continuation_reports_absolute_iterations() {
     let out = Trainer::new(&params, &d, 200)
         .init_model(&first)
         .eval(&valid, "valid")
-        .early_stopping_rounds(3)
+        .early_stopping_rounds(NonZeroUsize::new(3).unwrap())
         .train()
         .unwrap();
-    assert_eq!(out.history[0].iteration, start);
+    assert_eq!(out.history.first_iteration(), start);
     let chosen = out.model.best_iteration().expect("stops early");
     assert!(chosen >= start, "{chosen} < {start} (earlier best {best})");
     assert_eq!(
@@ -244,10 +248,10 @@ fn continuation_without_an_improving_metric_keeps_the_initial_model() {
     let out = Trainer::new(&params, &train_set, 10)
         .init_model(&first)
         .eval(&censored, "censored")
-        .early_stopping_rounds(2)
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .train()
         .unwrap();
-    assert!(out.history.iter().all(|r| r.scores[0].value.is_nan()));
+    assert!(out.history.rounds().all(|r| r.values()[0].is_nan()));
     assert_eq!(out.model.best_iteration(), Some(4));
     assert_eq!(
         out.model.predict(&train_set).unwrap(),
@@ -634,7 +638,7 @@ fn slicing_selects_iterations_with_their_dart_weights() {
     let valid = noisy(80, 6);
     let stopped = Trainer::new(&base().build().unwrap(), &d, 200)
         .eval(&valid, "v")
-        .early_stopping_rounds(2)
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .train()
         .unwrap()
         .model;

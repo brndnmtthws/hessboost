@@ -4,6 +4,7 @@
 use hessboost::metric::EvalMetric;
 use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
+use std::num::NonZeroUsize;
 
 mod common;
 use common::{accuracy, fill_random, lcg};
@@ -37,7 +38,7 @@ fn main() -> Result<()> {
     // Watch `dvalid`; stop after 20 rounds without improvement on the last metric.
     let out = Trainer::new(&params, &dtrain, 500)
         .eval(&dvalid, "valid")
-        .early_stopping_rounds(20)
+        .early_stopping_rounds(NonZeroUsize::new(20).unwrap())
         .train()?;
     let model = out.model;
     println!(

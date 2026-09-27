@@ -1,7 +1,7 @@
 //! Evaluation during training: eval sets, metrics, early stopping, and the
 //! per-round reporter.
 
-use super::api::{RoundEval, RoundHook, Score, TrainResult};
+use super::api::{EvalHistory, RoundEval, RoundHook, TrainResult};
 use super::margins::MarginCaches;
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, MetaInfo};
@@ -9,6 +9,7 @@ use crate::error::{HessboostError, Result};
 use crate::metric::Metric;
 use crate::model::BoostedModel;
 use crate::objective::Loss;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 /// A named evaluation dataset watched during training.
@@ -19,14 +20,16 @@ pub(super) struct EvalSet<'a> {
     pub(super) name: &'a str,
 }
 
-/// The eval sets' metrics and the buffer their predictions are transformed
-/// in, reused every round.
+/// The eval sets' metrics and the buffers their predictions are transformed
+/// and scored in, reused every round.
 pub(super) struct EvalPlan<'a> {
     objective: &'a dyn Loss,
     evals: &'a [EvalSet<'a>],
     infos: Vec<MetaInfo<'a>>,
     pub(super) metrics: Vec<Box<dyn Metric>>,
     preds: Vec<f32>,
+    /// One round's values, `[dataset][metric]`.
+    scores: Vec<f64>,
 }
 
 impl<'a> EvalPlan<'a> {
@@ -70,6 +73,7 @@ impl<'a> EvalPlan<'a> {
             infos,
             metrics,
             preds: Vec::new(),
+            scores: Vec::new(),
         })
     }
 
@@ -78,32 +82,33 @@ impl<'a> EvalPlan<'a> {
         self.metrics.last().is_some_and(|m| m.maximize())
     }
 
+    /// An empty history of these eval sets and metrics, starting at model
+    /// iteration `first_iteration`.
+    fn history(&self, first_iteration: usize) -> EvalHistory {
+        EvalHistory::new(
+            self.evals.iter().map(|set| set.name.to_owned()).collect(),
+            self.metrics.iter().map(|m| m.name().to_owned()).collect(),
+            first_iteration,
+        )
+    }
+
     /// Evaluate every metric on every eval set's `margins`, append the
-    /// scores to `history`, and return the last one (the early-stopping
+    /// round to `history`, and return the last value (the early-stopping
     /// metric of the last eval set).
-    pub(super) fn record(
-        &mut self,
-        iteration: usize,
-        margins: &MarginCaches,
-        history: &mut Vec<RoundEval>,
-    ) -> f64 {
-        let mut scores = Vec::with_capacity(self.evals.len() * self.metrics.len());
+    fn record(&mut self, margins: &MarginCaches, history: &mut EvalHistory) -> f64 {
+        self.scores.clear();
         let mut last_metric_value = 0.0;
-        for (ei, set) in self.evals.iter().enumerate() {
+        for ei in 0..self.evals.len() {
             self.preds.clear();
             self.preds.extend_from_slice(&margins.evals[ei]);
             self.objective.eval_transform(&mut self.preds);
             for m in &self.metrics {
                 let v = m.eval_info(&self.preds, &self.infos[ei]);
-                scores.push(Score {
-                    dataset: set.name.to_string(),
-                    metric: m.name().to_string(),
-                    value: v,
-                });
+                self.scores.push(v);
                 last_metric_value = v;
             }
         }
-        history.push(RoundEval { iteration, scores });
+        history.push_round(self.scores.iter().copied());
         last_metric_value
     }
 }
@@ -113,7 +118,7 @@ impl<'a> EvalPlan<'a> {
 /// `patience` rounds without improvement. Shared by [`Trainer`](super::Trainer) and
 /// [`CrossValidation`](crate::training::CrossValidation).
 pub(super) struct EarlyStopping {
-    patience: usize,
+    patience: NonZeroUsize,
     maximize: bool,
     best_score: f64,
     best_round: usize,
@@ -121,20 +126,9 @@ pub(super) struct EarlyStopping {
 }
 
 impl EarlyStopping {
-    /// Refuse early stopping with a patience of zero rounds.
-    pub(crate) fn check_patience(rounds: Option<usize>) -> Result<()> {
-        if rounds == Some(0) {
-            return Err(HessboostError::invalid_param(
-                "early_stopping_rounds",
-                "must be greater than zero",
-            ));
-        }
-        Ok(())
-    }
-
     /// Tracking that starts at round `first_round`, which stays the best
     /// one when no score ever improves.
-    pub(crate) fn new(patience: usize, maximize: bool, first_round: usize) -> Self {
+    pub(crate) fn new(patience: NonZeroUsize, maximize: bool, first_round: usize) -> Self {
         EarlyStopping {
             patience,
             maximize,
@@ -162,7 +156,7 @@ impl EarlyStopping {
             false
         } else {
             self.since_improved += 1;
-            self.since_improved >= self.patience
+            self.since_improved >= self.patience.get()
         }
     }
 
@@ -247,7 +241,7 @@ fn check_prediction_width(
 pub(super) struct RoundReporter<'a> {
     /// The eval sets' metrics; `None` without eval sets.
     eval_plan: Option<EvalPlan<'a>>,
-    history: Vec<RoundEval>,
+    history: EvalHistory,
     stopping: Option<EarlyStopping>,
     on_round: Option<RoundHook<'a>>,
 }
@@ -258,7 +252,7 @@ impl<'a> RoundReporter<'a> {
     pub(super) fn new(on_round: Option<RoundHook<'a>>) -> Self {
         RoundReporter {
             eval_plan: None,
-            history: Vec::new(),
+            history: EvalHistory::default(),
             stopping: None,
             on_round,
         }
@@ -270,12 +264,13 @@ impl<'a> RoundReporter<'a> {
     pub(super) fn watch(
         &mut self,
         plan: EvalPlan<'a>,
-        early_stopping_rounds: Option<usize>,
+        early_stopping_rounds: Option<NonZeroUsize>,
         first_round: usize,
     ) {
         self.stopping = early_stopping_rounds
             .map(|patience| EarlyStopping::new(patience, plan.maximize(), first_round));
         if !plan.evals.is_empty() {
+            self.history = plan.history(first_round);
             self.eval_plan = Some(plan);
         }
     }
@@ -289,21 +284,21 @@ impl<'a> RoundReporter<'a> {
         margins: Option<&MarginCaches>,
     ) -> ControlFlow<()> {
         let mut stop = false;
+        let mut scored = false;
         if let (Some(plan), Some(margins)) = (&mut self.eval_plan, margins) {
-            let score = plan.record(iteration, margins, &mut self.history);
+            let score = plan.record(margins, &mut self.history);
+            scored = true;
             if let Some(stopping) = &mut self.stopping {
                 stop = stopping.observe(iteration, score);
             }
         }
         if let Some(hook) = &mut self.on_round {
-            let flow = match self.history.last() {
-                Some(round) if round.iteration == iteration => hook(round),
-                _ => hook(&RoundEval {
-                    iteration,
-                    scores: Vec::new(),
-                }),
+            let round = match self.history.last() {
+                Some(round) if scored => round,
+                _ => RoundEval::unscored(iteration),
             };
-            stop |= flow.is_break();
+            debug_assert_eq!(round.iteration(), iteration);
+            stop |= hook(round).is_break();
         }
         if stop {
             ControlFlow::Break(())
@@ -318,11 +313,13 @@ impl<'a> RoundReporter<'a> {
     pub(super) fn into_result(self, mut model: BoostedModel) -> TrainResult {
         let mut best_score = None;
         if let Some(stopping) = &self.stopping
-            && let Some(first) = self.history.first()
+            && !self.history.is_empty()
         {
             let best_iter = stopping.best_round();
-            let round = &self.history[best_iter - first.iteration];
-            best_score = round.scores.last().map(|score| score.value);
+            best_score = self
+                .history
+                .round(best_iter)
+                .and_then(|round| round.values().last().copied());
             // A shrunk model's later iterations rescaled the best one, so keep
             // the model as it was after the best iteration (CatBoost's
             // `use_best_model`) instead of hiding the rest behind the selection.

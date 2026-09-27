@@ -8,6 +8,7 @@ use hessboost::data::FeatureType;
 use hessboost::objective::{GradPair, Multiclass, PseudoHuber, RegLoss, Tweedie};
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, BudgetStop, train_with_budget};
+use std::num::NonZeroUsize;
 
 mod common;
 use common::{labeled_dense, lcg};
@@ -161,7 +162,7 @@ fn held_out_quality_is_comparable_to_validation_tuned_training() {
             .unwrap();
         let tuned = Trainer::new(&tuned_params, &train_set, 2000)
             .eval(&valid, "valid")
-            .early_stopping_rounds(50)
+            .early_stopping_rounds(NonZeroUsize::new(50).unwrap())
             .train()
             .unwrap()
             .model;

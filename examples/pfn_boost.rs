@@ -84,6 +84,7 @@ use hessboost::data::{CsvOptions, load_csv};
 use hessboost::metric::EvalMetric;
 use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 mod common;
@@ -168,7 +169,7 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
     // Baseline: boosting from the constant intercept, early-stopped on `valid`.
     let scratch = Trainer::new(&params, &train.data, MAX_ROUNDS)
         .eval(&valid.data, "valid")
-        .early_stopping_rounds(EARLY_STOPPING)
+        .early_stopping_rounds(NonZeroUsize::new(EARLY_STOPPING).unwrap())
         .train()?
         .model;
 
@@ -184,7 +185,7 @@ fn compare(train: &Split, valid: &Split, test: &Split) -> Result<Comparison> {
         let dvalid = valid.with_prior(s, c)?;
         let model = Trainer::new(&params, &dtrain, MAX_ROUNDS)
             .eval(&dvalid, "valid")
-            .early_stopping_rounds(EARLY_STOPPING)
+            .early_stopping_rounds(NonZeroUsize::new(EARLY_STOPPING).unwrap())
             .train()?
             .model;
         let valid_loss = EvalMetric::LogLoss.build(1)?.eval(

@@ -487,8 +487,8 @@ fn ranking_ndcg_improves_over_rounds() {
     assert!(!res.history.is_empty());
 
     // rank:ndcg's default metric: XGBoost's `ndcg@32`.
-    let ndcg_of = |r: &RoundEval| r.score("train", "ndcg@32").unwrap();
-    let first = ndcg_of(&res.history[0]);
+    let ndcg_of = |r: RoundEval| r.score("train", "ndcg@32").unwrap();
+    let first = ndcg_of(res.history.round(0).unwrap());
     let last = ndcg_of(res.history.last().unwrap());
 
     // Baseline NDCG of the untrained (all-equal-score) ranking.
@@ -883,7 +883,7 @@ fn custom_metric_matches_builtin_rmse_early_stopping() {
     // Builtin path: default `rmse` metric drives early stopping.
     let builtin = Trainer::new(&params, &d, 200)
         .eval(&d, "train")
-        .early_stopping_rounds(5)
+        .early_stopping_rounds(NonZeroUsize::new(5).unwrap())
         .train()
         .unwrap();
 
@@ -901,7 +901,7 @@ fn custom_metric_matches_builtin_rmse_early_stopping() {
     });
     let custom = Trainer::new(&params, &d, 200)
         .eval(&d, "train")
-        .early_stopping_rounds(5)
+        .early_stopping_rounds(NonZeroUsize::new(5).unwrap())
         .custom_metric(Box::new(rmse_metric))
         .train()
         .unwrap();
@@ -920,17 +920,9 @@ fn custom_metric_matches_builtin_rmse_early_stopping() {
     // As in XGBoost's `xgb.train`, the custom metric is reported after
     // the configured (here the default) ones and, being last, drives
     // early stopping.
-    let history = &custom.history[0];
-    let names: Vec<&str> = history
-        .scores
-        .iter()
-        .map(|score| score.metric.as_str())
-        .collect();
-    assert_eq!(names, vec!["rmse", "my-rmse"]);
-    assert_eq!(
-        history.score("train", "my-rmse"),
-        Some(history.scores[1].value)
-    );
+    assert_eq!(custom.history.metrics(), ["rmse", "my-rmse"]);
+    let history = custom.history.round(0).unwrap();
+    assert_eq!(history.score("train", "my-rmse"), Some(history.values()[1]));
     assert_eq!(history.score("valid", "my-rmse"), None);
 }
 
@@ -1067,14 +1059,7 @@ fn invalid_training_and_evaluation_inputs_return_errors() {
         .unwrap();
     assert!(
         Trainer::new(&params, &d, 2)
-            .early_stopping_rounds(1)
-            .train()
-            .is_err()
-    );
-    assert!(
-        Trainer::new(&params, &d, 2)
-            .eval(&d, "eval")
-            .early_stopping_rounds(0)
+            .early_stopping_rounds(NonZeroUsize::new(1).unwrap())
             .train()
             .is_err()
     );
@@ -1405,7 +1390,10 @@ fn label_metrics_are_refused_on_bound_only_eval_sets() {
             .eval(&d, "eval")
             .train()
             .unwrap();
-        assert!(run.history[1].scores[0].value.is_finite(), "{metric}");
+        assert!(
+            run.history.round(1).unwrap().values()[0].is_finite(),
+            "{metric}"
+        );
     }
     for metric in ["rmse", "mae", "cox-nloglik"] {
         let run = Trainer::new(&params(metric), &d, 2)
@@ -1561,7 +1549,12 @@ fn metrics_must_match_the_prediction_width() {
     ] {
         let history = run(params.build().unwrap()).unwrap();
         assert!(
-            history[1].scores.iter().all(|s| s.value.is_finite()),
+            history
+                .round(1)
+                .unwrap()
+                .values()
+                .iter()
+                .all(|v| v.is_finite()),
             "{history:?}"
         );
     }

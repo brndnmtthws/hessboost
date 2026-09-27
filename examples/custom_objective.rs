@@ -4,6 +4,7 @@
 use hessboost::metric::{CustomMetric, EvalMetric};
 use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::prelude::*;
+use std::num::NonZeroUsize;
 
 mod common;
 use common::{fill_random, lcg};
@@ -53,13 +54,13 @@ fn main() -> Result<()> {
         .build()?;
     let out = Trainer::new(&builtin, &d, 100)
         .eval(&d, "train")
-        .early_stopping_rounds(10)
+        .early_stopping_rounds(NonZeroUsize::new(10).unwrap())
         .custom_metric(Box::new(mae))
         .train()?;
     println!(
         "custom-metric run: {} trees, last MAE = {:.4}",
         out.model.num_trees(),
-        out.history.last().unwrap().scores.last().unwrap().value
+        out.history.last().unwrap().values().last().unwrap()
     );
     Ok(())
 }

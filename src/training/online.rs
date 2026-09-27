@@ -289,7 +289,7 @@ impl OnlineModel {
         data: &DMatrix,
         num_boost_round: usize,
         online: OnlineParams,
-        on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+        on_round: impl FnMut(RoundEval<'_>) -> ControlFlow<()> + Send,
     ) -> Result<Self> {
         check_supported(params, data, online)?;
         let model = Trainer::new(params, data, num_boost_round)
@@ -421,7 +421,7 @@ impl OnlineModel {
         &mut self,
         additions: Option<&DMatrix>,
         deletions: &[usize],
-        on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+        on_round: impl FnMut(RoundEval<'_>) -> ControlFlow<()> + Send,
     ) -> Result<UpdateReport> {
         self.update_with_commit(additions, deletions, on_round, || ControlFlow::Continue(()))
     }
@@ -438,7 +438,7 @@ impl OnlineModel {
         &mut self,
         additions: Option<&DMatrix>,
         deletions: &[usize],
-        mut on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+        mut on_round: impl FnMut(RoundEval<'_>) -> ControlFlow<()> + Send,
         commit: impl FnOnce() -> ControlFlow<()>,
     ) -> Result<UpdateReport> {
         let deleted = self.check_change(additions, deletions)?;
@@ -954,7 +954,7 @@ impl Incremental<'_> {
     fn run(
         &self,
         cache: &mut Cache,
-        on_round: &mut dyn FnMut(&RoundEval) -> ControlFlow<()>,
+        on_round: &mut dyn FnMut(RoundEval<'_>) -> ControlFlow<()>,
     ) -> Result<(Vec<RegTree>, UpdateReport)> {
         let (old, new) = (self.old, self.new);
         let deleted_rows: Vec<usize> = (0..old.n_rows()).filter(|&r| self.deleted[r]).collect();
@@ -1048,11 +1048,7 @@ impl Incremental<'_> {
                     margins[i] = base + trees.iter().map(|t| t.predict_row(new, i)).sum::<f32>();
                 }
             }
-            let round = RoundEval {
-                iteration: m,
-                scores: Vec::new(),
-            };
-            if on_round(&round).is_break() {
+            if on_round(RoundEval::unscored(m)).is_break() {
                 return Err(interrupted());
             }
         }

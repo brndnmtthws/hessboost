@@ -460,7 +460,7 @@ fn the_round_hook_sees_both_stages_and_stops_training() {
         let mut seen = Vec::new();
         let observed = Trainer::new(&params, &dtrain, 6)
             .on_round(|round| {
-                seen.push(round.iteration);
+                seen.push(round.iteration());
                 ControlFlow::Continue(())
             })
             .train()
@@ -473,7 +473,7 @@ fn the_round_hook_sees_both_stages_and_stops_training() {
         let stop_at = |k: usize| {
             Trainer::new(&params, &dtrain, 6)
                 .on_round(move |round| {
-                    if round.iteration == k {
+                    if round.iteration() == k {
                         ControlFlow::Break(())
                     } else {
                         ControlFlow::Continue(())

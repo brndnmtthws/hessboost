@@ -781,7 +781,8 @@ impl TrainingParams {
     ///
     /// # Errors
     ///
-    /// A configuration XGBoost's form cannot state: a custom loss, or a
+    /// A configuration [`validate`](Self::validate) refuses, or one
+    /// XGBoost's form cannot state: a custom loss, or a
     /// metric whose parameters differ from the objective's (XGBoost's
     /// `mphe`, `quantile`, `expectile`, and `aft-nloglik` read the same
     /// keys as the objective, and `nll` / `crps` its `dist:*` family).
@@ -830,6 +831,9 @@ impl TrainingParams {
                 format!("the custom loss `{}` has no XGBoost flat form", loss.name()),
             ));
         }
+        // The fields are public: an invalid value (a NaN bound) would be
+        // written as one that reads back as another (`null`, unset).
+        self.validate()?;
         let mut objective_keys = objective_keys(objective);
         for metric in eval_metric {
             for (key, value) in metric_keys(metric, objective)? {
@@ -1442,6 +1446,34 @@ mod tests {
     /// `mphe` the `huber_slope`, `quantile` / `expectile` the alpha lists,
     /// `aft-nloglik` the AFT noise, and `nll` / `crps` the `dist:*` family.
     /// A metric with other parameters has no flat form.
+    /// The fields are public, so a configuration can be invalid: it is
+    /// refused by name rather than written as a flat form that reads back
+    /// as a different one (a NaN bound or base score as `null`, i.e. unset).
+    #[test]
+    fn invalid_configurations_are_refused_not_serialized() {
+        for (p, key) in [
+            (
+                TrainingParams {
+                    max_delta_step: MaxDeltaStep::Bounded(f64::NAN),
+                    ..TrainingParams::default()
+                },
+                "max_delta_step",
+            ),
+            (
+                TrainingParams {
+                    base_score: Some(f64::NAN),
+                    ..TrainingParams::default()
+                },
+                "base_score",
+            ),
+        ] {
+            match p.to_xgboost() {
+                Err(HessboostError::InvalidParameter { name, .. }) => assert_eq!(name, key),
+                other => panic!("{key}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
     /// A Tweedie metric's variance power survives the flat form in full:
     /// its `evals_result` key rounds to six digits, its flat spelling not.
     #[test]

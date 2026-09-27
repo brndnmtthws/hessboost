@@ -655,7 +655,6 @@ fn boulevard_stage(
     let (stage, rounds) = stage;
     let TrainContext { params, dtrain, .. } = *run;
     let n = dtrain.n_rows();
-    let labels = dtrain.labels().unwrap_or_default();
     let schedule = Schedule {
         dropout: 0.0,
         learning_rate: params.eta,
@@ -678,7 +677,7 @@ fn boulevard_stage(
             let gpair = gradients(run, &margins);
             let rows: Vec<Vec<u32>> = terms
                 .iter()
-                .map(|_| sample_rows(n, params, labels, rng))
+                .map(|_| sample_rows(n, params, run.rows, rng))
                 .collect();
             let seeds: Vec<u64> = terms.iter().map(|_| rng.next_u64()).collect();
             prepared.fill_approx_cache(run, &gpair);

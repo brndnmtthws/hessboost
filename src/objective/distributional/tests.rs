@@ -1,5 +1,8 @@
+use super::family::nb_size_score;
+use super::loss::MIN_CURVATURE;
 use super::*;
 use crate::objective::gradient_pairs;
+use crate::objective::{GradPair, Loss};
 use crate::rng::Rng;
 
 /// Margins and labels exercising every family away from the link bounds.

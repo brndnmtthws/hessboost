@@ -8,6 +8,7 @@ mod loaders;
 mod meta;
 pub(crate) mod quantile;
 mod sketch;
+mod sort;
 pub mod target_stats;
 
 pub use dmatrix::DMatrix;

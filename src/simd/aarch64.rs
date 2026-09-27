@@ -1,6 +1,6 @@
 use super::{
-    BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION, scalar,
-    sigmoid_scalar,
+    BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MAX_FAST_EXP_INPUT, MIN_POSITIVE_PREDICTION,
+    RowWeights, scalar, sigmoid_scalar,
 };
 use crate::objective::GradPair;
 #[allow(
@@ -22,7 +22,7 @@ macro_rules! accumulate_metric_sum {
     ($weights:expr, $index:ident, $value_low:expr, $value_high:expr, $sum_low:ident, $sum_high:ident, $weight_low:ident, $weight_high:ident) => {
         match $weights {
             Some(weights) => {
-                let weight = vld1q_f32(weights.as_ptr().add($index));
+                let weight = lane_weights(RowWeights::from(weights), $index);
                 let current_weight_low = vcvt_f64_f32(vget_low_f32(weight));
                 let current_weight_high = vcvt_high_f64_f32(weight);
                 $sum_low = vfmaq_f64($sum_low, $value_low, current_weight_low);
@@ -66,6 +66,26 @@ macro_rules! gradient_guard {
             continue;
         }
     };
+}
+/// The weights of the four cells from `index`: one vector load for one
+/// weight per cell, else each cell's row weight gathered into the lanes.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn lane_weights(weights: RowWeights<'_>, index: usize) -> float32x4_t {
+    if weights.stride == 1 {
+        // SAFETY: the caller guarantees NEON support and weights covering
+        // the four cells from `index`.
+        unsafe { vld1q_f32(weights.values.as_ptr().add(index)) }
+    } else {
+        let lanes = [
+            weights.get(index),
+            weights.get(index + 1),
+            weights.get(index + 2),
+            weights.get(index + 3),
+        ];
+        // SAFETY: the caller guarantees NEON support; `lanes` holds four f32s.
+        unsafe { vld1q_f32(lanes.as_ptr()) }
+    }
 }
 #[inline]
 #[target_feature(enable = "neon")]
@@ -1014,7 +1034,7 @@ unsafe fn softmax_gradient_row(
 pub(super) unsafe fn distance_sum<const SQUARED: bool>(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
     // documented at each memory access below.
@@ -1071,7 +1091,7 @@ pub(super) unsafe fn distance_sum<const SQUARED: bool>(
 pub(super) unsafe fn classification_error_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
     // documented at each memory access below.
@@ -1088,7 +1108,7 @@ pub(super) unsafe fn classification_error_sum(
                 // each input slice.
                 let pred = vld1q_f32(preds.as_ptr().add(index));
                 let label = vld1q_f32(labels.as_ptr().add(index));
-                let weight = vld1q_f32(weights.as_ptr().add(index));
+                let weight = lane_weights(weights, index);
                 let mismatch = veorq_u32(vcgtq_f32(pred, threshold), vcgtq_f32(label, threshold));
                 let wrong_weight = vbslq_f32(mismatch, weight, vdupq_n_f32(0.0));
                 let current_wrong_low = vcvt_f64_f32(vget_low_f32(wrong_weight));
@@ -1134,7 +1154,7 @@ pub(super) unsafe fn classification_error_sum(
 pub(super) unsafe fn log_loss_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
     // documented at each memory access below.
@@ -1211,7 +1231,7 @@ pub(super) unsafe fn log_loss_sum(
 pub(super) unsafe fn positive_nloglik_sum<const GAMMA: bool>(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
     // documented at each memory access below.
@@ -1286,7 +1306,7 @@ pub(super) unsafe fn positive_nloglik_sum<const GAMMA: bool>(
 pub(super) unsafe fn tweedie_nloglik_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     rho: f64,
 ) -> (f64, f64) {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are

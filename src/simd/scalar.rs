@@ -1,6 +1,8 @@
 //! Scalar formulas shared by dispatch fallbacks and NEON tails.
 
-use super::{BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION, sigmoid_scalar};
+use super::{
+    BINARY_LOG_LOSS_EPSILON, LOG_LOSS_EPSILON, MIN_POSITIVE_PREDICTION, RowWeights, sigmoid_scalar,
+};
 use crate::objective::GradPair;
 
 pub(super) fn logistic_gradient(
@@ -90,14 +92,14 @@ pub(super) fn tweedie_gradient(
 /// `None`: the accumulation shared by the weighted metric sums.
 #[inline]
 fn weighted_sum(
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     range: std::ops::Range<usize>,
     term: impl Fn(usize) -> f64,
 ) -> (f64, f64) {
     let mut sum = 0.0;
     let mut weight_sum = 0.0;
     for index in range {
-        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+        let weight = weights.map_or(1.0, |weights| f64::from(weights.get(index)));
         sum += weight * term(index);
         weight_sum += weight;
     }
@@ -107,7 +109,7 @@ fn weighted_sum(
 pub(super) fn distance_sum<const SQUARED: bool>(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
     weighted_sum(weights, range, |index| {
@@ -123,13 +125,13 @@ pub(super) fn distance_sum<const SQUARED: bool>(
 pub(super) fn classification_error_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
     let mut wrong = 0.0;
     let mut weight_sum = 0.0;
     for index in range {
-        let weight = weights.map_or(1.0, |values| f64::from(values[index]));
+        let weight = weights.map_or(1.0, |weights| f64::from(weights.get(index)));
         if (preds[index] > 0.5) != (labels[index] > 0.5) {
             wrong += weight;
         }
@@ -157,7 +159,7 @@ fn xlogy(x: f64, y: f64) -> f64 {
 pub(super) fn log_loss(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
     weighted_sum(weights, range, |index| {
@@ -170,7 +172,7 @@ pub(super) fn log_loss(
 pub(super) fn positive_nloglik<const GAMMA: bool>(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
     weighted_sum(weights, range, |index| {
@@ -187,7 +189,7 @@ pub(super) fn positive_nloglik<const GAMMA: bool>(
 pub(super) fn tweedie_nloglik(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     rho: f64,
     range: std::ops::Range<usize>,
 ) -> (f64, f64) {
@@ -209,7 +211,7 @@ pub(super) fn multiclass_log_loss(
     num_class: usize,
     rows: std::ops::Range<usize>,
 ) -> (f64, f64) {
-    weighted_sum(weights, rows, |row| {
+    weighted_sum(weights.map(RowWeights::from), rows, |row| {
         -f64::from(preds[row * num_class + labels[row] as usize])
             .clamp(LOG_LOSS_EPSILON, 1.0)
             .ln()

@@ -643,7 +643,7 @@ fn pointwise_metric_sums_are_close_to_scalar() {
     let preds: Vec<f32> = (0..4_103).map(|i| (i % 1_001) as f32 * 0.001).collect();
     let labels: Vec<f32> = (0..preds.len()).map(|i| (i % 2) as f32).collect();
     let weights = sawtooth(preds.len(), 17, 0.5, 0.0625);
-    for weights in [None, Some(weights.as_slice())] {
+    for weights in [None, Some(RowWeights::from(weights.as_slice()))] {
         let range = 0..preds.len();
         assert_sums_close(
             squared_error_sum(&preds, &labels, weights),
@@ -672,7 +672,7 @@ fn logarithmic_metric_sums_are_close_to_scalar() {
     // unclamped 1e-16 floor of each log argument.
     let margins = sawtooth(4_103, 999, -0.5, 0.002);
     let range = 0..preds.len();
-    for weights in [None, Some(weights.as_slice())] {
+    for weights in [None, Some(RowWeights::from(weights.as_slice()))] {
         for p in [&preds, &margins] {
             assert_sums_close(
                 log_loss_sum(p, &binary_labels, weights),
@@ -699,10 +699,69 @@ fn tweedie_metric_sum_is_close_to_scalar() {
     let labels = sawtooth(preds.len(), 101, 0.25, 0.02);
     let weight_values = sawtooth(preds.len(), 17, 0.51, 0.061);
     for rho in [1.1, 1.5, 1.9] {
-        for weights in [None, Some(weight_values.as_slice())] {
+        for weights in [None, Some(RowWeights::from(weight_values.as_slice()))] {
             let actual = tweedie_nloglik_sum(&preds, &labels, weights, rho);
             let expected = scalar::tweedie_nloglik(&preds, &labels, weights, rho, 0..preds.len());
             assert_sums_close(actual, expected, 3e-12);
+        }
+    }
+}
+
+#[test]
+fn strided_row_weights_sum_like_their_repeated_cell_weights() {
+    // Odd lengths and strides put rows across vector lanes and the tail.
+    for (cells, stride) in [(4_103, 3), (4_101, 7), (4_100, 2)] {
+        let preds = sawtooth(cells, 999, 0.001, 0.001);
+        let labels: Vec<f32> = (0..cells).map(|i| (i % 2) as f32).collect();
+        let rows = sawtooth(cells.div_ceil(stride), 17, 0.51, 0.061);
+        let repeated: Vec<f32> = rows
+            .iter()
+            .flat_map(|&w| std::iter::repeat_n(w, stride))
+            .take(cells)
+            .collect();
+        let strided = Some(RowWeights::new(&rows, stride));
+        let flat = Some(RowWeights::from(repeated.as_slice()));
+        let pairs = [
+            (
+                squared_error_sum(&preds, &labels, strided),
+                squared_error_sum(&preds, &labels, flat),
+            ),
+            (
+                absolute_error_sum(&preds, &labels, strided),
+                absolute_error_sum(&preds, &labels, flat),
+            ),
+            (
+                classification_error_sum(&preds, &labels, strided),
+                classification_error_sum(&preds, &labels, flat),
+            ),
+            (
+                log_loss_sum(&preds, &labels, strided),
+                log_loss_sum(&preds, &labels, flat),
+            ),
+            (
+                positive_nloglik_sum::<true>(&preds, &labels, strided),
+                positive_nloglik_sum::<true>(&preds, &labels, flat),
+            ),
+            (
+                positive_nloglik_sum::<false>(&preds, &labels, strided),
+                positive_nloglik_sum::<false>(&preds, &labels, flat),
+            ),
+            (
+                tweedie_nloglik_sum(&preds, &labels, strided, 1.5),
+                tweedie_nloglik_sum(&preds, &labels, flat, 1.5),
+            ),
+        ];
+        for (kernel, (strided, flat)) in pairs.into_iter().enumerate() {
+            assert_eq!(
+                strided.0.to_bits(),
+                flat.0.to_bits(),
+                "kernel {kernel} stride {stride}"
+            );
+            assert_eq!(
+                strided.1.to_bits(),
+                flat.1.to_bits(),
+                "kernel {kernel} stride {stride}"
+            );
         }
     }
 }

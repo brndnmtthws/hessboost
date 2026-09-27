@@ -19,7 +19,7 @@
 //! gradient is refreshed, below) update the node's cached per-bin gradient
 //! histogram, and the node's current split is ranked among every candidate
 //! of the updated histogram with the histogram builder's own scoring. With
-//! [`OnlineParams::tolerance`] `σ`, a split ranked within the top
+//! [`OnlineParams::approximate`]'s tolerance `σ`, a split ranked within the top
 //! `max(1, ⌊σ · candidates⌋)` is kept (the paper's split robustness
 //! tolerance); otherwise the subtree under the node is regrown with the
 //! histogram builder on the rows now reaching it. Leaves whose statistics
@@ -35,13 +35,13 @@
 //!
 //! # Exactness
 //!
-//! `tolerance = 0` is the exact mode: every node's split must still be the
+//! [`OnlineParams::exact`] is the exact mode: every node's split must still be the
 //! best one on recomputed statistics, bin boundaries and intercept, which is
 //! by definition what retraining produces, so the exact mode defers every
 //! tree to the builder: the result equals [`train`](super::train) on
 //! [`OnlineModel::data`] bit for bit, at about the cost of retraining (a
 //! reference to measure the approximate mode against, and the answer when
-//! unlearning must be exact). `tolerance > 0` is approximate: the kept
+//! unlearning must be exact). [`OnlineParams::approximate`] is approximate: the kept
 //! splits, the fixed bins and intercept, and the lazily refreshed gradients
 //! make the model differ from a retrain, by a gap that grows with the
 //! fraction of rows changed and with `σ`, in exchange for touching only the
@@ -139,28 +139,66 @@ use crate::tree::gain::{GradStats, RegParams, calc_weight};
 use crate::tree::sampler::ColumnSampler;
 use crate::tree::{ChildLeaf, RegTree, SplitRule};
 
-/// Settings of [`OnlineModel`].
+/// Settings of [`OnlineModel`]: the exact mode ([`Self::exact`], see the
+/// [module docs](self#exactness)) or the approximate one with a split
+/// robustness tolerance ([`Self::approximate`]). The default is approximate
+/// at `0.1`, the paper's recommendation.
+///
+/// ```
+/// use hessboost::training::online::OnlineParams;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// assert_eq!(OnlineParams::default().tolerance(), Some(0.1));
+/// assert_eq!(OnlineParams::exact().tolerance(), None);
+/// // The exact mode is `exact()`, not a tolerance of 0.
+/// assert!(OnlineParams::approximate(0.0).is_err());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
 pub struct OnlineParams {
-    /// Split robustness tolerance `σ` in `[0, 1]`: a node keeps its split
-    /// while it ranks within the top `max(1, ⌊σ · candidates⌋)` candidates.
-    /// `0` is the exact mode (see the [module docs](self#exactness)), `1`
-    /// regrows only nodes whose split stopped being a valid candidate (a
-    /// child below `min_child_weight`, a gain below `gamma`). Default `0.1`, the paper's recommendation.
-    pub tolerance: f64,
+    tolerance: Option<f64>,
 }
 
 impl Default for OnlineParams {
     fn default() -> Self {
-        OnlineParams { tolerance: 0.1 }
+        OnlineParams {
+            tolerance: Some(0.1),
+        }
     }
 }
 
 impl OnlineParams {
-    /// Settings with split robustness tolerance `tolerance` (`0` is exact).
-    pub fn with_tolerance(tolerance: f64) -> Self {
-        OnlineParams { tolerance }
+    /// The exact mode: every update reproduces retraining bit for bit.
+    pub fn exact() -> Self {
+        OnlineParams { tolerance: None }
+    }
+
+    /// The approximate mode with split robustness tolerance `σ` in
+    /// `(0, 1]`: a node keeps its split while it ranks within the top
+    /// `max(1, ⌊σ · candidates⌋)` candidates; `1` regrows only nodes whose
+    /// split stopped being a valid candidate (a child below
+    /// `min_child_weight`, a gain below `gamma`).
+    ///
+    /// # Errors
+    ///
+    /// `tolerance` outside `(0, 1]` (for the exact mode use
+    /// [`Self::exact`]), named `tolerance`.
+    pub fn approximate(tolerance: f64) -> Result<Self> {
+        if !(tolerance > 0.0 && tolerance <= 1.0) {
+            return Err(HessboostError::invalid_param(
+                "tolerance",
+                format!("must be in (0, 1] (use the exact mode for none), got {tolerance}"),
+            ));
+        }
+        Ok(OnlineParams {
+            tolerance: Some(tolerance),
+        })
+    }
+
+    /// The split robustness tolerance, `None` in the exact mode.
+    pub fn tolerance(&self) -> Option<f64> {
+        self.tolerance
     }
 }
 
@@ -190,6 +228,8 @@ pub struct OnlineModel {
 /// The approximate mode's state.
 #[derive(Debug, Clone)]
 struct Cache {
+    /// The split robustness tolerance (the approximate mode's).
+    tolerance: f64,
     cuts: HistCuts,
     /// No row has a missing value (the builder then enumerates no missing
     /// directions).
@@ -301,11 +341,10 @@ impl OnlineModel {
                  Boulevard or EBM) with constant leaves of these parameters and data",
             ));
         }
-        let cache = if online.tolerance > 0.0 {
-            Some(Cache::build(&model, params, data)?)
-        } else {
-            None
-        };
+        let cache = online
+            .tolerance
+            .map(|tolerance| Cache::build(&model, params, data, tolerance))
+            .transpose()?;
         Ok(OnlineModel {
             params: params.clone(),
             online,
@@ -403,7 +442,7 @@ impl OnlineModel {
         let mut cache = cache.clone();
         let run = Incremental {
             params: &self.params,
-            tolerance: self.online.tolerance,
+            tolerance: cache.tolerance,
             old: &self.data,
             new: &updated,
             deleted: &deleted,
@@ -514,13 +553,6 @@ fn kept_nodes(before: &BoostedModel, after: &BoostedModel) -> usize {
 /// The refusals of the module docs.
 fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams) -> Result<()> {
     params.validate()?;
-    let t = online.tolerance;
-    if !(t.is_finite() && (0.0..=1.0).contains(&t)) {
-        return Err(HessboostError::invalid_param(
-            "tolerance",
-            format!("must be in [0, 1], got {t}"),
-        ));
-    }
     let refuse = |name: &'static str, why: &str| {
         Err(HessboostError::invalid_param(
             name,
@@ -643,10 +675,10 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         return refuse("objective", "a single-output objective");
     }
     check_data(data, "data")?;
-    if t > 0.0 && data.feature_types().contains(&FeatureType::Categorical) {
+    if online.tolerance.is_some() && data.feature_types().contains(&FeatureType::Categorical) {
         return refuse(
             "data",
-            "numerical features for tolerance > 0 (the exact mode accepts categorical ones)",
+            "numerical features in the approximate mode (the exact mode accepts categorical ones)",
         );
     }
     validate_training_data(params, data)
@@ -781,7 +813,12 @@ fn accumulate(
 
 impl Cache {
     /// Replay `model`'s trees over `data` (as training grew them).
-    fn build(model: &BoostedModel, params: &TrainingParams, data: &DMatrix) -> Result<Self> {
+    fn build(
+        model: &BoostedModel,
+        params: &TrainingParams,
+        data: &DMatrix,
+        tolerance: f64,
+    ) -> Result<Self> {
         let cuts = HistCuts::from_dmatrix(data, params.max_bin);
         let ghist = GHistIndex::from_dmatrix(data, cuts.clone());
         let objective = params.loss(1)?;
@@ -804,7 +841,12 @@ impl Cache {
             trees.push(TreeCache { nodes, grads });
         }
         let dense = ghist.dense_stride().is_some();
-        Ok(Cache { cuts, dense, trees })
+        Ok(Cache {
+            tolerance,
+            cuts,
+            dense,
+            trees,
+        })
     }
 }
 

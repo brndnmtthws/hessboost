@@ -28,11 +28,22 @@ pub struct OnlineModel {
     tolerance: f64,
 }
 
+/// Python's `tolerance`: `0` is the exact mode, anything else the
+/// approximate mode's split robustness tolerance.
+fn online_params(tolerance: f64) -> PyResult<OnlineParams> {
+    if tolerance == 0.0 {
+        Ok(OnlineParams::exact())
+    } else {
+        OnlineParams::approximate(tolerance).or_raise()
+    }
+}
+
 impl OnlineModel {
     fn new(online: online::OnlineModel) -> Self {
         Self {
             rows: AtomicUsize::new(online.data().n_rows()),
-            tolerance: online.online_params().tolerance,
+            // Python's `0` is the exact mode.
+            tolerance: online.online_params().tolerance().unwrap_or(0.0),
             state: Mutex::new(online),
         }
     }
@@ -73,7 +84,7 @@ impl OnlineModel {
         num_boost_round: usize,
         tolerance: f64,
     ) -> PyResult<Self> {
-        let online = OnlineParams::with_tolerance(tolerance);
+        let online = online_params(tolerance)?;
         let failure = Failure::default();
         let trained = run_hooked(py, None, &failure, |hook, _gate| {
             online::OnlineModel::train_with(
@@ -97,13 +108,14 @@ impl OnlineModel {
         dtrain: &DMatrix,
         tolerance: f64,
     ) -> PyResult<Self> {
+        let mode = online_params(tolerance)?;
         let online = py
             .detach(|| {
                 online::OnlineModel::from_model(
                     (*booster.model).clone(),
                     &params.inner,
                     &dtrain.inner,
-                    OnlineParams::with_tolerance(tolerance),
+                    mode,
                 )
             })
             .or_raise()?;

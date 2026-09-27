@@ -5,7 +5,9 @@
 //!
 //! `cargo run --release --example ebm`
 
-use hessboost::config::{BoosterKind, Ebm, GrowPolicy};
+use std::num::NonZeroUsize;
+
+use hessboost::config::{BoosterKind, Ebm, EbmEarlyStopping, GrowPolicy};
 use hessboost::data::FeatureType;
 use hessboost::ebm::{TermAxis, shape_functions};
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
@@ -63,7 +65,10 @@ fn main() -> Result<()> {
             Ebm::builder()
                 .outer_bags(8)
                 .bag_fraction(0.85)
-                .early_stopping_rounds(50)
+                .early_stopping(EbmEarlyStopping::new(
+                    NonZeroUsize::new(50).expect("50 is nonzero"),
+                    EbmEarlyStopping::DEFAULT_TOLERANCE,
+                )?)
                 .interactions(1)
                 .build()?,
         ))

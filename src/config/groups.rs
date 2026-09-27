@@ -2,7 +2,8 @@
 //! that only mean something when a switch is on live inside that switch
 //! (`BoosterKind::Dart(Dart)`, `ProcessType::Update(Refresh)`,
 //! `Option<QuantizedGrad>`, `Option<ExtraTrees>`, `Option<LinearTree>`,
-//! `Option<BalancedBagging>`, `Option<QueryBagging>`), so
+//! `Option<BalancedBagging>`, `Option<QueryBagging>`, `Option<Langevin>`,
+//! `Option<ModelShrink>`), so
 //! they cannot be set while the switch is off. Each validates its values
 //! when built.
 
@@ -307,6 +308,190 @@ impl LinearTree {
     }
 }
 
+/// Stochastic Gradient Langevin Boosting (CatBoost `langevin`; Ustimenko
+/// and Prokhorenkova, ICML 2021). Every round adds Gaussian noise of
+/// standard deviation `sqrt(2 / (eta * T))` (`T` the diffusion temperature)
+/// to every row's gradient the tree structure is searched on (CatBoost's
+/// per-row noise), then re-estimates every leaf from the noise-free
+/// gradients of its rows plus independent noise
+/// `sqrt(2 / (eta * T)) * sqrt(|H| + lambda)` on the leaf's gradient sum
+/// (CatBoost's Newton leaves). The draws are keyed by `seed`, iteration,
+/// tree, and row or leaf, so they do not depend on the thread count.
+///
+/// ```
+/// use hessboost::config::Langevin;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let langevin = Langevin::builder().diffusion_temperature(500.0).build()?;
+/// assert_eq!(langevin.diffusion_temperature(), Some(500.0));
+/// assert_eq!(Langevin::default().diffusion_temperature(), None); // 10000
+/// assert!(Langevin::builder().diffusion_temperature(0.0).build().is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Langevin {
+    diffusion_temperature: Option<f64>,
+}
+
+impl Langevin {
+    /// Start a builder at CatBoost's defaults (temperature unset).
+    pub fn builder() -> LangevinBuilder {
+        LangevinBuilder {
+            langevin: Langevin::default(),
+        }
+    }
+
+    /// The inverse diffusion temperature `T > 0` (CatBoost
+    /// `diffusion_temperature`; larger is quieter). `None` takes CatBoost's
+    /// `10000`, or the training row count under posterior sampling.
+    pub fn diffusion_temperature(&self) -> Option<f64> {
+        self.diffusion_temperature
+    }
+}
+
+/// Builder of [`Langevin`].
+#[derive(Debug, Clone, Copy)]
+pub struct LangevinBuilder {
+    langevin: Langevin,
+}
+
+impl LangevinBuilder {
+    /// Set the inverse diffusion temperature (`diffusion_temperature`).
+    #[must_use]
+    pub fn diffusion_temperature(mut self, temperature: f64) -> Self {
+        self.langevin.diffusion_temperature = Some(temperature);
+        self
+    }
+
+    /// The validated settings.
+    ///
+    /// # Errors
+    ///
+    /// A diffusion temperature that is not finite and positive (`0` would
+    /// switch off the noise Langevin asks for).
+    pub fn build(self) -> Result<Langevin> {
+        if let Some(t) = self.langevin.diffusion_temperature
+            && !(t.is_finite() && t > 0.0)
+        {
+            return Err(HessboostError::invalid_param(
+                "diffusion_temperature",
+                format!("must be > 0, got {t}"),
+            ));
+        }
+        Ok(self.langevin)
+    }
+}
+
+/// How the model shrinkage coefficient of each boosting iteration is
+/// computed (CatBoost `model_shrink_mode`). At the start of iteration
+/// `i >= 1` the whole current model, intercept included, is multiplied by
+/// the coefficient `s_i`; iteration `0` does not shrink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ModelShrinkMode {
+    /// `s_i = 1 - rate * eta` (CatBoost's default; the mode posterior
+    /// sampling uses).
+    #[default]
+    Constant,
+    /// `s_i = 1 - rate / i`.
+    Decreasing,
+}
+
+/// Per-iteration model shrinkage (CatBoost `model_shrink_rate` and
+/// `model_shrink_mode`): at the start of every iteration `i >= 1` the
+/// current model (trees and intercept) is multiplied by `1 - rate * eta`
+/// (constant) or `1 - rate / i` (decreasing). A rate of `0` is no
+/// shrinkage (which turns off Langevin's default rate).
+///
+/// ```
+/// use hessboost::config::{ModelShrink, ModelShrinkMode};
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let shrink = ModelShrink::builder()
+///     .rate(0.1)
+///     .mode(ModelShrinkMode::Decreasing)
+///     .build()?;
+/// assert_eq!((shrink.rate(), shrink.mode()), (0.1, ModelShrinkMode::Decreasing));
+/// assert!(ModelShrink::builder().rate(-1.0).build().is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ModelShrink {
+    rate: f64,
+    mode: ModelShrinkMode,
+}
+
+impl ModelShrink {
+    /// Start a builder at rate `0` in the constant mode.
+    pub fn builder() -> ModelShrinkBuilder {
+        ModelShrinkBuilder {
+            shrink: ModelShrink::default(),
+        }
+    }
+
+    /// The shrinkage rate `>= 0` (CatBoost `model_shrink_rate`).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// How the coefficient follows from the rate (CatBoost
+    /// `model_shrink_mode`).
+    pub fn mode(&self) -> ModelShrinkMode {
+        self.mode
+    }
+}
+
+/// Builder of [`ModelShrink`].
+#[derive(Debug, Clone, Copy)]
+pub struct ModelShrinkBuilder {
+    shrink: ModelShrink,
+}
+
+impl ModelShrinkBuilder {
+    /// Set the shrinkage rate (`model_shrink_rate`).
+    #[must_use]
+    pub fn rate(mut self, rate: f64) -> Self {
+        self.shrink.rate = rate;
+        self
+    }
+
+    /// Set how the coefficient is computed (`model_shrink_mode`).
+    #[must_use]
+    pub fn mode(mut self, mode: ModelShrinkMode) -> Self {
+        self.shrink.mode = mode;
+        self
+    }
+
+    /// The validated shrinkage. The constant mode's `rate * eta < 1` needs
+    /// the learning rate and is checked by
+    /// [`TrainingParams::validate`](super::TrainingParams::validate).
+    ///
+    /// # Errors
+    ///
+    /// A rate that is negative or not finite; in the decreasing mode, a
+    /// rate outside `(0, 1)` (CatBoost's range, keeping every `1 - rate / i`
+    /// positive).
+    pub fn build(self) -> Result<ModelShrink> {
+        let ModelShrink { rate, mode } = self.shrink;
+        if !(rate.is_finite() && rate >= 0.0) {
+            return Err(HessboostError::invalid_param(
+                "model_shrink_rate",
+                format!("must be >= 0, got {rate}"),
+            ));
+        }
+        if mode == ModelShrinkMode::Decreasing && !(rate > 0.0 && rate < 1.0) {
+            return Err(HessboostError::invalid_param(
+                "model_shrink_rate",
+                format!("must be in (0, 1) in the decreasing mode, got {rate}"),
+            ));
+        }
+        Ok(self.shrink)
+    }
+}
+
 /// LightGBM's query-level bagging for ranking (`bagging_by_query`): every
 /// round keeps each query group whole with probability `fraction` (its
 /// `bagging_fraction`, in `(0, 1)`), in place of `subsample`'s per-row draw.
@@ -468,6 +653,22 @@ mod tests {
         assert!(Refresh::default().refresh_leaf());
         assert!(!Refresh::stats_only().refresh_leaf());
         assert_eq!(ExtraTrees::default().seed(), 6);
+        for t in [0.0, -1.0, f64::NAN] {
+            assert_eq!(
+                refused(&Langevin::builder().diffusion_temperature(t).build()),
+                Some("diffusion_temperature")
+            );
+        }
+        assert_eq!(
+            refused(&ModelShrink::builder().rate(-0.1).build()),
+            Some("model_shrink_rate")
+        );
+        for rate in [0.0, 1.0] {
+            let decreasing = ModelShrink::builder()
+                .rate(rate)
+                .mode(ModelShrinkMode::Decreasing);
+            assert_eq!(refused(&decreasing.build()), Some("model_shrink_rate"));
+        }
         for v in [0.0, -0.5, 1.1, f64::NAN, f64::INFINITY] {
             assert_eq!(
                 refused(&BalancedBagging::new(v, 0.5)),

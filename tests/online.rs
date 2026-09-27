@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use hessboost::config::{BoosterKind, Dart, GrowPolicy};
+use hessboost::config::{BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink};
 use hessboost::data::FeatureType;
 use hessboost::objective::{CustomLoss, GradPair, Logistic, Objective};
 use hessboost::prelude::*;
@@ -266,6 +266,20 @@ fn unsound_configurations_and_changes_are_refused() {
                 .unwrap(),
             "objective",
         ),
+        // SGLB draws fresh noise for every row each round, and model
+        // shrinkage rescales every earlier tree: neither replays in place.
+        (
+            base().langevin(Langevin::default()).build().unwrap(),
+            "params",
+        ),
+        (
+            base()
+                .model_shrink(ModelShrink::builder().rate(0.1).build().unwrap())
+                .build()
+                .unwrap(),
+            "params",
+        ),
+        (base().posterior_sampling(true).build().unwrap(), "params"),
     ] {
         assert_eq!(
             invalid_param(OnlineModel::train(&params, &train_data, 3, online)),
@@ -340,6 +354,24 @@ fn from_model_refuses_linear_leaves() {
     }
 }
 
+/// A model trained with model shrinkage is refused even under plain
+/// parameters: every round rescaled the trees before it, so updating one
+/// node's subtree cannot reproduce a retrain.
+#[test]
+fn from_model_refuses_shrunk_models() {
+    let data = data(200, 5, false);
+    let p = params(Objective::SquaredError);
+    let mut shrunk = p.clone();
+    shrunk.model_shrink = Some(ModelShrink::builder().rate(0.1).build().unwrap());
+    let model = train(&shrunk, &data, 3).unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
+            "model"
+        );
+    }
+}
 /// A model with splits deeper than `max_depth` is not one `params` trained:
 /// regrowing below such a split would have no depth left.
 #[test]

@@ -10,6 +10,7 @@ mod multi_output;
 pub mod online;
 mod refresh;
 mod sampling;
+mod sglb;
 mod train;
 
 pub use cv::{CrossValidation, CvResult, Fold, cv};

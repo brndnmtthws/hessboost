@@ -21,7 +21,14 @@ Submodules:
 from importlib.metadata import version as _version
 
 from hessboost import conformal, folds, online
-from hessboost._core import Booster, DMatrix, Distributions, ImportanceType, ModelFormat
+from hessboost._core import (
+    Booster,
+    DMatrix,
+    Distributions,
+    ImportanceType,
+    ModelFormat,
+    Uncertainty,
+)
 from hessboost._exceptions import HessboostError, ModelFormatError
 from hessboost._training import (
     CustomMetric,
@@ -47,6 +54,7 @@ __all__ = [
     "ModelFormatError",
     "Objective",
     "TrainingCallback",
+    "Uncertainty",
     "__version__",
     "conformal",
     "cv",

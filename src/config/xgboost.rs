@@ -4,7 +4,8 @@
 //! and the training fuzz target all go through it.
 
 use super::groups::{
-    BalancedBagging, Dart, ExtraTrees, LinearTree, QuantizedGrad, QueryBagging, Refresh,
+    BalancedBagging, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
+    QuantizedGrad, QueryBagging, Refresh,
 };
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
@@ -142,6 +143,11 @@ flat_params! {
     one_drop: bool,
     toad_penalty_feature: f64,
     toad_penalty_threshold: f64,
+    langevin: bool,
+    diffusion_temperature: f64,
+    model_shrink_rate: f64,
+    model_shrink_mode: ModelShrinkMode,
+    posterior_sampling: bool,
 }
 
 /// The flat keys of the objective parameters, with the objectives and
@@ -256,6 +262,11 @@ impl Flat {
             one_drop,
             toad_penalty_feature,
             toad_penalty_threshold,
+            langevin,
+            diffusion_temperature,
+            model_shrink_rate,
+            model_shrink_mode,
+            posterior_sampling,
         } = self;
         // Aligned with `OBJECTIVE_KEYS`.
         let present = [
@@ -374,6 +385,18 @@ impl Flat {
                 use_quantized_grad == Some(true),
                 "`use_quantized_grad=true`",
             ),
+            (
+                "diffusion_temperature",
+                diffusion_temperature.is_some(),
+                langevin == Some(true),
+                "`langevin=true`",
+            ),
+            (
+                "model_shrink_mode",
+                model_shrink_mode.is_some(),
+                model_shrink_rate.is_some(),
+                "`model_shrink_rate`",
+            ),
         ];
         for (key, set, on, needs) in switches {
             if set && !on {
@@ -456,6 +479,32 @@ impl Flat {
         } else {
             (subsample, None)
         };
+        // CatBoost: posterior sampling needs Langevin "not set or true".
+        if posterior_sampling == Some(true) && langevin == Some(false) {
+            return Err(HessboostError::invalid_param(
+                "langevin",
+                "`posterior_sampling` requires Langevin boosting; leave `langevin` unset or true",
+            ));
+        }
+        let langevin = if langevin == Some(true) {
+            let mut l = Langevin::builder();
+            if let Some(temperature) = diffusion_temperature {
+                l = l.diffusion_temperature(temperature);
+            }
+            Some(l.build()?)
+        } else {
+            None
+        };
+        let model_shrink = match model_shrink_rate {
+            Some(rate) => {
+                let mut shrink = ModelShrink::builder().rate(rate);
+                if let Some(mode) = model_shrink_mode {
+                    shrink = shrink.mode(mode);
+                }
+                Some(shrink.build()?)
+            }
+            None => None,
+        };
         let d = TrainingParams::default();
         Ok(TrainingParams {
             booster,
@@ -498,6 +547,9 @@ impl Flat {
             quantized,
             toad_penalty_feature: toad_penalty_feature.unwrap_or(d.toad_penalty_feature),
             toad_penalty_threshold: toad_penalty_threshold.unwrap_or(d.toad_penalty_threshold),
+            langevin,
+            model_shrink,
+            posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
         })
     }
 }
@@ -835,6 +887,9 @@ impl TrainingParams {
             quantized,
             toad_penalty_feature,
             toad_penalty_threshold,
+            langevin,
+            model_shrink,
+            posterior_sampling,
         } = self;
         if let Objective::Custom(loss) = objective {
             return Err(HessboostError::invalid_param(
@@ -956,6 +1011,17 @@ impl TrainingParams {
         }
         set("toad_penalty_feature", json(toad_penalty_feature));
         set("toad_penalty_threshold", json(toad_penalty_threshold));
+        if let Some(langevin) = langevin {
+            set("langevin", json(true));
+            if let Some(temperature) = langevin.diffusion_temperature() {
+                set("diffusion_temperature", json(temperature));
+            }
+        }
+        if let Some(shrink) = model_shrink {
+            set("model_shrink_rate", json(shrink.rate()));
+            set("model_shrink_mode", json(shrink.mode()));
+        }
+        set("posterior_sampling", json(posterior_sampling));
         Ok(flat)
     }
 
@@ -999,6 +1065,9 @@ impl TrainingParams {
             quantized,
             toad_penalty_feature,
             toad_penalty_threshold,
+            langevin,
+            model_shrink,
+            posterior_sampling,
         } = self;
         let mut changed = Vec::new();
         let mut differs = |key: &'static str, same: bool| {
@@ -1080,6 +1149,12 @@ impl TrainingParams {
         differs(
             "toad_penalty_threshold",
             *toad_penalty_threshold == other.toad_penalty_threshold,
+        );
+        differs("langevin", *langevin == other.langevin);
+        differs("model_shrink_rate", *model_shrink == other.model_shrink);
+        differs(
+            "posterior_sampling",
+            *posterior_sampling == other.posterior_sampling,
         );
         changed.sort_unstable();
         changed

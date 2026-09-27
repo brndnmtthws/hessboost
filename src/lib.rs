@@ -51,7 +51,7 @@
 //!   [`training::budget`], [`training::online`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
 //!   native and XGBoost JSON/UBJSON, LightGBM text import);
-//!   [`model::compact`].
+//!   [`model::compact`], [`model::uncertainty`].
 //! - [`objective`]: [`Objective`](objective::Objective) and its parameter
 //!   types, the `Loss` trait, `CustomLoss`, [`objective::distributional`]
 //!   (`dist:*` objectives).
@@ -147,6 +147,14 @@
 //!     per-row distributions
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
 //!     [`objective::distributional`]), scored by `nll` / `crps`.
+//!   - CatBoost's Stochastic Gradient Langevin Boosting and model shrinkage
+//!     ([`langevin`](config::TrainingParams::langevin),
+//!     [`model_shrink`](config::TrainingParams::model_shrink),
+//!     [`posterior_sampling`](config::TrainingParams::posterior_sampling))
+//!     with virtual ensembles: knowledge, data, and total uncertainty from
+//!     one model's exactly rebuilt truncations
+//!     ([`predict_uncertainty`](model::BoostedModel::predict_uncertainty),
+//!     [`model::uncertainty`]);
 //!   - native Metal on macOS 10.15+ (`metal` feature): bit-identical GPU
 //!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~2.5x faster at
 //!     scale) and bit-identical GPU histograms
@@ -158,9 +166,10 @@
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `balanced_bagging`, `online_update`,
-//! `ordered_target_stats`, `pfn_boost`, `metal` with `--features metal` on
-//! macOS). Run one with `cargo run --release --example binary_classification`.
+//! `distributional`, `virtual_ensembles`, `budget`, `balanced_bagging`,
+//! `online_update`, `ordered_target_stats`, `pfn_boost`, `metal` with
+//! `--features metal` on macOS). Run one with
+//! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
 //!

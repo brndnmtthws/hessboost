@@ -245,6 +245,14 @@ def test_virtual_ensembles_and_uncertainty() -> None:
     assert u.mean.shape == (300, 3) and u.knowledge.shape == (300,)
     assert u.data is not None and u.total is not None
     np.testing.assert_allclose(u.knowledge, u.total - u.data)
+    # Multi-label classification: every part is one column per label.
+    two_labels = np.stack([labels % 2, labels // 2], axis=1).astype(np.float32)
+    multi_label = hessboost.train(
+        {"objective": "binary:logistic", "posterior_sampling": True}, DMatrix(x, two_labels), 30
+    )
+    u = multi_label.predict_uncertainty(x, 3)
+    assert u.data is not None and u.total is not None
+    assert u.mean.shape == u.knowledge.shape == u.data.shape == u.total.shape == (300, 2)
 
     with pytest.raises(HessboostError, match="virtual_ensembles_count"):
         booster.predict_uncertainty(x, 21)

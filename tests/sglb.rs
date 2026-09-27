@@ -12,6 +12,7 @@ use hessboost::config::{
     QuantizedGrad, TrainingParamsBuilder,
 };
 use hessboost::metric::Metric;
+use hessboost::model::Predictions;
 use hessboost::objective::distributional::{DistFamily, Distributional};
 use hessboost::objective::{Logistic, Multiclass, Objective};
 use hessboost::prelude::*;
@@ -667,11 +668,16 @@ fn uncertainty_decomposes_per_objective() {
     .unwrap();
     let u = model.predict_uncertainty(&binary, 10).unwrap();
     let (data, total) = (u.data.unwrap(), u.total.unwrap());
-    for ((&k, &d), &t) in u.knowledge.iter().zip(&data).zip(&total) {
+    let cells = |p: &Predictions<f64>| p.as_slice().to_vec();
+    for ((&k, &d), &t) in cells(&u.knowledge)
+        .iter()
+        .zip(&cells(&data))
+        .zip(&cells(&total))
+    {
         assert!((k - (t - d)).abs() < 1e-15);
         assert!(k > -1e-12 && d >= 0.0 && t <= std::f64::consts::LN_2 + 1e-12);
     }
-    assert!(u.mean.iter().all(|&p| (0.0..=1.0).contains(&p)));
+    assert!(u.mean.as_slice().iter().all(|&p| (0.0..=1.0).contains(&p)));
 
     let reg = regression(300);
     let dist = train(
@@ -682,7 +688,11 @@ fn uncertainty_decomposes_per_objective() {
     .unwrap();
     let u = dist.predict_uncertainty(&reg, 5).unwrap();
     let (data, total) = (u.data.unwrap(), u.total.unwrap());
-    for ((&k, &d), &t) in u.knowledge.iter().zip(&data).zip(&total) {
+    for ((&k, &d), &t) in cells(&u.knowledge)
+        .iter()
+        .zip(&cells(&data))
+        .zip(&cells(&total))
+    {
         assert!(k >= 0.0 && d > 0.0);
         assert_eq!(t, k + d);
     }
@@ -690,7 +700,7 @@ fn uncertainty_decomposes_per_objective() {
     let squared = train(&params(Objective::SquaredError), &reg, 40).unwrap();
     let u = squared.predict_uncertainty(&reg, 5).unwrap();
     assert!(u.data.is_none() && u.total.is_none());
-    assert!(u.knowledge.iter().all(|&k| k >= 0.0));
+    assert!(u.knowledge.as_slice().iter().all(|&k| k >= 0.0));
     // Too few iterations for the members, and no decomposition for ranking.
     assert_eq!(
         common::invalid_param(squared.predict_virtual_ensembles(&reg, 21)),
@@ -709,4 +719,68 @@ fn uncertainty_decomposes_per_objective() {
     assert!(members.member_margins(5).is_none());
     assert!(members.member_predictions(usize::MAX).is_none());
     assert!(members.member_margins(usize::MAX).is_none());
+}
+
+/// Each part of the decomposition has its own width: a multiclass model's
+/// mean holds a probability per class and its uncertainties one value per
+/// row; multi-label, multi-output, and distributional models keep theirs.
+#[test]
+fn uncertainty_parts_have_their_own_widths() {
+    let params = |objective: Objective| {
+        TrainingParams::builder()
+            .objective(objective)
+            .max_depth(2)
+            .posterior_sampling(true)
+            .build()
+            .unwrap()
+    };
+    let labels = |i: usize| [(i % 2) as f32, ((i / 2) % 2) as f32];
+    let x: Vec<f32> = (0..120).flat_map(common::four_features).collect();
+    let multi_label = DMatrix::from_dense(&x, 120, 4)
+        .unwrap()
+        .with_label_matrix(&(0..120).flat_map(labels).collect::<Vec<_>>(), 2)
+        .unwrap();
+    let multiclass = classification(120, 3);
+    let reg = regression(120);
+    let cases = [
+        (
+            Objective::Softprob(Multiclass::new(3).unwrap()),
+            &multiclass,
+            3,
+            1,
+        ),
+        (
+            Objective::Softmax(Multiclass::new(3).unwrap()),
+            &multiclass,
+            3,
+            1,
+        ),
+        (
+            Objective::BinaryLogistic(Logistic::default()),
+            &multi_label,
+            2,
+            2,
+        ),
+        (Objective::SquaredError, &multi_label, 2, 2),
+        (
+            Objective::Dist(Distributional::new(DistFamily::Normal)),
+            &reg,
+            1,
+            1,
+        ),
+    ];
+    for (objective, data, mean_width, width) in cases {
+        let name = objective.name().to_string();
+        let model = train(&params(objective), data, 20).unwrap();
+        let u = model.predict_uncertainty(data, 5).unwrap();
+        assert_eq!(
+            (u.mean.n_rows(), u.mean.width()),
+            (120, mean_width),
+            "{name}"
+        );
+        let parts = [Some(&u.knowledge), u.data.as_ref(), u.total.as_ref()];
+        for part in parts.into_iter().flatten() {
+            assert_eq!((part.n_rows(), part.width()), (120, width), "{name}");
+        }
+    }
 }

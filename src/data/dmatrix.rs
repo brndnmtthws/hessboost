@@ -410,17 +410,42 @@ impl DMatrix {
     pub fn with_feature_types(mut self, types: &[FeatureType]) -> Result<Self> {
         check_len("feature_types length", types.len(), self.n_cols)?;
         self.feature_types = types.to_vec();
-        for (col, ty) in types.iter().enumerate() {
-            if *ty == FeatureType::Categorical {
-                for row in 0..self.n_rows {
-                    if let Some(v) = self.get(row, col)
-                        && (v < 0.0 || v.fract() != 0.0 || v >= u32::MAX as f32)
-                    {
-                        return Err(HessboostError::invalid_param(
-                            "categorical feature",
-                            format!("feature {col} contains invalid category value {v}"),
-                        ));
+        let invalid = |col: usize, v: f32| {
+            HessboostError::invalid_param(
+                "categorical feature",
+                format!("feature {col} contains invalid category value {v}"),
+            )
+        };
+        let is_invalid = |v: f32| v < 0.0 || v.fract() != 0.0 || v >= u32::MAX as f32;
+        match &self.storage {
+            Storage::Dense(_) => {
+                for (col, ty) in types.iter().enumerate() {
+                    if *ty == FeatureType::Categorical {
+                        for row in 0..self.n_rows {
+                            if let Some(v) = self.get(row, col)
+                                && is_invalid(v)
+                            {
+                                return Err(invalid(col, v));
+                            }
+                        }
                     }
+                }
+            }
+            // One pass over the stored entries; the first invalid entry by
+            // column, then row, is the one reported, as the dense scan does.
+            Storage::Csr { .. } => {
+                let mut first: Option<(usize, usize, f32)> = None;
+                self.for_each_entry(|row, col, v| {
+                    let col = col as usize;
+                    if types[col] == FeatureType::Categorical
+                        && is_invalid(v)
+                        && first.is_none_or(|(c, r, _)| (col, row) < (c, r))
+                    {
+                        first = Some((col, row, v));
+                    }
+                });
+                if let Some((col, _, v)) = first {
+                    return Err(invalid(col, v));
                 }
             }
         }
@@ -673,7 +698,8 @@ impl DMatrix {
     /// Build a new matrix containing only `rows` (in the given order), carrying
     /// over labels (every target of each row), label bounds, weights, base
     /// margin, and feature metadata. Used for cross-validation folds. Ranking
-    /// group info is not carried over.
+    /// group info is not carried over. A dense matrix stays dense and a
+    /// sparse one sparse; either way the result's missing sentinel is NaN.
     pub fn select_rows(&self, rows: &[usize]) -> Result<Self> {
         if let Some(&row) = rows.iter().find(|&&row| row >= self.n_rows) {
             return Err(HessboostError::invalid_param(
@@ -681,18 +707,43 @@ impl DMatrix {
                 format!("row index {row} is out of bounds for {} rows", self.n_rows),
             ));
         }
-        let mut indptr = Vec::with_capacity(rows.len() + 1);
-        indptr.push(0usize);
-        let mut indices: Vec<u32> = Vec::new();
-        let mut values: Vec<f32> = Vec::new();
-        for &r in rows {
-            self.for_row_entry(r, |index, value| {
-                indices.push(index);
-                values.push(value);
-            });
-            indptr.push(values.len());
-        }
-        let mut out = DMatrix::from_csr(indptr, indices, values, self.n_cols)?;
+        let mut out = match &self.storage {
+            Storage::Dense(data) => {
+                if rows.is_empty() {
+                    return Err(HessboostError::EmptyDataset(
+                        "from_dense: zero rows or columns",
+                    ));
+                }
+                let n_cols = self.n_cols;
+                let mut selected = Vec::with_capacity(rows.len() * n_cols);
+                for &r in rows {
+                    selected.extend_from_slice(&data[r * n_cols..(r + 1) * n_cols]);
+                }
+                if !self.missing.is_nan() {
+                    for v in &mut selected {
+                        if *v == self.missing {
+                            *v = f32::NAN;
+                        }
+                    }
+                }
+                // The source's values are already validated.
+                Self::new(rows.len(), n_cols, Storage::Dense(selected), f32::NAN)
+            }
+            Storage::Csr { .. } => {
+                let mut indptr = Vec::with_capacity(rows.len() + 1);
+                indptr.push(0usize);
+                let mut indices: Vec<u32> = Vec::new();
+                let mut values: Vec<f32> = Vec::new();
+                for &r in rows {
+                    self.for_row_entry(r, |index, value| {
+                        indices.push(index);
+                        values.push(value);
+                    });
+                    indptr.push(values.len());
+                }
+                DMatrix::from_csr(indptr, indices, values, self.n_cols)?
+            }
+        };
         out.feature_types.clone_from(&self.feature_types);
         out.feature_weights.clone_from(&self.feature_weights);
         out.n_targets = self.n_targets;
@@ -926,6 +977,58 @@ mod tests {
         assert_eq!(s.label_lower_bound().unwrap(), &[3.0, 1.0]);
         assert_eq!(s.label_upper_bound().unwrap(), &[3.5, 1.5]);
         assert_eq!(s.feature_weights().unwrap(), &[0.25, 0.75]);
+    }
+
+    /// A dense selection stays dense, and a non-NaN sentinel's missing
+    /// entries become NaN under the result's NaN sentinel.
+    #[test]
+    fn select_rows_keeps_dense_storage_and_missing_entries() {
+        let d = DMatrix::from_dense_with_missing(&[1.0, -1.0, -1.0, 4.0, 5.0, 6.0], 3, 2, -1.0)
+            .unwrap();
+        let s = d.select_rows(&[1, 0, 1]).unwrap();
+        assert!(s.missing().is_nan());
+        let values = s.dense_values().unwrap();
+        assert_eq!(values.len(), 6);
+        let expected = [None, Some(4.0), Some(1.0), None, None, Some(4.0)];
+        for (cell, &want) in expected.iter().enumerate() {
+            assert_eq!(s.get(cell / 2, cell % 2), want, "cell {cell}");
+        }
+        assert!(d.select_rows(&[]).is_err());
+    }
+
+    /// Categorical validation on sparse storage reports the first invalid
+    /// entry by column, then row, like the dense scan.
+    #[test]
+    fn csr_categorical_validation_reports_the_first_invalid_column() {
+        let d = DMatrix::from_csr(
+            vec![0, 2, 4],
+            vec![1, 0, 0, 1],
+            vec![2.5, 1.0, -3.0, 7.5],
+            2,
+        )
+        .unwrap();
+        let types = [FeatureType::Categorical; 2];
+        let err = d
+            .clone()
+            .with_feature_types(&types)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("feature 0 contains invalid category value -3"),
+            "{err}"
+        );
+        let numeric_first = [FeatureType::Numerical, FeatureType::Categorical];
+        let err = d
+            .clone()
+            .with_feature_types(&numeric_first)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("feature 1 contains invalid category value 2.5"),
+            "{err}"
+        );
+        let d = DMatrix::from_csr(vec![0, 1, 2], vec![1, 0], vec![3.0, 1.5], 2).unwrap();
+        assert!(d.with_feature_types(&numeric_first).is_ok());
     }
 
     #[test]

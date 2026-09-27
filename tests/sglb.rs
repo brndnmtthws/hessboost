@@ -4,6 +4,7 @@
 //! formats; and the uncertainty decomposition's invariants.
 
 mod common;
+use common::bits::bits;
 
 use std::sync::mpsc::{Sender, channel};
 
@@ -49,10 +50,6 @@ fn classification(n: usize, classes: usize) -> DMatrix {
 /// Model shrinkage at `rate` in `mode`.
 fn shrink(rate: f64, mode: ModelShrinkMode) -> ModelShrink {
     ModelShrink::new(rate, mode).unwrap()
-}
-
-fn bits(values: impl AsRef<[f32]>) -> Vec<u32> {
-    values.as_ref().iter().map(|v| v.to_bits()).collect()
 }
 
 /// The model after `k` iterations of a `rounds`-round shrunk model, however

@@ -302,12 +302,11 @@ fn inference_outputs_are_typed_per_row() {
     }
 }
 
+fn refused(b: TrainingParamsBuilder) -> &'static str {
+    invalid_param(b.build())
+}
 #[test]
 fn settings_that_break_the_linear_smoother_are_refused() {
-    let refused = |b: TrainingParamsBuilder| match b.build() {
-        Err(HessboostError::InvalidParameter { name, .. }) => name,
-        other => panic!("expected a refusal, got {other:?}"),
-    };
     assert_eq!(
         refused(builder().objective(Objective::SquaredLogError)),
         "objective"

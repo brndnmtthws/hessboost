@@ -25,6 +25,17 @@ use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, train_with_budget};
 use std::hint::black_box;
 
+fn base_hist_params() -> TrainingParamsBuilder {
+    TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .max_depth(6)
+        .eta(0.1)
+}
+
+fn trained_model(data: &DMatrix, rounds: usize) -> BoostedModel {
+    train(&base_hist_params().build().unwrap(), data, rounds).unwrap()
+}
+
 /// Deterministic synthetic regression dataset.
 fn make_data(n: usize, f: usize) -> DMatrix {
     let mut x = vec![0f32; n * f];
@@ -608,13 +619,7 @@ fn bench_predict(c: &mut Criterion) {
         ("depthwise", GrowPolicy::DepthWise),
         ("symmetric", GrowPolicy::Symmetric),
     ] {
-        let params = TrainingParams::builder()
-            .tree_method(TreeMethod::Hist)
-            .grow_policy(policy)
-            .max_depth(6)
-            .eta(0.1)
-            .build()
-            .unwrap();
+        let params = base_hist_params().grow_policy(policy).build().unwrap();
         let model = train(&params, &data, 100).unwrap();
         group.bench_function(name, |b| {
             b.iter(|| model.predict_margin(black_box(&data)).unwrap());
@@ -627,13 +632,7 @@ fn bench_predict(c: &mut Criterion) {
 /// rows): contributions for 2,000 rows and interaction values for 200.
 fn bench_shap(c: &mut Criterion) {
     let data = make_data(20_000, 20);
-    let params = TrainingParams::builder()
-        .tree_method(TreeMethod::Hist)
-        .max_depth(6)
-        .eta(0.1)
-        .build()
-        .unwrap();
-    let model = train(&params, &data, 100).unwrap();
+    let model = trained_model(&data, 100);
     let values: Vec<f32> = (0..2_000 * 20)
         .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
         .collect();
@@ -1087,13 +1086,8 @@ fn bench_train_variants(c: &mut Criterion) {
 fn bench_predict_csr(c: &mut Criterion) {
     let mut group = c.benchmark_group("predict_csr_100trees_depth6");
     group.sample_size(20);
-    let params = TrainingParams::builder()
-        .tree_method(TreeMethod::Hist)
-        .max_depth(6)
-        .eta(0.1)
-        .build()
-        .unwrap();
-    let model = train(&params, &make_data(100_000, 30), 100).unwrap();
+    let data = make_data(100_000, 30);
+    let model = trained_model(&data, 100);
     let sparse = make_csr_data(100_000, 30);
     group.throughput(Throughput::Elements(sparse.n_rows() as u64));
     group.bench_function("100k_x30", |b| {
@@ -1135,7 +1129,7 @@ fn bench_predict_csr(c: &mut Criterion) {
         .unwrap()
         .with_labels(&labels)
         .unwrap();
-    let model = train(&params, &wide, 100).unwrap();
+    let model = trained_model(&wide, 100);
     group.throughput(Throughput::Elements(n as u64));
     group.bench_function("20k_x5000_wide", |b| {
         b.iter(|| model.predict_margin(black_box(&wide)).unwrap());
@@ -1146,13 +1140,8 @@ fn bench_predict_csr(c: &mut Criterion) {
 /// Serializing and loading a 100-tree model in the native binary, native
 /// JSON, and XGBoost JSON formats.
 fn bench_model_io(c: &mut Criterion) {
-    let params = TrainingParams::builder()
-        .tree_method(TreeMethod::Hist)
-        .max_depth(6)
-        .eta(0.1)
-        .build()
-        .unwrap();
-    let model = train(&params, &make_data(20_000, 20), 100).unwrap();
+    let data = make_data(20_000, 20);
+    let model = trained_model(&data, 100);
     let bytes = model.to_bytes().unwrap();
     let json = model.to_json().unwrap();
     let xgboost = model.to_xgboost_json().unwrap();
@@ -1256,14 +1245,7 @@ fn bench_metal(c: &mut Criterion) {
     // Batch prediction: the compact-forest walk against the GPU walk.
     {
         let model_data = make_data(100_000, 30);
-        let params = TrainingParams::builder()
-            .objective(Objective::SquaredError(RegLoss::default()))
-            .tree_method(TreeMethod::Hist)
-            .max_depth(6)
-            .eta(0.1)
-            .build()
-            .unwrap();
-        let model = train(&params, &model_data, 100).unwrap();
+        let model = trained_model(&model_data, 100);
         let gpu = model.to_gpu().unwrap();
         let data = make_data(500_000, 30);
         let mut group = c.benchmark_group("metal_predict_500k_x30_100trees_depth6");

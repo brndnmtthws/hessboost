@@ -68,3 +68,7 @@ pub fn with_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T 
         .unwrap()
         .install(f)
 }
+
+pub mod bits;
+pub mod fixtures;
+pub mod smooth;

@@ -46,15 +46,24 @@ Changelog = "https://github.com/brndnmtthws/hessboost/releases"
 [dependency-groups]
 test = [
   "pytest>=9.1",
-  "mypy>=2.3",
+  # CI's `pyright --verifytypes` checks the installed wheel's public types.
   "pyright>=1.1.414",
   "pandas>=2.2",
-  "pandas-stubs>=2.2",
   "scikit-learn>=1.6",
   "scipy>=1.14",
-  "scipy-stubs>=1.14",
 ]
-dev = [{ include-group = "test" }, "maturin>=1.15,<2"]
+# ruff and ty for all of the repository's Python (config: ../ruff.toml,
+# ../ty.toml), plus what ty needs to resolve it.
+lint = [
+  { include-group = "test" },
+  "ruff>=0.16.9",
+  "ty>=0.0.84",
+  "pandas-stubs>=2.2",
+  "scipy-stubs>=1.14",
+  # release.py's dependency.
+  "tomlkit>=0.13",
+]
+dev = [{ include-group = "lint" }, "maturin>=1.15,<2"]
 
 [tool.maturin]
 # Every build (maturin CLI, `uv sync`/`uv run`, pip from the sdist) uses the
@@ -67,10 +76,6 @@ python-source = "python"
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers"]
 xfail_strict = true
-
-[tool.mypy]
-files = ["python/hessboost", "tests"]
-strict = true
 
 [tool.uv]
 # `uv sync` and `uv run` rebuild the extension when these change (by default

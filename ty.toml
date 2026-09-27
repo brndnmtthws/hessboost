@@ -1,0 +1,23 @@
+# Type-checking settings for every Python file in the repository: the
+# bindings (python/), scripts/, and release.py. CI runs `ty check` from the
+# root after `uv sync --locked --only-group lint` in python/, which installs
+# the bindings' dependencies and stubs (not the extension: ty reads the
+# checked-in `_hessboost.pyi`).
+[environment]
+python = "python/.venv"
+python-version = "3.11"
+# Import roots: the package source, the tests (`conftest`), the scripts.
+root = ["python/python", "python/tests", "scripts"]
+
+[src]
+include = ["python/python", "python/tests", "scripts", "release.py"]
+
+[analysis]
+# Only `ty: ignore[rule]` suppresses a diagnostic.
+respect-type-ignore-comments = false
+# The scripts' XGBoost and LightGBM are installed for the parity job only
+# (scripts/requirements-*.txt).
+allowed-unresolved-imports = ["xgboost", "xgboost.**", "lightgbm", "lightgbm.**"]
+
+[terminal]
+error-on-warning = true

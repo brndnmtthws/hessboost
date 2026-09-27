@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import FRAME_TYPES, frame, numpy_codes, reorder_colors
 
 import hessboost
+from conftest import FRAME_TYPES, frame, numpy_codes, reorder_colors
 from hessboost import DMatrix, HessboostError
 from hessboost.conformal import ConformalizedQuantile, SplitConformal
 
@@ -29,9 +29,7 @@ def test_split_conformal_covers_new_rows() -> None:
     assert calibrated.n_calibration == 1000
     intervals = calibrated.predict_interval(x[2000:])
     assert intervals.shape == (1000, 2)
-    np.testing.assert_allclose(
-        intervals.mean(axis=1), booster.predict(x[2000:]), atol=1e-5
-    )
+    np.testing.assert_allclose(intervals.mean(axis=1), booster.predict(x[2000:]), atol=1e-5)
     np.testing.assert_allclose(
         intervals[:, 1] - intervals[:, 0], 2 * calibrated.half_width, rtol=1e-5
     )
@@ -55,12 +53,8 @@ def test_cqr_from_two_models_one_model_and_a_distribution() -> None:
     dtrain = DMatrix(x[:2000], y[:2000])
     calibration = (x[2000:3000], y[2000:3000])
     test_x, test_y = x[3000:], y[3000:]
-    lower = hessboost.train(
-        {"objective": "reg:quantileerror", "quantile_alpha": 0.05}, dtrain, 100
-    )
-    upper = hessboost.train(
-        {"objective": "reg:quantileerror", "quantile_alpha": 0.95}, dtrain, 100
-    )
+    lower = hessboost.train({"objective": "reg:quantileerror", "quantile_alpha": 0.05}, dtrain, 100)
+    upper = hessboost.train({"objective": "reg:quantileerror", "quantile_alpha": 0.95}, dtrain, 100)
     band = hessboost.train(
         {"objective": "reg:quantileerror", "quantile_alpha": [0.05, 0.95]}, dtrain, 100
     )
@@ -84,9 +78,7 @@ def test_cqr_from_two_models_one_model_and_a_distribution() -> None:
         raw + np.array([-1, 1]) * calibrators[1].correction,
         atol=1e-5,
     )
-    swapped = ConformalizedQuantile.calibrate_outputs(
-        band, *calibration, alpha=0.1, outputs=(1, 0)
-    )
+    swapped = ConformalizedQuantile.calibrate_outputs(band, *calibration, alpha=0.1, outputs=(1, 0))
     assert swapped.correction != calibrators[1].correction
 
 
@@ -96,7 +88,7 @@ def test_calibration_refusals() -> None:
     with pytest.raises(HessboostError, match="alpha"):
         SplitConformal.calibrate(booster, x, y, alpha=1.5)
     with pytest.raises(TypeError, match="alpha"):
-        SplitConformal.calibrate(booster, x, y, alpha="0.1")  # type: ignore[arg-type]
+        SplitConformal.calibrate(booster, x, y, alpha="0.1")  # ty: ignore[invalid-argument-type]
     with pytest.raises(HessboostError, match="labels"):
         SplitConformal.calibrate(booster, x, alpha=0.1)
     with pytest.raises(HessboostError, match="weights"):
@@ -122,9 +114,7 @@ def test_calibration_recodes_categories_and_refuses_mismatched_bands() -> None:
     # A band's two models are evaluated on one matrix, so they must share
     # their categories.
     quantile = {"objective": "reg:quantileerror", "max_depth": 3}
-    lower = hessboost.train(
-        {**quantile, "quantile_alpha": 0.05}, DMatrix(df[fit], y[fit]), 20
-    )
+    lower = hessboost.train({**quantile, "quantile_alpha": 0.05}, DMatrix(df[fit], y[fit]), 20)
     upper = hessboost.train(
         {**quantile, "quantile_alpha": 0.95}, DMatrix(reorder_colors(df[fit]), y[fit]), 20
     )

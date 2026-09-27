@@ -28,11 +28,11 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 try:
-    from sklearn.utils import check_random_state  # type: ignore[import-untyped]
-    from sklearn.utils.multiclass import (  # type: ignore[import-untyped]
+    from sklearn.utils import check_random_state
+    from sklearn.utils.multiclass import (
         check_classification_targets,
     )
-    from sklearn.utils.validation import (  # type: ignore[import-untyped]
+    from sklearn.utils.validation import (
         check_array,
         column_or_1d,
         validate_data,
@@ -48,7 +48,7 @@ except ImportError as _missing:  # pragma: no cover - exercised without scikit-l
     ) from _missing
 
 from hessboost import _data
-from hessboost._core import Booster, DMatrix, Distributions, ImportanceType
+from hessboost._core import Booster, Distributions, DMatrix, ImportanceType
 from hessboost._exceptions import HessboostError
 from hessboost._training import EvalsResult, TrainingCallback, _init_model, train
 
@@ -197,7 +197,9 @@ class _HessboostModel(BaseEstimator):
                 params["seed"] = int(check_random_state(self.random_state).randint(2**31 - 1))
         for name, value in (self.params or {}).items():
             if name in params and name != "objective":
-                raise HessboostError(f"{name!r} is set both as an estimator parameter and in params")
+                raise HessboostError(
+                    f"{name!r} is set both as an estimator parameter and in params"
+                )
             params[name] = value
         return params
 
@@ -260,8 +262,8 @@ class _HessboostModel(BaseEstimator):
         dtrain = self._matrix(X, y, sample_weight, base_margin, group, earlier)
         categories = {**earlier, **dtrain._categories}
         evals: list[tuple[DMatrix, str]] = []
-        for index, (X_eval, y_eval) in enumerate(eval_set or ()):
-            X_eval = self._check_X(X_eval, reset=False)
+        for index, (raw_eval, y_eval) in enumerate(eval_set or ()):
+            X_eval = self._check_X(raw_eval, reset=False)
             weight = None if sample_weight_eval_set is None else sample_weight_eval_set[index]
             margin = None if base_margin_eval_set is None else base_margin_eval_set[index]
             labels = encode(y_eval) if encode is not None else y_eval
@@ -322,7 +324,7 @@ class _HessboostModel(BaseEstimator):
             sklearn.exceptions.NotFittedError: The estimator is not fitted.
         """
         if not hasattr(self, "_booster"):
-            from sklearn.exceptions import NotFittedError  # type: ignore[import-untyped]
+            from sklearn.exceptions import NotFittedError
 
             raise NotFittedError(f"this {type(self).__name__} is not fitted yet; call fit first")
         return self._booster
@@ -353,7 +355,6 @@ class _HessboostModel(BaseEstimator):
             values[index] = value
         total = values.sum()
         return values / total if total > 0 else values
-
 
 
 def _labels(y: ArrayLike | None, name: str) -> NDArray[Any]:
@@ -387,9 +388,7 @@ class HessboostRegressor(RegressorMixin, _HessboostModel):
     ) -> Self:
         """Fits the model on ``X`` (array, sparse matrix or DataFrame) and
         ``y``. ``xgb_model`` continues from an earlier fit."""
-        labels = check_array(
-            _labels(y, type(self).__name__), ensure_2d=False, dtype=np.float64
-        )
+        labels = check_array(_labels(y, type(self).__name__), ensure_2d=False, dtype=np.float64)
         if labels.ndim == 2 and labels.shape[1] == 1:
             labels = labels.reshape(-1)
         return self._fit(

@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse
-from conftest import FRAME_TYPES, frame, numpy_codes, regression, reorder_colors
 
 import hessboost
+from conftest import FRAME_TYPES, frame, numpy_codes, regression, reorder_colors
 from hessboost import DMatrix, HessboostError
 
 
@@ -244,7 +244,7 @@ def test_numpy_category_codes_with_feature_types() -> None:
     assert booster.save_raw() == frame_model.save_raw()
     bad = codes.copy()
     bad[0, 0] = 1.5
-    with pytest.raises(HessboostError, match="invalid category value 1.5"):
+    with pytest.raises(HessboostError, match=r"invalid category value 1\.5"):
         DMatrix(bad, y, feature_types=["c", "q"])
 
 

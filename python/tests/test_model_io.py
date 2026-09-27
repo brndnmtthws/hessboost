@@ -10,9 +10,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from conftest import classes, regression, saved_models_dir
 
 import hessboost
+from conftest import classes, regression, saved_models_dir
 from hessboost import Booster, DMatrix, HessboostError, ModelFormatError
 
 
@@ -81,10 +81,12 @@ def test_formats_refuse_what_they_cannot_hold() -> None:
         linear.save_raw("xgboost-json")
     np.testing.assert_array_equal(Booster(linear.save_raw()).predict(x), linear.predict(x))
     with pytest.raises(ValueError, match="unknown model format"):
-        linear.save_raw("pickle")  # type: ignore[arg-type]
+        linear.save_raw("pickle")  # ty: ignore[invalid-argument-type]
 
 
-def test_corrupt_and_missing_models_raise(tmp_path: Path, trained: tuple[Booster, np.ndarray]) -> None:
+def test_corrupt_and_missing_models_raise(
+    tmp_path: Path, trained: tuple[Booster, np.ndarray]
+) -> None:
     booster, _ = trained
     raw = bytearray(booster.save_raw())
     raw[len(raw) // 2] ^= 0xFF
@@ -134,8 +136,10 @@ def test_models_saved_by_the_rust_crate_predict_its_recorded_margins() -> None:
             assert got.tobytes() == expected.tobytes(), f"{margins.stem}{suffix}"
 
 
-def test_pickle_keeps_the_model_and_its_python_metadata(trained: tuple[Booster, np.ndarray]) -> None:
-    booster, x = trained
+def test_pickle_keeps_the_model_and_its_python_metadata(
+    trained: tuple[Booster, np.ndarray],
+) -> None:
+    booster, _ = trained
     booster = booster.copy()
     booster.best_score = 1.5
     restored = pickle.loads(pickle.dumps(booster))
@@ -156,7 +160,7 @@ def test_native_bytes_round_trip_exactly(trained: tuple[Booster, np.ndarray]) ->
 
 
 def test_copies_are_independent(trained: tuple[Booster, np.ndarray]) -> None:
-    booster, x = trained
+    booster, _ = trained
     for duplicate in [booster.copy(), copy.copy(booster), copy.deepcopy(booster)]:
         duplicate.feature_names = ["p", "q", "r", "s", "t"]
         duplicate.load_model(booster[:2].save_raw())
@@ -183,7 +187,7 @@ def test_slicing_selects_iterations(trained: tuple[Booster, np.ndarray]) -> None
     with pytest.raises(HessboostError, match="positive step"):
         booster[::-1]
     with pytest.raises(TypeError):
-        booster["a"]  # type: ignore[call-overload]
+        booster["a"]  # ty: ignore[invalid-argument-type]
 
 
 def test_shap_contributions_sum_to_the_margin(trained: tuple[Booster, np.ndarray]) -> None:
@@ -224,7 +228,8 @@ def test_multiclass_layouts() -> None:
 def test_feature_importance(trained: tuple[Booster, np.ndarray]) -> None:
     booster, _ = trained
     weight = booster.get_score()
-    assert set(weight) <= set("abcde") and "b" in weight
+    assert set(weight) <= set("abcde")
+    assert "b" in weight
     assert all(isinstance(value, float) for value in weight.values())
     total = booster.get_score("total_gain")
     average = booster.get_score("gain")
@@ -234,7 +239,7 @@ def test_feature_importance(trained: tuple[Booster, np.ndarray]) -> None:
     unnamed = Booster(booster.save_raw())
     assert set(unnamed.get_score()) <= {"f0", "f1", "f2", "f3", "f4"}
     with pytest.raises(ValueError, match="importance_type"):
-        booster.get_score("split")  # type: ignore[arg-type]
+        booster.get_score("split")  # ty: ignore[invalid-argument-type]
 
 
 def test_lightgbm_text_models_load_and_predict_lightgbms_values() -> None:
@@ -253,7 +258,7 @@ def test_lightgbm_text_models_load_and_predict_lightgbms_values() -> None:
         explicit.load_model(path, format="lightgbm")
         assert explicit.save_raw() == booster.save_raw()
     with pytest.raises(HessboostError, match="import-only"):
-        booster.save_raw("lightgbm")  # type: ignore[arg-type]
+        booster.save_raw("lightgbm")  # ty: ignore[invalid-argument-type]
     refused = path.read_text().replace("version=v4", "version=v3", 1)
     with pytest.raises(ModelFormatError, match="LightGBM model: model version"):
         Booster(refused.encode())

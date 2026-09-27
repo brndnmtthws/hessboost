@@ -9,14 +9,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
-from conftest import classes, frame, regression, reorder_colors
-from sklearn.base import clone  # type: ignore[import-untyped]
-from sklearn.model_selection import GridSearchCV  # type: ignore[import-untyped]
-from sklearn.pipeline import make_pipeline  # type: ignore[import-untyped]
-from sklearn.preprocessing import StandardScaler  # type: ignore[import-untyped]
-from sklearn.utils.estimator_checks import parametrize_with_checks  # type: ignore[import-untyped]
+from sklearn.base import clone
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.estimator_checks import parametrize_with_checks
 
 import hessboost
+from conftest import classes, frame, regression, reorder_colors
 from hessboost import HessboostError
 from hessboost.sklearn import (
     HessboostClassifier,
@@ -47,7 +47,7 @@ def expected_failures(estimator: Any) -> dict[str, str]:
     return failures
 
 
-@parametrize_with_checks(  # type: ignore[untyped-decorator]
+@parametrize_with_checks(
     [
         HessboostRegressor(n_estimators=20),
         HessboostClassifier(n_estimators=20),
@@ -97,7 +97,8 @@ def test_eval_sets_and_continuation_are_recoded_to_the_training_categories() -> 
     swapped = HessboostRegressor(**settings).fit(
         fit_df, fit_y, eval_set=[(reorder_colors(valid_df), valid_y)]
     )
-    assert right.best_iteration is not None and right.best_iteration < 199
+    assert right.best_iteration is not None
+    assert right.best_iteration < 199
     assert swapped.evals_result() == right.evals_result()
     assert swapped.best_iteration == right.best_iteration
     # Continuing or refreshing an earlier fit re-codes X to its categories.
@@ -123,7 +124,8 @@ def test_early_stopping_with_eval_sets() -> None:
     assert set(history) == {"validation_0", "validation_1"}
     assert list(history["validation_1"]) == ["mae"]
     best = model.best_iteration
-    assert best is not None and best < 999
+    assert best is not None
+    assert best < 999
     assert model.best_score == min(history["validation_1"]["mae"])
     classifier = HessboostClassifier(n_estimators=100, early_stopping_rounds=3)
     x, labels = classes()
@@ -183,8 +185,13 @@ def test_ranker() -> None:
     relevance = np.clip(np.round(x[:, 0] + 1), 0, 3)
     qid = np.repeat(np.arange(30), 10)
     ranker = HessboostRanker(n_estimators=20, eval_metric="ndcg@5", early_stopping_rounds=5)
-    ranker.fit(x[:200], relevance[:200], qid=qid[:200], eval_set=[(x[200:], relevance[200:])],
-               eval_qid=[qid[200:]])
+    ranker.fit(
+        x[:200],
+        relevance[:200],
+        qid=qid[:200],
+        eval_set=[(x[200:], relevance[200:])],
+        eval_qid=[qid[200:]],
+    )
     assert list(ranker.evals_result()["validation_0"]) == ["ndcg@5"]
     scores = ranker.predict(x)
     assert np.corrcoef(scores, relevance)[0, 1] > 0.8
@@ -218,7 +225,9 @@ def test_estimators_work_in_model_selection_and_pickle() -> None:
     assert search.best_params_ == {"hessboostregressor__max_depth": 4}
     model = HessboostClassifier(n_estimators=5, max_depth=2).fit(*classes())
     restored = pickle.loads(pickle.dumps(model))
-    np.testing.assert_array_equal(restored.predict_proba(classes()[0]), model.predict_proba(classes()[0]))
+    np.testing.assert_array_equal(
+        restored.predict_proba(classes()[0]), model.predict_proba(classes()[0])
+    )
     assert clone(model).get_params() == model.get_params()
     assert "max_depth=2" in repr(model)
 
@@ -240,7 +249,7 @@ def test_callbacks_and_verbose_pass_through(capsys: pytest.CaptureFixture[str]) 
 
 
 def test_unfitted_estimators_raise_not_fitted() -> None:
-    from sklearn.exceptions import NotFittedError  # type: ignore[import-untyped]
+    from sklearn.exceptions import NotFittedError
 
     with pytest.raises(NotFittedError):
         HessboostRegressor().predict(np.zeros((1, 2)))

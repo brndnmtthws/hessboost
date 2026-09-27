@@ -17,21 +17,19 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
 import tomlkit
-import tomllib
 
 ROOT = Path(__file__).resolve().parent
 REPO = "brndnmtthws/hessboost"
 USER_AGENT = f"hessboost release.py (https://github.com/{REPO})"
 _ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
-SEMVER = re.compile(
-    rf"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-({_ID}(?:\.{_ID})*))?"
-)
+SEMVER = re.compile(rf"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-({_ID}(?:\.{_ID})*))?")
 PEP440_PRE = {"alpha": "a", "beta": "b", "rc": "rc"}
 SemverKey = tuple[int, int, int, int, tuple[tuple[int, int, str], ...]]
 
@@ -51,9 +49,7 @@ def run(*cmd: str, cwd: Path = ROOT) -> str:
     proc = execute(*cmd, cwd=cwd)
     if proc.returncode:
         lines = (proc.stderr or proc.stdout).strip().splitlines()
-        raise CheckError(
-            f"`{' '.join(cmd)}` failed" + (f": {lines[-1]}" if lines else "")
-        )
+        raise CheckError(f"`{' '.join(cmd)}` failed" + (f": {lines[-1]}" if lines else ""))
     return proc.stdout.strip()
 
 
@@ -74,15 +70,10 @@ def semver_key(version: str) -> SemverKey:
     """Return SemVer 2.0 precedence (build metadata is ignored)."""
     match = SEMVER.fullmatch(version.split("+", 1)[0])
     if match is None:
-        raise CheckError(
-            f"{version!r} is not a SemVer version (MAJOR.MINOR.PATCH[-PRERELEASE])"
-        )
+        raise CheckError(f"{version!r} is not a SemVer version (MAJOR.MINOR.PATCH[-PRERELEASE])")
     major, minor, patch, pre = match.groups()
     ids = (
-        tuple(
-            (0, int(item), "") if item.isdigit() else (1, 0, item)
-            for item in pre.split(".")
-        )
+        tuple((0, int(item), "") if item.isdigit() else (1, 0, item) for item in pre.split("."))
         if pre
         else ()
     )
@@ -108,9 +99,7 @@ def package_version(manifest: str) -> str:
 
 
 def check_tools() -> str:
-    missing = [
-        tool for tool in ("git", "cargo", "uv", "gh") if shutil.which(tool) is None
-    ]
+    missing = [tool for tool in ("git", "cargo", "uv", "gh") if shutil.which(tool) is None]
     if missing:
         raise CheckError(f"not on PATH: {', '.join(missing)}")
     return "git, cargo, uv, gh"
@@ -135,9 +124,7 @@ def check_git() -> str:
 def check_manifests(version: str) -> str:
     root, python = package_version("Cargo.toml"), package_version("python/Cargo.toml")
     if not root == python == version:
-        raise CheckError(
-            f"Cargo.toml {root}, python/Cargo.toml {python}, release {version}"
-        )
+        raise CheckError(f"Cargo.toml {root}, python/Cargo.toml {python}, release {version}")
     return f"Cargo.toml and python/Cargo.toml are {version}"
 
 
@@ -171,7 +158,8 @@ def check_locks() -> str:
         "python/Cargo.toml",
     ).returncode:
         problems.append(
-            "python/Cargo.lock is stale: run `cargo update -p hessboost --manifest-path python/Cargo.toml`"
+            "python/Cargo.lock is stale: run "
+            "`cargo update -p hessboost --manifest-path python/Cargo.toml`"
         )
     if execute("uv", "lock", "--check", cwd=ROOT / "python").returncode:
         problems.append("python/uv.lock is stale: run `uv lock` in python/")
@@ -183,9 +171,7 @@ def check_locks() -> str:
 def check_saved_models(version: str) -> str:
     directory = f"tests/data/saved/{version}"
     if not (ROOT / directory).is_dir():
-        raise CheckError(
-            f"{directory}/ does not exist; save this release's models and commit them"
-        )
+        raise CheckError(f"{directory}/ does not exist; save this release's models and commit them")
     tracked = run("git", "ls-files", "--", f"{directory}/**")
     if not tracked:
         raise CheckError(
@@ -195,10 +181,7 @@ def check_saved_models(version: str) -> str:
 
 
 def check_tag(tag: str) -> str:
-    if (
-        execute("git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}").returncode
-        == 0
-    ):
+    if execute("git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}").returncode == 0:
         raise CheckError(f"{tag} already exists locally")
     if run("git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}"):
         raise CheckError(f"{tag} already exists on origin")
@@ -215,7 +198,10 @@ def check_unpublished(version: str) -> str:
         raise CheckError(f"crates.io returned HTTP {status} for hessboost {version}")
     status, body = http_get("https://pypi.org/pypi/hessboost/json")
     if status == 404:
-        return f"not on crates.io; PyPI project does not exist yet, configure pending trusted publisher ({REPO}, publish.yml, environment pypi)"
+        return (
+            "not on crates.io; PyPI project does not exist yet, configure pending trusted "
+            f"publisher ({REPO}, publish.yml, environment pypi)"
+        )
     if status != 200:
         raise CheckError(f"PyPI returned HTTP {status}")
     if wheel in json.loads(body)["releases"]:
@@ -306,9 +292,7 @@ def bumped_version(current: str, part: str) -> str:
     if part == "minor":
         return f"{major}.{minor + 1}.0"
     if part == "patch":
-        return (
-            f"{major}.{minor}.{patch}" if match[4] else f"{major}.{minor}.{patch + 1}"
-        )
+        return f"{major}.{minor}.{patch}" if match[4] else f"{major}.{minor}.{patch + 1}"
     if SEMVER.fullmatch(part) is None:
         raise CheckError(f"{part!r} is not an accepted SemVer release version")
     semver_key(part)
@@ -340,18 +324,11 @@ def check_bump_targets(version: str) -> str:
     if saved.exists():
         raise CheckError(f"{saved.relative_to(ROOT)}/ already exists")
     branch = f"release/v{version}"
-    if (
-        execute(
-            "git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
-        ).returncode
-        == 0
-    ):
+    if execute("git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
         raise CheckError(f"branch {branch} already exists locally")
     if run("git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"):
         raise CheckError(f"branch {branch} already exists on origin")
-    return (
-        f"{tag} and {saved.relative_to(ROOT)}/ do not exist; branch name is available"
-    )
+    return f"{tag} and {saved.relative_to(ROOT)}/ do not exist; branch name is available"
 
 
 def replace_package_version(manifest: str, version: str) -> None:
@@ -371,9 +348,7 @@ def update_version_references(current: str, version: str) -> list[str]:
             continue
         text = path.read_text()
         updated = DEPENDENCY_VERSION.sub(
-            lambda match: (
-                match[1] + new_minor + match[3] if match[2] == old_minor else match[0]
-            ),
+            lambda match: match[1] + new_minor + match[3] if match[2] == old_minor else match[0],
             text,
         )
         if updated != text:
@@ -463,11 +438,7 @@ def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
         references = update_version_references(current, version)
         print(
             "  ✓ version references: "
-            + (
-                ", ".join(references)
-                if references
-                else "no current-release snippets found"
-            )
+            + (", ".join(references) if references else "no current-release snippets found")
         )
         before_saved = run("git", "status", "--porcelain", "--", "tests/data/saved")
         if not step(
@@ -490,16 +461,18 @@ def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
             raise CheckError(f"{saved.relative_to(ROOT)}/ was not created with files")
         expected_status = f"?? tests/data/saved/{version}/"
         if after_saved.strip() != expected_status or before_saved:
-            raise CheckError(
-                "saved-model status changed outside the new version directory"
-            )
+            raise CheckError("saved-model status changed outside the new version directory")
         print(f"  ✓ saved models: {saved.relative_to(ROOT)}/ contains new files only")
         run("git", "add", "-A")
         run("git", "commit", "-m", f"chore(release): v{version}")
         run("git", "push", "-u", "origin", branch)
         print(f"  ✓ push: pushed {branch} to origin")
         if not no_pr:
-            body = f"## Release bump\n\nUpdated hessboost to `{version}`, refreshed Rust/Python lockfiles, and saved this version's native models.\n\nAfter merge, on `main`: `./release.py --dry-run` then `./release.py`."
+            body = (
+                f"## Release bump\n\nUpdated hessboost to `{version}`, refreshed Rust/Python "
+                "lockfiles, and saved this version's native models.\n\n"
+                "After merge, on `main`: `./release.py --dry-run` then `./release.py`."
+            )
             url = run(
                 "gh",
                 "pr",
@@ -518,7 +491,8 @@ def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
     except (CheckError, OSError, KeyError, ValueError) as err:
         if created:
             print(
-                f"\n✗ Release bump stopped: {err}\nBranch {branch} holds partial changes. Discard it with `git checkout main && git branch -D {branch}`.",
+                f"\n✗ Release bump stopped: {err}\nBranch {branch} holds partial changes. "
+                f"Discard it with `git checkout main && git branch -D {branch}`.",
                 file=sys.stderr,
             )
         else:
@@ -531,20 +505,14 @@ def main() -> int:
     commands = parser.add_subparsers(dest="command")
     bump_parser = commands.add_parser("bump", help="prepare and open a version-bump PR")
     bump_parser.add_argument("version", help="major, minor, patch, or explicit SemVer")
-    bump_parser.add_argument(
-        "--dry-run", action="store_true", help="show plan without changes"
-    )
+    bump_parser.add_argument("--dry-run", action="store_true", help="show plan without changes")
     bump_parser.add_argument("--yes", action="store_true", help="skip confirmation")
     bump_parser.add_argument(
         "--no-pr", action="store_true", help="push branch without opening a PR"
     )
-    parser.add_argument(
-        "tag_version", nargs="?", help="tag version; defaults to root Cargo.toml"
-    )
+    parser.add_argument("tag_version", nargs="?", help="tag version; defaults to root Cargo.toml")
     parser.add_argument("--dry-run", action="store_true", help="run tag checks only")
-    parser.add_argument(
-        "--yes", action="store_true", help="tag and push without asking"
-    )
+    parser.add_argument("--yes", action="store_true", help="tag and push without asking")
     args = parser.parse_args()
     if args.command == "bump":
         return bump(args.version, args.dry_run, args.yes, args.no_pr)
@@ -579,7 +547,10 @@ def main() -> int:
     commit = run("git", "log", "-1", "--format=%h %s")
     prerelease = " (marked prerelease)" if "-" in version else ""
     print(
-        f"\nRelease hessboost {version}\n  tag:    {tag} (annotated)\n  commit: {commit}\nPushing {tag} starts Publish: it validates, builds and verifies Python distributions, publishes hessboost {version} to crates.io and hessboost {pep440(version)} to PyPI, then creates a GitHub release{prerelease}."
+        f"\nRelease hessboost {version}\n  tag:    {tag} (annotated)\n  commit: {commit}\n"
+        f"Pushing {tag} starts Publish: it validates, builds and verifies Python "
+        f"distributions, publishes hessboost {version} to crates.io and hessboost "
+        f"{pep440(version)} to PyPI, then creates a GitHub release{prerelease}."
     )
     if args.dry_run:
         print("\nDry run: all checks passed; not tagging.")

@@ -9,6 +9,7 @@ use hessboost::prelude::*;
 use libfuzzer_sys::arbitrary::{Arbitrary, Error as ArbError, Result as ArbResult, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Map, Value, json};
+use std::num::NonZeroUsize;
 
 #[path = "common.rs"]
 mod common;
@@ -436,7 +437,7 @@ impl<'a> Arbitrary<'a> for Case {
 
 fn fit(case: &Case, nthread: usize) -> Option<BoostedModel> {
     let mut params = case.params.clone();
-    params.nthread = nthread;
+    params.nthread = NonZeroUsize::new(nthread);
     let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds);
     // gblinear refuses evaluation sets and early stopping; attaching them
     // would reject every linear case before it trains.

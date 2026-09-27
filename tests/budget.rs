@@ -3,6 +3,7 @@
 //! determinism, model compatibility, the objectives' pointwise losses, and
 //! the configuration contract.
 
+use hessboost::config::MaxDeltaStep;
 use hessboost::data::FeatureType;
 use hessboost::objective::{GradPair, Logistic, Multiclass, PseudoHuber, Tweedie};
 use hessboost::prelude::*;
@@ -500,7 +501,7 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
     let bounded = |objective| {
         TrainingParams::builder()
             .objective(objective)
-            .max_delta_step(0.5)
+            .max_delta_step(MaxDeltaStep::Bounded(0.5))
             .build()
             .unwrap()
     };

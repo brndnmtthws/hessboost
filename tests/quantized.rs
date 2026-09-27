@@ -78,9 +78,14 @@ fn quantized_with(
 fn quantized_training_is_identical_across_thread_counts() {
     let (x, y) = regression(30_000, 1, true);
     let d = labeled_dense(&x, FEATURES, &y);
-    let fit = |nthread: usize, seed: u64, policy: GrowPolicy| {
-        let params = quantized(TrainingParams::builder())
-            .nthread(nthread)
+    // `None` trains on the global pool.
+    let fit = |nthread: Option<usize>, seed: u64, policy: GrowPolicy| {
+        let builder = quantized(TrainingParams::builder());
+        let builder = match nthread {
+            Some(n) => builder.nthread(n),
+            None => builder.global_pool(),
+        };
+        let params = builder
             .seed(seed)
             .grow_policy(policy)
             .max_leaves(32)
@@ -91,11 +96,11 @@ fn quantized_training_is_identical_across_thread_counts() {
         train(&params, &d, 8).unwrap().predict(&d).unwrap()
     };
     for policy in [GrowPolicy::DepthWise, GrowPolicy::LossGuide] {
-        let serial = fit(1, 7, policy);
-        assert_eq!(serial, fit(6, 7, policy), "{policy:?}");
-        assert_eq!(serial, fit(0, 7, policy), "{policy:?}");
+        let serial = fit(Some(1), 7, policy);
+        assert_eq!(serial, fit(Some(6), 7, policy), "{policy:?}");
+        assert_eq!(serial, fit(None, 7, policy), "{policy:?}");
         // The rounding stream follows the seed.
-        assert_ne!(serial, fit(1, 8, policy), "{policy:?}");
+        assert_ne!(serial, fit(Some(1), 8, policy), "{policy:?}");
     }
 }
 

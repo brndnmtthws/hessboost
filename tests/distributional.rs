@@ -2,7 +2,7 @@
 //! calibration of the predicted distributions, metrics, serialization, and
 //! conformalized intervals.
 
-use hessboost::config::{MultiStrategy, TrainingParamsBuilder, TreeMethod};
+use hessboost::config::{MaxDeltaStep, MultiStrategy, TrainingParamsBuilder, TreeMethod};
 use hessboost::conformal::ConformalizedQuantile;
 use hessboost::metric::EvalMetric;
 use hessboost::objective::distributional::{
@@ -273,7 +273,7 @@ fn dist_poisson_trains_like_count_poisson_without_max_delta_step() {
     });
     let fit = |objective: Objective| {
         let p = params(objective)
-            .max_delta_step(0.0)
+            .max_delta_step(MaxDeltaStep::Unbounded)
             .base_score(2.0)
             .build()
             .unwrap();

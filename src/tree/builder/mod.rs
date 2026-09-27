@@ -10,6 +10,7 @@ mod hist;
 mod lightgbm;
 mod multi;
 mod oblivious;
+pub(crate) mod online;
 
 pub(crate) use exact::{ExactTreeBuilder, SortedColumns, all_rows};
 pub use hist::HistTreeBuilder;
@@ -19,6 +20,7 @@ pub(crate) use oblivious::check_symmetric_input;
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 use crate::K_RT_EPS;
 use crate::objective::GradPair;
@@ -29,10 +31,10 @@ use crate::tree::gain::{GradStats, RegParams, calc_gain, threshold_l1};
 use crate::tree::reuse::CategoricalPenalty;
 use crate::tree::{ChildLeaf, RegTree, SplitRule};
 
-/// The bound set by a `max_depth` / `max_leaves` style parameter, where `0`
-/// means unlimited.
-pub(super) fn limit_or_unbounded(limit: usize) -> usize {
-    if limit == 0 { usize::MAX } else { limit }
+/// The bound set by a `max_depth` / `max_leaves` style parameter, where
+/// `None` means unlimited.
+pub(super) fn limit_or_unbounded(limit: Option<NonZeroUsize>) -> usize {
+    limit.map_or(usize::MAX, NonZeroUsize::get)
 }
 
 /// The best split found so far for one node.

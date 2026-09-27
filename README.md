@@ -110,6 +110,7 @@ runnable programs live in [`examples/`](examples)
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
 | `budget` | budget training against default and tuned training |
+| `online_update` | adding and deleting training rows in place, and exact unlearning |
 | `pfn_boost` | boosting from a pretrained model's logits |
 | `metal` | CPU vs GPU prediction (macOS, `--features metal`) |
 
@@ -117,8 +118,8 @@ runnable programs live in [`examples/`](examples)
 
 [`python/`](python) holds the Python package (`pip install hessboost`),
 with XGBoost's Python API (`DMatrix`, `train`, `cv`, `Booster`),
-scikit-learn estimators, pandas categorical input, and the conformal and
-distributional extras:
+scikit-learn estimators, pandas categorical input, and the conformal,
+distributional, and in-place update extras:
 
 ```python
 import hessboost
@@ -161,6 +162,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
+| [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/) | add or delete training rows of a trained model (incremental learning, machine unlearning): exact, or approximate and faster than retraining for small changes, after Lin et al. |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
 | [LightGBM model import](https://docs.rs/hessboost/latest/hessboost/model/#lightgbm-import) | load LightGBM 4.x text models (`model.txt`) that predict, explain with SHAP, slice, and save like native ones, checked against LightGBM's predictions and `pred_contrib`; splits or objectives with no exact equivalent are refused |
 | LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), and symmetric trees |
@@ -171,6 +173,11 @@ Beyond XGBoost (opt-in, none changes default training):
 
 ## Caveats
 
+- Approximate in-place updates (`training::online`, tolerance > 0) stay close
+  to retraining without matching it, and pay off for small changes (1.3–4.8x
+  faster than retraining for 0.1–1% of the rows in its benchmarks; slower
+  beyond a few percent). Unlearning is exact only at tolerance 0, which
+  costs a retrain.
 - Randomized training (sampling, forests, DART) matches XGBoost's quality,
   not its trees: the random streams differ.
 - gblinear, custom-objective, `dist:*`, and linear-leaf models have no

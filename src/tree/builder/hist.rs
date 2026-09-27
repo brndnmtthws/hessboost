@@ -1391,7 +1391,7 @@ mod tests {
         let rows = all_rows(n);
         let params = TrainingParams::builder()
             .grow_policy(GrowPolicy::LossGuide)
-            .max_depth(0)
+            .unlimited_depth()
             .max_leaves(24)
             .build()
             .unwrap();
@@ -1473,7 +1473,7 @@ mod tests {
         let params = TrainingParams::builder()
             .grow_policy(GrowPolicy::LossGuide)
             .max_leaves(4)
-            .max_depth(0)
+            .unlimited_depth()
             .min_child_weight(0.0)
             .gamma(0.0)
             .lambda(0.0)

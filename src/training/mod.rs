@@ -7,6 +7,7 @@ mod continuation;
 mod cv;
 mod gblinear;
 mod multi_output;
+pub mod online;
 mod refresh;
 mod sampling;
 mod sglb;

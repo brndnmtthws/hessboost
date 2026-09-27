@@ -8,15 +8,18 @@
 //! converts arguments and results and releases the GIL around the work.
 //!
 //! The module declares free-threading support (`gil_used = false`): it has no
-//! `unsafe` code and no global mutable state, and every class is immutable
-//! (`frozen`). Models and matrices are shared read-only between threads;
-//! the Python layer swaps whole objects rather than mutating them.
+//! `unsafe` code and no global mutable state, and every class is `frozen`.
+//! Models and matrices are immutable and shared read-only between threads;
+//! the Python layer swaps whole objects rather than mutating them. The one
+//! exception, `OnlineModel`, updates in place under a mutex it only locks
+//! with the GIL released.
 
 mod booster;
 mod conformal;
 mod data;
 mod dist;
 mod errors;
+mod online;
 mod params;
 mod train;
 
@@ -30,6 +33,7 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<dist::Distributions>()?;
     m.add_class::<conformal::SplitConformal>()?;
     m.add_class::<conformal::ConformalizedQuantile>()?;
+    m.add_class::<online::OnlineModel>()?;
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
     m.add_function(wrap_pyfunction!(train::cv, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;

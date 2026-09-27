@@ -9,6 +9,6 @@ pub use groups::{
     ModelShrinkBuilder, ModelShrinkMode, QuantizedGrad, QuantizedGradBuilder, Refresh,
 };
 pub use params::{
-    BoosterKind, Device, GrowPolicy, MAX_SYMMETRIC_DEPTH, Monotone, MultiStrategy, ProcessType,
-    SamplingMethod, TrainingParams, TrainingParamsBuilder, TreeMethod,
+    BoosterKind, Device, GrowPolicy, MAX_SYMMETRIC_DEPTH, MaxDeltaStep, Monotone, MultiStrategy,
+    ProcessType, SamplingMethod, TrainingParams, TrainingParamsBuilder, TreeMethod,
 };

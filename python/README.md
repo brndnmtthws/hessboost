@@ -177,10 +177,28 @@ d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
 sglb = hessboost.train({"posterior_sampling": True}, hessboost.DMatrix(X_train, y_train), 1000)
 members, iterations = sglb.predict_virtual_ensembles(X_test, 10)   # (10, rows)
 u = sglb.predict_uncertainty(X_test, 10)   # u.knowledge rises off the training data
+
+from hessboost.online import OnlineModel
+
+online = OnlineModel.train({"tree_method": "hist", "max_depth": 6},
+                           hessboost.DMatrix(X_train, y_train), 100, tolerance=0.1)
+report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
+online.model.predict(X_test)   # online.data: the updated training rows
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
   (from two quantile models, two outputs of one, or a `dist:*` model).
+- `hessboost.online`: `OnlineModel` adds and deletes training rows of a
+  trained model in place (incremental learning, machine unlearning).
+  `tolerance=0` is exact: every update equals `hessboost.train` on
+  `online.data` bit for bit; `tolerance > 0` (default `0.1`) keeps splits
+  that still rank near the top and is faster than retraining for small
+  changes. `update(additions, deletions, callback=...)` returns an
+  `UpdateReport` (`nodes_kept`, `subtrees_regrown`, `rows_refreshed`), or
+  `None` when `callback(iteration)` returned `True`; a refused, stopped, or
+  interrupted (Ctrl-C) update changes nothing. `OnlineModel.from_model`
+  resumes from a saved `Booster` and its training data. Updates need `hist`
+  depth-wise trees without sampling or constraints and unweighted data.
 - `hessboost.folds`: `k_fold`, `forward_chaining` (expanding-window,
   purged by a row `gap`), and `purged_forward` (timestamped rows, purged
   by each row's own label window, for overlapping or irregular horizons)

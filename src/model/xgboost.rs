@@ -1344,7 +1344,7 @@ fn strict_nonnegative_integer_array(v: &Value, key: &str) -> Result<Vec<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BoosterKind, Dart, TrainingParams};
+    use crate::config::{BoosterKind, Dart, MaxDeltaStep, TrainingParams};
     use crate::data::{DMatrix, FeatureType};
     use crate::objective::{Aft, LambdaRank, Logistic, PseudoHuber, Tweedie};
     use crate::objective::{Objective, Quantiles};
@@ -2210,7 +2210,8 @@ mod tests {
                 },
             ),
             (
-                b().objective(Objective::Poisson).max_delta_step(0.3),
+                b().objective(Objective::Poisson)
+                    .max_delta_step(MaxDeltaStep::Bounded(0.3)),
                 &d,
                 "poisson_regression_param",
                 "max_delta_step",

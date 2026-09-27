@@ -441,15 +441,19 @@ fn unsupported_vector_layouts_are_rejected() {
         "multi_strategy"
     );
     // The opt-in growth modes that bypass the vector-leaf split search.
+    // Set directly, unvalidated: `train` itself must refuse them.
+    let unchecked = |edit: fn(&mut TrainingParams)| {
+        let mut params = vector_params().build().unwrap();
+        edit(&mut params);
+        params
+    };
     for (params, name) in [
         (
-            vector_params()
-                .grow_policy(GrowPolicy::Symmetric)
-                .build_unchecked(),
+            unchecked(|p| p.grow_policy = GrowPolicy::Symmetric),
             "grow_policy",
         ),
         (
-            vector_params().toad_penalty_feature(0.1).build_unchecked(),
+            unchecked(|p| p.toad_penalty_feature = 0.1),
             "toad_penalty_feature",
         ),
     ] {

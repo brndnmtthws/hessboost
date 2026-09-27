@@ -35,6 +35,8 @@ pub(super) struct RoundState<'a> {
     pub(super) reuse: Option<ReuseSet>,
     /// SGLB's noisy structure gradients, `[row][n_out]` (empty otherwise).
     pub(super) noisy_gpair: Vec<GradPair>,
+    /// Every training row, ascending: the rows of an unsampled round.
+    pub(super) all_rows: Vec<u32>,
 }
 
 /// `process_type=update`: refresh iteration `iteration`'s trees of `queue`
@@ -102,7 +104,7 @@ pub(super) fn grow_round(
         &mut state.gpair,
     );
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
-    let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
+    let weight = dart_new_tree_weight(dropped.as_ref(), params);
     // SGLB: the structure is searched on noisy gradients; `state.gpair`
     // keeps the noise-free ones the leaves are re-estimated from.
     let structure: &[GradPair] = match run.langevin {
@@ -114,8 +116,13 @@ pub(super) fn grow_round(
 
     // 2. Row subsets (uniform, class-balanced, or by query), drawn before
     //    the trees and shared across the per-output fits.
-    let row_subsets =
-        iteration_row_subsets(n, params, prepared.samples_per_forest(), run.rows, &mut rng);
+    let row_subsets = iteration_row_subsets(
+        params,
+        prepared.samples_per_forest(),
+        run.rows,
+        &state.all_rows,
+        &mut rng,
+    );
     // An output's gradient-based sample, when its whole forest shares one.
     let mut forest_sample = None;
     let forest_indices = prepared.forest_indices(n_out, parallel);
@@ -133,7 +140,7 @@ pub(super) fn grow_round(
     //    output-major like XGBoost's layout.
     let slots: Vec<TreeSlot> = (0..n_out * parallel)
         .map(|slot| {
-            let row_subset = &row_subsets[(slot % parallel) % row_subsets.len()];
+            let row_subset = row_subsets.rows(slot % parallel);
             // Retaining the final row partitions replaces per-row tree
             // traversals of the raw feature matrix with one sequential pass
             // per leaf: the training margin update's, when every row took

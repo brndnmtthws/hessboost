@@ -16,6 +16,7 @@ use crate::objective::{GradPair, Loss};
 use crate::training::continuation::{require_model_for_update, resume_model};
 use crate::training::multi_output;
 use crate::training::sglb::{Sglb, Shrink};
+use crate::tree::builder::all_rows;
 use crate::tree::reuse::ReuseSet;
 
 /// Run `train` on a dedicated pool of `params.nthread` threads, or on the
@@ -234,6 +235,7 @@ fn train_trees<'a>(
         },
         reuse,
         noisy_gpair: Vec::new(),
+        all_rows: all_rows(n),
     };
     if start_iteration > 0
         && let RoundPlan::Grow(prepared) = &plan
@@ -271,6 +273,7 @@ fn train_trees<'a>(
                     &multi_output::VectorRound {
                         run: run.ctx,
                         ghist,
+                        all_rows: &state.all_rows,
                     },
                     &mut state.model,
                     iteration,

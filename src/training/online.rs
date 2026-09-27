@@ -126,6 +126,7 @@ use std::ops::ControlFlow;
 
 use super::api::{RoundEval, Trainer};
 use super::eval::configured_metrics;
+use super::margins::{TreeOutput, add_tree_margins};
 use super::train::{initial_intercepts, with_thread_pool};
 use super::validate::{validate_trained_model, validate_training_data};
 use crate::config::{
@@ -915,9 +916,7 @@ impl Cache {
                 grads.iter().copied().enumerate(),
                 &mut nodes,
             );
-            for (row, m) in margins.iter_mut().enumerate() {
-                *m += tree.predict_row(data, row);
-            }
+            add_tree_margins(tree, data, &mut margins, 1, TreeOutput::Scalar(0));
             trees.push(TreeCache { nodes, grads });
         }
         let dense = ghist.dense_stride().is_some();

@@ -100,44 +100,74 @@ impl<'a> RowMeta<'a> {
 /// the whole forest when `per_forest` (`approx`,
 /// [`Prepared::samples_per_forest`](super::prepare::Prepared::samples_per_forest)) or when there is no row sampling
 /// (every tree then reads all rows, and [`sample_rows`] draws nothing).
-/// Parallel tree `p` uses entry `p % len`, shared across its per-output
-/// fits. With query bagging each subset is the rows of the query groups
-/// (the whole matrix without any) a draw keeps.
-pub(super) fn iteration_row_subsets(
-    n: usize,
+/// Parallel tree `p` uses [`RoundRows::rows`]`(p)`, shared across its
+/// per-output fits. With query bagging each subset is the rows of the
+/// query groups (the whole matrix without any) a draw keeps. `all` is
+/// every training row, ascending, which an unsampled round borrows.
+pub(super) fn iteration_row_subsets<'a>(
     params: &TrainingParams,
     per_forest: bool,
     meta: RowMeta<'_>,
+    all: &'a [u32],
     rng: &mut Rng,
-) -> Vec<Vec<u32>> {
+) -> RoundRows<'a> {
+    let n = all.len();
     let samples = params.sampling_method == SamplingMethod::Uniform
         && (params.subsample < 1.0
             || params.balanced_bagging.is_some()
             || params.bagging_by_query.is_some());
-    let draws = if per_forest || !samples {
+    if !samples {
+        // `sample_rows` would return every row without a draw (query
+        // bagging always samples: it requires uniform sampling).
+        return RoundRows::All(all);
+    }
+    let draws = if per_forest {
         1
     } else {
         params.num_parallel_tree
     };
     let Some(bagging) = params.bagging_by_query else {
-        return (0..draws)
-            .map(|_| sample_rows(n, params, meta, rng))
-            .collect();
+        return RoundRows::Sampled(
+            (0..draws)
+                .map(|_| sample_rows(n, params, meta, rng))
+                .collect(),
+        );
     };
     let queries: Vec<(usize, usize)> = meta
         .group
         .map_or_else(|| vec![(0, n)], |group| group.iter_ranges().collect());
-    (0..draws)
-        .map(|_| {
-            bernoulli_sample(queries.len(), bagging.fraction(), rng)
-                .into_iter()
-                .flat_map(|query| {
-                    let (start, end) = queries[query as usize];
-                    start as u32..end as u32
-                })
-                .collect()
-        })
-        .collect()
+    RoundRows::Sampled(
+        (0..draws)
+            .map(|_| {
+                bernoulli_sample(queries.len(), bagging.fraction(), rng)
+                    .into_iter()
+                    .flat_map(|query| {
+                        let (start, end) = queries[query as usize];
+                        start as u32..end as u32
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// One iteration's row subsets ([`iteration_row_subsets`]).
+#[derive(Debug, PartialEq)]
+pub(super) enum RoundRows<'a> {
+    /// No row sampling: every tree reads every row (ascending).
+    All(&'a [u32]),
+    /// The drawn subsets, one per draw.
+    Sampled(Vec<Vec<u32>>),
+}
+
+impl RoundRows<'_> {
+    /// The rows parallel tree `parallel` grows on.
+    pub(super) fn rows(&self, parallel: usize) -> &[u32] {
+        match self {
+            RoundRows::All(all) => all,
+            RoundRows::Sampled(subsets) => &subsets[parallel % subsets.len()],
+        }
+    }
 }
 
 /// Whether trees are grown on gradient-based (MVS) row samples.
@@ -175,6 +205,7 @@ mod tests {
         let group_sizes = vec![3, 7, 2, 8, 4, 5, 6];
         let group = GroupInfo::from_sizes(&group_sizes);
         let n: usize = group_sizes.iter().sum();
+        let all = all_rows(n);
         let params = TrainingParams::builder()
             .objective(Objective::RankNdcg(LambdaRank::default()))
             .bagging_by_query(crate::config::QueryBagging::new(0.5).unwrap())
@@ -188,7 +219,6 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 iteration_row_subsets(
-                    n,
                     &params,
                     false,
                     RowMeta {
@@ -196,13 +226,14 @@ mod tests {
                         positives: 0,
                         group: Some(&group),
                     },
+                    &all,
                     &mut Rng::new(41),
                 )
             })
         };
         let one = select(1);
         assert_eq!(one, select(4));
-        let selected = &one[0];
+        let selected = one.rows(0);
         assert!(!selected.is_empty() && selected.len() < n);
         for (query, (start, end)) in group.iter_ranges().enumerate() {
             let included = selected

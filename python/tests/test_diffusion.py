@@ -142,15 +142,18 @@ def test_every_format_round_trips_bit_for_bit(
         assert other.n_steps == model.n_steps
 
 
-def test_n_steps_swaps_in_a_copy(fitted: tuple[DiffusionModel, NDArray[np.float64]]) -> None:
+def test_sample_steps_override_the_stored_default(
+    fitted: tuple[DiffusionModel, NDArray[np.float64]],
+) -> None:
     model, x = fitted
-    copy = pickle.loads(pickle.dumps(model))
-    copy.n_steps = 12
-    assert (copy.n_steps, model.n_steps) == (12, 5)
-    assert not np.array_equal(copy.sample(x[:2], 10), model.sample(x[:2], 10))
-    assert DiffusionModel.from_bytes(copy.to_bytes()).n_steps == 12
+    assert model.n_steps == 5
+    np.testing.assert_array_equal(model.sample(x[:2], 10, n_steps=5), model.sample(x[:2], 10))
+    assert not np.array_equal(model.sample(x[:2], 10, n_steps=12), model.sample(x[:2], 10))
+    assert model.n_steps == 5
     with pytest.raises(HessboostError, match="n_steps"):
-        copy.n_steps = 0
+        model.sample(x[:2], 10, n_steps=0)
+    with pytest.raises(AttributeError):
+        setattr(model, "n_steps", 12)  # noqa: B010
 
 
 def test_summaries_match_numpy(fitted: tuple[DiffusionModel, NDArray[np.float64]]) -> None:

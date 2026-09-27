@@ -13,7 +13,7 @@
 
 use std::time::Instant;
 
-use hessboost::diffusion::{DiffusionModel, DiffusionParams, Samples};
+use hessboost::diffusion::{DiffusionModel, DiffusionParams, SampleOptions, Samples};
 use hessboost::objective::distributional::{DistFamily, Distributional};
 use hessboost::prelude::*;
 
@@ -116,7 +116,7 @@ fn report(name: &str, params: &DiffusionParams, train: &DMatrix, test: &DMatrix)
     let model = DiffusionModel::fit(params, train)?;
     let fit_time = start.elapsed();
     let start = Instant::now();
-    let samples = model.sample(test, 100, 1)?;
+    let samples = model.sample(test, 100, &SampleOptions::seeded(1))?;
     let sample_time = start.elapsed();
     let labels = test.labels().unwrap_or_default();
     println!(
@@ -147,7 +147,7 @@ fn main() -> Result<()> {
     // Where do the draws land? Two probe rows, x = 0.1 and x = 0.9.
     let model = DiffusionModel::fit(&DiffusionParams::default(), &train)?;
     let probes = DMatrix::from_dense(&[0.1, 0.9], 2, 1)?;
-    let samples = model.sample(&probes, 2000, 3)?;
+    let samples = model.sample(&probes, 2000, &SampleOptions::seeded(3))?;
     let q = samples.quantiles(&[0.1, 0.25, 0.5, 0.75, 0.9])?;
     for (row, x) in [0.1, 0.9].into_iter().enumerate() {
         println!(
@@ -186,7 +186,7 @@ fn main() -> Result<()> {
     let data = DMatrix::from_dense(&x, n, 1)?.with_label_matrix(&y, 2)?;
     let model = DiffusionModel::fit(&DiffusionParams::treeffuser(), &data)?;
     let probe = DMatrix::from_dense(&[0.5], 1, 1)?;
-    let draws = model.sample(&probe, 2000, 4)?;
+    let draws = model.sample(&probe, 2000, &SampleOptions::seeded(4))?;
     let pairs: Vec<(f64, f64)> = draws
         .as_slice()
         .as_chunks::<2>()
@@ -220,12 +220,12 @@ fn main() -> Result<()> {
     let from_bytes = DiffusionModel::from_bytes(&model.to_bytes()?)?;
     let from_json = DiffusionModel::from_json(&model.to_json()?)?;
     assert_eq!(
-        from_bytes.sample(&probe, 50, 9)?,
-        model.sample(&probe, 50, 9)?
+        from_bytes.sample(&probe, 50, &SampleOptions::seeded(9))?,
+        model.sample(&probe, 50, &SampleOptions::seeded(9))?
     );
     assert_eq!(
-        from_json.sample(&probe, 50, 9)?,
-        model.sample(&probe, 50, 9)?
+        from_json.sample(&probe, 50, &SampleOptions::seeded(9))?,
+        model.sample(&probe, 50, &SampleOptions::seeded(9))?
     );
     println!(
         "saved: {} bytes native, {} bytes JSON; reloaded samples match",

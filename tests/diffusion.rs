@@ -8,8 +8,8 @@ use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
 use hessboost::diffusion::{
-    DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, Samples, ScoreConfig,
-    Sde,
+    DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, SampleOptions, Samples,
+    ScoreConfig, Sde,
 };
 use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
@@ -59,7 +59,9 @@ fn samples_recover_both_modes() {
         quick(DiffusionParams::flow_matching()),
     ] {
         let model = DiffusionModel::fit(&params, &data).unwrap();
-        let samples = model.sample(&probe, 400, 3).unwrap();
+        let samples = model
+            .sample(&probe, 400, &SampleOptions::seeded(3))
+            .unwrap();
         for (row, x) in [0.2f32, 0.8].into_iter().enumerate() {
             let draws = samples.row(row).unwrap();
             let mode = 1.0 + x;
@@ -104,7 +106,9 @@ fn multivariate_labels_are_sampled_jointly() {
         .unwrap();
     let model = DiffusionModel::fit(&quick(DiffusionParams::default()), &data).unwrap();
     assert_eq!(model.n_outputs(), 2);
-    let samples = model.sample(&probes(&[0.5]), 300, 5).unwrap();
+    let samples = model
+        .sample(&probes(&[0.5]), 300, &SampleOptions::seeded(5))
+        .unwrap();
     assert_eq!(samples.as_slice().len(), 300 * 2);
     let aligned = samples
         .as_slice()
@@ -123,34 +127,68 @@ fn fitting_and_sampling_ignore_the_thread_count() {
     let run = |threads| {
         with_threads(threads, || {
             let model = DiffusionModel::fit(&quick(DiffusionParams::default()), &data).unwrap();
-            model.sample(&probe, 50, 11).unwrap()
+            model
+                .sample(&probe, 50, &SampleOptions::seeded(11))
+                .unwrap()
         })
     };
     assert_eq!(run(1), run(4));
+}
+
+/// A per-call step count samples exactly as a model trained to take that
+/// many steps by default; without one, the model's own count applies.
+#[test]
+fn per_call_step_counts_override_the_stored_default() {
+    let data = bimodal(200, 2);
+    let probe = probes(&[0.3, 0.7]);
+    let mut three = quick(DiffusionParams::flow_matching());
+    three.n_steps = nz(3);
+    let stored = DiffusionModel::fit(&three, &data).unwrap();
+    let model = DiffusionModel::fit(&quick(DiffusionParams::flow_matching()), &data).unwrap();
+    assert_eq!(model.n_steps(), nz(5));
+    let options = SampleOptions::seeded(4);
+    let overridden = model
+        .sample(&probe, 20, &options.with_n_steps(nz(3)))
+        .unwrap();
+    assert_eq!(overridden, stored.sample(&probe, 20, &options).unwrap());
+    assert_ne!(overridden, model.sample(&probe, 20, &options).unwrap());
 }
 
 #[test]
 fn draws_depend_only_on_their_row_and_sample_index() {
     let data = bimodal(300, 3);
     let model = DiffusionModel::fit(&quick(DiffusionParams::flow_matching()), &data).unwrap();
-    let all = model.sample(&probes(&[0.1, 0.5, 0.9]), 30, 7).unwrap();
+    let all = model
+        .sample(&probes(&[0.1, 0.5, 0.9]), 30, &SampleOptions::seeded(7))
+        .unwrap();
     // Fewer samples: a prefix of each row's draws.
-    let fewer = model.sample(&probes(&[0.1, 0.5, 0.9]), 10, 7).unwrap();
+    let fewer = model
+        .sample(&probes(&[0.1, 0.5, 0.9]), 10, &SampleOptions::seeded(7))
+        .unwrap();
     for row in 0..3 {
         assert_eq!(fewer.row(row).unwrap(), &all.row(row).unwrap()[..10]);
     }
     // Fewer rows: the same draws for the rows kept.
-    let first = model.sample(&probes(&[0.1]), 30, 7).unwrap();
+    let first = model
+        .sample(&probes(&[0.1]), 30, &SampleOptions::seeded(7))
+        .unwrap();
     assert_eq!(first.row(0), all.row(0));
     // Another seed: other draws.
-    assert_ne!(model.sample(&probes(&[0.1]), 30, 8).unwrap(), first);
+    assert_ne!(
+        model
+            .sample(&probes(&[0.1]), 30, &SampleOptions::seeded(8))
+            .unwrap(),
+        first
+    );
 }
 
 #[test]
 fn stored_draws_rebuild_their_samples() {
     let data = bimodal(300, 5);
     let model = DiffusionModel::fit(&quick(DiffusionParams::flow_matching()), &data).unwrap();
-    let samples = model.sample(&probes(&[0.2, 0.6, 0.9]), 40, 1).unwrap();
+    let samples = model
+        .sample(&probes(&[0.2, 0.6, 0.9]), 40, &SampleOptions::seeded(1))
+        .unwrap();
     let rebuilt = Samples::new(samples.as_slice().to_vec(), 40, 1).unwrap();
     assert_eq!(rebuilt, samples);
     assert_eq!(rebuilt.n_rows(), 3);
@@ -199,7 +237,7 @@ fn both_formats_round_trip_the_sampler() {
         quick(DiffusionParams::flow_matching()),
     ] {
         let model = DiffusionModel::fit(&params, &data).unwrap();
-        let expected = model.sample(&probe, 20, 1).unwrap();
+        let expected = model.sample(&probe, 20, &SampleOptions::seeded(1)).unwrap();
         let bytes = model.to_bytes().unwrap();
         let from_bytes = DiffusionModel::from_bytes(&bytes).unwrap();
         assert!(
@@ -210,7 +248,12 @@ fn both_formats_round_trip_the_sampler() {
         for loaded in [&from_bytes, &from_json] {
             assert_eq!(loaded.method(), model.method());
             assert_eq!(loaded.n_steps(), model.n_steps());
-            assert_eq!(loaded.sample(&probe, 20, 1).unwrap(), expected);
+            assert_eq!(
+                loaded
+                    .sample(&probe, 20, &SampleOptions::seeded(1))
+                    .unwrap(),
+                expected
+            );
         }
     }
 }
@@ -342,9 +385,14 @@ fn single_label_boosters_train_on_one_label_column() {
         );
         params.early_stopping = None;
         let model = DiffusionModel::fit(&params, &data).unwrap();
-        let samples = model.sample(&probe, 50, 1).unwrap();
+        let samples = model.sample(&probe, 50, &SampleOptions::seeded(1)).unwrap();
         let reloaded = DiffusionModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
-        assert_eq!(reloaded.sample(&probe, 50, 1).unwrap(), samples);
+        assert_eq!(
+            reloaded
+                .sample(&probe, 50, &SampleOptions::seeded(1))
+                .unwrap(),
+            samples
+        );
         assert!(matches!(
             DiffusionModel::fit(&params, &wide),
             Err(HessboostError::InvalidParameter { .. })
@@ -440,18 +488,18 @@ fn unsupported_inputs_are_refused() {
     );
     let model = DiffusionModel::fit(&quick(DiffusionParams::treeffuser()), &small).unwrap();
     assert_eq!(
-        invalid_param(model.sample(&probes(&[0.5]), 0, 1)),
+        invalid_param(model.sample(&probes(&[0.5]), 0, &SampleOptions::seeded(1))),
         "n_samples"
     );
     // Requests too large to allocate are refused, not a capacity-overflow
     // panic: the samples, and the noisy training set (whose element count
     // fits in `usize` but whose bytes exceed `isize::MAX`).
     assert_eq!(
-        invalid_param(model.sample(&probes(&[0.5]), usize::MAX, 1)),
+        invalid_param(model.sample(&probes(&[0.5]), usize::MAX, &SampleOptions::seeded(1))),
         "n_samples"
     );
     assert_eq!(
-        invalid_param(model.sample(&probes(&[0.5]), usize::MAX / 2, 1)),
+        invalid_param(model.sample(&probes(&[0.5]), usize::MAX / 2, &SampleOptions::seeded(1))),
         "n_samples"
     );
     for n_repeats in [usize::MAX, (1usize << 62) / (50 * 4)] {
@@ -465,7 +513,11 @@ fn unsupported_inputs_are_refused() {
         );
     }
     assert!(matches!(
-        model.sample(&DMatrix::from_dense(&[0.5, 0.5], 1, 2).unwrap(), 5, 1),
+        model.sample(
+            &DMatrix::from_dense(&[0.5, 0.5], 1, 2).unwrap(),
+            5,
+            &SampleOptions::seeded(1)
+        ),
         Err(HessboostError::DimensionMismatch { .. })
     ));
 }

@@ -4,7 +4,7 @@ AISTATS 2024).
 
 A :class:`ForestModel` learns the joint distribution of a table's columns,
 optionally per class of a label, with one GBDT per noise level (and per
-class). It then generates new rows, and a diffusion model also imputes the
+class). It then samples new rows, and a diffusion model also imputes the
 missing (NaN) entries of rows, any number of times, keeping the observed
 ones::
 
@@ -12,9 +12,9 @@ ones::
 
     params = ForestParams(column_kinds=["continuous", "integer", "categorical"])
     model = ForestModel.fit(params, X)
-    values, labels = model.generate(1000, seed=0)  # (1000, columns) float32, None
+    synthetic = model.sample(1000, seed=0)  # ForestSamples: (1000, columns) float32, None
 
-    model = ForestModel.fit(ForestParams.diffusion(), X_with_nans)
+    model = ForestModel.fit(ForestParams.forest_diffusion(), X_with_nans)
     filled = model.impute(X_with_nans, n_imputations=5, seed=0)  # (5, rows, columns)
 
 Columns are encoded by their :data:`ColumnKind` (categorical columns as
@@ -59,6 +59,7 @@ __all__ = [
     "ForestMethod",
     "ForestModel",
     "ForestParams",
+    "ForestSamples",
     "Repaint",
 ]
 
@@ -110,7 +111,7 @@ class Repaint:
 
 
 def _default_training() -> Mapping[str, Any]:
-    training: dict[str, Any] = _hessboost.ForestParams.preset("default")["training"]
+    training: dict[str, Any] = _hessboost.ForestParams.preset("forest_flow")["training"]
     return training
 
 
@@ -203,17 +204,32 @@ class ForestParams:
         )
 
     @classmethod
-    def default(cls) -> Self:
-        """The reference's ForestFlow configuration: 50 noise levels, 100
-        copies of each row, 100 rounds of depth-7 ``hist`` trees with
-        ``eta = 0.3`` and ``lambda = 0``."""
-        return cls._preset("default")
+    def forest_flow(cls) -> Self:
+        """The reference's ForestFlow configuration (the defaults): 50 noise
+        levels, 100 copies of each row, 100 rounds of depth-7 ``hist`` trees
+        with ``eta = 0.3`` and ``lambda = 0``."""
+        return cls._preset("forest_flow")
 
     @classmethod
-    def diffusion(cls) -> Self:
-        """The reference's ForestDiffusion configuration: :meth:`default`
+    def forest_diffusion(cls) -> Self:
+        """The reference's ForestDiffusion configuration: :meth:`forest_flow`
         with :class:`Diffusion` (``β`` from 0.1 to 8)."""
-        return cls._preset("diffusion")
+        return cls._preset("forest_diffusion")
+
+
+@dataclass(frozen=True)
+class ForestSamples:
+    """Synthetic rows from :meth:`ForestModel.sample` or
+    :meth:`ForestModel.sample_for_labels`.
+
+    Attributes:
+        values: ``(rows, n_columns)`` ``float32``.
+        labels: Each row's class label, ``(rows,)`` ``float32``, for a
+            class-conditional model (else ``None``).
+    """
+
+    values: NDArray[np.float32]
+    labels: NDArray[np.float32] | None
 
 
 class ForestModel:
@@ -283,31 +299,29 @@ class ForestModel:
             matrix._categories,
         )
 
-    def generate(
-        self, n_rows: int, *, seed: int = 0
-    ) -> tuple[NDArray[np.float32], NDArray[np.float32] | None]:
-        """``n_rows`` synthetic rows: ``(values, labels)`` with ``values``
-        ``(n_rows, n_columns)`` ``float32`` and, for a class-conditional
-        model, each row's label drawn from the training proportions,
-        ``(n_rows,)`` (else ``None``).
+    def sample(self, n_rows: int, *, seed: int = 0) -> ForestSamples:
+        """``n_rows`` synthetic rows, ``(n_rows, n_columns)``, with each
+        row's label drawn from the training proportions for a
+        class-conditional model (else ``labels`` is ``None``).
 
         Raises:
             HessboostError: ``n_rows`` is 0 or too large, or the sampler
                 diverges.
         """
-        return self._core.generate(_count("n_rows", n_rows), _count("seed", seed))
+        values, labels = self._core.sample(_count("n_rows", n_rows), _count("seed", seed))
+        return ForestSamples(values, labels)
 
-    def generate_for_labels(self, labels: ArrayLike, *, seed: int = 0) -> NDArray[np.float32]:
+    def sample_for_labels(self, labels: ArrayLike, *, seed: int = 0) -> ForestSamples:
         """One synthetic row per entry of ``labels``, from that class's
-        model, ``(len(labels), n_columns)`` ``float32``.
+        model, ``(len(labels), n_columns)``, labelled with them.
 
         Raises:
             HessboostError: The model is unconditional, ``labels`` is empty,
                 or holds a label the model was not trained on.
         """
         classes = np.ascontiguousarray(np.asarray(labels, dtype=np.float32).reshape(-1))
-        values, _ = self._core.generate_for_labels(classes, _count("seed", seed))
-        return values
+        values, drawn = self._core.sample_for_labels(classes, _count("seed", seed))
+        return ForestSamples(values, drawn)
 
     def impute(
         self,

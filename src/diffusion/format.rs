@@ -1,6 +1,6 @@
 //! The diffusion model's native binary and JSON formats.
 //!
-//! Binary: the native model container ([`crate::model::native`]) with magic
+//! Binary: the shared model container ([`crate::model::container`]) with magic
 //! `HBDM` and its own version byte, zstd-compressed:
 //!
 //! ```text
@@ -26,12 +26,18 @@ use super::{
 };
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::model::native::{frame, pack, section_table, unpack, write_container};
-use crate::model::sections::{Sections, Writer, format_error};
+use crate::model::container::{ContainerSpec, WRITER, read_models, write_models};
+use crate::model::native::write_container;
+use crate::model::sections::{REQUIRED, Sections, Writer, format_error, unknown_value as unknown};
 
-const MAGIC: &[u8; 4] = b"HBDM";
-const VERSION: u8 = 1;
-const WRITER: &str = concat!("hessboost ", env!("CARGO_PKG_VERSION"));
+/// The diffusion model container.
+const HBDM: ContainerSpec = ContainerSpec {
+    magic: *b"HBDM",
+    version: 1,
+    what: "diffusion model",
+    known: |name| KNOWN.contains(&name),
+    legacy: None,
+};
 
 /// Every section this version reads.
 const KNOWN: &[&str] = &[
@@ -145,34 +151,23 @@ pub(super) fn write(model: &DiffusionModel) -> Result<Vec<u8>> {
             f64::to_le_bytes,
         );
         w.array("residual.scale", r.scale.iter().copied(), f64::to_le_bytes);
-        let mut lengths = Vec::with_capacity(r.models.len());
-        let mut models = Vec::new();
-        for m in &r.models {
-            let bytes = write_container(m)?;
-            lengths.push(bytes.len() as u64);
-            models.extend_from_slice(&bytes);
-        }
+        let (lengths, models) = write_models(&r.models)?;
         w.array("residual.model_lengths", lengths, u64::to_le_bytes);
-        w.raw("residual.models", crate::model::sections::REQUIRED, &models);
+        w.raw_owned("residual.models", REQUIRED, models);
     }
-    w.raw(
+    w.raw_owned(
         "regressor.model",
-        crate::model::sections::REQUIRED,
-        &write_container(&model.regressor)?,
+        REQUIRED,
+        write_container(&model.regressor)?,
     );
-    pack(frame(*MAGIC, VERSION, w))
+    HBDM.seal(w)
 }
 
 pub(super) fn read(bytes: &[u8]) -> Result<DiffusionModel> {
-    let container = unpack(bytes)?;
-    let table = section_table(&container, *MAGIC, VERSION, "diffusion model")?;
-    let (s, rest) = Sections::parse(table, |name| KNOWN.contains(&name))?;
-    if !rest.is_empty() {
-        return Err(format_error(format!(
-            "{} unexpected bytes after the last section",
-            rest.len()
-        )));
-    }
+    HBDM.read(bytes, read_model)
+}
+
+fn read_model(s: &Sections) -> Result<DiffusionModel> {
     let time_sampling = match s.str("time.sampling")? {
         "uniform" => TimeSampling::Uniform,
         "log_noise_normal" => TimeSampling::LogNoiseNormal {
@@ -243,25 +238,13 @@ pub(super) fn read(bytes: &[u8]) -> Result<DiffusionModel> {
     };
     let n_outputs = s.usize("diffusion.n_outputs")?;
     let residualizer = if s.has("residual.models") {
-        let lengths = s.array("residual.model_lengths", u64::from_le_bytes)?;
-        let mut blob = s.bytes("residual.models")?;
-        let mut models = Vec::with_capacity(lengths.len());
-        for len in lengths {
-            let len = usize::try_from(len)
-                .ok()
-                .filter(|&len| len <= blob.len())
-                .ok_or_else(|| format_error("section `residual.model_lengths` is out of range"))?;
-            let (model, rest) = blob.split_at(len);
-            models.push(BoostedModel::from_bytes(model)?);
-            blob = rest;
-        }
-        if !blob.is_empty() {
-            return Err(format_error(
-                "section `residual.models` has bytes past its models",
-            ));
-        }
         Some(FittedResidualizer {
-            models,
+            models: read_models(
+                &s.array("residual.model_lengths", u64::from_le_bytes)?,
+                s.bytes("residual.models")?,
+                "residual.model_lengths",
+                "residual.models",
+            )?,
             center: s.array_exact("residual.center", n_outputs, f64::from_le_bytes)?,
             scale: s.array_exact("residual.scale", n_outputs, f64::from_le_bytes)?,
         })
@@ -281,10 +264,6 @@ pub(super) fn read(bytes: &[u8]) -> Result<DiffusionModel> {
     };
     model.validate()?;
     Ok(model)
-}
-
-fn unknown(name: &str, value: &str) -> HessboostError {
-    format_error(format!("unknown `{name}` value `{value}`"))
 }
 
 /// The serialized fields of a [`DiffusionModel`] (its JSON format), before

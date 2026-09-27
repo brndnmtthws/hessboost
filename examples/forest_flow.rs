@@ -11,7 +11,9 @@
 
 use std::num::NonZeroUsize;
 
-use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams, Repaint};
+use hessboost::diffusion::forest::{
+    ColumnKind, ForestModel, ForestParams, ImputeOptions, NoiseLevels, Repaint,
+};
 use hessboost::prelude::*;
 
 mod common;
@@ -89,12 +91,12 @@ fn main() -> Result<()> {
 
     let mut params = ForestParams::default();
     params.column_kinds = Some(kinds.clone());
-    params.n_t = 20;
+    params.n_t = NoiseLevels::new(20).unwrap();
     params.duplicate_k = NonZeroUsize::new(50).unwrap();
     let start = std::time::Instant::now();
     let flow = ForestModel::fit(&params, &data)?;
     println!("ForestFlow: fitted in {:.1?}", start.elapsed());
-    let synthetic = flow.generate(n, 7)?;
+    let synthetic = flow.sample(n, 7)?;
     let labels = synthetic.labels().unwrap_or_default();
     println!("real:");
     for line in summary(&x, &y) {
@@ -126,9 +128,9 @@ fn main() -> Result<()> {
         })
         .collect();
     let holes = masked.iter().filter(|v| v.is_nan()).count();
-    let mut params = ForestParams::diffusion();
+    let mut params = ForestParams::forest_diffusion();
     params.column_kinds = Some(kinds);
-    params.n_t = 20;
+    params.n_t = NoiseLevels::new(20).unwrap();
     params.duplicate_k = NonZeroUsize::new(50).unwrap();
     let start = std::time::Instant::now();
     let diffusion = ForestModel::fit(
@@ -140,7 +142,11 @@ fn main() -> Result<()> {
         start.elapsed()
     );
     let incomplete = DMatrix::from_dense(&masked, n, COLS)?.with_labels(&y)?;
-    let imputations = diffusion.impute(&incomplete, 1, Some(Repaint::default()), 3)?;
+    let imputations = diffusion.impute(
+        &incomplete,
+        1,
+        &ImputeOptions::seeded(3).with_repaint(Repaint::default()),
+    )?;
     let imputed = imputations.as_slice(); // one imputation: [row][column]
     let observed_mean = |j: usize| {
         let v: Vec<f64> = masked
@@ -176,12 +182,12 @@ fn main() -> Result<()> {
 
     let from_bytes = ForestModel::from_bytes(&flow.to_bytes()?)?;
     let from_json = ForestModel::from_json(&flow.to_json()?)?;
-    assert_eq!(from_bytes.generate(50, 1)?, flow.generate(50, 1)?);
-    assert_eq!(from_json.generate(50, 1)?, flow.generate(50, 1)?);
+    assert_eq!(from_bytes.sample(50, 1)?, flow.sample(50, 1)?);
+    assert_eq!(from_json.sample(50, 1)?, flow.sample(50, 1)?);
     println!(
-        "saved ForestFlow: {} bytes native, {} GBDTs; reloaded models generate the same rows",
+        "saved ForestFlow: {} bytes native, {} GBDTs; reloaded models sample the same rows",
         flow.to_bytes()?.len(),
-        2 * flow.n_t()
+        2 * flow.n_t().get()
     );
     Ok(())
 }

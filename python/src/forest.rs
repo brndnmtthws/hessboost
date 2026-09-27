@@ -9,7 +9,9 @@ use crate::data::{DMatrix, row_major, to_numpy};
 use crate::diffusion::positive;
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::{Params, to_python};
-use hessboost::diffusion::forest::{self, ColumnKind, Repaint, Synthetic};
+use hessboost::diffusion::forest::{
+    self, ColumnKind, ImputeOptions, NoiseLevels, Repaint, Synthetic,
+};
 use numpy::{PyArrayDyn, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -71,7 +73,7 @@ impl ForestParams {
     fn new(request: ForestRequest) -> PyResult<Self> {
         let mut inner = forest::ForestParams::default();
         inner.method = from_json(&request.method, METHOD)?;
-        inner.n_t = request.n_t;
+        inner.n_t = NoiseLevels::try_from(request.n_t).or_raise()?;
         inner.duplicate_k = positive("duplicate_k", request.duplicate_k)?;
         inner.column_kinds = request
             .column_kinds
@@ -84,23 +86,24 @@ impl ForestParams {
         Ok(Self { inner })
     }
 
-    /// The preset `name` (`"default"`, `"diffusion"`) as the `dict` the
+    /// The preset `name` (`"forest_flow"`, `"forest_diffusion"`) as the `dict` the
     /// constructor takes, with the training configuration as its XGBoost
     /// `dict` instead of `Params`.
     #[staticmethod]
     fn preset<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
         let params = match name {
-            "default" => forest::ForestParams::default(),
-            "diffusion" => forest::ForestParams::diffusion(),
+            "forest_flow" => forest::ForestParams::forest_flow(),
+            "forest_diffusion" => forest::ForestParams::forest_diffusion(),
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown forest preset {other:?}; expected \"default\" or \"diffusion\""
+                    "unknown forest preset {other:?}; expected \"forest_flow\" or \
+                     \"forest_diffusion\""
                 )));
             }
         };
         let dict = PyDict::new(py);
         dict.set_item("method", to_json(&params.method, METHOD)?)?;
-        dict.set_item("n_t", params.n_t)?;
+        dict.set_item("n_t", params.n_t.get())?;
         dict.set_item("duplicate_k", params.duplicate_k.get())?;
         let kinds = params
             .column_kinds
@@ -152,25 +155,25 @@ impl ForestModel {
 
     /// `n_rows` synthetic rows, with labels drawn from the training
     /// proportions for a class-conditional model.
-    fn generate<'py>(
+    fn sample<'py>(
         &self,
         py: Python<'py>,
         n_rows: usize,
         seed: u64,
     ) -> PyResult<SyntheticArrays<'py>> {
-        let synthetic = py.detached(|| self.inner.generate(n_rows, seed))?;
+        let synthetic = py.detached(|| self.inner.sample(n_rows, seed))?;
         synthetic_arrays(py, synthetic)
     }
 
     /// One synthetic row per label, from that class's model.
-    fn generate_for_labels<'py>(
+    fn sample_for_labels<'py>(
         &self,
         py: Python<'py>,
         labels: PyReadonlyArray1<'_, f32>,
         seed: u64,
     ) -> PyResult<SyntheticArrays<'py>> {
         let labels = row_major(&labels, "labels")?;
-        let synthetic = py.detached(|| self.inner.generate_for_labels(labels, seed))?;
+        let synthetic = py.detached(|| self.inner.sample_for_labels(labels, seed))?;
         synthetic_arrays(py, synthetic)
     }
 
@@ -185,17 +188,15 @@ impl ForestModel {
         repaint: Option<(usize, f64)>,
         seed: u64,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
-        let repaint = match repaint {
-            Some((resample, jump)) => {
-                let mut repaint = Repaint::default();
-                repaint.resample = positive("repaint.resample", resample)?;
-                repaint.jump = jump;
-                Some(repaint)
-            }
-            None => None,
-        };
+        let mut options = ImputeOptions::seeded(seed);
+        if let Some((resample, jump)) = repaint {
+            let mut repaint = Repaint::default();
+            repaint.resample = positive("repaint.resample", resample)?;
+            repaint.jump = jump;
+            options = options.with_repaint(repaint);
+        }
         let imputations =
-            py.detached(|| self.inner.impute(&data.inner, n_imputations, repaint, seed))?;
+            py.detached(|| self.inner.impute(&data.inner, n_imputations, &options))?;
         let shape = [
             imputations.n_imputations(),
             imputations.n_rows(),
@@ -236,7 +237,7 @@ impl ForestModel {
 
     #[getter]
     fn n_t(&self) -> usize {
-        self.inner.n_t()
+        self.inner.n_t().get()
     }
 
     #[getter]

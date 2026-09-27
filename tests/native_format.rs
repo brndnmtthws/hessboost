@@ -11,8 +11,10 @@
 
 use hessboost::config::{BoosterKind, Dart, LinearTree, MultiStrategy};
 use hessboost::data::FeatureType;
-use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams};
-use hessboost::diffusion::{DiffusionModel, DiffusionParams, Method, ScoreConfig, Sde};
+use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams, NoiseLevels};
+use hessboost::diffusion::{
+    DiffusionModel, DiffusionParams, Method, SampleOptions, ScoreConfig, Sde,
+};
 use hessboost::model::compact::CompactModel;
 use hessboost::objective::distributional::{
     DistFamily, DistGradient, DistSplitDirection, Distributional,
@@ -736,7 +738,12 @@ fn saved_models_keep_loading_with_their_margins() {
                 assert_eq!(model.method(), case.method(), "{name} ({format})");
                 let margins = regressor_margins(&model);
                 assert!(margins == expected, "{}: {name} ({format})", dir.display());
-                assert!(model.sample(&matrix(1), 2, 0).is_ok(), "{name} ({format})");
+                assert!(
+                    model
+                        .sample(&matrix(1), 2, &SampleOptions::seeded(0))
+                        .is_ok(),
+                    "{name} ({format})"
+                );
             }
         }
         // Forest models likewise, from the release that introduced them.
@@ -753,10 +760,84 @@ fn saved_models_keep_loading_with_their_margins() {
                 assert_eq!(model.classes(), case.classes(), "{name} ({format})");
                 let margins = forest_margins(&model);
                 assert!(margins == expected, "{}: {name} ({format})", dir.display());
-                assert!(model.generate(2, 0).is_ok(), "{name} ({format})");
+                assert!(model.sample(2, 0).is_ok(), "{name} ({format})");
             }
         }
     }
+}
+
+/// Re-saving every saved model reproduces what its writer stored:
+///
+/// - each `BoostedModel`, loaded from its `.bin` and from its `.json`,
+///   re-saves the `.json` document member for member (members a later writer
+///   adds are `null`, and none may be dropped) and, where a `.hbtd` was
+///   saved, the compact bytes exactly, from every version;
+/// - the native binary containers (`.bin`, `.hbdm`, `.hbff`) re-save byte
+///   for byte from this version's directory: they record their writer's
+///   version, so earlier versions' files differ in that record.
+#[test]
+fn saved_models_re_save_byte_identically() {
+    let mut versions = 0;
+    for dir in std::fs::read_dir(saved_dir("")).unwrap() {
+        let dir = dir.unwrap().path();
+        let current = dir.file_name().unwrap() == env!("CARGO_PKG_VERSION");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let what = path.display();
+            let stored = std::fs::read(&path).unwrap();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("bin") => {
+                    let json_path = path.with_extension("json");
+                    let json = std::fs::read_to_string(&json_path).unwrap();
+                    let saved_json: Value = serde_json::from_str(&json).unwrap();
+                    let saved_json = saved_json.as_object().unwrap();
+                    let hbtd = std::fs::read(path.with_extension("hbtd")).ok();
+                    let from_bin = BoostedModel::from_bytes(&stored).unwrap();
+                    let from_json = BoostedModel::from_json(&json).unwrap();
+                    for (source, model) in [("bin", from_bin), ("json", from_json)] {
+                        if current {
+                            let bytes = model.to_bytes().unwrap();
+                            assert!(bytes == stored, "{what}: {source} re-saved as bin");
+                        }
+                        let resaved: Value =
+                            serde_json::from_str(&model.to_json().unwrap()).unwrap();
+                        let resaved = resaved.as_object().unwrap();
+                        for key in saved_json.keys() {
+                            assert!(resaved.contains_key(key), "{what}: {source} drops `{key}`");
+                        }
+                        for (key, value) in resaved {
+                            let saved = saved_json.get(key).unwrap_or(&Value::Null);
+                            assert!(value == saved, "{what}: {source} re-saves `{key}`");
+                        }
+                        if let Some(hbtd) = &hbtd {
+                            let compact = model.to_compact_bytes().unwrap();
+                            assert!(compact == *hbtd, "{what}: {source} re-saved as compact");
+                        }
+                    }
+                }
+                Some("hbdm") if current => {
+                    let resaved = DiffusionModel::from_bytes(&stored)
+                        .unwrap()
+                        .to_bytes()
+                        .unwrap();
+                    assert!(resaved == stored, "{what} re-saves differently");
+                }
+                Some("hbff") if current => {
+                    let resaved = ForestModel::from_bytes(&stored)
+                        .unwrap()
+                        .to_bytes()
+                        .unwrap();
+                    assert!(resaved == stored, "{what} re-saves differently");
+                }
+                _ => continue,
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no saved models under {}", dir.display());
+        versions += 1;
+    }
+    assert!(versions > 0, "no saved model versions");
 }
 
 /// Write this version's saved models (see the module docs). Refuses to
@@ -849,7 +930,7 @@ fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
 /// (one GBDT per level and column).
 fn forest_models() -> Vec<(&'static str, ForestModel)> {
     let tiny = |mut params: ForestParams, kinds: Option<Vec<ColumnKind>>| {
-        params.n_t = 3;
+        params.n_t = NoiseLevels::new(3).unwrap();
         params.duplicate_k = std::num::NonZeroUsize::new(2).unwrap();
         params.num_boost_round = std::num::NonZeroUsize::new(3).unwrap();
         params.training.nthread = std::num::NonZeroUsize::new(1);
@@ -873,7 +954,7 @@ fn forest_models() -> Vec<(&'static str, ForestModel)> {
     )
     .unwrap();
     let diffusion = ForestModel::fit(
-        &tiny(ForestParams::diffusion(), None),
+        &tiny(ForestParams::forest_diffusion(), None),
         &DMatrix::from_dense(&with_missing, n, COLS)
             .unwrap()
             .with_labels(&classes)

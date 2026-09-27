@@ -149,26 +149,65 @@ impl ModelObjective {
     }
 }
 
-/// The objective parameters the model formats store, in their stored
-/// layout: every built-in objective's parameters at the values the model's
-/// objective gives them (the defaults for the ones it does not read), plus
-/// the `max_delta_step` training used and the `dist:*` family. Native JSON
-/// names the members as the fields; the native binary and compact formats
-/// store `objective.<field>` sections.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct StoredObjectiveParams {
-    pub(crate) scale_pos_weight: f64,
-    pub(crate) max_delta_step: f64,
-    pub(crate) tweedie_variance_power: f64,
-    pub(crate) huber_slope: f64,
-    pub(crate) lambdarank_num_pair_per_sample: usize,
-    pub(crate) quantile_alpha: Vec<f64>,
-    pub(crate) expectile_alpha: Vec<f64>,
-    pub(crate) aft_loss_distribution: AftDistribution,
-    pub(crate) aft_loss_distribution_scale: f64,
-    pub(crate) dist_gradient: DistGradient,
-    pub(crate) dist_split_direction: DistSplitDirection,
-    pub(crate) distribution: Option<DistFamily>,
+/// Declares [`StoredObjectiveParams`] (serialized with its fields in
+/// declaration order) and its all-optional mirror
+/// [`PartialStoredObjectiveParams`] with `fill`, from one member list. A new
+/// stored objective parameter is one line here plus its value in
+/// [`StoredObjectiveParams::of`].
+macro_rules! stored_objective_params {
+    ($(#[doc = $sdoc:literal])* ; $(#[doc = $pdoc:literal])* ; $($name:ident: $ty:ty),* $(,)?) => {
+        $(#[doc = $sdoc])*
+        #[derive(Debug, Clone, PartialEq, Serialize)]
+        pub(crate) struct StoredObjectiveParams {
+            $(pub(crate) $name: $ty,)*
+        }
+
+        $(#[doc = $pdoc])*
+        #[derive(Deserialize, Default)]
+        pub(crate) struct PartialStoredObjectiveParams {
+            $(#[serde(default)] $name: Stored<$ty>,)*
+        }
+
+        impl PartialStoredObjectiveParams {
+            /// The stored parameters, each missing one taken from `objective`'s
+            /// defaults.
+            pub(crate) fn fill(self, objective: &str) -> StoredObjectiveParams {
+                let d = StoredObjectiveParams::defaults_for(objective);
+                StoredObjectiveParams {
+                    $($name: self.$name.unwrap_or(d.$name),)*
+                }
+            }
+        }
+    };
+}
+
+stored_objective_params! {
+    /// The objective parameters the model formats store, in their stored
+    /// layout: every built-in objective's parameters at the values the model's
+    /// objective gives them (the defaults for the ones it does not read), plus
+    /// the `max_delta_step` training used and the `dist:*` family. Native JSON
+    /// names the members as the fields; the native binary and compact formats
+    /// store `objective.<field>` sections.
+    ;
+    /// [`StoredObjectiveParams`] as native JSON stores them, with every member
+    /// optional: [`PartialStoredObjectiveParams::fill`] takes each missing one
+    /// from the recorded objective's defaults
+    /// ([`StoredObjectiveParams::defaults_for`]), which a per-field serde default
+    /// could not (they depend on the objective). A stored value is read as
+    /// strictly as the full record (`null` only for `distribution`).
+    ;
+    scale_pos_weight: f64,
+    max_delta_step: f64,
+    tweedie_variance_power: f64,
+    huber_slope: f64,
+    lambdarank_num_pair_per_sample: usize,
+    quantile_alpha: Vec<f64>,
+    expectile_alpha: Vec<f64>,
+    aft_loss_distribution: AftDistribution,
+    aft_loss_distribution_scale: f64,
+    dist_gradient: DistGradient,
+    dist_split_direction: DistSplitDirection,
+    distribution: Option<DistFamily>,
 }
 
 impl StoredObjectiveParams {
@@ -208,78 +247,6 @@ impl StoredObjectiveParams {
         );
         defaults.distribution = DistFamily::from_objective(objective);
         defaults
-    }
-}
-
-/// [`StoredObjectiveParams`] as native JSON stores them, with every member
-/// optional: [`PartialStoredObjectiveParams::fill`] takes each missing one
-/// from the recorded objective's defaults
-/// ([`StoredObjectiveParams::defaults_for`]), which a per-field serde default
-/// could not (they depend on the objective). A stored value is read as
-/// strictly as the full record (`null` only for `distribution`).
-#[derive(Deserialize, Default)]
-pub(crate) struct PartialStoredObjectiveParams {
-    #[serde(default)]
-    scale_pos_weight: Stored<f64>,
-    #[serde(default)]
-    max_delta_step: Stored<f64>,
-    #[serde(default)]
-    tweedie_variance_power: Stored<f64>,
-    #[serde(default)]
-    huber_slope: Stored<f64>,
-    #[serde(default)]
-    lambdarank_num_pair_per_sample: Stored<usize>,
-    #[serde(default)]
-    quantile_alpha: Stored<Vec<f64>>,
-    #[serde(default)]
-    expectile_alpha: Stored<Vec<f64>>,
-    #[serde(default)]
-    aft_loss_distribution: Stored<AftDistribution>,
-    #[serde(default)]
-    aft_loss_distribution_scale: Stored<f64>,
-    #[serde(default)]
-    dist_gradient: Stored<DistGradient>,
-    #[serde(default)]
-    dist_split_direction: Stored<DistSplitDirection>,
-    #[serde(default)]
-    distribution: Stored<Option<DistFamily>>,
-}
-
-impl PartialStoredObjectiveParams {
-    /// The stored parameters, each missing one taken from `objective`'s
-    /// defaults.
-    pub(crate) fn fill(self, objective: &str) -> StoredObjectiveParams {
-        let d = StoredObjectiveParams::defaults_for(objective);
-        let PartialStoredObjectiveParams {
-            scale_pos_weight,
-            max_delta_step,
-            tweedie_variance_power,
-            huber_slope,
-            lambdarank_num_pair_per_sample,
-            quantile_alpha,
-            expectile_alpha,
-            aft_loss_distribution,
-            aft_loss_distribution_scale,
-            dist_gradient,
-            dist_split_direction,
-            distribution,
-        } = self;
-        StoredObjectiveParams {
-            scale_pos_weight: scale_pos_weight.unwrap_or(d.scale_pos_weight),
-            max_delta_step: max_delta_step.unwrap_or(d.max_delta_step),
-            tweedie_variance_power: tweedie_variance_power.unwrap_or(d.tweedie_variance_power),
-            huber_slope: huber_slope.unwrap_or(d.huber_slope),
-            lambdarank_num_pair_per_sample: lambdarank_num_pair_per_sample
-                .unwrap_or(d.lambdarank_num_pair_per_sample),
-            quantile_alpha: quantile_alpha.unwrap_or(d.quantile_alpha),
-            expectile_alpha: expectile_alpha.unwrap_or(d.expectile_alpha),
-            aft_loss_distribution: aft_loss_distribution.unwrap_or(d.aft_loss_distribution),
-            aft_loss_distribution_scale: aft_loss_distribution_scale
-                .unwrap_or(d.aft_loss_distribution_scale),
-            dist_gradient: dist_gradient.unwrap_or(d.dist_gradient),
-            dist_split_direction: dist_split_direction.unwrap_or(d.dist_split_direction),
-            distribution: distribution.unwrap_or(d.distribution),
-        }
     }
 }
 

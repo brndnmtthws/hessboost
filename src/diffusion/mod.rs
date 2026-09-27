@@ -99,7 +99,8 @@
 //! feature matrix, laid out row-major `[row][sample][output]`. The noise of
 //! draw `s` of row `r` comes from a counter-based SplitMix64 stream keyed by
 //! the seed, `r` and `s`, so the result depends only on the model, the
-//! matrix, `n_samples` and the seed: never on the thread count or on how the
+//! matrix, `n_samples` and the [`SampleOptions`] (seed and step count):
+//! never on the thread count or on how the
 //! sampler batches pairs, and the first `k` samples of a row are the same for
 //! every `n_samples ≥ k`.
 //!
@@ -154,7 +155,7 @@
 //! ```
 //! use std::num::NonZeroUsize;
 //!
-//! use hessboost::diffusion::{DiffusionModel, DiffusionParams};
+//! use hessboost::diffusion::{DiffusionModel, DiffusionParams, SampleOptions};
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {
@@ -171,13 +172,14 @@
 //! params.num_boost_round = NonZeroUsize::new(50).unwrap();
 //! let model = DiffusionModel::fit(&params, &data)?;
 //!
-//! let samples = model.sample(&data, 20, 7)?; // [row][sample][output]
+//! let options = SampleOptions::seeded(7);
+//! let samples = model.sample(&data, 20, &options)?; // [row][sample][output]
 //! assert_eq!(samples.as_slice().len(), n * 20);
 //! let q = samples.quantiles(&[0.1, 0.9])?;
 //! assert!(q.get(0, 0).unwrap()[0] < q.get(0, 1).unwrap()[0]); // row 0: 10% < 90%
 //!
 //! let restored = DiffusionModel::from_bytes(&model.to_bytes()?)?;
-//! assert_eq!(restored.sample(&data, 20, 7)?, samples);
+//! assert_eq!(restored.sample(&data, 20, &options)?, samples);
 //! # Ok(())
 //! # }
 //! ```
@@ -198,7 +200,7 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Objective;
 
-pub use sample::{Quantiles, Samples};
+pub use sample::{Quantiles, SampleOptions, Samples, SamplesView};
 
 /// What the GBDT learns and how sampling integrates it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -475,7 +477,8 @@ pub struct DiffusionParams {
     pub method: Method,
     /// Noisy copies of each training row (Treeffuser's `n_repeats`).
     pub n_repeats: NonZeroUsize,
-    /// Integration steps of the sampler, stored with the model.
+    /// Integration steps of the sampler, stored with the model as its
+    /// default ([`SampleOptions::n_steps`] overrides it per call).
     pub n_steps: NonZeroUsize,
     /// Parameters of the score/velocity GBDT (objective
     /// `reg:squarederror`, `scale_pos_weight = 1`).
@@ -775,8 +778,10 @@ impl DiffusionModel {
 
     /// Draw `n_samples` labels from the model's `p(y | x)` for every row of
     /// `data` (features only; labels are ignored), laid out
-    /// `[row][sample][output]`. Deterministic for a given `seed` at any
-    /// thread count; see the [module docs](self#sampling).
+    /// `[row][sample][output]`, integrating `options.n_steps` steps (the
+    /// model's [`n_steps`](Self::n_steps) by default). Deterministic for a
+    /// given `options` at any thread count; see the
+    /// [module docs](self#sampling).
     ///
     /// # Errors
     ///
@@ -784,8 +789,13 @@ impl DiffusionModel {
     /// margin on `data`, or a sampler that diverges to non-finite values;
     /// [`HessboostError::DimensionMismatch`] when `data`'s feature count
     /// differs from the training data's.
-    pub fn sample(&self, data: &DMatrix, n_samples: usize, seed: u64) -> Result<Samples> {
-        sample::sample(self, data, n_samples, seed)
+    pub fn sample(
+        &self,
+        data: &DMatrix,
+        n_samples: usize,
+        options: &SampleOptions,
+    ) -> Result<Samples> {
+        sample::sample(self, data, n_samples, options)
     }
 
     /// The method and its settings.
@@ -793,15 +803,11 @@ impl DiffusionModel {
         &self.method
     }
 
-    /// Integration steps [`Self::sample`] takes.
+    /// Integration steps [`Self::sample`] takes unless
+    /// [`SampleOptions::n_steps`] overrides them (the training
+    /// [`DiffusionParams::n_steps`]).
     pub fn n_steps(&self) -> NonZeroUsize {
         self.n_steps
-    }
-
-    /// Change the number of integration steps: more steps follow the
-    /// learned dynamics more closely at a proportional cost.
-    pub fn set_n_steps(&mut self, n_steps: NonZeroUsize) {
-        self.n_steps = n_steps;
     }
 
     /// Feature columns the model conditions on.

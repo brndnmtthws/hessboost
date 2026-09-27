@@ -119,7 +119,7 @@ _LoadFormat: TypeAlias = _ModelFormat | Literal["auto", "lightgbm"]
 _PredictKind: TypeAlias = Literal["value", "margin", "contribs", "interactions"]
 _ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
 _DiffusionPreset: TypeAlias = Literal["default", "treeffuser", "flow_matching"]
-_ForestPreset: TypeAlias = Literal["default", "diffusion"]
+_ForestPreset: TypeAlias = Literal["forest_flow", "forest_diffusion"]
 
 @final
 class Booster:
@@ -306,8 +306,9 @@ class DiffusionParams:
 class DiffusionModel:
     @staticmethod
     def fit(params: DiffusionParams, data: DMatrix) -> DiffusionModel: ...
-    def sample(self, data: DMatrix, n_samples: int, seed: int) -> NDArray[np.float32]: ...
-    def with_n_steps(self, n_steps: int) -> DiffusionModel: ...
+    def sample(
+        self, data: DMatrix, n_samples: int, seed: int, n_steps: int | None = None
+    ) -> NDArray[np.float32]: ...
     @staticmethod
     def from_bytes(data: bytes) -> DiffusionModel: ...
     @staticmethod
@@ -335,10 +336,10 @@ class ForestParams:
 class ForestModel:
     @staticmethod
     def fit(params: ForestParams, data: DMatrix) -> ForestModel: ...
-    def generate(
+    def sample(
         self, n_rows: int, seed: int
     ) -> tuple[NDArray[np.float32], NDArray[np.float32] | None]: ...
-    def generate_for_labels(
+    def sample_for_labels(
         self, labels: NDArray[np.float32], seed: int
     ) -> tuple[NDArray[np.float32], NDArray[np.float32] | None]: ...
     def impute(

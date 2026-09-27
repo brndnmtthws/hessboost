@@ -1,6 +1,8 @@
 //! [`DiffusionModel::sample`]: reverse-time integration from the prior, and
 //! the [`Samples`] it returns.
 
+use std::num::NonZeroUsize;
+
 use super::fit::{Edm, dense_features, quantile_sorted, residual_mean};
 use super::process::{T_EPS, keyed_normal, try_filled};
 use super::{DiffusionModel, Method, OdeSolver, Parameterization, ScoreConfig};
@@ -17,7 +19,8 @@ const CHUNK_PAIRS: usize = 1 << 14;
 
 /// Draws from a [`DiffusionModel`], laid out row-major
 /// `[row][sample][output]`: value `(r, s, o)` is at
-/// `(r · n_samples + s) · n_outputs + o`.
+/// `(r · n_samples + s) · n_outputs + o`. [`Samples::view`] borrows them as
+/// a [`SamplesView`], which also summarizes draws stored elsewhere.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Samples {
     values: Vec<f32>,
@@ -26,10 +29,43 @@ pub struct Samples {
     n_outputs: usize,
 }
 
+/// Validate draws laid out `[row][sample][output]`; their row count.
+fn check_layout(values: &[f32], n_samples: usize, n_outputs: usize) -> Result<usize> {
+    if n_samples == 0 || n_outputs == 0 {
+        return Err(HessboostError::invalid_param(
+            "samples",
+            format!("needs at least one sample and one output, got {n_samples} and {n_outputs}"),
+        ));
+    }
+    let Some(width) = n_samples.checked_mul(n_outputs) else {
+        return Err(HessboostError::invalid_param(
+            "samples",
+            format!("{n_samples} samples × {n_outputs} outputs overflows usize"),
+        ));
+    };
+    if !values.len().is_multiple_of(width) {
+        return Err(HessboostError::invalid_param(
+            "samples",
+            format!(
+                "{} draws are not whole rows of {n_samples} samples × {n_outputs} outputs",
+                values.len()
+            ),
+        ));
+    }
+    if !values.iter().all(|v| v.is_finite()) {
+        return Err(HessboostError::invalid_param(
+            "samples",
+            "all draws must be finite",
+        ));
+    }
+    Ok(values.len() / width)
+}
+
 impl Samples {
     /// Draws laid out `[row][sample][output]` (such as
     /// [`DiffusionModel::sample`]'s, stored and read back), for their
-    /// summaries.
+    /// summaries. [`SamplesView::new`] summarizes them without taking
+    /// ownership.
     ///
     /// # Errors
     ///
@@ -37,41 +73,23 @@ impl Samples {
     /// `n_outputs`, a length that is not a whole number of rows of
     /// `n_samples · n_outputs` draws, or a non-finite draw.
     pub fn new(values: Vec<f32>, n_samples: usize, n_outputs: usize) -> Result<Self> {
-        if n_samples == 0 || n_outputs == 0 {
-            return Err(HessboostError::invalid_param(
-                "samples",
-                format!(
-                    "needs at least one sample and one output, got {n_samples} and {n_outputs}"
-                ),
-            ));
-        }
-        let Some(width) = n_samples.checked_mul(n_outputs) else {
-            return Err(HessboostError::invalid_param(
-                "samples",
-                format!("{n_samples} samples × {n_outputs} outputs overflows usize"),
-            ));
-        };
-        if !values.len().is_multiple_of(width) {
-            return Err(HessboostError::invalid_param(
-                "samples",
-                format!(
-                    "{} draws are not whole rows of {n_samples} samples × {n_outputs} outputs",
-                    values.len()
-                ),
-            ));
-        }
-        if !values.iter().all(|v| v.is_finite()) {
-            return Err(HessboostError::invalid_param(
-                "samples",
-                "all draws must be finite",
-            ));
-        }
+        let n_rows = check_layout(&values, n_samples, n_outputs)?;
         Ok(Samples {
-            n_rows: values.len() / width,
             values,
+            n_rows,
             per_row: n_samples,
             n_outputs,
         })
+    }
+
+    /// The draws, borrowed.
+    pub fn view(&self) -> SamplesView<'_> {
+        SamplesView {
+            values: &self.values,
+            n_rows: self.n_rows,
+            per_row: self.per_row,
+            n_outputs: self.n_outputs,
+        }
     }
 
     /// The flat `[row][sample][output]` buffer.
@@ -102,6 +120,93 @@ impl Samples {
 
     /// The draws of `row`, `[sample][output]`, or `None` past the last row.
     pub fn row(&self, row: usize) -> Option<&[f32]> {
+        self.view().row(row)
+    }
+
+    /// The `n_outputs` values of draw `sample` of `row`, or `None` if either
+    /// is out of range.
+    pub fn get(&self, row: usize, sample: usize) -> Option<&[f32]> {
+        self.view().get(row, sample)
+    }
+
+    /// See [`SamplesView::mean`].
+    pub fn mean(&self) -> Predictions<f64> {
+        self.view().mean()
+    }
+
+    /// See [`SamplesView::quantiles`].
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::InvalidParameter`] for a level outside `[0, 1]`.
+    pub fn quantiles(&self, levels: &[f64]) -> Result<Quantiles> {
+        self.view().quantiles(levels)
+    }
+
+    /// See [`SamplesView::crps`].
+    ///
+    /// # Errors
+    ///
+    /// As [`SamplesView::crps`].
+    pub fn crps(&self, labels: &[f32]) -> Result<Predictions<f64>> {
+        self.view().crps(labels)
+    }
+}
+
+impl AsRef<[f32]> for Samples {
+    fn as_ref(&self) -> &[f32] {
+        &self.values
+    }
+}
+
+/// Borrowed draws laid out like [`Samples`], `[row][sample][output]`: the
+/// summaries of draws held elsewhere (a NumPy array), without copying them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplesView<'a> {
+    values: &'a [f32],
+    n_rows: usize,
+    per_row: usize,
+    n_outputs: usize,
+}
+
+impl<'a> SamplesView<'a> {
+    /// Borrow draws laid out `[row][sample][output]`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Samples::new`].
+    pub fn new(values: &'a [f32], n_samples: usize, n_outputs: usize) -> Result<Self> {
+        let n_rows = check_layout(values, n_samples, n_outputs)?;
+        Ok(SamplesView {
+            values,
+            n_rows,
+            per_row: n_samples,
+            n_outputs,
+        })
+    }
+
+    /// The flat `[row][sample][output]` buffer.
+    pub fn as_slice(&self) -> &'a [f32] {
+        self.values
+    }
+
+    /// Rows sampled.
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Draws per row.
+    pub fn n_samples(&self) -> usize {
+        self.per_row
+    }
+
+    /// Label columns per draw.
+    pub fn n_outputs(&self) -> usize {
+        self.n_outputs
+    }
+
+    /// The draws of `row`, `[sample][output]`, or `None` past the last row.
+    pub fn row(&self, row: usize) -> Option<&'a [f32]> {
         let width = self.per_row * self.n_outputs;
         let start = row.checked_mul(width)?;
         self.values.get(start..start.checked_add(width)?)
@@ -109,7 +214,7 @@ impl Samples {
 
     /// The `n_outputs` values of draw `sample` of `row`, or `None` if either
     /// is out of range.
-    pub fn get(&self, row: usize, sample: usize) -> Option<&[f32]> {
+    pub fn get(&self, row: usize, sample: usize) -> Option<&'a [f32]> {
         if sample >= self.per_row {
             return None;
         }
@@ -156,7 +261,9 @@ impl Samples {
             .n_rows
             .checked_mul(k)
             .and_then(|n| n.checked_mul(d))
-            .unwrap_or(usize::MAX);
+            .ok_or_else(|| {
+                HessboostError::invalid_param("levels", "the quantile table overflows usize")
+            })?;
         let mut out = try_filled(len, 0.0, "levels")?;
         let mut column = Vec::new();
         for row in 0..self.n_rows {
@@ -233,12 +340,6 @@ impl Samples {
     }
 }
 
-impl AsRef<[f32]> for Samples {
-    fn as_ref(&self) -> &[f32] {
-        &self.values
-    }
-}
-
 /// Empirical quantiles of [`Samples`] ([`Samples::quantiles`]): per row and
 /// level, one value per output, laid out `[row][level][output]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -292,11 +393,43 @@ impl AsRef<[f64]> for Quantiles {
     }
 }
 
+/// Settings of one [`DiffusionModel::sample`] call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SampleOptions {
+    /// Seed of the draws: the same seed, step count and data give the same
+    /// draws at any thread count.
+    pub seed: u64,
+    /// Integration steps; `None` takes the model's
+    /// ([`DiffusionModel::n_steps`], its training
+    /// [`DiffusionParams::n_steps`](super::DiffusionParams::n_steps)). More
+    /// steps follow the learned dynamics more closely at a proportional
+    /// cost.
+    pub n_steps: Option<NonZeroUsize>,
+}
+
+impl SampleOptions {
+    /// Options drawing with `seed` and the model's step count.
+    pub fn seeded(seed: u64) -> Self {
+        SampleOptions {
+            seed,
+            n_steps: None,
+        }
+    }
+
+    /// These options integrating `n_steps` steps instead of the model's.
+    #[must_use]
+    pub fn with_n_steps(mut self, n_steps: NonZeroUsize) -> Self {
+        self.n_steps = Some(n_steps);
+        self
+    }
+}
+
 pub(super) fn sample(
     model: &DiffusionModel,
     data: &DMatrix,
     n_samples: usize,
-    seed: u64,
+    options: &SampleOptions,
 ) -> Result<Samples> {
     if n_samples == 0 {
         return Err(HessboostError::invalid_param(
@@ -334,7 +467,8 @@ pub(super) fn sample(
         features: dense_features(data),
         mean,
         n_samples,
-        key: splitmix64(seed ^ SAMPLE_STREAM),
+        n_steps: options.n_steps.unwrap_or(model.n_steps).get(),
+        key: splitmix64(options.seed ^ SAMPLE_STREAM),
     };
     let mut values = try_filled(total, 0.0f32, "n_samples")?;
     let n_pairs = n_rows * n_samples;
@@ -358,6 +492,8 @@ struct Sampler<'a> {
     /// The residualizer's conditional mean, `[row][n_outputs]`.
     mean: Option<Vec<f64>>,
     n_samples: usize,
+    /// Integration steps.
+    n_steps: usize,
     key: u64,
 }
 
@@ -457,7 +593,7 @@ impl Sampler<'_> {
     fn reverse_sde(&self, score: &ScoreConfig, batch: &mut Batch, y: &mut [f64]) -> Result<()> {
         let model = self.model;
         let d = model.n_outputs;
-        let steps = model.n_steps.get();
+        let steps = self.n_steps;
         let dt = (1.0 - T_EPS) / steps as f64;
         for step in 0..steps {
             let t = 1.0 - step as f64 * dt;
@@ -495,7 +631,7 @@ impl Sampler<'_> {
     /// (DiffGBM's flow-matching sampler).
     fn reverse_ode(&self, solver: OdeSolver, batch: &mut Batch, y: &mut [f64]) -> Result<()> {
         let model = self.model;
-        let steps = model.n_steps.get();
+        let steps = self.n_steps;
         let ds = (1.0 - T_EPS) / steps as f64;
         let time = |t: f64| [t as f32, 0.0];
         let mut predictor = match solver {

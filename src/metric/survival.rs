@@ -68,9 +68,9 @@ const PARALLEL_INTERVAL_ROWS: usize = 16_384;
 /// observed times (`lower == upper == label`). NaN unless the predictions,
 /// intervals, and weights all have one entry per row.
 fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> f64 + Sync) -> f64 {
-    let (lower, upper) = match (info.label_lower_bound, info.label_upper_bound) {
-        (Some(lower), Some(upper)) => (lower, upper),
-        _ => (info.labels, info.labels),
+    let (lower, upper) = match info.bounds {
+        Some(bounds) => (bounds.lower(), bounds.upper()),
+        None => (info.label_values(), info.label_values()),
     };
     if upper.len() != lower.len() || !consistent(preds, lower, info.weights, 1) {
         return f64::NAN;
@@ -115,8 +115,7 @@ fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> 
 /// [`Metric::validate_info`] of the interval metrics: they read the label
 /// bounds, or the labels as observed times when there are none.
 fn validate_intervals(name: &str, info: &MetaInfo) -> Result<()> {
-    let bounded = info.label_lower_bound.is_some() && info.label_upper_bound.is_some();
-    if info.n_rows > 0 && !bounded && info.labels.is_empty() {
+    if info.n_rows > 0 && info.bounds.is_none() && info.label_values().is_empty() {
         return Err(HessboostError::invalid_param(
             "eval_metric",
             format!("metric `{name}` needs label bounds or labels, but dataset has neither"),
@@ -222,9 +221,9 @@ mod tests {
     fn bounded<'a>(lower: &'a [f32], upper: &'a [f32], weights: Option<&'a [f32]>) -> MetaInfo<'a> {
         MetaInfo {
             n_rows: lower.len(),
-            label_lower_bound: Some(lower),
-            label_upper_bound: Some(upper),
-            ..MetaInfo::new(&[], weights, None)
+            bounds: Some(crate::data::LabelBounds::new(lower, upper)),
+            weights,
+            ..MetaInfo::unlabeled(0)
         }
     }
 

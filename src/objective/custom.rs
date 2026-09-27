@@ -137,13 +137,15 @@ impl Loss for CustomLoss {
     /// matrix of another width is refused before the gradient closure sees
     /// it.
     fn validate_info(&self, info: &crate::data::MetaInfo) -> crate::error::Result<()> {
-        if info.n_targets != 1 && info.n_targets != self.n_outputs {
+        if info.n_targets() != 1 && info.n_targets() != self.n_outputs {
             return Err(crate::error::HessboostError::invalid_param(
                 "objective",
                 format!(
                     "custom objective `{}` has {} outputs; dataset has a {}-column label matrix \
                      (one label per row or per output expected)",
-                    self.name, self.n_outputs, info.n_targets
+                    self.name,
+                    self.n_outputs,
+                    info.n_targets()
                 ),
             ));
         }

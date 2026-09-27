@@ -48,11 +48,7 @@ fn classification(n: usize, classes: usize) -> DMatrix {
 
 /// Model shrinkage at `rate` in `mode`.
 fn shrink(rate: f64, mode: ModelShrinkMode) -> ModelShrink {
-    ModelShrink::builder()
-        .rate(rate)
-        .mode(mode)
-        .build()
-        .unwrap()
+    ModelShrink::new(rate, mode).unwrap()
 }
 
 fn bits(values: impl AsRef<[f32]>) -> Vec<u32> {
@@ -622,6 +618,62 @@ fn unsupported_combinations_are_refused() {
     assert!(train(&steep, &regression(2), 1).is_ok());
 }
 
+/// No shrinkage is `model_shrink = None`, never a rate of 0: typed Langevin
+/// shrinks only when asked, while the flat form keeps CatBoost's defaults
+/// (`langevin=true` alone shrinks at 0.001, `model_shrink_rate=0` is none),
+/// and both round-trip.
+#[test]
+fn no_model_shrinkage_is_none() {
+    assert_eq!(
+        common::invalid_param(ModelShrink::new(0.0, ModelShrinkMode::Constant)),
+        "model_shrink_rate"
+    );
+    let data = regression(100);
+    let typed = TrainingParams::builder()
+        .langevin(Langevin::default())
+        .build()
+        .unwrap();
+    // An unshrunk model can be trained further.
+    let model = train(&typed, &data, 3).unwrap();
+    assert!(
+        Trainer::new(&typed, &data, 2)
+            .init_model(&model)
+            .train()
+            .is_ok()
+    );
+    let flat =
+        |pairs: &[(&str, serde_json::Value)]| TrainingParams::from_xgboost(pairs.iter().cloned());
+    let catboost = flat(&[("langevin", json!(true))]).unwrap();
+    assert_eq!(
+        catboost.model_shrink,
+        Some(shrink(0.001, ModelShrinkMode::Constant))
+    );
+    let off = flat(&[("langevin", json!(true)), ("model_shrink_rate", json!(0.0))]).unwrap();
+    assert_eq!(off, typed);
+    for params in [&typed, &catboost] {
+        assert_eq!(
+            &TrainingParams::from_xgboost(params.to_xgboost().unwrap()).unwrap(),
+            params
+        );
+    }
+    // A mode needs a rate other than 0, and posterior sampling derives its
+    // own rate, refusing an explicit 0 too.
+    assert_eq!(
+        common::invalid_param(flat(&[
+            ("model_shrink_rate", json!(0.0)),
+            ("model_shrink_mode", json!("decreasing"))
+        ])),
+        "model_shrink_mode"
+    );
+    assert_eq!(
+        common::invalid_param(flat(&[
+            ("posterior_sampling", json!(true)),
+            ("model_shrink_rate", json!(0.0))
+        ])),
+        "model_shrink_rate"
+    );
+}
+
 /// Continued Langevin training (without shrinkage) grows the trees of the
 /// uninterrupted run: its draws are keyed by the absolute iteration.
 #[test]
@@ -630,7 +682,6 @@ fn langevin_continuation_matches_the_uninterrupted_run() {
     let params = TrainingParams::builder()
         .max_depth(3)
         .langevin(Langevin::default())
-        .model_shrink(shrink(0.0, ModelShrinkMode::Constant))
         .build()
         .unwrap();
     let first = train(&params, &data, 5).unwrap();

@@ -6,7 +6,8 @@
 use std::ops::ControlFlow;
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink, QueryBagging,
+    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink, ModelShrinkMode,
+    QueryBagging,
 };
 use hessboost::data::FeatureType;
 use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Logistic, Objective};
@@ -276,7 +277,7 @@ fn unsound_configurations_and_changes_are_refused() {
         ),
         (
             base()
-                .model_shrink(ModelShrink::builder().rate(0.1).build().unwrap())
+                .model_shrink(ModelShrink::new(0.1, ModelShrinkMode::Constant).unwrap())
                 .build()
                 .unwrap(),
             "params",
@@ -408,7 +409,7 @@ fn from_model_refuses_shrunk_models() {
     let data = data(200, 5, false);
     let p = params(Objective::SquaredError);
     let mut shrunk = p.clone();
-    shrunk.model_shrink = Some(ModelShrink::builder().rate(0.1).build().unwrap());
+    shrunk.model_shrink = Some(ModelShrink::new(0.1, ModelShrinkMode::Constant).unwrap());
     let model = train(&shrunk, &data, 3).unwrap();
     for tolerance in [0.1, 0.0] {
         let online = OnlineParams::with_tolerance(tolerance);

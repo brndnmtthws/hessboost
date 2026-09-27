@@ -66,7 +66,7 @@ const NOISE_CHUNK: usize = 8192;
 pub(super) struct Sglb {
     /// The Langevin noise, when `langevin` (or posterior sampling) is on.
     pub(super) langevin: Option<Langevin>,
-    /// The per-iteration model shrinkage, when its rate is positive.
+    /// The per-iteration model shrinkage, when configured (or derived).
     pub(super) shrink: Option<Shrink>,
 }
 
@@ -82,8 +82,11 @@ impl Sglb {
                 "needs training rows to derive its temperature and shrink rate from",
             ));
         }
-        let (rate, mode) = params.effective_model_shrink(n_rows);
-        if params.posterior_sampling && rate * params.eta >= 1.0 {
+        let shrink = params.effective_model_shrink(n_rows);
+        if params.posterior_sampling
+            && let Some((rate, _)) = shrink
+            && rate * params.eta >= 1.0
+        {
             return Err(HessboostError::invalid_param(
                 "posterior_sampling",
                 format!(
@@ -102,7 +105,7 @@ impl Sglb {
                 seed: params.seed,
             }
         });
-        let shrink = (rate > 0.0).then_some(Shrink {
+        let shrink = shrink.map(|(rate, mode)| Shrink {
             mode,
             rate,
             eta: params.eta,

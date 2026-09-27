@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use std::ops::ControlFlow;
 
 use super::train::{
-    MarginCaches, Prepared, TrainContext, TreeSample, make_column_sampler, sample_rows,
+    MarginCaches, Prepared, RowMeta, TrainContext, TreeSample, make_column_sampler, sample_rows,
 };
 use crate::config::{BoosterKind, Boulevard, TrainingParams};
 use crate::data::DMatrix;
@@ -319,7 +319,7 @@ pub(super) fn boost(
         reuse,
     } = state;
     let n = dtrain.n_rows();
-    let labels = dtrain.labels().unwrap_or_default();
+    let row_meta = RowMeta::of(dtrain, params);
     let mu = model.base_scores()[0];
     let mut recursion = Recursion::new(Schedule::from_params(params), n);
     let mut eval_sums: Vec<Vec<f64>> = margins.evals.iter().map(|m| vec![0.0; m.len()]).collect();
@@ -341,7 +341,7 @@ pub(super) fn boost(
             // Row samples, then column samplers, in slot order.
             let rows: Vec<Vec<u32>> = gpairs
                 .iter()
-                .map(|_| sample_rows(n, params, labels, rng))
+                .map(|_| sample_rows(n, params, row_meta, rng))
                 .collect();
             let mut samplers: Vec<_> = gpairs
                 .iter()

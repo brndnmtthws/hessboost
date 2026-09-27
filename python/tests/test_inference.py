@@ -81,15 +81,21 @@ def test_refusals() -> None:
         hessboost.train(
             {**PARAMS, "objective": "reg:pseudohubererror"}, hessboost.DMatrix(x, label=y), 2
         )
-    # Class-balanced bagging samples rows by label, whatever the objective.
-    for objective in ("reg:squarederror", "binary:logistic"):
-        balanced = {**PARAMS, "subsample": 1.0, "objective": objective}
-        with pytest.raises(hessboost.HessboostError, match="linear smoother"):
-            hessboost.train(
-                {**balanced, "neg_bagging_fraction": 0.5},
-                hessboost.DMatrix(x, label=(y > 0).astype(float)),
-                2,
-            )
+    # Class-balanced bagging samples rows by label (and needs a `binary:*`
+    # objective, which it refuses first otherwise).
+    balanced = {**PARAMS, "subsample": 1.0, "objective": "binary:logistic"}
+    with pytest.raises(hessboost.HessboostError, match="linear smoother"):
+        hessboost.train(
+            {**balanced, "neg_bagging_fraction": 0.5},
+            hessboost.DMatrix(x, label=(y > 0).astype(float)),
+            2,
+        )
+    with pytest.raises(hessboost.HessboostError, match="binary"):
+        hessboost.train(
+            {**balanced, "objective": "reg:squarederror", "neg_bagging_fraction": 0.5},
+            hessboost.DMatrix(x, label=(y > 0).astype(float)),
+            2,
+        )
 
 
 def test_sglb_and_virtual_ensembles_are_refused() -> None:

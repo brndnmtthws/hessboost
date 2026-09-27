@@ -156,7 +156,9 @@ impl Samples {
             .n_rows
             .checked_mul(k)
             .and_then(|n| n.checked_mul(d))
-            .unwrap_or(usize::MAX);
+            .ok_or_else(|| {
+                HessboostError::invalid_param("levels", "the quantile table overflows usize")
+            })?;
         let mut out = try_filled(len, 0.0, "levels")?;
         let mut column = Vec::new();
         for row in 0..self.n_rows {

@@ -144,7 +144,7 @@ use crate::config::{TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
-use crate::rng::{GOLDEN, Rng, mix64, splitmix64};
+use crate::rng::{Rng, keyed_unit, splitmix64};
 use crate::training::train;
 
 mod format;
@@ -690,8 +690,7 @@ impl ForestModel {
         if !self.classes.is_empty() {
             let key = splitmix64(seed ^ LABEL_STREAM);
             for (r, class) in class_of.iter_mut().enumerate() {
-                let bits = mix64(key.wrapping_add((r as u64 + 1).wrapping_mul(GOLDEN)));
-                let u = (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64);
+                let u = keyed_unit(key, r as u64);
                 let mut acc = 0.0;
                 *class = self
                     .class_probs

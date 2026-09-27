@@ -46,6 +46,12 @@ fn keyed_unit_open(key: u64, index: u64) -> f64 {
     ((keyed_bits(key, index) >> 11) + 1) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
+/// Uniform variate on `[0, 1)` at position `index` of the stream `key`.
+#[inline]
+pub(crate) fn keyed_unit(key: u64, index: u64) -> f64 {
+    (keyed_bits(key, index) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
 /// Uniform `f32` variate on `[0, 1)` at position `index` of the stream
 /// `key`: the top 24 bits of [`keyed_bits`], every value a multiple of
 /// `2^-24` (the `f32` mantissa, so the conversion is exact).

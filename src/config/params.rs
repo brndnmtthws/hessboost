@@ -6,8 +6,8 @@
 //! name and document the alias.
 
 use super::groups::{
-    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
-    QuantizedGrad, QueryBagging, Refresh,
+    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
 use crate::error::{HessboostError, Result};
 use crate::objective::{Loss, LossContext, Objective};

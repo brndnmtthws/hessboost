@@ -1,7 +1,8 @@
 //! `booster = boulevard` and its statistical inference ([`hessboost::inference`]).
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Boulevard, QueryBagging, TrainingParams, TrainingParamsBuilder,
+    BalancedBagging, BoosterKind, Boulevard, Langevin, ModelShrink, QueryBagging, TrainingParams,
+    TrainingParamsBuilder,
 };
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::objective::{LambdaRank, Logistic, Objective};
@@ -291,4 +292,28 @@ fn online_updates_refuse_a_boulevard_model() {
             "model"
         );
     }
+}
+
+/// SGLB runs in the gbtree loop (Langevin noise would also add variance the
+/// kernel does not model, and model shrinkage would rescale the average), so
+/// it is refused; and a Boulevard model's iteration prefixes are not the
+/// models of fewer rounds (every leaf carries the full run's `1/B`), so
+/// virtual ensembles of one are refused.
+#[test]
+fn sglb_and_virtual_ensembles_are_refused() {
+    let refused = |b: TrainingParamsBuilder| invalid_param(b.build());
+    assert_eq!(refused(builder().langevin(Langevin::default())), "langevin");
+    assert_eq!(refused(builder().posterior_sampling(true)), "langevin");
+    let shrink = ModelShrink::builder().rate(0.01).build().unwrap();
+    assert_eq!(refused(builder().model_shrink(shrink)), "model_shrink_rate");
+    let dtrain = data(200, 17);
+    let model = train(&builder().build().unwrap(), &dtrain, 20).unwrap();
+    assert_eq!(
+        invalid_param(model.predict_virtual_ensembles(&dtrain, 2)),
+        "model"
+    );
+    assert_eq!(
+        invalid_param(model.predict_uncertainty(&dtrain, 2)),
+        "model"
+    );
 }

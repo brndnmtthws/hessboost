@@ -310,6 +310,7 @@ pub(super) fn boost(
         dtrain,
         info,
         objective,
+        ..
     } = *run;
     debug_assert!(matches!(params.booster, BoosterKind::Boulevard(_)));
     let BoostState {

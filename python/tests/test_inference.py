@@ -90,3 +90,16 @@ def test_refusals() -> None:
                 hessboost.DMatrix(x, label=(y > 0).astype(float)),
                 2,
             )
+
+
+def test_sglb_and_virtual_ensembles_are_refused() -> None:
+    x, y = data(200, 7)
+    dtrain = hessboost.DMatrix(x, label=y)
+    for key, value in (("langevin", True), ("posterior_sampling", True), ("model_shrink_rate", 0.01)):
+        with pytest.raises(hessboost.HessboostError, match="gbtree"):
+            hessboost.train({**PARAMS, key: value}, dtrain, 2)
+    booster = hessboost.train(PARAMS, dtrain, 20)
+    with pytest.raises(hessboost.HessboostError, match="Boulevard"):
+        booster.predict_uncertainty(x, 2)
+    with pytest.raises(hessboost.HessboostError, match="Boulevard"):
+        booster.predict_virtual_ensembles(x, 2)

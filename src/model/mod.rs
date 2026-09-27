@@ -451,7 +451,7 @@ pub struct BoostedModel {
     /// Predictions do not depend on it.
     boulevard: Option<BoulevardInfo>,
     /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
-/// never serialized. Reset whenever `trees` changes.
+    /// never serialized. Reset whenever `trees` changes.
     compact: OnceLock<CompactForest>,
 }
 
@@ -1641,6 +1641,7 @@ impl BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
             shrinkage: Some(shrinkage.truncated(k)),
+            boulevard: None,
             compact: OnceLock::new(),
         }
     }

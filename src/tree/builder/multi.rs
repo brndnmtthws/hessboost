@@ -48,7 +48,7 @@ use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
 use crate::tree::gain::{GradStats, RegParams, threshold_l1};
 use crate::tree::hist::feature_slices;
-use crate::tree::sampler::ColumnSampler;
+use crate::tree::sampler::{ColumnSampler, FeatureSet};
 use crate::tree::{ChildLeaf, RegTree};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -800,7 +800,7 @@ impl Grow<'_, '_> {
     /// `AssignNodes` + `BuildHistLeftRight` + `EvaluateSplits`. `features`
     /// are sampled in XGBoost's child order (left, then right); the children
     /// are returned in the same order.
-    fn children(&self, e: Expanded, features: [Vec<u32>; 2]) -> [Entry; 2] {
+    fn children(&self, e: Expanded, features: [FeatureSet; 2]) -> [Entry; 2] {
         let Expanded {
             entry,
             children: (xl, xr),

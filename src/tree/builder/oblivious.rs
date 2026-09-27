@@ -198,7 +198,8 @@ impl<'a> SymmetricTreeBuilder<'a> {
         for depth in 0..depth_limit {
             let features: Vec<u32> = sampler
                 .sample(depth)
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|&f| permits(allowed.as_ref(), f))
                 .collect();
             let Some(split) = self.best_level_split(ghist, &level, &features) else {

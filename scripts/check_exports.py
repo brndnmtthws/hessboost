@@ -28,6 +28,8 @@ import sys
 import numpy as np
 import xgboost as xgb
 
+from _fixture_common import dense_f32
+
 FIX_DIR = os.path.join(os.path.dirname(__file__), "..", "fixtures")
 EXPORT_DIR = os.path.join(FIX_DIR, "exports")
 SUFFIXES = (".model.json", ".model.ubj")
@@ -117,8 +119,7 @@ def _check_ubj_forms(model_path: str, booster: xgb.Booster) -> str | None:
 
 
 def _dense(values: list, n_rows: int, n_cols: int) -> np.ndarray:
-    x = np.array([np.nan if v is None else v for v in values], dtype=np.float32)
-    return x.reshape(n_rows, n_cols)
+    return dense_f32(values, n_rows, n_cols)
 
 
 def check_case(model_path: str) -> tuple[str, str]:

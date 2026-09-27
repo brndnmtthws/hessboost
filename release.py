@@ -98,11 +98,11 @@ def package_version(manifest: str) -> str:
         return str(tomllib.load(manifest_file)["package"]["version"])
 
 
-def check_tools() -> str:
-    missing = [tool for tool in ("git", "cargo", "uv", "gh") if shutil.which(tool) is None]
+def require_tools(names: tuple[str, ...]) -> str:
+    missing = [tool for tool in names if shutil.which(tool) is None]
     if missing:
         raise CheckError(f"not on PATH: {', '.join(missing)}")
-    return "git, cargo, uv, gh"
+    return ", ".join(names)
 
 
 def check_git() -> str:
@@ -300,14 +300,6 @@ def bumped_version(current: str, part: str) -> str:
     return part
 
 
-def check_bump_tools(no_pr: bool) -> str:
-    required = ("git", "cargo", "cargo-nextest", "uv") + (() if no_pr else ("gh",))
-    missing = [tool for tool in required if shutil.which(tool) is None]
-    if missing:
-        raise CheckError(f"not on PATH: {', '.join(missing)}")
-    return ", ".join(required)
-
-
 def check_bump_version(version: str, current: str) -> str:
     semver_key(version)
     wheel = pep440(version)
@@ -366,6 +358,90 @@ def step(name: str, check: Callable[[], str]) -> bool:
         return False
 
 
+def run_checks(checks: list[tuple[str, Callable[[], str]]], failure: str) -> bool:
+    failed = 0
+    for name, check in checks:
+        if not step(name, check):
+            failed += 1
+    if failed:
+        print(f"\n{failure.format(failed=failed)}")
+        return False
+    return True
+
+
+def confirm(prompt: str) -> bool:
+    try:
+        answer = input(prompt)
+    except EOFError:
+        answer = ""
+    return answer.strip().lower() in ("y", "yes")
+
+
+def refresh_manifest_versions(version: str) -> str:
+    replace_package_version("Cargo.toml", version)
+    replace_package_version("python/Cargo.toml", version)
+    if package_version("Cargo.toml") != version or package_version("python/Cargo.toml") != version:
+        raise CheckError("manifest version verification failed")
+    return f"Cargo.toml and python/Cargo.toml are {version}"
+
+
+def refresh_lockfiles() -> str:
+    run("cargo", "update", "-p", "hessboost", "--manifest-path", "python/Cargo.toml")
+    run("uv", "lock", cwd=ROOT / "python")
+    return check_locks()
+
+
+def save_and_verify_models(version: str) -> str:
+    before = run("git", "status", "--porcelain", "--", "tests/data/saved")
+    run(
+        "cargo",
+        "nextest",
+        "run",
+        "--test",
+        "native_format",
+        "--run-ignored",
+        "only",
+        "save_models_of_this_version",
+    )
+    saved = ROOT / "tests" / "data" / "saved" / version
+    after = run("git", "status", "--porcelain", "--", "tests/data/saved")
+    if not saved.is_dir() or not any(saved.iterdir()):
+        raise CheckError(f"{saved.relative_to(ROOT)}/ was not created with files")
+    if after.strip() != f"?? tests/data/saved/{version}/" or before:
+        raise CheckError("saved-model status changed outside the new version directory")
+    return f"{saved.relative_to(ROOT)}/ contains new files only"
+
+
+def open_pr(branch: str, version: str) -> str:
+    body = (
+        f"## Release bump\n\nUpdated hessboost to `{version}`, refreshed Rust/Python "
+        "lockfiles, and saved this version's native models.\n\n"
+        "After merge, on `main`: `./release.py --dry-run` then `./release.py`."
+    )
+    return run(
+        "gh",
+        "pr",
+        "create",
+        "--base",
+        "main",
+        "--head",
+        branch,
+        "--title",
+        f"chore(release): v{version}",
+        "--body",
+        body,
+    )
+
+
+def commit_and_push(branch: str, version: str, no_pr: bool) -> None:
+    run("git", "add", "-A")
+    run("git", "commit", "-m", f"chore(release): v{version}")
+    run("git", "push", "-u", "origin", branch)
+    print(f"  ✓ push: pushed {branch} to origin")
+    if not no_pr:
+        print(f"  ✓ pull request: {open_pr(branch, version)}")
+
+
 def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
     try:
         current = package_version("Cargo.toml")
@@ -375,18 +451,18 @@ def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
         return 1
     branch = f"release/v{version}"
     checks: list[tuple[str, Callable[[], str]]] = [
-        ("tools", lambda: check_bump_tools(no_pr)),
+        (
+            "tools",
+            lambda: require_tools(
+                ("git", "cargo", "cargo-nextest", "uv") + (() if no_pr else ("gh",))
+            ),
+        ),
         ("git state", check_git),
         ("version", lambda: check_bump_version(version, current)),
         ("release targets", lambda: check_bump_targets(version)),
     ]
     print(f"Checking release bump hessboost {current} → {version}")
-    failed = 0
-    for name, check in checks:
-        if not step(name, check):
-            failed += 1
-    if failed:
-        print("\nPreconditions failed; no changes made.")
+    if not run_checks(checks, "Preconditions failed; no changes made."):
         return 1
     print(
         f"\nPlan: hessboost {current} → {version}\n  PyPI:   {pep440(version)}\n  branch: {branch}"
@@ -394,99 +470,27 @@ def bump(version_arg: str, dry_run: bool, yes: bool, no_pr: bool) -> int:
     if dry_run:
         print("\nDry run: preconditions passed; no changes made.")
         return 0
-    if not yes:
-        try:
-            answer = input(f"\nCreate and push {branch}? [y/N] ")
-        except EOFError:
-            answer = ""
-        if answer.strip().lower() not in ("y", "yes"):
-            print("Aborted.")
-            return 1
+    if not yes and not confirm(f"\nCreate and push {branch}? [y/N] "):
+        print("Aborted.")
+        return 1
     created = False
     try:
         run("git", "switch", "-c", branch)
         created = True
         print(f"  ✓ branch: created {branch}")
 
-        def manifest_versions() -> str:
-            replace_package_version("Cargo.toml", version)
-            replace_package_version("python/Cargo.toml", version)
-            if (
-                package_version("Cargo.toml") != version
-                or package_version("python/Cargo.toml") != version
-            ):
-                raise CheckError("manifest version verification failed")
-            return f"Cargo.toml and python/Cargo.toml are {version}"
-
-        if not step("manifest versions", manifest_versions):
+        if not step("manifest versions", lambda: refresh_manifest_versions(version)):
             raise CheckError("manifest update failed")
-
-        def lockfiles() -> str:
-            run(
-                "cargo",
-                "update",
-                "-p",
-                "hessboost",
-                "--manifest-path",
-                "python/Cargo.toml",
-            )
-            run("uv", "lock", cwd=ROOT / "python")
-            return check_locks()
-
-        if not step("lockfiles", lockfiles):
+        if not step("lockfiles", refresh_lockfiles):
             raise CheckError("lockfile refresh failed")
         references = update_version_references(current, version)
         print(
             "  ✓ version references: "
             + (", ".join(references) if references else "no current-release snippets found")
         )
-        before_saved = run("git", "status", "--porcelain", "--", "tests/data/saved")
-        if not step(
-            "saved models",
-            lambda: run(
-                "cargo",
-                "nextest",
-                "run",
-                "--test",
-                "native_format",
-                "--run-ignored",
-                "only",
-                "save_models_of_this_version",
-            ),
-        ):
+        if not step("saved models", lambda: save_and_verify_models(version)):
             raise CheckError("saved-model generation failed")
-        saved = ROOT / "tests" / "data" / "saved" / version
-        after_saved = run("git", "status", "--porcelain", "--", "tests/data/saved")
-        if not saved.is_dir() or not any(saved.iterdir()):
-            raise CheckError(f"{saved.relative_to(ROOT)}/ was not created with files")
-        expected_status = f"?? tests/data/saved/{version}/"
-        if after_saved.strip() != expected_status or before_saved:
-            raise CheckError("saved-model status changed outside the new version directory")
-        print(f"  ✓ saved models: {saved.relative_to(ROOT)}/ contains new files only")
-        run("git", "add", "-A")
-        run("git", "commit", "-m", f"chore(release): v{version}")
-        run("git", "push", "-u", "origin", branch)
-        print(f"  ✓ push: pushed {branch} to origin")
-        if not no_pr:
-            body = (
-                f"## Release bump\n\nUpdated hessboost to `{version}`, refreshed Rust/Python "
-                "lockfiles, and saved this version's native models.\n\n"
-                "After merge, on `main`: `./release.py --dry-run` then `./release.py`."
-            )
-            url = run(
-                "gh",
-                "pr",
-                "create",
-                "--base",
-                "main",
-                "--head",
-                branch,
-                "--title",
-                f"chore(release): v{version}",
-                "--body",
-                body,
-            )
-            print(f"  ✓ pull request: {url}")
+        commit_and_push(branch, version, no_pr)
         return 0
     except (CheckError, OSError, KeyError, ValueError) as err:
         if created:
@@ -523,7 +527,7 @@ def main() -> int:
         return 1
     tag = f"v{version}"
     checks: list[tuple[str, Callable[[], str]]] = [
-        ("tools", check_tools),
+        ("tools", lambda: require_tools(("git", "cargo", "uv", "gh"))),
         ("git state", check_git),
         ("manifest versions", lambda: check_manifests(version)),
         ("version", lambda: check_newer(version)),
@@ -534,15 +538,7 @@ def main() -> int:
         ("CI", check_ci),
     ]
     print(f"Checking release hessboost {version} ({tag})")
-    failed = 0
-    for name, check in checks:
-        try:
-            print(f"  ✓ {name}: {check()}")
-        except (CheckError, OSError, KeyError, ValueError) as err:
-            print(f"  ✗ {name}: {err}")
-            failed += 1
-    if failed:
-        print(f"\n{failed} check(s) failed; not tagging.")
+    if not run_checks(checks, "{failed} check(s) failed; not tagging."):
         return 1
     commit = run("git", "log", "-1", "--format=%h %s")
     prerelease = " (marked prerelease)" if "-" in version else ""
@@ -555,14 +551,9 @@ def main() -> int:
     if args.dry_run:
         print("\nDry run: all checks passed; not tagging.")
         return 0
-    if not args.yes:
-        try:
-            answer = input(f"\nCreate and push tag {tag}? [y/N] ")
-        except EOFError:
-            answer = ""
-        if answer.strip().lower() not in ("y", "yes"):
-            print("Aborted.")
-            return 1
+    if not args.yes and not confirm(f"\nCreate and push tag {tag}? [y/N] "):
+        print("Aborted.")
+        return 1
     run("git", "tag", "-a", tag, "-m", tag)
     try:
         run("git", "push", "origin", f"refs/tags/{tag}")

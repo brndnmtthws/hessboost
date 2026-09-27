@@ -30,12 +30,19 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import zlib
 from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 import xgboost as xgb
+
+from _fixture_common import json_floats, seed_for, write_json
+
+
+def _to_json_floats(values: np.ndarray) -> list:
+    """f32 array -> list of Python floats, NaN -> None (JSON null)."""
+    return json_floats(values, np.float32)
+
 
 # The pinned release (scripts/requirements-xgboost.txt).
 XGBOOST_VERSION = "3.4.2"
@@ -79,7 +86,7 @@ TREE_BASE = {
 
 
 def _seed(name: str) -> int:
-    return BASE_SEED ^ zlib.crc32(name.encode())
+    return seed_for(BASE_SEED, name)
 
 
 # ---------------------------------------------------------------------------
@@ -1054,14 +1061,6 @@ def _quality_band(params: dict) -> float:
     return BAND_RMSE
 
 
-def _to_json_floats(a: np.ndarray) -> list:
-    """f32 array -> list of Python floats, NaN -> None (JSON null)."""
-    a = np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
-    out = a.astype(np.float64).astype(object)
-    out[np.isnan(a)] = None
-    return out.tolist()
-
-
 def _to_json_bounds(a: np.ndarray) -> list:
     """f32 label bounds -> list of Python floats; +/-inf -> "inf"/"-inf" strings
     (JSON has no infinity; bounds are never NaN)."""
@@ -1456,8 +1455,7 @@ def main() -> None:
     for name in CASES:
         fixture = build_case(name)
         path = os.path.join(FIX_DIR, f"{name}.json")
-        with open(path, "w") as fh:
-            json.dump(fixture, fh, separators=(",", ":"))
+        write_json(path, fixture)
         print(
             f"{name:<26} {fixture['tier']:<7} {fixture['params']['objective']:<22} "
             f"rounds={fixture['num_round']:<3} pred={len(fixture['xgb_pred'])} "
@@ -1469,8 +1467,7 @@ def main() -> None:
     for name in CUT_CASES:
         fixture = build_cut_case(name)
         path = os.path.join(CUT_DIR, f"{name}.json")
-        with open(path, "w") as fh:
-            json.dump(fixture, fh, separators=(",", ":"))
+        write_json(path, fixture)
         print(
             f"{name:<26} cuts    rows={fixture['n_rows']:<7} cols={fixture['n_cols']} "
             f"max_bin={fixture['max_bin']:<4} n_cuts={len(fixture['cuts'])}"

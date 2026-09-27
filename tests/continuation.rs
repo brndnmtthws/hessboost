@@ -357,7 +357,7 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
         stats_only
             .trees()
             .iter()
-            .all(|t| t.node(0).sum_hess == 150.0)
+            .all(|t| t.node(0).unwrap().sum_hess == 150.0)
     );
 
     let update = base()

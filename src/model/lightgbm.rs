@@ -847,8 +847,11 @@ fn convert_tree(fields: &TreeFields, n_features: usize) -> Result<RegTree, Strin
             .ok_or_else(|| at(format!("unknown decision_type {}", decision_types[i])))?;
         let mut node = Node::leaf(0.0, internal_covers[i]);
         node.split_feature = feature;
-        node.left = node_id(left[i], n_internal, n_leaves).map_err(at)?;
-        node.right = node_id(right[i], n_internal, n_leaves).map_err(at)?;
+        let (left, right) = (
+            node_id(left[i], n_internal, n_leaves).map_err(at)?,
+            node_id(right[i], n_internal, n_leaves).map_err(at)?,
+        );
+        node.set_links(left, right);
         node.split_gain = gains[i];
         if decision & CATEGORICAL_MASK != 0 {
             // `CategoricalDecision`: NaN and negative values go right,
@@ -869,7 +872,7 @@ fn convert_tree(fields: &TreeFields, n_features: usize) -> Result<RegTree, Strin
             node.split_cond = route.split_cond;
             node.default_left = route.default_left;
             if route.swap {
-                std::mem::swap(&mut node.left, &mut node.right);
+                node.set_links(right, left);
             }
         }
         nodes.push(node);

@@ -112,7 +112,9 @@ fn linear_leaves_route_zero_weight_rows_like_the_tree() {
         [1.5, 0.0, 7.5, 0.0, 0.0]
     );
     let linear = model.trees()[1].linear_leaves().unwrap();
-    let intercepts: Vec<u64> = (0..5).map(|id| linear.intercept(id).to_bits()).collect();
+    let intercepts: Vec<u64> = (0..5)
+        .map(|id| linear.intercept(id).unwrap().to_bits())
+        .collect();
     let routed: Vec<u64> = [0.0f64, 0.0, 2.5, 0.5, -0.0].map(f64::to_bits).to_vec();
     assert_eq!(intercepts, routed);
 }
@@ -1654,14 +1656,14 @@ fn custom_objective_outputs_must_match_the_label_layout() {
 #[test]
 fn exact_interaction_constraints_confine_each_path() {
     fn visit(tree: &RegTree, node: usize, path: &mut Vec<u32>) {
-        let current = tree.node(node);
-        if current.is_leaf() {
+        let current = tree.node_at(node);
+        let Some((left, right)) = current.children() else {
             assert!(path.iter().all(|feature| *feature == path[0]));
             return;
-        }
+        };
         path.push(current.split_feature);
-        visit(tree, current.left as usize, path);
-        visit(tree, current.right as usize, path);
+        visit(tree, left, path);
+        visit(tree, right, path);
         path.pop();
     }
 

@@ -94,13 +94,12 @@ fn depth_and_completeness(tree: &RegTree, stack: &mut Vec<(usize, u32)>) -> (u32
     stack.push((0, 0));
     let (mut shallowest, mut deepest) = (u32::MAX, 0);
     while let Some((id, d)) = stack.pop() {
-        let node = tree.node(id);
-        if node.is_leaf() {
+        if let Some((left, right)) = tree.node_at(id).children() {
+            stack.push((left, d + 1));
+            stack.push((right, d + 1));
+        } else {
             shallowest = shallowest.min(d);
             deepest = deepest.max(d);
-        } else {
-            stack.push((node.left as usize, d + 1));
-            stack.push((node.right as usize, d + 1));
         }
     }
     (deepest, shallowest >= deepest)
@@ -114,10 +113,9 @@ fn preorder(tree: &RegTree, order: &mut Vec<usize>, stack: &mut Vec<usize>) {
     stack.push(0);
     while let Some(id) = stack.pop() {
         order.push(id);
-        let node = tree.node(id);
-        if !node.is_leaf() {
-            stack.push(node.right as usize);
-            stack.push(node.left as usize);
+        if let Some((left, right)) = tree.node_at(id).children() {
+            stack.push(right);
+            stack.push(left);
         }
     }
 }
@@ -472,18 +470,17 @@ impl<'a> Encoding<'a> {
         heap.resize(2 * internal + 1, None);
         heap[0] = Some(0);
         for i in 0..internal {
-            if let Some(id) = heap[i] {
-                let node = tree.node(id);
-                if !node.is_leaf() {
-                    heap[2 * i + 1] = Some(node.left as usize);
-                    heap[2 * i + 2] = Some(node.right as usize);
-                }
+            if let Some(id) = heap[i]
+                && let Some((left, right)) = tree.node_at(id).children()
+            {
+                heap[2 * i + 1] = Some(left);
+                heap[2 * i + 2] = Some(right);
             }
         }
         for (i, slot) in heap.iter().enumerate() {
             let start = w.len;
             if let Some(id) = *slot {
-                let node = tree.node(id);
+                let node = tree.node_at(id);
                 if i < internal && !complete {
                     w.write_bool(node.is_leaf());
                 }
@@ -520,11 +517,11 @@ impl<'a> Encoding<'a> {
         let offset_bits = bits(u64::from(nodes) - 1);
         for (p, &id) in scratch.order.iter().enumerate() {
             let start = w.len;
-            let node = tree.node(id);
+            let node = tree.node_at(id);
             w.write_bool(node.is_leaf());
             self.write_node(w, tree, node, &mut scratch.cats);
-            if !node.is_leaf() {
-                let right = position[node.right as usize] - p as u32;
+            if let Some((_, right)) = node.children() {
+                let right = position[right] - p as u32;
                 w.write(u64::from(right), offset_bits);
             }
             w.write(0, slot_width - (w.len - start) as u32);

@@ -66,7 +66,7 @@ impl<'a> TermPart<'a> {
         for (t, tree) in trees.iter().enumerate() {
             for leaf in &grid.leaves[grid.leaf_start[t]..grid.leaf_start[t + 1]] {
                 let rows: f64 = leaf.boxes.iter().map(|&b| grid.box_sum(&prefix, b)).sum();
-                let cover = f64::from(tree.node(leaf.node as usize).sum_hess);
+                let cover = f64::from(tree.node_at(leaf.node as usize).sum_hess);
                 if rows < cover {
                     return Err(HessboostError::invalid_param(
                         "train",

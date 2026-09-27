@@ -270,7 +270,7 @@ impl TreeUpdate<'_> {
         // (old node, new node, depth, deltas reaching it)
         let mut queue = std::collections::VecDeque::from([(0usize, 0usize, 0usize, deltas)]);
         while let Some((old_id, new_id, depth, deltas)) = queue.pop_front() {
-            let old = *self.old_tree.node(old_id);
+            let old = *self.old_tree.node_at(old_id);
             let mut cache = std::mem::take(&mut old_nodes[old_id]);
             // A split no row of the cached data reached has no histogram
             // yet (a model resumed on other data, or a regrown node the
@@ -287,7 +287,7 @@ impl TreeUpdate<'_> {
                 }
             }
             let touched = !deltas.is_empty();
-            if old.is_leaf() {
+            let Some((old_left, old_right)) = old.children() else {
                 let value = if touched {
                     (calc_weight(cache.stats, self.reg) as f32) * self.eta
                 } else {
@@ -298,7 +298,7 @@ impl TreeUpdate<'_> {
                 nodes[new_id] = cache;
                 report.nodes_kept += 1;
                 continue;
-            }
+            };
             // An untouched node's histogram, and so its ranking, is as
             // before: its split stays.
             let (keep, gain) = if touched {
@@ -331,14 +331,14 @@ impl TreeUpdate<'_> {
                 let (mut left, mut right) = (Vec::new(), Vec::new());
                 for d in deltas {
                     let value = self.value(&d, old.split_feature as usize);
-                    if self.old_tree.child(old_id, value) == old.left as usize {
+                    if self.old_tree.child(old_id, value) == old_left {
                         left.push(d);
                     } else {
                         right.push(d);
                     }
                 }
-                queue.push_back((old.left as usize, l, depth + 1, left));
-                queue.push_back((old.right as usize, r, depth + 1, right));
+                queue.push_back((old_left, l, depth + 1, left));
+                queue.push_back((old_right, r, depth + 1, right));
                 report.nodes_kept += 1;
                 continue;
             }
@@ -384,12 +384,12 @@ impl TreeUpdate<'_> {
 /// Copy `src`'s subtree at `src_id` into `dst` at leaf `dst_id`, scaling
 /// leaf weights by `eta` (the builder leaves them unshrunk).
 fn graft(dst: &mut RegTree, dst_id: usize, src: &RegTree, src_id: usize, eta: f32) {
-    let node = *src.node(src_id);
+    let node = *src.node_at(src_id);
     dst.set_sum_hess(dst_id, node.sum_hess);
-    if node.is_leaf() {
+    let Some((src_left, src_right)) = node.children() else {
         dst.set_leaf_value(dst_id, node.leaf_value * eta);
         return;
-    }
+    };
     let (l, r) = dst.expand(
         dst_id,
         SplitRule::numeric(node.split_feature, node.split_cond, node.default_left),
@@ -397,8 +397,8 @@ fn graft(dst: &mut RegTree, dst_id: usize, src: &RegTree, src_id: usize, eta: f3
         ChildLeaf::new(0.0, 0.0),
     );
     dst.set_split_gain(dst_id, node.split_gain);
-    graft(dst, l, src, node.left as usize, eta);
-    graft(dst, r, src, node.right as usize, eta);
+    graft(dst, l, src, src_left, eta);
+    graft(dst, r, src, src_right, eta);
 }
 
 #[cfg(test)]

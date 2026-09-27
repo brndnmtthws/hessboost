@@ -432,9 +432,9 @@ fn vector_leaf_storage_is_bounded_by_the_leaf_weights() {
     let mut tj = tree(heap_left, heap_right, &weights);
     tj["tree_param"]["size_leaf_vector"] = json!(k.to_string());
     let decoded = tree_from_json(&tj, k).unwrap();
-    assert_eq!(decoded.leaf_vector(internal), [0.0, 1.0]);
+    assert_eq!(decoded.leaf_weights(internal), [0.0, 1.0]);
     assert_eq!(
-        decoded.leaf_vector(N - 1),
+        decoded.leaf_weights(N - 1),
         [(2 * leaves - 2) as f32, (2 * leaves - 1) as f32]
     );
 }
@@ -690,7 +690,12 @@ fn gblinear_export_is_rejected_and_categorical_roundtrips() {
     assert!(export_xgboost_json(&model).is_err());
 
     let (model, categorical) = categorical_model();
-    assert!(model.trees().iter().any(|tree| tree.node(0).is_categorical));
+    assert!(
+        model
+            .trees()
+            .iter()
+            .any(|tree| tree.node_at(0).is_categorical)
+    );
     let before = model.predict(&categorical, Iterations::Best).unwrap();
     let restored = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
     assert_eq!(

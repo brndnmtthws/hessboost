@@ -60,8 +60,8 @@ fn reference_margins(model: &BoostedModel, x: &[f32], n: usize) -> Vec<f32> {
         let row = &x[r * COLS..(r + 1) * COLS];
         let mut m = model.base_scores().to_vec();
         for tree in model.trees() {
-            let leaf = tree.leaf_id_dense(row, f32::NAN);
-            for (o, v) in m.iter_mut().zip(tree.leaf_vector(leaf)) {
+            let leaf = tree.leaf_id_dense(row, f32::NAN).unwrap();
+            for (o, v) in m.iter_mut().zip(tree.leaf_vector(leaf).unwrap()) {
                 *o += v;
             }
         }
@@ -331,7 +331,9 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
     let mut sums = vec![[0.0f64; K]; tree.num_nodes()];
     let mut counts = vec![0usize; tree.num_nodes()];
     for r in 0..N {
-        let leaf = tree.leaf_id_dense(&x[r * COLS..(r + 1) * COLS], f32::NAN);
+        let leaf = tree
+            .leaf_id_dense(&x[r * COLS..(r + 1) * COLS], f32::NAN)
+            .unwrap();
         counts[leaf] += 1;
         for (sum, &label) in sums[leaf].iter_mut().zip(&y[r * K..(r + 1) * K]) {
             *sum += f64::from(label - 0.5);
@@ -340,7 +342,7 @@ fn reduced_gradients_grow_structure_from_the_sketch() {
     for (leaf, &count) in counts.iter().enumerate().filter(|(_, c)| **c > 0) {
         for (t, sum) in sums[leaf].iter().enumerate() {
             let want = 0.3 * sum / count as f64;
-            let got = f64::from(tree.leaf_vector(leaf)[t]);
+            let got = f64::from(tree.leaf_vector(leaf).unwrap()[t]);
             assert!(
                 (got - want).abs() < 1e-5,
                 "leaf {leaf} target {t}: {got} vs {want}"

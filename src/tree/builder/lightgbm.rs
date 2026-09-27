@@ -133,7 +133,7 @@ impl SplitOptions {
 /// parent's split recorded; only a root that never split still needs its own
 /// (unsmoothed) output.
 pub(super) fn finalize_smoothed_leaves(tree: &mut RegTree, root: GradStats, reg: &RegParams) {
-    if tree.node(0).is_leaf() {
+    if tree.node_at(0).is_leaf() {
         tree.set_leaf_value(0, xgb_calc_weight(root, reg) as f32);
     }
 }
@@ -464,14 +464,14 @@ mod tests {
             let mut nid = 0usize;
             loop {
                 members[nid].push(row);
-                let node = tree.node(nid);
-                if node.is_leaf() {
+                let node = tree.node_at(nid);
+                let Some((left, right)) = node.children() else {
                     break;
-                }
+                };
                 let go_left = data
                     .get(row, node.split_feature as usize)
                     .map_or(node.default_left, |v| v < node.split_cond);
-                nid = if go_left { node.left } else { node.right } as usize;
+                nid = if go_left { left } else { right };
             }
         }
         for (nid, node) in tree.nodes().iter().enumerate() {
@@ -506,7 +506,7 @@ mod tests {
         let sets: std::collections::BTreeSet<usize> = (0..16)
             .map(|seed| {
                 let tree = grow(&extra(1), &data, &gpair, seed);
-                let root = tree.node(0);
+                let root = tree.node_at(0);
                 assert!(root.is_categorical);
                 (root.cat_end - root.cat_begin) as usize
             })

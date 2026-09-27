@@ -243,15 +243,15 @@ impl BreadthFirst {
         while i < order.len() {
             let old = order[i] as usize;
             let n = &src[old];
-            if !n.is_leaf() {
+            if let Some((left, right)) = n.children() {
                 // Numeric splits whose missing values go right are stored
                 // mirrored; categorical nodes keep (left, right).
                 let (first, second) = if n.default_left || n.is_categorical {
-                    (n.left, n.right)
+                    (left, right)
                 } else {
-                    (n.right, n.left)
+                    (right, left)
                 };
-                for child in [first as usize, second as usize] {
+                for child in [first, second] {
                     new_id[child] = base + order.len() as u32;
                     depth_of[child] = depth_of[old] + 1;
                     order.push(child as u32);
@@ -388,11 +388,11 @@ impl CompactForest {
     ) -> CNode {
         let n = &tree.nodes()[old];
         let id = self.nodes.len() as u32;
-        if n.is_leaf() {
+        let Some((left, right)) = n.children() else {
             let aux = if tree.is_vector_leaf() {
                 let offset = u32::try_from(self.leaf_vectors.len())
                     .expect("leaf vectors exceed the compact encoding");
-                self.leaf_vectors.extend_from_slice(tree.leaf_vector(old));
+                self.leaf_vectors.extend_from_slice(tree.leaf_weights(old));
                 offset
             } else {
                 n.leaf_value.to_bits()
@@ -403,7 +403,7 @@ impl CompactForest {
                 left: id,
                 aux,
             };
-        }
+        };
         meta.max_feature = meta.max_feature.max(n.split_feature);
         if n.is_categorical {
             meta.has_categorical = true;
@@ -419,7 +419,7 @@ impl CompactForest {
             CNode {
                 slot: n.split_feature * FEATURE_LANES as u32,
                 key: begin,
-                left: new_id[n.left as usize],
+                left: new_id[left],
                 aux,
             }
         } else if n.default_left {
@@ -427,7 +427,7 @@ impl CompactForest {
             CNode {
                 slot: n.split_feature * FEATURE_LANES as u32,
                 key: key(next_below(n.split_cond)),
-                left: new_id[n.left as usize],
+                left: new_id[left],
                 aux: 0,
             }
         } else {
@@ -436,7 +436,7 @@ impl CompactForest {
             CNode {
                 slot: n.split_feature * FEATURE_LANES as u32 + LANES as u32,
                 key: key(-n.split_cond),
-                left: new_id[n.right as usize],
+                left: new_id[right],
                 aux: 0,
             }
         }
@@ -930,11 +930,11 @@ mod tests {
         };
         f.original_leaf_ids(0, block, &mut out, 1);
         for (r, row) in rows.iter().enumerate() {
-            let want = t.leaf_id_dense(row, f32::NAN);
+            let want = t.leaf_id_dense(row, f32::NAN).unwrap();
             assert_eq!(out[r] as usize, want, "row {r}");
             let leaf = f.leaf_id(0, row);
             assert_eq!(f.original_id(leaf) as usize, want);
-            assert_eq!(f.leaf_value(leaf), t.node(want).leaf_value);
+            assert_eq!(f.leaf_value(leaf), t.node_at(want).leaf_value);
         }
     }
 
@@ -1011,10 +1011,10 @@ mod tests {
         f.accumulate_row(&row, 3..trees.len(), 2, |t| 1.0 + t as f32, &mut acc);
         let mut want_acc = vec![0.25f32; 3];
         for (t, tree) in trees.iter().enumerate() {
-            let want = tree.leaf_id_dense(&row, f32::NAN);
+            let want = tree.leaf_id_dense(&row, f32::NAN).unwrap();
             assert_eq!(out[t] as usize, want, "tree {t}");
             if t >= 3 {
-                want_acc[(t / 2) % 3] += (1.0 + t as f32) * tree.node(want).leaf_value;
+                want_acc[(t / 2) % 3] += (1.0 + t as f32) * tree.node_at(want).leaf_value;
             }
         }
         assert_eq!(acc, want_acc);
@@ -1041,10 +1041,10 @@ mod tests {
             let f = CompactForest::from_trees(&[first, t.clone()]);
             assert!(f.trees[1].has_categorical);
             for v in [0.0f32, 2.0, 5.0, 7.0, f32::NAN] {
-                let want = t.leaf_id_dense(&[v], f32::NAN);
+                let want = t.leaf_id_dense(&[v], f32::NAN).unwrap();
                 let got = f.leaf_id(1, &[v]);
                 assert_eq!(f.original_id(got) as usize, want, "v={v} dl={default_left}");
-                assert_eq!(f.leaf_value(got), t.node(want).leaf_value);
+                assert_eq!(f.leaf_value(got), t.node_at(want).leaf_value);
             }
         }
     }
@@ -1151,7 +1151,7 @@ mod tests {
             f.original_leaf_ids(t, block, &mut ids, 1);
             for r in 0..n {
                 let row = &rows[r * 2..r * 2 + 2];
-                let want = tree.leaf_id_dense(row, f32::NAN);
+                let want = tree.leaf_id_dense(row, f32::NAN).unwrap();
                 assert_eq!(ids[r] as usize, want, "tree {t} row {row:?} (block)");
                 let leaf = f.leaf_id(t, row);
                 assert_eq!(f.original_id(leaf) as usize, want, "tree {t} row {row:?}");
@@ -1175,7 +1175,7 @@ mod tests {
         );
         let f = CompactForest::from_trees(std::slice::from_ref(&t));
         for v in [f32::NEG_INFINITY, -1.0, 0.0, 1.0, f32::INFINITY, f32::NAN] {
-            let want = t.leaf_id_dense(&[v], f32::NAN);
+            let want = t.leaf_id_dense(&[v], f32::NAN).unwrap();
             assert_eq!(f.original_id(f.leaf_id(0, &[v])) as usize, want, "v={v}");
             let mut out = [0u32];
             f.original_leaf_ids_for_row(&[v], &mut out);

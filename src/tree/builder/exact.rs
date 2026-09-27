@@ -351,7 +351,7 @@ impl<'a> ExactTreeBuilder<'a> {
                     if *nid < 0 {
                         return;
                     }
-                    let node = tree.node(*nid as usize);
+                    let node = tree.node_at(*nid as usize);
                     if node.is_leaf() {
                         return;
                     }
@@ -778,7 +778,7 @@ mod tests {
             3,
             "root should have split into two leaves"
         );
-        let root = tree.node(0);
+        let root = tree.node_at(0);
         assert_eq!(root.split_feature, 0);
         assert!((root.split_cond - 0.5).abs() < 1e-6);
         // left leaf: G=2,H=2 -> w=-1 ; right leaf: G=-2,H=2 -> w=+1
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(tree.num_nodes(), 3);
         // The missing row should be routed with the negative-gradient group
         // (right, positive weight). default_left should therefore be false.
-        assert!(!tree.node(0).default_left);
+        assert!(!tree.node_at(0).default_left);
         assert!(tree.predict_row(&data, 2) > 0.0);
     }
 
@@ -884,7 +884,10 @@ mod tests {
         let tree = grow_exact(&params, &data, &gpair);
 
         assert_eq!(tree.num_nodes(), 3, "root should split");
-        assert!(tree.node(0).is_categorical, "split should be categorical");
+        assert!(
+            tree.node_at(0).is_categorical,
+            "split should be categorical"
+        );
 
         // Prediction for a bare category value.
         let pred = |c: f32| tree.leaf_id_with(|_| Some(c));
@@ -894,7 +897,7 @@ mod tests {
         assert_ne!(pred(0.0), pred(1.0), "the two groups must be separated");
 
         // Even cats (positive grad) want negative weight; odd cats positive.
-        let val = |c: f32| tree.node(pred(c)).leaf_value;
+        let val = |c: f32| tree.node_at(pred(c)).leaf_value;
         assert!(val(0.0) < 0.0 && val(2.0) < 0.0);
         assert!(val(1.0) > 0.0 && val(3.0) > 0.0);
     }

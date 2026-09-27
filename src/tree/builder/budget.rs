@@ -428,7 +428,7 @@ impl GrownTree {
     /// Add each leaf's value to the training margins of its rows.
     pub fn apply(&self, margins: &mut [f32]) {
         for &(nid, start, end) in &self.leaves {
-            let value = self.tree.node(nid).leaf_value;
+            let value = self.tree.node_at(nid).leaf_value;
             for &r in &self.index[start..end] {
                 margins[r as usize] += value;
             }

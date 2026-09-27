@@ -384,7 +384,7 @@ impl EbmInfo {
         let mut leaf_values = Vec::with_capacity(grid.leaves.len());
         for (t, tree) in trees.iter().enumerate() {
             for leaf in &grid.leaves[grid.leaf_start[t]..grid.leaf_start[t + 1]] {
-                leaf_values.push(f64::from(tree.node(leaf.node as usize).leaf_value));
+                leaf_values.push(f64::from(tree.node_at(leaf.node as usize).leaf_value));
             }
         }
         grid.paint(|i| leaf_values[i])

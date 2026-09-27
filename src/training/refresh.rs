@@ -50,18 +50,15 @@ pub(super) fn refresh_tree(
     };
     let stats = node_stats(tree, data, gpair);
     for nid in 0..tree.num_nodes() {
-        let node = *tree.node(nid);
+        let node = *tree.node_at(nid);
         tree.set_sum_hess(nid, stats[nid].hess as f32);
-        if node.is_leaf() {
-            if refresh.refresh_leaf() {
-                let base_weight = calc_weight(stats[nid], reg) as f32;
-                tree.set_leaf_value(nid, base_weight * learning_rate);
-            }
-        } else {
-            let gain = calc_gain(stats[node.left as usize], reg)
-                + calc_gain(stats[node.right as usize], reg)
+        if let Some((left, right)) = node.children() {
+            let gain = calc_gain(stats[left], reg) + calc_gain(stats[right], reg)
                 - calc_gain(stats[nid], reg);
             tree.set_split_gain(nid, gain as f32);
+        } else if refresh.refresh_leaf() {
+            let base_weight = calc_weight(stats[nid], reg) as f32;
+            tree.set_leaf_value(nid, base_weight * learning_rate);
         }
     }
 }
@@ -88,8 +85,8 @@ fn node_stats_batched(
             let gp = GradStats::from_pair(gpair[row]);
             let mut nid = 0;
             stats[nid].add(gp);
-            while !tree.node(nid).is_leaf() {
-                let feature = tree.node(nid).split_feature as usize;
+            while !tree.node_at(nid).is_leaf() {
+                let feature = tree.node_at(nid).split_feature as usize;
                 nid = tree.child(nid, data.get(row, feature));
                 stats[nid].add(gp);
             }
@@ -160,14 +157,14 @@ mod tests {
             GradStats::new(-3.0, 2.0),
             GradStats::new(0.5, 4.5),
         );
-        assert_eq!(tree.node(0).sum_hess, 4.5);
-        assert_eq!(tree.node(1).sum_hess, 2.5);
-        assert_eq!(tree.node(2).sum_hess, 2.0);
+        assert_eq!(tree.node_at(0).sum_hess, 4.5);
+        assert_eq!(tree.node_at(1).sum_hess, 2.5);
+        assert_eq!(tree.node_at(2).sum_hess, 2.0);
         let gain = calc_gain(left, &reg) + calc_gain(right, &reg) - calc_gain(root, &reg);
-        assert_eq!(tree.node(0).split_gain, gain as f32);
+        assert_eq!(tree.node_at(0).split_gain, gain as f32);
         // Leaf = base weight -G / (H + lambda), shrunk by the learning rate.
-        assert_eq!(tree.node(1).leaf_value, (-3.5f64 / 3.5) as f32 * 0.25);
-        assert_eq!(tree.node(2).leaf_value, (3.0f64 / 3.0) as f32 * 0.25);
+        assert_eq!(tree.node_at(1).leaf_value, (-3.5f64 / 3.5) as f32 * 0.25);
+        assert_eq!(tree.node_at(2).leaf_value, (3.0f64 / 3.0) as f32 * 0.25);
 
         // Without refresh_leaf the statistics change but the leaves do not.
         let mut kept = stump();
@@ -179,10 +176,10 @@ mod tests {
             Refresh::stats_only(),
             0.25,
         );
-        assert_eq!(kept.node(1).leaf_value, 7.0);
-        assert_eq!(kept.node(2).leaf_value, -7.0);
-        assert_eq!(kept.node(0).sum_hess, 4.5);
-        assert_eq!(kept.node(0).split_gain, gain as f32);
+        assert_eq!(kept.node_at(1).leaf_value, 7.0);
+        assert_eq!(kept.node_at(2).leaf_value, -7.0);
+        assert_eq!(kept.node_at(0).sum_hess, 4.5);
+        assert_eq!(kept.node_at(0).split_gain, gain as f32);
     }
 
     #[test]
@@ -198,8 +195,8 @@ mod tests {
             Refresh::default(),
             0.3,
         );
-        assert_eq!(tree.node(2).sum_hess, 0.0);
-        assert_eq!(tree.node(2).leaf_value, 0.0);
+        assert_eq!(tree.node_at(2).sum_hess, 0.0);
+        assert_eq!(tree.node_at(2).leaf_value, 0.0);
     }
 
     /// Bounding the buffered blocks does not change the ordered reduction:

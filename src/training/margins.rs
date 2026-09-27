@@ -130,7 +130,7 @@ pub(super) fn add_tree_margins(
         }),
         TreeOutput::Vector => for_each_row_margins(margins, n_out, |(row, margin)| {
             let leaf = tree.leaf_id_with(|f| data.get(row, f as usize));
-            for (m, &v) in margin.iter_mut().zip(tree.leaf_vector(leaf)) {
+            for (m, &v) in margin.iter_mut().zip(tree.leaf_weights(leaf)) {
                 *m += v;
             }
         }),
@@ -152,7 +152,7 @@ fn apply_leaf_rows(
             leaf_rows,
             margins,
             n_out,
-            |node| tree.node(node).leaf_value,
+            |node| tree.node_at(node).leaf_value,
             |margins, base, _, value| margins[base + k] += value,
         ),
         // `RegTree::predict_row`'s linear-leaf arithmetic, without routing.
@@ -163,14 +163,14 @@ fn apply_leaf_rows(
             |node| node,
             |margins, base, row, node| {
                 let get = |f: u32| data.get(row as usize, f as usize);
-                margins[base + k] += linear.predict(node, tree.node(node).leaf_value, get);
+                margins[base + k] += linear.predict(node, tree.node_at(node).leaf_value, get);
             },
         ),
         (TreeOutput::Vector, _) => apply_leaf_values(
             leaf_rows,
             margins,
             n_out,
-            |node| tree.leaf_vector(node),
+            |node| tree.leaf_weights(node),
             |margins, base, _, value: &[f32]| {
                 for (m, &v) in margins[base..base + n_out].iter_mut().zip(value) {
                     *m += v;

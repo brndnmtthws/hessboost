@@ -111,7 +111,7 @@ pub(super) fn accumulate(
         let g = stats_of(g);
         let mut nid = root;
         loop {
-            let node = tree.node(nid);
+            let node = tree.node_at(nid);
             out[nid].stats.add(g);
             if node.is_leaf() {
                 break;
@@ -130,10 +130,9 @@ pub(super) fn clear_subtree(tree: &RegTree, root: usize, nodes: &mut [NodeCache]
     let mut stack = vec![root];
     while let Some(nid) = stack.pop() {
         nodes[nid] = NodeCache::default();
-        let node = tree.node(nid);
-        if !node.is_leaf() {
-            stack.push(node.left as usize);
-            stack.push(node.right as usize);
+        if let Some((left, right)) = tree.node_at(nid).children() {
+            stack.push(left);
+            stack.push(right);
         }
     }
 }

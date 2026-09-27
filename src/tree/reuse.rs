@@ -333,7 +333,7 @@ mod tests {
             for tree in stumps(&stump_params(iota, xi), &data, &g, &[]) {
                 assert_eq!(tree.num_nodes() == 3, splits, "iota {iota}, xi {xi}");
                 if splits {
-                    let root = tree.node(0);
+                    let root = tree.node_at(0);
                     assert_eq!(root.split_feature, 0);
                     // The stored gain is the penalized one, eq. 3.
                     assert!((f64::from(root.split_gain) - (8.0 - iota - xi)).abs() < 1e-5);
@@ -354,7 +354,7 @@ mod tests {
             .map(|i| GradPair::new(if i < 4 { 1.0 } else { -1.0 }, 1.0))
             .collect();
         let [seed, _] = stumps(&stump_params(0.0, 0.0), &data, &g, &[]);
-        assert!(seed.node(0).is_categorical);
+        assert!(seed.node_at(0).is_categorical);
         for (iota, xi, seeded, splits) in [
             (5.0, 2.9, false, true),
             (5.0, 3.1, false, false),
@@ -391,21 +391,21 @@ mod tests {
             })
             .collect();
         let [seed1_hist, seed1_exact] = stumps(&free, &data, &g1, &[]);
-        assert_eq!(seed1_hist.node(0).split_feature, 1);
-        assert_eq!(seed.node(0).split_feature, 0);
+        assert_eq!(seed1_hist.node_at(0).split_feature, 1);
+        assert_eq!(seed.node_at(0).split_feature, 0);
         // ι = 7 makes feature 0 (gain 8) worth 1 − ξ, below feature 1's
         // reused threshold (gain 2, no penalty).
         let params = stump_params(7.0, 1.0);
         let [hist, _] = stumps(&params, &data, &g, std::slice::from_ref(&seed1_hist));
         let [_, exact] = stumps(&params, &data, &g, std::slice::from_ref(&seed1_exact));
         for (tree, seed) in [(hist, &seed1_hist), (exact, &seed1_exact)] {
-            assert_eq!(tree.node(0).split_feature, 1);
-            assert_eq!(tree.node(0).split_cond, seed.node(0).split_cond);
+            assert_eq!(tree.node_at(0).split_feature, 1);
+            assert_eq!(tree.node_at(0).split_cond, seed.node_at(0).split_cond);
         }
         // Without the seed, feature 1 is new too and feature 0 wins again.
         let [hist, exact] = stumps(&params, &data, &g, &[]);
-        assert!(hist.num_nodes() == 1 || hist.node(0).split_feature == 0);
-        assert!(exact.num_nodes() == 1 || exact.node(0).split_feature == 0);
+        assert!(hist.num_nodes() == 1 || hist.node_at(0).split_feature == 0);
+        assert!(exact.num_nodes() == 1 || exact.node_at(0).split_feature == 0);
     }
 
     /// Ten informative features, all of which plain boosting uses.

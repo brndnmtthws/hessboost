@@ -175,6 +175,33 @@ fn subsample_of(pool: &[u32], subsample: f64, rng: &mut Rng) -> Vec<u32> {
     bernoulli_rows(pool, rng, |_| subsample)
 }
 
+/// The rows of `pool` (whose queries are `row_queries`, out of `queries`)
+/// in the queries kept with probability `fraction`, one draw per query in
+/// query order. When no query of the pool is kept, the whole query of a
+/// random pool row: a tree always trains on whole queries.
+fn query_sample(
+    pool: &[u32],
+    row_queries: &[u32],
+    queries: usize,
+    fraction: f64,
+    rng: &mut Rng,
+) -> Vec<u32> {
+    let mut kept: Vec<bool> = (0..queries).map(|_| rng.f64() < fraction).collect();
+    let in_kept = |kept: &[bool]| -> Vec<u32> {
+        pool.iter()
+            .zip(row_queries)
+            .filter(|&(_, &query)| kept[query as usize])
+            .map(|(&row, _)| row)
+            .collect()
+    };
+    let rows = in_kept(&kept);
+    if !rows.is_empty() {
+        return rows;
+    }
+    kept[row_queries[rng.range(0..pool.len())] as usize] = true;
+    in_kept(&kept)
+}
+
 /// The rows of `pool`, each kept with probability `keep(row)`, in pool
 /// order (one draw per row); a random row of `pool` if none is kept.
 fn bernoulli_rows(pool: &[u32], rng: &mut Rng, keep: impl Fn(u32) -> f64) -> Vec<u32> {
@@ -342,24 +369,16 @@ impl Bag {
     /// `subsample`; under class-balanced bagging with its class's fraction
     /// (a label-`1` row with `pos_fraction`, any other with
     /// `neg_fraction`); under query bagging the rows of the queries kept
-    /// with probability `fraction` (one draw per query, in query order).
-    /// At least one row.
+    /// with probability `fraction` ([`query_sample`]). At least one row.
     fn tree_sample(&self, params: &TrainingParams, labels: &[f32], rng: &mut Rng) -> Vec<u32> {
         if let Some(bagging) = params.bagging_by_query {
-            let kept: Vec<bool> = (0..self.queries)
-                .map(|_| rng.f64() < bagging.fraction())
-                .collect();
-            let mut rows: Vec<u32> = self
-                .rows
-                .iter()
-                .zip(&self.row_queries)
-                .filter(|&(_, &query)| kept[query as usize])
-                .map(|(&row, _)| row)
-                .collect();
-            if rows.is_empty() {
-                rows.push(self.rows[rng.range(0..self.rows.len())]);
-            }
-            return rows;
+            return query_sample(
+                &self.rows,
+                &self.row_queries,
+                self.queries,
+                bagging.fraction(),
+                rng,
+            );
         }
         let Some(bagging) = params.balanced_bagging else {
             return subsample_of(&self.rows, params.subsample, rng);
@@ -856,4 +875,35 @@ pub(super) fn validate_data(dtrain: &DMatrix) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_sample;
+    use crate::rng::Rng;
+
+    /// With no query drawn, a tree still gets one whole query (its rows in
+    /// the bag), never a lone row of a multi-row query.
+    #[test]
+    fn an_empty_query_draw_falls_back_to_a_whole_query() {
+        // Queries 0 (rows 0..3), 1 (rows 3..10), 2 (rows 10..12); the bag
+        // lacks row 4.
+        let query_of = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2];
+        let pool: Vec<u32> = (0..12).filter(|&r| r != 4).collect();
+        let row_queries: Vec<u32> = pool.iter().map(|&r| query_of[r as usize]).collect();
+        let whole = |q: u32| -> Vec<u32> {
+            pool.iter()
+                .copied()
+                .filter(|&r| query_of[r as usize] == q)
+                .collect()
+        };
+        let mut seen = [false; 3];
+        for seed in 0..64 {
+            let rows = query_sample(&pool, &row_queries, 3, 1e-12, &mut Rng::new(seed));
+            let q = query_of[rows[0] as usize];
+            assert_eq!(rows, whole(q), "seed {seed}");
+            seen[q as usize] = true;
+        }
+        assert_eq!(seen, [true; 3]);
+    }
 }

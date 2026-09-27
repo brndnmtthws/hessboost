@@ -124,7 +124,7 @@
 //! let shapes = shape_functions(&model)?;
 //! assert_eq!(shapes.terms.len(), 2);
 //! let margin = shapes.intercept + shapes.terms[0].value(&[0.3])? + shapes.terms[1].value(&[0.5])?;
-//! let direct = model.predict(&DMatrix::from_dense(&[0.3, 0.5], 1, 2)?)?[0];
+//! let direct = model.predict(&DMatrix::from_dense(&[0.3, 0.5], 1, 2)?)?.as_slice()[0];
 //! assert!((margin - f64::from(direct)).abs() < 1e-4);
 //! # Ok(())
 //! # }

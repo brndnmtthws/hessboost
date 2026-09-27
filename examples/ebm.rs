@@ -77,6 +77,7 @@ fn main() -> Result<()> {
         let preds = m.predict(&dtest)?;
         let labels = dtest.labels().unwrap_or_default();
         let sse: f64 = preds
+            .as_slice()
             .iter()
             .zip(labels)
             .map(|(p, y)| f64::from(p - y).powi(2))

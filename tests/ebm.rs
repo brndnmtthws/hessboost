@@ -92,7 +92,7 @@ fn shape_functions_add_up_to_the_prediction() {
         let features: Vec<Vec<u32>> = shapes.terms.iter().map(|t| t.features().to_vec()).collect();
         assert_eq!(features, [vec![0], vec![1], vec![2], vec![0, 1]]);
         let preds = model.predict(&dtrain).unwrap();
-        for (row, &p) in x.chunks(3).zip(&preds) {
+        for (row, &p) in x.chunks(3).zip(preds.as_slice()) {
             let margin: f64 = shapes.intercept
                 + shapes
                     .terms
@@ -400,7 +400,7 @@ fn categorical_shapes_recover_the_per_category_effects() {
             );
         }
         let preds = model.predict(&dtrain).unwrap();
-        for (row, &p) in x.chunks(2).zip(&preds) {
+        for (row, &p) in x.chunks(2).zip(preds.as_slice()) {
             let margin = shapes.intercept
                 + shapes.terms[0].value(&row[..1]).unwrap()
                 + shapes.terms[1].value(&row[1..]).unwrap();
@@ -456,7 +456,7 @@ fn categorical_shapes_reconstruct_the_margins_for_codes_past_2_pow_24() {
     .unwrap();
     let shapes = shape_functions(&model).unwrap();
     let preds = model.predict(&dtrain).unwrap();
-    for (row, &p) in shifted.chunks(2).zip(&preds) {
+    for (row, &p) in shifted.chunks(2).zip(preds.as_slice()) {
         let margin = shapes.intercept
             + shapes.terms[0].value(&row[..1]).unwrap()
             + shapes.terms[1].value(&row[1..]).unwrap();

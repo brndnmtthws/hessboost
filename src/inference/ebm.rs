@@ -452,6 +452,7 @@ impl<'a> EbmInference<'a> {
         let norms = self.prediction_norms(data)?;
         let preds = self.model.predict(data)?;
         Ok(preds
+            .as_slice()
             .iter()
             .zip(norms)
             .map(|(&p, w2)| {

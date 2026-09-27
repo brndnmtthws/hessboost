@@ -190,7 +190,7 @@ fn ebm_refit(
     let n = values.n_rows();
     let mu = labels.iter().map(|&y| f64::from(y)).sum::<f64>() / n as f64;
     let t_count = model.num_trees();
-    let node_ids = model.predict_leaf_range(values, ..)?;
+    let node_ids = model.predict_leaf_range(values, ..)?.into_vec();
     let mut refit = model.clone();
     let mut base = vec![mu; n];
     let mut first_tree = 0;

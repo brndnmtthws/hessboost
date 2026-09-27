@@ -124,10 +124,10 @@
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
-use super::train::{
-    RoundEval, Trainer, configured_metrics, initial_intercepts, validate_trained_model,
-    validate_training_data, with_thread_pool,
-};
+use super::api::{RoundEval, Trainer};
+use super::eval::configured_metrics;
+use super::train::{initial_intercepts, with_thread_pool};
+use super::validate::{validate_trained_model, validate_training_data};
 use crate::config::{
     BoosterKind, Device, GrowPolicy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
 };

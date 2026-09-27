@@ -23,8 +23,8 @@ what the published crate ships.
 cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # CI checks the fuzz crate too
 cargo clippy --all-targets --all-features -- -D warnings
-cargo nextest run --all-features
-cargo test --doc --all-features   # nextest skips doctests
+cargo nextest run --all-features   # CI adds --cargo-profile ci
+cargo test --doc --all-features   # nextest skips doctests; CI adds --profile ci
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 MISE_RUST_VERSION=1.93.0 mise exec -- cargo build --all-features   # MSRV
 cargo semver-checks   # API vs. latest crates.io release; Cargo.toml's version must be a large enough bump
@@ -54,12 +54,18 @@ CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
 tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal tests
 needing a device skip without one; a guard test still fails if the kernels
-do not compile). Its Python jobs build and test the extension on
-x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows across CPython 3.11,
-latest Python 3.x, and free-threaded 3.14t, plus pyright's public-type
+do not compile) under the `ci` Cargo profile (`Cargo.toml`: `dev` at
+opt-level 1, debug assertions and overflow checks on; about ten times
+faster than opt-level 0). The parity job caches uv's XGBoost source build.
+Its Python jobs build one abi3 wheel each on x86_64/aarch64 Linux, aarch64
+macOS, and x86_64 Windows (without the release profile's LTO and single
+codegen unit) and test it on CPython 3.11 and the latest 3.x with
+`.github/scripts/test-wheel.sh`, plus the free-threaded 3.14t wheel on
+x86_64 Linux and pyright's public-type
 check (which also fails on a public function or class without a docstring),
 a ruff/ty lint job over all of the repository's Python, and an sdist round
-trip. `publish.yml` builds the manylinux, musllinux, macOS, and Windows
+trip (with the release profile). `publish.yml` builds the manylinux,
+musllinux, macOS, and Windows
 wheels and tests each with `.github/scripts/test-wheel.sh` (musllinux in
 Alpine, without scikit-learn, which has no musl wheels). Root fmt also
 checks `python/Cargo.toml`; Python
@@ -75,8 +81,10 @@ cargo clippy --all-targets --all-features --target aarch64-unknown-linux-gnu -- 
 
 Fuzzing: run from `fuzz/` (its own crate; its `mise.toml` adds nightly and
 cargo-fuzz). `./run.sh [seconds] [target...]` rebuilds seeds from
-`tests/data/` and `fuzz/fixed-seeds/`, then runs each target (CI: 10
-s). A crash is saved in `fuzz/artifacts/<target>/`; replay with
+`tests/data/` and `fuzz/fixed-seeds/`, builds the targets, then runs them,
+one per CPU at a time (`FUZZ_JOBS` overrides), each for the given time (CI:
+10 s); each one's output is in `fuzz/logs/<target>.log`. A crash is saved
+in `fuzz/artifacts/<target>/`; replay with
 `cargo fuzz run <target> <file>`. Pass `--target <host triple>` as `run.sh`
 does: prebuilt x86_64 cargo-fuzz defaults to musl, which the sanitizers
 reject. After changing `train.rs`'s input layout, re-check

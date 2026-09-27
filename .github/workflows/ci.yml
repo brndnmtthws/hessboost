@@ -84,10 +84,13 @@ jobs:
       - uses: jdx/mise-action@v4
       - uses: jdx/mr-boxington-action@v1
         with:
-          cache-generation: test
-      - run: mbx nextest run --all-features
+          cache-generation: test-ci
+      # The `ci` Cargo profile (Cargo.toml): opt-level 1 with debug
+      # assertions, about ten times faster than `dev` for this suite.
+      # nextest's own `--profile` would pick a nextest profile.
+      - run: mbx nextest run --cargo-profile ci --all-features
       # nextest does not run doctests.
-      - run: mbx test --doc --all-features
+      - run: mbx test --doc --profile ci --all-features
 
   docs:
     name: docs
@@ -134,16 +137,24 @@ jobs:
       - uses: jdx/mr-boxington-action@v1
         with:
           cache-generation: parity
+      # uv's cache keeps the XGBoost wheel it builds from the source tarball
+      # (over three minutes with CMake). `uv cache prune --ci` below drops
+      # what uv can download again, so the saved cache is mostly that wheel.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/uv
+          key: uv-parity-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/requirements-*.txt') }}
+          restore-keys: uv-parity-${{ runner.os }}-${{ runner.arch }}-
       - name: Generate fixtures from XGBoost 3.4.2
         run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/gen_fixtures.py
-      - name: Train, import and cut parity
-        run: mbx nextest run --test parity --release --run-ignored only --no-capture
-      - name: Export parity (reload in XGBoost)
-        run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
       - name: Generate LightGBM import fixtures from LightGBM 4.7.0
         run: uv run --with-requirements scripts/requirements-lightgbm.txt python scripts/gen_lightgbm_fixtures.py
-      - name: LightGBM import parity
-        run: mbx nextest run --test lightgbm_parity --release --run-ignored only --no-capture
+      # One invocation builds both test binaries in one release build.
+      - name: Train, import and cut parity; LightGBM import parity
+        run: mbx nextest run --test parity --test lightgbm_parity --release --run-ignored only --no-capture
+      - name: Export parity (reload in XGBoost)
+        run: uv run --with-requirements scripts/requirements-xgboost.txt python scripts/check_exports.py
+      - run: uv cache prune --ci
 
   semver:
     name: semver compatibility
@@ -194,8 +205,11 @@ jobs:
             echo
           done
 
+  # One abi3 wheel per platform, tested on the newest and oldest supported
+  # CPython, plus the free-threaded wheel on Linux: the wheels publish.yml
+  # builds, through the same test-wheel.sh.
   python:
-    name: Python / ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    name: Python / ${{ matrix.os }} / ${{ matrix.wheel }}
     runs-on: ${{ matrix.os }}
     env:
       UV_MANAGED_PYTHON: "1"
@@ -210,51 +224,52 @@ jobs:
           - ubuntu-26.04-arm
           - macos-latest
           - windows-latest
-        python-version: ["3.11", "3"]
+        wheel: [abi3]
         include:
           - os: ubuntu-26.04
-            python-version: "3.14t"
+            wheel: free-threaded
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
         with:
-          python-version: ${{ matrix.python-version }}
           working-directory: python
-      - name: Install selected Python
-        id: python
+      - name: Install free-threaded Python
+        if: matrix.wheel == 'free-threaded'
+        id: ft-python
         run: |
-          uv python install
-          echo "path=$(uv python find)" >> "$GITHUB_OUTPUT"
-        working-directory: python
+          uv python install 3.14t
+          echo "path=$(uv python find 3.14t)" >> "$GITHUB_OUTPUT"
+      # Without the release profile's LTO and single codegen unit, which
+      # change neither behavior nor results but serialize the build (over
+      # a minute of it). python-sdist and publish.yml build with them.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         with:
           command: build
-          manylinux: ${{ matrix.python-version == '3.14t' && 'off' || '' }}
-          args: --release --locked --out dist ${{ matrix.python-version == '3.14t' && format('-i {0}', steps.python.outputs.path) || '' }}
+          manylinux: ${{ matrix.wheel == 'free-threaded' && 'off' || '' }}
+          args: --release --locked --out dist ${{ matrix.wheel == 'free-threaded' && format('-i {0}', steps.ft-python.outputs.path) || '' }}
           working-directory: python
-      - name: Install test dependencies
-        run: uv sync --locked --only-group test
+      # Latest Python first: "3" matches any installed 3.x, so it must run
+      # before 3.11 is installed to fetch the newest one.
+      - name: Test abi3 wheel on latest Python
+        if: matrix.wheel == 'abi3'
+        run: sh ../.github/scripts/test-wheel.sh 3 'dist/*cp311-abi3*.whl'
         working-directory: python
-      - name: Install built wheel
-        run: uv pip install dist/*.whl
-        working-directory: python
-      - name: Verify imports use installed wheel
-        run: uv run --no-sync python -c "import hessboost; assert 'site-packages' in hessboost.__file__, hessboost.__file__"
-        working-directory: python
-      - name: Run Python tests
-        run: uv run --no-sync pytest -p no:cacheprovider tests
-        working-directory: python
+      # In the latest-Python environment the step above left, with the wheel
+      # installed.
       - name: Check public types
-        if: matrix.os == 'ubuntu-26.04' && matrix.python-version == '3'
+        if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3'
         run: uv run --no-sync pyright --verifytypes hessboost --ignoreexternal
         working-directory: python
       # Editors show these docstrings on hover; pyright counts the public
       # functions and classes without one but does not fail on them.
       - name: Check public docstrings
-        if: matrix.os == 'ubuntu-26.04' && matrix.python-version == '3'
+        if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3'
         run: |
           uv run --no-sync pyright --verifytypes hessboost --ignoreexternal --outputjson |
             uv run --no-sync python -c '
@@ -264,6 +279,14 @@ jobs:
           undocumented = [s["name"] for s in report["symbols"] for d in s["diagnostics"] if "docstring" in d["message"]]
           sys.exit(f"{missing} public symbols without a docstring: {undocumented}" if missing else 0)
           '
+        working-directory: python
+      - name: Test abi3 wheel on Python 3.11
+        if: matrix.wheel == 'abi3'
+        run: sh ../.github/scripts/test-wheel.sh 3.11 'dist/*cp311-abi3*.whl'
+        working-directory: python
+      - name: Test free-threaded wheel
+        if: matrix.wheel == 'free-threaded'
+        run: sh ../.github/scripts/test-wheel.sh 3.14t 'dist/*cp314-cp314t*.whl'
         working-directory: python
 
   python-lint:

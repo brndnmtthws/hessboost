@@ -4,3 +4,4 @@ artifacts
 coverage
 seeds
 Cargo.lock
+logs

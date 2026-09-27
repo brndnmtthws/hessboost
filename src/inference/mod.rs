@@ -499,7 +499,8 @@ impl<'a> BoulevardInference<'a> {
     /// # Errors
     ///
     /// [`HessboostError::InvalidParameter`] when `model` is not a Boulevard
-    /// fit ([`BoostedModel::boulevard`] is `None`), when `train` is not its
+    /// fit ([`BoostedModel::boulevard`] is `None`) or has no trees (0
+    /// rounds), when `train` is not its
     /// training data (a leaf holds fewer of its rows than it was grown on),
     /// has row weights or base margins, or (for the noise estimate) lacks
     /// labels; when [`KernelSolver::Exact`] gets more than
@@ -517,6 +518,12 @@ impl<'a> BoulevardInference<'a> {
                 "not a Boulevard fit: train it with `booster = boulevard`",
             )
         })?;
+        if model.num_trees() == 0 {
+            return Err(HessboostError::invalid_param(
+                "model",
+                "has no trees (trained for 0 rounds), so its leaf kernel has no rows",
+            ));
+        }
         check_data(
             model,
             train,

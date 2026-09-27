@@ -178,6 +178,44 @@ fn inference_refuses_rows_the_model_was_not_trained_on() {
     assert_eq!(invalid_param(fit), "model");
 }
 
+/// A Boulevard model trained for 0 rounds has no trees and so no kernel
+/// rows: inference on it is refused (it used to fit and then panic), and
+/// empty inputs elsewhere give empty results or errors, never panics.
+#[test]
+fn inference_on_empty_inputs_is_refused_or_empty() {
+    let dtrain = data(100, 12);
+    let empty = train(&builder().build().unwrap(), &dtrain, 0).unwrap();
+    for solver in [
+        KernelSolver::Exact,
+        KernelSolver::Nystrom {
+            landmarks: 10,
+            seed: 1,
+        },
+    ] {
+        let fit = BoulevardInference::fit(&empty, &dtrain, NoiseVariance::Known(1.0), solver);
+        assert_eq!(invalid_param(fit), "model");
+    }
+    let model = train(&builder().build().unwrap(), &dtrain, 5).unwrap();
+    let inference = BoulevardInference::fit(
+        &model,
+        &dtrain,
+        NoiseVariance::Known(1.0),
+        KernelSolver::Nystrom {
+            landmarks: 1,
+            seed: 3,
+        },
+    )
+    .unwrap();
+    assert!(inference.standard_errors(&data(3, 13)).is_ok());
+    if let Ok(none) = dtrain.select_rows(&[]) {
+        assert!(
+            inference
+                .standard_errors(&none)
+                .is_ok_and(|se| se.is_empty())
+        );
+    }
+}
+
 #[test]
 fn settings_that_break_the_linear_smoother_are_refused() {
     let refused = |b: TrainingParamsBuilder| match b.build() {

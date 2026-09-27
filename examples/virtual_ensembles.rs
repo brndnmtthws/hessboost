@@ -85,7 +85,7 @@ fn main() -> Result<()> {
         members.n_members(),
         members.iterations()
     );
-    let inside = model.predict_uncertainty(&test, 10)?.knowledge;
+    let inside = model.predict_uncertainty(&test, 10)?.knowledge.into_vec();
     println!(
         "\n{:<34} {:>10} {:>8} {:>6}",
         "inputs", "knowledge", "ratio", "AUC"
@@ -99,7 +99,7 @@ fn main() -> Result<()> {
         ("left-out corner x0, x1 > 0.6", &corner),
         ("beyond the range, x0 in [1.2, 2]", &beyond),
     ] {
-        let knowledge = model.predict_uncertainty(data, 10)?.knowledge;
+        let knowledge = model.predict_uncertainty(data, 10)?.knowledge.into_vec();
         println!(
             "{name:<34} {:>10.2e} {:>7.1}x {:>6.3}",
             mean(&knowledge),
@@ -131,9 +131,9 @@ fn main() -> Result<()> {
             / 101.0;
         println!(
             "             {name:<22} {:>10.2e} {:>10.4} {:>10.4} {:>10.4}",
-            mean(&u.knowledge),
-            mean(u.data.as_deref().unwrap_or_default()),
-            mean(u.total.as_deref().unwrap_or_default()),
+            mean(u.knowledge.as_slice()),
+            mean(u.data.as_ref().map_or(&[], |d| d.as_slice())),
+            mean(u.total.as_ref().map_or(&[], |t| t.as_slice())),
             truth
         );
     }

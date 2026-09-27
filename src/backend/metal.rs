@@ -1447,17 +1447,19 @@ impl GpuModel {
     /// (the convention of
     /// [`BoostedModel::predict_margin_range`](crate::model::BoostedModel::predict_margin_range)),
     /// computed on the GPU. Bit-identical to the CPU margins. A model
-    /// trained with model shrinkage predicts its whole ensemble only (the
-    /// CPU rebuilds its truncations).
+    /// trained with model shrinkage predicts on the CPU, whose per-iteration
+    /// shrink-then-add arithmetic repeats training's.
     pub fn predict_margin_range(
         &self,
         data: &crate::data::DMatrix,
         iterations: impl RangeBounds<usize>,
     ) -> Result<crate::model::Predictions> {
         let model = &self.model;
+        if model.shrinkage().is_some() {
+            return model.predict_margin_range(data, iterations);
+        }
         model.validate_prediction_data(data)?;
         let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
-        model.refuse_partial_shrunk_range(&trees, "GPU prediction")?;
         let k = model.n_outputs();
         let n = data.n_rows();
         let mut margins = initial_margins(model.base_scores(), data);

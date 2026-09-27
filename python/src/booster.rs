@@ -84,7 +84,7 @@ enum Kind {
 }
 
 /// `(rows,)` for one value per row, else `(rows, width)`.
-fn dense(predictions: Predictions) -> (Vec<f32>, Vec<usize>) {
+fn dense<T>(predictions: Predictions<T>) -> (Vec<T>, Vec<usize>) {
     let (rows, width) = (predictions.n_rows(), predictions.width());
     let shape = if width == 1 {
         vec![rows]
@@ -320,9 +320,10 @@ impl Booster {
         ))
     }
 
-    /// A virtual ensemble's `(mean, knowledge, data, total)` uncertainty:
-    /// `mean` `(rows,)` or `(rows, width)`; the others `(rows,)` or
-    /// `(rows, columns)`, `data` and `total` `None` for plain regression.
+    /// A virtual ensemble's `(mean, knowledge, data, total)` uncertainty,
+    /// each `(rows,)` or `(rows, width)` with its own width (a multiclass
+    /// `mean` per class, its uncertainties per row); `data` and `total`
+    /// `None` for plain regression.
     #[allow(
         clippy::type_complexity,
         reason = "the tuple is the extension's return shape; the public class wraps it"
@@ -341,14 +342,8 @@ impl Booster {
         let uncertainty = py
             .detach(|| self.model.predict_uncertainty(&data.inner, count))
             .or_raise()?;
-        // Every matrix has at least one row.
-        let rows = data.inner.n_rows();
-        let shape = |values: &[f64]| match values.len() / rows {
-            1 => vec![rows],
-            width => vec![rows, width],
-        };
-        let array = |values: Vec<f64>| {
-            let shape = shape(&values);
+        let array = |values: Predictions<f64>| {
+            let (values, shape) = dense(values);
             to_numpy(py, values, &shape)
         };
         Ok((

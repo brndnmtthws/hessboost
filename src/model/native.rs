@@ -96,8 +96,8 @@ const KNOWN: &[&str] = &[
     "model.best_iteration",
     "model.tree_weights",
     "model.num_parallel_tree",
-    "shrinkage.factors",
-    "shrinkage.base_score",
+    SHRINKAGE_SECTIONS[0],
+    SHRINKAGE_SECTIONS[1],
     "gblinear.weights",
     "gblinear.bias",
     "tree.node_count",
@@ -203,6 +203,37 @@ pub(super) const OBJECTIVE_SECTIONS: &[&str] = &[
     "objective.distribution",
 ];
 
+/// The `shrinkage.*` sections [`write_shrinkage`] writes, shared by the
+/// native and compact formats.
+pub(super) const SHRINKAGE_SECTIONS: [&str; 2] = ["shrinkage.factors", "shrinkage.base_score"];
+
+/// Write the model shrinkage record `shrinkage` (both sections `REQUIRED`).
+pub(super) fn write_shrinkage(w: &mut Writer, shrinkage: &Shrinkage) {
+    w.array(
+        SHRINKAGE_SECTIONS[0],
+        shrinkage.factors().iter().copied(),
+        f64::to_le_bytes,
+    );
+    w.array(
+        SHRINKAGE_SECTIONS[1],
+        shrinkage.base_score().iter().copied(),
+        f32::to_le_bytes,
+    );
+}
+
+/// The model shrinkage record [`write_shrinkage`] wrote, `None` when `s`
+/// has neither section (no shrinkage). The caller validates it against its
+/// model.
+pub(super) fn read_shrinkage(s: &Sections) -> Result<Option<Shrinkage>> {
+    if !SHRINKAGE_SECTIONS.iter().any(|name| s.has(name)) {
+        return Ok(None);
+    }
+    Ok(Some(Shrinkage::new(
+        s.array(SHRINKAGE_SECTIONS[0], f64::from_le_bytes)?,
+        s.array(SHRINKAGE_SECTIONS[1], f32::from_le_bytes)?,
+    )))
+}
+
 /// Encode `model` as a container: zstd-compressed unless the frame would
 /// expand further than [`read`] accepts (see [`pack`]).
 pub(super) fn write(model: &BoostedModel) -> Result<Vec<u8>> {
@@ -257,16 +288,7 @@ fn write_model_sections(w: &mut Writer, m: &BoostedModel) {
         );
     }
     if let Some(shrinkage) = &m.shrinkage {
-        w.array(
-            "shrinkage.factors",
-            shrinkage.factors().iter().copied(),
-            f64::to_le_bytes,
-        );
-        w.array(
-            "shrinkage.base_score",
-            shrinkage.base_score().iter().copied(),
-            f32::to_le_bytes,
-        );
+        write_shrinkage(w, shrinkage);
     }
     write_objective_params(
         w,
@@ -497,15 +519,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
-        shrinkage: if s.has("shrinkage.factors") || s.has("shrinkage.base_score") {
-            Some(Shrinkage::new(
-                s.array("shrinkage.factors", f64::from_le_bytes)?,
-                s.array("shrinkage.base_score", f32::from_le_bytes)?,
-            ))
-        } else {
-            None
-        },
         boulevard: read_boulevard(&s)?,
+        shrinkage: read_shrinkage(&s)?,
         compact: OnceLock::new(),
     })
 }

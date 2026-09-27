@@ -32,7 +32,9 @@
 //!    XGBoost's leaf weight `-Tα(G) / (H + λ)` (clamped to
 //!    `max_delta_step`). The paper draws the structure and the leaf noise
 //!    independently so that the tree distribution does not depend on the
-//!    leaf noise.
+//!    leaf noise. A leaf whose Hessian sum is below `min_child_weight` (or
+//!    not positive) weighs `0`, as in XGBoost's `CalcWeight`, and gets no
+//!    noise, as CatBoost skips the leaves it cannot estimate (no data).
 //!
 //! Every draw is a keyed standard normal ([`crate::rng::keyed_normal`]):
 //! structure noise by `(seed, iteration)` and `row * n_outputs + output`,
@@ -64,7 +66,7 @@ const NOISE_CHUNK: usize = 8192;
 pub(super) struct Sglb {
     /// The Langevin noise, when `langevin` (or posterior sampling) is on.
     pub(super) langevin: Option<Langevin>,
-    /// The per-iteration model shrinkage, when its rate is positive.
+    /// The per-iteration model shrinkage, when configured (or derived).
     pub(super) shrink: Option<Shrink>,
 }
 
@@ -80,8 +82,11 @@ impl Sglb {
                 "needs training rows to derive its temperature and shrink rate from",
             ));
         }
-        let (rate, mode) = params.effective_model_shrink(n_rows);
-        if params.posterior_sampling && rate * params.eta >= 1.0 {
+        let shrink = params.effective_model_shrink(n_rows);
+        if params.posterior_sampling
+            && let Some((rate, _)) = shrink
+            && rate * params.eta >= 1.0
+        {
             return Err(HessboostError::invalid_param(
                 "posterior_sampling",
                 format!(
@@ -91,16 +96,18 @@ impl Sglb {
                 ),
             ));
         }
+        // `TrainingParams::validate` keeps the scale a normal `f32` (always,
+        // for posterior sampling's row-count temperature).
         let langevin = params.langevin_on().then(|| {
             let temperature = params.effective_diffusion_temperature(n_rows);
             let reg = RegParams::from_params(params);
             Langevin {
-                sigma: (2.0 / (params.eta * temperature)).sqrt(),
+                sigma: params.langevin_noise_scale(temperature),
                 reg,
                 seed: params.seed,
             }
         });
-        let shrink = (rate > 0.0).then_some(Shrink {
+        let shrink = shrink.map(|(rate, mode)| Shrink {
             mode,
             rate,
             eta: params.eta,
@@ -222,6 +229,14 @@ impl Langevin {
             }
             for (out, value) in values.iter_mut().enumerate() {
                 let GradStats { grad, hess } = stats[node * width + out];
+                // XGBoost's `CalcWeight` weighs a leaf below
+                // `min_child_weight` (or without positive Hessian) `0`; like
+                // the leaves without data CatBoost's
+                // `AddLangevinNoiseToLeafNewtonSum` skips, it gets no noise.
+                if hess < self.reg.min_child_weight || hess <= 0.0 {
+                    *value = 0.0;
+                    continue;
+                }
                 let scale = self.sigma * (hess.abs() + self.reg.lambda).sqrt();
                 let z = keyed_normal(key, (node * width + out) as u64);
                 *value = xgb_calc_weight(GradStats::new(grad + scale * z, hess), &self.reg) as f32;

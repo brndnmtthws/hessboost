@@ -458,7 +458,9 @@ impl LangevinBuilder {
         self
     }
 
-    /// The validated settings.
+    /// The validated settings. The noise scale `sqrt(2 / (eta * T))` needs
+    /// the learning rate: [`TrainingParams::validate`](super::TrainingParams::validate)
+    /// refuses a temperature that puts it outside `f32`'s normal range.
     ///
     /// # Errors
     ///
@@ -496,37 +498,55 @@ pub enum ModelShrinkMode {
 /// Per-iteration model shrinkage (CatBoost `model_shrink_rate` and
 /// `model_shrink_mode`): at the start of every iteration `i >= 1` the
 /// current model (trees and intercept) is multiplied by `1 - rate * eta`
-/// (constant) or `1 - rate / i` (decreasing). A rate of `0` is no
-/// shrinkage (which turns off Langevin's default rate).
+/// (constant) or `1 - rate / i` (decreasing). No shrinkage is
+/// [`TrainingParams::model_shrink`](super::TrainingParams::model_shrink)
+/// `None` (CatBoost's rate `0`).
 ///
 /// ```
 /// use hessboost::config::{ModelShrink, ModelShrinkMode};
 ///
 /// # fn main() -> hessboost::error::Result<()> {
-/// let shrink = ModelShrink::builder()
-///     .rate(0.1)
-///     .mode(ModelShrinkMode::Decreasing)
-///     .build()?;
+/// let shrink = ModelShrink::new(0.1, ModelShrinkMode::Decreasing)?;
 /// assert_eq!((shrink.rate(), shrink.mode()), (0.1, ModelShrinkMode::Decreasing));
-/// assert!(ModelShrink::builder().rate(-1.0).build().is_err());
+/// // No shrinkage is no `ModelShrink`, not a rate of 0.
+/// assert!(ModelShrink::new(0.0, ModelShrinkMode::Constant).is_err());
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelShrink {
     rate: f64,
     mode: ModelShrinkMode,
 }
 
 impl ModelShrink {
-    /// Start a builder at rate `0` in the constant mode.
-    pub fn builder() -> ModelShrinkBuilder {
-        ModelShrinkBuilder {
-            shrink: ModelShrink::default(),
+    /// Shrink at `rate` in `mode`. The constant mode's `rate * eta < 1`
+    /// needs the learning rate and is checked by
+    /// [`TrainingParams::validate`](super::TrainingParams::validate).
+    ///
+    /// # Errors
+    ///
+    /// A rate that is not finite and positive (leave the option unset for
+    /// no shrinkage); in the decreasing mode, a rate outside `(0, 1)`
+    /// (CatBoost's range, keeping every `1 - rate / i` positive). Named
+    /// `model_shrink_rate`.
+    pub fn new(rate: f64, mode: ModelShrinkMode) -> Result<Self> {
+        if !(rate.is_finite() && rate > 0.0) {
+            return Err(HessboostError::invalid_param(
+                "model_shrink_rate",
+                format!("must be > 0 (leave model shrinkage unset for none), got {rate}"),
+            ));
         }
+        if mode == ModelShrinkMode::Decreasing && rate >= 1.0 {
+            return Err(HessboostError::invalid_param(
+                "model_shrink_rate",
+                format!("must be in (0, 1) in the decreasing mode, got {rate}"),
+            ));
+        }
+        Ok(ModelShrink { rate, mode })
     }
 
-    /// The shrinkage rate `>= 0` (CatBoost `model_shrink_rate`).
+    /// The shrinkage rate `> 0` (CatBoost `model_shrink_rate`).
     pub fn rate(&self) -> f64 {
         self.rate
     }
@@ -535,54 +555,6 @@ impl ModelShrink {
     /// `model_shrink_mode`).
     pub fn mode(&self) -> ModelShrinkMode {
         self.mode
-    }
-}
-
-/// Builder of [`ModelShrink`].
-#[derive(Debug, Clone, Copy)]
-pub struct ModelShrinkBuilder {
-    shrink: ModelShrink,
-}
-
-impl ModelShrinkBuilder {
-    /// Set the shrinkage rate (`model_shrink_rate`).
-    #[must_use]
-    pub fn rate(mut self, rate: f64) -> Self {
-        self.shrink.rate = rate;
-        self
-    }
-
-    /// Set how the coefficient is computed (`model_shrink_mode`).
-    #[must_use]
-    pub fn mode(mut self, mode: ModelShrinkMode) -> Self {
-        self.shrink.mode = mode;
-        self
-    }
-
-    /// The validated shrinkage. The constant mode's `rate * eta < 1` needs
-    /// the learning rate and is checked by
-    /// [`TrainingParams::validate`](super::TrainingParams::validate).
-    ///
-    /// # Errors
-    ///
-    /// A rate that is negative or not finite; in the decreasing mode, a
-    /// rate outside `(0, 1)` (CatBoost's range, keeping every `1 - rate / i`
-    /// positive).
-    pub fn build(self) -> Result<ModelShrink> {
-        let ModelShrink { rate, mode } = self.shrink;
-        if !(rate.is_finite() && rate >= 0.0) {
-            return Err(HessboostError::invalid_param(
-                "model_shrink_rate",
-                format!("must be >= 0, got {rate}"),
-            ));
-        }
-        if mode == ModelShrinkMode::Decreasing && !(rate > 0.0 && rate < 1.0) {
-            return Err(HessboostError::invalid_param(
-                "model_shrink_rate",
-                format!("must be in (0, 1) in the decreasing mode, got {rate}"),
-            ));
-        }
-        Ok(self.shrink)
     }
 }
 
@@ -753,16 +725,17 @@ mod tests {
                 Some("diffusion_temperature")
             );
         }
+        for rate in [-0.1, 0.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                refused(&ModelShrink::new(rate, ModelShrinkMode::Constant)),
+                Some("model_shrink_rate")
+            );
+        }
         assert_eq!(
-            refused(&ModelShrink::builder().rate(-0.1).build()),
+            refused(&ModelShrink::new(1.0, ModelShrinkMode::Decreasing)),
             Some("model_shrink_rate")
         );
-        for rate in [0.0, 1.0] {
-            let decreasing = ModelShrink::builder()
-                .rate(rate)
-                .mode(ModelShrinkMode::Decreasing);
-            assert_eq!(refused(&decreasing.build()), Some("model_shrink_rate"));
-        }
+        assert!(ModelShrink::new(1.0, ModelShrinkMode::Constant).is_ok());
         for v in [0.0, -0.5, 1.1, f64::NAN, f64::INFINITY] {
             assert_eq!(
                 refused(&BalancedBagging::new(v, 0.5)),

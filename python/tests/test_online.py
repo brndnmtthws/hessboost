@@ -218,6 +218,28 @@ def test_labels_retraining_refuses_are_refused(tolerance: float) -> None:
     assert online.num_row() == 302
 
 
+def test_approximate_updates_refuse_values_beyond_the_training_bins() -> None:
+    x = np.array([[0.0], [1.0], [np.nan], [np.nan]], dtype=np.float32)
+    params = {**PARAMS, "max_depth": 1}
+    approximate = OnlineModel.train(params, DMatrix(x, [0.0, 0.0, 1.0, 1.0]), 1)
+    before = state(approximate)
+    with pytest.raises(HessboostError, match="additions"):
+        approximate.update(DMatrix([[3.0]], [0.0]), [0])
+    assert state(approximate) == before
+    exact = OnlineModel.train(params, DMatrix(x, [0.0, 0.0, 1.0, 1.0]), 1, 0.0)
+    exact.update(DMatrix([[3.0]], [0.0]), [0])
+    assert exact.num_row() == 4
+
+
+def test_an_update_that_overflows_is_refused() -> None:
+    top = float(np.finfo(np.float32).max)
+    online = OnlineModel.train({"base_score": top}, DMatrix([[0.0]], [top]), 2)
+    before = state(online)
+    with pytest.raises(hessboost.ModelFormatError):
+        online.update(DMatrix([[0.0]], [-top]))
+    assert state(online) == before
+
+
 def test_unsupported_configurations_and_changes_are_refused() -> None:
     x, y = regression(rows=200)
     dtrain = DMatrix(x, y, feature_names=[f"f{i}" for i in range(5)])

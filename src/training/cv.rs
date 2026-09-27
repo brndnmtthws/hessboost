@@ -470,7 +470,7 @@ pub fn cv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::Objective;
+    use crate::objective::{Objective, RegLoss};
     use crate::test_support::labeled_dense;
 
     /// Six rows per daily decision over 20 days, labels ending `horizon`
@@ -615,7 +615,7 @@ mod tests {
         }
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()

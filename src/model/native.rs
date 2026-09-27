@@ -967,7 +967,7 @@ mod tests {
     use super::super::sections::REQUIRED;
     use super::*;
     use crate::config::TrainingParams;
-    use crate::objective::{Objective, PseudoHuber};
+    use crate::objective::{Objective, PseudoHuber, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
 
@@ -1238,7 +1238,7 @@ mod tests {
         write(&BoostedModel {
             trees: Vec::new(),
             base_score: vec![0.5],
-            objective: ModelObjective::trained_with(&Objective::SquaredError),
+            objective: ModelObjective::trained_with(&Objective::SquaredError(RegLoss::default())),
             max_delta_step: 0.0,
             num_class: 0,
             n_outputs: 1,

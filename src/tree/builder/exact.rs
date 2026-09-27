@@ -731,7 +731,7 @@ mod tests {
     use super::super::test_support::{gp, grow_exact, monotone_v_shape_data, non_decreasing};
     use super::*;
     use crate::config::TrainingParams;
-    use crate::objective::Objective;
+    use crate::objective::{Objective, RegLoss};
 
     /// A clean separable problem: feature 0 perfectly separates the sign of the
     /// gradient at threshold 0.5, so the root should split there.
@@ -888,7 +888,7 @@ mod tests {
         let n = x.len();
         let data = crate::test_support::labeled_dense(x, n, 1, y);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Exact)
             .max_depth(2)
             .eta(0.5)

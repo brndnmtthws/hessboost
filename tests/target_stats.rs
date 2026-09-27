@@ -48,7 +48,7 @@ fn ordered_target_stats_beat_native_splits_on_sparse_categories() {
     let test_set = sample(TEST_ROWS, &effects, &mut rng);
 
     let params = TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .tree_method(TreeMethod::Hist)
         .max_depth(4)
         .eta(0.1)

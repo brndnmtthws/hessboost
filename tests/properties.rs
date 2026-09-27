@@ -26,7 +26,7 @@ fn dataset() -> impl Strategy<Value = (Vec<f32>, Vec<f32>)> {
 
 fn base_params(seed: u64) -> TrainingParams {
     TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .max_depth(3)
         .eta(0.3)
         .subsample(0.8) // exercise the RNG path
@@ -88,7 +88,7 @@ proptest! {
     ) {
         let d = labeled_dense(&x, 1, &y);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .max_depth(4)
             .eta(0.3)
             .monotone_constraints(vec![Monotone::Increasing])
@@ -148,7 +148,7 @@ fn training_is_independent_of_the_thread_count() {
         .with_labels(&labels)
         .unwrap();
     let params = TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .base_score(0.0)
         .max_depth(2)
         .build()

@@ -63,7 +63,7 @@ fn main() -> Result<()> {
     let dtrain = DMatrix::from_dense(&x, n_rows, n_cols)?.with_labels(&y)?;
 
     let params = TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .tree_method(TreeMethod::Hist)
         .max_depth(6)
         .eta(0.1)

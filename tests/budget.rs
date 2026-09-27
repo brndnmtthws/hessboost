@@ -5,7 +5,7 @@
 
 use hessboost::config::MaxDeltaStep;
 use hessboost::data::FeatureType;
-use hessboost::objective::{GradPair, Logistic, Multiclass, PseudoHuber, Tweedie};
+use hessboost::objective::{GradPair, Multiclass, PseudoHuber, RegLoss, Tweedie};
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, BudgetStop, train_with_budget};
 
@@ -89,12 +89,12 @@ fn loss(model: &BoostedModel, data: &DMatrix) -> f64 {
 fn larger_budgets_train_more_trees_and_fit_held_out_data_at_least_as_well() {
     for (objective, data, test) in [
         (
-            Objective::SquaredError,
+            Objective::SquaredError(RegLoss::default()),
             regression(1500, 1),
             regression(4000, 101),
         ),
         (
-            Objective::BinaryLogistic(Logistic::default()),
+            Objective::BinaryLogistic(RegLoss::default()),
             binary(1500, 1),
             binary(4000, 101),
         ),
@@ -133,14 +133,14 @@ fn larger_budgets_train_more_trees_and_fit_held_out_data_at_least_as_well() {
 fn held_out_quality_is_comparable_to_validation_tuned_training() {
     for (objective, train_set, valid, test, band) in [
         (
-            Objective::SquaredError,
+            Objective::SquaredError(RegLoss::default()),
             regression(1500, 3),
             regression(1000, 4),
             regression(4000, 5),
             1.10,
         ),
         (
-            Objective::BinaryLogistic(Logistic::default()),
+            Objective::BinaryLogistic(RegLoss::default()),
             binary(1500, 6),
             binary(1000, 7),
             binary(4000, 8),
@@ -183,7 +183,7 @@ fn training_is_deterministic_and_independent_of_the_thread_count() {
     let data = binary(6000, 9);
     let run = |nthread: usize| {
         let p = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .nthread(nthread)
             .build()
             .unwrap();
@@ -199,7 +199,7 @@ fn training_is_deterministic_and_independent_of_the_thread_count() {
 fn budget_models_are_ordinary_gbtree_models() {
     let data = regression(800, 10);
     let model = train_with_budget(
-        &params(Objective::SquaredError),
+        &params(Objective::SquaredError(RegLoss::default())),
         &data,
         &BudgetConfig::new(0.5),
     )
@@ -221,9 +221,12 @@ fn budget_models_are_ordinary_gbtree_models() {
 /// safeguard, its Hessian as the second derivative).
 #[test]
 fn pointwise_losses_differentiate_to_the_objective_gradients() {
-    let weighted = || Logistic::new(2.0).unwrap();
+    let weighted = || RegLoss::new(2.0).unwrap();
     let cases: [(Objective, &[f32]); 7] = [
-        (Objective::SquaredError, &[-1.5, 0.0, 2.0]),
+        (
+            Objective::SquaredError(RegLoss::default()),
+            &[-1.5, 0.0, 2.0],
+        ),
         (
             Objective::PseudoHuber(PseudoHuber::default()),
             &[-1.5, 0.0, 2.0],
@@ -231,7 +234,7 @@ fn pointwise_losses_differentiate_to_the_objective_gradients() {
         (Objective::BinaryLogistic(weighted()), &[0.0, 1.0]),
         (Objective::RegLogistic(weighted()), &[0.3, 0.8]),
         (Objective::Poisson, &[0.0, 3.0]),
-        (Objective::Gamma, &[0.5, 4.0]),
+        (Objective::Gamma(RegLoss::default()), &[0.5, 4.0]),
         (Objective::Tweedie(Tweedie::default()), &[0.0, 2.5]),
     ];
     let margins = [-1.2f32, 0.1, 0.9];
@@ -285,7 +288,7 @@ fn learns_missing_value_directions_and_categorical_splits() {
         .with_feature_types(&[FeatureType::Numerical, FeatureType::Categorical])
         .unwrap();
     let result = train_with_budget(
-        &params(Objective::SquaredError),
+        &params(Objective::SquaredError(RegLoss::default())),
         &data,
         &BudgetConfig::new(1.0),
     )
@@ -306,7 +309,7 @@ fn learns_missing_value_directions_and_categorical_splits() {
 fn iteration_limit_caps_the_rounds() {
     let data = regression(1000, 12);
     let result = train_with_budget(
-        &params(Objective::SquaredError),
+        &params(Objective::SquaredError(RegLoss::default())),
         &data,
         &BudgetConfig::new(1.5).iteration_limit(7),
     )
@@ -324,7 +327,7 @@ fn unbounded_stopping_rounds_override_trains() {
     let config = BudgetConfig::new(0.5).iteration_limit(30);
     let train = |rounds| {
         let result = train_with_budget(
-            &params(Objective::SquaredError),
+            &params(Objective::SquaredError(RegLoss::default())),
             &data,
             &config.stopping_rounds(rounds),
         )
@@ -368,8 +371,12 @@ fn non_finite_steps_are_not_appended() {
     let mut y = vec![1.0f32; n];
     y[n - 1] = 1e-30;
     let data = labeled_dense(&x, 1, &y);
-    let result =
-        train_with_budget(&params(Objective::Gamma), &data, &BudgetConfig::new(0.5)).unwrap();
+    let result = train_with_budget(
+        &params(Objective::Gamma(RegLoss::default())),
+        &data,
+        &BudgetConfig::new(0.5),
+    )
+    .unwrap();
     assert_eq!(result.stop, BudgetStop::NonFiniteLoss);
     let preds = result.model.predict(&data).unwrap();
     assert!(preds.as_slice().iter().all(|p| p.is_finite()));
@@ -382,7 +389,7 @@ fn non_finite_steps_are_not_appended() {
 fn undefined_root_generalization_keeps_the_best_split() {
     let data = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 1, &[0.0, 0.0, 1.0, 1.0]);
     let result = train_with_budget(
-        &params(Objective::SquaredError),
+        &params(Objective::SquaredError(RegLoss::default())),
         &data,
         &BudgetConfig::default().iteration_limit(1),
     )
@@ -395,7 +402,7 @@ fn undefined_root_generalization_keeps_the_best_split() {
 /// format; returns its training predictions and the reason training stopped.
 fn one_saved_tree(data: &DMatrix) -> (Vec<f32>, BudgetStop) {
     let result = train_with_budget(
-        &params(Objective::SquaredError),
+        &params(Objective::SquaredError(RegLoss::default())),
         data,
         &BudgetConfig::default().iteration_limit(1),
     )
@@ -426,7 +433,7 @@ fn roots_with_overflowing_hessian_sums_are_errors() {
     let data = labeled_dense(&[0.0, 0.0], 1, &[0.0, 0.0])
         .with_weights(&[3e38, 3e38])
         .unwrap();
-    let params = params(Objective::SquaredError);
+    let params = params(Objective::SquaredError(RegLoss::default()));
     assert!(matches!(
         train(&params, &data, 1),
         Err(HessboostError::ModelFormat(_))
@@ -483,7 +490,7 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
 
     // Objective parameters and the parameters budget mode reads are accepted.
     let accepted = TrainingParams::builder()
-        .objective(Objective::BinaryLogistic(Logistic::new(3.0).unwrap()))
+        .objective(Objective::BinaryLogistic(RegLoss::new(3.0).unwrap()))
         .max_bin(64)
         .nthread(2)
         .base_score(0.4)
@@ -513,7 +520,7 @@ fn derived_or_unused_parameters_are_rejected_by_name() {
     )
     .unwrap();
     let (name, reason) = rejection(
-        &bounded(Objective::SquaredError),
+        &bounded(Objective::SquaredError(RegLoss::default())),
         &data,
         &BudgetConfig::default(),
     );
@@ -532,7 +539,7 @@ fn unsupported_objectives_and_budgets_are_rejected() {
     assert_eq!(name, "objective");
     for budget in [0.0, -1.0, 5.0, f64::NAN] {
         let (name, _) = rejection(
-            &params(Objective::BinaryLogistic(Logistic::default())),
+            &params(Objective::BinaryLogistic(RegLoss::default())),
             &data,
             &BudgetConfig::new(budget),
         );

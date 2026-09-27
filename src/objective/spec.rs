@@ -6,9 +6,9 @@ use super::distributional::{
 };
 use super::{
     AbsoluteError, Aft, AftDistribution, AftLoss, Cox, Expectile, Expectiles, Gamma, Hinge,
-    LambdaMart, LambdaRank, Logistic, LogisticLoss, Loss, Multiclass, Poisson, PseudoHuber,
-    PseudoHuberLoss, Quantile, Quantiles, Softmax, SquaredError, SquaredLogError, Tweedie,
-    TweedieLoss, Xendcg, multi_target::MultiTarget,
+    LambdaMart, LambdaRank, LogisticLoss, Loss, Multiclass, Poisson, PseudoHuber, PseudoHuberLoss,
+    Quantile, Quantiles, RegLoss, Softmax, SquaredError, SquaredLogError, Tweedie, TweedieLoss,
+    Xendcg, multi_target::MultiTarget,
 };
 use crate::error::{HessboostError, Result};
 use std::fmt;
@@ -17,10 +17,13 @@ use std::sync::Arc;
 /// The learning objective: a built-in XGBoost (or `dist:*`) objective with
 /// its parameters, or a custom [`Loss`]. The variants' XGBoost names are
 /// given by [`Objective::name`]; parameterized variants wrap a parameter
-/// struct that validates on construction.
+/// struct that validates on construction. The objectives XGBoost trains
+/// through `RegLossObj` (`reg:squarederror`, `reg:gamma`, and the logistic
+/// ones) carry its `scale_pos_weight` ([`RegLoss`]); the default is
+/// `reg:squarederror` at weight `1`.
 ///
 /// ```
-/// use hessboost::objective::{Multiclass, Objective, Quantiles, Tweedie};
+/// use hessboost::objective::{Multiclass, Objective, Quantiles, RegLoss, Tweedie};
 ///
 /// # fn main() -> hessboost::error::Result<()> {
 /// let tweedie = Objective::Tweedie(Tweedie::new(1.3)?);
@@ -28,16 +31,16 @@ use std::sync::Arc;
 /// let classes = Objective::Softprob(Multiclass::new(3)?);
 /// assert_eq!(classes.num_class(), Some(3));
 /// let bands = Objective::Quantile(Quantiles::new([0.1, 0.5, 0.9])?);
-/// # let _ = bands;
+/// let reweighted = Objective::SquaredError(RegLoss::new(2.0)?);
+/// # let _ = (bands, reweighted);
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Objective {
     /// `reg:squarederror` (XGBoost's alias `reg:linear`): squared error.
-    #[default]
-    SquaredError,
+    SquaredError(RegLoss),
     /// `reg:squaredlogerror`: squared log error, labels `> -1`.
     SquaredLogError,
     /// `reg:pseudohubererror`: the pseudo-Huber loss.
@@ -52,11 +55,11 @@ pub enum Objective {
     Expectile(Expectiles),
     /// `reg:logistic`: logistic regression on probabilities, evaluated with
     /// `rmse`.
-    RegLogistic(Logistic),
+    RegLogistic(RegLoss),
     /// `binary:logistic`: binary classification, predicting probabilities.
-    BinaryLogistic(Logistic),
+    BinaryLogistic(RegLoss),
     /// `binary:logitraw`: binary classification, predicting margins.
-    BinaryLogitRaw(Logistic),
+    BinaryLogitRaw(RegLoss),
     /// `binary:hinge`: the hinge loss, predicting 0 or 1.
     BinaryHinge,
     /// `multi:softmax`: multiclass, predicting the class index.
@@ -68,7 +71,7 @@ pub enum Objective {
     /// [`TrainingParams::max_delta_step`](crate::config::TrainingParams::max_delta_step)).
     Poisson,
     /// `reg:gamma`: gamma regression with a log link.
-    Gamma,
+    Gamma(RegLoss),
     /// `reg:tweedie`: Tweedie regression with a log link.
     Tweedie(Tweedie),
     /// `rank:pairwise`: LambdaMART on pairwise loss.
@@ -103,6 +106,14 @@ pub enum Objective {
     Custom(Arc<dyn Loss>),
 }
 
+impl Default for Objective {
+    /// `reg:squarederror`, XGBoost's default objective, at its default
+    /// `scale_pos_weight` of `1`.
+    fn default() -> Self {
+        Objective::SquaredError(RegLoss::default())
+    }
+}
+
 impl fmt::Debug for dyn Loss + '_ {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Loss").field("name", &self.name()).finish()
@@ -115,20 +126,20 @@ impl PartialEq for Objective {
     fn eq(&self, other: &Self) -> bool {
         use Objective as O;
         match (self, other) {
-            (O::SquaredError, O::SquaredError)
-            | (O::SquaredLogError, O::SquaredLogError)
+            (O::SquaredLogError, O::SquaredLogError)
             | (O::AbsoluteError, O::AbsoluteError)
             | (O::BinaryHinge, O::BinaryHinge)
             | (O::Poisson, O::Poisson)
-            | (O::Gamma, O::Gamma)
             | (O::RankXendcg, O::RankXendcg)
             | (O::Cox, O::Cox) => true,
             (O::PseudoHuber(a), O::PseudoHuber(b)) => a == b,
             (O::Quantile(a), O::Quantile(b)) => a == b,
             (O::Expectile(a), O::Expectile(b)) => a == b,
-            (O::RegLogistic(a), O::RegLogistic(b))
+            (O::SquaredError(a), O::SquaredError(b))
+            | (O::RegLogistic(a), O::RegLogistic(b))
             | (O::BinaryLogistic(a), O::BinaryLogistic(b))
-            | (O::BinaryLogitRaw(a), O::BinaryLogitRaw(b)) => a == b,
+            | (O::BinaryLogitRaw(a), O::BinaryLogitRaw(b))
+            | (O::Gamma(a), O::Gamma(b)) => a == b,
             (O::Softmax(a), O::Softmax(b)) | (O::Softprob(a), O::Softprob(b)) => a == b,
             (O::Tweedie(a), O::Tweedie(b)) => a == b,
             (O::RankPairwise(a), O::RankPairwise(b))
@@ -197,7 +208,7 @@ impl Default for ObjectiveParts {
     fn default() -> Self {
         ObjectiveParts {
             num_class: 0,
-            scale_pos_weight: Logistic::default().scale_pos_weight(),
+            scale_pos_weight: RegLoss::default().scale_pos_weight(),
             tweedie_variance_power: Tweedie::default().variance_power(),
             huber_slope: PseudoHuber::default().slope(),
             lambdarank_num_pair_per_sample: LambdaRank::default().num_pair_per_sample(),
@@ -221,7 +232,7 @@ impl Objective {
     /// ...), a custom loss's [`Loss::name`].
     pub fn name(&self) -> &str {
         match self {
-            Objective::SquaredError => "reg:squarederror",
+            Objective::SquaredError(_) => "reg:squarederror",
             Objective::SquaredLogError => "reg:squaredlogerror",
             Objective::PseudoHuber(_) => "reg:pseudohubererror",
             Objective::AbsoluteError => "reg:absoluteerror",
@@ -234,7 +245,7 @@ impl Objective {
             Objective::Softmax(_) => "multi:softmax",
             Objective::Softprob(_) => "multi:softprob",
             Objective::Poisson => "count:poisson",
-            Objective::Gamma => "reg:gamma",
+            Objective::Gamma(_) => "reg:gamma",
             Objective::Tweedie(_) => "reg:tweedie",
             Objective::RankPairwise(_) => "rank:pairwise",
             Objective::RankNdcg(_) => "rank:ndcg",
@@ -282,6 +293,13 @@ impl Objective {
         matches!(self, Objective::AbsoluteError | Objective::Quantile(_))
     }
 
+    /// Whether the objective is `reg:squarederror` without reweighting
+    /// (`scale_pos_weight` at `1`): the plain least-squares fit Boulevard
+    /// and its inference assume.
+    pub(crate) fn is_unweighted_squared_error(&self) -> bool {
+        matches!(self, Objective::SquaredError(r) if *r == RegLoss::default())
+    }
+
     /// Whether the objective ranks documents within query groups (the
     /// `rank:*` objectives).
     pub(crate) fn is_ranking(&self) -> bool {
@@ -310,7 +328,7 @@ impl Objective {
     /// How the objective trains on a label matrix.
     pub(crate) fn label_matrix(&self) -> LabelMatrix {
         match self {
-            Objective::SquaredError
+            Objective::SquaredError(_)
             | Objective::PseudoHuber(_)
             | Objective::RegLogistic(_)
             | Objective::BinaryLogistic(_) => LabelMatrix::PerColumn,
@@ -323,7 +341,7 @@ impl Objective {
             | Objective::Softmax(_)
             | Objective::Softprob(_)
             | Objective::Poisson
-            | Objective::Gamma
+            | Objective::Gamma(_)
             | Objective::Tweedie(_)
             | Objective::RankPairwise(_)
             | Objective::RankNdcg(_)
@@ -341,9 +359,11 @@ impl Objective {
             Objective::PseudoHuber(_) => &["huber_slope"],
             Objective::Quantile(_) => &["quantile_alpha"],
             Objective::Expectile(_) => &["expectile_alpha"],
-            Objective::RegLogistic(_)
+            Objective::SquaredError(_)
+            | Objective::RegLogistic(_)
             | Objective::BinaryLogistic(_)
-            | Objective::BinaryLogitRaw(_) => &["scale_pos_weight"],
+            | Objective::BinaryLogitRaw(_)
+            | Objective::Gamma(_) => &["scale_pos_weight"],
             Objective::Softmax(_) | Objective::Softprob(_) => &["num_class"],
             Objective::Tweedie(_) => &["tweedie_variance_power"],
             Objective::RankPairwise(_) | Objective::RankNdcg(_) | Objective::RankMap(_) => {
@@ -351,12 +371,10 @@ impl Objective {
             }
             Objective::Aft(_) => &["aft_loss_distribution", "aft_loss_distribution_scale"],
             Objective::Dist(_) => &["dist_gradient", "dist_split_direction"],
-            Objective::SquaredError
-            | Objective::SquaredLogError
+            Objective::SquaredLogError
             | Objective::AbsoluteError
             | Objective::BinaryHinge
             | Objective::Poisson
-            | Objective::Gamma
             | Objective::RankXendcg
             | Objective::Cox
             | Objective::Custom(_) => &[],
@@ -374,11 +392,11 @@ impl Objective {
     /// name that is not a built-in objective, an error when its parameters
     /// are invalid.
     pub(crate) fn from_parts(name: &str, parts: &ObjectiveParts) -> Option<Result<Objective>> {
-        let logistic = || Logistic::new(parts.scale_pos_weight);
+        let reg_loss = || RegLoss::new(parts.scale_pos_weight);
         let classes = || Multiclass::new(parts.num_class);
         let rank = || LambdaRank::new(parts.lambdarank_num_pair_per_sample);
         let objective = match name {
-            "reg:squarederror" | "reg:linear" => Ok(Objective::SquaredError),
+            "reg:squarederror" | "reg:linear" => reg_loss().map(Objective::SquaredError),
             "reg:squaredlogerror" => Ok(Objective::SquaredLogError),
             "reg:pseudohubererror" => {
                 PseudoHuber::new(parts.huber_slope).map(Objective::PseudoHuber)
@@ -390,14 +408,14 @@ impl Objective {
             "reg:expectileerror" => {
                 Expectiles::new(parts.expectile_alpha.iter().copied()).map(Objective::Expectile)
             }
-            "reg:logistic" => logistic().map(Objective::RegLogistic),
-            "binary:logistic" => logistic().map(Objective::BinaryLogistic),
-            "binary:logitraw" => logistic().map(Objective::BinaryLogitRaw),
+            "reg:logistic" => reg_loss().map(Objective::RegLogistic),
+            "binary:logistic" => reg_loss().map(Objective::BinaryLogistic),
+            "binary:logitraw" => reg_loss().map(Objective::BinaryLogitRaw),
             "binary:hinge" => Ok(Objective::BinaryHinge),
             "multi:softmax" => classes().map(Objective::Softmax),
             "multi:softprob" => classes().map(Objective::Softprob),
             "count:poisson" => Ok(Objective::Poisson),
-            "reg:gamma" => Ok(Objective::Gamma),
+            "reg:gamma" => reg_loss().map(Objective::Gamma),
             "reg:tweedie" => Tweedie::new(parts.tweedie_variance_power).map(Objective::Tweedie),
             "rank:pairwise" => rank().map(Objective::RankPairwise),
             "rank:ndcg" => rank().map(Objective::RankNdcg),
@@ -438,10 +456,12 @@ impl Objective {
                 expectile_alpha: e.alpha().to_vec(),
                 ..d
             },
-            Objective::RegLogistic(l)
-            | Objective::BinaryLogistic(l)
-            | Objective::BinaryLogitRaw(l) => ObjectiveParts {
-                scale_pos_weight: l.scale_pos_weight(),
+            Objective::SquaredError(r)
+            | Objective::RegLogistic(r)
+            | Objective::BinaryLogistic(r)
+            | Objective::BinaryLogitRaw(r)
+            | Objective::Gamma(r) => ObjectiveParts {
+                scale_pos_weight: r.scale_pos_weight(),
                 ..d
             },
             Objective::Softmax(c) | Objective::Softprob(c) => ObjectiveParts {
@@ -468,12 +488,10 @@ impl Objective {
                 dist_split_direction: dist.split_direction(),
                 ..d
             },
-            Objective::SquaredError
-            | Objective::SquaredLogError
+            Objective::SquaredLogError
             | Objective::AbsoluteError
             | Objective::BinaryHinge
             | Objective::Poisson
-            | Objective::Gamma
             | Objective::RankXendcg
             | Objective::Cox
             | Objective::Custom(_) => d,
@@ -492,25 +510,25 @@ impl Objective {
         let single: Box<dyn Loss> = match self {
             Objective::Custom(loss) => return Ok(Arc::clone(loss)),
             Objective::AbsoluteError => return Ok(Arc::new(AbsoluteError::new(n_targets))),
-            Objective::SquaredError => Box::new(SquaredError),
+            Objective::SquaredError(r) => Box::new(SquaredError::new(r.scale_pos_weight() as f32)),
             Objective::SquaredLogError => Box::new(SquaredLogError),
             Objective::PseudoHuber(huber) => Box::new(PseudoHuberLoss::new(*huber)),
             Objective::Quantile(q) => Box::new(Quantile::from_levels(q.clone())),
             Objective::Expectile(e) => Box::new(Expectile::from_levels(e.clone())),
-            Objective::RegLogistic(l) => {
-                Box::new(LogisticLoss::regression(l.scale_pos_weight() as f32))
+            Objective::RegLogistic(r) => {
+                Box::new(LogisticLoss::regression(r.scale_pos_weight() as f32))
             }
-            Objective::BinaryLogistic(l) => {
-                Box::new(LogisticLoss::new(l.scale_pos_weight() as f32))
+            Objective::BinaryLogistic(r) => {
+                Box::new(LogisticLoss::new(r.scale_pos_weight() as f32))
             }
-            Objective::BinaryLogitRaw(l) => {
-                Box::new(LogisticLoss::raw(l.scale_pos_weight() as f32))
+            Objective::BinaryLogitRaw(r) => {
+                Box::new(LogisticLoss::raw(r.scale_pos_weight() as f32))
             }
             Objective::BinaryHinge => Box::new(Hinge),
             Objective::Softmax(c) => Box::new(Softmax::new(c.num_class(), false)),
             Objective::Softprob(c) => Box::new(Softmax::new(c.num_class(), true)),
             Objective::Poisson => Box::new(Poisson::new(context.max_delta_step as f32)),
-            Objective::Gamma => Box::new(Gamma),
+            Objective::Gamma(r) => Box::new(Gamma::new(r.scale_pos_weight() as f32)),
             Objective::Tweedie(t) => Box::new(TweedieLoss::new(*t)),
             Objective::RankPairwise(r) => Box::new(LambdaMart::pairwise(r.num_pair_per_sample())),
             Objective::RankNdcg(r) => Box::new(LambdaMart::ndcg(r.num_pair_per_sample())),

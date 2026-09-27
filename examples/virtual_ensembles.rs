@@ -6,8 +6,8 @@
 //!
 //! Run with: `cargo run --release --example virtual_ensembles`
 
-use hessboost::objective::Objective;
 use hessboost::objective::distributional::{DistFamily, Distributional};
+use hessboost::objective::{Objective, RegLoss};
 use hessboost::prelude::*;
 
 mod common;
@@ -78,7 +78,11 @@ fn main() -> Result<()> {
             .build()
     };
 
-    let model = train(&params(Objective::SquaredError)?, &dtrain, 1000)?;
+    let model = train(
+        &params(Objective::SquaredError(RegLoss::default()))?,
+        &dtrain,
+        1000,
+    )?;
     let members = model.predict_virtual_ensembles(&test, 10)?;
     println!(
         "reg:squarederror, {} members: the models after iterations {:?}",

@@ -2503,7 +2503,7 @@ mod tests {
     use crate::config::LinearTree;
     use crate::metric::{Metric, Rmse};
     use crate::objective::{
-        Aft, CustomLoss, LambdaRank, Logistic, Multiclass, Objective, PseudoHuber,
+        Aft, CustomLoss, LambdaRank, Multiclass, Objective, PseudoHuber, RegLoss,
     };
     use crate::test_support::labeled_dense;
     use crate::tree::{ChildLeaf, SplitRule};
@@ -2562,7 +2562,7 @@ mod tests {
             .map(|row| if row < 4_000 { 1.0 } else { 0.0 })
             .collect();
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .balanced_bagging(crate::config::BalancedBagging::new(0.6, 0.1).unwrap())
             .seed(53)
             .build()
@@ -2875,7 +2875,7 @@ mod tests {
     fn binary_logistic_separates_classes() {
         let d = step_dataset(100);
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -2892,7 +2892,7 @@ mod tests {
         // Zero rounds -> prediction is just the base score (label mean).
         let d = step_dataset(10);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .build()
             .unwrap();
         let model = train(&params, &d, 0).unwrap();
@@ -2908,7 +2908,7 @@ mod tests {
         let d = step_dataset(120);
         let rmse = |method: TreeMethod| {
             let params = TrainingParams::builder()
-                .objective(Objective::SquaredError)
+                .objective(Objective::SquaredError(RegLoss::default()))
                 .tree_method(method)
                 .max_depth(3)
                 .eta(0.3)
@@ -2932,7 +2932,7 @@ mod tests {
     fn lossguide_trains_end_to_end() {
         let d = step_dataset(120);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Hist)
             .grow_policy(GrowPolicy::LossGuide)
             .max_leaves(16)
@@ -2975,7 +2975,7 @@ mod tests {
         // `from_bytes`/`from_json` then refused; the class count now lives
         // in the multiclass objective only.
         for (objective, num_class) in [
-            (Objective::SquaredError, 0),
+            (Objective::SquaredError(RegLoss::default()), 0),
             (Objective::Softprob(Multiclass::new(3).unwrap()), 3),
         ] {
             let model = train(&params(objective), &d, 2).unwrap();
@@ -3080,7 +3080,7 @@ mod tests {
 
         let builtin = {
             let p = TrainingParams::builder()
-                .objective(Objective::SquaredError)
+                .objective(Objective::SquaredError(RegLoss::default()))
                 .max_depth(3)
                 .eta(0.3)
                 .base_score(0.0)
@@ -3224,7 +3224,7 @@ mod tests {
     fn dart_trains_reduces_error_and_roundtrips() {
         let d = step_dataset(120);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .booster(BoosterKind::Dart(
                 Dart::builder().rate_drop(0.1).build().unwrap(),
             ))
@@ -3344,7 +3344,7 @@ mod tests {
         // bit-for-bit the unweighted tree sum.
         let d = step_dataset(100);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -3391,7 +3391,7 @@ mod tests {
         for method in [TreeMethod::Auto, TreeMethod::Exact] {
             let mk = |d: &DMatrix| {
                 let p = TrainingParams::builder()
-                    .objective(Objective::SquaredError)
+                    .objective(Objective::SquaredError(RegLoss::default()))
                     .tree_method(method)
                     .max_depth(1)
                     .eta(0.3)
@@ -3431,7 +3431,7 @@ mod tests {
         }
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Exact)
             .max_depth(4)
             .eta(0.3)
@@ -3459,7 +3459,7 @@ mod tests {
         let bm: Vec<f32> = (0..60).map(|i| i as f32 * 0.01 + 1.5).collect();
         let d_bm = d.with_base_margin(&bm).unwrap();
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -3496,7 +3496,7 @@ mod tests {
 
         let train_with = |bynode: f64| {
             let p = TrainingParams::builder()
-                .objective(Objective::SquaredError)
+                .objective(Objective::SquaredError(RegLoss::default()))
                 .max_depth(4)
                 .eta(0.3)
                 .colsample_bynode(bynode)
@@ -3540,7 +3540,7 @@ mod tests {
     fn gblinear_fits_linear_target() {
         let d = linear_dataset(400);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .booster(BoosterKind::GbLinear)
             .eta(0.5)
             .base_score(0.0)
@@ -3569,7 +3569,7 @@ mod tests {
     fn gblinear_roundtrips() {
         let d = linear_dataset(200);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .booster(BoosterKind::GbLinear)
             .eta(0.5)
             .build()
@@ -3590,7 +3590,7 @@ mod tests {
         use crate::metric::CustomMetric;
         let d = step_dataset(80);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -3688,8 +3688,8 @@ mod tests {
         let x: Vec<f32> = (0..8).map(|i| i as f32 / 8.0).collect();
         let soft = [0.25f32, 0.75, 0.0, 1.0, 0.5, 0.9, 0.1, 0.6];
         for objective in [
-            Objective::RegLogistic(Logistic::default()),
-            Objective::BinaryLogistic(Logistic::default()),
+            Objective::RegLogistic(RegLoss::default()),
+            Objective::BinaryLogistic(RegLoss::default()),
         ] {
             let name = objective.name();
             let params = TrainingParams::builder()
@@ -3749,7 +3749,7 @@ mod tests {
     fn base_score_domain_follows_the_trained_loss() {
         let d = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
         let outside = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .base_score(2.0)
             .build()
             .unwrap();
@@ -3778,7 +3778,7 @@ mod tests {
     fn invalid_training_and_evaluation_inputs_return_errors() {
         let d = step_dataset(20);
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .build()
             .unwrap();
         assert!(
@@ -3821,7 +3821,7 @@ mod tests {
     fn eval_set_label_domain_errors_name_the_dataset() {
         let d = step_dataset(20);
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .build()
             .unwrap();
         let holdout = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 2.0]);
@@ -3924,10 +3924,10 @@ mod tests {
     #[test]
     fn multi_target_outputs_equal_per_column_models() {
         for (objective, logistic) in [
-            (Objective::SquaredError, false),
+            (Objective::SquaredError(RegLoss::default()), false),
             (Objective::PseudoHuber(PseudoHuber::default()), false),
-            (Objective::BinaryLogistic(Logistic::default()), true),
-            (Objective::RegLogistic(Logistic::default()), true),
+            (Objective::BinaryLogistic(RegLoss::default()), true),
+            (Objective::RegLogistic(RegLoss::default()), true),
         ] {
             let name = objective.name();
             for method in [TreeMethod::Hist, TreeMethod::Exact, TreeMethod::Approx] {
@@ -3975,7 +3975,7 @@ mod tests {
     fn multi_label_model_round_trips_and_classifies_per_label() {
         let (d, cols, _) = two_target_dataset(true);
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .eta(0.5)
             .build()
             .unwrap();

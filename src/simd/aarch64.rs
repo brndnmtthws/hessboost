@@ -528,12 +528,17 @@ pub(super) unsafe fn gamma_gradient(
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
+    scale_pos_weight: f32,
     out: &mut [GradPair],
 ) {
     // SAFETY: the caller guarantees NEON support. Pointer bounds are
     // documented at each memory access below.
     unsafe {
         let one = vdupq_n_f32(1.0);
+        let scale = vdupq_n_f32(scale_pos_weight);
+        let scalar_range = |out: &mut [GradPair], range| {
+            scalar::gamma_gradient(preds, labels, weights, scale_pos_weight, out, range);
+        };
         let mut index = 0;
         while index + VECTOR_WIDTH <= preds.len() {
             // SAFETY: the common-length contract leaves four readable inputs.
@@ -542,13 +547,14 @@ pub(super) unsafe fn gamma_gradient(
             gradient_guard!(
                 !regular_input(negative),
                 index,
-                scalar::gamma_gradient(preds, labels, weights, out, index..index + VECTOR_WIDTH)
+                scalar_range(out, index..index + VECTOR_WIDTH)
             );
             let label = vld1q_f32(labels.as_ptr().add(index));
-            let weight = match weights {
+            let mut weight = match weights {
                 Some(values) => vld1q_f32(values.as_ptr().add(index)),
                 None => one,
             };
+            weight = vmulq_f32(weight, vbslq_f32(vceqq_f32(label, one), scale, one));
             let scaled = vmulq_f32(label, expq_f32::<true>(negative));
             let grad = vmulq_f32(vsubq_f32(one, scaled), weight);
             let hess = vmulq_f32(scaled, weight);
@@ -556,7 +562,7 @@ pub(super) unsafe fn gamma_gradient(
             store_grad_pairs(out.as_mut_ptr(), index, grad, hess);
             index += VECTOR_WIDTH;
         }
-        scalar::gamma_gradient(preds, labels, weights, out, index..preds.len());
+        scalar_range(out, index..preds.len());
     }
 }
 

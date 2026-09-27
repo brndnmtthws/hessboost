@@ -262,7 +262,11 @@ impl EbmInfo {
             if !(b.reg_lambda.is_finite() && b.reg_lambda >= 0.0) {
                 return fail("reg_lambda must be finite and >= 0".into());
             }
-            if !matches!(model.objective().built_in(), Some(Objective::SquaredError)) {
+            if !model
+                .objective()
+                .built_in()
+                .is_some_and(Objective::is_unweighted_squared_error)
+            {
                 return fail("a Boulevard EBM is a reg:squarederror model".into());
             }
             self.validate_stages().or_else(fail)?;

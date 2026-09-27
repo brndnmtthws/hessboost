@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     let (dtrain, dtest) = (matrix(&train_x, &train_y)?, matrix(&test_x, &test_y)?);
 
     let params = TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .max_depth(4)
         .eta(0.1)
         .build()?;

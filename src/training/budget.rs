@@ -84,8 +84,9 @@
 //! # Parameters
 //!
 //! Budget mode derives the learning rate, tree size, and round count itself.
-//! It reads `objective` (with its parameters: `scale_pos_weight` of the
-//! logistic objectives, `huber_slope` of `reg:pseudohubererror`,
+//! It reads `objective` (with its parameters: `scale_pos_weight` of
+//! `reg:squarederror`, `reg:gamma`, and the logistic objectives,
+//! `huber_slope` of `reg:pseudohubererror`,
 //! `tweedie_variance_power` of `reg:tweedie`), `base_score`, `max_bin`,
 //! `nthread`, and `max_delta_step` for `count:poisson`; every other
 //! [`TrainingParams`] field must keep its default, or training fails naming
@@ -378,7 +379,7 @@ fn train_budget_inner(
     let stopping_rounds = config.effective_stopping_rounds();
     let regression_like = matches!(
         params.objective,
-        Objective::SquaredError | Objective::PseudoHuber(_)
+        Objective::SquaredError(_) | Objective::PseudoHuber(_)
     );
     let initial_loss = average(&loss);
     let mut previous_loss = initial_loss;

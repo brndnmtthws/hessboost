@@ -252,21 +252,35 @@ impl Default for Aft {
     }
 }
 
-/// The positive-class weight of the logistic objectives (`binary:logistic`,
-/// `binary:logitraw`, `reg:logistic`): the loss of every row labeled `1` is
-/// multiplied by it, to balance imbalanced classes. XGBoost
-/// `scale_pos_weight`, default `1`.
+/// The parameter of XGBoost's `RegLossObj` objectives
+/// (`reg:squarederror`, `reg:gamma`, `reg:logistic`, `binary:logistic`,
+/// `binary:logitraw`): the positive-label weight `scale_pos_weight`
+/// (XGBoost's `reg_loss_param`), default `1`.
 ///
-/// XGBoost also applies `scale_pos_weight` in `reg:squarederror` and
-/// `reg:gamma`; hessboost does not, so only the logistic objectives carry
-/// it.
+/// The gradient and Hessian of every row labeled exactly `1` (every cell of
+/// a label matrix) are multiplied by it on top of the sample weight, in
+/// `f32` as XGBoost's `GetGradient` does; to balance imbalanced classes, or
+/// to reweight the rows at `1` of a regression. Away from `1` an estimated
+/// intercept is one Newton step on these reweighted gradients (XGBoost's
+/// `FitIntercept`) instead of the (weighted) label mean.
+///
+/// ```
+/// use hessboost::objective::{Objective, RegLoss};
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let balanced = Objective::BinaryLogistic(RegLoss::new(3.0)?);
+/// assert_eq!(Objective::default(), Objective::SquaredError(RegLoss::default()));
+/// # let _ = balanced;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Logistic {
+pub struct RegLoss {
     scale_pos_weight: f64,
 }
 
-impl Logistic {
-    /// The logistic loss with positive-class weight `scale_pos_weight`.
+impl RegLoss {
+    /// The loss with positive-label weight `scale_pos_weight`.
     ///
     /// # Errors
     ///
@@ -286,19 +300,19 @@ impl Logistic {
                 format!("must stay positive and finite in f32, got {scale_pos_weight}"),
             ));
         }
-        Ok(Logistic { scale_pos_weight })
+        Ok(RegLoss { scale_pos_weight })
     }
 
-    /// The positive-class weight.
+    /// The positive-label weight.
     pub fn scale_pos_weight(&self) -> f64 {
         self.scale_pos_weight
     }
 }
 
-impl Default for Logistic {
-    /// XGBoost's default weight `1` (positives and negatives weigh the same).
+impl Default for RegLoss {
+    /// XGBoost's default weight `1` (rows labeled `1` weigh as the others).
     fn default() -> Self {
-        Logistic {
+        RegLoss {
             scale_pos_weight: 1.0,
         }
     }

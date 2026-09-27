@@ -242,7 +242,12 @@ fn objective_reads(objective: &str, key: &str, shared_trees: bool) -> bool {
         "num_class" => objective.starts_with("multi:"),
         "scale_pos_weight" => matches!(
             objective,
-            "binary:logistic" | "binary:logitraw" | "reg:logistic"
+            "reg:squarederror"
+                | "reg:linear"
+                | "reg:gamma"
+                | "binary:logistic"
+                | "binary:logitraw"
+                | "reg:logistic"
         ),
         "tweedie_variance_power" => objective == "reg:tweedie",
         "huber_slope" => objective == "reg:pseudohubererror",

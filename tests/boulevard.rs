@@ -1,5 +1,7 @@
 //! `booster = boulevard` and its statistical inference ([`hessboost::inference`]).
 
+use std::num::NonZeroUsize;
+
 use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Langevin, ModelShrink, ModelShrinkMode, QueryBagging,
     TrainingParams, TrainingParamsBuilder,
@@ -88,7 +90,7 @@ fn nystrom_on_every_row_reproduces_the_exact_solver() {
         };
         let exact = se(KernelSolver::Exact);
         let nystrom = se(KernelSolver::Nystrom {
-            landmarks: 300,
+            landmarks: NonZeroUsize::new(300).unwrap(),
             seed: 7,
         });
         for (e, n) in exact.as_slice().iter().zip(nystrom.as_slice()) {
@@ -108,7 +110,7 @@ fn training_and_inference_are_identical_across_thread_counts() {
             &dtrain,
             NoiseVariance::TrainingResiduals,
             KernelSolver::Nystrom {
-                landmarks: 100,
+                landmarks: NonZeroUsize::new(100).unwrap(),
                 seed: 1,
             },
         )
@@ -188,7 +190,7 @@ fn inference_on_empty_inputs_is_refused_or_empty() {
     for solver in [
         KernelSolver::Exact,
         KernelSolver::Nystrom {
-            landmarks: 10,
+            landmarks: NonZeroUsize::new(10).unwrap(),
             seed: 1,
         },
     ] {
@@ -201,7 +203,7 @@ fn inference_on_empty_inputs_is_refused_or_empty() {
         &dtrain,
         NoiseVariance::Known(1.0),
         KernelSolver::Nystrom {
-            landmarks: 1,
+            landmarks: NonZeroUsize::MIN,
             seed: 3,
         },
     )

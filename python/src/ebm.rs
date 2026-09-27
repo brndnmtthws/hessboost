@@ -4,10 +4,10 @@
 use crate::booster::Booster;
 use crate::data::{DMatrix, to_numpy};
 use crate::errors::{OrRaise, refuse};
-use crate::inference::intervals;
+use crate::inference::{intervals, solver};
 use hessboost::data::DMatrix as RustMatrix;
 use hessboost::ebm::{self, TermAxis};
-use hessboost::inference::{self, KernelSolver, NoiseVariance};
+use hessboost::inference::{self, NoiseVariance};
 use hessboost::model::{BoostedModel, Predictions};
 use numpy::PyArrayDyn;
 use pyo3::prelude::*;
@@ -186,10 +186,7 @@ impl EbmInference {
             holdout: holdout.map(|h| h.inner.clone()),
         };
         let train = &train.inner;
-        let solver = landmarks.map_or(KernelSolver::Exact, |landmarks| KernelSolver::Nystrom {
-            landmarks,
-            seed,
-        });
+        let solver = solver(landmarks, seed)?;
         let cell = py
             .detach(|| {
                 Cell::try_new(owner, |owner| {

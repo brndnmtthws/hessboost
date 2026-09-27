@@ -85,6 +85,8 @@ def test_refusals() -> None:
     booster = hessboost.train(PARAMS, hessboost.DMatrix(x, label=y), 5)
     with pytest.raises(hessboost.HessboostError, match="not both"):
         BoulevardInference.fit(booster, x, holdout=x, holdout_label=y, noise_variance=1.0)
+    with pytest.raises(hessboost.HessboostError, match="landmark"):
+        BoulevardInference.fit(booster, x, noise_variance=1.0, landmarks=0)
     with pytest.raises(TypeError):
         BoulevardInference.fit(booster, x, noise_variance="1")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):

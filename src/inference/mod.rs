@@ -197,6 +197,8 @@ mod refit;
 mod solver;
 mod term_kernel;
 
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
 use crate::conformal::Interval;
@@ -331,9 +333,18 @@ pub enum KernelSolver {
     /// [`Exact`](Self::Exact) up to rounding), those numerically dependent
     /// on the others dropped. `O(n s²)` time and `8 n s` bytes for
     /// `s = landmarks`.
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use hessboost::inference::KernelSolver;
+    ///
+    /// let landmarks = NonZeroUsize::new(1000).expect("1000 is nonzero");
+    /// let solver = KernelSolver::Nystrom { landmarks, seed: 0 };
+    /// # let _ = solver;
+    /// ```
     Nystrom {
-        /// Number of landmark rows (`>= 1`).
-        landmarks: usize,
+        /// Number of landmark rows.
+        landmarks: NonZeroUsize,
         /// Seed of the landmark draw.
         seed: u64,
     },
@@ -534,13 +545,7 @@ fn build_solver(kernel: &impl Kernel, solver: KernelSolver, c: f64) -> Result<Ri
             RidgeSolver::exact(kernel, c)
         }
         KernelSolver::Nystrom { landmarks, seed } => {
-            if landmarks == 0 {
-                return Err(HessboostError::invalid_param(
-                    "solver",
-                    "the Nyström solver needs at least one landmark",
-                ));
-            }
-            RidgeSolver::nystrom(kernel, c, landmarks, seed)
+            RidgeSolver::nystrom(kernel, c, landmarks.get(), seed)
         }
     }
 }
@@ -558,8 +563,8 @@ impl<'a> BoulevardInference<'a> {
     /// training data (a leaf holds fewer of its rows than it was grown on),
     /// has row weights or base margins, or (for the noise estimate) lacks
     /// labels; when [`KernelSolver::Exact`] gets more than
-    /// [`MAX_EXACT_ROWS`] rows or `Nystrom` no landmark; when a noise
-    /// variance is not finite and positive.
+    /// [`MAX_EXACT_ROWS`] rows; when a noise variance is not finite and
+    /// positive.
     pub fn fit(
         model: &'a BoostedModel,
         train: &DMatrix,

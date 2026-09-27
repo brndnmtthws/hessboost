@@ -152,6 +152,8 @@
 //! # Example
 //!
 //! ```
+//! use std::num::NonZeroUsize;
+//!
 //! use hessboost::diffusion::{DiffusionModel, DiffusionParams};
 //! use hessboost::prelude::*;
 //!
@@ -165,14 +167,14 @@
 //! let data = DMatrix::from_dense(&x, n, 1)?.with_labels(&y)?;
 //!
 //! let mut params = DiffusionParams::flow_matching();
-//! params.n_repeats = 5;
-//! params.num_boost_round = 50;
+//! params.n_repeats = NonZeroUsize::new(5).unwrap();
+//! params.num_boost_round = NonZeroUsize::new(50).unwrap();
 //! let model = DiffusionModel::fit(&params, &data)?;
 //!
 //! let samples = model.sample(&data, 20, 7)?; // [row][sample][output]
-//! assert_eq!(samples.values().len(), n * 20);
-//! let q = samples.quantiles(&[0.1, 0.9])?; // [row][level][output]
-//! assert!(q[0] < q[1]);
+//! assert_eq!(samples.as_slice().len(), n * 20);
+//! let q = samples.quantiles(&[0.1, 0.9])?;
+//! assert!(q.get(0, 0).unwrap()[0] < q.get(0, 1).unwrap()[0]); // row 0: 10% < 90%
 //!
 //! let restored = DiffusionModel::from_bytes(&model.to_bytes()?)?;
 //! assert_eq!(restored.sample(&data, 20, 7)?, samples);
@@ -195,7 +197,7 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Objective;
 
-pub use sample::Samples;
+pub use sample::{Quantiles, Samples};
 
 /// What the GBDT learns and how sampling integrates it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -413,9 +415,8 @@ pub enum OdeSolver {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct EarlyStopping {
-    /// Rounds without improvement of the validation RMSE before stopping
-    /// (`> 0`).
-    pub rounds: usize,
+    /// Rounds without improvement of the validation RMSE before stopping.
+    pub rounds: NonZeroUsize,
     /// Fraction of the rows held out (in `(0, 1)`; `ceil(fraction · n)`
     /// rows, at least one row on each side).
     pub eval_fraction: f64,
@@ -425,7 +426,7 @@ impl Default for EarlyStopping {
     /// Treeffuser's 50 rounds on 10% of the rows.
     fn default() -> Self {
         EarlyStopping {
-            rounds: 50,
+            rounds: const { NonZeroUsize::new(50).unwrap() },
             eval_fraction: 0.1,
         }
     }
@@ -442,8 +443,8 @@ pub struct Residualizer {
     pub folds: usize,
     /// Parameters of the fold models (objective `reg:squarederror`).
     pub training: TrainingParams,
-    /// Boosting rounds of each fold model (`> 0`).
-    pub num_boost_round: usize,
+    /// Boosting rounds of each fold model.
+    pub num_boost_round: NonZeroUsize,
 }
 
 impl Default for Residualizer {
@@ -457,7 +458,7 @@ impl Default for Residualizer {
                 max_depth: NonZeroUsize::new(6),
                 ..lightgbm_like()
             },
-            num_boost_round: 100,
+            num_boost_round: const { NonZeroUsize::new(100).unwrap() },
         }
     }
 }
@@ -470,16 +471,15 @@ impl Default for Residualizer {
 pub struct DiffusionParams {
     /// Score diffusion or flow matching, with its settings.
     pub method: Method,
-    /// Noisy copies of each training row (`> 0`; Treeffuser's
-    /// `n_repeats`).
-    pub n_repeats: usize,
-    /// Integration steps of the sampler (`> 0`), stored with the model.
-    pub n_steps: usize,
+    /// Noisy copies of each training row (Treeffuser's `n_repeats`).
+    pub n_repeats: NonZeroUsize,
+    /// Integration steps of the sampler, stored with the model.
+    pub n_steps: NonZeroUsize,
     /// Parameters of the score/velocity GBDT (objective
     /// `reg:squarederror`).
     pub training: TrainingParams,
-    /// Maximum boosting rounds of the score/velocity GBDT (`> 0`).
-    pub num_boost_round: usize,
+    /// Maximum boosting rounds of the score/velocity GBDT.
+    pub num_boost_round: NonZeroUsize,
     /// Early stopping on a validation split; `None` trains every round on
     /// all rows.
     pub early_stopping: Option<EarlyStopping>,
@@ -496,10 +496,10 @@ impl Default for DiffusionParams {
     fn default() -> Self {
         DiffusionParams {
             method: Method::Score(ScoreConfig::default()),
-            n_repeats: 30,
-            n_steps: 50,
+            n_repeats: const { NonZeroUsize::new(30).unwrap() },
+            n_steps: const { NonZeroUsize::new(50).unwrap() },
             training: lightgbm_like(),
-            num_boost_round: 3000,
+            num_boost_round: const { NonZeroUsize::new(3000).unwrap() },
             early_stopping: Some(EarlyStopping::default()),
             residualizer: Some(Residualizer::default()),
             seed: 0,
@@ -523,7 +523,7 @@ impl DiffusionParams {
     pub fn flow_matching() -> Self {
         DiffusionParams {
             method: Method::FlowMatching(FlowMatchingConfig::default()),
-            n_steps: 5,
+            n_steps: const { NonZeroUsize::new(5).unwrap() },
             ..DiffusionParams::default()
         }
     }
@@ -532,18 +532,14 @@ impl DiffusionParams {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for a zero count, an
-    /// out-of-range fraction or process parameter, or GBDT parameters that
-    /// fail [`TrainingParams::validate`], name an objective other than
+    /// [`HessboostError::InvalidParameter`] for an out-of-range fraction,
+    /// fold count or process parameter, or GBDT parameters that fail
+    /// [`TrainingParams::validate`], name an objective other than
     /// `reg:squarederror`, or set `process_type` to `update`.
     pub fn validate(&self) -> Result<()> {
         self.method.validate()?;
-        positive_count("n_repeats", self.n_repeats)?;
-        positive_count("n_steps", self.n_steps)?;
-        positive_count("num_boost_round", self.num_boost_round)?;
         validate_regressor_params("training", &self.training)?;
         if let Some(stop) = &self.early_stopping {
-            positive_count("early_stopping.rounds", stop.rounds)?;
             let f = stop.eval_fraction;
             if !(f.is_finite() && f > 0.0 && f < 1.0) {
                 return Err(HessboostError::invalid_param(
@@ -559,7 +555,6 @@ impl DiffusionParams {
                     format!("must be at least 2, got {}", r.folds),
                 ));
             }
-            positive_count("residualizer.num_boost_round", r.num_boost_round)?;
             validate_regressor_params("residualizer.training", &r.training)?;
         }
         Ok(())
@@ -581,13 +576,6 @@ fn lightgbm_like() -> TrainingParams {
         max_bin: 255,
         ..TrainingParams::default()
     }
-}
-
-fn positive_count(name: &'static str, v: usize) -> Result<()> {
-    if v == 0 {
-        return Err(HessboostError::invalid_param(name, "must be at least 1"));
-    }
-    Ok(())
 }
 
 /// `params` validate, regress with squared error (the loss every diffusion
@@ -742,7 +730,7 @@ struct FittedResidualizer {
 #[serde(try_from = "format::UncheckedDiffusionModel")]
 pub struct DiffusionModel {
     method: Method,
-    n_steps: usize,
+    n_steps: NonZeroUsize,
     /// Feature columns of the data (`x`).
     n_features: usize,
     /// Label columns (`y`).
@@ -795,20 +783,14 @@ impl DiffusionModel {
     }
 
     /// Integration steps [`Self::sample`] takes.
-    pub fn n_steps(&self) -> usize {
+    pub fn n_steps(&self) -> NonZeroUsize {
         self.n_steps
     }
 
-    /// Change the number of integration steps (`> 0`): more steps follow
-    /// the learned dynamics more closely at a proportional cost.
-    ///
-    /// # Errors
-    ///
-    /// [`HessboostError::InvalidParameter`] for `0`.
-    pub fn set_n_steps(&mut self, n_steps: usize) -> Result<()> {
-        positive_count("n_steps", n_steps)?;
+    /// Change the number of integration steps: more steps follow the
+    /// learned dynamics more closely at a proportional cost.
+    pub fn set_n_steps(&mut self, n_steps: NonZeroUsize) {
         self.n_steps = n_steps;
-        Ok(())
     }
 
     /// Feature columns the model conditions on.
@@ -918,9 +900,6 @@ impl DiffusionModel {
             .validate()
             .map_err(|e| HessboostError::model_format(e.to_string()))?;
         let bad = |msg: String| Err(HessboostError::model_format(msg));
-        if self.n_steps == 0 {
-            return bad("n_steps must be at least 1".into());
-        }
         let d = self.n_outputs;
         if d == 0 || self.n_features == 0 {
             return bad("a diffusion model needs at least one feature and one output".into());

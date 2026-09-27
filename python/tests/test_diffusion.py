@@ -258,6 +258,15 @@ def test_unsupported_data_is_refused(fitted: tuple[DiffusionModel, NDArray[np.fl
         mean(np.full((1, 2, 1), np.nan))
 
 
+def test_summaries_of_no_rows_are_empty() -> None:
+    # Zero rows leave the sample count unbounded by the array's size: the
+    # summaries must not allocate by it.
+    empty = np.empty((0, 2**40, 1), dtype=np.float32)
+    assert mean(empty).shape == (0, 1)
+    assert quantiles(empty, [0.1, 0.9]).shape == (0, 2, 1)
+    assert crps(empty, np.empty((0, 1))).shape == (0, 1)
+
+
 def test_damaged_models_are_refused(
     fitted: tuple[DiffusionModel, NDArray[np.float64]], tmp_path: Path
 ) -> None:

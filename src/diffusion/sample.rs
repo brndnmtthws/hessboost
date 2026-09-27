@@ -6,6 +6,7 @@ use super::process::{T_EPS, keyed_normal, try_filled};
 use super::{DiffusionModel, Method, OdeSolver, Parameterization, ScoreConfig};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
+use crate::model::Predictions;
 use crate::rng::splitmix64;
 
 /// Stream of the sampler's noise.
@@ -44,7 +45,12 @@ impl Samples {
                 ),
             ));
         }
-        let width = n_samples.saturating_mul(n_outputs);
+        let Some(width) = n_samples.checked_mul(n_outputs) else {
+            return Err(HessboostError::invalid_param(
+                "samples",
+                format!("{n_samples} samples × {n_outputs} outputs overflows usize"),
+            ));
+        };
         if !values.len().is_multiple_of(width) {
             return Err(HessboostError::invalid_param(
                 "samples",
@@ -68,13 +74,13 @@ impl Samples {
         })
     }
 
-    /// Every draw, `[row][sample][output]`.
-    pub fn values(&self) -> &[f32] {
+    /// The flat `[row][sample][output]` buffer.
+    pub fn as_slice(&self) -> &[f32] {
         &self.values
     }
 
-    /// The draws as an owned vector, `[row][sample][output]`.
-    pub fn into_values(self) -> Vec<f32> {
+    /// The flat `[row][sample][output]` buffer, without copying.
+    pub fn into_vec(self) -> Vec<f32> {
         self.values
     }
 
@@ -101,8 +107,19 @@ impl Samples {
         self.values.get(start..start.checked_add(width)?)
     }
 
-    /// Monte Carlo estimate of the conditional mean, `[row][output]`.
-    pub fn mean(&self) -> Vec<f64> {
+    /// The `n_outputs` values of draw `sample` of `row`, or `None` if either
+    /// is out of range.
+    pub fn get(&self, row: usize, sample: usize) -> Option<&[f32]> {
+        if sample >= self.per_row {
+            return None;
+        }
+        let draws = self.row(row)?;
+        Some(&draws[sample * self.n_outputs..(sample + 1) * self.n_outputs])
+    }
+
+    /// Monte Carlo estimate of the conditional mean: one row per sampled
+    /// row, [`n_outputs`](Self::n_outputs) values wide.
+    pub fn mean(&self) -> Predictions<f64> {
         let mut out = vec![0.0; self.n_rows * self.n_outputs];
         let width = self.per_row * self.n_outputs;
         for (mean, draws) in out
@@ -118,17 +135,16 @@ impl Samples {
                 *m /= self.per_row as f64;
             }
         }
-        out
+        Predictions::new(out, self.n_rows, self.n_outputs)
     }
 
     /// Empirical quantiles at `levels` (each in `[0, 1]`) by linear
-    /// interpolation between order statistics (NumPy's default),
-    /// `[row][level][output]`.
+    /// interpolation between order statistics (NumPy's default).
     ///
     /// # Errors
     ///
     /// [`HessboostError::InvalidParameter`] for a level outside `[0, 1]`.
-    pub fn quantiles(&self, levels: &[f64]) -> Result<Vec<f64>> {
+    pub fn quantiles(&self, levels: &[f64]) -> Result<Quantiles> {
         if let Some(&level) = levels.iter().find(|l| !(0.0..=1.0).contains(*l)) {
             return Err(HessboostError::invalid_param(
                 "levels",
@@ -142,7 +158,7 @@ impl Samples {
             .and_then(|n| n.checked_mul(d))
             .unwrap_or(usize::MAX);
         let mut out = try_filled(len, 0.0, "levels")?;
-        let mut column = vec![0.0; self.per_row];
+        let mut column = Vec::new();
         for row in 0..self.n_rows {
             for o in 0..d {
                 self.sorted_column(row, o, &mut column);
@@ -151,20 +167,26 @@ impl Samples {
                 }
             }
         }
-        Ok(out)
+        Ok(Quantiles {
+            values: out,
+            n_rows: self.n_rows,
+            n_levels: k,
+            n_outputs: d,
+        })
     }
 
     /// The continuous ranked probability score of each label under the
-    /// empirical distribution of its row's draws, `[row][output]`:
-    /// `mean |X - y| - ½ mean |X - X'|` over the draws `X`, `X'` (the
-    /// ensemble CRPS; lower is better). `labels` is `[row][output]`.
+    /// empirical distribution of its row's draws: `mean |X - y| - ½ mean
+    /// |X - X'|` over the draws `X`, `X'` (the ensemble CRPS; lower is
+    /// better), one row per sampled row, [`n_outputs`](Self::n_outputs)
+    /// values wide. `labels` is `[row][output]`.
     ///
     /// # Errors
     ///
     /// [`HessboostError::DimensionMismatch`] unless `labels` holds
     /// `n_rows · n_outputs` values; [`HessboostError::InvalidParameter`] for
     /// a non-finite label.
-    pub fn crps(&self, labels: &[f32]) -> Result<Vec<f64>> {
+    pub fn crps(&self, labels: &[f32]) -> Result<Predictions<f64>> {
         let d = self.n_outputs;
         if labels.len() != self.n_rows * d {
             return Err(HessboostError::DimensionMismatch {
@@ -180,7 +202,7 @@ impl Samples {
             ));
         }
         let s = self.per_row as f64;
-        let mut column = vec![0.0; self.per_row];
+        let mut column = Vec::new();
         let mut out = vec![0.0; self.n_rows * d];
         for row in 0..self.n_rows {
             for o in 0..d {
@@ -197,16 +219,76 @@ impl Samples {
                 out[row * d + o] = spread_to_label - pairwise / (2.0 * s * s);
             }
         }
-        Ok(out)
+        Ok(Predictions::new(out, self.n_rows, d))
     }
 
-    /// The draws of `(row, output)` into `column`, ascending.
-    fn sorted_column(&self, row: usize, output: usize, column: &mut [f64]) {
+    /// The draws of `(row, output)` into `column`, ascending. `column` is
+    /// only allocated once there is a row to read: without rows,
+    /// `n_samples` is unbounded by the draws' length.
+    fn sorted_column(&self, row: usize, output: usize, column: &mut Vec<f64>) {
         let base = row * self.per_row * self.n_outputs + output;
-        for (s, c) in column.iter_mut().enumerate() {
-            *c = f64::from(self.values[base + s * self.n_outputs]);
-        }
+        column.clear();
+        column.extend((0..self.per_row).map(|s| f64::from(self.values[base + s * self.n_outputs])));
         column.sort_unstable_by(f64::total_cmp);
+    }
+}
+
+impl AsRef<[f32]> for Samples {
+    fn as_ref(&self) -> &[f32] {
+        &self.values
+    }
+}
+
+/// Empirical quantiles of [`Samples`] ([`Samples::quantiles`]): per row and
+/// level, one value per output, laid out `[row][level][output]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Quantiles {
+    values: Vec<f64>,
+    n_rows: usize,
+    n_levels: usize,
+    n_outputs: usize,
+}
+
+impl Quantiles {
+    /// Number of rows (the sampled rows).
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Number of quantile levels.
+    pub fn n_levels(&self) -> usize {
+        self.n_levels
+    }
+
+    /// Label columns per quantile.
+    pub fn n_outputs(&self) -> usize {
+        self.n_outputs
+    }
+
+    /// The `n_outputs` quantiles of `row` at level index `level`, or `None`
+    /// if either is out of range.
+    pub fn get(&self, row: usize, level: usize) -> Option<&[f64]> {
+        if row >= self.n_rows || level >= self.n_levels {
+            return None;
+        }
+        let start = (row * self.n_levels + level) * self.n_outputs;
+        Some(&self.values[start..start + self.n_outputs])
+    }
+
+    /// The flat `[row][level][output]` buffer.
+    pub fn as_slice(&self) -> &[f64] {
+        &self.values
+    }
+
+    /// The flat `[row][level][output]` buffer, without copying.
+    pub fn into_vec(self) -> Vec<f64> {
+        self.values
+    }
+}
+
+impl AsRef<[f64]> for Quantiles {
+    fn as_ref(&self) -> &[f64] {
+        &self.values
     }
 }
 
@@ -375,7 +457,7 @@ impl Sampler<'_> {
     fn reverse_sde(&self, score: &ScoreConfig, batch: &mut Batch, y: &mut [f64]) -> Result<()> {
         let model = self.model;
         let d = model.n_outputs;
-        let steps = model.n_steps;
+        let steps = model.n_steps.get();
         let dt = (1.0 - T_EPS) / steps as f64;
         for step in 0..steps {
             let t = 1.0 - step as f64 * dt;
@@ -413,7 +495,7 @@ impl Sampler<'_> {
     /// (DiffGBM's flow-matching sampler).
     fn reverse_ode(&self, solver: OdeSolver, batch: &mut Batch, y: &mut [f64]) -> Result<()> {
         let model = self.model;
-        let steps = model.n_steps;
+        let steps = model.n_steps.get();
         let ds = (1.0 - T_EPS) / steps as f64;
         let time = |t: f64| [t as f32, 0.0];
         let mut predictor = match solver {
@@ -491,13 +573,13 @@ mod tests {
                     .flat_map(|a| draws.iter().map(move |b| (a - b).abs()))
                     .sum::<f64>()
                     / 8.0;
-                assert!((crps[row * 2 + o] - (to_label - pairwise)).abs() < 1e-12);
+                assert!((crps.get(row, o).unwrap() - (to_label - pairwise)).abs() < 1e-12);
             }
         }
         // Row 0, output 0 draws {0.5, -1}: the median is their midpoint.
         let q = samples.quantiles(&[0.0, 0.5, 1.0]).unwrap();
-        assert_eq!(&q[..6], &[-1.0, 2.0, -0.25, 2.5, 0.5, 3.0]);
-        assert_eq!(samples.mean()[..2], [-0.25, 2.5]);
+        assert_eq!(&q.as_slice()[..6], &[-1.0, 2.0, -0.25, 2.5, 0.5, 3.0]);
+        assert_eq!(samples.mean().row(0).unwrap(), [-0.25, 2.5]);
         assert!(samples.quantiles(&[1.5]).is_err());
         assert!(samples.crps(&[0.0; 3]).is_err());
     }

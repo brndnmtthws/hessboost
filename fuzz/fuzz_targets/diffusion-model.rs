@@ -46,7 +46,7 @@ fuzz_target!(|data: &[u8]| {
         .expect("a saved model loads");
     assert_eq!(from_bytes.method(), model.method());
     assert_eq!(from_json.method(), model.method());
-    if model.n_steps() <= MAX_STEPS
+    if model.n_steps().get() <= MAX_STEPS
         && model.n_features() <= MAX_FEATURES
         && model.n_outputs() <= MAX_FEATURES
         && model.regressor().num_trees() <= MAX_TREES
@@ -56,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
         // Sampling may refuse a diverging sampler, but never panics, and a
         // successful draw has the documented shape and reloads identically.
         if let Ok(samples) = model.sample(&probe, 2, 0) {
-            assert_eq!(samples.values().len(), 2 * 2 * model.n_outputs());
+            assert_eq!(samples.as_slice().len(), 2 * 2 * model.n_outputs());
             assert_eq!(from_bytes.sample(&probe, 2, 0).ok(), Some(samples));
         }
     }

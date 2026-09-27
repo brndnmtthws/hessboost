@@ -2,6 +2,8 @@
 //! learned distribution's shape, sampling determinism, persistence, and
 //! refusals.
 
+use std::num::NonZeroUsize;
+
 use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
@@ -34,9 +36,13 @@ fn bimodal(n: usize, seed: u64) -> DMatrix {
 
 /// A small, fast configuration of `base`.
 fn quick(mut base: DiffusionParams) -> DiffusionParams {
-    base.n_repeats = 10;
-    base.num_boost_round = 150;
+    base.n_repeats = nz(10);
+    base.num_boost_round = nz(150);
     base
+}
+
+fn nz(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
 }
 
 fn probes(xs: &[f32]) -> DMatrix {
@@ -99,9 +105,9 @@ fn multivariate_labels_are_sampled_jointly() {
     let model = DiffusionModel::fit(&quick(DiffusionParams::default()), &data).unwrap();
     assert_eq!(model.n_outputs(), 2);
     let samples = model.sample(&probes(&[0.5]), 300, 5).unwrap();
-    assert_eq!(samples.values().len(), 300 * 2);
+    assert_eq!(samples.as_slice().len(), 300 * 2);
     let aligned = samples
-        .values()
+        .as_slice()
         .as_chunks::<2>()
         .0
         .iter()
@@ -145,7 +151,7 @@ fn stored_draws_rebuild_their_samples() {
     let data = bimodal(300, 5);
     let model = DiffusionModel::fit(&quick(DiffusionParams::flow_matching()), &data).unwrap();
     let samples = model.sample(&probes(&[0.2, 0.6, 0.9]), 40, 1).unwrap();
-    let rebuilt = Samples::new(samples.values().to_vec(), 40, 1).unwrap();
+    let rebuilt = Samples::new(samples.as_slice().to_vec(), 40, 1).unwrap();
     assert_eq!(rebuilt, samples);
     assert_eq!(rebuilt.n_rows(), 3);
     // Wrong layouts and non-finite draws are refused.
@@ -154,12 +160,26 @@ fn stored_draws_rebuild_their_samples() {
         (vec![0.0; 6], 0, 1),
         (vec![0.0; 6], 3, 0),
         (vec![0.0, f32::NAN], 2, 1),
+        (Vec::new(), usize::MAX, 2),
     ] {
         assert_eq!(
             invalid_param(Samples::new(values, n_samples, n_outputs)),
             "samples"
         );
     }
+}
+
+#[test]
+fn summaries_of_no_rows_are_empty() {
+    // Without rows, `n_samples` is not bounded by the draws' length: the
+    // summaries must not size buffers by it (2⁴⁰ `f64`s cannot be allocated).
+    let empty = Samples::new(Vec::new(), 1 << 40, 1).unwrap();
+    assert_eq!(empty.n_rows(), 0);
+    assert!(empty.mean().as_slice().is_empty());
+    let q = empty.quantiles(&[0.1, 0.9]).unwrap();
+    assert_eq!((q.n_rows(), q.n_levels(), q.n_outputs()), (0, 2, 1));
+    assert!(q.as_slice().is_empty());
+    assert!(empty.crps(&[]).unwrap().as_slice().is_empty());
 }
 
 #[test]
@@ -329,13 +349,6 @@ fn unsupported_inputs_are_refused() {
     );
 
     let mut params = quick(DiffusionParams::default());
-    params.n_repeats = 0;
-    assert_eq!(
-        invalid_param(DiffusionModel::fit(&params, &data)),
-        "n_repeats"
-    );
-
-    let mut params = quick(DiffusionParams::default());
     let mut broken = ScoreConfig::default();
     broken.sde = Sde::VarianceExploding {
         sigma_min: 1.0,
@@ -415,7 +428,7 @@ fn unsupported_inputs_are_refused() {
         let mut params = quick(DiffusionParams::default());
         params.residualizer = None;
         params.early_stopping = None;
-        params.n_repeats = n_repeats;
+        params.n_repeats = nz(n_repeats);
         assert_eq!(
             invalid_param(DiffusionModel::fit(&params, &small)),
             "n_repeats"

@@ -75,17 +75,17 @@ pub(super) fn fit(params: &DiffusionParams, data: &DMatrix) -> Result<DiffusionM
     };
     let mut rng = Rng::new(splitmix64(params.seed ^ NOISE_STREAM));
     let mut normal = Normal::default();
-    let dtrain = set.build(train_rows, params.n_repeats, &mut rng, &mut normal)?;
+    let dtrain = set.build(train_rows, params.n_repeats.get(), &mut rng, &mut normal)?;
     let regressor = match &params.early_stopping {
         Some(stop) => {
             let dval = set.build(val_rows, 1, &mut rng, &mut normal)?;
-            Trainer::new(&params.training, &dtrain, params.num_boost_round)
+            Trainer::new(&params.training, &dtrain, params.num_boost_round.get())
                 .eval(&dval, "valid")
-                .early_stopping_rounds(stop.rounds)
+                .early_stopping_rounds(stop.rounds.get())
                 .train()?
                 .model
         }
-        None => train(&params.training, &dtrain, params.num_boost_round)?,
+        None => train(&params.training, &dtrain, params.num_boost_round.get())?,
     };
 
     let model = DiffusionModel {
@@ -224,7 +224,7 @@ fn residualize(
         let dfold = data
             .select_rows(&train_rows)?
             .with_label_matrix(&fold_labels, d)?;
-        let model = train(&config.training, &dfold, config.num_boost_round)?;
+        let model = train(&config.training, &dfold, config.num_boost_round.get())?;
         let pred = model.predict_margin(&data.select_rows(test)?)?;
         for (&row, values) in test.iter().zip(pred.as_slice().chunks_exact(d)) {
             for (o, &v) in oof[row * d..(row + 1) * d].iter_mut().zip(values) {

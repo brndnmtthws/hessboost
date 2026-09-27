@@ -125,7 +125,7 @@ pub(super) fn write(model: &DiffusionModel) -> Result<Vec<u8>> {
             w.f64("time.std", std);
         }
     }
-    w.u64("diffusion.n_steps", model.n_steps as u64);
+    w.u64("diffusion.n_steps", model.n_steps.get() as u64);
     w.u64("diffusion.n_features", model.n_features as u64);
     w.u64("diffusion.n_outputs", model.n_outputs as u64);
     w.array(
@@ -270,7 +270,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<DiffusionModel> {
     };
     let model = DiffusionModel {
         method,
-        n_steps: s.usize("diffusion.n_steps")?,
+        n_steps: std::num::NonZeroUsize::new(s.usize("diffusion.n_steps")?)
+            .ok_or_else(|| format_error("section `diffusion.n_steps` must be at least 1"))?,
         n_features: s.usize("diffusion.n_features")?,
         n_outputs,
         target_mean: s.array_exact("target.mean", n_outputs, f64::from_le_bytes)?,
@@ -292,7 +293,7 @@ fn unknown(name: &str, value: &str) -> HessboostError {
 #[derive(Deserialize)]
 pub(super) struct UncheckedDiffusionModel {
     method: Method,
-    n_steps: usize,
+    n_steps: std::num::NonZeroUsize,
     n_features: usize,
     n_outputs: usize,
     target_mean: Vec<f64>,

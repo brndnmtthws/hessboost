@@ -85,8 +85,11 @@ fn coverage90(samples: &Samples, labels: &[f32]) -> Result<f64> {
     let q = samples.quantiles(&[0.05, 0.95])?;
     let inside = labels
         .iter()
-        .zip(q.as_chunks::<2>().0)
-        .filter(|&(&y, band)| band[0] <= f64::from(y) && f64::from(y) <= band[1])
+        .enumerate()
+        .filter(|&(row, &y)| match (q.get(row, 0), q.get(row, 1)) {
+            (Some(lo), Some(hi)) => lo[0] <= f64::from(y) && f64::from(y) <= hi[0],
+            _ => false,
+        })
         .count();
     Ok(inside as f64 / labels.len() as f64)
 }
@@ -118,7 +121,7 @@ fn report(name: &str, params: &DiffusionParams, train: &DMatrix, test: &DMatrix)
     let labels = test.labels().unwrap_or_default();
     println!(
         "  {name:<14} CRPS {:.4}  90% coverage {:.3}  ({} rounds, fit {:.1?}, 100 samples × {} rows {:.1?})",
-        mean(&samples.crps(labels)?),
+        mean(samples.crps(labels)?.as_slice()),
         coverage90(&samples, labels)?,
         model.regressor().num_boost_rounds(),
         fit_time,
@@ -149,9 +152,9 @@ fn main() -> Result<()> {
     for (row, x) in [0.1, 0.9].into_iter().enumerate() {
         println!(
             "  x = {x}: quantiles 10/25/50/75/90% = {:?}, modes at ±{:.1}",
-            q[row * 5..row * 5 + 5]
-                .iter()
-                .map(|v| (v * 100.0).round() / 100.0)
+            (0..q.n_levels())
+                .filter_map(|level| q.get(row, level))
+                .map(|v| (v[0] * 100.0).round() / 100.0)
                 .collect::<Vec<_>>(),
             1.0 + x,
         );
@@ -185,7 +188,7 @@ fn main() -> Result<()> {
     let probe = DMatrix::from_dense(&[0.5], 1, 1)?;
     let draws = model.sample(&probe, 2000, 4)?;
     let pairs: Vec<(f64, f64)> = draws
-        .values()
+        .as_slice()
         .as_chunks::<2>()
         .0
         .iter()
@@ -205,6 +208,7 @@ fn main() -> Result<()> {
          vs {:.3} across draws (true noise alone: 0.034)",
         draws
             .mean()
+            .as_slice()
             .iter()
             .map(|v| (v * 100.0).round() / 100.0)
             .collect::<Vec<_>>(),

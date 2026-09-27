@@ -778,12 +778,12 @@ fn save_models_of_this_version() {
 /// One small diffusion model per method, as saved for each release.
 fn diffusion_models() -> Vec<(&'static str, DiffusionModel)> {
     let tiny = |mut params: DiffusionParams| {
-        params.n_repeats = 2;
-        params.num_boost_round = 4;
+        params.n_repeats = std::num::NonZeroUsize::new(2).unwrap();
+        params.num_boost_round = std::num::NonZeroUsize::new(4).unwrap();
         params.early_stopping = None;
         params.training.nthread = std::num::NonZeroUsize::new(1);
         if let Some(r) = &mut params.residualizer {
-            r.num_boost_round = 3;
+            r.num_boost_round = std::num::NonZeroUsize::new(3).unwrap();
         }
         params
     };

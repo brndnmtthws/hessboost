@@ -8,10 +8,6 @@ use libfuzzer_sys::fuzz_target;
 #[path = "common.rs"]
 mod common;
 
-/// Widest model the target predicts with (see `common.rs`).
-const MAX_PREDICT_FEATURES: usize = 64;
-const MAX_OUTPUTS: usize = 16;
-
 fuzz_target!(|data: &[u8]| {
     let Ok(model) = CompactModel::from_bytes(data) else {
         return;
@@ -20,27 +16,5 @@ fuzz_target!(|data: &[u8]| {
         model.to_bytes() == data,
         "to_bytes returns the parsed bytes"
     );
-    let n_features = model.n_features();
-    let k = model.n_outputs();
-    assert!(n_features > 0 && k > 0);
-    for feature in model.used_features() {
-        assert!(feature < n_features);
-    }
-    if n_features > MAX_PREDICT_FEATURES || k > MAX_OUTPUTS {
-        return;
-    }
-    let probe = common::probe_matrix(n_features);
-    let margin = model
-        .predict_margin(&probe)
-        .expect("probe matrix matches the model");
-    assert_eq!((margin.n_rows(), margin.width()), (probe.n_rows(), k));
-    let preds = model
-        .predict(&probe)
-        .expect("probe matrix matches the model");
-    let expected = if model.objective().name() == "multi:softmax" {
-        1
-    } else {
-        k
-    };
-    assert_eq!((preds.n_rows(), preds.width()), (probe.n_rows(), expected));
+    common::exercise_compact(&model);
 });

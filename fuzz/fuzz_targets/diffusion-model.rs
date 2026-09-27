@@ -11,6 +11,9 @@ use hessboost::diffusion::DiffusionModel;
 use hessboost::prelude::*;
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common.rs"]
+mod common;
+
 /// `b"HBDM"` and the container version (`diffusion/format.rs`).
 const HEADER: &[u8] = b"HBDM\x01";
 /// Largest model the target samples from: a fuzzed header can claim any
@@ -23,29 +26,29 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
-    let model = match mode {
-        0 => DiffusionModel::from_bytes(rest),
-        1 => {
-            let mut container = [HEADER, rest].concat();
-            let checksum = xxhash_rust::xxh64::xxh64(&container, 0);
-            container.extend_from_slice(&checksum.to_le_bytes());
-            DiffusionModel::from_bytes(&container)
-        }
-        _ => match std::str::from_utf8(rest) {
-            Ok(text) => DiffusionModel::from_json(text),
-            Err(_) => return,
-        },
+    let Some(model) = common::parse_mode(
+        mode,
+        rest,
+        HEADER,
+        DiffusionModel::from_bytes,
+        DiffusionModel::from_json,
+    ) else {
+        return;
     };
     let Ok(model) = model else {
         return;
     };
+    common::round_trip(
+        &model,
+        |model| model.to_bytes(),
+        DiffusionModel::from_bytes,
+        |model| model.to_json(),
+        DiffusionModel::from_json,
+        |model, from_bytes| assert_eq!(from_bytes.method(), model.method()),
+    );
     let from_bytes =
         DiffusionModel::from_bytes(&model.to_bytes().expect("an accepted model saves"))
             .expect("a saved model loads");
-    let from_json = DiffusionModel::from_json(&model.to_json().expect("an accepted model saves"))
-        .expect("a saved model loads");
-    assert_eq!(from_bytes.method(), model.method());
-    assert_eq!(from_json.method(), model.method());
     if model.n_steps().get() <= MAX_STEPS
         && model.n_features() <= MAX_FEATURES
         && model.n_outputs() <= MAX_FEATURES

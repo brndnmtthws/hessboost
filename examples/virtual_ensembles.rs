@@ -11,7 +11,7 @@ use hessboost::objective::{Objective, RegLoss};
 use hessboost::prelude::*;
 
 mod common;
-use common::lcg;
+use common::{lcg, normal};
 
 /// The noise scale of the target at `x0`.
 fn noise_sd(x0: f32) -> f32 {
@@ -28,8 +28,7 @@ fn dataset(n: usize, seed: u64) -> Result<DMatrix> {
         if x0 > 0.6 && x1 > 0.6 {
             continue;
         }
-        // A sum of twelve uniforms: roughly standard normal noise.
-        let eps = (0..12).map(|_| next()).sum::<f32>() - 6.0;
+        let eps = normal(&mut next);
         x.extend_from_slice(&[x0, x1]);
         y.push((std::f32::consts::TAU * x0).sin() + x1 + noise_sd(x0) * eps);
     }

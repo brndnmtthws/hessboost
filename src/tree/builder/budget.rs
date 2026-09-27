@@ -31,12 +31,14 @@
 //! with the missing rows counted in every fold's statistics. (Perpetual's
 //! imputing splitter adds the whole missing mass to the in-fold side only.)
 
-use super::hist::rayon_available;
+use super::partition::{SplitRoute, partition_rows};
+use super::shared::rayon_available;
+use super::{SplitLocation, SplitPos};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::hist::feature_slices;
-use crate::tree::{ChildLeaf, RegTree, SplitRule};
+use crate::tree::{ChildLeaf, RegTree};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -512,7 +514,6 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
     let mut stopper = TreeStopper::Generalization;
     let mut leaves = Vec::new();
     let mut children = Vec::new();
-    let mut scratch = Vec::new();
 
     while !heap.is_empty() {
         if tree.num_nodes() + 2 > MAX_NODES {
@@ -542,22 +543,24 @@ pub(crate) fn grow(ghist: &GHistIndex, gpair: &[GradPair], cfg: &GrowConfig) -> 
             continue;
         };
 
-        let n_left = partition(ghist, &mut index[node.start..node.end], &best, &mut scratch);
+        let location = if best.cat_bins.is_empty() {
+            SplitLocation::Numeric(SplitPos::Bin(best.split_bin))
+        } else {
+            SplitLocation::Categories(left_categories(ghist, &best))
+        };
+        let route = SplitRoute {
+            feature: best.feature,
+            location: &location,
+            default_left: best.default_left,
+        };
+        let n_left = partition(ghist, &mut index[node.start..node.end], route);
         let mid = node.start + n_left;
         let (lt, rt) = (best.left.totals(), best.right.totals());
         let left_value = leaf_value(lt.grad, lt.hess, cfg);
         let right_value = leaf_value(rt.grad, rt.hess, cfg);
-        let cats: Vec<u32>;
-        let split = if best.cat_bins.is_empty() {
-            let threshold = ghist.cuts().cut_value(best.split_bin);
-            SplitRule::numeric(best.feature, threshold, best.default_left)
-        } else {
-            cats = left_categories(ghist, &best);
-            SplitRule::categorical(best.feature, &cats, best.default_left)
-        };
         let (left_id, right_id) = tree.expand(
             node.nid,
-            split,
+            route.rule(ghist.cuts()),
             ChildLeaf::new(left_value, lt.hess as f32),
             ChildLeaf::new(right_value, rt.hess as f32),
         );
@@ -859,40 +862,11 @@ impl<'a> FeatureScan<'a> {
 
 /// Stable in-place partition of a node's rows by the chosen split. Returns
 /// the number of rows routed left.
-fn partition(
-    ghist: &GHistIndex,
-    rows: &mut [u32],
-    split: &Candidate,
-    scratch: &mut Vec<u32>,
-) -> usize {
-    let cuts = ghist.cuts();
-    let f = split.feature as usize;
-    let (fs, fe) = cuts.feature_bins(f);
-    let mut left_mask = vec![false; fe - fs];
-    if split.cat_bins.is_empty() {
-        left_mask[..=split.split_bin - fs].fill(true);
-    } else {
-        for &b in &split.cat_bins {
-            left_mask[b - fs] = true;
-        }
-    }
-    let goes_left = |r: u32| match ghist.feature_bin_at(r as usize, f, fs, fe) {
-        Some(bin) => left_mask[bin as usize - fs],
-        None => split.default_left,
-    };
-    scratch.clear();
-    let mut n_left = 0;
-    for i in 0..rows.len() {
-        let r = rows[i];
-        if goes_left(r) {
-            rows[n_left] = r;
-            n_left += 1;
-        } else {
-            scratch.push(r);
-        }
-    }
-    rows[n_left..].copy_from_slice(scratch);
-    n_left
+fn partition(ghist: &GHistIndex, rows: &mut [u32], route: SplitRoute) -> usize {
+    let (left, right) = partition_rows(ghist, rows, route);
+    rows[..left.len()].copy_from_slice(&left);
+    rows[left.len()..].copy_from_slice(&right);
+    left.len()
 }
 
 #[cfg(test)]

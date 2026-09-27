@@ -31,6 +31,9 @@
 //!
 //! [`DMatrix::with_feature_weights`]: crate::data::DMatrix::with_feature_weights
 
+use std::ops::Deref;
+use std::sync::Arc;
+
 use crate::K_RT_EPS_F32;
 use crate::rng::Rng;
 
@@ -38,9 +41,10 @@ use crate::rng::Rng;
 /// and `bynode` ratios, optionally weighted by per-feature weights.
 #[derive(Debug)]
 pub struct ColumnSampler {
-    tree: Vec<u32>,
-    /// `bylevel` subsets by depth, drawn lazily.
-    levels: Vec<Option<Vec<u32>>>,
+    tree: Arc<[u32]>,
+    /// `bylevel` subsets by depth, drawn lazily (the tree pool itself when
+    /// `bylevel` draws nothing).
+    levels: Vec<Option<Arc<[u32]>>>,
     /// Per-feature sampling weights indexed by feature id; `None` samples
     /// uniformly.
     weights: Option<Vec<f32>>,
@@ -51,6 +55,37 @@ pub struct ColumnSampler {
     /// derives from the configured seed, round, and output.
     seed: u64,
 }
+
+/// The candidate features [`ColumnSampler::sample`] returns, ascending: a
+/// node's own `bynode` draw, or the tree's (or level's) set shared without a
+/// copy when the node stage draws nothing.
+#[derive(Debug, Clone)]
+pub enum FeatureSet {
+    /// A set the sampler keeps: the tree's pool or a depth's `bylevel` set.
+    Shared(Arc<[u32]>),
+    /// A node's `bynode` draw.
+    Drawn(Vec<u32>),
+}
+
+impl Deref for FeatureSet {
+    type Target = [u32];
+
+    #[inline]
+    fn deref(&self) -> &[u32] {
+        match self {
+            FeatureSet::Shared(features) => features,
+            FeatureSet::Drawn(features) => features,
+        }
+    }
+}
+
+impl PartialEq for FeatureSet {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for FeatureSet {}
 
 impl ColumnSampler {
     /// Build the sampler for one tree over `n_features` columns, drawing the
@@ -74,9 +109,9 @@ impl ColumnSampler {
         let weights = weights.map(<[f32]>::to_vec);
         let mut rng = Rng::new(seed);
         let all: Vec<u32> = (0..n_features as u32).collect();
-        let tree = draw(&mut rng, weights.as_deref(), &all, bytree as f32);
+        let tree = draw(&mut rng, weights.as_deref(), &all, bytree as f32).unwrap_or(all);
         ColumnSampler {
-            tree,
+            tree: tree.into(),
             levels: Vec::new(),
             weights,
             bylevel: bylevel as f32,
@@ -97,7 +132,7 @@ impl ColumnSampler {
     /// random streams ([`Self::seed`]).
     pub(crate) fn only(features: Vec<u32>, seed: u64) -> Self {
         ColumnSampler {
-            tree: features,
+            tree: features.into(),
             levels: Vec::new(),
             weights: None,
             bylevel: 1.0,
@@ -110,23 +145,30 @@ impl ColumnSampler {
     /// The candidate features for a node at `depth`: that depth's cached
     /// `bylevel` subset of the tree pool, then a fresh `bynode` subset of it.
     /// Returned features are sorted ascending.
-    pub fn sample(&mut self, depth: usize) -> Vec<u32> {
-        if self.bylevel >= 1.0 && self.bynode >= 1.0 {
-            return self.tree.clone();
+    pub fn sample(&mut self, depth: usize) -> FeatureSet {
+        if let Some(features) = self.fixed_features() {
+            return features;
         }
         if self.levels.len() <= depth {
             self.levels.resize(depth + 1, None);
         }
         let weights = self.weights.as_deref();
-        let level = self.levels[depth]
-            .get_or_insert_with(|| draw(&mut self.rng, weights, &self.tree, self.bylevel));
-        draw(&mut self.rng, weights, level, self.bynode)
+        let tree = &self.tree;
+        let level = self.levels[depth].get_or_insert_with(|| {
+            draw(&mut self.rng, weights, tree, self.bylevel)
+                .map_or_else(|| Arc::clone(tree), Arc::from)
+        });
+        match draw(&mut self.rng, weights, level, self.bynode) {
+            Some(drawn) => FeatureSet::Drawn(drawn),
+            None => FeatureSet::Shared(Arc::clone(level)),
+        }
     }
 
     /// What [`Self::sample`] returns at every depth when it draws nothing
     /// (no `bylevel` or `bynode` sampling), else `None`.
-    pub(crate) fn fixed_features(&self) -> Option<&[u32]> {
-        (self.bylevel >= 1.0 && self.bynode >= 1.0).then_some(self.tree.as_slice())
+    pub(crate) fn fixed_features(&self) -> Option<FeatureSet> {
+        (self.bylevel >= 1.0 && self.bynode >= 1.0)
+            .then(|| FeatureSet::Shared(Arc::clone(&self.tree)))
     }
 
     /// The per-tree seed this sampler was built with. Other per-tree random
@@ -139,9 +181,11 @@ impl ColumnSampler {
 
 /// One sampling stage over `pool`: `max(1, trunc(ratio * len))` features
 /// without replacement (weighted when `weights` is set), sorted ascending.
-fn draw(rng: &mut Rng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> Vec<u32> {
+/// `None` when the stage keeps the whole pool (`ratio >= 1` or an empty
+/// pool), which draws nothing.
+fn draw(rng: &mut Rng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> Option<Vec<u32>> {
     if ratio >= 1.0 || pool.is_empty() {
-        return pool.to_vec();
+        return None;
     }
     let n = ((ratio * pool.len() as f32) as usize).clamp(1, pool.len());
     let mut chosen = match weights {
@@ -167,7 +211,7 @@ fn draw(rng: &mut Rng, weights: Option<&[f32]>, pool: &[u32], ratio: f32) -> Vec
         }
     };
     chosen.sort_unstable();
-    chosen
+    Some(chosen)
 }
 
 #[cfg(test)]
@@ -177,8 +221,9 @@ mod tests {
     #[test]
     fn pass_through_when_ratios_one() {
         let mut s = ColumnSampler::all(10);
-        assert_eq!(s.sample(0), (0..10u32).collect::<Vec<_>>());
-        assert_eq!(s.sample(3), (0..10u32).collect::<Vec<_>>());
+        let all: Vec<u32> = (0..10).collect();
+        assert_eq!(*s.sample(0), all);
+        assert_eq!(*s.sample(3), all);
     }
 
     #[test]
@@ -269,7 +314,7 @@ mod tests {
             let mut s = ColumnSampler::new(3, Some(&weights), 1.0, 1.0, 0.7, seed);
             let f = s.sample(0);
             assert_eq!(f.len(), 2);
-            for x in f {
+            for &x in f.iter() {
                 counts[x as usize] += 1;
             }
         }
@@ -292,7 +337,7 @@ mod tests {
         for seed in 0..200 {
             let mut s = ColumnSampler::new(5, Some(&weights), 1.0, 0.4, 1.0, seed);
             let two = s.sample(0);
-            assert_eq!(two, vec![1, 3], "large weights win on these seeds");
+            assert_eq!(*two, [1, 3], "large weights win on these seeds");
             let mut s = ColumnSampler::new(5, Some(&weights), 0.6, 1.0, 1.0, seed);
             let three = s.sample(0);
             assert_eq!(three.len(), 3);
@@ -311,7 +356,7 @@ mod tests {
             let s = ColumnSampler::new(2, Some(&[0.0, 1e-8]), 0.5, 1.0, 1.0, seed);
             let floored = ColumnSampler::new(2, Some(&[0.0, 0.0]), 0.5, 1.0, 1.0, seed);
             assert_eq!(s.tree, floored.tree);
-            zero_drawn += usize::from(s.tree == [0]);
+            zero_drawn += usize::from(*s.tree == [0]);
         }
         let freq = zero_drawn as f64 / trials as f64;
         // Binomial standard error is ~0.008; allow ~5 sigma.

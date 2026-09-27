@@ -6,26 +6,26 @@
 //! is ever built directly. Supports `depthwise` and `lossguide` growth, and
 //! hands `symmetric` growth to the level-wise oblivious builder.
 
+mod search;
+
 use super::lightgbm::{SplitOptions, finalize_smoothed_leaves};
-use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, NumericInput, NumericScan, SplitPos,
-    SplitScorer, build_interaction_sets, finalize_leaf_values, for_each_numeric_split,
-    limit_or_unbounded, need_replace, next_allowed, permits, scan_numeric_pair, sum_rows,
-    sweep_categorical, with_scan_scratch, xgb_calc_weight, xgb_node_gain, xgb_update,
+use super::partition::{child_histograms, partition_rows};
+use super::shared::{
+    BuilderConfig, InteractionState, LeafRows, finalize_leaf_values, rayon_available, sum_rows,
+    xgb_calc_weight,
 };
+use super::{BELOW_ALL_VALUES, BestSplit, SplitLocation, limit_or_unbounded};
 use crate::config::{GrowPolicy, TrainingParams};
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
 use crate::objective::GradPair;
-use crate::tree::constraints::{Bounds, MonotoneConstraints};
-use crate::tree::gain::{GradStats, RegParams};
+use crate::tree::constraints::Bounds;
+use crate::tree::gain::GradStats;
 use crate::tree::hist::quantized::QuantNode;
-use crate::tree::hist::{
-    BinIndex, CpuBackend, Histogram, HistogramBackend, subtract_in_place, zeroed,
-};
+use crate::tree::hist::{CpuBackend, Histogram, HistogramBackend, zeroed};
 use crate::tree::regtree::RegTree;
-use crate::tree::reuse::{CategoricalPenalty, HistReuse, ReuseSet};
-use crate::tree::sampler::ColumnSampler;
+use crate::tree::reuse::{HistReuse, ReuseSet};
+use crate::tree::sampler::{ColumnSampler, FeatureSet};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -43,22 +43,6 @@ const PARALLEL_EVALUATE_ROWS: usize = 4096;
 /// level's child histograms concurrently. Below this, the fork costs more
 /// than the scan.
 pub(super) const PARALLEL_FRONTIER_ROWS: usize = 4096;
-
-/// Split candidates (feature bins) at which a node's numeric scans run in
-/// parallel chunks of about [`SCAN_TASK_BINS`] candidates each.
-const PARALLEL_SCAN_BINS: usize = 4096;
-const SCAN_TASK_BINS: usize = 2048;
-
-/// Whether the rayon pool has more than one thread, so parallelism can pay off.
-pub(super) fn rayon_available() -> bool {
-    rayon::current_num_threads() > 1
-}
-
-/// Training rows that reached a leaf during tree construction.
-pub(crate) struct LeafRows {
-    pub node: usize,
-    pub rows: Vec<u32>,
-}
 
 /// The node a split search runs for.
 #[derive(Debug, Clone, Copy)]
@@ -104,8 +88,8 @@ struct PendingSplit {
     right_id: usize,
     left_bounds: Bounds,
     right_bounds: Bounds,
-    left_features: Vec<u32>,
-    right_features: Vec<u32>,
+    left_features: FeatureSet,
+    right_features: FeatureSet,
     /// Depthwise children at the depth limit: they stay leaves, so they need
     /// no histograms or split searches, only their rows (kept only when leaf
     /// rows are captured; otherwise the split is never built).
@@ -134,14 +118,7 @@ impl Ord for NodeEntry {
 
 /// Histogram tree builder.
 pub struct HistTreeBuilder<'a> {
-    params: &'a TrainingParams,
-    reg: RegParams,
-    cons: MonotoneConstraints,
-    /// Per-feature interaction sets: feature -> sorted set of features it may be
-    /// combined with on a path (its interaction set). `None` means interaction
-    /// constraints are inactive (no filtering). An unlisted feature may only
-    /// interact with itself.
-    interaction_sets: Option<Vec<Vec<u32>>>,
+    config: BuilderConfig<'a>,
     /// Histogram construction backend (the CPU's, or a GPU's when
     /// `device = metal`).
     backend: &'a dyn HistogramBackend,
@@ -158,10 +135,7 @@ impl<'a> HistTreeBuilder<'a> {
     /// Create a builder bound to a training configuration.
     pub fn new(params: &'a TrainingParams) -> Self {
         HistTreeBuilder {
-            params,
-            reg: RegParams::from_params(params),
-            cons: MonotoneConstraints::from_params(&params.monotone_constraints),
-            interaction_sets: build_interaction_sets(&params.interaction_constraints),
+            config: BuilderConfig::new(params),
             backend: &CPU_BACKEND,
             options: SplitOptions::from_params(params),
             reuse: None,
@@ -237,8 +211,8 @@ impl<'a> HistTreeBuilder<'a> {
         // here); every node build below reads the same slice.
         self.backend.prepare(ghist, gpair);
 
-        if self.params.grow_policy == GrowPolicy::Symmetric {
-            return super::oblivious::SymmetricTreeBuilder::new(self.params, self.backend).build(
+        if self.config.params.grow_policy == GrowPolicy::Symmetric {
+            return super::oblivious::SymmetricTreeBuilder::new(&self.config, self.backend).build(
                 ghist,
                 gpair,
                 row_subset,
@@ -253,7 +227,7 @@ impl<'a> HistTreeBuilder<'a> {
         );
         // Leaf renewal recomputes leaf values from full-precision sums, which
         // needs every leaf's rows.
-        let renew = self.params.quantized.is_some_and(|q| q.renew_leaf());
+        let renew = self.config.params.quantized.is_some_and(|q| q.renew_leaf());
         let (root, root_stats) = self.root(ghist, gpair, row_subset, sampler);
         let mut tree = RegTree::with_root(root_stats.hess as f32);
         let mut store = NodeStore {
@@ -262,7 +236,7 @@ impl<'a> HistTreeBuilder<'a> {
             leaf_rows: (capture_rows || renew).then(Vec::new),
         };
 
-        match self.params.grow_policy {
+        match self.config.params.grow_policy {
             GrowPolicy::DepthWise => {
                 self.grow_depthwise(&mut tree, &mut store, ghist, gpair, sampler, root);
             }
@@ -281,9 +255,9 @@ impl<'a> HistTreeBuilder<'a> {
         // Path-smoothed leaves already hold the outputs their splits chose.
         match &self.options {
             Some(options) if options.smoothing() => {
-                finalize_smoothed_leaves(&mut tree, root_stats, &self.reg);
+                finalize_smoothed_leaves(&mut tree, root_stats, &self.config.reg);
             }
-            _ => finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.reg),
+            _ => finalize_leaf_values(&mut tree, &store.stats, &store.bounds, &self.config.reg),
         }
         let leaf_rows = if capture_rows {
             store.leaf_rows.unwrap_or_default()
@@ -303,25 +277,26 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
     ) -> (NodeEntry, GradStats) {
         let total_bins = ghist.total_bins();
-        let (root_stats, root_hist, root_quant) = if let Some(quantized) = self.params.quantized {
-            let (quant, stats, hist) =
-                QuantNode::root(ghist, gpair, row_subset, quantized, self.rounding_seed);
-            (stats, hist, Some(quant))
-        } else {
-            // The root sum is a sequential pass; it runs beside the
-            // (parallel) root histogram instead of before it.
-            let build_hist = || {
-                let mut root_hist = zeroed(total_bins);
-                self.backend.build(ghist, row_subset, gpair, &mut root_hist);
-                root_hist
-            };
-            let (root_stats, root_hist) = if rayon_available() {
-                rayon::join(|| sum_rows(gpair, row_subset), build_hist)
+        let (root_stats, root_hist, root_quant) =
+            if let Some(quantized) = self.config.params.quantized {
+                let (quant, stats, hist) =
+                    QuantNode::root(ghist, gpair, row_subset, quantized, self.rounding_seed);
+                (stats, hist, Some(quant))
             } else {
-                (sum_rows(gpair, row_subset), build_hist())
+                // The root sum is a sequential pass; it runs beside the
+                // (parallel) root histogram instead of before it.
+                let build_hist = || {
+                    let mut root_hist = zeroed(total_bins);
+                    self.backend.build(ghist, row_subset, gpair, &mut root_hist);
+                    root_hist
+                };
+                let (root_stats, root_hist) = if rayon_available() {
+                    rayon::join(|| sum_rows(gpair, row_subset), build_hist)
+                } else {
+                    (sum_rows(gpair, row_subset), build_hist())
+                };
+                (root_stats, root_hist, None)
             };
-            (root_stats, root_hist, None)
-        };
 
         // Per-node column sampling (bylevel ∘ bynode) draws a fresh subset here.
         let root_feats = sampler.sample(0);
@@ -331,7 +306,7 @@ impl<'a> HistTreeBuilder<'a> {
             stats: root_stats,
             bounds: Bounds::default(),
             rows: row_subset.len(),
-            output: xgb_calc_weight(root_stats, &self.reg),
+            output: xgb_calc_weight(root_stats, &self.config.reg),
             tree_seed,
         };
         let best = self.evaluate(ghist, &root_hist, &root_feats, None, root_ctx);
@@ -358,7 +333,7 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         root: NodeEntry,
     ) {
-        let limit = limit_or_unbounded(self.params.max_depth);
+        let limit = limit_or_unbounded(self.config.params.max_depth);
         let mut frontier = vec![root];
         let mut depth = 0;
         while depth < limit && !frontier.is_empty() {
@@ -404,8 +379,8 @@ impl<'a> HistTreeBuilder<'a> {
         sampler: &mut ColumnSampler,
         root: NodeEntry,
     ) {
-        let limit = limit_or_unbounded(self.params.max_depth);
-        let max_leaves = limit_or_unbounded(self.params.max_leaves);
+        let limit = limit_or_unbounded(self.config.params.max_depth);
+        let max_leaves = limit_or_unbounded(self.config.params.max_leaves);
         let expandable = |entry: &NodeEntry| entry.depth < limit && self.valid(&entry.best);
         let speculative = self.speculative_features(sampler);
         // Children built ahead of their parent's turn, by parent node id.
@@ -471,15 +446,15 @@ impl<'a> HistTreeBuilder<'a> {
     /// without per-level or per-node draws, no reuse penalties (which each
     /// expansion extends), no LightGBM options (which key draws by node id),
     /// no quantized histograms, and more than one worker.
-    fn speculative_features(&self, sampler: &ColumnSampler) -> Option<Vec<u32>> {
+    fn speculative_features(&self, sampler: &ColumnSampler) -> Option<FeatureSet> {
         if self.reuse.is_some()
             || self.options.is_some()
-            || self.params.quantized.is_some()
+            || self.config.params.quantized.is_some()
             || !rayon_available()
         {
             return None;
         }
-        sampler.fixed_features().map(<[u32]>::to_vec)
+        sampler.fixed_features()
     }
 
     /// [`Self::build_children`] of `entry` (whose split is valid) ahead of
@@ -491,11 +466,11 @@ impl<'a> HistTreeBuilder<'a> {
         ghist: &GHistIndex,
         gpair: &[GradPair],
         entry: &NodeEntry,
-        features: &[u32],
+        features: &FeatureSet,
     ) -> (NodeEntry, NodeEntry) {
         let b = &entry.best;
         let (left_bounds, right_bounds) =
-            b.child_bounds(entry.bounds, self.cons.dir(b.feature as usize));
+            b.child_bounds(entry.bounds, self.config.cons.dir(b.feature as usize));
         let split = PendingSplit {
             entry: NodeEntry {
                 nid: entry.nid,
@@ -512,8 +487,8 @@ impl<'a> HistTreeBuilder<'a> {
             right_id: 0,
             left_bounds,
             right_bounds,
-            left_features: features.to_vec(),
-            right_features: features.to_vec(),
+            left_features: features.clone(),
+            right_features: features.clone(),
             terminal: false,
         };
         self.build_children(ghist, gpair, split)
@@ -521,7 +496,7 @@ impl<'a> HistTreeBuilder<'a> {
 
     /// Whether a node's best split should be taken.
     fn valid(&self, best: &BestSplit) -> bool {
-        best.valid(self.params.gamma, self.reg.min_child_weight)
+        best.valid(self.config.params.gamma, self.config.reg.min_child_weight)
     }
 
     /// Expand a node and draw child features in traversal order. Children at the
@@ -537,19 +512,16 @@ impl<'a> HistTreeBuilder<'a> {
         let b = &entry.best;
 
         // Monotone child bounds derived from the (bounded) child weights.
-        let dir = self.cons.dir(b.feature as usize);
+        let dir = self.config.cons.dir(b.feature as usize);
         let (lb_bounds, rb_bounds) = b.child_bounds(entry.bounds, dir);
 
-        let threshold = match b.split_bin {
-            Some(bin) => cuts.cut_value(bin),
-            None => BELOW_ALL_VALUES,
-        };
-        let (left_id, right_id) = b.expand(tree, entry.nid, threshold);
+        let (left_id, right_id) = b.expand(tree, entry.nid, b.route().rule(cuts));
         if let Some(reuse) = &self.reuse {
-            if b.is_categorical {
-                reuse.commit_categorical(b.feature, &b.cat_left);
-            } else {
-                reuse.commit_numeric(b.feature, b.split_bin);
+            match &b.location {
+                SplitLocation::Categories(categories) => {
+                    reuse.commit_categorical(b.feature, categories);
+                }
+                SplitLocation::Numeric(pos) => reuse.commit_numeric(b.feature, pos.bin()),
             }
         }
         debug_assert_eq!(left_id, store.stats.len());
@@ -557,8 +529,8 @@ impl<'a> HistTreeBuilder<'a> {
         store.push(b.right, rb_bounds);
 
         let child_depth = entry.depth + 1;
-        let terminal = self.params.grow_policy == GrowPolicy::DepthWise
-            && child_depth >= limit_or_unbounded(self.params.max_depth);
+        let terminal = self.config.params.grow_policy == GrowPolicy::DepthWise
+            && child_depth >= limit_or_unbounded(self.config.params.max_depth);
         if terminal && store.leaf_rows.is_none() {
             // Preserve the draws for these two nodes, including when callers
             // reuse the sampler. Their rows, histograms and candidate splits
@@ -610,7 +582,7 @@ impl<'a> HistTreeBuilder<'a> {
         } = entry;
         let b = &best;
 
-        let (left_rows, right_rows) = partition_rows(ghist, &parent_rows, b);
+        let (left_rows, right_rows) = partition_rows(ghist, &parent_rows, b.route());
         drop(parent_rows);
 
         let (mut left_quant, mut right_quant) = (None, None);
@@ -633,11 +605,7 @@ impl<'a> HistTreeBuilder<'a> {
 
         // Both children share the state derived from the complete updated path:
         // path features plus groups containing every feature on that path.
-        let child_allowed = next_allowed(
-            parent_allowed.as_ref(),
-            b.feature,
-            self.interaction_sets.as_deref(),
-        );
+        let child_allowed = self.config.next_allowed(parent_allowed.as_ref(), b.feature);
 
         // The children's split searches are independent; near the root, where
         // the frontier holds too few nodes to occupy the pool, running them
@@ -698,202 +666,6 @@ impl<'a> HistTreeBuilder<'a> {
         };
         (left, right)
     }
-
-    /// Find the best split for `node` from its histogram, enumerating each
-    /// sampled feature's bins as XGBoost's histogram evaluator does
-    /// ([`for_each_numeric_split`]). Candidates are scored and compared with
-    /// XGBoost's `f32` arithmetic and tie rule, so near-equal gains resolve
-    /// the same way. Monotone bounds are honored through the bounded child
-    /// weights. With LightGBM split options enabled the search is delegated
-    /// to [`SplitOptions::evaluate`].
-    fn evaluate(
-        &self,
-        ghist: &GHistIndex,
-        hist: &[GradStats],
-        feature_subset: &[u32],
-        allowed: Option<&InteractionState>,
-        node: NodeCtx,
-    ) -> BestSplit {
-        // Restrict the sampled features to those permitted by the interaction
-        // constraints for this node. `allowed` is a sorted set; `None` means all
-        // features are allowed (constraints inactive or unconstrained path).
-        let filtered: Vec<u32>;
-        let feature_subset: &[u32] = match allowed {
-            Some(_) => {
-                filtered = feature_subset
-                    .iter()
-                    .copied()
-                    .filter(|&f| permits(allowed, f))
-                    .collect();
-                &filtered
-            }
-            None => feature_subset,
-        };
-        if let Some(options) = &self.options {
-            return options.evaluate(ghist, hist, feature_subset, &self.cons, &self.reg, node);
-        }
-        let cuts = ghist.cuts();
-        let mut best = BestSplit::none();
-        // A dense index has no missing entries: every feature's bins sum to
-        // `total`, so the missing direction is never distinct and the
-        // per-feature sums need not be computed.
-        let dense = ghist.dense_stride().is_some();
-        let total = node.stats;
-        let node_scorer = SplitScorer {
-            reg: &self.reg,
-            root_gain: xgb_node_gain(total, &self.reg, node.bounds),
-            bounds: node.bounds,
-            dir: 0,
-        };
-        let input = |f: u32| {
-            let (fs, fe) = cuts.feature_bins(f as usize);
-            NumericInput {
-                bins: &hist[fs..fe],
-                first: fs,
-                total,
-                dense,
-                scorer: SplitScorer {
-                    dir: self.cons.dir(f as usize),
-                    ..node_scorer
-                },
-            }
-        };
-        // [`scan_numeric_splits`] of every plain numeric feature of `chunk`
-        // (by position; `None` for the others), two at a time so their
-        // prefix-sum chains overlap.
-        let scan_chunk = |chunk: &[u32]| -> Vec<Option<NumericScan>> {
-            let plain = |f: u32| {
-                let (fs, fe) = cuts.feature_bins(f as usize);
-                !cuts.is_categorical(f as usize) && fe > fs + 1
-            };
-            let mut out: Vec<Option<NumericScan>> = chunk.iter().map(|_| None).collect();
-            with_scan_scratch(|[sa, sb]| {
-                let mut pending = None;
-                for (i, &f) in chunk.iter().enumerate() {
-                    if !plain(f) {
-                        continue;
-                    }
-                    match pending.take() {
-                        None => pending = Some(i),
-                        Some(j) => {
-                            let [x, y] = scan_numeric_pair(&input(chunk[j]), &input(f), [sa, sb]);
-                            (out[j], out[i]) = (Some(x), Some(y));
-                        }
-                    }
-                }
-                if let Some(j) = pending {
-                    out[j] = Some(input(chunk[j]).scan(sa));
-                }
-            });
-            out
-        };
-        // The scans of plain numeric features do not depend on the
-        // incumbent, so they are computed up front (a wide search in
-        // parallel); they are then merged in feature order exactly as below.
-        let mut scans = if self.reuse.is_some() {
-            None
-        } else {
-            Some(
-                Self::parallel_scans(cuts, feature_subset, scan_chunk)
-                    .unwrap_or_else(|| scan_chunk(feature_subset)),
-            )
-        };
-
-        for (i, &f) in feature_subset.iter().enumerate() {
-            let (fs, fe) = cuts.feature_bins(f as usize);
-            let scorer = SplitScorer {
-                dir: self.cons.dir(f as usize),
-                ..node_scorer
-            };
-
-            if cuts.is_categorical(f as usize) {
-                // Every category bin, empty ones included, as XGBoost
-                // enumerates them (a lone category can still split present
-                // from missing values).
-                let cats: Vec<(u32, GradStats)> = (fs..fe)
-                    .map(|i| (cuts.cut_value(i) as u32, hist[i]))
-                    .collect();
-                sweep_categorical(
-                    &mut best,
-                    &cats,
-                    total,
-                    &scorer,
-                    f,
-                    self.reuse.as_ref().map(|r| r as &dyn CategoricalPenalty),
-                );
-                continue;
-            }
-            if fe <= fs + 1 {
-                continue; // degenerate feature, no interior boundary
-            }
-
-            if let Some(reuse) = &self.reuse {
-                for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
-                    let Some(mut score) = scorer.loss_chg(children.left, children.right) else {
-                        return;
-                    };
-                    let bin = match pos {
-                        SplitPos::Bin(bin) => Some(bin),
-                        _ => None,
-                    };
-                    score.loss_chg -= reuse.bin_penalty(f, bin);
-                    xgb_update(&mut best, f, pos, children, score);
-                });
-                continue;
-            }
-            let scanned = scans.as_mut().and_then(|scans| scans[i].take());
-            match scanned.unwrap_or_else(|| with_scan_scratch(|[s, _]| input(f).scan(s))) {
-                NumericScan::Empty => {}
-                NumericScan::Best {
-                    loss_chg,
-                    pos,
-                    children,
-                } => {
-                    if need_replace(best.loss_chg as f32, best.feature, loss_chg, f)
-                        && let Some(score) = scorer.loss_chg(children.left, children.right)
-                    {
-                        xgb_update(&mut best, f, pos, children, score);
-                    }
-                }
-                NumericScan::Nan => {
-                    for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
-                        if let Some(score) = scorer.loss_chg(children.left, children.right) {
-                            xgb_update(&mut best, f, pos, children, score);
-                        }
-                    });
-                }
-            }
-        }
-        best
-    }
-
-    /// `scan_chunk` over parallel chunks of `feature_subset`, concatenated,
-    /// when the subset holds enough candidates to pay for the tasks. `None`
-    /// otherwise.
-    fn parallel_scans(
-        cuts: &HistCuts,
-        feature_subset: &[u32],
-        scan_chunk: impl Fn(&[u32]) -> Vec<Option<NumericScan>> + Sync,
-    ) -> Option<Vec<Option<NumericScan>>> {
-        if !rayon_available() {
-            return None;
-        }
-        let bins = |f: u32| {
-            let (fs, fe) = cuts.feature_bins(f as usize);
-            fe - fs
-        };
-        let candidates: usize = feature_subset.iter().map(|&f| bins(f)).sum();
-        if candidates < PARALLEL_SCAN_BINS {
-            return None;
-        }
-        let per_task = (SCAN_TASK_BINS * feature_subset.len()).div_ceil(candidates);
-        Some(
-            feature_subset
-                .par_chunks(per_task.max(1))
-                .flat_map_iter(&scan_chunk)
-                .collect(),
-        )
-    }
 }
 
 /// The nodes whose children loss-guided growth builds together: `entry` (the
@@ -909,263 +681,6 @@ fn speculation_batch<'e>(
     std::iter::once(entry)
         .chain(queued.into_iter().take(budget - 1))
         .collect()
-}
-
-/// Rows per parallel partition chunk. Large nodes near the root are routed in
-/// row-order chunks whose halves are concatenated, so the output order matches
-/// the sequential loop exactly.
-const PARTITION_CHUNK_ROWS: usize = 16_384;
-
-/// Split `rows` (kept in order) into the rows for which `$go_left` (an
-/// expression of the row `$r: u32`) holds and the others. Every row is
-/// written to both output slots and only the matching length advances,
-/// keeping the loop free of data-dependent branches; the outputs are written
-/// into spare capacity, so neither buffer is zero-filled first. A macro, not
-/// a function taking a closure: the predicate is expanded into the loop, so
-/// the column it reads stays in registers (measured: a closure argument adds
-/// loads to the dense partition loop).
-macro_rules! route_rows {
-    ($rows:expr, |$r:ident| $go_left:expr) => {
-        route_rows!($rows, [], |$r| $go_left)
-    };
-    ($rows:expr, [$($copy:ident),*], |$r:ident| $go_left:expr) => {{
-        let route = |rows: &[u32]| {
-            let n = rows.len();
-            let mut left: Vec<u32> = Vec::with_capacity(n);
-            let mut right: Vec<u32> = Vec::with_capacity(n);
-            let (mut nl, mut nr) = (0usize, 0usize);
-            {
-                // Copied into locals so they stay in registers across the
-                // loop's stores.
-                $(let $copy = $copy;)*
-                let (lp, rp) = (left.as_mut_ptr(), right.as_mut_ptr());
-                for &$r in rows {
-                    let go_left: bool = $go_left;
-                    // SAFETY: `nl + nr` rows were routed before this one, so
-                    // `nl, nr < n`, the reserved capacity of both buffers.
-                    unsafe {
-                        lp.add(nl).write($r);
-                        rp.add(nr).write($r);
-                    }
-                    nl += usize::from(go_left);
-                    nr += usize::from(!go_left);
-                }
-            }
-            // SAFETY: `nl + nr == n` and each side's slot `k` was written at
-            // the iteration where its length was `k`, so `left[..nl]` and
-            // `right[..nr]` are initialized and within the reserved capacity.
-            unsafe {
-                left.set_len(nl);
-                right.set_len(nr);
-            }
-            (left, right)
-        };
-        let rows: &[u32] = $rows;
-        if rows.len() < 2 * PARTITION_CHUNK_ROWS || !rayon_available() {
-            route(rows)
-        } else {
-            let chunks: Vec<(Vec<u32>, Vec<u32>)> =
-                rows.par_chunks(PARTITION_CHUNK_ROWS).map(route).collect();
-            let mut left = Vec::with_capacity(chunks.iter().map(|(l, _)| l.len()).sum());
-            let mut right = Vec::with_capacity(chunks.iter().map(|(_, r)| r.len()).sum());
-            for (l, r) in chunks {
-                left.extend_from_slice(&l);
-                right.extend_from_slice(&r);
-            }
-            (left, right)
-        }
-    }};
-}
-
-/// Split `rows` (kept in order) into the rows routed left and right by `best`.
-#[allow(
-    clippy::needless_bitwise_bool,
-    reason = "branch-free routing predicates keep the partition loop free of data-dependent branches"
-)]
-pub(super) fn partition_rows(
-    ghist: &GHistIndex,
-    rows: &[u32],
-    best: &BestSplit,
-) -> (Vec<u32>, Vec<u32>) {
-    let feature = best.feature as usize;
-    if let (Some(columns), false) = (ghist.column_bins(), best.is_categorical) {
-        let Some(split_bin) = best.split_bin else {
-            // Missing-only-left split: a dense index has no missing rows.
-            return (Vec::new(), rows.to_vec());
-        };
-        let n_rows = ghist.n_rows();
-        return match columns {
-            Bins::U16(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                b <= split_bin
-            }),
-            Bins::U32(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                b <= split_bin
-            }),
-        };
-    }
-    if let (Some(columns), false) = (ghist.missing_columns(), best.is_categorical) {
-        // Present bins below `limit` go left; the sentinel (above every bin,
-        // so never below `limit`) follows `default_left`.
-        let limit = best.split_bin.map_or(0, |s| s + 1);
-        let default_left = best.default_left;
-        let n_rows = ghist.n_rows();
-        return match columns {
-            Bins::U16(bins) => {
-                let missing = usize::from(u16::MAX);
-                route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                    (b < limit) | ((b == missing) & default_left)
-                })
-            }
-            Bins::U32(bins) => {
-                let missing = u32::MAX as usize;
-                route_column(rows, &bins[feature * n_rows..][..n_rows], move |b| {
-                    (b < limit) | ((b == missing) & default_left)
-                })
-            }
-        };
-    }
-
-    if best.is_categorical {
-        partition_categorical(ghist, rows, best)
-    } else {
-        let split_bin = best.split_bin;
-        partition_by_bin(ghist, rows, best, |bin| split_bin.is_some_and(|s| bin <= s))
-    }
-}
-
-/// [`partition_rows`] of a categorical split: present bins go left when they
-/// hold a category of the left set.
-#[inline(never)]
-fn partition_categorical(
-    ghist: &GHistIndex,
-    rows: &[u32],
-    best: &BestSplit,
-) -> (Vec<u32>, Vec<u32>) {
-    let cuts = ghist.cuts();
-    let (fs, fe) = cuts.feature_bins(best.feature as usize);
-    // A bin goes left when its category code (`in_category_set`'s
-    // `cut as u32`) is in the set. Categorical cut values ascend and the
-    // saturating cast is monotone, so the codes ascend too: each category of
-    // the set marks its run of bins, found by binary search, instead of every
-    // bin scanning the set.
-    let code = |bin: usize| cuts.cut_value(bin) as u32;
-    let mut category_left = vec![false; fe - fs];
-    for &category in &best.cat_left {
-        let (mut lo, mut hi) = (fs, fe);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if code(mid) < category {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        for bin in (lo..fe).take_while(|&bin| code(bin) == category) {
-            category_left[bin - fs] = true;
-        }
-    }
-    partition_by_bin(ghist, rows, best, |bin| category_left[bin - fs])
-}
-
-/// [`partition_rows`] without a numeric column fast path: a present bin of
-/// the split feature goes left when `present_left(bin)`, a missing value
-/// follows `best.default_left`. Uses the feature's column when the index
-/// keeps one (a missing sentinel lies outside the feature's bins), else each
-/// row's stored bins.
-#[inline(always)]
-fn partition_by_bin(
-    ghist: &GHistIndex,
-    rows: &[u32],
-    best: &BestSplit,
-    present_left: impl Fn(usize) -> bool + Sync,
-) -> (Vec<u32>, Vec<u32>) {
-    let feature = best.feature as usize;
-    let (fs, fe) = ghist.cuts().feature_bins(feature);
-    let default_left = best.default_left;
-    if let Some(columns) = ghist.column_bins().or_else(|| ghist.missing_columns()) {
-        let go_left = |b: usize| {
-            if (fs..fe).contains(&b) {
-                present_left(b)
-            } else {
-                default_left
-            }
-        };
-        let n_rows = ghist.n_rows();
-        return match columns {
-            Bins::U16(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], go_left),
-            Bins::U32(bins) => route_column(rows, &bins[feature * n_rows..][..n_rows], go_left),
-        };
-    }
-    // Only sparse indexes reach here: a dense one always keeps its columns.
-    let row_ptr = ghist.row_ptr();
-    let row = |r: u32| row_ptr[r as usize]..row_ptr[r as usize + 1];
-    match ghist.bins() {
-        Bins::U16(bins) => route_rows!(rows, |r| {
-            row_goes_left(&bins[row(r)], (fs, fe), default_left, &present_left)
-        }),
-        Bins::U32(bins) => route_rows!(rows, |r| {
-            row_goes_left(&bins[row(r)], (fs, fe), default_left, &present_left)
-        }),
-    }
-}
-
-/// Histograms of both children of a split node: the smaller child is built
-/// directly and the sibling derived by subtracting it from `parent` in place.
-/// The parent's buffer is dead once the node expands, so the sibling reuses
-/// it without a new allocation.
-pub(super) fn child_histograms(
-    backend: &dyn HistogramBackend,
-    ghist: &GHistIndex,
-    gpair: &[GradPair],
-    left_rows: &[u32],
-    right_rows: &[u32],
-    mut parent: Histogram,
-) -> (Histogram, Histogram) {
-    let left_smaller = left_rows.len() <= right_rows.len();
-    let mut small = zeroed(parent.len());
-    backend.build(
-        ghist,
-        if left_smaller { left_rows } else { right_rows },
-        gpair,
-        &mut small,
-    );
-    subtract_in_place(&mut parent, &small);
-    if left_smaller {
-        (small, parent)
-    } else {
-        (parent, small)
-    }
-}
-
-/// Partition rows on a split using the split feature's column (`column[r]`
-/// is row `r`'s bin, or a missing sentinel); `go_left` decides a bin. Rows
-/// ascend, so the column is read as a monotone stream the hardware
-/// prefetcher follows.
-#[inline(always)]
-fn route_column<B: BinIndex>(
-    rows: &[u32],
-    column: &[B],
-    go_left: impl Fn(usize) -> bool + Sync + Copy,
-) -> (Vec<u32>, Vec<u32>) {
-    route_rows!(rows, [go_left, column], |r| go_left(
-        column[r as usize].index()
-    ))
-}
-
-/// Whether a sparse row whose stored bins are `row` goes left on the feature
-/// with global bin range `(fs, fe)`: `present_left` of its first bin in the
-/// range, or `default_left` when the feature is missing.
-#[inline(always)]
-fn row_goes_left<B: BinIndex>(
-    row: &[B],
-    (fs, fe): (usize, usize),
-    default_left: bool,
-    present_left: impl Fn(usize) -> bool,
-) -> bool {
-    row.iter()
-        .map(|&b| b.index())
-        .find(|b| (fs..fe).contains(b))
-        .map_or(default_left, present_left)
 }
 
 /// Per-node statistics and monotone bounds, indexed by node id.
@@ -1201,7 +716,6 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::tree::builder::all_rows;
-    use crate::tree::in_category_set;
 
     #[test]
     fn splits_on_separating_feature() {
@@ -1707,93 +1221,6 @@ mod tests {
         }
         for r in 3..6 {
             assert!((tree.predict_row(&data, r) - 1.0).abs() < 1e-6, "row {r}");
-        }
-    }
-
-    /// Every layout's routing (dense columns, columns with a missing
-    /// sentinel, per-row CSR scans) sends each row where its own bin
-    /// decides, for numeric and categorical splits in both default
-    /// directions, serially and in parallel chunks.
-    #[test]
-    fn partition_matches_per_row_routing_in_every_layout() {
-        use crate::data::FeatureType;
-        // Two thirds of the rows are routed: more than two parallel chunks.
-        let n = 3 * PARTITION_CHUNK_ROWS + 1_000;
-        let features = 4;
-        let pool = |threads| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap()
-        };
-        let (serial_pool, parallel_pool) = (pool(1), pool(4));
-        for (missing, layout) in [(0.0, "dense"), (0.2, "missing columns"), (0.8, "sparse")] {
-            let mut rng = crate::rng::Rng::new(7);
-            let x: Vec<f32> = (0..n * features)
-                .map(|i| {
-                    if rng.f32() < missing {
-                        f32::NAN
-                    } else if i % features < 2 {
-                        (rng.next_u64() % 12) as f32
-                    } else {
-                        rng.f32()
-                    }
-                })
-                .collect();
-            let types = [
-                FeatureType::Categorical,
-                FeatureType::Categorical,
-                FeatureType::Numerical,
-                FeatureType::Numerical,
-            ];
-            let data = DMatrix::from_dense(&x, n, features)
-                .unwrap()
-                .with_feature_types(&types)
-                .unwrap();
-            let ghist = binned(&data, 32);
-            let has = (
-                ghist.column_bins().is_some(),
-                ghist.missing_columns().is_some(),
-            );
-            assert_eq!(
-                has,
-                match layout {
-                    "dense" => (true, false),
-                    "missing columns" => (false, true),
-                    _ => (false, false),
-                },
-                "{layout}"
-            );
-            let cuts = ghist.cuts();
-            let rows: Vec<u32> = (0..n as u32).filter(|r| r % 3 != 1).collect();
-            for feature in 0..features {
-                let (fs, fe) = cuts.feature_bins(feature);
-                for default_left in [false, true] {
-                    let mut best = BestSplit::none();
-                    best.feature = feature as u32;
-                    best.default_left = default_left;
-                    if feature < 2 {
-                        best.is_categorical = true;
-                        // Unordered, with a repeat and an absent category.
-                        best.cat_left = vec![11, 4, 1, 5, 4, 99];
-                    } else {
-                        best.split_bin = Some(fs + (fe - fs) / 2);
-                    }
-                    let goes_left = |r: u32| match ghist.feature_bin_at(r as usize, feature, fs, fe)
-                    {
-                        Some(bin) if best.is_categorical => {
-                            in_category_set(&best.cat_left, cuts.cut_value(bin as usize))
-                        }
-                        Some(bin) => best.split_bin.is_some_and(|s| bin as usize <= s),
-                        None => default_left,
-                    };
-                    let expected: (Vec<u32>, Vec<u32>) = rows.iter().partition(|&&r| goes_left(r));
-                    let serial = serial_pool.install(|| partition_rows(&ghist, &rows, &best));
-                    let parallel = parallel_pool.install(|| partition_rows(&ghist, &rows, &best));
-                    assert_eq!(serial, expected, "{layout}, feature {feature}");
-                    assert_eq!(parallel, expected, "{layout}, feature {feature}");
-                }
-            }
         }
     }
 }

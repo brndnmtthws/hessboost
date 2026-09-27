@@ -11,16 +11,21 @@
 //!
 //! Monotone and interaction constraints are honored during split search.
 
-use super::hist::{LeafRows, rayon_available};
+use super::categorical::sweep_categorical;
+use super::shared::{
+    BuilderConfig, InteractionState, LeafRows, finalize_leaf_values, permits, rayon_available,
+    sum_rows, xgb_node_gain,
+};
+use super::split::{Screen, ScreenBound, SplitScorer};
 use super::{
-    BELOW_ALL_VALUES, BestSplit, Children, InteractionState, Screen, ScreenBound, SplitPos,
-    SplitScorer, build_interaction_sets, finalize_leaf_values, limit_or_unbounded, need_replace,
-    next_allowed, permits, sum_rows, sweep_categorical, xgb_node_gain, xgb_update,
+    BELOW_ALL_VALUES, BestSplit, Children, SplitLocation, SplitPos, limit_or_unbounded,
+    need_replace, xgb_update,
 };
 use crate::K_RT_EPS_F32;
 use crate::config::TrainingParams;
 use crate::data::{DMatrix, FeatureType};
 use crate::objective::GradPair;
+use crate::tree::SplitRule;
 use crate::tree::constraints::{Bounds, MonotoneConstraints};
 use crate::tree::gain::{GradStats, RegParams};
 use crate::tree::regtree::RegTree;
@@ -110,10 +115,7 @@ impl SortedColumns {
 
 /// Exact greedy tree builder.
 pub struct ExactTreeBuilder<'a> {
-    params: &'a TrainingParams,
-    reg: RegParams,
-    cons: MonotoneConstraints,
-    interaction_sets: Option<Vec<Vec<u32>>>,
+    config: BuilderConfig<'a>,
     /// Opt-in reuse penalties (`toad_penalty_*`): the ensemble's used features
     /// and thresholds, extended by every split this builder commits. `None`
     /// on the default path.
@@ -124,10 +126,7 @@ impl<'a> ExactTreeBuilder<'a> {
     /// Create a builder bound to a training configuration.
     pub fn new(params: &'a TrainingParams) -> Self {
         ExactTreeBuilder {
-            params,
-            reg: RegParams::from_params(params),
-            cons: MonotoneConstraints::from_params(&params.monotone_constraints),
-            interaction_sets: build_interaction_sets(&params.interaction_constraints),
+            config: BuilderConfig::new(params),
             reuse: None,
         }
     }
@@ -202,7 +201,7 @@ impl<'a> ExactTreeBuilder<'a> {
 
         let ftypes = data.feature_types();
 
-        let depth_limit = limit_or_unbounded(self.params.max_depth);
+        let depth_limit = limit_or_unbounded(self.config.params.max_depth);
         let mut active: Vec<usize> = vec![0];
         let mut depth = 0;
 
@@ -221,7 +220,8 @@ impl<'a> ExactTreeBuilder<'a> {
             // XGBoost's `root_gain`: the node's own structure score as `f32`.
             let mut root_gain = vec![0f32; k];
             for (slot, &nid) in active.iter().enumerate() {
-                root_gain[slot] = xgb_node_gain(node_stats[nid], &self.reg, node_bounds[nid]);
+                root_gain[slot] =
+                    xgb_node_gain(node_stats[nid], &self.config.reg, node_bounds[nid]);
             }
 
             let row_slot: Vec<u32> = node_of_row
@@ -233,8 +233,8 @@ impl<'a> ExactTreeBuilder<'a> {
                 .collect();
             let reuse_guard = self.reuse.as_ref().map(RefCell::borrow);
             let level = Level {
-                reg: &self.reg,
-                cons: &self.cons,
+                reg: &self.config.reg,
+                cons: &self.config.cons,
                 cols,
                 ftypes,
                 gpair,
@@ -286,7 +286,7 @@ impl<'a> ExactTreeBuilder<'a> {
                 }
             } else {
                 let mut scratch = Scratch::new(k);
-                for &f in &feature_subset {
+                for &f in feature_subset.iter() {
                     level.scan_feature(f, &mut best, &mut scratch);
                 }
             }
@@ -297,25 +297,36 @@ impl<'a> ExactTreeBuilder<'a> {
             for &nid in &active {
                 let slot = slot_of_node[nid];
                 let b = &best[slot];
-                if !b.valid(self.params.gamma, self.reg.min_child_weight) {
+                if !b.valid(self.config.params.gamma, self.config.reg.min_child_weight) {
                     continue; // stays a leaf; value finalized below
                 }
 
                 // Monotone child bounds derived from the (bounded) child weights.
-                let dir = self.cons.dir(b.feature as usize);
+                let dir = self.config.cons.dir(b.feature as usize);
                 let (lb_bounds, rb_bounds) = b.child_bounds(node_bounds[nid], dir);
 
                 // Children carry XGBoost's bounded `f32` weight, so the
                 // `leaf_value` field of nodes that later split records the value
                 // they had as a leaf at expansion time. Leaves are overwritten
                 // by the finalize pass below.
-                let (left_id, right_id) = b.expand(&mut tree, nid, b.threshold);
+                let rule = match &b.location {
+                    SplitLocation::Numeric(pos) => {
+                        SplitRule::numeric(b.feature, value_threshold(*pos), b.default_left)
+                    }
+                    SplitLocation::Categories(categories) => {
+                        SplitRule::categorical(b.feature, categories, b.default_left)
+                    }
+                };
+                let (left_id, right_id) = b.expand(&mut tree, nid, rule);
                 if let Some(reuse) = &self.reuse {
                     let mut reuse = reuse.borrow_mut();
-                    if b.is_categorical {
-                        reuse.record_categorical(b.feature, &b.cat_left);
-                    } else {
-                        reuse.record_numeric(b.feature, b.threshold);
+                    match &b.location {
+                        SplitLocation::Numeric(pos) => {
+                            reuse.record_numeric(b.feature, value_threshold(*pos));
+                        }
+                        SplitLocation::Categories(categories) => {
+                            reuse.record_categorical(b.feature, categories);
+                        }
                     }
                 }
                 debug_assert_eq!(left_id, node_stats.len());
@@ -323,11 +334,9 @@ impl<'a> ExactTreeBuilder<'a> {
                 node_stats.push(b.right);
                 node_bounds.push(lb_bounds);
                 node_bounds.push(rb_bounds);
-                let allowed = next_allowed(
-                    node_allowed[nid].as_ref(),
-                    b.feature,
-                    self.interaction_sets.as_deref(),
-                );
+                let allowed = self
+                    .config
+                    .next_allowed(node_allowed[nid].as_ref(), b.feature);
                 node_allowed.push(allowed.clone());
                 node_allowed.push(allowed);
                 next_active.push(left_id);
@@ -366,7 +375,7 @@ impl<'a> ExactTreeBuilder<'a> {
         }
 
         // Finalize every leaf's weight (respecting each leaf's monotone bounds).
-        finalize_leaf_values(&mut tree, &node_stats, &node_bounds, &self.reg);
+        finalize_leaf_values(&mut tree, &node_stats, &node_bounds, &self.config.reg);
         if !capture_rows {
             return (tree, Vec::new());
         }
@@ -388,6 +397,17 @@ impl<'a> ExactTreeBuilder<'a> {
             leaves[*slot].rows.push(r as u32);
         }
         (tree, leaves)
+    }
+}
+
+/// The threshold of an exact split position, which search records in value
+/// space ([`SplitPos::Value`]).
+fn value_threshold(pos: SplitPos) -> f32 {
+    match pos {
+        SplitPos::Value(threshold) => threshold,
+        SplitPos::Bin(_) | SplitPos::BelowBins => {
+            unreachable!("exact search records value-space thresholds")
+        }
     }
 }
 

@@ -45,23 +45,25 @@
 //! and XGBoost export treat them like any other tree; prediction recognizes
 //! the shape and routes rows by bit pattern (`crate::tree::oblivious`).
 
-use super::hist::{PARALLEL_FRONTIER_ROWS, child_histograms, partition_rows, rayon_available};
-use super::{
-    BELOW_ALL_VALUES, BestSplit, Children, InteractionState, LeafRows, Score, SplitPos,
-    SplitScorer, build_interaction_sets, finalize_leaf_values, next_allowed, permits, sum_rows,
-    xgb_node_gain,
+use super::hist::PARALLEL_FRONTIER_ROWS;
+use super::partition::{SplitRoute, child_histograms, partition_rows};
+use super::shared::{
+    BuilderConfig, InteractionState, LeafRows, finalize_leaf_values, permits, rayon_available,
+    sum_rows, xgb_node_gain,
 };
+use super::split::SplitScorer;
+use super::{Score, SplitLocation, SplitPos};
 use crate::K_RT_EPS;
-use crate::config::{TrainingParams, TreeMethod};
+use crate::config::TreeMethod;
 use crate::data::ghist::GHistIndex;
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
-use crate::tree::constraints::{Bounds, MonotoneConstraints, child_bounds};
-use crate::tree::gain::{GradStats, RegParams};
+use crate::tree::constraints::{Bounds, child_bounds};
+use crate::tree::gain::GradStats;
 use crate::tree::hist::{Histogram, HistogramBackend, zeroed};
 use crate::tree::sampler::ColumnSampler;
-use crate::tree::{ChildLeaf, RegTree, SplitRule};
+use crate::tree::{ChildLeaf, RegTree};
 use rayon::prelude::*;
 use std::num::NonZeroUsize;
 
@@ -116,10 +118,10 @@ struct LevelSplit {
 impl LevelSplit {
     /// The histogram position the tree node and row partition use.
     fn pos(&self, fs: usize) -> SplitPos {
-        match (self.missing_left, self.offset) {
-            (false, b) => SplitPos::Bin(fs + b),
-            (true, 0) => SplitPos::BelowBins,
-            (true, b) => SplitPos::Bin(fs + b - 1),
+        if self.missing_left {
+            SplitPos::backward(fs, self.offset)
+        } else {
+            SplitPos::Bin(fs + self.offset)
         }
     }
 }
@@ -146,22 +148,13 @@ struct ExpandedNode {
 
 /// Symmetric tree builder over the histogram index.
 pub(super) struct SymmetricTreeBuilder<'a> {
-    params: &'a TrainingParams,
-    reg: RegParams,
-    cons: MonotoneConstraints,
-    interaction_sets: Option<Vec<Vec<u32>>>,
+    config: &'a BuilderConfig<'a>,
     backend: &'a dyn HistogramBackend,
 }
 
 impl<'a> SymmetricTreeBuilder<'a> {
-    pub(super) fn new(params: &'a TrainingParams, backend: &'a dyn HistogramBackend) -> Self {
-        SymmetricTreeBuilder {
-            params,
-            reg: RegParams::from_params(params),
-            cons: MonotoneConstraints::from_params(&params.monotone_constraints),
-            interaction_sets: build_interaction_sets(&params.interaction_constraints),
-            backend,
-        }
+    pub(super) fn new(config: &'a BuilderConfig<'a>, backend: &'a dyn HistogramBackend) -> Self {
+        SymmetricTreeBuilder { config, backend }
     }
 
     /// Grow one symmetric tree. With `capture_rows`, also return every leaf's
@@ -201,11 +194,12 @@ impl<'a> SymmetricTreeBuilder<'a> {
         )];
         let mut allowed: Option<InteractionState> = None;
         // Validation bounds symmetric trees to `1..=MAX_SYMMETRIC_DEPTH`.
-        let depth_limit = self.params.max_depth.map_or(0, NonZeroUsize::get);
+        let depth_limit = self.config.params.max_depth.map_or(0, NonZeroUsize::get);
         for depth in 0..depth_limit {
             let features: Vec<u32> = sampler
                 .sample(depth)
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|&f| permits(allowed.as_ref(), f))
                 .collect();
             let Some(split) = self.best_level_split(ghist, &level, &features) else {
@@ -214,12 +208,13 @@ impl<'a> SymmetricTreeBuilder<'a> {
             let cuts = ghist.cuts();
             let feature = split.feature as usize;
             let (fs, _) = cuts.feature_bins(feature);
-            let pos = split.pos(fs);
-            let threshold = match pos {
-                SplitPos::Bin(bin) => cuts.cut_value(bin),
-                _ => BELOW_ALL_VALUES,
+            let location = SplitLocation::Numeric(split.pos(fs));
+            let route = SplitRoute {
+                feature: split.feature,
+                location: &location,
+                default_left: split.missing_left,
             };
-            let dir = self.cons.dir(feature);
+            let dir = self.config.cons.dir(feature);
 
             // Expand in node order, so child ids stay breadth-first.
             let mut pending = Vec::with_capacity(level.len());
@@ -232,7 +227,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
                     child_bounds(node.bounds, dir, f64::from(s.w_left), f64::from(s.w_right));
                 let (left_id, right_id) = tree.expand(
                     node.nid,
-                    SplitRule::numeric(split.feature, threshold, split.missing_left),
+                    route.rule(cuts),
                     ChildLeaf::new(s.w_left, s.left.hess as f32),
                     ChildLeaf::new(s.w_right, s.right.hess as f32),
                 );
@@ -247,33 +242,19 @@ impl<'a> SymmetricTreeBuilder<'a> {
                     bounds: [lb, rb],
                 });
             }
-            allowed = next_allowed(
-                allowed.as_ref(),
-                split.feature,
-                self.interaction_sets.as_deref(),
-            );
+            allowed = self.config.next_allowed(allowed.as_ref(), split.feature);
 
             let terminal = depth + 1 == depth_limit;
             if terminal && !capture_rows {
                 level = Vec::new();
                 break;
             }
-            let routing = BestSplit::numeric(
-                split.feature,
-                pos,
-                Children::new(
-                    split.missing_left,
-                    GradStats::default(),
-                    GradStats::default(),
-                ),
-                Score::default(),
-            );
             let parallel = pending.len() > 1
                 && pending.iter().map(|p| p.node.rows.len()).sum::<usize>()
                     >= PARALLEL_FRONTIER_ROWS
                 && rayon_available();
             let build =
-                |expanded: ExpandedNode| self.children(ghist, gpair, &routing, expanded, terminal);
+                |expanded: ExpandedNode| self.children(ghist, gpair, route, expanded, terminal);
             let children: Vec<[LevelNode; 2]> = if parallel {
                 pending.into_par_iter().map(build).collect()
             } else {
@@ -285,7 +266,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
             record_leaf(node);
         }
 
-        finalize_leaf_values(&mut tree, &stats, &bounds, &self.reg);
+        finalize_leaf_values(&mut tree, &stats, &bounds, &self.config.reg);
         (tree, leaf_rows)
     }
 
@@ -303,7 +284,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
             hist,
             total,
             bounds,
-            root_gain: xgb_node_gain(total, &self.reg, bounds),
+            root_gain: xgb_node_gain(total, &self.config.reg, bounds),
         }
     }
 
@@ -313,7 +294,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
         &self,
         ghist: &GHistIndex,
         gpair: &[GradPair],
-        routing: &BestSplit,
+        route: SplitRoute,
         expanded: ExpandedNode,
         terminal: bool,
     ) -> [LevelNode; 2] {
@@ -323,7 +304,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
             ids: [left_id, right_id],
             bounds: [lb, rb],
         } = expanded;
-        let (left_rows, right_rows) = partition_rows(ghist, &node.rows, routing);
+        let (left_rows, right_rows) = partition_rows(ghist, &node.rows, route);
         let (left_hist, right_hist) = if terminal {
             (Vec::new(), Vec::new())
         } else {
@@ -353,14 +334,14 @@ impl<'a> SymmetricTreeBuilder<'a> {
         dir: i8,
     ) -> Option<Score<f32>> {
         let scorer = SplitScorer {
-            reg: &self.reg,
+            reg: &self.config.reg,
             root_gain: node.root_gain,
             bounds: node.bounds,
             dir,
         };
         let score = scorer.loss_chg(left, right)?;
         let gain = f64::from(score.loss_chg);
-        (score.loss_chg.is_finite() && gain > K_RT_EPS && gain >= self.params.gamma)
+        (score.loss_chg.is_finite() && gain > K_RT_EPS && gain >= self.config.params.gamma)
             .then_some(score)
     }
 
@@ -401,8 +382,8 @@ impl<'a> SymmetricTreeBuilder<'a> {
         }
         let n_bins = fe - fs;
         let dense = ghist.dense_stride().is_some();
-        let dir = self.cons.dir(f as usize);
-        let gamma = self.params.gamma;
+        let dir = self.config.cons.dir(f as usize);
+        let gamma = self.config.params.gamma;
         // `(Σ (loss_chg − gamma), nodes split)` per boundary.
         let mut forward = vec![(0.0f64, 0u32); n_bins];
         let mut backward = if dense {
@@ -526,7 +507,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
             loss_chg,
             w_left,
             w_right,
-        } = self.node_gain(node, left, right, self.cons.dir(feature))?;
+        } = self.node_gain(node, left, right, self.config.cons.dir(feature))?;
         Some(NodeSplit {
             left,
             right,
@@ -541,7 +522,7 @@ impl<'a> SymmetricTreeBuilder<'a> {
 mod tests {
     use super::super::test_support::{binned, gp, grow_hist};
     use super::*;
-    use crate::config::{GrowPolicy, Monotone};
+    use crate::config::{GrowPolicy, Monotone, TrainingParams};
     use crate::training::train;
     use crate::tree::builder::{HistTreeBuilder, all_rows};
 

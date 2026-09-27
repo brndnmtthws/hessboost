@@ -32,7 +32,9 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+mod common;
+use common::fixtures::{fixtures_dir, load_all, nan_for_null};
 
 /// Rows of `x_test` on which the fixture carries SHAP contributions.
 const CONTRIB_ROWS: usize = 50;
@@ -185,12 +187,6 @@ struct CutFixture {
     cuts: Vec<f32>,
 }
 
-/// JSON `null` is the fixture encoding for a missing value.
-fn nan_for_null<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
-    let v: Vec<Option<f32>> = Vec::deserialize(d)?;
-    Ok(v.into_iter().map(|x| x.unwrap_or(f32::NAN)).collect())
-}
-
 /// Label bounds: numbers, with `"inf"` / `"-inf"` strings for infinities.
 fn bounds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error> {
     #[derive(Deserialize)]
@@ -211,36 +207,6 @@ fn bounds<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<f32>>, D::Error>
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
-}
-
-fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
-}
-
-/// Every `*.json` fixture in `dir`, in path order.
-fn load_all<T: for<'de> Deserialize<'de>>(dir: &Path, what: &str) -> Vec<T> {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{what} fixtures missing at {}: {e}; run scripts/gen_fixtures.py",
-            dir.display()
-        )
-    });
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
-        .collect();
-    assert!(!paths.is_empty(), "no {what} fixtures in {}", dir.display());
-    paths.sort();
-    paths
-        .iter()
-        .map(|path| {
-            let text = std::fs::read_to_string(path)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("parsing {}: {e}", path.display()))
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,7 +990,7 @@ fn xgboost_parity() {
     let dir = fixtures_dir();
     let exports = dir.join("exports");
     std::fs::create_dir_all(&exports).expect("create fixtures/exports");
-    let fixtures: Vec<Fixture> = load_all(&dir, "parity");
+    let fixtures: Vec<Fixture> = load_all(&dir, "parity", "scripts/gen_fixtures.py");
 
     let mut failures = Vec::new();
     println!(
@@ -1075,7 +1041,11 @@ fn xgboost_parity() {
 #[test]
 #[ignore = "requires fixtures from scripts/gen_fixtures.py"]
 fn quantile_cuts_match_xgboost() {
-    let fixtures: Vec<CutFixture> = load_all(&fixtures_dir().join("cuts"), "cut");
+    let fixtures: Vec<CutFixture> = load_all(
+        &fixtures_dir().join("cuts"),
+        "cut",
+        "scripts/gen_fixtures.py",
+    );
     let mut failures: Vec<String> = Vec::new();
     for fx in &fixtures {
         let mut d = DMatrix::from_dense(&fx.x, fx.n_rows, fx.n_cols).expect("dense matrix");

@@ -224,12 +224,11 @@ fn inference_needs_a_boulevard_ebm_and_its_training_rows() {
     assert_eq!(invalid_param(inference.term_bands(4, 0.1)), "term");
 }
 
+fn refused(b: TrainingParamsBuilder) -> &'static str {
+    invalid_param(b.build())
+}
 #[test]
 fn unsupported_combinations_are_refused() {
-    let refused = |b: TrainingParamsBuilder| match b.build() {
-        Err(HessboostError::InvalidParameter { name, .. }) => name,
-        other => panic!("expected a refusal, got {other:?}"),
-    };
     let serde_json::Value::Object(flat) = serde_json::json!({"ebm_interactions": 2}) else {
         unreachable!()
     };

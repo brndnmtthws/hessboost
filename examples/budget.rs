@@ -92,7 +92,7 @@ fn report(
     let start = Instant::now();
     let model = train(&params, dtrain, 100)?;
     let seconds = start.elapsed().as_secs_f64();
-    let value = score(model.predict(dtest)?.as_slice());
+    let value = score(model.predict(dtest, Iterations::Best)?.as_slice());
     row(
         "default (eta 0.3, depth 6, 100)",
         &model,
@@ -115,7 +115,7 @@ fn report(
         .model;
     let seconds = start.elapsed().as_secs_f64();
     let rounds = tuned.best_iteration().map_or(tuned.num_trees(), |b| b + 1);
-    let value = score(tuned.predict(dtest)?.as_slice());
+    let value = score(tuned.predict(dtest, Iterations::Best)?.as_slice());
     row(
         "tuned (eta 0.05, early stopping)",
         &tuned,
@@ -128,7 +128,7 @@ fn report(
         let start = Instant::now();
         let result = train_with_budget(&params, dtrain, &BudgetConfig::new(budget))?;
         let seconds = start.elapsed().as_secs_f64();
-        let value = score(result.model.predict(dtest)?.as_slice());
+        let value = score(result.model.predict(dtest, Iterations::Best)?.as_slice());
         let label = format!("budget {budget} (eta {:.3}, {:?})", result.eta, result.stop);
         row(
             &label,

@@ -15,13 +15,13 @@
 //! element, or as one flat slice via [`as_slice`](Predictions::as_slice) /
 //! [`into_vec`](Predictions::into_vec).
 //!
-//! Each has a `_range` variant ([`predict_range`], [`predict_margin_range`],
-//! [`predict_leaf_range`], [`predict_contribs_range`],
-//! [`predict_interactions_range`], [`predict_distribution_range`]) taking
-//! XGBoost's `iteration_range` as a Rust range of boosting iterations: `..`
-//! for all, `..n` for the first `n`, `2..5`. Leaf, contribution, and
-//! interaction ranges must start at 0. [`BoostedModel::slice`] cuts a
-//! sub-model out of an iteration range with a step.
+//! Every prediction method takes the boosting iterations it uses
+//! ([`Iterations`], XGBoost's `iteration_range`): [`Iterations::Best`] for
+//! the effective iterations (through `best_iteration` after early stopping,
+//! else all), or a Rust range of iterations: `..` for all, `..n` for the
+//! first `n`, `2..5`. Leaf, contribution, and interaction ranges must start
+//! at 0 (`Best` always does). [`BoostedModel::slice`] cuts a sub-model out
+//! of an iteration range with a step.
 //!
 //! A model trained with per-iteration model shrinkage
 //! ([`model_shrink`](crate::config::TrainingParams::model_shrink),
@@ -315,12 +315,6 @@
 //! [`predict_distribution`]: BoostedModel::predict_distribution
 //! [`predict_contribs`]: BoostedModel::predict_contribs
 //! [`predict_interactions`]: BoostedModel::predict_interactions
-//! [`predict_range`]: BoostedModel::predict_range
-//! [`predict_margin_range`]: BoostedModel::predict_margin_range
-//! [`predict_leaf_range`]: BoostedModel::predict_leaf_range
-//! [`predict_contribs_range`]: BoostedModel::predict_contribs_range
-//! [`predict_interactions_range`]: BoostedModel::predict_interactions_range
-//! [`predict_distribution_range`]: BoostedModel::predict_distribution_range
 //! [`from_bytes`]: BoostedModel::from_bytes
 //! [`save_binary`]: BoostedModel::save_binary
 //! [`load_binary`]: BoostedModel::load_binary
@@ -355,8 +349,9 @@ mod xgboost;
 pub(crate) use shrinkage::{Shrinkage, shrink_margins};
 
 pub use objective::ModelObjective;
+pub use predict::Iterations;
 use predict::RowBlock;
-pub(crate) use predict::{initial_margins, transform_model_margins};
+pub(crate) use predict::{initial_margins, transform_margins_in_place, transform_model_margins};
 pub use predictions::{Contributions, Interactions, Predictions};
 pub(crate) use validate::{check_objective_width, validate_prediction_data};
 
@@ -369,7 +364,7 @@ use crate::objective::{Loss, LossContext};
 use crate::tree::compact::CompactForest;
 use crate::tree::{RegTree, scalar_tree_output};
 use ::serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -863,38 +858,32 @@ impl BoostedModel {
     }
 
     /// Compute feature importance of the requested type, returned as a map from
-    /// feature index to score (features that never split are absent).
-    pub fn feature_importance(&self, kind: ImportanceType) -> HashMap<u32, f64> {
-        let mut count: HashMap<u32, f64> = HashMap::new();
-        let mut cover: HashMap<u32, f64> = HashMap::new();
-        let mut gain: HashMap<u32, f64> = HashMap::new();
+    /// feature index to score in ascending feature order (features that never
+    /// split are absent).
+    pub fn feature_importance(&self, kind: ImportanceType) -> BTreeMap<usize, f64> {
+        let value = |node: &crate::tree::Node| match kind {
+            ImportanceType::Weight => 1.0,
+            ImportanceType::Cover | ImportanceType::TotalCover => f64::from(node.sum_hess),
+            ImportanceType::Gain | ImportanceType::TotalGain => f64::from(node.split_gain),
+        };
+        // Per feature: the total of `value` and the split count.
+        let mut totals: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
         for tree in &self.trees {
             for node in tree.nodes() {
                 if node.is_leaf() {
                     continue;
                 }
-                *count.entry(node.split_feature).or_default() += 1.0;
-                *cover.entry(node.split_feature).or_default() += f64::from(node.sum_hess);
-                *gain.entry(node.split_feature).or_default() += f64::from(node.split_gain);
+                let (total, count) = totals.entry(node.split_feature as usize).or_default();
+                *total += value(node);
+                *count += 1.0;
             }
         }
         // Divide a total by the split count to get the per-split average.
-        let average = |totals: HashMap<u32, f64>| -> HashMap<u32, f64> {
-            totals
-                .into_iter()
-                .map(|(f, t)| {
-                    let n = count.get(&f).copied().unwrap_or(1.0);
-                    (f, t / n)
-                })
-                .collect()
-        };
-        match kind {
-            ImportanceType::Weight => count,
-            ImportanceType::TotalCover => cover,
-            ImportanceType::Cover => average(cover),
-            ImportanceType::TotalGain => gain,
-            ImportanceType::Gain => average(gain),
-        }
+        let average = matches!(kind, ImportanceType::Cover | ImportanceType::Gain);
+        totals
+            .into_iter()
+            .map(|(f, (total, count))| (f, if average { total / count } else { total }))
+            .collect()
     }
 
     /// Lay this model out for GPU batch prediction on Metal. Without the
@@ -944,7 +933,7 @@ impl BoostedModel {
     fn attribution_prologue(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: Iterations,
         what: &str,
     ) -> Result<AttributionPrologue<'_>> {
         self.validate_prediction_data(data)?;
@@ -1090,23 +1079,29 @@ impl BoostedModel {
         })
     }
 
-    /// The iteration range plain prediction uses: `..best_iteration + 1`
-    /// when early stopping selected an iteration, else every iteration
-    /// (`..`, which is also the only range a `gblinear` model accepts).
-    pub(crate) fn default_iteration_range(&self) -> (Bound<usize>, Bound<usize>) {
-        let end = self
-            .best_iteration
-            .map_or(Bound::Unbounded, |it| Bound::Excluded(it + 1));
-        (Bound::Unbounded, end)
+    /// The bounds of `iterations`: [`Iterations::Best`] is
+    /// `..best_iteration + 1` when early stopping selected an iteration,
+    /// else every iteration (`..`, which is also the only range a
+    /// `gblinear` model accepts).
+    fn iteration_bounds(&self, iterations: Iterations) -> (Bound<usize>, Bound<usize>) {
+        match iterations {
+            Iterations::Best => {
+                let end = self
+                    .best_iteration
+                    .map_or(Bound::Unbounded, |it| Bound::Excluded(it + 1));
+                (Bound::Unbounded, end)
+            }
+            Iterations::Range { start, end } => (start, end),
+        }
     }
 
-    /// Resolve `iterations`, any range of boosting iterations (`..`, `..end`,
-    /// `begin..end`, ...), against the model's iteration count.
+    /// Resolve `iterations` against the model's iteration count.
     pub(crate) fn resolve_iterations(
         &self,
-        iterations: impl RangeBounds<usize>,
+        iterations: Iterations,
         param: &'static str,
     ) -> Result<Range<usize>> {
+        let iterations = self.iteration_bounds(iterations);
         if self.linear.is_some() {
             // No iterations to select: only the whole model (`..`) is a range.
             let whole = matches!(
@@ -1153,7 +1148,7 @@ impl BoostedModel {
     /// The trees of `iterations` for the attribution and leaf predictions,
     /// which (as in XGBoost) only accept ranges starting at iteration `0`;
     /// slice the model for a later start.
-    fn prefix_trees(&self, iterations: impl RangeBounds<usize>, what: &str) -> Result<usize> {
+    fn prefix_trees(&self, iterations: Iterations, what: &str) -> Result<usize> {
         let trees = self.iteration_trees(self.resolve_iterations(iterations, "iterations")?);
         if trees.start != 0 {
             return Err(HessboostError::invalid_param(
@@ -1350,6 +1345,7 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::error::HessboostError;
+    use crate::model::Iterations;
     use crate::objective::{Objective, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::training::train;
@@ -1446,7 +1442,10 @@ mod tests {
         let (model, mut doc) = gblinear_doc();
         let valid: BoostedModel = serde_json::from_value(doc.clone()).unwrap();
         let d = DMatrix::from_dense(&[1.0, 2.0], 1, 2).unwrap();
-        assert_eq!(valid.predict(&d).unwrap(), model.predict(&d).unwrap());
+        assert_eq!(
+            valid.predict(&d, Iterations::Best).unwrap(),
+            model.predict(&d, Iterations::Best).unwrap()
+        );
         doc["linear"]["bias"] = serde_json::json!([]);
         assert!(serde_json::from_value::<BoostedModel>(doc.clone()).is_err());
         assert!(matches!(

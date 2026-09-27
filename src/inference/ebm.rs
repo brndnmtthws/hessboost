@@ -2,6 +2,7 @@
 //! Pipping & Hooker, *Statistical Inference for Explainable Boosting
 //! Machines*, AISTATS 2026).
 
+use crate::model::Iterations;
 use rayon::prelude::*;
 
 use super::solver::RidgeSolver;
@@ -453,7 +454,7 @@ impl<'a> EbmInference<'a> {
         check_alpha(alpha)?;
         let z = z_value(alpha);
         let norms = self.prediction_norms(data)?;
-        let preds = self.model.predict(data)?;
+        let preds = self.model.predict(data, Iterations::Best)?;
         Ok(preds
             .as_slice()
             .iter()

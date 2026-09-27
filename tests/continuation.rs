@@ -5,7 +5,7 @@ use hessboost::config::{
     BoosterKind, Dart, ExtraTrees, GrowPolicy, LinearTree, ProcessType, QuantizedGrad, Refresh,
     SamplingMethod, TreeMethod,
 };
-use hessboost::model::Predictions;
+use hessboost::model::{Iterations, Predictions};
 use hessboost::objective::{Multiclass, PseudoHuber};
 use hessboost::prelude::{
     BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
@@ -117,7 +117,10 @@ fn continuing_grows_the_same_trees_as_training_in_one_run() {
         .train()
         .unwrap()
         .model;
-    assert_eq!(a.predict(&d).unwrap(), b.predict(&d).unwrap());
+    assert_eq!(
+        a.predict(&d, Iterations::Best).unwrap(),
+        b.predict(&d, Iterations::Best).unwrap()
+    );
 }
 
 #[test]
@@ -133,8 +136,8 @@ fn continuation_keeps_the_intercept_unless_base_score_is_given() {
         .model;
     assert_eq!(kept.base_scores(), first.base_scores());
     // The new rounds fit the shifted labels from the old margins.
-    let before = first.predict(&shifted).unwrap();
-    let after = kept.predict(&shifted).unwrap();
+    let before = first.predict(&shifted, Iterations::Best).unwrap();
+    let after = kept.predict(&shifted, Iterations::Best).unwrap();
     assert!(
         after
             .as_slice()
@@ -178,8 +181,8 @@ fn early_stopping_records_the_best_round_without_stopping() {
     assert_eq!(out.best_score, Some(out.history[best].scores[0].value));
     assert_eq!(stopped.best_score, out.best_score);
     assert_eq!(
-        out.model.predict(&valid).unwrap(),
-        out.model.predict_range(&valid, ..=best).unwrap()
+        out.model.predict(&valid, Iterations::Best).unwrap(),
+        out.model.predict(&valid, ..=best).unwrap()
     );
     // Without early stopping nothing is selected.
     let plain = Trainer::new(&params, &d, best + 3)
@@ -222,8 +225,8 @@ fn early_stopping_after_continuation_reports_absolute_iterations() {
     let chosen = out.model.best_iteration().expect("stops early");
     assert!(chosen >= start, "{chosen} < {start} (earlier best {best})");
     assert_eq!(
-        out.model.predict(&valid).unwrap(),
-        out.model.predict_range(&valid, ..=chosen).unwrap()
+        out.model.predict(&valid, Iterations::Best).unwrap(),
+        out.model.predict(&valid, ..=chosen).unwrap()
     );
 }
 
@@ -250,8 +253,8 @@ fn continuation_without_an_improving_metric_keeps_the_initial_model() {
     assert!(out.history.iter().all(|r| r.scores[0].value.is_nan()));
     assert_eq!(out.model.best_iteration(), Some(4));
     assert_eq!(
-        out.model.predict(&train_set).unwrap(),
-        out.model.predict_range(&train_set, ..5).unwrap()
+        out.model.predict(&train_set, Iterations::Best).unwrap(),
+        out.model.predict(&train_set, ..5).unwrap()
     );
 }
 
@@ -303,7 +306,10 @@ fn gblinear_continues_from_its_weights() {
     let whole = train(&params, &d, 8).unwrap();
     // Coordinate descent resumes: agrees with the uninterrupted run up to
     // the f32 margin rounding of recomputing predictions.
-    let (a, b) = (resumed.predict(&d).unwrap(), whole.predict(&d).unwrap());
+    let (a, b) = (
+        resumed.predict(&d, Iterations::Best).unwrap(),
+        whole.predict(&d, Iterations::Best).unwrap(),
+    );
     assert!(
         a.as_slice()
             .iter()
@@ -329,7 +335,10 @@ fn refreshing_on_the_training_data_reproduces_the_model() {
             .train()
             .unwrap()
             .model;
-        let (a, b) = (model.predict(&d).unwrap(), refreshed.predict(&d).unwrap());
+        let (a, b) = (
+            model.predict(&d, Iterations::Best).unwrap(),
+            refreshed.predict(&d, Iterations::Best).unwrap(),
+        );
         assert!(
             a.as_slice()
                 .iter()
@@ -364,7 +373,10 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
         .train()
         .unwrap()
         .model;
-    assert_eq!(stats_only.predict(&d).unwrap(), model.predict(&d).unwrap());
+    assert_eq!(
+        stats_only.predict(&d, Iterations::Best).unwrap(),
+        model.predict(&d, Iterations::Best).unwrap()
+    );
     // Covers count the 150 refresh rows (squared error: hess 1 each).
     assert!(
         stats_only
@@ -384,8 +396,12 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
         .model;
     assert_eq!(partial.num_boost_rounds(), 4);
     // The refreshed leaves chase the shifted labels.
-    let shifted = partial.predict(&half).unwrap();
-    let original = model.slice(..4, 1).unwrap().predict(&half).unwrap();
+    let shifted = partial.predict(&half, Iterations::Best).unwrap();
+    let original = model
+        .slice(..4, 1)
+        .unwrap()
+        .predict(&half, Iterations::Best)
+        .unwrap();
     assert!(
         shifted
             .as_slice()
@@ -525,30 +541,37 @@ fn iteration_ranges_select_whole_iterations() {
     let model = train(&params, &d, 6).unwrap();
     let prefix = train(&params, &d, 4).unwrap();
     assert_eq!(
-        model.predict_margin_range(&d, ..4).unwrap(),
-        prefix.predict_margin(&d).unwrap()
+        model.predict_margin(&d, ..4).unwrap(),
+        prefix.predict_margin(&d, Iterations::Best).unwrap()
     );
     assert_eq!(
-        model.predict_range(&d, ..).unwrap(),
-        model.predict(&d).unwrap()
+        model.predict(&d, ..).unwrap(),
+        model.predict(&d, Iterations::Best).unwrap()
     );
-    let contribs = model.predict_contribs_range(&d, ..4).unwrap();
-    assert_eq!(contribs, prefix.predict_contribs(&d).unwrap());
-    let leaves = model.predict_leaf_range(&d, ..4).unwrap();
-    assert_eq!(leaves, prefix.predict_leaf(&d).unwrap());
-    let inter = model.predict_interactions_range(&d, ..2).unwrap();
+    let contribs = model.predict_contribs(&d, ..4).unwrap();
+    assert_eq!(
+        contribs,
+        prefix.predict_contribs(&d, Iterations::Best).unwrap()
+    );
+    let leaves = model.predict_leaf(&d, ..4).unwrap();
+    assert_eq!(leaves, prefix.predict_leaf(&d, ..).unwrap());
+    let inter = model.predict_interactions(&d, ..2).unwrap();
     assert_eq!(
         inter,
         model
             .slice(..2, 1)
             .unwrap()
-            .predict_interactions(&d)
+            .predict_interactions(&d, Iterations::Best)
             .unwrap()
     );
 
     // A middle range keeps the intercept and adds only its trees.
-    let middle = model.predict_margin_range(&d, 2..5).unwrap();
-    let sliced = model.slice(2..5, 1).unwrap().predict_margin(&d).unwrap();
+    let middle = model.predict_margin(&d, 2..5).unwrap();
+    let sliced = model
+        .slice(2..5, 1)
+        .unwrap()
+        .predict_margin(&d, Iterations::Best)
+        .unwrap();
     let diff = middle
         .as_slice()
         .iter()
@@ -558,20 +581,16 @@ fn iteration_ranges_select_whole_iterations() {
     assert!(diff < 1e-5, "{diff}");
 
     let bad = |r| invalid_param::<Predictions>(r) == "iterations";
-    assert!(bad(model.predict_margin_range(&d, ..7)));
-    assert!(bad(model.predict_margin_range(
-        &d,
-        (Bound::Included(4), Bound::Excluded(3))
-    )));
+    assert!(bad(model.predict_margin(&d, ..7)));
+    assert!(bad(
+        model.predict_margin(&d, (Bound::Included(4), Bound::Excluded(3)))
+    ));
     // Attributions and leaves, as in XGBoost, only take prefixes.
     assert_eq!(
-        invalid_param(model.predict_contribs_range(&d, 1..3)),
+        invalid_param(model.predict_contribs(&d, 1..3)),
         "iterations"
     );
-    assert_eq!(
-        invalid_param(model.predict_leaf_range(&d, 1..)),
-        "iterations"
-    );
+    assert_eq!(invalid_param(model.predict_leaf(&d, 1..)), "iterations");
 }
 
 #[test]
@@ -579,15 +598,12 @@ fn gblinear_accepts_only_the_whole_range() {
     let d = regression(100, 0.0);
     let params = base().booster(BoosterKind::GbLinear).build().unwrap();
     let model = train(&params, &d, 5).unwrap();
-    let whole = model.predict_margin(&d).unwrap();
-    assert_eq!(model.predict_margin_range(&d, ..).unwrap(), whole);
-    assert_eq!(model.predict_margin_range(&d, 0..).unwrap(), whole);
+    let whole = model.predict_margin(&d, Iterations::Best).unwrap();
+    assert_eq!(model.predict_margin(&d, ..).unwrap(), whole);
+    assert_eq!(model.predict_margin(&d, 0..).unwrap(), whole);
     // An explicit empty range would predict the intercept alone on a tree
     // model; a linear model has no iterations to leave out, so it is refused.
-    for bad in [
-        model.predict_margin_range(&d, 0..0),
-        model.predict_range(&d, ..0),
-    ] {
+    for bad in [model.predict_margin(&d, 0..0), model.predict(&d, ..0)] {
         assert_eq!(invalid_param(bad), "iterations");
     }
     assert_eq!(invalid_param(model.slice(.., 1)), "slice");
@@ -609,7 +625,7 @@ fn slicing_selects_iterations_with_their_dart_weights() {
     assert_eq!(sliced.base_scores(), model.base_scores());
     // Iterations 1, 4, 7 contribute exactly their weighted trees.
     let pick = |m: &BoostedModel, it: usize| {
-        let full = m.predict_margin_range(&d, it..=it).unwrap();
+        let full = m.predict_margin(&d, it..=it).unwrap();
         full.as_slice()
             .iter()
             .map(|v| v - m.base_score())
@@ -619,7 +635,7 @@ fn slicing_selects_iterations_with_their_dart_weights() {
     let expected: Vec<f32> = (0..d.n_rows())
         .map(|r| model.base_score() + picked.iter().map(|p| p[r]).sum::<f32>())
         .collect();
-    let got = sliced.predict_margin(&d).unwrap();
+    let got = sliced.predict_margin(&d, Iterations::Best).unwrap();
     assert!(
         got.as_slice()
             .iter()
@@ -642,8 +658,8 @@ fn slicing_selects_iterations_with_their_dart_weights() {
     let head = stopped.slice(..=best, 1).unwrap();
     assert_eq!(head.best_iteration(), None);
     assert_eq!(
-        head.predict(&valid).unwrap(),
-        stopped.predict(&valid).unwrap()
+        head.predict(&valid, Iterations::Best).unwrap(),
+        stopped.predict(&valid, Iterations::Best).unwrap()
     );
 
     for (b, e, s) in [(0, 0, 0), (3, 3, 1), (0, 10, 1), (5, 2, 1)] {

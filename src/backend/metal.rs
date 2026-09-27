@@ -91,7 +91,7 @@ unsafe extern "C" {}
 use crate::backend::exact_sum::SumDomain;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
-use crate::model::{BoostedModel, initial_margins, transform_model_margins};
+use crate::model::{BoostedModel, Iterations, initial_margins, transform_model_margins};
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;
 use crate::tree::hist::{CpuBackend, HistogramBackend};
@@ -104,7 +104,6 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
 };
 use rayon::prelude::*;
-use std::ops::RangeBounds;
 use std::ptr::NonNull;
 use std::ptr::copy_nonoverlapping;
 use std::slice;
@@ -1444,19 +1443,20 @@ impl GpuModel {
     }
 
     /// Raw margin predictions of `data` from the boosting `iterations`
-    /// (the convention of
-    /// [`BoostedModel::predict_margin_range`](crate::model::BoostedModel::predict_margin_range)),
+    /// ([`Iterations`], as for
+    /// [`BoostedModel::predict_margin`](crate::model::BoostedModel::predict_margin)),
     /// computed on the GPU. Bit-identical to the CPU margins. A model
     /// trained with model shrinkage predicts on the CPU, whose per-iteration
     /// shrink-then-add arithmetic repeats training's.
-    pub fn predict_margin_range(
+    pub fn predict_margin(
         &self,
         data: &crate::data::DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: impl Into<Iterations>,
     ) -> Result<crate::model::Predictions> {
         let model = &self.model;
+        let iterations = iterations.into();
         if model.shrinkage().is_some() {
-            return model.predict_margin_range(data, iterations);
+            return model.predict_margin(data, iterations);
         }
         model.validate_prediction_data(data)?;
         let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
@@ -1536,18 +1536,15 @@ impl GpuModel {
         Ok(crate::model::Predictions::new(margins, n, k))
     }
 
-    /// Raw margin predictions of `data` (the model's effective iterations),
-    /// computed on the GPU. Bit-identical to
-    /// [`BoostedModel::predict_margin`](crate::prelude::BoostedModel::predict_margin).
-    pub fn predict_margin(&self, data: &crate::data::DMatrix) -> Result<crate::model::Predictions> {
-        self.predict_margin_range(data, self.model.default_iteration_range())
-    }
-
-    /// Predictions in the objective's reported space (the model's effective
-    /// iterations), computed on the GPU. Bit-identical to
+    /// Predictions in the objective's reported space from the boosting
+    /// `iterations`, computed on the GPU. Bit-identical to
     /// [`BoostedModel::predict`](crate::prelude::BoostedModel::predict).
-    pub fn predict(&self, data: &crate::data::DMatrix) -> Result<crate::model::Predictions> {
-        let margin = self.predict_margin(data)?;
+    pub fn predict(
+        &self,
+        data: &crate::data::DMatrix,
+        iterations: impl Into<Iterations>,
+    ) -> Result<crate::model::Predictions> {
+        let margin = self.predict_margin(data, iterations)?;
         Ok(transform_model_margins(
             self.model.objective(),
             self.model.max_delta_step(),
@@ -1562,35 +1559,9 @@ impl GpuModel {
     pub fn predict_class(
         &self,
         data: &crate::data::DMatrix,
+        iterations: impl Into<Iterations>,
     ) -> Result<crate::model::Predictions<u32>> {
-        let probs = self.predict(data)?;
-        let k = self.model.n_outputs();
-        if k == 1 || self.model.n_targets() > 1 {
-            let values = probs
-                .as_slice()
-                .iter()
-                .map(|&p| u32::from(p > 0.5))
-                .collect();
-            return Ok(crate::model::Predictions::new(
-                values,
-                probs.n_rows(),
-                probs.width(),
-            ));
-        }
-        if self
-            .model
-            .objective()
-            .built_in()
-            .is_some_and(crate::objective::Objective::predicts_class_index)
-        {
-            let values = probs.as_slice().iter().map(|&class| class as u32).collect();
-            return Ok(crate::model::Predictions::new(values, probs.n_rows(), 1));
-        }
-        let values = probs
-            .rows()
-            .map(|row| crate::simd::argmax_scalar(row) as u32)
-            .collect();
-        Ok(crate::model::Predictions::new(values, probs.n_rows(), 1))
+        Ok(self.model.classes(&self.predict(data, iterations)?))
     }
 
     /// Check out buffers that fit the call, allocating when the pool has
@@ -2054,14 +2025,17 @@ mod tests {
             .unwrap();
         let model = train(&params, &data, 12).unwrap();
         let gpu = model.to_gpu().unwrap();
-        assert_eq!(model.predict(&data).unwrap(), gpu.predict(&data).unwrap());
         assert_eq!(
-            model.predict_margin(&data).unwrap(),
-            gpu.predict_margin(&data).unwrap()
+            model.predict(&data, Iterations::Best).unwrap(),
+            gpu.predict(&data, Iterations::Best).unwrap()
         );
         assert_eq!(
-            model.predict_class(&data).unwrap(),
-            gpu.predict_class(&data).unwrap()
+            model.predict_margin(&data, Iterations::Best).unwrap(),
+            gpu.predict_margin(&data, Iterations::Best).unwrap()
+        );
+        assert_eq!(
+            model.predict_class(&data, Iterations::Best).unwrap(),
+            gpu.predict_class(&data, Iterations::Best).unwrap()
         );
     }
 }

@@ -2502,6 +2502,7 @@ mod tests {
     use super::*;
     use crate::config::LinearTree;
     use crate::metric::{Metric, Rmse};
+    use crate::model::Iterations;
     use crate::objective::{
         Aft, CustomLoss, LambdaRank, Multiclass, Objective, PseudoHuber, RegLoss,
     };
@@ -2791,7 +2792,7 @@ mod tests {
                 .build()
                 .unwrap();
             let model = train(&params, &d, 3).unwrap();
-            model.predict_margin(&d).unwrap()
+            model.predict_margin(&d, Iterations::Best).unwrap()
         };
         let serial = fit(1);
         for _ in 0..32 {
@@ -2826,7 +2827,7 @@ mod tests {
             .unwrap();
         let model = Trainer::new(&params, &data, 2).train().unwrap().model;
         assert_eq!(
-            model.predict(&data).unwrap().as_slice(),
+            model.predict(&data, Iterations::Best).unwrap().as_slice(),
             [1.5, 0.0, 7.5, 0.0, 0.0]
         );
         let linear = model.trees()[1].linear_leaves().unwrap();
@@ -2863,7 +2864,10 @@ mod tests {
                 .nthread(nthread)
                 .build()
                 .unwrap();
-            train(&params, &d, 3).unwrap().predict_margin(&d).unwrap()
+            train(&params, &d, 3)
+                .unwrap()
+                .predict_margin(&d, Iterations::Best)
+                .unwrap()
         };
         let serial = fit(1);
         for _ in 0..4 {
@@ -2881,7 +2885,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 50).unwrap();
-        let preds = model.predict(&d).unwrap().into_vec(); // probabilities, one per row
+        let preds = model.predict(&d, Iterations::Best).unwrap().into_vec(); // probabilities, one per row
         // Low-x rows -> ~0, high-x rows -> ~1.
         assert!(preds[0] < 0.1, "expected ~0, got {}", preds[0]);
         assert!(preds[99] > 0.9, "expected ~1, got {}", preds[99]);
@@ -2896,7 +2900,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 0).unwrap();
-        let preds = model.predict(&d).unwrap();
+        let preds = model.predict(&d, Iterations::Best).unwrap();
         let mean = d.labels().unwrap().iter().sum::<f32>() / 10.0;
         for p in preds.into_vec() {
             assert!((p - mean).abs() < 1e-6);
@@ -2915,7 +2919,7 @@ mod tests {
                 .build()
                 .unwrap();
             let model = train(&params, &d, 60).unwrap();
-            let preds = model.predict(&d).unwrap();
+            let preds = model.predict(&d, Iterations::Best).unwrap();
             Rmse.eval(preds.as_slice(), d.labels().unwrap(), None)
         };
         let rmse_hist = rmse(TreeMethod::Hist);
@@ -2940,7 +2944,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 60).unwrap();
-        let preds = model.predict(&d).unwrap();
+        let preds = model.predict(&d, Iterations::Best).unwrap();
         let rmse = Rmse.eval(preds.as_slice(), d.labels().unwrap(), None);
         assert!(rmse < 0.06, "lossguide rmse {rmse}");
     }
@@ -3023,7 +3027,7 @@ mod tests {
         assert_eq!(model.num_boost_rounds(), 60);
 
         // Probabilities: three per row, each row sums to 1.
-        let probs = model.predict(&d).unwrap();
+        let probs = model.predict(&d, Iterations::Best).unwrap();
         assert_eq!((probs.n_rows(), probs.width()), (n, 3));
         for row in probs.rows() {
             let s: f32 = row.iter().sum();
@@ -3031,7 +3035,7 @@ mod tests {
         }
 
         // Predicted classes match the region labels on almost all rows.
-        let classes = model.predict_class(&d).unwrap();
+        let classes = model.predict_class(&d, Iterations::Best).unwrap();
         let correct = classes
             .as_slice()
             .iter()
@@ -3056,7 +3060,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 60).unwrap();
-        let preds = model.predict(&d).unwrap().into_vec(); // rates (exp transform), one per row
+        let preds = model.predict(&d, Iterations::Best).unwrap().into_vec(); // rates (exp transform), one per row
         assert!(preds.iter().all(|&p| p > 0.0), "rates must be positive");
         // Higher x should predict a higher rate: compare mean predicted rate for
         // low-x vs high-x rows (the feature is randomized, so bucket by value).
@@ -3086,7 +3090,10 @@ mod tests {
                 .base_score(0.0)
                 .build()
                 .unwrap();
-            train(&p, &d, 30).unwrap().predict(&d).unwrap()
+            train(&p, &d, 30)
+                .unwrap()
+                .predict(&d, Iterations::Best)
+                .unwrap()
         };
 
         let custom = {
@@ -3102,7 +3109,10 @@ mod tests {
                 .eta(0.3)
                 .build()
                 .unwrap();
-            train(&p, &d, 30).unwrap().predict(&d).unwrap()
+            train(&p, &d, 30)
+                .unwrap()
+                .predict(&d, Iterations::Best)
+                .unwrap()
         };
 
         for (a, b) in builtin.as_slice().iter().zip(custom.as_slice()) {
@@ -3137,10 +3147,10 @@ mod tests {
         assert_eq!(model.base_scores().len(), 2);
         assert_eq!(model.num_trees(), 2 * rounds);
 
-        let margin = model.predict_margin(&d).unwrap();
+        let margin = model.predict_margin(&d, Iterations::Best).unwrap();
         assert_eq!((margin.n_rows(), margin.width()), (n, 2));
         // Unknown objective name: `predict` falls back to raw margins.
-        assert_eq!(model.predict(&d).unwrap(), margin);
+        assert_eq!(model.predict(&d, Iterations::Best).unwrap(), margin);
 
         let labels = d.labels().unwrap();
         let (mut err0, mut err1, mut err_init) = (0.0f32, 0.0f32, 0.0f32);
@@ -3162,10 +3172,16 @@ mod tests {
 
         let via_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
         assert_eq!(via_json.n_outputs(), 2);
-        assert_eq!(via_json.predict_margin(&d).unwrap(), margin);
+        assert_eq!(
+            via_json.predict_margin(&d, Iterations::Best).unwrap(),
+            margin
+        );
         let via_bytes = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
         assert_eq!(via_bytes.n_outputs(), 2);
-        assert_eq!(via_bytes.predict_margin(&d).unwrap(), margin);
+        assert_eq!(
+            via_bytes.predict_margin(&d, Iterations::Best).unwrap(),
+            margin
+        );
     }
 
     #[test]
@@ -3236,7 +3252,7 @@ mod tests {
         assert_eq!(model.num_trees(), 60);
 
         // It should learn the step: RMSE well below a constant predictor.
-        let preds = model.predict(&d).unwrap();
+        let preds = model.predict(&d, Iterations::Best).unwrap();
         let rmse = Rmse.eval(preds.as_slice(), d.labels().unwrap(), None);
         assert!(rmse < 0.1, "dart rmse too high: {rmse}");
 
@@ -3245,7 +3261,7 @@ mod tests {
             BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
             BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
         ] {
-            assert_eq!(restored.predict(&d).unwrap(), preds);
+            assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), preds);
         }
     }
 
@@ -3267,7 +3283,10 @@ mod tests {
         let gbtree = fit(BoosterKind::GbTree);
         let dart = fit(BoosterKind::Dart(Dart::default()));
         assert_eq!(dart.trees(), gbtree.trees());
-        assert_eq!(dart.predict(&d).unwrap(), gbtree.predict(&d).unwrap());
+        assert_eq!(
+            dart.predict(&d, Iterations::Best).unwrap(),
+            gbtree.predict(&d, Iterations::Best).unwrap()
+        );
     }
 
     /// A round that drops nothing reads the training margin cache, so after
@@ -3308,8 +3327,8 @@ mod tests {
                 .unwrap()
                 .model;
             assert_eq!(
-                resumed.predict_margin(data).unwrap(),
-                whole.predict_margin(data).unwrap(),
+                resumed.predict_margin(data, Iterations::Best).unwrap(),
+                whole.predict_margin(data, Iterations::Best).unwrap(),
                 "{strategy:?}"
             );
         }
@@ -3351,7 +3370,7 @@ mod tests {
             .unwrap();
         let model = train(&params, &d, 40).unwrap();
         // Compare weighted prediction against a manual unit-weight tree sum.
-        let preds = model.predict_margin(&d).unwrap();
+        let preds = model.predict_margin(&d, Iterations::Best).unwrap();
         let n = d.n_rows();
         let mut manual = vec![model.base_score(); n];
         for tree in model.trees() {
@@ -3398,7 +3417,11 @@ mod tests {
                     .build()
                     .unwrap();
                 let m = train(&p, d, 40).unwrap();
-                Rmse.eval(m.predict(d).unwrap().as_slice(), d.labels().unwrap(), None)
+                Rmse.eval(
+                    m.predict(d, Iterations::Best).unwrap().as_slice(),
+                    d.labels().unwrap(),
+                    None,
+                )
             };
             let rmse_num = mk(&numeric);
             let rmse_cat = mk(&categorical);
@@ -3439,7 +3462,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 50).unwrap();
-        let preds = model.predict(&d).unwrap().into_vec(); // one value per row
+        let preds = model.predict(&d, Iterations::Best).unwrap().into_vec(); // one value per row
         let mut prev = f32::NEG_INFINITY;
         for (i, p) in preds.iter().enumerate() {
             assert!(
@@ -3465,10 +3488,16 @@ mod tests {
             .build()
             .unwrap();
         let initial = train(&params, &d_bm, 0).unwrap();
-        assert_eq!(initial.predict_margin(&d_bm).unwrap().as_slice(), bm);
+        assert_eq!(
+            initial
+                .predict_margin(&d_bm, Iterations::Best)
+                .unwrap()
+                .as_slice(),
+            bm
+        );
 
         let fitted = train(&params, &d_bm, 10).unwrap();
-        let margin = fitted.predict_margin(&d_bm).unwrap();
+        let margin = fitted.predict_margin(&d_bm, Iterations::Best).unwrap();
         let rmse = Rmse.eval(margin.as_slice(), d_bm.labels().unwrap(), None);
         assert!(
             rmse < 0.2,
@@ -3503,7 +3532,10 @@ mod tests {
                 .seed(1)
                 .build()
                 .unwrap();
-            train(&p, &d, 20).unwrap().predict(&d).unwrap()
+            train(&p, &d, 20)
+                .unwrap()
+                .predict(&d, Iterations::Best)
+                .unwrap()
         };
         let full = train_with(1.0);
         let sampled = train_with(0.5);
@@ -3549,7 +3581,7 @@ mod tests {
         let model = train(&params, &d, 200).unwrap();
         assert_eq!(model.num_trees(), 0);
 
-        let preds = model.predict(&d).unwrap();
+        let preds = model.predict(&d, Iterations::Best).unwrap();
         let y = d.labels().unwrap();
         let rmse = Rmse.eval(preds.as_slice(), y, None);
 
@@ -3575,13 +3607,13 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 100).unwrap();
-        let before = model.predict(&d).unwrap();
+        let before = model.predict(&d, Iterations::Best).unwrap();
 
         for restored in [
             BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
             BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
         ] {
-            assert_eq!(restored.predict(&d).unwrap(), before);
+            assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), before);
         }
     }
 
@@ -3629,8 +3661,8 @@ mod tests {
         assert_eq!(builtin.model.num_trees(), best + 6);
         assert_eq!(custom.model.best_iteration(), Some(best));
         assert_eq!(
-            custom.model.predict(&d).unwrap(),
-            builtin.model.predict(&d).unwrap()
+            custom.model.predict(&d, Iterations::Best).unwrap(),
+            builtin.model.predict(&d, Iterations::Best).unwrap()
         );
 
         // As in XGBoost's `xgb.train`, the custom metric is reported after
@@ -3663,7 +3695,7 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 20).unwrap();
-        let predictions = model.predict(&d).unwrap();
+        let predictions = model.predict(&d, Iterations::Best).unwrap();
         assert_eq!((predictions.n_rows(), predictions.width()), (d.n_rows(), 1));
         assert!(
             predictions
@@ -3672,7 +3704,10 @@ mod tests {
                 .all(|value| value.fract() == 0.0 && *value < 3.0)
         );
         assert_eq!(
-            model.predict_class(&d).unwrap().as_slice(),
+            model
+                .predict_class(&d, Iterations::Best)
+                .unwrap()
+                .as_slice(),
             predictions
                 .as_slice()
                 .iter()
@@ -3702,7 +3737,7 @@ mod tests {
             assert_eq!(model.objective().name(), name);
             assert!(
                 model
-                    .predict(&d)
+                    .predict(&d, Iterations::Best)
                     .unwrap()
                     .as_slice()
                     .iter()
@@ -3734,7 +3769,7 @@ mod tests {
         let model = train(&params, &d, 0).unwrap();
         assert!(
             model
-                .predict(&d)
+                .predict(&d, Iterations::Best)
                 .unwrap()
                 .as_slice()
                 .iter()
@@ -3810,9 +3845,13 @@ mod tests {
                 .is_err()
         );
         let model = train(&params, &d, 2).unwrap();
-        assert!(model.predict(&wrong_features).is_err());
-        assert!(model.predict_margin(&wrong_features).is_err());
-        assert!(model.predict_leaf(&wrong_features).is_err());
+        assert!(model.predict(&wrong_features, Iterations::Best).is_err());
+        assert!(
+            model
+                .predict_margin(&wrong_features, Iterations::Best)
+                .is_err()
+        );
+        assert!(model.predict_leaf(&wrong_features, ..).is_err());
     }
 
     /// Label-domain checks run through `Loss::validate_info` for every
@@ -3940,7 +3979,7 @@ mod tests {
                     .unwrap();
                 let model = train(&params, &d, 4).unwrap();
                 assert_eq!((model.n_outputs(), model.n_targets()), (2, 2));
-                let preds = model.predict(&d).unwrap();
+                let preds = model.predict(&d, Iterations::Best).unwrap();
                 assert_eq!((preds.n_rows(), preds.width()), (d.n_rows(), 2));
                 for (j, col) in cols.iter().enumerate() {
                     let single = d
@@ -3955,7 +3994,7 @@ mod tests {
                         reference.base_score().to_bits(),
                         "{name} {method:?} intercept {j}"
                     );
-                    let expected = reference.predict(&single).unwrap();
+                    let expected = reference.predict(&single, Iterations::Best).unwrap();
                     for (row, e) in expected.as_slice().iter().enumerate() {
                         assert_eq!(
                             preds.get(row, j).unwrap().to_bits(),
@@ -3980,8 +4019,8 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 10).unwrap();
-        let preds = model.predict(&d).unwrap();
-        let classes = model.predict_class(&d).unwrap();
+        let preds = model.predict(&d, Iterations::Best).unwrap();
+        let classes = model.predict_class(&d, Iterations::Best).unwrap();
         assert_eq!((classes.n_rows(), classes.width()), (d.n_rows(), 2));
         for (i, (&c, &p)) in classes.as_slice().iter().zip(preds.as_slice()).enumerate() {
             assert_eq!(c, u32::from(p > 0.5), "cell {i}");
@@ -3994,7 +4033,7 @@ mod tests {
             BoostedModel::from_xgboost_ubjson(&model.to_xgboost_ubjson().unwrap()).unwrap(),
         ] {
             assert_eq!(restored.n_targets(), 2);
-            assert_eq!(restored.predict(&d).unwrap(), preds);
+            assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), preds);
         }
     }
 
@@ -4068,7 +4107,10 @@ mod tests {
         // Base margin is the mean midpoint (1 and 5 → 3); one full-step tree
         // then lands every row on its own midpoint.
         assert_eq!(model.base_score(), 3.0);
-        let preds = model.predict_margin(&d).unwrap().into_vec(); // one per row
+        let preds = model
+            .predict_margin(&d, Iterations::Best)
+            .unwrap()
+            .into_vec(); // one per row
         for (row, p) in preds.iter().enumerate() {
             let expected = if row < 16 { 1.0 } else { 5.0 };
             assert!((p - expected).abs() < 1e-3, "row {row}: {p}");

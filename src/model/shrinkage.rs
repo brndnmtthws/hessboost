@@ -21,7 +21,7 @@
 //! Training evaluates `F_k` by its recurrence in `f32` margins: starting
 //! from `b0`, every iteration multiplies each margin by `s_i` (in `f64`,
 //! rounded once, [`shrink_margins`]) and then adds its trees. Prediction
-//! ([`BoostedModel::predict_margin_range`](super::BoostedModel::predict_margin_range),
+//! ([`BoostedModel::predict_margin`](super::BoostedModel::predict_margin),
 //! slices, virtual ensembles, the compact format) runs the same recurrence
 //! over the same record, so the model after any `k` iterations predicts
 //! bit for bit the margins training reached after `k` rounds (and those of

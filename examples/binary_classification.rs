@@ -46,8 +46,8 @@ fn main() -> Result<()> {
         model.best_iteration()
     );
 
-    let probs = model.predict(&dvalid)?; // probabilities in [0, 1]
-    let classes = model.predict_class(&dvalid)?; // hard 0/1 labels
+    let probs = model.predict(&dvalid, Iterations::Best)?; // probabilities in [0, 1]
+    let classes = model.predict_class(&dvalid, Iterations::Best)?; // hard 0/1 labels
     let acc = accuracy(classes.as_slice(), dvalid.labels().unwrap());
     let auc = EvalMetric::Auc
         .build(1)?

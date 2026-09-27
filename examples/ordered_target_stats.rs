@@ -42,7 +42,7 @@ fn fit_rmse(
     let model = train(params, train_set, 200)?;
     let rmse = |data: &DMatrix| -> Result<f64> {
         Ok(EvalMetric::Rmse.build(1)?.eval(
-            model.predict(data)?.as_slice(),
+            model.predict(data, Iterations::Best)?.as_slice(),
             data.labels().unwrap_or_default(),
             None,
         ))

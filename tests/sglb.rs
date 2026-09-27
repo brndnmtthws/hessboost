@@ -130,9 +130,9 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
         assert_eq!(members.iterations(), &[15, 18, 21, 24], "{name}");
         for k in [1, 7, 15, 18, 23, rounds] {
             let short = train(params, data, k).unwrap();
-            let expected = bits(short.predict_margin(data).unwrap());
+            let expected = bits(short.predict_margin(data, Iterations::Best).unwrap());
             assert_eq!(
-                bits(long.predict_margin_range(data, ..k).unwrap()),
+                bits(long.predict_margin(data, ..k).unwrap()),
                 expected,
                 "{name}: iterations ..{k}"
             );
@@ -151,6 +151,117 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             }
         }
     }
+}
+
+/// Virtual-ensemble members come from one pass over the trees, copied out
+/// at every member's iteration count. Each member is still, bit for bit,
+/// the separate prediction of its prefix (margins and transformed
+/// predictions) on every accumulation path: both shrink modes, DART
+/// weights, linear leaves, vector leaves, boosted forests, `multi:softmax`
+/// class indices, a `base_margin`, a batch smaller than one lane group
+/// (the per-row path), and CSR too wide to densify.
+#[test]
+fn virtual_ensemble_members_are_the_prefix_predictions() {
+    let base = || {
+        TrainingParams::builder()
+            .max_depth(3)
+            .eta(0.3)
+            .seed(3)
+            .tree_method(TreeMethod::Hist)
+    };
+    let softmax = || Objective::Softmax(Multiclass::new(3).unwrap());
+    let cases: Vec<(&str, TrainingParamsBuilder, DMatrix)> = vec![
+        ("gbtree", base(), regression(300)),
+        (
+            "constant shrinkage",
+            base().model_shrink(shrink(0.4, ModelShrinkMode::Constant)),
+            regression(300),
+        ),
+        (
+            "decreasing shrinkage, linear leaves",
+            base()
+                .model_shrink(shrink(0.3, ModelShrinkMode::Decreasing))
+                .linear_tree(LinearTree::default()),
+            regression(300),
+        ),
+        (
+            "linear leaves",
+            base().linear_tree(LinearTree::default()),
+            regression(300),
+        ),
+        (
+            "dart",
+            base().booster(BoosterKind::Dart(Dart::default())),
+            regression(300),
+        ),
+        (
+            "boosted forest",
+            base().num_parallel_tree(2).subsample(0.7),
+            regression(300),
+        ),
+        (
+            "vector-leaf softmax",
+            base()
+                .objective(softmax())
+                .multi_strategy(MultiStrategy::MultiOutputTree),
+            classification(300, 3),
+        ),
+        (
+            "softmax, decreasing shrinkage",
+            base()
+                .objective(softmax())
+                .model_shrink(shrink(0.3, ModelShrinkMode::Decreasing)),
+            classification(300, 3),
+        ),
+        ("wide CSR", base(), wide_csr_regression(300)),
+    ];
+    for (name, params, train_data) in cases {
+        let model = train(&params.build().unwrap(), &train_data, 20).unwrap();
+        let k = model.n_outputs();
+        let few = train_data.select_rows(&[0, 1, 2, 3, 4]).unwrap();
+        let offsets: Vec<f32> = (0..300 * k).map(|i| (i % 13) as f32 * 0.25).collect();
+        let offset = train_data.clone().with_base_margin(&offsets).unwrap();
+        for (probe, data) in [
+            ("all rows", &train_data),
+            ("5 rows", &few),
+            ("base_margin", &offset),
+        ] {
+            let members = model.predict_virtual_ensembles(data, 4).unwrap();
+            for (m, &end) in members.iterations().iter().enumerate() {
+                assert_eq!(
+                    bits(members.member_margins(m).unwrap()),
+                    bits(model.predict_margin(data, ..end).unwrap()),
+                    "{name}, {probe}: member {m} margins"
+                );
+                assert_eq!(
+                    bits(members.member_predictions(m).unwrap()),
+                    bits(model.predict(data, ..end).unwrap()),
+                    "{name}, {probe}: member {m} predictions"
+                );
+            }
+        }
+    }
+}
+
+/// [`regression`]'s rows as CSR with 4096 empty columns after the four
+/// features, wider than prediction densifies.
+fn wide_csr_regression(n: usize) -> DMatrix {
+    let dense = regression(n);
+    let labels = dense.labels().unwrap().to_vec();
+    let (mut indptr, mut indices, mut values) = (vec![0], Vec::new(), Vec::new());
+    for i in 0..n {
+        for (f, v) in common::four_features(i).into_iter().enumerate() {
+            if !v.is_nan() {
+                indices.push(f as u32);
+                values.push(v);
+            }
+        }
+        indptr.push(indices.len());
+    }
+    DMatrix::from_csr(indptr, indices, values, 4 + 4096)
+        .unwrap()
+        .with_labels(&labels)
+        .unwrap()
 }
 
 /// Early stopping keeps the shrunk model as it was after the best
@@ -177,8 +288,8 @@ fn early_stopping_keeps_the_best_iteration_model() {
     assert_eq!(model.num_boost_rounds(), best + 1);
     let short = train(&params, &data, best + 1).unwrap();
     assert_eq!(
-        bits(model.predict_margin(&valid).unwrap()),
-        bits(short.predict_margin(&valid).unwrap())
+        bits(model.predict_margin(&valid, Iterations::Best).unwrap()),
+        bits(short.predict_margin(&valid, Iterations::Best).unwrap())
     );
 }
 
@@ -221,7 +332,7 @@ fn predictions_are_the_training_margins() {
         .unwrap();
     assert_eq!(result.history.last().unwrap().scores[0].value, 0.0);
     assert_eq!(
-        bits(result.model.predict_margin(&one).unwrap()),
+        bits(result.model.predict_margin(&one, Iterations::Best).unwrap()),
         bits([0.0])
     );
 
@@ -300,13 +411,13 @@ fn predictions_are_the_training_margins() {
         assert_eq!(seen.len(), rounds, "{name}");
         for (k, margins) in seen.iter().enumerate() {
             assert_eq!(
-                bits(model.predict_margin_range(&data, ..=k).unwrap()),
+                bits(model.predict_margin(&data, ..=k).unwrap()),
                 bits(margins),
                 "{name}: after round {k}"
             );
         }
         assert_eq!(
-            bits(model.predict_margin(&data).unwrap()),
+            bits(model.predict_margin(&data, Iterations::Best).unwrap()),
             bits(&seen[rounds - 1]),
             "{name}"
         );
@@ -378,8 +489,8 @@ fn renewed_leaves_keep_min_child_weight() {
         let noisy = train(&params(strategy, true), data, 3).unwrap();
         let plain = train(&params(MultiStrategy::OneOutputPerTree, false), data, 3).unwrap();
         assert_eq!(
-            bits(noisy.predict_margin(data).unwrap()),
-            bits(plain.predict_margin(data).unwrap()),
+            bits(noisy.predict_margin(data, Iterations::Best).unwrap()),
+            bits(plain.predict_margin(data, Iterations::Best).unwrap()),
             "{strategy:?}"
         );
     }
@@ -398,22 +509,22 @@ fn shrunk_models_round_trip() {
         .build()
         .unwrap();
     let model = train(&params, &data, 12).unwrap();
-    let margin = model.predict_margin(&data).unwrap();
+    let margin = model.predict_margin(&data, Iterations::Best).unwrap();
     let margins = bits(&margin);
-    let prefix = bits(model.predict_margin_range(&data, ..5).unwrap());
+    let prefix = bits(model.predict_margin(&data, ..5).unwrap());
     for restored in [
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
         BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
     ] {
-        assert_eq!(bits(restored.predict_margin(&data).unwrap()), margins);
         assert_eq!(
-            bits(restored.predict_margin_range(&data, ..5).unwrap()),
-            prefix
+            bits(restored.predict_margin(&data, Iterations::Best).unwrap()),
+            margins
         );
+        assert_eq!(bits(restored.predict_margin(&data, ..5).unwrap()), prefix);
     }
     let xgboost = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
     for (&x, &m) in xgboost
-        .predict_margin(&data)
+        .predict_margin(&data, Iterations::Best)
         .unwrap()
         .as_slice()
         .iter()
@@ -428,11 +539,11 @@ fn shrunk_models_round_trip() {
     let offset = regression(200).with_base_margin(&[0.5; 200]).unwrap();
     assert_eq!(
         bits(compact.predict_margin(&offset).unwrap()),
-        bits(model.predict_margin(&offset).unwrap())
+        bits(model.predict_margin(&offset, Iterations::Best).unwrap())
     );
     // SHAP attributes the weighted trees: each row's contributions sum to
     // its margin.
-    let contribs = model.predict_contribs(&data).unwrap();
+    let contribs = model.predict_contribs(&data, Iterations::Best).unwrap();
     for (row, &m) in margin.as_slice().iter().enumerate() {
         let sum: f32 = contribs.get(row, 0).unwrap().iter().sum();
         assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");
@@ -458,17 +569,17 @@ fn shrunk_models_refuse_non_prefix_selections() {
         .unwrap();
     let model = train(&params, &data, 10).unwrap();
     assert_eq!(
-        common::invalid_param(model.predict_margin_range(&data, 2..5)),
+        common::invalid_param(model.predict_margin(&data, 2..5)),
         "iterations"
     );
     assert_eq!(common::invalid_param(model.slice(2..5, 1)), "slice");
     assert_eq!(common::invalid_param(model.slice(..6, 2)), "slice");
     assert_eq!(
-        common::invalid_param(model.predict_contribs_range(&data, ..4)),
+        common::invalid_param(model.predict_contribs(&data, ..4)),
         "iterations"
     );
-    assert!(model.predict_contribs_range(&data, ..).is_ok());
-    assert!(model.predict_leaf_range(&data, ..4).is_ok());
+    assert!(model.predict_contribs(&data, ..).is_ok());
+    assert!(model.predict_leaf(&data, ..4).is_ok());
 }
 
 /// Quantized training's full-precision leaf renewal would be overwritten
@@ -726,8 +837,8 @@ fn langevin_continuation_matches_the_uninterrupted_run() {
         .model;
     let whole = train(&params, &data, 9).unwrap();
     assert_eq!(
-        bits(continued.predict_margin(&data).unwrap()),
-        bits(whole.predict_margin(&data).unwrap())
+        bits(continued.predict_margin(&data, Iterations::Best).unwrap()),
+        bits(whole.predict_margin(&data, Iterations::Best).unwrap())
     );
 }
 

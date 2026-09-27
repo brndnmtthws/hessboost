@@ -164,6 +164,7 @@ impl Loss for AbsoluteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Iterations;
     use crate::objective::Objective;
     use crate::objective::{base_margins, gradient_pairs};
 
@@ -272,11 +273,11 @@ mod tests {
         let both = base.clone().with_label_matrix(&matrix, 2).unwrap();
         let joint = crate::training::train(&params, &both, 5).unwrap();
         assert_eq!(joint.n_outputs(), 2);
-        let joint_pred = joint.predict(&base).unwrap();
+        let joint_pred = joint.predict(&base, Iterations::Best).unwrap();
         for (j, y) in [&y0, &y1].into_iter().enumerate() {
             let single = base.clone().with_labels(y).unwrap();
             let alone = crate::training::train(&params, &single, 5).unwrap();
-            let pred = alone.predict(&base).unwrap();
+            let pred = alone.predict(&base, Iterations::Best).unwrap();
             let column: Vec<f32> = joint_pred.rows().map(|row| row[j]).collect();
             assert_eq!(column, pred.as_slice(), "target {j}");
         }

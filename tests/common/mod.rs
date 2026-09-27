@@ -2,6 +2,7 @@
 //! with `mod common;` (`tests/common/mod.rs` is not a test target itself).
 #![allow(dead_code, reason = "each test crate uses a subset of the helpers")]
 
+use hessboost::model::Iterations;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Result};
 
 /// A dense matrix of `labels.len()` rows × `n_cols` features with `labels`.
@@ -48,7 +49,7 @@ pub fn invalid_param<T: std::fmt::Debug>(result: Result<T>) -> &'static str {
 /// Root mean squared error of `model`'s predictions on the labels of `data`
 /// (every label cell of a label matrix).
 pub fn rmse(model: &BoostedModel, data: &DMatrix) -> f64 {
-    let preds = model.predict(data).unwrap();
+    let preds = model.predict(data, Iterations::Best).unwrap();
     let labels = data.labels().unwrap();
     let sse: f64 = preds
         .as_slice()

@@ -989,6 +989,7 @@ mod tests {
     use super::super::sections::REQUIRED;
     use super::*;
     use crate::config::TrainingParams;
+    use crate::model::Iterations;
     use crate::objective::{Objective, PseudoHuber, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
@@ -1074,8 +1075,8 @@ mod tests {
             let loaded = BoostedModel::from_bytes(&edited);
             if flags == 0 {
                 assert_eq!(
-                    loaded.unwrap().predict(&data).unwrap(),
-                    model.predict(&data).unwrap()
+                    loaded.unwrap().predict(&data, Iterations::Best).unwrap(),
+                    model.predict(&data, Iterations::Best).unwrap()
                 );
             } else {
                 let err = loaded.unwrap_err().to_string();
@@ -1109,8 +1110,8 @@ mod tests {
         let loaded = BoostedModel::from_bytes(&edited).unwrap();
         assert!(loaded.boulevard().is_none());
         assert_eq!(
-            loaded.predict(&data).unwrap(),
-            model.predict(&data).unwrap()
+            loaded.predict(&data, Iterations::Best).unwrap(),
+            model.predict(&data, Iterations::Best).unwrap()
         );
     }
 
@@ -1135,9 +1136,9 @@ mod tests {
         assert_eq!(
             BoostedModel::from_bytes(&without)
                 .unwrap()
-                .predict(&data)
+                .predict(&data, Iterations::Best)
                 .unwrap(),
-            model.predict(&data).unwrap()
+            model.predict(&data, Iterations::Best).unwrap()
         );
     }
 

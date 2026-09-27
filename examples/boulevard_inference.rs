@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         .flat_map(|i| [0.05 + 0.1125 * i as f32, 0.5])
         .collect();
     let dgrid = DMatrix::from_dense(&grid, 9, 2)?;
-    let preds = model.predict(&dgrid)?;
+    let preds = model.predict(&dgrid, Iterations::Best)?;
     let se = inference.standard_errors(&dgrid)?;
     let ci = inference.confidence_intervals(&dgrid, 0.05)?;
     let pi = inference.prediction_intervals(&dgrid, 0.05)?;

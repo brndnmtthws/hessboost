@@ -8,7 +8,48 @@ use crate::objective::distributional::Dist;
 use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, key};
 use crate::tree::scalar_tree_output;
 use rayon::prelude::*;
-use std::ops::{Range, RangeBounds};
+use std::ops::{Bound, Range, RangeBounds};
+
+/// The boosting iterations a prediction uses (XGBoost's `iteration_range`).
+///
+/// Every prediction method of [`BoostedModel`] takes one as
+/// `impl Into<Iterations>`, so a call passes either [`Iterations::Best`] or
+/// any Rust range of iteration indices: `..` is the whole model regardless
+/// of early stopping, `..n` the first `n` iterations, `2..5` iterations 2
+/// to 4 (`2..=4` and `2..` work too). The intercept / dataset
+/// `base_margin` is always included, so an empty range predicts it alone.
+///
+/// Leaf, contribution, and interaction predictions accept only ranges
+/// starting at iteration 0 (as in XGBoost); [`BoostedModel::slice`] cuts
+/// out a later start. [`Iterations::Best`] always starts there, so every
+/// prediction accepts it. A `gblinear` model has no boosting iterations to
+/// select and accepts only `..` (and [`Iterations::Best`], which is `..`
+/// for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Iterations {
+    /// The effective iterations: `..best_iteration + 1` after early
+    /// stopping, else every iteration (`..`).
+    #[default]
+    Best,
+    /// The iterations between two bounds, as any Rust range describes
+    /// them (the [`From`] conversion builds this from one).
+    Range {
+        /// First iteration (`Unbounded`: iteration 0).
+        start: Bound<usize>,
+        /// End of the range (`Unbounded`: through the last iteration).
+        end: Bound<usize>,
+    },
+}
+
+impl<R: RangeBounds<usize>> From<R> for Iterations {
+    fn from(range: R) -> Self {
+        Iterations::Range {
+            start: range.start_bound().cloned(),
+            end: range.end_bound().cloned(),
+        }
+    }
+}
 
 impl BoostedModel {
     /// Margins from the trees `trees` (tree ids) without validating `data`.
@@ -159,14 +200,21 @@ impl BoostedModel {
             );
     }
 
-    /// [`Self::predict`] from the boosting `iterations` only (see
-    /// [`Self::predict_margin_range`] for the range convention).
-    pub fn predict_range(
+    /// Predictions in the objective's reported space from the boosting
+    /// `iterations` ([`Iterations`]; [`Iterations::Best`] for the effective
+    /// ones). `multi:softprob` returns an `n_rows × num_class` probability
+    /// matrix while `multi:softmax` returns one class index per row,
+    /// encoded as `f32`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::predict_margin`].
+    pub fn predict(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
-        let margin = self.predict_margin_range(data, iterations)?;
+        let margin = self.predict_margin(data, iterations)?;
         Ok(transform_model_margins(
             &self.objective,
             self.max_delta_step,
@@ -179,9 +227,24 @@ impl BoostedModel {
     /// For single-output models this returns the transformed prediction rounded
     /// to the nearest class at 0.5. A multi-target model (label matrix) is
     /// multi-label: each target is thresholded at 0.5 independently, giving
-    /// `n_rows × n_targets` decisions laid out `[row][target]`.
-    pub fn predict_class(&self, data: &DMatrix) -> Result<Predictions<u32>> {
-        let probs = self.predict(data)?;
+    /// `n_rows × n_targets` decisions laid out `[row][target]`. Predicts
+    /// from the boosting `iterations` ([`Iterations`]).
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::predict_margin`].
+    pub fn predict_class(
+        &self,
+        data: &DMatrix,
+        iterations: impl Into<Iterations>,
+    ) -> Result<Predictions<u32>> {
+        Ok(self.classes(&self.predict(data, iterations)?))
+    }
+
+    /// The class decisions of [`Self::predict_class`] from the
+    /// predictions `probs` of [`Self::predict`] (shared with the GPU
+    /// predictor).
+    pub(crate) fn classes(&self, probs: &Predictions) -> Predictions<u32> {
         let k = self.n_outputs();
         if k == 1 || self.n_targets > 1 {
             let values = probs
@@ -189,7 +252,7 @@ impl BoostedModel {
                 .iter()
                 .map(|&p| u32::from(p > 0.5))
                 .collect();
-            return Ok(Predictions::new(values, probs.n_rows(), probs.width()));
+            return Predictions::new(values, probs.n_rows(), probs.width());
         }
         if self
             .objective
@@ -197,29 +260,38 @@ impl BoostedModel {
             .is_some_and(Objective::predicts_class_index)
         {
             let values = probs.as_slice().iter().map(|&class| class as u32).collect();
-            return Ok(Predictions::new(values, probs.n_rows(), 1));
+            return Predictions::new(values, probs.n_rows(), 1);
         }
         let values = probs
             .rows()
             .map(|row| crate::simd::argmax_scalar(row) as u32)
             .collect();
-        Ok(Predictions::new(values, probs.n_rows(), 1))
+        Predictions::new(values, probs.n_rows(), 1)
     }
 
-    /// [`Self::predict_leaf`] for the trees of the iterations in
-    /// `iterations` (shape `n_rows × trees`). As in XGBoost the range
-    /// must start at iteration `0`; use [`Self::slice`] for a later start.
+    /// Per-row leaf indices for each tree of the boosting `iterations`
+    /// (shape `n_rows × trees`, row-major, trees in [`Self::trees`] order).
+    /// `..` walks every tree regardless of early stopping;
+    /// [`Iterations::Best`] only the trees through `best_iteration`, like
+    /// the other predictions. As in XGBoost a range must start at
+    /// iteration `0`; use [`Self::slice`] for a later start.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
+    /// model, [`HessboostError::InvalidParameter`] for an out-of-range
+    /// `iterations` or one starting after iteration `0`.
     #[allow(
         clippy::redundant_closure_for_method_calls,
         reason = "the method path is not general enough over the block lifetime"
     )]
-    pub fn predict_leaf_range(
+    pub fn predict_leaf(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: impl Into<Iterations>,
     ) -> Result<Predictions<u32>> {
         self.validate_prediction_data(data)?;
-        let t = self.prefix_trees(iterations, "leaf prediction")?;
+        let t = self.prefix_trees(iterations.into(), "leaf prediction")?;
         let n = data.n_rows();
         let mut out = vec![0u32; n * t];
         if t == 0 {
@@ -238,19 +310,11 @@ impl BoostedModel {
         Ok(Predictions::new(out, n, t))
     }
 
-    /// Raw margin predictions using the effective iterations (`[0,
-    /// best_iteration + 1)` after early stopping, else all), laid out
-    /// `[row][output]` (`n_outputs` wide).
-    pub fn predict_margin(&self, data: &DMatrix) -> Result<Predictions> {
-        self.predict_margin_range(data, self.default_iteration_range())
-    }
-
-    /// Raw margin predictions from the boosting `iterations` only (XGBoost's
-    /// `iteration_range`), any range of iteration indices: `..` is the whole
-    /// model regardless of early stopping, `..n` the first `n` iterations,
-    /// `2..5` iterations 2 to 4. The intercept / dataset `base_margin` is
-    /// always included, so an empty range predicts it alone. A `gblinear`
-    /// model has no boosting iterations to select and accepts only `..`.
+    /// Raw margin predictions from the boosting `iterations`
+    /// ([`Iterations`]: [`Iterations::Best`] for the effective iterations,
+    /// `[0, best_iteration + 1)` after early stopping, else all; or a range
+    /// such as `..`, `..n`, `2..5`), laid out `[row][output]` (`n_outputs`
+    /// wide).
     ///
     /// For a model trained with model shrinkage
     /// ([`TrainingParams::model_shrink`](crate::config::TrainingParams::model_shrink)),
@@ -261,13 +325,19 @@ impl BoostedModel {
     /// trees. A dataset's `base_margin` replaces the shrunk intercepts (it
     /// is added to the trees' shrunk sum). Ranges starting after iteration 0
     /// are refused, since the ensemble is rescaled every iteration.
-    pub fn predict_margin_range(
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
+    /// model, [`HessboostError::InvalidParameter`] for an out-of-range
+    /// `iterations` (or, for a shrunk model, one starting after iteration 0).
+    pub fn predict_margin(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: impl Into<Iterations>,
     ) -> Result<Predictions> {
         self.validate_prediction_data(data)?;
-        let iterations = self.resolve_iterations(iterations, "iterations")?;
+        let iterations = self.resolve_iterations(iterations.into(), "iterations")?;
         if let Some(shrinkage) = &self.shrinkage {
             // Every later iteration rescaled the earlier ones, so the
             // iterations `a..b` alone are no model.
@@ -295,23 +365,40 @@ impl BoostedModel {
     /// tree order (the blocked traversal keeps that order per cell).
     fn shrunk_margins(&self, shrinkage: &Shrinkage, data: &DMatrix, k: usize) -> Vec<f32> {
         let mut out = shrinkage.start_margins(data);
-        let factors = &shrinkage.factors()[..k];
+        self.shrink_and_add(shrinkage, data, &mut out, 0..k);
+        shrinkage.finish_margins(data, &mut out);
+        out
+    }
+
+    /// Continue the shrunk margins `out` (before
+    /// [`Shrinkage::finish_margins`]) through `iterations`: every iteration
+    /// shrinks every margin and then adds its trees. Running `a..b` and then
+    /// `b..c` is running `a..c`: each cell sees the same operations in the
+    /// same order.
+    fn shrink_and_add(
+        &self,
+        shrinkage: &Shrinkage,
+        data: &DMatrix,
+        out: &mut [f32],
+        iterations: Range<usize>,
+    ) {
+        let factors = shrinkage.factors();
         let per = self.trees_per_iteration();
         let n_out = self.n_outputs();
-        let trees = 0..k * per;
+        let trees = iterations.start * per..iterations.end * per;
         let unit = |_: usize| 1.0f32;
         if self.trees[trees.clone()]
             .iter()
             .any(|tree| tree.linear_leaves().is_some())
         {
-            for (i, &factor) in factors.iter().enumerate() {
-                shrink_margins(&mut out, factor);
+            for i in iterations {
+                shrink_margins(out, factors[i]);
                 crate::tree::linear::accumulate_forest(
                     &self.trees,
                     i * per..(i + 1) * per,
                     |t| self.tree_output(t),
                     data,
-                    &mut out,
+                    out,
                     n_out,
                     unit,
                 );
@@ -321,12 +408,12 @@ impl BoostedModel {
             let parallel = self.num_parallel_tree;
             self.traverse_blocks(
                 data,
-                &mut out,
+                out,
                 n_out,
                 trees,
                 |block, forest, r, out_row| {
-                    for (i, &factor) in factors.iter().enumerate() {
-                        shrink_margins(out_row, factor);
+                    for i in iterations.clone() {
+                        shrink_margins(out_row, factors[i]);
                         let layer = i * per..(i + 1) * per;
                         if vector {
                             block.accumulate_row_vector(forest, r, layer, unit, out_row);
@@ -348,8 +435,42 @@ impl BoostedModel {
                 },
             );
         }
-        shrinkage.finish_margins(data, &mut out);
-        out
+    }
+
+    /// The margins of the models after each of the `ends` iterations
+    /// (ascending, each at most [`Self::num_boost_rounds`]), concatenated
+    /// `[member][row][output]`: bit for bit
+    /// [`Self::predict_margin`]`(data, ..end)` of every `end`, from one
+    /// pass over the trees. The trees of `..ends[0]`, then those up to
+    /// `ends[1]`, and so on, add onto the running margins, which are copied
+    /// out at every end; the accumulation adds each tree once per cell in
+    /// tree order either way (for a shrunk model, each iteration shrinks
+    /// before it adds), so a split pass sums what one pass over `..end`
+    /// does.
+    pub(crate) fn prefix_margins(&self, data: &DMatrix, ends: &[usize]) -> Result<Vec<f32>> {
+        self.validate_prediction_data(data)?;
+        let cells = data.n_rows() * self.n_outputs();
+        let mut margins = Vec::with_capacity(ends.len() * cells);
+        let mut start = 0;
+        if let Some(shrinkage) = &self.shrinkage {
+            let mut out = shrinkage.start_margins(data);
+            for &end in ends {
+                self.shrink_and_add(shrinkage, data, &mut out, start..end);
+                let member = margins.len();
+                margins.extend_from_slice(&out);
+                shrinkage.finish_margins(data, &mut margins[member..]);
+                start = end;
+            }
+        } else {
+            let mut out = self.initial_margins(data);
+            for &end in ends {
+                let trees = self.iteration_trees(start..end);
+                self.accumulate_forest(data, &mut out, trees, |ti| self.tree_weight(ti));
+                margins.extend_from_slice(&out);
+                start = end;
+            }
+        }
+        Ok(margins)
     }
 
     /// Refuse anything but the whole ensemble of a shrunk model, for the
@@ -372,35 +493,21 @@ impl BoostedModel {
         ))
     }
 
-    /// Predictions in the objective's reported space. `multi:softprob` returns
-    /// an `n_rows × num_class` probability matrix while `multi:softmax` returns
-    /// one class index per row, encoded as `f32`. Uses the effective
-    /// iterations, like [`Self::predict_margin`].
-    pub fn predict(&self, data: &DMatrix) -> Result<Predictions> {
-        self.predict_range(data, self.default_iteration_range())
-    }
-
     /// The predicted distribution of every row for a model trained with a
     /// distributional `dist:*` objective (beyond XGBoost, see
     /// [`crate::objective::distributional`]): one [`Dist`] per row, with its
     /// mean, variance, CDF, quantiles, log density, CRPS, intervals and
-    /// sampling. The margins are mapped through the links in `f64`. Uses the
-    /// effective iterations, like [`Self::predict`].
+    /// sampling. The margins, from the boosting `iterations`
+    /// ([`Iterations`]), are mapped through the links in `f64`.
     ///
     /// # Errors
     ///
     /// [`HessboostError::InvalidParameter`] if the model's objective is not
     /// a `dist:*` objective, plus the errors of [`Self::predict_margin`].
-    pub fn predict_distribution(&self, data: &DMatrix) -> Result<Vec<Dist>> {
-        self.predict_distribution_range(data, self.default_iteration_range())
-    }
-
-    /// [`Self::predict_distribution`] from the boosting iterations in
-    /// `iterations` only (see [`Self::predict_margin_range`]).
-    pub fn predict_distribution_range(
+    pub fn predict_distribution(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: impl Into<Iterations>,
     ) -> Result<Vec<Dist>> {
         let family = self
             .objective
@@ -415,7 +522,7 @@ impl BoostedModel {
                     ),
                 )
             })?;
-        let margin = self.predict_margin_range(data, iterations)?;
+        let margin = self.predict_margin(data, iterations)?;
         Ok(margin
             .as_slice()
             .chunks_exact(family.n_params())
@@ -427,13 +534,6 @@ impl BoostedModel {
                 family.dist_from_margins(&eta[..row.len()])
             })
             .collect())
-    }
-
-    /// Per-row leaf indices for each tree (shape `n_rows × num_trees`,
-    /// row-major, trees in [`Self::trees`] order). Walks every tree,
-    /// regardless of early stopping.
-    pub fn predict_leaf(&self, data: &DMatrix) -> Result<Predictions<u32>> {
-        self.predict_leaf_range(data, ..)
     }
 }
 
@@ -470,25 +570,43 @@ pub(crate) fn transform_model_margins(
 ) -> Predictions {
     let (n_rows, n_outputs) = (margin.n_rows(), margin.width());
     let mut values = margin.into_vec();
+    let width =
+        transform_margins_in_place(objective, max_delta_step, n_targets, &mut values, n_outputs);
+    values.truncate(n_rows * width);
+    Predictions::new(values, n_rows, width)
+}
+
+/// [`transform_model_margins`] in place: turns the margins `values`
+/// (`[row][output]`, `n_outputs` wide) into predictions and returns their
+/// width. For `multi:softmax` (width 1) the class indices fill the first
+/// `n_rows` values and the rest are left over.
+pub(crate) fn transform_margins_in_place(
+    objective: &ModelObjective,
+    max_delta_step: f64,
+    n_targets: usize,
+    values: &mut [f32],
+    n_outputs: usize,
+) -> usize {
     if let Some(Ok(loss)) = rebuild_objective(objective, max_delta_step, n_targets) {
-        loss.pred_transform(&mut values);
+        loss.pred_transform(values);
     }
     if objective
         .built_in()
         .is_some_and(Objective::predicts_class_index)
     {
-        let classes = values
-            .chunks_exact(n_outputs)
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map_or(0.0, |(i, _)| i as f32)
-            })
-            .collect();
-        return Predictions::new(classes, n_rows, 1);
+        // Row `r`'s class lands at index `r`, at or before the row's own
+        // values, so every row is read before it is overwritten.
+        for r in 0..values.len() / n_outputs {
+            let class = values[r * n_outputs..(r + 1) * n_outputs]
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map_or(0.0, |(i, _)| i as f32);
+            values[r] = class;
+        }
+        return 1;
     }
-    Predictions::new(values, n_rows, n_outputs)
+    n_outputs
 }
 
 /// Rows per prediction block: the block's feature rows stay in cache while

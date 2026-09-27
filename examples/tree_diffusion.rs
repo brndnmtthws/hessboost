@@ -72,7 +72,7 @@ fn normal_crps(train: &DMatrix, test: &DMatrix) -> Result<f64> {
         .model;
     let labels = test.labels().unwrap_or_default();
     let crps: Vec<f64> = model
-        .predict_distribution(test)?
+        .predict_distribution(test, Iterations::Best)?
         .iter()
         .zip(labels)
         .map(|(d, &y)| d.crps(f64::from(y)))

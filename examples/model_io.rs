@@ -23,7 +23,7 @@ fn main() -> Result<()> {
         .eta(0.2)
         .build()?;
     let model = train(&params, &d, 40)?;
-    let before = model.predict(&d)?;
+    let before = model.predict(&d, Iterations::Best)?;
 
     let dir = std::env::temp_dir();
     let bin = dir.join("hessboost_model.bin");
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         ("xgboost-json", &m_xgb),
         ("xgboost-ubj", &m_ubj),
     ] {
-        let after = m.predict(&d)?;
+        let after = m.predict(&d, Iterations::Best)?;
         let max_diff = before
             .as_slice()
             .iter()

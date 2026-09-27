@@ -797,6 +797,7 @@ fn erf(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Iterations;
     use crate::objective::gradient_pairs;
     use crate::objective::{Aft, Objective};
     use approx::assert_relative_eq;
@@ -991,8 +992,11 @@ mod tests {
         let model = train(&params, &d, 20).unwrap();
         assert_eq!(model.base_scores(), &[0.5f32.ln()]);
         // One value per row.
-        let pred = model.predict(&d).unwrap().into_vec();
-        let margin = model.predict_margin(&d).unwrap().into_vec();
+        let pred = model.predict(&d, Iterations::Best).unwrap().into_vec();
+        let margin = model
+            .predict_margin(&d, Iterations::Best)
+            .unwrap()
+            .into_vec();
         for (p, m) in pred.iter().zip(&margin) {
             assert_eq!(*p, m.exp());
         }

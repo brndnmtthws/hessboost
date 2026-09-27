@@ -126,12 +126,12 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
     let data = labeled_dense(&values, 2, &y);
     let params = base().linear_tree(LinearTree::default()).build().unwrap();
     let model = train(&params, &data, 6).unwrap();
-    let before = model.predict(&data).unwrap();
+    let before = model.predict(&data, Iterations::Best).unwrap();
 
     let from_bytes = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
-    assert_eq!(from_bytes.predict(&data).unwrap(), before);
+    assert_eq!(from_bytes.predict(&data, Iterations::Best).unwrap(), before);
     let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
-    assert_eq!(from_json.predict(&data).unwrap(), before);
+    assert_eq!(from_json.predict(&data, Iterations::Best).unwrap(), before);
 
     assert!(matches!(
         model.to_xgboost_json(),
@@ -141,9 +141,12 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
         model.to_xgboost_ubjson(),
         Err(HessboostError::ModelFormat(_))
     ));
-    assert_eq!(invalid_param(model.predict_contribs(&data)), "linear_tree");
     assert_eq!(
-        invalid_param(model.predict_interactions(&data)),
+        invalid_param(model.predict_contribs(&data, Iterations::Best)),
+        "linear_tree"
+    );
+    assert_eq!(
+        invalid_param(model.predict_interactions(&data, Iterations::Best)),
         "linear_tree"
     );
 }
@@ -204,7 +207,7 @@ fn vanishing_path_smoothing_approaches_the_unsmoothed_tree() {
         .unwrap();
     let preds = train(&params, &data, 1)
         .unwrap()
-        .predict(&data)
+        .predict(&data, Iterations::Best)
         .unwrap()
         .into_vec(); // one value per row
     assert!(
@@ -235,7 +238,10 @@ fn categorical_splits_keep_their_monotone_leaves() {
             .base_score(0.0)
             .build()
             .unwrap();
-        let preds = train(&params, &data, 1).unwrap().predict(&data).unwrap();
+        let preds = train(&params, &data, 1)
+            .unwrap()
+            .predict(&data, Iterations::Best)
+            .unwrap();
         assert_eq!(
             preds.as_slice(),
             [0.0, 0.0, 2.0, 2.0],
@@ -260,7 +266,12 @@ fn categorical_splits_with_unrepresentable_gains_are_skipped() {
         base().path_smooth(1.0),
     ] {
         let params = builder.base_score(0.0).build().unwrap();
-        let preds = |data: &DMatrix| train(&params, data, 1).unwrap().predict(data).unwrap();
+        let preds = |data: &DMatrix| {
+            train(&params, data, 1)
+                .unwrap()
+                .predict(data, Iterations::Best)
+                .unwrap()
+        };
         assert_eq!(preds(&categorical), preds(&numerical));
     }
 }

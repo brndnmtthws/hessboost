@@ -731,6 +731,7 @@ mod tests {
     use super::super::test_support::{gp, grow_exact, monotone_v_shape_data, non_decreasing};
     use super::*;
     use crate::config::TrainingParams;
+    use crate::model::Iterations;
     use crate::objective::{Objective, RegLoss};
 
     /// A clean separable problem: feature 0 perfectly separates the sign of the
@@ -907,9 +908,9 @@ mod tests {
             }
         }
         assert!(n_splits > 0, "the model should have split");
-        let pred = model.predict(&data).unwrap();
+        let pred = model.predict(&data, Iterations::Best).unwrap();
         let back = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
-        assert_eq!(back.predict(&data).unwrap(), pred);
+        assert_eq!(back.predict(&data, Iterations::Best).unwrap(), pred);
         pred.into_vec()
     }
 

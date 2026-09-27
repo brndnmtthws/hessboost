@@ -114,7 +114,7 @@ fn training_and_inference_are_identical_across_thread_counts() {
         )
         .unwrap();
         (
-            model.predict(&points).unwrap(),
+            model.predict(&points, Iterations::Best).unwrap(),
             inference.confidence_intervals(&points, 0.1).unwrap(),
         )
     };
@@ -132,7 +132,10 @@ fn the_boulevard_record_survives_the_native_formats_but_not_slicing() {
     ];
     for m in &reloaded {
         assert_eq!(m.boulevard(), Some(&info));
-        assert_eq!(m.predict(&dtrain).unwrap(), model.predict(&dtrain).unwrap());
+        assert_eq!(
+            m.predict(&dtrain, Iterations::Best).unwrap(),
+            model.predict(&dtrain, Iterations::Best).unwrap()
+        );
     }
     // A prefix of a Boulevard average is not one, and neither is a
     // continuation of it.
@@ -268,8 +271,8 @@ fn no_truncation_is_none() {
     let clipped = train(&truncated, &dtrain, 4).unwrap();
     assert_eq!(clipped.boulevard().unwrap().truncation, Some(0.2));
     assert_ne!(
-        clipped.predict(&dtrain).unwrap(),
-        model.predict(&dtrain).unwrap()
+        clipped.predict(&dtrain, Iterations::Best).unwrap(),
+        model.predict(&dtrain, Iterations::Best).unwrap()
     );
 }
 
@@ -293,7 +296,7 @@ fn inference_outputs_are_typed_per_row() {
     let ci: Vec<hessboost::conformal::Interval<f64>> =
         inference.confidence_intervals(&points, 0.1).unwrap();
     let pi = inference.prediction_intervals(&points, 0.1).unwrap();
-    let preds = model.predict(&points).unwrap();
+    let preds = model.predict(&points, Iterations::Best).unwrap();
     assert_eq!((ci.len(), pi.len()), (7, 7));
     for ((c, p), &y) in ci.iter().zip(&pi).zip(preds.as_slice()) {
         let center = f64::midpoint(c.lower, c.upper);
@@ -389,8 +392,8 @@ fn the_round_hook_sees_every_round_and_break_keeps_a_boulevard_average() {
     let ten = train(&params, &dtrain, 10).unwrap();
     assert_eq!(stopped.num_boost_rounds(), 10);
     assert_eq!(
-        stopped.predict(&dtrain).unwrap(),
-        ten.predict(&dtrain).unwrap()
+        stopped.predict(&dtrain, Iterations::Best).unwrap(),
+        ten.predict(&dtrain, Iterations::Best).unwrap()
     );
     assert!(stopped.boulevard().is_some());
 }

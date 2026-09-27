@@ -85,7 +85,7 @@ with squared-error and logistic round-0 Hessians).
      `n_rows` training rows relabelled `y`; hessboost refreshes the imported
      model (and, for `exact`-tier cases, its own) with `Trainer::init_model`.
    - `ranges` / `range_contribs` / `slices`: `iteration_range=(begin, end)`
-     margins (hessboost's `predict_margin_range(begin..end)`), prefix-range
+     margins (hessboost's `predict_margin(data, begin..end)`), prefix-range
      contributions and leaf indices on the contribution rows, and
      `booster[begin:end:step]` margins (`slice(begin..end, step)`). Checked
      on the imported model (leaf ids included) and, for `exact`-tier cases,

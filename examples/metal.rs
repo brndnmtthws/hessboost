@@ -83,8 +83,8 @@ fn metal_main() -> hessboost::error::Result<()> {
     let batch = dataset(500_000, 11)?;
 
     // Correctness first: the GPU predictions are bit-identical.
-    let cpu = model.predict(&batch)?;
-    let metal = gpu.predict(&batch)?;
+    let cpu = model.predict(&batch, Iterations::Best)?;
+    let metal = gpu.predict(&batch, Iterations::Best)?;
     assert_eq!(cpu, metal, "GPU predictions must be bit-identical");
     println!("GPU predictions match the CPU's bit for bit");
 
@@ -92,10 +92,10 @@ fn metal_main() -> hessboost::error::Result<()> {
     let (mut cpu_best, mut gpu_best) = (f64::INFINITY, f64::INFINITY);
     for _ in 0..3 {
         let t = std::time::Instant::now();
-        let _ = model.predict(&batch)?;
+        let _ = model.predict(&batch, Iterations::Best)?;
         cpu_best = cpu_best.min(t.elapsed().as_secs_f64());
         let t = std::time::Instant::now();
-        let _ = gpu.predict(&batch)?;
+        let _ = gpu.predict(&batch, Iterations::Best)?;
         gpu_best = gpu_best.min(t.elapsed().as_secs_f64());
     }
     println!(

@@ -59,7 +59,7 @@ fn contributions_survive_a_later_constant_tree() {
     let row = DMatrix::from_dense(&[0.7f32], 1, 1).unwrap();
 
     // One row of [feature 0, bias].
-    let contribs = model.predict_contribs(&row).unwrap();
+    let contribs = model.predict_contribs(&row, Iterations::Best).unwrap();
     assert_eq!(
         (
             contribs.n_rows(),
@@ -95,9 +95,9 @@ fn zero_cover_splits_average_their_children() {
     let row = DMatrix::from_dense(&[0.7f32, 0.2], 1, 2).unwrap();
 
     // E[f] = 0.5 * -1 + 0.25 * 2 + 0.25 * 4 = 1; margin 2.
-    let contribs = model.predict_contribs(&row).unwrap();
+    let contribs = model.predict_contribs(&row, Iterations::Best).unwrap();
     assert_eq!(contribs.as_slice(), [1.75, -0.75, 1.0]);
-    let interactions = model.predict_interactions(&row).unwrap();
+    let interactions = model.predict_interactions(&row, Iterations::Best).unwrap();
     let want = [2.0, -0.25, 0.0, -0.25, -0.5, 0.0, 0.0, 0.0, 1.0];
     for (got, want) in interactions.as_slice().iter().zip(want) {
         assert!((got - want).abs() < 1e-6, "{interactions:?}");
@@ -130,18 +130,24 @@ fn repeated_feature_basis_update_stays_finite() {
         1,
     );
     let row = DMatrix::from_dense(&[0.2f32], 1, 1).unwrap();
-    assert_eq!(model.predict_margin(&row).unwrap().as_slice(), [1.0]);
+    assert_eq!(
+        model
+            .predict_margin(&row, Iterations::Best)
+            .unwrap()
+            .as_slice(),
+        [1.0]
+    );
 
     // E[f] = 2^-128, so feature 0 carries the whole margin.
     let bias = cover(128) as f32;
     assert!(bias > 0.0);
-    let contribs = model.predict_contribs(&row).unwrap();
+    let contribs = model.predict_contribs(&row, Iterations::Best).unwrap();
     assert_eq!(contribs.bias(0, 0), Some(bias), "{contribs:?}");
     assert!(
         (contribs.get(0, 0).unwrap()[0] - 1.0).abs() < 1e-6,
         "{contribs:?}"
     );
-    let interactions = model.predict_interactions(&row).unwrap();
+    let interactions = model.predict_interactions(&row, Iterations::Best).unwrap();
     assert_eq!(interactions.at(0, 0, 1, 1), Some(bias), "{interactions:?}");
     assert!(
         (interactions.at(0, 0, 0, 0).unwrap() - 1.0).abs() < 1e-6,
@@ -174,18 +180,24 @@ fn vector_leaf_bias_accumulates_leaves_top_down() {
     );
     let model = BoostedModel::from_json(&model_json).unwrap();
     let row = DMatrix::from_dense(&[0.7f32, 0.7], 1, 2).unwrap();
-    assert_eq!(model.predict_margin(&row).unwrap().as_slice(), [1.0, 0.0]);
+    assert_eq!(
+        model
+            .predict_margin(&row, Iterations::Best)
+            .unwrap()
+            .as_slice(),
+        [1.0, 0.0]
+    );
 
     let third = (1.0f64 / 3.0) as f32;
     // Per output: [x0, x1, bias].
-    let contribs = model.predict_contribs(&row).unwrap();
+    let contribs = model.predict_contribs(&row, Iterations::Best).unwrap();
     assert_eq!(
         [contribs.bias(0, 0), contribs.bias(0, 1)],
         [Some(third), Some(0.0)],
         "{contribs:?}"
     );
     // Per output: a 3 × 3 matrix with the bias in its last cell.
-    let interactions = model.predict_interactions(&row).unwrap();
+    let interactions = model.predict_interactions(&row, Iterations::Best).unwrap();
     assert_eq!(
         [interactions.at(0, 0, 2, 2), interactions.at(0, 1, 2, 2)],
         [Some(third), Some(0.0)],

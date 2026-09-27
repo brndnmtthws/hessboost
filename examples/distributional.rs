@@ -16,7 +16,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 mod common;
-use common::lcg;
+use common::{coverage, lcg};
 
 /// `y = 2 sin(2π x0) + (0.1 + x1) · ε`, `ε ~ N(0, 1)`: the noise scale grows
 /// with `x1`.
@@ -50,17 +50,7 @@ fn mean_nll(dists: &[Dist], data: &DMatrix) -> f64 {
 
 /// Coverage and mean width of `intervals` on `data`.
 fn summarize(intervals: &[(f64, f64)], data: &DMatrix) -> (f64, f64) {
-    let labels = data.labels().unwrap_or_default();
-    let covered = intervals
-        .iter()
-        .zip(labels)
-        .filter(|&(&(lo, hi), &y)| lo <= f64::from(y) && f64::from(y) <= hi)
-        .count();
-    let width: f64 = intervals.iter().map(|(lo, hi)| hi - lo).sum();
-    (
-        covered as f64 / labels.len() as f64,
-        width / labels.len() as f64,
-    )
+    coverage(intervals.iter().copied(), data.labels().unwrap_or_default())
 }
 
 fn main() -> Result<()> {

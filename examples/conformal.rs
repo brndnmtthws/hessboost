@@ -13,7 +13,7 @@ use hessboost::objective::{CustomLoss, GradPair};
 use hessboost::prelude::*;
 
 mod common;
-use common::lcg;
+use common::{lcg, normal};
 
 /// `y = sin(2π x0) + (0.1 + x1) · ε` with `ε` roughly standard normal: the
 /// noise scale grows with `x1`.
@@ -23,8 +23,7 @@ fn dataset(n: usize, seed: u64) -> Result<DMatrix> {
     let mut y = Vec::with_capacity(n);
     for _ in 0..n {
         let (x0, x1) = (next(), next());
-        // Sum of 12 uniforms minus 6: mean 0, variance 1.
-        let eps: f32 = (0..12).map(|_| next()).sum::<f32>() - 6.0;
+        let eps = normal(&mut next);
         x.extend_from_slice(&[x0, x1]);
         y.push((std::f32::consts::TAU * x0).sin() + (0.1 + x1) * eps);
     }
@@ -33,15 +32,12 @@ fn dataset(n: usize, seed: u64) -> Result<DMatrix> {
 
 /// Fraction of rows whose label lies in its interval, and the mean width.
 fn summarize(intervals: &[Interval], data: &DMatrix) -> (f64, f64) {
-    let labels = data.labels().unwrap_or_default();
-    let covered = intervals
-        .iter()
-        .zip(labels)
-        .filter(|&(i, &y)| i.lower <= y && y <= i.upper)
-        .count();
-    let width: f64 = intervals.iter().map(|i| f64::from(i.upper - i.lower)).sum();
-    let n = intervals.len() as f64;
-    (covered as f64 / n, width / n)
+    common::coverage(
+        intervals
+            .iter()
+            .map(|i| (f64::from(i.lower), f64::from(i.upper))),
+        data.labels().unwrap_or_default(),
+    )
 }
 
 fn main() -> Result<()> {

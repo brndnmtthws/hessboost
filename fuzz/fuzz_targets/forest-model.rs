@@ -11,6 +11,9 @@ use hessboost::diffusion::forest::{ForestMethod, ForestModel};
 use hessboost::prelude::*;
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common.rs"]
+mod common;
+
 /// `b"HBFF"` and the container version (`diffusion/forest/format.rs`).
 const HEADER: &[u8] = b"HBFF\x01";
 /// Largest model the target samples from: a fuzzed header can claim any
@@ -23,28 +26,29 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
-    let model = match mode {
-        0 => ForestModel::from_bytes(rest),
-        1 => {
-            let mut container = [HEADER, rest].concat();
-            let checksum = xxhash_rust::xxh64::xxh64(&container, 0);
-            container.extend_from_slice(&checksum.to_le_bytes());
-            ForestModel::from_bytes(&container)
-        }
-        _ => match std::str::from_utf8(rest) {
-            Ok(text) => ForestModel::from_json(text),
-            Err(_) => return,
-        },
+    let Some(model) = common::parse_mode(
+        mode,
+        rest,
+        HEADER,
+        ForestModel::from_bytes,
+        ForestModel::from_json,
+    ) else {
+        return;
     };
     let Ok(model) = model else {
         return;
     };
+    common::round_trip(
+        &model,
+        |model| model.to_bytes(),
+        ForestModel::from_bytes,
+        |model| model.to_json(),
+        ForestModel::from_json,
+        |model, from_bytes| assert_eq!(from_bytes.method(), model.method()),
+    );
     let from_bytes = ForestModel::from_bytes(&model.to_bytes().expect("an accepted model saves"))
         .expect("a saved model loads");
-    let from_json = ForestModel::from_json(&model.to_json().expect("an accepted model saves"))
-        .expect("a saved model loads");
-    assert_eq!(from_bytes.method(), model.method());
-    assert_eq!(from_json.classes(), model.classes());
+    assert_eq!(from_bytes.classes(), model.classes());
     let trees: usize = model.gbdts().iter().map(BoostedModel::num_trees).sum();
     if model.n_t() > MAX_LEVELS || model.n_columns() > MAX_COLUMNS || trees > MAX_TREES {
         return;

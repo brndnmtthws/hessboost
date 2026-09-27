@@ -26,6 +26,28 @@ pub fn fill_random(mut rng: impl FnMut() -> f32, out: &mut [f32]) {
     }
 }
 
+/// Sum twelve LCG draws, matching the examples' original Gaussian approximation.
+pub fn normal(mut rng: impl FnMut() -> f32) -> f32 {
+    let mut sum = 0.0;
+    for _ in 0..12 {
+        sum += rng();
+    }
+    sum - 6.0
+}
+
+/// Coverage and mean interval width for predictions aligned with labels.
+pub fn coverage(intervals: impl Iterator<Item = (f64, f64)>, labels: &[f32]) -> (f64, f64) {
+    let mut covered = 0;
+    let mut width = 0.0;
+    for ((lower, upper), &label) in intervals.zip(labels) {
+        let label = f64::from(label);
+        covered += usize::from(lower <= label && label <= upper);
+        width += upper - lower;
+    }
+    let n = labels.len() as f64;
+    (covered as f64 / n, width / n)
+}
+
 /// Fraction of rows where the predicted class equals the label.
 pub fn accuracy(classes: &[u32], labels: &[f32]) -> f32 {
     classes

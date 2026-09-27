@@ -21,6 +21,7 @@ what the published crate ships.
 
 ```sh
 cargo fmt --all --check
+cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # CI checks the fuzz crate too
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --all-features
 cargo test --doc --all-features   # nextest skips doctests

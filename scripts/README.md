@@ -137,6 +137,8 @@ Fixtures are not checked in; CI regenerates them (`.github/workflows/ci.yml`,
 job `parity`). The generator refuses any XGBoost version other than 3.4.2, pinned in
 `requirements-xgboost.txt` (a source build: 3.4.2 has no PyPI wheel).
 
+Fixture generators share deterministic seed, dtype-explicit JSON-float, dense-array, and compact JSON-writing helpers in `_fixture_common.py`; their case matrices and data distributions remain separate. `gen_lightgbm_fixtures.py --test-data` is parsed as a command-line option and regenerates the checked-in small models under `tests/data/`.
+
 ## LightGBM import parity
 
 `gen_lightgbm_fixtures.py` trains **real LightGBM 4.7.0**

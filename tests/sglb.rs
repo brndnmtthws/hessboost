@@ -347,6 +347,47 @@ fn langevin_training_is_thread_count_independent() {
     assert_ne!(serial, train(&plain, &data, 6).unwrap().to_bytes().unwrap());
 }
 
+/// A leaf whose Hessian sum is below `min_child_weight` weighs `0`
+/// (XGBoost's `CalcWeight`) also when its leaves are re-estimated with
+/// Langevin noise, which it does not receive (as CatBoost skips leaves
+/// without data): a root that cannot form a leaf predicts what the
+/// noise-free scalar trees do, the shrunk intercepts.
+#[test]
+fn renewed_leaves_keep_min_child_weight() {
+    let x = [0.0, 1.0, 2.0, 3.0];
+    let scalar = common::labeled_dense(&x, 1, &[5.0, 6.0, 7.0, 8.0]);
+    let matrix = DMatrix::from_dense(&x, 4, 1)
+        .unwrap()
+        .with_label_matrix(&[5.0, -1.0, 6.0, -2.0, 7.0, -3.0, 8.0, -4.0], 2)
+        .unwrap();
+    let params = |strategy, langevin: bool| {
+        let builder = TrainingParams::builder()
+            .base_score(0.5)
+            .min_child_weight(10.0)
+            .multi_strategy(strategy)
+            .model_shrink(shrink(0.1, ModelShrinkMode::Constant));
+        let builder = if langevin {
+            builder.langevin(Langevin::default())
+        } else {
+            builder
+        };
+        builder.build().unwrap()
+    };
+    for (strategy, data) in [
+        (MultiStrategy::OneOutputPerTree, &scalar),
+        (MultiStrategy::OneOutputPerTree, &matrix),
+        (MultiStrategy::MultiOutputTree, &matrix),
+    ] {
+        let noisy = train(&params(strategy, true), data, 3).unwrap();
+        let plain = train(&params(MultiStrategy::OneOutputPerTree, false), data, 3).unwrap();
+        assert_eq!(
+            bits(noisy.predict_margin(data).unwrap()),
+            bits(plain.predict_margin(data).unwrap()),
+            "{strategy:?}"
+        );
+    }
+}
+
 /// Every format keeps a shrunk model's predictions (the native and compact
 /// ones bit for bit, XGBoost's closed form within `f32` rounding), and the
 /// native ones keep its truncations; an inconsistent shrinkage record is

@@ -32,7 +32,9 @@
 //!    XGBoost's leaf weight `-Tα(G) / (H + λ)` (clamped to
 //!    `max_delta_step`). The paper draws the structure and the leaf noise
 //!    independently so that the tree distribution does not depend on the
-//!    leaf noise.
+//!    leaf noise. A leaf whose Hessian sum is below `min_child_weight` (or
+//!    not positive) weighs `0`, as in XGBoost's `CalcWeight`, and gets no
+//!    noise, as CatBoost skips the leaves it cannot estimate (no data).
 //!
 //! Every draw is a keyed standard normal ([`crate::rng::keyed_normal`]):
 //! structure noise by `(seed, iteration)` and `row * n_outputs + output`,
@@ -222,6 +224,14 @@ impl Langevin {
             }
             for (out, value) in values.iter_mut().enumerate() {
                 let GradStats { grad, hess } = stats[node * width + out];
+                // XGBoost's `CalcWeight` weighs a leaf below
+                // `min_child_weight` (or without positive Hessian) `0`; like
+                // the leaves without data CatBoost's
+                // `AddLangevinNoiseToLeafNewtonSum` skips, it gets no noise.
+                if hess < self.reg.min_child_weight || hess <= 0.0 {
+                    *value = 0.0;
+                    continue;
+                }
                 let scale = self.sigma * (hess.abs() + self.reg.lambda).sqrt();
                 let z = keyed_normal(key, (node * width + out) as u64);
                 *value = xgb_calc_weight(GradStats::new(grad + scale * z, hess), &self.reg) as f32;

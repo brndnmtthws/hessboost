@@ -32,7 +32,7 @@ use super::{BinIndex, PARALLEL_THRESHOLD, REDUCE_BINS, ROWS_PER_TASK, feature_sl
 use crate::config::QuantizedGrad;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
-use crate::rng::{GOLDEN, mix64};
+use crate::rng::{keyed_unit, mix64};
 use crate::tree::gain::GradStats;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -43,14 +43,6 @@ const QUANTIZE_CHUNK: usize = 8192;
 /// Stream salts separating the gradient and Hessian rounding variates.
 const GRAD_STREAM: u64 = 0x6772_6164_5F71_6E74;
 const HESS_STREAM: u64 = 0x6865_7373_5F71_6E74;
-
-/// Uniform variate in `[0, 1)` for `row` of the stream keyed by `key`
-/// (SplitMix64 at position `row + 1`, top 53 bits).
-#[inline]
-fn uniform(key: u64, row: usize) -> f64 {
-    let bits = mix64(key.wrapping_add((row as u64).wrapping_add(1).wrapping_mul(GOLDEN)));
-    (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
-}
 
 /// Round `x` to an adjacent integer toward or away from zero: truncating
 /// `x + u` (`x ≥ 0`) or `x − u` (`x < 0`) returns `⌈x⌉` with probability
@@ -149,7 +141,10 @@ impl QuantizedGradients {
                 for (i, (o, gp)) in out.iter_mut().zip(grads).enumerate() {
                     let row = first + i;
                     let (ug, uh) = if stochastic {
-                        (uniform(grad_key, row), uniform(hess_key, row))
+                        (
+                            keyed_unit(grad_key, row as u64),
+                            keyed_unit(hess_key, row as u64),
+                        )
                     } else {
                         (0.5, 0.5)
                     };
@@ -577,8 +572,8 @@ mod tests {
     fn gradients(n: usize, seed: u64) -> Vec<GradPair> {
         (0..n)
             .map(|i| {
-                let a = uniform(seed, i) as f32;
-                let b = uniform(seed ^ 1, i) as f32;
+                let a = keyed_unit(seed, i as u64) as f32;
+                let b = keyed_unit(seed ^ 1, i as u64) as f32;
                 gp(4.0 * a - 1.5, 0.05 + b)
             })
             .collect()
@@ -590,7 +585,7 @@ mod tests {
                 if missing && i % 7 == 3 {
                     f32::NAN
                 } else {
-                    uniform(99, i) as f32
+                    keyed_unit(99, i as u64) as f32
                 }
             })
             .collect();

@@ -4,7 +4,7 @@
 
 use super::{FlowPath, Sde, TimeSampling};
 use crate::error::{HessboostError, Result};
-use crate::rng::{GOLDEN, Rng, mix64};
+use crate::rng::{Rng, keyed_unit};
 
 /// Smallest time drawn for training and the end point of reverse-time
 /// integration (Treeffuser's and DiffGBM's `EPS`).
@@ -252,10 +252,7 @@ fn box_muller(u1: f64, u2: f64) -> (f64, f64) {
 /// draw depends on its row, sample, step, and output only (never on
 /// batching or the thread count).
 pub(super) fn keyed_normal(key: u64, counter: u64) -> f64 {
-    let uniform = |i: u64| {
-        let bits = mix64(key.wrapping_add(i.wrapping_add(1).wrapping_mul(GOLDEN)));
-        (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
-    };
+    let uniform = |i: u64| keyed_unit(key, i);
     let pair = counter.wrapping_mul(2);
     box_muller(uniform(pair), uniform(pair.wrapping_add(1))).0
 }

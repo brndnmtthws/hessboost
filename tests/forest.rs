@@ -2,7 +2,9 @@
 //! generated rows' structure and validity, imputation, determinism,
 //! persistence, and refusals.
 
-use hessboost::config::{BalancedBagging, ProcessType, QueryBagging, Refresh};
+use hessboost::config::{
+    BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
+};
 use hessboost::diffusion::forest::{ColumnKind, ForestMethod, ForestModel, ForestParams, Repaint};
 use hessboost::objective::{LambdaRank, Logistic};
 use hessboost::prelude::*;
@@ -286,6 +288,32 @@ fn row_bagging_training_params_are_refused() {
             ));
             assert!(matches!(
                 ForestModel::fit(&params, &data),
+                Err(HessboostError::InvalidParameter { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn single_label_boosters_on_several_columns_are_refused() {
+    // Each noise level fits one GBDT on a label matrix of every column;
+    // `booster = boulevard` and `booster = ebm` regress one label column
+    // only, so a table of several columns is refused by `fit`, not trained
+    // or panicked on.
+    let (x, y) = table(60, 6);
+    for booster in [
+        BoosterKind::Boulevard(Boulevard::default()),
+        BoosterKind::Ebm(Ebm::default()),
+    ] {
+        for base in [ForestParams::diffusion(), ForestParams::default()] {
+            let mut params = quick(base);
+            params.training = TrainingParams::builder()
+                .booster(booster)
+                .eta(0.8)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                ForestModel::fit(&params, &labelled(&x, &y)),
                 Err(HessboostError::InvalidParameter { .. })
             ));
         }

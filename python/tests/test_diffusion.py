@@ -9,10 +9,10 @@ from typing import Any
 
 import numpy as np
 import pytest
-from conftest import frame, reorder_colors
 from numpy.typing import NDArray
 
 import hessboost
+from conftest import frame, reorder_colors
 from hessboost import DMatrix, HessboostError, ModelFormatError
 from hessboost.diffusion import (
     DiffusionModel,
@@ -79,7 +79,8 @@ def test_samples_recover_both_modes(fitted: tuple[DiffusionModel, NDArray[np.flo
         values = draws[row, :, 0]
         upper = np.sum(np.abs(values - (1 + x)) < 0.5)
         lower = np.sum(np.abs(values + (1 + x)) < 0.5)
-        assert upper > 70 and lower > 70, (upper, lower)
+        assert upper > 70, (upper, lower)
+        assert lower > 70, (upper, lower)
         assert upper + lower > 220
 
 
@@ -196,9 +197,9 @@ def test_invalid_configurations_are_refused() -> None:
     with pytest.raises(HessboostError, match="squarederror"):
         DiffusionParams(training={"objective": "reg:absoluteerror"})
     with pytest.raises(HessboostError, match="parameterization"):
-        Score(parameterization="edm")  # type: ignore[arg-type]
+        Score(parameterization="edm")  # ty: ignore[invalid-argument-type]
     with pytest.raises(HessboostError, match="solver"):
-        FlowMatching(solver="rk4")  # type: ignore[arg-type]
+        FlowMatching(solver="rk4")  # ty: ignore[invalid-argument-type]
     with pytest.raises(HessboostError, match="n_steps"):
         DiffusionParams(n_steps=-1)
     # A training mapping from scratch starts at XGBoost's defaults.
@@ -210,25 +211,25 @@ def test_invalid_configurations_are_refused() -> None:
 
 def test_wrong_types_raise_type_error() -> None:
     with pytest.raises(TypeError, match="method"):
-        DiffusionParams(method="score")  # type: ignore[arg-type]
+        DiffusionParams(method="score")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="n_steps"):
-        DiffusionParams(n_steps="5")  # type: ignore[arg-type]
+        DiffusionParams(n_steps="5")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="n_repeats"):
         DiffusionParams(n_repeats=True)
     with pytest.raises(TypeError, match="training"):
-        DiffusionParams(training=[("eta", 0.1)])  # type: ignore[arg-type]
+        DiffusionParams(training=[("eta", 0.1)])  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="sde"):
-        Score(sde="variance_exploding")  # type: ignore[arg-type]
+        Score(sde="variance_exploding")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="sigma_min"):
-        VarianceExploding(sigma_min="0.01")  # type: ignore[arg-type]
+        VarianceExploding(sigma_min="0.01")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="early_stopping"):
-        DiffusionParams(early_stopping=(50, 0.1))  # type: ignore[arg-type]
+        DiffusionParams(early_stopping=(50, 0.1))  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="DiffusionParams"):
-        DiffusionModel.fit({"n_steps": 5}, *bimodal(10, 0))  # type: ignore[arg-type]
+        DiffusionModel.fit({"n_steps": 5}, *bimodal(10, 0))  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
         DiffusionModel()
     with pytest.raises(TypeError):
-        DiffusionModel.from_json(b"{}")  # type: ignore[arg-type]
+        DiffusionModel.from_json(b"{}")  # ty: ignore[invalid-argument-type]
 
 
 def test_unsupported_data_is_refused(fitted: tuple[DiffusionModel, NDArray[np.float64]]) -> None:
@@ -258,6 +259,15 @@ def test_unsupported_data_is_refused(fitted: tuple[DiffusionModel, NDArray[np.fl
         mean(np.full((1, 2, 1), np.nan))
 
 
+def test_summaries_of_no_rows_are_empty() -> None:
+    # Zero rows leave the sample count unbounded by the array's size: the
+    # summaries must not allocate by it.
+    empty = np.empty((0, 2**40, 1), dtype=np.float32)
+    assert mean(empty).shape == (0, 1)
+    assert quantiles(empty, [0.1, 0.9]).shape == (0, 2, 1)
+    assert crps(empty, np.empty((0, 1))).shape == (0, 1)
+
+
 def test_damaged_models_are_refused(
     fitted: tuple[DiffusionModel, NDArray[np.float64]], tmp_path: Path
 ) -> None:
@@ -269,6 +279,5 @@ def test_damaged_models_are_refused(
         DiffusionModel.from_json(model.to_json()[:-10])
     with pytest.raises(ModelFormatError):
         DiffusionModel.from_bytes(hessboost.train({}, DMatrix(*bimodal(20, 0)), 2).save_raw())
-    with pytest.raises(OSError):
+    with pytest.raises(FileNotFoundError):
         DiffusionModel.load_binary(tmp_path / "missing.hbdm")
-

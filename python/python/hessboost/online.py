@@ -174,10 +174,11 @@ class OnlineModel:
         Raises:
             HessboostError: The refusals of :meth:`train`, or ``booster`` is
                 not a model ``params`` could have trained on ``dtrain``
-                (another objective, several outputs, weighted or categorical
-                trees, linear leaves such as an imported LightGBM
-                ``linear_tree`` model's, another feature count or other
-                features).
+                (another objective or ``max_delta_step``, several outputs,
+                weighted trees, categorical trees with ``tolerance > 0``,
+                linear leaves such as an imported LightGBM ``linear_tree``
+                model's, another feature count or other features), or it was
+                early-stopped (slice it to its best iterations first).
         """
         if not isinstance(booster, Booster):
             raise TypeError(f"booster must be a Booster, got {type(booster).__name__}")
@@ -244,8 +245,11 @@ class OnlineModel:
             HessboostError: The model is being updated, or the change is
                 refused: out-of-range or repeated deletions, deleting every
                 row, additions without labels or with metadata or other
-                features, or updated data retraining refuses (such as labels
-                outside the objective's domain).
+                features, (with ``tolerance > 0``) added values beyond the
+                training data's bins, or updated data retraining refuses
+                (such as labels outside the objective's domain).
+            ModelFormatError: The update overflows ``float32`` (extreme
+                labels or margins), as training refuses such a model.
             KeyboardInterrupt: The update was interrupted.
         """
         matrix = None

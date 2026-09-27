@@ -1,12 +1,14 @@
 //! The option groups of [`TrainingParams`](super::TrainingParams): settings
 //! that only mean something when a switch is on live inside that switch
 //! (`BoosterKind::Dart(Dart)`, `BoosterKind::Boulevard(Boulevard)`,
-//! `BoosterKind::Ebm(Ebm)`, `ProcessType::Update(Refresh)`,
+//! `BoosterKind::Ebm(Ebm)` (with `Option<EbmEarlyStopping>`), `ProcessType::Update(Refresh)`,
 //! `Option<QuantizedGrad>`, `Option<ExtraTrees>`, `Option<LinearTree>`,
 //! `Option<BalancedBagging>`, `Option<QueryBagging>`, `Option<Langevin>`,
 //! `Option<ModelShrink>`), so
 //! they cannot be set while the switch is off. Each validates its values
 //! when built.
+
+use std::num::NonZeroUsize;
 
 use crate::error::{HessboostError, Result};
 
@@ -214,8 +216,65 @@ impl BoulevardBuilder {
 /// training rows while the bags train.
 const MAX_EBM_OUTER_BAGS: usize = 1024;
 
-/// Default [`Ebm::early_stopping_tolerance`] (InterpretML's).
-const EBM_EARLY_STOPPING_TOLERANCE: f64 = 1e-5;
+/// Per-bag early stopping of a classic EBM ([`Ebm::early_stopping`]) on
+/// the bag's held-out rows (the `1 − bag_fraction` it does not train on),
+/// after InterpretML: after every tree the bag scores its held-out rows
+/// with [`Trainer::custom_metric`](crate::training::Trainer::custom_metric)'s
+/// metric when given, else the last eval metric, stops once no tree of the
+/// last `rounds × terms` improved on the best score before them by the
+/// relative `tolerance`, and keeps its trees up to its best score. Each
+/// stage (main effects, pairs) stops separately.
+///
+/// ```
+/// use std::num::NonZeroUsize;
+///
+/// use hessboost::config::EbmEarlyStopping;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let rounds = NonZeroUsize::new(50).unwrap();
+/// let stopping = EbmEarlyStopping::new(rounds, EbmEarlyStopping::DEFAULT_TOLERANCE)?;
+/// assert_eq!((stopping.rounds(), stopping.tolerance()), (rounds, 1e-5));
+/// assert!(EbmEarlyStopping::new(rounds, f64::NAN).is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EbmEarlyStopping {
+    rounds: NonZeroUsize,
+    tolerance: f64,
+}
+
+impl EbmEarlyStopping {
+    /// InterpretML's `early_stopping_tolerance`.
+    pub const DEFAULT_TOLERANCE: f64 = 1e-5;
+
+    /// Stop after `rounds` rounds (`ebm_early_stopping_rounds`) without a
+    /// relative improvement of `tolerance` (`ebm_early_stopping_tolerance`;
+    /// negative values keep boosting through small losses).
+    ///
+    /// # Errors
+    ///
+    /// A tolerance that is not finite, named `ebm_early_stopping_tolerance`.
+    pub fn new(rounds: NonZeroUsize, tolerance: f64) -> Result<Self> {
+        if !tolerance.is_finite() {
+            return Err(HessboostError::invalid_param(
+                "ebm_early_stopping_tolerance",
+                format!("must be finite, got {tolerance}"),
+            ));
+        }
+        Ok(EbmEarlyStopping { rounds, tolerance })
+    }
+
+    /// The patience in rounds (`ebm_early_stopping_rounds`).
+    pub fn rounds(&self) -> NonZeroUsize {
+        self.rounds
+    }
+
+    /// The relative improvement required (`ebm_early_stopping_tolerance`).
+    pub fn tolerance(&self) -> f64 {
+        self.tolerance
+    }
+}
 
 /// The settings of an explainable boosting machine (`booster = ebm`,
 /// beyond XGBoost; see [`crate::ebm`]). Build with [`Ebm::builder`]; the
@@ -223,18 +282,25 @@ const EBM_EARLY_STOPPING_TOLERANCE: f64 = 1e-5;
 /// and the classic cyclic EBM.
 ///
 /// ```
-/// use hessboost::config::Ebm;
+/// use std::num::NonZeroUsize;
+///
+/// use hessboost::config::{Ebm, EbmEarlyStopping};
 ///
 /// # fn main() -> hessboost::error::Result<()> {
+/// let stopping = EbmEarlyStopping::new(
+///     NonZeroUsize::new(50).unwrap(),
+///     EbmEarlyStopping::DEFAULT_TOLERANCE,
+/// )?;
 /// let ebm = Ebm::builder()
 ///     .interactions(2)
 ///     .outer_bags(8)
 ///     .bag_fraction(0.85)
-///     .early_stopping_rounds(50)
+///     .early_stopping(stopping)
 ///     .build()?;
 /// assert_eq!((ebm.interactions(), ebm.outer_bags()), (2, 8));
+/// assert_eq!(ebm.early_stopping(), Some(stopping));
 /// // Early stopping scores each bag on the rows it does not train on.
-/// assert!(Ebm::builder().early_stopping_rounds(50).build().is_err());
+/// assert!(Ebm::builder().early_stopping(stopping).build().is_err());
 /// # Ok(())
 /// # }
 /// ```
@@ -244,8 +310,7 @@ pub struct Ebm {
     outer_bags: usize,
     bag_fraction: f64,
     boulevard: bool,
-    early_stopping_rounds: usize,
-    early_stopping_tolerance: f64,
+    early_stopping: Option<EbmEarlyStopping>,
 }
 
 impl Default for Ebm {
@@ -255,8 +320,7 @@ impl Default for Ebm {
             outer_bags: 1,
             bag_fraction: 1.0,
             boulevard: false,
-            early_stopping_rounds: 0,
-            early_stopping_tolerance: EBM_EARLY_STOPPING_TOLERANCE,
+            early_stopping: None,
         }
     }
 }
@@ -304,24 +368,10 @@ impl Ebm {
         self.boulevard
     }
 
-    /// Per-bag early stopping of a classic EBM on the bag's held-out rows
-    /// (the `1 − bag_fraction` it does not train on), after InterpretML:
-    /// after every tree the bag scores its held-out rows with
-    /// [`Trainer::custom_metric`](crate::training::Trainer::custom_metric)'s
-    /// metric when given, else the last eval metric, stops once no tree of
-    /// the last `early_stopping_rounds × terms` improved on the best score
-    /// before them by the tolerance, and keeps its trees up to its best
-    /// score. Each stage (main effects, pairs) stops separately. `0` is off.
-    /// `ebm_early_stopping_rounds`.
-    pub fn early_stopping_rounds(&self) -> usize {
-        self.early_stopping_rounds
-    }
-
-    /// The relative improvement early stopping requires (InterpretML's
-    /// `early_stopping_tolerance`, `1e-5`; negative values keep boosting
-    /// through small losses). `ebm_early_stopping_tolerance`.
-    pub fn early_stopping_tolerance(&self) -> f64 {
-        self.early_stopping_tolerance
+    /// Per-bag early stopping of a classic EBM ([`EbmEarlyStopping`]),
+    /// `None` for none.
+    pub fn early_stopping(&self) -> Option<EbmEarlyStopping> {
+        self.early_stopping
     }
 }
 
@@ -360,18 +410,11 @@ impl EbmBuilder {
         self
     }
 
-    /// Set the per-bag early-stopping patience in rounds
-    /// (`ebm_early_stopping_rounds`, `0` = off).
+    /// Stop each bag early on its held-out rows (`ebm_early_stopping_rounds`
+    /// and `ebm_early_stopping_tolerance`).
     #[must_use]
-    pub fn early_stopping_rounds(mut self, rounds: usize) -> Self {
-        self.ebm.early_stopping_rounds = rounds;
-        self
-    }
-
-    /// Set the early-stopping tolerance (`ebm_early_stopping_tolerance`).
-    #[must_use]
-    pub fn early_stopping_tolerance(mut self, tolerance: f64) -> Self {
-        self.ebm.early_stopping_tolerance = tolerance;
+    pub fn early_stopping(mut self, early_stopping: EbmEarlyStopping) -> Self {
+        self.ebm.early_stopping = Some(early_stopping);
         self
     }
 
@@ -380,8 +423,7 @@ impl EbmBuilder {
     /// # Errors
     ///
     /// `outer_bags` outside `[1, 1024]`, `bag_fraction` outside `(0, 1]`,
-    /// a non-finite tolerance or one set without early stopping, early
-    /// stopping without held-out rows (`bag_fraction = 1`) or with
+    /// early stopping without held-out rows (`bag_fraction = 1`) or with
     /// `boulevard`, and `boulevard` with several bags or a bag fraction
     /// below 1.
     pub fn build(self) -> Result<Ebm> {
@@ -400,19 +442,7 @@ impl EbmBuilder {
                 format!("must be in (0, 1], got {}", e.bag_fraction),
             );
         }
-        if !e.early_stopping_tolerance.is_finite() {
-            return fail(
-                "ebm_early_stopping_tolerance",
-                format!("must be finite, got {}", e.early_stopping_tolerance),
-            );
-        }
-        if e.early_stopping_rounds == 0 {
-            if e.early_stopping_tolerance != EBM_EARLY_STOPPING_TOLERANCE {
-                return fail(
-                    "ebm_early_stopping_tolerance",
-                    "is only used with `ebm_early_stopping_rounds > 0`".into(),
-                );
-            }
+        if e.early_stopping.is_none() {
         } else if e.boulevard {
             return fail(
                 "ebm_early_stopping_rounds",

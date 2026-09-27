@@ -7,9 +7,9 @@ from typing import Any
 
 import numpy as np
 import pytest
-from conftest import regression
 
 import hessboost
+from conftest import regression
 from hessboost import DMatrix, HessboostError
 
 
@@ -52,7 +52,7 @@ def test_bad_parameters_are_refused_by_name(
 
 def test_parameters_must_be_a_mapping_of_plain_values(dtrain: DMatrix) -> None:
     with pytest.raises(TypeError, match="mapping"):
-        hessboost.train([("eta", 0.1)], dtrain, 1)  # type: ignore[arg-type]
+        hessboost.train([("eta", 0.1)], dtrain, 1)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="parameter `eta` has unsupported type object"):
         hessboost.train({"eta": object()}, dtrain, 1)
 
@@ -79,6 +79,7 @@ def test_aliases_and_numpy_values_set_the_same_model(dtrain: DMatrix) -> None:
     other = hessboost.train({"eta": 0.2}, dtrain, 5)
     assert other.save_raw() != canonical.save_raw()
 
+
 def test_balanced_bagging_params_are_accepted_and_validated() -> None:
     x = np.linspace(-2, 2, 400).reshape(-1, 1)
     y = (x[:, 0] > 0).astype(np.float32)
@@ -94,9 +95,7 @@ def test_balanced_bagging_params_are_accepted_and_validated() -> None:
     second = hessboost.train(params, dtrain, 4)
     assert first.save_raw() == second.save_raw()
     with pytest.raises(HessboostError, match="balanced bagging needs a `binary:\\*` objective"):
-        hessboost.train(
-            {"objective": "reg:squarederror", "pos_bagging_fraction": 0.5}, dtrain, 1
-        )
+        hessboost.train({"objective": "reg:squarederror", "pos_bagging_fraction": 0.5}, dtrain, 1)
     with pytest.raises(HessboostError, match="balanced bagging replaces `subsample`"):
         hessboost.train(
             {
@@ -137,9 +136,7 @@ def test_fixed_options_are_accepted_at_their_only_setting(dtrain: DMatrix) -> No
     "constraints",
     ["(1,0,0,0,0)", [1, 0, 0, 0, 0], (1, 0, 0, 0, 0), {"a": 1}, {0: 1}],
 )
-def test_monotone_constraints_in_every_xgboost_form(
-    dtrain: DMatrix, constraints: object
-) -> None:
+def test_monotone_constraints_in_every_xgboost_form(dtrain: DMatrix, constraints: object) -> None:
     booster = hessboost.train({"monotone_constraints": constraints}, dtrain, 20)
     grid = np.zeros((50, 5))
     grid[:, 0] = np.linspace(-3, 3, 50)
@@ -153,9 +150,7 @@ def test_monotone_constraints_by_name_need_known_features(dtrain: DMatrix) -> No
 
 def test_interaction_constraints_by_index_name_and_string(dtrain: DMatrix) -> None:
     by_index = hessboost.train({"interaction_constraints": [[0, 1], [2, 3, 4]]}, dtrain, 5)
-    by_name = hessboost.train(
-        {"interaction_constraints": [["a", "b"], ["c", "d", "e"]]}, dtrain, 5
-    )
+    by_name = hessboost.train({"interaction_constraints": [["a", "b"], ["c", "d", "e"]]}, dtrain, 5)
     by_string = hessboost.train({"interaction_constraints": "[[0, 1], [2, 3, 4]]"}, dtrain, 5)
     assert by_index.save_raw() == by_name.save_raw() == by_string.save_raw()
     assert by_index.save_raw() != hessboost.train({}, dtrain, 5).save_raw()

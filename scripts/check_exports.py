@@ -167,7 +167,9 @@ def main() -> int:
         )
         return 2
     failures = [(label, why) for label, why in map(check_case, models) if why != "OK"]
-    print(f"{len(models) - len(failures)}/{len(models)} exports reload in xgboost {xgb.__version__}")
+    print(
+        f"{len(models) - len(failures)}/{len(models)} exports reload in xgboost {xgb.__version__}"
+    )
     if failures:
         print("export parity failures:")
         for label, why in failures:

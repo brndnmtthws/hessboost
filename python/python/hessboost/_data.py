@@ -7,7 +7,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -43,25 +43,25 @@ def _pandas() -> Any:
     return sys.modules.get("pandas")
 
 
-def _is_frame(data: object) -> bool:
+def _is_frame(data: object) -> TypeGuard[pd.DataFrame]:
     pd = _pandas()
     return pd is not None and isinstance(data, pd.DataFrame)
 
 
-def _sparse_csr(data: object) -> Any:
+def _sparse_csr(data: Any) -> Any:
     """``data`` as a canonical scipy CSR matrix, or ``None`` if it is not a
     scipy sparse matrix or array."""
     sparse = sys.modules.get("scipy.sparse")
     if sparse is None or not sparse.issparse(data):
         return None
-    csr = data.tocsr()  # type: ignore[attr-defined]
+    csr = data.tocsr()
     if not csr.has_canonical_format:
         csr = csr.copy()
         csr.sum_duplicates()
     return csr
 
 
-def as_float32(values: ArrayLike, name: str) -> NDArray[np.float32]:
+def as_float32(values: object, name: str) -> NDArray[np.float32]:
     """``values`` as a C-contiguous ``float32`` array (no copy when it
     already is one)."""
     if values is None:
@@ -171,11 +171,10 @@ def features(
         n_cols = int(csr.shape[1])
         values = None
     elif _is_frame(data):
-        frame: pd.DataFrame = data  # type: ignore[assignment]
-        values, names, types, categories = _frame_values(frame, enable_categorical, reference)
+        values, names, types, categories = _frame_values(data, enable_categorical, reference)
         n_cols = values.shape[1]
     else:
-        values = as_float32(data, "data")  # type: ignore[arg-type]
+        values = as_float32(data, "data")
         if values.ndim != 2:
             raise ValueError(
                 f"data must be 2-D (rows, features), got shape {values.shape}; reshape a "

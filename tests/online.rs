@@ -6,10 +6,11 @@
 use std::ops::ControlFlow;
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink, ModelShrinkMode,
-    QueryBagging,
+    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, MaxDeltaStep, ModelShrink,
+    ModelShrinkMode, QueryBagging,
 };
 use hessboost::data::FeatureType;
+use hessboost::metric::EvalMetric;
 use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Logistic, Objective};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
@@ -57,8 +58,7 @@ fn exact_updates_equal_retraining_bit_for_bit() {
         let name = objective.name().to_owned();
         let p = params(objective);
         let train_data = data(400, 1, binary);
-        let mut online =
-            OnlineModel::train(&p, &train_data, 15, OnlineParams::with_tolerance(0.0)).unwrap();
+        let mut online = OnlineModel::train(&p, &train_data, 15, OnlineParams::exact()).unwrap();
         let added = data(30, 2, binary);
         // Several updates in a row: each equals retraining on the data so far.
         for (additions, deletions) in [
@@ -103,7 +103,7 @@ fn approximate_updates_stay_close_to_retraining() {
     // A higher tolerance keeps more splits: tolerance 1 regrows only nodes
     // whose split stopped being a valid candidate.
     let mut frozen =
-        OnlineModel::train(&p, &train_data, 30, OnlineParams::with_tolerance(1.0)).unwrap();
+        OnlineModel::train(&p, &train_data, 30, OnlineParams::approximate(1.0).unwrap()).unwrap();
     let tolerant = frozen.update(Some(&added), &deletions).unwrap();
     assert!(tolerant.subtrees_regrown <= report.subtrees_regrown);
     assert!(tolerant.nodes_kept >= report.nodes_kept);
@@ -116,9 +116,13 @@ fn updates_ignore_the_thread_count() {
     let added = data(20, 7, true);
     let run = |threads| {
         with_threads(threads, || {
-            let mut online =
-                OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(0.05))
-                    .unwrap();
+            let mut online = OnlineModel::train(
+                &p,
+                &train_data,
+                10,
+                OnlineParams::approximate(0.05).unwrap(),
+            )
+            .unwrap();
             online.update(Some(&added), &[1, 2, 3, 50]).unwrap();
             online.model().to_json().unwrap()
         })
@@ -130,10 +134,11 @@ fn updates_ignore_the_thread_count() {
 fn an_interrupted_update_changes_nothing() {
     let p = params(Objective::SquaredError);
     let train_data = data(300, 8, false);
-    for tolerance in [0.0, 0.1] {
-        let mut online =
-            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+    for mode in [
+        OnlineParams::exact(),
+        OnlineParams::approximate(0.1).unwrap(),
+    ] {
+        let mut online = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
         let before = online.model().to_json().unwrap();
         let stop = |round: &RoundEval| {
             if round.iteration == 3 {
@@ -165,9 +170,7 @@ fn an_interrupted_update_changes_nothing() {
         assert_eq!(online.data().n_rows(), 300);
         // The model still updates afterwards, as an uninterrupted one would.
         online.update(None, &[0, 1]).unwrap();
-        let mut fresh =
-            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+        let mut fresh = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
         fresh.update(None, &[0, 1]).unwrap();
         assert_eq!(
             online.model().to_json().unwrap(),
@@ -189,26 +192,25 @@ fn updates_refuse_labels_retraining_refuses() {
         .with_labels(&[2.0])
         .unwrap();
     let good = data(5, 11, true);
-    for tolerance in [0.1, 0.0] {
-        let mut online =
-            OnlineModel::train(&p, &train_data, 8, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+    for mode in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
+        let mut online = OnlineModel::train(&p, &train_data, 8, mode).unwrap();
         let before = online.model().to_json().unwrap();
         // Retraining refuses the added row's label under the same name.
         let retrain_err = invalid_param(train(&p, &bad, 8));
         assert_eq!(
             invalid_param(online.update(Some(&bad), &[0])),
             retrain_err,
-            "tolerance {tolerance}"
+            "{mode:?}"
         );
         assert_eq!(online.model().to_json().unwrap(), before);
         assert_eq!(online.data().n_rows(), 300);
         // A later valid update still works, as on a fresh model.
         online.update(Some(&good), &[0]).unwrap();
         assert_eq!(online.data().n_rows(), 304);
-        let mut fresh =
-            OnlineModel::train(&p, &train_data, 8, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+        let mut fresh = OnlineModel::train(&p, &train_data, 8, mode).unwrap();
         fresh.update(Some(&good), &[0]).unwrap();
         assert_eq!(
             online.model().to_json().unwrap(),
@@ -290,15 +292,14 @@ fn unsound_configurations_and_changes_are_refused() {
         );
     }
     let p = base().build().unwrap();
-    assert_eq!(
-        invalid_param(OnlineModel::train(
-            &p,
-            &train_data,
-            3,
-            OnlineParams::with_tolerance(1.5)
-        )),
-        "tolerance"
-    );
+    // The exact mode is `exact()`, never a tolerance of 0.
+    for tolerance in [0.0, -0.1, 1.5, f64::NAN] {
+        assert_eq!(
+            invalid_param(OnlineParams::approximate(tolerance)),
+            "tolerance"
+        );
+    }
+    assert_eq!(OnlineParams::exact().tolerance(), None);
     let weighted = data(200, 9, false).with_weights(&[1.0; 200]).unwrap();
     assert_eq!(
         invalid_param(OnlineModel::train(&p, &weighted, 3, online)),
@@ -353,18 +354,20 @@ fn row_bagging_is_refused() {
     assert!(train(&balanced, &binary, 3).is_ok());
     assert!(train(&ranking, &queries, 3).is_ok());
     let model = train(&params(logistic()), &binary, 3).unwrap();
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         for (p, d) in [(&balanced, &binary), (&ranking, &queries)] {
             assert_eq!(
                 invalid_param(OnlineModel::train(p, d, 3, online)),
                 "params",
-                "train, tolerance {tolerance}"
+                "train, {online:?}"
             );
             assert_eq!(
                 invalid_param(OnlineModel::from_model(model.clone(), p, d, online)),
                 "params",
-                "from_model, tolerance {tolerance}"
+                "from_model, {online:?}"
             );
         }
     }
@@ -389,8 +392,10 @@ fn from_model_refuses_linear_leaves() {
         .with_labels(&y)
         .unwrap();
     let p = params(Objective::SquaredError);
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         assert_eq!(
             invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
             "model"
@@ -411,8 +416,10 @@ fn from_model_refuses_shrunk_models() {
     let mut shrunk = p.clone();
     shrunk.model_shrink = Some(ModelShrink::new(0.1, ModelShrinkMode::Constant).unwrap());
     let model = train(&shrunk, &data, 3).unwrap();
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         assert_eq!(
             invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
             "model"
@@ -428,8 +435,10 @@ fn from_model_refuses_trees_deeper_than_max_depth() {
     let mut deeper = p.clone();
     deeper.max_depth = p.max_depth.and_then(|depth| depth.checked_add(2));
     let model = train(&deeper, &d, 3).unwrap();
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         assert_eq!(
             invalid_param(OnlineModel::from_model(model.clone(), &p, &d, online)),
             "model"
@@ -451,10 +460,11 @@ fn an_abandoned_update_keeps_the_update_state() {
         data(20, 15, false),
         data(25, 16, false),
     );
-    for tolerance in [0.1, 0.0] {
-        let mut online =
-            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
+        let mut online = OnlineModel::train(&p, &train_data, 10, online).unwrap();
         online.update(Some(&a), &[0, 5, 9]).unwrap();
         let mut control = online.clone();
         let stop = |round: &RoundEval| {
@@ -485,8 +495,263 @@ fn an_abandoned_update_keeps_the_update_state() {
             assert_eq!(
                 online.model().to_json().unwrap(),
                 control.model().to_json().unwrap(),
-                "tolerance {tolerance}"
+                "{online:?}"
             );
         }
     }
+}
+
+/// Labelled dense rows, with `NaN` as missing.
+fn rows(x: &[f32], cols: usize, y: &[f32]) -> DMatrix {
+    DMatrix::from_dense(x, y.len(), cols)
+        .unwrap()
+        .with_labels(y)
+        .unwrap()
+}
+
+/// One-step trees without shrinkage or L2 penalty, so leaf values are the
+/// plain means the tests reason about.
+fn plain(max_depth: usize) -> TrainingParams {
+    TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .max_depth(max_depth)
+        .eta(1.0)
+        .lambda(0.0)
+        .base_score(0.0)
+        .build()
+        .unwrap()
+}
+
+/// `from_model` refuses what `params` would not have trained, or training
+/// would refuse: an early-stopped model (an update would predict with every
+/// iteration and drop `best_iteration`; its best-iterations slice is fine),
+/// another `max_delta_step` than the parameters', and a metric the
+/// objective cannot score.
+#[test]
+fn from_model_refuses_models_and_metrics_training_would_not_give() {
+    let d = data(300, 11, false);
+    let valid = data(100, 12, false);
+    let p = params(Objective::SquaredError);
+    let stopped = Trainer::new(&p, &d, 200)
+        .eval(&valid, "valid")
+        .early_stopping_rounds(2)
+        .train()
+        .unwrap()
+        .model;
+    let best = stopped.best_iteration().expect("stops early");
+    for online in [OnlineParams::default(), OnlineParams::exact()] {
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(stopped.clone(), &p, &d, online)),
+            "model"
+        );
+        let best_slice = stopped.slice(..=best, 1).unwrap();
+        assert!(OnlineModel::from_model(best_slice, &p, &d, online).is_ok());
+    }
+
+    let counts = rows(&[0.0, 0.0, 1.0, 1.0], 1, &[0.0, 0.0, 1.0, 1.0]);
+    let poisson = TrainingParams::builder()
+        .objective(Objective::Poisson)
+        .tree_method(TreeMethod::Hist)
+        .max_depth(1)
+        .build()
+        .unwrap();
+    let model = train(&poisson, &counts, 2).unwrap();
+    let mut unbounded = poisson.clone();
+    unbounded.max_delta_step = MaxDeltaStep::Unbounded;
+    assert_eq!(
+        invalid_param(OnlineModel::from_model(
+            model.clone(),
+            &unbounded,
+            &counts,
+            OnlineParams::default()
+        )),
+        "model"
+    );
+    assert!(OnlineModel::from_model(model, &poisson, &counts, OnlineParams::default()).is_ok());
+
+    let binary = data(100, 13, true);
+    let logistic_params = params(logistic());
+    let model = train(&logistic_params, &binary, 2).unwrap();
+    let mut multiclass_metric = logistic_params.clone();
+    multiclass_metric.eval_metric = vec![EvalMetric::MLogLoss];
+    assert_eq!(
+        invalid_param(OnlineModel::from_model(
+            model,
+            &multiclass_metric,
+            &binary,
+            OnlineParams::default()
+        )),
+        "eval_metric"
+    );
+}
+
+/// The exact mode retrains, so it accepts categorical features (and a
+/// model with categorical splits) and equals retraining; the approximate
+/// mode, which replays numeric splits, refuses them.
+#[test]
+fn the_exact_mode_updates_categorical_models() {
+    let d = rows(
+        &[0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+        1,
+        &[0.0, 0.0, 1.0, 1.0, 3.0, 3.0],
+    )
+    .with_feature_types(&[FeatureType::Categorical])
+    .unwrap();
+    let p = plain(2);
+    let mut exact = OnlineModel::train(&p, &d, 2, OnlineParams::exact()).unwrap();
+    assert!(
+        exact.model().trees()[0]
+            .nodes()
+            .iter()
+            .any(|n| n.is_categorical)
+    );
+    let added = rows(&[1.0], 1, &[2.0])
+        .with_feature_types(&[FeatureType::Categorical])
+        .unwrap();
+    exact.update(Some(&added), &[0]).unwrap();
+    assert_eq!(
+        exact.model().trees(),
+        train(&p, exact.data(), 2).unwrap().trees()
+    );
+    assert_eq!(
+        invalid_param(OnlineModel::train(&p, &d, 2, OnlineParams::default())),
+        "data"
+    );
+}
+
+/// An update refuses data whose intercept retraining could not estimate
+/// (here `count:poisson` with only zero labels left), and changes nothing.
+#[test]
+fn updates_refuse_data_without_a_finite_intercept() {
+    let poisson = TrainingParams::builder()
+        .objective(Objective::Poisson)
+        .tree_method(TreeMethod::Hist)
+        .max_depth(1)
+        .build()
+        .unwrap();
+    let counts = rows(&[0.0, 1.0], 1, &[0.0, 1.0]);
+    for online_params in [OnlineParams::default(), OnlineParams::exact()] {
+        let mut online = OnlineModel::train(&poisson, &counts, 2, online_params).unwrap();
+        assert_eq!(
+            invalid_param(train(&poisson, &rows(&[0.0], 1, &[0.0]), 2)),
+            "base_score"
+        );
+        assert_eq!(invalid_param(online.update(None, &[1])), "base_score");
+        assert_eq!(online.data().n_rows(), 2);
+    }
+}
+
+/// Updates run on `nthread` threads, as training does, whatever pool the
+/// caller runs them in.
+#[test]
+fn updates_run_on_the_configured_threads() {
+    let mut p = params(Objective::SquaredError);
+    p.nthread = std::num::NonZeroUsize::new(1);
+    let d = data(200, 14, false);
+    with_threads(4, || {
+        let mut online = OnlineModel::train(&p, &d, 3, OnlineParams::default()).unwrap();
+        let mut seen = Vec::new();
+        online
+            .update_with(None, &[0], |_| {
+                seen.push(rayon::current_num_threads());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(seen, vec![1; 3]);
+    });
+}
+
+/// A changed row may reach a split that no row of the cached data reached
+/// (a model resumed on other data, or a node of a regrown subtree the rows
+/// route around): its histogram is all zero, and the update proceeds.
+#[test]
+fn updates_reach_splits_the_cached_rows_never_did() {
+    let nan = f32::NAN;
+    let p = plain(2);
+    let full = rows(
+        &[nan, 0.0, nan, 1.0, 0.0, 0.0, 1.0, 1.0],
+        2,
+        &[0.0, 1.0, 10.0, 11.0],
+    );
+    let model = train(&p, &full, 1).unwrap();
+    let observed = rows(&[0.0, 0.0, 1.0, 1.0], 2, &[10.0, 11.0]);
+    let online = OnlineParams::approximate(1.0).unwrap();
+    let mut resumed = OnlineModel::from_model(model, &p, &observed, online).unwrap();
+    let missing = rows(&[nan, 0.0], 2, &[0.0]);
+    assert!(resumed.update(Some(&missing), &[]).is_ok());
+
+    let start = rows(
+        &[0.0, 0.0, 1.0, 1.0, nan, 0.0, nan, 1.0],
+        2,
+        &[0.0, 10.0, 1.0, 11.0],
+    );
+    let mut online_model = OnlineModel::train(&p, &start, 1, online).unwrap();
+    let replacement = rows(
+        &[1.0, 0.0, 1.0, 1.0, nan, 0.0, nan, 1.0],
+        2,
+        &[0.0, 1.0, 10.0, 11.0],
+    );
+    online_model
+        .update(Some(&replacement), &[0, 1, 2, 3])
+        .unwrap();
+    assert!(
+        online_model
+            .update(Some(&rows(&[0.0, 0.0], 2, &[0.0])), &[])
+            .is_ok()
+    );
+    assert_eq!(online_model.data().n_rows(), 5);
+}
+
+/// The approximate mode keeps the training bins, so it refuses an added
+/// value at or above a feature's top cut (it would be ranked in the last
+/// bin but predicted right of a split there); the exact mode, which
+/// retrains, accepts it, as it does values inside the bins.
+#[test]
+fn approximate_updates_refuse_values_beyond_the_training_bins() {
+    let nan = f32::NAN;
+    let mut p = plain(1);
+    p.min_child_weight = 2.0;
+    let d = rows(&[0.0, 1.0, nan, nan], 1, &[0.0, 0.0, 1.0, 1.0]);
+    let beyond = rows(&[3.0], 1, &[0.0]);
+    let mut approximate =
+        OnlineModel::train(&p, &d, 1, OnlineParams::approximate(1.0).unwrap()).unwrap();
+    let before = approximate.model().clone();
+    assert_eq!(
+        invalid_param(approximate.update(Some(&beyond), &[0])),
+        "additions"
+    );
+    assert_eq!(approximate.model().trees(), before.trees());
+    assert_eq!(approximate.data().n_rows(), 4);
+    assert!(
+        approximate
+            .update(Some(&rows(&[0.5], 1, &[0.0])), &[0])
+            .is_ok()
+    );
+    let mut exact = OnlineModel::train(&p, &d, 1, OnlineParams::exact()).unwrap();
+    exact.update(Some(&beyond), &[0]).unwrap();
+    assert_eq!(
+        exact.model().trees(),
+        train(&p, exact.data(), 1).unwrap().trees()
+    );
+}
+
+/// An update whose arithmetic overflows `f32` is refused, as training
+/// refuses the model it would produce, and changes nothing.
+#[test]
+fn updates_that_overflow_are_refused_and_change_nothing() {
+    let max = f32::MAX;
+    let p = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .base_score(f64::from(max))
+        .build()
+        .unwrap();
+    let mut online =
+        OnlineModel::train(&p, &rows(&[0.0], 1, &[max]), 2, OnlineParams::default()).unwrap();
+    let before = online.model().clone();
+    let err = online
+        .update(Some(&rows(&[0.0], 1, &[-max])), &[])
+        .unwrap_err();
+    assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
+    assert_eq!(online.model().trees(), before.trees());
+    assert_eq!(online.data().n_rows(), 1);
 }

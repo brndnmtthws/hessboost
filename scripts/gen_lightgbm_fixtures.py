@@ -51,16 +51,16 @@ BASE_SEED = 20260926
 
 # Every case starts from these; `deterministic` with one thread makes the
 # fixtures reproducible.
-BASE_PARAMS = dict(
-    num_leaves=15,
-    learning_rate=0.1,
-    min_data_in_leaf=10,
-    num_threads=1,
-    deterministic=True,
-    force_row_wise=True,
-    seed=7,
-    verbose=-1,
-)
+BASE_PARAMS = {
+    "num_leaves": 15,
+    "learning_rate": 0.1,
+    "min_data_in_leaf": 10,
+    "num_threads": 1,
+    "deterministic": True,
+    "force_row_wise": True,
+    "seed": 7,
+    "verbose": -1,
+}
 
 
 def _seed(name: str) -> int:
@@ -159,64 +159,187 @@ def y_zero_middle(x, rng):
 # name -> dict(objective params, target, data options, expectation). `expect`
 # is "import" (with the hessboost objective) or ("refuse", message substring).
 CASES = {
-    "regression_numeric": dict(params=dict(objective="regression"), y=y_regression, objective="reg:squarederror"),
-    "regression_nan": dict(params=dict(objective="regression"), y=y_regression, nan=0.15, zeros=0.1,
-                           objective="reg:squarederror"),
-    "binary_nan": dict(params=dict(objective="binary"), y=y_binary, nan=0.1, zeros=0.1, objective="binary:logistic"),
-    "zero_as_missing_nonnegative": dict(
-        params=dict(objective="regression", zero_as_missing=True, num_leaves=4),
-        y=y_zero_nonnegative, abs=True, zeros=0.25, rounds=20, objective="reg:squarederror"),
-    "zero_as_missing_refused": dict(
-        params=dict(objective="regression", zero_as_missing=True),
-        y=y_zero_middle, zeros=0.25, refuse="zero_as_missing"),
-    "categorical": dict(
-        params=dict(objective="regression", max_cat_to_onehot=4, cat_smooth=1.0, min_data_per_group=5),
-        y=y_categorical, categorical=((0, 40), (1, 3)), nan=0.05, objective="reg:squarederror"),
-    "categorical_binary": dict(
-        params=dict(objective="binary", max_cat_threshold=64, cat_smooth=1.0, min_data_per_group=5),
-        y=lambda x, rng: (y_categorical(x, rng) > 0).astype(np.float64),
-        categorical=((0, 60), (1, 5)), nan=0.05, objective="binary:logistic"),
-    "multiclass": dict(params=dict(objective="multiclass", num_class=3), y=y_multiclass, nan=0.1,
-                       objective="multi:softprob"),
-    "multiclassova": dict(params=dict(objective="multiclassova", num_class=3), y=y_multiclass, nan=0.1,
-                          objective="binary:logistic"),
-    "lambdarank": dict(params=dict(objective="lambdarank"), y=y_relevance, ranking=True, nan=0.05,
-                       objective="rank:ndcg"),
-    "rank_xendcg": dict(params=dict(objective="rank_xendcg"), y=y_relevance, ranking=True, objective="rank:ndcg"),
-    "linear_tree": dict(params=dict(objective="regression", linear_tree=True, linear_lambda=0.1), y=y_regression,
-                        nan=0.1, objective="reg:squarederror"),
-    "linear_tree_binary_categorical": dict(
-        params=dict(objective="binary", linear_tree=True, max_cat_to_onehot=4, min_data_per_group=5),
-        y=lambda x, rng: (y_categorical(x, rng) > 0).astype(np.float64),
-        categorical=((0, 12),), nan=0.05, objective="binary:logistic"),
-    "regression_l1": dict(params=dict(objective="regression_l1"), y=y_regression, objective="reg:absoluteerror"),
-    "huber": dict(params=dict(objective="huber", alpha=1.3), y=y_regression, objective="reg:pseudohubererror"),
-    "fair": dict(params=dict(objective="fair"), y=y_regression, objective="reg:squarederror"),
-    "quantile": dict(params=dict(objective="quantile", alpha=0.8), y=y_regression, objective="reg:quantileerror"),
-    "mape": dict(params=dict(objective="mape"), y=y_positive, objective="reg:absoluteerror"),
-    "poisson": dict(params=dict(objective="poisson"), y=y_counts, objective="count:poisson"),
-    "gamma": dict(params=dict(objective="gamma"), y=y_positive, objective="reg:gamma"),
-    "tweedie": dict(params=dict(objective="tweedie", tweedie_variance_power=1.3), y=y_positive,
-                    objective="reg:tweedie"),
-    "cross_entropy": dict(params=dict(objective="cross_entropy"), y=y_probability, objective="reg:logistic"),
-    "dart": dict(params=dict(objective="regression", boosting="dart", drop_seed=3), y=y_regression, nan=0.1,
-                 objective="reg:squarederror"),
-    "goss_bagging": dict(params=dict(objective="binary", data_sample_strategy="goss", feature_fraction=0.7),
-                         y=y_binary, objective="binary:logistic"),
-    "binary_sigmoid_2": dict(params=dict(objective="binary", sigmoid=2.0), y=y_binary, refuse="sigmoid"),
-    "multiclassova_sigmoid_2": dict(params=dict(objective="multiclassova", num_class=3, sigmoid=2.0),
-                                    y=y_multiclass, refuse="sigmoid"),
-    "regression_sqrt": dict(params=dict(objective="regression", reg_sqrt=True), y=y_regression, refuse="sqrt"),
-    "cross_entropy_lambda": dict(params=dict(objective="cross_entropy_lambda"), y=y_probability,
-                                 refuse="cross_entropy_lambda"),
-    "random_forest": dict(params=dict(objective="regression", boosting="rf", bagging_fraction=0.7, bagging_freq=1),
-                          y=y_regression, refuse="average_output"),
+    "regression_numeric": {
+        "params": {"objective": "regression"},
+        "y": y_regression,
+        "objective": "reg:squarederror",
+    },
+    "regression_nan": {
+        "params": {"objective": "regression"},
+        "y": y_regression,
+        "nan": 0.15,
+        "zeros": 0.1,
+        "objective": "reg:squarederror",
+    },
+    "binary_nan": {
+        "params": {"objective": "binary"},
+        "y": y_binary,
+        "nan": 0.1,
+        "zeros": 0.1,
+        "objective": "binary:logistic",
+    },
+    "zero_as_missing_nonnegative": {
+        "params": {"objective": "regression", "zero_as_missing": True, "num_leaves": 4},
+        "y": y_zero_nonnegative,
+        "abs": True,
+        "zeros": 0.25,
+        "rounds": 20,
+        "objective": "reg:squarederror",
+    },
+    "zero_as_missing_refused": {
+        "params": {"objective": "regression", "zero_as_missing": True},
+        "y": y_zero_middle,
+        "zeros": 0.25,
+        "refuse": "zero_as_missing",
+    },
+    "categorical": {
+        "params": {
+            "objective": "regression",
+            "max_cat_to_onehot": 4,
+            "cat_smooth": 1.0,
+            "min_data_per_group": 5,
+        },
+        "y": y_categorical,
+        "categorical": ((0, 40), (1, 3)),
+        "nan": 0.05,
+        "objective": "reg:squarederror",
+    },
+    "categorical_binary": {
+        "params": {
+            "objective": "binary",
+            "max_cat_threshold": 64,
+            "cat_smooth": 1.0,
+            "min_data_per_group": 5,
+        },
+        "y": lambda x, rng: (y_categorical(x, rng) > 0).astype(np.float64),
+        "categorical": ((0, 60), (1, 5)),
+        "nan": 0.05,
+        "objective": "binary:logistic",
+    },
+    "multiclass": {
+        "params": {"objective": "multiclass", "num_class": 3},
+        "y": y_multiclass,
+        "nan": 0.1,
+        "objective": "multi:softprob",
+    },
+    "multiclassova": {
+        "params": {"objective": "multiclassova", "num_class": 3},
+        "y": y_multiclass,
+        "nan": 0.1,
+        "objective": "binary:logistic",
+    },
+    "lambdarank": {
+        "params": {"objective": "lambdarank"},
+        "y": y_relevance,
+        "ranking": True,
+        "nan": 0.05,
+        "objective": "rank:ndcg",
+    },
+    "rank_xendcg": {
+        "params": {"objective": "rank_xendcg"},
+        "y": y_relevance,
+        "ranking": True,
+        "objective": "rank:ndcg",
+    },
+    "linear_tree": {
+        "params": {"objective": "regression", "linear_tree": True, "linear_lambda": 0.1},
+        "y": y_regression,
+        "nan": 0.1,
+        "objective": "reg:squarederror",
+    },
+    "linear_tree_binary_categorical": {
+        "params": {
+            "objective": "binary",
+            "linear_tree": True,
+            "max_cat_to_onehot": 4,
+            "min_data_per_group": 5,
+        },
+        "y": lambda x, rng: (y_categorical(x, rng) > 0).astype(np.float64),
+        "categorical": ((0, 12),),
+        "nan": 0.05,
+        "objective": "binary:logistic",
+    },
+    "regression_l1": {
+        "params": {"objective": "regression_l1"},
+        "y": y_regression,
+        "objective": "reg:absoluteerror",
+    },
+    "huber": {
+        "params": {"objective": "huber", "alpha": 1.3},
+        "y": y_regression,
+        "objective": "reg:pseudohubererror",
+    },
+    "fair": {"params": {"objective": "fair"}, "y": y_regression, "objective": "reg:squarederror"},
+    "quantile": {
+        "params": {"objective": "quantile", "alpha": 0.8},
+        "y": y_regression,
+        "objective": "reg:quantileerror",
+    },
+    "mape": {"params": {"objective": "mape"}, "y": y_positive, "objective": "reg:absoluteerror"},
+    "poisson": {"params": {"objective": "poisson"}, "y": y_counts, "objective": "count:poisson"},
+    "gamma": {"params": {"objective": "gamma"}, "y": y_positive, "objective": "reg:gamma"},
+    "tweedie": {
+        "params": {"objective": "tweedie", "tweedie_variance_power": 1.3},
+        "y": y_positive,
+        "objective": "reg:tweedie",
+    },
+    "cross_entropy": {
+        "params": {"objective": "cross_entropy"},
+        "y": y_probability,
+        "objective": "reg:logistic",
+    },
+    "dart": {
+        "params": {"objective": "regression", "boosting": "dart", "drop_seed": 3},
+        "y": y_regression,
+        "nan": 0.1,
+        "objective": "reg:squarederror",
+    },
+    "goss_bagging": {
+        "params": {"objective": "binary", "data_sample_strategy": "goss", "feature_fraction": 0.7},
+        "y": y_binary,
+        "objective": "binary:logistic",
+    },
+    "binary_sigmoid_2": {
+        "params": {"objective": "binary", "sigmoid": 2.0},
+        "y": y_binary,
+        "refuse": "sigmoid",
+    },
+    "multiclassova_sigmoid_2": {
+        "params": {"objective": "multiclassova", "num_class": 3, "sigmoid": 2.0},
+        "y": y_multiclass,
+        "refuse": "sigmoid",
+    },
+    "regression_sqrt": {
+        "params": {"objective": "regression", "reg_sqrt": True},
+        "y": y_regression,
+        "refuse": "sqrt",
+    },
+    "cross_entropy_lambda": {
+        "params": {"objective": "cross_entropy_lambda"},
+        "y": y_probability,
+        "refuse": "cross_entropy_lambda",
+    },
+    "random_forest": {
+        "params": {
+            "objective": "regression",
+            "boosting": "rf",
+            "bagging_fraction": 0.7,
+            "bagging_freq": 1,
+        },
+        "y": y_regression,
+        "refuse": "average_output",
+    },
 }
 
 
 def make_data(spec, rng, n):
-    x = features(rng, n, nan=spec.get("nan", 0.0), zeros=spec.get("zeros", 0.0),
-                 categorical=spec.get("categorical", ()))
+    x = features(
+        rng,
+        n,
+        nan=spec.get("nan", 0.0),
+        zeros=spec.get("zeros", 0.0),
+        categorical=spec.get("categorical", ()),
+    )
     if spec.get("abs"):
         x = np.abs(x)
     return x
@@ -259,7 +382,11 @@ def boundary_rows(booster, x_test, limit=40):
     rows = []
     for i, (feature, threshold) in enumerate(splits):
         at = np.float32(threshold)
-        for value in (np.nextafter(at, np.float32(-np.inf)), at, np.nextafter(at, np.float32(np.inf))):
+        for value in (
+            np.nextafter(at, np.float32(-np.inf)),
+            at,
+            np.nextafter(at, np.float32(np.inf)),
+        ):
             row = x_test[i % len(x_test)].copy()
             row[feature] = value
             rows.append(row)
@@ -269,8 +396,13 @@ def boundary_rows(booster, x_test, limit=40):
 def fixture(name, spec, booster, x_test):
     if "refuse" not in spec:
         x_test = boundary_rows(booster, x_test)
-    out = dict(name=name, lightgbm_version=lgb.__version__, n_cols=N_COLS, n_test=len(x_test),
-               x_test=_floats(x_test))
+    out = {
+        "name": name,
+        "lightgbm_version": lgb.__version__,
+        "n_cols": N_COLS,
+        "n_test": len(x_test),
+        "x_test": _floats(x_test),
+    }
     if "refuse" in spec:
         out.update(expect="refuse", error=spec["refuse"])
         return out
@@ -301,15 +433,17 @@ def write(directory, name, booster, data, suffix=".json"):
 # a binary model with NaN, zero and categorical splits, and a linear_tree
 # model with missing values.
 TEST_DATA = {
-    f"lightgbm-{LIGHTGBM_VERSION}-binary": ("categorical_binary", dict(num_leaves=6)),
-    f"lightgbm-{LIGHTGBM_VERSION}-linear": ("linear_tree", dict(num_leaves=4)),
+    f"lightgbm-{LIGHTGBM_VERSION}-binary": ("categorical_binary", {"num_leaves": 6}),
+    f"lightgbm-{LIGHTGBM_VERSION}-linear": ("linear_tree", {"num_leaves": 4}),
 }
 
 
 def write_test_data():
     for file_name, (case, overrides) in TEST_DATA.items():
         spec = CASES[case]
-        booster, x_test = train(case, spec, n_train=600, n_test=24, num_round=6, overrides=overrides)
+        booster, x_test = train(
+            case, spec, n_train=600, n_test=24, num_round=6, overrides=overrides
+        )
         data = fixture(file_name, spec, booster, x_test)
         write(TEST_DATA_DIR, file_name, booster, data, suffix=".expected.json")
         print(f"wrote tests/data/{file_name}.{{txt,expected.json}}")

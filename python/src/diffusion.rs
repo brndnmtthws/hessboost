@@ -10,12 +10,14 @@ use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{OrRaise, refuse};
 use crate::params::{Params, to_python};
 use hessboost::config::TrainingParams;
-use hessboost::diffusion::{self, EarlyStopping, Method, Residualizer, Samples};
+use hessboost::diffusion::{self, EarlyStopping, Method, Quantiles, Residualizer, Samples};
+use hessboost::model::Predictions;
 use numpy::{PyArrayDyn, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use serde_json::Value;
+use std::num::NonZeroUsize;
 
 /// A fit configuration, passed from Python as a `dict`.
 #[derive(FromPyObject)]
@@ -32,6 +34,11 @@ pub(crate) struct ParamsRequest {
     /// `(folds, training, num_boost_round)`.
     residualizer: Option<(usize, Py<Params>, usize)>,
     seed: u64,
+}
+
+/// `value` as a positive count, refused under `name` when it is `0`.
+fn positive(name: &str, value: usize) -> PyResult<NonZeroUsize> {
+    NonZeroUsize::new(value).ok_or_else(|| refuse(format!("{name} must be at least 1, got 0")))
 }
 
 fn method_from_json(json: &str) -> PyResult<Method> {
@@ -62,25 +69,30 @@ impl DiffusionParams {
     fn new(request: ParamsRequest) -> PyResult<Self> {
         let mut inner = diffusion::DiffusionParams::default();
         inner.method = method_from_json(&request.method)?;
-        inner.n_repeats = request.n_repeats;
-        inner.n_steps = request.n_steps;
+        inner.n_repeats = positive("n_repeats", request.n_repeats)?;
+        inner.n_steps = positive("n_steps", request.n_steps)?;
         inner.training = request.training.get().inner.clone();
-        inner.num_boost_round = request.num_boost_round;
-        inner.early_stopping = request.early_stopping.map(|(rounds, eval_fraction)| {
-            let mut stop = EarlyStopping::default();
-            stop.rounds = rounds;
-            stop.eval_fraction = eval_fraction;
-            stop
-        });
-        inner.residualizer = request
-            .residualizer
-            .map(|(folds, training, num_boost_round)| {
+        inner.num_boost_round = positive("num_boost_round", request.num_boost_round)?;
+        inner.early_stopping = match request.early_stopping {
+            Some((rounds, eval_fraction)) => {
+                let mut stop = EarlyStopping::default();
+                stop.rounds = positive("early_stopping.rounds", rounds)?;
+                stop.eval_fraction = eval_fraction;
+                Some(stop)
+            }
+            None => None,
+        };
+        inner.residualizer = match request.residualizer {
+            Some((folds, training, num_boost_round)) => {
                 let mut residualizer = Residualizer::default();
                 residualizer.folds = folds;
                 residualizer.training = training.get().inner.clone();
-                residualizer.num_boost_round = num_boost_round;
-                residualizer
-            });
+                residualizer.num_boost_round =
+                    positive("residualizer.num_boost_round", num_boost_round)?;
+                Some(residualizer)
+            }
+            None => None,
+        };
         inner.seed = request.seed;
         inner.validate().or_raise()?;
         Ok(Self { inner })
@@ -104,18 +116,22 @@ impl DiffusionParams {
         };
         let dict = PyDict::new(py);
         dict.set_item("method", method_json(&params.method)?)?;
-        dict.set_item("n_repeats", params.n_repeats)?;
-        dict.set_item("n_steps", params.n_steps)?;
+        dict.set_item("n_repeats", params.n_repeats.get())?;
+        dict.set_item("n_steps", params.n_steps.get())?;
         dict.set_item("training", training_dict(py, &params.training)?)?;
-        dict.set_item("num_boost_round", params.num_boost_round)?;
+        dict.set_item("num_boost_round", params.num_boost_round.get())?;
         dict.set_item(
             "early_stopping",
             params
                 .early_stopping
-                .map(|stop| (stop.rounds, stop.eval_fraction)),
+                .map(|stop| (stop.rounds.get(), stop.eval_fraction)),
         )?;
         let residualizer = match &params.residualizer {
-            Some(r) => Some((r.folds, training_dict(py, &r.training)?, r.num_boost_round)),
+            Some(r) => Some((
+                r.folds,
+                training_dict(py, &r.training)?,
+                r.num_boost_round.get(),
+            )),
             None => None,
         };
         dict.set_item("residualizer", residualizer)?;
@@ -154,13 +170,14 @@ impl DiffusionModel {
             .detach(|| self.inner.sample(&data.inner, n_samples, seed))
             .or_raise()?;
         let shape = [samples.n_rows(), samples.n_samples(), samples.n_outputs()];
-        to_numpy(py, samples.into_values(), &shape)
+        to_numpy(py, samples.into_vec(), &shape)
     }
 
     /// A copy of the model that samples with `n_steps` integration steps.
     fn with_n_steps(&self, py: Python<'_>, n_steps: usize) -> PyResult<Self> {
+        let n_steps = positive("n_steps", n_steps)?;
         let mut inner = py.detach(|| self.inner.clone());
-        inner.set_n_steps(n_steps).or_raise()?;
+        inner.set_n_steps(n_steps);
         Ok(Self { inner })
     }
 
@@ -201,7 +218,7 @@ impl DiffusionModel {
 
     #[getter]
     fn n_steps(&self) -> usize {
-        self.inner.n_steps()
+        self.inner.n_steps().get()
     }
 
     #[getter]
@@ -246,7 +263,7 @@ pub(crate) fn samples_mean<'py>(
     py: Python<'py>,
     samples: PyReadonlyArrayDyn<'_, f32>,
 ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
-    let (mean, shape) = summarize(py, &samples, |s| Ok(s.mean()))?;
+    let (mean, shape) = summarize(py, &samples, |s| Ok(s.mean().into_vec()))?;
     to_numpy(py, mean, &shape)
 }
 
@@ -258,7 +275,9 @@ pub(crate) fn samples_quantiles<'py>(
     levels: Vec<f64>,
 ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
     let k = levels.len();
-    let (quantiles, [rows, outputs]) = summarize(py, &samples, |s| s.quantiles(&levels))?;
+    let (quantiles, [rows, outputs]) = summarize(py, &samples, |s| {
+        s.quantiles(&levels).map(Quantiles::into_vec)
+    })?;
     to_numpy(py, quantiles, &[rows, k, outputs])
 }
 
@@ -270,6 +289,6 @@ pub(crate) fn samples_crps<'py>(
     labels: PyReadonlyArrayDyn<'_, f32>,
 ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
     let labels = row_major(&labels, "labels")?;
-    let (crps, shape) = summarize(py, &samples, |s| s.crps(labels))?;
+    let (crps, shape) = summarize(py, &samples, |s| s.crps(labels).map(Predictions::into_vec))?;
     to_numpy(py, crps, &shape)
 }

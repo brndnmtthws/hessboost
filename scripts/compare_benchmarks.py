@@ -6,10 +6,10 @@ import gzip
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
 
 
 def main():
@@ -28,8 +28,10 @@ def main():
         parser.error("threads/resamples must be positive and samples must be at least 10")
     if args.warmup <= 0 or args.measurement <= 0:
         parser.error("warmup and measurement must be positive")
-    executables = {name: path.resolve(strict=True) for name, path in
-                   [("baseline", args.baseline), ("optimized", args.optimized)]}
+    executables = {
+        name: path.resolve(strict=True)
+        for name, path in [("baseline", args.baseline), ("optimized", args.optimized)]
+    }
     args.output.mkdir(parents=True, exist_ok=False)
     metadata = {
         "platform": platform.platform(),
@@ -39,8 +41,10 @@ def main():
         "requested_measurement_seconds": args.measurement,
         "requested_samples": args.samples,
         "resamples": args.resamples,
-        "executable_sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest()
-                              for name, path in executables.items()},
+        "executable_sha256": {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in executables.items()
+        },
         "run_started_at": {},
     }
     estimates, raw = {}, {}
@@ -48,12 +52,26 @@ def main():
         label = f"{name}-{repeat}"
         folder = args.output / label
         folder.mkdir()
-        metadata["run_started_at"][label] = datetime.now(timezone.utc).isoformat()
-        command = [str(executables[name]), "--bench", args.filter, "--noplot",
-                   "--warm-up-time", str(args.warmup), "--measurement-time", str(args.measurement),
-                   "--sample-size", str(args.samples), "--nresamples", str(args.resamples)]
-        env = dict(os.environ, RAYON_NUM_THREADS=str(args.threads),
-                   CRITERION_HOME=str((folder / "criterion").resolve()))
+        metadata["run_started_at"][label] = datetime.now(UTC).isoformat()
+        command = [
+            str(executables[name]),
+            "--bench",
+            args.filter,
+            "--noplot",
+            "--warm-up-time",
+            str(args.warmup),
+            "--measurement-time",
+            str(args.measurement),
+            "--sample-size",
+            str(args.samples),
+            "--nresamples",
+            str(args.resamples),
+        ]
+        env = dict(
+            os.environ,
+            RAYON_NUM_THREADS=str(args.threads),
+            CRITERION_HOME=str((folder / "criterion").resolve()),
+        )
         with (folder / "stdout.log").open("w") as log:
             subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
         estimates[label] = {
@@ -65,8 +83,10 @@ def main():
         raw[label] = {
             "command": command,
             "stdout": (folder / "stdout.log").read_text(),
-            "files": {str(path.relative_to(folder)): json.loads(path.read_text())
-                      for path in folder.glob("criterion/**/new/*.json")},
+            "files": {
+                str(path.relative_to(folder)): json.loads(path.read_text())
+                for path in folder.glob("criterion/**/new/*.json")
+            },
         }
         print(f"{label}: {len(estimates[label])} cases", flush=True)
     cases = set(estimates["baseline-1"])
@@ -81,13 +101,17 @@ def main():
             "baseline_median_ms": sum(baseline) / 2e6,
             "optimized_median_ms": sum(optimized) / 2e6,
             "elapsed_time_reduction_percent": 100 * (1 - sum(optimized) / sum(baseline)),
-            "paired_reduction_percent": [100 * (1 - o / b) for b, o in zip(baseline, optimized)],
+            "paired_reduction_percent": [
+                100 * (1 - o / b) for b, o in zip(baseline, optimized, strict=True)
+            ],
             "run_medians_ns": medians,
         }
     (args.output / "comparison.json").write_text(
-        json.dumps({"metadata": metadata, "benchmarks": results}, indent=2) + "\n")
+        json.dumps({"metadata": metadata, "benchmarks": results}, indent=2) + "\n"
+    )
     (args.output / "samples.json.gz").write_bytes(
-        gzip.compress(json.dumps(raw, separators=(",", ":")).encode(), mtime=0))
+        gzip.compress(json.dumps(raw, separators=(",", ":")).encode(), mtime=0)
+    )
 
 
 if __name__ == "__main__":

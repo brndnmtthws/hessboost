@@ -172,14 +172,10 @@ impl EbmInference {
     ) -> PyResult<Self> {
         let owner = Owner::new(booster, holdout, noise_variance)?;
         let train = &train.inner;
+        let solver = solver(landmarks, seed)?;
         let cell = py.detached(|| {
             Cell::try_new(owner, |owner| {
-                inference::EbmInference::fit(
-                    &owner.model,
-                    train,
-                    owner.noise(),
-                    solver(landmarks, seed),
-                )
+                inference::EbmInference::fit(&owner.model, train, owner.noise(), solver)
             })
         })?;
         Ok(Self { cell })

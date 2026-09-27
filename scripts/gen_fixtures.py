@@ -187,6 +187,25 @@ def y_multi_heavy_tail(x, rng):
     )
 
 
+def y_regression_ones(x, rng):
+    """y_regression with the rows where column 3 is below 0.35 (about a
+    third, so a split can find them) labeled exactly 1: the rows
+    `scale_pos_weight` reweights in XGBoost's `RegLossObj`."""
+    return np.where(x[:, 3] < 0.35, 1.0, y_regression(x, rng)).astype(np.float32)
+
+
+def y_gamma_ones(x, rng):
+    """y_gamma with the rows where column 3 is below 0.35 labeled exactly 1."""
+    return np.where(x[:, 3] < 0.35, 1.0, y_gamma(x, rng)).astype(np.float32)
+
+
+def y_multi_regression_ones(x, rng):
+    """y_multi_regression with the cells of target j where column 5 + j is
+    below 0.3 labeled exactly 1, so each target reweights other rows."""
+    ones = x[:, 5:8] < 0.3
+    return np.where(ones, 1.0, y_multi_regression(x, rng)).astype(np.float32)
+
+
 def y_cox(x, rng):
     """Signed survival times for survival:cox: exponential event times with a
     log-hazard linear in the features, independent exponential censoring
@@ -305,6 +324,11 @@ CASES: dict[str, tuple[Callable[..., Any], dict[str, Any], dict[str, Any]]] = {
     # reg:logistic is binary:logistic's loss reported as a probability
     # regression (rmse); XGBoost saves the name as-is.
     "reg_logistic_d6": (y_binary, {"objective": "reg:logistic"}, {"tol_train": TOL_TRAIN_PROB}),
+    "nobs_reg_logistic_spw2_weighted_d4": (
+        y_binary,
+        {"objective": "reg:logistic", "scale_pos_weight": 2.0, "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True, "tol_train": TOL_TRAIN_PROB},
+    ),
     # Deprecated alias: XGBoost 3.4.2 trains it as reg:squarederror (with a
     # warning) and saves the model objective as reg:squarederror.
     "reg_linear_d6": (y_regression, {"objective": "reg:linear"}, {}),
@@ -370,6 +394,39 @@ CASES: dict[str, tuple[Callable[..., Any], dict[str, Any], dict[str, Any]]] = {
         y_binary,
         {"objective": "binary:logitraw", "scale_pos_weight": 3.0, "max_depth": 4},
         {"drop": ("base_score",), "evals": True},
+    ),
+    # scale_pos_weight in the other RegLossObj objectives: rows labeled exactly
+    # 1 weigh scale_pos_weight times as much, in the gradient and (without
+    # base_score) the Newton intercept, which replaces the label mean.
+    "nobs_reg_spw3_weighted_d4": (
+        y_regression_ones,
+        {"scale_pos_weight": 3.0, "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True, "evals": True},
+    ),
+    "reg_spw0p5_exact_d4": (
+        y_regression_ones,
+        {"scale_pos_weight": 0.5, "tree_method": "exact", "max_depth": 4},
+        {},
+    ),
+    "nobs_reg_linear_spw2_d4": (
+        y_regression_ones,
+        {"objective": "reg:linear", "scale_pos_weight": 2.0, "max_depth": 4},
+        {"drop": ("base_score",)},
+    ),
+    "nobs_gamma_spw3_d4": (
+        y_gamma_ones,
+        {"objective": "reg:gamma", "scale_pos_weight": 3.0, "max_depth": 4},
+        {"drop": ("base_score",)},
+    ),
+    "gamma_spw0p5_weighted_exact_d4": (
+        y_gamma_ones,
+        {
+            "objective": "reg:gamma",
+            "scale_pos_weight": 0.5,
+            "tree_method": "exact",
+            "max_depth": 4,
+        },
+        {"weighted": True},
     ),
     "hinge_d4": (y_binary, {"objective": "binary:hinge", "max_depth": 4}, {"evals": True}),
     "hinge_exact_d4": (
@@ -498,6 +555,12 @@ CASES: dict[str, tuple[Callable[..., Any], dict[str, Any], dict[str, Any]]] = {
         y_multi_label,
         {"objective": "binary:logistic", "scale_pos_weight": 3.0, "max_depth": 4},
         {"drop": ("base_score",), "tol_train": TOL_TRAIN_PROB},
+    ),
+    # scale_pos_weight per cell: a cell labeled 1 is reweighted, not its row
+    "multi_reg3_spw3_weighted_nobs_d4": (
+        y_multi_regression_ones,
+        {"scale_pos_weight": 3.0, "max_depth": 4},
+        {"drop": ("base_score",), "weighted": True},
     ),
     "multi_huber_weighted_d4": (
         y_multi_heavy_tail,

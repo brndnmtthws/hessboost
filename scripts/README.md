@@ -7,9 +7,13 @@ synthetic datasets, one case per supported feature (tree methods, missing values
 constraints, every objective — including `reg:logistic`, the `reg:linear`
 alias, the alpha-list objectives with one and three alphas (list-valued
 `quantile_alpha` / `expectile_alpha` params), and the survival objectives
-with censored and tied times — sample weights, ranking groups, gblinear,
-DART, intercept estimation, row/column sampling including
-`sampling_method=gradient_based` and DMatrix `feature_weights`, multi-target
+with censored and tied times — sample weights, `scale_pos_weight` on every
+objective XGBoost reads it in (`binary:logistic`, `binary:logitraw`,
+`reg:logistic`, `reg:squarederror`, `reg:linear`, `reg:gamma`: the
+`*_spw*` cases, whose regression labels are exactly 1 on about a third of
+the rows), ranking groups, gblinear, DART, intercept estimation, row/column
+sampling including `sampling_method=gradient_based` and DMatrix
+`feature_weights`, multi-target
 label matrices, per-round metric oracles for `rmsle`, `mape`, `mphe`,
 `pre`/`pre@k`, the survival metrics and each objective's default metric,
 continued training, `process_type=update`, `num_parallel_tree` forests,
@@ -31,8 +35,9 @@ forward and backward partition scans differ and `max_cat_threshold` binds)
 and `categorical_onehot_reg_d6` (3 and 2 categories, one-hot splits) cover
 the categorical split search. `n_targets`
 gives the label columns: the `multi_*` cases (3-target `reg:squarederror`
-on hist and exact, multi-label `binary:logistic` with and without
-`scale_pos_weight`, weighted 2-target `reg:pseudohubererror` and
+on hist and exact and with `scale_pos_weight`, multi-label
+`binary:logistic` with and without `scale_pos_weight`, weighted 2-target
+`reg:pseudohubererror` and
 `reg:absoluteerror`) store `y_train`/`y_test` row-major `[row][target]`, and
 their predictions, margins, and contributions carry the target axis. The
 `mot_*` cases train `multi_strategy=multi_output_tree` (vector-leaf trees):

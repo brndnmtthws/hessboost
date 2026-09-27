@@ -79,8 +79,10 @@
 //!
 //! - **Regression with squared error**, `y = f(x) + ε` with independent,
 //!   homoscedastic, sub-Gaussian noise. `booster = boulevard` refuses every
-//!   other objective, row weights, and base margins, and every option that
-//!   makes leaf values nonlinear in the labels (see
+//!   other objective, row weights, base margins, row sampling that depends
+//!   on the labels or gradients (class-balanced bagging, gradient-based
+//!   sampling), and every option that makes leaf values nonlinear in the
+//!   labels (see
 //!   [`TrainingParams::validate`](crate::config::TrainingParams::validate)).
 //! - **Structure–value isolation** (the tree structures independent of the
 //!   labels the leaves average): not true of trees grown greedily on the

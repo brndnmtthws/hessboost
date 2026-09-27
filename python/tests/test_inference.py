@@ -81,3 +81,12 @@ def test_refusals() -> None:
         hessboost.train(
             {**PARAMS, "objective": "reg:pseudohubererror"}, hessboost.DMatrix(x, label=y), 2
         )
+    # Class-balanced bagging samples rows by label, whatever the objective.
+    for objective in ("reg:squarederror", "binary:logistic"):
+        balanced = {**PARAMS, "subsample": 1.0, "objective": objective}
+        with pytest.raises(hessboost.HessboostError, match="linear smoother"):
+            hessboost.train(
+                {**balanced, "neg_bagging_fraction": 0.5},
+                hessboost.DMatrix(x, label=(y > 0).astype(float)),
+                2,
+            )

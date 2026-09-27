@@ -1,8 +1,10 @@
 //! `booster = boulevard` and its statistical inference ([`hessboost::inference`]).
 
-use hessboost::config::{BoosterKind, Boulevard, TrainingParams, TrainingParamsBuilder};
+use hessboost::config::{
+    BalancedBagging, BoosterKind, Boulevard, TrainingParams, TrainingParamsBuilder,
+};
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
-use hessboost::objective::Objective;
+use hessboost::objective::{Logistic, Objective};
 use hessboost::prelude::*;
 
 mod common;
@@ -192,6 +194,20 @@ fn settings_that_break_the_linear_smoother_are_refused() {
         refused(builder().booster(boulevard(0.0)).num_parallel_tree(2)),
         "eta"
     );
+    // Class-balanced bagging draws rows by their labels; it is refused under
+    // its own key whatever the objective (it needs a `binary:*` one, which
+    // Boulevard refuses in turn).
+    let balanced = BalancedBagging::new(1.0, 0.2).unwrap();
+    for objective in [
+        Objective::SquaredError,
+        Objective::BinaryLogistic(Logistic::default()),
+    ] {
+        let bagged = builder()
+            .subsample(1.0)
+            .objective(objective)
+            .balanced_bagging(balanced);
+        assert_eq!(refused(bagged), "pos_bagging_fraction");
+    }
     // A dropout of 1 keeps no tree; flat keys need their booster.
     assert_eq!(
         invalid_param(Boulevard::builder().dropout(1.0).build()),

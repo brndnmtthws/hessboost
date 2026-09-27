@@ -353,7 +353,8 @@ pub struct TrainingParams {
     /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
     /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
     /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
-    /// booster, uniform sampling, and one label column of `0`/`1` labels.
+    /// booster other than `boulevard`, uniform sampling, and one label
+    /// column of `0`/`1` labels.
     pub balanced_bagging: Option<BalancedBagging>,
     /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
     /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
@@ -602,11 +603,11 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
-        self.validate_balanced_bagging()?;
         self.validate_bagging_by_query()?;
         self.validate_tree_options()?;
         self.validate_sglb()?;
-        self.validate_boulevard()
+        self.validate_boulevard()?;
+        self.validate_balanced_bagging()
     }
 
     /// Query-level bagging: a ranking objective on a tree booster, with
@@ -1116,8 +1117,9 @@ impl TrainingParams {
     /// `Σ z / (m + lambda)` over its `m` sampled rows), so the options that
     /// make leaf values nonlinear in the labels (L1 leaves, clipped leaves,
     /// monotone clipping, quantized gradients, linear or smoothed leaves),
-    /// that reweight rows by their residuals (gradient-based sampling), or
-    /// that change the loss are refused. Structure-only options (depth,
+    /// that reweight rows by their residuals (gradient-based sampling) or
+    /// sample them by their labels (class-balanced bagging), or that change
+    /// the loss are refused. Structure-only options (depth,
     /// `min_child_weight`, `gamma`, column sampling, `extra_trees`,
     /// interaction constraints, categorical splits) are accepted.
     fn validate_boulevard(&self) -> Result<()> {
@@ -1125,6 +1127,14 @@ impl TrainingParams {
             return Ok(());
         };
         let dropout = boulevard.dropout();
+        // Before the objective check: balanced bagging needs a `binary:*`
+        // objective, and the reason it cannot work is not the loss.
+        ensure(
+            "pos_bagging_fraction",
+            self.balanced_bagging.is_none(),
+            "class-balanced bagging keeps a row with a probability set by its label, so a leaf \
+             is no longer a linear smoother of the labels; Boulevard needs uniform `subsample`",
+        )?;
         ensure(
             "objective",
             matches!(self.objective, Objective::SquaredError),

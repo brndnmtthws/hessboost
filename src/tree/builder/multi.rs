@@ -35,21 +35,21 @@
 //!
 //! Leaf weights are left unscaled; training multiplies them by `eta`.
 
-use super::hist::{partition_rows, rayon_available};
-use super::{
-    BELOW_ALL_VALUES, BestSplit, InteractionState, LeafRows, MAX_CAT_THRESHOLD, MAX_CAT_TO_ONEHOT,
-    build_interaction_sets, limit_or_unbounded, need_replace, next_allowed, permits,
+use super::categorical::{MAX_CAT_THRESHOLD, MAX_CAT_TO_ONEHOT};
+use super::partition::{SplitRoute, partition_rows, with_sibling};
+use super::shared::{
+    BuilderConfig, InteractionState, LeafRows, apply_bounds, permits, rayon_available,
     xgb_calc_weight, xgb_gain_given_weight,
 };
+use super::{SplitLocation, SplitPos, limit_or_unbounded, need_replace};
 use crate::K_RT_EPS_F32;
 use crate::config::{GrowPolicy, TrainingParams};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
-use crate::tree::constraints::MonotoneConstraints;
 use crate::tree::gain::{GradStats, RegParams, threshold_l1};
-use crate::tree::hist::{feature_slices, subtract_in_place};
+use crate::tree::hist::feature_slices;
 use crate::tree::sampler::ColumnSampler;
-use crate::tree::{ChildLeaf, RegTree, SplitRule};
+use crate::tree::{ChildLeaf, RegTree};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 
@@ -81,32 +81,19 @@ pub(crate) struct VectorGradients<'a> {
 
 /// Vector-leaf histogram tree builder.
 pub(crate) struct MultiTreeBuilder<'a> {
-    params: &'a TrainingParams,
-    reg: RegParams,
-    cons: MonotoneConstraints,
-    interaction_sets: Option<Vec<Vec<u32>>>,
-}
-
-/// Where a candidate split falls, in XGBoost's orientation.
-#[derive(Debug, Clone)]
-enum Loc {
-    /// Numeric: bins `<= b` go left.
-    Bin(usize),
-    /// Numeric: every present bin goes right, only missing values left.
-    BelowBins,
-    /// Categorical: these categories go right (XGBoost's category set).
-    Cats(Vec<u32>),
+    config: BuilderConfig<'a>,
 }
 
 /// XGBoost's `SplitEntryContainer` over vector statistics, in XGBoost's
-/// orientation: for a categorical split `right` is the category set and
-/// `default_left` sends missing values to the other side.
+/// orientation: for a categorical split the location's categories are the
+/// set going right (`right` holds their statistics), and `default_left` sends
+/// missing values to the other side.
 #[derive(Debug, Clone)]
 struct Candidate {
     loss_chg: f32,
     feature: u32,
     default_left: bool,
-    loc: Loc,
+    loc: SplitLocation,
     left: Vec<GradStats>,
     right: Vec<GradStats>,
 }
@@ -117,7 +104,7 @@ impl Candidate {
             loss_chg: 0.0,
             feature: 0,
             default_left: false,
-            loc: Loc::BelowBins,
+            loc: SplitLocation::Numeric(SplitPos::BelowBins),
             left: Vec::new(),
             right: Vec::new(),
         }
@@ -128,7 +115,7 @@ impl Candidate {
         loss_chg: f32,
         feature: u32,
         default_left: bool,
-        loc: impl FnOnce() -> Loc,
+        loc: impl FnOnce() -> SplitLocation,
         left: &[GradStats],
         right: &[GradStats],
     ) -> bool {
@@ -153,7 +140,7 @@ impl Candidate {
     }
 
     fn is_categorical(&self) -> bool {
-        matches!(self.loc, Loc::Cats(_))
+        self.loc.is_categorical()
     }
 }
 
@@ -218,10 +205,7 @@ impl<'a> MultiTreeBuilder<'a> {
     /// Create a builder bound to a training configuration.
     pub(crate) fn new(params: &'a TrainingParams) -> Self {
         MultiTreeBuilder {
-            params,
-            reg: RegParams::from_params(params),
-            cons: MonotoneConstraints::from_params(&params.monotone_constraints),
-            interaction_sets: build_interaction_sets(&params.interaction_constraints),
+            config: BuilderConfig::new(params),
         }
     }
 
@@ -249,7 +233,7 @@ impl<'a> MultiTreeBuilder<'a> {
         }
         // XGBoost sums the target Hessians of the root cover in `f32`.
         let root_hess = root.iter().fold(0.0f32, |acc, t| acc + t.hess as f32);
-        let n_bounds = if self.cons.is_active() { s } else { 0 };
+        let n_bounds = if self.config.cons.is_active() { s } else { 0 };
         let mut grow = Grow {
             b: self,
             ghist,
@@ -290,7 +274,7 @@ impl<'a> MultiTreeBuilder<'a> {
     /// `CalcGainGivenWeight`).
     fn gain_given_weights(&self, stats: &[GradStats], weights: &[f32]) -> f64 {
         stats.iter().zip(weights).fold(0.0, |gain, (st, &w)| {
-            gain + xgb_gain_given_weight(*st, &self.reg, w)
+            gain + xgb_gain_given_weight(*st, &self.config.reg, w)
         })
     }
 }
@@ -306,7 +290,7 @@ impl Grow<'_, '_> {
 
     /// XGBoost's bounded `CalcWeight` for target `t` of node `nid`.
     fn weight(&self, nid: usize, t: usize, stats: GradStats) -> f32 {
-        self.bound(nid, t, xgb_calc_weight(stats, &self.b.reg) as f32)
+        self.bound(nid, t, xgb_calc_weight(stats, &self.b.config.reg) as f32)
     }
 
     /// XGBoost's `ApplyBounds`.
@@ -315,13 +299,7 @@ impl Grow<'_, '_> {
             return w;
         }
         let i = nid * self.n_split() + t;
-        if w < self.lower[i] {
-            self.lower[i]
-        } else if w > self.upper[i] {
-            self.upper[i]
-        } else {
-            w
-        }
+        apply_bounds(w, self.lower[i], self.upper[i])
     }
 
     /// XGBoost's scalar `CalcSplitWeights` for target `t` of a split of
@@ -346,9 +324,9 @@ impl Grow<'_, '_> {
         }
         // Two leaves share one value, each with its own regularization.
         let pooled_reg = RegParams {
-            lambda: 2.0 * self.b.reg.lambda,
-            alpha: 2.0 * self.b.reg.alpha,
-            ..self.b.reg
+            lambda: 2.0 * self.b.config.reg.lambda,
+            alpha: 2.0 * self.b.config.reg.alpha,
+            ..self.b.config.reg
         };
         let mut both = left;
         both.add(right);
@@ -359,7 +337,7 @@ impl Grow<'_, '_> {
     /// XGBoost's vector `CalcSplitGain`: the summed child scores, or `-inf`
     /// when the mean child Hessian fails `min_child_weight`.
     fn split_gain(&self, nid: usize, dir: i8, left: &[GradStats], right: &[GradStats]) -> f64 {
-        let reg = &self.b.reg;
+        let reg = &self.b.config.reg;
         let constrained = self.constrained();
         let (mut left_hess, mut right_hess, mut gain) = (0.0f64, 0.0f64, 0.0f64);
         for (l, r) in left.iter().zip(right) {
@@ -532,7 +510,7 @@ impl Grow<'_, '_> {
         let s = self.n_split();
         let parent = self.node_stats(nid);
         let parent_gain = self.gain[nid];
-        let dir = self.b.cons.dir(f as usize);
+        let dir = self.b.config.cons.dir(f as usize);
         let mut acc = vec![GradStats::default(); s];
         let mut rest = vec![GradStats::default(); s];
         let bins: Box<dyn Iterator<Item = usize>> = if forward {
@@ -547,16 +525,11 @@ impl Grow<'_, '_> {
             }
             if forward {
                 let loss = (self.split_gain(nid, dir, &acc, &rest) - parent_gain) as f32;
-                best.update(loss, f, false, || Loc::Bin(i), &acc, &rest);
+                let loc = || SplitLocation::Numeric(SplitPos::Bin(i));
+                best.update(loss, f, false, loc, &acc, &rest);
             } else {
                 let loss = (self.split_gain(nid, dir, &rest, &acc) - parent_gain) as f32;
-                let loc = || {
-                    if i == fs {
-                        Loc::BelowBins
-                    } else {
-                        Loc::Bin(i - 1)
-                    }
-                };
+                let loc = || SplitLocation::Numeric(SplitPos::backward(fs, i - fs));
                 best.update(loss, f, true, loc, &rest, &acc);
             }
         }
@@ -578,7 +551,7 @@ impl Grow<'_, '_> {
         let s = self.n_split();
         let parent = self.node_stats(nid);
         let parent_gain = self.gain[nid];
-        let dir = self.b.cons.dir(f as usize);
+        let dir = self.b.config.cons.dir(f as usize);
         let cuts = self.ghist.cuts();
         // Per-target missing statistics: the node total minus every bin.
         let mut missing = parent.to_vec();
@@ -593,7 +566,7 @@ impl Grow<'_, '_> {
         let mut right = vec![GradStats::default(); s];
         let mut local = Candidate::none();
         for i in fs..fe {
-            let cat = || Loc::Cats(vec![cuts.cut_value(i) as u32]);
+            let cat = || SplitLocation::Categories(vec![cuts.cut_value(i) as u32]);
             for missing_left in [true, false] {
                 for t in 0..s {
                     right[t] = hist[i * s + t];
@@ -617,7 +590,7 @@ impl Grow<'_, '_> {
             nid, hist, fs, fe, ..
         } = *bins;
         let s = self.n_split();
-        let reg = &self.b.reg;
+        let reg = &self.b.config.reg;
         let parent = self.node_stats(nid);
         let n_bins = fe - fs;
         // Order categories by `w_parent · w_category` (unbounded weights, as
@@ -661,7 +634,7 @@ impl Grow<'_, '_> {
         let s = self.n_split();
         let parent = self.node_stats(nid);
         let parent_gain = self.gain[nid];
-        let dir = self.b.cons.dir(f as usize);
+        let dir = self.b.config.cons.dir(f as usize);
         let n_bins_feature = fe - fs;
         let n_bins = MAX_CAT_THRESHOLD.min(n_bins_feature);
         let mut left = vec![GradStats::default(); s];
@@ -686,7 +659,8 @@ impl Grow<'_, '_> {
                 }
             }
             let loss = (self.split_gain(nid, dir, &left, &right) - parent_gain) as f32;
-            if local.update(loss, f, forward, || Loc::BelowBins, &left, &right) {
+            let placeholder = || SplitLocation::Numeric(SplitPos::BelowBins);
+            if local.update(loss, f, forward, placeholder, &left, &right) {
                 best_partition = Some(if forward { step + 1 } else { j });
             }
         }
@@ -697,7 +671,7 @@ impl Grow<'_, '_> {
                 .map(|&c| cuts.cut_value(fs + c) as u32)
                 .collect();
             cats.sort_unstable();
-            local.loc = Loc::Cats(cats);
+            local.loc = SplitLocation::Categories(cats);
         }
         if local.is_categorical() {
             best.merge(local);
@@ -709,7 +683,7 @@ impl Grow<'_, '_> {
         let s = self.n_split();
         let nid = entry.nid;
         let best = &entry.best;
-        let dir = self.b.cons.dir(best.feature as usize);
+        let dir = self.b.config.cons.dir(best.feature as usize);
         let mut w_left = Vec::with_capacity(s);
         let mut w_right = Vec::with_capacity(s);
         for t in 0..s {
@@ -721,7 +695,7 @@ impl Grow<'_, '_> {
         self.store_children(nid, dir, best, [&w_left, &w_right], [xgb_left, xgb_right]);
 
         let categorical = best.is_categorical();
-        let (rows_tree_left, rows_tree_right) = partition_rows(self.ghist, &entry.rows, &route);
+        let (rows_tree_left, rows_tree_right) = partition_rows(self.ghist, &entry.rows, route);
         let rows = if categorical {
             (rows_tree_right, rows_tree_left)
         } else {
@@ -742,43 +716,29 @@ impl Grow<'_, '_> {
     /// routed by, and the ids of XGBoost's left and right children.
     /// hessboost's categorical nodes route their set to the tree's left
     /// child, which is XGBoost's right child.
-    fn expand(&mut self, nid: usize, best: &Candidate) -> (BestSplit, (usize, usize)) {
+    fn expand<'c>(&mut self, nid: usize, best: &'c Candidate) -> (SplitRoute<'c>, (usize, usize)) {
         let left_hess: f64 = best.left.iter().map(|g| g.hess).sum();
         let right_hess: f64 = best.right.iter().map(|g| g.hess).sum();
-        let mut route = BestSplit::none();
-        route.feature = best.feature;
-        let (tree_left, tree_right) = match &best.loc {
-            Loc::Cats(cats) => {
-                route.is_categorical = true;
-                route.cat_left.clone_from(cats);
-                route.default_left = !best.default_left;
-                self.tree.expand(
-                    nid,
-                    SplitRule::categorical(best.feature, cats, !best.default_left),
-                    ChildLeaf::new(0.0, right_hess as f32),
-                    ChildLeaf::new(0.0, left_hess as f32),
-                )
-            }
-            loc => {
-                let threshold = match loc {
-                    Loc::Bin(b) => {
-                        route.split_bin = Some(*b);
-                        self.ghist.cuts().cut_value(*b)
-                    }
-                    _ => BELOW_ALL_VALUES,
-                };
-                route.default_left = best.default_left;
-                self.tree.expand(
-                    nid,
-                    SplitRule::numeric(best.feature, threshold, best.default_left),
-                    ChildLeaf::new(0.0, left_hess as f32),
-                    ChildLeaf::new(0.0, right_hess as f32),
-                )
-            }
+        let categorical = best.is_categorical();
+        let route = SplitRoute {
+            feature: best.feature,
+            location: &best.loc,
+            default_left: best.default_left != categorical,
         };
+        let (tree_left_hess, tree_right_hess) = if categorical {
+            (right_hess, left_hess)
+        } else {
+            (left_hess, right_hess)
+        };
+        let (tree_left, tree_right) = self.tree.expand(
+            nid,
+            route.rule(self.ghist.cuts()),
+            ChildLeaf::new(0.0, tree_left_hess as f32),
+            ChildLeaf::new(0.0, tree_right_hess as f32),
+        );
         self.tree.set_split_gain(nid, best.loss_chg);
         self.tree.set_sum_hess(nid, (left_hess + right_hess) as f32);
-        let children = if best.is_categorical() {
+        let children = if categorical {
             (tree_right, tree_left)
         } else {
             (tree_left, tree_right)
@@ -850,21 +810,15 @@ impl Grow<'_, '_> {
         let b = &entry.best;
         let left_hess: f64 = b.left.iter().map(|g| g.hess).sum();
         let right_hess: f64 = b.right.iter().map(|g| g.hess).sum();
-        let mut sibling = entry.hist;
-        let (hist_l, hist_r) = if right_hess < left_hess {
-            let built = self.build_hist(&rows_r);
-            subtract_in_place(&mut sibling, &built);
-            (sibling, built)
-        } else {
-            let built = self.build_hist(&rows_l);
-            subtract_in_place(&mut sibling, &built);
-            (built, sibling)
-        };
-        let allowed = next_allowed(
-            entry.allowed.as_ref(),
-            b.feature,
-            self.b.interaction_sets.as_deref(),
-        );
+        // XGBoost builds the child with the smaller summed Hessian (the left
+        // one on ties, or when either sum is NaN).
+        let build_right = right_hess < left_hess;
+        let built = self.build_hist(if build_right { &rows_r } else { &rows_l });
+        let (hist_l, hist_r) = with_sibling(entry.hist, built, !build_right);
+        let allowed = self
+            .b
+            .config
+            .next_allowed(entry.allowed.as_ref(), b.feature);
         let [f_l, f_r] = features;
         let n_rows = rows_l.len() + rows_r.len();
         let eval_l = || self.evaluate(xl, &hist_l, &f_l, allowed.as_ref(), rows_l.len());
@@ -903,15 +857,15 @@ impl Grow<'_, '_> {
     fn expandable(&self, e: &Entry) -> bool {
         let loss = e.best.loss_chg;
         !(loss <= K_RT_EPS_F32
-            || loss < self.b.params.gamma as f32
-            || e.depth == limit_or_unbounded(self.b.params.max_depth)
-            || self.num_leaves == limit_or_unbounded(self.b.params.max_leaves))
+            || loss < self.b.config.params.gamma as f32
+            || e.depth == limit_or_unbounded(self.b.config.params.max_depth)
+            || self.num_leaves == limit_or_unbounded(self.b.config.params.max_leaves))
     }
 
     /// XGBoost's `Driver::IsChildValid`.
     fn child_valid(&self, e: &Entry) -> bool {
-        !(e.depth + 1 >= limit_or_unbounded(self.b.params.max_depth)
-            || self.num_leaves >= limit_or_unbounded(self.b.params.max_leaves))
+        !(e.depth + 1 >= limit_or_unbounded(self.b.config.params.max_depth)
+            || self.num_leaves >= limit_or_unbounded(self.b.config.params.max_leaves))
     }
 
     /// XGBoost's `Driver::Pop`. Popped entries that cannot expand become
@@ -920,7 +874,7 @@ impl Grow<'_, '_> {
         if queue.is_empty() {
             return Vec::new();
         }
-        if self.b.params.grow_policy == GrowPolicy::LossGuide {
+        if self.b.config.params.grow_policy == GrowPolicy::LossGuide {
             let mut top = 0;
             for (i, e) in queue.iter().enumerate().skip(1) {
                 let t = &queue[top];
@@ -1027,7 +981,7 @@ impl Grow<'_, '_> {
                         }
                     }
                     for (w, st) in w.iter_mut().zip(&sums) {
-                        *w = xgb_calc_weight(*st, &self.b.reg) as f32;
+                        *w = xgb_calc_weight(*st, &self.b.config.reg) as f32;
                     }
                     self.tree.set_leaf_vector(leaf.node, &w);
                 }

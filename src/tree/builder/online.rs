@@ -3,7 +3,8 @@
 //! among the candidates a histogram now offers, scored exactly as the
 //! histogram builder scores them.
 
-use super::{BELOW_ALL_VALUES, SplitPos, SplitScorer, xgb_node_gain};
+use super::shared::xgb_node_gain;
+use super::split::{SplitScorer, for_each_numeric_split};
 use crate::data::quantile::HistCuts;
 use crate::tree::constraints::Bounds;
 use crate::tree::gain::{GradStats, RegParams};
@@ -48,7 +49,7 @@ pub(crate) fn rank_split(
         if cuts.is_categorical(f) || fe <= fs + 1 {
             continue;
         }
-        super::for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
+        for_each_numeric_split(&hist[fs..fe], fs, total, dense, |pos, children| {
             let Some(score) = scorer.loss_chg(children.left, children.right) else {
                 return;
             };
@@ -56,12 +57,10 @@ pub(crate) fn rank_split(
                 return;
             }
             gains.push(score.loss_chg);
-            let cond = match pos {
-                SplitPos::Bin(bin) => cuts.cut_value(bin),
-                SplitPos::BelowBins => BELOW_ALL_VALUES,
-                SplitPos::Value(v) => v,
-            };
-            if f as u32 == feature && cond == split_cond && children.default_left == default_left {
+            if f as u32 == feature
+                && pos.threshold(cuts) == split_cond
+                && children.default_left == default_left
+            {
                 current = Some(score.loss_chg);
             }
         });

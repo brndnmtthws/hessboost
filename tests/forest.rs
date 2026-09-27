@@ -2,8 +2,9 @@
 //! generated rows' structure and validity, imputation, determinism,
 //! persistence, and refusals.
 
-use hessboost::config::{ProcessType, Refresh};
+use hessboost::config::{BalancedBagging, ProcessType, QueryBagging, Refresh};
 use hessboost::diffusion::forest::{ColumnKind, ForestMethod, ForestModel, ForestParams, Repaint};
+use hessboost::objective::{LambdaRank, Logistic};
 use hessboost::prelude::*;
 
 mod common;
@@ -250,6 +251,45 @@ fn refresh_training_params_are_refused() {
         invalid_param(ForestModel::fit(&params, &labelled(&x, &y))),
         "training"
     );
+}
+
+#[test]
+fn row_bagging_training_params_are_refused() {
+    // The class label conditions the model (one GBDT set per class); it is
+    // not a target, so LightGBM's class-balanced bagging, like query-level
+    // bagging, has nothing to sample by: each level's GBDT fits
+    // `reg:squarederror`. Both are refused alone and with the objective each
+    // one needs, for both methods.
+    let balanced = || Some(BalancedBagging::new(0.5, 0.5).unwrap());
+    let query = || Some(QueryBagging::new(0.5).unwrap());
+    let configs: [&dyn Fn(&mut TrainingParams); 4] = [
+        &|t| t.balanced_bagging = balanced(),
+        &|t| t.bagging_by_query = query(),
+        &|t| {
+            t.objective = Objective::BinaryLogistic(Logistic::default());
+            t.balanced_bagging = balanced();
+        },
+        &|t| {
+            t.objective = Objective::RankPairwise(LambdaRank::default());
+            t.bagging_by_query = query();
+        },
+    ];
+    let (x, y) = table(60, 6);
+    let data = labelled(&x, &y);
+    for set in configs {
+        for base in [ForestParams::diffusion(), ForestParams::default()] {
+            let mut params = quick(base);
+            set(&mut params.training);
+            assert!(matches!(
+                params.validate(),
+                Err(HessboostError::InvalidParameter { .. })
+            ));
+            assert!(matches!(
+                ForestModel::fit(&params, &data),
+                Err(HessboostError::InvalidParameter { .. })
+            ));
+        }
+    }
 }
 
 #[test]

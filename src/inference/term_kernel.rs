@@ -90,45 +90,53 @@ impl<'a> TermPart<'a> {
             weight,
             col_mean: Vec::new(),
         };
+        // `K_t 1`: the per-cell sums of the ones vector are the row counts.
         let mut col_sum = vec![0.0; n];
-        part.add_product(&vec![1.0; n], &mut col_sum);
+        part.add_cell_sums_product(&counts, &mut col_sum);
         part.col_mean = col_sum.into_iter().map(|v| v / n as f64).collect();
         Ok(part)
     }
 
-    /// `K_t` between grid cell `cell` and every grid cell.
-    fn cell_row(&self, cell: usize) -> Vec<f64> {
+    /// `K_t` between grid cell `cell` and every grid cell, into
+    /// `scratch.row`.
+    fn cell_row(&self, cell: usize, scratch: &mut CellScratch) {
         let grid = &self.grid;
-        let mut diff = grid.diff();
+        grid.reset_diff(&mut scratch.diff);
         for (t, tree) in self.trees.iter().enumerate() {
             let leaf = grid.leaf_of_cell(tree, t, cell);
             let w = self.weight[leaf];
             if w != 0.0 {
                 for &b in &grid.leaves[leaf].boxes {
-                    grid.box_add(&mut diff, b, w);
+                    grid.box_add(&mut scratch.diff, b, w);
                 }
             }
         }
-        grid.integrate(&diff)
+        grid.integrate_into(&scratch.diff, &mut scratch.row);
     }
 
     /// Add `K_t(x, ·)` over the training rows to `out`, for a point in
     /// grid cell `cell`.
-    fn add_cell_vector(&self, cell: usize, out: &mut [f64]) {
-        let row = self.cell_row(cell);
+    fn add_cell_vector(&self, cell: usize, scratch: &mut CellScratch, out: &mut [f64]) {
+        self.cell_row(cell, scratch);
         for (o, &c) in out.iter_mut().zip(&self.cell_of_row) {
-            *o += row[c as usize];
+            *o += scratch.row[c as usize];
         }
     }
 
     /// `out += K_t v` over the training rows.
     fn add_product(&self, v: &[f64], out: &mut [f64]) {
-        let grid = &self.grid;
-        let mut sums = vec![0.0; grid.len()];
+        let mut sums = vec![0.0; self.grid.len()];
         for (&c, &vi) in self.cell_of_row.iter().zip(v) {
             sums[c as usize] += vi;
         }
-        let prefix = grid.prefix(&sums);
+        self.add_cell_sums_product(&sums, out);
+    }
+
+    /// `out += K_t v` over the training rows, for the `v` whose sums over
+    /// the training rows of each grid cell are `sums`.
+    fn add_cell_sums_product(&self, sums: &[f64], out: &mut [f64]) {
+        let grid = &self.grid;
+        let prefix = grid.prefix(sums);
         let mut diff = grid.diff();
         for (leaf, &w) in grid.leaves.iter().zip(&self.weight) {
             if w == 0.0 {
@@ -151,6 +159,22 @@ impl<'a> TermPart<'a> {
     pub(super) fn cell_of(&self, data: &DMatrix, row: usize) -> usize {
         self.grid.cell_of_row(data, row)
     }
+}
+
+/// A kernel row on one term's grid and its difference array.
+#[derive(Default)]
+struct CellScratch {
+    diff: Vec<f64>,
+    row: Vec<f64>,
+}
+
+/// Working buffers of [`TermKernel::add_query`] and [`Kernel::add_row`],
+/// reused across calls (every call resets what it reads).
+#[derive(Default)]
+pub(super) struct TermScratch {
+    cells: CellScratch,
+    /// A kernel vector over the training rows.
+    k: Vec<f64>,
 }
 
 /// The centered additive kernel `K̄ = J (Σ_t K_t) J` of a stage's terms.
@@ -191,15 +215,23 @@ impl<'a> TermKernel<'a> {
     /// Add `J k̃_t(x)` to `out`: part `t`'s kernel vector of a point in its
     /// grid cell `cell`, minus the part's `K_t 1 / n` (the tree centering),
     /// then centered.
-    pub(super) fn add_query(&self, t: usize, cell: usize, out: &mut [f64]) {
+    pub(super) fn add_query(
+        &self,
+        t: usize,
+        cell: usize,
+        scratch: &mut TermScratch,
+        out: &mut [f64],
+    ) {
         let part = &self.parts[t];
-        let mut k = vec![0.0; self.n];
-        part.add_cell_vector(cell, &mut k);
+        let TermScratch { cells, k } = scratch;
+        k.clear();
+        k.resize(self.n, 0.0);
+        part.add_cell_vector(cell, cells, k);
         for (v, &a) in k.iter_mut().zip(&part.col_mean) {
             *v -= a;
         }
-        center(&mut k);
-        for (o, v) in out.iter_mut().zip(k) {
+        center(k);
+        for (o, &v) in out.iter_mut().zip(k.iter()) {
             *o += v;
         }
     }
@@ -218,19 +250,27 @@ impl<'a> TermKernel<'a> {
 }
 
 impl Kernel for TermKernel<'_> {
+    type Scratch = TermScratch;
+
     fn n(&self) -> usize {
         self.n
     }
 
+    fn scratch(&self) -> TermScratch {
+        TermScratch::default()
+    }
+
     /// `K̄_i = K_i − K1/n − (K1/n)_i + 1ᵀK1/n²`, each term's row summed in
     /// term order.
-    fn add_row(&self, row: usize, out: &mut [f64]) {
-        let mut k = vec![0.0; self.n];
+    fn add_row(&self, row: usize, scratch: &mut TermScratch, out: &mut [f64]) {
+        let TermScratch { cells, k } = scratch;
+        k.clear();
+        k.resize(self.n, 0.0);
         for part in &self.parts {
-            part.add_cell_vector(part.cell_of_row[row] as usize, &mut k);
+            part.add_cell_vector(part.cell_of_row[row] as usize, cells, k);
         }
         let shift = self.grand_mean - self.col_mean[row];
-        for ((o, v), &a) in out.iter_mut().zip(k).zip(&self.col_mean) {
+        for ((o, &v), &a) in out.iter_mut().zip(k.iter()).zip(&self.col_mean) {
             *o += v - a + shift;
         }
     }

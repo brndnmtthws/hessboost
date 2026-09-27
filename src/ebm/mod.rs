@@ -70,7 +70,8 @@
 //!
 //! # Shape functions
 //!
-//! [`shape_functions`] merges every term's trees into one piecewise-constant
+//! [`shape_functions`] (or [`term_shape`] for one term) merges every term's
+//! trees into one piecewise-constant
 //! function on the grid their splits cut the term's features into: the
 //! union of the thresholds of a numerical feature, one cell per category a
 //! split sends left (plus one for every other category) of a categorical
@@ -139,6 +140,8 @@
 
 pub(crate) mod grid;
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 
 use crate::data::DMatrix;
@@ -182,17 +185,33 @@ pub struct EbmBoulevard {
     pub reg_lambda: f64,
 }
 
+/// One Boulevard EBM stage ([`EbmInfo::stages`]): a contiguous run of terms
+/// and the contiguous trees of its rounds, one tree per term in term order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stage {
+    /// `0` for the main-effect stage, `1` for the pair stage.
+    pub(crate) index: usize,
+    /// The stage's terms (never empty).
+    pub(crate) terms: Range<usize>,
+    /// The stage's trees, round by round.
+    pub(crate) trees: Range<usize>,
+    /// The stage's rounds (`trees.len() / terms.len()`).
+    pub(crate) rounds: usize,
+}
+
+/// A malformed EBM record.
+fn invalid_record(reason: impl std::fmt::Display) -> HessboostError {
+    HessboostError::model_format(format!("invalid EBM record: {reason}"))
+}
+
 impl EbmInfo {
     /// Check the record against `model`: one term per tree, terms of one or
-    /// two distinct features, every tree splitting numerically on its
-    /// term's features only, and (for a Boulevard fit) the settings'
-    /// ranges.
+    /// two distinct features, every tree splitting only on its term's
+    /// features (each feature of a term numerically in all its trees or
+    /// categorically in all of them), and (for a Boulevard fit) the
+    /// settings' ranges and the stage layout ([`Self::stages`]).
     pub(crate) fn validate(&self, model: &BoostedModel) -> Result<()> {
-        let fail = |reason: String| {
-            Err(HessboostError::model_format(format!(
-                "invalid EBM record: {reason}"
-            )))
-        };
+        let fail = |reason: String| Err(invalid_record(reason));
         if model.n_outputs() != 1
             || model.has_vector_leaves()
             || model.has_non_unit_tree_weights()
@@ -269,25 +288,34 @@ impl EbmInfo {
             {
                 return fail("a Boulevard EBM is a reg:squarederror model".into());
             }
-            self.validate_stages().or_else(fail)?;
+            self.stages().map(drop)?;
         }
         Ok(())
     }
 
-    /// The layout a Boulevard EBM's inference and refit read: the main
-    /// terms first, then the pairs, and each stage's trees contiguous,
-    /// round by round, one per term of the stage in term order.
-    fn validate_stages(&self) -> std::result::Result<(), String> {
+    /// The non-empty stages of a Boulevard EBM, in order, as its validation,
+    /// inference, and refit read them: the main terms first, then the
+    /// pairs, and each stage's trees contiguous, round by round, one per
+    /// term of the stage in term order.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::ModelFormat`] when the record does not have that
+    /// layout.
+    pub(crate) fn stages(&self) -> Result<impl Iterator<Item = Stage>> {
         let mains = self.terms.iter().take_while(|t| t.len() == 1).count();
         if self.terms[mains..].iter().any(|t| t.len() == 1) {
-            return Err("a Boulevard EBM lists its main terms before its pairs".into());
+            return Err(invalid_record(
+                "a Boulevard EBM lists its main terms before its pairs",
+            ));
         }
         let mut at = 0;
-        for stage in [0..mains, mains..self.terms.len()] {
-            let k = stage.len();
+        let mut stages = Vec::with_capacity(2);
+        for (index, terms) in [0..mains, mains..self.terms.len()].into_iter().enumerate() {
+            let k = terms.len();
             let trees = self.tree_terms[at..]
                 .iter()
-                .take_while(|&&t| stage.contains(&(t as usize)))
+                .take_while(|&&t| terms.contains(&(t as usize)))
                 .count();
             if k == 0 {
                 continue;
@@ -295,20 +323,26 @@ impl EbmInfo {
             let round_robin = self.tree_terms[at..at + trees]
                 .iter()
                 .enumerate()
-                .all(|(i, &t)| t as usize == stage.start + i % k);
+                .all(|(i, &t)| t as usize == terms.start + i % k);
             if trees % k != 0 || !round_robin {
-                return Err(format!(
+                return Err(invalid_record(format!(
                     "a Boulevard EBM stage must hold whole rounds of its {k} terms in term order"
-                ));
+                )));
             }
+            stages.push(Stage {
+                index,
+                terms,
+                trees: at..at + trees,
+                rounds: trees / k,
+            });
             at += trees;
         }
         if at != self.tree_terms.len() {
-            return Err(
-                "a Boulevard EBM's trees must be its main stage, then its pair stage".into(),
-            );
+            return Err(invalid_record(
+                "a Boulevard EBM's trees must be its main stage, then its pair stage",
+            ));
         }
-        Ok(())
+        Ok(stages.into_iter())
     }
 
     /// The trees of term `term`, in model order.
@@ -354,6 +388,22 @@ impl EbmInfo {
             }
         }
         grid.paint(|i| leaf_values[i])
+    }
+
+    /// The shape function of term `term` (in range).
+    fn shape(&self, model: &BoostedModel, term: usize) -> TermShape {
+        let grid = self.grid(model, term);
+        let mean = self.term_means[term];
+        let values = self
+            .raw_values(model, term, &grid)
+            .into_iter()
+            .map(|v| v - mean)
+            .collect();
+        TermShape {
+            features: self.terms[term].clone(),
+            axes: grid.axes.into_iter().map(|a| a.kind).collect(),
+            values,
+        }
     }
 }
 
@@ -427,8 +477,8 @@ impl TermAxis {
 /// [`axes`](Self::axes)`[a]`; [`values`](Self::values) holds one value per
 /// grid cell, row-major (the first feature's cell slowest), so a main term
 /// has `axes[0].cells()` values and a pair `axes[0].cells() ×
-/// axes[1].cells()`. Built only by [`shape_functions`], so the three always
-/// agree.
+/// axes[1].cells()`. Built only by [`shape_functions`] and [`term_shape`],
+/// so the three always agree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TermShape {
     features: Vec<u32>,
@@ -483,6 +533,13 @@ impl TermShape {
     }
 }
 
+/// The EBM record of `model`, refusing other models.
+fn ebm_info(model: &BoostedModel) -> Result<&EbmInfo> {
+    model.ebm().ok_or_else(|| {
+        HessboostError::invalid_param("model", "not an EBM: train it with `booster = ebm`")
+    })
+}
+
 /// The shape functions and intercept of `model`, an EBM
 /// ([`BoosterKind::Ebm`](crate::config::BoosterKind::Ebm)): every term's
 /// trees merged into one piecewise-constant function of its features (see
@@ -494,27 +551,52 @@ impl TermShape {
 /// [`HessboostError::InvalidParameter`] when `model` is not an EBM
 /// ([`BoostedModel::ebm`] is `None`).
 pub fn shape_functions(model: &BoostedModel) -> Result<ShapeFunctions> {
-    let info = model.ebm().ok_or_else(|| {
-        HessboostError::invalid_param("model", "not an EBM: train it with `booster = ebm`")
-    })?;
+    let info = ebm_info(model)?;
     let terms = (0..info.terms.len())
-        .map(|t| {
-            let grid = info.grid(model, t);
-            let mean = info.term_means[t];
-            let values = info
-                .raw_values(model, t, &grid)
-                .into_iter()
-                .map(|v| v - mean)
-                .collect();
-            TermShape {
-                features: info.terms[t].clone(),
-                axes: grid.axes.iter().map(|a| a.kind.clone()).collect(),
-                values,
-            }
-        })
+        .map(|t| info.shape(model, t))
         .collect();
     Ok(ShapeFunctions {
         intercept: f64::from(model.base_scores()[0]) + info.term_means.iter().sum::<f64>(),
         terms,
     })
+}
+
+/// The shape function of term `term` of the EBM `model`: element `term` of
+/// [`shape_functions`]' terms, built without the other terms' grids.
+///
+/// # Errors
+///
+/// [`HessboostError::InvalidParameter`] when `model` is not an EBM
+/// ([`BoostedModel::ebm`] is `None`) or has no term `term`.
+///
+/// # Example
+///
+/// ```
+/// use hessboost::config::{BoosterKind, Ebm};
+/// use hessboost::ebm::{shape_functions, term_shape};
+/// use hessboost::prelude::*;
+///
+/// # fn main() -> Result<()> {
+/// let x: Vec<f32> = (0..200).map(|i| ((i * 37) % 101) as f32 / 101.0).collect();
+/// let y: Vec<f32> = x.chunks(2).map(|r| r[0] - r[1]).collect();
+/// let dtrain = DMatrix::from_dense(&x, 100, 2)?.with_labels(&y)?;
+/// let params = TrainingParams::builder()
+///     .booster(BoosterKind::Ebm(Ebm::default()))
+///     .max_depth(2)
+///     .build()?;
+/// let model = train(&params, &dtrain, 10)?;
+/// assert_eq!(term_shape(&model, 1)?, shape_functions(&model)?.terms[1]);
+/// assert!(term_shape(&model, 2).is_err());
+/// # Ok(())
+/// # }
+/// ```
+pub fn term_shape(model: &BoostedModel, term: usize) -> Result<TermShape> {
+    let info = ebm_info(model)?;
+    if term >= info.terms.len() {
+        return Err(HessboostError::invalid_param(
+            "term",
+            format!("the model has {} terms, got {term}", info.terms.len()),
+        ));
+    }
+    Ok(info.shape(model, term))
 }

@@ -132,8 +132,9 @@ fn runs(cells: &[bool]) -> Vec<(usize, usize)> {
 
 impl TermGrid {
     /// The grid of `trees`, which split only on `features` (one or two,
-    /// ascending) at numeric thresholds; [`crate::ebm::EbmInfo::validate`]
-    /// checks that of every loaded model.
+    /// ascending), each feature at numerical thresholds in every tree or on
+    /// category sets in every tree; [`crate::ebm::EbmInfo::validate`] checks
+    /// that of every loaded model.
     pub(crate) fn new(trees: &[&RegTree], features: &[u32]) -> Self {
         let axes: Vec<Axis> = features
             .iter()
@@ -264,7 +265,15 @@ impl TermGrid {
 
     /// A zeroed difference array (`(dims[0] + 1) × (dims[1] + 1)`).
     pub(crate) fn diff(&self) -> Vec<f64> {
-        vec![0.0; (self.dims[0] + 1) * (self.dims[1] + 1)]
+        let mut diff = Vec::new();
+        self.reset_diff(&mut diff);
+        diff
+    }
+
+    /// Make `diff` a zeroed difference array, reusing its allocation.
+    pub(crate) fn reset_diff(&self, diff: &mut Vec<f64>) {
+        diff.clear();
+        diff.resize((self.dims[0] + 1) * (self.dims[1] + 1), 0.0);
     }
 
     /// Add `v` over box `b` of the difference array `diff`.
@@ -279,9 +288,17 @@ impl TermGrid {
 
     /// The cell values of the difference array `diff`.
     pub(crate) fn integrate(&self, diff: &[f64]) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.integrate_into(diff, &mut out);
+        out
+    }
+
+    /// [`Self::integrate`] into `out`, reusing its allocation.
+    pub(crate) fn integrate_into(&self, diff: &[f64], out: &mut Vec<f64>) {
         let [d0, d1] = self.dims;
         let s = d1 + 1;
-        let mut out = vec![0.0; d0 * d1];
+        out.clear();
+        out.resize(d0 * d1, 0.0);
         for i in 0..d0 {
             let mut run = 0.0;
             for j in 0..d1 {
@@ -289,7 +306,6 @@ impl TermGrid {
                 out[i * d1 + j] = run + if i > 0 { out[(i - 1) * d1 + j] } else { 0.0 };
             }
         }
-        out
     }
 
     /// The inclusive-exclusive prefix sums `P[i][j] = Σ_{< i, < j}` of the

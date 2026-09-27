@@ -273,7 +273,8 @@ pub struct ForestParams {
     /// How each column is encoded, one entry per column; `None` makes every
     /// column [`ColumnKind::Continuous`].
     pub column_kinds: Option<Vec<ColumnKind>>,
-    /// Parameters of every GBDT (objective `reg:squarederror`). Default:
+    /// Parameters of every GBDT (objective `reg:squarederror` with
+    /// `scale_pos_weight = 1`). Default:
     /// the reference's XGBoost settings, `hist`, depth 7, `eta = 0.3`,
     /// `lambda = 0`.
     pub training: TrainingParams,
@@ -317,10 +318,10 @@ impl ForestParams {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for `n_t < 2`, a zero count,
-    /// invalid `β`, or GBDT parameters that fail
-    /// [`TrainingParams::validate`], name an objective other than
-    /// `reg:squarederror`, or set `process_type` to `update`.
+    /// [`HessboostError::InvalidParameter`] for `n_t < 2`, invalid `β`, or
+    /// GBDT parameters that fail [`TrainingParams::validate`], name an
+    /// objective other than `reg:squarederror` with `scale_pos_weight = 1`,
+    /// or set `process_type` to `update`.
     pub fn validate(&self) -> Result<()> {
         self.method.validate()?;
         if self.n_t < 2 {

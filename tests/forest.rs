@@ -8,7 +8,7 @@ use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
 use hessboost::diffusion::forest::{ColumnKind, ForestMethod, ForestModel, ForestParams, Repaint};
-use hessboost::objective::{LambdaRank, Logistic};
+use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
@@ -212,6 +212,10 @@ fn unsupported_inputs_are_refused() {
     let mut params = quick(ForestParams::default());
     params.n_t = 1;
     assert_eq!(invalid_param(ForestModel::fit(&params, &data)), "n_t");
+    // Every level regresses its target with unweighted squared error.
+    let mut params = quick(ForestParams::default());
+    params.training.objective = Objective::SquaredError(RegLoss::new(2.0).unwrap());
+    assert_eq!(invalid_param(ForestModel::fit(&params, &data)), "training");
     let mut params = quick(ForestParams::default());
     params.method = ForestMethod::Diffusion {
         beta_min: 1.0,
@@ -277,7 +281,7 @@ fn row_bagging_training_params_are_refused() {
         &|t| t.balanced_bagging = balanced(),
         &|t| t.bagging_by_query = query(),
         &|t| {
-            t.objective = Objective::BinaryLogistic(Logistic::default());
+            t.objective = Objective::BinaryLogistic(RegLoss::default());
             t.balanced_bagging = balanced();
         },
         &|t| {

@@ -201,7 +201,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
+use crate::model::{BoostedModel, Predictions};
 use crate::objective::Objective;
 use crate::objective::distributional::special::norm_ppf;
 use kernel::{Kernel, LeafKernel};
@@ -542,7 +542,7 @@ impl<'a> BoulevardInference<'a> {
         )?;
         let noise_variance = noise_estimate(model, train, noise)?;
         let (c, s) = info.ridge(model.num_parallel_tree());
-        let leaves = model.predict_leaf_range(train, ..)?.into_vec();
+        let leaves = model.predict_leaf_range(train, ..)?;
         let kernel = LeafKernel::new(model.trees(), &leaves, info.kappa())?;
         let solver = build_solver(&kernel, solver, c)?;
         Ok(BoulevardInference {
@@ -592,18 +592,21 @@ impl<'a> BoulevardInference<'a> {
     }
 
     /// The leaf node ids of `data`'s rows, `[row][tree]`.
-    fn leaves(&self, data: &DMatrix) -> Result<Vec<u32>> {
+    fn leaves(&self, data: &DMatrix) -> Result<Predictions<u32>> {
         check_data(self.model, data, "data", false)?;
-        Ok(self.model.predict_leaf_range(data, ..)?.into_vec())
+        self.model.predict_leaf_range(data, ..)
     }
 
     /// The kernel vectors of the `rows` of `leaves` (`[row][tree]`), one
     /// per row of the result (`rows.len() × n`).
-    fn kernel_vectors(&self, leaves: &[u32], rows: std::ops::Range<usize>) -> Vec<f64> {
-        let (n, t) = (self.kernel.n(), self.kernel.n_trees());
+    fn kernel_vectors(&self, leaves: &Predictions<u32>, rows: std::ops::Range<usize>) -> Vec<f64> {
+        let n = self.kernel.n();
         let mut k = vec![0.0; rows.len() * n];
-        for (out, row) in k.chunks_exact_mut(n).zip(rows) {
-            self.kernel.add_query(&leaves[row * t..(row + 1) * t], out);
+        for (out, ids) in k
+            .chunks_exact_mut(n)
+            .zip(rows.filter_map(|row| leaves.row(row)))
+        {
+            self.kernel.add_query(ids, out);
         }
         k
     }

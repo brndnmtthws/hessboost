@@ -150,9 +150,12 @@ fn gradient_based_sampling_tree_method_support() {
     assert!(train(&dart, &data, 3).is_ok());
 }
 
-/// Query bagging trains deterministically from the seed and still splits.
+/// Query bagging trains deterministically from the seed, still splits, and
+/// trains on a sample: its trees differ from the unbagged run's. (That each
+/// query is kept or dropped whole is checked on the sampler itself, in
+/// `training::train`'s `query_subsets_keep_whole_groups_at_any_thread_count`.)
 #[test]
-fn bagging_by_query_is_seeded_and_keeps_whole_groups() {
+fn bagging_by_query_is_seeded_and_changes_the_trees() {
     let n_groups = 30;
     let group_size = 4;
     let n = n_groups * group_size;
@@ -181,6 +184,9 @@ fn bagging_by_query_is_seeded_and_keeps_whole_groups() {
     for tree in &first {
         assert!(tree.nodes().iter().any(|node| !node.is_leaf()));
     }
+    let mut unbagged = params;
+    unbagged.bagging_by_query = None;
+    assert_ne!(first, train(&unbagged, &data, 4).unwrap().trees().to_vec());
 }
 
 /// Query bagging needs a `rank:*` objective on a tree booster, uniform

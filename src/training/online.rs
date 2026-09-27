@@ -123,7 +123,10 @@
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
-use super::train::{RoundEval, Trainer, validate_training_data};
+use super::train::{
+    RoundEval, Trainer, configured_metrics, initial_intercepts, validate_training_data,
+    with_thread_pool,
+};
 use crate::config::{
     BoosterKind, Device, GrowPolicy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
 };
@@ -262,10 +265,13 @@ impl OnlineModel {
     ///
     /// The refusals of [`Self::train`], and
     /// [`HessboostError::InvalidParameter`] for a model that `params` could
-    /// not have trained (another objective, several outputs, weighted or
-    /// categorical trees, linear leaves, a `gblinear`, `boulevard`, or
-    /// `ebm` booster, for example from an imported LightGBM `linear_tree`
-    /// model, model shrinkage, a different feature count).
+    /// not have trained (another objective or `max_delta_step`, several
+    /// outputs, weighted trees, categorical trees in the approximate mode,
+    /// linear leaves, a `gblinear`, `boulevard`, or `ebm` booster, for
+    /// example from an imported LightGBM `linear_tree` model, model
+    /// shrinkage, a different feature count), for an early-stopped model
+    /// (`best_iteration` set: slice it to its best iterations first), and
+    /// for `eval_metric`s training would refuse.
     pub fn from_model(
         model: BoostedModel,
         params: &TrainingParams,
@@ -273,6 +279,9 @@ impl OnlineModel {
         online: OnlineParams,
     ) -> Result<Self> {
         check_supported(params, data, online)?;
+        // Training refuses metrics the objective cannot score before any
+        // round; a resumed model gets the same check.
+        configured_metrics(params, params.loss(1)?.as_ref())?;
         let categorical = model
             .trees()
             .iter()
@@ -281,7 +290,12 @@ impl OnlineModel {
             || model.n_outputs() != 1
             || model.num_parallel_tree() != 1
             || model.n_features() != data.n_cols()
-            || categorical
+            // The approximate mode replays numeric splits only; the exact
+            // mode retrains, so categorical trees are fine there.
+            || (categorical && online.tolerance > 0.0)
+            // The objective's `max_delta_step` shapes every leaf: a model
+            // trained with another one is not a model of these parameters.
+            || model.max_delta_step() != params.effective_max_delta_step()
             || model.linear().is_some()
             || model.boulevard().is_some()
             || model.ebm().is_some()
@@ -301,8 +315,24 @@ impl OnlineModel {
                  Boulevard or EBM) with constant leaves of these parameters and data",
             ));
         }
+        if let Some(best) = model.best_iteration() {
+            // Early stopping keeps every trained iteration but predicts with
+            // the first `best + 1`; an update updates (and predicts with)
+            // them all, and a model without `best_iteration`.
+            return Err(HessboostError::invalid_param(
+                "model",
+                format!(
+                    "an early-stopped model (best_iteration {best} of {} iterations) is not \
+                     updatable: slice it to its best iterations first (`slice(..{}, 1)`)",
+                    model.num_boost_rounds(),
+                    best + 1
+                ),
+            ));
+        }
         let cache = if online.tolerance > 0.0 {
-            Some(Cache::build(&model, params, data)?)
+            Some(with_thread_pool(params, || {
+                Cache::build(&model, params, data)
+            })?)
         } else {
             None
         };
@@ -373,6 +403,15 @@ impl OnlineModel {
         // the loss's domain) before any state changes: the approximate mode
         // computes gradients without going through the trainer's checks.
         validate_training_data(&self.params, &updated)?;
+        // Retraining estimates the intercept from the labels (unless
+        // `base_score` is set) and refuses a non-finite one; the approximate
+        // mode keeps the original intercept, so check it here.
+        initial_intercepts(
+            &self.params,
+            self.params.loss(1)?.as_ref(),
+            &updated.info(),
+            1,
+        )?;
         let rounds = self.model.num_boost_rounds();
         // The approximate mode updates a copy of the cache, swapped in on
         // success, so an abandoned update leaves exactly the state it started
@@ -409,8 +448,8 @@ impl OnlineModel {
             deleted: &deleted,
             model: &self.model,
         };
-        let outcome = run
-            .run(&mut cache, &mut on_round)
+        // On `nthread` threads, as training runs.
+        let outcome = with_thread_pool(&self.params, || run.run(&mut cache, &mut on_round))
             .and_then(|done| match commit() {
                 ControlFlow::Continue(()) => Ok(done),
                 ControlFlow::Break(()) => Err(interrupted()),

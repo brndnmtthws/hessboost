@@ -6,10 +6,11 @@
 use std::ops::ControlFlow;
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink, ModelShrinkMode,
-    QueryBagging,
+    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, MaxDeltaStep, ModelShrink,
+    ModelShrinkMode, QueryBagging,
 };
 use hessboost::data::FeatureType;
+use hessboost::metric::EvalMetric;
 use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Logistic, Objective};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
@@ -489,4 +490,176 @@ fn an_abandoned_update_keeps_the_update_state() {
             );
         }
     }
+}
+
+/// Labelled dense rows, with `NaN` as missing.
+fn rows(x: &[f32], cols: usize, y: &[f32]) -> DMatrix {
+    DMatrix::from_dense(x, y.len(), cols)
+        .unwrap()
+        .with_labels(y)
+        .unwrap()
+}
+
+/// One-step trees without shrinkage or L2 penalty, so leaf values are the
+/// plain means the tests reason about.
+fn plain(max_depth: usize) -> TrainingParams {
+    TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .max_depth(max_depth)
+        .eta(1.0)
+        .lambda(0.0)
+        .base_score(0.0)
+        .build()
+        .unwrap()
+}
+
+/// `from_model` refuses what `params` would not have trained, or training
+/// would refuse: an early-stopped model (an update would predict with every
+/// iteration and drop `best_iteration`; its best-iterations slice is fine),
+/// another `max_delta_step` than the parameters', and a metric the
+/// objective cannot score.
+#[test]
+fn from_model_refuses_models_and_metrics_training_would_not_give() {
+    let d = data(300, 11, false);
+    let valid = data(100, 12, false);
+    let p = params(Objective::SquaredError);
+    let stopped = Trainer::new(&p, &d, 200)
+        .eval(&valid, "valid")
+        .early_stopping_rounds(2)
+        .train()
+        .unwrap()
+        .model;
+    let best = stopped.best_iteration().expect("stops early");
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(stopped.clone(), &p, &d, online)),
+            "model"
+        );
+        let best_slice = stopped.slice(..=best, 1).unwrap();
+        assert!(OnlineModel::from_model(best_slice, &p, &d, online).is_ok());
+    }
+
+    let counts = rows(&[0.0, 0.0, 1.0, 1.0], 1, &[0.0, 0.0, 1.0, 1.0]);
+    let poisson = TrainingParams::builder()
+        .objective(Objective::Poisson)
+        .tree_method(TreeMethod::Hist)
+        .max_depth(1)
+        .build()
+        .unwrap();
+    let model = train(&poisson, &counts, 2).unwrap();
+    let mut unbounded = poisson.clone();
+    unbounded.max_delta_step = MaxDeltaStep::Unbounded;
+    assert_eq!(
+        invalid_param(OnlineModel::from_model(
+            model.clone(),
+            &unbounded,
+            &counts,
+            OnlineParams::default()
+        )),
+        "model"
+    );
+    assert!(OnlineModel::from_model(model, &poisson, &counts, OnlineParams::default()).is_ok());
+
+    let binary = data(100, 13, true);
+    let logistic_params = params(logistic());
+    let model = train(&logistic_params, &binary, 2).unwrap();
+    let mut multiclass_metric = logistic_params.clone();
+    multiclass_metric.eval_metric = vec![EvalMetric::MLogLoss];
+    assert_eq!(
+        invalid_param(OnlineModel::from_model(
+            model,
+            &multiclass_metric,
+            &binary,
+            OnlineParams::default()
+        )),
+        "eval_metric"
+    );
+}
+
+/// The exact mode retrains, so it accepts categorical features (and a
+/// model with categorical splits) and equals retraining; the approximate
+/// mode, which replays numeric splits, refuses them.
+#[test]
+fn the_exact_mode_updates_categorical_models() {
+    let d = rows(
+        &[0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+        1,
+        &[0.0, 0.0, 1.0, 1.0, 3.0, 3.0],
+    )
+    .with_feature_types(&[FeatureType::Categorical])
+    .unwrap();
+    let p = plain(2);
+    let mut exact = OnlineModel::train(&p, &d, 2, OnlineParams::with_tolerance(0.0)).unwrap();
+    assert!(
+        exact.model().trees()[0]
+            .nodes()
+            .iter()
+            .any(|n| n.is_categorical)
+    );
+    let added = rows(&[1.0], 1, &[2.0])
+        .with_feature_types(&[FeatureType::Categorical])
+        .unwrap();
+    exact.update(Some(&added), &[0]).unwrap();
+    assert_eq!(
+        exact.model().trees(),
+        train(&p, exact.data(), 2).unwrap().trees()
+    );
+    assert_eq!(
+        invalid_param(OnlineModel::train(
+            &p,
+            &d,
+            2,
+            OnlineParams::with_tolerance(0.1)
+        )),
+        "data"
+    );
+}
+
+/// An update refuses data whose intercept retraining could not estimate
+/// (here `count:poisson` with only zero labels left), and changes nothing.
+#[test]
+fn updates_refuse_data_without_a_finite_intercept() {
+    let poisson = TrainingParams::builder()
+        .objective(Objective::Poisson)
+        .tree_method(TreeMethod::Hist)
+        .max_depth(1)
+        .build()
+        .unwrap();
+    let counts = rows(&[0.0, 1.0], 1, &[0.0, 1.0]);
+    for tolerance in [0.1, 0.0] {
+        let mut online = OnlineModel::train(
+            &poisson,
+            &counts,
+            2,
+            OnlineParams::with_tolerance(tolerance),
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_param(train(&poisson, &rows(&[0.0], 1, &[0.0]), 2)),
+            "base_score"
+        );
+        assert_eq!(invalid_param(online.update(None, &[1])), "base_score");
+        assert_eq!(online.data().n_rows(), 2);
+    }
+}
+
+/// Updates run on `nthread` threads, as training does, whatever pool the
+/// caller runs them in.
+#[test]
+fn updates_run_on_the_configured_threads() {
+    let mut p = params(Objective::SquaredError);
+    p.nthread = std::num::NonZeroUsize::new(1);
+    let d = data(200, 14, false);
+    with_threads(4, || {
+        let mut online = OnlineModel::train(&p, &d, 3, OnlineParams::default()).unwrap();
+        let mut seen = Vec::new();
+        online
+            .update_with(None, &[0], |_| {
+                seen.push(rayon::current_num_threads());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(seen, vec![1; 3]);
+    });
 }

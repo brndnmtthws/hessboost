@@ -37,6 +37,86 @@ fn node_counts(tree: &RegTree, leaf_counts: &[usize]) -> Vec<usize> {
     counts
 }
 
+/// The leaf node id of every row of the refit sample in every tree.
+struct LeafIds {
+    /// `[row][tree]`.
+    ids: Vec<u32>,
+    rows: usize,
+    trees: usize,
+}
+
+impl LeafIds {
+    fn new(model: &BoostedModel, values: &DMatrix) -> Result<Self> {
+        Ok(LeafIds {
+            ids: model.predict_leaf_range(values, ..)?.into_vec(),
+            rows: values.n_rows(),
+            trees: model.num_trees(),
+        })
+    }
+
+    /// The leaf of row `row` in tree `tree`.
+    fn leaf(&self, row: usize, tree: usize) -> usize {
+        self.ids[row * self.trees + tree] as usize
+    }
+}
+
+/// Per node of one tree, the sum and count of the residuals of the sampled
+/// rows reaching it (leaves only; internal nodes stay `0`).
+struct LeafSums {
+    sums: Vec<f64>,
+    counts: Vec<usize>,
+}
+
+impl LeafSums {
+    /// Add `residual(row)` of every row `in_bag` keeps to its leaf of tree
+    /// `tree` (of `nodes` nodes), in row order.
+    fn accumulate(
+        leaves: &LeafIds,
+        tree: usize,
+        nodes: usize,
+        in_bag: &[bool],
+        residual: impl Fn(usize) -> f64,
+    ) -> Self {
+        let mut sums = vec![0.0f64; nodes];
+        let mut counts = vec![0usize; nodes];
+        for (row, &keep) in in_bag.iter().enumerate() {
+            if keep {
+                let leaf = leaves.leaf(row, tree);
+                sums[leaf] += residual(row);
+                counts[leaf] += 1;
+            }
+        }
+        LeafSums { sums, counts }
+    }
+
+    /// Every leaf's `Σ z / (m + lambda)` (`0` when that denominator is not
+    /// positive, and at internal nodes), per node id of `tree`.
+    fn leaf_values(&self, tree: &RegTree, reg_lambda: f64) -> Vec<f64> {
+        let mut values = vec![0.0f64; tree.num_nodes()];
+        for (id, node) in tree.nodes().iter().enumerate() {
+            let denom = self.counts[id] as f64 + reg_lambda;
+            if node.is_leaf() && denom > 0.0 {
+                values[id] = self.sums[id] / denom;
+            }
+        }
+        values
+    }
+}
+
+/// Set every node's cover to the number of rows of `leaves` reaching it,
+/// tree by tree.
+fn update_covers(trees: &mut [RegTree], leaves: &LeafIds) {
+    for (t, tree) in trees.iter_mut().enumerate() {
+        let mut leaf_counts = vec![0usize; tree.num_nodes()];
+        for row in 0..leaves.rows {
+            leaf_counts[leaves.leaf(row, t)] += 1;
+        }
+        for (id, &c) in node_counts(tree, &leaf_counts).iter().enumerate() {
+            tree.set_sum_hess(id, c as f32);
+        }
+    }
+}
+
 /// Refit every leaf of the Boulevard model `model` on `values`, labelled
 /// rows independent of its training data, keeping every tree's structure:
 /// the Boulevard recursion the model was trained with (BRAT-D with its
@@ -85,8 +165,7 @@ pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedMod
     } else {
         model.base_score()
     };
-    let t_count = model.num_trees();
-    let node_ids = model.predict_leaf_range(values, ..)?.into_vec();
+    let leaves = LeafIds::new(model, values)?;
     let parallel = model.num_parallel_tree();
     let schedule = Schedule::from_info(&info, parallel, REFIT_SALT);
     let mut refit = model.clone();
@@ -105,49 +184,29 @@ pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedMod
                 let t = index * parallel + first_slot + j;
                 let in_bag = row_sample(n, info.subsample, rng);
                 let tree = &mut trees[t];
-                let mut sums = vec![0.0f64; tree.num_nodes()];
-                let mut counts = vec![0usize; tree.num_nodes()];
-                for (row, &keep) in in_bag.iter().enumerate() {
-                    if keep {
-                        let leaf = node_ids[row * t_count + t] as usize;
-                        sums[leaf] += f64::from(labels[row]) - f64::from(mu) - offset[row];
-                        counts[leaf] += 1;
-                    }
-                }
-                let mut values = vec![0.0f32; tree.num_nodes()];
-                for (id, node) in tree.nodes().iter().enumerate() {
-                    if node.is_leaf() {
-                        let denom = counts[id] as f64 + info.reg_lambda;
-                        if denom > 0.0 {
-                            values[id] = (sums[id] / denom) as f32;
-                        }
-                    }
-                }
+                let sums = LeafSums::accumulate(&leaves, t, tree.num_nodes(), &in_bag, |row| {
+                    f64::from(labels[row]) - f64::from(mu) - offset[row]
+                });
+                let values: Vec<f32> = sums
+                    .leaf_values(tree, info.reg_lambda)
+                    .into_iter()
+                    .map(|v| v as f32)
+                    .collect();
                 for (id, &v) in values.iter().enumerate() {
                     if tree.nodes()[id].is_leaf() {
                         tree.set_leaf_value(id, v);
                     }
                 }
-                preds.push(
-                    (0..n)
-                        .map(|row| values[node_ids[row * t_count + t] as usize])
-                        .collect(),
-                );
+                preds.push((0..n).map(|row| values[leaves.leaf(row, t)]).collect());
             }
             Ok(preds)
         })?;
     }
     let scale = recursion.scale() as f32;
-    for (t, tree) in trees.iter_mut().enumerate() {
+    for tree in trees.iter_mut() {
         tree.scale_leaves(scale);
-        let mut leaf_counts = vec![0usize; tree.num_nodes()];
-        for row in 0..n {
-            leaf_counts[node_ids[row * t_count + t] as usize] += 1;
-        }
-        for (id, &c) in node_counts(tree, &leaf_counts).iter().enumerate() {
-            tree.set_sum_hess(id, c as f32);
-        }
     }
+    update_covers(trees, &leaves);
     refit.set_base_scores(vec![mu]);
     refit.set_best_iteration(None);
     if refit
@@ -189,65 +248,45 @@ fn ebm_refit(
     let labels = finite_labels(model, values)?;
     let n = values.n_rows();
     let mu = labels.iter().map(|&y| f64::from(y)).sum::<f64>() / n as f64;
-    let t_count = model.num_trees();
-    let node_ids = model.predict_leaf_range(values, ..)?.into_vec();
+    let leaves = LeafIds::new(model, values)?;
     let mut refit = model.clone();
     let mut base = vec![mu; n];
-    let mut first_tree = 0;
-    for (stage, size) in [1usize, 2].into_iter().enumerate() {
-        let terms = info.terms.iter().filter(|t| t.len() == size).count();
-        let stage_trees = info.tree_terms[first_tree..]
-            .iter()
-            .take_while(|&&t| info.terms[t as usize].len() == size)
-            .count();
-        if terms == 0 {
-            continue;
-        }
-        let rounds = stage_trees / terms;
+    for stage in info.stages()? {
+        let terms = stage.terms.len();
         let schedule = Schedule {
             dropout: 0.0,
             learning_rate: settings.learning_rate,
             truncation: None,
             parallel: 1,
             seed: 0,
-            salt: REFIT_SALT ^ stage as u64,
+            salt: REFIT_SALT ^ stage.index as u64,
         };
         let mut recursion = Recursion::new(schedule, n);
         let mut total = vec![0.0f64; n];
         let trees = refit.trees_mut();
-        for round in 0..rounds {
+        for round in 0..stage.rounds {
             recursion.step(|request| {
                 let RoundRequest { offsets, rng, .. } = request;
                 let mut round_sum = vec![0.0f64; n];
                 for k in 0..terms {
-                    let t = first_tree + round * terms + k;
+                    let t = stage.trees.start + round * terms + k;
                     let in_bag = row_sample(n, settings.subsample, rng);
                     let tree = &mut trees[t];
-                    let mut sums = vec![0.0f64; tree.num_nodes()];
-                    let mut counts = vec![0usize; tree.num_nodes()];
-                    for (row, &keep) in in_bag.iter().enumerate() {
-                        if keep {
-                            let leaf = node_ids[row * t_count + t] as usize;
-                            sums[leaf] += f64::from(labels[row]) - base[row] - offsets[0][row];
-                            counts[leaf] += 1;
-                        }
-                    }
-                    let mut leaf_values = vec![0.0f64; tree.num_nodes()];
-                    for (id, node) in tree.nodes().iter().enumerate() {
-                        let denom = counts[id] as f64 + settings.reg_lambda;
-                        if node.is_leaf() && denom > 0.0 {
-                            leaf_values[id] = sums[id] / denom;
-                        }
-                    }
-                    let leaf_of = |row: usize| node_ids[row * t_count + t] as usize;
-                    let mean = (0..n).map(|row| leaf_values[leaf_of(row)]).sum::<f64>() / n as f64;
+                    let sums = LeafSums::accumulate(&leaves, t, tree.num_nodes(), &in_bag, |row| {
+                        f64::from(labels[row]) - base[row] - offsets[0][row]
+                    });
+                    let leaf_values = sums.leaf_values(tree, settings.reg_lambda);
+                    let mean = (0..n)
+                        .map(|row| leaf_values[leaves.leaf(row, t)])
+                        .sum::<f64>()
+                        / n as f64;
                     for (id, v) in leaf_values.iter().enumerate() {
                         if tree.nodes()[id].is_leaf() {
                             tree.set_leaf_value(id, (v - mean) as f32);
                         }
                     }
                     for (row, s) in round_sum.iter_mut().enumerate() {
-                        *s += f64::from(tree.nodes()[leaf_of(row)].leaf_value);
+                        *s += f64::from(tree.nodes()[leaves.leaf(row, t)].leaf_value);
                     }
                 }
                 for (t, &s) in total.iter_mut().zip(&round_sum) {
@@ -257,23 +296,14 @@ fn ebm_refit(
             })?;
         }
         let scale = recursion.scale();
-        for tree in trees.iter_mut().skip(first_tree).take(stage_trees) {
+        for tree in &mut trees[stage.trees] {
             tree.scale_leaves(scale as f32);
         }
         for (b, &t) in base.iter_mut().zip(&total) {
             *b += scale * t;
         }
-        first_tree += stage_trees;
     }
-    for (t, tree) in refit.trees_mut().iter_mut().enumerate() {
-        let mut leaf_counts = vec![0usize; tree.num_nodes()];
-        for row in 0..n {
-            leaf_counts[node_ids[row * t_count + t] as usize] += 1;
-        }
-        for (id, &c) in node_counts(tree, &leaf_counts).iter().enumerate() {
-            tree.set_sum_hess(id, c as f32);
-        }
-    }
+    update_covers(refit.trees_mut(), &leaves);
     refit.set_base_scores(vec![mu as f32]);
     if refit
         .trees()

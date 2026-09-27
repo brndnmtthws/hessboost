@@ -91,12 +91,12 @@ impl RidgeSolver {
         // W = K[S, S], one landmark's kernel row at a time.
         let mut w = vec![0.0; s * s];
         w.par_chunks_mut(s.max(1)).zip(&rows).for_each_init(
-            || vec![0.0; n],
-            |scratch, (out, &row)| {
-                scratch.fill(0.0);
-                kernel.add_row(row, scratch);
+            || (vec![0.0; n], kernel.scratch()),
+            |(buffer, scratch), (out, &row)| {
+                buffer.fill(0.0);
+                kernel.add_row(row, scratch, buffer);
                 for (o, &j) in out.iter_mut().zip(&rows) {
-                    *o = scratch[j];
+                    *o = buffer[j];
                 }
             },
         );
@@ -106,11 +106,12 @@ impl RidgeSolver {
         // F = K[:, P] L_Wᵀ⁻¹: fill column t with pivot t's kernel row, then
         // solve every row against L_W.
         let mut f = vec![0.0; n * r];
-        let mut scratch = vec![0.0; n];
+        let mut buffer = vec![0.0; n];
+        let mut scratch = kernel.scratch();
         for (t, &row) in pivot_rows.iter().enumerate() {
-            scratch.fill(0.0);
-            kernel.add_row(row, &mut scratch);
-            for (i, &v) in scratch.iter().enumerate() {
+            buffer.fill(0.0);
+            kernel.add_row(row, &mut scratch, &mut buffer);
+            for (i, &v) in buffer.iter().enumerate() {
                 f[i * r + t] = v;
             }
         }

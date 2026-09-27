@@ -24,19 +24,27 @@ use crate::tree::RegTree;
 /// ridge solvers ([`super::solver::RidgeSolver`]) read it: one row at a
 /// time, or densely.
 pub(super) trait Kernel: Sync {
+    /// Working buffers [`add_row`](Self::add_row) reuses across calls; no
+    /// call reads what an earlier one left in them.
+    type Scratch: Send;
+
     /// Number of kernel rows.
     fn n(&self) -> usize;
 
+    /// Fresh buffers for [`add_row`](Self::add_row).
+    fn scratch(&self) -> Self::Scratch;
+
     /// Add the kernel row of training row `row` to `out` (length `n`).
-    fn add_row(&self, row: usize, out: &mut [f64]);
+    fn add_row(&self, row: usize, scratch: &mut Self::Scratch, out: &mut [f64]);
 
     /// The dense `n × n` kernel matrix, row-major (rows in parallel).
     fn dense(&self) -> Vec<f64> {
         let n = self.n();
         let mut k = vec![0.0; n * n];
-        k.par_chunks_mut(n.max(1))
-            .enumerate()
-            .for_each(|(row, out)| self.add_row(row, out));
+        k.par_chunks_mut(n.max(1)).enumerate().for_each_init(
+            || self.scratch(),
+            |scratch, (row, out)| self.add_row(row, scratch, out),
+        );
         k
     }
 }
@@ -188,13 +196,17 @@ impl LeafKernel {
 }
 
 impl Kernel for LeafKernel {
+    type Scratch = ();
+
     fn n(&self) -> usize {
         self.n
     }
 
+    fn scratch(&self) {}
+
     /// Add the kernel vector of kernel row `row` to `out` (each row summed
     /// over its trees in tree order).
-    fn add_row(&self, row: usize, out: &mut [f64]) {
+    fn add_row(&self, row: usize, (): &mut (), out: &mut [f64]) {
         let leaves = &self.row_leaves[row * self.n_trees..(row + 1) * self.n_trees];
         for &leaf in leaves {
             self.add_leaf(leaf, out);

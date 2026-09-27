@@ -665,7 +665,7 @@ fn boulevard_stage(
     let schedule = Schedule {
         dropout: 0.0,
         learning_rate: params.eta,
-        truncation: 0.0,
+        truncation: None,
         parallel: 1,
         seed: params.seed,
         salt: EBM_BOULEVARD_SALT ^ stage,

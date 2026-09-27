@@ -185,7 +185,7 @@
 //! )?;
 //! let ci = inference.confidence_intervals(&dcal, 0.05)?;
 //! let pi = inference.prediction_intervals(&dcal, 0.05)?;
-//! assert!(ci.iter().zip(&pi).all(|(c, p)| p.0 < c.0 && c.1 < p.1));
+//! assert!(ci.iter().zip(&pi).all(|(c, p)| p.lower < c.lower && c.upper < p.upper));
 //! # Ok(())
 //! # }
 //! ```
@@ -199,9 +199,10 @@ mod term_kernel;
 
 use serde::{Deserialize, Serialize};
 
+use crate::conformal::Interval;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::BoostedModel;
+use crate::model::{BoostedModel, Predictions};
 use crate::objective::Objective;
 use crate::objective::distributional::special::norm_ppf;
 use kernel::{Kernel, LeafKernel};
@@ -236,15 +237,25 @@ pub struct BoulevardInfo {
     pub subsample: f64,
     /// The L2 leaf penalty (`lambda`).
     pub reg_lambda: f64,
-    /// The residual truncation level `M`
-    /// ([`Boulevard::truncation`](crate::config::Boulevard::truncation);
-    /// `0` = none).
-    pub truncation: f64,
+    /// The residual truncation level `M`, if any
+    /// ([`Boulevard::truncation`](crate::config::Boulevard::truncation)).
+    /// JSON writes none as `null` and reads a `0` (older files) as none.
+    #[serde(deserialize_with = "truncation_from_json")]
+    pub truncation: Option<f64>,
     /// The training seed, which [`honest_refit`] derives its draws from.
     pub seed: u64,
     /// Whether the intercept is the training-label mean (`base_score`
     /// unset), which the variance then includes.
     pub intercept_from_labels: bool,
+}
+
+/// [`BoulevardInfo::truncation`] from JSON: a number or `null` (the field
+/// itself stays required), a `0` meaning none as files written before it
+/// was optional record it.
+fn truncation_from_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error> {
+    Ok(Option::<f64>::deserialize(deserializer)?.filter(|&t| t != 0.0))
 }
 
 impl BoulevardInfo {
@@ -268,8 +279,8 @@ impl BoulevardInfo {
         if !(self.reg_lambda.is_finite() && self.reg_lambda >= 0.0) {
             return fail("reg_lambda must be finite and >= 0");
         }
-        if !(self.truncation.is_finite() && self.truncation >= 0.0) {
-            return fail("truncation must be finite and >= 0");
+        if self.truncation.is_some_and(|t| !(t.is_finite() && t > 0.0)) {
+            return fail("truncation must be finite and > 0");
         }
         if model.num_parallel_tree() > 1 && (self.dropout != 0.0 || self.learning_rate != 1.0) {
             return fail("BRAT-P (num_parallel_tree > 1) needs dropout 0 and learning_rate 1");
@@ -499,7 +510,8 @@ impl<'a> BoulevardInference<'a> {
     /// # Errors
     ///
     /// [`HessboostError::InvalidParameter`] when `model` is not a Boulevard
-    /// fit ([`BoostedModel::boulevard`] is `None`), when `train` is not its
+    /// fit ([`BoostedModel::boulevard`] is `None`) or has no trees (0
+    /// rounds), when `train` is not its
     /// training data (a leaf holds fewer of its rows than it was grown on),
     /// has row weights or base margins, or (for the noise estimate) lacks
     /// labels; when [`KernelSolver::Exact`] gets more than
@@ -517,6 +529,12 @@ impl<'a> BoulevardInference<'a> {
                 "not a Boulevard fit: train it with `booster = boulevard`",
             )
         })?;
+        if model.num_trees() == 0 {
+            return Err(HessboostError::invalid_param(
+                "model",
+                "has no trees (trained for 0 rounds), so its leaf kernel has no rows",
+            ));
+        }
         check_data(
             model,
             train,
@@ -525,7 +543,7 @@ impl<'a> BoulevardInference<'a> {
         )?;
         let noise_variance = noise_estimate(model, train, noise)?;
         let (c, s) = info.ridge(model.num_parallel_tree());
-        let leaves = model.predict_leaf_range(train, ..)?.into_vec();
+        let leaves = model.predict_leaf_range(train, ..)?;
         let kernel = LeafKernel::new(model.trees(), &leaves, info.kappa())?;
         let solver = build_solver(&kernel, solver, c)?;
         Ok(BoulevardInference {
@@ -575,18 +593,21 @@ impl<'a> BoulevardInference<'a> {
     }
 
     /// The leaf node ids of `data`'s rows, `[row][tree]`.
-    fn leaves(&self, data: &DMatrix) -> Result<Vec<u32>> {
+    fn leaves(&self, data: &DMatrix) -> Result<Predictions<u32>> {
         check_data(self.model, data, "data", false)?;
-        Ok(self.model.predict_leaf_range(data, ..)?.into_vec())
+        self.model.predict_leaf_range(data, ..)
     }
 
     /// The kernel vectors of the `rows` of `leaves` (`[row][tree]`), one
     /// per row of the result (`rows.len() × n`).
-    fn kernel_vectors(&self, leaves: &[u32], rows: std::ops::Range<usize>) -> Vec<f64> {
-        let (n, t) = (self.kernel.n(), self.kernel.n_trees());
+    fn kernel_vectors(&self, leaves: &Predictions<u32>, rows: std::ops::Range<usize>) -> Vec<f64> {
+        let n = self.kernel.n();
         let mut k = vec![0.0; rows.len() * n];
-        for (out, row) in k.chunks_exact_mut(n).zip(rows) {
-            self.kernel.add_query(&leaves[row * t..(row + 1) * t], out);
+        for (out, ids) in k
+            .chunks_exact_mut(n)
+            .zip(rows.filter_map(|row| leaves.row(row)))
+        {
+            self.kernel.add_query(ids, out);
         }
         k
     }
@@ -617,23 +638,23 @@ impl<'a> BoulevardInference<'a> {
     ///
     /// When `data` does not have the model's features, or has row weights
     /// or base margins.
-    pub fn standard_errors(&self, data: &DMatrix) -> Result<Vec<f64>> {
+    pub fn standard_errors(&self, data: &DMatrix) -> Result<Predictions<f64>> {
         let sigma = self.noise_variance.sqrt();
-        Ok(self
+        let se: Vec<f64> = self
             .weight_norms(data)?
             .into_iter()
             .map(|w2| sigma * w2.sqrt())
-            .collect())
+            .collect();
+        Ok(Predictions::new(se, data.n_rows(), 1))
     }
 
-    /// `(prediction, half width)` of every row with half widths
-    /// `z · width(‖w‖²)`.
+    /// The interval `prediction ± z · width(‖w‖²)` of every row.
     fn intervals(
         &self,
         data: &DMatrix,
         alpha: f64,
         width: impl Fn(f64) -> f64,
-    ) -> Result<Vec<(f64, f64)>> {
+    ) -> Result<Vec<Interval<f64>>> {
         check_alpha(alpha)?;
         let z = z_value(alpha);
         let norms = self.weight_norms(data)?;
@@ -644,7 +665,10 @@ impl<'a> BoulevardInference<'a> {
             .zip(norms)
             .map(|(&p, w2)| {
                 let (center, half) = (f64::from(p), z * width(w2));
-                (center - half, center + half)
+                Interval {
+                    lower: center - half,
+                    upper: center + half,
+                }
             })
             .collect())
     }
@@ -658,7 +682,7 @@ impl<'a> BoulevardInference<'a> {
     ///
     /// When `alpha` is not in `(0, 1)`, plus those of
     /// [`standard_errors`](Self::standard_errors).
-    pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * w2).sqrt())
     }
@@ -680,7 +704,7 @@ impl<'a> BoulevardInference<'a> {
     /// # Errors
     ///
     /// As [`confidence_intervals`](Self::confidence_intervals).
-    pub fn prediction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn prediction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * (1.0 + w2)).sqrt())
     }
@@ -693,7 +717,7 @@ impl<'a> BoulevardInference<'a> {
     /// # Errors
     ///
     /// As [`confidence_intervals`](Self::confidence_intervals).
-    pub fn reproduction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<(f64, f64)>> {
+    pub fn reproduction_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (2.0 * sigma2 * w2).sqrt())
     }
@@ -717,7 +741,7 @@ impl<'a> BoulevardInference<'a> {
         &self,
         data: &DMatrix,
         alpha: f64,
-    ) -> Result<Vec<(f64, f64)>> {
+    ) -> Result<Vec<Interval<f64>>> {
         let holdout = self.holdout.ok_or_else(|| {
             HessboostError::invalid_param(
                 "noise",
@@ -729,9 +753,9 @@ impl<'a> BoulevardInference<'a> {
         let mut ratios: Vec<f64> = calibration
             .iter()
             .zip(labels)
-            .map(|(&(lo, hi), &y)| {
-                let half = (hi - lo) / 2.0;
-                let center = f64::midpoint(hi, lo);
+            .map(|(iv, &y)| {
+                let half = (iv.upper - iv.lower) / 2.0;
+                let center = f64::midpoint(iv.upper, iv.lower);
                 (f64::from(y) - center).abs() / half.max(f64::MIN_POSITIVE)
             })
             .collect();
@@ -742,12 +766,18 @@ impl<'a> BoulevardInference<'a> {
         Ok(self
             .prediction_intervals(data, alpha)?
             .into_iter()
-            .map(|(lo, hi)| {
-                let (center, half) = (f64::midpoint(hi, lo), (hi - lo) / 2.0 * scale);
+            .map(|Interval { lower, upper }| {
+                let (center, half) = (f64::midpoint(upper, lower), (upper - lower) / 2.0 * scale);
                 if half.is_finite() {
-                    (center - half, center + half)
+                    Interval {
+                        lower: center - half,
+                        upper: center + half,
+                    }
                 } else {
-                    (f64::NEG_INFINITY, f64::INFINITY)
+                    Interval {
+                        lower: f64::NEG_INFINITY,
+                        upper: f64::INFINITY,
+                    }
                 }
             })
             .collect())

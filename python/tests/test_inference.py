@@ -59,6 +59,13 @@ def test_honest_refit_and_the_boulevard_record() -> None:
     info = booster.boulevard
     assert isinstance(info, BoulevardInfo)
     assert info.dropout == 0.5 and info.learning_rate == 0.8 and info.intercept_from_labels
+    # No truncation is None; the flat `boulevard_truncation = 0` is none too.
+    assert info.truncation is None
+    for level, expected in ((0.0, None), (0.5, 0.5)):
+        clipped = hessboost.train(
+            {**PARAMS, "boulevard_truncation": level}, hessboost.DMatrix(x, label=y), 2
+        )
+        assert clipped.boulevard is not None and clipped.boulevard.truncation == expected
     refit = honest_refit(booster, xv, yv)
     assert refit.boulevard == info
     BoulevardInference.fit(refit, xv, label=yv)  # training-residual noise

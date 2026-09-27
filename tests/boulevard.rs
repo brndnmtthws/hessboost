@@ -50,7 +50,7 @@ fn mean_standard_error(n: usize, points: &DMatrix) -> f64 {
         KernelSolver::Exact,
     )
     .unwrap();
-    let se = inference.standard_errors(points).unwrap();
+    let se = inference.standard_errors(points).unwrap().into_vec();
     assert!(se.iter().all(|&s| s.is_finite() && s > 0.0));
     se.iter().sum::<f64>() / se.len() as f64
 }
@@ -91,7 +91,7 @@ fn nystrom_on_every_row_reproduces_the_exact_solver() {
             landmarks: 300,
             seed: 7,
         });
-        for (e, n) in exact.iter().zip(&nystrom) {
+        for (e, n) in exact.as_slice().iter().zip(nystrom.as_slice()) {
             assert!((e - n).abs() <= 1e-9 * e, "{parallel}: {e} vs {n}");
         }
     }
@@ -176,6 +176,130 @@ fn inference_refuses_rows_the_model_was_not_trained_on() {
         KernelSolver::Exact,
     );
     assert_eq!(invalid_param(fit), "model");
+}
+
+/// A Boulevard model trained for 0 rounds has no trees and so no kernel
+/// rows: inference on it is refused (it used to fit and then panic), and
+/// empty inputs elsewhere give empty results or errors, never panics.
+#[test]
+fn inference_on_empty_inputs_is_refused_or_empty() {
+    let dtrain = data(100, 12);
+    let empty = train(&builder().build().unwrap(), &dtrain, 0).unwrap();
+    for solver in [
+        KernelSolver::Exact,
+        KernelSolver::Nystrom {
+            landmarks: 10,
+            seed: 1,
+        },
+    ] {
+        let fit = BoulevardInference::fit(&empty, &dtrain, NoiseVariance::Known(1.0), solver);
+        assert_eq!(invalid_param(fit), "model");
+    }
+    let model = train(&builder().build().unwrap(), &dtrain, 5).unwrap();
+    let inference = BoulevardInference::fit(
+        &model,
+        &dtrain,
+        NoiseVariance::Known(1.0),
+        KernelSolver::Nystrom {
+            landmarks: 1,
+            seed: 3,
+        },
+    )
+    .unwrap();
+    assert!(inference.standard_errors(&data(3, 13)).is_ok());
+    if let Ok(none) = dtrain.select_rows(&[]) {
+        assert!(
+            inference
+                .standard_errors(&none)
+                .is_ok_and(|se| se.n_rows() == 0)
+        );
+    }
+}
+
+/// No truncation is `None`, never a level of 0: the builder refuses `0`,
+/// the flat and native `0` read as none, JSON writes none as `null` and
+/// reads an older file's `0` as none.
+#[test]
+fn no_truncation_is_none() {
+    assert_eq!(Boulevard::default().truncation(), None);
+    for level in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let built = Boulevard::builder().truncation(level).build();
+        assert_eq!(invalid_param(built), "boulevard_truncation");
+    }
+    let flat = |truncation: f64| {
+        TrainingParams::from_xgboost([
+            ("booster", serde_json::json!("boulevard")),
+            ("boulevard_truncation", serde_json::json!(truncation)),
+        ])
+        .unwrap()
+    };
+    for (level, expected) in [(0.0, None), (2.5, Some(2.5))] {
+        let params = flat(level);
+        let BoosterKind::Boulevard(settings) = params.booster else {
+            panic!("a Boulevard booster");
+        };
+        assert_eq!(settings.truncation(), expected);
+        assert_eq!(
+            TrainingParams::from_xgboost(params.to_xgboost().unwrap()).unwrap(),
+            params
+        );
+    }
+    let dtrain = data(150, 14);
+    let model = train(&builder().build().unwrap(), &dtrain, 4).unwrap();
+    assert_eq!(model.boulevard().unwrap().truncation, None);
+    let json = model.to_json().unwrap();
+    let mut doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(doc["boulevard"]["truncation"], serde_json::Value::Null);
+    doc["boulevard"]["truncation"] = serde_json::json!(0.0);
+    let older = BoostedModel::from_json(&doc.to_string()).unwrap();
+    assert_eq!(older.boulevard(), model.boulevard());
+    let native = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+    assert_eq!(native.boulevard(), model.boulevard());
+    let truncated = builder()
+        .booster(BoosterKind::Boulevard(
+            Boulevard::builder()
+                .dropout(0.5)
+                .truncation(0.2)
+                .build()
+                .unwrap(),
+        ))
+        .build()
+        .unwrap();
+    let clipped = train(&truncated, &dtrain, 4).unwrap();
+    assert_eq!(clipped.boulevard().unwrap().truncation, Some(0.2));
+    assert_ne!(
+        clipped.predict(&dtrain).unwrap(),
+        model.predict(&dtrain).unwrap()
+    );
+}
+
+/// Standard errors are one value per row (`Predictions<f64>`) and every
+/// interval a `conformal::Interval<f64>` centred on the prediction, the
+/// prediction interval enclosing the confidence interval.
+#[test]
+fn inference_outputs_are_typed_per_row() {
+    let dtrain = data(200, 15);
+    let model = train(&builder().build().unwrap(), &dtrain, 10).unwrap();
+    let inference = BoulevardInference::fit(
+        &model,
+        &dtrain,
+        NoiseVariance::Known(0.25),
+        KernelSolver::Exact,
+    )
+    .unwrap();
+    let points = data(7, 16);
+    let se = inference.standard_errors(&points).unwrap();
+    assert_eq!((se.n_rows(), se.width()), (7, 1));
+    let ci: Vec<hessboost::conformal::Interval<f64>> =
+        inference.confidence_intervals(&points, 0.1).unwrap();
+    let pi = inference.prediction_intervals(&points, 0.1).unwrap();
+    let preds = model.predict(&points).unwrap();
+    assert_eq!((ci.len(), pi.len()), (7, 7));
+    for ((c, p), &y) in ci.iter().zip(&pi).zip(preds.as_slice()) {
+        let center = f64::midpoint(c.lower, c.upper);
+        assert!((center - f64::from(y)).abs() < 1e-9, "{c:?} around {y}");
+        assert!(p.lower < c.lower && c.lower < c.upper && c.upper < p.upper);
+    }
 }
 
 #[test]

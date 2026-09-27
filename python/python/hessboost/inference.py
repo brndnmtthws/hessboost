@@ -56,8 +56,8 @@ class BoulevardInfo:
     """The row subsample ratio."""
     reg_lambda: float
     """The L2 leaf penalty."""
-    truncation: float
-    """The residual truncation level (``0`` = none)."""
+    truncation: float | None
+    """The residual truncation level, ``None`` for none."""
     seed: int
     """The training seed, which :func:`honest_refit` derives its draws from."""
     intercept_from_labels: bool

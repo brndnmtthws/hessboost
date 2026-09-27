@@ -1071,22 +1071,23 @@ impl TrainingParams {
                 "is derived by `posterior_sampling` (constant, 1 / (2 * rows)); leave it unset",
             )?;
         }
-        // The noise joins `f32` gradients, so its scale must be a normal
-        // `f32`: an underflowing `eta * T` would make every noisy gradient
-        // infinite, an overflowing one would switch the noise off. Under
-        // posterior sampling `T` is the row count `n >= 1` and `eta < 2n`
+        // The noise joins `f32` gradients, so its scale must be a finite,
+        // positive `f32`: an underflowing `eta * T` would make every noisy
+        // gradient infinite, an overflowing one would switch the noise off
+        // (a subnormal scale is tiny but still noise). Under posterior
+        // sampling `T` is the row count `n >= 1` and `eta < 2n`
         // (`Sglb::resolve`), so `eta * T` lies in `(2^-150, 2n^2)` and the
-        // scale in `(1 / n, 2^76)`: always normal.
+        // scale in `(1 / n, 2^76)`: always representable.
         if self.langevin.is_some() && !self.posterior_sampling {
             let temperature = self.effective_diffusion_temperature(0);
             let sigma = self.langevin_noise_scale(temperature);
             ensure(
                 "diffusion_temperature",
-                (sigma as f32).is_normal(),
+                (sigma as f32).is_finite() && sigma as f32 > 0.0,
                 format!(
                     "gives a Langevin noise scale sqrt(2 / (eta * diffusion_temperature)) \
-                     outside f32's normal range: {sigma:e} for eta {:e} and temperature \
-                     {temperature:e}",
+                     that is not a finite, positive f32: {sigma:e} for eta {:e} and \
+                     temperature {temperature:e}",
                     self.eta
                 ),
             )?;

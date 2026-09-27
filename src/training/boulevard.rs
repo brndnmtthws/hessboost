@@ -50,8 +50,8 @@ pub(crate) struct Schedule {
     pub(crate) dropout: f64,
     /// The learning rate `λ`.
     pub(crate) learning_rate: f64,
-    /// The residual truncation level `M` (`0` = none).
-    pub(crate) truncation: f64,
+    /// The residual truncation level `M`, if any.
+    pub(crate) truncation: Option<f64>,
     /// Trees per round (`1`: BRAT-D; more: BRAT-P).
     pub(crate) parallel: usize,
     /// Base of the per-round RNG seeds.
@@ -100,10 +100,9 @@ impl Schedule {
     }
 
     fn truncate(&self, v: f64) -> f64 {
-        if self.truncation > 0.0 {
-            v.clamp(-self.truncation, self.truncation)
-        } else {
-            v
+        match self.truncation {
+            Some(m) => v.clamp(-m, m),
+            None => v,
         }
     }
 }

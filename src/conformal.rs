@@ -77,16 +77,17 @@ use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Predictions};
 
-/// A prediction interval `[lower, upper]` for one row.
+/// An interval `[lower, upper]` for one row: `f32` for the conformal
+/// predictors here, `f64` for [`crate::inference`]'s intervals.
 ///
 /// Split-conformal intervals always have `lower <= upper`; a conformalized
 /// quantile band shrunk by a negative correction may not.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Interval {
+pub struct Interval<T = f32> {
     /// The lower bound.
-    pub lower: f32,
+    pub lower: T,
     /// The upper bound.
-    pub upper: f32,
+    pub upper: T,
 }
 
 impl Interval {

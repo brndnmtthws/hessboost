@@ -96,7 +96,7 @@ impl Sglb {
                 ),
             ));
         }
-        // `TrainingParams::validate` keeps the scale a normal `f32` (always,
+        // `TrainingParams::validate` keeps the scale a finite, positive `f32` (always,
         // for posterior sampling's row-count temperature).
         let langevin = params.langevin_on().then(|| {
             let temperature = params.effective_diffusion_temperature(n_rows);

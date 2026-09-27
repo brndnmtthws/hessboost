@@ -17,6 +17,7 @@
 use rayon::prelude::*;
 
 use crate::error::{HessboostError, Result};
+use crate::model::Predictions;
 use crate::tree::RegTree;
 
 /// A symmetric positive semidefinite kernel over `n` training rows, as the
@@ -64,18 +65,20 @@ pub(super) struct LeafKernel {
 }
 
 impl LeafKernel {
-    /// The kernel of `trees` over rows whose leaf node ids are `node_ids`
-    /// (`[row][tree]`, as [`BoostedModel::predict_leaf`] returns them), with
-    /// leaf-count offset `kappa`.
+    /// The kernel of `trees` over the rows of `node_ids`, their leaf node
+    /// ids (`[row][tree]`, as [`BoostedModel::predict_leaf`] returns them),
+    /// with leaf-count offset `kappa`: one kernel row per row of
+    /// `node_ids`, whatever the tree count.
     ///
     /// Every leaf must hold at least as many kernel rows as its cover (the
     /// rows it was grown on, all of weight one): otherwise the rows are not
     /// the ones the trees were fitted to, and the error says so.
     ///
     /// [`BoostedModel::predict_leaf`]: crate::model::BoostedModel::predict_leaf
-    pub(super) fn new(trees: &[RegTree], node_ids: &[u32], kappa: f64) -> Result<Self> {
+    pub(super) fn new(trees: &[RegTree], node_ids: &Predictions<u32>, kappa: f64) -> Result<Self> {
         let n_trees = trees.len();
-        let n = node_ids.len().checked_div(n_trees).unwrap_or(0);
+        debug_assert_eq!(node_ids.width(), n_trees);
+        let n = node_ids.n_rows();
         let mut node_offset = Vec::with_capacity(n_trees + 1);
         let mut node_leaf = Vec::new();
         let mut n_leaves = 0u32;
@@ -93,7 +96,7 @@ impl LeafKernel {
         node_offset.push(node_leaf.len());
         let mut row_leaves = vec![0u32; n * n_trees];
         let mut counts = vec![0usize; n_leaves as usize];
-        for (row, ids) in node_ids.chunks_exact(n_trees.max(1)).enumerate() {
+        for (row, ids) in node_ids.rows().enumerate() {
             for (t, &id) in ids.iter().enumerate() {
                 let leaf = node_leaf[node_offset[t] + id as usize];
                 row_leaves[row * n_trees + t] = leaf;
@@ -196,5 +199,35 @@ impl Kernel for LeafKernel {
         for &leaf in leaves {
             self.add_leaf(leaf, out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::{ChildLeaf, SplitRule};
+
+    /// The kernel has one row per row of the leaf-id matrix, whatever the
+    /// tree count (a flat buffer's length says nothing about its rows when
+    /// there are no trees), and averages the shared leaves over the trees.
+    #[test]
+    fn kernel_rows_are_the_leaf_matrix_rows() {
+        let empty = LeafKernel::new(&[], &Predictions::new(Vec::new(), 5, 0), 0.0).unwrap();
+        assert_eq!((empty.n(), empty.n_trees()), (5, 0));
+
+        let mut tree = RegTree::with_root(0.0);
+        let (left, right) = tree.expand(
+            0,
+            SplitRule::numeric(0, 0.5, true),
+            ChildLeaf::new(0.0, 2.0),
+            ChildLeaf::new(0.0, 1.0),
+        );
+        let ids = Predictions::new(vec![left as u32, left as u32, right as u32], 3, 1);
+        let kernel = LeafKernel::new(std::slice::from_ref(&tree), &ids, 0.0).unwrap();
+        assert_eq!(kernel.n(), 3);
+        assert_eq!(
+            kernel.dense(),
+            vec![0.5, 0.5, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0]
+        );
     }
 }

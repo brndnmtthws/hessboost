@@ -116,25 +116,27 @@ impl DartBuilder {
 /// (each earlier tree left out of a round's residuals independently with
 /// probability `p`, the kept ones still divided by the full tree count;
 /// `0`, the default, is Zhou & Hooker's Boulevard, and BRAT-P with
-/// `num_parallel_tree > 1` needs `0`), and the truncation level `M >= 0` of
-/// the ensemble part subtracted in a round's residuals (clipped to
-/// `[-M, M]`, the `Γ_M` of Fang, Tan & Hooker's proofs; `0`, the default,
-/// is none).
+/// `num_parallel_tree > 1` needs `0`), and the optional truncation level
+/// `M > 0` of the ensemble part subtracted in a round's residuals (clipped
+/// to `[-M, M]`, the `Γ_M` of Fang, Tan & Hooker's proofs; unset, the
+/// default, is none).
 ///
 /// ```
 /// use hessboost::config::Boulevard;
 ///
 /// # fn main() -> hessboost::error::Result<()> {
 /// let boulevard = Boulevard::builder().dropout(0.5).build()?;
-/// assert_eq!((boulevard.dropout(), boulevard.truncation()), (0.5, 0.0));
+/// assert_eq!((boulevard.dropout(), boulevard.truncation()), (0.5, None));
 /// assert!(Boulevard::builder().dropout(1.0).build().is_err());
+/// // No truncation is no level, not a level of 0.
+/// assert!(Boulevard::builder().truncation(0.0).build().is_err());
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Boulevard {
     dropout: f64,
-    truncation: f64,
+    truncation: Option<f64>,
 }
 
 impl Boulevard {
@@ -150,9 +152,9 @@ impl Boulevard {
         self.dropout
     }
 
-    /// The residual truncation level `M`, `0` for none
-    /// (`boulevard_truncation`).
-    pub fn truncation(&self) -> f64 {
+    /// The residual truncation level `M`, `None` for none
+    /// (`boulevard_truncation`, whose `0` is none).
+    pub fn truncation(&self) -> Option<f64> {
         self.truncation
     }
 }
@@ -171,11 +173,11 @@ impl BoulevardBuilder {
         self
     }
 
-    /// Set the residual truncation level (`boulevard_truncation`, `0` =
-    /// none).
+    /// Set the residual truncation level `M > 0` (`boulevard_truncation`;
+    /// leave it unset for none).
     #[must_use]
     pub fn truncation(mut self, truncation: f64) -> Self {
-        self.boulevard.truncation = truncation;
+        self.boulevard.truncation = Some(truncation);
         self
     }
 
@@ -183,7 +185,8 @@ impl BoulevardBuilder {
     ///
     /// # Errors
     ///
-    /// `dropout` outside `[0, 1)` or `truncation` negative or non-finite.
+    /// `dropout` outside `[0, 1)` or a `truncation` that is not finite and
+    /// positive.
     pub fn build(self) -> Result<Boulevard> {
         let Boulevard {
             dropout,
@@ -195,10 +198,12 @@ impl BoulevardBuilder {
                 format!("must be in [0, 1), got {dropout}"),
             ));
         }
-        if !(truncation.is_finite() && truncation >= 0.0) {
+        if let Some(truncation) = truncation
+            && !(truncation.is_finite() && truncation > 0.0)
+        {
             return Err(HessboostError::invalid_param(
                 "boulevard_truncation",
-                format!("must be finite and >= 0, got {truncation}"),
+                format!("must be finite and > 0 (leave it unset for none), got {truncation}"),
             ));
         }
         Ok(self.boulevard)
@@ -688,7 +693,7 @@ impl LangevinBuilder {
 
     /// The validated settings. The noise scale `sqrt(2 / (eta * T))` needs
     /// the learning rate: [`TrainingParams::validate`](super::TrainingParams::validate)
-    /// refuses a temperature that puts it outside `f32`'s normal range.
+    /// refuses a temperature that makes it 0 or infinite in `f32`.
     ///
     /// # Errors
     ///

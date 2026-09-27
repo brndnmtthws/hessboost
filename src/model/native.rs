@@ -145,7 +145,8 @@ fn write_boulevard(w: &mut Writer, info: &BoulevardInfo) {
         ("boulevard.learning_rate", info.learning_rate),
         ("boulevard.subsample", info.subsample),
         ("boulevard.reg_lambda", info.reg_lambda),
-        ("boulevard.truncation", info.truncation),
+        // `0` is no truncation, as in files written before it was optional.
+        ("boulevard.truncation", info.truncation.unwrap_or(0.0)),
     ];
     for (name, value) in f64s {
         w.raw(name, 0, &value.to_le_bytes());
@@ -187,7 +188,7 @@ fn read_boulevard(s: &Sections) -> Result<Option<BoulevardInfo>> {
         learning_rate: s.f64("boulevard.learning_rate")?,
         subsample: s.f64("boulevard.subsample")?,
         reg_lambda: s.f64("boulevard.reg_lambda")?,
-        truncation: s.f64("boulevard.truncation")?,
+        truncation: Some(s.f64("boulevard.truncation")?).filter(|&t| t != 0.0),
         seed: s.u64("boulevard.seed")?,
         intercept_from_labels,
     }))

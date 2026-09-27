@@ -160,11 +160,12 @@ fn main() -> Result<()> {
         );
     }
     let first = dtest.select_rows(&[0, 1, 2])?;
-    for (i, (lo, hi)) in inference
+    for (i, interval) in inference
         .confidence_intervals(&first, 0.05)?
         .iter()
         .enumerate()
     {
+        let (lo, hi) = (interval.lower, interval.upper);
         println!("  test row {i}: f(x) in [{lo:.3}, {hi:.3}]");
     }
     Ok(())

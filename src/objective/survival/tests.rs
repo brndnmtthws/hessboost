@@ -124,9 +124,9 @@ fn aft_reads_bounds_and_weights() {
     let preds = [0.1, 0.2, 0.3];
     let info = MetaInfo {
         n_rows: 3,
-        label_lower_bound: Some(&lower),
-        label_upper_bound: Some(&upper),
-        ..MetaInfo::new(&[], Some(&weights), None)
+        bounds: Some(crate::data::LabelBounds::new(&lower, &upper)),
+        weights: Some(&weights),
+        ..MetaInfo::unlabeled(0)
     };
     obj.validate_info(&info).unwrap();
     let mut out = [GradPair::default(); 3];

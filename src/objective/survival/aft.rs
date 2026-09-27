@@ -128,9 +128,9 @@ impl Loss for AftLoss {
     }
 
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
-        match (info.label_lower_bound, info.label_upper_bound) {
-            (Some(lower), Some(upper)) => self.dispatch(preds, lower, upper, info.weights, out),
-            _ => self.gradient(preds, info.labels, info.weights, out),
+        match info.bounds {
+            Some(bounds) => self.dispatch(preds, bounds.lower(), bounds.upper(), info.weights, out),
+            None => self.gradient(preds, info.label_values(), info.weights, out),
         }
     }
 
@@ -156,7 +156,7 @@ impl Loss for AftLoss {
     }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
-        if info.label_lower_bound.is_none() || info.label_upper_bound.is_none() {
+        if info.bounds.is_none() {
             return Err(HessboostError::invalid_param(
                 "label_bounds",
                 "dataset has no label bounds; survival:aft needs \

@@ -130,7 +130,7 @@ impl Loss for AbsoluteError {
     }
 
     fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
-        let (labels, weights) = (info.labels, info.weights);
+        let (labels, weights) = (info.label_values(), info.weights);
         let k = self.n_targets;
         let n = labels.len() / k;
         if total_weight(weights, n).is_none() {

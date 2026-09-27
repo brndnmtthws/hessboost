@@ -2468,11 +2468,11 @@ fn check_prediction_width(
              {n_out} outputs",
             metric.name()
         ),
-        None if !n_out.is_multiple_of(info.n_targets.max(1)) => format!(
+        None if !n_out.is_multiple_of(info.n_targets().max(1)) => format!(
             "metric `{}` needs a whole number of the model's {n_out} outputs per label \
              column of dataset ({} columns)",
             metric.name(),
-            info.n_targets
+            info.n_targets()
         ),
         _ => return Ok(()),
     };
@@ -4004,8 +4004,8 @@ mod tests {
 
     impl BoundsMidpoint {
         fn target(info: &MetaInfo, row: usize) -> f32 {
-            let lo = info.label_lower_bound.expect("validated")[row];
-            let hi = info.label_upper_bound.expect("validated")[row];
+            let lo = info.bounds.expect("validated").lower()[row];
+            let hi = info.bounds.expect("validated").upper()[row];
             f32::midpoint(lo, hi)
         }
     }
@@ -4031,7 +4031,7 @@ mod tests {
         }
 
         fn validate_info(&self, info: &MetaInfo) -> Result<()> {
-            if info.label_lower_bound.is_none() || info.label_upper_bound.is_none() {
+            if info.bounds.is_none() {
                 return Err(HessboostError::invalid_param(
                     "label_lower_bound",
                     "dataset has no label bounds",

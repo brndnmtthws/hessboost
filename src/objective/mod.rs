@@ -366,7 +366,7 @@ pub trait Loss: Send + Sync {
     /// objectives that read other metadata (label bounds, several targets per
     /// row) override it.
     fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
-        self.gradient_grouped(preds, info.labels, info.weights, info.group, out);
+        self.gradient_grouped(preds, info.label_values(), info.weights, info.group, out);
     }
 
     /// Compute the gradients of boosting round `iteration` (counted from
@@ -589,7 +589,7 @@ pub(crate) enum OutputDomain {
 /// Shared [`Loss::validate_info`] label-domain check: reject the dataset
 /// when any label satisfies `invalid`.
 pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool) -> Result<()> {
-    if info.labels.iter().any(|&y| invalid(y)) {
+    if info.label_values().iter().any(|&y| invalid(y)) {
         return Err(HessboostError::invalid_param(
             "labels",
             "dataset has labels outside the objective's valid domain",
@@ -604,12 +604,12 @@ pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool)
 /// the built-in objectives'
 /// [`TrainingParams::loss`](crate::config::TrainingParams::loss)).
 pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()> {
-    if info.n_targets != n_targets {
+    if info.n_targets() != n_targets {
         return Err(HessboostError::invalid_param(
             "labels",
             format!(
                 "dataset has {} label columns but the objective models {n_targets}",
-                info.n_targets
+                info.n_targets()
             ),
         ));
     }
@@ -693,8 +693,8 @@ mod tests {
                 out.fill(GradPair::new(f32::NAN, 1.0));
             }
             fn gradient_info(&self, preds: &[f32], info: &MetaInfo, out: &mut [GradPair]) {
-                let (Some(lo), Some(hi)) = (info.label_lower_bound, info.label_upper_bound) else {
-                    return self.gradient(preds, info.labels, info.weights, out);
+                let Some((lo, hi)) = info.bounds.map(|b| (b.lower(), b.upper())) else {
+                    return self.gradient(preds, info.label_values(), info.weights, out);
                 };
                 for (i, g) in out.iter_mut().enumerate() {
                     *g = GradPair::new(preds[i] - f32::midpoint(lo[i], hi[i]), 1.0);
@@ -707,13 +707,13 @@ mod tests {
         let (lower, upper) = ([0.0f32, 4.0], [2.0f32, 6.0]);
         let info = MetaInfo {
             n_rows: 2,
-            label_lower_bound: Some(&lower),
-            label_upper_bound: Some(&upper),
-            ..MetaInfo::new(&[], None, None)
+            bounds: Some(crate::data::LabelBounds::new(&lower, &upper)),
+            weights: None,
+            ..MetaInfo::unlabeled(0)
         };
         assert_eq!(Midpoint.base_margins_info(&info), vec![3.0]);
         let inconsistent = MetaInfo {
-            n_targets: usize::MAX,
+            labels: Some(crate::data::Labels::new(&[], std::num::NonZeroUsize::MAX)),
             ..info
         };
         assert!(Midpoint.base_margins_info(&inconsistent)[0].is_nan());

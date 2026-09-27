@@ -100,16 +100,16 @@ fn tie_runs<'a>(
 /// with the row weights, then take the plain mean over targets. A single
 /// label column evaluates through [`Metric::eval_grouped`].
 fn macro_average_targets(metric: &impl CurveMetric, preds: &[f32], info: &MetaInfo) -> f64 {
-    let k = info.n_targets;
+    let k = info.n_targets();
     if k <= 1 {
-        return metric.eval_grouped(preds, info.labels, info.weights, info.group);
+        return metric.eval_grouped(preds, info.label_values(), info.weights, info.group);
     }
     let mut total = 0.0;
     for target in 0..k {
         total += eval_columns(
             metric,
             Column::target(preds, target, k),
-            Column::target(info.labels, target, k),
+            Column::target(info.label_values(), target, k),
             info.weights,
         );
     }

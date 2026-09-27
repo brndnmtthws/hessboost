@@ -1,8 +1,9 @@
 //! The core dataset container: a feature matrix plus training metadata.
 
-use crate::data::meta::{FeatureType, GroupInfo, MetaInfo};
+use crate::data::meta::{FeatureType, GroupInfo, LabelBounds, Labels, MetaInfo};
 use crate::error::{HessboostError, Result};
 use rayon::prelude::*;
+use std::num::NonZeroUsize;
 
 /// Dense inputs with at least this many values are validated and copied in
 /// parallel.
@@ -144,9 +145,9 @@ pub struct DMatrix {
     missing: f32,
     /// Row-major `[row][target]`, length `n_rows * n_targets`.
     labels: Option<Vec<f32>>,
-    n_targets: usize,
-    label_lower_bound: Option<Vec<f32>>,
-    label_upper_bound: Option<Vec<f32>>,
+    n_targets: NonZeroUsize,
+    /// Lower and upper label bounds, `n_rows` each, attached together.
+    label_bounds: Option<(Vec<f32>, Vec<f32>)>,
     weights: Option<Vec<f32>>,
     base_margin: Option<Vec<f32>>,
     group: Option<GroupInfo>,
@@ -163,9 +164,8 @@ impl DMatrix {
             storage,
             missing,
             labels: None,
-            n_targets: 1,
-            label_lower_bound: None,
-            label_upper_bound: None,
+            n_targets: NonZeroUsize::MIN,
+            label_bounds: None,
             weights: None,
             base_margin: None,
             group: None,
@@ -271,13 +271,13 @@ impl DMatrix {
     /// Attach a label matrix with `n_targets` targets per row, laid out
     /// row-major `[row][target]` (`len == n_rows * n_targets`).
     pub fn with_label_matrix(mut self, labels: &[f32], n_targets: usize) -> Result<Self> {
-        if n_targets == 0 {
+        let Some(n_targets) = NonZeroUsize::new(n_targets) else {
             return Err(HessboostError::invalid_param(
                 "labels",
                 "n_targets must be at least 1",
             ));
-        }
-        let expected = self.n_rows.checked_mul(n_targets).ok_or_else(|| {
+        };
+        let expected = self.n_rows.checked_mul(n_targets.get()).ok_or_else(|| {
             HessboostError::invalid_param("labels", "n_rows * n_targets overflows usize")
         })?;
         check_len("labels", labels.len(), expected)?;
@@ -304,8 +304,7 @@ impl DMatrix {
                 ));
             }
         }
-        self.label_lower_bound = Some(lower.to_vec());
-        self.label_upper_bound = Some(upper.to_vec());
+        self.label_bounds = Some((lower.to_vec(), upper.to_vec()));
         Ok(self)
     }
 
@@ -481,19 +480,23 @@ impl DMatrix {
     /// [`DMatrix::with_label_matrix`].
     #[inline]
     pub fn n_targets(&self) -> usize {
-        self.n_targets
+        self.n_targets.get()
     }
 
     /// Lower label bounds for interval-censored labels, if attached.
     #[inline]
     pub fn label_lower_bound(&self) -> Option<&[f32]> {
-        self.label_lower_bound.as_deref()
+        self.label_bounds
+            .as_ref()
+            .map(|(lower, _)| lower.as_slice())
     }
 
     /// Upper label bounds for interval-censored labels, if attached.
     #[inline]
     pub fn label_upper_bound(&self) -> Option<&[f32]> {
-        self.label_upper_bound.as_deref()
+        self.label_bounds
+            .as_ref()
+            .map(|(_, upper)| upper.as_slice())
     }
 
     /// Weights, if attached.
@@ -531,12 +534,16 @@ impl DMatrix {
     pub fn info(&self) -> MetaInfo<'_> {
         MetaInfo {
             n_rows: self.n_rows,
-            labels: self.labels.as_deref().unwrap_or(&[]),
-            n_targets: self.n_targets,
+            labels: self
+                .labels
+                .as_deref()
+                .map(|values| Labels::new(values, self.n_targets)),
             weights: self.weights.as_deref(),
             group: self.group.as_ref(),
-            label_lower_bound: self.label_lower_bound.as_deref(),
-            label_upper_bound: self.label_upper_bound.as_deref(),
+            bounds: self
+                .label_bounds
+                .as_ref()
+                .map(|(lower, upper)| LabelBounds::new(lower, upper)),
         }
     }
 
@@ -755,9 +762,14 @@ impl DMatrix {
             }
             selected
         };
-        out.labels = self.labels.as_deref().map(|l| gather(l, self.n_targets));
-        out.label_lower_bound = self.label_lower_bound.as_deref().map(|lo| gather(lo, 1));
-        out.label_upper_bound = self.label_upper_bound.as_deref().map(|hi| gather(hi, 1));
+        out.labels = self
+            .labels
+            .as_deref()
+            .map(|l| gather(l, self.n_targets.get()));
+        out.label_bounds = self
+            .label_bounds
+            .as_ref()
+            .map(|(lo, hi)| (gather(lo, 1), gather(hi, 1)));
         out.weights = self.weights.as_deref().map(|w| gather(w, 1));
         out.base_margin = self
             .base_margin
@@ -914,8 +926,8 @@ mod tests {
             .unwrap();
         assert_eq!(m.n_targets(), 2);
         let info = m.info();
-        assert_eq!((info.n_rows, info.n_targets), (3, 2));
-        assert_eq!(info.labels, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!((info.n_rows, info.n_targets()), (3, 2));
+        assert_eq!(info.label_values(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         // Re-attaching single-target labels resets the target count.
         assert_eq!(m.with_labels(&[0.0, 1.0, 2.0]).unwrap().n_targets(), 1);
     }
@@ -931,7 +943,7 @@ mod tests {
         assert_eq!(censored.label_lower_bound().unwrap(), &[0.0, -1.0, 2.0]);
         assert_eq!(censored.label_upper_bound().unwrap(), &[1.0, inf, 1.5]);
         assert!(censored.labels().is_none());
-        assert!(censored.info().labels.is_empty());
+        assert!(censored.info().labels.is_none());
         assert!(
             d.clone()
                 .with_label_bounds(&[f32::NAN, 0.0, 0.0], &[1.0; 3])

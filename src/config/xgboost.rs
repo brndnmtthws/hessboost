@@ -880,7 +880,7 @@ impl TrainingParams {
         if let Some(base_score) = base_score {
             set("base_score", json(base_score));
         }
-        let names: Vec<_> = eval_metric.iter().map(EvalMetric::name).collect();
+        let names: Vec<_> = eval_metric.iter().map(EvalMetric::flat_name).collect();
         set("eval_metric", json(names));
         set("eta", json(eta));
         set("gamma", json(gamma));
@@ -1442,6 +1442,22 @@ mod tests {
     /// `mphe` the `huber_slope`, `quantile` / `expectile` the alpha lists,
     /// `aft-nloglik` the AFT noise, and `nll` / `crps` the `dist:*` family.
     /// A metric with other parameters has no flat form.
+    /// A Tweedie metric's variance power survives the flat form in full:
+    /// its `evals_result` key rounds to six digits, its flat spelling not.
+    #[test]
+    fn tweedie_metric_powers_round_trip_exactly() {
+        for power in ["1.999999", "1.23456789", "1.5"] {
+            let p = TrainingParams::from_xgboost([(
+                "eval_metric",
+                json!(format!("tweedie-nloglik@{power}")),
+            )])
+            .unwrap();
+            let back = TrainingParams::from_xgboost(p.to_xgboost().unwrap())
+                .unwrap_or_else(|e| panic!("{power}: {e}"));
+            assert_eq!(back.eval_metric, p.eval_metric, "{power}");
+        }
+    }
+
     #[test]
     fn metrics_take_the_flat_parameters_xgboost_gives_them() {
         use crate::objective::distributional::DistFamily;

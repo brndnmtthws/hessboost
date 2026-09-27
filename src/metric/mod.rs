@@ -982,6 +982,20 @@ fn cutoff_name(base: &str, k: Option<usize>) -> String {
 }
 
 impl EvalMetric {
+    /// The metric's spelling in XGBoost's flat `eval_metric`, which
+    /// [`TrainingParams::from_xgboost`](crate::config::TrainingParams::from_xgboost)
+    /// reads back to the same metric: [`name`](Self::name), except that a
+    /// Tweedie power is written in full rather than rounded to the six
+    /// digits of its `evals_result` key.
+    pub(crate) fn flat_name(&self) -> Cow<'static, str> {
+        match self {
+            EvalMetric::TweedieNLogLik(tweedie) => {
+                Cow::Owned(format!("tweedie-nloglik@{}", tweedie.variance_power()))
+            }
+            _ => self.name(),
+        }
+    }
+
     /// XGBoost's `evals_result` key: the metric's name with its suffix
     /// (`ndcg@5`, `tweedie-nloglik@1.5`), as
     /// [`Metric::name`] of the built metric reports it.

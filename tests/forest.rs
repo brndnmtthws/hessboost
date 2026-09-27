@@ -191,6 +191,8 @@ fn both_formats_round_trip() {
         let model = ForestModel::fit(&params, &data).unwrap();
         let expected = model.generate(20, 1).unwrap();
         let bytes = model.to_bytes().unwrap();
+        let resaved = ForestModel::from_bytes(&bytes).unwrap().to_bytes().unwrap();
+        assert!(resaved == bytes, "re-saving changes the bytes");
         for loaded in [
             ForestModel::from_bytes(&bytes).unwrap(),
             ForestModel::from_json(&model.to_json().unwrap()).unwrap(),

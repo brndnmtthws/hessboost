@@ -200,7 +200,12 @@ fn both_formats_round_trip_the_sampler() {
     ] {
         let model = DiffusionModel::fit(&params, &data).unwrap();
         let expected = model.sample(&probe, 20, 1).unwrap();
-        let from_bytes = DiffusionModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        let bytes = model.to_bytes().unwrap();
+        let from_bytes = DiffusionModel::from_bytes(&bytes).unwrap();
+        assert!(
+            from_bytes.to_bytes().unwrap() == bytes,
+            "re-saving changes the bytes"
+        );
         let from_json = DiffusionModel::from_json(&model.to_json().unwrap()).unwrap();
         for loaded in [&from_bytes, &from_json] {
             assert_eq!(loaded.method(), model.method());

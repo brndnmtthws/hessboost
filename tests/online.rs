@@ -358,3 +358,56 @@ fn from_model_refuses_trees_deeper_than_max_depth() {
         assert!(OnlineModel::from_model(model.clone(), &deeper, &d, online).is_ok());
     }
 }
+
+/// An abandoned approximate update (a break from the hook, or a refused
+/// commit) restores the exact update state it started from, the fixed bins
+/// and lazily kept gradients of earlier updates included: later updates
+/// then equal those of a copy that never tried it.
+#[test]
+fn an_abandoned_update_keeps_the_update_state() {
+    let p = params(Objective::SquaredError);
+    let train_data = data(600, 13, false);
+    let (a, b, c) = (
+        data(30, 14, false),
+        data(20, 15, false),
+        data(25, 16, false),
+    );
+    for tolerance in [0.1, 0.0] {
+        let mut online =
+            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
+                .unwrap();
+        online.update(Some(&a), &[0, 5, 9]).unwrap();
+        let mut control = online.clone();
+        let stop = |round: &RoundEval| {
+            if round.iteration == 4 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        assert_eq!(
+            invalid_param(online.update_with(Some(&b), &[1, 2], stop)),
+            "on_round"
+        );
+        let refused = online.update_with_commit(
+            Some(&b),
+            &[1, 2],
+            |_| ControlFlow::Continue(()),
+            || ControlFlow::Break(()),
+        );
+        assert_eq!(invalid_param(refused), "on_round");
+        assert_eq!(
+            online.model().to_json().unwrap(),
+            control.model().to_json().unwrap()
+        );
+        for (additions, deletions) in [(Some(&c), vec![3, 7]), (None, vec![0, 1, 40])] {
+            let report = online.update(additions, &deletions).unwrap();
+            assert_eq!(report, control.update(additions, &deletions).unwrap());
+            assert_eq!(
+                online.model().to_json().unwrap(),
+                control.model().to_json().unwrap(),
+                "tolerance {tolerance}"
+            );
+        }
+    }
+}

@@ -3,9 +3,10 @@
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
 use hessboost::config::{
-    BoosterKind, Dart, ProcessType, QueryBagging, Refresh, SamplingMethod, TrainingParamsBuilder,
+    BalancedBagging, BoosterKind, Dart, ProcessType, QueryBagging, Refresh, SamplingMethod,
+    TrainingParamsBuilder,
 };
-use hessboost::objective::LambdaRank;
+use hessboost::objective::{LambdaRank, Logistic};
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -212,6 +213,76 @@ fn bagging_by_query_refuses_non_ranking_or_incompatible_sampling() {
         invalid_param(train(&ranking().build().unwrap(), &ungrouped, 1)),
         "bagging_by_query"
     );
+}
+
+/// Class-balanced bagging draws a different, seed-deterministic sample of
+/// each class every round.
+#[test]
+fn balanced_bagging_changes_binary_training_deterministically() {
+    let (n_pos, n_neg) = (200usize, 800usize);
+    let n = n_pos + n_neg;
+    let mut x = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        x.push((i % 100) as f32 / 100.0);
+        y.push(if i < n_pos { 1.0 } else { 0.0 });
+    }
+    let data = labeled_dense(&x, 1, &y);
+    let base = || {
+        TrainingParams::builder()
+            .objective(binary())
+            .tree_method(TreeMethod::Hist)
+            .max_depth(2)
+            .seed(53)
+    };
+    let all = train(&base().build().unwrap(), &data, 3)
+        .unwrap()
+        .trees()
+        .to_vec();
+    let balanced = base()
+        .balanced_bagging(BalancedBagging::new(0.6, 0.1).unwrap())
+        .build()
+        .unwrap();
+    let sampled = train(&balanced, &data, 3).unwrap().trees().to_vec();
+    assert_ne!(all, sampled);
+    assert_eq!(sampled, train(&balanced, &data, 3).unwrap().trees());
+}
+
+/// Balanced bagging needs a binary objective on a tree booster, uniform
+/// sampling, `subsample = 1`, and one label column of `0`/`1` labels.
+#[test]
+fn balanced_bagging_refuses_unsupported_parameters_and_labels() {
+    let bagging = BalancedBagging::new(0.5, 1.0).unwrap();
+    let builder = || TrainingParams::builder().balanced_bagging(bagging);
+    for (params, name) in [
+        (builder(), "pos_bagging_fraction"),
+        (
+            builder()
+                .objective(binary())
+                .sampling_method(SamplingMethod::GradientBased),
+            "sampling_method",
+        ),
+        (builder().objective(binary()).subsample(0.8), "subsample"),
+        (
+            builder().objective(binary()).booster(BoosterKind::GbLinear),
+            "pos_bagging_fraction",
+        ),
+    ] {
+        assert_eq!(invalid_param(params.build()), name);
+    }
+    let binary = builder().objective(binary()).build().unwrap();
+    let multi = DMatrix::from_dense(&[0.0, 1.0, 1.0, 0.0], 2, 2)
+        .unwrap()
+        .with_label_matrix(&[0.0, 1.0, 1.0, 0.0], 2)
+        .unwrap();
+    assert_eq!(invalid_param(train(&binary, &multi, 1)), "labels");
+    let graded = labeled_dense(&[0.0, 1.0], 1, &[0.0, 0.5]);
+    assert_eq!(invalid_param(train(&binary, &graded, 1)), "labels");
+}
+
+/// `binary:logistic`.
+fn binary() -> Objective {
+    Objective::BinaryLogistic(Logistic::default())
 }
 
 /// Zero weights are epsilon weights (floored at 1e-6, as in XGBoost): against

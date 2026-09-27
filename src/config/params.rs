@@ -5,7 +5,9 @@
 //! exposes aliases (e.g. `eta`/`learning_rate`), we pick the canonical field
 //! name and document the alias.
 
-use super::groups::{Dart, ExtraTrees, LinearTree, QuantizedGrad, QueryBagging, Refresh};
+use super::groups::{
+    BalancedBagging, Dart, ExtraTrees, LinearTree, QuantizedGrad, QueryBagging, Refresh,
+};
 use crate::error::{HessboostError, Result};
 use crate::objective::{Loss, LossContext, Objective, ObjectiveParts};
 use serde::{Deserialize, Serialize};
@@ -333,6 +335,13 @@ pub struct TrainingParams {
     pub num_parallel_tree: usize,
     /// Row subsampling method. XGBoost `sampling_method`.
     pub sampling_method: SamplingMethod,
+    /// LightGBM's class-balanced bagging for binary classification
+    /// ([`BalancedBagging`]; `pos_bagging_fraction` /
+    /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
+    /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
+    /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
+    /// booster, uniform sampling, and one label column of `0`/`1` labels.
+    pub balanced_bagging: Option<BalancedBagging>,
     /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
     /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
     /// whole query groups are kept or dropped each round. It replaces
@@ -425,6 +434,7 @@ impl Default for TrainingParams {
             num_parallel_tree: 1,
             sampling_method: SamplingMethod::Uniform,
             bagging_by_query: None,
+            balanced_bagging: None,
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
             extra_trees: None,
@@ -539,6 +549,7 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
+        self.validate_balanced_bagging()?;
         self.validate_bagging_by_query()?;
         self.validate_tree_options()
     }
@@ -571,6 +582,38 @@ impl TrainingParams {
             "sampling_method",
             self.sampling_method == SamplingMethod::Uniform,
             "query bagging keeps whole queries; `gradient_based` is not supported with it",
+        )
+    }
+    /// Class-balanced bagging: a binary objective on a tree booster, with
+    /// uniform sampling and no `subsample` it would override.
+    fn validate_balanced_bagging(&self) -> Result<()> {
+        if self.balanced_bagging.is_none() {
+            return Ok(());
+        }
+        ensure(
+            "pos_bagging_fraction",
+            self.booster != BoosterKind::GbLinear,
+            "balanced bagging needs a tree booster: `gblinear` samples no rows",
+        )?;
+        ensure(
+            "pos_bagging_fraction",
+            self.objective.is_binary_classifier(),
+            format!(
+                "balanced bagging needs a `binary:*` objective, not `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            "subsample",
+            self.subsample == 1.0,
+            "balanced bagging replaces `subsample` (LightGBM ignores \
+             `bagging_fraction` then); leave it at 1",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "balanced bagging samples uniformly within each class; \
+             `gradient_based` is not supported with it",
         )
     }
 
@@ -1099,6 +1142,13 @@ impl TrainingParamsBuilder {
     #[must_use]
     pub fn bagging_by_query(mut self, bagging: QueryBagging) -> Self {
         self.params.bagging_by_query = Some(bagging);
+        self
+    }
+    /// Enable LightGBM's class-balanced bagging (`pos_bagging_fraction`,
+    /// `neg_bagging_fraction`).
+    #[must_use]
+    pub fn balanced_bagging(mut self, bagging: BalancedBagging) -> Self {
+        self.params.balanced_bagging = Some(bagging);
         self
     }
 

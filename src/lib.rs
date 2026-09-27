@@ -122,6 +122,9 @@
 //!     [`path_smooth`](config::TrainingParams::path_smooth),
 //!     [`linear_tree`](config::TrainingParams::linear_tree),
 //!     [`LinearLeaves`](tree::LinearLeaves));
+//!   - LightGBM class-balanced bagging for binary classification
+//!     ([`BalancedBagging`](config::BalancedBagging): `pos_bagging_fraction`,
+//!     `neg_bagging_fraction`), in place of `subsample`;
 //!   - LightGBM XE-NDCG ranking
 //!     ([`Objective::RankXendcg`](objective::Objective::RankXendcg); its keyed
 //!     per-round draws differ from LightGBM's random stream) and query-level
@@ -155,9 +158,9 @@
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `online_update`, `ordered_target_stats`,
-//! `pfn_boost`, `metal` with `--features metal` on macOS). Run one with
-//! `cargo run --release --example binary_classification`.
+//! `distributional`, `budget`, `balanced_bagging`, `online_update`,
+//! `ordered_target_stats`, `pfn_boost`, `metal` with `--features metal` on
+//! macOS). Run one with `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
 //!

@@ -105,27 +105,7 @@ pub(super) fn fit(params: &DiffusionParams, data: &DMatrix) -> Result<DiffusionM
 /// The labels of `data`, after refusing the metadata a diffusion model
 /// cannot honor.
 fn check_data(data: &DMatrix) -> Result<&[f32]> {
-    let refuse = |what: &str| {
-        Err(HessboostError::invalid_param(
-            "data",
-            format!("diffusion models do not support {what}"),
-        ))
-    };
-    if data.weights().is_some() {
-        return refuse("instance weights");
-    }
-    if data.base_margin().is_some() {
-        return refuse("base margins");
-    }
-    if data.group().is_some() {
-        return refuse("ranking groups");
-    }
-    if data.label_lower_bound().is_some() || data.label_upper_bound().is_some() {
-        return refuse("label bounds");
-    }
-    if data.feature_weights().is_some() {
-        return refuse("feature weights");
-    }
+    refuse_unsupported_metadata(data, "diffusion")?;
     let labels = data.labels().ok_or_else(|| {
         HessboostError::invalid_param("data", "fitting a diffusion model needs labels")
     })?;
@@ -136,6 +116,29 @@ fn check_data(data: &DMatrix) -> Result<&[f32]> {
         ));
     }
     Ok(labels)
+}
+
+/// Refuse the metadata neither generative model honors (`what` names the
+/// model in the error: "diffusion", "forest"): instance weights, base
+/// margins, ranking groups, label bounds and feature weights, in that order.
+pub(super) fn refuse_unsupported_metadata(data: &DMatrix, what: &str) -> Result<()> {
+    let unsupported = if data.weights().is_some() {
+        "instance weights"
+    } else if data.base_margin().is_some() {
+        "base margins"
+    } else if data.group().is_some() {
+        "ranking groups"
+    } else if data.label_lower_bound().is_some() || data.label_upper_bound().is_some() {
+        "label bounds"
+    } else if data.feature_weights().is_some() {
+        "feature weights"
+    } else {
+        return Ok(());
+    };
+    Err(HessboostError::invalid_param(
+        "data",
+        format!("{what} models do not support {unsupported}"),
+    ))
 }
 
 /// Per-column mean and population standard deviation of the `[row][d]`

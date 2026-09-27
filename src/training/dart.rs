@@ -11,7 +11,7 @@ use crate::rng::Rng;
 /// gbtree takes the gradients at the cached `margin`. DART (Dropout Additive
 /// Regression Trees) first draws a dropout set `D` over the trees built so
 /// far ([`select_dropout`]) and takes the gradients of the ensemble
-/// **excluding** `D`, whose tree ids it returns. Using XGBoost's `tree`
+/// **excluding** `D`, which it returns. Using XGBoost's `tree`
 /// normalization, if `k = |D|` the round's new trees then get weight
 /// `1/(k+eta)` ([`dart_new_tree_weight`]) and [`finish_dart`] rescales each
 /// dropped tree by `k/(k+eta)`. A round that drops nothing (DART without
@@ -23,7 +23,7 @@ pub(super) fn round_gradients(
     iteration: usize,
     margin: &[f32],
     gpair: &mut [GradPair],
-) -> (Rng, Option<Vec<usize>>) {
+) -> (Rng, Option<Dropout>) {
     let TrainContext {
         params,
         dtrain,
@@ -36,15 +36,24 @@ pub(super) fn round_gradients(
         BoosterKind::Dart(dart) if dart.has_dropout() => select_dropout(model, &dart, &mut rng),
         _ => None,
     };
-    let Some((dropped, drop_indices)) = dropout else {
+    let Some(dropout) = dropout else {
         // Nothing dropped: the round reads the ensemble's own margins and
         // its trees are not normalized, as in gbtree.
         objective.gradient_info_at(margin, info, gpair, iteration);
         return (rng, None);
     };
-    let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
+    let margin_excl = model.predict_margin_dropout(dtrain, &dropout.mask);
     objective.gradient_info_at(&margin_excl, info, gpair, iteration);
-    (rng, Some(drop_indices))
+    (rng, Some(dropout))
+}
+
+/// A DART round's dropout set: which trees it drops, and how many.
+#[derive(Debug, PartialEq)]
+pub(super) struct Dropout {
+    /// Per tree of the ensemble, whether it is dropped.
+    pub(super) mask: Vec<bool>,
+    /// The number of dropped trees (at least one).
+    pub(super) count: usize,
 }
 
 /// The DART round RNG's booster salt.
@@ -64,13 +73,9 @@ pub(super) fn round_salt(params: &TrainingParams) -> u64 {
 /// XGBoost's `GBTree::DropTrees` (uniform sampling): nothing and no draws
 /// over an empty ensemble; skipped with probability `skip_drop`; otherwise
 /// each tree independently with probability `rate_drop`, plus one tree at
-/// random when none was drawn and `one_drop` is set. Returns the per-tree
-/// mask and the dropped indices, or `None` when nothing is dropped.
-pub(super) fn select_dropout(
-    model: &BoostedModel,
-    dart: &Dart,
-    rng: &mut Rng,
-) -> Option<(Vec<bool>, Vec<usize>)> {
+/// random when none was drawn and `one_drop` is set. `None` when nothing
+/// is dropped.
+pub(super) fn select_dropout(model: &BoostedModel, dart: &Dart, rng: &mut Rng) -> Option<Dropout> {
     let existing = model.num_trees();
     if existing == 0 {
         return None;
@@ -78,30 +83,27 @@ pub(super) fn select_dropout(
     if dart.skip_drop() > 0.0 && rng.f64() < dart.skip_drop() {
         return None;
     }
-    let mut dropped = vec![false; existing];
-    let mut drop_indices: Vec<usize> = Vec::new();
-    for (i, d) in dropped.iter_mut().enumerate() {
+    let mut mask = vec![false; existing];
+    let mut count = 0;
+    for d in &mut mask {
         if rng.f64() < dart.rate_drop() {
             *d = true;
-            drop_indices.push(i);
+            count += 1;
         }
     }
-    if drop_indices.is_empty() && dart.one_drop() {
-        let i = rng.range(0..existing);
-        dropped[i] = true;
-        drop_indices.push(i);
+    if count == 0 && dart.one_drop() {
+        mask[rng.range(0..existing)] = true;
+        count = 1;
     }
-    (!drop_indices.is_empty()).then_some((dropped, drop_indices))
+    (count > 0).then_some(Dropout { mask, count })
 }
 
 /// XGBoost's `tree` normalization weight of a DART round's new trees:
 /// `1 / (k + eta)` for `k` dropped trees, `1` when none were dropped.
-pub(super) fn dart_new_tree_weight(drop_indices: &[usize], params: &TrainingParams) -> f32 {
-    let k = drop_indices.len();
-    if k == 0 {
-        1.0
-    } else {
-        1.0 / (k as f32 + params.eta as f32)
+pub(super) fn dart_new_tree_weight(dropout: Option<&Dropout>, params: &TrainingParams) -> f32 {
+    match dropout {
+        None => 1.0,
+        Some(dropout) => 1.0 / (dropout.count as f32 + params.eta as f32),
     }
 }
 
@@ -112,12 +114,12 @@ pub(super) fn dart_new_tree_weight(drop_indices: &[usize], params: &TrainingPara
 pub(super) fn finish_dart(
     model: &mut BoostedModel,
     params: &TrainingParams,
-    drop_indices: &[usize],
+    dropout: &Dropout,
     margins: &mut MarginCaches,
 ) {
-    let k = drop_indices.len() as f32;
+    let k = dropout.count as f32;
     let factor = k / (k + params.eta as f32);
-    for &i in drop_indices {
+    for (i, _) in dropout.mask.iter().enumerate().filter(|&(_, &d)| d) {
         model.scale_tree_weight(i, factor);
     }
     margins.recompute(model);

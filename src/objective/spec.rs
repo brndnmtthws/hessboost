@@ -94,11 +94,12 @@ pub enum Objective {
     /// A custom loss ([`CustomLoss`](crate::objective::CustomLoss) or any
     /// [`Loss`]): the gradients, transform, intercept, default metric, and
     /// `base_score` domain all come from it. A model trained with it
-    /// records the loss's name ([`ModelObjective::Other`]) and predicts
-    /// untransformed margins once saved; the name must not be a built-in
-    /// objective's. Its default `max_delta_step` is 0 (unbounded).
+    /// records the loss's name ([`ModelObjective::name`], with no
+    /// [`built_in`](crate::model::ModelObjective::built_in) objective) and
+    /// predicts untransformed margins once saved; the name must not be a
+    /// built-in objective's. Its default `max_delta_step` is 0 (unbounded).
     ///
-    /// [`ModelObjective::Other`]: crate::model::ModelObjective::Other
+    /// [`ModelObjective::name`]: crate::model::ModelObjective::name
     Custom(Arc<dyn Loss>),
 }
 
@@ -360,6 +361,12 @@ impl Objective {
             | Objective::Cox
             | Objective::Custom(_) => &[],
         }
+    }
+
+    /// Whether `name` is a built-in objective's (XGBoost's `reg:linear`
+    /// alias and the `dist:*` names included), whatever its parameters.
+    pub(crate) fn is_built_in_name(name: &str) -> bool {
+        Objective::from_parts(name, &ObjectiveParts::default()).is_some()
     }
 
     /// The built-in objective XGBoost names `name` (`reg:linear` is

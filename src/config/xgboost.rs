@@ -140,6 +140,7 @@ flat_params! {
     quant_train_renew_leaf: bool,
     rate_drop: f64,
     skip_drop: f64,
+    one_drop: bool,
     toad_penalty_feature: f64,
     toad_penalty_threshold: f64,
     langevin: bool,
@@ -258,6 +259,7 @@ impl Flat {
             quant_train_renew_leaf,
             rate_drop,
             skip_drop,
+            one_drop,
             toad_penalty_feature,
             toad_penalty_threshold,
             langevin,
@@ -342,6 +344,12 @@ impl Flat {
                 "`booster=dart`",
             ),
             (
+                "one_drop",
+                one_drop.is_some(),
+                booster == Some(FlatBooster::Dart),
+                "`booster=dart`",
+            ),
+            (
                 "refresh_leaf",
                 refresh_leaf.is_some(),
                 process_type == Some(FlatProcess::Update),
@@ -408,6 +416,9 @@ impl Flat {
                 }
                 if let Some(skip_drop) = skip_drop {
                     dart = dart.skip_drop(skip_drop);
+                }
+                if let Some(one_drop) = one_drop {
+                    dart = dart.one_drop(one_drop);
                 }
                 BoosterKind::Dart(dart.build()?)
             }
@@ -833,7 +844,8 @@ impl TrainingParams {
     ///
     /// # Errors
     ///
-    /// A configuration XGBoost's form cannot state: a custom loss, or a
+    /// A configuration [`validate`](Self::validate) refuses, or one
+    /// XGBoost's form cannot state: a custom loss, or a
     /// metric whose parameters differ from the objective's (XGBoost's
     /// `mphe`, `quantile`, `expectile`, and `aft-nloglik` read the same
     /// keys as the objective, and `nll` / `crps` its `dist:*` family).
@@ -885,6 +897,9 @@ impl TrainingParams {
                 format!("the custom loss `{}` has no XGBoost flat form", loss.name()),
             ));
         }
+        // The fields are public: an invalid value (a NaN bound) would be
+        // written as one that reads back as another (`null`, unset).
+        self.validate()?;
         let mut objective_keys = objective_keys(objective);
         for metric in eval_metric {
             for (key, value) in metric_keys(metric, objective)? {
@@ -923,6 +938,7 @@ impl TrainingParams {
                 set("booster", json("dart"));
                 set("rate_drop", json(dart.rate_drop()));
                 set("skip_drop", json(dart.skip_drop()));
+                set("one_drop", json(dart.one_drop()));
             }
         }
         set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));
@@ -935,7 +951,7 @@ impl TrainingParams {
         if let Some(base_score) = base_score {
             set("base_score", json(base_score));
         }
-        let names: Vec<_> = eval_metric.iter().map(EvalMetric::name).collect();
+        let names: Vec<_> = eval_metric.iter().map(EvalMetric::flat_name).collect();
         set("eval_metric", json(names));
         set("eta", json(eta));
         set("gamma", json(gamma));
@@ -1235,6 +1251,7 @@ mod tests {
     fn dependent_keys_without_their_switch_are_refused_by_name() {
         for (pairs, key) in [
             (json!({"booster": "gbtree", "rate_drop": 0.1}), "rate_drop"),
+            (json!({"one_drop": true}), "one_drop"),
             (json!({"refresh_leaf": false}), "refresh_leaf"),
             (json!({"extra_seed": 3}), "extra_seed"),
             (json!({"extra_trees": false, "extra_seed": 3}), "extra_seed"),
@@ -1341,6 +1358,7 @@ mod tests {
                 Dart::builder()
                     .rate_drop(0.2)
                     .skip_drop(0.3)
+                    .one_drop(true)
                     .build()
                     .unwrap(),
             ),
@@ -1517,6 +1535,50 @@ mod tests {
     /// `mphe` the `huber_slope`, `quantile` / `expectile` the alpha lists,
     /// `aft-nloglik` the AFT noise, and `nll` / `crps` the `dist:*` family.
     /// A metric with other parameters has no flat form.
+    /// The fields are public, so a configuration can be invalid: it is
+    /// refused by name rather than written as a flat form that reads back
+    /// as a different one (a NaN bound or base score as `null`, i.e. unset).
+    #[test]
+    fn invalid_configurations_are_refused_not_serialized() {
+        for (p, key) in [
+            (
+                TrainingParams {
+                    max_delta_step: MaxDeltaStep::Bounded(f64::NAN),
+                    ..TrainingParams::default()
+                },
+                "max_delta_step",
+            ),
+            (
+                TrainingParams {
+                    base_score: Some(f64::NAN),
+                    ..TrainingParams::default()
+                },
+                "base_score",
+            ),
+        ] {
+            match p.to_xgboost() {
+                Err(HessboostError::InvalidParameter { name, .. }) => assert_eq!(name, key),
+                other => panic!("{key}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A Tweedie metric's variance power survives the flat form in full:
+    /// its `evals_result` key rounds to six digits, its flat spelling not.
+    #[test]
+    fn tweedie_metric_powers_round_trip_exactly() {
+        for power in ["1.999999", "1.23456789", "1.5"] {
+            let p = TrainingParams::from_xgboost([(
+                "eval_metric",
+                json!(format!("tweedie-nloglik@{power}")),
+            )])
+            .unwrap();
+            let back = TrainingParams::from_xgboost(p.to_xgboost().unwrap())
+                .unwrap_or_else(|e| panic!("{power}: {e}"));
+            assert_eq!(back.eval_metric, p.eval_metric, "{power}");
+        }
+    }
+
     #[test]
     fn metrics_take_the_flat_parameters_xgboost_gives_them() {
         use crate::objective::distributional::DistFamily;

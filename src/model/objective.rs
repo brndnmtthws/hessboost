@@ -11,57 +11,99 @@ use serde::{Deserialize, Serialize};
 /// objective with its parameters, or the name of one this crate does not
 /// implement, whose predictions are untransformed margins.
 ///
+/// The two never overlap: a built-in objective is never a custom loss, and
+/// a recorded name is never a built-in objective's (a model file naming
+/// one loads as that objective).
+///
 /// ```
 /// use hessboost::model::ModelObjective;
-/// use hessboost::objective::Objective;
+/// use hessboost::objective::{CustomLoss, GradPair, Objective};
 ///
-/// let known = ModelObjective::BuiltIn(Objective::Poisson);
+/// # fn main() -> hessboost::error::Result<()> {
+/// let known = ModelObjective::new(Objective::Poisson)?;
 /// assert_eq!(known.name(), "count:poisson");
 /// assert_eq!(known.built_in(), Some(&Objective::Poisson));
-/// let custom = ModelObjective::Other("my:loss".to_owned());
-/// assert_eq!(custom.built_in(), None);
+/// let loss = CustomLoss::new("my:loss", 1, |p, y, _, out| {
+///     for ((g, p), y) in out.iter_mut().zip(p).zip(y) {
+///         *g = GradPair::new(p - y, 1.0);
+///     }
+/// });
+/// let custom = ModelObjective::new(Objective::custom(loss))?;
+/// assert_eq!((custom.name(), custom.built_in()), ("my:loss", None));
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum ModelObjective {
+pub struct ModelObjective(Recorded);
+
+/// [`ModelObjective`]'s representation, private so that its invariant
+/// holds.
+#[derive(Debug, Clone, PartialEq)]
+enum Recorded {
     /// A built-in objective (never [`Objective::Custom`]), which gives the
     /// prediction transform and XGBoost export.
     BuiltIn(Objective),
     /// A custom loss's [`name`](crate::objective::Loss::name), or an
-    /// XGBoost objective hessboost does not implement: the model predicts
-    /// margins, and XGBoost export refuses it.
+    /// XGBoost objective hessboost does not implement (never a built-in
+    /// objective's name): the model predicts margins, and XGBoost export
+    /// refuses it.
     Other(String),
 }
 
 impl ModelObjective {
+    /// What a model trained with `objective` records: a built-in objective
+    /// as itself, a custom loss by its name.
+    ///
+    /// # Errors
+    ///
+    /// A custom loss named like a built-in objective (`invalid parameter
+    /// "objective"`): a saved model would reload as that objective, so
+    /// training refuses it too.
+    pub fn new(objective: Objective) -> Result<Self> {
+        Ok(ModelObjective(match objective {
+            Objective::Custom(loss) if Objective::is_built_in_name(loss.name()) => {
+                return Err(HessboostError::invalid_param(
+                    "objective",
+                    format!(
+                        "the custom loss is named `{}`, a built-in objective's name, as \
+                         which a saved model would reload; rename the loss",
+                        loss.name()
+                    ),
+                ));
+            }
+            Objective::Custom(loss) => Recorded::Other(loss.name().to_owned()),
+            built_in => Recorded::BuiltIn(built_in),
+        }))
+    }
+
     /// The objective's name, as the model formats store it.
     pub fn name(&self) -> &str {
-        match self {
-            ModelObjective::BuiltIn(objective) => objective.name(),
-            ModelObjective::Other(name) => name,
+        match &self.0 {
+            Recorded::BuiltIn(objective) => objective.name(),
+            Recorded::Other(name) => name,
         }
     }
 
     /// The built-in objective, if it is one.
     pub fn built_in(&self) -> Option<&Objective> {
-        match self {
-            ModelObjective::BuiltIn(objective) => Some(objective),
-            ModelObjective::Other(_) => None,
+        match &self.0 {
+            Recorded::BuiltIn(objective) => Some(objective),
+            Recorded::Other(_) => None,
         }
     }
 
-    /// What a model trained with `objective` records: a custom loss by its
-    /// name, a built-in objective as itself.
+    /// [`ModelObjective::new`] for a configuration that validated (whose
+    /// custom loss, if any, has a name no built-in objective has).
     pub(crate) fn trained_with(objective: &Objective) -> Self {
-        match objective {
-            Objective::Custom(loss) => ModelObjective::Other(loss.name().to_owned()),
-            built_in => ModelObjective::BuiltIn(built_in.clone()),
-        }
+        ModelObjective(match objective {
+            Objective::Custom(loss) => Recorded::Other(loss.name().to_owned()),
+            built_in => Recorded::BuiltIn(built_in.clone()),
+        })
     }
 
     /// The objective the formats store as `name` with `stored` parameters
     /// and class count `num_class`: the built-in objective of that name
-    /// (only the parameters it reads matter), else [`ModelObjective::Other`].
+    /// (only the parameters it reads matter), else the name.
     ///
     /// # Errors
     ///
@@ -98,8 +140,8 @@ impl ModelObjective {
             },
         };
         match Objective::from_parts(name, &parts) {
-            None => Ok(ModelObjective::Other(name.to_owned())),
-            Some(Ok(objective)) => Ok(ModelObjective::BuiltIn(objective)),
+            None => Ok(ModelObjective(Recorded::Other(name.to_owned()))),
+            Some(Ok(objective)) => Ok(ModelObjective(Recorded::BuiltIn(objective))),
             Some(Err(e)) => Err(HessboostError::model_format(format!(
                 "invalid objective parameters: {e}"
             ))),
@@ -160,8 +202,10 @@ impl StoredObjectiveParams {
         } else {
             0.0
         };
-        let mut defaults =
-            StoredObjectiveParams::of(&ModelObjective::Other(String::new()), max_delta_step);
+        let mut defaults = StoredObjectiveParams::of(
+            &ModelObjective(Recorded::Other(String::new())),
+            max_delta_step,
+        );
         defaults.distribution = DistFamily::from_objective(objective);
         defaults
     }
@@ -263,5 +307,33 @@ impl<T> Stored<T> {
             Stored::Absent => default,
             Stored::Present(value) => value,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::objective::{CustomLoss, GradPair};
+
+    /// A custom loss named like a built-in objective cannot be recorded
+    /// (it would reload as that objective), and a stored built-in name
+    /// always loads as the objective, so the two states never overlap.
+    #[test]
+    fn recorded_names_are_never_built_in() {
+        let loss = |name: &'static str| {
+            Objective::custom(CustomLoss::new(name, 1, |_, _, _, out: &mut [GradPair]| {
+                out.fill(GradPair::new(0.0, 1.0));
+            }))
+        };
+        for name in ["reg:squarederror", "reg:linear", "dist:normal"] {
+            assert!(ModelObjective::new(loss(name)).is_err(), "{name}");
+        }
+        let custom = ModelObjective::new(loss("custom:mine")).unwrap();
+        assert_eq!((custom.name(), custom.built_in()), ("custom:mine", None));
+        let defaults = StoredObjectiveParams::defaults_for("reg:linear");
+        let stored = ModelObjective::from_stored("reg:linear", &defaults, 0).unwrap();
+        assert_eq!(stored.built_in(), Some(&Objective::SquaredError));
+        let unknown = ModelObjective::from_stored("rank:foo", &defaults, 0).unwrap();
+        assert_eq!((unknown.name(), unknown.built_in()), ("rank:foo", None));
     }
 }

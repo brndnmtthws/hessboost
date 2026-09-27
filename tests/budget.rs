@@ -539,3 +539,46 @@ fn unsupported_objectives_and_budgets_are_rejected() {
         assert_eq!(name, "budget", "budget {budget}");
     }
 }
+
+/// A custom loss that supplies reduced split gradients (vector-leaf trees
+/// only) is refused by budget mode, as by the other trainers, rather than
+/// trained on its full gradients.
+#[test]
+fn custom_split_gradients_are_refused() {
+    use hessboost::objective::{Loss, PointwiseLoss, SplitGradient};
+    struct Reduced;
+    impl Loss for Reduced {
+        fn name(&self) -> &'static str {
+            "custom:reduced"
+        }
+        fn gradient(&self, preds: &[f32], labels: &[f32], _: Option<&[f32]>, out: &mut [GradPair]) {
+            for ((g, p), y) in out.iter_mut().zip(preds).zip(labels) {
+                *g = GradPair::new(p - y, 1.0);
+            }
+        }
+        fn split_gradient(&self, _: usize, gpair: &[GradPair]) -> Option<SplitGradient> {
+            Some(SplitGradient::new(gpair.to_vec(), 1))
+        }
+        fn pointwise_loss(&self) -> Option<PointwiseLoss<'_>> {
+            Some(Box::new(|margin, label| {
+                f64::from((margin - label).powi(2)) / 2.0
+            }))
+        }
+        fn default_metric(&self) -> EvalMetric {
+            EvalMetric::Rmse
+        }
+    }
+    let (x, y) = friedman(500, 3);
+    let data = labeled_dense(&x, N_FEATURES, &y);
+    let params = TrainingParams::builder()
+        .objective(Objective::custom(Reduced))
+        .build()
+        .unwrap();
+    match train_with_budget(&params, &data, &BudgetConfig::default()) {
+        Err(HessboostError::InvalidParameter { name, .. }) => assert_eq!(name, "objective"),
+        other => panic!(
+            "expected an `objective` refusal, got {:?}",
+            other.map(|r| r.stop)
+        ),
+    }
+}

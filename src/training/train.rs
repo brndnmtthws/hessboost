@@ -210,17 +210,10 @@ impl Prepared {
         if !const_hess_approx || !gradient_sampling(params) {
             return Ok(());
         }
-        // Iteration 0's draws before its first sample: a DART round first
-        // draws its skip variate (`select_dropout` over an empty ensemble
-        // draws nothing more), and `sample_rows` draws nothing under
-        // gradient sampling.
-        let mut rng = if matches!(params.booster, BoosterKind::Dart(_)) {
-            let mut rng = round_rng(params, 0, DART_SALT);
-            let _skip = rng.f64();
-            rng
-        } else {
-            round_rng(params, 0, 0)
-        };
+        // Iteration 0's stream before its first sample: `select_dropout`
+        // draws nothing over the empty ensemble, and `sample_rows` draws
+        // nothing under gradient sampling.
+        let mut rng = round_rng(params, 0, round_salt(params));
         objective.gradient_info(margin0, info, gpair);
         let g0 = gather_output(gpair, gpair_k, n_out, 0);
         let sampled = gradient_based_sample(g0, 1, params.subsample, &mut rng)?;
@@ -1261,8 +1254,8 @@ fn grow_round(
     };
 
     for (slot, (tree, leaf_rows)) in slots.iter().zip(trees) {
-        // DART's gradients come from the ensemble, not the margin caches
-        // (`finish_dart` recomputes the eval ones).
+        // A dropout round's gradients come from the ensemble, not the margin
+        // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // The builder's final row partitions already identify the training
             // leaves when every row took part in growing the tree.
@@ -1628,9 +1621,10 @@ impl<'a> MarginCaches<'a> {
         }
     }
 
-    /// Recompute the eval caches from `model` (after a DART rescaling, which
+    /// Recompute every cache from `model` (after a DART rescaling, which
     /// makes them non-additive).
-    pub(super) fn recompute_evals(&mut self, model: &BoostedModel) {
+    pub(super) fn recompute(&mut self, model: &BoostedModel) {
+        self.train = model.margin_from_trees(self.dtrain, 0..model.num_trees());
         for (margins, (d, _)) in self.evals.iter_mut().zip(self.eval_sets) {
             *margins = model.margin_from_trees(d, 0..model.num_trees());
         }
@@ -1747,7 +1741,9 @@ fn apply_leaf_values<V: Copy + Send + Sync>(
 /// **excluding** `D`, whose tree ids it returns. Using XGBoost's `tree`
 /// normalization, if `k = |D|` the round's new trees then get weight
 /// `1/(k+eta)` ([`dart_new_tree_weight`]) and [`finish_dart`] rescales each
-/// dropped tree by `k/(k+eta)`.
+/// dropped tree by `k/(k+eta)`. A round that drops nothing (DART without
+/// dropout, a skipped dropout, or no tree drawn) returns `None` and trains as
+/// gbtree.
 pub(super) fn round_gradients(
     run: &TrainContext,
     model: &BoostedModel,
@@ -1762,12 +1758,17 @@ pub(super) fn round_gradients(
         objective,
         ..
     } = *run;
-    let BoosterKind::Dart(dart) = params.booster else {
-        objective.gradient_info_at(margin, info, gpair, iteration);
-        return (round_rng(params, iteration, 0), None);
+    let mut rng = round_rng(params, iteration, round_salt(params));
+    let dropout = match params.booster {
+        BoosterKind::Dart(dart) if dart.has_dropout() => select_dropout(model, &dart, &mut rng),
+        _ => None,
     };
-    let mut rng = round_rng(params, iteration, DART_SALT);
-    let (dropped, drop_indices) = select_dropout(model, &dart, &mut rng);
+    let Some((dropped, drop_indices)) = dropout else {
+        // Nothing dropped: the round reads the ensemble's own margins and
+        // its trees are not normalized, as in gbtree.
+        objective.gradient_info_at(margin, info, gpair, iteration);
+        return (rng, None);
+    };
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
     objective.gradient_info_at(&margin_excl, info, gpair, iteration);
     (rng, Some(drop_indices))
@@ -1776,30 +1777,48 @@ pub(super) fn round_gradients(
 /// The DART round RNG's booster salt.
 const DART_SALT: u64 = 0x0DA27;
 
-/// Draw a DART round's dropout set over the trees built so far: skipped with
-/// probability `skip_drop`, otherwise each tree independently with
-/// probability `rate_drop`, and at least one tree when any exist (as
-/// XGBoost). Returns the per-tree mask and the dropped indices.
-fn select_dropout(model: &BoostedModel, dart: &Dart, rng: &mut Rng) -> (Vec<bool>, Vec<usize>) {
+/// The salt of a round's RNG: DART's when its dropout can drop a tree,
+/// else gbtree's (a DART booster without dropout trains exactly as
+/// gbtree).
+fn round_salt(params: &TrainingParams) -> u64 {
+    match params.booster {
+        BoosterKind::Dart(dart) if dart.has_dropout() => DART_SALT,
+        _ => 0,
+    }
+}
+
+/// Draw a DART round's dropout set over the trees built so far, as
+/// XGBoost's `GBTree::DropTrees` (uniform sampling): nothing and no draws
+/// over an empty ensemble; skipped with probability `skip_drop`; otherwise
+/// each tree independently with probability `rate_drop`, plus one tree at
+/// random when none was drawn and `one_drop` is set. Returns the per-tree
+/// mask and the dropped indices, or `None` when nothing is dropped.
+fn select_dropout(
+    model: &BoostedModel,
+    dart: &Dart,
+    rng: &mut Rng,
+) -> Option<(Vec<bool>, Vec<usize>)> {
     let existing = model.num_trees();
+    if existing == 0 {
+        return None;
+    }
+    if dart.skip_drop() > 0.0 && rng.f64() < dart.skip_drop() {
+        return None;
+    }
     let mut dropped = vec![false; existing];
     let mut drop_indices: Vec<usize> = Vec::new();
-    let skip = rng.f64() < dart.skip_drop();
-    if !skip && existing > 0 {
-        for (i, d) in dropped.iter_mut().enumerate() {
-            if rng.f64() < dart.rate_drop() {
-                *d = true;
-                drop_indices.push(i);
-            }
-        }
-        if drop_indices.is_empty() {
-            // Guarantee at least one dropped tree, as XGBoost does.
-            let i = rng.range(0..existing);
-            dropped[i] = true;
+    for (i, d) in dropped.iter_mut().enumerate() {
+        if rng.f64() < dart.rate_drop() {
+            *d = true;
             drop_indices.push(i);
         }
     }
-    (dropped, drop_indices)
+    if drop_indices.is_empty() && dart.one_drop() {
+        let i = rng.range(0..existing);
+        dropped[i] = true;
+        drop_indices.push(i);
+    }
+    (!drop_indices.is_empty()).then_some((dropped, drop_indices))
 }
 
 /// XGBoost's `tree` normalization weight of a DART round's new trees:
@@ -1814,8 +1833,9 @@ pub(super) fn dart_new_tree_weight(drop_indices: &[usize], params: &TrainingPara
 }
 
 /// Finish a DART round: rescale its dropped trees by `k / (k + eta)` so the
-/// ensemble stays balanced, then recompute the eval margin caches, which the
-/// rescaling makes non-additive.
+/// ensemble stays balanced, then recompute the margin caches, which the
+/// rescaling makes non-additive (a later round that drops nothing reads the
+/// training one).
 pub(super) fn finish_dart(
     model: &mut BoostedModel,
     params: &TrainingParams,
@@ -1827,7 +1847,7 @@ pub(super) fn finish_dart(
     for &i in drop_indices {
         model.scale_tree_weight(i, factor);
     }
-    margins.recompute_evals(model);
+    margins.recompute(model);
 }
 
 /// Borrow the gradient slice for output `k`: the whole buffer for
@@ -3025,6 +3045,95 @@ mod tests {
         }
     }
 
+    /// XGBoost's `DropTrees`: DART without dropout never drops a tree, so it
+    /// trains exactly as gbtree (row sampling included).
+    #[test]
+    fn dart_without_dropout_trains_as_gbtree() {
+        let d = step_dataset(200);
+        let fit = |booster| {
+            let params = TrainingParams::builder()
+                .booster(booster)
+                .max_depth(3)
+                .subsample(0.7)
+                .seed(5)
+                .build()
+                .unwrap();
+            train(&params, &d, 20).unwrap()
+        };
+        let gbtree = fit(BoosterKind::GbTree);
+        let dart = fit(BoosterKind::Dart(Dart::default()));
+        assert_eq!(dart.trees(), gbtree.trees());
+        assert_eq!(dart.predict(&d).unwrap(), gbtree.predict(&d).unwrap());
+    }
+
+    /// A round that drops nothing reads the training margin cache, so after
+    /// a dropout round (which rescales trees) that cache must match the
+    /// ensemble: training in one run equals training half, then continuing
+    /// from the saved half (whose caches are rebuilt from the model), for
+    /// scalar and vector-leaf trees.
+    #[test]
+    fn dart_rounds_after_a_dropout_read_current_margins() {
+        let x: Vec<f32> = (0..400).map(|i| ((i * 37) % 101) as f32 / 101.0).collect();
+        let y: Vec<f32> = (0..400).map(|i| ((i * 13) % 7) as f32).collect();
+        let scalar = labeled_dense(&x, 200, 2, &y[..200]);
+        let vector = DMatrix::from_dense(&x, 200, 2)
+            .unwrap()
+            .with_label_matrix(&y, 2)
+            .unwrap();
+        let dart = Dart::builder()
+            .rate_drop(0.3)
+            .skip_drop(0.5)
+            .build()
+            .unwrap();
+        for (data, strategy) in [
+            (&scalar, crate::config::MultiStrategy::OneOutputPerTree),
+            (&vector, crate::config::MultiStrategy::MultiOutputTree),
+        ] {
+            let params = TrainingParams::builder()
+                .booster(BoosterKind::Dart(dart))
+                .multi_strategy(strategy)
+                .max_depth(3)
+                .seed(11)
+                .build()
+                .unwrap();
+            let whole = train(&params, data, 12).unwrap();
+            let half = train(&params, data, 6).unwrap();
+            let resumed = Trainer::new(&params, data, 6)
+                .init_model(&half)
+                .train()
+                .unwrap()
+                .model;
+            assert_eq!(
+                resumed.predict_margin(data).unwrap(),
+                whole.predict_margin(data).unwrap(),
+                "{strategy:?}"
+            );
+        }
+    }
+
+    /// A round whose draw selects no tree drops nothing unless `one_drop`,
+    /// which then drops exactly one; an empty ensemble draws nothing.
+    #[test]
+    fn dart_forces_a_drop_only_under_one_drop() {
+        let d = step_dataset(50);
+        let params = TrainingParams::builder().max_depth(2).build().unwrap();
+        let model = train(&params, &d, 5).unwrap();
+        let never = Dart::builder().rate_drop(1e-300).build().unwrap();
+        let forced = Dart::builder()
+            .rate_drop(1e-300)
+            .one_drop(true)
+            .build()
+            .unwrap();
+        let mut rng = Rng::new(3);
+        assert_eq!(select_dropout(&model, &never, &mut rng), None);
+        let (mask, dropped) = select_dropout(&model, &forced, &mut rng).unwrap();
+        assert_eq!((dropped.len(), mask.iter().filter(|&&m| m).count()), (1, 1));
+        let empty = train(&params, &d, 0).unwrap();
+        let mut before = rng.clone();
+        assert_eq!(select_dropout(&empty, &forced, &mut rng), None);
+        assert_eq!(rng.f64(), before.f64());
+    }
+
     #[test]
     fn gbtree_unchanged_by_weight_field() {
         // A default gbtree model carries all-1.0 weights, so predictions must be
@@ -3816,6 +3925,29 @@ mod tests {
                 .train();
             let reason = eval_metric_rejection(run, metric);
             assert!(reason.contains("`eval`"), "{reason}");
+        }
+    }
+
+    /// A multi-output model that is not multiclass (three quantiles) gives
+    /// `mlogloss` / `merror` their width, but its regression labels are not
+    /// class indices: the metrics refuse the eval set instead of reading a
+    /// probability past the row.
+    #[test]
+    fn class_index_metrics_refuse_non_class_labels() {
+        let x: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..32).map(|i| 10.0 + i as f32).collect();
+        let d = labeled_dense(&x, 32, 1, &y);
+        for metric in ["mlogloss", "merror"] {
+            let params = TrainingParams::builder()
+                .objective(Objective::Quantile(
+                    crate::objective::Quantiles::new([0.1, 0.5, 0.9]).unwrap(),
+                ))
+                .eval_metric(named_metric(metric))
+                .build()
+                .unwrap();
+            let run = Trainer::new(&params, &d, 2).eval(&d, "eval").train();
+            let reason = eval_metric_rejection(run, metric);
+            assert!(reason.contains("class"), "{reason}");
         }
     }
 

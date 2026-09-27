@@ -2079,7 +2079,7 @@ mod tests {
         ));
         // A three-alpha objective cannot describe a two-output layout.
         let widened = with_meta(&bytes, |m| {
-            m.objective = ModelObjective::BuiltIn(Objective::Quantile(
+            m.objective = ModelObjective::trained_with(&Objective::Quantile(
                 Quantiles::new([0.1, 0.5, 0.9]).unwrap(),
             ));
             m.n_targets = 1;
@@ -2118,7 +2118,7 @@ mod tests {
             w.write_bool(true); // complete
         }
         let meta = Meta {
-            objective: ModelObjective::BuiltIn(Objective::SquaredError),
+            objective: ModelObjective::trained_with(&Objective::SquaredError),
             max_delta_step: 0.0,
             num_class: 0,
             n_targets: 1,

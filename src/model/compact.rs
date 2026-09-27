@@ -27,10 +27,12 @@
 //! bytes 5..9   u32 little-endian M, the metadata length
 //! next M bytes metadata: a section table (`model::sections`, the
 //!              native format's building block) holding the objective name,
-//!              num_class, n_targets, num_parallel_tree, and the objective
-//!              parameters when they differ from the objective's defaults;
-//!              readers give sections a file lacks their default, so later
-//!              additions keep older files loading
+//!              num_class, n_targets, num_parallel_tree, the objective
+//!              parameters when they differ from the objective's defaults,
+//!              and a shrunk model's shrinkage record (the native format's
+//!              `REQUIRED` `shrinkage.*` sections); readers give sections a
+//!              file lacks their default, so later additions keep older
+//!              files loading
 //! rest         one bit stream
 //! ```
 //!
@@ -89,7 +91,11 @@
 //! or the matrix's sentinel) follows the split's default direction, a
 //! numeric split sends `x < threshold` left, and a categorical split sends
 //! the categories of its set left. Margins accumulate `weight × leaf` per
-//! output in tree order in `f32`, exactly as the native predictor does.
+//! output in tree order in `f32`, exactly as the native predictor does. A
+//! model trained with model shrinkage keeps its closed-form tree weights and
+//! intercepts in the bit stream, but predicts from its shrinkage record as
+//! the native predictor does (every iteration shrinks the margins, then adds
+//! its trees at weight `1`; see `model::shrinkage`).
 //!
 //! # Example
 //!
@@ -118,14 +124,17 @@
 //! # }
 //! ```
 
-use super::native::{OBJECTIVE_SECTIONS, read_objective_params, write_objective_params};
+use super::native::{
+    OBJECTIVE_SECTIONS, SHRINKAGE_SECTIONS, read_objective_params, read_shrinkage,
+    write_objective_params, write_shrinkage,
+};
 use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{
-    BoostedModel, RowBlock, check_objective_width, initial_margins, transform_model_margins,
-    validate_prediction_data,
+    BoostedModel, RowBlock, Shrinkage, check_objective_width, initial_margins, shrink_margins,
+    transform_model_margins, validate_prediction_data,
 };
 use crate::tree::{Node, RegTree, scalar_tree_output};
 use rayon::prelude::*;
@@ -171,9 +180,12 @@ struct Meta {
     /// Trees per output in each boosting iteration: tree `t` feeds output
     /// `(t / num_parallel_tree) % n_outputs`.
     num_parallel_tree: usize,
+    /// The model shrinkage record, when the model was trained with it.
+    shrinkage: Option<Shrinkage>,
 }
 
-/// Every metadata section besides [`OBJECTIVE_SECTIONS`].
+/// Every metadata section besides [`OBJECTIVE_SECTIONS`] and
+/// [`SHRINKAGE_SECTIONS`].
 const META_SECTIONS: &[&str] = &["objective", "num_class", "n_targets", "num_parallel_tree"];
 
 impl Meta {
@@ -191,12 +203,17 @@ impl Meta {
         if params != StoredObjectiveParams::defaults_for(name) {
             write_objective_params(&mut w, &params);
         }
+        if let Some(shrinkage) = &self.shrinkage {
+            write_shrinkage(&mut w, shrinkage);
+        }
         w
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
         let (s, rest) = Sections::parse(bytes, |name| {
-            META_SECTIONS.contains(&name) || OBJECTIVE_SECTIONS.contains(&name)
+            META_SECTIONS.contains(&name)
+                || OBJECTIVE_SECTIONS.contains(&name)
+                || SHRINKAGE_SECTIONS.contains(&name)
         })
         .map_err(|e| format_error(format!("metadata: {e}")))?;
         if !rest.is_empty() {
@@ -211,6 +228,7 @@ impl Meta {
             num_class,
             n_targets: s.usize("n_targets")?,
             num_parallel_tree: s.usize("num_parallel_tree")?,
+            shrinkage: read_shrinkage(&s)?,
         })
     }
 }
@@ -840,6 +858,18 @@ impl CompactModel {
                 .ok_or_else(too_large)?,
         };
         let header = read_header(&mut r, &meta)?;
+        if let Some(shrinkage) = &meta.shrinkage {
+            let per = header.base_score.len() * meta.num_parallel_tree;
+            shrinkage
+                .validate(header.n_trees / per, header.base_score.len())
+                .map_err(|e| format_error(e.to_string()))?;
+            let weight = |t: usize| header.tree_weights.as_ref().map_or(1.0, |w| w[t]);
+            if !shrinkage.matches(per, weight, &header.base_score) {
+                return Err(format_error(
+                    "the tree weights and intercepts do not match the shrinkage record",
+                ));
+            }
+        }
         let widths = Widths::new(
             header.n_used,
             header.max_thresholds as usize,
@@ -1069,9 +1099,19 @@ impl CompactModel {
     pub fn predict_margin(&self, data: &DMatrix) -> Result<super::Predictions> {
         let k = self.n_outputs();
         validate_prediction_data(self.n_features, k, data)?;
-        let mut out = initial_margins(&self.base_score, data);
-        let weight = |t: usize| self.tree_weights.as_ref().map_or(1.0, |w| w[t]);
+        let shrinkage = self.meta.shrinkage.as_ref();
+        let (mut out, weights) = match shrinkage {
+            // The record's own recurrence; the stored weights are its
+            // closed form.
+            Some(shrinkage) => (shrinkage.start_margins(data), None),
+            None => (
+                initial_margins(&self.base_score, data),
+                self.tree_weights.as_deref(),
+            ),
+        };
+        let weight = |t: usize| weights.map_or(1.0, |w| w[t]);
         let parallel = self.meta.num_parallel_tree;
+        let per = parallel * k;
         out.par_chunks_mut(k)
             .enumerate()
             .with_min_len(256)
@@ -1081,11 +1121,19 @@ impl CompactModel {
                     block.load(r, 1);
                     let row = block.row(0).expect("single-row blocks are dense");
                     for t in 0..self.trees.len() {
+                        if let Some(shrinkage) = shrinkage
+                            && t % per == 0
+                        {
+                            shrink_margins(margins, shrinkage.factors()[t / per]);
+                        }
                         margins[scalar_tree_output(t, parallel, k)] +=
                             weight(t) * self.tree_leaf(t, row);
                     }
                 },
             );
+        if let Some(shrinkage) = shrinkage {
+            shrinkage.finish_margins(data, &mut out);
+        }
         Ok(super::Predictions::new(out, data.n_rows(), k))
     }
 
@@ -1720,6 +1768,7 @@ impl<'a> Encoding<'a> {
             num_class: model.num_class(),
             n_targets: model.n_targets(),
             num_parallel_tree: model.num_parallel_tree(),
+            shrinkage: model.shrinkage().cloned(),
         }
     }
 }
@@ -2123,6 +2172,7 @@ mod tests {
             num_class: 0,
             n_targets: 1,
             num_parallel_tree: 1,
+            shrinkage: None,
         };
         frame(&meta, &w.bytes)
     }

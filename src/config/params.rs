@@ -433,25 +433,26 @@ pub struct TrainingParams {
     /// Stochastic Gradient Langevin Boosting (CatBoost `langevin`;
     /// Ustimenko and Prokhorenkova, ICML 2021; see [`Langevin`]), `None`
     /// for off unless [`posterior_sampling`](Self::posterior_sampling) turns
-    /// it on. With Langevin on, an unset
-    /// [`model_shrink`](Self::model_shrink) takes CatBoost's constant rate
-    /// `0.001`.
+    /// it on. Langevin adds no model shrinkage of its own: set
+    /// [`model_shrink`](Self::model_shrink) for it (CatBoost's flat
+    /// `langevin=true` defaults to a constant rate `0.001`, which
+    /// [`from_xgboost`](Self::from_xgboost) maps to that `model_shrink`).
     ///
     /// Needs `booster = gbtree` with one tree per output and iteration
     /// (`num_parallel_tree = 1`); refused with monotone constraints,
-    /// `linear_tree`, `path_smooth` (all of which the re-estimated leaves
+    /// `linear_tree`, `path_smooth`, quantized leaf renewal
+    /// ([`QuantizedGrad::renew_leaf`]; all of which the re-estimated leaves
     /// would bypass), gradient-based sampling (whose row probabilities the
     /// noise would distort), and `process_type = update`.
     pub langevin: Option<Langevin>,
     /// Per-iteration model shrinkage (CatBoost `model_shrink_rate` /
-    /// `model_shrink_mode`; see [`ModelShrink`]), `None` for off (or the
-    /// defaults of [`langevin`](Self::langevin) and
-    /// [`posterior_sampling`](Self::posterior_sampling)). The constant
-    /// coefficient `1 - rate * eta` must stay positive.
+    /// `model_shrink_mode`; see [`ModelShrink`]), `None` for none
+    /// ([`posterior_sampling`](Self::posterior_sampling) derives its own).
+    /// The constant coefficient `1 - rate * eta` must stay positive.
     ///
     /// A shrunk model stores its trees unscaled with the per-iteration
-    /// factors: each tree's contribution weight is the product of the
-    /// factors applied after it was grown, so iteration ranges `..k`,
+    /// factors and predicts with training's shrink-then-add arithmetic, so
+    /// iteration ranges `..k`,
     /// [`slice`](crate::model::BoostedModel::slice)`(..k, 1)`, and early
     /// stopping reproduce the model trained for `k` rounds exactly. Refused
     /// with `dart`, `gblinear`, `process_type = update`, continued training,
@@ -1027,25 +1028,27 @@ impl TrainingParams {
         }
     }
 
-    /// The model shrinkage in effect for `n_rows` training rows:
-    /// `1 / (2 n_rows)` constant under posterior sampling, else the
-    /// configured shrinkage, CatBoost's Langevin default (`0.001`
-    /// constant), or none (rate `0`).
-    pub(crate) fn effective_model_shrink(&self, n_rows: usize) -> (f64, ModelShrinkMode) {
+    /// The Langevin noise scale `sqrt(2 / (eta * temperature))` (CatBoost's
+    /// `CalcLangevinNoiseRate`).
+    pub(crate) fn langevin_noise_scale(&self, temperature: f64) -> f64 {
+        (2.0 / (self.eta * temperature)).sqrt()
+    }
+
+    /// The model shrinkage `(rate, mode)` in effect for `n_rows` training
+    /// rows: `1 / (2 n_rows)` constant under posterior sampling, else the
+    /// configured shrinkage, if any.
+    pub(crate) fn effective_model_shrink(&self, n_rows: usize) -> Option<(f64, ModelShrinkMode)> {
         if self.posterior_sampling {
-            return (1.0 / (2.0 * n_rows as f64), ModelShrinkMode::Constant);
+            return Some((1.0 / (2.0 * n_rows as f64), ModelShrinkMode::Constant));
         }
-        match self.model_shrink {
-            Some(shrink) => (shrink.rate(), shrink.mode()),
-            None if self.langevin.is_some() => (0.001, ModelShrinkMode::Constant),
-            None => (0.0, ModelShrinkMode::Constant),
-        }
+        self.model_shrink
+            .map(|shrink| (shrink.rate(), shrink.mode()))
     }
 
     /// Whether training shrinks the model every iteration (known without
     /// the data: posterior sampling always shrinks at a positive rate).
     pub(crate) fn model_shrinkage_on(&self) -> bool {
-        self.posterior_sampling || self.effective_model_shrink(1).0 > 0.0
+        self.posterior_sampling || self.model_shrink.is_some()
     }
 
     /// Compatibility of Langevin boosting and model shrinkage (CatBoost's
@@ -1068,18 +1071,42 @@ impl TrainingParams {
                 "is derived by `posterior_sampling` (constant, 1 / (2 * rows)); leave it unset",
             )?;
         }
+        // The noise joins `f32` gradients, so its scale must be a normal
+        // `f32`: an underflowing `eta * T` would make every noisy gradient
+        // infinite, an overflowing one would switch the noise off. Under
+        // posterior sampling `T` is the row count `n >= 1` and `eta < 2n`
+        // (`Sglb::resolve`), so `eta * T` lies in `(2^-150, 2n^2)` and the
+        // scale in `(1 / n, 2^76)`: always normal.
+        if self.langevin.is_some() && !self.posterior_sampling {
+            let temperature = self.effective_diffusion_temperature(0);
+            let sigma = self.langevin_noise_scale(temperature);
+            ensure(
+                "diffusion_temperature",
+                (sigma as f32).is_normal(),
+                format!(
+                    "gives a Langevin noise scale sqrt(2 / (eta * diffusion_temperature)) \
+                     outside f32's normal range: {sigma:e} for eta {:e} and temperature \
+                     {temperature:e}",
+                    self.eta
+                ),
+            )?;
+        }
         // Posterior sampling's rate depends on the row count; its coefficient
         // is checked with the data (`Sglb::resolve`).
-        let (rate, mode) = self.effective_model_shrink(1);
-        ensure(
-            "model_shrink_rate",
-            self.posterior_sampling || mode == ModelShrinkMode::Decreasing || rate * self.eta < 1.0,
-            format!(
-                "the constant shrink coefficient 1 - model_shrink_rate * eta must stay \
-                 positive, got rate {rate} with eta {}",
-                self.eta
-            ),
-        )?;
+        if let Some(shrink) = self.model_shrink
+            && shrink.mode() == ModelShrinkMode::Constant
+        {
+            ensure(
+                "model_shrink_rate",
+                shrink.rate() * self.eta < 1.0,
+                format!(
+                    "the constant shrink coefficient 1 - model_shrink_rate * eta must stay \
+                     positive, got rate {} with eta {}",
+                    shrink.rate(),
+                    self.eta
+                ),
+            )?;
+        }
         let enabled = [
             ("langevin", self.langevin_on()),
             ("model_shrink_rate", self.model_shrinkage_on()),
@@ -1102,7 +1129,8 @@ impl TrainingParams {
         if self.langevin_on() {
             // The noise scale assumes one tree carries each output's whole
             // step; the re-estimated leaves would bypass the constraint
-            // bounds, the path-smoothed outputs, and the leaf linear fits.
+            // bounds, the path-smoothed outputs, the leaf linear fits, and
+            // quantized training's renewed leaves.
             ensure(
                 "langevin",
                 self.num_parallel_tree == 1,
@@ -1119,6 +1147,12 @@ impl TrainingParams {
                 "langevin",
                 self.linear_tree.is_none() && self.path_smooth == 0.0,
                 "is not supported with `linear_tree` or `path_smooth`",
+            )?;
+            ensure(
+                "langevin",
+                self.quantized.is_none_or(|q| !q.renew_leaf()),
+                "is not supported with `quant_train_renew_leaf` (the Langevin leaf \
+                 re-estimation would replace the renewed leaves)",
             )?;
             ensure(
                 "langevin",

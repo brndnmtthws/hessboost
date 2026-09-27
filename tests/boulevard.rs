@@ -1,8 +1,8 @@
 //! `booster = boulevard` and its statistical inference ([`hessboost::inference`]).
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Boulevard, Langevin, ModelShrink, QueryBagging, TrainingParams,
-    TrainingParamsBuilder,
+    BalancedBagging, BoosterKind, Boulevard, Langevin, ModelShrink, ModelShrinkMode, QueryBagging,
+    TrainingParams, TrainingParamsBuilder,
 };
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::objective::{LambdaRank, Logistic, Objective};
@@ -304,7 +304,7 @@ fn sglb_and_virtual_ensembles_are_refused() {
     let refused = |b: TrainingParamsBuilder| invalid_param(b.build());
     assert_eq!(refused(builder().langevin(Langevin::default())), "langevin");
     assert_eq!(refused(builder().posterior_sampling(true)), "langevin");
-    let shrink = ModelShrink::builder().rate(0.01).build().unwrap();
+    let shrink = ModelShrink::new(0.01, ModelShrinkMode::Constant).unwrap();
     assert_eq!(refused(builder().model_shrink(shrink)), "model_shrink_rate");
     let dtrain = data(200, 17);
     let model = train(&builder().build().unwrap(), &dtrain, 20).unwrap();

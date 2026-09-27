@@ -40,6 +40,10 @@ const FIXED: &[(&str, &str)] = &[
     ("max_cat_threshold", "64"),
 ];
 
+/// CatBoost's `model_shrink_rate` for `langevin=true` in the constant mode
+/// when the rate is not given (`SetNotSpecifiedOptionsToDefaults`).
+const LANGEVIN_SHRINK_RATE: f64 = 0.001;
+
 /// XGBoost's `booster` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -460,8 +464,8 @@ impl Flat {
             (
                 "model_shrink_mode",
                 model_shrink_mode.is_some(),
-                model_shrink_rate.is_some(),
-                "`model_shrink_rate`",
+                model_shrink_rate.is_some_and(|rate| rate != 0.0),
+                "a `model_shrink_rate` other than 0",
             ),
         ];
         for (key, set, on, needs) in switches {
@@ -577,11 +581,19 @@ impl Flat {
         } else {
             (subsample, None)
         };
-        // CatBoost: posterior sampling needs Langevin "not set or true".
+        // CatBoost: posterior sampling needs Langevin "not set or true", and
+        // derives the shrink rate (an explicit one, `0` included, is refused
+        // rather than overridden).
         if posterior_sampling == Some(true) && langevin == Some(false) {
             return Err(HessboostError::invalid_param(
                 "langevin",
                 "`posterior_sampling` requires Langevin boosting; leave `langevin` unset or true",
+            ));
+        }
+        if posterior_sampling == Some(true) && model_shrink_rate.is_some() {
+            return Err(HessboostError::invalid_param(
+                "model_shrink_rate",
+                "is derived by `posterior_sampling` (constant, 1 / (2 * rows)); leave it unset",
             ));
         }
         let langevin = if langevin == Some(true) {
@@ -594,13 +606,17 @@ impl Flat {
             None
         };
         let model_shrink = match model_shrink_rate {
-            Some(rate) => {
-                let mut shrink = ModelShrink::builder().rate(rate);
-                if let Some(mode) = model_shrink_mode {
-                    shrink = shrink.mode(mode);
-                }
-                Some(shrink.build()?)
-            }
+            // CatBoost's rate `0` is no shrinkage.
+            Some(0.0) => None,
+            Some(rate) => Some(ModelShrink::new(
+                rate,
+                model_shrink_mode.unwrap_or_default(),
+            )?),
+            // CatBoost's default under Langevin (`SetNotSpecifiedOptionsToDefaults`
+            // in `catboost_options.cpp`); posterior sampling derives its own.
+            None if langevin.is_some() && posterior_sampling != Some(true) => Some(
+                ModelShrink::new(LANGEVIN_SHRINK_RATE, ModelShrinkMode::Constant)?,
+            ),
             None => None,
         };
         let d = TrainingParams::default();
@@ -847,6 +863,11 @@ impl TrainingParams {
     /// `nthread` reads as `None` (no limit, the global pool), and
     /// `max_delta_step` as a [`MaxDeltaStep`]: absent or `null` is
     /// `ObjectiveDefault`, `0` is `Unbounded`, anything else `Bounded`.
+    /// CatBoost's `model_shrink_rate = 0` reads as `model_shrink = None`,
+    /// and `langevin = true` without a rate (and without posterior
+    /// sampling) as CatBoost's default, a constant rate `0.001`;
+    /// [`to_xgboost`](Self::to_xgboost) writes a `0` rate for Langevin
+    /// without shrinkage.
     ///
     /// # Errors
     ///
@@ -1135,9 +1156,17 @@ impl TrainingParams {
                 set("diffusion_temperature", json(temperature));
             }
         }
-        if let Some(shrink) = model_shrink {
-            set("model_shrink_rate", json(shrink.rate()));
-            set("model_shrink_mode", json(shrink.mode()));
+        match model_shrink {
+            Some(shrink) => {
+                set("model_shrink_rate", json(shrink.rate()));
+                set("model_shrink_mode", json(shrink.mode()));
+            }
+            // The flat `langevin=true` alone shrinks at CatBoost's default
+            // rate; `0` keeps it off.
+            None if langevin.is_some() && !posterior_sampling => {
+                set("model_shrink_rate", json(0.0));
+            }
+            None => {}
         }
         set("posterior_sampling", json(posterior_sampling));
         Ok(flat)

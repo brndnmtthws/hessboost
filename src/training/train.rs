@@ -9,7 +9,7 @@ use crate::data::quantile::HistCuts;
 use crate::data::{DMatrix, GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::Metric;
-use crate::model::{BoostedModel, ModelSpec, Shrinkage};
+use crate::model::{BoostedModel, ModelSpec, Shrinkage, shrink_margins};
 use crate::objective::{GradPair, Loss};
 use crate::rng::Rng;
 use crate::training::continuation::{require_model_for_update, resume_model};
@@ -1792,17 +1792,13 @@ impl<'a> MarginCaches<'a> {
         }
     }
 
-    /// Multiply every cached margin by `factor` (model shrinkage, in `f64`
-    /// and rounded once per cell). Cells are independent, so the parallel
-    /// pass gives the serial result.
+    /// Multiply every cached margin by `factor` (model shrinkage,
+    /// [`shrink_margins`], the step prediction repeats). Cells are
+    /// independent, so the parallel pass gives the serial result.
     pub(super) fn scale(&mut self, factor: f64) {
         let n_out = self.n_out;
         for margins in std::iter::once(&mut self.train).chain(&mut self.evals) {
-            for_each_row_margins(margins, n_out, |(_, row)| {
-                for m in row {
-                    *m = (f64::from(*m) * factor) as f32;
-                }
-            });
+            for_each_row_margins(margins, n_out, |(_, row)| shrink_margins(row, factor));
         }
     }
 

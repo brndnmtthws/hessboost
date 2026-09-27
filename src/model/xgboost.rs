@@ -145,9 +145,10 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     let n_trees = model.effective_num_trees();
     let per_iteration = model.trees_per_iteration();
 
-    // A shrunk model's contribution weights go into its leaves (as CatBoost
-    // bakes its shrinkage), so XGBoost reads plain gbtree trees; the `f32`
-    // product is the one prediction forms, so margins stay bit-identical.
+    // A shrunk model's closed-form contribution weights go into its leaves
+    // (as CatBoost bakes its shrinkage), so XGBoost reads plain gbtree
+    // trees. A sum of trees cannot repeat training's per-iteration
+    // rounding, so the exported margins match within `f32` rounding.
     let baked: Vec<RegTree>;
     let exported = if model.shrinkage().is_some() {
         baked = model.trees()[..n_trees]

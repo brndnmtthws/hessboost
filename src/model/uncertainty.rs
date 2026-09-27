@@ -81,7 +81,8 @@
 //! let ensembles = model.predict_virtual_ensembles(&dtrain, 10)?;
 //! assert_eq!(ensembles.iterations(), &[55, 60, 65, 70, 75, 80, 85, 90, 95, 100]);
 //! let uncertainty = model.predict_uncertainty(&dtrain, 10)?;
-//! assert_eq!(uncertainty.knowledge.len(), 200);
+//! assert_eq!(uncertainty.knowledge.n_rows(), 200);
+//! assert_eq!(uncertainty.knowledge.width(), 1);
 //! assert!(uncertainty.data.is_none()); // squared error has no data uncertainty
 //! # Ok(())
 //! # }
@@ -145,25 +146,26 @@ impl VirtualEnsembles {
 /// ([`BoostedModel::predict_uncertainty`]; see the
 /// [module docs](self#decomposition) for the per-objective definitions).
 ///
-/// `knowledge`, `data`, and `total` hold [`columns`](Self::columns) values
-/// per row, row-major: one per row, except one per output for multi-output
-/// regression and one per label column for multi-label classification.
+/// Every field is one row per predicted row, each with its own width.
+/// `knowledge`, `data`, and `total` share theirs: one per row, except one
+/// per output for multi-output regression and one per label column for
+/// multi-label classification. `mean` is as wide as the mean prediction:
+/// `num_class` probabilities for multiclass models (`multi:softmax` too),
+/// otherwise the width of the uncertainties.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Uncertainty {
-    /// Values per row of `knowledge`, `data`, and `total`.
-    pub columns: usize,
     /// The members' mean prediction: predictions for regression, predicted
     /// means for `dist:*`, probabilities for classification
-    /// (`multi:softmax` too: one per class), row-major.
-    pub mean: Vec<f64>,
+    /// (`multi:softmax` too: one per class).
+    pub mean: Predictions<f64>,
     /// Knowledge (epistemic) uncertainty.
-    pub knowledge: Vec<f64>,
+    pub knowledge: Predictions<f64>,
     /// Data (aleatoric) uncertainty; `None` for plain regression, whose
     /// models predict no spread.
-    pub data: Option<Vec<f64>>,
+    pub data: Option<Predictions<f64>>,
     /// Total uncertainty (`data + knowledge`); `None` when `data` is.
-    pub total: Option<Vec<f64>>,
+    pub total: Option<Predictions<f64>>,
 }
 
 /// How [`BoostedModel::predict_uncertainty`] reads an objective's members.
@@ -364,9 +366,8 @@ impl BoostedModel {
                     knowledge.push(variance);
                 }
                 Uncertainty {
-                    columns: width,
-                    mean,
-                    knowledge,
+                    mean: Predictions::new(mean, n, width),
+                    knowledge: Predictions::new(knowledge, n, width),
                     data: None,
                     total: None,
                 }
@@ -393,11 +394,10 @@ impl BoostedModel {
                     .map(|(a, b)| a + b)
                     .collect();
                 Uncertainty {
-                    columns: 1,
-                    mean,
-                    knowledge,
-                    data: Some(aleatoric),
-                    total: Some(total),
+                    mean: Predictions::new(mean, n, 1),
+                    knowledge: Predictions::new(knowledge, n, 1),
+                    data: Some(Predictions::new(aleatoric, n, 1)),
+                    total: Some(Predictions::new(total, n, 1)),
                 }
             }
             Decomposition::Binary => {
@@ -415,11 +415,10 @@ impl BoostedModel {
                 }
                 let knowledge = total.iter().zip(&aleatoric).map(|(t, d)| t - d).collect();
                 Uncertainty {
-                    columns: k,
-                    mean,
-                    knowledge,
-                    data: Some(aleatoric),
-                    total: Some(total),
+                    mean: Predictions::new(mean, n, k),
+                    knowledge: Predictions::new(knowledge, n, k),
+                    data: Some(Predictions::new(aleatoric, n, k)),
+                    total: Some(Predictions::new(total, n, k)),
                 }
             }
             Decomposition::Multiclass => {
@@ -458,11 +457,10 @@ impl BoostedModel {
                 }
                 let knowledge = total.iter().zip(&aleatoric).map(|(t, d)| t - d).collect();
                 Uncertainty {
-                    columns: 1,
-                    mean,
-                    knowledge,
-                    data: Some(aleatoric),
-                    total: Some(total),
+                    mean: Predictions::new(mean, n, k),
+                    knowledge: Predictions::new(knowledge, n, 1),
+                    data: Some(Predictions::new(aleatoric, n, 1)),
+                    total: Some(Predictions::new(total, n, 1)),
                 }
             }
         })

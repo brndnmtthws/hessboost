@@ -123,7 +123,7 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts; uniform, class-balanced, and query-level row sampling), `boulevard` (BRAT-D/BRAT-P `Recursion`, shared with the honest refit), `ebm` (classic cyclic EBM with outer bags, Boulevard EBM stages on the same `Recursion`, FAST pair ranking), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
 |`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `EbmInference`, `TermBands`, `honest_refit`); `kernel` (the `Kernel` trait the solvers read; leaf kernel over the training rows), `term_kernel` (a Boulevard EBM stage's centered additive kernel, computed on term grids), `solver` (exact Cholesky or Nyström ridge solves, Gram or solution vectors), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`, Boulevard models and Boulevard EBMs), `ebm` (shape-function bands)|
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means), `shape_functions`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds, leaves as boxes, difference arrays)|
-|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; exact truncations), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
+|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -256,10 +256,13 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   outputs. Counts, `best_iteration`, slicing, and ranges are in iterations,
   never trees. Tree weights are DART's or model shrinkage's: a shrunk
   model stores unscaled trees, per-iteration coefficients, and the
-  unshrunk intercepts (`model/shrinkage.rs`), from which its tree weights
-  and intercepts derive bit for bit; its `..k` ranges and `slice(..k, 1)`
-  rebuild the `k`-round model exactly, later starts are refused, and
-  early stopping truncates it to the best iteration.
+  unshrunk intercepts (`model/shrinkage.rs`), from which its closed-form
+  tree weights and intercepts derive bit for bit (SHAP and XGBoost export
+  use them). Its predictions (native, compact, `..k` ranges,
+  `slice(..k, 1)`, virtual ensembles) repeat training's shrink-then-add
+  recurrence (`shrink_margins`), so they are the training margins and the
+  `k`-round model bit for bit; later starts are refused, and early
+  stopping truncates it to the best iteration.
 - **Prediction layout:** predictions return `model::Predictions` (row-major
   `n_rows × width`, owning the computed buffer without a copy): width
   `n_outputs` (`num_class` for `multi:softprob`), 1 for `multi:softmax`, tree

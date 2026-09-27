@@ -36,7 +36,9 @@ class Uncertainty:
 
     ``knowledge``, ``data`` and ``total`` are ``(rows,)``, or ``(rows, K)``
     for multi-output regression (one per output) and multi-label
-    classification (one per label column).
+    classification (one per label column). ``mean`` has its own width: a
+    multiclass model's is ``(rows, classes)`` while its uncertainties are
+    ``(rows,)``.
     """
 
     mean: NDArray[np.float64]

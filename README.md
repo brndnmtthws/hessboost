@@ -199,7 +199,8 @@ Beyond XGBoost (opt-in, none changes default training):
   50,000 rows they're break-even.
 - SGLB needs `gbtree` with one tree per output and iteration; model
   shrinkage refuses DART, continued training, and per-row `base_margin`s,
-  and a shrunk model's iteration ranges must start at 0.
+  a shrunk model's iteration ranges must start at 0, and its XGBoost export
+  matches its predictions within `f32` rounding (not bit for bit).
 - Boulevard's intervals for `f(x)` are asymptotic and ignore the fit's
   bias: they reach nominal coverage when the leaves are refitted on an
   independent sample (`honest_refit`) and the bias is small, and

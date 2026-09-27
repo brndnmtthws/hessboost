@@ -10,7 +10,8 @@ use crate::diffusion::positive;
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::{Params, to_python};
 use hessboost::diffusion::forest::{
-    self, ColumnKind, Repaint, Synthetic, ImputeOptions, NoiseLevels, };
+    self, ColumnKind, ImputeOptions, NoiseLevels, Repaint, Synthetic,
+};
 use numpy::{PyArrayDyn, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;

@@ -399,10 +399,15 @@ pub(crate) fn group_ranges(
 /// consistent total preorder.
 /// Shared by the ranking metrics and the LambdaMART objective.
 pub(crate) fn argsort_desc(values: &[f32]) -> Vec<usize> {
-    stable_argsort(values.len(), |&a, &b| {
-        values[b]
-            .partial_cmp(&values[a])
-            .unwrap_or_else(|| values[b].total_cmp(&values[a]))
+    argsort_desc_by(values.len(), |i| values[i])
+}
+
+/// [`argsort_desc`] of the `n` values `value(0..n)`, read in place (the
+/// curve metrics' strided label-matrix columns).
+pub(crate) fn argsort_desc_by(n: usize, value: impl Fn(usize) -> f32 + Sync) -> Vec<usize> {
+    stable_argsort(n, |&a, &b| {
+        let (a, b) = (value(a), value(b));
+        b.partial_cmp(&a).unwrap_or_else(|| b.total_cmp(&a))
     })
 }
 
@@ -797,6 +802,36 @@ mod tests {
             per_target / 2.0,
             epsilon = 1e-12
         );
+    }
+
+    /// The strided per-target columns of a tied, weighted label matrix
+    /// score exactly like the copied-out columns.
+    #[test]
+    fn curve_metric_label_columns_match_copied_columns_bit_for_bit() {
+        let (n_rows, k) = (403, 3);
+        // Coarse predictions tie within and across columns.
+        let preds: Vec<f32> = (0..n_rows * k)
+            .map(|i| ((i * 37) % 11) as f32 * 0.1)
+            .collect();
+        let labels: Vec<f32> = (0..n_rows * k)
+            .map(|i| f32::from(u8::from((i + i / 5) % 3 == 0)))
+            .collect();
+        let weights: Vec<f32> = (0..n_rows).map(|i| 0.25 + (i % 7) as f32 * 0.5).collect();
+        let info = MetaInfo {
+            n_rows,
+            n_targets: k,
+            ..MetaInfo::new(&labels, Some(&weights), None)
+        };
+        let col = |v: &[f32], t: usize| v.iter().skip(t).step_by(k).copied().collect::<Vec<_>>();
+        for metric in [&Auc as &dyn Metric, &AucPr] {
+            let copied: f64 = (0..k)
+                .map(|t| metric.eval(&col(&preds, t), &col(&labels, t), Some(&weights)))
+                .sum::<f64>()
+                / k as f64;
+            let strided = metric.eval_info(&preds, &info);
+            assert!(strided > 0.0 && strided < 1.0, "{}", metric.name());
+            assert_eq!(strided.to_bits(), copied.to_bits(), "{}", metric.name());
+        }
     }
 
     /// Ranking, multiclass, and per-row survival metrics read one label (or

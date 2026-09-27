@@ -43,9 +43,16 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _data, _hessboost
-from hessboost._core import _RECODE_HINT, DMatrix, _check_schema
-from hessboost.diffusion import (
+from hessboost._matrix import _matrix_for
+from hessboost._model_io import (
     PathLike,
+    _SchemaState,
+    read_bytes,
+    read_text,
+    write_bytes,
+    write_text,
+)
+from hessboost.diffusion import (
     _choice,
     _count,
     _number,
@@ -216,15 +223,12 @@ class ForestParams:
         return cls._preset("diffusion")
 
 
-class ForestModel:
+class ForestModel(_SchemaState):
     """A fitted ForestFlow / ForestDiffusion model. Build one with
     :meth:`fit` or a loader; it is immutable and may be shared between
     threads."""
 
     _core: _hessboost.ForestModel
-    _feature_names: list[str] | None
-    _feature_types: list[str] | None
-    _categories: _data.Categories
 
     def __init__(self) -> None:
         raise TypeError("use ForestModel.fit(...) or a loader such as ForestModel.from_bytes")
@@ -239,16 +243,8 @@ class ForestModel:
     ) -> Self:
         self = object.__new__(cls)
         self._core = core
-        self._feature_names = feature_names
-        self._feature_types = feature_types
-        self._categories = {} if categories is None else categories
+        self._set_schema(feature_names, feature_types, {} if categories is None else categories)
         return self
-
-    @staticmethod
-    def _labelled(matrix: DMatrix, label: ArrayLike | None) -> _hessboost.DMatrix:
-        if label is None:
-            return matrix._core
-        return matrix._core.with_info({**_data.info(label=label), "categorical": None})
 
     @classmethod
     def fit(cls, params: ForestParams, data: object, label: ArrayLike | None = None) -> Self:
@@ -270,14 +266,9 @@ class ForestModel:
         """
         if not isinstance(params, ForestParams):
             raise TypeError(f"params must be ForestParams, got {type(params).__name__}")
-        if isinstance(data, DMatrix):
-            matrix = data
-            core = cls._labelled(matrix, label)
-        else:
-            matrix = DMatrix(data, label)
-            core = matrix._core
+        matrix = _matrix_for(data, (), label=label)
         return cls._wrap(
-            _hessboost.ForestModel.fit(params._build(), core),
+            _hessboost.ForestModel.fit(params._build(), matrix._core),
             matrix._feature_names,
             matrix._feature_types,
             matrix._categories,
@@ -337,16 +328,9 @@ class ForestModel:
         """
         if repaint is not None and not isinstance(repaint, Repaint):
             raise TypeError(f"repaint must be Repaint or None, got {type(repaint).__name__}")
-        if isinstance(data, DMatrix):
-            matrix = data
-            core = self._labelled(matrix, label)
-        else:
-            info = {} if label is None else _data.info(label=label)
-            matrix = DMatrix._coded(data, self._categories, np.nan, info)
-            core = matrix._core
-        _check_schema(self, matrix, "the data", "the model's", hint=_RECODE_HINT)
+        matrix = _matrix_for(data, ((self, "the model's"),), label=label)
         return self._core.impute(
-            core,
+            matrix._core,
             _count("n_imputations", n_imputations),
             None if repaint is None else (repaint.resample, repaint.jump),
             _count("seed", seed),
@@ -395,9 +379,7 @@ class ForestModel:
 
     def save_binary(self, path: PathLike) -> None:
         """Writes :meth:`to_bytes` to ``path``."""
-        data = self.to_bytes()
-        with open(path, "wb") as file:
-            file.write(data)
+        write_bytes(path, self.to_bytes())
 
     @classmethod
     def load_binary(cls, path: PathLike) -> Self:
@@ -407,8 +389,7 @@ class ForestModel:
             ModelFormatError: The file is not a valid forest model.
             OSError: The file cannot be read.
         """
-        with open(path, "rb") as file:
-            return cls.from_bytes(file.read())
+        return cls.from_bytes(read_bytes(path))
 
     def to_json(self) -> str:
         """The model as JSON, each GBDT in hessboost's native JSON."""
@@ -425,9 +406,7 @@ class ForestModel:
 
     def save_json(self, path: PathLike) -> None:
         """Writes :meth:`to_json` to ``path``."""
-        text = self.to_json()
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(text)
+        write_text(path, self.to_json())
 
     @classmethod
     def load_json(cls, path: PathLike) -> Self:
@@ -437,22 +416,13 @@ class ForestModel:
             ModelFormatError: The file is not a valid forest model.
             OSError: The file cannot be read.
         """
-        with open(path, encoding="utf-8") as file:
-            return cls.from_json(file.read())
+        return cls.from_json(read_text(path))
 
-    def __getstate__(self) -> dict[str, object]:
-        return {
-            "model": self._core.to_bytes(),
-            "feature_names": self._feature_names,
-            "feature_types": self._feature_types,
-            "categories": self._categories,
-        }
+    def _model_state(self) -> bytes:
+        return self._core.to_bytes()
 
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self._core = _hessboost.ForestModel.from_bytes(state["model"])
-        self._feature_names = state["feature_names"]
-        self._feature_types = state["feature_types"]
-        self._categories = state["categories"]
+    def _restore_model(self, model: bytes) -> None:
+        self._core = _hessboost.ForestModel.from_bytes(model)
 
     def __repr__(self) -> str:
         method = "flow" if self.method == "flow" else "diffusion"

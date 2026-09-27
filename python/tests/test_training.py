@@ -10,12 +10,8 @@ import pytest
 from numpy.typing import NDArray
 
 import hessboost
-from conftest import classes, regression
+from conftest import classes, regression, rmse
 from hessboost import DMatrix, HessboostError
-
-
-def rmse(a: NDArray[np.floating], b: NDArray[np.floating]) -> float:
-    return float(np.sqrt(np.mean((np.asarray(a, np.float64) - b) ** 2)))
 
 
 def test_regression_learns_and_reports_the_history() -> None:

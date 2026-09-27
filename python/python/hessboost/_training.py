@@ -10,8 +10,9 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _hessboost
-from hessboost._core import Booster, DMatrix, _check_schema
+from hessboost._booster import Booster
 from hessboost._exceptions import HessboostError
+from hessboost._matrix import DMatrix, _check_schema
 
 __all__ = ["CustomMetric", "Objective", "TrainingCallback", "cv", "train"]
 

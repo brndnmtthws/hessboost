@@ -21,20 +21,21 @@ case per mapped feature, and writes for each case `fixtures/lightgbm/<name>.txt`
               whether the imported model has an XGBoost JSON encoding.
 
 `tests/lightgbm_parity.rs` consumes them. With `--test-data` the script
-instead rewrites the small always-on models under `tests/data/`
-(`lightgbm-<version>-*.txt` plus the same fields in `*.expected.json`;
+rewrites the small always-on models under `tests/data/` (a parsed argparse
+flag; `lightgbm-<version>-*.txt` plus the same fields in `*.expected.json`;
 checked in, regenerate only when moving to a new LightGBM release).
 """
 
 from __future__ import annotations
 
-import json
+import argparse
 import os
 import sys
-import zlib
 
 import lightgbm as lgb
 import numpy as np
+
+from _fixture_common import json_floats, seed_for, write_json
 
 # The pinned release (scripts/requirements-lightgbm.txt).
 LIGHTGBM_VERSION = "4.7.0"
@@ -64,13 +65,12 @@ BASE_PARAMS = {
 
 
 def _seed(name: str) -> int:
-    return BASE_SEED ^ zlib.crc32(name.encode())
+    return seed_for(BASE_SEED, name)
 
 
 def _floats(a) -> list:
     """Array -> flat list of Python floats, NaN -> None (JSON null)."""
-    flat = np.asarray(a, dtype=np.float64).ravel()
-    return [None if np.isnan(v) else float(v) for v in flat]
+    return json_floats(a, np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +425,7 @@ def fixture(name, spec, booster, x_test):
 
 def write(directory, name, booster, data, suffix=".json"):
     booster.save_model(os.path.join(directory, f"{name}.txt"))
-    with open(os.path.join(directory, f"{name}{suffix}"), "w") as fh:
-        json.dump(data, fh, separators=(",", ":"))
+    write_json(os.path.join(directory, f"{name}{suffix}"), data)
 
 
 # The always-on models checked in under tests/data/ (small on purpose):
@@ -450,9 +449,16 @@ def write_test_data():
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--test-data",
+        action="store_true",
+        help="regenerate the small always-on models in tests/data",
+    )
+    args = parser.parse_args()
     if lgb.__version__ != LIGHTGBM_VERSION:
         sys.exit(f"expected LightGBM {LIGHTGBM_VERSION}, found {lgb.__version__}")
-    if "--test-data" in sys.argv[1:]:
+    if args.test_data:
         write_test_data()
         return
     os.makedirs(FIX_DIR, exist_ok=True)

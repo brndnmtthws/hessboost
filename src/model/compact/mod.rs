@@ -116,7 +116,7 @@
 //!
 //! let bytes = model.to_compact_bytes()?;
 //! let compact = CompactModel::from_bytes(&bytes)?;
-//! assert_eq!(compact.predict_margin(&dtrain)?, model.predict_margin(&dtrain)?);
+//! assert_eq!(compact.predict_margin(&dtrain)?, model.predict_margin(&dtrain, Iterations::Best)?);
 //!
 //! let report = model.size_report()?;
 //! assert!(report.compact_bytes < report.native_bytes);

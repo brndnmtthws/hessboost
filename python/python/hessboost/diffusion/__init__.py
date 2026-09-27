@@ -37,12 +37,12 @@ refused). The presets' mappings hold every setting (LightGBM's defaults,
 as Treeffuser and DiffGBM train); override keys with
 ``{**params.training, "max_leaves": 15}``.
 
-Draws are deterministic for a given model, input, ``n_samples`` and seed at
-any thread count, and the first ``k`` draws of a row are the same for every
-``n_samples >= k``. :meth:`DiffusionModel.fit` releases the GIL but cannot
+Draws are deterministic for a given model, input, ``n_samples``, seed and
+step count at any thread count, and the first ``k`` draws of a row are the
+same for every ``n_samples >= k``. :meth:`DiffusionModel.fit` releases the GIL but cannot
 be interrupted: Ctrl-C takes effect once it returns.
 
-:mod:`hessboost.diffusion.forest` generates and imputes tabular rows with
+:mod:`hessboost.diffusion.forest` samples and imputes tabular rows with
 ForestFlow and ForestDiffusion.
 """
 
@@ -584,9 +584,8 @@ def crps(samples: ArrayLike, y: ArrayLike) -> NDArray[np.float64]:
 
 class DiffusionModel(_SchemaState):
     """A fitted conditional diffusion or flow-matching model of ``p(y |
-    x)``. Build one with :meth:`fit` or a loader. The model is immutable
-    (setting :attr:`n_steps` swaps in a copy), so it may be shared between
-    threads."""
+    x)``. Build one with :meth:`fit` or a loader. The model is immutable,
+    so it may be shared between threads."""
 
     _core: _hessboost.DiffusionModel
 
@@ -635,20 +634,30 @@ class DiffusionModel(_SchemaState):
             matrix._categories,
         )
 
-    def sample(self, data: object, n_samples: int, *, seed: int = 0) -> NDArray[np.float32]:
+    def sample(
+        self, data: object, n_samples: int, *, seed: int = 0, n_steps: int | None = None
+    ) -> NDArray[np.float32]:
         """``n_samples`` draws from ``p(y | x)`` for every row of ``data``
         (a :class:`~hessboost.DMatrix` or anything it accepts; labels are
         ignored), a ``float32`` array of shape ``(rows, n_samples,
         outputs)`` (the crate's ``[row][sample][output]`` layout). Frames
-        are re-coded to the training categories.
+        are re-coded to the training categories. ``n_steps`` (``> 0``)
+        overrides the model's :attr:`n_steps`: more steps follow the
+        learned dynamics more closely at a proportional cost. The draws
+        depend only on the model, the data, ``n_samples``, ``seed`` and the
+        step count, at any thread count.
 
         Raises:
-            HessboostError: ``n_samples`` is 0, the features differ from the
-                training data's, ``data`` has base margins, or the sampler
-                diverges (use more :attr:`n_steps`).
+            HessboostError: ``n_samples`` or ``n_steps`` is 0, the features
+                differ from the training data's, ``data`` has base margins,
+                or the sampler diverges (use more steps).
         """
         matrix = _matrix_for(data, ((self, "the model's"),))._core
-        return self._core.sample(matrix, _count("n_samples", n_samples), _count("seed", seed))
+        return self._core.sample(matrix,
+            _count("n_samples", n_samples),
+            _count("seed", seed),
+            None if n_steps is None else _count("n_steps", n_steps),
+        )
 
     @property
     def method(self) -> Method:
@@ -657,14 +666,10 @@ class DiffusionModel(_SchemaState):
 
     @property
     def n_steps(self) -> int:
-        """Sampler integration steps. Assigning (``> 0``) swaps in a copy of
-        the model that samples with that many: more steps follow the
-        learned dynamics more closely at a proportional cost."""
+        """The integration steps :meth:`sample` takes unless its
+        ``n_steps`` overrides them (the training
+        :attr:`DiffusionParams.n_steps`)."""
         return self._core.n_steps
-
-    @n_steps.setter
-    def n_steps(self, n_steps: int) -> None:
-        self._core = self._core.with_n_steps(_count("n_steps", n_steps))
 
     @property
     def n_features(self) -> int:

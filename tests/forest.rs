@@ -7,7 +7,9 @@ use std::num::NonZeroUsize;
 use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
-use hessboost::diffusion::forest::{ColumnKind, ForestMethod, ForestModel, ForestParams, Repaint};
+use hessboost::diffusion::forest::{
+    ColumnKind, ForestMethod, ForestModel, ForestParams, ImputeOptions, NoiseLevels, Repaint,
+};
 use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
@@ -37,7 +39,7 @@ fn table(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
 }
 
 fn quick(mut params: ForestParams) -> ForestParams {
-    params.n_t = 30;
+    params.n_t = NoiseLevels::new(30).unwrap();
     params.duplicate_k = NonZeroUsize::new(20).unwrap();
     params.num_boost_round = NonZeroUsize::new(30).unwrap();
     params.column_kinds = Some(vec![
@@ -55,10 +57,10 @@ fn generated_rows_follow_each_class() {
     let (x, y) = table(300, 1);
     for params in [
         quick(ForestParams::default()),
-        quick(ForestParams::diffusion()),
+        quick(ForestParams::forest_diffusion()),
     ] {
         let model = ForestModel::fit(&params, &labelled(&x, &y)).unwrap();
-        let synthetic = model.generate(400, 3).unwrap();
+        let synthetic = model.sample(400, 3).unwrap();
         let labels = synthetic.labels().unwrap();
         let ones = labels.iter().filter(|&&l| l == 1.0).count();
         assert!(
@@ -93,7 +95,7 @@ fn generated_rows_follow_each_class() {
             .count();
         assert!(class1_cat7 as f64 > 0.9 * ones as f64);
         // Rows for given labels come from that class.
-        let class0 = model.generate_for_labels(&[0.0; 50], 4).unwrap();
+        let class0 = model.sample_for_labels(&[0.0; 50], 4).unwrap();
         assert!(
             class0
                 .as_slice()
@@ -122,9 +124,12 @@ fn imputation_keeps_observed_entries_and_uses_them() {
         })
         .collect();
     let data = labelled(&masked, &y);
-    let model = ForestModel::fit(&quick(ForestParams::diffusion()), &data).unwrap();
-    for repaint in [None, Some(Repaint::default())] {
-        let imputed = model.impute(&data, 2, repaint, 1).unwrap();
+    let model = ForestModel::fit(&quick(ForestParams::forest_diffusion()), &data).unwrap();
+    for options in [
+        ImputeOptions::seeded(1),
+        ImputeOptions::seeded(1).with_repaint(Repaint::default()),
+    ] {
+        let imputed = model.impute(&data, 2, &options).unwrap();
         assert_eq!(imputed.as_slice().len(), 2 * 300 * COLS);
         assert_eq!((imputed.n_imputations(), imputed.n_rows()), (2, 300));
         let first = &imputed.as_slice()[..300 * COLS];
@@ -141,13 +146,16 @@ fn imputation_keeps_observed_entries_and_uses_them() {
         let rmse = (se / f64::from(holes)).sqrt();
         // `b` spans about [0, 2] ∪ [6, 8]; ignoring `a` and the class (the
         // mean) would be off by ~3.
-        assert!(rmse < 1.5, "{repaint:?}: RMSE {rmse}");
+        assert!(rmse < 1.5, "{:?}: RMSE {rmse}", options.repaint);
         // The two imputations are different draws.
         assert_ne!(first, &imputed.as_slice()[300 * COLS..]);
     }
     // Flow matching cannot impute.
     let flow = ForestModel::fit(&quick(ForestParams::default()), &labelled(&x, &y)).unwrap();
-    assert_eq!(invalid_param(flow.impute(&data, 1, None, 0)), "method");
+    assert_eq!(
+        invalid_param(flow.impute(&data, 1, &ImputeOptions::seeded(0))),
+        "method"
+    );
 }
 
 #[test]
@@ -156,15 +164,17 @@ fn fitting_and_generation_ignore_the_thread_count() {
     let run = |threads| {
         with_threads(threads, || {
             let model =
-                ForestModel::fit(&quick(ForestParams::diffusion()), &labelled(&x, &y)).unwrap();
-            model.generate(30, 9).unwrap()
+                ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y))
+                    .unwrap();
+            model.sample(30, 9).unwrap()
         })
     };
     let one = run(1);
     assert_eq!(one, run(4));
     // Rows depend on their index only: fewer rows are a prefix.
-    let model = ForestModel::fit(&quick(ForestParams::diffusion()), &labelled(&x, &y)).unwrap();
-    let fewer = model.generate(10, 9).unwrap();
+    let model =
+        ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
+    let fewer = model.sample(10, 9).unwrap();
     assert_eq!(fewer.as_slice(), &one.as_slice()[..10 * COLS]);
 }
 
@@ -176,7 +186,10 @@ fn both_formats_round_trip() {
     for (params, data) in [
         (quick(ForestParams::default()), labelled(&x, &y)),
         // Missing values: one GBDT per column.
-        (quick(ForestParams::diffusion()), labelled(&masked, &y)),
+        (
+            quick(ForestParams::forest_diffusion()),
+            labelled(&masked, &y),
+        ),
         // Unconditional.
         (
             quick(ForestParams::default()),
@@ -184,7 +197,7 @@ fn both_formats_round_trip() {
         ),
     ] {
         let model = ForestModel::fit(&params, &data).unwrap();
-        let expected = model.generate(20, 1).unwrap();
+        let expected = model.sample(20, 1).unwrap();
         let bytes = model.to_bytes().unwrap();
         let resaved = ForestModel::from_bytes(&bytes).unwrap().to_bytes().unwrap();
         assert!(resaved == bytes, "re-saving changes the bytes");
@@ -193,7 +206,7 @@ fn both_formats_round_trip() {
             ForestModel::from_json(&model.to_json().unwrap()).unwrap(),
         ] {
             assert_eq!(loaded.method(), model.method());
-            assert_eq!(loaded.generate(20, 1).unwrap(), expected);
+            assert_eq!(loaded.sample(20, 1).unwrap(), expected);
         }
         assert!(matches!(
             ForestModel::from_bytes(&bytes[..bytes.len() / 2]),
@@ -206,9 +219,8 @@ fn both_formats_round_trip() {
 fn unsupported_inputs_are_refused() {
     let (x, y) = table(60, 6);
     let data = labelled(&x, &y);
-    let mut params = quick(ForestParams::default());
-    params.n_t = 1;
-    assert_eq!(invalid_param(ForestModel::fit(&params, &data)), "n_t");
+    assert_eq!(NoiseLevels::new(1), None);
+    assert_eq!(invalid_param(NoiseLevels::try_from(1)), "n_t");
     // Every level regresses its target with unweighted squared error.
     let mut params = quick(ForestParams::default());
     params.training.objective = Objective::SquaredError(RegLoss::new(2.0).unwrap());
@@ -231,23 +243,23 @@ fn unsupported_inputs_are_refused() {
         "data"
     );
 
-    let model = ForestModel::fit(&quick(ForestParams::diffusion()), &data).unwrap();
-    assert_eq!(invalid_param(model.generate(0, 1)), "n_rows");
-    assert_eq!(invalid_param(model.generate(usize::MAX, 1)), "n_rows");
-    assert_eq!(
-        invalid_param(model.generate_for_labels(&[2.0], 1)),
-        "labels"
-    );
+    let model = ForestModel::fit(&quick(ForestParams::forest_diffusion()), &data).unwrap();
+    assert_eq!(invalid_param(model.sample(0, 1)), "n_rows");
+    assert_eq!(invalid_param(model.sample(usize::MAX, 1)), "n_rows");
+    assert_eq!(invalid_param(model.sample_for_labels(&[2.0], 1)), "labels");
     let unlabelled = DMatrix::from_dense(&x, 60, COLS).unwrap();
-    assert_eq!(invalid_param(model.impute(&unlabelled, 1, None, 1)), "data");
+    assert_eq!(
+        invalid_param(model.impute(&unlabelled, 1, &ImputeOptions::seeded(1))),
+        "data"
+    );
     let mut unseen = x.clone();
     unseen[2] = 5.0;
     assert_eq!(
-        invalid_param(model.impute(&labelled(&unseen, &y), 1, None, 1)),
+        invalid_param(model.impute(&labelled(&unseen, &y), 1, &ImputeOptions::seeded(1))),
         "data"
     );
     assert_eq!(
-        invalid_param(model.impute(&data, usize::MAX, None, 1)),
+        invalid_param(model.impute(&data, usize::MAX, &ImputeOptions::seeded(1))),
         "n_imputations"
     );
 }
@@ -256,7 +268,7 @@ fn unsupported_inputs_are_refused() {
 fn refresh_training_params_are_refused() {
     // Every level's GBDT is trained from scratch: there is nothing to refresh.
     let (x, y) = table(60, 6);
-    let mut params = quick(ForestParams::diffusion());
+    let mut params = quick(ForestParams::forest_diffusion());
     params.training.process_type = ProcessType::Update(Refresh::default());
     assert_eq!(invalid_param(params.validate()), "training");
     assert_eq!(
@@ -289,7 +301,7 @@ fn row_bagging_training_params_are_refused() {
     let (x, y) = table(60, 6);
     let data = labelled(&x, &y);
     for set in configs {
-        for base in [ForestParams::diffusion(), ForestParams::default()] {
+        for base in [ForestParams::forest_diffusion(), ForestParams::default()] {
             let mut params = quick(base);
             set(&mut params.training);
             assert!(matches!(
@@ -315,7 +327,7 @@ fn single_label_boosters_on_several_columns_are_refused() {
         BoosterKind::Boulevard(Boulevard::default()),
         BoosterKind::Ebm(Ebm::default()),
     ] {
-        for base in [ForestParams::diffusion(), ForestParams::default()] {
+        for base in [ForestParams::forest_diffusion(), ForestParams::default()] {
             let mut params = quick(base);
             params.training = TrainingParams::builder()
                 .booster(booster)
@@ -335,13 +347,17 @@ fn imputation_refuses_label_matrices() {
     // Two columns of valid classes: read flat, rows would take each other's
     // classes, so the matrix is refused as it is by `fit`.
     let (x, y) = table(60, 6);
-    let model = ForestModel::fit(&quick(ForestParams::diffusion()), &labelled(&x, &y)).unwrap();
+    let model =
+        ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
     let matrix: Vec<f32> = y.iter().flat_map(|&c| [c, 1.0 - c]).collect();
     let data = DMatrix::from_dense(&x, 60, COLS)
         .unwrap()
         .with_label_matrix(&matrix, 2)
         .unwrap();
-    assert_eq!(invalid_param(model.impute(&data, 1, None, 1)), "data");
+    assert_eq!(
+        invalid_param(model.impute(&data, 1, &ImputeOptions::seeded(1))),
+        "data"
+    );
 }
 
 #[test]
@@ -349,7 +365,8 @@ fn stored_values_outside_f32_are_refused() {
     // Labels, categories and ranges decode to `f32`: a document holding a
     // value no `f32` fit could have produced is not a model.
     let (x, y) = table(60, 7);
-    let model = ForestModel::fit(&quick(ForestParams::diffusion()), &labelled(&x, &y)).unwrap();
+    let model =
+        ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
     let json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
     for (path, value) in [
         ("/classes/0", serde_json::json!(-1e100)),

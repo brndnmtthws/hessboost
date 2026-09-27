@@ -196,7 +196,7 @@ fn fit_level_models(
     let jobs: Vec<(usize, usize, Target)> = (0..classes.count())
         .flat_map(|class| {
             let targets = &targets;
-            (0..params.n_t)
+            (0..params.n_t.get())
                 .flat_map(move |level| targets.iter().map(move |&target| (class, level, target)))
         })
         .collect();
@@ -211,7 +211,7 @@ fn fit_level_models(
     };
     jobs.into_par_iter()
         .map(|(class, level, target)| {
-            let t = level_time(params.n_t, level);
+            let t = level_time(params.n_t.get(), level);
             let dtrain = set.build(class, t, target)?;
             train(&params.training, &dtrain, params.num_boost_round.get())
         })

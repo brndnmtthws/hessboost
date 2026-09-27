@@ -105,7 +105,10 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
         }
         // LightGBM refuses SHAP for linear trees; so does hessboost.
         None => match model.predict_contribs(&data, Iterations::Best) {
-            Err(HessboostError::InvalidParameter { .. }) => "refused".to_string(),
+            Err(HessboostError::IncompatibleModel {
+                what: "linear_tree",
+                ..
+            }) => "refused".to_string(),
             other => return Err(format!("contribs of a linear-leaf model: {other:?}")),
         },
     };

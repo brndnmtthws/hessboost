@@ -12,7 +12,7 @@ use hessboost::prelude::*;
 use std::num::NonZeroUsize;
 
 mod common;
-use common::{four_features, invalid_param, labeled_dense, rmse};
+use common::{four_features, incompatible_model, invalid_param, labeled_dense, rmse};
 
 const N: usize = 300;
 const COLS: usize = 4;
@@ -476,7 +476,7 @@ fn unsupported_vector_layouts_are_rejected() {
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(
+        incompatible_model(
             Trainer::new(&refresh, &dtrain, 2)
                 .init_model(&vector)
                 .train()
@@ -486,7 +486,7 @@ fn unsupported_vector_layouts_are_rejected() {
     // A model keeps one tree kind.
     let scalar = TrainingParams::builder().max_depth(4).build().unwrap();
     assert_eq!(
-        invalid_param(
+        incompatible_model(
             Trainer::new(&scalar, &dtrain, 2)
                 .init_model(&vector)
                 .train()

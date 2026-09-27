@@ -15,7 +15,7 @@ use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
-use common::{invalid_param, labeled_dense, lcg, with_threads};
+use common::{incompatible_model, invalid_data, invalid_param, labeled_dense, lcg, with_threads};
 
 const COLS: usize = 3;
 
@@ -154,8 +154,8 @@ fn imputation_keeps_observed_entries_and_uses_them() {
     // Flow matching cannot impute.
     let flow = ForestModel::fit(&quick(ForestParams::default()), &labelled(&x, &y)).unwrap();
     assert_eq!(
-        invalid_param(flow.impute(&data, 1, &ImputeOptions::seeded(0))),
-        "method"
+        incompatible_model(flow.impute(&data, 1, &ImputeOptions::seeded(0))),
+        "impute"
     );
 }
 
@@ -247,24 +247,27 @@ fn unsupported_inputs_are_refused() {
     ));
     let weighted = labelled(&x, &y).with_weights(&[1.0; 60]).unwrap();
     assert_eq!(
-        invalid_param(ForestModel::fit(&quick(ForestParams::default()), &weighted)),
-        "data"
+        invalid_data(ForestModel::fit(&quick(ForestParams::default()), &weighted)),
+        ("weights", None)
     );
 
     let model = ForestModel::fit(&quick(ForestParams::forest_diffusion()), &data).unwrap();
     assert_eq!(invalid_param(model.sample(0, 1)), "n_rows");
     assert_eq!(invalid_param(model.sample(usize::MAX, 1)), "n_rows");
-    assert_eq!(invalid_param(model.sample_for_labels(&[2.0], 1)), "labels");
+    assert_eq!(
+        invalid_data(model.sample_for_labels(&[2.0], 1)),
+        ("labels", None)
+    );
     let unlabelled = DMatrix::from_dense(&x, 60, COLS).unwrap();
     assert_eq!(
-        invalid_param(model.impute(&unlabelled, 1, &ImputeOptions::seeded(1))),
-        "data"
+        invalid_data(model.impute(&unlabelled, 1, &ImputeOptions::seeded(1))),
+        ("labels", None)
     );
     let mut unseen = x.clone();
     unseen[2] = 5.0;
     assert_eq!(
-        invalid_param(model.impute(&labelled(&unseen, &y), 1, &ImputeOptions::seeded(1))),
-        "data"
+        invalid_data(model.impute(&labelled(&unseen, &y), 1, &ImputeOptions::seeded(1))),
+        ("data", None)
     );
     assert_eq!(
         invalid_param(model.impute(&data, usize::MAX, &ImputeOptions::seeded(1))),
@@ -342,10 +345,10 @@ fn single_label_boosters_on_several_columns_are_refused() {
                 .eta(0.8)
                 .build()
                 .unwrap();
-            assert!(matches!(
-                ForestModel::fit(&params, &labelled(&x, &y)),
-                Err(HessboostError::InvalidParameter { .. })
-            ));
+            assert_eq!(
+                invalid_data(ForestModel::fit(&params, &labelled(&x, &y))),
+                ("labels", None)
+            );
         }
     }
 }
@@ -363,8 +366,8 @@ fn imputation_refuses_label_matrices() {
         .with_label_matrix(&matrix, 2)
         .unwrap();
     assert_eq!(
-        invalid_param(model.impute(&data, 1, &ImputeOptions::seeded(1))),
-        "data"
+        invalid_data(model.impute(&data, 1, &ImputeOptions::seeded(1))),
+        ("labels", None)
     );
 }
 

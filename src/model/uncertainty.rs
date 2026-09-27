@@ -207,7 +207,7 @@ enum Decomposition {
 impl Decomposition {
     fn of(objective: &ModelObjective) -> Result<Self> {
         let refused = || {
-            Err(HessboostError::invalid_param(
+            Err(HessboostError::incompatible_model(
                 "objective",
                 format!(
                     "uncertainty is defined for regression, `dist:*`, and probabilistic \
@@ -270,20 +270,20 @@ impl BoostedModel {
     /// the effective iterations (CatBoost's `ApplyVirtualEnsembles`).
     fn virtual_ensemble_iterations(&self, count: usize) -> Result<Vec<usize>> {
         if self.linear.is_some() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 "gblinear models have no boosting iterations to form virtual ensembles from",
             ));
         }
         if self.ebm.is_some() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 "an EBM's trees are ordered by bag, stage, and term, so its iteration prefixes \
                  are not the models of fewer rounds",
             ));
         }
         if self.boulevard.is_some() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 "a Boulevard model's leaves carry its average over every round, so its \
                  iteration prefixes are not the models of fewer rounds; its variance comes from \
@@ -299,7 +299,7 @@ impl BoostedModel {
         let end = self.effective_num_trees() / self.trees_per_iteration();
         let period = end / count.saturating_mul(2);
         if period == 0 || period * count >= end {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "virtual_ensembles_count",
                 format!(
                     "{count} virtual ensembles need a model of at least {} iterations, this one \
@@ -322,10 +322,13 @@ impl BoostedModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for `count == 0`, a model with
-    /// fewer iterations than `count` members need, a `gblinear` model, or a
+    /// [`HessboostError::InvalidParameter`] (`virtual_ensembles_count`) for
+    /// `count == 0`; [`HessboostError::IncompatibleModel`] for a model with
+    /// fewer iterations than `count` members need
+    /// (`virtual_ensembles_count`), or for a `gblinear` model, a
     /// `booster = boulevard` model or an EBM (whose prefixes are not the
-    /// models of fewer rounds), plus the errors of [`Self::predict_margin`].
+    /// models of fewer rounds; `model`); plus the errors of
+    /// [`Self::predict_margin`].
     pub fn predict_virtual_ensembles(
         &self,
         data: &DMatrix,
@@ -376,9 +379,9 @@ impl BoostedModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for objectives without a
-    /// decomposition (ranking, `binary:hinge`, custom objectives), plus the
-    /// errors of [`Self::predict_virtual_ensembles`].
+    /// [`HessboostError::IncompatibleModel`] (`objective`) for objectives
+    /// without a decomposition (ranking, `binary:hinge`, custom objectives),
+    /// plus the errors of [`Self::predict_virtual_ensembles`].
     pub fn predict_uncertainty(&self, data: &DMatrix, count: usize) -> Result<Uncertainty> {
         let decomposition = Decomposition::of(&self.objective)?;
         let ensembles = self.predict_virtual_ensembles(data, count)?;

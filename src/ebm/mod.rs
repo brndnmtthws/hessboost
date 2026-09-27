@@ -536,7 +536,7 @@ impl TermShape {
 /// The EBM record of `model`, refusing other models.
 fn ebm_info(model: &BoostedModel) -> Result<&EbmInfo> {
     model.ebm().ok_or_else(|| {
-        HessboostError::invalid_param("model", "not an EBM: train it with `booster = ebm`")
+        HessboostError::incompatible_model("model", "not an EBM: train it with `booster = ebm`")
     })
 }
 
@@ -548,7 +548,7 @@ fn ebm_info(model: &BoostedModel) -> Result<&EbmInfo> {
 ///
 /// # Errors
 ///
-/// [`HessboostError::InvalidParameter`] when `model` is not an EBM
+/// [`HessboostError::IncompatibleModel`] when `model` is not an EBM
 /// ([`BoostedModel::ebm`] is `None`).
 pub fn shape_functions(model: &BoostedModel) -> Result<ShapeFunctions> {
     let info = ebm_info(model)?;
@@ -566,7 +566,7 @@ pub fn shape_functions(model: &BoostedModel) -> Result<ShapeFunctions> {
 ///
 /// # Errors
 ///
-/// [`HessboostError::InvalidParameter`] when `model` is not an EBM
+/// [`HessboostError::IncompatibleModel`] when `model` is not an EBM
 /// ([`BoostedModel::ebm`] is `None`) or has no term `term`.
 ///
 /// # Example
@@ -593,7 +593,7 @@ pub fn shape_functions(model: &BoostedModel) -> Result<ShapeFunctions> {
 pub fn term_shape(model: &BoostedModel, term: usize) -> Result<TermShape> {
     let info = ebm_info(model)?;
     if term >= info.terms.len() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "term",
             format!("the model has {} terms, got {term}", info.terms.len()),
         ));

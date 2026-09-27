@@ -958,7 +958,7 @@ impl BoostedModel {
         self.refuse_partial_shrunk_range(&(0..end), what)?;
         let trees = &self.trees[..end];
         if trees.iter().any(|tree| tree.linear_leaves().is_some()) {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "linear_tree",
                 "SHAP contributions and interactions are not defined for models with linear leaves",
             ));
@@ -1126,7 +1126,7 @@ impl BoostedModel {
                 Bound::Unbounded | Bound::Included(0)
             ) && iterations.end_bound() == Bound::Unbounded;
             if !whole {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::incompatible_model(
                     param,
                     "gblinear models have no boosting iterations to select; pass `..`",
                 ));
@@ -1145,10 +1145,16 @@ impl BoostedModel {
             Bound::Excluded(&e) => e,
             Bound::Unbounded => rounds,
         };
-        if end > rounds || begin > end {
-            return Err(HessboostError::invalid_param(
+        if end > rounds {
+            return Err(HessboostError::incompatible_model(
                 param,
                 format!("{begin}..{end} is out of range for a model with {rounds} iterations"),
+            ));
+        }
+        if begin > end {
+            return Err(HessboostError::invalid_param(
+                param,
+                format!("{begin}..{end} is an inverted range"),
             ));
         }
         Ok(begin..end)

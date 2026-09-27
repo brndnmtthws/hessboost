@@ -46,14 +46,16 @@ pub(super) fn resume_model(
     // (`AdjustPosteriorSamplingDeafultValues`, `DropModelShrinkageIfBaselineUsed`
     // in `catboost/libs/train_lib/options_helper.cpp`): the continued run's
     // coefficients would rescale a model whose margins it did not cache.
-    if init.shrinkage().is_some() || params.model_shrinkage_on() {
+    if init.shrinkage().is_some() {
+        return Err(HessboostError::incompatible_model(
+            "init_model",
+            "a model trained with model shrinkage cannot be trained further",
+        ));
+    }
+    if params.model_shrinkage_on() {
         return Err(HessboostError::invalid_param(
             "model_shrink_rate",
-            if init.shrinkage().is_some() {
-                "a model trained with model shrinkage cannot be trained further"
-            } else {
-                "model shrinkage is not supported with continued training"
-            },
+            "model shrinkage is not supported with continued training",
         ));
     }
     // A Boulevard model averages all of its rounds (its leaves carry the
@@ -61,7 +63,7 @@ pub(super) fn resume_model(
     // booster, would not give a Boulevard average; nor can Boulevard
     // continue another model's sum.
     if matches!(params.booster, BoosterKind::Boulevard(_)) || init.boulevard().is_some() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "init_model",
             "Boulevard models average every round of one run and cannot be trained further, \
              and `booster = boulevard` cannot continue another model",
@@ -70,7 +72,7 @@ pub(super) fn resume_model(
     // An EBM's record assigns every tree to a term of one run; appended
     // trees would belong to none, and a sum cannot continue into terms.
     if matches!(params.booster, BoosterKind::Ebm(_)) || init.ebm().is_some() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "init_model",
             "EBMs are boosted term by term in one run and cannot be trained further, and \
              `booster = ebm` cannot continue another model",
@@ -78,7 +80,7 @@ pub(super) fn resume_model(
     }
     let is_linear = init.linear().is_some();
     if is_linear != (params.booster == BoosterKind::GbLinear) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "booster",
             if is_linear {
                 "a gblinear model can only be trained further with booster=gblinear"
@@ -88,7 +90,7 @@ pub(super) fn resume_model(
         ));
     }
     if params.objective.name() != init.objective().name() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "objective",
             format!(
                 "`{}` does not match the model's objective `{}`",
@@ -98,7 +100,7 @@ pub(super) fn resume_model(
         ));
     }
     if objective.n_outputs() != init.n_outputs() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "num_class",
             format!(
                 "the objective's {} outputs do not match the model's {} (num_class {})",
@@ -125,7 +127,7 @@ pub(super) fn resume_model(
     if !is_linear && init.num_trees() > 0 {
         // Iterations must stay uniform: every layer holds the same forest size.
         if params.num_parallel_tree != init.num_parallel_tree() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "num_parallel_tree",
                 format!(
                     "{} does not match the model's num_parallel_tree {}",
@@ -136,7 +138,7 @@ pub(super) fn resume_model(
         }
         // A model's trees are either all vector-leaf or all scalar-leaf.
         if init.has_vector_leaves() != multi_output::vector_leaf(params, objective.n_outputs()) {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "multi_strategy",
                 if init.has_vector_leaves() {
                     "a vector-leaf model can only be trained further with \
@@ -183,13 +185,13 @@ fn check_update(
     }
     // XGBoost's refresh updater handles single-target trees only.
     if init.has_vector_leaves() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "process_type",
             "`update` cannot refresh vector-leaf trees (`multi_output_tree`)",
         ));
     }
     if init.has_non_unit_tree_weights() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "process_type",
             "`update` cannot refresh a model with DART tree weights",
         ));
@@ -211,14 +213,14 @@ fn check_update(
         .iter()
         .any(|tree| tree.linear_leaves().is_some())
     {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "process_type",
             "`update` cannot refresh linear-leaf trees (`linear_tree`)",
         ));
     }
     reject_unused_by_refresh(params)?;
     if num_boost_round > init.num_boost_rounds() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "num_boost_round",
             format!(
                 "{num_boost_round} exceeds the {} iterations `process_type=update` can refresh",

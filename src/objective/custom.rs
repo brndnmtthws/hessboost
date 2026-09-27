@@ -138,14 +138,14 @@ impl Loss for CustomLoss {
     /// it.
     fn validate_info(&self, info: &crate::data::MetaInfo) -> crate::error::Result<()> {
         if info.n_targets() != 1 && info.n_targets() != self.n_outputs {
-            return Err(crate::error::HessboostError::invalid_param(
-                "objective",
+            return Err(crate::error::HessboostError::invalid_data(
+                "labels",
                 format!(
-                    "custom objective `{}` has {} outputs; dataset has a {}-column label matrix \
+                    "a {}-column label matrix, but custom objective `{}` has {} outputs \
                      (one label per row or per output expected)",
+                    info.n_targets(),
                     self.name,
-                    self.n_outputs,
-                    info.n_targets()
+                    self.n_outputs
                 ),
             ));
         }

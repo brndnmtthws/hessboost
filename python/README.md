@@ -288,8 +288,13 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
 
 ## Differences from XGBoost's Python package
 
-- Errors: `hessboost.HessboostError` (a `ValueError`; `ModelFormatError`
-  for model files) for refused inputs, `TypeError` for wrong types.
+- Errors: `hessboost.HessboostError` (a `ValueError`) for refused inputs,
+  with subclasses `InvalidDataError` (data content: labels outside the
+  objective's domain, negative weights, bad groups or bounds; the message
+  names the input and any eval set), `IncompatibleModelError` (a model the
+  parameters or data do not match: continued training, refresh, slicing)
+  and `ModelFormatError` (model files); invalid or conflicting parameters
+  raise `HessboostError` itself. `TypeError` for wrong types.
   Unsupported parameters are refused, including `verbosity`; `missing`
   belongs to `DMatrix`.
 - `TrainingCallback.after_iteration(iteration, evals_log) -> bool` sees the

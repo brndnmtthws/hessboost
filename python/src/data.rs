@@ -155,7 +155,7 @@ impl InfoSlices<'_> {
             let mut types = vec![FeatureType::Numerical; matrix.n_cols()];
             for &column in columns {
                 let slot = types.get_mut(column).ok_or_else(|| {
-                    hessboost::error::HessboostError::invalid_param(
+                    hessboost::error::HessboostError::invalid_data(
                         "feature_types",
                         format!(
                             "categorical column {column} is out of range for {} columns",
@@ -262,7 +262,7 @@ impl DMatrix {
         let inner = py.detached(|| {
             let convert = |name: &'static str, value: i64| {
                 usize::try_from(value).map_err(|_| {
-                    hessboost::error::HessboostError::invalid_param(
+                    hessboost::error::HessboostError::invalid_data(
                         name,
                         format!("negative entry {value}"),
                     )
@@ -277,7 +277,7 @@ impl DMatrix {
                 .map(|&index| {
                     convert("csr indices", index).and_then(|index| {
                         u32::try_from(index).map_err(|_| {
-                            hessboost::error::HessboostError::invalid_param(
+                            hessboost::error::HessboostError::invalid_data(
                                 "csr indices",
                                 format!("column {index} does not fit in 32 bits"),
                             )

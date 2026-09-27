@@ -212,12 +212,7 @@ impl OnlineParams {
     /// `tolerance` outside `(0, 1]` (for the exact mode use
     /// [`Self::exact`]), named `tolerance`.
     pub fn approximate(tolerance: f64) -> Result<Self> {
-        if !(tolerance > 0.0 && tolerance <= 1.0) {
-            return Err(HessboostError::invalid_param(
-                "tolerance",
-                format!("must be in (0, 1] (use the exact mode for none), got {tolerance}"),
-            ));
-        }
+        crate::check::fraction("tolerance", tolerance)?;
         Ok(OnlineParams {
             mode: OnlineMode::Approximate { tolerance },
         })
@@ -306,15 +301,16 @@ impl OnlineModel {
     ///
     /// # Errors
     ///
-    /// The refusals of [`Self::train`], and
-    /// [`HessboostError::InvalidParameter`] for a model that `params` could
-    /// not have trained (another objective or `max_delta_step`, several
-    /// outputs, weighted trees, categorical trees in the approximate mode,
-    /// linear leaves, a `gblinear`, `boulevard`, or `ebm` booster, for
-    /// example from an imported LightGBM `linear_tree` model, model
-    /// shrinkage, a different feature count), for an early-stopped model
-    /// (`best_iteration` set: slice it to its best iterations first), and
-    /// for `eval_metric`s training would refuse.
+    /// The refusals of [`Self::train`],
+    /// [`HessboostError::IncompatibleModel`] (`model`) for a model that
+    /// `params` could not have trained (another objective or
+    /// `max_delta_step`, several outputs, weighted trees, categorical trees
+    /// in the approximate mode, linear leaves, a `gblinear`, `boulevard`, or
+    /// `ebm` booster, for example from an imported LightGBM `linear_tree`
+    /// model, model shrinkage, a different feature count) and for an
+    /// early-stopped model (`best_iteration` set: slice it to its best
+    /// iterations first), and [`HessboostError::InvalidParameter`] for
+    /// `eval_metric`s training would refuse.
     pub fn from_model(
         model: BoostedModel,
         params: &TrainingParams,
@@ -352,7 +348,7 @@ impl OnlineModel {
             // an update of one node's subtree would not reproduce a retrain.
             || model.shrinkage().is_some()
         {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 "not a single-output, unweighted, unshrunk, numeric gbtree model (not \
                  Boulevard or EBM) with constant leaves of these parameters and data",
@@ -362,7 +358,7 @@ impl OnlineModel {
             // Early stopping keeps every trained iteration but predicts with
             // the first `best + 1`; an update updates (and predicts with)
             // them all, and a model without `best_iteration`.
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 format!(
                     "an early-stopped model (best_iteration {best} of {} iterations) is not \
@@ -394,10 +390,11 @@ impl OnlineModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for out-of-range or repeated
-    /// deletions, deleting every row, additions without labels or with
-    /// metadata, or of another shape, and (approximate mode) added values
-    /// beyond the training data's bins; whatever training refuses on the
+    /// [`HessboostError::InvalidParameter`] (`deletions`) for out-of-range
+    /// or repeated deletions or deleting every row;
+    /// [`HessboostError::InvalidData`] (`additions`) for additions without
+    /// labels or with metadata, or of another shape, and (approximate mode)
+    /// added values beyond the training data's bins; whatever training refuses on the
     /// updated data (such as labels outside the objective's domain), checked
     /// before anything changes; [`HessboostError::ModelFormat`] for an
     /// update whose arithmetic overflows `f32`, as training refuses such a
@@ -565,7 +562,7 @@ impl OnlineModel {
         if let Some(a) = additions {
             check_data(a, "additions")?;
             if a.n_cols() != self.data.n_cols() || a.feature_types() != self.data.feature_types() {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::invalid_data(
                     "additions",
                     "added rows need the training data's columns and feature types",
                 ));
@@ -593,7 +590,7 @@ fn check_within_cuts(cuts: &HistCuts, additions: &DMatrix) -> Result<()> {
             }
         });
         if let Some((row, c, v)) = outside {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "additions",
                 format!(
                     "added row {row} has feature {c} = {v}, beyond the training data's bins, \
@@ -772,7 +769,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
 /// Labels and none of the metadata updates cannot honor.
 fn check_data(data: &DMatrix, name: &'static str) -> Result<()> {
     if data.labels().is_none() || data.n_targets() != 1 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             name,
             "in-place updates need one label per row",
         ));
@@ -783,7 +780,7 @@ fn check_data(data: &DMatrix, name: &'static str) -> Result<()> {
         || data.label_lower_bound().is_some()
         || data.feature_weights().is_some()
     {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             name,
             "in-place updates do not support weights, base margins, groups, label bounds, or \
              feature weights",

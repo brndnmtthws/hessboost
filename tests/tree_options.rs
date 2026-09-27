@@ -8,7 +8,7 @@ use hessboost::data::FeatureType;
 use hessboost::prelude::*;
 
 mod common;
-use common::{invalid_param, labeled_dense, lcg, rmse};
+use common::{incompatible_model, invalid_param, labeled_dense, lcg, rmse};
 
 /// `n` deterministic pseudo-random values in `[0, 1)`.
 fn uniform(n: usize, seed: u64) -> Vec<f32> {
@@ -162,11 +162,11 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
         Err(HessboostError::ModelFormat(_))
     ));
     assert_eq!(
-        invalid_param(model.predict_contribs(&data, Iterations::Best)),
+        incompatible_model(model.predict_contribs(&data, Iterations::Best)),
         "linear_tree"
     );
     assert_eq!(
-        invalid_param(model.predict_interactions(&data, Iterations::Best)),
+        incompatible_model(model.predict_interactions(&data, Iterations::Best)),
         "linear_tree"
     );
 }

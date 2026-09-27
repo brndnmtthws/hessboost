@@ -173,7 +173,7 @@ fn gradients(run: &TrainContext, margins: &[f32], iteration: usize) -> Vec<GradP
 /// (it samples no columns).
 pub(super) fn validate_data(dtrain: &DMatrix) -> Result<()> {
     if dtrain.feature_weights().is_some() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "feature_weights",
             "`booster = ebm` does not sample columns",
         ));

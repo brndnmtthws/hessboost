@@ -53,9 +53,12 @@ pub(super) fn fit(params: &DiffusionParams, data: &DMatrix) -> Result<DiffusionM
         Some(stop) => {
             let n_val = (stop.eval_fraction * n as f64).ceil() as usize;
             if n_val >= n {
-                return Err(HessboostError::invalid_param(
-                    "early_stopping.eval_fraction",
-                    format!("holds out {n_val} of {n} rows, leaving none to train on"),
+                return Err(HessboostError::invalid_data(
+                    "data",
+                    format!(
+                        "`early_stopping.eval_fraction` holds out {n_val} of {n} rows, leaving \
+                         none to train on"
+                    ),
                 ));
             }
             Rng::new(splitmix64(params.seed ^ SPLIT_STREAM)).shuffle(&mut rows);
@@ -107,10 +110,10 @@ pub(super) fn fit(params: &DiffusionParams, data: &DMatrix) -> Result<DiffusionM
 fn check_data(data: &DMatrix) -> Result<&[f32]> {
     refuse_unsupported_metadata(data, "diffusion")?;
     let labels = data.labels().ok_or_else(|| {
-        HessboostError::invalid_param("data", "fitting a diffusion model needs labels")
+        HessboostError::invalid_data("labels", "fitting a diffusion model needs labels")
     })?;
     if data.n_rows() < 2 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "data",
             "fitting a diffusion model needs at least 2 rows",
         ));
@@ -120,23 +123,25 @@ fn check_data(data: &DMatrix) -> Result<&[f32]> {
 
 /// Refuse the metadata neither generative model honors (`what` names the
 /// model in the error: "diffusion", "forest"): instance weights, base
-/// margins, ranking groups, label bounds and feature weights, in that order.
+/// margins, ranking groups, label bounds and feature weights, in that order,
+/// as [`HessboostError::InvalidData`] naming the metadata (`weights`,
+/// `base_margin`, `group_sizes`, `label_bounds`, `feature_weights`).
 pub(super) fn refuse_unsupported_metadata(data: &DMatrix, what: &str) -> Result<()> {
-    let unsupported = if data.weights().is_some() {
-        "instance weights"
+    let (input, unsupported) = if data.weights().is_some() {
+        ("weights", "instance weights")
     } else if data.base_margin().is_some() {
-        "base margins"
+        ("base_margin", "base margins")
     } else if data.group().is_some() {
-        "ranking groups"
+        ("group_sizes", "ranking groups")
     } else if data.label_lower_bound().is_some() || data.label_upper_bound().is_some() {
-        "label bounds"
+        ("label_bounds", "label bounds")
     } else if data.feature_weights().is_some() {
-        "feature weights"
+        ("feature_weights", "feature weights")
     } else {
         return Ok(());
     };
-    Err(HessboostError::invalid_param(
-        "data",
+    Err(HessboostError::invalid_data(
+        input,
         format!("{what} models do not support {unsupported}"),
     ))
 }
@@ -193,8 +198,8 @@ fn residualize(
 ) -> Result<(FittedResidualizer, Vec<f64>)> {
     let (n, d) = (data.n_rows(), data.n_targets());
     if n < MIN_RESIDUALIZE_ROWS {
-        return Err(HessboostError::invalid_param(
-            "residualizer",
+        return Err(HessboostError::invalid_data(
+            "data",
             format!(
                 "cross-fitted residualization needs at least {MIN_RESIDUALIZE_ROWS} rows, got \
                  {n}; set `residualizer` to `None`"

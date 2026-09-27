@@ -6,15 +6,22 @@ use pyo3::prelude::*;
 
 pyo3::import_exception!(hessboost._exceptions, HessboostError);
 pyo3::import_exception!(hessboost._exceptions, ModelFormatError);
+pyo3::import_exception!(hessboost._exceptions, InvalidDataError);
+pyo3::import_exception!(hessboost._exceptions, IncompatibleModelError);
 
 /// Maps a hessboost error to `HessboostError` (a `ValueError`), its
-/// `ModelFormatError` subclass for model (de)serialization, or `OSError`
-/// (with the `errno` subclass Python picks) for I/O.
+/// subclasses `ModelFormatError` (model (de)serialization),
+/// `InvalidDataError` and `IncompatibleModelError`, or `OSError` (with the
+/// `errno` subclass Python picks) for I/O.
 pub(crate) fn map_err(error: RustError) -> PyErr {
     match error {
         RustError::Io(error) => PyErr::from(error),
         error @ (RustError::ModelFormat(_) | RustError::Json(_)) => {
             ModelFormatError::new_err(error.to_string())
+        }
+        error @ RustError::InvalidData { .. } => InvalidDataError::new_err(error.to_string()),
+        error @ RustError::IncompatibleModel { .. } => {
+            IncompatibleModelError::new_err(error.to_string())
         }
         error => HessboostError::new_err(error.to_string()),
     }

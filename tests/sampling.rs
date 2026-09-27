@@ -11,7 +11,7 @@ use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
 mod common;
-use common::{invalid_param, labeled_dense, lcg};
+use common::{invalid_data, invalid_param, labeled_dense, lcg};
 
 /// Deterministic `n × f` regression data whose label depends on every
 /// feature, with a few large-residual rows so gradient magnitudes vary.
@@ -219,8 +219,8 @@ fn bagging_by_query_refuses_non_ranking_or_incompatible_sampling() {
     }
     let ungrouped = labeled_dense(&[0.0, 1.0], 1, &[0.0, 1.0]);
     assert_eq!(
-        invalid_param(train(&ranking().build().unwrap(), &ungrouped, 1)),
-        "bagging_by_query"
+        invalid_data(train(&ranking().build().unwrap(), &ungrouped, 1)),
+        ("group_sizes", None)
     );
 }
 
@@ -284,9 +284,9 @@ fn balanced_bagging_refuses_unsupported_parameters_and_labels() {
         .unwrap()
         .with_label_matrix(&[0.0, 1.0, 1.0, 0.0], 2)
         .unwrap();
-    assert_eq!(invalid_param(train(&binary, &multi, 1)), "labels");
+    assert_eq!(invalid_data(train(&binary, &multi, 1)), ("labels", None));
     let graded = labeled_dense(&[0.0, 1.0], 1, &[0.0, 0.5]);
-    assert_eq!(invalid_param(train(&binary, &graded, 1)), "labels");
+    assert_eq!(invalid_data(train(&binary, &graded, 1)), ("labels", None));
 }
 
 /// `binary:logistic`.
@@ -548,8 +548,8 @@ fn feature_weights_are_refused_where_columns_are_not_sampled() {
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(train(&linear, &weighted, 2)),
-        "feature_weights"
+        invalid_data(train(&linear, &weighted, 2)),
+        ("feature_weights", None)
     );
     let model = train(&TrainingParams::default(), &data, 2).unwrap();
     let update = TrainingParams::builder()
@@ -557,6 +557,6 @@ fn feature_weights_are_refused_where_columns_are_not_sampled() {
         .build()
         .unwrap();
     let refresh = |data: &DMatrix| Trainer::new(&update, data, 2).init_model(&model).train();
-    assert_eq!(invalid_param(refresh(&weighted)), "feature_weights");
+    assert_eq!(invalid_data(refresh(&weighted)), ("feature_weights", None));
     assert!(refresh(&data).is_ok());
 }

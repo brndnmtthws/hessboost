@@ -201,6 +201,7 @@ use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
+use crate::check::ensure;
 use crate::conformal::Interval;
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -396,7 +397,8 @@ impl std::fmt::Debug for BoulevardInference<'_> {
 
 /// Refuse `data` unless it has `model`'s features, one label column when
 /// `labelled`, and neither row weights other than 1 nor base margins (which
-/// Boulevard training refuses too).
+/// Boulevard training refuses too): [`HessboostError::InvalidData`] naming
+/// the input `what` (`train`, `holdout`, `values`, `data`).
 fn check_data(
     model: &BoostedModel,
     data: &DMatrix,
@@ -414,23 +416,20 @@ fn check_data(
         ));
     }
     if labelled && data.labels().is_none() {
-        return Err(HessboostError::invalid_param(what, "needs labels"));
+        return Err(HessboostError::invalid_data(what, "needs labels"));
     }
     if labelled && data.n_targets() != 1 {
-        return Err(HessboostError::invalid_param(
-            what,
-            "needs one label column",
-        ));
+        return Err(HessboostError::invalid_data(what, "needs one label column"));
     }
     if data.weights().is_some_and(|w| w.iter().any(|&v| v != 1.0)) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             what,
             "row weights other than 1 are not supported: Boulevard inference assumes equal \
              noise per row",
         ));
     }
     if data.base_margin().is_some() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             what,
             "base margins are not supported by Boulevard inference",
         ));
@@ -440,14 +439,11 @@ fn check_data(
 
 /// `alpha` must be a miscoverage level in `(0, 1)`.
 fn check_alpha(alpha: f64) -> Result<()> {
-    if alpha > 0.0 && alpha < 1.0 {
-        Ok(())
-    } else {
-        Err(HessboostError::invalid_param(
-            "alpha",
-            format!("must be in (0, 1), got {alpha}"),
-        ))
-    }
+    ensure(
+        "alpha",
+        alpha > 0.0 && alpha < 1.0,
+        format!("must be in (0, 1), got {alpha}"),
+    )
 }
 
 /// The two-sided normal quantile `z_{1 − α/2}`.
@@ -479,12 +475,11 @@ fn noise_estimate(model: &BoostedModel, train: &DMatrix, noise: NoiseVariance) -
         NoiseVariance::TrainingResiduals => mean_squared_residual(model, train)?,
         NoiseVariance::Known(v) => v,
     };
-    if !(noise_variance.is_finite() && noise_variance > 0.0) {
-        return Err(HessboostError::invalid_param(
-            "noise",
-            format!("the noise variance must be finite and > 0, got {noise_variance}"),
-        ));
-    }
+    ensure(
+        "noise",
+        noise_variance.is_finite() && noise_variance > 0.0,
+        format!("the noise variance must be finite and > 0, got {noise_variance}"),
+    )?;
     Ok(noise_variance)
 }
 
@@ -557,14 +552,15 @@ impl<'a> BoulevardInference<'a> {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] when `model` is not a Boulevard
-    /// fit ([`BoostedModel::boulevard`] is `None`) or has no trees (0
-    /// rounds), when `train` is not its
-    /// training data (a leaf holds fewer of its rows than it was grown on),
-    /// has row weights or base margins, or (for the noise estimate) lacks
-    /// labels; when [`KernelSolver::Exact`] gets more than
-    /// [`MAX_EXACT_ROWS`] rows; when a noise variance is not finite and
-    /// positive.
+    /// [`HessboostError::IncompatibleModel`] (`model`) when `model` is not
+    /// a Boulevard fit ([`BoostedModel::boulevard`] is `None`) or has no
+    /// trees (0 rounds); [`HessboostError::InvalidData`] (`train`, or
+    /// `holdout` for its rows) when `train` is not its training data (a
+    /// leaf holds fewer of its rows than it was grown on), has row weights
+    /// or base margins, or (for the noise estimate) lacks labels;
+    /// [`HessboostError::InvalidParameter`] when [`KernelSolver::Exact`]
+    /// gets more than [`MAX_EXACT_ROWS`] rows (`solver`) or a noise
+    /// variance is not finite and positive (`noise`).
     pub fn fit(
         model: &'a BoostedModel,
         train: &DMatrix,
@@ -572,13 +568,13 @@ impl<'a> BoulevardInference<'a> {
         solver: KernelSolver,
     ) -> Result<Self> {
         let info = model.boulevard().ok_or_else(|| {
-            HessboostError::invalid_param(
+            HessboostError::incompatible_model(
                 "model",
                 "not a Boulevard fit: train it with `booster = boulevard`",
             )
         })?;
         if model.num_trees() == 0 {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 "has no trees (trained for 0 rounds), so its leaf kernel has no rows",
             ));
@@ -678,8 +674,9 @@ impl<'a> BoulevardInference<'a> {
     ///
     /// # Errors
     ///
-    /// When `data` does not have the model's features, or has row weights
-    /// or base margins.
+    /// [`HessboostError::DimensionMismatch`] when `data` does not have the
+    /// model's features; [`HessboostError::InvalidData`] (`data`) when it
+    /// has row weights or base margins.
     pub fn standard_errors(&self, data: &DMatrix) -> Result<Predictions<f64>> {
         let sigma = self.noise_variance.sqrt();
         let se: Vec<f64> = self
@@ -707,8 +704,8 @@ impl<'a> BoulevardInference<'a> {
     ///
     /// # Errors
     ///
-    /// When `alpha` is not in `(0, 1)`, plus those of
-    /// [`standard_errors`](Self::standard_errors).
+    /// [`HessboostError::InvalidParameter`] when `alpha` is not in
+    /// `(0, 1)`, plus those of [`standard_errors`](Self::standard_errors).
     pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * w2).sqrt())

@@ -11,7 +11,7 @@ from numpy.typing import NDArray
 
 import hessboost
 from conftest import classes, regression, rmse
-from hessboost import DMatrix, HessboostError
+from hessboost import DMatrix, HessboostError, IncompatibleModelError, InvalidDataError
 
 
 def test_regression_learns_and_reports_the_history() -> None:
@@ -333,6 +333,23 @@ def test_early_stopping_needs_an_eval_set() -> None:
     x, y = regression(rows=50)
     with pytest.raises(HessboostError):
         hessboost.train({}, DMatrix(x, y), 5, early_stopping_rounds=2)
+
+
+def test_refusals_raise_the_subclass_of_their_kind() -> None:
+    x, y = regression()
+    dtrain = DMatrix(x, np.abs(y))
+    # A setting: the base class itself.
+    with pytest.raises(HessboostError) as setting:
+        hessboost.train({"eta": -1.0}, dtrain, 1)
+    assert type(setting.value) is HessboostError
+    # Data content, naming the eval set it came from.
+    negative = DMatrix(x[:20], -np.abs(y[:20]) - 1.0)
+    with pytest.raises(InvalidDataError, match="labels in dataset `valid`"):
+        hessboost.train({"objective": "count:poisson"}, dtrain, 1, evals=[(negative, "valid")])
+    # A model the parameters do not fit.
+    first = hessboost.train({}, dtrain, 2)
+    with pytest.raises(IncompatibleModelError, match="objective"):
+        hessboost.train({"objective": "reg:pseudohubererror"}, dtrain, 1, xgb_model=first)
 
 
 def test_continued_training_matches_one_run() -> None:

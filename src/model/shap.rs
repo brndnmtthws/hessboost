@@ -976,8 +976,11 @@ impl BoostedModel {
     ///
     /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
     /// model, [`HessboostError::ModelFormat`] when a tree has a negative cover,
-    /// [`HessboostError::InvalidParameter`] for linear-leaf models and an
-    /// out-of-range `iterations`.
+    /// [`HessboostError::IncompatibleModel`] for linear-leaf models
+    /// (`linear_tree`), `iterations` past the model's or a partial range of
+    /// a shrunk model (`iterations`); [`HessboostError::InvalidParameter`]
+    /// (`iterations`) for an inverted range or one starting after iteration
+    /// `0`.
     pub fn predict_contribs(
         &self,
         data: &DMatrix,

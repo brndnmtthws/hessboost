@@ -10,7 +10,7 @@ use hessboost::prelude::*;
 use std::num::NonZeroUsize;
 
 mod common;
-use common::{invalid_param, labeled_dense, lcg, with_threads};
+use common::{incompatible_model, invalid_data, invalid_param, labeled_dense, lcg, with_threads};
 
 /// `n` rows of two uniform features with `y = sin(6 x0) + x1 / 2 + noise`.
 fn data(n: usize, seed: u64) -> DMatrix {
@@ -148,7 +148,7 @@ fn the_boulevard_record_survives_the_native_formats_but_not_slicing() {
     assert!(sliced.boulevard().is_none());
     let gbtree = TrainingParams::builder().build().unwrap();
     let continued = Trainer::new(&gbtree, &dtrain, 1).init_model(&model).train();
-    assert_eq!(invalid_param(continued), "init_model");
+    assert_eq!(incompatible_model(continued), "init_model");
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn inference_refuses_rows_the_model_was_not_trained_on() {
         NoiseVariance::Known(1.0),
         KernelSolver::Exact,
     );
-    assert_eq!(invalid_param(fit), "train");
+    assert_eq!(invalid_data(fit), ("train", None));
     // After an honest refit the kernel rows are the refit's.
     let values = data(300, 11);
     let refit = honest_refit(&model, &values).unwrap();
@@ -183,7 +183,7 @@ fn inference_refuses_rows_the_model_was_not_trained_on() {
         NoiseVariance::Known(1.0),
         KernelSolver::Exact,
     );
-    assert_eq!(invalid_param(fit), "model");
+    assert_eq!(incompatible_model(fit), "model");
 }
 
 /// A Boulevard model trained for 0 rounds has no trees and so no kernel
@@ -201,7 +201,7 @@ fn inference_on_empty_inputs_is_refused_or_empty() {
         },
     ] {
         let fit = BoulevardInference::fit(&empty, &dtrain, NoiseVariance::Known(1.0), solver);
-        assert_eq!(invalid_param(fit), "model");
+        assert_eq!(incompatible_model(fit), "model");
     }
     let model = train(&builder().build().unwrap(), &dtrain, 5).unwrap();
     let inference = BoulevardInference::fit(
@@ -369,7 +369,10 @@ fn settings_that_break_the_linear_smoother_are_refused() {
     let dtrain = data(100, 12);
     let params = builder().build().unwrap();
     let weighted = dtrain.clone().with_weights(&[2.0; 100]).unwrap();
-    assert_eq!(invalid_param(train(&params, &weighted, 2)), "weights");
+    assert_eq!(
+        invalid_data(train(&params, &weighted, 2)),
+        ("weights", None)
+    );
     let stopping = Trainer::new(&params, &dtrain, 5)
         .eval(&dtrain, "train")
         .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
@@ -423,7 +426,7 @@ fn online_updates_refuse_a_boulevard_model() {
         OnlineParams::exact(),
     ] {
         assert_eq!(
-            invalid_param(OnlineModel::from_model(
+            incompatible_model(OnlineModel::from_model(
                 model.clone(),
                 &gbtree,
                 &dtrain,
@@ -449,11 +452,11 @@ fn sglb_and_virtual_ensembles_are_refused() {
     let dtrain = data(200, 17);
     let model = train(&builder().build().unwrap(), &dtrain, 20).unwrap();
     assert_eq!(
-        invalid_param(model.predict_virtual_ensembles(&dtrain, 2)),
+        incompatible_model(model.predict_virtual_ensembles(&dtrain, 2)),
         "model"
     );
     assert_eq!(
-        invalid_param(model.predict_uncertainty(&dtrain, 2)),
+        incompatible_model(model.predict_uncertainty(&dtrain, 2)),
         "model"
     );
 }
@@ -468,5 +471,5 @@ fn label_matrices_are_refused_as_labels() {
         .with_label_matrix(&y, 2)
         .unwrap();
     let params = builder().build().unwrap();
-    assert_eq!(invalid_param(train(&params, &dtrain, 2)), "labels");
+    assert_eq!(invalid_data(train(&params, &dtrain, 2)), ("labels", None));
 }

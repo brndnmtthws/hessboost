@@ -16,7 +16,7 @@ use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
-use common::{invalid_param, lcg, with_threads};
+use common::{invalid_data, invalid_param, lcg, with_threads};
 
 /// `y = ±(1 + x) + 0.05 ε`: two modes whose gap grows with `x`.
 fn bimodal(n: usize, seed: u64) -> DMatrix {
@@ -202,8 +202,8 @@ fn stored_draws_rebuild_their_samples() {
         (Vec::new(), usize::MAX, 2),
     ] {
         assert_eq!(
-            invalid_param(Samples::new(values, n_samples, n_outputs)),
-            "samples"
+            invalid_data(Samples::new(values, n_samples, n_outputs)),
+            ("samples", None)
         );
     }
 }
@@ -405,10 +405,10 @@ fn single_label_boosters_train_on_one_label_column() {
                 .unwrap(),
             samples
         );
-        assert!(matches!(
-            DiffusionModel::fit(&params, &wide),
-            Err(HessboostError::InvalidParameter { .. })
-        ));
+        assert_eq!(
+            invalid_data(DiffusionModel::fit(&params, &wide)),
+            ("labels", None)
+        );
     }
 }
 
@@ -475,28 +475,28 @@ fn unsupported_inputs_are_refused() {
     params.method = Method::FlowMatching(vanishing);
     assert_eq!(invalid_param(DiffusionModel::fit(&params, &data)), "path");
     assert_eq!(
-        invalid_param(DiffusionModel::fit(
+        invalid_data(DiffusionModel::fit(
             &quick(DiffusionParams::default()),
             &weighted
         )),
-        "data"
+        ("weights", None)
     );
     let unlabelled = DMatrix::from_dense(&[0.0; 10], 10, 1).unwrap();
     assert_eq!(
-        invalid_param(DiffusionModel::fit(
+        invalid_data(DiffusionModel::fit(
             &quick(DiffusionParams::treeffuser()),
             &unlabelled
         )),
-        "data"
+        ("labels", None)
     );
     // Residualization cross-fits on at least 80 rows.
     let small = bimodal(50, 6);
     assert_eq!(
-        invalid_param(DiffusionModel::fit(
+        invalid_data(DiffusionModel::fit(
             &quick(DiffusionParams::default()),
             &small
         )),
-        "residualizer"
+        ("data", None)
     );
     let model = DiffusionModel::fit(&quick(DiffusionParams::treeffuser()), &small).unwrap();
     assert_eq!(

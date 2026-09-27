@@ -231,15 +231,16 @@
 //! `expectile_loss_param.expectile_alpha`,
 //! `aft_loss_param.{aft_loss_distribution, aft_loss_distribution_scale}`)
 //! becomes the parameters of the model's [`Objective`]
-//! ([`ModelObjective::BuiltIn`]); absent fields take XGBoost's defaults, and
+//! ([`ModelObjective::built_in`]); absent fields take XGBoost's defaults, and
 //! parameters the objective does not read are dropped (e.g.
 //! `reg_loss_param.scale_pos_weight` of `reg:squarederror` or `reg:gamma`,
 //! which hessboost does not apply). The alpha lists are XGBoost's array strings
 //! (`"[0.1,0.5,0.9]"`, `(..)` also read); `reg:absoluteerror` and
 //! `survival:cox` have no block. A value that does not parse, or an invalid
 //! parameter of the objective (e.g. an empty or unsorted alpha list), is a
-//! format error. An objective hessboost does not implement imports as
-//! [`ModelObjective::Other`]: its model predicts margins.
+//! format error. An objective hessboost does not implement imports by its
+//! name alone ([`ModelObjective::built_in`] is `None`): its model predicts
+//! margins.
 //!
 //! ## `base_score`
 //!

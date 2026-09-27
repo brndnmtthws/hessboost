@@ -1874,7 +1874,9 @@ mod tests {
             Vec::new(),
             vec![0.0, 0.0],
             ModelSpec {
-                objective: ModelObjective::BuiltIn(Objective::BinaryLogistic(Logistic::default())),
+                objective: ModelObjective::trained_with(&Objective::BinaryLogistic(
+                    Logistic::default(),
+                )),
                 max_delta_step: 0.0,
                 num_class: 2,
                 n_outputs: 2,

@@ -989,7 +989,7 @@ mod tests {
         write(&BoostedModel {
             trees: Vec::new(),
             base_score: vec![0.5],
-            objective: ModelObjective::BuiltIn(Objective::SquaredError),
+            objective: ModelObjective::trained_with(&Objective::SquaredError),
             max_delta_step: 0.0,
             num_class: 0,
             n_outputs: 1,

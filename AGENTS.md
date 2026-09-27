@@ -225,9 +225,11 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     `PartialStoredObjectiveParams` (each member a `Stored`, so `null` stays
     an error), and missing members take
     `StoredObjectiveParams::defaults_for(objective)`. Loading maps the
-    record to `ModelObjective::from_stored` (unknown names are
-    `ModelObjective::Other`; parameters the objective does not read are
-    dropped).
+    record to `ModelObjective::from_stored` (an unknown name is recorded
+    as a name alone, a built-in name always loads as that objective;
+    parameters the objective does not read are dropped). `ModelObjective`
+    keeps its representation private so a recorded name is never a
+    built-in objective's and a built-in objective never a custom loss.
     Everything predictions depend on is required, nullable ones via
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
@@ -303,7 +305,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `Objective::Custom`, so every property (base-score domain, default
   metric, default `max_delta_step`, adaptive leaves, output count) comes
   from the loss being trained. A custom loss may not take a built-in
-  objective's name: the model records it as `ModelObjective::Other(name)`.
+  objective's name: the model records it by name (`ModelObjective::name`,
+  no `built_in` objective).
 - **Python:** `python/` uses only the crate's public API. The public
   Python API is pure Python; the extension is private, fully stubbed
   (stubtest), `unsafe`-free (`forbid`), declares `gil_used = false`, keeps

@@ -9,7 +9,7 @@ use super::groups::{
     BalancedBagging, Dart, ExtraTrees, LinearTree, QuantizedGrad, QueryBagging, Refresh,
 };
 use crate::error::{HessboostError, Result};
-use crate::objective::{Loss, LossContext, Objective, ObjectiveParts};
+use crate::objective::{Loss, LossContext, Objective};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -720,7 +720,7 @@ impl TrainingParams {
         if let Objective::Custom(loss) = &self.objective {
             ensure(
                 "objective",
-                Objective::from_parts(loss.name(), &ObjectiveParts::default()).is_none(),
+                !Objective::is_built_in_name(loss.name()),
                 format!(
                     "the custom loss is named `{}`, a built-in objective's name, as which a \
                      saved model would reload; rename the loss",

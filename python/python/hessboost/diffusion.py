@@ -391,7 +391,7 @@ class Residualizer:
         folds: Cross-fitting folds (``>= 2``; at most one per 40 rows are
             used).
         training: The fold models' XGBoost parameters (objective
-            ``reg:squarederror``); default: learning rate 0.05, depth 6,
+            ``reg:squarederror``, ``scale_pos_weight`` 1); default: learning rate 0.05, depth 6,
             31 leaves, 20 rows per leaf.
         num_boost_round: Boosting rounds of each fold model (``> 0``).
     """
@@ -416,7 +416,7 @@ class DiffusionParams:
         n_repeats: Noisy copies of each training row (``> 0``).
         n_steps: Sampler integration steps (``> 0``), stored with the model.
         training: The score/velocity GBDT's XGBoost parameters (objective
-            ``reg:squarederror``); default: LightGBM's defaults (leaf-wise,
+            ``reg:squarederror``, ``scale_pos_weight`` 1); default: LightGBM's defaults (leaf-wise,
             31 leaves, learning rate 0.1, 20 rows per leaf, no L2 penalty,
             255 bins).
         num_boost_round: Maximum boosting rounds of that GBDT (``> 0``).
@@ -431,7 +431,8 @@ class DiffusionParams:
     Raises:
         HessboostError: A count is zero, a process parameter or fraction is
             out of range, or a ``training`` mapping is refused (unknown
-            keys, an objective other than ``reg:squarederror``).
+            keys, an objective other than ``reg:squarederror``, or
+            ``scale_pos_weight`` other than 1).
         TypeError: A field has the wrong type.
     """
 

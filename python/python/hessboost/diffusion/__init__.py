@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self, TypeAlias
@@ -59,8 +58,16 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _data, _hessboost
-from hessboost._core import _RECODE_HINT, DMatrix, _check_schema
 from hessboost._exceptions import HessboostError
+from hessboost._matrix import _matrix_for
+from hessboost._model_io import (
+    PathLike,
+    _SchemaState,
+    read_bytes,
+    read_text,
+    write_bytes,
+    write_text,
+)
 
 __all__ = [
     "DiffusionModel",
@@ -85,8 +92,6 @@ __all__ = [
     "mean",
     "quantiles",
 ]
-
-PathLike: TypeAlias = str | os.PathLike[str]
 
 
 def _number(owner: object, name: str) -> None:
@@ -575,16 +580,13 @@ def crps(samples: ArrayLike, y: ArrayLike) -> NDArray[np.float64]:
     return _hessboost.samples_crps(draws, labels)
 
 
-class DiffusionModel:
+class DiffusionModel(_SchemaState):
     """A fitted conditional diffusion or flow-matching model of ``p(y |
     x)``. Build one with :meth:`fit` or a loader. The model is immutable
     (setting :attr:`n_steps` swaps in a copy), so it may be shared between
     threads."""
 
     _core: _hessboost.DiffusionModel
-    _feature_names: list[str] | None
-    _feature_types: list[str] | None
-    _categories: _data.Categories
 
     def __init__(self) -> None:
         raise TypeError("use DiffusionModel.fit(...) or a loader such as DiffusionModel.from_bytes")
@@ -599,9 +601,7 @@ class DiffusionModel:
     ) -> Self:
         self = object.__new__(cls)
         self._core = core
-        self._feature_names = feature_names
-        self._feature_types = feature_types
-        self._categories = {} if categories is None else categories
+        self._set_schema(feature_names, feature_types, {} if categories is None else categories)
         return self
 
     @classmethod
@@ -625,18 +625,9 @@ class DiffusionModel:
         """
         if not isinstance(params, DiffusionParams):
             raise TypeError(f"params must be DiffusionParams, got {type(params).__name__}")
-        if isinstance(data, DMatrix):
-            matrix = data
-            core = (
-                matrix._core
-                if label is None
-                else matrix._core.with_info({**_data.info(label=label), "categorical": None})
-            )
-        else:
-            matrix = DMatrix(data, label)
-            core = matrix._core
+        matrix = _matrix_for(data, (), label=label)
         return cls._wrap(
-            _hessboost.DiffusionModel.fit(params._build(), core),
+            _hessboost.DiffusionModel.fit(params._build(), matrix._core),
             matrix._feature_names,
             matrix._feature_types,
             matrix._categories,
@@ -654,13 +645,8 @@ class DiffusionModel:
                 training data's, ``data`` has base margins, or the sampler
                 diverges (use more :attr:`n_steps`).
         """
-        matrix = (
-            data
-            if isinstance(data, DMatrix)
-            else DMatrix._coded(data, self._categories, np.nan, {})
-        )
-        _check_schema(self, matrix, "the data", "the model's", hint=_RECODE_HINT)
-        return self._core.sample(matrix._core, _count("n_samples", n_samples), _count("seed", seed))
+        matrix = _matrix_for(data, ((self, "the model's"),))._core
+        return self._core.sample(matrix, _count("n_samples", n_samples), _count("seed", seed))
 
     @property
     def method(self) -> Method:
@@ -715,9 +701,7 @@ class DiffusionModel:
 
     def save_binary(self, path: PathLike) -> None:
         """Writes :meth:`to_bytes` to ``path``."""
-        data = self.to_bytes()
-        with open(path, "wb") as file:
-            file.write(data)
+        write_bytes(path, self.to_bytes())
 
     @classmethod
     def load_binary(cls, path: PathLike) -> Self:
@@ -727,8 +711,7 @@ class DiffusionModel:
             ModelFormatError: The file is not a valid diffusion model.
             OSError: The file cannot be read.
         """
-        with open(path, "rb") as file:
-            return cls.from_bytes(file.read())
+        return cls.from_bytes(read_bytes(path))
 
     def to_json(self) -> str:
         """The model as JSON: the method, the label standardization, the
@@ -746,9 +729,7 @@ class DiffusionModel:
 
     def save_json(self, path: PathLike) -> None:
         """Writes :meth:`to_json` to ``path``."""
-        text = self.to_json()
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(text)
+        write_text(path, self.to_json())
 
     @classmethod
     def load_json(cls, path: PathLike) -> Self:
@@ -758,22 +739,13 @@ class DiffusionModel:
             ModelFormatError: The file is not a valid diffusion model.
             OSError: The file cannot be read.
         """
-        with open(path, encoding="utf-8") as file:
-            return cls.from_json(file.read())
+        return cls.from_json(read_text(path))
 
-    def __getstate__(self) -> dict[str, object]:
-        return {
-            "model": self._core.to_bytes(),
-            "feature_names": self._feature_names,
-            "feature_types": self._feature_types,
-            "categories": self._categories,
-        }
+    def _model_state(self) -> bytes:
+        return self._core.to_bytes()
 
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self._core = _hessboost.DiffusionModel.from_bytes(state["model"])
-        self._feature_names = state["feature_names"]
-        self._feature_types = state["feature_types"]
-        self._categories = state["categories"]
+    def _restore_model(self, model: bytes) -> None:
+        self._core = _hessboost.DiffusionModel.from_bytes(model)
 
     def __repr__(self) -> str:
         method = type(self.method).__name__

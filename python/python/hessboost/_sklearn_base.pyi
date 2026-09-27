@@ -1,6 +1,8 @@
-"""Type declarations of the scikit-learn base classes :mod:`hessboost.sklearn`
-builds on (scikit-learn ships no type information). Type checking only:
-at runtime the estimators inherit scikit-learn's own classes."""
+"""Type declarations of the scikit-learn base classes the estimators build
+on (``BaseEstimator`` in :mod:`hessboost._sklearn_common`, the mixins in
+:mod:`hessboost.sklearn`; scikit-learn ships no type information). Type
+checking only: at runtime the estimators inherit scikit-learn's own
+classes."""
 
 from typing import Any, Self
 

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
+from typing import Any, overload
 
 import numpy as np
 import pandas as pd
 import pytest
 from numpy.typing import NDArray
+
+from hessboost.diffusion import DiffusionModel
+from hessboost.diffusion.forest import ForestModel
 
 # Models saved by each release of the Rust crate, with the margins it
 # recorded (repository checkout only).
@@ -41,6 +46,43 @@ def classes(
     score = x[:, 0] + 0.5 * x[:, 1] + rng.normal(0.0, 0.3, rows)
     edges = np.quantile(score, np.linspace(0, 1, n_classes + 1)[1:-1])
     return x, np.searchsorted(edges, score).astype(np.int64)
+
+
+def additive(
+    rows: int, seed: int, *, features: int, noise: float
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """``features`` (2 or 3) uniform features and an additive target,
+    ``sin(6 x0) + (x1 - 0.5)^2 [+ (x2 > 0.5)]`` plus Gaussian ``noise``."""
+    rng = np.random.default_rng(seed)
+    x = rng.random((rows, features))
+    y = np.sin(6 * x[:, 0]) + (x[:, 1] - 0.5) ** 2
+    if features > 2:
+        y = y + (x[:, 2] > 0.5)
+    return x, y + noise * rng.standard_normal(rows)
+
+
+def rmse(a: NDArray[np.floating], b: NDArray[np.floating]) -> float:
+    """The root mean squared difference of ``a`` and ``b``, in ``float64``."""
+    return float(np.sqrt(np.mean((np.asarray(a, np.float64) - b) ** 2)))
+
+
+@overload
+def reloaded(model: DiffusionModel, tmp_path: Path, suffix: str) -> list[DiffusionModel]: ...
+@overload
+def reloaded(model: ForestModel, tmp_path: Path, suffix: str) -> list[ForestModel]: ...
+def reloaded(model: DiffusionModel | ForestModel, tmp_path: Path, suffix: str) -> list[Any]:
+    """``model`` read back from each of its encodings: bytes, JSON, a binary
+    file named with ``suffix``, a JSON file, and a pickle."""
+    cls = type(model)
+    model.save_binary(tmp_path / f"model{suffix}")
+    model.save_json(tmp_path / "model.json")
+    return [
+        cls.from_bytes(model.to_bytes()),
+        cls.from_json(model.to_json()),
+        cls.load_binary(tmp_path / f"model{suffix}"),
+        cls.load_json(tmp_path / "model.json"),
+        pickle.loads(pickle.dumps(model)),
+    ]
 
 
 def frame(rows: int = 400, seed: int = 0) -> tuple[pd.DataFrame, NDArray[np.float64]]:

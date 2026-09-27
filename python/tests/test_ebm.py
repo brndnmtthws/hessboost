@@ -7,7 +7,8 @@ import pandas as pd
 import pytest
 
 import hessboost
-from hessboost.ebm import CategoricalAxis, EbmInfo, NumericAxis, shape_functions
+from conftest import additive
+from hessboost.ebm import CategoricalAxis, EbmInfo, NumericAxis, _axis, shape_functions
 from hessboost.inference import EbmInference, TermBands
 
 CLASSIC = {"booster": "ebm", "eta": 0.1, "max_leaves": 3, "grow_policy": "lossguide"}
@@ -22,15 +23,8 @@ BOULEVARD = {
 }
 
 
-def data(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    x = rng.random((n, 3))
-    y = np.sin(6 * x[:, 0]) + (x[:, 1] - 0.5) ** 2 + (x[:, 2] > 0.5) + 0.1 * rng.standard_normal(n)
-    return x, y
-
-
 def test_shape_functions_add_up_to_the_margin() -> None:
-    x, y = data(500, 0)
+    x, y = additive(500, 0, features=3, noise=0.1)
     booster = hessboost.train({**CLASSIC, "ebm_interactions": 1}, hessboost.DMatrix(x, label=y), 40)
     shapes = shape_functions(booster)
     assert len(shapes.terms) == 4
@@ -39,8 +33,8 @@ def test_shape_functions_add_up_to_the_margin() -> None:
     assert main.values.shape == (main.axes[0].cells,)
     assert pair.values.shape == tuple(axis.cells for axis in pair.axes)
     margins = booster.predict(x[:50], output_margin=True)
-    for row, m in zip(x[:50], margins, strict=True):
-        total = shapes.intercept + sum(t.value(row[list(t.features)]) for t in shapes.terms)
+    for row, m in zip(x[:50].tolist(), margins, strict=True):
+        total = shapes.intercept + sum(t.value([row[f] for f in t.features]) for t in shapes.terms)
         assert total == pytest.approx(float(m), abs=1e-4)
     assert main.cell([np.nan]) == (main.axes[0].cells - 1,)
     info = booster.ebm
@@ -71,7 +65,7 @@ def test_categorical_terms_report_per_category_cells() -> None:
 
 
 def test_boulevard_bands() -> None:
-    x, y = data(400, 2)
+    x, y = additive(400, 2, features=3, noise=0.1)
     booster = hessboost.train(BOULEVARD, hessboost.DMatrix(x, label=y), 30)
     inference = EbmInference.fit(booster, x, label=y)
     bands = inference.term_bands(0, alpha=0.05)
@@ -91,7 +85,7 @@ def test_boulevard_bands() -> None:
 
 
 def test_refusals() -> None:
-    x, y = data(100, 3)
+    x, y = additive(100, 3, features=3, noise=0.1)
     classic = hessboost.train(CLASSIC, hessboost.DMatrix(x, label=y), 5)
     with pytest.raises(hessboost.HessboostError, match="Boulevard EBM"):
         EbmInference.fit(classic, x, noise_variance=1.0)
@@ -117,7 +111,7 @@ def test_refusals() -> None:
 
 
 def test_classic_ebms_bag_rows_by_class() -> None:
-    x, y = data(600, 5)
+    x, y = additive(600, 5, features=3, noise=0.1)
     dtrain = hessboost.DMatrix(x, label=(y > np.median(y)).astype(float))
     params = {**CLASSIC, "objective": "binary:logistic"}
     plain = hessboost.train(params, dtrain, 40).predict(dtrain)
@@ -127,7 +121,7 @@ def test_classic_ebms_bag_rows_by_class() -> None:
 
 
 def test_classic_ebms_bag_whole_queries() -> None:
-    x, _ = data(400, 6)
+    x, _ = additive(400, 6, features=3, noise=0.1)
     relevance = np.minimum(np.floor(3 * (x[:, 0] + 0.5 * x[:, 1])), 3)
     dtrain = hessboost.DMatrix(x, label=relevance, group=[10] * 40)
     params = {**CLASSIC, "objective": "rank:ndcg"}
@@ -140,7 +134,7 @@ def test_classic_ebms_bag_whole_queries() -> None:
 
 
 def test_sglb_and_virtual_ensembles_are_refused() -> None:
-    x, y = data(200, 7)
+    x, y = additive(200, 7, features=3, noise=0.1)
     dtrain = hessboost.DMatrix(x, label=y)
     with pytest.raises(hessboost.HessboostError, match="gbtree"):
         hessboost.train({**CLASSIC, "posterior_sampling": True}, dtrain, 2)
@@ -150,7 +144,7 @@ def test_sglb_and_virtual_ensembles_are_refused() -> None:
 
 
 def test_early_stopping_rounds_zero_is_off() -> None:
-    x, y = data(200, 3)
+    x, y = additive(200, 3, features=3, noise=0.1)
     dtrain = hessboost.DMatrix(x, label=y)
     off = hessboost.train({**CLASSIC, "ebm_early_stopping_rounds": 0}, dtrain, 5)
     plain = hessboost.train(CLASSIC, dtrain, 5)
@@ -165,3 +159,16 @@ def test_early_stopping_rounds_zero_is_off() -> None:
                 )
     stopped = {**CLASSIC, "ebm_bag_fraction": 0.8, "ebm_early_stopping_rounds": 2}
     hessboost.train({**stopped, "ebm_early_stopping_tolerance": 0.01}, dtrain, 5)
+
+
+def test_axis_tags_decode_exhaustively() -> None:
+    numeric = _axis("numeric", [0.5, 1.5])
+    assert isinstance(numeric, NumericAxis)
+    assert numeric.edges.dtype == np.float32
+    assert numeric.cells == 4
+    categorical = _axis("categorical", [0, 3])
+    assert isinstance(categorical, CategoricalAxis)
+    assert categorical.categories == (0, 3)
+    # An unknown tag is refused rather than read as categorical.
+    with pytest.raises(hessboost.HessboostError, match="unknown term axis kind 'ordinal'"):
+        _axis("ordinal", [1.0])

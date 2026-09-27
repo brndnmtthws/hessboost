@@ -11,7 +11,7 @@ import pytest
 import scipy.sparse
 
 import hessboost
-from conftest import FRAME_TYPES, frame, numpy_codes, regression, reorder_colors
+from conftest import FRAME_TYPES, frame, numpy_codes, regression, reorder_colors, rmse
 from hessboost import DMatrix, HessboostError
 
 
@@ -137,7 +137,7 @@ def test_pandas_frames_keep_names_and_categories() -> None:
     assert booster.feature_names == ["color", "size", "count", "flag"]
     assert booster.feature_types == ["c", "q", "q", "q"]
     predictions = booster.predict(df)
-    assert np.sqrt(np.mean((predictions - y) ** 2)) < 0.5
+    assert rmse(predictions, y) < 0.5
     assert set(booster.get_score()) <= {"color", "size", "count", "flag"}
     assert "color" in booster.get_score("total_gain")
 

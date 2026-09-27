@@ -1,10 +1,10 @@
 //! `booster = boulevard` and its statistical inference ([`hessboost::inference`]).
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Boulevard, TrainingParams, TrainingParamsBuilder,
+    BalancedBagging, BoosterKind, Boulevard, QueryBagging, TrainingParams, TrainingParamsBuilder,
 };
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
-use hessboost::objective::{Logistic, Objective};
+use hessboost::objective::{LambdaRank, Logistic, Objective};
 use hessboost::prelude::*;
 
 mod common;
@@ -208,6 +208,12 @@ fn settings_that_break_the_linear_smoother_are_refused() {
             .balanced_bagging(balanced);
         assert_eq!(refused(bagged), "pos_bagging_fraction");
     }
+    // Query bagging needs a `rank:*` objective, which Boulevard refuses.
+    let by_query = builder()
+        .subsample(1.0)
+        .objective(Objective::RankNdcg(LambdaRank::default()))
+        .bagging_by_query(QueryBagging::new(0.5).unwrap());
+    assert_eq!(refused(by_query), "objective");
     // A dropout of 1 keeps no tree; flat keys need their booster.
     assert_eq!(
         invalid_param(Boulevard::builder().dropout(1.0).build()),

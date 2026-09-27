@@ -11,10 +11,11 @@ from numpy.typing import NDArray
 import hessboost
 from conftest import classes, regression
 from hessboost import DMatrix, HessboostError
-from hessboost.online import OnlineModel, UpdateReport
+from hessboost.online import Approximate, Exact, OnlineMode, OnlineModel, UpdateReport
 
 PARAMS = {"tree_method": "hist", "max_depth": 4, "eta": 0.3}
 ROUNDS = 12
+MODES = [Approximate(0.1), Exact()]
 
 
 def binary(rows: int, seed: int) -> DMatrix:
@@ -34,8 +35,8 @@ def test_exact_updates_equal_training_on_the_data(objective: str) -> None:
     else:
         x, y = regression(rows=320)
         dtrain, added = DMatrix(x[:300], y[:300]), DMatrix(x[300:], y[300:])
-    online = OnlineModel.train(params, dtrain, ROUNDS, tolerance=0.0)
-    assert online.tolerance == 0.0
+    online = OnlineModel.train(params, dtrain, ROUNDS, mode=Exact())
+    assert online.mode == Exact()
     changes: list[tuple[DMatrix | None, list[int] | NDArray[np.int64]]] = [
         (added, [0, 7, 299]),
         (None, np.array([3, 4, 5])),
@@ -55,7 +56,7 @@ def test_approximate_updates_report_and_stay_close_to_retraining() -> None:
     dtrain, test = DMatrix(x[:2000], y[:2000]), x[2000:2360]
     added = DMatrix(x[2360:], y[2360:])
     online = OnlineModel.train(PARAMS, dtrain, ROUNDS)
-    assert online.tolerance == 0.1
+    assert online.mode == Approximate(0.1)
     report = online.update(added, deletions=list(range(0, 400, 10)))
     assert isinstance(report, UpdateReport)
     assert report.nodes_kept > 0
@@ -75,12 +76,12 @@ def test_the_model_is_a_snapshot() -> None:
     assert before.save_raw() == saved != online.model.save_raw()
 
 
-@pytest.mark.parametrize("tolerance", [0.1, 0.0])
-def test_from_model_resumes_like_the_trained_online_model(tolerance: float) -> None:
+@pytest.mark.parametrize("mode", MODES)
+def test_from_model_resumes_like_the_trained_online_model(mode: OnlineMode) -> None:
     dtrain, added = binary(300, 4), binary(15, 5)
-    trained = OnlineModel.train(PARAMS, dtrain, ROUNDS, tolerance)
+    trained = OnlineModel.train(PARAMS, dtrain, ROUNDS, mode)
     loaded = hessboost.Booster(trained.model.save_raw())
-    resumed = OnlineModel.from_model(loaded, PARAMS, dtrain, tolerance)
+    resumed = OnlineModel.from_model(loaded, PARAMS, dtrain, mode)
     for online in (trained, resumed):
         online.update(added, [1, 2])
     assert trained.model.save_raw() == resumed.model.save_raw()
@@ -107,9 +108,9 @@ def test_from_model_refuses_an_early_stopped_model() -> None:
     assert resumed.model.num_boosted_rounds() == best + 1
 
 
-@pytest.mark.parametrize("tolerance", [0.1, 0.0])
-def test_a_stopping_callback_abandons_the_update(tolerance: float) -> None:
-    online = OnlineModel.train(PARAMS, binary(300, 6), ROUNDS, tolerance)
+@pytest.mark.parametrize("mode", MODES)
+def test_a_stopping_callback_abandons_the_update(mode: OnlineMode) -> None:
+    online = OnlineModel.train(PARAMS, binary(300, 6), ROUNDS, mode)
     before = state(online)
     calls: list[int] = []
 
@@ -140,22 +141,22 @@ def test_a_stopping_callback_abandons_the_update(tolerance: float) -> None:
     report = online.update(binary(10, 7), [0, 1], callback=watch)
     assert report is not None
     assert calls == list(range(ROUNDS))
-    fresh = OnlineModel.train(PARAMS, binary(300, 6), ROUNDS, tolerance)
+    fresh = OnlineModel.train(PARAMS, binary(300, 6), ROUNDS, mode)
     fresh.update(binary(10, 7), [0, 1])
     assert state(online) == state(fresh)
 
 
-@pytest.mark.parametrize("tolerance", [0.1, 0.0])
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("at", [2, ROUNDS - 1])
 @pytest.mark.parametrize("wait", [0.3, 0.0])
-def test_keyboard_interrupt_abandons_the_update(tolerance: float, at: int, wait: float) -> None:
+def test_keyboard_interrupt_abandons_the_update(mode: OnlineMode, at: int, wait: float) -> None:
     """Ctrl-C during any iteration's callback, the last included, and
     whether or not the waiting caller sees it before the callback returns,
     raises with the state unchanged."""
     import _thread
     import time
 
-    online = OnlineModel.train(PARAMS, binary(300, 8), ROUNDS, tolerance)
+    online = OnlineModel.train(PARAMS, binary(300, 8), ROUNDS, mode)
     before = state(online)
 
     def interrupt(iteration: int) -> bool:
@@ -175,18 +176,18 @@ _REENTRANT = """
 import numpy as np
 import hessboost
 from hessboost import DMatrix, HessboostError
-from hessboost.online import OnlineModel
+from hessboost.online import Approximate, Exact, OnlineModel
 
 rng = np.random.default_rng(0)
 x = rng.normal(size=(300, 4))
 y = x[:, 0] - x[:, 1]
 online = OnlineModel.train(
-    {"tree_method": "hist", "max_depth": 3}, DMatrix(x, y), 6, tolerance=TOLERANCE
+    {"tree_method": "hist", "max_depth": 3}, DMatrix(x, y), 6, mode=MODE
 )
 seen = []
 
 def callback(iteration):
-    seen.append((online.num_row(), online.tolerance, repr(online)))
+    seen.append((online.num_row(), online.mode, repr(online)))
     for access in (lambda: online.model, lambda: online.data, lambda: online.update(None, [0])):
         try:
             access()
@@ -199,21 +200,22 @@ def callback(iteration):
 report = online.update(DMatrix(x[:5], y[:5]), [1, 2], callback=callback)
 assert report is not None
 assert [rows for rows, _, _ in seen] == [300] * 6, seen
+assert all(mode == MODE for _, mode, _ in seen), seen
 assert online.num_row() == 303 == online.data.num_row()
 assert online.model.num_boosted_rounds() == 6
 print("ok")
 """
 
 
-@pytest.mark.parametrize("tolerance", [0.1, 0.0])
-def test_access_from_the_update_callback_fails_fast(tolerance: float) -> None:
+@pytest.mark.parametrize("mode", MODES)
+def test_access_from_the_update_callback_fails_fast(mode: OnlineMode) -> None:
     """Reading the model or data, or updating again, from an update's own
-    callback raises instead of deadlocking; the row count and tolerance stay
+    callback raises instead of deadlocking; the row count and mode stay
     readable. Run in a subprocess, so a deadlock fails the test by timeout."""
     import subprocess
     import sys
 
-    code = _REENTRANT.replace("TOLERANCE", repr(tolerance))
+    code = _REENTRANT.replace("MODE", repr(mode))
     done = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=False
     )
@@ -221,11 +223,11 @@ def test_access_from_the_update_callback_fails_fast(tolerance: float) -> None:
     assert done.stdout.strip() == "ok"
 
 
-@pytest.mark.parametrize("tolerance", [0.1, 0.0])
-def test_labels_retraining_refuses_are_refused(tolerance: float) -> None:
+@pytest.mark.parametrize("mode", MODES)
+def test_labels_retraining_refuses_are_refused(mode: OnlineMode) -> None:
     params = {**PARAMS, "objective": "binary:logistic"}
     x, y = classes(rows=300, seed=10)
-    online = OnlineModel.train(params, DMatrix(x, y), ROUNDS, tolerance)
+    online = OnlineModel.train(params, DMatrix(x, y), ROUNDS, mode)
     before = state(online)
     bad = DMatrix(x[:1], [2.0])
     with pytest.raises(HessboostError, match="labels"):
@@ -245,7 +247,7 @@ def test_approximate_updates_refuse_values_beyond_the_training_bins() -> None:
     with pytest.raises(HessboostError, match="additions"):
         approximate.update(DMatrix([[3.0]], [0.0]), [0])
     assert state(approximate) == before
-    exact = OnlineModel.train(params, DMatrix(x, [0.0, 0.0, 1.0, 1.0]), 1, 0.0)
+    exact = OnlineModel.train(params, DMatrix(x, [0.0, 0.0, 1.0, 1.0]), 1, Exact())
     exact.update(DMatrix([[3.0]], [0.0]), [0])
     assert exact.num_row() == 4
 
@@ -270,8 +272,9 @@ def test_unsupported_configurations_and_changes_are_refused() -> None:
     for params in refused:
         with pytest.raises(HessboostError):
             OnlineModel.train({**PARAMS, **params}, dtrain, 3)
-    with pytest.raises(HessboostError, match="tolerance"):
-        OnlineModel.train(PARAMS, dtrain, 3, tolerance=1.5)
+    for tolerance in (0.0, -0.1, 1.5, float("nan")):
+        with pytest.raises(HessboostError, match="tolerance"):
+            OnlineModel.train(PARAMS, dtrain, 3, Approximate(tolerance))
     with pytest.raises(HessboostError, match="weights"):
         OnlineModel.train(PARAMS, DMatrix(x, y, weight=np.ones(200)), 3)
     online = OnlineModel.train(PARAMS, dtrain, 3)
@@ -289,20 +292,22 @@ def test_unsupported_configurations_and_changes_are_refused() -> None:
     with pytest.raises(TypeError):
         online.update(None, [0.5])  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
-        OnlineModel.train(PARAMS, dtrain, 3, tolerance="0.1")  # ty: ignore[invalid-argument-type]
+        Approximate("0.1")  # ty: ignore[invalid-argument-type]
+    with pytest.raises(TypeError):
+        OnlineModel.train(PARAMS, dtrain, 3, 0.1)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
         OnlineModel()
 
 
-@pytest.mark.parametrize("tolerance", [0.1, 0.0])
-def test_an_interrupted_update_keeps_the_update_state(tolerance: float) -> None:
+@pytest.mark.parametrize("mode", MODES)
+def test_an_interrupted_update_keeps_the_update_state(mode: OnlineMode) -> None:
     """Ctrl-C at the last iteration (refused at the commit gate) after an
     earlier update restores the exact update state: later updates equal
     those of a model that never tried the interrupted one."""
     import _thread
 
     dtrain, a, b, c = binary(400, 20), binary(20, 21), binary(15, 22), binary(25, 23)
-    online, control = (OnlineModel.train(PARAMS, dtrain, ROUNDS, tolerance) for _ in range(2))
+    online, control = (OnlineModel.train(PARAMS, dtrain, ROUNDS, mode) for _ in range(2))
     for model in (online, control):
         model.update(a, [0, 5, 9])
 

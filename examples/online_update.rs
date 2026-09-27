@@ -5,15 +5,15 @@
 //! Trains a regression model on 20,000 rows, then adds 200 new rows and
 //! deletes 200 old ones with the approximate mode (split robustness
 //! tolerance 0.1), comparing time and test error with retraining; then
-//! checks that the exact mode (tolerance 0) reproduces retraining bit for
-//! bit.
+//! checks that the exact mode (`OnlineMode::Exact`) reproduces retraining
+//! bit for bit.
 //!
 //! Run with: `cargo run --release --example online_update`
 
 use std::time::Instant;
 
 use hessboost::prelude::*;
-use hessboost::training::online::{OnlineModel, OnlineParams};
+use hessboost::training::online::{OnlineMode, OnlineModel, OnlineParams};
 
 mod common;
 use common::lcg;
@@ -84,8 +84,9 @@ fn main() -> Result<()> {
         rmse(&retrained, &test)?,
     );
 
-    // Exact unlearning: tolerance 0 equals retraining on the remaining rows.
+    // Exact unlearning: the exact mode equals retraining on the remaining rows.
     let mut exact = OnlineModel::train(&params, &data, rounds, OnlineParams::exact())?;
+    assert_eq!(exact.online_params().mode(), OnlineMode::Exact);
     exact.update(None, &deletions)?;
     let reference = train(&params, exact.data(), rounds)?;
     println!(

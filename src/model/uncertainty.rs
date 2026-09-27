@@ -211,6 +211,7 @@ impl Decomposition {
             | Objective::RankPairwise(_)
             | Objective::RankNdcg(_)
             | Objective::RankMap(_)
+            | Objective::RankXendcg
             | Objective::Custom(_) => return refused(),
         })
     }

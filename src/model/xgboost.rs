@@ -223,10 +223,12 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
 }
 
 /// Refuse hessboost's own objectives, which XGBoost does not define: the
-/// distributional `dist:*` objectives. Their models are saved in the native
-/// binary or JSON formats only.
+/// distributional `dist:*` objectives and `rank:xendcg`. Their models are
+/// saved in the native binary or JSON formats only.
 fn reject_extension_objective(objective: &str) -> Result<()> {
-    if crate::objective::distributional::DistFamily::from_objective(objective).is_some() {
+    if crate::objective::distributional::DistFamily::from_objective(objective).is_some()
+        || objective == Objective::RankXendcg.name()
+    {
         return Err(HessboostError::model_format(format!(
             "objective `{objective}` is a hessboost extension that XGBoost models cannot \
              carry; save the model in the native binary or JSON format"
@@ -954,6 +956,7 @@ fn objective_to_json(objective: &Objective, max_delta_step: f64) -> Value {
         | Objective::BinaryHinge
         | Objective::AbsoluteError
         | Objective::Dist(_)
+        | Objective::RankXendcg
         | Objective::Custom(_) => {
             return Value::Object(out);
         }
@@ -2395,6 +2398,32 @@ mod tests {
         let back = import_xgboost_json(&exported).unwrap();
         assert_eq!(back.base_scores(), cox.base_scores());
         assert_eq!(back.predict(&dc).unwrap(), cox.predict(&dc).unwrap());
+    }
+
+    /// An XE-NDCG model (a hessboost extension) round-trips through the
+    /// native format, but XGBoost's model format cannot carry it.
+    #[test]
+    fn xendcg_native_roundtrip_and_xgboost_exports_refused() {
+        let data = labeled_dense(&[0.0, 1.0, 2.0, 0.5], 4, 1, &[0.0, 1.0, 2.0, 1.0])
+            .with_group_sizes(&[2, 2])
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective(Objective::RankXendcg)
+            .max_depth(2)
+            .seed(9)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 3).unwrap();
+        let bytes = model.to_bytes().unwrap();
+        let restored = BoostedModel::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.to_bytes().unwrap(), bytes);
+        assert_eq!(restored.objective(), model.objective());
+        assert_eq!(
+            restored.predict(&data).unwrap(),
+            model.predict(&data).unwrap()
+        );
+        assert_format_error(export_xgboost_json(&model), "hessboost extension");
+        assert_format_error(export_xgboost_ubjson(&model), "hessboost extension");
     }
 
     #[test]

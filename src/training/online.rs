@@ -625,6 +625,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         | Objective::RankPairwise(_)
         | Objective::RankNdcg(_)
         | Objective::RankMap(_)
+        | Objective::RankXendcg
         | Objective::Cox
         | Objective::Custom(_) => false,
     };

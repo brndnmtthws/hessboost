@@ -5,7 +5,7 @@
 
 use super::groups::{
     BalancedBagging, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
-    QuantizedGrad, Refresh,
+    QuantizedGrad, QueryBagging, Refresh,
 };
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
@@ -125,6 +125,7 @@ flat_params! {
     sampling_method: SamplingMethod,
     pos_bagging_fraction: f64,
     neg_bagging_fraction: f64,
+    bagging_by_query: bool,
     multi_strategy: MultiStrategy,
     process_type: FlatProcess,
     refresh_leaf: bool,
@@ -242,6 +243,7 @@ impl Flat {
             sampling_method,
             pos_bagging_fraction,
             neg_bagging_fraction,
+            bagging_by_query,
             multi_strategy,
             process_type,
             refresh_leaf,
@@ -449,6 +451,23 @@ impl Flat {
                     .transpose()?
             }
         };
+        // LightGBM's `bagging_by_query` turns `bagging_fraction`
+        // (`subsample`) into the fraction of queries kept.
+        let (subsample, bagging_by_query) = if bagging_by_query == Some(true) {
+            let fraction = subsample.unwrap_or(1.0);
+            if fraction >= 1.0 {
+                return Err(HessboostError::invalid_param(
+                    "bagging_by_query",
+                    format!(
+                        "needs `subsample` < 1, the fraction of queries kept each round, \
+                         got {fraction}"
+                    ),
+                ));
+            }
+            (None, Some(QueryBagging::new(fraction)?))
+        } else {
+            (subsample, None)
+        };
         // CatBoost: posterior sampling needs Langevin "not set or true".
         if posterior_sampling == Some(true) && langevin == Some(false) {
             return Err(HessboostError::invalid_param(
@@ -508,6 +527,7 @@ impl Flat {
             num_parallel_tree: num_parallel_tree.unwrap_or(d.num_parallel_tree),
             sampling_method: sampling_method.unwrap_or(d.sampling_method),
             balanced_bagging,
+            bagging_by_query,
             multi_strategy: multi_strategy.unwrap_or(d.multi_strategy),
             process_type,
             extra_trees,
@@ -794,7 +814,7 @@ impl TrainingParams {
                         Objective::RankPairwise(_) | Objective::RankNdcg(_) | Objective::RankMap(_)
                     ) =>
                 {
-                    "applies only to the `rank:*` objectives"
+                    "applies only to the LambdaMART `rank:*` objectives"
                 }
                 _ => continue,
             };
@@ -846,6 +866,7 @@ impl TrainingParams {
             num_parallel_tree,
             sampling_method,
             balanced_bagging,
+            bagging_by_query,
             multi_strategy,
             process_type,
             extra_trees,
@@ -926,7 +947,13 @@ impl TrainingParams {
             MaxDeltaStep::Unbounded => set("max_delta_step", json(0.0)),
             MaxDeltaStep::Bounded(bound) => set("max_delta_step", json(bound)),
         }
-        set("subsample", json(subsample));
+        match bagging_by_query {
+            Some(bagging) => {
+                set("bagging_by_query", json(true));
+                set("subsample", json(bagging.fraction()));
+            }
+            None => set("subsample", json(subsample)),
+        }
         set("colsample_bytree", json(colsample_bytree));
         set("colsample_bylevel", json(colsample_bylevel));
         set("colsample_bynode", json(colsample_bynode));
@@ -1013,6 +1040,7 @@ impl TrainingParams {
             num_parallel_tree,
             sampling_method,
             balanced_bagging,
+            bagging_by_query,
             multi_strategy,
             process_type,
             extra_trees,
@@ -1088,6 +1116,10 @@ impl TrainingParams {
         );
         differs("pos_bagging_fraction", ours.0 == theirs.0);
         differs("neg_bagging_fraction", ours.1 == theirs.1);
+        differs(
+            "bagging_by_query",
+            *bagging_by_query == other.bagging_by_query,
+        );
         differs("multi_strategy", *multi_strategy == other.multi_strategy);
         differs("process_type", *process_type == other.process_type);
         differs("extra_trees", *extra_trees == other.extra_trees);
@@ -1263,6 +1295,43 @@ mod tests {
         }
     }
 
+    /// LightGBM's `bagging_by_query` reads `subsample` as the fraction of
+    /// queries kept, and writes it back there; without a fraction below 1,
+    /// or with a non-ranking objective, it is refused by name.
+    #[test]
+    fn bagging_by_query_reads_subsample_as_the_query_fraction() {
+        let p = TrainingParams::from_xgboost([
+            ("objective", json!("rank:xendcg")),
+            ("bagging_by_query", json!(true)),
+            ("subsample", json!(0.7)),
+        ])
+        .unwrap();
+        assert_eq!(p.bagging_by_query, Some(QueryBagging::new(0.7).unwrap()));
+        assert_eq!(p.subsample, 1.0);
+        let flat = p.to_xgboost().unwrap();
+        assert_eq!(
+            (&flat["bagging_by_query"], &flat["subsample"]),
+            (&json!(true), &json!(0.7))
+        );
+        assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), p);
+        let off = TrainingParams::from_xgboost([
+            ("bagging_by_query", json!(false)),
+            ("subsample", json!(0.7)),
+        ])
+        .unwrap();
+        assert_eq!((off.bagging_by_query, off.subsample), (None, 0.7));
+        for pairs in [
+            json!({"objective": "rank:ndcg", "bagging_by_query": true}),
+            json!({"bagging_by_query": true, "subsample": 0.5}),
+        ] {
+            let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
+            assert!(
+                refusal.starts_with("invalid parameter `bagging_by_query`"),
+                "{pairs}: {refusal}"
+            );
+        }
+    }
+
     /// Every option group, switched on with non-default values, reads back
     /// from its flat form unchanged.
     #[test]
@@ -1371,6 +1440,7 @@ mod tests {
             Objective::RankPairwise(LambdaRank::new(4).unwrap()),
             Objective::RankNdcg(LambdaRank::new(8).unwrap()),
             Objective::RankMap(LambdaRank::default()),
+            Objective::RankXendcg,
             Objective::Cox,
             Objective::Aft(Aft::new(AftDistribution::Logistic, 1.7).unwrap()),
             Objective::Dist(dist),

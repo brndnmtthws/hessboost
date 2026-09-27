@@ -80,7 +80,7 @@
 //! - **Objectives** ([`Objective`](objective::Objective), each with its
 //!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
-//!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
+//!   and multiclass, counts, LambdaMART and XE-NDCG ranking, survival (`survival:cox`,
 //!   `survival:aft` on censored bounds), plus custom losses
 //!   ([`Objective::Custom`](objective::Objective::Custom), e.g. a
 //!   [`CustomLoss`](objective::CustomLoss)).
@@ -125,6 +125,10 @@
 //!   - LightGBM class-balanced bagging for binary classification
 //!     ([`BalancedBagging`](config::BalancedBagging): `pos_bagging_fraction`,
 //!     `neg_bagging_fraction`), in place of `subsample`;
+//!   - LightGBM XE-NDCG ranking
+//!     ([`Objective::RankXendcg`](objective::Objective::RankXendcg); its keyed
+//!     per-round draws differ from LightGBM's random stream) and query-level
+//!     bagging ([`QueryBagging`](config::QueryBagging), `bagging_by_query`);
 //!   - CatBoost-style symmetric trees
 //!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), routed by
 //!     bit pattern in batch prediction;
@@ -160,7 +164,7 @@
 //!     elsewhere [`backend::metal`] is a stub.
 //!
 //! `examples/` has one program per topic (`train_regression`,
-//! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
+//! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`, `model_io`,
 //! `custom_objective`, `constraints`, `conformal`, `compact_model`,
 //! `distributional`, `virtual_ensembles`, `budget`, `balanced_bagging`,
 //! `online_update`, `ordered_target_stats`, `pfn_boost`, `metal` with

@@ -3,9 +3,10 @@
 //! feature-weighted column sampling (`DMatrix::with_feature_weights`).
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Dart, ProcessType, Refresh, SamplingMethod, TrainingParamsBuilder,
+    BalancedBagging, BoosterKind, Dart, ProcessType, QueryBagging, Refresh, SamplingMethod,
+    TrainingParamsBuilder,
 };
-use hessboost::objective::Logistic;
+use hessboost::objective::{LambdaRank, Logistic};
 use hessboost::prelude::*;
 use hessboost::tree::RegTree;
 
@@ -147,6 +148,71 @@ fn gradient_based_sampling_tree_method_support() {
         .build()
         .unwrap();
     assert!(train(&dart, &data, 3).is_ok());
+}
+
+/// Query bagging trains deterministically from the seed and still splits.
+#[test]
+fn bagging_by_query_is_seeded_and_keeps_whole_groups() {
+    let n_groups = 30;
+    let group_size = 4;
+    let n = n_groups * group_size;
+    let mut x = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    for group in 0..n_groups {
+        for doc in 0..group_size {
+            x.push(doc as f32 + group as f32 * 0.001);
+            y.push(doc as f32);
+        }
+    }
+    let data = labeled_dense(&x, 1, &y)
+        .with_group_sizes(&vec![group_size; n_groups])
+        .unwrap();
+    let params = TrainingParams::builder()
+        .objective(Objective::RankNdcg(LambdaRank::default()))
+        .tree_method(TreeMethod::Hist)
+        .bagging_by_query(QueryBagging::new(0.5).unwrap())
+        .seed(22)
+        .max_depth(2)
+        .build()
+        .unwrap();
+    let first = train(&params, &data, 4).unwrap().trees().to_vec();
+    let second = train(&params, &data, 4).unwrap().trees().to_vec();
+    assert_eq!(first, second);
+    for tree in &first {
+        assert!(tree.nodes().iter().any(|node| !node.is_leaf()));
+    }
+}
+
+/// Query bagging needs a `rank:*` objective on a tree booster, uniform
+/// sampling, `subsample = 1`, and query groups on the training data.
+#[test]
+fn bagging_by_query_refuses_non_ranking_or_incompatible_sampling() {
+    let bagging = QueryBagging::new(0.5).unwrap();
+    let ranking = || {
+        TrainingParams::builder()
+            .objective(Objective::RankNdcg(LambdaRank::default()))
+            .bagging_by_query(bagging)
+    };
+    for (params, name) in [
+        (ranking().subsample(0.8), "subsample"),
+        (
+            ranking().sampling_method(SamplingMethod::GradientBased),
+            "sampling_method",
+        ),
+        (ranking().booster(BoosterKind::GbLinear), "bagging_by_query"),
+        (
+            TrainingParams::builder().bagging_by_query(bagging),
+            "bagging_by_query",
+        ),
+    ] {
+        assert_eq!(invalid_param(params.build()), name);
+    }
+    // Query groups are data, so they are checked at training.
+    let ungrouped = labeled_dense(&[0.0, 1.0], 1, &[0.0, 1.0]);
+    assert_eq!(
+        invalid_param(train(&ranking().build().unwrap(), &ungrouped, 1)),
+        "bagging_by_query"
+    );
 }
 
 /// Class-balanced bagging draws a different, seed-deterministic sample of

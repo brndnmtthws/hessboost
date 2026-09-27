@@ -14,7 +14,7 @@ use hessboost::config::{
 use hessboost::metric::Metric;
 use hessboost::model::Predictions;
 use hessboost::objective::distributional::{DistFamily, Distributional};
-use hessboost::objective::{Logistic, Multiclass, Objective};
+use hessboost::objective::{Multiclass, Objective, RegLoss};
 use hessboost::prelude::*;
 use serde_json::json;
 
@@ -78,7 +78,7 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             "exact decreasing shrinkage with Langevin",
             base()
                 .tree_method(TreeMethod::Exact)
-                .objective(Objective::BinaryLogistic(Logistic::default()))
+                .objective(Objective::BinaryLogistic(RegLoss::default()))
                 .langevin(
                     Langevin::builder()
                         .diffusion_temperature(50.0)
@@ -320,7 +320,7 @@ fn langevin_training_is_thread_count_independent() {
     let data = regression(20_000);
     let params = |seed| {
         TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Hist)
             .max_depth(4)
             .posterior_sampling(true)
@@ -746,7 +746,7 @@ fn uncertainty_decomposes_per_objective() {
             .unwrap()
     };
     let model = train(
-        &params(Objective::BinaryLogistic(Logistic::default())),
+        &params(Objective::BinaryLogistic(RegLoss::default())),
         &binary,
         40,
     )
@@ -782,7 +782,12 @@ fn uncertainty_decomposes_per_objective() {
         assert_eq!(t, k + d);
     }
 
-    let squared = train(&params(Objective::SquaredError), &reg, 40).unwrap();
+    let squared = train(
+        &params(Objective::SquaredError(RegLoss::default())),
+        &reg,
+        40,
+    )
+    .unwrap();
     let u = squared.predict_uncertainty(&reg, 5).unwrap();
     assert!(u.data.is_none() && u.total.is_none());
     assert!(u.knowledge.as_slice().iter().all(|&k| k >= 0.0));
@@ -841,12 +846,17 @@ fn uncertainty_parts_have_their_own_widths() {
             1,
         ),
         (
-            Objective::BinaryLogistic(Logistic::default()),
+            Objective::BinaryLogistic(RegLoss::default()),
             &multi_label,
             2,
             2,
         ),
-        (Objective::SquaredError, &multi_label, 2, 2),
+        (
+            Objective::SquaredError(RegLoss::default()),
+            &multi_label,
+            2,
+            2,
+        ),
         (
             Objective::Dist(Distributional::new(DistFamily::Normal)),
             &reg,

@@ -11,7 +11,7 @@ use hessboost::config::{
 };
 use hessboost::data::FeatureType;
 use hessboost::metric::EvalMetric;
-use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Logistic, Objective};
+use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
 use hessboost::training::online::{OnlineModel, OnlineParams};
@@ -22,7 +22,7 @@ use common::{invalid_param, lcg, rmse, with_threads};
 const COLS: usize = 4;
 
 fn logistic() -> Objective {
-    Objective::BinaryLogistic(Logistic::default())
+    Objective::BinaryLogistic(RegLoss::default())
 }
 
 /// `y = 3 x0 - 2 x1 + x2 x3 + noise`, or its sign for classification.
@@ -53,7 +53,7 @@ fn params(objective: Objective) -> TrainingParams {
 
 #[test]
 fn exact_updates_equal_retraining_bit_for_bit() {
-    for objective in [Objective::SquaredError, logistic()] {
+    for objective in [Objective::SquaredError(RegLoss::default()), logistic()] {
         let binary = matches!(objective, Objective::BinaryLogistic(_));
         let name = objective.name().to_owned();
         let p = params(objective);
@@ -80,7 +80,7 @@ fn exact_updates_equal_retraining_bit_for_bit() {
 
 #[test]
 fn approximate_updates_stay_close_to_retraining() {
-    let p = params(Objective::SquaredError);
+    let p = params(Objective::SquaredError(RegLoss::default()));
     let train_data = data(2000, 3, false);
     let test = data(1000, 4, false);
     let added = data(40, 5, false);
@@ -132,7 +132,7 @@ fn updates_ignore_the_thread_count() {
 
 #[test]
 fn an_interrupted_update_changes_nothing() {
-    let p = params(Objective::SquaredError);
+    let p = params(Objective::SquaredError(RegLoss::default()));
     let train_data = data(300, 8, false);
     for mode in [
         OnlineParams::exact(),
@@ -391,7 +391,7 @@ fn from_model_refuses_linear_leaves() {
         .unwrap()
         .with_labels(&y)
         .unwrap();
-    let p = params(Objective::SquaredError);
+    let p = params(Objective::SquaredError(RegLoss::default()));
     for online in [
         OnlineParams::approximate(0.1).unwrap(),
         OnlineParams::exact(),
@@ -412,7 +412,7 @@ fn from_model_refuses_linear_leaves() {
 #[test]
 fn from_model_refuses_shrunk_models() {
     let data = data(200, 5, false);
-    let p = params(Objective::SquaredError);
+    let p = params(Objective::SquaredError(RegLoss::default()));
     let mut shrunk = p.clone();
     shrunk.model_shrink = Some(ModelShrink::new(0.1, ModelShrinkMode::Constant).unwrap());
     let model = train(&shrunk, &data, 3).unwrap();
@@ -431,7 +431,7 @@ fn from_model_refuses_shrunk_models() {
 #[test]
 fn from_model_refuses_trees_deeper_than_max_depth() {
     let d = data(200, 14, false);
-    let p = params(Objective::SquaredError);
+    let p = params(Objective::SquaredError(RegLoss::default()));
     let mut deeper = p.clone();
     deeper.max_depth = p.max_depth.and_then(|depth| depth.checked_add(2));
     let model = train(&deeper, &d, 3).unwrap();
@@ -453,7 +453,7 @@ fn from_model_refuses_trees_deeper_than_max_depth() {
 /// then equal those of a copy that never tried it.
 #[test]
 fn an_abandoned_update_keeps_the_update_state() {
-    let p = params(Objective::SquaredError);
+    let p = params(Objective::SquaredError(RegLoss::default()));
     let train_data = data(600, 13, false);
     let (a, b, c) = (
         data(30, 14, false),
@@ -531,7 +531,7 @@ fn plain(max_depth: usize) -> TrainingParams {
 fn from_model_refuses_models_and_metrics_training_would_not_give() {
     let d = data(300, 11, false);
     let valid = data(100, 12, false);
-    let p = params(Objective::SquaredError);
+    let p = params(Objective::SquaredError(RegLoss::default()));
     let stopped = Trainer::new(&p, &d, 200)
         .eval(&valid, "valid")
         .early_stopping_rounds(2)
@@ -645,7 +645,7 @@ fn updates_refuse_data_without_a_finite_intercept() {
 /// caller runs them in.
 #[test]
 fn updates_run_on_the_configured_threads() {
-    let mut p = params(Objective::SquaredError);
+    let mut p = params(Objective::SquaredError(RegLoss::default()));
     p.nthread = std::num::NonZeroUsize::new(1);
     let d = data(200, 14, false);
     with_threads(4, || {

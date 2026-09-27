@@ -249,10 +249,11 @@
 //! `expectile_loss_param.expectile_alpha`,
 //! `aft_loss_param.{aft_loss_distribution, aft_loss_distribution_scale}`)
 //! becomes the parameters of the model's [`Objective`]
-//! ([`ModelObjective::built_in`]); absent fields take XGBoost's defaults, and
-//! parameters the objective does not read are dropped (e.g.
-//! `reg_loss_param.scale_pos_weight` of `reg:squarederror` or `reg:gamma`,
-//! which hessboost does not apply). The alpha lists are XGBoost's array strings
+//! ([`ModelObjective::built_in`]), `scale_pos_weight` for every `RegLossObj`
+//! objective (`reg:squarederror`, `reg:gamma`, and the logistic ones); absent
+//! fields take XGBoost's defaults, and parameters the objective does not read
+//! are dropped (e.g. `reg_loss_param.scale_pos_weight` of
+//! `reg:squaredlogerror`). The alpha lists are XGBoost's array strings
 //! (`"[0.1,0.5,0.9]"`, `(..)` also read); `reg:absoluteerror` and
 //! `survival:cox` have no block. A value that does not parse, or an invalid
 //! parameter of the objective (e.g. an empty or unsorted alpha list), is a
@@ -2584,7 +2585,7 @@ mod tests {
     use crate::config::TrainingParams;
     use crate::data::DMatrix;
     use crate::error::HessboostError;
-    use crate::objective::{Logistic, Objective};
+    use crate::objective::{Objective, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::training::train;
 
@@ -2738,7 +2739,7 @@ mod tests {
             Err(HessboostError::InvalidParameter { name, .. }) if name == "num_class"
         ));
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .build()
             .unwrap();
         let model = train(&params, &d, 1).unwrap();

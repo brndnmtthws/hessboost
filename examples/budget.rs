@@ -8,7 +8,7 @@
 //! Run with: `cargo run --release --example budget`
 
 use hessboost::metric::EvalMetric;
-use hessboost::objective::Logistic;
+use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
 use hessboost::training::budget::{BudgetConfig, train_with_budget};
 use std::time::Instant;
@@ -145,7 +145,7 @@ fn report(
 fn main() -> Result<()> {
     report(
         "Friedman #1 regression, 5000 rows",
-        &Objective::SquaredError,
+        &Objective::SquaredError(RegLoss::default()),
         &regression(5000, 1)?,
         &regression(2000, 2)?,
         &regression(10_000, 3)?,
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
     )?;
     report(
         "Friedman #1 binary classification, 5000 rows",
-        &Objective::BinaryLogistic(Logistic::default()),
+        &Objective::BinaryLogistic(RegLoss::default()),
         &binary(5000, 4)?,
         &binary(2000, 5)?,
         &binary(10_000, 6)?,

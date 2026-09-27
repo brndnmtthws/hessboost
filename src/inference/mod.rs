@@ -285,7 +285,10 @@ impl BoulevardInfo {
         if model.num_parallel_tree() > 1 && (self.dropout != 0.0 || self.learning_rate != 1.0) {
             return fail("BRAT-P (num_parallel_tree > 1) needs dropout 0 and learning_rate 1");
         }
-        if !matches!(model.objective().built_in(), Some(Objective::SquaredError))
+        if !model
+            .objective()
+            .built_in()
+            .is_some_and(Objective::is_unweighted_squared_error)
             || model.n_outputs() != 1
             || model.has_vector_leaves()
             || model.has_non_unit_tree_weights()

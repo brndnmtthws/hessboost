@@ -398,13 +398,21 @@ pub(crate) fn gamma_gradient(
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
+    scale_pos_weight: f32,
     out: &mut [GradPair],
 ) {
     dispatch_gradient!(
         gradient_gate(preds, labels, weights, out),
-        aarch64::gamma_gradient(preds, labels, weights, out)
+        aarch64::gamma_gradient(preds, labels, weights, scale_pos_weight, out)
     );
-    scalar::gamma_gradient(preds, labels, weights, out, 0..preds.len());
+    scalar::gamma_gradient(
+        preds,
+        labels,
+        weights,
+        scale_pos_weight,
+        out,
+        0..preds.len(),
+    );
 }
 
 pub(crate) fn tweedie_gradient(

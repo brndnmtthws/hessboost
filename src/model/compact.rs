@@ -1787,7 +1787,7 @@ mod tests {
     use super::*;
     use crate::config::{BoosterKind, Dart, GrowPolicy, LinearTree, TrainingParams, TreeMethod};
     use crate::data::FeatureType;
-    use crate::objective::{Logistic, Multiclass, Objective, Quantiles};
+    use crate::objective::{Multiclass, Objective, Quantiles, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::training::{Trainer, train};
 
@@ -1861,7 +1861,7 @@ mod tests {
             (
                 base()
                     .tree_method(TreeMethod::Exact)
-                    .objective(Objective::BinaryLogistic(Logistic::default()))
+                    .objective(Objective::BinaryLogistic(RegLoss::default()))
                     .build()
                     .unwrap(),
                 &binary,
@@ -2167,7 +2167,7 @@ mod tests {
             w.write_bool(true); // complete
         }
         let meta = Meta {
-            objective: ModelObjective::trained_with(&Objective::SquaredError),
+            objective: ModelObjective::trained_with(&Objective::SquaredError(RegLoss::default())),
             max_delta_step: 0.0,
             num_class: 0,
             n_targets: 1,

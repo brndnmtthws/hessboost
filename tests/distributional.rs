@@ -9,7 +9,7 @@ use hessboost::objective::distributional::{
     Dist, DistFamily, DistGradient, DistSplitDirection, Distributional,
 };
 use hessboost::prelude::{
-    BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
+    BoostedModel, DMatrix, HessboostError, Objective, RegLoss, Trainer, TrainingParams, train,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
@@ -152,7 +152,9 @@ fn distributional_nll_beats_a_homoscedastic_baseline() {
         &dvalid,
     );
     let point = fit(
-        &params(Objective::SquaredError).build().unwrap(),
+        &params(Objective::SquaredError(RegLoss::default()))
+            .build()
+            .unwrap(),
         &dtrain,
         &dvalid,
     );
@@ -331,7 +333,14 @@ fn xgboost_formats_refuse_distributional_models() {
         Err(HessboostError::ModelFormat(_))
     ));
     // A document claiming a `dist:*` objective is refused on import too.
-    let point = train(&params(Objective::SquaredError).build().unwrap(), &d, 3).unwrap();
+    let point = train(
+        &params(Objective::SquaredError(RegLoss::default()))
+            .build()
+            .unwrap(),
+        &d,
+        3,
+    )
+    .unwrap();
     let doc = point
         .to_xgboost_json()
         .unwrap()
@@ -391,7 +400,9 @@ fn conformalized_distribution_intervals_cover_misspecified_models() {
     assert!((f64::from(conformal[0].upper) - (hi + cqr.correction())).abs() < 1e-4);
     // Only distributional models qualify.
     let point = train(
-        &params(Objective::SquaredError).build().unwrap(),
+        &params(Objective::SquaredError(RegLoss::default()))
+            .build()
+            .unwrap(),
         &dtrain,
         5,
     )
@@ -431,13 +442,20 @@ fn configuration_errors() {
     );
     // `nll` / `crps` score distributions: a point model's single output is
     // not a Normal's two parameters.
-    let p = params(Objective::SquaredError)
+    let p = params(Objective::SquaredError(RegLoss::default()))
         .eval_metric(EvalMetric::Crps(DistFamily::Normal))
         .build()
         .unwrap();
     assert!(Trainer::new(&p, &d, 1).eval(&d, "d").train().is_err());
     // Point models do not predict distributions.
-    let point = train(&params(Objective::SquaredError).build().unwrap(), &d, 1).unwrap();
+    let point = train(
+        &params(Objective::SquaredError(RegLoss::default()))
+            .build()
+            .unwrap(),
+        &d,
+        1,
+    )
+    .unwrap();
     assert!(point.predict_distribution(&d).is_err());
 }
 

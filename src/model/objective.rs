@@ -313,7 +313,7 @@ impl<T> Stored<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objective::{CustomLoss, GradPair};
+    use crate::objective::{CustomLoss, GradPair, RegLoss};
 
     /// A custom loss named like a built-in objective cannot be recorded
     /// (it would reload as that objective), and a stored built-in name
@@ -332,7 +332,10 @@ mod tests {
         assert_eq!((custom.name(), custom.built_in()), ("custom:mine", None));
         let defaults = StoredObjectiveParams::defaults_for("reg:linear");
         let stored = ModelObjective::from_stored("reg:linear", &defaults, 0).unwrap();
-        assert_eq!(stored.built_in(), Some(&Objective::SquaredError));
+        assert_eq!(
+            stored.built_in(),
+            Some(&Objective::SquaredError(RegLoss::default()))
+        );
         let unknown = ModelObjective::from_stored("rank:foo", &defaults, 0).unwrap();
         assert_eq!((unknown.name(), unknown.built_in()), ("rank:foo", None));
     }

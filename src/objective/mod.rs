@@ -7,7 +7,7 @@
 //! XGBoost's separation of `GetGradient` / `PredTransform`.
 //!
 //! A configuration names its objective with [`Objective`]: a built-in
-//! XGBoost objective with its parameters ([`Logistic`], [`Multiclass`],
+//! XGBoost objective with its parameters ([`RegLoss`], [`Multiclass`],
 //! [`PseudoHuber`], [`Quantiles`], [`Expectiles`], [`Tweedie`],
 //! [`LambdaRank`], [`Aft`], [`distributional::Distributional`]; each
 //! validated when constructed, several shared with the metrics that read
@@ -60,7 +60,7 @@ pub(crate) use count::{Gamma, Poisson, TweedieLoss};
 pub use custom::CustomLoss;
 pub(crate) use multiclass::Softmax;
 pub use params::{
-    Aft, AftDistribution, Expectiles, LambdaRank, Logistic, Multiclass, PseudoHuber, Quantiles,
+    Aft, AftDistribution, Expectiles, LambdaRank, Multiclass, PseudoHuber, Quantiles, RegLoss,
     Tweedie,
 };
 pub(crate) use quantile::{Expectile, Quantile};
@@ -717,7 +717,7 @@ mod tests {
         for objective in [
             Objective::Softprob(Multiclass::new(3).unwrap()),
             Objective::Poisson,
-            Objective::Gamma,
+            Objective::Gamma(RegLoss::default()),
             Objective::Tweedie(Tweedie::default()),
             Objective::Quantile(Quantiles::new([0.5]).unwrap()),
             Objective::Expectile(Expectiles::new([0.5]).unwrap()),
@@ -770,7 +770,7 @@ mod tests {
     fn chunked_gradients_match_whole_batch() {
         let c = GRADIENT_CHUNK_ROWS;
         let objectives: Vec<(Box<dyn Loss>, usize, Vec<usize>)> = vec![
-            (Box::new(SquaredError), 1, vec![2 * c + 4097]),
+            (Box::new(SquaredError::new(1.5)), 1, vec![2 * c + 4097]),
             (
                 Box::new(LogisticLoss::new(1.5)),
                 1,
@@ -781,7 +781,11 @@ mod tests {
                 1,
                 (1..=15).map(|r| 2 * c + r).collect(),
             ),
-            (Box::new(Gamma), 1, (1..=15).map(|r| 2 * c + r).collect()),
+            (
+                Box::new(Gamma::new(1.5)),
+                1,
+                (1..=15).map(|r| 2 * c + r).collect(),
+            ),
             (
                 Box::new(TweedieLoss::new(Tweedie::new(1.3).unwrap())),
                 1,

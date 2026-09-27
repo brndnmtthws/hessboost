@@ -47,7 +47,7 @@ fn main() -> Result<()> {
             / p.len() as f64
     });
     let builtin = TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .max_depth(3)
         .eta(0.2)
         .build()?;

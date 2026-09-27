@@ -103,7 +103,7 @@ fn main() -> Result<()> {
     }
 
     // Homoscedastic baseline: squared-error point model, one global sigma.
-    let point = fit(Objective::SquaredError)?;
+    let point = fit(Objective::SquaredError(RegLoss::default()))?;
     // One value per row.
     let fitted = point.predict(&dtrain)?.into_vec();
     let labels = dtrain.labels().unwrap_or_default();

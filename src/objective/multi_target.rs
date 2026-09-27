@@ -5,9 +5,10 @@
 //! label matrix `[n_rows, K]` and model one output per label column
 //! (`Targets(info) = labels.Shape(1)`). Every cell's gradient is the
 //! single-target formula on `(margin(i, j), label(i, j))`, scaled by the
-//! row's weight (`weight[idx / n_targets]`), and the intercept is estimated
-//! independently per column (`FitInterceptGlmLike`'s per-column weighted mean
-//! or `FitIntercept`'s per-target Newton stump). [`MultiTarget`] reproduces
+//! row's weight (`weight[idx / n_targets]`, times `scale_pos_weight` for a
+//! cell labeled exactly 1), and the intercept is estimated independently
+//! per column (`FitInterceptGlmLike`'s per-column weighted mean or
+//! `FitIntercept`'s per-target Newton stump). [`MultiTarget`] reproduces
 //! that on top of the single-target objective: the loss runs over all
 //! `n_rows * K` cells as one flat batch with the row weights broadcast per
 //! cell, and intercepts come from the objective's own estimator on each label
@@ -137,7 +138,7 @@ mod tests {
 
     fn objective(name: &str, n_targets: usize) -> Arc<dyn Loss> {
         let mut flat = vec![("objective", json!(name))];
-        if name == "binary:logistic" {
+        if matches!(name, "reg:squarederror" | "binary:logistic") {
             flat.push(("scale_pos_weight", json!(2.0)));
         }
         let params = TrainingParams::from_xgboost(flat).unwrap();
@@ -156,7 +157,8 @@ mod tests {
     /// Output `j` of the multi-target objective is exactly the single-target
     /// objective on label column `j` with the row weights: gradients bit for
     /// bit, and the intercept of each column (weighted mean, or the Newton
-    /// step `binary:logistic` takes under `scale_pos_weight`).
+    /// step `reg:squarederror` and `binary:logistic` take under
+    /// `scale_pos_weight`, which reweights the cells labeled 1).
     #[test]
     fn each_output_is_the_single_target_objective_on_its_column() {
         let (matrix, cols, weights) = columns();

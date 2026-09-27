@@ -5,7 +5,7 @@ use hessboost::config::{
     TrainingParams, TrainingParamsBuilder,
 };
 use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, honest_refit};
-use hessboost::objective::{LambdaRank, Logistic, Objective};
+use hessboost::objective::{LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
 
 mod common;
@@ -312,6 +312,9 @@ fn settings_that_break_the_linear_smoother_are_refused() {
         refused(builder().objective(Objective::SquaredLogError)),
         "objective"
     );
+    // `scale_pos_weight` reweights rows like the sample weights it refuses.
+    let reweighted = Objective::SquaredError(RegLoss::new(2.0).unwrap());
+    assert_eq!(refused(builder().objective(reweighted)), "objective");
     assert_eq!(refused(builder().alpha(1.0)), "alpha");
     assert_eq!(refused(builder().eta(1.5)), "eta");
     assert_eq!(refused(builder().num_parallel_tree(2)), "boulevard_dropout");
@@ -324,8 +327,8 @@ fn settings_that_break_the_linear_smoother_are_refused() {
     // Boulevard refuses in turn).
     let balanced = BalancedBagging::new(1.0, 0.2).unwrap();
     for objective in [
-        Objective::SquaredError,
-        Objective::BinaryLogistic(Logistic::default()),
+        Objective::SquaredError(RegLoss::default()),
+        Objective::BinaryLogistic(RegLoss::default()),
     ] {
         let bagged = builder()
             .subsample(1.0)

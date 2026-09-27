@@ -32,41 +32,28 @@ from typing import Self, TypeAlias
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from hessboost import _data, _hessboost
-from hessboost._core import _RECODE_HINT, Booster, DMatrix, _check_schema
-from hessboost._exceptions import HessboostError
+from hessboost import _hessboost
+from hessboost._booster import Booster
+from hessboost._matrix import _check_schema, _matrix_for
 
 __all__ = ["ConformalizedQuantile", "SplitConformal"]
 
 
 _Models: TypeAlias = tuple[tuple[Booster, str], ...]
-"""The models reading one matrix, each with its name in errors."""
+"""The models reading one matrix, each with its name in errors
+(``"the model's"``)."""
 
 
-def _matrix(
-    models: _Models, data: object, label: ArrayLike | None, *, calibration: bool
-) -> _hessboost.DMatrix:
-    """``data`` as a matrix every one of ``models`` reads, labelled by
-    ``label`` (a calibration matrix needs labels): other input converted
-    with its pandas categories re-coded to the models' (they agree wherever
-    both record them), and checked against each model, since a side without
-    recorded categories matches anything."""
-    if isinstance(data, DMatrix):
-        matrix = data
-    else:
-        if calibration and label is None:
-            raise HessboostError("calibration needs labels: pass label= or a labelled DMatrix")
-        categories: _data.Categories = {}
-        for model, _ in reversed(models):
-            categories.update(model._categories)
-        info = {} if label is None else _data.info(label=label)
-        matrix = DMatrix._coded(data, categories, np.nan, info)
-        label = None
-    for model, name in models:
-        _check_schema(model, matrix, "the data", f"{name}'s", hint=_RECODE_HINT)
-    if label is None:
-        return matrix._core
-    return matrix._core.with_info({**_data.info(label=label), "categorical": None})
+def _matrix(models: _Models, data: object, label: ArrayLike | None = None) -> _hessboost.DMatrix:
+    """``data`` as every one of ``models`` reads it, labelled by ``label``
+    (:func:`~hessboost._matrix._matrix_for`)."""
+    return _matrix_for(data, models, label=label)._core
+
+
+def _calibration(models: _Models, data: object, label: ArrayLike | None) -> _hessboost.DMatrix:
+    """As :func:`_matrix`, for labelled rows (other input than a
+    :class:`~hessboost.DMatrix` needs ``label``)."""
+    return _matrix_for(data, models, label=label, require_label=True)._core
 
 
 def _check_alpha(alpha: float) -> float:
@@ -102,10 +89,10 @@ class SplitConformal:
                 non-uniformly.
         """
         self = object.__new__(cls)
-        self._models = ((booster, "the model"),)
+        self._models = ((booster, "the model's"),)
         self._core = _hessboost.SplitConformal.calibrate(
             booster._model,
-            _matrix(self._models, data, label, calibration=True),
+            _calibration(self._models, data, label),
             _check_alpha(alpha),
         )
         return self
@@ -113,7 +100,7 @@ class SplitConformal:
     def predict_interval(self, data: object) -> NDArray[np.float32]:
         """``(rows, 2)`` ``[lower, upper]`` intervals for every row of
         ``data``."""
-        return self._core.predict_interval(_matrix(self._models, data, None, calibration=False))
+        return self._core.predict_interval(_matrix(self._models, data))
 
     @property
     def half_width(self) -> float:
@@ -167,7 +154,7 @@ class ConformalizedQuantile:
     ) -> Self:
         self = object.__new__(cls)
         self._models = models
-        self._core = build(_matrix(models, data, label, calibration=True))
+        self._core = build(_calibration(models, data, label))
         return self
 
     @classmethod
@@ -190,7 +177,7 @@ class ConformalizedQuantile:
         """
         _check_schema(lower, upper, "upper", "lower's")
         return cls._calibrate(
-            ((lower, "lower"), (upper, "upper")),
+            ((lower, "lower's"), (upper, "upper's")),
             data,
             label,
             lambda matrix: _hessboost.ConformalizedQuantile.calibrate(
@@ -212,7 +199,7 @@ class ConformalizedQuantile:
         e.g. ``reg:quantileerror`` with ``quantile_alpha=[alpha / 2, 1 -
         alpha / 2]``."""
         return cls._calibrate(
-            ((booster, "the model"),),
+            ((booster, "the model's"),),
             data,
             label,
             lambda matrix: _hessboost.ConformalizedQuantile.calibrate_outputs(
@@ -233,7 +220,7 @@ class ConformalizedQuantile:
         2`` quantiles, restoring finite-sample coverage whether or not the
         distribution is well specified."""
         return cls._calibrate(
-            ((booster, "the model"),),
+            ((booster, "the model's"),),
             data,
             label,
             lambda matrix: _hessboost.ConformalizedQuantile.calibrate_distribution(
@@ -245,7 +232,7 @@ class ConformalizedQuantile:
         """``(rows, 2)`` ``[lower, upper]`` intervals for every row of
         ``data``; a row whose adjusted bounds cross is returned as is (the
         empty set)."""
-        return self._core.predict_interval(_matrix(self._models, data, None, calibration=False))
+        return self._core.predict_interval(_matrix(self._models, data))
 
     @property
     def correction(self) -> float:

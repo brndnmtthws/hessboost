@@ -25,15 +25,15 @@ Submodules:
 from importlib.metadata import version as _version
 
 from hessboost import conformal, diffusion, ebm, folds, inference, online
-from hessboost._core import (
+from hessboost._booster import (
     Booster,
     Distributions,
-    DMatrix,
     ImportanceType,
     ModelFormat,
-    Uncertainty,
 )
+from hessboost._core import Uncertainty
 from hessboost._exceptions import HessboostError, ModelFormatError
+from hessboost._matrix import DMatrix
 from hessboost._training import (
     CustomMetric,
     EvalsResult,

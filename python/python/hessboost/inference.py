@@ -26,16 +26,17 @@ assumptions, and a table of validated regimes.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any, Generic, Protocol, Self, TypeAlias, TypeVar
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from hessboost import _hessboost
-from hessboost._core import Booster
+from hessboost._booster import Booster
 from hessboost._exceptions import HessboostError
-from hessboost.conformal import _check_alpha, _matrix
+from hessboost.conformal import _calibration, _check_alpha, _matrix
 from hessboost.ebm import TermShape
 
 __all__ = ["BoulevardInference", "BoulevardInfo", "EbmInference", "TermBands", "honest_refit"]
@@ -88,14 +89,102 @@ def _check_count(name: str, value: int | None) -> int | None:
     return int(value)
 
 
-class BoulevardInference:
+class _InferenceCore(Protocol):
+    """The native queries :class:`BoulevardInference` and
+    :class:`EbmInference` share."""
+
+    @property
+    def noise_variance(self) -> float: ...
+    def standard_errors(self, data: _hessboost.DMatrix) -> NDArray[np.float64]: ...
+    def confidence_intervals(
+        self, data: _hessboost.DMatrix, alpha: float
+    ) -> NDArray[np.float64]: ...
+    def prediction_intervals(
+        self, data: _hessboost.DMatrix, alpha: float
+    ) -> NDArray[np.float64]: ...
+
+
+_CoreT = TypeVar("_CoreT", bound=_InferenceCore)
+
+_NativeFit: TypeAlias = Callable[
+    [
+        _hessboost.Booster,
+        _hessboost.DMatrix,
+        _hessboost.DMatrix | None,
+        float | None,
+        int | None,
+        int,
+    ],
+    _CoreT,
+]
+"""A native inference class's ``fit``: model, training rows, holdout rows,
+noise variance, landmarks, seed."""
+
+
+class _IntervalQueries(Generic[_CoreT]):
+    """The fitting and the interval queries of an inference over one
+    model's training rows."""
+
+    _core: _CoreT
+    _models: tuple[tuple[Booster, str], ...]
+
+    @classmethod
+    def _fit(
+        cls,
+        native: _NativeFit[_CoreT],
+        booster: Booster,
+        data: object,
+        label: ArrayLike | None,
+        holdout: object | None,
+        holdout_label: ArrayLike | None,
+        noise_variance: float | None,
+        landmarks: int | None,
+        seed: int,
+    ) -> Self:
+        self = object.__new__(cls)
+        self._models = ((booster, "the model's"),)
+        train = _matrix(self._models, data, label)
+        held = None if holdout is None else _calibration(self._models, holdout, holdout_label)
+        seed = _check_count("seed", seed) or 0
+        self._core = native(
+            booster._model,
+            train,
+            held,
+            _check_noise(noise_variance),
+            _check_count("landmarks", landmarks),
+            seed,
+        )
+        return self
+
+    def _data(self, data: object) -> _hessboost.DMatrix:
+        return _matrix(self._models, data)
+
+    @property
+    def noise_variance(self) -> float:
+        """The noise variance estimate."""
+        return self._core.noise_variance
+
+    def standard_errors(self, data: object) -> NDArray[np.float64]:
+        """The standard error of the model's prediction at every row of
+        ``data``."""
+        return self._core.standard_errors(self._data(data))
+
+    def confidence_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
+        """``(rows, 2)`` ``[lower, upper]`` confidence intervals for the
+        model's ``f(x)`` at miscoverage ``alpha``."""
+        return self._core.confidence_intervals(self._data(data), _check_alpha(alpha))
+
+    def prediction_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
+        """``(rows, 2)`` prediction intervals for a new label (Gaussian
+        noise)."""
+        return self._core.prediction_intervals(self._data(data), _check_alpha(alpha))
+
+
+class BoulevardInference(_IntervalQueries[_hessboost.BoulevardInference]):
     """The leaf-kernel variance machinery of one Boulevard model: build one
     with :meth:`fit`, then query any rows."""
 
     __module__ = "hessboost.inference"
-
-    _core: _hessboost.BoulevardInference
-    _models: tuple[tuple[Booster, str], ...]
 
     def __init__(self) -> None:
         raise TypeError("use BoulevardInference.fit(...)")
@@ -129,47 +218,17 @@ class BoulevardInference:
                 ``noise_variance`` are given, or the exact solver gets too
                 many rows.
         """
-        self = object.__new__(cls)
-        self._models = ((booster, "the model"),)
-        train = _matrix(self._models, data, label, calibration=False)
-        held = (
-            None
-            if holdout is None
-            else _matrix(self._models, holdout, holdout_label, calibration=True)
-        )
-        seed = _check_count("seed", seed) or 0
-        self._core = _hessboost.BoulevardInference.fit(
-            booster._model,
-            train,
-            held,
-            _check_noise(noise_variance),
-            _check_count("landmarks", landmarks),
+        return cls._fit(
+            _hessboost.BoulevardInference.fit,
+            booster,
+            data,
+            label,
+            holdout,
+            holdout_label,
+            noise_variance,
+            landmarks,
             seed,
         )
-        return self
-
-    @property
-    def noise_variance(self) -> float:
-        """The noise variance estimate."""
-        return self._core.noise_variance
-
-    def _data(self, data: object) -> _hessboost.DMatrix:
-        return _matrix(self._models, data, None, calibration=False)
-
-    def standard_errors(self, data: object) -> NDArray[np.float64]:
-        """The standard error of the model's prediction at every row of
-        ``data``."""
-        return self._core.standard_errors(self._data(data))
-
-    def confidence_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
-        """``(rows, 2)`` ``[lower, upper]`` confidence intervals for ``f(x)``
-        at miscoverage ``alpha``."""
-        return self._core.confidence_intervals(self._data(data), _check_alpha(alpha))
-
-    def prediction_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
-        """``(rows, 2)`` prediction intervals for a new label (Gaussian
-        noise)."""
-        return self._core.prediction_intervals(self._data(data), _check_alpha(alpha))
 
     def reproduction_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
         """``(rows, 2)`` intervals for the prediction of the same procedure
@@ -202,7 +261,7 @@ class TermBands:
     """The shape plus ``z * standard error`` at every cell."""
 
 
-class EbmInference:
+class EbmInference(_IntervalQueries[_hessboost.EbmInference]):
     """Confidence bands on the shape functions of a Boulevard EBM
     (``{"booster": "ebm", "ebm_boulevard": True}``; Fang, Tan, Pipping &
     Hooker, AISTATS 2026). Conditional on the tree structures, so they
@@ -210,9 +269,6 @@ class EbmInference:
     ``hessboost::inference::EbmInference`` validation table)."""
 
     __module__ = "hessboost.inference"
-
-    _core: _hessboost.EbmInference
-    _models: tuple[tuple[Booster, str], ...]
 
     def __init__(self) -> None:
         raise TypeError("use EbmInference.fit(...)")
@@ -236,37 +292,22 @@ class EbmInference:
             HessboostError: ``booster`` is not a Boulevard EBM, or as
                 :meth:`BoulevardInference.fit`.
         """
-        self = object.__new__(cls)
-        self._models = ((booster, "the model"),)
-        train = _matrix(self._models, data, label, calibration=False)
-        held = (
-            None
-            if holdout is None
-            else _matrix(self._models, holdout, holdout_label, calibration=True)
-        )
-        seed = _check_count("seed", seed) or 0
-        self._core = _hessboost.EbmInference.fit(
-            booster._model,
-            train,
-            held,
-            _check_noise(noise_variance),
-            _check_count("landmarks", landmarks),
+        return cls._fit(
+            _hessboost.EbmInference.fit,
+            booster,
+            data,
+            label,
+            holdout,
+            holdout_label,
+            noise_variance,
+            landmarks,
             seed,
         )
-        return self
-
-    @property
-    def noise_variance(self) -> float:
-        """The noise variance estimate."""
-        return self._core.noise_variance
 
     @property
     def intercept_standard_error(self) -> float:
         """The standard error of the intercept."""
         return self._core.intercept_standard_error
-
-    def _data(self, data: object) -> _hessboost.DMatrix:
-        return _matrix(self._models, data, None, calibration=False)
 
     def term_bands(self, term: int, *, alpha: float) -> TermBands:
         """Bands on every cell of term ``term``'s shape function at
@@ -281,19 +322,6 @@ class EbmInference:
         index = _check_count("term", term) or 0
         return self._core.term_standard_errors(index, self._data(data))
 
-    def standard_errors(self, data: object) -> NDArray[np.float64]:
-        """The standard error of the whole prediction at every row."""
-        return self._core.standard_errors(self._data(data))
-
-    def confidence_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
-        """``(rows, 2)`` confidence intervals for the model's ``f(x)``."""
-        return self._core.confidence_intervals(self._data(data), _check_alpha(alpha))
-
-    def prediction_intervals(self, data: object, *, alpha: float) -> NDArray[np.float64]:
-        """``(rows, 2)`` prediction intervals for a new label (Gaussian
-        noise)."""
-        return self._core.prediction_intervals(self._data(data), _check_alpha(alpha))
-
     def __repr__(self) -> str:
         return f"EbmInference(noise_variance={self.noise_variance})"
 
@@ -307,7 +335,6 @@ def honest_refit(booster: Booster, data: object, label: ArrayLike | None = None)
         HessboostError: ``booster`` is not a Boulevard fit, or ``data`` is
             unlabelled or weighted.
     """
-    models = ((booster, "the model"),)
-    values = _matrix(models, data, label, calibration=True)
+    values = _calibration(((booster, "the model's"),), data, label)
     core = _hessboost.honest_refit(booster._model, values)
     return Booster._wrap(core, booster._feature_names, booster._feature_types, booster._categories)

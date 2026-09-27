@@ -9,7 +9,7 @@ import pytest
 from numpy.typing import NDArray
 
 import hessboost
-from conftest import classes, regression
+from conftest import classes, regression, rmse
 from hessboost import DMatrix, HessboostError
 from hessboost.online import OnlineModel, UpdateReport
 
@@ -63,8 +63,8 @@ def test_approximate_updates_report_and_stay_close_to_retraining() -> None:
     retrained = hessboost.train(PARAMS, online.data, ROUNDS)
     updated, reference = online.model.predict(test), retrained.predict(test)
     target = y[2000:2360]
-    rmse = [float(np.sqrt(np.mean((p - target) ** 2))) for p in (updated, reference)]
-    assert rmse[0] == pytest.approx(rmse[1], rel=0.05)
+    errors = [rmse(p, target) for p in (updated, reference)]
+    assert errors[0] == pytest.approx(errors[1], rel=0.05)
 
 
 def test_the_model_is_a_snapshot() -> None:

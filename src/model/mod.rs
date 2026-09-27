@@ -336,6 +336,7 @@
 //! [`save_xgboost_ubjson`]: BoostedModel::save_xgboost_ubjson
 //! [`load_xgboost_ubjson`]: BoostedModel::load_xgboost_ubjson
 
+mod categories;
 pub mod compact;
 mod lightgbm;
 pub(crate) mod native;

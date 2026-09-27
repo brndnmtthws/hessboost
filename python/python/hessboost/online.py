@@ -244,8 +244,11 @@ class OnlineModel:
             HessboostError: The model is being updated, or the change is
                 refused: out-of-range or repeated deletions, deleting every
                 row, additions without labels or with metadata or other
-                features, or updated data retraining refuses (such as labels
-                outside the objective's domain).
+                features, (with ``tolerance > 0``) added values beyond the
+                training data's bins, or updated data retraining refuses
+                (such as labels outside the objective's domain).
+            ModelFormatError: The update overflows ``float32`` (extreme
+                labels or margins), as training refuses such a model.
             KeyboardInterrupt: The update was interrupted.
         """
         matrix = None

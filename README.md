@@ -183,8 +183,9 @@ Beyond XGBoost (opt-in, none changes default training):
 - Approximate in-place updates (`training::online`,
   `OnlineParams::approximate`) stay close to retraining without matching it,
   and pay off for small changes (1.3–4.8x faster than retraining for 0.1–1%
-  of the rows in its benchmarks; slower beyond a few percent). Unlearning is
-  exact only in the exact mode (`OnlineParams::exact`; Python
+  of the rows in its benchmarks; slower beyond a few percent). They keep the
+  training bins, so they refuse added values beyond the training range.
+  Unlearning is exact only in the exact mode (`OnlineParams::exact`; Python
   `tolerance=0`), which costs a retrain.
 - Randomized training (sampling, forests, DART) matches XGBoost's quality,
   not its trees: the random streams differ.

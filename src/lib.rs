@@ -1,8 +1,11 @@
 //! # hessboost
 //!
-//! Gradient boosting in Rust. The only C dependency is zstd (native model
-//! files); the opt-in `metal` feature adds Apple's Metal framework for GPU
-//! prediction and bit-identical GPU histograms on macOS.
+//! Fast, deterministic gradient boosting in Rust (with Python bindings).
+//! hessboost provides multi-core tree building with runtime-detected NEON and AVX2
+//! SIMD, strict parameter validation, reproducible models on any thread count, and
+//! stable model storage. It supports modern extensions like conformal prediction,
+//! explainable boosting machines (EBMs), distributional modeling, and tree-based
+//! diffusion, alongside bidirectional XGBoost JSON/UBJSON model interchange.
 //!
 //! ## Quick start
 //!

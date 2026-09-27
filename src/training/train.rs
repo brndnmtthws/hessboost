@@ -2211,9 +2211,9 @@ fn grow_sampled_tree(
     {
         let lambda = linear_tree.lambda();
         if leaf_rows.is_empty() {
-            crate::tree::linear::fit_linear_leaves(&mut tree, dtrain, gk, rows, lambda);
+            crate::tree::linear_fit::fit_linear_leaves(&mut tree, dtrain, gk, rows, lambda);
         } else {
-            crate::tree::linear::fit_captured_linear_leaves(
+            crate::tree::linear_fit::fit_captured_linear_leaves(
                 &mut tree, dtrain, gk, &leaf_rows, lambda,
             );
         }
@@ -2710,7 +2710,7 @@ mod tests {
             .map(|&v| GradPair::new(-(2.0 * v.max(0.0) + 1.0), 1.0))
             .collect();
         let rows: Vec<u32> = (0..n as u32).collect();
-        crate::tree::linear::fit_linear_leaves(&mut linear, &data, &gpair, &rows, 0.5);
+        crate::tree::linear_fit::fit_linear_leaves(&mut linear, &data, &gpair, &rows, 0.5);
         assert!(linear.linear_leaves().is_some());
         for tree in [&scalar, &linear] {
             let output = TreeOutput::Scalar(1);

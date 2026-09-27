@@ -9,11 +9,13 @@
 //! halves histogram construction cost.
 
 pub(crate) mod quantized;
+mod walk;
 
-use crate::data::ghist::{Bins, GHistIndex};
+use crate::data::ghist::GHistIndex;
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;
 use rayon::prelude::*;
+use walk::{Bucket, RowValue, SweepRows, accumulate, by_features, contiguous_range};
 
 /// A gradient histogram: one [`GradStats`] bucket per global bin.
 pub type Histogram = Vec<GradStats>;
@@ -132,53 +134,15 @@ impl HistogramBackend for CpuBackend {
             return;
         }
 
-        // A contiguous row range with a column-major copy is split by feature
-        // instead of by rows: each task streams its features' columns over
-        // every row straight into the features' slices of `out`. Every bin has
-        // one writer that adds its rows in ascending order, so there are no
-        // partial histograms to allocate or reduce and the result is identical
-        // to the sequential sweep. Tasks take as few features as keep every
-        // worker busy (at most four), swept together so each pass reads the
-        // gradients once for all of them.
-        if let Some(range) = range {
-            let n_rows = ghist.n_rows();
-            let per_task = ghist.n_cols().div_ceil(threads).clamp(1, 4);
-            let mut slices = feature_slices(ghist, out, 1);
-            slices
-                .par_chunks_mut(per_task)
-                .enumerate()
-                .for_each(|(task, features)| {
-                    let f = task * per_task;
-                    match columns {
-                        Bins::U16(c) => {
-                            accumulate_feature_group(c, n_rows, f, features, &range, gpair);
-                        }
-                        Bins::U32(c) => {
-                            accumulate_feature_group(c, n_rows, f, features, &range, gpair);
-                        }
-                    }
-                });
-            return;
-        }
-
-        // Any other row subset of a small enough column-major index is
-        // gathered the same way, a group of features per task: still one
-        // writer per bin in ascending row order, with no partial histograms
-        // to allocate and reduce. Every group re-reads the gradients, so this
-        // pays only while they stay in a core's cache.
-        let n_rows = ghist.n_rows();
-        let per_task = ghist.n_cols().div_ceil(threads).clamp(1, 4);
-        let mut slices = feature_slices(ghist, out, 1);
-        slices
-            .par_chunks_mut(per_task)
-            .enumerate()
-            .for_each(|(task, features)| {
-                let f = task * per_task;
-                match columns {
-                    Bins::U16(c) => gather_feature_group(c, n_rows, f, features, rows, gpair),
-                    Bins::U32(c) => gather_feature_group(c, n_rows, f, features, rows, gpair),
-                }
-            });
+        // A contiguous row range with a column-major copy is split by
+        // feature. Any other row subset of a small enough column-major index
+        // is gathered the same way: every feature group re-reads the
+        // gradients, so this pays only while they stay in a core's cache.
+        let rows = match range {
+            Some(range) => SweepRows::Range(range),
+            None => SweepRows::Subset(rows),
+        };
+        by_features(ghist, &columns, &rows, gpair, out, threads);
     }
 }
 
@@ -242,65 +206,6 @@ fn accumulate_blocks(
     }
 }
 
-/// [`accumulate_feature_group`] over an ascending subset `rows` instead of a
-/// contiguous range.
-#[inline(always)]
-fn gather_feature_group<B: BinIndex>(
-    columns: &[B],
-    n_rows: usize,
-    f: usize,
-    features: &mut [(usize, &mut [GradStats])],
-    rows: &[u32],
-    gpair: &[GradPair],
-) {
-    let column = |f: usize| &columns[f * n_rows..][..n_rows];
-    for (_, slice) in features.iter_mut() {
-        slice.fill(GradStats::default());
-    }
-    match features {
-        [a] => gather_slices([column(f)], [a], rows, gpair),
-        [a, b] => gather_slices([column(f), column(f + 1)], [a, b], rows, gpair),
-        [a, b, c] => gather_slices(
-            [column(f), column(f + 1), column(f + 2)],
-            [a, b, c],
-            rows,
-            gpair,
-        ),
-        [a, b, c, d] => gather_slices(
-            [column(f), column(f + 1), column(f + 2), column(f + 3)],
-            [a, b, c, d],
-            rows,
-            gpair,
-        ),
-        _ => unreachable!("callers pass one to four features"),
-    }
-}
-
-/// [`sweep_slices`] over the rows `rows` of full-length `columns` and
-/// `gpair`.
-#[inline(always)]
-fn gather_slices<const K: usize, B: BinIndex>(
-    columns: [&[B]; K],
-    slices: [&mut (usize, &mut [GradStats]); K],
-    rows: &[u32],
-    gpair: &[GradPair],
-) {
-    let mut slices = slices.map(|(first, slice)| (*first, &mut **slice));
-    for &r in rows {
-        let r = r as usize;
-        let g = GradStats::from_pair(gpair[r]);
-        for (column, (first, slice)) in columns.iter().zip(&mut slices) {
-            slice[column[r].index() - *first].add(g);
-        }
-    }
-}
-
-/// Rows to run ahead of the accumulation loop when prefetching. Each row's bins
-/// and gradient are fetched into L1 before the loop needs them. Subsets deep in
-/// the tree are too sparse for hardware stride prediction.
-const PREFETCH_ROWS: usize = 8;
-const CACHE_LINE: usize = 64;
-
 /// Bin-index storage widths the accumulation and partition loops specialize on.
 pub(crate) trait BinIndex: Copy + Send + Sync {
     fn index(self) -> usize;
@@ -320,332 +225,17 @@ impl BinIndex for u32 {
     }
 }
 
-/// Sequential accumulation of `rows` into `out` (added, not reset). Specialized
-/// on the bin-index width so the inner loop reads the narrowest integers.
-#[inline]
-fn accumulate(ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-    match ghist.bins() {
-        Bins::U16(bins) => accumulate_bins(ghist, bins, rows, gpair, out),
-        Bins::U32(bins) => accumulate_bins(ghist, bins, rows, gpair, out),
+impl Bucket for GradStats {
+    #[inline(always)]
+    fn push(&mut self, value: GradStats) {
+        self.add(value);
     }
 }
 
-/// Prefetch the `len` bins of one row starting at `start`, a cache line at a
-/// time.
-#[inline(always)]
-pub(crate) fn prefetch_bins<B>(bins: &[B], start: usize, len: usize) {
-    for offset in (0..len).step_by(CACHE_LINE / std::mem::size_of::<B>()) {
-        if let Some(bin) = bins.get(start + offset) {
-            crate::simd::prefetch_read(bin);
-        }
-    }
-}
-
-/// Feature blocks `[f0, f1)` of a dense index with `stride` features whose
-/// bin ranges each span at most `block_bins` (a single feature may exceed it).
-pub(crate) fn feature_blocks(
-    ghist: &GHistIndex,
-    stride: usize,
-    block_bins: usize,
-) -> Vec<(usize, usize)> {
-    let cuts = ghist.cuts();
-    let mut blocks = Vec::new();
-    let mut block_start = 0;
-    for f in 1..=stride {
-        let span = cuts.feature_bins(f - 1).1 - cuts.feature_bins(block_start).0;
-        if span > block_bins && f - 1 > block_start {
-            blocks.push((block_start, f - 1));
-            block_start = f - 1;
-        }
-    }
-    blocks.push((block_start, stride));
-    blocks
-}
-
-#[inline(always)]
-fn accumulate_bins<B: BinIndex>(
-    ghist: &GHistIndex,
-    bins: &[B],
-    rows: &[u32],
-    gpair: &[GradPair],
-    out: &mut [GradStats],
-) {
-    // Establishes the bound used by `add_row`: with `out` covering every bin,
-    // the `GHistIndex` invariant (all stored bins < total_bins) makes every
-    // histogram index in range.
-    assert_eq!(
-        out.len(),
-        ghist.total_bins(),
-        "histogram length must equal the binned index's bin count"
-    );
-    // A row holds at most one bin per feature (dense rows one each, and
-    // `DMatrix` refuses duplicate CSR columns), from disjoint ranges, so its
-    // bins are distinct: four histogram entries are loaded before any is
-    // stored, which lets the loads overlap. Each bin still receives its rows
-    // in order.
-    let add_row = |row_bins: &[B], gp: GradPair, out: &mut [GradStats]| {
-        let g = GradStats::from_pair(gp);
-        let base = out.as_mut_ptr();
-        let (quads, rest) = row_bins.as_chunks::<4>();
-        for &quad in quads {
-            let [a, b, c, d] = quad.map(BinIndex::index);
-            // SAFETY: every bin is `< ghist.total_bins() == out.len()` by the
-            // index invariant and the assertion above, and the four bins are
-            // distinct (different features of one row), so the reads and
-            // writes are in bounds and never overlap.
-            unsafe {
-                let (ha, hb, hc, hd) = (*base.add(a), *base.add(b), *base.add(c), *base.add(d));
-                let add = |mut h: GradStats| {
-                    h.add(g);
-                    h
-                };
-                *base.add(a) = add(ha);
-                *base.add(b) = add(hb);
-                *base.add(c) = add(hc);
-                *base.add(d) = add(hd);
-            }
-        }
-        for &bin in rest {
-            // SAFETY: as above.
-            unsafe { &mut *base.add(bin.index()) }.add(g);
-        }
-    };
-
-    // A contiguous row range (the root, or a root chunk, without row
-    // sampling) sweeps the column-major copy one feature at a time: the bins
-    // stream sequentially and each feature's histogram slice stays in L1.
-    // Every bin still receives its rows in ascending order, so the sums are
-    // identical to the row sweep.
-    if let Some(columns) = ghist.column_bins()
-        && let Some(range) = contiguous_range(rows)
-    {
-        let n_rows = ghist.n_rows();
-        match columns {
-            Bins::U16(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
-            Bins::U32(columns) => accumulate_columns(columns, n_rows, range, gpair, out),
-        }
-        return;
-    }
-    if let Some(stride) = ghist.dense_stride() {
-        accumulate_dense(ghist, bins, stride, rows, gpair, out, add_row);
-    } else {
-        let rp = ghist.row_ptr();
-        for (i, &r) in rows.iter().enumerate() {
-            if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
-                let ahead = ahead as usize;
-                if let (Some(&start), Some(&end)) = (rp.get(ahead), rp.get(ahead + 1)) {
-                    prefetch_bins(bins, start, end - start);
-                }
-                if let Some(gp) = gpair.get(ahead) {
-                    crate::simd::prefetch_read(gp);
-                }
-            }
-            let ri = r as usize;
-            add_row(&bins[rp[ri]..rp[ri + 1]], gpair[ri], out);
-        }
-    }
-}
-
-/// `Some(first..end)` when `rows` is exactly the ascending run
-/// `first, first + 1, ..., end - 1` (checked element by element, so unsorted
-/// or repeated indices never take the column path).
-#[inline]
-fn contiguous_range(rows: &[u32]) -> Option<std::ops::Range<usize>> {
-    let first = *rows.first()? as usize;
-    let end = first.checked_add(rows.len())?;
-    let contiguous = rows
-        .iter()
-        .enumerate()
-        .all(|(i, &row)| row as usize == first + i);
-    contiguous.then_some(first..end)
-}
-
-/// Column-wise accumulation of the rows in `range` over every feature, four
-/// features per pass so each pass reads and widens the gradients once for
-/// all of them. `columns` is the column-major bin copy (`n_rows` entries per
-/// feature). Each bin still receives its rows in ascending order.
-#[inline(always)]
-fn accumulate_columns<B: BinIndex>(
-    columns: &[B],
-    n_rows: usize,
-    range: std::ops::Range<usize>,
-    gpair: &[GradPair],
-    out: &mut [GradStats],
-) {
-    fn column<'a, B>(
-        group: &'a [B],
-        k: usize,
-        n_rows: usize,
-        range: &std::ops::Range<usize>,
-    ) -> &'a [B] {
-        &group[k * n_rows..][..n_rows][range.clone()]
-    }
-    let gpair = &gpair[range.clone()];
-    let mut quads = columns.chunks_exact(4 * n_rows);
-    for quad in &mut quads {
-        let c = |k| column(quad, k, n_rows, &range);
-        sweep_columns([c(0), c(1), c(2), c(3)], gpair, out);
-    }
-    let rest = quads.remainder();
-    let c = |k| column(rest, k, n_rows, &range);
-    match rest.len() / n_rows {
-        3 => sweep_columns([c(0), c(1), c(2)], gpair, out),
-        2 => sweep_columns([c(0), c(1)], gpair, out),
-        1 => sweep_columns([c(0)], gpair, out),
-        _ => {}
-    }
-}
-
-/// Add each row's gradient to its bin in each of the `K` feature columns
-/// `columns` (bins are global histogram indices, rows aligned with `gpair`).
-/// The `K` bins of a row belong to different features, so they are distinct:
-/// all are loaded before any is stored, which lets the loads overlap.
-#[inline(always)]
-fn sweep_columns<const K: usize, B: BinIndex>(
-    columns: [&[B]; K],
-    gpair: &[GradPair],
-    out: &mut [GradStats],
-) {
-    let n = gpair.len();
-    let columns = columns.map(|c| &c[..n]);
-    let base = out.as_mut_ptr();
-    for (r, gp) in gpair.iter().enumerate() {
-        let g = GradStats::from_pair(*gp);
-        // SAFETY: `r < n` and every column holds `n` entries.
-        let bins = columns.map(|c| unsafe { c.get_unchecked(r) }.index());
-        // SAFETY: every bin is `< ghist.total_bins() == out.len()` by the
-        // index invariant and the caller's assertion, and the `K` bins are
-        // distinct (different features of one row), so the reads and writes
-        // are in bounds and never overlap.
-        unsafe {
-            let mut stats = bins.map(|b| *base.add(b));
-            for s in &mut stats {
-                s.add(g);
-            }
-            for (&b, s) in bins.iter().zip(stats) {
-                *base.add(b) = s;
-            }
-        }
-    }
-}
-
-/// Column-wise accumulation of the rows in `range` for the (up to four)
-/// consecutive features `f..` whose histogram slices `features` holds
-/// (`features[k]` is feature `f + k`'s first global bin and its slice,
-/// overwritten), in one pass that reads each gradient once. Bins in a column
-/// are global indices, so each slice is indexed relative to its first bin;
-/// the binned-index invariant keeps every bin of a feature's column in its
-/// range, and the slice index bounds check catches any violation. Every
-/// bin receives its rows in ascending order, as in a one-feature sweep.
-#[inline(always)]
-fn accumulate_feature_group<B: BinIndex>(
-    columns: &[B],
-    n_rows: usize,
-    f: usize,
-    features: &mut [(usize, &mut [GradStats])],
-    range: &std::ops::Range<usize>,
-    gpair: &[GradPair],
-) {
-    let column = |f: usize| &columns[f * n_rows..][..n_rows][range.clone()];
-    let gpair = &gpair[range.clone()];
-    for (_, slice) in features.iter_mut() {
-        slice.fill(GradStats::default());
-    }
-    match features {
-        [a] => sweep_slices([column(f)], [a], gpair),
-        [a, b] => sweep_slices([column(f), column(f + 1)], [a, b], gpair),
-        [a, b, c] => sweep_slices([column(f), column(f + 1), column(f + 2)], [a, b, c], gpair),
-        [a, b, c, d] => sweep_slices(
-            [column(f), column(f + 1), column(f + 2), column(f + 3)],
-            [a, b, c, d],
-            gpair,
-        ),
-        _ => unreachable!("callers pass one to four features"),
-    }
-}
-
-/// Add each row's gradient to its bin in each of the `K` feature columns,
-/// into that feature's `(first bin, slice)` (rows aligned with `gpair`).
-#[inline(always)]
-fn sweep_slices<const K: usize, B: BinIndex>(
-    columns: [&[B]; K],
-    slices: [&mut (usize, &mut [GradStats]); K],
-    gpair: &[GradPair],
-) {
-    let n = gpair.len();
-    let columns = columns.map(|c| &c[..n]);
-    let mut slices = slices.map(|(first, slice)| (*first, &mut **slice));
-    for (r, gp) in gpair.iter().enumerate() {
-        let g = GradStats::from_pair(*gp);
-        for (column, (first, slice)) in columns.iter().zip(&mut slices) {
-            slice[column[r].index() - *first].add(g);
-        }
-    }
-}
-
-/// Rows per tile of the dense accumulation. A tile's row lines stay in cache while
-/// its feature blocks are swept, so re-reading them per block is cheap.
-const TILE_ROWS: usize = 1024;
-/// Histogram bins a feature block may span, sized so the block's histogram
-/// slice (16 bytes per bin) stays resident in a 64 KiB L1 while a tile is
-/// accumulated into it.
-const BLOCK_BINS: usize = 4096;
-
-/// Dense accumulation tiled by rows and feature blocks. Every bin still
-/// receives its rows in ascending order, so the result is identical to a
-/// straight row sweep. The tiling only changes which histogram bins are hot.
-#[inline(always)]
-fn accumulate_dense<B: BinIndex>(
-    ghist: &GHistIndex,
-    bins: &[B],
-    stride: usize,
-    rows: &[u32],
-    gpair: &[GradPair],
-    out: &mut [GradStats],
-    add_row: impl Fn(&[B], GradPair, &mut [GradStats]),
-) {
-    let blocks = feature_blocks(ghist, stride, BLOCK_BINS);
-    // A row of at most a cache line spans one or two lines: its first and
-    // last bins cover both, without a loop. Longer rows take every line.
-    let short_rows = stride * std::mem::size_of::<B>() <= CACHE_LINE;
-    let prefetch = |rows: &[u32], i: usize| {
-        if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
-            let ahead = ahead as usize;
-            if short_rows {
-                if let Some(row) = bins.get(ahead * stride..(ahead + 1) * stride)
-                    && let (Some(first), Some(last)) = (row.first(), row.last())
-                {
-                    crate::simd::prefetch_read(first);
-                    crate::simd::prefetch_read(last);
-                }
-            } else {
-                prefetch_bins(bins, ahead * stride, stride);
-            }
-            if let Some(gp) = gpair.get(ahead) {
-                crate::simd::prefetch_read(gp);
-            }
-        }
-    };
-    if blocks.len() == 1 {
-        // Dense rows sit at `r * stride`: no row-pointer load, and the address
-        // of a future row is known without touching memory.
-        for (i, &r) in rows.iter().enumerate() {
-            prefetch(rows, i);
-            let start = r as usize * stride;
-            add_row(&bins[start..start + stride], gpair[r as usize], out);
-        }
-        return;
-    }
-    for tile in rows.chunks(TILE_ROWS) {
-        for (block, &(f0, f1)) in blocks.iter().enumerate() {
-            for (i, &r) in tile.iter().enumerate() {
-                if block == 0 {
-                    prefetch(tile, i);
-                }
-                let start = r as usize * stride;
-                add_row(&bins[start + f0..start + f1], gpair[r as usize], out);
-            }
-        }
+impl RowValue<GradStats> for GradPair {
+    #[inline(always)]
+    fn value(self) -> GradStats {
+        GradStats::from_pair(self)
     }
 }
 
@@ -653,6 +243,7 @@ fn accumulate_dense<B: BinIndex>(
 mod tests {
     use super::*;
     use crate::data::DMatrix;
+    use crate::data::ghist::Bins;
     use crate::data::quantile::HistCuts;
 
     #[test]

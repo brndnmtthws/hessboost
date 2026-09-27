@@ -88,7 +88,7 @@ pub trait Metric: Send + Sync {
     /// groups to [`Metric::eval_grouped`]; metrics that read other metadata
     /// (label bounds) override it.
     ///
-    /// For a label matrix (`info.n_targets > 1`) the default is XGBoost's
+    /// For a label matrix (`info.n_targets() > 1`) the default is XGBoost's
     /// elementwise reduction: `preds` and `labels` are both
     /// `[row][target]`, every cell counts as one instance, and each row's
     /// weight is repeated for its cells, so the metric averages over all
@@ -99,13 +99,13 @@ pub trait Metric: Send + Sync {
         if info.check_layout().is_err() {
             return f64::NAN;
         }
-        if info.n_targets > 1 {
+        if info.n_targets() > 1 {
             let Ok(cell_weights) = info.cell_weights() else {
                 return f64::NAN;
             };
-            return self.eval_grouped(preds, info.labels, cell_weights.as_deref(), None);
+            return self.eval_grouped(preds, info.label_values(), cell_weights.as_deref(), None);
         }
-        self.eval_grouped(preds, info.labels, info.weights, info.group)
+        self.eval_grouped(preds, info.label_values(), info.weights, info.group)
     }
 
     /// Whether [`Metric::eval_info`] is defined on a label matrix
@@ -135,7 +135,7 @@ pub trait Metric: Send + Sync {
     /// [`CustomMetric`] hook). Training refuses an evaluation set on which a
     /// metric's width differs from the model's output count.
     fn prediction_width(&self, info: &MetaInfo) -> Option<usize> {
-        Some(info.n_targets)
+        Some(info.n_targets())
     }
 }
 
@@ -168,14 +168,14 @@ fn cells_consistent(preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_
 /// reduction, with each row's weight read for its `n_targets` cells in
 /// place instead of repeated into a cell-weight buffer.
 fn eval_cells_info(metric: &impl CellMetric, preds: &[f32], info: &MetaInfo) -> f64 {
-    let stride = info.n_targets;
+    let stride = info.n_targets();
     if info.check_layout().is_err()
-        || (stride > 1 && info.n_rows.checked_mul(stride) != Some(info.labels.len()))
+        || (stride > 1 && info.n_rows.checked_mul(stride) != Some(info.label_values().len()))
     {
         return f64::NAN;
     }
     let weights = info.weights.map(|w| RowWeights::new(w, stride));
-    metric.eval_cells(preds, info.labels, weights)
+    metric.eval_cells(preds, info.label_values(), weights)
 }
 
 /// Normalize a metric total, returning zero for an empty or nonpositive weight sum.
@@ -187,7 +187,7 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
 /// [`Metric::validate_info`]'s default: the metric named `name` reads
 /// ordinary labels, which a dataset with rows must carry.
 fn require_labels(name: &str, info: &MetaInfo) -> Result<()> {
-    if info.n_rows > 0 && info.labels.is_empty() {
+    if info.n_rows > 0 && info.label_values().is_empty() {
         return Err(HessboostError::invalid_param(
             "eval_metric",
             format!("metric `{name}` needs labels, but dataset has none"),
@@ -262,7 +262,7 @@ macro_rules! simple_metric {
             }
             fn validate_info(&self, info: &MetaInfo) -> Result<()> {
                 require_labels(self.name(), info)?;
-                match first_non_class(info.labels, self.$field) {
+                match first_non_class(info.label_values(), self.$field) {
                     None => Ok(()),
                     Some(label) => Err(HessboostError::invalid_param(
                         "eval_metric",
@@ -550,14 +550,17 @@ mod tests {
             let w = Some(weights.as_slice());
             let matrix = MetaInfo {
                 n_rows: n,
-                n_targets: 3,
+                labels: Some(crate::data::Labels::new(
+                    &labels,
+                    std::num::NonZeroUsize::new(3).unwrap(),
+                )),
                 ..MetaInfo::new(&labels, Some(&weights), None)
             };
             let bounds = MetaInfo {
                 n_rows: n,
-                label_lower_bound: Some(&lower),
-                label_upper_bound: Some(&upper),
-                ..MetaInfo::new(&[], Some(&weights), None)
+                bounds: Some(crate::data::LabelBounds::new(&lower, &upper)),
+                weights: Some(&weights),
+                ..MetaInfo::unlabeled(0)
             };
             let g = Some(&group);
             [
@@ -722,7 +725,10 @@ mod tests {
         let weights = [1.0f32, 3.0];
         let info = MetaInfo {
             n_rows: 2,
-            n_targets: 3,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )),
             ..MetaInfo::new(&labels, Some(&weights), None)
         };
         // Row 0 squared errors 1, 0, 4 (weight 1); row 1: 0, 1, 0 (weight 3).
@@ -754,7 +760,10 @@ mod tests {
         let weights: Vec<f32> = (0..n_rows).map(|i| 0.5 + (i % 13) as f32 * 0.125).collect();
         let info = MetaInfo {
             n_rows,
-            n_targets,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::new(n_targets).unwrap(),
+            )),
             ..MetaInfo::new(&labels, Some(&weights), None)
         };
         let cell_weights = info.cell_weights().unwrap().unwrap();
@@ -787,7 +796,10 @@ mod tests {
         let preds = [0.9f32, 0.1, 0.8, 0.3, 0.2, 0.7, 0.1, 0.9];
         let info = MetaInfo {
             n_rows: 4,
-            n_targets: 2,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
             ..MetaInfo::new(&labels, None, None)
         };
         assert_relative_eq!(Auc.eval_info(&preds, &info), 0.5, epsilon = 1e-12);
@@ -819,7 +831,10 @@ mod tests {
         let weights: Vec<f32> = (0..n_rows).map(|i| 0.25 + (i % 7) as f32 * 0.5).collect();
         let info = MetaInfo {
             n_rows,
-            n_targets: k,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::new(k).unwrap(),
+            )),
             ..MetaInfo::new(&labels, Some(&weights), None)
         };
         let col = |v: &[f32], t: usize| v.iter().skip(t).step_by(k).copied().collect::<Vec<_>>();
@@ -987,26 +1002,32 @@ mod tests {
         let weights = [1.0f32, 1.0];
         let info = MetaInfo {
             n_rows: 2,
-            n_targets: 2,
+            labels: Some(crate::data::Labels::new(
+                &labels,
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
             ..MetaInfo::new(&labels, Some(&weights), None)
         };
         assert_eq!(Rmse.eval_info(&labels, &info), 0.0);
-        for n_targets in [usize::MAX, 0, 3] {
-            let bad = MetaInfo { n_targets, ..info };
+        for n_targets in [usize::MAX, 1, 3] {
+            let k = std::num::NonZeroUsize::new(n_targets).unwrap();
+            let bad = MetaInfo {
+                labels: Some(crate::data::Labels::new(&labels, k)),
+                ..info
+            };
             assert!(Rmse.eval_info(&labels, &bad).is_nan(), "{n_targets}");
         }
-        let mut unlabeled = MetaInfo::new(&[], Some(&[1.0]), None);
-        unlabeled.n_rows = 1;
-        for n_targets in [2, usize::MAX] {
-            unlabeled.n_targets = n_targets;
-            assert!(Rmse.eval_info(&[], &unlabeled).is_nan(), "{n_targets}");
-        }
+        let unlabeled = MetaInfo {
+            weights: Some(&[1.0]),
+            ..MetaInfo::unlabeled(1)
+        };
+        assert!(Rmse.eval_info(&[], &unlabeled).is_nan());
         // Bounds-only metadata (no labels) stays valid where it is read.
         let bounds = [1.0f32];
         let aft = MetaInfo {
-            label_lower_bound: Some(&bounds),
-            label_upper_bound: Some(&bounds),
-            ..MetaInfo::new(&[], Some(&[1.0]), None)
+            bounds: Some(crate::data::LabelBounds::new(&bounds, &bounds)),
+            weights: Some(&[1.0]),
+            ..MetaInfo::unlabeled(0)
         };
         let aft = MetaInfo { n_rows: 1, ..aft };
         let nloglik = AftNLogLik::new(crate::objective::AftDistribution::Normal, 1.0);

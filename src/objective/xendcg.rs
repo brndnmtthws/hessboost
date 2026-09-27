@@ -218,7 +218,14 @@ impl Loss for Xendcg {
         out: &mut [GradPair],
         iteration: usize,
     ) {
-        self.query_gradients(preds, info.labels, info.weights, info.group, out, iteration);
+        self.query_gradients(
+            preds,
+            info.label_values(),
+            info.weights,
+            info.group,
+            out,
+            iteration,
+        );
     }
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {

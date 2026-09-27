@@ -171,7 +171,7 @@ impl Loss for DistLoss {
     /// Maximum-likelihood fit of the marginal label distribution.
     fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
         self.family
-            .mle_margins(info.labels, info.weights)
+            .mle_margins(info.label_values(), info.weights)
             .into_iter()
             .map(|m| m as f32)
             .collect()

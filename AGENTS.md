@@ -300,7 +300,12 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `MetaInfo` hooks (`Loss::gradient_info`, `base_margins_info`,
   `eval_transform`, `validate_info`, `requires_labels`;
   `Metric::eval_info`, `validate_info`, `prediction_width`,
-  `supports_label_matrix`). `base_margins_info` is the only intercept hook;
+  `supports_label_matrix`). `MetaInfo` states presence explicitly:
+  `labels: Option<Labels>` (values plus `NonZeroUsize` targets; `n_targets()`
+  is 1 without labels) and `bounds: Option<LabelBounds>` (lower and upper
+  together). Losses and metrics that read bounds fall back to the labels
+  only when `bounds` is `None`; `label_values()` (empty without labels) is
+  what the slice hooks receive. `base_margins_info` is the only intercept hook;
   `probs_to_margins` is the only link hook, applied to user, imported, and
   Newton-default `base_score`; a user `base_score` is first checked by
   `validate_base_score` of the loss being trained (never by the configured

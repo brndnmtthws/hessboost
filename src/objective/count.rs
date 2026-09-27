@@ -26,7 +26,7 @@ fn poisson_deviance(margin: f32, label: f32) -> f64 {
 /// The log-link intercept of XGBoost's `FitInterceptGlmLike`: the
 /// (weighted) label mean through the link.
 fn log_label_mean(info: &MetaInfo) -> Vec<f32> {
-    let mut margin = [weighted_label_mean(info.labels, info.weights)];
+    let mut margin = [weighted_label_mean(info.label_values(), info.weights)];
     log_link(&mut margin);
     margin.to_vec()
 }

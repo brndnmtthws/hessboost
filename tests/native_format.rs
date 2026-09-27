@@ -759,6 +759,80 @@ fn saved_models_keep_loading_with_their_margins() {
     }
 }
 
+/// Re-saving every saved model reproduces what its writer stored:
+///
+/// - each `BoostedModel`, loaded from its `.bin` and from its `.json`,
+///   re-saves the `.json` document member for member (members a later writer
+///   adds are `null`, and none may be dropped) and, where a `.hbtd` was
+///   saved, the compact bytes exactly, from every version;
+/// - the native binary containers (`.bin`, `.hbdm`, `.hbff`) re-save byte
+///   for byte from this version's directory: they record their writer's
+///   version, so earlier versions' files differ in that record.
+#[test]
+fn saved_models_re_save_byte_identically() {
+    let mut versions = 0;
+    for dir in std::fs::read_dir(saved_dir("")).unwrap() {
+        let dir = dir.unwrap().path();
+        let current = dir.file_name().unwrap() == env!("CARGO_PKG_VERSION");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let what = path.display();
+            let stored = std::fs::read(&path).unwrap();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("bin") => {
+                    let json_path = path.with_extension("json");
+                    let json = std::fs::read_to_string(&json_path).unwrap();
+                    let saved_json: Value = serde_json::from_str(&json).unwrap();
+                    let saved_json = saved_json.as_object().unwrap();
+                    let hbtd = std::fs::read(path.with_extension("hbtd")).ok();
+                    let from_bin = BoostedModel::from_bytes(&stored).unwrap();
+                    let from_json = BoostedModel::from_json(&json).unwrap();
+                    for (source, model) in [("bin", from_bin), ("json", from_json)] {
+                        if current {
+                            let bytes = model.to_bytes().unwrap();
+                            assert!(bytes == stored, "{what}: {source} re-saved as bin");
+                        }
+                        let resaved: Value =
+                            serde_json::from_str(&model.to_json().unwrap()).unwrap();
+                        let resaved = resaved.as_object().unwrap();
+                        for key in saved_json.keys() {
+                            assert!(resaved.contains_key(key), "{what}: {source} drops `{key}`");
+                        }
+                        for (key, value) in resaved {
+                            let saved = saved_json.get(key).unwrap_or(&Value::Null);
+                            assert!(value == saved, "{what}: {source} re-saves `{key}`");
+                        }
+                        if let Some(hbtd) = &hbtd {
+                            let compact = model.to_compact_bytes().unwrap();
+                            assert!(compact == *hbtd, "{what}: {source} re-saved as compact");
+                        }
+                    }
+                }
+                Some("hbdm") if current => {
+                    let resaved = DiffusionModel::from_bytes(&stored)
+                        .unwrap()
+                        .to_bytes()
+                        .unwrap();
+                    assert!(resaved == stored, "{what} re-saves differently");
+                }
+                Some("hbff") if current => {
+                    let resaved = ForestModel::from_bytes(&stored)
+                        .unwrap()
+                        .to_bytes()
+                        .unwrap();
+                    assert!(resaved == stored, "{what} re-saves differently");
+                }
+                _ => continue,
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no saved models under {}", dir.display());
+        versions += 1;
+    }
+    assert!(versions > 0, "no saved model versions");
+}
+
 /// Write this version's saved models (see the module docs). Refuses to
 /// overwrite a version's existing directory.
 #[test]

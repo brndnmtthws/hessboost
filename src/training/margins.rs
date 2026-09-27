@@ -321,7 +321,7 @@ mod tests {
             .map(|&v| GradPair::new(-(2.0 * v.max(0.0) + 1.0), 1.0))
             .collect();
         let rows: Vec<u32> = (0..n as u32).collect();
-        crate::tree::linear::fit_linear_leaves(&mut linear, &data, &gpair, &rows, 0.5);
+        crate::tree::linear_fit::fit_linear_leaves(&mut linear, &data, &gpair, &rows, 0.5);
         assert!(linear.linear_leaves().is_some());
         for tree in [&scalar, &linear] {
             let output = TreeOutput::Scalar(1);

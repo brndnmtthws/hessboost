@@ -27,10 +27,8 @@
 //! "forward sum equals node total" missing-value test then holds exactly as it
 //! does for the integers.
 
-use super::{
-    BinIndex, PARALLEL_THRESHOLD, PREFETCH_ROWS, REDUCE_BINS, ROWS_PER_TASK, TILE_ROWS,
-    contiguous_range, feature_blocks, feature_slices, prefetch_bins,
-};
+use super::walk::{Bucket, RowValue, accumulate, contiguous_range};
+use super::{BinIndex, PARALLEL_THRESHOLD, REDUCE_BINS, ROWS_PER_TASK, feature_slices};
 use crate::config::QuantizedGrad;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::objective::GradPair;
@@ -41,9 +39,6 @@ use std::sync::Arc;
 
 /// Rows per parallel quantization task.
 const QUANTIZE_CHUNK: usize = 8192;
-/// Bytes of histogram a dense feature block may span, so the block stays in
-/// L1 while a row tile is accumulated into it (the float path's 64 KiB).
-const BLOCK_BYTES: usize = 64 * 1024;
 
 /// Stream salts separating the gradient and Hessian rounding variates.
 const GRAD_STREAM: u64 = 0x6772_6164_5F71_6E74;
@@ -252,6 +247,9 @@ impl QuantizedGradients {
 
         if let (Some(columns), Some(range)) = (ghist.column_bins(), contiguous_range(rows)) {
             let mut out = vec![A::default(); total];
+            // Unlike the shared feature-group sweep, which widens each row
+            // once per feature, the row values are widened once up front:
+            // that pays when every feature task re-reads them.
             let values: Vec<A> = self.packed[range.clone()]
                 .iter()
                 .map(|&p| A::from_row(p))
@@ -477,7 +475,7 @@ impl QuantNode {
 /// below `2^(s−1)` in magnitude, `s` half the width. Sums of packed values are
 /// the packed sums while both halves stay in range, which the per-node width
 /// choice guarantees.
-trait Packed: Copy + Default + Send + Sync {
+trait Packed: Bucket {
     /// Width in bits.
     const BITS: u32;
     /// Pack `(g, h)`.
@@ -525,84 +523,17 @@ macro_rules! packed {
                 self - other
             }
         }
+        impl Bucket for $ty {
+            #[inline(always)]
+            fn push(&mut self, value: Self) {
+                *self += value;
+            }
+        }
     };
 }
 packed!(i32, i16, 16);
 packed!(i64, i32, 32);
 packed!(i128, i64, 64);
-
-/// Sequential accumulation of `rows` into `out` (added, not reset).
-fn accumulate<A: Packed>(ghist: &GHistIndex, rows: &[u32], packed: &[i32], out: &mut [A]) {
-    match ghist.bins() {
-        Bins::U16(bins) => accumulate_bins(ghist, bins, rows, packed, out),
-        Bins::U32(bins) => accumulate_bins(ghist, bins, rows, packed, out),
-    }
-}
-
-#[inline(always)]
-fn accumulate_bins<A: Packed, B: BinIndex>(
-    ghist: &GHistIndex,
-    bins: &[B],
-    rows: &[u32],
-    packed: &[i32],
-    out: &mut [A],
-) {
-    // Establishes the bound used by `add_row`: with `out` covering every bin,
-    // the `GHistIndex` invariant (all stored bins < total_bins) makes every
-    // histogram index in range.
-    assert_eq!(
-        out.len(),
-        ghist.total_bins(),
-        "histogram length must equal the binned index's bin count"
-    );
-    let add_row = |row_bins: &[B], v: A, out: &mut [A]| {
-        for &bin in row_bins {
-            // SAFETY: `bin < ghist.total_bins() == out.len()` by the index
-            // invariant and the assertion above.
-            let slot = unsafe { out.get_unchecked_mut(bin.index()) };
-            *slot = slot.add(v);
-        }
-    };
-
-    if let Some(columns) = ghist.column_bins()
-        && let Some(range) = contiguous_range(rows)
-    {
-        let n_rows = ghist.n_rows();
-        let values: Vec<A> = packed[range.clone()]
-            .iter()
-            .map(|&p| A::from_row(p))
-            .collect();
-        match columns {
-            Bins::U16(columns) => {
-                for column in columns.chunks_exact(n_rows) {
-                    accumulate_column(&column[range.clone()], 0, &values, out);
-                }
-            }
-            Bins::U32(columns) => {
-                for column in columns.chunks_exact(n_rows) {
-                    accumulate_column(&column[range.clone()], 0, &values, out);
-                }
-            }
-        }
-        return;
-    }
-
-    if let Some(stride) = ghist.dense_stride() {
-        accumulate_dense(ghist, bins, stride, rows, packed, out, add_row);
-    } else {
-        let rp = ghist.row_ptr();
-        for (i, &r) in rows.iter().enumerate() {
-            if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
-                let ahead = ahead as usize;
-                if let (Some(&start), Some(&end)) = (rp.get(ahead), rp.get(ahead + 1)) {
-                    prefetch_bins(bins, start, end - start);
-                }
-            }
-            let ri = r as usize;
-            add_row(&bins[rp[ri]..rp[ri + 1]], A::from_row(packed[ri]), out);
-        }
-    }
-}
 
 /// Accumulate one feature column (`column[i]` is the bin of `values[i]`'s
 /// row) into `slice`, whose first entry is global bin `first_bin`.
@@ -619,50 +550,11 @@ fn accumulate_column<A: Packed, B: BinIndex>(
     }
 }
 
-/// Dense accumulation tiled by rows and feature blocks, as the float path
-/// does, with blocks sized for the accumulator width.
-#[inline(always)]
-fn accumulate_dense<A: Packed, B: BinIndex>(
-    ghist: &GHistIndex,
-    bins: &[B],
-    stride: usize,
-    rows: &[u32],
-    packed: &[i32],
-    out: &mut [A],
-    add_row: impl Fn(&[B], A, &mut [A]),
-) {
-    let blocks = feature_blocks(ghist, stride, BLOCK_BYTES / std::mem::size_of::<A>());
-
-    let prefetch = |rows: &[u32], i: usize| {
-        if let Some(&ahead) = rows.get(i + PREFETCH_ROWS) {
-            prefetch_bins(bins, ahead as usize * stride, stride);
-        }
-    };
-    if blocks.len() == 1 {
-        for (i, &r) in rows.iter().enumerate() {
-            prefetch(rows, i);
-            let start = r as usize * stride;
-            add_row(
-                &bins[start..start + stride],
-                A::from_row(packed[r as usize]),
-                out,
-            );
-        }
-        return;
-    }
-    let mut values: Vec<A> = Vec::with_capacity(TILE_ROWS.min(rows.len()));
-    for tile in rows.chunks(TILE_ROWS) {
-        values.clear();
-        values.extend(tile.iter().map(|&r| A::from_row(packed[r as usize])));
-        for (block, &(f0, f1)) in blocks.iter().enumerate() {
-            for (i, (&r, &v)) in tile.iter().zip(&values).enumerate() {
-                if block == 0 {
-                    prefetch(tile, i);
-                }
-                let start = r as usize * stride;
-                add_row(&bins[start + f0..start + f1], v, out);
-            }
-        }
+impl<A: Packed> RowValue<A> for i32 {
+    /// Re-pack one row's `ĝ·2¹⁶ + ĥ` at the accumulator's width.
+    #[inline(always)]
+    fn value(self) -> A {
+        A::from_row(self)
     }
 }
 

@@ -210,10 +210,13 @@ fn bagging_by_query_refuses_non_ranking_or_incompatible_sampling() {
             TrainingParams::builder().bagging_by_query(bagging),
             "bagging_by_query",
         ),
+        (
+            ranking().balanced_bagging(BalancedBagging::new(0.5, 1.0).unwrap()),
+            "bagging_by_query",
+        ),
     ] {
         assert_eq!(invalid_param(params.build()), name);
     }
-    // Query groups are data, so they are checked at training.
     let ungrouped = labeled_dense(&[0.0, 1.0], 1, &[0.0, 1.0]);
     assert_eq!(
         invalid_param(train(&ranking().build().unwrap(), &ungrouped, 1)),

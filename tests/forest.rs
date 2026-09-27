@@ -253,6 +253,20 @@ fn refresh_training_params_are_refused() {
 }
 
 #[test]
+fn imputation_refuses_label_matrices() {
+    // Two columns of valid classes: read flat, rows would take each other's
+    // classes, so the matrix is refused as it is by `fit`.
+    let (x, y) = table(60, 6);
+    let model = ForestModel::fit(&quick(ForestParams::diffusion()), &labelled(&x, &y)).unwrap();
+    let matrix: Vec<f32> = y.iter().flat_map(|&c| [c, 1.0 - c]).collect();
+    let data = DMatrix::from_dense(&x, 60, COLS)
+        .unwrap()
+        .with_label_matrix(&matrix, 2)
+        .unwrap();
+    assert_eq!(invalid_param(model.impute(&data, 1, None, 1)), "data");
+}
+
+#[test]
 fn stored_values_outside_f32_are_refused() {
     // Labels, categories and ranges decode to `f32`: a document holding a
     // value no `f32` fit could have produced is not a model.

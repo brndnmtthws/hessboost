@@ -652,10 +652,11 @@ impl ForestModel {
     ///
     /// [`HessboostError::InvalidParameter`] for a flow model (the reference
     /// imputes with diffusion only), `n_imputations == 0`, an invalid
-    /// [`Repaint`], missing or unknown labels on a class-conditional model,
-    /// a categorical value the model has not seen, or a sampler that
-    /// diverges; [`HessboostError::DimensionMismatch`] for the wrong column
-    /// count.
+    /// [`Repaint`], metadata [`Self::fit`] refuses (weights, base margins,
+    /// groups, label bounds, feature weights, a label matrix), missing or
+    /// unknown labels on a class-conditional model, a categorical value the
+    /// model has not seen, or a sampler that diverges;
+    /// [`HessboostError::DimensionMismatch`] for the wrong column count.
     pub fn impute(
         &self,
         data: &DMatrix,
@@ -695,6 +696,7 @@ impl ForestModel {
                 data.n_cols(),
             ));
         }
+        refuse_metadata(data)?;
         let class_of = if self.classes.is_empty() {
             vec![0; data.n_rows()]
         } else {

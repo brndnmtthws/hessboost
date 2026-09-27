@@ -200,6 +200,18 @@ def test_unsupported_requests_are_refused(
         model.impute(x[:3], y[:3], repaint=(5, 0.1))  # type: ignore[arg-type]
 
 
+def test_imputation_refuses_label_matrices(
+    conditional: tuple[ForestModel, NDArray[np.float64], NDArray[np.float64]],
+) -> None:
+    # Two columns of valid classes, which read flat would misassign rows.
+    model, x, y = conditional
+    two_columns = np.column_stack([y[:3], 1.0 - y[:3]])
+    with pytest.raises(HessboostError, match="label matrices"):
+        model.impute(x[:3], two_columns)
+    with pytest.raises(HessboostError, match="label matrices"):
+        model.impute(DMatrix(x[:3], label=two_columns))
+
+
 def test_damaged_models_are_refused(
     conditional: tuple[ForestModel, NDArray[np.float64], NDArray[np.float64]], tmp_path: Path
 ) -> None:

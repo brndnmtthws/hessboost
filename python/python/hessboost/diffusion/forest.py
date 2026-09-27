@@ -329,9 +329,11 @@ class ForestModel:
         Raises:
             HessboostError: The model is a flow model (imputation needs
                 :class:`Diffusion`), ``n_imputations`` is 0, the repaint
-                settings are out of range, labels are missing or unknown,
-                a categorical value was unseen in training, or the column
-                count differs.
+                settings are out of range, the data has metadata ``fit``
+                refuses (weights, base margins, groups, label bounds,
+                feature weights or a label matrix), labels are missing or
+                unknown, a categorical value was unseen in training, or the
+                column count differs.
         """
         if repaint is not None and not isinstance(repaint, Repaint):
             raise TypeError(f"repaint must be Repaint or None, got {type(repaint).__name__}")

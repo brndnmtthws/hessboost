@@ -15,8 +15,10 @@
 //! ```
 
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError};
-use serde::{Deserialize, Deserializer};
-use std::path::PathBuf;
+use serde::Deserialize;
+mod common;
+use common::bits::same_bits;
+use common::fixtures::{fixtures_dir, nan_for_null};
 
 /// Pointwise tolerance, relative to `max(1, |LightGBM|)`: hessboost stores
 /// leaf values as `f32` and sums them in `f32`, LightGBM in `f64`.
@@ -41,16 +43,6 @@ struct Fixture {
     raw_slice: Option<Vec<f64>>,
     xgboost_export: Option<bool>,
 }
-
-fn nan_for_null<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
-    let values: Vec<Option<f32>> = Vec::deserialize(d)?;
-    Ok(values.into_iter().map(|v| v.unwrap_or(f32::NAN)).collect())
-}
-
-fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/lightgbm")
-}
-
 /// The largest `|a - b| / max(1, |b|)`, or an error naming the first entry
 /// past [`TOL`].
 fn compare(what: &str, got: &[f32], want: &[f64]) -> Result<f64, String> {
@@ -71,11 +63,6 @@ fn compare(what: &str, got: &[f32], want: &[f64]) -> Result<f64, String> {
     }
     Ok(worst)
 }
-
-fn same_bits(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-}
-
 fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
     let model = BoostedModel::from_lightgbm_text(text).map_err(|e| format!("import: {e}"))?;
     let expected_objective = fx.objective.as_deref().unwrap_or_default();
@@ -194,22 +181,11 @@ fn check_refusal(fx: &Fixture, text: &str) -> Result<String, String> {
 #[test]
 #[ignore = "requires fixtures from scripts/gen_lightgbm_fixtures.py"]
 fn lightgbm_parity() {
-    let dir = fixtures_dir();
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: {e}; run scripts/gen_lightgbm_fixtures.py",
-                dir.display()
-            )
-        })
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    paths.sort();
-    assert!(!paths.is_empty(), "no fixtures in {}", dir.display());
+    let dir = fixtures_dir().join("lightgbm");
+    let paths = common::fixtures::json_paths(&dir, "LightGBM", "scripts/gen_lightgbm_fixtures.py");
     let mut failures = Vec::new();
     for path in &paths {
-        let fx: Fixture = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let fx: Fixture = common::fixtures::load_json(path);
         let text = std::fs::read_to_string(path.with_extension("txt")).unwrap();
         let result = match fx.expect.as_str() {
             "import" => check_import(&fx, &text),

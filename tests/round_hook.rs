@@ -2,34 +2,17 @@
 //! changes the model, and a `Break` ends training with the rounds so far.
 
 use hessboost::config::{BoosterKind, Dart, ProcessType, Refresh};
-use hessboost::prelude::{BoostedModel, DMatrix, Trainer, TrainingParams, train};
+use hessboost::prelude::{BoostedModel, Trainer, TrainingParams, train};
 use hessboost::training::RoundEval;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 mod common;
-use common::labeled_dense;
-
-/// `n` rows of 4 features with a noisy smooth target (`salt` varies the
-/// noise), so a validation set eventually stops improving.
-fn data(n: usize, salt: usize) -> DMatrix {
-    let mut x = Vec::with_capacity(n * 4);
-    let mut y = Vec::with_capacity(n);
-    for i in 0..n {
-        let f: Vec<f32> = (0..4)
-            .map(|j| ((i * (7 + 3 * j) + 11 * j) % 97) as f32 / 97.0)
-            .collect();
-        let noise = (((i + salt) * 2_654_435_761) % 1000) as f32 / 1000.0 - 0.5;
-        y.push(2.0 * f[0] - 3.0 * f[1] * f[1] + 0.5 * f[2] + noise);
-        x.extend(f);
-    }
-    labeled_dense(&x, 4, &y)
-}
+use common::smooth::noisy as data;
 
 fn bytes(model: &BoostedModel) -> Vec<u8> {
     model.to_bytes().unwrap()
 }
-
 /// Row sampling and DART dropout: a hook must not disturb the RNG streams.
 fn sampled() -> TrainingParams {
     TrainingParams::builder()

@@ -11,7 +11,7 @@ use hessboost::diffusion::{
     DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, Samples, ScoreConfig,
     Sde,
 };
-use hessboost::objective::{LambdaRank, Logistic};
+use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
@@ -238,6 +238,15 @@ fn damaged_or_incomplete_files_are_refused() {
         DiffusionModel::from_json(&json.to_string()),
         Err(HessboostError::Json(_) | HessboostError::ModelFormat(_))
     ));
+    // A regressor weighted by `scale_pos_weight` is not the unweighted
+    // squared-error model the sampler integrates.
+    let mut json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    json["regressor"]["objective_params"]["scale_pos_weight"] = serde_json::json!(2.0);
+    let refused = DiffusionModel::from_json(&json.to_string()).unwrap_err();
+    assert!(
+        refused.to_string().contains("scale_pos_weight 1"),
+        "{refused}"
+    );
 }
 
 #[test]
@@ -268,7 +277,7 @@ fn row_bagging_regressor_params_are_refused() {
         &|t| t.balanced_bagging = balanced(),
         &|t| t.bagging_by_query = query(),
         &|t| {
-            t.objective = Objective::BinaryLogistic(Logistic::default());
+            t.objective = Objective::BinaryLogistic(RegLoss::default());
             t.balanced_bagging = balanced();
         },
         &|t| {
@@ -347,6 +356,22 @@ fn unsupported_inputs_are_refused() {
         invalid_param(DiffusionModel::fit(&params, &data)),
         "training"
     );
+    // `scale_pos_weight` would reweight the rows whose noisy target is
+    // positive: only the unweighted squared error is accepted, for the
+    // score GBDT and the residualizer.
+    let weighted = || Objective::SquaredError(RegLoss::new(2.0).unwrap());
+    let mut params = quick(DiffusionParams::default());
+    params.training.objective = weighted();
+    assert_eq!(invalid_param(params.validate()), "training");
+    let mut params = quick(DiffusionParams::default());
+    params.residualizer.as_mut().unwrap().training.objective = weighted();
+    assert_eq!(
+        invalid_param(DiffusionModel::fit(&params, &data)),
+        "residualizer.training"
+    );
+    let mut params = quick(DiffusionParams::default());
+    params.training.objective = Objective::SquaredError(RegLoss::new(1.0).unwrap());
+    assert!(params.validate().is_ok());
 
     let mut params = quick(DiffusionParams::default());
     let mut broken = ScoreConfig::default();

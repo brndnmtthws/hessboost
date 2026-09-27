@@ -578,18 +578,26 @@ fn lightgbm_like() -> TrainingParams {
     }
 }
 
-/// `params` validate, regress with squared error (the loss every diffusion
-/// target is fit with), and grow new trees: every GBDT is trained from
-/// scratch, so there is no model for `process_type = update` to refresh.
+/// `params` validate, regress with unweighted squared error (the loss every
+/// diffusion target is fit with; `scale_pos_weight` would reweight the rows
+/// whose noisy target happens to be positive), and grow new trees: every
+/// GBDT is trained from scratch, so there is no model for
+/// `process_type = update` to refresh.
 fn validate_regressor_params(name: &'static str, params: &TrainingParams) -> Result<()> {
     params.validate()?;
-    if !matches!(params.objective, Objective::SquaredError) {
+    if !params.objective.is_unweighted_squared_error() {
         return Err(HessboostError::invalid_param(
             name,
             format!(
                 "the diffusion targets are regressed with squared error: objective must be \
-                 `reg:squarederror`, got `{}`",
-                params.objective.name()
+                 `reg:squarederror` with `scale_pos_weight = 1`, got `{}`{}",
+                params.objective.name(),
+                match &params.objective {
+                    Objective::SquaredError(r) => {
+                        format!(" with `scale_pos_weight = {}`", r.scale_pos_weight())
+                    }
+                    _ => String::new(),
+                }
             ),
         ));
     }
@@ -941,21 +949,24 @@ impl DiffusionModel {
     }
 }
 
-/// `model` is a squared-error regressor on `n_features` columns with
-/// `n_outputs` outputs.
+/// `model` is an unweighted squared-error regressor on `n_features`
+/// columns with `n_outputs` outputs.
 fn check_regressor(
     what: &str,
     model: &BoostedModel,
     n_features: usize,
     n_outputs: usize,
 ) -> Result<()> {
-    if !matches!(model.objective().built_in(), Some(Objective::SquaredError))
+    if !model
+        .objective()
+        .built_in()
+        .is_some_and(Objective::is_unweighted_squared_error)
         || model.n_features() != n_features
         || model.n_outputs() != n_outputs
     {
         return Err(HessboostError::model_format(format!(
-            "the {what} must be a reg:squarederror model with {n_features} features and \
-             {n_outputs} outputs, got `{}` with {} and {}",
+            "the {what} must be a reg:squarederror model (scale_pos_weight 1) with \
+             {n_features} features and {n_outputs} outputs, got `{}` with {} and {}",
             model.objective().name(),
             model.n_features(),
             model.n_outputs()

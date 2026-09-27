@@ -118,7 +118,7 @@ impl LeafKernel {
                 }
                 let count = counts[node_leaf[node_offset[t] + id] as usize];
                 if (count as f64) < f64::from(node.sum_hess) {
-                    return Err(HessboostError::invalid_param(
+                    return Err(HessboostError::invalid_data(
                         "train",
                         format!(
                             "leaf {id} of tree {t} was grown on {} rows but only {count} of these \

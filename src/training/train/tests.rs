@@ -2,6 +2,7 @@ use super::*;
 use crate::config::{Dart, GrowPolicy, LinearTree, TreeMethod};
 use crate::metric::{Metric, Rmse};
 use crate::model::Iterations;
+use crate::model::ModelFormat;
 use crate::objective::{Aft, CustomLoss, LambdaRank, Multiclass, Objective, PseudoHuber, RegLoss};
 use crate::rng::Rng;
 use crate::test_support::labeled_dense;
@@ -272,7 +273,11 @@ fn num_class_must_match_the_objective_outputs() {
                 .unwrap_or(0),
             num_class
         );
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap();
     }
 }
 
@@ -451,13 +456,18 @@ fn custom_multi_output_objective_trains_with_stride_and_round_trips() {
         "output 1 did not learn: {err1} vs {err_init}"
     );
 
-    let via_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
+    let via_json =
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap();
     assert_eq!(via_json.n_outputs(), 2);
     assert_eq!(
         via_json.predict_margin(&d, Iterations::Best).unwrap(),
         margin
     );
-    let via_bytes = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+    let via_bytes = BoostedModel::decode(
+        model.encode(ModelFormat::Binary).unwrap(),
+        ModelFormat::Binary,
+    )
+    .unwrap();
     assert_eq!(via_bytes.n_outputs(), 2);
     assert_eq!(
         via_bytes.predict_margin(&d, Iterations::Best).unwrap(),
@@ -539,8 +549,12 @@ fn dart_trains_reduces_error_and_roundtrips() {
 
     // Native and JSON round-trips preserve predictions (weights included).
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ] {
         assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), preds);
     }
@@ -894,8 +908,12 @@ fn gblinear_roundtrips() {
     let before = model.predict(&d, Iterations::Best).unwrap();
 
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ] {
         assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), before);
     }
@@ -1026,7 +1044,10 @@ fn logistic_objectives_accept_probability_labels() {
             assert!(
                 matches!(
                     train(&params, &d, 3),
-                    Err(HessboostError::InvalidParameter { .. })
+                    Err(HessboostError::InvalidData {
+                        input: "labels",
+                        ..
+                    })
                 ),
                 "{name} should reject label {bad}"
             );
@@ -1137,12 +1158,9 @@ fn eval_set_label_domain_errors_name_the_dataset() {
         .eval(&holdout, "holdout")
         .train()
     {
-        Err(HessboostError::InvalidParameter { name, reason }) => {
-            assert_eq!(name, "labels");
-            assert_eq!(
-                reason,
-                "dataset `holdout` has labels outside the objective's valid domain"
-            );
+        Err(HessboostError::InvalidData { input, dataset, .. }) => {
+            assert_eq!(input, "labels");
+            assert_eq!(dataset.as_deref(), Some("holdout"));
         }
         other => panic!("expected a label-domain error, got {other:?}"),
     }
@@ -1166,7 +1184,10 @@ fn target_count_mismatches_are_rejected() {
         .unwrap();
     assert!(matches!(
         train(&poisson, &two_targets, 1),
-        Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+        Err(HessboostError::InvalidData {
+            input: "labels",
+            ..
+        })
     ));
     assert!(matches!(
         Trainer::new(&params, &d, 1)
@@ -1296,10 +1317,22 @@ fn multi_label_model_round_trips_and_classifies_per_label() {
         assert_eq!(c as f32, cols[i % 2][i / 2], "separable cell {i}");
     }
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
-        BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap(),
-        BoostedModel::from_xgboost_ubjson(&model.to_xgboost_ubjson().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::XgboostJson).unwrap(),
+            ModelFormat::XgboostJson,
+        )
+        .unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::XgboostUbjson).unwrap(),
+            ModelFormat::XgboostUbjson,
+        )
+        .unwrap(),
     ] {
         assert_eq!(restored.n_targets(), 2);
         assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), preds);
@@ -1340,8 +1373,8 @@ impl crate::objective::Loss for BoundsMidpoint {
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         if info.bounds.is_none() {
-            return Err(HessboostError::invalid_param(
-                "label_lower_bound",
+            return Err(HessboostError::invalid_data(
+                "label_bounds",
                 "dataset has no label bounds",
             ));
         }
@@ -1388,7 +1421,10 @@ fn training_routes_through_metadata_hooks() {
     let unbounded = DMatrix::from_dense(&x, 32, 1).unwrap();
     assert!(matches!(
         train(&params, &unbounded, 1),
-        Err(HessboostError::InvalidParameter { name, .. }) if name == "label_lower_bound"
+        Err(HessboostError::InvalidData {
+            input: "label_bounds",
+            ..
+        })
     ));
 }
 
@@ -1406,6 +1442,18 @@ fn eval_metric_rejection<T: std::fmt::Debug>(result: Result<T>, context: &str) -
             reason,
         }) => reason,
         other => panic!("{context}: expected an `eval_metric` rejection, got {other:?}"),
+    }
+}
+/// The dataset of an invalid-`labels` rejection of the `context` run,
+/// panicking on any other outcome.
+fn label_rejection<T: std::fmt::Debug>(result: Result<T>, context: &str) -> String {
+    match result {
+        Err(HessboostError::InvalidData {
+            input: "labels",
+            dataset: Some(dataset),
+            ..
+        }) => dataset,
+        other => panic!("{context}: expected an invalid-`labels` rejection, got {other:?}"),
     }
 }
 
@@ -1441,8 +1489,7 @@ fn label_metrics_are_refused_on_bound_only_eval_sets() {
         let run = Trainer::new(&params(metric), &d, 2)
             .eval(&d, "eval")
             .train();
-        let reason = eval_metric_rejection(run, metric);
-        assert!(reason.contains("`eval`"), "{reason}");
+        assert_eq!(label_rejection(run, metric), "eval");
     }
 }
 
@@ -1464,8 +1511,7 @@ fn class_index_metrics_refuse_non_class_labels() {
             .build()
             .unwrap();
         let run = Trainer::new(&params, &d, 2).eval(&d, "eval").train();
-        let reason = eval_metric_rejection(run, metric);
-        assert!(reason.contains("class"), "{reason}");
+        assert_eq!(label_rejection(run, metric), "eval");
     }
 }
 
@@ -1642,7 +1688,8 @@ fn custom_objective_outputs_must_match_the_label_layout() {
     for k in [1, 3] {
         assert!(matches!(
             run(k),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
+            Err(HessboostError::InvalidData { input: "labels", dataset: Some(dataset), .. })
+                if dataset == "dtrain"
         ));
     }
 }

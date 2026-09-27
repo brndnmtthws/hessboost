@@ -23,9 +23,16 @@ impl BoostedModel {
     /// internal check when `end - begin` is not a multiple of `step`; here
     /// every step selects `ceil((end - begin) / step)` iterations, matching
     /// XGBoost wherever it succeeds.
+    ///
+    /// # Errors
+    ///
+    /// [`HessboostError::IncompatibleModel`] (`slice`) for a `gblinear`
+    /// model, iterations past [`Self::num_boost_rounds`], or anything but a
+    /// prefix of a shrunk model; [`HessboostError::InvalidParameter`]
+    /// (`slice`) for `step == 0` or an empty or inverted range.
     pub fn slice(&self, iterations: impl RangeBounds<usize>, step: usize) -> Result<BoostedModel> {
         if self.linear.is_some() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "slice",
                 "gblinear models have no boosting iterations to slice",
             ));
@@ -46,7 +53,7 @@ impl BoostedModel {
         }
         if let Some(shrinkage) = &self.shrinkage {
             if begin != 0 || step != 1 {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::incompatible_model(
                     "slice",
                     "a model trained with model shrinkage slices to prefixes only (`..k`, step 1)",
                 ));

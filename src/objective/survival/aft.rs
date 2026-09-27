@@ -157,9 +157,9 @@ impl Loss for AftLoss {
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         if info.bounds.is_none() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "label_bounds",
-                "dataset has no label bounds; survival:aft needs \
+                "missing; survival:aft needs \
                  `label_lower_bound` and `label_upper_bound` (DMatrix::with_label_bounds)",
             ));
         }

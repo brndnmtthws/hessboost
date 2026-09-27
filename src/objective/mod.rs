@@ -599,9 +599,9 @@ pub(crate) enum OutputDomain {
 /// when any label satisfies `invalid`.
 pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool) -> Result<()> {
     if info.label_values().iter().any(|&y| invalid(y)) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "labels",
-            "dataset has labels outside the objective's valid domain",
+            "outside the objective's valid domain",
         ));
     }
     Ok(())
@@ -614,10 +614,10 @@ pub(crate) fn check_label_domain(info: &MetaInfo, invalid: impl Fn(f32) -> bool)
 /// [`TrainingParams::loss`](crate::config::TrainingParams::loss)).
 pub(crate) fn check_label_width(info: &MetaInfo, n_targets: usize) -> Result<()> {
     if info.n_targets() != n_targets {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "labels",
             format!(
-                "dataset has {} label columns but the objective models {n_targets}",
+                "{} label columns but the objective models {n_targets}",
                 info.n_targets()
             ),
         ));
@@ -774,8 +774,8 @@ mod tests {
             let p = with_objective(objective);
             assert!(p.loss(1).is_ok(), "{name}");
             match p.loss(2) {
-                Err(HessboostError::InvalidParameter { name: param, .. }) => {
-                    assert_eq!(param, "labels", "{name}");
+                Err(HessboostError::InvalidData { input, .. }) => {
+                    assert_eq!(input, "labels", "{name}");
                 }
                 Err(other) => panic!("{name}: unexpected error {other}"),
                 Ok(_) => panic!("{name}: accepted two targets"),

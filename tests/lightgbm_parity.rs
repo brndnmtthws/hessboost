@@ -15,6 +15,7 @@
 //! ```
 
 use hessboost::model::Iterations;
+use hessboost::model::ModelFormat;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError};
 use serde::Deserialize;
 mod common;
@@ -65,7 +66,8 @@ fn compare(what: &str, got: &[f32], want: &[f64]) -> Result<f64, String> {
     Ok(worst)
 }
 fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
-    let model = BoostedModel::from_lightgbm_text(text).map_err(|e| format!("import: {e}"))?;
+    let model = BoostedModel::decode(text, ModelFormat::LightgbmText)
+        .map_err(|e| format!("import: {e}"))?;
     let expected_objective = fx.objective.as_deref().unwrap_or_default();
     if model.objective().name() != expected_objective {
         return Err(format!(
@@ -103,7 +105,10 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
         }
         // LightGBM refuses SHAP for linear trees; so does hessboost.
         None => match model.predict_contribs(&data, Iterations::Best) {
-            Err(HessboostError::InvalidParameter { .. }) => "refused".to_string(),
+            Err(HessboostError::IncompatibleModel {
+                what: "linear_tree",
+                ..
+            }) => "refused".to_string(),
             other => return Err(format!("contribs of a linear-leaf model: {other:?}")),
         },
     };
@@ -136,10 +141,18 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
         fx.raw_slice.as_deref().unwrap_or_default(),
     )?;
 
-    let from_bytes = BoostedModel::from_bytes(&model.to_bytes().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    let from_json = BoostedModel::from_json(&model.to_json().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let from_bytes = BoostedModel::decode(
+        &model
+            .encode(ModelFormat::Binary)
+            .map_err(|e| e.to_string())?,
+        ModelFormat::Binary,
+    )
+    .map_err(|e| e.to_string())?;
+    let from_json = BoostedModel::decode(
+        &model.encode(ModelFormat::Json).map_err(|e| e.to_string())?,
+        ModelFormat::Json,
+    )
+    .map_err(|e| e.to_string())?;
     for (what, restored) in [("native binary", &from_bytes), ("native JSON", &from_json)] {
         if !same_bits(
             restored
@@ -151,9 +164,13 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
             return Err(format!("{what} round trip changed predictions"));
         }
     }
-    match (model.to_xgboost_json(), fx.xgboost_export.unwrap_or(false)) {
+    match (
+        model.encode(ModelFormat::XgboostJson),
+        fx.xgboost_export.unwrap_or(false),
+    ) {
         (Ok(json), true) => {
-            let restored = BoostedModel::from_xgboost_json(&json).map_err(|e| e.to_string())?;
+            let restored =
+                BoostedModel::decode(&json, ModelFormat::XgboostJson).map_err(|e| e.to_string())?;
             if !same_bits(
                 restored
                     .predict(&data, Iterations::Best)
@@ -178,7 +195,7 @@ fn check_import(fx: &Fixture, text: &str) -> Result<String, String> {
 
 fn check_refusal(fx: &Fixture, text: &str) -> Result<String, String> {
     let needle = fx.error.as_deref().unwrap_or_default();
-    match BoostedModel::from_lightgbm_text(text) {
+    match BoostedModel::decode(text, ModelFormat::LightgbmText) {
         Err(HessboostError::ModelFormat(message)) if message.contains(needle) => {
             Ok(format!("refused: {message}"))
         }

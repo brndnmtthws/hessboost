@@ -32,19 +32,19 @@ pub struct Samples {
 /// Validate draws laid out `[row][sample][output]`; their row count.
 fn check_layout(values: &[f32], n_samples: usize, n_outputs: usize) -> Result<usize> {
     if n_samples == 0 || n_outputs == 0 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "samples",
             format!("needs at least one sample and one output, got {n_samples} and {n_outputs}"),
         ));
     }
     let Some(width) = n_samples.checked_mul(n_outputs) else {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "samples",
             format!("{n_samples} samples × {n_outputs} outputs overflows usize"),
         ));
     };
     if !values.len().is_multiple_of(width) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "samples",
             format!(
                 "{} draws are not whole rows of {n_samples} samples × {n_outputs} outputs",
@@ -53,7 +53,7 @@ fn check_layout(values: &[f32], n_samples: usize, n_outputs: usize) -> Result<us
         ));
     }
     if !values.iter().all(|v| v.is_finite()) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "samples",
             "all draws must be finite",
         ));
@@ -69,7 +69,7 @@ impl Samples {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for zero `n_samples` or
+    /// [`HessboostError::InvalidData`] (`samples`) for zero `n_samples` or
     /// `n_outputs`, a length that is not a whole number of rows of
     /// `n_samples · n_outputs` draws, or a non-finite draw.
     pub fn new(values: Vec<f32>, n_samples: usize, n_outputs: usize) -> Result<Self> {
@@ -291,8 +291,8 @@ impl<'a> SamplesView<'a> {
     /// # Errors
     ///
     /// [`HessboostError::DimensionMismatch`] unless `labels` holds
-    /// `n_rows · n_outputs` values; [`HessboostError::InvalidParameter`] for
-    /// a non-finite label.
+    /// `n_rows · n_outputs` values; [`HessboostError::InvalidData`]
+    /// (`labels`) for a non-finite label.
     pub fn crps(&self, labels: &[f32]) -> Result<Predictions<f64>> {
         let d = self.n_outputs;
         if labels.len() != self.n_rows * d {
@@ -303,7 +303,7 @@ impl<'a> SamplesView<'a> {
             });
         }
         if labels.iter().any(|v| !v.is_finite()) {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "labels",
                 "all labels must be finite",
             ));
@@ -431,12 +431,7 @@ pub(super) fn sample(
     n_samples: usize,
     options: &SampleOptions,
 ) -> Result<Samples> {
-    if n_samples == 0 {
-        return Err(HessboostError::invalid_param(
-            "n_samples",
-            "must be at least 1",
-        ));
-    }
+    crate::check::ensure("n_samples", n_samples != 0, "must be at least 1")?;
     if data.n_cols() != model.n_features {
         return Err(HessboostError::DimensionMismatch {
             what: "sampling feature count",
@@ -445,8 +440,8 @@ pub(super) fn sample(
         });
     }
     if data.base_margin().is_some() {
-        return Err(HessboostError::invalid_param(
-            "data",
+        return Err(HessboostError::invalid_data(
+            "base_margin",
             "diffusion models do not support base margins",
         ));
     }

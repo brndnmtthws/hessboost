@@ -1,12 +1,13 @@
 #![no_main]
-//! The diffusion model decoders (`DiffusionModel::from_bytes` and
-//! `from_json`): arbitrary input either fails to decode or yields a model
+//! The diffusion model decoders (`DiffusionModel::decode` in its binary and
+//! JSON formats): arbitrary input either fails to decode or yields a model
 //! that samples and round-trips.
 //!
-//! The first byte picks the decoder: `0` passes the rest to `from_bytes`
+//! The first byte picks the decoder: `0` decodes the rest as binary
 //! unchanged; `1` seals the rest as a section table in an uncompressed
 //! `HBDM` container with a valid checksum, so mutations reach the section
 //! decoder; anything else parses the rest as JSON.
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::{DiffusionModel, SampleOptions};
 use hessboost::prelude::*;
 use libfuzzer_sys::fuzz_target;
@@ -26,13 +27,9 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
-    let Some(model) = common::parse_mode(
-        mode,
-        rest,
-        HEADER,
-        DiffusionModel::from_bytes,
-        DiffusionModel::from_json,
-    ) else {
+    let Some(model) = common::parse_mode(mode, rest, HEADER, |bytes, format| {
+        DiffusionModel::decode(bytes, format)
+    }) else {
         return;
     };
     let Ok(model) = model else {
@@ -40,15 +37,17 @@ fuzz_target!(|data: &[u8]| {
     };
     common::round_trip(
         &model,
-        |model| model.to_bytes(),
-        DiffusionModel::from_bytes,
-        |model| model.to_json(),
-        DiffusionModel::from_json,
+        |model, format| model.encode(format),
+        |bytes, format| DiffusionModel::decode(bytes, format),
         |model, from_bytes| assert_eq!(from_bytes.method(), model.method()),
     );
-    let from_bytes =
-        DiffusionModel::from_bytes(&model.to_bytes().expect("an accepted model saves"))
-            .expect("a saved model loads");
+    let from_bytes = DiffusionModel::decode(
+        model
+            .encode(DiffusionFormat::Binary)
+            .expect("an accepted model saves"),
+        DiffusionFormat::Binary,
+    )
+    .expect("a saved model loads");
     if model.n_steps().get() <= MAX_STEPS
         && model.n_features() <= MAX_FEATURES
         && model.n_outputs() <= MAX_FEATURES

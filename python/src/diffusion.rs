@@ -6,7 +6,7 @@
 //! which the Python layer's dataclasses map onto one to one; the GBDTs'
 //! training parameters as validated `Params`.
 
-use crate::codec::{encode_bytes, from_json, to_json};
+use crate::codec::{self, from_json, to_json};
 use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::{Params, to_python};
@@ -170,27 +170,16 @@ impl DiffusionModel {
         to_numpy(py, samples.into_vec(), &shape)
     }
 
+    /// Decodes a model in `format` (`"auto"` detects it from the bytes).
     #[staticmethod]
-    fn from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
-        let inner = py.detached(|| diffusion::DiffusionModel::from_bytes(data))?;
+    fn decode(py: Python<'_>, data: &[u8], format: &str) -> PyResult<Self> {
+        let inner = codec::decode(py, data, format, diffusion::DiffusionModel::decode)?;
         Ok(Self { inner })
     }
 
-    /// Decodes the JSON format.
-    #[staticmethod]
-    fn from_json(py: Python<'_>, json: &str) -> PyResult<Self> {
-        let inner = py.detached(|| diffusion::DiffusionModel::from_json(json))?;
-        Ok(Self { inner })
-    }
-
-    /// The model in the native binary format.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        encode_bytes(py, || self.inner.to_bytes())
-    }
-
-    /// The model as JSON.
-    fn to_json(&self, py: Python<'_>) -> PyResult<String> {
-        py.detached(|| self.inner.to_json())
+    /// The model encoded in `format`.
+    fn encode<'py>(&self, py: Python<'py>, format: &str) -> PyResult<Bound<'py, PyBytes>> {
+        codec::encode(py, format, |format| self.inner.encode(format))
     }
 
     /// The JSON of the model's [`Method`].

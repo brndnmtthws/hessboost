@@ -62,12 +62,12 @@ with squared-error and logistic round-0 Hessians).
 
 1. **Train parity** - train on the fixture data, compare `predict(x_test)` with
    XGBoost's predictions.
-2. **Import parity** - `BoostedModel::from_xgboost_json` on the embedded model,
+2. **Import parity** - `BoostedModel::decode` (`ModelFormat::XgboostJson`) on the embedded model,
    compare predictions, raw margins, SHAP contributions, and (where recorded)
-   SHAP interaction values; `from_xgboost_ubjson` on the `.ubj` sidecar must
+   SHAP interaction values; decoding the `.ubj` sidecar (`XgboostUbjson`) must
    yield the identical model (column `ubj`).
-3. **Export parity** - write `to_xgboost_json` (`<name>.model.json`),
-   `to_xgboost_ubjson` (`<name>.model.ubj`) and hessboost's predictions to
+3. **Export parity** - encode `XgboostJson` (`<name>.model.json`),
+   `XgboostUbjson` (`<name>.model.ubj`) and hessboost's predictions to
    `../fixtures/exports/`; `check_exports.py` reloads each model in XGBoost and
    compares predictions, and for UBJSON also requires every array to use the
    same container form (typed element marker or generic) as XGBoost's own

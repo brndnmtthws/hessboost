@@ -12,7 +12,7 @@ use hessboost::prelude::*;
 use std::num::NonZeroUsize;
 
 mod common;
-use common::{four_features, invalid_param, labeled_dense, rmse};
+use common::{four_features, incompatible_model, invalid_param, labeled_dense, rmse};
 
 const N: usize = 300;
 const COLS: usize = 4;
@@ -190,10 +190,22 @@ fn formats_round_trip_vector_leaves() {
     let d = dtrain();
     let want = model.predict(&d, Iterations::Best).unwrap();
     let reloaded = [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
-        BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap(),
-        BoostedModel::from_xgboost_ubjson(&model.to_xgboost_ubjson().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::XgboostJson).unwrap(),
+            ModelFormat::XgboostJson,
+        )
+        .unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::XgboostUbjson).unwrap(),
+            ModelFormat::XgboostUbjson,
+        )
+        .unwrap(),
     ];
     for m in reloaded {
         assert!(m.has_vector_leaves());
@@ -464,7 +476,7 @@ fn unsupported_vector_layouts_are_rejected() {
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(
+        incompatible_model(
             Trainer::new(&refresh, &dtrain, 2)
                 .init_model(&vector)
                 .train()
@@ -474,7 +486,7 @@ fn unsupported_vector_layouts_are_rejected() {
     // A model keeps one tree kind.
     let scalar = TrainingParams::builder().max_depth(4).build().unwrap();
     assert_eq!(
-        invalid_param(
+        incompatible_model(
             Trainer::new(&scalar, &dtrain, 2)
                 .init_model(&vector)
                 .train()

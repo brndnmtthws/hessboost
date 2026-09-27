@@ -123,9 +123,11 @@ impl<'a> SplitConformal<'a> {
     ///
     /// # Errors
     ///
-    /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`,
-    ///   the model has more than one output, the calibration set carries a
-    ///   label matrix or non-uniform weights, or a prediction is not finite.
+    /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`.
+    /// - [`HessboostError::InvalidData`] if the calibration set carries a
+    ///   label matrix (`labels`) or non-uniform weights (`weights`).
+    /// - [`HessboostError::IncompatibleModel`] (`model`) if the model has
+    ///   more than one output or a prediction is not finite.
     /// - [`HessboostError::EmptyDataset`] if the calibration set has no rows or
     ///   no labels.
     /// - [`HessboostError::DimensionMismatch`] if the calibration set's feature
@@ -156,7 +158,8 @@ impl<'a> SplitConformal<'a> {
     /// # Errors
     ///
     /// [`HessboostError::DimensionMismatch`] on a feature-count mismatch and
-    /// [`HessboostError::InvalidParameter`] if a prediction is not finite.
+    /// [`HessboostError::IncompatibleModel`] (`model`) if a prediction is not
+    /// finite.
     pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<Interval>> {
         let preds = single_output_predictions(self.model, data)?;
         Ok(preds
@@ -302,9 +305,11 @@ impl<'a> ConformalizedQuantile<'a> {
     ///
     /// # Errors
     ///
-    /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`,
-    ///   either model has more than one output, the calibration set carries
-    ///   a label matrix or non-uniform weights, or a prediction is not finite.
+    /// - [`HessboostError::InvalidParameter`] if `alpha` is not in `(0, 1)`.
+    /// - [`HessboostError::InvalidData`] if the calibration set carries a
+    ///   label matrix (`labels`) or non-uniform weights (`weights`).
+    /// - [`HessboostError::IncompatibleModel`] (`model`) if either model has
+    ///   more than one output or a prediction is not finite.
     /// - [`HessboostError::EmptyDataset`] if the calibration set has no rows or
     ///   no labels.
     /// - [`HessboostError::DimensionMismatch`] if the two models expect
@@ -331,9 +336,12 @@ impl<'a> ConformalizedQuantile<'a> {
     ///
     /// # Errors
     ///
-    /// As [`Self::calibrate`], plus [`HessboostError::InvalidParameter`] if an
-    /// output index is out of range, the two indices are equal, or the model's
-    /// predictions are not laid out `[row][output]` (e.g. `multi:softmax`).
+    /// As [`Self::calibrate`], plus [`HessboostError::IncompatibleModel`] if
+    /// an output index is out of range for the model (`lower_output`,
+    /// `upper_output`) or the model's predictions are not laid out
+    /// `[row][output]` (e.g. `multi:softmax`; `model`), and
+    /// [`HessboostError::InvalidParameter`] (`upper_output`) if the two
+    /// indices are equal.
     pub fn calibrate_outputs(
         model: &'a BoostedModel,
         lower_output: usize,
@@ -347,7 +355,7 @@ impl<'a> ConformalizedQuantile<'a> {
             ("upper_output", upper_output),
         ] {
             if index >= k {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::incompatible_model(
                     name,
                     format!("output index {index} is out of range for a model with {k} outputs"),
                 ));
@@ -379,11 +387,11 @@ impl<'a> ConformalizedQuantile<'a> {
     ///
     /// # Errors
     ///
-    /// As [`Self::calibrate`], plus [`HessboostError::InvalidParameter`] if
-    /// the model's objective is not a `dist:*` objective or a predicted
-    /// quantile is not finite. Quantiles are not evaluated when `k > n`
-    /// (`Q = +∞`), so a tiny `alpha` yields `(-∞, +∞)` intervals rather than
-    /// an error.
+    /// As [`Self::calibrate`], plus [`HessboostError::IncompatibleModel`] if
+    /// the model's objective is not a `dist:*` objective (`objective`) or a
+    /// predicted quantile is not finite (`model`). Quantiles are not
+    /// evaluated when `k > n` (`Q = +∞`), so a tiny `alpha` yields
+    /// `(-∞, +∞)` intervals rather than an error.
     pub fn calibrate_distribution(
         model: &'a BoostedModel,
         calibration: &DMatrix,
@@ -427,7 +435,8 @@ impl<'a> ConformalizedQuantile<'a> {
     /// # Errors
     ///
     /// [`HessboostError::DimensionMismatch`] on a feature-count mismatch and
-    /// [`HessboostError::InvalidParameter`] if a prediction is not finite.
+    /// [`HessboostError::IncompatibleModel`] (`model`) if a prediction is not
+    /// finite.
     pub fn predict_interval(&self, data: &DMatrix) -> Result<Vec<Interval>> {
         if self.correction == f64::INFINITY {
             self.band.check(data)?;
@@ -483,7 +492,7 @@ fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
         "conformal calibration set has no labels",
     ))?;
     if calibration.n_targets() != 1 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "labels",
             format!(
                 "conformal calibration needs one label per row, got a {}-column label matrix",
@@ -494,7 +503,7 @@ fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
     if let Some(weights) = calibration.weights()
         && weights.iter().any(|&w| w != weights[0])
     {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "weights",
             "conformal calibration does not support non-uniform instance weights",
         ));
@@ -505,7 +514,7 @@ fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
 /// `model.predict(data, Iterations::Best)` for a single-output model, validated finite.
 fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Predictions> {
     if model.n_outputs() != 1 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "model",
             format!(
                 "expected a single-output model, got {} outputs",
@@ -520,7 +529,7 @@ fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Pre
 fn checked_predictions(model: &BoostedModel, data: &DMatrix, width: usize) -> Result<Predictions> {
     let preds = model.predict(data, Iterations::Best)?;
     if preds.width() != width {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::incompatible_model(
             "model",
             format!(
                 "predictions must have one value per output ({width}), got {} per row",
@@ -536,7 +545,7 @@ fn checked_predictions(model: &BoostedModel, data: &DMatrix, width: usize) -> Re
 fn check_finite(preds: impl IntoIterator<Item = f32>) -> Result<()> {
     match preds.into_iter().enumerate().find(|(_, p)| !p.is_finite()) {
         None => Ok(()),
-        Some((i, p)) => Err(HessboostError::invalid_param(
+        Some((i, p)) => Err(HessboostError::incompatible_model(
             "model",
             format!("prediction {i} is not finite ({p})"),
         )),
@@ -947,6 +956,20 @@ mod tests {
         }
     }
 
+    fn assert_invalid_data<T: std::fmt::Debug>(r: Result<T>, expected: &str) {
+        match r {
+            Err(HessboostError::InvalidData { input, .. }) => assert_eq!(input, expected),
+            other => panic!("expected InvalidData `{expected}`, got {other:?}"),
+        }
+    }
+
+    fn assert_incompatible<T: std::fmt::Debug>(r: Result<T>, expected: &str) {
+        match r {
+            Err(HessboostError::IncompatibleModel { what, .. }) => assert_eq!(what, expected),
+            other => panic!("expected IncompatibleModel `{expected}`, got {other:?}"),
+        }
+    }
+
     #[test]
     fn invalid_inputs_are_rejected() {
         let mut rng = Rng::new(16);
@@ -981,13 +1004,13 @@ mod tests {
         .unwrap()
         .with_label_matrix(&two_targets, 2)
         .unwrap();
-        assert_invalid(SplitConformal::calibrate(&model, &matrix, ALPHA), "labels");
-        assert_invalid(
+        assert_invalid_data(SplitConformal::calibrate(&model, &matrix, ALPHA), "labels");
+        assert_invalid_data(
             ConformalizedQuantile::calibrate(&model, &model, &matrix, ALPHA),
             "labels",
         );
         let multi = quantile_model(&train_set, [0.1, 0.9]);
-        assert_invalid(
+        assert_invalid_data(
             ConformalizedQuantile::calibrate_outputs(&multi, 0, 1, &matrix, ALPHA),
             "labels",
         );
@@ -996,7 +1019,7 @@ mod tests {
         let ones = vec![2.0; cal.n_rows()];
         let mut uneven = ones.clone();
         uneven[3] = 1.0;
-        assert_invalid(
+        assert_invalid_data(
             SplitConformal::calibrate(&model, &cal.clone().with_weights(&uneven).unwrap(), ALPHA),
             "weights",
         );
@@ -1026,16 +1049,16 @@ mod tests {
         ));
 
         // Output selection on multi-output models.
-        assert_invalid(SplitConformal::calibrate(&multi, &cal, ALPHA), "model");
-        assert_invalid(
+        assert_incompatible(SplitConformal::calibrate(&multi, &cal, ALPHA), "model");
+        assert_incompatible(
             ConformalizedQuantile::calibrate(&multi, &model, &cal, ALPHA),
             "model",
         );
-        assert_invalid(
+        assert_incompatible(
             ConformalizedQuantile::calibrate_outputs(&multi, 0, 2, &cal, ALPHA),
             "upper_output",
         );
-        assert_invalid(
+        assert_incompatible(
             ConformalizedQuantile::calibrate_outputs(&multi, 5, 1, &cal, ALPHA),
             "lower_output",
         );
@@ -1065,12 +1088,12 @@ mod tests {
             let n = d.n_rows();
             d.with_base_margin(&vec![f32::MAX; n]).unwrap()
         };
-        assert_invalid(
+        assert_incompatible(
             SplitConformal::calibrate(&exploding, &at_max(cal.clone()), ALPHA),
             "model",
         );
         let finite = SplitConformal::calibrate(&exploding, &cal, ALPHA).unwrap();
-        assert_invalid(
+        assert_incompatible(
             finite.predict_interval(&at_max(hetero(10, &mut rng))),
             "model",
         );
@@ -1088,7 +1111,7 @@ mod tests {
             .unwrap();
         let model = train(&params, &d, 2).unwrap();
         // One class index per row, not `[row][output]`.
-        assert_invalid(
+        assert_incompatible(
             ConformalizedQuantile::calibrate_outputs(&model, 0, 2, &d, ALPHA),
             "model",
         );

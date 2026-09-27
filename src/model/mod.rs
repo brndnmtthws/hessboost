@@ -48,28 +48,48 @@
 //!
 //! # Persistence
 //!
-//! - **Native binary:** [`BoostedModel::to_bytes`] / [`from_bytes`],
-//!   [`save_binary`] / [`load_binary`]: a zstd-compressed, checksummed
-//!   section table holding everything the model needs, including linear
-//!   leaves and gblinear weights. Files written by 0.2.0 and later keep
-//!   loading in every later release.
-//! - **Native JSON:** [`BoostedModel::to_json`] / [`from_json`],
-//!   [`save_json`] / [`load_json`]: the same model as readable JSON.
-//! - **XGBoost JSON and UBJSON:** [`BoostedModel::to_xgboost_json`] /
-//!   [`from_xgboost_json`], [`save_xgboost_json`] / [`load_xgboost_json`],
-//!   and the `_xgboost_ubjson` counterparts ([`to_xgboost_ubjson`],
-//!   [`from_xgboost_ubjson`], [`save_xgboost_ubjson`],
-//!   [`load_xgboost_ubjson`]); see [XGBoost interchange](#xgboost-interchange).
-//! - **LightGBM import:** [`BoostedModel::from_lightgbm_text`] /
-//!   [`BoostedModel::load_lightgbm_text`] read LightGBM 4.x text models
-//!   (`model.txt`); see [LightGBM import](#lightgbm-import).
+//! Four verbs take a [`ModelFormat`]: [`BoostedModel::encode`] /
+//! [`decode`] convert to and from bytes, [`save`] / [`load`] to and from a
+//! file. [`ModelFormat::detect`] names the format of unknown bytes.
+//!
+//! - **Native binary** ([`ModelFormat::Binary`]): a zstd-compressed,
+//!   checksummed section table holding everything the model needs,
+//!   including linear leaves and gblinear weights. Files written by 0.2.0
+//!   and later keep loading in every later release.
+//! - **Native JSON** ([`ModelFormat::Json`]): the same model as readable
+//!   JSON.
+//! - **XGBoost JSON and UBJSON** ([`ModelFormat::XgboostJson`],
+//!   [`ModelFormat::XgboostUbjson`]): see
+//!   [XGBoost interchange](#xgboost-interchange).
+//! - **LightGBM import** ([`ModelFormat::LightgbmText`], decode and load
+//!   only): LightGBM 4.x text models (`model.txt`); see
+//!   [LightGBM import](#lightgbm-import).
+//!
+//! ```
+//! use hessboost::prelude::*;
+//!
+//! # fn main() -> Result<()> {
+//! let x: Vec<f32> = (0..40).map(|i| i as f32).collect();
+//! let dtrain = DMatrix::from_dense(&x, 40, 1)?.with_labels(&x)?;
+//! let model = train(&TrainingParams::default(), &dtrain, 3)?;
+//!
+//! let bytes = model.encode(ModelFormat::XgboostUbjson)?;
+//! assert_eq!(ModelFormat::detect(&bytes), Some(ModelFormat::XgboostUbjson));
+//! let restored = BoostedModel::decode(&bytes, ModelFormat::XgboostUbjson)?;
+//! assert_eq!(
+//!     restored.predict(&dtrain, Iterations::Best)?,
+//!     model.predict(&dtrain, Iterations::Best)?,
+//! );
+//! # Ok(())
+//! # }
+//! ```
 //! - **Compact:** [`BoostedModel::to_compact`] builds a bit-packed
 //!   [`CompactModel`](compact::CompactModel) predicting bit-identical margins
 //!   in a fraction of the size; see [`compact`].
 //!
 //! # LightGBM import
 //!
-//! [`BoostedModel::from_lightgbm_text`] reads the text model LightGBM 4.x
+//! [`BoostedModel::decode`] with [`ModelFormat::LightgbmText`] reads the text model LightGBM 4.x
 //! writes with `Booster.save_model` / `model_to_string` (format `v4`).
 //! The imported model predicts, explains ([`predict_contribs`] matches
 //! LightGBM's `pred_contrib`), slices, and saves natively like any other,
@@ -156,11 +176,11 @@
 //!
 //! # XGBoost interchange
 //!
-//! The XGBoost methods target the XGBoost 3.4.2 schema (identical to
+//! The XGBoost formats target the XGBoost 3.4.2 schema (identical to
 //! 3.4.1's) in both of XGBoost's encodings: JSON text
-//! ([`to_xgboost_json`] / [`from_xgboost_json`], XGBoost's `m.json`) and
-//! Universal Binary JSON ([`to_xgboost_ubjson`] / [`from_xgboost_ubjson`],
-//! XGBoost's `m.ubj` and `save_raw("ubj")`). Both encodings carry the same
+//! ([`ModelFormat::XgboostJson`], XGBoost's `m.json`) and Universal Binary
+//! JSON ([`ModelFormat::XgboostUbjson`], XGBoost's `m.ubj` and
+//! `save_raw("ubj")`). Both encodings carry the same
 //! document and share one model mapping; UBJSON only changes how it is
 //! serialized (see [UBJSON encoding](#ubjson-encoding)).
 //!
@@ -299,7 +319,7 @@
 //!
 //! XGBoost keeps the node-indexed tree arrays as typed arrays and writes them
 //! to UBJSON in optimized form (`[$<type>#L<count>` plus big-endian
-//! payloads). [`to_xgboost_ubjson`] does the same with XGBoost's element
+//! payloads). Encoding [`ModelFormat::XgboostUbjson`] does the same with XGBoost's element
 //! types: float32 for `split_conditions`, `base_weights`, `loss_changes`,
 //! `sum_hessian` (and `leaf_weights`, gblinear `weights`); int32 for
 //! `left_children`, `right_children`, `parents`, `categories`,
@@ -309,7 +329,7 @@
 //! category container's int32 `feature_segments` / `sorted_idx` / `offsets`
 //! and its per-column `values` follow XGBoost too. Every other array is a
 //! counted generic array, numbers are float32 and integers the narrowest
-//! width, again as XGBoost writes them. [`from_xgboost_ubjson`] accepts the
+//! width, again as XGBoost writes them. Decoding it accepts the
 //! optimized and the plain UBJSON container forms alike.
 //!
 //! [`predict_margin`]: BoostedModel::predict_margin
@@ -318,24 +338,14 @@
 //! [`predict_distribution`]: BoostedModel::predict_distribution
 //! [`predict_contribs`]: BoostedModel::predict_contribs
 //! [`predict_interactions`]: BoostedModel::predict_interactions
-//! [`from_bytes`]: BoostedModel::from_bytes
-//! [`save_binary`]: BoostedModel::save_binary
-//! [`load_binary`]: BoostedModel::load_binary
-//! [`from_json`]: BoostedModel::from_json
-//! [`save_json`]: BoostedModel::save_json
-//! [`load_json`]: BoostedModel::load_json
-//! [`to_xgboost_json`]: BoostedModel::to_xgboost_json
-//! [`from_xgboost_json`]: BoostedModel::from_xgboost_json
-//! [`save_xgboost_json`]: BoostedModel::save_xgboost_json
-//! [`load_xgboost_json`]: BoostedModel::load_xgboost_json
-//! [`to_xgboost_ubjson`]: BoostedModel::to_xgboost_ubjson
-//! [`from_xgboost_ubjson`]: BoostedModel::from_xgboost_ubjson
-//! [`save_xgboost_ubjson`]: BoostedModel::save_xgboost_ubjson
-//! [`load_xgboost_ubjson`]: BoostedModel::load_xgboost_ubjson
+//! [`decode`]: BoostedModel::decode
+//! [`save`]: BoostedModel::save
+//! [`load`]: BoostedModel::load
 
 mod categories;
 pub mod compact;
 pub(crate) mod container;
+mod io;
 mod lightgbm;
 pub(crate) mod native;
 mod objective;
@@ -353,6 +363,7 @@ mod xgboost;
 
 pub(crate) use shrinkage::{Shrinkage, shrink_margins};
 
+pub use io::ModelFormat;
 pub use objective::ModelObjective;
 pub use predict::Iterations;
 use predict::RowBlock;
@@ -407,7 +418,8 @@ pub enum ImportanceType {
 /// `(t / num_parallel_tree) % n_outputs`.
 ///
 /// The serde implementations are the native JSON format
-/// ([`to_json`](Self::to_json) / [`from_json`](Self::from_json)).
+/// ([`ModelFormat::Json`] in [`encode`](Self::encode) /
+/// [`decode`](Self::decode)).
 /// Deserializing validates the model like every loader does and refuses an
 /// inconsistent one, so a model deserialized through serde directly is as
 /// safe to predict with and train on as a loaded one.
@@ -946,7 +958,7 @@ impl BoostedModel {
         self.refuse_partial_shrunk_range(&(0..end), what)?;
         let trees = &self.trees[..end];
         if trees.iter().any(|tree| tree.linear_leaves().is_some()) {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "linear_tree",
                 "SHAP contributions and interactions are not defined for models with linear leaves",
             ));
@@ -1114,7 +1126,7 @@ impl BoostedModel {
                 Bound::Unbounded | Bound::Included(0)
             ) && iterations.end_bound() == Bound::Unbounded;
             if !whole {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::incompatible_model(
                     param,
                     "gblinear models have no boosting iterations to select; pass `..`",
                 ));
@@ -1133,10 +1145,16 @@ impl BoostedModel {
             Bound::Excluded(&e) => e,
             Bound::Unbounded => rounds,
         };
-        if end > rounds || begin > end {
-            return Err(HessboostError::invalid_param(
+        if end > rounds {
+            return Err(HessboostError::incompatible_model(
                 param,
                 format!("{begin}..{end} is out of range for a model with {rounds} iterations"),
+            ));
+        }
+        if begin > end {
+            return Err(HessboostError::invalid_param(
+                param,
+                format!("{begin}..{end} is an inverted range"),
             ));
         }
         Ok(begin..end)
@@ -1199,125 +1217,6 @@ impl BoostedModel {
         validate_prediction_data(self.n_features, self.n_outputs(), data)
     }
 
-    /// Serialize the model to the native binary format: a zstd-compressed
-    /// container of named, typed sections holding the trees column-wise.
-    /// Files written by this version keep loading in later ones.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        native::write(self)
-    }
-
-    /// Deserialize a model from bytes produced by [`BoostedModel::to_bytes`]
-    /// of this or an earlier version. Malformed input, and files that need
-    /// a feature this version lacks, are refused with
-    /// [`HessboostError::ModelFormat`].
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let model = native::read(bytes)?;
-        model.validate_structure()?;
-        Ok(model)
-    }
-
-    /// Save the model to a file in the native binary format.
-    pub fn save_binary(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_bytes()?)?)
-    }
-
-    /// Load a model from a native binary file.
-    pub fn load_binary(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_bytes(&std::fs::read(path)?)
-    }
-
-    /// Serialize the model to a (human-readable) JSON string: the model's
-    /// fields by name.
-    pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
-    }
-
-    /// Deserialize a model from a JSON string produced by
-    /// [`BoostedModel::to_json`]. Malformed JSON is refused with
-    /// [`HessboostError::Json`], an inconsistent model with
-    /// [`HessboostError::ModelFormat`].
-    pub fn from_json(s: &str) -> Result<Self> {
-        Self::try_from(serde_json::from_str::<UncheckedBoostedModel>(s)?)
-    }
-    /// Save the model to a JSON file.
-    pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_json()?)?)
-    }
-
-    /// Load a model from a JSON file.
-    pub fn load_json(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_json(&std::fs::read_to_string(path)?)
-    }
-
-    /// Serialize the model to XGBoost's JSON model schema (the text form of
-    /// `booster.save_model("m.json")`), so XGBoost-compatible tooling can read
-    /// it. See [XGBoost interchange](crate::model#xgboost-interchange) for the
-    /// mapping and caveats.
-    pub fn to_xgboost_json(&self) -> Result<String> {
-        crate::model::xgboost::export_xgboost_json(self)
-    }
-
-    /// Parse a model saved in XGBoost's JSON model schema: `gbtree` boosters
-    /// (including DART) with scalar- or vector-leaf trees. See
-    /// [XGBoost interchange](crate::model#xgboost-interchange) for the
-    /// mapping and limitations.
-    pub fn from_xgboost_json(json: &str) -> Result<Self> {
-        crate::model::xgboost::import_xgboost_json(json)
-    }
-
-    /// Save the model to a file in XGBoost's JSON model format.
-    pub fn save_xgboost_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_xgboost_json()?)?)
-    }
-
-    /// Load a model from a file written in XGBoost's JSON model format.
-    pub fn load_xgboost_json(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_xgboost_json(&std::fs::read_to_string(path)?)
-    }
-
-    /// Serialize the model to XGBoost's UBJSON model format (the bytes of
-    /// `booster.save_model("m.ubj")` / `save_raw("ubj")`), carrying the same
-    /// document as [`BoostedModel::to_xgboost_json`]. See
-    /// [UBJSON encoding](crate::model#ubjson-encoding) for the element types.
-    pub fn to_xgboost_ubjson(&self) -> Result<Vec<u8>> {
-        crate::model::xgboost::export_xgboost_ubjson(self)
-    }
-
-    /// Parse a model saved in XGBoost's UBJSON model format (optimized or
-    /// plain containers), with the same mapping and limitations as
-    /// [`BoostedModel::from_xgboost_json`].
-    pub fn from_xgboost_ubjson(bytes: &[u8]) -> Result<Self> {
-        crate::model::xgboost::import_xgboost_ubjson(bytes)
-    }
-
-    /// Save the model to a file in XGBoost's UBJSON model format (XGBoost's
-    /// `.ubj` files).
-    pub fn save_xgboost_ubjson(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_xgboost_ubjson()?)?)
-    }
-
-    /// Load a model from a file written in XGBoost's UBJSON model format.
-    pub fn load_xgboost_ubjson(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_xgboost_ubjson(&std::fs::read(path)?)
-    }
-
-    /// Parse a LightGBM 4.x text model: the file `booster.save_model("model.txt")`
-    /// writes, or `booster.model_to_string()`. The model predicts, explains,
-    /// slices, and saves like any other; see
-    /// [LightGBM import](crate::model#lightgbm-import) for the mapping, the
-    /// input conventions it assumes (missing values as `NaN`, categories as
-    /// non-negative codes), and the models it refuses with a
-    /// [`HessboostError::ModelFormat`].
-    pub fn from_lightgbm_text(text: &str) -> Result<Self> {
-        crate::model::lightgbm::import_lightgbm_text(text)
-    }
-
-    /// Load a LightGBM 4.x text model file (`booster.save_model("model.txt")`);
-    /// see [`BoostedModel::from_lightgbm_text`].
-    pub fn load_lightgbm_text(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_lightgbm_text(&std::fs::read_to_string(path)?)
-    }
-
     /// The loss of the model's built-in objective (`None` for another
     /// objective, whose predictions are margins).
     pub(crate) fn rebuild_objective(&self) -> Option<Result<Arc<dyn Loss>>> {
@@ -1351,6 +1250,7 @@ mod tests {
     use crate::data::DMatrix;
     use crate::error::HessboostError;
     use crate::model::Iterations;
+    use crate::model::ModelFormat;
     use crate::objective::{Objective, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::training::train;
@@ -1389,15 +1289,16 @@ mod tests {
     fn loading_propagates_invalid_builtin_objective() {
         let d = labeled_dense(&[0.0, 1.0], 2, 1, &[0.0, 1.0]);
         let model = train(&TrainingParams::default(), &d, 1).unwrap();
-        let mut value: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
         value["n_targets"] = 2.into();
         value["objective"] = "count:poisson".into();
         assert!(matches!(
-            BoostedModel::from_json(&value.to_string()),
+            BoostedModel::decode(value.to_string(), ModelFormat::Json),
             Err(HessboostError::ModelFormat(_))
         ));
         value["objective"] = "my:custom".into();
-        let custom = BoostedModel::from_json(&value.to_string()).unwrap();
+        let custom = BoostedModel::decode(value.to_string(), ModelFormat::Json).unwrap();
         assert_eq!(custom.objective().name(), "my:custom");
         assert_eq!(custom.objective().built_in(), None);
     }
@@ -1413,14 +1314,23 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 2).unwrap();
-        assert!(BoostedModel::from_bytes(&model.to_bytes().unwrap()).is_ok());
+        assert!(
+            BoostedModel::decode(
+                model.encode(ModelFormat::Binary).unwrap(),
+                ModelFormat::Binary
+            )
+            .is_ok()
+        );
         for (weight, bias) in [(f32::INFINITY, 0.0), (0.0, f32::NAN)] {
             let mut corrupt = model.clone();
             let linear = corrupt.linear.as_mut().unwrap();
             linear.weights[0] = weight;
             linear.bias[0] = bias;
             assert!(matches!(
-                BoostedModel::from_bytes(&corrupt.to_bytes().unwrap()),
+                BoostedModel::decode(
+                    corrupt.encode(ModelFormat::Binary).unwrap(),
+                    ModelFormat::Binary
+                ),
                 Err(HessboostError::ModelFormat(_))
             ));
         }
@@ -1435,11 +1345,11 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 2).unwrap();
-        let doc = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        let doc = serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
         (model, doc)
     }
 
-    /// Deserializing through serde directly validates like `from_json`: an
+    /// Deserializing through serde directly validates like decoding native JSON: an
     /// empty gblinear bias used to load and panic in prediction, and a cyclic
     /// tree used to load and loop forever in traversal.
     #[test]
@@ -1454,18 +1364,19 @@ mod tests {
         doc["linear"]["bias"] = serde_json::json!([]);
         assert!(serde_json::from_value::<BoostedModel>(doc.clone()).is_err());
         assert!(matches!(
-            BoostedModel::from_json(&doc.to_string()),
+            BoostedModel::decode(doc.to_string(), ModelFormat::Json),
             Err(HessboostError::ModelFormat(_))
         ));
 
         let d = labeled_dense(&[0.0, 1.0, 2.0, 3.0], 4, 1, &[0.0, 0.0, 1.0, 1.0]);
         let model = train(&TrainingParams::default(), &d, 1).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
         assert!(doc["trees"][0]["nodes"].as_array().unwrap().len() > 1);
         doc["trees"][0]["nodes"][0]["left"] = 0.into();
         assert!(serde_json::from_value::<BoostedModel>(doc.clone()).is_err());
         assert!(matches!(
-            BoostedModel::from_json(&doc.to_string()),
+            BoostedModel::decode(doc.to_string(), ModelFormat::Json),
             Err(HessboostError::ModelFormat(_))
         ));
     }
@@ -1478,13 +1389,16 @@ mod tests {
         let (model, mut doc) = gblinear_doc();
         doc["best_iteration"] = 0.into();
         assert!(matches!(
-            BoostedModel::from_json(&doc.to_string()),
+            BoostedModel::decode(doc.to_string(), ModelFormat::Json),
             Err(HessboostError::ModelFormat(_))
         ));
         let mut stopped = model.clone();
         stopped.set_best_iteration(Some(0));
         assert!(matches!(
-            BoostedModel::from_bytes(&stopped.to_bytes().unwrap()),
+            BoostedModel::decode(
+                stopped.encode(ModelFormat::Binary).unwrap(),
+                ModelFormat::Binary
+            ),
             Err(HessboostError::ModelFormat(_))
         ));
     }
@@ -1512,11 +1426,12 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &d, 1).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
-        assert!(BoostedModel::from_json(&doc.to_string()).is_ok());
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
+        assert!(BoostedModel::decode(doc.to_string(), ModelFormat::Json).is_ok());
         doc["num_class"] = 2.into();
         assert!(matches!(
-            BoostedModel::from_json(&doc.to_string()),
+            BoostedModel::decode(doc.to_string(), ModelFormat::Json),
             Err(HessboostError::ModelFormat(_))
         ));
     }

@@ -362,7 +362,8 @@ class Booster(_SchemaState):
         "LightGBM import" docs for the mapping.
 
         Raises:
-            ModelFormatError: The content is not a valid model.
+            ModelFormatError: The content is in none of these formats (when
+                detecting it), or is not a valid model.
             OSError: The file cannot be read.
         """
         data = (

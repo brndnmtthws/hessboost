@@ -632,7 +632,7 @@ impl Objective {
         }
         match self.label_matrix() {
             LabelMatrix::PerColumn => Ok(Arc::new(MultiTarget::new(single, n_targets))),
-            LabelMatrix::Native | LabelMatrix::Refused => Err(HessboostError::invalid_param(
+            LabelMatrix::Native | LabelMatrix::Refused => Err(HessboostError::invalid_data(
                 "labels",
                 format!(
                     "objective `{}` supports one target per row, got {n_targets}",

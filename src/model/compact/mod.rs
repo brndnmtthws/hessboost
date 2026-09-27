@@ -115,7 +115,7 @@
 //! let model = train(&params, &dtrain, 20)?;
 //!
 //! let bytes = model.to_compact_bytes()?;
-//! let compact = CompactModel::from_bytes(&bytes)?;
+//! let compact = CompactModel::decode(&bytes)?;
 //! assert_eq!(compact.predict_margin(&dtrain)?, model.predict_margin(&dtrain, Iterations::Best)?);
 //!
 //! let report = model.size_report()?;
@@ -136,6 +136,7 @@ use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
+use crate::model::ModelFormat;
 use crate::model::{
     BoostedModel, RowBlock, Shrinkage, initial_margins, shrink_margins, transform_model_margins,
     validate_prediction_data,
@@ -399,12 +400,12 @@ enum Slot {
 /// margins to the [`BoostedModel`] it was built from.
 ///
 /// Build one with [`BoostedModel::to_compact`] or parse
-/// [`BoostedModel::to_compact_bytes`] output with [`CompactModel::from_bytes`].
+/// [`BoostedModel::to_compact_bytes`] output with [`CompactModel::decode`].
 /// Prediction walks the packed trees directly; the in-memory footprint is the
 /// serialized bytes plus the decoded threshold and leaf dictionaries.
 #[derive(Debug, Clone)]
 pub struct CompactModel {
-    /// The serialized form, as [`CompactModel::to_bytes`] returns it,
+    /// The serialized form, as [`CompactModel::encode`] returns it,
     /// followed by [`STREAM_PAD`] zero bytes so a field read may always load
     /// eight bytes; tree offsets index its bits.
     bytes: Vec<u8>,
@@ -583,7 +584,7 @@ impl CompactModel {
     }
 
     /// The serialized model (the exact bytes it was parsed from).
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         self.serialized().to_vec()
     }
 
@@ -600,7 +601,7 @@ impl CompactModel {
 
     /// Load a model saved with [`CompactModel::save`].
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_bytes(&std::fs::read(path)?)
+        Self::decode(std::fs::read(path)?)
     }
 
     /// The objective that drives [`CompactModel::predict`].
@@ -646,7 +647,8 @@ impl CompactModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ModelSizeReport {
-    /// [`BoostedModel::to_bytes`] length (all trees, with covers and gains).
+    /// [`BoostedModel::encode`] length in [`ModelFormat::Binary`] (all
+    /// trees, with covers and gains).
     pub native_bytes: usize,
     /// [`BoostedModel::to_compact_bytes`] length.
     pub compact_bytes: usize,
@@ -685,13 +687,13 @@ impl BoostedModel {
     /// gblinear, linear-leaf and vector-leaf models and for trees the format
     /// cannot express (a feature split both numerically and categorically).
     pub fn to_compact(&self) -> Result<CompactModel> {
-        CompactModel::from_bytes(&encode(self)?)
+        CompactModel::decode(encode(self)?)
     }
 
     /// Serialize this model in the compact layout without parsing the result
     /// back (the path for writing `HBTD` files; [`Self::to_compact`] is this
-    /// plus [`CompactModel::from_bytes`]). Parse the bytes with
-    /// [`CompactModel::from_bytes`].
+    /// plus [`CompactModel::decode`]). Parse the bytes with
+    /// [`CompactModel::decode`].
     pub fn to_compact_bytes(&self) -> Result<Vec<u8>> {
         encode(self)
     }
@@ -707,7 +709,7 @@ impl BoostedModel {
             .sum();
         let nodes: usize = trees.iter().map(RegTree::num_nodes).sum();
         Ok(ModelSizeReport {
-            native_bytes: self.to_bytes()?.len(),
+            native_bytes: self.encode(ModelFormat::Binary)?.len(),
             compact_bytes: compact.size_bytes(),
             trees: trees.len(),
             splits,

@@ -63,8 +63,8 @@ impl<'a> EvalPlan<'a> {
             for metric in &metrics {
                 metric
                     .validate_info(info)
-                    .and_then(|()| check_prediction_width(metric.as_ref(), info, n_out))
-                    .map_err(|error| name_dataset(error, set.name))?;
+                    .map_err(|error| error.in_dataset(set.name))?;
+                check_prediction_width(metric.as_ref(), info, n_out, set.name)?;
             }
         }
         Ok(EvalPlan {
@@ -185,48 +185,31 @@ pub(super) fn configured_metrics(
     }
 }
 
-/// Name the offending dataset in a [`validate_info`] error: the first
-/// "dataset" in the reason becomes ``dataset `name` `` (reasons without that
-/// word get a ``dataset `name`: `` prefix).
-///
-/// [`validate_info`]: crate::objective::Loss::validate_info
-pub(super) fn name_dataset(error: HessboostError, dataset: &str) -> HessboostError {
-    match error {
-        HessboostError::InvalidParameter { name, reason } => {
-            let named = format!("dataset `{dataset}`");
-            let reason = if reason.contains("dataset") {
-                reason.replacen("dataset", &named, 1)
-            } else {
-                format!("{named}: {reason}")
-            };
-            HessboostError::InvalidParameter { name, reason }
-        }
-        other => other,
-    }
-}
-
 /// Refuse a metric that reads a different number of predictions per row
 /// than the model's `n_out` outputs (XGBoost's "label and prediction size
 /// not match"): an elementwise metric on an alpha-list, multiclass, or
 /// distributional model, a multiclass metric on a single-output model, and
 /// so on. A metric of any width ([`Metric::prediction_width`] `None`, the
 /// custom-metric hook) needs a whole number of outputs per label column.
+/// Fails with [`HessboostError::InvalidParameter`] (`eval_metric`), the
+/// reason naming `dataset`.
 ///
 /// [`Metric::prediction_width`]: crate::metric::Metric::prediction_width
 fn check_prediction_width(
     metric: &dyn crate::metric::Metric,
     info: &MetaInfo,
     n_out: usize,
+    dataset: &str,
 ) -> Result<()> {
     let reason = match metric.prediction_width(info) {
         Some(width) if width != n_out => format!(
-            "metric `{}` reads {width} prediction(s) per row of dataset, but the model has \
-             {n_out} outputs",
+            "metric `{}` reads {width} prediction(s) per row of dataset `{dataset}`, but the \
+             model has {n_out} outputs",
             metric.name()
         ),
         None if !n_out.is_multiple_of(info.n_targets().max(1)) => format!(
             "metric `{}` needs a whole number of the model's {n_out} outputs per label \
-             column of dataset ({} columns)",
+             column of dataset `{dataset}` ({} columns)",
             metric.name(),
             info.n_targets()
         ),

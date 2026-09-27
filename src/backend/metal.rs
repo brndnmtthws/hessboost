@@ -900,14 +900,14 @@ impl MetalHistBackend {
         let n_cols = index.n_cols();
         let total_bins = index.total_bins();
         if total_bins == 0 || n_rows == 0 {
-            return Err(HessboostError::invalid_param(
-                "device",
+            return Err(HessboostError::invalid_data(
+                "data",
                 "the Metal backend needs a non-empty binned dataset",
             ));
         }
         if total_bins > MAX_BUFFER_ENTRIES || n_rows > MAX_BUFFER_ENTRIES {
-            return Err(HessboostError::invalid_param(
-                "device",
+            return Err(HessboostError::invalid_data(
+                "data",
                 format!(
                     "the dataset exceeds the Metal backend's index limits \
                      ({n_rows} rows, {total_bins} bins)"
@@ -1289,8 +1289,8 @@ fn interleaved_columns(
         .checked_mul(n_records)
         .filter(|&r| r * record <= MAX_BUFFER_ENTRIES)
         .ok_or_else(|| {
-            HessboostError::invalid_param(
-                "device",
+            HessboostError::invalid_data(
+                "data",
                 format!(
                     "the interleaved column copy the Metal backend needs \
                      ({n} rows x {f_count} features) exceeds 4 GiB"
@@ -1467,7 +1467,7 @@ impl GpuModel {
             return Ok(crate::model::Predictions::new(margins, n, k));
         }
         if n > MAX_BUFFER_ENTRIES || n * data.n_cols() > MAX_BUFFER_ENTRIES {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "data",
                 format!(
                     "GPU prediction needs a dense row copy ({} rows x {} features) \
@@ -1604,13 +1604,13 @@ impl BoostedModel {
             )
         })?;
         if self.is_gblinear() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 "gblinear models predict from their linear weights, not the tree forest",
             ));
         }
         if self.has_linear_leaves() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "model",
                 "`linear_tree` models predict through per-leaf linear models, \
                  which the GPU forest does not hold",

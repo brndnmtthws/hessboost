@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::forest::{
     ColumnKind, ForestMethod, ForestModel, ForestParams, ImputeOptions, NoiseLevels, Repaint,
 };
@@ -14,7 +15,7 @@ use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
-use common::{invalid_param, labeled_dense, lcg, with_threads};
+use common::{incompatible_model, invalid_data, invalid_param, labeled_dense, lcg, with_threads};
 
 const COLS: usize = 3;
 
@@ -153,8 +154,8 @@ fn imputation_keeps_observed_entries_and_uses_them() {
     // Flow matching cannot impute.
     let flow = ForestModel::fit(&quick(ForestParams::default()), &labelled(&x, &y)).unwrap();
     assert_eq!(
-        invalid_param(flow.impute(&data, 1, &ImputeOptions::seeded(0))),
-        "method"
+        incompatible_model(flow.impute(&data, 1, &ImputeOptions::seeded(0))),
+        "impute"
     );
 }
 
@@ -198,18 +199,25 @@ fn both_formats_round_trip() {
     ] {
         let model = ForestModel::fit(&params, &data).unwrap();
         let expected = model.sample(20, 1).unwrap();
-        let bytes = model.to_bytes().unwrap();
-        let resaved = ForestModel::from_bytes(&bytes).unwrap().to_bytes().unwrap();
+        let bytes = model.encode(DiffusionFormat::Binary).unwrap();
+        let resaved = ForestModel::decode(&bytes, DiffusionFormat::Binary)
+            .unwrap()
+            .encode(DiffusionFormat::Binary)
+            .unwrap();
         assert!(resaved == bytes, "re-saving changes the bytes");
         for loaded in [
-            ForestModel::from_bytes(&bytes).unwrap(),
-            ForestModel::from_json(&model.to_json().unwrap()).unwrap(),
+            ForestModel::decode(&bytes, DiffusionFormat::Binary).unwrap(),
+            ForestModel::decode(
+                model.encode(DiffusionFormat::Json).unwrap(),
+                DiffusionFormat::Json,
+            )
+            .unwrap(),
         ] {
             assert_eq!(loaded.method(), model.method());
             assert_eq!(loaded.sample(20, 1).unwrap(), expected);
         }
         assert!(matches!(
-            ForestModel::from_bytes(&bytes[..bytes.len() / 2]),
+            ForestModel::decode(&bytes[..bytes.len() / 2], DiffusionFormat::Binary),
             Err(HessboostError::ModelFormat(_))
         ));
     }
@@ -239,24 +247,27 @@ fn unsupported_inputs_are_refused() {
     ));
     let weighted = labelled(&x, &y).with_weights(&[1.0; 60]).unwrap();
     assert_eq!(
-        invalid_param(ForestModel::fit(&quick(ForestParams::default()), &weighted)),
-        "data"
+        invalid_data(ForestModel::fit(&quick(ForestParams::default()), &weighted)),
+        ("weights", None)
     );
 
     let model = ForestModel::fit(&quick(ForestParams::forest_diffusion()), &data).unwrap();
     assert_eq!(invalid_param(model.sample(0, 1)), "n_rows");
     assert_eq!(invalid_param(model.sample(usize::MAX, 1)), "n_rows");
-    assert_eq!(invalid_param(model.sample_for_labels(&[2.0], 1)), "labels");
+    assert_eq!(
+        invalid_data(model.sample_for_labels(&[2.0], 1)),
+        ("labels", None)
+    );
     let unlabelled = DMatrix::from_dense(&x, 60, COLS).unwrap();
     assert_eq!(
-        invalid_param(model.impute(&unlabelled, 1, &ImputeOptions::seeded(1))),
-        "data"
+        invalid_data(model.impute(&unlabelled, 1, &ImputeOptions::seeded(1))),
+        ("labels", None)
     );
     let mut unseen = x.clone();
     unseen[2] = 5.0;
     assert_eq!(
-        invalid_param(model.impute(&labelled(&unseen, &y), 1, &ImputeOptions::seeded(1))),
-        "data"
+        invalid_data(model.impute(&labelled(&unseen, &y), 1, &ImputeOptions::seeded(1))),
+        ("data", None)
     );
     assert_eq!(
         invalid_param(model.impute(&data, usize::MAX, &ImputeOptions::seeded(1))),
@@ -334,10 +345,10 @@ fn single_label_boosters_on_several_columns_are_refused() {
                 .eta(0.8)
                 .build()
                 .unwrap();
-            assert!(matches!(
-                ForestModel::fit(&params, &labelled(&x, &y)),
-                Err(HessboostError::InvalidParameter { .. })
-            ));
+            assert_eq!(
+                invalid_data(ForestModel::fit(&params, &labelled(&x, &y))),
+                ("labels", None)
+            );
         }
     }
 }
@@ -355,8 +366,8 @@ fn imputation_refuses_label_matrices() {
         .with_label_matrix(&matrix, 2)
         .unwrap();
     assert_eq!(
-        invalid_param(model.impute(&data, 1, &ImputeOptions::seeded(1))),
-        "data"
+        invalid_data(model.impute(&data, 1, &ImputeOptions::seeded(1))),
+        ("labels", None)
     );
 }
 
@@ -367,7 +378,8 @@ fn stored_values_outside_f32_are_refused() {
     let (x, y) = table(60, 7);
     let model =
         ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
-    let json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&model.encode(DiffusionFormat::Json).unwrap()).unwrap();
     for (path, value) in [
         ("/classes/0", serde_json::json!(-1e100)),
         ("/classes/0", serde_json::json!(0.1)),
@@ -377,7 +389,7 @@ fn stored_values_outside_f32_are_refused() {
         let mut doc = json.clone();
         *doc.pointer_mut(path).unwrap() = value;
         assert!(
-            ForestModel::from_json(&doc.to_string()).is_err(),
+            ForestModel::decode(doc.to_string(), DiffusionFormat::Json).is_err(),
             "{path} accepted"
         );
     }

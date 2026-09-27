@@ -976,8 +976,11 @@ impl BoostedModel {
     ///
     /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
     /// model, [`HessboostError::ModelFormat`] when a tree has a negative cover,
-    /// [`HessboostError::InvalidParameter`] for linear-leaf models and an
-    /// out-of-range `iterations`.
+    /// [`HessboostError::IncompatibleModel`] for linear-leaf models
+    /// (`linear_tree`), `iterations` past the model's or a partial range of
+    /// a shrunk model (`iterations`); [`HessboostError::InvalidParameter`]
+    /// (`iterations`) for an inverted range or one starting after iteration
+    /// `0`.
     pub fn predict_contribs(
         &self,
         data: &DMatrix,
@@ -1180,6 +1183,7 @@ mod tests {
     use crate::config::{BoosterKind, Dart, TrainingParams, TreeMethod};
     use crate::data::{DMatrix, FeatureType};
     use crate::model::Iterations;
+    use crate::model::ModelFormat;
     use crate::objective::{Multiclass, Objective, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
@@ -1670,7 +1674,7 @@ mod tests {
             node(0, -1, -1, 1.0, -1.0),
             node(0, -1, -1, 2.0, 2.0),
         );
-        let model = crate::model::BoostedModel::from_json(&json).unwrap();
+        let model = crate::model::BoostedModel::decode(&json, ModelFormat::Json).unwrap();
         let d = DMatrix::from_dense(&[0.2], 1, 1).unwrap();
         assert!(matches!(
             model.predict_contribs(&d, Iterations::Best),

@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::{
     DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, SampleOptions, Samples,
     ScoreConfig, Sde,
@@ -15,7 +16,7 @@ use hessboost::objective::LambdaRank;
 use hessboost::prelude::*;
 
 mod common;
-use common::{invalid_param, lcg, with_threads};
+use common::{invalid_data, invalid_param, lcg, with_threads};
 
 /// `y = ±(1 + x) + 0.05 ε`: two modes whose gap grows with `x`.
 fn bimodal(n: usize, seed: u64) -> DMatrix {
@@ -201,8 +202,8 @@ fn stored_draws_rebuild_their_samples() {
         (Vec::new(), usize::MAX, 2),
     ] {
         assert_eq!(
-            invalid_param(Samples::new(values, n_samples, n_outputs)),
-            "samples"
+            invalid_data(Samples::new(values, n_samples, n_outputs)),
+            ("samples", None)
         );
     }
 }
@@ -238,13 +239,17 @@ fn both_formats_round_trip_the_sampler() {
     ] {
         let model = DiffusionModel::fit(&params, &data).unwrap();
         let expected = model.sample(&probe, 20, &SampleOptions::seeded(1)).unwrap();
-        let bytes = model.to_bytes().unwrap();
-        let from_bytes = DiffusionModel::from_bytes(&bytes).unwrap();
+        let bytes = model.encode(DiffusionFormat::Binary).unwrap();
+        let from_bytes = DiffusionModel::decode(&bytes, DiffusionFormat::Binary).unwrap();
         assert!(
-            from_bytes.to_bytes().unwrap() == bytes,
+            from_bytes.encode(DiffusionFormat::Binary).unwrap() == bytes,
             "re-saving changes the bytes"
         );
-        let from_json = DiffusionModel::from_json(&model.to_json().unwrap()).unwrap();
+        let from_json = DiffusionModel::decode(
+            model.encode(DiffusionFormat::Json).unwrap(),
+            DiffusionFormat::Json,
+        )
+        .unwrap();
         for loaded in [&from_bytes, &from_json] {
             assert_eq!(loaded.method(), model.method());
             assert_eq!(loaded.n_steps(), model.n_steps());
@@ -262,35 +267,38 @@ fn both_formats_round_trip_the_sampler() {
 fn damaged_or_incomplete_files_are_refused() {
     let data = bimodal(300, 5);
     let model = DiffusionModel::fit(&quick(DiffusionParams::default()), &data).unwrap();
-    let bytes = model.to_bytes().unwrap();
+    let bytes = model.encode(DiffusionFormat::Binary).unwrap();
     for truncated in [&bytes[..bytes.len() / 2], &bytes[..3], &[][..]] {
         assert!(matches!(
-            DiffusionModel::from_bytes(truncated),
+            DiffusionModel::decode(truncated, DiffusionFormat::Binary),
             Err(HessboostError::ModelFormat(_))
         ));
     }
     // A native GBDT file is not a diffusion model, and vice versa.
-    let gbdt = model.regressor().to_bytes().unwrap();
+    let gbdt = model.regressor().encode(ModelFormat::Binary).unwrap();
     assert!(matches!(
-        DiffusionModel::from_bytes(&gbdt),
+        DiffusionModel::decode(&gbdt, DiffusionFormat::Binary),
         Err(HessboostError::ModelFormat(_))
     ));
-    assert!(BoostedModel::from_bytes(&bytes).is_err());
+    assert!(BoostedModel::decode(&bytes, ModelFormat::Binary).is_err());
 
-    let mut json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&model.encode(DiffusionFormat::Json).unwrap()).unwrap();
     json.as_object_mut().unwrap().remove("residualizer");
-    assert!(DiffusionModel::from_json(&json.to_string()).is_err());
-    let mut json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    assert!(DiffusionModel::decode(json.to_string(), DiffusionFormat::Json).is_err());
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&model.encode(DiffusionFormat::Json).unwrap()).unwrap();
     json["target_scale"] = serde_json::json!([0.0]);
     assert!(matches!(
-        DiffusionModel::from_json(&json.to_string()),
+        DiffusionModel::decode(json.to_string(), DiffusionFormat::Json),
         Err(HessboostError::Json(_) | HessboostError::ModelFormat(_))
     ));
     // A regressor weighted by `scale_pos_weight` is not the unweighted
     // squared-error model the sampler integrates.
-    let mut json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&model.encode(DiffusionFormat::Json).unwrap()).unwrap();
     json["regressor"]["objective_params"]["scale_pos_weight"] = serde_json::json!(2.0);
-    let refused = DiffusionModel::from_json(&json.to_string()).unwrap_err();
+    let refused = DiffusionModel::decode(json.to_string(), DiffusionFormat::Json).unwrap_err();
     assert!(
         refused.to_string().contains("scale_pos_weight 1"),
         "{refused}"
@@ -386,17 +394,21 @@ fn single_label_boosters_train_on_one_label_column() {
         params.early_stopping = None;
         let model = DiffusionModel::fit(&params, &data).unwrap();
         let samples = model.sample(&probe, 50, &SampleOptions::seeded(1)).unwrap();
-        let reloaded = DiffusionModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        let reloaded = DiffusionModel::decode(
+            model.encode(DiffusionFormat::Binary).unwrap(),
+            DiffusionFormat::Binary,
+        )
+        .unwrap();
         assert_eq!(
             reloaded
                 .sample(&probe, 50, &SampleOptions::seeded(1))
                 .unwrap(),
             samples
         );
-        assert!(matches!(
-            DiffusionModel::fit(&params, &wide),
-            Err(HessboostError::InvalidParameter { .. })
-        ));
+        assert_eq!(
+            invalid_data(DiffusionModel::fit(&params, &wide)),
+            ("labels", None)
+        );
     }
 }
 
@@ -463,28 +475,28 @@ fn unsupported_inputs_are_refused() {
     params.method = Method::FlowMatching(vanishing);
     assert_eq!(invalid_param(DiffusionModel::fit(&params, &data)), "path");
     assert_eq!(
-        invalid_param(DiffusionModel::fit(
+        invalid_data(DiffusionModel::fit(
             &quick(DiffusionParams::default()),
             &weighted
         )),
-        "data"
+        ("weights", None)
     );
     let unlabelled = DMatrix::from_dense(&[0.0; 10], 10, 1).unwrap();
     assert_eq!(
-        invalid_param(DiffusionModel::fit(
+        invalid_data(DiffusionModel::fit(
             &quick(DiffusionParams::treeffuser()),
             &unlabelled
         )),
-        "data"
+        ("labels", None)
     );
     // Residualization cross-fits on at least 80 rows.
     let small = bimodal(50, 6);
     assert_eq!(
-        invalid_param(DiffusionModel::fit(
+        invalid_data(DiffusionModel::fit(
             &quick(DiffusionParams::default()),
             &small
         )),
-        "residualizer"
+        ("data", None)
     );
     let model = DiffusionModel::fit(&quick(DiffusionParams::treeffuser()), &small).unwrap();
     assert_eq!(

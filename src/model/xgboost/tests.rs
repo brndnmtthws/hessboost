@@ -5,6 +5,7 @@ use super::{objective::*, parse::*, tree::*};
 use crate::config::{BoosterKind, Dart, MaxDeltaStep, TrainingParams};
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
+use crate::model::ModelFormat;
 use crate::model::ModelSpec;
 use crate::model::objective::ModelObjective;
 use crate::model::{BoostedModel, Iterations};
@@ -734,7 +735,10 @@ fn xgboost_ubjson_imports_like_its_json_twin() {
             .iter()
             .any(|t| t.nodes().iter().any(|n| n.is_categorical && !n.is_leaf()))
     );
-    assert_eq!(from_ubj.to_bytes().unwrap(), from_json.to_bytes().unwrap());
+    assert_eq!(
+        from_ubj.encode(ModelFormat::Binary).unwrap(),
+        from_json.encode(ModelFormat::Binary).unwrap()
+    );
 
     let truncated = &XGB_UBJ[..XGB_UBJ.len() / 2];
     assert_format_error(import_xgboost_ubjson(truncated), "truncated");
@@ -781,7 +785,10 @@ fn ubjson_export_is_the_json_document_with_typed_tree_arrays() {
             model.predict(data, Iterations::Best).unwrap()
         );
         let via_json = import_xgboost_json(&export_xgboost_json(&model).unwrap()).unwrap();
-        assert_eq!(restored.to_bytes().unwrap(), via_json.to_bytes().unwrap());
+        assert_eq!(
+            restored.encode(ModelFormat::Binary).unwrap(),
+            via_json.encode(ModelFormat::Binary).unwrap()
+        );
     }
 }
 
@@ -1170,9 +1177,9 @@ fn xendcg_native_roundtrip_and_xgboost_exports_refused() {
         .build()
         .unwrap();
     let model = train(&params, &data, 3).unwrap();
-    let bytes = model.to_bytes().unwrap();
-    let restored = BoostedModel::from_bytes(&bytes).unwrap();
-    assert_eq!(restored.to_bytes().unwrap(), bytes);
+    let bytes = model.encode(ModelFormat::Binary).unwrap();
+    let restored = BoostedModel::decode(&bytes, ModelFormat::Binary).unwrap();
+    assert_eq!(restored.encode(ModelFormat::Binary).unwrap(), bytes);
     assert_eq!(restored.objective(), model.objective());
     assert_eq!(
         restored.predict(&data, Iterations::Best).unwrap(),

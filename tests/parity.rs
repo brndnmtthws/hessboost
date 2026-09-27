@@ -27,6 +27,7 @@ use hessboost::config::{ProcessType, Refresh};
 use hessboost::data::FeatureType;
 use hessboost::internals::HistCuts;
 use hessboost::model::Iterations;
+use hessboost::model::ModelFormat;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
 use hessboost::training::EvalHistory;
 use serde::{Deserialize, Deserializer};
@@ -575,8 +576,9 @@ impl Case<'_> {
     fn continue_imported(&self, dtest: &DMatrix, c: &Continuation) -> Result<f64, String> {
         let fx = self.fx;
         let params = build_params(fx)?;
-        let initial = BoostedModel::from_xgboost_json(&c.xgb_model_initial.to_string())
-            .map_err(|e| format!("import initial model: {e}"))?;
+        let initial =
+            BoostedModel::decode(c.xgb_model_initial.to_string(), ModelFormat::XgboostJson)
+                .map_err(|e| format!("import initial model: {e}"))?;
         let model = Trainer::new(
             &params,
             &self.train_matrix()?,
@@ -847,13 +849,15 @@ impl Case<'_> {
         let fx = self.fx;
         let from_ubj = std::fs::read(dir.join(&fx.xgb_model_ubj))
             .map_err(HessboostError::from)
-            .and_then(|bytes| BoostedModel::from_xgboost_ubjson(&bytes));
+            .and_then(|bytes| BoostedModel::decode(&bytes, ModelFormat::XgboostUbjson));
         let verdict = match (&from_ubj, from_json) {
-            (Ok(u), Ok(j)) => match (u.to_bytes(), j.to_bytes()) {
-                (Ok(u), Ok(j)) if u == j => Ok("same"),
-                (Ok(_), Ok(_)) => Err("UBJSON import differs from the JSON import".to_string()),
-                (Err(e), _) | (_, Err(e)) => Err(format!("encode imported model: {e}")),
-            },
+            (Ok(u), Ok(j)) => {
+                match (u.encode(ModelFormat::Binary), j.encode(ModelFormat::Binary)) {
+                    (Ok(u), Ok(j)) if u == j => Ok("same"),
+                    (Ok(_), Ok(_)) => Err("UBJSON import differs from the JSON import".to_string()),
+                    (Err(e), _) | (_, Err(e)) => Err(format!("encode imported model: {e}")),
+                }
+            }
             (Err(HessboostError::ModelFormat(_)), Err(HessboostError::ModelFormat(_))) => Ok("n/a"),
             (Err(e), _) => Err(format!("UBJSON import: {e}")),
             (Ok(_), Err(e)) => Err(format!("UBJSON import succeeded, JSON import failed: {e}")),
@@ -875,7 +879,7 @@ impl Case<'_> {
             return "skipped".to_string();
         }
         let written = model
-            .to_xgboost_json()
+            .encode(ModelFormat::XgboostJson)
             .map_err(|e| format!("export: {e}"))
             .and_then(|json| {
                 std::fs::write(dir.join(format!("{}.model.json", fx.name)), json)
@@ -883,7 +887,7 @@ impl Case<'_> {
             })
             .and_then(|()| {
                 model
-                    .to_xgboost_ubjson()
+                    .encode(ModelFormat::XgboostUbjson)
                     .map_err(|e| format!("export UBJSON: {e}"))
             })
             .and_then(|ubj| {
@@ -971,7 +975,7 @@ impl Case<'_> {
             }
         };
 
-        let imported = BoostedModel::from_xgboost_json(&fx.xgb_model.to_string());
+        let imported = BoostedModel::decode(fx.xgb_model.to_string(), ModelFormat::XgboostJson);
         [row.import, row.margin, row.contribs, row.interactions] =
             self.import_and_compare(&imported, &dtest, &dcontrib);
         row.ubj = self.import_ubjson(&imported, dir);

@@ -106,10 +106,12 @@
 //!
 //! # Persistence
 //!
-//! [`DiffusionModel::to_bytes`] writes a zstd-compressed section container
-//! (magic `HBDM`) holding the method, the standardization, the residualizer
-//! and the GBDTs as embedded native containers;
-//! [`DiffusionModel::to_json`] writes the same content as JSON, with each
+//! [`DiffusionModel::encode`] / [`decode`](DiffusionModel::decode) and
+//! [`save`](DiffusionModel::save) / [`load`](DiffusionModel::load) take a
+//! [`DiffusionFormat`]: [`DiffusionFormat::Binary`] is a zstd-compressed
+//! section container (magic `HBDM`) holding the method, the
+//! standardization, the residualizer and the GBDTs as embedded native
+//! containers; [`DiffusionFormat::Json`] the same content as JSON, with each
 //! GBDT in the native JSON format. Both readers validate the model.
 //!
 //! # Refusals
@@ -155,7 +157,7 @@
 //! ```
 //! use std::num::NonZeroUsize;
 //!
-//! use hessboost::diffusion::{DiffusionModel, DiffusionParams, SampleOptions};
+//! use hessboost::diffusion::{DiffusionFormat, DiffusionModel, DiffusionParams, SampleOptions};
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {
@@ -178,7 +180,8 @@
 //! let q = samples.quantiles(&[0.1, 0.9])?;
 //! assert!(q.get(0, 0).unwrap()[0] < q.get(0, 1).unwrap()[0]); // row 0: 10% < 90%
 //!
-//! let restored = DiffusionModel::from_bytes(&model.to_bytes()?)?;
+//! let bytes = model.encode(DiffusionFormat::Binary)?;
+//! let restored = DiffusionModel::decode(&bytes, DiffusionFormat::Binary)?;
 //! assert_eq!(restored.sample(&data, 20, &options)?, samples);
 //! # Ok(())
 //! # }
@@ -187,6 +190,7 @@
 mod fit;
 pub mod forest;
 mod format;
+mod io;
 mod process;
 mod sample;
 
@@ -194,12 +198,14 @@ use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
+use crate::check::{ensure, positive};
 use crate::config::{GrowPolicy, ProcessType, TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Objective;
 
+pub use io::DiffusionFormat;
 pub use sample::{Quantiles, SampleOptions, Samples, SamplesView};
 
 /// What the GBDT learns and how sampling integrates it.
@@ -547,20 +553,18 @@ impl DiffusionParams {
         validate_regressor_params("training", &self.training)?;
         if let Some(stop) = &self.early_stopping {
             let f = stop.eval_fraction;
-            if !(f.is_finite() && f > 0.0 && f < 1.0) {
-                return Err(HessboostError::invalid_param(
-                    "early_stopping.eval_fraction",
-                    format!("must be in (0, 1), got {f}"),
-                ));
-            }
+            ensure(
+                "early_stopping.eval_fraction",
+                f.is_finite() && f > 0.0 && f < 1.0,
+                format!("must be in (0, 1), got {f}"),
+            )?;
         }
         if let Some(r) = &self.residualizer {
-            if r.folds < 2 {
-                return Err(HessboostError::invalid_param(
-                    "residualizer.folds",
-                    format!("must be at least 2, got {}", r.folds),
-                ));
-            }
+            ensure(
+                "residualizer.folds",
+                r.folds >= 2,
+                format!("must be at least 2, got {}", r.folds),
+            )?;
             validate_regressor_params("residualizer.training", &r.training)?;
         }
         Ok(())
@@ -617,28 +621,15 @@ fn validate_regressor_params(name: &'static str, params: &TrainingParams) -> Res
     Ok(())
 }
 
-/// `v` is finite and `> 0`.
-fn check_positive(name: &'static str, v: f64) -> Result<()> {
-    if !(v.is_finite() && v > 0.0) {
-        return Err(HessboostError::invalid_param(
-            name,
-            format!("must be finite and > 0, got {v}"),
-        ));
-    }
-    Ok(())
-}
-
 /// `0 < lo < hi`, both finite.
 fn check_schedule(name: &'static str, lo: f64, hi: f64) -> Result<()> {
-    check_positive(name, lo)?;
-    check_positive(name, hi)?;
-    if lo >= hi {
-        return Err(HessboostError::invalid_param(
-            name,
-            format!("the minimum ({lo}) must be below the maximum ({hi})"),
-        ));
-    }
-    Ok(())
+    positive(name, lo)?;
+    positive(name, hi)?;
+    ensure(
+        name,
+        lo < hi,
+        format!("the minimum ({lo}) must be below the maximum ({hi})"),
+    )
 }
 
 impl Method {
@@ -658,9 +649,9 @@ impl Method {
                     }
                 }
                 if let Parameterization::Edm { sigma_data } = score.parameterization {
-                    check_positive("sigma_data", sigma_data)?;
+                    positive("sigma_data", sigma_data)?;
                     // The coefficients divide by `σ_d²`-sized terms.
-                    check_positive("sigma_data", sigma_data * sigma_data)?;
+                    positive("sigma_data", sigma_data * sigma_data)?;
                 }
                 // Finite parameters can still overflow the kernel (e.g. a VE
                 // `σ_max²` beyond `f64::MAX`); every quantity is monotone in
@@ -670,12 +661,11 @@ impl Method {
                     let (c, g2) = score.sde.drift_diffusion(t);
                     [alpha, std, std.ln(), c, g2].iter().all(|v| v.is_finite())
                 }) && score.sde.prior_std().is_finite();
-                if !finite {
-                    return Err(HessboostError::invalid_param(
-                        "sde",
-                        "the schedule's noise scale or drift is zero or overflows on [1e-5, 1]",
-                    ));
-                }
+                ensure(
+                    "sde",
+                    finite,
+                    "the schedule's noise scale or drift is zero or overflows on [1e-5, 1]",
+                )?;
                 score.time_sampling.validate()
             }
             Method::FlowMatching(flow) => {
@@ -688,12 +678,11 @@ impl Method {
                         .iter()
                         .all(|v| v.is_finite())
                 });
-                if !finite {
-                    return Err(HessboostError::invalid_param(
-                        "path",
-                        "the path's noise scale or velocity is zero or overflows on [1e-5, 1]",
-                    ));
-                }
+                ensure(
+                    "path",
+                    finite,
+                    "the path's noise scale or velocity is zero or overflows on [1e-5, 1]",
+                )?;
                 flow.time_sampling.validate()
             }
         }
@@ -712,13 +701,12 @@ impl Method {
 impl TimeSampling {
     fn validate(self) -> Result<()> {
         if let TimeSampling::LogNoiseNormal { mean, std } = self {
-            if !mean.is_finite() {
-                return Err(HessboostError::invalid_param(
-                    "time_sampling",
-                    format!("mean must be finite, got {mean}"),
-                ));
-            }
-            check_positive("time_sampling", std)?;
+            ensure(
+                "time_sampling",
+                mean.is_finite(),
+                format!("mean must be finite, got {mean}"),
+            )?;
+            positive("time_sampling", std)?;
         }
         Ok(())
     }
@@ -737,9 +725,9 @@ struct FittedResidualizer {
 /// score/velocity GBDT, the label standardization, the optional
 /// residualizer, and the sampler settings. See the [module docs](self).
 ///
-/// The serde implementations are the JSON format ([`Self::to_json`] /
-/// [`Self::from_json`]); deserializing validates the model like the loaders
-/// do.
+/// The serde implementations are the JSON format ([`DiffusionFormat::Json`]
+/// in [`Self::encode`] / [`Self::decode`]); deserializing validates the
+/// model like the loaders do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "format::UncheckedDiffusionModel")]
 pub struct DiffusionModel {
@@ -768,10 +756,12 @@ impl DiffusionModel {
     /// # Errors
     ///
     /// Everything [`DiffusionParams::validate`] refuses, plus
-    /// [`HessboostError::InvalidParameter`] for data without labels, with
-    /// weights, base margins, groups, label bounds, or feature weights, too
-    /// few rows for the validation split (2) or the residualizer (80), and
-    /// the errors of training.
+    /// [`HessboostError::InvalidData`] for data without labels (`labels`),
+    /// with weights, base margins, groups, label bounds, or feature weights
+    /// (named by the metadata: `weights`, `base_margin`, `group_sizes`,
+    /// `label_bounds`, `feature_weights`), or with too few rows for the
+    /// validation split (2) or the residualizer (80) (`data`), and the
+    /// errors of training.
     pub fn fit(params: &DiffusionParams, data: &DMatrix) -> Result<Self> {
         fit::fit(params, data)
     }
@@ -785,10 +775,11 @@ impl DiffusionModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for `n_samples == 0`, a base
-    /// margin on `data`, or a sampler that diverges to non-finite values;
-    /// [`HessboostError::DimensionMismatch`] when `data`'s feature count
-    /// differs from the training data's.
+    /// [`HessboostError::InvalidParameter`] for `n_samples == 0` or a
+    /// sampler that diverges to non-finite values (`n_steps`: use more
+    /// steps); [`HessboostError::InvalidData`] (`base_margin`) for a base
+    /// margin on `data`; [`HessboostError::DimensionMismatch`] when
+    /// `data`'s feature count differs from the training data's.
     pub fn sample(
         &self,
         data: &DMatrix,
@@ -833,82 +824,57 @@ impl DiffusionModel {
         &self.regressor
     }
 
-    /// Serialize to the native binary format: a zstd-compressed section
-    /// container (magic `HBDM`) embedding the GBDTs' native containers.
+    /// The model encoded in `format` ([`DiffusionFormat::Binary`]: a
+    /// zstd-compressed section container, magic `HBDM`, embedding the GBDTs'
+    /// native containers; [`DiffusionFormat::Json`]: the method, the
+    /// standardization, the residualizer, and each GBDT in the native JSON
+    /// format, pretty-printed).
     ///
     /// # Errors
     ///
     /// [`HessboostError::ModelFormat`] for a GBDT too large for the native
-    /// format; [`HessboostError::Io`] if compression fails.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        format::write(self)
+    /// format; [`HessboostError::Io`] if compression fails;
+    /// [`HessboostError::Json`] if JSON serialization fails.
+    pub fn encode(&self, format: DiffusionFormat) -> Result<Vec<u8>> {
+        match format {
+            DiffusionFormat::Binary => format::write(self),
+            DiffusionFormat::Json => Ok(serde_json::to_vec_pretty(self)?),
+        }
     }
 
-    /// Deserialize a model written by [`Self::to_bytes`].
+    /// Decode a model written by [`Self::encode`] in `format`
+    /// ([`DiffusionFormat::detect`] guesses the format of unknown bytes).
     ///
     /// # Errors
     ///
     /// [`HessboostError::ModelFormat`] for malformed or inconsistent input,
-    /// and for files needing a feature this version lacks.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        format::read(bytes)
-    }
-
-    /// Save to a file in the native binary format.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::to_bytes`] and of writing the file.
-    pub fn save_binary(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_bytes()?)?)
-    }
-
-    /// Load a native binary file.
-    ///
-    /// # Errors
-    ///
-    /// The errors of reading the file and of [`Self::from_bytes`].
-    pub fn load_binary(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_bytes(&std::fs::read(path)?)
-    }
-
-    /// Serialize to JSON: the method, the standardization, the residualizer,
-    /// and each GBDT in the native JSON format
-    /// ([`BoostedModel::to_json`]).
-    ///
-    /// # Errors
-    ///
-    /// [`HessboostError::Json`] if serialization fails.
-    pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
-    }
-
-    /// Deserialize a model written by [`Self::to_json`].
-    ///
-    /// # Errors
-    ///
+    /// and for files needing a feature this version lacks;
     /// [`HessboostError::Json`] for malformed JSON (a missing field
-    /// included), [`HessboostError::ModelFormat`] for an inconsistent model.
-    pub fn from_json(json: &str) -> Result<Self> {
-        Ok(serde_json::from_str(json)?)
+    /// included).
+    pub fn decode(bytes: impl AsRef<[u8]>, format: DiffusionFormat) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        match format {
+            DiffusionFormat::Binary => format::read(bytes),
+            DiffusionFormat::Json => Ok(serde_json::from_slice(bytes)?),
+        }
     }
 
-    /// Save to a file as JSON.
+    /// Write [`Self::encode`]`(format)` to the file at `path`.
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::to_json`] and of writing the file.
-    pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_json()?)?)
+    /// The errors of [`Self::encode`] and of writing the file.
+    pub fn save(&self, path: impl AsRef<std::path::Path>, format: DiffusionFormat) -> Result<()> {
+        Ok(std::fs::write(path, self.encode(format)?)?)
     }
 
-    /// Load a JSON file.
+    /// [`Self::decode`] the file at `path` in `format`.
     ///
     /// # Errors
     ///
-    /// The errors of reading the file and of [`Self::from_json`].
-    pub fn load_json(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_json(&std::fs::read_to_string(path)?)
+    /// The errors of reading the file and of [`Self::decode`].
+    pub fn load(path: impl AsRef<std::path::Path>, format: DiffusionFormat) -> Result<Self> {
+        Self::decode(std::fs::read(path)?, format)
     }
 
     /// Check what sampling and the formats rely on.

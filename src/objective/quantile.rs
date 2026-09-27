@@ -415,6 +415,7 @@ mod tests {
     use super::*;
     use crate::error::HessboostError;
     use crate::model::Iterations;
+    use crate::model::ModelFormat;
     use crate::objective::Objective;
     use crate::objective::{base_margins, gradient_pairs};
     use crate::training::Trainer;
@@ -651,7 +652,11 @@ mod tests {
             .unwrap();
         let mut model = crate::training::train(&params, &d, 3).unwrap();
         model.set_base_scores(vec![10.0, 0.0]);
-        let restored = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
+        let restored = BoostedModel::decode(
+            model.encode(ModelFormat::XgboostJson).unwrap(),
+            ModelFormat::XgboostJson,
+        )
+        .unwrap();
         assert_eq!(restored.base_scores(), [10.0, 0.0]);
         let close = |a: Predictions, b: Predictions| {
             assert_eq!((a.n_rows(), a.width()), (b.n_rows(), b.width()));
@@ -690,7 +695,10 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 Trainer::new(&params, &d, 1).train(),
-                Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+                Err(HessboostError::InvalidData {
+                    input: "labels",
+                    ..
+                })
             ));
         }
     }
@@ -710,7 +718,11 @@ mod tests {
             .build()
             .unwrap();
         let model = Trainer::new(&params, &d, 1).train().unwrap().model;
-        let loaded = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        let loaded = BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap();
         assert_eq!(loaded.objective().built_in(), Some(&objective));
     }
 }

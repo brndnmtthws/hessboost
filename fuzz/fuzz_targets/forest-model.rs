@@ -1,12 +1,13 @@
 #![no_main]
-//! The forest model decoders (`ForestModel::from_bytes` and `from_json`):
+//! The forest model decoders (`ForestModel::decode`, binary and JSON):
 //! arbitrary input either fails to decode or yields a model that generates,
 //! imputes, and round-trips.
 //!
-//! The first byte picks the decoder: `0` passes the rest to `from_bytes`
+//! The first byte picks the decoder: `0` decodes the rest as binary
 //! unchanged; `1` seals the rest as a section table in an uncompressed
 //! `HBFF` container with a valid checksum, so mutations reach the section
 //! decoder; anything else parses the rest as JSON.
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::forest::{ForestMethod, ForestModel, ImputeOptions};
 use hessboost::prelude::*;
 use libfuzzer_sys::fuzz_target;
@@ -26,13 +27,9 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
-    let Some(model) = common::parse_mode(
-        mode,
-        rest,
-        HEADER,
-        ForestModel::from_bytes,
-        ForestModel::from_json,
-    ) else {
+    let Some(model) = common::parse_mode(mode, rest, HEADER, |bytes, format| {
+        ForestModel::decode(bytes, format)
+    }) else {
         return;
     };
     let Ok(model) = model else {
@@ -40,14 +37,17 @@ fuzz_target!(|data: &[u8]| {
     };
     common::round_trip(
         &model,
-        |model| model.to_bytes(),
-        ForestModel::from_bytes,
-        |model| model.to_json(),
-        ForestModel::from_json,
+        |model, format| model.encode(format),
+        |bytes, format| ForestModel::decode(bytes, format),
         |model, from_bytes| assert_eq!(from_bytes.method(), model.method()),
     );
-    let from_bytes = ForestModel::from_bytes(&model.to_bytes().expect("an accepted model saves"))
-        .expect("a saved model loads");
+    let from_bytes = ForestModel::decode(
+        model
+            .encode(DiffusionFormat::Binary)
+            .expect("an accepted model saves"),
+        DiffusionFormat::Binary,
+    )
+    .expect("a saved model loads");
     assert_eq!(from_bytes.classes(), model.classes());
     let trees: usize = model.gbdts().iter().map(BoostedModel::num_trees).sum();
     if model.n_t().get() > MAX_LEVELS || model.n_columns() > MAX_COLUMNS || trees > MAX_TREES {

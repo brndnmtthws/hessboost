@@ -14,6 +14,8 @@ import pytest
 import hessboost
 from conftest import classes, regression, saved_models_dir
 from hessboost import Booster, DMatrix, HessboostError, ModelFormatError
+from hessboost.diffusion import DiffusionModel
+from hessboost.diffusion.forest import ForestModel
 
 
 @pytest.fixture(scope="module")
@@ -63,6 +65,16 @@ def test_every_format_round_trips_predictions_and_is_detected(
     assert Booster(str(path)).save_raw(format) == raw
 
 
+def test_ubjson_with_leading_no_op_padding_is_detected(
+    trained: tuple[Booster, np.ndarray],
+) -> None:
+    """UBJSON allows `N` no-ops before a key, the first one included."""
+    booster, x = trained
+    raw = booster.save_raw("xgboost-ubjson")
+    padded = raw[:1] + b"N" + raw[1:]
+    np.testing.assert_array_equal(Booster(padded).predict(x), booster.predict(x))
+
+
 def test_xgboost_json_is_an_xgboost_document(trained: tuple[Booster, np.ndarray]) -> None:
     import json
 
@@ -104,6 +116,24 @@ def test_corrupt_and_missing_models_raise(
     assert repr(empty) == "Booster(empty)"
     with pytest.raises(HessboostError, match="holds no model"):
         empty.predict(np.zeros((1, 5)))
+
+
+def test_detecting_unrecognized_bytes_raises_model_format_error(tmp_path: Path) -> None:
+    garbage = b"PK\x03\x04 not a model"
+    path = tmp_path / "garbage.bin"
+    path.write_bytes(garbage)
+    for source in (garbage, path, str(path)):
+        with pytest.raises(ModelFormatError, match="unrecognized model format"):
+            Booster().load_model(source)
+    for model in (DiffusionModel, ForestModel):
+        with pytest.raises(ModelFormatError, match="unrecognized model format"):
+            model.from_bytes(garbage)
+        with pytest.raises(ModelFormatError, match="unrecognized model format"):
+            model.load(path)
+        # A named format skips detection; decoding then refuses the bytes.
+        with pytest.raises(ModelFormatError) as refused:
+            model.from_bytes(garbage, "binary")
+        assert "unrecognized" not in str(refused.value)
 
 
 def saved_features(rows: int = 160) -> np.ndarray:

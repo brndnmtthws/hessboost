@@ -68,7 +68,7 @@ impl<'a> TermPart<'a> {
                 let rows: f64 = leaf.boxes.iter().map(|&b| grid.box_sum(&prefix, b)).sum();
                 let cover = f64::from(tree.node(leaf.node as usize).sum_hess);
                 if rows < cover {
-                    return Err(HessboostError::invalid_param(
+                    return Err(HessboostError::invalid_data(
                         "train",
                         format!(
                             "a leaf of term {features:?} was grown on {cover} rows but only {rows} \

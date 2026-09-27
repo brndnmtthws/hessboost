@@ -189,7 +189,7 @@ fn training_is_deterministic_and_independent_of_the_thread_count() {
             .build()
             .unwrap();
         let result = train_with_budget(&p, &data, &BudgetConfig::new(0.5)).unwrap();
-        (result.model.to_json().unwrap(), result.stop)
+        (result.model.encode(ModelFormat::Json).unwrap(), result.stop)
     };
     let serial = run(1);
     assert_eq!(serial, run(1));
@@ -207,8 +207,16 @@ fn budget_models_are_ordinary_gbtree_models() {
     .unwrap()
     .model;
     let preds = model.predict(&data, Iterations::Best).unwrap();
-    let via_xgboost = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
-    let via_native = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+    let via_xgboost = BoostedModel::decode(
+        model.encode(ModelFormat::XgboostJson).unwrap(),
+        ModelFormat::XgboostJson,
+    )
+    .unwrap();
+    let via_native = BoostedModel::decode(
+        model.encode(ModelFormat::Binary).unwrap(),
+        ModelFormat::Binary,
+    )
+    .unwrap();
     for other in [via_xgboost, via_native] {
         let round_trip = other.predict(&data, Iterations::Best).unwrap();
         for (a, b) in preds.as_slice().iter().zip(round_trip.as_slice()) {
@@ -416,7 +424,11 @@ fn one_saved_tree(data: &DMatrix) -> (Vec<f32>, BudgetStop) {
         &BudgetConfig::default().iteration_limit(1),
     )
     .unwrap();
-    let loaded = BoostedModel::from_bytes(&result.model.to_bytes().unwrap()).unwrap();
+    let loaded = BoostedModel::decode(
+        result.model.encode(ModelFormat::Binary).unwrap(),
+        ModelFormat::Binary,
+    )
+    .unwrap();
     (
         loaded.predict(data, Iterations::Best).unwrap().into_vec(),
         result.stop,

@@ -396,8 +396,8 @@ pub(super) fn initial_intercepts(
         ));
     }
     if base_margins.iter().any(|m| !m.is_finite()) {
-        return Err(HessboostError::invalid_param(
-            "base_score",
+        return Err(HessboostError::invalid_data(
+            "labels",
             format!("estimated intercept is not finite ({base_margins:?}); check the labels"),
         ));
     }

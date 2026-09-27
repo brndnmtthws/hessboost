@@ -119,9 +119,10 @@ pub trait Metric: Send + Sync {
     /// Check that a dataset carries the metadata [`Metric::eval_info`]
     /// reads, before training evaluates it. The default requires ordinary
     /// labels; metrics that can read other metadata (the survival metrics'
-    /// label bounds) override it. Errors are
-    /// [`HessboostError::InvalidParameter`] naming `eval_metric`, with a
-    /// reason mentioning "dataset" (training names the dataset there).
+    /// label bounds) override it. Errors are [`HessboostError::InvalidData`]
+    /// naming the offending input (`labels`, `label_bounds`); training
+    /// attributes them to the dataset
+    /// ([`HessboostError::in_dataset`]).
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         require_labels(self.name(), info)
     }
@@ -188,9 +189,9 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
 /// ordinary labels, which a dataset with rows must carry.
 fn require_labels(name: &str, info: &MetaInfo) -> Result<()> {
     if info.n_rows > 0 && info.label_values().is_empty() {
-        return Err(HessboostError::invalid_param(
-            "eval_metric",
-            format!("metric `{name}` needs labels, but dataset has none"),
+        return Err(HessboostError::invalid_data(
+            "labels",
+            format!("missing; metric `{name}` needs labels"),
         ));
     }
     Ok(())
@@ -264,11 +265,10 @@ macro_rules! simple_metric {
                 require_labels(self.name(), info)?;
                 match first_non_class(info.label_values(), self.$field) {
                     None => Ok(()),
-                    Some(label) => Err(HessboostError::invalid_param(
-                        "eval_metric",
+                    Some(label) => Err(HessboostError::invalid_data(
+                        "labels",
                         format!(
-                            "metric `{}` reads labels as class indices in 0..{}, but dataset \
-                             has label {label}",
+                            "metric `{}` reads labels as class indices in 0..{}, got {label}",
                             self.name(),
                             self.$field
                         ),

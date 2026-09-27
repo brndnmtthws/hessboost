@@ -249,11 +249,12 @@ fn read_tree_layouts(
 }
 
 impl CompactModel {
-    /// Parse bytes written by [`CompactModel::to_bytes`] /
+    /// Parse bytes written by [`CompactModel::encode`] /
     /// [`BoostedModel::to_compact_bytes`](crate::model::BoostedModel::to_compact_bytes).
     /// Every reference is validated, so prediction on a parsed model cannot
     /// index out of bounds.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        let bytes = bytes.as_ref();
         let (meta, stream) = split_frame(bytes)?;
         let meta = Meta::decode(meta)?;
         if meta.n_targets == 0 {

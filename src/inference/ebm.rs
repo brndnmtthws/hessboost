@@ -177,13 +177,14 @@ impl<'a> EbmInference<'a> {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] when `model` is not a Boulevard
-    /// EBM ([`BoostedModel::ebm`] is `None` or has no
-    /// [`boulevard`](EbmInfo::boulevard) record), when `train` is not its
-    /// training data (a leaf holds fewer of its rows than it was grown on),
-    /// has row weights or base margins, or (for the noise estimate) lacks
-    /// labels; as [`BoulevardInference::fit`](super::BoulevardInference::fit)
-    /// for the solver and the noise variance.
+    /// [`HessboostError::IncompatibleModel`] (`model`) when `model` is not
+    /// a Boulevard EBM ([`BoostedModel::ebm`] is `None` or has no
+    /// [`boulevard`](EbmInfo::boulevard) record); [`HessboostError::InvalidData`]
+    /// (`train`) when `train` is not its training data (a leaf holds fewer
+    /// of its rows than it was grown on), has row weights or base margins,
+    /// or (for the noise estimate) lacks labels; as
+    /// [`BoulevardInference::fit`](super::BoulevardInference::fit) for the
+    /// solver and the noise variance.
     pub fn fit(
         model: &'a BoostedModel,
         train: &DMatrix,
@@ -191,7 +192,7 @@ impl<'a> EbmInference<'a> {
         solver: KernelSolver,
     ) -> Result<Self> {
         let not_boulevard = || {
-            HessboostError::invalid_param(
+            HessboostError::incompatible_model(
                 "model",
                 "not a Boulevard EBM: train it with `booster = ebm` and `ebm_boulevard`",
             )
@@ -289,7 +290,7 @@ impl<'a> EbmInference<'a> {
     /// The stage and part of term `term`, refusing unknown terms.
     fn slot(&self, term: usize) -> Result<(usize, usize)> {
         self.term_slot.get(term).copied().ok_or_else(|| {
-            HessboostError::invalid_param(
+            HessboostError::incompatible_model(
                 "term",
                 format!("the model has {} terms, got {term}", self.term_slot.len()),
             )
@@ -321,8 +322,9 @@ impl<'a> EbmInference<'a> {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] when `term` is not a term of the
-    /// model or `alpha` is not in `(0, 1)`.
+    /// [`HessboostError::IncompatibleModel`] (`term`) when `term` is not a
+    /// term of the model; [`HessboostError::InvalidParameter`] when `alpha`
+    /// is not in `(0, 1)`.
     pub fn term_bands(&self, term: usize, alpha: f64) -> Result<TermBands> {
         check_alpha(alpha)?;
         self.slot(term)?;
@@ -349,8 +351,10 @@ impl<'a> EbmInference<'a> {
     ///
     /// # Errors
     ///
-    /// When `term` is not a term of the model, or `data` does not have the
-    /// model's features or has row weights or base margins.
+    /// [`HessboostError::IncompatibleModel`] (`term`) when `term` is not a
+    /// term of the model; [`HessboostError::DimensionMismatch`] when `data`
+    /// does not have the model's features; [`HessboostError::InvalidData`]
+    /// (`data`) when it has row weights or base margins.
     pub fn term_standard_errors(&self, term: usize, data: &DMatrix) -> Result<Predictions<f64>> {
         check_data(self.model, data, "data", false)?;
         let (stage, part) = self.slot(term)?;
@@ -427,8 +431,9 @@ impl<'a> EbmInference<'a> {
     ///
     /// # Errors
     ///
-    /// When `data` does not have the model's features, or has row weights
-    /// or base margins.
+    /// [`HessboostError::DimensionMismatch`] when `data` does not have the
+    /// model's features; [`HessboostError::InvalidData`] (`data`) when it
+    /// has row weights or base margins.
     pub fn standard_errors(&self, data: &DMatrix) -> Result<Predictions<f64>> {
         let sigma = self.noise_variance.sqrt();
         let se: Vec<f64> = self
@@ -463,8 +468,8 @@ impl<'a> EbmInference<'a> {
     ///
     /// # Errors
     ///
-    /// When `alpha` is not in `(0, 1)`, plus those of
-    /// [`standard_errors`](Self::standard_errors).
+    /// [`HessboostError::InvalidParameter`] when `alpha` is not in
+    /// `(0, 1)`, plus those of [`standard_errors`](Self::standard_errors).
     pub fn confidence_intervals(&self, data: &DMatrix, alpha: f64) -> Result<Vec<Interval<f64>>> {
         let sigma2 = self.noise_variance;
         self.intervals(data, alpha, |w2| (sigma2 * w2).sqrt())

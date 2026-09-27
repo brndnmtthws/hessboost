@@ -141,10 +141,11 @@ fn update_covers(trees: &mut [RegTree], leaves: &LeafIds) {
 ///
 /// # Errors
 ///
-/// [`HessboostError::InvalidParameter`] when `model` is not a Boulevard
-/// fit or Boulevard EBM, or `values` lacks labels or has row weights or
-/// base margins; [`HessboostError::DimensionMismatch`] for a different
-/// feature count.
+/// [`HessboostError::IncompatibleModel`] (`model`) when `model` is not a
+/// Boulevard fit or Boulevard EBM; [`HessboostError::InvalidData`]
+/// (`values`) when `values` lacks labels, has non-finite labels, row
+/// weights or base margins, or refits leaves that overflow `f32`;
+/// [`HessboostError::DimensionMismatch`] for a different feature count.
 pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedModel> {
     if let Some(info) = model.ebm()
         && let Some(settings) = info.boulevard
@@ -152,7 +153,7 @@ pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedMod
         return ebm_refit(model, info, settings, values);
     }
     let info = *model.boulevard().ok_or_else(|| {
-        HessboostError::invalid_param(
+        HessboostError::incompatible_model(
             "model",
             "not a Boulevard fit: train it with `booster = boulevard` (or `booster = ebm` with \
              `ebm_boulevard`)",
@@ -214,7 +215,7 @@ pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedMod
         .iter()
         .any(|t| t.nodes().iter().any(|n| !n.leaf_value.is_finite()))
     {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "values",
             "the refitted leaves overflow f32",
         ));
@@ -227,7 +228,7 @@ fn finite_labels<'v>(model: &BoostedModel, values: &'v DMatrix) -> Result<&'v [f
     check_data(model, values, "values", true)?;
     let labels = values.labels().unwrap_or_default();
     if labels.iter().any(|y| !y.is_finite()) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "values",
             "labels must be finite",
         ));
@@ -310,7 +311,7 @@ fn ebm_refit(
         .iter()
         .any(|t| t.nodes().iter().any(|n| !n.leaf_value.is_finite()))
     {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "values",
             "the refitted leaves overflow f32",
         ));

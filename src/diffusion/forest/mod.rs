@@ -84,9 +84,12 @@
 //!
 //! # Persistence
 //!
-//! [`ForestModel::to_bytes`] writes the diffusion container framing with its
-//! own magic `HBFF` (see [`super`]'s `HBDM`), embedding every GBDT as a native
-//! container; [`ForestModel::to_json`] writes the same content as JSON.
+//! [`ForestModel::encode`] / [`decode`](ForestModel::decode) and
+//! [`save`](ForestModel::save) / [`load`](ForestModel::load) take a
+//! [`DiffusionFormat`]: [`DiffusionFormat::Binary`] is the diffusion
+//! container framing with its own magic `HBFF` (see [`super`]'s `HBDM`),
+//! embedding every GBDT as a native container; [`DiffusionFormat::Json`]
+//! the same content as JSON.
 //!
 //! # Deviations from the reference
 //!
@@ -136,9 +139,10 @@ use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
-use super::Sde;
 use super::process::{keyed_normal, try_filled};
+use super::{DiffusionFormat, Sde};
 use super::{check_regressor, validate_regressor_params};
+use crate::check::{ensure, fraction};
 use crate::config::{TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -630,14 +634,18 @@ impl ForestModel {
     /// # Errors
     ///
     /// Everything [`ForestParams::validate`] refuses, plus
-    /// [`HessboostError::InvalidParameter`] for weights, base margins,
-    /// groups, label bounds, feature weights, a label matrix,
-    /// `column_kinds` of the wrong length, a categorical column with
-    /// non-integral or out-of-range values... (see [`ColumnKind`]), a column
-    /// with no observed value (overall or in a class, with missing values),
-    /// and the errors of training: each level's GBDT regresses a label
-    /// matrix of every column, which `booster = boulevard` and
-    /// `booster = ebm` refuse for a table of several columns.
+    /// [`HessboostError::InvalidData`] for weights, base margins, groups,
+    /// label bounds or feature weights (named by the metadata: `weights`,
+    /// `base_margin`, `group_sizes`, `label_bounds`, `feature_weights`), a
+    /// label matrix (`labels`), a categorical column with non-integral or
+    /// out-of-range values... (see [`ColumnKind`]), a column with no
+    /// observed value (overall or in a class, with missing values) or rows
+    /// that are all entirely missing (`data`);
+    /// [`HessboostError::DimensionMismatch`] for `column_kinds` of the
+    /// wrong length; and the errors of training: each level's GBDT
+    /// regresses a label matrix of every column, which
+    /// `booster = boulevard` and `booster = ebm` refuse for a table of
+    /// several columns.
     pub fn fit(params: &ForestParams, data: &DMatrix) -> Result<Self> {
         fit::fit(params, data)
     }
@@ -676,9 +684,10 @@ impl ForestModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for an unconditional model, an
-    /// empty `labels`, or a label the model was not trained on; the errors
-    /// of [`Self::sample`].
+    /// [`HessboostError::IncompatibleModel`] (`labels`) for an
+    /// unconditional model; [`HessboostError::InvalidParameter`] for an
+    /// empty `labels`; [`HessboostError::InvalidData`] (`labels`) for a
+    /// label the model was not trained on; the errors of [`Self::sample`].
     pub fn sample_for_labels(&self, labels: &[f32], seed: u64) -> Result<Synthetic> {
         positive_count("labels", labels.len())?;
         let class_of = self.class_indices(labels)?;
@@ -693,13 +702,16 @@ impl ForestModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for a flow model (the reference
-    /// imputes with diffusion only), `n_imputations == 0`, an invalid
-    /// [`Repaint`], metadata [`Self::fit`] refuses (weights, base margins,
-    /// groups, label bounds, feature weights, a label matrix), missing or
-    /// unknown labels on a class-conditional model, a categorical value the
-    /// model has not seen, or a sampler that diverges;
-    /// [`HessboostError::DimensionMismatch`] for the wrong column count.
+    /// [`HessboostError::IncompatibleModel`] (`impute`) for a flow model
+    /// (the reference imputes with diffusion only);
+    /// [`HessboostError::InvalidParameter`] for `n_imputations == 0`, an
+    /// invalid [`Repaint`], or a sampler that diverges (`n_t`);
+    /// [`HessboostError::InvalidData`] for metadata [`Self::fit`] refuses
+    /// (weights, base margins, groups, label bounds, feature weights, a
+    /// label matrix), missing or unknown labels on a class-conditional
+    /// model (`labels`), or a categorical value the model has not seen
+    /// (`data`); [`HessboostError::DimensionMismatch`] for the wrong column
+    /// count.
     pub fn impute(
         &self,
         data: &DMatrix,
@@ -708,8 +720,8 @@ impl ForestModel {
     ) -> Result<Imputations> {
         let ImputeOptions { seed, repaint } = *options;
         let Some(sde) = self.method.sde() else {
-            return Err(HessboostError::invalid_param(
-                "method",
+            return Err(HessboostError::incompatible_model(
+                "impute",
                 "imputation needs ForestMethod::Diffusion (flow matching cannot condition \
                  on the observed entries)",
             ));
@@ -718,12 +730,7 @@ impl ForestModel {
         let (resample, jump) = match repaint {
             None => (1, self.n_t.get()),
             Some(r) => {
-                if !(r.jump.is_finite() && r.jump > 0.0 && r.jump <= 1.0) {
-                    return Err(HessboostError::invalid_param(
-                        "repaint.jump",
-                        format!("must be in (0, 1], got {}", r.jump),
-                    ));
-                }
+                fraction("repaint.jump", r.jump)?;
                 (
                     r.resample.get(),
                     ((r.jump * self.n_t.get() as f64).ceil() as usize).max(1),
@@ -743,8 +750,8 @@ impl ForestModel {
             vec![0; data.n_rows()]
         } else {
             let labels = data.labels().ok_or_else(|| {
-                HessboostError::invalid_param(
-                    "data",
+                HessboostError::invalid_data(
+                    "labels",
                     "a class-conditional model imputes rows of known class: attach labels",
                 )
             })?;
@@ -763,7 +770,7 @@ impl ForestModel {
                         .binary_search_by(|x| x.total_cmp(&v))
                         .is_err()
                 {
-                    return Err(HessboostError::invalid_param(
+                    return Err(HessboostError::invalid_data(
                         "data",
                         format!("column {j} has category {v}, unseen in training"),
                     ));
@@ -786,7 +793,7 @@ impl ForestModel {
         for (i, dest) in out.chunks_exact_mut(n_rows * p).enumerate() {
             sampler.key = splitmix64(seed ^ splitmix64(i as u64));
             let x = sampler.reverse_sde(sde, Some(&known), (resample, jump))?;
-            self.decode(&x, dest)?;
+            self.decode_rows(&x, dest)?;
         }
         Ok(Imputations {
             values: out,
@@ -816,78 +823,54 @@ impl ForestModel {
         &self.classes
     }
 
-    /// Serialize to the binary format (magic `HBFF`).
+    /// The model encoded in `format` ([`DiffusionFormat::Binary`]: the
+    /// diffusion container framing, magic `HBFF`, embedding the GBDTs'
+    /// native containers; [`DiffusionFormat::Json`]: pretty-printed JSON with every
+    /// GBDT in the native JSON format).
     ///
     /// # Errors
     ///
     /// [`HessboostError::ModelFormat`] for a GBDT too large for the native
-    /// format; [`HessboostError::Io`] if compression fails.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        format::write(self)
+    /// format; [`HessboostError::Io`] if compression fails;
+    /// [`HessboostError::Json`] if JSON serialization fails.
+    pub fn encode(&self, format: DiffusionFormat) -> Result<Vec<u8>> {
+        match format {
+            DiffusionFormat::Binary => format::write(self),
+            DiffusionFormat::Json => Ok(serde_json::to_vec_pretty(self)?),
+        }
     }
 
-    /// Deserialize a model written by [`Self::to_bytes`].
+    /// Decode a model written by [`Self::encode`] in `format`
+    /// ([`DiffusionFormat::detect`] guesses the format of unknown bytes).
     ///
     /// # Errors
     ///
-    /// [`HessboostError::ModelFormat`] for malformed or inconsistent input.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        format::read(bytes)
+    /// [`HessboostError::ModelFormat`] for malformed or inconsistent input;
+    /// [`HessboostError::Json`] for malformed JSON.
+    pub fn decode(bytes: impl AsRef<[u8]>, format: DiffusionFormat) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        match format {
+            DiffusionFormat::Binary => format::read(bytes),
+            DiffusionFormat::Json => Ok(serde_json::from_slice(bytes)?),
+        }
     }
 
-    /// Serialize to JSON, with every GBDT in the native JSON format.
+    /// Write [`Self::encode`]`(format)` to the file at `path`.
     ///
     /// # Errors
     ///
-    /// [`HessboostError::Json`] if serialization fails.
-    pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
+    /// The errors of [`Self::encode`] and of writing the file.
+    pub fn save(&self, path: impl AsRef<std::path::Path>, format: DiffusionFormat) -> Result<()> {
+        Ok(std::fs::write(path, self.encode(format)?)?)
     }
 
-    /// Deserialize a model written by [`Self::to_json`].
+    /// [`Self::decode`] the file at `path` in `format`.
     ///
     /// # Errors
     ///
-    /// [`HessboostError::Json`] for malformed JSON,
-    /// [`HessboostError::ModelFormat`] for an inconsistent model.
-    pub fn from_json(json: &str) -> Result<Self> {
-        Ok(serde_json::from_str(json)?)
-    }
-
-    /// Save to a file in the binary format.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::to_bytes`] and of writing the file.
-    pub fn save_binary(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_bytes()?)?)
-    }
-
-    /// Load a binary file.
-    ///
-    /// # Errors
-    ///
-    /// The errors of reading the file and of [`Self::from_bytes`].
-    pub fn load_binary(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_bytes(&std::fs::read(path)?)
-    }
-
-    /// Save to a file as JSON.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::to_json`] and of writing the file.
-    pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_json()?)?)
-    }
-
-    /// Load a JSON file.
-    ///
-    /// # Errors
-    ///
-    /// The errors of reading the file and of [`Self::from_json`].
-    pub fn load_json(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_json(&std::fs::read_to_string(path)?)
+    /// The errors of reading the file and of [`Self::decode`].
+    pub fn load(path: impl AsRef<std::path::Path>, format: DiffusionFormat) -> Result<Self> {
+        Self::decode(std::fs::read(path)?, format)
     }
 
     /// Every GBDT, in `[class][level]` order, or `[class][level][encoded
@@ -901,7 +884,7 @@ impl ForestModel {
     /// Indices into [`Self::classes`] of `labels`.
     fn class_indices(&self, labels: &[f32]) -> Result<Vec<usize>> {
         if self.classes.is_empty() {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::incompatible_model(
                 "labels",
                 "the model was fitted without class labels",
             ));
@@ -913,7 +896,7 @@ impl ForestModel {
                 self.classes
                     .binary_search_by(|c| c.total_cmp(&l))
                     .map_err(|_| {
-                        HessboostError::invalid_param(
+                        HessboostError::invalid_data(
                             "labels",
                             format!("label {l} was not a training class"),
                         )
@@ -934,7 +917,7 @@ impl ForestModel {
             None => sampler.euler_flow()?,
             Some(sde) => sampler.reverse_sde(sde, None, (1, self.n_t.get()))?,
         };
-        self.decode(&x, &mut values)?;
+        self.decode_rows(&x, &mut values)?;
         let labels = (!self.classes.is_empty())
             .then(|| class_of.iter().map(|&k| self.classes[k] as f32).collect());
         Ok(Synthetic {
@@ -946,7 +929,7 @@ impl ForestModel {
 
     /// Scaled encoded rows `x` (`[row][c]`) back to columns in `out`
     /// (`[row][p]`).
-    fn decode(&self, x: &[f64], out: &mut [f32]) -> Result<()> {
+    fn decode_rows(&self, x: &[f64], out: &mut [f32]) -> Result<()> {
         let (c, p) = (self.scales.len(), self.columns.len());
         for (row, dest) in x.chunks_exact(c).zip(out.chunks_exact_mut(p)) {
             let mut at = 0;
@@ -1059,8 +1042,8 @@ impl ForestModel {
 fn refuse_metadata(data: &DMatrix) -> Result<()> {
     super::fit::refuse_unsupported_metadata(data, "forest")?;
     if data.labels().is_some() && data.n_targets() != 1 {
-        return Err(HessboostError::invalid_param(
-            "data",
+        return Err(HessboostError::invalid_data(
+            "labels",
             "forest models do not support label matrices (labels are class labels)",
         ));
     }
@@ -1146,12 +1129,10 @@ impl<'a> Sampler<'a> {
                     *d = v as f32;
                 }
             }
-            // The matrix's invariant, which building it checked before.
+            // The matrix's invariant, which building it checked before: an
+            // infinite state is a diverged sampler.
             if values.iter().any(|v| v.is_infinite()) {
-                return Err(HessboostError::invalid_param(
-                    "dense data",
-                    "non-missing feature values must be finite",
-                ));
+                return Err(diverged());
             }
             let models = model.level_models(batch.class, level);
             for (m, gbdt) in models.iter().enumerate() {
@@ -1283,10 +1264,7 @@ impl<'a> Sampler<'a> {
 }
 
 fn positive_count(name: &'static str, v: usize) -> Result<()> {
-    if v == 0 {
-        return Err(HessboostError::invalid_param(name, "must be at least 1"));
-    }
-    Ok(())
+    ensure(name, v != 0, "must be at least 1")
 }
 
 fn check_finite(x: &[f64]) -> Result<()> {

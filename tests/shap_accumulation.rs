@@ -22,10 +22,10 @@ fn scalar_model(trees: &[&[String]], n_features: usize) -> BoostedModel {
             )
         })
         .collect();
-    BoostedModel::from_json(&format!(
+    BoostedModel::decode(format!(
         r#"{{"trees": [{}], "tree_weights": [], "base_score": [0.0], "objective": "reg:squarederror", "num_class": 0, "n_outputs": 1, "n_targets": 1, "num_parallel_tree": 1, "n_features": {n_features}, "linear": null}}"#,
         trees.join(", "),
-    ))
+    ), ModelFormat::Json)
     .unwrap()
 }
 
@@ -178,7 +178,7 @@ fn vector_leaf_bias_accumulates_leaves_top_down() {
         node(0, -1, -1, 0.0, 1.0),
         neg = -huge,
     );
-    let model = BoostedModel::from_json(&model_json).unwrap();
+    let model = BoostedModel::decode(&model_json, ModelFormat::Json).unwrap();
     let row = DMatrix::from_dense(&[0.7f32, 0.7], 1, 2).unwrap();
     assert_eq!(
         model

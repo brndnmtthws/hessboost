@@ -590,8 +590,8 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
-        self.validate_balanced_bagging()?;
         self.validate_bagging_by_query()?;
+        self.validate_balanced_bagging()?;
         self.validate_tree_options()?;
         self.validate_sglb()
     }
@@ -614,6 +614,11 @@ impl TrainingParams {
                 "query bagging needs a `rank:*` objective, not `{}`",
                 self.objective.name()
             ),
+        )?;
+        ensure(
+            "bagging_by_query",
+            self.balanced_bagging.is_none(),
+            "query bagging is not supported together with class-balanced bagging",
         )?;
         ensure(
             "subsample",

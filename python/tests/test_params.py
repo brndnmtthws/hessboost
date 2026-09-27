@@ -108,6 +108,20 @@ def test_balanced_bagging_params_are_accepted_and_validated() -> None:
             dtrain,
             1,
         )
+    with pytest.raises(
+        HessboostError,
+        match="query bagging is not supported together with class-balanced bagging",
+    ):
+        hessboost.train(
+            {
+                "objective": "rank:ndcg",
+                "bagging_by_query": True,
+                "pos_bagging_fraction": 0.5,
+                "subsample": 0.5,
+            },
+            DMatrix(np.arange(8.0).reshape(4, 2), [0, 1, 0, 1], group=[2, 2]),
+            1,
+        )
 
 
 def test_fixed_options_are_accepted_at_their_only_setting(dtrain: DMatrix) -> None:

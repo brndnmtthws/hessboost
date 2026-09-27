@@ -6,15 +6,101 @@ use hessboost::model::compact::CompactModel;
 use hessboost::model::{ImportanceType, Predictions};
 use hessboost::objective::distributional::DistFamily;
 use hessboost::prelude::*;
+use xxhash_rust::xxh64::xxh64;
 
+/// Seal fuzzed container bytes with a format header and valid xxh64 checksum.
+pub fn seal(header: &[u8], rest: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(header.len() + rest.len() + 8);
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(rest);
+    let checksum = xxh64(&bytes, 0);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
+/// Decode the three shared mode-byte choices: raw bytes, sealed container, or JSON text.
+pub fn parse_mode<T, E>(
+    mode: u8,
+    rest: &[u8],
+    header: &[u8],
+    from_bytes: impl Fn(&[u8]) -> std::result::Result<T, E>,
+    from_json: impl Fn(&str) -> std::result::Result<T, E>,
+) -> Option<std::result::Result<T, E>> {
+    match mode {
+        0 => Some(from_bytes(rest)),
+        1 => Some(from_bytes(&seal(header, rest))),
+        _ => std::str::from_utf8(rest).ok().map(from_json),
+    }
+}
+
+/// Round-trip a model through its binary and JSON formats, retaining target-specific equality.
+pub fn round_trip<M>(
+    model: &M,
+    to_bytes: impl Fn(&M) -> Result<Vec<u8>>,
+    from_bytes: impl Fn(&[u8]) -> Result<M>,
+    to_json: impl Fn(&M) -> Result<String>,
+    from_json: impl Fn(&str) -> Result<M>,
+    eq: impl Fn(&M, &M),
+) {
+    let bytes = to_bytes(model).expect("an accepted model saves");
+    let from_bytes = from_bytes(&bytes).expect("a saved model loads");
+    let json = to_json(model).expect("an accepted model saves");
+    let from_json = from_json(&json).expect("a saved model loads");
+    eq(model, &from_bytes);
+    eq(model, &from_json);
+}
+
+/// Shared one-parser targets for text and binary model parsers.
+#[macro_export]
+macro_rules! text_target {
+    ($parser:path) => {
+        libfuzzer_sys::fuzz_target!(|data: &[u8]| {
+            let Ok(text) = std::str::from_utf8(data) else {
+                return;
+            };
+            if let Ok(model) = $parser(text) {
+                common::exercise(&model);
+            }
+        });
+    };
+}
+
+#[macro_export]
+macro_rules! bytes_target {
+    ($parser:path) => {
+        libfuzzer_sys::fuzz_target!(|data: &[u8]| {
+            if let Ok(model) = $parser(data) {
+                common::exercise(&model);
+            }
+        });
+    };
+}
+
+const MAX_PREDICT_FEATURES: usize = 64;
+const MAX_OUTPUTS: usize = 16;
+
+/// Check compact predictions using the shared probe size ceilings.
+pub fn exercise_compact(model: &CompactModel) {
+    let n_features = model.n_features();
+    let k = model.n_outputs();
+    assert!(n_features > 0 && k > 0);
+    for feature in model.used_features() {
+        assert!(feature < n_features);
+    }
+    if !small_enough(n_features, k) {
+        return;
+    }
+    let probe = probe_matrix(n_features);
+    let margin = model.predict_margin(&probe).expect("probe matrix matches the model");
+    assert_eq!((margin.n_rows(), margin.width()), (probe.n_rows(), k));
+    let preds = model.predict(&probe).expect("probe matrix matches the model");
+    let expected = if model.objective().name() == "multi:softmax" { 1 } else { k };
+    assert_eq!((preds.n_rows(), preds.width()), (probe.n_rows(), expected));
+}
 /// Widest model `exercise` predicts with: a fuzzed header can claim any
 /// feature or output count, which only makes the probe matrix (not the
 /// model) expensive.
-const MAX_PREDICT_FEATURES: usize = 64;
-const MAX_OUTPUTS: usize = 16;
-/// Interaction values are `(n_features + 1)^2` per row and output.
 const MAX_INTERACTION_FEATURES: usize = 8;
-
 /// Bitwise equality, so NaN predictions compare equal to themselves.
 pub fn same_bits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
@@ -88,7 +174,6 @@ pub fn exercise(model: &BoostedModel) {
         }
     }
 
-    // The compact layout predicts bit-identically to its source.
     if let Ok(compact) = model.to_compact() {
         assert_eq!(compact.n_features(), n_features);
         assert_eq!(compact.n_outputs(), k);

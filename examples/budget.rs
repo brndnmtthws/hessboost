@@ -15,7 +15,7 @@ use std::num::NonZeroUsize;
 use std::time::Instant;
 
 mod common;
-use common::lcg;
+use common::{lcg, normal};
 
 const N_FEATURES: usize = 10;
 
@@ -31,7 +31,7 @@ fn friedman(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             + 20.0 * (row[2] - 0.5).powi(2)
             + 10.0 * row[3]
             + 5.0 * row[4];
-        let eps: f32 = (0..12).map(|_| next()).sum::<f32>() - 6.0;
+        let eps = normal(&mut next);
         x.extend_from_slice(&row);
         clean.push(f);
         noisy.push(f + eps);

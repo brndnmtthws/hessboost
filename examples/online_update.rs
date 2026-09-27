@@ -38,14 +38,8 @@ fn friedman(n: usize, seed: u64) -> Result<DMatrix> {
 
 fn rmse(model: &BoostedModel, data: &DMatrix) -> Result<f64> {
     let preds = model.predict(data, Iterations::Best)?;
-    let labels = data.labels().unwrap_or_default();
-    let sse: f64 = preds
-        .as_slice()
-        .iter()
-        .zip(labels)
-        .map(|(p, y)| f64::from(p - y).powi(2))
-        .sum();
-    Ok((sse / labels.len() as f64).sqrt())
+    let metric = EvalMetric::Rmse.build(1)?;
+    Ok(metric.eval(preds.as_slice(), data.labels().unwrap_or_default(), None))
 }
 
 fn main() -> Result<()> {

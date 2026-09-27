@@ -14,7 +14,7 @@ use hessboost::inference::{BoulevardInference, KernelSolver, NoiseVariance, hone
 use hessboost::prelude::*;
 
 mod common;
-use common::lcg;
+use common::{lcg, normal};
 
 /// The true regression function: `f(x) = sin(2π x0) + x0² / 2` (Fang, Tan &
 /// Hooker's Figure 1). `x1` is pure noise.
@@ -31,8 +31,7 @@ fn dataset(n: usize, w: f32, seed: u64) -> (Vec<f32>, Vec<f32>) {
     let mut y = Vec::with_capacity(n);
     for _ in 0..n {
         let (x0, x1) = (next(), next());
-        // Sum of 12 uniforms minus 6: mean 0, variance 1.
-        let eps: f32 = (0..12).map(|_| next()).sum::<f32>() - 6.0;
+        let eps = normal(&mut next);
         x.extend_from_slice(&[x0, x1]);
         y.push(f(x0) as f32 + w * x1 + 0.5 * eps);
     }

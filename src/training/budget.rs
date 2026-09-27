@@ -106,9 +106,9 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, Objective};
 use crate::training::multi_output::reject_split_gradient;
-use crate::training::train::{
-    initial_intercepts, new_model, reject_feature_weights, validate_dataset,
-    validate_trained_model, with_thread_pool,
+use crate::training::train::{initial_intercepts, new_model, with_thread_pool};
+use crate::training::validate::{
+    reject_feature_weights, validate_datasets, validate_trained_model,
 };
 use crate::tree::builder::budget::{
     ChildRecord, GENERALIZATION_THRESHOLD_RELAXED, GrowConfig, N_FOLDS, TreeStopper,
@@ -354,15 +354,7 @@ fn train_budget_inner(
         ));
     };
     let n = dtrain.n_rows();
-    let n_features = dtrain.n_cols();
-    validate_dataset(
-        objective.as_ref(),
-        dtrain,
-        dtrain.n_targets(),
-        n_features,
-        n_out,
-        "dtrain",
-    )?;
+    validate_datasets(objective.as_ref(), dtrain, &[])?;
     let info = dtrain.info();
     let base_margins = initial_intercepts(params, objective.as_ref(), &info, n_out)?;
     let mut model = new_model(params, objective.as_ref(), dtrain, base_margins);

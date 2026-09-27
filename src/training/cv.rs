@@ -8,7 +8,7 @@ use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::rng::Rng;
 use crate::training::Trainer;
-use crate::training::train::{EarlyStopping, configured_metrics};
+use crate::training::eval::{EarlyStopping, configured_metrics};
 
 /// Per-metric cross-validation history, aggregated across folds.
 #[derive(Debug, Clone)]

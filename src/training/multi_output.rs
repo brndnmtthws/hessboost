@@ -3,10 +3,11 @@
 //! for `gbtree` and DART, optionally growing its structure from reduced split
 //! gradients supplied by the objective ([`Loss::split_gradient`]).
 
-use super::train::{
-    MarginCaches, TrainContext, TreeOutput, dart_new_tree_weight, finish_dart, gradient_sampling,
-    iteration_row_subsets, make_column_sampler, round_gradients, tree_eta,
-};
+use super::dart::{dart_new_tree_weight, finish_dart, round_gradients};
+use super::margins::{MarginCaches, TreeOutput};
+use super::prepare::TrainContext;
+use super::round::tree_eta;
+use super::row_sampling::{gradient_sampling, iteration_row_subsets, make_column_sampler};
 use crate::config::{BoosterKind, Device, MultiStrategy, TrainingParams, TreeMethod};
 use crate::data::ghist::GHistIndex;
 use crate::error::{HessboostError, Result};

@@ -88,6 +88,25 @@ def test_from_model_resumes_like_the_trained_online_model(tolerance: float) -> N
         OnlineModel.from_model(loaded, {**PARAMS, "objective": "reg:logistic"}, dtrain)
 
 
+def test_from_model_refuses_an_early_stopped_model() -> None:
+    x, y = regression(rows=400)
+    dtrain, dvalid = DMatrix(x[:300], y[:300]), DMatrix(x[300:], y[300:])
+    stopped = hessboost.train(
+        PARAMS,
+        dtrain,
+        200,
+        evals=[(dvalid, "valid")],
+        early_stopping_rounds=2,
+        verbose_eval=False,
+    )
+    best = stopped.best_iteration
+    assert best is not None
+    with pytest.raises(HessboostError, match="early-stopped"):
+        OnlineModel.from_model(stopped, PARAMS, dtrain)
+    resumed = OnlineModel.from_model(stopped[: best + 1], PARAMS, dtrain)
+    assert resumed.model.num_boosted_rounds() == best + 1
+
+
 @pytest.mark.parametrize("tolerance", [0.1, 0.0])
 def test_a_stopping_callback_abandons_the_update(tolerance: float) -> None:
     online = OnlineModel.train(PARAMS, binary(300, 6), ROUNDS, tolerance)

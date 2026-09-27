@@ -35,3 +35,21 @@ impl<T> OrRaise<T> for Result<T, RustError> {
         self.map_err(map_err)
     }
 }
+
+/// `Python::detach` for fallible hessboost work: runs `f` without the GIL
+/// (attached thread state) and raises its error.
+pub(crate) trait DetachExt {
+    fn detached<T: Send>(
+        self,
+        f: impl FnOnce() -> Result<T, RustError> + pyo3::marker::Ungil,
+    ) -> PyResult<T>;
+}
+
+impl DetachExt for Python<'_> {
+    fn detached<T: Send>(
+        self,
+        f: impl FnOnce() -> Result<T, RustError> + pyo3::marker::Ungil,
+    ) -> PyResult<T> {
+        self.detach(f).or_raise()
+    }
+}

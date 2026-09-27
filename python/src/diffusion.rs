@@ -6,8 +6,9 @@
 //! which the Python layer's dataclasses map onto one to one; the GBDTs'
 //! training parameters as validated `Params`.
 
+use crate::codec::{encode_bytes, from_json, to_json};
 use crate::data::{DMatrix, row_major, to_numpy};
-use crate::errors::{OrRaise, refuse};
+use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::{Params, to_python};
 use hessboost::config::TrainingParams;
 use hessboost::diffusion::{
@@ -43,15 +44,7 @@ pub(crate) fn positive(name: &str, value: usize) -> PyResult<NonZeroUsize> {
     NonZeroUsize::new(value).ok_or_else(|| refuse(format!("{name} must be at least 1, got 0")))
 }
 
-fn method_from_json(json: &str) -> PyResult<Method> {
-    serde_json::from_str(json)
-        .map_err(|error| refuse(format!("invalid diffusion method {json}: {error}")))
-}
-
-fn method_json(method: &Method) -> PyResult<String> {
-    serde_json::to_string(method)
-        .map_err(|error| refuse(format!("cannot describe the diffusion method: {error}")))
-}
+const METHOD: &str = "diffusion method";
 
 /// `params` in XGBoost's flat form, as a `dict`.
 fn training_dict<'py>(py: Python<'py>, params: &TrainingParams) -> PyResult<Bound<'py, PyAny>> {
@@ -70,7 +63,7 @@ impl DiffusionParams {
     #[new]
     fn new(request: ParamsRequest) -> PyResult<Self> {
         let mut inner = diffusion::DiffusionParams::default();
-        inner.method = method_from_json(&request.method)?;
+        inner.method = from_json::<Method>(&request.method, METHOD)?;
         inner.n_repeats = positive("n_repeats", request.n_repeats)?;
         inner.n_steps = positive("n_steps", request.n_steps)?;
         inner.training = request.training.get().inner.clone();
@@ -117,7 +110,7 @@ impl DiffusionParams {
             }
         };
         let dict = PyDict::new(py);
-        dict.set_item("method", method_json(&params.method)?)?;
+        dict.set_item("method", to_json(&params.method, METHOD)?)?;
         dict.set_item("n_repeats", params.n_repeats.get())?;
         dict.set_item("n_steps", params.n_steps.get())?;
         dict.set_item("training", training_dict(py, &params.training)?)?;
@@ -153,9 +146,7 @@ impl DiffusionModel {
     /// Fits a model of `p(y | x)` to the features and labels of `data`.
     #[staticmethod]
     fn fit(py: Python<'_>, params: &DiffusionParams, data: &DMatrix) -> PyResult<Self> {
-        let inner = py
-            .detach(|| diffusion::DiffusionModel::fit(&params.inner, &data.inner))
-            .or_raise()?;
+        let inner = py.detached(|| diffusion::DiffusionModel::fit(&params.inner, &data.inner))?;
         Ok(Self { inner })
     }
 
@@ -174,45 +165,38 @@ impl DiffusionModel {
         if let Some(n_steps) = n_steps {
             options = options.with_n_steps(positive("n_steps", n_steps)?);
         }
-        let samples = py
-            .detach(|| self.inner.sample(&data.inner, n_samples, &options))
-            .or_raise()?;
+        let samples = py.detached(|| self.inner.sample(&data.inner, n_samples, &options))?;
         let shape = [samples.n_rows(), samples.n_samples(), samples.n_outputs()];
         to_numpy(py, samples.into_vec(), &shape)
     }
 
     #[staticmethod]
     fn from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
-        let inner = py
-            .detach(|| diffusion::DiffusionModel::from_bytes(data))
-            .or_raise()?;
+        let inner = py.detached(|| diffusion::DiffusionModel::from_bytes(data))?;
         Ok(Self { inner })
     }
 
     /// Decodes the JSON format.
     #[staticmethod]
     fn from_json(py: Python<'_>, json: &str) -> PyResult<Self> {
-        let inner = py
-            .detach(|| diffusion::DiffusionModel::from_json(json))
-            .or_raise()?;
+        let inner = py.detached(|| diffusion::DiffusionModel::from_json(json))?;
         Ok(Self { inner })
     }
 
     /// The model in the native binary format.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py.detach(|| self.inner.to_bytes()).or_raise()?;
-        Ok(PyBytes::new(py, &bytes))
+        encode_bytes(py, || self.inner.to_bytes())
     }
 
     /// The model as JSON.
     fn to_json(&self, py: Python<'_>) -> PyResult<String> {
-        py.detach(|| self.inner.to_json()).or_raise()
+        py.detached(|| self.inner.to_json())
     }
 
     /// The JSON of the model's [`Method`].
     #[getter]
     fn method(&self) -> PyResult<String> {
-        method_json(self.inner.method())
+        to_json(self.inner.method(), METHOD)
     }
 
     #[getter]
@@ -250,9 +234,7 @@ fn summarize<T: Send>(
         )));
     };
     let values = row_major(samples, "samples")?;
-    let out = py
-        .detach(|| summary(SamplesView::new(values, n_samples, outputs)?))
-        .or_raise()?;
+    let out = py.detached(|| summary(SamplesView::new(values, n_samples, outputs)?))?;
     Ok((out, [rows, outputs]))
 }
 

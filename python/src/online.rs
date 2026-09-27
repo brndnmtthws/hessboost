@@ -2,7 +2,7 @@
 
 use crate::booster::Booster;
 use crate::data::{DMatrix, row_major};
-use crate::errors::{OrRaise, refuse};
+use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
 use crate::train::{Failure, run_hooked};
 use hessboost::training::online;
@@ -118,16 +118,14 @@ impl OnlineModel {
         mode: &OnlineParams,
     ) -> PyResult<Self> {
         let mode = mode.inner;
-        let online = py
-            .detach(|| {
-                online::OnlineModel::from_model(
-                    (*booster.model).clone(),
-                    &params.inner,
-                    &dtrain.inner,
-                    mode,
-                )
-            })
-            .or_raise()?;
+        let online = py.detached(|| {
+            online::OnlineModel::from_model(
+                (*booster.model).clone(),
+                &params.inner,
+                &dtrain.inner,
+                mode,
+            )
+        })?;
         Ok(Self::new(online))
     }
 

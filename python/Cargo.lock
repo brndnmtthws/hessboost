@@ -107,6 +107,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "self_cell",
+ "serde",
  "serde_json",
 ]
 

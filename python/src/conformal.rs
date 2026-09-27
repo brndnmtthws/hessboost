@@ -2,8 +2,8 @@
 //! the calibrator keeps alive.
 
 use crate::booster::Booster;
-use crate::data::{DMatrix, to_numpy};
-use crate::errors::OrRaise;
+use crate::data::{DMatrix, intervals_to_numpy};
+use crate::errors::DetachExt;
 use hessboost::conformal;
 use hessboost::model::BoostedModel;
 use numpy::PyArrayDyn;
@@ -37,19 +37,6 @@ self_cell!(
     }
 );
 
-/// `(rows, 2)` `[lower, upper]` bounds.
-fn intervals(
-    py: Python<'_>,
-    bounds: Vec<conformal::Interval>,
-) -> PyResult<Bound<'_, PyArrayDyn<f32>>> {
-    let rows = bounds.len();
-    let values = bounds
-        .into_iter()
-        .flat_map(|iv| [iv.lower, iv.upper])
-        .collect();
-    to_numpy(py, values, &[rows, 2])
-}
-
 /// Split-conformal intervals `[f(x) - Q, f(x) + Q]` around a single-output
 /// model.
 #[pyclass(frozen, module = "hessboost._hessboost")]
@@ -69,13 +56,11 @@ impl SplitConformal {
         alpha: f64,
     ) -> PyResult<Self> {
         let model = Arc::clone(&booster.model);
-        let cell = py
-            .detach(|| {
-                SplitCell::try_new(model, |model| {
-                    conformal::SplitConformal::calibrate(model, &calibration.inner, alpha)
-                })
+        let cell = py.detached(|| {
+            SplitCell::try_new(model, |model| {
+                conformal::SplitConformal::calibrate(model, &calibration.inner, alpha)
             })
-            .or_raise()?;
+        })?;
         Ok(Self { cell })
     }
 
@@ -84,10 +69,8 @@ impl SplitConformal {
         py: Python<'py>,
         data: &DMatrix,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
-        let bounds = py
-            .detach(|| self.cell.borrow_dependent().predict_interval(&data.inner))
-            .or_raise()?;
-        intervals(py, bounds)
+        let bounds = py.detached(|| self.cell.borrow_dependent().predict_interval(&data.inner))?;
+        intervals_to_numpy(py, bounds)
     }
 
     #[getter]
@@ -133,32 +116,28 @@ impl ConformalizedQuantile {
         alpha: f64,
     ) -> PyResult<Self> {
         let data = &calibration.inner;
-        let cell = py
-            .detach(|| {
-                QuantileCell::try_new(models, |models| match band {
-                    Band::Models => conformal::ConformalizedQuantile::calibrate(
-                        &models.lower,
-                        &models.upper,
-                        data,
-                        alpha,
-                    ),
-                    Band::Outputs(lower, upper) => {
-                        conformal::ConformalizedQuantile::calibrate_outputs(
-                            &models.lower,
-                            lower,
-                            upper,
-                            data,
-                            alpha,
-                        )
-                    }
-                    Band::Distribution => conformal::ConformalizedQuantile::calibrate_distribution(
-                        &models.lower,
-                        data,
-                        alpha,
-                    ),
-                })
+        let cell = py.detached(|| {
+            QuantileCell::try_new(models, |models| match band {
+                Band::Models => conformal::ConformalizedQuantile::calibrate(
+                    &models.lower,
+                    &models.upper,
+                    data,
+                    alpha,
+                ),
+                Band::Outputs(lower, upper) => conformal::ConformalizedQuantile::calibrate_outputs(
+                    &models.lower,
+                    lower,
+                    upper,
+                    data,
+                    alpha,
+                ),
+                Band::Distribution => conformal::ConformalizedQuantile::calibrate_distribution(
+                    &models.lower,
+                    data,
+                    alpha,
+                ),
             })
-            .or_raise()?;
+        })?;
         Ok(Self { cell })
     }
 
@@ -223,10 +202,8 @@ impl ConformalizedQuantile {
         py: Python<'py>,
         data: &DMatrix,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
-        let bounds = py
-            .detach(|| self.cell.borrow_dependent().predict_interval(&data.inner))
-            .or_raise()?;
-        intervals(py, bounds)
+        let bounds = py.detached(|| self.cell.borrow_dependent().predict_interval(&data.inner))?;
+        intervals_to_numpy(py, bounds)
     }
 
     #[getter]

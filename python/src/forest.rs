@@ -4,12 +4,13 @@
 //! As in `diffusion`, the method crosses the boundary as the JSON of
 //! `ForestMethod` (the form forest model files store).
 
+use crate::codec::{encode_bytes, from_json, to_json};
 use crate::data::{DMatrix, row_major, to_numpy};
 use crate::diffusion::positive;
-use crate::errors::{OrRaise, refuse};
+use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::{Params, to_python};
 use hessboost::diffusion::forest::{
-    self, ColumnKind, ForestMethod, ImputeOptions, NoiseLevels, Repaint, Synthetic,
+    self, ColumnKind, ImputeOptions, NoiseLevels, Repaint, Synthetic,
 };
 use numpy::{PyArrayDyn, PyReadonlyArray1};
 use pyo3::exceptions::PyValueError;
@@ -33,27 +34,29 @@ pub(crate) struct ForestRequest {
     seed: u64,
 }
 
-fn method_from_json(json: &str) -> PyResult<ForestMethod> {
-    serde_json::from_str(json)
-        .map_err(|error| refuse(format!("invalid forest method {json}: {error}")))
-}
-
-fn method_json(method: ForestMethod) -> PyResult<String> {
-    serde_json::to_string(&method)
-        .map_err(|error| refuse(format!("cannot describe the forest method: {error}")))
-}
+const METHOD: &str = "forest method";
 
 /// A column kind from its crate (serde) name.
 fn column_kind(name: &str) -> PyResult<ColumnKind> {
-    serde_json::from_value(Value::String(name.to_owned()))
-        .map_err(|error| refuse(format!("invalid column kind {name:?}: {error}")))
+    match name {
+        "continuous" => Ok(ColumnKind::Continuous),
+        "integer" => Ok(ColumnKind::Integer),
+        "categorical" => Ok(ColumnKind::Categorical),
+        other => Err(refuse(format!(
+            "invalid column kind {other:?}; expected \"continuous\", \"integer\" or \"categorical\""
+        ))),
+    }
 }
 
 /// The crate (serde) name of `kind`.
-fn column_kind_name(kind: ColumnKind) -> PyResult<String> {
-    match serde_json::to_value(kind) {
-        Ok(Value::String(name)) => Ok(name),
-        _ => Err(refuse(format!("cannot name the column kind {kind:?}"))),
+fn column_kind_name(kind: ColumnKind) -> PyResult<&'static str> {
+    match kind {
+        ColumnKind::Continuous => Ok("continuous"),
+        ColumnKind::Integer => Ok("integer"),
+        ColumnKind::Categorical => Ok("categorical"),
+        // `ColumnKind` is `#[non_exhaustive]`: a kind added in the crate
+        // is refused until it has a name here.
+        other => Err(refuse(format!("cannot name the column kind {other:?}"))),
     }
 }
 
@@ -69,7 +72,7 @@ impl ForestParams {
     #[new]
     fn new(request: ForestRequest) -> PyResult<Self> {
         let mut inner = forest::ForestParams::default();
-        inner.method = method_from_json(&request.method)?;
+        inner.method = from_json(&request.method, METHOD)?;
         inner.n_t = NoiseLevels::try_from(request.n_t).or_raise()?;
         inner.duplicate_k = positive("duplicate_k", request.duplicate_k)?;
         inner.column_kinds = request
@@ -99,7 +102,7 @@ impl ForestParams {
             }
         };
         let dict = PyDict::new(py);
-        dict.set_item("method", method_json(params.method)?)?;
+        dict.set_item("method", to_json(&params.method, METHOD)?)?;
         dict.set_item("n_t", params.n_t.get())?;
         dict.set_item("duplicate_k", params.duplicate_k.get())?;
         let kinds = params
@@ -146,9 +149,7 @@ impl ForestModel {
     /// Fits a model of the rows of `data`, per class of its labels if any.
     #[staticmethod]
     fn fit(py: Python<'_>, params: &ForestParams, data: &DMatrix) -> PyResult<Self> {
-        let inner = py
-            .detach(|| forest::ForestModel::fit(&params.inner, &data.inner))
-            .or_raise()?;
+        let inner = py.detached(|| forest::ForestModel::fit(&params.inner, &data.inner))?;
         Ok(Self { inner })
     }
 
@@ -160,7 +161,7 @@ impl ForestModel {
         n_rows: usize,
         seed: u64,
     ) -> PyResult<SyntheticArrays<'py>> {
-        let synthetic = py.detach(|| self.inner.sample(n_rows, seed)).or_raise()?;
+        let synthetic = py.detached(|| self.inner.sample(n_rows, seed))?;
         synthetic_arrays(py, synthetic)
     }
 
@@ -172,9 +173,7 @@ impl ForestModel {
         seed: u64,
     ) -> PyResult<SyntheticArrays<'py>> {
         let labels = row_major(&labels, "labels")?;
-        let synthetic = py
-            .detach(|| self.inner.sample_for_labels(labels, seed))
-            .or_raise()?;
+        let synthetic = py.detached(|| self.inner.sample_for_labels(labels, seed))?;
         synthetic_arrays(py, synthetic)
     }
 
@@ -196,9 +195,8 @@ impl ForestModel {
             repaint.jump = jump;
             options = options.with_repaint(repaint);
         }
-        let imputations = py
-            .detach(|| self.inner.impute(&data.inner, n_imputations, &options))
-            .or_raise()?;
+        let imputations =
+            py.detached(|| self.inner.impute(&data.inner, n_imputations, &options))?;
         let shape = [
             imputations.n_imputations(),
             imputations.n_rows(),
@@ -210,36 +208,31 @@ impl ForestModel {
     /// Decodes the binary format.
     #[staticmethod]
     fn from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
-        let inner = py
-            .detach(|| forest::ForestModel::from_bytes(data))
-            .or_raise()?;
+        let inner = py.detached(|| forest::ForestModel::from_bytes(data))?;
         Ok(Self { inner })
     }
 
     /// Decodes the JSON format.
     #[staticmethod]
     fn from_json(py: Python<'_>, json: &str) -> PyResult<Self> {
-        let inner = py
-            .detach(|| forest::ForestModel::from_json(json))
-            .or_raise()?;
+        let inner = py.detached(|| forest::ForestModel::from_json(json))?;
         Ok(Self { inner })
     }
 
     /// The model in the binary format.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py.detach(|| self.inner.to_bytes()).or_raise()?;
-        Ok(PyBytes::new(py, &bytes))
+        encode_bytes(py, || self.inner.to_bytes())
     }
 
     /// The model as JSON.
     fn to_json(&self, py: Python<'_>) -> PyResult<String> {
-        py.detach(|| self.inner.to_json()).or_raise()
+        py.detached(|| self.inner.to_json())
     }
 
     /// The JSON of the model's [`ForestMethod`].
     #[getter]
     fn method(&self) -> PyResult<String> {
-        method_json(self.inner.method())
+        to_json(&self.inner.method(), METHOD)
     }
 
     #[getter]

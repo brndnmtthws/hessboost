@@ -201,14 +201,17 @@ impl<'a> MetaInfo<'a> {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] naming the inconsistent field.
+    /// [`HessboostError::InvalidData`] naming the inconsistent field.
     pub(crate) fn check_layout(&self) -> Result<()> {
         let n_targets = self.n_targets();
         let cells = self.n_rows.checked_mul(n_targets);
         if cells.is_none() {
-            return Err(HessboostError::invalid_param(
-                "n_targets",
-                format!("dataset has {n_targets} targets for {} rows", self.n_rows),
+            return Err(HessboostError::invalid_data(
+                "labels",
+                format!(
+                    "{n_targets} targets for {} rows overflow usize",
+                    self.n_rows
+                ),
             ));
         }
         if let Some(labels) = self.labels
@@ -224,13 +227,9 @@ impl<'a> MetaInfo<'a> {
             if let Some(values) = values
                 && values.len() != self.n_rows
             {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::invalid_data(
                     name,
-                    format!(
-                        "dataset has {} {name} for {} rows",
-                        values.len(),
-                        self.n_rows
-                    ),
+                    format!("{} {name} for {} rows", values.len(), self.n_rows),
                 ));
             }
         }
@@ -239,10 +238,10 @@ impl<'a> MetaInfo<'a> {
 
     /// The `labels` error of a label count that is not `n_rows * n_targets`.
     fn label_count_error(&self) -> HessboostError {
-        HessboostError::invalid_param(
+        HessboostError::invalid_data(
             "labels",
             format!(
-                "dataset has {} labels for {} rows of {} targets",
+                "{} labels for {} rows of {} targets",
                 self.label_values().len(),
                 self.n_rows,
                 self.n_targets()
@@ -258,8 +257,9 @@ impl<'a> MetaInfo<'a> {
     /// # Errors
     ///
     /// The [`check_layout`](Self::check_layout) error when the lengths are
-    /// inconsistent, and an `InvalidParameter` naming `labels` when there
-    /// are no labels to back the cells (nothing is allocated on error).
+    /// inconsistent, and an [`HessboostError::InvalidData`] naming `labels`
+    /// when there are no labels to back the cells (nothing is allocated on
+    /// error).
     pub(crate) fn cell_weights(&self) -> Result<Option<Vec<f32>>> {
         self.check_layout()?;
         if self.labels.is_none() {

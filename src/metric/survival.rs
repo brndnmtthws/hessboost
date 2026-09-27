@@ -116,9 +116,9 @@ fn interval_mean(preds: &[f32], info: &MetaInfo, row: impl Fn(f64, f64, f64) -> 
 /// bounds, or the labels as observed times when there are none.
 fn validate_intervals(name: &str, info: &MetaInfo) -> Result<()> {
     if info.n_rows > 0 && info.bounds.is_none() && info.label_values().is_empty() {
-        return Err(HessboostError::invalid_param(
-            "eval_metric",
-            format!("metric `{name}` needs label bounds or labels, but dataset has neither"),
+        return Err(HessboostError::invalid_data(
+            "label_bounds",
+            format!("missing; metric `{name}` needs label bounds or labels"),
         ));
     }
     Ok(())

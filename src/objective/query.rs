@@ -18,17 +18,16 @@ pub(super) fn validate_query_info(info: &MetaInfo, invalid: impl Fn(f32) -> bool
     check_label_width(info, 1)?;
     check_label_domain(info, invalid)?;
     let Some(group) = info.group else {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "group_sizes",
-            "ranking dataset requires group information",
+            "ranking objectives require query groups",
         ));
     };
     if !group.partitions(info.n_rows) || group.iter_ranges().any(|(start, end)| start == end) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "group_sizes",
             format!(
-                "dataset has {} rows, but its query groups are not non-empty consecutive \
-                 row ranges covering them",
+                "query groups are not non-empty consecutive row ranges covering the {} rows",
                 info.n_rows
             ),
         ));
@@ -39,9 +38,9 @@ pub(super) fn validate_query_info(info: &MetaInfo, invalid: impl Fn(f32) -> bool
                 .iter()
                 .any(|weight| *weight != weights[start])
             {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::invalid_data(
                     "weights",
-                    "ranking dataset requires one constant weight per query group",
+                    "ranking objectives require one constant weight per query group",
                 ));
             }
         }

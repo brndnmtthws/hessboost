@@ -32,7 +32,12 @@ from hessboost._booster import (
     ModelFormat,
 )
 from hessboost._core import Uncertainty
-from hessboost._exceptions import HessboostError, ModelFormatError
+from hessboost._exceptions import (
+    HessboostError,
+    IncompatibleModelError,
+    InvalidDataError,
+    ModelFormatError,
+)
 from hessboost._matrix import DMatrix
 from hessboost._training import (
     CustomMetric,
@@ -54,6 +59,8 @@ __all__ = [
     "EvalsResult",
     "HessboostError",
     "ImportanceType",
+    "IncompatibleModelError",
+    "InvalidDataError",
     "ModelFormat",
     "ModelFormatError",
     "Objective",

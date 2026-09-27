@@ -36,14 +36,14 @@ pub(crate) fn check_len(what: &'static str, got: usize, expected: usize) -> Resu
 /// Caller must ensure `indptr` is non-empty (`from_csr` rejects that first).
 fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
     if indptr[0] != 0 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "csr indptr",
             "the first offset must be 0",
         ));
     }
     for pair in indptr.windows(2) {
         if pair[0] > pair[1] || pair[1] > nnz {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "csr indptr",
                 "offsets must be monotonic and within the values array",
             ));
@@ -52,16 +52,16 @@ fn check_csr(indptr: &[usize], nnz: usize) -> Result<()> {
     check_len("csr indptr terminal", indptr[indptr.len() - 1], nnz)
 }
 
-/// Reject any non-finite value of `values` under parameter `name`.
+/// Reject any non-finite value of `values` as invalid input `name`.
 fn check_finite(name: &'static str, values: &[f32], reason: &'static str) -> Result<()> {
     if values.iter().any(|v| !v.is_finite()) {
-        return Err(HessboostError::invalid_param(name, reason));
+        return Err(HessboostError::invalid_data(name, reason));
     }
     Ok(())
 }
 
 /// Reject weights that are negative or non-finite (`invalid`), or none of
-/// which is positive (`none_positive`), under parameter `name`.
+/// which is positive (`none_positive`), as invalid input `name`.
 fn check_weights(
     name: &'static str,
     weights: &[f32],
@@ -69,10 +69,10 @@ fn check_weights(
     none_positive: &'static str,
 ) -> Result<()> {
     if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
-        return Err(HessboostError::invalid_param(name, invalid));
+        return Err(HessboostError::invalid_data(name, invalid));
     }
     if !weights.iter().any(|v| *v > 0.0) {
-        return Err(HessboostError::invalid_param(name, none_positive));
+        return Err(HessboostError::invalid_data(name, none_positive));
     }
     Ok(())
 }
@@ -86,9 +86,9 @@ fn check_dense(data: &[f32], n_rows: usize, n_cols: usize, missing: f32) -> Resu
             "from_dense: zero rows or columns",
         ));
     }
-    let expected = n_rows.checked_mul(n_cols).ok_or_else(|| {
-        HessboostError::invalid_param("matrix shape", "n_rows * n_cols overflows usize")
-    })?;
+    let expected = n_rows
+        .checked_mul(n_cols)
+        .ok_or_else(|| HessboostError::invalid_data("data", "n_rows * n_cols overflows usize"))?;
     check_len("dense data length", data.len(), expected)?;
     // With the NaN sentinel the only rejected values are infinities, a
     // branch-free check the compiler vectorizes; other sentinels need the
@@ -107,8 +107,8 @@ fn check_dense(data: &[f32], n_rows: usize, n_cols: usize, missing: f32) -> Resu
         rejects(data)
     };
     if invalid {
-        return Err(HessboostError::invalid_param(
-            "dense data",
+        return Err(HessboostError::invalid_data(
+            "data",
             "non-missing feature values must be finite",
         ));
     }
@@ -243,7 +243,7 @@ impl DMatrix {
             seen.clear();
             for &col in &indices[indptr[row]..indptr[row + 1]] {
                 if !seen.insert(col) {
-                    return Err(HessboostError::invalid_param(
+                    return Err(HessboostError::invalid_data(
                         "csr indices",
                         format!("duplicate column {col} in row {row}"),
                     ));
@@ -272,13 +272,13 @@ impl DMatrix {
     /// row-major `[row][target]` (`len == n_rows * n_targets`).
     pub fn with_label_matrix(mut self, labels: &[f32], n_targets: usize) -> Result<Self> {
         let Some(n_targets) = NonZeroUsize::new(n_targets) else {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "labels",
                 "n_targets must be at least 1",
             ));
         };
         let expected = self.n_rows.checked_mul(n_targets.get()).ok_or_else(|| {
-            HessboostError::invalid_param("labels", "n_rows * n_targets overflows usize")
+            HessboostError::invalid_data("labels", "n_rows * n_targets overflows usize")
         })?;
         check_len("labels", labels.len(), expected)?;
         check_finite("labels", labels, "all labels must be finite")?;
@@ -298,7 +298,7 @@ impl DMatrix {
         check_len("label_upper_bound", upper.len(), self.n_rows)?;
         for (name, bound) in [("label_lower_bound", lower), ("label_upper_bound", upper)] {
             if bound.iter().any(|v| v.is_nan()) {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::invalid_data(
                     name,
                     "label bounds must not be NaN",
                 ));
@@ -355,7 +355,7 @@ impl DMatrix {
     /// model: predicting on a matrix without one uses the intercept.
     pub fn with_base_margin(mut self, base_margin: &[f32]) -> Result<Self> {
         if base_margin.is_empty() || !base_margin.len().is_multiple_of(self.n_rows) {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "base_margin",
                 "length must be a non-zero multiple of n_rows",
             ));
@@ -368,14 +368,14 @@ impl DMatrix {
     /// Attach ranking group information (sizes sum to `n_rows`).
     pub fn with_group_sizes(mut self, sizes: &[usize]) -> Result<Self> {
         if sizes.is_empty() || sizes.contains(&0) {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "group_sizes",
                 "groups must be non-empty and every group must contain a row",
             ));
         }
         let total = sizes.iter().try_fold(0usize, |acc, &s| acc.checked_add(s));
         let Some(total) = total else {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "group_sizes",
                 "group-size sum overflows usize",
             ));
@@ -392,7 +392,7 @@ impl DMatrix {
     /// XGBoost-compatible per-query weighting semantics.
     pub fn with_group_weights(mut self, weights: &[f32]) -> Result<Self> {
         let group = self.group.as_ref().ok_or_else(|| {
-            HessboostError::invalid_param("group_weights", "attach group sizes first")
+            HessboostError::invalid_data("group_weights", "attach group sizes first")
         })?;
         check_len("group_weights length", weights.len(), group.num_groups())?;
         let invalid = "weights must be finite and non-negative with at least one positive value";
@@ -410,7 +410,7 @@ impl DMatrix {
         check_len("feature_types length", types.len(), self.n_cols)?;
         self.feature_types = types.to_vec();
         let invalid = |col: usize, v: f32| {
-            HessboostError::invalid_param(
+            HessboostError::invalid_data(
                 "categorical feature",
                 format!("feature {col} contains invalid category value {v}"),
             )

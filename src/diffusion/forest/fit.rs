@@ -76,7 +76,7 @@ fn prepare_table(params: &ForestParams, data: &DMatrix) -> Result<Table> {
         .filter(|&r| raw[r * p..(r + 1) * p].iter().any(|v| !v.is_nan()))
         .collect();
     if keep.is_empty() {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "data",
             "every row is entirely missing",
         ));
@@ -90,7 +90,7 @@ fn prepare_table(params: &ForestParams, data: &DMatrix) -> Result<Table> {
     let columns = describe_columns(&rows, p, &kinds)?;
     let c: usize = columns.iter().map(Column::width).sum();
     if c == 0 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "data",
             "every column is a single-category categorical: nothing to model",
         ));
@@ -281,7 +281,7 @@ impl LevelSet<'_> {
         }
         let n_rows = labels.len() / width;
         if n_rows == 0 {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "data",
                 match target {
                     Target::All => format!("class {class} has no rows"),

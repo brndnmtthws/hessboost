@@ -695,7 +695,10 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 Trainer::new(&params, &d, 1).train(),
-                Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+                Err(HessboostError::InvalidData {
+                    input: "labels",
+                    ..
+                })
             ));
         }
     }

@@ -46,6 +46,22 @@ pub fn invalid_param<T: std::fmt::Debug>(result: Result<T>) -> &'static str {
     }
 }
 
+/// The input and dataset of the invalid-data error `result` must hold.
+pub fn invalid_data<T: std::fmt::Debug>(result: Result<T>) -> (&'static str, Option<String>) {
+    match result {
+        Err(HessboostError::InvalidData { input, dataset, .. }) => (input, dataset),
+        other => panic!("expected an invalid-data error, got {other:?}"),
+    }
+}
+
+/// What the incompatible-model error `result` must hold conflicts with.
+pub fn incompatible_model<T: std::fmt::Debug>(result: Result<T>) -> &'static str {
+    match result {
+        Err(HessboostError::IncompatibleModel { what, .. }) => what,
+        other => panic!("expected an incompatible-model error, got {other:?}"),
+    }
+}
+
 /// Root mean squared error of `model`'s predictions on the labels of `data`
 /// (every label cell of a label matrix).
 pub fn rmse(model: &BoostedModel, data: &DMatrix) -> f64 {

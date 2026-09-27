@@ -1044,7 +1044,10 @@ fn logistic_objectives_accept_probability_labels() {
             assert!(
                 matches!(
                     train(&params, &d, 3),
-                    Err(HessboostError::InvalidParameter { .. })
+                    Err(HessboostError::InvalidData {
+                        input: "labels",
+                        ..
+                    })
                 ),
                 "{name} should reject label {bad}"
             );
@@ -1159,12 +1162,9 @@ fn eval_set_label_domain_errors_name_the_dataset() {
         .eval(&holdout, "holdout")
         .train()
     {
-        Err(HessboostError::InvalidParameter { name, reason }) => {
-            assert_eq!(name, "labels");
-            assert_eq!(
-                reason,
-                "dataset `holdout` has labels outside the objective's valid domain"
-            );
+        Err(HessboostError::InvalidData { input, dataset, .. }) => {
+            assert_eq!(input, "labels");
+            assert_eq!(dataset.as_deref(), Some("holdout"));
         }
         other => panic!("expected a label-domain error, got {other:?}"),
     }
@@ -1188,7 +1188,10 @@ fn target_count_mismatches_are_rejected() {
         .unwrap();
     assert!(matches!(
         train(&poisson, &two_targets, 1),
-        Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+        Err(HessboostError::InvalidData {
+            input: "labels",
+            ..
+        })
     ));
     assert!(matches!(
         Trainer::new(&params, &d, 1)
@@ -1374,8 +1377,8 @@ impl crate::objective::Loss for BoundsMidpoint {
 
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
         if info.bounds.is_none() {
-            return Err(HessboostError::invalid_param(
-                "label_lower_bound",
+            return Err(HessboostError::invalid_data(
+                "label_bounds",
                 "dataset has no label bounds",
             ));
         }
@@ -1422,7 +1425,10 @@ fn training_routes_through_metadata_hooks() {
     let unbounded = DMatrix::from_dense(&x, 32, 1).unwrap();
     assert!(matches!(
         train(&params, &unbounded, 1),
-        Err(HessboostError::InvalidParameter { name, .. }) if name == "label_lower_bound"
+        Err(HessboostError::InvalidData {
+            input: "label_bounds",
+            ..
+        })
     ));
 }
 
@@ -1440,6 +1446,18 @@ fn eval_metric_rejection<T: std::fmt::Debug>(result: Result<T>, context: &str) -
             reason,
         }) => reason,
         other => panic!("{context}: expected an `eval_metric` rejection, got {other:?}"),
+    }
+}
+/// The dataset of an invalid-`labels` rejection of the `context` run,
+/// panicking on any other outcome.
+fn label_rejection<T: std::fmt::Debug>(result: Result<T>, context: &str) -> String {
+    match result {
+        Err(HessboostError::InvalidData {
+            input: "labels",
+            dataset: Some(dataset),
+            ..
+        }) => dataset,
+        other => panic!("{context}: expected an invalid-`labels` rejection, got {other:?}"),
     }
 }
 
@@ -1475,8 +1493,7 @@ fn label_metrics_are_refused_on_bound_only_eval_sets() {
         let run = Trainer::new(&params(metric), &d, 2)
             .eval(&d, "eval")
             .train();
-        let reason = eval_metric_rejection(run, metric);
-        assert!(reason.contains("`eval`"), "{reason}");
+        assert_eq!(label_rejection(run, metric), "eval");
     }
 }
 
@@ -1498,8 +1515,7 @@ fn class_index_metrics_refuse_non_class_labels() {
             .build()
             .unwrap();
         let run = Trainer::new(&params, &d, 2).eval(&d, "eval").train();
-        let reason = eval_metric_rejection(run, metric);
-        assert!(reason.contains("class"), "{reason}");
+        assert_eq!(label_rejection(run, metric), "eval");
     }
 }
 
@@ -1676,7 +1692,8 @@ fn custom_objective_outputs_must_match_the_label_layout() {
     for k in [1, 3] {
         assert!(matches!(
             run(k),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "objective"
+            Err(HessboostError::InvalidData { input: "labels", dataset: Some(dataset), .. })
+                if dataset == "dtrain"
         ));
     }
 }

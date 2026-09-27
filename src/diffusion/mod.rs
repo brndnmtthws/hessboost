@@ -199,6 +199,7 @@ use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
+use crate::check::{ensure, positive};
 use crate::config::{GrowPolicy, ProcessType, TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -553,20 +554,18 @@ impl DiffusionParams {
         validate_regressor_params("training", &self.training)?;
         if let Some(stop) = &self.early_stopping {
             let f = stop.eval_fraction;
-            if !(f.is_finite() && f > 0.0 && f < 1.0) {
-                return Err(HessboostError::invalid_param(
-                    "early_stopping.eval_fraction",
-                    format!("must be in (0, 1), got {f}"),
-                ));
-            }
+            ensure(
+                "early_stopping.eval_fraction",
+                f.is_finite() && f > 0.0 && f < 1.0,
+                format!("must be in (0, 1), got {f}"),
+            )?;
         }
         if let Some(r) = &self.residualizer {
-            if r.folds < 2 {
-                return Err(HessboostError::invalid_param(
-                    "residualizer.folds",
-                    format!("must be at least 2, got {}", r.folds),
-                ));
-            }
+            ensure(
+                "residualizer.folds",
+                r.folds >= 2,
+                format!("must be at least 2, got {}", r.folds),
+            )?;
             validate_regressor_params("residualizer.training", &r.training)?;
         }
         Ok(())
@@ -623,28 +622,15 @@ fn validate_regressor_params(name: &'static str, params: &TrainingParams) -> Res
     Ok(())
 }
 
-/// `v` is finite and `> 0`.
-fn check_positive(name: &'static str, v: f64) -> Result<()> {
-    if !(v.is_finite() && v > 0.0) {
-        return Err(HessboostError::invalid_param(
-            name,
-            format!("must be finite and > 0, got {v}"),
-        ));
-    }
-    Ok(())
-}
-
 /// `0 < lo < hi`, both finite.
 fn check_schedule(name: &'static str, lo: f64, hi: f64) -> Result<()> {
-    check_positive(name, lo)?;
-    check_positive(name, hi)?;
-    if lo >= hi {
-        return Err(HessboostError::invalid_param(
-            name,
-            format!("the minimum ({lo}) must be below the maximum ({hi})"),
-        ));
-    }
-    Ok(())
+    positive(name, lo)?;
+    positive(name, hi)?;
+    ensure(
+        name,
+        lo < hi,
+        format!("the minimum ({lo}) must be below the maximum ({hi})"),
+    )
 }
 
 impl Method {
@@ -664,9 +650,9 @@ impl Method {
                     }
                 }
                 if let Parameterization::Edm { sigma_data } = score.parameterization {
-                    check_positive("sigma_data", sigma_data)?;
+                    positive("sigma_data", sigma_data)?;
                     // The coefficients divide by `σ_d²`-sized terms.
-                    check_positive("sigma_data", sigma_data * sigma_data)?;
+                    positive("sigma_data", sigma_data * sigma_data)?;
                 }
                 // Finite parameters can still overflow the kernel (e.g. a VE
                 // `σ_max²` beyond `f64::MAX`); every quantity is monotone in
@@ -676,12 +662,11 @@ impl Method {
                     let (c, g2) = score.sde.drift_diffusion(t);
                     [alpha, std, std.ln(), c, g2].iter().all(|v| v.is_finite())
                 }) && score.sde.prior_std().is_finite();
-                if !finite {
-                    return Err(HessboostError::invalid_param(
-                        "sde",
-                        "the schedule's noise scale or drift is zero or overflows on [1e-5, 1]",
-                    ));
-                }
+                ensure(
+                    "sde",
+                    finite,
+                    "the schedule's noise scale or drift is zero or overflows on [1e-5, 1]",
+                )?;
                 score.time_sampling.validate()
             }
             Method::FlowMatching(flow) => {
@@ -694,12 +679,11 @@ impl Method {
                         .iter()
                         .all(|v| v.is_finite())
                 });
-                if !finite {
-                    return Err(HessboostError::invalid_param(
-                        "path",
-                        "the path's noise scale or velocity is zero or overflows on [1e-5, 1]",
-                    ));
-                }
+                ensure(
+                    "path",
+                    finite,
+                    "the path's noise scale or velocity is zero or overflows on [1e-5, 1]",
+                )?;
                 flow.time_sampling.validate()
             }
         }
@@ -718,13 +702,12 @@ impl Method {
 impl TimeSampling {
     fn validate(self) -> Result<()> {
         if let TimeSampling::LogNoiseNormal { mean, std } = self {
-            if !mean.is_finite() {
-                return Err(HessboostError::invalid_param(
-                    "time_sampling",
-                    format!("mean must be finite, got {mean}"),
-                ));
-            }
-            check_positive("time_sampling", std)?;
+            ensure(
+                "time_sampling",
+                mean.is_finite(),
+                format!("mean must be finite, got {mean}"),
+            )?;
+            positive("time_sampling", std)?;
         }
         Ok(())
     }
@@ -774,10 +757,12 @@ impl DiffusionModel {
     /// # Errors
     ///
     /// Everything [`DiffusionParams::validate`] refuses, plus
-    /// [`HessboostError::InvalidParameter`] for data without labels, with
-    /// weights, base margins, groups, label bounds, or feature weights, too
-    /// few rows for the validation split (2) or the residualizer (80), and
-    /// the errors of training.
+    /// [`HessboostError::InvalidData`] for data without labels (`labels`),
+    /// with weights, base margins, groups, label bounds, or feature weights
+    /// (named by the metadata: `weights`, `base_margin`, `group_sizes`,
+    /// `label_bounds`, `feature_weights`), or with too few rows for the
+    /// validation split (2) or the residualizer (80) (`data`), and the
+    /// errors of training.
     pub fn fit(params: &DiffusionParams, data: &DMatrix) -> Result<Self> {
         fit::fit(params, data)
     }
@@ -791,10 +776,11 @@ impl DiffusionModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] for `n_samples == 0`, a base
-    /// margin on `data`, or a sampler that diverges to non-finite values;
-    /// [`HessboostError::DimensionMismatch`] when `data`'s feature count
-    /// differs from the training data's.
+    /// [`HessboostError::InvalidParameter`] for `n_samples == 0` or a
+    /// sampler that diverges to non-finite values (`n_steps`: use more
+    /// steps); [`HessboostError::InvalidData`] (`base_margin`) for a base
+    /// margin on `data`; [`HessboostError::DimensionMismatch`] when
+    /// `data`'s feature count differs from the training data's.
     pub fn sample(
         &self,
         data: &DMatrix,

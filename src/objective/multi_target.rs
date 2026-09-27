@@ -237,7 +237,10 @@ mod tests {
         let single = MetaInfo::new(&labels, None, None);
         assert!(matches!(
             multi.validate_info(&single),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+            Err(HessboostError::InvalidData {
+                input: "labels",
+                ..
+            })
         ));
     }
 
@@ -258,7 +261,10 @@ mod tests {
         };
         assert!(matches!(
             multi.validate_info(&info),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "weights"
+            Err(HessboostError::InvalidData {
+                input: "weights",
+                ..
+            })
         ));
         let huge = MetaInfo {
             labels: Some(crate::data::Labels::new(

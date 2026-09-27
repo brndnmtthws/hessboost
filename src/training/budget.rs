@@ -98,6 +98,7 @@
 //! deterministic (no random numbers are drawn) and independent of the thread
 //! count.
 
+use crate::check::ensure;
 use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::data::ghist::GHistIndex;
@@ -176,24 +177,21 @@ impl BudgetConfig {
 
     /// Reject budgets outside `(0, 5)` and zero limits.
     pub fn validate(&self) -> Result<()> {
-        if !(self.budget > 0.0 && self.budget < MAX_BUDGET) {
-            return Err(HessboostError::invalid_param(
-                "budget",
-                format!("must be in (0, {MAX_BUDGET}), got {}", self.budget),
-            ));
-        }
-        if self.iteration_limit == Some(0) {
-            return Err(HessboostError::invalid_param(
-                "iteration_limit",
-                "must be at least 1",
-            ));
-        }
-        if self.stopping_rounds == Some(0) {
-            return Err(HessboostError::invalid_param(
-                "stopping_rounds",
-                "must be at least 1",
-            ));
-        }
+        ensure(
+            "budget",
+            self.budget > 0.0 && self.budget < MAX_BUDGET,
+            format!("must be in (0, {MAX_BUDGET}), got {}", self.budget),
+        )?;
+        ensure(
+            "iteration_limit",
+            self.iteration_limit != Some(0),
+            "must be at least 1",
+        )?;
+        ensure(
+            "stopping_rounds",
+            self.stopping_rounds != Some(0),
+            "must be at least 1",
+        )?;
         Ok(())
     }
 

@@ -5,8 +5,8 @@ use hessboost::config::{
     BoosterKind, Dart, ExtraTrees, GrowPolicy, LinearTree, ProcessType, QuantizedGrad, Refresh,
     SamplingMethod, TreeMethod,
 };
+use hessboost::model::Iterations;
 use hessboost::model::ModelFormat;
-use hessboost::model::{Iterations, Predictions};
 use hessboost::objective::{Multiclass, PseudoHuber};
 use hessboost::prelude::{
     BoostedModel, DMatrix, HessboostError, Objective, Trainer, TrainingParams, train,
@@ -16,7 +16,7 @@ use std::ops::Bound;
 
 mod common;
 use common::smooth::{continuation_noisy as noisy, regression};
-use common::{invalid_param, labeled_dense, rmse};
+use common::{incompatible_model, invalid_param, labeled_dense, rmse};
 fn multiclass(n: usize) -> DMatrix {
     let d = regression(n, 0.0);
     let y: Vec<f32> = (0..n)
@@ -250,17 +250,17 @@ fn incompatible_continuations_are_rejected() {
         .build()
         .unwrap();
     assert_eq!(
-        invalid_param(Trainer::new(&objective, &d, 1).init_model(&first).train()),
+        incompatible_model(Trainer::new(&objective, &d, 1).init_model(&first).train()),
         "objective"
     );
     let forest = base().num_parallel_tree(2).build().unwrap();
     assert_eq!(
-        invalid_param(Trainer::new(&forest, &d, 1).init_model(&first).train()),
+        incompatible_model(Trainer::new(&forest, &d, 1).init_model(&first).train()),
         "num_parallel_tree"
     );
     let linear = base().booster(BoosterKind::GbLinear).build().unwrap();
     assert_eq!(
-        invalid_param(Trainer::new(&linear, &d, 1).init_model(&first).train()),
+        incompatible_model(Trainer::new(&linear, &d, 1).init_model(&first).train()),
         "booster"
     );
     let narrow = labeled_dense(&[0.5; 30], 3, &[0.0; 10]);
@@ -394,7 +394,7 @@ fn refresh_on_new_data_recomputes_statistics_and_truncates() {
     );
 
     assert_eq!(
-        invalid_param(Trainer::new(&update, &half, 7).init_model(&model).train()),
+        incompatible_model(Trainer::new(&update, &half, 7).init_model(&model).train()),
         "num_boost_round"
     );
     assert_eq!(invalid_param(train(&update, &d, 1)), "process_type");
@@ -421,7 +421,14 @@ fn refresh_refuses_options_it_cannot_apply() {
         3,
     )
     .unwrap();
-    assert!(refused(&update().build().unwrap(), &linear));
+    assert_eq!(
+        incompatible_model(
+            Trainer::new(&update().build().unwrap(), &d, 2)
+                .init_model(&linear)
+                .train()
+        ),
+        "process_type"
+    );
     let plain = train(&base().build().unwrap(), &d, 3).unwrap();
     for params in [
         update().linear_tree(LinearTree::default()),
@@ -563,11 +570,14 @@ fn iteration_ranges_select_whole_iterations() {
         .fold(0.0, f32::max);
     assert!(diff < 1e-5, "{diff}");
 
-    let bad = |r| invalid_param::<Predictions>(r) == "iterations";
-    assert!(bad(model.predict_margin(&d, ..7)));
-    assert!(bad(
-        model.predict_margin(&d, (Bound::Included(4), Bound::Excluded(3)))
-    ));
+    assert_eq!(
+        incompatible_model(model.predict_margin(&d, ..7)),
+        "iterations"
+    );
+    assert_eq!(
+        invalid_param(model.predict_margin(&d, (Bound::Included(4), Bound::Excluded(3)))),
+        "iterations"
+    );
     // Attributions and leaves, as in XGBoost, only take prefixes.
     assert_eq!(
         invalid_param(model.predict_contribs(&d, 1..3)),
@@ -587,9 +597,9 @@ fn gblinear_accepts_only_the_whole_range() {
     // An explicit empty range would predict the intercept alone on a tree
     // model; a linear model has no iterations to leave out, so it is refused.
     for bad in [model.predict_margin(&d, 0..0), model.predict(&d, ..0)] {
-        assert_eq!(invalid_param(bad), "iterations");
+        assert_eq!(incompatible_model(bad), "iterations");
     }
-    assert_eq!(invalid_param(model.slice(.., 1)), "slice");
+    assert_eq!(incompatible_model(model.slice(.., 1)), "slice");
 }
 
 #[test]
@@ -645,7 +655,10 @@ fn slicing_selects_iterations_with_their_dart_weights() {
         stopped.predict(&valid, Iterations::Best).unwrap()
     );
 
-    for (b, e, s) in [(0, 0, 0), (3, 3, 1), (0, 10, 1), (5, 2, 1)] {
+    // A step of 0, an empty range, and an inverted range are bad arguments;
+    // a range past the model's iterations does not fit the model.
+    for (b, e, s) in [(0, 0, 0), (3, 3, 1), (5, 2, 1)] {
         assert_eq!(invalid_param(model.slice(b..e, s)), "slice");
     }
+    assert_eq!(incompatible_model(model.slice(0..10, 1)), "slice");
 }

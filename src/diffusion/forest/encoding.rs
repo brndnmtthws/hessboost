@@ -20,7 +20,7 @@ pub(super) fn describe_columns(
                 .filter(|v| !v.is_nan())
                 .collect();
             if observed.is_empty() {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::invalid_data(
                     "data",
                     format!("column {j} has no observed value"),
                 ));

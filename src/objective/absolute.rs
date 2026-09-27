@@ -298,7 +298,10 @@ mod tests {
         let info = MetaInfo::new(&labels, None, None);
         assert!(matches!(
             AbsoluteError::new(2).validate_info(&info),
-            Err(HessboostError::InvalidParameter { name, .. }) if name == "labels"
+            Err(HessboostError::InvalidData {
+                input: "labels",
+                ..
+            })
         ));
         AbsoluteError::new(1).validate_info(&info).unwrap();
         let d = crate::test_support::labeled_dense(&[0.0, 1.0], 2, 1, &labels);

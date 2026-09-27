@@ -166,6 +166,16 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 
 - **Errors:** public fallible APIs return `error::Result`. No panics
   (`unwrap`, `expect`, ...) on user input, NaN included, in library code.
+  The variant says whose fault it is: `InvalidParameter` for settings and
+  arguments (ranges through `crate::check`, combinations),
+  `InvalidData { input, dataset, .. }` for data content (labels outside a
+  domain, weights, groups, bounds, unsupported metadata; eval-set refusals
+  get their dataset through `HessboostError::in_dataset`, never by
+  editing the message), `IncompatibleModel { what, .. }` for a model the
+  request does not fit (continuation, refresh, slicing, iterations,
+  outputs), `DimensionMismatch` for lengths, `ModelFormat` for files.
+  Tests match variants and fields (`tests/common`'s `invalid_param`,
+  `invalid_data`, `incompatible_model`), not message text.
 - **Determinism:** same params, data, and seed give the same predictions
   at any thread count. Every grow policy grows the same tree serially and
   in parallel; parallel reductions keep a fixed order. CPU `f64`
@@ -393,8 +403,10 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   callbacks (objective, metric, per-round) re-attach to the interpreter,
   and the first exception (or Ctrl-C's `KeyboardInterrupt`) stops
   training through `Trainer::on_round` at the end of the round and is
-  re-raised. Crate errors map to `HessboostError` (a `ValueError`),
-  `ModelFormatError`, and `OSError`; wrong Python types raise `TypeError`.
+  re-raised. Crate errors map to `HessboostError` (a `ValueError`), its
+  subclasses `ModelFormatError` (`ModelFormat`, `Json`), `InvalidDataError`
+  (`InvalidData`) and `IncompatibleModelError` (`IncompatibleModel`), and
+  `OSError`; wrong Python types raise `TypeError`.
 
 ## Public API
 

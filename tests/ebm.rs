@@ -15,7 +15,7 @@ use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 mod common;
-use common::{invalid_param, labeled_dense, lcg, with_threads};
+use common::{incompatible_model, invalid_data, invalid_param, labeled_dense, lcg, with_threads};
 
 /// Early stopping after `rounds` rounds at the default tolerance.
 fn stopping(rounds: usize) -> EbmEarlyStopping {
@@ -147,7 +147,7 @@ fn the_ebm_record_survives_the_native_formats_but_not_slicing() {
     let continued = Trainer::new(&classic().build().unwrap(), &dtrain, 1)
         .init_model(&model)
         .train();
-    assert_eq!(invalid_param(continued), "init_model");
+    assert_eq!(incompatible_model(continued), "init_model");
 }
 
 #[test]
@@ -215,10 +215,10 @@ fn inference_needs_a_boulevard_ebm_and_its_training_rows() {
         EbmInference::fit(model, rows, NoiseVariance::Known(1.0), KernelSolver::Exact).map(|_| ())
     };
     let bagged = train(&classic().build().unwrap(), &dtrain, 5).unwrap();
-    assert_eq!(invalid_param(solve(&bagged, &dtrain)), "model");
+    assert_eq!(incompatible_model(solve(&bagged, &dtrain)), "model");
     let model = train(&boulevard().subsample(1.0).build().unwrap(), &dtrain, 5).unwrap();
     let fewer = dtrain.select_rows(&(0..150).collect::<Vec<_>>()).unwrap();
-    assert_eq!(invalid_param(solve(&model, &fewer)), "train");
+    assert_eq!(invalid_data(solve(&model, &fewer)), ("train", None));
     let inference = EbmInference::fit(
         &model,
         &dtrain,
@@ -226,7 +226,7 @@ fn inference_needs_a_boulevard_ebm_and_its_training_rows() {
         KernelSolver::Exact,
     )
     .unwrap();
-    assert_eq!(invalid_param(inference.term_bands(4, 0.1)), "term");
+    assert_eq!(incompatible_model(inference.term_bands(4, 0.1)), "term");
 }
 
 fn refused(b: TrainingParamsBuilder) -> &'static str {
@@ -355,11 +355,14 @@ fn unsupported_combinations_are_refused() {
     // Classic EBMs start every margin at the intercept, so a base margin
     // would split training from prediction.
     let offset = dtrain.clone().with_base_margin(&[0.5; 100]).unwrap();
-    assert_eq!(invalid_param(train(&params, &offset, 2)), "base_margin");
+    assert_eq!(
+        invalid_data(train(&params, &offset, 2)),
+        ("base_margin", None)
+    );
     let weighted = dtrain.clone().with_weights(&[2.0; 100]).unwrap();
     assert_eq!(
-        invalid_param(train(&boulevard().build().unwrap(), &weighted, 2)),
-        "weights"
+        invalid_data(train(&boulevard().build().unwrap(), &weighted, 2)),
+        ("weights", None)
     );
 }
 
@@ -400,7 +403,7 @@ fn classic_ebms_bag_rows_by_class() {
         "mean probability {balanced} with balanced bagging vs {plain} without"
     );
     let soft = labeled_dense(&x, 2, &vec![0.5; n]);
-    assert_eq!(invalid_param(train(&bagged, &soft, 2)), "labels");
+    assert_eq!(invalid_data(train(&bagged, &soft, 2)), ("labels", None));
 }
 
 /// A classic ranking EBM draws each tree's rows from its outer bag by query
@@ -453,8 +456,8 @@ fn classic_ebms_bag_whole_queries() {
     );
     let ungrouped = labeled_dense(&x, 2, &relevance);
     assert_eq!(
-        invalid_param(train(&bagged, &ungrouped, 2)),
-        "bagging_by_query"
+        invalid_data(train(&bagged, &ungrouped, 2)),
+        ("group_sizes", None)
     );
 }
 
@@ -789,7 +792,7 @@ fn online_updates_refuse_an_ebm() {
         OnlineParams::exact(),
     ] {
         assert_eq!(
-            invalid_param(OnlineModel::from_model(
+            incompatible_model(OnlineModel::from_model(
                 model.clone(),
                 &gbtree,
                 &dtrain,
@@ -816,7 +819,7 @@ fn sglb_and_virtual_ensembles_are_refused() {
     let (_, dtrain) = data(200, 17);
     let model = train(&classic().build().unwrap(), &dtrain, 10).unwrap();
     assert_eq!(
-        invalid_param(model.predict_virtual_ensembles(&dtrain, 2)),
+        incompatible_model(model.predict_virtual_ensembles(&dtrain, 2)),
         "model"
     );
 }
@@ -878,5 +881,5 @@ fn label_matrices_are_refused_as_labels() {
         .with_label_matrix(&y, 2)
         .unwrap();
     let params = classic().build().unwrap();
-    assert_eq!(invalid_param(train(&params, &dtrain, 2)), "labels");
+    assert_eq!(invalid_data(train(&params, &dtrain, 2)), ("labels", None));
 }

@@ -1,6 +1,6 @@
 //! Request validation: what training refuses before anything is built.
 
-use super::eval::{EvalSet, name_dataset};
+use super::eval::EvalSet;
 use crate::config::{BoosterKind, ProcessType, TrainingParams};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -28,7 +28,7 @@ pub(super) fn validate_trained_model(model: &BoostedModel) -> Result<()> {
 /// sampling.
 pub(super) fn reject_feature_weights(dtrain: &DMatrix, reason: &'static str) -> Result<()> {
     if dtrain.feature_weights().is_some() {
-        return Err(HessboostError::invalid_param("feature_weights", reason));
+        return Err(HessboostError::invalid_data("feature_weights", reason));
     }
     Ok(())
 }
@@ -109,15 +109,15 @@ fn validate_query_bagging(params: &TrainingParams, dtrain: &DMatrix) -> Result<(
         return Ok(());
     }
     let Some(group) = dtrain.group() else {
-        return Err(HessboostError::invalid_param(
-            "bagging_by_query",
-            "requires query group sizes on the training dataset",
+        return Err(HessboostError::invalid_data(
+            "group_sizes",
+            "`bagging_by_query` requires query group sizes on the training dataset",
         ));
     };
     if !group.partitions(dtrain.n_rows()) || group.iter_ranges().any(|(start, end)| start == end) {
-        return Err(HessboostError::invalid_param(
-            "bagging_by_query",
-            "requires non-empty query groups covering all training rows",
+        return Err(HessboostError::invalid_data(
+            "group_sizes",
+            "`bagging_by_query` requires non-empty query groups covering all training rows",
         ));
     }
     Ok(())
@@ -129,7 +129,7 @@ fn validate_balanced_bagging(params: &TrainingParams, dtrain: &DMatrix) -> Resul
         return Ok(());
     }
     if dtrain.n_targets() != 1 {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "labels",
             "balanced bagging requires exactly one label column",
         ));
@@ -138,7 +138,7 @@ fn validate_balanced_bagging(params: &TrainingParams, dtrain: &DMatrix) -> Resul
         "train: balanced bagging requires binary labels",
     ))?;
     if labels.iter().any(|&label| label != 0.0 && label != 1.0) {
-        return Err(HessboostError::invalid_param(
+        return Err(HessboostError::invalid_data(
             "labels",
             "balanced bagging requires labels exactly 0 or 1",
         ));
@@ -210,10 +210,11 @@ fn validate_shrinkage_margins(request: &TrainRequest) -> Result<()> {
         .chain(evals.iter().copied())
         .find_map(|set| set.data.base_margin().map(|_| set.name))
     {
-        return Err(HessboostError::invalid_param(
-            "model_shrink_rate",
-            format!("model shrinkage is not supported with a `base_margin` (dataset `{name}`)"),
-        ));
+        return Err(HessboostError::invalid_data(
+            "base_margin",
+            "model shrinkage (`model_shrink_rate`) is not supported with a `base_margin`",
+        )
+        .in_dataset(name));
     }
     Ok(())
 }
@@ -235,6 +236,9 @@ fn validate_boulevard_request(
             format!("`{who}`: {reason}"),
         ))
     };
+    let refuse_data = |input: &'static str, reason: &str| {
+        HessboostError::invalid_data(input, format!("`{who}`: {reason}"))
+    };
     if request.early_stopping_rounds.is_some() {
         return refuse(
             "early_stopping_rounds",
@@ -249,20 +253,29 @@ fn validate_boulevard_request(
     }
     let dtrain = request.dtrain;
     if dtrain.n_targets() != 1 || objective.n_outputs() != 1 {
-        return refuse(
+        return Err(refuse_data(
             "labels",
             &format!("needs one label column, got {}", dtrain.n_targets()),
-        );
+        ));
     }
     if dtrain
         .weights()
         .is_some_and(|w| w.iter().any(|&v| v != 1.0))
     {
-        return refuse("weights", "row weights other than 1 are not supported");
+        return Err(refuse_data(
+            "weights",
+            "row weights other than 1 are not supported",
+        ));
     }
-    for data in std::iter::once(dtrain).chain(request.evals.iter().map(|set| set.data)) {
-        if data.base_margin().is_some() {
-            return refuse("base_margin", "base margins are not supported");
+    let dtrain_set = EvalSet {
+        data: dtrain,
+        name: "dtrain",
+    };
+    for set in std::iter::once(dtrain_set).chain(request.evals.iter().copied()) {
+        if set.data.base_margin().is_some() {
+            return Err(
+                refuse_data("base_margin", "base margins are not supported").in_dataset(set.name)
+            );
         }
     }
     Ok(())
@@ -281,6 +294,12 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
             format!("`booster = ebm`: {reason}"),
         ))
     };
+    let refuse_data = |input: &'static str, reason: &str| {
+        Err(HessboostError::invalid_data(
+            input,
+            format!("`booster = ebm`: {reason}"),
+        ))
+    };
     if request.early_stopping_rounds.is_some() || !request.evals.is_empty() {
         return refuse(
             "early_stopping_rounds",
@@ -288,7 +307,7 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
         );
     }
     if request.dtrain.n_targets() != 1 {
-        return refuse(
+        return refuse_data(
             "labels",
             &format!("needs one label column, got {}", request.dtrain.n_targets()),
         );
@@ -303,7 +322,7 @@ fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<
         );
     }
     if request.dtrain.base_margin().is_some() {
-        return refuse(
+        return refuse_data(
             "base_margin",
             "base margins are not supported: the terms and their centering assume the \
              intercept alone",
@@ -377,15 +396,16 @@ fn validate_dataset(
     } = contract;
     match data.labels() {
         None if objective.requires_labels() => {
-            return Err(HessboostError::invalid_param(
-                "evals",
-                format!("dataset `{name}` has no labels"),
-            ));
+            return Err(HessboostError::invalid_data(
+                "labels",
+                "missing; the objective needs labels",
+            )
+            .in_dataset(name));
         }
         None => {}
         Some(labels) => {
             let expected = data.n_rows().checked_mul(n_targets).ok_or_else(|| {
-                HessboostError::invalid_param("labels", "expected length overflows usize")
+                HessboostError::invalid_data("labels", "expected length overflows usize")
             })?;
             if labels.len() != expected {
                 return Err(HessboostError::dimension_mismatch(
@@ -405,7 +425,7 @@ fn validate_dataset(
     }
     if let Some(margin) = data.base_margin() {
         let expected = data.n_rows().checked_mul(n_out).ok_or_else(|| {
-            HessboostError::invalid_param("base_margin", "expected length overflows usize")
+            HessboostError::invalid_data("base_margin", "expected length overflows usize")
         })?;
         if margin.len() != data.n_rows() && margin.len() != expected {
             return Err(HessboostError::dimension_mismatch(
@@ -417,5 +437,5 @@ fn validate_dataset(
     }
     objective
         .validate_info(&data.info())
-        .map_err(|error| name_dataset(error, name))
+        .map_err(|error| error.in_dataset(name))
 }

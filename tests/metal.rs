@@ -178,8 +178,7 @@ fn device_metal_refuses_unsupported_combinations() {
         ),
     ];
     for (params, name) in variants {
-        let err = params.validate().unwrap_err().to_string();
-        assert!(err.contains("device"), "{name}: {err}");
+        assert_eq!(common::invalid_param(params.validate()), "device", "{name}");
     }
 }
 
@@ -265,8 +264,7 @@ fn to_gpu_refuses_unsupported_models() {
         4,
     )
     .unwrap();
-    let err = gblinear.to_gpu().unwrap_err().to_string();
-    assert!(err.contains("gblinear"), "{err}");
+    assert_eq!(common::incompatible_model(gblinear.to_gpu()), "model");
 
     let linear = train(
         &TrainingParams::builder()
@@ -278,8 +276,7 @@ fn to_gpu_refuses_unsupported_models() {
         4,
     )
     .unwrap();
-    let err = linear.to_gpu().unwrap_err().to_string();
-    assert!(err.contains("linear_tree"), "{err}");
+    assert_eq!(common::incompatible_model(linear.to_gpu()), "model");
 }
 
 /// The review's dynamic-range case: in every 128-row slice the first 64

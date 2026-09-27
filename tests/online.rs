@@ -18,7 +18,7 @@ use hessboost::training::RoundEval;
 use hessboost::training::online::{OnlineMode, OnlineModel, OnlineParams};
 
 mod common;
-use common::{invalid_param, lcg, rmse, with_threads};
+use common::{incompatible_model, invalid_data, invalid_param, lcg, rmse, with_threads};
 
 const COLS: usize = 4;
 
@@ -200,9 +200,9 @@ fn updates_refuse_labels_retraining_refuses() {
         let mut online = OnlineModel::train(&p, &train_data, 8, mode).unwrap();
         let before = online.model().encode(ModelFormat::Json).unwrap();
         // Retraining refuses the added row's label under the same name.
-        let retrain_err = invalid_param(train(&p, &bad, 8));
+        let retrain_err = invalid_data(train(&p, &bad, 8));
         assert_eq!(
-            invalid_param(online.update(Some(&bad), &[0])),
+            invalid_data(online.update(Some(&bad), &[0])),
             retrain_err,
             "{mode:?}"
         );
@@ -303,8 +303,8 @@ fn unsound_configurations_and_changes_are_refused() {
     assert_eq!(OnlineParams::exact().mode(), OnlineMode::Exact);
     let weighted = data(200, 9, false).with_weights(&[1.0; 200]).unwrap();
     assert_eq!(
-        invalid_param(OnlineModel::train(&p, &weighted, 3, online)),
-        "data"
+        invalid_data(OnlineModel::train(&p, &weighted, 3, online)),
+        ("data", None)
     );
     let categorical = data(200, 9, false)
         .with_feature_types(&[FeatureType::Numerical; COLS])
@@ -318,14 +318,17 @@ fn unsound_configurations_and_changes_are_refused() {
     assert_eq!(invalid_param(model.update(None, &all)), "deletions");
     let unlabelled = DMatrix::from_dense(&[0.0; COLS], 1, COLS).unwrap();
     assert_eq!(
-        invalid_param(model.update(Some(&unlabelled), &[])),
-        "additions"
+        invalid_data(model.update(Some(&unlabelled), &[])),
+        ("additions", None)
     );
     let narrow = DMatrix::from_dense(&[0.0; 2], 1, 2)
         .unwrap()
         .with_labels(&[1.0])
         .unwrap();
-    assert_eq!(invalid_param(model.update(Some(&narrow), &[])), "additions");
+    assert_eq!(
+        invalid_data(model.update(Some(&narrow), &[])),
+        ("additions", None)
+    );
 }
 
 /// LightGBM's class-balanced and query-level bagging draw a fresh per-class
@@ -398,7 +401,7 @@ fn from_model_refuses_linear_leaves() {
         OnlineParams::exact(),
     ] {
         assert_eq!(
-            invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
+            incompatible_model(OnlineModel::from_model(model.clone(), &p, &data, online)),
             "model"
         );
         // A model of these parameters on this data is accepted.
@@ -422,7 +425,7 @@ fn from_model_refuses_shrunk_models() {
         OnlineParams::exact(),
     ] {
         assert_eq!(
-            invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
+            incompatible_model(OnlineModel::from_model(model.clone(), &p, &data, online)),
             "model"
         );
     }
@@ -441,7 +444,7 @@ fn from_model_refuses_trees_deeper_than_max_depth() {
         OnlineParams::exact(),
     ] {
         assert_eq!(
-            invalid_param(OnlineModel::from_model(model.clone(), &p, &d, online)),
+            incompatible_model(OnlineModel::from_model(model.clone(), &p, &d, online)),
             "model"
         );
         assert!(OnlineModel::from_model(model.clone(), &deeper, &d, online).is_ok());
@@ -542,7 +545,7 @@ fn from_model_refuses_models_and_metrics_training_would_not_give() {
     let best = stopped.best_iteration().expect("stops early");
     for online in [OnlineParams::default(), OnlineParams::exact()] {
         assert_eq!(
-            invalid_param(OnlineModel::from_model(stopped.clone(), &p, &d, online)),
+            incompatible_model(OnlineModel::from_model(stopped.clone(), &p, &d, online)),
             "model"
         );
         let best_slice = stopped.slice(..=best, 1).unwrap();
@@ -560,7 +563,7 @@ fn from_model_refuses_models_and_metrics_training_would_not_give() {
     let mut unbounded = poisson.clone();
     unbounded.max_delta_step = MaxDeltaStep::Unbounded;
     assert_eq!(
-        invalid_param(OnlineModel::from_model(
+        incompatible_model(OnlineModel::from_model(
             model.clone(),
             &unbounded,
             &counts,
@@ -634,10 +637,10 @@ fn updates_refuse_data_without_a_finite_intercept() {
     for online_params in [OnlineParams::default(), OnlineParams::exact()] {
         let mut online = OnlineModel::train(&poisson, &counts, 2, online_params).unwrap();
         assert_eq!(
-            invalid_param(train(&poisson, &rows(&[0.0], 1, &[0.0]), 2)),
-            "base_score"
+            invalid_data(train(&poisson, &rows(&[0.0], 1, &[0.0]), 2)),
+            ("labels", None)
         );
-        assert_eq!(invalid_param(online.update(None, &[1])), "base_score");
+        assert_eq!(invalid_data(online.update(None, &[1])), ("labels", None));
         assert_eq!(online.data().n_rows(), 2);
     }
 }
@@ -718,8 +721,8 @@ fn approximate_updates_refuse_values_beyond_the_training_bins() {
         OnlineModel::train(&p, &d, 1, OnlineParams::approximate(1.0).unwrap()).unwrap();
     let before = approximate.model().clone();
     assert_eq!(
-        invalid_param(approximate.update(Some(&beyond), &[0])),
-        "additions"
+        invalid_data(approximate.update(Some(&beyond), &[0])),
+        ("additions", None)
     );
     assert_eq!(approximate.model().trees(), before.trees());
     assert_eq!(approximate.data().n_rows(), 4);

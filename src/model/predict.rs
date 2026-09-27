@@ -279,8 +279,10 @@ impl BoostedModel {
     /// # Errors
     ///
     /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
-    /// model, [`HessboostError::InvalidParameter`] for an out-of-range
-    /// `iterations` or one starting after iteration `0`.
+    /// model, [`HessboostError::IncompatibleModel`] (`iterations`) for
+    /// `iterations` past the model's, [`HessboostError::InvalidParameter`]
+    /// (`iterations`) for an inverted range or one starting after
+    /// iteration `0`.
     #[allow(
         clippy::redundant_closure_for_method_calls,
         reason = "the method path is not general enough over the block lifetime"
@@ -329,8 +331,10 @@ impl BoostedModel {
     /// # Errors
     ///
     /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
-    /// model, [`HessboostError::InvalidParameter`] for an out-of-range
-    /// `iterations` (or, for a shrunk model, one starting after iteration 0).
+    /// model, [`HessboostError::IncompatibleModel`] (`iterations`) for
+    /// `iterations` past the model's (or, for a shrunk model, one starting
+    /// after iteration 0), [`HessboostError::InvalidParameter`]
+    /// (`iterations`) for an inverted or overflowing range.
     pub fn predict_margin(
         &self,
         data: &DMatrix,
@@ -342,7 +346,7 @@ impl BoostedModel {
             // Every later iteration rescaled the earlier ones, so the
             // iterations `a..b` alone are no model.
             if iterations.start != 0 {
-                return Err(HessboostError::invalid_param(
+                return Err(HessboostError::incompatible_model(
                     "iterations",
                     format!(
                         "a model trained with model shrinkage rescales its earlier iterations \
@@ -484,7 +488,7 @@ impl BoostedModel {
         if self.shrinkage.is_none() || (trees.start == 0 && trees.end == self.trees.len()) {
             return Ok(());
         }
-        Err(HessboostError::invalid_param(
+        Err(HessboostError::incompatible_model(
             "iterations",
             format!(
                 "{what} of a model trained with model shrinkage covers the whole ensemble \
@@ -502,8 +506,9 @@ impl BoostedModel {
     ///
     /// # Errors
     ///
-    /// [`HessboostError::InvalidParameter`] if the model's objective is not
-    /// a `dist:*` objective, plus the errors of [`Self::predict_margin`].
+    /// [`HessboostError::IncompatibleModel`] (`objective`) if the model's
+    /// objective is not a `dist:*` objective, plus the errors of
+    /// [`Self::predict_margin`].
     pub fn predict_distribution(
         &self,
         data: &DMatrix,
@@ -514,7 +519,7 @@ impl BoostedModel {
             .built_in()
             .and_then(Objective::dist_family)
             .ok_or_else(|| {
-                HessboostError::invalid_param(
+                HessboostError::incompatible_model(
                     "objective",
                     format!(
                         "`{}` does not predict distributions; train with a `dist:*` objective",

@@ -470,10 +470,7 @@ mod tests {
         let refused = |labels: &[f32], weights: Option<&[f32]>, group: GroupInfo| {
             let err = obj.validate_info(&MetaInfo::new(labels, weights, Some(&group)));
             assert!(
-                matches!(
-                    err,
-                    Err(crate::error::HessboostError::InvalidParameter { .. })
-                ),
+                matches!(err, Err(crate::error::HessboostError::InvalidData { .. })),
                 "{group:?}: {err:?}"
             );
         };

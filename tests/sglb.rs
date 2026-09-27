@@ -567,10 +567,11 @@ fn shrunk_models_round_trip() {
     let mut doc: serde_json::Value =
         serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
     doc["shrinkage"]["factors"][3] = 0.5.into();
-    let err = BoostedModel::decode(doc.to_string(), ModelFormat::Json)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("shrinkage record"), "{err}");
+    let err = BoostedModel::decode(doc.to_string(), ModelFormat::Json).unwrap_err();
+    assert!(
+        matches!(&err, HessboostError::ModelFormat(msg) if msg.contains("shrinkage record")),
+        "{err:?}"
+    );
 }
 
 /// A shrunk model has no meaning for ranges starting after iteration 0 or
@@ -585,13 +586,13 @@ fn shrunk_models_refuse_non_prefix_selections() {
         .unwrap();
     let model = train(&params, &data, 10).unwrap();
     assert_eq!(
-        common::invalid_param(model.predict_margin(&data, 2..5)),
+        common::incompatible_model(model.predict_margin(&data, 2..5)),
         "iterations"
     );
-    assert_eq!(common::invalid_param(model.slice(2..5, 1)), "slice");
-    assert_eq!(common::invalid_param(model.slice(..6, 2)), "slice");
+    assert_eq!(common::incompatible_model(model.slice(2..5, 1)), "slice");
+    assert_eq!(common::incompatible_model(model.slice(..6, 2)), "slice");
     assert_eq!(
-        common::invalid_param(model.predict_contribs(&data, ..4)),
+        common::incompatible_model(model.predict_contribs(&data, ..4)),
         "iterations"
     );
     assert!(model.predict_contribs(&data, ..).is_ok());
@@ -752,22 +753,22 @@ fn unsupported_combinations_are_refused() {
     let params = base().posterior_sampling(true).build().unwrap();
     let with_margin = regression(50).with_base_margin(&[0.5; 50]).unwrap();
     assert_eq!(
-        common::invalid_param(train(&params, &with_margin, 2)),
-        "model_shrink_rate"
+        common::invalid_data(train(&params, &with_margin, 2)),
+        ("base_margin", Some("dtrain".into()))
     );
     let shrunk = train(&params, &data, 4).unwrap();
     assert_eq!(
-        common::invalid_param(Trainer::new(&params, &data, 2).init_model(&shrunk).train()),
-        "model_shrink_rate"
+        common::incompatible_model(Trainer::new(&params, &data, 2).init_model(&shrunk).train()),
+        "init_model"
     );
     let plain_params = base().build().unwrap();
     assert_eq!(
-        common::invalid_param(
+        common::incompatible_model(
             Trainer::new(&plain_params, &data, 2)
                 .init_model(&shrunk)
                 .train()
         ),
-        "model_shrink_rate"
+        "init_model"
     );
     // Posterior sampling's constant coefficient 1 - eta / (2N) must stay
     // positive for the actual row count.
@@ -920,7 +921,7 @@ fn uncertainty_decomposes_per_objective() {
     assert!(u.knowledge.as_slice().iter().all(|&k| k >= 0.0));
     // Too few iterations for the members, and no decomposition for ranking.
     assert_eq!(
-        common::invalid_param(squared.predict_virtual_ensembles(&reg, 21)),
+        common::incompatible_model(squared.predict_virtual_ensembles(&reg, 21)),
         "virtual_ensembles_count"
     );
     assert_eq!(
@@ -928,7 +929,7 @@ fn uncertainty_decomposes_per_objective() {
         "virtual_ensembles_count"
     );
     assert_eq!(
-        common::invalid_param(squared.predict_virtual_ensembles(&reg, usize::MAX)),
+        common::incompatible_model(squared.predict_virtual_ensembles(&reg, usize::MAX)),
         "virtual_ensembles_count"
     );
     let members = squared.predict_virtual_ensembles(&reg, 5).unwrap();

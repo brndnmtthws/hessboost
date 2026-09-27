@@ -83,6 +83,7 @@ use crate::rng::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::check;
 use crate::data::dmatrix::check_len;
 use crate::data::{DMatrix, FeatureType};
 use crate::error::{HessboostError, Result};
@@ -178,26 +179,15 @@ impl OrderedTargetEncoderBuilder {
     /// Validate the settings and produce the encoder.
     pub fn build(self) -> Result<OrderedTargetEncoder> {
         let e = &self.encoder;
-        if !e.prior_weight.is_finite() || e.prior_weight <= 0.0 {
-            return Err(HessboostError::invalid_param(
-                "prior_weight",
-                "must be finite and > 0",
-            ));
-        }
-        if e.prior
-            .is_some_and(|p| !p.is_finite() || p.abs() > f64::from(f32::MAX))
-        {
-            return Err(HessboostError::invalid_param(
+        check::positive("prior_weight", e.prior_weight)?;
+        if let Some(p) = e.prior {
+            check::ensure(
                 "prior",
-                "must be finite and within the f32 range",
-            ));
+                p.is_finite() && p.abs() <= f64::from(f32::MAX),
+                format!("must be finite and within the f32 range, got {p}"),
+            )?;
         }
-        if e.permutations == 0 {
-            return Err(HessboostError::invalid_param(
-                "permutations",
-                "must be >= 1",
-            ));
-        }
+        check::ensure("permutations", e.permutations != 0, "must be >= 1, got 0")?;
         Ok(self.encoder)
     }
 }
@@ -233,16 +223,16 @@ impl OrderedTargetEncoder {
     ) -> Result<(DMatrix, FittedTargetEncoder)> {
         let n_rows = data.n_rows();
         let labels = data.labels().ok_or_else(|| {
-            HessboostError::invalid_param("labels", "ordered target statistics need labels")
+            HessboostError::invalid_data("labels", "ordered target statistics need labels")
         })?;
         if labels.len() != n_rows {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "labels",
                 "ordered target statistics need exactly one label per row",
             ));
         }
         if self.target == TargetKind::Binary && labels.iter().any(|&y| y != 0.0 && y != 1.0) {
-            return Err(HessboostError::invalid_param(
+            return Err(HessboostError::invalid_data(
                 "labels",
                 "TargetKind::Binary needs 0/1 labels (multiclass targets are not supported)",
             ));

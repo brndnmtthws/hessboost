@@ -9,6 +9,8 @@
 //!
 //! Run with: `cargo run --release --example forest_flow`
 
+use std::num::NonZeroUsize;
+
 use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams, Repaint};
 use hessboost::prelude::*;
 
@@ -86,9 +88,9 @@ fn main() -> Result<()> {
     ];
 
     let mut params = ForestParams::default();
-    params.column_kinds.clone_from(&kinds);
+    params.column_kinds = Some(kinds.clone());
     params.n_t = 20;
-    params.duplicate_k = 50;
+    params.duplicate_k = NonZeroUsize::new(50).unwrap();
     let start = std::time::Instant::now();
     let flow = ForestModel::fit(&params, &data)?;
     println!("ForestFlow: fitted in {:.1?}", start.elapsed());
@@ -99,11 +101,11 @@ fn main() -> Result<()> {
         println!("  {line}");
     }
     println!("synthetic:");
-    for line in summary(synthetic.values(), labels) {
+    for line in summary(synthetic.as_slice(), labels) {
         println!("  {line}");
     }
     let integral = synthetic
-        .values()
+        .as_slice()
         .as_chunks::<COLS>()
         .0
         .iter()
@@ -125,9 +127,9 @@ fn main() -> Result<()> {
         .collect();
     let holes = masked.iter().filter(|v| v.is_nan()).count();
     let mut params = ForestParams::diffusion();
-    params.column_kinds = kinds;
+    params.column_kinds = Some(kinds);
     params.n_t = 20;
-    params.duplicate_k = 50;
+    params.duplicate_k = NonZeroUsize::new(50).unwrap();
     let start = std::time::Instant::now();
     let diffusion = ForestModel::fit(
         &params,
@@ -138,7 +140,8 @@ fn main() -> Result<()> {
         start.elapsed()
     );
     let incomplete = DMatrix::from_dense(&masked, n, COLS)?.with_labels(&y)?;
-    let imputed = diffusion.impute(&incomplete, 1, Some(Repaint::default()), 3)?;
+    let imputations = diffusion.impute(&incomplete, 1, Some(Repaint::default()), 3)?;
+    let imputed = imputations.as_slice(); // one imputation: [row][column]
     let observed_mean = |j: usize| {
         let v: Vec<f64> = masked
             .as_chunks::<COLS>()
@@ -167,7 +170,7 @@ fn main() -> Result<()> {
     }
     let kept = masked
         .iter()
-        .zip(&imputed)
+        .zip(imputed)
         .all(|(m, i)| m.is_nan() || m == i);
     println!("  observed entries kept: {kept}");
 

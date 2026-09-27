@@ -139,8 +139,8 @@ class ForestParams:
         method: ``"flow"`` or :class:`Diffusion`.
         n_t: Noise levels, and GBDTs per class (``>= 2``).
         duplicate_k: Noisy copies of each row (``> 0``).
-        column_kinds: One :data:`ColumnKind` per column, or empty for all
-            continuous.
+        column_kinds: One :data:`ColumnKind` per column, or ``None`` for
+            all continuous.
         training: Every GBDT's XGBoost parameters (objective
             ``reg:squarederror``).
         num_boost_round: Boosting rounds of each GBDT (``> 0``).
@@ -155,7 +155,7 @@ class ForestParams:
     method: ForestMethod = "flow"
     n_t: int = 50
     duplicate_k: int = 100
-    column_kinds: Sequence[ColumnKind] = ()
+    column_kinds: Sequence[ColumnKind] | None = None
     training: Mapping[str, Any] = field(default_factory=_default_training)
     num_boost_round: int = 100
     seed: int = 0
@@ -164,13 +164,15 @@ class ForestParams:
         for name in ("n_t", "duplicate_k", "num_boost_round", "seed"):
             _store_count(self, name)
         kinds = self.column_kinds
-        if isinstance(kinds, str) or not isinstance(kinds, Sequence):
-            raise TypeError(
-                f"column_kinds must be a sequence of column kinds, got {type(kinds).__name__}"
-            )
-        for kind in kinds:
-            _choice("column kind", kind, _COLUMN_KINDS, ())
-        object.__setattr__(self, "column_kinds", tuple(kinds))
+        if kinds is not None:
+            if isinstance(kinds, str) or not isinstance(kinds, Sequence):
+                raise TypeError(
+                    "column_kinds must be a sequence of column kinds or None, got "
+                    f"{type(kinds).__name__}"
+                )
+            for kind in kinds:
+                _choice("column kind", kind, _COLUMN_KINDS, ())
+            object.__setattr__(self, "column_kinds", tuple(kinds))
         _store_training(self, "training")
         self._build()
 
@@ -182,7 +184,7 @@ class ForestParams:
                 "method": _method_json(self.method),
                 "n_t": self.n_t,
                 "duplicate_k": self.duplicate_k,
-                "column_kinds": list(self.column_kinds),
+                "column_kinds": None if self.column_kinds is None else list(self.column_kinds),
                 "training": _hessboost.Params(self.training),
                 "num_boost_round": self.num_boost_round,
                 "seed": self.seed,

@@ -102,6 +102,8 @@
 //! # Example
 //!
 //! ```
+//! use std::num::NonZeroUsize;
+//!
 //! use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams};
 //! use hessboost::prelude::*;
 //!
@@ -117,15 +119,15 @@
 //! let data = DMatrix::from_dense(&x, n, 2)?;
 //!
 //! let mut params = ForestParams::default();
-//! params.column_kinds = vec![ColumnKind::Continuous, ColumnKind::Integer];
+//! params.column_kinds = Some(vec![ColumnKind::Continuous, ColumnKind::Integer]);
 //! params.n_t = 10;
-//! params.duplicate_k = 10;
-//! params.num_boost_round = 20;
+//! params.duplicate_k = NonZeroUsize::new(10).unwrap();
+//! params.num_boost_round = NonZeroUsize::new(20).unwrap();
 //! let model = ForestModel::fit(&params, &data)?;
 //!
 //! let synthetic = model.generate(100, 7)?; // [row][column]
-//! assert_eq!(synthetic.values().len(), 100 * 2);
-//! assert!(synthetic.values().chunks(2).all(|r| r[1] == 0.0 || r[1] == 1.0));
+//! assert_eq!(synthetic.n_rows(), 100);
+//! assert!(synthetic.rows().all(|r| r[1] == 0.0 || r[1] == 1.0));
 //! # Ok(())
 //! # }
 //! ```
@@ -137,7 +139,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Sde;
 use super::process::{keyed_normal, try_filled};
-use super::{check_regressor, positive_count, validate_regressor_params};
+use super::{check_regressor, validate_regressor_params};
 use crate::config::{TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
@@ -149,6 +151,13 @@ mod format;
 
 /// Smallest noise level (the reference's `eps`).
 const EPS: f64 = 1e-3;
+
+/// The time of noise level `level` of `n_t`, evenly spaced on `[EPS, 1]`
+/// (the reference's `t_levels`). Training and sampling both index the
+/// levels, so every step evaluates the GBDTs trained at its own time.
+fn level_time(n_t: usize, level: usize) -> f64 {
+    EPS + (1.0 - EPS) * level as f64 / (n_t - 1) as f64
+}
 /// Stream of the training noise.
 const NOISE_STREAM: u64 = 0xF0E5_0001;
 /// Streams of the samplers: the prior, the reverse-SDE noise, the re-noised
@@ -232,9 +241,9 @@ pub enum ColumnKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct Repaint {
-    /// Passes over each segment (`>= 1`; `1` disables resampling). The
-    /// reference's `r`.
-    pub resample: usize,
+    /// Passes over each segment (`1` disables resampling). The reference's
+    /// `r`.
+    pub resample: NonZeroUsize,
     /// Segment length as a fraction of `n_t` (in `(0, 1]`; `ceil(jump ·
     /// n_t)` steps). The reference's `j`.
     pub jump: f64,
@@ -244,7 +253,7 @@ impl Default for Repaint {
     /// The reference's `r = 5`, `j = 0.1`.
     fn default() -> Self {
         Repaint {
-            resample: 5,
+            resample: const { NonZeroUsize::new(5).unwrap() },
             jump: 0.1,
         }
     }
@@ -259,17 +268,17 @@ pub struct ForestParams {
     pub method: ForestMethod,
     /// Number of noise levels, and of GBDTs per class (`>= 2`; 50).
     pub n_t: usize,
-    /// Noisy copies of each row (`> 0`; 100).
-    pub duplicate_k: usize,
-    /// How each column is encoded; empty means every column is
-    /// [`ColumnKind::Continuous`], otherwise one entry per column.
-    pub column_kinds: Vec<ColumnKind>,
+    /// Noisy copies of each row (100).
+    pub duplicate_k: NonZeroUsize,
+    /// How each column is encoded, one entry per column; `None` makes every
+    /// column [`ColumnKind::Continuous`].
+    pub column_kinds: Option<Vec<ColumnKind>>,
     /// Parameters of every GBDT (objective `reg:squarederror`). Default:
     /// the reference's XGBoost settings, `hist`, depth 7, `eta = 0.3`,
     /// `lambda = 0`.
     pub training: TrainingParams,
-    /// Boosting rounds of each GBDT (`> 0`; 100).
-    pub num_boost_round: usize,
+    /// Boosting rounds of each GBDT (100).
+    pub num_boost_round: NonZeroUsize,
     /// Seed of the training noise.
     pub seed: u64,
 }
@@ -279,8 +288,8 @@ impl Default for ForestParams {
         ForestParams {
             method: ForestMethod::Flow,
             n_t: 50,
-            duplicate_k: 100,
-            column_kinds: Vec::new(),
+            duplicate_k: const { NonZeroUsize::new(100).unwrap() },
+            column_kinds: None,
             training: TrainingParams {
                 tree_method: TreeMethod::Hist,
                 max_depth: NonZeroUsize::new(7),
@@ -288,7 +297,7 @@ impl Default for ForestParams {
                 lambda: 0.0,
                 ..TrainingParams::default()
             },
-            num_boost_round: 100,
+            num_boost_round: const { NonZeroUsize::new(100).unwrap() },
             seed: 0,
         }
     }
@@ -320,8 +329,6 @@ impl ForestParams {
                 format!("needs at least 2 noise levels, got {}", self.n_t),
             ));
         }
-        positive_count("duplicate_k", self.duplicate_k)?;
-        positive_count("num_boost_round", self.num_boost_round)?;
         validate_regressor_params("training", &self.training)
     }
 }
@@ -375,9 +382,25 @@ pub struct Synthetic {
 }
 
 impl Synthetic {
-    /// The rows, `[row][column]`.
-    pub fn values(&self) -> &[f32] {
+    /// Row `row`, or `None` past the last row.
+    pub fn row(&self, row: usize) -> Option<&[f32]> {
+        let start = row.checked_mul(self.n_columns)?;
+        self.values.get(start..start.checked_add(self.n_columns)?)
+    }
+
+    /// The rows in order.
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = &[f32]> {
+        self.values.chunks_exact(self.n_columns)
+    }
+
+    /// The flat `[row][column]` buffer.
+    pub fn as_slice(&self) -> &[f32] {
         &self.values
+    }
+
+    /// The flat `[row][column]` buffer and the labels, without copying.
+    pub fn into_parts(self) -> (Vec<f32>, Option<Vec<f32>>) {
+        (self.values, self.labels)
     }
 
     /// Each row's class label (a class-conditional model only).
@@ -407,6 +430,59 @@ impl Synthetic {
             Some(labels) => m.with_labels(labels),
             None => Ok(m),
         }
+    }
+}
+
+/// Imputed rows from [`ForestModel::impute`]: per imputation, one row per
+/// input row, laid out `[imputation][row][column]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Imputations {
+    values: Vec<f32>,
+    draws: usize,
+    n_rows: usize,
+    n_columns: usize,
+}
+
+impl Imputations {
+    /// Number of imputations.
+    pub fn n_imputations(&self) -> usize {
+        self.draws
+    }
+
+    /// Rows per imputation (the input's rows).
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Number of columns.
+    pub fn n_columns(&self) -> usize {
+        self.n_columns
+    }
+
+    /// Row `row` of imputation `imputation`, or `None` if either is out of
+    /// range.
+    pub fn get(&self, imputation: usize, row: usize) -> Option<&[f32]> {
+        if imputation >= self.draws || row >= self.n_rows {
+            return None;
+        }
+        let start = (imputation * self.n_rows + row) * self.n_columns;
+        Some(&self.values[start..start + self.n_columns])
+    }
+
+    /// The flat `[imputation][row][column]` buffer.
+    pub fn as_slice(&self) -> &[f32] {
+        &self.values
+    }
+
+    /// The flat `[imputation][row][column]` buffer, without copying.
+    pub fn into_vec(self) -> Vec<f32> {
+        self.values
+    }
+}
+
+impl AsRef<[f32]> for Imputations {
+    fn as_ref(&self) -> &[f32] {
+        &self.values
     }
 }
 
@@ -452,16 +528,16 @@ impl ForestModel {
         params.validate()?;
         refuse_metadata(data)?;
         let p = data.n_cols();
-        let kinds = if params.column_kinds.is_empty() {
-            vec![ColumnKind::Continuous; p]
-        } else if params.column_kinds.len() == p {
-            params.column_kinds.clone()
-        } else {
-            return Err(HessboostError::dimension_mismatch(
-                "column_kinds",
-                p,
-                params.column_kinds.len(),
-            ));
+        let kinds = match &params.column_kinds {
+            None => vec![ColumnKind::Continuous; p],
+            Some(kinds) if kinds.len() == p => kinds.clone(),
+            Some(kinds) => {
+                return Err(HessboostError::dimension_mismatch(
+                    "column_kinds",
+                    p,
+                    kinds.len(),
+                ));
+            }
         };
 
         // Rows with at least one observed value, densely with NaN.
@@ -545,7 +621,7 @@ impl ForestModel {
         };
 
         // Noise shared by every level, per duplicated row.
-        let k = params.duplicate_k;
+        let k = params.duplicate_k.get();
         let n_dup = n
             .checked_mul(k)
             .filter(|m| m.checked_mul(c).is_some())
@@ -562,9 +638,6 @@ impl ForestModel {
             *v = normal.draw(&mut rng);
         }
 
-        let levels: Vec<f64> = (0..params.n_t)
-            .map(|i| EPS + (1.0 - EPS) * i as f64 / (params.n_t - 1) as f64)
-            .collect();
         let outputs = if per_output { c } else { 1 };
         let jobs: Vec<(usize, usize, usize)> = (0..n_classes)
             .flat_map(|class| {
@@ -583,8 +656,9 @@ impl ForestModel {
         let models = jobs
             .into_par_iter()
             .map(|(class, level, output)| {
-                let dtrain = set.build(class, levels[level], per_output.then_some(output))?;
-                train(&params.training, &dtrain, params.num_boost_round)
+                let t = level_time(params.n_t, level);
+                let dtrain = set.build(class, t, per_output.then_some(output))?;
+                train(&params.training, &dtrain, params.num_boost_round.get())
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -665,7 +739,7 @@ impl ForestModel {
         n_imputations: usize,
         repaint: Option<Repaint>,
         seed: u64,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<Imputations> {
         let Some(sde) = self.method.sde() else {
             return Err(HessboostError::invalid_param(
                 "method",
@@ -677,7 +751,6 @@ impl ForestModel {
         let (resample, jump) = match repaint {
             None => (1, self.n_t),
             Some(r) => {
-                positive_count("repaint.resample", r.resample)?;
                 if !(r.jump.is_finite() && r.jump > 0.0 && r.jump <= 1.0) {
                     return Err(HessboostError::invalid_param(
                         "repaint.jump",
@@ -685,7 +758,7 @@ impl ForestModel {
                     ));
                 }
                 (
-                    r.resample,
+                    r.resample.get(),
                     ((r.jump * self.n_t as f64).ceil() as usize).max(1),
                 )
             }
@@ -750,7 +823,12 @@ impl ForestModel {
             let x = sampler.reverse_sde(sde, Some(&known), (resample, jump))?;
             self.decode(&x, dest)?;
         }
-        Ok(out)
+        Ok(Imputations {
+            values: out,
+            draws: n_imputations,
+            n_rows,
+            n_columns: p,
+        })
     }
 
     /// The method.
@@ -1188,11 +1266,11 @@ impl Sampler<'_> {
         Ok(x)
     }
 
-    /// The level-`t` GBDTs' predictions at `x` (`[row][c]`).
-    fn predict(&self, x: &[f64], t: f64) -> Result<Vec<f64>> {
+    /// The predictions of the GBDTs of noise level `level` at `x`
+    /// (`[row][c]`).
+    fn predict(&self, x: &[f64], level: usize) -> Result<Vec<f64>> {
         let model = self.model;
         let c = model.scales.len();
-        let level = ((t * (model.n_t - 1) as f64).round() as usize).min(model.n_t - 1);
         let mut out = vec![0.0; x.len()];
         for class in 0..model.classes.len().max(1) {
             let rows: Vec<usize> = (0..self.class_of.len())
@@ -1229,7 +1307,7 @@ impl Sampler<'_> {
         let h = 1.0 / (n_t - 1) as f64;
         let mut x = self.prior()?;
         for step in 0..n_t - 1 {
-            let v = self.predict(&x, step as f64 * h)?;
+            let v = self.predict(&x, step)?;
             for (s, &d) in x.iter_mut().zip(&v) {
                 *s += h * d;
             }
@@ -1238,18 +1316,18 @@ impl Sampler<'_> {
         Ok(x)
     }
 
-    /// The score at `x` and time `t`; with `known` (imputation), the
-    /// observed entries are first re-noised to level `t` with the draws of
-    /// evaluation `eval`.
+    /// The score at `x` and noise level `level`; with `known` (imputation),
+    /// the observed entries are first re-noised to that level with the draws
+    /// of evaluation `eval`.
     fn score(
         &self,
         sde: Sde,
         x: &mut [f64],
         known: Option<&[f64]>,
-        t: f64,
+        level: usize,
         eval: u64,
     ) -> Result<Vec<f64>> {
-        let (alpha, std) = sde.marginal(t);
+        let (alpha, std) = sde.marginal(level_time(self.model.n_t, level));
         if let Some(known) = known {
             let c = self.model.scales.len();
             for (row, (state, obs)) in x.chunks_exact_mut(c).zip(known.chunks_exact(c)).enumerate()
@@ -1262,7 +1340,7 @@ impl Sampler<'_> {
                 }
             }
         }
-        let mut out = self.predict(x, t)?;
+        let mut out = self.predict(x, level)?;
         for v in &mut out {
             *v = -*v / std;
         }
@@ -1280,17 +1358,16 @@ impl Sampler<'_> {
     ) -> Result<Vec<f64>> {
         let n_t = self.model.n_t;
         let c = self.model.scales.len() as u64;
-        let times: Vec<f64> = (0..n_t)
-            .map(|i| 1.0 - (1.0 - EPS) * i as f64 / (n_t - 1) as f64)
-            .collect();
-        let step = |i: usize| times[i] - times.get(i + 1).copied().unwrap_or(0.0);
+        // Step `i` runs from level `n_t - 1 - i` to the one below it.
+        let level = |i: usize| n_t - 1 - i;
+        let step = |i: usize| level_time(n_t, level(i)) - level_time(n_t, level(i) - 1);
         let mut x = self.prior()?;
         let mut eval = 0u64;
         let (mut i, mut passes) = (0usize, 0usize);
         while i < n_t - 1 {
-            let t = times[i];
+            let t = level_time(n_t, level(i));
             let h = step(i);
-            let score = self.score(sde, &mut x, known, t, eval)?;
+            let score = self.score(sde, &mut x, known, level(i), eval)?;
             let (drift, g2) = sde.drift_diffusion(t);
             let noise_scale = (g2 * h).sqrt();
             for (e, (v, &s)) in x.iter_mut().zip(&score).enumerate() {
@@ -1319,7 +1396,7 @@ impl Sampler<'_> {
             i += 1;
         }
         let (_, std) = sde.marginal(EPS);
-        let score = self.score(sde, &mut x, known, EPS, eval)?;
+        let score = self.score(sde, &mut x, known, 0, eval)?;
         for (v, &s) in x.iter_mut().zip(&score) {
             *v += std * std * s;
         }
@@ -1333,6 +1410,13 @@ impl Sampler<'_> {
         check_finite(&x)?;
         Ok(x)
     }
+}
+
+fn positive_count(name: &'static str, v: usize) -> Result<()> {
+    if v == 0 {
+        return Err(HessboostError::invalid_param(name, "must be at least 1"));
+    }
+    Ok(())
 }
 
 fn check_finite(x: &[f64]) -> Result<()> {
@@ -1352,4 +1436,74 @@ fn diverged() -> HessboostError {
 fn f32_exact(v: f64) -> bool {
     let narrowed = v as f32;
     narrowed.is_finite() && f64::from(narrowed) == v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-column diffusion model whose level-`L` GBDT predicts `L`, so
+    /// the draws show which level each step evaluates.
+    fn level_indexed_model(n_t: usize) -> ForestModel {
+        let data = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
+        let params = TrainingParams::default();
+        let models = (0..n_t)
+            .map(|level| {
+                let dtrain = data.clone().with_labels(&[level as f32; 2]).unwrap();
+                train(&params, &dtrain, 1).unwrap()
+            })
+            .collect();
+        ForestModel {
+            method: ForestMethod::diffusion(),
+            n_t,
+            columns: vec![Column {
+                kind: ColumnKind::Continuous,
+                min: -1e30,
+                max: 1e30,
+                categories: Vec::new(),
+            }],
+            scales: vec![Scale {
+                min: -1.0,
+                range: 2.0,
+            }],
+            classes: Vec::new(),
+            class_probs: Vec::new(),
+            per_output: false,
+            models,
+        }
+    }
+
+    /// Every reverse-SDE step evaluates the GBDTs trained at its own time,
+    /// at any `n_t`: finding the level by rounding `t (n_t - 1)` picked the
+    /// next one up once `EPS · i` reached `½` (from step 500 on).
+    #[test]
+    fn reverse_steps_use_the_level_trained_at_their_time() {
+        let n_t = 600;
+        let model = level_indexed_model(n_t);
+        let sde = model.method.sde().unwrap();
+        let sampler = Sampler {
+            model: &model,
+            class_of: &[0, 0, 0],
+            key: 7,
+        };
+        let drawn = sampler.reverse_sde(sde, None, (1, n_t)).unwrap();
+
+        // The same Euler–Maruyama steps with each step's level named.
+        let mut x = sampler.prior().unwrap();
+        for (eval, level) in (1..n_t).rev().enumerate() {
+            let t = level_time(n_t, level);
+            let h = t - level_time(n_t, level - 1);
+            let (_, std) = sde.marginal(t);
+            let (drift, g2) = sde.drift_diffusion(t);
+            for (row, v) in x.iter_mut().enumerate() {
+                let score = -(level as f64) / std;
+                let noise = sampler.noise(STEP_STREAM, row, eval as u64);
+                *v = *v - (drift * *v - g2 * score) * h + (g2 * h).sqrt() * noise;
+            }
+        }
+        // Level 0's GBDT predicts 0: the final denoising step adds nothing.
+        for (a, b) in drawn.iter().zip(&x) {
+            assert!((a - b).abs() <= 1e-9 * b.abs().max(1.0), "{a} vs {b}");
+        }
+    }
 }

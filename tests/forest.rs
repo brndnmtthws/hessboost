@@ -2,6 +2,8 @@
 //! generated rows' structure and validity, imputation, determinism,
 //! persistence, and refusals.
 
+use std::num::NonZeroUsize;
+
 use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
@@ -36,13 +38,13 @@ fn table(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
 
 fn quick(mut params: ForestParams) -> ForestParams {
     params.n_t = 30;
-    params.duplicate_k = 20;
-    params.num_boost_round = 30;
-    params.column_kinds = vec![
+    params.duplicate_k = NonZeroUsize::new(20).unwrap();
+    params.num_boost_round = NonZeroUsize::new(30).unwrap();
+    params.column_kinds = Some(vec![
         ColumnKind::Continuous,
         ColumnKind::Continuous,
         ColumnKind::Categorical,
-    ];
+    ]);
     params
 }
 
@@ -70,7 +72,13 @@ fn generated_rows_follow_each_class() {
             params.method
         );
         let (mut on_class, mut on_line) = (0, 0);
-        for (row, &class) in synthetic.values().as_chunks::<COLS>().0.iter().zip(labels) {
+        for (row, &class) in synthetic
+            .as_slice()
+            .as_chunks::<COLS>()
+            .0
+            .iter()
+            .zip(labels)
+        {
             // Categories decode to seen values; every value is within range.
             assert!(row[2] == 3.0 || row[2] == 7.0);
             assert!((0.0..=4.0).contains(&row[0]), "{row:?}");
@@ -81,7 +89,7 @@ fn generated_rows_follow_each_class() {
         assert!(on_class > 360, "{:?}: {on_class} of 400", params.method);
         assert!(on_line > 300, "{:?}: {on_line} of 400", params.method);
         let class1_cat7 = synthetic
-            .values()
+            .as_slice()
             .as_chunks::<COLS>()
             .0
             .iter()
@@ -93,7 +101,7 @@ fn generated_rows_follow_each_class() {
         let class0 = model.generate_for_labels(&[0.0; 50], 4).unwrap();
         assert!(
             class0
-                .values()
+                .as_slice()
                 .as_chunks::<COLS>()
                 .0
                 .iter()
@@ -122,8 +130,9 @@ fn imputation_keeps_observed_entries_and_uses_them() {
     let model = ForestModel::fit(&quick(ForestParams::diffusion()), &data).unwrap();
     for repaint in [None, Some(Repaint::default())] {
         let imputed = model.impute(&data, 2, repaint, 1).unwrap();
-        assert_eq!(imputed.len(), 2 * 300 * COLS);
-        let first = &imputed[..300 * COLS];
+        assert_eq!(imputed.as_slice().len(), 2 * 300 * COLS);
+        assert_eq!((imputed.n_imputations(), imputed.n_rows()), (2, 300));
+        let first = &imputed.as_slice()[..300 * COLS];
         let (mut se, mut holes) = (0.0, 0);
         for ((m, i), t) in masked.iter().zip(first).zip(&x) {
             if m.is_nan() {
@@ -139,7 +148,7 @@ fn imputation_keeps_observed_entries_and_uses_them() {
         // mean) would be off by ~3.
         assert!(rmse < 1.5, "{repaint:?}: RMSE {rmse}");
         // The two imputations are different draws.
-        assert_ne!(first, &imputed[300 * COLS..]);
+        assert_ne!(first, &imputed.as_slice()[300 * COLS..]);
     }
     // Flow matching cannot impute.
     let flow = ForestModel::fit(&quick(ForestParams::default()), &labelled(&x, &y)).unwrap();
@@ -161,7 +170,7 @@ fn fitting_and_generation_ignore_the_thread_count() {
     // Rows depend on their index only: fewer rows are a prefix.
     let model = ForestModel::fit(&quick(ForestParams::diffusion()), &labelled(&x, &y)).unwrap();
     let fewer = model.generate(10, 9).unwrap();
-    assert_eq!(fewer.values(), &one.values()[..10 * COLS]);
+    assert_eq!(fewer.as_slice(), &one.as_slice()[..10 * COLS]);
 }
 
 #[test]
@@ -210,7 +219,7 @@ fn unsupported_inputs_are_refused() {
     };
     assert_eq!(invalid_param(ForestModel::fit(&params, &data)), "method");
     let mut params = quick(ForestParams::default());
-    params.column_kinds.pop();
+    params.column_kinds.as_mut().unwrap().pop();
     assert!(matches!(
         ForestModel::fit(&params, &data),
         Err(HessboostError::DimensionMismatch { .. })

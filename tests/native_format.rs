@@ -854,10 +854,10 @@ fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
 fn forest_models() -> Vec<(&'static str, ForestModel)> {
     let tiny = |mut params: ForestParams, kinds: Vec<ColumnKind>| {
         params.n_t = 3;
-        params.duplicate_k = 2;
-        params.num_boost_round = 3;
+        params.duplicate_k = std::num::NonZeroUsize::new(2).unwrap();
+        params.num_boost_round = std::num::NonZeroUsize::new(3).unwrap();
         params.training.nthread = std::num::NonZeroUsize::new(1);
-        params.column_kinds = kinds;
+        params.column_kinds = Some(kinds);
         params
     };
     let n = 160;

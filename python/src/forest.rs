@@ -5,6 +5,7 @@
 //! `ForestMethod` (the form forest model files store).
 
 use crate::data::{DMatrix, row_major, to_numpy};
+use crate::diffusion::positive;
 use crate::errors::{OrRaise, refuse};
 use crate::params::{Params, to_python};
 use hessboost::diffusion::forest::{self, ColumnKind, ForestMethod, Repaint, Synthetic};
@@ -22,8 +23,9 @@ pub(crate) struct ForestRequest {
     method: String,
     n_t: usize,
     duplicate_k: usize,
-    /// `"continuous"`, `"integer"` or `"categorical"` per column (or none).
-    column_kinds: Vec<String>,
+    /// `"continuous"`, `"integer"` or `"categorical"` per column, or `None`
+    /// for all continuous.
+    column_kinds: Option<Vec<String>>,
     training: Py<Params>,
     num_boost_round: usize,
     seed: u64,
@@ -67,14 +69,13 @@ impl ForestParams {
         let mut inner = forest::ForestParams::default();
         inner.method = method_from_json(&request.method)?;
         inner.n_t = request.n_t;
-        inner.duplicate_k = request.duplicate_k;
+        inner.duplicate_k = positive("duplicate_k", request.duplicate_k)?;
         inner.column_kinds = request
             .column_kinds
-            .iter()
-            .map(|name| column_kind(name))
-            .collect::<PyResult<_>>()?;
+            .map(|names| names.iter().map(|name| column_kind(name)).collect())
+            .transpose()?;
         inner.training = request.training.get().inner.clone();
-        inner.num_boost_round = request.num_boost_round;
+        inner.num_boost_round = positive("num_boost_round", request.num_boost_round)?;
         inner.seed = request.seed;
         inner.validate().or_raise()?;
         Ok(Self { inner })
@@ -97,16 +98,20 @@ impl ForestParams {
         let dict = PyDict::new(py);
         dict.set_item("method", method_json(params.method)?)?;
         dict.set_item("n_t", params.n_t)?;
-        dict.set_item("duplicate_k", params.duplicate_k)?;
+        dict.set_item("duplicate_k", params.duplicate_k.get())?;
         let kinds = params
             .column_kinds
-            .iter()
-            .map(|&kind| column_kind_name(kind))
-            .collect::<PyResult<Vec<_>>>()?;
+            .map(|kinds| {
+                kinds
+                    .into_iter()
+                    .map(column_kind_name)
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()?;
         dict.set_item("column_kinds", kinds)?;
         let training = Value::Object(params.training.to_xgboost().or_raise()?);
         dict.set_item("training", to_python(py, &training)?)?;
-        dict.set_item("num_boost_round", params.num_boost_round)?;
+        dict.set_item("num_boost_round", params.num_boost_round.get())?;
         dict.set_item("seed", params.seed)?;
         Ok(dict)
     }
@@ -120,14 +125,11 @@ type SyntheticArrays<'py> = (
 
 fn synthetic_arrays(py: Python<'_>, synthetic: Synthetic) -> PyResult<SyntheticArrays<'_>> {
     let (rows, columns) = (synthetic.n_rows(), synthetic.n_columns());
-    let labels = synthetic
-        .labels()
-        .map(|labels| to_numpy(py, labels.to_vec(), &[rows]))
+    let (values, labels) = synthetic.into_parts();
+    let labels = labels
+        .map(|labels| to_numpy(py, labels, &[rows]))
         .transpose()?;
-    Ok((
-        to_numpy(py, synthetic.values().to_vec(), &[rows, columns])?,
-        labels,
-    ))
+    Ok((to_numpy(py, values, &[rows, columns])?, labels))
 }
 
 /// A fitted ForestFlow / ForestDiffusion model.
@@ -184,17 +186,24 @@ impl ForestModel {
         repaint: Option<(usize, f64)>,
         seed: u64,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
-        let repaint = repaint.map(|(resample, jump)| {
-            let mut repaint = Repaint::default();
-            repaint.resample = resample;
-            repaint.jump = jump;
-            repaint
-        });
-        let values = py
+        let repaint = match repaint {
+            Some((resample, jump)) => {
+                let mut repaint = Repaint::default();
+                repaint.resample = positive("repaint.resample", resample)?;
+                repaint.jump = jump;
+                Some(repaint)
+            }
+            None => None,
+        };
+        let imputations = py
             .detach(|| self.inner.impute(&data.inner, n_imputations, repaint, seed))
             .or_raise()?;
-        let shape = [n_imputations, data.inner.n_rows(), self.inner.n_columns()];
-        to_numpy(py, values, &shape)
+        let shape = [
+            imputations.n_imputations(),
+            imputations.n_rows(),
+            imputations.n_columns(),
+        ];
+        to_numpy(py, imputations.into_vec(), &shape)
     }
 
     /// Decodes the binary format.

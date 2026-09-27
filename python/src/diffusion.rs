@@ -37,7 +37,7 @@ pub(crate) struct ParamsRequest {
 }
 
 /// `value` as a positive count, refused under `name` when it is `0`.
-fn positive(name: &str, value: usize) -> PyResult<NonZeroUsize> {
+pub(crate) fn positive(name: &str, value: usize) -> PyResult<NonZeroUsize> {
     NonZeroUsize::new(value).ok_or_else(|| refuse(format!("{name} must be at least 1, got 0")))
 }
 

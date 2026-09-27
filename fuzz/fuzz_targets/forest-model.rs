@@ -52,8 +52,8 @@ fuzz_target!(|data: &[u8]| {
     // Generation may refuse a diverging sampler, but never panics, and a
     // successful draw has the documented shape and reloads identically.
     if let Ok(rows) = model.generate(2, 0) {
-        assert_eq!(rows.values().len(), 2 * model.n_columns());
-        assert!(rows.values().iter().all(|v| v.is_finite()));
+        assert_eq!(rows.as_slice().len(), 2 * model.n_columns());
+        assert!(rows.as_slice().iter().all(|v| v.is_finite()));
         assert_eq!(from_bytes.generate(2, 0).ok(), Some(rows));
     }
     if matches!(model.method(), ForestMethod::Diffusion { .. }) {

@@ -1,9 +1,8 @@
 //! # hessboost
 //!
-//! [XGBoost](https://github.com/dmlc/xgboost) gradient boosting in Rust. The
-//! only C dependency is zstd (native model files); the opt-in `metal`
-//! feature adds Apple's Metal framework for GPU prediction and bit-identical
-//! GPU histograms on macOS.
+//! Gradient boosting in Rust. The only C dependency is zstd (native model
+//! files); the opt-in `metal` feature adds Apple's Metal framework for GPU
+//! prediction and bit-identical GPU histograms on macOS.
 //!
 //! ## Quick start
 //!
@@ -22,7 +21,7 @@
 //! let dtrain = DMatrix::from_dense(&x, 6, 2)?.with_labels(&y)?;
 //!
 //! let params = TrainingParams::builder()
-//!     .objective(Objective::SquaredError(RegLoss::default())) // XGBoost's `reg:squarederror`
+//!     .objective(Objective::SquaredError(RegLoss::default()))
 //!     .tree_method(TreeMethod::Hist)
 //!     .max_depth(3)
 //!     .eta(0.1)
@@ -102,7 +101,7 @@
 //!   mlogloss, merror, poisson/gamma/tweedie-nloglik, ndcg, map, pre,
 //!   quantile, expectile, cox/aft-nloglik, interval-regression-accuracy, plus
 //!   a custom hook ([`Trainer::custom_metric`](training::Trainer::custom_metric),
-//!   reported after them as in XGBoost). XGBoost's names parse through
+//!   reported after built-in metrics). XGBoost-compatible parameter dictionaries parse through
 //!   [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost):
 //!   `@k` ranking cutoffs and `@rho` on tweedie-nloglik, other suffixes
 //!   refused.
@@ -122,7 +121,7 @@
 //!   [`Fold::purged_forward`](training::Fold::purged_forward))
 //!   [`Fold`](training::Fold)s with fold-mean early stopping
 //!   ([`CrossValidation`](training::CrossValidation)).
-//! - **Beyond XGBoost (opt-in, default training unchanged):**
+//! - **Advanced & experimental methods (opt-in):**
 //!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);
 //!   - Boulevard boosting (Zhou & Hooker, JMLR 2022) and its dropout
@@ -202,16 +201,14 @@
 //!
 //! ## Compatibility notes
 //!
-//! Parameter, objective, and metric names are XGBoost's, so an XGBoost
-//! configuration carries over:
+//! While hessboost is a standalone library, it offers extensive compatibility with
+//! XGBoost configurations and models:
 //! [`TrainingParams::from_xgboost`](config::TrainingParams::from_xgboost)
-//! reads an XGBoost `params` dict (keys, aliases, and value spellings), and
-//! unsupported settings are refused. Parity with
-//! XGBoost 3.4.2 is CI-tested: deterministic fixtures reproduce XGBoost
-//! within `1e-4` (quantile cuts bit for bit), and imported XGBoost models
-//! predict and explain as XGBoost does. RNG-driven options (subsampling,
-//! forests, DART) match in quality only — the streams differ.
-//!
+//! reads XGBoost `params` dictionaries (keys, aliases, and value spellings), and
+//! unsupported settings are refused. Deterministic configurations reproduce XGBoost
+//! predictions within `1e-4` (quantile cuts bit for bit), and imported XGBoost models
+//! predict and explain identically. RNG-driven options (subsampling,
+//! forests, DART) match in quality only — the random streams differ.
 //! ### Not implemented
 //!
 //! - Distributed and external-memory training; GPU training outside macOS.

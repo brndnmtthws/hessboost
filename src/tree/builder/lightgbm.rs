@@ -32,10 +32,9 @@
 //! Hessians); leaves keep the outputs their split recorded.
 
 use super::hist::NodeCtx;
-use super::{
-    BestSplit, Children, Score, SplitPos, SplitScorer, children_valid, for_each_numeric_split,
-    xgb_calc_weight, xgb_node_gain, xgb_update,
-};
+use super::shared::{xgb_calc_weight, xgb_node_gain};
+use super::split::{SplitScorer, for_each_numeric_split};
+use super::{BestSplit, Children, Score, SplitPos, children_valid, xgb_update};
 use crate::K_RT_EPS;
 use crate::config::TrainingParams;
 use crate::data::ghist::GHistIndex;

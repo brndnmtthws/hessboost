@@ -611,8 +611,11 @@ fn dart_forces_a_drop_only_under_one_drop() {
         .unwrap();
     let mut rng = Rng::new(3);
     assert_eq!(select_dropout(&model, &never, &mut rng), None);
-    let (mask, dropped) = select_dropout(&model, &forced, &mut rng).unwrap();
-    assert_eq!((dropped.len(), mask.iter().filter(|&&m| m).count()), (1, 1));
+    let dropout = select_dropout(&model, &forced, &mut rng).unwrap();
+    assert_eq!(
+        (dropout.count, dropout.mask.iter().filter(|&&m| m).count()),
+        (1, 1)
+    );
     let empty = train(&params, &d, 0).unwrap();
     let mut before = rng.clone();
     assert_eq!(select_dropout(&empty, &forced, &mut rng), None);

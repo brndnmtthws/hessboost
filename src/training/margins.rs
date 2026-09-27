@@ -116,7 +116,7 @@ impl<'a> MarginCaches<'a> {
 }
 
 /// Add `tree`'s prediction of every row of `data` to `margins`.
-fn add_tree_margins(
+pub(super) fn add_tree_margins(
     tree: &RegTree,
     data: &DMatrix,
     margins: &mut [f32],

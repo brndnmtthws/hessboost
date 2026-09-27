@@ -116,7 +116,8 @@
 //!
 //! Fitting refuses data without labels, instance weights, base margins,
 //! ranking groups, label bounds, or feature weights; an objective other than
-//! `reg:squarederror` or a refresh (`process_type = update`) in the GBDT
+//! `reg:squarederror` with `scale_pos_weight = 1`, or a refresh
+//! (`process_type = update`), in the GBDT
 //! parameters (which also rules out class-balanced and query-level
 //! bagging, since they need a `binary:*` or `rank:*` objective);
 //! residualization with fewer than 80 rows; and non-positive or non-finite
@@ -442,7 +443,8 @@ pub struct Residualizer {
     /// `min(folds, max(2, n / 40))` are used, so every fold keeps about 40
     /// rows or more; fewer than 80 rows are refused.
     pub folds: usize,
-    /// Parameters of the fold models (objective `reg:squarederror`).
+    /// Parameters of the fold models (objective `reg:squarederror`,
+    /// `scale_pos_weight = 1`).
     pub training: TrainingParams,
     /// Boosting rounds of each fold model.
     pub num_boost_round: NonZeroUsize,
@@ -477,7 +479,7 @@ pub struct DiffusionParams {
     /// Integration steps of the sampler, stored with the model.
     pub n_steps: NonZeroUsize,
     /// Parameters of the score/velocity GBDT (objective
-    /// `reg:squarederror`).
+    /// `reg:squarederror`, `scale_pos_weight = 1`).
     pub training: TrainingParams,
     /// Maximum boosting rounds of the score/velocity GBDT.
     pub num_boost_round: NonZeroUsize,
@@ -536,7 +538,8 @@ impl DiffusionParams {
     /// [`HessboostError::InvalidParameter`] for an out-of-range fraction,
     /// fold count or process parameter, or GBDT parameters that fail
     /// [`TrainingParams::validate`], name an objective other than
-    /// `reg:squarederror`, or set `process_type` to `update`.
+    /// `reg:squarederror` with `scale_pos_weight = 1`, or set
+    /// `process_type` to `update`.
     pub fn validate(&self) -> Result<()> {
         self.method.validate()?;
         validate_regressor_params("training", &self.training)?;

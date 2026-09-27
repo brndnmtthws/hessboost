@@ -2,6 +2,7 @@
 //! learned distribution's shape, sampling determinism, persistence, and
 //! refusals.
 
+use hessboost::config::{ProcessType, Refresh};
 use hessboost::diffusion::{
     DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, Samples, ScoreConfig,
     Sde,
@@ -214,6 +215,22 @@ fn damaged_or_incomplete_files_are_refused() {
         DiffusionModel::from_json(&json.to_string()),
         Err(HessboostError::Json(_) | HessboostError::ModelFormat(_))
     ));
+}
+
+#[test]
+fn refresh_regressor_params_are_refused() {
+    // Every GBDT is trained from scratch: there is nothing to refresh.
+    let update = ProcessType::Update(Refresh::default());
+    let mut params = quick(DiffusionParams::default());
+    params.training.process_type = update;
+    assert_eq!(invalid_param(params.validate()), "training");
+    assert_eq!(
+        invalid_param(DiffusionModel::fit(&params, &bimodal(100, 7))),
+        "training"
+    );
+    let mut params = quick(DiffusionParams::default());
+    params.residualizer.as_mut().unwrap().training.process_type = update;
+    assert_eq!(invalid_param(params.validate()), "residualizer.training");
 }
 
 #[test]

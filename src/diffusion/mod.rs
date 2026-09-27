@@ -116,7 +116,8 @@
 //!
 //! Fitting refuses data without labels, instance weights, base margins,
 //! ranking groups, label bounds, or feature weights; an objective other than
-//! `reg:squarederror`; residualization with fewer than 80 rows; and
+//! `reg:squarederror` or a refresh (`process_type = update`) in the GBDT
+//! parameters; residualization with fewer than 80 rows; and
 //! non-positive or non-finite process parameters. Sampling refuses a matrix
 //! whose feature count differs from the training data's, or one with base
 //! margins.
@@ -184,7 +185,7 @@ use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{GrowPolicy, TrainingParams, TreeMethod};
+use crate::config::{GrowPolicy, ProcessType, TrainingParams, TreeMethod};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
@@ -529,8 +530,8 @@ impl DiffusionParams {
     ///
     /// [`HessboostError::InvalidParameter`] for a zero count, an
     /// out-of-range fraction or process parameter, or GBDT parameters that
-    /// fail [`TrainingParams::validate`] or name an objective other than
-    /// `reg:squarederror`.
+    /// fail [`TrainingParams::validate`], name an objective other than
+    /// `reg:squarederror`, or set `process_type` to `update`.
     pub fn validate(&self) -> Result<()> {
         self.method.validate()?;
         positive_count("n_repeats", self.n_repeats)?;
@@ -585,8 +586,9 @@ fn positive_count(name: &'static str, v: usize) -> Result<()> {
     Ok(())
 }
 
-/// `params` validate and regress with squared error, the loss every
-/// diffusion target is fit with.
+/// `params` validate, regress with squared error (the loss every diffusion
+/// target is fit with), and grow new trees: every GBDT is trained from
+/// scratch, so there is no model for `process_type = update` to refresh.
 fn validate_regressor_params(name: &'static str, params: &TrainingParams) -> Result<()> {
     params.validate()?;
     if !matches!(params.objective, Objective::SquaredError) {
@@ -597,6 +599,13 @@ fn validate_regressor_params(name: &'static str, params: &TrainingParams) -> Res
                  `reg:squarederror`, got `{}`",
                 params.objective.name()
             ),
+        ));
+    }
+    if matches!(params.process_type, ProcessType::Update(_)) {
+        return Err(HessboostError::invalid_param(
+            name,
+            "the diffusion GBDTs are trained from scratch: process_type must be `default`, \
+             not `update` (refresh)",
         ));
     }
     Ok(())

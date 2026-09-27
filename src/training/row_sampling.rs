@@ -27,25 +27,22 @@ pub(super) fn sample_rows(
         return if params.subsample >= 1.0 {
             all_rows(n)
         } else {
-            bernoulli_sample(n, params.subsample, rng)
+            let fraction = params.subsample;
+            bernoulli_rows(n, |i| i as u32, |_| fraction, n as f64 * fraction, rng)
         };
     };
     let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
     let labels = &meta.labels[..n];
     let positives = meta.positives;
-    let mut rows = with_sample_capacity(positives as f64 * pos + (n - positives) as f64 * neg);
-    rows.extend((0..n as u32).filter(|&row| {
-        let fraction = if labels[row as usize] == 1.0 {
+    let expected = positives as f64 * pos + (n - positives) as f64 * neg;
+    let fraction = |row: u32| {
+        if labels[row as usize] == 1.0 {
             pos
         } else {
             neg
-        };
-        rng.f64() < fraction
-    }));
-    if rows.is_empty() {
-        rows.push(rng.range(0..n) as u32);
-    }
-    rows
+        }
+    };
+    bernoulli_rows(n, |i| i as u32, fraction, expected, rng)
 }
 
 /// A row buffer sized for a Bernoulli sample of `expected` rows plus a few
@@ -54,13 +51,22 @@ fn with_sample_capacity(expected: f64) -> Vec<u32> {
     Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize)
 }
 
-/// The indices in `0..n` kept by one `rng` draw each with probability
-/// `fraction`, or one random index when none is kept.
-fn bernoulli_sample(n: usize, fraction: f64, rng: &mut Rng) -> Vec<u32> {
-    let mut kept = with_sample_capacity(n as f64 * fraction);
-    kept.extend((0..n as u32).filter(|_| rng.f64() < fraction));
+/// Bernoulli sampling, the primitive every row sampler draws with: the
+/// rows `row(i)` for `i` in `0..len`, each kept with probability
+/// `keep(row)` by one `rng.f64()` draw per row, in order; when none is
+/// kept, the single row `row(rng.range(0..len))`. `expected` (the expected
+/// number kept) only sizes the buffer.
+pub(super) fn bernoulli_rows(
+    len: usize,
+    row: impl Fn(usize) -> u32,
+    keep: impl Fn(u32) -> f64,
+    expected: f64,
+    rng: &mut Rng,
+) -> Vec<u32> {
+    let mut kept = with_sample_capacity(expected);
+    kept.extend((0..len).map(&row).filter(|&r| rng.f64() < keep(r)));
     if kept.is_empty() {
-        kept.push(rng.range(0..n) as u32);
+        kept.push(row(rng.range(0..len)));
     }
     kept
 }
@@ -139,7 +145,9 @@ pub(super) fn iteration_row_subsets<'a>(
     RoundRows::Sampled(
         (0..draws)
             .map(|_| {
-                bernoulli_sample(queries.len(), bagging.fraction(), rng)
+                let fraction = bagging.fraction();
+                let expected = queries.len() as f64 * fraction;
+                bernoulli_rows(queries.len(), |q| q as u32, |_| fraction, expected, rng)
                     .into_iter()
                     .flat_map(|query| {
                         let (start, end) = queries[query as usize];

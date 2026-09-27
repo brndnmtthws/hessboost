@@ -94,10 +94,11 @@ def test_refusals() -> None:
         hessboost.train({**CLASSIC, "colsample_bytree": 0.5}, hessboost.DMatrix(x, label=y), 2)
     # Class-balanced bagging samples rows by label, which the Boulevard EBM's
     # kernel cannot represent, whatever the objective.
+    # (A non-binary objective is refused first by balanced bagging itself.)
     labels = (y > np.median(y)).astype(float)
-    for objective in ("reg:squarederror", "binary:logistic"):
+    for objective, reason in (("binary:logistic", "linear smoother"), ("reg:squarederror", "binary")):
         balanced = {**BOULEVARD, "subsample": 1.0, "objective": objective}
-        with pytest.raises(hessboost.HessboostError, match="linear smoother"):
+        with pytest.raises(hessboost.HessboostError, match=reason):
             hessboost.train(
                 {**balanced, "neg_bagging_fraction": 0.5}, hessboost.DMatrix(x, label=labels), 2
             )

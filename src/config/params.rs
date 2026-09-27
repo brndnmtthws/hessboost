@@ -616,11 +616,11 @@ impl TrainingParams {
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
         self.validate_bagging_by_query()?;
+        self.validate_balanced_bagging()?;
         self.validate_tree_options()?;
         self.validate_sglb()?;
         self.validate_boulevard()?;
-        self.validate_ebm()?;
-        self.validate_balanced_bagging()
+        self.validate_ebm()
     }
 
     /// Query-level bagging: a ranking objective on a tree booster, with

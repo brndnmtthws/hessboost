@@ -318,15 +318,38 @@ mod tests {
     /// Every query's gradients, at the default seed and iteration 0 (the
     /// stream positions a bare `mix64` chain from 0 made degenerate) and at
     /// a later seed and iteration, with unequal scores, match the reference
-    /// formula fed the draws of that query's documented stream (seed, salt,
-    /// iteration, query).
+    /// formula fed known-answer draws. The draws were generated outside the
+    /// crate by a plain SplitMix64 port: key = fold of
+    /// `splitmix64(key ^ part)` over (seed, `TARGET_STREAM`, iteration,
+    /// query) from 0; document `d` takes `mix64(key + (d + 1) * GOLDEN) >> 40`,
+    /// divided by `2^24`. A fault in the crate's stream helpers therefore
+    /// cannot move the implementation and the oracle together.
     #[test]
     fn query_gradient_matches_independent_formula() {
         let scores = [0.0, 0.0, 0.7, -0.4, 1.3];
         let labels = [2.0, 0.0, 1.0, 0.0, 3.0];
         let group = GroupInfo::from_sizes(&[2, 3]);
         let widen = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
-        for (seed, iteration) in [(0, 0), (97, 3)] {
+        // (seed, iteration, the 24-bit draw numerators of queries 0 and 1).
+        let known: [(u64, usize, [&[u32]; 2]); 2] = [
+            (
+                0,
+                0,
+                [
+                    &[14_072_319, 14_623_561],
+                    &[2_530_116, 12_303_826, 14_452_181],
+                ],
+            ),
+            (
+                97,
+                3,
+                [
+                    &[15_331_060, 7_202_913],
+                    &[1_743_921, 16_286_074, 1_457_671],
+                ],
+            ),
+        ];
+        for (seed, iteration, draws) in known {
             let gradients = |iteration: usize| {
                 let mut out = [GradPair::default(); 5];
                 Xendcg::new(seed).query_gradients(
@@ -340,10 +363,10 @@ mod tests {
                 out
             };
             let actual = gradients(iteration);
-            for (query, (start, end)) in group.iter_ranges().enumerate() {
-                let key = stream_key(&[seed, TARGET_STREAM, iteration as u64, query as u64]);
-                let u: Vec<f64> = (0..end - start)
-                    .map(|doc| f64::from(keyed_unit_f32(key, doc as u64)))
+            for ((start, end), numerators) in group.iter_ranges().zip(draws) {
+                let u: Vec<f64> = numerators
+                    .iter()
+                    .map(|&k| f64::from(k) / f64::from(1u32 << 24))
                     .collect();
                 let (grad, hess) =
                     reference(&widen(&scores[start..end]), &widen(&labels[start..end]), &u);

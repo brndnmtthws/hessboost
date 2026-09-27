@@ -4,6 +4,7 @@
 
 use crate::booster::Booster;
 use crate::data::{DMatrix, to_numpy};
+use crate::diffusion::positive;
 use crate::errors::{OrRaise, refuse};
 use hessboost::conformal::Interval;
 use hessboost::data::DMatrix as RustMatrix;
@@ -45,11 +46,14 @@ pub(crate) fn intervals(
     to_numpy(py, values, &[rows, 2])
 }
 
-/// The kernel solver: Nyström with `landmarks`, else exact.
-fn solver(landmarks: Option<usize>, seed: u64) -> KernelSolver {
-    landmarks.map_or(KernelSolver::Exact, |landmarks| KernelSolver::Nystrom {
-        landmarks,
-        seed,
+/// The kernel solver: Nyström with `landmarks` (refusing 0), else exact.
+pub(crate) fn solver(landmarks: Option<usize>, seed: u64) -> PyResult<KernelSolver> {
+    Ok(match landmarks {
+        Some(landmarks) => KernelSolver::Nystrom {
+            landmarks: positive("landmarks", landmarks)?,
+            seed,
+        },
+        None => KernelSolver::Exact,
     })
 }
 
@@ -116,6 +120,7 @@ impl BoulevardInference {
             holdout: holdout.map(|h| h.inner.clone()),
         };
         let train = &train.inner;
+        let solver = solver(landmarks, seed)?;
         let cell = py
             .detach(|| {
                 Cell::try_new(owner, |owner| {
@@ -124,12 +129,7 @@ impl BoulevardInference {
                         (None, Some(v)) => NoiseVariance::Known(v),
                         (None, None) => NoiseVariance::TrainingResiduals,
                     };
-                    inference::BoulevardInference::fit(
-                        &owner.model,
-                        train,
-                        noise,
-                        solver(landmarks, seed),
-                    )
+                    inference::BoulevardInference::fit(&owner.model, train, noise, solver)
                 })
             })
             .or_raise()?;

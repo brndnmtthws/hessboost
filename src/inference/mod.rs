@@ -198,6 +198,8 @@ mod solver;
 mod term_kernel;
 
 use crate::model::Iterations;
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
 use crate::conformal::Interval;
@@ -332,9 +334,18 @@ pub enum KernelSolver {
     /// [`Exact`](Self::Exact) up to rounding), those numerically dependent
     /// on the others dropped. `O(n s²)` time and `8 n s` bytes for
     /// `s = landmarks`.
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use hessboost::inference::KernelSolver;
+    ///
+    /// let landmarks = NonZeroUsize::new(1000).expect("1000 is nonzero");
+    /// let solver = KernelSolver::Nystrom { landmarks, seed: 0 };
+    /// # let _ = solver;
+    /// ```
     Nystrom {
-        /// Number of landmark rows (`>= 1`).
-        landmarks: usize,
+        /// Number of landmark rows.
+        landmarks: NonZeroUsize,
         /// Seed of the landmark draw.
         seed: u64,
     },
@@ -478,6 +489,46 @@ fn noise_estimate(model: &BoostedModel, train: &DMatrix, noise: NoiseVariance) -
     Ok(noise_variance)
 }
 
+/// Check `train` (labelled when the noise comes from its residuals) and
+/// estimate the noise variance: the start of every inference fit.
+fn fit_noise(model: &BoostedModel, train: &DMatrix, noise: NoiseVariance) -> Result<f64> {
+    check_data(
+        model,
+        train,
+        "train",
+        matches!(noise, NoiseVariance::TrainingResiduals),
+    )?;
+    noise_estimate(model, train, noise)
+}
+
+/// The interval `prediction ± z_{1−α/2} · width(‖w‖²)` of `model` at every
+/// row of `data`, with the squared weight norms `‖w‖²` from `norms` (which
+/// checks `data`).
+fn normal_intervals(
+    model: &BoostedModel,
+    data: &DMatrix,
+    alpha: f64,
+    norms: impl FnOnce() -> Result<Vec<f64>>,
+    width: impl Fn(f64) -> f64,
+) -> Result<Vec<Interval<f64>>> {
+    check_alpha(alpha)?;
+    let z = z_value(alpha);
+    let norms = norms()?;
+    let preds = model.predict(data, Iterations::Best)?;
+    Ok(preds
+        .as_slice()
+        .iter()
+        .zip(norms)
+        .map(|(&p, w2)| {
+            let (center, half) = (f64::from(p), z * width(w2));
+            Interval {
+                lower: center - half,
+                upper: center + half,
+            }
+        })
+        .collect())
+}
+
 /// Factor `c I + kernel` with `solver`.
 fn build_solver(kernel: &impl Kernel, solver: KernelSolver, c: f64) -> Result<RidgeSolver> {
     let n = kernel.n();
@@ -495,13 +546,7 @@ fn build_solver(kernel: &impl Kernel, solver: KernelSolver, c: f64) -> Result<Ri
             RidgeSolver::exact(kernel, c)
         }
         KernelSolver::Nystrom { landmarks, seed } => {
-            if landmarks == 0 {
-                return Err(HessboostError::invalid_param(
-                    "solver",
-                    "the Nyström solver needs at least one landmark",
-                ));
-            }
-            RidgeSolver::nystrom(kernel, c, landmarks, seed)
+            RidgeSolver::nystrom(kernel, c, landmarks.get(), seed)
         }
     }
 }
@@ -519,8 +564,8 @@ impl<'a> BoulevardInference<'a> {
     /// training data (a leaf holds fewer of its rows than it was grown on),
     /// has row weights or base margins, or (for the noise estimate) lacks
     /// labels; when [`KernelSolver::Exact`] gets more than
-    /// [`MAX_EXACT_ROWS`] rows or `Nystrom` no landmark; when a noise
-    /// variance is not finite and positive.
+    /// [`MAX_EXACT_ROWS`] rows; when a noise variance is not finite and
+    /// positive.
     pub fn fit(
         model: &'a BoostedModel,
         train: &DMatrix,
@@ -539,13 +584,7 @@ impl<'a> BoulevardInference<'a> {
                 "has no trees (trained for 0 rounds), so its leaf kernel has no rows",
             ));
         }
-        check_data(
-            model,
-            train,
-            "train",
-            matches!(noise, NoiseVariance::TrainingResiduals),
-        )?;
-        let noise_variance = noise_estimate(model, train, noise)?;
+        let noise_variance = fit_noise(model, train, noise)?;
         let (c, s) = info.ridge(model.num_parallel_tree());
         let leaves = model.predict_leaf(train, ..)?;
         let kernel = LeafKernel::new(model.trees(), &leaves, info.kappa())?;
@@ -659,22 +698,7 @@ impl<'a> BoulevardInference<'a> {
         alpha: f64,
         width: impl Fn(f64) -> f64,
     ) -> Result<Vec<Interval<f64>>> {
-        check_alpha(alpha)?;
-        let z = z_value(alpha);
-        let norms = self.weight_norms(data)?;
-        let preds = self.model.predict(data, Iterations::Best)?;
-        Ok(preds
-            .as_slice()
-            .iter()
-            .zip(norms)
-            .map(|(&p, w2)| {
-                let (center, half) = (f64::from(p), z * width(w2));
-                Interval {
-                    lower: center - half,
-                    upper: center + half,
-                }
-            })
-            .collect())
+        normal_intervals(self.model, data, alpha, || self.weight_norms(data), width)
     }
 
     /// Confidence intervals for the regression function `f(x)` at every row
@@ -763,10 +787,7 @@ impl<'a> BoulevardInference<'a> {
                 (f64::from(y) - center).abs() / half.max(f64::MIN_POSITIVE)
             })
             .collect();
-        let scale = match crate::conformal::conformal_rank(ratios.len(), alpha) {
-            Some(k) => *ratios.select_nth_unstable_by(k - 1, f64::total_cmp).1,
-            None => f64::INFINITY,
-        };
+        let scale = crate::conformal::conformal_quantile(&mut ratios, alpha);
         Ok(self
             .prediction_intervals(data, alpha)?
             .into_iter()

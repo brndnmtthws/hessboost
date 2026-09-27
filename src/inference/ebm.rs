@@ -2,18 +2,17 @@
 //! Pipping & Hooker, *Statistical Inference for Explainable Boosting
 //! Machines*, AISTATS 2026).
 
-use crate::model::Iterations;
 use rayon::prelude::*;
 
 use super::solver::RidgeSolver;
-use super::term_kernel::{TermKernel, TermPart};
+use super::term_kernel::{TermKernel, TermPart, TermScratch};
 use super::{
-    KernelSolver, NoiseVariance, QUERY_BLOCK, build_solver, check_alpha, check_data,
-    noise_estimate, z_value,
+    KernelSolver, NoiseVariance, QUERY_BLOCK, build_solver, check_alpha, check_data, fit_noise,
+    normal_intervals, z_value,
 };
 use crate::conformal::Interval;
 use crate::data::DMatrix;
-use crate::ebm::{EbmInfo, TermShape, shape_functions};
+use crate::ebm::{EbmInfo, TermShape, term_shape};
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Predictions};
 
@@ -199,31 +198,20 @@ impl<'a> EbmInference<'a> {
         };
         let info = model.ebm().ok_or_else(not_boulevard)?;
         let settings = info.boulevard.ok_or_else(not_boulevard)?;
-        check_data(
-            model,
-            train,
-            "train",
-            matches!(noise, NoiseVariance::TrainingResiduals),
-        )?;
-        let noise_variance = noise_estimate(model, train, noise)?;
+        let noise_variance = fit_noise(model, train, noise)?;
         let lambda = settings.learning_rate;
         let (c, s) = (1.0 / lambda, (1.0 + lambda) / lambda);
         let kappa = settings.reg_lambda / settings.subsample;
         let n = train.n_rows();
         let mut term_slot = vec![(0, 0); info.terms.len()];
         let mut stages = Vec::new();
-        for size in [1, 2] {
-            let terms: Vec<usize> = (0..info.terms.len())
-                .filter(|&t| info.terms[t].len() == size)
-                .collect();
-            if terms.is_empty() {
-                continue;
-            }
-            let parts = terms
-                .iter()
-                .map(|&t| TermPart::new(info.term_trees(model, t), &info.terms[t], train, kappa))
+        for stage in info.stages()? {
+            let parts = stage
+                .terms
+                .clone()
+                .map(|t| TermPart::new(info.term_trees(model, t), &info.terms[t], train, kappa))
                 .collect::<Result<Vec<_>>>()?;
-            for (k, &t) in terms.iter().enumerate() {
+            for (k, t) in stage.terms.enumerate() {
                 term_slot[t] = (stages.len(), k);
             }
             let kernel = TermKernel::new(parts, n);
@@ -267,10 +255,15 @@ impl<'a> EbmInference<'a> {
         }
     }
 
-    /// `‖r(x)‖²` for query points given as `rhs(a, out)`, which adds the
-    /// right-hand side of point `a` of stage `stage` to `out`; second-stage
-    /// weights go through the first stage.
-    fn norms(&self, stage: usize, m: usize, rhs: impl Fn(usize, &mut [f64]) + Sync) -> Vec<f64> {
+    /// `‖r(x)‖²` for query points given as `rhs(a, scratch, out)`, which adds
+    /// the right-hand side of point `a` of stage `stage` to `out` (using the
+    /// block's `scratch`); second-stage weights go through the first stage.
+    fn norms(
+        &self,
+        stage: usize,
+        m: usize,
+        rhs: impl Fn(usize, &mut TermScratch, &mut [f64]) + Sync,
+    ) -> Vec<f64> {
         let n = self.n;
         (0..m.div_ceil(QUERY_BLOCK))
             .into_par_iter()
@@ -278,8 +271,9 @@ impl<'a> EbmInference<'a> {
                 let range = b * QUERY_BLOCK..((b + 1) * QUERY_BLOCK).min(m);
                 let k = range.len();
                 let mut u = vec![0.0; k * n];
+                let mut scratch = TermScratch::default();
                 for (out, a) in u.chunks_exact_mut(n).zip(range) {
-                    rhs(a, out);
+                    rhs(a, &mut scratch, out);
                 }
                 self.stages[stage].solver.solve_vectors(&mut u, k, self.c);
                 if stage > 0 {
@@ -309,15 +303,15 @@ impl<'a> EbmInference<'a> {
         let kernel = &self.stages[stage].kernel;
         let scale = self.s * self.noise_variance.sqrt();
         Ok(self
-            .norms(stage, cells.len(), |a, out| {
-                kernel.add_query(part, cells[a], out);
+            .norms(stage, cells.len(), |a, scratch, out| {
+                kernel.add_query(part, cells[a], scratch, out);
             })
             .into_iter()
             .map(|w2| scale * w2.max(0.0).sqrt())
             .collect())
     }
 
-    /// Term `term`'s shape function (as [`shape_functions`] gives it) with
+    /// Term `term`'s shape function (as [`term_shape`] gives it) with
     /// pointwise bands at miscoverage `alpha` on every cell of its grid:
     /// `shape ± z_{1−α/2} σ̂ (1 + λ)/λ ‖r_t‖`, asymptotically covering the
     /// term's centered limit `f_t` (see the type docs). One ridge solve per
@@ -332,7 +326,7 @@ impl<'a> EbmInference<'a> {
     pub fn term_bands(&self, term: usize, alpha: f64) -> Result<TermBands> {
         check_alpha(alpha)?;
         self.slot(term)?;
-        let shape = shape_functions(self.model)?.terms.swap_remove(term);
+        let shape = term_shape(self.model, term)?;
         let cells: Vec<usize> = (0..shape.values().len()).collect();
         let standard_errors = self.cell_standard_errors(term, &cells)?;
         let z = z_value(alpha);
@@ -395,6 +389,7 @@ impl<'a> EbmInference<'a> {
             .flat_map_iter(|b| {
                 let range = b * QUERY_BLOCK..((b + 1) * QUERY_BLOCK).min(rows);
                 let k = range.len();
+                let mut scratch = TermScratch::default();
                 let mut sides: Vec<Vec<f64>> = self
                     .stages
                     .iter()
@@ -403,7 +398,7 @@ impl<'a> EbmInference<'a> {
                         let mut u = vec![0.0; k * n];
                         for (out, a) in u.chunks_exact_mut(n).zip(range.clone()) {
                             for (p, cells) in cells.iter().enumerate() {
-                                stage.kernel.add_query(p, cells[a], out);
+                                stage.kernel.add_query(p, cells[a], &mut scratch, out);
                             }
                         }
                         stage.solver.solve_vectors(&mut u, k, self.c);
@@ -444,29 +439,21 @@ impl<'a> EbmInference<'a> {
         Ok(Predictions::new(se, data.n_rows(), 1))
     }
 
-    /// The interval `prediction ± z · width(‖w‖²)` of every row.
+    /// The interval `prediction ± z · width(‖w‖²)` of every row, `‖w‖²`
+    /// clamped at 0.
     fn intervals(
         &self,
         data: &DMatrix,
         alpha: f64,
         width: impl Fn(f64) -> f64,
     ) -> Result<Vec<Interval<f64>>> {
-        check_alpha(alpha)?;
-        let z = z_value(alpha);
-        let norms = self.prediction_norms(data)?;
-        let preds = self.model.predict(data, Iterations::Best)?;
-        Ok(preds
-            .as_slice()
-            .iter()
-            .zip(norms)
-            .map(|(&p, w2)| {
-                let (center, half) = (f64::from(p), z * width(w2.max(0.0)));
-                Interval {
-                    lower: center - half,
-                    upper: center + half,
-                }
-            })
-            .collect())
+        normal_intervals(
+            self.model,
+            data,
+            alpha,
+            || self.prediction_norms(data),
+            |w2| width(w2.max(0.0)),
+        )
     }
 
     /// Confidence intervals for `f(x)` at every row of `data`:

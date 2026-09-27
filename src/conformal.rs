@@ -548,7 +548,7 @@ fn check_finite(preds: impl IntoIterator<Item = f32>) -> Result<()> {
 ///
 /// `k` is evaluated as `(n + 1) - floor((n + 1) * alpha)`, which equals the
 /// ceiling form exactly and avoids the rounding of `1 - alpha`.
-pub(crate) fn conformal_rank(n: usize, alpha: f64) -> Option<usize> {
+fn conformal_rank(n: usize, alpha: f64) -> Option<usize> {
     let n1 = n + 1;
     // `0 < alpha < 1` bounds the floor to `[0, n]`, so `1 <= k <= n + 1`.
     let k = n1 - ((n1 as f64) * alpha).floor() as usize;
@@ -566,9 +566,11 @@ fn score_quantile(labels: &[f32], alpha: f64, score: impl Fn(usize, f64) -> f64)
     conformal_quantile(&mut scores, alpha)
 }
 
-/// The `k`-th smallest score with `k` from [`conformal_rank`], or `+∞` when
-/// `k > n`. Reorders `scores`; `scores` must be non-empty and finite.
-fn conformal_quantile(scores: &mut [f64], alpha: f64) -> f64 {
+/// The `k`-th smallest score with `k` from [`conformal_rank`] (scores
+/// ordered by [`f64::total_cmp`]), or `+∞` when `k > n`: the split-conformal
+/// quantile, shared with [`crate::inference`]'s calibrated intervals.
+/// Reorders `scores`; `alpha` must be in `(0, 1)`.
+pub(crate) fn conformal_quantile(scores: &mut [f64], alpha: f64) -> f64 {
     let Some(k) = conformal_rank(scores.len(), alpha) else {
         return f64::INFINITY;
     };

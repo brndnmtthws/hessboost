@@ -11,6 +11,7 @@ use hessboost::ebm::shape_functions;
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
 use hessboost::objective::{LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 mod common;
@@ -183,7 +184,7 @@ fn bands_narrow_with_more_data_and_nystrom_on_every_row_is_exact() {
         let bands = exact.term_bands(1, 0.05).unwrap();
         if n == 200 {
             let nystrom = fit(KernelSolver::Nystrom {
-                landmarks: n,
+                landmarks: NonZeroUsize::new(n).unwrap(),
                 seed: 3,
             });
             let se = nystrom.term_bands(1, 0.05).unwrap().standard_errors;

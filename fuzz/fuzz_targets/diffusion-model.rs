@@ -7,7 +7,7 @@
 //! unchanged; `1` seals the rest as a section table in an uncompressed
 //! `HBDM` container with a valid checksum, so mutations reach the section
 //! decoder; anything else parses the rest as JSON.
-use hessboost::diffusion::DiffusionModel;
+use hessboost::diffusion::{DiffusionModel, SampleOptions};
 use hessboost::prelude::*;
 use libfuzzer_sys::fuzz_target;
 
@@ -55,9 +55,9 @@ fuzz_target!(|data: &[u8]| {
             .expect("probe matrix is valid");
         // Sampling may refuse a diverging sampler, but never panics, and a
         // successful draw has the documented shape and reloads identically.
-        if let Ok(samples) = model.sample(&probe, 2, 0) {
+        if let Ok(samples) = model.sample(&probe, 2, &SampleOptions::seeded(0)) {
             assert_eq!(samples.as_slice().len(), 2 * 2 * model.n_outputs());
-            assert_eq!(from_bytes.sample(&probe, 2, 0).ok(), Some(samples));
+            assert_eq!(from_bytes.sample(&probe, 2, &SampleOptions::seeded(0)).ok(), Some(samples));
         }
     }
 });

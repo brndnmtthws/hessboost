@@ -335,6 +335,7 @@
 
 mod categories;
 pub mod compact;
+pub(crate) mod container;
 mod lightgbm;
 pub(crate) mod native;
 mod objective;

@@ -11,8 +11,10 @@
 
 use hessboost::config::{BoosterKind, Dart, LinearTree, MultiStrategy};
 use hessboost::data::FeatureType;
-use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams};
-use hessboost::diffusion::{DiffusionModel, DiffusionParams, Method, ScoreConfig, Sde};
+use hessboost::diffusion::forest::{ColumnKind, ForestModel, ForestParams, NoiseLevels};
+use hessboost::diffusion::{
+    DiffusionModel, DiffusionParams, Method, SampleOptions, ScoreConfig, Sde,
+};
 use hessboost::model::compact::CompactModel;
 use hessboost::objective::distributional::{
     DistFamily, DistGradient, DistSplitDirection, Distributional,
@@ -760,7 +762,12 @@ fn saved_models_keep_loading_with_their_margins() {
                 assert_eq!(model.method(), case.method(), "{name} ({format})");
                 let margins = regressor_margins(&model);
                 assert!(margins == expected, "{}: {name} ({format})", dir.display());
-                assert!(model.sample(&matrix(1), 2, 0).is_ok(), "{name} ({format})");
+                assert!(
+                    model
+                        .sample(&matrix(1), 2, &SampleOptions::seeded(0))
+                        .is_ok(),
+                    "{name} ({format})"
+                );
             }
         }
         // Forest models likewise, from the release that introduced them.
@@ -777,7 +784,7 @@ fn saved_models_keep_loading_with_their_margins() {
                 assert_eq!(model.classes(), case.classes(), "{name} ({format})");
                 let margins = forest_margins(&model);
                 assert!(margins == expected, "{}: {name} ({format})", dir.display());
-                assert!(model.generate(2, 0).is_ok(), "{name} ({format})");
+                assert!(model.sample(2, 0).is_ok(), "{name} ({format})");
             }
         }
     }
@@ -952,7 +959,7 @@ fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
 /// (one GBDT per level and column).
 fn forest_models() -> Vec<(&'static str, ForestModel)> {
     let tiny = |mut params: ForestParams, kinds: Option<Vec<ColumnKind>>| {
-        params.n_t = 3;
+        params.n_t = NoiseLevels::new(3).unwrap();
         params.duplicate_k = std::num::NonZeroUsize::new(2).unwrap();
         params.num_boost_round = std::num::NonZeroUsize::new(3).unwrap();
         params.training.nthread = std::num::NonZeroUsize::new(1);
@@ -976,7 +983,7 @@ fn forest_models() -> Vec<(&'static str, ForestModel)> {
     )
     .unwrap();
     let diffusion = ForestModel::fit(
-        &tiny(ForestParams::diffusion(), None),
+        &tiny(ForestParams::forest_diffusion(), None),
         &DMatrix::from_dense(&with_missing, n, COLS)
             .unwrap()
             .with_labels(&classes)

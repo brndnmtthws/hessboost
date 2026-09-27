@@ -1,7 +1,8 @@
 //! Special functions for the distributional objectives, in `f64`: log-gamma,
 //! digamma/trigamma (with cancellation-free large-argument forms),
 //! regularized incomplete gamma and beta functions, and the standard normal
-//! CDF and quantile.
+//! CDF and quantile. Also [`erf_glibc`], glibc's `erf`, which the AFT
+//! objective's normal CDF uses to match XGBoost on Linux.
 //!
 //! Accuracy targets are close to double precision for moderate arguments:
 //! the Stirling/asymptotic series are used from `x >= 10` (truncation error
@@ -605,6 +606,180 @@ pub(crate) fn norm_ppf(p: f64) -> f64 {
     x - u / (1.0 + 0.5 * x * u)
 }
 
+// `erf` below is ported from glibc 2.41's sysdeps/ieee754/dbl-64/s_erf.c,
+// whose notice follows verbatim:
+//
+// /* @(#)s_erf.c 5.1 93/09/24 */
+// /*
+//  * ====================================================
+//  * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+//  *
+//  * Developed at SunPro, a Sun Microsystems, Inc. business.
+//  * Permission to use, copy, modify, and distribute this
+//  * software is freely granted, provided that this notice
+//  * is preserved.
+//  * ====================================================
+//  */
+// /* Modified by Naohiko Shimizu/Tokai University, Japan 1997/08/25,
+//    for performance improvement on pipelined processors.
+// */
+/// The error function, ported from glibc's `s_erf.c` (Sun fdlibm with
+/// glibc's polynomial evaluation order), the `erf` XGBoost's normal CDF
+/// calls on Linux. Each `a + b * c` is a fused multiply-add, as GCC
+/// contracts it: bit-identical to glibc 2.41 on aarch64, within 1 ulp of
+/// the unfused evaluation elsewhere.
+#[allow(
+    clippy::excessive_precision,
+    reason = "fdlibm's published coefficients"
+)]
+pub(crate) fn erf_glibc(x: f64) -> f64 {
+    const ERX: f64 = 8.450_629_115_104_675_292_97e-01;
+    const EFX: f64 = 1.283_791_670_955_125_852_83e-01;
+    const PP0: f64 = 1.283_791_670_955_125_585_61e-01;
+    const PP1: f64 = -3.250_421_072_470_014_993_70e-01;
+    const PP2: f64 = -2.848_174_957_559_851_047_66e-02;
+    const PP3: f64 = -5.770_270_296_489_441_591_57e-03;
+    const PP4: f64 = -2.376_301_665_665_016_260_84e-05;
+    const QQ1: f64 = 3.979_172_239_591_553_528_19e-01;
+    const QQ2: f64 = 6.502_224_998_876_729_444_85e-02;
+    const QQ3: f64 = 5.081_306_281_875_765_627_76e-03;
+    const QQ4: f64 = 1.324_947_380_043_216_445_26e-04;
+    const QQ5: f64 = -3.960_228_278_775_368_123_20e-06;
+    const PA0: f64 = -2.362_118_560_752_659_440_77e-03;
+    const PA1: f64 = 4.148_561_186_837_483_316_66e-01;
+    const PA2: f64 = -3.722_078_760_357_013_238_47e-01;
+    const PA3: f64 = 3.183_466_199_011_617_536_74e-01;
+    const PA4: f64 = -1.108_946_942_823_966_774_76e-01;
+    const PA5: f64 = 3.547_830_432_561_823_593_71e-02;
+    const PA6: f64 = -2.166_375_594_868_790_843_00e-03;
+    const QA1: f64 = 1.064_208_804_008_442_282_86e-01;
+    const QA2: f64 = 5.403_979_177_021_710_489_37e-01;
+    const QA3: f64 = 7.182_865_441_419_626_628_68e-02;
+    const QA4: f64 = 1.261_712_198_087_616_421_12e-01;
+    const QA5: f64 = 1.363_708_391_202_905_073_62e-02;
+    const QA6: f64 = 1.198_449_984_679_910_741_70e-02;
+    const RA0: f64 = -9.864_944_034_847_148_227_05e-03;
+    const RA1: f64 = -6.938_585_727_071_817_643_72e-01;
+    const RA2: f64 = -1.055_862_622_532_329_098_14e+01;
+    const RA3: f64 = -6.237_533_245_032_600_603_96e+01;
+    const RA4: f64 = -1.623_966_694_625_734_703_55e+02;
+    const RA5: f64 = -1.846_050_929_067_110_359_94e+02;
+    const RA6: f64 = -8.128_743_550_630_659_342_46e+01;
+    const RA7: f64 = -9.814_329_344_169_145_485_92e+00;
+    const SA1: f64 = 1.965_127_166_743_925_712_92e+01;
+    const SA2: f64 = 1.376_577_541_435_190_426_00e+02;
+    const SA3: f64 = 4.345_658_774_752_292_288_21e+02;
+    const SA4: f64 = 6.453_872_717_332_678_803_36e+02;
+    const SA5: f64 = 4.290_081_400_275_678_333_86e+02;
+    const SA6: f64 = 1.086_350_055_417_794_351_34e+02;
+    const SA7: f64 = 6.570_249_770_319_281_701_35e+00;
+    const SA8: f64 = -6.042_441_521_485_809_874_38e-02;
+    const RB0: f64 = -9.864_942_924_700_099_285_97e-03;
+    const RB1: f64 = -7.992_832_376_805_230_065_74e-01;
+    const RB2: f64 = -1.775_795_491_775_475_198_89e+01;
+    const RB3: f64 = -1.606_363_848_558_219_160_62e+02;
+    const RB4: f64 = -6.375_664_433_683_896_277_22e+02;
+    const RB5: f64 = -1.025_095_131_611_077_249_54e+03;
+    const RB6: f64 = -4.835_191_916_086_513_970_19e+02;
+    const SB1: f64 = 3.033_806_074_348_245_829_24e+01;
+    const SB2: f64 = 3.257_925_129_965_739_188_26e+02;
+    const SB3: f64 = 1.536_729_586_084_436_959_94e+03;
+    const SB4: f64 = 3.199_858_219_508_595_539_08e+03;
+    const SB5: f64 = 2.553_050_406_433_164_425_83e+03;
+    const SB6: f64 = 4.745_285_412_069_553_672_15e+02;
+    const SB7: f64 = -2.244_095_244_658_581_833_62e+01;
+    const TINY: f64 = 1e-300;
+
+    let hx = (x.to_bits() >> 32) as u32;
+    let negative = hx >> 31 != 0;
+    let ix = hx & 0x7fff_ffff;
+    if ix >= 0x7ff0_0000 {
+        // erf(nan) = nan, erf(+-inf) = +-1.
+        return if negative { -1.0 } else { 1.0 } + 1.0 / x;
+    }
+    if ix < 0x3feb_0000 {
+        // |x| < 0.84375
+        if ix < 0x3e30_0000 {
+            // |x| < 2^-28
+            if ix < 0x0080_0000 {
+                return 0.0625 * (16.0 * x + (16.0 * EFX) * x);
+            }
+            return EFX.mul_add(x, x);
+        }
+        let z = x * x;
+        let r1 = z.mul_add(PP1, PP0);
+        let z2 = z * z;
+        let r2 = z.mul_add(PP3, PP2);
+        let z4 = z2 * z2;
+        let s1 = z.mul_add(QQ1, 1.0);
+        let s2 = z.mul_add(QQ3, QQ2);
+        let s3 = z.mul_add(QQ5, QQ4);
+        let r = z4.mul_add(PP4, z2.mul_add(r2, r1));
+        let s = z4.mul_add(s3, z2.mul_add(s2, s1));
+        return x.mul_add(r / s, x);
+    }
+    if ix < 0x3ff4_0000 {
+        // 0.84375 <= |x| < 1.25
+        let s = x.abs() - 1.0;
+        let p1 = s.mul_add(PA1, PA0);
+        let s2 = s * s;
+        let q1 = s.mul_add(QA1, 1.0);
+        let s4 = s2 * s2;
+        let p2 = s.mul_add(PA3, PA2);
+        let s6 = s4 * s2;
+        let q2 = s.mul_add(QA3, QA2);
+        let p3 = s.mul_add(PA5, PA4);
+        let q3 = s.mul_add(QA5, QA4);
+        let p = s6.mul_add(PA6, s4.mul_add(p3, s2.mul_add(p2, p1)));
+        let q = s6.mul_add(QA6, s4.mul_add(q3, s2.mul_add(q2, q1)));
+        return if negative { -ERX - p / q } else { ERX + p / q };
+    }
+    if ix >= 0x4018_0000 {
+        // |x| >= 6
+        return if negative { TINY - 1.0 } else { 1.0 - TINY };
+    }
+    let ax = x.abs();
+    let s = 1.0 / (ax * ax);
+    let (r, big_s) = if ix < 0x4006_db6e {
+        // |x| < 1/0.35
+        let r1 = s.mul_add(RA1, RA0);
+        let s2 = s * s;
+        let t1 = s.mul_add(SA1, 1.0);
+        let s4 = s2 * s2;
+        let r2 = s.mul_add(RA3, RA2);
+        let s6 = s4 * s2;
+        let t2 = s.mul_add(SA3, SA2);
+        let s8 = s4 * s4;
+        let r3 = s.mul_add(RA5, RA4);
+        let t3 = s.mul_add(SA5, SA4);
+        let r4 = s.mul_add(RA7, RA6);
+        let t4 = s.mul_add(SA7, SA6);
+        (
+            s6.mul_add(r4, s4.mul_add(r3, s2.mul_add(r2, r1))),
+            s8.mul_add(SA8, s6.mul_add(t4, s4.mul_add(t3, s2.mul_add(t2, t1)))),
+        )
+    } else {
+        // |x| >= 1/0.35
+        let r1 = s.mul_add(RB1, RB0);
+        let s2 = s * s;
+        let t1 = s.mul_add(SB1, 1.0);
+        let s4 = s2 * s2;
+        let r2 = s.mul_add(RB3, RB2);
+        let s6 = s4 * s2;
+        let t2 = s.mul_add(SB3, SB2);
+        let r3 = s.mul_add(RB5, RB4);
+        let t3 = s.mul_add(SB5, SB4);
+        let t4 = s.mul_add(SB7, SB6);
+        (
+            s6.mul_add(RB6, s4.mul_add(r3, s2.mul_add(r2, r1))),
+            s6.mul_add(t4, s4.mul_add(t3, s2.mul_add(t2, t1))),
+        )
+    };
+    let z = f64::from_bits(ax.to_bits() & 0xffff_ffff_0000_0000);
+    let r = (-z).mul_add(z, -0.5625).exp() * (z - ax).mul_add(z + ax, r / big_s).exp();
+    if negative { r / ax - 1.0 } else { 1.0 - r / ax }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,5 +977,24 @@ mod tests {
         }
         assert_eq!(ln_norm_cdf(f64::NEG_INFINITY), f64::NEG_INFINITY);
         assert_eq!(ln_norm_cdf(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn erf_glibc_matches_reference_values() {
+        // Values of erf from the defining integral (Abramowitz & Stegun 7.1),
+        // one per branch of the rational approximation.
+        for (x, want) in [
+            (1e-10, 1.128_379_167_095_512_6e-10),
+            (0.5, 0.520_499_877_813_046_5),
+            (1.0, 0.842_700_792_949_714_9),
+            (2.0, 0.995_322_265_018_952_7),
+            (3.5, 0.999_999_256_901_627_7),
+            (7.0, 1.0),
+        ] {
+            approx::assert_relative_eq!(erf_glibc(x), want, max_relative = 2e-16);
+            approx::assert_relative_eq!(erf_glibc(-x), -want, max_relative = 2e-16);
+        }
+        assert_eq!(erf_glibc(f64::INFINITY), 1.0);
+        assert!(erf_glibc(f64::NAN).is_nan());
     }
 }

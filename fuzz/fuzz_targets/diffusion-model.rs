@@ -46,8 +46,9 @@ fuzz_target!(|data: &[u8]| {
         DiffusionModel::from_json,
         |model, from_bytes| assert_eq!(from_bytes.method(), model.method()),
     );
-    let from_bytes = DiffusionModel::from_bytes(&model.to_bytes().expect("an accepted model saves"))
-        .expect("a saved model loads");
+    let from_bytes =
+        DiffusionModel::from_bytes(&model.to_bytes().expect("an accepted model saves"))
+            .expect("a saved model loads");
     if model.n_steps().get() <= MAX_STEPS
         && model.n_features() <= MAX_FEATURES
         && model.n_outputs() <= MAX_FEATURES
@@ -59,7 +60,10 @@ fuzz_target!(|data: &[u8]| {
         // successful draw has the documented shape and reloads identically.
         if let Ok(samples) = model.sample(&probe, 2, &SampleOptions::seeded(0)) {
             assert_eq!(samples.as_slice().len(), 2 * 2 * model.n_outputs());
-            assert_eq!(from_bytes.sample(&probe, 2, &SampleOptions::seeded(0)).ok(), Some(samples));
+            assert_eq!(
+                from_bytes.sample(&probe, 2, &SampleOptions::seeded(0)).ok(),
+                Some(samples)
+            );
         }
     }
 });

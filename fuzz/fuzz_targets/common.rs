@@ -91,10 +91,18 @@ pub fn exercise_compact(model: &CompactModel) {
         return;
     }
     let probe = probe_matrix(n_features);
-    let margin = model.predict_margin(&probe).expect("probe matrix matches the model");
+    let margin = model
+        .predict_margin(&probe)
+        .expect("probe matrix matches the model");
     assert_eq!((margin.n_rows(), margin.width()), (probe.n_rows(), k));
-    let preds = model.predict(&probe).expect("probe matrix matches the model");
-    let expected = if model.objective().name() == "multi:softmax" { 1 } else { k };
+    let preds = model
+        .predict(&probe)
+        .expect("probe matrix matches the model");
+    let expected = if model.objective().name() == "multi:softmax" {
+        1
+    } else {
+        k
+    };
     assert_eq!((preds.n_rows(), preds.width()), (probe.n_rows(), expected));
 }
 /// Widest model `exercise` predicts with: a fuzzed header can claim any

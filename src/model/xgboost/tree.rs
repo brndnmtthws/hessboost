@@ -1,6 +1,9 @@
 //! XGBoost trees: node columns, categorical segments, vector leaves.
 
-use super::parse::{Scalars, scalar_f64, strict_nonnegative_integer_array};
+use super::parse::{
+    column_len, float_column, integer_column, optional_float_column, scalar_f64,
+    strict_nonnegative_integer_array,
+};
 use crate::error::{HessboostError, Result};
 use crate::model::categories::{CategoryPool, PoolError};
 use crate::tree::{Node, RegTree};
@@ -142,7 +145,7 @@ pub(super) fn tree_to_json(id: usize, tree: &RegTree, num_feature: usize) -> Val
 pub(super) fn vector_leaves(tj: &Value, left: &[i32], right: &[i32], k: usize) -> Result<Vec<f32>> {
     // Converted once: leaves may share a slot, so a lazy per-leaf read would
     // re-parse string entries once per referencing leaf.
-    let leaf_weights = Scalars::required(tj, "leaf_weights")?.to_f32s();
+    let leaf_weights = float_column(tj, "leaf_weights", None)?;
     let n_leaves = left.iter().filter(|&&l| l == -1).count();
     if n_leaves.checked_mul(2) != left.len().checked_add(1) {
         return Err(HessboostError::model_format(format!(
@@ -269,17 +272,55 @@ impl TreeCategories {
     }
 }
 
-/// A tree's per-node arrays, as [`decode_nodes`] reads them.
+/// A tree's per-node arrays, as [`decode_nodes`] reads them, each of the
+/// tree's node count.
 pub(super) struct NodeColumns<'a> {
     left: &'a [i32],
     right: &'a [i32],
+    /// Empty when the tree has no `split_type`.
     split_type: &'a [u64],
-    split_indices: Scalars<'a>,
-    split_conditions: Scalars<'a>,
-    default_left: Scalars<'a>,
-    base_weights: Scalars<'a>,
-    sum_hessian: Scalars<'a>,
-    loss_changes: Scalars<'a>,
+    split_indices: Vec<u32>,
+    split_conditions: Vec<f32>,
+    default_left: Vec<u8>,
+    /// Zeros when absent.
+    sum_hessian: Vec<f32>,
+    /// Zeros when absent.
+    loss_changes: Vec<f32>,
+}
+
+impl<'a> NodeColumns<'a> {
+    /// Read the columns of a tree of `left.len()` nodes. XGBoost 3.4.2
+    /// writes every per-node array; the statistics XGBoost does not predict
+    /// with (`base_weights`, `sum_hessian`, `loss_changes`) may be absent,
+    /// but a present one must be whole and numeric. `base_weights` (`k`
+    /// values per node in a vector-leaf tree of width `k`) is checked and
+    /// dropped: leaves carry their values in `split_conditions`.
+    fn read(
+        tj: &Value,
+        left: &'a [i32],
+        right: &'a [i32],
+        split_type: &'a [u64],
+        k: usize,
+    ) -> Result<Self> {
+        let n = left.len();
+        let statistic = |key| {
+            optional_float_column(tj, key, n).map(|column| column.unwrap_or_else(|| vec![0.0; n]))
+        };
+        let weights = n
+            .checked_mul(k.max(1))
+            .ok_or_else(|| HessboostError::model_format("`base_weights` length overflows"))?;
+        optional_float_column(tj, "base_weights", weights)?;
+        Ok(NodeColumns {
+            left,
+            right,
+            split_type,
+            split_indices: integer_column(tj, "split_indices", n, 0..=i64::from(u32::MAX))?,
+            split_conditions: float_column(tj, "split_conditions", Some(n))?,
+            default_left: integer_column(tj, "default_left", n, 0..=1)?,
+            sum_hessian: statistic("sum_hessian")?,
+            loss_changes: statistic("loss_changes")?,
+        })
+    }
 }
 
 /// `size_leaf_vector`: 0 or 1 for scalar trees and the model's output count
@@ -315,18 +356,13 @@ pub(super) fn decode_nodes(
     let n = left.len();
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
-        let sum_hess = cols.sum_hessian.at(i) as f32;
+        let sum_hess = cols.sum_hessian[i];
         if left[i] == -1 && size_leaf_vector > 1 {
             // Vector leaf: the weights live in `leaf_vectors`.
             nodes.push(Node::leaf(0.0, sum_hess));
         } else if left[i] == -1 {
-            // Leaf: prefer split_conditions, fall back to base_weights.
-            let leaf_value = cols
-                .split_conditions
-                .get(i)
-                .or_else(|| cols.base_weights.get(i))
-                .unwrap_or(0.0) as f32;
-            nodes.push(Node::leaf(leaf_value, sum_hess));
+            // XGBoost carries a leaf's weight in `split_conditions`.
+            nodes.push(Node::leaf(cols.split_conditions[i], sum_hess));
         } else {
             if left[i] < 0 || right[i] < 0 || left[i] as usize >= n || right[i] as usize >= n {
                 return Err(HessboostError::model_format(format!(
@@ -339,20 +375,18 @@ pub(super) fn decode_nodes(
                     "categorical node {i} has no category segment"
                 )));
             }
-            let default_left = cols.default_left.at(i);
+            let default_left = cols.default_left[i] == 1;
             nodes.push(Node {
-                split_feature: cols.split_indices.at(i) as u32,
-                split_cond: cols.split_conditions.at(i) as f32,
-                default_left: if is_categorical {
-                    default_left == 0.0
-                } else {
-                    default_left != 0.0
-                },
+                split_feature: cols.split_indices[i],
+                split_cond: cols.split_conditions[i],
+                // XGBoost sends missing values of a categorical split
+                // the other way round (its children are swapped).
+                default_left: default_left != is_categorical,
                 left: if is_categorical { right[i] } else { left[i] },
                 right: if is_categorical { left[i] } else { right[i] },
                 leaf_value: 0.0,
                 sum_hess,
-                split_gain: cols.loss_changes.at(i) as f32,
+                split_gain: cols.loss_changes[i],
                 is_categorical,
                 cat_begin: 0,
                 cat_end: 0,
@@ -365,18 +399,13 @@ pub(super) fn decode_nodes(
 /// Decode one XGBoost tree object into a [`RegTree`] of a model with
 /// `n_outputs` outputs.
 pub(super) fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
-    let left = Scalars::required(tj, "left_children")?.to_i32s();
-    let n = left.len();
+    let child = -1..=i64::from(i32::MAX);
+    let n = column_len(tj, "left_children")?;
     if n == 0 {
         return Err(HessboostError::model_format("tree contains no nodes"));
     }
-
-    let right = Scalars::required(tj, "right_children")?.to_i32s();
-    if right.len() != n {
-        return Err(HessboostError::model_format(
-            "child arrays have different lengths",
-        ));
-    }
+    let left = integer_column(tj, "left_children", n, child.clone())?;
+    let right = integer_column(tj, "right_children", n, child)?;
 
     let split_type = strict_nonnegative_integer_array(tj, "split_type")?;
     if !split_type.is_empty() && split_type.len() != n {
@@ -385,18 +414,8 @@ pub(super) fn tree_from_json(tj: &Value, n_outputs: usize) -> Result<RegTree> {
         ));
     }
     let categories = TreeCategories::read(tj, n)?;
-    let cols = NodeColumns {
-        left: &left,
-        right: &right,
-        split_type: &split_type,
-        split_indices: Scalars::optional(tj, "split_indices"),
-        split_conditions: Scalars::required(tj, "split_conditions")?,
-        default_left: Scalars::optional(tj, "default_left"),
-        base_weights: Scalars::optional(tj, "base_weights"),
-        sum_hessian: Scalars::optional(tj, "sum_hessian"),
-        loss_changes: Scalars::optional(tj, "loss_changes"),
-    };
     let size_leaf_vector = leaf_vector_width(tj, n_outputs)?;
+    let cols = NodeColumns::read(tj, &left, &right, &split_type, size_leaf_vector)?;
     let mut nodes = decode_nodes(&cols, &categories, size_leaf_vector)?;
     let leaf_vectors = if size_leaf_vector > 1 {
         vector_leaves(tj, &left, &right, size_leaf_vector)?

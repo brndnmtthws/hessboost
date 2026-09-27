@@ -203,6 +203,64 @@ fn booster_model(doc: &mut Value) -> &mut Value {
 }
 
 #[test]
+fn malformed_node_arrays_are_refused() {
+    let with = |key: &str, value: Option<Value>| {
+        let mut doc = hand_stump();
+        let tree = booster_model(&mut doc)["trees"][0].as_object_mut().unwrap();
+        match value {
+            Some(value) => tree.insert(key.to_owned(), value),
+            None => tree.remove(key),
+        };
+        doc
+    };
+    // XGBoost 3.4.2 writes every per-node array at the node count; none is
+    // defaulted, truncated, or coerced.
+    for key in [
+        "left_children",
+        "right_children",
+        "split_indices",
+        "split_conditions",
+        "default_left",
+    ] {
+        assert_format_error(import_doc(&with(key, None)), format!("missing {key}"));
+        assert_format_error(import_doc(&with(key, Some(json!(1)))), key);
+    }
+    let refused = [
+        ("left_children", json!([1.7, -1, -1])),
+        ("left_children", json!([1, "x", -1])),
+        ("left_children", json!([1, -1])),
+        ("right_children", json!([2, -1, -1, -1])),
+        ("right_children", json!([2_147_483_648_i64, -1, -1])),
+        ("left_children", json!([1, -2, -1])),
+        ("split_indices", json!([-1, 0, 0])),
+        ("split_indices", json!([0.5, 0, 0])),
+        ("split_indices", json!([4_294_967_296_i64, 0, 0])),
+        ("split_conditions", json!([1.5, null, -10.0])),
+        ("split_conditions", json!([1.5, 10.0])),
+        ("default_left", json!([1, 0])),
+        ("default_left", json!([2, 0, 0])),
+        ("base_weights", json!([0.0, 10.0])),
+        ("base_weights", json!([0.0, [10.0], -10.0])),
+        ("sum_hessian", json!([8.0, 5.0])),
+        ("loss_changes", json!([42.0, "gain", 0.0])),
+    ];
+    for (key, value) in refused {
+        let what = format!("{key}: {value}");
+        assert_format_error(import_doc(&with(key, Some(value))), what);
+    }
+    // Statistics XGBoost does not predict with may be absent, and integral
+    // entries may be spelled as floats, strings, or booleans.
+    let d = DMatrix::from_dense(&[1.0, 2.0, f32::NAN], 3, 1).unwrap();
+    let margins = |doc: Value| import_doc(&doc).unwrap().predict_margin(&d).unwrap();
+    let expected = margins(hand_stump());
+    for key in ["base_weights", "sum_hessian", "loss_changes"] {
+        assert_eq!(margins(with(key, None)), expected, "{key}");
+    }
+    let spelled = with("default_left", Some(json!([true, 0.0, "0"])));
+    assert_eq!(margins(spelled), expected);
+}
+
+#[test]
 fn import_hand_written_stump_routes_correctly() {
     let model = import_doc(&hand_stump()).unwrap();
     assert_eq!(model.num_trees(), 1);
@@ -266,7 +324,7 @@ fn vector_stump(width: &str, leaf_weights: &[f32]) -> Value {
         "tree_param": {"num_nodes": "1", "num_feature": "1", "size_leaf_vector": width},
         "left_children": [-1], "right_children": [0], "parents": [-1],
         "split_indices": [0], "split_conditions": [0.0], "default_left": [0],
-        "base_weights": [], "leaf_weights": leaf_weights,
+        "leaf_weights": leaf_weights,
         "loss_changes": [0.0], "sum_hessian": [1.0], "split_type": [0]
     }]);
     booster_model(&mut doc)
@@ -309,7 +367,9 @@ fn vector_leaf_storage_is_bounded_by_the_leaf_weights() {
                            "size_leaf_vector": K.to_string()},
             "left_children": left,
             "right_children": right,
+            "split_indices": vec![0; N],
             "split_conditions": vec![0.0f32; N],
+            "default_left": vec![0; N],
             "leaf_weights": leaf_weights,
         })
     };

@@ -187,7 +187,10 @@
 //! direction, matching the exact semantics of [`RegTree`].
 //! Categorical internal nodes (`split_type[i] == 1`) carry their category set
 //! in the tree's `categories` / `categories_nodes` / `categories_segments` /
-//! `categories_sizes` arrays.
+//! `categories_sizes` arrays. Import requires the first five arrays with an
+//! entry per node (integers where XGBoost writes integers); `base_weights`,
+//! `sum_hessian` and `loss_changes` may be absent, but not partial. A
+//! malformed array is refused rather than defaulted.
 //!
 //! ## Scope and caveats
 //!

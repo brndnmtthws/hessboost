@@ -200,14 +200,14 @@ impl Decomposition {
             | Objective::BinaryLogitRaw(_)
             | Objective::RegLogistic(_) => Decomposition::Binary,
             Objective::Softmax(_) | Objective::Softprob(_) => Decomposition::Multiclass,
-            Objective::SquaredError
+            Objective::SquaredError(_)
             | Objective::SquaredLogError
             | Objective::PseudoHuber(_)
             | Objective::AbsoluteError
             | Objective::Quantile(_)
             | Objective::Expectile(_)
             | Objective::Poisson
-            | Objective::Gamma
+            | Objective::Gamma(_)
             | Objective::Tweedie(_)
             | Objective::Cox
             | Objective::Aft(_) => Decomposition::Regression,

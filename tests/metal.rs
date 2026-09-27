@@ -11,7 +11,7 @@ use hessboost::backend::metal;
 use hessboost::config::{
     BoosterKind, Dart, Device, LinearTree, ProcessType, QuantizedGrad, Refresh,
 };
-use hessboost::objective::{GradPair, Logistic, Multiclass};
+use hessboost::objective::{GradPair, Multiclass, RegLoss};
 use hessboost::prelude::*;
 
 /// Whether a Metal device is present, with the skip reason printed so a
@@ -92,7 +92,7 @@ fn device_metal_training_matches_single_threaded_cpu() {
     for posterior_sampling in [false, true] {
         let build = |device| {
             TrainingParams::builder()
-                .objective(Objective::SquaredError)
+                .objective(Objective::SquaredError(RegLoss::default()))
                 .tree_method(TreeMethod::Hist)
                 .max_depth(6)
                 .eta(0.3)
@@ -122,7 +122,7 @@ fn device_metal_training_is_deterministic() {
     }
     let data = dataset(20_000, 9);
     let params = TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .tree_method(TreeMethod::Hist)
         .max_depth(6)
         .eta(0.3)
@@ -188,8 +188,8 @@ fn to_gpu_predicts_bit_identically() {
         return;
     }
     let cases = [
-        Objective::SquaredError,
-        Objective::BinaryLogistic(Logistic::default()),
+        Objective::SquaredError(RegLoss::default()),
+        Objective::BinaryLogistic(RegLoss::default()),
         Objective::Softmax(Multiclass::new(4).unwrap()),
     ];
     for spec in cases {
@@ -362,7 +362,7 @@ fn wide_dynamic_range_training_matches_single_threaded_cpu() {
         .unwrap();
     let build = |device| {
         TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Hist)
             .base_score(0.0)
             .max_depth(2)

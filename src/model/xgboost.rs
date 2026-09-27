@@ -282,8 +282,8 @@ fn model_from_value(root: &Value) -> Result<BoostedModel> {
 
     // Parameter blocks come from the file: the objective's own parameters
     // are checked as its constructors check them; parameters it does not
-    // read (e.g. `reg_loss_param.scale_pos_weight` of `reg:squarederror`,
-    // which hessboost does not apply) are dropped.
+    // read (e.g. `tweedie_regression_param` of `reg:squarederror`) are
+    // dropped.
     let stored = objective_params_from_json(&objective, objective_json)?;
     let max_delta_step = stored.max_delta_step;
     let objective = ModelObjective::from_stored(&objective, &stored, num_class)?;
@@ -931,9 +931,9 @@ fn parse_param_array(text: &str) -> Option<Vec<f64>> {
 /// the file. The objective's parameters (and Poisson's `max_delta_step`) are
 /// written as XGBoost's stringified numbers; LambdaRank parameters hessboost
 /// does not have are written at XGBoost's defaults, and the alpha lists as
-/// XGBoost's array strings. `reg:squarederror` and `reg:gamma` write
-/// XGBoost's `scale_pos_weight` at its default `1`, which is what they
-/// train with here. Objectives without parameters (`reg:squaredlogerror`,
+/// XGBoost's array strings. Every `RegLossObj` objective (`reg:squarederror`,
+/// `reg:gamma`, and the logistic ones) writes its `scale_pos_weight` in
+/// `reg_loss_param`. Objectives without parameters (`reg:squaredlogerror`,
 /// `binary:hinge`, `reg:absoluteerror`, `survival:cox`) write their name
 /// only.
 fn objective_to_json(objective: &Objective, max_delta_step: f64) -> Value {
@@ -978,10 +978,11 @@ fn objective_to_json(objective: &Objective, max_delta_step: f64) -> Value {
         Objective::RankPairwise(r) | Objective::RankNdcg(r) | Objective::RankMap(r) => {
             (LAMBDARANK_NUM_PAIR, r.num_pair_per_sample().to_string())
         }
-        Objective::RegLogistic(l) | Objective::BinaryLogistic(l) | Objective::BinaryLogitRaw(l) => {
-            (SCALE_POS_WEIGHT, l.scale_pos_weight().to_string())
-        }
-        Objective::SquaredError | Objective::Gamma => (SCALE_POS_WEIGHT, 1.0f64.to_string()),
+        Objective::SquaredError(r)
+        | Objective::RegLogistic(r)
+        | Objective::BinaryLogistic(r)
+        | Objective::BinaryLogitRaw(r)
+        | Objective::Gamma(r) => (SCALE_POS_WEIGHT, r.scale_pos_weight().to_string()),
     };
     let mut fields = Map::new();
     if block == LAMBDARANK_NUM_PAIR.0 {
@@ -1350,7 +1351,7 @@ mod tests {
     use super::*;
     use crate::config::{BoosterKind, Dart, MaxDeltaStep, TrainingParams};
     use crate::data::{DMatrix, FeatureType};
-    use crate::objective::{Aft, LambdaRank, Logistic, PseudoHuber, Tweedie};
+    use crate::objective::{Aft, LambdaRank, PseudoHuber, RegLoss, Tweedie};
     use crate::objective::{Objective, Quantiles};
     use crate::test_support::labeled_dense;
     use crate::training::train;
@@ -1369,7 +1370,7 @@ mod tests {
         }
         let d = labeled_dense(&x, n, 2, &y);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -1470,7 +1471,7 @@ mod tests {
         let y: Vec<f32> = x.iter().map(|&v| f32::from(v > 0.4)).collect();
         let d = labeled_dense(&x, n, 1, &y);
         let params = TrainingParams::builder()
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
             .max_depth(3)
             .eta(0.3)
             .build()
@@ -1837,26 +1838,32 @@ mod tests {
             r#"{"name": "reg:quantileerror", "quantile_loss_param": {"quantile_alpha": 0.5}}"#,
             r#"{"name": "reg:quantileerror", "quantile_loss_param": {"quantile_alpha": "[a]"}}"#,
             r#"{"name": "binary:logistic", "reg_loss_param": {"scale_pos_weight": "-1"}}"#,
+            r#"{"name": "reg:gamma", "reg_loss_param": {"scale_pos_weight": "-1"}}"#,
             r#"{"name": 7}"#,
             r#""reg:squarederror""#,
         ] {
             assert_format_error(import_xgboost_json(&with_objective(objective)), objective);
         }
-        // Parameters the objective does not read are dropped, whatever
-        // their (parseable) value: hessboost does not apply XGBoost's
-        // `scale_pos_weight` to `reg:squarederror` or `reg:gamma`.
+        // Every `RegLossObj` objective keeps its `scale_pos_weight`;
+        // parameters the objective does not read are dropped, whatever
+        // their (parseable) value.
+        let reweighted = RegLoss::new(3.0).unwrap();
         for (objective, expected) in [
             (
                 r#"{"name": "reg:squarederror", "reg_loss_param": {"scale_pos_weight": "3"}}"#,
-                Objective::SquaredError,
+                Objective::SquaredError(reweighted),
             ),
             (
-                r#"{"name": "reg:gamma", "reg_loss_param": {"scale_pos_weight": "-1"}}"#,
-                Objective::Gamma,
+                r#"{"name": "reg:gamma", "reg_loss_param": {"scale_pos_weight": "3"}}"#,
+                Objective::Gamma(reweighted),
             ),
             (
                 r#"{"name": "reg:squarederror", "tweedie_regression_param": {"tweedie_variance_power": "5"}}"#,
-                Objective::SquaredError,
+                Objective::SquaredError(RegLoss::default()),
+            ),
+            (
+                r#"{"name": "reg:squaredlogerror", "reg_loss_param": {"scale_pos_weight": "3"}}"#,
+                Objective::SquaredLogError,
             ),
         ] {
             let model = import_xgboost_json(&with_objective(objective)).unwrap();
@@ -1894,7 +1901,7 @@ mod tests {
             vec![0.0, 0.0],
             ModelSpec {
                 objective: ModelObjective::trained_with(&Objective::BinaryLogistic(
-                    Logistic::default(),
+                    RegLoss::default(),
                 )),
                 max_delta_step: 0.0,
                 num_class: 2,
@@ -2199,6 +2206,8 @@ mod tests {
         let counts: Vec<f32> = (0..n).map(|i| (i % 4) as f32).collect();
         let binary: Vec<f32> = x.iter().map(|&v| f32::from(v > 0.6)).collect();
         let d = labeled_dense(&x, n, 1, &counts);
+        let positive: Vec<f32> = counts.iter().map(|c| c + 1.0).collect();
+        let positive = labeled_dense(&x, n, 1, &positive);
         let binary = labeled_dense(&x, n, 1, &binary);
         let ranked = labeled_dense(&x, n, 1, &counts)
             .with_group_sizes(&[20, 20])
@@ -2209,7 +2218,7 @@ mod tests {
         let b = TrainingParams::builder;
         let ranker = || b().objective(Objective::RankNdcg(LambdaRank::new(5).unwrap()));
         // (configuration, data, block, key, exported text, retained value)
-        let cases: [(_, _, _, _, _, Retained); 5] = [
+        let cases: [(_, _, _, _, _, Retained); 7] = [
             (
                 b().objective(Objective::Tweedie(Tweedie::new(1.2).unwrap())),
                 &d,
@@ -2242,13 +2251,35 @@ mod tests {
                 },
             ),
             (
-                b().objective(Objective::BinaryLogistic(Logistic::new(3.0).unwrap())),
+                b().objective(Objective::BinaryLogistic(RegLoss::new(3.0).unwrap())),
                 &binary,
                 "reg_loss_param",
                 "scale_pos_weight",
                 "3",
                 |m| match m.objective().built_in() {
                     Some(Objective::BinaryLogistic(l)) => Some(l.scale_pos_weight()),
+                    _ => None,
+                },
+            ),
+            (
+                b().objective(Objective::SquaredError(RegLoss::new(0.5).unwrap())),
+                &d,
+                "reg_loss_param",
+                "scale_pos_weight",
+                "0.5",
+                |m| match m.objective().built_in() {
+                    Some(Objective::SquaredError(r)) => Some(r.scale_pos_weight()),
+                    _ => None,
+                },
+            ),
+            (
+                b().objective(Objective::Gamma(RegLoss::new(2.0).unwrap())),
+                &positive,
+                "reg_loss_param",
+                "scale_pos_weight",
+                "2",
+                |m| match m.objective().built_in() {
+                    Some(Objective::Gamma(r)) => Some(r.scale_pos_weight()),
                     _ => None,
                 },
             ),

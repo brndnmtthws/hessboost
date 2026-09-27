@@ -196,6 +196,8 @@ def test_invalid_configurations_are_refused() -> None:
         DiffusionParams(training={"max_dept": 3})
     with pytest.raises(HessboostError, match="squarederror"):
         DiffusionParams(training={"objective": "reg:absoluteerror"})
+    with pytest.raises(HessboostError, match="scale_pos_weight"):
+        DiffusionParams(training={"scale_pos_weight": 2.0})
     with pytest.raises(HessboostError, match="parameterization"):
         Score(parameterization="edm")  # ty: ignore[invalid-argument-type]
     with pytest.raises(HessboostError, match="solver"):

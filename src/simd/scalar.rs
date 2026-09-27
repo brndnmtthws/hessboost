@@ -47,14 +47,20 @@ pub(super) fn gamma_gradient(
     preds: &[f32],
     labels: &[f32],
     weights: Option<&[f32]>,
+    scale_pos_weight: f32,
     out: &mut [GradPair],
     range: std::ops::Range<usize>,
 ) {
-    // XGBoost `GammaDeviance`: `p = expf(x)`, `g = 1 - y / p`, `h = y / p`.
+    // XGBoost `GammaDeviance`: `p = expf(x)`, `g = 1 - y / p`, `h = y / p`,
+    // times `RegLossObj`'s weight (scaled for a label of exactly 1).
     for index in range {
-        let weight = weights.map_or(1.0, |values| values[index]);
+        let label = labels[index];
+        let mut weight = weights.map_or(1.0, |values| values[index]);
+        if label == 1.0 {
+            weight *= scale_pos_weight;
+        }
         let p = preds[index].exp();
-        let scaled = labels[index] / p;
+        let scaled = label / p;
         out[index] = GradPair::new((1.0 - scaled) * weight, scaled * weight);
     }
 }

@@ -9,7 +9,7 @@ use hessboost::data::FeatureType;
 use hessboost::ebm::TermAxis;
 use hessboost::ebm::shape_functions;
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
-use hessboost::objective::{LambdaRank, Logistic, Objective};
+use hessboost::objective::{LambdaRank, Objective, RegLoss};
 use hessboost::prelude::*;
 use std::ops::ControlFlow;
 
@@ -258,8 +258,8 @@ fn unsupported_combinations_are_refused() {
     // objective (it needs a `binary:*` one, which `ebm_boulevard` refuses).
     let balanced = BalancedBagging::new(1.0, 0.2).unwrap();
     for objective in [
-        Objective::SquaredError,
-        Objective::BinaryLogistic(Logistic::default()),
+        Objective::SquaredError(RegLoss::default()),
+        Objective::BinaryLogistic(RegLoss::default()),
     ] {
         let bagged = boulevard()
             .subsample(1.0)
@@ -379,7 +379,7 @@ fn classic_ebms_bag_rows_by_class() {
     let base = || {
         classic()
             .subsample(1.0)
-            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .objective(Objective::BinaryLogistic(RegLoss::default()))
     };
     let bagged = base()
         .balanced_bagging(BalancedBagging::new(1.0, 0.1).unwrap())

@@ -18,7 +18,7 @@ use hessboost::internals::{
 use hessboost::metric::{EvalMetric, Metric};
 use hessboost::objective::distributional::{DistFamily, Distributional};
 use hessboost::objective::{
-    Aft, CustomLoss, Expectiles, GradPair, LambdaRank, Logistic, Loss, Multiclass, Quantiles,
+    Aft, CustomLoss, Expectiles, GradPair, LambdaRank, Loss, Multiclass, Quantiles, RegLoss,
     Tweedie,
 };
 use hessboost::prelude::*;
@@ -306,8 +306,8 @@ fn bench_objective_gradients(c: &mut Criterion) {
             .loss(1)
             .unwrap()
     };
-    let logistic = loss(Objective::BinaryLogistic(Logistic::default()));
-    let gamma = loss(Objective::Gamma);
+    let logistic = loss(Objective::BinaryLogistic(RegLoss::default()));
+    let gamma = loss(Objective::Gamma(RegLoss::default()));
     let mut run = |name: &str, objective: &dyn Loss, y: &[f32], weights: Option<&[f32]>| {
         group.bench_function(name, |b| {
             b.iter(|| {
@@ -319,7 +319,7 @@ fn bench_objective_gradients(c: &mut Criterion) {
     run("logistic_unweighted_1m", logistic.as_ref(), &labels, None);
     run(
         "logistic_weighted_1m",
-        loss(Objective::BinaryLogistic(Logistic::new(1.5).unwrap())).as_ref(),
+        loss(Objective::BinaryLogistic(RegLoss::new(1.5).unwrap())).as_ref(),
         &labels,
         Some(&weights),
     );
@@ -375,8 +375,8 @@ fn bench_prediction_transforms(c: &mut Criterion) {
             .loss(1)
             .unwrap()
     };
-    let logistic = loss(Objective::BinaryLogistic(Logistic::default()));
-    let gamma = loss(Objective::Gamma);
+    let logistic = loss(Objective::BinaryLogistic(RegLoss::default()));
+    let gamma = loss(Objective::Gamma(RegLoss::default()));
     let source: Vec<f32> = wide_range(N);
     let mut values = source.clone();
     let mut group = c.benchmark_group("prediction_transform");
@@ -542,7 +542,7 @@ fn bench_binary_train(c: &mut Criterion) {
         labels.iter().map(|&label| f64::from(label)).sum::<f64>() / labels.len() as f64;
     let base_margin = (positive_rate / (1.0 - positive_rate)).ln() as f32;
     let params = TrainingParams::builder()
-        .objective(Objective::BinaryLogistic(Logistic::default()))
+        .objective(Objective::BinaryLogistic(RegLoss::default()))
         .tree_method(TreeMethod::Hist)
         .max_depth(6)
         .eta(0.1)
@@ -579,7 +579,7 @@ fn bench_train(c: &mut Criterion) {
         ("Hist_quantized", TreeMethod::Hist, 0.0, 256, true),
     ] {
         let mut builder = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(method)
             .max_depth(6)
             .eta(0.1)
@@ -710,7 +710,7 @@ fn bench_other_gradients(c: &mut Criterion) {
     );
     run(
         "squarederror_k3_1m_outputs",
-        objective(Objective::SquaredError, k).as_ref(),
+        objective(Objective::SquaredError(RegLoss::default()), k).as_ref(),
         &matrix,
         k,
     );
@@ -963,7 +963,7 @@ fn bench_train_variants(c: &mut Criterion) {
     group.sample_size(10);
     let base = || {
         TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Hist)
             .max_depth(6)
             .eta(0.1)
@@ -1240,7 +1240,7 @@ fn bench_metal(c: &mut Criterion) {
         group.sample_size(10);
         for (name, device) in [("cpu", Device::Cpu), ("metal", Device::Metal)] {
             let params = TrainingParams::builder()
-                .objective(Objective::SquaredError)
+                .objective(Objective::SquaredError(RegLoss::default()))
                 .tree_method(TreeMethod::Hist)
                 .max_depth(8)
                 .eta(0.1)
@@ -1257,7 +1257,7 @@ fn bench_metal(c: &mut Criterion) {
     {
         let model_data = make_data(100_000, 30);
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Hist)
             .max_depth(6)
             .eta(0.1)

@@ -396,7 +396,8 @@ Easy-to-miss requirements: multiclass needs `Multiclass::new(k)`; ranking needs
 losses randomized per round (XE-NDCG) take the round from
 `Loss::gradient_info_at`, so every training loop calls it;
 `Loss::split_gradient` serves vector-leaf trees only, not with
-monotone constraints. `booster = boulevard` is squared error only, refuses
+monotone constraints. `booster = boulevard` is squared error only (at
+`scale_pos_weight = 1`: `Objective::is_unweighted_squared_error`), refuses
 nonlinear-leaf options, label-dependent row sampling (gradient-based,
 class-balanced), weights, base margins, early stopping, continuation, and
 online updates, and needs `eta = 1` with `num_parallel_tree > 1` (BRAT-P); its

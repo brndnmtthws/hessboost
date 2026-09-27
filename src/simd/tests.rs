@@ -148,6 +148,12 @@ fn logistic_gradient_dispatch_is_close_to_scalar() {
 fn count_gradients_are_close_to_scalar() {
     let preds = sawtooth(4_103, 4_103, -5.0, 10.0 / 4_102.0);
     let labels = sawtooth(preds.len(), 101, 0.25, 0.02);
+    // Every third gamma label exactly 1, which `scale_pos_weight` reweights.
+    let gamma_labels: Vec<f32> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, &y)| if i % 3 == 0 { 1.0 } else { y })
+        .collect();
     let weights = sawtooth(preds.len(), 13, 0.5, 0.125);
 
     for weights in [None, Some(weights.as_slice())] {
@@ -159,8 +165,15 @@ fn count_gradients_are_close_to_scalar() {
         scalar::poisson_gradient(&preds, &labels, weights, 0.7, &mut expected, range.clone());
         assert_grad_pairs_close(&actual, &expected);
 
-        gamma_gradient(&preds, &labels, weights, &mut actual);
-        scalar::gamma_gradient(&preds, &labels, weights, &mut expected, range.clone());
+        gamma_gradient(&preds, &gamma_labels, weights, 1.5, &mut actual);
+        scalar::gamma_gradient(
+            &preds,
+            &gamma_labels,
+            weights,
+            1.5,
+            &mut expected,
+            range.clone(),
+        );
         assert_grad_pairs_close(&actual, &expected);
 
         tweedie_gradient(&preds, &labels, weights, 1.5, &mut actual);

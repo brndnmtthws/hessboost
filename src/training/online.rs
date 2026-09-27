@@ -719,7 +719,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
     )?;
     // Exhaustive, so a new objective has to be classified here.
     let per_row_newton = match &params.objective {
-        Objective::SquaredError
+        Objective::SquaredError(_)
         | Objective::SquaredLogError
         | Objective::PseudoHuber(_)
         | Objective::Expectile(_)
@@ -730,7 +730,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         | Objective::Softmax(_)
         | Objective::Softprob(_)
         | Objective::Poisson
-        | Objective::Gamma
+        | Objective::Gamma(_)
         | Objective::Tweedie(_)
         | Objective::Aft(_)
         | Objective::Dist(_) => true,

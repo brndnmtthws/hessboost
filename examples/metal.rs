@@ -66,7 +66,7 @@ fn metal_main() -> hessboost::error::Result<()> {
 
     let train_data = dataset(100_000, 7)?;
     let params = TrainingParams::builder()
-        .objective(Objective::SquaredError)
+        .objective(Objective::SquaredError(RegLoss::default()))
         .tree_method(TreeMethod::Hist)
         .max_depth(8)
         .eta(0.2)

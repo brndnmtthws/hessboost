@@ -2,7 +2,7 @@
 //! stopping. Run: `cargo run --release --example binary_classification`.
 
 use hessboost::metric::EvalMetric;
-use hessboost::objective::Logistic;
+use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
 
 mod common;
@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     let dvalid = DMatrix::from_dense(&x[split..], 400, f)?.with_labels(&y[1600..])?;
 
     let params = TrainingParams::builder()
-        .objective(Objective::BinaryLogistic(Logistic::default()))
+        .objective(Objective::BinaryLogistic(RegLoss::default()))
         .eval_metric(EvalMetric::LogLoss)
         .eval_metric(EvalMetric::Auc)
         .max_depth(4)

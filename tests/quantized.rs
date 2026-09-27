@@ -7,7 +7,7 @@ use hessboost::config::{
     BoosterKind, GrowPolicy, MultiStrategy, QuantizedGrad, QuantizedGradBuilder,
     TrainingParamsBuilder, TreeMethod,
 };
-use hessboost::objective::Logistic;
+use hessboost::objective::RegLoss;
 use hessboost::prelude::*;
 
 mod common;
@@ -161,7 +161,7 @@ fn quantized_binary_classification_stays_close_to_full_precision() {
         labeled_dense(&xt, FEATURES, &yt),
     );
     let base = TrainingParams::builder()
-        .objective(Objective::BinaryLogistic(Logistic::default()))
+        .objective(Objective::BinaryLogistic(RegLoss::default()))
         .max_depth(6)
         .eta(0.1);
     let score = |builder: TrainingParamsBuilder| {

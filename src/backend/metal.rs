@@ -2044,7 +2044,7 @@ mod tests {
             .with_labels(&y)
             .unwrap();
         let params = TrainingParams::builder()
-            .objective(Objective::SquaredError)
+            .objective(Objective::SquaredError(RegLoss::default()))
             .tree_method(TreeMethod::Hist)
             .max_depth(5)
             .eta(0.3)

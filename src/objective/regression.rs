@@ -1,19 +1,38 @@
 //! Regression objectives.
 
-use super::{GradPair, Loss, check_label_domain, weighted_label_mean};
+use super::{GradPair, Loss, check_label_domain, newton_intercepts, weighted_label_mean};
+use crate::K_RT_EPS_F32;
 use crate::data::MetaInfo;
 use crate::error::Result;
 use crate::metric::EvalMetric;
 use crate::objective::PseudoHuber;
 
-/// Squared-error regression (`reg:squarederror`).
+/// Squared-error regression (`reg:squarederror`), XGBoost's
+/// `RegLossObj<LinearSquareLoss>`.
 ///
 /// Loss `½ (pred − label)²` gives gradient `pred − label` and constant Hessian
-/// `1`. The prediction transform is the identity and the optimal base margin is
-/// the (weighted) label mean.
-#[derive(Debug, Clone, Copy, Default)]
-#[non_exhaustive]
-pub struct SquaredError;
+/// `1`, both times the row weight, which `scale_pos_weight` multiplies for a
+/// label of exactly `1`. The prediction transform is the identity and the
+/// optimal base margin is the (weighted) label mean, or with
+/// `scale_pos_weight != 1` XGBoost's Newton step (`FitIntercept`) on the
+/// reweighted gradients.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SquaredError {
+    scale_pos_weight: f32,
+}
+
+impl SquaredError {
+    /// The loss with positive-label weight `scale_pos_weight`.
+    pub(crate) fn new(scale_pos_weight: f32) -> Self {
+        SquaredError { scale_pos_weight }
+    }
+}
+
+impl Default for SquaredError {
+    fn default() -> Self {
+        SquaredError::new(1.0)
+    }
+}
 
 impl Loss for SquaredError {
     fn name(&self) -> &'static str {
@@ -27,24 +46,40 @@ impl Loss for SquaredError {
         weights: Option<&[f32]>,
         out: &mut [GradPair],
     ) {
-        super::elementwise_gradient(preds, labels, weights, out, |p, y, w| {
+        let scale_pos_weight = self.scale_pos_weight;
+        super::elementwise_gradient(preds, labels, weights, out, |p, y, mut w| {
+            // XGBoost `RegLossObj::GetGradient`: `w *= scale_pos_weight`
+            // for a label of exactly 1, in `f32`.
+            if y == 1.0 {
+                w *= scale_pos_weight;
+            }
             GradPair::new((p - y) * w, w)
         });
     }
 
     fn const_hess(&self) -> bool {
+        // XGBoost's `LinearSquareLoss::Info` whatever `scale_pos_weight`:
+        // the Hessian does not depend on the margin.
         true
     }
 
     fn base_margins_info(&self, info: &MetaInfo) -> Vec<f32> {
-        // XGBoost `FitInterceptGlmLike`: the (weighted) label mean.
+        // XGBoost `RegLossObj::InitEstimation`: `FitInterceptGlmLike`'s
+        // (weighted) label mean, unless `scale_pos_weight` is in play, in
+        // which case the reweighted loss needs the Newton step.
+        if (self.scale_pos_weight - 1.0).abs() > K_RT_EPS_F32 {
+            return newton_intercepts(self, info);
+        }
         vec![weighted_label_mean(info.labels, info.weights)]
     }
 
     fn pointwise_loss(&self) -> Option<super::PointwiseLoss<'_>> {
-        // `½ (margin − y)²`.
-        Some(Box::new(|margin, label| {
-            0.5 * (f64::from(margin) - f64::from(label)).powi(2)
+        // `½ (margin − y)²`, with a label of 1 reweighted by
+        // `scale_pos_weight` exactly as in the gradient.
+        let scale_pos_weight = f64::from(self.scale_pos_weight);
+        Some(Box::new(move |margin, label| {
+            let weight = if label == 1.0 { scale_pos_weight } else { 1.0 };
+            weight * 0.5 * (f64::from(margin) - f64::from(label)).powi(2)
         }))
     }
 
@@ -175,7 +210,7 @@ mod tests {
 
     #[test]
     fn gradient_matches_closed_form() {
-        let obj = SquaredError;
+        let obj = SquaredError::default();
         let preds = [2.0f32, 0.0, -1.0];
         let labels = [1.0f32, 0.5, -3.0];
         let out = gradient_pairs(&obj, &preds, &labels, None);
@@ -186,7 +221,7 @@ mod tests {
 
     #[test]
     fn weighted_gradient_scales() {
-        let obj = SquaredError;
+        let obj = SquaredError::default();
         let preds = [2.0f32];
         let labels = [1.0f32];
         let w = [4.0f32];
@@ -194,9 +229,22 @@ mod tests {
         assert_eq!(out[0], GradPair::new(4.0, 4.0));
     }
 
+    /// `scale_pos_weight` multiplies the sample weight of the rows labeled
+    /// exactly 1 only, and moves the intercept from the label mean to the
+    /// Newton step on the reweighted rows: `Σ w'y / Σ w'`.
+    #[test]
+    fn scale_pos_weight_reweights_rows_labeled_one() {
+        let obj = SquaredError::new(3.0);
+        let out = gradient_pairs(&obj, &[2.0, 2.0], &[1.0, 1.5], Some(&[2.0, 2.0]));
+        assert_eq!(out[0], GradPair::new(6.0, 6.0)); // (2 - 1) * 2 * 3
+        assert_eq!(out[1], GradPair::new(1.0, 2.0)); // (2 - 1.5) * 2
+        // (1 * 3 + 4) / (3 + 1) = 1.75, not the mean 2.5.
+        assert_eq!(base_margins(&obj, &[1.0, 4.0], None), vec![1.75]);
+    }
+
     #[test]
     fn base_margins_is_label_mean() {
-        let obj = SquaredError;
+        let obj = SquaredError::default();
         assert_eq!(base_margins(&obj, &[1.0, 2.0, 3.0], None), vec![2.0]);
     }
 

@@ -116,7 +116,7 @@
 //!
 //! let bytes = model.to_compact_bytes()?;
 //! let compact = CompactModel::from_bytes(&bytes)?;
-//! assert_eq!(compact.predict_margin(&dtrain)?, model.predict_margin(&dtrain)?);
+//! assert_eq!(compact.predict_margin(&dtrain)?, model.predict_margin(&dtrain, Iterations::Best)?);
 //!
 //! let report = model.size_report()?;
 //! assert!(report.compact_bytes < report.native_bytes);
@@ -1256,7 +1256,9 @@ impl BoostedModel {
         CompactModel::from_bytes(&encode(self)?)
     }
 
-    /// Serialize this model in the compact layout; parse the bytes with
+    /// Serialize this model in the compact layout without parsing the result
+    /// back (the path for writing `HBTD` files; [`Self::to_compact`] is this
+    /// plus [`CompactModel::from_bytes`]). Parse the bytes with
     /// [`CompactModel::from_bytes`].
     pub fn to_compact_bytes(&self) -> Result<Vec<u8>> {
         encode(self)
@@ -1787,6 +1789,7 @@ mod tests {
     use super::*;
     use crate::config::{BoosterKind, Dart, GrowPolicy, LinearTree, TrainingParams, TreeMethod};
     use crate::data::FeatureType;
+    use crate::model::Iterations;
     use crate::objective::{Multiclass, Objective, Quantiles, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::training::{Trainer, train};
@@ -1831,11 +1834,16 @@ mod tests {
         let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
         assert_eq!(
             bits(compact.predict_margin(data).unwrap().into_vec()),
-            bits(model.predict_margin(data).unwrap().into_vec())
+            bits(
+                model
+                    .predict_margin(data, Iterations::Best)
+                    .unwrap()
+                    .into_vec()
+            )
         );
         assert_eq!(
             bits(compact.predict(data).unwrap().into_vec()),
-            bits(model.predict(data).unwrap().into_vec())
+            bits(model.predict(data, Iterations::Best).unwrap().into_vec())
         );
         compact
     }

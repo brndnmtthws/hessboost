@@ -48,7 +48,7 @@ struct LeafIds {
 impl LeafIds {
     fn new(model: &BoostedModel, values: &DMatrix) -> Result<Self> {
         Ok(LeafIds {
-            ids: model.predict_leaf_range(values, ..)?.into_vec(),
+            ids: model.predict_leaf(values, ..)?.into_vec(),
             rows: values.n_rows(),
             trees: model.num_trees(),
         })

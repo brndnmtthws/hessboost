@@ -75,7 +75,7 @@
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::{BoostedModel, Predictions};
+use crate::model::{BoostedModel, Iterations, Predictions};
 
 /// An interval `[lower, upper]` for one row: `f32` for the conformal
 /// predictors here, `f64` for [`crate::inference`]'s intervals.
@@ -236,7 +236,9 @@ impl QuantileBand<'_> {
     /// that round to 0 or 1 (infinite bounds).
     fn check(self, data: &DMatrix) -> Result<()> {
         match self {
-            QuantileBand::Distribution { model, .. } => model.predict_distribution(data).map(drop),
+            QuantileBand::Distribution { model, .. } => {
+                model.predict_distribution(data, Iterations::Best).map(drop)
+            }
             QuantileBand::Pair { lower, upper } => {
                 single_output_predictions(lower, data)?;
                 single_output_predictions(upper, data).map(drop)
@@ -280,7 +282,7 @@ impl QuantileBand<'_> {
                 upper,
             } => {
                 let band: Vec<Interval> = model
-                    .predict_distribution(data)?
+                    .predict_distribution(data, Iterations::Best)?
                     .iter()
                     .map(|d| Interval {
                         lower: round_down(d.quantile(lower)),
@@ -500,7 +502,7 @@ fn calibration_labels(calibration: &DMatrix) -> Result<&[f32]> {
     Ok(labels)
 }
 
-/// `model.predict(data)` for a single-output model, validated finite.
+/// `model.predict(data, Iterations::Best)` for a single-output model, validated finite.
 fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Predictions> {
     if model.n_outputs() != 1 {
         return Err(HessboostError::invalid_param(
@@ -514,9 +516,9 @@ fn single_output_predictions(model: &BoostedModel, data: &DMatrix) -> Result<Pre
     checked_predictions(model, data, 1)
 }
 
-/// `model.predict(data)`, validated as `width` finite values per row.
+/// `model.predict(data, Iterations::Best)`, validated as `width` finite values per row.
 fn checked_predictions(model: &BoostedModel, data: &DMatrix, width: usize) -> Result<Predictions> {
-    let preds = model.predict(data)?;
+    let preds = model.predict(data, Iterations::Best)?;
     if preds.width() != width {
         return Err(HessboostError::invalid_param(
             "model",
@@ -887,7 +889,10 @@ mod tests {
             .build()
             .unwrap();
         let model = train(&params, &cal, 0).unwrap();
-        assert_eq!(model.predict(&cal).unwrap().as_slice(), [1.0]);
+        assert_eq!(
+            model.predict(&cal, Iterations::Best).unwrap().as_slice(),
+            [1.0]
+        );
         let covers = |i: Interval| i.lower <= y && y <= i.upper;
 
         let sc = SplitConformal::calibrate(&model, &cal, 0.5).unwrap();

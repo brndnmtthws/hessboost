@@ -37,7 +37,7 @@ fn friedman(n: usize, seed: u64) -> Result<DMatrix> {
 }
 
 fn rmse(model: &BoostedModel, data: &DMatrix) -> Result<f64> {
-    let preds = model.predict(data)?;
+    let preds = model.predict(data, Iterations::Best)?;
     let metric = EvalMetric::Rmse.build(1)?;
     Ok(metric.eval(preds.as_slice(), data.labels().unwrap_or_default(), None))
 }

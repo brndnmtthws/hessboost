@@ -56,7 +56,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             samples.push(elapsed);
         }
         if run == repeats {
-            let preds = model.predict(&dtest)?;
+            let preds = model.predict(&dtest, Iterations::Best)?;
             score = metric.eval(preds.as_slice(), &y_test, None);
         }
     }

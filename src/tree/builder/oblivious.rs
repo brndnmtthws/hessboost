@@ -523,6 +523,7 @@ mod tests {
     use super::super::test_support::{binned, gp, grow_hist};
     use super::*;
     use crate::config::{GrowPolicy, Monotone, TrainingParams};
+    use crate::model::Iterations;
     use crate::training::train;
     use crate::tree::builder::{HistTreeBuilder, all_rows};
 
@@ -734,7 +735,11 @@ mod tests {
                     let mut row = vec![s as f32 / 40.0];
                     row.extend(&base);
                     let d = DMatrix::from_dense(&row, 1, 4).unwrap();
-                    *model.predict(&d).unwrap().get(0, 0).unwrap()
+                    *model
+                        .predict(&d, Iterations::Best)
+                        .unwrap()
+                        .get(0, 0)
+                        .unwrap()
                 })
                 .collect();
             assert!(preds.windows(2).all(|w| w[1] <= w[0]), "{preds:?}");
@@ -796,7 +801,7 @@ mod tests {
                 .unwrap();
             let pred = train(&params, &dtrain, 200)
                 .unwrap()
-                .predict(&dtest)
+                .predict(&dtest, Iterations::Best)
                 .unwrap();
             let se: f32 = pred
                 .as_slice()

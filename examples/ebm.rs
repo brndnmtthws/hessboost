@@ -79,7 +79,7 @@ fn main() -> Result<()> {
         .build()?;
     let model = train(&params, &dtrain, 5000)?;
     let rmse = |m: &BoostedModel| -> Result<f64> {
-        let preds = m.predict(&dtest)?;
+        let preds = m.predict(&dtest, Iterations::Best)?;
         let labels = dtest.labels().unwrap_or_default();
         let sse: f64 = preds
             .as_slice()

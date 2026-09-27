@@ -77,7 +77,7 @@ fn main() -> Result<()> {
     quantile_params.objective = Objective::custom(pinball);
     let quantiles = train(&quantile_params, &dtrain, 200)?;
     // The uncalibrated band, for comparison: predictions are `[row][output]`.
-    let preds = quantiles.predict(&dtest)?;
+    let preds = quantiles.predict(&dtest, Iterations::Best)?;
     let band: Vec<Interval> = preds
         .rows()
         .map(|row| Interval {

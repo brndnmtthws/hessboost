@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         .eta(0.2)
         .build()?;
     let model = Trainer::new(&params, &d, 60).train()?.model;
-    let preds = model.predict(&d)?;
+    let preds = model.predict(&d, Iterations::Best)?;
     let rmse = EvalMetric::Rmse.build(1)?.eval(preds.as_slice(), &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
 

@@ -129,7 +129,7 @@
 //! let shapes = shape_functions(&model)?;
 //! assert_eq!(shapes.terms.len(), 2);
 //! let margin = shapes.intercept + shapes.terms[0].value(&[0.3])? + shapes.terms[1].value(&[0.5])?;
-//! let direct = model.predict(&DMatrix::from_dense(&[0.3, 0.5], 1, 2)?)?;
+//! let direct = model.predict(&DMatrix::from_dense(&[0.3, 0.5], 1, 2)?, Iterations::Best)?;
 //! let direct = *direct.get(0, 0).expect("one row, one output");
 //! assert!((margin - f64::from(direct)).abs() < 1e-4);
 //! # Ok(())

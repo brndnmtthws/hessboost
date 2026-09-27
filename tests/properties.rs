@@ -44,8 +44,8 @@ proptest! {
     fn training_is_deterministic((x, y) in dataset(), seed in 0u64..10_000) {
         let d = labeled_dense(&x, COLS, &y);
         let params = base_params(seed);
-        let a = train(&params, &d, 15).unwrap().predict(&d).unwrap();
-        let b = train(&params, &d, 15).unwrap().predict(&d).unwrap();
+        let a = train(&params, &d, 15).unwrap().predict(&d, Iterations::Best).unwrap();
+        let b = train(&params, &d, 15).unwrap().predict(&d, Iterations::Best).unwrap();
         prop_assert_eq!(a, b);
     }
 
@@ -72,8 +72,8 @@ proptest! {
             .unwrap();
 
         let params = base_params(seed);
-        let pd = train(&params, &dense, 15).unwrap().predict(&dense).unwrap();
-        let ps = train(&params, &sparse, 15).unwrap().predict(&sparse).unwrap();
+        let pd = train(&params, &dense, 15).unwrap().predict(&dense, Iterations::Best).unwrap();
+        let ps = train(&params, &sparse, 15).unwrap().predict(&sparse, Iterations::Best).unwrap();
         for (a, b) in pd.as_slice().iter().zip(ps.as_slice()) {
             prop_assert!((a - b).abs() < 1e-4, "dense {a} vs sparse {b}");
         }
@@ -95,7 +95,7 @@ proptest! {
             .build()
             .unwrap();
         let model = train(&params, &d, 20).unwrap();
-        let preds = model.predict(&d).unwrap().into_vec(); // one value per row
+        let preds = model.predict(&d, Iterations::Best).unwrap().into_vec(); // one value per row
 
         // Sort rows by feature value; predictions must be non-decreasing.
         let mut idx: Vec<usize> = (0..ROWS).collect();
@@ -112,14 +112,14 @@ proptest! {
     fn serde_roundtrip_preserves_predictions((x, y) in dataset(), seed in 0u64..10_000) {
         let d = labeled_dense(&x, COLS, &y);
         let model = train(&base_params(seed), &d, 12).unwrap();
-        let before = model.predict(&d).unwrap();
+        let before = model.predict(&d, Iterations::Best).unwrap();
 
         let restored = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
-        let after = restored.predict(&d).unwrap();
+        let after = restored.predict(&d, Iterations::Best).unwrap();
         prop_assert_eq!(&before, &after);
 
         let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
-        let after_json = from_json.predict(&d).unwrap();
+        let after_json = from_json.predict(&d, Iterations::Best).unwrap();
         for (a, b) in before.as_slice().iter().zip(after_json.as_slice()) {
             prop_assert!((a - b).abs() < 1e-6);
         }

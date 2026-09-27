@@ -48,7 +48,7 @@ fn mvs_params(seed: u64) -> TrainingParams {
 fn predictions(params: &TrainingParams, data: &DMatrix, rounds: usize) -> Vec<f32> {
     train(params, data, rounds)
         .unwrap()
-        .predict(data)
+        .predict(data, Iterations::Best)
         .unwrap()
         .into_vec()
 }
@@ -508,8 +508,8 @@ fn approx_gradient_sampling_continuation_matches_uninterrupted_training() {
                 .unwrap()
                 .model;
             assert_eq!(
-                full.predict(data).unwrap(),
-                resumed.predict(data).unwrap(),
+                full.predict(data, Iterations::Best).unwrap(),
+                resumed.predict(data, Iterations::Best).unwrap(),
                 "{booster:?} depth {depth}"
             );
         }

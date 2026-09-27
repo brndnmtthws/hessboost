@@ -39,10 +39,9 @@
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
-use crate::model::{BoostedModel, RowBlock};
+use crate::model::{BoostedModel, Iterations, RowBlock};
 use crate::tree::{RegTree, SplitTest, split_goes_left};
 use rayon::prelude::*;
-use std::ops::RangeBounds;
 use std::sync::LazyLock;
 
 /// Quadrature points (XGBoost's `kQuadratureTreeShapPoints`).
@@ -787,13 +786,13 @@ fn enter_child(
     (p_enter, c_child)
 }
 
-/// Rows [`BoostedModel::predict_contribs_range`] walks in lockstep. Fewer
+/// Rows [`BoostedModel::predict_contribs`] walks in lockstep. Fewer
 /// than a lane group, so a single-row [`RowBlock`] loaded with them keeps
 /// every one row-major.
 const SHAP_ROWS: usize = 8;
 const _: () = assert!(SHAP_ROWS < crate::tree::compact::LANES);
 
-/// The per-call state of [`BoostedModel::predict_contribs_range`].
+/// The per-call state of [`BoostedModel::predict_contribs`].
 struct ContribContext<'a> {
     forest: &'a ShapForest,
     rule: &'a QuadratureRule,
@@ -966,34 +965,25 @@ impl BoostedModel {
     /// to every output with that output's leaf values and the tree's covers.
     ///
     /// For every row (and output) the `n_features + 1` values sum to the raw
-    /// margin from [`BoostedModel::predict_margin`] up to `f32` rounding. Uses
-    /// the effective iterations (`[0, best_iteration + 1)` after early
-    /// stopping).
+    /// margin from [`BoostedModel::predict_margin`] with the same
+    /// `iterations` up to `f32` rounding. The boosting `iterations`
+    /// ([`Iterations`]) are [`Iterations::Best`] (the effective iterations,
+    /// `[0, best_iteration + 1)` after early stopping) or a range, which as
+    /// in XGBoost must start at iteration `0`; use [`BoostedModel::slice`]
+    /// for a later start.
     ///
     /// # Errors
     ///
     /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
     /// model, [`HessboostError::ModelFormat`] when a tree has a negative cover,
-    /// [`HessboostError::InvalidParameter`] for linear-leaf models.
-    pub fn predict_contribs(&self, data: &DMatrix) -> Result<super::Contributions> {
-        self.predict_contribs_range(data, self.default_iteration_range())
-    }
-
-    /// [`Self::predict_contribs`] over the boosting iterations in
-    /// `iterations` (see [`BoostedModel::predict_margin_range`]). As in
-    /// XGBoost the range must start at iteration `0`; use
-    /// [`BoostedModel::slice`] for a later start.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Self::predict_contribs`], plus an out-of-range
-    /// `iterations`.
-    pub fn predict_contribs_range(
+    /// [`HessboostError::InvalidParameter`] for linear-leaf models and an
+    /// out-of-range `iterations`.
+    pub fn predict_contribs(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: impl Into<Iterations>,
     ) -> Result<super::Contributions> {
-        let pro = self.attribution_prologue(data, iterations, "contribution prediction")?;
+        let pro = self.attribution_prologue(data, iterations.into(), "contribution prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let forest = self.shap_forest(trees, k)?;
@@ -1072,27 +1062,16 @@ impl BoostedModel {
     /// `n_rows × n_outputs × (n_features + 1)^2`, row-major: the matrix for row
     /// `r`, output `c` occupies the `(n_features + 1)^2` values starting at
     /// `(r * n_outputs + c) * (n_features + 1)^2`. Tree `t` contributes to output
-    /// `(t / num_parallel_tree) % n_outputs`. Uses the effective iterations,
-    /// like [`Self::predict_contribs`].
+    /// `(t / num_parallel_tree) % n_outputs`. The boosting `iterations` are
+    /// those of [`Self::predict_contribs`].
     ///
     /// # Errors
     ///
     /// As for [`BoostedModel::predict_contribs`].
-    pub fn predict_interactions(&self, data: &DMatrix) -> Result<super::Interactions> {
-        self.predict_interactions_range(data, self.default_iteration_range())
-    }
-
-    /// [`Self::predict_interactions`] over the boosting iterations in
-    /// `iterations`, which must start at iteration `0` (see
-    /// [`Self::predict_contribs_range`]).
-    ///
-    /// # Errors
-    ///
-    /// As for [`Self::predict_contribs_range`].
-    pub fn predict_interactions_range(
+    pub fn predict_interactions(
         &self,
         data: &DMatrix,
-        iterations: impl RangeBounds<usize>,
+        iterations: impl Into<Iterations>,
     ) -> Result<super::Interactions> {
         struct Scratch<'a> {
             rows: RowBlock<'a>,
@@ -1105,7 +1084,7 @@ impl BoostedModel {
             last: Vec<u32>,
         }
 
-        let pro = self.attribution_prologue(data, iterations, "interaction prediction")?;
+        let pro = self.attribution_prologue(data, iterations.into(), "interaction prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
         let mwidth = width * width;
@@ -1200,6 +1179,7 @@ fn finalize_interactions(m: &mut [f32], diag: &[f32], width: usize) {
 mod tests {
     use crate::config::{BoosterKind, Dart, TrainingParams, TreeMethod};
     use crate::data::{DMatrix, FeatureType};
+    use crate::model::Iterations;
     use crate::objective::{Multiclass, Objective, RegLoss};
     use crate::test_support::labeled_dense;
     use crate::{model::BoostedModel, training::train};
@@ -1273,11 +1253,11 @@ mod tests {
     /// the margin of every row and output.
     fn assert_additive(model: &BoostedModel, d: &DMatrix) {
         let width = d.n_cols() + 1;
-        let contribs = model.predict_contribs(d).unwrap();
+        let contribs = model.predict_contribs(d, Iterations::Best).unwrap();
         assert_eq!(contribs.n_rows(), d.n_rows());
         assert_eq!(contribs.n_outputs(), model.n_outputs());
         assert_eq!(contribs.n_features(), d.n_cols());
-        let margin = model.predict_margin(d).unwrap();
+        let margin = model.predict_margin(d, Iterations::Best).unwrap();
         let err = max_additivity_error(contribs.as_slice(), margin.as_slice(), width);
         assert!(err < 1e-4, "max additivity error {err} exceeded 1e-4");
     }
@@ -1288,13 +1268,13 @@ mod tests {
     fn assert_interactions_consistent(model: &BoostedModel, d: &DMatrix) {
         let width = d.n_cols() + 1;
         let k = model.n_outputs();
-        let inter = model.predict_interactions(d).unwrap();
+        let inter = model.predict_interactions(d, Iterations::Best).unwrap();
         assert_eq!(
             (inter.n_rows(), inter.n_outputs(), inter.n_features()),
             (d.n_rows(), k, d.n_cols())
         );
-        let contribs = model.predict_contribs(d).unwrap();
-        let margin = model.predict_margin(d).unwrap();
+        let contribs = model.predict_contribs(d, Iterations::Best).unwrap();
+        let margin = model.predict_margin(d, Iterations::Best).unwrap();
 
         let (mut row_err, mut eff_err, mut sym_err) = (0f64, 0f64, 0f64);
         for r in 0..d.n_rows() {
@@ -1466,7 +1446,7 @@ mod tests {
     /// row of `x`, the row-major features of `d`.
     fn assert_matches_textbook(model: &BoostedModel, d: &DMatrix, x: &[f32]) {
         let nf = d.n_cols();
-        let contribs = model.predict_contribs(d).unwrap();
+        let contribs = model.predict_contribs(d, Iterations::Best).unwrap();
         let mut max_err = 0f64;
         for (row_index, row) in x.chunks_exact(nf).enumerate() {
             let c = contribs.get(row_index, 0).unwrap();
@@ -1556,7 +1536,7 @@ mod tests {
             .any(|nd| !nd.is_leaf() && nd.split_feature == 3);
         assert!(!used, "feature 3 unexpectedly used in a split");
 
-        let contribs = model.predict_contribs(&d).unwrap();
+        let contribs = model.predict_contribs(&d, Iterations::Best).unwrap();
         let mut max_abs = 0f32;
         for row in 0..n {
             max_abs = max_abs.max(contribs.get(row, 0).unwrap()[3].abs());
@@ -1693,11 +1673,11 @@ mod tests {
         let model = crate::model::BoostedModel::from_json(&json).unwrap();
         let d = DMatrix::from_dense(&[0.2], 1, 1).unwrap();
         assert!(matches!(
-            model.predict_contribs(&d),
+            model.predict_contribs(&d, Iterations::Best),
             Err(crate::error::HessboostError::ModelFormat(_))
         ));
         assert!(matches!(
-            model.predict_interactions(&d),
+            model.predict_interactions(&d, Iterations::Best),
             Err(crate::error::HessboostError::ModelFormat(_))
         ));
     }

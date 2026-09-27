@@ -653,7 +653,8 @@ class DiffusionModel(_SchemaState):
                 or the sampler diverges (use more steps).
         """
         matrix = _matrix_for(data, ((self, "the model's"),))._core
-        return self._core.sample(matrix,
+        return self._core.sample(
+            matrix,
             _count("n_samples", n_samples),
             _count("seed", seed),
             None if n_steps is None else _count("n_steps", n_steps),

@@ -61,6 +61,8 @@
 //! - [`inference`]: Boulevard boosting's confidence and prediction intervals
 //!   for `f(x)`, and a Boulevard EBM's shape-function bands.
 //! - [`ebm`]: explainable boosting machines' terms and shape functions.
+//! - [`diffusion`]: conditional diffusion and flow matching with GBDT score
+//!   models, sampling a nonparametric `p(y | x)`.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
 //!
@@ -163,7 +165,7 @@
 //!     `dist:lognormal`, `dist:gamma`, `dist:poisson`, `dist:negbinomial`
 //!     per-row distributions
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
-//!     [`objective::distributional`]), scored by `nll` / `crps`.
+//!     [`objective::distributional`]), scored by `nll` / `crps`;
 //!   - CatBoost's Stochastic Gradient Langevin Boosting and model shrinkage
 //!     ([`langevin`](config::TrainingParams::langevin),
 //!     [`model_shrink`](config::TrainingParams::model_shrink),
@@ -172,6 +174,9 @@
 //!     one model's exactly rebuilt truncations
 //!     ([`predict_uncertainty`](model::BoostedModel::predict_uncertainty),
 //!     [`model::uncertainty`]);
+//!   - nonparametric `p(y | x)` by tree-based conditional diffusion
+//!     (Treeffuser) and flow matching (DiffGBM) for scalar or vector
+//!     labels, sampled deterministically ([`diffusion`]);
 //!   - native Metal on macOS 10.15+ (`metal` feature): bit-identical GPU
 //!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~2.5x faster at
 //!     scale) and bit-identical GPU histograms
@@ -184,9 +189,9 @@
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
 //! `model_io`, `custom_objective`, `constraints`, `conformal`,
 //! `boulevard_inference`, `ebm`, `compact_model`, `distributional`,
-//! `virtual_ensembles`, `budget`, `balanced_bagging`, `online_update`,
-//! `ordered_target_stats`, `pfn_boost`, `metal` with `--features metal` on
-//! macOS). Run one with
+//! `virtual_ensembles`, `tree_diffusion`, `budget`, `balanced_bagging`,
+//! `online_update`, `ordered_target_stats`, `pfn_boost`, `metal` with
+//! `--features metal` on macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -233,6 +238,7 @@ pub mod backend;
 pub mod config;
 pub mod conformal;
 pub mod data;
+pub mod diffusion;
 pub mod ebm;
 pub mod error;
 pub mod inference;

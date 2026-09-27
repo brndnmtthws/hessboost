@@ -16,13 +16,15 @@ Submodules:
 * :mod:`hessboost.conformal` -- conformal prediction intervals
 * :mod:`hessboost.ebm` -- explainable boosting machines' shape functions
 * :mod:`hessboost.inference` -- Boulevard confidence intervals for ``f(x)`` and EBM bands
+* :mod:`hessboost.diffusion` -- nonparametric ``p(y | x)`` by tree-based
+  diffusion and flow matching
 * :mod:`hessboost.folds` -- k-fold and forward-chaining (purged) folds
 * :mod:`hessboost.online` -- adding and deleting training rows in place
 """
 
 from importlib.metadata import version as _version
 
-from hessboost import conformal, ebm, folds, inference, online
+from hessboost import conformal, diffusion, ebm, folds, inference, online
 from hessboost._core import (
     Booster,
     Distributions,
@@ -60,6 +62,7 @@ __all__ = [
     "__version__",
     "conformal",
     "cv",
+    "diffusion",
     "ebm",
     "folds",
     "inference",

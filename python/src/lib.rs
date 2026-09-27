@@ -17,6 +17,7 @@
 mod booster;
 mod conformal;
 mod data;
+mod diffusion;
 mod dist;
 mod ebm;
 mod errors;
@@ -41,10 +42,15 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ebm::TermShape>()?;
     m.add_class::<ebm::EbmInference>()?;
     m.add_function(wrap_pyfunction!(ebm::shape_functions, m)?)?;
+    m.add_class::<diffusion::DiffusionParams>()?;
+    m.add_class::<diffusion::DiffusionModel>()?;
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
     m.add_function(wrap_pyfunction!(train::cv, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;
     m.add_function(wrap_pyfunction!(train::forward_chaining, m)?)?;
     m.add_function(wrap_pyfunction!(train::purged_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(diffusion::samples_mean, m)?)?;
+    m.add_function(wrap_pyfunction!(diffusion::samples_quantiles, m)?)?;
+    m.add_function(wrap_pyfunction!(diffusion::samples_crps, m)?)?;
     Ok(())
 }

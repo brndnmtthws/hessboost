@@ -8,11 +8,11 @@
 //! change. Pair values, accumulation, per-query normalization, and query
 //! weighting use XGBoost's float/double conversion points.
 
-use super::{GradPair, Loss, MIN_HESS_F64, check_label_domain};
+use super::query::{for_each_query, validate_query_info};
+use super::{GradPair, Loss, MIN_HESS_F64};
 use crate::data::{GroupInfo, MetaInfo};
-use crate::error::{HessboostError, Result};
+use crate::error::Result;
 use crate::metric::{argsort_desc, group_ranges};
-use rayon::prelude::*;
 
 /// Which ranking loss the LambdaMART objective optimizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,10 +142,6 @@ fn normalize_group(out: &mut [GradPair], sum_lambda: f64, query_weight: f32, wei
     }
 }
 
-/// Queries at least this many rows in total compute their gradients in
-/// parallel (each query writes only its own rows).
-const PARALLEL_RANK_ROWS: usize = 4096;
-
 impl Loss for LambdaMart {
     fn name(&self) -> &str {
         match self.mode {
@@ -189,79 +185,32 @@ impl Loss for LambdaMart {
         } else {
             (ranges.len() as f64 / sum_w) as f32
         };
-        // The ranges tile the rows in order, so each query gets its own
-        // disjoint slice of `out`.
-        let mut queries = Vec::with_capacity(ranges.len());
-        let mut rest = &mut out[..];
-        let mut offset = 0;
-        for (&(start, end), &weight) in ranges.iter().zip(&group_weights) {
-            let (_, tail) = std::mem::take(&mut rest).split_at_mut(start - offset);
-            let (rows, tail) = tail.split_at_mut(end - start);
-            rest = tail;
-            offset = end;
-            queries.push((start, rows, weight));
-        }
-        let query = |(start, out, weight): (usize, &mut [GradPair], f32)| {
-            let end = start + out.len();
-            self.accumulate_group(
-                &preds[start..end],
-                &labels[start..end],
-                weight,
-                weight_norm,
-                out,
-            );
-        };
-        if preds.len() >= PARALLEL_RANK_ROWS
-            && queries.len() > 1
-            && rayon::current_num_threads() > 1
-        {
-            queries.into_par_iter().for_each(query);
-        } else {
-            queries.into_iter().for_each(query);
-        }
+        for_each_query(
+            &ranges,
+            out,
+            || (),
+            |(), query, start, out| {
+                let end = start + out.len();
+                self.accumulate_group(
+                    &preds[start..end],
+                    &labels[start..end],
+                    group_weights[query],
+                    weight_norm,
+                    out,
+                );
+            },
+        );
     }
 
     /// One label per row in the objective's domain, and non-empty query
     /// groups that cover the rows in order, each with one constant weight
     /// (lengths are checked before any group is sliced).
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
-        info.check_layout()?;
-        super::check_label_width(info, 1)?;
         match self.mode {
             // NDCG gains are `2^label - 1` in a `u32`: relevance in [0, 31].
-            RankMode::Ndcg => check_label_domain(info, |y| !(0.0..=31.0).contains(&y))?,
-            RankMode::Pairwise | RankMode::Map => check_label_domain(info, |y| y < 0.0)?,
+            RankMode::Ndcg => validate_query_info(info, |y| !(0.0..=31.0).contains(&y)),
+            RankMode::Pairwise | RankMode::Map => validate_query_info(info, |y| y < 0.0),
         }
-        let Some(group) = info.group else {
-            return Err(HessboostError::invalid_param(
-                "group_sizes",
-                "ranking dataset requires group information",
-            ));
-        };
-        if !group.partitions(info.n_rows) || group.iter_ranges().any(|(start, end)| start == end) {
-            return Err(HessboostError::invalid_param(
-                "group_sizes",
-                format!(
-                    "dataset has {} rows, but its query groups are not non-empty consecutive \
-                     row ranges covering them",
-                    info.n_rows
-                ),
-            ));
-        }
-        if let Some(weights) = info.weights {
-            for (start, end) in group.iter_ranges() {
-                if weights[start..end]
-                    .iter()
-                    .any(|weight| *weight != weights[start])
-                {
-                    return Err(HessboostError::invalid_param(
-                        "weights",
-                        "ranking dataset requires one constant weight per query group",
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 
     fn default_metric(&self) -> crate::metric::EvalMetric {
@@ -379,7 +328,7 @@ mod tests {
         let mut sizes: Vec<usize> = (0..400).map(|g| 1 + (g * 37) % 60).collect();
         sizes[3] = 0;
         let n: usize = sizes.iter().sum();
-        assert!(n >= PARALLEL_RANK_ROWS);
+        assert!(n >= crate::objective::query::PARALLEL_QUERY_ROWS);
         let preds: Vec<f32> = (0..n).map(|i| ((i * 7919) % 1009) as f32 / 101.0).collect();
         let labels: Vec<f32> = (0..n).map(|i| ((i * 31) % 5) as f32).collect();
         let mut weights = Vec::with_capacity(n);
@@ -521,7 +470,10 @@ mod tests {
         let refused = |labels: &[f32], weights: Option<&[f32]>, group: GroupInfo| {
             let err = obj.validate_info(&MetaInfo::new(labels, weights, Some(&group)));
             assert!(
-                matches!(err, Err(HessboostError::InvalidParameter { .. })),
+                matches!(
+                    err,
+                    Err(crate::error::HessboostError::InvalidParameter { .. })
+                ),
                 "{group:?}: {err:?}"
             );
         };

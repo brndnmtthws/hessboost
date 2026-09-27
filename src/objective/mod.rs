@@ -48,6 +48,7 @@ mod multi_target;
 mod multiclass;
 mod params;
 mod quantile;
+mod query;
 mod ranking;
 mod regression;
 mod spec;
@@ -141,13 +142,9 @@ pub(crate) const MIN_HESS: f32 = 1e-16;
 pub(crate) const MIN_HESS_F64: f64 = 1e-16;
 
 /// Run a row-independent gradient `kernel` over `n_rows` instances with
-/// `n_outputs` values each, in parallel row chunks when the batch is large and
-/// a thread pool is available. Every row's outputs depend only on that row,
-/// and the chunking is fixed (not thread-count dependent): a short final
-/// chunk is folded into the last full chunk so every row takes the same
-/// vector/scalar path as in one whole-batch call, and the result is
-/// identical. Debug builds first assert the shapes with
-/// [`check_gradient_inputs`].
+/// `n_outputs` values each and one label per row, in parallel row chunks when
+/// the batch is large and a thread pool is available
+/// ([`rowwise_cells`] with one label column).
 pub(crate) fn rowwise_gradient<K>(
     n_rows: usize,
     n_outputs: usize,
@@ -160,10 +157,51 @@ pub(crate) fn rowwise_gradient<K>(
     K: Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Sync,
 {
     check_gradient_inputs(n_rows, n_outputs, preds, labels, weights, out);
+    let shape = RowShape {
+        n_rows,
+        n_outputs,
+        label_cols: 1,
+    };
+    rowwise_cells(shape, preds, labels, weights, out, kernel);
+}
+
+/// The per-row layout of a [`rowwise_cells`] batch: `preds` and `out` hold
+/// `n_outputs` values per row, `labels` hold `label_cols`, and weights one.
+#[derive(Clone, Copy)]
+pub(crate) struct RowShape {
+    pub(crate) n_rows: usize,
+    pub(crate) n_outputs: usize,
+    pub(crate) label_cols: usize,
+}
+
+/// Run a row-independent gradient `kernel` over `shape.n_rows` rows, in
+/// parallel row chunks when the batch is large and a thread pool is
+/// available. Every row's outputs depend only on that row, and the chunking
+/// is fixed (not thread-count dependent): a short final chunk is folded into
+/// the last full chunk so every row takes the same vector/scalar path as in
+/// one whole-batch call, and the result is identical. Mis-shaped inputs run
+/// as one whole-batch call.
+pub(crate) fn rowwise_cells<K>(
+    shape: RowShape,
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    out: &mut [GradPair],
+    kernel: K,
+) where
+    K: Fn(&[f32], &[f32], Option<&[f32]>, &mut [GradPair]) + Sync,
+{
+    let RowShape {
+        n_rows,
+        n_outputs,
+        label_cols,
+    } = shape;
     let complete = n_rows
         .checked_mul(n_outputs)
         .is_some_and(|values| preds.len() == values && out.len() == values)
-        && labels.len() == n_rows
+        && n_rows
+            .checked_mul(label_cols)
+            .is_some_and(|values| labels.len() == values)
         && weights.is_none_or(|w| w.len() == n_rows);
     if !complete
         || n_rows == 0
@@ -178,7 +216,7 @@ pub(crate) fn rowwise_gradient<K>(
         let rows = out.len() / n_outputs;
         kernel(
             &preds[first * n_outputs..(first + rows) * n_outputs],
-            &labels[first..first + rows],
+            &labels[first * label_cols..(first + rows) * label_cols],
             weights.map(|w| &w[first..first + rows]),
             out,
         );

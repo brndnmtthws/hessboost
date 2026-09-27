@@ -515,7 +515,7 @@ fn langevin_noise_scale_must_be_representable() {
             .langevin(langevin)
             .build()
     };
-    for (eta, temperature) in [(1e-10, 1e-300), (1e30, 1e300), (1.0, 1e-78), (1.0, 1e78)] {
+    for (eta, temperature) in [(1e-10, 1e-300), (1e30, 1e300), (1.0, 1e-78), (1.0, 1e92)] {
         assert_eq!(
             common::invalid_param(params(eta, temperature)),
             "diffusion_temperature",
@@ -523,6 +523,8 @@ fn langevin_noise_scale_must_be_representable() {
         );
     }
     assert!(params(1.0, 1e-70).is_ok() && params(1.0, 1e70).is_ok());
+    // A subnormal scale (about 1.4e-39 here) is tiny, but still noise.
+    assert!(params(1.0, 1e78).is_ok());
     let tiny = TrainingParams::builder()
         .eta(1e-44)
         .posterior_sampling(true)

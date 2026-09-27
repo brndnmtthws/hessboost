@@ -1162,28 +1162,28 @@ fn bench_predict_csr(c: &mut Criterion) {
 fn bench_model_io(c: &mut Criterion) {
     let data = make_data(20_000, 20);
     let model = trained_model(&data, 100);
-    let bytes = model.to_bytes().unwrap();
-    let json = model.to_json().unwrap();
-    let xgboost = model.to_xgboost_json().unwrap();
+    let bytes = model.encode(ModelFormat::Binary).unwrap();
+    let json = model.encode(ModelFormat::Json).unwrap();
+    let xgboost = model.encode(ModelFormat::XgboostJson).unwrap();
     let mut group = c.benchmark_group("model_io_100trees_depth6");
     group.sample_size(20);
     group.bench_function("to_bytes", |b| {
-        b.iter(|| black_box(model.to_bytes().unwrap()));
+        b.iter(|| black_box(model.encode(ModelFormat::Binary).unwrap()));
     });
     group.bench_function("from_bytes", |b| {
-        b.iter(|| black_box(BoostedModel::from_bytes(&bytes).unwrap()));
+        b.iter(|| black_box(BoostedModel::decode(&bytes, ModelFormat::Binary).unwrap()));
     });
     group.bench_function("to_json", |b| {
-        b.iter(|| black_box(model.to_json().unwrap()));
+        b.iter(|| black_box(model.encode(ModelFormat::Json).unwrap()));
     });
     group.bench_function("from_json", |b| {
-        b.iter(|| black_box(BoostedModel::from_json(&json).unwrap()));
+        b.iter(|| black_box(BoostedModel::decode(&json, ModelFormat::Json).unwrap()));
     });
     group.bench_function("to_xgboost_json", |b| {
-        b.iter(|| black_box(model.to_xgboost_json().unwrap()));
+        b.iter(|| black_box(model.encode(ModelFormat::XgboostJson).unwrap()));
     });
     group.bench_function("from_xgboost_json", |b| {
-        b.iter(|| black_box(BoostedModel::from_xgboost_json(&xgboost).unwrap()));
+        b.iter(|| black_box(BoostedModel::decode(&xgboost, ModelFormat::XgboostJson).unwrap()));
     });
     group.finish();
 }

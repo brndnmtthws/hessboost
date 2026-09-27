@@ -136,8 +136,8 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
             );
             let sliced = long.slice(..k, 1).unwrap();
             assert_eq!(
-                sliced.to_json().unwrap(),
-                short.to_json().unwrap(),
+                sliced.encode(ModelFormat::Json).unwrap(),
+                short.encode(ModelFormat::Json).unwrap(),
                 "{name}: slice ..{k}"
             );
             if let Some(m) = members.iterations().iter().position(|&it| it == k) {
@@ -439,7 +439,10 @@ fn langevin_training_is_thread_count_independent() {
     };
     let run = |threads, seed| {
         common::with_threads(threads, || {
-            train(&params(seed), &data, 6).unwrap().to_bytes().unwrap()
+            train(&params(seed), &data, 6)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
         })
     };
     let serial = run(1, 0);
@@ -450,7 +453,13 @@ fn langevin_training_is_thread_count_independent() {
         .max_depth(4)
         .build()
         .unwrap();
-    assert_ne!(serial, train(&plain, &data, 6).unwrap().to_bytes().unwrap());
+    assert_ne!(
+        serial,
+        train(&plain, &data, 6)
+            .unwrap()
+            .encode(ModelFormat::Binary)
+            .unwrap()
+    );
 }
 
 /// A leaf whose Hessian sum is below `min_child_weight` weighs `0`
@@ -511,8 +520,12 @@ fn shrunk_models_round_trip() {
     let margins = bits(&margin);
     let prefix = bits(model.predict_margin(&data, ..5).unwrap());
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ] {
         assert_eq!(
             bits(restored.predict_margin(&data, Iterations::Best).unwrap()),
@@ -520,7 +533,11 @@ fn shrunk_models_round_trip() {
         );
         assert_eq!(bits(restored.predict_margin(&data, ..5).unwrap()), prefix);
     }
-    let xgboost = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
+    let xgboost = BoostedModel::decode(
+        model.encode(ModelFormat::XgboostJson).unwrap(),
+        ModelFormat::XgboostJson,
+    )
+    .unwrap();
     for (&x, &m) in xgboost
         .predict_margin(&data, Iterations::Best)
         .unwrap()
@@ -532,7 +549,7 @@ fn shrunk_models_round_trip() {
     }
     let compact = model.to_compact().unwrap();
     assert_eq!(bits(compact.predict_margin(&data).unwrap()), margins);
-    let compact = hessboost::model::compact::CompactModel::from_bytes(&compact.to_bytes()).unwrap();
+    let compact = hessboost::model::compact::CompactModel::decode(compact.encode()).unwrap();
     assert_eq!(bits(compact.predict_margin(&data).unwrap()), margins);
     let offset = regression(200).with_base_margin(&[0.5; 200]).unwrap();
     assert_eq!(
@@ -547,9 +564,10 @@ fn shrunk_models_round_trip() {
         assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");
     }
 
-    let mut doc: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
     doc["shrinkage"]["factors"][3] = 0.5.into();
-    let err = BoostedModel::from_json(&doc.to_string())
+    let err = BoostedModel::decode(doc.to_string(), ModelFormat::Json)
         .unwrap_err()
         .to_string();
     assert!(err.contains("shrinkage record"), "{err}");

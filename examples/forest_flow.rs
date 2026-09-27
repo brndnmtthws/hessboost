@@ -11,6 +11,7 @@
 
 use std::num::NonZeroUsize;
 
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::forest::{
     ColumnKind, ForestModel, ForestParams, ImputeOptions, NoiseLevels, Repaint,
 };
@@ -180,13 +181,17 @@ fn main() -> Result<()> {
         .all(|(m, i)| m.is_nan() || m == i);
     println!("  observed entries kept: {kept}");
 
-    let from_bytes = ForestModel::from_bytes(&flow.to_bytes()?)?;
-    let from_json = ForestModel::from_json(&flow.to_json()?)?;
+    let from_bytes = ForestModel::decode(
+        &flow.encode(DiffusionFormat::Binary)?,
+        DiffusionFormat::Binary,
+    )?;
+    let from_json =
+        ForestModel::decode(&flow.encode(DiffusionFormat::Json)?, DiffusionFormat::Json)?;
     assert_eq!(from_bytes.sample(50, 1)?, flow.sample(50, 1)?);
     assert_eq!(from_json.sample(50, 1)?, flow.sample(50, 1)?);
     println!(
         "saved ForestFlow: {} bytes native, {} GBDTs; reloaded models sample the same rows",
-        flow.to_bytes()?.len(),
+        flow.encode(DiffusionFormat::Binary)?.len(),
         2 * flow.n_t().get()
     );
     Ok(())

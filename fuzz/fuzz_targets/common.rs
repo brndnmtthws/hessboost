@@ -2,6 +2,7 @@
 //! so this file is pulled in per target with `#[path]`.
 #![allow(dead_code, reason = "each target uses a different subset")]
 
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::model::compact::CompactModel;
 use hessboost::model::{ImportanceType, Predictions};
 use hessboost::objective::distributional::DistFamily;
@@ -18,47 +19,47 @@ pub fn seal(header: &[u8], rest: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Decode the three shared mode-byte choices: raw bytes, sealed container, or JSON text.
-pub fn parse_mode<T, E>(
+/// Decode the three shared mode-byte choices: raw bytes, sealed container
+/// (both [`DiffusionFormat::Binary`]), or UTF-8 JSON text.
+pub fn parse_mode<T>(
     mode: u8,
     rest: &[u8],
     header: &[u8],
-    from_bytes: impl Fn(&[u8]) -> std::result::Result<T, E>,
-    from_json: impl Fn(&str) -> std::result::Result<T, E>,
-) -> Option<std::result::Result<T, E>> {
+    decode: impl Fn(&[u8], DiffusionFormat) -> Result<T>,
+) -> Option<Result<T>> {
     match mode {
-        0 => Some(from_bytes(rest)),
-        1 => Some(from_bytes(&seal(header, rest))),
-        _ => std::str::from_utf8(rest).ok().map(from_json),
+        0 => Some(decode(rest, DiffusionFormat::Binary)),
+        1 => Some(decode(&seal(header, rest), DiffusionFormat::Binary)),
+        _ => std::str::from_utf8(rest)
+            .ok()
+            .map(|text| decode(text.as_bytes(), DiffusionFormat::Json)),
     }
 }
 
 /// Round-trip a model through its binary and JSON formats, retaining target-specific equality.
 pub fn round_trip<M>(
     model: &M,
-    to_bytes: impl Fn(&M) -> Result<Vec<u8>>,
-    from_bytes: impl Fn(&[u8]) -> Result<M>,
-    to_json: impl Fn(&M) -> Result<String>,
-    from_json: impl Fn(&str) -> Result<M>,
+    encode: impl Fn(&M, DiffusionFormat) -> Result<Vec<u8>>,
+    decode: impl Fn(&[u8], DiffusionFormat) -> Result<M>,
     eq: impl Fn(&M, &M),
 ) {
-    let bytes = to_bytes(model).expect("an accepted model saves");
-    let from_bytes = from_bytes(&bytes).expect("a saved model loads");
-    let json = to_json(model).expect("an accepted model saves");
-    let from_json = from_json(&json).expect("a saved model loads");
-    eq(model, &from_bytes);
-    eq(model, &from_json);
+    for format in [DiffusionFormat::Binary, DiffusionFormat::Json] {
+        let bytes = encode(model, format).expect("an accepted model saves");
+        let decoded = decode(&bytes, format).expect("a saved model loads");
+        eq(model, &decoded);
+    }
 }
 
-/// Shared one-parser targets for text and binary model parsers.
+/// Shared one-format targets decoding `BoostedModel`s: text formats see
+/// UTF-8 input only, binary formats every input.
 #[macro_export]
 macro_rules! text_target {
-    ($parser:path) => {
+    ($format:expr) => {
         libfuzzer_sys::fuzz_target!(|data: &[u8]| {
             let Ok(text) = std::str::from_utf8(data) else {
                 return;
             };
-            if let Ok(model) = $parser(text) {
+            if let Ok(model) = BoostedModel::decode(text, $format) {
                 common::exercise(&model);
             }
         });
@@ -67,9 +68,9 @@ macro_rules! text_target {
 
 #[macro_export]
 macro_rules! bytes_target {
-    ($parser:path) => {
+    ($format:expr) => {
         libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-            if let Ok(model) = $parser(data) {
+            if let Ok(model) = BoostedModel::decode(data, $format) {
                 common::exercise(&model);
             }
         });
@@ -153,31 +154,36 @@ pub fn exercise(model: &BoostedModel) {
     let margin = small_enough(n_features, k).then(|| predict_all(model));
 
     // Native binary: decoding what was encoded re-encodes to the same bytes.
-    let bytes = model.to_bytes().expect("a valid model encodes");
-    let decoded = BoostedModel::from_bytes(&bytes).expect("an encoded model decodes");
+    let bytes = model
+        .encode(ModelFormat::Binary)
+        .expect("a valid model encodes");
+    let decoded =
+        BoostedModel::decode(&bytes, ModelFormat::Binary).expect("an encoded model decodes");
     assert!(
-        decoded.to_bytes().expect("re-encode") == bytes,
+        decoded.encode(ModelFormat::Binary).expect("re-encode") == bytes,
         "native round trip changed the model"
     );
 
     // Native JSON: the same model back.
-    let json = model.to_json().expect("a valid model serializes to JSON");
-    let from_json = BoostedModel::from_json(&json).expect("serialized JSON parses");
+    let json = model
+        .encode(ModelFormat::Json)
+        .expect("a valid model serializes to JSON");
+    let from_json = BoostedModel::decode(&json, ModelFormat::Json).expect("serialized JSON parses");
     assert!(
-        from_json.to_bytes().expect("re-encode") == bytes,
+        from_json.encode(ModelFormat::Binary).expect("re-encode") == bytes,
         "JSON round trip changed the model"
     );
 
     // XGBoost interchange is partial; whatever exports must import and
     // predict like the model (see `check_xgboost_round_trip`).
-    if let Ok(xgb) = model.to_xgboost_json() {
-        let imported =
-            BoostedModel::from_xgboost_json(&xgb).expect("exported XGBoost JSON imports");
+    if let Ok(xgb) = model.encode(ModelFormat::XgboostJson) {
+        let imported = BoostedModel::decode(&xgb, ModelFormat::XgboostJson)
+            .expect("exported XGBoost JSON imports");
         check_xgboost_round_trip(model, &imported, &xgb, "JSON");
         // Both encodings hold the same document.
-        if let Ok(ubj) = model.to_xgboost_ubjson() {
-            let imported =
-                BoostedModel::from_xgboost_ubjson(&ubj).expect("exported XGBoost UBJSON imports");
+        if let Ok(ubj) = model.encode(ModelFormat::XgboostUbjson) {
+            let imported = BoostedModel::decode(&ubj, ModelFormat::XgboostUbjson)
+                .expect("exported XGBoost UBJSON imports");
             check_xgboost_round_trip(model, &imported, &xgb, "UBJSON");
         }
     }
@@ -185,8 +191,8 @@ pub fn exercise(model: &BoostedModel) {
     if let Ok(compact) = model.to_compact() {
         assert_eq!(compact.n_features(), n_features);
         assert_eq!(compact.n_outputs(), k);
-        let reparsed = CompactModel::from_bytes(&compact.to_bytes()).expect("compact bytes parse");
-        assert!(reparsed.to_bytes() == compact.to_bytes());
+        let reparsed = CompactModel::decode(compact.encode()).expect("compact bytes parse");
+        assert!(reparsed.encode() == compact.encode());
         if let Some(margin) = &margin {
             let data = probe_matrix(n_features);
             let compact_margin = compact
@@ -308,7 +314,7 @@ fn predict_all(model: &BoostedModel) -> Predictions {
 fn check_xgboost_round_trip(
     model: &BoostedModel,
     imported: &BoostedModel,
-    exported: &str,
+    exported: &[u8],
     format: &str,
 ) {
     let n_features = model.n_features();
@@ -333,7 +339,7 @@ fn check_xgboost_round_trip(
         );
     }
     let again = imported
-        .to_xgboost_json()
+        .encode(ModelFormat::XgboostJson)
         .expect("an imported XGBoost model exports again");
     let (stored, restored) = (stored_base_score(exported), stored_base_score(&again));
     assert_eq!(stored.len(), restored.len());
@@ -348,7 +354,8 @@ fn check_xgboost_round_trip(
 
 /// The `base_score` entries an XGBoost JSON export stores
 /// (`"base_score": "[v0,v1,...]"`, written once, in `learner_model_param`).
-fn stored_base_score(json: &str) -> Vec<f32> {
+fn stored_base_score(json: &[u8]) -> Vec<f32> {
+    let json = std::str::from_utf8(json).expect("XGBoost JSON is UTF-8");
     let key = r#""base_score": "["#;
     let start = json.find(key).expect("the export stores base_score") + key.len();
     let len = json[start..].find(']').expect("base_score is a vector");

@@ -150,7 +150,7 @@ it.
 | Method | Formats |
 |---|---|
 | `save_model(path, format=None)` | by extension: `.json` native JSON, `.ubj` XGBoost UBJSON, anything else native binary; or `format="binary" \| "json" \| "xgboost-json" \| "xgboost-ubjson"` |
-| `Booster(path_or_bytes)`, `load_model(...)` | any of the four, or a LightGBM 4.x text model (`format="lightgbm"`, import only), detected from the content |
+| `Booster(path_or_bytes)`, `load_model(...)` | any of the four, or a LightGBM 4.x text model (`format="lightgbm"`, import only), detected from the content (`ModelFormatError` if it looks like none of them) |
 | `save_raw(format="binary")` | the same formats as bytes |
 | `pickle` / `copy` | native binary plus feature names, categories, and `best_score` |
 
@@ -253,9 +253,11 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
   `DiffusionModel.sample` returns `(rows, n_samples, outputs)` draws,
   deterministic per seed and step count (`n_steps=` overrides the model's);
   `mean`, `quantiles`, and `crps` summarize them.
-  Models save with `to_bytes`/`save_binary` and `to_json`/`save_json`
-  (and load with `from_bytes`/`load_binary`, `from_json`/`load_json`) or
-  pickle (which also keeps feature names and categories). `fit` releases
+  Models save with `to_bytes(format="binary")` / `save(path,
+  format="binary")` (`"binary"` or `"json"`) and load with
+  `from_bytes(data, format="auto")` / `load(path, format="auto")`, which
+  detect the format (`ModelFormatError` for bytes in neither), or pickle
+  (which also keeps feature names and categories). `fit` releases
   the GIL but cannot be interrupted: Ctrl-C takes effect once it returns.
 - `hessboost.diffusion.forest`: ForestFlow / ForestDiffusion synthetic
   tabular rows (optionally per class of a label) and missing-value

@@ -2,6 +2,7 @@ use super::*;
 use crate::config::{Dart, GrowPolicy, LinearTree, TreeMethod};
 use crate::metric::{Metric, Rmse};
 use crate::model::Iterations;
+use crate::model::ModelFormat;
 use crate::objective::{Aft, CustomLoss, LambdaRank, Multiclass, Objective, PseudoHuber, RegLoss};
 use crate::rng::Rng;
 use crate::test_support::labeled_dense;
@@ -272,7 +273,11 @@ fn num_class_must_match_the_objective_outputs() {
                 .unwrap_or(0),
             num_class
         );
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap();
     }
 }
 
@@ -451,13 +456,18 @@ fn custom_multi_output_objective_trains_with_stride_and_round_trips() {
         "output 1 did not learn: {err1} vs {err_init}"
     );
 
-    let via_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
+    let via_json =
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap();
     assert_eq!(via_json.n_outputs(), 2);
     assert_eq!(
         via_json.predict_margin(&d, Iterations::Best).unwrap(),
         margin
     );
-    let via_bytes = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+    let via_bytes = BoostedModel::decode(
+        model.encode(ModelFormat::Binary).unwrap(),
+        ModelFormat::Binary,
+    )
+    .unwrap();
     assert_eq!(via_bytes.n_outputs(), 2);
     assert_eq!(
         via_bytes.predict_margin(&d, Iterations::Best).unwrap(),
@@ -539,8 +549,12 @@ fn dart_trains_reduces_error_and_roundtrips() {
 
     // Native and JSON round-trips preserve predictions (weights included).
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ] {
         assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), preds);
     }
@@ -894,8 +908,12 @@ fn gblinear_roundtrips() {
     let before = model.predict(&d, Iterations::Best).unwrap();
 
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ] {
         assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), before);
     }
@@ -1300,10 +1318,22 @@ fn multi_label_model_round_trips_and_classifies_per_label() {
         assert_eq!(c as f32, cols[i % 2][i / 2], "separable cell {i}");
     }
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
-        BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap(),
-        BoostedModel::from_xgboost_ubjson(&model.to_xgboost_ubjson().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::XgboostJson).unwrap(),
+            ModelFormat::XgboostJson,
+        )
+        .unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::XgboostUbjson).unwrap(),
+            ModelFormat::XgboostUbjson,
+        )
+        .unwrap(),
     ] {
         assert_eq!(restored.n_targets(), 2);
         assert_eq!(restored.predict(&d, Iterations::Best).unwrap(), preds);

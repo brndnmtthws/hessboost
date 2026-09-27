@@ -6,6 +6,7 @@ use hessboost::config::{MaxDeltaStep, MultiStrategy, TrainingParamsBuilder, Tree
 use hessboost::conformal::ConformalizedQuantile;
 use hessboost::metric::EvalMetric;
 use hessboost::model::Iterations;
+use hessboost::model::ModelFormat;
 use hessboost::objective::distributional::{
     Dist, DistFamily, DistGradient, DistSplitDirection, Distributional,
 };
@@ -333,8 +334,12 @@ fn native_round_trip_and_determinism() {
     );
     let dists = model.predict_distribution(&d, Iterations::Best).unwrap();
     for restored in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ] {
         assert_eq!(restored.objective().name(), "dist:gamma");
         assert_eq!(
@@ -353,11 +358,11 @@ fn xgboost_formats_refuse_distributional_models() {
     let d = sampled(300, 10, |a, _| Dist::Normal { mu: a, sigma: 1.0 });
     let model = train(&params(dist(DistFamily::Normal)).build().unwrap(), &d, 3).unwrap();
     assert!(matches!(
-        model.to_xgboost_json(),
+        model.encode(ModelFormat::XgboostJson),
         Err(HessboostError::ModelFormat(_))
     ));
     assert!(matches!(
-        model.to_xgboost_ubjson(),
+        model.encode(ModelFormat::XgboostUbjson),
         Err(HessboostError::ModelFormat(_))
     ));
     // A document claiming a `dist:*` objective is refused on import too.
@@ -369,12 +374,11 @@ fn xgboost_formats_refuse_distributional_models() {
         3,
     )
     .unwrap();
-    let doc = point
-        .to_xgboost_json()
+    let doc = String::from_utf8(point.encode(ModelFormat::XgboostJson).unwrap())
         .unwrap()
         .replace("\"reg:squarederror\"", "\"dist:normal\"");
     assert!(matches!(
-        BoostedModel::from_xgboost_json(&doc),
+        BoostedModel::decode(&doc, ModelFormat::XgboostJson),
         Err(HessboostError::ModelFormat(_))
     ));
 }
@@ -542,7 +546,11 @@ fn shared_trees_fit_every_parameter_in_one_tree_per_round() {
                 .predict_margin(&dtest, Iterations::Best)
                 .unwrap()
         );
-        let restored = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        let restored = BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap();
         assert_eq!(
             restored
                 .predict_distribution(&dtest, Iterations::Best)

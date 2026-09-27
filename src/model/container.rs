@@ -15,6 +15,7 @@
 //! stored as uncompressed native containers ([`write_models`],
 //! [`read_models`]).
 
+use crate::model::ModelFormat;
 use std::borrow::Cow;
 use std::io::Read;
 
@@ -27,6 +28,12 @@ use crate::error::Result;
 pub(crate) const WRITER: &str = concat!("hessboost ", env!("CARGO_PKG_VERSION"));
 /// The zstd frame magic number, little-endian.
 pub(super) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Whether `bytes` start like a zstd frame (the packed form of every
+/// section container).
+pub(crate) fn is_zstd_frame(bytes: &[u8]) -> bool {
+    bytes.starts_with(&ZSTD_MAGIC)
+}
 /// Decompressed containers up to this size always load; larger ones must
 /// stay within [`MAX_EXPANSION`] of their compressed size. Together they
 /// bound what a small malicious file can make the reader allocate.
@@ -140,7 +147,7 @@ pub(crate) fn read_models(
             .filter(|&len| len <= blob.len())
             .ok_or_else(|| format_error(format!("section `{lengths_name}` is out of range")))?;
         let (model, rest) = blob.split_at(len);
-        models.push(BoostedModel::from_bytes(model)?);
+        models.push(BoostedModel::decode(model, ModelFormat::Binary)?);
         blob = rest;
     }
     if !blob.is_empty() {

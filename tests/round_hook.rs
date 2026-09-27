@@ -2,6 +2,7 @@
 //! changes the model, and a `Break` ends training with the rounds so far.
 
 use hessboost::config::{BoosterKind, Dart, ProcessType, Refresh};
+use hessboost::model::ModelFormat;
 use hessboost::prelude::{BoostedModel, Trainer, TrainingParams, train};
 use hessboost::training::RoundEval;
 use std::num::NonZeroUsize;
@@ -11,7 +12,7 @@ mod common;
 use common::smooth::noisy as data;
 
 fn bytes(model: &BoostedModel) -> Vec<u8> {
-    model.to_bytes().unwrap()
+    model.encode(ModelFormat::Binary).unwrap()
 }
 /// Row sampling and DART dropout: a hook must not disturb the RNG streams.
 fn sampled() -> TrainingParams {

@@ -130,8 +130,12 @@ fn the_ebm_record_survives_the_native_formats_but_not_slicing() {
     let model = train(&classic().build().unwrap(), &dtrain, 10).unwrap();
     let info = model.ebm().cloned().expect("an EBM");
     for m in [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ] {
         assert_eq!(m.ebm(), Some(&info));
         assert_eq!(
@@ -160,8 +164,8 @@ fn training_and_bands_are_identical_across_thread_counts() {
         )
         .unwrap();
         (
-            bagged.to_bytes().unwrap(),
-            model.to_bytes().unwrap(),
+            bagged.encode(ModelFormat::Binary).unwrap(),
+            model.encode(ModelFormat::Binary).unwrap(),
             inference.term_bands(0, 0.1).unwrap(),
             inference.term_bands(3, 0.1).unwrap(),
             inference.confidence_intervals(&dtrain, 0.1).unwrap(),
@@ -472,7 +476,10 @@ fn the_round_hook_sees_both_stages_and_stops_training() {
         // Six main-effect rounds, then six pair rounds; observing changes
         // nothing.
         assert_eq!(seen, (0..12).collect::<Vec<_>>());
-        assert_eq!(observed.to_bytes().unwrap(), plain.to_bytes().unwrap());
+        assert_eq!(
+            observed.encode(ModelFormat::Binary).unwrap(),
+            plain.encode(ModelFormat::Binary).unwrap()
+        );
         let stop_at = |k: usize| {
             Trainer::new(&params, &dtrain, 6)
                 .on_round(move |round| {
@@ -727,7 +734,10 @@ fn early_stopping_ends_every_bag_at_its_best_round() {
         stopped.num_trees()
     );
     let (again, _) = rounds(4000);
-    assert_eq!(again.to_bytes().unwrap(), stopped.to_bytes().unwrap());
+    assert_eq!(
+        again.encode(ModelFormat::Binary).unwrap(),
+        stopped.encode(ModelFormat::Binary).unwrap()
+    );
     assert_eq!(shape_functions(&stopped).unwrap().terms.len(), 4);
 }
 
@@ -742,8 +752,9 @@ fn a_boulevard_ebm_with_a_broken_round_layout_does_not_load() {
         3,
     )
     .unwrap();
-    let mut json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
-    assert!(BoostedModel::from_json(&json.to_string()).is_ok());
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&model.encode(ModelFormat::Json).unwrap()).unwrap();
+    assert!(BoostedModel::decode(json.to_string(), ModelFormat::Json).is_ok());
     // One more main-effect tree: the stage no longer holds whole rounds.
     let first = json["trees"][0].clone();
     json["trees"].as_array_mut().unwrap().push(first);
@@ -757,7 +768,7 @@ fn a_boulevard_ebm_with_a_broken_round_layout_does_not_load() {
         .unwrap()
         .push(serde_json::json!(0));
     assert!(matches!(
-        BoostedModel::from_json(&json.to_string()),
+        BoostedModel::decode(json.to_string(), ModelFormat::Json),
         Err(HessboostError::ModelFormat(_))
     ));
 }

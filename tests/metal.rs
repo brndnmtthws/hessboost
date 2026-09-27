@@ -105,8 +105,8 @@ fn device_metal_training_matches_single_threaded_cpu() {
         let cpu = train_one(build(Device::Cpu));
         let gpu = train_one(build(Device::Metal));
         assert_eq!(
-            cpu.to_bytes().unwrap(),
-            gpu.to_bytes().unwrap(),
+            cpu.encode(ModelFormat::Binary).unwrap(),
+            gpu.encode(ModelFormat::Binary).unwrap(),
             "the metal-trained model must be bit-identical to the CPU's \
              (posterior sampling {posterior_sampling})"
         );
@@ -132,7 +132,10 @@ fn device_metal_training_is_deterministic() {
         .unwrap();
     let run = |threads| {
         common::with_threads(threads, || {
-            train(&params, &data, 8).unwrap().to_bytes().unwrap()
+            train(&params, &data, 8)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
         })
     };
     assert_eq!(run(1), run(1));
@@ -372,8 +375,12 @@ fn wide_dynamic_range_training_matches_single_threaded_cpu() {
     };
     let train_one = |params| common::with_threads(1, || train(&params, &data, 2).unwrap());
     assert_eq!(
-        train_one(build(Device::Cpu)).to_bytes().unwrap(),
-        train_one(build(Device::Metal)).to_bytes().unwrap()
+        train_one(build(Device::Cpu))
+            .encode(ModelFormat::Binary)
+            .unwrap(),
+        train_one(build(Device::Metal))
+            .encode(ModelFormat::Binary)
+            .unwrap()
     );
 }
 

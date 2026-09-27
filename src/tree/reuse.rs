@@ -265,6 +265,7 @@ mod tests {
     use super::*;
     use crate::data::DMatrix;
     use crate::data::ghist::GHistIndex;
+    use crate::model::ModelFormat;
     use crate::objective::GradPair;
     use crate::training::train;
     use crate::tree::builder::{ExactTreeBuilder, HistTreeBuilder, SortedColumns, all_rows};
@@ -464,7 +465,10 @@ mod tests {
                 .toad_penalty_threshold(1.0)
                 .build()
                 .unwrap();
-            train(&p, &data, 10).unwrap().to_bytes().unwrap()
+            train(&p, &data, 10)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
         };
         for method in [
             crate::config::TreeMethod::Hist,

@@ -60,14 +60,7 @@ from numpy.typing import ArrayLike, NDArray
 from hessboost import _data, _hessboost
 from hessboost._exceptions import HessboostError
 from hessboost._matrix import _matrix_for
-from hessboost._model_io import (
-    PathLike,
-    _SchemaState,
-    read_bytes,
-    read_text,
-    write_bytes,
-    write_text,
-)
+from hessboost._model_io import PathLike, _SchemaState, read_bytes, write_bytes
 
 __all__ = [
     "DiffusionModel",
@@ -693,67 +686,56 @@ class DiffusionModel(_SchemaState):
         files; pickling keeps them)."""
         return None if self._feature_names is None else list(self._feature_names)
 
-    def to_bytes(self) -> bytes:
-        """The model in the native binary format (zstd-compressed, magic
-        ``HBDM``)."""
-        return self._core.to_bytes()
+    def to_bytes(self, format: Literal["binary", "json"] = "binary") -> bytes:
+        """The model encoded as ``format``: ``"binary"``, the native binary
+        format (zstd-compressed, magic ``HBDM``), or ``"json"``, UTF-8 JSON
+        of the method, the label standardization, the residualizer, and
+        each GBDT in hessboost's native JSON.
+
+        Feature names and categories are not part of the formats; pickle
+        the model to keep them."""
+        return self._core.encode(format)
 
     @classmethod
-    def from_bytes(cls, data: bytes | bytearray | memoryview) -> Self:
-        """Reads a model written by :meth:`to_bytes`.
+    def from_bytes(
+        cls,
+        data: bytes | bytearray | memoryview,
+        format: Literal["auto", "binary", "json"] = "auto",
+    ) -> Self:
+        """Reads a model written by :meth:`to_bytes` as ``format``, by
+        default the one the bytes look like.
 
         Raises:
-            ModelFormatError: The bytes are not a valid diffusion model.
+            ModelFormatError: The bytes are in neither format, or not a
+                valid diffusion model.
         """
-        return cls._wrap(_hessboost.DiffusionModel.from_bytes(bytes(data)))
+        return cls._wrap(_hessboost.DiffusionModel.decode(bytes(data), format))
 
-    def save_binary(self, path: PathLike) -> None:
-        """Writes :meth:`to_bytes` to ``path``."""
-        write_bytes(path, self.to_bytes())
-
-    @classmethod
-    def load_binary(cls, path: PathLike) -> Self:
-        """Reads a file written by :meth:`save_binary`.
+    def save(self, path: PathLike, format: Literal["binary", "json"] = "binary") -> None:
+        """Writes :meth:`to_bytes` of ``format`` to ``path``.
 
         Raises:
-            ModelFormatError: The file is not a valid diffusion model.
+            OSError: The file cannot be written.
+        """
+        write_bytes(path, self.to_bytes(format))
+
+    @classmethod
+    def load(cls, path: PathLike, format: Literal["auto", "binary", "json"] = "auto") -> Self:
+        """Reads a file written by :meth:`save`, as :meth:`from_bytes` reads
+        bytes.
+
+        Raises:
+            ModelFormatError: The file is in neither format, or not a valid
+                diffusion model.
             OSError: The file cannot be read.
         """
-        return cls.from_bytes(read_bytes(path))
-
-    def to_json(self) -> str:
-        """The model as JSON: the method, the label standardization, the
-        residualizer, and each GBDT in hessboost's native JSON."""
-        return self._core.to_json()
-
-    @classmethod
-    def from_json(cls, text: str) -> Self:
-        """Reads a model written by :meth:`to_json`.
-
-        Raises:
-            ModelFormatError: The text is not a valid diffusion model.
-        """
-        return cls._wrap(_hessboost.DiffusionModel.from_json(text))
-
-    def save_json(self, path: PathLike) -> None:
-        """Writes :meth:`to_json` to ``path``."""
-        write_text(path, self.to_json())
-
-    @classmethod
-    def load_json(cls, path: PathLike) -> Self:
-        """Reads a file written by :meth:`save_json`.
-
-        Raises:
-            ModelFormatError: The file is not a valid diffusion model.
-            OSError: The file cannot be read.
-        """
-        return cls.from_json(read_text(path))
+        return cls.from_bytes(read_bytes(path), format)
 
     def _model_state(self) -> bytes:
-        return self._core.to_bytes()
+        return self._core.encode("binary")
 
     def _restore_model(self, model: bytes) -> None:
-        self._core = _hessboost.DiffusionModel.from_bytes(model)
+        self._core = _hessboost.DiffusionModel.decode(model, "binary")
 
     def __repr__(self) -> str:
         method = type(self.method).__name__

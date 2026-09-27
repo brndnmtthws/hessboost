@@ -128,8 +128,12 @@ fn the_boulevard_record_survives_the_native_formats_but_not_slicing() {
     let model = train(&builder().build().unwrap(), &dtrain, 10).unwrap();
     let info = model.boulevard().copied().expect("a Boulevard fit");
     let reloaded = [
-        BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
-        BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
+        BoostedModel::decode(
+            model.encode(ModelFormat::Binary).unwrap(),
+            ModelFormat::Binary,
+        )
+        .unwrap(),
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap(),
     ];
     for m in &reloaded {
         assert_eq!(m.boulevard(), Some(&info));
@@ -251,13 +255,17 @@ fn no_truncation_is_none() {
     let dtrain = data(150, 14);
     let model = train(&builder().build().unwrap(), &dtrain, 4).unwrap();
     assert_eq!(model.boulevard().unwrap().truncation, None);
-    let json = model.to_json().unwrap();
-    let mut doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let json = model.encode(ModelFormat::Json).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_slice(&json).unwrap();
     assert_eq!(doc["boulevard"]["truncation"], serde_json::Value::Null);
     doc["boulevard"]["truncation"] = serde_json::json!(0.0);
-    let older = BoostedModel::from_json(&doc.to_string()).unwrap();
+    let older = BoostedModel::decode(doc.to_string(), ModelFormat::Json).unwrap();
     assert_eq!(older.boulevard(), model.boulevard());
-    let native = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+    let native = BoostedModel::decode(
+        model.encode(ModelFormat::Binary).unwrap(),
+        ModelFormat::Binary,
+    )
+    .unwrap();
     assert_eq!(native.boulevard(), model.boulevard());
     let truncated = builder()
         .booster(BoosterKind::Boulevard(

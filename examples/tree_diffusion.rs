@@ -14,6 +14,7 @@
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::{DiffusionModel, DiffusionParams, SampleOptions, Samples};
 use hessboost::objective::distributional::{DistFamily, Distributional};
 use hessboost::prelude::*;
@@ -218,8 +219,12 @@ fn main() -> Result<()> {
     );
 
     // Both formats reproduce the samples exactly.
-    let from_bytes = DiffusionModel::from_bytes(&model.to_bytes()?)?;
-    let from_json = DiffusionModel::from_json(&model.to_json()?)?;
+    let from_bytes = DiffusionModel::decode(
+        &model.encode(DiffusionFormat::Binary)?,
+        DiffusionFormat::Binary,
+    )?;
+    let from_json =
+        DiffusionModel::decode(&model.encode(DiffusionFormat::Json)?, DiffusionFormat::Json)?;
     assert_eq!(
         from_bytes.sample(&probe, 50, &SampleOptions::seeded(9))?,
         model.sample(&probe, 50, &SampleOptions::seeded(9))?
@@ -230,8 +235,8 @@ fn main() -> Result<()> {
     );
     println!(
         "saved: {} bytes native, {} bytes JSON; reloaded samples match",
-        model.to_bytes()?.len(),
-        model.to_json()?.len()
+        model.encode(DiffusionFormat::Binary)?.len(),
+        model.encode(DiffusionFormat::Json)?.len()
     );
     Ok(())
 }

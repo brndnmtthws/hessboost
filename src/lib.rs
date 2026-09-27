@@ -32,7 +32,7 @@
 //! let preds = model.predict(&dtrain, Iterations::Best)?;
 //! assert_eq!((preds.n_rows(), preds.width()), (6, 1)); // `[row][output]`
 //!
-//! model.save_binary("model.bin")?;      // native format
+//! model.save("model.bin", ModelFormat::Binary)?; // native format
 //! # std::fs::remove_file("model.bin").ok();
 //! # Ok(())
 //! # }
@@ -113,8 +113,10 @@
 //! - **I/O:** libsvm/CSV loaders, native binary + JSON, XGBoost JSON and
 //!   UBJSON import/export ([XGBoost interchange](model#xgboost-interchange)),
 //!   LightGBM 4.x text model import
-//!   ([`from_lightgbm_text`](model::BoostedModel::from_lightgbm_text); see
-//!   [LightGBM import](model#lightgbm-import)).
+//!   ([`ModelFormat::LightgbmText`](model::ModelFormat::LightgbmText); see
+//!   [LightGBM import](model#lightgbm-import)), all through one
+//!   [`ModelFormat`](model::ModelFormat) with byte-level
+//!   [`detect`](model::ModelFormat::detect)ion.
 //! - **Validation:** cross-validation ([`cv`](training::cv)), custom,
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
 //!   (timestamped rows, purged by each label window,
@@ -284,7 +286,7 @@ pub mod prelude {
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
     pub use crate::metric::EvalMetric;
-    pub use crate::model::{BoostedModel, ImportanceType, Iterations};
+    pub use crate::model::{BoostedModel, ImportanceType, Iterations, ModelFormat};
     pub use crate::objective::{Objective, RegLoss};
     pub use crate::training::{Trainer, train};
 }

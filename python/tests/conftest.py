@@ -71,16 +71,22 @@ def reloaded(model: DiffusionModel, tmp_path: Path, suffix: str) -> list[Diffusi
 @overload
 def reloaded(model: ForestModel, tmp_path: Path, suffix: str) -> list[ForestModel]: ...
 def reloaded(model: DiffusionModel | ForestModel, tmp_path: Path, suffix: str) -> list[Any]:
-    """``model`` read back from each of its encodings: bytes, JSON, a binary
-    file named with ``suffix``, a JSON file, and a pickle."""
+    """``model`` read back from each of its encodings: binary and JSON
+    bytes (detected and named), a binary file named with ``suffix`` and a
+    JSON file (detected and named), and a pickle."""
     cls = type(model)
-    model.save_binary(tmp_path / f"model{suffix}")
-    model.save_json(tmp_path / "model.json")
+    binary, text = model.to_bytes(), model.to_bytes("json")
+    model.save(tmp_path / f"model{suffix}")
+    model.save(tmp_path / "model.json", "json")
+    assert (tmp_path / "model.json").read_bytes() == text
     return [
-        cls.from_bytes(model.to_bytes()),
-        cls.from_json(model.to_json()),
-        cls.load_binary(tmp_path / f"model{suffix}"),
-        cls.load_json(tmp_path / "model.json"),
+        cls.from_bytes(binary),
+        cls.from_bytes(text),
+        cls.from_bytes(bytearray(binary), "binary"),
+        cls.from_bytes(memoryview(text), "json"),
+        cls.load(tmp_path / f"model{suffix}"),
+        cls.load(tmp_path / "model.json"),
+        cls.load(tmp_path / "model.json", "json"),
         pickle.loads(pickle.dumps(model)),
     ]
 

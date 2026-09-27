@@ -7,6 +7,7 @@ use std::num::NonZeroUsize;
 use hessboost::config::{
     BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
 };
+use hessboost::diffusion::DiffusionFormat;
 use hessboost::diffusion::forest::{
     ColumnKind, ForestMethod, ForestModel, ForestParams, ImputeOptions, NoiseLevels, Repaint,
 };
@@ -198,18 +199,25 @@ fn both_formats_round_trip() {
     ] {
         let model = ForestModel::fit(&params, &data).unwrap();
         let expected = model.sample(20, 1).unwrap();
-        let bytes = model.to_bytes().unwrap();
-        let resaved = ForestModel::from_bytes(&bytes).unwrap().to_bytes().unwrap();
+        let bytes = model.encode(DiffusionFormat::Binary).unwrap();
+        let resaved = ForestModel::decode(&bytes, DiffusionFormat::Binary)
+            .unwrap()
+            .encode(DiffusionFormat::Binary)
+            .unwrap();
         assert!(resaved == bytes, "re-saving changes the bytes");
         for loaded in [
-            ForestModel::from_bytes(&bytes).unwrap(),
-            ForestModel::from_json(&model.to_json().unwrap()).unwrap(),
+            ForestModel::decode(&bytes, DiffusionFormat::Binary).unwrap(),
+            ForestModel::decode(
+                model.encode(DiffusionFormat::Json).unwrap(),
+                DiffusionFormat::Json,
+            )
+            .unwrap(),
         ] {
             assert_eq!(loaded.method(), model.method());
             assert_eq!(loaded.sample(20, 1).unwrap(), expected);
         }
         assert!(matches!(
-            ForestModel::from_bytes(&bytes[..bytes.len() / 2]),
+            ForestModel::decode(&bytes[..bytes.len() / 2], DiffusionFormat::Binary),
             Err(HessboostError::ModelFormat(_))
         ));
     }
@@ -367,7 +375,8 @@ fn stored_values_outside_f32_are_refused() {
     let (x, y) = table(60, 7);
     let model =
         ForestModel::fit(&quick(ForestParams::forest_diffusion()), &labelled(&x, &y)).unwrap();
-    let json: serde_json::Value = serde_json::from_str(&model.to_json().unwrap()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&model.encode(DiffusionFormat::Json).unwrap()).unwrap();
     for (path, value) in [
         ("/classes/0", serde_json::json!(-1e100)),
         ("/classes/0", serde_json::json!(0.1)),
@@ -377,7 +386,7 @@ fn stored_values_outside_f32_are_refused() {
         let mut doc = json.clone();
         *doc.pointer_mut(path).unwrap() = value;
         assert!(
-            ForestModel::from_json(&doc.to_string()).is_err(),
+            ForestModel::decode(doc.to_string(), DiffusionFormat::Json).is_err(),
             "{path} accepted"
         );
     }

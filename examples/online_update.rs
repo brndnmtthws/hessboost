@@ -85,7 +85,7 @@ fn main() -> Result<()> {
     let reference = train(&params, exact.data(), rounds)?;
     println!(
         "exact mode after deleting 200 rows equals retraining bit for bit: {}",
-        exact.model().to_json()? == reference.to_json()?
+        exact.model().encode(ModelFormat::Json)? == reference.encode(ModelFormat::Json)?
     );
     Ok(())
 }

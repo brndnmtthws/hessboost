@@ -107,10 +107,12 @@
 //!
 //! # Persistence
 //!
-//! [`DiffusionModel::to_bytes`] writes a zstd-compressed section container
-//! (magic `HBDM`) holding the method, the standardization, the residualizer
-//! and the GBDTs as embedded native containers;
-//! [`DiffusionModel::to_json`] writes the same content as JSON, with each
+//! [`DiffusionModel::encode`] / [`decode`](DiffusionModel::decode) and
+//! [`save`](DiffusionModel::save) / [`load`](DiffusionModel::load) take a
+//! [`DiffusionFormat`]: [`DiffusionFormat::Binary`] is a zstd-compressed
+//! section container (magic `HBDM`) holding the method, the
+//! standardization, the residualizer and the GBDTs as embedded native
+//! containers; [`DiffusionFormat::Json`] the same content as JSON, with each
 //! GBDT in the native JSON format. Both readers validate the model.
 //!
 //! # Refusals
@@ -156,7 +158,7 @@
 //! ```
 //! use std::num::NonZeroUsize;
 //!
-//! use hessboost::diffusion::{DiffusionModel, DiffusionParams, SampleOptions};
+//! use hessboost::diffusion::{DiffusionFormat, DiffusionModel, DiffusionParams, SampleOptions};
 //! use hessboost::prelude::*;
 //!
 //! # fn main() -> Result<()> {
@@ -179,7 +181,8 @@
 //! let q = samples.quantiles(&[0.1, 0.9])?;
 //! assert!(q.get(0, 0).unwrap()[0] < q.get(0, 1).unwrap()[0]); // row 0: 10% < 90%
 //!
-//! let restored = DiffusionModel::from_bytes(&model.to_bytes()?)?;
+//! let bytes = model.encode(DiffusionFormat::Binary)?;
+//! let restored = DiffusionModel::decode(&bytes, DiffusionFormat::Binary)?;
 //! assert_eq!(restored.sample(&data, 20, &options)?, samples);
 //! # Ok(())
 //! # }
@@ -188,6 +191,7 @@
 mod fit;
 pub mod forest;
 mod format;
+mod io;
 mod process;
 mod sample;
 
@@ -201,6 +205,7 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Objective;
 
+pub use io::DiffusionFormat;
 pub use sample::{Quantiles, SampleOptions, Samples, SamplesView};
 
 /// What the GBDT learns and how sampling integrates it.
@@ -738,9 +743,9 @@ struct FittedResidualizer {
 /// score/velocity GBDT, the label standardization, the optional
 /// residualizer, and the sampler settings. See the [module docs](self).
 ///
-/// The serde implementations are the JSON format ([`Self::to_json`] /
-/// [`Self::from_json`]); deserializing validates the model like the loaders
-/// do.
+/// The serde implementations are the JSON format ([`DiffusionFormat::Json`]
+/// in [`Self::encode`] / [`Self::decode`]); deserializing validates the
+/// model like the loaders do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "format::UncheckedDiffusionModel")]
 pub struct DiffusionModel {
@@ -834,82 +839,57 @@ impl DiffusionModel {
         &self.regressor
     }
 
-    /// Serialize to the native binary format: a zstd-compressed section
-    /// container (magic `HBDM`) embedding the GBDTs' native containers.
+    /// The model encoded in `format` ([`DiffusionFormat::Binary`]: a
+    /// zstd-compressed section container, magic `HBDM`, embedding the GBDTs'
+    /// native containers; [`DiffusionFormat::Json`]: the method, the
+    /// standardization, the residualizer, and each GBDT in the native JSON
+    /// format, pretty-printed).
     ///
     /// # Errors
     ///
     /// [`HessboostError::ModelFormat`] for a GBDT too large for the native
-    /// format; [`HessboostError::Io`] if compression fails.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        format::write(self)
+    /// format; [`HessboostError::Io`] if compression fails;
+    /// [`HessboostError::Json`] if JSON serialization fails.
+    pub fn encode(&self, format: DiffusionFormat) -> Result<Vec<u8>> {
+        match format {
+            DiffusionFormat::Binary => format::write(self),
+            DiffusionFormat::Json => Ok(serde_json::to_vec_pretty(self)?),
+        }
     }
 
-    /// Deserialize a model written by [`Self::to_bytes`].
+    /// Decode a model written by [`Self::encode`] in `format`
+    /// ([`DiffusionFormat::detect`] guesses the format of unknown bytes).
     ///
     /// # Errors
     ///
     /// [`HessboostError::ModelFormat`] for malformed or inconsistent input,
-    /// and for files needing a feature this version lacks.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        format::read(bytes)
-    }
-
-    /// Save to a file in the native binary format.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Self::to_bytes`] and of writing the file.
-    pub fn save_binary(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_bytes()?)?)
-    }
-
-    /// Load a native binary file.
-    ///
-    /// # Errors
-    ///
-    /// The errors of reading the file and of [`Self::from_bytes`].
-    pub fn load_binary(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_bytes(&std::fs::read(path)?)
-    }
-
-    /// Serialize to JSON: the method, the standardization, the residualizer,
-    /// and each GBDT in the native JSON format
-    /// ([`BoostedModel::to_json`]).
-    ///
-    /// # Errors
-    ///
-    /// [`HessboostError::Json`] if serialization fails.
-    pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(self)?)
-    }
-
-    /// Deserialize a model written by [`Self::to_json`].
-    ///
-    /// # Errors
-    ///
+    /// and for files needing a feature this version lacks;
     /// [`HessboostError::Json`] for malformed JSON (a missing field
-    /// included), [`HessboostError::ModelFormat`] for an inconsistent model.
-    pub fn from_json(json: &str) -> Result<Self> {
-        Ok(serde_json::from_str(json)?)
+    /// included).
+    pub fn decode(bytes: impl AsRef<[u8]>, format: DiffusionFormat) -> Result<Self> {
+        let bytes = bytes.as_ref();
+        match format {
+            DiffusionFormat::Binary => format::read(bytes),
+            DiffusionFormat::Json => Ok(serde_json::from_slice(bytes)?),
+        }
     }
 
-    /// Save to a file as JSON.
+    /// Write [`Self::encode`]`(format)` to the file at `path`.
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::to_json`] and of writing the file.
-    pub fn save_json(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_json()?)?)
+    /// The errors of [`Self::encode`] and of writing the file.
+    pub fn save(&self, path: impl AsRef<std::path::Path>, format: DiffusionFormat) -> Result<()> {
+        Ok(std::fs::write(path, self.encode(format)?)?)
     }
 
-    /// Load a JSON file.
+    /// [`Self::decode`] the file at `path` in `format`.
     ///
     /// # Errors
     ///
-    /// The errors of reading the file and of [`Self::from_json`].
-    pub fn load_json(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_json(&std::fs::read_to_string(path)?)
+    /// The errors of reading the file and of [`Self::decode`].
+    pub fn load(path: impl AsRef<std::path::Path>, format: DiffusionFormat) -> Result<Self> {
+        Self::decode(std::fs::read(path)?, format)
     }
 
     /// Check what sampling and the formats rely on.

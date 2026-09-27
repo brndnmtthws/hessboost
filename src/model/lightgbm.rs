@@ -958,6 +958,7 @@ mod tests {
     use super::*;
     use crate::data::DMatrix;
     use crate::model::Iterations;
+    use crate::model::ModelFormat;
     use serde_json::Value;
 
     /// LightGBM 4.7.0 models with LightGBM's own predictions on their test
@@ -998,7 +999,7 @@ mod tests {
             (LINEAR, LINEAR_EXPECTED, "reg:squarederror"),
         ] {
             let expected: Value = serde_json::from_str(expected).unwrap();
-            let model = BoostedModel::from_lightgbm_text(text).unwrap();
+            let model = BoostedModel::decode(text, ModelFormat::LightgbmText).unwrap();
             assert_eq!(model.objective().name(), objective);
             let x: Vec<f32> = floats(&expected, "x_test")
                 .iter()
@@ -1053,7 +1054,11 @@ mod tests {
                     .as_slice(),
                 &floats(&expected, "raw_slice"),
             );
-            let restored = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+            let restored = BoostedModel::decode(
+                model.encode(ModelFormat::Binary).unwrap(),
+                ModelFormat::Binary,
+            )
+            .unwrap();
             assert_eq!(
                 restored.predict(&data, Iterations::Best).unwrap(),
                 model.predict(&data, Iterations::Best).unwrap()
@@ -1105,7 +1110,7 @@ mod tests {
 
     /// The leaf (`1` left, `2` right) each of `values` reaches.
     fn route(model: &str, values: &[f32]) -> Vec<f32> {
-        let model = BoostedModel::from_lightgbm_text(model).unwrap();
+        let model = BoostedModel::decode(model, ModelFormat::LightgbmText).unwrap();
         let data = DMatrix::from_dense(values, values.len(), 1).unwrap();
         model
             .predict_margin(&data, Iterations::Best)
@@ -1119,10 +1124,12 @@ mod tests {
     #[test]
     fn class_counts_are_bounded_by_the_parsed_trees() {
         for classes in [usize::MAX.to_string(), "3".to_string()] {
-            let err =
-                BoostedModel::from_lightgbm_text(&format!("{}end of trees\n", header(&classes)))
-                    .unwrap_err()
-                    .to_string();
+            let err = BoostedModel::decode(
+                format!("{}end of trees\n", header(&classes)),
+                ModelFormat::LightgbmText,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("whole iteration"), "{err}");
         }
         // A one-tree model claiming more outputs than it has trees too.
@@ -1131,7 +1138,7 @@ mod tests {
             header("3"),
             stump_tree("0.5", NONE, None)
         );
-        let err = BoostedModel::from_lightgbm_text(&wide)
+        let err = BoostedModel::decode(&wide, ModelFormat::LightgbmText)
             .unwrap_err()
             .to_string();
         assert!(err.contains("whole iteration"), "{err}");
@@ -1223,7 +1230,8 @@ mod tests {
         // Zeros sent away from the small values of their own side.
         for (threshold, decision) in [("0.5", ZERO), ("-0.5", ZERO | LEFT)] {
             let error =
-                BoostedModel::from_lightgbm_text(&stump(threshold, decision, None)).unwrap_err();
+                BoostedModel::decode(stump(threshold, decision, None), ModelFormat::LightgbmText)
+                    .unwrap_err();
             assert!(error.to_string().contains("zero_as_missing"), "{error}");
         }
     }
@@ -1239,8 +1247,11 @@ mod tests {
             ),
             [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
         );
-        let empty =
-            BoostedModel::from_lightgbm_text(&stump("0", CATEGORICAL_MASK, Some("0"))).unwrap_err();
+        let empty = BoostedModel::decode(
+            stump("0", CATEGORICAL_MASK, Some("0")),
+            ModelFormat::LightgbmText,
+        )
+        .unwrap_err();
         assert!(empty.to_string().contains("empty"), "{empty}");
     }
 
@@ -1302,7 +1313,7 @@ mod tests {
             (replace("is_linear=0", "is_linear=2"), "is_linear"),
         ];
         for (text, needle) in cases {
-            match BoostedModel::from_lightgbm_text(&text) {
+            match BoostedModel::decode(&text, ModelFormat::LightgbmText) {
                 Err(HessboostError::ModelFormat(message)) => {
                     assert!(message.contains(needle), "`{needle}` not in `{message}`");
                 }

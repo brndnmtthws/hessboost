@@ -18,6 +18,7 @@
 //! Every section is `REQUIRED` except `diffusion.writer`, and the reader
 //! refuses unknown values inside known sections, as the native reader does.
 
+use crate::model::ModelFormat;
 use serde::Deserialize;
 
 use super::{
@@ -260,7 +261,7 @@ fn read_model(s: &Sections) -> Result<DiffusionModel> {
         target_mean: s.array_exact("target.mean", n_outputs, f64::from_le_bytes)?,
         target_scale: s.array_exact("target.scale", n_outputs, f64::from_le_bytes)?,
         residualizer,
-        regressor: BoostedModel::from_bytes(s.bytes("regressor.model")?)?,
+        regressor: BoostedModel::decode(s.bytes("regressor.model")?, ModelFormat::Binary)?,
     };
     model.validate()?;
     Ok(model)

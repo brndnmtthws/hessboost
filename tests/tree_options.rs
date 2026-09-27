@@ -46,7 +46,10 @@ fn disabled_options_keep_the_default_model_bit_for_bit() {
     // the switches off only `path_smooth` can be spelled out.
     let explicit = base().path_smooth(0.0).build().unwrap();
     let off = train(&explicit, &data, 10).unwrap();
-    assert_eq!(default.to_bytes().unwrap(), off.to_bytes().unwrap());
+    assert_eq!(
+        default.encode(ModelFormat::Binary).unwrap(),
+        off.encode(ModelFormat::Binary).unwrap()
+    );
 }
 
 #[test]
@@ -54,15 +57,24 @@ fn every_option_changes_the_model_and_is_reproducible() {
     let data = piecewise_linear(500, 2);
     let default = train(&base().build().unwrap(), &data, 10)
         .unwrap()
-        .to_bytes()
+        .encode(ModelFormat::Binary)
         .unwrap();
     for params in [
         base().extra_trees(ExtraTrees::default()).build().unwrap(),
         base().path_smooth(5.0).build().unwrap(),
         base().linear_tree(LinearTree::default()).build().unwrap(),
     ] {
-        let a = train(&params, &data, 10).unwrap().to_bytes().unwrap();
-        assert_eq!(a, train(&params, &data, 10).unwrap().to_bytes().unwrap());
+        let a = train(&params, &data, 10)
+            .unwrap()
+            .encode(ModelFormat::Binary)
+            .unwrap();
+        assert_eq!(
+            a,
+            train(&params, &data, 10)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
+        );
         assert_ne!(a, default);
     }
 }
@@ -81,7 +93,10 @@ fn options_grow_the_same_model_serially_and_in_parallel() {
         .unwrap();
     let fit = |threads: usize| {
         common::with_threads(threads, || {
-            train(&params, &data, 4).unwrap().to_bytes().unwrap()
+            train(&params, &data, 4)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
         })
     };
     assert_eq!(fit(1), fit(4));
@@ -128,17 +143,22 @@ fn linear_models_round_trip_natively_and_refuse_xgboost_formats_and_shap() {
     let model = train(&params, &data, 6).unwrap();
     let before = model.predict(&data, Iterations::Best).unwrap();
 
-    let from_bytes = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+    let from_bytes = BoostedModel::decode(
+        model.encode(ModelFormat::Binary).unwrap(),
+        ModelFormat::Binary,
+    )
+    .unwrap();
     assert_eq!(from_bytes.predict(&data, Iterations::Best).unwrap(), before);
-    let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
+    let from_json =
+        BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap();
     assert_eq!(from_json.predict(&data, Iterations::Best).unwrap(), before);
 
     assert!(matches!(
-        model.to_xgboost_json(),
+        model.encode(ModelFormat::XgboostJson),
         Err(HessboostError::ModelFormat(_))
     ));
     assert!(matches!(
-        model.to_xgboost_ubjson(),
+        model.encode(ModelFormat::XgboostUbjson),
         Err(HessboostError::ModelFormat(_))
     ));
     assert_eq!(

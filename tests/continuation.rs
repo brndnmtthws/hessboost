@@ -5,6 +5,7 @@ use hessboost::config::{
     BoosterKind, Dart, ExtraTrees, GrowPolicy, LinearTree, ProcessType, QuantizedGrad, Refresh,
     SamplingMethod, TreeMethod,
 };
+use hessboost::model::ModelFormat;
 use hessboost::model::{Iterations, Predictions};
 use hessboost::objective::{Multiclass, PseudoHuber};
 use hessboost::prelude::{
@@ -71,14 +72,21 @@ fn continuing_grows_the_same_trees_as_training_in_one_run() {
             .unwrap()
             .model;
         assert_eq!(resumed.num_boost_rounds(), 12);
-        assert_eq!(resumed.to_bytes().unwrap(), whole.to_bytes().unwrap());
+        assert_eq!(
+            resumed.encode(ModelFormat::Binary).unwrap(),
+            whole.encode(ModelFormat::Binary).unwrap()
+        );
         // The input model is untouched.
         assert_eq!(first.num_boost_rounds(), 5);
     }
     // Continuing an XGBoost-JSON round trip of the model works the same way.
     let params = base().build().unwrap();
     let first = train(&params, &d, 4).unwrap();
-    let imported = BoostedModel::from_xgboost_json(&first.to_xgboost_json().unwrap()).unwrap();
+    let imported = BoostedModel::decode(
+        first.encode(ModelFormat::XgboostJson).unwrap(),
+        ModelFormat::XgboostJson,
+    )
+    .unwrap();
     let a = Trainer::new(&params, &d, 3)
         .init_model(&first)
         .train()

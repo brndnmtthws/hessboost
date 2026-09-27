@@ -114,11 +114,11 @@ proptest! {
         let model = train(&base_params(seed), &d, 12).unwrap();
         let before = model.predict(&d, Iterations::Best).unwrap();
 
-        let restored = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        let restored = BoostedModel::decode(model.encode(ModelFormat::Binary).unwrap(), ModelFormat::Binary).unwrap();
         let after = restored.predict(&d, Iterations::Best).unwrap();
         prop_assert_eq!(&before, &after);
 
-        let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
+        let from_json = BoostedModel::decode(model.encode(ModelFormat::Json).unwrap(), ModelFormat::Json).unwrap();
         let after_json = from_json.predict(&d, Iterations::Best).unwrap();
         for (a, b) in before.as_slice().iter().zip(after_json.as_slice()) {
             prop_assert!((a - b).abs() < 1e-6);
@@ -155,7 +155,10 @@ fn training_is_independent_of_the_thread_count() {
         .unwrap();
     let train_on = |threads| {
         common::with_threads(threads, || {
-            train(&params, &data, 2).unwrap().to_bytes().unwrap()
+            train(&params, &data, 2)
+                .unwrap()
+                .encode(ModelFormat::Binary)
+                .unwrap()
         })
     };
     let serial = train_on(1);

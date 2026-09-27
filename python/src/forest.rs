@@ -4,7 +4,7 @@
 //! As in `diffusion`, the method crosses the boundary as the JSON of
 //! `ForestMethod` (the form forest model files store).
 
-use crate::codec::{encode_bytes, from_json, to_json};
+use crate::codec::{self, from_json, to_json};
 use crate::data::{DMatrix, row_major, to_numpy};
 use crate::diffusion::positive;
 use crate::errors::{DetachExt, OrRaise, refuse};
@@ -205,28 +205,16 @@ impl ForestModel {
         to_numpy(py, imputations.into_vec(), &shape)
     }
 
-    /// Decodes the binary format.
+    /// Decodes a model in `format` (`"auto"` detects it from the bytes).
     #[staticmethod]
-    fn from_bytes(py: Python<'_>, data: &[u8]) -> PyResult<Self> {
-        let inner = py.detached(|| forest::ForestModel::from_bytes(data))?;
+    fn decode(py: Python<'_>, data: &[u8], format: &str) -> PyResult<Self> {
+        let inner = codec::decode(py, data, format, forest::ForestModel::decode)?;
         Ok(Self { inner })
     }
 
-    /// Decodes the JSON format.
-    #[staticmethod]
-    fn from_json(py: Python<'_>, json: &str) -> PyResult<Self> {
-        let inner = py.detached(|| forest::ForestModel::from_json(json))?;
-        Ok(Self { inner })
-    }
-
-    /// The model in the binary format.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        encode_bytes(py, || self.inner.to_bytes())
-    }
-
-    /// The model as JSON.
-    fn to_json(&self, py: Python<'_>) -> PyResult<String> {
-        py.detached(|| self.inner.to_json())
+    /// The model encoded in `format`.
+    fn encode<'py>(&self, py: Python<'py>, format: &str) -> PyResult<Bound<'py, PyBytes>> {
+        codec::encode(py, format, |format| self.inner.encode(format))
     }
 
     /// The JSON of the model's [`ForestMethod`].

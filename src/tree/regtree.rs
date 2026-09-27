@@ -329,7 +329,10 @@ impl RegTree {
                     && node.leaf_value.is_finite()
                     && node.split_cond.is_finite()
                     && node.split_gain.is_finite()
-                    && (node.is_leaf()
+                    // A leaf has no right child either: the XGBoost
+                    // importer refuses any other entry, so an accepted model
+                    // must export to what it imports.
+                    && ((node.is_leaf() && node.right == NO_CHILD)
                         || ((node.split_feature as usize) < n_features
                             && node.left >= 0
                             && node.right >= 0
@@ -691,5 +694,16 @@ mod tests {
         assert!(vector.is_valid_for_features(1));
         vector.set_linear_leaves(linear);
         assert!(!vector.is_valid_for_features(1));
+    }
+
+    /// A leaf (no left child) with a right child is invalid: the XGBoost
+    /// formats refuse it, so accepting it would load a model that cannot be
+    /// exported and imported again.
+    #[test]
+    fn a_leaf_refuses_a_right_child() {
+        let mut tree = RegTree::with_root(1.0);
+        assert!(tree.is_valid_for_features(1));
+        tree.nodes[0].right = -2;
+        assert!(!tree.is_valid_for_features(1));
     }
 }

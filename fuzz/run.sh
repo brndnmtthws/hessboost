@@ -60,12 +60,28 @@ printf '\x23a;b;c\n1;NA;3\n4;5;NA\n' > seeds/loaders/csv-semicolon-na
 # cargo-fuzz defaults to the target it was built for; the prebuilt Linux
 # binary is a musl build, whose static libc the sanitizers cannot use.
 host="$(rustc -vV | sed -n 's/^host: //p')"
-targets=("$@")
-if [ ${#targets[@]} -eq 0 ]; then
+# Build first, with the flags `cargo fuzz run` uses, so the runs below only
+# check freshness: one build of every target compiles their binaries in
+# parallel.
+if [ $# -eq 0 ]; then
   mapfile -t targets < <(cargo fuzz list)
+  cargo fuzz build --target "$host"
+else
+  targets=("$@")
+  for target in "${targets[@]}"; do
+    cargo fuzz build --target "$host" "$target"
+  done
 fi
-for target in "${targets[@]}"; do
-  corpora=("corpus/$target")
+
+# One libFuzzer process per target, up to one per CPU (FUZZ_JOBS overrides;
+# macOS has no `nproc`) at a time. Each writes logs/<target>.log, printed
+# when it ends, and its exit status to logs/<target>.status.
+jobs="${FUZZ_JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)}"
+rm -rf logs
+mkdir logs
+fuzz() {
+  local target="$1" status=0
+  local corpora=("corpus/$target")
   mkdir -p "${corpora[0]}"
   if [ -d "seeds/$target" ]; then
     corpora+=("seeds/$target")
@@ -74,5 +90,28 @@ for target in "${targets[@]}"; do
   # each input too; libFuzzer's default 2 GB RSS limit catches runaway
   # allocations.
   cargo fuzz run --target "$host" "$target" "${corpora[@]}" \
-    -- -max_total_time="$seconds" -timeout=10
+    -- -max_total_time="$seconds" -timeout=10 > "logs/$target.log" 2>&1 || status=$?
+  echo "$status" > "logs/$target.status"
+  printf '== %s (exit %s)\n%s\n' "$target" "$status" "$(cat "logs/$target.log")"
+}
+running=0
+for target in "${targets[@]}"; do
+  if [ "$running" -ge "$jobs" ]; then
+    wait -n
+    running=$((running - 1))
+  fi
+  fuzz "$target" &
+  running=$((running + 1))
 done
+wait
+
+failed=()
+for target in "${targets[@]}"; do
+  if [ "$(cat "logs/$target.status")" != 0 ]; then
+    failed+=("$target")
+  fi
+done
+if [ ${#failed[@]} -ne 0 ]; then
+  echo "failed: ${failed[*]}" >&2
+  exit 1
+fi

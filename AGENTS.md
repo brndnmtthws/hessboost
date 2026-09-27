@@ -111,17 +111,17 @@ per-node state). Add new proper nouns in docs to `clippy.toml`.
 |Path|Non-obvious contents|
 |---|---|
 |`lib.rs`|crate docs ("What's here", "Not implemented"), `prelude`, hidden `internals`|
-|`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams|
+|`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams (`stream_key`, `keyed_normal`)|
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
-|`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree`, `BalancedBagging`, `QueryBagging` (`Option` fields); each validates when built|
+|`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree`, `BalancedBagging`, `QueryBagging`, `Langevin`, `ModelShrink` (`Option` fields); each validates when built|
 |`config/xgboost.rs`|XGBoost's flat parameter form: `TrainingParams::from_xgboost`/`to_xgboost` (keys, aliases, value spellings, one-setting options), `changed_keys`|
 |`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `xendcg` (LightGBM XE-NDCG; its own keyed RNG stream), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
 |`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`, `online` (split ranking for `training::online`)|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts; uniform, class-balanced, and query-level row sampling), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
-|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts; uniform, class-balanced, and query-level row sampling), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
+|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; exact truncations), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -156,7 +156,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   blocks. Sequential draws (rows, columns, DART, folds, target-stat
   permutations) use `rng::Rng`. Keyed draws (`extra_trees` node seeds,
   `dist:*` split direction, quantized stochastic rounding, per-block
-  row-sampling seeds) use SplitMix64 streams keyed by seed and index.
+  row-sampling seeds, Langevin noise) use SplitMix64 streams keyed by seed
+  and index.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
   `Trainer::on_round` only observes: a hook that always continues leaves
   the model byte-identical, and a `Break` after round `k` gives the
@@ -232,7 +233,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
     (0) except in multi-output models, and `leaf_vectors`; an absent
-    `best_iteration` means none. Writers emit every field.
+    `best_iteration` means none, and an absent `shrinkage` means no model
+    shrinkage. Writers emit every field.
   - Compact (`HBTD`, `model/compact.rs`): section-table metadata; a bit
     stream change bumps its version byte (1).
 - **Tree layout:** iteration `i` owns trees `i * trees_per_iteration ..`.
@@ -240,7 +242,12 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   output; tree `t` feeds output `(t / num_parallel_tree) % n_outputs`.
   Vector leaves: `num_parallel_tree` per iteration, each feeding all
   outputs. Counts, `best_iteration`, slicing, and ranges are in iterations,
-  never trees.
+  never trees. Tree weights are DART's or model shrinkage's: a shrunk
+  model stores unscaled trees, per-iteration coefficients, and the
+  unshrunk intercepts (`model/shrinkage.rs`), from which its tree weights
+  and intercepts derive bit for bit; its `..k` ranges and `slice(..k, 1)`
+  rebuild the `k`-round model exactly, later starts are refused, and
+  early stopping truncates it to the best iteration.
 - **Prediction layout:** predictions return `model::Predictions` (row-major
   `n_rows × width`, owning the computed buffer without a copy): width
   `n_outputs` (`num_class` for `multi:softprob`), 1 for `multi:softmax`, tree
@@ -293,7 +300,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `validate_request` in `training/train.rs` (data-dependent),
   `training/multi_output.rs::validate`, `training/continuation.rs`,
   `EvalMetric::from_xgboost` (metric names and suffixes), `training/budget.rs`,
-  and `training/online.rs::check_supported`.
+  and `training/online.rs::check_supported`; SGLB and model shrinkage in
+  `TrainingParams::validate_sglb` (static) and `training/sglb.rs::Sglb::resolve`
+  (posterior sampling's row count).
   Budget mode and refresh compare params against defaults plus an
   allow-list (`TrainingParams::refuse_changes_from`, over `changed_keys`,
   which destructures every field), so any new field is refused there
@@ -331,7 +340,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   aliases.
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
-  `objective::distributional`, `conformal`, `training::online`).
+  `objective::distributional`, `conformal`, `model::uncertainty`,
+  `training::online`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.

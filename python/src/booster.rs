@@ -283,6 +283,82 @@ impl Booster {
         Distributions::new(dists)
     }
 
+    /// The predictions (`output_margin`: raw margins) of a virtual ensemble
+    /// of `count` members, `(count, rows)` or `(count, rows, width)`, and
+    /// each member's iteration count.
+    fn predict_virtual_ensembles<'py>(
+        &self,
+        py: Python<'py>,
+        data: &DMatrix,
+        count: usize,
+        output_margin: bool,
+    ) -> PyResult<(Bound<'py, PyArrayDyn<f32>>, Vec<usize>)> {
+        let ensembles = py
+            .detach(|| self.model.predict_virtual_ensembles(&data.inner, count))
+            .or_raise()?;
+        let (members, rows) = (ensembles.n_members(), ensembles.n_rows());
+        let member = |m| {
+            if output_margin {
+                ensembles.member_margins(m)
+            } else {
+                ensembles.member_predictions(m)
+            }
+        };
+        let width = member(0).map_or(1, hessboost::model::Predictions::width);
+        let mut values = Vec::with_capacity(members * rows * width);
+        for m in 0..members {
+            values.extend_from_slice(member(m).map_or(&[], |p| p.as_slice()));
+        }
+        let shape = if width == 1 {
+            vec![members, rows]
+        } else {
+            vec![members, rows, width]
+        };
+        Ok((
+            to_numpy(py, values, &shape)?,
+            ensembles.iterations().to_vec(),
+        ))
+    }
+
+    /// A virtual ensemble's `(mean, knowledge, data, total)` uncertainty:
+    /// `mean` `(rows,)` or `(rows, width)`; the others `(rows,)` or
+    /// `(rows, columns)`, `data` and `total` `None` for plain regression.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple is the extension's return shape; the public class wraps it"
+    )]
+    fn predict_uncertainty<'py>(
+        &self,
+        py: Python<'py>,
+        data: &DMatrix,
+        count: usize,
+    ) -> PyResult<(
+        Bound<'py, PyArrayDyn<f64>>,
+        Bound<'py, PyArrayDyn<f64>>,
+        Option<Bound<'py, PyArrayDyn<f64>>>,
+        Option<Bound<'py, PyArrayDyn<f64>>>,
+    )> {
+        let uncertainty = py
+            .detach(|| self.model.predict_uncertainty(&data.inner, count))
+            .or_raise()?;
+        // Every matrix has at least one row.
+        let rows = data.inner.n_rows();
+        let shape = |values: &[f64]| match values.len() / rows {
+            1 => vec![rows],
+            width => vec![rows, width],
+        };
+        let array = |values: Vec<f64>| {
+            let shape = shape(&values);
+            to_numpy(py, values, &shape)
+        };
+        Ok((
+            array(uncertainty.mean)?,
+            array(uncertainty.knowledge)?,
+            uncertainty.data.map(array).transpose()?,
+            uncertainty.total.map(array).transpose()?,
+        ))
+    }
+
     /// `{feature index: score}` for every feature used in a split.
     fn feature_importance<'py>(
         &self,

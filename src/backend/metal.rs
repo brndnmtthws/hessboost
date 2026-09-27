@@ -1446,7 +1446,9 @@ impl GpuModel {
     /// Raw margin predictions of `data` from the boosting `iterations`
     /// (the convention of
     /// [`BoostedModel::predict_margin_range`](crate::model::BoostedModel::predict_margin_range)),
-    /// computed on the GPU. Bit-identical to the CPU margins.
+    /// computed on the GPU. Bit-identical to the CPU margins. A model
+    /// trained with model shrinkage predicts its whole ensemble only (the
+    /// CPU rebuilds its truncations).
     pub fn predict_margin_range(
         &self,
         data: &crate::data::DMatrix,
@@ -1455,6 +1457,7 @@ impl GpuModel {
         let model = &self.model;
         model.validate_prediction_data(data)?;
         let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
+        model.refuse_partial_shrunk_range(&trees, "GPU prediction")?;
         let k = model.n_outputs();
         let n = data.n_rows();
         let mut margins = initial_margins(model.base_scores(), data);

@@ -2,7 +2,8 @@
 //! behind row, column, DART, fold and permutation sampling, and the
 //! SplitMix64 mixing shared by the counter-based streams (`extra_trees` node
 //! seeds, quantized stochastic rounding, `dist:*` split-direction draws,
-//! Langevin gradient noise) and the per-block row-sampling seeds.
+//! Langevin gradient noise, XE-NDCG targets) and the per-block row-sampling
+//! seeds.
 
 use std::ops::Range;
 
@@ -30,12 +31,27 @@ pub(crate) fn stream_key(parts: &[u64]) -> u64 {
     parts.iter().fold(0, |key, &part| splitmix64(key ^ part))
 }
 
+/// The 64 random bits at position `index` of the stream `key`: SplitMix64
+/// at `index + 1`, so position `0` of a zero key is not the fixed point
+/// `mix64(0) = 0`.
+#[inline]
+fn keyed_bits(key: u64, index: u64) -> u64 {
+    mix64(key.wrapping_add(index.wrapping_add(1).wrapping_mul(GOLDEN)))
+}
+
 /// Uniform variate on `(0, 1]` at position `index` of the stream `key`
-/// (SplitMix64 at `index + 1`, top 53 bits plus one ulp, so never `0`).
+/// (the top 53 bits of [`keyed_bits`] plus one ulp, so never `0`).
 #[inline]
 fn keyed_unit_open(key: u64, index: u64) -> f64 {
-    let bits = mix64(key.wrapping_add(index.wrapping_add(1).wrapping_mul(GOLDEN)));
-    ((bits >> 11) + 1) as f64 * (1.0 / (1u64 << 53) as f64)
+    ((keyed_bits(key, index) >> 11) + 1) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// Uniform `f32` variate on `[0, 1)` at position `index` of the stream
+/// `key`: the top 24 bits of [`keyed_bits`], every value a multiple of
+/// `2^-24` (the `f32` mantissa, so the conversion is exact).
+#[inline]
+pub(crate) fn keyed_unit_f32(key: u64, index: u64) -> f32 {
+    (keyed_bits(key, index) >> 40) as f32 * (1.0 / (1u32 << 24) as f32)
 }
 
 /// Standard normal variate `index` of the stream `key`: Box–Muller's cosine

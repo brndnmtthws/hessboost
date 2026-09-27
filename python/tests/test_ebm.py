@@ -124,3 +124,13 @@ def test_classic_ebms_bag_whole_queries() -> None:
     again = hessboost.train(bagged, dtrain, 10).predict(dtrain, output_margin=True)
     assert not np.array_equal(first, plain)
     np.testing.assert_array_equal(first, again)
+
+
+def test_sglb_and_virtual_ensembles_are_refused() -> None:
+    x, y = data(200, 7)
+    dtrain = hessboost.DMatrix(x, label=y)
+    with pytest.raises(hessboost.HessboostError, match="gbtree"):
+        hessboost.train({**CLASSIC, "posterior_sampling": True}, dtrain, 2)
+    booster = hessboost.train(CLASSIC, dtrain, 10)
+    with pytest.raises(hessboost.HessboostError, match="EBM"):
+        booster.predict_virtual_ensembles(x, 2)

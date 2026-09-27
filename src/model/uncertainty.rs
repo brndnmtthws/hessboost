@@ -32,7 +32,8 @@
 //! [`predict_margin_range`](BoostedModel::predict_margin_range)), so member
 //! `k` predicts bit for bit what the same run stopped after `k` rounds
 //! predicts, in either shrink mode. A model trained without shrinkage has
-//! plain prefixes as members. A `booster = boulevard` model is refused: its
+//! plain prefixes as members. EBMs are refused (their trees are ordered by
+//! bag, stage, and term), and so is a `booster = boulevard` model: its
 //! leaves carry the average over all of its rounds, so its prefixes are not
 //! the models of fewer rounds (its variance is
 //! [`BoulevardInference`](crate::inference::BoulevardInference)'s).
@@ -244,6 +245,13 @@ impl BoostedModel {
                 "gblinear models have no boosting iterations to form virtual ensembles from",
             ));
         }
+        if self.ebm.is_some() {
+            return Err(HessboostError::invalid_param(
+                "model",
+                "an EBM's trees are ordered by bag, stage, and term, so its iteration prefixes \
+                 are not the models of fewer rounds",
+            ));
+        }
         if self.boulevard.is_some() {
             return Err(HessboostError::invalid_param(
                 "model",
@@ -286,8 +294,8 @@ impl BoostedModel {
     ///
     /// [`HessboostError::InvalidParameter`] for `count == 0`, a model with
     /// fewer iterations than `count` members need, a `gblinear` model, or a
-    /// `booster = boulevard` model (whose prefixes are not the models of
-    /// fewer rounds), plus the errors of [`Self::predict_margin`].
+    /// `booster = boulevard` model or an EBM (whose prefixes are not the
+    /// models of fewer rounds), plus the errors of [`Self::predict_margin`].
     pub fn predict_virtual_ensembles(
         &self,
         data: &DMatrix,

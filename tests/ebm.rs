@@ -719,3 +719,24 @@ fn online_updates_refuse_an_ebm() {
         );
     }
 }
+
+/// SGLB runs in the gbtree loop only, so EBMs refuse it; and an EBM's tree
+/// prefixes are not the models of fewer rounds, so virtual ensembles of one
+/// are refused.
+#[test]
+fn sglb_and_virtual_ensembles_are_refused() {
+    use hessboost::config::{Langevin, ModelShrink};
+    let refused = |b: TrainingParamsBuilder| invalid_param(b.build());
+    let shrink = ModelShrink::builder().rate(0.01).build().unwrap();
+    for ebm in [classic, boulevard] {
+        assert_eq!(refused(ebm().langevin(Langevin::default())), "langevin");
+        assert_eq!(refused(ebm().posterior_sampling(true)), "langevin");
+        assert_eq!(refused(ebm().model_shrink(shrink)), "model_shrink_rate");
+    }
+    let (_, dtrain) = data(200, 17);
+    let model = train(&classic().build().unwrap(), &dtrain, 10).unwrap();
+    assert_eq!(
+        invalid_param(model.predict_virtual_ensembles(&dtrain, 2)),
+        "model"
+    );
+}

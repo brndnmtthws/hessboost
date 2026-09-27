@@ -1670,6 +1670,7 @@ impl BoostedModel {
             linear: None,
             shrinkage: Some(shrinkage.truncated(k)),
             boulevard: None,
+            ebm: None,
             compact: OnceLock::new(),
         }
     }

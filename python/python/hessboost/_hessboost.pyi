@@ -1,7 +1,7 @@
 """Native extension module. Import from :mod:`hessboost` instead."""
 
 from collections.abc import Callable, Mapping
-from typing import Any, final
+from typing import Any, Literal, TypeAlias, final
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -108,13 +108,20 @@ class Distributions:
     def __len__(self) -> int:
         """The number of rows."""
 
+_ModelFormat: TypeAlias = Literal["binary", "json", "xgboost-json", "xgboost-ubjson"]
+_LoadFormat: TypeAlias = _ModelFormat | Literal["auto", "lightgbm"]
+_PredictKind: TypeAlias = Literal["value", "margin", "contribs", "interactions"]
+_ImportanceType: TypeAlias = Literal["weight", "gain", "total_gain", "cover", "total_cover"]
+_DiffusionPreset: TypeAlias = Literal["default", "treeffuser", "flow_matching"]
+_ForestPreset: TypeAlias = Literal["default", "diffusion"]
+
 @final
 class Booster:
     @staticmethod
-    def load(data: bytes, format: str) -> Booster: ...
-    def save(self, format: str) -> bytes: ...
+    def load(data: bytes, format: _LoadFormat) -> Booster: ...
+    def save(self, format: _ModelFormat) -> bytes: ...
     def predict(
-        self, data: DMatrix, kind: str, iteration_range: tuple[int, int] | None = None
+        self, data: DMatrix, kind: _PredictKind, iteration_range: tuple[int, int] | None = None
     ) -> NDArray[np.float32]: ...
     def predict_leaf(
         self, data: DMatrix, iteration_range: tuple[int, int] | None = None
@@ -133,7 +140,7 @@ class Booster:
         NDArray[np.float64] | None,
         NDArray[np.float64] | None,
     ]: ...
-    def feature_importance(self, importance_type: str) -> dict[int, float]: ...
+    def feature_importance(self, importance_type: _ImportanceType) -> dict[int, float]: ...
     def slice(self, begin: int, end: int, step: int) -> Booster: ...
     @property
     def objective(self) -> str: ...
@@ -282,7 +289,7 @@ class EbmInference:
 class DiffusionParams:
     def __new__(cls, request: Mapping[str, object]) -> DiffusionParams: ...
     @staticmethod
-    def preset(name: str) -> dict[str, Any]: ...
+    def preset(name: _DiffusionPreset) -> dict[str, Any]: ...
 
 @final
 class DiffusionModel:
@@ -311,7 +318,7 @@ class DiffusionModel:
 class ForestParams:
     def __new__(cls, request: Mapping[str, object]) -> ForestParams: ...
     @staticmethod
-    def preset(name: str) -> dict[str, Any]: ...
+    def preset(name: _ForestPreset) -> dict[str, Any]: ...
 
 @final
 class ForestModel:

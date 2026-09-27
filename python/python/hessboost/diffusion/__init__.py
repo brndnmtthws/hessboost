@@ -349,7 +349,9 @@ def _method(text: str) -> Method:
     )
 
 
-def _preset_training(preset: str, residualizer: bool) -> dict[str, Any]:
+def _preset_training(
+    preset: Literal["default", "treeffuser", "flow_matching"], residualizer: bool
+) -> dict[str, Any]:
     description = _hessboost.DiffusionParams.preset(preset)
     training: dict[str, Any] = (
         description["residualizer"][1] if residualizer else description["training"]
@@ -487,7 +489,7 @@ class DiffusionParams:
         return _hessboost.DiffusionParams(request)
 
     @classmethod
-    def _preset(cls, name: str) -> Self:
+    def _preset(cls, name: Literal["default", "treeffuser", "flow_matching"]) -> Self:
         description = _hessboost.DiffusionParams.preset(name)
         stop = description["early_stopping"]
         residualizer = description["residualizer"]

@@ -264,3 +264,13 @@ def test_prediction_validates_feature_names() -> None:
     np.testing.assert_array_equal(booster.predict(codes), booster.predict(df))
     with pytest.raises(HessboostError, match="feature count"):
         booster.predict(np.zeros((2, 3)))
+
+
+def test_native_base_margin_rank_is_checked() -> None:
+    # `as_float32` already promotes a scalar to 1-D; the extension must
+    # refuse other ranks itself.
+    x, y = regression(rows=1)
+    native = DMatrix(x, y)._core
+    for margin in (np.array(0.5, np.float32), np.zeros((1, 1, 1), np.float32)):
+        with pytest.raises(HessboostError, match="1-D or 2-D"):
+            native.with_info({"base_margin": margin, "categorical": None})

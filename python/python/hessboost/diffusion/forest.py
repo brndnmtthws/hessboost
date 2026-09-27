@@ -190,7 +190,7 @@ class ForestParams:
         )
 
     @classmethod
-    def _preset(cls, name: str) -> Self:
+    def _preset(cls, name: Literal["default", "diffusion"]) -> Self:
         description = _hessboost.ForestParams.preset(name)
         return cls(
             method=_method(description["method"]),

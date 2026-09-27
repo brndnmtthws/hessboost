@@ -1,4 +1,4 @@
-//! Metrics of the distributional `dist:*` objectives (beyond XGBoost): the
+//! Metrics of the distributional `dist:*` objectives: the
 //! mean negative log-likelihood (`nll`) and the mean continuous ranked
 //! probability score (`crps`) of the predicted distributions.
 //!

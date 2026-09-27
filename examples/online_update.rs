@@ -1,4 +1,4 @@
-//! In-place data updates (beyond XGBoost): add and delete training rows of
+//! In-place data updates: add and delete training rows of
 //! a trained model without retraining it from scratch, and unlearn rows
 //! exactly when that is required.
 //!

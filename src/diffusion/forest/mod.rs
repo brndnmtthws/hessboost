@@ -1,6 +1,5 @@
 //! ForestFlow and ForestDiffusion: generating synthetic tabular rows from
-//! `p(x)` and imputing missing entries with boosted trees (beyond XGBoost,
-//! opt-in).
+//! `p(x)` and imputing missing entries with boosted trees (opt-in).
 //!
 //! A [`ForestModel`] learns the joint distribution of a table's columns,
 //! optionally per class of a label, and then

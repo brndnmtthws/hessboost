@@ -1,4 +1,4 @@
-//! Distributional boosting (beyond XGBoost): predict a full Normal
+//! Distributional boosting: predict a full Normal
 //! distribution `N(μ(x), σ(x)²)` per row on heteroscedastic data, read off
 //! prediction intervals, and compare the held-out negative log-likelihood
 //! with a homoscedastic baseline (a point model plus one global residual

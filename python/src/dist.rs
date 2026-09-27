@@ -66,19 +66,19 @@ impl Distributions {
 
 #[pymethods]
 impl Distributions {
-    /// The objective naming the family, e.g. `"dist:normal"`.
+    /// The objective naming the family, e.g. ``"dist:normal"``.
     #[getter]
     fn family(&self) -> &'static str {
         self.family
     }
 
-    /// The natural parameters' names, in column order of `params`.
+    /// The natural parameters' names, in column order of ``params``.
     #[getter]
     fn param_names(&self) -> Vec<&'static str> {
         self.param_names.to_vec()
     }
 
-    /// The natural parameters, `(rows, len(param_names))`.
+    /// The natural parameters, ``(rows, len(param_names))``.
     #[getter]
     fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
         let values = self.dists.iter().flat_map(Dist::params).collect();

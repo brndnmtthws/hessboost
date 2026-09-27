@@ -1,4 +1,4 @@
-//! ForestFlow / ForestDiffusion (beyond XGBoost): generate synthetic tabular
+//! ForestFlow / ForestDiffusion: generate synthetic tabular
 //! rows and impute missing entries with per-noise-level boosted trees.
 //!
 //! A mixed table (two correlated continuous columns, an integer count, a

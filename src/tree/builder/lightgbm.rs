@@ -1,5 +1,5 @@
-//! LightGBM's split-search options for the histogram builder (opt-in, beyond
-//! XGBoost): `extra_trees` and `path_smooth`.
+//! LightGBM's split-search options for the histogram builder (opt-in):
+//! `extra_trees` and `path_smooth`.
 //!
 //! When either is enabled, [`SplitOptions::evaluate`] replaces the builder's
 //! XGBoost split search for the node; with both off the builder never reaches

@@ -108,7 +108,7 @@ impl DartBuilder {
     }
 }
 
-/// Boulevard boosting's settings (`booster = boulevard`, beyond XGBoost;
+/// Boulevard boosting's settings (`booster = boulevard`;
 /// see [`crate::inference`]): BRAT-D's dropout probability `p` in `[0, 1)`
 /// (each earlier tree left out of a round's residuals independently with
 /// probability `p`, the kept ones still divided by the full tree count;
@@ -264,8 +264,8 @@ impl EbmEarlyStopping {
     }
 }
 
-/// The settings of an explainable boosting machine (`booster = ebm`,
-/// beyond XGBoost; see [`crate::ebm`]). Build with [`Ebm::builder`]; the
+/// The settings of an explainable boosting machine (`booster = ebm`;
+/// see [`crate::ebm`]). Build with [`Ebm::builder`]; the
 /// defaults are one bag of every row, main effects only, no early stopping,
 /// and the classic cyclic EBM.
 ///
@@ -466,7 +466,7 @@ impl Default for Refresh {
 
 /// Training on quantized gradients (LightGBM `use_quantized_grad`; Shi et
 /// al., NeurIPS 2022): gradients and Hessians become small integers
-/// summed in integer histograms. Opt-in and beyond XGBoost: trees differ
+/// summed in integer histograms. Opt-in: trees differ
 /// from full-precision training.
 ///
 /// ```

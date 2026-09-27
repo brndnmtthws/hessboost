@@ -1,5 +1,5 @@
 //! Virtual ensembles and uncertainty decomposition for models trained with
-//! SGLB posterior sampling (beyond XGBoost; CatBoost's
+//! SGLB posterior sampling (CatBoost's
 //! `virtual_ensembles_predict`).
 //!
 //! A model trained with

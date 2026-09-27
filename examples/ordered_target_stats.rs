@@ -1,4 +1,4 @@
-//! Opt-in CatBoost-style ordered target statistics (beyond XGBoost) for a
+//! Opt-in CatBoost-style ordered target statistics for a
 //! high-cardinality categorical feature with few rows per category, compared
 //! with native categorical splits and a leaky in-sample target mean.
 //! Run: `cargo run --release --example ordered_target_stats`.

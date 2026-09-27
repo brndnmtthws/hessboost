@@ -97,9 +97,14 @@ class Distributions:
     def std(self) -> NDArray[np.float64]:
         """The standard deviation of every row's distribution, ``(rows,)``."""
     def quantile(self, q: float) -> NDArray[np.float64]:
-        """The ``q``-quantile of every row's distribution, ``(rows,)``."""
+        """The ``q``-quantile of every row's distribution, ``(rows,)``: the
+        smallest ``y`` with ``cdf(y) >= q`` (an integer for count families);
+        NaN outside ``[0, 1]``.
+        """
     def interval(self, coverage: float) -> NDArray[np.float64]:
-        """The central interval holding probability ``coverage``, ``(rows, 2)``."""
+        """The central interval holding probability ``coverage``, ``(rows, 2)``
+        as ``[lower, upper]``.
+        """
     def cdf(self, y: ArrayLike) -> NDArray[np.float64]:
         """``P(Y <= y)`` for every row, ``(rows,)``."""
     def log_prob(self, y: ArrayLike) -> NDArray[np.float64]:

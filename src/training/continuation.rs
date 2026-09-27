@@ -250,7 +250,7 @@ fn check_update(
 ///
 /// Refused are row and column sampling (`subsample`, `sampling_method`,
 /// `colsample_*`), DART's `rate_drop`/`skip_drop`, symmetric growth, and the
-/// beyond-XGBoost split-search and leaf options (`extra_trees`,
+/// split-search and leaf options (`extra_trees`,
 /// `path_smooth`, `linear_tree`, quantized gradients, reuse penalties): they
 /// would silently have no effect.
 fn reject_unused_by_refresh(params: &TrainingParams) -> Result<()> {

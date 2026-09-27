@@ -87,7 +87,7 @@ pub enum BoosterKind {
     /// column sampling, `num_parallel_tree > 1`, tree constraints, and
     /// training-matrix feature weights are refused with it.
     GbLinear,
-    /// Boulevard boosting for statistical inference (beyond XGBoost, opt-in):
+    /// Boulevard boosting for statistical inference (opt-in):
     /// every iteration's trees are averaged rather than summed, so the
     /// ensemble converges to a kernel ridge regression with a central limit
     /// theorem. `num_parallel_tree = 1` runs BRAT-D (Fang, Tan & Hooker,
@@ -97,7 +97,7 @@ pub enum BoosterKind {
     /// only; see [`crate::inference`] for the trained model's confidence and
     /// prediction intervals and the settings it refuses.
     Boulevard(Boulevard),
-    /// Explainable boosting machine (EBM, a GA²M; beyond XGBoost, opt-in):
+    /// Explainable boosting machine (EBM, a GA²M; opt-in):
     /// cyclic boosting of one small tree per feature at a time, so the
     /// model is a sum of per-feature shape functions, optionally followed
     /// by pairwise interaction terms (FAST detection,
@@ -142,7 +142,7 @@ pub enum GrowPolicy {
     LossGuide,
     /// Symmetric (oblivious) trees, CatBoost-style: every level applies one
     /// shared split (feature, threshold, missing direction) chosen to maximize
-    /// the summed gain over the level's nodes. Beyond XGBoost (opt-in). Needs
+    /// the summed gain over the level's nodes. Opt-in. Needs
     /// a tree booster (`gbtree` or `dart`), `tree_method = hist` or `approx`,
     /// numerical features only, `max_depth`
     /// in `1..=`[`MAX_SYMMETRIC_DEPTH`], and no `max_leaves`. A node whose
@@ -169,7 +169,7 @@ pub enum Device {
     /// histogram construction runs on the GPU for every node whose sums it
     /// can compute exactly and on the CPU for the rest, reproducing
     /// single-threaded CPU training bit for bit. Requires `tree_method =
-    /// hist`/`auto` and a tree booster. Beyond XGBoost (opt-in).
+    /// hist`/`auto` and a tree booster. Opt-in.
     ///
     /// A correctness path so far, not a speedup: with the earlier
     /// floating-point kernels the GPU histograms were slower than the
@@ -263,7 +263,7 @@ pub enum ProcessType {
     /// [`Trainer::init_model`](crate::training::Trainer::init_model)). It
     /// keeps every split and sums every row, so settings it does not read
     /// (row and column sampling, symmetric growth, DART dropout, the
-    /// beyond-XGBoost tree options) and training-matrix feature weights
+    /// LightGBM and compact-training tree options) and training-matrix feature weights
     /// must keep their defaults.
     Update(Refresh),
 }
@@ -361,7 +361,7 @@ pub struct TrainingParams {
     pub sampling_method: SamplingMethod,
     /// LightGBM's class-balanced bagging for binary classification
     /// ([`BalancedBagging`]; `pos_bagging_fraction` /
-    /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
+    /// `neg_bagging_fraction`), `None` (the default) for
     /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
     /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
     /// booster (a classic `booster = ebm` tree draws from its outer bag),
@@ -369,7 +369,7 @@ pub struct TrainingParams {
     /// inference (`booster = boulevard`, `ebm_boulevard`) refuses it.
     pub balanced_bagging: Option<BalancedBagging>,
     /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
-    /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
+    /// `bagging_by_query`), `None` (the default) for off:
     /// whole query groups are kept or dropped each round. It replaces
     /// `subsample`, which must stay `1`, and needs a `rank:*` objective, a
     /// tree booster (a classic `booster = ebm` tree keeps the rows of its
@@ -383,7 +383,7 @@ pub struct TrainingParams {
     /// options). XGBoost `process_type`.
     pub process_type: ProcessType,
 
-    // ---- LightGBM tree options (opt-in, beyond XGBoost) ----
+    // ---- LightGBM tree options (opt-in) ----
     /// Extremely randomized split search (LightGBM `extra_trees`), `None`
     /// for XGBoost's exhaustive search. Requires the histogram builder
     /// (`hist`/`approx`) and one output per tree; refused with
@@ -411,7 +411,7 @@ pub struct TrainingParams {
     /// and a tree booster.
     pub quantized: Option<QuantizedGrad>,
 
-    // ---- Compact training (Trees on a Diet; beyond XGBoost, opt-in) ----
+    // ---- Compact training (Trees on a Diet; opt-in) ----
     /// Penalty `ι` subtracted from the loss change of a split on a feature the
     /// ensemble does not use yet (Herrmann et al., *Boosted Trees on a Diet*,
     /// ICLR 2026, eq. 3). Same units as [`gamma`](Self::gamma); `0` (the
@@ -430,7 +430,7 @@ pub struct TrainingParams {
     /// `toad_penalty_threshold`.
     pub toad_penalty_threshold: f64,
 
-    // ---- SGLB and model shrinkage (CatBoost; beyond XGBoost, opt-in) ----
+    // ---- SGLB and model shrinkage (CatBoost; opt-in) ----
     /// Stochastic Gradient Langevin Boosting (CatBoost `langevin`;
     /// Ustimenko and Prokhorenkova, ICML 2021; see [`Langevin`]), `None`
     /// for off unless [`posterior_sampling`](Self::posterior_sampling) turns
@@ -878,8 +878,8 @@ impl TrainingParams {
     /// not neutral (`max_depth`, `min_child_weight`, `max_bin`,
     /// `tree_method`, `grow_policy`, ...) stay accepted: every configuration
     /// carries them. The ones refused here default to "off" and are only
-    /// changed to ask for their effect. (The beyond-XGBoost tree options are
-    /// refused by their own checks.)
+    /// changed to ask for their effect. (The LightGBM and compact-training
+    /// tree options are refused by their own checks.)
     fn validate_gblinear(&self) -> Result<()> {
         ensure(
             "num_parallel_tree",

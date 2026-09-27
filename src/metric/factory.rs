@@ -124,10 +124,10 @@ pub enum EvalMetric {
     /// (`interval-regression-accuracy`).
     IntervalRegressionAccuracy,
     /// Negative log-likelihood of predicted distributions of this family
-    /// (`nll`, beyond XGBoost; see [`crate::objective::distributional`]).
+    /// (`nll`; see [`crate::objective::distributional`]).
     Nll(DistFamily),
     /// Continuous ranked probability score of predicted distributions of
-    /// this family (`crps`, beyond XGBoost).
+    /// this family (`crps`).
     Crps(DistFamily),
 }
 

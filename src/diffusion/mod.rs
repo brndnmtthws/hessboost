@@ -1,6 +1,5 @@
 //! Nonparametric probabilistic regression: conditional diffusion and flow
-//! matching with boosted trees as the score or velocity model (beyond
-//! XGBoost, opt-in).
+//! matching with boosted trees as the score or velocity model (opt-in).
 //!
 //! A [`DiffusionModel`] learns the whole conditional distribution `p(y | x)`
 //! of a scalar or vector label, with no parametric family: multimodal,

@@ -1,4 +1,4 @@
-//! Tree-based conditional diffusion and flow matching (beyond XGBoost):
+//! Tree-based conditional diffusion and flow matching:
 //! learn the whole conditional distribution `p(y | x)` without a parametric
 //! family and sample from it.
 //!

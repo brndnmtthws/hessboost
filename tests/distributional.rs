@@ -1,4 +1,4 @@
-//! Distributional boosting (`dist:*` objectives, beyond XGBoost): training,
+//! Distributional boosting (`dist:*` objectives): training,
 //! calibration of the predicted distributions, metrics, serialization, and
 //! conformalized intervals.
 

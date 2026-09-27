@@ -1,7 +1,7 @@
 //! Distributional (probabilistic) boosting: objectives that predict a full
 //! conditional distribution `p(y | x)` instead of a point, in the style of
 //! NGBoost (Duan et al., 2020, arXiv:1910.03225) and XGBoostLSS (März, 2019,
-//! arXiv:1907.03178). Opt-in and beyond XGBoost: the objective names live
+//! arXiv:1907.03178). Opt-in: the objective names live
 //! outside XGBoost's namespace, and XGBoost-format export refuses them.
 //!
 //! # Families and parameterizations
@@ -131,7 +131,7 @@ pub use family::{Dist, DistFamily};
 pub(crate) use loss::DistLoss;
 
 /// The second-order statistic the `dist:*` distributional objectives give
-/// the trees (beyond XGBoost; see [`crate::objective::distributional`]).
+/// the trees (see [`crate::objective::distributional`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -150,7 +150,7 @@ pub enum DistGradient {
 }
 
 /// How the shared tree of a `dist:*` objective chooses its structure under
-/// `multi_strategy = multi_output_tree` (beyond XGBoost; see
+/// `multi_strategy = multi_output_tree` (see
 /// [`crate::objective::distributional`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

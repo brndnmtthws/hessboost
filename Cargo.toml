@@ -6,7 +6,7 @@ rust-version = "1.93"
 license = "Apache-2.0"
 repository = "https://github.com/brndnmtthws/hessboost"
 authors = ["Brenden Matthews <brenden@brndn.io>"]
-description = "Rust XGBoost: gradient boosted decision trees (GBDT) for machine learning in Rust, reimplementing XGBoost's training, parameters, and model formats"
+description = "Fast, deterministic gradient boosting (GBDT) in Rust: conformal intervals, explainable boosting machines, distributional boosting, tree-based diffusion, and XGBoost model interchange"
 keywords = ["xgboost", "gradient-boosting", "gbdt", "machine-learning", "decision-trees"]
 categories = ["artificial-intelligence", "algorithms", "science"]
 # What the published crate ships: the library, its tests (with their saved

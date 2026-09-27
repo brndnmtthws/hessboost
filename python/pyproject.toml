@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "hessboost"
 dynamic = ["version"]
-description = "XGBoost reimplemented in Rust: gradient boosted trees with XGBoost's parameters, model formats and Python API"
+description = "Fast, deterministic gradient boosting in Rust: conformal intervals, explainable boosting machines, distributional boosting, and tree-based diffusion"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"

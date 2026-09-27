@@ -1,7 +1,7 @@
 //! Quantized-gradient histograms: the opt-in `use_quantized_grad` training
 //! mode (LightGBM's quantized training; Shi et al., "Quantized Training of
-//! Gradient Boosting Decision Trees", NeurIPS 2022, arXiv:2207.09682). Beyond
-//! XGBoost; the default float path never reaches this module.
+//! Gradient Boosting Decision Trees", NeurIPS 2022, arXiv:2207.09682). The
+//! default float path never reaches this module.
 //!
 //! For each tree the gradients `g` and Hessians `h` are mapped to small
 //! integers with iteration-global scales (LightGBM `gradient_discretizer.cpp`):

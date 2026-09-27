@@ -1,6 +1,5 @@
 //! In-place data addition and deletion for trained GBDT models
-//! (incremental and decremental learning, machine unlearning; beyond
-//! XGBoost, opt-in).
+//! (incremental and decremental learning, machine unlearning; opt-in).
 //!
 //! An [`OnlineModel`] keeps a model together with its training data and,
 //! when approximate updates are enabled, the node statistics that let it
@@ -57,7 +56,7 @@
 //! `max_leaves`, one output, `num_parallel_tree = 1`, no row or column
 //! sampling (a retrain draws its samples sequentially over the rows, so
 //! they would change with any added or deleted row), no monotone or
-//! interaction constraints, none of the beyond-XGBoost split options
+//! interaction constraints, none of the opt-in split options
 //! (`extra_trees`, `path_smooth`, `linear_tree`, quantized gradients, reuse
 //! penalties), CPU, and a built-in objective whose gradients are per row
 //! and whose leaves are plain Newton steps (not ranking, `survival:cox`,
@@ -688,7 +687,10 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         || params.toad_penalty_feature != 0.0
         || params.toad_penalty_threshold != 0.0
     {
-        return refuse("extra_trees", "none of the beyond-XGBoost split options");
+        return refuse(
+            "extra_trees",
+            "no extra_trees, path_smooth, linear_tree, quantized gradients, or reuse penalties",
+        );
     }
     if params.device != Device::Cpu {
         return refuse("device", "device = cpu");

@@ -1,6 +1,6 @@
 //! Compact, bit-packed tree-ensemble format after *Boosted Trees on a Diet*
-//! (Herrmann et al., ICLR 2026, arXiv:2510.26557, §3.2), an opt-in extension
-//! beyond XGBoost for memory-constrained inference.
+//! (Herrmann et al., ICLR 2026, arXiv:2510.26557, §3.2), an opt-in format
+//! for memory-constrained inference.
 //!
 //! [`BoostedModel::to_compact`] turns a tree ensemble into a [`CompactModel`]
 //! that predicts **bit-identical** margins (and transformed predictions) to

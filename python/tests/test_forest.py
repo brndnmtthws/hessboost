@@ -60,7 +60,9 @@ def test_generated_rows_follow_the_column_kinds() -> None:
     assert labels is None
     assert set(np.unique(values[:, 1])) <= {0.0, 1.0}
     assert set(np.unique(values[:, 2])) <= {2.0, 5.0, 7.0}
-    assert x[:, 0].min() <= values[:, 0].min() and values[:, 0].max() <= x[:, 0].max()
+    lo, hi = float(np.min(x[:, 0])), float(np.max(x[:, 0]))
+    assert lo <= float(np.min(values[:, 0]))
+    assert float(np.max(values[:, 0])) <= hi
     # The binary column follows the continuous one, as in the data.
     assert np.corrcoef(values[:, 0], values[:, 1])[0, 1] > 0.3
 
@@ -70,8 +72,9 @@ def test_class_conditional_generation(
 ) -> None:
     model, _, _ = conditional
     np.testing.assert_array_equal(model.classes, [0.0, 1.0])
-    values, labels = model.generate(50, seed=0)
-    assert labels is not None and labels.shape == (50,)
+    _, labels = model.generate(50, seed=0)
+    assert labels is not None
+    assert labels.shape == (50,)
     assert set(np.unique(labels)) <= {0.0, 1.0}
     rows = model.generate_for_labels([1, 0, 1], seed=4)
     assert rows.shape == (3, 3)
@@ -113,9 +116,7 @@ def test_imputation_keeps_observed_entries(
     np.testing.assert_array_equal(
         model.impute(holes, y[:8], n_imputations=2, repaint=Repaint(2, 0.5), seed=1), repainted
     )
-    np.testing.assert_array_equal(
-        model.impute(holes, y[:8], n_imputations=4, seed=1), filled
-    )
+    np.testing.assert_array_equal(model.impute(holes, y[:8], n_imputations=4, seed=1), filled)
 
 
 def test_every_format_round_trips_bit_for_bit(
@@ -151,21 +152,25 @@ def test_invalid_configurations_are_refused() -> None:
     with pytest.raises(HessboostError, match="method"):
         ForestParams(method=Diffusion(beta_min=2.0, beta_max=1.0))
     with pytest.raises(HessboostError, match="column kind"):
-        ForestParams(column_kinds=["ordinal"])  # type: ignore[list-item]
+        ForestParams(column_kinds=["ordinal"])  # ty: ignore[invalid-argument-type]
     with pytest.raises(HessboostError, match="squarederror"):
         ForestParams(training={"objective": "reg:absoluteerror"})
+    with pytest.raises(HessboostError, match="scale_pos_weight"):
+        ForestParams(training={"scale_pos_weight": 2.0})
+    # No column kinds: every column is continuous.
+    assert ForestParams().column_kinds is None
     with pytest.raises(HessboostError, match="method"):
-        ForestParams(method="diffusion")  # type: ignore[arg-type]
+        ForestParams(method="diffusion")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="method"):
-        ForestParams(method=DiffusionParams())  # type: ignore[arg-type]
+        ForestParams(method=DiffusionParams())  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="column_kinds"):
-        ForestParams(column_kinds="continuous")  # type: ignore[arg-type]
+        ForestParams(column_kinds="continuous")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="n_t"):
-        ForestParams(n_t=2.5)  # type: ignore[arg-type]
+        ForestParams(n_t=2.5)  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="beta_max"):
-        Diffusion(beta_max="8")  # type: ignore[arg-type]
+        Diffusion(beta_max="8")  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError, match="ForestParams"):
-        ForestModel.fit(DiffusionParams(), np.ones((4, 2)))  # type: ignore[arg-type]
+        ForestModel.fit(DiffusionParams(), np.ones((4, 2)))  # ty: ignore[invalid-argument-type]
     with pytest.raises(TypeError):
         ForestModel()
 
@@ -196,8 +201,10 @@ def test_unsupported_requests_are_refused(
         model.impute(x[:3], y[:3], n_imputations=0)
     with pytest.raises(HessboostError, match="jump"):
         model.impute(x[:3], y[:3], repaint=Repaint(jump=2.0))
+    with pytest.raises(HessboostError, match="resample"):
+        model.impute(x[:3], y[:3], repaint=Repaint(resample=0))
     with pytest.raises(TypeError, match="repaint"):
-        model.impute(x[:3], y[:3], repaint=(5, 0.1))  # type: ignore[arg-type]
+        model.impute(x[:3], y[:3], repaint=(5, 0.1))  # ty: ignore[invalid-argument-type]
 
 
 def test_imputation_refuses_label_matrices(
@@ -227,5 +234,5 @@ def test_damaged_models_are_refused(
     )
     with pytest.raises(ModelFormatError):
         ForestModel.from_bytes(diffusion.to_bytes())
-    with pytest.raises(OSError):
+    with pytest.raises(FileNotFoundError):
         ForestModel.load_json(tmp_path / "missing.json")

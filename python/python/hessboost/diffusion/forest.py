@@ -117,9 +117,7 @@ def _default_training() -> Mapping[str, Any]:
 def _method_json(method: ForestMethod) -> str:
     _choice("method", method, ("flow",), (Diffusion,))
     if isinstance(method, Diffusion):
-        return json.dumps(
-            {"diffusion": {"beta_min": method.beta_min, "beta_max": method.beta_max}}
-        )
+        return json.dumps({"diffusion": {"beta_min": method.beta_min, "beta_max": method.beta_max}})
     return json.dumps(method)
 
 
@@ -142,7 +140,7 @@ class ForestParams:
         column_kinds: One :data:`ColumnKind` per column, or ``None`` for
             all continuous.
         training: Every GBDT's XGBoost parameters (objective
-            ``reg:squarederror``).
+            ``reg:squarederror``, ``scale_pos_weight`` 1).
         num_boost_round: Boosting rounds of each GBDT (``> 0``).
         seed: Seed of the training noise.
 

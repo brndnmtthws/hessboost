@@ -785,4 +785,4 @@ class DiffusionModel:
 
 
 # Last: `forest` reuses this module's helpers.
-from hessboost.diffusion import forest
+from hessboost.diffusion import forest  # noqa: E402

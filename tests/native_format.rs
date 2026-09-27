@@ -852,12 +852,12 @@ fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
 /// per level) and a class-conditional diffusion model with missing values
 /// (one GBDT per level and column).
 fn forest_models() -> Vec<(&'static str, ForestModel)> {
-    let tiny = |mut params: ForestParams, kinds: Vec<ColumnKind>| {
+    let tiny = |mut params: ForestParams, kinds: Option<Vec<ColumnKind>>| {
         params.n_t = 3;
         params.duplicate_k = std::num::NonZeroUsize::new(2).unwrap();
         params.num_boost_round = std::num::NonZeroUsize::new(3).unwrap();
         params.training.nthread = std::num::NonZeroUsize::new(1);
-        params.column_kinds = Some(kinds);
+        params.column_kinds = kinds;
         params
     };
     let n = 160;
@@ -872,12 +872,12 @@ fn forest_models() -> Vec<(&'static str, ForestModel)> {
     let mut kinds = vec![ColumnKind::Continuous; COLS];
     kinds[3] = ColumnKind::Categorical;
     let flow = ForestModel::fit(
-        &tiny(ForestParams::default(), kinds),
+        &tiny(ForestParams::default(), Some(kinds)),
         &DMatrix::from_dense(&complete, n, COLS).unwrap(),
     )
     .unwrap();
     let diffusion = ForestModel::fit(
-        &tiny(ForestParams::diffusion(), Vec::new()),
+        &tiny(ForestParams::diffusion(), None),
         &DMatrix::from_dense(&with_missing, n, COLS)
             .unwrap()
             .with_labels(&classes)

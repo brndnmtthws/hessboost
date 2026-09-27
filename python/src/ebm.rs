@@ -2,18 +2,17 @@
 //! their Boulevard confidence bands (`hessboost::inference::EbmInference`).
 
 use crate::booster::Booster;
+use crate::data::intervals_to_numpy;
 use crate::data::{DMatrix, to_numpy};
-use crate::errors::{OrRaise, refuse};
-use crate::inference::intervals;
-use hessboost::data::DMatrix as RustMatrix;
+use crate::errors::{DetachExt, OrRaise, refuse};
+use crate::inference::{Owner, solver};
 use hessboost::ebm::{self, TermAxis};
-use hessboost::inference::{self, KernelSolver, NoiseVariance};
+use hessboost::inference;
 use hessboost::model::{BoostedModel, Predictions};
 use numpy::PyArrayDyn;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use self_cell::self_cell;
-use std::sync::Arc;
 
 /// One term's shape function.
 #[pyclass(frozen, module = "hessboost._hessboost")]
@@ -126,11 +125,6 @@ pub(crate) fn ebm_info<'py>(
     Ok(Some(dict))
 }
 
-struct Owner {
-    model: Arc<BoostedModel>,
-    holdout: Option<RustMatrix>,
-}
-
 type InferenceRef<'a> = inference::EbmInference<'a>;
 
 self_cell!(
@@ -176,32 +170,18 @@ impl EbmInference {
         landmarks: Option<usize>,
         seed: u64,
     ) -> PyResult<Self> {
-        if holdout.is_some() && noise_variance.is_some() {
-            return Err(refuse(
-                "pass either holdout rows or a known noise_variance, not both",
-            ));
-        }
-        let owner = Owner {
-            model: Arc::clone(&booster.model),
-            holdout: holdout.map(|h| h.inner.clone()),
-        };
+        let owner = Owner::new(booster, holdout, noise_variance)?;
         let train = &train.inner;
-        let solver = landmarks.map_or(KernelSolver::Exact, |landmarks| KernelSolver::Nystrom {
-            landmarks,
-            seed,
-        });
-        let cell = py
-            .detach(|| {
-                Cell::try_new(owner, |owner| {
-                    let noise = match (&owner.holdout, noise_variance) {
-                        (Some(holdout), _) => NoiseVariance::Holdout(holdout),
-                        (None, Some(v)) => NoiseVariance::Known(v),
-                        (None, None) => NoiseVariance::TrainingResiduals,
-                    };
-                    inference::EbmInference::fit(&owner.model, train, noise, solver)
-                })
+        let cell = py.detached(|| {
+            Cell::try_new(owner, |owner| {
+                inference::EbmInference::fit(
+                    &owner.model,
+                    train,
+                    owner.noise(),
+                    solver(landmarks, seed),
+                )
             })
-            .or_raise()?;
+        })?;
         Ok(Self { cell })
     }
 
@@ -216,9 +196,7 @@ impl EbmInference {
     }
 
     fn term_bands<'py>(&self, py: Python<'py>, term: usize, alpha: f64) -> PyResult<Bands<'py>> {
-        let bands = py
-            .detach(|| self.cell.borrow_dependent().term_bands(term, alpha))
-            .or_raise()?;
+        let bands = py.detached(|| self.cell.borrow_dependent().term_bands(term, alpha))?;
         let shape = &bands.shape;
         let se = on_grid(py, shape, bands.standard_errors)?;
         let lower = on_grid(py, shape, bands.lower)?;
@@ -232,13 +210,11 @@ impl EbmInference {
         term: usize,
         data: &DMatrix,
     ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
-        let se = py
-            .detach(|| {
-                self.cell
-                    .borrow_dependent()
-                    .term_standard_errors(term, &data.inner)
-            })
-            .or_raise()?;
+        let se = py.detached(|| {
+            self.cell
+                .borrow_dependent()
+                .term_standard_errors(term, &data.inner)
+        })?;
         column(py, se)
     }
 
@@ -247,9 +223,7 @@ impl EbmInference {
         py: Python<'py>,
         data: &DMatrix,
     ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
-        let se = py
-            .detach(|| self.cell.borrow_dependent().standard_errors(&data.inner))
-            .or_raise()?;
+        let se = py.detached(|| self.cell.borrow_dependent().standard_errors(&data.inner))?;
         column(py, se)
     }
 
@@ -259,14 +233,12 @@ impl EbmInference {
         data: &DMatrix,
         alpha: f64,
     ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
-        let bounds = py
-            .detach(|| {
-                self.cell
-                    .borrow_dependent()
-                    .confidence_intervals(&data.inner, alpha)
-            })
-            .or_raise()?;
-        intervals(py, bounds)
+        let bounds = py.detached(|| {
+            self.cell
+                .borrow_dependent()
+                .confidence_intervals(&data.inner, alpha)
+        })?;
+        intervals_to_numpy(py, bounds)
     }
 
     fn prediction_intervals<'py>(
@@ -275,13 +247,11 @@ impl EbmInference {
         data: &DMatrix,
         alpha: f64,
     ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
-        let bounds = py
-            .detach(|| {
-                self.cell
-                    .borrow_dependent()
-                    .prediction_intervals(&data.inner, alpha)
-            })
-            .or_raise()?;
-        intervals(py, bounds)
+        let bounds = py.detached(|| {
+            self.cell
+                .borrow_dependent()
+                .prediction_intervals(&data.inner, alpha)
+        })?;
+        intervals_to_numpy(py, bounds)
     }
 }

@@ -3,9 +3,8 @@
 //! leaf refit.
 
 use crate::booster::Booster;
-use crate::data::{DMatrix, to_numpy};
-use crate::errors::{OrRaise, refuse};
-use hessboost::conformal::Interval;
+use crate::data::{DMatrix, intervals_to_numpy, to_numpy};
+use crate::errors::{DetachExt, refuse};
 use hessboost::data::DMatrix as RustMatrix;
 use hessboost::inference::{self, KernelSolver, NoiseVariance};
 use hessboost::model::BoostedModel;
@@ -17,9 +16,41 @@ use std::sync::Arc;
 
 /// What a fitted inference borrows: the model, and the holdout rows its
 /// noise variance (and calibrated intervals) come from, if any.
-struct Owner {
-    model: Arc<BoostedModel>,
+pub(crate) struct Owner {
+    pub(crate) model: Arc<BoostedModel>,
     holdout: Option<RustMatrix>,
+    noise_variance: Option<f64>,
+}
+
+impl Owner {
+    /// The owner of an inference over `booster`, refusing both `holdout`
+    /// rows and a known `noise_variance`.
+    pub(crate) fn new(
+        booster: &Booster,
+        holdout: Option<&DMatrix>,
+        noise_variance: Option<f64>,
+    ) -> PyResult<Self> {
+        if holdout.is_some() && noise_variance.is_some() {
+            return Err(refuse(
+                "pass either holdout rows or a known noise_variance, not both",
+            ));
+        }
+        Ok(Self {
+            model: Arc::clone(&booster.model),
+            holdout: holdout.map(|h| h.inner.clone()),
+            noise_variance,
+        })
+    }
+
+    /// Where the noise variance comes from: the holdout rows, the known
+    /// value, or (neither) the training residuals.
+    pub(crate) fn noise(&self) -> NoiseVariance<'_> {
+        match (&self.holdout, self.noise_variance) {
+            (Some(holdout), _) => NoiseVariance::Holdout(holdout),
+            (None, Some(v)) => NoiseVariance::Known(v),
+            (None, None) => NoiseVariance::TrainingResiduals,
+        }
+    }
 }
 
 type InferenceRef<'a> = inference::BoulevardInference<'a>;
@@ -32,21 +63,8 @@ self_cell!(
     }
 );
 
-/// `(rows, 2)` `[lower, upper]` bounds.
-pub(crate) fn intervals(
-    py: Python<'_>,
-    bounds: Vec<Interval<f64>>,
-) -> PyResult<Bound<'_, PyArrayDyn<f64>>> {
-    let rows = bounds.len();
-    let values = bounds
-        .into_iter()
-        .flat_map(|iv| [iv.lower, iv.upper])
-        .collect();
-    to_numpy(py, values, &[rows, 2])
-}
-
 /// The kernel solver: Nyström with `landmarks`, else exact.
-fn solver(landmarks: Option<usize>, seed: u64) -> KernelSolver {
+pub(crate) fn solver(landmarks: Option<usize>, seed: u64) -> KernelSolver {
     landmarks.map_or(KernelSolver::Exact, |landmarks| KernelSolver::Nystrom {
         landmarks,
         seed,
@@ -77,15 +95,13 @@ impl BoulevardInference {
         kind: Kind,
     ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
         let inner = self.cell.borrow_dependent();
-        let bounds = py
-            .detach(|| match kind {
-                Kind::Confidence => inner.confidence_intervals(&data.inner, alpha),
-                Kind::Prediction => inner.prediction_intervals(&data.inner, alpha),
-                Kind::Reproduction => inner.reproduction_intervals(&data.inner, alpha),
-                Kind::Calibrated => inner.calibrated_prediction_intervals(&data.inner, alpha),
-            })
-            .or_raise()?;
-        intervals(py, bounds)
+        let bounds = py.detached(|| match kind {
+            Kind::Confidence => inner.confidence_intervals(&data.inner, alpha),
+            Kind::Prediction => inner.prediction_intervals(&data.inner, alpha),
+            Kind::Reproduction => inner.reproduction_intervals(&data.inner, alpha),
+            Kind::Calibrated => inner.calibrated_prediction_intervals(&data.inner, alpha),
+        })?;
+        intervals_to_numpy(py, bounds)
     }
 }
 
@@ -106,33 +122,18 @@ impl BoulevardInference {
         landmarks: Option<usize>,
         seed: u64,
     ) -> PyResult<Self> {
-        if holdout.is_some() && noise_variance.is_some() {
-            return Err(refuse(
-                "pass either holdout rows or a known noise_variance, not both",
-            ));
-        }
-        let owner = Owner {
-            model: Arc::clone(&booster.model),
-            holdout: holdout.map(|h| h.inner.clone()),
-        };
+        let owner = Owner::new(booster, holdout, noise_variance)?;
         let train = &train.inner;
-        let cell = py
-            .detach(|| {
-                Cell::try_new(owner, |owner| {
-                    let noise = match (&owner.holdout, noise_variance) {
-                        (Some(holdout), _) => NoiseVariance::Holdout(holdout),
-                        (None, Some(v)) => NoiseVariance::Known(v),
-                        (None, None) => NoiseVariance::TrainingResiduals,
-                    };
-                    inference::BoulevardInference::fit(
-                        &owner.model,
-                        train,
-                        noise,
-                        solver(landmarks, seed),
-                    )
-                })
+        let cell = py.detached(|| {
+            Cell::try_new(owner, |owner| {
+                inference::BoulevardInference::fit(
+                    &owner.model,
+                    train,
+                    owner.noise(),
+                    solver(landmarks, seed),
+                )
             })
-            .or_raise()?;
+        })?;
         Ok(Self { cell })
     }
 
@@ -146,9 +147,7 @@ impl BoulevardInference {
         py: Python<'py>,
         data: &DMatrix,
     ) -> PyResult<Bound<'py, PyArrayDyn<f64>>> {
-        let se = py
-            .detach(|| self.cell.borrow_dependent().standard_errors(&data.inner))
-            .or_raise()?;
+        let se = py.detached(|| self.cell.borrow_dependent().standard_errors(&data.inner))?;
         let rows = se.n_rows();
         to_numpy(py, se.into_vec(), &[rows])
     }
@@ -194,9 +193,7 @@ impl BoulevardInference {
 /// `values`, keeping its tree structures.
 #[pyfunction]
 pub fn honest_refit(py: Python<'_>, booster: &Booster, values: &DMatrix) -> PyResult<Booster> {
-    let model = py
-        .detach(|| inference::honest_refit(&booster.model, &values.inner))
-        .or_raise()?;
+    let model = py.detached(|| inference::honest_refit(&booster.model, &values.inner))?;
     Ok(Booster::new(model))
 }
 

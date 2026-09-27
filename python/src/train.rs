@@ -2,7 +2,7 @@
 
 use crate::booster::Booster;
 use crate::data::{DMatrix, row_major, to_numpy};
-use crate::errors::{OrRaise, refuse};
+use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
 use hessboost::metric::CustomMetric;
 use hessboost::objective::{CustomLoss, GradPair, Objective};
@@ -420,15 +420,13 @@ pub(crate) fn cv(
         .into_iter()
         .map(|(train, test)| Fold::new(train, test))
         .collect();
-    let results = py
-        .detach(|| {
-            let mut cv = CrossValidation::new(&params.inner, &data.inner, num_boost_round, folds);
-            if let Some(rounds) = early_stopping_rounds {
-                cv = cv.early_stopping_rounds(rounds);
-            }
-            cv.run()
-        })
-        .or_raise()?;
+    let results = py.detached(|| {
+        let mut cv = CrossValidation::new(&params.inner, &data.inner, num_boost_round, folds);
+        if let Some(rounds) = early_stopping_rounds {
+            cv = cv.early_stopping_rounds(rounds);
+        }
+        cv.run()
+    })?;
     Ok(results
         .into_iter()
         .map(|result| (result.metric, result.test_mean, result.test_std))
@@ -493,16 +491,14 @@ pub(crate) fn purged_forward<'py>(
         row_major(&decision_at, "decision_at")?,
         row_major(&label_end, "label_end")?,
     );
-    let folds = py
-        .detach(|| {
-            Fold::purged_forward(
-                decision_at,
-                label_end,
-                validation_fraction,
-                blocks,
-                min_train,
-            )
-        })
-        .or_raise()?;
+    let folds = py.detached(|| {
+        Fold::purged_forward(
+            decision_at,
+            label_end,
+            validation_fraction,
+            blocks,
+            min_train,
+        )
+    })?;
     fold_arrays(py, folds)
 }

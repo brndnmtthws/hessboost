@@ -1,9 +1,10 @@
 //! `Booster`: a trained or loaded model, its prediction variants, feature
 //! importance, slicing, and every model format.
 
+use crate::codec::encode_bytes;
 use crate::data::{DMatrix, to_numpy};
 use crate::dist::Distributions;
-use crate::errors::OrRaise;
+use crate::errors::DetachExt;
 use hessboost::model::{BoostedModel, Contributions, ImportanceType, Interactions, Predictions};
 use numpy::PyArrayDyn;
 use pyo3::exceptions::PyValueError;
@@ -161,34 +162,29 @@ impl Booster {
         } else {
             Format::parse(format)?
         };
-        let model = py
-            .detach(|| match format {
-                Format::Binary => BoostedModel::from_bytes(data),
-                Format::Json => BoostedModel::from_json(utf8(data)?),
-                Format::XgboostJson => BoostedModel::from_xgboost_json(utf8(data)?),
-                Format::XgboostUbjson => BoostedModel::from_xgboost_ubjson(data),
-                Format::Lightgbm => BoostedModel::from_lightgbm_text(utf8(data)?),
-            })
-            .or_raise()?;
+        let model = py.detached(|| match format {
+            Format::Binary => BoostedModel::from_bytes(data),
+            Format::Json => BoostedModel::from_json(utf8(data)?),
+            Format::XgboostJson => BoostedModel::from_xgboost_json(utf8(data)?),
+            Format::XgboostUbjson => BoostedModel::from_xgboost_ubjson(data),
+            Format::Lightgbm => BoostedModel::from_lightgbm_text(utf8(data)?),
+        })?;
         Ok(Self::new(model))
     }
 
     /// The model encoded in `format`.
     fn save<'py>(&self, py: Python<'py>, format: &str) -> PyResult<Bound<'py, PyBytes>> {
         let format = Format::parse(format)?;
-        let bytes = py
-            .detach(|| match format {
-                Format::Binary => self.model.to_bytes(),
-                Format::Json => self.model.to_json().map(String::into_bytes),
-                Format::XgboostJson => self.model.to_xgboost_json().map(String::into_bytes),
-                Format::XgboostUbjson => self.model.to_xgboost_ubjson(),
-                Format::Lightgbm => Err(hessboost::error::HessboostError::invalid_param(
-                    "format",
-                    "\"lightgbm\" is an import-only format: LightGBM models load, but do not save",
-                )),
-            })
-            .or_raise()?;
-        Ok(PyBytes::new(py, &bytes))
+        encode_bytes(py, || match format {
+            Format::Binary => self.model.to_bytes(),
+            Format::Json => self.model.to_json().map(String::into_bytes),
+            Format::XgboostJson => self.model.to_xgboost_json().map(String::into_bytes),
+            Format::XgboostUbjson => self.model.to_xgboost_ubjson(),
+            Format::Lightgbm => Err(hessboost::error::HessboostError::invalid_param(
+                "format",
+                "\"lightgbm\" is an import-only format: LightGBM models load, but do not save",
+            )),
+        })
     }
 
     /// Predictions of `kind` (`value`, `margin`, `contribs`,
@@ -215,26 +211,22 @@ impl Booster {
         let model = &*self.model;
         let matrix = &data.inner;
         let range = iteration_range.map(|range| self.range(range));
-        let (values, shape) = py
-            .detach(|| -> hessboost::error::Result<_> {
-                Ok(match (kind, range) {
-                    (Kind::Value, None) => dense(model.predict(matrix)?),
-                    (Kind::Value, Some(range)) => dense(model.predict_range(matrix, range)?),
-                    (Kind::Margin, None) => dense(model.predict_margin(matrix)?),
-                    (Kind::Margin, Some(range)) => {
-                        dense(model.predict_margin_range(matrix, range)?)
-                    }
-                    (Kind::Contribs, None) => contributions(model.predict_contribs(matrix)?),
-                    (Kind::Contribs, Some(range)) => {
-                        contributions(model.predict_contribs_range(matrix, range)?)
-                    }
-                    (Kind::Interactions, None) => interactions(model.predict_interactions(matrix)?),
-                    (Kind::Interactions, Some(range)) => {
-                        interactions(model.predict_interactions_range(matrix, range)?)
-                    }
-                })
+        let (values, shape) = py.detached(|| -> hessboost::error::Result<_> {
+            Ok(match (kind, range) {
+                (Kind::Value, None) => dense(model.predict(matrix)?),
+                (Kind::Value, Some(range)) => dense(model.predict_range(matrix, range)?),
+                (Kind::Margin, None) => dense(model.predict_margin(matrix)?),
+                (Kind::Margin, Some(range)) => dense(model.predict_margin_range(matrix, range)?),
+                (Kind::Contribs, None) => contributions(model.predict_contribs(matrix)?),
+                (Kind::Contribs, Some(range)) => {
+                    contributions(model.predict_contribs_range(matrix, range)?)
+                }
+                (Kind::Interactions, None) => interactions(model.predict_interactions(matrix)?),
+                (Kind::Interactions, Some(range)) => {
+                    interactions(model.predict_interactions_range(matrix, range)?)
+                }
             })
-            .or_raise()?;
+        })?;
         to_numpy(py, values, &shape)
     }
 
@@ -249,12 +241,10 @@ impl Booster {
     ) -> PyResult<Bound<'py, PyArrayDyn<i32>>> {
         let model = &*self.model;
         let range = iteration_range.map(|range| self.range(range));
-        let leaves = py
-            .detach(|| match range {
-                None => model.predict_leaf(&data.inner),
-                Some(range) => model.predict_leaf_range(&data.inner, range),
-            })
-            .or_raise()?;
+        let leaves = py.detached(|| match range {
+            None => model.predict_leaf(&data.inner),
+            Some(range) => model.predict_leaf_range(&data.inner, range),
+        })?;
         let (rows, trees) = (leaves.n_rows(), leaves.width());
         // Leaf ids index a tree's nodes, far below `i32::MAX`.
         let leaves = leaves
@@ -274,12 +264,10 @@ impl Booster {
         iteration_range: Option<(usize, usize)>,
     ) -> PyResult<Distributions> {
         let range = iteration_range.map(|range| self.range(range));
-        let dists = py
-            .detach(|| match range {
-                None => self.model.predict_distribution(&data.inner),
-                Some(range) => self.model.predict_distribution_range(&data.inner, range),
-            })
-            .or_raise()?;
+        let dists = py.detached(|| match range {
+            None => self.model.predict_distribution(&data.inner),
+            Some(range) => self.model.predict_distribution_range(&data.inner, range),
+        })?;
         Distributions::new(dists)
     }
 
@@ -293,9 +281,7 @@ impl Booster {
         count: usize,
         output_margin: bool,
     ) -> PyResult<(Bound<'py, PyArrayDyn<f32>>, Vec<usize>)> {
-        let ensembles = py
-            .detach(|| self.model.predict_virtual_ensembles(&data.inner, count))
-            .or_raise()?;
+        let ensembles = py.detached(|| self.model.predict_virtual_ensembles(&data.inner, count))?;
         let (members, rows) = (ensembles.n_members(), ensembles.n_rows());
         let member = |m| {
             if output_margin {
@@ -339,9 +325,7 @@ impl Booster {
         Option<Bound<'py, PyArrayDyn<f64>>>,
         Option<Bound<'py, PyArrayDyn<f64>>>,
     )> {
-        let uncertainty = py
-            .detach(|| self.model.predict_uncertainty(&data.inner, count))
-            .or_raise()?;
+        let uncertainty = py.detached(|| self.model.predict_uncertainty(&data.inner, count))?;
         let array = |values: Predictions<f64>| {
             let (values, shape) = dense(values);
             to_numpy(py, values, &shape)
@@ -388,9 +372,7 @@ impl Booster {
 
     /// Every `step`-th iteration of `begin..end`.
     fn slice(&self, py: Python<'_>, begin: usize, end: usize, step: usize) -> PyResult<Self> {
-        let model = py
-            .detach(|| self.model.slice(begin..end, step))
-            .or_raise()?;
+        let model = py.detached(|| self.model.slice(begin..end, step))?;
         Ok(Self::new(model))
     }
 

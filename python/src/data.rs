@@ -1,7 +1,8 @@
 //! `DMatrix`: hessboost's dataset container, built from borrowed row-major
 //! `float32` arrays (the Python layer converts everything else).
 
-use crate::errors::{OrRaise, refuse};
+use crate::errors::{DetachExt, refuse};
+use hessboost::conformal::Interval;
 use hessboost::data::{DMatrix as RustMatrix, FeatureType, GroupInfo};
 use numpy::ndarray::{ArrayD, IxDyn};
 use numpy::{
@@ -25,6 +26,37 @@ pub(crate) fn row_major<'a, T: numpy::Element, D: numpy::ndarray::Dimension>(
         )));
     }
     Ok(array.as_slice()?)
+}
+
+/// [`row_major`] of a `(rows,)` or `(rows, columns)` array, with its
+/// column count (`1` for a vector); any other rank is refused.
+fn row_major_vector_or_matrix<'a, T: numpy::Element>(
+    array: &'a PyReadonlyArrayDyn<'_, T>,
+    name: &str,
+) -> PyResult<(&'a [T], usize)> {
+    let columns = match array.shape() {
+        [_] => 1,
+        [_, columns] => *columns,
+        shape => {
+            return Err(refuse(format!(
+                "{name} must be 1-D or 2-D, got shape {shape:?}"
+            )));
+        }
+    };
+    Ok((row_major(array, name)?, columns))
+}
+
+/// `(rows, 2)` `[lower, upper]` bounds.
+pub(crate) fn intervals_to_numpy<T: numpy::Element>(
+    py: Python<'_>,
+    bounds: Vec<Interval<T>>,
+) -> PyResult<Bound<'_, PyArrayDyn<T>>> {
+    let rows = bounds.len();
+    let values = bounds
+        .into_iter()
+        .flat_map(|iv| [iv.lower, iv.upper])
+        .collect();
+    to_numpy(py, values, &[rows, 2])
 }
 
 /// A row-major matrix or vector as a numpy array of `shape`.
@@ -82,28 +114,11 @@ impl Info<'_> {
     fn slices(&self) -> PyResult<InfoSlices<'_>> {
         let label = match &self.label {
             None => None,
-            Some(label) => {
-                let targets = match label.shape() {
-                    [_] => 1,
-                    [_, targets] => *targets,
-                    shape => {
-                        return Err(refuse(format!(
-                            "label must be 1-D or 2-D, got shape {shape:?}"
-                        )));
-                    }
-                };
-                Some((row_major(label, "label")?, targets))
-            }
+            Some(label) => Some(row_major_vector_or_matrix(label, "label")?),
         };
         let base_margin = match &self.base_margin {
             None => None,
-            Some(margin) if margin.ndim() <= 2 => Some(row_major(margin, "base_margin")?),
-            Some(margin) => {
-                return Err(refuse(format!(
-                    "base_margin must be 1-D or 2-D, got shape {:?}",
-                    margin.shape()
-                )));
-            }
+            Some(margin) => Some(row_major_vector_or_matrix(margin, "base_margin")?.0),
         };
         let label_bounds = match &self.label_bounds {
             None => None,
@@ -218,12 +233,10 @@ impl DMatrix {
         let [rows, columns] = [data.shape()[0], data.shape()[1]];
         let values = row_major(&data, "data")?;
         let info = info.slices()?;
-        let inner = py
-            .detach(|| {
-                let matrix = RustMatrix::from_dense_with_missing(values, rows, columns, missing)?;
-                info.apply(matrix)
-            })
-            .or_raise()?;
+        let inner = py.detached(|| {
+            let matrix = RustMatrix::from_dense_with_missing(values, rows, columns, missing)?;
+            info.apply(matrix)
+        })?;
         Ok(Self { inner })
     }
 
@@ -246,44 +259,42 @@ impl DMatrix {
             row_major(&values, "values")?,
         );
         let info = info.slices()?;
-        let inner = py
-            .detach(|| {
-                let convert = |name: &'static str, value: i64| {
-                    usize::try_from(value).map_err(|_| {
-                        hessboost::error::HessboostError::invalid_param(
-                            name,
-                            format!("negative entry {value}"),
-                        )
-                    })
-                };
-                let indptr = indptr
-                    .iter()
-                    .map(|&offset| convert("csr indptr", offset))
-                    .collect::<hessboost::error::Result<Vec<_>>>()?;
-                let indices = indices
-                    .iter()
-                    .map(|&index| {
-                        convert("csr indices", index).and_then(|index| {
-                            u32::try_from(index).map_err(|_| {
-                                hessboost::error::HessboostError::invalid_param(
-                                    "csr indices",
-                                    format!("column {index} does not fit in 32 bits"),
-                                )
-                            })
+        let inner = py.detached(|| {
+            let convert = |name: &'static str, value: i64| {
+                usize::try_from(value).map_err(|_| {
+                    hessboost::error::HessboostError::invalid_param(
+                        name,
+                        format!("negative entry {value}"),
+                    )
+                })
+            };
+            let indptr = indptr
+                .iter()
+                .map(|&offset| convert("csr indptr", offset))
+                .collect::<hessboost::error::Result<Vec<_>>>()?;
+            let indices = indices
+                .iter()
+                .map(|&index| {
+                    convert("csr indices", index).and_then(|index| {
+                        u32::try_from(index).map_err(|_| {
+                            hessboost::error::HessboostError::invalid_param(
+                                "csr indices",
+                                format!("column {index} does not fit in 32 bits"),
+                            )
                         })
                     })
-                    .collect::<hessboost::error::Result<Vec<_>>>()?;
-                let matrix = RustMatrix::from_csr(indptr, indices, values.to_vec(), n_cols)?;
-                info.apply(matrix)
-            })
-            .or_raise()?;
+                })
+                .collect::<hessboost::error::Result<Vec<_>>>()?;
+            let matrix = RustMatrix::from_csr(indptr, indices, values.to_vec(), n_cols)?;
+            info.apply(matrix)
+        })?;
         Ok(Self { inner })
     }
 
     /// A copy with the fields present in `info` replaced.
     fn with_info(&self, py: Python<'_>, info: Info<'_>) -> PyResult<Self> {
         let info = info.slices()?;
-        let inner = py.detach(|| info.apply(self.inner.clone())).or_raise()?;
+        let inner = py.detached(|| info.apply(self.inner.clone()))?;
         Ok(Self { inner })
     }
 
@@ -301,7 +312,7 @@ impl DMatrix {
                     .ok_or_else(|| refuse(format!("row index {row} is out of range for {n} rows")))
             })
             .collect::<PyResult<Vec<_>>>()?;
-        let inner = py.detach(|| self.inner.select_rows(&rows)).or_raise()?;
+        let inner = py.detached(|| self.inner.select_rows(&rows))?;
         Ok(Self { inner })
     }
 

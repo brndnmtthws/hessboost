@@ -3,6 +3,7 @@
 //! it, updates are deterministic and atomic, and unsound configurations are
 //! refused.
 
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use hessboost::config::{
@@ -140,8 +141,8 @@ fn an_interrupted_update_changes_nothing() {
     ] {
         let mut online = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
         let before = online.model().to_json().unwrap();
-        let stop = |round: &RoundEval| {
-            if round.iteration == 3 {
+        let stop = |round: RoundEval| {
+            if round.iteration() == 3 {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -467,8 +468,8 @@ fn an_abandoned_update_keeps_the_update_state() {
         let mut online = OnlineModel::train(&p, &train_data, 10, online).unwrap();
         online.update(Some(&a), &[0, 5, 9]).unwrap();
         let mut control = online.clone();
-        let stop = |round: &RoundEval| {
-            if round.iteration == 4 {
+        let stop = |round: RoundEval| {
+            if round.iteration() == 4 {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -534,7 +535,7 @@ fn from_model_refuses_models_and_metrics_training_would_not_give() {
     let p = params(Objective::SquaredError(RegLoss::default()));
     let stopped = Trainer::new(&p, &d, 200)
         .eval(&valid, "valid")
-        .early_stopping_rounds(2)
+        .early_stopping_rounds(NonZeroUsize::new(2).unwrap())
         .train()
         .unwrap()
         .model;

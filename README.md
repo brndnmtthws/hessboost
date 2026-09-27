@@ -80,9 +80,11 @@ For eval sets, early stopping, custom objectives, or continued training, use
 `Trainer` (the `xgb.train` keyword-argument equivalent):
 
 ```rust
+use std::num::NonZeroUsize;
+
 let result = Trainer::new(&params, &dtrain, 1000)
     .eval(&dvalid, "valid")
-    .early_stopping_rounds(20)
+    .early_stopping_rounds(NonZeroUsize::new(20).unwrap())
     .train()?;
 let model = result.model; // predicts with the best iteration
 ```

@@ -13,6 +13,7 @@ use hessboost::prelude::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
+use std::num::NonZeroUsize;
 
 mod common;
 use common::labeled_dense;
@@ -73,7 +74,7 @@ fn params(objective: Objective) -> TrainingParamsBuilder {
 fn fit(p: &TrainingParams, dtrain: &DMatrix, dvalid: &DMatrix) -> BoostedModel {
     let result = Trainer::new(p, dtrain, 1000)
         .eval(dvalid, "valid")
-        .early_stopping_rounds(20)
+        .early_stopping_rounds(NonZeroUsize::new(20).unwrap())
         .train()
         .unwrap();
     assert!(
@@ -237,29 +238,26 @@ fn every_family_and_gradient_mode_learns() {
             .unwrap();
             let result = Trainer::new(&p, &dtrain, 1000)
                 .eval(&dvalid, "valid")
-                .early_stopping_rounds(20)
+                .early_stopping_rounds(NonZeroUsize::new(20).unwrap())
                 .train()
                 .unwrap();
             let model = result.model;
             assert_eq!(model.n_outputs(), family.n_params());
             let best = model.best_iteration().expect("early stopping triggered");
-            let first = &result.history[0].scores;
-            let at_best = &result.history[best].scores;
-            assert_eq!(
-                (first[0].metric.as_str(), first[1].metric.as_str()),
-                ("crps", "nll")
-            );
+            let first = result.history.round(0).unwrap().values();
+            let at_best = result.history.round(best).unwrap().values();
+            assert_eq!(result.history.metrics(), ["crps", "nll"]);
             assert!(
-                at_best[0].value < first[0].value && at_best[1].value < first[1].value,
+                at_best[0] < first[0] && at_best[1] < first[1],
                 "{objective} {mode:?}"
             );
             // The reported metric is the mean NLL of the predicted
             // distributions (up to the f32 rounding of the parameters).
             let valid = mean_nll(&model.predict_distribution(&dvalid).unwrap(), &dvalid);
             assert!(
-                (valid - at_best[1].value).abs() < 1e-3 * valid.abs().max(1.0),
+                (valid - at_best[1]).abs() < 1e-3 * valid.abs().max(1.0),
                 "{objective}: {valid} vs {}",
-                at_best[1].value
+                at_best[1]
             );
             let nll = mean_nll(&model.predict_distribution(&dtest).unwrap(), &dtest);
             let marginal = train(&p, &dtrain, 0).unwrap();

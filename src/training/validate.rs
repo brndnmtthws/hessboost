@@ -1,12 +1,13 @@
 //! Request validation: what training refuses before anything is built.
 
-use super::eval::{EarlyStopping, EvalSet, name_dataset};
+use super::eval::{EvalSet, name_dataset};
 use crate::config::{BoosterKind, ProcessType, TrainingParams};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Loss;
 use crate::training::multi_output;
+use std::num::NonZeroUsize;
 
 /// Check that a freshly trained model would load again. Arithmetic that
 /// overflows `f32` (from extreme labels, weights, or margins) leaves
@@ -55,7 +56,7 @@ pub(super) struct TrainRequest<'a> {
     pub(super) params: &'a TrainingParams,
     pub(super) dtrain: &'a DMatrix,
     pub(super) evals: &'a [EvalSet<'a>],
-    pub(super) early_stopping_rounds: Option<usize>,
+    pub(super) early_stopping_rounds: Option<NonZeroUsize>,
 }
 /// Refuse a training call that cannot run: invalid parameters, early
 /// stopping without eval sets, unlabeled or mismatched data, constraints
@@ -93,7 +94,6 @@ fn validate_setup(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
     } = request;
     params.validate()?;
     multi_output::validate(params, objective.n_outputs())?;
-    EarlyStopping::check_patience(early_stopping_rounds)?;
     if early_stopping_rounds.is_some() && evals.is_empty() {
         return Err(HessboostError::invalid_param(
             "early_stopping_rounds",

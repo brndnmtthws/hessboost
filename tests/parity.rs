@@ -27,7 +27,7 @@ use hessboost::config::{ProcessType, Refresh};
 use hessboost::data::FeatureType;
 use hessboost::internals::HistCuts;
 use hessboost::prelude::{BoostedModel, DMatrix, HessboostError, Trainer, TrainingParams, train};
-use hessboost::training::RoundEval;
+use hessboost::training::EvalHistory;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
@@ -511,7 +511,7 @@ impl Case<'_> {
     fn train_and_compare(
         &mut self,
         dtest: &DMatrix,
-    ) -> Result<(BoostedModel, Vec<f32>, Vec<RoundEval>), String> {
+    ) -> Result<(BoostedModel, Vec<f32>, EvalHistory), String> {
         let fx = self.fx;
         let params = build_params(fx)?;
         let dtrain = self.train_matrix()?;
@@ -524,7 +524,7 @@ impl Case<'_> {
                     .train()
                     .map(|r| r.model)
                     .map_err(|e| format!("continue training: {e}"))?;
-                (model, Vec::new())
+                (model, EvalHistory::default())
             }
             None if fx.xgb_evals.is_some() => {
                 let deval = self.eval_matrix()?;
@@ -537,7 +537,7 @@ impl Case<'_> {
             None => {
                 let model =
                     train(&params, &dtrain, fx.num_round).map_err(|e| format!("train: {e}"))?;
-                (model, Vec::new())
+                (model, EvalHistory::default())
             }
         };
         let preds = model.predict(dtest).map_err(|e| format!("predict: {e}"))?;
@@ -555,17 +555,15 @@ impl Case<'_> {
     /// `evals_result`: the same metric names (the default metric's name when
     /// the case sets no `eval_metric`) and values within the relative
     /// `tol.evals`. Returns the largest relative delta as the table cell.
-    fn compare_evals(&mut self, history: &[RoundEval]) -> String {
+    fn compare_evals(&mut self, history: &EvalHistory) -> String {
         let fx = self.fx;
         let Some(oracle) = &fx.xgb_evals else {
             return "-".to_string();
         };
         let mut ours: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
-        for round in history {
-            for score in &round.scores {
-                ours.entry(score.metric.as_str())
-                    .or_default()
-                    .push(score.value);
+        for round in history.rounds() {
+            for (_, metric, value) in round.scores() {
+                ours.entry(metric).or_default().push(value);
             }
         }
         let our_names: Vec<&str> = ours.keys().copied().collect();

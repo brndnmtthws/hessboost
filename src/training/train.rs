@@ -18,6 +18,7 @@ use crate::training::multi_output;
 use crate::training::sglb::{Sglb, Shrink};
 use crate::tree::builder::all_rows;
 use crate::tree::reuse::ReuseSet;
+use std::num::NonZeroUsize;
 
 /// Run `train` on a dedicated pool of `params.nthread` threads, or on the
 /// global rayon pool when `nthread` is unset.
@@ -103,7 +104,7 @@ pub(super) fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<T
 pub(super) struct Run<'a> {
     ctx: TrainContext<'a>,
     evals: &'a [EvalSet<'a>],
-    early_stopping_rounds: Option<usize>,
+    early_stopping_rounds: Option<NonZeroUsize>,
     metric_override: Option<Box<dyn Metric>>,
     num_boost_round: usize,
     /// The per-iteration model shrinkage (SGLB), when configured.

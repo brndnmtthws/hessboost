@@ -31,13 +31,14 @@ fn main() -> Result<()> {
     let result = Trainer::new(&params, &data, 100)
         .eval(&data, "train")
         .train()?;
-    let scores = &result
+    let scores: Vec<_> = result
         .history
         .last()
         .ok_or_else(|| {
             hessboost::error::HessboostError::invalid_param("num_boost_round", "must be positive")
         })?
-        .scores;
+        .scores()
+        .collect();
     println!("final ranking metrics: {scores:?}");
     Ok(())
 }

@@ -4,7 +4,7 @@
 use crate::data::{DMatrix, to_numpy};
 use crate::dist::Distributions;
 use crate::errors::OrRaise;
-use hessboost::model::{BoostedModel, ImportanceType};
+use hessboost::model::{BoostedModel, Contributions, ImportanceType, Interactions, Predictions};
 use numpy::PyArrayDyn;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -81,6 +81,48 @@ enum Kind {
     Margin,
     Contribs,
     Interactions,
+}
+
+/// `(rows,)` for one value per row, else `(rows, width)`.
+fn dense(predictions: Predictions) -> (Vec<f32>, Vec<usize>) {
+    let (rows, width) = (predictions.n_rows(), predictions.width());
+    let shape = if width == 1 {
+        vec![rows]
+    } else {
+        vec![rows, width]
+    };
+    (predictions.into_vec(), shape)
+}
+
+/// `(rows, features + 1)`, with an output axis for multi-output models.
+fn contributions(contribs: Contributions) -> (Vec<f32>, Vec<usize>) {
+    let (rows, outputs, width) = (
+        contribs.n_rows(),
+        contribs.n_outputs(),
+        contribs.n_features() + 1,
+    );
+    let shape = if outputs == 1 {
+        vec![rows, width]
+    } else {
+        vec![rows, outputs, width]
+    };
+    (contribs.into_vec(), shape)
+}
+
+/// `(rows, features + 1, features + 1)`, with an output axis for
+/// multi-output models.
+fn interactions(interactions: Interactions) -> (Vec<f32>, Vec<usize>) {
+    let (rows, outputs, width) = (
+        interactions.n_rows(),
+        interactions.n_outputs(),
+        interactions.n_features() + 1,
+    );
+    let shape = if outputs == 1 {
+        vec![rows, width, width]
+    } else {
+        vec![rows, outputs, width, width]
+    };
+    (interactions.into_vec(), shape)
 }
 
 /// A trained model, shared read-only.
@@ -173,41 +215,26 @@ impl Booster {
         let model = &*self.model;
         let matrix = &data.inner;
         let range = iteration_range.map(|range| self.range(range));
-        let values = py
-            .detach(|| match (kind, range) {
-                (Kind::Value, None) => model.predict(matrix),
-                (Kind::Value, Some(range)) => model.predict_range(matrix, range),
-                (Kind::Margin, None) => model.predict_margin(matrix),
-                (Kind::Margin, Some(range)) => model.predict_margin_range(matrix, range),
-                (Kind::Contribs, None) => model.predict_contribs(matrix),
-                (Kind::Contribs, Some(range)) => model.predict_contribs_range(matrix, range),
-                (Kind::Interactions, None) => model.predict_interactions(matrix),
-                (Kind::Interactions, Some(range)) => {
-                    model.predict_interactions_range(matrix, range)
-                }
+        let (values, shape) = py
+            .detach(|| -> hessboost::error::Result<_> {
+                Ok(match (kind, range) {
+                    (Kind::Value, None) => dense(model.predict(matrix)?),
+                    (Kind::Value, Some(range)) => dense(model.predict_range(matrix, range)?),
+                    (Kind::Margin, None) => dense(model.predict_margin(matrix)?),
+                    (Kind::Margin, Some(range)) => {
+                        dense(model.predict_margin_range(matrix, range)?)
+                    }
+                    (Kind::Contribs, None) => contributions(model.predict_contribs(matrix)?),
+                    (Kind::Contribs, Some(range)) => {
+                        contributions(model.predict_contribs_range(matrix, range)?)
+                    }
+                    (Kind::Interactions, None) => interactions(model.predict_interactions(matrix)?),
+                    (Kind::Interactions, Some(range)) => {
+                        interactions(model.predict_interactions_range(matrix, range)?)
+                    }
+                })
             })
             .or_raise()?;
-        // Every matrix has at least one row.
-        let rows = matrix.n_rows();
-        let width = model.n_features() + 1;
-        let per_row = values.len() / rows;
-        let shape = match kind {
-            Kind::Value | Kind::Margin => {
-                if per_row == 1 {
-                    vec![rows]
-                } else {
-                    vec![rows, per_row]
-                }
-            }
-            Kind::Contribs => match per_row / width {
-                1 => vec![rows, width],
-                outputs => vec![rows, outputs, width],
-            },
-            Kind::Interactions => match per_row / (width * width) {
-                1 => vec![rows, width, width],
-                outputs => vec![rows, outputs, width, width],
-            },
-        };
         to_numpy(py, values, &shape)
     }
 
@@ -228,10 +255,10 @@ impl Booster {
                 Some(range) => model.predict_leaf_range(&data.inner, range),
             })
             .or_raise()?;
-        let rows = data.inner.n_rows();
-        let trees = leaves.len() / rows;
+        let (rows, trees) = (leaves.n_rows(), leaves.width());
         // Leaf ids index a tree's nodes, far below `i32::MAX`.
         let leaves = leaves
+            .into_vec()
             .into_iter()
             .map(|leaf| i32::try_from(leaf).unwrap_or(i32::MAX))
             .collect();
@@ -269,12 +296,19 @@ impl Booster {
         let ensembles = py
             .detach(|| self.model.predict_virtual_ensembles(&data.inner, count))
             .or_raise()?;
-        let (values, width) = if output_margin {
-            (ensembles.margins().to_vec(), self.model.n_outputs())
-        } else {
-            (ensembles.predictions().to_vec(), ensembles.width())
-        };
         let (members, rows) = (ensembles.n_members(), ensembles.n_rows());
+        let member = |m| {
+            if output_margin {
+                ensembles.member_margins(m)
+            } else {
+                ensembles.member_predictions(m)
+            }
+        };
+        let width = member(0).map_or(1, hessboost::model::Predictions::width);
+        let mut values = Vec::with_capacity(members * rows * width);
+        for m in 0..members {
+            values.extend_from_slice(member(m).map_or(&[], |p| p.as_slice()));
+        }
         let shape = if width == 1 {
             vec![members, rows]
         } else {

@@ -38,11 +38,14 @@ self_cell!(
 );
 
 /// `(rows, 2)` `[lower, upper]` bounds.
-fn intervals(py: Python<'_>, bounds: Vec<(f32, f32)>) -> PyResult<Bound<'_, PyArrayDyn<f32>>> {
+fn intervals(
+    py: Python<'_>,
+    bounds: Vec<conformal::Interval>,
+) -> PyResult<Bound<'_, PyArrayDyn<f32>>> {
     let rows = bounds.len();
     let values = bounds
         .into_iter()
-        .flat_map(|(lower, upper)| [lower, upper])
+        .flat_map(|iv| [iv.lower, iv.upper])
         .collect();
     to_numpy(py, values, &[rows, 2])
 }

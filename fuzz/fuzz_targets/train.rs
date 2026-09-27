@@ -460,13 +460,16 @@ fuzz_target!(|case: Case| {
     let margin = model
         .predict_margin(&case.dtrain)
         .expect("a model predicts its training data");
-    assert_eq!(margin.len(), case.dtrain.n_rows() * model.n_outputs());
+    assert_eq!(
+        (margin.n_rows(), margin.width()),
+        (case.dtrain.n_rows(), model.n_outputs())
+    );
     let parallel = fit(&case, 3).expect("training succeeds whatever the thread count");
     let parallel = parallel
         .predict_margin(&case.dtrain)
         .expect("a model predicts its training data");
     assert!(
-        common::same_bits(&margin, &parallel),
+        common::same_bits(margin.as_slice(), parallel.as_slice()),
         "training depends on the thread count"
     );
 });

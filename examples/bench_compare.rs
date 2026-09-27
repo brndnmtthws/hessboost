@@ -57,7 +57,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         if run == repeats {
             let preds = model.predict(&dtest)?;
-            score = metric.eval(&preds, &y_test, None);
+            score = metric.eval(preds.as_slice(), &y_test, None);
         }
     }
     println!(

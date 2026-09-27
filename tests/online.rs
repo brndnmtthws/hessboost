@@ -145,6 +145,21 @@ fn an_interrupted_update_changes_nothing() {
         );
         assert_eq!(online.model().to_json().unwrap(), before);
         assert_eq!(online.data().n_rows(), 300);
+        // Refusing the commit after every iteration ran abandons it too.
+        let mut rounds = 0;
+        let refused = online.update_with_commit(
+            None,
+            &[0, 1],
+            |_| {
+                rounds += 1;
+                ControlFlow::Continue(())
+            },
+            || ControlFlow::Break(()),
+        );
+        assert_eq!(invalid_param(refused), "on_round");
+        assert_eq!(rounds, 10);
+        assert_eq!(online.model().to_json().unwrap(), before);
+        assert_eq!(online.data().n_rows(), 300);
         // The model still updates afterwards, as an uninterrupted one would.
         online.update(None, &[0, 1]).unwrap();
         let mut fresh =
@@ -219,6 +234,8 @@ fn unsound_configurations_and_changes_are_refused() {
                 .unwrap(),
             "grow_policy",
         ),
+        (base().max_leaves(8).build().unwrap(), "grow_policy"),
+        (base().unlimited_depth().build().unwrap(), "grow_policy"),
         (
             base()
                 .booster(BoosterKind::Dart(Dart::default()))
@@ -353,5 +370,23 @@ fn from_model_refuses_shrunk_models() {
             invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
             "model"
         );
+    }
+}
+/// A model with splits deeper than `max_depth` is not one `params` trained:
+/// regrowing below such a split would have no depth left.
+#[test]
+fn from_model_refuses_trees_deeper_than_max_depth() {
+    let d = data(200, 14, false);
+    let p = params(Objective::SquaredError);
+    let mut deeper = p.clone();
+    deeper.max_depth = p.max_depth.and_then(|depth| depth.checked_add(2));
+    let model = train(&deeper, &d, 3).unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(model.clone(), &p, &d, online)),
+            "model"
+        );
+        assert!(OnlineModel::from_model(model.clone(), &deeper, &d, online).is_ok());
     }
 }

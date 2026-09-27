@@ -1453,7 +1453,7 @@ impl GpuModel {
         &self,
         data: &crate::data::DMatrix,
         iterations: impl RangeBounds<usize>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<crate::model::Predictions> {
         let model = &self.model;
         model.validate_prediction_data(data)?;
         let trees = model.iteration_trees(model.resolve_iterations(iterations, "iterations")?);
@@ -1462,7 +1462,7 @@ impl GpuModel {
         let n = data.n_rows();
         let mut margins = initial_margins(model.base_scores(), data);
         if trees.is_empty() || n == 0 {
-            return Ok(margins);
+            return Ok(crate::model::Predictions::new(margins, n, k));
         }
         if n > MAX_BUFFER_ENTRIES || n * data.n_cols() > MAX_BUFFER_ENTRIES {
             return Err(HessboostError::invalid_param(
@@ -1531,26 +1531,25 @@ impl GpuModel {
         })();
         self.checkin(call);
         result?;
-        Ok(margins)
+        Ok(crate::model::Predictions::new(margins, n, k))
     }
 
     /// Raw margin predictions of `data` (the model's effective iterations),
     /// computed on the GPU. Bit-identical to
     /// [`BoostedModel::predict_margin`](crate::prelude::BoostedModel::predict_margin).
-    pub fn predict_margin(&self, data: &crate::data::DMatrix) -> Result<Vec<f32>> {
+    pub fn predict_margin(&self, data: &crate::data::DMatrix) -> Result<crate::model::Predictions> {
         self.predict_margin_range(data, self.model.default_iteration_range())
     }
 
     /// Predictions in the objective's reported space (the model's effective
     /// iterations), computed on the GPU. Bit-identical to
     /// [`BoostedModel::predict`](crate::prelude::BoostedModel::predict).
-    pub fn predict(&self, data: &crate::data::DMatrix) -> Result<Vec<f32>> {
+    pub fn predict(&self, data: &crate::data::DMatrix) -> Result<crate::model::Predictions> {
         let margin = self.predict_margin(data)?;
         Ok(transform_model_margins(
             self.model.objective(),
             self.model.max_delta_step(),
             self.model.n_targets(),
-            self.model.n_outputs(),
             margin,
         ))
     }
@@ -1558,11 +1557,23 @@ impl GpuModel {
     /// The predicted class per row, matching
     /// [`BoostedModel::predict_class`](crate::prelude::BoostedModel::predict_class)
     /// on top of the GPU probabilities.
-    pub fn predict_class(&self, data: &crate::data::DMatrix) -> Result<Vec<u32>> {
+    pub fn predict_class(
+        &self,
+        data: &crate::data::DMatrix,
+    ) -> Result<crate::model::Predictions<u32>> {
         let probs = self.predict(data)?;
         let k = self.model.n_outputs();
         if k == 1 || self.model.n_targets() > 1 {
-            return Ok(probs.iter().map(|&p| u32::from(p > 0.5)).collect());
+            let values = probs
+                .as_slice()
+                .iter()
+                .map(|&p| u32::from(p > 0.5))
+                .collect();
+            return Ok(crate::model::Predictions::new(
+                values,
+                probs.n_rows(),
+                probs.width(),
+            ));
         }
         if self
             .model
@@ -1570,12 +1581,14 @@ impl GpuModel {
             .built_in()
             .is_some_and(crate::objective::Objective::predicts_class_index)
         {
-            return Ok(probs.iter().map(|&class| class as u32).collect());
+            let values = probs.as_slice().iter().map(|&class| class as u32).collect();
+            return Ok(crate::model::Predictions::new(values, probs.n_rows(), 1));
         }
-        Ok(probs
-            .chunks_exact(k)
+        let values = probs
+            .rows()
             .map(|row| crate::simd::argmax_scalar(row) as u32)
-            .collect())
+            .collect();
+        Ok(crate::model::Predictions::new(values, probs.n_rows(), 1))
     }
 
     /// Check out buffers that fit the call, allocating when the pool has

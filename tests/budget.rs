@@ -63,7 +63,7 @@ fn params(objective: Objective) -> TrainingParams {
 
 /// Mean squared error (regression) or log loss (binary) of `model` on `data`.
 fn loss(model: &BoostedModel, data: &DMatrix) -> f64 {
-    let preds = model.predict(data).unwrap();
+    let preds = model.predict(data).unwrap().into_vec(); // one value per row
     let labels = data.labels().unwrap();
     let total: f64 = preds
         .iter()
@@ -210,7 +210,7 @@ fn budget_models_are_ordinary_gbtree_models() {
     let via_native = BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
     for other in [via_xgboost, via_native] {
         let round_trip = other.predict(&data).unwrap();
-        for (a, b) in preds.iter().zip(&round_trip) {
+        for (a, b) in preds.as_slice().iter().zip(round_trip.as_slice()) {
             assert!((a - b).abs() <= 1e-5 * a.abs().max(1.0), "{a} vs {b}");
         }
     }
@@ -346,7 +346,7 @@ fn poisson_leaf_steps_are_bounded() {
     let data = labeled_dense(&x, 1, &x);
     let result =
         train_with_budget(&params(Objective::Poisson), &data, &BudgetConfig::new(0.5)).unwrap();
-    let preds = result.model.predict(&data).unwrap();
+    let preds = result.model.predict(&data).unwrap().into_vec(); // one value per row
     assert!(preds.iter().all(|p| p.is_finite()), "{:?}", result.stop);
     assert!(preds[0] < 1e-3, "zero-count prediction {}", preds[0]);
     assert!(
@@ -372,7 +372,7 @@ fn non_finite_steps_are_not_appended() {
         train_with_budget(&params(Objective::Gamma), &data, &BudgetConfig::new(0.5)).unwrap();
     assert_eq!(result.stop, BudgetStop::NonFiniteLoss);
     let preds = result.model.predict(&data).unwrap();
-    assert!(preds.iter().all(|p| p.is_finite()));
+    assert!(preds.as_slice().iter().all(|p| p.is_finite()));
 }
 
 /// Four rows leave no fold with rows on both sides, and the root gradient
@@ -387,7 +387,7 @@ fn undefined_root_generalization_keeps_the_best_split() {
         &BudgetConfig::default().iteration_limit(1),
     )
     .unwrap();
-    let p = result.model.predict(&data).unwrap();
+    let p = result.model.predict(&data).unwrap().into_vec(); // one value per row
     assert!(p[0] == p[1] && p[2] == p[3] && p[1] < p[2], "{p:?}");
 }
 
@@ -401,7 +401,7 @@ fn one_saved_tree(data: &DMatrix) -> (Vec<f32>, BudgetStop) {
     )
     .unwrap();
     let loaded = BoostedModel::from_bytes(&result.model.to_bytes().unwrap()).unwrap();
-    (loaded.predict(data).unwrap(), result.stop)
+    (loaded.predict(data).unwrap().into_vec(), result.stop)
 }
 
 /// Separating the `±1e20` labels gains about `1e40`, which `f32` cannot

@@ -1428,8 +1428,11 @@ mod tests {
         assert_eq!(restored.num_trees(), model.num_trees());
         assert_eq!(restored.n_features(), model.n_features());
         assert_eq!(restored.objective(), model.objective());
-        assert_eq!(before.len(), after.len());
-        for (a, b) in before.iter().zip(&after) {
+        assert_eq!(
+            (before.n_rows(), before.width()),
+            (after.n_rows(), after.width())
+        );
+        for (a, b) in before.as_slice().iter().zip(after.as_slice()) {
             assert!((a - b).abs() < 1e-5, "pred drift: {a} vs {b}");
         }
     }
@@ -1477,7 +1480,7 @@ mod tests {
         // base_score should round-trip through the logit/sigmoid link.
         assert!((restored.base_score() - model.base_score()).abs() < 1e-4);
         let after = restored.predict(&d).unwrap();
-        for (a, b) in before.iter().zip(&after) {
+        for (a, b) in before.as_slice().iter().zip(after.as_slice()) {
             assert!((a - b).abs() < 1e-5, "pred drift: {a} vs {b}");
         }
     }
@@ -1529,13 +1532,13 @@ mod tests {
 
         // x=1.0 (< 1.5) -> left leaf +10 ; x=2.0 (>= 1.5) -> right leaf -10.
         let d = DMatrix::from_dense(&[1.0, 2.0], 2, 1).unwrap();
-        let margins = model.predict_margin(&d).unwrap();
+        let margins = model.predict_margin(&d).unwrap().into_vec(); // one per row
         assert!((margins[0] - 10.0).abs() < 1e-6, "got {}", margins[0]);
         assert!((margins[1] + 10.0).abs() < 1e-6, "got {}", margins[1]);
 
         // Missing value follows default_left = true -> left leaf.
         let dm = DMatrix::from_dense(&[f32::NAN], 1, 1).unwrap();
-        let mm = model.predict_margin(&dm).unwrap();
+        let mm = model.predict_margin(&dm).unwrap().into_vec();
         assert!(
             (mm[0] - 10.0).abs() < 1e-6,
             "missing routed wrong: {}",
@@ -1564,7 +1567,7 @@ mod tests {
         assert_eq!(model.base_scores(), &expected);
         let d = DMatrix::from_dense(&[0.0, 1.0], 2, 1).unwrap();
         let margins = model.predict_margin(&d).unwrap();
-        assert_eq!(margins, [expected, expected].concat());
+        assert_eq!(margins.as_slice(), [expected, expected].concat());
 
         // A single entry applies to every class (XGBoost's old-format rule).
         let uniform = import_xgboost_json(&three_class_json("[5E-1]")).unwrap();
@@ -1612,7 +1615,7 @@ mod tests {
     fn vector_leaf_width_is_validated_before_allocating() {
         let model = import_xgboost_json(&vector_stump_json("2", "[1.0, 2.0]")).unwrap();
         let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
-        assert_eq!(model.predict_margin(&d).unwrap(), [1.0, 2.0]);
+        assert_eq!(model.predict_margin(&d).unwrap().as_slice(), [1.0, 2.0]);
         // A width that saturates `usize` must not panic allocating the leaf
         // storage: it, a width other than the model's outputs, a fractional
         // width, or one the leaf weights cannot fill is a format error.
@@ -2119,7 +2122,7 @@ mod tests {
     fn class_margins(json: &str) -> Vec<f32> {
         let model = import_xgboost_json(json).unwrap();
         let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
-        model.predict_margin(&d).unwrap()
+        model.predict_margin(&d).unwrap().into_vec()
     }
 
     #[test]
@@ -2150,7 +2153,10 @@ mod tests {
         assert_eq!(model.num_boost_rounds(), 2);
         let first = model.slice(0..1, 1).unwrap();
         let d = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
-        assert_eq!(first.predict_margin(&d).unwrap(), [3.0, 30.0, 300.0]);
+        assert_eq!(
+            first.predict_margin(&d).unwrap().as_slice(),
+            [3.0, 30.0, 300.0]
+        );
 
         // DART weights are indexed by XGBoost position and follow their trees.
         let weights = [1.0, 0.5, 1.0, 0.5, 1.0, 0.5];

@@ -248,13 +248,15 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   and intercepts derive bit for bit; its `..k` ranges and `slice(..k, 1)`
   rebuild the `k`-round model exactly, later starts are refused, and
   early stopping truncates it to the best iteration.
-- **Prediction layout:** single-output and `multi:softmax` give `n_rows`
-  values; `multi:softprob` `n_rows * num_class`; other multi-output models
-  `n_rows * n_outputs`, row-major. Multi-target `predict_class` thresholds
-  each target. SHAP: `[row][n_features + 1]` (bias last), interactions
-  `[row][(n_features + 1)^2]`, plus an output axis for multi-output.
-  `n_targets` counts label columns; XGBoost's `num_target` counts outputs
-  (columns or alphas) and is 1 for multiclass.
+- **Prediction layout:** predictions return `model::Predictions` (row-major
+  `n_rows × width`, owning the computed buffer without a copy): width
+  `n_outputs` (`num_class` for `multi:softprob`), 1 for `multi:softmax`, tree
+  count for leaves. Multi-target `predict_class` thresholds each target. SHAP:
+  `Contributions` `[row][output][n_features + 1]` (bias last),
+  `Interactions` `[row][output][(n_features + 1)^2]`. No `Deref` to slices:
+  callers take the flat buffer (`as_slice`/`into_vec`) only where it is flat
+  (numpy, metrics). `n_targets` counts label columns; XGBoost's `num_target`
+  counts outputs (columns or alphas) and is 1 for multiclass.
 - **Loss/metric hooks:** training and evaluation read data only via
   `MetaInfo` hooks (`Loss::gradient_info`, `base_margins_info`,
   `eval_transform`, `validate_info`, `requires_labels`;

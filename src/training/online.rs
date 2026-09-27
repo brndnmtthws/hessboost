@@ -90,6 +90,8 @@
 //! per-iteration hook as [`Trainer::on_round`] does. Breaking stops
 //! training after the iteration (as it stops [`Trainer`]) and abandons an
 //! update, leaving the model, data and state unchanged.
+//! [`OnlineModel::update_with_commit`] also asks for a last confirmation
+//! once the update is computed, before it is applied.
 //!
 //! # Example
 //!
@@ -116,6 +118,7 @@
 //! # }
 //! ```
 
+use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use super::train::{RoundEval, Trainer, validate_training_data};
@@ -279,6 +282,10 @@ impl OnlineModel {
             || categorical
             || model.linear().is_some()
             || model.trees().iter().any(|t| t.linear_leaves().is_some())
+            || model
+                .trees()
+                .iter()
+                .any(|t| splits_below(t, params.max_depth))
             || (0..model.num_trees()).any(|t| model.tree_weight(t) != 1.0)
             // Model shrinkage rescales every earlier tree each round, so
             // an update of one node's subtree would not reproduce a retrain.
@@ -336,7 +343,25 @@ impl OnlineModel {
         &mut self,
         additions: Option<&DMatrix>,
         deletions: &[usize],
+        on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+    ) -> Result<UpdateReport> {
+        self.update_with_commit(additions, deletions, on_round, || ControlFlow::Continue(()))
+    }
+
+    /// [`Self::update_with`] asking `commit` once the update is computed,
+    /// just before it is applied: [`ControlFlow::Break`] abandons it as a
+    /// break from `on_round` does (for a caller whose interruption can
+    /// arrive after the last iteration's hook, such as a signal).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Self::update_with`].
+    pub fn update_with_commit(
+        &mut self,
+        additions: Option<&DMatrix>,
+        deletions: &[usize],
         mut on_round: impl FnMut(&RoundEval) -> ControlFlow<()> + Send,
+        commit: impl FnOnce() -> ControlFlow<()>,
     ) -> Result<UpdateReport> {
         let deleted = self.check_change(additions, deletions)?;
         let updated = compose(&self.data, &deleted, additions)?;
@@ -358,7 +383,7 @@ impl OnlineModel {
                 })
                 .train()?
                 .model;
-            if stopped || model.num_boost_rounds() != rounds {
+            if stopped || model.num_boost_rounds() != rounds || commit().is_break() {
                 return Err(interrupted());
             }
             let report = UpdateReport {
@@ -378,7 +403,13 @@ impl OnlineModel {
             deleted: &deleted,
             model: &self.model,
         };
-        match run.run(&mut cache, &mut on_round) {
+        let outcome = run
+            .run(&mut cache, &mut on_round)
+            .and_then(|done| match commit() {
+                ControlFlow::Continue(()) => Ok(done),
+                ControlFlow::Break(()) => Err(interrupted()),
+            });
+        match outcome {
             Ok((trees, report)) => {
                 self.model = self.model.with_trees(trees);
                 self.data = updated;
@@ -504,12 +535,12 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         return refuse("tree_method", "tree_method = hist");
     }
     if params.grow_policy != GrowPolicy::DepthWise
-        || params.max_leaves != 0
-        || params.max_depth == 0
+        || params.max_leaves.is_some()
+        || params.max_depth.is_none()
     {
         return refuse(
             "grow_policy",
-            "depth-wise growth with max_depth > 0 and no max_leaves (a node's subtree must \
+            "depth-wise growth with a max_depth and no max_leaves (a node's subtree must \
              depend on its rows only)",
         );
     }
@@ -1026,8 +1057,13 @@ impl TreeUpdate<'_> {
                 .filter(|&i| tree.leaf_id_with(|f| new.get(i, f as usize)) == new_id)
                 .map(|i| i as u32)
                 .collect();
+            // A split node lies above `max_depth` (`check_supported` requires
+            // one, `from_model` refuses deeper trees), so its subtree keeps at
+            // least one level.
             let sub_params = TrainingParams {
-                max_depth: params.max_depth - depth,
+                max_depth: params
+                    .max_depth
+                    .and_then(|limit| NonZeroUsize::new(limit.get().saturating_sub(depth))),
                 ..params.clone()
             };
             let mut sampler = ColumnSampler::new(new.n_cols(), None, 1.0, 1.0, 1.0, params.seed);
@@ -1048,6 +1084,27 @@ impl TreeUpdate<'_> {
         }
         (tree, nodes, regrown_rows)
     }
+}
+
+/// Whether `tree` splits a node at depth `max_depth` or deeper (`None`: no
+/// limit), which depth-wise training to that depth never does.
+fn splits_below(tree: &RegTree, max_depth: Option<NonZeroUsize>) -> bool {
+    let Some(limit) = max_depth else {
+        return false;
+    };
+    let mut stack = vec![(0usize, 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        let node = tree.node(id);
+        if node.is_leaf() {
+            continue;
+        }
+        if depth >= limit.get() {
+            return true;
+        }
+        stack.push((node.left as usize, depth + 1));
+        stack.push((node.right as usize, depth + 1));
+    }
+    false
 }
 
 /// Reset the caches of `root`'s subtree in `tree`.

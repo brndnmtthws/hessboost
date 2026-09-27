@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     let preds = model.predict(&dtrain)?;
     let rmse = EvalMetric::Rmse
         .build(1)?
-        .eval(&preds, dtrain.labels().unwrap(), None);
+        .eval(preds.as_slice(), dtrain.labels().unwrap(), None);
     println!("trained {} trees", model.num_trees());
     println!("training RMSE: {rmse:.5}");
 

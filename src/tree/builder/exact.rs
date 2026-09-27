@@ -910,7 +910,7 @@ mod tests {
         let pred = model.predict(&data).unwrap();
         let back = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
         assert_eq!(back.predict(&data).unwrap(), pred);
-        pred
+        pred.into_vec()
     }
 
     #[test]

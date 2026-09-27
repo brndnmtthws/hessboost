@@ -83,7 +83,7 @@
 //! # }
 //! ```
 
-use super::{BoostedModel, ModelObjective, transform_model_margins};
+use super::{BoostedModel, ModelObjective, Predictions, transform_model_margins};
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::objective::Objective;
@@ -96,10 +96,9 @@ use crate::objective::distributional::{Dist, DistFamily};
 pub struct VirtualEnsembles {
     iterations: Vec<usize>,
     n_rows: usize,
-    n_outputs: usize,
     width: usize,
-    margins: Vec<f32>,
-    predictions: Vec<f32>,
+    margins: Vec<Predictions>,
+    predictions: Vec<Predictions>,
 }
 
 impl VirtualEnsembles {
@@ -125,34 +124,16 @@ impl VirtualEnsembles {
         self.width
     }
 
-    /// Member `m`'s predictions in [`BoostedModel::predict`]'s layout
-    /// (`n_rows * width`), or `None` past the last member.
-    pub fn member_predictions(&self, m: usize) -> Option<&[f32]> {
-        if m >= self.n_members() {
-            return None;
-        }
-        let len = self.n_rows * self.width;
-        self.predictions.get(m * len..(m + 1) * len)
+    /// Member `m`'s predictions, as [`BoostedModel::predict`] returns them
+    /// for its model, or `None` past the last member.
+    pub fn member_predictions(&self, m: usize) -> Option<&Predictions> {
+        self.predictions.get(m)
     }
 
-    /// Member `m`'s raw margins in [`BoostedModel::predict_margin`]'s layout
-    /// (`n_rows * n_outputs`), or `None` past the last member.
-    pub fn member_margins(&self, m: usize) -> Option<&[f32]> {
-        if m >= self.n_members() {
-            return None;
-        }
-        let len = self.n_rows * self.n_outputs;
-        self.margins.get(m * len..(m + 1) * len)
-    }
-
-    /// Every member's predictions, member-major: `[member][row][value]`.
-    pub fn predictions(&self) -> &[f32] {
-        &self.predictions
-    }
-
-    /// Every member's raw margins, member-major: `[member][row][output]`.
-    pub fn margins(&self) -> &[f32] {
-        &self.margins
+    /// Member `m`'s raw margins, as [`BoostedModel::predict_margin`]
+    /// returns them for its model, or `None` past the last member.
+    pub fn member_margins(&self, m: usize) -> Option<&Predictions> {
+        self.margins.get(m)
     }
 }
 
@@ -300,18 +281,17 @@ impl BoostedModel {
         count: usize,
     ) -> Result<VirtualEnsembles> {
         let iterations = self.virtual_ensemble_iterations(count)?;
-        let mut margins = Vec::new();
-        let mut predictions = Vec::new();
+        let mut margins = Vec::with_capacity(iterations.len());
+        let mut predictions = Vec::with_capacity(iterations.len());
         for &k in &iterations {
             let margin = self.predict_margin_range(data, ..k)?;
-            margins.extend_from_slice(&margin);
-            predictions.extend(transform_model_margins(
+            predictions.push(transform_model_margins(
                 &self.objective,
                 self.max_delta_step,
                 self.n_targets,
-                self.n_outputs,
-                margin,
+                margin.clone(),
             ));
+            margins.push(margin);
         }
         Ok(VirtualEnsembles {
             // `predict`'s layout: one class index per row for `multi:softmax`.
@@ -326,7 +306,6 @@ impl BoostedModel {
             },
             iterations,
             n_rows: data.n_rows(),
-            n_outputs: self.n_outputs,
             margins,
             predictions,
         })
@@ -349,7 +328,7 @@ impl BoostedModel {
         let k = self.n_outputs;
         let members = || 0..ensembles.n_members();
         let margin = |m: usize, row: usize, out: usize| {
-            f64::from(ensembles.margins[(m * n + row) * k + out])
+            f64::from(ensembles.margins[m].as_slice()[row * k + out])
         };
         Ok(match decomposition {
             Decomposition::Regression => {
@@ -358,7 +337,7 @@ impl BoostedModel {
                 let mut knowledge = Vec::with_capacity(n * width);
                 for cell in 0..n * width {
                     let values =
-                        members().map(|m| f64::from(ensembles.predictions[m * n * width + cell]));
+                        members().map(|m| f64::from(ensembles.predictions[m].as_slice()[cell]));
                     let (mu, variance) = mean_variance(values);
                     mean.push(mu);
                     knowledge.push(variance);

@@ -39,12 +39,13 @@ fn unknown_and_corrupt_native_payloads_are_refused() {
     assert_eq!(&container[..4], b"HBM\0");
     assert_eq!(
         bits(
-            &BoostedModel::from_bytes(&container)
+            BoostedModel::from_bytes(&container)
                 .unwrap()
                 .predict(&matrix(1))
                 .unwrap()
+                .as_slice()
         ),
-        bits(&model.predict(&matrix(1)).unwrap())
+        bits(model.predict(&matrix(1)).unwrap().as_slice())
     );
     let with_version = |version: u8| {
         let mut bytes = container.clone();
@@ -273,8 +274,8 @@ fn json_documents_may_omit_defaults() {
             "{name}"
         );
         assert_eq!(
-            bits(&restored.predict(&data).unwrap()),
-            bits(&model.predict(&data).unwrap()),
+            bits(restored.predict(&data).unwrap().as_slice()),
+            bits(model.predict(&data).unwrap().as_slice()),
             "{name}"
         );
         // Saving writes every field again.
@@ -648,9 +649,13 @@ fn native_formats_round_trip_every_model_feature() {
         assert_eq!(from_binary.to_bytes().unwrap(), bytes, "{name}: binary");
         let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
         assert_eq!(from_json.to_bytes().unwrap(), bytes, "{name}: JSON");
-        let expected = bits(&model.predict(&data).unwrap());
+        let expected = bits(model.predict(&data).unwrap().as_slice());
         for restored in [&from_binary, &from_json] {
-            assert_eq!(bits(&restored.predict(&data).unwrap()), expected, "{name}");
+            assert_eq!(
+                bits(restored.predict(&data).unwrap().as_slice()),
+                expected,
+                "{name}"
+            );
             assert_eq!(restored.n_outputs(), model.n_outputs(), "{name}");
             assert_eq!(restored.best_iteration(), model.best_iteration(), "{name}");
             assert_eq!(restored.n_targets(), model.n_targets(), "{name}");
@@ -710,12 +715,12 @@ fn saved_models_keep_loading_with_their_margins() {
             let binary = BoostedModel::load_binary(file("bin")).unwrap();
             let json = BoostedModel::load_json(file("json")).unwrap();
             for (format, model) in [("bin", binary), ("json", json)] {
-                let margins = margin_bytes(&model.predict_margin(data).unwrap());
+                let margins = margin_bytes(model.predict_margin(data).unwrap().as_slice());
                 assert!(margins == expected, "{}: {name} ({format})", dir.display());
             }
             if file("hbtd").exists() {
                 let compact = CompactModel::load(file("hbtd")).unwrap();
-                let margins = margin_bytes(&compact.predict_margin(data).unwrap());
+                let margins = margin_bytes(compact.predict_margin(data).unwrap().as_slice());
                 assert!(margins == expected, "{}: {name} (compact)", dir.display());
             }
         }
@@ -742,6 +747,6 @@ fn save_models_of_this_version() {
             compact.save(file("hbtd")).unwrap();
         }
         let margins = model.predict_margin(&data).unwrap();
-        std::fs::write(file("margins"), margin_bytes(&margins)).unwrap();
+        std::fs::write(file("margins"), margin_bytes(margins.as_slice())).unwrap();
     }
 }

@@ -51,8 +51,8 @@ fn shrink(rate: f64, mode: ModelShrinkMode) -> ModelShrink {
         .unwrap()
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
-    values.iter().map(|v| v.to_bits()).collect()
+fn bits(values: impl AsRef<[f32]>) -> Vec<u32> {
+    values.as_ref().iter().map(|v| v.to_bits()).collect()
 }
 
 /// The model after `k` iterations of a `rounds`-round shrunk model, however
@@ -130,9 +130,9 @@ fn truncations_are_the_shorter_runs_bit_for_bit() {
         assert_eq!(members.iterations(), &[15, 18, 21, 24], "{name}");
         for k in [1, 7, 15, 18, 23, rounds] {
             let short = train(params, data, k).unwrap();
-            let expected = bits(&short.predict_margin(data).unwrap());
+            let expected = bits(short.predict_margin(data).unwrap());
             assert_eq!(
-                bits(&long.predict_margin_range(data, ..k).unwrap()),
+                bits(long.predict_margin_range(data, ..k).unwrap()),
                 expected,
                 "{name}: iterations ..{k}"
             );
@@ -177,8 +177,8 @@ fn early_stopping_keeps_the_best_iteration_model() {
     assert_eq!(model.num_boost_rounds(), best + 1);
     let short = train(&params, &data, best + 1).unwrap();
     assert_eq!(
-        bits(&model.predict_margin(&valid).unwrap()),
-        bits(&short.predict_margin(&valid).unwrap())
+        bits(model.predict_margin(&valid).unwrap()),
+        bits(short.predict_margin(&valid).unwrap())
     );
 }
 
@@ -224,32 +224,28 @@ fn shrunk_models_round_trip() {
         .build()
         .unwrap();
     let model = train(&params, &data, 12).unwrap();
-    let margins = bits(&model.predict_margin(&data).unwrap());
-    let prefix = bits(&model.predict_margin_range(&data, ..5).unwrap());
+    let margins = bits(model.predict_margin(&data).unwrap());
+    let prefix = bits(model.predict_margin_range(&data, ..5).unwrap());
     for restored in [
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
         BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
     ] {
-        assert_eq!(bits(&restored.predict_margin(&data).unwrap()), margins);
+        assert_eq!(bits(restored.predict_margin(&data).unwrap()), margins);
         assert_eq!(
-            bits(&restored.predict_margin_range(&data, ..5).unwrap()),
+            bits(restored.predict_margin_range(&data, ..5).unwrap()),
             prefix
         );
     }
     let xgboost = BoostedModel::from_xgboost_json(&model.to_xgboost_json().unwrap()).unwrap();
-    assert_eq!(bits(&xgboost.predict_margin(&data).unwrap()), margins);
+    assert_eq!(bits(xgboost.predict_margin(&data).unwrap()), margins);
     let compact = model.to_compact().unwrap();
-    assert_eq!(bits(&compact.predict_margin(&data).unwrap()), margins);
+    assert_eq!(bits(compact.predict_margin(&data).unwrap()), margins);
     // SHAP attributes the weighted trees: each row's contributions sum to
     // its margin.
     let contribs = model.predict_contribs(&data).unwrap();
-    for (row, &m) in contribs
-        .as_chunks::<5>()
-        .0
-        .iter()
-        .zip(&model.predict_margin(&data).unwrap())
-    {
-        let sum: f32 = row.iter().sum();
+    let margin = model.predict_margin(&data).unwrap();
+    for (row, &m) in margin.as_slice().iter().enumerate() {
+        let sum: f32 = contribs.get(row, 0).unwrap().iter().sum();
         assert!((sum - m).abs() < 1e-4, "{sum} vs {m}");
     }
 
@@ -424,8 +420,8 @@ fn langevin_continuation_matches_the_uninterrupted_run() {
         .model;
     let whole = train(&params, &data, 9).unwrap();
     assert_eq!(
-        bits(&continued.predict_margin(&data).unwrap()),
-        bits(&whole.predict_margin(&data).unwrap())
+        bits(continued.predict_margin(&data).unwrap()),
+        bits(whole.predict_margin(&data).unwrap())
     );
 }
 

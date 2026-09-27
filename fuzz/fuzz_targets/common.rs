@@ -2,8 +2,8 @@
 //! so this file is pulled in per target with `#[path]`.
 #![allow(dead_code, reason = "each target uses a different subset")]
 
-use hessboost::model::ImportanceType;
 use hessboost::model::compact::CompactModel;
+use hessboost::model::{ImportanceType, Predictions};
 use hessboost::objective::distributional::DistFamily;
 use hessboost::prelude::*;
 
@@ -99,11 +99,14 @@ pub fn exercise(model: &BoostedModel) {
             let compact_margin = compact
                 .predict_margin(&data)
                 .expect("compact model predicts");
-            assert!(same_bits(margin, &compact_margin), "compact margins differ");
+            assert!(
+                same_bits(margin.as_slice(), compact_margin.as_slice()),
+                "compact margins differ"
+            );
             let preds = model.predict(&data).expect("model predicts");
             let compact_preds = compact.predict(&data).expect("compact model predicts");
             assert!(
-                same_bits(&preds, &compact_preds),
+                same_bits(preds.as_slice(), compact_preds.as_slice()),
                 "compact predictions differ"
             );
         }
@@ -111,7 +114,7 @@ pub fn exercise(model: &BoostedModel) {
 }
 
 /// Runs each prediction API on the probe matrix and returns the margins.
-fn predict_all(model: &BoostedModel) -> Vec<f32> {
+fn predict_all(model: &BoostedModel) -> Predictions {
     let n_features = model.n_features();
     let k = model.n_outputs();
     let data = probe_matrix(n_features);
@@ -120,21 +123,21 @@ fn predict_all(model: &BoostedModel) -> Vec<f32> {
     let margin = model
         .predict_margin(&data)
         .expect("probe matrix matches the model");
-    assert_eq!(margin.len(), n * k);
+    assert_eq!((margin.n_rows(), margin.width()), (n, k));
     let whole = model
         .predict_margin_range(&data, ..)
         .expect("the whole model is a valid range");
-    assert_eq!(whole.len(), n * k);
+    assert_eq!((whole.n_rows(), whole.width()), (n, k));
 
     let preds = model
         .predict(&data)
         .expect("probe matrix matches the model");
-    let expected = if model.objective().name() == "multi:softmax" {
-        n
+    let width = if model.objective().name() == "multi:softmax" {
+        1
     } else {
-        n * k
+        k
     };
-    assert_eq!(preds.len(), expected);
+    assert_eq!((preds.n_rows(), preds.width()), (n, width));
     model
         .predict_class(&data)
         .expect("probe matrix matches the model");
@@ -142,21 +145,33 @@ fn predict_all(model: &BoostedModel) -> Vec<f32> {
     let leaves = model
         .predict_leaf(&data)
         .expect("probe matrix matches the model");
-    assert_eq!(leaves.len(), n * model.num_trees());
-    for (i, &leaf) in leaves.iter().enumerate() {
-        let tree = &model.trees()[i % model.num_trees()];
-        assert!(tree.nodes()[leaf as usize].is_leaf());
+    assert_eq!((leaves.n_rows(), leaves.width()), (n, model.num_trees()));
+    for row in leaves.rows() {
+        for (tree, &leaf) in model.trees().iter().zip(row) {
+            assert!(tree.nodes()[leaf as usize].is_leaf());
+        }
     }
 
     if let Ok(contribs) = model.predict_contribs(&data) {
-        assert_eq!(contribs.len(), n * k * (n_features + 1));
+        assert_eq!(
+            (
+                contribs.n_rows(),
+                contribs.n_outputs(),
+                contribs.n_features()
+            ),
+            (n, k, n_features)
+        );
     }
     if n_features <= MAX_INTERACTION_FEATURES
         && let Ok(interactions) = model.predict_interactions(&data)
     {
         assert_eq!(
-            interactions.len(),
-            n * k * (n_features + 1) * (n_features + 1)
+            (
+                interactions.n_rows(),
+                interactions.n_outputs(),
+                interactions.n_features()
+            ),
+            (n, k, n_features)
         );
     }
     if DistFamily::from_objective(model.objective().name()).is_some() {
@@ -171,7 +186,7 @@ fn predict_all(model: &BoostedModel) -> Vec<f32> {
     {
         let sliced_margin = sliced.predict_margin(&data).expect("a slice predicts");
         assert!(
-            same_bits(&whole, &sliced_margin),
+            same_bits(whole.as_slice(), sliced_margin.as_slice()),
             "slice(.., 1) changed the margins"
         );
         let first = model.slice(..1, 1).expect("the first iteration slices");
@@ -214,7 +229,7 @@ fn check_xgboost_round_trip(
             .predict_margin(&data)
             .expect("imported model predicts");
         assert!(
-            same_bits(&before, &after),
+            same_bits(before.as_slice(), after.as_slice()),
             "XGBoost {format} round trip changed the trees: {before:?} -> {after:?}"
         );
     }

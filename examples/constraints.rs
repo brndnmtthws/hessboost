@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     // Predictions are non-decreasing in x when sorted by x.
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&a, &b| x[a].partial_cmp(&x[b]).unwrap());
-    let preds = model.predict(&d)?;
+    let preds = model.predict(&d)?.into_vec(); // one value per row
     let monotone = idx.windows(2).all(|w| preds[w[1]] >= preds[w[0]] - 1e-5);
     println!("monotone constraint respected: {monotone}");
 
@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         30,
     )?;
     let pc = mc.predict(&dc)?;
-    let rmse = EvalMetric::Rmse.build(1)?.eval(&pc, &yc, None);
+    let rmse = EvalMetric::Rmse.build(1)?.eval(pc.as_slice(), &yc, None);
     println!("categorical fit RMSE on non-ordinal pattern: {rmse:.4}");
     Ok(())
 }

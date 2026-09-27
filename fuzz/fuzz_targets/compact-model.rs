@@ -33,7 +33,7 @@ fuzz_target!(|data: &[u8]| {
     let margin = model
         .predict_margin(&probe)
         .expect("probe matrix matches the model");
-    assert_eq!(margin.len(), probe.n_rows() * k);
+    assert_eq!((margin.n_rows(), margin.width()), (probe.n_rows(), k));
     let preds = model
         .predict(&probe)
         .expect("probe matrix matches the model");
@@ -42,5 +42,5 @@ fuzz_target!(|data: &[u8]| {
     } else {
         k
     };
-    assert_eq!(preds.len(), probe.n_rows() * expected);
+    assert_eq!((preds.n_rows(), preds.width()), (probe.n_rows(), expected));
 });

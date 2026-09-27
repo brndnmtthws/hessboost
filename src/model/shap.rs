@@ -975,7 +975,7 @@ impl BoostedModel {
     /// [`HessboostError::DimensionMismatch`] when `data` does not fit the
     /// model, [`HessboostError::ModelFormat`] when a tree has a negative cover,
     /// [`HessboostError::InvalidParameter`] for linear-leaf models.
-    pub fn predict_contribs(&self, data: &DMatrix) -> Result<Vec<f32>> {
+    pub fn predict_contribs(&self, data: &DMatrix) -> Result<super::Contributions> {
         self.predict_contribs_range(data, self.default_iteration_range())
     }
 
@@ -992,7 +992,7 @@ impl BoostedModel {
         &self,
         data: &DMatrix,
         iterations: impl RangeBounds<usize>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<super::Contributions> {
         let pro = self.attribution_prologue(data, iterations, "contribution prediction")?;
         let (n, k, nf, width, trees) = (pro.n, pro.k, pro.nf, pro.width, pro.trees);
         let initial = pro.initial;
@@ -1046,7 +1046,7 @@ impl BoostedModel {
                     }
                 },
             );
-        Ok(out)
+        Ok(super::Contributions::new(out, n, k, nf))
     }
 
     /// SHAP interaction values, matching XGBoost `pred_interactions=True`
@@ -1078,7 +1078,7 @@ impl BoostedModel {
     /// # Errors
     ///
     /// As for [`BoostedModel::predict_contribs`].
-    pub fn predict_interactions(&self, data: &DMatrix) -> Result<Vec<f32>> {
+    pub fn predict_interactions(&self, data: &DMatrix) -> Result<super::Interactions> {
         self.predict_interactions_range(data, self.default_iteration_range())
     }
 
@@ -1093,7 +1093,7 @@ impl BoostedModel {
         &self,
         data: &DMatrix,
         iterations: impl RangeBounds<usize>,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<super::Interactions> {
         struct Scratch<'a> {
             rows: RowBlock<'a>,
             contribs: Vec<f32>,
@@ -1166,7 +1166,7 @@ impl BoostedModel {
                 }
             },
         );
-        Ok(out)
+        Ok(super::Interactions::new(out, n, k, nf))
     }
 }
 
@@ -1274,9 +1274,11 @@ mod tests {
     fn assert_additive(model: &BoostedModel, d: &DMatrix) {
         let width = d.n_cols() + 1;
         let contribs = model.predict_contribs(d).unwrap();
-        assert_eq!(contribs.len(), d.n_rows() * model.n_outputs() * width);
+        assert_eq!(contribs.n_rows(), d.n_rows());
+        assert_eq!(contribs.n_outputs(), model.n_outputs());
+        assert_eq!(contribs.n_features(), d.n_cols());
         let margin = model.predict_margin(d).unwrap();
-        let err = max_additivity_error(&contribs, &margin, width);
+        let err = max_additivity_error(contribs.as_slice(), margin.as_slice(), width);
         assert!(err < 1e-4, "max additivity error {err} exceeded 1e-4");
     }
 
@@ -1285,23 +1287,30 @@ mod tests {
     /// each matrix to the margin, and every matrix is symmetric.
     fn assert_interactions_consistent(model: &BoostedModel, d: &DMatrix) {
         let width = d.n_cols() + 1;
-        let mwidth = width * width;
+        let k = model.n_outputs();
         let inter = model.predict_interactions(d).unwrap();
-        assert_eq!(inter.len(), d.n_rows() * model.n_outputs() * mwidth);
+        assert_eq!(
+            (inter.n_rows(), inter.n_outputs(), inter.n_features()),
+            (d.n_rows(), k, d.n_cols())
+        );
         let contribs = model.predict_contribs(d).unwrap();
         let margin = model.predict_margin(d).unwrap();
 
         let (mut row_err, mut eff_err, mut sym_err) = (0f64, 0f64, 0f64);
-        let matrices = inter.chunks_exact(mwidth).zip(contribs.chunks_exact(width));
-        for ((m, c), &target) in matrices.zip(&margin) {
-            for (row, &cval) in m.chunks_exact(width).zip(c) {
-                row_err = row_err.max((sum64(row) - f64::from(cval)).abs());
-            }
-            eff_err = eff_err.max((sum64(m) - f64::from(target)).abs());
-            for i in 0..width {
-                for j in 0..width {
-                    let e = (f64::from(m[i * width + j]) - f64::from(m[j * width + i])).abs();
-                    sym_err = sym_err.max(e);
+        for r in 0..d.n_rows() {
+            for o in 0..k {
+                let m = inter.get(r, o).unwrap();
+                let c = contribs.get(r, o).unwrap();
+                let target = *margin.get(r, o).unwrap();
+                for (row, &cval) in m.chunks_exact(width).zip(c) {
+                    row_err = row_err.max((sum64(row) - f64::from(cval)).abs());
+                }
+                eff_err = eff_err.max((sum64(m) - f64::from(target)).abs());
+                for i in 0..width {
+                    for j in 0..width {
+                        let (a, b) = (m[i * width + j], m[j * width + i]);
+                        sym_err = sym_err.max((f64::from(a) - f64::from(b)).abs());
+                    }
                 }
             }
         }
@@ -1459,7 +1468,8 @@ mod tests {
         let nf = d.n_cols();
         let contribs = model.predict_contribs(d).unwrap();
         let mut max_err = 0f64;
-        for (c, row) in contribs.chunks_exact(nf + 1).zip(x.chunks_exact(nf)) {
+        for (row_index, row) in x.chunks_exact(nf).enumerate() {
+            let c = contribs.get(row_index, 0).unwrap();
             for (&got, want) in c.iter().zip(textbook::contributions(model, row)) {
                 max_err = max_err.max((f64::from(got) - want).abs());
             }
@@ -1547,10 +1557,9 @@ mod tests {
         assert!(!used, "feature 3 unexpectedly used in a split");
 
         let contribs = model.predict_contribs(&d).unwrap();
-        let width = nf + 1;
         let mut max_abs = 0f32;
         for row in 0..n {
-            max_abs = max_abs.max(contribs[row * width + 3].abs());
+            max_abs = max_abs.max(contribs.get(row, 0).unwrap()[3].abs());
         }
         assert!(
             max_abs < 1e-6,
@@ -1683,11 +1692,13 @@ mod tests {
         );
         let model = crate::model::BoostedModel::from_json(&json).unwrap();
         let d = DMatrix::from_dense(&[0.2], 1, 1).unwrap();
-        for result in [model.predict_contribs(&d), model.predict_interactions(&d)] {
-            assert!(matches!(
-                result,
-                Err(crate::error::HessboostError::ModelFormat(_))
-            ));
-        }
+        assert!(matches!(
+            model.predict_contribs(&d),
+            Err(crate::error::HessboostError::ModelFormat(_))
+        ));
+        assert!(matches!(
+            model.predict_interactions(&d),
+            Err(crate::error::HessboostError::ModelFormat(_))
+        ));
     }
 }

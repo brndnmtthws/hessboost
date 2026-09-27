@@ -1066,7 +1066,7 @@ impl CompactModel {
     /// bit-identical to [`BoostedModel::predict_margin`] of the source model.
     /// A dataset's per-instance `base_margin` overrides the intercepts, as
     /// for [`BoostedModel`].
-    pub fn predict_margin(&self, data: &DMatrix) -> Result<Vec<f32>> {
+    pub fn predict_margin(&self, data: &DMatrix) -> Result<super::Predictions> {
         let k = self.n_outputs();
         validate_prediction_data(self.n_features, k, data)?;
         let mut out = initial_margins(&self.base_score, data);
@@ -1086,19 +1086,18 @@ impl CompactModel {
                     }
                 },
             );
-        Ok(out)
+        Ok(super::Predictions::new(out, data.n_rows(), k))
     }
 
     /// Predictions in the objective's reported space, identical to
     /// [`BoostedModel::predict`] of the source model (probabilities for
     /// logistic objectives, class indices for `multi:softmax`, ...).
-    pub fn predict(&self, data: &DMatrix) -> Result<Vec<f32>> {
+    pub fn predict(&self, data: &DMatrix) -> Result<super::Predictions> {
         let margin = self.predict_margin(data)?;
         Ok(transform_model_margins(
             &self.meta.objective,
             self.meta.max_delta_step,
             self.meta.n_targets,
-            self.n_outputs(),
             margin,
         ))
     }
@@ -1782,12 +1781,12 @@ mod tests {
         let compact = CompactModel::from_bytes(&model.to_compact_bytes().unwrap()).unwrap();
         let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
         assert_eq!(
-            bits(compact.predict_margin(data).unwrap()),
-            bits(model.predict_margin(data).unwrap())
+            bits(compact.predict_margin(data).unwrap().into_vec()),
+            bits(model.predict_margin(data).unwrap().into_vec())
         );
         assert_eq!(
-            bits(compact.predict(data).unwrap()),
-            bits(model.predict(data).unwrap())
+            bits(compact.predict(data).unwrap().into_vec()),
+            bits(model.predict(data).unwrap().into_vec())
         );
         compact
     }
@@ -2136,7 +2135,7 @@ mod tests {
         assert!(bytes.len() < 4096);
         let model = CompactModel::from_bytes(&bytes).unwrap();
         let data = DMatrix::from_dense(&[0.0], 1, 1).unwrap();
-        assert_eq!(model.predict_margin(&data).unwrap(), [4096.5]);
+        assert_eq!(model.predict_margin(&data).unwrap().as_slice(), [4096.5]);
         // The shared zero-width leaf reference is still range-checked.
         assert!(matches!(
             CompactModel::from_bytes(&zero_width_heaps(4096, 0)),

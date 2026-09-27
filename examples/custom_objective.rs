@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         .build()?;
     let model = Trainer::new(&params, &d, 60).train()?.model;
     let preds = model.predict(&d)?;
-    let rmse = EvalMetric::Rmse.build(1)?.eval(&preds, &y, None);
+    let rmse = EvalMetric::Rmse.build(1)?.eval(preds.as_slice(), &y, None);
     println!("custom-objective RMSE: {rmse:.4}");
 
     // --- Custom metric: mean absolute error, used for early stopping. ---
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     println!(
         "custom-metric run: {} trees, last MAE = {:.4}",
         out.model.num_trees(),
-        out.history.last().unwrap().scores.last().unwrap().2
+        out.history.last().unwrap().scores.last().unwrap().value
     );
     Ok(())
 }

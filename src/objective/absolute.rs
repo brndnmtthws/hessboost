@@ -277,8 +277,8 @@ mod tests {
             let single = base.clone().with_labels(y).unwrap();
             let alone = crate::training::train(&params, &single, 5).unwrap();
             let pred = alone.predict(&base).unwrap();
-            let column: Vec<f32> = joint_pred.iter().skip(j).step_by(2).copied().collect();
-            assert_eq!(column, pred, "target {j}");
+            let column: Vec<f32> = joint_pred.rows().map(|row| row[j]).collect();
+            assert_eq!(column, pred.as_slice(), "target {j}");
         }
     }
 

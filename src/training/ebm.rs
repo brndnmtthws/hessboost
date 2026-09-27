@@ -9,7 +9,8 @@ use std::ops::ControlFlow;
 use rayon::prelude::*;
 
 use super::boulevard::{Recursion, RoundRequest, Schedule, tree_rows};
-use super::train::{Prepared, TrainContext, TreeSample, sample_rows};
+use super::prepare::{Prepared, TrainContext, TreeSample};
+use super::row_sampling::sample_rows;
 use crate::config::{Device, TrainingParams};
 use crate::data::DMatrix;
 use crate::data::quantile::HistCuts;

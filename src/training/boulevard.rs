@@ -14,9 +14,9 @@
 use rayon::prelude::*;
 use std::ops::ControlFlow;
 
-use super::train::{
-    MarginCaches, Prepared, TrainContext, TreeSample, make_column_sampler, sample_rows,
-};
+use super::margins::MarginCaches;
+use super::prepare::{Prepared, TrainContext, TreeSample};
+use super::row_sampling::{make_column_sampler, sample_rows};
 use crate::config::{BoosterKind, Boulevard, TrainingParams};
 use crate::data::DMatrix;
 use crate::error::Result;

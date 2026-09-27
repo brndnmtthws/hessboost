@@ -92,3 +92,22 @@ def test_refusals() -> None:
     assert plain.ebm is None
     with pytest.raises(hessboost.HessboostError):
         hessboost.train({**CLASSIC, "colsample_bytree": 0.5}, hessboost.DMatrix(x, label=y), 2)
+    # Class-balanced bagging samples rows by label, which the Boulevard EBM's
+    # kernel cannot represent, whatever the objective.
+    labels = (y > np.median(y)).astype(float)
+    for objective in ("reg:squarederror", "binary:logistic"):
+        balanced = {**BOULEVARD, "subsample": 1.0, "objective": objective}
+        with pytest.raises(hessboost.HessboostError, match="linear smoother"):
+            hessboost.train(
+                {**balanced, "neg_bagging_fraction": 0.5}, hessboost.DMatrix(x, label=labels), 2
+            )
+
+
+def test_classic_ebms_bag_rows_by_class() -> None:
+    x, y = data(600, 5)
+    dtrain = hessboost.DMatrix(x, label=(y > np.median(y)).astype(float))
+    params = {**CLASSIC, "objective": "binary:logistic"}
+    plain = hessboost.train(params, dtrain, 40).predict(dtrain)
+    bagged = hessboost.train({**params, "neg_bagging_fraction": 0.1}, dtrain, 40).predict(dtrain)
+    # Keeping a tenth of the negatives pulls every tree toward the positives.
+    assert bagged.mean() > plain.mean() + 0.05

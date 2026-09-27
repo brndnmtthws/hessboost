@@ -363,8 +363,9 @@ pub struct TrainingParams {
     /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
     /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
     /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
-    /// booster other than `boulevard`, uniform sampling, and one label
-    /// column of `0`/`1` labels.
+    /// booster (a classic `booster = ebm` tree draws from its outer bag),
+    /// uniform sampling, and one label column of `0`/`1` labels; Boulevard
+    /// inference (`booster = boulevard`, `ebm_boulevard`) refuses it.
     pub balanced_bagging: Option<BalancedBagging>,
     /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
     /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
@@ -1145,14 +1146,7 @@ impl TrainingParams {
             return Ok(());
         };
         let dropout = boulevard.dropout();
-        // Before the objective check: balanced bagging needs a `binary:*`
-        // objective, and the reason it cannot work is not the loss.
-        ensure(
-            "pos_bagging_fraction",
-            self.balanced_bagging.is_none(),
-            "class-balanced bagging keeps a row with a probability set by its label, so a leaf \
-             is no longer a linear smoother of the labels; Boulevard needs uniform `subsample`",
-        )?;
+        self.refuse_balanced_bagging()?;
         ensure(
             "objective",
             matches!(self.objective, Objective::SquaredError),
@@ -1187,6 +1181,19 @@ impl TrainingParams {
             )?;
         }
         self.validate_linear_smoother()
+    }
+
+    /// Class-balanced bagging under Boulevard inference (of `booster =
+    /// boulevard` and of `ebm_boulevard`), checked before the objective:
+    /// balanced bagging needs a `binary:*` objective, and the reason it
+    /// cannot work is not the loss.
+    fn refuse_balanced_bagging(&self) -> Result<()> {
+        ensure(
+            "pos_bagging_fraction",
+            self.balanced_bagging.is_none(),
+            "class-balanced bagging keeps a row with a probability set by its label, so a leaf \
+             is no longer a linear smoother of the labels; Boulevard needs uniform `subsample`",
+        )
     }
 
     /// The settings Boulevard inference (of `booster = boulevard` and of
@@ -1289,6 +1296,7 @@ impl TrainingParams {
         if !ebm.boulevard() {
             return Ok(());
         }
+        self.refuse_balanced_bagging()?;
         ensure(
             "objective",
             matches!(self.objective, Objective::SquaredError),

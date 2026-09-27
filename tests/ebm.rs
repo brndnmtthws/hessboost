@@ -2,13 +2,14 @@
 //! ([`hessboost::ebm`]), and the Boulevard EBM's bands.
 
 use hessboost::config::{
-    BoosterKind, Ebm, EbmBuilder, GrowPolicy, TrainingParams, TrainingParamsBuilder,
+    BalancedBagging, BoosterKind, Ebm, EbmBuilder, GrowPolicy, TrainingParams,
+    TrainingParamsBuilder,
 };
 use hessboost::data::FeatureType;
 use hessboost::ebm::TermAxis;
 use hessboost::ebm::shape_functions;
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
-use hessboost::objective::Objective;
+use hessboost::objective::{Logistic, Objective};
 use hessboost::prelude::*;
 use std::ops::ControlFlow;
 
@@ -243,6 +244,20 @@ fn unsupported_combinations_are_refused() {
     );
     assert_eq!(refused(boulevard().base_score(0.5)), "base_score");
     assert_eq!(refused(boulevard().alpha(1.0)), "alpha");
+    // Class-balanced bagging draws rows by their labels, which the Boulevard
+    // EBM's kernel cannot represent; refused under its own key whatever the
+    // objective (it needs a `binary:*` one, which `ebm_boulevard` refuses).
+    let balanced = BalancedBagging::new(1.0, 0.2).unwrap();
+    for objective in [
+        Objective::SquaredError,
+        Objective::BinaryLogistic(Logistic::default()),
+    ] {
+        let bagged = boulevard()
+            .subsample(1.0)
+            .objective(objective)
+            .balanced_bagging(balanced);
+        assert_eq!(refused(bagged), "pos_bagging_fraction");
+    }
 
     assert_eq!(
         invalid_param(boulevard_ebm().early_stopping_rounds(5).build()),
@@ -282,6 +297,46 @@ fn unsupported_combinations_are_refused() {
         invalid_param(train(&boulevard().build().unwrap(), &weighted, 2)),
         "weights"
     );
+}
+
+/// A classic EBM draws each tree's rows from its outer bag by class under
+/// class-balanced bagging: keeping a tenth of the negatives pulls every
+/// tree toward the positives, so the predicted probabilities rise, and the
+/// labels must be 0 or 1.
+#[test]
+fn classic_ebms_bag_rows_by_class() {
+    let n = 600;
+    let mut next = lcg(21);
+    let mut x = Vec::with_capacity(2 * n);
+    let mut labels = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (a, b) = (next(), next());
+        x.extend_from_slice(&[a, b]);
+        let label = (6.0 * a).sin() + b + 0.5 * (next() - 0.5) > 0.5;
+        labels.push(f32::from(u8::from(label)));
+    }
+    let dtrain = labeled_dense(&x, 2, &labels);
+    let base = || {
+        classic()
+            .subsample(1.0)
+            .objective(Objective::BinaryLogistic(Logistic::default()))
+    };
+    let bagged = base()
+        .balanced_bagging(BalancedBagging::new(1.0, 0.1).unwrap())
+        .build()
+        .unwrap();
+    let mean = |params: &TrainingParams| {
+        let model = train(params, &dtrain, 40).unwrap();
+        let preds = model.predict(&dtrain).unwrap();
+        preds.as_slice().iter().map(|&p| f64::from(p)).sum::<f64>() / n as f64
+    };
+    let (plain, balanced) = (mean(&base().build().unwrap()), mean(&bagged));
+    assert!(
+        balanced > plain + 0.05,
+        "mean probability {balanced} with balanced bagging vs {plain} without"
+    );
+    let soft = labeled_dense(&x, 2, &vec![0.5; n]);
+    assert_eq!(invalid_param(train(&bagged, &soft, 2)), "labels");
 }
 
 #[test]

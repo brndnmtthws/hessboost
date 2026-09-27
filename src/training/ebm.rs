@@ -172,10 +172,34 @@ fn subsample_of(pool: &[u32], subsample: f64, rng: &mut Rng) -> Vec<u32> {
     if subsample >= 1.0 {
         return pool.to_vec();
     }
+    bernoulli_rows(pool, rng, |_| subsample)
+}
+
+/// The rows of an outer bag's `pool` one classic tree trains on: each kept
+/// with probability `subsample`, or under class-balanced bagging with its
+/// class's fraction (a label-`1` row with `pos_fraction`, any other with
+/// `neg_fraction`), at least one.
+fn tree_sample(pool: &[u32], params: &TrainingParams, labels: &[f32], rng: &mut Rng) -> Vec<u32> {
+    let Some(bagging) = params.balanced_bagging else {
+        return subsample_of(pool, params.subsample, rng);
+    };
+    let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
+    bernoulli_rows(pool, rng, |row| {
+        if labels[row as usize] == 1.0 {
+            pos
+        } else {
+            neg
+        }
+    })
+}
+
+/// The rows of `pool`, each kept with probability `keep(row)`, in pool
+/// order (one draw per row); a random row of `pool` if none is kept.
+fn bernoulli_rows(pool: &[u32], rng: &mut Rng, keep: impl Fn(u32) -> f64) -> Vec<u32> {
     let mut rows: Vec<u32> = pool
         .iter()
         .copied()
-        .filter(|_| rng.f64() < subsample)
+        .filter(|&row| rng.f64() < keep(row))
         .collect();
     if rows.is_empty() {
         rows.push(pool[rng.range(0..pool.len())]);
@@ -379,12 +403,13 @@ impl Bag {
             ^ stage.wrapping_mul(GOLDEN)
             ^ splitmix64(self.index ^ round.wrapping_mul(GOLDEN));
         let mut rng = Rng::new(splitmix64(key));
+        let labels = run.dtrain.labels().unwrap_or_default();
         for &(term, features) in terms {
             if self.stopped() {
                 return;
             }
             let gpair = gradients(run, &self.margins);
-            let rows = subsample_of(&self.rows, params.subsample, &mut rng);
+            let rows = tree_sample(&self.rows, params, labels, &mut rng);
             let seed = rng.next_u64();
             prepared.fill_approx_cache(run, &gpair);
             let mut tree = grow(run, prepared, &gpair, &rows, features, seed);
@@ -574,6 +599,7 @@ fn boulevard_stage(
     let (stage, rounds) = stage;
     let TrainContext { params, dtrain, .. } = *run;
     let n = dtrain.n_rows();
+    let labels = dtrain.labels().unwrap_or_default();
     let schedule = Schedule {
         dropout: 0.0,
         learning_rate: params.eta,
@@ -594,7 +620,10 @@ fn boulevard_stage(
                 .map(|(&b, &o)| (b + o) as f32)
                 .collect();
             let gpair = gradients(run, &margins);
-            let rows: Vec<Vec<u32>> = terms.iter().map(|_| sample_rows(n, params, rng)).collect();
+            let rows: Vec<Vec<u32>> = terms
+                .iter()
+                .map(|_| sample_rows(n, params, labels, rng))
+                .collect();
             let seeds: Vec<u64> = terms.iter().map(|_| rng.next_u64()).collect();
             prepared.fill_approx_cache(run, &gpair);
             let build = |k: usize| grow(run, prepared, &gpair, &rows[k], terms[k].1, seeds[k]);

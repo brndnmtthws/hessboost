@@ -1,4 +1,4 @@
-//! Linear leaves: LightGBM's `linear_tree` (opt-in, beyond XGBoost).
+//! Linear leaves: LightGBM's `linear_tree` (opt-in).
 //!
 //! After a tree's structure is grown, every leaf fits a ridge-regularized
 //! linear model on the numerical features split on along its root-to-leaf path

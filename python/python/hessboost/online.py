@@ -1,5 +1,5 @@
 """In-place row addition and deletion for trained models (incremental and
-decremental learning, machine unlearning; beyond XGBoost).
+decremental learning, machine unlearning).
 
 An :class:`OnlineModel` keeps a model together with its training data and,
 for approximate updates, the per-node statistics that let
@@ -26,7 +26,8 @@ the cost of retraining (the answer when unlearning must be complete).
 Updates need a configuration whose retraining depends on the data alone:
 ``gbtree`` with ``tree_method="hist"`` (or ``"auto"``), depth-wise growth
 with ``max_depth > 0``, one output, no row or column sampling, no
-constraints, none of the beyond-XGBoost split options, CPU, and an
+constraints, no ``extra_trees``, ``path_smooth``, ``linear_tree``, quantized
+gradients or reuse penalties, CPU, and an
 objective with per-row gradients and Newton-step leaves (not ranking,
 ``survival:cox``, ``reg:absoluteerror`` or ``reg:quantileerror``); the data
 has one label per row and no weights, base margins, groups, label bounds or

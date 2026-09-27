@@ -1,6 +1,6 @@
 //! CatBoost-style **ordered target statistics**: an opt-in encoder that turns
-//! categorical columns into numeric ones. This is an extension beyond XGBoost;
-//! nothing in training uses it unless you call it.
+//! categorical columns into numeric ones. Nothing in training uses it unless
+//! you call it.
 //!
 //! # Encoding
 //!

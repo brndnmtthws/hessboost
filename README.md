@@ -120,8 +120,8 @@ runnable programs live in [`examples/`](examples)
 
 ## Python
 
-[`python/`](python) holds the Python package (`pip install hessboost`),
-with XGBoost's Python API (`DMatrix`, `train`, `cv`, `Booster`),
+[`python/`](python) holds the Python package (`pip install hessboost`):
+`DMatrix`, `train`, `cv`, and `Booster` (taking XGBoost's parameter names),
 scikit-learn estimators, pandas categorical input, and the conformal,
 distributional, tree-diffusion, ForestFlow, and in-place update extras:
 

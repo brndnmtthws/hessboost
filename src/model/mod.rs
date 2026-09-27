@@ -797,7 +797,7 @@ impl BoostedModel {
         self.boulevard = info;
     }
 
-    /// How this model was trained by `booster = boulevard` (beyond XGBoost),
+    /// How this model was trained by `booster = boulevard`,
     /// which [`crate::inference::BoulevardInference`] reads; `None` for every
     /// other model, including a Boulevard model's [`slice`](Self::slice)s
     /// and its XGBoost-format or compact exports (which predict the same
@@ -811,7 +811,7 @@ impl BoostedModel {
         self.ebm = info;
     }
 
-    /// The terms of a `booster = ebm` model (beyond XGBoost), which
+    /// The terms of a `booster = ebm` model, which
     /// [`crate::ebm::shape_functions`] and
     /// [`crate::inference::EbmInference`] read; `None` for every other
     /// model, including an EBM's [`slice`](Self::slice)s and its
@@ -1581,7 +1581,7 @@ impl BoostedModel {
     }
 
     /// The predicted distribution of every row for a model trained with a
-    /// distributional `dist:*` objective (beyond XGBoost, see
+    /// distributional `dist:*` objective (see
     /// [`crate::objective::distributional`]): one [`Dist`] per row, with its
     /// mean, variance, CDF, quantiles, log density, CRPS, intervals and
     /// sampling. The margins are mapped through the links in `f64`. Uses the

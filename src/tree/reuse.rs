@@ -1,6 +1,6 @@
 //! Feature- and threshold-reuse penalties from *Boosted Trees on a Diet*
 //! (Herrmann et al., ICLR 2026, arXiv:2510.26557, §3.1 and Appendix A), an
-//! opt-in extension beyond XGBoost.
+//! opt-in extension.
 //!
 //! The paper adds `ι·|F_U| + ξ·Σ_{f∈F_U} |T^f|` to each tree's regularizer,
 //! where `F_U` is the set of features the ensemble already splits on and

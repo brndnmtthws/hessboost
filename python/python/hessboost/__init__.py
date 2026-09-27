@@ -1,8 +1,7 @@
-"""hessboost: XGBoost's gradient boosting, reimplemented in Rust.
+"""hessboost: fast, deterministic gradient boosting in Rust.
 
-The API follows XGBoost's Python package: build a :class:`DMatrix`, pass a
-dict of XGBoost parameters to :func:`train`, predict with the returned
-:class:`Booster`::
+Build a :class:`DMatrix`, pass a dict of parameters (XGBoost's names) to
+:func:`train`, and predict with the returned :class:`Booster`::
 
     import hessboost
 

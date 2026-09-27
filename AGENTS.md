@@ -57,8 +57,12 @@ needing a device skip without one; a guard test still fails if the kernels
 do not compile). Its Python jobs build and test the extension on
 x86_64/aarch64 Linux, aarch64 macOS, and x86_64 Windows across CPython 3.11,
 latest Python 3.x, and free-threaded 3.14t, plus pyright's public-type
-check, a ruff/ty lint job over all of the repository's Python, and an sdist
-round trip. Root fmt also checks `python/Cargo.toml`; Python
+check (which also fails on a public function or class without a docstring),
+a ruff/ty lint job over all of the repository's Python, and an sdist round
+trip. `publish.yml` builds the manylinux, musllinux, macOS, and Windows
+wheels and tests each with `.github/scripts/test-wheel.sh` (musllinux in
+Alpine, without scikit-learn, which has no musl wheels). Root fmt also
+checks `python/Cargo.toml`; Python
 clippy runs in both the x86_64-linux and aarch64-macOS lint jobs (the
 latter checks the Metal feature). `all-checks-passed` gates merges. After
 touching `simd/` or `cfg(target_arch)` code, lint the architecture your
@@ -160,7 +164,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 |`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `metal` on macOS|
 |`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `codec` (detached model encoding to `bytes`, method configurations as serde JSON), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `inference` (`BoulevardInference` owning its model and holdout rows via `self_cell`, `honest_refit`), `ebm` (`TermShape`, `shape_functions`, `EbmInference`), `online` (`OnlineParams`: `exact()`/`approximate(tolerance)`; `OnlineModel`: the one mutable class, its state behind a mutex locked only detached; updates through `run_hooked`), `dist`, `diffusion` (`DiffusionParams` from a request dict with the `Method` as its serde JSON, `DiffusionModel`, `Samples` summaries of draw arrays; `fit` has no round hook, so it is not interruptible), `forest` (`ForestParams`/`ForestModel` the same way, `ForestMethod` and column kinds by serde name)|
 |`python/hessboost/`|the public API, pure Python: `_matrix` (`DMatrix`; `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through; `_matrix_for`: data as the models it is paired with read it, which prediction, conformal, inference, diffusion and forests go through), `_booster` (`Booster`, `ModelFormat`), `_core` (`Uncertainty` only, kept there so its `__module__` and pickles stay `hessboost._core`), `_model_io` (file I/O helpers, `_SchemaState`: the feature schema and pickle state of `Booster`, `DiffusionModel`, `ForestModel`), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn` (the estimators; their shared base `_HessboostModel` in `_sklearn_common`), `conformal`, `diffusion/` (`__init__`: frozen dataclasses mirroring `hessboost::diffusion`, presets read from the crate, `DiffusionModel`, `mean`/`quantiles`/`crps`; `forest`: `ForestParams`, `ForestModel`), `inference` (`BoulevardInference`, `BoulevardInfo`, `EbmInference`, `TermBands`, `honest_refit`), `ebm` (`shape_functions`, `TermShape`, axes, `EbmInfo`), `folds`, `online` (`OnlineModel`, `UpdateReport`, frozen dataclasses `Exact`/`Approximate` mirroring `OnlineMode`); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
-|`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit|
+|`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit; `test_stubs.py` pins the native classes public modules hand out unwrapped (`Distributions`) and requires their stub docstrings to equal the Rust docs|
 
 ## Invariants
 
@@ -218,7 +222,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `approx` with uniform sampling, per-round cuts weight unsampled rows by
   Hessian (XGBoost: zero). Categorical splits follow XGBoost's
   `HistEvaluator` (one-hot below 4 categories, else partition scanned both
-  ways up to 64) for the hist and exact builders. Beyond-XGBoost features are
+  ways up to 64) for the hist and exact builders. Features XGBoost lacks are
   opt-in, default off, and absent from fixtures.
 - **Parity-fixed options:** XGBoost options supported at one setting only
   ("Not implemented" in `lib.rs`) are not `TrainingParams` fields;
@@ -362,9 +366,11 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   objective's name: the model records it by name (`ModelObjective::name`,
   no `built_in` objective).
 - **Python:** `python/` uses only the crate's public API. The public
-  Python API is pure Python; the extension is private, fully stubbed
-  (`_hessboost.pyi`, which ty checks callers against; nothing checks it
-  against the built module, so change both together), `unsafe`-free
+  Python API is pure Python except `Distributions`, a native class
+  re-exported as is; the extension is private, fully stubbed
+  (`_hessboost.pyi`, which ty checks callers against; only the docstrings
+  of re-exported native classes are checked against the built module, so
+  change both together), `unsafe`-free
   (`forbid`), declares `gil_used = false`, keeps
   every class `frozen`, and releases the GIL around matrix construction,
   training, prediction, and model encode/decode. Parameter mappings go

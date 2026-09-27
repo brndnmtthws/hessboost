@@ -1,4 +1,4 @@
-//! Virtual ensembles (beyond XGBoost): SGLB posterior sampling turns one
+//! Virtual ensembles: SGLB posterior sampling turns one
 //! model into an ensemble of its own truncations, whose disagreement is
 //! knowledge (epistemic) uncertainty. It grows where the training data is
 //! missing. A distributional (`dist:normal`) model adds data (aleatoric)

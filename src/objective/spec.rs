@@ -83,8 +83,8 @@ pub enum Objective {
     /// `rank:map`: LambdaMART on MAP.
     RankMap(LambdaRank),
     /// `rank:xendcg`: LightGBM's XE-NDCG listwise ranking loss
-    /// (`rank_xendcg`; beyond XGBoost, so its models are saved in the
-    /// native formats only). Its per-round random targets are keyed by
+    /// (`rank_xendcg`; its models are saved in the native formats
+    /// only). Its per-round random targets are keyed by
     /// [`seed`](crate::config::TrainingParams::seed), iteration, query, and
     /// document, so the trees differ from LightGBM's.
     RankXendcg,
@@ -93,7 +93,7 @@ pub enum Objective {
     Cox,
     /// `survival:aft`: accelerated failure time on label bounds.
     Aft(Aft),
-    /// `dist:<family>`: distributional boosting (beyond XGBoost; see
+    /// `dist:<family>`: distributional boosting (see
     /// [`crate::objective::distributional`]).
     Dist(Distributional),
     /// A custom loss ([`CustomLoss`](crate::objective::CustomLoss) or any

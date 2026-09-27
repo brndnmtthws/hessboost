@@ -348,7 +348,7 @@ impl<'a> Trainer<'a> {
     /// needs a gbtree model without DART weights or linear leaves, no
     /// monotone constraints, and no feature weights on `dtrain`; settings
     /// refresh does not read (row and column sampling, symmetric growth,
-    /// DART dropout, the beyond-XGBoost tree options) must keep their
+    /// DART dropout, the LightGBM and compact-training tree options) must keep their
     /// defaults, while XGBoost's tree-shape settings (`tree_method`,
     /// `max_depth`, `min_child_weight`, ...) are accepted.
     ///

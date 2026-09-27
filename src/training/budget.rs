@@ -2,7 +2,7 @@
 //! tuning, after [PerpetualBooster](https://github.com/perpetual-ml/perpetual)
 //! (Apache-2.0; the algorithm is re-implemented here, no code is copied).
 //!
-//! Beyond XGBoost and opt-in: nothing here runs unless you call
+//! Opt-in: nothing here runs unless you call
 //! [`train_with_budget`]. The trained model is an ordinary gbtree
 //! [`BoostedModel`], so prediction, SHAP, and every model format (including
 //! XGBoost JSON/UBJSON export) work unchanged.

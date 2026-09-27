@@ -1,6 +1,6 @@
 //! Explainable boosting machines (EBMs): cyclic GA²M boosting, per-term
 //! shape functions, and (with Boulevard averaging) confidence bands on them.
-//! Beyond XGBoost and opt-in: train with
+//! Opt-in: train with
 //! [`BoosterKind::Ebm`](crate::config::BoosterKind::Ebm), read the shape
 //! functions with [`shape_functions`], and, for an
 //! [`Ebm::boulevard`](crate::config::Ebm::boulevard) model,

@@ -305,7 +305,7 @@ class HessboostRanker(_HessboostModel):
 
 class HessboostDistributionRegressor(RegressorMixin, _HessboostModel):
     """Distributional regression (NGBoost / XGBoostLSS style): predicts a
-    full conditional distribution per row. Beyond XGBoost.
+    full conditional distribution per row.
 
     The objective defaults to ``dist:normal``; ``dist:lognormal``,
     ``dist:gamma``, ``dist:poisson`` and ``dist:negbinomial`` are the other

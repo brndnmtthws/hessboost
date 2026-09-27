@@ -251,6 +251,20 @@ jobs:
         if: matrix.os == 'ubuntu-26.04' && matrix.python-version == '3'
         run: uv run --no-sync pyright --verifytypes hessboost --ignoreexternal
         working-directory: python
+      # Editors show these docstrings on hover; pyright counts the public
+      # functions and classes without one but does not fail on them.
+      - name: Check public docstrings
+        if: matrix.os == 'ubuntu-26.04' && matrix.python-version == '3'
+        run: |
+          uv run --no-sync pyright --verifytypes hessboost --ignoreexternal --outputjson |
+            uv run --no-sync python -c '
+          import json, sys
+          report = json.load(sys.stdin)["typeCompleteness"]
+          missing = report["missingFunctionDocStringCount"] + report["missingClassDocStringCount"]
+          undocumented = [s["name"] for s in report["symbols"] for d in s["diagnostics"] if "docstring" in d["message"]]
+          sys.exit(f"{missing} public symbols without a docstring: {undocumented}" if missing else 0)
+          '
+        working-directory: python
 
   python-lint:
     name: Python lint (ruff, ty)

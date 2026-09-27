@@ -2,7 +2,7 @@
 //! the regression function `f(x)`, prediction intervals for new labels,
 //! and reproduction intervals, with asymptotic (central-limit) guarantees
 //! under the assumptions below and validated only in the regimes listed in
-//! [Validation](#validation). Beyond XGBoost and opt-in: train with
+//! [Validation](#validation). Opt-in: train with
 //! [`BoosterKind::Boulevard`](crate::config::BoosterKind::Boulevard), then
 //! fit a [`BoulevardInference`] on the training rows. A Boulevard EBM
 //! ([`crate::ebm`], `ebm_boulevard`) gets bands on its shape functions from

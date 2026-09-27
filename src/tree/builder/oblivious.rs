@@ -1,5 +1,5 @@
 //! Symmetric (oblivious) tree growth, CatBoost-style (`grow_policy =
-//! symmetric`, beyond XGBoost).
+//! symmetric`).
 //!
 //! A symmetric tree applies one split — the same feature, threshold, and
 //! missing-value direction — to every node of a level. The split is chosen

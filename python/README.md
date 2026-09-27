@@ -1,10 +1,9 @@
 # hessboost for Python
 
-**Fast, deterministic gradient boosting in Rust**, with an XGBoost-compatible
-Python API: `DMatrix`, `train`, `cv`, `Booster`, and scikit-learn
-estimators. hessboost accepts standard parameter names, reproduces
-deterministic model predictions, and supports bidirectional XGBoost JSON
-and UBJSON model interchange.
+**Fast, deterministic gradient boosting in Rust.** The core API (`DMatrix`,
+`train`, `cv`, `Booster`, and scikit-learn estimators) takes the parameter
+names XGBoost users know, and models move to and from XGBoost as JSON or
+UBJSON.
 
 - **Strict.** An unknown parameter, a value of the wrong type or range, or
   a combination hessboost does not implement raises an error; nothing is
@@ -28,11 +27,12 @@ uv add hessboost        # or: pip install hessboost
 Extras: `hessboost[pandas]` and `hessboost[scikit-learn]`. numpy is the only
 required dependency.
 
-Prebuilt wheels are published for Linux x86_64 and aarch64 (manylinux),
-macOS arm64 (with Metal support, `device="metal"`), and Windows x86_64: one
-`abi3` wheel per platform for CPython 3.11 and newer, plus a wheel for
-free-threaded CPython 3.14t. Elsewhere the installer builds from the source
-distribution, which needs Rust 1.93 or newer and a C compiler (for libzstd).
+Prebuilt wheels are published for Linux x86_64 and aarch64 (glibc
+manylinux and musl/Alpine musllinux), macOS arm64 (with Metal support,
+`device="metal"`), and Windows x86_64: one `abi3` wheel per platform for
+CPython 3.11 and newer, plus a wheel for free-threaded CPython 3.14t.
+Elsewhere the installer builds from the source distribution, which needs
+Rust 1.93 or newer and a C compiler (for libzstd).
 
 ## Quick start
 
@@ -162,7 +162,7 @@ missing values as `NaN` and categorical features as non-negative codes;
 models with no exact equivalent raise `ModelFormatError`. `booster[a:b]`
 slices boosting iterations.
 
-## Beyond XGBoost
+## Modern modeling
 
 ```python
 from hessboost.conformal import ConformalizedQuantile

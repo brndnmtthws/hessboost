@@ -1,5 +1,5 @@
 //! Stochastic Gradient Langevin Boosting (SGLB) and model shrinkage in the
-//! training loop (beyond XGBoost; CatBoost's `langevin`,
+//! training loop (CatBoost's `langevin`,
 //! `diffusion_temperature`, `model_shrink_rate`, `model_shrink_mode`, and
 //! `posterior_sampling`).
 //!

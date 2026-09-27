@@ -146,7 +146,7 @@ pub fn exercise(model: &BoostedModel) {
         ImportanceType::TotalCover,
     ] {
         for &feature in model.feature_importance(kind).keys() {
-            assert!((feature as usize) < n_features);
+            assert!(feature < n_features);
         }
     }
 
@@ -196,7 +196,9 @@ pub fn exercise(model: &BoostedModel) {
                 same_bits(margin.as_slice(), compact_margin.as_slice()),
                 "compact margins differ"
             );
-            let preds = model.predict(&data).expect("model predicts");
+            let preds = model
+                .predict(&data, Iterations::Best)
+                .expect("model predicts");
             let compact_preds = compact.predict(&data).expect("compact model predicts");
             assert!(
                 same_bits(preds.as_slice(), compact_preds.as_slice()),
@@ -214,16 +216,16 @@ fn predict_all(model: &BoostedModel) -> Predictions {
     let n = data.n_rows();
 
     let margin = model
-        .predict_margin(&data)
+        .predict_margin(&data, Iterations::Best)
         .expect("probe matrix matches the model");
     assert_eq!((margin.n_rows(), margin.width()), (n, k));
     let whole = model
-        .predict_margin_range(&data, ..)
+        .predict_margin(&data, ..)
         .expect("the whole model is a valid range");
     assert_eq!((whole.n_rows(), whole.width()), (n, k));
 
     let preds = model
-        .predict(&data)
+        .predict(&data, Iterations::Best)
         .expect("probe matrix matches the model");
     let width = if model.objective().name() == "multi:softmax" {
         1
@@ -232,11 +234,11 @@ fn predict_all(model: &BoostedModel) -> Predictions {
     };
     assert_eq!((preds.n_rows(), preds.width()), (n, width));
     model
-        .predict_class(&data)
+        .predict_class(&data, Iterations::Best)
         .expect("probe matrix matches the model");
 
     let leaves = model
-        .predict_leaf(&data)
+        .predict_leaf(&data, ..)
         .expect("probe matrix matches the model");
     assert_eq!((leaves.n_rows(), leaves.width()), (n, model.num_trees()));
     for row in leaves.rows() {
@@ -245,7 +247,7 @@ fn predict_all(model: &BoostedModel) -> Predictions {
         }
     }
 
-    if let Ok(contribs) = model.predict_contribs(&data) {
+    if let Ok(contribs) = model.predict_contribs(&data, Iterations::Best) {
         assert_eq!(
             (
                 contribs.n_rows(),
@@ -256,7 +258,7 @@ fn predict_all(model: &BoostedModel) -> Predictions {
         );
     }
     if n_features <= MAX_INTERACTION_FEATURES
-        && let Ok(interactions) = model.predict_interactions(&data)
+        && let Ok(interactions) = model.predict_interactions(&data, Iterations::Best)
     {
         assert_eq!(
             (
@@ -269,7 +271,7 @@ fn predict_all(model: &BoostedModel) -> Predictions {
     }
     if DistFamily::from_objective(model.objective().name()).is_some() {
         model
-            .predict_distribution(&data)
+            .predict_distribution(&data, Iterations::Best)
             .expect("dist:* models predict distributions");
     }
 
@@ -277,7 +279,9 @@ fn predict_all(model: &BoostedModel) -> Predictions {
     if model.num_boost_rounds() > 0
         && let Ok(sliced) = model.slice(.., 1)
     {
-        let sliced_margin = sliced.predict_margin(&data).expect("a slice predicts");
+        let sliced_margin = sliced
+            .predict_margin(&data, Iterations::Best)
+            .expect("a slice predicts");
         assert!(
             same_bits(whole.as_slice(), sliced_margin.as_slice()),
             "slice(.., 1) changed the margins"
@@ -317,9 +321,11 @@ fn check_xgboost_round_trip(
         let data = probe
             .with_base_margin(&intercepts)
             .expect("zero base margins are valid");
-        let before = model.predict_margin(&data).expect("model predicts");
+        let before = model
+            .predict_margin(&data, Iterations::Best)
+            .expect("model predicts");
         let after = imported
-            .predict_margin(&data)
+            .predict_margin(&data, Iterations::Best)
             .expect("imported model predicts");
         assert!(
             same_bits(before.as_slice(), after.as_slice()),

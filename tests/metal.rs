@@ -222,26 +222,26 @@ fn to_gpu_predicts_bit_identically() {
         let model = train(&params, &data, 15).unwrap();
         let gpu = model.to_gpu().unwrap();
         assert_eq!(
-            model.predict(&data).unwrap(),
-            gpu.predict(&data).unwrap(),
+            model.predict(&data, Iterations::Best).unwrap(),
+            gpu.predict(&data, Iterations::Best).unwrap(),
             "{objective}: predict"
         );
         assert_eq!(
-            model.predict_margin(&data).unwrap(),
-            gpu.predict_margin(&data).unwrap(),
+            model.predict_margin(&data, Iterations::Best).unwrap(),
+            gpu.predict_margin(&data, Iterations::Best).unwrap(),
             "{objective}: predict_margin"
         );
         assert_eq!(
-            model.predict_class(&data).unwrap(),
-            gpu.predict_class(&data).unwrap(),
+            model.predict_class(&data, Iterations::Best).unwrap(),
+            gpu.predict_class(&data, Iterations::Best).unwrap(),
             "{objective}: predict_class"
         );
         // Range predictions: the first half of the iterations.
         let half = model.num_boost_rounds() / 2;
         assert_eq!(
-            model.predict_margin_range(&data, ..half).unwrap(),
-            gpu.predict_margin_range(&data, ..half).unwrap(),
-            "{objective}: predict_margin_range"
+            model.predict_margin(&data, ..half).unwrap(),
+            gpu.predict_margin(&data, ..half).unwrap(),
+            "{objective}: predict_margin(..half)"
         );
     }
 }

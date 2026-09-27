@@ -99,10 +99,19 @@ fn one_vector_tree_per_round_predicts_every_output() {
     let want = reference_margins(&model, &x, N);
     // Block kernels (lockstep groups plus a tail) and the small-batch path.
     let d = DMatrix::from_dense(&x, N, COLS).unwrap();
-    assert_eq!(model.predict_margin(&d).unwrap().as_slice(), want);
+    assert_eq!(
+        model
+            .predict_margin(&d, Iterations::Best)
+            .unwrap()
+            .as_slice(),
+        want
+    );
     let few = DMatrix::from_dense(&x[..5 * COLS], 5, COLS).unwrap();
     assert_eq!(
-        model.predict_margin(&few).unwrap().as_slice(),
+        model
+            .predict_margin(&few, Iterations::Best)
+            .unwrap()
+            .as_slice(),
         &want[..5 * K]
     );
     // CSR rows (missing entries absent) take the scratch-block path.
@@ -118,9 +127,18 @@ fn one_vector_tree_per_round_predicts_every_output() {
         indptr.push(indices.len());
     }
     let csr = DMatrix::from_csr(indptr, indices, values, COLS).unwrap();
-    assert_eq!(model.predict_margin(&csr).unwrap().as_slice(), want);
+    assert_eq!(
+        model
+            .predict_margin(&csr, Iterations::Best)
+            .unwrap()
+            .as_slice(),
+        want
+    );
     // Squared error: predictions are the margins, `[row][output]`.
-    assert_eq!(model.predict(&d).unwrap().as_slice(), want);
+    assert_eq!(
+        model.predict(&d, Iterations::Best).unwrap().as_slice(),
+        want
+    );
 }
 
 #[test]
@@ -147,11 +165,11 @@ fn shap_is_additive_per_output() {
     let (x, _) = data();
     let n = 40;
     let d = DMatrix::from_dense(&x[..n * COLS], n, COLS).unwrap();
-    let margin = model.predict_margin(&d).unwrap();
+    let margin = model.predict_margin(&d, Iterations::Best).unwrap();
     let width = COLS + 1;
-    let contribs = model.predict_contribs(&d).unwrap();
+    let contribs = model.predict_contribs(&d, Iterations::Best).unwrap();
     assert_contribs_sum_to(&contribs, &margin);
-    let inter = model.predict_interactions(&d).unwrap();
+    let inter = model.predict_interactions(&d, Iterations::Best).unwrap();
     assert_eq!(
         (inter.n_rows(), inter.n_outputs(), inter.n_features()),
         (n, K, COLS)
@@ -170,7 +188,7 @@ fn shap_is_additive_per_output() {
 fn formats_round_trip_vector_leaves() {
     let model = model();
     let d = dtrain();
-    let want = model.predict(&d).unwrap();
+    let want = model.predict(&d, Iterations::Best).unwrap();
     let reloaded = [
         BoostedModel::from_bytes(&model.to_bytes().unwrap()).unwrap(),
         BoostedModel::from_json(&model.to_json().unwrap()).unwrap(),
@@ -179,7 +197,7 @@ fn formats_round_trip_vector_leaves() {
     ];
     for m in reloaded {
         assert!(m.has_vector_leaves());
-        assert_eq!(m.predict(&d).unwrap(), want);
+        assert_eq!(m.predict(&d, Iterations::Best).unwrap(), want);
         assert_eq!(m.num_boost_rounds(), 8);
     }
 }
@@ -214,12 +232,9 @@ fn early_stopping_keeps_whole_vector_rounds() {
     let best = model.best_iteration().expect("early stopping triggers");
     // Patience 1: one round past the best, one vector tree per round.
     assert_eq!(model.num_trees(), best + 2);
-    let margin = model.predict_margin(&dtrain).unwrap();
-    assert_eq!(
-        margin,
-        model.predict_margin_range(&dtrain, ..=best).unwrap()
-    );
-    assert_ne!(margin, model.predict_margin_range(&dtrain, ..).unwrap());
+    let margin = model.predict_margin(&dtrain, Iterations::Best).unwrap();
+    assert_eq!(margin, model.predict_margin(&dtrain, ..=best).unwrap());
+    assert_ne!(margin, model.predict_margin(&dtrain, ..).unwrap());
 }
 
 #[test]
@@ -239,7 +254,10 @@ fn single_output_builds_scalar_trees() {
     )
     .unwrap();
     assert!(!vector.has_vector_leaves());
-    assert_eq!(vector.predict(&d).unwrap(), scalar.predict(&d).unwrap());
+    assert_eq!(
+        vector.predict(&d, Iterations::Best).unwrap(),
+        scalar.predict(&d, Iterations::Best).unwrap()
+    );
 }
 
 #[test]
@@ -261,10 +279,13 @@ fn dart_rounds_train_vector_trees() {
     assert_eq!(model.num_trees(), 6);
     let (x, _) = data();
     // Dropout rescales earlier trees, so the margins are the weighted sum.
-    let margins = model.predict_margin(&d).unwrap();
+    let margins = model.predict_margin(&d, Iterations::Best).unwrap();
     let unweighted = reference_margins(&model, &x, N);
     assert_ne!(margins.as_slice(), unweighted);
-    assert_contribs_sum_to(&model.predict_contribs(&d).unwrap(), &margins);
+    assert_contribs_sum_to(
+        &model.predict_contribs(&d, Iterations::Best).unwrap(),
+        &margins,
+    );
 }
 
 fn squared_error(k: usize) -> CustomLoss {
@@ -399,16 +420,20 @@ fn vector_forests_hold_num_parallel_tree_trees_per_iteration() {
     let (x, _) = data();
     // Without sampling the forest's trees are identical, each shrunk by
     // eta / 3, and the iteration ranges select whole forests.
-    let all = model.predict_margin(&d).unwrap();
+    let all = model.predict_margin(&d, Iterations::Best).unwrap();
     assert_eq!(all.as_slice(), reference_margins(&model, &x, N));
-    let first_two = model.predict_margin_range(&d, ..2).unwrap();
+    let first_two = model.predict_margin(&d, ..2).unwrap();
     assert_eq!(
         first_two,
-        model.slice(..2, 1).unwrap().predict_margin(&d).unwrap()
+        model
+            .slice(..2, 1)
+            .unwrap()
+            .predict_margin(&d, Iterations::Best)
+            .unwrap()
     );
     assert_ne!(first_two, all);
     // SHAP over a prefix range stays additive.
-    assert_contribs_sum_to(&model.predict_contribs_range(&d, ..2).unwrap(), &first_two);
+    assert_contribs_sum_to(&model.predict_contribs(&d, ..2).unwrap(), &first_two);
 }
 
 #[test]
@@ -424,8 +449,8 @@ fn continued_vector_training_matches_one_run() {
         .model;
     assert_eq!(continued.num_trees(), 8);
     assert_eq!(
-        continued.predict_margin(&dtrain).unwrap(),
-        full.predict_margin(&dtrain).unwrap()
+        continued.predict_margin(&dtrain, Iterations::Best).unwrap(),
+        full.predict_margin(&dtrain, Iterations::Best).unwrap()
     );
 }
 
@@ -506,7 +531,10 @@ fn one_round_margins(params: hessboost::config::TrainingParamsBuilder, d: &DMatr
         .base_score(0.0)
         .build()
         .unwrap();
-    train(&params, d, 1).unwrap().predict_margin(d).unwrap()
+    train(&params, d, 1)
+        .unwrap()
+        .predict_margin(d, Iterations::Best)
+        .unwrap()
 }
 
 /// Each row's two margins equal its label `want[row]`.

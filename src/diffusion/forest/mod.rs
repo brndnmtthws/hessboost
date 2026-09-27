@@ -131,6 +131,7 @@
 //! # }
 //! ```
 
+use crate::model::Iterations;
 use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
@@ -1154,7 +1155,7 @@ impl<'a> Sampler<'a> {
             }
             let models = model.level_models(batch.class, level);
             for (m, gbdt) in models.iter().enumerate() {
-                let pred = gbdt.predict_margin(&batch.input)?;
+                let pred = gbdt.predict_margin(&batch.input, Iterations::Best)?;
                 for (&r, p) in batch.rows.iter().zip(pred.rows()) {
                     match model.layout {
                         OutputLayout::PerColumn => out[r * c + m] = f64::from(p[0]),

@@ -1,4 +1,4 @@
-use super::{BoostedModel, Shrinkage, TreeWeights};
+use super::{BoostedModel, Iterations, Shrinkage, TreeWeights};
 use crate::error::{HessboostError, Result};
 use std::ops::{Range, RangeBounds};
 use std::sync::OnceLock;
@@ -16,7 +16,7 @@ impl BoostedModel {
     /// A model trained with model shrinkage slices to prefixes only
     /// (`..k` with step 1): the result is the model after `k` iterations,
     /// bit for bit the model the same training run stopped after `k` rounds
-    /// returns (see [`Self::predict_margin_range`]).
+    /// returns (see [`Self::predict_margin`]).
     ///
     /// `step` must be at least 1 and the range non-empty and within
     /// [`Self::num_boost_rounds`]. XGBoost 3.4.2 additionally trips an
@@ -36,7 +36,8 @@ impl BoostedModel {
                 "step must be at least 1",
             ));
         }
-        let Range { start: begin, end } = self.resolve_iterations(iterations, "slice")?;
+        let Range { start: begin, end } =
+            self.resolve_iterations(Iterations::from(iterations), "slice")?;
         if begin == end {
             return Err(HessboostError::invalid_param(
                 "slice",

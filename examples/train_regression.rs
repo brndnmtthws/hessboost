@@ -41,7 +41,7 @@ fn main() -> Result<()> {
 
     let model = train(&params, &dtrain, 200)?;
 
-    let preds = model.predict(&dtrain)?;
+    let preds = model.predict(&dtrain, Iterations::Best)?;
     let rmse = EvalMetric::Rmse
         .build(1)?
         .eval(preds.as_slice(), dtrain.labels().unwrap(), None);

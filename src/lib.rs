@@ -28,7 +28,7 @@
 //!     .build()?;
 //!
 //! let model = train(&params, &dtrain, 50)?;
-//! let preds = model.predict(&dtrain)?;
+//! let preds = model.predict(&dtrain, Iterations::Best)?;
 //! assert_eq!((preds.n_rows(), preds.width()), (6, 1)); // `[row][output]`
 //!
 //! model.save_binary("model.bin")?;      // native format
@@ -78,9 +78,8 @@
 //!   hook for progress, custom stopping, and cancellation
 //!   ([`Trainer::on_round`](training::Trainer::on_round)), slicing
 //!   ([`BoostedModel::slice`](model::BoostedModel::slice)), `iteration_range`
-//!   prediction as Rust ranges
-//!   ([`predict_margin_range`](model::BoostedModel::predict_margin_range) and
-//!   siblings).
+//!   prediction as Rust ranges (every prediction method's
+//!   [`Iterations`](model::Iterations) argument).
 //! - **Tree methods:** `exact`, `hist`, `approx`; `depthwise`/`lossguide`
 //!   growth; uniform or `gradient_based` row sampling; column sampling with
 //!   optional per-feature weights
@@ -282,7 +281,7 @@ pub mod prelude {
     pub use crate::data::DMatrix;
     pub use crate::error::{HessboostError, Result};
     pub use crate::metric::EvalMetric;
-    pub use crate::model::{BoostedModel, ImportanceType};
+    pub use crate::model::{BoostedModel, ImportanceType, Iterations};
     pub use crate::objective::{Objective, RegLoss};
     pub use crate::training::{Trainer, train};
 }

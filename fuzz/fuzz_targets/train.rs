@@ -495,7 +495,7 @@ fuzz_target!(|case: Case| {
     common::exercise(&model);
 
     let margin = model
-        .predict_margin(&case.dtrain)
+        .predict_margin(&case.dtrain, Iterations::Best)
         .expect("a model predicts its training data");
     assert_eq!(
         (margin.n_rows(), margin.width()),
@@ -503,7 +503,7 @@ fuzz_target!(|case: Case| {
     );
     let parallel = fit(&case, 3).expect("training succeeds whatever the thread count");
     let parallel = parallel
-        .predict_margin(&case.dtrain)
+        .predict_margin(&case.dtrain, Iterations::Best)
         .expect("a model predicts its training data");
     assert!(
         common::same_bits(margin.as_slice(), parallel.as_slice()),

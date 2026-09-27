@@ -41,11 +41,16 @@ fn unknown_and_corrupt_native_payloads_are_refused() {
         bits(
             BoostedModel::from_bytes(&container)
                 .unwrap()
-                .predict(&matrix(1))
+                .predict(&matrix(1), Iterations::Best)
                 .unwrap()
                 .as_slice()
         ),
-        bits(model.predict(&matrix(1)).unwrap().as_slice())
+        bits(
+            model
+                .predict(&matrix(1), Iterations::Best)
+                .unwrap()
+                .as_slice()
+        )
     );
     let with_version = |version: u8| {
         let mut bytes = container.clone();
@@ -274,8 +279,13 @@ fn json_documents_may_omit_defaults() {
             "{name}"
         );
         assert_eq!(
-            bits(restored.predict(&data).unwrap().as_slice()),
-            bits(model.predict(&data).unwrap().as_slice()),
+            bits(
+                restored
+                    .predict(&data, Iterations::Best)
+                    .unwrap()
+                    .as_slice()
+            ),
+            bits(model.predict(&data, Iterations::Best).unwrap().as_slice()),
             "{name}"
         );
         // Saving writes every field again.
@@ -649,10 +659,15 @@ fn native_formats_round_trip_every_model_feature() {
         assert_eq!(from_binary.to_bytes().unwrap(), bytes, "{name}: binary");
         let from_json = BoostedModel::from_json(&model.to_json().unwrap()).unwrap();
         assert_eq!(from_json.to_bytes().unwrap(), bytes, "{name}: JSON");
-        let expected = bits(model.predict(&data).unwrap().as_slice());
+        let expected = bits(model.predict(&data, Iterations::Best).unwrap().as_slice());
         for restored in [&from_binary, &from_json] {
             assert_eq!(
-                bits(restored.predict(&data).unwrap().as_slice()),
+                bits(
+                    restored
+                        .predict(&data, Iterations::Best)
+                        .unwrap()
+                        .as_slice()
+                ),
                 expected,
                 "{name}"
             );
@@ -715,7 +730,12 @@ fn saved_models_keep_loading_with_their_margins() {
             let binary = BoostedModel::load_binary(file("bin")).unwrap();
             let json = BoostedModel::load_json(file("json")).unwrap();
             for (format, model) in [("bin", binary), ("json", json)] {
-                let margins = margin_bytes(model.predict_margin(data).unwrap().as_slice());
+                let margins = margin_bytes(
+                    model
+                        .predict_margin(data, Iterations::Best)
+                        .unwrap()
+                        .as_slice(),
+                );
                 assert!(margins == expected, "{}: {name} ({format})", dir.display());
             }
             if file("hbtd").exists() {
@@ -859,7 +879,7 @@ fn save_models_of_this_version() {
         if let Ok(compact) = model.to_compact() {
             compact.save(file("hbtd")).unwrap();
         }
-        let margins = model.predict_margin(&data).unwrap();
+        let margins = model.predict_margin(&data, Iterations::Best).unwrap();
         std::fs::write(file("margins"), margin_bytes(margins.as_slice())).unwrap();
     }
     for (name, model) in diffusion_models() {
@@ -921,7 +941,12 @@ fn regressor_margins(model: &DiffusionModel) -> Vec<u8> {
         .map(|i| ((i * 37) % 101) as f32 / 25.0 - 2.0)
         .collect();
     let probe = DMatrix::from_dense(&x, 16, cols).unwrap();
-    margin_bytes(regressor.predict_margin(&probe).unwrap().as_slice())
+    margin_bytes(
+        regressor
+            .predict_margin(&probe, Iterations::Best)
+            .unwrap()
+            .as_slice(),
+    )
 }
 
 /// One small forest model per structure, as saved for each release: an
@@ -976,7 +1001,9 @@ fn forest_margins(model: &ForestModel) -> Vec<u8> {
             .collect();
         let probe = DMatrix::from_dense(&x, 8, cols).unwrap();
         out.extend(margin_bytes(
-            gbdt.predict_margin(&probe).unwrap().as_slice(),
+            gbdt.predict_margin(&probe, Iterations::Best)
+                .unwrap()
+                .as_slice(),
         ));
     }
     out

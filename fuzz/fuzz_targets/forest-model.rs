@@ -66,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
         // Zero may be an unseen category, which is refused; otherwise the
         // missing entry is filled.
         if let Ok(imputed) = model.impute(&probe, 1, None, 0) {
-            assert_eq!(imputed.len(), model.n_columns());
+            assert_eq!(imputed.as_slice().len(), model.n_columns());
         }
     }
 });

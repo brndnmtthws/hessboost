@@ -323,7 +323,7 @@ impl Bag {
             ));
             subsample_of(&all_rows(n), params.ebm_settings().bag_fraction(), &mut rng)
         };
-        let holdout = if params.ebm_settings().early_stopping_rounds() > 0 {
+        let holdout = if params.ebm_settings().early_stopping().is_some() {
             let mut in_bag = vec![false; n];
             for &r in &rows {
                 in_bag[r as usize] = true;
@@ -416,19 +416,11 @@ impl Bag {
     /// Start a stage of `terms` terms: with early stopping, a stopper
     /// seeded with the current model.
     fn start_stage(&mut self, run: &TrainContext, scorer: Option<&Scorer>, terms: usize) {
-        self.stopper = scorer.map(|scorer| {
-            let capacity = run
-                .params
-                .ebm_settings()
-                .early_stopping_rounds()
-                .saturating_mul(terms);
+        let stopping = run.params.ebm_settings().early_stopping();
+        self.stopper = scorer.zip(stopping).map(|(scorer, stopping)| {
+            let capacity = stopping.rounds().get().saturating_mul(terms);
             let start = self.score(run, scorer);
-            Stopper::new(
-                capacity,
-                run.params.ebm_settings().early_stopping_tolerance(),
-                start,
-                self,
-            )
+            Stopper::new(capacity, stopping.tolerance(), start, self)
         });
     }
 
@@ -541,7 +533,7 @@ fn classic(
     let mut bags = (0..n_bags)
         .map(|b| Bag::new(run, b, mu))
         .collect::<Result<Vec<Bag>>>()?;
-    let metric = metric.filter(|_| params.ebm_settings().early_stopping_rounds() > 0);
+    let metric = metric.filter(|_| params.ebm_settings().early_stopping().is_some());
     let scorer = metric.map(|metric| Scorer {
         metric,
         sign: if metric.maximize() { -1.0 } else { 1.0 },

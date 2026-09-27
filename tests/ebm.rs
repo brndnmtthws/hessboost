@@ -2,8 +2,8 @@
 //! ([`hessboost::ebm`]), and the Boulevard EBM's bands.
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Ebm, EbmBuilder, GrowPolicy, QueryBagging, TrainingParams,
-    TrainingParamsBuilder,
+    BalancedBagging, BoosterKind, Ebm, EbmBuilder, EbmEarlyStopping, GrowPolicy, QueryBagging,
+    TrainingParams, TrainingParamsBuilder,
 };
 use hessboost::data::FeatureType;
 use hessboost::ebm::TermAxis;
@@ -15,6 +15,15 @@ use std::ops::ControlFlow;
 
 mod common;
 use common::{invalid_param, labeled_dense, lcg, with_threads};
+
+/// Early stopping after `rounds` rounds at the default tolerance.
+fn stopping(rounds: usize) -> EbmEarlyStopping {
+    EbmEarlyStopping::new(
+        std::num::NonZeroUsize::new(rounds).unwrap(),
+        EbmEarlyStopping::DEFAULT_TOLERANCE,
+    )
+    .unwrap()
+}
 
 /// `n` rows of three uniform features (the third missing every seventh
 /// row, which then adds `½`) with
@@ -267,20 +276,59 @@ fn unsupported_combinations_are_refused() {
     assert_eq!(refused(by_query), "objective");
 
     assert_eq!(
-        invalid_param(boulevard_ebm().early_stopping_rounds(5).build()),
+        invalid_param(boulevard_ebm().early_stopping(stopping(5)).build()),
         "ebm_early_stopping_rounds"
     );
     assert_eq!(
         invalid_param(
             classic_ebm()
                 .bag_fraction(1.0)
-                .early_stopping_rounds(5)
+                .early_stopping(stopping(5))
                 .build()
         ),
         "ebm_early_stopping_rounds"
     );
+    // No early stopping is `None`: the flat `0` rounds is off, and a
+    // tolerance without early stopping is refused there.
+    let flat =
+        |pairs: &[(&str, serde_json::Value)]| TrainingParams::from_xgboost(pairs.iter().cloned());
+    let ebm = serde_json::json!("ebm");
+    let off = flat(&[
+        ("booster", ebm.clone()),
+        ("ebm_early_stopping_rounds", serde_json::json!(0)),
+    ])
+    .unwrap();
+    assert_eq!(off, flat(&[("booster", ebm.clone())]).unwrap());
     assert_eq!(
-        invalid_param(classic_ebm().early_stopping_tolerance(0.0).build()),
+        invalid_param(flat(&[
+            ("booster", ebm.clone()),
+            ("ebm_early_stopping_tolerance", serde_json::json!(0.0)),
+        ])),
+        "ebm_early_stopping_tolerance"
+    );
+    let on = flat(&[
+        ("booster", ebm.clone()),
+        ("ebm_bag_fraction", serde_json::json!(0.8)),
+        ("ebm_early_stopping_rounds", serde_json::json!(7)),
+        ("ebm_early_stopping_tolerance", serde_json::json!(0.01)),
+    ])
+    .unwrap();
+    let BoosterKind::Ebm(settings) = on.booster else {
+        panic!("an EBM booster");
+    };
+    let expected = EbmEarlyStopping::new(std::num::NonZeroUsize::new(7).unwrap(), 0.01).unwrap();
+    assert_eq!(settings.early_stopping(), Some(expected));
+    for params in [&off, &on] {
+        assert_eq!(
+            &TrainingParams::from_xgboost(params.to_xgboost().unwrap()).unwrap(),
+            params
+        );
+    }
+    assert_eq!(
+        invalid_param(EbmEarlyStopping::new(
+            std::num::NonZeroUsize::MIN,
+            f64::INFINITY
+        )),
         "ebm_early_stopping_tolerance"
     );
 
@@ -383,7 +431,7 @@ fn classic_ebms_bag_whole_queries() {
     // Early stopping scores held-out rows, which would split the queries.
     let stopping = base()
         .booster(BoosterKind::Ebm(
-            classic_ebm().early_stopping_rounds(5).build().unwrap(),
+            classic_ebm().early_stopping(stopping(5)).build().unwrap(),
         ))
         .build()
         .unwrap();
@@ -612,7 +660,7 @@ fn early_stopping_scores_bags_with_the_custom_metric() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     let (_, dtrain) = data(400, 13);
-    let params = classic_with(classic_ebm().early_stopping_rounds(3))
+    let params = classic_with(classic_ebm().early_stopping(stopping(3)))
         .eta(0.3)
         .build()
         .unwrap();
@@ -635,7 +683,7 @@ fn early_stopping_scores_bags_with_the_custom_metric() {
 #[test]
 fn an_oversized_early_stopping_patience_just_never_stops() {
     let (_, dtrain) = data(200, 14);
-    let params = classic_with(classic_ebm().early_stopping_rounds(usize::MAX))
+    let params = classic_with(classic_ebm().early_stopping(stopping(usize::MAX)))
         .build()
         .unwrap();
     let model = train(&params, &dtrain, 2).unwrap();
@@ -645,7 +693,7 @@ fn an_oversized_early_stopping_patience_just_never_stops() {
 #[test]
 fn early_stopping_ends_every_bag_at_its_best_round() {
     let (_, dtrain) = data(600, 11);
-    let params = classic_with(classic_ebm().early_stopping_rounds(5))
+    let params = classic_with(classic_ebm().early_stopping(stopping(5)))
         .eta(0.3)
         .build()
         .unwrap();

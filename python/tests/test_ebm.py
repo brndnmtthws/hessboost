@@ -135,3 +135,15 @@ def test_sglb_and_virtual_ensembles_are_refused() -> None:
     booster = hessboost.train(CLASSIC, dtrain, 10)
     with pytest.raises(hessboost.HessboostError, match="EBM"):
         booster.predict_virtual_ensembles(x, 2)
+
+
+def test_early_stopping_rounds_zero_is_off() -> None:
+    x, y = data(200, 3)
+    dtrain = hessboost.DMatrix(x, label=y)
+    off = hessboost.train({**CLASSIC, "ebm_early_stopping_rounds": 0}, dtrain, 5)
+    plain = hessboost.train(CLASSIC, dtrain, 5)
+    np.testing.assert_array_equal(off.predict(x), plain.predict(x))
+    with pytest.raises(hessboost.HessboostError, match="ebm_early_stopping_tolerance"):
+        hessboost.train({**CLASSIC, "ebm_early_stopping_tolerance": 0.01}, dtrain, 5)
+    stopped = {**CLASSIC, "ebm_bag_fraction": 0.8, "ebm_early_stopping_rounds": 2}
+    hessboost.train({**stopped, "ebm_early_stopping_tolerance": 0.01}, dtrain, 5)

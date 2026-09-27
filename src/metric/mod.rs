@@ -15,6 +15,24 @@ macro_rules! nan_unless_consistent {
     };
 }
 
+/// The [`Metric::eval`] and [`Metric::eval_info`] of a `CellMetric`. Defined before the
+/// submodules so their metrics can use it too.
+macro_rules! cell_metric_eval {
+    () => {
+        fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+            $crate::metric::CellMetric::eval_cells(
+                self,
+                preds,
+                labels,
+                weights.map($crate::simd::RowWeights::from),
+            )
+        }
+        fn eval_info(&self, preds: &[f32], info: &$crate::data::MetaInfo) -> f64 {
+            $crate::metric::eval_cells_info(self, preds, info)
+        }
+    };
+}
+
 mod distributional;
 mod elementwise;
 mod quantile;
@@ -31,6 +49,7 @@ use crate::data::MetaInfo;
 use crate::error::{HessboostError, Result};
 use crate::objective::distributional::DistFamily;
 use crate::objective::{Aft, AftDistribution, Expectiles, PseudoHuber, Quantiles, Tweedie};
+use crate::simd::RowWeights;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
@@ -129,24 +148,43 @@ fn consistent(preds: &[f32], labels: &[f32], weights: Option<&[f32]>, width: usi
         && weights.is_none_or(|w| w.len() == labels.len())
 }
 
+/// A built-in elementwise metric: a weighted reduction over `[row][target]`
+/// cells, one prediction per cell, whose weights are read through
+/// [`RowWeights`] so a label matrix never materializes its repeated row
+/// weights. [`CustomMetric`] and other external metrics keep the
+/// materializing default [`Metric::eval_info`].
+trait CellMetric: Metric {
+    /// The metric over cells: NaN unless `preds` holds one value per label
+    /// and `weights`, when given, cover exactly the labels.
+    fn eval_cells(&self, preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_>>) -> f64;
+}
+
+/// Whether `preds` holds one value per label and `weights`, when given,
+/// cover exactly the labels: [`consistent`] for [`CellMetric::eval_cells`].
+fn cells_consistent(preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_>>) -> bool {
+    preds.len() == labels.len() && weights.is_none_or(|w| w.cells() == Some(labels.len()))
+}
+
+/// [`Metric::eval_info`] of a [`CellMetric`]: the default elementwise
+/// reduction, with each row's weight read for its `n_targets` cells in
+/// place instead of repeated into a cell-weight buffer.
+fn eval_cells_info(metric: &impl CellMetric, preds: &[f32], info: &MetaInfo) -> f64 {
+    let stride = info.n_targets;
+    if info.check_layout().is_err()
+        || (stride > 1 && info.n_rows.checked_mul(stride) != Some(info.labels.len()))
+    {
+        return f64::NAN;
+    }
+    let weights = info.weights.map(|w| RowWeights::new(w, stride));
+    metric.eval_cells(preds, info.labels, weights)
+}
+
 /// Normalize a metric total, returning zero for an empty or nonpositive weight sum.
 #[inline]
 fn weighted_mean((total, weight): (f64, f64)) -> f64 {
     if weight > 0.0 { total / weight } else { 0.0 }
 }
 
-/// Define a purely-pointwise metric from its SIMD weighted-sum kernel.
-/// Generates the metric struct plus its [`Metric`] impl from the metric name
-/// and the `crate::simd` kernel path; `eval` is
-/// `weighted_mean(kernel(preds, labels, weights))`, NaN for inconsistent
-/// lengths. Metrics with metric-level state take a `field: Type` arm and
-/// pass `self.field` as the kernel's final argument; `rmse` takes `=> sqrt`
-/// for its root. A trailing `per_label` on the `field` arm marks a metric
-/// reading `self.field` predictions per label (the multiclass metrics: one
-/// probability per class, one class id per row, so no label matrices). All
-/// generated metrics minimize (`maximize` keeps its default `false`);
-/// metrics with non-trivial logic (`auc`, `aucpr`, ranking) stay
-/// handwritten below.
 /// [`Metric::validate_info`]'s default: the metric named `name` reads
 /// ordinary labels, which a dataset with rows must carry.
 fn require_labels(name: &str, info: &MetaInfo) -> Result<()> {
@@ -168,6 +206,17 @@ fn first_non_class(labels: &[f32], num_class: usize) -> Option<f32> {
         .find(|&label| !(label >= 0.0 && label.fract() == 0.0 && (label as usize) < num_class))
 }
 
+/// Define a purely-pointwise metric from its SIMD weighted-sum kernel.
+/// Generates the metric struct plus its [`Metric`] impl from the metric name
+/// and the `crate::simd` kernel path. The plain arm is a [`CellMetric`]
+/// whose `eval_cells` is `weighted_mean(kernel(preds, labels, weights))`,
+/// NaN for inconsistent lengths; `rmse` takes `=> sqrt` for its root. The
+/// `field: Type, …, per_label` arm is a metric reading `self.field`
+/// predictions per label and passing `self.field` as the kernel's final
+/// argument (the multiclass metrics: one probability per class, one class
+/// id per row, so no label matrices). All generated metrics minimize
+/// (`maximize` keeps its default `false`); metrics with non-trivial logic
+/// (`auc`, `aucpr`, ranking) stay handwritten below.
 macro_rules! simple_metric {
     ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path $(=> $root:ident)?) => {
         $(#[$m])*
@@ -178,25 +227,19 @@ macro_rules! simple_metric {
             fn name(&self) -> &str {
                 $name
             }
-            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-                nan_unless_consistent!(preds, labels, weights, 1);
+            cell_metric_eval!();
+        }
+        impl CellMetric for $ty {
+            fn eval_cells(
+                &self,
+                preds: &[f32],
+                labels: &[f32],
+                weights: Option<RowWeights<'_>>,
+            ) -> f64 {
+                if !cells_consistent(preds, labels, weights) {
+                    return f64::NAN;
+                }
                 weighted_mean($simd(preds, labels, weights))$(.$root())?
-            }
-        }
-    };
-    ($(#[$m:meta])* $ty:ident, $name:literal, $field:ident: $field_ty:ty, $simd:path) => {
-        $(#[$m])*
-        #[derive(Debug, Clone, Copy)]
-        pub(crate) struct $ty {
-            $field: $field_ty,
-        }
-        impl Metric for $ty {
-            fn name(&self) -> &str {
-                $name
-            }
-            fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-                nan_unless_consistent!(preds, labels, weights, 1);
-                weighted_mean($simd(preds, labels, weights, self.$field))
             }
         }
     };
@@ -416,8 +459,14 @@ impl Metric for TweedieNLogLik {
     fn name(&self) -> &str {
         &self.name
     }
-    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
-        nan_unless_consistent!(preds, labels, weights, 1);
+    cell_metric_eval!();
+}
+
+impl CellMetric for TweedieNLogLik {
+    fn eval_cells(&self, preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_>>) -> f64 {
+        if !cells_consistent(preds, labels, weights) {
+            return f64::NAN;
+        }
         weighted_mean(crate::simd::tweedie_nloglik_sum(
             preds, labels, weights, self.rho,
         ))
@@ -1499,6 +1548,43 @@ mod tests {
             (6.0f64 / 6.0).sqrt(),
             epsilon = 1e-12
         );
+    }
+
+    /// The strided row weights of a label matrix give exactly the value of
+    /// the metric over the materialized cell weights.
+    #[test]
+    fn label_matrix_row_weights_match_repeated_cell_weights_bit_for_bit() {
+        let (n_rows, n_targets) = (1_367, 3);
+        let cells = n_rows * n_targets;
+        let preds: Vec<f32> = (0..cells).map(|i| 0.05 + (i % 97) as f32 * 0.009).collect();
+        let labels: Vec<f32> = (0..cells)
+            .map(|i| ((i * 7) % 5) as f32 * 0.25 + 0.125)
+            .collect();
+        let weights: Vec<f32> = (0..n_rows).map(|i| 0.5 + (i % 13) as f32 * 0.125).collect();
+        let info = MetaInfo {
+            n_rows,
+            n_targets,
+            ..MetaInfo::new(&labels, Some(&weights), None)
+        };
+        let cell_weights = info.cell_weights().unwrap().unwrap();
+        let metrics: [Box<dyn Metric>; 10] = [
+            Box::new(Rmse),
+            Box::new(Mae),
+            Box::new(LogLoss),
+            Box::new(ErrorRate),
+            Box::new(PoissonNLogLik),
+            Box::new(GammaNLogLik),
+            Box::new(TweedieNLogLik::new(1.5)),
+            Box::new(Rmsle),
+            Box::new(Mape),
+            Box::new(PseudoHuberError::new(1.0)),
+        ];
+        for metric in metrics {
+            let strided = metric.eval_info(&preds, &info);
+            let repeated = metric.eval(&preds, &labels, Some(&cell_weights));
+            assert!(strided.is_finite(), "{}", metric.name());
+            assert_eq!(strided.to_bits(), repeated.to_bits(), "{}", metric.name());
+        }
     }
 
     /// Multi-label AUC / AUCPR is the plain mean of the per-target values.

@@ -305,16 +305,59 @@ fn shap_denominator(alpha: f32, u: f32) -> f32 {
 #[inline]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn gradient_gate(preds: &[f32], labels: &[f32], weights: Option<&[f32]>, out: &[GradPair]) -> bool {
-    metric_gate(preds, labels, weights) && out.len() >= preds.len()
+    metric_gate(preds, labels, weights.map(RowWeights::from)) && out.len() >= preds.len()
 }
 
 /// Whether a metric-sum kernel may take the vector path: at least
 /// `MIN_SIMD_LEN` predictions, with labels and weights covering them.
 #[inline]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn metric_gate(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> bool {
+fn metric_gate(preds: &[f32], labels: &[f32], weights: Option<RowWeights<'_>>) -> bool {
     let len = preds.len();
-    len >= MIN_SIMD_LEN && labels.len() >= len && weights.is_none_or(|values| values.len() >= len)
+    len >= MIN_SIMD_LEN
+        && labels.len() >= len
+        && weights.is_none_or(|weights| weights.cells().is_some_and(|cells| cells >= len))
+}
+
+/// Row weights of a `[row][target]` cell layout: cell `i` has weight
+/// `values[i / stride]`, so the metric sums read each row's weight for its
+/// `stride` cells without materializing the repeated weights. A stride of
+/// one is one weight per cell.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowWeights<'a> {
+    values: &'a [f32],
+    stride: usize,
+}
+
+impl<'a> RowWeights<'a> {
+    /// `values` repeated for `stride` (positive) consecutive cells each.
+    pub(crate) fn new(values: &'a [f32], stride: usize) -> Self {
+        debug_assert!(stride > 0, "row weight stride must be positive");
+        RowWeights { values, stride }
+    }
+
+    /// The weight of cell `cell`.
+    #[inline]
+    pub(crate) fn get(self, cell: usize) -> f32 {
+        if self.stride == 1 {
+            self.values[cell]
+        } else {
+            self.values[cell / self.stride]
+        }
+    }
+
+    /// The number of cells the weights cover, `None` on overflow.
+    #[inline]
+    pub(crate) fn cells(self) -> Option<usize> {
+        self.values.len().checked_mul(self.stride)
+    }
+}
+
+impl<'a> From<&'a [f32]> for RowWeights<'a> {
+    /// One weight per cell.
+    fn from(values: &'a [f32]) -> Self {
+        Self::new(values, 1)
+    }
 }
 
 /// Whether `labels` (and `weights`, if any) index complete `num_class` rows
@@ -548,7 +591,7 @@ pub(super) fn softmax_gradient_row_scalar(
 pub(crate) fn squared_error_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     distance_sum::<true>(preds, labels, weights)
 }
@@ -556,7 +599,7 @@ pub(crate) fn squared_error_sum(
 pub(crate) fn absolute_error_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     distance_sum::<false>(preds, labels, weights)
 }
@@ -564,7 +607,7 @@ pub(crate) fn absolute_error_sum(
 fn distance_sum<const SQUARED: bool>(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     dispatch_gradient!(
         metric_gate(preds, labels, weights),
@@ -577,7 +620,7 @@ fn distance_sum<const SQUARED: bool>(
 pub(crate) fn classification_error_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     dispatch_gradient!(
         metric_gate(preds, labels, weights),
@@ -587,7 +630,11 @@ pub(crate) fn classification_error_sum(
     scalar::classification_error_sum(preds, labels, weights, 0..preds.len())
 }
 
-pub(crate) fn log_loss_sum(preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> (f64, f64) {
+pub(crate) fn log_loss_sum(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<RowWeights<'_>>,
+) -> (f64, f64) {
     dispatch_gradient!(
         metric_gate(preds, labels, weights),
         aarch64::log_loss_sum(preds, labels, weights)
@@ -599,7 +646,7 @@ pub(crate) fn log_loss_sum(preds: &[f32], labels: &[f32], weights: Option<&[f32]
 pub(crate) fn positive_nloglik_sum<const GAMMA: bool>(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
 ) -> (f64, f64) {
     dispatch_gradient!(
         metric_gate(preds, labels, weights),
@@ -612,7 +659,7 @@ pub(crate) fn positive_nloglik_sum<const GAMMA: bool>(
 pub(crate) fn tweedie_nloglik_sum(
     preds: &[f32],
     labels: &[f32],
-    weights: Option<&[f32]>,
+    weights: Option<RowWeights<'_>>,
     rho: f64,
 ) -> (f64, f64) {
     dispatch_gradient!(

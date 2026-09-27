@@ -1,10 +1,10 @@
 # hessboost for Python
 
-**XGBoost's gradient boosting, reimplemented in Rust**, with XGBoost's
+**Fast, deterministic gradient boosting in Rust**, with an XGBoost-compatible
 Python API: `DMatrix`, `train`, `cv`, `Booster`, and scikit-learn
-estimators. hessboost takes XGBoost's parameter names, reproduces XGBoost
-3.4.2's predictions (checked against XGBoost in CI), and reads and writes
-XGBoost JSON and UBJSON model files.
+estimators. hessboost accepts standard parameter names, reproduces
+deterministic model predictions, and supports bidirectional XGBoost JSON
+and UBJSON model interchange.
 
 - **Strict.** An unknown parameter, a value of the wrong type or range, or
   a combination hessboost does not implement raises an error; nothing is
@@ -13,7 +13,7 @@ XGBoost JSON and UBJSON model files.
   model at any `nthread`.
 - **Typed** (`py.typed`, complete type information), with the GIL released
   while training and predicting, and free-threaded CPython supported.
-- **More than XGBoost, opt-in.** Conformal prediction intervals,
+- **Modern modeling (opt-in).** Conformal prediction intervals,
   confidence intervals for the regression function (Boulevard boosting),
   distributional boosting (a predictive distribution per row), LightGBM/CatBoost
   tree options, class-balanced binary bagging, and XE-NDCG ranking

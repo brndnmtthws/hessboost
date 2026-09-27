@@ -19,7 +19,7 @@
 //!   `max_bin` entries. Used by `approx`, whose weights are the current
 //!   Hessians.
 
-use super::quantile::{RadixScratch, radix_sort, sort_key, unsort_key};
+use super::sort::{RadixScratch, radix_sort, sort_key, unsort_key};
 
 /// One summary entry (`WQSummary::Entry`): a value with its rank interval
 /// `[rmin, rmax]` and the weight `wmin` of the value itself.

@@ -117,10 +117,14 @@
 //! Fitting refuses data without labels, instance weights, base margins,
 //! ranking groups, label bounds, or feature weights; an objective other than
 //! `reg:squarederror` or a refresh (`process_type = update`) in the GBDT
-//! parameters; residualization with fewer than 80 rows; and
-//! non-positive or non-finite process parameters. Sampling refuses a matrix
-//! whose feature count differs from the training data's, or one with base
-//! margins.
+//! parameters (which also rules out class-balanced and query-level
+//! bagging, since they need a `binary:*` or `rank:*` objective);
+//! residualization with fewer than 80 rows; and non-positive or non-finite
+//! process parameters. `booster = boulevard` and `booster = ebm` train one
+//! label column without early stopping, so their training refuses vector
+//! labels and the early-stopping presets (set `early_stopping` to `None`).
+//! Sampling refuses a matrix whose feature count differs from the training
+//! data's, or one with base margins.
 //!
 //! # Sources
 //!

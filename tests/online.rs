@@ -660,3 +660,98 @@ fn updates_run_on_the_configured_threads() {
         assert_eq!(seen, vec![1; 3]);
     });
 }
+
+/// A changed row may reach a split that no row of the cached data reached
+/// (a model resumed on other data, or a node of a regrown subtree the rows
+/// route around): its histogram is all zero, and the update proceeds.
+#[test]
+fn updates_reach_splits_the_cached_rows_never_did() {
+    let nan = f32::NAN;
+    let p = plain(2);
+    let full = rows(
+        &[nan, 0.0, nan, 1.0, 0.0, 0.0, 1.0, 1.0],
+        2,
+        &[0.0, 1.0, 10.0, 11.0],
+    );
+    let model = train(&p, &full, 1).unwrap();
+    let observed = rows(&[0.0, 0.0, 1.0, 1.0], 2, &[10.0, 11.0]);
+    let online = OnlineParams::approximate(1.0).unwrap();
+    let mut resumed = OnlineModel::from_model(model, &p, &observed, online).unwrap();
+    let missing = rows(&[nan, 0.0], 2, &[0.0]);
+    assert!(resumed.update(Some(&missing), &[]).is_ok());
+
+    let start = rows(
+        &[0.0, 0.0, 1.0, 1.0, nan, 0.0, nan, 1.0],
+        2,
+        &[0.0, 10.0, 1.0, 11.0],
+    );
+    let mut online_model = OnlineModel::train(&p, &start, 1, online).unwrap();
+    let replacement = rows(
+        &[1.0, 0.0, 1.0, 1.0, nan, 0.0, nan, 1.0],
+        2,
+        &[0.0, 1.0, 10.0, 11.0],
+    );
+    online_model
+        .update(Some(&replacement), &[0, 1, 2, 3])
+        .unwrap();
+    assert!(
+        online_model
+            .update(Some(&rows(&[0.0, 0.0], 2, &[0.0])), &[])
+            .is_ok()
+    );
+    assert_eq!(online_model.data().n_rows(), 5);
+}
+
+/// The approximate mode keeps the training bins, so it refuses an added
+/// value at or above a feature's top cut (it would be ranked in the last
+/// bin but predicted right of a split there); the exact mode, which
+/// retrains, accepts it, as it does values inside the bins.
+#[test]
+fn approximate_updates_refuse_values_beyond_the_training_bins() {
+    let nan = f32::NAN;
+    let mut p = plain(1);
+    p.min_child_weight = 2.0;
+    let d = rows(&[0.0, 1.0, nan, nan], 1, &[0.0, 0.0, 1.0, 1.0]);
+    let beyond = rows(&[3.0], 1, &[0.0]);
+    let mut approximate =
+        OnlineModel::train(&p, &d, 1, OnlineParams::approximate(1.0).unwrap()).unwrap();
+    let before = approximate.model().clone();
+    assert_eq!(
+        invalid_param(approximate.update(Some(&beyond), &[0])),
+        "additions"
+    );
+    assert_eq!(approximate.model().trees(), before.trees());
+    assert_eq!(approximate.data().n_rows(), 4);
+    assert!(
+        approximate
+            .update(Some(&rows(&[0.5], 1, &[0.0])), &[0])
+            .is_ok()
+    );
+    let mut exact = OnlineModel::train(&p, &d, 1, OnlineParams::exact()).unwrap();
+    exact.update(Some(&beyond), &[0]).unwrap();
+    assert_eq!(
+        exact.model().trees(),
+        train(&p, exact.data(), 1).unwrap().trees()
+    );
+}
+
+/// An update whose arithmetic overflows `f32` is refused, as training
+/// refuses the model it would produce, and changes nothing.
+#[test]
+fn updates_that_overflow_are_refused_and_change_nothing() {
+    let max = f32::MAX;
+    let p = TrainingParams::builder()
+        .tree_method(TreeMethod::Hist)
+        .base_score(f64::from(max))
+        .build()
+        .unwrap();
+    let mut online =
+        OnlineModel::train(&p, &rows(&[0.0], 1, &[max]), 2, OnlineParams::default()).unwrap();
+    let before = online.model().clone();
+    let err = online
+        .update(Some(&rows(&[0.0], 1, &[-max])), &[])
+        .unwrap_err();
+    assert!(matches!(err, HessboostError::ModelFormat(_)), "{err}");
+    assert_eq!(online.model().trees(), before.trees());
+    assert_eq!(online.data().n_rows(), 1);
+}

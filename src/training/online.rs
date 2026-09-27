@@ -31,7 +31,8 @@
 //! keeps the gradient cached for it, since its margin only drifts by the
 //! (small) changes of the leaf weights it reaches. The histogram's bin
 //! boundaries and the model's intercept stay those of the original
-//! training.
+//! training, so an added value at or above a feature's top bin boundary
+//! (beyond the training data's range) is refused in this mode.
 //!
 //! # Exactness
 //!
@@ -124,8 +125,8 @@ use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 
 use super::train::{
-    RoundEval, Trainer, configured_metrics, initial_intercepts, validate_training_data,
-    with_thread_pool,
+    RoundEval, Trainer, configured_metrics, initial_intercepts, validate_trained_model,
+    validate_training_data, with_thread_pool,
 };
 use crate::config::{
     BoosterKind, Device, GrowPolicy, ProcessType, SamplingMethod, TrainingParams, TreeMethod,
@@ -393,9 +394,12 @@ impl OnlineModel {
     ///
     /// [`HessboostError::InvalidParameter`] for out-of-range or repeated
     /// deletions, deleting every row, additions without labels or with
-    /// metadata, or of another shape; whatever training refuses on the
+    /// metadata, or of another shape, and (approximate mode) added values
+    /// beyond the training data's bins; whatever training refuses on the
     /// updated data (such as labels outside the objective's domain), checked
-    /// before anything changes; the errors of training.
+    /// before anything changes; [`HessboostError::ModelFormat`] for an
+    /// update whose arithmetic overflows `f32`, as training refuses such a
+    /// model; the errors of training.
     pub fn update(
         &mut self,
         additions: Option<&DMatrix>,
@@ -494,7 +498,12 @@ impl OnlineModel {
                 ControlFlow::Break(()) => Err(interrupted()),
             });
         let (trees, report) = outcome?;
-        self.model = self.model.with_trees(trees);
+        // Arithmetic that overflows `f32` (extreme labels or margins) leaves
+        // non-finite leaves the model formats refuse: refuse the update, as
+        // training refuses such a model, before anything changes.
+        let model = self.model.with_trees(trees);
+        validate_trained_model(&model)?;
+        self.model = model;
         self.data = updated;
         self.cache = Some(cache);
         Ok(report)
@@ -559,9 +568,41 @@ impl OnlineModel {
                     "added rows need the training data's columns and feature types",
                 ));
             }
+            if let Some(cache) = &self.cache {
+                check_within_cuts(&cache.cuts, a)?;
+            }
         }
         Ok(deleted)
     }
+}
+
+/// Refuse an added value at or above its feature's top cut. The approximate
+/// mode keeps the original training's bins, whose last bin ends at that cut:
+/// a value past it would count in the last bin of the histograms that rank
+/// splits while prediction routes it right of a split at the top cut, so
+/// the ranked and the actual children would differ.
+fn check_within_cuts(cuts: &HistCuts, additions: &DMatrix) -> Result<()> {
+    let mut outside = None;
+    for row in 0..additions.n_rows() {
+        additions.for_row_entry(row, |c, v| {
+            let (start, end) = cuts.feature_bins(c as usize);
+            if outside.is_none() && (end == start || v >= cuts.cut_value(end - 1)) {
+                outside = Some((row, c, v));
+            }
+        });
+        if let Some((row, c, v)) = outside {
+            return Err(HessboostError::invalid_param(
+                "additions",
+                format!(
+                    "added row {row} has feature {c} = {v}, beyond the training data's bins, \
+                     which the approximate mode keeps fixed; use the exact mode (`OnlineParams::exact`, \
+                     Python `tolerance=0`), \
+                     or rebuild the state on data covering it with `OnlineModel::from_model`"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn interrupted() -> HessboostError {
@@ -1064,6 +1105,12 @@ impl TreeUpdate<'_> {
         while let Some((old_id, new_id, depth, deltas)) = queue.pop_front() {
             let old = *self.old_tree.node(old_id);
             let mut cache = std::mem::take(&mut old_nodes[old_id]);
+            // A split no row of the cached data reached has no histogram
+            // yet (a model resumed on other data, or a regrown node the
+            // rows route around): its sums are all zero.
+            if !old.is_leaf() && !deltas.is_empty() && cache.hist.is_empty() {
+                cache.hist = vec![GradStats::default(); self.cuts.total_bins()];
+            }
             for d in &deltas {
                 cache.stats.add(d.g);
                 if !old.is_leaf() {

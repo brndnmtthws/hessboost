@@ -86,7 +86,7 @@ pub(crate) fn import_lightgbm_text(text: &str) -> Result<BoostedModel> {
         Vec::new(),
         vec![0.0; n_outputs],
         ModelSpec {
-            objective: ModelObjective::BuiltIn(objective.objective),
+            objective: ModelObjective::trained_with(&objective.objective),
             max_delta_step: objective.max_delta_step,
             num_class: objective.num_class,
             n_outputs,

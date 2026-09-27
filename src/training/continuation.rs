@@ -42,6 +42,40 @@ pub(super) fn resume_model(
         };
         HessboostError::model_format(format!("invalid init model: {reason}"))
     })?;
+    // CatBoost refuses model shrinkage with learning continuation
+    // (`AdjustPosteriorSamplingDeafultValues`, `DropModelShrinkageIfBaselineUsed`
+    // in `catboost/libs/train_lib/options_helper.cpp`): the continued run's
+    // coefficients would rescale a model whose margins it did not cache.
+    if init.shrinkage().is_some() || params.model_shrinkage_on() {
+        return Err(HessboostError::invalid_param(
+            "model_shrink_rate",
+            if init.shrinkage().is_some() {
+                "a model trained with model shrinkage cannot be trained further"
+            } else {
+                "model shrinkage is not supported with continued training"
+            },
+        ));
+    }
+    // A Boulevard model averages all of its rounds (its leaves carry the
+    // `1/B` of the run), so appending or refreshing rounds, with any
+    // booster, would not give a Boulevard average; nor can Boulevard
+    // continue another model's sum.
+    if matches!(params.booster, BoosterKind::Boulevard(_)) || init.boulevard().is_some() {
+        return Err(HessboostError::invalid_param(
+            "init_model",
+            "Boulevard models average every round of one run and cannot be trained further, \
+             and `booster = boulevard` cannot continue another model",
+        ));
+    }
+    // An EBM's record assigns every tree to a term of one run; appended
+    // trees would belong to none, and a sum cannot continue into terms.
+    if matches!(params.booster, BoosterKind::Ebm(_)) || init.ebm().is_some() {
+        return Err(HessboostError::invalid_param(
+            "init_model",
+            "EBMs are boosted term by term in one run and cannot be trained further, and \
+             `booster = ebm` cannot continue another model",
+        ));
+    }
     let is_linear = init.linear().is_some();
     if is_linear != (params.booster == BoosterKind::GbLinear) {
         return Err(HessboostError::invalid_param(

@@ -105,16 +105,7 @@ pub trait Metric: Send + Sync {
     /// [`HessboostError::InvalidParameter`] naming `eval_metric`, with a
     /// reason mentioning "dataset" (training names the dataset there).
     fn validate_info(&self, info: &MetaInfo) -> Result<()> {
-        if info.n_rows > 0 && info.labels.is_empty() {
-            return Err(HessboostError::invalid_param(
-                "eval_metric",
-                format!(
-                    "metric `{}` needs labels, but dataset has none",
-                    self.name()
-                ),
-            ));
-        }
-        Ok(())
+        require_labels(self.name(), info)
     }
 
     /// Predictions per row (`[row][output]`) that [`Metric::eval_info`]
@@ -156,6 +147,27 @@ fn weighted_mean((total, weight): (f64, f64)) -> f64 {
 /// generated metrics minimize (`maximize` keeps its default `false`);
 /// metrics with non-trivial logic (`auc`, `aucpr`, ranking) stay
 /// handwritten below.
+/// [`Metric::validate_info`]'s default: the metric named `name` reads
+/// ordinary labels, which a dataset with rows must carry.
+fn require_labels(name: &str, info: &MetaInfo) -> Result<()> {
+    if info.n_rows > 0 && info.labels.is_empty() {
+        return Err(HessboostError::invalid_param(
+            "eval_metric",
+            format!("metric `{name}` needs labels, but dataset has none"),
+        ));
+    }
+    Ok(())
+}
+
+/// The first label that is not a class index in `0..num_class` (XGBoost's
+/// `MultiClassEvaluation` label check), if any.
+fn first_non_class(labels: &[f32], num_class: usize) -> Option<f32> {
+    labels
+        .iter()
+        .copied()
+        .find(|&label| !(label >= 0.0 && label.fract() == 0.0 && (label as usize) < num_class))
+}
+
 macro_rules! simple_metric {
     ($(#[$m:meta])* $ty:ident, $name:literal, $simd:path $(=> $root:ident)?) => {
         $(#[$m])*
@@ -201,7 +213,25 @@ macro_rules! simple_metric {
             }
             fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
                 nan_unless_consistent!(preds, labels, weights, self.$field);
+                if first_non_class(labels, self.$field).is_some() {
+                    return f64::NAN;
+                }
                 weighted_mean($simd(preds, labels, weights, self.$field))
+            }
+            fn validate_info(&self, info: &MetaInfo) -> Result<()> {
+                require_labels(self.name(), info)?;
+                match first_non_class(info.labels, self.$field) {
+                    None => Ok(()),
+                    Some(label) => Err(HessboostError::invalid_param(
+                        "eval_metric",
+                        format!(
+                            "metric `{}` reads labels as class indices in 0..{}, but dataset \
+                             has label {label}",
+                            self.name(),
+                            self.$field
+                        ),
+                    )),
+                }
             }
             fn supports_label_matrix(&self) -> bool {
                 false
@@ -952,6 +982,20 @@ fn cutoff_name(base: &str, k: Option<usize>) -> String {
 }
 
 impl EvalMetric {
+    /// The metric's spelling in XGBoost's flat `eval_metric`, which
+    /// [`TrainingParams::from_xgboost`](crate::config::TrainingParams::from_xgboost)
+    /// reads back to the same metric: [`name`](Self::name), except that a
+    /// Tweedie power is written in full rather than rounded to the six
+    /// digits of its `evals_result` key.
+    pub(crate) fn flat_name(&self) -> Cow<'static, str> {
+        match self {
+            EvalMetric::TweedieNLogLik(tweedie) => {
+                Cow::Owned(format!("tweedie-nloglik@{}", tweedie.variance_power()))
+            }
+            _ => self.name(),
+        }
+    }
+
     /// XGBoost's `evals_result` key: the metric's name with its suffix
     /// (`ndcg@5`, `tweedie-nloglik@1.5`), as
     /// [`Metric::name`] of the built metric reports it.
@@ -1402,6 +1446,29 @@ mod tests {
             let built = metric.build(4).unwrap();
             let info = MetaInfo::new(&[0.0], None, None);
             assert_eq!(built.prediction_width(&info), Some(4));
+        }
+    }
+
+    /// The class-index metrics read `labels` as classes of the model's
+    /// outputs: anything else (out of range, negative, fractional, NaN) is
+    /// refused by `validate_info` and evaluates to NaN, never indexing past
+    /// the row.
+    #[test]
+    fn class_index_metrics_refuse_labels_outside_the_classes() {
+        for metric in [EvalMetric::MLogLoss, EvalMetric::MError] {
+            let built = metric.build(3).unwrap();
+            for label in [3.0, 10.0, -1.0, 0.5, f32::NAN] {
+                let labels = [0.0, label];
+                let info = MetaInfo::new(&labels, None, None);
+                assert!(built.validate_info(&info).is_err(), "{metric:?} {label}");
+                let preds = [0.2, 0.3, 0.5, 0.2, 0.3, 0.5];
+                assert!(
+                    built.eval(&preds, &labels, None).is_nan(),
+                    "{metric:?} {label}"
+                );
+            }
+            let info = MetaInfo::new(&[0.0, 2.0], None, None);
+            assert!(built.validate_info(&info).is_ok(), "{metric:?}");
         }
     }
 

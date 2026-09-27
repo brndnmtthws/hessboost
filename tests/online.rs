@@ -5,9 +5,12 @@
 
 use std::ops::ControlFlow;
 
-use hessboost::config::{BoosterKind, Dart, GrowPolicy};
+use hessboost::config::{
+    BalancedBagging, BoosterKind, Dart, GrowPolicy, Langevin, ModelShrink, ModelShrinkMode,
+    QueryBagging,
+};
 use hessboost::data::FeatureType;
-use hessboost::objective::{CustomLoss, GradPair, Logistic, Objective};
+use hessboost::objective::{CustomLoss, GradPair, LambdaRank, Logistic, Objective};
 use hessboost::prelude::*;
 use hessboost::training::RoundEval;
 use hessboost::training::online::{OnlineModel, OnlineParams};
@@ -266,6 +269,20 @@ fn unsound_configurations_and_changes_are_refused() {
                 .unwrap(),
             "objective",
         ),
+        // SGLB draws fresh noise for every row each round, and model
+        // shrinkage rescales every earlier tree: neither replays in place.
+        (
+            base().langevin(Langevin::default()).build().unwrap(),
+            "params",
+        ),
+        (
+            base()
+                .model_shrink(ModelShrink::new(0.1, ModelShrinkMode::Constant).unwrap())
+                .build()
+                .unwrap(),
+            "params",
+        ),
+        (base().posterior_sampling(true).build().unwrap(), "params"),
     ] {
         assert_eq!(
             invalid_param(OnlineModel::train(&params, &train_data, 3, online)),
@@ -309,6 +326,50 @@ fn unsound_configurations_and_changes_are_refused() {
     assert_eq!(invalid_param(model.update(Some(&narrow), &[])), "additions");
 }
 
+/// LightGBM's class-balanced and query-level bagging draw a fresh per-class
+/// or per-query row sample every round, which an in-place update cannot
+/// replay: both are refused by `train` and `from_model` at either
+/// tolerance, in otherwise valid configurations (a `binary:*` objective for
+/// the first; `rank:*` with query groups for the second).
+#[test]
+fn row_bagging_is_refused() {
+    let balanced = TrainingParams::builder()
+        .objective(logistic())
+        .tree_method(TreeMethod::Hist)
+        .max_depth(3)
+        .balanced_bagging(BalancedBagging::new(0.5, 0.8).unwrap())
+        .build()
+        .unwrap();
+    let binary = data(200, 9, true);
+    let ranking = TrainingParams::builder()
+        .objective(Objective::RankPairwise(LambdaRank::default()))
+        .tree_method(TreeMethod::Hist)
+        .max_depth(3)
+        .bagging_by_query(QueryBagging::new(0.5).unwrap())
+        .build()
+        .unwrap();
+    let queries = data(200, 9, true).with_group_sizes(&[50; 4]).unwrap();
+    // Both configurations train normally.
+    assert!(train(&balanced, &binary, 3).is_ok());
+    assert!(train(&ranking, &queries, 3).is_ok());
+    let model = train(&params(logistic()), &binary, 3).unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        for (p, d) in [(&balanced, &binary), (&ranking, &queries)] {
+            assert_eq!(
+                invalid_param(OnlineModel::train(p, d, 3, online)),
+                "params",
+                "train, tolerance {tolerance}"
+            );
+            assert_eq!(
+                invalid_param(OnlineModel::from_model(model.clone(), p, d, online)),
+                "params",
+                "from_model, tolerance {tolerance}"
+            );
+        }
+    }
+}
+
 /// Models whose trees updates cannot replay are refused: linear leaves
 /// (an imported LightGBM `linear_tree` model) have no Newton-step leaf to
 /// recompute.
@@ -340,6 +401,24 @@ fn from_model_refuses_linear_leaves() {
     }
 }
 
+/// A model trained with model shrinkage is refused even under plain
+/// parameters: every round rescaled the trees before it, so updating one
+/// node's subtree cannot reproduce a retrain.
+#[test]
+fn from_model_refuses_shrunk_models() {
+    let data = data(200, 5, false);
+    let p = params(Objective::SquaredError);
+    let mut shrunk = p.clone();
+    shrunk.model_shrink = Some(ModelShrink::new(0.1, ModelShrinkMode::Constant).unwrap());
+    let model = train(&shrunk, &data, 3).unwrap();
+    for tolerance in [0.1, 0.0] {
+        let online = OnlineParams::with_tolerance(tolerance);
+        assert_eq!(
+            invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
+            "model"
+        );
+    }
+}
 /// A model with splits deeper than `max_depth` is not one `params` trained:
 /// regrowing below such a split would have no depth left.
 #[test]
@@ -356,5 +435,58 @@ fn from_model_refuses_trees_deeper_than_max_depth() {
             "model"
         );
         assert!(OnlineModel::from_model(model.clone(), &deeper, &d, online).is_ok());
+    }
+}
+
+/// An abandoned approximate update (a break from the hook, or a refused
+/// commit) restores the exact update state it started from, the fixed bins
+/// and lazily kept gradients of earlier updates included: later updates
+/// then equal those of a copy that never tried it.
+#[test]
+fn an_abandoned_update_keeps_the_update_state() {
+    let p = params(Objective::SquaredError);
+    let train_data = data(600, 13, false);
+    let (a, b, c) = (
+        data(30, 14, false),
+        data(20, 15, false),
+        data(25, 16, false),
+    );
+    for tolerance in [0.1, 0.0] {
+        let mut online =
+            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
+                .unwrap();
+        online.update(Some(&a), &[0, 5, 9]).unwrap();
+        let mut control = online.clone();
+        let stop = |round: &RoundEval| {
+            if round.iteration == 4 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        assert_eq!(
+            invalid_param(online.update_with(Some(&b), &[1, 2], stop)),
+            "on_round"
+        );
+        let refused = online.update_with_commit(
+            Some(&b),
+            &[1, 2],
+            |_| ControlFlow::Continue(()),
+            || ControlFlow::Break(()),
+        );
+        assert_eq!(invalid_param(refused), "on_round");
+        assert_eq!(
+            online.model().to_json().unwrap(),
+            control.model().to_json().unwrap()
+        );
+        for (additions, deletions) in [(Some(&c), vec![3, 7]), (None, vec![0, 1, 40])] {
+            let report = online.update(additions, &deletions).unwrap();
+            assert_eq!(report, control.update(additions, &deletions).unwrap());
+            assert_eq!(
+                online.model().to_json().unwrap(),
+                control.model().to_json().unwrap(),
+                "tolerance {tolerance}"
+            );
+        }
     }
 }

@@ -51,13 +51,16 @@
 //!   [`training::budget`], [`training::online`].
 //! - [`model`]: [`BoostedModel`] (prediction, SHAP, importance, slicing,
 //!   native and XGBoost JSON/UBJSON, LightGBM text import);
-//!   [`model::compact`].
+//!   [`model::compact`], [`model::uncertainty`].
 //! - [`objective`]: [`Objective`](objective::Objective) and its parameter
 //!   types, the `Loss` trait, `CustomLoss`, [`objective::distributional`]
 //!   (`dist:*` objectives).
 //! - [`metric`]: [`EvalMetric`](metric::EvalMetric) (the built-in metrics),
 //!   the `Metric` trait, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
+//! - [`inference`]: Boulevard boosting's confidence and prediction intervals
+//!   for `f(x)`, and a Boulevard EBM's shape-function bands.
+//! - [`ebm`]: explainable boosting machines' terms and shape functions.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
 //!
@@ -80,7 +83,7 @@
 //! - **Objectives** ([`Objective`](objective::Objective), each with its
 //!   parameters): regression (squared, squared-log, pseudo-Huber, smoothed
 //!   absolute, quantile/expectile lists), binary (logistic, logitraw, hinge)
-//!   and multiclass, counts, LambdaMART ranking, survival (`survival:cox`,
+//!   and multiclass, counts, LambdaMART and XE-NDCG ranking, survival (`survival:cox`,
 //!   `survival:aft` on censored bounds), plus custom losses
 //!   ([`Objective::Custom`](objective::Objective::Custom), e.g. a
 //!   [`CustomLoss`](objective::CustomLoss)).
@@ -116,12 +119,33 @@
 //! - **Beyond XGBoost (opt-in, default training unchanged):**
 //!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);
+//!   - Boulevard boosting (Zhou & Hooker, JMLR 2022) and its dropout
+//!     (BRAT-D) and parallel (BRAT-P) variants (Fang, Tan & Hooker, NeurIPS
+//!     2025) with CLT-based confidence intervals for `f(x)`, prediction and
+//!     reproduction intervals, an
+//!     honest leaf refit, and exact or Nyström variance
+//!     ([`BoosterKind::Boulevard`](config::BoosterKind::Boulevard),
+//!     [`inference`]);
+//!   - explainable boosting machines (GA²M: cyclic per-feature boosting,
+//!     early-stopped outer bags, FAST pair terms, numerical and categorical
+//!     terms; Lou et al., KDD 2012/2013, InterpretML)
+//!     with per-term shape functions, and their Boulevard variant (Fang, Tan,
+//!     Pipping & Hooker, AISTATS 2026) with confidence bands on every shape
+//!     ([`BoosterKind::Ebm`](config::BoosterKind::Ebm), [`ebm`],
+//!     [`EbmInference`](inference::EbmInference));
 //!   - CatBoost-style ordered target statistics ([`data::target_stats`]);
 //!   - LightGBM options `extra_trees`, `path_smooth`, `linear_tree` leaves
 //!     ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
 //!     [`path_smooth`](config::TrainingParams::path_smooth),
 //!     [`linear_tree`](config::TrainingParams::linear_tree),
 //!     [`LinearLeaves`](tree::LinearLeaves));
+//!   - LightGBM class-balanced bagging for binary classification
+//!     ([`BalancedBagging`](config::BalancedBagging): `pos_bagging_fraction`,
+//!     `neg_bagging_fraction`), in place of `subsample`;
+//!   - LightGBM XE-NDCG ranking
+//!     ([`Objective::RankXendcg`](objective::Objective::RankXendcg); its keyed
+//!     per-round draws differ from LightGBM's random stream) and query-level
+//!     bagging ([`QueryBagging`](config::QueryBagging), `bagging_by_query`);
 //!   - CatBoost-style symmetric trees
 //!     ([`GrowPolicy::Symmetric`](config::GrowPolicy::Symmetric)), routed by
 //!     bit pattern in batch prediction;
@@ -140,6 +164,14 @@
 //!     per-row distributions
 //!     ([`predict_distribution`](model::BoostedModel::predict_distribution),
 //!     [`objective::distributional`]), scored by `nll` / `crps`.
+//!   - CatBoost's Stochastic Gradient Langevin Boosting and model shrinkage
+//!     ([`langevin`](config::TrainingParams::langevin),
+//!     [`model_shrink`](config::TrainingParams::model_shrink),
+//!     [`posterior_sampling`](config::TrainingParams::posterior_sampling))
+//!     with virtual ensembles: knowledge, data, and total uncertainty from
+//!     one model's exactly rebuilt truncations
+//!     ([`predict_uncertainty`](model::BoostedModel::predict_uncertainty),
+//!     [`model::uncertainty`]);
 //!   - native Metal on macOS 10.15+ (`metal` feature): bit-identical GPU
 //!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~2.5x faster at
 //!     scale) and bit-identical GPU histograms
@@ -149,10 +181,12 @@
 //!     elsewhere [`backend::metal`] is a stub.
 //!
 //! `examples/` has one program per topic (`train_regression`,
-//! `binary_classification`, `multiclass`, `ranking`, `shap`, `model_io`,
-//! `custom_objective`, `constraints`, `conformal`, `compact_model`,
-//! `distributional`, `budget`, `online_update`, `ordered_target_stats`,
-//! `pfn_boost`, `metal` with `--features metal` on macOS). Run one with
+//! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
+//! `model_io`, `custom_objective`, `constraints`, `conformal`,
+//! `boulevard_inference`, `ebm`, `compact_model`, `distributional`,
+//! `virtual_ensembles`, `budget`, `balanced_bagging`, `online_update`,
+//! `ordered_target_stats`, `pfn_boost`, `metal` with `--features metal` on
+//! macOS). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -175,8 +209,9 @@
 //!   setting): gblinear uses `updater = coord_descent`
 //!   with `feature_selector = cyclic`; LambdaMART uses
 //!   `lambdarank_pair_method = topk` (no `lambdarank_unbiased` or
-//!   `ndcg_exp_gain`); DART has no `sample_type`, `normalize_type`, or
-//!   `one_drop`; categorical splits use XGBoost's defaults
+//!   `ndcg_exp_gain`); DART has no `sample_type` or `normalize_type` (it
+//!   samples uniformly and normalizes by `tree`); categorical splits use
+//!   XGBoost's defaults
 //!   `max_cat_to_onehot = 4` and `max_cat_threshold = 64`.
 //! - The metrics `gamma-deviance`, `error@t` (XGBoost's classification
 //!   threshold suffix), and the `-` variants of the ranking metrics
@@ -200,7 +235,9 @@ pub mod backend;
 pub mod config;
 pub mod conformal;
 pub mod data;
+pub mod ebm;
 pub mod error;
+pub mod inference;
 pub mod metric;
 pub mod model;
 pub mod objective;

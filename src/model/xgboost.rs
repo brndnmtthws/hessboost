@@ -145,7 +145,26 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     let n_trees = model.effective_num_trees();
     let per_iteration = model.trees_per_iteration();
 
-    let trees: Vec<Value> = model.trees()[..n_trees]
+    // A shrunk model's closed-form contribution weights go into its leaves
+    // (as CatBoost bakes its shrinkage), so XGBoost reads plain gbtree
+    // trees. A sum of trees cannot repeat training's per-iteration
+    // rounding, so the exported margins match within `f32` rounding.
+    let baked: Vec<RegTree>;
+    let exported = if model.shrinkage().is_some() {
+        baked = model.trees()[..n_trees]
+            .iter()
+            .enumerate()
+            .map(|(t, tree)| {
+                let mut tree = tree.clone();
+                tree.scale_leaves(model.tree_weight(t));
+                tree
+            })
+            .collect();
+        &baked[..]
+    } else {
+        &model.trees()[..n_trees]
+    };
+    let trees: Vec<Value> = exported
         .iter()
         .enumerate()
         .map(|(id, t)| tree_to_json(id, t, num_feature))
@@ -173,7 +192,7 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
     });
     // DART: XGBoost 3.4.1 keeps the booster name `gbtree` and stores the
     // per-tree weights alongside the trees.
-    if model.has_non_unit_tree_weights() {
+    if model.shrinkage().is_none() && model.has_non_unit_tree_weights() {
         let weight_drop: Vec<Value> = (0..n_trees).map(|t| json!(model.tree_weight(t))).collect();
         booster_model["weight_drop"] = Value::Array(weight_drop);
     }
@@ -205,10 +224,12 @@ fn model_to_value(model: &BoostedModel) -> Result<Value> {
 }
 
 /// Refuse hessboost's own objectives, which XGBoost does not define: the
-/// distributional `dist:*` objectives. Their models are saved in the native
-/// binary or JSON formats only.
+/// distributional `dist:*` objectives and `rank:xendcg`. Their models are
+/// saved in the native binary or JSON formats only.
 fn reject_extension_objective(objective: &str) -> Result<()> {
-    if crate::objective::distributional::DistFamily::from_objective(objective).is_some() {
+    if crate::objective::distributional::DistFamily::from_objective(objective).is_some()
+        || objective == Objective::RankXendcg.name()
+    {
         return Err(HessboostError::model_format(format!(
             "objective `{objective}` is a hessboost extension that XGBoost models cannot \
              carry; save the model in the native binary or JSON format"
@@ -936,6 +957,7 @@ fn objective_to_json(objective: &Objective, max_delta_step: f64) -> Value {
         | Objective::BinaryHinge
         | Objective::AbsoluteError
         | Objective::Dist(_)
+        | Objective::RankXendcg
         | Objective::Custom(_) => {
             return Value::Object(out);
         }
@@ -1871,7 +1893,9 @@ mod tests {
             Vec::new(),
             vec![0.0, 0.0],
             ModelSpec {
-                objective: ModelObjective::BuiltIn(Objective::BinaryLogistic(Logistic::default())),
+                objective: ModelObjective::trained_with(&Objective::BinaryLogistic(
+                    Logistic::default(),
+                )),
                 max_delta_step: 0.0,
                 num_class: 2,
                 n_outputs: 2,
@@ -2377,6 +2401,32 @@ mod tests {
         let back = import_xgboost_json(&exported).unwrap();
         assert_eq!(back.base_scores(), cox.base_scores());
         assert_eq!(back.predict(&dc).unwrap(), cox.predict(&dc).unwrap());
+    }
+
+    /// An XE-NDCG model (a hessboost extension) round-trips through the
+    /// native format, but XGBoost's model format cannot carry it.
+    #[test]
+    fn xendcg_native_roundtrip_and_xgboost_exports_refused() {
+        let data = labeled_dense(&[0.0, 1.0, 2.0, 0.5], 4, 1, &[0.0, 1.0, 2.0, 1.0])
+            .with_group_sizes(&[2, 2])
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective(Objective::RankXendcg)
+            .max_depth(2)
+            .seed(9)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 3).unwrap();
+        let bytes = model.to_bytes().unwrap();
+        let restored = BoostedModel::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.to_bytes().unwrap(), bytes);
+        assert_eq!(restored.objective(), model.objective());
+        assert_eq!(
+            restored.predict(&data).unwrap(),
+            model.predict(&data).unwrap()
+        );
+        assert_format_error(export_xgboost_json(&model), "hessboost extension");
+        assert_format_error(export_xgboost_ubjson(&model), "hessboost extension");
     }
 
     #[test]

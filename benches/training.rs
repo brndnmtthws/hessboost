@@ -772,6 +772,7 @@ fn bench_other_gradients(c: &mut Criterion) {
             "rank_pairwise",
             objective(Objective::RankPairwise(LambdaRank::default()), 1),
         ),
+        ("rank_xendcg", objective(Objective::RankXendcg, 1)),
     ] {
         run(
             &format!("{name}_100k_groups100"),

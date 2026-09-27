@@ -104,6 +104,7 @@ use crate::data::quantile::HistCuts;
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, Objective};
+use crate::training::multi_output::reject_split_gradient;
 use crate::training::train::{
     initial_intercepts, new_model, reject_feature_weights, validate_dataset,
     validate_trained_model, with_thread_pool,
@@ -388,10 +389,12 @@ fn train_budget_inner(
     let mut gpair = vec![GradPair::default(); n];
     let mut stop = BudgetStop::IterationLimit;
 
-    for _ in 0..config.effective_iteration_limit() {
+    for round in 0..config.effective_iteration_limit() {
         let target = (untargeted_rounds <= stopping_rounds.saturating_add(1))
             .then(|| config.target(initial_loss, previous_loss));
         objective.gradient_info(&margins, &info, &mut gpair);
+        // Budget trees are scalar: reduced split gradients would be ignored.
+        reject_split_gradient(objective.as_ref(), round, &gpair)?;
         let row_decrement = |r: u32, delta: f32| {
             let r = r as usize;
             loss[r] - row_loss(r, margins[r] + delta)

@@ -5,9 +5,12 @@
 //! exposes aliases (e.g. `eta`/`learning_rate`), we pick the canonical field
 //! name and document the alias.
 
-use super::groups::{Dart, ExtraTrees, LinearTree, QuantizedGrad, Refresh};
+use super::groups::{
+    BalancedBagging, Boulevard, Dart, Ebm, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
+};
 use crate::error::{HessboostError, Result};
-use crate::objective::{Loss, LossContext, Objective, ObjectiveParts};
+use crate::objective::{Loss, LossContext, Objective};
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -83,6 +86,26 @@ pub enum BoosterKind {
     /// column sampling, `num_parallel_tree > 1`, tree constraints, and
     /// training-matrix feature weights are refused with it.
     GbLinear,
+    /// Boulevard boosting for statistical inference (beyond XGBoost, opt-in):
+    /// every iteration's trees are averaged rather than summed, so the
+    /// ensemble converges to a kernel ridge regression with a central limit
+    /// theorem. `num_parallel_tree = 1` runs BRAT-D (Fang, Tan & Hooker,
+    /// NeurIPS 2025, Algorithm 1; Zhou & Hooker's Boulevard at
+    /// [`Boulevard::dropout`] `= 0`), more
+    /// trees per iteration BRAT-P (Algorithm 2). Squared-error regression
+    /// only; see [`crate::inference`] for the trained model's confidence and
+    /// prediction intervals and the settings it refuses.
+    Boulevard(Boulevard),
+    /// Explainable boosting machine (EBM, a GA²M; beyond XGBoost, opt-in):
+    /// cyclic boosting of one small tree per feature at a time, so the
+    /// model is a sum of per-feature shape functions, optionally followed
+    /// by pairwise interaction terms (FAST detection,
+    /// [`Ebm::interactions`]) and outer
+    /// bagging. With [`Ebm::boulevard`] the
+    /// terms are Boulevard-averaged instead, which gives the shape
+    /// functions confidence bands. See [`crate::ebm`] for the algorithms,
+    /// the shape functions, and the settings it refuses.
+    Ebm(Ebm),
 }
 
 /// Tree construction algorithm.
@@ -290,7 +313,9 @@ pub struct TrainingParams {
     /// Maximum tree depth; `None` is no limit. XGBoost `max_depth` (`0`
     /// there is `None` here).
     pub max_depth: Option<NonZeroUsize>,
-    /// Maximum number of leaves per tree; `None` is no limit. XGBoost
+    /// Maximum number of leaves per tree grown by `lossguide` (and of
+    /// vector-leaf trees under either policy); `None` is no limit. As in
+    /// XGBoost, depth-wise scalar trees read only `max_depth`. XGBoost
     /// `max_leaves` (`0` there is `None` here).
     pub max_leaves: Option<NonZeroUsize>,
     /// Minimum sum of instance hessian needed in a child. XGBoost `min_child_weight`.
@@ -333,6 +358,23 @@ pub struct TrainingParams {
     pub num_parallel_tree: usize,
     /// Row subsampling method. XGBoost `sampling_method`.
     pub sampling_method: SamplingMethod,
+    /// LightGBM's class-balanced bagging for binary classification
+    /// ([`BalancedBagging`]; `pos_bagging_fraction` /
+    /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
+    /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
+    /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
+    /// booster (a classic `booster = ebm` tree draws from its outer bag),
+    /// uniform sampling, and one label column of `0`/`1` labels; Boulevard
+    /// inference (`booster = boulevard`, `ebm_boulevard`) refuses it.
+    pub balanced_bagging: Option<BalancedBagging>,
+    /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
+    /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
+    /// whole query groups are kept or dropped each round. It replaces
+    /// `subsample`, which must stay `1`, and needs a `rank:*` objective, a
+    /// tree booster (a classic `booster = ebm` tree keeps the rows of its
+    /// outer bag in the kept queries), uniform sampling, and query groups on
+    /// the training data.
+    pub bagging_by_query: Option<QueryBagging>,
     /// Output-to-tree allocation for multi-output models. XGBoost
     /// `multi_strategy`.
     pub multi_strategy: MultiStrategy,
@@ -386,6 +428,44 @@ pub struct TrainingParams {
     /// [`gamma`](Self::gamma); `0` (the default) disables it. The paper's
     /// `toad_penalty_threshold`.
     pub toad_penalty_threshold: f64,
+
+    // ---- SGLB and model shrinkage (CatBoost; beyond XGBoost, opt-in) ----
+    /// Stochastic Gradient Langevin Boosting (CatBoost `langevin`;
+    /// Ustimenko and Prokhorenkova, ICML 2021; see [`Langevin`]), `None`
+    /// for off unless [`posterior_sampling`](Self::posterior_sampling) turns
+    /// it on. Langevin adds no model shrinkage of its own: set
+    /// [`model_shrink`](Self::model_shrink) for it (CatBoost's flat
+    /// `langevin=true` defaults to a constant rate `0.001`, which
+    /// [`from_xgboost`](Self::from_xgboost) maps to that `model_shrink`).
+    ///
+    /// Needs `booster = gbtree` with one tree per output and iteration
+    /// (`num_parallel_tree = 1`); refused with monotone constraints,
+    /// `linear_tree`, `path_smooth`, quantized leaf renewal
+    /// ([`QuantizedGrad::renew_leaf`]; all of which the re-estimated leaves
+    /// would bypass), gradient-based sampling (whose row probabilities the
+    /// noise would distort), and `process_type = update`.
+    pub langevin: Option<Langevin>,
+    /// Per-iteration model shrinkage (CatBoost `model_shrink_rate` /
+    /// `model_shrink_mode`; see [`ModelShrink`]), `None` for none
+    /// ([`posterior_sampling`](Self::posterior_sampling) derives its own).
+    /// The constant coefficient `1 - rate * eta` must stay positive.
+    ///
+    /// A shrunk model stores its trees unscaled with the per-iteration
+    /// factors and predicts with training's shrink-then-add arithmetic, so
+    /// iteration ranges `..k`,
+    /// [`slice`](crate::model::BoostedModel::slice)`(..k, 1)`, and early
+    /// stopping reproduce the model trained for `k` rounds exactly. Refused
+    /// with `dart`, `gblinear`, `process_type = update`, continued training,
+    /// and per-row `base_margin`s.
+    pub model_shrink: Option<ModelShrink>,
+    /// SGLB posterior sampling (CatBoost `posterior_sampling`): Langevin on
+    /// with diffusion temperature `N` and constant model shrinkage at rate
+    /// `1 / (2N)`, `N` the number of training rows, so the iterates sample
+    /// the Bayesian posterior of the ensemble. The basis of
+    /// [`predict_virtual_ensembles`](crate::model::BoostedModel::predict_virtual_ensembles)'
+    /// knowledge uncertainty. An explicit Langevin temperature or model
+    /// shrinkage is refused rather than overridden.
+    pub posterior_sampling: bool,
 }
 
 impl Default for TrainingParams {
@@ -417,6 +497,8 @@ impl Default for TrainingParams {
             interaction_constraints: Vec::new(),
             num_parallel_tree: 1,
             sampling_method: SamplingMethod::Uniform,
+            bagging_by_query: None,
+            balanced_bagging: None,
             multi_strategy: MultiStrategy::OneOutputPerTree,
             process_type: ProcessType::Default,
             extra_trees: None,
@@ -425,6 +507,9 @@ impl Default for TrainingParams {
             quantized: None,
             toad_penalty_feature: 0.0,
             toad_penalty_threshold: 0.0,
+            langevin: None,
+            model_shrink: None,
+            posterior_sampling: false,
         }
     }
 }
@@ -511,8 +596,8 @@ impl TrainingParams {
     ///
     /// The checks run in a fixed order (numeric ranges, reuse penalties,
     /// device, objective parameters, booster, tree shape, training modes,
-    /// tree options), so a configuration that breaks several rules always
-    /// reports the same one.
+    /// tree options, SGLB and model shrinkage, Boulevard), so a
+    /// configuration that breaks several rules always reports the same one.
     pub fn validate(&self) -> Result<()> {
         self.validate_ranges()?;
         self.validate_reuse_penalties()?;
@@ -531,7 +616,81 @@ impl TrainingParams {
         }
         self.validate_tree_shape()?;
         self.validate_training_modes()?;
-        self.validate_tree_options()
+        self.validate_bagging_by_query()?;
+        self.validate_balanced_bagging()?;
+        self.validate_tree_options()?;
+        self.validate_sglb()?;
+        self.validate_boulevard()?;
+        self.validate_ebm()
+    }
+
+    /// Query-level bagging: a ranking objective on a tree booster, with
+    /// uniform sampling and no `subsample` it would override.
+    fn validate_bagging_by_query(&self) -> Result<()> {
+        if self.bagging_by_query.is_none() {
+            return Ok(());
+        }
+        ensure(
+            "bagging_by_query",
+            self.booster != BoosterKind::GbLinear,
+            "query bagging needs a tree booster: `gblinear` samples no rows",
+        )?;
+        ensure(
+            "bagging_by_query",
+            self.objective.is_ranking(),
+            format!(
+                "query bagging needs a `rank:*` objective, not `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            "bagging_by_query",
+            self.balanced_bagging.is_none(),
+            "query bagging is not supported together with class-balanced bagging",
+        )?;
+        ensure(
+            "subsample",
+            self.subsample == 1.0,
+            "query bagging replaces `subsample` with its query fraction; leave it at 1",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "query bagging keeps whole queries; `gradient_based` is not supported with it",
+        )
+    }
+
+    /// Class-balanced bagging: a binary objective on a tree booster, with
+    /// uniform sampling and no `subsample` it would override.
+    fn validate_balanced_bagging(&self) -> Result<()> {
+        if self.balanced_bagging.is_none() {
+            return Ok(());
+        }
+        ensure(
+            "pos_bagging_fraction",
+            self.booster != BoosterKind::GbLinear,
+            "balanced bagging needs a tree booster: `gblinear` samples no rows",
+        )?;
+        ensure(
+            "pos_bagging_fraction",
+            self.objective.is_binary_classifier(),
+            format!(
+                "balanced bagging needs a `binary:*` objective, not `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            "subsample",
+            self.subsample == 1.0,
+            "balanced bagging replaces `subsample` (LightGBM ignores \
+             `bagging_fraction` then); leave it at 1",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "balanced bagging samples uniformly within each class; \
+             `gradient_based` is not supported with it",
+        )
     }
 
     /// Whether either reuse penalty (Trees-on-a-Diet) is on.
@@ -637,7 +796,7 @@ impl TrainingParams {
         if let Objective::Custom(loss) = &self.objective {
             ensure(
                 "objective",
-                Objective::from_parts(loss.name(), &ObjectiveParts::default()).is_none(),
+                !Objective::is_built_in_name(loss.name()),
                 format!(
                     "the custom loss is named `{}`, a built-in objective's name, as which a \
                      saved model would reload; rename the loss",
@@ -850,6 +1009,362 @@ impl TrainingParams {
         )
     }
 
+    /// Whether Stochastic Gradient Langevin Boosting is on: set directly or
+    /// through [`posterior_sampling`](Self::posterior_sampling).
+    pub(crate) fn langevin_on(&self) -> bool {
+        self.langevin.is_some() || self.posterior_sampling
+    }
+
+    /// The Langevin diffusion temperature in effect for `n_rows` training
+    /// rows: the row count under posterior sampling, else the configured
+    /// value or CatBoost's `10000`.
+    pub(crate) fn effective_diffusion_temperature(&self, n_rows: usize) -> f64 {
+        if self.posterior_sampling {
+            n_rows as f64
+        } else {
+            self.langevin
+                .and_then(|l| l.diffusion_temperature())
+                .unwrap_or(1e4)
+        }
+    }
+
+    /// The Langevin noise scale `sqrt(2 / (eta * temperature))` (CatBoost's
+    /// `CalcLangevinNoiseRate`).
+    pub(crate) fn langevin_noise_scale(&self, temperature: f64) -> f64 {
+        (2.0 / (self.eta * temperature)).sqrt()
+    }
+
+    /// The model shrinkage `(rate, mode)` in effect for `n_rows` training
+    /// rows: `1 / (2 n_rows)` constant under posterior sampling, else the
+    /// configured shrinkage, if any.
+    pub(crate) fn effective_model_shrink(&self, n_rows: usize) -> Option<(f64, ModelShrinkMode)> {
+        if self.posterior_sampling {
+            return Some((1.0 / (2.0 * n_rows as f64), ModelShrinkMode::Constant));
+        }
+        self.model_shrink
+            .map(|shrink| (shrink.rate(), shrink.mode()))
+    }
+
+    /// Whether training shrinks the model every iteration (known without
+    /// the data: posterior sampling always shrinks at a positive rate).
+    pub(crate) fn model_shrinkage_on(&self) -> bool {
+        self.posterior_sampling || self.model_shrink.is_some()
+    }
+
+    /// Compatibility of Langevin boosting and model shrinkage (CatBoost's
+    /// `TBoostingOptions::Validate` and `TCatBoostOptions::Validate`, plus
+    /// what the tree path here supports); the groups validate their own
+    /// values.
+    fn validate_sglb(&self) -> Result<()> {
+        if self.posterior_sampling {
+            // CatBoost derives these from the row count and refuses explicit
+            // values instead of overriding them.
+            ensure(
+                "diffusion_temperature",
+                self.langevin
+                    .is_none_or(|l| l.diffusion_temperature().is_none()),
+                "is derived by `posterior_sampling` (the training row count); leave it unset",
+            )?;
+            ensure(
+                "model_shrink_rate",
+                self.model_shrink.is_none(),
+                "is derived by `posterior_sampling` (constant, 1 / (2 * rows)); leave it unset",
+            )?;
+        }
+        // The noise joins `f32` gradients, so its scale must be a finite,
+        // positive `f32`: an underflowing `eta * T` would make every noisy
+        // gradient infinite, an overflowing one would switch the noise off
+        // (a subnormal scale is tiny but still noise). Under posterior
+        // sampling `T` is the row count `n >= 1` and `eta < 2n`
+        // (`Sglb::resolve`), so `eta * T` lies in `(2^-150, 2n^2)` and the
+        // scale in `(1 / n, 2^76)`: always representable.
+        if self.langevin.is_some() && !self.posterior_sampling {
+            let temperature = self.effective_diffusion_temperature(0);
+            let sigma = self.langevin_noise_scale(temperature);
+            ensure(
+                "diffusion_temperature",
+                (sigma as f32).is_finite() && sigma as f32 > 0.0,
+                format!(
+                    "gives a Langevin noise scale sqrt(2 / (eta * diffusion_temperature)) \
+                     that is not a finite, positive f32: {sigma:e} for eta {:e} and \
+                     temperature {temperature:e}",
+                    self.eta
+                ),
+            )?;
+        }
+        // Posterior sampling's rate depends on the row count; its coefficient
+        // is checked with the data (`Sglb::resolve`).
+        if let Some(shrink) = self.model_shrink
+            && shrink.mode() == ModelShrinkMode::Constant
+        {
+            ensure(
+                "model_shrink_rate",
+                shrink.rate() * self.eta < 1.0,
+                format!(
+                    "the constant shrink coefficient 1 - model_shrink_rate * eta must stay \
+                     positive, got rate {} with eta {}",
+                    shrink.rate(),
+                    self.eta
+                ),
+            )?;
+        }
+        let enabled = [
+            ("langevin", self.langevin_on()),
+            ("model_shrink_rate", self.model_shrinkage_on()),
+        ];
+        for (name, _) in enabled.iter().filter(|&&(_, on)| on) {
+            // DART rescales its trees with the contribution weights that
+            // shrinkage stores; gblinear grows no trees; refresh grows
+            // nothing new.
+            ensure(
+                name,
+                self.booster == BoosterKind::GbTree,
+                "requires `booster = gbtree`",
+            )?;
+            ensure(
+                name,
+                self.process_type == ProcessType::Default,
+                "is not supported with `process_type = update` (refresh grows no trees)",
+            )?;
+        }
+        if self.langevin_on() {
+            // The noise scale assumes one tree carries each output's whole
+            // step; the re-estimated leaves would bypass the constraint
+            // bounds, the path-smoothed outputs, the leaf linear fits, and
+            // quantized training's renewed leaves.
+            ensure(
+                "langevin",
+                self.num_parallel_tree == 1,
+                "requires `num_parallel_tree = 1`",
+            )?;
+            ensure(
+                "langevin",
+                self.monotone_constraints
+                    .iter()
+                    .all(|&m| m == Monotone::None),
+                "is not supported with monotone constraints",
+            )?;
+            ensure(
+                "langevin",
+                self.linear_tree.is_none() && self.path_smooth == 0.0,
+                "is not supported with `linear_tree` or `path_smooth`",
+            )?;
+            ensure(
+                "langevin",
+                self.quantized.is_none_or(|q| !q.renew_leaf()),
+                "is not supported with `quant_train_renew_leaf` (the Langevin leaf \
+                 re-estimation would replace the renewed leaves)",
+            )?;
+            ensure(
+                "langevin",
+                !(self.sampling_method == SamplingMethod::GradientBased && self.subsample < 1.0),
+                "is not supported with `sampling_method = gradient_based` (the noise would \
+                 distort its row probabilities)",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Ranges of the Boulevard options, and the settings `booster =
+    /// boulevard` refuses. Its inference ([`crate::inference`]) reads every
+    /// tree as a linear smoother of the round's residuals (a leaf predicts
+    /// `Σ z / (m + lambda)` over its `m` sampled rows), so the options that
+    /// make leaf values nonlinear in the labels (L1 leaves, clipped leaves,
+    /// monotone clipping, quantized gradients, linear or smoothed leaves),
+    /// that reweight rows by their residuals (gradient-based sampling) or
+    /// sample them by their labels (class-balanced bagging), or that change
+    /// the loss are refused. Structure-only options (depth,
+    /// `min_child_weight`, `gamma`, column sampling, `extra_trees`,
+    /// interaction constraints, categorical splits) are accepted.
+    fn validate_boulevard(&self) -> Result<()> {
+        let BoosterKind::Boulevard(boulevard) = self.booster else {
+            return Ok(());
+        };
+        let dropout = boulevard.dropout();
+        self.refuse_balanced_bagging()?;
+        ensure(
+            "objective",
+            matches!(self.objective, Objective::SquaredError),
+            format!(
+                "`booster = boulevard` supports `reg:squarederror` only, got `{}`",
+                self.objective.name()
+            ),
+        )?;
+        if self.num_parallel_tree > 1 {
+            ensure(
+                "boulevard_dropout",
+                dropout == 0.0,
+                "BRAT-P (`num_parallel_tree > 1`) leaves one tree per round out instead of \
+                 dropping trees at random; must be 0",
+            )?;
+            ensure(
+                "eta",
+                self.eta == 1.0,
+                format!(
+                    "BRAT-P (`num_parallel_tree > 1`) has no learning rate; must be 1, got {}",
+                    self.eta
+                ),
+            )?;
+        } else {
+            ensure(
+                "eta",
+                self.eta <= 1.0,
+                format!(
+                    "Boulevard's learning rate must be in (0, 1], got {}",
+                    self.eta
+                ),
+            )?;
+        }
+        self.validate_linear_smoother()
+    }
+
+    /// Class-balanced bagging under Boulevard inference (of `booster =
+    /// boulevard` and of `ebm_boulevard`), checked before the objective:
+    /// balanced bagging needs a `binary:*` objective, and the reason it
+    /// cannot work is not the loss.
+    fn refuse_balanced_bagging(&self) -> Result<()> {
+        ensure(
+            "pos_bagging_fraction",
+            self.balanced_bagging.is_none(),
+            "class-balanced bagging keeps a row with a probability set by its label, so a leaf \
+             is no longer a linear smoother of the labels; Boulevard needs uniform `subsample`",
+        )
+    }
+
+    /// The settings Boulevard inference (of `booster = boulevard` and of
+    /// `booster = ebm` with `ebm_boulevard`) refuses: every tree must be a
+    /// linear smoother of its round's residuals with constant leaves.
+    fn validate_linear_smoother(&self) -> Result<()> {
+        let nonlinear = "makes leaf values nonlinear in the labels, which Boulevard inference \
+                         cannot represent";
+        ensure(
+            "alpha",
+            self.alpha == 0.0,
+            format!("L1 regularization {nonlinear}; must be 0"),
+        )?;
+        ensure(
+            "max_delta_step",
+            self.effective_max_delta_step() == 0.0,
+            format!("clipping leaves {nonlinear}; leave it unbounded"),
+        )?;
+        ensure(
+            "monotone_constraints",
+            self.monotone_constraints
+                .iter()
+                .all(|&m| m == Monotone::None),
+            format!("clipping leaves to monotone bounds {nonlinear}"),
+        )?;
+        ensure(
+            "use_quantized_grad",
+            self.quantized.is_none(),
+            format!("quantized gradients {nonlinear}"),
+        )?;
+        ensure(
+            "linear_tree",
+            self.linear_tree.is_none(),
+            "linear leaves are not constant smoothers; Boulevard needs constant leaves",
+        )?;
+        ensure(
+            "path_smooth",
+            self.path_smooth == 0.0,
+            "smoothed leaves mix in their ancestors' rows; must be 0",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "gradient-based sampling reweights rows by their residuals; Boulevard needs uniform \
+             subsampling",
+        )?;
+        ensure(
+            "process_type",
+            self.process_type == ProcessType::Default,
+            "`update` refreshes existing trees; Boulevard models are grown in one run",
+        )
+    }
+
+    /// Ranges of the EBM options, the settings `booster = ebm` refuses
+    /// (anything that would let a tree reach features outside its term, or
+    /// leaves the shape functions cannot read), and with `ebm_boulevard`
+    /// the Boulevard inference refusals.
+    fn validate_ebm(&self) -> Result<()> {
+        let BoosterKind::Ebm(ebm) = self.booster else {
+            return Ok(());
+        };
+        let term = "`booster = ebm` fixes every tree's features to its term";
+        ensure(
+            "num_parallel_tree",
+            self.num_parallel_tree == 1,
+            "`booster = ebm` grows one tree per term at a time; must be 1",
+        )?;
+        for (name, ratio) in [
+            ("colsample_bytree", self.colsample_bytree),
+            ("colsample_bylevel", self.colsample_bylevel),
+            ("colsample_bynode", self.colsample_bynode),
+        ] {
+            ensure(name, ratio == 1.0, format!("{term}; must be 1"))?;
+        }
+        ensure(
+            "interaction_constraints",
+            self.interaction_constraints.is_empty(),
+            format!("{term}; must be empty"),
+        )?;
+        ensure(
+            "linear_tree",
+            self.linear_tree.is_none(),
+            "EBM shape functions need constant leaves",
+        )?;
+        ensure(
+            "toad_penalty_feature",
+            !self.reuse_penalties_on(),
+            "reuse penalties are not supported with `booster = ebm`",
+        )?;
+        ensure(
+            "process_type",
+            self.process_type == ProcessType::Default,
+            "`update` refreshes existing trees; EBM models are grown in one run",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "`booster = ebm` samples rows uniformly (`subsample`)",
+        )?;
+        if !ebm.boulevard() {
+            return Ok(());
+        }
+        self.refuse_balanced_bagging()?;
+        ensure(
+            "objective",
+            matches!(self.objective, Objective::SquaredError),
+            format!(
+                "`ebm_boulevard` supports `reg:squarederror` only, got `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            "eta",
+            self.eta <= 1.0,
+            format!(
+                "Boulevard's learning rate must be in (0, 1], got {}",
+                self.eta
+            ),
+        )?;
+        ensure(
+            "base_score",
+            self.base_score.is_none(),
+            "the Boulevard EBM's centered terms leave the label mean as the intercept; leave it \
+             unset",
+        )?;
+        self.validate_linear_smoother()
+    }
+
+    /// The `booster = ebm` settings (the defaults for any other booster).
+    pub(crate) fn ebm_settings(&self) -> Ebm {
+        match self.booster {
+            BoosterKind::Ebm(ebm) => ebm,
+            _ => Ebm::default(),
+        }
+    }
+
     /// The `max_delta_step` in effect (`0` = no bound): the configured
     /// bound, or the objective's default (XGBoost's 0.7 for
     /// `count:poisson`).
@@ -879,6 +1394,7 @@ impl TrainingParams {
             max_delta_step: self.effective_max_delta_step(),
             shared_tree_seed: (self.multi_strategy == MultiStrategy::MultiOutputTree)
                 .then_some(self.seed),
+            seed: self.seed,
         })
     }
 
@@ -983,7 +1499,8 @@ impl TrainingParamsBuilder {
         self.params.max_depth = None;
         self
     }
-    /// Set the maximum number of leaves per tree. `0` is refused at
+    /// Set the maximum number of leaves per `lossguide` (or vector-leaf)
+    /// tree ([`TrainingParams::max_leaves`]). `0` is refused at
     /// [`build`](Self::build); [`unlimited_leaves`](Self::unlimited_leaves)
     /// removes the limit (the default).
     #[must_use]
@@ -1054,10 +1571,46 @@ impl TrainingParamsBuilder {
         self
     }
 
+    /// Enable LightGBM's query-level bagging (`bagging_by_query`).
+    #[must_use]
+    pub fn bagging_by_query(mut self, bagging: QueryBagging) -> Self {
+        self.params.bagging_by_query = Some(bagging);
+        self
+    }
+    /// Enable LightGBM's class-balanced bagging (`pos_bagging_fraction`,
+    /// `neg_bagging_fraction`).
+    #[must_use]
+    pub fn balanced_bagging(mut self, bagging: BalancedBagging) -> Self {
+        self.params.balanced_bagging = Some(bagging);
+        self
+    }
+
     /// Enable quantized-gradient training (LightGBM `use_quantized_grad`).
     #[must_use]
     pub fn quantized(mut self, quantized: QuantizedGrad) -> Self {
         self.params.quantized = Some(quantized);
+        self
+    }
+
+    /// Enable Stochastic Gradient Langevin Boosting (CatBoost `langevin`).
+    #[must_use]
+    pub fn langevin(mut self, langevin: Langevin) -> Self {
+        self.params.langevin = Some(langevin);
+        self
+    }
+
+    /// Enable per-iteration model shrinkage (CatBoost `model_shrink_rate`
+    /// and `model_shrink_mode`).
+    #[must_use]
+    pub fn model_shrink(mut self, model_shrink: ModelShrink) -> Self {
+        self.params.model_shrink = Some(model_shrink);
+        self
+    }
+
+    /// Enable SGLB posterior sampling (CatBoost `posterior_sampling`).
+    #[must_use]
+    pub fn posterior_sampling(mut self, posterior_sampling: bool) -> Self {
+        self.params.posterior_sampling = posterior_sampling;
         self
     }
 

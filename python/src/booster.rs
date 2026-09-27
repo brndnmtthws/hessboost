@@ -84,7 +84,7 @@ enum Kind {
 }
 
 /// `(rows,)` for one value per row, else `(rows, width)`.
-fn dense(predictions: Predictions) -> (Vec<f32>, Vec<usize>) {
+fn dense<T>(predictions: Predictions<T>) -> (Vec<T>, Vec<usize>) {
     let (rows, width) = (predictions.n_rows(), predictions.width());
     let shape = if width == 1 {
         vec![rows]
@@ -283,6 +283,77 @@ impl Booster {
         Distributions::new(dists)
     }
 
+    /// The predictions (`output_margin`: raw margins) of a virtual ensemble
+    /// of `count` members, `(count, rows)` or `(count, rows, width)`, and
+    /// each member's iteration count.
+    fn predict_virtual_ensembles<'py>(
+        &self,
+        py: Python<'py>,
+        data: &DMatrix,
+        count: usize,
+        output_margin: bool,
+    ) -> PyResult<(Bound<'py, PyArrayDyn<f32>>, Vec<usize>)> {
+        let ensembles = py
+            .detach(|| self.model.predict_virtual_ensembles(&data.inner, count))
+            .or_raise()?;
+        let (members, rows) = (ensembles.n_members(), ensembles.n_rows());
+        let member = |m| {
+            if output_margin {
+                ensembles.member_margins(m)
+            } else {
+                ensembles.member_predictions(m)
+            }
+        };
+        let width = member(0).map_or(1, hessboost::model::Predictions::width);
+        let mut values = Vec::with_capacity(members * rows * width);
+        for m in 0..members {
+            values.extend_from_slice(member(m).map_or(&[], |p| p.as_slice()));
+        }
+        let shape = if width == 1 {
+            vec![members, rows]
+        } else {
+            vec![members, rows, width]
+        };
+        Ok((
+            to_numpy(py, values, &shape)?,
+            ensembles.iterations().to_vec(),
+        ))
+    }
+
+    /// A virtual ensemble's `(mean, knowledge, data, total)` uncertainty,
+    /// each `(rows,)` or `(rows, width)` with its own width (a multiclass
+    /// `mean` per class, its uncertainties per row); `data` and `total`
+    /// `None` for plain regression.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple is the extension's return shape; the public class wraps it"
+    )]
+    fn predict_uncertainty<'py>(
+        &self,
+        py: Python<'py>,
+        data: &DMatrix,
+        count: usize,
+    ) -> PyResult<(
+        Bound<'py, PyArrayDyn<f64>>,
+        Bound<'py, PyArrayDyn<f64>>,
+        Option<Bound<'py, PyArrayDyn<f64>>>,
+        Option<Bound<'py, PyArrayDyn<f64>>>,
+    )> {
+        let uncertainty = py
+            .detach(|| self.model.predict_uncertainty(&data.inner, count))
+            .or_raise()?;
+        let array = |values: Predictions<f64>| {
+            let (values, shape) = dense(values);
+            to_numpy(py, values, &shape)
+        };
+        Ok((
+            array(uncertainty.mean)?,
+            array(uncertainty.knowledge)?,
+            uncertainty.data.map(array).transpose()?,
+            uncertainty.total.map(array).transpose()?,
+        ))
+    }
+
     /// `{feature index: score}` for every feature used in a split.
     fn feature_importance<'py>(
         &self,
@@ -372,5 +443,17 @@ impl Booster {
     #[getter]
     fn vector_leaves(&self) -> bool {
         self.model.has_vector_leaves()
+    }
+
+    /// The Boulevard record of a `booster = boulevard` model, else `None`.
+    #[getter]
+    fn boulevard<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        crate::inference::boulevard_info(py, &self.model)
+    }
+
+    /// The EBM record of a `booster = ebm` model, else `None`.
+    #[getter]
+    fn ebm<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        crate::ebm::ebm_info(py, &self.model)
     }
 }

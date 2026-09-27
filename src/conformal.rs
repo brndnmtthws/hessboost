@@ -77,16 +77,17 @@ use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Predictions};
 
-/// A prediction interval `[lower, upper]` for one row.
+/// An interval `[lower, upper]` for one row: `f32` for the conformal
+/// predictors here, `f64` for [`crate::inference`]'s intervals.
 ///
 /// Split-conformal intervals always have `lower <= upper`; a conformalized
 /// quantile band shrunk by a negative correction may not.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Interval {
+pub struct Interval<T = f32> {
     /// The lower bound.
-    pub lower: f32,
+    pub lower: T,
     /// The upper bound.
-    pub upper: f32,
+    pub upper: T,
 }
 
 impl Interval {
@@ -545,7 +546,7 @@ fn check_finite(preds: impl IntoIterator<Item = f32>) -> Result<()> {
 ///
 /// `k` is evaluated as `(n + 1) - floor((n + 1) * alpha)`, which equals the
 /// ceiling form exactly and avoids the rounding of `1 - alpha`.
-fn conformal_rank(n: usize, alpha: f64) -> Option<usize> {
+pub(crate) fn conformal_rank(n: usize, alpha: f64) -> Option<usize> {
     let n1 = n + 1;
     // `0 < alpha < 1` bounds the floor to `[0, n]`, so `1 <= k <= n + 1`.
     let k = n1 - ((n1 as f64) * alpha).floor() as usize;

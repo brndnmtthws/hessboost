@@ -69,7 +69,9 @@
 //!
 //! The approximate mode caches, per tree, one gradient pair per row and one
 //! histogram (`total_bins` pairs of `f64`) per internal node: `trees × (8 ·
-//! rows + 16 · total_bins · internal nodes)` bytes.
+//! rows + 16 · total_bins · internal nodes)` bytes. An update works on a
+//! copy of it, swapped in on success, so an abandoned update restores the
+//! exact state it started from; the copy briefly doubles that memory.
 //!
 //! # Accuracy and speed
 //!
@@ -261,9 +263,9 @@ impl OnlineModel {
     /// The refusals of [`Self::train`], and
     /// [`HessboostError::InvalidParameter`] for a model that `params` could
     /// not have trained (another objective, several outputs, weighted or
-    /// categorical trees, linear leaves or a `gblinear` booster, for
-    /// example from an imported LightGBM `linear_tree` model, a different
-    /// feature count).
+    /// categorical trees, linear leaves, a `gblinear`, `boulevard`, or
+    /// `ebm` booster, for example from an imported LightGBM `linear_tree`
+    /// model, model shrinkage, a different feature count).
     pub fn from_model(
         model: BoostedModel,
         params: &TrainingParams,
@@ -281,17 +283,22 @@ impl OnlineModel {
             || model.n_features() != data.n_cols()
             || categorical
             || model.linear().is_some()
+            || model.boulevard().is_some()
+            || model.ebm().is_some()
             || model.trees().iter().any(|t| t.linear_leaves().is_some())
             || model
                 .trees()
                 .iter()
                 .any(|t| splits_below(t, params.max_depth))
             || (0..model.num_trees()).any(|t| model.tree_weight(t) != 1.0)
+            // Model shrinkage rescales every earlier tree each round, so
+            // an update of one node's subtree would not reproduce a retrain.
+            || model.shrinkage().is_some()
         {
             return Err(HessboostError::invalid_param(
                 "model",
-                "not a single-output, unweighted, numeric gbtree model with constant leaves of \
-                 these parameters and data",
+                "not a single-output, unweighted, unshrunk, numeric gbtree model (not \
+                 Boulevard or EBM) with constant leaves of these parameters and data",
             ));
         }
         let cache = if online.tolerance > 0.0 {
@@ -367,10 +374,11 @@ impl OnlineModel {
         // computes gradients without going through the trainer's checks.
         validate_training_data(&self.params, &updated)?;
         let rounds = self.model.num_boost_rounds();
-        // The cache is updated in place (copying it would cost more than
-        // the update); on failure it is rebuilt from the unchanged model and
-        // data.
-        let Some(mut cache) = self.cache.take() else {
+        // The approximate mode updates a copy of the cache, swapped in on
+        // success, so an abandoned update leaves exactly the state it started
+        // from (a rebuild would recompute the bins and gradients earlier
+        // updates keep fixed).
+        let Some(cache) = self.cache.as_ref() else {
             let mut stopped = false;
             let model = Trainer::new(&self.params, &updated, rounds)
                 .on_round(|round| {
@@ -392,6 +400,7 @@ impl OnlineModel {
             self.data = updated;
             return Ok(report);
         };
+        let mut cache = cache.clone();
         let run = Incremental {
             params: &self.params,
             tolerance: self.online.tolerance,
@@ -406,18 +415,11 @@ impl OnlineModel {
                 ControlFlow::Continue(()) => Ok(done),
                 ControlFlow::Break(()) => Err(interrupted()),
             });
-        match outcome {
-            Ok((trees, report)) => {
-                self.model = self.model.with_trees(trees);
-                self.data = updated;
-                self.cache = Some(cache);
-                Ok(report)
-            }
-            Err(e) => {
-                self.cache = Some(Cache::build(&self.model, &self.params, &self.data)?);
-                Err(e)
-            }
-        }
+        let (trees, report) = outcome?;
+        self.model = self.model.with_trees(trees);
+        self.data = updated;
+        self.cache = Some(cache);
+        Ok(report)
     }
 
     /// The current model.
@@ -625,6 +627,7 @@ fn check_supported(params: &TrainingParams, data: &DMatrix, online: OnlineParams
         | Objective::RankPairwise(_)
         | Objective::RankNdcg(_)
         | Objective::RankMap(_)
+        | Objective::RankXendcg
         | Objective::Cox
         | Objective::Custom(_) => false,
     };

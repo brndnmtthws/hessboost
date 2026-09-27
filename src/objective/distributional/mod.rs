@@ -119,7 +119,7 @@
 //! log density, CRPS, intervals, and inverse-CDF sampling. Metrics `nll`
 //! (the default) and `crps` score them.
 
-mod special;
+pub(crate) mod special;
 
 use serde::{Deserialize, Serialize};
 
@@ -1290,7 +1290,7 @@ fn bisect_quantile(x: f64, residual: impl Fn(f64) -> f64) -> f64 {
 /// with the second-order statistic chosen by [`DistGradient`] (see the
 /// [module docs](self)).
 #[derive(Debug, Clone, Copy)]
-pub struct DistLoss {
+pub(crate) struct DistLoss {
     family: DistFamily,
     gradient: DistGradient,
     /// Parallel-gradient-boosting direction and seed for shared trees, set
@@ -1301,7 +1301,7 @@ pub struct DistLoss {
 impl DistLoss {
     /// The objective for `family` with gradient mode `gradient`, growing one
     /// tree per parameter (no reduced split gradients).
-    pub fn new(family: DistFamily, gradient: DistGradient) -> Self {
+    pub(crate) fn new(family: DistFamily, gradient: DistGradient) -> Self {
         DistLoss {
             family,
             gradient,
@@ -1315,14 +1315,14 @@ impl DistLoss {
     /// round (`seed` drives [`DistSplitDirection::Random`]), or `None` for
     /// [`DistSplitDirection::All`] and one-parameter families.
     #[must_use]
-    pub fn with_split_direction(mut self, direction: DistSplitDirection, seed: u64) -> Self {
+    pub(crate) fn with_split_direction(mut self, direction: DistSplitDirection, seed: u64) -> Self {
         self.shared = Some((direction, seed));
         self
     }
 
     /// The parameter whose gradients drive the structure of round
     /// `iteration`'s shared tree, if any.
-    pub fn split_parameter(&self, iteration: usize) -> Option<usize> {
+    pub(crate) fn split_parameter(&self, iteration: usize) -> Option<usize> {
         let k = self.family.n_params();
         match self.shared? {
             _ if k < 2 => None,
@@ -1333,11 +1333,6 @@ impl DistLoss {
                 Some((draw % k as u64) as usize)
             }
         }
-    }
-
-    /// The distribution family.
-    pub fn family(&self) -> DistFamily {
-        self.family
     }
 
     /// One row's `(gradient, curvature)` per parameter, before row weights.

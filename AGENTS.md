@@ -124,17 +124,19 @@ Fix findings rather than suppress them.
 |Path|Non-obvious contents|
 |---|---|
 |`lib.rs`|crate docs ("What's here", "Not implemented"), `prelude`, hidden `internals`|
-|`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams|
+|`rng.rs`|`Rng` (xoshiro256++), SplitMix64 counter-based streams (`stream_key`, `keyed_normal`)|
 |`data/`|`meta` (`MetaInfo`), `sketch`/`quantile` (`HistCuts`), `ghist` (`GHistIndex`), `target_stats` (public, opt-in)|
 |`config/params.rs`|`TrainingParams`, builder, `validate`, `loss` (the loss a configuration trains with), parameter enums|
-|`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree` (`Option` fields); each validates when built|
+|`config/groups.rs`|option groups a switch owns: `Dart` (`BoosterKind::Dart`), `Boulevard` (`BoosterKind::Boulevard`), `Ebm` (`BoosterKind::Ebm`), `Refresh` (`ProcessType::Update`), `QuantizedGrad`, `ExtraTrees`, `LinearTree`, `BalancedBagging`, `QueryBagging`, `Langevin`, `ModelShrink` (`Option` fields); each validates when built|
 |`config/xgboost.rs`|XGBoost's flat parameter form: `TrainingParams::from_xgboost`/`to_xgboost` (keys, aliases, value spellings, one-setting options), `changed_keys`|
-|`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
+|`objective/`|`spec` (`Objective`: one exhaustive match per property, `build_loss`, `ObjectiveParts`/`from_parts`/`parts`, the flat keys by XGBoost name), `params` (the validated parameter structs, shared with `EvalMetric`); losses by XGBoost family (crate-private): `absolute` (smoothed MAE), `survival` (`erf` from glibc), `xendcg` (LightGBM XE-NDCG; its own keyed RNG stream), `multi_target` (label-matrix wrapper), `distributional/` (public, `dist:*`, `Distributional`)|
 |`metric/`|`mod.rs` holds `EvalMetric` (the typed metrics; `from_xgboost` reads XGBoost names with the flat parameters they borrow) and most metrics; the rest by family (built-in metric structs are crate-private)|
 |`tree/`|`regtree`, `gain`, `constraints`, `sampler` (colsample), `hist/` (accumulation; `quantized`), `compact`, `oblivious` (symmetric-tree prediction), `linear` (`linear_tree` leaves), `reuse` (Trees-on-a-Diet penalties); public: `RegTree`, `Node`, `LinearLeaves`|
 |`tree/builder/`|`mod.rs`: split enumeration for all builders, `sweep_categorical`, `scan_numeric_splits` with the `f32` prefilter (`approx_run`, `APPROX_MARGIN`) and exact's `ScreenBound` screen (`Screen::bound`, `rules_out`), both proven to keep the sequential choice. `hist` (also `approx`; speculative parallel loss-guide), `exact`, `multi` (vector leaves), `oblivious`, `lightgbm` (`extra_trees`/`path_smooth`), `budget`, `online` (split ranking for `training::online`)|
-|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts), `gblinear`, `multi_output`, `sampling` (gradient-based), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
-|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
+|`training/`|`train` (gbtree, DART, gblinear, forests; `approx` = hist with per-round weighted cuts; uniform, class-balanced, and query-level row sampling), `boulevard` (BRAT-D/BRAT-P `Recursion`, shared with the honest refit), `ebm` (classic cyclic EBM with outer bags, Boulevard EBM stages on the same `Recursion`, FAST pair ranking), `gblinear`, `multi_output`, `sampling` (gradient-based), `sglb` (Langevin noise, leaf re-estimation, shrink schedule), `continuation`, `refresh`, `cv` (`Fold` builders incl. `purged_forward`), `budget` (public), `online` (public: in-place row addition/deletion; cached per-node histograms, split robustness tolerance, lazy gradients; exact mode = retraining)|
+|`inference/`|public: Boulevard inference (`BoulevardInfo`, `BoulevardInference`, `EbmInference`, `TermBands`, `honest_refit`); `kernel` (the `Kernel` trait the solvers read; leaf kernel over the training rows), `term_kernel` (a Boulevard EBM stage's centered additive kernel, computed on term grids), `solver` (exact Cholesky or Nyström ridge solves, Gram or solution vectors), `linalg` (blocked and pivoted Cholesky, triangular solves), `refit` (`honest_refit`, Boulevard models and Boulevard EBMs), `ebm` (shape-function bands)|
+|`ebm/`|public: `EbmInfo` (terms, tree→term map, term means), `shape_functions`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds, leaves as boxes, difference arrays)|
+|`model/`|`mod.rs` (`BoostedModel`; XGBoost interchange docs), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `native`, `sections` (shared by native and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact` (public, `HBTD`), `xgboost` (JSON/UBJSON schema), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
@@ -152,8 +154,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 |Path|Non-obvious contents|
 |---|---|
 |`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `metal` on macOS|
-|`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `online` (`OnlineModel`: the one mutable class, its state behind a mutex locked only detached; updates through `run_hooked`), `dist`|
-|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`, `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `folds`, `online` (`OnlineModel`, `UpdateReport`); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
+|`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, formats, format detection), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `inference` (`BoulevardInference` owning its model and holdout rows via `self_cell`, `honest_refit`), `ebm` (`TermShape`, `shape_functions`, `EbmInference`), `online` (`OnlineModel`: the one mutable class, its state behind a mutex locked only detached; updates through `run_hooked`), `dist`|
+|`python/hessboost/`|the public API, pure Python: `_core` (`DMatrix`, `Booster`, `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn`, `conformal`, `inference` (`BoulevardInference`, `BoulevardInfo`, `EbmInference`, `TermBands`, `honest_refit`), `ebm` (`shape_functions`, `TermShape`, axes, `EbmInfo`), `folds`, `online` (`OnlineModel`, `UpdateReport`); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
 |`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit|
 
 ## Invariants
@@ -169,7 +171,13 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   blocks. Sequential draws (rows, columns, DART, folds, target-stat
   permutations) use `rng::Rng`. Keyed draws (`extra_trees` node seeds,
   `dist:*` split direction, quantized stochastic rounding, per-block
-  row-sampling seeds) use SplitMix64 streams keyed by seed and index.
+  row-sampling seeds, Langevin noise) use SplitMix64 streams keyed by seed
+  and index. Boulevard rounds (dropout sets, row samples) and Nyström
+  landmarks draw from `rng::Rng` seeded per round; the inference's parallel
+  loops split by rows or fixed row blocks, never by thread. EBM rounds draw
+  from `Rng` keyed by seed, bag, stage, and round (bags' rows from
+  SplitMix64 keyed by bag); bags and a Boulevard round's per-term trees may
+  grow in parallel and are combined in bag and term order.
   Quantized histograms sum integers. `rand` stays a dev-dependency.
   `Trainer::on_round` only observes: a hook that always continues leaves
   the model byte-identical, and a `Break` after round `k` gives the
@@ -219,7 +227,9 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     (`model/sections.rs`), XXH64 of the preceding bytes. A new stored field
     is a new section: flag it `REQUIRED` if unaware readers must refuse
     rather than skip it, and default its absence to reproduce older files
-    (objective parameters: the objective's defaults). Readers refuse
+    (objective parameters: the objective's defaults; the optional
+    `boulevard.*` sections: not a Boulevard fit; the optional `ebm.*`
+    sections: not an EBM). Readers refuse
     anything undefined inside known sections (unknown `node.flags` bits,
     `tree.has_linear` not 0/1, trailing bytes), which is what makes new flag
     bits safe. Changing a section's meaning or the container layout bumps
@@ -238,14 +248,18 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
     `PartialStoredObjectiveParams` (each member a `Stored`, so `null` stays
     an error), and missing members take
     `StoredObjectiveParams::defaults_for(objective)`. Loading maps the
-    record to `ModelObjective::from_stored` (unknown names are
-    `ModelObjective::Other`; parameters the objective does not read are
-    dropped).
+    record to `ModelObjective::from_stored` (an unknown name is recorded
+    as a name alone, a built-in name always loads as that objective;
+    parameters the objective does not read are dropped). `ModelObjective`
+    keeps its representation private so a recorded name is never a
+    built-in objective's and a built-in objective never a custom loss.
+    A missing `boulevard` or `ebm` is `None`.
     Everything predictions depend on is required, nullable ones via
     `deserialize_with = "Option::deserialize"` (a plain `Option` would
     default when absent); exceptions: a tree may omit `size_leaf_vector`
     (0) except in multi-output models, and `leaf_vectors`; an absent
-    `best_iteration` means none. Writers emit every field.
+    `best_iteration` means none, and an absent `shrinkage` means no model
+    shrinkage. Writers emit every field.
   - Compact (`HBTD`, `model/compact.rs`): section-table metadata; a bit
     stream change bumps its version byte (1).
 - **Tree layout:** iteration `i` owns trees `i * trees_per_iteration ..`.
@@ -253,7 +267,15 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   output; tree `t` feeds output `(t / num_parallel_tree) % n_outputs`.
   Vector leaves: `num_parallel_tree` per iteration, each feeding all
   outputs. Counts, `best_iteration`, slicing, and ranges are in iterations,
-  never trees.
+  never trees. Tree weights are DART's or model shrinkage's: a shrunk
+  model stores unscaled trees, per-iteration coefficients, and the
+  unshrunk intercepts (`model/shrinkage.rs`), from which its closed-form
+  tree weights and intercepts derive bit for bit (SHAP and XGBoost export
+  use them). Its predictions (native, compact, `..k` ranges,
+  `slice(..k, 1)`, virtual ensembles) repeat training's shrink-then-add
+  recurrence (`shrink_margins`), so they are the training margins and the
+  `k`-round model bit for bit; later starts are refused, and early
+  stopping truncates it to the best iteration.
 - **Prediction layout:** predictions return `model::Predictions` (row-major
   `n_rows × width`, owning the computed buffer without a copy): width
   `n_outputs` (`num_class` for `multi:softprob`), 1 for `multi:softmax`, tree
@@ -304,9 +326,12 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   refused, `OBJECTIVE_KEYS` in `config/xgboost.rs`, as is a dependent key
   without its switch, e.g. `rate_drop` without `booster=dart`),
   `validate_request` in `training/train.rs` (data-dependent),
+  `validate_boulevard_request` and `validate_ebm_request` there too,
   `training/multi_output.rs::validate`, `training/continuation.rs`,
   `EvalMetric::from_xgboost` (metric names and suffixes), `training/budget.rs`,
-  and `training/online.rs::check_supported`.
+  and `training/online.rs::check_supported`; SGLB and model shrinkage in
+  `TrainingParams::validate_sglb` (static) and `training/sglb.rs::Sglb::resolve`
+  (posterior sampling's row count).
   Budget mode and refresh compare params against defaults plus an
   allow-list (`TrainingParams::refuse_changes_from`, over `changed_keys`,
   which destructures every field), so any new field is refused there
@@ -316,7 +341,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `Objective::Custom`, so every property (base-score domain, default
   metric, default `max_delta_step`, adaptive leaves, output count) comes
   from the loss being trained. A custom loss may not take a built-in
-  objective's name: the model records it as `ModelObjective::Other(name)`.
+  objective's name: the model records it by name (`ModelObjective::name`,
+  no `built_in` objective).
 - **Python:** `python/` uses only the crate's public API. The public
   Python API is pure Python; the extension is private, fully stubbed
   (`_hessboost.pyi`, which ty checks callers against; nothing checks it
@@ -346,7 +372,8 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   aliases.
 - Opt-in subsystems with substantial docs get their own public module
   (`data::target_stats`, `training::budget`, `model::compact`,
-  `objective::distributional`, `conformal`, `training::online`).
+  `objective::distributional`, `conformal`, `model::uncertainty`,
+  `inference`, `ebm`, `training::online`).
 - Implementation modules are crate-private; benches and parity tests reach
   internals through `#[doc(hidden)] pub mod internals` in `lib.rs`, which
   is not public API.
@@ -358,8 +385,24 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 Easy-to-miss requirements: multiclass needs `Multiclass::new(k)`; ranking needs
 `.with_group_sizes`; `survival:aft` needs `.with_label_bounds`;
 `survival:cox` reads non-positive labels as right-censored;
+losses randomized per round (XE-NDCG) take the round from
+`Loss::gradient_info_at`, so every training loop calls it;
 `Loss::split_gradient` serves vector-leaf trees only, not with
-monotone constraints. Linear-leaf models predict through `tree::linear`;
+monotone constraints. `booster = boulevard` is squared error only, refuses
+nonlinear-leaf options, label-dependent row sampling (gradient-based,
+class-balanced), weights, base margins, early stopping, continuation, and
+online updates, and needs `eta = 1` with `num_parallel_tree > 1` (BRAT-P); its
+leaves carry the final `1/B` scale, so exports and SHAP see a plain gbtree
+ensemble, and slices drop the `BoulevardInfo`. `booster = ebm` counts every
+tree as an iteration (`num_boost_round` counts EBM rounds, one tree per term
+each, and caps each stage under `ebm_early_stopping_rounds`, which stops
+every bag on its held-out rows), needs one output, refuses eval sets,
+`Trainer::early_stopping_rounds`, continuation, online updates, column sampling,
+interaction constraints, forests, feature weights, and base margins, draws
+each classic tree's rows from its outer bag (by class under balanced
+bagging, by query under query bagging), and calls `on_round` after every round of both stages; `ebm_boulevard` adds
+Boulevard's refusals plus outer bags, early stopping, and `base_score`, and
+its loaders check the stage-contiguous round-robin tree layout. Slices and exports drop the `EbmInfo`. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.
 
 ## When changing behavior

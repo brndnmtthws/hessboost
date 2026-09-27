@@ -1,8 +1,9 @@
 //! The crate's random numbers: [`Rng`], the seeded sequential generator
 //! behind row, column, DART, fold and permutation sampling, and the
 //! SplitMix64 mixing shared by the counter-based streams (`extra_trees` node
-//! seeds, quantized stochastic rounding, `dist:*` split-direction draws) and
-//! the per-block row-sampling seeds.
+//! seeds, quantized stochastic rounding, `dist:*` split-direction draws,
+//! Langevin gradient noise, XE-NDCG targets) and the per-block row-sampling
+//! seeds.
 
 use std::ops::Range;
 
@@ -21,6 +22,47 @@ pub(crate) fn mix64(mut z: u64) -> u64 {
 #[inline]
 pub(crate) fn splitmix64(z: u64) -> u64 {
     mix64(z.wrapping_add(GOLDEN))
+}
+
+/// The key of the counter-based stream named by `parts` (a seed, a salt,
+/// then indices such as the iteration and the tree): chained SplitMix64
+/// steps, so every part changes the whole key.
+pub(crate) fn stream_key(parts: &[u64]) -> u64 {
+    parts.iter().fold(0, |key, &part| splitmix64(key ^ part))
+}
+
+/// The 64 random bits at position `index` of the stream `key`: SplitMix64
+/// at `index + 1`, so position `0` of a zero key is not the fixed point
+/// `mix64(0) = 0`.
+#[inline]
+fn keyed_bits(key: u64, index: u64) -> u64 {
+    mix64(key.wrapping_add(index.wrapping_add(1).wrapping_mul(GOLDEN)))
+}
+
+/// Uniform variate on `(0, 1]` at position `index` of the stream `key`
+/// (the top 53 bits of [`keyed_bits`] plus one ulp, so never `0`).
+#[inline]
+fn keyed_unit_open(key: u64, index: u64) -> f64 {
+    ((keyed_bits(key, index) >> 11) + 1) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// Uniform `f32` variate on `[0, 1)` at position `index` of the stream
+/// `key`: the top 24 bits of [`keyed_bits`], every value a multiple of
+/// `2^-24` (the `f32` mantissa, so the conversion is exact).
+#[inline]
+pub(crate) fn keyed_unit_f32(key: u64, index: u64) -> f32 {
+    (keyed_bits(key, index) >> 40) as f32 * (1.0 / (1u32 << 24) as f32)
+}
+
+/// Standard normal variate `index` of the stream `key`: Box–Muller's cosine
+/// branch on the stream's uniforms `2 * index` and `2 * index + 1`. A pure
+/// function of `(key, index)`, so parallel callers draw the same variates
+/// in any order.
+#[inline]
+pub(crate) fn keyed_normal(key: u64, index: u64) -> f64 {
+    let u1 = keyed_unit_open(key, index.wrapping_mul(2));
+    let u2 = keyed_unit_open(key, index.wrapping_mul(2).wrapping_add(1));
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
 /// A seeded xoshiro256++ generator (Blackman and Vigna, 2019), its state
@@ -159,5 +201,25 @@ mod tests {
             first[v[0]] += 1;
         }
         assert!(first.iter().all(|&c| c.abs_diff(10_000) < 500), "{first:?}");
+    }
+
+    #[test]
+    fn keyed_normals_are_standard_normal() {
+        let key = stream_key(&[11, 0x5617_B000]);
+        let n = 200_000u64;
+        let draws: Vec<f64> = (0..n).map(|i| keyed_normal(key, i)).collect();
+        let mean = draws.iter().sum::<f64>() / n as f64;
+        let var = draws.iter().map(|z| (z - mean).powi(2)).sum::<f64>() / n as f64;
+        let tail = draws.iter().filter(|z| z.abs() > 1.959_964).count() as f64 / n as f64;
+        // Standard errors: mean 0.0022, variance 0.0032, tail share 0.0005.
+        assert!(mean.abs() < 0.012, "mean {mean}");
+        assert!((var - 1.0).abs() < 0.016, "variance {var}");
+        assert!((tail - 0.05).abs() < 0.003, "two-sided 5% tail {tail}");
+        assert!(draws.iter().all(|z| z.is_finite()));
+        // Distinct keys give distinct streams.
+        assert_ne!(
+            keyed_normal(key, 0),
+            keyed_normal(stream_key(&[12, 0x5617_B000]), 0)
+        );
     }
 }

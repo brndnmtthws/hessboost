@@ -92,6 +92,21 @@ impl ColumnSampler {
         ColumnSampler::new(n_features, None, 1.0, 1.0, 1.0, 0)
     }
 
+    /// A sampler that offers exactly `features` (ascending) at every node,
+    /// drawing nothing: an EBM term's tree. `seed` keys the tree's other
+    /// random streams ([`Self::seed`]).
+    pub(crate) fn only(features: Vec<u32>, seed: u64) -> Self {
+        ColumnSampler {
+            tree: features,
+            levels: Vec::new(),
+            weights: None,
+            bylevel: 1.0,
+            bynode: 1.0,
+            rng: Rng::new(seed),
+            seed,
+        }
+    }
+
     /// The candidate features for a node at `depth`: that depth's cached
     /// `bylevel` subset of the tree pool, then a fresh `bynode` subset of it.
     /// Returned features are sorted ascending.

@@ -3,7 +3,10 @@
 //! and [`TrainingParams::to_xgboost`]. The Python bindings, the parity tests,
 //! and the training fuzz target all go through it.
 
-use super::groups::{Dart, ExtraTrees, LinearTree, QuantizedGrad, Refresh};
+use super::groups::{
+    BalancedBagging, Boulevard, Dart, Ebm, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
+};
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
     SamplingMethod, TrainingParams, TreeMethod,
@@ -37,6 +40,10 @@ const FIXED: &[(&str, &str)] = &[
     ("max_cat_threshold", "64"),
 ];
 
+/// CatBoost's `model_shrink_rate` for `langevin=true` in the constant mode
+/// when the rate is not given (`SetNotSpecifiedOptionsToDefaults`).
+const LANGEVIN_SHRINK_RATE: f64 = 0.001;
+
 /// XGBoost's `booster` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,6 +51,8 @@ enum FlatBooster {
     GbTree,
     Dart,
     GbLinear,
+    Boulevard,
+    Ebm,
 }
 
 /// XGBoost's `process_type` names.
@@ -120,6 +129,9 @@ flat_params! {
     interaction_constraints: Vec<Vec<u32>>,
     num_parallel_tree: usize,
     sampling_method: SamplingMethod,
+    pos_bagging_fraction: f64,
+    neg_bagging_fraction: f64,
+    bagging_by_query: bool,
     multi_strategy: MultiStrategy,
     process_type: FlatProcess,
     refresh_leaf: bool,
@@ -134,8 +146,22 @@ flat_params! {
     quant_train_renew_leaf: bool,
     rate_drop: f64,
     skip_drop: f64,
+    one_drop: bool,
     toad_penalty_feature: f64,
     toad_penalty_threshold: f64,
+    langevin: bool,
+    diffusion_temperature: f64,
+    model_shrink_rate: f64,
+    model_shrink_mode: ModelShrinkMode,
+    posterior_sampling: bool,
+    boulevard_dropout: f64,
+    boulevard_truncation: f64,
+    ebm_interactions: usize,
+    ebm_outer_bags: usize,
+    ebm_bag_fraction: f64,
+    ebm_boulevard: bool,
+    ebm_early_stopping_rounds: usize,
+    ebm_early_stopping_tolerance: f64,
 }
 
 /// The flat keys of the objective parameters, with the objectives and
@@ -230,6 +256,9 @@ impl Flat {
             interaction_constraints,
             num_parallel_tree,
             sampling_method,
+            pos_bagging_fraction,
+            neg_bagging_fraction,
+            bagging_by_query,
             multi_strategy,
             process_type,
             refresh_leaf,
@@ -244,8 +273,22 @@ impl Flat {
             quant_train_renew_leaf,
             rate_drop,
             skip_drop,
+            one_drop,
             toad_penalty_feature,
             toad_penalty_threshold,
+            langevin,
+            diffusion_temperature,
+            model_shrink_rate,
+            model_shrink_mode,
+            posterior_sampling,
+            boulevard_dropout,
+            boulevard_truncation,
+            ebm_interactions,
+            ebm_outer_bags,
+            ebm_bag_fraction,
+            ebm_boulevard,
+            ebm_early_stopping_rounds,
+            ebm_early_stopping_tolerance,
         } = self;
         // Aligned with `OBJECTIVE_KEYS`.
         let present = [
@@ -323,6 +366,60 @@ impl Flat {
                 "`booster=dart`",
             ),
             (
+                "one_drop",
+                one_drop.is_some(),
+                booster == Some(FlatBooster::Dart),
+                "`booster=dart`",
+            ),
+            (
+                "boulevard_dropout",
+                boulevard_dropout.is_some(),
+                booster == Some(FlatBooster::Boulevard),
+                "`booster=boulevard`",
+            ),
+            (
+                "boulevard_truncation",
+                boulevard_truncation.is_some(),
+                booster == Some(FlatBooster::Boulevard),
+                "`booster=boulevard`",
+            ),
+            (
+                "ebm_interactions",
+                ebm_interactions.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_outer_bags",
+                ebm_outer_bags.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_bag_fraction",
+                ebm_bag_fraction.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_boulevard",
+                ebm_boulevard.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_early_stopping_rounds",
+                ebm_early_stopping_rounds.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
+                "ebm_early_stopping_tolerance",
+                ebm_early_stopping_tolerance.is_some(),
+                booster == Some(FlatBooster::Ebm),
+                "`booster=ebm`",
+            ),
+            (
                 "refresh_leaf",
                 refresh_leaf.is_some(),
                 process_type == Some(FlatProcess::Update),
@@ -358,6 +455,18 @@ impl Flat {
                 use_quantized_grad == Some(true),
                 "`use_quantized_grad=true`",
             ),
+            (
+                "diffusion_temperature",
+                diffusion_temperature.is_some(),
+                langevin == Some(true),
+                "`langevin=true`",
+            ),
+            (
+                "model_shrink_mode",
+                model_shrink_mode.is_some(),
+                model_shrink_rate.is_some_and(|rate| rate != 0.0),
+                "a `model_shrink_rate` other than 0",
+            ),
         ];
         for (key, set, on, needs) in switches {
             if set && !on {
@@ -378,7 +487,43 @@ impl Flat {
                 if let Some(skip_drop) = skip_drop {
                     dart = dart.skip_drop(skip_drop);
                 }
+                if let Some(one_drop) = one_drop {
+                    dart = dart.one_drop(one_drop);
+                }
                 BoosterKind::Dart(dart.build()?)
+            }
+            FlatBooster::Boulevard => {
+                let mut boulevard = Boulevard::builder();
+                if let Some(dropout) = boulevard_dropout {
+                    boulevard = boulevard.dropout(dropout);
+                }
+                // The flat `0` is no truncation.
+                if let Some(truncation) = boulevard_truncation.filter(|&t| t != 0.0) {
+                    boulevard = boulevard.truncation(truncation);
+                }
+                BoosterKind::Boulevard(boulevard.build()?)
+            }
+            FlatBooster::Ebm => {
+                let mut ebm = Ebm::builder();
+                if let Some(v) = ebm_interactions {
+                    ebm = ebm.interactions(v);
+                }
+                if let Some(v) = ebm_outer_bags {
+                    ebm = ebm.outer_bags(v);
+                }
+                if let Some(v) = ebm_bag_fraction {
+                    ebm = ebm.bag_fraction(v);
+                }
+                if let Some(v) = ebm_boulevard {
+                    ebm = ebm.boulevard(v);
+                }
+                if let Some(v) = ebm_early_stopping_rounds {
+                    ebm = ebm.early_stopping_rounds(v);
+                }
+                if let Some(v) = ebm_early_stopping_tolerance {
+                    ebm = ebm.early_stopping_tolerance(v);
+                }
+                BoosterKind::Ebm(ebm.build()?)
             }
         };
         let process_type = match process_type.unwrap_or(FlatProcess::Default) {
@@ -409,6 +554,71 @@ impl Flat {
             Some(q.build()?)
         } else {
             None
+        };
+        // LightGBM's default of 1 for both fractions is no balanced bagging.
+        let balanced_bagging = match (pos_bagging_fraction, neg_bagging_fraction) {
+            (None, None) => None,
+            (pos, neg) => {
+                let (pos, neg) = (pos.unwrap_or(1.0), neg.unwrap_or(1.0));
+                (pos != 1.0 || neg != 1.0)
+                    .then(|| BalancedBagging::new(pos, neg))
+                    .transpose()?
+            }
+        };
+        // LightGBM's `bagging_by_query` turns `bagging_fraction`
+        // (`subsample`) into the fraction of queries kept.
+        let (subsample, bagging_by_query) = if bagging_by_query == Some(true) {
+            let fraction = subsample.unwrap_or(1.0);
+            if fraction >= 1.0 {
+                return Err(HessboostError::invalid_param(
+                    "bagging_by_query",
+                    format!(
+                        "needs `subsample` < 1, the fraction of queries kept each round, \
+                         got {fraction}"
+                    ),
+                ));
+            }
+            (None, Some(QueryBagging::new(fraction)?))
+        } else {
+            (subsample, None)
+        };
+        // CatBoost: posterior sampling needs Langevin "not set or true", and
+        // derives the shrink rate (an explicit one, `0` included, is refused
+        // rather than overridden).
+        if posterior_sampling == Some(true) && langevin == Some(false) {
+            return Err(HessboostError::invalid_param(
+                "langevin",
+                "`posterior_sampling` requires Langevin boosting; leave `langevin` unset or true",
+            ));
+        }
+        if posterior_sampling == Some(true) && model_shrink_rate.is_some() {
+            return Err(HessboostError::invalid_param(
+                "model_shrink_rate",
+                "is derived by `posterior_sampling` (constant, 1 / (2 * rows)); leave it unset",
+            ));
+        }
+        let langevin = if langevin == Some(true) {
+            let mut l = Langevin::builder();
+            if let Some(temperature) = diffusion_temperature {
+                l = l.diffusion_temperature(temperature);
+            }
+            Some(l.build()?)
+        } else {
+            None
+        };
+        let model_shrink = match model_shrink_rate {
+            // CatBoost's rate `0` is no shrinkage.
+            Some(0.0) => None,
+            Some(rate) => Some(ModelShrink::new(
+                rate,
+                model_shrink_mode.unwrap_or_default(),
+            )?),
+            // CatBoost's default under Langevin (`SetNotSpecifiedOptionsToDefaults`
+            // in `catboost_options.cpp`); posterior sampling derives its own.
+            None if langevin.is_some() && posterior_sampling != Some(true) => Some(
+                ModelShrink::new(LANGEVIN_SHRINK_RATE, ModelShrinkMode::Constant)?,
+            ),
+            None => None,
         };
         let d = TrainingParams::default();
         Ok(TrainingParams {
@@ -442,6 +652,8 @@ impl Flat {
             interaction_constraints: interaction_constraints.unwrap_or(d.interaction_constraints),
             num_parallel_tree: num_parallel_tree.unwrap_or(d.num_parallel_tree),
             sampling_method: sampling_method.unwrap_or(d.sampling_method),
+            balanced_bagging,
+            bagging_by_query,
             multi_strategy: multi_strategy.unwrap_or(d.multi_strategy),
             process_type,
             extra_trees,
@@ -450,6 +662,9 @@ impl Flat {
             quantized,
             toad_penalty_feature: toad_penalty_feature.unwrap_or(d.toad_penalty_feature),
             toad_penalty_threshold: toad_penalty_threshold.unwrap_or(d.toad_penalty_threshold),
+            langevin,
+            model_shrink,
+            posterior_sampling: posterior_sampling.unwrap_or(d.posterior_sampling),
         })
     }
 }
@@ -649,6 +864,11 @@ impl TrainingParams {
     /// `nthread` reads as `None` (no limit, the global pool), and
     /// `max_delta_step` as a [`MaxDeltaStep`]: absent or `null` is
     /// `ObjectiveDefault`, `0` is `Unbounded`, anything else `Bounded`.
+    /// CatBoost's `model_shrink_rate = 0` reads as `model_shrink = None`,
+    /// and `langevin = true` without a rate (and without posterior
+    /// sampling) as CatBoost's default, a constant rate `0.001`;
+    /// [`to_xgboost`](Self::to_xgboost) writes a `0` rate for Langevin
+    /// without shrinkage.
     ///
     /// # Errors
     ///
@@ -725,7 +945,7 @@ impl TrainingParams {
                         Objective::RankPairwise(_) | Objective::RankNdcg(_) | Objective::RankMap(_)
                     ) =>
                 {
-                    "applies only to the `rank:*` objectives"
+                    "applies only to the LambdaMART `rank:*` objectives"
                 }
                 _ => continue,
             };
@@ -744,7 +964,8 @@ impl TrainingParams {
     ///
     /// # Errors
     ///
-    /// A configuration XGBoost's form cannot state: a custom loss, or a
+    /// A configuration [`validate`](Self::validate) refuses, or one
+    /// XGBoost's form cannot state: a custom loss, or a
     /// metric whose parameters differ from the objective's (XGBoost's
     /// `mphe`, `quantile`, `expectile`, and `aft-nloglik` read the same
     /// keys as the objective, and `nll` / `crps` its `dist:*` family).
@@ -776,6 +997,8 @@ impl TrainingParams {
             interaction_constraints,
             num_parallel_tree,
             sampling_method,
+            balanced_bagging,
+            bagging_by_query,
             multi_strategy,
             process_type,
             extra_trees,
@@ -784,6 +1007,9 @@ impl TrainingParams {
             quantized,
             toad_penalty_feature,
             toad_penalty_threshold,
+            langevin,
+            model_shrink,
+            posterior_sampling,
         } = self;
         if let Objective::Custom(loss) = objective {
             return Err(HessboostError::invalid_param(
@@ -791,6 +1017,9 @@ impl TrainingParams {
                 format!("the custom loss `{}` has no XGBoost flat form", loss.name()),
             ));
         }
+        // The fields are public: an invalid value (a NaN bound) would be
+        // written as one that reads back as another (`null`, unset).
+        self.validate()?;
         let mut objective_keys = objective_keys(objective);
         for metric in eval_metric {
             for (key, value) in metric_keys(metric, objective)? {
@@ -829,6 +1058,30 @@ impl TrainingParams {
                 set("booster", json("dart"));
                 set("rate_drop", json(dart.rate_drop()));
                 set("skip_drop", json(dart.skip_drop()));
+                set("one_drop", json(dart.one_drop()));
+            }
+            BoosterKind::Boulevard(boulevard) => {
+                set("booster", json("boulevard"));
+                set("boulevard_dropout", json(boulevard.dropout()));
+                set(
+                    "boulevard_truncation",
+                    json(boulevard.truncation().unwrap_or(0.0)),
+                );
+            }
+            BoosterKind::Ebm(ebm) => {
+                set("booster", json("ebm"));
+                set("ebm_interactions", json(ebm.interactions()));
+                set("ebm_outer_bags", json(ebm.outer_bags()));
+                set("ebm_bag_fraction", json(ebm.bag_fraction()));
+                set("ebm_boulevard", json(ebm.boulevard()));
+                set(
+                    "ebm_early_stopping_rounds",
+                    json(ebm.early_stopping_rounds()),
+                );
+                set(
+                    "ebm_early_stopping_tolerance",
+                    json(ebm.early_stopping_tolerance()),
+                );
             }
         }
         set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));
@@ -841,7 +1094,7 @@ impl TrainingParams {
         if let Some(base_score) = base_score {
             set("base_score", json(base_score));
         }
-        let names: Vec<_> = eval_metric.iter().map(EvalMetric::name).collect();
+        let names: Vec<_> = eval_metric.iter().map(EvalMetric::flat_name).collect();
         set("eval_metric", json(names));
         set("eta", json(eta));
         set("gamma", json(gamma));
@@ -853,7 +1106,13 @@ impl TrainingParams {
             MaxDeltaStep::Unbounded => set("max_delta_step", json(0.0)),
             MaxDeltaStep::Bounded(bound) => set("max_delta_step", json(bound)),
         }
-        set("subsample", json(subsample));
+        match bagging_by_query {
+            Some(bagging) => {
+                set("bagging_by_query", json(true));
+                set("subsample", json(bagging.fraction()));
+            }
+            None => set("subsample", json(subsample)),
+        }
         set("colsample_bytree", json(colsample_bytree));
         set("colsample_bylevel", json(colsample_bylevel));
         set("colsample_bynode", json(colsample_bynode));
@@ -866,6 +1125,10 @@ impl TrainingParams {
         set("interaction_constraints", json(interaction_constraints));
         set("num_parallel_tree", json(num_parallel_tree));
         set("sampling_method", json(sampling_method));
+        if let Some(bagging) = balanced_bagging {
+            set("pos_bagging_fraction", json(bagging.pos_fraction()));
+            set("neg_bagging_fraction", json(bagging.neg_fraction()));
+        }
         set("multi_strategy", json(multi_strategy));
         match process_type {
             ProcessType::Default => set("process_type", json("default")),
@@ -891,6 +1154,25 @@ impl TrainingParams {
         }
         set("toad_penalty_feature", json(toad_penalty_feature));
         set("toad_penalty_threshold", json(toad_penalty_threshold));
+        if let Some(langevin) = langevin {
+            set("langevin", json(true));
+            if let Some(temperature) = langevin.diffusion_temperature() {
+                set("diffusion_temperature", json(temperature));
+            }
+        }
+        match model_shrink {
+            Some(shrink) => {
+                set("model_shrink_rate", json(shrink.rate()));
+                set("model_shrink_mode", json(shrink.mode()));
+            }
+            // The flat `langevin=true` alone shrinks at CatBoost's default
+            // rate; `0` keeps it off.
+            None if langevin.is_some() && !posterior_sampling => {
+                set("model_shrink_rate", json(0.0));
+            }
+            None => {}
+        }
+        set("posterior_sampling", json(posterior_sampling));
         Ok(flat)
     }
 
@@ -924,6 +1206,8 @@ impl TrainingParams {
             interaction_constraints,
             num_parallel_tree,
             sampling_method,
+            balanced_bagging,
+            bagging_by_query,
             multi_strategy,
             process_type,
             extra_trees,
@@ -932,6 +1216,9 @@ impl TrainingParams {
             quantized,
             toad_penalty_feature,
             toad_penalty_threshold,
+            langevin,
+            model_shrink,
+            posterior_sampling,
         } = self;
         let mut changed = Vec::new();
         let mut differs = |key: &'static str, same: bool| {
@@ -986,6 +1273,20 @@ impl TrainingParams {
             *num_parallel_tree == other.num_parallel_tree,
         );
         differs("sampling_method", *sampling_method == other.sampling_method);
+        // Each fraction as LightGBM states it, 1 when balanced bagging is off.
+        let fractions = |bagging: &Option<BalancedBagging>| {
+            bagging.map_or((1.0, 1.0), |b| (b.pos_fraction(), b.neg_fraction()))
+        };
+        let (ours, theirs) = (
+            fractions(balanced_bagging),
+            fractions(&other.balanced_bagging),
+        );
+        differs("pos_bagging_fraction", ours.0 == theirs.0);
+        differs("neg_bagging_fraction", ours.1 == theirs.1);
+        differs(
+            "bagging_by_query",
+            *bagging_by_query == other.bagging_by_query,
+        );
         differs("multi_strategy", *multi_strategy == other.multi_strategy);
         differs("process_type", *process_type == other.process_type);
         differs("extra_trees", *extra_trees == other.extra_trees);
@@ -999,6 +1300,12 @@ impl TrainingParams {
         differs(
             "toad_penalty_threshold",
             *toad_penalty_threshold == other.toad_penalty_threshold,
+        );
+        differs("langevin", *langevin == other.langevin);
+        differs("model_shrink_rate", *model_shrink == other.model_shrink);
+        differs(
+            "posterior_sampling",
+            *posterior_sampling == other.posterior_sampling,
         );
         changed.sort_unstable();
         changed
@@ -1095,6 +1402,7 @@ mod tests {
     fn dependent_keys_without_their_switch_are_refused_by_name() {
         for (pairs, key) in [
             (json!({"booster": "gbtree", "rate_drop": 0.1}), "rate_drop"),
+            (json!({"one_drop": true}), "one_drop"),
             (json!({"refresh_leaf": false}), "refresh_leaf"),
             (json!({"extra_seed": 3}), "extra_seed"),
             (json!({"extra_trees": false, "extra_seed": 3}), "extra_seed"),
@@ -1109,6 +1417,89 @@ mod tests {
         }
     }
 
+    /// LightGBM's class fractions become one [`BalancedBagging`] (a missing
+    /// one at LightGBM's default 1, both at 1 meaning off) and read back
+    /// from the flat form; the fractions are refused by name where nothing
+    /// would bag by class.
+    #[test]
+    fn balanced_bagging_reads_lightgbm_fractions() {
+        let binary = json!("binary:logistic");
+        let p = TrainingParams::from_xgboost([
+            ("objective", binary.clone()),
+            ("neg_bagging_fraction", json!(0.2)),
+        ])
+        .unwrap();
+        assert_eq!(
+            p.balanced_bagging,
+            Some(BalancedBagging::new(1.0, 0.2).unwrap())
+        );
+        assert_eq!(
+            TrainingParams::from_xgboost(p.to_xgboost().unwrap()).unwrap(),
+            p
+        );
+        let off = TrainingParams::from_xgboost([
+            ("objective", binary.clone()),
+            ("pos_bagging_fraction", json!(1.0)),
+            ("neg_bagging_fraction", json!(1.0)),
+        ])
+        .unwrap();
+        assert_eq!(off.balanced_bagging, None);
+        for (pairs, key) in [
+            (json!({"pos_bagging_fraction": 0.5}), "pos_bagging_fraction"),
+            (
+                json!({"objective": binary, "neg_bagging_fraction": 0.5, "subsample": 0.8}),
+                "subsample",
+            ),
+            (
+                json!({"objective": binary, "neg_bagging_fraction": 0.0}),
+                "neg_bagging_fraction",
+            ),
+        ] {
+            let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
+            assert!(
+                refusal.starts_with(&format!("invalid parameter `{key}`")),
+                "{pairs}: {refusal}"
+            );
+        }
+    }
+
+    /// LightGBM's `bagging_by_query` reads `subsample` as the fraction of
+    /// queries kept, and writes it back there; without a fraction below 1,
+    /// or with a non-ranking objective, it is refused by name.
+    #[test]
+    fn bagging_by_query_reads_subsample_as_the_query_fraction() {
+        let p = TrainingParams::from_xgboost([
+            ("objective", json!("rank:xendcg")),
+            ("bagging_by_query", json!(true)),
+            ("subsample", json!(0.7)),
+        ])
+        .unwrap();
+        assert_eq!(p.bagging_by_query, Some(QueryBagging::new(0.7).unwrap()));
+        assert_eq!(p.subsample, 1.0);
+        let flat = p.to_xgboost().unwrap();
+        assert_eq!(
+            (&flat["bagging_by_query"], &flat["subsample"]),
+            (&json!(true), &json!(0.7))
+        );
+        assert_eq!(TrainingParams::from_xgboost(flat).unwrap(), p);
+        let off = TrainingParams::from_xgboost([
+            ("bagging_by_query", json!(false)),
+            ("subsample", json!(0.7)),
+        ])
+        .unwrap();
+        assert_eq!((off.bagging_by_query, off.subsample), (None, 0.7));
+        for pairs in [
+            json!({"objective": "rank:ndcg", "bagging_by_query": true}),
+            json!({"bagging_by_query": true, "subsample": 0.5}),
+        ] {
+            let refusal = refused(pairs.clone()).unwrap_or_else(|| panic!("{pairs} accepted"));
+            assert!(
+                refusal.starts_with("invalid parameter `bagging_by_query`"),
+                "{pairs}: {refusal}"
+            );
+        }
+    }
+
     /// Every option group, switched on with non-default values, reads back
     /// from its flat form unchanged.
     #[test]
@@ -1118,6 +1509,7 @@ mod tests {
                 Dart::builder()
                     .rate_drop(0.2)
                     .skip_drop(0.3)
+                    .one_drop(true)
                     .build()
                     .unwrap(),
             ),
@@ -1217,6 +1609,7 @@ mod tests {
             Objective::RankPairwise(LambdaRank::new(4).unwrap()),
             Objective::RankNdcg(LambdaRank::new(8).unwrap()),
             Objective::RankMap(LambdaRank::default()),
+            Objective::RankXendcg,
             Objective::Cox,
             Objective::Aft(Aft::new(AftDistribution::Logistic, 1.7).unwrap()),
             Objective::Dist(dist),
@@ -1293,6 +1686,50 @@ mod tests {
     /// `mphe` the `huber_slope`, `quantile` / `expectile` the alpha lists,
     /// `aft-nloglik` the AFT noise, and `nll` / `crps` the `dist:*` family.
     /// A metric with other parameters has no flat form.
+    /// The fields are public, so a configuration can be invalid: it is
+    /// refused by name rather than written as a flat form that reads back
+    /// as a different one (a NaN bound or base score as `null`, i.e. unset).
+    #[test]
+    fn invalid_configurations_are_refused_not_serialized() {
+        for (p, key) in [
+            (
+                TrainingParams {
+                    max_delta_step: MaxDeltaStep::Bounded(f64::NAN),
+                    ..TrainingParams::default()
+                },
+                "max_delta_step",
+            ),
+            (
+                TrainingParams {
+                    base_score: Some(f64::NAN),
+                    ..TrainingParams::default()
+                },
+                "base_score",
+            ),
+        ] {
+            match p.to_xgboost() {
+                Err(HessboostError::InvalidParameter { name, .. }) => assert_eq!(name, key),
+                other => panic!("{key}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A Tweedie metric's variance power survives the flat form in full:
+    /// its `evals_result` key rounds to six digits, its flat spelling not.
+    #[test]
+    fn tweedie_metric_powers_round_trip_exactly() {
+        for power in ["1.999999", "1.23456789", "1.5"] {
+            let p = TrainingParams::from_xgboost([(
+                "eval_metric",
+                json!(format!("tweedie-nloglik@{power}")),
+            )])
+            .unwrap();
+            let back = TrainingParams::from_xgboost(p.to_xgboost().unwrap())
+                .unwrap_or_else(|e| panic!("{power}: {e}"));
+            assert_eq!(back.eval_metric, p.eval_metric, "{power}");
+        }
+    }
+
     #[test]
     fn metrics_take_the_flat_parameters_xgboost_gives_them() {
         use crate::objective::distributional::DistFamily;

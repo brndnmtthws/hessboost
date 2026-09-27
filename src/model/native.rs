@@ -13,7 +13,14 @@
 //! per node field across all trees (`node.*`), split per tree by
 //! `tree.node_count`, plus per-tree category pools, leaf vectors and leaf
 //! linear models. `model.writer` (optional, not `REQUIRED`, never read back)
-//! names the release that wrote the file, e.g. `hessboost 0.2.0`.
+//! names the release that wrote the file, e.g. `hessboost 0.2.0`. A model
+//! trained with model shrinkage adds `shrinkage.factors` (`f64`, one
+//! coefficient per iteration) and `shrinkage.base_score` (`f32`, the
+//! intercepts before shrinkage), both `REQUIRED`: a reader unaware of them
+//! would read iteration ranges as tree prefixes. Their absence means no
+//! shrinkage. A Boulevard fit adds the `boulevard.*` sections of its
+//! [`BoulevardInfo`] (not `REQUIRED`: predictions do not read them), an
+//! EBM the `ebm.*` sections of its [`EbmInfo`] (likewise optional).
 //!
 //! The reader is strict about everything it knows: `node.flags` bits it
 //! does not define, `tree.has_linear` bytes other than 0 and 1, and bytes
@@ -44,8 +51,10 @@ use std::sync::OnceLock;
 
 use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer, format_error, wrong_length};
-use super::{BoostedModel, LinearModel};
+use super::{BoostedModel, LinearModel, Shrinkage};
+use crate::ebm::{EbmBoulevard, EbmInfo};
 use crate::error::Result;
+use crate::inference::BoulevardInfo;
 use crate::objective::AftDistribution;
 use crate::objective::distributional::DistFamily;
 use crate::objective::distributional::{DistGradient, DistSplitDirection};
@@ -89,6 +98,8 @@ const KNOWN: &[&str] = &[
     "model.best_iteration",
     "model.tree_weights",
     "model.num_parallel_tree",
+    SHRINKAGE_SECTIONS[0],
+    SHRINKAGE_SECTIONS[1],
     "gblinear.weights",
     "gblinear.bias",
     "tree.node_count",
@@ -111,7 +122,172 @@ const KNOWN: &[&str] = &[
     "leaf_linear.intercepts",
     "leaf_linear.features",
     "leaf_linear.coeffs",
+    "boulevard.dropout",
+    "boulevard.learning_rate",
+    "boulevard.subsample",
+    "boulevard.reg_lambda",
+    "boulevard.truncation",
+    "boulevard.seed",
+    "boulevard.intercept_from_labels",
+    "ebm.term_sizes",
+    "ebm.term_features",
+    "ebm.tree_terms",
+    "ebm.term_means",
+    "ebm.boulevard",
 ];
+
+/// The `boulevard.*` sections of a Boulevard model ([`BoulevardInfo`]),
+/// all written together. Not `REQUIRED`: predictions do not read them, so a
+/// reader that predates them loads the model as a plain `gbtree` ensemble.
+fn write_boulevard(w: &mut Writer, info: &BoulevardInfo) {
+    let f64s = [
+        ("boulevard.dropout", info.dropout),
+        ("boulevard.learning_rate", info.learning_rate),
+        ("boulevard.subsample", info.subsample),
+        ("boulevard.reg_lambda", info.reg_lambda),
+        // `0` is no truncation, as in files written before it was optional.
+        ("boulevard.truncation", info.truncation.unwrap_or(0.0)),
+    ];
+    for (name, value) in f64s {
+        w.raw(name, 0, &value.to_le_bytes());
+    }
+    w.raw("boulevard.seed", 0, &info.seed.to_le_bytes());
+    w.raw(
+        "boulevard.intercept_from_labels",
+        0,
+        &u64::from(info.intercept_from_labels).to_le_bytes(),
+    );
+}
+
+/// The [`BoulevardInfo`] of the `boulevard.*` sections: `None` when the file
+/// has none of them (every model that is not a Boulevard fit, and files
+/// written before they existed), an error when only some are present.
+fn read_boulevard(s: &Sections) -> Result<Option<BoulevardInfo>> {
+    if !s.has("boulevard.dropout") {
+        if let Some(name) = KNOWN
+            .iter()
+            .find(|name| name.starts_with("boulevard.") && s.has(name))
+        {
+            return Err(format_error(format!(
+                "`{name}` without `boulevard.dropout`"
+            )));
+        }
+        return Ok(None);
+    }
+    let intercept_from_labels = match s.u64("boulevard.intercept_from_labels")? {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(format_error(format!(
+                "`boulevard.intercept_from_labels` must be 0 or 1, got {other}"
+            )));
+        }
+    };
+    Ok(Some(BoulevardInfo {
+        dropout: s.f64("boulevard.dropout")?,
+        learning_rate: s.f64("boulevard.learning_rate")?,
+        subsample: s.f64("boulevard.subsample")?,
+        reg_lambda: s.f64("boulevard.reg_lambda")?,
+        truncation: Some(s.f64("boulevard.truncation")?).filter(|&t| t != 0.0),
+        seed: s.u64("boulevard.seed")?,
+        intercept_from_labels,
+    }))
+}
+
+/// The `ebm.*` sections of an EBM ([`EbmInfo`]): the terms' feature counts
+/// and features (concatenated), the term of each tree, the terms' training
+/// means, and for a Boulevard EBM `ebm.boulevard` (learning rate,
+/// subsample, `lambda`). Not `REQUIRED`: predictions do not read them, so a
+/// reader that predates them loads the model as a plain `gbtree` ensemble.
+fn write_ebm(w: &mut Writer, info: &EbmInfo) {
+    fn optional<const N: usize, T: Copy>(
+        w: &mut Writer,
+        name: &'static str,
+        values: impl IntoIterator<Item = T>,
+        to_le: fn(T) -> [u8; N],
+    ) {
+        let payload: Vec<u8> = values.into_iter().flat_map(to_le).collect();
+        w.raw(name, 0, &payload);
+    }
+    optional(
+        w,
+        "ebm.term_sizes",
+        info.terms.iter().map(|t| t.len() as u32),
+        u32::to_le_bytes,
+    );
+    optional(
+        w,
+        "ebm.term_features",
+        info.terms.iter().flatten().copied(),
+        u32::to_le_bytes,
+    );
+    optional(
+        w,
+        "ebm.tree_terms",
+        info.tree_terms.iter().copied(),
+        u32::to_le_bytes,
+    );
+    optional(
+        w,
+        "ebm.term_means",
+        info.term_means.iter().copied(),
+        f64::to_le_bytes,
+    );
+    if let Some(b) = &info.boulevard {
+        optional(
+            w,
+            "ebm.boulevard",
+            [b.learning_rate, b.subsample, b.reg_lambda],
+            f64::to_le_bytes,
+        );
+    }
+}
+
+/// The [`EbmInfo`] of the `ebm.*` sections: `None` when the file has none
+/// of them (every model that is not an EBM, and files written before they
+/// existed), an error when only some are present or they disagree in
+/// length. [`EbmInfo::validate`] checks the rest with the model.
+fn read_ebm(s: &Sections) -> Result<Option<EbmInfo>> {
+    if !s.has("ebm.term_sizes") {
+        if let Some(name) = KNOWN
+            .iter()
+            .find(|name| name.starts_with("ebm.") && s.has(name))
+        {
+            return Err(format_error(format!("`{name}` without `ebm.term_sizes`")));
+        }
+        return Ok(None);
+    }
+    let sizes = s.array("ebm.term_sizes", u32::from_le_bytes)?;
+    let features = s.array("ebm.term_features", u32::from_le_bytes)?;
+    if sizes.iter().map(|&k| k as usize).sum::<usize>() != features.len() {
+        return Err(wrong_length("ebm.term_features"));
+    }
+    let mut rest = features.as_slice();
+    let terms = sizes
+        .iter()
+        .map(|&k| {
+            let (term, tail) = rest.split_at(k as usize);
+            rest = tail;
+            term.to_vec()
+        })
+        .collect();
+    let boulevard = if s.has("ebm.boulevard") {
+        let v = s.array_exact("ebm.boulevard", 3, f64::from_le_bytes)?;
+        Some(EbmBoulevard {
+            learning_rate: v[0],
+            subsample: v[1],
+            reg_lambda: v[2],
+        })
+    } else {
+        None
+    };
+    Ok(Some(EbmInfo {
+        terms,
+        tree_terms: s.array("ebm.tree_terms", u32::from_le_bytes)?,
+        term_means: s.array("ebm.term_means", f64::from_le_bytes)?,
+        boulevard,
+    }))
+}
 
 /// The `objective.*` sections [`write_objective_params`] writes, shared by
 /// the native and compact formats.
@@ -129,6 +305,37 @@ pub(super) const OBJECTIVE_SECTIONS: &[&str] = &[
     "objective.dist_split_direction",
     "objective.distribution",
 ];
+
+/// The `shrinkage.*` sections [`write_shrinkage`] writes, shared by the
+/// native and compact formats.
+pub(super) const SHRINKAGE_SECTIONS: [&str; 2] = ["shrinkage.factors", "shrinkage.base_score"];
+
+/// Write the model shrinkage record `shrinkage` (both sections `REQUIRED`).
+pub(super) fn write_shrinkage(w: &mut Writer, shrinkage: &Shrinkage) {
+    w.array(
+        SHRINKAGE_SECTIONS[0],
+        shrinkage.factors().iter().copied(),
+        f64::to_le_bytes,
+    );
+    w.array(
+        SHRINKAGE_SECTIONS[1],
+        shrinkage.base_score().iter().copied(),
+        f32::to_le_bytes,
+    );
+}
+
+/// The model shrinkage record [`write_shrinkage`] wrote, `None` when `s`
+/// has neither section (no shrinkage). The caller validates it against its
+/// model.
+pub(super) fn read_shrinkage(s: &Sections) -> Result<Option<Shrinkage>> {
+    if !SHRINKAGE_SECTIONS.iter().any(|name| s.has(name)) {
+        return Ok(None);
+    }
+    Ok(Some(Shrinkage::new(
+        s.array(SHRINKAGE_SECTIONS[0], f64::from_le_bytes)?,
+        s.array(SHRINKAGE_SECTIONS[1], f32::from_le_bytes)?,
+    )))
+}
 
 /// Encode `model` as a container: zstd-compressed unless the frame would
 /// expand further than [`read`] accepts (see [`pack`]).
@@ -183,10 +390,19 @@ fn write_model_sections(w: &mut Writer, m: &BoostedModel) {
             f32::to_le_bytes,
         );
     }
+    if let Some(shrinkage) = &m.shrinkage {
+        write_shrinkage(w, shrinkage);
+    }
     write_objective_params(
         w,
         &StoredObjectiveParams::of(&m.objective, m.max_delta_step),
     );
+    if let Some(info) = &m.boulevard {
+        write_boulevard(w, info);
+    }
+    if let Some(info) = &m.ebm {
+        write_ebm(w, info);
+    }
 }
 
 /// The trees, column-wise: `tree.*` per-tree arrays, `node.*` per-node
@@ -409,6 +625,9 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
+        boulevard: read_boulevard(&s)?,
+        ebm: read_ebm(&s)?,
+        shrinkage: read_shrinkage(&s)?,
         compact: OnceLock::new(),
     })
 }
@@ -843,6 +1062,36 @@ mod tests {
         }
     }
 
+    /// A reader that predates the `boulevard.*` sections (here: they are
+    /// renamed to names this reader does not know) still loads a Boulevard
+    /// model and predicts the same, because the sections are optional.
+    #[test]
+    fn boulevard_sections_are_optional_for_older_readers() {
+        let (_, data) = model();
+        let params = TrainingParams::builder()
+            .booster(crate::config::BoosterKind::Boulevard(
+                crate::config::Boulevard::default(),
+            ))
+            .max_depth(2)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 3).unwrap();
+        let bytes = model.to_bytes().unwrap();
+        let edited = rewrite(&bytes, |entries| {
+            for e in entries.iter_mut() {
+                if let Some(rest) = e.name.strip_prefix("boulevard.") {
+                    e.name = format!("future.{rest}");
+                }
+            }
+        });
+        let loaded = BoostedModel::from_bytes(&edited).unwrap();
+        assert!(loaded.boulevard().is_none());
+        assert_eq!(
+            loaded.predict(&data).unwrap(),
+            model.predict(&data).unwrap()
+        );
+    }
+
     /// Every file names its writer in an optional section, so a reader that
     /// predates the section (or drops it) loads the file the same.
     #[test]
@@ -989,7 +1238,7 @@ mod tests {
         write(&BoostedModel {
             trees: Vec::new(),
             base_score: vec![0.5],
-            objective: ModelObjective::BuiltIn(Objective::SquaredError),
+            objective: ModelObjective::trained_with(&Objective::SquaredError),
             max_delta_step: 0.0,
             num_class: 0,
             n_outputs: 1,
@@ -999,6 +1248,9 @@ mod tests {
             tree_weights: Vec::new(),
             num_parallel_tree: 1,
             linear: Some(LinearModel::new(vec![0.0; n_features], vec![0.0])),
+            shrinkage: None,
+            boulevard: None,
+            ebm: None,
             compact: OnceLock::new(),
         })
         .unwrap()

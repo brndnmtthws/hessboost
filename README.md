@@ -32,9 +32,11 @@ and `λ` is the L2 penalty `lambda`.
   any thread count.
 - **Stable model files.** Anything saved by 0.2.0 or later loads in every
   later release.
-- **More than XGBoost, opt-in.** Conformal intervals, distributional
-  boosting, budget training, compact models, and more — all off by default,
-  none of them changes default training.
+- **More than XGBoost, opt-in.** Conformal intervals, confidence intervals
+  for the regression function (Boulevard boosting), explainable boosting
+  machines with shape-function bands, distributional boosting, SGLB
+  uncertainty, budget training, compact models, XE-NDCG ranking, and more —
+  all off by default, none of them changes default training.
 
 ## Getting started
 
@@ -98,14 +100,18 @@ runnable programs live in [`examples/`](examples)
 |---|---|
 | `train_regression` | end-to-end regression with feature importance |
 | `binary_classification` | a watched eval set, early stopping, AUC |
+| `balanced_bagging` | LightGBM class-stratified sampling for imbalanced binary classification |
 | `multiclass` | per-class probabilities and predicted classes |
-| `ranking` | LambdaMART over query groups |
+| `ranking` / `rank_xendcg` | LambdaMART and XE-NDCG with query bagging |
 | `constraints` | monotone and interaction constraints, categorical features |
 | `custom_objective` | a custom loss and eval metric |
 | `shap` | SHAP contributions and interaction values |
 | `model_io` | native and XGBoost JSON/UBJSON save and load |
 | `conformal` | calibrated prediction intervals |
+| `boulevard_inference` | confidence intervals for `f(x)` and prediction intervals |
+| `ebm` | an explainable boosting machine's shape functions and their confidence bands |
 | `distributional` | predictive distributions, intervals, and NLL |
+| `virtual_ensembles` | SGLB posterior sampling: knowledge uncertainty rising off the training data |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
 | `compact_model` | reuse penalties and the compact model format |
 | `budget` | budget training against default and tuned training |
@@ -159,17 +165,19 @@ Beyond XGBoost (opt-in, none changes default training):
 | Feature | What it gives you |
 |---|---|
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
+| [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/) | Boulevard boosting (`booster = boulevard`, with BRAT-D dropout and BRAT-P parallel variants) and its asymptotic confidence intervals for `f(x)` and prediction intervals, after Zhou & Hooker (JMLR 2022) and Fang, Tan & Hooker (NeurIPS 2025); squared error only |
+| [Explainable boosting machines](https://docs.rs/hessboost/latest/hessboost/ebm/) | GA²M models (`booster = ebm`): cyclic per-feature trees, outer bags with per-bag early stopping, FAST pair terms (Lou et al., KDD 2013; InterpretML), numerical and categorical terms, per-term shape functions, and with `ebm_boulevard` confidence bands on every shape (Fang, Tan, Pipping & Hooker, AISTATS 2026) |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
+| [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
 | [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/) | add or delete training rows of a trained model (incremental learning, machine unlearning): exact, or approximate and faster than retraining for small changes, after Lin et al. |
 | [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/) | a bit-packed format with bit-identical margins, 2.8–3.3× smaller than the native binary in the `compact_model` example |
 | [LightGBM model import](https://docs.rs/hessboost/latest/hessboost/model/#lightgbm-import) | load LightGBM 4.x text models (`model.txt`) that predict, explain with SHAP, slice, and save like native ones, checked against LightGBM's predictions and `pred_contrib`; splits or objectives with no exact equivalent are refused |
-| LightGBM and CatBoost tree options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), and symmetric trees |
+| LightGBM and CatBoost options | `extra_trees`, `path_smooth`, linear leaves (`linear_tree`), symmetric trees, class-balanced bagging for binary classification (`pos_bagging_fraction`, `neg_bagging_fraction`; replaces `subsample`), query-level ranking bagging (`bagging_by_query`), and XE-NDCG ranking (`rank:xendcg`) |
 | Quantized-gradient training | up to 1.85× faster tree building on large data (`use_quantized_grad`) |
 | [Ordered target statistics](https://docs.rs/hessboost/latest/hessboost/data/target_stats/) | CatBoost-style ordered target encoding of high-cardinality categoricals |
 | Boosting from a pretrained model | start from TabPFN or LLM logits through `base_margin` (PFN-Boost, LLM-Boost) |
 | Metal GPU (macOS, `--features metal`) | GPU prediction about 2.5× faster than the CPU on an M4 Max, and GPU training that reproduces CPU training bit for bit |
-
 ## Caveats
 
 - Approximate in-place updates (`training::online`, tolerance > 0) stay close
@@ -179,6 +187,9 @@ Beyond XGBoost (opt-in, none changes default training):
   costs a retrain.
 - Randomized training (sampling, forests, DART) matches XGBoost's quality,
   not its trees: the random streams differ.
+- `rank:xendcg` uses stateless keyed SplitMix64 draws per seed, iteration,
+  query, and document, so its random values and trained trees differ from
+  LightGBM's `rank_xendcg` RNG.
 - gblinear, custom-objective, `dist:*`, and linear-leaf models have no
   XGBoost encoding — native formats only.
 - 0.1.x native model files are refused.
@@ -187,6 +198,20 @@ Beyond XGBoost (opt-in, none changes default training):
 - Budget training runs 10–54× a depth-6 `hist` fit with the same tree count.
 - Quantized gradients only pay off when histogram building dominates; on
   50,000 rows they're break-even.
+- SGLB needs `gbtree` with one tree per output and iteration; model
+  shrinkage refuses DART, continued training, and per-row `base_margin`s,
+  a shrunk model's iteration ranges must start at 0, and its XGBoost export
+  matches its predictions within `f32` rounding (not bit for bit).
+- Boulevard's intervals for `f(x)` are asymptotic and ignore the fit's
+  bias: they reach nominal coverage when the leaves are refitted on an
+  independent sample (`honest_refit`) and the bias is small, and
+  under-cover otherwise: 95% intervals cover 0.73 of the time in the
+  paper's 3-d test setup and 0.15 in 5 dimensions (validated table in the
+  `inference` docs). Its prediction intervals assume Gaussian noise.
+- A Boulevard EBM's shape-function bands (`ebm_boulevard`) share those
+  caveats: they are conditional on the trees, so 95% bands covered
+  0.76–0.86 of the time with `honest_refit` and 0.57–0.71 in-sample in the
+  simulations of the `EbmInference` docs.
 
 ## Not implemented
 

@@ -3,7 +3,7 @@
 //! configuration `TrainingParams::from_xgboost` accepts must train or return an
 //! error, never panic; a trained model must be deterministic across thread
 //! counts and survive every prediction and serialization API.
-use hessboost::config::BoosterKind;
+use hessboost::config::{BoosterKind, Boulevard, Ebm};
 use hessboost::data::FeatureType;
 use hessboost::prelude::*;
 use libfuzzer_sys::arbitrary::{Arbitrary, Error as ArbError, Result as ArbResult, Unstructured};
@@ -38,6 +38,7 @@ const OBJECTIVES: &[&str] = &[
     "rank:pairwise",
     "rank:ndcg",
     "rank:map",
+    "rank:xendcg",
     "survival:cox",
     "survival:aft",
     "dist:normal",
@@ -413,19 +414,50 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
             set(key, value);
         }
     }
-    let Ok(params) = TrainingParams::from_xgboost(flat) else {
+    let Ok(mut params) = TrainingParams::from_xgboost(flat) else {
         return Ok(None);
     };
 
+    let rounds = u.int_in_range(1..=MAX_ROUNDS)?;
+    let early_stopping = if u.arbitrary()? {
+        Some(u.int_in_range(1..=2)?)
+    } else {
+        None
+    };
+    // Drawn last so earlier seeds keep their meaning; exhausted input
+    // (`ratio` then answers true) keeps the booster drawn above.
+    if !u.ratio(3, 4)? {
+        let Ok(boulevard) = Boulevard::builder()
+            .dropout(param(u, &[0.0, 0.5, 0.9])?)
+            .truncation(param(u, &[0.0, 1.0])?)
+            .build()
+        else {
+            return Ok(None);
+        };
+        params.booster = BoosterKind::Boulevard(boulevard);
+        if params.validate().is_err() {
+            return Ok(None);
+        }
+    } else if !u.ratio(3, 4)? {
+        let Ok(ebm) = Ebm::builder()
+            .interactions(u.int_in_range(0..=2)?)
+            .outer_bags(u.int_in_range(1..=3)?)
+            .bag_fraction(param(u, &[0.85, 0.5, 1.0])?)
+            .boulevard(u.arbitrary()?)
+            .build()
+        else {
+            return Ok(None);
+        };
+        params.booster = BoosterKind::Ebm(ebm);
+        if params.validate().is_err() {
+            return Ok(None);
+        }
+    }
     Ok(Some(Case {
         params,
         dtrain,
-        rounds: u.int_in_range(1..=MAX_ROUNDS)?,
-        early_stopping: if u.arbitrary()? {
-            Some(u.int_in_range(1..=2)?)
-        } else {
-            None
-        },
+        rounds,
+        early_stopping,
     }))
 }
 
@@ -439,9 +471,9 @@ fn fit(case: &Case, nthread: usize) -> Option<BoostedModel> {
     let mut params = case.params.clone();
     params.nthread = NonZeroUsize::new(nthread);
     let mut trainer = Trainer::new(&params, &case.dtrain, case.rounds);
-    // gblinear refuses evaluation sets and early stopping; attaching them
-    // would reject every linear case before it trains.
-    if params.booster != BoosterKind::GbLinear {
+    // gblinear and ebm refuse evaluation sets and early stopping; attaching
+    // them would reject every such case before it trains.
+    if !matches!(params.booster, BoosterKind::GbLinear | BoosterKind::Ebm(_)) {
         trainer = trainer.eval(&case.dtrain, "train");
         if let Some(rounds) = case.early_stopping {
             trainer = trainer.early_stopping_rounds(rounds);

@@ -6,16 +6,17 @@ use crate::config::{
 };
 use crate::data::ghist::GHistIndex;
 use crate::data::quantile::HistCuts;
-use crate::data::{DMatrix, MetaInfo};
+use crate::data::{DMatrix, GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::Metric;
-use crate::model::{BoostedModel, ModelSpec};
+use crate::model::{BoostedModel, ModelSpec, Shrinkage, shrink_margins};
 use crate::objective::{GradPair, Loss};
 use crate::rng::Rng;
 use crate::training::continuation::{require_model_for_update, resume_model};
 use crate::training::multi_output;
 use crate::training::refresh::refresh_tree;
 use crate::training::sampling::{GradientSample, gradient_based_sample};
+use crate::training::sglb::{Langevin, LeafRenewal, Sglb};
 use crate::tree::RegTree;
 use crate::tree::builder::{
     ExactTreeBuilder, HistTreeBuilder, LeafRows, SortedColumns, all_rows, check_symmetric_input,
@@ -27,31 +28,35 @@ use std::ops::ControlFlow;
 use std::sync::OnceLock;
 
 /// What every boosting round of one training run reads: the parameters, the
-/// training matrix with its metadata, and the objective.
+/// training matrix with its metadata, the objective, and the Langevin noise
+/// (`None` unless SGLB is on).
 #[derive(Clone, Copy)]
 pub(super) struct TrainContext<'a> {
     pub(super) params: &'a TrainingParams,
     pub(super) dtrain: &'a DMatrix,
     pub(super) info: &'a MetaInfo<'a>,
     pub(super) objective: &'a dyn Loss,
+    pub(super) langevin: Option<&'a Langevin>,
+    /// What row sampling reads of `dtrain`, gathered once per run.
+    pub(super) rows: RowMeta<'a>,
 }
 
 /// The gradients one tree grows on and the rows that take part: an output's
 /// gradients and its uniform row subset, or their gradient-based sample.
 #[derive(Clone, Copy)]
-struct TreeSample<'a> {
-    gpair: &'a [GradPair],
-    rows: &'a [u32],
+pub(super) struct TreeSample<'a> {
+    pub(super) gpair: &'a [GradPair],
+    pub(super) rows: &'a [u32],
     /// Under `approx` with per-round cuts, the gradient index that every
     /// tree of this output's forest builds from these same gradients
     /// (`None` elsewhere): built before the parallel trees start, or by the
     /// first tree that needs it on the serial path.
-    forest_index: Option<&'a OnceLock<GHistIndex>>,
+    pub(super) forest_index: Option<&'a OnceLock<GHistIndex>>,
 }
 use crate::tree::hist::{CpuBackend, HistogramBackend};
 
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
-enum Prepared {
+pub(super) enum Prepared {
     Exact(SortedColumns),
     /// Histogram method: the binned dataset plus the backend its histograms
     /// are built on (the CPU's, or the Metal GPU's when `device = metal`).
@@ -86,7 +91,7 @@ impl Prepared {
     /// penalties (`reuse` is `Some`) the split search is penalized by the
     /// ensemble's dictionary, which the new tree's splits then extend.
     /// `rounding_seed` keys the stochastic rounding of quantized training.
-    fn build_tree(
+    pub(super) fn build_tree(
         &self,
         run: &TrainContext,
         sample: TreeSample,
@@ -207,17 +212,10 @@ impl Prepared {
         if !const_hess_approx || !gradient_sampling(params) {
             return Ok(());
         }
-        // Iteration 0's draws before its first sample: a DART round first
-        // draws its skip variate (`select_dropout` over an empty ensemble
-        // draws nothing more), and `sample_rows` draws nothing under
-        // gradient sampling.
-        let mut rng = if matches!(params.booster, BoosterKind::Dart(_)) {
-            let mut rng = round_rng(params, 0, DART_SALT);
-            let _skip = rng.f64();
-            rng
-        } else {
-            round_rng(params, 0, 0)
-        };
+        // Iteration 0's stream before its first sample: `select_dropout`
+        // draws nothing over the empty ensemble, and `sample_rows` draws
+        // nothing under gradient sampling.
+        let mut rng = round_rng(params, 0, round_salt(params));
         objective.gradient_info(margin0, info, gpair);
         let g0 = gather_output(gpair, gpair_k, n_out, 0);
         let sampled = gradient_based_sample(g0, 1, params.subsample, &mut rng)?;
@@ -235,7 +233,7 @@ impl Prepared {
     /// by output. XGBoost 3.4.2 likewise keeps the first gradient index its
     /// training matrix builds (`BatchParam::regen` is false), whichever
     /// output group later reads it.
-    fn fill_approx_cache(&self, run: &TrainContext, gpair: &[GradPair]) {
+    pub(super) fn fill_approx_cache(&self, run: &TrainContext, gpair: &[GradPair]) {
         if let Prepared::Approx {
             const_hess: true,
             cached,
@@ -489,6 +487,13 @@ impl<'a> Trainer<'a> {
     /// either way. When the metric never improves (it is NaN), the best
     /// round is this run's first.
     ///
+    /// A model trained with model shrinkage
+    /// ([`model_shrink`](crate::config::TrainingParams::model_shrink),
+    /// posterior sampling) is instead cut back to its best iteration, as
+    /// CatBoost's `use_best_model` does: every later iteration rescaled the
+    /// earlier ones, so the returned model is the one the run held after the
+    /// best iteration, and its `best_iteration` is its last.
+    ///
     /// After [`init_model`](Self::init_model) the early-stopping state starts
     /// fresh; `best_iteration` and the history's iterations are absolute
     /// iteration indices of the continued model (XGBoost's `starting_round`
@@ -541,6 +546,12 @@ impl<'a> Trainer<'a> {
     /// defaults, while XGBoost's tree-shape settings (`tree_method`,
     /// `max_depth`, `min_child_weight`, ...) are accepted.
     ///
+    /// Model shrinkage is refused on both sides, as in CatBoost: a model
+    /// trained with it cannot be continued, and shrinkage parameters cannot
+    /// continue a model. Langevin noise without shrinkage (an explicit
+    /// `model_shrink_rate` of `0`) continues exactly: its draws are keyed by
+    /// the absolute iteration.
+    ///
     /// The model must be structurally valid, as every loaded model is.
     #[must_use]
     pub fn init_model(mut self, model: &'a BoostedModel) -> Self {
@@ -562,9 +573,16 @@ impl<'a> Trainer<'a> {
     /// still records the best round so far as
     /// [`best_iteration`](BoostedModel::best_iteration) (with its
     /// [`TrainResult::best_score`]). With `process_type=update` the model
-    /// holds the iterations refreshed so far. For `gblinear`, which stores
+    /// holds the iterations refreshed so far; with `booster = boulevard` it
+    /// is the Boulevard average of the rounds run so far. For `gblinear`, which stores
     /// no boosting iterations, [`RoundEval::iteration`] counts this run's
-    /// rounds from 0.
+    /// rounds from 0. For `booster = ebm` it counts EBM rounds from 0
+    /// through the main-effect stage and on through the pair stage (up to
+    /// `num_boost_round` each, fewer once every bag has early-stopped); a
+    /// `Break` keeps the completed rounds (each bag's best ones under
+    /// `ebm_early_stopping_rounds`), a stopped main-effect stage gets no
+    /// pair terms, and with interactions the result is then not a shorter
+    /// run's model.
     ///
     /// Observing never changes the model: training with a hook that always
     /// continues gives the same result as training without one.
@@ -677,6 +695,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
     let info = dtrain.info();
     let n = dtrain.n_rows();
     let n_out = objective.n_outputs();
+    let sglb = Sglb::resolve(params, n)?;
     let intercepts = || initial_intercepts(params, objective, &info, n_out);
     let mut model = if let Some(init) = init_model {
         resume_model(init, params, objective, dtrain, num_boost_round, intercepts)?
@@ -734,6 +753,8 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
         dtrain,
         info: &info,
         objective,
+        langevin: sglb.langevin.as_ref(),
+        rows: RowMeta::of(dtrain, params),
     };
     let mut state = RoundState {
         model,
@@ -747,6 +768,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
             Vec::new()
         },
         reuse,
+        noisy_gpair: Vec::new(),
     };
     if start_iteration > 0
         && let RoundPlan::Grow(prepared) = &plan
@@ -766,9 +788,89 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
     // is more than one output (a single output keeps scalar trees, as
     // XGBoost's `LeafLength` does).
     let vector_leaf = multi_output::vector_leaf(params, n_out);
+    // Model shrinkage: the intercepts before any shrinkage and every
+    // iteration's coefficient (continued training is refused with it, so
+    // iterations count from 0).
+    let unshrunk_base = state.model.base_scores().to_vec();
+    let mut shrink_factors = Vec::new();
+
+    if matches!(params.booster, BoosterKind::Boulevard(_)) {
+        // `validate` refuses `process_type = update` for Boulevard, and
+        // `validate_request` early stopping, so every round grows trees
+        // and the history is the whole run's.
+        let RoundPlan::Grow(prepared) = &plan else {
+            return Err(HessboostError::invalid_param(
+                "process_type",
+                "`booster = boulevard` grows new trees only",
+            ));
+        };
+        let boost = super::boulevard::BoostState {
+            model: &mut state.model,
+            margins: &mut state.margins,
+            reuse: &mut state.reuse,
+        };
+        super::boulevard::boost(&run, prepared, boost, num_boost_round, |round, margins| {
+            if !evals.is_empty() {
+                eval_plan.record(objective, round, margins, &mut history);
+            }
+            match (&mut on_round, history.last()) {
+                (None, _) => ControlFlow::Continue(()),
+                (Some(hook), Some(last)) if last.iteration == round => hook(last),
+                (Some(hook), _) => hook(&RoundEval {
+                    iteration: round,
+                    scores: Vec::new(),
+                }),
+            }
+        })?;
+        return Ok(TrainResult {
+            model: state.model,
+            history,
+            best_score: None,
+        });
+    }
+
+    if matches!(params.booster, BoosterKind::Ebm(_)) {
+        // `validate` refuses `process_type = update` for EBMs, and
+        // `validate_request` eval sets and early stopping.
+        let RoundPlan::Grow(prepared) = &plan else {
+            return Err(HessboostError::invalid_param(
+                "process_type",
+                "`booster = ebm` grows new trees only",
+            ));
+        };
+        super::ebm::boost(
+            &run,
+            prepared,
+            &mut state.model,
+            num_boost_round,
+            // The early-stopping metric: `Trainer::custom_metric`'s, else
+            // the last configured one.
+            eval_plan.metrics.last().map(AsRef::as_ref),
+            &mut |iteration| {
+                on_round.as_mut().map_or(ControlFlow::Continue(()), |hook| {
+                    hook(&RoundEval {
+                        iteration,
+                        scores: Vec::new(),
+                    })
+                })
+            },
+        )?;
+        return Ok(TrainResult {
+            model: state.model,
+            history,
+            best_score: None,
+        });
+    }
 
     for round in 0..num_boost_round {
         let iteration = start_iteration + round;
+        if let Some(shrink) = &sglb.shrink {
+            let factor = shrink.factor(iteration);
+            if factor != 1.0 {
+                state.margins.scale(factor);
+            }
+            shrink_factors.push(factor);
+        }
         match &mut plan {
             RoundPlan::Grow(Prepared::Hist { index: ghist, .. }) if vector_leaf => {
                 multi_output::boost_round(
@@ -777,6 +879,7 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
                     iteration,
                     &mut state.margins,
                     &mut state.gpair,
+                    &mut state.noisy_gpair,
                 )?;
             }
             RoundPlan::Refresh(queue, refresh) => {
@@ -807,6 +910,9 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
     }
 
     let mut model = state.model;
+    if sglb.shrink.is_some() {
+        model.set_shrinkage(Shrinkage::new(shrink_factors, unshrunk_base));
+    }
     // XGBoost records the best iteration whenever early stopping is on, not
     // only when patience runs out.
     let mut best_round_score = None;
@@ -816,6 +922,10 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
         let best_iter = stopping.best_round();
         let round = &history[best_iter - first.iteration];
         best_round_score = round.scores.last().map(|score| score.value);
+        // A shrunk model's later iterations rescaled the best one, so keep
+        // the model as it was after the best iteration (CatBoost's
+        // `use_best_model`) instead of hiding the rest behind the selection.
+        model.truncate_shrunk(best_iter + 1);
         model.set_best_iteration(Some(best_iter));
     }
 
@@ -913,8 +1023,41 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
         ));
     }
 
+    if params.bagging_by_query.is_some() {
+        let Some(group) = dtrain.group() else {
+            return Err(HessboostError::invalid_param(
+                "bagging_by_query",
+                "requires query group sizes on the training dataset",
+            ));
+        };
+        if !group.partitions(dtrain.n_rows())
+            || group.iter_ranges().any(|(start, end)| start == end)
+        {
+            return Err(HessboostError::invalid_param(
+                "bagging_by_query",
+                "requires non-empty query groups covering all training rows",
+            ));
+        }
+    }
     if objective.requires_labels() && dtrain.labels().is_none() {
         return Err(HessboostError::EmptyDataset("train: dtrain has no labels"));
+    }
+    if params.balanced_bagging.is_some() {
+        if dtrain.n_targets() != 1 {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                "balanced bagging requires exactly one label column",
+            ));
+        }
+        let labels = dtrain.labels().ok_or(HessboostError::EmptyDataset(
+            "train: balanced bagging requires binary labels",
+        ))?;
+        if labels.iter().any(|&label| label != 0.0 && label != 1.0) {
+            return Err(HessboostError::invalid_param(
+                "labels",
+                "balanced bagging requires labels exactly 0 or 1",
+            ));
+        }
     }
     let n_features = dtrain.n_cols();
     let n_out = objective.n_outputs();
@@ -955,8 +1098,134 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     if matches!(params.process_type, ProcessType::Update(_)) {
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
+    if matches!(params.booster, BoosterKind::Boulevard(_)) {
+        validate_boulevard_request(request, objective, "booster = boulevard")?;
+    }
+    if matches!(params.booster, BoosterKind::Ebm(_)) {
+        validate_ebm_request(request, objective)?;
+    }
 
+    // Model shrinkage multiplies the intercept-and-trees margin every
+    // iteration; a per-row `base_margin` replaces the intercept and would be
+    // shrunk with it in the caches but not in prediction (CatBoost refuses
+    // baselines with shrinkage too, `options_helper.cpp`).
+    if params.model_shrinkage_on()
+        && let Some(name) = std::iter::once((dtrain, "dtrain"))
+            .chain(evals.iter().copied())
+            .find_map(|(data, name)| data.base_margin().map(|_| name))
+    {
+        return Err(HessboostError::invalid_param(
+            "model_shrink_rate",
+            format!("model shrinkage is not supported with a `base_margin` (dataset `{name}`)"),
+        ));
+    }
     BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)
+}
+
+/// The data-dependent refusals of `booster = boulevard` (and, as `who`
+/// names, of the Boulevard EBM): its inference ([`crate::inference`])
+/// models one squared-error label column with equal noise per row, around
+/// the intercept alone. Early stopping is refused too: the prediction
+/// averages every round, so a `best_iteration` prefix of the trees is not a
+/// Boulevard estimate.
+fn validate_boulevard_request(
+    request: &TrainRequest,
+    objective: &dyn Loss,
+    who: &str,
+) -> Result<()> {
+    let refuse = |name: &'static str, reason: &str| {
+        Err(HessboostError::invalid_param(
+            name,
+            format!("`{who}`: {reason}"),
+        ))
+    };
+    if request.early_stopping_rounds.is_some() {
+        return refuse(
+            "early_stopping_rounds",
+            "the model averages every round, so it cannot stop at a best iteration",
+        );
+    }
+    if objective.name() != "reg:squarederror" {
+        return refuse(
+            "objective",
+            &format!("supports reg:squarederror only, got `{}`", objective.name()),
+        );
+    }
+    let dtrain = request.dtrain;
+    if dtrain.n_targets() != 1 || objective.n_outputs() != 1 {
+        return refuse(
+            "labels",
+            &format!("needs one label column, got {}", dtrain.n_targets()),
+        );
+    }
+    if dtrain
+        .weights()
+        .is_some_and(|w| w.iter().any(|&v| v != 1.0))
+    {
+        return refuse("weights", "row weights other than 1 are not supported");
+    }
+    for data in std::iter::once(dtrain).chain(request.evals.iter().map(|&(d, _)| d)) {
+        if data.base_margin().is_some() {
+            return refuse("base_margin", "base margins are not supported");
+        }
+    }
+    Ok(())
+}
+
+/// The data-dependent refusals of `booster = ebm`: one output, numerical
+/// features, no feature weights or base margins (the terms and their
+/// centering assume the intercept alone), and no eval sets or early stopping (the
+/// terms of one run are boosted round by round, so no prefix of the trees
+/// is a model of every term); with `ebm_boulevard` also Boulevard's
+/// refusals (squared error, unit row weights, no base margins).
+fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
+    let refuse = |name: &'static str, reason: &str| {
+        Err(HessboostError::invalid_param(
+            name,
+            format!("`booster = ebm`: {reason}"),
+        ))
+    };
+    if request.early_stopping_rounds.is_some() || !request.evals.is_empty() {
+        return refuse(
+            "early_stopping_rounds",
+            "eval sets and early stopping are not supported; evaluate the trained model",
+        );
+    }
+    if request.dtrain.n_targets() != 1 {
+        return refuse(
+            "labels",
+            &format!("needs one label column, got {}", request.dtrain.n_targets()),
+        );
+    }
+    if objective.n_outputs() != 1 {
+        return refuse(
+            "objective",
+            &format!(
+                "needs a single-output objective, got `{}`",
+                objective.name()
+            ),
+        );
+    }
+    if request.dtrain.base_margin().is_some() {
+        return refuse(
+            "base_margin",
+            "base margins are not supported: the terms and their centering assume the \
+             intercept alone",
+        );
+    }
+    if request.params.ebm_settings().early_stopping_rounds() > 0 && request.dtrain.group().is_some()
+    {
+        return refuse(
+            "ebm_early_stopping_rounds",
+            "early stopping scores each bag's held-out rows, which split the query groups; not \
+             supported with query groups",
+        );
+    }
+    super::ebm::validate_data(request.dtrain)?;
+    if request.params.ebm_settings().boulevard() {
+        validate_boulevard_request(request, objective, "ebm_boulevard")?;
+    }
+    Ok(())
 }
 
 /// What the tree-growing and refresh rounds update: the ensemble, its
@@ -970,6 +1239,8 @@ struct RoundState<'a> {
     /// single-output objectives, which read `gpair` directly).
     gpair_k: Vec<GradPair>,
     reuse: Option<ReuseSet>,
+    /// SGLB's noisy structure gradients, `[row][n_out]` (empty otherwise).
+    noisy_gpair: Vec<GradPair>,
 }
 
 /// `process_type=update`: refresh iteration `iteration`'s trees of `queue`
@@ -987,12 +1258,13 @@ fn refresh_round(
         dtrain,
         info,
         objective,
+        ..
     } = *run;
     let n_out = objective.n_outputs();
     let parallel = params.num_parallel_tree;
     // Gradients from the already refreshed iterations; iteration `i`'s trees
     // are then refreshed in place, output by output.
-    objective.gradient_info(&state.margins.train, info, &mut state.gpair);
+    objective.gradient_info_at(&state.margins.train, info, &mut state.gpair, iteration);
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
     let per_iteration = n_out * parallel;
     for slot in 0..per_iteration {
@@ -1037,17 +1309,27 @@ fn grow_round(
     );
     multi_output::reject_split_gradient(objective, iteration, &state.gpair)?;
     let weight = dart_new_tree_weight(dropped.as_deref().unwrap_or_default(), params);
+    // SGLB: the structure is searched on noisy gradients; `state.gpair`
+    // keeps the noise-free ones the leaves are re-estimated from.
+    let structure: &[GradPair] = match run.langevin {
+        Some(langevin) => {
+            langevin.structure_gradients(&state.gpair, iteration, &mut state.noisy_gpair)
+        }
+        None => &state.gpair,
+    };
 
-    // 2. Uniform row subsets, drawn before the trees and shared across the
-    //    per-output fits.
-    let row_subsets = iteration_row_subsets(n, params, prepared.samples_per_forest(), &mut rng);
+    // 2. Row subsets (uniform, class-balanced, or by query), drawn before
+    //    the trees and shared across the per-output fits.
+    let row_subsets =
+        iteration_row_subsets(n, params, prepared.samples_per_forest(), run.rows, &mut rng);
     // An output's gradient-based sample, when its whole forest shares one.
     let mut forest_sample = None;
     let forest_indices = prepared.forest_indices(n_out, parallel);
     let grow = GrowRound {
         run,
         prepared,
-        gpair: &state.gpair,
+        gpair: structure,
+        clean_gpair: &state.gpair,
         n_out,
         iteration,
         forest_indices: &forest_indices,
@@ -1082,7 +1364,8 @@ fn grow_round(
                 output: slot / parallel,
                 parallel: slot % parallel,
                 rows: row_subset,
-                capture_rows: margin_rows || linear_rows,
+                // Leaf re-estimation (SGLB) reads the partitions too.
+                capture_rows: margin_rows || linear_rows || (routed && run.langevin.is_some()),
                 margin_rows,
             }
         })
@@ -1100,10 +1383,7 @@ fn grow_round(
         && rayon::current_num_threads() > 1
     {
         // The first tree's cuts, before any tree reads them.
-        prepared.fill_approx_cache(
-            run,
-            gather_output(&state.gpair, &mut state.gpair_k, n_out, 0),
-        );
+        prepared.fill_approx_cache(run, gather_output(structure, &mut state.gpair_k, n_out, 0));
         let draws: Vec<(ColumnSampler, u64)> = slots
             .iter()
             .map(|_| {
@@ -1113,10 +1393,10 @@ fn grow_round(
             .collect();
         // Every output's gradients gathered once, output-major, for all of
         // its parallel trees (single-output objectives read `gpair`).
-        let gathered = gather_outputs(&state.gpair, n_out);
+        let gathered = gather_outputs(structure, n_out);
         let output_gpair = |k: usize| {
             if n_out == 1 {
-                &state.gpair[..]
+                structure
             } else {
                 &gathered[k * n..(k + 1) * n]
             }
@@ -1159,8 +1439,8 @@ fn grow_round(
     };
 
     for (slot, (tree, leaf_rows)) in slots.iter().zip(trees) {
-        // DART's gradients come from the ensemble, not the margin caches
-        // (`finish_dart` recomputes the eval ones).
+        // A dropout round's gradients come from the ensemble, not the margin
+        // caches, which `finish_dart` recomputes.
         if dropped.is_none() {
             // The builder's final row partitions already identify the training
             // leaves when every row took part in growing the tree.
@@ -1512,12 +1792,28 @@ impl<'a> MarginCaches<'a> {
         }
     }
 
-    /// Recompute the eval caches from `model` (after a DART rescaling, which
+    /// Multiply every cached margin by `factor` (model shrinkage,
+    /// [`shrink_margins`], the step prediction repeats). Cells are
+    /// independent, so the parallel pass gives the serial result.
+    pub(super) fn scale(&mut self, factor: f64) {
+        let n_out = self.n_out;
+        for margins in std::iter::once(&mut self.train).chain(&mut self.evals) {
+            for_each_row_margins(margins, n_out, |(_, row)| shrink_margins(row, factor));
+        }
+    }
+
+    /// Recompute every cache from `model` (after a DART rescaling, which
     /// makes them non-additive).
-    pub(super) fn recompute_evals(&mut self, model: &BoostedModel) {
+    pub(super) fn recompute(&mut self, model: &BoostedModel) {
+        self.train = model.margin_from_trees(self.dtrain, 0..model.num_trees());
         for (margins, (d, _)) in self.evals.iter_mut().zip(self.eval_sets) {
             *margins = model.margin_from_trees(d, 0..model.num_trees());
         }
+    }
+
+    /// The eval sets' matrices, in eval-set order.
+    pub(super) fn eval_data(&self) -> impl Iterator<Item = &'a DMatrix> + 'a {
+        self.eval_sets.iter().map(|&(d, _)| d)
     }
 }
 
@@ -1631,7 +1927,9 @@ fn apply_leaf_values<V: Copy + Send + Sync>(
 /// **excluding** `D`, whose tree ids it returns. Using XGBoost's `tree`
 /// normalization, if `k = |D|` the round's new trees then get weight
 /// `1/(k+eta)` ([`dart_new_tree_weight`]) and [`finish_dart`] rescales each
-/// dropped tree by `k/(k+eta)`.
+/// dropped tree by `k/(k+eta)`. A round that drops nothing (DART without
+/// dropout, a skipped dropout, or no tree drawn) returns `None` and trains as
+/// gbtree.
 pub(super) fn round_gradients(
     run: &TrainContext,
     model: &BoostedModel,
@@ -1644,45 +1942,69 @@ pub(super) fn round_gradients(
         dtrain,
         info,
         objective,
+        ..
     } = *run;
-    let BoosterKind::Dart(dart) = params.booster else {
-        objective.gradient_info(margin, info, gpair);
-        return (round_rng(params, iteration, 0), None);
+    let mut rng = round_rng(params, iteration, round_salt(params));
+    let dropout = match params.booster {
+        BoosterKind::Dart(dart) if dart.has_dropout() => select_dropout(model, &dart, &mut rng),
+        _ => None,
     };
-    let mut rng = round_rng(params, iteration, DART_SALT);
-    let (dropped, drop_indices) = select_dropout(model, &dart, &mut rng);
+    let Some((dropped, drop_indices)) = dropout else {
+        // Nothing dropped: the round reads the ensemble's own margins and
+        // its trees are not normalized, as in gbtree.
+        objective.gradient_info_at(margin, info, gpair, iteration);
+        return (rng, None);
+    };
     let margin_excl = model.predict_margin_dropout(dtrain, &dropped);
-    objective.gradient_info(&margin_excl, info, gpair);
+    objective.gradient_info_at(&margin_excl, info, gpair, iteration);
     (rng, Some(drop_indices))
 }
 
 /// The DART round RNG's booster salt.
 const DART_SALT: u64 = 0x0DA27;
 
-/// Draw a DART round's dropout set over the trees built so far: skipped with
-/// probability `skip_drop`, otherwise each tree independently with
-/// probability `rate_drop`, and at least one tree when any exist (as
-/// XGBoost). Returns the per-tree mask and the dropped indices.
-fn select_dropout(model: &BoostedModel, dart: &Dart, rng: &mut Rng) -> (Vec<bool>, Vec<usize>) {
+/// The salt of a round's RNG: DART's when its dropout can drop a tree,
+/// else gbtree's (a DART booster without dropout trains exactly as
+/// gbtree).
+fn round_salt(params: &TrainingParams) -> u64 {
+    match params.booster {
+        BoosterKind::Dart(dart) if dart.has_dropout() => DART_SALT,
+        _ => 0,
+    }
+}
+
+/// Draw a DART round's dropout set over the trees built so far, as
+/// XGBoost's `GBTree::DropTrees` (uniform sampling): nothing and no draws
+/// over an empty ensemble; skipped with probability `skip_drop`; otherwise
+/// each tree independently with probability `rate_drop`, plus one tree at
+/// random when none was drawn and `one_drop` is set. Returns the per-tree
+/// mask and the dropped indices, or `None` when nothing is dropped.
+fn select_dropout(
+    model: &BoostedModel,
+    dart: &Dart,
+    rng: &mut Rng,
+) -> Option<(Vec<bool>, Vec<usize>)> {
     let existing = model.num_trees();
+    if existing == 0 {
+        return None;
+    }
+    if dart.skip_drop() > 0.0 && rng.f64() < dart.skip_drop() {
+        return None;
+    }
     let mut dropped = vec![false; existing];
     let mut drop_indices: Vec<usize> = Vec::new();
-    let skip = rng.f64() < dart.skip_drop();
-    if !skip && existing > 0 {
-        for (i, d) in dropped.iter_mut().enumerate() {
-            if rng.f64() < dart.rate_drop() {
-                *d = true;
-                drop_indices.push(i);
-            }
-        }
-        if drop_indices.is_empty() {
-            // Guarantee at least one dropped tree, as XGBoost does.
-            let i = rng.range(0..existing);
-            dropped[i] = true;
+    for (i, d) in dropped.iter_mut().enumerate() {
+        if rng.f64() < dart.rate_drop() {
+            *d = true;
             drop_indices.push(i);
         }
     }
-    (dropped, drop_indices)
+    if drop_indices.is_empty() && dart.one_drop() {
+        let i = rng.range(0..existing);
+        dropped[i] = true;
+        drop_indices.push(i);
+    }
+    (!drop_indices.is_empty()).then_some((dropped, drop_indices))
 }
 
 /// XGBoost's `tree` normalization weight of a DART round's new trees:
@@ -1697,8 +2019,9 @@ pub(super) fn dart_new_tree_weight(drop_indices: &[usize], params: &TrainingPara
 }
 
 /// Finish a DART round: rescale its dropped trees by `k / (k + eta)` so the
-/// ensemble stays balanced, then recompute the eval margin caches, which the
-/// rescaling makes non-additive.
+/// ensemble stays balanced, then recompute the margin caches, which the
+/// rescaling makes non-additive (a later round that drops nothing reads the
+/// training one).
 pub(super) fn finish_dart(
     model: &mut BoostedModel,
     params: &TrainingParams,
@@ -1710,7 +2033,7 @@ pub(super) fn finish_dart(
     for &i in drop_indices {
         model.scale_tree_weight(i, factor);
     }
-    margins.recompute_evals(model);
+    margins.recompute(model);
 }
 
 /// Borrow the gradient slice for output `k`: the whole buffer for
@@ -1762,8 +2085,12 @@ fn round_rng(params: &TrainingParams, round: usize, salt: u64) -> Rng {
 struct GrowRound<'a> {
     run: &'a TrainContext<'a>,
     prepared: &'a Prepared,
-    /// Every output's gradients for this iteration, `[row][n_out]`.
+    /// Every output's gradients the structures are searched on,
+    /// `[row][n_out]` (with Langevin noise under SGLB).
     gpair: &'a [GradPair],
+    /// The noise-free gradients SGLB re-estimates the leaves from (the
+    /// same as `gpair` otherwise).
+    clean_gpair: &'a [GradPair],
     n_out: usize,
     /// The model's absolute iteration index.
     iteration: usize,
@@ -1866,6 +2193,18 @@ fn grow_sampled_tree(
         rounding_seed,
         slot.capture_rows,
     );
+    if let Some(langevin) = grow.run.langevin {
+        let at = LeafRenewal {
+            data: dtrain,
+            gpair: grow.clean_gpair,
+            n_out: grow.n_out,
+            rows,
+            leaf_rows: &leaf_rows,
+            iteration: grow.iteration,
+            tree: slot.output * params.num_parallel_tree + slot.parallel,
+        };
+        langevin.renew_leaves(&mut tree, TreeOutput::Scalar(slot.output), &at);
+    }
     // LightGBM keeps the first iteration's trees constant.
     if let Some(linear_tree) = params.linear_tree
         && grow.iteration > 0
@@ -1897,43 +2236,135 @@ fn quantization_seed(params: &TrainingParams, rng: &mut Rng) -> u64 {
 }
 
 /// Bernoulli row subsampling (each row kept with probability `subsample`),
-/// matching XGBoost's default sampling method. Guarantees at least one row.
-/// Gradient-based sampling keeps every row here; it samples the gradients in
-/// [`fit_output_tree`] instead.
-pub(super) fn sample_rows(n: usize, params: &TrainingParams, rng: &mut Rng) -> Vec<u32> {
-    let subsample = params.subsample;
-    if subsample >= 1.0 || params.sampling_method == SamplingMethod::GradientBased {
+/// matching XGBoost's default sampling method, or with LightGBM's
+/// class-balanced bagging (a positive row, label `1`, kept with
+/// probability `pos_fraction`, any other with `neg_fraction`) in its
+/// place. Guarantees at least one row. Gradient-based sampling keeps every
+/// row here; it samples the gradients in [`fit_output_tree`] instead.
+pub(super) fn sample_rows(
+    n: usize,
+    params: &TrainingParams,
+    meta: RowMeta<'_>,
+    rng: &mut Rng,
+) -> Vec<u32> {
+    if params.sampling_method == SamplingMethod::GradientBased {
         return all_rows(n);
     }
-    // Sized for the expected sample plus a few standard deviations.
-    let expected = n as f64 * subsample;
-    let mut rows: Vec<u32> = Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize);
-    rows.extend((0..n as u32).filter(|_| rng.f64() < subsample));
+    let Some(bagging) = params.balanced_bagging else {
+        return if params.subsample >= 1.0 {
+            all_rows(n)
+        } else {
+            bernoulli_sample(n, params.subsample, rng)
+        };
+    };
+    let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
+    let labels = &meta.labels[..n];
+    let positives = meta.positives;
+    let mut rows = with_sample_capacity(positives as f64 * pos + (n - positives) as f64 * neg);
+    rows.extend((0..n as u32).filter(|&row| {
+        let fraction = if labels[row as usize] == 1.0 {
+            pos
+        } else {
+            neg
+        };
+        rng.f64() < fraction
+    }));
     if rows.is_empty() {
         rows.push(rng.range(0..n) as u32);
     }
     rows
 }
 
-/// One iteration's uniform row subsets, drawn before its trees: one per
-/// parallel tree, or a single subset for the whole forest when
-/// `per_forest` (`approx`, [`Prepared::samples_per_forest`]) or when there is
-/// no uniform sampling (every tree then reads all rows, and [`sample_rows`]
-/// draws nothing). Parallel tree `p` uses entry `p % len`, shared across its
-/// per-output fits.
+/// A row buffer sized for a Bernoulli sample of `expected` rows plus a few
+/// standard deviations.
+fn with_sample_capacity(expected: f64) -> Vec<u32> {
+    Vec::with_capacity((expected + 4.0 * expected.sqrt() + 16.0) as usize)
+}
+
+/// The indices in `0..n` kept by one `rng` draw each with probability
+/// `fraction`, or one random index when none is kept.
+fn bernoulli_sample(n: usize, fraction: f64, rng: &mut Rng) -> Vec<u32> {
+    let mut kept = with_sample_capacity(n as f64 * fraction);
+    kept.extend((0..n as u32).filter(|_| rng.f64() < fraction));
+    if kept.is_empty() {
+        kept.push(rng.range(0..n) as u32);
+    }
+    kept
+}
+
+/// The training metadata row sampling reads: the labels and their count
+/// of positives (class-balanced bagging) and the query groups (query
+/// bagging). Built once per training run, so no draw rescans the labels.
+#[derive(Clone, Copy)]
+pub(super) struct RowMeta<'a> {
+    labels: &'a [f32],
+    /// Rows labelled `1`, counted only under class-balanced bagging (it
+    /// sizes each draw's row buffer).
+    positives: usize,
+    group: Option<&'a GroupInfo>,
+}
+
+impl<'a> RowMeta<'a> {
+    /// `data`'s labels (empty without any), their positives when `params`
+    /// bags by class, and its query groups.
+    pub(super) fn of(data: &'a DMatrix, params: &TrainingParams) -> Self {
+        let labels = data.labels().unwrap_or_default();
+        let positives = if params.balanced_bagging.is_some() {
+            labels.iter().filter(|&&label| label == 1.0).count()
+        } else {
+            0
+        };
+        RowMeta {
+            labels,
+            positives,
+            group: data.group(),
+        }
+    }
+}
+
+/// One iteration's row subsets (uniform, class-balanced, or by query),
+/// drawn before its trees: one per parallel tree, or a single subset for
+/// the whole forest when `per_forest` (`approx`,
+/// [`Prepared::samples_per_forest`]) or when there is no row sampling
+/// (every tree then reads all rows, and [`sample_rows`] draws nothing).
+/// Parallel tree `p` uses entry `p % len`, shared across its per-output
+/// fits. With query bagging each subset is the rows of the query groups
+/// (the whole matrix without any) a draw keeps.
 pub(super) fn iteration_row_subsets(
     n: usize,
     params: &TrainingParams,
     per_forest: bool,
+    meta: RowMeta<'_>,
     rng: &mut Rng,
 ) -> Vec<Vec<u32>> {
-    let uniform = params.subsample < 1.0 && params.sampling_method == SamplingMethod::Uniform;
-    let draws = if per_forest || !uniform {
+    let samples = params.sampling_method == SamplingMethod::Uniform
+        && (params.subsample < 1.0
+            || params.balanced_bagging.is_some()
+            || params.bagging_by_query.is_some());
+    let draws = if per_forest || !samples {
         1
     } else {
         params.num_parallel_tree
     };
-    (0..draws).map(|_| sample_rows(n, params, rng)).collect()
+    let Some(bagging) = params.bagging_by_query else {
+        return (0..draws)
+            .map(|_| sample_rows(n, params, meta, rng))
+            .collect();
+    };
+    let queries: Vec<(usize, usize)> = meta
+        .group
+        .map_or_else(|| vec![(0, n)], |group| group.iter_ranges().collect());
+    (0..draws)
+        .map(|_| {
+            bernoulli_sample(queries.len(), bagging.fraction(), rng)
+                .into_iter()
+                .flat_map(|query| {
+                    let (start, end) = queries[query as usize];
+                    start as u32..end as u32
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Whether trees are grown on gradient-based (MVS) row samples.
@@ -2076,6 +2507,92 @@ mod tests {
     };
     use crate::test_support::labeled_dense;
     use crate::tree::{ChildLeaf, SplitRule};
+
+    /// Query bagging keeps or drops each query whole, and its draw does not
+    /// depend on the thread count.
+    #[test]
+    fn query_subsets_keep_whole_groups_at_any_thread_count() {
+        let group_sizes = vec![3, 7, 2, 8, 4, 5, 6];
+        let group = GroupInfo::from_sizes(&group_sizes);
+        let n: usize = group_sizes.iter().sum();
+        let params = TrainingParams::builder()
+            .objective(Objective::RankNdcg(LambdaRank::default()))
+            .bagging_by_query(crate::config::QueryBagging::new(0.5).unwrap())
+            .seed(17)
+            .build()
+            .unwrap();
+        let select = |threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                iteration_row_subsets(
+                    n,
+                    &params,
+                    false,
+                    RowMeta {
+                        labels: &[],
+                        positives: 0,
+                        group: Some(&group),
+                    },
+                    &mut Rng::new(41),
+                )
+            })
+        };
+        let one = select(1);
+        assert_eq!(one, select(4));
+        let selected = &one[0];
+        assert!(!selected.is_empty() && selected.len() < n);
+        for (query, (start, end)) in group.iter_ranges().enumerate() {
+            let included = selected
+                .iter()
+                .filter(|&&row| (start..end).contains(&(row as usize)))
+                .count();
+            assert!(
+                included == 0 || included == end - start,
+                "query {query} split"
+            );
+        }
+    }
+
+    #[test]
+    fn balanced_row_sampler_respects_class_fractions() {
+        let labels: Vec<f32> = (0..20_000)
+            .map(|row| if row < 4_000 { 1.0 } else { 0.0 })
+            .collect();
+        let params = TrainingParams::builder()
+            .objective(Objective::BinaryLogistic(Logistic::default()))
+            .balanced_bagging(crate::config::BalancedBagging::new(0.6, 0.1).unwrap())
+            .seed(53)
+            .build()
+            .unwrap();
+        let meta = |labels| RowMeta {
+            labels,
+            positives: labels.iter().filter(|&&label| label == 1.0).count(),
+            group: None,
+        };
+        let selected = sample_rows(labels.len(), &params, meta(&labels), &mut Rng::new(77));
+        let positives = selected
+            .iter()
+            .filter(|&&row| labels[row as usize] == 1.0)
+            .count();
+        let negatives = selected.len() - positives;
+        let pos_rate = positives as f64 / 4_000.0;
+        let neg_rate = negatives as f64 / 16_000.0;
+        assert!((0.57..0.63).contains(&pos_rate), "positive rate {pos_rate}");
+        assert!(
+            (0.092..0.108).contains(&neg_rate),
+            "negative rate {neg_rate}"
+        );
+        // Without positives the negative fraction still applies.
+        let negatives_only = vec![0.0f32; 20_000];
+        let kept = sample_rows(20_000, &params, meta(&negatives_only), &mut Rng::new(77)).len();
+        assert!(
+            (1_840..2_160).contains(&kept),
+            "kept {kept} of 20000 negatives"
+        );
+    }
 
     /// A deterministic uniform `[0, 1)` stream (a 64-bit LCG's top 31 bits).
     fn lcg(mut s: u64) -> impl FnMut() -> f32 {
@@ -2730,6 +3247,95 @@ mod tests {
         ] {
             assert_eq!(restored.predict(&d).unwrap(), preds);
         }
+    }
+
+    /// XGBoost's `DropTrees`: DART without dropout never drops a tree, so it
+    /// trains exactly as gbtree (row sampling included).
+    #[test]
+    fn dart_without_dropout_trains_as_gbtree() {
+        let d = step_dataset(200);
+        let fit = |booster| {
+            let params = TrainingParams::builder()
+                .booster(booster)
+                .max_depth(3)
+                .subsample(0.7)
+                .seed(5)
+                .build()
+                .unwrap();
+            train(&params, &d, 20).unwrap()
+        };
+        let gbtree = fit(BoosterKind::GbTree);
+        let dart = fit(BoosterKind::Dart(Dart::default()));
+        assert_eq!(dart.trees(), gbtree.trees());
+        assert_eq!(dart.predict(&d).unwrap(), gbtree.predict(&d).unwrap());
+    }
+
+    /// A round that drops nothing reads the training margin cache, so after
+    /// a dropout round (which rescales trees) that cache must match the
+    /// ensemble: training in one run equals training half, then continuing
+    /// from the saved half (whose caches are rebuilt from the model), for
+    /// scalar and vector-leaf trees.
+    #[test]
+    fn dart_rounds_after_a_dropout_read_current_margins() {
+        let x: Vec<f32> = (0..400).map(|i| ((i * 37) % 101) as f32 / 101.0).collect();
+        let y: Vec<f32> = (0..400).map(|i| ((i * 13) % 7) as f32).collect();
+        let scalar = labeled_dense(&x, 200, 2, &y[..200]);
+        let vector = DMatrix::from_dense(&x, 200, 2)
+            .unwrap()
+            .with_label_matrix(&y, 2)
+            .unwrap();
+        let dart = Dart::builder()
+            .rate_drop(0.3)
+            .skip_drop(0.5)
+            .build()
+            .unwrap();
+        for (data, strategy) in [
+            (&scalar, crate::config::MultiStrategy::OneOutputPerTree),
+            (&vector, crate::config::MultiStrategy::MultiOutputTree),
+        ] {
+            let params = TrainingParams::builder()
+                .booster(BoosterKind::Dart(dart))
+                .multi_strategy(strategy)
+                .max_depth(3)
+                .seed(11)
+                .build()
+                .unwrap();
+            let whole = train(&params, data, 12).unwrap();
+            let half = train(&params, data, 6).unwrap();
+            let resumed = Trainer::new(&params, data, 6)
+                .init_model(&half)
+                .train()
+                .unwrap()
+                .model;
+            assert_eq!(
+                resumed.predict_margin(data).unwrap(),
+                whole.predict_margin(data).unwrap(),
+                "{strategy:?}"
+            );
+        }
+    }
+
+    /// A round whose draw selects no tree drops nothing unless `one_drop`,
+    /// which then drops exactly one; an empty ensemble draws nothing.
+    #[test]
+    fn dart_forces_a_drop_only_under_one_drop() {
+        let d = step_dataset(50);
+        let params = TrainingParams::builder().max_depth(2).build().unwrap();
+        let model = train(&params, &d, 5).unwrap();
+        let never = Dart::builder().rate_drop(1e-300).build().unwrap();
+        let forced = Dart::builder()
+            .rate_drop(1e-300)
+            .one_drop(true)
+            .build()
+            .unwrap();
+        let mut rng = Rng::new(3);
+        assert_eq!(select_dropout(&model, &never, &mut rng), None);
+        let (mask, dropped) = select_dropout(&model, &forced, &mut rng).unwrap();
+        assert_eq!((dropped.len(), mask.iter().filter(|&&m| m).count()), (1, 1));
+        let empty = train(&params, &d, 0).unwrap();
+        let mut before = rng.clone();
+        assert_eq!(select_dropout(&empty, &forced, &mut rng), None);
+        assert_eq!(rng.f64(), before.f64());
     }
 
     #[test]
@@ -3523,6 +4129,29 @@ mod tests {
                 .train();
             let reason = eval_metric_rejection(run, metric);
             assert!(reason.contains("`eval`"), "{reason}");
+        }
+    }
+
+    /// A multi-output model that is not multiclass (three quantiles) gives
+    /// `mlogloss` / `merror` their width, but its regression labels are not
+    /// class indices: the metrics refuse the eval set instead of reading a
+    /// probability past the row.
+    #[test]
+    fn class_index_metrics_refuse_non_class_labels() {
+        let x: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..32).map(|i| 10.0 + i as f32).collect();
+        let d = labeled_dense(&x, 32, 1, &y);
+        for metric in ["mlogloss", "merror"] {
+            let params = TrainingParams::builder()
+                .objective(Objective::Quantile(
+                    crate::objective::Quantiles::new([0.1, 0.5, 0.9]).unwrap(),
+                ))
+                .eval_metric(named_metric(metric))
+                .build()
+                .unwrap();
+            let run = Trainer::new(&params, &d, 2).eval(&d, "eval").train();
+            let reason = eval_metric_rejection(run, metric);
+            assert!(reason.contains("class"), "{reason}");
         }
     }
 

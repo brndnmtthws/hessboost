@@ -3,6 +3,8 @@ determinism invariants."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 from numpy.typing import NDArray
@@ -91,7 +93,7 @@ def ranking_data() -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np
     return x, relevance, qid
 
 
-@pytest.mark.parametrize("objective", ["rank:ndcg", "rank:pairwise", "rank:map"])
+@pytest.mark.parametrize("objective", ["rank:ndcg", "rank:pairwise", "rank:map", "rank:xendcg"])
 def test_ranking_orders_documents_within_queries(objective: str) -> None:
     x, relevance, qid = ranking_data()
     by_group = DMatrix(x, relevance, group=[10] * 30)
@@ -212,6 +214,90 @@ def test_distributional_objective_predicts_distributions() -> None:
     point = hessboost.train({}, DMatrix(x, y), 5)
     with pytest.raises(HessboostError, match="dist"):
         point.predict_distribution(x)
+
+
+def test_virtual_ensembles_and_uncertainty() -> None:
+    x, y = regression(rows=300)
+    params = {"posterior_sampling": True, "max_depth": 3}
+    booster = hessboost.train(params, DMatrix(x, y), 40)
+    members, iterations = booster.predict_virtual_ensembles(x, 4)
+    assert iterations == [25, 30, 35, 40]
+    assert members.dtype == np.float32 and members.shape == (4, 300)
+    # Members are the models after their iterations, the last the whole model.
+    np.testing.assert_array_equal(members[-1], booster.predict(x))
+    np.testing.assert_array_equal(members[0], booster.predict(x, iteration_range=(0, 25)))
+    margins, _ = booster.predict_virtual_ensembles(x, 4, output_margin=True)
+    np.testing.assert_array_equal(margins, members)
+    u = booster.predict_uncertainty(x, 4)
+    assert isinstance(u, hessboost.Uncertainty)
+    assert u.mean.shape == u.knowledge.shape == (300,)
+    np.testing.assert_allclose(
+        u.knowledge, members.astype(np.float64).var(axis=0), rtol=1e-6, atol=1e-12
+    )
+    assert u.data is None and u.total is None
+
+    x, labels = classes(rows=300, n_classes=3)
+    softprob = hessboost.train(
+        {"objective": "multi:softprob", "num_class": 3, "posterior_sampling": True},
+        DMatrix(x, labels),
+        30,
+    )
+    probs, _ = softprob.predict_virtual_ensembles(x, 3)
+    assert probs.shape == (3, 300, 3)
+    u = softprob.predict_uncertainty(x, 3)
+    assert u.mean.shape == (300, 3) and u.knowledge.shape == (300,)
+    assert u.data is not None and u.total is not None
+    np.testing.assert_allclose(u.knowledge, u.total - u.data)
+    # Multi-label classification: every part is one column per label.
+    two_labels = np.stack([labels % 2, labels // 2], axis=1).astype(np.float32)
+    multi_label = hessboost.train(
+        {"objective": "binary:logistic", "posterior_sampling": True}, DMatrix(x, two_labels), 30
+    )
+    u = multi_label.predict_uncertainty(x, 3)
+    assert u.data is not None and u.total is not None
+    assert u.mean.shape == u.knowledge.shape == u.data.shape == u.total.shape == (300, 2)
+
+    with pytest.raises(HessboostError, match="virtual_ensembles_count"):
+        booster.predict_uncertainty(x, 21)
+    with pytest.raises(HessboostError, match="at least 1"):
+        booster.predict_virtual_ensembles(x, 0)
+    ranker = hessboost.train({"objective": "rank:ndcg"}, DMatrix(x[:40], labels[:40], group=[40]), 4)
+    with pytest.raises(HessboostError, match="uncertainty is defined"):
+        ranker.predict_uncertainty(x[:40], 2)
+
+
+def test_sglb_parameters_train_and_refuse_conflicts() -> None:
+    x, y = regression(rows=200)
+    dtrain = DMatrix(x, y)
+    explicit = hessboost.train(
+        {
+            "langevin": True,
+            "diffusion_temperature": 50.0,
+            "model_shrink_rate": 0.3,
+            "model_shrink_mode": "decreasing",
+            "max_depth": 2,
+        },
+        dtrain,
+        12,
+    )
+    # Shrinkage rescales every iteration: a later range start is refused, and
+    # a prefix slice is the model after that many iterations.
+    with pytest.raises(HessboostError, match="model shrinkage"):
+        explicit.predict(x, iteration_range=(2, 5))
+    np.testing.assert_array_equal(
+        explicit[:5].predict(x), explicit.predict(x, iteration_range=(0, 5))
+    )
+    conflicts: list[tuple[dict[str, Any], str]] = [
+        ({"posterior_sampling": True, "langevin": False}, "langevin"),
+        ({"posterior_sampling": True, "diffusion_temperature": 5.0}, "diffusion_temperature"),
+        ({"model_shrink_mode": "decreasing"}, "model_shrink_mode"),
+        ({"langevin": True, "booster": "dart"}, "langevin"),
+    ]
+    for conflict, key in conflicts:
+        with pytest.raises(HessboostError, match=key):
+            hessboost.train(conflict, dtrain, 2)
+    with pytest.raises(HessboostError, match="model_shrink_mode"):
+        hessboost.train({"model_shrink_mode": "sometimes"}, dtrain, 2)
 
 
 def test_early_stopping_records_the_best_iteration() -> None:

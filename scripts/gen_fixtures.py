@@ -823,6 +823,19 @@ CASES: dict[str, tuple[Callable[..., Any], dict[str, Any], dict[str, Any]]] = {
         {"booster": "dart", "rate_drop": 0.1, "skip_drop": 0.5, "seed": 42, "max_depth": 4},
         {"tier": "quality"},
     ),
+    # DART without dropout (XGBoost `DropTrees` never drops a tree) trains
+    # exactly as gbtree -> pointwise
+    "dart_nodrop_d4": (
+        y_regression,
+        dict(booster="dart", seed=42, max_depth=4),
+        {},
+    ),
+    # `one_drop`: a round that draws no tree drops one at random
+    "dart_one_drop_d4": (
+        y_regression,
+        dict(booster="dart", rate_drop=0.05, one_drop=True, seed=42, max_depth=4),
+        dict(tier="quality"),
+    ),
     # continued training (`xgb_model=`), deterministic -> pointwise
     "continue_hist_reg_d6": (y_regression, {}, {"continue_from": 20}),
     "continue_exact_nobs_binary_d4": (

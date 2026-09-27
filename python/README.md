@@ -14,8 +14,10 @@ XGBoost JSON and UBJSON model files.
 - **Typed** (`py.typed`, complete type information), with the GIL released
   while training and predicting, and free-threaded CPython supported.
 - **More than XGBoost, opt-in.** Conformal prediction intervals,
-  distributional boosting (a predictive distribution per row), and
-  LightGBM/CatBoost tree options.
+  confidence intervals for the regression function (Boulevard boosting),
+  distributional boosting (a predictive distribution per row), LightGBM/CatBoost
+  tree options, class-balanced binary bagging, and XE-NDCG ranking
+  (`objective="rank:xendcg"`).
 
 ## Installation
 
@@ -177,6 +179,10 @@ dist = hessboost.train({"objective": "dist:normal"}, hessboost.DMatrix(X_train, 
 d = dist.predict_distribution(X_test)
 d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
 
+sglb = hessboost.train({"posterior_sampling": True}, hessboost.DMatrix(X_train, y_train), 1000)
+members, iterations = sglb.predict_virtual_ensembles(X_test, 10)  # (10, rows)
+u = sglb.predict_uncertainty(X_test, 10)  # u.knowledge rises off the training data
+
 from hessboost.online import OnlineModel
 
 online = OnlineModel.train(
@@ -184,6 +190,14 @@ online = OnlineModel.train(
 )
 report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
 online.model.predict(X_test)  # online.data: the updated training rows
+
+from hessboost.inference import BoulevardInference, honest_refit
+
+params = {"booster": "boulevard", "eta": 0.8, "boulevard_dropout": 0.5, "subsample": 0.8}
+trained = hessboost.train(params, hessboost.DMatrix(X_struct, y_struct), 200)
+model = honest_refit(trained, X_values, y_values)  # leaves from independent rows
+inference = BoulevardInference.fit(model, X_values, holdout=X_cal, holdout_label=y_cal)
+lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T  # for f(x)
 ```
 
 - `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
@@ -199,13 +213,33 @@ online.model.predict(X_test)  # online.data: the updated training rows
   interrupted (Ctrl-C) update changes nothing. `OnlineModel.from_model`
   resumes from a saved `Booster` and its training data. Updates need `hist`
   depth-wise trees without sampling or constraints and unweighted data.
+- `hessboost.ebm`: explainable boosting machines (`{"booster": "ebm"}`,
+  cyclic GA2M with outer bags, FAST pairs, per-bag early stopping, and
+  categorical terms): `shape_functions` returns every term's
+  piecewise-constant shape (`NumericAxis` edges or `CategoricalAxis`
+  codes, plus a missing cell per axis) and `Booster.ebm`;
+  `hessboost.inference.EbmInference` puts confidence bands on the shapes of
+  an `ebm_boulevard` model.
+- `hessboost.inference`: Boulevard boosting's asymptotic confidence,
+  prediction (Gaussian noise), and reproduction intervals for `f(x)`
+  (`BoulevardInference`, exact or Nystrom), `honest_refit`, and
+  `Booster.boulevard`. The intervals are conditional on the tree
+  structures: nominal for low-dimensional smooth signals after an honest
+  refit, under-covering elsewhere (see the crate's `inference` docs).
 - `hessboost.folds`: `k_fold`, `forward_chaining` (expanding-window,
   purged by a row `gap`), and `purged_forward` (timestamped rows, purged
   by each row's own label window, for overlapping or irregular horizons)
   folds for `cv` or your own validation loops.
+- `Booster.predict_virtual_ensembles` / `predict_uncertainty`: CatBoost's
+  virtual ensembles of an SGLB model (`posterior_sampling`, `langevin`,
+  `model_shrink_rate`), with knowledge, data, and total uncertainty
+  (`hessboost.Uncertainty`).
 - Every hessboost training option (`path_smooth`, `extra_trees`,
-  `linear_tree`, `grow_policy="symmetric"`, `use_quantized_grad`, the
-  `dist:*` objectives and their `dist_gradient`, ...) is a `params` key.
+  `linear_tree`, `grow_policy="symmetric"`, `use_quantized_grad`,
+  `pos_bagging_fraction`, `neg_bagging_fraction`, `bagging_by_query`, the
+  `dist:*` objectives and their `dist_gradient`, `rank:xendcg`, ...) is a
+  `params` key. XE-NDCG's keyed per-round random stream differs from
+  LightGBM's `rank_xendcg` stream.
 
 ## Differences from XGBoost's Python package
 

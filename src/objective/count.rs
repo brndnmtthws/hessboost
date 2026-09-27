@@ -235,8 +235,13 @@ impl Loss for TweedieLoss {
 
     fn default_metric(&self) -> EvalMetric {
         // XGBoost `TweedieRegression::Configure` names the metric with the
-        // configured power so evaluation uses the same distribution.
-        EvalMetric::TweedieNLogLik(self.param)
+        // power the loss trains with (its `float`), and the metric reads
+        // that name back: the `f32` power, as its shortest decimal in `f64`.
+        let trained = format!("{}", self.rho).parse::<f64>().map(Tweedie::new);
+        EvalMetric::TweedieNLogLik(match trained {
+            Ok(Ok(power)) => power,
+            _ => self.param,
+        })
     }
 }
 
@@ -245,6 +250,24 @@ mod tests {
     use super::*;
     use crate::objective::{base_margins, gradient_pairs};
     use approx::assert_relative_eq;
+
+    /// Tweedie's default metric evaluates at the power the loss trains with
+    /// (its `f32`), as XGBoost names and reads it back, so a power that
+    /// rounds to 1 in `f32` trains and evaluates at 1.
+    #[test]
+    fn tweedie_default_metric_uses_the_trained_power() {
+        let loss = TweedieLoss::new(Tweedie::new(1.000_000_04).unwrap());
+        let at_one = EvalMetric::TweedieNLogLik(Tweedie::new(1.0).unwrap());
+        assert_eq!(loss.default_metric(), at_one);
+        let (preds, labels) = ([1.0f32, 2.0], [1.0f32, 3.0]);
+        let score = |metric: EvalMetric| metric.build(1).unwrap().eval(&preds, &labels, None);
+        assert_eq!(
+            score(loss.default_metric()).to_bits(),
+            score(at_one).to_bits()
+        );
+        let default = TweedieLoss::new(Tweedie::default());
+        assert_eq!(default.default_metric().name(), "tweedie-nloglik@1.5");
+    }
 
     #[test]
     fn poisson_gradient_at_log_mean_is_zero_sum() {

@@ -1,7 +1,254 @@
-//! Precision at `k` (`pre`, `pre@k`) for learning to rank.
+//! Learning-to-rank metrics over query groups: NDCG (`ndcg`), mean
+//! average precision (`map`), and precision at `k` (`pre`), each with
+//! XGBoost's `@k` cutoff.
 
-use super::{Metric, argsort_desc, fold_groups, group_ranges, weighted_mean};
+use super::factory::cutoff_name;
+use super::{Metric, argsort_desc, group_ranges, weighted_mean};
 use crate::K_RT_EPS_F32;
+use rayon::prelude::*;
+
+/// Weighted mean of a per-group `score` over the non-empty query-group
+/// ranges, weighted by each group's first document weight (`1.0` when
+/// unweighted); zero-weight groups are skipped, and without any rows or
+/// weight the result is `0`, like the elementwise metrics. Shared by the
+/// ranking metrics' `eval_grouped`.
+fn grouped_average(
+    preds: &[f32],
+    labels: &[f32],
+    weights: Option<&[f32]>,
+    group: Option<&crate::data::GroupInfo>,
+    score: impl Fn(&[f32], &[f32]) -> f64 + Sync,
+) -> f64 {
+    let ranges = group_ranges(preds.len(), group);
+    let weight = |start: usize| weights.map_or(1.0, |values| f64::from(values[start]));
+    let totals = fold_groups(
+        &ranges,
+        |start, end| (weight(start) != 0.0).then(|| score(&preds[start..end], &labels[start..end])),
+        (0.0, 0.0),
+        |(sum, weight_sum), (start, _), score| match score {
+            Some(score) => {
+                let weight = weight(start);
+                (sum + weight * score, weight_sum + weight)
+            }
+            None => (sum, weight_sum),
+        },
+    );
+    weighted_mean(totals)
+}
+
+/// Query groups covering at least this many rows are scored in parallel.
+const PARALLEL_GROUP_ROWS: usize = 4096;
+
+/// `fold` over `f(start, end)` of every `(start, end)` range, in range
+/// order. When the ranges cover many rows and the pool has several threads,
+/// the `f` values are computed in parallel first; the fold always runs in
+/// range order, so its result does not depend on the thread count.
+pub(super) fn fold_groups<T: Send, A>(
+    ranges: &[(usize, usize)],
+    f: impl Fn(usize, usize) -> T + Sync,
+    init: A,
+    mut fold: impl FnMut(A, (usize, usize), T) -> A,
+) -> A {
+    let rows: usize = ranges.iter().map(|(start, end)| end - start).sum();
+    if ranges.len() > 1 && rows >= PARALLEL_GROUP_ROWS && rayon::current_num_threads() > 1 {
+        let values: Vec<T> = ranges
+            .par_iter()
+            .map(|&(start, end)| f(start, end))
+            .collect();
+        ranges
+            .iter()
+            .zip(values)
+            .fold(init, |acc, (&range, value)| fold(acc, range, value))
+    } else {
+        ranges.iter().fold(init, |acc, &(start, end)| {
+            fold(acc, (start, end), f(start, end))
+        })
+    }
+}
+
+/// Normalized Discounted Cumulative Gain (`ndcg`), averaged over query groups.
+///
+/// Gains are `2^rel - 1` with the standard `1 / log2(rank + 2)` discount.
+/// Supports XGBoost's `@k` truncation (e.g. `ndcg@5`). Higher is better.
+/// A group whose ideal DCG is zero contributes `0`. Named `ndcg@k` with a
+/// cutoff, else `ndcg`, as XGBoost reports it.
+#[derive(Debug, Clone)]
+pub(crate) struct Ndcg {
+    /// Optional rank cutoff `k`. `None` uses the full list.
+    k: Option<usize>,
+    name: String,
+}
+
+impl Default for Ndcg {
+    /// `ndcg` over the full list.
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl Ndcg {
+    /// Create an NDCG metric with an optional `@k` truncation.
+    pub(crate) fn new(k: Option<usize>) -> Self {
+        Ndcg {
+            k,
+            name: cutoff_name("ndcg", k),
+        }
+    }
+
+    /// NDCG of a single group given its predictions and labels.
+    fn group_ndcg(&self, preds: &[f32], labels: &[f32]) -> f64 {
+        let m = preds.len();
+        let cut = self.k.map_or(m, |k| k.min(m));
+
+        // DCG in prediction order.
+        let order = argsort_desc(preds);
+        let dcg: f64 = order[..cut]
+            .iter()
+            .enumerate()
+            .map(|(p, &i)| ndcg_gain(f64::from(labels[i])) * ndcg_discount(p))
+            .sum();
+
+        let idcg = ideal_dcg(labels, cut);
+
+        if idcg <= 0.0 { 0.0 } else { dcg / idcg }
+    }
+}
+
+impl Metric for Ndcg {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn maximize(&self) -> bool {
+        true
+    }
+
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        // No group info: treat everything as a single query.
+        self.eval_grouped(preds, labels, weights, None)
+    }
+
+    fn eval_grouped(
+        &self,
+        preds: &[f32],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        group: Option<&crate::data::GroupInfo>,
+    ) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
+        grouped_average(preds, labels, weights, group, |p, l| self.group_ndcg(p, l))
+    }
+}
+
+/// NDCG gain of a relevance label: `2^rel - 1`.
+#[inline]
+fn ndcg_gain(rel: f64) -> f64 {
+    (2.0f64).powf(rel) - 1.0
+}
+
+/// NDCG position discount for 0-based rank `p`: `1 / log2(p + 2)`.
+#[inline]
+fn ndcg_discount(p: usize) -> f64 {
+    1.0 / ((p + 2) as f64).log2()
+}
+
+/// Ideal DCG of a group: labels sorted by descending relevance, gains
+/// accumulated with the standard discount, truncated at `cut` ranks.
+fn ideal_dcg(labels: &[f32], cut: usize) -> f64 {
+    let mut ideal: Vec<f64> = labels.iter().map(|&l| f64::from(l)).collect();
+    ideal.sort_by(|a, b| b.total_cmp(a));
+    ideal[..cut]
+        .iter()
+        .enumerate()
+        .map(|(p, &l)| ndcg_gain(l) * ndcg_discount(p))
+        .sum()
+}
+
+/// Mean Average Precision (`map`), averaged over query groups.
+///
+/// Relevance is binarized as `label > 0`. Supports `@k` truncation (e.g.
+/// `map@10`), which restricts the precision sum to the top-`k` ranks. Higher is
+/// better. A group with no relevant documents contributes `0`. Named `map@k`
+/// with a cutoff, else `map`, as XGBoost reports it.
+#[derive(Debug, Clone)]
+pub(crate) struct MeanAveragePrecision {
+    /// Optional rank cutoff `k`. `None` uses the full list.
+    k: Option<usize>,
+    name: String,
+}
+
+impl Default for MeanAveragePrecision {
+    /// `map` over the full list.
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl MeanAveragePrecision {
+    /// Create a MAP metric with an optional `@k` truncation.
+    pub(crate) fn new(k: Option<usize>) -> Self {
+        MeanAveragePrecision {
+            k,
+            name: cutoff_name("map", k),
+        }
+    }
+
+    /// Average precision of a single group.
+    fn group_ap(&self, preds: &[f32], labels: &[f32]) -> f64 {
+        let m = preds.len();
+        let cut = self.k.map_or(m, |k| k.min(m));
+
+        let order = argsort_desc(preds);
+
+        let num_rel = labels.iter().filter(|&&l| l > 0.0).count();
+        if num_rel == 0 {
+            return 0.0;
+        }
+
+        let mut hits = 0usize;
+        let mut ap = 0.0f64;
+        for (p, &i) in order[..cut].iter().enumerate() {
+            if labels[i] > 0.0 {
+                hits += 1;
+                ap += hits as f64 / (p + 1) as f64;
+            }
+        }
+        ap / num_rel as f64
+    }
+}
+
+impl Metric for MeanAveragePrecision {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn maximize(&self) -> bool {
+        true
+    }
+
+    fn supports_label_matrix(&self) -> bool {
+        false
+    }
+
+    fn eval(&self, preds: &[f32], labels: &[f32], weights: Option<&[f32]>) -> f64 {
+        self.eval_grouped(preds, labels, weights, None)
+    }
+
+    fn eval_grouped(
+        &self,
+        preds: &[f32],
+        labels: &[f32],
+        weights: Option<&[f32]>,
+        group: Option<&crate::data::GroupInfo>,
+    ) -> f64 {
+        nan_unless_consistent!(preds, labels, weights, 1);
+        grouped_average(preds, labels, weights, group, |p, l| self.group_ap(p, l))
+    }
+}
 
 /// XGBoost's default ranking cutoff (`LambdaRankParam::DefaultK`), used by
 /// `pre` without an `@k` suffix.
@@ -30,7 +277,7 @@ impl Precision {
     pub(super) fn new(k: Option<usize>) -> Self {
         Precision {
             k: k.unwrap_or(DEFAULT_TOP_K),
-            name: super::cutoff_name("pre", k),
+            name: cutoff_name("pre", k),
         }
     }
 }

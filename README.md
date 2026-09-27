@@ -25,8 +25,7 @@ gradients and second derivatives (Newton boosting).
   same model on any thread count.
 - **Strict.** Invalid parameters and unsupported combinations fail loudly;
   nothing is silently ignored.
-- **Stable storage.** Models saved by version 0.2.0 or later load in every
-  subsequent release.
+- **Stable storage.** Models saved natively are forwards-compatible across releases.
 - **Modern modeling.** Built-in support for conformal intervals, Boulevard
   confidence bands, explainable boosting machines (EBMs), distributional
   boosting, SGLB uncertainty, tree-based diffusion, in-place updates, and
@@ -154,13 +153,12 @@ See [`python/README.md`](python/README.md).
   - [Generative tabular modeling](https://docs.rs/hessboost/latest/hessboost/diffusion/): Tree-based conditional diffusion, flow matching, and ForestFlow synthetic data and imputation.
   - [In-place updates](https://docs.rs/hessboost/latest/hessboost/training/online/): Fast incremental learning and exact or approximate unlearning.
   - [Compact models](https://docs.rs/hessboost/latest/hessboost/model/compact/): Bit-packed model format with identical margins.
-  - [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/): Automatic parameterless training with PerpetualBooster.
+  - [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/): Training controlled by one budget value, based on PerpetualBooster.
   - [Metal GPU](https://docs.rs/hessboost/latest/hessboost/backend/metal/): Apple Silicon GPU prediction and training (`--features metal`).
 
 ## Caveats
 
 - Full technical details, invariants, and statistical assumptions are documented in the [API reference](https://docs.rs/hessboost).
-- Native binary models from 0.1.x are not supported; use 0.2.0+.
 - Approximate in-place updates are designed for incremental shifts (under ~1% of rows); larger changes benefit from a retrain.
 - Asymptotic Boulevard inference and prediction intervals require specific noise and structure assumptions; see the [`inference` docs](https://docs.rs/hessboost/latest/hessboost/inference/#validation) for conditions and empirical coverage validation.
 ## Not implemented

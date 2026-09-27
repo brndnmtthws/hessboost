@@ -155,7 +155,7 @@ it.
 | `pickle` / `copy` | native binary plus feature names, categories, and `best_score` |
 
 The native binary format is compressed, checksummed, and lossless; files
-written by 0.2.0 or later load in every later release. Use
+load in subsequent releases. Use
 `format="xgboost-json"` or `.ubj` for a file XGBoost loads. A LightGBM
 model (`lightgbm.Booster.save_model`) predicts LightGBM's values for
 missing values as `NaN` and categorical features as non-negative codes;

@@ -4,7 +4,9 @@
 //! under the assumptions below and validated only in the regimes listed in
 //! [Validation](#validation). Beyond XGBoost and opt-in: train with
 //! [`BoosterKind::Boulevard`](crate::config::BoosterKind::Boulevard), then
-//! fit a [`BoulevardInference`] on the training rows.
+//! fit a [`BoulevardInference`] on the training rows. A Boulevard EBM
+//! ([`crate::ebm`], `ebm_boulevard`) gets bands on its shape functions from
+//! [`EbmInference`], built on the same solvers.
 //!
 //! Unlike [`crate::conformal`], whose intervals have finite-sample
 //! *marginal* coverage of the label, these intervals are about `f` itself
@@ -188,10 +190,12 @@
 //! # }
 //! ```
 
+mod ebm;
 mod kernel;
 mod linalg;
 mod refit;
 mod solver;
+mod term_kernel;
 
 use serde::{Deserialize, Serialize};
 
@@ -200,10 +204,11 @@ use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::Objective;
 use crate::objective::distributional::special::norm_ppf;
-use kernel::LeafKernel;
+use kernel::{Kernel, LeafKernel};
 use rayon::prelude::*;
 use solver::RidgeSolver;
 
+pub use ebm::{EbmInference, TermBands};
 pub use refit::honest_refit;
 
 /// Query points solved together: one block of right-hand sides.
@@ -438,6 +443,54 @@ fn mean_squared_residual(model: &BoostedModel, data: &DMatrix) -> Result<f64> {
     Ok(sum / labels.len() as f64)
 }
 
+/// The noise variance `noise` names for `model` trained on `train`, which
+/// must be finite and positive.
+fn noise_estimate(model: &BoostedModel, train: &DMatrix, noise: NoiseVariance) -> Result<f64> {
+    let noise_variance = match noise {
+        NoiseVariance::Holdout(holdout) => {
+            check_data(model, holdout, "holdout", true)?;
+            mean_squared_residual(model, holdout)?
+        }
+        NoiseVariance::TrainingResiduals => mean_squared_residual(model, train)?,
+        NoiseVariance::Known(v) => v,
+    };
+    if !(noise_variance.is_finite() && noise_variance > 0.0) {
+        return Err(HessboostError::invalid_param(
+            "noise",
+            format!("the noise variance must be finite and > 0, got {noise_variance}"),
+        ));
+    }
+    Ok(noise_variance)
+}
+
+/// Factor `c I + kernel` with `solver`.
+fn build_solver(kernel: &impl Kernel, solver: KernelSolver, c: f64) -> Result<RidgeSolver> {
+    let n = kernel.n();
+    match solver {
+        KernelSolver::Exact => {
+            if n > MAX_EXACT_ROWS {
+                return Err(HessboostError::invalid_param(
+                    "solver",
+                    format!(
+                        "the exact solver factors at most {MAX_EXACT_ROWS} rows, got {n}; use \
+                         `KernelSolver::Nystrom`"
+                    ),
+                ));
+            }
+            RidgeSolver::exact(kernel, c)
+        }
+        KernelSolver::Nystrom { landmarks, seed } => {
+            if landmarks == 0 {
+                return Err(HessboostError::invalid_param(
+                    "solver",
+                    "the Nyström solver needs at least one landmark",
+                ));
+            }
+            RidgeSolver::nystrom(kernel, c, landmarks, seed)
+        }
+    }
+}
+
 impl<'a> BoulevardInference<'a> {
     /// Build the leaf kernel of `model` over `train`, the rows it was
     /// trained on (or, after [`honest_refit`], refitted on), factor the
@@ -470,47 +523,11 @@ impl<'a> BoulevardInference<'a> {
             "train",
             matches!(noise, NoiseVariance::TrainingResiduals),
         )?;
-        let n = train.n_rows();
-        let noise_variance = match noise {
-            NoiseVariance::Holdout(holdout) => {
-                check_data(model, holdout, "holdout", true)?;
-                mean_squared_residual(model, holdout)?
-            }
-            NoiseVariance::TrainingResiduals => mean_squared_residual(model, train)?,
-            NoiseVariance::Known(v) => v,
-        };
-        if !(noise_variance.is_finite() && noise_variance > 0.0) {
-            return Err(HessboostError::invalid_param(
-                "noise",
-                format!("the noise variance must be finite and > 0, got {noise_variance}"),
-            ));
-        }
+        let noise_variance = noise_estimate(model, train, noise)?;
         let (c, s) = info.ridge(model.num_parallel_tree());
         let leaves = model.predict_leaf_range(train, ..)?.into_vec();
         let kernel = LeafKernel::new(model.trees(), &leaves, info.kappa())?;
-        let solver = match solver {
-            KernelSolver::Exact => {
-                if n > MAX_EXACT_ROWS {
-                    return Err(HessboostError::invalid_param(
-                        "solver",
-                        format!(
-                            "the exact solver factors at most {MAX_EXACT_ROWS} rows, got {n}; use \
-                             `KernelSolver::Nystrom`"
-                        ),
-                    ));
-                }
-                RidgeSolver::exact(&kernel, c)?
-            }
-            KernelSolver::Nystrom { landmarks, seed } => {
-                if landmarks == 0 {
-                    return Err(HessboostError::invalid_param(
-                        "solver",
-                        "the Nyström solver needs at least one landmark",
-                    ));
-                }
-                RidgeSolver::nystrom(&kernel, c, landmarks, seed)?
-            }
-        };
+        let solver = build_solver(&kernel, solver, c)?;
         Ok(BoulevardInference {
             model,
             kernel,

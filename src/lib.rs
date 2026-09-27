@@ -59,7 +59,8 @@
 //!   the `Metric` trait, `CustomMetric`.
 //! - [`conformal`]: split-conformal and conformalized-quantile intervals.
 //! - [`inference`]: Boulevard boosting's confidence and prediction intervals
-//!   for `f(x)`.
+//!   for `f(x)`, and a Boulevard EBM's shape-function bands.
+//! - [`ebm`]: explainable boosting machines' terms and shape functions.
 //! - [`tree`]: [`RegTree`](tree::RegTree) and nodes, for model inspection.
 //! - [`error`]: `HessboostError` and `Result`.
 //!
@@ -125,6 +126,13 @@
 //!     honest leaf refit, and exact or Nyström variance
 //!     ([`BoosterKind::Boulevard`](config::BoosterKind::Boulevard),
 //!     [`inference`]);
+//!   - explainable boosting machines (GA²M: cyclic per-feature boosting,
+//!     early-stopped outer bags, FAST pair terms, numerical and categorical
+//!     terms; Lou et al., KDD 2012/2013, InterpretML)
+//!     with per-term shape functions, and their Boulevard variant (Fang, Tan,
+//!     Pipping & Hooker, AISTATS 2026) with confidence bands on every shape
+//!     ([`BoosterKind::Ebm`](config::BoosterKind::Ebm), [`ebm`],
+//!     [`EbmInference`](inference::EbmInference));
 //!   - CatBoost-style ordered target statistics ([`data::target_stats`]);
 //!   - LightGBM options `extra_trees`, `path_smooth`, `linear_tree` leaves
 //!     ([`TrainingParams::extra_trees`](config::TrainingParams::extra_trees),
@@ -175,7 +183,7 @@
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
 //! `model_io`, `custom_objective`, `constraints`, `conformal`,
-//! `boulevard_inference`, `compact_model`, `distributional`,
+//! `boulevard_inference`, `ebm`, `compact_model`, `distributional`,
 //! `virtual_ensembles`, `budget`, `balanced_bagging`, `online_update`,
 //! `ordered_target_stats`, `pfn_boost`, `metal` with `--features metal` on
 //! macOS). Run one with
@@ -227,6 +235,7 @@ pub mod backend;
 pub mod config;
 pub mod conformal;
 pub mod data;
+pub mod ebm;
 pub mod error;
 pub mod inference;
 pub mod metric;

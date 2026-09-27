@@ -19,6 +19,27 @@ use rayon::prelude::*;
 use crate::error::{HessboostError, Result};
 use crate::tree::RegTree;
 
+/// A symmetric positive semidefinite kernel over `n` training rows, as the
+/// ridge solvers ([`super::solver::RidgeSolver`]) read it: one row at a
+/// time, or densely.
+pub(super) trait Kernel: Sync {
+    /// Number of kernel rows.
+    fn n(&self) -> usize;
+
+    /// Add the kernel row of training row `row` to `out` (length `n`).
+    fn add_row(&self, row: usize, out: &mut [f64]);
+
+    /// The dense `n × n` kernel matrix, row-major (rows in parallel).
+    fn dense(&self) -> Vec<f64> {
+        let n = self.n();
+        let mut k = vec![0.0; n * n];
+        k.par_chunks_mut(n.max(1))
+            .enumerate()
+            .for_each(|(row, out)| self.add_row(row, out));
+        k
+    }
+}
+
 /// Sentinel of [`LeafKernel::node_leaf`] for internal nodes.
 const INTERNAL: u32 = u32::MAX;
 
@@ -136,11 +157,6 @@ impl LeafKernel {
         })
     }
 
-    /// Number of kernel rows.
-    pub(super) fn n(&self) -> usize {
-        self.n
-    }
-
     /// Number of trees.
     pub(super) fn n_trees(&self) -> usize {
         self.n_trees
@@ -159,14 +175,6 @@ impl LeafKernel {
         }
     }
 
-    /// Add the kernel vector of kernel row `row` to `out`.
-    pub(super) fn add_row(&self, row: usize, out: &mut [f64]) {
-        let leaves = &self.row_leaves[row * self.n_trees..(row + 1) * self.n_trees];
-        for &leaf in leaves {
-            self.add_leaf(leaf, out);
-        }
-    }
-
     fn add_leaf(&self, leaf: u32, out: &mut [f64]) {
         let leaf = leaf as usize;
         let w = self.leaf_weight[leaf];
@@ -174,15 +182,19 @@ impl LeafKernel {
             out[row as usize] += w;
         }
     }
+}
 
-    /// The dense `n × n` kernel matrix, row-major (rows in parallel, each
-    /// summed over its trees in tree order).
-    pub(super) fn dense(&self) -> Vec<f64> {
-        let n = self.n;
-        let mut k = vec![0.0; n * n];
-        k.par_chunks_mut(n.max(1))
-            .enumerate()
-            .for_each(|(row, out)| self.add_row(row, out));
-        k
+impl Kernel for LeafKernel {
+    fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Add the kernel vector of kernel row `row` to `out` (each row summed
+    /// over its trees in tree order).
+    fn add_row(&self, row: usize, out: &mut [f64]) {
+        let leaves = &self.row_leaves[row * self.n_trees..(row + 1) * self.n_trees];
+        for &leaf in leaves {
+            self.add_leaf(leaf, out);
+        }
     }
 }

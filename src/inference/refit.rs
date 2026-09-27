@@ -3,6 +3,7 @@
 
 use super::check_data;
 use crate::data::DMatrix;
+use crate::ebm::{EbmBoulevard, EbmInfo};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::rng::Rng;
@@ -45,34 +46,40 @@ fn node_counts(tree: &RegTree, leaf_counts: &[usize]) -> Vec<usize> {
 /// them (`0` for a leaf none reaches), and the result scaled as training
 /// scales it. A label-mean intercept is re-estimated on `values`.
 ///
+/// A Boulevard EBM (`booster = ebm` with `ebm_boulevard`) is refitted the
+/// same way through its own recursion (Algorithm 1 of Fang, Tan, Pipping &
+/// Hooker): stage by stage, every round's trees on the same residuals,
+/// each centered on `values`; its term means are re-estimated on `values`.
+///
 /// The structures then depend on the training labels only, and the leaf
 /// values on `values`' labels only: Fang, Tan & Hooker's *integrity*
 /// (Zhou & Hooker's structure–value isolation), under which
-/// [`BoulevardInference`](super::BoulevardInference) is fitted on `values`
-/// (not the training rows). Node covers become `values`' row counts, so
-/// SHAP values of the refitted model are relative to `values`.
+/// [`BoulevardInference`](super::BoulevardInference) (or
+/// [`EbmInference`](super::EbmInference)) is fitted on `values` (not the
+/// training rows). Node covers become `values`' row counts, so SHAP values
+/// of the refitted model are relative to `values`.
 ///
 /// # Errors
 ///
 /// [`HessboostError::InvalidParameter`] when `model` is not a Boulevard
-/// fit, or `values` lacks labels or has row weights or base margins;
-/// [`HessboostError::DimensionMismatch`] for a different feature count.
+/// fit or Boulevard EBM, or `values` lacks labels or has row weights or
+/// base margins; [`HessboostError::DimensionMismatch`] for a different
+/// feature count.
 pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedModel> {
+    if let Some(info) = model.ebm()
+        && let Some(settings) = info.boulevard
+    {
+        return ebm_refit(model, info, settings, values);
+    }
     let info = *model.boulevard().ok_or_else(|| {
         HessboostError::invalid_param(
             "model",
-            "not a Boulevard fit: train it with `booster = boulevard`",
+            "not a Boulevard fit: train it with `booster = boulevard` (or `booster = ebm` with \
+             `ebm_boulevard`)",
         )
     })?;
-    check_data(model, values, "values", true)?;
+    let labels = finite_labels(model, values)?;
     let n = values.n_rows();
-    let labels = values.labels().unwrap_or_default();
-    if labels.iter().any(|y| !y.is_finite()) {
-        return Err(HessboostError::invalid_param(
-            "values",
-            "labels must be finite",
-        ));
-    }
     let mu = if info.intercept_from_labels {
         (labels.iter().map(|&y| f64::from(y)).sum::<f64>() / n as f64) as f32
     } else {
@@ -153,6 +160,134 @@ pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedMod
             "the refitted leaves overflow f32",
         ));
     }
+    Ok(refit)
+}
+
+/// The labels of `values` (checked finite) after [`check_data`].
+fn finite_labels<'v>(model: &BoostedModel, values: &'v DMatrix) -> Result<&'v [f32]> {
+    check_data(model, values, "values", true)?;
+    let labels = values.labels().unwrap_or_default();
+    if labels.iter().any(|y| !y.is_finite()) {
+        return Err(HessboostError::invalid_param(
+            "values",
+            "labels must be finite",
+        ));
+    }
+    Ok(labels)
+}
+
+/// [`honest_refit`] of a Boulevard EBM: its main-effect stage from the
+/// label mean, then its pair stage from the refitted main effects, each
+/// round refitting one tree per term of the stage (trees are stored stage
+/// by stage, round by round, in term order).
+fn ebm_refit(
+    model: &BoostedModel,
+    info: &EbmInfo,
+    settings: EbmBoulevard,
+    values: &DMatrix,
+) -> Result<BoostedModel> {
+    let labels = finite_labels(model, values)?;
+    let n = values.n_rows();
+    let mu = labels.iter().map(|&y| f64::from(y)).sum::<f64>() / n as f64;
+    let t_count = model.num_trees();
+    let node_ids = model.predict_leaf_range(values, ..)?.into_vec();
+    let mut refit = model.clone();
+    let mut base = vec![mu; n];
+    let mut first_tree = 0;
+    for (stage, size) in [1usize, 2].into_iter().enumerate() {
+        let terms = info.terms.iter().filter(|t| t.len() == size).count();
+        let stage_trees = info.tree_terms[first_tree..]
+            .iter()
+            .take_while(|&&t| info.terms[t as usize].len() == size)
+            .count();
+        if terms == 0 {
+            continue;
+        }
+        let rounds = stage_trees / terms;
+        let schedule = Schedule {
+            dropout: 0.0,
+            learning_rate: settings.learning_rate,
+            truncation: 0.0,
+            parallel: 1,
+            seed: 0,
+            salt: REFIT_SALT ^ stage as u64,
+        };
+        let mut recursion = Recursion::new(schedule, n);
+        let mut total = vec![0.0f64; n];
+        let trees = refit.trees_mut();
+        for round in 0..rounds {
+            recursion.step(|request| {
+                let RoundRequest { offsets, rng, .. } = request;
+                let mut round_sum = vec![0.0f64; n];
+                for k in 0..terms {
+                    let t = first_tree + round * terms + k;
+                    let in_bag = row_sample(n, settings.subsample, rng);
+                    let tree = &mut trees[t];
+                    let mut sums = vec![0.0f64; tree.num_nodes()];
+                    let mut counts = vec![0usize; tree.num_nodes()];
+                    for (row, &keep) in in_bag.iter().enumerate() {
+                        if keep {
+                            let leaf = node_ids[row * t_count + t] as usize;
+                            sums[leaf] += f64::from(labels[row]) - base[row] - offsets[0][row];
+                            counts[leaf] += 1;
+                        }
+                    }
+                    let mut leaf_values = vec![0.0f64; tree.num_nodes()];
+                    for (id, node) in tree.nodes().iter().enumerate() {
+                        let denom = counts[id] as f64 + settings.reg_lambda;
+                        if node.is_leaf() && denom > 0.0 {
+                            leaf_values[id] = sums[id] / denom;
+                        }
+                    }
+                    let leaf_of = |row: usize| node_ids[row * t_count + t] as usize;
+                    let mean = (0..n).map(|row| leaf_values[leaf_of(row)]).sum::<f64>() / n as f64;
+                    for (id, v) in leaf_values.iter().enumerate() {
+                        if tree.nodes()[id].is_leaf() {
+                            tree.set_leaf_value(id, (v - mean) as f32);
+                        }
+                    }
+                    for (row, s) in round_sum.iter_mut().enumerate() {
+                        *s += f64::from(tree.nodes()[leaf_of(row)].leaf_value);
+                    }
+                }
+                for (t, &s) in total.iter_mut().zip(&round_sum) {
+                    *t += s;
+                }
+                Ok(vec![round_sum.iter().map(|&s| s as f32).collect()])
+            })?;
+        }
+        let scale = recursion.scale();
+        for tree in trees.iter_mut().skip(first_tree).take(stage_trees) {
+            tree.scale_leaves(scale as f32);
+        }
+        for (b, &t) in base.iter_mut().zip(&total) {
+            *b += scale * t;
+        }
+        first_tree += stage_trees;
+    }
+    for (t, tree) in refit.trees_mut().iter_mut().enumerate() {
+        let mut leaf_counts = vec![0usize; tree.num_nodes()];
+        for row in 0..n {
+            leaf_counts[node_ids[row * t_count + t] as usize] += 1;
+        }
+        for (id, &c) in node_counts(tree, &leaf_counts).iter().enumerate() {
+            tree.set_sum_hess(id, c as f32);
+        }
+    }
+    refit.set_base_scores(vec![mu as f32]);
+    if refit
+        .trees()
+        .iter()
+        .any(|t| t.nodes().iter().any(|n| !n.leaf_value.is_finite()))
+    {
+        return Err(HessboostError::invalid_param(
+            "values",
+            "the refitted leaves overflow f32",
+        ));
+    }
+    let mut refit_info = info.clone();
+    refit_info.term_means = refit_info.term_means_on(&refit, values);
+    refit.set_ebm(Some(refit_info));
     Ok(refit)
 }
 

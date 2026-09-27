@@ -1,9 +1,10 @@
 //! The option groups of [`TrainingParams`](super::TrainingParams): settings
 //! that only mean something when a switch is on live inside that switch
 //! (`BoosterKind::Dart(Dart)`, `BoosterKind::Boulevard(Boulevard)`,
-//! `ProcessType::Update(Refresh)`, `Option<QuantizedGrad>`,
-//! `Option<ExtraTrees>`, `Option<LinearTree>`, `Option<BalancedBagging>`,
-//! `Option<QueryBagging>`, `Option<Langevin>`, `Option<ModelShrink>`), so
+//! `BoosterKind::Ebm(Ebm)`, `ProcessType::Update(Refresh)`,
+//! `Option<QuantizedGrad>`, `Option<ExtraTrees>`, `Option<LinearTree>`,
+//! `Option<BalancedBagging>`, `Option<QueryBagging>`, `Option<Langevin>`,
+//! `Option<ModelShrink>`), so
 //! they cannot be set while the switch is off. Each validates its values
 //! when built.
 
@@ -201,6 +202,233 @@ impl BoulevardBuilder {
             ));
         }
         Ok(self.boulevard)
+    }
+}
+
+/// Largest [`Ebm::outer_bags`]: every bag keeps its margins over the
+/// training rows while the bags train.
+const MAX_EBM_OUTER_BAGS: usize = 1024;
+
+/// Default [`Ebm::early_stopping_tolerance`] (InterpretML's).
+const EBM_EARLY_STOPPING_TOLERANCE: f64 = 1e-5;
+
+/// The settings of an explainable boosting machine (`booster = ebm`,
+/// beyond XGBoost; see [`crate::ebm`]). Build with [`Ebm::builder`]; the
+/// defaults are one bag of every row, main effects only, no early stopping,
+/// and the classic cyclic EBM.
+///
+/// ```
+/// use hessboost::config::Ebm;
+///
+/// # fn main() -> hessboost::error::Result<()> {
+/// let ebm = Ebm::builder()
+///     .interactions(2)
+///     .outer_bags(8)
+///     .bag_fraction(0.85)
+///     .early_stopping_rounds(50)
+///     .build()?;
+/// assert_eq!((ebm.interactions(), ebm.outer_bags()), (2, 8));
+/// // Early stopping scores each bag on the rows it does not train on.
+/// assert!(Ebm::builder().early_stopping_rounds(50).build().is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ebm {
+    interactions: usize,
+    outer_bags: usize,
+    bag_fraction: f64,
+    boulevard: bool,
+    early_stopping_rounds: usize,
+    early_stopping_tolerance: f64,
+}
+
+impl Default for Ebm {
+    fn default() -> Self {
+        Ebm {
+            interactions: 0,
+            outer_bags: 1,
+            bag_fraction: 1.0,
+            boulevard: false,
+            early_stopping_rounds: 0,
+            early_stopping_tolerance: EBM_EARLY_STOPPING_TOLERANCE,
+        }
+    }
+}
+
+impl Ebm {
+    /// Start a builder at the defaults.
+    pub fn builder() -> EbmBuilder {
+        EbmBuilder {
+            ebm: Ebm::default(),
+        }
+    }
+
+    /// Number of pairwise interaction terms added after the main effects:
+    /// the top pairs by FAST (Lou et al., KDD 2013) on the main-effect
+    /// model's gradients, each boosted like a main effect on its two
+    /// features. At most `n_features (n_features − 1) / 2` (checked at
+    /// training). `ebm_interactions`.
+    pub fn interactions(&self) -> usize {
+        self.interactions
+    }
+
+    /// Outer bags (InterpretML's `outer_bags`): each bag boosts its own copy
+    /// of every term on its own row sample, and the model averages them.
+    /// `ebm_outer_bags`.
+    pub fn outer_bags(&self) -> usize {
+        self.outer_bags
+    }
+
+    /// Fraction of the rows each outer bag trains on, drawn without
+    /// replacement per bag (InterpretML trains each bag on `1 −
+    /// validation_size = 0.85`). `ebm_bag_fraction`.
+    pub fn bag_fraction(&self) -> f64 {
+        self.bag_fraction
+    }
+
+    /// Boulevard-regularized EBM (Fang, Tan, Pipping & Hooker, AISTATS
+    /// 2026, Algorithm 1): every round fits one tree per term to the same
+    /// residuals, centers it, and averages it into its term with learning
+    /// rate `eta ∈ (0, 1]`, so the terms converge to a feature-wise kernel
+    /// ridge regression with confidence bands
+    /// ([`EbmInference`](crate::inference::EbmInference)). Squared error
+    /// only, with Boulevard's refusals, one bag of every row, and no early
+    /// stopping. `ebm_boulevard`.
+    pub fn boulevard(&self) -> bool {
+        self.boulevard
+    }
+
+    /// Per-bag early stopping of a classic EBM on the bag's held-out rows
+    /// (the `1 − bag_fraction` it does not train on), after InterpretML:
+    /// after every tree the bag scores its held-out rows with
+    /// [`Trainer::custom_metric`](crate::training::Trainer::custom_metric)'s
+    /// metric when given, else the last eval metric, stops once no tree of
+    /// the last `early_stopping_rounds × terms` improved on the best score
+    /// before them by the tolerance, and keeps its trees up to its best
+    /// score. Each stage (main effects, pairs) stops separately. `0` is off.
+    /// `ebm_early_stopping_rounds`.
+    pub fn early_stopping_rounds(&self) -> usize {
+        self.early_stopping_rounds
+    }
+
+    /// The relative improvement early stopping requires (InterpretML's
+    /// `early_stopping_tolerance`, `1e-5`; negative values keep boosting
+    /// through small losses). `ebm_early_stopping_tolerance`.
+    pub fn early_stopping_tolerance(&self) -> f64 {
+        self.early_stopping_tolerance
+    }
+}
+
+/// Builder of [`Ebm`].
+#[derive(Debug, Clone, Copy)]
+pub struct EbmBuilder {
+    ebm: Ebm,
+}
+
+impl EbmBuilder {
+    /// Set the number of pairwise interaction terms (`ebm_interactions`).
+    #[must_use]
+    pub fn interactions(mut self, interactions: usize) -> Self {
+        self.ebm.interactions = interactions;
+        self
+    }
+
+    /// Set the number of outer bags (`ebm_outer_bags`).
+    #[must_use]
+    pub fn outer_bags(mut self, outer_bags: usize) -> Self {
+        self.ebm.outer_bags = outer_bags;
+        self
+    }
+
+    /// Set the row fraction of each outer bag (`ebm_bag_fraction`).
+    #[must_use]
+    pub fn bag_fraction(mut self, bag_fraction: f64) -> Self {
+        self.ebm.bag_fraction = bag_fraction;
+        self
+    }
+
+    /// Boulevard-average the terms for inference (`ebm_boulevard`).
+    #[must_use]
+    pub fn boulevard(mut self, boulevard: bool) -> Self {
+        self.ebm.boulevard = boulevard;
+        self
+    }
+
+    /// Set the per-bag early-stopping patience in rounds
+    /// (`ebm_early_stopping_rounds`, `0` = off).
+    #[must_use]
+    pub fn early_stopping_rounds(mut self, rounds: usize) -> Self {
+        self.ebm.early_stopping_rounds = rounds;
+        self
+    }
+
+    /// Set the early-stopping tolerance (`ebm_early_stopping_tolerance`).
+    #[must_use]
+    pub fn early_stopping_tolerance(mut self, tolerance: f64) -> Self {
+        self.ebm.early_stopping_tolerance = tolerance;
+        self
+    }
+
+    /// The validated settings.
+    ///
+    /// # Errors
+    ///
+    /// `outer_bags` outside `[1, 1024]`, `bag_fraction` outside `(0, 1]`,
+    /// a non-finite tolerance or one set without early stopping, early
+    /// stopping without held-out rows (`bag_fraction = 1`) or with
+    /// `boulevard`, and `boulevard` with several bags or a bag fraction
+    /// below 1.
+    pub fn build(self) -> Result<Ebm> {
+        let e = self.ebm;
+        let fail =
+            |name: &'static str, reason: String| Err(HessboostError::invalid_param(name, reason));
+        if !(1..=MAX_EBM_OUTER_BAGS).contains(&e.outer_bags) {
+            return fail(
+                "ebm_outer_bags",
+                format!("must be in [1, {MAX_EBM_OUTER_BAGS}], got {}", e.outer_bags),
+            );
+        }
+        if !(e.bag_fraction.is_finite() && e.bag_fraction > 0.0 && e.bag_fraction <= 1.0) {
+            return fail(
+                "ebm_bag_fraction",
+                format!("must be in (0, 1], got {}", e.bag_fraction),
+            );
+        }
+        if !e.early_stopping_tolerance.is_finite() {
+            return fail(
+                "ebm_early_stopping_tolerance",
+                format!("must be finite, got {}", e.early_stopping_tolerance),
+            );
+        }
+        if e.early_stopping_rounds == 0 {
+            if e.early_stopping_tolerance != EBM_EARLY_STOPPING_TOLERANCE {
+                return fail(
+                    "ebm_early_stopping_tolerance",
+                    "is only used with `ebm_early_stopping_rounds > 0`".into(),
+                );
+            }
+        } else if e.boulevard {
+            return fail(
+                "ebm_early_stopping_rounds",
+                "a Boulevard EBM averages every round, so it cannot stop at a best round".into(),
+            );
+        } else if e.bag_fraction >= 1.0 {
+            return fail(
+                "ebm_early_stopping_rounds",
+                "each bag stops on the rows it does not train on; set `ebm_bag_fraction < 1`"
+                    .into(),
+            );
+        }
+        if e.boulevard && (e.outer_bags != 1 || e.bag_fraction != 1.0) {
+            return fail(
+                "ebm_outer_bags",
+                "a bagged Boulevard EBM has no kernel ridge limit its inference covers; use one \
+                 bag of every row"
+                    .into(),
+            );
+        }
+        Ok(e)
     }
 }
 

@@ -18,6 +18,7 @@ mod booster;
 mod conformal;
 mod data;
 mod dist;
+mod ebm;
 mod errors;
 mod inference;
 mod online;
@@ -37,6 +38,9 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<online::OnlineModel>()?;
     m.add_class::<inference::BoulevardInference>()?;
     m.add_function(wrap_pyfunction!(inference::honest_refit, m)?)?;
+    m.add_class::<ebm::TermShape>()?;
+    m.add_class::<ebm::EbmInference>()?;
+    m.add_function(wrap_pyfunction!(ebm::shape_functions, m)?)?;
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
     m.add_function(wrap_pyfunction!(train::cv, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;

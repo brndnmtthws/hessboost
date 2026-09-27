@@ -6,7 +6,7 @@
 //! name and document the alias.
 
 use super::groups::{
-    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    BalancedBagging, Boulevard, Dart, Ebm, ExtraTrees, Langevin, LinearTree, ModelShrink,
     ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
 use crate::error::{HessboostError, Result};
@@ -96,6 +96,16 @@ pub enum BoosterKind {
     /// only; see [`crate::inference`] for the trained model's confidence and
     /// prediction intervals and the settings it refuses.
     Boulevard(Boulevard),
+    /// Explainable boosting machine (EBM, a GA²M; beyond XGBoost, opt-in):
+    /// cyclic boosting of one small tree per feature at a time, so the
+    /// model is a sum of per-feature shape functions, optionally followed
+    /// by pairwise interaction terms (FAST detection,
+    /// [`Ebm::interactions`]) and outer
+    /// bagging. With [`Ebm::boulevard`] the
+    /// terms are Boulevard-averaged instead, which gives the shape
+    /// functions confidence bands. See [`crate::ebm`] for the algorithms,
+    /// the shape functions, and the settings it refuses.
+    Ebm(Ebm),
 }
 
 /// Tree construction algorithm.
@@ -353,15 +363,17 @@ pub struct TrainingParams {
     /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
     /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
     /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
-    /// booster other than `boulevard`, uniform sampling, and one label
-    /// column of `0`/`1` labels.
+    /// booster (a classic `booster = ebm` tree draws from its outer bag),
+    /// uniform sampling, and one label column of `0`/`1` labels; Boulevard
+    /// inference (`booster = boulevard`, `ebm_boulevard`) refuses it.
     pub balanced_bagging: Option<BalancedBagging>,
     /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
     /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
     /// whole query groups are kept or dropped each round. It replaces
     /// `subsample`, which must stay `1`, and needs a `rank:*` objective, a
-    /// tree booster, uniform sampling, and query groups on the training
-    /// data.
+    /// tree booster (a classic `booster = ebm` tree keeps the rows of its
+    /// outer bag in the kept queries), uniform sampling, and query groups on
+    /// the training data.
     pub bagging_by_query: Option<QueryBagging>,
     /// Output-to-tree allocation for multi-output models. XGBoost
     /// `multi_strategy`.
@@ -609,7 +621,7 @@ impl TrainingParams {
         self.validate_tree_options()?;
         self.validate_sglb()?;
         self.validate_boulevard()?;
-        self.validate_balanced_bagging()
+        self.validate_ebm()
     }
 
     /// Query-level bagging: a ranking objective on a tree booster, with
@@ -1168,14 +1180,7 @@ impl TrainingParams {
             return Ok(());
         };
         let dropout = boulevard.dropout();
-        // Before the objective check: balanced bagging needs a `binary:*`
-        // objective, and the reason it cannot work is not the loss.
-        ensure(
-            "pos_bagging_fraction",
-            self.balanced_bagging.is_none(),
-            "class-balanced bagging keeps a row with a probability set by its label, so a leaf \
-             is no longer a linear smoother of the labels; Boulevard needs uniform `subsample`",
-        )?;
+        self.refuse_balanced_bagging()?;
         ensure(
             "objective",
             matches!(self.objective, Objective::SquaredError),
@@ -1209,6 +1214,26 @@ impl TrainingParams {
                 ),
             )?;
         }
+        self.validate_linear_smoother()
+    }
+
+    /// Class-balanced bagging under Boulevard inference (of `booster =
+    /// boulevard` and of `ebm_boulevard`), checked before the objective:
+    /// balanced bagging needs a `binary:*` objective, and the reason it
+    /// cannot work is not the loss.
+    fn refuse_balanced_bagging(&self) -> Result<()> {
+        ensure(
+            "pos_bagging_fraction",
+            self.balanced_bagging.is_none(),
+            "class-balanced bagging keeps a row with a probability set by its label, so a leaf \
+             is no longer a linear smoother of the labels; Boulevard needs uniform `subsample`",
+        )
+    }
+
+    /// The settings Boulevard inference (of `booster = boulevard` and of
+    /// `booster = ebm` with `ebm_boulevard`) refuses: every tree must be a
+    /// linear smoother of its round's residuals with constant leaves.
+    fn validate_linear_smoother(&self) -> Result<()> {
         let nonlinear = "makes leaf values nonlinear in the labels, which Boulevard inference \
                          cannot represent";
         ensure(
@@ -1254,6 +1279,89 @@ impl TrainingParams {
             self.process_type == ProcessType::Default,
             "`update` refreshes existing trees; Boulevard models are grown in one run",
         )
+    }
+
+    /// Ranges of the EBM options, the settings `booster = ebm` refuses
+    /// (anything that would let a tree reach features outside its term, or
+    /// leaves the shape functions cannot read), and with `ebm_boulevard`
+    /// the Boulevard inference refusals.
+    fn validate_ebm(&self) -> Result<()> {
+        let BoosterKind::Ebm(ebm) = self.booster else {
+            return Ok(());
+        };
+        let term = "`booster = ebm` fixes every tree's features to its term";
+        ensure(
+            "num_parallel_tree",
+            self.num_parallel_tree == 1,
+            "`booster = ebm` grows one tree per term at a time; must be 1",
+        )?;
+        for (name, ratio) in [
+            ("colsample_bytree", self.colsample_bytree),
+            ("colsample_bylevel", self.colsample_bylevel),
+            ("colsample_bynode", self.colsample_bynode),
+        ] {
+            ensure(name, ratio == 1.0, format!("{term}; must be 1"))?;
+        }
+        ensure(
+            "interaction_constraints",
+            self.interaction_constraints.is_empty(),
+            format!("{term}; must be empty"),
+        )?;
+        ensure(
+            "linear_tree",
+            self.linear_tree.is_none(),
+            "EBM shape functions need constant leaves",
+        )?;
+        ensure(
+            "toad_penalty_feature",
+            !self.reuse_penalties_on(),
+            "reuse penalties are not supported with `booster = ebm`",
+        )?;
+        ensure(
+            "process_type",
+            self.process_type == ProcessType::Default,
+            "`update` refreshes existing trees; EBM models are grown in one run",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "`booster = ebm` samples rows uniformly (`subsample`)",
+        )?;
+        if !ebm.boulevard() {
+            return Ok(());
+        }
+        self.refuse_balanced_bagging()?;
+        ensure(
+            "objective",
+            matches!(self.objective, Objective::SquaredError),
+            format!(
+                "`ebm_boulevard` supports `reg:squarederror` only, got `{}`",
+                self.objective.name()
+            ),
+        )?;
+        ensure(
+            "eta",
+            self.eta <= 1.0,
+            format!(
+                "Boulevard's learning rate must be in (0, 1], got {}",
+                self.eta
+            ),
+        )?;
+        ensure(
+            "base_score",
+            self.base_score.is_none(),
+            "the Boulevard EBM's centered terms leave the label mean as the intercept; leave it \
+             unset",
+        )?;
+        self.validate_linear_smoother()
+    }
+
+    /// The `booster = ebm` settings (the defaults for any other booster).
+    pub(crate) fn ebm_settings(&self) -> Ebm {
+        match self.booster {
+            BoosterKind::Ebm(ebm) => ebm,
+            _ => Ebm::default(),
+        }
     }
 
     /// The `max_delta_step` in effect (`0` = no bound): the configured

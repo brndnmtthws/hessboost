@@ -576,7 +576,13 @@ impl<'a> Trainer<'a> {
     /// holds the iterations refreshed so far; with `booster = boulevard` it
     /// is the Boulevard average of the rounds run so far. For `gblinear`, which stores
     /// no boosting iterations, [`RoundEval::iteration`] counts this run's
-    /// rounds from 0.
+    /// rounds from 0. For `booster = ebm` it counts EBM rounds from 0
+    /// through the main-effect stage and on through the pair stage (up to
+    /// `num_boost_round` each, fewer once every bag has early-stopped); a
+    /// `Break` keeps the completed rounds (each bag's best ones under
+    /// `ebm_early_stopping_rounds`), a stopped main-effect stage gets no
+    /// pair terms, and with interactions the result is then not a shorter
+    /// run's model.
     ///
     /// Observing never changes the model: training with a hook that always
     /// continues gives the same result as training without one.
@@ -823,6 +829,39 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
         });
     }
 
+    if matches!(params.booster, BoosterKind::Ebm(_)) {
+        // `validate` refuses `process_type = update` for EBMs, and
+        // `validate_request` eval sets and early stopping.
+        let RoundPlan::Grow(prepared) = &plan else {
+            return Err(HessboostError::invalid_param(
+                "process_type",
+                "`booster = ebm` grows new trees only",
+            ));
+        };
+        super::ebm::boost(
+            &run,
+            prepared,
+            &mut state.model,
+            num_boost_round,
+            // The early-stopping metric: `Trainer::custom_metric`'s, else
+            // the last configured one.
+            eval_plan.metrics.last().map(AsRef::as_ref),
+            &mut |iteration| {
+                on_round.as_mut().map_or(ControlFlow::Continue(()), |hook| {
+                    hook(&RoundEval {
+                        iteration,
+                        scores: Vec::new(),
+                    })
+                })
+            },
+        )?;
+        return Ok(TrainResult {
+            model: state.model,
+            history,
+            best_score: None,
+        });
+    }
+
     for round in 0..num_boost_round {
         let iteration = start_iteration + round;
         if let Some(shrink) = &sglb.shrink {
@@ -1060,7 +1099,10 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
     if matches!(params.booster, BoosterKind::Boulevard(_)) {
-        validate_boulevard_request(request, objective)?;
+        validate_boulevard_request(request, objective, "booster = boulevard")?;
+    }
+    if matches!(params.booster, BoosterKind::Ebm(_)) {
+        validate_ebm_request(request, objective)?;
     }
 
     // Model shrinkage multiplies the intercept-and-trees margin every
@@ -1080,16 +1122,21 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)
 }
 
-/// The data-dependent refusals of `booster = boulevard`: its inference
-/// ([`crate::inference`]) models one squared-error label column with equal
-/// noise per row, around the intercept alone. Early stopping is refused
-/// too: the prediction averages every round, so a `best_iteration` prefix
-/// of the trees is not a Boulevard estimate.
-fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
+/// The data-dependent refusals of `booster = boulevard` (and, as `who`
+/// names, of the Boulevard EBM): its inference ([`crate::inference`])
+/// models one squared-error label column with equal noise per row, around
+/// the intercept alone. Early stopping is refused too: the prediction
+/// averages every round, so a `best_iteration` prefix of the trees is not a
+/// Boulevard estimate.
+fn validate_boulevard_request(
+    request: &TrainRequest,
+    objective: &dyn Loss,
+    who: &str,
+) -> Result<()> {
     let refuse = |name: &'static str, reason: &str| {
         Err(HessboostError::invalid_param(
             name,
-            format!("`booster = boulevard`: {reason}"),
+            format!("`{who}`: {reason}"),
         ))
     };
     if request.early_stopping_rounds.is_some() {
@@ -1098,13 +1145,19 @@ fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Loss) -> R
             "the model averages every round, so it cannot stop at a best iteration",
         );
     }
-    if objective.name() != "reg:squarederror" || objective.n_outputs() != 1 {
+    if objective.name() != "reg:squarederror" {
         return refuse(
             "objective",
             &format!("supports reg:squarederror only, got `{}`", objective.name()),
         );
     }
     let dtrain = request.dtrain;
+    if dtrain.n_targets() != 1 || objective.n_outputs() != 1 {
+        return refuse(
+            "labels",
+            &format!("needs one label column, got {}", dtrain.n_targets()),
+        );
+    }
     if dtrain
         .weights()
         .is_some_and(|w| w.iter().any(|&v| v != 1.0))
@@ -1115,6 +1168,62 @@ fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Loss) -> R
         if data.base_margin().is_some() {
             return refuse("base_margin", "base margins are not supported");
         }
+    }
+    Ok(())
+}
+
+/// The data-dependent refusals of `booster = ebm`: one output, numerical
+/// features, no feature weights or base margins (the terms and their
+/// centering assume the intercept alone), and no eval sets or early stopping (the
+/// terms of one run are boosted round by round, so no prefix of the trees
+/// is a model of every term); with `ebm_boulevard` also Boulevard's
+/// refusals (squared error, unit row weights, no base margins).
+fn validate_ebm_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
+    let refuse = |name: &'static str, reason: &str| {
+        Err(HessboostError::invalid_param(
+            name,
+            format!("`booster = ebm`: {reason}"),
+        ))
+    };
+    if request.early_stopping_rounds.is_some() || !request.evals.is_empty() {
+        return refuse(
+            "early_stopping_rounds",
+            "eval sets and early stopping are not supported; evaluate the trained model",
+        );
+    }
+    if request.dtrain.n_targets() != 1 {
+        return refuse(
+            "labels",
+            &format!("needs one label column, got {}", request.dtrain.n_targets()),
+        );
+    }
+    if objective.n_outputs() != 1 {
+        return refuse(
+            "objective",
+            &format!(
+                "needs a single-output objective, got `{}`",
+                objective.name()
+            ),
+        );
+    }
+    if request.dtrain.base_margin().is_some() {
+        return refuse(
+            "base_margin",
+            "base margins are not supported: the terms and their centering assume the \
+             intercept alone",
+        );
+    }
+    if request.params.ebm_settings().early_stopping_rounds() > 0 && request.dtrain.group().is_some()
+    {
+        return refuse(
+            "ebm_early_stopping_rounds",
+            "early stopping scores each bag's held-out rows, which split the query groups; not \
+             supported with query groups",
+        );
+    }
+    super::ebm::validate_data(request.dtrain)?;
+    if request.params.ebm_settings().boulevard() {
+        validate_boulevard_request(request, objective, "ebm_boulevard")?;
     }
     Ok(())
 }

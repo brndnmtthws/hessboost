@@ -66,7 +66,21 @@ fuzz_target!(|data: &[u8]| {
         // Zero may be an unseen category, which is refused; otherwise the
         // missing entry is filled.
         if let Ok(imputed) = model.impute(&probe, 1, None, 0) {
+            // One imputation of one row: `[imputation][row][column]`.
+            assert_eq!(
+                (
+                    imputed.n_imputations(),
+                    imputed.n_rows(),
+                    imputed.n_columns()
+                ),
+                (1, 1, model.n_columns())
+            );
             assert_eq!(imputed.as_slice().len(), model.n_columns());
+            assert!(
+                imputed
+                    .get(0, 0)
+                    .is_some_and(|r| r.iter().all(|v| v.is_finite()))
+            );
         }
     }
 });

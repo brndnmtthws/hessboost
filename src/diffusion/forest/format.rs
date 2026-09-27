@@ -20,7 +20,7 @@
 
 use serde::Deserialize;
 
-use super::{Column, ColumnKind, ForestMethod, ForestModel, Scale};
+use super::{Column, ColumnKind, ForestMethod, ForestModel, OutputLayout, Scale};
 use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::model::container::{ContainerSpec, WRITER, read_models, write_models};
@@ -67,7 +67,7 @@ pub(super) fn write(model: &ForestModel) -> Result<Vec<u8>> {
         }
     }
     w.u64("forest.n_t", model.n_t as u64);
-    w.u64("forest.per_output", u64::from(model.per_output));
+    w.u64("forest.per_output", u64::from(bool::from(model.layout)));
     let columns = &model.columns;
     w.array(
         "columns.kind",
@@ -137,9 +137,9 @@ fn read_model(s: &Sections) -> Result<ForestModel> {
         },
         other => return Err(unknown("forest.method", other)),
     };
-    let per_output = match s.u64("forest.per_output")? {
-        0 => false,
-        1 => true,
+    let layout = match s.u64("forest.per_output")? {
+        0 => OutputLayout::Joint,
+        1 => OutputLayout::PerColumn,
         other => return Err(unknown("forest.per_output", &other.to_string())),
     };
     let kinds = s.array("columns.kind", |[b]: [u8; 1]| b)?;
@@ -199,7 +199,7 @@ fn read_model(s: &Sections) -> Result<ForestModel> {
             .collect(),
         classes,
         class_probs,
-        per_output,
+        layout,
         models,
     };
     model.validate()?;
@@ -216,7 +216,8 @@ pub(super) struct UncheckedForestModel {
     scales: Vec<Scale>,
     classes: Vec<f64>,
     class_probs: Vec<f64>,
-    per_output: bool,
+    #[serde(rename = "per_output")]
+    layout: OutputLayout,
     models: Vec<BoostedModel>,
 }
 
@@ -231,7 +232,7 @@ impl TryFrom<UncheckedForestModel> for ForestModel {
             scales: m.scales,
             classes: m.classes,
             class_probs: m.class_probs,
-            per_output: m.per_output,
+            layout: m.layout,
             models: m.models,
         };
         model.validate()?;

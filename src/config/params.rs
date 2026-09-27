@@ -292,7 +292,9 @@ pub struct TrainingParams {
     /// Maximum tree depth; `None` is no limit. XGBoost `max_depth` (`0`
     /// there is `None` here).
     pub max_depth: Option<NonZeroUsize>,
-    /// Maximum number of leaves per tree; `None` is no limit. XGBoost
+    /// Maximum number of leaves per tree grown by `lossguide` (and of
+    /// vector-leaf trees under either policy); `None` is no limit. As in
+    /// XGBoost, depth-wise scalar trees read only `max_depth`. XGBoost
     /// `max_leaves` (`0` there is `None` here).
     pub max_leaves: Option<NonZeroUsize>,
     /// Minimum sum of instance hessian needed in a child. XGBoost `min_child_weight`.
@@ -1067,7 +1069,8 @@ impl TrainingParamsBuilder {
         self.params.max_depth = None;
         self
     }
-    /// Set the maximum number of leaves per tree. `0` is refused at
+    /// Set the maximum number of leaves per `lossguide` (or vector-leaf)
+    /// tree ([`TrainingParams::max_leaves`]). `0` is refused at
     /// [`build`](Self::build); [`unlimited_leaves`](Self::unlimited_leaves)
     /// removes the limit (the default).
     #[must_use]

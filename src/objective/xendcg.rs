@@ -3,8 +3,9 @@
 //!
 //! The randomized target `2^label - U(0, 1)`, softmax probabilities, and
 //! approximate gradient and diagonal Hessian terms follow LightGBM's
-//! `src/objective/rank_objective.hpp`. Draws are stateless SplitMix64 values
-//! keyed by seed, boosting iteration, query, and document. LightGBM seeds a
+//! `src/objective/rank_objective.hpp`. Each document's `U` is position
+//! `doc` of the counter-based stream keyed by (seed, a salt of its own,
+//! boosting iteration, query) ([`crate::rng::stream_key`]). LightGBM seeds a
 //! mutable `Random` stream for each query with `objective_seed + query_index`;
 //! the formula matches, but the RNG values and trained trees differ.
 //! Unlike LightGBM's direct `1 - rho` denominator, softmax complements are
@@ -15,10 +16,13 @@ use super::{GradPair, Loss, check_label_domain, check_label_width};
 use crate::data::{GroupInfo, MetaInfo};
 use crate::error::{HessboostError, Result};
 use crate::metric::group_ranges;
-use crate::rng::{GOLDEN, mix64};
+use crate::rng::{keyed_unit_f32, stream_key};
 
 use rayon::prelude::*;
 
+/// Salt of the XE-NDCG target stream (`"xendcg"`), keeping its draws apart
+/// from every other keyed stream of the same seed.
+const TARGET_STREAM: u64 = 0x0000_7865_6E64_6367;
 /// Query batches this large use the same disjoint-group parallel strategy as LambdaMART.
 const PARALLEL_XENDCG_ROWS: usize = 4096;
 /// XE-NDCG loss (LightGBM `rank_xendcg`, named `rank:xendcg` here).
@@ -159,13 +163,10 @@ impl Xendcg {
             *probability /= denominator;
         }
 
-        let seed_key = mix64(*seed);
-        let iter_key = mix64(seed_key ^ (*iteration as u64).wrapping_mul(GOLDEN));
-        let query_key = mix64(iter_key ^ (*query as u64).wrapping_mul(GOLDEN));
+        let key = stream_key(&[*seed, TARGET_STREAM, *iteration as u64, *query as u64]);
         target.clear();
         target.extend(labels.iter().enumerate().map(|(doc, &label)| {
-            let bits = mix64(query_key ^ (doc as u64).wrapping_mul(GOLDEN));
-            let draw = (bits >> 40) as f32 * (1.0 / (1u32 << 24) as f32);
+            let draw = keyed_unit_f32(key, doc as u64);
             2.0f64.powf(f64::from(label)) - f64::from(draw)
         }));
         let inv_target_sum = 1.0 / target.iter().sum::<f64>().max(1e-15);
@@ -286,44 +287,84 @@ impl Loss for Xendcg {
 mod tests {
     use super::*;
 
+    /// LightGBM's `RankXENDCG::GetGradientsForOneQuery` in plain `f64`
+    /// (softmax, targets `2^label - U` normalized, then the three
+    /// correction terms), for the documents' draws `u`.
+    fn reference(scores: &[f64], labels: &[f64], u: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+        let total: f64 = exp.iter().sum();
+        let rho: Vec<f64> = exp.iter().map(|e| e / total).collect();
+        let phi: Vec<f64> = labels
+            .iter()
+            .zip(u)
+            .map(|(l, u)| 2f64.powf(*l) - u)
+            .collect();
+        let phi_sum: f64 = phi.iter().sum();
+        let n = scores.len();
+        let first: Vec<f64> = (0..n).map(|i| -phi[i] / phi_sum + rho[i]).collect();
+        let p1: Vec<f64> = (0..n).map(|i| first[i] / (1.0 - rho[i])).collect();
+        let l1: f64 = p1.iter().sum();
+        let second: Vec<f64> = (0..n).map(|i| rho[i] * (l1 - p1[i])).collect();
+        let p2: Vec<f64> = (0..n).map(|i| second[i] / (1.0 - rho[i])).collect();
+        let l2: f64 = p2.iter().sum();
+        let grad = (0..n)
+            .map(|i| first[i] + second[i] + rho[i] * (l2 - p2[i]))
+            .collect();
+        let hess = rho.iter().map(|r| r * (1.0 - r)).collect();
+        (grad, hess)
+    }
+
+    /// Every query's gradients, at the default seed and iteration 0 (the
+    /// stream positions a bare `mix64` chain from 0 made degenerate) and at
+    /// a later seed and iteration, with unequal scores, match the reference
+    /// formula fed the draws of that query's documented stream (seed, salt,
+    /// iteration, query).
     #[test]
     fn query_gradient_matches_independent_formula() {
-        let scores = [0.0, 0.0];
-        let labels = [1.0, 0.0];
-        let query_key = mix64(mix64(0));
-        let draws: Vec<f64> = (0..2)
-            .map(|doc| {
-                let bits = mix64(query_key ^ (doc as u64).wrapping_mul(GOLDEN));
-                f64::from((bits >> 40) as f32 * (1.0 / (1u32 << 24) as f32))
-            })
-            .collect();
-        let target = [2.0 - draws[0], 1.0 - draws[1]];
-        let z = target[0] + target[1];
-        let rho = [0.5, 0.5];
-        let first = [-target[0] / z + rho[0], -target[1] / z + rho[1]];
-        let params1 = [first[0] / 0.5, first[1] / 0.5];
-        let sum_l1 = params1[0] + params1[1];
-        let second = [
-            rho[0] * (sum_l1 - params1[0]),
-            rho[1] * (sum_l1 - params1[1]),
-        ];
-        let params2 = [second[0] / 0.5, second[1] / 0.5];
-        let sum_l2 = params2[0] + params2[1];
-        let expected = [
-            (first[0] + second[0] + rho[0] * (sum_l2 - params2[0])) as f32,
-            (first[1] + second[1] + rho[1] * (sum_l2 - params2[1])) as f32,
-        ];
-        let objective = Xendcg::new(0);
-        let mut actual = [GradPair::default(); 2];
-        objective.query_gradients(&scores, &labels, None, None, &mut actual, 0);
-        assert_eq!(actual[0].grad, expected[0]);
-        assert_eq!(actual[1].grad, expected[1]);
-        assert_eq!(actual[0].hess, 0.25);
-        assert_eq!(actual[1].hess, 0.25);
-        let mut again = [GradPair::default(); 2];
-        objective.query_gradients(&scores, &labels, None, None, &mut again, 4);
-        assert_ne!(actual, again);
+        let scores = [0.0, 0.0, 0.7, -0.4, 1.3];
+        let labels = [2.0, 0.0, 1.0, 0.0, 3.0];
+        let group = GroupInfo::from_sizes(&[2, 3]);
+        let widen = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
+        for (seed, iteration) in [(0, 0), (97, 3)] {
+            let gradients = |iteration: usize| {
+                let mut out = [GradPair::default(); 5];
+                Xendcg::new(seed).query_gradients(
+                    &scores,
+                    &labels,
+                    None,
+                    Some(&group),
+                    &mut out,
+                    iteration,
+                );
+                out
+            };
+            let actual = gradients(iteration);
+            for (query, (start, end)) in group.iter_ranges().enumerate() {
+                let key = stream_key(&[seed, TARGET_STREAM, iteration as u64, query as u64]);
+                let u: Vec<f64> = (0..end - start)
+                    .map(|doc| f64::from(keyed_unit_f32(key, doc as u64)))
+                    .collect();
+                let (grad, hess) =
+                    reference(&widen(&scores[start..end]), &widen(&labels[start..end]), &u);
+                for (pair, (g, h)) in actual[start..end].iter().zip(grad.iter().zip(&hess)) {
+                    assert!(
+                        (f64::from(pair.grad) - g).abs() < 1e-6,
+                        "{} vs {g}",
+                        pair.grad
+                    );
+                    assert!(
+                        (f64::from(pair.hess) - h).abs() < 1e-6,
+                        "{} vs {h}",
+                        pair.hess
+                    );
+                }
+            }
+            // Another iteration redraws the targets.
+            assert_ne!(actual, gradients(iteration + 1));
+        }
     }
+
     #[test]
     fn extreme_score_margins_keep_gradients_finite() {
         let labels = [1.0, 0.0];

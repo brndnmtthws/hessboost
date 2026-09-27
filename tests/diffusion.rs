@@ -2,7 +2,9 @@
 //! learned distribution's shape, sampling determinism, persistence, and
 //! refusals.
 
-use hessboost::config::{BalancedBagging, ProcessType, QueryBagging, Refresh};
+use hessboost::config::{
+    BalancedBagging, BoosterKind, Boulevard, Ebm, ProcessType, QueryBagging, Refresh,
+};
 use hessboost::diffusion::{
     DiffusionModel, DiffusionParams, FlowMatchingConfig, FlowPath, Method, Samples, ScoreConfig,
     Sde,
@@ -272,6 +274,47 @@ fn row_bagging_regressor_params_are_refused() {
         let mut params = quick(DiffusionParams::default());
         set(&mut params.residualizer.as_mut().unwrap().training);
         refused(&params);
+    }
+}
+
+#[test]
+fn single_label_boosters_train_on_one_label_column() {
+    // `booster = boulevard` (one averaged squared-error regressor) and
+    // `booster = ebm` (additive terms) score a scalar target without early
+    // stopping; their own refusals (early stopping, a label matrix) come
+    // back as errors from `fit`, not panics.
+    let boosters = [
+        BoosterKind::Boulevard(Boulevard::default()),
+        BoosterKind::Ebm(Ebm::default()),
+    ];
+    let data = bimodal(200, 4);
+    let probe = probes(&[0.5]);
+    let y: Vec<f32> = (0..200).flat_map(|i| [i as f32, -(i as f32)]).collect();
+    let x: Vec<f32> = (0..200).map(|i| i as f32 / 200.0).collect();
+    let wide = DMatrix::from_dense(&x, 200, 1)
+        .unwrap()
+        .with_label_matrix(&y, 2)
+        .unwrap();
+    for booster in boosters {
+        let mut params = quick(DiffusionParams::treeffuser());
+        params.training = TrainingParams::builder()
+            .booster(booster)
+            .eta(0.8)
+            .build()
+            .unwrap();
+        assert_eq!(
+            invalid_param(DiffusionModel::fit(&params, &data)),
+            "early_stopping_rounds"
+        );
+        params.early_stopping = None;
+        let model = DiffusionModel::fit(&params, &data).unwrap();
+        let samples = model.sample(&probe, 50, 1).unwrap();
+        let reloaded = DiffusionModel::from_bytes(&model.to_bytes().unwrap()).unwrap();
+        assert_eq!(reloaded.sample(&probe, 50, 1).unwrap(), samples);
+        assert!(matches!(
+            DiffusionModel::fit(&params, &wide),
+            Err(HessboostError::InvalidParameter { .. })
+        ));
     }
 }
 

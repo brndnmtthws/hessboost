@@ -51,7 +51,7 @@ use std::sync::OnceLock;
 
 use super::objective::{ModelObjective, StoredObjectiveParams};
 use super::sections::{Sections, Writer, format_error, wrong_length};
-use super::{BoostedModel, LinearModel, Shrinkage};
+use super::{BoostedModel, LinearModel, Shrinkage, TreeWeights};
 use crate::ebm::{EbmBoulevard, EbmInfo};
 use crate::error::Result;
 use crate::inference::BoulevardInfo;
@@ -644,7 +644,7 @@ pub(super) fn read(bytes: &[u8]) -> Result<BoostedModel> {
         } else {
             None
         },
-        tree_weights: s.array("model.tree_weights", f32::from_le_bytes)?,
+        tree_weights: TreeWeights::from_vec(s.array("model.tree_weights", f32::from_le_bytes)?),
         num_parallel_tree: s.usize("model.num_parallel_tree")?,
         linear,
         boulevard: read_boulevard(&s)?,
@@ -1267,7 +1267,7 @@ mod tests {
             n_targets: 1,
             n_features,
             best_iteration: None,
-            tree_weights: Vec::new(),
+            tree_weights: TreeWeights::Unit,
             num_parallel_tree: 1,
             linear: Some(LinearModel::new(vec![0.0; n_features], vec![0.0])),
             shrinkage: None,

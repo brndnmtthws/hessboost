@@ -25,7 +25,7 @@ use crate::tree::hist::quantized::QuantNode;
 use crate::tree::hist::{CpuBackend, Histogram, HistogramBackend, zeroed};
 use crate::tree::regtree::RegTree;
 use crate::tree::reuse::{HistReuse, ReuseSet};
-use crate::tree::sampler::ColumnSampler;
+use crate::tree::sampler::{ColumnSampler, FeatureSet};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -88,8 +88,8 @@ struct PendingSplit {
     right_id: usize,
     left_bounds: Bounds,
     right_bounds: Bounds,
-    left_features: Vec<u32>,
-    right_features: Vec<u32>,
+    left_features: FeatureSet,
+    right_features: FeatureSet,
     /// Depthwise children at the depth limit: they stay leaves, so they need
     /// no histograms or split searches, only their rows (kept only when leaf
     /// rows are captured; otherwise the split is never built).
@@ -446,7 +446,7 @@ impl<'a> HistTreeBuilder<'a> {
     /// without per-level or per-node draws, no reuse penalties (which each
     /// expansion extends), no LightGBM options (which key draws by node id),
     /// no quantized histograms, and more than one worker.
-    fn speculative_features(&self, sampler: &ColumnSampler) -> Option<Vec<u32>> {
+    fn speculative_features(&self, sampler: &ColumnSampler) -> Option<FeatureSet> {
         if self.reuse.is_some()
             || self.options.is_some()
             || self.config.params.quantized.is_some()
@@ -454,7 +454,7 @@ impl<'a> HistTreeBuilder<'a> {
         {
             return None;
         }
-        sampler.fixed_features().map(<[u32]>::to_vec)
+        sampler.fixed_features()
     }
 
     /// [`Self::build_children`] of `entry` (whose split is valid) ahead of
@@ -466,7 +466,7 @@ impl<'a> HistTreeBuilder<'a> {
         ghist: &GHistIndex,
         gpair: &[GradPair],
         entry: &NodeEntry,
-        features: &[u32],
+        features: &FeatureSet,
     ) -> (NodeEntry, NodeEntry) {
         let b = &entry.best;
         let (left_bounds, right_bounds) =
@@ -487,8 +487,8 @@ impl<'a> HistTreeBuilder<'a> {
             right_id: 0,
             left_bounds,
             right_bounds,
-            left_features: features.to_vec(),
-            right_features: features.to_vec(),
+            left_features: features.clone(),
+            right_features: features.clone(),
             terminal: false,
         };
         self.build_children(ghist, gpair, split)

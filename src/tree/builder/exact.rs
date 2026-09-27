@@ -286,7 +286,7 @@ impl<'a> ExactTreeBuilder<'a> {
                 }
             } else {
                 let mut scratch = Scratch::new(k);
-                for &f in &feature_subset {
+                for &f in feature_subset.iter() {
                     level.scan_feature(f, &mut best, &mut scratch);
                 }
             }

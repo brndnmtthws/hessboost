@@ -79,7 +79,7 @@ pub fn honest_refit(model: &BoostedModel, values: &DMatrix) -> Result<BoostedMod
         model.base_score()
     };
     let t_count = model.num_trees();
-    let node_ids = model.predict_leaf_range(values, ..)?;
+    let node_ids = model.predict_leaf_range(values, ..)?.into_vec();
     let parallel = model.num_parallel_tree();
     let schedule = Schedule::from_info(&info, parallel, REFIT_SALT);
     let mut refit = model.clone();

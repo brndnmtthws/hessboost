@@ -430,6 +430,7 @@ fn mean_squared_residual(model: &BoostedModel, data: &DMatrix) -> Result<f64> {
     let preds = model.predict(data)?;
     let labels = data.labels().unwrap_or_default();
     let sum: f64 = preds
+        .as_slice()
         .iter()
         .zip(labels)
         .map(|(&p, &y)| (f64::from(y) - f64::from(p)).powi(2))
@@ -485,7 +486,7 @@ impl<'a> BoulevardInference<'a> {
             ));
         }
         let (c, s) = info.ridge(model.num_parallel_tree());
-        let leaves = model.predict_leaf_range(train, ..)?;
+        let leaves = model.predict_leaf_range(train, ..)?.into_vec();
         let kernel = LeafKernel::new(model.trees(), &leaves, info.kappa())?;
         let solver = match solver {
             KernelSolver::Exact => {
@@ -559,7 +560,7 @@ impl<'a> BoulevardInference<'a> {
     /// The leaf node ids of `data`'s rows, `[row][tree]`.
     fn leaves(&self, data: &DMatrix) -> Result<Vec<u32>> {
         check_data(self.model, data, "data", false)?;
-        self.model.predict_leaf_range(data, ..)
+        Ok(self.model.predict_leaf_range(data, ..)?.into_vec())
     }
 
     /// The kernel vectors of the `rows` of `leaves` (`[row][tree]`), one
@@ -621,6 +622,7 @@ impl<'a> BoulevardInference<'a> {
         let norms = self.weight_norms(data)?;
         let preds = self.model.predict(data)?;
         Ok(preds
+            .as_slice()
             .iter()
             .zip(norms)
             .map(|(&p, w2)| {

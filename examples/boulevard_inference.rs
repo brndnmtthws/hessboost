@@ -97,7 +97,7 @@ fn main() -> Result<()> {
             "  {:.3}  {:+.3}  {:+.3}  {:.3}  [{:+.3}, {:+.3}]  [{:+.3}, {:+.3}]",
             grid[2 * i],
             f(grid[2 * i]),
-            preds[i],
+            preds.as_slice()[i],
             se[i],
             ci[i].0,
             ci[i].1,

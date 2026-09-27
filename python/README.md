@@ -173,8 +173,8 @@ band = hessboost.train(
     200,
 )
 cqr = ConformalizedQuantile.calibrate_outputs(band, X_cal, y_cal, alpha=0.1)
-lower, upper = cqr.predict_interval(X_test).T   # >= 90% coverage, finite-sample
-lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T   # for f(x)
+lower, upper = cqr.predict_interval(X_test).T  # >= 90% coverage, finite-sample
+lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T  # for f(x)
 
 dist = hessboost.train({"objective": "dist:normal"}, hessboost.DMatrix(X_train, y_train), 300)
 d = dist.predict_distribution(X_test)

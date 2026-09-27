@@ -219,7 +219,7 @@ _SDES = (VarianceExploding, VariancePreserving, SubVariancePreserving)
 @dataclass(frozen=True)
 class Score:
     """Score-based diffusion: the GBDT reconstructs the score of an SDE's
-    marginals; sampling runs Euler–Maruyama on the reverse SDE. The
+    marginals; sampling runs Euler-Maruyama on the reverse SDE. The
     defaults are DiffGBM's score-side recipe.
 
     Args:
@@ -501,7 +501,7 @@ class DiffusionParams:
     def default(cls) -> Self:
         """DiffGBM's score-side recipe: VE SDE, EDM preconditioning, a
         log-noise feature, log-normal noise levels, conditional-mean
-        residualization, 30 repeats, 50 Euler–Maruyama steps, up to 3000
+        residualization, 30 repeats, 50 Euler-Maruyama steps, up to 3000
         rounds stopped after 50 without improvement on 10% of the rows."""
         return cls._preset("default")
 

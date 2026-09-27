@@ -44,19 +44,19 @@ pub(super) struct TrainContext<'a> {
 /// The gradients one tree grows on and the rows that take part: an output's
 /// gradients and its uniform row subset, or their gradient-based sample.
 #[derive(Clone, Copy)]
-struct TreeSample<'a> {
-    gpair: &'a [GradPair],
-    rows: &'a [u32],
+pub(super) struct TreeSample<'a> {
+    pub(super) gpair: &'a [GradPair],
+    pub(super) rows: &'a [u32],
     /// Under `approx` with per-round cuts, the gradient index that every
     /// tree of this output's forest builds from these same gradients
     /// (`None` elsewhere): built before the parallel trees start, or by the
     /// first tree that needs it on the serial path.
-    forest_index: Option<&'a OnceLock<GHistIndex>>,
+    pub(super) forest_index: Option<&'a OnceLock<GHistIndex>>,
 }
 use crate::tree::hist::{CpuBackend, HistogramBackend};
 
 /// Prepared, reusable per-round builder state, chosen by `tree_method`.
-enum Prepared {
+pub(super) enum Prepared {
     Exact(SortedColumns),
     /// Histogram method: the binned dataset plus the backend its histograms
     /// are built on (the CPU's, or the Metal GPU's when `device = metal`).
@@ -91,7 +91,7 @@ impl Prepared {
     /// penalties (`reuse` is `Some`) the split search is penalized by the
     /// ensemble's dictionary, which the new tree's splits then extend.
     /// `rounding_seed` keys the stochastic rounding of quantized training.
-    fn build_tree(
+    pub(super) fn build_tree(
         &self,
         run: &TrainContext,
         sample: TreeSample,
@@ -233,7 +233,7 @@ impl Prepared {
     /// by output. XGBoost 3.4.2 likewise keeps the first gradient index its
     /// training matrix builds (`BatchParam::regen` is false), whichever
     /// output group later reads it.
-    fn fill_approx_cache(&self, run: &TrainContext, gpair: &[GradPair]) {
+    pub(super) fn fill_approx_cache(&self, run: &TrainContext, gpair: &[GradPair]) {
         if let Prepared::Approx {
             const_hess: true,
             cached,
@@ -573,7 +573,8 @@ impl<'a> Trainer<'a> {
     /// still records the best round so far as
     /// [`best_iteration`](BoostedModel::best_iteration) (with its
     /// [`TrainResult::best_score`]). With `process_type=update` the model
-    /// holds the iterations refreshed so far. For `gblinear`, which stores
+    /// holds the iterations refreshed so far; with `booster = boulevard` it
+    /// is the Boulevard average of the rounds run so far. For `gblinear`, which stores
     /// no boosting iterations, [`RoundEval::iteration`] counts this run's
     /// rounds from 0.
     ///
@@ -786,6 +787,41 @@ fn train_impl(trainer: Trainer<'_>, objective: &dyn Loss) -> Result<TrainResult>
     // iterations count from 0).
     let unshrunk_base = state.model.base_scores().to_vec();
     let mut shrink_factors = Vec::new();
+
+    if matches!(params.booster, BoosterKind::Boulevard(_)) {
+        // `validate` refuses `process_type = update` for Boulevard, and
+        // `validate_request` early stopping, so every round grows trees
+        // and the history is the whole run's.
+        let RoundPlan::Grow(prepared) = &plan else {
+            return Err(HessboostError::invalid_param(
+                "process_type",
+                "`booster = boulevard` grows new trees only",
+            ));
+        };
+        let boost = super::boulevard::BoostState {
+            model: &mut state.model,
+            margins: &mut state.margins,
+            reuse: &mut state.reuse,
+        };
+        super::boulevard::boost(&run, prepared, boost, num_boost_round, |round, margins| {
+            if !evals.is_empty() {
+                eval_plan.record(objective, round, margins, &mut history);
+            }
+            match (&mut on_round, history.last()) {
+                (None, _) => ControlFlow::Continue(()),
+                (Some(hook), Some(last)) if last.iteration == round => hook(last),
+                (Some(hook), _) => hook(&RoundEval {
+                    iteration: round,
+                    scores: Vec::new(),
+                }),
+            }
+        })?;
+        return Ok(TrainResult {
+            model: state.model,
+            history,
+            best_score: None,
+        });
+    }
 
     for round in 0..num_boost_round {
         let iteration = start_iteration + round;
@@ -1023,6 +1059,9 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
     if matches!(params.process_type, ProcessType::Update(_)) {
         reject_feature_weights(dtrain, "`process_type=update` does not sample columns")?;
     }
+    if matches!(params.booster, BoosterKind::Boulevard(_)) {
+        validate_boulevard_request(request, objective)?;
+    }
 
     // Model shrinkage multiplies the intercept-and-trees margin every
     // iteration; a per-row `base_margin` replaces the intercept and would be
@@ -1039,6 +1078,45 @@ fn validate_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> 
         ));
     }
     BoostedModel::check_iteration_size(n_out, params.num_parallel_tree)
+}
+
+/// The data-dependent refusals of `booster = boulevard`: its inference
+/// ([`crate::inference`]) models one squared-error label column with equal
+/// noise per row, around the intercept alone. Early stopping is refused
+/// too: the prediction averages every round, so a `best_iteration` prefix
+/// of the trees is not a Boulevard estimate.
+fn validate_boulevard_request(request: &TrainRequest, objective: &dyn Loss) -> Result<()> {
+    let refuse = |name: &'static str, reason: &str| {
+        Err(HessboostError::invalid_param(
+            name,
+            format!("`booster = boulevard`: {reason}"),
+        ))
+    };
+    if request.early_stopping_rounds.is_some() {
+        return refuse(
+            "early_stopping_rounds",
+            "the model averages every round, so it cannot stop at a best iteration",
+        );
+    }
+    if objective.name() != "reg:squarederror" || objective.n_outputs() != 1 {
+        return refuse(
+            "objective",
+            &format!("supports reg:squarederror only, got `{}`", objective.name()),
+        );
+    }
+    let dtrain = request.dtrain;
+    if dtrain
+        .weights()
+        .is_some_and(|w| w.iter().any(|&v| v != 1.0))
+    {
+        return refuse("weights", "row weights other than 1 are not supported");
+    }
+    for data in std::iter::once(dtrain).chain(request.evals.iter().map(|&(d, _)| d)) {
+        if data.base_margin().is_some() {
+            return refuse("base_margin", "base margins are not supported");
+        }
+    }
+    Ok(())
 }
 
 /// What the tree-growing and refresh rounds update: the ensemble, its
@@ -1626,6 +1704,11 @@ impl<'a> MarginCaches<'a> {
         for (margins, (d, _)) in self.evals.iter_mut().zip(self.eval_sets) {
             *margins = model.margin_from_trees(d, 0..model.num_trees());
         }
+    }
+
+    /// The eval sets' matrices, in eval-set order.
+    pub(super) fn eval_data(&self) -> impl Iterator<Item = &'a DMatrix> + 'a {
+        self.eval_sets.iter().map(|&(d, _)| d)
     }
 }
 

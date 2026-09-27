@@ -32,7 +32,8 @@ and `λ` is the L2 penalty `lambda`.
   any thread count.
 - **Stable model files.** Anything saved by 0.2.0 or later loads in every
   later release.
-- **More than XGBoost, opt-in.** Conformal intervals, distributional
+- **More than XGBoost, opt-in.** Conformal intervals, confidence intervals
+  for the regression function (Boulevard boosting), distributional
   boosting, SGLB uncertainty, budget training, compact models, XE-NDCG
   ranking, and more — all off by default, none of them changes default
   training.
@@ -107,6 +108,7 @@ runnable programs live in [`examples/`](examples)
 | `shap` | SHAP contributions and interaction values |
 | `model_io` | native and XGBoost JSON/UBJSON save and load |
 | `conformal` | calibrated prediction intervals |
+| `boulevard_inference` | confidence intervals for `f(x)` and prediction intervals |
 | `distributional` | predictive distributions, intervals, and NLL |
 | `virtual_ensembles` | SGLB posterior sampling: knowledge uncertainty rising off the training data |
 | `ordered_target_stats` | encoding a high-cardinality categorical |
@@ -161,6 +163,7 @@ Beyond XGBoost (opt-in, none changes default training):
 | Feature | What it gives you |
 |---|---|
 | [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/) | prediction intervals with a finite-sample coverage guarantee |
+| [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/) | Boulevard boosting (`booster = boulevard`, with BRAT-D dropout and BRAT-P parallel variants) and its asymptotic confidence intervals for `f(x)` and prediction intervals, after Zhou & Hooker (JMLR 2022) and Fang, Tan & Hooker (NeurIPS 2025); squared error only |
 | [Distributional boosting](https://docs.rs/hessboost/latest/hessboost/objective/distributional/) | a full predictive distribution per row (`dist:normal`, `dist:gamma`, ...), after NGBoost and XGBoostLSS |
 | [SGLB and virtual ensembles](https://docs.rs/hessboost/latest/hessboost/model/uncertainty/) | CatBoost's Langevin boosting, model shrinkage, and `posterior_sampling`; knowledge, data, and total uncertainty from one model's truncations (after Malinin et al., ICLR 2021) |
 | [Budget training](https://docs.rs/hessboost/latest/hessboost/training/budget/) | one `budget` number instead of tuning learning rate, depth, and rounds, after PerpetualBooster |
@@ -195,6 +198,12 @@ Beyond XGBoost (opt-in, none changes default training):
 - SGLB needs `gbtree` with one tree per output and iteration; model
   shrinkage refuses DART, continued training, and per-row `base_margin`s,
   and a shrunk model's iteration ranges must start at 0.
+- Boulevard's intervals for `f(x)` are asymptotic and ignore the fit's
+  bias: they reach nominal coverage when the leaves are refitted on an
+  independent sample (`honest_refit`) and the bias is small, and
+  under-cover otherwise: 95% intervals cover 0.73 of the time in the
+  paper's 3-d test setup and 0.15 in 5 dimensions (validated table in the
+  `inference` docs). Its prediction intervals assume Gaussian noise.
 
 ## Not implemented
 

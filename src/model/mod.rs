@@ -350,6 +350,7 @@ pub use predictions::{Contributions, Interactions, Predictions};
 
 use crate::data::DMatrix;
 use crate::error::{HessboostError, Result};
+use crate::inference::BoulevardInfo;
 use crate::objective::distributional::Dist;
 use crate::objective::{Loss, LossContext, Objective};
 use crate::tree::compact::{CompactForest, FEATURE_LANES, LANES, LaneBlock, fill_lanes, key};
@@ -445,6 +446,10 @@ pub struct BoostedModel {
     /// posterior sampling): `Some` exactly when training shrank the model,
     /// whose tree weights and intercepts it then determines.
     shrinkage: Option<Shrinkage>,
+    /// How a `booster = boulevard` model was trained, which its statistical
+    /// inference reads ([`crate::inference`]); `None` for every other model.
+    /// Predictions do not depend on it.
+    boulevard: Option<BoulevardInfo>,
     /// Prediction layout of `trees` ([`CompactForest`]), derived lazily and
     /// never serialized. Reset whenever `trees` changes.
     compact: OnceLock<CompactForest>,
@@ -467,6 +472,7 @@ struct SerializedBoostedModel<'a> {
     num_parallel_tree: usize,
     linear: &'a Option<LinearModel>,
     shrinkage: &'a Option<Shrinkage>,
+    boulevard: &'a Option<BoulevardInfo>,
 }
 
 impl Serialize for BoostedModel {
@@ -488,6 +494,7 @@ impl Serialize for BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: &self.linear,
             shrinkage: &self.shrinkage,
+            boulevard: &self.boulevard,
         }
         .serialize(serializer)
     }
@@ -508,7 +515,8 @@ impl Serialize for BoostedModel {
 /// (scalar) and `leaf_vectors` (none), except that a multi-output model's
 /// trees must state `size_leaf_vector`, since it decides whether they are
 /// vector-leaf trees; each tree's `linear` is required
-/// ([`UncheckedRegTree`]).
+/// ([`UncheckedRegTree`]). An absent `boulevard` (files written before
+/// Boulevard boosting existed) means the model is not a Boulevard fit.
 #[derive(Deserialize)]
 struct UncheckedBoostedModel {
     trees: Vec<UncheckedRegTree>,
@@ -528,6 +536,8 @@ struct UncheckedBoostedModel {
     /// Absent in files written before model shrinkage existed: none.
     #[serde(default)]
     shrinkage: Option<Shrinkage>,
+    #[serde(default)]
+    boulevard: Option<BoulevardInfo>,
 }
 
 impl TryFrom<UncheckedBoostedModel> for BoostedModel {
@@ -562,6 +572,7 @@ impl TryFrom<UncheckedBoostedModel> for BoostedModel {
             num_parallel_tree: m.num_parallel_tree,
             linear: m.linear,
             shrinkage: m.shrinkage,
+            boulevard: m.boulevard,
             compact: OnceLock::new(),
         };
         model.validate_structure()?;
@@ -667,6 +678,7 @@ impl BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
             shrinkage: None,
+            boulevard: None,
             compact: OnceLock::new(),
         }
     }
@@ -765,6 +777,20 @@ impl BoostedModel {
         self.best_iteration = it;
     }
 
+    /// Record (or clear) how the model was trained by `booster = boulevard`.
+    pub(crate) fn set_boulevard(&mut self, info: Option<BoulevardInfo>) {
+        self.boulevard = info;
+    }
+
+    /// How this model was trained by `booster = boulevard` (beyond XGBoost),
+    /// which [`crate::inference::BoulevardInference`] reads; `None` for every
+    /// other model, including a Boulevard model's [`slice`](Self::slice)s
+    /// and its XGBoost-format or compact exports (which predict the same
+    /// but are no longer Boulevard fits).
+    pub fn boulevard(&self) -> Option<&BoulevardInfo> {
+        self.boulevard.as_ref()
+    }
+
     /// Reassemble a model from its constituent parts. Used by the XGBoost and
     /// LightGBM importers, which build trees and metadata externally. `tree_weights`
     /// is either empty (every tree weighs `1.0`) or holds one DART weight per
@@ -789,6 +815,7 @@ impl BoostedModel {
             num_parallel_tree: 1,
             linear: None,
             shrinkage: None,
+            boulevard: None,
             compact: OnceLock::new(),
         }
     }
@@ -1217,6 +1244,21 @@ impl BoostedModel {
         std::mem::take(&mut self.trees)
     }
 
+    /// Multiply every tree's leaves by `factor` (Boulevard's final `1/B`
+    /// averaging scale).
+    pub(crate) fn scale_all_leaves(&mut self, factor: f32) {
+        for tree in self.trees_mut() {
+            tree.scale_leaves(factor);
+        }
+    }
+
+    /// The trees, for in-place edits of their values (the prediction layout
+    /// is rebuilt on next use).
+    pub(crate) fn trees_mut(&mut self) -> &mut [RegTree] {
+        self.compact = OnceLock::new();
+        &mut self.trees
+    }
+
     /// Number of trees (boosting rounds × outputs × `num_parallel_tree`).
     pub fn num_trees(&self) -> usize {
         self.trees.len()
@@ -1573,6 +1615,8 @@ impl BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
             shrinkage: None,
+            // A slice of a Boulevard average is not itself one.
+            boulevard: None,
             compact: OnceLock::new(),
         })
     }
@@ -1597,6 +1641,7 @@ impl BoostedModel {
             num_parallel_tree: self.num_parallel_tree,
             linear: None,
             shrinkage: Some(shrinkage.truncated(k)),
+            boulevard: None,
             compact: OnceLock::new(),
         }
     }
@@ -1800,6 +1845,9 @@ impl BoostedModel {
                     "linear model parameters must be finite",
                 ));
             }
+        }
+        if let Some(info) = &self.boulevard {
+            info.validate(self)?;
         }
         self.validate_shrinkage()
     }

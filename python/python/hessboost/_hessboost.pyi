@@ -8,6 +8,7 @@ from numpy.typing import ArrayLike, NDArray
 
 __all__ = [
     "Booster",
+    "BoulevardInference",
     "ConformalizedQuantile",
     "DMatrix",
     "Distributions",
@@ -16,6 +17,7 @@ __all__ = [
     "SplitConformal",
     "cv",
     "forward_chaining",
+    "honest_refit",
     "k_fold",
     "purged_forward",
     "train",
@@ -143,6 +145,8 @@ class Booster:
     def base_margins(self) -> list[float]: ...
     @property
     def vector_leaves(self) -> bool: ...
+    @property
+    def boulevard(self) -> dict[str, Any] | None: ...
 
 @final
 class SplitConformal:
@@ -203,6 +207,28 @@ class OnlineModel:
     @property
     def tolerance(self) -> float: ...
 
+@final
+class BoulevardInference:
+    @staticmethod
+    def fit(
+        booster: Booster,
+        train: DMatrix,
+        holdout: DMatrix | None,
+        noise_variance: float | None,
+        landmarks: int | None,
+        seed: int,
+    ) -> BoulevardInference: ...
+    @property
+    def noise_variance(self) -> float: ...
+    def standard_errors(self, data: DMatrix) -> NDArray[np.float64]: ...
+    def confidence_intervals(self, data: DMatrix, alpha: float) -> NDArray[np.float64]: ...
+    def prediction_intervals(self, data: DMatrix, alpha: float) -> NDArray[np.float64]: ...
+    def reproduction_intervals(self, data: DMatrix, alpha: float) -> NDArray[np.float64]: ...
+    def calibrated_prediction_intervals(
+        self, data: DMatrix, alpha: float
+    ) -> NDArray[np.float64]: ...
+
+def honest_refit(booster: Booster, values: DMatrix) -> Booster: ...
 def train(request: Mapping[str, object]) -> tuple[Booster, float | None]: ...
 def cv(
     params: Params,

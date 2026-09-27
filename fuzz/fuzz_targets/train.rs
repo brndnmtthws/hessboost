@@ -3,7 +3,7 @@
 //! configuration `TrainingParams::from_xgboost` accepts must train or return an
 //! error, never panic; a trained model must be deterministic across thread
 //! counts and survive every prediction and serialization API.
-use hessboost::config::BoosterKind;
+use hessboost::config::{BoosterKind, Boulevard};
 use hessboost::data::FeatureType;
 use hessboost::prelude::*;
 use libfuzzer_sys::arbitrary::{Arbitrary, Error as ArbError, Result as ArbResult, Unstructured};
@@ -414,19 +414,36 @@ fn case(u: &mut Unstructured) -> ArbResult<Option<Case>> {
             set(key, value);
         }
     }
-    let Ok(params) = TrainingParams::from_xgboost(flat) else {
+    let Ok(mut params) = TrainingParams::from_xgboost(flat) else {
         return Ok(None);
     };
 
+    let rounds = u.int_in_range(1..=MAX_ROUNDS)?;
+    let early_stopping = if u.arbitrary()? {
+        Some(u.int_in_range(1..=2)?)
+    } else {
+        None
+    };
+    // Drawn last so earlier seeds keep their meaning; exhausted input
+    // (`ratio` then answers true) keeps the booster drawn above.
+    if !u.ratio(3, 4)? {
+        let Ok(boulevard) = Boulevard::builder()
+            .dropout(param(u, &[0.0, 0.5, 0.9])?)
+            .truncation(param(u, &[0.0, 1.0])?)
+            .build()
+        else {
+            return Ok(None);
+        };
+        params.booster = BoosterKind::Boulevard(boulevard);
+        if params.validate().is_err() {
+            return Ok(None);
+        }
+    }
     Ok(Some(Case {
         params,
         dtrain,
-        rounds: u.int_in_range(1..=MAX_ROUNDS)?,
-        early_stopping: if u.arbitrary()? {
-            Some(u.int_in_range(1..=2)?)
-        } else {
-            None
-        },
+        rounds,
+        early_stopping,
     }))
 }
 

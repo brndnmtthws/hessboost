@@ -6,8 +6,8 @@
 //! name and document the alias.
 
 use super::groups::{
-    BalancedBagging, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
-    QuantizedGrad, QueryBagging, Refresh,
+    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
 use crate::error::{HessboostError, Result};
 use crate::objective::{Loss, LossContext, Objective};
@@ -86,6 +86,16 @@ pub enum BoosterKind {
     /// column sampling, `num_parallel_tree > 1`, tree constraints, and
     /// training-matrix feature weights are refused with it.
     GbLinear,
+    /// Boulevard boosting for statistical inference (beyond XGBoost, opt-in):
+    /// every iteration's trees are averaged rather than summed, so the
+    /// ensemble converges to a kernel ridge regression with a central limit
+    /// theorem. `num_parallel_tree = 1` runs BRAT-D (Fang, Tan & Hooker,
+    /// NeurIPS 2025, Algorithm 1; Zhou & Hooker's Boulevard at
+    /// [`Boulevard::dropout`] `= 0`), more
+    /// trees per iteration BRAT-P (Algorithm 2). Squared-error regression
+    /// only; see [`crate::inference`] for the trained model's confidence and
+    /// prediction intervals and the settings it refuses.
+    Boulevard(Boulevard),
 }
 
 /// Tree construction algorithm.
@@ -343,7 +353,8 @@ pub struct TrainingParams {
     /// `neg_bagging_fraction`, beyond XGBoost), `None` (the default) for
     /// off. It replaces `subsample`, which must stay `1` (LightGBM ignores
     /// `bagging_fraction` then), and needs a `binary:*` objective, a tree
-    /// booster, uniform sampling, and one label column of `0`/`1` labels.
+    /// booster other than `boulevard`, uniform sampling, and one label
+    /// column of `0`/`1` labels.
     pub balanced_bagging: Option<BalancedBagging>,
     /// LightGBM's query-level bagging for ranking ([`QueryBagging`];
     /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
@@ -572,8 +583,8 @@ impl TrainingParams {
     ///
     /// The checks run in a fixed order (numeric ranges, reuse penalties,
     /// device, objective parameters, booster, tree shape, training modes,
-    /// tree options, SGLB and model shrinkage), so a configuration that
-    /// breaks several rules always reports the same one.
+    /// tree options, SGLB and model shrinkage, Boulevard), so a
+    /// configuration that breaks several rules always reports the same one.
     pub fn validate(&self) -> Result<()> {
         self.validate_ranges()?;
         self.validate_reuse_penalties()?;
@@ -595,7 +606,9 @@ impl TrainingParams {
         self.validate_bagging_by_query()?;
         self.validate_balanced_bagging()?;
         self.validate_tree_options()?;
-        self.validate_sglb()
+        self.validate_sglb()?;
+        self.validate_boulevard()?;
+        self.validate_balanced_bagging()
     }
 
     /// Query-level bagging: a ranking objective on a tree booster, with
@@ -1103,6 +1116,110 @@ impl TrainingParams {
             )?;
         }
         Ok(())
+    }
+
+    /// Ranges of the Boulevard options, and the settings `booster =
+    /// boulevard` refuses. Its inference ([`crate::inference`]) reads every
+    /// tree as a linear smoother of the round's residuals (a leaf predicts
+    /// `Σ z / (m + lambda)` over its `m` sampled rows), so the options that
+    /// make leaf values nonlinear in the labels (L1 leaves, clipped leaves,
+    /// monotone clipping, quantized gradients, linear or smoothed leaves),
+    /// that reweight rows by their residuals (gradient-based sampling) or
+    /// sample them by their labels (class-balanced bagging), or that change
+    /// the loss are refused. Structure-only options (depth,
+    /// `min_child_weight`, `gamma`, column sampling, `extra_trees`,
+    /// interaction constraints, categorical splits) are accepted.
+    fn validate_boulevard(&self) -> Result<()> {
+        let BoosterKind::Boulevard(boulevard) = self.booster else {
+            return Ok(());
+        };
+        let dropout = boulevard.dropout();
+        // Before the objective check: balanced bagging needs a `binary:*`
+        // objective, and the reason it cannot work is not the loss.
+        ensure(
+            "pos_bagging_fraction",
+            self.balanced_bagging.is_none(),
+            "class-balanced bagging keeps a row with a probability set by its label, so a leaf \
+             is no longer a linear smoother of the labels; Boulevard needs uniform `subsample`",
+        )?;
+        ensure(
+            "objective",
+            matches!(self.objective, Objective::SquaredError),
+            format!(
+                "`booster = boulevard` supports `reg:squarederror` only, got `{}`",
+                self.objective.name()
+            ),
+        )?;
+        if self.num_parallel_tree > 1 {
+            ensure(
+                "boulevard_dropout",
+                dropout == 0.0,
+                "BRAT-P (`num_parallel_tree > 1`) leaves one tree per round out instead of \
+                 dropping trees at random; must be 0",
+            )?;
+            ensure(
+                "eta",
+                self.eta == 1.0,
+                format!(
+                    "BRAT-P (`num_parallel_tree > 1`) has no learning rate; must be 1, got {}",
+                    self.eta
+                ),
+            )?;
+        } else {
+            ensure(
+                "eta",
+                self.eta <= 1.0,
+                format!(
+                    "Boulevard's learning rate must be in (0, 1], got {}",
+                    self.eta
+                ),
+            )?;
+        }
+        let nonlinear = "makes leaf values nonlinear in the labels, which Boulevard inference \
+                         cannot represent";
+        ensure(
+            "alpha",
+            self.alpha == 0.0,
+            format!("L1 regularization {nonlinear}; must be 0"),
+        )?;
+        ensure(
+            "max_delta_step",
+            self.effective_max_delta_step() == 0.0,
+            format!("clipping leaves {nonlinear}; leave it unbounded"),
+        )?;
+        ensure(
+            "monotone_constraints",
+            self.monotone_constraints
+                .iter()
+                .all(|&m| m == Monotone::None),
+            format!("clipping leaves to monotone bounds {nonlinear}"),
+        )?;
+        ensure(
+            "use_quantized_grad",
+            self.quantized.is_none(),
+            format!("quantized gradients {nonlinear}"),
+        )?;
+        ensure(
+            "linear_tree",
+            self.linear_tree.is_none(),
+            "linear leaves are not constant smoothers; Boulevard needs constant leaves",
+        )?;
+        ensure(
+            "path_smooth",
+            self.path_smooth == 0.0,
+            "smoothed leaves mix in their ancestors' rows; must be 0",
+        )?;
+        ensure(
+            "sampling_method",
+            self.sampling_method == SamplingMethod::Uniform,
+            "gradient-based sampling reweights rows by their residuals; Boulevard needs uniform \
+             subsampling",
+        )?;
+        ensure(
+            "process_type",
+            self.process_type == ProcessType::Default,
+            "`update` refreshes existing trees; Boulevard models are grown in one run",
+        )
     }
 
     /// The `max_delta_step` in effect (`0` = no bound): the configured

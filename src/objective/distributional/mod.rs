@@ -119,7 +119,7 @@
 //! log density, CRPS, intervals, and inverse-CDF sampling. Metrics `nll`
 //! (the default) and `crps` score them.
 
-mod special;
+pub(crate) mod special;
 
 use serde::{Deserialize, Serialize};
 

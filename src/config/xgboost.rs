@@ -4,8 +4,8 @@
 //! and the training fuzz target all go through it.
 
 use super::groups::{
-    BalancedBagging, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink, ModelShrinkMode,
-    QuantizedGrad, QueryBagging, Refresh,
+    BalancedBagging, Boulevard, Dart, ExtraTrees, Langevin, LinearTree, ModelShrink,
+    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
 };
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,
@@ -47,6 +47,7 @@ enum FlatBooster {
     GbTree,
     Dart,
     GbLinear,
+    Boulevard,
 }
 
 /// XGBoost's `process_type` names.
@@ -148,6 +149,8 @@ flat_params! {
     model_shrink_rate: f64,
     model_shrink_mode: ModelShrinkMode,
     posterior_sampling: bool,
+    boulevard_dropout: f64,
+    boulevard_truncation: f64,
 }
 
 /// The flat keys of the objective parameters, with the objectives and
@@ -267,6 +270,8 @@ impl Flat {
             model_shrink_rate,
             model_shrink_mode,
             posterior_sampling,
+            boulevard_dropout,
+            boulevard_truncation,
         } = self;
         // Aligned with `OBJECTIVE_KEYS`.
         let present = [
@@ -350,6 +355,18 @@ impl Flat {
                 "`booster=dart`",
             ),
             (
+                "boulevard_dropout",
+                boulevard_dropout.is_some(),
+                booster == Some(FlatBooster::Boulevard),
+                "`booster=boulevard`",
+            ),
+            (
+                "boulevard_truncation",
+                boulevard_truncation.is_some(),
+                booster == Some(FlatBooster::Boulevard),
+                "`booster=boulevard`",
+            ),
+            (
                 "refresh_leaf",
                 refresh_leaf.is_some(),
                 process_type == Some(FlatProcess::Update),
@@ -421,6 +438,16 @@ impl Flat {
                     dart = dart.one_drop(one_drop);
                 }
                 BoosterKind::Dart(dart.build()?)
+            }
+            FlatBooster::Boulevard => {
+                let mut boulevard = Boulevard::builder();
+                if let Some(dropout) = boulevard_dropout {
+                    boulevard = boulevard.dropout(dropout);
+                }
+                if let Some(truncation) = boulevard_truncation {
+                    boulevard = boulevard.truncation(truncation);
+                }
+                BoosterKind::Boulevard(boulevard.build()?)
             }
         };
         let process_type = match process_type.unwrap_or(FlatProcess::Default) {
@@ -939,6 +966,11 @@ impl TrainingParams {
                 set("rate_drop", json(dart.rate_drop()));
                 set("skip_drop", json(dart.skip_drop()));
                 set("one_drop", json(dart.one_drop()));
+            }
+            BoosterKind::Boulevard(boulevard) => {
+                set("booster", json("boulevard"));
+                set("boulevard_dropout", json(boulevard.dropout()));
+                set("boulevard_truncation", json(boulevard.truncation()));
             }
         }
         set("nthread", json(nthread.map_or(0, NonZeroUsize::get)));

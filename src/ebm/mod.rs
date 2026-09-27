@@ -36,8 +36,9 @@
 //!   ([`Ebm::bag_fraction`](crate::config::Ebm::bag_fraction))
 //!   and the model averages the bags (each bag's trees carry `1/B`). The
 //!   bags train in parallel and are combined in bag order. Each tree
-//!   subsamples its bag's rows (`subsample`, or by class under
-//!   [`BalancedBagging`](crate::config::BalancedBagging)).
+//!   subsamples its bag's rows (`subsample`, by class under
+//!   [`BalancedBagging`](crate::config::BalancedBagging), or by query under
+//!   [`QueryBagging`](crate::config::QueryBagging)).
 //! - **Early stopping** ([`Ebm::early_stopping_rounds`](crate::config::Ebm::early_stopping_rounds)):
 //!   InterpretML's rule. Every bag scores the rows it does not train on
 //!   after every tree, stops a stage once the last `rounds × terms` trees

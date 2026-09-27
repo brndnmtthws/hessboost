@@ -175,24 +175,6 @@ fn subsample_of(pool: &[u32], subsample: f64, rng: &mut Rng) -> Vec<u32> {
     bernoulli_rows(pool, rng, |_| subsample)
 }
 
-/// The rows of an outer bag's `pool` one classic tree trains on: each kept
-/// with probability `subsample`, or under class-balanced bagging with its
-/// class's fraction (a label-`1` row with `pos_fraction`, any other with
-/// `neg_fraction`), at least one.
-fn tree_sample(pool: &[u32], params: &TrainingParams, labels: &[f32], rng: &mut Rng) -> Vec<u32> {
-    let Some(bagging) = params.balanced_bagging else {
-        return subsample_of(pool, params.subsample, rng);
-    };
-    let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
-    bernoulli_rows(pool, rng, |row| {
-        if labels[row as usize] == 1.0 {
-            pos
-        } else {
-            neg
-        }
-    })
-}
-
 /// The rows of `pool`, each kept with probability `keep(row)`, in pool
 /// order (one draw per row); a random row of `pool` if none is kept.
 fn bernoulli_rows(pool: &[u32], rng: &mut Rng, keep: impl Fn(u32) -> f64) -> Vec<u32> {
@@ -281,12 +263,15 @@ struct Scorer<'m> {
     sign: f64,
 }
 
-/// One outer bag of the classic EBM: its rows, its margins over every
-/// training row, its trees (learning rate applied, not yet `1/B`), and with
-/// early stopping its held-out rows and the current stage's stopper.
+/// One outer bag of the classic EBM: its rows (with query bagging, each
+/// row's query index and the query count), its margins over every training
+/// row, its trees (learning rate applied, not yet `1/B`), and with early
+/// stopping its held-out rows and the current stage's stopper.
 struct Bag {
     index: u64,
     rows: Vec<u32>,
+    row_queries: Vec<u32>,
+    queries: usize,
     margins: Vec<f32>,
     trees: Vec<(u32, RegTree)>,
     holdout: Option<Holdout>,
@@ -327,13 +312,65 @@ impl Bag {
         } else {
             None
         };
+        // Query bagging keeps whole queries: each bag row's query index.
+        let (row_queries, queries) = match (params.bagging_by_query, dtrain.group()) {
+            (Some(_), Some(group)) => {
+                let mut query_of = vec![0u32; n];
+                let mut queries = 0;
+                for (query, (start, end)) in group.iter_ranges().enumerate() {
+                    query_of[start..end].fill(query as u32);
+                    queries += 1;
+                }
+                let row_queries = rows.iter().map(|&r| query_of[r as usize]).collect();
+                (row_queries, queries)
+            }
+            _ => (Vec::new(), 0),
+        };
         Ok(Bag {
             index,
             rows,
+            row_queries,
+            queries,
             margins: vec![mu as f32; n],
             trees: Vec::new(),
             holdout,
             stopper: None,
+        })
+    }
+
+    /// The bag rows one classic tree trains on: each kept with probability
+    /// `subsample`; under class-balanced bagging with its class's fraction
+    /// (a label-`1` row with `pos_fraction`, any other with
+    /// `neg_fraction`); under query bagging the rows of the queries kept
+    /// with probability `fraction` (one draw per query, in query order).
+    /// At least one row.
+    fn tree_sample(&self, params: &TrainingParams, labels: &[f32], rng: &mut Rng) -> Vec<u32> {
+        if let Some(bagging) = params.bagging_by_query {
+            let kept: Vec<bool> = (0..self.queries)
+                .map(|_| rng.f64() < bagging.fraction())
+                .collect();
+            let mut rows: Vec<u32> = self
+                .rows
+                .iter()
+                .zip(&self.row_queries)
+                .filter(|&(_, &query)| kept[query as usize])
+                .map(|(&row, _)| row)
+                .collect();
+            if rows.is_empty() {
+                rows.push(self.rows[rng.range(0..self.rows.len())]);
+            }
+            return rows;
+        }
+        let Some(bagging) = params.balanced_bagging else {
+            return subsample_of(&self.rows, params.subsample, rng);
+        };
+        let (pos, neg) = (bagging.pos_fraction(), bagging.neg_fraction());
+        bernoulli_rows(&self.rows, rng, |row| {
+            if labels[row as usize] == 1.0 {
+                pos
+            } else {
+                neg
+            }
         })
     }
 
@@ -409,7 +446,7 @@ impl Bag {
                 return;
             }
             let gpair = gradients(run, &self.margins);
-            let rows = tree_sample(&self.rows, params, labels, &mut rng);
+            let rows = self.tree_sample(params, labels, &mut rng);
             let seed = rng.next_u64();
             prepared.fill_approx_cache(run, &gpair);
             let mut tree = grow(run, prepared, &gpair, &rows, features, seed);

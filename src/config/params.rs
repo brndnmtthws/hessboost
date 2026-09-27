@@ -371,8 +371,9 @@ pub struct TrainingParams {
     /// `bagging_by_query`, beyond XGBoost), `None` (the default) for off:
     /// whole query groups are kept or dropped each round. It replaces
     /// `subsample`, which must stay `1`, and needs a `rank:*` objective, a
-    /// tree booster, uniform sampling, and query groups on the training
-    /// data.
+    /// tree booster (a classic `booster = ebm` tree keeps the rows of its
+    /// outer bag in the kept queries), uniform sampling, and query groups on
+    /// the training data.
     pub bagging_by_query: Option<QueryBagging>,
     /// Output-to-tree allocation for multi-output models. XGBoost
     /// `multi_strategy`.

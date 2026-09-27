@@ -2,14 +2,14 @@
 //! ([`hessboost::ebm`]), and the Boulevard EBM's bands.
 
 use hessboost::config::{
-    BalancedBagging, BoosterKind, Ebm, EbmBuilder, GrowPolicy, TrainingParams,
+    BalancedBagging, BoosterKind, Ebm, EbmBuilder, GrowPolicy, QueryBagging, TrainingParams,
     TrainingParamsBuilder,
 };
 use hessboost::data::FeatureType;
 use hessboost::ebm::TermAxis;
 use hessboost::ebm::shape_functions;
 use hessboost::inference::{EbmInference, KernelSolver, NoiseVariance, honest_refit};
-use hessboost::objective::{Logistic, Objective};
+use hessboost::objective::{LambdaRank, Logistic, Objective};
 use hessboost::prelude::*;
 use std::ops::ControlFlow;
 
@@ -258,6 +258,13 @@ fn unsupported_combinations_are_refused() {
             .balanced_bagging(balanced);
         assert_eq!(refused(bagged), "pos_bagging_fraction");
     }
+    // Query bagging needs a `rank:*` objective, which `ebm_boulevard`
+    // refuses: classic EBMs only.
+    let by_query = boulevard()
+        .subsample(1.0)
+        .objective(Objective::RankNdcg(LambdaRank::default()))
+        .bagging_by_query(QueryBagging::new(0.5).unwrap());
+    assert_eq!(refused(by_query), "objective");
 
     assert_eq!(
         invalid_param(boulevard_ebm().early_stopping_rounds(5).build()),
@@ -337,6 +344,47 @@ fn classic_ebms_bag_rows_by_class() {
     );
     let soft = labeled_dense(&x, 2, &vec![0.5; n]);
     assert_eq!(invalid_param(train(&bagged, &soft, 2)), "labels");
+}
+
+/// A classic ranking EBM draws each tree's rows from its outer bag by query
+/// under query bagging: the model changes (it used to be the unbagged one),
+/// stays seed-deterministic, and needs query groups.
+#[test]
+fn classic_ebms_bag_whole_queries() {
+    let (queries, size) = (40, 10);
+    let n = queries * size;
+    let mut next = lcg(23);
+    let mut x = Vec::with_capacity(2 * n);
+    let mut relevance = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (a, b) = (next(), next());
+        x.extend_from_slice(&[a, b]);
+        relevance.push((3.0 * (a + 0.5 * b + 0.3 * next())).floor().min(3.0));
+    }
+    let dtrain = labeled_dense(&x, 2, &relevance)
+        .with_group_sizes(&vec![size; queries])
+        .unwrap();
+    let base = || {
+        classic()
+            .subsample(1.0)
+            .objective(Objective::RankNdcg(LambdaRank::default()))
+    };
+    let bagged = base()
+        .bagging_by_query(QueryBagging::new(0.3).unwrap())
+        .build()
+        .unwrap();
+    let margins = |params: &TrainingParams| {
+        let model = train(params, &dtrain, 10).unwrap();
+        model.predict_margin(&dtrain).unwrap().into_vec()
+    };
+    let with_queries = margins(&bagged);
+    assert_ne!(with_queries, margins(&base().build().unwrap()));
+    assert_eq!(with_queries, margins(&bagged));
+    let ungrouped = labeled_dense(&x, 2, &relevance);
+    assert_eq!(
+        invalid_param(train(&bagged, &ungrouped, 2)),
+        "bagging_by_query"
+    );
 }
 
 #[test]

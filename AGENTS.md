@@ -382,7 +382,7 @@ every bag on its held-out rows), needs one output, refuses eval sets,
 `Trainer::early_stopping_rounds`, continuation, online updates, column sampling,
 interaction constraints, forests, feature weights, and base margins, draws
 each classic tree's rows from its outer bag (by class under balanced
-bagging), and calls `on_round` after every round of both stages; `ebm_boulevard` adds
+bagging, by query under query bagging), and calls `on_round` after every round of both stages; `ebm_boulevard` adds
 Boulevard's refusals plus outer bags, early stopping, and `base_score`, and
 its loaders check the stage-contiguous round-robin tree layout. Slices and exports drop the `EbmInfo`. Linear-leaf models predict through `tree::linear`;
 XGBoost export, SHAP, and compact refuse them.

@@ -5,7 +5,8 @@
 
 use super::groups::{
     BalancedBagging, Boulevard, Dart, Ebm, ExtraTrees, Langevin, LinearTree, ModelShrink,
-    ModelShrinkMode, QuantizedGrad, QueryBagging, Refresh,
+    ModelShrinkMode, QuantizedGrad, QueryBagging,
+    Refresh,
 };
 use super::params::{
     BoosterKind, Device, GrowPolicy, MaxDeltaStep, Monotone, MultiStrategy, ProcessType,

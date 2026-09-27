@@ -111,3 +111,16 @@ def test_classic_ebms_bag_rows_by_class() -> None:
     bagged = hessboost.train({**params, "neg_bagging_fraction": 0.1}, dtrain, 40).predict(dtrain)
     # Keeping a tenth of the negatives pulls every tree toward the positives.
     assert bagged.mean() > plain.mean() + 0.05
+
+
+def test_classic_ebms_bag_whole_queries() -> None:
+    x, y = data(400, 6)
+    relevance = np.minimum(np.floor(3 * (x[:, 0] + 0.5 * x[:, 1])), 3)
+    dtrain = hessboost.DMatrix(x, label=relevance, group=[10] * 40)
+    params = {**CLASSIC, "objective": "rank:ndcg"}
+    plain = hessboost.train(params, dtrain, 10).predict(dtrain, output_margin=True)
+    bagged = {**params, "bagging_by_query": True, "subsample": 0.3}
+    first = hessboost.train(bagged, dtrain, 10).predict(dtrain, output_margin=True)
+    again = hessboost.train(bagged, dtrain, 10).predict(dtrain, output_margin=True)
+    assert not np.array_equal(first, plain)
+    np.testing.assert_array_equal(first, again)

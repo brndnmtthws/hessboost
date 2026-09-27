@@ -24,10 +24,7 @@ fuzz_target!(|data: &[u8]| {
     let container = if mode == 0 {
         rest.to_vec()
     } else {
-        let mut container = [HEADER, rest].concat();
-        let checksum = xxhash_rust::xxh64::xxh64(&container, 0);
-        container.extend_from_slice(&checksum.to_le_bytes());
-        container
+        common::seal(HEADER, rest)
     };
     if let Ok(model) = BoostedModel::from_bytes(&container) {
         common::exercise(&model);

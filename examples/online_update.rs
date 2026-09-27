@@ -85,7 +85,7 @@ fn main() -> Result<()> {
     );
 
     // Exact unlearning: tolerance 0 equals retraining on the remaining rows.
-    let mut exact = OnlineModel::train(&params, &data, rounds, OnlineParams::with_tolerance(0.0))?;
+    let mut exact = OnlineModel::train(&params, &data, rounds, OnlineParams::exact())?;
     exact.update(None, &deletions)?;
     let reference = train(&params, exact.data(), rounds)?;
     println!(

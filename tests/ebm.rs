@@ -765,8 +765,10 @@ fn online_updates_refuse_an_ebm() {
         .tree_method(TreeMethod::Hist)
         .build()
         .unwrap();
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         assert_eq!(
             invalid_param(OnlineModel::from_model(
                 model.clone(),

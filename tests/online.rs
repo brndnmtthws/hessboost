@@ -57,8 +57,7 @@ fn exact_updates_equal_retraining_bit_for_bit() {
         let name = objective.name().to_owned();
         let p = params(objective);
         let train_data = data(400, 1, binary);
-        let mut online =
-            OnlineModel::train(&p, &train_data, 15, OnlineParams::with_tolerance(0.0)).unwrap();
+        let mut online = OnlineModel::train(&p, &train_data, 15, OnlineParams::exact()).unwrap();
         let added = data(30, 2, binary);
         // Several updates in a row: each equals retraining on the data so far.
         for (additions, deletions) in [
@@ -103,7 +102,7 @@ fn approximate_updates_stay_close_to_retraining() {
     // A higher tolerance keeps more splits: tolerance 1 regrows only nodes
     // whose split stopped being a valid candidate.
     let mut frozen =
-        OnlineModel::train(&p, &train_data, 30, OnlineParams::with_tolerance(1.0)).unwrap();
+        OnlineModel::train(&p, &train_data, 30, OnlineParams::approximate(1.0).unwrap()).unwrap();
     let tolerant = frozen.update(Some(&added), &deletions).unwrap();
     assert!(tolerant.subtrees_regrown <= report.subtrees_regrown);
     assert!(tolerant.nodes_kept >= report.nodes_kept);
@@ -116,9 +115,13 @@ fn updates_ignore_the_thread_count() {
     let added = data(20, 7, true);
     let run = |threads| {
         with_threads(threads, || {
-            let mut online =
-                OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(0.05))
-                    .unwrap();
+            let mut online = OnlineModel::train(
+                &p,
+                &train_data,
+                10,
+                OnlineParams::approximate(0.05).unwrap(),
+            )
+            .unwrap();
             online.update(Some(&added), &[1, 2, 3, 50]).unwrap();
             online.model().to_json().unwrap()
         })
@@ -130,10 +133,11 @@ fn updates_ignore_the_thread_count() {
 fn an_interrupted_update_changes_nothing() {
     let p = params(Objective::SquaredError);
     let train_data = data(300, 8, false);
-    for tolerance in [0.0, 0.1] {
-        let mut online =
-            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+    for mode in [
+        OnlineParams::exact(),
+        OnlineParams::approximate(0.1).unwrap(),
+    ] {
+        let mut online = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
         let before = online.model().to_json().unwrap();
         let stop = |round: &RoundEval| {
             if round.iteration == 3 {
@@ -165,9 +169,7 @@ fn an_interrupted_update_changes_nothing() {
         assert_eq!(online.data().n_rows(), 300);
         // The model still updates afterwards, as an uninterrupted one would.
         online.update(None, &[0, 1]).unwrap();
-        let mut fresh =
-            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+        let mut fresh = OnlineModel::train(&p, &train_data, 10, mode).unwrap();
         fresh.update(None, &[0, 1]).unwrap();
         assert_eq!(
             online.model().to_json().unwrap(),
@@ -189,26 +191,25 @@ fn updates_refuse_labels_retraining_refuses() {
         .with_labels(&[2.0])
         .unwrap();
     let good = data(5, 11, true);
-    for tolerance in [0.1, 0.0] {
-        let mut online =
-            OnlineModel::train(&p, &train_data, 8, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+    for mode in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
+        let mut online = OnlineModel::train(&p, &train_data, 8, mode).unwrap();
         let before = online.model().to_json().unwrap();
         // Retraining refuses the added row's label under the same name.
         let retrain_err = invalid_param(train(&p, &bad, 8));
         assert_eq!(
             invalid_param(online.update(Some(&bad), &[0])),
             retrain_err,
-            "tolerance {tolerance}"
+            "{mode:?}"
         );
         assert_eq!(online.model().to_json().unwrap(), before);
         assert_eq!(online.data().n_rows(), 300);
         // A later valid update still works, as on a fresh model.
         online.update(Some(&good), &[0]).unwrap();
         assert_eq!(online.data().n_rows(), 304);
-        let mut fresh =
-            OnlineModel::train(&p, &train_data, 8, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+        let mut fresh = OnlineModel::train(&p, &train_data, 8, mode).unwrap();
         fresh.update(Some(&good), &[0]).unwrap();
         assert_eq!(
             online.model().to_json().unwrap(),
@@ -290,15 +291,14 @@ fn unsound_configurations_and_changes_are_refused() {
         );
     }
     let p = base().build().unwrap();
-    assert_eq!(
-        invalid_param(OnlineModel::train(
-            &p,
-            &train_data,
-            3,
-            OnlineParams::with_tolerance(1.5)
-        )),
-        "tolerance"
-    );
+    // The exact mode is `exact()`, never a tolerance of 0.
+    for tolerance in [0.0, -0.1, 1.5, f64::NAN] {
+        assert_eq!(
+            invalid_param(OnlineParams::approximate(tolerance)),
+            "tolerance"
+        );
+    }
+    assert_eq!(OnlineParams::exact().tolerance(), None);
     let weighted = data(200, 9, false).with_weights(&[1.0; 200]).unwrap();
     assert_eq!(
         invalid_param(OnlineModel::train(&p, &weighted, 3, online)),
@@ -353,18 +353,20 @@ fn row_bagging_is_refused() {
     assert!(train(&balanced, &binary, 3).is_ok());
     assert!(train(&ranking, &queries, 3).is_ok());
     let model = train(&params(logistic()), &binary, 3).unwrap();
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         for (p, d) in [(&balanced, &binary), (&ranking, &queries)] {
             assert_eq!(
                 invalid_param(OnlineModel::train(p, d, 3, online)),
                 "params",
-                "train, tolerance {tolerance}"
+                "train, {online:?}"
             );
             assert_eq!(
                 invalid_param(OnlineModel::from_model(model.clone(), p, d, online)),
                 "params",
-                "from_model, tolerance {tolerance}"
+                "from_model, {online:?}"
             );
         }
     }
@@ -389,8 +391,10 @@ fn from_model_refuses_linear_leaves() {
         .with_labels(&y)
         .unwrap();
     let p = params(Objective::SquaredError);
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         assert_eq!(
             invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
             "model"
@@ -411,8 +415,10 @@ fn from_model_refuses_shrunk_models() {
     let mut shrunk = p.clone();
     shrunk.model_shrink = Some(ModelShrink::new(0.1, ModelShrinkMode::Constant).unwrap());
     let model = train(&shrunk, &data, 3).unwrap();
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         assert_eq!(
             invalid_param(OnlineModel::from_model(model.clone(), &p, &data, online)),
             "model"
@@ -428,8 +434,10 @@ fn from_model_refuses_trees_deeper_than_max_depth() {
     let mut deeper = p.clone();
     deeper.max_depth = p.max_depth.and_then(|depth| depth.checked_add(2));
     let model = train(&deeper, &d, 3).unwrap();
-    for tolerance in [0.1, 0.0] {
-        let online = OnlineParams::with_tolerance(tolerance);
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
         assert_eq!(
             invalid_param(OnlineModel::from_model(model.clone(), &p, &d, online)),
             "model"
@@ -451,10 +459,11 @@ fn an_abandoned_update_keeps_the_update_state() {
         data(20, 15, false),
         data(25, 16, false),
     );
-    for tolerance in [0.1, 0.0] {
-        let mut online =
-            OnlineModel::train(&p, &train_data, 10, OnlineParams::with_tolerance(tolerance))
-                .unwrap();
+    for online in [
+        OnlineParams::approximate(0.1).unwrap(),
+        OnlineParams::exact(),
+    ] {
+        let mut online = OnlineModel::train(&p, &train_data, 10, online).unwrap();
         online.update(Some(&a), &[0, 5, 9]).unwrap();
         let mut control = online.clone();
         let stop = |round: &RoundEval| {
@@ -485,7 +494,7 @@ fn an_abandoned_update_keeps_the_update_state() {
             assert_eq!(
                 online.model().to_json().unwrap(),
                 control.model().to_json().unwrap(),
-                "tolerance {tolerance}"
+                "{online:?}"
             );
         }
     }

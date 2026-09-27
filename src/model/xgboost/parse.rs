@@ -62,55 +62,75 @@ pub(super) fn scalar_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// A JSON array field read element by element, each entry coerced with
-/// [`scalar_f64`] (`0` for non-scalar entries), without copying the array.
-#[derive(Clone, Copy)]
-pub(super) struct Scalars<'a>(&'a [Value]);
-
-impl<'a> Scalars<'a> {
-    /// The array field `key` of `v`, empty when absent or not an array.
-    pub(super) fn optional(v: &'a Value, key: &str) -> Self {
-        Scalars(
-            v.get(key)
-                .and_then(Value::as_array)
-                .map_or(&[], Vec::as_slice),
-        )
+/// The array field `key` of `v`: a missing field is a missing-field error
+/// naming `key`, a non-array one malformed. With `len`, an array of any
+/// other length is malformed too.
+fn column<'a>(v: &'a Value, key: &str, len: Option<usize>) -> Result<&'a [Value]> {
+    let entries = v
+        .get(key)
+        .ok_or_else(|| HessboostError::missing_field(key))?
+        .as_array()
+        .ok_or_else(|| HessboostError::model_format(format!("`{key}` is not an array")))?;
+    match len {
+        Some(len) if entries.len() != len => Err(HessboostError::model_format(format!(
+            "`{key}` has {} entries, not {len}",
+            entries.len()
+        ))),
+        _ => Ok(entries),
     }
+}
 
-    /// The array field `key` of `v`; a missing or non-array field is a
-    /// missing-field error naming `key`.
-    pub(super) fn required(v: &'a Value, key: &str) -> Result<Self> {
-        v.get(key)
-            .and_then(Value::as_array)
-            .map(|a| Scalars(a))
-            .ok_or_else(|| HessboostError::missing_field(key))
-    }
+/// The length of the required array field `key` of `v`.
+pub(super) fn column_len(v: &Value, key: &str) -> Result<usize> {
+    column(v, key, None).map(<[Value]>::len)
+}
 
-    /// Entry `i`, `None` past the end.
-    pub(super) fn get(self, i: usize) -> Option<f64> {
-        self.0.get(i).map(|e| scalar_f64(e).unwrap_or(0.0))
-    }
+/// The required array field `key` of `v` as `f32`s (of `len` entries, if
+/// given); a non-numeric entry is malformed.
+pub(super) fn float_column(v: &Value, key: &str, len: Option<usize>) -> Result<Vec<f32>> {
+    column(v, key, len)?
+        .iter()
+        .map(|entry| {
+            scalar_f64(entry).map(|x| x as f32).ok_or_else(|| {
+                HessboostError::model_format(format!("`{key}` contains a non-numeric entry"))
+            })
+        })
+        .collect()
+}
 
-    /// Entry `i`, `0` past the end.
-    pub(super) fn at(self, i: usize) -> f64 {
-        self.get(i).unwrap_or(0.0)
-    }
+/// [`float_column`] for a field XGBoost may omit: `None` when absent.
+pub(super) fn optional_float_column(v: &Value, key: &str, len: usize) -> Result<Option<Vec<f32>>> {
+    v.get(key)
+        .map(|_| float_column(v, key, Some(len)))
+        .transpose()
+}
 
-    /// Every entry as `f32`.
-    pub(super) fn to_f32s(self) -> Vec<f32> {
-        self.0
-            .iter()
-            .map(|e| scalar_f64(e).unwrap_or(0.0) as f32)
-            .collect()
-    }
-
-    /// Every entry as `i32` (truncated).
-    pub(super) fn to_i32s(self) -> Vec<i32> {
-        self.0
-            .iter()
-            .map(|e| scalar_f64(e).unwrap_or(0.0) as i32)
-            .collect()
-    }
+/// The required array field `key` of `v`, `len` integers each within
+/// `range`; a non-numeric, fractional, or out-of-range entry is malformed.
+pub(super) fn integer_column<T: TryFrom<i64>>(
+    v: &Value,
+    key: &str,
+    len: usize,
+    range: std::ops::RangeInclusive<i64>,
+) -> Result<Vec<T>> {
+    column(v, key, Some(len))?
+        .iter()
+        .map(|entry| {
+            let value = scalar_f64(entry).ok_or_else(|| {
+                HessboostError::model_format(format!("`{key}` contains a non-numeric entry"))
+            })?;
+            // `range` is within `i64`, so the cast is exact wherever it holds.
+            let integer = value as i64;
+            if value.fract() != 0.0 || !range.contains(&integer) || integer as f64 != value {
+                return Err(HessboostError::model_format(format!(
+                    "`{key}` contains an invalid entry {value}"
+                )));
+            }
+            T::try_from(integer).map_err(|_| {
+                HessboostError::model_format(format!("`{key}` contains an invalid entry {value}"))
+            })
+        })
+        .collect()
 }
 
 /// Read a JSON array whose entries are finite, non-negative integers.

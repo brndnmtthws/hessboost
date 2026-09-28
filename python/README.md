@@ -62,8 +62,8 @@ booster = hessboost.train(
 
 `predict` takes a `DMatrix` or anything its constructor accepts. The default
 range is the iterations through `best_iteration` (pass `iteration_range=(0, 0)`
-for every iteration), except `pred_leaf`, which defaults to every iteration
-regardless of early stopping — so the leaves below cover all 500 trees.
+for every iteration), except `pred_leaf`, which defaults to all of the
+model's trees, not just through `best_iteration`.
 The flag arguments are exclusive:
 
 ```python

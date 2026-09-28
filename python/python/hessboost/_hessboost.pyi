@@ -17,6 +17,7 @@ __all__ = [
     "EbmInference",
     "ForestModel",
     "ForestParams",
+    "GpuModel",
     "OnlineModel",
     "OnlineParams",
     "Params",
@@ -172,6 +173,17 @@ class Booster:
     def boulevard(self) -> dict[str, Any] | None: ...
     @property
     def ebm(self) -> dict[str, Any] | None: ...
+    def to_gpu(self) -> GpuModel: ...
+
+@final
+class GpuModel:
+    @staticmethod
+    def available() -> bool: ...
+    @staticmethod
+    def device_name() -> str | None: ...
+    def predict(
+        self, data: DMatrix, kind: _PredictKind, iteration_range: tuple[int, int] | None = None
+    ) -> NDArray[np.float32]: ...
 
 @final
 class SplitConformal:

@@ -5,6 +5,7 @@ use crate::codec;
 use crate::data::{DMatrix, to_numpy};
 use crate::dist::Distributions;
 use crate::errors::{DetachExt, refuse};
+use crate::gpu::GpuModel;
 use hessboost::model::{
     BoostedModel, Contributions, ImportanceType, Interactions, Iterations, Predictions,
 };
@@ -267,6 +268,24 @@ impl Booster {
     fn slice(&self, py: Python<'_>, begin: usize, end: usize, step: usize) -> PyResult<Self> {
         let model = py.detached(|| self.model.slice(begin..end, step))?;
         Ok(Self::new(model))
+    }
+
+    /// Lays this model out for GPU batch prediction on Metal (macOS with
+    /// the `metal` feature and a Metal device; `gblinear` and `linear_tree`
+    /// models are refused, as they do not predict through the forest).
+    fn to_gpu(&self, py: Python<'_>) -> PyResult<GpuModel> {
+        #[cfg(target_os = "macos")]
+        {
+            let gpu = py.detached(|| self.model.to_gpu())?;
+            Ok(GpuModel::new(gpu))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (self, py);
+            Err(refuse(
+                "GPU prediction requires the `metal` feature on macOS",
+            ))
+        }
     }
 
     #[getter]

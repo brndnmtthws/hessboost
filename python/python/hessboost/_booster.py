@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Booster",
     "Distributions",
+    "GpuModel",
     "ImportanceType",
     "ModelFormat",
 ]
@@ -243,6 +244,20 @@ class Booster(_SchemaState):
         )
         return model.predict(matrix, kind, iterations)
 
+    def to_gpu(self) -> GpuModel:
+        """Lays this model out for GPU batch prediction on Metal (macOS
+        only): the forest, category pools, and per-tree weights are uploaded
+        once, and each prediction call uploads its rows. Predictions are
+        bit-identical to the CPU's, and faster from roughly a few thousand
+        row-trees upward.
+
+        Raises:
+            HessboostError: No Metal device is available, or the model is a
+                ``gblinear`` or ``linear_tree`` model (which do not predict
+                through the forest).
+        """
+        return GpuModel._wrap(self._model.to_gpu(), self)
+
     def predict_distribution(
         self,
         data: object,
@@ -432,3 +447,73 @@ class Booster(_SchemaState):
             f"Booster(objective={core.objective!r}, rounds={core.num_boosted_rounds}, "
             f"features={core.num_features}, outputs={core.num_outputs}{best})"
         )
+
+
+class GpuModel:
+    """A model laid out for GPU batch prediction on Metal, from
+    :meth:`Booster.to_gpu` (macOS only). Wraps
+    ``hessboost._hessboost.GpuModel`` with the same feature-name checks as
+    :meth:`Booster.predict`; unlike a booster it holds no file state and
+    cannot be pickled.
+    """
+
+    __module__ = "hessboost"
+
+    _core: _hessboost.GpuModel
+    _model: Booster
+
+    def __init__(self) -> None:
+        raise TypeError("use Booster.to_gpu()")
+
+    @classmethod
+    def _wrap(cls, core: _hessboost.GpuModel, model: Booster) -> GpuModel:
+        gpu = cls.__new__(cls)
+        gpu._core = core
+        gpu._model = model
+        return gpu
+
+    @property
+    def booster(self) -> Booster:
+        """The model this GPU predictor was built from."""
+        return self._model
+
+    @staticmethod
+    def available() -> bool:
+        """Whether a Metal device with working compute pipelines is
+        available (``False`` off macOS, or on a machine with no GPU)."""
+        return _hessboost.GpuModel.available()
+
+    @staticmethod
+    def device_name() -> str | None:
+        """The name of the Metal device predictions run on, if any (for
+        diagnostics and benchmarks)."""
+        return _hessboost.GpuModel.device_name()
+
+    def predict(
+        self,
+        data: object,
+        *,
+        output_margin: bool = False,
+        iteration_range: tuple[int, int] | None = None,
+        validate_features: bool = True,
+        base_margin: ArrayLike | None = None,
+        missing: float = np.nan,
+    ) -> NDArray[Any]:
+        """Predicts every row of ``data`` on the GPU, bit-identical to
+        :meth:`Booster.predict` (values or, with ``output_margin``, raw
+        margins): ``(rows,)`` or ``(rows, K)`` for ``K`` outputs.
+
+        Args:
+            iteration_range: ``(begin, end)`` boosting iterations, ``end=0``
+                meaning the last; ``None`` uses iterations through the
+                model's best iteration (all without early stopping).
+            validate_features: Refuse data whose feature names differ from
+                the model's.
+            base_margin: Starting margins for array input (a
+                :class:`DMatrix` carries its own).
+            missing: The missing-value marker for array input.
+        """
+        model = self._model
+        matrix = model._matrix(data, base_margin, missing, validate_features)
+        kind = "margin" if output_margin else "value"
+        return self._core.predict(matrix, kind, Booster._range(iteration_range))

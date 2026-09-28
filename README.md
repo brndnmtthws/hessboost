@@ -123,7 +123,8 @@ runnable programs live in [`examples/`](examples)
 [`python/`](python) holds the Python package (`pip install hessboost`):
 `DMatrix`, `train`, `cv`, and `Booster` (taking XGBoost's parameter names),
 scikit-learn estimators, pandas and polars categorical input, and the conformal,
-distributional, tree-diffusion, ForestFlow, and in-place update extras:
+distributional, tree-diffusion, ForestFlow, and in-place update extras
+(on macOS, `Booster.to_gpu()` batch-predicts on the Metal GPU):
 
 ```python
 import hessboost

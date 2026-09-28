@@ -27,6 +27,7 @@ from hessboost import conformal, diffusion, ebm, folds, inference, online
 from hessboost._booster import (
     Booster,
     Distributions,
+    GpuModel,
     ImportanceType,
     ModelFormat,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "DMatrix",
     "Distributions",
     "EvalsResult",
+    "GpuModel",
     "HessboostError",
     "ImportanceType",
     "IncompatibleModelError",

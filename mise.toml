@@ -7,6 +7,7 @@ uv = "0.12.18"
 cargo-binstall = "1.23.0"
 "cargo:cargo-nextest" = "0.9.146"
 "cargo:cargo-semver-checks" = "0.50.0"
+shellcheck = "0.11.0"
 
 # Install anything missing whenever a mise-activated shell enters the repo.
 [hooks]

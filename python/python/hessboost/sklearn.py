@@ -11,8 +11,8 @@ weights, base margins, eval sets and ``verbose`` (live per-round output,
 (XGBoost's) defaults; ``params`` passes any other training parameter.
 
 Needs scikit-learn (``pip install 'hessboost[scikit-learn]'``); ``import
-hessboost`` itself does not import it. pandas frames keep their
-``category`` columns as categorical features: ``eval_set`` frames are
+hessboost`` itself does not import it. pandas and polars frames keep their
+categorical columns as categorical features: ``eval_set`` frames are
 re-coded to the training frame's categories, a frame continuing an earlier
 fit (``xgb_model``) to that model's, and prediction frames to the fitted
 model's (values they lack become missing).

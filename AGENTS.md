@@ -10,8 +10,9 @@ at release time.
 ## Toolchain
 
 `mise install` provides the pinned Rust 1.98.1, `mbx` (build cache),
-cargo-nextest, and uv; after changing a version, refresh `mise.lock` with
-`mise lock`. MSRV 1.93. `Cargo.lock` is gitignored: never pass `--locked`.
+cargo-nextest, uv, and shellcheck; after changing a version, refresh
+`mise.lock` with `mise lock`. MSRV 1.93. `Cargo.lock` is gitignored: never
+pass `--locked`.
 libzstd needs a C compiler for every build target. docs.rs builds only
 Linux (no Apple SDK for `zstd-sys`), so the Metal API renders only in a
 local macOS `cargo doc --features metal`. `include` in `Cargo.toml` lists
@@ -28,6 +29,7 @@ cargo test --doc --all-features   # nextest skips doctests; CI adds --profile ci
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 MISE_RUST_VERSION=1.93.0 mise exec -- cargo build --all-features   # MSRV
 cargo semver-checks   # API vs. latest crates.io release; Cargo.toml's version must be a large enough bump
+shellcheck .github/scripts/*.sh   # not run by CI
 ```
 
 XGBoost parity needs uv, CMake, and a C++ compiler (the first run builds
@@ -67,7 +69,8 @@ a ruff/ty lint job over all of the repository's Python, and an sdist round
 trip (with the release profile). `publish.yml` builds the manylinux,
 musllinux, macOS, and Windows
 wheels and tests each with `.github/scripts/test-wheel.sh` (musllinux in
-Alpine, without scikit-learn, which has no musl wheels). Root fmt also
+Alpine, without scikit-learn, which has no musl wheels; free-threaded
+without polars, whose abi3-only wheels it cannot load). Root fmt also
 checks `python/Cargo.toml`; Python
 clippy runs in both the x86_64-linux and aarch64-macOS lint jobs (the
 latter checks the Metal feature). `all-checks-passed` gates merges. After
@@ -171,7 +174,7 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
 |---|---|
 |`Cargo.toml`|`hessboost-python`, version = root's (the wheel's); `include` is the sdist; `metal` on macOS|
 |`src/`|private extension `hessboost._hessboost`: `data` (`DMatrix`, metadata dict → setters), `params` (mapping → `TrainingParams`), `booster` (predict variants, `load`/`save` through `codec`), `codec` (the `Format` trait: `ModelFormat` / `DiffusionFormat` by their Python names, `"auto"` through the crate's `detect` with `ModelFormatError` for unrecognized bytes; detached `encode` to `bytes` and `decode` shared by `Booster`, `DiffusionModel`, `ForestModel`; method configurations as serde JSON), `train` (`Trainer` on a signal-polled worker thread via `run_hooked`, `cv`, folds, Python callbacks), `conformal` (calibrators owning their model via `self_cell`), `inference` (`BoulevardInference` owning its model and holdout rows via `self_cell`, `honest_refit`), `ebm` (`TermShape`, `shape_functions`, `EbmInference`), `online` (`OnlineParams`: `exact()`/`approximate(tolerance)`; `OnlineModel`: the one mutable class, its state behind a mutex locked only detached; updates through `run_hooked`), `dist`, `diffusion` (`DiffusionParams` from a request dict with the `Method` as its serde JSON, `DiffusionModel`, `SamplesView` summaries of draw arrays without copying; `fit` has no round hook, so it is not interruptible), `forest` (`ForestParams`/`ForestModel` the same way, `ForestMethod` and column kinds by serde name)|
-|`python/hessboost/`|the public API, pure Python: `_matrix` (`DMatrix`; `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through; `_matrix_for`: data as the models it is paired with read it, which prediction, conformal, inference, diffusion and forests go through), `_booster` (`Booster`, `ModelFormat`), `_core` (`Uncertainty` only, kept there so its `__module__` and pickles stay `hessboost._core`), `_model_io` (`PathLike`, `read_bytes`/`write_bytes`, `_SchemaState`: the feature schema and pickle state of `Booster`, `DiffusionModel`, `ForestModel`, the model as native binary bytes), `_data` (numpy/pandas/scipy conversion, category re-coding), `_training` (`train`, `cv`), `sklearn` (the estimators; their shared base `_HessboostModel` in `_sklearn_common`), `conformal`, `diffusion/` (`__init__`: frozen dataclasses mirroring `hessboost::diffusion`, presets read from the crate, `DiffusionModel`, `mean`/`quantiles`/`crps`; `forest`: `ForestParams`, `ForestModel`, `ForestSamples`), `inference` (`BoulevardInference`, `BoulevardInfo`, `EbmInference`, `TermBands`, `honest_refit`), `ebm` (`shape_functions`, `TermShape`, axes, `EbmInfo`), `folds`, `online` (`OnlineModel`, `UpdateReport`, frozen dataclasses `Exact`/`Approximate` mirroring `OnlineMode`); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
+|`python/hessboost/`|the public API, pure Python: `_matrix` (`DMatrix`; `_check_schema`: the feature-name/categorical/category-order check every pairing of data with a model or `dtrain` goes through; `_matrix_for`: data as the models it is paired with read it, which prediction, conformal, inference, diffusion and forests go through), `_booster` (`Booster`, `ModelFormat`), `_core` (`Uncertainty` only, kept there so its `__module__` and pickles stay `hessboost._core`), `_model_io` (`PathLike`, `read_bytes`/`write_bytes`, `_SchemaState`: the feature schema and pickle state of `Booster`, `DiffusionModel`, `ForestModel`, the model as native binary bytes), `_data` (numpy/pandas/polars/scipy conversion, category re-coding; frame libraries are detected through `sys.modules`, never imported; a polars `Categorical`'s categories are its sorted values, never its physical codes, which index a shared pool), `_training` (`train`, `cv`), `sklearn` (the estimators; their shared base `_HessboostModel` in `_sklearn_common`), `conformal`, `diffusion/` (`__init__`: frozen dataclasses mirroring `hessboost::diffusion`, presets read from the crate, `DiffusionModel`, `mean`/`quantiles`/`crps`; `forest`: `ForestParams`, `ForestModel`, `ForestSamples`), `inference` (`BoulevardInference`, `BoulevardInfo`, `EbmInference`, `TermBands`, `honest_refit`), `ebm` (`shape_functions`, `TermShape`, axes, `EbmInfo`), `folds`, `online` (`OnlineModel`, `UpdateReport`, frozen dataclasses `Exact`/`Approximate` mirroring `OnlineMode`); `_hessboost.pyi` (native stub), `_sklearn_base.pyi` (typed scikit-learn bases)|
 |`tests/`|pytest; `test_model_io.py` checks the root's `tests/data/saved/` margins bit for bit; `test_stubs.py` pins the native classes public modules hand out unwrapped (`Distributions`) and requires their stub docstrings to equal the Rust docs|
 
 ## Invariants

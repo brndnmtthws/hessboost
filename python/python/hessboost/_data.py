@@ -1,6 +1,6 @@
 """Conversion of user inputs (numpy arrays of any dtype and layout, pandas
-frames, scipy sparse matrices, array-likes) into the row-major ``float32``
-arrays the native core borrows."""
+and polars frames, scipy sparse matrices, array-likes) into the row-major
+``float32`` arrays the native core borrows."""
 
 from __future__ import annotations
 
@@ -17,12 +17,13 @@ from hessboost._exceptions import HessboostError
 
 if TYPE_CHECKING:
     import pandas as pd
+    import polars as pl
 
 FeatureTypes: TypeAlias = list[str]
 """Per-feature types: ``"q"`` (numerical) or ``"c"`` (categorical)."""
 
 Categories: TypeAlias = dict[int, list[Any]]
-"""The categories of each pandas-categorical column, by column index."""
+"""The categories of each categorical frame column, by column index."""
 
 _NUMERICAL_TYPES = frozenset({"q", "float", "int", "i"})
 
@@ -43,9 +44,31 @@ def _pandas() -> Any:
     return sys.modules.get("pandas")
 
 
-def _is_frame(data: object) -> TypeGuard[pd.DataFrame]:
+def _polars() -> Any:
+    """The polars module if it is already imported, else ``None``."""
+    return sys.modules.get("polars")
+
+
+def _is_pandas_frame(data: object) -> TypeGuard[pd.DataFrame]:
     pd = _pandas()
     return pd is not None and isinstance(data, pd.DataFrame)
+
+
+def _is_polars_frame(data: object) -> TypeGuard[pl.DataFrame]:
+    pl = _polars()
+    return pl is not None and isinstance(data, pl.DataFrame)
+
+
+def _is_frame(data: object) -> bool:
+    """Whether ``data`` is a pandas or polars frame, which keeps its column
+    names and categorical columns."""
+    return _is_pandas_frame(data) or _is_polars_frame(data)
+
+
+def _refuse_categorical(name: object) -> HessboostError:
+    return HessboostError(
+        f"column {name!r} is categorical; pass enable_categorical=True to train on its categories"
+    )
 
 
 def _sparse_csr(data: Any) -> Any:
@@ -106,10 +129,10 @@ def _categorical_columns(feature_types: Sequence[str], n_cols: int) -> list[int]
     return columns
 
 
-def _frame_values(
+def _pandas_frame_values(
     frame: pd.DataFrame, enable_categorical: bool, reference: Categories | None
 ) -> tuple[NDArray[np.float32], list[str], FeatureTypes, Categories]:
-    """A frame's values as ``float32``: numeric and boolean columns as is
+    """A pandas frame's values as ``float32``: numeric and boolean columns as is
     (``NA`` missing), category columns as their codes (``NaN`` missing),
     re-coded to the ``reference`` categories of a trained model."""
     pd = _pandas()
@@ -121,10 +144,7 @@ def _frame_values(
         dtype = series.dtype
         if isinstance(dtype, pd.CategoricalDtype):
             if not enable_categorical:
-                raise HessboostError(
-                    f"column {name!r} is categorical; pass enable_categorical=True to train on "
-                    "its categories"
-                )
+                raise _refuse_categorical(name)
             known = list(dtype.categories)
             wanted = None if reference is None else reference.get(column)
             codes = series.cat.codes.to_numpy()
@@ -150,6 +170,59 @@ def _frame_values(
     return values, names, types, categories
 
 
+def _polars_frame_values(
+    frame: pl.DataFrame, enable_categorical: bool, reference: Categories | None
+) -> tuple[NDArray[np.float32], list[str], FeatureTypes, Categories]:
+    """A polars frame's values as ``float32``: numeric and boolean columns as
+    is (null missing), ``Enum`` and ``Categorical`` columns as positions in
+    their categories (null missing), re-coded to the ``reference``
+    categories of a trained model. An ``Enum``'s categories are its
+    dtype's; a ``Categorical``'s are its values, sorted (as pandas infers
+    them), since its physical codes index a pool other columns share."""
+    pl = _polars()
+    rows, cols = frame.shape
+    values = np.empty((rows, cols), dtype=np.float32)
+    types: FeatureTypes = []
+    categories: Categories = {}
+    for column, series in enumerate(frame.get_columns()):
+        name, dtype = series.name, series.dtype
+        if isinstance(dtype, (pl.Categorical, pl.Enum)):
+            if not enable_categorical:
+                raise _refuse_categorical(name)
+            strings = series.cast(pl.String)
+            if isinstance(dtype, pl.Enum):
+                known: list[Any] = dtype.categories.to_list()
+            else:
+                known = sorted(strings.drop_nulls().unique().to_list())
+            wanted = None if reference is None else reference.get(column)
+            if wanted is not None:
+                known = wanted
+            # Polars categories are strings; a reference's other values
+            # (a pandas model's integer categories) match nothing.
+            positions = [
+                (value, code) for code, value in enumerate(known) if isinstance(value, str)
+            ]
+            codes = strings.replace_strict(
+                [value for value, _ in positions],
+                [code for _, code in positions],
+                default=None,
+                return_dtype=pl.Float32,
+            )
+            column_values = codes.to_numpy()
+            types.append("c")
+            categories[column] = known
+        elif dtype.is_numeric() or dtype == pl.Boolean:
+            column_values = series.cast(pl.Float32).to_numpy()
+            types.append("q")
+        else:
+            raise TypeError(
+                f"column {name!r} has dtype {dtype}; hessboost takes numeric, Boolean, Enum and "
+                "Categorical columns (convert strings with .cast(pl.Categorical))"
+            )
+        values[:, column] = column_values
+    return values, list(frame.columns), types, categories
+
+
 def features(
     data: object,
     *,
@@ -162,7 +235,7 @@ def features(
 ) -> Features:
     """Converts ``data`` and builds the native matrix with ``info``
     attached. ``reference`` holds a trained model's categories, to which
-    pandas categorical columns are re-coded."""
+    frame categorical columns are re-coded."""
     names: list[str] | None = None
     types: FeatureTypes | None = None
     categories: Categories = {}
@@ -170,8 +243,11 @@ def features(
     if csr is not None:
         n_cols = int(csr.shape[1])
         values = None
-    elif _is_frame(data):
-        values, names, types, categories = _frame_values(data, enable_categorical, reference)
+    elif _is_pandas_frame(data):
+        values, names, types, categories = _pandas_frame_values(data, enable_categorical, reference)
+        n_cols = values.shape[1]
+    elif _is_polars_frame(data):
+        values, names, types, categories = _polars_frame_values(data, enable_categorical, reference)
         n_cols = values.shape[1]
     else:
         values = as_float32(data, "data")

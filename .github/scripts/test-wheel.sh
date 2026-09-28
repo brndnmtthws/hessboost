@@ -21,7 +21,14 @@ sync_args=
 pytest_args=
 if ldd --version 2>&1 | grep -q musl; then
   sync_args="--no-install-package scikit-learn"
-  pytest_args="--ignore=tests/test_sklearn.py --deselect=tests/test_training.py::test_cv_accepts_explicit_folds_and_splitters"
+  pytest_args="--ignore=tests/test_sklearn.py --deselect=tests/test_training.py::test_cv_accepts_explicit_folds_and_splitters --deselect=tests/test_polars.py::test_estimators_take_polars_frames"
+fi
+# polars publishes only abi3 wheels, which free-threaded interpreters cannot
+# load (and building it from source would dominate the job), so test
+# without it and its tests there; its conversion is pure Python.
+if uv run --no-project --python "$python" python -c "import sys, sysconfig; sys.exit(not sysconfig.get_config_var('Py_GIL_DISABLED'))"; then
+  sync_args="$sync_args --no-install-package polars --no-install-package polars-runtime-32"
+  pytest_args="$pytest_args --ignore=tests/test_polars.py"
 fi
 
 # The argument lists and the glob are unquoted on purpose: the lists split

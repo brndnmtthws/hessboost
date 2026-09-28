@@ -24,8 +24,8 @@ UBJSON.
 uv add hessboost        # or: pip install hessboost
 ```
 
-Extras: `hessboost[pandas]` and `hessboost[scikit-learn]`. numpy is the only
-required dependency.
+Extras: `hessboost[pandas]`, `hessboost[polars]`, and
+`hessboost[scikit-learn]`. numpy is the only required dependency.
 
 Prebuilt wheels are published for Linux x86_64 and aarch64 (glibc
 manylinux and musl/Alpine musllinux), macOS arm64 (with Metal support,
@@ -61,10 +61,11 @@ print(booster.best_iteration, booster.get_score(importance_type="gain"))
 ```
 
 `DMatrix` takes numpy arrays of any numeric dtype and memory layout (a
-C-contiguous `float32` array is used without a copy), pandas DataFrames,
-scipy sparse matrices, and anything `numpy.asarray` accepts. NaN is missing
-(or pass `missing=`); ranking data takes `group=` sizes or `qid=`, and
-`survival:aft` takes `label_lower_bound=`/`label_upper_bound=`.
+C-contiguous `float32` array is used without a copy), pandas and polars
+DataFrames, scipy sparse matrices, and anything `numpy.asarray` accepts.
+NaN, and a frame's null, is missing (or pass `missing=`); ranking data
+takes `group=` sizes or `qid=`, and `survival:aft` takes
+`label_lower_bound=`/`label_upper_bound=`.
 `Booster.predict` accepts the same inputs directly.
 
 `train` supports XGBoost's everyday arguments: `evals`, `evals_result`,
@@ -84,14 +85,17 @@ class StopAtTarget(hessboost.TrainingCallback):
 hessboost.train(params, dtrain, 1000, evals=[(dvalid, "valid")], callbacks=[StopAtTarget()])
 ```
 
-### pandas and categorical features
+### DataFrames and categorical features
 
-DataFrame column names become feature names, and `category` columns become
-native categorical features. A category's code is its position in the
-column's categories, so the booster remembers each column's categories and
-re-codes a frame passed to `predict` (and the other prediction and
-calibration methods) whose categories are ordered differently or include
-unseen values (which count as missing):
+pandas and polars column names become feature names, and categorical
+columns (pandas `category`; polars `Enum` and `Categorical`) become native
+categorical features. A category's code is its position in the column's
+categories: a pandas column's or an `Enum`'s declared categories, or a
+polars `Categorical`'s values, sorted (as pandas infers them). The booster
+remembers each column's categories and re-codes a frame passed to `predict`
+(and the other prediction and calibration methods) whose categories are
+ordered differently or include unseen values (which count as missing),
+whichever library the frame is from:
 
 ```python
 import pandas as pd
@@ -110,7 +114,9 @@ against `dtrain` and against `xgb_model`, and `dtrain` against `xgb_model`
 categorical, and each categorical feature's categories, in order, must
 match; a mismatch raises `HessboostError` naming the eval set and the
 feature. Build eval frames with the training frame's categories (for
-example `valid["color"].cat.set_categories(train["color"].cat.categories)`).
+example `valid["color"].cat.set_categories(train["color"].cat.categories)`
+in pandas; in polars, an `Enum` of the training categories, since a
+`Categorical` missing some of its values has other categories).
 Codes without recorded categories (numpy data with
 `feature_types=["c", ...]`) are taken to be the other side's codes; only
 which features are categorical is compared, and a model continued on them

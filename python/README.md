@@ -36,6 +36,9 @@ Rust 1.93 or newer and a C compiler (for libzstd).
 
 ## Quick start
 
+Train on a `DMatrix`, evaluating a holdout set every round and stopping
+once it stops improving:
+
 ```python
 import numpy as np
 import hessboost
@@ -55,10 +58,23 @@ booster = hessboost.train(
     early_stopping_rounds=20,
     verbose_eval=False,
 )
-probabilities = booster.predict(X[800:])  # through booster.best_iteration
+```
+
+`predict` takes a `DMatrix` or anything its constructor accepts. The default
+range is the iterations through `best_iteration` (pass `iteration_range=(0, 0)`
+for every iteration), except `pred_leaf`, which defaults to all of the
+model's trees, not just through `best_iteration`.
+The flag arguments are exclusive:
+
+```python
+probabilities = booster.predict(X[800:])  # through best_iteration
+margins = booster.predict(X[800:], output_margin=True)
 shap = booster.predict(X[800:], pred_contribs=True)  # (rows, features + 1)
+leaves = booster.predict(X[800:], pred_leaf=True)  # (rows, trees) int32, all trees
 print(booster.best_iteration, booster.get_score(importance_type="gain"))
 ```
+
+### Input data
 
 `DMatrix` takes numpy arrays of any numeric dtype and memory layout (a
 C-contiguous `float32` array is used without a copy), pandas and polars
@@ -68,6 +84,8 @@ takes `group=` sizes or `qid=`, and `survival:aft` takes
 `label_lower_bound=`/`label_upper_bound=`.
 `Booster.predict` accepts the same inputs directly.
 
+### Training controls
+
 `train` supports XGBoost's everyday arguments: `evals`, `evals_result`,
 `early_stopping_rounds`, `verbose_eval` (printed live, every round or
 every `n`-th), `xgb_model` (continued training, or tree refresh with
@@ -76,13 +94,23 @@ and `callbacks`. Ctrl-C stops training at the end of the current round
 and raises `KeyboardInterrupt`. `hessboost.cv` cross-validates over
 shuffled folds, explicit folds, or a scikit-learn splitter.
 
+Subclass `TrainingCallback` to stop on your own condition; `after_iteration`
+sees the round and the evaluation history, and returning `True` stops
+training with the rounds so far:
+
 ```python
 class StopAtTarget(hessboost.TrainingCallback):
     def after_iteration(self, iteration, evals_log):
         return evals_log["valid"]["auc"][-1] > 0.99  # True stops training
 
 
-hessboost.train(params, dtrain, 1000, evals=[(dvalid, "valid")], callbacks=[StopAtTarget()])
+hessboost.train(
+    {"objective": "binary:logistic", "eval_metric": "auc", "max_depth": 4},
+    dtrain,
+    1000,
+    evals=[(dvalid, "valid")],
+    callbacks=[StopAtTarget()],
+)
 ```
 
 ### DataFrames and categorical features
@@ -128,6 +156,11 @@ every `eval_set` frame to the training frame's categories and, with
 
 ## scikit-learn
 
+The estimators take XGBoost's scikit-learn parameter names, plus
+`callbacks`. Parameters left at `None` keep hessboost's defaults, and
+`params={...}` passes any other training parameter; `fit(..., verbose=True)`
+(or a period) prints rounds live:
+
 ```python
 from hessboost.sklearn import HessboostClassifier
 
@@ -142,14 +175,10 @@ model.feature_importances_
 `HessboostRegressor` (multi-target with a 2-D `y`), `HessboostClassifier`
 (any class labels), `HessboostRanker` (`group=` or `qid=`), and
 `HessboostDistributionRegressor` (`dist:*` objectives; `predict` returns
-means, `predict_distribution` the distributions) take XGBoost's
-scikit-learn parameter names, plus `callbacks`. Parameters left at `None`
-keep hessboost's defaults, and `params={...}` passes any other training
-parameter; `fit(..., verbose=True)` (or a period) prints rounds live. They
-work with pipelines, `clone`, grid search, and pickling, and pass
-scikit-learn's estimator checks (except three documented deviations).
-`import hessboost` does not import scikit-learn; `hessboost.sklearn` needs
-it.
+means, `predict_distribution` the distributions) work with pipelines,
+`clone`, grid search, and pickling, and pass scikit-learn's estimator checks
+(except three documented deviations). `import hessboost` does not import
+scikit-learn; `hessboost.sklearn` needs it.
 
 ## Model files
 
@@ -161,14 +190,37 @@ it.
 | `pickle` / `copy` | native binary plus feature names, categories, and `best_score` |
 
 The native binary format is compressed, checksummed, and lossless; files
-load in subsequent releases. Use
-`format="xgboost-json"` or `.ubj` for a file XGBoost loads. A LightGBM
-model (`lightgbm.Booster.save_model`) predicts LightGBM's values for
+load in subsequent releases. A LightGBM model
+(`lightgbm.Booster.save_model`) predicts LightGBM's values for inputs with
 missing values as `NaN` and categorical features as non-negative codes;
-models with no exact equivalent raise `ModelFormatError`. `booster[a:b]`
-slices boosting iterations.
+models with no exact equivalent raise `ModelFormatError`:
+
+```python
+booster.save_model("model.ubj")  # a file XGBoost loads; .json for native JSON
+loaded = hessboost.Booster("model.ubj")  # format detected from the content
+early = booster[:10]  # the first 10 boosting iterations, as a Booster
+```
 
 ## Modern modeling
+
+### Conformal intervals
+
+`SplitConformal` wraps one single-output model in `f(x) ± Q`, where `Q` is
+the calibration set's quantile of `|y - f(x)|` — finite-sample `1 - alpha`
+coverage for exchangeable rows:
+
+```python
+from hessboost.conformal import SplitConformal
+
+cal = SplitConformal.calibrate(booster, X_cal, y_cal, alpha=0.1)
+lower, upper = cal.predict_interval(X_test).T
+```
+
+`ConformalizedQuantile` instead adjusts a quantile band `[q_lo(x), q_hi(x)]`
+by its calibration quantile, so it also tightens a band that over-covers.
+The band comes from two single-quantile models (`calibrate`), two outputs
+of one multi-quantile model (`calibrate_outputs`), or a `dist:*` model's
+central quantiles (`calibrate_distribution`):
 
 ```python
 from hessboost.conformal import ConformalizedQuantile
@@ -180,16 +232,50 @@ band = hessboost.train(
 )
 cqr = ConformalizedQuantile.calibrate_outputs(band, X_cal, y_cal, alpha=0.1)
 lower, upper = cqr.predict_interval(X_test).T  # >= 90% coverage, finite-sample
-lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T  # for f(x)
+```
 
+### Distributional boosting
+
+A `dist:*` objective fits a predictive distribution per row instead of a
+point. `predict_distribution` returns a `Distributions` object whose
+summaries are vectorized over rows:
+
+```python
 dist = hessboost.train({"objective": "dist:normal"}, hessboost.DMatrix(X_train, y_train), 300)
 d = dist.predict_distribution(X_test)
-d.mean(), d.std(), d.interval(0.9), d.log_prob(y_test), d.crps(y_test)
+means, stds = d.mean(), d.std()
+lower, upper = d.interval(0.9).T
+ll, score = d.log_prob(y_test), d.crps(y_test)
+```
 
+### Virtual ensembles
+
+A model trained with `posterior_sampling` (SGLB: `langevin` noise plus
+`model_shrink_rate`) carries its own posterior ensemble: `count` members
+rebuilt exactly from its model shrinkage, member-major (`(count, rows)` for
+single-output models), with each member's iteration count alongside:
+
+```python
 sglb = hessboost.train({"posterior_sampling": True}, hessboost.DMatrix(X_train, y_train), 1000)
-members, iterations = sglb.predict_virtual_ensembles(X_test, 10)  # (10, rows)
-u = sglb.predict_uncertainty(X_test, 10)  # u.knowledge rises off the training data
+members, iterations = sglb.predict_virtual_ensembles(X_test, 10)
+u = sglb.predict_uncertainty(X_test, 10)  # u.mean, u.knowledge, u.data, u.total
+```
 
+`predict_uncertainty` decomposes the ensemble à la CatBoost: knowledge
+(epistemic) uncertainty rises off the training data. Plain regression has
+only `mean` and `knowledge` (`data`/`total` are `None`); `dist:*` and
+classification models get the full decomposition.
+
+### Online updates
+
+`OnlineModel` keeps a trained model with its training data and updates both
+in place as rows arrive or must be forgotten. `Exact()` retrains, so every
+update equals `hessboost.train` on the updated data bit for bit;
+`Approximate(tolerance)` (default, `0.1`) keeps splits that still rank near
+the top and is faster for small changes. A refused, stopped, or interrupted
+(Ctrl-C) update changes nothing:
+
+```python
 from hessboost.online import Approximate, OnlineModel
 
 online = OnlineModel.train(
@@ -200,97 +286,134 @@ online = OnlineModel.train(
 )
 report = online.update(hessboost.DMatrix(X_new, y_new), deletions=[3, 17])
 online.model.predict(X_test)  # online.data: the updated training rows
+```
 
+The report counts kept nodes, regrown subtrees, and refreshed rows
+(`UpdateReport`); `OnlineModel.from_model` resumes from a saved `Booster`
+and its training data. Updates need `hist` depth-wise trees without sampling
+or constraints and unweighted data.
+
+### Explainable boosting machines
+
+`{"booster": "ebm"}` trains a cyclic GA2M with outer bags, FAST pairs, and
+per-bag early stopping. Every term's piecewise-constant shape function is
+readable from the model (`NumericAxis` edges or `CategoricalAxis` codes,
+plus a missing cell per axis); intercept plus shapes is the margin:
+
+```python
+from hessboost import ebm
+
+model = hessboost.train({"booster": "ebm"}, hessboost.DMatrix(X_train, y_train), 50)
+shapes = ebm.shape_functions(model)
+shapes.intercept, shapes.terms[0].values
+```
+
+A Boulevard EBM (`{"booster": "ebm", "ebm_boulevard": True}`) additionally
+supports confidence bands on its shapes via
+`hessboost.inference.EbmInference.term_bands`.
+
+### Boulevard inference
+
+Boulevard boosting (`{"booster": "boulevard"}`) samples trees with dropout
+so the ensemble converges to a kernel ridge posterior, whose leaf kernel
+gives asymptotic confidence, prediction, and reproduction intervals for
+`f(x)`. Refit the leaves on independent rows first (`honest_refit`), fit
+the kernel over those rows, then query any rows:
+
+```python
 from hessboost.inference import BoulevardInference, honest_refit
 
-params = {"booster": "boulevard", "eta": 0.8, "boulevard_dropout": 0.5, "subsample": 0.8}
-trained = hessboost.train(params, hessboost.DMatrix(X_struct, y_struct), 200)
+trained = hessboost.train(
+    {"booster": "boulevard", "eta": 0.8, "boulevard_dropout": 0.5, "subsample": 0.8},
+    hessboost.DMatrix(X_struct, y_struct),
+    200,
+)
 model = honest_refit(trained, X_values, y_values)  # leaves from independent rows
-inference = BoulevardInference.fit(model, X_values, holdout=X_cal, holdout_label=y_cal)
+inference = BoulevardInference.fit(model, X_values, y_values, holdout=X_cal, holdout_label=y_cal)
+lower, upper = inference.confidence_intervals(X_test, alpha=0.05).T  # for f(x)
+```
 
+The intervals are conditional on the tree structures: nominal for
+low-dimensional smooth signals after an honest refit, under-covering
+elsewhere (see the crate's `inference` docs). `Booster.boulevard` records
+how the model was trained.
+
+### Diffusion models
+
+`hessboost.diffusion` fits nonparametric `p(y | x)` for scalar or vector
+labels (multimodal, skewed, heavy-tailed) by conditional diffusion or flow
+matching with GBDT score models, after Treeffuser and DiffGBM. `sample`
+returns `(rows, n_samples, outputs)` draws, deterministic per seed and step
+count (`n_steps=` overrides the model's); `mean`, `quantiles`, and `crps`
+summarize them:
+
+```python
 from hessboost.diffusion import DiffusionModel, DiffusionParams, crps, quantiles
 
 flow = DiffusionModel.fit(DiffusionParams.flow_matching(), X_train, y_train)
 draws = flow.sample(X_test, 200, seed=0)  # (rows, 200, outputs) float32
-quantiles(draws, [0.05, 0.5, 0.95])  # (rows, 3, outputs)
-crps(draws, y_test)  # (rows, outputs)
+bands = quantiles(draws, [0.05, 0.5, 0.95])  # (rows, 3, outputs)
+scores = crps(draws, y_test)  # (rows, outputs)
+```
 
+`DiffusionParams` is a frozen dataclass tree with presets `default()`,
+`treeffuser()`, and `flow_matching()`; its `training` mappings are XGBoost
+parameters, as `train` reads them. Models save with
+`to_bytes(format="binary")` / `save(path, format="binary")` (`"binary"` or
+`"json"`) and load with `from_bytes(data, format="auto")` /
+`load(path, format="auto")`, or pickle (which also keeps feature names and
+categories). `fit` releases the GIL but cannot be interrupted: Ctrl-C takes
+effect once it returns.
+
+### Synthetic tabular data
+
+`hessboost.diffusion.forest` fits ForestFlow / ForestDiffusion models of
+whole rows (optionally per class of a label) with per-noise-level GBDTs.
+`sample` draws synthetic rows as a `ForestSamples` (`values`, plus `labels`
+for a class-conditional model); `sample_for_labels` draws one row per given
+label:
+
+```python
 from hessboost.diffusion.forest import ForestModel, ForestParams
 
 forest = ForestModel.fit(ForestParams.forest_diffusion(), X_with_nans)
-synthetic = forest.sample(1000, seed=0)  # ForestSamples: .values (1000, columns), .labels None
+synthetic = forest.sample(1000, seed=0)  # .values (1000, columns), .labels None
+```
+
+The diffusion variant also imputes missing values, keeping the observed
+entries (flow models refuse). Values are in the data's own coding:
+
+```python
 filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
 ```
 
-- `hessboost.conformal`: `SplitConformal` and `ConformalizedQuantile`
-  (from two quantile models, two outputs of one, or a `dist:*` model).
-- `hessboost.online`: `OnlineModel` adds and deletes training rows of a
-  trained model in place (incremental learning, machine unlearning).
-  `mode=Exact()` is exact: every update equals `hessboost.train` on
-  `online.data` bit for bit; `Approximate(tolerance)` (the default, at
-  `0.1`) keeps splits that still rank near the top and is faster than
-  retraining for small changes. `update(additions, deletions, callback=...)`
-  returns an `UpdateReport` (`nodes_kept`, `subtrees_regrown`,
-  `rows_refreshed`), or
-  `None` when `callback(iteration)` returned `True`; a refused, stopped, or
-  interrupted (Ctrl-C) update changes nothing. `OnlineModel.from_model`
-  resumes from a saved `Booster` and its training data. Updates need `hist`
-  depth-wise trees without sampling or constraints and unweighted data.
-- `hessboost.ebm`: explainable boosting machines (`{"booster": "ebm"}`,
-  cyclic GA2M with outer bags, FAST pairs, per-bag early stopping, and
-  categorical terms): `shape_functions` returns every term's
-  piecewise-constant shape (`NumericAxis` edges or `CategoricalAxis`
-  codes, plus a missing cell per axis) and `Booster.ebm`;
-  `hessboost.inference.EbmInference` puts confidence bands on the shapes of
-  an `ebm_boulevard` model.
-- `hessboost.inference`: Boulevard boosting's asymptotic confidence,
-  prediction (Gaussian noise), and reproduction intervals for `f(x)`
-  (`BoulevardInference`, exact or Nystrom), `honest_refit`, and
-  `Booster.boulevard`. The intervals are conditional on the tree
-  structures: nominal for low-dimensional smooth signals after an honest
-  refit, under-covering elsewhere (see the crate's `inference` docs).
-- `hessboost.diffusion`: nonparametric `p(y | x)` for scalar or vector
-  labels (multimodal, skewed, heavy-tailed) by conditional diffusion or
-  flow matching with GBDT score models, after Treeffuser and DiffGBM.
-  `DiffusionParams` is a frozen dataclass tree (`Score`/`FlowMatching` and
-  their SDEs, paths, and time sampling; `EarlyStopping`, `Residualizer`)
-  with presets `default()`, `treeffuser()`, and `flow_matching()`; its
-  `training` mappings are XGBoost parameters, as `train` reads them.
-  `DiffusionModel.sample` returns `(rows, n_samples, outputs)` draws,
-  deterministic per seed and step count (`n_steps=` overrides the model's);
-  `mean`, `quantiles`, and `crps` summarize them.
-  Models save with `to_bytes(format="binary")` / `save(path,
-  format="binary")` (`"binary"` or `"json"`) and load with
-  `from_bytes(data, format="auto")` / `load(path, format="auto")`, which
-  detect the format (`ModelFormatError` for bytes in neither), or pickle
-  (which also keeps feature names and categories). `fit` releases
-  the GIL but cannot be interrupted: Ctrl-C takes effect once it returns.
-- `hessboost.diffusion.forest`: ForestFlow / ForestDiffusion synthetic
-  tabular rows (optionally per class of a label) and missing-value
-  imputation with per-noise-level GBDTs. `ForestParams` (method `"flow"`
-  or `Diffusion(beta_min, beta_max)`, `n_t`, `duplicate_k`, one
-  `"continuous"`/`"integer"`/`"categorical"` kind per column, XGBoost
-  `training` parameters) has presets `forest_flow()` (the defaults) and
-  `forest_diffusion()`. `ForestModel.sample(n_rows)` returns a frozen
-  `ForestSamples(values, labels)` (labels only for a class-conditional
-  model), `sample_for_labels(labels)` one row per label, and `impute(X, y, n_imputations=, repaint=Repaint(...))`
-  `(n_imputations, rows, columns)` with the observed entries kept
-  (diffusion only). Values are in the data's own coding. Models save and
-  load like `DiffusionModel`s.
-- `hessboost.folds`: `k_fold`, `forward_chaining` (expanding-window,
-  purged by a row `gap`), and `purged_forward` (timestamped rows, purged
-  by each row's own label window, for overlapping or irregular horizons)
-  folds for `cv` or your own validation loops.
-- `Booster.predict_virtual_ensembles` / `predict_uncertainty`: CatBoost's
-  virtual ensembles of an SGLB model (`posterior_sampling`, `langevin`,
-  `model_shrink_rate`), with knowledge, data, and total uncertainty
-  (`hessboost.Uncertainty`).
-- Every hessboost training option (`path_smooth`, `extra_trees`,
-  `linear_tree`, `grow_policy="symmetric"`, `use_quantized_grad`,
-  `pos_bagging_fraction`, `neg_bagging_fraction`, `bagging_by_query`, the
-  `dist:*` objectives and their `dist_gradient`, `rank:xendcg`, ...) is a
-  `params` key. XE-NDCG's keyed per-round random stream differs from
-  LightGBM's `rank_xendcg` stream.
+`ForestParams` has presets `forest_flow()` (the defaults) and
+`forest_diffusion()`; its `training` mappings are XGBoost parameters, and
+models save and load like `DiffusionModel`s.
+
+### Validation folds
+
+`hessboost.folds` builds `(train_rows, test_rows)` splits for `cv` or custom
+loops: shuffled `k_fold` (what `cv` uses by default), `forward_chaining`
+expanding windows with a purged `gap`, and `purged_forward` (timestamped
+rows, purged by each row's own label window, for overlapping or irregular
+horizons):
+
+```python
+from hessboost import folds
+
+splits = folds.forward_chaining(dtrain.num_row(), 4, gap=24)
+result = hessboost.cv({"max_depth": 4}, dtrain, 100, folds=splits)
+```
+
+### Extra training options
+
+Every hessboost training option (`path_smooth`, `extra_trees`,
+`linear_tree`, `grow_policy="symmetric"`, `use_quantized_grad`,
+`pos_bagging_fraction`, `neg_bagging_fraction`, `bagging_by_query`, the
+`dist:*` objectives and their `dist_gradient`, `rank:xendcg`, ...) is a
+`params` key. XE-NDCG's keyed per-round random stream differs from
+LightGBM's `rank_xendcg` stream.
 
 ## Differences from XGBoost's Python package
 
@@ -318,13 +441,15 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
 - `cv` returns a dict of numpy arrays (`test-<metric>-mean`/`-std`) with
   held-out metrics only; there is no `stratified` or `as_pandas`.
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's
-  scikit-learn behavior); pass `iteration_range=(0, 0)` for all.
-  `pred_leaf` returns `int32`.
+  scikit-learn behavior); pass `iteration_range=(0, 0)` for all. SHAP and
+  leaf ranges start at iteration 0; `pred_leaf` defaults to every iteration
+  instead, and returns `int32`.
 - Model files do not store feature names or categories (pickles do).
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
   (`predict` takes arrays directly), `Booster.get_dump`/`trees_to_dataframe`
   /`dump_model`, attributes (`set_attr`), plotting, distributed (Dask/Spark)
-  and GPU (CUDA) training, `approx_contribs`, and `strict_shape`.
+  and CUDA training, `approx_contribs`, and `strict_shape`. The macOS wheels
+  support `device="metal"` (GPU histograms while training).
 
 ## Development
 
@@ -332,18 +457,18 @@ From `python/` in the [repository](https://github.com/brndnmtthws/hessboost),
 with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uv sync                        # build the extension and install dev tools
-uv run pytest
-uv run pyright --verifytypes hessboost --ignoreexternal
+uv sync --locked              # build the extension and install dev tools
+uv run --locked pytest
+uv run --locked pyright --verifytypes hessboost --ignoreexternal
 ```
 
 Lint, format, and type-check all of the repository's Python from its root
 (configuration: `ruff.toml`, `ty.toml`):
 
 ```sh
-uv run --project python ruff check
-uv run --project python ruff format --check
-uv run --project python ty check
+uv run --project python --locked ruff check
+uv run --project python --locked ruff format --check
+uv run --project python --locked ty check
 ```
 
 ## License

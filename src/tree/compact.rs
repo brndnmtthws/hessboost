@@ -318,7 +318,109 @@ pub(crate) struct GpuForestParts<'a> {
     pub(crate) roots: Vec<u32>,
 }
 
+/// The forest's node arena in the GPU's compact 8-byte encoding, when every
+/// tree fits it (see [`CompactForest::gpu_arena8`]). Two `u32`s per node:
+///
+/// - `key`: the numeric threshold itself for an internal node (as `f32`
+///   bits, so the walk compares floats), the leaf value's bits for a leaf;
+/// - `packed`: `child | feature << 15 | MIRRORED | LEAF`, where `child` is
+///   the arena-relative index of the child taken when the compare is false
+///   (the other child is `child + 1`), `feature` the split feature, and
+///   `MIRRORED` marks a node that reads the negated value. A leaf stores the
+///   `LEAF` bit and no child.
+///
+/// Half the bytes of the CPU arena is worth having on a GPU because
+/// prediction is bound by the cache lines a warp's scattered node loads
+/// touch: 16 nodes share a line instead of 8, which halves the traffic at
+/// the deeper levels of a tree, where a warp's rows spread over most of the
+/// level. Only the Metal backend uses it.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) struct GpuArena8 {
+    /// The `key` and `packed` words, node after node.
+    pub(crate) words: Vec<u32>,
+    /// Each tree's first node index in the arena (its root).
+    pub(crate) roots: Vec<u32>,
+}
+
+/// Leaf marker of [`GpuArena8::words`]'s `packed` word.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const GPU8_LEAF: u32 = 1 << 31;
+/// Mirrored-value marker of [`GpuArena8::words`]'s `packed` word (the
+/// [mirrored slot](LANES) bit of the CPU encoding, transposed).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const GPU8_MIRROR: u32 = 1 << 30;
+/// Bits of the `packed` word's child and feature fields.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const GPU8_BITS: u32 = 15;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const GPU8_MASK: u32 = (1 << GPU8_BITS) - 1;
+
 impl CompactForest {
+    /// The node arena in the 8-byte encoding ([`GpuArena8`]), or `None` when
+    /// a tree does not fit it: a categorical split (the category set needs
+    /// the wide encoding), a `NaN` threshold (its key differs from the value
+    /// under a float compare), a tree of more than `2^15 - 1` nodes, a used
+    /// feature index at or past `2^15`, or the caller's `excluded` test
+    /// (`true` for a tree the caller cannot use, such as a vector-leaf one).
+    ///
+    /// The encoding is exact for what it covers — a numeric node needs its
+    /// threshold key, its feature, its mirrored flag, and one child index —
+    /// so a model that fits predicts identically through either arena.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn gpu_arena8(&self, mut excluded: impl FnMut(usize) -> bool) -> Option<GpuArena8> {
+        let mut arena = GpuArena8 {
+            words: Vec::with_capacity(self.nodes.len() * 2),
+            roots: Vec::with_capacity(self.trees.len()),
+        };
+        for (t, meta) in self.trees.iter().enumerate() {
+            let end = self
+                .trees
+                .get(t + 1)
+                .map_or(self.nodes.len(), |next| next.root as usize);
+            let count = end - meta.root as usize;
+            if excluded(t)
+                || meta.has_categorical
+                || count > GPU8_MASK as usize
+                || meta.max_feature > GPU8_MASK
+            {
+                return None;
+            }
+            // The narrow arena packs the trees in the same order, so a
+            // tree's first node index is its node count so far.
+            arena.roots.push((arena.words.len() / 2) as u32);
+            for (local, node) in self.nodes[meta.root as usize..end].iter().enumerate() {
+                let id = meta.root + local as u32;
+                if Self::is_leaf(node, id) {
+                    arena.words.push(node.aux);
+                    arena.words.push(GPU8_LEAF);
+                } else {
+                    // A threshold whose key is `0` is a `NaN` (the only value
+                    // that keys there): the key walk sends every value right
+                    // of it, while the float walk's `v > NaN` is false for
+                    // every value. The wide arena is the one whose walk the
+                    // CPU's own test compares against, so such a node keeps
+                    // the model on it.
+                    if node.key == 0 {
+                        return None;
+                    }
+                    let mirrored = if node.slot & LANES as u32 != 0 {
+                        GPU8_MIRROR
+                    } else {
+                        0
+                    };
+                    let feature = node.slot / FEATURE_LANES as u32;
+                    // The threshold itself, so the GPU walk compares floats
+                    // instead of rebuilding `key` per node ([`unkey`]).
+                    arena.words.push(unkey(node.key).to_bits());
+                    arena
+                        .words
+                        .push((node.left - meta.root) | (feature << GPU8_BITS) | mirrored);
+                }
+            }
+        }
+        Some(arena)
+    }
+
     pub(crate) fn from_trees(trees: &[RegTree]) -> Self {
         let total: usize = trees.iter().map(RegTree::num_nodes).sum();
         let mut forest = CompactForest {
@@ -1049,6 +1151,65 @@ mod tests {
         }
     }
 
+    /// The 8-byte arena takes ordinary numeric trees and refuses one whose
+    /// threshold is `NaN`: its key is `0`, where the walk's float compare
+    /// (`v > NaN`, false for everything) would disagree with the CPU's key
+    /// compare (`key_of(v) > 0`, true for everything but a missing value).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn arena8_keeps_nan_thresholds_on_the_wide_arena() {
+        let mut ordinary = RegTree::with_root(1.0);
+        let (l, r) = ordinary.expand(
+            0,
+            SplitRule::numeric(0, 1.5, false),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
+        ordinary.expand(
+            l,
+            SplitRule::numeric(1, -1.5, true),
+            ChildLeaf::new(2.0, 1.0),
+            ChildLeaf::new(3.0, 1.0),
+        );
+        ordinary.expand(
+            r,
+            SplitRule::numeric(1, 0.0, true),
+            ChildLeaf::new(4.0, 1.0),
+            ChildLeaf::new(5.0, 1.0),
+        );
+        let arena = CompactForest::from_trees(&[ordinary])
+            .gpu_arena8(|_| false)
+            .expect("an ordinary numeric tree fits the 8-byte arena");
+        assert_eq!(arena.roots, vec![0]);
+        assert_eq!(arena.words.len() / 2, 7, "every node is uploaded");
+
+        let mut nan = RegTree::with_root(1.0);
+        let (l, r) = nan.expand(
+            0,
+            SplitRule::numeric(0, f32::NAN, false),
+            ChildLeaf::new(0.0, 1.0),
+            ChildLeaf::new(1.0, 1.0),
+        );
+        nan.expand(
+            l,
+            SplitRule::numeric(1, 1.0, true),
+            ChildLeaf::new(2.0, 1.0),
+            ChildLeaf::new(3.0, 1.0),
+        );
+        nan.expand(
+            r,
+            SplitRule::numeric(1, 2.0, true),
+            ChildLeaf::new(4.0, 1.0),
+            ChildLeaf::new(5.0, 1.0),
+        );
+        assert!(
+            CompactForest::from_trees(&[nan])
+                .gpu_arena8(|_| false)
+                .is_none(),
+            "a NaN threshold must keep the wide arena"
+        );
+    }
+
     #[test]
     fn keys_order_like_floats_and_isolate_missing() {
         let values = [
@@ -1068,6 +1229,18 @@ mod tests {
                 assert_eq!(key(a) > key(b), a > b, "{a} vs {b}");
                 assert_eq!(key(a) == key(b), a == b, "{a} vs {b}");
             }
+            // The GPU's 8-byte walk stores `unkey`s and compares floats, so
+            // the recovered values must order exactly as the keys do.
+            for &b in &values {
+                assert_eq!(
+                    unkey(key(a)) > unkey(key(b)),
+                    key(a) > key(b),
+                    "{a} vs {b} after unkey"
+                );
+            }
+            // A missing value is unordered against every threshold, so the
+            // walk's `>` takes the left child, exactly as key `0` does.
+            assert!(f32::NAN.partial_cmp(&unkey(key(a))).is_none(), "missing");
             assert!(key(a) > key(f32::NAN), "{a} must key above missing");
             assert!((key(f32::NAN) <= key(a)), "missing never compares greater");
             assert!(unkey(key(a)) == a, "{a} round trip");

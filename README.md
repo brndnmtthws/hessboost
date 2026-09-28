@@ -89,6 +89,17 @@ let result = Trainer::new(&params, &dtrain, 1000)
 let model = result.model; // predicts with the best iteration
 ```
 
+To ship a self-contained (e.g. static) binary, compile the model file into it;
+it decodes on first use:
+
+```rust
+use hessboost::model::EmbeddedModel;
+
+static MODEL: EmbeddedModel = EmbeddedModel::new(include_bytes!("model.bin"), ModelFormat::Binary);
+
+let preds = MODEL.get()?.predict(&dtest, Iterations::Best)?;
+```
+
 Every type and option is in the [API docs](https://docs.rs/hessboost);
 runnable programs live in [`examples/`](examples)
 (`cargo run --release --example <name>`):
@@ -146,7 +157,7 @@ See [`python/README.md`](python/README.md).
   plus typed objective and metric APIs and custom loss hooks.
 - **Validation & workflow:** Cross-validation (including purged and forward time-series folds),
   early stopping, feature importance, SHAP values and interactions, model slicing, and iteration ranges.
-- **Interchange:** Native binary and JSON formats, XGBoost JSON/UBJSON import/export, and LightGBM model import.
+- **Interchange:** Native binary and JSON formats, XGBoost JSON/UBJSON import/export, LightGBM model import, and models embedded in the binary at compile time.
 - **Modern modeling (opt-in):**
   - [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/): Finite-sample coverage guarantees.
   - [Boulevard inference](https://docs.rs/hessboost/latest/hessboost/inference/): Asymptotic confidence and prediction intervals for `f(x)`.

@@ -24,11 +24,12 @@ def trained() -> tuple[Booster, np.ndarray]:
     return booster, x
 
 
-def test_available_reports_a_device_name(trained: tuple[Booster, np.ndarray]) -> None:
+def test_available_reports_a_device_name() -> None:
     assert GpuModel.available() == (GpuModel.device_name() is not None)
     if sys.platform == "darwin" and GpuModel.available():
         assert GpuModel.device_name()
-    trained[0].to_gpu()
+    with pytest.raises(TypeError):
+        GpuModel()
 
 
 @NEEDS_GPU
@@ -45,8 +46,6 @@ def test_gpu_predicts_bit_identically(trained: tuple[Booster, np.ndarray]) -> No
         gpu.predict(x, iteration_range=(0, half)),
         booster.predict(x, iteration_range=(0, half)),
     )
-    with pytest.raises(TypeError):
-        GpuModel()
 
 
 @NEEDS_GPU
@@ -67,12 +66,12 @@ def test_gpu_predict_matches_cpu_on_every_objective() -> None:
         )
 
 
-@NEEDS_GPU
-def test_gpu_refuses_unsupported_models() -> None:
+def test_gpu_refusals_name_the_cause() -> None:
     x, y = regression(rows=100)
     linear = hessboost.train({"booster": "gblinear"}, DMatrix(x, y), 3, verbose_eval=False)
     with pytest.raises(HessboostError):
         linear.to_gpu()
-    tree = hessboost.train({"linear_tree": True}, DMatrix(x, y), 3, verbose_eval=False)
-    with pytest.raises(HessboostError):
-        tree.to_gpu()
+    if GpuModel.available():
+        tree = hessboost.train({"linear_tree": True}, DMatrix(x, y), 3, verbose_eval=False)
+        with pytest.raises(HessboostError):
+            tree.to_gpu()

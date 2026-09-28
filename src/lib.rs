@@ -118,7 +118,8 @@
 //!   ([`ModelFormat::LightgbmText`](model::ModelFormat::LightgbmText); see
 //!   [LightGBM import](model#lightgbm-import)), all through one
 //!   [`ModelFormat`](model::ModelFormat) with byte-level
-//!   [`detect`](model::ModelFormat::detect)ion.
+//!   [`detect`](model::ModelFormat::detect)ion; models compiled into the
+//!   binary with [`EmbeddedModel`](model::EmbeddedModel).
 //! - **Validation:** cross-validation ([`cv`](training::cv)), custom,
 //!   forward-chaining (time-ordered, purged by a row gap), or purged forward
 //!   (timestamped rows, purged by each label window,

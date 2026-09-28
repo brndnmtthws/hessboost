@@ -86,6 +86,9 @@
 //! - **Compact:** [`BoostedModel::to_compact`] builds a bit-packed
 //!   [`CompactModel`](compact::CompactModel) predicting bit-identical margins
 //!   in a fraction of the size; see [`compact`].
+//! - **Embedded:** an [`EmbeddedModel`] in a `static` compiles a model file
+//!   into the program ([`include_bytes!`]) and decodes it on first use, so a
+//!   static binary ships without a model file.
 //!
 //! # LightGBM import
 //!
@@ -345,6 +348,7 @@
 mod categories;
 pub mod compact;
 pub(crate) mod container;
+mod embed;
 mod io;
 mod lightgbm;
 pub(crate) mod native;
@@ -363,6 +367,7 @@ mod xgboost;
 
 pub(crate) use shrinkage::{Shrinkage, shrink_margins};
 
+pub use embed::EmbeddedModel;
 pub use io::ModelFormat;
 pub use objective::ModelObjective;
 pub use predict::Iterations;

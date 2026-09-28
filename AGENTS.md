@@ -10,7 +10,7 @@ at release time.
 ## Toolchain
 
 `mise install` provides the pinned Rust 1.98.1, `mbx` (build cache),
-cargo-nextest, uv, and shellcheck; after changing a version, refresh
+cargo-nextest, uv, shellcheck, and ruff; after changing a version, refresh
 `mise.lock` with `mise lock`. MSRV 1.93. `Cargo.lock` is gitignored: never
 pass `--locked`.
 libzstd needs a C compiler for every build target. docs.rs builds only

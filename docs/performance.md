@@ -724,29 +724,49 @@ general error bounds.
 
 The `metal` feature adds a native Metal backend (`src/backend/metal.rs` has
 the design and determinism contract). **Apple M4 Max** (40-core GPU, 14 CPU
-cores, macOS 26.6.2, Rust 1.98.1, 2026-09-24):
+cores, 16 threads, macOS 27.0, Rust 1.98.1, 2026-09-28):
 
 | Workload | CPU | Metal | Speedup |
 |---|---|---|---|
-| predict, 500k rows × 30 features, 200 depth-8 trees | 31.0 ms | 12.6 ms | **2.5×** |
-| predict, 500k rows × 30 features, 100 depth-6 trees | 12.4 ms | 6–11 ms (thermal-sensitive) | ~1.1–1.8× |
-| hist build, 1M rows × 30 features (root node)\* | 2.0 ms | 11.2 ms | 0.18× |
-| train, 200k × 30, depth 8, 50 rounds\* | 278 ms | 501 ms | 0.56× |
+| predict, 500k rows × 30 features, 200 depth-8 trees | 25.7 ms | 8.0 ms | **3.2×** |
+| train, 200k × 30, depth 8, 50 rounds | 177 ms | 285 ms | 0.62× |
 
-\* Old double-float histogram kernels; the current integer kernels are unmeasured.
+Histogram builds, by node size (the crate's `metal_histogram_build`
+benches, 4 CPU threads against the 40-core GPU):
 
-GPU **prediction** is the win: independent per-row walks, L2-resident
-compact forest, fixed upload cost amortized over bigger batches and
-ensembles (2.5× at 200 trees; larger models widen it).
+| Rows × 30 features | CPU | Metal | Speedup |
+|---|---|---|---|
+| 4M | 6.62 ms | 5.75 ms | **1.15×** |
+| 1M | 1.81 ms | 2.11 ms | 0.86× |
+| 100k | 0.30 ms | 0.54 ms | 0.56× |
 
-GPU **histograms** (`device = metal`) trailed the 14-core CPU path under the
-double-float kernels. Bit-identical training without FP atomics, on GPUs
-without `double`, meant exact two-sum accumulation (~6× the CPU's native
-`f64` adds) with a single-writer-per-bin layout stuck on the scalar path.
-Current kernels sum 64-bit integers (one add per component, 16-byte pairs)
-wherever the CPU's `f64` sums are exact, else CPU fallback. Wider blocks
-and threadgroup-memory loading are the known next steps; tried variants
-(up to 1024 threads, interleaved `uint4`) regressed.
+GPU **prediction** is the win: independent per-row walks over an L2-resident
+compact forest, with each call's fixed row upload amortized over larger
+batches and ensembles (larger models widen the 3.2×). The kernel is bound by
+the cache lines a warp's scattered node loads touch — 32 rows walk different
+nodes at every level — so fewer bytes per node is the lever that pays: a model
+that fits it is uploaded in an 8-byte-per-node encoding (a threshold value
+plus a packed feature/child word) instead of the arena's 16 bytes, and the
+walk then compares floats rather than rebuilding the CPU's monotone key.
+Categorical splits, vector leaves, and multi-output models keep 16 bytes per
+node. Row materialization is at the memory system's limit either way, so a
+call is pipelined in row blocks and one block's upload runs while the GPU
+walks another.
+
+GPU **histograms** (`device = metal`) scatter a node's rows into a
+threadgroup-shared histogram through 32-bit atomics (`hist_scatter_u16`),
+each 64-bit grain count split into exact high and low pieces that the piece
+merge rejoins. Integer addition is order-free, so inside the exactness bound
+this reproduces the CPU's `f64` sums bit for bit; a node whose grain counts
+would overflow the pieces runs the register-bin kernels instead. A build's
+per-row cost is sublinear in the node's rows (a fixed gather-and-merge cost per
+node amortizes over more of them), so the GPU crosses the CPU between 1M and
+4M rows per node: `device = metal` pays for the large nodes of a big dataset
+and trails the CPU below that. A node of at least `CPU_ROWS` (8,192) rows is
+offered to the GPU; smaller nodes, non-finite gradients, and data outside the
+exactness bound run on the CPU. Which threshold minimizes *training* wall time
+is machine- and workload-dependent — a CPU thread has slack while the GPU
+waits — so the constant is a conservative default, not a portable optimum.
 
 Run the Metal benches on a Mac with a Metal device:
 

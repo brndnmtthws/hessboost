@@ -6,23 +6,40 @@
 //!   walks the branch-free compact forest arena on the GPU, one thread per
 //!   row, adding each tree's leaf value in tree order. This is the speed
 //!   win: on an M4 Max, 500k rows through 200 depth-8 trees predict about
-//!   2.5× faster than the CPU walk (100 depth-6 trees: ~1.1–1.8×,
-//!   thermal-sensitive), and the gap widens with more trees and rows (each
-//!   call's fixed row-upload cost amortizes).
+//!   3.2× faster than the CPU walk, and the gap widens with more trees and
+//!   rows (each call's fixed row-upload cost amortizes). A call is pipelined
+//!   in row blocks, so one block's rows upload while the GPU walks another. A
+//!   model that fits it is uploaded in an 8-byte-per-node encoding (a
+//!   threshold value plus a packed feature/child word) instead of the arena's
+//!   16 bytes: prediction is bound by the cache lines a warp's scattered node
+//!   loads touch, and twice as many nodes per line is what that buys. That
+//!   arena also stores each threshold as a float, so the walk compares values
+//!   instead of rebuilding the CPU's monotone key at every node. Categorical
+//!   splits, vector leaves, and multi-output models keep the 16-byte arena.
 //! - **Training** (`device = metal`, see
 //!   [`TrainingParams::device`](crate::config::TrainingParams::device)):
 //!   the histogram construction of `tree_method = hist` moves to the GPU
 //!   for every node it can sum exactly (below), bit-identical to the
-//!   CPU's. It is correct and deterministic everywhere, but on multicore
-//!   Apple Silicon it has been *slower* than the CPU histogram path: with
-//!   the earlier `float` double-float kernels, 1M rows × 30 features took
-//!   ~11 ms on the GPU vs ~2 ms on a 14-core CPU, and end-to-end 200k × 30
-//!   depth-8 training was ~1.8× slower. The current integer kernels do less
-//!   arithmetic per row (one 64-bit add per component, instead of a
-//!   double-float's ~7 `float` operations) but read 16-byte gradient pairs
-//!   instead of 8-byte ones; they have not been re-measured. The
-//!   determinism contract forbids the floating-point atomics other GPU
-//!   histogram implementations use. Set `device = metal` to exercise the
+//!   CPU's. It is correct and deterministic everywhere, but a GPU build pays
+//!   a fixed gather-and-merge cost per node, so on a multicore Apple Silicon
+//!   CPU it wins only for large nodes: on an M4 Max, a 4,000,000-row,
+//!   30-feature histogram takes 5.8 ms against 6.6 ms for the CPU, 1,000,000
+//!   rows 2.1 ms against 1.8 ms, and 100,000 rows 0.54 ms against 0.30 ms;
+//!   200k × 30 depth-8 training takes 285 ms against 177 ms, its nodes
+//!   sitting below that crossover. A node of at least `CPU_ROWS` (8,192)
+//!   rows is offered to the GPU; where that threshold belongs is machine- and
+//!   workload-dependent (a CPU thread has slack while the GPU waits), so it
+//!   is a conservative default rather than a portable optimum.
+//!
+//!   The scan is a scatter (the `hist_scatter_u16` kernel): one thread per row,
+//!   summing into a threadgroup-shared histogram through 32-bit atomics
+//!   (Metal has no 64-bit ones), each 64-bit grain count split into high and
+//!   low pieces that the piece merge rejoins exactly. Integer addition
+//!   is order-free, so inside the exactness domain this reproduces the CPU's
+//!   `f64` sums bit for bit; a node whose grain counts would overflow the
+//!   pieces (or an index without the feature-major store the scatter reads)
+//!   runs the register-bin kernels instead. The determinism contract still
+//!   forbids floating-point atomics. Set `device = metal` to exercise the
 //!   GPU path; for speed, keep training on the CPU and use
 //!   [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu) for prediction.
 //!
@@ -124,23 +141,39 @@ const ROW_SLICES: usize = 64;
 /// Nodes below this many rows run on the CPU backend: the kernel dispatch
 /// and readback cost more than the scan.
 const CPU_ROWS: usize = 8_192;
-/// Threads of one histogram threadgroup per feature: 64 threads times 4
+/// Threads of one histogram threadgroup per feature: 32 threads times 8
 /// register bins cover a feature's whole 256-bin window, so a group covers
-/// every bin of each of its features.
-const THREADS_PER_FEATURE: usize = 64;
+/// every bin of each of its features. The lanes that walk every row of a
+/// slice limit the scan, so fewer, wider per-thread register bins win
+/// (measured on M4 Max: a 200k-row, 30-feature build takes 2.0 ms at 32
+/// threads x 8 bins, 2.4 ms at 64 x 4, and more at 16 bins per thread).
+const THREADS_PER_FEATURE: usize = 32;
 /// Features packed into one interleaved column record.
 const RECORD_FEATURES: usize = 8;
 /// Largest feature count one threadgroup covers (1024 threads, the Metal
 /// per-threadgroup ceiling).
 const MAX_GROUP_FEATURES: usize = 16;
 /// Bins owned by one histogram thread, held in registers.
-const BINS_PER_THREAD: usize = 4;
+const BINS_PER_THREAD: usize = 8;
 /// Bins of one feature covered by a threadgroup's window.
 const WINDOW_BINS: usize = THREADS_PER_FEATURE * BINS_PER_THREAD;
 /// Threads per merge threadgroup (one bin per thread).
 const MERGE_THREADS: usize = 64;
+/// Threads per scatter threadgroup: one thread per row of the slice, summing
+/// into the threadgroup's shared histogram (one 256-bin feature window).
+const SCATTER_THREADS: usize = 256;
 /// Threads per prediction threadgroup (rows are independent).
 const PREDICT_THREADS: usize = 256;
+/// Rows per prediction block: a call is split into blocks this size (at most
+/// [`PREDICT_BLOCKS_MAX`] of them) so the row upload of one block overlaps
+/// the GPU walking another. Blocks are large because a dispatch costs
+/// ~90 us before its threads run (measured), so fewer of them keeps the GPU
+/// busier: on an M4 Max, 500k rows measure 7.99 ms unsplit and 7.2 ms in 2
+/// blocks.
+const PREDICT_BLOCK_ROWS: usize = 262_144;
+/// Largest number of prediction blocks. The pipeline needs two row buffers
+/// (one per block in flight), not one per block.
+const PREDICT_BLOCKS_MAX: usize = 4;
 /// Upper bound on GPU buffer sizes (entries), keeping index math in `u32`.
 const MAX_BUFFER_ENTRIES: usize = 1 << 30;
 
@@ -185,22 +218,34 @@ using namespace metal;
 
 // Accumulate one row's gradient pair (in grains) into this thread's bin
 // registers: `wl` is the row's bin offset within this thread's window,
-// `gh` its gradient pair. The owner check and the four-way register select
+// `gh` its gradient pair. The owner check and the eight-way register select
 // stay branch-predicated; `j`, `n_win`, and `win_base` are thread-uniform.
 #define ACC_BIN(wl_, gh) { \
-    if ((wl_) >= 0 && (uint)(wl_) < n_win && (uint)((wl_) >> 2) == j) { \
-        if (((wl_) & 3) == 0) { \
+    if ((wl_) >= 0 && (uint)(wl_) < n_win && (uint)((wl_) >> 3) == j) { \
+        if (((wl_) & 7) == 0) { \
             g0 += (gh).x; \
             h0 += (gh).y; \
-        } else if (((wl_) & 3) == 1) { \
+        } else if (((wl_) & 7) == 1) { \
             g1 += (gh).x; \
             h1 += (gh).y; \
-        } else if (((wl_) & 3) == 2) { \
+        } else if (((wl_) & 7) == 2) { \
             g2 += (gh).x; \
             h2 += (gh).y; \
-        } else { \
+        } else if (((wl_) & 7) == 3) { \
             g3 += (gh).x; \
             h3 += (gh).y; \
+        } else if (((wl_) & 7) == 4) { \
+            g4 += (gh).x; \
+            h4 += (gh).y; \
+        } else if (((wl_) & 7) == 5) { \
+            g5 += (gh).x; \
+            h5 += (gh).y; \
+        } else if (((wl_) & 7) == 6) { \
+            g6 += (gh).x; \
+            h6 += (gh).y; \
+        } else { \
+            g7 += (gh).x; \
+            h7 += (gh).y; \
         } \
     } \
 }
@@ -240,6 +285,124 @@ struct HistRun {
 // one 16-byte word per (row, block), so a row step costs one uniform load
 // for the row id, one for the word, and one for the gradient pair —
 // amortized across the block's 8 features.
+// One thread per entry of the node's row listing: `out[i] = gpair[rows[i]]`.
+// The scatter kernel then reads the pairs sequentially instead of by row
+// id, which turns one scattered 16-byte read per (row, feature) into one
+// scattered read per row.
+struct GatherArgs { uint n; };
+
+kernel void hist_gather(
+    const device uint* rows [[buffer(0)]],
+    const device long2* gpair [[buffer(1)]],
+    device long2* out [[buffer(2)]],
+    constant GatherArgs& a [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= a.n) { return; }
+    out[i] = gpair[rows[i]];
+}
+
+// The scatter scan: one threadgroup per (feature, 256-bin window) like
+// `hist_scan_u16`, but each thread takes whole rows instead of owning bins,
+// and sums them into a threadgroup-shared histogram. A row's bin is read
+// from the index's feature-major `u16` store, so a warp's reads are
+// coalesced whenever the node's row listing is (it is a contiguous range at
+// the top of a tree, and never worse than the register kernel's per-window
+// scan otherwise); the gradient pairs come from `hist_gather`'s compacted
+// array, read in listing order.
+//
+// Shared atomics are 32-bit, so each 64-bit grain count is split as
+// `k = hi * 2^16 + lo` with `lo` in `[0, 2^16)` and the pieces accumulated
+// in separate counters. Integer addition is order-free, so the histogram is
+// the same one the CPU's `f64` chain and the register kernels produce, as
+// long as each threadgroup's piece sums stay inside their counters — the
+// host gates a node on that (`scatter_row_bound`) and runs the CPU backend
+// otherwise.
+struct ScatterArgs {
+    uint chunk_rows;   // rows in this chunk
+    uint chunk_index;
+    uint slices;
+    uint total_bins;
+    uint n_rows;       // dataset rows: the feature-major store's stride
+};
+
+kernel void hist_scatter_u16(
+    const device ushort* bins [[buffer(0)]],
+    const device uint* rows [[buffer(1)]],
+    const device long2* grad [[buffer(2)]],
+    const device BlockInfo* blocks [[buffer(3)]],
+    const device ScanGroup* groups [[buffer(4)]],
+    device int4* partials [[buffer(5)]],
+    constant ScatterArgs& chunk [[buffer(6)]],
+    uint2 gpos [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    // One feature per threadgroup (see `features_per_group`).
+    ScanGroup sg = groups[gpos.x];
+    uint feature = sg.block;
+    uint fs = blocks[feature].fs[0];
+    uint nbins = blocks[feature].nbins[0];
+    uint win_base = fs + sg.window_base;
+    uint n_win = (nbins > sg.window_base)
+        ? min(256u, nbins - sg.window_base)
+        : 0u;
+    threadgroup atomic_uint hist[256u * 4u];
+    for (uint i = tid; i < 256u * 4u; i += 256u) {
+        atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const device ushort* column = bins + (size_t)feature * chunk.n_rows;
+    uint slice_len = (chunk.chunk_rows + chunk.slices - 1u) / chunk.slices;
+    uint slice_begin = gpos.y * slice_len;
+    uint slice_rows = (slice_begin < chunk.chunk_rows)
+        ? min(slice_len, chunk.chunk_rows - slice_begin)
+        : 0u;
+    for (uint i = tid; i < slice_rows; i += 256u) {
+        // A missing entry's sentinel and a bin outside this window both leave
+        // the range below (the sentinel is `u16::MAX`, far past `win_base`).
+        uint w = (uint)column[rows[slice_begin + i]] - win_base;
+        if (w >= n_win) { continue; }
+        long2 q = grad[slice_begin + i];
+        atomic_fetch_add_explicit(&hist[w * 4u + 0u], (uint)((long)q.x >> 16), memory_order_relaxed);
+        atomic_fetch_add_explicit(&hist[w * 4u + 1u], (uint)((ulong)q.x & 0xFFFFul), memory_order_relaxed);
+        atomic_fetch_add_explicit(&hist[w * 4u + 2u], (uint)((long)q.y >> 16), memory_order_relaxed);
+        atomic_fetch_add_explicit(&hist[w * 4u + 3u], (uint)((ulong)q.y & 0xFFFFul), memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device int4* out = partials + (size_t)(chunk.chunk_index * chunk.slices + gpos.y) * chunk.total_bins;
+    for (uint b = tid; b < n_win; b += 256u) {
+        out[win_base + b] = int4(
+            (int)atomic_load_explicit(&hist[b * 4u + 0u], memory_order_relaxed),
+            (int)atomic_load_explicit(&hist[b * 4u + 1u], memory_order_relaxed),
+            (int)atomic_load_explicit(&hist[b * 4u + 2u], memory_order_relaxed),
+            (int)atomic_load_explicit(&hist[b * 4u + 3u], memory_order_relaxed));
+    }
+}
+
+// Merge the scatter kernel's (high, low) piece partials of every bin: the
+// pieces are exact integers, so any order gives the bin's total.
+struct PiecesArgs { uint n_partials; uint total_bins; };
+
+kernel void hist_merge_pieces(
+    const device int4* partials [[buffer(0)]],
+    device long2* hist [[buffer(1)]],
+    constant PiecesArgs& merge [[buffer(2)]],
+    uint b [[thread_position_in_grid]])
+{
+    if (b >= merge.total_bins) { return; }
+    long g_hi = 0, g_lo = 0, h_hi = 0, h_lo = 0;
+    for (uint c = 0; c < merge.n_partials; c++) {
+        int4 p = partials[(size_t)c * merge.total_bins + b];
+        // The high pieces are signed, the low ones unsigned (they add up
+        // below `2^32` by the host's row bound).
+        g_hi += (long)p.x;
+        g_lo += (long)(uint)p.y;
+        h_hi += (long)p.z;
+        h_lo += (long)(uint)p.w;
+    }
+    hist[b] = long2(g_hi * 65536L + g_lo, h_hi * 65536L + h_lo);
+}
+
 kernel void hist_scan_u16(
     const device uint* rows [[buffer(0)]],
     const device uint4* columns [[buffer(1)]],
@@ -253,13 +416,13 @@ kernel void hist_scan_u16(
     uint tid [[thread_index_in_threadgroup]])
 {
     ScanGroup sg = groups[gpos.x];
-    // Thread `tid` covers feature `tid / 64` of the block and bin quarter
-    // `(tid % 64) * 4`: 64 threads times 4 register bins cover a whole
+    // Thread `tid` covers feature `tid / 32` of the block and bin eighth
+    // `(tid % 32) * 8`: 32 threads times 8 register bins cover a whole
     // 256-bin window of one feature, so one group covers every bin of its
     // `features_per_group` features and the row ids and gradient pairs load
     // once per group instead of once per feature.
-    uint f = tid / 64u;
-    uint j = tid % 64u;
+    uint f = tid / 32u;
+    uint j = tid % 32u;
     uint my_feature = sg.block * run.features_per_group + f;
     uint record = my_feature >> 3;
     uint word = (my_feature & 7u) >> 1;
@@ -280,46 +443,33 @@ kernel void hist_scan_u16(
     uint slice_rows = (slice_begin < chunk.chunk_rows)
         ? min(slice_len, chunk.chunk_rows - slice_begin)
         : 0u;
-    long g0 = 0, g1 = 0, g2 = 0, g3 = 0;
-    long h0 = 0, h1 = 0, h2 = 0, h3 = 0;
-    // Batches of 8: the row ids load together, then the column words and
+    long g0 = 0, g1 = 0, g2 = 0, g3 = 0, g4 = 0, g5 = 0, g6 = 0, g7 = 0;
+    long h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0, h5 = 0, h6 = 0, h7 = 0;
+    // Batches of 4: the row ids load together, then the column words and
     // gradient pairs, so the dependent uniform loads pipeline across the
-    // batch. The accumulation order per bin is unchanged (ascending rows
-    // within the slice).
+    // batch. (Four, not eight: with the 8-bin registers below, a batch of
+    // eight needs more live values than the register file has room for, and
+    // the spills measured slower than the pipelining saved.) The
+    // accumulation order per bin is unchanged (ascending rows within the
+    // slice).
     uint i = 0;
-    for (; i + 8 <= slice_rows; i += 8) {
+    for (; i + 4 <= slice_rows; i += 4) {
         uint r0 = rows[slice_begin + i + 0];
         uint r1 = rows[slice_begin + i + 1];
         uint r2 = rows[slice_begin + i + 2];
         uint r3 = rows[slice_begin + i + 3];
-        uint r4 = rows[slice_begin + i + 4];
-        uint r5 = rows[slice_begin + i + 5];
-        uint r6 = rows[slice_begin + i + 6];
-        uint r7 = rows[slice_begin + i + 7];
         uint4 c0 = columns[(size_t)r0 * run.n_records + record];
         uint4 c1 = columns[(size_t)r1 * run.n_records + record];
         uint4 c2 = columns[(size_t)r2 * run.n_records + record];
         uint4 c3 = columns[(size_t)r3 * run.n_records + record];
-        uint4 c4 = columns[(size_t)r4 * run.n_records + record];
-        uint4 c5 = columns[(size_t)r5 * run.n_records + record];
-        uint4 c6 = columns[(size_t)r6 * run.n_records + record];
-        uint4 c7 = columns[(size_t)r7 * run.n_records + record];
         long2 q0 = gpair[r0];
         long2 q1 = gpair[r1];
         long2 q2 = gpair[r2];
         long2 q3 = gpair[r3];
-        long2 q4 = gpair[r4];
-        long2 q5 = gpair[r5];
-        long2 q6 = gpair[r6];
-        long2 q7 = gpair[r7];
         ACC_BIN((int)((c0[word] >> shift) & 0xFFFFu) - (int)win_base, q0)
         ACC_BIN((int)((c1[word] >> shift) & 0xFFFFu) - (int)win_base, q1)
         ACC_BIN((int)((c2[word] >> shift) & 0xFFFFu) - (int)win_base, q2)
         ACC_BIN((int)((c3[word] >> shift) & 0xFFFFu) - (int)win_base, q3)
-        ACC_BIN((int)((c4[word] >> shift) & 0xFFFFu) - (int)win_base, q4)
-        ACC_BIN((int)((c5[word] >> shift) & 0xFFFFu) - (int)win_base, q5)
-        ACC_BIN((int)((c6[word] >> shift) & 0xFFFFu) - (int)win_base, q6)
-        ACC_BIN((int)((c7[word] >> shift) & 0xFFFFu) - (int)win_base, q7)
     }
     for (; i < slice_rows; i++) {
         uint r = rows[slice_begin + i];
@@ -328,11 +478,15 @@ kernel void hist_scan_u16(
         ACC_BIN((int)((c[word] >> shift) & 0xFFFFu) - (int)win_base, gh)
     }
     device long2* out = partials + (size_t)(chunk.chunk_index * chunk.slices + gpos.y) * run.total_bins;
-    uint base = win_base + j * 4;
-    if (j * 4 + 0 < n_win) { out[base + 0] = long2(g0, h0); }
-    if (j * 4 + 1 < n_win) { out[base + 1] = long2(g1, h1); }
-    if (j * 4 + 2 < n_win) { out[base + 2] = long2(g2, h2); }
-    if (j * 4 + 3 < n_win) { out[base + 3] = long2(g3, h3); }
+    uint base = win_base + j * 8u;
+    if (j * 8u + 0u < n_win) { out[base + 0u] = long2(g0, h0); }
+    if (j * 8u + 1u < n_win) { out[base + 1u] = long2(g1, h1); }
+    if (j * 8u + 2u < n_win) { out[base + 2u] = long2(g2, h2); }
+    if (j * 8u + 3u < n_win) { out[base + 3u] = long2(g3, h3); }
+    if (j * 8u + 4u < n_win) { out[base + 4u] = long2(g4, h4); }
+    if (j * 8u + 5u < n_win) { out[base + 5u] = long2(g5, h5); }
+    if (j * 8u + 6u < n_win) { out[base + 6u] = long2(g6, h6); }
+    if (j * 8u + 7u < n_win) { out[base + 7u] = long2(g7, h7); }
 }
 
 // The wide-bin variant (more than 65,536 total bins, or a sparse dataset
@@ -352,8 +506,8 @@ kernel void hist_scan_u32(
 {
     ScanGroup sg = groups[gpos.x];
     // See hist_scan_u16 for the thread mapping.
-    uint f = tid / 64u;
-    uint j = tid % 64u;
+    uint f = tid / 32u;
+    uint j = tid % 32u;
     uint my_feature = sg.block * run.features_per_group + f;
     uint record = my_feature >> 3;
     uint slot = my_feature & 7u;
@@ -369,43 +523,29 @@ kernel void hist_scan_u32(
     uint slice_rows = (slice_begin < chunk.chunk_rows)
         ? min(slice_len, chunk.chunk_rows - slice_begin)
         : 0u;
-    long g0 = 0, g1 = 0, g2 = 0, g3 = 0;
-    long h0 = 0, h1 = 0, h2 = 0, h3 = 0;
+    long g0 = 0, g1 = 0, g2 = 0, g3 = 0, g4 = 0, g5 = 0, g6 = 0, g7 = 0;
+    long h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0, h5 = 0, h6 = 0, h7 = 0;
     uint stride = run.n_records * 8u;
+    // See hist_scan_u16: batches of four keep the register pressure within
+    // the register file.
     uint i = 0;
-    for (; i + 8 <= slice_rows; i += 8) {
+    for (; i + 4 <= slice_rows; i += 4) {
         uint r0 = rows[slice_begin + i + 0];
         uint r1 = rows[slice_begin + i + 1];
         uint r2 = rows[slice_begin + i + 2];
         uint r3 = rows[slice_begin + i + 3];
-        uint r4 = rows[slice_begin + i + 4];
-        uint r5 = rows[slice_begin + i + 5];
-        uint r6 = rows[slice_begin + i + 6];
-        uint r7 = rows[slice_begin + i + 7];
         uint b0 = columns[(size_t)r0 * stride + record * 8u + slot];
         uint b1 = columns[(size_t)r1 * stride + record * 8u + slot];
         uint b2 = columns[(size_t)r2 * stride + record * 8u + slot];
         uint b3 = columns[(size_t)r3 * stride + record * 8u + slot];
-        uint b4 = columns[(size_t)r4 * stride + record * 8u + slot];
-        uint b5 = columns[(size_t)r5 * stride + record * 8u + slot];
-        uint b6 = columns[(size_t)r6 * stride + record * 8u + slot];
-        uint b7 = columns[(size_t)r7 * stride + record * 8u + slot];
         long2 q0 = gpair[r0];
         long2 q1 = gpair[r1];
         long2 q2 = gpair[r2];
         long2 q3 = gpair[r3];
-        long2 q4 = gpair[r4];
-        long2 q5 = gpair[r5];
-        long2 q6 = gpair[r6];
-        long2 q7 = gpair[r7];
         ACC_BIN((int)b0 - (int)win_base, q0)
         ACC_BIN((int)b1 - (int)win_base, q1)
         ACC_BIN((int)b2 - (int)win_base, q2)
         ACC_BIN((int)b3 - (int)win_base, q3)
-        ACC_BIN((int)b4 - (int)win_base, q4)
-        ACC_BIN((int)b5 - (int)win_base, q5)
-        ACC_BIN((int)b6 - (int)win_base, q6)
-        ACC_BIN((int)b7 - (int)win_base, q7)
     }
     for (; i < slice_rows; i++) {
         uint r = rows[slice_begin + i];
@@ -414,11 +554,15 @@ kernel void hist_scan_u32(
         ACC_BIN((int)b - (int)win_base, gh)
     }
     device long2* out = partials + (size_t)(chunk.chunk_index * chunk.slices + gpos.y) * run.total_bins;
-    uint base = win_base + j * 4;
-    if (j * 4 + 0 < n_win) { out[base + 0] = long2(g0, h0); }
-    if (j * 4 + 1 < n_win) { out[base + 1] = long2(g1, h1); }
-    if (j * 4 + 2 < n_win) { out[base + 2] = long2(g2, h2); }
-    if (j * 4 + 3 < n_win) { out[base + 3] = long2(g3, h3); }
+    uint base = win_base + j * 8u;
+    if (j * 8u + 0u < n_win) { out[base + 0u] = long2(g0, h0); }
+    if (j * 8u + 1u < n_win) { out[base + 1u] = long2(g1, h1); }
+    if (j * 8u + 2u < n_win) { out[base + 2u] = long2(g2, h2); }
+    if (j * 8u + 3u < n_win) { out[base + 3u] = long2(g3, h3); }
+    if (j * 8u + 4u < n_win) { out[base + 4u] = long2(g4, h4); }
+    if (j * 8u + 5u < n_win) { out[base + 5u] = long2(g5, h5); }
+    if (j * 8u + 6u < n_win) { out[base + 6u] = long2(g6, h6); }
+    if (j * 8u + 7u < n_win) { out[base + 7u] = long2(g7, h7); }
 }
 
 // Merge the slice partials of every bin. Integer adds: exact, so the
@@ -477,6 +621,48 @@ inline bool cat_in_set(
 // Single-output models keep the running margin in a register (the adds are
 // the same sequence, just without the per-tree global round trip);
 // multi-output models read-modify-write their slot per tree.
+// One tree's dispatch record in the 8-byte arena (`tree::compact::GpuArena8`).
+struct PTree8 { uint root; float weight; };
+struct PredictArgs8 { uint n_rows; uint n_cols; uint tree_begin; uint tree_end; };
+
+// The compact-forest walk over the 8-byte node arena: two `u32`s per node,
+// `key` (the threshold key, or the leaf value's bits) and
+// `packed = child | feature << 15 | MIRRORED | LEAF`. Half the bytes per
+// node means 16 nodes share a cache line instead of 8, which is what the
+// scattered node loads of a warp are bound by. The arithmetic per node is
+// the same as `forest_predict`'s, in the same order, so the margins are the
+// same bit for bit; the single-output, scalar-leaf models it covers are the
+// ones whose walk needs nothing else.
+kernel void forest_predict8(
+    const device uint2* nodes [[buffer(0)]],
+    const device PTree8* trees [[buffer(1)]],
+    const device float* rows [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant PredictArgs8& a [[buffer(4)]],
+    uint r [[thread_position_in_grid]])
+{
+    if (r >= a.n_rows) { return; }
+    const device float* row = rows + (size_t)r * a.n_cols;
+    float acc = out[r];
+    for (uint t = a.tree_begin; t < a.tree_end; t++) {
+        uint base = trees[t].root;
+        uint nid = 0u;
+        uint2 n = nodes[base];
+        while ((n.y & 0x80000000u) == 0u) {
+            float v = row[(n.y >> 15) & 0x7FFFu];
+            // A mirrored node compares the negated value, and `n.x` holds the
+            // threshold itself, so the compare is a float compare: the same
+            // order the CPU's monotone keys give, including for `±0.0` (equal
+            // either way) and a missing `NaN` (false, so the left child).
+            if (n.y & 0x40000000u) { v = -v; }
+            nid = (n.y & 0x7FFFu) + (v > as_type<float>(n.x) ? 1u : 0u);
+            n = nodes[(size_t)base + nid];
+        }
+        acc += trees[t].weight * as_type<float>(n.x);
+    }
+    out[r] = acc;
+}
+
 kernel void forest_predict(
     const device uint4* nodes [[buffer(0)]],
     const device uint* categories [[buffer(1)]],
@@ -649,10 +835,14 @@ unsafe fn as_bytes<T>(v: &[T]) -> &[u8] {
 struct MetalContext {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    hist_gather: Pipeline,
+    hist_scatter_u16: Pipeline,
+    hist_merge_pieces: Pipeline,
     hist_u16: Pipeline,
     hist_u32: Pipeline,
     hist_merge: Pipeline,
     forest_predict: Pipeline,
+    forest_predict8: Pipeline,
     device_name: String,
 }
 
@@ -710,10 +900,14 @@ impl MetalContext {
                 .map_err(|e| format!("building the `{name}` pipeline failed: {e}"))
         };
         Ok(MetalContext {
+            hist_gather: pipeline("hist_gather")?,
+            hist_scatter_u16: pipeline("hist_scatter_u16")?,
+            hist_merge_pieces: pipeline("hist_merge_pieces")?,
             hist_u16: pipeline("hist_scan_u16")?,
             hist_u32: pipeline("hist_scan_u32")?,
             hist_merge: pipeline("hist_merge")?,
             forest_predict: pipeline("forest_predict")?,
+            forest_predict8: pipeline("forest_predict8")?,
             device_name: device.name().to_string(),
             device,
             queue,
@@ -735,6 +929,11 @@ impl MetalContext {
 /// no longer touches the buffers it referenced when this returns.
 fn submit(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
     cb.commit();
+    completed(cb)
+}
+
+/// Wait for an already committed `cb` to finish and check that it did.
+fn completed(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
     cb.waitUntilCompleted();
     let status = cb.status();
     if status == MTLCommandBufferStatus::Completed {
@@ -823,6 +1022,43 @@ impl StagedGradients {
     }
 }
 
+/// Which scan kernels a node's histogram is built with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// [`hist_scatter_u16`]: the index's feature-major `u16` store, one row
+    /// per thread, summed into shared 32-bit accumulators.
+    Scatter,
+    /// [`hist_scan_u16`]: the interleaved `u16` record, one bin per register.
+    Packed,
+    /// [`hist_scan_u32`]: the interleaved `u32` record, one bin per register.
+    Wide,
+}
+
+/// Rows one threadgroup scans: a node's chunk is split into this many slices,
+/// and the bound below only has to admit that many.
+const ROWS_PER_SLICE: usize = CHUNK_ROWS / ROW_SLICES;
+
+/// Rows one threadgroup may scan with the scatter kernel's shared 32-bit
+/// accumulators, given the staged slices' magnitude statistics: a grain count
+/// `k` is split as `k = hi * 2^16 + lo`, so one threadgroup's `hi` sum must
+/// stay inside an `i32` (`lo` is 16-bit each and sums inside a `u32`). The
+/// bound is at least [`SCATTER_MIN_ROWS`] for any slice whose values allow
+/// the GPU at all; past it the node runs on the CPU backend, whose sums are
+/// exact by the same argument (see `backend::exact_sum`).
+fn scatter_row_bound(grad: &SumDomain, hess: &SumDomain) -> usize {
+    let bound = |domain: &SumDomain| -> u64 {
+        let max = domain.max_units();
+        if max == 0 {
+            return u64::from(u32::MAX);
+        }
+        let hi = max.div_ceil(1 << 16);
+        // Both accumulators stay exact: `hi` in an `i32`, `lo` in a `u32`
+        // (the largest 16-bit sum, 65535 per row).
+        (((1u64 << 31) - 1) / hi).min((u64::from(u32::MAX) - 1) / 65_535)
+    };
+    usize::try_from(bound(grad).min(bound(hess))).unwrap_or(usize::MAX)
+}
+
 /// Per-call GPU buffers of the histogram backend, pooled across the parallel
 /// node builds of a training run. Each concurrent `build` owns one set.
 struct CallBuffers {
@@ -871,6 +1107,14 @@ pub struct MetalHistBackend {
     /// data, or sparse data with a spare `u16` sentinel); `false` for eight
     /// `u32` bins (wider bin counts).
     columns_u16: bool,
+    /// The index's feature-major `u16` bin store (feature `f` of row `r` at
+    /// `f * n_rows + r`), which the scatter kernel reads directly. `None`
+    /// when the index has no such store (or its bins need `u32`), and the
+    /// register kernels serve the node instead.
+    feature_bins: Option<GpuBuffer>,
+    /// The node's gradient pairs compacted into listing order by
+    /// [`hist_gather`], sized for the largest node.
+    gathered: GpuBuffer,
     /// The interleaved column store: one record per (row, feature block).
     columns: GpuBuffer,
     blocks_bytes: GpuBuffer,
@@ -926,14 +1170,27 @@ impl MetalHistBackend {
             None => u16::try_from(total_bins).is_ok(),
         };
         let columns = interleaved_columns(&ctx.device, index, columns_u16, n_records)?;
-        // Feature blocks per threadgroup. Measured on Apple Silicon (with
-        // the earlier `float` kernels): one feature per 64-thread group (a
-        // whole 256-bin window) beats every wider block — the interleaved
-        // record load costs more than the row/gradient amortization saves,
-        // and 512+-thread groups lose occupancy to register pressure. The
-        // integer sums make the choice a pure tuning knob. Wider blocks are
-        // a tuning direction if the scan kernels are reworked around the
-        // scalar-load path.
+        // The scatter kernel needs no interleaved copy at all: it reads the
+        // feature-major store the index already keeps, when that store is
+        // `u16` (the dense one, or the one with the missing-value sentinel).
+        let feature_bins = match index.column_bins().or_else(|| index.missing_columns()) {
+            Some(Bins::U16(bins)) => {
+                let buffer = GpuBuffer::new(&ctx.device, bins.len() * 2)?;
+                // SAFETY: the buffer was just allocated and is not yet
+                // shared; its length covers `bins`.
+                unsafe { buffer.write(0, as_bytes(bins))? };
+                Some(buffer)
+            }
+            _ => None,
+        };
+        let gathered = GpuBuffer::new(&ctx.device, n_rows * 16)?;
+        // Feature blocks per threadgroup. Measured on Apple Silicon: one
+        // feature per threadgroup (a whole 256-bin window) beats every wider
+        // block — the interleaved record load costs more than the
+        // row/gradient amortization saves, and 512+-thread groups lose
+        // occupancy to register pressure. 2 and 4 features per group are
+        // within noise of 1 (a 200k-row, 30-feature build: 1.98 ms, 1.98 ms,
+        // 2.05 ms).
         let features_per_group = 1;
         let threads_per_group = features_per_group * THREADS_PER_FEATURE;
         // Per-block bin ranges, and one group per (block, 256-bin window);
@@ -987,6 +1244,8 @@ impl MetalHistBackend {
         let gpair = GpuBuffer::new(&ctx.device, n_rows * 16)?;
         Ok(MetalHistBackend {
             ctx,
+            feature_bins,
+            gathered,
             columns_u16,
             columns,
             blocks_bytes,
@@ -1029,8 +1288,8 @@ impl MetalHistBackend {
         if gpair.len() != self.n_rows {
             return;
         }
-        let grad = SumDomain::of(gpair.iter().map(|p| p.grad));
-        let hess = SumDomain::of(gpair.iter().map(|p| p.hess));
+        let grad = SumDomain::of_slice(gpair, |p| p.grad);
+        let hess = SumDomain::of_slice(gpair, |p| p.hess);
         // SAFETY: the write lock excludes every GPU build (each holds a
         // read guard until its command buffer has completed), so no GPU work
         // reads the buffer and nothing else aliases it; `[i64; 2]` is plain
@@ -1122,12 +1381,166 @@ impl MetalHistBackend {
         if !staged.sums_exact(rows.len()) {
             return false;
         }
+        // The scatter kernel needs the index's feature-major `u16` store, and
+        // its 32-bit shared accumulators only stay exact while a
+        // threadgroup's rows fit `scatter_row_bound`; anything else takes the
+        // register kernels.
+        let scan = match &self.feature_bins {
+            Some(_) if scatter_row_bound(&staged.grad, &staged.hess) >= ROWS_PER_SLICE => {
+                Scan::Scatter
+            }
+            _ if self.columns_u16 => Scan::Packed,
+            _ => Scan::Wide,
+        };
         let Ok(call) = self.checkout() else {
             return false;
         };
-        let result = self.dispatch(&call, &staged, rows, out);
+        let result = self.dispatch(&call, &staged, rows, scan, out);
         self.checkin(call);
         result.is_ok()
+    }
+
+    /// Encode, run, and read back the scatter path of `rows` over the staged
+    /// `gradients`: one gather pass into listing order, one scatter per chunk,
+    /// and the piece merge. `try_gpu` has checked the inputs, the feature-major
+    /// store's presence, and the accumulator bound.
+    fn dispatch_scatter(
+        &self,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        call: &CallBuffers,
+        gradients: &StagedGradients,
+        rows: &[u32],
+        out: &mut [GradStats],
+    ) -> Result<()> {
+        let bins = self.feature_bins.as_ref().ok_or_else(|| {
+            HessboostError::gpu("the scatter kernel needs the feature-major store")
+        })?;
+        // SAFETY: this call exclusively owns `call` (checked out of the pool),
+        // and nothing has been dispatched on it yet.
+        unsafe { call.rows.write(0, as_bytes(rows))? };
+        let chunks = rows.len().div_ceil(CHUNK_ROWS);
+        // SAFETY: the encoders below run after the writes above (encoders of
+        // one command buffer are ordered), the argument blocks are live
+        // plain-data locals outliving them, and every access is in bounds:
+        // `rows` holds `rows.len() <= n_rows` ids below `n_rows` (the
+        // feature-major store's rows and the compacted pair array's length),
+        // and the partials of `chunks <= ceil(n_rows / CHUNK_ROWS)` chunks
+        // fit the pool's buffer.
+        unsafe {
+            let enc = cb
+                .computeCommandEncoder()
+                .ok_or_else(|| HessboostError::gpu("encoder creation failed"))?;
+            enc.setComputePipelineState(&self.ctx.hist_gather.0);
+            enc.setBuffer_offset_atIndex(Some(&call.rows.0), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&gradients.buffer.0), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&self.gathered.0), 0, 2);
+            let gather = GatherArgs {
+                n: rows.len() as u32,
+            };
+            enc.setBytes_length_atIndex(
+                NonNull::from(&gather).cast(),
+                std::mem::size_of::<GatherArgs>(),
+                3,
+            );
+            enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: rows.len(),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: MERGE_THREADS * 4,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.endEncoding();
+        }
+        for c in 0..chunks {
+            let begin = c * CHUNK_ROWS;
+            let chunk_rows = (rows.len() - begin).min(CHUNK_ROWS);
+            let args = ScatterArgs {
+                chunk_rows: chunk_rows as u32,
+                chunk_index: c as u32,
+                slices: ROW_SLICES as u32,
+                total_bins: self.total_bins as u32,
+                n_rows: self.n_rows as u32,
+            };
+            // SAFETY: see above; the row offset lies within the rows buffer,
+            // and the gather wrote one pair per listing position.
+            unsafe {
+                let enc = cb
+                    .computeCommandEncoder()
+                    .ok_or_else(|| HessboostError::gpu("encoder creation failed"))?;
+                enc.setComputePipelineState(&self.ctx.hist_scatter_u16.0);
+                enc.setBuffer_offset_atIndex(Some(&bins.0), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&call.rows.0), begin * 4, 1);
+                enc.setBuffer_offset_atIndex(Some(&self.gathered.0), begin * 16, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.blocks_bytes.0), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&self.groups_bytes.0), 0, 4);
+                enc.setBuffer_offset_atIndex(Some(&call.partials.0), 0, 5);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&args).cast(),
+                    std::mem::size_of::<ScatterArgs>(),
+                    6,
+                );
+                let grid = MTLSize {
+                    width: self.groups.len(),
+                    height: ROW_SLICES,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: SCATTER_THREADS,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+                enc.endEncoding();
+            }
+        }
+        // SAFETY: encoders of one command buffer run in order, so the merge
+        // reads complete partials; its `total_bins` threads index both
+        // buffers within their sizes.
+        unsafe {
+            let enc = cb
+                .computeCommandEncoder()
+                .ok_or_else(|| HessboostError::gpu("encoder creation failed"))?;
+            enc.setComputePipelineState(&self.ctx.hist_merge_pieces.0);
+            enc.setBuffer_offset_atIndex(Some(&call.partials.0), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&call.hist.0), 0, 1);
+            let merge = PiecesArgs {
+                n_partials: (chunks * ROW_SLICES) as u32,
+                total_bins: self.total_bins as u32,
+            };
+            enc.setBytes_length_atIndex(
+                NonNull::from(&merge).cast(),
+                std::mem::size_of::<PiecesArgs>(),
+                2,
+            );
+            enc.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: self.total_bins,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: MERGE_THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.endEncoding();
+        }
+        submit(cb)?;
+        // SAFETY: the command buffer has completed, so the GPU is done with
+        // the buffer; this call owns it.
+        let hist = unsafe { call.hist.as_slice_mut::<[i64; 2]>(self.total_bins)? };
+        for (o, &[g, h]) in out.iter_mut().zip(hist.iter()) {
+            // Exact piece sums in grains (below 2^53), scaled back exactly.
+            o.grad = gradients.grad.value(g);
+            o.hess = gradients.hess.value(h);
+        }
+        Ok(())
     }
 
     /// Encode, run, and read back the scan and merge of `rows` over the
@@ -1140,9 +1553,13 @@ impl MetalHistBackend {
         call: &CallBuffers,
         gradients: &StagedGradients,
         rows: &[u32],
+        scan: Scan,
         out: &mut [GradStats],
     ) -> Result<()> {
         let cb = self.ctx.command_buffer()?;
+        if scan == Scan::Scatter {
+            return self.dispatch_scatter(&cb, call, gradients, rows, out);
+        }
         // SAFETY: this call exclusively owns `call` (checked out of the
         // pool), and nothing has been dispatched on it yet.
         unsafe { call.rows.write(0, as_bytes(rows))? };
@@ -1399,9 +1816,59 @@ struct PredictArgs {
     tree_end: u32,
 }
 
-/// Per-call prediction buffers, pooled across concurrent calls.
+/// Kernel argument block of `forest_predict8`.
+#[repr(C)]
+struct PredictArgs8 {
+    n_rows: u32,
+    n_cols: u32,
+    tree_begin: u32,
+    tree_end: u32,
+}
+
+/// One tree's dispatch record of `forest_predict8`.
+#[repr(C)]
+struct PTree8 {
+    root: u32,
+    weight: f32,
+}
+
+/// The prediction arena in the 8-byte node encoding, when the model fits it
+/// (see [`tree::compact::GpuArena8`](crate::tree::compact)). Prediction is
+/// bound by the cache lines a warp's scattered node loads touch, and this
+/// arena has twice as many nodes per line as the 16-byte one.
+struct NarrowArena {
+    nodes: GpuBuffer,
+    trees: GpuBuffer,
+}
+
+/// Kernel argument block of `hist_gather`.
+#[repr(C)]
+struct GatherArgs {
+    n: u32,
+}
+
+/// Kernel argument block of `hist_scatter_u16`.
+#[repr(C)]
+struct ScatterArgs {
+    chunk_rows: u32,
+    chunk_index: u32,
+    slices: u32,
+    total_bins: u32,
+    n_rows: u32,
+}
+
+/// Kernel argument block of `hist_merge_pieces`.
+#[repr(C)]
+struct PiecesArgs {
+    n_partials: u32,
+    total_bins: u32,
+}
+
+/// Per-call prediction buffers, pooled across concurrent calls. The two row
+/// buffers are the pipeline's stages: block `b` uploads into `rows[b % 2]`
+/// after the command buffer that read that slot has completed.
 struct PredictBuffers {
-    rows: GpuBuffer,
+    rows: [GpuBuffer; 2],
     out: GpuBuffer,
 }
 
@@ -1423,6 +1890,9 @@ pub struct GpuModel {
     categories: GpuBuffer,
     leaf_vectors: GpuBuffer,
     trees_bytes: GpuBuffer,
+    /// The 8-byte arena, when the model fits it; the 16-byte buffers above
+    /// are then never dispatched (their contents stay empty).
+    narrow: Option<NarrowArena>,
     pool: Mutex<Vec<PredictBuffers>>,
 }
 
@@ -1477,56 +1947,110 @@ impl GpuModel {
                 ),
             ));
         }
-        let call = self.checkout(n * data.n_cols() * 4, margins.len() * 4)?;
+        // Split the batch into row blocks and pipeline them: each block's
+        // rows upload into one of two slots while the GPU walks the other
+        // block's. The margins are block-local inside the kernel (the row and
+        // out buffers are bound at the block's base), so the walk's
+        // arithmetic and its order are exactly the single-block call's.
+        let blocks = n.div_ceil(PREDICT_BLOCK_ROWS).clamp(1, PREDICT_BLOCKS_MAX);
+        let block_rows = n.div_ceil(blocks);
+        let call = self.checkout(block_rows * data.n_cols() * 4, margins.len() * 4)?;
         let result: Result<()> = (|| {
-            let cb = self.ctx.command_buffer()?;
-            // SAFETY: this call owns `call`; nothing is dispatched on it yet.
-            unsafe {
-                let rows_slice = call.rows.as_slice_mut::<f32>(n * data.n_cols())?;
-                materialize_rows(data, rows_slice);
-                call.out.write(0, as_bytes(&margins))?;
+            // The command buffers whose blocks the GPU may still be reading.
+            let mut pending: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>> =
+                Vec::with_capacity(blocks);
+            for b in 0..blocks {
+                let begin = b * block_rows;
+                let rows_here = (n - begin).min(block_rows);
+                if rows_here == 0 {
+                    break;
+                }
+                // The slot this block uploads into was read by the block two
+                // back, whose command buffer must therefore have completed.
+                if b >= 2 {
+                    let previous = pending.remove(0);
+                    completed(&previous)?;
+                }
+                let rows_buffer = &call.rows[b % 2];
+                // SAFETY: this call owns `call`, and the slot's previous
+                // reader (if any) has completed above; nothing else writes
+                // the slot, its block, or the margins' block range.
+                unsafe {
+                    let rows_slice = rows_buffer.as_slice_mut::<f32>(rows_here * data.n_cols())?;
+                    materialize_rows(data, begin, rows_slice);
+                    call.out.write(
+                        begin * k * 4,
+                        as_bytes(&margins[begin * k..(begin + rows_here) * k]),
+                    )?;
+                }
+                let cb = self.ctx.command_buffer()?;
+                // SAFETY: the writes above precede the encoder (encoders of
+                // one command buffer are ordered, and this buffer is committed
+                // after them), the argument block is a live plain-data local,
+                // and every buffer index is within the ranges this call owns.
+                unsafe {
+                    let enc = cb
+                        .computeCommandEncoder()
+                        .ok_or_else(|| HessboostError::gpu("encoder creation failed"))?;
+                    if let Some(narrow) = &self.narrow {
+                        enc.setComputePipelineState(&self.ctx.forest_predict8.0);
+                        enc.setBuffer_offset_atIndex(Some(&narrow.nodes.0), 0, 0);
+                        enc.setBuffer_offset_atIndex(Some(&narrow.trees.0), 0, 1);
+                        enc.setBuffer_offset_atIndex(Some(&rows_buffer.0), 0, 2);
+                        enc.setBuffer_offset_atIndex(Some(&call.out.0), begin * k * 4, 3);
+                        let args = PredictArgs8 {
+                            n_rows: rows_here as u32,
+                            n_cols: data.n_cols() as u32,
+                            tree_begin: trees.start as u32,
+                            tree_end: trees.end as u32,
+                        };
+                        enc.setBytes_length_atIndex(
+                            NonNull::from(&args).cast(),
+                            std::mem::size_of::<PredictArgs8>(),
+                            4,
+                        );
+                    } else {
+                        enc.setComputePipelineState(&self.ctx.forest_predict.0);
+                        enc.setBuffer_offset_atIndex(Some(&self.nodes.0), 0, 0);
+                        enc.setBuffer_offset_atIndex(Some(&self.categories.0), 0, 1);
+                        enc.setBuffer_offset_atIndex(Some(&self.leaf_vectors.0), 0, 2);
+                        enc.setBuffer_offset_atIndex(Some(&self.trees_bytes.0), 0, 3);
+                        enc.setBuffer_offset_atIndex(Some(&rows_buffer.0), 0, 4);
+                        enc.setBuffer_offset_atIndex(Some(&call.out.0), begin * k * 4, 5);
+                        let args = PredictArgs {
+                            n_rows: rows_here as u32,
+                            n_cols: data.n_cols() as u32,
+                            k: k as u32,
+                            tree_begin: trees.start as u32,
+                            tree_end: trees.end as u32,
+                        };
+                        enc.setBytes_length_atIndex(
+                            NonNull::from(&args).cast(),
+                            std::mem::size_of::<PredictArgs>(),
+                            6,
+                        );
+                    }
+                    let grid = MTLSize {
+                        width: rows_here,
+                        height: 1,
+                        depth: 1,
+                    };
+                    let tg = MTLSize {
+                        width: PREDICT_THREADS,
+                        height: 1,
+                        depth: 1,
+                    };
+                    enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
+                    enc.endEncoding();
+                }
+                cb.commit();
+                pending.push(cb);
             }
-            // SAFETY: the encoder runs after the writes above (encoders of
-            // one command buffer are ordered), the argument block is a live
-            // plain-data local, and this call owns `call`.
-            unsafe {
-                let enc = cb
-                    .computeCommandEncoder()
-                    .ok_or_else(|| HessboostError::gpu("encoder creation failed"))?;
-                enc.setComputePipelineState(&self.ctx.forest_predict.0);
-                enc.setBuffer_offset_atIndex(Some(&self.nodes.0), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&self.categories.0), 0, 1);
-                enc.setBuffer_offset_atIndex(Some(&self.leaf_vectors.0), 0, 2);
-                enc.setBuffer_offset_atIndex(Some(&self.trees_bytes.0), 0, 3);
-                enc.setBuffer_offset_atIndex(Some(&call.rows.0), 0, 4);
-                enc.setBuffer_offset_atIndex(Some(&call.out.0), 0, 5);
-                let args = PredictArgs {
-                    n_rows: n as u32,
-                    n_cols: data.n_cols() as u32,
-                    k: k as u32,
-                    tree_begin: trees.start as u32,
-                    tree_end: trees.end as u32,
-                };
-                enc.setBytes_length_atIndex(
-                    NonNull::from(&args).cast(),
-                    std::mem::size_of::<PredictArgs>(),
-                    6,
-                );
-                let grid = MTLSize {
-                    width: n,
-                    height: 1,
-                    depth: 1,
-                };
-                let tg = MTLSize {
-                    width: PREDICT_THREADS,
-                    height: 1,
-                    depth: 1,
-                };
-                enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
-                enc.endEncoding();
+            for cb in &pending {
+                completed(cb)?;
             }
-            submit(&cb)?;
-            // SAFETY: the command buffer completed; this call owns the buffer.
+            // SAFETY: every command buffer completed; this call owns the
+            // buffer, and nothing else writes it.
             let out = unsafe { call.out.as_slice_mut::<f32>(margins.len())? };
             margins.copy_from_slice(out);
             Ok(())
@@ -1568,14 +2092,16 @@ impl GpuModel {
     /// none large enough.
     fn checkout(&self, rows_bytes: usize, out_bytes: usize) -> Result<PredictBuffers> {
         let mut pool = self.pool.lock().expect("predict pool lock poisoned");
-        if let Some(idx) = pool
-            .iter()
-            .position(|b| b.rows.len() >= rows_bytes && b.out.len() >= out_bytes)
-        {
+        if let Some(idx) = pool.iter().position(|b| {
+            b.rows.iter().all(|row| row.len() >= rows_bytes) && b.out.len() >= out_bytes
+        }) {
             return Ok(pool.swap_remove(idx));
         }
         Ok(PredictBuffers {
-            rows: GpuBuffer::new(&self.ctx.device, rows_bytes)?,
+            rows: [
+                GpuBuffer::new(&self.ctx.device, rows_bytes)?,
+                GpuBuffer::new(&self.ctx.device, rows_bytes)?,
+            ],
             out: GpuBuffer::new(&self.ctx.device, out_bytes)?,
         })
     }
@@ -1617,6 +2143,37 @@ impl BoostedModel {
             ));
         }
         let forest = self.compact_forest();
+        // The 8-byte arena covers single-output, categorical-free,
+        // scalar-leaf trees; everything else predicts through the 16-byte
+        // one. Both walks are the same arithmetic, so the choice is speed.
+        let narrow = if self.n_outputs() == 1 {
+            forest
+                .gpu_arena8(|t| self.tree_is_vector_leaf(t))
+                .map(|arena| -> Result<NarrowArena> {
+                    let nodes = GpuBuffer::new(&ctx.device, arena.words.len() * 4)?;
+                    // SAFETY: fresh buffer, written once before any dispatch.
+                    unsafe { nodes.write(0, as_bytes(&arena.words))? };
+                    let trees: Vec<PTree8> = arena
+                        .roots
+                        .iter()
+                        .enumerate()
+                        .map(|(t, &root)| PTree8 {
+                            root,
+                            weight: self.tree_weight(t),
+                        })
+                        .collect();
+                    let trees_bytes = GpuBuffer::new(&ctx.device, trees.len() * 8)?;
+                    // SAFETY: see above; `PTree8` is `repr(C)` of `u32, f32`.
+                    unsafe { trees_bytes.write(0, as_bytes(&trees))? };
+                    Ok(NarrowArena {
+                        nodes,
+                        trees: trees_bytes,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let parts = forest.gpu_parts();
         let nodes = GpuBuffer::new(&ctx.device, parts.nodes.len())?;
         // SAFETY: fresh buffers, written once before any dispatch.
@@ -1649,29 +2206,33 @@ impl BoostedModel {
             categories,
             leaf_vectors,
             trees_bytes,
+            narrow,
             pool: Mutex::new(Vec::new()),
         })
     }
 }
 
-/// Write `data`'s rows into `rows` as a dense `NaN`-for-missing matrix, the
-/// same materialization the CPU's row blocks use: dense NaN-sentinel
-/// matrices copy in place, a dense matrix with another sentinel maps
-/// sentinel values to `NaN`, and CSR rows materialize per entry.
-fn materialize_rows(data: &crate::data::DMatrix, rows: &mut [f32]) {
-    let n = data.n_rows();
+/// Write `data`'s rows starting at row `begin` into `rows` as a dense
+/// `NaN`-for-missing matrix, the same materialization the CPU's row blocks
+/// use: dense NaN-sentinel matrices copy in place, a dense matrix with
+/// another sentinel maps sentinel values to `NaN`, and CSR rows materialize
+/// per entry. `rows` holds a whole number of rows; it is one prediction
+/// block of the batch.
+fn materialize_rows(data: &crate::data::DMatrix, begin: usize, rows: &mut [f32]) {
     let n_cols = data.n_cols();
     if let Some(dense) = data.dense_values()
         && data.missing().is_nan()
-        && dense.len() == n * n_cols
+        && dense.len() == data.n_rows() * n_cols
     {
-        rows.copy_from_slice(dense);
+        let start = begin * n_cols;
+        rows.copy_from_slice(&dense[start..start + rows.len()]);
         return;
     }
     let missing = data.missing();
     rows.par_chunks_mut(n_cols)
         .enumerate()
-        .for_each(|(r, row)| {
+        .for_each(|(i, row)| {
+            let r = begin + i;
             for (f, slot) in row.iter_mut().enumerate() {
                 *slot = match data.get(r, f) {
                     Some(v) if v != missing || missing.is_nan() => v,
@@ -1899,6 +2460,92 @@ mod tests {
         let all: Vec<u32> = (0..n as u32).collect();
         let sampled: Vec<u32> = all.iter().copied().step_by(3).collect();
         let backend = MetalHistBackend::new(&index).unwrap();
+        for rows in [&all, &sampled] {
+            assert_eq!(
+                gpu_hist(&backend, &index, rows, &gpair),
+                cpu_hist(&index, rows, &gpair)
+            );
+        }
+    }
+
+    /// A slice whose grain counts are too coarse for the scatter kernel's
+    /// 32-bit shared accumulators (a huge magnitude next to a value with a
+    /// fine grain) still builds its histogram on the GPU, through the
+    /// register kernel, and still matches the CPU.
+    #[test]
+    fn coarse_grains_fall_back_to_the_register_kernel() {
+        if !context() {
+            return;
+        }
+        // 8,192 rows of at most 2^40 grains: inside the CPU/GPU exactness
+        // domain (`n * max <= 2^53`), past the scatter kernel's bound (the
+        // high piece alone would need more than an `i32` per threadgroup).
+        let n = CPU_ROWS;
+        let gpair: Vec<GradPair> = (0..n)
+            .map(|i| {
+                let grad = if i % 32 == 0 {
+                    2f32.powi(40)
+                } else {
+                    1.0 + (i % 3) as f32
+                };
+                GradPair::new(grad, 1.0)
+            })
+            .collect();
+        let index = one_feature(n, 8);
+        let backend = MetalHistBackend::new(&index).unwrap();
+        let rows: Vec<u32> = (0..n as u32).collect();
+        backend.prepare(&index, &gpair);
+        let staged = backend.gradients.read().unwrap();
+        assert!(
+            staged.sums_exact(rows.len()),
+            "the node must be inside the exactness domain"
+        );
+        assert!(
+            scatter_row_bound(&staged.grad, &staged.hess) < ROWS_PER_SLICE,
+            "the scatter kernel must not take this node"
+        );
+        drop(staged);
+        assert_eq!(
+            gpu_hist(&backend, &index, &rows, &gpair),
+            cpu_hist(&index, &rows, &gpair)
+        );
+    }
+
+    /// More than 65,536 bins in total: the binned store is 32-bit, so the
+    /// scan runs [`hist_scan_u32`](MetalHistBackend)'s eight-`u32`-record
+    /// kernel instead of the packed `u16` one, and its histograms must match
+    /// the CPU's just the same.
+    #[test]
+    fn hist_matches_cpu_wide_bins() {
+        if !context() {
+            return;
+        }
+        // 300 features at up to 256 bins each is 76,800 bins, past the
+        // `u16` sentinel the packed record needs.
+        let (n, cols) = (12_000, 300);
+        let x: Vec<f32> = (0..n * cols)
+            .map(|i: usize| ((i.wrapping_mul(2_654_435_761)) % 100_003) as f32 * 0.001)
+            .collect();
+        let data = crate::data::DMatrix::from_dense(&x, n, cols).unwrap();
+        let cuts = HistCuts::from_dmatrix(&data, 256);
+        let index = GHistIndex::from_dmatrix(&data, cuts);
+        assert!(
+            index.total_bins() > u16::MAX as usize + 1,
+            "the test needs more bins than the packed record holds"
+        );
+        let gpair: Vec<GradPair> = (0..n)
+            .map(|i| GradPair {
+                grad: ((i as i32 % 11) as f32 - 5.0).powi(3) * 0.01,
+                hess: ((i % 3) as f32 + 1.0).powi(2),
+            })
+            .collect();
+        let all: Vec<u32> = (0..n as u32).collect();
+        let sampled: Vec<u32> = all.iter().copied().step_by(7).collect();
+        let backend = MetalHistBackend::new(&index).unwrap();
+        assert!(
+            !backend.columns_u16,
+            "the wide-bin kernel must be the one run"
+        );
         for rows in [&all, &sampled] {
             assert_eq!(
                 gpu_hist(&backend, &index, rows, &gpair),

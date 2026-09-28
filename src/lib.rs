@@ -187,7 +187,7 @@
 //!   - ForestFlow / ForestDiffusion tabular generation and imputation
 //!     ([`diffusion::forest`]);
 //!   - native Metal on macOS 10.15+ (`metal` feature): bit-identical GPU
-//!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~2.5x faster at
+//!     prediction ([`to_gpu`](model::BoostedModel::to_gpu), ~3x faster at
 //!     scale) and bit-identical GPU histograms
 //!     ([`device`](config::TrainingParams::device) = `metal`; exact integer
 //!     sums, CPU fallback outside their exact domain). Documented only in

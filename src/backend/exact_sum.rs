@@ -62,6 +62,33 @@ impl SumDomain {
         finite: true,
     };
 
+    /// The statistics of `values`, folded over the row chunks in parallel.
+    ///
+    /// The fold's result does not depend on the order — `max` of
+    /// non-negative magnitudes, `min` of grains, and the finiteness flag are
+    /// commutative and associative — so this agrees with [`of`](Self::of)
+    /// bit for bit. Staging runs it once per tree on the whole gradient
+    /// slice, where one thread's fold is a measurable share of the round.
+    pub(crate) fn of_slice<T: Sync>(values: &[T], project: impl Fn(&T) -> f32 + Sync) -> Self {
+        use rayon::prelude::*;
+        /// Values per fold chunk: enough to amortize the reduction.
+        const CHUNK: usize = 4096;
+        values
+            .par_chunks(CHUNK)
+            .map(|chunk| Self::of(chunk.iter().map(&project)))
+            .reduce(|| Self::EMPTY, Self::combine)
+    }
+
+    /// The statistics of both domains together; see [`of`](Self::of) and
+    /// [`of_slice`](Self::of_slice).
+    fn combine(self, other: Self) -> Self {
+        Self {
+            max: self.max.max(other.max),
+            grain: self.grain.min(other.grain),
+            finite: self.finite && other.finite,
+        }
+    }
+
     /// The statistics of `values`.
     pub(crate) fn of(values: impl IntoIterator<Item = f32>) -> Self {
         values.into_iter().fold(Self::EMPTY, |domain, v| {
@@ -98,6 +125,18 @@ impl SumDomain {
         let max_units = f64::from(self.max) * pow2(-self.grain);
         max_units <= MAX_UNITS as f64
             && (n as u128) * u128::from(max_units as u64) <= u128::from(MAX_UNITS)
+    }
+
+    /// The largest magnitude of the slice's values in grains:
+    /// `max / 2^grain`, an exact integer (`0` for an empty or all-zero
+    /// slice). The scatter kernel splits each grain count into a high and a
+    /// low 16-bit piece, and a threadgroup's high-piece sum must stay inside
+    /// an `i32`, so this bounds how many rows one threadgroup may scan.
+    pub(crate) fn max_units(&self) -> u64 {
+        if self.grain == i32::MAX {
+            return 0;
+        }
+        (f64::from(self.max) * pow2(-self.grain)) as u64
     }
 
     /// `x` in grains: the integer the GPU sums. Exact for a value of the
@@ -160,6 +199,45 @@ mod tests {
     /// The CPU's sequential `f64` chain.
     fn cpu_sum(values: &[f32]) -> f64 {
         values.iter().fold(0.0f64, |s, &x| s + f64::from(x))
+    }
+
+    /// The magnitude in grains agrees with the bound `sums_exact` computes.
+    #[test]
+    fn max_units_matches_the_exactness_bound() {
+        let values = [0.75f32, -3.0, 1.0 + f32::EPSILON];
+        let domain = SumDomain::of(values.iter().copied());
+        let max_units = domain.max_units();
+        assert!(max_units >= 1);
+        assert!(domain.sums_exact(1));
+        assert!(domain.sums_exact((MAX_UNITS / max_units) as usize));
+        assert!(!domain.sums_exact((MAX_UNITS / max_units) as usize + 1));
+        assert_eq!(SumDomain::EMPTY.max_units(), 0);
+        assert_eq!(SumDomain::of([0.0f32, -0.0].iter().copied()).max_units(), 0);
+    }
+
+    /// The parallel fold agrees with the serial one exactly, including for
+    /// the values that make a slice inexact: the chunking must not change a
+    /// domain (staging picks the grain and the bound from it).
+    #[test]
+    fn the_parallel_fold_matches_the_serial_one() {
+        let mut values = vec![0.0, -0.0, -3.0, 0.75, 1.0 + f32::EPSILON, 2f32.powi(50)];
+        values.extend((0..10_000).map(|i| (i as f32 * 0.37).sin() * 2f32.powi(i % 40 - 20)));
+        for extra in [
+            vec![],
+            vec![f32::INFINITY, -1.0],
+            vec![f32::NAN],
+            vec![f32::from_bits(1)],
+        ] {
+            let all: Vec<f32> = values
+                .iter()
+                .copied()
+                .chain(extra.iter().copied())
+                .collect();
+            assert_eq!(
+                SumDomain::of_slice(&all, |v| *v),
+                SumDomain::of(all.iter().copied())
+            );
+        }
     }
 
     #[test]

@@ -248,6 +248,71 @@ fn to_gpu_predicts_bit_identically() {
     }
 }
 
+/// A batch larger than one prediction block: the GPU pipelines the call in
+/// row blocks (uploading one block's rows while the GPU walks another), and
+/// every block still lands bit-identical to the CPU's single walk. Covers
+/// both arenas: the regression model is single-output (the 8-byte one) and
+/// the multiclass model several outputs (the 16-byte one).
+#[test]
+fn to_gpu_predicts_bit_identically_across_blocks() {
+    if !device() {
+        return;
+    }
+    // Enough blocks to reuse a row slot (four, at 262,144 rows each) with a
+    // last block that is short, and a handful of features so the batch stays
+    // manageable.
+    let rows = 1_200_000;
+    let cols = 5;
+    let train_data = dataset(4_000, cols);
+    let batch = dataset(rows, cols);
+    let mut specs: Vec<(Objective, DMatrix)> = Vec::new();
+    for spec in [
+        Objective::SquaredError(RegLoss::default()),
+        Objective::Softmax(Multiclass::new(3).unwrap()),
+    ] {
+        // A multiclass objective needs labels inside its class range.
+        let data = match spec.num_class() {
+            Some(classes) => {
+                let labels: Vec<f32> = train_data
+                    .labels()
+                    .unwrap()
+                    .iter()
+                    .map(|&y| y.trunc().abs() % classes as f32)
+                    .collect();
+                train_data.clone().with_labels(&labels).unwrap()
+            }
+            None => train_data.clone(),
+        };
+        specs.push((spec, data));
+    }
+    assert!(
+        batch.n_rows() > 3 * 262_144,
+        "the test needs four prediction blocks"
+    );
+    for (spec, train_data) in specs {
+        let objective = spec.name().to_owned();
+        let params = TrainingParams::builder()
+            .objective(spec)
+            .tree_method(TreeMethod::Hist)
+            .max_depth(4)
+            .eta(0.4)
+            .build()
+            .unwrap();
+        let model = train(&params, &train_data, 8).unwrap();
+        let gpu = model.to_gpu().unwrap();
+        assert_eq!(
+            model.predict_margin(&batch, Iterations::Best).unwrap(),
+            gpu.predict_margin(&batch, Iterations::Best).unwrap(),
+            "{objective}: predict_margin across blocks"
+        );
+        assert_eq!(
+            model.predict(&batch, Iterations::Best).unwrap(),
+            gpu.predict(&batch, Iterations::Best).unwrap(),
+            "{objective}: predict across blocks"
+        );
+    }
+}
+
 /// `to_gpu` refuses models that do not predict through the compact forest.
 #[test]
 fn to_gpu_refuses_unsupported_models() {

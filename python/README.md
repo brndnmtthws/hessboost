@@ -60,10 +60,11 @@ booster = hessboost.train(
 )
 ```
 
-`predict` takes a `DMatrix` or anything its constructor accepts, and by
-default predicts through `best_iteration` (pass `iteration_range=(0, 0)`
-for every iteration; `pred_leaf` instead defaults to every iteration, so
-the example below covers all 500 trees). The flag arguments are exclusive:
+`predict` takes a `DMatrix` or anything its constructor accepts. The default
+range is the iterations through `best_iteration` (pass `iteration_range=(0, 0)`
+for every iteration), except `pred_leaf`, which defaults to every iteration
+regardless of early stopping — so the leaves below cover all 500 trees.
+The flag arguments are exclusive:
 
 ```python
 probabilities = booster.predict(X[800:])  # through best_iteration
@@ -104,7 +105,7 @@ class StopAtTarget(hessboost.TrainingCallback):
 
 
 hessboost.train(
-    {"objective": "binary:logistic", "eval_metric": "auc"},
+    {"objective": "binary:logistic", "eval_metric": "auc", "max_depth": 4},
     dtrain,
     1000,
     evals=[(dvalid, "valid")],
@@ -401,8 +402,8 @@ horizons):
 ```python
 from hessboost import folds
 
-splits = folds.forward_chaining(len(y), 4, gap=24)
-result = hessboost.cv(params, dtrain, 100, folds=splits)
+splits = folds.forward_chaining(dtrain.num_row(), 4, gap=24)
+result = hessboost.cv({"max_depth": 4}, dtrain, 100, folds=splits)
 ```
 
 ### Extra training options
@@ -440,14 +441,15 @@ LightGBM's `rank_xendcg` stream.
 - `cv` returns a dict of numpy arrays (`test-<metric>-mean`/`-std`) with
   held-out metrics only; there is no `stratified` or `as_pandas`.
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's
-  scikit-learn behavior); pass `iteration_range=(0, 0)` for all
-  (`pred_leaf` defaults to every iteration instead).
-  `pred_leaf` returns `int32`.
+  scikit-learn behavior); pass `iteration_range=(0, 0)` for all. SHAP and
+  leaf ranges start at iteration 0; `pred_leaf` defaults to every iteration
+  instead, and returns `int32`.
 - Model files do not store feature names or categories (pickles do).
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
   (`predict` takes arrays directly), `Booster.get_dump`/`trees_to_dataframe`
   /`dump_model`, attributes (`set_attr`), plotting, distributed (Dask/Spark)
-  and GPU (CUDA) training, `approx_contribs`, and `strict_shape`.
+  and CUDA training, `approx_contribs`, and `strict_shape`. The macOS wheels
+  support `device="metal"` (GPU histograms and prediction).
 
 ## Development
 
@@ -455,18 +457,18 @@ From `python/` in the [repository](https://github.com/brndnmtthws/hessboost),
 with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uv sync                        # build the extension and install dev tools
-uv run pytest
-uv run pyright --verifytypes hessboost --ignoreexternal
+uv sync --locked              # build the extension and install dev tools
+uv run --locked pytest
+uv run --locked pyright --verifytypes hessboost --ignoreexternal
 ```
 
 Lint, format, and type-check all of the repository's Python from its root
 (configuration: `ruff.toml`, `ty.toml`):
 
 ```sh
-uv run --project python ruff check
-uv run --project python ruff format --check
-uv run --project python ty check
+uv run --project python --locked ruff check
+uv run --project python --locked ruff format --check
+uv run --project python --locked ty check
 ```
 
 ## License

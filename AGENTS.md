@@ -10,8 +10,9 @@ at release time.
 ## Toolchain
 
 `mise install` provides the pinned Rust 1.98.1, `mbx` (build cache),
-cargo-nextest, and uv; after changing a version, refresh `mise.lock` with
-`mise lock`. MSRV 1.93. `Cargo.lock` is gitignored: never pass `--locked`.
+cargo-nextest, uv, and shellcheck; after changing a version, refresh
+`mise.lock` with `mise lock`. MSRV 1.93. `Cargo.lock` is gitignored: never
+pass `--locked`.
 libzstd needs a C compiler for every build target. docs.rs builds only
 Linux (no Apple SDK for `zstd-sys`), so the Metal API renders only in a
 local macOS `cargo doc --features metal`. `include` in `Cargo.toml` lists
@@ -28,6 +29,7 @@ cargo test --doc --all-features   # nextest skips doctests; CI adds --profile ci
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 MISE_RUST_VERSION=1.93.0 mise exec -- cargo build --all-features   # MSRV
 cargo semver-checks   # API vs. latest crates.io release; Cargo.toml's version must be a large enough bump
+shellcheck .github/scripts/*.sh   # not run by CI
 ```
 
 XGBoost parity needs uv, CMake, and a C++ compiler (the first run builds

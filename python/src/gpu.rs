@@ -8,9 +8,11 @@
 //! device; building one is refused.
 use crate::data::DMatrix;
 use hessboost::backend::metal::GpuModel as RustGpuModel;
-use hessboost::model::Iterations;
 use numpy::PyArrayDyn;
 use pyo3::prelude::*;
+
+#[cfg(target_os = "macos")]
+use hessboost::model::Iterations;
 
 #[cfg(target_os = "macos")]
 use crate::data::to_numpy;
@@ -46,25 +48,16 @@ impl GpuModel {
 
     /// XGBoost's `iteration_range` as iterations: `(begin, 0)` runs through
     /// the last iteration, and `None` is the method's `default`.
+    #[cfg(target_os = "macos")]
     fn iterations(&self, range: Option<(usize, usize)>, default: Iterations) -> Iterations {
-        #[cfg(target_os = "macos")]
-        {
-            range.map_or(default, |(begin, end)| {
-                let end = if end == 0 {
-                    self.gpu.model().num_boost_rounds()
-                } else {
-                    end
-                };
-                (begin..end).into()
-            })
-        }
-        // Unreachable in practice: `to_gpu` never succeeds where the Metal
-        // backend is not compiled in, so no `GpuModel` exists to call this.
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = range;
-            default
-        }
+        range.map_or(default, |(begin, end)| {
+            let end = if end == 0 {
+                self.gpu.model().num_boost_rounds()
+            } else {
+                end
+            };
+            (begin..end).into()
+        })
     }
 }
 

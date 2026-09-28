@@ -281,7 +281,7 @@ impl Booster {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = py;
+            let _ = (self, py);
             Err(refuse(
                 "GPU prediction requires the `metal` feature on macOS",
             ))

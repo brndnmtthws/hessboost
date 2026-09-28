@@ -28,8 +28,9 @@ Extras: `hessboost[pandas]`, `hessboost[polars]`, and
 `hessboost[scikit-learn]`. numpy is the only required dependency.
 
 Prebuilt wheels are published for Linux x86_64 and aarch64 (glibc
-manylinux and musl/Alpine musllinux), macOS arm64 (with Metal support,
-`device="metal"`), and Windows x86_64: one `abi3` wheel per platform for
+manylinux and musl/Alpine musllinux), macOS arm64 (with Metal support:
+`device="metal"` training histograms and `Booster.to_gpu()` GPU batch
+prediction), and Windows x86_64: one `abi3` wheel per platform for
 CPython 3.11 and newer, plus a wheel for free-threaded CPython 3.14t.
 Elsewhere the installer builds from the source distribution, which needs
 Rust 1.93 or newer and a C compiler (for libzstd).
@@ -320,6 +321,9 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's
   scikit-learn behavior); pass `iteration_range=(0, 0)` for all.
   `pred_leaf` returns `int32`.
+- On macOS, `Booster.to_gpu()` lays the model out for GPU batch prediction
+  on Metal (`GpuModel.predict`, bit-identical to `Booster.predict`; see
+  whether a device exists with `GpuModel.available()`).
 - Model files do not store feature names or categories (pickles do).
 - Not available: `DMatrix` from files or `QuantileDMatrix`, `inplace_predict`
   (`predict` takes arrays directly), `Booster.get_dump`/`trees_to_dataframe`

@@ -23,6 +23,7 @@ mod dist;
 mod ebm;
 mod errors;
 mod forest;
+mod gpu;
 mod inference;
 mod online;
 mod params;
@@ -36,6 +37,7 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<params::Params>()?;
     m.add_class::<booster::Booster>()?;
     m.add_class::<dist::Distributions>()?;
+    m.add_class::<gpu::GpuModel>()?;
     m.add_class::<conformal::SplitConformal>()?;
     m.add_class::<conformal::ConformalizedQuantile>()?;
     m.add_class::<online::OnlineModel>()?;

@@ -34,6 +34,7 @@ dependencies = ["numpy>=2"]
 
 [project.optional-dependencies]
 pandas = ["pandas>=2.2"]
+polars = ["polars>=1.0"]
 scikit-learn = ["scikit-learn>=1.6"]
 
 [project.urls]
@@ -49,6 +50,8 @@ test = [
   # CI's `pyright --verifytypes` checks the installed wheel's public types.
   "pyright>=1.1.414",
   "pandas>=2.2",
+  # abi3-only wheels: test-wheel.sh leaves it out on free-threaded Python.
+  "polars>=1.0",
   "scikit-learn>=1.6",
   "scipy>=1.14",
 ]

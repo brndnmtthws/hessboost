@@ -24,7 +24,7 @@ def write_bytes(path: PathLike, data: bytes) -> None:
 
 class _SchemaState:
     """The feature schema a model's wrapper records (names, types and
-    pandas categories, which model files do not store), and its pickle
+    frame categories, which model files do not store), and its pickle
     state: the model's native bytes (:meth:`_model_state`, restored by
     :meth:`_restore_model`) with the schema."""
 

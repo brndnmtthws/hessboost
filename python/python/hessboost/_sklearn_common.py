@@ -181,7 +181,7 @@ class _HessboostModel(BaseEstimator):
 
     def _check_X(self, X: Any, reset: bool) -> Any:
         """``X`` validated (feature count and names) as scikit-learn does;
-        pandas frames are passed on unchanged to keep their categories."""
+        pandas and polars frames are passed on unchanged to keep their categories."""
         if _data._is_frame(X):
             validate_data(self, X, reset=reset, skip_check_array=True)
             return X
@@ -203,7 +203,7 @@ class _HessboostModel(BaseEstimator):
         extra: Mapping[str, Any] | None,
         categories: _data.Categories,
     ) -> DMatrix:
-        """``X`` and its metadata as a matrix, pandas categories re-coded to
+        """``X`` and its metadata as a matrix, frame categories re-coded to
         ``categories`` (values they lack become missing)."""
         info = _data.info(label=y, weight=weight, base_margin=base_margin, **(extra or {}))
         return DMatrix._coded(X, categories, self.missing, info)

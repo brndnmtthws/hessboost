@@ -169,7 +169,7 @@ def train(
             the number of iterations of ``xgb_model`` to refresh).
         evals: ``(data, name)`` pairs evaluated after every round. Each must
             have ``dtrain``'s features: the same names and categorical
-            features (where both record them) and, for pandas categoricals,
+            features (where both record them) and, for frame categoricals,
             the same categories in the same order, since codes are positions
             in them. Codes without recorded categories (numpy data with
             ``feature_types``) are taken to be ``dtrain``'s.

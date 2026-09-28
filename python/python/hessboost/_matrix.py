@@ -21,9 +21,11 @@ class DMatrix:
 
     ``data`` may be a 2-D numpy array of any numeric dtype and memory
     layout (converted to C-contiguous ``float32``, without a copy when it
-    already is), a pandas ``DataFrame`` (column names become
-    ``feature_names``; ``category`` columns become categorical features
-    coded by position in their categories, which are recorded), a scipy
+    already is), a pandas or polars ``DataFrame`` (column names become
+    ``feature_names``; categorical columns (pandas ``category``, polars
+    ``Enum`` and ``Categorical``) become categorical features coded by
+    position in their categories, which are recorded: a polars
+    ``Categorical``'s are its values, sorted), a scipy
     sparse matrix (absent entries are missing), or any array-like numpy
     accepts. Values equal to ``missing`` (every NaN by default) are missing;
     infinities are refused.
@@ -56,7 +58,7 @@ class DMatrix:
         label_upper_bound: ``survival:aft`` interval upper bounds
             (``inf`` for right-censored rows).
         feature_weights: Per-feature column-sampling weights.
-        enable_categorical: Accept pandas ``category`` columns (as XGBoost
+        enable_categorical: Accept categorical frame columns (as XGBoost
             requires spelling out).
 
     Raises:
@@ -121,7 +123,7 @@ class DMatrix:
     def _coded(
         cls, data: object, categories: _data.Categories, missing: float, info: dict[str, object]
     ) -> DMatrix:
-        """``data`` converted with its pandas categories re-coded to
+        """``data`` converted with its frame categories re-coded to
         ``categories`` (a model's or a training matrix's; values they lack
         become missing)."""
         matrix = cls.__new__(cls)
@@ -315,7 +317,7 @@ def _matrix_for(
 
     A :class:`DMatrix` is taken as it is (``base_margin`` belongs on it).
     Other input is converted with ``missing``, ``label`` and
-    ``base_margin``, its pandas categories re-coded to the references' (the
+    ``base_margin``, its frame categories re-coded to the references' (the
     first reference's where two record a feature's; values they lack become
     missing); ``require_label`` refuses it unlabelled. Either way it is
     checked against every reference with :func:`_check_schema` (feature

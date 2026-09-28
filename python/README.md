@@ -392,6 +392,20 @@ filled = forest.impute(X_with_nans, n_imputations=5)  # (5, rows, columns)
 `forest_diffusion()`; its `training` mappings are XGBoost parameters, and
 models save and load like `DiffusionModel`s.
 
+### GPU prediction
+
+On macOS, `Booster.to_gpu()` lays the model out for batch prediction on
+Metal: the forest uploads once, and each call predicts bit-identically to
+`Booster.predict` (values or raw margins), faster from roughly a few
+thousand row-trees upward:
+
+```python
+from hessboost import GpuModel
+
+gpu = booster.to_gpu()
+probabilities = gpu.predict(X_test)
+```
+
 ### Validation folds
 
 `hessboost.folds` builds `(train_rows, test_rows)` splits for `cv` or custom

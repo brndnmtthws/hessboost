@@ -142,7 +142,7 @@ impl GpuModel {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (py, data, kind, iteration_range);
+            let _ = (self, py, data, kind, iteration_range);
             Err(refuse(
                 "GPU prediction requires the `metal` feature on macOS",
             ))

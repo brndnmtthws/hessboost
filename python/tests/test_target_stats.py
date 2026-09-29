@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 import hessboost
 from hessboost import DMatrix, HessboostError, InvalidDataError
@@ -24,7 +24,7 @@ def categorical_data(
     return x, effect[codes] + 0.1 * rng.normal(size=rows)
 
 
-def matrix(x: NDArray[np.float64], label: object) -> DMatrix:
+def matrix(x: NDArray[np.float64], label: ArrayLike) -> DMatrix:
     return DMatrix(x, label, feature_names=["city", "noise"], feature_types=["c", "q"])
 
 

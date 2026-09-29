@@ -551,13 +551,11 @@ def test_cv_accepts_explicit_folds_and_splitters() -> None:
 
 
 def test_ranking_cv_keeps_whole_query_groups() -> None:
-    from sklearn.model_selection import GroupKFold
-
     x, relevance, qid = ranking_data()
     dtrain = DMatrix(x, relevance, qid=qid)
-    result = hessboost.cv(
-        {"objective": "rank:ndcg"}, dtrain, 5, folds=GroupKFold(3).split(x, groups=qid)
-    )
+    # Every third query held out in turn: whole groups, in row order.
+    folds = [(np.flatnonzero(qid % 3 != f), np.flatnonzero(qid % 3 == f)) for f in range(3)]
+    result = hessboost.cv({"objective": "rank:ndcg"}, dtrain, 5, folds=folds)
     assert result["test-ndcg@32-mean"].shape == (5,)
     assert np.all(np.isfinite(result["test-ndcg@32-mean"]))
     # The shuffled default folds split query groups.

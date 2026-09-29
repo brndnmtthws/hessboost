@@ -1,4 +1,4 @@
-"""``train`` and ``cv``, exported from :mod:`hessboost`."""
+"""``train``, ``train_with_budget`` and ``cv``, exported from :mod:`hessboost`."""
 
 from __future__ import annotations
 
@@ -13,8 +13,9 @@ from hessboost import _hessboost
 from hessboost._booster import Booster
 from hessboost._exceptions import HessboostError
 from hessboost._matrix import DMatrix, _check_schema
+from hessboost.target_stats import Column, OrderedTargetEncoder, _column_indices
 
-__all__ = ["CustomMetric", "Objective", "TrainingCallback", "cv", "train"]
+__all__ = ["CustomMetric", "Objective", "TrainingCallback", "cv", "train", "train_with_budget"]
 
 Objective: TypeAlias = Callable[[NDArray[np.float32], DMatrix], tuple[ArrayLike, ArrayLike]]
 """A custom objective, as XGBoost's ``obj``: ``obj(margins, dtrain)``
@@ -304,6 +305,63 @@ def train(
     return booster
 
 
+def train_with_budget(
+    params: Mapping[str, Any],
+    dtrain: DMatrix,
+    budget: float = 0.5,
+    *,
+    iteration_limit: int | None = None,
+    stopping_rounds: int | None = None,
+) -> Booster:
+    """Trains with one fitting ``budget`` in place of a learning rate, tree
+    limits and a round count (PerpetualBooster's algorithm, reimplemented;
+    see the Rust ``hessboost::training::budget`` docs).
+
+    The budget sets the learning rate (``10 ** -budget`` for budgets up to
+    1, decaying more slowly above), each tree's loss-reduction target, and
+    the stopping rules; trees grow best-first while a five-fold
+    generalization check accepts their splits. It is much slower than one
+    fixed-round fit of the same size, since it replaces a tuning search.
+    The model is an ordinary gbtree booster (predictions, SHAP and every
+    model format work unchanged).
+
+    Args:
+        params: XGBoost parameters by name, as for :func:`train`. Budget
+            mode reads only ``objective`` (with its parameters),
+            ``base_score``, ``max_bin``, ``nthread``, and ``max_delta_step``
+            for ``count:poisson``; any other parameter set to other than its
+            default is refused. Objectives: ``reg:squarederror``,
+            ``reg:pseudohubererror``, ``binary:logistic``,
+            ``binary:logitraw``, ``reg:logistic``, ``count:poisson``,
+            ``reg:gamma``, ``reg:tweedie``.
+        dtrain: The training data (one label per row).
+        budget: The fitting budget, in ``(0, 5)``; larger budgets train more
+            trees with a smaller learning rate and fit more closely (``1.0``
+            and ``1.5`` are common choices).
+        iteration_limit: Lower the hard cap on boosting rounds (default:
+            the budget's, 1000 to 4000).
+        stopping_rounds: Weak or non-improving rounds that stop training
+            (default: the budget's).
+
+    Training is deterministic and independent of ``nthread``. The GIL is
+    released while training; Ctrl-C takes effect only once it returns.
+
+    Raises:
+        HessboostError: The budget or a limit is out of range, or a
+            parameter or the objective is not supported in budget mode.
+    """
+    if not isinstance(dtrain, DMatrix):
+        raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float, np.integer, np.floating)):
+        raise TypeError(f"budget must be a number, got {type(budget).__name__}")
+    core = _hessboost.train_with_budget(
+        _params(params, dtrain), dtrain._core, float(budget), iteration_limit, stopping_rounds
+    )
+    return Booster._wrap(
+        core, dtrain._feature_names, dtrain._feature_types, dict(dtrain._categories)
+    )
+
+
 def cv(
     params: Mapping[str, Any],
     dtrain: DMatrix,
@@ -313,11 +371,17 @@ def cv(
     folds: _Splitter | Iterable[tuple[ArrayLike, ArrayLike]] | None = None,
     seed: int = 0,
     early_stopping_rounds: int | None = None,
+    target_stats: Sequence[Column] | None = None,
+    target_encoder: OrderedTargetEncoder | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Cross-validates ``params`` on ``dtrain``, as XGBoost's ``xgboost.cv``.
 
     Every fold trains ``num_boost_round`` rounds on its training rows and is
-    evaluated on its test rows after each round.
+    evaluated on its test rows after each round. On ranking data (``group``
+    or ``qid`` set), every fold's training and test rows must be whole query
+    groups, each group's rows together and in row order (as
+    ``sklearn.model_selection.GroupKFold`` over the query ids gives them);
+    the shuffled default folds split groups and are refused.
 
     Args:
         nfold: Shuffled folds to use when ``folds`` is not given.
@@ -327,6 +391,13 @@ def cv(
         seed: The shuffle seed of the default folds.
         early_stopping_rounds: Stop on the fold-mean of the last metric;
             the results end at the best round.
+        target_stats: Categorical features (indices or names) to encode
+            with ordered target statistics inside each fold: the encoder is
+            fitted on the fold's training rows only and encodes its test
+            rows with those statistics, so no held-out label reaches an
+            encoding (see :mod:`hessboost.target_stats`).
+        target_encoder: The encoder ``target_stats`` uses (default:
+            ``OrderedTargetEncoder()``).
 
     Returns:
         ``{"test-<metric>-mean": ..., "test-<metric>-std": ...}`` per
@@ -336,6 +407,16 @@ def cv(
     if not isinstance(dtrain, DMatrix):
         raise TypeError(f"dtrain must be a DMatrix, got {type(dtrain).__name__}")
     native = _params(params, dtrain)
+    encoding: tuple[_hessboost.OrderedTargetEncoder, list[int]] | None = None
+    if target_stats is not None:
+        encoder = OrderedTargetEncoder() if target_encoder is None else target_encoder
+        if not isinstance(encoder, OrderedTargetEncoder):
+            raise TypeError(
+                f"target_encoder must be an OrderedTargetEncoder, got {type(encoder).__name__}"
+            )
+        encoding = (encoder._core, _column_indices(target_stats, dtrain._feature_names))
+    elif target_encoder is not None:
+        raise HessboostError("target_encoder needs target_stats, the columns to encode")
     rows = dtrain.num_row()
     if folds is None:
         pairs = [
@@ -352,7 +433,7 @@ def cv(
             for train, test in chosen
         ]
     results = _hessboost.cv(
-        native, dtrain._core, int(num_boost_round), pairs, early_stopping_rounds
+        native, dtrain._core, int(num_boost_round), pairs, early_stopping_rounds, encoding
     )
     out: dict[str, NDArray[np.float64]] = {}
     for metric, mean, std in results:

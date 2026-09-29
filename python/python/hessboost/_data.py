@@ -5,7 +5,7 @@ and polars frames, scipy sparse matrices, array-likes) into the row-major
 from __future__ import annotations
 
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard
 
@@ -130,11 +130,16 @@ def _categorical_columns(feature_types: Sequence[str], n_cols: int) -> list[int]
 
 
 def _pandas_frame_values(
-    frame: pd.DataFrame, enable_categorical: bool, reference: Categories | None
+    frame: pd.DataFrame,
+    enable_categorical: bool,
+    reference: Categories | None,
+    unseen: Collection[int] = (),
 ) -> tuple[NDArray[np.float32], list[str], FeatureTypes, Categories]:
     """A pandas frame's values as ``float32``: numeric and boolean columns as is
     (``NA`` missing), category columns as their codes (``NaN`` missing),
-    re-coded to the ``reference`` categories of a trained model."""
+    re-coded to the ``reference`` categories of a trained model. A value the
+    reference lacks is missing, except in the ``unseen`` columns, where it
+    gets the code one past the reference's categories."""
     pd = _pandas()
     rows, cols = frame.shape
     values = np.empty((rows, cols), dtype=np.float32)
@@ -151,6 +156,8 @@ def _pandas_frame_values(
             if wanted is not None and wanted != known:
                 # Old code -> position in the training categories (-1: unseen).
                 recode = pd.Index(wanted).get_indexer(dtype.categories)
+                if column in unseen:
+                    recode = np.where(recode >= 0, recode, len(wanted))
                 codes = np.where(codes >= 0, recode[codes], -1)
                 known = wanted
             column_values = codes.astype(np.float32)
@@ -171,14 +178,19 @@ def _pandas_frame_values(
 
 
 def _polars_frame_values(
-    frame: pl.DataFrame, enable_categorical: bool, reference: Categories | None
+    frame: pl.DataFrame,
+    enable_categorical: bool,
+    reference: Categories | None,
+    unseen: Collection[int] = (),
 ) -> tuple[NDArray[np.float32], list[str], FeatureTypes, Categories]:
     """A polars frame's values as ``float32``: numeric and boolean columns as
     is (null missing), ``Enum`` and ``Categorical`` columns as positions in
     their categories (null missing), re-coded to the ``reference``
-    categories of a trained model. An ``Enum``'s categories are its
-    dtype's; a ``Categorical``'s are its values, sorted (as pandas infers
-    them), since its physical codes index a pool other columns share."""
+    categories of a trained model (a value they lack is missing, except in
+    the ``unseen`` columns, where it gets the code one past them). An
+    ``Enum``'s categories are its dtype's; a ``Categorical``'s are its
+    values, sorted (as pandas infers them), since its physical codes index
+    a pool other columns share."""
     pl = _polars()
     rows, cols = frame.shape
     values = np.empty((rows, cols), dtype=np.float32)
@@ -202,13 +214,16 @@ def _polars_frame_values(
             positions = [
                 (value, code) for code, value in enumerate(known) if isinstance(value, str)
             ]
+            other = float(len(known)) if wanted is not None and column in unseen else None
             codes = strings.replace_strict(
                 [value for value, _ in positions],
                 [code for _, code in positions],
-                default=None,
+                default=other,
                 return_dtype=pl.Float32,
             )
-            column_values = codes.to_numpy()
+            column_values = codes.to_numpy(writable=other is not None)
+            if other is not None:
+                column_values[strings.is_null().to_numpy()] = np.nan
             types.append("c")
             categories[column] = known
         elif dtype.is_numeric() or dtype == pl.Boolean:
@@ -232,10 +247,13 @@ def features(
     enable_categorical: bool,
     reference: Categories | None,
     info: Mapping[str, object],
+    unseen: Collection[int] = (),
 ) -> Features:
     """Converts ``data`` and builds the native matrix with ``info``
     attached. ``reference`` holds a trained model's categories, to which
-    frame categorical columns are re-coded."""
+    frame categorical columns are re-coded; values it lacks are missing,
+    except in the ``unseen`` columns, where they are coded one past its
+    categories (a target encoder's unseen category)."""
     names: list[str] | None = None
     types: FeatureTypes | None = None
     categories: Categories = {}
@@ -244,10 +262,14 @@ def features(
         n_cols = int(csr.shape[1])
         values = None
     elif _is_pandas_frame(data):
-        values, names, types, categories = _pandas_frame_values(data, enable_categorical, reference)
+        values, names, types, categories = _pandas_frame_values(
+            data, enable_categorical, reference, unseen
+        )
         n_cols = values.shape[1]
     elif _is_polars_frame(data):
-        values, names, types, categories = _polars_frame_values(data, enable_categorical, reference)
+        values, names, types, categories = _polars_frame_values(
+            data, enable_categorical, reference, unseen
+        )
         n_cols = values.shape[1]
     else:
         values = as_float32(data, "data")

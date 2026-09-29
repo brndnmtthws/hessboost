@@ -3,7 +3,7 @@ every pairing of data with a model or a training matrix goes through."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Protocol
 
 import numpy as np
@@ -121,11 +121,17 @@ class DMatrix:
 
     @classmethod
     def _coded(
-        cls, data: object, categories: _data.Categories, missing: float, info: dict[str, object]
+        cls,
+        data: object,
+        categories: _data.Categories,
+        missing: float,
+        info: dict[str, object],
+        unseen: Collection[int] = (),
     ) -> DMatrix:
         """``data`` converted with its frame categories re-coded to
         ``categories`` (a model's or a training matrix's; values they lack
-        become missing)."""
+        become missing, except in the ``unseen`` columns, where they are
+        coded one past them)."""
         matrix = cls.__new__(cls)
         matrix._set(
             _data.features(
@@ -136,6 +142,7 @@ class DMatrix:
                 enable_categorical=True,
                 reference=categories or None,
                 info=info,
+                unseen=unseen,
             )
         )
         return matrix
@@ -221,7 +228,9 @@ class DMatrix:
 
     def slice(self, rindex: ArrayLike) -> DMatrix:
         """A new matrix of the rows ``rindex`` (in that order), with their
-        labels, weights, margins and bounds; query groups are dropped."""
+        labels, weights, margins and bounds. On ranking data ``rindex`` must
+        list whole query groups, each group's rows together and in row
+        order; they stay the result's groups."""
         rows = np.ascontiguousarray(np.asarray(rindex).reshape(-1), dtype=np.int64)
         return self._with_core(self._core.select_rows(rows))
 
@@ -310,6 +319,7 @@ def _matrix_for(
     require_label: bool = False,
     missing: float = np.nan,
     validate_names: bool = True,
+    unseen: Collection[int] = (),
 ) -> DMatrix:
     """``data`` (a :class:`DMatrix` or anything it accepts) as a matrix
     every one of ``references`` reads, each given with its name in errors
@@ -319,7 +329,8 @@ def _matrix_for(
     Other input is converted with ``missing``, ``label`` and
     ``base_margin``, its frame categories re-coded to the references' (the
     first reference's where two record a feature's; values they lack become
-    missing); ``require_label`` refuses it unlabelled. Either way it is
+    missing, or in the ``unseen`` columns a code past them);
+    ``require_label`` refuses it unlabelled. Either way it is
     checked against every reference with :func:`_check_schema` (feature
     names only with ``validate_names``), since a reference without recorded
     categories matches anything. With no references this is the training
@@ -335,7 +346,7 @@ def _matrix_for(
         for reference, _ in reversed(references):
             categories.update(reference._categories)
         info = _data.info(label=label, base_margin=base_margin)
-        matrix = DMatrix._coded(data, categories, missing, info)
+        matrix = DMatrix._coded(data, categories, missing, info, unseen)
         label = None
     for reference, against in references:
         _check_schema(

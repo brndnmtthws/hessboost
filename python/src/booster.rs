@@ -2,6 +2,7 @@
 //! importance, slicing, and every model format.
 
 use crate::codec;
+use crate::compact::CompactModel;
 use crate::data::{DMatrix, to_numpy};
 use crate::dist::Distributions;
 use crate::errors::{DetachExt, refuse};
@@ -25,7 +26,7 @@ enum Kind {
 }
 
 /// `(rows,)` for one value per row, else `(rows, width)`.
-fn dense<T>(predictions: Predictions<T>) -> (Vec<T>, Vec<usize>) {
+pub(crate) fn dense<T>(predictions: Predictions<T>) -> (Vec<T>, Vec<usize>) {
     let (rows, width) = (predictions.n_rows(), predictions.width());
     let shape = if width == 1 {
         vec![rows]
@@ -286,6 +287,28 @@ impl Booster {
                 "GPU prediction requires the `metal` feature on macOS",
             ))
         }
+    }
+
+    /// This model in the bit-packed compact layout (the trees prediction
+    /// uses by default).
+    fn to_compact(&self, py: Python<'_>) -> PyResult<CompactModel> {
+        py.detached(|| self.model.to_compact())
+            .map(CompactModel::new)
+    }
+
+    /// Native versus compact size and the compact dictionary statistics.
+    fn size_report<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let report = py.detached(|| self.model.size_report())?;
+        let dict = PyDict::new(py);
+        dict.set_item("native_bytes", report.native_bytes)?;
+        dict.set_item("compact_bytes", report.compact_bytes)?;
+        dict.set_item("trees", report.trees)?;
+        dict.set_item("splits", report.splits)?;
+        dict.set_item("leaves", report.leaves)?;
+        dict.set_item("used_features", report.used_features)?;
+        dict.set_item("thresholds", report.thresholds)?;
+        dict.set_item("leaf_values", report.leaf_values)?;
+        Ok(dict)
     }
 
     #[getter]

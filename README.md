@@ -134,7 +134,8 @@ runnable programs live in [`examples/`](examples)
 [`python/`](python) holds the Python package (`pip install hessboost`):
 `DMatrix`, `train`, `cv`, and `Booster` (taking XGBoost's parameter names),
 scikit-learn estimators, pandas and polars categorical input, and the conformal,
-distributional, tree-diffusion, ForestFlow, and in-place update extras
+distributional, tree-diffusion, ForestFlow, in-place update, ordered target
+statistics, budget training, and compact model extras
 (on macOS, `Booster.to_gpu()` batch-predicts on the Metal GPU):
 
 ```python
@@ -155,8 +156,9 @@ See [`python/README.md`](python/README.md).
 - **Objectives & metrics:** Regression (squared, log, Huber, quantile, expectile),
   binary/multiclass classification, ranking (LambdaMART, XE-NDCG), count, and survival (Cox, AFT),
   plus typed objective and metric APIs and custom loss hooks.
-- **Validation & workflow:** Cross-validation (including purged and forward time-series folds),
-  early stopping, feature importance, SHAP values and interactions, model slicing, and iteration ranges.
+- **Validation & workflow:** Cross-validation (including purged and forward time-series folds,
+  whole-query ranking folds, and per-fold target statistics), early stopping, feature importance,
+  SHAP values and interactions, model slicing, and iteration ranges.
 - **Interchange:** Native binary and JSON formats, XGBoost JSON/UBJSON import/export, LightGBM model import, and models embedded in the binary at compile time.
 - **Modern modeling (opt-in):**
   - [Conformal intervals](https://docs.rs/hessboost/latest/hessboost/conformal/): Finite-sample coverage guarantees.

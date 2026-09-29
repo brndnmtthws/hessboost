@@ -298,8 +298,8 @@ impl DMatrix {
         Ok(Self { inner })
     }
 
-    /// The rows `rows`, in that order, with their metadata (groups are not
-    /// carried over).
+    /// The rows `rows`, in that order, with their metadata (query groups
+    /// only when `rows` lists whole groups, each in row order).
     fn select_rows(&self, py: Python<'_>, rows: PyReadonlyArray1<'_, i64>) -> PyResult<Self> {
         let rows = row_major(&rows, "rows")?;
         let n = self.inner.n_rows();

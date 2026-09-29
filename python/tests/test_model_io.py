@@ -292,3 +292,20 @@ def test_lightgbm_text_models_load_and_predict_lightgbms_values() -> None:
     refused = path.read_text().replace("version=v4", "version=v3", 1)
     with pytest.raises(ModelFormatError, match="LightGBM model: model version"):
         Booster(refused.encode())
+
+
+def test_model_layout_metadata() -> None:
+    x, y = classes(n_classes=3)
+    forest = hessboost.train(
+        {"objective": "multi:softprob", "num_class": 3, "num_parallel_tree": 2}, DMatrix(x, y), 4
+    )
+    assert (forest.num_outputs, forest.num_targets, forest.num_parallel_tree) == (3, 1, 2)
+    assert forest.num_trees() == 4 * 3 * 2 == forest.predict(x, pred_leaf=True).shape[1]
+    assert len(forest.base_margins) == 3
+    assert not forest.vector_leaves
+    targets = np.column_stack([x[:, 0], x[:, 1]])
+    vector = hessboost.train(
+        {"multi_strategy": "multi_output_tree", "tree_method": "hist"}, DMatrix(x, targets), 3
+    )
+    assert vector.vector_leaves
+    assert (vector.num_outputs, vector.num_targets, vector.num_trees()) == (2, 2, 3)

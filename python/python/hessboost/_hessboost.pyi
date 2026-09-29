@@ -9,17 +9,20 @@ from numpy.typing import ArrayLike, NDArray
 __all__ = [
     "Booster",
     "BoulevardInference",
+    "CompactModel",
     "ConformalizedQuantile",
     "DMatrix",
     "DiffusionModel",
     "DiffusionParams",
     "Distributions",
     "EbmInference",
+    "FittedTargetEncoder",
     "ForestModel",
     "ForestParams",
     "GpuModel",
     "OnlineModel",
     "OnlineParams",
+    "OrderedTargetEncoder",
     "Params",
     "SplitConformal",
     "TermShape",
@@ -33,6 +36,7 @@ __all__ = [
     "samples_quantiles",
     "shape_functions",
     "train",
+    "train_with_budget",
 ]
 
 @final
@@ -174,6 +178,31 @@ class Booster:
     @property
     def ebm(self) -> dict[str, Any] | None: ...
     def to_gpu(self) -> GpuModel: ...
+    def to_compact(self) -> CompactModel: ...
+    def size_report(self) -> dict[str, int]: ...
+
+@final
+class CompactModel:
+    @staticmethod
+    def load(data: bytes) -> CompactModel: ...
+    def save(self) -> bytes: ...
+    def predict(self, data: DMatrix, margin: bool) -> NDArray[np.float32]: ...
+    @property
+    def objective(self) -> str: ...
+    @property
+    def num_trees(self) -> int: ...
+    @property
+    def num_features(self) -> int: ...
+    @property
+    def num_outputs(self) -> int: ...
+    @property
+    def size_bytes(self) -> int: ...
+    @property
+    def used_features(self) -> list[int]: ...
+    @property
+    def num_thresholds(self) -> int: ...
+    @property
+    def num_leaf_values(self) -> int: ...
 
 @final
 class GpuModel:
@@ -370,13 +399,45 @@ class ForestModel:
     @property
     def classes(self) -> NDArray[np.float64]: ...
 
+@final
+class OrderedTargetEncoder:
+    def __new__(
+        cls,
+        *,
+        prior_weight: float,
+        prior: float | None,
+        permutations: int,
+        seed: int,
+        target: Literal["regression", "binary"],
+    ) -> OrderedTargetEncoder: ...
+    def fit_transform(
+        self, data: DMatrix, columns: list[int], label: NDArray[np.float32] | None = None
+    ) -> tuple[DMatrix, FittedTargetEncoder]: ...
+
+@final
+class FittedTargetEncoder:
+    def transform(self, data: DMatrix) -> DMatrix: ...
+    def encode(self, column: int, code: int) -> float | None: ...
+    @property
+    def prior(self) -> float: ...
+    @property
+    def columns(self) -> list[int]: ...
+
 def train(request: Mapping[str, object]) -> tuple[Booster, float | None]: ...
+def train_with_budget(
+    params: Params,
+    dtrain: DMatrix,
+    budget: float,
+    iteration_limit: int | None = None,
+    stopping_rounds: int | None = None,
+) -> Booster: ...
 def cv(
     params: Params,
     data: DMatrix,
     num_boost_round: int,
     folds: list[tuple[list[int], list[int]]],
     early_stopping_rounds: int | None = None,
+    target_stats: tuple[OrderedTargetEncoder, list[int]] | None = None,
 ) -> list[tuple[str, list[float], list[float]]]: ...
 def k_fold(
     n_rows: int, nfold: int, seed: int

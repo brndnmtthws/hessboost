@@ -1,10 +1,11 @@
 """``Booster``, exported from :mod:`hessboost`, with its prediction and
-model-format types."""
+model-format types, and the compact and GPU layouts a booster converts to."""
 
 from __future__ import annotations
 
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, overload
 
 import numpy as np
@@ -22,10 +23,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Booster",
+    "CompactModel",
     "Distributions",
     "GpuModel",
     "ImportanceType",
     "ModelFormat",
+    "ModelSizeReport",
 ]
 
 Distributions = _hessboost.Distributions
@@ -59,6 +62,42 @@ def _format_for(path: PathLike, format: ModelFormat | None) -> ModelFormat:
     if suffix == ".ubj":
         return "xgboost-ubjson"
     return "binary"
+
+
+@dataclass(frozen=True)
+class ModelSizeReport:
+    """A booster's size in the native binary and compact formats, with the
+    dictionary statistics of the *Trees on a Diet* paper, from
+    :meth:`Booster.size_report`."""
+
+    native_bytes: int
+    """The native binary model's size (every tree, covers and gains included)."""
+    compact_bytes: int
+    """The compact model's size."""
+    trees: int
+    """The trees the compact model stores (those prediction uses)."""
+    splits: int
+    """Split nodes across those trees."""
+    leaves: int
+    """Leaves across those trees."""
+    used_features: int
+    """Features the trees split on."""
+    thresholds: int
+    """Distinct thresholds and categorical sets, over every used feature."""
+    leaf_values: int
+    """Distinct leaf values."""
+
+    @property
+    def compression_ratio(self) -> float:
+        """``native_bytes / compact_bytes``."""
+        return self.native_bytes / self.compact_bytes
+
+    @property
+    def reuse_factor(self) -> float:
+        """Nodes per distinct dictionary entry, ``(splits + leaves) /
+        (thresholds + leaf_values)``: how often each threshold or leaf value
+        is shared."""
+        return (self.splits + self.leaves) / max(self.thresholds + self.leaf_values, 1)
 
 
 class Booster(_SchemaState):
@@ -160,6 +199,38 @@ class Booster(_SchemaState):
         """The number of features the model takes."""
         return self._model.num_features
 
+    def num_trees(self) -> int:
+        """The number of trees (``num_boosted_rounds() * trees per
+        iteration``; the column count of ``pred_leaf``)."""
+        return self._model.num_trees
+
+    @property
+    def num_outputs(self) -> int:
+        """Raw outputs (margins) per row: ``num_class`` for multiclass, one
+        per target or quantile otherwise."""
+        return self._model.num_outputs
+
+    @property
+    def num_targets(self) -> int:
+        """Label columns the model was trained on."""
+        return self._model.num_targets
+
+    @property
+    def num_parallel_tree(self) -> int:
+        """Trees per output per iteration (a boosted forest's size)."""
+        return self._model.num_parallel_tree
+
+    @property
+    def base_margins(self) -> list[float]:
+        """The per-output intercepts, in margin space."""
+        return self._model.base_margins
+
+    @property
+    def vector_leaves(self) -> bool:
+        """Whether each tree predicts every output (``multi_strategy=
+        "multi_output_tree"``), rather than one output per tree."""
+        return self._model.vector_leaves
+
     def _matrix(
         self, data: object, base_margin: ArrayLike | None, missing: float, validate: bool = True
     ) -> _hessboost.DMatrix:
@@ -257,6 +328,31 @@ class Booster(_SchemaState):
                 through the forest).
         """
         return GpuModel._wrap(self._model.to_gpu(), self)
+
+    def to_compact(self) -> CompactModel:
+        """This model in the bit-packed compact layout (*Boosted Trees on a
+        Diet*), for memory-constrained inference: it predicts bit-identical
+        values and margins to :meth:`predict` with the default iterations
+        (through :attr:`best_iteration`), and stores only those trees,
+        without covers and gains. Training with ``toad_penalty_feature`` and
+        ``toad_penalty_threshold`` shrinks it further. The compact model
+        keeps this booster's feature names and categories.
+
+        Raises:
+            HessboostError: The model is ``gblinear``, has ``linear_tree`` or
+                vector leaves, or splits one feature both numerically and
+                categorically.
+        """
+        return CompactModel._wrap(self._model.to_compact(), self)
+
+    def size_report(self) -> ModelSizeReport:
+        """This model's native binary versus compact size, with the compact
+        layout's dictionary statistics.
+
+        Raises:
+            HessboostError: As :meth:`to_compact`.
+        """
+        return ModelSizeReport(**self._model.size_report())
 
     def predict_distribution(
         self,
@@ -517,3 +613,151 @@ class GpuModel:
         matrix = model._matrix(data, base_margin, missing, validate_features)
         kind = "margin" if output_margin else "value"
         return self._core.predict(matrix, kind, Booster._range(iteration_range))
+
+
+class CompactModel(_SchemaState):
+    """A tree ensemble in hessboost's bit-packed compact format (``HBTD``,
+    *Boosted Trees on a Diet*), predicting bit-identical values and margins
+    to the :class:`Booster` it came from while taking a fraction of its
+    size. It predicts straight from the packed trees; it has no SHAP, leaf
+    or iteration-range predictions (only the trees default prediction uses
+    are stored). XGBoost cannot read the format.
+
+    Get one from :meth:`Booster.to_compact`, or load a saved one with
+    ``CompactModel(model_file)``.
+
+    Args:
+        model_file: A path or the bytes of a compact model
+            (:meth:`save_model`/:meth:`save_raw`).
+
+    Raises:
+        ModelFormatError: The content is not a valid compact model.
+        OSError: The file cannot be read.
+    """
+
+    __module__ = "hessboost"
+
+    _core: _hessboost.CompactModel
+
+    def __init__(self, model_file: PathLike | bytes | bytearray | memoryview) -> None:
+        data = (
+            bytes(model_file)
+            if isinstance(model_file, (bytes, bytearray, memoryview))
+            else read_bytes(model_file)
+        )
+        self._core = _hessboost.CompactModel.load(data)
+        self._set_schema(None, None, {})
+
+    @classmethod
+    def _wrap(cls, core: _hessboost.CompactModel, booster: Booster) -> CompactModel:
+        model = cls.__new__(cls)
+        model._core = core
+        model._set_schema(booster._feature_names, booster._feature_types, dict(booster._categories))
+        return model
+
+    @property
+    def feature_names(self) -> list[str] | None:
+        """The training features' names, if known (not stored in the file;
+        pickling keeps them). Assignable, as :attr:`Booster.feature_names`."""
+        return None if self._feature_names is None else list(self._feature_names)
+
+    @feature_names.setter
+    def feature_names(self, names: Sequence[str] | None) -> None:
+        self._feature_names = (
+            None if names is None else _data._check_names(names, self.num_features())
+        )
+
+    @property
+    def feature_types(self) -> list[str] | None:
+        """``"q"``/``"c"`` per training feature, if known."""
+        return None if self._feature_types is None else list(self._feature_types)
+
+    @property
+    def objective(self) -> str:
+        """The objective that drives :meth:`predict`."""
+        return self._core.objective
+
+    def num_features(self) -> int:
+        """The number of features the model takes."""
+        return self._core.num_features
+
+    def num_trees(self) -> int:
+        """The number of stored trees."""
+        return self._core.num_trees
+
+    @property
+    def num_outputs(self) -> int:
+        """Raw outputs (margins) per row."""
+        return self._core.num_outputs
+
+    @property
+    def size_bytes(self) -> int:
+        """The serialized size in bytes."""
+        return self._core.size_bytes
+
+    @property
+    def used_features(self) -> list[int]:
+        """The indices of the features the trees split on, ascending."""
+        return self._core.used_features
+
+    @property
+    def num_thresholds(self) -> int:
+        """Distinct thresholds and categorical sets, over every used feature."""
+        return self._core.num_thresholds
+
+    @property
+    def num_leaf_values(self) -> int:
+        """Distinct leaf values."""
+        return self._core.num_leaf_values
+
+    def predict(
+        self,
+        data: object,
+        *,
+        output_margin: bool = False,
+        validate_features: bool = True,
+        base_margin: ArrayLike | None = None,
+        missing: float = np.nan,
+    ) -> NDArray[np.float32]:
+        """Predicts every row of ``data`` (a :class:`DMatrix` or anything
+        its constructor accepts; frames are re-coded to the model's
+        categories): the objective's predictions or, with ``output_margin``,
+        raw margins, ``(rows,)`` or ``(rows, K)`` for ``K`` outputs,
+        bit-identical to :meth:`Booster.predict`.
+
+        Args:
+            validate_features: Refuse data whose feature names differ from
+                the model's.
+            base_margin: Starting margins for array input (a
+                :class:`DMatrix` carries its own).
+            missing: The missing-value marker for array input.
+        """
+        matrix = _matrix_for(
+            data,
+            ((self, "the model's"),),
+            base_margin=base_margin,
+            missing=missing,
+            validate_names=validate_features,
+        )
+        return self._core.predict(matrix._core, output_margin)
+
+    def save_raw(self) -> bytes:
+        """The serialized model."""
+        return self._core.save()
+
+    def save_model(self, fname: PathLike) -> None:
+        """Writes the model to ``fname``. Feature names and categories are
+        not part of the format; pickle the model to keep them."""
+        write_bytes(fname, self.save_raw())
+
+    def _model_state(self) -> bytes:
+        return self._core.save()
+
+    def _restore_model(self, model: bytes) -> None:
+        self._core = _hessboost.CompactModel.load(model)
+
+    def __repr__(self) -> str:
+        return (
+            f"CompactModel(objective={self.objective!r}, trees={self.num_trees()}, "
+            f"features={self.num_features()}, bytes={self.size_bytes})"
+        )

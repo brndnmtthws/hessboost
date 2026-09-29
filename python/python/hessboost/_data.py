@@ -158,7 +158,12 @@ def _pandas_frame_values(
                 recode = pd.Index(wanted).get_indexer(dtype.categories)
                 if column in unseen:
                     recode = np.where(recode >= 0, recode, len(wanted))
-                codes = np.where(codes >= 0, recode[codes], -1)
+                # Only present codes index `recode`, which is empty when
+                # the frame's categories are.
+                present = codes >= 0
+                recoded = np.full(codes.shape, -1, dtype=np.int64)
+                recoded[present] = recode[codes[present]]
+                codes = recoded
                 known = wanted
             column_values = codes.astype(np.float32)
             column_values[codes < 0] = np.nan

@@ -87,6 +87,8 @@ def test_frame_transform_keeps_unseen_categories_apart_from_nulls(library: str) 
 
         train = pd.DataFrame({"city": pd.Categorical(cities), "x": np.arange(6.0)})
         test = pd.DataFrame({"city": pd.Categorical(new), "x": np.arange(3.0)})
+        # No categories at all: every code is null.
+        nulls = pd.DataFrame({"city": pd.Categorical([None, None]), "x": [0.0, 1.0]})
     else:
         pl = pytest.importorskip("polars")
         train = pl.DataFrame({"city": cities, "x": np.arange(6.0)}).with_columns(
@@ -95,6 +97,9 @@ def test_frame_transform_keeps_unseen_categories_apart_from_nulls(library: str) 
         test = pl.DataFrame({"city": new, "x": np.arange(3.0)}).with_columns(
             pl.col("city").cast(pl.Categorical)
         )
+        nulls = pl.DataFrame(
+            {"city": pl.Series([None, None], dtype=pl.String), "x": [0.0, 1.0]}
+        ).with_columns(pl.col("city").cast(pl.Categorical))
     stats = OrderedTargetEncoder().fit_transform(DMatrix(train, y), ["city"])[1]
     rome = stats.encode("city", sorted(set(cities)).index("rome"))
     # A linear model reads the encoded values back: a missing entry adds
@@ -108,6 +113,10 @@ def test_frame_transform_keeps_unseen_categories_apart_from_nulls(library: str) 
     unseen_prior = [[stats.prior, 0.0], [np.nan, 1.0], [rome, 2.0]]
     np.testing.assert_array_equal(got, probe.predict(np.array(unseen_prior)))
     assert got[0] != probe.predict(np.array([[np.nan, 0.0]]))[0]
+    np.testing.assert_array_equal(
+        probe.predict(stats.transform(nulls)),
+        probe.predict(np.array([[np.nan, 0.0], [np.nan, 1.0]])),
+    )
 
 
 def test_refusals() -> None:

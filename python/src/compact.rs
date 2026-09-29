@@ -30,9 +30,10 @@ impl CompactModel {
             .map(Self::new)
     }
 
-    /// The serialized model.
+    /// The serialized model, copied out without the GIL.
     fn save<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.inner.encode())
+        let bytes = py.detach(|| self.inner.encode());
+        PyBytes::new(py, &bytes)
     }
 
     /// Predictions (`margin`: raw margins), `(rows,)` or `(rows, width)`.

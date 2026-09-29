@@ -146,7 +146,11 @@ impl Incremental<'_> {
             trees.push(tree);
             for i in regrown_rows {
                 if !std::mem::replace(&mut fresh[i], true) {
-                    margins[i] = base + trees.iter().map(|t| t.predict_row(new, i)).sum::<f32>();
+                    // Tree by tree from the intercept, as prediction adds
+                    // them (a sum of the trees first rounds differently).
+                    margins[i] = trees
+                        .iter()
+                        .fold(base, |margin, t| margin + t.predict_row(new, i));
                 }
             }
             if on_round(RoundEval::unscored(m)).is_break() {

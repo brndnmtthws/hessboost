@@ -307,9 +307,12 @@ impl OnlineModel {
     /// `max_delta_step`, several outputs, weighted trees, categorical trees
     /// in the approximate mode, linear leaves, a `gblinear`, `boulevard`, or
     /// `ebm` booster, for example from an imported LightGBM `linear_tree`
-    /// model, model shrinkage, a different feature count) and for an
-    /// early-stopped model (`best_iteration` set: slice it to its best
-    /// iterations first), and [`HessboostError::InvalidParameter`] for
+    /// model, model shrinkage, a different feature count, or, in the
+    /// approximate mode, a first tree whose leaves are not these parameters'
+    /// Newton steps on `data`: another `eta` or `lambda`, other data, or an
+    /// imported LightGBM model, whose first tree carries the label average)
+    /// and for an early-stopped model (`best_iteration` set: slice it to its
+    /// best iterations first), and [`HessboostError::InvalidParameter`] for
     /// `eval_metric`s training would refuse.
     pub fn from_model(
         model: BoostedModel,

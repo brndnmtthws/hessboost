@@ -759,3 +759,101 @@ fn updates_that_overflow_are_refused_and_change_nothing() {
     assert_eq!(online.model().trees(), before.trees());
     assert_eq!(online.data().n_rows(), 1);
 }
+
+/// The approximate mode refuses a model whose first-tree leaves are not the
+/// parameters' Newton steps on the data: an imported LightGBM model (its
+/// first tree carries the label average) or one trained with another `eta`.
+/// A model the approximate mode itself produced, resumed on its data, is
+/// accepted; the exact mode, which retrains, accepts all of them.
+#[test]
+fn approximate_from_model_refuses_leaves_other_parameters_made() {
+    let text = "tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nlabel_index=0\n\
+                max_feature_idx=0\nobjective=regression\nfeature_names=x\nfeature_infos=none\n\n\
+                Tree=0\nnum_leaves=1\nnum_cat=0\nleaf_value=5\nleaf_weight=4\nleaf_count=4\n\
+                is_linear=0\nshrinkage=1\n\n\nend of trees\n";
+    let imported = BoostedModel::decode(text, ModelFormat::LightgbmText).unwrap();
+    let fives = rows(&[0.0, 1.0, 2.0, 3.0], 1, &[5.0; 4]);
+    let mut p = plain(1);
+    p.eta = 0.3;
+    p.base_score = None;
+    let approximate = OnlineParams::default();
+    assert_eq!(
+        incompatible_model(OnlineModel::from_model(
+            imported.clone(),
+            &p,
+            &fives,
+            approximate
+        )),
+        "model"
+    );
+    assert!(OnlineModel::from_model(imported, &p, &fives, OnlineParams::exact()).is_ok());
+
+    let d = data(300, 21, false);
+    let trained = params(Objective::SquaredError(RegLoss::default()));
+    let model = train(&trained, &d, 5).unwrap();
+    let mut other_eta = trained.clone();
+    other_eta.eta = 0.5;
+    assert_eq!(
+        incompatible_model(OnlineModel::from_model(
+            model.clone(),
+            &other_eta,
+            &d,
+            approximate
+        )),
+        "model"
+    );
+    let mut online = OnlineModel::from_model(model, &trained, &d, approximate).unwrap();
+    online
+        .update(Some(&data(20, 22, false)), &[0, 5, 9])
+        .unwrap();
+    let saved = online.model().clone();
+    assert!(OnlineModel::from_model(saved, &trained, online.data(), approximate).is_ok());
+}
+
+/// Rows whose gradients are refreshed after a regrowth get the updated
+/// model's margins, accumulated tree by tree from the intercept as
+/// prediction does. At a large intercept a sum of the trees first rounds
+/// differently: here every row is fresh at the third tree, which must then
+/// be the tree one round of training fits to the updated two-tree model's
+/// residuals.
+#[test]
+fn refreshed_margins_follow_the_prediction_recurrence() {
+    let mut p = plain(1);
+    p.base_score = Some(1e8);
+    let d = rows(&[0.0, 1.0, 2.0, 3.0], 1, &[0.0, 1.0, 2.0, 3.0]);
+    let mut online =
+        OnlineModel::train(&p, &d, 3, OnlineParams::approximate(0.01).unwrap()).unwrap();
+    online.update(Some(&rows(&[0.0], 1, &[10.0])), &[]).unwrap();
+    let data = online.data();
+    let prefix = online
+        .model()
+        .slice(..2, 1)
+        .unwrap()
+        .predict(data, ..)
+        .unwrap();
+    let labels: Vec<f32> = data.labels().unwrap().to_vec();
+    let x: Vec<f32> = (0..data.n_rows())
+        .map(|i| data.get(i, 0).unwrap())
+        .collect();
+    let residuals: Vec<f32> = labels
+        .iter()
+        .zip(prefix.as_slice())
+        .map(|(y, m)| y - m)
+        .collect();
+    let mut correction_params = plain(1);
+    correction_params.base_score = Some(0.0);
+    let correction = train(&correction_params, &rows(&x, 1, &residuals), 1)
+        .unwrap()
+        .predict(&rows(&x, 1, &residuals), ..)
+        .unwrap();
+    let expected: Vec<f32> = prefix
+        .as_slice()
+        .iter()
+        .zip(correction.as_slice())
+        .map(|(m, c)| m + c)
+        .collect();
+    assert_eq!(
+        online.model().predict(data, ..).unwrap().as_slice(),
+        expected
+    );
+}

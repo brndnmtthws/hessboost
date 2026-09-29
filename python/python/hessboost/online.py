@@ -214,8 +214,11 @@ class OnlineModel:
                 (another objective or ``max_delta_step``, several outputs,
                 weighted trees, categorical trees in the :class:`Approximate` mode,
                 linear leaves such as an imported LightGBM ``linear_tree``
-                model's, another feature count or other features), or it was
-                early-stopped (slice it to its best iterations first).
+                model's, another feature count or other features), it was
+                early-stopped (slice it to its best iterations first), or (in
+                the :class:`Approximate` mode) its first tree's leaves are not
+                ``params``' Newton steps on ``dtrain`` (another ``eta`` or
+                ``lambda``, other data, or an imported LightGBM model).
         """
         if not isinstance(booster, Booster):
             raise TypeError(f"booster must be a Booster, got {type(booster).__name__}")

@@ -5,12 +5,12 @@ use crate::config::TrainingParams;
 use crate::data::DMatrix;
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::data::quantile::HistCuts;
-use crate::error::Result;
+use crate::error::{HessboostError, Result};
 use crate::model::BoostedModel;
 use crate::objective::{GradPair, Loss};
 use crate::training::margins::{TreeOutput, add_tree_margins};
 use crate::tree::RegTree;
-use crate::tree::gain::GradStats;
+use crate::tree::gain::{GradStats, RegParams, calc_weight};
 
 /// The approximate mode's state.
 #[derive(Debug, Clone)]
@@ -52,7 +52,7 @@ impl Cache {
         let objective = params.loss(1)?;
         let mut margins = vec![model.base_scores()[0]; data.n_rows()];
         let mut trees = Vec::with_capacity(model.num_trees());
-        for tree in model.trees() {
+        for (t, tree) in model.trees().iter().enumerate() {
             let grads = gradients(objective.as_ref(), data, &margins);
             let mut nodes = vec![NodeCache::default(); tree.num_nodes()];
             accumulate(
@@ -63,6 +63,9 @@ impl Cache {
                 grads.iter().copied().enumerate(),
                 &mut nodes,
             );
+            if t == 0 {
+                check_newton_leaves(tree, &nodes, params)?;
+            }
             add_tree_margins(tree, data, &mut margins, 1, TreeOutput::Scalar(0));
             trees.push(TreeCache { nodes, grads });
         }
@@ -74,6 +77,41 @@ impl Cache {
             trees,
         })
     }
+}
+
+/// Refuse a first tree whose leaves are not the `eta`-scaled Newton steps
+/// `params` gives on the replayed rows. Updates recompute every leaf they
+/// touch that way, so a model whose leaves follow another convention (an
+/// imported LightGBM model, whose first tree carries the label average) or
+/// other parameters (another `eta`, `lambda`, `alpha`) or data would have
+/// its untouched and recomputed leaves disagree. The first tree is checked
+/// because its gradients, at the intercept, stay exact through approximate
+/// updates: a model an update produced passes on its own data.
+fn check_newton_leaves(tree: &RegTree, nodes: &[NodeCache], params: &TrainingParams) -> Result<()> {
+    let reg = RegParams::from_params(params);
+    let eta = params.eta as f32;
+    for (nid, cache) in nodes.iter().enumerate() {
+        let node = tree.node(nid);
+        if !node.is_leaf() || cache.stats.hess <= 0.0 {
+            continue;
+        }
+        let expected = (calc_weight(cache.stats, &reg) as f32) * eta;
+        let stored = node.leaf_value;
+        // `false` for a NaN leaf, which is refused too.
+        let close = (stored - expected).abs() <= 1e-3 * (1.0 + expected.abs());
+        if !close {
+            return Err(HessboostError::incompatible_model(
+                "model",
+                format!(
+                    "leaf {nid} of the first tree holds {stored}, but these parameters give \
+                     {expected} on this data: the approximate mode updates only models \
+                     trained with these parameters on this data (not, for example, an \
+                     imported LightGBM model, whose first tree carries the label average)"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Gradient pairs of every row of `data` at `margins`.

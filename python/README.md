@@ -93,7 +93,11 @@ every `n`-th), `xgb_model` (continued training, or tree refresh with
 `process_type="update"`), a custom objective `obj`, a `custom_metric`,
 and `callbacks`. Ctrl-C stops training at the end of the current round
 and raises `KeyboardInterrupt`. `hessboost.cv` cross-validates over
-shuffled folds, explicit folds, or a scikit-learn splitter.
+shuffled folds, explicit folds, or a scikit-learn splitter; on ranking data
+each fold must hold whole query groups (e.g. `GroupKFold` over the query
+ids). `hessboost.train_with_budget(params, dtrain, budget)` trains with one
+fitting budget in place of `eta`, tree limits, and a round count
+(PerpetualBooster's algorithm).
 
 Subclass `TrainingCallback` to stop on your own condition; `after_iteration`
 sees the round and the evaluation history, and returning `True` stops
@@ -406,6 +410,23 @@ gpu = booster.to_gpu()
 probabilities = gpu.predict(X_test)
 ```
 
+### Compact models
+
+`Booster.to_compact()` packs the trees default prediction uses into
+hessboost's bit-packed `HBTD` format (*Boosted Trees on a Diet*), which
+predicts bit-identical values and margins in a fraction of the size;
+training with `toad_penalty_feature`/`toad_penalty_threshold` shrinks it
+further. `Booster.size_report()` compares the two formats:
+
+```python
+from hessboost import CompactModel
+
+compact = booster.to_compact()
+compact.save_model("model.hbtd")
+predictions = CompactModel("model.hbtd").predict(X_test)
+print(booster.size_report().compression_ratio)
+```
+
 ### Validation folds
 
 `hessboost.folds` builds `(train_rows, test_rows)` splits for `cv` or custom
@@ -419,6 +440,24 @@ from hessboost import folds
 
 splits = folds.forward_chaining(dtrain.num_row(), 4, gap=24)
 result = hessboost.cv({"max_depth": 4}, dtrain, 100, folds=splits)
+```
+
+### Ordered target statistics
+
+`hessboost.target_stats.OrderedTargetEncoder` replaces categorical columns
+with CatBoost-style ordered target means: a training row's encoding never
+sees its own label. `label=` supplies the target for a multi-target matrix
+or a class's 0/1 indicator. In `cv`, `target_stats=` fits the encoder on
+each fold's training rows only, so no held-out label reaches an encoding:
+
+```python
+from hessboost.target_stats import OrderedTargetEncoder
+
+encoder = OrderedTargetEncoder(seed=7)
+dtrain_encoded, stats = encoder.fit_transform(dtrain, ["city"])
+booster = hessboost.train({"max_depth": 4}, dtrain_encoded, 100)
+predictions = booster.predict(stats.transform(X_test))
+result = hessboost.cv({"max_depth": 4}, dtrain, 100, target_stats=["city"], target_encoder=encoder)
 ```
 
 ### Extra training options

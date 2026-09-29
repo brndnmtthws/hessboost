@@ -125,7 +125,9 @@
 //!   (timestamped rows, purged by each label window,
 //!   [`Fold::purged_forward`](training::Fold::purged_forward))
 //!   [`Fold`](training::Fold)s with fold-mean early stopping
-//!   ([`CrossValidation`](training::CrossValidation)).
+//!   ([`CrossValidation`](training::CrossValidation)); whole-query folds of
+//!   ranking data; ordered target statistics fitted inside each fold
+//!   ([`CrossValidation::target_stats`](training::CrossValidation::target_stats)).
 //! - **Advanced & experimental methods (opt-in):**
 //!   - split-conformal and conformalized-quantile intervals with
 //!     finite-sample marginal coverage ([`conformal`]);

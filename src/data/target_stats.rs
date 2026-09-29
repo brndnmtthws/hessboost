@@ -48,8 +48,18 @@
 //! arbitrary order on the classes, and CatBoost's per-class encodings would
 //! replace one column with `num_class` columns and renumber every later
 //! feature. To get per-class statistics, fit one encoder per class on 0/1
-//! indicator labels. Instance weights are ignored (unweighted counts, as in
-//! CatBoost's counters).
+//! indicator labels. The statistics come from the matrix's own labels
+//! ([`OrderedTargetEncoder::fit_transform`], one per row) or from a separate
+//! per-row target ([`OrderedTargetEncoder::fit_transform_with_labels`]: one
+//! column of a multi-target matrix, a class indicator), which leaves the
+//! matrix's labels as they are. Instance weights are ignored (unweighted
+//! counts, as in CatBoost's counters).
+//!
+//! To cross-validate a model trained on encoded columns, fit the encoder
+//! inside each fold
+//! ([`CrossValidation::target_stats`](crate::training::CrossValidation::target_stats)):
+//! encoding the whole matrix first puts every test row's label into its own
+//! encoding.
 //!
 //! ```
 //! use hessboost::data::FeatureType;
@@ -209,6 +219,9 @@ impl OrderedTargetEncoder {
 
     /// Fit statistics on the labelled training matrix `data` and encode its
     /// `columns`, which must be distinct and [`FeatureType::Categorical`].
+    /// `data` needs one label per row; for a multi-target matrix (or to
+    /// encode against another target), use
+    /// [`fit_transform_with_labels`](Self::fit_transform_with_labels).
     ///
     /// Returns the training matrix with those columns replaced by their
     /// ordered encodings (now [`FeatureType::Numerical`]; everything else,
@@ -221,16 +234,48 @@ impl OrderedTargetEncoder {
         data: &DMatrix,
         columns: &[usize],
     ) -> Result<(DMatrix, FittedTargetEncoder)> {
-        let n_rows = data.n_rows();
         let labels = data.labels().ok_or_else(|| {
             HessboostError::invalid_data("labels", "ordered target statistics need labels")
         })?;
-        if labels.len() != n_rows {
+        if labels.len() != data.n_rows() {
             return Err(HessboostError::invalid_data(
                 "labels",
-                "ordered target statistics need exactly one label per row",
+                "ordered target statistics need exactly one label per row; pass the per-row \
+                 target separately",
             ));
         }
+        self.fit_labels(data, columns, labels)
+    }
+
+    /// [`fit_transform`](Self::fit_transform) with the statistics taken over
+    /// `labels` (one finite value per row) instead of `data`'s labels, which
+    /// may be absent or have several targets and are kept unchanged in the
+    /// encoded matrix. This encodes a multi-target matrix against one of its
+    /// targets (or any other per-row target) without copying it to relabel it.
+    pub fn fit_transform_with_labels(
+        &self,
+        data: &DMatrix,
+        columns: &[usize],
+        labels: &[f32],
+    ) -> Result<(DMatrix, FittedTargetEncoder)> {
+        check_len("target statistics labels", labels.len(), data.n_rows())?;
+        if labels.iter().any(|y| !y.is_finite()) {
+            return Err(HessboostError::invalid_data(
+                "labels",
+                "ordered target statistics need finite labels",
+            ));
+        }
+        self.fit_labels(data, columns, labels)
+    }
+
+    /// The shared fit over `labels`, one per row of `data`.
+    fn fit_labels(
+        &self,
+        data: &DMatrix,
+        columns: &[usize],
+        labels: &[f32],
+    ) -> Result<(DMatrix, FittedTargetEncoder)> {
+        let n_rows = data.n_rows();
         if self.target == TargetKind::Binary && labels.iter().any(|&y| y != 0.0 && y != 1.0) {
             return Err(HessboostError::invalid_data(
                 "labels",
@@ -243,7 +288,6 @@ impl OrderedTargetEncoder {
             .unwrap_or_else(|| labels.iter().map(|&y| f64::from(y)).sum::<f64>() / n_rows as f64);
         let a = self.prior_weight;
         let codes = collect_codes(data, &slots, columns.len());
-
         let mut encodings = vec![vec![0f64; n_rows]; codes.len()];
         let mut rng = Rng::new(self.seed);
         let mut order: Vec<usize> = (0..n_rows).collect();
@@ -660,6 +704,51 @@ mod tests {
         assert_eq!(out.feature_types(), &[FeatureType::Numerical; 2]);
         assert_eq!(fitted.encode(0, 5), Some(prior as f32));
         assert_eq!(fitted.encode(1, 0), None);
+    }
+
+    /// Explicit labels encode a multi-target matrix exactly as a matrix
+    /// labelled with that target alone, and leave its label matrix intact.
+    #[test]
+    fn explicit_labels_encode_a_multi_target_matrix() {
+        let (cats, labels) = crafted();
+        let second: Vec<f32> = labels.iter().map(|&y| 3.0 - y).collect();
+        let pairs: Vec<f32> = labels
+            .iter()
+            .zip(&second)
+            .flat_map(|(&a, &b)| [a, b])
+            .collect();
+        let multi = matrix(&cats, &labels).with_label_matrix(&pairs, 2).unwrap();
+        let enc = encoder(2, 9);
+        assert!(matches!(
+            enc.fit_transform(&multi, &[0]),
+            Err(HessboostError::InvalidData {
+                input: "labels",
+                ..
+            })
+        ));
+
+        let (encoded, fitted) = enc
+            .fit_transform_with_labels(&multi, &[0], &second)
+            .unwrap();
+        let (single, single_fitted) = enc.fit_transform(&matrix(&cats, &second), &[0]).unwrap();
+        assert_eq!(column(&encoded, 0), column(&single, 0));
+        assert_eq!(fitted, single_fitted);
+        assert_eq!(encoded.n_targets(), 2);
+        assert_eq!(encoded.labels().unwrap(), pairs.as_slice());
+
+        assert!(matches!(
+            enc.fit_transform_with_labels(&multi, &[0], &second[1..]),
+            Err(HessboostError::DimensionMismatch { .. })
+        ));
+        let mut bad = second.clone();
+        bad[3] = f32::NAN;
+        assert!(matches!(
+            enc.fit_transform_with_labels(&multi, &[0], &bad),
+            Err(HessboostError::InvalidData {
+                input: "labels",
+                ..
+            })
+        ));
     }
 
     #[test]

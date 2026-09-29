@@ -1,11 +1,14 @@
-//! Training (`Trainer`), cross-validation, and fold construction.
+//! Training (`Trainer`, budget mode), cross-validation, and fold
+//! construction.
 
 use crate::booster::Booster;
 use crate::data::{DMatrix, row_major, to_numpy};
 use crate::errors::{DetachExt, OrRaise, refuse};
 use crate::params::Params;
+use crate::target_stats::OrderedTargetEncoder;
 use hessboost::metric::CustomMetric;
 use hessboost::objective::{CustomLoss, GradPair, Objective};
+use hessboost::training::budget::{self, BudgetConfig};
 use hessboost::training::{CrossValidation, Fold, RoundEval, Trainer};
 use numpy::ndarray::{ArrayView1, ArrayView2};
 use numpy::{PyArrayDyn, PyReadonlyArray1, ToPyArray};
@@ -419,12 +422,39 @@ pub(crate) fn train(py: Python<'_>, request: TrainRequest) -> PyResult<(Booster,
     Ok((Booster::new(result.model), result.best_score))
 }
 
+/// Trains in budget mode (`hessboost::training::budget`). There is no
+/// round hook, so it is not interruptible.
+#[pyfunction]
+#[pyo3(signature = (params, dtrain, budget, iteration_limit=None, stopping_rounds=None))]
+pub(crate) fn train_with_budget(
+    py: Python<'_>,
+    params: &Params,
+    dtrain: &DMatrix,
+    budget: f64,
+    iteration_limit: Option<usize>,
+    stopping_rounds: Option<usize>,
+) -> PyResult<Booster> {
+    let mut config = BudgetConfig::new(budget);
+    if let Some(limit) = iteration_limit {
+        config = config.iteration_limit(limit);
+    }
+    if let Some(rounds) = stopping_rounds {
+        config = config.stopping_rounds(rounds);
+    }
+    let result =
+        py.detached(|| budget::train_with_budget(&params.inner, &dtrain.inner, &config))?;
+    Ok(Booster::new(result.model))
+}
+
 /// `(metric, per-round test means, per-round test standard deviations)`.
 type CvHistory = Vec<(String, Vec<f64>, Vec<f64>)>;
 
-/// Cross-validates over explicit `(train rows, test rows)` folds.
+/// Cross-validates over explicit `(train rows, test rows)` folds, with
+/// `target_stats = (encoder, columns)` fitted inside each fold.
 #[pyfunction]
-#[pyo3(signature = (params, data, num_boost_round, folds, early_stopping_rounds=None))]
+#[pyo3(signature = (
+    params, data, num_boost_round, folds, early_stopping_rounds=None, target_stats=None
+))]
 pub(crate) fn cv(
     py: Python<'_>,
     params: &Params,
@@ -432,16 +462,22 @@ pub(crate) fn cv(
     num_boost_round: usize,
     folds: Vec<(Vec<usize>, Vec<usize>)>,
     early_stopping_rounds: Option<usize>,
+    target_stats: Option<(Py<OrderedTargetEncoder>, Vec<usize>)>,
 ) -> PyResult<CvHistory> {
     let early_stopping_rounds = patience(early_stopping_rounds)?;
     let folds = folds
         .into_iter()
         .map(|(train, test)| Fold::new(train, test))
         .collect();
+    let target_stats =
+        target_stats.map(|(encoder, columns)| (encoder.get().inner.clone(), columns));
     let results = py.detached(|| {
         let mut cv = CrossValidation::new(&params.inner, &data.inner, num_boost_round, folds);
         if let Some(rounds) = early_stopping_rounds {
             cv = cv.early_stopping_rounds(rounds);
+        }
+        if let Some((encoder, columns)) = target_stats {
+            cv = cv.target_stats(encoder, columns);
         }
         cv.run()
     })?;

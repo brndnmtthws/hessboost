@@ -16,6 +16,7 @@
 
 mod booster;
 mod codec;
+mod compact;
 mod conformal;
 mod data;
 mod diffusion;
@@ -27,6 +28,7 @@ mod gpu;
 mod inference;
 mod online;
 mod params;
+mod target_stats;
 mod train;
 
 use pyo3::prelude::*;
@@ -36,6 +38,7 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<data::DMatrix>()?;
     m.add_class::<params::Params>()?;
     m.add_class::<booster::Booster>()?;
+    m.add_class::<compact::CompactModel>()?;
     m.add_class::<dist::Distributions>()?;
     m.add_class::<gpu::GpuModel>()?;
     m.add_class::<conformal::SplitConformal>()?;
@@ -51,7 +54,10 @@ fn _hessboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<diffusion::DiffusionModel>()?;
     m.add_class::<forest::ForestParams>()?;
     m.add_class::<forest::ForestModel>()?;
+    m.add_class::<target_stats::OrderedTargetEncoder>()?;
+    m.add_class::<target_stats::FittedTargetEncoder>()?;
     m.add_function(wrap_pyfunction!(train::train, m)?)?;
+    m.add_function(wrap_pyfunction!(train::train_with_budget, m)?)?;
     m.add_function(wrap_pyfunction!(train::cv, m)?)?;
     m.add_function(wrap_pyfunction!(train::k_fold, m)?)?;
     m.add_function(wrap_pyfunction!(train::forward_chaining, m)?)?;

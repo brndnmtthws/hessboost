@@ -19,17 +19,20 @@ Submodules:
   diffusion and flow matching
 * :mod:`hessboost.folds` -- k-fold and forward-chaining (purged) folds
 * :mod:`hessboost.online` -- adding and deleting training rows in place
+* :mod:`hessboost.target_stats` -- ordered target statistics for categorical columns
 """
 
 from importlib.metadata import version as _version
 
-from hessboost import conformal, diffusion, ebm, folds, inference, online
+from hessboost import conformal, diffusion, ebm, folds, inference, online, target_stats
 from hessboost._booster import (
     Booster,
+    CompactModel,
     Distributions,
     GpuModel,
     ImportanceType,
     ModelFormat,
+    ModelSizeReport,
 )
 from hessboost._core import Uncertainty
 from hessboost._exceptions import (
@@ -46,6 +49,7 @@ from hessboost._training import (
     TrainingCallback,
     cv,
     train,
+    train_with_budget,
 )
 
 __version__: str = _version("hessboost")
@@ -53,6 +57,7 @@ __version__: str = _version("hessboost")
 
 __all__ = [
     "Booster",
+    "CompactModel",
     "CustomMetric",
     "DMatrix",
     "Distributions",
@@ -64,6 +69,7 @@ __all__ = [
     "InvalidDataError",
     "ModelFormat",
     "ModelFormatError",
+    "ModelSizeReport",
     "Objective",
     "TrainingCallback",
     "Uncertainty",
@@ -75,5 +81,7 @@ __all__ = [
     "folds",
     "inference",
     "online",
+    "target_stats",
     "train",
+    "train_with_budget",
 ]

@@ -704,9 +704,15 @@ impl DMatrix {
 
     /// Build a new matrix containing only `rows` (in the given order), carrying
     /// over labels (every target of each row), label bounds, weights, base
-    /// margin, and feature metadata. Used for cross-validation folds. Ranking
-    /// group info is not carried over. A dense matrix stays dense and a
-    /// sparse one sparse; either way the result's missing sentinel is NaN.
+    /// margin, ranking groups, and feature metadata. Used for cross-validation
+    /// folds. A dense matrix stays dense and a sparse one sparse; either way
+    /// the result's missing sentinel is NaN.
+    ///
+    /// On a matrix with query groups, `rows` must list whole groups back to
+    /// back, each group's rows together and in row order (a group may repeat
+    /// or be left out); the result has one group per listed group. A
+    /// selection that splits a group, reorders its rows, or interleaves them
+    /// with another group's is refused.
     pub fn select_rows(&self, rows: &[usize]) -> Result<Self> {
         if let Some(&row) = rows.iter().find(|&&row| row >= self.n_rows) {
             return Err(HessboostError::invalid_param(
@@ -714,6 +720,9 @@ impl DMatrix {
                 format!("row index {row} is out of bounds for {} rows", self.n_rows),
             ));
         }
+        let group_sizes = self
+            .selected_group_sizes(rows)
+            .map_err(|reason| HessboostError::invalid_param("rows", format!("rows {reason}")))?;
         let mut out = match &self.storage {
             Storage::Dense(data) => {
                 if rows.is_empty() {
@@ -775,7 +784,44 @@ impl DMatrix {
             .base_margin
             .as_deref()
             .map(|bm| gather(bm, bm.len() / self.n_rows));
+        if let Some(sizes) = group_sizes.filter(|sizes| !sizes.is_empty()) {
+            out.group = Some(GroupInfo::from_sizes(&sizes));
+        }
         Ok(out)
+    }
+
+    /// The query-group sizes of in-bounds `rows` selected from this matrix
+    /// ([`select_rows`](Self::select_rows)): `None` without groups, else one
+    /// size per whole group `rows` lists. A selection that is not whole
+    /// groups back to back, each in row order, is refused with the reason,
+    /// which completes "rows …".
+    pub(crate) fn selected_group_sizes(
+        &self,
+        rows: &[usize],
+    ) -> std::result::Result<Option<Vec<usize>>, String> {
+        let Some(group) = &self.group else {
+            return Ok(None);
+        };
+        let ptr = &group.group_ptr;
+        let mut sizes = Vec::new();
+        let mut at = 0;
+        while let Some(&row) = rows.get(at) {
+            // `ptr` starts at 0 and ends at `n_rows`, past every row, so the
+            // group holding `row` is the last one starting at or before it.
+            let g = ptr.partition_point(|&start| start <= row) - 1;
+            let (start, end) = (ptr[g], ptr[g + 1]);
+            let run = rows.get(at..at + (end - start));
+            if !run.is_some_and(|run| run.iter().copied().eq(start..end)) {
+                return Err(format!(
+                    "split query group {g} (rows {start}..{end}), reorder it, or interleave it \
+                     with other rows; select whole groups, each group's rows together and in \
+                     row order"
+                ));
+            }
+            sizes.push(end - start);
+            at += end - start;
+        }
+        Ok(Some(sizes))
     }
 
     /// Visit every non-missing entry as `(row, col, value)`, in row order.
@@ -1006,6 +1052,45 @@ mod tests {
             assert_eq!(s.get(cell / 2, cell % 2), want, "cell {cell}");
         }
         assert!(d.select_rows(&[]).is_err());
+    }
+
+    fn is_rows_refusal(result: &Result<DMatrix>) -> bool {
+        matches!(
+            result,
+            Err(HessboostError::InvalidParameter { name: "rows", .. })
+        )
+    }
+
+    /// Whole query groups keep their groups (and each row's expanded group
+    /// weight), in the order listed; any other selection of grouped rows is
+    /// refused rather than silently ungrouped.
+    #[test]
+    fn select_rows_keeps_whole_query_groups() {
+        let x: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let d = DMatrix::from_dense(&x, 6, 1)
+            .unwrap()
+            .with_group_sizes(&[2, 3, 1])
+            .unwrap()
+            .with_group_weights(&[1.0, 2.0, 3.0])
+            .unwrap();
+        let s = d.select_rows(&[5, 0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(s.group().unwrap().group_ptr, [0, 1, 3, 6, 7]);
+        assert_eq!(s.weights().unwrap(), &[3.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0]);
+        assert_eq!(s.get(0, 0), Some(5.0));
+        // Part of group 1, a group out of row order, and two interleaved
+        // groups.
+        assert!(is_rows_refusal(&d.select_rows(&[0, 1, 2, 3])));
+        assert!(is_rows_refusal(&d.select_rows(&[3, 2, 4])));
+        assert!(is_rows_refusal(&d.select_rows(&[1, 0])));
+        assert!(is_rows_refusal(&d.select_rows(&[0, 5, 1])));
+        // Without groups any selection goes.
+        assert!(
+            sample_dense()
+                .select_rows(&[2, 0])
+                .unwrap()
+                .group()
+                .is_none()
+        );
     }
 
     /// Categorical validation on sparse storage reports the first invalid

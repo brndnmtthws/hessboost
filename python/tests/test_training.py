@@ -550,6 +550,37 @@ def test_cv_accepts_explicit_folds_and_splitters() -> None:
     np.testing.assert_array_equal(by_splitter["test-rmse-mean"], by_pairs["test-rmse-mean"])
 
 
+def test_ranking_cv_keeps_whole_query_groups() -> None:
+    from sklearn.model_selection import GroupKFold
+
+    x, relevance, qid = ranking_data()
+    dtrain = DMatrix(x, relevance, qid=qid)
+    result = hessboost.cv(
+        {"objective": "rank:ndcg"}, dtrain, 5, folds=GroupKFold(3).split(x, groups=qid)
+    )
+    assert result["test-ndcg@32-mean"].shape == (5,)
+    assert np.all(np.isfinite(result["test-ndcg@32-mean"]))
+    # The shuffled default folds split query groups.
+    with pytest.raises(HessboostError, match="query group"):
+        hessboost.cv({"objective": "rank:ndcg"}, dtrain, 5)
+
+
+def test_train_with_budget_fits_and_refuses_tuned_parameters() -> None:
+    x, y = regression()
+    dtrain = DMatrix(x[:300], y[:300], feature_names=[f"f{i}" for i in range(x.shape[1])])
+    booster = hessboost.train_with_budget({}, dtrain, 1.0, iteration_limit=40)
+    assert 1 < booster.num_boosted_rounds() <= 40
+    assert booster.feature_names == dtrain.feature_names
+    baseline = rmse(np.full(100, y[:300].mean()), y[300:])
+    assert rmse(booster.predict(x[300:]), y[300:]) < 0.6 * baseline
+    again = hessboost.train_with_budget({"nthread": 1}, dtrain, 1.0, iteration_limit=40)
+    assert again.save_raw() == booster.save_raw()
+    with pytest.raises(HessboostError, match="max_depth"):
+        hessboost.train_with_budget({"max_depth": 3}, dtrain, 1.0)
+    with pytest.raises(HessboostError, match="budget"):
+        hessboost.train_with_budget({}, dtrain, 5.0)
+
+
 def test_folds() -> None:
     folds = hessboost.folds.k_fold(10, 3, seed=1)
     assert len(folds) == 3

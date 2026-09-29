@@ -95,11 +95,14 @@ def test_metadata_getters_and_set_info() -> None:
     assert targets.get_label().shape == (10, 2)
     matrix.feature_names = ["v", "w", "x", "y", "z"]
     assert matrix.feature_names == ["v", "w", "x", "y", "z"]
-    part = matrix.slice([9, 0])
-    np.testing.assert_array_equal(part.get_label(), y[[9, 0]].astype(np.float32))
-    np.testing.assert_array_equal(part.get_weight(), [10.0, 1.0])
+    part = matrix.slice([4, 5, 6, 7, 8, 9, 0, 1, 2, 3])
+    order = [4, 5, 6, 7, 8, 9, 0, 1, 2, 3]
+    np.testing.assert_array_equal(part.get_label(), y[order].astype(np.float32))
+    np.testing.assert_array_equal(part.get_weight()[:2], [5.0, 6.0])
     assert part.feature_names == matrix.feature_names
-    assert part.get_group().size == 0
+    np.testing.assert_array_equal(part.get_group(), [6, 4])
+    with pytest.raises(HessboostError, match="query group 1"):
+        matrix.slice([9, 0])
     with pytest.raises(HessboostError, match="out of range"):
         matrix.slice([10])
     assert repr(matrix) == "DMatrix(rows=10, features=5)"

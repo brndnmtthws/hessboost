@@ -492,6 +492,9 @@ LightGBM's `rank_xendcg` stream.
   `objective`, which `params` must then not set, and `num_class` is the
   custom objective's output count (XGBoost's custom-softmax convention;
   default: one per label column).
+  To fix `obj replaces objective`, remove the redundant `objective` entry
+  (such as `"objective": "reg:squarederror"`) from `params`, leaving the
+  callback's gradients, Hessians, and weighting unchanged.
 - `cv` returns a dict of numpy arrays (`test-<metric>-mean`/`-std`) with
   held-out metrics only; there is no `stratified` or `as_pandas`.
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's

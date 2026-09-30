@@ -492,9 +492,8 @@ LightGBM's `rank_xendcg` stream.
   `objective`, which `params` must then not set, and `num_class` is the
   custom objective's output count (XGBoost's custom-softmax convention;
   default: one per label column).
-  Unlike XGBoost, hessboost refuses `objective` alongside `obj`, so remove
-  `objective` from `params` when porting without changing the callback's
-  gradients, Hessians, or weighting.
+  Unlike XGBoost, which accepts both, hessboost refuses `objective` alongside
+  `obj`: drop `objective` from ported `params`; the callback needs no change.
 - `cv` returns a dict of numpy arrays (`test-<metric>-mean`/`-std`) with
   held-out metrics only; there is no `stratified` or `as_pandas`.
 - `predict` defaults to the iterations through `best_iteration` (XGBoost's

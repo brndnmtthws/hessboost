@@ -195,13 +195,18 @@
 //!     ([`device`](config::TrainingParams::device) = `metal`; exact integer
 //!     sums, CPU fallback outside their exact domain). Documented only in
 //!     macOS builds with the feature (`cargo doc --features metal`);
-//!     elsewhere [`backend::metal`] is a stub.
+//!     elsewhere [`backend::metal`] is a stub;
 //!   - portable GPU acceleration through wgpu (`wgpu` feature; Vulkan,
 //!     Metal, DirectX 12): the same bit-identical prediction
 //!     ([`to_wgpu`](model::BoostedModel::to_wgpu)) and histograms
 //!     ([`device`](config::TrainingParams::device) = `wgpu`), runnable
 //!     without a GPU on a software adapter such as Mesa's lavapipe;
-//!     unmeasured on real GPUs so far ([`backend::wgpu`]).
+//!     unmeasured on real GPUs so far ([`backend::wgpu`]);
+//!   - NVIDIA CUDA on Linux (`cuda` feature): bit-identical GPU histograms
+//!     ([`device`](config::TrainingParams::device) = `cuda`/`cuda:<n>`;
+//!     exact integer sums, `f64` chains in the CPU's order outside them),
+//!     loading the driver and NVRTC at run time. A correctness path so far
+//!     (one node at a time), not a speedup ([`backend::cuda`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
@@ -224,7 +229,7 @@
 //! forests, DART) match in quality only — the random streams differ.
 //! ### Not implemented
 //!
-//! - Distributed and external-memory training; CUDA.
+//! - Distributed and external-memory training; CUDA prediction.
 //! - XGBoost options available at one setting only (so they are not
 //!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
 //!   setting): gblinear uses `updater = coord_descent`
@@ -304,6 +309,8 @@ pub mod prelude {
 /// part of the public API: hidden from the docs and changed without notice.
 #[doc(hidden)]
 pub mod internals {
+    #[cfg(all(target_os = "linux", feature = "cuda"))]
+    pub use crate::backend::cuda::compile::compile_kernels;
     pub use crate::data::ghist::GHistIndex;
     pub use crate::data::quantile::HistCuts;
     pub use crate::tree::builder::HistTreeBuilder;

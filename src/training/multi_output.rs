@@ -47,7 +47,7 @@ pub(super) fn validate(params: &TrainingParams, n_outputs: usize) -> Result<()> 
             format!(
                 "`{}` does not support `multi_strategy = multi_output_tree` \
                  (the vector-leaf builder has its own histogram loop)",
-                params.device.name()
+                params.device
             ),
         ));
     }

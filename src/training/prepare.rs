@@ -350,5 +350,22 @@ fn hist_backend(params: &TrainingParams, index: &GHistIndex) -> Result<Box<dyn H
                 ))
             }
         }
+        Device::Cuda { ordinal } => {
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            {
+                let backend: Box<dyn HistogramBackend> =
+                    Box::new(crate::backend::cuda::CudaHistBackend::new(index, ordinal)?);
+                Ok(backend)
+            }
+            #[cfg(not(all(target_os = "linux", feature = "cuda")))]
+            {
+                // Unreachable in practice, as for `metal`.
+                let _ = (index, ordinal);
+                Err(HessboostError::invalid_param(
+                    "device",
+                    "`cuda` requires building with the `cuda` feature on Linux",
+                ))
+            }
+        }
     }
 }

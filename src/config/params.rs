@@ -155,15 +155,16 @@ pub enum GrowPolicy {
     Symmetric,
 }
 
-/// Which processor training runs on. XGBoost `device` (XGBoost spells its
-/// GPU choices `cuda`/`gpu`; the GPU backends here are `metal` and `wgpu`).
+/// Which processor training runs on. XGBoost `device`: `cpu`, `cuda`,
+/// `cuda:<ordinal>`, and XGBoost's aliases `gpu`/`gpu:<ordinal>` for CUDA;
+/// the other GPU backends here are `metal` and `wgpu`. Serializes as those
+/// strings (`cuda` for ordinal 0).
 ///
-/// Either GPU moves histogram construction to the GPU for every node whose
+/// Every GPU moves histogram construction to the GPU for every node whose
 /// sums it can compute exactly and keeps the rest on the CPU, reproducing
-/// single-threaded CPU training bit for bit. Both require `tree_method =
+/// single-threaded CPU training bit for bit. All require `tree_method =
 /// hist`/`auto` and a tree booster, and are opt-in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Device {
     /// The CPU (default): always available, and what the parity fixtures
@@ -187,26 +188,91 @@ pub enum Device {
     /// GPUs so far (see [`backend::wgpu`](crate::backend::wgpu)); prediction
     /// goes through [`BoostedModel::to_wgpu`](crate::model::BoostedModel::to_wgpu).
     Wgpu,
+    /// An NVIDIA GPU through CUDA, on Linux with the `cuda` feature (see
+    /// [`backend::cuda`](crate::backend::cuda)): histogram construction
+    /// runs on the GPU. A correctness path so far, not a speedup: every
+    /// node's rows are uploaded and its histogram read back, one node at a
+    /// time.
+    Cuda {
+        /// The CUDA device ordinal (XGBoost `cuda:<ordinal>`; `0` for
+        /// plain `cuda`).
+        ordinal: usize,
+    },
 }
 
 impl Device {
-    /// The device's XGBoost spelling (`cpu`, `metal`, `wgpu`).
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Device::Cpu => "cpu",
-            Device::Metal => "metal",
-            Device::Wgpu => "wgpu",
+    /// The XGBoost spellings [`Device`] parses, for error messages.
+    const SPELLINGS: &'static [&'static str] = &[
+        "cpu",
+        "metal",
+        "wgpu",
+        "cuda",
+        "cuda:<ordinal>",
+        "gpu",
+        "gpu:<ordinal>",
+    ];
+
+    /// Parse an XGBoost `device` value.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cpu" => return Some(Device::Cpu),
+            "metal" => return Some(Device::Metal),
+            "wgpu" => return Some(Device::Wgpu),
+            "cuda" | "gpu" => return Some(Device::Cuda { ordinal: 0 }),
+            _ => {}
         }
+        let ordinal = value
+            .strip_prefix("cuda:")
+            .or_else(|| value.strip_prefix("gpu:"))?;
+        // Digits only: `usize::from_str` would also take a leading `+`.
+        if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        ordinal.parse().ok().map(|ordinal| Device::Cuda { ordinal })
     }
 
     /// Whether this build can run the device: the CPU always, a GPU with its
-    /// feature (and, for Metal, on macOS).
+    /// feature (and, for Metal, on macOS; for CUDA, on Linux).
     pub(crate) fn is_compiled_in(self) -> bool {
         match self {
             Device::Cpu => true,
             Device::Metal => cfg!(all(target_os = "macos", feature = "metal")),
             Device::Wgpu => cfg!(feature = "wgpu"),
+            Device::Cuda { .. } => cfg!(all(target_os = "linux", feature = "cuda")),
         }
+    }
+}
+
+/// The device's XGBoost spelling: `cpu`, `metal`, `wgpu`, `cuda`, or
+/// `cuda:<ordinal>`.
+impl std::fmt::Display for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Device::Cpu => f.write_str("cpu"),
+            Device::Metal => f.write_str("metal"),
+            Device::Wgpu => f.write_str("wgpu"),
+            Device::Cuda { ordinal: 0 } => f.write_str("cuda"),
+            Device::Cuda { ordinal } => write!(f, "cuda:{ordinal}"),
+        }
+    }
+}
+
+impl Serialize for Device {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Device {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Device::parse(&value)
+            .ok_or_else(|| serde::de::Error::unknown_variant(&value, Device::SPELLINGS))
     }
 }
 
@@ -316,7 +382,8 @@ pub struct TrainingParams {
     pub seed: u64,
 
     /// Which processor training runs on. XGBoost `device`. `metal` (macOS,
-    /// `metal` feature) and `wgpu` (`wgpu` feature) move histogram
+    /// `metal` feature), `wgpu` (`wgpu` feature), and `cuda` (Linux, `cuda`
+    /// feature) move histogram
     /// construction to the GPU; the default `cpu` leaves everything as it
     /// was.
     pub device: Device,
@@ -752,16 +819,21 @@ impl TrainingParams {
     /// other tree methods, the quantized path, and `gblinear` have their
     /// own accumulation loops that would silently ignore the device.
     fn validate_device(&self) -> Result<()> {
-        if self.device == Device::Cpu {
+        let device = self.device;
+        if device == Device::Cpu {
             return Ok(());
         }
-        let device = self.device.name();
         ensure(
             "device",
-            self.device.is_compiled_in(),
-            match self.device {
-                Device::Metal => "`metal` requires building with the `metal` feature on macOS",
-                _ => "`wgpu` requires building with the `wgpu` feature",
+            device.is_compiled_in(),
+            match device {
+                Device::Metal => {
+                    "`metal` requires building with the `metal` feature on macOS".to_owned()
+                }
+                Device::Cuda { .. } => {
+                    format!("`{device}` requires building with the `cuda` feature on Linux")
+                }
+                _ => "`wgpu` requires building with the `wgpu` feature".to_owned(),
             },
         )?;
         ensure(
@@ -783,8 +855,7 @@ impl TrainingParams {
             "device",
             !matches!(self.process_type, ProcessType::Update(_)),
             format!("`{device}` does not support `process_type = update` (refresh grows no trees)"),
-        )?;
-        Ok(())
+        )
     }
 
     /// `base_score` and the objective settings its parameter structs cannot

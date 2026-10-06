@@ -138,7 +138,8 @@ scikit-learn estimators, pandas and polars (1.x and 2.x; DataFrames and
 LazyFrames, with labels taken from the frame's columns by name) categorical
 input, and the conformal, distributional, tree-diffusion, ForestFlow,
 in-place update, ordered target statistics, budget training, and compact
-model extras (on macOS, `Booster.to_gpu()` batch-predicts on the Metal GPU):
+model extras, with GPU training and batch prediction (`device="wgpu"` on
+every platform, `device="metal"` on macOS; `Booster.to_gpu()`):
 
 ```python
 import hessboost

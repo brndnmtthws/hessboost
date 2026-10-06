@@ -1,95 +1,172 @@
-//! `GpuModel`: a model laid out for GPU batch prediction on Metal.
+//! `GpuModel`: a model laid out for GPU batch prediction, on Metal (macOS)
+//! or through wgpu (Vulkan, Metal, DirectX 12).
 //!
 //! Built with [`Booster::to_gpu`](crate::booster::Booster::to_gpu); the
 //! forest, category pools, and per-tree weights are uploaded once, and each
 //! prediction call uploads its rows. Predictions are bit-identical to the
-//! CPU's. Where the backend is not compiled in (off macOS), only
-//! [`GpuModel::available`] and [`GpuModel::device_name`] work, reporting no
-//! device; building one is refused.
-use crate::data::DMatrix;
-use hessboost::backend::metal::GpuModel as RustGpuModel;
+//! CPU's. wgpu is compiled into every build and Metal into macOS builds
+//! only: elsewhere `"metal"` reports no device and building on it is
+//! refused.
+
+use crate::booster::{dense, iterations};
+use crate::data::{DMatrix, to_numpy};
+use crate::errors::{DetachExt, refuse};
+use hessboost::backend::wgpu;
+use hessboost::error::Result;
+use hessboost::model::{BoostedModel, Iterations, Predictions};
 use numpy::PyArrayDyn;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-#[cfg(target_os = "macos")]
-use hessboost::model::Iterations;
+/// A GPU backend, as the `device` argument names it.
+#[derive(Clone, Copy)]
+enum Backend {
+    /// Native Metal (macOS).
+    Metal,
+    /// wgpu over Vulkan, Metal, or DirectX 12.
+    Wgpu,
+}
 
-#[cfg(target_os = "macos")]
-use crate::data::to_numpy;
+impl Backend {
+    /// The backend `device` names; `None` is the platform's default, Metal
+    /// on macOS and wgpu elsewhere.
+    fn parse(device: Option<&str>) -> PyResult<Self> {
+        match device {
+            None if cfg!(target_os = "macos") => Ok(Self::Metal),
+            None | Some("wgpu") => Ok(Self::Wgpu),
+            Some("metal") => Ok(Self::Metal),
+            Some(other) => Err(refuse(format!(
+                "unknown GPU device {other:?}; expected \"metal\" or \"wgpu\""
+            ))),
+        }
+    }
 
-#[cfg(target_os = "macos")]
-use crate::errors::DetachExt;
-#[cfg(not(target_os = "macos"))]
-use crate::errors::refuse;
-#[cfg(target_os = "macos")]
-use pyo3::exceptions::PyValueError;
+    /// Whether the backend has a usable GPU here. The first call per
+    /// backend initializes it (adapter selection, kernel compilation).
+    fn available(self) -> bool {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal => hessboost::backend::metal::available(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Metal => false,
+            Self::Wgpu => wgpu::available(),
+        }
+    }
 
-/// A model laid out for GPU batch prediction on Metal.
+    /// The name of the GPU the backend runs on, if any.
+    fn device_name(self) -> Option<String> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal => hessboost::backend::metal::device_name(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Metal => None,
+            Self::Wgpu => wgpu::device_name(),
+        }
+    }
+}
+
+/// A model uploaded to one backend's GPU.
+enum Predictor {
+    #[cfg(target_os = "macos")]
+    Metal(hessboost::backend::metal::GpuModel),
+    Wgpu(wgpu::GpuModel),
+}
+
+impl Predictor {
+    /// `model` laid out on `backend`, without the GIL.
+    fn build(py: Python<'_>, model: &BoostedModel, backend: Backend) -> PyResult<Self> {
+        match backend {
+            #[cfg(target_os = "macos")]
+            Backend::Metal => py.detached(|| model.to_gpu()).map(Self::Metal),
+            #[cfg(not(target_os = "macos"))]
+            Backend::Metal => {
+                let _ = (py, model);
+                Err(refuse(
+                    "Metal GPU prediction is only available on macOS; device=\"wgpu\" runs on \
+                     Vulkan, Metal, or DirectX 12",
+                ))
+            }
+            Backend::Wgpu => py.detached(|| model.to_wgpu()).map(Self::Wgpu),
+        }
+    }
+
+    fn model(&self) -> &BoostedModel {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(gpu) => gpu.model(),
+            Self::Wgpu(gpu) => gpu.model(),
+        }
+    }
+
+    /// The `device` name of the backend.
+    fn device(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => "metal",
+            Self::Wgpu(_) => "wgpu",
+        }
+    }
+
+    /// Raw margins (`margin`) or values of `data` from `iterations`.
+    fn predict(
+        &self,
+        data: &hessboost::data::DMatrix,
+        iterations: Iterations,
+        margin: bool,
+    ) -> Result<Predictions> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Metal(gpu) if margin => gpu.predict_margin(data, iterations),
+            #[cfg(target_os = "macos")]
+            Self::Metal(gpu) => gpu.predict(data, iterations),
+            Self::Wgpu(gpu) if margin => gpu.predict_margin(data, iterations),
+            Self::Wgpu(gpu) => gpu.predict(data, iterations),
+        }
+    }
+}
+
+/// A model laid out for GPU batch prediction, on Metal or through wgpu.
 #[pyclass(frozen, module = "hessboost._hessboost")]
 pub struct GpuModel {
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(dead_code, reason = "only read where the Metal backend is compiled in")
-    )]
-    gpu: RustGpuModel,
+    gpu: Predictor,
 }
 
 impl GpuModel {
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(
-            dead_code,
-            reason = "only built where the Metal backend is compiled in"
-        )
-    )]
-    pub(crate) fn new(gpu: RustGpuModel) -> Self {
-        Self { gpu }
-    }
-
-    /// XGBoost's `iteration_range` as iterations: `(begin, 0)` runs through
-    /// the last iteration, and `None` is the method's `default`.
-    #[cfg(target_os = "macos")]
-    fn iterations(&self, range: Option<(usize, usize)>, default: Iterations) -> Iterations {
-        range.map_or(default, |(begin, end)| {
-            let end = if end == 0 {
-                self.gpu.model().num_boost_rounds()
-            } else {
-                end
-            };
-            (begin..end).into()
-        })
+    /// `model` laid out on the GPU `device` names.
+    pub(crate) fn build(
+        py: Python<'_>,
+        model: &BoostedModel,
+        device: Option<&str>,
+    ) -> PyResult<Self> {
+        let backend = Backend::parse(device)?;
+        Predictor::build(py, model, backend).map(|gpu| Self { gpu })
     }
 }
 
 #[pymethods]
 impl GpuModel {
-    /// Whether a Metal device with working compute pipelines is available
-    /// (`false` where the backend is not compiled in, or the machine has no
-    /// GPU).
+    /// Whether `device` (`None`: the platform's default) has a usable GPU:
+    /// for Metal, a device with working compute pipelines (`false` off
+    /// macOS); for wgpu, an adapter with 64-bit shader integers and
+    /// compiled kernels.
     #[staticmethod]
-    fn available() -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            hessboost::backend::metal::available()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+    fn available(py: Python<'_>, device: Option<&str>) -> PyResult<bool> {
+        let backend = Backend::parse(device)?;
+        Ok(py.detach(|| backend.available()))
     }
 
-    /// The name of the Metal device predictions would run on, if any (for
-    /// diagnostics and benchmarks).
+    /// The name of the GPU `device` runs on, if any (for diagnostics and
+    /// benchmarks).
     #[staticmethod]
-    fn device_name() -> Option<String> {
-        #[cfg(target_os = "macos")]
-        {
-            hessboost::backend::metal::device_name()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
+    fn device_name(py: Python<'_>, device: Option<&str>) -> PyResult<Option<String>> {
+        let backend = Backend::parse(device)?;
+        Ok(py.detach(|| backend.device_name()))
+    }
+
+    /// The backend this model predicts on (`"metal"` or `"wgpu"`).
+    #[getter]
+    fn device(&self) -> &'static str {
+        self.gpu.device()
     }
 
     /// Predictions of `kind` (`value`, `margin`) shaped as XGBoost's Python
@@ -102,43 +179,21 @@ impl GpuModel {
         kind: &str,
         iteration_range: Option<(usize, usize)>,
     ) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
-        #[cfg(target_os = "macos")]
-        {
-            let margin = match kind {
-                "value" => false,
-                "margin" => true,
-                other => {
-                    return Err(PyValueError::new_err(format!(
-                        "unknown prediction kind {other:?}"
-                    )));
-                }
-            };
-            let gpu = &self.gpu;
-            let matrix = &data.inner;
-            // `None`: through `best_iteration` after early stopping.
-            let iterations = self.iterations(iteration_range, Iterations::Best);
-            let (values, shape) = py.detached(|| -> hessboost::error::Result<_> {
-                let predictions = if margin {
-                    gpu.predict_margin(matrix, iterations)?
-                } else {
-                    gpu.predict(matrix, iterations)?
-                };
-                let (rows, width) = (predictions.n_rows(), predictions.width());
-                let shape = if width == 1 {
-                    vec![rows]
-                } else {
-                    vec![rows, width]
-                };
-                Ok((predictions.into_vec(), shape))
-            })?;
-            to_numpy(py, values, &shape)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (self, py, data, kind, iteration_range);
-            Err(refuse(
-                "GPU prediction requires the `metal` feature on macOS",
-            ))
-        }
+        let margin = match kind {
+            "value" => false,
+            "margin" => true,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown prediction kind {other:?}"
+                )));
+            }
+        };
+        let gpu = &self.gpu;
+        let matrix = &data.inner;
+        // `None`: through `best_iteration` after early stopping.
+        let iterations = iterations(gpu.model(), iteration_range, Iterations::Best);
+        let predictions = py.detached(|| gpu.predict(matrix, iterations, margin))?;
+        let (values, shape) = dense(predictions);
+        to_numpy(py, values, &shape)
     }
 }

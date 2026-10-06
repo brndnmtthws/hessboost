@@ -32,7 +32,10 @@ test = false
 doctest = false
 
 [dependencies]
-hessboost = { path = ".." }
+# `device="wgpu"` and `Booster.to_gpu(device="wgpu")` in every wheel: wgpu
+# loads its Vulkan, Metal, and DirectX 12 drivers at run time, so a machine
+# without them still imports the package and reports no adapter.
+hessboost = { path = "..", features = ["wgpu"] }
 numpy = "0.29"
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
 # Method configurations cross the boundary as their serde JSON.

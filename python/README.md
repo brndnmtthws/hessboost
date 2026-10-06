@@ -436,7 +436,7 @@ on macOS, DirectX 12 on Windows). `Booster.to_gpu()` lays a model out for
 batch prediction (on Metal on macOS and on wgpu elsewhere;
 `to_gpu("wgpu")` asks for wgpu): the forest uploads once, and each call
 predicts bit-identically to `Booster.predict` (values or raw margins).
-`GpuModel.available()` says whether there is a GPU to use:
+`GpuModel.available()` says whether the device can predict here:
 
 ```python
 from hessboost import GpuModel

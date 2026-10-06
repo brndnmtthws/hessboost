@@ -61,7 +61,11 @@ impl GpuPredictor for wgpu::GpuModel {
 #[test]
 fn backend_available_or_no_adapter() {
     match wgpu::unavailable_reason() {
-        None => {}
+        None => assert!(
+            wgpu::prediction_available(),
+            "the wgpu adapter {:?} failed the addition-order probe, so it cannot predict",
+            wgpu::device_name()
+        ),
         Some(reason) => {
             assert!(
                 std::env::var_os("HESSBOOST_REQUIRE_WGPU").is_none(),
@@ -71,6 +75,7 @@ fn backend_available_or_no_adapter() {
                 reason.starts_with("no wgpu adapter found"),
                 "the wgpu backend failed to initialize: {reason}"
             );
+            assert!(!wgpu::prediction_available());
         }
     }
 }

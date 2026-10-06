@@ -83,8 +83,9 @@
 //! permits reassociating them, so the backend checks once per process with
 //! a chain of additions that any reassociation changes and refuses
 //! [`to_wgpu`](crate::model::BoostedModel::to_wgpu) on an adapter that
-//! fails it (training, which only adds integers, stays available). That
-//! check is a probe, not a proof.
+//! fails it ([`prediction_available`](crate::backend::wgpu::prediction_available)
+//! is then `false`; training, which only adds integers, stays available).
+//! That check is a probe, not a proof.
 //!
 //! # Limitations
 //!
@@ -146,6 +147,14 @@ const MIN_BUFFER_BYTES: u64 = 16;
 #[must_use]
 pub fn available() -> bool {
     Context::shared().is_some()
+}
+
+/// Whether [`BoostedModel::to_wgpu`] lays models out here: the backend is
+/// [`available`] and its adapter passed the addition-order probe (see the
+/// [module docs](crate::backend::wgpu)). Training needs only [`available`].
+#[must_use]
+pub fn prediction_available() -> bool {
+    Context::shared().is_some_and(|ctx| ctx.predict_check.is_ok())
 }
 
 /// Why the wgpu backend is unavailable (no adapter, a missing feature, or

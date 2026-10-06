@@ -22,7 +22,8 @@ DEVICES: list[Device] = ["metal", "wgpu"]
 
 
 def needs(device: Device) -> None:
-    """Skips the calling test when ``device`` has no usable GPU here."""
+    """Skips the calling test when ``device`` cannot predict here (the guard
+    below fails on a wgpu adapter that only trains)."""
     if not GpuModel.available(device):
         pytest.skip(f"no {device} GPU here")
 
@@ -37,7 +38,8 @@ def trained() -> tuple[Booster, np.ndarray]:
 def test_wgpu_is_available_or_the_machine_has_no_adapter(
     trained: tuple[Booster, np.ndarray],
 ) -> None:
-    """A kernel-compile or probe failure is never a reason to skip the wgpu
+    """A kernel-compile failure, or an adapter that fails the addition-order
+    probe (it trains but cannot predict), is never a reason to skip the wgpu
     tests: without this guard they would pass vacuously while the backend is
     broken. ``HESSBOOST_REQUIRE_WGPU`` turns a missing adapter into a
     failure too. Without an adapter, ``device="wgpu"`` training is refused
@@ -48,21 +50,21 @@ def test_wgpu_is_available_or_the_machine_has_no_adapter(
         trained[0].to_gpu("wgpu")
     reason = str(refused.value)
     assert "HESSBOOST_REQUIRE_WGPU" not in os.environ, (
-        f"HESSBOOST_REQUIRE_WGPU is set but wgpu is unavailable: {reason}"
+        f"HESSBOOST_REQUIRE_WGPU is set but wgpu prediction is unavailable: {reason}"
     )
     assert reason.startswith("GPU backend error: no wgpu adapter"), (
-        f"the wgpu backend failed to initialize: {reason}"
+        f"wgpu prediction is unavailable: {reason}"
     )
+    assert GpuModel.device_name("wgpu") is None
     x, y = regression(rows=100)
     with pytest.raises(HessboostError, match="no wgpu adapter"):
         hessboost.train({"device": "wgpu"}, DMatrix(x, y), 1)
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_available_reports_a_device_name(device: Device) -> None:
-    assert GpuModel.available(device) == (GpuModel.device_name(device) is not None)
-    if GpuModel.available(device):
-        assert GpuModel.device_name(device)
+def test_a_device_that_predicts_has_a_name(device: Device) -> None:
+    needs(device)
+    assert GpuModel.device_name(device)
 
 
 def test_default_device_is_metal_on_macos_and_wgpu_elsewhere(

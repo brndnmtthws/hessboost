@@ -331,9 +331,10 @@ class Booster(_SchemaState):
                 on macOS, wgpu elsewhere.
 
         Raises:
-            HessboostError: ``device`` is unknown or has no usable GPU (the
-                message says why), the wgpu adapter reassociates float
-                additions (which would change the predictions), or the model
+            HessboostError: ``device`` is unknown or cannot predict here
+                (:meth:`GpuModel.available` is ``False``; the message says
+                why: no usable GPU, or a wgpu adapter that reassociates float
+                additions, which would change the predictions), or the model
                 is a ``gblinear`` or ``linear_tree`` model (which do not
                 predict through the forest).
         """
@@ -590,12 +591,14 @@ class GpuModel:
 
     @staticmethod
     def available(device: _GpuDevice | None = None) -> bool:
-        """Whether ``device`` (``None``: Metal on macOS, wgpu elsewhere) has
-        a usable GPU, for :meth:`Booster.to_gpu` and for training with that
-        ``device``: for Metal, a device with working compute pipelines
-        (``False`` off macOS); for wgpu, an adapter with 64-bit shader
-        integers. The first call per device sets its backend up (picks the
-        adapter and compiles the kernels).
+        """Whether ``device`` (``None``: Metal on macOS, wgpu elsewhere) can
+        predict here, so that :meth:`Booster.to_gpu` lays forest models out
+        on it: for Metal, a device with working compute pipelines (``False``
+        off macOS); for wgpu, an adapter with 64-bit shader integers whose
+        float additions passed the backend's addition-order check. Training
+        with ``device`` needs the same GPU, except that wgpu also trains on
+        an adapter that fails the check. The first call per device sets its
+        backend up (picks the adapter, compiles the kernels, runs the check).
 
         Raises:
             HessboostError: ``device`` is not ``"metal"`` or ``"wgpu"``.
@@ -605,7 +608,9 @@ class GpuModel:
     @staticmethod
     def device_name(device: _GpuDevice | None = None) -> str | None:
         """The name of the GPU ``device`` (``None``: Metal on macOS, wgpu
-        elsewhere) runs on, if it has one (for diagnostics and benchmarks).
+        elsewhere) picked, if it found one (for diagnostics and benchmarks),
+        including a wgpu adapter that trains but fails the addition-order
+        check.
 
         Raises:
             HessboostError: ``device`` is not ``"metal"`` or ``"wgpu"``.

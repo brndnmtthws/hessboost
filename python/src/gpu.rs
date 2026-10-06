@@ -41,19 +41,20 @@ impl Backend {
         }
     }
 
-    /// Whether the backend has a usable GPU here. The first call per
-    /// backend initializes it (adapter selection, kernel compilation).
+    /// Whether the backend predicts here ([`Predictor::build`] lays forest
+    /// models out on it). The first call per backend initializes it
+    /// (adapter selection, kernel compilation, wgpu's addition-order probe).
     fn available(self) -> bool {
         match self {
             #[cfg(target_os = "macos")]
             Self::Metal => hessboost::backend::metal::available(),
             #[cfg(not(target_os = "macos"))]
             Self::Metal => false,
-            Self::Wgpu => wgpu::available(),
+            Self::Wgpu => wgpu::prediction_available(),
         }
     }
 
-    /// The name of the GPU the backend runs on, if any.
+    /// The name of the GPU the backend picked, if any.
     fn device_name(self) -> Option<String> {
         match self {
             #[cfg(target_os = "macos")]
@@ -145,17 +146,17 @@ impl GpuModel {
 
 #[pymethods]
 impl GpuModel {
-    /// Whether `device` (`None`: the platform's default) has a usable GPU:
-    /// for Metal, a device with working compute pipelines (`false` off
-    /// macOS); for wgpu, an adapter with 64-bit shader integers and
-    /// compiled kernels.
+    /// Whether `device` (`None`: the platform's default) predicts here: for
+    /// Metal, a device with working compute pipelines (`false` off macOS);
+    /// for wgpu, an adapter with 64-bit shader integers that passed the
+    /// addition-order probe.
     #[staticmethod]
     fn available(py: Python<'_>, device: Option<&str>) -> PyResult<bool> {
         let backend = Backend::parse(device)?;
         Ok(py.detach(|| backend.available()))
     }
 
-    /// The name of the GPU `device` runs on, if any (for diagnostics and
+    /// The name of the GPU `device` picked, if any (for diagnostics and
     /// benchmarks).
     #[staticmethod]
     fn device_name(py: Python<'_>, device: Option<&str>) -> PyResult<Option<String>> {

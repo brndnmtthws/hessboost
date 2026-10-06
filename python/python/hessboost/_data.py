@@ -447,12 +447,19 @@ per-output margins)."""
 _MATRIX_FIELDS = frozenset({"label", "base_margin"})
 
 
-def _column_names(value: object) -> list[str] | None:
-    """``value`` read as column names: a ``str``, or a non-empty list or
-    tuple of them; ``None`` for anything else (an array)."""
+def _column_names(field: str, value: object) -> list[str] | None:
+    """``value`` read as ``field``'s column names: a ``str``, or for the
+    fields that take several columns (``label``, ``base_margin``) a
+    non-empty list or tuple of them; ``None`` for anything else, an array
+    included (a list of strings is query ids for ``qid``)."""
     if isinstance(value, str):
         return [value]
-    if isinstance(value, (list, tuple)) and value and all(isinstance(v, str) for v in value):
+    if (
+        field in _MATRIX_FIELDS
+        and isinstance(value, (list, tuple))
+        and value
+        and all(isinstance(v, str) for v in value)
+    ):
         return list(value)
     return None
 
@@ -515,17 +522,16 @@ def take_metadata(data: object, **fields: Any) -> tuple[object, dict[str, Any]]:
     under polars' streaming engine, so an array alongside it is refused.
 
     Raises:
-        HessboostError: A name is not a column of ``data``, several names
-            are given for a one-column field, ``group`` (sizes, not a
-            column) is given by name, or an array accompanies a
-            ``LazyFrame``.
+        HessboostError: A name is not a column of ``data`` or is named
+            twice, ``group`` (sizes, not a column) is given by name, or an
+            array accompanies a ``LazyFrame``.
         TypeError: A name is given for data that is not a frame, or names
             a column that is not numeric or boolean.
     """
     named = {
         field: names
         for field, value in fields.items()
-        if (names := _column_names(value)) is not None
+        if (names := _column_names(field, value)) is not None
     }
     if _is_polars_lazyframe(data):
         for field, value in fields.items():
@@ -546,8 +552,6 @@ def take_metadata(data: object, **fields: Any) -> tuple[object, dict[str, Any]]:
             raise HessboostError(
                 f"{field} is not one value per row, so it cannot be a column name{hint}"
             )
-        if field not in _MATRIX_FIELDS and len(names) != 1:
-            raise HessboostError(f"{field} takes one column name, got {names}")
         if len(set(names)) != len(names):
             raise HessboostError(f"{field} names a column twice: {names}")
         for name in names:

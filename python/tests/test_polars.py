@@ -123,12 +123,18 @@ def test_lazyframe_takes_labels_and_weights_from_its_columns() -> None:
     np.testing.assert_array_equal(
         booster.predict(full.lazy().select(features)), booster.predict(df)
     )
-    # Query ids by name, numeric or string, give the groups.
+    # Query ids by name, numeric or string, give the groups; a list of
+    # strings is query ids, not column names.
     ranked = DMatrix(full.lazy().drop("w"), label="y", qid="qid")
     assert ranked.feature_names == features
     assert ranked.get_group().tolist() == [20] * 20
     strings = full.with_columns(pl.col("qid").cast(pl.String).str.zfill(3))
     assert DMatrix(strings, label="y", qid="qid").get_group().tolist() == [20] * 20
+    ids = strings["qid"].to_list()
+    labelled = full.select([*features, "y"])
+    assert DMatrix(labelled, label="y", qid=ids).get_group().tolist() == [20] * 20
+    numbers = full.select(["size", "count", "flag"]).to_numpy()
+    assert DMatrix(numbers, qid=tuple(ids)).get_group().tolist() == [20] * 20
 
 
 def test_lazyframe_refuses_metadata_it_cannot_align() -> None:
@@ -178,8 +184,8 @@ def test_frame_columns_name_the_metadata(library: str) -> None:
     np.testing.assert_array_equal(upper, full["w"].to_numpy().astype(np.float32))
     with pytest.raises(HessboostError, match="label column 'price' is not a column"):
         DMatrix(data, label="price")
-    with pytest.raises(HessboostError, match="weight takes one column name"):
-        DMatrix(data, label="y", weight=["w", "y"])
+    with pytest.raises(HessboostError, match="label names a column twice"):
+        DMatrix(data, label=["y", "y"])
     with pytest.raises(HessboostError, match=r"group is not one value per row.*qid="):
         DMatrix(data, label="y", group="qid")
     with pytest.raises(TypeError, match="label column 'color' has dtype"):

@@ -501,7 +501,7 @@ def _polars_columns(frame: pl.DataFrame, field: str, names: list[str]) -> NDArra
     return columns[0] if len(columns) == 1 else np.column_stack(columns)
 
 
-def take_metadata(data: object, **fields: object) -> tuple[object, dict[str, object]]:
+def take_metadata(data: object, **fields: Any) -> tuple[object, dict[str, Any]]:
     """``data`` and its metadata ``fields`` (:func:`info`'s arguments) with
     the per-row ones a frame supplies by column name resolved: a ``str``
     (``label="y"``; ``label`` and ``base_margin`` also a list of names, for
@@ -554,7 +554,7 @@ def take_metadata(data: object, **fields: object) -> tuple[object, dict[str, obj
             if name not in frame.columns:
                 raise HessboostError(f"{field} column {name!r} is not a column of data")
     taken = list(dict.fromkeys(name for names in named.values() for name in names))
-    resolved = dict(fields)
+    resolved: dict[str, Any] = dict(fields)
     if _is_pandas_frame(frame):
         for field, names in named.items():
             resolved[field] = _pandas_columns(frame, field, names)

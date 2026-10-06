@@ -229,10 +229,14 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `backend/exact_sum.rs`). Everything else (small nodes, non-finite
   gradients, grain counts past a workgroup's 32-bit pieces
   (`backend::scatter_row_bound`), failed commands) runs on CPU. wgpu
-  prediction adds floats only (each tree's `weight * leaf` is formed on the
-  host) and probes the adapter once for reassociated additions, refusing
-  `to_wgpu` on one that fails; the wgpu backend needs `SHADER_INT64` and
-  picks a software adapter (lavapipe, WARP) only when it is the only one.
+  prediction only adds (each tree's `weight * leaf` is formed on the
+  host), on bit patterns: the adapter's `f32` add serves finite normal
+  operands with a finite normal sum, everything else (zeros, subnormals,
+  infinities, NaN, overflow) an integer IEEE 754 `soft_add`, so
+  flush-to-zero adapters still give the CPU's bits; the adapter is probed
+  once for reassociated additions, refusing `to_wgpu` on one that fails.
+  The wgpu backend needs `SHADER_INT64` and picks a software adapter
+  (lavapipe, WARP) only when it is the only one.
 - **Unsafe:** only in `simd/`, hot loops of `tree/compact.rs`, `tree/hist/`,
   `tree/builder/partition.rs`, and `backend/metal.rs` (`backend/wgpu.rs`
   has none: `bytemuck` casts). Each block needs `// SAFETY:`.

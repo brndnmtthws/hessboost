@@ -66,20 +66,25 @@
 //! (`scatter_row_bound` in `backend/mod.rs`); a node whose grain
 //! counts are too coarse for that runs on the CPU.
 //!
-//! Prediction adds floats, and the walk compares integer keys of the
-//! values' bits (as the CPU does), so it depends on nothing but the
-//! adapter's `f32` addition being correctly rounded in tree order, which
-//! Vulkan and DirectX 12 require. Multiplications are kept off the GPU:
-//! each tree's weighted leaf values are formed on the host (`weight * leaf`
-//! in `f32`, the product the CPU forms per row), so there is no
-//! multiply-add for a shader compiler to fuse. Metal through wgpu compiles
-//! with fast math, which permits reassociating the additions; the backend
-//! checks for that once per process with a chain of additions that any
-//! reassociation changes, and refuses [`to_wgpu`](crate::model::BoostedModel::to_wgpu)
-//! on an adapter that fails it (training, which only adds integers, stays
-//! available). The check is a probe, not a proof. Subnormal margins
-//! (below `1.2e-38`) may be flushed to zero on adapters that do so by
-//! default, which no realistic model reaches.
+//! Prediction works on bit patterns: the walk compares integer keys of the
+//! values' bits (as the CPU does), and every addition goes through the
+//! kernel's `add_f32`. Multiplications are kept off the GPU: each tree's
+//! weighted leaf values are formed on the host (`weight * leaf` in `f32`,
+//! the product the CPU forms per row). `add_f32` uses the adapter's own
+//! `f32` add only for finite normal operands whose sum is finite and normal
+//! (correctly rounded on every Vulkan, Metal, and DirectX 12
+//! implementation, and out of reach of subnormal flushing); zeros,
+//! subnormal operands or results, infinities, NaN, and overflow take
+//! `soft_add`, an IEEE 754 addition in integer arithmetic (round to nearest,
+//! ties to even), so a model with subnormal leaves or margins, or two
+//! normal leaves whose sum is subnormal, predicts the CPU's bits on an
+//! adapter that flushes subnormals. The remaining assumption is the order
+//! of the additions: Metal through wgpu compiles with fast math, which
+//! permits reassociating them, so the backend checks once per process with
+//! a chain of additions that any reassociation changes and refuses
+//! [`to_wgpu`](crate::model::BoostedModel::to_wgpu) on an adapter that
+//! fails it (training, which only adds integers, stays available). That
+//! check is a probe, not a proof.
 //!
 //! # Limitations
 //!
@@ -314,23 +319,26 @@ fn hist_merge(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// when the split reads the negated value), `key` the threshold key ("go
 /// right when greater") or the category pool start, `left` the child taken
 /// when the compare is false (a leaf points at itself), `aux` the leaf
-/// value's bits, the leaf-vector offset, or the categorical flags. The
-/// walk works on the values' bits, as the CPU does (`tree::compact::key`),
-/// so a missing `NaN`, `-0.0`, and infinities route like the CPU's.
+/// value's bits, the leaf-vector offset, or the categorical flags. Rows,
+/// leaves, and margins are handled as `u32` bit patterns: the walk compares
+/// integer keys (as the CPU does, `tree::compact::key`), so a missing
+/// `NaN`, `-0.0`, and infinities route like the CPU's, and the additions go
+/// through `add_f32`, which is exact for every finite input even where the
+/// adapter flushes subnormals to zero (see the module docs).
 const PREDICT_WGSL: &str = r"
 struct PredictArgs {
     n_rows: u32, n_cols: u32, k: u32, tree_begin: u32,
-    tree_end: u32, pad0: u32, pad1: u32, pad2: u32,
+    tree_end: u32, soft: u32, pad0: u32, pad1: u32,
 }
 struct PTree { root: u32, output: u32, vector: u32, pad: u32 }
 
 @group(0) @binding(0) var<uniform> pa: PredictArgs;
 @group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> categories: array<u32>;
-@group(0) @binding(3) var<storage, read> leaf_vectors: array<f32>;
+@group(0) @binding(3) var<storage, read> leaf_vectors: array<u32>;
 @group(0) @binding(4) var<storage, read> trees: array<PTree>;
-@group(0) @binding(5) var<storage, read> rows: array<f32>;
-@group(0) @binding(6) var<storage, read_write> out: array<f32>;
+@group(0) @binding(5) var<storage, read> rows: array<u32>;
+@group(0) @binding(6) var<storage, read_write> out: array<u32>;
 
 // Monotone unsigned key of a float's bits, matching `tree::compact::key`:
 // NaN maps to 0, -0.0 is treated as +0.0, negatives are complemented.
@@ -347,11 +355,13 @@ fn is_nan(bits: u32) -> bool {
 
 // A non-missing value's category code: Rust's saturating `v as u32`,
 // decided on the bits (negative values and -0.0 give 0, values of 2^32 or
-// more and +inf give the maximum) so no float compare is involved.
-fn category_of(bits: u32, v: f32) -> u32 {
+// more and +inf give the maximum) so no float compare is involved; the
+// remaining conversion truncates a value in [0, 2^32), where a flushed
+// subnormal truncates to 0 either way.
+fn category_of(bits: u32) -> u32 {
     if (bits & 0x80000000u) != 0u { return 0u; }
     if (bits >> 23u) >= 159u { return 0xFFFFFFFFu; }
-    return u32(v);
+    return u32(bitcast<f32>(bits));
 }
 
 fn cat_in_set(begin: u32, end: u32, cat: u32) -> bool {
@@ -361,27 +371,112 @@ fn cat_in_set(begin: u32, end: u32, cat: u32) -> bool {
     return false;
 }
 
+// IEEE 754 binary32 addition on the bit patterns, in integer arithmetic:
+// round to nearest, ties to even, exact for every finite input including
+// subnormals (which the adapter may flush to zero in its own float adds)
+// and for zero signs and overflow. NaNs propagate quieted.
+fn soft_add(a: u32, b: u32) -> u32 {
+    // `x` holds the larger magnitude.
+    var x = a;
+    var y = b;
+    if (b & 0x7FFFFFFFu) > (a & 0x7FFFFFFFu) { x = b; y = a; }
+    let ex = (x >> 23u) & 0xFFu;
+    let ey = (y >> 23u) & 0xFFu;
+    if ex == 0xFFu {
+        if (x & 0x7FFFFFu) != 0u { return x | 0x400000u; }
+        if ey == 0xFFu {
+            if (y & 0x7FFFFFu) != 0u { return y | 0x400000u; }
+            if ((x ^ y) & 0x80000000u) != 0u { return 0x7FC00000u; }
+        }
+        return x;
+    }
+    if (y & 0x7FFFFFFFu) == 0u {
+        // Adding a zero: `x`, except that two zeros give +0 unless both are -0.
+        if (x & 0x7FFFFFFFu) == 0u { return x & y; }
+        return x;
+    }
+    // Significands with the hidden bit at bit 29 (a subnormal has none and
+    // the exponent of the smallest normal), six extra bits for rounding.
+    var mx = (x & 0x7FFFFFu) << 6u;
+    var my = (y & 0x7FFFFFu) << 6u;
+    var e = ex;
+    var ey2 = ey;
+    if ex == 0u { e = 1u; } else { mx |= 0x20000000u; }
+    if ey == 0u { ey2 = 1u; } else { my |= 0x20000000u; }
+    // Align `y` to `x`'s exponent, jamming the lost bits into the sticky bit.
+    let shift = e - ey2;
+    if shift >= 32u {
+        my = select(0u, 1u, my != 0u);
+    } else if shift != 0u {
+        let lost = my & ((1u << shift) - 1u);
+        my = (my >> shift) | select(0u, 1u, lost != 0u);
+    }
+    let sign = x & 0x80000000u;
+    var m: u32;
+    if ((x ^ y) & 0x80000000u) == 0u {
+        m = mx + my;
+        if (m & 0x40000000u) != 0u {
+            m = (m >> 1u) | (m & 1u);
+            e += 1u;
+        }
+    } else {
+        m = mx - my;
+        if m == 0u { return 0u; }
+        // Renormalize (bit 29 is the hidden bit's place) as far as the
+        // exponent allows; a result that cannot reach it is subnormal.
+        let s = min(countLeadingZeros(m) - 2u, e - 1u);
+        m = m << s;
+        e -= s;
+    }
+    // Round the six extra bits to nearest, ties to even.
+    let low = m & 0x3Fu;
+    m = m >> 6u;
+    if low > 0x20u || (low == 0x20u && (m & 1u) != 0u) { m += 1u; }
+    if (m & 0x1000000u) != 0u {
+        m = m >> 1u;
+        e += 1u;
+    }
+    if e >= 0xFFu { return sign | 0x7F800000u; }
+    if (m & 0x800000u) == 0u { return sign | m; }
+    return sign | (e << 23u) | (m & 0x7FFFFFu);
+}
+
+// `a + b` on the bit patterns, bit for bit as the CPU computes it. Finite
+// normal operands whose native sum is finite and normal take the adapter's
+// add (correctly rounded, and flushing cannot touch it); everything else
+// (zeros, subnormals, infinities, NaN, a sum that leaves the normal range)
+// goes through `soft_add`. `pa.soft` forces the integer path (tests).
+fn add_f32(a: u32, b: u32) -> u32 {
+    if pa.soft == 0u
+        && ((a >> 23u) & 0xFFu) - 1u < 254u
+        && ((b >> 23u) & 0xFFu) - 1u < 254u
+    {
+        let s = bitcast<u32>(bitcast<f32>(a) + bitcast<f32>(b));
+        if ((s >> 23u) & 0xFFu) - 1u < 254u { return s; }
+    }
+    return soft_add(a, b);
+}
+
 @compute @workgroup_size(64)
 fn forest_predict(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = gid.x;
     if r >= pa.n_rows { return; }
     let row = r * pa.n_cols;
     let scalar_run = pa.k == 1u;
-    var acc = 0.0;
+    var acc = 0u;
     if scalar_run { acc = out[r]; }
     for (var t = pa.tree_begin; t < pa.tree_end; t++) {
         let tr = trees[t];
         var nid = tr.root;
         var n = nodes[nid];
         while n.z != nid {
-            let v = rows[row + n.x / 32u];
-            let bits = bitcast<u32>(v);
+            let bits = rows[row + n.x / 32u];
             if (n.w & 1u) != 0u {
                 var go_left: bool;
                 if is_nan(bits) {
                     go_left = (n.w & 2u) != 0u;
                 } else {
-                    go_left = cat_in_set(n.y, n.w >> 2u, category_of(bits, v));
+                    go_left = cat_in_set(n.y, n.w >> 2u, category_of(bits));
                 }
                 nid = n.z + select(1u, 0u, go_left);
             } else {
@@ -393,11 +488,14 @@ fn forest_predict(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         if tr.vector != 0u {
             let o = r * pa.k;
-            for (var j = 0u; j < pa.k; j++) { out[o + j] += leaf_vectors[n.w + j]; }
+            for (var j = 0u; j < pa.k; j++) {
+                out[o + j] = add_f32(out[o + j], leaf_vectors[n.w + j]);
+            }
         } else if scalar_run {
-            acc += bitcast<f32>(n.w);
+            acc = add_f32(acc, n.w);
         } else {
-            out[r * pa.k + tr.output] += bitcast<f32>(n.w);
+            let o = r * pa.k + tr.output;
+            out[o] = add_f32(out[o], n.w);
         }
     }
     if scalar_run { out[r] = acc; }
@@ -456,7 +554,9 @@ struct PredictArgs {
     k: u32,
     tree_begin: u32,
     tree_end: u32,
-    pad: [u32; 3],
+    /// Force `soft_add` for every addition (tests; `0` in production).
+    soft: u32,
+    pad: [u32; 2],
 }
 
 /// One tree's dispatch record of `forest_predict`.
@@ -838,70 +938,135 @@ impl Context {
     /// of the small terms. Fast-math compilers (Metal's default) may
     /// reassociate; the probe is a check, not a proof.
     fn probe_addition_order(&self) -> std::result::Result<(), String> {
-        const ROWS: usize = 64;
         let small = 2f32.powi(-24);
         let mut leaves = vec![1.0f32];
         leaves.extend(std::iter::repeat_n(small, 16));
         leaves.push(-1.0);
-        let expected = leaves.iter().fold(0.0f32, |acc, &v| acc + v);
-        if expected != 0.0 {
-            return Err(format!("the CPU probe sum is {expected}, not 0"));
+        let chain = AdditionChain {
+            k: 1,
+            vector: false,
+            leaves,
+            margins: vec![0.0; 64],
+            soft: false,
+        };
+        let expected = chain.cpu();
+        if expected.iter().any(|&m| m != 0.0) {
+            return Err("the CPU probe sum is not 0".to_string());
         }
-        // Single-leaf trees: node `i` is its own left child with the leaf
-        // bits in `aux`.
-        let nodes: Vec<[u32; 4]> = leaves
+        let got = self.run_chain(&chain).map_err(|e| e.to_string())?;
+        match got
             .iter()
-            .enumerate()
-            .map(|(i, v)| [0, 0, i as u32, v.to_bits()])
-            .collect();
-        let trees: Vec<PTree> = (0..leaves.len() as u32)
-            .map(|root| PTree {
-                root,
-                output: 0,
-                vector: 0,
-                pad: 0,
-            })
-            .collect();
-        let (forest, call) = self
-            .scoped("allocating the probe", || {
-                let forest = ForestBuffers {
-                    nodes: self.storage_init("probe nodes", bytemuck::cast_slice(&nodes))?,
-                    categories: self.storage_init("probe categories", &[0; 16])?,
-                    leaf_vectors: self.storage_init("probe leaf vectors", &[0; 16])?,
-                    trees: self.storage_init("probe trees", bytemuck::cast_slice(&trees))?,
-                };
-                let call = PredictBuffers::new(self, &forest, ROWS, 1, 1, ROWS)?;
-                Ok((forest, call))
-            })
-            .map_err(|e| e.to_string())?;
-        drop(forest);
-        let rows = vec![0.0f32; ROWS];
-        let mut margins = vec![0.0f32; ROWS];
-        call.run_block(
-            self,
-            &PredictArgs {
-                n_rows: ROWS as u32,
-                n_cols: 1,
-                k: 1,
-                tree_begin: 0,
-                tree_end: trees.len() as u32,
-                pad: [0; 3],
-            },
-            &rows,
-            &margins,
-            0,
-        )
-        .map_err(|e| e.to_string())?;
-        call.read_margins(self, &mut margins)
-            .map_err(|e| e.to_string())?;
-        match margins.iter().find(|&&m| m != expected) {
+            .zip(&expected)
+            .find(|(g, e)| g.to_bits() != e.to_bits())
+        {
             None => Ok(()),
-            Some(got) => Err(format!(
+            Some((got, expected)) => Err(format!(
                 "the adapter {} reassociates float additions (a probe summed to {got} instead \
                  of {expected}); its predictions could differ from the CPU's",
                 self.device_name
             )),
         }
+    }
+
+    /// Run `chain` through the prediction kernel: one single-leaf tree per
+    /// leaf (or per `k` leaf values with vector leaves), one row per margin
+    /// row, no features. Returns the accumulated margins.
+    fn run_chain(&self, chain: &AdditionChain) -> Result<Vec<f32>> {
+        let k = chain.k;
+        let n_trees = chain.leaves.len() / if chain.vector { k } else { 1 };
+        let rows = chain.margins.len() / k;
+        // Single-leaf trees: node `t` is its own left child; `aux` holds the
+        // leaf's bits, or the tree's offset into the leaf-vector pool.
+        let nodes: Vec<[u32; 4]> = (0..n_trees)
+            .map(|t| {
+                let aux = if chain.vector {
+                    (t * k) as u32
+                } else {
+                    chain.leaves[t].to_bits()
+                };
+                [0, 0, t as u32, aux]
+            })
+            .collect();
+        let trees: Vec<PTree> = (0..n_trees)
+            .map(|t| PTree {
+                root: t as u32,
+                output: (t % k) as u32,
+                vector: u32::from(chain.vector),
+                pad: 0,
+            })
+            .collect();
+        let (forest, call) = self.scoped("allocating the addition chain", || {
+            let forest = ForestBuffers {
+                nodes: self.storage_init("chain nodes", bytemuck::cast_slice(&nodes))?,
+                categories: self.storage_init("chain categories", &[0; 16])?,
+                leaf_vectors: self
+                    .storage_init("chain leaf vectors", bytemuck::cast_slice(&chain.leaves))?,
+                trees: self.storage_init("chain trees", bytemuck::cast_slice(&trees))?,
+            };
+            let call = PredictBuffers::new(self, &forest, rows, 1, k, rows)?;
+            Ok((forest, call))
+        })?;
+        drop(forest);
+        let features = vec![0.0f32; rows];
+        let mut margins = chain.margins.clone();
+        call.run_block(
+            self,
+            &PredictArgs {
+                n_rows: rows as u32,
+                n_cols: 1,
+                k: k as u32,
+                tree_begin: 0,
+                tree_end: n_trees as u32,
+                soft: u32::from(chain.soft),
+                pad: [0; 2],
+            },
+            &features,
+            &margins,
+            0,
+        )?;
+        call.read_margins(self, &mut margins)?;
+        Ok(margins)
+    }
+}
+
+/// A sequence of leaf additions run through the prediction kernel without
+/// any tree walk: the probe's and the tests' way to exercise `add_f32` on
+/// chosen bit patterns, through each of the kernel's three accumulation
+/// paths (one output, several scalar outputs, vector leaves).
+struct AdditionChain {
+    /// Outputs per row.
+    k: usize,
+    /// Vector leaves (`k` values per tree) instead of one scalar leaf per
+    /// tree feeding output `t % k`.
+    vector: bool,
+    /// Leaf values, `k` per tree when `vector`.
+    leaves: Vec<f32>,
+    /// Initial margins, `k` per row.
+    margins: Vec<f32>,
+    /// Force the integer addition path for every add.
+    soft: bool,
+}
+
+impl AdditionChain {
+    /// What the CPU computes: each row's margins plus every tree's leaf in
+    /// tree order, in `f32`.
+    fn cpu(&self) -> Vec<f32> {
+        let k = self.k;
+        let mut out = self.margins.clone();
+        for row in out.chunks_exact_mut(k) {
+            if self.vector {
+                for leaf in self.leaves.chunks_exact(k) {
+                    for (o, &l) in row.iter_mut().zip(leaf) {
+                        *o += l;
+                    }
+                }
+            } else {
+                for (t, &l) in self.leaves.iter().enumerate() {
+                    row[t % k] += l;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1688,7 +1853,8 @@ impl GpuModel {
                     k: k as u32,
                     tree_begin: trees.start as u32,
                     tree_end: trees.end as u32,
-                    pad: [0; 3],
+                    soft: 0,
+                    pad: [0; 2],
                 };
                 call.run_block(
                     self.ctx,
@@ -2380,6 +2546,222 @@ mod tests {
             assert!(
                 (x as usize) * LINEAR_THREADS as usize * (y as usize) >= items,
                 "{items}"
+            );
+        }
+    }
+
+    /// Run `chain` on the GPU and require the CPU's bits, row by row (two
+    /// NaNs count as equal: their payloads are platform-defined on the CPU
+    /// too).
+    fn assert_chain_matches(chain: &AdditionChain, what: &str) {
+        let ctx = Context::shared().unwrap();
+        let got = ctx.run_chain(chain).unwrap();
+        let expected = chain.cpu();
+        for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                g.to_bits() == e.to_bits() || (g.is_nan() && e.is_nan()),
+                "{what}: slot {i}: GPU {g:e} ({:#010x}) != CPU {e:e} ({:#010x}); margin \
+                 {:#010x}",
+                g.to_bits(),
+                e.to_bits(),
+                chain.margins[i].to_bits()
+            );
+        }
+    }
+
+    /// Operand pairs that a native float add gets wrong on a flush-to-zero
+    /// adapter or that stress the integer path's rounding: subnormal
+    /// operands and results, signed zeros, ties, sticky bits, carries,
+    /// cancellation, and overflow.
+    fn addition_edge_cases() -> Vec<(f32, f32)> {
+        let b = f32::from_bits;
+        let min_normal = b(0x0080_0000);
+        let min_sub = b(0x0000_0001);
+        vec![
+            // Two normals whose exact sum is the smallest subnormal.
+            (b(0x0100_0000), -b(0x00ff_ffff)),
+            (-b(0x00ff_ffff), b(0x0100_0000)),
+            (min_sub, min_sub),
+            (min_sub, -min_sub),
+            (b(0x007f_ffff), min_sub),
+            (min_normal, -min_sub),
+            (min_normal, min_sub),
+            (b(0x0040_0000), b(0x0040_0000)),
+            (1.0, min_sub),
+            (-1.0, b(0x0012_3456)),
+            (b(0x0012_3456), b(0x0065_4321)),
+            (b(0x0012_3456), -b(0x0065_4321)),
+            (0.0, -0.0),
+            (-0.0, 0.0),
+            (-0.0, -0.0),
+            (0.0, 0.0),
+            (1.0, -1.0),
+            (-1.0, 1.0),
+            (min_sub, 0.0),
+            (-0.0, min_sub),
+            (1.0, 2f32.powi(-24)),
+            (b(0x3f80_0001), 2f32.powi(-24)),
+            (1.0, 3.0 * 2f32.powi(-24)),
+            (1.0, 2f32.powi(-25)),
+            (1.0, -2f32.powi(-25)),
+            (1.0, -(2f32.powi(-24) + 2f32.powi(-30))),
+            (1.0, 1e-30),
+            (1e30, 1.0),
+            (1.0, -b(0x3f7f_ffff)),
+            (b(0x3f7f_ffff), -1.0),
+            (3.0, 5.0),
+            (-2.5, 1.25),
+            (f32::MAX, f32::MAX),
+            (f32::MAX, 2f32.powi(103)),
+            (f32::MAX, 2f32.powi(102)),
+            (f32::MAX, -f32::MAX),
+            (-f32::MAX, -f32::MAX),
+            (f32::INFINITY, 1.0),
+            (-f32::INFINITY, f32::MAX),
+            (f32::INFINITY, f32::INFINITY),
+            (f32::INFINITY, -f32::INFINITY),
+            (f32::INFINITY, f32::NAN),
+            (f32::NAN, 1.0),
+            (b(0x3f80_0000), b(0x3f80_0000)),
+            (b(0x7f7f_ffff), b(0x3380_0000)),
+            (b(0x4000_0000), b(0x3fff_ffff)),
+            (b(0x4000_0000), -b(0x3fff_ffff)),
+        ]
+    }
+
+    /// A deterministic finite `f32` from a SplitMix64 step, over every
+    /// exponent (including subnormals and zeros), both signs.
+    fn random_finite(state: &mut u64) -> f32 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let bits = z as u32;
+        // Keep the exponent out of the NaN/inf range; bias half the draws
+        // toward the bottom of the range so subnormals and near-subnormal
+        // sums are common.
+        let exponent = if z >> 63 == 0 {
+            (bits >> 23) & 0xFF
+        } else {
+            (bits >> 23) & 0x07
+        };
+        f32::from_bits((bits & 0x807F_FFFF) | (exponent.min(0xFE) << 23))
+    }
+
+    /// The kernel's additions equal the CPU's bit for bit on every edge case
+    /// of `f32` addition and on random operands, through the integer path
+    /// (`soft`) and the adapter's own add behind the normal-range check,
+    /// for each accumulation path (one output, scalar outputs, vector
+    /// leaves).
+    #[test]
+    fn additions_match_the_cpu_bit_for_bit() {
+        if !context() {
+            return;
+        }
+        // Every edge pair as (margin, leaf) and as (leaf, margin): one tree,
+        // one row per pair.
+        let pairs = addition_edge_cases();
+        for soft in [true, false] {
+            for &(m, l) in &pairs {
+                for (margin, leaf) in [(m, l), (l, m)] {
+                    assert_chain_matches(
+                        &AdditionChain {
+                            k: 1,
+                            vector: false,
+                            leaves: vec![leaf],
+                            margins: vec![margin],
+                            soft,
+                        },
+                        &format!("{margin:e} + {leaf:e} (soft {soft})"),
+                    );
+                }
+            }
+        }
+        // Random chains: 32 leaves over 8,192 rows of random margins, so the
+        // running sums meet every alignment and cancellation.
+        let mut state = 0x5EED_u64;
+        for (k, vector) in [(1, false), (3, false), (2, true)] {
+            for soft in [true, false] {
+                let leaves: Vec<f32> = (0..32 * if vector { k } else { 1 })
+                    .map(|_| random_finite(&mut state))
+                    .collect();
+                let margins: Vec<f32> = (0..8_192 * k).map(|_| random_finite(&mut state)).collect();
+                assert_chain_matches(
+                    &AdditionChain {
+                        k,
+                        vector,
+                        leaves,
+                        margins,
+                        soft,
+                    },
+                    &format!("random chain (k {k}, vector {vector}, soft {soft})"),
+                );
+            }
+        }
+    }
+
+    /// A model whose leaves and base margins are subnormal predicts
+    /// bit-identically through the real tree walk: every addition routes
+    /// through the integer path.
+    #[test]
+    fn gpu_predicts_subnormal_margins_like_cpu() {
+        use crate::config::TreeMethod;
+        use crate::prelude::*;
+        if !context() {
+            return;
+        }
+        let n = 3_000;
+        let cols = 4;
+        let x: Vec<f32> = (0..n * cols)
+            .map(|i: usize| ((i.wrapping_mul(2_654_435_761)) % 1000) as f32 * 0.001)
+            .collect();
+        // Labels around the smallest normal, so the leaves (label means)
+        // and most running margins are subnormal or straddle the boundary.
+        let min_normal = f32::from_bits(0x0080_0000);
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                let scale = ((i * 7919) % 1000) as f32 * 0.003 - 1.0;
+                min_normal * scale
+            })
+            .collect();
+        let data = DMatrix::from_dense(&x, n, cols)
+            .unwrap()
+            .with_labels(&y)
+            .unwrap();
+        let params = TrainingParams::builder()
+            .objective(Objective::SquaredError(RegLoss::default()))
+            .tree_method(TreeMethod::Hist)
+            .base_score(0.0)
+            .max_depth(4)
+            .eta(1.0)
+            .build()
+            .unwrap();
+        let model = train(&params, &data, 6).unwrap();
+        let subnormal_leaves = model
+            .trees()
+            .iter()
+            .flat_map(|t| {
+                t.nodes()
+                    .iter()
+                    .filter(|n| n.is_leaf())
+                    .map(|n| n.leaf_value)
+            })
+            .filter(|v| *v != 0.0 && v.abs() < min_normal)
+            .count();
+        assert!(subnormal_leaves > 0, "the test needs subnormal leaves");
+        let gpu = model.to_wgpu().unwrap();
+        let base_margin: Vec<f32> = (0..n)
+            .map(|i| {
+                f32::from_bits(((i * 48_271) % 0x00FF_FFFF) as u32)
+                    * if i % 2 == 0 { 1.0 } else { -1.0 }
+            })
+            .collect();
+        let with_margin = data.clone().with_base_margin(&base_margin).unwrap();
+        for d in [&data, &with_margin] {
+            assert_eq!(
+                model.predict_margin(d, Iterations::Best).unwrap(),
+                gpu.predict_margin(d, Iterations::Best).unwrap()
             );
         }
     }

@@ -780,8 +780,8 @@ Hosted macOS CI has no Metal device: those tests skip there.
 ## wgpu GPU (Vulkan, Metal, DirectX 12)
 
 The `wgpu` feature adds a portable GPU backend (`src/backend/wgpu.rs` has
-the design, the same exactness bound as Metal, and the one assumption about
-the adapter's float addition and how it is checked). It is a correctness and
+the design, the same exactness bound as Metal, and how prediction's
+additions stay exact on adapters that flush subnormals). It is a correctness and
 portability path so far: **nothing has been measured on a real GPU**. The
 only numbers to date come from Mesa's lavapipe software adapter on a
 192-core aarch64 Linux host (Rust 1.98.1, 2026-10-06), where the "GPU" is

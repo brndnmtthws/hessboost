@@ -10,7 +10,7 @@ mod common;
 
 use hessboost::backend::wgpu;
 use hessboost::config::{
-    BoosterKind, Dart, Device, LinearTree, ProcessType, QuantizedGrad, Refresh,
+    BoosterKind, Dart, Device, LinearTree, MultiStrategy, ProcessType, QuantizedGrad, Refresh,
 };
 use hessboost::objective::{GradPair, Multiclass, RegLoss};
 use hessboost::prelude::*;
@@ -328,6 +328,88 @@ fn to_wgpu_predicts_bit_identically_across_blocks() {
             gpu.predict(&batch, Iterations::Best).unwrap(),
             "{objective}: predict across blocks"
         );
+    }
+}
+
+/// Subnormal arithmetic through the public API: a model whose leaves sit
+/// around the smallest normal `f32`, predicted with and without subnormal
+/// base margins, through scalar leaves (one output) and vector leaves
+/// (`multi_output_tree`, several outputs). An adapter that flushes
+/// subnormals in its own float adds must still give the CPU's bits.
+#[test]
+fn to_wgpu_predicts_subnormal_margins_bit_identically() {
+    if !device() {
+        return;
+    }
+    let n = 3_000;
+    let cols = 4;
+    let x: Vec<f32> = (0..n * cols)
+        .map(|i: usize| ((i.wrapping_mul(2_654_435_761)) % 1000) as f32 * 0.001)
+        .collect();
+    let min_normal = f32::from_bits(0x0080_0000);
+    let labels = |targets: usize| -> Vec<f32> {
+        (0..n * targets)
+            .map(|i| min_normal * (((i * 7919) % 1000) as f32 * 0.003 - 1.0))
+            .collect()
+    };
+    let base_margin = |targets: usize| -> Vec<f32> {
+        (0..n * targets)
+            .map(|i| {
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                f32::from_bits(((i * 48_271) % 0x00FF_FFFF) as u32) * sign
+            })
+            .collect()
+    };
+    let scalar = DMatrix::from_dense(&x, n, cols)
+        .unwrap()
+        .with_labels(&labels(1))
+        .unwrap();
+    let vector = DMatrix::from_dense(&x, n, cols)
+        .unwrap()
+        .with_label_matrix(&labels(3), 3)
+        .unwrap();
+    let params = |strategy| {
+        TrainingParams::builder()
+            .objective(Objective::SquaredError(RegLoss::default()))
+            .tree_method(TreeMethod::Hist)
+            .multi_strategy(strategy)
+            .base_score(0.0)
+            .max_depth(4)
+            .eta(1.0)
+            .build()
+            .unwrap()
+    };
+    for (data, strategy, targets) in [
+        (scalar, MultiStrategy::OneOutputPerTree, 1),
+        (vector, MultiStrategy::MultiOutputTree, 3),
+    ] {
+        let model = train(&params(strategy), &data, 6).unwrap();
+        let subnormal_leaves = model
+            .trees()
+            .iter()
+            .flat_map(|t| {
+                (0..t.nodes().len())
+                    .filter(|&i| t.node(i).is_leaf())
+                    .flat_map(|i| t.leaf_vector(i).iter().copied())
+            })
+            .filter(|v| *v != 0.0 && v.abs() < min_normal)
+            .count();
+        assert!(
+            subnormal_leaves > 0,
+            "{strategy:?}: the test needs subnormal leaves"
+        );
+        let gpu = model.to_wgpu().unwrap();
+        let with_margin = data
+            .clone()
+            .with_base_margin(&base_margin(targets))
+            .unwrap();
+        for d in [&data, &with_margin] {
+            assert_eq!(
+                model.predict_margin(d, Iterations::Best).unwrap(),
+                gpu.predict_margin(d, Iterations::Best).unwrap(),
+                "{strategy:?}"
+            );
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 """Conversion of user inputs (numpy arrays of any dtype and layout, pandas
-and polars frames, scipy sparse matrices, array-likes) into the row-major
-``float32`` arrays the native core borrows."""
+and polars frames (polars 1.x and 2.x; a ``LazyFrame`` is collected once),
+scipy sparse matrices, array-likes) into the row-major ``float32`` arrays
+the native core borrows, and of per-row metadata a frame supplies by column
+name (:func:`take_metadata`)."""
 
 from __future__ import annotations
 
@@ -59,10 +61,22 @@ def _is_polars_frame(data: object) -> TypeGuard[pl.DataFrame]:
     return pl is not None and isinstance(data, pl.DataFrame)
 
 
+def _is_polars_lazyframe(data: object) -> TypeGuard[pl.LazyFrame]:
+    pl = _polars()
+    return pl is not None and isinstance(data, pl.LazyFrame)
+
+
 def _is_frame(data: object) -> bool:
     """Whether ``data`` is a pandas or polars frame, which keeps its column
     names and categorical columns."""
     return _is_pandas_frame(data) or _is_polars_frame(data)
+
+
+def collect_frame(data: object) -> object:
+    """A polars ``LazyFrame`` collected, once, by polars' default engine
+    (the streaming engine since polars 2.0, which spills to disk when the
+    frame outgrows memory); anything else as it is."""
+    return data.collect() if _is_polars_lazyframe(data) else data
 
 
 def _refuse_categorical(name: object) -> HessboostError:
@@ -182,6 +196,36 @@ def _pandas_frame_values(
     return values, names, types, categories
 
 
+def _polars_numeric(pl: Any, dtype: Any) -> bool:
+    """Whether a polars ``dtype`` reads as a number: numeric (``Decimal``
+    included), ``Boolean``, or ``Null`` (a column of nothing but missing)."""
+    return bool(dtype.is_numeric()) or dtype == pl.Boolean or dtype == pl.Null
+
+
+def _refuse_polars_dtype(pl: Any, what: str, dtype: Any, *, categorical: bool) -> TypeError:
+    """The refusal of a polars column of ``dtype``, with the conversion that
+    would make it acceptable where there is one. ``categorical`` columns
+    are accepted for features, not for metadata."""
+    extension = getattr(pl, "Extension", None)
+    if extension is not None and isinstance(dtype, extension):
+        hint = "; take its storage values with .ext.storage()"
+    elif dtype.is_temporal():
+        hint = "; convert it to a number, e.g. with .dt.epoch() or .to_physical()"
+    elif dtype == pl.String and categorical:
+        hint = "; convert strings with .cast(pl.Categorical)"
+    else:
+        hint = ""
+    accepted = (
+        "numeric, Boolean, Enum and Categorical columns" if categorical else "numeric or Boolean"
+    )
+    return TypeError(f"{what} has dtype {dtype}; hessboost takes {accepted}{hint}")
+
+
+_CONVERSION_BLOCK_BYTES = 64 << 20
+"""The float32 output a polars frame is converted per row block (bounding
+the intermediate ``Float32`` frame)."""
+
+
 def _polars_frame_values(
     frame: pl.DataFrame,
     enable_categorical: bool,
@@ -195,51 +239,70 @@ def _polars_frame_values(
     the ``unseen`` columns, where it gets the code one past them). An
     ``Enum``'s categories are its dtype's; a ``Categorical``'s are its
     values, sorted (as pandas infers them), since its physical codes index
-    a pool other columns share."""
+    a pool other columns share.
+
+    The conversion is a polars ``select`` of ``Float32`` expressions, which
+    polars evaluates in parallel, written row-major by
+    ``to_numpy(order="c")``, over row blocks of ``_CONVERSION_BLOCK_BYTES``
+    of output so the intermediate frame stays small. Columns are addressed
+    by position (``pl.nth``): ``pl.col`` parses a name that looks like a
+    regex as one."""
     pl = _polars()
-    rows, cols = frame.shape
-    values = np.empty((rows, cols), dtype=np.float32)
+    exprs: list[Any] = []
     types: FeatureTypes = []
     categories: Categories = {}
-    for column, series in enumerate(frame.get_columns()):
-        name, dtype = series.name, series.dtype
+    for column, (name, dtype) in enumerate(frame.schema.items()):
         if isinstance(dtype, (pl.Categorical, pl.Enum)):
             if not enable_categorical:
                 raise _refuse_categorical(name)
-            strings = series.cast(pl.String)
             if isinstance(dtype, pl.Enum):
                 known: list[Any] = dtype.categories.to_list()
             else:
-                known = sorted(strings.drop_nulls().unique().to_list())
+                known = sorted(frame[:, column].unique().drop_nulls().cast(pl.String).to_list())
             wanted = None if reference is None else reference.get(column)
             if wanted is not None:
                 known = wanted
             # Polars categories are strings; a reference's other values
-            # (a pandas model's integer categories) match nothing.
+            # (a pandas model's integer categories) match nothing. Null maps
+            # to null explicitly: `default` would replace it too.
             positions = [
                 (value, code) for code, value in enumerate(known) if isinstance(value, str)
             ]
             other = float(len(known)) if wanted is not None and column in unseen else None
-            codes = strings.replace_strict(
-                [value for value, _ in positions],
-                [code for _, code in positions],
-                default=other,
-                return_dtype=pl.Float32,
+            exprs.append(
+                pl.nth(column)
+                .cast(pl.String)
+                .replace_strict(
+                    [*(value for value, _ in positions), None],
+                    [*(code for _, code in positions), None],
+                    default=other,
+                    return_dtype=pl.Float32,
+                )
             )
-            column_values = codes.to_numpy(writable=other is not None)
-            if other is not None:
-                column_values[strings.is_null().to_numpy()] = np.nan
             types.append("c")
             categories[column] = known
-        elif dtype.is_numeric() or dtype == pl.Boolean:
-            column_values = series.cast(pl.Float32).to_numpy()
+        elif _polars_numeric(pl, dtype):
+            exprs.append(pl.nth(column).cast(pl.Float32))
             types.append("q")
         else:
-            raise TypeError(
-                f"column {name!r} has dtype {dtype}; hessboost takes numeric, Boolean, Enum and "
-                "Categorical columns (convert strings with .cast(pl.Categorical))"
-            )
-        values[:, column] = column_values
+            raise _refuse_polars_dtype(pl, f"column {name!r}", dtype, categorical=True)
+    values = np.empty((frame.height, len(exprs)), dtype=np.float32)
+    if exprs:
+        # In row blocks: a block's Float32 frame is the only intermediate,
+        # and every expression is Float32, so `to_numpy` gives a float32
+        # block (nulls NaN) that is copied into place.
+        block = max(1, _CONVERSION_BLOCK_BYTES // (4 * len(exprs)))
+        for start in range(0, frame.height, block):
+            part = frame.slice(start, block).select(exprs).to_numpy(order="c")
+            target = values[start : start + block]
+            if part.shape != target.shape:
+                # polars 1.0 drops a selected column whose name reads as a
+                # regex (`^...$`); never let numpy broadcast over that.
+                raise HessboostError(
+                    f"polars converted {part.shape[1]} of {len(exprs)} columns; a column name "
+                    "that reads as a regex (^...$) needs a newer polars"
+                )
+            target[...] = part
     return values, list(frame.columns), types, categories
 
 
@@ -258,7 +321,10 @@ def features(
     attached. ``reference`` holds a trained model's categories, to which
     frame categorical columns are re-coded; values it lacks are missing,
     except in the ``unseen`` columns, where they are coded one past its
-    categories (a target encoder's unseen category)."""
+    categories (a target encoder's unseen category). A polars ``LazyFrame``
+    is collected (:func:`take_metadata` has already checked that nothing
+    needs aligning with its rows)."""
+    data = collect_frame(data)
     names: list[str] | None = None
     types: FeatureTypes | None = None
     categories: Categories = {}
@@ -325,7 +391,8 @@ def group_sizes(group: ArrayLike | None, qid: ArrayLike | None) -> list[int] | N
         raise HessboostError("qid is empty")
     if np.any(ids[1:] < ids[:-1]):
         raise HessboostError("qid must be sorted (rows of a query are contiguous)")
-    starts = np.flatnonzero(np.diff(ids)) + 1
+    # Compared, not subtracted: query ids may be strings.
+    starts = np.flatnonzero(ids[1:] != ids[:-1]) + 1
     bounds = np.concatenate([[0], starts, [ids.size]])
     return [int(size) for size in np.diff(bounds)]
 
@@ -363,3 +430,141 @@ def info(
     if feature_weights is not None:
         out["feature_weights"] = as_vector(feature_weights, "feature_weights")
     return out
+
+
+_PER_ROW_FIELDS = (
+    "label",
+    "weight",
+    "base_margin",
+    "qid",
+    "label_lower_bound",
+    "label_upper_bound",
+)
+"""The metadata with one value per row, which a frame can supply by column
+name (``label`` and ``base_margin`` several, for a label matrix or
+per-output margins)."""
+
+_MATRIX_FIELDS = frozenset({"label", "base_margin"})
+
+
+def _column_names(field: str, value: object) -> list[str] | None:
+    """``value`` read as ``field``'s column names: a ``str``, or for the
+    fields that take several columns (``label``, ``base_margin``) a
+    non-empty list or tuple of them; ``None`` for anything else, an array
+    included (a list of strings is query ids for ``qid``)."""
+    if isinstance(value, str):
+        return [value]
+    if (
+        field in _MATRIX_FIELDS
+        and isinstance(value, (list, tuple))
+        and value
+        and all(isinstance(v, str) for v in value)
+    ):
+        return list(value)
+    return None
+
+
+def _lazy_alignment_error(field: str) -> HessboostError:
+    by_name = "qid='...' for the query ids" if field == "group" else f"{field}='...'"
+    return HessboostError(
+        f"{field} is an array, but data is a polars LazyFrame, which hessboost collects itself: "
+        f"its rows may not be in the order of a separately collected frame (the streaming engine "
+        f"keeps no row order after a join or group_by). Name a column of the frame instead "
+        f"({by_name}), or collect it (data.collect()) and pass the DataFrame along with the array"
+    )
+
+
+def _pandas_columns(frame: pd.DataFrame, field: str, names: list[str]) -> NDArray[Any]:
+    """The ``names`` columns of a pandas frame as ``field``'s values:
+    ``float32`` with ``NA`` missing (``qid`` keeps its values), ``(rows,)``
+    for one name and ``(rows, k)`` for ``k``."""
+    pd = _pandas()
+    if field == "qid":
+        return frame[names[0]].to_numpy()
+    for name in names:
+        dtype = frame[name].dtype
+        if not (pd.api.types.is_bool_dtype(dtype) or pd.api.types.is_numeric_dtype(dtype)):
+            raise TypeError(
+                f"{field} column {name!r} has dtype {dtype}; it must be numeric or boolean"
+            )
+    if len(names) == 1:
+        return frame[names[0]].to_numpy(dtype=np.float32, na_value=np.nan)
+    return frame[names].to_numpy(dtype=np.float32, na_value=np.nan)
+
+
+def _polars_columns(frame: pl.DataFrame, field: str, names: list[str]) -> NDArray[Any]:
+    """The ``names`` columns of a polars frame as ``field``'s values:
+    ``float32`` with null missing (``qid`` keeps its values), ``(rows,)``
+    for one name and ``(rows, k)`` for ``k``. Columns are looked up by
+    exact name (``get_column``), not through ``pl.col``'s regex parsing."""
+    pl = _polars()
+    if field == "qid":
+        return frame.get_column(names[0]).to_numpy()
+    for name in names:
+        dtype = frame.schema[name]
+        if not _polars_numeric(pl, dtype):
+            raise _refuse_polars_dtype(pl, f"{field} column {name!r}", dtype, categorical=False)
+    columns = [frame.get_column(name).cast(pl.Float32).to_numpy() for name in names]
+    return columns[0] if len(columns) == 1 else np.column_stack(columns)
+
+
+def take_metadata(data: object, **fields: Any) -> tuple[object, dict[str, Any]]:
+    """``data`` and its metadata ``fields`` (:func:`info`'s arguments) with
+    the per-row ones a frame supplies by column name resolved: a ``str``
+    (``label="y"``; ``label`` and ``base_margin`` also a list of names, for
+    a label matrix or per-output margins) names a column of a pandas or
+    polars ``data``, which becomes that field's values and leaves the
+    features. The returned data is the frame without those columns.
+
+    A polars ``LazyFrame`` is collected here, once, and may only be given
+    per-row metadata (``group`` sizes included) by column name: a frame the
+    caller collected separately need not come out in the same row order
+    under polars' streaming engine, so an array alongside it is refused.
+
+    Raises:
+        HessboostError: A name is not a column of ``data`` or is named
+            twice, ``group`` (sizes, not a column) is given by name, or an
+            array accompanies a ``LazyFrame``.
+        TypeError: A name is given for data that is not a frame, or names
+            a column that is not numeric or boolean.
+    """
+    named = {
+        field: names
+        for field, value in fields.items()
+        if (names := _column_names(field, value)) is not None
+    }
+    if _is_polars_lazyframe(data):
+        for field, value in fields.items():
+            if value is not None and field not in named:
+                raise _lazy_alignment_error(field)
+    frame = collect_frame(data)
+    if not named:
+        return frame, fields
+    if not (_is_pandas_frame(frame) or _is_polars_frame(frame)):
+        field = next(iter(named))
+        raise TypeError(
+            f"{field}={fields[field]!r} names a column, but data is a "
+            f"{type(frame).__name__}, not a DataFrame"
+        )
+    for field, names in named.items():
+        if field not in _PER_ROW_FIELDS:
+            hint = "; query groups come from qid= as a column name" if field == "group" else ""
+            raise HessboostError(
+                f"{field} is not one value per row, so it cannot be a column name{hint}"
+            )
+        if len(set(names)) != len(names):
+            raise HessboostError(f"{field} names a column twice: {names}")
+        for name in names:
+            if name not in frame.columns:
+                raise HessboostError(f"{field} column {name!r} is not a column of data")
+    taken = list(dict.fromkeys(name for names in named.values() for name in names))
+    resolved: dict[str, Any] = dict(fields)
+    if _is_pandas_frame(frame):
+        for field, names in named.items():
+            resolved[field] = _pandas_columns(frame, field, names)
+        return frame.drop(columns=taken), resolved
+    assert _is_polars_frame(frame)
+    for field, names in named.items():
+        resolved[field] = _polars_columns(frame, field, names)
+    kept = [column for column, name in enumerate(frame.columns) if name not in taken]
+    return frame[:, kept], resolved

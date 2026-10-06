@@ -681,7 +681,9 @@ mod tests {
                 .build()
                 .unwrap();
             let tree = grow(&params, &data, &gpair);
-            assert!(!levels(&tree).is_empty());
+            // Still symmetric (`levels` asserts it), split, and smaller than
+            // the unconstrained tree.
+            levels(&tree);
             assert!(tree.num_leaves() > 1 && tree.num_leaves() < full.num_leaves());
             for n in tree.nodes() {
                 if n.is_leaf() {

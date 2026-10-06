@@ -214,11 +214,11 @@ fn summaries_of_no_rows_are_empty() {
     // summaries must not size buffers by it (2⁴⁰ `f64`s cannot be allocated).
     let empty = Samples::new(Vec::new(), 1 << 40, 1).unwrap();
     assert_eq!(empty.n_rows(), 0);
-    assert!(empty.mean().as_slice().is_empty());
+    assert_eq!(empty.mean().as_slice(), [] as [f64; 0]);
     let q = empty.quantiles(&[0.1, 0.9]).unwrap();
     assert_eq!((q.n_rows(), q.n_levels(), q.n_outputs()), (0, 2, 1));
-    assert!(q.as_slice().is_empty());
-    assert!(empty.crps(&[]).unwrap().as_slice().is_empty());
+    assert_eq!(q.as_slice(), [] as [f64; 0]);
+    assert_eq!(empty.crps(&[]).unwrap().as_slice(), [] as [f64; 0]);
 }
 
 #[test]

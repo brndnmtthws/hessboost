@@ -66,7 +66,7 @@ fn a_continuing_hook_changes_nothing_and_sees_every_round_in_order() {
     let mut iterations = Vec::new();
     let unscored = Trainer::new(&params, &dtrain, 5)
         .on_round(|round| {
-            assert!(round.values().is_empty());
+            assert_eq!(round.values(), [] as [f64; 0]);
             iterations.push(round.iteration());
             ControlFlow::Continue(())
         })

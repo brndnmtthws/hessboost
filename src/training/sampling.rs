@@ -348,7 +348,7 @@ mod tests {
         let s = gradient_based_sample(&g, 1, 0.3, &mut rng)
             .unwrap()
             .unwrap();
-        assert!(s.rows.is_empty());
+        assert_eq!(s.rows, [] as [u32; 0]);
         assert!(s.gpair.iter().all(|p| *p == GradPair::default()));
     }
 
@@ -509,7 +509,9 @@ mod tests {
             let b = gradient_based_sample(&big, n_targets, 0.3, &mut Rng::new(3))
                 .unwrap()
                 .unwrap();
-            assert!(!s.rows.is_empty());
+            // The sample keeps about its 900-row budget (standard deviation
+            // at most 30), so the comparisons below are not vacuous.
+            assert!(s.rows.len().abs_diff(900) <= 150, "kept {}", s.rows.len());
             assert_eq!(b.rows, s.rows, "2^{exponent}");
             assert_eq!(b.probability, s.probability, "2^{exponent}");
             if exponent == 85 {

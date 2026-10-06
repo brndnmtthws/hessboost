@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(features, &[0]);
         assert!((coeffs[0] - slope).abs() < 1e-12, "{coeffs:?} vs {slope}");
         assert!((linear.intercept(2) - intercept).abs() < 1e-12);
-        assert!(linear.terms(1).0.is_empty());
+        assert_eq!(linear.terms(1).0, [] as [u32; 0]);
         assert_eq!(tree.predict_row(&data, 0), -0.5);
         // Without a penalty the fit recovers the line.
         let mut exact = stump(true);

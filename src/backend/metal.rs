@@ -106,6 +106,7 @@
 unsafe extern "C" {}
 
 use crate::backend::exact_sum::SumDomain;
+use crate::backend::{materialize_rows, scatter_row_bound};
 use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
 use crate::model::{BoostedModel, Iterations, initial_margins, transform_model_margins};
@@ -1037,27 +1038,6 @@ enum Scan {
 /// Rows one threadgroup scans: a node's chunk is split into this many slices,
 /// and the bound below only has to admit that many.
 const ROWS_PER_SLICE: usize = CHUNK_ROWS / ROW_SLICES;
-
-/// Rows one threadgroup may scan with the scatter kernel's shared 32-bit
-/// accumulators, given the staged slices' magnitude statistics: a grain count
-/// `k` is split as `k = hi * 2^16 + lo`, so one threadgroup's `hi` sum must
-/// stay inside an `i32` (`lo` is 16-bit each and sums inside a `u32`). The
-/// bound is at least [`SCATTER_MIN_ROWS`] for any slice whose values allow
-/// the GPU at all; past it the node runs on the CPU backend, whose sums are
-/// exact by the same argument (see `backend::exact_sum`).
-fn scatter_row_bound(grad: &SumDomain, hess: &SumDomain) -> usize {
-    let bound = |domain: &SumDomain| -> u64 {
-        let max = domain.max_units();
-        if max == 0 {
-            return u64::from(u32::MAX);
-        }
-        let hi = max.div_ceil(1 << 16);
-        // Both accumulators stay exact: `hi` in an `i32`, `lo` in a `u32`
-        // (the largest 16-bit sum, 65535 per row).
-        (((1u64 << 31) - 1) / hi).min((u64::from(u32::MAX) - 1) / 65_535)
-    };
-    usize::try_from(bound(grad).min(bound(hess))).unwrap_or(usize::MAX)
-}
 
 /// Per-call GPU buffers of the histogram backend, pooled across the parallel
 /// node builds of a training run. Each concurrent `build` owns one set.
@@ -2210,36 +2190,6 @@ impl BoostedModel {
             pool: Mutex::new(Vec::new()),
         })
     }
-}
-
-/// Write `data`'s rows starting at row `begin` into `rows` as a dense
-/// `NaN`-for-missing matrix, the same materialization the CPU's row blocks
-/// use: dense NaN-sentinel matrices copy in place, a dense matrix with
-/// another sentinel maps sentinel values to `NaN`, and CSR rows materialize
-/// per entry. `rows` holds a whole number of rows; it is one prediction
-/// block of the batch.
-fn materialize_rows(data: &crate::data::DMatrix, begin: usize, rows: &mut [f32]) {
-    let n_cols = data.n_cols();
-    if let Some(dense) = data.dense_values()
-        && data.missing().is_nan()
-        && dense.len() == data.n_rows() * n_cols
-    {
-        let start = begin * n_cols;
-        rows.copy_from_slice(&dense[start..start + rows.len()]);
-        return;
-    }
-    let missing = data.missing();
-    rows.par_chunks_mut(n_cols)
-        .enumerate()
-        .for_each(|(i, row)| {
-            let r = begin + i;
-            for (f, slot) in row.iter_mut().enumerate() {
-                *slot = match data.get(r, f) {
-                    Some(v) if v != missing || missing.is_nan() => v,
-                    _ => f32::NAN,
-                };
-            }
-        });
 }
 
 // ---------------------------------------------------------------------------

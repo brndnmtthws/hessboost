@@ -156,7 +156,12 @@ pub enum GrowPolicy {
 }
 
 /// Which processor training runs on. XGBoost `device` (XGBoost spells its
-/// GPU choices `cuda`/`gpu`; the macOS GPU backend here is `metal`).
+/// GPU choices `cuda`/`gpu`; the GPU backends here are `metal` and `wgpu`).
+///
+/// Either GPU moves histogram construction to the GPU for every node whose
+/// sums it can compute exactly and keeps the rest on the CPU, reproducing
+/// single-threaded CPU training bit for bit. Both require `tree_method =
+/// hist`/`auto` and a tree booster, and are opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -165,11 +170,7 @@ pub enum Device {
     /// run on.
     #[default]
     Cpu,
-    /// Apple's Metal GPU, on macOS 10.15 or later with the `metal` feature:
-    /// histogram construction runs on the GPU for every node whose sums it
-    /// can compute exactly and on the CPU for the rest, reproducing
-    /// single-threaded CPU training bit for bit. Requires `tree_method =
-    /// hist`/`auto` and a tree booster. Opt-in.
+    /// Apple's Metal GPU, on macOS 10.15 or later with the `metal` feature.
     ///
     /// A correctness path so far, not a speedup: with the earlier
     /// floating-point kernels the GPU histograms were slower than the
@@ -178,6 +179,35 @@ pub enum Device {
     /// prediction, through
     /// [`BoostedModel::to_gpu`](crate::model::BoostedModel::to_gpu).
     Metal,
+    /// A GPU through [wgpu](https://wgpu.rs) (Vulkan, Metal, or DirectX 12)
+    /// with the `wgpu` feature, on Linux, macOS, and Windows. Needs an
+    /// adapter with 64-bit shader integers; a software adapter (Mesa's
+    /// lavapipe, Microsoft's WARP) is used only when it is the only one, so
+    /// the path is testable on machines without a GPU. Unmeasured on real
+    /// GPUs so far (see [`backend::wgpu`](crate::backend::wgpu)); prediction
+    /// goes through [`BoostedModel::to_wgpu`](crate::model::BoostedModel::to_wgpu).
+    Wgpu,
+}
+
+impl Device {
+    /// The device's XGBoost spelling (`cpu`, `metal`, `wgpu`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Device::Cpu => "cpu",
+            Device::Metal => "metal",
+            Device::Wgpu => "wgpu",
+        }
+    }
+
+    /// Whether this build can run the device: the CPU always, a GPU with its
+    /// feature (and, for Metal, on macOS).
+    pub(crate) fn is_compiled_in(self) -> bool {
+        match self {
+            Device::Cpu => true,
+            Device::Metal => cfg!(all(target_os = "macos", feature = "metal")),
+            Device::Wgpu => cfg!(feature = "wgpu"),
+        }
+    }
 }
 
 /// Deepest tree `grow_policy = symmetric` grows (`2^16` leaves), CatBoost's
@@ -285,9 +315,10 @@ pub struct TrainingParams {
     /// RNG seed for subsampling and column sampling. XGBoost `seed`.
     pub seed: u64,
 
-    /// Which processor training runs on. XGBoost `device`. `metal` moves
-    /// histogram construction to the GPU (macOS, `metal` feature); the
-    /// default `cpu` leaves everything as it was.
+    /// Which processor training runs on. XGBoost `device`. `metal` (macOS,
+    /// `metal` feature) and `wgpu` (`wgpu` feature) move histogram
+    /// construction to the GPU; the default `cpu` leaves everything as it
+    /// was.
     pub device: Device,
 
     // ---- Learning task ----
@@ -717,37 +748,42 @@ impl TrainingParams {
         )
     }
 
-    /// The GPU backend accelerates the histogram tree method only; the
+    /// The GPU backends accelerate the histogram tree method only; the
     /// other tree methods, the quantized path, and `gblinear` have their
     /// own accumulation loops that would silently ignore the device.
     fn validate_device(&self) -> Result<()> {
-        if self.device != Device::Cpu {
-            ensure(
-                "device",
-                cfg!(all(target_os = "macos", feature = "metal")),
-                "`metal` requires building with the `metal` feature on macOS",
-            )?;
-            ensure(
-                "device",
-                !matches!(self.tree_method, TreeMethod::Exact | TreeMethod::Approx),
-                "`metal` requires `tree_method = hist` (or `auto`)",
-            )?;
-            ensure(
-                "device",
-                self.quantized.is_none(),
-                "`metal` does not support `use_quantized_grad`",
-            )?;
-            ensure(
-                "device",
-                self.booster != BoosterKind::GbLinear,
-                "`metal` needs a tree booster (`gbtree` or `dart`)",
-            )?;
-            ensure(
-                "device",
-                !matches!(self.process_type, ProcessType::Update(_)),
-                "`metal` does not support `process_type = update` (refresh grows no trees)",
-            )?;
+        if self.device == Device::Cpu {
+            return Ok(());
         }
+        let device = self.device.name();
+        ensure(
+            "device",
+            self.device.is_compiled_in(),
+            match self.device {
+                Device::Metal => "`metal` requires building with the `metal` feature on macOS",
+                _ => "`wgpu` requires building with the `wgpu` feature",
+            },
+        )?;
+        ensure(
+            "device",
+            !matches!(self.tree_method, TreeMethod::Exact | TreeMethod::Approx),
+            format!("`{device}` requires `tree_method = hist` (or `auto`)"),
+        )?;
+        ensure(
+            "device",
+            self.quantized.is_none(),
+            format!("`{device}` does not support `use_quantized_grad`"),
+        )?;
+        ensure(
+            "device",
+            self.booster != BoosterKind::GbLinear,
+            format!("`{device}` needs a tree booster (`gbtree` or `dart`)"),
+        )?;
+        ensure(
+            "device",
+            !matches!(self.process_type, ProcessType::Update(_)),
+            format!("`{device}` does not support `process_type = update` (refresh grows no trees)"),
+        )?;
         Ok(())
     }
 

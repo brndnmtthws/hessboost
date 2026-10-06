@@ -1296,6 +1296,99 @@ fn bench_metal_registered(c: &mut Criterion) {
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
 fn bench_metal_registered(_c: &mut Criterion) {}
 
+/// wgpu GPU benches (`cargo bench --features wgpu` on a machine with a
+/// Vulkan, Metal, or DirectX 12 adapter): the same three comparisons as the
+/// Metal group. On a software adapter (lavapipe, WARP) the GPU side measures
+/// the CPU emulating one, which says nothing about a GPU.
+#[cfg(feature = "wgpu")]
+fn bench_wgpu(c: &mut Criterion) {
+    use hessboost::backend::wgpu;
+    use hessboost::backend::wgpu::WgpuHistBackend;
+    use hessboost::config::Device;
+
+    if let Some(reason) = wgpu::unavailable_reason() {
+        eprintln!("skipping wgpu benches: {reason}");
+        return;
+    }
+    eprintln!(
+        "wgpu adapter: {}{}",
+        wgpu::device_name().unwrap_or_default(),
+        if wgpu::is_software_adapter() == Some(true) {
+            " (software renderer)"
+        } else {
+            ""
+        }
+    );
+    {
+        let mut group = c.benchmark_group("wgpu_histogram_build");
+        group.sample_size(10);
+        for &n in &[100_000usize, 1_000_000] {
+            let (ghist, gpair, rows) = histogram_case(&make_data(n, 30));
+            let gpu = WgpuHistBackend::new(&ghist).unwrap();
+            let mut cpu_out = zeroed(ghist.total_bins());
+            let mut gpu_out = zeroed(ghist.total_bins());
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(BenchmarkId::new("cpu", n), &n, |b, _| {
+                b.iter(|| CpuBackend.build(&ghist, &rows, &gpair, &mut cpu_out));
+            });
+            group.bench_with_input(BenchmarkId::new("wgpu", n), &n, |b, _| {
+                b.iter(|| gpu.build(&ghist, &rows, &gpair, &mut gpu_out));
+            });
+        }
+        group.finish();
+    }
+    {
+        let data = make_data(200_000, 30);
+        let mut group = c.benchmark_group("wgpu_train_200k_x30_50rounds_depth8");
+        group.sample_size(10);
+        for (name, device) in [("cpu", Device::Cpu), ("wgpu", Device::Wgpu)] {
+            let params = TrainingParams::builder()
+                .objective(Objective::SquaredError(RegLoss::default()))
+                .tree_method(TreeMethod::Hist)
+                .max_depth(8)
+                .eta(0.1)
+                .device(device)
+                .build()
+                .unwrap();
+            group.bench_function(name, |b| {
+                b.iter(|| black_box(train(&params, &data, 50).unwrap()));
+            });
+        }
+        group.finish();
+    }
+    {
+        let model_data = make_data(100_000, 30);
+        let model = trained_model(&model_data, 100);
+        let gpu = model.to_wgpu().unwrap();
+        let data = make_data(500_000, 30);
+        let mut group = c.benchmark_group("wgpu_predict_500k_x30_100trees_depth6");
+        group.sample_size(10);
+        group.throughput(Throughput::Elements(data.n_rows() as u64));
+        group.bench_function("cpu", |b| {
+            b.iter(|| {
+                model
+                    .predict_margin(black_box(&data), Iterations::Best)
+                    .unwrap()
+            });
+        });
+        group.bench_function("wgpu", |b| {
+            b.iter(|| {
+                gpu.predict_margin(black_box(&data), Iterations::Best)
+                    .unwrap()
+            });
+        });
+        group.finish();
+    }
+}
+
+#[cfg(feature = "wgpu")]
+fn bench_wgpu_registered(c: &mut Criterion) {
+    bench_wgpu(c);
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn bench_wgpu_registered(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_histogram_build,
@@ -1315,6 +1408,7 @@ criterion_group!(
     bench_predict_csr,
     bench_model_io,
     bench_data_prep,
-    bench_metal_registered
+    bench_metal_registered,
+    bench_wgpu_registered
 );
 criterion_main!(benches);

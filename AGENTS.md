@@ -1,11 +1,12 @@
 # AGENTS.md
 
 hessboost reimplements XGBoost in Rust as one library crate. No C/C++ or FFI
-besides `zstd` (libzstd, for native model files) and, with the macOS-only
-`metal` feature, `objc2-metal`. User docs: `README.md` (overview only;
-details belong in rustdoc), rustdoc (`src/lib.rs`, module docs),
-`examples/`, `docs/performance.md`. No changelog: release notes are written
-at release time.
+besides `zstd` (libzstd, for native model files), with the macOS-only
+`metal` feature `objc2-metal`, and with the `wgpu` feature `wgpu` (whose
+Vulkan, Metal, and DirectX 12 backends load the drivers at run time). User
+docs: `README.md` (overview only; details belong in rustdoc), rustdoc
+(`src/lib.rs`, module docs), `examples/`, `docs/performance.md`. No
+changelog: release notes are written at release time.
 
 ## Toolchain
 
@@ -56,9 +57,12 @@ CI (`.github/workflows/ci.yml`) runs the Rust checks through `mbx` with
 loads `mise.ci.toml`, which moves rustup's toolchains into that cache. Rust
 tests run on x86_64 Linux, aarch64 Linux, and aarch64 macOS (Metal tests
 needing a device skip without one; a guard test still fails if the kernels
-do not compile) under the `ci` Cargo profile (`Cargo.toml`: `dev` at
-opt-level 1, debug assertions and overflow checks on; about ten times
-faster than opt-level 0). The parity job caches uv's XGBoost source build.
+do not compile; the Linux runners install Mesa's lavapipe and set
+`HESSBOOST_REQUIRE_WGPU=1`, so `tests/wgpu.rs` and the `backend::wgpu`
+unit tests run the GPU paths there) under the `ci` Cargo profile
+(`Cargo.toml`: `dev` at opt-level 1, debug assertions and overflow checks
+on; about ten times faster than opt-level 0). The parity job caches uv's
+XGBoost source build.
 Its Python jobs build one abi3 wheel each on x86_64/aarch64 Linux, aarch64
 macOS, and x86_64 Windows (without the release profile's LTO and single
 codegen unit) and test it on CPython 3.11 and the latest 3.x with
@@ -159,7 +163,7 @@ Fix findings rather than suppress them.
 |`ebm/`|public: `EbmInfo` (terms, tree→term map, term means; crate-private `stages`, the Boulevard stage layout validation, inference, and refit share), `shape_functions`, `term_shape`, `TermShape`; `grid` (a term's cell grid from its trees' thresholds and category sets, leaves as boxes, difference arrays)|
 |`model/`|`mod.rs` (`BoostedModel`, accessors, `TreeWeights`; XGBoost interchange docs), `io` (`ModelFormat`, its detection, the four codec verbs), `embed` (`EmbeddedModel`: `include_bytes!` in a `static`, decoded on first successful `get`), `serde` (native JSON mirror `UncheckedBoostedModel`), `validate` (`validate_structure`, prediction-data and objective-width checks), `predict` (`Iterations`, prediction dispatch, `accumulate_forest`, shrunk and multi-prefix margins, `RowBlock` traversal), `slice` (`slice`, `shrunk_prefix`), `objective` (`ModelObjective`; `StoredObjectiveParams`, the stored objective-parameter record), `container` (`ContainerSpec`: the magic/version/checksum framing, zstd packing and expansion bound shared by `HBM`, `HBDM` and `HBFF`; embedded-model blobs), `native`, `sections` (shared by every container and compact), `shap` (QuadratureTreeSHAP), `shrinkage` (per-iteration record; training's shrink step, shared by prediction), `uncertainty` (public, virtual ensembles), `compact/` (public, `HBTD`; `mod.rs` model and layout docs, `bitstream`, `decode`, `encode`), `xgboost/` (JSON/UBJSON schema: `document` model mapping, `tree` node columns, `objective` objective and `base_score`, `parse` scalar parsers), `categories` (`CategoryPool`, shared by the XGBoost and LightGBM importers), `ubjson` (codec over `serde_json::Value`), `lightgbm` (LightGBM text import; mapping docs in `mod.rs`, "LightGBM import")|
 |`diffusion/`|public, opt-in: `mod.rs` (params, `DiffusionModel`), `process` (SDE kernels, flow paths, time sampling, Box–Muller and keyed normal draws), `fit` (standardization, cross-fitted residualizer, noisy training set), `sample` (reverse SDE/ODE, `SampleOptions`, `Samples`, the borrowed `SamplesView`, `Quantiles`), `io` (`DiffusionFormat`, shared with `forest`), `format` (`HBDM` container embedding native GBDT containers; JSON), `forest/` (public, ForestFlow/ForestDiffusion: per-level GBDTs, generation, RePaint imputation; `fit`: table preparation and per-level training; `encoding`: column ranges, one-hot encoding, scaling; `format`: `HBFF`)|
-|`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
+|`backend/`|`metal.rs` (GPU histograms and prediction, runtime-compiled MSL), `wgpu.rs` (the portable sibling over wgpu: WGSL kernels, adapter selection, `WgpuHistBackend`, `GpuModel`/`to_wgpu`), `mod.rs` (`materialize_rows` and `scatter_row_bound`, shared by both), `exact_sum.rs` (`SumDomain` and its proof; built on every platform)|
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
 Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixtures; `properties.rs` is
@@ -216,15 +220,22 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   `Trainer::on_round` only observes: a hook that always continues leaves
   the model byte-identical, and a `Break` after round `k` gives the
   `k + 1`-round model (`tests/round_hook.rs`).
-- **Metal:** `device = metal` reproduces the single-threaded CPU model bit
-  for bit: gradients are staged as integer multiples of a per-component
-  grain and summed in 64-bit integers (order-free, no atomics), and a node
-  goes to the GPU only where the CPU's `f64` sums are also exact
-  (`n * max <= 2^53` grains, `backend/exact_sum.rs`). Everything else
-  (small nodes, non-finite gradients, failed command buffers) runs on CPU.
+- **GPU backends:** `device = metal` and `device = wgpu` reproduce the
+  single-threaded CPU model bit for bit: gradients are staged as integer
+  multiples of a per-component grain and summed in integers (order-free:
+  64-bit register sums, or 32-bit shared atomics on exact high/low pieces
+  rejoined in 64-bit), and a node goes to the GPU only where the CPU's
+  `f64` sums are also exact (`n * max <= 2^53` grains,
+  `backend/exact_sum.rs`). Everything else (small nodes, non-finite
+  gradients, grain counts past a workgroup's 32-bit pieces
+  (`backend::scatter_row_bound`), failed commands) runs on CPU. wgpu
+  prediction adds floats only (each tree's `weight * leaf` is formed on the
+  host) and probes the adapter once for reassociated additions, refusing
+  `to_wgpu` on one that fails; the wgpu backend needs `SHADER_INT64` and
+  picks a software adapter (lavapipe, WARP) only when it is the only one.
 - **Unsafe:** only in `simd/`, hot loops of `tree/compact.rs`, `tree/hist/`,
-  `tree/builder/partition.rs`, and `backend/metal.rs`. Each block needs
-  `// SAFETY:`.
+  `tree/builder/partition.rs`, and `backend/metal.rs` (`backend/wgpu.rs`
+  has none: `bytemuck` casts). Each block needs `// SAFETY:`.
 - **SIMD:** covers objective gradients, exp/sigmoid/softmax, metric sums,
   cut search (`count_le`), and SHAP's per-lane kernels (return-edge terms
   `shap_edge_terms`, child basis `shap_scaled_basis`/`shap_divided_basis`),

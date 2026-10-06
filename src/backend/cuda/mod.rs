@@ -26,9 +26,9 @@
 //! # Exactness
 //!
 //! The CPU adds each histogram bin in `f64` in a fixed order: one chain in
-//! row order, or fixed chunks of rows each chained from zero and then added
-//! in chunk order (`SumOrder`, chosen from the index and the row list
-//! alone). Every node uses the first strategy that applies:
+//! row order below 8,192 rows, else fixed chunks of rows each chained from
+//! zero and then added in chunk order (`SumOrder`, chosen from the node's
+//! row count alone). Every node uses the first strategy that applies:
 //!
 //! 1. **Exact integers.** When every sum of the node's rows is exact
 //!    (`n * max <= 2^53` gradient grains for both components, the domain
@@ -38,13 +38,9 @@
 //! 2. **Exact chunks.** For a chunked node whose *chunks* are exact, each
 //!    chunk's integer sum is that chunk's `f64` chain, and the GPU then adds
 //!    the chunk partials in chunk order in `f64`, the CPU's own operations.
-//! 3. **Chains.** Otherwise, for a chunked node or a node below 8,192 rows,
-//!    one GPU thread per (chunk, feature) runs that feature's `f64` chain in
-//!    row order, and the chunk partials are added in chunk order.
-//! 4. **CPU.** A single-chain node of 8,192 rows or more outside the exact
-//!    domain (a dense index's unsampled root, or any node of a dense index
-//!    of at most 2^18 rows) runs the CPU backend's build: one GPU thread
-//!    per feature over that many rows would be slower than the CPU.
+//! 3. **Chains.** Otherwise one GPU thread per (chunk, feature) runs that
+//!    feature's `f64` chain in row order (a node below 8,192 rows is one
+//!    chunk), and the chunk partials are added in chunk order.
 //!
 //! The kernels are compiled without FP contraction, flush-to-zero, or
 //! approximate division, so every `f64` operation is the single IEEE
@@ -71,7 +67,7 @@ use crate::data::ghist::{Bins, GHistIndex};
 use crate::error::{HessboostError, Result};
 use crate::objective::GradPair;
 use crate::tree::gain::GradStats;
-use crate::tree::hist::{CpuBackend, HistogramBackend, PARALLEL_THRESHOLD, SumOrder, sum_order};
+use crate::tree::hist::{CpuBackend, HistogramBackend, SumOrder, sum_order};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg, sys,
 };
@@ -280,8 +276,8 @@ pub struct NodeCounts {
     pub exact_chunk_nodes: u64,
     /// Nodes summed as `f64` chains on the GPU (strategy 3).
     pub chain_nodes: u64,
-    /// Nodes built by the CPU backend (strategy 4, input mismatches, and
-    /// every node after a CUDA error).
+    /// Nodes built by the CPU backend (non-finite gradients, input
+    /// mismatches, and every node after a CUDA error).
     pub cpu_nodes: u64,
     /// Rows of the nodes counted in `exact_nodes`.
     pub exact_rows: u64,
@@ -319,7 +315,7 @@ impl Counters {
     }
 }
 
-/// A node's strategy (the [module docs](self)' numbering).
+/// A node's strategy: the [module docs](self)' numbering, plus the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Strategy {
     Exact = 0,
@@ -570,7 +566,7 @@ impl CudaHistBackend {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.build_on(&mut state, ghist, rows, gpair, out)
+        self.build_on(&mut state, rows, gpair, out)
             .unwrap_or_else(|_| {
                 // CUDA errors are sticky: every later node runs on the CPU.
                 self.device.failed.store(true, Ordering::Release);
@@ -583,7 +579,6 @@ impl CudaHistBackend {
     fn build_on(
         &self,
         state: &mut State,
-        ghist: &GHistIndex,
         rows: &[u32],
         gpair: &[GradPair],
         out: &mut [GradStats],
@@ -594,14 +589,14 @@ impl CudaHistBackend {
                 return Ok(Strategy::Cpu);
             }
         }
-        let strategy = plan(&state.staged, sum_order(ghist, rows), rows.len());
+        let strategy = plan(&state.staged, sum_order(rows.len()), rows.len());
         if strategy == Strategy::Cpu {
             return Ok(strategy);
         }
         if rows.is_empty() {
             out.fill(GradStats::default());
         } else {
-            self.run(state, ghist, rows, strategy, out)?;
+            self.run(state, rows, strategy, out)?;
         }
         Ok(strategy)
     }
@@ -610,7 +605,6 @@ impl CudaHistBackend {
     fn run(
         &self,
         state: &mut State,
-        ghist: &GHistIndex,
         rows: &[u32],
         strategy: Strategy,
         out: &mut [GradStats],
@@ -630,7 +624,7 @@ impl CudaHistBackend {
             staged,
         } = state;
         stream.memcpy_htod(rows, &mut dev_rows.slice_mut(..rows.len()))?;
-        let seg_rows = match (strategy, sum_order(ghist, rows)) {
+        let seg_rows = match (strategy, sum_order(rows.len())) {
             (Strategy::ExactChunks | Strategy::Chains, SumOrder::Blocked { grain }) => grain,
             _ => rows.len(),
         };
@@ -768,9 +762,7 @@ fn plan(staged: &Staged, order: SumOrder, n: usize) -> Strategy {
     }
     match order {
         SumOrder::Blocked { grain } if staged.sums_exact(grain) => Strategy::ExactChunks,
-        SumOrder::Blocked { .. } => Strategy::Chains,
-        SumOrder::Chain if n < PARALLEL_THRESHOLD => Strategy::Chains,
-        SumOrder::Chain => Strategy::Cpu,
+        SumOrder::Blocked { .. } | SumOrder::Chain => Strategy::Chains,
     }
 }
 

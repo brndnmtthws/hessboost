@@ -245,7 +245,8 @@ fn histograms_match_cpu_for_every_strategy() {
         }
     };
 
-    // A dense index of 2^18 rows or fewer: every node is one chain.
+    // A dense index of 2^18 rows or fewer (row subsets swept by feature): a
+    // node below 8,192 rows is one chain, a larger one chunked.
     let small = index(60_000, 6, 256, value);
     let all: Vec<u32> = (0..60_000).collect();
     let thirds: Vec<u32> = (0..60_000).step_by(3).collect();
@@ -261,10 +262,10 @@ fn histograms_match_cpu_for_every_strategy() {
         &small,
         &thirds,
         &wide_pairs(60_000),
-        "dense large chain, cpu",
+        "dense chunked subset, chains",
     );
 
-    // A dense index above 2^18 rows: a row subset is chunked.
+    // A dense index above 2^18 rows (row subsets split by rows).
     let large = index(300_000, 4, 64, value);
     let half: Vec<u32> = (0..300_000).step_by(2).collect();
     check(&large, &half, &exact_pairs(300_000), "dense chunked, exact");

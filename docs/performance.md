@@ -609,14 +609,17 @@ configs score everything exactly, still batched. Exact skips candidates a
 division-free bound rules out. `tree::builder::tests` checks both against
 sequential search.
 
-The root sweeps the column-major bin copy two features at a time, one
-writer per bin. Other subsets up to 2^18 rows gather per feature pair from
-the same copy — no partial histograms, rows ascending per bin. Larger nodes
-(8,192+ rows, sparse or big) split into `n / 4,096` fixed blocks, each
-summed from zero and added in block order, one wave per worker count — sums
-depend on rows, never thread count (serial sums the same blocks). Row
-sweeps prefetch four bins before storing. At 8 threads the fixed blocks
-cost ~5% on the 50k-row `missing` build, nothing measurable at 1M rows.
+Nodes below 8,192 rows are one chain in row order. Larger nodes sum
+`n / 4,096` fixed blocks, each from zero, added in block order — whatever
+the index layout, so sums depend on the row count alone, never on thread
+count or layout, and a GPU backend reproduces them in parallel. The root
+and other subsets up to 2^18 rows sweep the column-major bin copy a feature
+group at a time (one writer per bin, a partial per block); other nodes
+split by rows, one wave of blocks per worker count. Row sweeps prefetch
+four bins before storing. At 8 threads the fixed blocks cost ~5% on the
+50k-row `missing` build, nothing measurable at 1M rows. On one thread they
+cost dense indexes 5–9% of 50k-row hist training (Neoverse-V3, against the
+single chain they replaced); at 16 threads the difference is within noise.
 
 Leaves at `max_depth` skip histograms and split search. Under full row
 sampling, training keeps their final partitions (depthwise, loss-guide,

@@ -263,9 +263,13 @@ LightGBM saves (with LightGBM's predictions in `*.expected.json`, written by
   when the node's sums are exact, exact integer chunks reduced in `f64` in
   chunk order when only the chunks are, otherwise one GPU thread per
   (chunk, feature) running the CPU's `f64` chain (kernels compiled with
-  `--fmad=false`, no FTZ, IEEE division; no floating-point atomics), and
-  the CPU for a large single-chain node outside the exact domain. Inputs
-  that do not fit and every node after a CUDA error run on the CPU.
+  `--fmad=false`, no FTZ, IEEE division; no floating-point atomics).
+  Non-finite gradients, inputs that do not fit, and every node after a
+  CUDA error run on the CPU.
+- **CPU summation order:** `tree::hist::sum_order` depends on a node's row
+  count alone (a chain below 8,192 rows, else `len / 4096` blocks reduced
+  in block order), for every index layout, the feature sweeps, and the
+  root's `sum_rows`, so a GPU can reproduce every node in parallel.
 - **Unsafe:** only in `simd/`, hot loops of `tree/compact.rs`, `tree/hist/`,
   `tree/builder/partition.rs`, `backend/metal.rs`, and `backend/cuda/`
   (`backend/wgpu.rs` has none: `bytemuck` casts). Each block needs

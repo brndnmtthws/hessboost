@@ -79,11 +79,42 @@ print(booster.best_iteration, booster.get_score(importance_type="gain"))
 
 `DMatrix` takes numpy arrays of any numeric dtype and memory layout (a
 C-contiguous `float32` array is used without a copy), pandas and polars
-DataFrames, scipy sparse matrices, and anything `numpy.asarray` accepts.
-NaN, and a frame's null, is missing (or pass `missing=`); ranking data
-takes `group=` sizes or `qid=`, and `survival:aft` takes
-`label_lower_bound=`/`label_upper_bound=`.
+DataFrames, polars LazyFrames, scipy sparse matrices, and anything
+`numpy.asarray` accepts. NaN, and a frame's null, is missing (or pass
+`missing=`); ranking data takes `group=` sizes or `qid=`, and
+`survival:aft` takes `label_lower_bound=`/`label_upper_bound=`.
 `Booster.predict` accepts the same inputs directly.
+
+With a frame, the per-row metadata can name its columns instead of
+arriving as separate arrays: `label`, `weight`, `base_margin`, `qid`,
+`label_lower_bound` and `label_upper_bound` (`label` and `base_margin`
+also a list of names, for a label matrix or per-output margins). The named
+columns leave the features:
+
+```python
+import polars as pl
+
+dtrain = hessboost.DMatrix(
+    pl.scan_parquet("train.parquet").filter(pl.col("split") == "train").drop("split"),
+    label="price",
+    weight="exposure",
+)
+```
+
+A `LazyFrame` is collected once, by polars' default engine, which since
+polars 2.0 is the streaming engine (spilling to disk when the frame
+outgrows memory). Because that engine keeps no row order after a join or
+`group_by`, a `LazyFrame` takes labels and the other per-row metadata by
+column name only, so that they come out of the same `collect` as the
+features; an array alongside it (or `group` sizes) is refused. Predictions
+on a `LazyFrame` align with its collected rows, so to attach them to a
+frame, collect it yourself and predict on the DataFrame. A polars frame
+converts through a `select` of `Float32` expressions that polars evaluates
+in parallel, in row blocks of 64 MiB of output; `Decimal` and all-null
+columns are numeric, and a column of another dtype (`Datetime`, `String`,
+polars 2.0's `Extension` for Arrow extension types the frame was read with)
+is refused with the conversion that would make it numeric. polars 1.x and
+2.x are both supported (`polars>=1.0`).
 
 ### Training controls
 

@@ -284,6 +284,18 @@ jobs:
         if: matrix.wheel == 'abi3'
         run: sh ../.github/scripts/test-wheel.sh 3.11 'dist/*cp311-abi3*.whl'
         working-directory: python
+      # uv.lock pins polars 2.x; hessboost also supports 1.x (polars>=1.0).
+      # The polars tests also run with the oldest and the latest 1.x
+      # release, layered over the Python 3.11 environment the step above
+      # left (the layer's polars shadows the locked one).
+      - name: Test polars 1.x (oldest and latest)
+        if: matrix.os == 'ubuntu-26.04' && matrix.wheel == 'abi3'
+        run: |
+          for polars in 'polars==1.0.0' 'polars<2'; do
+            uv run --no-sync --with "$polars" python -c 'import polars; print("polars", polars.__version__)'
+            uv run --no-sync --with "$polars" pytest -p no:cacheprovider tests/test_polars.py tests/test_target_stats.py
+          done
+        working-directory: python
       - name: Test free-threaded wheel
         if: matrix.wheel == 'free-threaded'
         run: sh ../.github/scripts/test-wheel.sh 3.14t 'dist/*cp314-cp314t*.whl'

@@ -179,9 +179,21 @@ class _HessboostModel(BaseEstimator):
 
     # -- data ---------------------------------------------------------------
 
-    def _check_X(self, X: Any, reset: bool) -> Any:
+    def _check_X(self, X: Any, reset: bool, *, labelled: bool = False) -> Any:
         """``X`` validated (feature count and names) as scikit-learn does;
-        pandas and polars frames are passed on unchanged to keep their categories."""
+        pandas and polars frames are passed on unchanged to keep their
+        categories. A polars ``LazyFrame`` is collected once, except where
+        ``X`` comes with labels (``labelled``: fitting), whose separate array
+        might not align with the rows a collect inside hessboost yields."""
+        if _data._is_polars_lazyframe(X):
+            if labelled:
+                raise HessboostError(
+                    "X is a polars LazyFrame while y is a separate array, which may not be in "
+                    "the order of the rows hessboost would collect (polars' streaming engine keeps "
+                    "no row order after a join or group_by); collect it (X.collect()) and pass the "
+                    "DataFrame"
+                )
+            X = _data.collect_frame(X)
         if _data._is_frame(X):
             validate_data(self, X, reset=reset, skip_check_array=True)
             return X
@@ -225,7 +237,7 @@ class _HessboostModel(BaseEstimator):
         group: Mapping[str, Any] | None = None,
         eval_groups: Sequence[Mapping[str, Any]] | None = None,
     ) -> Self:
-        X = self._check_X(X, reset=True)
+        X = self._check_X(X, reset=True, labelled=True)
         init = _init_model(
             xgb_model.get_booster() if isinstance(xgb_model, _HessboostModel) else xgb_model
         )
@@ -237,7 +249,7 @@ class _HessboostModel(BaseEstimator):
         categories = {**earlier, **dtrain._categories}
         evals: list[tuple[DMatrix, str]] = []
         for index, (raw_eval, y_eval) in enumerate(eval_set or ()):
-            X_eval = self._check_X(raw_eval, reset=False)
+            X_eval = self._check_X(raw_eval, reset=False, labelled=True)
             weight = None if sample_weight_eval_set is None else sample_weight_eval_set[index]
             margin = None if base_margin_eval_set is None else base_margin_eval_set[index]
             labels = encode(y_eval) if encode is not None else y_eval

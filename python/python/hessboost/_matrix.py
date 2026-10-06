@@ -25,10 +25,20 @@ class DMatrix:
     ``feature_names``; categorical columns (pandas ``category``, polars
     ``Enum`` and ``Categorical``) become categorical features coded by
     position in their categories, which are recorded: a polars
-    ``Categorical``'s are its values, sorted), a scipy
+    ``Categorical``'s are its values, sorted), a polars ``LazyFrame``
+    (collected once, by polars' default engine), a scipy
     sparse matrix (absent entries are missing), or any array-like numpy
     accepts. Values equal to ``missing`` (every NaN by default) are missing;
     infinities are refused.
+
+    With a frame, the per-row metadata (``label``, ``weight``,
+    ``base_margin``, ``qid`` and the label bounds) may name columns of it
+    (``label="price"``; ``label`` and ``base_margin`` also a list of names,
+    for a label matrix or per-output margins), which then leave the
+    features. A ``LazyFrame`` takes them this way only, so that its labels
+    and rows come out of the same ``collect`` (polars' streaming engine, the
+    default since polars 2.0, keeps no row order after a join or
+    ``group_by``); ``group`` sizes are refused with it (pass ``qid``).
 
     A matrix is coded when it is built, so a model or matrix it is used with
     (``predict``, ``train``'s ``evals`` and ``xgb_model``) must have its
@@ -41,22 +51,26 @@ class DMatrix:
     Args:
         data: The ``(rows, features)`` feature matrix.
         label: ``(rows,)`` labels, or ``(rows, targets)`` for multi-target
-            models. NaN labels are refused.
-        weight: ``(rows,)`` non-negative instance weights; for ranking data,
-            one weight per query group (as XGBoost).
-        base_margin: ``(rows,)`` or ``(rows, outputs)`` starting margins,
-            replacing the model's intercept for these rows in training,
-            evaluation and prediction.
+            models; a frame's column name, or list of names. NaN labels are
+            refused.
+        weight: ``(rows,)`` non-negative instance weights (or a frame's
+            column name); for ranking data, one weight per query group (as
+            XGBoost).
+        base_margin: ``(rows,)`` or ``(rows, outputs)`` starting margins (or
+            a frame's column name, or list of names), replacing the model's
+            intercept for these rows in training, evaluation and prediction.
         missing: The value marking a missing dense entry.
         feature_names: One unique name per feature (default: a frame's
             column names, else none).
         feature_types: ``"q"`` (numerical) or ``"c"`` (categorical; values
             are non-negative integer codes) per feature.
         group: Ranking query-group sizes, in row order.
-        qid: Alternatively, a sorted query id per row.
-        label_lower_bound: ``survival:aft`` interval lower bounds.
+        qid: Alternatively, a sorted query id per row (or a frame's column
+            name).
+        label_lower_bound: ``survival:aft`` interval lower bounds (or a
+            frame's column name).
         label_upper_bound: ``survival:aft`` interval upper bounds
-            (``inf`` for right-censored rows).
+            (``inf`` for right-censored rows; or a frame's column name).
         feature_weights: Per-feature column-sampling weights.
         enable_categorical: Accept categorical frame columns (as XGBoost
             requires spelling out).
@@ -91,7 +105,8 @@ class DMatrix:
         feature_weights: ArrayLike | None = None,
         enable_categorical: bool = True,
     ) -> None:
-        info = _data.info(
+        data, fields = _data.take_metadata(
+            data,
             label=label,
             weight=weight,
             base_margin=base_margin,
@@ -99,8 +114,8 @@ class DMatrix:
             qid=qid,
             label_lower_bound=label_lower_bound,
             label_upper_bound=label_upper_bound,
-            feature_weights=feature_weights,
         )
+        info = _data.info(**fields, feature_weights=feature_weights)
         self._set(
             _data.features(
                 data,
@@ -327,14 +342,19 @@ def _matrix_for(
 
     A :class:`DMatrix` is taken as it is (``base_margin`` belongs on it).
     Other input is converted with ``missing``, ``label`` and
-    ``base_margin``, its frame categories re-coded to the references' (the
-    first reference's where two record a feature's; values they lack become
-    missing, or in the ``unseen`` columns a code past them);
-    ``require_label`` refuses it unlabelled. Either way it is
+    ``base_margin`` (frame column names resolved by
+    :func:`_data.take_metadata`), its frame categories re-coded to the
+    references' (the first reference's where two record a feature's; values
+    they lack become missing, or in the ``unseen`` columns a code past
+    them); ``require_label`` refuses it unlabelled. Either way it is
     checked against every reference with :func:`_check_schema` (feature
     names only with ``validate_names``), since a reference without recorded
     categories matches anything. With no references this is the training
     matrix of ``data`` and ``label``."""
+    # Resolves frame column names; refuses one for anything else, a DMatrix
+    # included.
+    data, fields = _data.take_metadata(data, label=label, base_margin=base_margin)
+    label, base_margin = fields["label"], fields["base_margin"]
     if isinstance(data, DMatrix):
         if base_margin is not None:
             raise HessboostError("set base_margin on the DMatrix, not in predict()")

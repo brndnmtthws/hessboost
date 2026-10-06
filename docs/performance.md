@@ -457,10 +457,12 @@ histogram of the pair's bins, its prefix sums, and every four-quadrant cut.
 The prefix sums were most of it (each cell waits on its left neighbor's
 three additions); they now run four rows at once, each a column behind the
 row above, over one interleaved `[g, h]` grid (one cache line a row in the
-scatter). FAST also reads its bins from the `hist` training index instead
-of sketching cuts and binning every value again. Same sums in the same
-order: pair gains, chosen pairs, and models are bit-identical (model hashes
-at 1 and 8 threads).
+scatter). With every Hessian finite and non-negative and `lambda` past the
+prefix sums' worst rounding, every quadrant's `H + λ` is positive, so the
+scan skips the test that scores the others 0. FAST also reads its bins
+from the `hist` training index instead of sketching cuts and binning every
+value again. Same sums in the same order: pair gains, chosen pairs, and
+models are bit-identical (model hashes at 1 and 8 threads).
 
 192-core **AWS Neoverse-V3** (Rust 1.99.0, bench profile), 2026-10-06 UTC,
 `scripts/compare_benchmarks.py` (baseline/optimized/optimized/baseline, 20
@@ -469,20 +471,30 @@ then FAST over all 190 pairs; `interactions_0` is the same EBM without it.
 
 | Case | Threads | Before (ms) | After (ms) | Less time |
 |---|---:|---:|---:|---:|
-| `10k_interactions_1` | 1 | 131.09 | 47.01 | 64.1% |
-| `100k_interactions_1` | 1 | 316.68 | 170.65 | 46.1% |
-| `10k_interactions_1` | 16 | 13.36 | 7.64 | 42.8% |
-| `100k_interactions_1` | 16 | 43.83 | 31.60 | 27.9% |
+| `10k_interactions_1` | 1 | 131.00 | 41.51 | 68.3% |
+| `100k_interactions_1` | 1 | 317.90 | 163.27 | 48.6% |
+| `10k_interactions_1` | 16 | 13.73 | 7.49 | 45.4% |
+| `100k_interactions_1` | 16 | 43.54 | 32.15 | 26.2% |
 
-Less the unchanged `interactions_0` times (within 1.6%), FAST itself takes
-3.1–3.3× less time; on 20,000 × 100 (4,950 pairs, 16 threads, throwaway
-harness) it went from 199 to 63 ms. Per pair at 256 bins, the prefix sums
-went from 338 to 43 µs and the scatter from 2.3 to 1.6 ns a row; the cut
-scan, four vectorized `f64` divisions per cut, is now the largest fixed
-cost (about 120 µs). Dropped: skipping tiles of cuts whose interval bound
-cannot beat the best exact score (the bounds admitted 45–100% of the cuts,
-20–85% slower), `u16` bins (up to 11% off the scatter at 200,000 rows,
-nothing at 10,000), and a spare cell for missing rows (up to 18% slower).
+Less the unchanged `interactions_0` times (within 1%), FAST itself takes
+3.2–3.9× less time; on 20,000 × 100 (4,950 pairs, 16 threads, throwaway
+harness) it went from 199 to 54 ms. Per pair at 256 bins (one core), the
+prefix sums went from 338 to 43 µs, the scatter from 2.3 to 1.6 ns a row,
+and the cut scan from 112 to 91 µs, still the largest fixed cost.
+
+Both loops already compile to two-lane NEON `f64` code, and the scan is
+bound by its instruction count, not its divider: dropping every division
+from the guarded scan saved 7%, dropping the guard's compare and select
+24%, and an all-`f32` four-lane scan (not bit-identical) would save 31%. So
+a division-free screen (prototyped: exact scores for 3% of cuts, 5%
+faster) and reciprocal-estimate or `f32` prefilters don't pay for their
+error bounds, and a branch-free prefix steady state ran no faster. x86-64
+builds get the same two lanes (SSE2); four-lane AVX2 is unmeasured. The
+interleaved grid costs the scan 7% against separate `g` and `h` grids.
+Dropped as well: skipping tiles of cuts whose interval bound cannot beat
+the best exact score (the bounds admitted 45–100% of the cuts, 20–85%
+slower), `u16` bins (up to 11% off the scatter at 200,000 rows, nothing at
+10,000), and a spare cell for missing rows (up to 18% slower).
 
 ### Prediction and explanations
 

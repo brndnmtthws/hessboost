@@ -31,6 +31,7 @@ pub(super) fn fast_pairs(
     };
     let cuts = index.cuts();
     let lambda = params.lambda;
+    let hess_total = hess_total(gpair);
     let bins: Vec<Vec<u32>> = index
         .feature_columns()
         .into_iter()
@@ -61,6 +62,7 @@ pub(super) fn fast_pairs(
                 },
                 gpair,
                 lambda,
+                hess_total,
                 grid,
             );
             (gain, i)
@@ -116,11 +118,25 @@ struct PairBins<'a> {
 /// Rows of a pair's grid whose prefix sums [`prefix_sums`] runs together.
 const PREFIX_BAND: usize = 4;
 
+/// The total of `gpair`'s Hessians if every one is finite and
+/// non-negative, the bound [`pair_gain`]'s guard-free scan needs.
+fn hess_total(gpair: &[GradPair]) -> Option<f64> {
+    gpair.iter().try_fold(0.0, |total, gp| {
+        (gp.hess >= 0.0 && gp.hess.is_finite()).then(|| total + f64::from(gp.hess))
+    })
+}
+
 /// FAST's score of one pair. `grid`, a worker's buffer reused across
 /// pairs, gets `ma + 1` rows of `mb + 1` cells of `[gradient, Hessian]`
 /// sums: the pair's bin histogram below a zero row and right of a zero
 /// column, then its 2D prefix sums.
-fn pair_gain(bins: &PairBins, gpair: &[GradPair], lambda: f64, grid: &mut Vec<[f64; 2]>) -> f64 {
+fn pair_gain(
+    bins: &PairBins,
+    gpair: &[GradPair],
+    lambda: f64,
+    hess_total: Option<f64>,
+    grid: &mut Vec<[f64; 2]>,
+) -> f64 {
     let PairBins {
         a: bins_a,
         b: bins_b,
@@ -139,7 +155,18 @@ fn pair_gain(bins: &PairBins, gpair: &[GradPair], lambda: f64, grid: &mut Vec<[f
         cell[1] += f64::from(gp.hess);
     }
     prefix_sums(grid, s);
-    best_cut(grid, ma, mb, lambda)
+    // A quadrant's computed Hessian sum, its rows' at least 0, can fall
+    // short by the rounding of its cells in `prefix_sums` (five roundings
+    // a cell, each at most the Hessian total) and of the scan's three
+    // differences. Past 32 roundings a cell `H + λ` is positive in every
+    // quadrant, so the guard in `best_cut` would always pass.
+    let positive =
+        hess_total.is_some_and(|total| lambda > 16.0 * f64::EPSILON * grid.len() as f64 * total);
+    if positive {
+        best_cut::<false>(grid, ma, mb, lambda)
+    } else {
+        best_cut::<true>(grid, ma, mb, lambda)
+    }
 }
 
 /// Turn the histogram in `grid` (rows of `s` cells, the first row and
@@ -194,10 +221,12 @@ fn prefix_band<const R: usize>(prev: &[[f64; 2]], band: &mut [[f64; 2]], s: usiz
 /// The best four-quadrant score over the prefix sums in `grid`, less the
 /// unsplit score: cut `(i, j)` splits the first feature's bins below `i`
 /// from the rest and the second's below `j`. A feature with one bin has
-/// no cut.
-fn best_cut(grid: &[[f64; 2]], ma: usize, mb: usize, lambda: f64) -> f64 {
+/// no cut. A quadrant scores 0 unless its `H + λ` is positive; without
+/// `GUARDED` the caller has shown it always is, and the vectorized scan
+/// runs a quarter fewer instructions.
+fn best_cut<const GUARDED: bool>(grid: &[[f64; 2]], ma: usize, mb: usize, lambda: f64) -> f64 {
     let score = |gs: f64, hs: f64| {
-        if hs + lambda > 0.0 {
+        if !GUARDED || hs + lambda > 0.0 {
             gs * gs / (hs + lambda)
         } else {
             0.0
@@ -271,7 +300,8 @@ mod tests {
     /// Integer gradients keep every sum exact, so the prefix-sum scan and
     /// the definition agree bit for bit, over grids whose row counts leave
     /// every remainder of [`PREFIX_BAND`], with missing rows, zero
-    /// Hessians, and one-bin features.
+    /// Hessians, and one-bin features; `lambda = 1` takes the guard-free
+    /// scan, `lambda = 0` (empty quadrants score 0, not `0 / 0`) the guarded.
     #[test]
     fn pair_gain_matches_the_definition() {
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
@@ -316,7 +346,7 @@ mod tests {
                     ma,
                     mb,
                 };
-                let gain = pair_gain(&bins, &gpair, lambda, &mut grid);
+                let gain = pair_gain(&bins, &gpair, lambda, hess_total(&gpair), &mut grid);
                 let want = reference_gain(&bins, &gpair, lambda);
                 assert_eq!(
                     gain.to_bits(),

@@ -88,4 +88,5 @@ pub fn with_threads<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T 
 
 pub mod bits;
 pub mod fixtures;
+pub mod gpu;
 pub mod smooth;

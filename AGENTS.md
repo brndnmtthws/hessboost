@@ -167,7 +167,9 @@ Fix findings rather than suppress them.
 |`simd/`|`scalar`, `aarch64` (NEON), `x86_64` (AVX2/FMA, SSE2), `tests`|
 
 Tests: `tests/parity.rs` and `tests/lightgbm_parity.rs` are ignored without fixtures; `properties.rs` is
-proptest; shared helpers are in `tests/common/` and `examples/common/`.
+proptest; shared helpers are in `tests/common/` and `examples/common/`;
+`tests/common/gpu.rs` is the suite every GPU backend's test file runs
+through its `GpuBackend` impl.
 `tests/data/saved/<version>/` holds each release's saved models (`.bin`,
 `.json`, `.hbtd`, `.margins`); `tests/data/xgboost-3.4.2-categorical.*` are
 XGBoost saves for `model/xgboost/tests.rs`, and `tests/data/lightgbm-4.7.0-*`

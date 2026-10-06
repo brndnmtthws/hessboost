@@ -23,7 +23,7 @@ what the published crate ships.
 
 ```sh
 cargo fmt --all --check
-cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # CI checks the fuzz crate too
+cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # from the root, as CI does: fuzz/'s nightly has no rustfmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --all-features   # CI adds --cargo-profile ci
 cargo test --doc --all-features   # nextest skips doctests; CI adds --profile ci

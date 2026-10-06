@@ -241,7 +241,7 @@ def test_regex_looking_column_names_are_never_misread() -> None:
     )
 
 
-def test_estimators_collect_lazyframes_only_for_prediction() -> None:
+def test_estimators_collect_lazyframes_only_without_aligned_arrays() -> None:
     pytest.importorskip("sklearn")
     from hessboost.sklearn import HessboostRegressor
 
@@ -254,3 +254,16 @@ def test_estimators_collect_lazyframes_only_for_prediction() -> None:
     with pytest.raises(HessboostError, match="X is a polars LazyFrame"):
         HessboostRegressor(n_estimators=10).fit(features, y, eval_set=[(features.lazy(), y)])
     np.testing.assert_array_equal(model.predict(features.lazy()), model.predict(features))
+    # A base_margin array is aligned with X's rows too: it comes with a
+    # DataFrame, not a LazyFrame. The booster reads one from a column.
+    margin = full["w"].to_numpy()
+    booster = model.get_booster()
+    np.testing.assert_array_equal(
+        model.predict(features, base_margin=margin), booster.predict(features, base_margin=margin)
+    )
+    with pytest.raises(HessboostError, match="X is a polars LazyFrame while base_margin"):
+        model.predict(features.lazy(), base_margin=margin)
+    np.testing.assert_array_equal(
+        booster.predict(full.lazy().drop(["y", "qid"]), base_margin="w"),
+        booster.predict(features, base_margin=margin),
+    )

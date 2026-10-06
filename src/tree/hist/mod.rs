@@ -102,53 +102,87 @@ pub struct CpuBackend;
 /// enough to amortize a partial histogram's zeroing and reduction.
 const ROWS_PER_TASK: usize = 4096;
 /// Nodes below this many rows are one block (built as a single chain).
-const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
+pub(crate) const PARALLEL_THRESHOLD: usize = 2 * ROWS_PER_TASK;
 /// Bins per task when the partial histograms are summed.
 const REDUCE_BINS: usize = 2048;
 /// Datasets up to this many rows gather row subsets feature by feature: the
 /// gradients (8 bytes a row) then fit a core's 2 MiB L2.
 const GATHER_MAX_ROWS: usize = 1 << 18;
 
-impl HistogramBackend for CpuBackend {
-    fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
-        if rows.len() < PARALLEL_THRESHOLD {
-            out.fill(GradStats::default());
-            accumulate(ghist, rows, gpair, out);
-            return;
-        }
-        let threads = rayon::current_num_threads();
-        let Some(columns) = ghist.column_bins() else {
-            accumulate_blocks(ghist, rows, gpair, out, threads);
-            return;
-        };
-        let range = contiguous_range(rows);
-        if range.is_none() && ghist.n_rows() > GATHER_MAX_ROWS {
-            accumulate_blocks(ghist, rows, gpair, out, threads);
-            return;
-        }
-        // The feature sweeps below are chains in row order, as is
-        // `accumulate`, which runs them serially.
-        if threads <= 1 {
-            out.fill(GradStats::default());
-            accumulate(ghist, rows, gpair, out);
-            return;
-        }
+/// The order in which [`CpuBackend`] adds each bin's rows: a function of the
+/// index and the rows alone, never of the thread count. A device backend
+/// reproducing the CPU's `f64` sums bit for bit follows the same order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SumOrder {
+    /// One chain in ascending row order, from `+0.0`.
+    Chain,
+    /// `rows.chunks(grain)`, each chained in row order from `+0.0`; the bin
+    /// is the first chunk's partial plus every later one in chunk order.
+    /// The chunk count is `rows.len().div_ceil(grain)`, which falls below
+    /// `rows.len() / ROWS_PER_TASK` past about 16.8M rows: count chunks from
+    /// `grain`, never from the row count.
+    Blocked {
+        /// Rows per chunk (the last one shorter).
+        grain: usize,
+    },
+}
 
-        // A contiguous row range with a column-major copy is split by
-        // feature. Any other row subset of a small enough column-major index
-        // is gathered the same way: every feature group re-reads the
-        // gradients, so this pays only while they stay in a core's cache.
-        let rows = match range {
-            Some(range) => SweepRows::Range(range),
-            None => SweepRows::Subset(rows),
-        };
-        by_features(ghist, &columns, &rows, gpair, out, threads);
+/// The summation order [`CpuBackend::build`] uses for `rows` of `ghist`.
+///
+/// A node below [`PARALLEL_THRESHOLD`] rows is one chain. A larger one is
+/// blocked when the index keeps no dense column-major copy (missing values
+/// or CSR), or when its rows are not one contiguous range and the index has
+/// more than [`GATHER_MAX_ROWS`] rows; otherwise it is one chain (swept by
+/// feature, or serially, in the same order).
+pub(crate) fn sum_order(ghist: &GHistIndex, rows: &[u32]) -> SumOrder {
+    if rows.len() < PARALLEL_THRESHOLD {
+        return SumOrder::Chain;
+    }
+    let blocked = ghist.column_bins().is_none()
+        || (ghist.n_rows() > GATHER_MAX_ROWS && contiguous_range(rows).is_none());
+    if blocked {
+        let blocks = rows.len() / ROWS_PER_TASK;
+        SumOrder::Blocked {
+            grain: rows.len().div_ceil(blocks),
+        }
+    } else {
+        SumOrder::Chain
     }
 }
 
-/// The blocked build of [`CpuBackend`]: `rows` (at least
-/// [`PARALLEL_THRESHOLD`]) split into `rows.len() / ROWS_PER_TASK` blocks
-/// of equal size (the last shorter), each accumulated from zero into a
+impl HistogramBackend for CpuBackend {
+    fn build(&self, ghist: &GHistIndex, rows: &[u32], gpair: &[GradPair], out: &mut [GradStats]) {
+        let threads = rayon::current_num_threads();
+        match sum_order(ghist, rows) {
+            SumOrder::Blocked { grain } => {
+                accumulate_blocks(ghist, rows, gpair, out, grain, threads);
+            }
+            SumOrder::Chain => {
+                // A large node with a column-major copy is split by feature:
+                // a contiguous row range, or any row subset of an index small
+                // enough that every feature group's re-read of the gradients
+                // stays in a core's cache. Both sweeps are chains in row
+                // order, as is `accumulate`, which runs them serially.
+                let columns = (rows.len() >= PARALLEL_THRESHOLD && threads > 1)
+                    .then(|| ghist.column_bins())
+                    .flatten();
+                if let Some(columns) = columns {
+                    let rows = match contiguous_range(rows) {
+                        Some(range) => SweepRows::Range(range),
+                        None => SweepRows::Subset(rows),
+                    };
+                    by_features(ghist, &columns, &rows, gpair, out, threads);
+                } else {
+                    out.fill(GradStats::default());
+                    accumulate(ghist, rows, gpair, out);
+                }
+            }
+        }
+    }
+}
+
+/// The blocked build of [`CpuBackend`] ([`SumOrder::Blocked`]): `rows`
+/// split into `rows.chunks(grain)`, each accumulated from zero into a
 /// partial histogram, and `out` = the first partial plus every later one in
 /// block order. The blocks depend only on the row count; `threads` only
 /// sets how many are built at once (in waves, each reduced into `out`
@@ -158,11 +192,11 @@ fn accumulate_blocks(
     rows: &[u32],
     gpair: &[GradPair],
     out: &mut [GradStats],
+    grain: usize,
     threads: usize,
 ) {
     let total = out.len();
-    let blocks = rows.len() / ROWS_PER_TASK;
-    let grain = rows.len().div_ceil(blocks);
+    let blocks = rows.len().div_ceil(grain);
     let wave = threads.clamp(1, blocks);
     let mut partials: Vec<Histogram> = Vec::with_capacity(wave);
     for (w, wave_rows) in rows.chunks(grain * wave).enumerate() {

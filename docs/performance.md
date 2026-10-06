@@ -450,6 +450,40 @@ Dropped as slower or flat: a dense CSR margin scratch row (+12% at 1
 thread), extending the cached prediction layout per tree (+2% everywhere),
 in-place gradient sampling (no gain).
 
+### EBM pair ranking
+
+FAST (`booster = ebm` with interactions) scores every feature pair: a 2D
+histogram of the pair's bins, its prefix sums, and every four-quadrant cut.
+The prefix sums were most of it (each cell waits on its left neighbor's
+three additions); they now run four rows at once, each a column behind the
+row above, over one interleaved `[g, h]` grid (one cache line a row in the
+scatter). FAST also reads its bins from the `hist` training index instead
+of sketching cuts and binning every value again. Same sums in the same
+order: pair gains, chosen pairs, and models are bit-identical (model hashes
+at 1 and 8 threads).
+
+192-core **AWS Neoverse-V3** (Rust 1.99.0, bench profile), 2026-10-06 UTC,
+`scripts/compare_benchmarks.py` (baseline/optimized/optimized/baseline, 20
+samples, pinned cores). `ebm_fast_x20_1round`: one round on 20 features,
+then FAST over all 190 pairs; `interactions_0` is the same EBM without it.
+
+| Case | Threads | Before (ms) | After (ms) | Less time |
+|---|---:|---:|---:|---:|
+| `10k_interactions_1` | 1 | 131.09 | 47.01 | 64.1% |
+| `100k_interactions_1` | 1 | 316.68 | 170.65 | 46.1% |
+| `10k_interactions_1` | 16 | 13.36 | 7.64 | 42.8% |
+| `100k_interactions_1` | 16 | 43.83 | 31.60 | 27.9% |
+
+Less the unchanged `interactions_0` times (within 1.6%), FAST itself takes
+3.1–3.3× less time; on 20,000 × 100 (4,950 pairs, 16 threads, throwaway
+harness) it went from 199 to 63 ms. Per pair at 256 bins, the prefix sums
+went from 338 to 43 µs and the scatter from 2.3 to 1.6 ns a row; the cut
+scan, four vectorized `f64` divisions per cut, is now the largest fixed
+cost (about 120 µs). Dropped: skipping tiles of cuts whose interval bound
+cannot beat the best exact score (the bounds admitted 45–100% of the cuts,
+20–85% slower), `u16` bins (up to 11% off the scatter at 200,000 rows,
+nothing at 10,000), and a spare cell for missing rows (up to 18% slower).
+
 ### Prediction and explanations
 
 Single-row compact walk keeps ≤128-feature keys on the stack; compact

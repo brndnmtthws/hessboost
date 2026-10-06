@@ -410,6 +410,7 @@ pub(super) fn classic(
             .collect();
         pairs = fast_pairs(
             run,
+            prepared,
             &gradients(run, &averaged, rounds),
             params.ebm_settings().interactions(),
         );

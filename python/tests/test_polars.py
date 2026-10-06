@@ -78,6 +78,7 @@ def test_polars_frames_need_numeric_or_categorical_columns() -> None:
 
 
 def test_estimators_take_polars_frames() -> None:
+    pytest.importorskip("sklearn")  # the musllinux wheel is tested without it
     from hessboost.sklearn import HessboostRegressor
 
     df, y = frame()
@@ -241,6 +242,7 @@ def test_regex_looking_column_names_are_never_misread() -> None:
 
 
 def test_estimators_collect_lazyframes_only_for_prediction() -> None:
+    pytest.importorskip("sklearn")
     from hessboost.sklearn import HessboostRegressor
 
     full, _ = labelled_frame()

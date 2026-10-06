@@ -15,13 +15,14 @@ wheel_glob="$2"
 
 # scikit-learn publishes no musllinux wheels, and building it from source
 # for every interpreter would dominate the job. On musl, test without it and
-# without the tests that import it; the estimators are pure Python over the
-# same extension the other tests exercise.
+# without the tests that import it (test_polars.py's estimator tests skip
+# themselves); the estimators are pure Python over the same extension the
+# other tests exercise.
 sync_args=
 pytest_args=
 if ldd --version 2>&1 | grep -q musl; then
   sync_args="--no-install-package scikit-learn"
-  pytest_args="--ignore=tests/test_sklearn.py --deselect=tests/test_training.py::test_cv_accepts_explicit_folds_and_splitters --deselect=tests/test_polars.py::test_estimators_take_polars_frames"
+  pytest_args="--ignore=tests/test_sklearn.py --deselect=tests/test_training.py::test_cv_accepts_explicit_folds_and_splitters"
 fi
 # polars publishes only abi3 wheels, which free-threaded interpreters cannot
 # load (and building it from source would dominate the job), so test

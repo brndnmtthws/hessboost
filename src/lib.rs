@@ -196,6 +196,12 @@
 //!     sums, CPU fallback outside their exact domain). Documented only in
 //!     macOS builds with the feature (`cargo doc --features metal`);
 //!     elsewhere [`backend::metal`] is a stub.
+//!   - portable GPU acceleration through wgpu (`wgpu` feature; Vulkan,
+//!     Metal, DirectX 12): the same bit-identical prediction
+//!     ([`to_wgpu`](model::BoostedModel::to_wgpu)) and histograms
+//!     ([`device`](config::TrainingParams::device) = `wgpu`), runnable
+//!     without a GPU on a software adapter such as Mesa's lavapipe;
+//!     unmeasured on real GPUs so far ([`backend::wgpu`]).
 //!
 //! `examples/` has one program per topic (`train_regression`,
 //! `binary_classification`, `multiclass`, `ranking`, `rank_xendcg`, `shap`,
@@ -203,7 +209,7 @@
 //! `boulevard_inference`, `ebm`, `compact_model`, `distributional`,
 //! `virtual_ensembles`, `tree_diffusion`, `forest_flow`, `budget`,
 //! `balanced_bagging`, `online_update`, `ordered_target_stats`, `pfn_boost`,
-//! `metal` with `--features metal` on macOS). Run one with
+//! `metal` with `--features metal` on macOS, `wgpu` with `--features wgpu`). Run one with
 //! `cargo run --release --example binary_classification`.
 //!
 //! ## Compatibility notes
@@ -218,7 +224,7 @@
 //! forests, DART) match in quality only — the random streams differ.
 //! ### Not implemented
 //!
-//! - Distributed and external-memory training; GPU training outside macOS.
+//! - Distributed and external-memory training; CUDA.
 //! - XGBoost options available at one setting only (so they are not
 //!   [`TrainingParams`] fields; `from_xgboost` accepts exactly that
 //!   setting): gblinear uses `updater = coord_descent`

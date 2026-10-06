@@ -69,7 +69,7 @@ fn grow(
 }
 
 /// Whether independent trees or bags may be grown in parallel: several
-/// threads and the CPU backend (the Metal backend serves one tree at a time).
+/// threads and the CPU backend (a GPU backend serves one tree at a time).
 fn parallel(params: &TrainingParams) -> bool {
     params.device == Device::Cpu && rayon::current_num_threads() > 1
 }

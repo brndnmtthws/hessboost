@@ -1,14 +1,14 @@
 [tools]
-rust = { version = "1.98.1", profile = "minimal", components = "clippy,rustfmt", mr_boxington = true }
-mr-boxington = "1.16.0"
-uv = "0.12.18"
+rust = { version = "1.99.0", profile = "minimal", components = "clippy,rustfmt", mr_boxington = true }
+mr-boxington = "1.22.0"
+uv = "0.12.23"
 # mise installs `cargo:` tools with cargo-binstall (prebuilt binaries) when
 # it is present, instead of compiling them.
-cargo-binstall = "1.23.0"
+cargo-binstall = "1.25.2"
 "cargo:cargo-nextest" = "0.9.146"
-"cargo:cargo-semver-checks" = "0.50.0"
+"cargo:cargo-semver-checks" = "0.51.0"
 shellcheck = "0.11.0"
-ruff = "0.16.9"
+ruff = "0.16.10"
 
 # Install anything missing whenever a mise-activated shell enters the repo.
 [hooks]

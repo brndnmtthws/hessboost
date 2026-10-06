@@ -1,7 +1,9 @@
 # Layered over the repository's mise.toml when mise runs in this directory:
-# fuzzing needs a nightly compiler (sanitizer flags) and cargo-fuzz.
+# fuzzing needs a nightly compiler (sanitizer flags) and cargo-fuzz. The
+# nightly has no rustfmt: mise.toml's formats every crate, this one included,
+# from the root (`cargo fmt --all --manifest-path fuzz/Cargo.toml`).
 [tools]
-rust = { version = "nightly-2026-09-22", profile = "minimal", components = "rustfmt", mr_boxington = true }
+rust = { version = "nightly-2026-09-22", profile = "minimal", mr_boxington = true }
 "cargo:cargo-fuzz" = "0.13.2"
 
 # The repository's enter hook does not fire when moving into this directory

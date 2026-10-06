@@ -10,10 +10,10 @@ changelog: release notes are written at release time.
 
 ## Toolchain
 
-`mise install` provides the pinned Rust 1.98.1, `mbx` (build cache),
-cargo-nextest, uv, shellcheck, and ruff; after changing a version, refresh
-`mise.lock` with `mise lock`. MSRV 1.93. `Cargo.lock` is gitignored: never
-pass `--locked`.
+`mise install` provides Rust, `mbx` (build cache), cargo-nextest, uv,
+shellcheck, and ruff at the versions `mise.toml` pins; after changing one,
+refresh `mise.lock` with `mise lock`. MSRV 1.93. `Cargo.lock` is
+gitignored: never pass `--locked`.
 libzstd needs a C compiler for every build target. docs.rs builds only
 Linux (no Apple SDK for `zstd-sys`), so the Metal API renders only in a
 local macOS `cargo doc --features metal`. `include` in `Cargo.toml` lists
@@ -23,7 +23,7 @@ what the published crate ships.
 
 ```sh
 cargo fmt --all --check
-cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # CI checks the fuzz crate too
+cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # from the root, as CI does: fuzz/'s nightly has no rustfmt
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --all-features   # CI adds --cargo-profile ci
 cargo test --doc --all-features   # nextest skips doctests; CI adds --profile ci

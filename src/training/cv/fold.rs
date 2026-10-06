@@ -362,9 +362,10 @@ mod tests {
         for (blocks, min_train) in [(3, 66), (1, 80), (5, 1)] {
             assert!(Fold::purged_forward(&decisions, &ends, 0.2, blocks, min_train).is_err());
         }
-        // A tail whose purge leaves nothing moves until a row trains.
+        // A tail whose purge leaves nothing moves until a row trains: day 7's
+        // start keeps no row, day 8's keeps day 0's six.
         let fold = &Fold::purged_forward(&decisions, &ends, 0.65, 1, 1).unwrap()[0];
-        assert!(!fold.train.is_empty());
+        assert_eq!(fold.train, [0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

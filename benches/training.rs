@@ -1208,36 +1208,43 @@ fn bench_data_prep(c: &mut Criterion) {
     group.finish();
 }
 
-/// Metal GPU benches (`cargo bench --features metal` on a Mac with a Metal
-/// device): histogram construction, end-to-end training, and batch
-/// prediction, each against its CPU counterpart on identical data. The GPU
-/// results are bit-identical to the single-threaded CPU's, so the benches
-/// compare speed only.
-#[cfg(all(target_os = "macos", feature = "metal"))]
-fn bench_metal(c: &mut Criterion) {
-    use hessboost::backend::metal;
-    use hessboost::backend::metal::MetalHistBackend;
-    use hessboost::config::Device;
+/// One GPU backend's entry points for [`bench_gpu`].
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+struct GpuBench<H, G> {
+    /// Group-name prefix and bench id (`metal`, `wgpu`).
+    name: &'static str,
+    /// The `device` that trains on the backend.
+    device: hessboost::config::Device,
+    /// The backend's histogram builder for an index.
+    hist_backend: fn(&GHistIndex) -> Result<H>,
+    /// The model laid out for the backend's prediction.
+    to_gpu: fn(&BoostedModel) -> Result<G>,
+    /// The GPU model's margins of every iteration.
+    predict_margin: fn(&G, &DMatrix) -> Result<hessboost::model::Predictions>,
+}
 
-    if let Some(reason) = metal::unavailable_reason() {
-        eprintln!("skipping metal benches: {reason}");
-        return;
-    }
+/// A GPU backend's benches: histogram construction, end-to-end training,
+/// and batch prediction, each against its CPU counterpart on identical
+/// data. The GPU results are bit-identical to the single-threaded CPU's, so
+/// the benches compare speed only.
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "wgpu"))]
+fn bench_gpu<H: HistogramBackend, G>(c: &mut Criterion, gpu: &GpuBench<H, G>) {
+    let name = gpu.name;
     // Histogram construction at the sizes where the GPU pays off.
     {
-        let mut group = c.benchmark_group("metal_histogram_build");
+        let mut group = c.benchmark_group(format!("{name}_histogram_build"));
         group.sample_size(10);
         for &n in &[100_000usize, 1_000_000] {
             let (ghist, gpair, rows) = histogram_case(&make_data(n, 30));
-            let gpu = MetalHistBackend::new(&ghist).unwrap();
+            let backend = (gpu.hist_backend)(&ghist).unwrap();
             let mut cpu_out = zeroed(ghist.total_bins());
             let mut gpu_out = zeroed(ghist.total_bins());
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(BenchmarkId::new("cpu", n), &n, |b, _| {
                 b.iter(|| CpuBackend.build(&ghist, &rows, &gpair, &mut cpu_out));
             });
-            group.bench_with_input(BenchmarkId::new("metal", n), &n, |b, _| {
-                b.iter(|| gpu.build(&ghist, &rows, &gpair, &mut gpu_out));
+            group.bench_with_input(BenchmarkId::new(name, n), &n, |b, _| {
+                b.iter(|| backend.build(&ghist, &rows, &gpair, &mut gpu_out));
             });
         }
         group.finish();
@@ -1245,9 +1252,9 @@ fn bench_metal(c: &mut Criterion) {
     // End-to-end training: identical parameters, CPU against GPU histograms.
     {
         let data = make_data(200_000, 30);
-        let mut group = c.benchmark_group("metal_train_200k_x30_50rounds_depth8");
+        let mut group = c.benchmark_group(format!("{name}_train_200k_x30_50rounds_depth8"));
         group.sample_size(10);
-        for (name, device) in [("cpu", Device::Cpu), ("metal", Device::Metal)] {
+        for (id, device) in [("cpu", hessboost::config::Device::Cpu), (name, gpu.device)] {
             let params = TrainingParams::builder()
                 .objective(Objective::SquaredError(RegLoss::default()))
                 .tree_method(TreeMethod::Hist)
@@ -1256,7 +1263,7 @@ fn bench_metal(c: &mut Criterion) {
                 .device(device)
                 .build()
                 .unwrap();
-            group.bench_function(name, |b| {
+            group.bench_function(id, |b| {
                 b.iter(|| black_box(train(&params, &data, 50).unwrap()));
             });
         }
@@ -1266,9 +1273,9 @@ fn bench_metal(c: &mut Criterion) {
     {
         let model_data = make_data(100_000, 30);
         let model = trained_model(&model_data, 100);
-        let gpu = model.to_gpu().unwrap();
+        let gpu_model = (gpu.to_gpu)(&model).unwrap();
         let data = make_data(500_000, 30);
-        let mut group = c.benchmark_group("metal_predict_500k_x30_100trees_depth6");
+        let mut group = c.benchmark_group(format!("{name}_predict_500k_x30_100trees_depth6"));
         group.sample_size(10);
         group.throughput(Throughput::Elements(data.n_rows() as u64));
         group.bench_function("cpu", |b| {
@@ -1278,33 +1285,45 @@ fn bench_metal(c: &mut Criterion) {
                     .unwrap()
             });
         });
-        group.bench_function("metal", |b| {
-            b.iter(|| {
-                gpu.predict_margin(black_box(&data), Iterations::Best)
-                    .unwrap()
-            });
+        group.bench_function(name, |b| {
+            b.iter(|| (gpu.predict_margin)(&gpu_model, black_box(&data)).unwrap());
         });
         group.finish();
     }
 }
 
+/// Metal GPU benches (`cargo bench --features metal` on a Mac with a Metal
+/// device); see [`bench_gpu`].
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn bench_metal_registered(c: &mut Criterion) {
-    bench_metal(c);
+fn bench_metal(c: &mut Criterion) {
+    use hessboost::backend::metal;
+
+    if let Some(reason) = metal::unavailable_reason() {
+        eprintln!("skipping metal benches: {reason}");
+        return;
+    }
+    bench_gpu(
+        c,
+        &GpuBench {
+            name: "metal",
+            device: hessboost::config::Device::Metal,
+            hist_backend: metal::MetalHistBackend::new,
+            to_gpu: BoostedModel::to_gpu,
+            predict_margin: |gpu, data| gpu.predict_margin(data, Iterations::Best),
+        },
+    );
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal")))]
-fn bench_metal_registered(_c: &mut Criterion) {}
+fn bench_metal(_c: &mut Criterion) {}
 
 /// wgpu GPU benches (`cargo bench --features wgpu` on a machine with a
-/// Vulkan, Metal, or DirectX 12 adapter): the same three comparisons as the
-/// Metal group. On a software adapter (lavapipe, WARP) the GPU side measures
-/// the CPU emulating one, which says nothing about a GPU.
+/// Vulkan, Metal, or DirectX 12 adapter); see [`bench_gpu`]. On a software
+/// adapter (lavapipe, WARP) the GPU side measures the CPU emulating one,
+/// which says nothing about a GPU.
 #[cfg(feature = "wgpu")]
 fn bench_wgpu(c: &mut Criterion) {
     use hessboost::backend::wgpu;
-    use hessboost::backend::wgpu::WgpuHistBackend;
-    use hessboost::config::Device;
 
     if let Some(reason) = wgpu::unavailable_reason() {
         eprintln!("skipping wgpu benches: {reason}");
@@ -1319,75 +1338,20 @@ fn bench_wgpu(c: &mut Criterion) {
             ""
         }
     );
-    {
-        let mut group = c.benchmark_group("wgpu_histogram_build");
-        group.sample_size(10);
-        for &n in &[100_000usize, 1_000_000] {
-            let (ghist, gpair, rows) = histogram_case(&make_data(n, 30));
-            let gpu = WgpuHistBackend::new(&ghist).unwrap();
-            let mut cpu_out = zeroed(ghist.total_bins());
-            let mut gpu_out = zeroed(ghist.total_bins());
-            group.throughput(Throughput::Elements(n as u64));
-            group.bench_with_input(BenchmarkId::new("cpu", n), &n, |b, _| {
-                b.iter(|| CpuBackend.build(&ghist, &rows, &gpair, &mut cpu_out));
-            });
-            group.bench_with_input(BenchmarkId::new("wgpu", n), &n, |b, _| {
-                b.iter(|| gpu.build(&ghist, &rows, &gpair, &mut gpu_out));
-            });
-        }
-        group.finish();
-    }
-    {
-        let data = make_data(200_000, 30);
-        let mut group = c.benchmark_group("wgpu_train_200k_x30_50rounds_depth8");
-        group.sample_size(10);
-        for (name, device) in [("cpu", Device::Cpu), ("wgpu", Device::Wgpu)] {
-            let params = TrainingParams::builder()
-                .objective(Objective::SquaredError(RegLoss::default()))
-                .tree_method(TreeMethod::Hist)
-                .max_depth(8)
-                .eta(0.1)
-                .device(device)
-                .build()
-                .unwrap();
-            group.bench_function(name, |b| {
-                b.iter(|| black_box(train(&params, &data, 50).unwrap()));
-            });
-        }
-        group.finish();
-    }
-    {
-        let model_data = make_data(100_000, 30);
-        let model = trained_model(&model_data, 100);
-        let gpu = model.to_wgpu().unwrap();
-        let data = make_data(500_000, 30);
-        let mut group = c.benchmark_group("wgpu_predict_500k_x30_100trees_depth6");
-        group.sample_size(10);
-        group.throughput(Throughput::Elements(data.n_rows() as u64));
-        group.bench_function("cpu", |b| {
-            b.iter(|| {
-                model
-                    .predict_margin(black_box(&data), Iterations::Best)
-                    .unwrap()
-            });
-        });
-        group.bench_function("wgpu", |b| {
-            b.iter(|| {
-                gpu.predict_margin(black_box(&data), Iterations::Best)
-                    .unwrap()
-            });
-        });
-        group.finish();
-    }
-}
-
-#[cfg(feature = "wgpu")]
-fn bench_wgpu_registered(c: &mut Criterion) {
-    bench_wgpu(c);
+    bench_gpu(
+        c,
+        &GpuBench {
+            name: "wgpu",
+            device: hessboost::config::Device::Wgpu,
+            hist_backend: wgpu::WgpuHistBackend::new,
+            to_gpu: BoostedModel::to_wgpu,
+            predict_margin: |gpu, data| gpu.predict_margin(data, Iterations::Best),
+        },
+    );
 }
 
 #[cfg(not(feature = "wgpu"))]
-fn bench_wgpu_registered(_c: &mut Criterion) {}
+fn bench_wgpu(_c: &mut Criterion) {}
 
 criterion_group!(
     benches,
@@ -1408,7 +1372,7 @@ criterion_group!(
     bench_predict_csr,
     bench_model_io,
     bench_data_prep,
-    bench_metal_registered,
-    bench_wgpu_registered
+    bench_metal,
+    bench_wgpu
 );
 criterion_main!(benches);
